@@ -91,7 +91,7 @@ jobs:
 
   build:
     name: Build ${{ matrix.asset }}
-    needs: test
+    needs: [prepare, test]
     strategy:
       fail-fast: false
       matrix:
