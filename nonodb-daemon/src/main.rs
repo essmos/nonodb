@@ -73,6 +73,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let data = PathBuf::from(std::env::var("NONODB_DATA").unwrap_or_else(|_| "./data".into()));
+    #[cfg(unix)]
     let sock =
         PathBuf::from(std::env::var("NONODB_SOCK").unwrap_or_else(|_| "/run/nonodb.sock".into()));
 
@@ -97,14 +98,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .with_state(state);
 
-    if let Some(parent) = sock.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    // Daemon jest jedynym właścicielem socketa — usuwamy ewentualny osierocony plik.
-    let _ = std::fs::remove_file(&sock);
-
     // Opcjonalny listener TCP (z TLS, jeśli podano certyfikat i klucz).
-    if let Ok(addr) = std::env::var("NONODB_TCP") {
+    let tcp_addr = std::env::var("NONODB_TCP").ok();
+    if let Some(addr) = tcp_addr.as_deref() {
         if std::env::var("NONODB_AUTH_TOKEN")
             .ok()
             .filter(|t| !t.is_empty())
@@ -124,6 +120,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             _ => return Err("podaj oba: NONODB_TLS_CERT i NONODB_TLS_KEY".into()),
         };
         let app_tcp = app.clone();
+        let addr = addr.to_string();
         tokio::spawn(async move {
             if let Err(e) = serve_tcp(&addr, tls, app_tcp).await {
                 tracing::error!(?e, %addr, "listener TCP zakończony");
@@ -131,43 +128,70 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    let listener = tokio::net::UnixListener::bind(&sock)?;
+    #[cfg(not(unix))]
+    {
+        // Windows and other non-Unix platforms do not have Unix domain sockets
+        // in tokio. TCP is therefore required there.
+        if tcp_addr.is_none() {
+            return Err(
+                "NONODB_TCP is required on this platform (Unix sockets are unavailable)".into(),
+            );
+        }
+        tracing::info!(
+            data = %data.display(),
+            tcp = tcp_addr.as_deref().unwrap_or(""),
+            "nonodb daemon listening"
+        );
+        shutdown_signal().await;
+        tracing::info!("nonodb daemon stopped");
+        return Ok(());
+    }
+
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o660))?;
-    }
+        if let Some(parent) = sock.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        // Daemon jest jedynym właścicielem socketa — usuwamy ewentualny osierocony plik.
+        let _ = std::fs::remove_file(&sock);
 
-    tracing::info!(
-        data = %data.display(),
-        sock = %sock.display(),
-        "nonodb daemon listening"
-    );
-
-    let mut shutdown = Box::pin(shutdown_signal());
-    loop {
-        let stream = tokio::select! {
-            _ = &mut shutdown => break,
-            accepted = listener.accept() => accepted?.0,
-        };
-
-        if !peer_allowed(&stream) {
-            tracing::warn!("odrzucono połączenie UDS: niedozwolony uid/gid");
-            continue;
+        let listener = tokio::net::UnixListener::bind(&sock)?;
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o660))?;
         }
 
-        let io = TokioIo::new(stream);
-        let service = TowerToHyperService::new(app.clone());
-        tokio::spawn(async move {
-            if let Err(err) = http1::Builder::new().serve_connection(io, service).await {
-                tracing::debug!(?err, "connection closed");
-            }
-        });
-    }
+        tracing::info!(
+            data = %data.display(),
+            sock = %sock.display(),
+            "nonodb daemon listening"
+        );
 
-    let _ = std::fs::remove_file(&sock);
-    tracing::info!("nonodb daemon stopped");
-    Ok(())
+        let mut shutdown = Box::pin(shutdown_signal());
+        loop {
+            let stream = tokio::select! {
+                _ = &mut shutdown => break,
+                accepted = listener.accept() => accepted?.0,
+            };
+
+            if !peer_allowed(&stream) {
+                tracing::warn!("odrzucono połączenie UDS: niedozwolony uid/gid");
+                continue;
+            }
+
+            let io = TokioIo::new(stream);
+            let service = TowerToHyperService::new(app.clone());
+            tokio::spawn(async move {
+                if let Err(err) = http1::Builder::new().serve_connection(io, service).await {
+                    tracing::debug!(?err, "connection closed");
+                }
+            });
+        }
+
+        let _ = std::fs::remove_file(&sock);
+        tracing::info!("nonodb daemon stopped");
+        Ok(())
+    }
 }
 
 fn tls_acceptor(cert: &str, key: &str) -> Result<TlsAcceptor, Box<dyn std::error::Error>> {
@@ -745,6 +769,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+#[cfg(unix)]
 fn peer_allowed(stream: &tokio::net::UnixStream) -> bool {
     static ALLOWED: std::sync::OnceLock<Option<(Vec<u32>, Vec<u32>)>> = std::sync::OnceLock::new();
     let allowed = ALLOWED.get_or_init(|| {
@@ -763,6 +788,7 @@ fn peer_allowed(stream: &tokio::net::UnixStream) -> bool {
     uids.contains(&uid) || gids.contains(&gid)
 }
 
+#[cfg(unix)]
 fn parse_ids(name: &str) -> Vec<u32> {
     std::env::var(name)
         .ok()

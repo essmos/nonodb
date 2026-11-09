@@ -12,6 +12,10 @@ A nonodb deployment has:
 - one or more application processes connecting over a Unix socket or TCP;
 - optionally `nonodb-cli` for administration and backups.
 
+Linux and macOS support both Unix sockets and TCP. Windows has no Unix socket
+listener; the daemon requires `NONODB_TCP` and `NONODB_AUTH_TOKEN` there. The
+Windows CLI connects over plaintext HTTP/TCP using `NONODB_URL`.
+
 The daemon must be the only process that opens the LMDB environment for
 writing. Do not run two daemons against the same data directory. Do not place
 the data directory on NFS, SMB, or other network filesystems that do not provide
@@ -46,7 +50,8 @@ Client-side environment variables:
 
 | Variable | Default | Description |
 |---|---|---|
-| `NONODB_SOCK` | `/run/nonodb.sock` | Default Unix socket for the Python client and CLI |
+| `NONODB_SOCK` | `/run/nonodb.sock` | Default Unix socket for the Python client and CLI (Unix) |
+| `NONODB_URL` | `http://127.0.0.1:7878` | HTTP base URL for the Windows CLI |
 | `NONODB_TOKEN` | — | Bearer token used by the Python client and CLI |
 | `NONODB_TIMEOUT` | `10` | Client request timeout in seconds |
 | `NONODB_TLS_VERIFY` | `1` | Set to `0`/`false`/`no` to disable certificate verification |

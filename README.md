@@ -166,12 +166,31 @@ footprint.
 
 ## Quick start
 
+### Prebuilt binaries
+
+Every tagged release contains ready-to-run binaries:
+
+| Platform | Release asset |
+| --- | --- |
+| Linux x86_64 | `nonodb-vX.Y.Z-linux-x86_64.tar.gz` |
+| macOS Apple Silicon | `nonodb-vX.Y.Z-macos-arm64.tar.gz` |
+| macOS Intel | `nonodb-vX.Y.Z-macos-x86_64.tar.gz` |
+| Windows x86_64 | `nonodb-vX.Y.Z-windows-x86_64.zip` |
+
+Each archive contains `nonodb-daemon`, `nonodb-cli`, `README.md`, `LICENSE` and
+`docs/`. Every archive also has a `.sha256` checksum on the
+[releases page](https://github.com/essmos/nonodb/releases).
+
+Linux and macOS use the Unix socket by default. Windows has no Unix socket
+listener, so the Windows daemon requires TCP plus `NONODB_AUTH_TOKEN`.
+
 ### Run on Linux (native)
 
 Requirements:
 
-- Rust stable (2021 edition; latest stable recommended) and Cargo.
-- Linux/Unix. The daemon uses Unix sockets and `SO_PEERCRED`.
+- Rust stable (2021 edition; latest stable recommended), Cargo, and a C
+  compiler for LMDB.
+- Linux or macOS for the Unix-socket daemon. The Windows daemon is TCP-only.
 - Python 3.9+ only if you want the optional Python client (`httpx`; `orjson`
   is an optional speedup).
 
@@ -241,6 +260,65 @@ NONODB_SOCK=/tmp/nonodb-run/nonodb.sock ./target/release/nonodb-cli find users '
 
 This runs in the foreground. For a production Linux service, use the systemd
 unit and installation steps in [Operations](docs/operations.md#deployment-with-systemd).
+
+### Run on macOS (native)
+
+Download the archive matching your CPU (`uname -m` prints `arm64` or `x86_64`):
+
+```bash
+TAG=v0.1.1
+curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/nonodb-$TAG-macos-arm64.tar.gz"
+tar -xzf "nonodb-$TAG-macos-arm64.tar.gz"
+cd "nonodb-$TAG-macos-arm64"
+```
+
+Release binaries are not signed or notarized. If Gatekeeper blocks them, remove
+the quarantine attribute once:
+
+```bash
+xattr -d com.apple.quarantine nonodb-daemon nonodb-cli 2>/dev/null || true
+```
+
+Start the daemon exactly as on Linux (Unix socket and `SO_PEERCRED` work on
+macOS):
+
+```bash
+mkdir -p /tmp/nonodb-data /tmp/nonodb-run
+
+NONODB_DATA=/tmp/nonodb-data \
+NONODB_SOCK=/tmp/nonodb-run/nonodb.sock \
+RUST_LOG=info \
+./nonodb-daemon
+```
+
+Then use `nonodb-cli`, `curl --unix-socket`, or the Python client with
+`NONODB_SOCK=/tmp/nonodb-run/nonodb.sock`.
+
+### Run on Windows (TCP only)
+
+Download and extract `nonodb-vX.Y.Z-windows-x86_64.zip`, then start the daemon
+from PowerShell. TCP is mandatory on Windows and always requires a bearer
+token:
+
+```powershell
+$env:NONODB_DATA = "$PWD\data"
+$env:NONODB_TCP = "127.0.0.1:7878"
+$env:NONODB_AUTH_TOKEN = "replace-with-a-long-random-token"
+$env:RUST_LOG = "info"
+.\nonodb-daemon.exe
+```
+
+In a second PowerShell window:
+
+```powershell
+$env:NONODB_URL = "http://127.0.0.1:7878"
+$env:NONODB_TOKEN = "replace-with-a-long-random-token"
+.\nonodb-cli.exe ping
+```
+
+The Windows CLI uses plaintext HTTP over TCP. For TLS connections, use the
+Python client with `base_url="https://..."` and a proper certificate. Keep the
+listener on `127.0.0.1` unless you terminate TLS in front of it.
 
 ### Run with Docker
 
@@ -336,7 +414,7 @@ See [Benchmarks](docs/benchmarks.md) for methodology and full tables.
 
 ## Status
 
-nonodb is an early-stage project (`0.1.0`). Its core storage, query, index,
+nonodb is an early-stage project (`0.1.1`). Its core storage, query, index,
 search, batching, security, snapshot, and operational paths are covered by unit,
 property-based, end-to-end, concurrency, crash, and large-data tests. The API
 may still change before a stable release.

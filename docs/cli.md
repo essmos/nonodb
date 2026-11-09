@@ -1,9 +1,11 @@
 # Command-line interface
 
-`nonodb-cli` is a small administrative client. Commands that talk to the daemon
-use the Unix socket (`NONODB_SOCK`, default `/run/nonodb.sock`) and the optional
-bearer token (`NONODB_TOKEN`). File commands (`backup`, `inspect`, `restore`)
-operate directly on an LMDB data directory.
+`nonodb-cli` is a small administrative client. On Linux and macOS, commands
+that talk to the daemon use the Unix socket (`NONODB_SOCK`, default
+`/run/nonodb.sock`) and the optional bearer token (`NONODB_TOKEN`). On Windows,
+daemon-facing commands use plaintext HTTP over TCP (`NONODB_URL`, default
+`http://127.0.0.1:7878`). File commands (`backup`, `inspect`, `restore`) operate
+directly on an LMDB data directory on every platform.
 
 ```bash
 nonodb-cli <command> [arguments]
@@ -162,7 +164,8 @@ Rules and warnings:
 
 | Variable | Default | Used by |
 |---|---|---|
-| `NONODB_SOCK` | `/run/nonodb.sock` | Daemon-facing commands |
+| `NONODB_SOCK` | `/run/nonodb.sock` | Daemon-facing commands on Linux/macOS |
+| `NONODB_URL` | `http://127.0.0.1:7878` | Daemon-facing commands on Windows |
 | `NONODB_TOKEN` | — | Bearer token for daemon-facing commands |
 
 `backup`, `inspect`, and `restore` do not use the socket or token.

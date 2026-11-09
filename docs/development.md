@@ -44,8 +44,8 @@ and [HTTP API](api.md).
 
 ## Prerequisites
 
-- Rust stable with Cargo.
-- Linux/Unix for the daemon (Unix sockets, `SO_PEERCRED`).
+- Rust stable with Cargo and a C compiler for LMDB.
+- Linux or macOS for the Unix-socket daemon. Windows builds are TCP-only.
 - Python 3.9+ and `httpx` for client tests. `orjson` is optional.
 - For large benchmarks: enough disk space and a real filesystem (`ext4`), not
   tmpfs.
@@ -272,9 +272,10 @@ git tag -a v0.1.0-beta.1 -m "nonodb v0.1.0-beta.1"
 git push origin v0.1.0-beta.1
 ```
 
-The workflow runs the tests, builds release binaries, creates a Linux x86_64
-tarball with checksums, and publishes a GitHub Release. Tags such as
-`v0.1.0-beta.1` and `v0.2.0-rc.1` are marked as pre-releases automatically.
+The workflow runs the tests, builds release binaries for Linux x86_64, macOS
+Intel, macOS Apple Silicon, and Windows x86_64, attaches checksums, and publishes
+a GitHub Release. Linux and macOS use `.tar.gz`; Windows uses `.zip`. Tags such
+as `v0.1.0-beta.1` and `v0.2.0-rc.1` are marked as pre-releases automatically.
 
 ### Manual release
 

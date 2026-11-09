@@ -18,7 +18,8 @@ quick-start instructions, and a feature overview.
 
 ## Common tasks
 
-- **Run on Linux:** [README — Run on Linux](../README.md#run-on-linux-native)
+- **Download prebuilt binaries:** [README — Prebuilt binaries](../README.md#prebuilt-binaries)
+- **Run on Linux, macOS or Windows:** [README — Quick start](../README.md#quick-start)
 - **Run with Docker:** [README — Run with Docker](../README.md#run-with-docker)
 - **Expose nonodb to Python workers:** [Python client](python-client.md)
 - **Secure a deployment:** [Authentication](operations.md#authentication) and

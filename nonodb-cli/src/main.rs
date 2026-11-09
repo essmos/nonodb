@@ -1,10 +1,14 @@
 //! `nonodb-cli` — proste narzędzie administracyjne.
 //!
-//! Połączenia idą przez gniazdo UDS; backup/restore/inspect działają na plikach
-//! LMDB i nie wymagają działającego daemona (backup/inspect otwierają bazę
-//! tylko do odczytu).
+//! On Unix, connections go through the UDS socket. On Windows, the CLI uses
+//! plaintext HTTP over TCP (`NONODB_URL`). Backup/restore/inspect work on LMDB
+//! files and do not require a running daemon (backup/inspect open the database
+//! read-only).
 
 use std::io::{Read, Write};
+#[cfg(not(unix))]
+use std::net::TcpStream;
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 
@@ -163,7 +167,8 @@ fn usage() -> Result<(), String> {
          inspect <data> [coll]      statystyki bazy/kolekcji\n\
          restore <backup> <data> [--force]  przywróć data.mdb (najpierw zatrzymaj daemona)\n\
          \n\
-         Zmienne: NONODB_SOCK (domyślnie /run/nonodb.sock), NONODB_TOKEN"
+         Zmienne: NONODB_SOCK (Unix, domyślnie /run/nonodb.sock),\n\
+         NONODB_URL (Windows, domyślnie http://127.0.0.1:7878), NONODB_TOKEN"
     );
     Ok(())
 }
@@ -184,8 +189,22 @@ fn parse_json_arg(raw: Option<&String>) -> Result<Value, String> {
     }
 }
 
+#[cfg(unix)]
 fn sock_path() -> String {
     std::env::var("NONODB_SOCK").unwrap_or_else(|_| "/run/nonodb.sock".into())
+}
+
+#[cfg(not(unix))]
+fn tcp_addr() -> Result<String, String> {
+    let url = std::env::var("NONODB_URL").unwrap_or_else(|_| "http://127.0.0.1:7878".into());
+    let rest = url
+        .strip_prefix("http://")
+        .ok_or("NONODB_URL musi zaczynać się od http:// (CLI nie obsługuje TLS)")?;
+    let rest = rest.trim_end_matches('/');
+    if rest.is_empty() {
+        return Err("NONODB_URL nie zawiera adresu host:port".into());
+    }
+    Ok(rest.to_string())
 }
 
 fn http_get(path: &str) -> Result<Value, String> {
@@ -197,7 +216,13 @@ fn http_post(path: &str, body: &Value) -> Result<Value, String> {
 }
 
 fn http_request(method: &str, path: &str, body: Option<&Value>) -> Result<Value, String> {
+    #[cfg(unix)]
     let mut stream = UnixStream::connect(sock_path()).map_err(|e| format!("connect: {e}"))?;
+    #[cfg(not(unix))]
+    let mut stream = {
+        let addr = tcp_addr()?;
+        TcpStream::connect(&addr).map_err(|e| format!("connect {addr}: {e}"))?
+    };
     let payload = body
         .map(|b| serde_json::to_vec(b).unwrap())
         .unwrap_or_default();
