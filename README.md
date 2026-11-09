@@ -6,12 +6,17 @@
 **A low-resource, crash-safe JSON document database — with a surprisingly
 large feature set under the hood.**
 
+**Idle daemon memory: about 5 MB RSS.** That is measured with a 1M-document
+database and three indexes after a restart. The on-disk LMDB file grows with
+the data and indexes; the ~5 MB figure is process memory, not the database
+file. Hot data stays in the OS page cache instead of the daemon heap.
+
 nonodb is a local NoSQL document store written in Rust. It needs no external
-database server, keeps a tiny idle memory footprint, and runs comfortably on
-small VMs, edge boxes, and developer machines. It speaks a practical subset of
-MongoDB's query language over HTTP/JSON, stores documents in LMDB, and runs as
-a single daemon that is the only process allowed to touch the database file.
-Application workers connect to it through a Unix socket and use a thin client.
+database server and runs comfortably on small VMs, edge boxes, and developer
+machines. It speaks a practical subset of MongoDB's query language over
+HTTP/JSON, stores documents in LMDB, and runs as a single daemon that is the
+only process allowed to touch the database file. Application workers connect
+to it through a Unix socket and use a thin client.
 
 Low resource use is the starting point, not the whole story. Under the hood,
 nonodb is a real document database with:
