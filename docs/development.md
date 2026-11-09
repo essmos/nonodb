@@ -227,6 +227,86 @@ increase request timeouts for index backfills.
 5. Add a client wrapper if appropriate.
 6. Add an end-to-end test and update `README.md`/`docs/api.md`.
 
+## Continuous integration
+
+GitHub Actions runs on every push to `main`, every pull request, and manually:
+
+```text
+.github/workflows/ci.yml
+```
+
+The workflow installs stable Rust with `rustfmt` and `clippy`, restores the
+Cargo cache, then runs:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked --all-targets --all-features
+cargo build --locked --release --bins --examples
+python3 -m compileall -q client scripts
+```
+
+A pull request should be green before merging.
+
+## Releasing
+
+Releases are built and published by:
+
+```text
+.github/workflows/release.yml
+```
+
+There are two supported flows.
+
+### Release from a tag
+
+Create and push an annotated tag:
+
+```bash
+# final release
+git tag -a v0.1.0 -m "nonodb v0.1.0"
+git push origin v0.1.0
+
+# pre-release (the hyphen makes it a GitHub pre-release automatically)
+git tag -a v0.1.0-beta.1 -m "nonodb v0.1.0-beta.1"
+git push origin v0.1.0-beta.1
+```
+
+The workflow runs the tests, builds release binaries, creates a Linux x86_64
+tarball with checksums, and publishes a GitHub Release. Tags such as
+`v0.1.0-beta.1` and `v0.2.0-rc.1` are marked as pre-releases automatically.
+
+### Manual release
+
+Use **Actions → Release → Run workflow** and provide:
+
+| Input | Meaning |
+|---|---|
+| `tag` | Tag to publish, e.g. `v0.1.1` or `v0.2.0-rc.1` |
+| `prerelease` | Mark the release as a pre-release |
+| `draft` | Create it as a draft for review |
+
+If the tag does not exist, `gh release create` creates it at the commit that was
+checked out. For a new release, this is normally the current `main` commit.
+
+### Release assets
+
+Each release contains:
+
+```text
+nonodb-<tag>-linux-x86_64.tar.gz
+nonodb-<tag>-linux-x86_64.tar.gz.sha256
+```
+
+The tarball contains `nonodb-daemon`, `nonodb-cli`, `README.md`, `LICENSE`, and
+the `docs/` directory.
+
+### Re-running a release
+
+If the GitHub Release already exists, the workflow uploads the newly built
+assets with `--clobber`. This allows a failed packaging or publishing step to be
+retried without deleting the release manually.
+
 ## Pull request checklist
 
 - [ ] `cargo fmt --check`

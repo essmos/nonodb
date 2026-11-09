@@ -1,5 +1,8 @@
 # nonodb
 
+[![CI](https://github.com/essmos/nonodb/actions/workflows/ci.yml/badge.svg)](https://github.com/essmos/nonodb/actions/workflows/ci.yml)
+[![Release](https://github.com/essmos/nonodb/actions/workflows/release.yml/badge.svg)](https://github.com/essmos/nonodb/actions/workflows/release.yml)
+
 **A low-resource, crash-safe document database for application state,
 settings, and JSON-heavy configuration.**
 

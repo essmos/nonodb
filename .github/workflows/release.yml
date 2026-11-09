@@ -1,0 +1,133 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag, e.g. v0.1.0 or v0.1.0-beta.1"
+        required: true
+        type: string
+        default: "v0.1.0"
+      prerelease:
+        description: "Mark this release as a pre-release"
+        required: false
+        type: boolean
+        default: false
+      draft:
+        description: "Create the release as a draft"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build and publish
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Resolve release metadata
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! "${TAG}" =~ ^v[0-9] ]]; then
+            echo "Release tag must start with 'v' followed by a version, got: ${TAG}" >&2
+            exit 1
+          fi
+
+          PRE="${{ github.event.inputs.prerelease || 'false' }}"
+          DRAFT="${{ github.event.inputs.draft || 'false' }}"
+
+          # Tags such as v0.1.0-beta.1 or v0.2.0-rc.1 are pre-releases
+          # automatically, even when the flag was not set manually.
+          if [[ "${TAG}" == *-* ]]; then
+            PRE=true
+          fi
+
+          {
+            echo "version=${TAG#v}"
+            echo "prerelease=${PRE}"
+            echo "draft=${DRAFT}"
+          } >> "${GITHUB_OUTPUT}"
+
+          echo "Releasing ${TAG} (prerelease=${PRE}, draft=${DRAFT})"
+
+      - name: Run tests
+        run: cargo test --locked
+
+      - name: Build release binaries
+        run: cargo build --locked --release --bin nonodb-daemon --bin nonodb-cli
+
+      - name: Package Linux x86_64 artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ARCHIVE="nonodb-${TAG}-linux-x86_64"
+          mkdir -p "dist/${ARCHIVE}"
+
+          cp target/release/nonodb-daemon "dist/${ARCHIVE}/"
+          cp target/release/nonodb-cli "dist/${ARCHIVE}/"
+          cp README.md LICENSE "dist/${ARCHIVE}/"
+          cp -R docs "dist/${ARCHIVE}/docs"
+
+          tar -C dist -czf "dist/${ARCHIVE}.tar.gz" "${ARCHIVE}"
+          (
+            cd dist
+            sha256sum "${ARCHIVE}.tar.gz" > "${ARCHIVE}.tar.gz.sha256"
+          )
+
+          ls -lh dist
+
+      - name: Publish GitHub release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PRE="${{ steps.meta.outputs.prerelease }}"
+          DRAFT="${{ steps.meta.outputs.draft }}"
+
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "Release ${TAG} already exists; uploading assets with --clobber."
+            gh release upload "${TAG}" dist/*.tar.gz dist/*.sha256 --clobber
+          else
+            FLAGS=()
+            if [[ "${PRE}" == "true" ]]; then
+              FLAGS+=(--prerelease)
+            fi
+            if [[ "${DRAFT}" == "true" ]]; then
+              FLAGS+=(--draft)
+            fi
+
+            gh release create "${TAG}" dist/*.tar.gz dist/*.sha256 \
+              --target "${GITHUB_SHA}" \
+              --title "${TAG}" \
+              --generate-notes \
+              "${FLAGS[@]}"
+          fi
