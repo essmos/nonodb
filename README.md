@@ -414,6 +414,20 @@ See [Benchmarks](docs/benchmarks.md) for methodology and full tables.
 | Idle daemon RSS at 1M docs, 3 indexes | ~5 MB |
 | Live backup of 8M docs + 1M text docs | 5.1 GB in ~10 s |
 
+## Sponsors
+
+<p>
+  <a href="https://liveapisec.com">
+    <img src="docs/assets/liveapisec-logo.svg" width="44" height="44" alt="LiveAPISec">
+  </a>
+  &nbsp;
+  <strong><a href="https://liveapisec.com">LiveAPISec</a></strong> supports
+  nonodb development.
+</p>
+
+LiveAPISec provides continuous API pentesting with live, checkable scan
+results. Visit [liveapisec.com](https://liveapisec.com) to learn more.
+
 ## Status
 
 nonodb is an early-stage project (`0.1.1`). Its core storage, query, index,
