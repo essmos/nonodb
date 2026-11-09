@@ -1,5 +1,5 @@
 [workspace]
-members = ["nonodb-core", "nonodb-daemon", "nonodb-cli"]
+members = ["nonodb-core", "nonodb-daemon", "nonodb-cli", "nonodb-client"]
 resolver = "2"
 
 [workspace.package]

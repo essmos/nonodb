@@ -1,0 +1,14 @@
+[package]
+name = "nonodb-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Rust client for nonodb over Unix sockets or TCP/TLS"
+
+[dependencies]
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

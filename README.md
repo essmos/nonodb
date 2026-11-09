@@ -162,6 +162,7 @@ footprint.
 - JSON metrics endpoint and request/queue/commit counters.
 - Group commit with adaptive batching, request size limits, and request
   timeouts.
+- Official thin clients for Python, Rust, Node.js, and Go.
 - Docker image, systemd unit, crash tests, and end-to-end test scripts.
 
 ## Quick start
@@ -388,6 +389,7 @@ More deployment details: [Operations — Docker](docs/operations.md#docker).
 |---|---|
 | [Architecture](docs/architecture.md) | Daemon model, LMDB layout, write path, indexes, search, concurrency, crash safety |
 | [HTTP API](docs/api.md) | Every operation, request/response shapes, filters, updates, indexes, search, errors |
+| [Clients](docs/clients.md) | Python, Rust, Node.js and Go clients: install, CRUD, batches, indexes, search, TCP/TLS |
 | [Python client](docs/python-client.md) | `NonoDB`/`Collection` API, caching, retries, TCP/TLS, FastAPI usage |
 | [CLI](docs/cli.md) | `ping`, `find`, `count`, `backup`, `restore`, `inspect`, `exec` |
 | [Operations](docs/operations.md) | Configuration, deployment, security, snapshots, monitoring, capacity, troubleshooting |

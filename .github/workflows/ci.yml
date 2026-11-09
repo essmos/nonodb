@@ -47,6 +47,25 @@ jobs:
       - name: Check Python syntax
         run: python3 -m compileall -q client scripts
 
+      - name: Check Node.js client
+        run: |
+          node --check client/node/index.js
+          node --check client/node/smoke_test.js
+
+      - name: Install Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: stable
+
+      - name: Test Go client
+        working-directory: client/go
+        run: |
+          go test ./...
+          go vet ./...
+
+      - name: Run client integration smoke tests
+        run: bash scripts/clients_test.sh
+
   cross-platform:
     name: Check ${{ matrix.os }}
     strategy:

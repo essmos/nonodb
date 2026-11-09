@@ -51,7 +51,7 @@ Client-side environment variables:
 | Variable | Default | Description |
 |---|---|---|
 | `NONODB_SOCK` | `/run/nonodb.sock` | Default Unix socket for the Python client and CLI (Unix) |
-| `NONODB_URL` | `http://127.0.0.1:7878` | HTTP base URL for the Windows CLI |
+| `NONODB_URL` | `http://127.0.0.1:7878` | HTTP base URL for Rust, Node.js, Go, and the Windows CLI |
 | `NONODB_TOKEN` | — | Bearer token used by the Python client and CLI |
 | `NONODB_TIMEOUT` | `10` | Client request timeout in seconds |
 | `NONODB_TLS_VERIFY` | `1` | Set to `0`/`false`/`no` to disable certificate verification |

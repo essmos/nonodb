@@ -9,7 +9,8 @@ quick-start instructions, and a feature overview.
 |---|---|---|
 | [Architecture](architecture.md) | Maintainers, advanced users | Process model, LMDB layout, write path, indexes, search, crash safety |
 | [HTTP API](api.md) | All client authors | Operations, request/response formats, filters, updates, errors |
-| [Python client](python-client.md) | Application developers | Connection, CRUD, upsert, indexes, search, batches, cache, FastAPI |
+| [Clients](clients.md) | Application developers | Python, Rust, Node.js and Go: install, connection, CRUD, batches, indexes, search |
+| [Python client](python-client.md) | Python developers | Connection, CRUD, upsert, indexes, search, batches, cache, FastAPI |
 | [CLI](cli.md) | Operators | Administration, backup, restore, inspect, raw requests |
 | [Operations](operations.md) | Operators, SRE | Configuration, deployment, security, snapshots, monitoring, capacity, troubleshooting |
 | [Benchmarks](benchmarks.md) | Evaluators, maintainers | Environment, methodology, throughput, latency, memory, large-data results |
@@ -21,6 +22,7 @@ quick-start instructions, and a feature overview.
 - **Download prebuilt binaries:** [README — Prebuilt binaries](../README.md#prebuilt-binaries)
 - **Run on Linux, macOS or Windows:** [README — Quick start](../README.md#quick-start)
 - **Run with Docker:** [README — Run with Docker](../README.md#run-with-docker)
+- **Pick a client:** [Clients](clients.md) — Python, Rust, Node.js, Go
 - **Expose nonodb to Python workers:** [Python client](python-client.md)
 - **Secure a deployment:** [Authentication](operations.md#authentication) and
   [TCP/TLS](operations.md#tcp-and-tls)

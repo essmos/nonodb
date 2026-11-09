@@ -34,7 +34,10 @@ and [HTTP API](api.md).
 │       ├── writer.rs          # single writer + group commit
 │       └── metrics.rs
 ├── nonodb-cli/                # administrative CLI
+├── nonodb-client/             # Rust client crate and example
 ├── client/                    # Python client and tests
+│   ├── node/                  # zero-dependency Node.js client
+│   └── go/                    # context-aware Go client
 ├── scripts/                   # benchmarks, concurrency/crash/search tests
 ├── deploy/                    # systemd unit
 ├── docs/                      # documentation
@@ -47,6 +50,7 @@ and [HTTP API](api.md).
 - Rust stable with Cargo and a C compiler for LMDB.
 - Linux or macOS for the Unix-socket daemon. Windows builds are TCP-only.
 - Python 3.9+ and `httpx` for client tests. `orjson` is optional.
+- Node.js 18+ for the Node client; Go 1.22+ for the Go client.
 - For large benchmarks: enough disk space and a real filesystem (`ext4`), not
   tmpfs.
 
@@ -105,10 +109,11 @@ This runs:
   unique constraints, query planning, Top-K, limits, BM25, fuzzy search, and
   JSON edge cases;
 - property-based tests with `proptest` for encoding and basic query semantics;
-- a persistence/reopen integration test.
+- a persistence/reopen integration test;
+- Rust client unit/doc tests.
 
-The latest run before this documentation was written: **49 unit tests, 5
-property tests, 1 reopen test**, all passing.
+The latest run before this documentation was written: **49 core unit tests,
+5 property tests, 1 reopen test, and 2 Rust client unit tests**, all passing.
 
 ### End-to-end scripts
 
@@ -127,6 +132,15 @@ python3 scripts/search_variants_test.py      # search/query edge cases
 python3 scripts/compound_test.py             # compound/covering indexes, phrases
 python3 scripts/concurrency_test.py          # 12 processes, unique index races
 ```
+
+Client smoke tests can also be run together, including starting a disposable
+daemon:
+
+```bash
+bash scripts/clients_test.sh
+```
+
+This runs the Rust, Node.js, and Go clients against the same daemon.
 
 Some scripts expect to create their own collections and may leave data behind;
 use a disposable database.
@@ -178,6 +192,7 @@ scripts are:
 | `scripts/large_test.py` | 1M+ document load, indexes, query latency, RAM |
 | `scripts/large_crash_test.sh` | Crash during writes on a large database |
 | `scripts/uvicorn_test.sh` | 12 uvicorn workers against one daemon |
+| `scripts/clients_test.sh` | Rust, Node.js, Go client smoke tests |
 | `scripts/concurrency_test.py` | Independent writers/readers and unique indexes |
 
 Put benchmark data on the target filesystem. If `/tmp` is tmpfs, write
