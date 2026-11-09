@@ -1,0 +1,9 @@
+/target
+/data
+/.dev-data
+/.bench
+__pycache__/
+*.pyc
+*.sock
+*.mdb
+.env

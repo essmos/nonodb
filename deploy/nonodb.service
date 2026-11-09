@@ -1,0 +1,25 @@
+[Unit]
+Description=nonodb document database daemon
+After=network.target
+
+[Service]
+Type=simple
+User=nonodb
+Group=nonodb
+RuntimeDirectory=nonodb
+Environment=NONODB_DATA=/var/lib/nonodb
+Environment=NONODB_SOCK=/run/nonodb/nonodb.sock
+Environment=RUST_LOG=info
+ExecStart=/usr/local/bin/nonodb-daemon
+Restart=on-failure
+RestartSec=2
+
+# Ochrona systemu — daemon potrzebuje tylko swojego katalogu i runtime.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/nonodb /run/nonodb
+
+[Install]
+WantedBy=multi-user.target

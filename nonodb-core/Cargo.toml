@@ -1,0 +1,18 @@
+[package]
+name = "nonodb-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+heed = "0.20"
+serde.workspace = true
+serde_json.workspace = true
+sonic-rs = "0.5"
+unicode-normalization = "0.1"
+thiserror = "1"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"
+proptest = "1"
