@@ -3,8 +3,8 @@
 [![CI](https://github.com/essmos/nonodb/actions/workflows/ci.yml/badge.svg)](https://github.com/essmos/nonodb/actions/workflows/ci.yml)
 [![Release](https://github.com/essmos/nonodb/actions/workflows/release.yml/badge.svg)](https://github.com/essmos/nonodb/actions/workflows/release.yml)
 
-**A low-resource, crash-safe document database for application state,
-settings, and JSON-heavy configuration.**
+**A low-resource, crash-safe JSON document database — with a surprisingly
+large feature set under the hood.**
 
 nonodb is a local NoSQL document store written in Rust. It needs no external
 database server, keeps a tiny idle memory footprint, and runs comfortably on
@@ -12,6 +12,21 @@ small VMs, edge boxes, and developer machines. It speaks a practical subset of
 MongoDB's query language over HTTP/JSON, stores documents in LMDB, and runs as
 a single daemon that is the only process allowed to touch the database file.
 Application workers connect to it through a Unix socket and use a thin client.
+
+Low resource use is the starting point, not the whole story. Under the hood,
+nonodb is a real document database with:
+
+- JSON documents, MongoDB-style filters, projections, sorting and updates;
+- single-field, compound, unique and covering secondary indexes;
+- atomic `write_batch` for all-or-nothing groups of writes;
+- full-text search with **BM25** ranking, Unicode tokenization, diacritic
+  folding and quoted phrases;
+- fuzzy search using trigrams plus Levenshtein distance;
+- snapshots, online backup, authentication, TLS, metrics and a CLI.
+
+These are capabilities often split across several services or reserved for
+larger databases and paid enterprise editions. nonodb puts them in one small,
+MIT-licensed binary: no paid tier, no license keys, no feature gates.
 
 If you need a shared, queryable JSON store without operating PostgreSQL,
 MongoDB, or Redis, nonodb is aimed at you.
