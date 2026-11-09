@@ -6,7 +6,7 @@
 **A low-resource, crash-safe JSON document database — with a surprisingly
 large feature set under the hood.**
 
-**Idle daemon memory: about 5 MB RSS.** That is measured with a 1M-document
+**Idle daemon memory: about 5 MB RAM.** That is measured with a 1M-document
 database and three indexes after a restart. The on-disk LMDB file grows with
 the data and indexes; the ~5 MB figure is process memory, not the database
 file. Hot data stays in the OS page cache instead of the daemon heap.
