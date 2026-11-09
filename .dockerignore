@@ -1,0 +1,11 @@
+target
+.git
+.github
+data
+.dev-data
+.bench
+__pycache__
+*.pyc
+*.mdb
+*.sock
+.env

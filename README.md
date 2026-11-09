@@ -161,36 +161,54 @@ footprint.
 
 ## Quick start
 
+### Run on Linux (native)
+
 Requirements:
 
 - Rust stable (2021 edition; latest stable recommended) and Cargo.
-- Linux for the daemon (Unix sockets and `SO_PEERCRED` checks are Linux/Unix
-  features).
-- Python 3.9+ for the optional client (`httpx`; `orjson` is an optional speedup).
+- Linux/Unix. The daemon uses Unix sockets and `SO_PEERCRED`.
+- Python 3.9+ only if you want the optional Python client (`httpx`; `orjson`
+  is an optional speedup).
 
-Build:
+Build the release binaries:
 
 ```bash
 cargo build --release
 ```
 
-Run the daemon:
+The binaries are:
+
+```text
+target/release/nonodb-daemon
+target/release/nonodb-cli
+```
+
+Create the data and socket directories and start the daemon in the foreground:
 
 ```bash
-mkdir -p ./data
-NONODB_DATA=./data NONODB_SOCK=/tmp/nonodb.sock ./target/release/nonodb-daemon
+mkdir -p /tmp/nonodb-data /tmp/nonodb-run
+
+NONODB_DATA=/tmp/nonodb-data \
+NONODB_SOCK=/tmp/nonodb-run/nonodb.sock \
+RUST_LOG=info \
+./target/release/nonodb-daemon
+```
+
+Leave that terminal running. In a second terminal, verify the daemon:
+
+```bash
+export NONODB_SOCK=/tmp/nonodb-run/nonodb.sock
+./target/release/nonodb-cli ping
 ```
 
 Insert and query with `curl`:
 
 ```bash
-S=/tmp/nonodb.sock
-
-curl -s --unix-socket "$S" -H 'content-type: application/json' \
+curl -s --unix-socket "$NONODB_SOCK" -H 'content-type: application/json' \
   -X POST http://localhost/v1/exec \
   -d '{"op":"insert","coll":"users","doc":{"name":"Ada","age":36}}'
 
-curl -s --unix-socket "$S" -H 'content-type: application/json' \
+curl -s --unix-socket "$NONODB_SOCK" -H 'content-type: application/json' \
   -X POST http://localhost/v1/exec \
   -d '{"op":"find","coll":"users","filter":{"age":{"$gte":18}},"sort":[["age",-1]]}'
 ```
@@ -202,7 +220,7 @@ export PYTHONPATH="$PWD/client"
 python3 - <<'PY'
 from nonodb import NonoDB
 
-with NonoDB("/tmp/nonodb.sock") as db:
+with NonoDB("/tmp/nonodb-run/nonodb.sock") as db:
     users = db.collection("users")
     users.insert({"name": "Grace", "age": 41})
     print(users.find({"age": {"$gte": 18}}, sort=[("age", -1)]))
@@ -212,10 +230,74 @@ PY
 Use the CLI:
 
 ```bash
-NONODB_SOCK=/tmp/nonodb.sock ./target/release/nonodb-cli ping
-NONODB_SOCK=/tmp/nonodb.sock ./target/release/nonodb-cli count users '{}'
-NONODB_SOCK=/tmp/nonodb.sock ./target/release/nonodb-cli find users '{}' --sort age:desc --limit 5
+NONODB_SOCK=/tmp/nonodb-run/nonodb.sock ./target/release/nonodb-cli count users '{}'
+NONODB_SOCK=/tmp/nonodb-run/nonodb.sock ./target/release/nonodb-cli find users '{}' --sort age:desc --limit 5
 ```
+
+This runs in the foreground. For a production Linux service, use the systemd
+unit and installation steps in [Operations](docs/operations.md#deployment-with-systemd).
+
+### Run with Docker
+
+A published Docker image is not currently provided; build it from the
+repository:
+
+```bash
+git clone https://github.com/essmos/nonodb.git
+cd nonodb
+docker build -t nonodb:local .
+```
+
+The simplest way to use it from a process on the host is TCP on loopback with a
+bearer token:
+
+```bash
+docker volume create nonodb-data
+
+docker run -d --name nonodb \
+  -e NONODB_AUTH_TOKEN='replace-with-a-long-random-token' \
+  -e NONODB_TCP=0.0.0.0:7878 \
+  -p 127.0.0.1:7878:7878 \
+  -v nonodb-data:/var/lib/nonodb \
+  nonodb:local
+```
+
+Check health and logs:
+
+```bash
+curl -s http://127.0.0.1:7878/healthz
+docker logs nonodb
+```
+
+Connect from Python:
+
+```python
+from nonodb import NonoDB
+
+db = NonoDB(
+    base_url="http://127.0.0.1:7878",
+    token="replace-with-a-long-random-token",
+)
+print(db.collection("users").count())
+db.close()
+```
+
+The named volume `nonodb-data` persists `/var/lib/nonodb`. The container runs as
+the unprivileged `nonodb` user.
+
+For container-to-container access over a Unix socket, mount a shared volume at
+`/run/nonodb`, for example `-v nonodb-run:/run/nonodb`. The client container must
+be able to access the socket with a matching uid/gid. For host processes, TCP on
+`127.0.0.1` is usually simpler; add TLS if the listener is not loopback-only.
+
+Docker Compose example:
+
+```bash
+export NONODB_AUTH_TOKEN='replace-with-a-long-random-token'
+docker compose -f deploy/docker-compose.yml up -d
+```
+
+More deployment details: [Operations — Docker](docs/operations.md#docker).
 
 ## Documentation
 

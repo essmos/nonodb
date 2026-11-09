@@ -18,7 +18,8 @@ quick-start instructions, and a feature overview.
 
 ## Common tasks
 
-- **Install and run:** [README quick start](../README.md#quick-start)
+- **Run on Linux:** [README — Run on Linux](../README.md#run-on-linux-native)
+- **Run with Docker:** [README — Run with Docker](../README.md#run-with-docker)
 - **Expose nonodb to Python workers:** [Python client](python-client.md)
 - **Secure a deployment:** [Authentication](operations.md#authentication) and
   [TCP/TLS](operations.md#tcp-and-tls)

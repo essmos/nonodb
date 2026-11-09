@@ -1,0 +1,21 @@
+services:
+  nonodb:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: nonodb:local
+    container_name: nonodb
+    restart: unless-stopped
+    environment:
+      NONODB_AUTH_TOKEN: "${NONODB_AUTH_TOKEN:?Set NONODB_AUTH_TOKEN before starting}"
+      NONODB_TCP: "0.0.0.0:7878"
+      RUST_LOG: "info"
+    ports:
+      - "127.0.0.1:7878:7878"
+    volumes:
+      - nonodb-data:/var/lib/nonodb
+      - nonodb-run:/run/nonodb
+
+volumes:
+  nonodb-data:
+  nonodb-run:

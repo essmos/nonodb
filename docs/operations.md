@@ -115,50 +115,147 @@ stop. The socket itself is recreated by the daemon at startup.
 
 ## Docker
 
-Build:
+A public Docker image is not currently published. Build the image from the
+repository:
 
 ```bash
+git clone https://github.com/essmos/nonodb.git
+cd nonodb
 docker build -t nonodb:local .
 ```
 
-Run with named volumes:
+The `.dockerignore` file keeps `target/`, git metadata, local data, sockets, and
+Python caches out of the build context. The Dockerfile builds in a Rust image
+and copies only `nonodb-daemon` and `nonodb-cli` into a slim Debian runtime.
 
-```bash
-docker volume create nonodb-data
-docker volume create nonodb-run
-
-docker run -d \
-  --name nonodb \
-  -v nonodb-data:/var/lib/nonodb \
-  -v nonodb-run:/run/nonodb \
-  nonodb:local
-```
-
-The image runs as the `nonodb` user and uses:
+The image runs as the unprivileged `nonodb` user and sets:
 
 ```text
 NONODB_DATA=/var/lib/nonodb
 NONODB_SOCK=/run/nonodb/nonodb.sock
 ```
 
-To connect from another container, share the socket directory as a volume and
-set `NONODB_SOCK` to the mounted path. Alternatively expose TCP with a token
-and preferably TLS:
+### Host access over TCP
+
+The simplest way for a host process to reach a containerized daemon is a
+loopback-only TCP listener with a bearer token:
 
 ```bash
+docker volume create nonodb-data
+
 docker run -d --name nonodb \
-  -v nonodb-data:/var/lib/nonodb \
-  -e NONODB_AUTH_TOKEN='change-me' \
+  -e NONODB_AUTH_TOKEN='replace-with-a-long-random-token' \
   -e NONODB_TCP=0.0.0.0:7878 \
   -p 127.0.0.1:7878:7878 \
+  -v nonodb-data:/var/lib/nonodb \
   nonodb:local
 ```
 
-For TLS, mount certificate and key files and set `NONODB_TLS_CERT` and
-`NONODB_TLS_KEY`.
+Verify it:
 
-Do not bind-mount a single socket file. Mount the containing directory, because
-the socket is unlinked and recreated when the daemon starts.
+```bash
+curl -s http://127.0.0.1:7878/healthz
+docker logs nonodb
+```
+
+Use it from the Python client:
+
+```python
+from nonodb import NonoDB
+
+db = NonoDB(
+    base_url="http://127.0.0.1:7878",
+    token="replace-with-a-long-random-token",
+)
+print(db.collection("users").count())
+db.close()
+```
+
+TCP requires `NONODB_AUTH_TOKEN`. Keep the published port on `127.0.0.1` unless
+you add TLS and intentionally expose the service. See
+[TCP and TLS](#tcp-and-tls).
+
+The named volume persists the LMDB data directory. Removing the container does
+not remove the volume; remove it explicitly when you really want to delete the
+database.
+
+### Docker Compose
+
+The repository includes [`deploy/docker-compose.yml`](../deploy/docker-compose.yml):
+
+```bash
+export NONODB_AUTH_TOKEN='replace-with-a-long-random-token'
+docker compose -f deploy/docker-compose.yml up -d --build
+```
+
+Check and stop it:
+
+```bash
+docker compose -f deploy/docker-compose.yml logs -f nonodb
+docker compose -f deploy/docker-compose.yml down
+```
+
+`down` keeps the named volumes. Add `-v` only when you intend to delete the
+database and socket volumes.
+
+### Unix socket between containers
+
+To use the Unix socket instead of TCP, share a socket directory volume:
+
+```bash
+docker volume create nonodb-data
+docker volume create nonodb-run
+
+docker run -d --name nonodb \
+  -v nonodb-data:/var/lib/nonodb \
+  -v nonodb-run:/run/nonodb \
+  nonodb:local
+```
+
+The client container mounts the same `nonodb-run` volume and sets:
+
+```text
+NONODB_SOCK=/run/nonodb/nonodb.sock
+```
+
+The socket is created with mode `0660`. The client process must run with a uid
+or gid that can open it. Running both containers as the same user/gid is the
+simplest option. Do not bind-mount a single socket file: mount the containing
+directory, because the daemon unlinks and recreates the socket on startup.
+
+### TLS in Docker
+
+Mount the certificate and key read-only and set both variables:
+
+```bash
+docker run -d --name nonodb \
+  -e NONODB_AUTH_TOKEN='replace-with-a-long-random-token' \
+  -e NONODB_TCP=0.0.0.0:7878 \
+  -e NONODB_TLS_CERT=/certs/server.crt \
+  -e NONODB_TLS_KEY=/certs/server.key \
+  -p 127.0.0.1:7878:7878 \
+  -v /host/certs:/certs:ro \
+  -v nonodb-data:/var/lib/nonodb \
+  nonodb:local
+```
+
+Without a certificate and key pair, TCP runs in plaintext and logs a warning.
+With only one of the two variables set, the daemon refuses to start.
+
+### Backup from Docker
+
+Back up into a separate mounted directory:
+
+```bash
+docker run --rm \
+  -v nonodb-data:/var/lib/nonodb:ro \
+  -v /host/backups:/backups \
+  nonodb:local \
+  nonodb-cli backup /var/lib/nonodb /backups/$(date -u +%Y%m%dT%H%M%SZ)
+```
+
+The backup command opens the source read-only and writes a compacted
+`data.mdb` into the destination directory.
 
 ## Permissions
 
