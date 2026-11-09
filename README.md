@@ -1,13 +1,14 @@
 # nonodb
 
-**A small, crash-safe document database for application state, settings, and
-JSON-heavy configuration.**
+**A low-resource, crash-safe document database for application state,
+settings, and JSON-heavy configuration.**
 
-nonodb is a local NoSQL document store written in Rust. It speaks a practical
-subset of MongoDB's query language over HTTP/JSON, stores documents in LMDB,
-and runs as a single daemon that is the only process allowed to touch the
-database file. Application workers connect to it through a Unix socket and use
-a thin client.
+nonodb is a local NoSQL document store written in Rust. It needs no external
+database server, keeps a tiny idle memory footprint, and runs comfortably on
+small VMs, edge boxes, and developer machines. It speaks a practical subset of
+MongoDB's query language over HTTP/JSON, stores documents in LMDB, and runs as
+a single daemon that is the only process allowed to touch the database file.
+Application workers connect to it through a Unix socket and use a thin client.
 
 If you need a shared, queryable JSON store without operating PostgreSQL,
 MongoDB, or Redis, nonodb is aimed at you.
