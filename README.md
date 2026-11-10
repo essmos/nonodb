@@ -30,6 +30,7 @@ nonodb is a real document database with:
 - a read-only aggregation pipeline for reporting and summaries;
 - snapshots, online backup, authentication, TLS, metrics and a CLI;
 - document revision history with global revision IDs and configurable retention;
+- optional vault collections with whole-document encryption and per-tenant keys;
 - a bounded daemon read cache, invalidated after every committed write;
 - optional automatic indexes for frequent query shapes, with TTL cleanup.
 
@@ -228,6 +229,45 @@ curl -s --unix-socket /tmp/nonodb.sock \
 See [Document history](docs/api.md#document-history) for the full request and
 retention semantics.
 
+### Vault collections (optional encryption)
+
+- Opt-in `profile: "vault"` collection; standard collections are unchanged.
+- Whole-document XChaCha20-Poly1305 encryption; only `_id` and `tenant_id` remain
+  plaintext.
+- Per-request tenant key in headers: `X-NonoDB-Tenant`,
+  `X-NonoDB-Key-Id`, `X-NonoDB-Key`.
+- AAD binds ciphertext to collection, tenant, `_id`, and key id.
+- Restricted API: CRUD by `_id`, list/count by `tenant_id`, history; no search,
+  fuzzy, aggregation, secondary indexes, arbitrary filters, or sorting.
+- History stores ciphertext and decrypts snapshots only for an authenticated
+  key.
+- Cache and automatic indexes are disabled for vault collections.
+
+Create and use a vault collection:
+
+```bash
+KEY=$(python3 -c 'import base64, os; print(base64.b64encode(os.urandom(32)).decode())')
+
+curl -s --unix-socket /tmp/nonodb.sock \
+  -H 'content-type: application/json' \
+  -d '{"op":"create_collection","coll":"vault","profile":"vault"}' \
+  http://localhost/v1/exec
+
+curl -s --unix-socket /tmp/nonodb.sock \
+  -H 'content-type: application/json' \
+  -H 'X-NonoDB-Tenant: acme' \
+  -H 'X-NonoDB-Key-Id: acme:v1' \
+  -H "X-NonoDB-Key: $KEY" \
+  -d '{"op":"insert","coll":"vault","doc":{"tenant_id":"acme","notes":"secret"}}' \
+  http://localhost/v1/exec
+```
+
+This is daemon-side encryption, not end-to-end encryption: the daemon sees
+plaintext and the raw key in memory. Use it for encryption at rest when you can
+accept the loss of query features. See
+[Vault collections](docs/vault.md) for the full contract, limitations, key
+rotation, and best-fit guidance.
+
 ### Operations
 
 - Single daemon; Unix socket by default, optional TCP.
@@ -343,7 +383,7 @@ unit and installation steps in [Operations](docs/operations.md#deployment-with-s
 Download the archive matching your CPU (`uname -m` prints `arm64` or `x86_64`):
 
 ```bash
-TAG=v0.3.0
+TAG=v0.4.0
 curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/nonodb-$TAG-macos-arm64.tar.gz"
 tar -xzf "nonodb-$TAG-macos-arm64.tar.gz"
 cd "nonodb-$TAG-macos-arm64"
@@ -467,6 +507,7 @@ More deployment details: [Operations — Docker](docs/operations.md#docker).
 | [HTTP API](docs/api.md) | Every operation, request/response shapes, filters, updates, indexes, search, errors |
 | [Clients](docs/clients.md) | Python, Rust, Node.js and Go clients: install, CRUD, batches, indexes, search, TCP/TLS |
 | [Python client](docs/python-client.md) | `NonoDB`/`Collection` API, caching, retries, TCP/TLS, FastAPI usage |
+| [Vault collections](docs/vault.md) | Optional encrypted tenant data, headers, restrictions, key rotation |
 | [CLI](docs/cli.md) | `ping`, `find`, `count`, `backup`, `restore`, `inspect`, `exec` |
 | [Operations](docs/operations.md) | Configuration, deployment, security, snapshots, monitoring, capacity, troubleshooting |
 | [Benchmarks](docs/benchmarks.md) | Test environment, throughput, latency, large data sets, RAM, reproducibility |
@@ -506,7 +547,7 @@ results. Visit [liveapisec.com](https://liveapisec.com) to learn more.
 
 ## Status
 
-nonodb is an early-stage project (`0.3.0`). Its core storage, query, index,
+nonodb is an early-stage project (`0.4.0`). Its core storage, query, index,
 search, batching, security, snapshot, and operational paths are covered by unit,
 property-based, end-to-end, concurrency, crash, and large-data tests. The API
 may still change before a stable release.

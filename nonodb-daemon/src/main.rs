@@ -28,8 +28,10 @@ use hyper_util::service::TowerToHyperService;
 use serde_json::{json, Value};
 
 use nonodb_core::heed::RoTxn;
-use nonodb_core::{FindQuery, HistoryConfig, Store, DEFAULT_FUZZY_DISTANCE};
-use protocol::{ApiError, ApiResponse, Request, WriteReq};
+use nonodb_core::{
+    vault, CollectionProfile, FindQuery, HistoryConfig, Store, VaultKey, DEFAULT_FUZZY_DISTANCE,
+};
+use protocol::{ApiError, ApiResponse, Request, VaultAuth, WriteReq};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
@@ -337,6 +339,36 @@ async fn metrics_handler(headers: HeaderMap) -> (StatusCode, Json<Value>) {
     (StatusCode::OK, Json(metrics::snapshot()))
 }
 
+fn header_value(headers: &HeaderMap, name: &str) -> Result<Option<String>, ApiError> {
+    match headers.get(name) {
+        None => Ok(None),
+        Some(value) => value
+            .to_str()
+            .map(|s| Some(s.to_string()))
+            .map_err(|_| ApiError {
+                code: "invalid_vault_key".into(),
+                message: format!("header `{name}` is not valid UTF-8"),
+            }),
+    }
+}
+
+/// Parses the optional vault headers. All three must be present together.
+fn vault_auth(headers: &HeaderMap) -> Result<Option<VaultAuth>, ApiError> {
+    let tenant = header_value(headers, "x-nonodb-tenant")?;
+    let kid = header_value(headers, "x-nonodb-key-id")?;
+    let key = header_value(headers, "x-nonodb-key")?;
+    if tenant.is_none() && kid.is_none() && key.is_none() {
+        return Ok(None);
+    }
+    let (Some(tenant), Some(kid), Some(key)) = (tenant, kid, key) else {
+        return Err(vault::key_required().into());
+    };
+    vault::validate_context(&tenant, &kid)?;
+    let key = zeroize::Zeroizing::new(key);
+    let key = VaultKey::from_base64(key.as_str())?;
+    Ok(Some(VaultAuth { key, kid, tenant }))
+}
+
 async fn exec(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -349,7 +381,11 @@ async fn exec(
             message: "missing or invalid bearer token".into(),
         }));
     }
-    let cache_key = if cacheable(&req) {
+    let vault_auth = match vault_auth(&headers) {
+        Ok(auth) => auth,
+        Err(err) => return respond(Err(err)),
+    };
+    let cache_key = if vault_auth.is_none() && cacheable(&req) {
         state.cache.key(&req)
     } else {
         None
@@ -357,12 +393,16 @@ async fn exec(
     let cache_version = state.cache.version();
     if let Some(key) = cache_key.as_deref() {
         if let Some(value) = state.cache.get(key) {
-            state.auto_index.record(&req, false);
+            if vault_auth.is_none() {
+                state.auto_index.record(&req, false);
+            }
             metrics::inc(&metrics::READ_OPS);
             return respond(Ok(value));
         }
     }
-    state.auto_index.record(&req, true);
+    if vault_auth.is_none() {
+        state.auto_index.record(&req, true);
+    }
 
     let response = match req {
         Request::Find {
@@ -374,8 +414,9 @@ async fn exec(
             limit,
         } => {
             let store = state.store.clone();
+            let auth = vault_auth.clone();
             let joined = tokio::task::spawn_blocking(move || {
-                let c = store.collection(&coll)?;
+                let c = read_collection(&store, &coll, auth.as_ref())?;
                 let query = FindQuery {
                     filter,
                     projection,
@@ -383,7 +424,18 @@ async fn exec(
                     skip,
                     limit,
                 };
-                Ok::<Value, ApiError>(Value::Array(c.find(&query)?))
+                if c.profile().is_vault() {
+                    let auth = auth.as_ref().ok_or_else(vault::key_required)?;
+                    let rtxn = store.read_txn()?;
+                    let out = c.find_vault_in(&rtxn, &query, &auth.key, &auth.tenant, &auth.kid)?;
+                    rtxn.commit().map_err(nonodb_core::Error::from)?;
+                    Ok::<Value, ApiError>(Value::Array(out))
+                } else {
+                    if auth.is_some() {
+                        return Err(vault::key_unexpected().into());
+                    }
+                    Ok::<Value, ApiError>(Value::Array(c.find(&query)?))
+                }
             });
             read_result(joined).await
         }
@@ -394,8 +446,9 @@ async fn exec(
             projection,
         } => {
             let store = state.store.clone();
+            let auth = vault_auth.clone();
             let joined = tokio::task::spawn_blocking(move || {
-                let c = store.collection(&coll)?;
+                let c = read_collection(&store, &coll, auth.as_ref())?;
                 let query = FindQuery {
                     filter,
                     projection,
@@ -403,24 +456,49 @@ async fn exec(
                     skip: 0,
                     limit: Some(1),
                 };
-                Ok::<Value, ApiError>(c.find(&query)?.into_iter().next().unwrap_or(Value::Null))
+                if c.profile().is_vault() {
+                    let auth = auth.as_ref().ok_or_else(vault::key_required)?;
+                    let rtxn = store.read_txn()?;
+                    let out = c.find_vault_in(&rtxn, &query, &auth.key, &auth.tenant, &auth.kid)?;
+                    rtxn.commit().map_err(nonodb_core::Error::from)?;
+                    Ok::<Value, ApiError>(out.into_iter().next().unwrap_or(Value::Null))
+                } else {
+                    if auth.is_some() {
+                        return Err(vault::key_unexpected().into());
+                    }
+                    Ok::<Value, ApiError>(c.find(&query)?.into_iter().next().unwrap_or(Value::Null))
+                }
             });
             read_result(joined).await
         }
 
         Request::Count { coll, filter } => {
             let store = state.store.clone();
+            let auth = vault_auth.clone();
             let joined = tokio::task::spawn_blocking(move || {
-                let c = store.collection(&coll)?;
-                Ok::<Value, ApiError>(json!({ "count": c.count(&filter)? }))
+                let c = read_collection(&store, &coll, auth.as_ref())?;
+                if c.profile().is_vault() {
+                    let auth = auth.as_ref().ok_or_else(vault::key_required)?;
+                    let rtxn = store.read_txn()?;
+                    let n = c.count_vault_in(&rtxn, &filter, &auth.tenant)?;
+                    rtxn.commit().map_err(nonodb_core::Error::from)?;
+                    Ok::<Value, ApiError>(json!({ "count": n }))
+                } else {
+                    if auth.is_some() {
+                        return Err(vault::key_unexpected().into());
+                    }
+                    Ok::<Value, ApiError>(json!({ "count": c.count(&filter)? }))
+                }
             });
             read_result(joined).await
         }
 
         Request::Aggregate { coll, pipeline } => {
             let store = state.store.clone();
+            let auth = vault_auth.clone();
             let joined = tokio::task::spawn_blocking(move || {
-                let c = store.collection(&coll)?;
+                let c = read_collection(&store, &coll, auth.as_ref())?;
+                reject_vault_read(&c, auth.as_ref(), "aggregation")?;
                 Ok::<Value, ApiError>(json!({ "results": c.aggregate(&pipeline)? }))
             });
             read_result(joined).await
@@ -428,8 +506,10 @@ async fn exec(
 
         Request::ListIndexes { coll } => {
             let store = state.store.clone();
+            let auth = vault_auth.clone();
             let joined = tokio::task::spawn_blocking(move || {
-                let c = store.collection(&coll)?;
+                let c = read_collection(&store, &coll, auth.as_ref())?;
+                reject_vault_read(&c, auth.as_ref(), "index listing")?;
                 let list: Vec<Value> = c
                     .list_index_defs()?
                     .into_iter()
@@ -449,8 +529,10 @@ async fn exec(
 
         Request::ListTextIndexes { coll } => {
             let store = state.store.clone();
+            let auth = vault_auth.clone();
             let joined = tokio::task::spawn_blocking(move || {
-                let c = store.collection(&coll)?;
+                let c = read_collection(&store, &coll, auth.as_ref())?;
+                reject_vault_read(&c, auth.as_ref(), "text index listing")?;
                 Ok::<Value, ApiError>(json!({ "text_indexes": c.list_text_indexes()? }))
             });
             read_result(joined).await
@@ -458,8 +540,10 @@ async fn exec(
 
         Request::ListFuzzyIndexes { coll } => {
             let store = state.store.clone();
+            let auth = vault_auth.clone();
             let joined = tokio::task::spawn_blocking(move || {
-                let c = store.collection(&coll)?;
+                let c = read_collection(&store, &coll, auth.as_ref())?;
+                reject_vault_read(&c, auth.as_ref(), "fuzzy index listing")?;
                 Ok::<Value, ApiError>(json!({ "fuzzy_indexes": c.list_fuzzy_indexes()? }))
             });
             read_result(joined).await
@@ -474,8 +558,10 @@ async fn exec(
             limit,
         } => {
             let store = state.store.clone();
+            let auth = vault_auth.clone();
             let joined = tokio::task::spawn_blocking(move || {
-                let c = store.collection(&coll)?;
+                let c = read_collection(&store, &coll, auth.as_ref())?;
+                reject_vault_read(&c, auth.as_ref(), "full-text search")?;
                 Ok::<Value, ApiError>(json!({
                     "results": c.search(&field, &query, &filter, skip, limit)?
                 }))
@@ -492,8 +578,10 @@ async fn exec(
             limit,
         } => {
             let store = state.store.clone();
+            let auth = vault_auth.clone();
             let joined = tokio::task::spawn_blocking(move || {
-                let c = store.collection(&coll)?;
+                let c = read_collection(&store, &coll, auth.as_ref())?;
+                reject_vault_read(&c, auth.as_ref(), "fuzzy search")?;
                 let distance = max_distance.unwrap_or(DEFAULT_FUZZY_DISTANCE);
                 Ok::<Value, ApiError>(json!({
                     "results": c.fuzzy_search(&field, &query, distance, &filter, limit)?
@@ -509,20 +597,59 @@ async fn exec(
             include_docs,
         } => {
             let store = state.store.clone();
+            let auth = vault_auth.clone();
             let joined = tokio::task::spawn_blocking(move || {
-                let c = store.collection(&coll)?;
-                Ok::<Value, ApiError>(json!({
-                    "revisions": c.history(&id, limit, include_docs)?
-                }))
+                let c = read_collection(&store, &coll, auth.as_ref())?;
+                if c.profile().is_vault() {
+                    let auth = auth.as_ref().ok_or_else(vault::key_required)?;
+                    let rtxn = store.read_txn()?;
+                    let revisions = c.history_vault_in(
+                        &rtxn,
+                        &id,
+                        limit,
+                        include_docs,
+                        &auth.key,
+                        &auth.tenant,
+                        &auth.kid,
+                    )?;
+                    rtxn.commit().map_err(nonodb_core::Error::from)?;
+                    Ok::<Value, ApiError>(json!({ "revisions": revisions }))
+                } else {
+                    if auth.is_some() {
+                        return Err(vault::key_unexpected().into());
+                    }
+                    Ok::<Value, ApiError>(json!({
+                        "revisions": c.history(&id, limit, include_docs)?
+                    }))
+                }
             });
             read_result(joined).await
         }
 
         Request::GetVersion { coll, id, version } => {
             let store = state.store.clone();
+            let auth = vault_auth.clone();
             let joined = tokio::task::spawn_blocking(move || {
-                let c = store.collection(&coll)?;
-                let entry = c.get_version(&id, version)?;
+                let c = read_collection(&store, &coll, auth.as_ref())?;
+                let entry = if c.profile().is_vault() {
+                    let auth = auth.as_ref().ok_or_else(vault::key_required)?;
+                    let rtxn = store.read_txn()?;
+                    let entry = c.get_version_vault_in(
+                        &rtxn,
+                        &id,
+                        version,
+                        &auth.key,
+                        &auth.tenant,
+                        &auth.kid,
+                    )?;
+                    rtxn.commit().map_err(nonodb_core::Error::from)?;
+                    entry
+                } else {
+                    if auth.is_some() {
+                        return Err(vault::key_unexpected().into());
+                    }
+                    c.get_version(&id, version)?
+                };
                 let value = serde_json::to_value(entry)
                     .map_err(nonodb_core::Error::from)
                     .map_err(ApiError::from)?;
@@ -532,6 +659,11 @@ async fn exec(
         }
 
         Request::Batch { ops } => {
+            if vault_auth.is_some() {
+                return respond(Err(
+                    vault::unsupported("batch reads on vault collections").into()
+                ));
+            }
             let store = state.store.clone();
             let n = ops.len();
             metrics::add(&metrics::BATCH_OPS, n as u64);
@@ -556,6 +688,11 @@ async fn exec(
         }
 
         Request::WriteBatch { ops } => {
+            if vault_auth.is_some() {
+                return respond(Err(
+                    vault::unsupported("write_batch on vault collections").into()
+                ));
+            }
             let req = WriteReq::Batch {
                 ops: ops.into_iter().map(WriteReq::from).collect(),
             };
@@ -564,8 +701,16 @@ async fn exec(
 
         write_req => {
             let req = match write_req {
-                Request::Insert { coll, doc } => WriteReq::Insert { coll, doc },
-                Request::InsertMany { coll, docs } => WriteReq::InsertMany { coll, docs },
+                Request::Insert { coll, doc } => WriteReq::Insert {
+                    coll,
+                    doc,
+                    vault: vault_auth.clone(),
+                },
+                Request::InsertMany { coll, docs } => WriteReq::InsertMany {
+                    coll,
+                    docs,
+                    vault: vault_auth.clone(),
+                },
                 Request::Update {
                     coll,
                     filter,
@@ -578,6 +723,7 @@ async fn exec(
                     update,
                     multi,
                     upsert,
+                    vault: vault_auth.clone(),
                 },
                 Request::Delete {
                     coll,
@@ -587,7 +733,18 @@ async fn exec(
                     coll,
                     filter,
                     multi,
+                    vault: vault_auth.clone(),
                 },
+                Request::CreateCollection { coll, profile } => {
+                    let profile = match profile {
+                        Some(raw) => match CollectionProfile::parse(&raw) {
+                            Ok(p) => p,
+                            Err(e) => return respond(Err(e.into())),
+                        },
+                        None => CollectionProfile::Standard,
+                    };
+                    WriteReq::CreateCollection { coll, profile }
+                }
                 Request::CreateIndex {
                     coll,
                     field,
@@ -654,6 +811,35 @@ fn cacheable(req: &Request) -> bool {
     )
 }
 
+fn read_collection<'a>(
+    store: &'a Store,
+    coll: &str,
+    auth: Option<&VaultAuth>,
+) -> Result<nonodb_core::Collection<'a>, ApiError> {
+    if auth.is_some() {
+        match store.collection_profile(coll)? {
+            Some(CollectionProfile::Vault) => {}
+            Some(CollectionProfile::Standard) => return Err(vault::key_unexpected().into()),
+            None => return Err(vault::not_a_vault_collection().into()),
+        }
+    }
+    Ok(store.collection(coll)?)
+}
+
+fn reject_vault_read(
+    c: &nonodb_core::Collection<'_>,
+    auth: Option<&VaultAuth>,
+    operation: &str,
+) -> Result<(), ApiError> {
+    if c.profile().is_vault() {
+        return Err(vault::unsupported(operation).into());
+    }
+    if auth.is_some() {
+        return Err(vault::key_unexpected().into());
+    }
+    Ok(())
+}
+
 async fn submit_write(state: &AppState, req: WriteReq) -> (StatusCode, Json<ApiResponse>) {
     let (tx, rx) = tokio::sync::oneshot::channel();
     metrics::inc(&metrics::WRITE_OPS);
@@ -698,6 +884,9 @@ fn execute_read(store: &Store, rtxn: &RoTxn<'_>, req: Request) -> Result<Value, 
             let Some(c) = store.collection_at(rtxn, &coll)? else {
                 return Ok(json!([]));
             };
+            if c.profile().is_vault() {
+                return Err(vault::unsupported("batch reads on vault collections").into());
+            }
             let query = FindQuery {
                 filter,
                 projection,
@@ -715,24 +904,36 @@ fn execute_read(store: &Store, rtxn: &RoTxn<'_>, req: Request) -> Result<Value, 
             let Some(c) = store.collection_at(rtxn, &coll)? else {
                 return Ok(Value::Null);
             };
+            if c.profile().is_vault() {
+                return Err(vault::unsupported("batch reads on vault collections").into());
+            }
             Ok(json!(c.find_one_in(rtxn, &filter, projection.as_ref())?))
         }
         Request::Count { coll, filter } => {
             let Some(c) = store.collection_at(rtxn, &coll)? else {
                 return Ok(json!({ "count": 0 }));
             };
+            if c.profile().is_vault() {
+                return Err(vault::unsupported("batch reads on vault collections").into());
+            }
             Ok(json!({ "count": c.count_in(rtxn, &filter)? }))
         }
         Request::Aggregate { coll, pipeline } => {
             let Some(c) = store.collection_at(rtxn, &coll)? else {
                 return Ok(json!({ "results": [] }));
             };
+            if c.profile().is_vault() {
+                return Err(vault::unsupported("batch reads on vault collections").into());
+            }
             Ok(json!({ "results": c.aggregate_in(rtxn, &pipeline)? }))
         }
         Request::ListIndexes { coll } => {
             let Some(c) = store.collection_at(rtxn, &coll)? else {
                 return Ok(json!({ "indexes": [] }));
             };
+            if c.profile().is_vault() {
+                return Err(vault::unsupported("batch reads on vault collections").into());
+            }
             let list: Vec<Value> = c
                 .index_defs_in(rtxn)?
                 .into_iter()
@@ -751,12 +952,18 @@ fn execute_read(store: &Store, rtxn: &RoTxn<'_>, req: Request) -> Result<Value, 
             let Some(c) = store.collection_at(rtxn, &coll)? else {
                 return Ok(json!({ "text_indexes": [] }));
             };
+            if c.profile().is_vault() {
+                return Err(vault::unsupported("batch reads on vault collections").into());
+            }
             Ok(json!({ "text_indexes": c.list_text_indexes_in(rtxn)? }))
         }
         Request::ListFuzzyIndexes { coll } => {
             let Some(c) = store.collection_at(rtxn, &coll)? else {
                 return Ok(json!({ "fuzzy_indexes": [] }));
             };
+            if c.profile().is_vault() {
+                return Err(vault::unsupported("batch reads on vault collections").into());
+            }
             Ok(json!({ "fuzzy_indexes": c.list_fuzzy_indexes_in(rtxn)? }))
         }
         Request::Search {
@@ -773,6 +980,9 @@ fn execute_read(store: &Store, rtxn: &RoTxn<'_>, req: Request) -> Result<Value, 
                 ))
                 .into());
             };
+            if c.profile().is_vault() {
+                return Err(vault::unsupported("batch reads on vault collections").into());
+            }
             Ok(json!({
                 "results": c.search_in(rtxn, &field, &query, &filter, skip, limit)?
             }))
@@ -791,6 +1001,9 @@ fn execute_read(store: &Store, rtxn: &RoTxn<'_>, req: Request) -> Result<Value, 
                 ))
                 .into());
             };
+            if c.profile().is_vault() {
+                return Err(vault::unsupported("batch reads on vault collections").into());
+            }
             let distance = max_distance.unwrap_or(DEFAULT_FUZZY_DISTANCE);
             Ok(json!({
                 "results": c.fuzzy_search_in(rtxn, &field, &query, distance, &filter, limit)?
@@ -805,6 +1018,9 @@ fn execute_read(store: &Store, rtxn: &RoTxn<'_>, req: Request) -> Result<Value, 
             let Some(c) = store.collection_at(rtxn, &coll)? else {
                 return Ok(json!({ "revisions": [] }));
             };
+            if c.profile().is_vault() {
+                return Err(vault::unsupported("batch reads on vault collections").into());
+            }
             Ok(json!({
                 "revisions": c.history_in(rtxn, &id, limit, include_docs)?
             }))
@@ -813,6 +1029,9 @@ fn execute_read(store: &Store, rtxn: &RoTxn<'_>, req: Request) -> Result<Value, 
             let Some(c) = store.collection_at(rtxn, &coll)? else {
                 return Ok(Value::Null);
             };
+            if c.profile().is_vault() {
+                return Err(vault::unsupported("batch reads on vault collections").into());
+            }
             let entry = c.get_version_in(rtxn, &id, version)?;
             Ok(serde_json::to_value(entry).map_err(nonodb_core::Error::from)?)
         }
@@ -849,8 +1068,22 @@ fn respond(res: Result<Value, ApiError>) -> (StatusCode, Json<ApiResponse>) {
         Err(err) => {
             metrics::inc(&metrics::ERRORS);
             let status = match err.code.as_str() {
-                "duplicate_key" | "invalid_id" | "invalid_query" | "invalid_json"
-                | "invalid_collection" => StatusCode::BAD_REQUEST,
+                "duplicate_key"
+                | "invalid_id"
+                | "invalid_query"
+                | "invalid_json"
+                | "invalid_collection"
+                | "vault_key_required"
+                | "vault_key_unexpected"
+                | "invalid_vault_key"
+                | "tenant_mismatch"
+                | "unsupported_encrypted_operation"
+                | "decryption_failed"
+                | "not_a_vault_collection"
+                | "invalid_vault_filter"
+                | "invalid_vault_document"
+                | "vault_profile_immutable"
+                | "invalid_collection_profile" => StatusCode::BAD_REQUEST,
                 "unauthorized" => StatusCode::UNAUTHORIZED,
                 "document_too_large" => StatusCode::PAYLOAD_TOO_LARGE,
                 _ => StatusCode::INTERNAL_SERVER_ERROR,

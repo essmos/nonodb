@@ -3,6 +3,26 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use nonodb_core::{CollectionProfile, VaultKey};
+
+/// Per-request vault credentials. Never format the key.
+#[derive(Clone)]
+pub struct VaultAuth {
+    pub key: VaultKey,
+    pub kid: String,
+    pub tenant: String,
+}
+
+impl std::fmt::Debug for VaultAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VaultAuth")
+            .field("key", &"<redacted>")
+            .field("kid", &self.kid)
+            .field("tenant", &self.tenant)
+            .finish()
+    }
+}
+
 /// Request to `/v1/exec`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -149,6 +169,12 @@ pub enum Request {
         ops: Vec<WriteOp>,
     },
     ListCollections,
+    /// Creates a collection explicitly. `profile` is `standard` (default) or `vault`.
+    CreateCollection {
+        coll: String,
+        #[serde(default)]
+        profile: Option<String>,
+    },
 }
 
 /// Write operation allowed in an atomic `write_batch`.
@@ -188,10 +214,12 @@ pub enum WriteReq {
     Insert {
         coll: String,
         doc: Value,
+        vault: Option<VaultAuth>,
     },
     InsertMany {
         coll: String,
         docs: Vec<Value>,
+        vault: Option<VaultAuth>,
     },
     Update {
         coll: String,
@@ -199,11 +227,17 @@ pub enum WriteReq {
         update: Value,
         multi: bool,
         upsert: bool,
+        vault: Option<VaultAuth>,
     },
     Delete {
         coll: String,
         filter: Value,
         multi: bool,
+        vault: Option<VaultAuth>,
+    },
+    CreateCollection {
+        coll: String,
+        profile: CollectionProfile,
     },
     CreateIndex {
         coll: String,
@@ -268,8 +302,16 @@ impl WriteReq {
 impl From<WriteOp> for WriteReq {
     fn from(op: WriteOp) -> Self {
         match op {
-            WriteOp::Insert { coll, doc } => WriteReq::Insert { coll, doc },
-            WriteOp::InsertMany { coll, docs } => WriteReq::InsertMany { coll, docs },
+            WriteOp::Insert { coll, doc } => WriteReq::Insert {
+                coll,
+                doc,
+                vault: None,
+            },
+            WriteOp::InsertMany { coll, docs } => WriteReq::InsertMany {
+                coll,
+                docs,
+                vault: None,
+            },
             WriteOp::Update {
                 coll,
                 filter,
@@ -282,6 +324,7 @@ impl From<WriteOp> for WriteReq {
                 update,
                 multi,
                 upsert,
+                vault: None,
             },
             WriteOp::Delete {
                 coll,
@@ -291,6 +334,7 @@ impl From<WriteOp> for WriteReq {
                 coll,
                 filter,
                 multi,
+                vault: None,
             },
         }
     }
@@ -308,6 +352,7 @@ impl From<nonodb_core::Error> for ApiError {
             E::Json(_) | E::JsonFast(_) => "invalid_json",
             E::Lmdb(_) => "storage",
             E::Io(_) => "io",
+            E::Vault { code, .. } => *code,
         };
         Self {
             code: code.to_string(),

@@ -19,6 +19,7 @@ pub mod index;
 pub mod query;
 pub mod search;
 pub mod store;
+pub mod vault;
 
 pub use aggregate::MAX_AGGREGATE_DOCS;
 pub use collection::{Collection, FindQuery, UpdateOutcome};
@@ -27,6 +28,7 @@ pub use history::{HistoryConfig, HistoryEntry, DEFAULT_HISTORY_MAX_VERSIONS};
 pub use index::{IndexDef, RangeBytes};
 pub use search::DEFAULT_FUZZY_DISTANCE;
 pub use store::{Store, MAP_SIZE, MAX_DBS, MAX_DOCUMENT_BYTES, META_DB, PAGE_SIZE};
+pub use vault::{CollectionProfile, VaultKey};
 
 // Re-export `heed` so the daemon layer can operate on `RwTxn`
 // without a separate dependency (version consistency).

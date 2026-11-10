@@ -16,6 +16,7 @@ use crate::index::{self, IndexDef};
 use crate::query::{apply_update, apply_upsert, matches, path, seed_from_filter};
 use crate::search;
 use crate::store::MAX_DOCUMENT_BYTES;
+use crate::vault::{self, CollectionProfile, VaultKey};
 
 /// Minimum document count for a sorted full scan to use multiple threads.
 #[cfg(not(test))]
@@ -162,6 +163,7 @@ pub struct Collection<'e> {
     history: Database<Bytes, Bytes>,
     history_config: HistoryConfig,
     name: String,
+    profile: CollectionProfile,
     env: &'e Env,
 }
 
@@ -173,6 +175,7 @@ impl<'e> Collection<'e> {
         history: Database<Bytes, Bytes>,
         history_config: HistoryConfig,
         name: String,
+        profile: CollectionProfile,
     ) -> Self {
         Self {
             db,
@@ -180,12 +183,37 @@ impl<'e> Collection<'e> {
             history,
             history_config,
             name,
+            profile,
             env,
         }
     }
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Collection profile (`standard` or `vault`).
+    pub fn profile(&self) -> CollectionProfile {
+        self.profile
+    }
+
+    fn ensure_vault(&self) -> Result<()> {
+        if self.profile.is_vault() {
+            Ok(())
+        } else {
+            Err(Error::Vault {
+                code: "not_a_vault_collection",
+                message: format!("collection `{}` is not a vault collection", self.name),
+            })
+        }
+    }
+
+    fn ensure_standard(&self) -> Result<()> {
+        if self.profile.is_vault() {
+            Err(vault::standard_write_forbidden())
+        } else {
+            Ok(())
+        }
     }
 
     // ----------------------------- indexes -----------------------------
@@ -244,6 +272,7 @@ impl<'e> Collection<'e> {
         unique: bool,
         include: &[String],
     ) -> Result<()> {
+        self.ensure_standard()?;
         if fields.is_empty() {
             return Err(Error::Query("index requires at least one field".into()));
         }
@@ -543,6 +572,7 @@ impl<'e> Collection<'e> {
     }
 
     pub fn create_text_index_txn(&self, wtxn: &mut RwTxn<'_>, field: &str) -> Result<()> {
+        self.ensure_standard()?;
         let def_key = search::text_def_key(&self.name, field);
         if self.meta.get(&*wtxn, def_key.as_bytes())?.is_some() {
             return Ok(());
@@ -632,6 +662,7 @@ impl<'e> Collection<'e> {
     }
 
     pub fn create_fuzzy_index_txn(&self, wtxn: &mut RwTxn<'_>, field: &str) -> Result<()> {
+        self.ensure_standard()?;
         let def_key = search::fuzzy_def_key(&self.name, field);
         if self.meta.get(&*wtxn, def_key.as_bytes())?.is_some() {
             return Ok(());
@@ -997,6 +1028,7 @@ impl<'e> Collection<'e> {
 
     /// Inserts a document in the given transaction. Assigns `_id` (UUID v4) if missing.
     pub fn insert_one_txn(&self, wtxn: &mut RwTxn<'_>, mut doc: Value) -> Result<String> {
+        self.ensure_standard()?;
         let obj = doc
             .as_object_mut()
             .ok_or_else(|| Error::Query("document must be an object".into()))?;
@@ -1037,6 +1069,7 @@ impl<'e> Collection<'e> {
         multi: bool,
         upsert: bool,
     ) -> Result<UpdateOutcome> {
+        self.ensure_standard()?;
         let keys = self.matching_keys(&*wtxn, filter, multi)?;
         if keys.is_empty() {
             if !upsert {
@@ -1127,6 +1160,7 @@ impl<'e> Collection<'e> {
 
     /// Deletes matching documents. Returns the number deleted.
     pub fn delete_txn(&self, wtxn: &mut RwTxn<'_>, filter: &Value, multi: bool) -> Result<usize> {
+        self.ensure_standard()?;
         let keys = self.matching_keys(&*wtxn, filter, multi)?;
         for key in &keys {
             let id = std::str::from_utf8(key)
@@ -1152,6 +1186,323 @@ impl<'e> Collection<'e> {
         let n = self.delete_txn(&mut wtxn, filter, multi)?;
         wtxn.commit()?;
         Ok(n)
+    }
+
+    // ----------------------------- vault -----------------------------
+
+    fn vault_stored(id: &str, tenant: &str, envelope: Value) -> Result<Value> {
+        let enc = envelope.get("_enc").cloned().ok_or_else(|| Error::Vault {
+            code: "encryption_failed",
+            message: "encryption did not produce an envelope".into(),
+        })?;
+        Ok(serde_json::json!({
+            "_id": id,
+            "tenant_id": tenant,
+            "_enc": enc,
+        }))
+    }
+
+    fn decrypt_stored(
+        &self,
+        stored: &Value,
+        key: &VaultKey,
+        tenant: &str,
+        id: &str,
+        kid: &str,
+    ) -> Result<Value> {
+        if vault::stored_tenant(stored) != Some(tenant) {
+            return Err(Error::Vault {
+                code: "tenant_mismatch",
+                message: "document belongs to a different tenant".into(),
+            });
+        }
+        let doc = vault::decrypt_document(stored, key, &self.name, tenant, id, kid)?;
+        let got_id = doc.get("_id").and_then(Value::as_str);
+        let got_tenant = doc.get(vault::TENANT_FIELD).and_then(Value::as_str);
+        if got_id != Some(id) || got_tenant != Some(tenant) {
+            return Err(Error::Vault {
+                code: "decryption_failed",
+                message: "decrypted document identity does not match its envelope".into(),
+            });
+        }
+        Ok(doc)
+    }
+
+    fn check_vault_size(stored: &Value) -> Result<Vec<u8>> {
+        let bytes = serde_json::to_vec(stored)?;
+        if bytes.len() > MAX_DOCUMENT_BYTES {
+            return Err(Error::DocumentTooLarge(bytes.len(), MAX_DOCUMENT_BYTES));
+        }
+        Ok(bytes)
+    }
+
+    /// Inserts a document into a vault collection in the given transaction.
+    pub fn insert_vault_txn(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        mut doc: Value,
+        key: &VaultKey,
+        tenant: &str,
+        kid: &str,
+    ) -> Result<String> {
+        self.ensure_vault()?;
+        vault::validate_context(tenant, kid)?;
+        let obj = doc
+            .as_object_mut()
+            .ok_or_else(|| Error::Query("document must be an object".into()))?;
+
+        let id = match obj.get("_id") {
+            Some(Value::String(s)) => s.clone(),
+            Some(_) => return Err(Error::InvalidId),
+            None => {
+                let id = uuid::Uuid::new_v4().to_string();
+                obj.insert("_id".to_string(), Value::String(id.clone()));
+                id
+            }
+        };
+        match obj.get(vault::TENANT_FIELD) {
+            Some(Value::String(got)) if got == tenant => {}
+            Some(Value::String(_)) => {
+                return Err(Error::Vault {
+                    code: "tenant_mismatch",
+                    message: "document `tenant_id` does not match X-NonoDB-Tenant".into(),
+                })
+            }
+            Some(_) => {
+                return Err(Error::Vault {
+                    code: "invalid_vault_document",
+                    message: "`tenant_id` must be a string".into(),
+                })
+            }
+            None => {
+                obj.insert(
+                    vault::TENANT_FIELD.to_string(),
+                    Value::String(tenant.to_string()),
+                );
+            }
+        }
+
+        if self.db.get(&*wtxn, id.as_bytes())?.is_some() {
+            return Err(Error::DuplicateKey(id));
+        }
+        let envelope = vault::encrypt_document(&doc, key, &self.name, tenant, &id, kid)?;
+        let stored = Self::vault_stored(&id, tenant, envelope)?;
+        let bytes = Self::check_vault_size(&stored)?;
+        self.db.put(&mut *wtxn, id.as_bytes(), &bytes)?;
+        self.record_history(wtxn, &id, "insert", Some(stored))?;
+        Ok(id)
+    }
+
+    /// Inserts many documents into a vault collection. Not all-or-nothing.
+    pub fn insert_many_vault_txn(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        docs: &[Value],
+        key: &VaultKey,
+        tenant: &str,
+        kid: &str,
+    ) -> Result<Vec<String>> {
+        let mut ids = Vec::with_capacity(docs.len());
+        for doc in docs {
+            ids.push(self.insert_vault_txn(wtxn, doc.clone(), key, tenant, kid)?);
+        }
+        Ok(ids)
+    }
+
+    /// Updates exactly one vault document by `_id`. `multi` is not supported.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_vault_txn(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        filter: &Value,
+        update: &Value,
+        multi: bool,
+        upsert: bool,
+        key: &VaultKey,
+        tenant: &str,
+        kid: &str,
+    ) -> Result<UpdateOutcome> {
+        self.ensure_vault()?;
+        if multi {
+            return Err(Error::Vault {
+                code: "invalid_vault_filter",
+                message: "multi update is not supported for vault collections".into(),
+            });
+        }
+        let id = vault::exact_id_filter(filter, tenant)?;
+        let Some(raw) = self.db.get(&*wtxn, id.as_bytes())? else {
+            if !upsert {
+                return Ok(UpdateOutcome {
+                    matched: 0,
+                    modified: 0,
+                    upserted_id: None,
+                });
+            }
+            let mut doc = seed_from_filter(filter);
+            doc["_id"] = Value::String(id.clone());
+            apply_upsert(&mut doc, update)?;
+            let id = self.insert_vault_txn(wtxn, doc, key, tenant, kid)?;
+            return Ok(UpdateOutcome {
+                matched: 0,
+                modified: 0,
+                upserted_id: Some(id),
+            });
+        };
+        let old_stored: Value = parse_json(raw)?;
+        let old = self.decrypt_stored(&old_stored, key, tenant, &id, kid)?;
+        let mut new = old.clone();
+        apply_update(&mut new, update)?;
+        if new.get("_id").and_then(Value::as_str) != Some(id.as_str()) {
+            return Err(Error::InvalidId);
+        }
+        if new.get(vault::TENANT_FIELD).and_then(Value::as_str) != Some(tenant) {
+            return Err(Error::Vault {
+                code: "tenant_mismatch",
+                message: "update cannot change `tenant_id`".into(),
+            });
+        }
+        let envelope = vault::encrypt_document(&new, key, &self.name, tenant, &id, kid)?;
+        let stored = Self::vault_stored(&id, tenant, envelope)?;
+        let bytes = Self::check_vault_size(&stored)?;
+        self.db.put(&mut *wtxn, id.as_bytes(), &bytes)?;
+        self.record_history(wtxn, &id, "update", Some(stored))?;
+        Ok(UpdateOutcome {
+            matched: 1,
+            modified: 1,
+            upserted_id: None,
+        })
+    }
+
+    /// Deletes exactly one vault document by `_id`.
+    pub fn delete_vault_txn(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        filter: &Value,
+        multi: bool,
+        key: &VaultKey,
+        tenant: &str,
+        kid: &str,
+    ) -> Result<usize> {
+        self.ensure_vault()?;
+        if multi {
+            return Err(Error::Vault {
+                code: "invalid_vault_filter",
+                message: "multi delete is not supported for vault collections".into(),
+            });
+        }
+        let id = vault::exact_id_filter(filter, tenant)?;
+        let Some(raw) = self.db.get(&*wtxn, id.as_bytes())? else {
+            return Ok(0);
+        };
+        let stored: Value = parse_json(raw)?;
+        // Decrypt before deleting: this enforces the tenant/key and catches corruption.
+        self.decrypt_stored(&stored, key, tenant, &id, kid)?;
+        self.db.delete(&mut *wtxn, id.as_bytes())?;
+        self.record_history(wtxn, &id, "delete", None)?;
+        Ok(1)
+    }
+
+    /// Reads vault documents. Only `_id`/`tenant_id` filters and `_id` sorting are allowed.
+    pub fn find_vault_in(
+        &self,
+        rtxn: &RoTxn<'_>,
+        query: &FindQuery,
+        key: &VaultKey,
+        tenant: &str,
+        kid: &str,
+    ) -> Result<Vec<Value>> {
+        self.ensure_vault()?;
+        vault::validate_projection(query.projection.as_ref())?;
+        vault::validate_sort(&query.sort)?;
+        let filter = vault::read_filter(&query.filter, tenant)?;
+        let stored_query = FindQuery {
+            filter,
+            projection: None,
+            sort: query.sort.clone(),
+            skip: query.skip,
+            limit: query.limit,
+        };
+        let stored = self.find_in(rtxn, &stored_query)?;
+        let mut out = Vec::with_capacity(stored.len());
+        for item in stored {
+            let id = item
+                .get("_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| Error::Vault {
+                    code: "decryption_failed",
+                    message: "stored vault document has no `_id`".into(),
+                })?;
+            out.push(self.decrypt_stored(&item, key, tenant, id, kid)?);
+        }
+        Ok(out)
+    }
+
+    pub fn find_one_vault_in(
+        &self,
+        rtxn: &RoTxn<'_>,
+        filter: &Value,
+        key: &VaultKey,
+        tenant: &str,
+        kid: &str,
+    ) -> Result<Option<Value>> {
+        let query = FindQuery {
+            filter: filter.clone(),
+            projection: None,
+            sort: Vec::new(),
+            skip: 0,
+            limit: Some(1),
+        };
+        Ok(self.find_vault_in(rtxn, &query, key, tenant, kid)?.pop())
+    }
+
+    /// Counts vault documents without decrypting them.
+    pub fn count_vault_in(&self, rtxn: &RoTxn<'_>, filter: &Value, tenant: &str) -> Result<usize> {
+        self.ensure_vault()?;
+        let filter = vault::read_filter(filter, tenant)?;
+        self.count_in(rtxn, &filter)
+    }
+
+    /// History for a vault document, with snapshots decrypted on read.
+    #[allow(clippy::too_many_arguments)]
+    pub fn history_vault_in(
+        &self,
+        rtxn: &RoTxn<'_>,
+        id: &str,
+        limit: Option<usize>,
+        include_docs: bool,
+        key: &VaultKey,
+        tenant: &str,
+        kid: &str,
+    ) -> Result<Vec<HistoryEntry>> {
+        self.ensure_vault()?;
+        let mut entries = self.history_in(rtxn, id, limit, include_docs)?;
+        if include_docs {
+            for entry in &mut entries {
+                if let Some(stored) = entry.doc.take() {
+                    entry.doc = Some(self.decrypt_stored(&stored, key, tenant, id, kid)?);
+                }
+            }
+        }
+        Ok(entries)
+    }
+
+    pub fn get_version_vault_in(
+        &self,
+        rtxn: &RoTxn<'_>,
+        id: &str,
+        rev: u64,
+        key: &VaultKey,
+        tenant: &str,
+        kid: &str,
+    ) -> Result<Option<HistoryEntry>> {
+        self.ensure_vault()?;
+        let mut entry = self.get_version_in(rtxn, id, rev)?;
+        if let Some(entry) = &mut entry {
+            if let Some(stored) = entry.doc.take() {
+                entry.doc = Some(self.decrypt_stored(&stored, key, tenant, id, kid)?);
+            }
+        }
+        Ok(entry)
     }
 
     fn record_history(

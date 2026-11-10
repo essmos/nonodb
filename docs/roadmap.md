@@ -5,7 +5,7 @@ is deliberately out of scope, and which gaps are candidates for future work.
 
 ## Current status
 
-The project is at `0.3.0`. It is suitable for local and single-host
+The project is at `0.4.0`. It is suitable for local and single-host
 applications that need a small, durable, queryable JSON store and can accept a
 single-writer model.
 
@@ -24,6 +24,7 @@ Implemented:
 - Unix-socket daemon, optional TCP/TLS, bearer auth, uid/gid allow-lists;
 - group commit, request limits/timeouts, metrics;
 - snapshots, online backup, restore, inspect, CLI;
+- optional vault collections with per-tenant whole-document encryption;
 - Python client, Docker image, systemd unit;
 - unit, property, integration, concurrency, crash, search, and large-data tests.
 
@@ -101,6 +102,12 @@ Implemented:
 
 - One global bearer token; no users, roles, per-collection permissions, or
   audit log.
+- Vault encryption is daemon-side, not end-to-end. The daemon sees plaintext
+  and the raw key in memory.
+- Vault collections have no searchable encryption, blind indexes, range
+  queries, or sorting beyond `_id`.
+- Vault key rotation is an operational re-encryption procedure; the daemon does
+  not keep a keyring of old keys.
 - No mutual TLS.
 - Unix peer checks use uid and primary gid only, not supplementary groups.
 - TCP requires a token but is plaintext unless TLS is configured.

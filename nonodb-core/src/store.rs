@@ -8,6 +8,7 @@ use heed::{Database, Env, EnvOpenOptions, RoTxn, RwTxn};
 use crate::collection::Collection;
 use crate::error::{Error, Result};
 use crate::history::{self, HistoryConfig, HISTORY_DB};
+use crate::vault::CollectionProfile;
 
 /// Maximum database file size. This is mmap address space - **not**
 /// a disk or RAM reservation. The file grows on demand up to this limit.
@@ -161,6 +162,132 @@ impl Store {
         Ok(())
     }
 
+    fn profile_key(name: &str) -> String {
+        format!("profile:{name}")
+    }
+
+    fn profile_from_ro(
+        meta: Database<Bytes, Bytes>,
+        rtxn: &RoTxn<'_>,
+        name: &str,
+    ) -> Result<CollectionProfile> {
+        let profile = meta
+            .get(rtxn, Self::profile_key(name).as_bytes())?
+            .and_then(|b| std::str::from_utf8(b).ok())
+            .unwrap_or("standard");
+        CollectionProfile::parse(profile)
+    }
+
+    fn profile_from_rw(
+        meta: Database<Bytes, Bytes>,
+        wtxn: &RwTxn<'_>,
+        name: &str,
+    ) -> Result<CollectionProfile> {
+        let profile = meta
+            .get(wtxn, Self::profile_key(name).as_bytes())?
+            .and_then(|b| std::str::from_utf8(b).ok())
+            .unwrap_or("standard");
+        CollectionProfile::parse(profile)
+    }
+
+    /// Creates a collection with an explicit profile.
+    ///
+    /// Existing collections cannot be converted between `standard` and `vault`;
+    /// create a new collection and reinsert the data instead.
+    pub fn create_collection(
+        &self,
+        name: &str,
+        profile: CollectionProfile,
+    ) -> Result<Collection<'_>> {
+        let mut wtxn = self.write_txn()?;
+        let collection = self.create_collection_in(&mut wtxn, name, profile)?;
+        wtxn.commit()?;
+        Ok(collection)
+    }
+
+    pub fn create_collection_in<'e>(
+        &'e self,
+        wtxn: &mut RwTxn<'_>,
+        name: &str,
+        profile: CollectionProfile,
+    ) -> Result<Collection<'e>> {
+        Self::validate_name(name)?;
+        let db = self
+            .env
+            .create_database::<Bytes, Bytes>(&mut *wtxn, Some(name))?;
+        let meta = self
+            .env
+            .create_database::<Bytes, Bytes>(&mut *wtxn, Some(META_DB))?;
+        let key = format!("collection:{name}");
+        let exists = meta.get(&*wtxn, key.as_bytes())?.is_some();
+        let current = Self::profile_from_rw(meta, wtxn, name)?;
+        if exists && current != profile {
+            return Err(Error::Vault {
+                code: "vault_profile_immutable",
+                message: format!(
+                    "collection `{name}` already exists as `{}`",
+                    current.as_str()
+                ),
+            });
+        }
+        if !exists {
+            meta.put(&mut *wtxn, key.as_bytes(), b"1")?;
+        }
+        meta.put(
+            &mut *wtxn,
+            Self::profile_key(name).as_bytes(),
+            profile.as_str().as_bytes(),
+        )?;
+        Ok(self.wrap(name, db, meta, profile))
+    }
+
+    /// Returns the profile of a collection, or `None` if it does not exist.
+    pub fn collection_profile(&self, name: &str) -> Result<Option<CollectionProfile>> {
+        let rtxn = self.read_txn()?;
+        let out = self.collection_profile_in(&rtxn, name)?;
+        rtxn.commit()?;
+        Ok(out)
+    }
+
+    /// Profile lookup inside an existing write transaction.
+    pub fn collection_profile_in_rw(
+        &self,
+        wtxn: &RwTxn<'_>,
+        name: &str,
+    ) -> Result<Option<CollectionProfile>> {
+        Self::validate_name(name)?;
+        let meta = self
+            .env
+            .open_database::<Bytes, Bytes>(wtxn, Some(META_DB))?
+            .ok_or_else(|| Error::Query("meta database missing".into()))?;
+        if meta
+            .get(wtxn, format!("collection:{name}").as_bytes())?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        Ok(Some(Self::profile_from_rw(meta, wtxn, name)?))
+    }
+
+    pub fn collection_profile_in(
+        &self,
+        rtxn: &RoTxn<'_>,
+        name: &str,
+    ) -> Result<Option<CollectionProfile>> {
+        Self::validate_name(name)?;
+        let meta = self
+            .env
+            .open_database::<Bytes, Bytes>(rtxn, Some(META_DB))?
+            .ok_or_else(|| Error::Query("meta database missing".into()))?;
+        if meta
+            .get(rtxn, format!("collection:{name}").as_bytes())?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        Ok(Some(Self::profile_from_ro(meta, rtxn, name)?))
+    }
+
     /// Opens a collection; creates it if it does not exist.
     ///
     /// An existing collection is opened with a read-only transaction.
@@ -177,8 +304,9 @@ impl Store {
                     .ok_or_else(|| Error::Query("meta database missing".into()))?;
                 // NOTE: heed requires `commit()` on the read transaction in which
                 // the database was opened; otherwise later `db` use fails with EINVAL.
+                let profile = Self::profile_from_ro(meta, &rtxn, name)?;
                 rtxn.commit()?;
-                return Ok(self.wrap(name, db, meta));
+                return Ok(self.wrap(name, db, meta, profile));
             }
             rtxn.commit()?;
         }
@@ -205,7 +333,8 @@ impl Store {
         if meta.get(&*wtxn, key.as_bytes())?.is_none() {
             meta.put(&mut *wtxn, key.as_bytes(), b"1")?;
         }
-        Ok(self.wrap(name, db, meta))
+        let profile = Self::profile_from_rw(meta, wtxn, name)?;
+        Ok(self.wrap(name, db, meta, profile))
     }
 
     /// Opens an **existing** collection in the given read transaction.
@@ -223,7 +352,8 @@ impl Store {
             .env
             .open_database::<Bytes, Bytes>(rtxn, Some(META_DB))?
             .ok_or_else(|| Error::Query("meta database missing".into()))?;
-        Ok(Some(self.wrap(name, db, meta)))
+        let profile = Self::profile_from_ro(meta, rtxn, name)?;
+        Ok(Some(self.wrap(name, db, meta, profile)))
     }
 
     fn wrap<'e>(
@@ -231,6 +361,7 @@ impl Store {
         name: &str,
         db: Database<Bytes, Bytes>,
         meta: Database<Bytes, Bytes>,
+        profile: CollectionProfile,
     ) -> Collection<'e> {
         Collection::new(
             &self.env,
@@ -239,6 +370,7 @@ impl Store {
             self.history,
             self.history_config,
             name.to_string(),
+            profile,
         )
     }
 

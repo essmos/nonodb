@@ -46,6 +46,20 @@ Authorization: Bearer <token>
 
 `GET /healthz` is always public. TCP listener mode requires a token.
 
+## Vault headers
+
+Requests against a vault collection must also send all three headers:
+
+```http
+X-NonoDB-Tenant: acme
+X-NonoDB-Key-Id: acme:v1
+X-NonoDB-Key: <base64-32-byte-key>
+```
+
+The key is sent only in the header, never in the JSON body. Vault collections
+support only a restricted subset of operations. See
+[Vault collections](vault.md) for the full contract.
+
 ## Limits
 
 | Limit | Value |
@@ -89,6 +103,7 @@ client timeout with `NONODB_TIMEOUT` or the `timeout=` argument.
 | [`history`](#document-history) | List revisions of one document |
 | [`get_version`](#document-history) | Read one exact document revision |
 | [`list_collections`](#list_collections) | List known collections |
+| [`create_collection`](#create_collection) | Create a standard or vault collection |
 
 ---
 
@@ -917,6 +932,26 @@ Rules:
 - Operations execute in order, and later operations in the same batch see
   earlier uncommitted changes. Use a read batch for independent reads.
 
+## create_collection
+
+```json
+{
+  "op": "create_collection",
+  "coll": "vault",
+  "profile": "vault"
+}
+```
+
+Response:
+
+```json
+{"ok": true, "result": {"created": "vault", "profile": "vault"}}
+```
+
+`profile` is `standard` (default) or `vault`. An existing collection cannot be
+converted between profiles; the request fails with
+`vault_profile_immutable`.
+
 ## list_collections
 
 ```json
@@ -929,7 +964,19 @@ Response:
 {"ok": true, "result": {"collections": ["users", "settings"]}}
 ```
 
-Collections are created on first write.
+Standard collections are created on first write. Vault collections should be
+created explicitly with `create_collection`.
+
+### Vault operation summary
+
+For a vault collection, `insert`, `insert_many`, `find`, `find_one`, `count`,
+`update`, `delete`, `history`, and `get_version` require the vault headers.
+Only exact `_id` / `tenant_id` filters are accepted, update/delete require one
+exact `_id`, and sort is limited to `_id`. Search, fuzzy search, aggregation,
+indexes, `batch`, and `write_batch` are rejected with
+`unsupported_encrypted_operation`.
+
+See [Vault collections](vault.md).
 
 ---
 
@@ -992,6 +1039,17 @@ Requires the bearer token when authentication is enabled.
 | `storage` | 500 | LMDB/storage error |
 | `io` | 500 | Filesystem or I/O error |
 | `internal` | 500 | Internal daemon error |
+| `vault_key_required` | 400 | Vault headers are missing |
+| `vault_key_unexpected` | 400 | Vault headers sent to a standard collection |
+| `invalid_vault_key` | 400 | Invalid or wrong-length vault key |
+| `tenant_mismatch` | 400 | Tenant/document/filter mismatch |
+| `decryption_failed` | 400 | Wrong key, tenant, key id, or corrupted envelope |
+| `unsupported_encrypted_operation` | 400 | Operation not available for vault collections |
+| `invalid_vault_filter` | 400 | Vault filter or multi update/delete is not allowed |
+| `invalid_vault_document` | 400 | Invalid vault document shape |
+| `vault_profile_immutable` | 400 | Collection profile cannot be changed |
+| `invalid_collection_profile` | 400 | Unknown collection profile |
+| `not_a_vault_collection` | 400 | Collection does not exist or is not a vault collection |
 
 ## curl examples
 

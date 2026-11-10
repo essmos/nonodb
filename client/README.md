@@ -11,3 +11,10 @@ See [docs/clients.md](../docs/clients.md) for installation and examples.
 
 When the daemon is started with `NONODB_HISTORY=1`, all clients expose
 history, exact-revision helpers, and aggregation.
+
+## Vault collections
+
+Use `db.vault(tenant, key_id, key)` for a handle that sends the three vault
+headers on every request. Vault collections support CRUD by `_id`, list/count
+by `tenant_id`, and history; search, indexes, aggregation, `batch`, and
+`write_batch` are rejected. See [Vault collections](../docs/vault.md).

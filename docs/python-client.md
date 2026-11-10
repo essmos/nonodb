@@ -85,14 +85,41 @@ with NonoDB("/run/nonodb/nonodb.sock") as db:
 
 ## Collections
 
-Collections are created on first write. There is no schema and no explicit
-`create_collection` call.
+Standard collections are created on first write. Vault collections must be
+created explicitly:
 
 ```python
-users = db.collection("users")
+users = db.collection("users")            # standard
+db.create_collection("vault", "vault")   # encrypted, restricted API
 ```
 
 A `Collection` is a lightweight handle around the same `NonoDB` connection.
+
+## Vault collections
+
+Use `NonoDB.vault(tenant, key_id, key)` for a tenant/key-bound handle. It sends the
+three vault headers on every request and bypasses the client-side read cache.
+
+```python
+import os
+
+key = os.environ["ACME_VAULT_KEY"]
+vault = db.vault("acme", "acme:v1", key)
+docs = vault.collection("vault")
+
+doc_id = docs.insert({
+    "tenant_id": "acme",
+    "type": "invoice",
+    "notes": "sensitive",
+})
+print(docs.find_one({"_id": doc_id}))
+docs.update({"_id": doc_id}, {"$set": {"notes": "changed"}})
+docs.delete({"_id": doc_id})
+```
+
+Vault collections support only CRUD by `_id`, list/count by `tenant_id`, and
+history. Search, fuzzy, aggregation, indexes, `batch`, and `write_batch` are not
+available. See [Vault collections](vault.md).
 
 ## Inserting
 

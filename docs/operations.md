@@ -636,6 +636,9 @@ backups.
   host.
 - Use TCP only with a token and TLS.
 - Do not disable certificate verification in production.
-- Back up regularly and test restores.
+- Back up regularly and test restores. Keep vault encryption keys in a separate
+  secret manager, not next to the LMDB backup.
+- Remember that vault encryption is applied inside the daemon; it protects data
+  at rest, not plaintext in daemon memory. See [Vault collections](vault.md).
 - Monitor `errors_total`, `queue_len`, and disk space.
 - Keep the OS, Rust toolchain, and dependencies patched.

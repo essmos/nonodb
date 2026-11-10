@@ -44,3 +44,12 @@ rows, err := users.Aggregate(ctx, []any{
     map[string]any{"$limit": 10},
 })
 ```
+
+## Vault collections
+
+```go
+vault := db.Vault("acme", "acme:v1", os.Getenv("ACME_VAULT_KEY"))
+docs := vault.Collection("vault")
+```
+
+See [Vault collections](../../docs/vault.md).

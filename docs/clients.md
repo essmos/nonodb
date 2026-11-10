@@ -178,10 +178,49 @@ The Go client methods take a `context.Context`; use it for cancellation and
 deadlines. `Exec` is available for operations not covered by a convenience
 method.
 
+## Vault collections
+
+Vault collections require the three encryption headers on every request. Each
+client has a credential-bound handle that adds them automatically.
+
+Python:
+
+```python
+vault = db.vault("acme", "acme:v1", os.environ["ACME_VAULT_KEY"])
+docs = vault.collection("vault")
+```
+
+Rust:
+
+```rust
+let vault = db.vault("acme", "acme:v1", std::env::var("ACME_VAULT_KEY")?);
+let docs = vault.collection("vault");
+```
+
+Node.js:
+
+```js
+const vault = db.vault('acme', 'acme:v1', process.env.ACME_VAULT_KEY);
+const docs = vault.collection('vault');
+```
+
+Go:
+
+```go
+vault := client.Vault("acme", "acme:v1", os.Getenv("ACME_VAULT_KEY"))
+docs := vault.Collection("vault")
+```
+
+All four handles use the normal CRUD methods. In a vault collection, only
+`_id`/`tenant_id` filters and single-document update/delete are valid. `batch`,
+`write_batch`, search, fuzzy, aggregation, and indexes are rejected by the
+daemon. See [Vault collections](vault.md).
+
 ## API coverage
 
 All clients expose the common document operations:
 
+- `create_collection` for explicit standard/vault collection creation;
 - `insert`, `insert_many`, `find`, `find_one`, `update`, `delete`, `count`;
 - `aggregate` for read-only reporting pipelines;
 - `batch` (read-only) and `write_batch` (atomic writes);
@@ -190,6 +229,7 @@ All clients expose the common document operations:
 - single-field, compound, unique, and covering indexes;
 - full-text (`search`) and fuzzy search;
 - text/fuzzy index listing and deletion;
-- collection listing and health checks.
+- collection listing and health checks;
+- vault collection handles in Python, Rust, Node.js, and Go.
 
 Use `exec`/`Exec`/`exec` for an operation that does not have a typed wrapper.

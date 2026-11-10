@@ -132,9 +132,12 @@ func WithTLSVerify(verify bool) Option {
 
 // Client is a thin nonodb client. It is safe for concurrent use.
 type Client struct {
-	baseURL string
-	token   string
-	http    *http.Client
+	baseURL     string
+	token       string
+	vaultTenant string
+	vaultKeyID  string
+	vaultKey    string
+	http        *http.Client
 }
 
 // New creates a client. Defaults come from NONODB_SOCK, NONODB_URL,
@@ -271,6 +274,11 @@ func (c *Client) execOnce(ctx context.Context, payload map[string]any) (json.Raw
 	if c.token != "" {
 		request.Header.Set("authorization", "Bearer "+c.token)
 	}
+	if c.vaultKey != "" {
+		request.Header.Set("x-nonodb-tenant", c.vaultTenant)
+		request.Header.Set("x-nonodb-key-id", c.vaultKeyID)
+		request.Header.Set("x-nonodb-key", c.vaultKey)
+	}
 	response, err := c.http.Do(request)
 	if err != nil {
 		return nil, err
@@ -326,6 +334,25 @@ func decodeAny(raw json.RawMessage) (any, error) {
 
 func decodeInto(raw json.RawMessage, out any) error {
 	return json.Unmarshal(raw, out)
+}
+
+// Vault returns a shallow copy bound to vault encryption headers.
+// The key is sent only in headers, never in JSON bodies.
+func (c *Client) Vault(tenant, keyID, key string) *Client {
+	clone := *c
+	clone.vaultTenant = tenant
+	clone.vaultKeyID = keyID
+	clone.vaultKey = key
+	return &clone
+}
+
+// CreateCollection creates a collection explicitly. Use profile "vault" for
+// encrypted storage.
+func (c *Client) CreateCollection(ctx context.Context, name, profile string) error {
+	_, err := c.execRaw(ctx, map[string]any{
+		"op": "create_collection", "coll": name, "profile": profile,
+	})
+	return err
 }
 
 // Collections lists collection names.

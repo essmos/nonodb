@@ -87,7 +87,7 @@ An LMDB environment contains named sub-databases. nonodb uses this layout:
 
 | Sub-database | Key | Value | Purpose |
 |---|---|---|---|
-| `meta` | metadata key | JSON or scalar | Collection registry, index definitions, search totals, history sequence |
+| `meta` | metadata key | JSON or scalar | Collection registry, collection profile, index definitions, search totals, history sequence |
 | `history` | collection + `_id` + revision | revision JSON | Append-only document history |
 | `coll:<name>` | `_id` bytes | JSON document | Primary collection data |
 | `idx:<coll>:<fields>` | encoded values + `_id` | encoded `_id` / covering payload | Secondary index |
@@ -103,6 +103,27 @@ The optional `history` sub-database stores immutable revision snapshots. A key
 contains the collection name, `_id`, and a global `rev` assigned by the writer.
 The current collection is never modified by history and history entries are
 not indexed. See [Document history](operations.md#document-history).
+
+### Vault collection layout
+
+A collection profile is stored in `meta` as `profile:<name>`. Missing
+means `standard`; the second supported value is `vault`.
+
+A vault document stores only its primary key, tenant, and encrypted envelope:
+
+```json
+{"_id":"...", "tenant_id":"acme", "_enc":{"v":1,"alg":"xchacha20poly1305","kid":"acme:v1","n":"...","ct":"..."}}
+```
+
+The complete original document is encrypted into `_enc.ct` with
+XChaCha20-Poly1305. AAD binds the ciphertext to collection name, tenant, `_id`,
+and key id. `_id` and `tenant_id` stay plaintext so primary-key lookup and tenant
+isolation do not require decrypting the whole collection.
+
+Vault collections have no secondary, text, or fuzzy indexes. Standard write
+methods reject vault collections, and vault requests require the three
+encryption headers. See [Vault collections](vault.md) for the API contract and
+threat model.
 
 Every collection and every index consumes a named LMDB sub-database.
 `MAX_DBS` is 256, which in practice limits a database to roughly 246

@@ -276,6 +276,46 @@ The script keeps the data set at or below the 100,000-document aggregation
 input cap. Values vary with page-cache state, CPU frequency, and filesystem;
 compare rows from the same run rather than mixing separate runs.
 
+## Vault encryption overhead
+
+Vault collections encrypt and decrypt the whole document with
+XChaCha20-Poly1305. This is optional: standard collections do not pay this cost.
+
+Measured with `scripts/vault_bench.py`, 5,000 documents, 256-byte payload,
+1,000 read/update iterations, daemon history enabled, `NONODB_CACHE_TTL=0`,
+and the database on **ext4**:
+
+| Operation | Standard | Vault | Vault overhead |
+|---|---:|---:|---:|
+| Bulk insert (`insert_many`, 200/chunk) | ~7,130 docs/s | ~2,560 docs/s | **2.79x** |
+| `find_one` by `_id` p50 | 0.97 ms | 1.32 ms | **1.36x** |
+| `find` by `tenant_id`, limit 100 p50 | 5.51 ms | 26.71 ms | **4.85x** |
+| `count` by `tenant_id` p50 | 70.07 ms | 124.47 ms | **1.78x** |
+| `update` by `_id` p50 | 2.90 ms | 3.49 ms | **1.20x** |
+
+Interpretation:
+
+- Point reads and updates add roughly one third of latency for encryption,
+  decryption, and a fresh nonce.
+- Listing a tenant is more expensive because every returned document is
+  decrypted. Use `limit` for wide tenant lists.
+- Counting does not decrypt documents, but both profiles still perform an
+  unindexed `tenant_id` scan; vault collections cannot have a secondary index.
+- Bulk insert pays for serialization, encryption, base64 encoding, and the
+  larger stored document.
+- Vault reads are not served from the daemon cache, so repeated reads do not
+  turn into cache hits.
+
+Reproduce:
+
+```bash
+NONODB_CACHE_TTL=0 NONODB_SOCK=$S \
+  python3 scripts/vault_bench.py --docs 5000 --iters 1000 --payload 256
+```
+
+These numbers are a baseline for this host. Measure your own workload, key
+size, document size, and history settings.
+
 ## Large data: 1,000,000 documents
 
 `scripts/large_test.py --docs 1000000 --text`, fresh database, ext4, release.
@@ -521,6 +561,8 @@ NONODB_SOCK=$S python3 scripts/search_variants_test.py
 NONODB_SOCK=$S python3 scripts/compound_test.py
 NONODB_SOCK=$S python3 scripts/upsert_test.py
 NONODB_SOCK=$S python3 scripts/write_batch_test.py
+NONODB_SOCK=$S python3 scripts/vault_regression_test.py
+NONODB_CACHE_TTL=0 NONODB_SOCK=$S python3 scripts/vault_bench.py --docs 5000 --iters 1000
 ```
 
 Large-data tests need a fresh database and larger map size:

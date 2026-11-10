@@ -50,6 +50,7 @@ class NonoDB {
     this.token = options.token ?? process.env.NONODB_TOKEN ?? '';
     this.timeoutMs = options.timeoutMs ?? envTimeoutMs();
     this.verify = options.verify ?? envVerify();
+    this.vaultHeaders = options.vaultHeaders ?? null;
 
     const baseUrl = options.baseUrl ?? (options.socketPath ? undefined : process.env.NONODB_URL);
     if (baseUrl) {
@@ -119,6 +120,7 @@ class NonoDB {
       headers['content-length'] = String(payload.length);
     }
     if (this.token) headers.authorization = `Bearer ${this.token}`;
+    if (this.vaultHeaders) Object.assign(headers, this.vaultHeaders);
 
     const url = new URL(path, this.baseUrl);
     const useTls = !this.socketPath && url.protocol === 'https:';
@@ -179,6 +181,23 @@ class NonoDB {
       if (payload) request.write(payload);
       request.end();
     });
+  }
+
+  /** Return a clone that sends vault encryption headers on every request. */
+  vault(tenant, keyId, key) {
+    const clone = Object.create(NonoDB.prototype);
+    Object.assign(clone, this);
+    clone.vaultHeaders = {
+      'x-nonodb-tenant': tenant,
+      'x-nonodb-key-id': keyId,
+      'x-nonodb-key': key,
+    };
+    return clone;
+  }
+
+  /** Create a collection explicitly. Use profile `vault` for encrypted storage. */
+  async createCollection(name, profile = 'standard') {
+    return this.exec({ op: 'create_collection', coll: name, profile });
   }
 
   /** List collection names. */

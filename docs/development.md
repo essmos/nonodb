@@ -17,6 +17,7 @@ and [HTTP API](api.md).
 │   │   ├── aggregate.rs       # read-only aggregation stages and expressions
 │   │   ├── index.rs           # order-preserving index encoding
 │   │   ├── search.rs          # tokenization, BM25, trigrams, Levenshtein
+│   │   ├── vault.rs           # optional encrypted collections
 │   │   ├── error.rs
 │   │   └── query/
 │   │       ├── matcher.rs     # MongoDB-like filters
@@ -24,7 +25,8 @@ and [HTTP API](api.md).
 │   │       └── path.rs        # dotted paths
 │   ├── tests/
 │   │   ├── properties.rs      # proptest
-│   │   └── reopen.rs          # persistence/reopen
+│   │   ├── reopen.rs          # persistence/reopen
+│   │   └── vault.rs           # vault encryption and tenant isolation
 │   └── examples/
 │       ├── backup.rs
 │       └── inspect.rs
@@ -129,6 +131,9 @@ python3 client/cache_test.py                 # TTL, invalidation, copies
 python3 scripts/batch_test.py                # read batch + get_many + cache
 python3 scripts/write_batch_test.py          # atomic commit/rollback
 python3 scripts/upsert_test.py               # upsert and array operators
+python3 scripts/vault_test.py                # optional vault encryption end-to-end
+python3 scripts/vault_regression_test.py     # vault API regressions
+python3 scripts/vault_bench.py --docs 5000   # standard vs vault performance
 python3 scripts/search_test.py               # BM25 + fuzzy end-to-end
 python3 scripts/search_variants_test.py      # search/query edge cases
 python3 scripts/compound_test.py             # compound/covering indexes, phrases
@@ -191,6 +196,9 @@ scripts are:
 | `scripts/bench.py` | Mixed CRUD throughput/latency with multiple processes |
 | `scripts/opt_bench.py` | Count, early exit, index update, batch comparison |
 | `scripts/aggregate_bench.py` | Per-stage aggregation timings and report pipelines |
+| `scripts/vault_test.py` | Vault encryption, tenant isolation, and restricted API |
+| `scripts/vault_regression_test.py` | Vault profiles, headers, filters, CRUD, errors, history |
+| `scripts/vault_bench.py` | Standard vs vault insert/read/update/count performance |
 | `scripts/cpu_bench.py` | Samples daemon CPU from `/proc` |
 | `scripts/large_test.py` | 1M+ document load, indexes, query latency, RAM |
 | `scripts/large_crash_test.sh` | Crash during writes on a large database |
@@ -282,8 +290,8 @@ Create and push an annotated tag:
 
 ```bash
 # final release
-git tag -a v0.3.0 -m "nonodb v0.3.0"
-git push origin v0.3.0
+git tag -a v0.4.0 -m "nonodb v0.4.0"
+git push origin v0.4.0
 
 # pre-release (the hyphen makes it a GitHub pre-release automatically)
 git tag -a v0.4.0-beta.1 -m "nonodb v0.4.0-beta.1"
@@ -301,7 +309,7 @@ Use **Actions → Release → Run workflow** and provide:
 
 | Input | Meaning |
 |---|---|
-| `tag` | Tag to publish, e.g. `v0.3.0` or `v0.4.0-rc.1` |
+| `tag` | Tag to publish, e.g. `v0.4.0` or `v0.4.0-rc.1` |
 | `prerelease` | Mark the release as a pre-release |
 | `draft` | Create it as a draft for review |
 

@@ -15,13 +15,14 @@ release build.
 | `cargo build --release --examples` | OK |
 | `cargo fmt --check` | OK |
 | `cargo clippy --all-targets -- -D warnings` | 0 warnings |
-| `cargo test` | 49 unit + 5 property-based + 1 reopen test, all passing |
+| `cargo test` | 67 unit + 5 property-based + 1 reopen + 2 vault integration tests, all passing |
 | CRUD, cache, batch, write batch, upsert, search, compound indexes | OK |
 | 12-process concurrency and unique-index race tests | OK |
 | `kill -9` during writes | No corruption; committed data readable |
 | 12 uvicorn workers against one daemon | OK |
 | Live backup and restore, 1M and 8M documents | OK |
 | Docker build and named-volume run | OK |
+| Vault encryption regression suite | OK (profiles, headers, isolation, CRUD, history, rejected ops) |
 
 ## Representative numbers
 
@@ -38,6 +39,8 @@ release build.
 | Full sort, 1M docs | 250–420 ms |
 | Idle RSS, 1M docs with 3 indexes | ~5.1 MB |
 | Live backup, 8M docs + 1M text docs | 5.1 GB in ~10 s |
+| Vault read by `_id`, 5k docs | 1.32 ms p50 (1.36x standard) |
+| Vault insert, 5k docs | 2.56k docs/s (2.79x standard) |
 
 Detailed tables, caveats, and reproduction commands:
 [docs/benchmarks.md](docs/benchmarks.md).

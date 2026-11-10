@@ -27,7 +27,7 @@ try:  # optional faster JSON; falls back to stdlib
 except ImportError:  # pragma: no cover
     _orjson = None
 
-__all__ = ["NonoDB", "Collection", "NonoDBError"]
+__all__ = ["NonoDB", "VaultDB", "Collection", "NonoDBError"]
 
 # Operations safe to retry after a transport error (idempotent reads).
 _READ_OPS = {
@@ -124,10 +124,15 @@ class NonoDB:
             self._cache.clear()
 
     # -- core --------------------------------------------------------
-    def exec(self, payload: dict[str, Any]) -> Any:
+    def exec(
+        self,
+        payload: dict[str, Any],
+        *,
+        headers: Optional[dict[str, str]] = None,
+    ) -> Any:
         op = payload.get("op")
         cache_key: Optional[bytes] = None
-        if self._cache_ttl > 0 and op in _READ_OPS:
+        if headers is None and self._cache_ttl > 0 and op in _READ_OPS:
             cache_key = _cache_key(payload)
             with self._cache_lock:
                 hit = self._cache.get(cache_key)
@@ -138,9 +143,9 @@ class NonoDB:
                 with self._cache_lock:
                     self._cache.pop(cache_key, None)
 
-        result = self._exec_uncached(payload, op)
+        result = self._exec_uncached(payload, op, headers)
 
-        if self._cache_ttl > 0:
+        if self._cache_ttl > 0 and headers is None:
             with self._cache_lock:
                 if cache_key is not None:
                     self._cache[cache_key] = (time.monotonic(), _dumps(result))
@@ -149,13 +154,20 @@ class NonoDB:
                     self._cache.clear()
         return result
 
-    def _exec_uncached(self, payload: dict[str, Any], op: Optional[str]) -> Any:
+    def _exec_uncached(
+        self,
+        payload: dict[str, Any],
+        op: Optional[str],
+        extra_headers: Optional[dict[str, str]] = None,
+    ) -> Any:
         # Reads are retried after a transport error; writes are not (duplicate risk).
         retries = 2 if op in _READ_OPS else 0
         attempt = 0
         while True:
             try:
                 headers = {"content-type": "application/json"}
+                if extra_headers:
+                    headers.update(extra_headers)
                 if self.token:
                     headers["authorization"] = f"Bearer {self.token}"
                 resp = self._http.post(
@@ -209,8 +221,63 @@ class NonoDB:
         """
         return self.exec({"op": "write_batch", "ops": ops})["results"]
 
+    def create_collection(self, name: str, profile: str = "standard") -> dict[str, Any]:
+        """Creates a collection explicitly. Use `profile="vault"` for encrypted storage."""
+        return self.exec(
+            {"op": "create_collection", "coll": name, "profile": profile}
+        )
+
+    def vault(self, tenant: str, key_id: str, key: str) -> "VaultDB":
+        """Returns a handle that sends vault encryption headers on every request."""
+        return VaultDB(self, tenant, key_id, key)
+
     def collection(self, name: str) -> "Collection":
         return Collection(self, name)
+
+
+class VaultDB:
+    """A tenant/key bound view of a nonodb database.
+
+    The key is sent only in request headers (never in JSON bodies) and this
+    wrapper does not use the client-side read cache.
+    """
+
+    def __init__(self, db: NonoDB, tenant: str, key_id: str, key: str):
+        self._db = db
+        self.tenant = tenant
+        self.key_id = key_id
+        self._key = key
+
+    def __repr__(self) -> str:
+        return (
+            f"VaultDB(tenant={self.tenant!r}, "
+            f"key_id={self.key_id!r}, key=<redacted>)"
+        )
+
+    def _headers(self) -> dict[str, str]:
+        return {
+            "x-nonodb-tenant": self.tenant,
+            "x-nonodb-key-id": self.key_id,
+            "x-nonodb-key": self._key,
+        }
+
+    def exec(self, payload: dict[str, Any]) -> Any:
+        return self._db.exec(payload, headers=self._headers())
+
+    def collection(self, name: str) -> "Collection":
+        return Collection(self, name)
+
+    def batch(self, ops: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        raise NonoDBError(
+            "unsupported_encrypted_operation",
+            "batch reads are not supported for vault collections",
+        )
+
+    def write_batch(self, ops: list[dict[str, Any]]) -> list[Any]:
+        raise NonoDBError(
+            "unsupported_encrypted_operation",
+            "write_batch is not supported for vault collections",
+        )
 
 
 class Collection:

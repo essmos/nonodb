@@ -179,8 +179,16 @@ impl ClientBuilder {
             http,
             base_url,
             token,
+            vault: None,
         })
     }
+}
+
+#[derive(Clone)]
+struct VaultHeaders {
+    tenant: String,
+    key_id: String,
+    key: String,
 }
 
 /// A thin, synchronous nonodb client.
@@ -189,6 +197,7 @@ pub struct Client {
     http: reqwest::blocking::Client,
     base_url: String,
     token: Option<String>,
+    vault: Option<VaultHeaders>,
 }
 
 impl Client {
@@ -247,6 +256,12 @@ impl Client {
         if let Some(token) = &self.token {
             request = request.bearer_auth(token);
         }
+        if let Some(vault) = &self.vault {
+            request = request
+                .header("x-nonodb-tenant", &vault.tenant)
+                .header("x-nonodb-key-id", &vault.key_id)
+                .header("x-nonodb-key", &vault.key);
+        }
         let response = request.send()?;
         let status = response.status();
         let bytes = response.bytes()?;
@@ -272,6 +287,34 @@ impl Client {
             });
         }
         Ok(body.get("result").cloned().unwrap_or(Value::Null))
+    }
+
+    /// Returns a clone bound to vault encryption headers.
+    ///
+    /// The key is sent only in headers, never in JSON bodies. Use the returned
+    /// client exactly like a normal `Client`.
+    pub fn vault(
+        &self,
+        tenant: impl Into<String>,
+        key_id: impl Into<String>,
+        key: impl Into<String>,
+    ) -> Self {
+        let mut client = self.clone();
+        client.vault = Some(VaultHeaders {
+            tenant: tenant.into(),
+            key_id: key_id.into(),
+            key: key.into(),
+        });
+        client
+    }
+
+    /// Create a collection explicitly (`profile` is `standard` or `vault`).
+    pub fn create_collection(&self, name: impl Into<String>, profile: &str) -> Result<Value> {
+        self.exec(json!({
+            "op": "create_collection",
+            "coll": name.into(),
+            "profile": profile,
+        }))
     }
 
     /// List collection names.

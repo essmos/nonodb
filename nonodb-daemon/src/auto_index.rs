@@ -412,6 +412,10 @@ impl AutoIndexer {
             rtxn.commit().ok();
             return Ok(false);
         };
+        if collection.profile().is_vault() {
+            rtxn.commit().ok();
+            return Ok(false);
+        }
         let defs = collection.index_defs_in(&rtxn).map_err(|e| e.to_string())?;
         let name = fields.join("+");
         if defs.iter().any(|d| d.name() == name) {

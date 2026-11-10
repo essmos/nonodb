@@ -52,3 +52,12 @@ let rows = users.aggregate(&[
     json!({"$limit": 10}),
 ])?;
 ```
+
+## Vault collections
+
+```rust
+let vault = db.vault("acme", "acme:v1", std::env::var("ACME_VAULT_KEY")?);
+let docs = vault.collection("vault");
+```
+
+See [Vault collections](../docs/vault.md).

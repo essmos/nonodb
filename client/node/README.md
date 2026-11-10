@@ -52,3 +52,12 @@ const rows = await users.aggregate([
   { $limit: 10 },
 ]);
 ```
+
+## Vault collections
+
+```js
+const vault = db.vault('acme', 'acme:v1', process.env.ACME_VAULT_KEY);
+const docs = vault.collection('vault');
+```
+
+See [Vault collections](../../docs/vault.md).
