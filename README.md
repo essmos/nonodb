@@ -1,4 +1,4 @@
-# nonodb
+# NoNoDB
 
 [![CI](https://github.com/essmos/nonodb/actions/workflows/ci.yml/badge.svg)](https://github.com/essmos/nonodb/actions/workflows/ci.yml)
 [![Release](https://github.com/essmos/nonodb/actions/workflows/release.yml/badge.svg)](https://github.com/essmos/nonodb/actions/workflows/release.yml)
@@ -11,7 +11,7 @@ database and three indexes after a restart. The on-disk LMDB file grows with
 the data and indexes; the ~5 MB figure is process memory, not the database
 file. Hot data stays in the OS page cache instead of the daemon heap.
 
-nonodb is a local NoSQL document store written in Rust. It needs no external
+NoNoDB is a local NoSQL document store written in Rust. It needs no external
 database server and runs comfortably on small VMs, edge boxes, and developer
 machines. It speaks a practical subset of MongoDB's query language over
 HTTP/JSON, stores documents in LMDB, and runs as a single daemon that is the
