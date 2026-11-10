@@ -5,7 +5,7 @@ is deliberately out of scope, and which gaps are candidates for future work.
 
 ## Current status
 
-The project is at `0.4.0`. It is suitable for local and single-host
+The project is at `0.5.0`. It is suitable for local and single-host
 applications that need a small, durable, queryable JSON store and can accept a
 single-writer model.
 
@@ -21,7 +21,7 @@ Implemented:
 - BM25 full-text search with diacritic folding and phrases;
 - fuzzy search with trigrams and bounded Levenshtein distance;
 - read batches and atomic write batches;
-- Unix-socket daemon, optional TCP/TLS, bearer auth, uid/gid allow-lists;
+- Unix-socket daemon, optional TCP/TLS and mutual TLS, bearer auth, uid/gid allow-lists;
 - group commit, request limits/timeouts, metrics;
 - snapshots, online backup, restore, inspect, CLI;
 - optional vault collections with per-tenant whole-document encryption;

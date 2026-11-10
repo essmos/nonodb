@@ -292,18 +292,18 @@ Create and push an annotated tag:
 
 ```bash
 # final release
-git tag -a v0.4.0 -m "nonodb v0.4.0"
-git push origin v0.4.0
+git tag -a v0.5.0 -m "nonodb v0.5.0"
+git push origin v0.5.0
 
 # pre-release (the hyphen makes it a GitHub pre-release automatically)
-git tag -a v0.4.0-beta.1 -m "nonodb v0.4.0-beta.1"
-git push origin v0.4.0-beta.1
+git tag -a v0.5.0-beta.1 -m "nonodb v0.5.0-beta.1"
+git push origin v0.5.0-beta.1
 ```
 
 The workflow runs the tests, builds release binaries for Linux x86_64, macOS
 Intel, macOS Apple Silicon, and Windows x86_64, attaches checksums, and publishes
 a GitHub Release. Linux and macOS use `.tar.gz`; Windows uses `.zip`. Tags such
-as `v0.4.0-beta.1` and `v0.4.0-rc.1` are marked as pre-releases automatically.
+as `v0.5.0-beta.1` and `v0.5.0-rc.1` are marked as pre-releases automatically.
 
 ### Manual release
 
@@ -311,7 +311,7 @@ Use **Actions → Release → Run workflow** and provide:
 
 | Input | Meaning |
 |---|---|
-| `tag` | Tag to publish, e.g. `v0.4.0` or `v0.4.0-rc.1` |
+| `tag` | Tag to publish, e.g. `v0.5.0` or `v0.5.0-rc.1` |
 | `prerelease` | Mark the release as a pre-release |
 | `draft` | Create it as a draft for review |
 
