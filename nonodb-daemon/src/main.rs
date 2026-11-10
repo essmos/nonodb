@@ -1,7 +1,7 @@
-//! nonodb daemon: HTTP/JSON po gnieździe uniksowym.
+//! nonodb daemon: HTTP/JSON over a Unix socket.
 //!
-//! Jeden proces jest wyłącznym właścicielem pliku LMDB. Klienci (np. procesy
-//! uvicorn) łączą się przez `/run/nonodb.sock` (ścieżki konfigurowalne przez
+//! One process is the sole owner of the LMDB file. Clients (e.g. uvicorn
+//! processes) connect through `/run/nonodb.sock` (paths configurable via
 //! `NONODB_SOCK` i `NONODB_DATA`).
 
 mod auto_index;
@@ -35,9 +35,9 @@ use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
 use writer::WriteJob;
 
-/// Maksymalny rozmiar ciała żądania (4 MiB).
+/// Maximum request body size (4 MiB).
 const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
-/// Timeout pojedynczego żądania API.
+/// Timeout for a single API request.
 fn request_timeout() -> Duration {
     static TIMEOUT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
     *TIMEOUT.get_or_init(|| {
@@ -59,8 +59,8 @@ struct AppState {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Jawny runtime: ograniczamy pulę wątków blokujących (mniej szczytowego VSZ),
-    // bo operacje LMDB wykonują się przez `spawn_blocking`.
+    // Explicit runtime: limit the blocking thread pool (lower peak VSZ),
+    // because LMDB operations run through `spawn_blocking`.
     let rt = tokio::runtime::Builder::new_multi_thread()
         .max_blocking_threads(64)
         .enable_all()
@@ -83,7 +83,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let store = Arc::new(Store::open(&data)?);
 
-    // Jeden wątek piszący, niezależny od runtime'u tokio (LMDB blokuje na fsync).
+    // One writer thread, independent of the tokio runtime (LMDB blocks on fsync).
     let (write_tx, write_rx) = mpsc::channel::<WriteJob>();
     let cache = Arc::new(cache::QueryCache::from_env());
     let writer_store = store.clone();
@@ -110,7 +110,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .with_state(state);
 
-    // Opcjonalny listener TCP (z TLS, jeśli podano certyfikat i klucz).
+    // Optional TCP listener (with TLS when a certificate and key are provided).
     let tcp_addr = std::env::var("NONODB_TCP").ok();
     if let Some(addr) = tcp_addr.as_deref() {
         if std::env::var("NONODB_AUTH_TOKEN")
@@ -164,7 +164,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(parent) = sock.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        // Daemon jest jedynym właścicielem socketa — usuwamy ewentualny osierocony plik.
+        // The daemon is the sole owner of the socket - remove any orphaned file.
         let _ = std::fs::remove_file(&sock);
 
         let listener = tokio::net::UnixListener::bind(&sock)?;
@@ -253,8 +253,8 @@ where
     }
 }
 
-/// Okresowe snapshoty LMDB (kopie spójne, bez zatrzymywania zapisów).
-/// To nie jest pełny PITR z WAL — daje punkty odtworzenia co N sekund.
+/// Periodic LMDB snapshots (consistent copies without stopping writes).
+/// This is not full PITR with a WAL - it provides restore points every N seconds.
 fn spawn_snapshots(store: Arc<Store>, dir: PathBuf) {
     let interval = std::env::var("NONODB_SNAPSHOT_INTERVAL")
         .ok()

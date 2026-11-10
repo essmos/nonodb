@@ -1,13 +1,13 @@
-"""Test współbieżności: 12 niezależnych źródeł zapisu + odczyty po `_id` i po polu.
+"""Concurrency test: 12 independent write sources plus `_id` and field reads.
 
-Weryfikuje nie tylko przepustowość, ale poprawność:
-  1. 12 równoległych pisarzy (osobne procesy, własne połączenie UDS),
-  2. odczyt po `_id` (bezpośredni klucz),
-  3. odczyt po polu bez indeksu i z indeksem (wyniki identyczne),
-  4. zakres po indeksie + sort + skip/limit,
-  5. równoległe `$inc` na tym samym dokumencie,
-  6. równoległe wstawianie unikalnego klucza (dokładnie jeden sukces),
-  7. mieszane czytanie podczas zapisu (brak błędów, spójny końcowy stan).
+Verifies not only throughput but also correctness:
+  1. 12 parallel writers (separate processes, own UDS connection),
+  2. read by `_id` (direct key),
+  3. read by field without and with an index (identical results),
+  4. index range + sort + skip/limit,
+  5. parallel `$inc` on the same document,
+  6. parallel insertion of a unique key (exactly one success),
+  7. mixed reads during writes (no errors, consistent final state).
 
     NONODB_SOCK=/tmp/nonodb.sock python3 scripts/concurrency_test.py
 """
@@ -129,7 +129,7 @@ def main() -> int:
 
     failures: list[str] = []
 
-    # --- 1. 12 równoległych pisarzy ---------------------------------
+    # --- 1. 12 parallel writers -------------------------------------
     with ProcessPoolExecutor(max_workers=WRITERS) as ex:
         results = list(ex.map(writer, range(WRITERS), [PER_WRITER] * WRITERS))
     ids = [i for r in results for i in r]
@@ -142,7 +142,7 @@ def main() -> int:
     )
     check_ids_unique(ids, failures)
 
-    # --- 2b. równoległy odczyt po polu BEZ indeksu ------------------
+    # --- 2b. parallel read by field WITHOUT an index ----------------
     with ProcessPoolExecutor(max_workers=READERS) as ex:
         res = list(ex.map(reader_field, range(READERS), [PER_WRITER] * READERS))
     bad = sum(r[1] for r in res)
@@ -151,7 +151,7 @@ def main() -> int:
     else:
         print(f"  2b. odczyt po polu bez indeksu: {READERS} czytelników, 0 błędów")
 
-    # --- 3. odczyt po polu: bez indeksu vs z indeksem ----------------
+    # --- 3. field read: without index vs with index ------------------
     before = {w: len(c_all(db, COLL, {"src": w})) for w in range(WRITERS)}
     create_index(db, COLL, "src", unique=False)
     after = {w: len(c_all(db, COLL, {"src": w})) for w in range(WRITERS)}
@@ -160,7 +160,7 @@ def main() -> int:
     else:
         print(f"  pole `src`: bez indeksu == z indeksem == {PER_WRITER} na źródło")
 
-    # --- 3b. równoległy odczyt po polu Z indeksem -------------------
+    # --- 3b. parallel read by field WITH an index -------------------
     with ProcessPoolExecutor(max_workers=READERS) as ex:
         res = list(ex.map(reader_field, range(READERS), [PER_WRITER] * READERS))
     bad = sum(r[1] for r in res)
@@ -169,7 +169,7 @@ def main() -> int:
     else:
         print(f"  3b. odczyt po polu z indeksem: {READERS} czytelników, 0 błędów")
 
-    # --- 2. odczyt po `_id` (12 czytelników) -------------------------
+    # --- 2. read by `_id` (12 readers) ------------------------------
     with ProcessPoolExecutor(max_workers=READERS) as ex:
         res = list(ex.map(reader_ids, [ids] * READERS, [READS_PER] * READERS))
     ok = sum(r[0] for r in res)
@@ -178,7 +178,7 @@ def main() -> int:
     if bad:
         failures.append(f"2. odczyt po _id: {bad} błędów")
 
-    # --- 4. zakres po indeksie + sort + skip/limit -------------------
+    # --- 4. index range + sort + skip/limit -------------------------
     create_index(db, COLL, "seq", unique=False)
     got = c_all(
         db,
@@ -194,7 +194,7 @@ def main() -> int:
     else:
         print(f"  4a. indeks zakres [100,200) sort+skip10+limit5 -> {seqs}")
 
-    # Jedno źródło = unikalne `seq`, więc skip/limit daje dokładny przedział.
+    # One source = unique `seq`, so skip/limit yields an exact range.
     one = c_all(
         db,
         COLL,
@@ -209,7 +209,7 @@ def main() -> int:
     else:
         print(f"  4b. src=0, skip10+limit5 -> {one_seqs}")
 
-    # --- 5. równoległe $inc -----------------------------------------
+    # --- 5. parallel $inc -------------------------------------------
     c.insert({"_id": "counter", "n": 0})
     with ProcessPoolExecutor(max_workers=WRITERS) as ex:
         list(ex.map(inc_worker, range(WRITERS)))
@@ -219,7 +219,7 @@ def main() -> int:
     else:
         print(f"  $inc: {WRITERS} źródeł × 100 -> n={n}")
 
-    # --- 6. unikalny indeks pod obciążeniem -------------------------
+    # --- 6. unique index under load ---------------------------------
     create_index(db, COLL, "uniq", unique=True)
     keys = [f"k{i}" for i in range(50)]
     with ProcessPoolExecutor(max_workers=WRITERS) as ex:
@@ -231,7 +231,7 @@ def main() -> int:
     else:
         print(f"  unique: {ok} sukcesów, {dup} konfliktów (oczekiwane 50 / 550)")
 
-    # --- 7. mieszany odczyt podczas zapisu --------------------------
+    # --- 7. mixed reads during writes -------------------------------
     with ProcessPoolExecutor(max_workers=WRITERS) as ex:
         readers = [
             ex.submit(mixed_reader, ids, 300) for _ in range(WRITERS // 2)
@@ -247,7 +247,7 @@ def main() -> int:
     if rbad:
         failures.append(f"7. mixed: {rbad} błędów odczytu")
 
-    # --- końcowa spójność -------------------------------------------
+    # --- final consistency ------------------------------------------
     total = c_all(db, COLL, {})
     want_total = expected + 1 + len(keys) + wres
     if len(total) != want_total:
@@ -267,7 +267,7 @@ def main() -> int:
     return 0
 
 
-# --- pomocnicze ------------------------------------------------------
+# --- helpers ---------------------------------------------------------
 def c_all(db, coll, flt, sort=None, skip=0, limit=None):
     q = {"op": "find", "coll": coll, "filter": flt}
     if sort:

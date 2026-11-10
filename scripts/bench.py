@@ -1,9 +1,9 @@
-"""Benchmark nonodb: przepustowość zapisów (group commit) i odczytów po `_id`.
+"""nonodb benchmark: write throughput (group commit) and `_id` read throughput.
 
-Uruchomienie (wymaga działającego daemona):
+Run with (requires a running daemon):
     NONODB_SOCK=/tmp/nonodb.sock python3 scripts/bench.py --workers 12 --writes 12000 --reads 60000
 
-Każdy worker to osobny proces z własnym połączeniem UDS — model jak uvicorn.
+Each worker is a separate process with its own UDS connection - modeled after uvicorn.
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ def write_worker(prefix: int, n: int) -> tuple[list[str], list[float], float]:
         lat.append(time.perf_counter() - t)
     elapsed = time.perf_counter() - start
     db.close()
-    # Do fazy odczytu zwracamy tylko próbkę `_id`, nie cały zbiór.
+    # For the read phase, return only a sample of `_id`s, not the whole set.
     return ids[:500], lat, elapsed
 
 
@@ -78,14 +78,14 @@ def main() -> int:
         print("za mało operacji dla podanej liczby workerów")
         return 1
 
-    # Czyścimy kolekcję benchmarkową.
+    # Clear the benchmark collection.
     db = _client()
     db.collection("bench").delete({}, multi=True)
     db.close()
 
     print(f"workers={args.workers} writes={args.writes} reads={args.reads}")
 
-    # --- zapisy ---
+    # --- writes ---
     t0 = time.perf_counter()
     with ProcessPoolExecutor(max_workers=args.workers) as ex:
         futures = [
@@ -102,7 +102,7 @@ def main() -> int:
         f" p99={pct(write_lat, 0.99):.2f}ms"
     )
 
-    # --- odczyty po _id ---
+    # --- reads by _id ---
     t0 = time.perf_counter()
     with ProcessPoolExecutor(max_workers=args.workers) as ex:
         futures = [

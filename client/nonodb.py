@@ -1,6 +1,6 @@
-"""Cienki klient nonodb dla Pythona (HTTP/JSON po gnieździe uniksowym).
+"""Thin Python client for nonodb (HTTP/JSON over a Unix socket).
 
-Użycie:
+Usage:
     from nonodb import NonoDB
     db = NonoDB("/run/nonodb.sock")
     users = db.collection("users")
@@ -8,8 +8,8 @@ Użycie:
     adults = users.find({"age": {"$gte": 18}})
     db.close()
 
-Klient jest cienki i bezstanowy poza połączeniem HTTP — cała logika jest
-w daemonie. Reużywaj jednej instancji na proces (worker uvicorn).
+The client is thin and stateless apart from the HTTP connection - all logic lives
+in the daemon. Reuse one instance per process (uvicorn worker).
 """
 
 from __future__ import annotations
@@ -22,14 +22,14 @@ from typing import Any, Iterable, Optional
 
 import httpx
 
-try:  # opcjonalnie szybszy JSON; fallback na stdlib
+try:  # optional faster JSON; falls back to stdlib
     import orjson as _orjson
 except ImportError:  # pragma: no cover
     _orjson = None
 
 __all__ = ["NonoDB", "Collection", "NonoDBError"]
 
-# Operacje bezpieczne do ponowienia po błędzie transportu (idempotentne odczyty).
+# Operations safe to retry after a transport error (idempotent reads).
 _READ_OPS = {
     "find",
     "find_one",
@@ -63,7 +63,7 @@ def _cache_key(payload: dict[str, Any]) -> bytes:
 
 
 class NonoDBError(Exception):
-    """Błąd zwrócony przez daemon (`ok: false`)."""
+    """Error returned by the daemon (`ok: false`)."""
 
     def __init__(self, code: str, message: str):
         super().__init__(f"{code}: {message}")
@@ -101,11 +101,11 @@ class NonoDB:
             timeout=timeout,
             verify=verify if transport is None else True,
         )
-        # Opcjonalny cache odczytów. Domyślnie wyłączony (cache_ttl=0).
-        # TTL ogranicza nieświeżość danych zapisanych przez inne procesy;
-        # każdy zapis przez tę instancję czyści cache w całości.
+        # Optional read cache. Disabled by default (cache_ttl=0).
+        # TTL bounds staleness for data written by other processes;
+        # every write through this instance clears the whole cache.
         self._cache_ttl = cache_ttl
-        # Wartości trzymamy jako zserializowany JSON (bez deepcopy).
+        # Values are stored as serialized JSON (no deepcopy).
         self._cache: dict[bytes, tuple[float, bytes]] = {}
         self._cache_lock = threading.Lock()
 
@@ -145,12 +145,12 @@ class NonoDB:
                 if cache_key is not None:
                     self._cache[cache_key] = (time.monotonic(), _dumps(result))
                 else:
-                    # Zapis unieważnia wszystkie odczyty (spójność w obrębie klienta).
+                    # A write invalidates all reads (consistency within the client).
                     self._cache.clear()
         return result
 
     def _exec_uncached(self, payload: dict[str, Any], op: Optional[str]) -> Any:
-        # Odczyty ponawiamy po błędzie transportu; zapisów nie (ryzyko duplikatu).
+        # Reads are retried after a transport error; writes are not (duplicate risk).
         retries = 2 if op in _READ_OPS else 0
         attempt = 0
         while True:
@@ -166,8 +166,8 @@ class NonoDB:
                 break
             except httpx.TransportError as exc:
                 if attempt >= retries:
-                    # Daemon niedostępny / zerwane połączenie — zawsze nasz typ,
-                    # żeby wołający nie musiał znać httpx.
+                    # Daemon unavailable / broken connection - always our own type,
+                    # so callers do not need to know about httpx.
                     raise NonoDBError("connection", str(exc)) from exc
                 attempt += 1
                 time.sleep(0.01 * attempt)
@@ -193,19 +193,19 @@ class NonoDB:
         return self.exec({"op": "list_collections"})["collections"]
 
     def batch(self, ops: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Wykonuje listę **odczytów** w jednej transakcji LMDB.
+        """Executes a list of **reads** in one LMDB transaction.
 
-        Każdy element wyniku to `{"ok": true, "result": ...}` albo
-        `{"ok": false, "error": {"code", "message"}}`. Operacje zapisu są
-        odrzucane (brak transakcji wielo-dokumentowych).
+        Each result element is `{"ok": true, "result": ...}` or
+        `{"ok": false, "error": {"code", "message"}}`. Write operations are
+        rejected (there are no multi-document transactions).
         """
         return self.exec({"op": "batch", "ops": ops})["results"]
 
     def write_batch(self, ops: list[dict[str, Any]]) -> list[Any]:
-        """Atomowy batch zapisów: wszystko albo nic.
+        """Atomic write batch: all or nothing.
 
-        Dozwolone operacje: `insert`, `insert_many`, `update`, `delete`.
-        Każda musi zawierać `coll`. Zwraca listę wyników w kolejności operacji.
+        Allowed operations: `insert`, `insert_many`, `update`, `delete`.
+        Each must contain `coll`. Returns results in operation order.
         """
         return self.exec({"op": "write_batch", "ops": ops})["results"]
 
@@ -218,7 +218,7 @@ class Collection:
         self._db = db
         self.name = name
 
-    # -- zapis -------------------------------------------------------
+    # -- write -------------------------------------------------------
     def insert(self, doc: dict[str, Any]) -> str:
         return self._db.exec({"op": "insert", "coll": self.name, "doc": doc})[
             "inserted_id"
@@ -237,7 +237,7 @@ class Collection:
         *,
         upsert: bool = False,
     ) -> int:
-        """Aktualizuje dokumenty; z `upsert=True` wstawia nowy, gdy brak trafień."""
+        """Updates documents; with `upsert=True`, inserts a new one when nothing matches."""
         return self.update_result(filter, update, multi=multi, upsert=upsert)["modified"]
 
     def update_result(
@@ -248,7 +248,7 @@ class Collection:
         *,
         upsert: bool = False,
     ) -> dict[str, Any]:
-        """Zwraca `{matched, modified, upserted_id}` (przydatne przy upsercie)."""
+        """Returns `{matched, modified, upserted_id}` (useful for upserts)."""
         return self._db.exec(
             {
                 "op": "update",
@@ -266,12 +266,12 @@ class Collection:
         )["deleted"]
 
     def write_batch(self, ops: list[dict[str, Any]]) -> list[Any]:
-        """Atomowy batch zapisów w tej kolekcji (`coll` dodawane automatycznie)."""
+        """Atomic write batch in this collection (`coll` is added automatically)."""
         return self._db.write_batch(
             [{**op, "coll": op.get("coll", self.name)} for op in ops]
         )
 
-    # -- indeksy -----------------------------------------------------
+    # -- indexes -----------------------------------------------------
     def create_index(
         self,
         field: Optional[str] = None,
@@ -280,14 +280,14 @@ class Collection:
         fields: Optional[list[str]] = None,
         include: Optional[list[str]] = None,
     ) -> bool:
-        """Tworzy indeks pojedynczy (`field`) albo złożony (`fields`).
+        """Creates a single-field (`field`) or compound (`fields`) index.
 
-        `include` kopiuje dodatkowe pola do indeksu, pozwalając pokryć projekcję
-        bez odczytu dokumentu (covering index).
+        `include` copies extra fields into the index, allowing a projection to be covered
+        without reading the document (covering index).
         """
         if fields is None:
             if field is None:
-                raise ValueError("podaj `field` albo `fields`")
+                raise ValueError("provide `field` or `fields`")
             fields = [field]
         self._db.exec(
             {
@@ -309,7 +309,7 @@ class Collection:
         return self._db.exec({"op": "list_indexes", "coll": self.name})["indexes"]
 
     def get_many(self, ids: Iterable[str]) -> list[dict[str, Any]]:
-        """Pobiera wiele dokumentów po `_id` jednym żądaniem (batch)."""
+        """Fetches multiple documents by `_id` in one request (batch)."""
         ops = [
             {"op": "find_one", "coll": self.name, "filter": {"_id": i}} for i in ids
         ]
@@ -361,7 +361,7 @@ class Collection:
         skip: int = 0,
         limit: int = 10,
     ) -> list[dict[str, Any]]:
-        """Full-text (BM25). Wyniki mają dodatkowe `_score`, malejąco."""
+        """Full-text search (BM25). Results include an extra `_score`, descending."""
         return self._db.exec(
             {
                 "op": "search",
@@ -383,7 +383,7 @@ class Collection:
         filter: Optional[dict[str, Any]] = None,
         limit: int = 10,
     ) -> list[dict[str, Any]]:
-        """Wyszukiwanie przybliżone. Wyniki mają `_distance`, rosnąco."""
+        """Approximate search. Results include `_distance`, ascending."""
         return self._db.exec(
             {
                 "op": "fuzzy",
@@ -396,7 +396,7 @@ class Collection:
             }
         )["results"]
 
-    # -- odczyt ------------------------------------------------------
+    # -- read --------------------------------------------------------
     def find(
         self,
         filter: Optional[dict[str, Any]] = None,

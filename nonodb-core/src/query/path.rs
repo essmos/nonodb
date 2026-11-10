@@ -1,9 +1,9 @@
-//! Operacje na ścieżkach dokumentu, np. `a.b.c`.
+//! Document path operations, e.g. `a.b.c`.
 
 use crate::error::{Error, Result};
 use serde_json::Value;
 
-/// Odczyt wartości spod ścieżki (kropki = zagnieżdżenie).
+/// Reads a value at a path (dots denote nesting).
 pub fn get<'a>(val: &'a Value, path: &str) -> Option<&'a Value> {
     let mut cur = val;
     for part in path.split('.') {
@@ -15,7 +15,7 @@ pub fn get<'a>(val: &'a Value, path: &str) -> Option<&'a Value> {
     Some(cur)
 }
 
-/// Zmienialny odczyt wartości spod ścieżki (bez tworzenia brakujących pól).
+/// Mutable read of a value at a path (without creating missing fields).
 pub fn get_mut<'a>(val: &'a mut Value, path: &str) -> Option<&'a mut Value> {
     match path.split_once('.') {
         None => val.as_object_mut()?.get_mut(path),
@@ -26,7 +26,7 @@ pub fn get_mut<'a>(val: &'a mut Value, path: &str) -> Option<&'a mut Value> {
     }
 }
 
-/// Ustawia wartość; tworzy brakujące obiekty pośrednie.
+/// Sets a value; creates missing intermediate objects.
 pub fn set(val: &mut Value, path: &str, new: Value) -> Result<()> {
     let (head, rest) = match path.split_once('.') {
         Some((h, r)) => (h, Some(r)),
@@ -51,7 +51,7 @@ pub fn set(val: &mut Value, path: &str, new: Value) -> Result<()> {
     Ok(())
 }
 
-/// Usuwa pole ze ścieżki. Zwraca `true`, jeśli coś usunięto.
+/// Removes a field at a path. Returns `true` if something was removed.
 pub fn unset(val: &mut Value, path: &str) -> bool {
     match path.split_once('.') {
         None => val

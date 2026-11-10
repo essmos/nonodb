@@ -1,4 +1,4 @@
-//! Otwieranie LMDB i zarządzanie kolekcjami.
+//! Opening LMDB and managing collections.
 
 use std::path::Path;
 
@@ -8,12 +8,12 @@ use heed::{Database, Env, EnvOpenOptions, RoTxn, RwTxn};
 use crate::collection::Collection;
 use crate::error::{Error, Result};
 
-/// Maksymalny rozmiar pliku bazy. To przestrzeń adresowa mmap — **nie**
-/// rezerwacja dysku ani RAM. Plik rośnie w miarę potrzeb do tego limitu.
+/// Maximum database file size. This is mmap address space - **not**
+/// a disk or RAM reservation. The file grows on demand up to this limit.
 pub const MAP_SIZE: usize = 1024 * 1024 * 1024; // 1 GiB
 
-/// Rozmiar mapy z `NONODB_MAP_SIZE` (np. `4GiB`, `2048MiB`, bajty).
-/// `map_size` to tylko rezerwacja przestrzeni adresowej — nie dysk ani RAM.
+/// Map size from `NONODB_MAP_SIZE` (e.g. `4GiB`, `2048MiB`, bytes).
+/// `map_size` is only an address-space reservation - not disk or RAM.
 fn configured_map_size() -> usize {
     std::env::var("NONODB_MAP_SIZE")
         .ok()
@@ -41,32 +41,32 @@ fn parse_size(raw: &str) -> Option<usize> {
     }
     s.parse().ok()
 }
-/// Domyślny rozmiar strony LMDB (4 KiB).
+/// Default LMDB page size (4 KiB).
 pub const PAGE_SIZE: usize = 4096;
-/// Maksymalna liczba sub-baz (kolekcje + meta + indeksy).
+/// Maximum number of sub-databases (collections + meta + indexes).
 pub const MAX_DBS: u32 = 256;
-/// Nazwa sub-bazy z metadanymi.
+/// Metadata sub-database name.
 pub const META_DB: &str = "meta";
-/// Wersja formatu danych (do przyszłych migracji).
+/// Data format version (for future migrations).
 pub const SCHEMA_VERSION: u32 = 1;
-/// Soft limit rozmiaru dokumentu (serializowanego JSON).
-/// LMDB technicznie obsługuje większe wartości (overflow pages), ale duży
-/// dokument = drogi update (przepisanie całości).
+/// Soft document size limit (serialized JSON).
+/// LMDB technically supports larger values (overflow pages), but a large
+/// document means an expensive update (the whole value is rewritten).
 pub const MAX_DOCUMENT_BYTES: usize = 1024 * 1024;
 
-/// Uchwyt do bazy. Jeden `Store` = jeden `Env` = jeden plik LMDB.
+/// Database handle. One `Store` = one `Env` = one LMDB file.
 pub struct Store {
     env: Env,
 }
 
 impl Store {
-    /// Otwiera (lub tworzy) bazę w katalogu `path`.
+    /// Opens (or creates) the database in the `path` directory.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         std::fs::create_dir_all(path)?;
 
-        // SAFETY: nie modyfikujemy pliku poza LMDB i nie otwieramy go
-        // równolegle z innym `map_size` (daemon jest jedynym właścicielem).
+        // SAFETY: the file is not modified outside LMDB and is not opened
+        // concurrently with another `map_size` (the daemon is the sole owner).
         let env = unsafe {
             EnvOpenOptions::new()
                 .map_size(configured_map_size())
@@ -75,7 +75,7 @@ impl Store {
         };
 
         let store = Self { env };
-        // Po `kill -9` mogą zostać martwe sloty czytelników w tabeli locków.
+        // After `kill -9`, dead reader slots may remain in the lock table.
         let _ = store.env.clear_stale_readers();
         store.init_meta()?;
         Ok(store)
@@ -114,13 +114,13 @@ impl Store {
         Ok(())
     }
 
-    /// Otwiera kolekcję; tworzy ją, jeśli nie istnieje.
+    /// Opens a collection; creates it if it does not exist.
     ///
-    /// Istniejąca kolekcja otwierana jest tylko transakcją odczytu (bez zapisu).
+    /// An existing collection is opened with a read-only transaction.
     pub fn collection(&self, name: &str) -> Result<Collection<'_>> {
         Self::validate_name(name)?;
 
-        // Szybka ścieżka: kolekcja już istnieje — tylko odczyt.
+        // Fast path: the collection already exists - read only.
         {
             let rtxn = self.read_txn()?;
             if let Some(db) = self.env.open_database::<Bytes, Bytes>(&rtxn, Some(name))? {
@@ -128,24 +128,24 @@ impl Store {
                     .env
                     .open_database::<Bytes, Bytes>(&rtxn, Some(META_DB))?
                     .ok_or_else(|| Error::Query("meta database missing".into()))?;
-                // UWAGA: heed wymaga `commit()` transakcji odczytu, w której
-                // otwarto bazę — inaczej kolejne użycie `db` kończy się EINVAL.
+                // NOTE: heed requires `commit()` on the read transaction in which
+                // the database was opened; otherwise later `db` use fails with EINVAL.
                 rtxn.commit()?;
                 return Ok(self.wrap(name, db, meta));
             }
             rtxn.commit()?;
         }
 
-        // Wolna ścieżka: pierwsze użycie — utwórz kolekcję.
+        // Slow path: first use - create the collection.
         let mut wtxn = self.write_txn()?;
         let collection = self.collection_in(&mut wtxn, name)?;
         wtxn.commit()?;
         Ok(collection)
     }
 
-    /// Otwiera/tworzy kolekcję w ramach **istniejącej** transakcji zapisu.
-    /// Używane przez task piszący (group commit), by nie otwierać zagnieżdżonej
-    /// transakcji.
+    /// Opens/creates a collection within an **existing** write transaction.
+    /// Used by the writer task (group commit) to avoid opening a nested
+    /// transaction.
     pub fn collection_in<'e>(&'e self, wtxn: &mut RwTxn<'_>, name: &str) -> Result<Collection<'e>> {
         Self::validate_name(name)?;
         let db = self
@@ -161,8 +161,8 @@ impl Store {
         Ok(self.wrap(name, db, meta))
     }
 
-    /// Otwiera **istniejącą** kolekcję w podanej transakcji odczytu.
-    /// Zwraca `None`, jeśli kolekcja nie istnieje (bez tworzenia).
+    /// Opens an **existing** collection in the given read transaction.
+    /// Returns `None` if the collection does not exist (without creating it).
     pub fn collection_at<'e>(
         &'e self,
         rtxn: &RoTxn<'_>,
@@ -188,7 +188,7 @@ impl Store {
         Collection::new(&self.env, db, meta, name.to_string())
     }
 
-    /// Lista zarejestrowanych kolekcji.
+    /// List of registered collections.
     pub fn collections(&self) -> Result<Vec<String>> {
         let rtxn = self.read_txn()?;
         let out = self.collections_in(&rtxn)?;
@@ -196,7 +196,7 @@ impl Store {
         Ok(out)
     }
 
-    /// Lista kolekcji w podanej transakcji odczytu.
+    /// List of collections in the given read transaction.
     pub fn collections_in(&self, rtxn: &RoTxn<'_>) -> Result<Vec<String>> {
         let meta: Database<Bytes, Bytes> = self
             .env

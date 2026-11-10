@@ -31,6 +31,10 @@ nonodb is a real document database with:
 - a bounded daemon read cache, invalidated after every committed write;
 - optional automatic indexes for frequent query shapes, with TTL cleanup.
 
+**Forget about creating indexes — NoNoDB will do it for you if it decides it is
+necessary.** Automatic indexing is opt-in (`NONODB_AUTO_INDEX=1`), conservative,
+and removes unused automatic indexes after a configurable TTL.
+
 These are capabilities often split across several services or reserved for
 larger databases and paid enterprise editions. nonodb puts them in one small,
 MIT-licensed binary: no paid tier, no license keys, no feature gates.

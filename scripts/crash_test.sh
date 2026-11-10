@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Test crash-safety: zapisuje równolegle, zabija daemon `kill -9`, restartuje
-# i weryfikuje, że baza się otwiera i dane są spójne.
+# Crash-safety test: writes concurrently, kills the daemon with `kill -9`, restarts it
+# and verifies that the database opens and the data is consistent.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"

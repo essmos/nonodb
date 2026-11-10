@@ -1,14 +1,14 @@
-//! nonodb-core — dokumentowa warstwa nad LMDB.
+//! nonodb-core - the document layer on top of LMDB.
 //!
-//! Warstwa storage nie zna protokołu (HTTP/JSON po UDS) ani daemona — dostaje
-//! dokumenty jako `serde_json::Value` i operuje na sub-bazach LMDB.
+//! The storage layer knows nothing about the protocol (HTTP/JSON over UDS) or
+//! the daemon - it receives documents as `serde_json::Value` and operates on LMDB sub-databases.
 //!
-//! Układ sub-baz:
-//!   `meta`               — rejestr kolekcji (klucz `collection:<nazwa>`);
-//!   `coll:<nazwa>`       — `_id` (string) -> dokument (JSON);
-//!   `idx:<coll>:<pole>`  — indeks wtórny (etap 4.0);
-//!   `ft:<coll>:<pole>`   — postings BM25 (full-text);
-//!   `fz:<coll>:<pole>`   — trigramy (fuzzy search).
+//! Sub-database layout:
+//!   `meta`               - collection registry (key `collection:<name>`);
+//!   `coll:<name>`        - `_id` (string) -> document (JSON);
+//!   `idx:<coll>:<field>` - secondary index;
+//!   `ft:<coll>:<field>`  - BM25 postings (full-text);
+//!   `fz:<coll>:<field>`  - trigrams (fuzzy search).
 
 pub mod collection;
 pub mod error;
@@ -23,6 +23,6 @@ pub use index::{IndexDef, RangeBytes};
 pub use search::DEFAULT_FUZZY_DISTANCE;
 pub use store::{Store, MAP_SIZE, MAX_DBS, MAX_DOCUMENT_BYTES, META_DB, PAGE_SIZE};
 
-// Re-eksport `heed`, aby warstwa daemona mogła operować na `RwTxn`
-// bez osobnej zależności (spójność wersji).
+// Re-export `heed` so the daemon layer can operate on `RwTxn`
+// without a separate dependency (version consistency).
 pub use heed;

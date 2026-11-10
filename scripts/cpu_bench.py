@@ -1,4 +1,4 @@
-"""Profil CPU daemona: ile rdzeni realnie używa zapis i odczyt.
+"""Daemon CPU profile: how many cores writes and reads actually use.
 
     NONODB_SOCK=/tmp/nonodb.sock NONODB_PID=1234 \
         python3 scripts/cpu_bench.py --workers 12 --writes 24000 --reads 60000
@@ -125,7 +125,7 @@ def main() -> int:
     )
     print(f"  -> {args.reads / wall_r:,.0f} ops/s")
 
-    # Skalowanie odczytu: 4 vs 12 procesów.
+    # Read scaling: 4 vs 12 processes.
     for w in (4, 12):
         (_, wall) = run_phase(
             f"ODCZYT _id ({w} procesów)",

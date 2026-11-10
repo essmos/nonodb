@@ -1,4 +1,4 @@
-"""Test cache odczytów klienta (wymaga działającego daemona).
+"""Client read-cache test (requires a running daemon).
 
     NONODB_SOCK=/tmp/nonodb.sock python3 client/cache_test.py
 """
@@ -26,20 +26,20 @@ def main() -> int:
 
     assert c.find_one({"_id": doc_id})["v"] == 1
 
-    # Inny proces zmienia dokument — cache w `cached` trzyma starą wartość (TTL).
+    # Another process changes the document - the cache in `cached` keeps the old value (TTL).
     p.update({"_id": doc_id}, {"$set": {"v": 2}})
     assert c.find_one({"_id": doc_id})["v"] == 1, "cache powinien zwrócić starą wartość"
 
-    # Zapis przez tę samą instancję czyści cache.
+    # A write through the same instance clears the cache.
     c.update({"_id": doc_id}, {"$set": {"v": 3}})
     assert c.find_one({"_id": doc_id})["v"] == 3
 
-    # Zwracana wartość to kopia — mutacja nie psuje cache.
+    # The returned value is a copy - mutation does not corrupt the cache.
     got = c.find_one({"_id": doc_id})
     got["v"] = 999
     assert c.find_one({"_id": doc_id})["v"] == 3
 
-    # TTL: po wygaśnięciu widać zmianę z innego procesu.
+    # TTL: after expiry, a change from another process becomes visible.
     short = NonoDB(SOCK, cache_ttl=0.2)
     s = short.collection("cachetest")
     assert s.find_one({"_id": doc_id})["v"] == 3
@@ -48,7 +48,7 @@ def main() -> int:
     time.sleep(0.25)
     assert s.find_one({"_id": doc_id})["v"] == 4, "po TTL powinien odświeżyć"
 
-    # Wyłączony cache (domyślnie) zawsze widzi świeże dane.
+    # A disabled cache (the default) always sees fresh data.
     assert p.find_one({"_id": doc_id})["v"] == 4
 
     cached.close()

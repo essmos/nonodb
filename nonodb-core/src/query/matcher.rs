@@ -1,17 +1,17 @@
-//! Matcher filtrów w stylu MongoDB (podzbiór).
+//! MongoDB-style filter matcher (subset).
 //!
-//! Obsługiwane operatory: `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`,
+//! Supported operators: `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`,
 //! `$nin`, `$exists`, `$not`, `$and`, `$or`, `$nor`.
 //!
-//! Reguła porównań: liczby są zawsze sprowadzane do `f64`, więc `30` i `30.0`
-//! są sobie równe — spójnie dla `$eq` i `$gt` (patrz TODO 3.0).
+//! Comparison rule: numbers are always converted to `f64`, so `30` and `30.0`
+//! compare as equal - consistently for `$eq` and `$gt` (see TODO 3.0).
 
 use serde_json::Value;
 use std::cmp::Ordering;
 
 use crate::query::path;
 
-/// Czy dokument pasuje do filtra. Filtr nie będący obiektem pasuje do wszystkiego.
+/// Does the document match the filter? A non-object filter matches everything.
 pub fn matches(doc: &Value, filter: &Value) -> bool {
     let Some(obj) = filter.as_object() else {
         return true;
@@ -26,7 +26,7 @@ pub fn matches(doc: &Value, filter: &Value) -> bool {
         "$nor" => cond
             .as_array()
             .is_some_and(|arr| !arr.iter().any(|f| matches(doc, f))),
-        // `$not` na poziomie filtra: neguje cały podfiltr.
+        // `$not` at filter level: negates the whole subfilter.
         "$not" => !matches(doc, cond),
         _ => {
             let actual = if key.contains('.') {
@@ -61,13 +61,13 @@ fn match_field(actual: Option<&Value>, cond: &Value) -> bool {
             });
         }
     }
-    // Zwykła równość: { "name": "Ala" }.
+    // Plain equality: { "name": "Ala" }.
     eq_opt(actual, cond)
 }
 
-/// Równość z semantyką MongoDB:
-/// - brak pola == `null`,
-/// - `{tags: "x"}` pasuje, gdy `tags` jest tablicą zawierającą `x`.
+/// Equality with MongoDB semantics:
+/// - missing field == `null`,
+/// - `{tags: "x"}` matches when `tags` is an array containing `x`.
 pub(crate) fn eq_opt(actual: Option<&Value>, expected: &Value) -> bool {
     match actual {
         None => expected.is_null(),
@@ -78,7 +78,7 @@ pub(crate) fn eq_opt(actual: Option<&Value>, expected: &Value) -> bool {
     }
 }
 
-/// Równość wartości z ujednoliconym porównaniem liczb.
+/// Value equality with unified number comparison.
 pub(crate) fn num_eq(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Number(x), Value::Number(y)) => match (x.as_f64(), y.as_f64()) {
@@ -149,7 +149,7 @@ mod tests {
         assert!(matches(&doc, &json!({"a.b": {"c": 7}})));
         assert!(!matches(&doc, &json!({"a.b.c": 8})));
         assert!(matches(&doc, &json!({"a.b.c": {"$gte": 7}})));
-        // Brak pola nadal znaczy `null`; `$exists` odróżnia te przypadki.
+        // A missing field still means `null`; `$exists` distinguishes these cases.
         assert!(matches(&doc, &json!({"a.b.missing": null})));
         assert!(!matches(&doc, &json!({"a.b.missing": {"$exists": true}})));
     }

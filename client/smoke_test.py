@@ -1,11 +1,11 @@
-"""Smoke + test współbieżności dla nonodb (wymaga uruchomionego daemona).
+"""Smoke and concurrency test for nonodb (requires a running daemon).
 
-Uruchomienie:
+Run with:
     NONODB_SOCK=/tmp/nonodb-smoke/nonodb.sock python3 client/smoke_test.py
 
-Test współbieżności: 12 wątków (symulacja 12 workerów uvicorn) wykonuje
-`$inc` na tym samym dokumencie. Oczekiwany wynik jest dokładny — to weryfikacja
-atomowego read-modify-write i group commit.
+Concurrency test: 12 threads (simulating 12 uvicorn workers) perform
+`$inc` on the same document. The expected result is exact - this verifies
+atomic read-modify-write and group commit.
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ def main() -> int:
     errors: list[BaseException] = []
 
     def worker() -> None:
-        # Każdy wątek ma własne połączenie — tak jak osobny worker uvicorn.
+        # Each thread has its own connection - like a separate uvicorn worker.
         local = NonoDB(SOCK)
         c = local.collection("concurrency")
         try:
@@ -59,7 +59,7 @@ def main() -> int:
         print("FAIL: zgubione aktualizacje (lost update)")
         return 1
 
-    # Błąd transportu musi być NonoDBError("connection"), nie surowy httpx.
+    # A transport error must be NonoDBError("connection"), not raw httpx.
     ghost = NonoDB("/tmp/nonodb-nie-istnieje.sock", timeout=0.2)
     try:
         ghost.collection("x").count({})

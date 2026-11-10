@@ -1,4 +1,4 @@
-//! Operacje na kolekcji dokumentów.
+//! Document collection operations.
 
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
@@ -15,36 +15,36 @@ use crate::query::{apply_update, apply_upsert, matches, path, seed_from_filter};
 use crate::search;
 use crate::store::MAX_DOCUMENT_BYTES;
 
-/// Od ilu dokumentów pełny skan z sortowaniem idzie na wiele wątków.
+/// Minimum document count for a sorted full scan to use multiple threads.
 #[cfg(not(test))]
 const PARALLEL_SCAN_MIN_ENTRIES: usize = 50_000;
 #[cfg(test)]
 const PARALLEL_SCAN_MIN_ENTRIES: usize = 200;
 
-/// Maksymalne `skip + limit` dla ścieżki równoległej. Przy głębokim `skip`
-/// każdy wątek musiałby trzymać własny duży TopK — wtedy lepiej zostać przy
-/// jednym wątku i ograniczonym zużyciu pamięci.
+/// Maximum `skip + limit` for the parallel path. With a deep `skip`
+/// each thread would have to keep its own large TopK; it is better to stay on
+/// one thread and keep memory use bounded.
 const PARALLEL_SCAN_MAX_WANT: usize = 50_000;
 
-/// Od jakiego `skip + limit` opłaca się równoległy skan bez sortowania.
-/// Dla `find_one` i bardzo małych limitów wczesne wyjście jest zwykle szybsze.
+/// Minimum `skip + limit` for a parallel scan without sorting to be worthwhile.
+/// For `find_one` and very small limits, early exit is usually faster.
 const PARALLEL_UNSORTED_MIN_WANT: usize = 16;
 
-/// Rozmiar porcji surowych bajtów przekazywanej wątkom roboczym.
+/// Size of the raw-byte chunk passed to worker threads.
 const PARALLEL_SCAN_CHUNK: usize = 8192;
 
-/// Porcja skanu: jeden bufor bajtów + offsety dokumentów (mniej alokacji).
+/// Scan chunk: one byte buffer plus document offsets (fewer allocations).
 struct ScanChunk {
     idx: usize,
     data: Vec<u8>,
     docs: Vec<(usize, u32, u32)>,
 }
 
-/// Tani prefiltr pełnego skanu: dla prostych równości string/bool sprawdza,
-/// czy w surowym JSON w ogóle występuje klucz i wartość. Fałszywe trafienia są
-/// akceptowane (potem i tak działa matcher), ale nie może być fałszywych
-/// pominięć. Liczby i `null` są pomijane, bo ich semantyka/różnice formatowania
-/// wymagają pełnego parsera.
+/// Cheap full-scan prefilter: for simple string/bool equalities, checks
+/// whether the key and value appear in the raw JSON at all. False positives are
+/// acceptable (the matcher runs afterwards), but false negatives are not
+/// allowed. Numbers and `null` are skipped because their semantics/formatting
+/// differences require the full parser.
 #[derive(Debug, Clone, Default)]
 struct RawPrefilter {
     needles: Vec<Vec<u8>>,
@@ -58,14 +58,14 @@ impl RawPrefilter {
     }
 }
 
-/// Buduje prefiltr dla bezpiecznych warunków równości. Warunki, których nie
-/// umiemy sprawdzić po bajtach, są ignorowane (filtr to AND, więc to bezpieczne).
+/// Builds a prefilter for safe equality conditions. Conditions we cannot
+/// check at the byte level are ignored (the filter is an AND, so this is safe).
 fn raw_prefilter(filter: &Value) -> Option<RawPrefilter> {
     let obj = filter.as_object()?;
     let mut needles = Vec::new();
     for (key, cond) in obj {
         if key.starts_with('$') {
-            // `$or` / `$not` / `$nor` nie da się bezpiecznie zignorować.
+            // `$or` / `$not` / `$nor` cannot be safely ignored.
             return None;
         }
         if key.contains('.') || key == "_id" {
@@ -90,8 +90,8 @@ fn raw_prefilter(filter: &Value) -> Option<RawPrefilter> {
     }
 }
 
-/// Zwraca wartość równości, jeśli da się ją bezpiecznie znaleźć w surowym
-/// JSON. Obsługujemy tylko stringi i boole; resztę zostawiamy parserowi.
+/// Returns the equality value if it can be safely found in the raw
+/// JSON. Only strings and booleans are supported; the rest goes to the parser.
 fn raw_equality_value(cond: &Value) -> Option<&Value> {
     match cond {
         Value::String(_) | Value::Bool(_) => Some(cond),
@@ -103,7 +103,7 @@ fn raw_equality_value(cond: &Value) -> Option<&Value> {
     }
 }
 
-/// Parsuje dokument tylko wtedy, gdy prefiltr go nie odrzucił.
+/// Parses a document only when the prefilter did not reject it.
 fn parse_prefiltered(bytes: &[u8], raw: Option<&RawPrefilter>) -> Result<Option<Value>> {
     if raw.is_some_and(|r| !r.matches(bytes)) {
         return Ok(None);
@@ -111,14 +111,14 @@ fn parse_prefiltered(bytes: &[u8], raw: Option<&RawPrefilter>) -> Result<Option<
     parse_json(bytes).map(Some)
 }
 
-/// Szybkie parsowanie JSON (SIMD) do `serde_json::Value`.
+/// Fast JSON parsing (SIMD) into `serde_json::Value`.
 fn parse_json(bytes: &[u8]) -> Result<Value> {
     sonic_rs::from_slice::<Value>(bytes).map_err(|e| Error::JsonFast(e.to_string()))
 }
 
 type TextBackfillEntry = (String, Vec<(String, u32)>, u32);
 
-/// Wynik operacji `update` (z opcjonalnym upsertem).
+/// `update` operation result (with optional upsert).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdateOutcome {
     pub matched: usize,
@@ -128,27 +128,27 @@ pub struct UpdateOutcome {
 type IndexIter<'a> = Box<dyn Iterator<Item = heed::Result<(&'a [u8], &'a [u8])>> + 'a>;
 type IdBounds = (Bound<Vec<u8>>, Bound<Vec<u8>>);
 
-/// Porcja backfillu: bufor z `_id` + dokumentami.
+/// Backfill chunk: a buffer of `_id` values plus documents.
 struct BackfillChunk {
     data: Vec<u8>,
     docs: Vec<(u32, u32, u32, u32)>, // id_start, id_len, doc_start, doc_len
 }
 
-/// Wybrany indeks i zakres kluczy dla filtra.
+/// Selected index and key range for a filter.
 struct IndexPlan {
     db: Database<Bytes, Bytes>,
     bounds: index::RangeBytes,
     def: IndexDef,
 }
 
-/// Parametry zapytania `find`.
+/// `find` query parameters.
 #[derive(Debug, Clone, Default)]
 pub struct FindQuery {
-    /// Filtr w stylu MongoDB; `Null`/`{}` = wszystko.
+    /// MongoDB-style filter; `Null`/`{}` = match everything.
     pub filter: Value,
-    /// Projekcja pól (na razie płaska, top-level).
+    /// Field projection (currently flat, top-level).
     pub projection: Option<Value>,
-    /// Klucze sortowania: `(ścieżka, 1 | -1)`.
+    /// Sort keys: `(path, 1 | -1)`.
     pub sort: Vec<(String, i32)>,
     pub skip: usize,
     pub limit: Option<usize>,
@@ -180,9 +180,9 @@ impl<'e> Collection<'e> {
         &self.name
     }
 
-    // ----------------------------- indeksy -----------------------------
+    // ----------------------------- indexes -----------------------------
 
-    /// Definicje indeksów tej kolekcji (odczyt w podanej transakcji).
+    /// Index definitions for this collection (read in the given transaction).
     fn index_defs(&self, txn: &RoTxn<'_>) -> Result<Vec<IndexDef>> {
         let prefix = format!("index:{}:", self.name);
         let mut defs = Vec::new();
@@ -205,8 +205,8 @@ impl<'e> Collection<'e> {
             .create_database(&mut *wtxn, Some(&index::db_name(&self.name, &def.name())))?)
     }
 
-    /// Tworzy indeks wtórny (pojedyncze pole) i uzupełnia go istniejącymi
-    /// dokumentami.
+    /// Creates a secondary index (single field) and backfills it with existing
+    /// documents.
     pub fn create_index(&self, field: &str, unique: bool) -> Result<()> {
         self.create_index_fields(&[field.to_string()], unique, &[])
     }
@@ -215,8 +215,8 @@ impl<'e> Collection<'e> {
         self.create_index_fields_txn(wtxn, &[field.to_string()], unique, &[])
     }
 
-    /// Tworzy indeks złożony. Kolejność pól ma znaczenie: prefiks pól może
-    /// obsłużyć filtr, a pełny indeks również sortowanie.
+    /// Creates a compound index. Field order matters: a field prefix can
+    /// serve a filter, and the full index can also serve sorting.
     pub fn create_index_fields(
         &self,
         fields: &[String],
@@ -253,7 +253,7 @@ impl<'e> Collection<'e> {
         )?;
         let idx_db = self.index_db_in(wtxn, &def)?;
 
-        // Backfill: równoległe parsowanie/kodowanie, zapis w jednej transakcji.
+        // Backfill: parallel parsing/encoding, written in one transaction.
         let fields = def.effective_fields();
         let def_ref = &def;
         let entries: Vec<(Vec<u8>, Vec<u8>, String)> =
@@ -279,7 +279,7 @@ impl<'e> Collection<'e> {
         Ok(())
     }
 
-    /// Usuwa indeks (czyści dane i definicję).
+    /// Drops an index (clears its data and definition).
     pub fn drop_index(&self, field: &str) -> Result<bool> {
         let mut wtxn = self.write_txn()?;
         let existed = self.drop_index_txn(&mut wtxn, field)?;
@@ -295,15 +295,15 @@ impl<'e> Collection<'e> {
                 .env
                 .open_database::<Bytes, Bytes>(&*wtxn, Some(&index::db_name(&self.name, field)))?
             {
-                // Usuwamy całą nazwaną sub-bazę, żeby nie zajmowała slotu
-                // `MAX_DBS` po kolejnych create/drop.
+                // Clear the entire named sub-database so it does not keep a
+                // `MAX_DBS` slot after repeated create/drop operations.
                 db.clear(&mut *wtxn)?;
             }
         }
         Ok(existed)
     }
 
-    /// Lista indeksów `(nazwa, unikalny)`; nazwa złożonego to `a+b`.
+    /// Index list `(name, unique)`; a compound index is named `a+b`.
     pub fn list_indexes(&self) -> Result<Vec<(String, bool)>> {
         let rtxn = self.read_txn()?;
         let out = self.list_indexes_in(&rtxn)?;
@@ -319,12 +319,12 @@ impl<'e> Collection<'e> {
             .collect())
     }
 
-    /// Pełne definicje indeksów w podanej transakcji.
+    /// Full index definitions in the given transaction.
     pub fn index_defs_in(&self, rtxn: &RoTxn<'_>) -> Result<Vec<IndexDef>> {
         self.index_defs(rtxn)
     }
 
-    /// Pełne definicje indeksów (dla API/CLI).
+    /// Full index definitions (for the API/CLI).
     pub fn list_index_defs(&self) -> Result<Vec<IndexDef>> {
         let rtxn = self.read_txn()?;
         let out = self.index_defs(&rtxn)?;
@@ -332,7 +332,7 @@ impl<'e> Collection<'e> {
         Ok(out)
     }
 
-    /// Sprawdza unikalność nowej wartości we wszystkich indeksach unikalnych.
+    /// Checks the new value for uniqueness across all unique indexes.
     fn validate_unique(&self, txn: &RoTxn<'_>, doc: &Value, id: &str) -> Result<()> {
         for def in self.index_defs(txn)? {
             if !def.unique {
@@ -355,7 +355,7 @@ impl<'e> Collection<'e> {
         Ok(())
     }
 
-    /// Aktualizuje wpisy indeksów dla zmiany `old -> new` (insert: `old=None`,
+    /// Updates index entries for an `old -> new` change (insert: `old=None`,
     /// delete: `new=None`).
     fn apply_index_entries(
         &self,
@@ -369,8 +369,8 @@ impl<'e> Collection<'e> {
             let fields = def.effective_fields();
             let old_vb = old.and_then(|d| index::encode_fields(d, &fields));
             let new_vb = new.and_then(|d| index::encode_fields(d, &fields));
-            // Przy `include` trzeba też porównać kopiowane pola, bo mogą się
-            // zmienić bez zmiany klucza indeksu.
+            // With `include`, copied fields must also be compared because they can
+            // change without changing the index key.
             let old_value = old.map(|d| index::encode_index_value(&def, d, id));
             let new_value = new.map(|d| index::encode_index_value(&def, d, id));
             if old_vb == new_vb && old_value == new_value {
@@ -392,11 +392,11 @@ impl<'e> Collection<'e> {
         Ok(())
     }
 
-    /// Ustala sub-bazę indeksu i zakres kluczy dla filtra.
+    /// Selects the index sub-database and key range for a filter.
     ///
-    /// Indeks złożony `[a, b, c]` jest używany, gdy filtr zawiera warunki dla
-    /// wszystkich pól, przy czym wszystkie oprócz ostatniego muszą być
-    /// równościowe (`a: 1` lub `a: {$eq: 1}`). Ostatnie pole może mieć zakres.
+    /// A compound index `[a, b, c]` is used when the filter has conditions for
+    /// all fields, with every field except the last being equality conditions
+    /// (`a: 1` or `a: {$eq: 1}`). The last field may have a range condition.
     fn index_plan(&self, rtxn: &RoTxn<'_>, filter: &Value) -> Result<Option<IndexPlan>> {
         let Some(obj) = filter.as_object() else {
             return Ok(None);
@@ -405,7 +405,7 @@ impl<'e> Collection<'e> {
             return Ok(None);
         }
 
-        // Najpierw indeksy z najdłuższym prefiksem pól (najbardziej selektywne).
+        // Try indexes with the longest field prefix first (most selective).
         let mut defs = self.index_defs(rtxn)?;
         defs.sort_by_key(|d| std::cmp::Reverse(d.effective_fields().len()));
 
@@ -446,7 +446,7 @@ impl<'e> Collection<'e> {
         Ok(Some(ids))
     }
 
-    /// Liczy wpisy indeksu w zakresie bez alokowania listy `_id`.
+    /// Counts index entries in a range without allocating an `_id` list.
     fn index_count_plan(&self, rtxn: &RoTxn<'_>, plan: &IndexPlan) -> Result<usize> {
         let (lower, upper) = &plan.bounds;
         let range = (as_bound(lower), as_bound(upper));
@@ -526,7 +526,7 @@ impl<'e> Collection<'e> {
             .create_database(&mut *wtxn, Some(&search::fuzzy_db_name(&self.name, field)))?)
     }
 
-    /// Tworzy indeks full-text (BM25) i uzupełnia go istniejącymi dokumentami.
+    /// Creates a full-text (BM25) index and backfills it with existing documents.
     pub fn create_text_index(&self, field: &str) -> Result<()> {
         let mut wtxn = self.write_txn()?;
         self.create_text_index_txn(&mut wtxn, field)?;
@@ -540,7 +540,7 @@ impl<'e> Collection<'e> {
             return Ok(());
         }
 
-        // Backfill: równoległa tokenizacja, zapis w jednej transakcji.
+        // Backfill: parallel tokenization, written in one transaction.
         let entries: Vec<TextBackfillEntry> = self.parallel_backfill(wtxn, |id, doc| {
             let Some(text) = index::field_value(&doc, field).and_then(search::field_text) else {
                 return Ok(Vec::new());
@@ -578,7 +578,7 @@ impl<'e> Collection<'e> {
         Ok(())
     }
 
-    /// Usuwa indeks full-text.
+    /// Drops a full-text index.
     pub fn drop_text_index(&self, field: &str) -> Result<bool> {
         let mut wtxn = self.write_txn()?;
         let existed = self.drop_text_index_txn(&mut wtxn, field)?;
@@ -615,7 +615,7 @@ impl<'e> Collection<'e> {
         self.text_defs(rtxn)
     }
 
-    /// Tworzy indeks trigramowy (fuzzy) i uzupełnia go istniejącymi dokumentami.
+    /// Creates a trigram (fuzzy) index and backfills it with existing documents.
     pub fn create_fuzzy_index(&self, field: &str) -> Result<()> {
         let mut wtxn = self.write_txn()?;
         self.create_fuzzy_index_txn(&mut wtxn, field)?;
@@ -677,7 +677,7 @@ impl<'e> Collection<'e> {
         self.fuzzy_defs(rtxn)
     }
 
-    /// Utrzymuje indeksy full-text przy zmianie `old -> new`.
+    /// Maintains full-text indexes on an `old -> new` change.
     fn apply_text_entries(
         &self,
         wtxn: &mut RwTxn<'_>,
@@ -734,7 +734,7 @@ impl<'e> Collection<'e> {
         Ok(())
     }
 
-    /// Utrzymuje indeksy trigramowe przy zmianie `old -> new`.
+    /// Maintains trigram indexes on an `old -> new` change.
     fn apply_fuzzy_entries(
         &self,
         wtxn: &mut RwTxn<'_>,
@@ -769,7 +769,7 @@ impl<'e> Collection<'e> {
         Ok(())
     }
 
-    /// Wyszukiwanie full-text (BM25). Wyniki mają dodatkowe pole `_score`.
+    /// Full-text search (BM25). Results include an extra `_score` field.
     pub fn search(
         &self,
         field: &str,
@@ -891,7 +891,7 @@ impl<'e> Collection<'e> {
         Ok(out)
     }
 
-    /// Wyszukiwanie przybliżone (trigramy + Levenshtein). Wyniki mają `_distance`.
+    /// Approximate search (trigrams + Levenshtein). Results include `_distance`.
     pub fn fuzzy_search(
         &self,
         field: &str,
@@ -930,7 +930,7 @@ impl<'e> Collection<'e> {
             return Ok(Vec::new());
         }
 
-        // Kandydaci: dokumenty współdzielące co najmniej jeden trigram.
+        // Candidates: documents sharing at least one trigram.
         let mut counts: HashMap<String, u32> = HashMap::new();
         for gram in search::trigrams(&query) {
             let prefix = search::posting_prefix(&gram);
@@ -977,9 +977,9 @@ impl<'e> Collection<'e> {
             .collect())
     }
 
-    // ----------------------------- zapis -----------------------------
+    // ----------------------------- write -----------------------------
 
-    /// Wstawia dokument w osobnej transakcji (wygodne w testach / bez daemona).
+    /// Inserts a document in its own transaction (handy in tests / without the daemon).
     pub fn insert_one(&self, doc: Value) -> Result<String> {
         let mut wtxn = self.write_txn()?;
         let id = self.insert_one_txn(&mut wtxn, doc)?;
@@ -987,7 +987,7 @@ impl<'e> Collection<'e> {
         Ok(id)
     }
 
-    /// Wstawia dokument w podanej transakcji. Nadaje `_id` (UUID v4), jeśli brak.
+    /// Inserts a document in the given transaction. Assigns `_id` (UUID v4) if missing.
     pub fn insert_one_txn(&self, wtxn: &mut RwTxn<'_>, mut doc: Value) -> Result<String> {
         let obj = doc
             .as_object_mut()
@@ -1019,7 +1019,7 @@ impl<'e> Collection<'e> {
         Ok(id)
     }
 
-    /// Aktualizacja z opcjonalnym upsertem; zwraca pełny wynik operacji.
+    /// Update with optional upsert; returns the full operation result.
     pub fn update_opts_txn(
         &self,
         wtxn: &mut RwTxn<'_>,
@@ -1040,7 +1040,7 @@ impl<'e> Collection<'e> {
             let mut doc = seed_from_filter(filter);
             let filter_id = doc.get("_id").cloned();
             apply_upsert(&mut doc, update)?;
-            // `_id` z filtra jest niezmienne; nie pozwól go zgubić przez update.
+            // `_id` from the filter is immutable; do not let an update lose it.
             if let Some(id) = filter_id {
                 doc["_id"] = id;
             }
@@ -1085,7 +1085,7 @@ impl<'e> Collection<'e> {
         })
     }
 
-    /// Stara sygnatura: zwraca tylko liczbę zmodyfikowanych dokumentów.
+    /// Legacy signature: returns only the number of modified documents.
     pub fn update_txn(
         &self,
         wtxn: &mut RwTxn<'_>,
@@ -1115,7 +1115,7 @@ impl<'e> Collection<'e> {
         Ok(self.update_opts(filter, update, multi, false)?.modified)
     }
 
-    /// Usuwa pasujące dokumenty. Zwraca liczbę usuniętych.
+    /// Deletes matching documents. Returns the number deleted.
     pub fn delete_txn(&self, wtxn: &mut RwTxn<'_>, filter: &Value, multi: bool) -> Result<usize> {
         let keys = self.matching_keys(&*wtxn, filter, multi)?;
         for key in &keys {
@@ -1143,10 +1143,10 @@ impl<'e> Collection<'e> {
         Ok(n)
     }
 
-    /// Zbiera klucze (`_id`) pasujące do filtra.
+    /// Collects keys (`_id`) matching the filter.
     ///
-    /// Korzysta z tych samych szybkich ścieżek co `find`: dokładne `_id`,
-    /// indeks wtórny, a dopiero na końcu pełny skan.
+    /// Uses the same fast paths as `find`: exact `_id`,
+    /// secondary index, and only then a full scan.
     fn matching_keys(&self, txn: &RoTxn<'_>, filter: &Value, multi: bool) -> Result<Vec<Vec<u8>>> {
         let mut keys = Vec::new();
         let raw = raw_prefilter(filter);
@@ -1208,17 +1208,17 @@ impl<'e> Collection<'e> {
         Ok(keys)
     }
 
-    // ----------------------------- odczyt -----------------------------
+    // ----------------------------- read ------------------------------
 
     pub fn find(&self, query: &FindQuery) -> Result<Vec<Value>> {
         let rtxn = self.read_txn()?;
         let limit = query.limit.unwrap_or(usize::MAX);
         let want = query.skip.saturating_add(limit);
 
-        // Sortowanie całego zbioru to operacja CPU-bound. Gdy filtr nie ma
-        // indeksu, parsowanie JSON i TopK można rozłożyć na wszystkie rdzenie.
-        // Snapshot pozostaje spójny: wątek główny czyta jeden `RoTxn` i wysyła
-        // wątkom tylko surowe bajty (nie współdzielimy kursora LMDB).
+        // Sorting the whole set is CPU-bound. When the filter has no
+        // index, JSON parsing and TopK can be spread across all cores.
+        // The snapshot stays consistent: the main thread reads one `RoTxn` and sends
+        // only raw bytes to workers (the LMDB cursor is not shared).
         let sorted = !query.sort.is_empty();
         let parallel_base = limit > 0
             && want <= PARALLEL_SCAN_MAX_WANT
@@ -1250,9 +1250,9 @@ impl<'e> Collection<'e> {
         Ok(out)
     }
 
-    /// Równoległy backfill indeksów: wątek główny czyta jeden `RwTxn`,
-    /// a wątki robocze parsują JSON i przygotowują wpisy. Zapis do LMDB
-    /// pozostaje w wątku głównym (jedna transakcja).
+    /// Parallel index backfill: the main thread reads one `RwTxn`,
+    /// while workers parse JSON and prepare entries. Writing to LMDB
+    /// stays on the main thread (one transaction).
     fn parallel_backfill<T, F>(&self, wtxn: &RwTxn<'_>, f: F) -> Result<Vec<T>>
     where
         T: Send,
@@ -1363,11 +1363,11 @@ impl<'e> Collection<'e> {
         Ok(out)
     }
 
-    /// Równoległy pełny skan z sortowaniem.
+    /// Parallel full scan with sorting.
     ///
-    /// Wątek główny iteruje po jednym `RoTxn` (spójny snapshot) i wrzuca porcje
-    /// surowych bajtów do kolejki. Wątki robocze parsują JSON, filtrują i liczą
-    /// lokalne TopK; na końcu wynik jest scalany z zachowaniem kolejności `seq`.
+    /// The main thread iterates one `RoTxn` (consistent snapshot) and pushes chunks
+    /// of raw bytes into a queue. Workers parse JSON, filter, and compute
+    /// local TopK; finally the result is merged preserving `seq` order.
     fn parallel_sorted_scan(
         &self,
         rtxn: &RoTxn<'_>,
@@ -1469,12 +1469,12 @@ impl<'e> Collection<'e> {
         })
     }
 
-    /// Równoległy pełny skan bez sortowania.
+    /// Parallel full scan without sorting.
     ///
-    /// Porcje są wysyłane falami: po jednej do każdego wątku. Koordynator
-    /// odbiera całą falę i składa wyniki w kolejności `_id`. Gdy uzbiera
-    /// `want` trafień, przestaje wysyłać kolejne porcje. Dzięki temu szerokie
-    /// filtry zachowują wczesne wyjście, a selektywne skanują równolegle.
+    /// Chunks are sent in waves: one to each worker. The coordinator
+    /// receives the whole wave and assembles results in `_id` order. Once it has
+    /// `want` matches, it stops sending more chunks. This lets broad
+    /// filters keep early exit while selective scans run in parallel.
     fn parallel_unsorted_scan(
         &self,
         rtxn: &RoTxn<'_>,
@@ -1500,8 +1500,8 @@ impl<'e> Collection<'e> {
         let filter = &query.filter;
         let raw = raw_prefilter(filter);
         let raw = raw.as_ref();
-        // Utwórz iterator przed startem wątków: błąd LMDB nie może zostawić
-        // workerów czekających na kanał, który nigdy nie zostanie zamknięty.
+        // Create the iterator before starting workers: an LMDB error must not leave
+        // workers waiting on a channel that is never closed.
         let mut iter = self.db.iter(rtxn)?;
 
         std::thread::scope(|scope| -> Result<Vec<Value>> {
@@ -1551,9 +1551,9 @@ impl<'e> Collection<'e> {
             let mut exhausted = false;
             let mut error: Option<Error> = None;
 
-            // Pierwsza fala jest mała, żeby szeroki filtr szybko się zatrzymał.
-            // Dopiero gdy nie wystarczy, zwiększamy falę i amortyzujemy
-            // synchronizację przy selektywnym pełnym skanie.
+            // The first wave is small so a broad filter stops quickly.
+            // Only when it is not enough do we enlarge the wave and amortize
+            // synchronization on a selective full scan.
             let mut rounds = 1usize;
             'scan: loop {
                 let mut sent = 0usize;
@@ -1650,7 +1650,7 @@ impl<'e> Collection<'e> {
         })
     }
 
-    /// Wersja jednowątkowa używana jako fallback (np. 1 rdzeń).
+    /// Single-threaded version used as a fallback (e.g. one core).
     fn scan_sorted_serial(
         &self,
         rtxn: &RoTxn<'_>,
@@ -1677,22 +1677,22 @@ impl<'e> Collection<'e> {
             return Ok(Vec::new());
         }
         let sorted = !query.sort.is_empty();
-        // Bez sortowania wystarczy `skip + limit` trafień (wczesne wyjście).
-        // Ze sortowaniem TopK trzyma tylko `want` najlepszych dokumentów.
+        // Without sorting, `skip + limit` matches are enough (early exit).
+        // With sorting, TopK keeps only the `want` best documents.
         let want = query.skip.saturating_add(limit);
         let mut acc = Acc::new(sorted, &query.sort, want);
         let mut post_skip = query.skip;
         let raw = raw_prefilter(&query.filter);
 
-        // 1) Dokładne `_id` -> bezpośredni get.
+        // 1) Exact `_id` -> direct get.
         if let Some(id) = direct_id(&query.filter) {
             if let Some(bytes) = self.db.get(rtxn, id.as_bytes())? {
                 acc.push(parse_json(bytes)?);
             }
         }
-        // 2) Indeks wtórny. Najpierw szybka ścieżka „index-only”: jeśli
-        //    sortowanie dokładnie odpowiada kolejności indeksu, idziemy po nim
-        //    i pobieramy tylko `skip + limit` dokumentów, zamiast całego zakresu.
+        // 2) Secondary index. First the fast "index-only" path: if
+        //    the sort exactly matches the index order, we walk the index
+        //    and fetch only `skip + limit` documents instead of the whole range.
         else if let Some(plan) = self.index_plan(rtxn, &query.filter)? {
             if sorted {
                 if let Some(reverse) = index_matches_sort(&plan.def, &query.sort) {
@@ -1754,15 +1754,15 @@ impl<'e> Collection<'e> {
                     let Some(doc) = parse_prefiltered(bytes, raw.as_ref())? else {
                         continue;
                     };
-                    // Residual filter: indeks może zwrócić nadmiarowe wpisy.
+                    // Residual filter: the index may return extra entries.
                     if matches(&doc, &query.filter) {
                         acc.push(doc);
                     }
                 }
             }
         }
-        // 3) Zakres `_id` po kluczu głównym. To nie jest indeks wtórny, ale
-        //    pozwala zawęzić pełny skan do ciągłego przedziału B+drzewa.
+        // 3) `_id` range over the primary key. This is not a secondary index, but
+        //    it narrows the full scan to a contiguous B+tree interval.
         else if let Some((lower, upper)) = id_bounds(&query.filter) {
             let range = (as_bound(&lower), as_bound(&upper));
             let reverse = id_sort_direction(&query.sort).unwrap_or(false);
@@ -1822,12 +1822,12 @@ impl<'e> Collection<'e> {
                 })
                 .collect());
         }
-        // 4) Pełny skan bez sortowania: pomijamy `skip` od razu, bez zbierania
-        //     pominiętych dokumentów i bez końcowego sortowania całej paczki.
+        // 4) Full scan without sorting: skip immediately, without collecting
+        //     skipped documents or sorting the whole batch at the end.
         else if !sorted {
             post_skip = 0;
             if is_match_all(&query.filter) {
-                // Naturalna kolejność = `_id`; pominiętych nie trzeba parsować.
+                // Natural order is `_id`; skipped documents do not need parsing.
                 for item in self.db.iter(rtxn)?.skip(query.skip).take(limit) {
                     let (_key, bytes) = item?;
                     acc.push(parse_json(bytes)?);
@@ -1852,7 +1852,7 @@ impl<'e> Collection<'e> {
                 }
             }
         }
-        // 3b) Pełny skan z sortowaniem: zbieramy trafienia przez TopK.
+        // 3b) Full scan with sorting: collect matches through TopK.
         else {
             for item in self.db.iter(rtxn)? {
                 let (_key, bytes) = item?;
@@ -1912,16 +1912,16 @@ impl<'e> Collection<'e> {
     }
 
     pub fn count_in(&self, rtxn: &RoTxn<'_>, filter: &Value) -> Result<usize> {
-        // `count({})` / `count(null)` -> O(1) z metadanych B+drzewa.
+        // `count({})` / `count(null)` -> O(1) from B+tree metadata.
         if is_match_all(filter) {
             return Ok(self.db.stat(rtxn)?.entries);
         }
-        // Dokładne `_id` -> bezpośredni `get`.
+        // Exact `_id` -> direct `get`.
         if let Some(id) = direct_id(filter) {
             return Ok(usize::from(self.db.get(rtxn, id.as_bytes())?.is_some()));
         }
-        // Zakres `_id` po kluczu głównym. Gdy filtr zawiera tylko warunki na
-        // `_id`, wystarczy policzyć wpisy w zakresie bez parsowania JSON.
+        // `_id` range over the primary key. When the filter contains only conditions on
+        // `_id`, counting range entries without parsing JSON is enough.
         if let Some((lower, upper)) = id_bounds(filter) {
             let range = (as_bound(&lower), as_bound(&upper));
             if filter.as_object().is_some_and(|o| o.len() == 1) {
@@ -1945,7 +1945,7 @@ impl<'e> Collection<'e> {
             }
             return Ok(n);
         }
-        // Filtr w całości pokryty indeksem: policz klucze, bez parsowania JSON.
+        // Filter fully covered by an index: count keys without parsing JSON.
         if let Some(plan) = self.index_plan(rtxn, filter)? {
             if index_filter_exact(&plan.def, filter) {
                 return self.index_count_plan(rtxn, &plan);
@@ -1974,9 +1974,9 @@ impl<'e> Collection<'e> {
     }
 }
 
-// ----------------------------- pomocnicze -----------------------------
+// ----------------------------- helpers -------------------------------
 
-/// Wartość równościowa z warunku (`5` albo `{"$eq": 5}`).
+/// Equality value from a condition (`5` or `{"$eq": 5}`).
 fn eq_value(cond: &Value) -> Option<&Value> {
     if let Some(obj) = cond.as_object() {
         if obj.len() == 1 {
@@ -1987,8 +1987,8 @@ fn eq_value(cond: &Value) -> Option<&Value> {
     Some(cond)
 }
 
-/// Buduje zakres indeksu dla filtra, jeśli wszystkie pola definicji mają
-/// warunki, a prefiks (wszystko poza ostatnim polem) jest równościowy.
+/// Builds an index range for the filter when all definition fields have
+/// conditions and the prefix (everything except the last field) is equality-based.
 fn bounds_for_index(def: &IndexDef, filter: &Map<String, Value>) -> Option<index::RangeBytes> {
     let fields = def.effective_fields();
     if fields.is_empty() {
@@ -1997,7 +1997,7 @@ fn bounds_for_index(def: &IndexDef, filter: &Map<String, Value>) -> Option<index
     let mut prefix = Vec::new();
     for (i, field) in fields.iter().enumerate() {
         let cond = filter.get(field)?;
-        // `null` pasuje też do braku pola, a braków nie ma w indeksie.
+        // `null` also matches a missing field, and missing fields are not in the index.
         if cond.is_null()
             || cond
                 .as_object()
@@ -2024,10 +2024,10 @@ fn is_match_all(filter: &Value) -> bool {
     filter.is_null() || filter.as_object().is_some_and(|o| o.is_empty())
 }
 
-/// Czy `count` może zaufać indeksowi bez czytania dokumentów.
+/// Whether `count` can trust the index without reading documents.
 ///
-/// Wykluczamy `null` (matcher traktuje brak pola jak `null`, a braków nie ma
-/// w indeksie) oraz operatory, których indeks nie obsługuje.
+/// We exclude `null` (the matcher treats a missing field as `null`, and missing fields
+/// are not in the index) and operators the index does not support.
 fn count_cond_safe(cond: &Value) -> bool {
     match cond {
         Value::Null => false,
@@ -2035,7 +2035,7 @@ fn count_cond_safe(cond: &Value) -> bool {
             if ops.is_empty() || ops.values().any(Value::is_null) {
                 return false;
             }
-            // `$eq` tylko samodzielnie; zakresy można łączyć (`$gte` + `$lt`).
+            // `$eq` only on its own; range operators may be combined (`$gte` + `$lt`).
             if ops.contains_key("$eq") && ops.len() != 1 {
                 return false;
             }
@@ -2046,8 +2046,8 @@ fn count_cond_safe(cond: &Value) -> bool {
     }
 }
 
-/// Filtr dokładnie pokrywa wszystkie pola indeksu (bez nadmiarowych warunków),
-/// więc liczba wpisów w zakresie równa się liczbie pasujących dokumentów.
+/// The filter covers exactly all index fields (no extra conditions),
+/// so the number of entries in the range equals the number of matching documents.
 fn index_filter_exact(def: &IndexDef, filter: &Value) -> bool {
     let Some(obj) = filter.as_object() else {
         return false;
@@ -2071,7 +2071,7 @@ fn value_at<'a>(doc: &'a Value, path_str: &str) -> Option<&'a Value> {
     path::get(doc, path_str)
 }
 
-/// Rozpoznaje filtr równoważny wyszukiwaniu po `_id`.
+/// Recognizes a filter equivalent to an `_id` lookup.
 fn direct_id(filter: &Value) -> Option<&str> {
     let obj = filter.as_object()?;
     if obj.len() != 1 {
@@ -2084,9 +2084,9 @@ fn direct_id(filter: &Value) -> Option<&str> {
     }
 }
 
-/// Buduje zakres klucza głównego `_id` z warunków `$gt/$gte/$lt/$lte`.
-/// Dokładny `_id` (string albo `{"$eq": ...}`) też jest zakresem, co pozwala
-/// łączyć go z dodatkowymi warunkami bez pełnego skanu.
+/// Builds a primary-key `_id` range from `$gt/$gte/$lt/$lte` conditions.
+/// An exact `_id` (string or `{"$eq": ...}`) is also a range, which allows
+/// combining it with additional conditions without a full scan.
 fn id_bounds(filter: &Value) -> Option<IdBounds> {
     let cond = filter.as_object()?.get("_id")?;
     if let Some(id) = cond.as_str() {
@@ -2168,7 +2168,7 @@ fn tighter_upper(a: Bound<Vec<u8>>, b: Bound<Vec<u8>>) -> Bound<Vec<u8>> {
     }
 }
 
-/// Czy sortowanie to pojedyncze `_id`? Zwraca `Some(reverse)` dla `-1`.
+/// Is the sort a single `_id`? Returns `Some(reverse)` for `-1`.
 fn id_sort_direction(sort: &[(String, i32)]) -> Option<bool> {
     if sort.len() == 1 && sort[0].0 == "_id" {
         Some(sort[0].1 < 0)
@@ -2180,7 +2180,7 @@ fn id_sort_direction(sort: &[(String, i32)]) -> Option<bool> {
 fn compare_values(a: Option<&Value>, b: Option<&Value>) -> Ordering {
     match (a, b) {
         (None, None) => Ordering::Equal,
-        (None, Some(_)) => Ordering::Greater, // brak pola na końcu
+        (None, Some(_)) => Ordering::Greater, // missing field sorts last
         (Some(_), None) => Ordering::Less,
         (Some(a), Some(b)) => match (a, b) {
             (Value::Null, Value::Null) => Ordering::Equal,
@@ -2197,8 +2197,8 @@ fn compare_values(a: Option<&Value>, b: Option<&Value>) -> Ordering {
     }
 }
 
-/// Buduje dokument z pól pokrywających indeksu, jeśli filtr i projekcja
-/// mieszczą się w `inc`. W przeciwnym razie zwraca `None` (trzeba pobrać dokument).
+/// Builds a document from covering-index fields when the filter and projection
+/// fit within `inc`. Otherwise returns `None` (the document must be fetched).
 fn covering_doc(
     id: &str,
     inc: Option<&Map<String, Value>>,
@@ -2207,7 +2207,7 @@ fn covering_doc(
 ) -> Option<Value> {
     let inc = inc?;
     let proj = projection.as_ref()?.as_object()?;
-    // Tylko projekcja inkluzywna: przy wykluczającej trzeba mieć cały dokument.
+    // Only inclusive projection: an exclusive projection needs the whole document.
     if !proj.iter().any(|(k, v)| k.as_str() != "_id" && truthy(v)) {
         return None;
     }
@@ -2226,9 +2226,9 @@ fn covering_doc(
     Some(Value::Object(obj))
 }
 
-/// Czy kolejność indeksu odpowiada sortowaniu? Zwraca `Some(reverse)` gdy
-/// sortowanie używa dokładnie tych samych pól (w tej samej kolejności) i
-/// wszystkich kierunków dodatnich (`false`) albo wszystkich ujemnych (`true`).
+/// Does index order match the sort? Returns `Some(reverse)` when
+/// the sort uses exactly the same fields (in the same order) and
+/// all directions are ascending (`false`) or all descending (`true`).
 fn index_matches_sort(def: &IndexDef, sort: &[(String, i32)]) -> Option<bool> {
     let fields = def.effective_fields();
     if fields.len() != sort.len() || sort.is_empty() {
@@ -2254,7 +2254,7 @@ fn compare_docs(a: &Value, b: &Value, sort: &[(String, i32)]) -> Ordering {
     Ordering::Equal
 }
 
-/// Akumulator wyników `find`: bez sortowania zwykła lista, z sortowaniem TopK.
+/// `find` result accumulator: a plain list without sorting, TopK with sorting.
 enum Acc<'a> {
     All(Vec<Value>),
     Top(TopK<'a>),
@@ -2286,7 +2286,7 @@ impl<'a> Acc<'a> {
     fn finish(self) -> Vec<Value> {
         match self {
             Acc::All(mut docs) => {
-                // Deterministyczna kolejność zwróconego zbioru.
+                // Deterministic order of the returned set.
                 docs.sort_by(|a, b| {
                     let ka = a.get("_id").and_then(Value::as_str).unwrap_or("");
                     let kb = b.get("_id").and_then(Value::as_str).unwrap_or("");
@@ -2299,7 +2299,7 @@ impl<'a> Acc<'a> {
     }
 }
 
-/// Dokument w kopcu TopK; `seq` zachowuje stabilność przy równych kluczach.
+/// Document in the TopK heap; `seq` preserves stability for equal keys.
 struct TopDoc<'a> {
     doc: Value,
     seq: usize,
@@ -2322,7 +2322,7 @@ impl PartialOrd for TopDoc<'_> {
 
 impl Ord for TopDoc<'_> {
     fn cmp(&self, other: &Self) -> Ordering {
-        // Większy = gorszy, więc na szczycie kopca jest najgorszy kandydat.
+        // Larger = worse, so the worst candidate is at the top of the heap.
         match compare_docs(&self.doc, &other.doc, self.sort) {
             Ordering::Equal => self.seq.cmp(&other.seq),
             ord => ord,
@@ -2330,7 +2330,7 @@ impl Ord for TopDoc<'_> {
     }
 }
 
-/// Ograniczony wybór `want` najlepszych dokumentów bez sortowania całości.
+/// Bounded selection of the `want` best documents without sorting everything.
 struct TopK<'a> {
     sort: &'a [(String, i32)],
     want: usize,
@@ -2353,7 +2353,7 @@ impl<'a> TopK<'a> {
         self.push_seq(doc, self.seq);
     }
 
-    /// Wstawia dokument z globalnym numerem kolejności (stabilność sortowania).
+    /// Inserts a document with a global sequence number (sort stability).
     fn push_seq(&mut self, doc: Value, seq: usize) {
         if self.want == 0 {
             return;
@@ -2400,7 +2400,7 @@ fn truthy(v: &Value) -> bool {
     }
 }
 
-/// Projekcja top-level: tryb include albo exclude (jak MongoDB).
+/// Top-level projection: include or exclude mode (like MongoDB).
 fn project(doc: &Value, projection: &Value) -> Value {
     let Some(p) = projection.as_object() else {
         return doc.clone();
@@ -2413,7 +2413,7 @@ fn project(doc: &Value, projection: &Value) -> Value {
 
     if include_mode {
         let mut out = Map::new();
-        // `_id` jest domyślnie włączone, chyba że projekcja jawnie daje `_id: 0`.
+        // `_id` is included by default unless the projection explicitly sets `_id: 0`.
         let include_id = p.get("_id").map(truthy).unwrap_or(true);
         if include_id {
             if let Some(id) = doc.get("_id") {
@@ -2495,9 +2495,9 @@ mod tests {
         let wrong_string = json!({"_id": "1", "name": "other", "active": true});
         assert!(!raw.matches(&serde_json::to_vec(&wrong_string).unwrap()));
 
-        // `$or` nie może być użyty jako prefiltr.
+        // `$or` cannot be used as a prefilter.
         assert!(raw_prefilter(&json!({"$or": [{"name": "a"}, {"name": "b"}]})).is_none());
-        // Liczba sama w sobie wymaga parsera (np. 1 vs 1.0).
+        // A number on its own requires the parser (e.g. 1 vs 1.0).
         assert!(raw_prefilter(&json!({"n": 1})).is_none());
     }
 
@@ -2524,7 +2524,7 @@ mod tests {
             c.find_one(&json!({"tags": "x"})).unwrap().unwrap()["_id"],
             "a"
         );
-        // Prefiltr używa tylko stringa; liczba nadal jest porównywana przez matcher.
+        // The prefilter uses only the string; the number is still compared by the matcher.
         assert_eq!(
             c.find_one(&json!({"name": "a\"b\n", "n": 1.0}))
                 .unwrap()
@@ -2557,9 +2557,9 @@ mod tests {
             skip: 7,
             limit: Some(31),
         };
-        // `find` bierze ścieżkę równoległą (1000 wpisów > próg testowy).
+        // `find` takes the parallel path (1000 entries > test threshold).
         let parallel = c.find(&q).unwrap();
-        // `find_in` to ten sam skan, ale jednowątkowy.
+        // `find_in` is the same scan but single-threaded.
         let rtxn = store.read_txn().unwrap();
         let serial = c.find_in(&rtxn, &q).unwrap();
         rtxn.commit().unwrap();
@@ -2598,7 +2598,7 @@ mod tests {
             limit: Some(31),
             ..Default::default()
         };
-        // `find` bierze równoległy skan bez sortowania.
+        // `find` takes the parallel scan without sorting.
         let parallel = c.find(&q).unwrap();
         let rtxn = store.read_txn().unwrap();
         let serial = c.find_in(&rtxn, &q).unwrap();
@@ -2616,7 +2616,7 @@ mod tests {
                 .unwrap();
         }
 
-        // Zakres `_id` + dodatkowy warunek; naturalna kolejność `_id`.
+        // `_id` range plus an extra condition; natural `_id` order.
         let q = FindQuery {
             filter: json!({"_id": {"$gte": "id05", "$lt": "id09"}, "n": {"$gte": 6}}),
             ..Default::default()
@@ -2625,7 +2625,7 @@ mod tests {
         let ids: Vec<_> = got.iter().map(|d| d["_id"].as_str().unwrap()).collect();
         assert_eq!(ids, ["id06", "id07", "id08"]);
 
-        // Sortowanie po `_id` malejąco nadal korzysta z zakresu.
+        // Descending `_id` sorting still uses the range.
         let q = FindQuery {
             filter: json!({"_id": {"$gt": "id05", "$lte": "id09"}}),
             sort: vec![("_id".to_string(), -1)],
@@ -2636,7 +2636,7 @@ mod tests {
         let ids: Vec<_> = got.iter().map(|d| d["_id"].as_str().unwrap()).collect();
         assert_eq!(ids, ["id09", "id08"]);
 
-        // Dokładny `_id` z dodatkowym warunkiem nie wymaga pełnego skanu.
+        // An exact `_id` with an extra condition does not require a full scan.
         assert!(c
             .find_one(&json!({"_id": "id07", "n": 7}))
             .unwrap()
@@ -2657,7 +2657,7 @@ mod tests {
             2
         );
 
-        // Pusty lub odwrócony zakres nie może wejść w pełny skan.
+        // An empty or reversed range must not fall back to a full scan.
         assert!(c
             .find(&FindQuery {
                 filter: json!({"_id": {"$gt": "id09", "$lt": "id05"}}),
@@ -2764,7 +2764,7 @@ mod tests {
             .unwrap()
             .contains(&("g+age".to_string(), false)));
 
-        // Zakres na ostatnim polu + sortowanie po indeksie.
+        // Range on the last field + sorting along the index.
         let q = FindQuery {
             filter: json!({"g": 1, "age": {"$gte": 4, "$lt": 8}}),
             sort: vec![("age".to_string(), 1)],
@@ -2775,7 +2775,7 @@ mod tests {
         assert_eq!(got[0]["age"], 4);
         assert_eq!(got[3]["age"], 7);
 
-        // Równość wszystkich pól + count przez indeks.
+        // Equality on all fields + count through the index.
         let q = FindQuery {
             filter: json!({"g": 2, "age": 3}),
             ..Default::default()
@@ -2786,14 +2786,14 @@ mod tests {
                 .unwrap(),
             4
         );
-        // Nadmiarowy warunek nie może użyć samego indeksu do count.
+        // An extra condition cannot use the index alone for count.
         assert_eq!(
             c.count(&json!({"g": 1, "age": {"$gte": 4, "$lt": 8}, "name": "1-4"}))
                 .unwrap(),
             1
         );
 
-        // Update przenosi wpis w indeksie.
+        // Update moves the entry in the index.
         c.update(
             &json!({"_id": "g1a5"}),
             &json!({"$set": {"age": 99}}),
@@ -2807,7 +2807,7 @@ mod tests {
         );
         assert!(c.find_one(&json!({"g": 1, "age": 99})).unwrap().is_some());
 
-        // Delete czyści wpis.
+        // Delete clears the entry.
         c.delete(&json!({"_id": "g2a3"}), false).unwrap();
         assert!(c.find_one(&json!({"g": 2, "age": 3})).unwrap().is_none());
     }
@@ -2822,7 +2822,7 @@ mod tests {
             .unwrap();
         c.update(&json!({"_id": "a"}), &json!({"$set": {"v": 43}}), false)
             .unwrap();
-        // Projekcja wykluczająca nie może być obsłużona tylko z indeksu.
+        // An exclusive projection cannot be served from the index alone.
         let excl = FindQuery {
             filter: json!({"g": 1}),
             projection: Some(json!({"other": 0})),
@@ -2832,8 +2832,8 @@ mod tests {
         let got = c.find(&excl).unwrap();
         assert_eq!(got[0]["v"], 43);
         assert!(got[0].get("other").is_none());
-        // Usuwamy dokument, zostawiając wpis indeksu — pokrycie nie może
-        // sięgać do kolekcji, więc wynik dowodzi użycia wartości indeksu.
+        // Delete the document but leave the index entry: coverage must not
+        // reach the collection, so the result proves the index value was used.
         let mut wtxn = c.write_txn().unwrap();
         c.db.delete(&mut wtxn, b"a").unwrap();
         wtxn.commit().unwrap();
@@ -2876,8 +2876,8 @@ mod tests {
         assert_eq!(doc["tags"], json!(["x", "y"]));
         assert_eq!(doc["ports"], json!([25, 587]));
 
-        // Drugi upsert trafia istniejący dokument: brak nowego `_id`,
-        // `$setOnInsert` nie działa.
+        // The second upsert matches an existing document: no new `_id`,
+        // `$setOnInsert` does not apply.
         let out = c
             .update_opts(
                 &json!({"tenant": "a", "key": "mail"}),
@@ -2898,7 +2898,7 @@ mod tests {
         assert_eq!(doc["created"], true);
         assert_eq!(doc["tags"], json!(["x", "y", "z"]));
 
-        // Replacement upsert dokłada equalities z filtra.
+        // Replacement upsert adds equalities from the filter.
         let out = c
             .update_opts(
                 &json!({"tenant": "b", "key": "db"}),
@@ -2953,7 +2953,7 @@ mod tests {
         let id = c.insert_one(json!({"name": "Ala", "age": 30})).unwrap();
         c.create_index("age", true).unwrap();
 
-        // Zmiana indeksowanego pola aktualizuje wpis.
+        // Changing an indexed field updates the entry.
         c.update(&json!({"_id": id}), &json!({"$set": {"age": 31}}), false)
             .unwrap();
         assert!(c.find_one(&json!({"age": 30})).unwrap().is_none());
@@ -2962,11 +2962,11 @@ mod tests {
             "Ala"
         );
 
-        // Unikalność.
+        // Uniqueness.
         c.insert_one(json!({"name": "Bob", "age": 40})).unwrap();
         assert!(c.insert_one(json!({"name": "Cezary", "age": 40})).is_err());
 
-        // Delete usuwa wpis z indeksu.
+        // Delete removes the entry from the index.
         c.delete(&json!({"age": 40}), true).unwrap();
         assert!(c.find_one(&json!({"age": 40})).unwrap().is_none());
     }
@@ -3004,17 +3004,17 @@ mod tests {
 
         let hits = c.search("title", "rust", &json!({}), 0, Some(10)).unwrap();
         assert_eq!(hits.len(), 2);
-        // Dokument z większą częstością `rust` ma wyższy score.
+        // A document with higher `rust` frequency has a higher score.
         assert!(hits[0]["title"].as_str().unwrap().contains("rust rust"));
         assert!(hits[0]["_score"].as_f64().unwrap() > hits[1]["_score"].as_f64().unwrap());
 
-        // Filtr residualny działa.
+        // The residual filter works.
         let only_db = c
             .search("title", "rust", &json!({"tag": "db"}), 0, Some(10))
             .unwrap();
         assert_eq!(only_db.len(), 2);
 
-        // Update i delete utrzymują indeks.
+        // Update and delete keep the index in sync.
         c.update(
             &json!({"title": "python web framework"}),
             &json!({"$set": {"title": "rust web framework"}}),
@@ -3085,7 +3085,7 @@ mod tests {
         let c = store.collection("nums").unwrap();
         c.insert_one(json!({"v": 1})).unwrap();
         c.insert_one(json!({"v": 2})).unwrap();
-        c.insert_one(json!({})).unwrap(); // brak pola
+        c.insert_one(json!({})).unwrap(); // missing field
         c.insert_one(json!({"v": null})).unwrap();
         c.create_index("v", false).unwrap();
 
@@ -3093,7 +3093,7 @@ mod tests {
         assert_eq!(c.count(&Value::Null).unwrap(), 4);
         assert_eq!(c.count(&json!({"v": 1})).unwrap(), 1);
         assert_eq!(c.count(&json!({"v": {"$gte": 2}})).unwrap(), 1);
-        // `null` pasuje też do braku pola -> nie wolno użyć indeksu.
+        // `null` also matches a missing field -> the index must not be used.
         assert_eq!(c.count(&json!({"v": null})).unwrap(), 2);
         assert_eq!(c.count(&json!({"v": {"$eq": null}})).unwrap(), 2);
 
@@ -3151,7 +3151,7 @@ mod tests {
             .collect();
         assert_eq!(ns, vec![Some(39), Some(38), Some(37)]);
 
-        // `find_one` po indeksowanym polu zwraca dokładnie jeden dokument.
+        // `find_one` on an indexed field returns exactly one document.
         let one = c.find_one(&json!({"grp": 1})).unwrap().unwrap();
         assert_eq!(one["grp"], 1);
     }
@@ -3164,7 +3164,7 @@ mod tests {
             c.insert_one(json!({"n": i, "grp": i % 3})).unwrap();
         }
 
-        // `skip` bez filtra: naturalna kolejność `_id`, bez zbierania pominiętych.
+        // `skip` without a filter: natural `_id` order, without collecting skipped documents.
         let q = FindQuery {
             filter: json!({}),
             skip: 90,
@@ -3173,7 +3173,7 @@ mod tests {
         };
         assert_eq!(c.find(&q).unwrap().len(), 5);
 
-        // `skip` z filtrem nie-match-all: pomijamy dopiero trafienia.
+        // `skip` with a non-match-all filter: only matching documents are skipped.
         let q = FindQuery {
             filter: json!({"grp": 0}),
             skip: 20,
@@ -3182,7 +3182,7 @@ mod tests {
         };
         assert_eq!(c.find(&q).unwrap().len(), 5);
 
-        // TopK z sortowaniem, skip i wieloma równymi kluczami.
+        // TopK with sorting, skip, and many equal keys.
         let all = c
             .find(&FindQuery {
                 filter: json!({}),
@@ -3222,7 +3222,7 @@ mod tests {
         c.insert_one(json!({"b": 1, "tag": "missing"})).unwrap();
         c.create_index("a", false).unwrap();
 
-        // Brak pola też pasuje do `null`; indeks nie zawiera braków.
+        // A missing field also matches `null`; the index does not contain missing fields.
         assert_eq!(c.count(&json!({"a": null})).unwrap(), 2);
         let q = FindQuery {
             filter: json!({"a": null}),
@@ -3248,7 +3248,7 @@ mod tests {
         }
         c.create_index("n", false).unwrap();
 
-        // Matcher nie porównuje różnych typów: tylko liczby > 2.
+        // The matcher does not compare different types: only numbers > 2.
         assert_eq!(c.count(&json!({"n": {"$gt": 2}})).unwrap(), 2);
         assert_eq!(c.count(&json!({"n": {"$lt": 2}})).unwrap(), 1);
         let mut ns: Vec<_> = c
@@ -3264,7 +3264,7 @@ mod tests {
         ns.sort();
         assert_eq!(ns, vec![3, 10]);
 
-        // Tylko stringi < "m".
+        // Only strings < "m".
         assert_eq!(c.count(&json!({"n": {"$lt": "m"}})).unwrap(), 1);
     }
 
@@ -3293,7 +3293,7 @@ mod tests {
         assert_eq!(c.count(&json!({"n": {"$gte": 30, "$lt": 35}})).unwrap(), 5);
         assert_eq!(c.count(&json!({"n": {"$gt": 30, "$lte": 35}})).unwrap(), 5);
 
-        // Zakres + sortowanie + skip/limit.
+        // Range + sorting + skip/limit.
         let q = FindQuery {
             filter: json!({"n": {"$gte": 30, "$lt": 35}}),
             sort: vec![("n".into(), -1)],
@@ -3329,7 +3329,7 @@ mod tests {
         assert_eq!(deleted, 1);
         assert_eq!(c.count(&json!({})).unwrap(), 2);
 
-        // Ścieżka dokładnego `_id` w update/delete.
+        // Exact `_id` path in update/delete.
         let one = c.find_one(&json!({"g": "a"})).unwrap().unwrap();
         let id = one["_id"].as_str().unwrap().to_string();
         assert_eq!(

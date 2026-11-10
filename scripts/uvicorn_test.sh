@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Test integracji: 12 workerów uvicorn (fork/spawn) -> daemon po UDS.
-# Weryfikuje, że architektura „daemon jest jedynym właścicielem LMDB” działa
-# przy wieloprocesowym serwerze HTTP, oraz że licznik rośnie dokładnie.
+# Integration test: 12 uvicorn workers (fork/spawn) -> daemon over UDS.
+# Verifies that the "daemon is the sole LMDB owner" architecture works
+# with a multi-process HTTP server, and that the counter grows exactly.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"

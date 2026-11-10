@@ -1,4 +1,4 @@
-"""Test e2e: indeksy złożone, covering, count, frazy i folding diakrytyków.
+"""E2E test: compound indexes, covering, count, phrases, and diacritic folding.
 
     NONODB_SOCK=/tmp/nonodb.sock python3 scripts/compound_test.py
 """
@@ -39,19 +39,19 @@ def main() -> None:
     idx = c.list_indexes()
     assert any(i["fields"] == ["grp", "age"] and i["include"] == ["score"] for i in idx), idx
 
-    # Sort rosnący/malejący dokładnie po indeksie.
+    # Ascending/descending sort exactly along the index.
     got = c.find({"grp": {"$gte": 1}}, sort=[["grp", 1], ["age", 1]], limit=4)
     assert [(d["grp"], d["age"]) for d in got] == [(1, 0), (1, 1), (1, 2), (1, 3)], got
     got = c.find({"grp": {"$gte": 1}}, sort=[["grp", -1], ["age", -1]], limit=4)
     assert [(d["grp"], d["age"]) for d in got] == [(3, 4), (3, 3), (3, 2), (3, 1)], got
 
-    # Zakres na ostatnim polu + count bez JSON-a.
+    # Range on the last field + count without JSON.
     got = c.find({"grp": 2, "age": {"$gte": 2}}, sort=[["grp", 1], ["age", 1]])
     assert [d["age"] for d in got] == [2, 3, 4], got
     assert c.count({"grp": 2, "age": {"$gte": 2}}) == 3
     assert c.count({"grp": 2, "age": {"$gte": 2}, "bio": "Ala ma kota"}) == 2
 
-    # Covering: projekcja z wartości indeksu.
+    # Covering: projection from the index value.
     got = c.find(
         {"grp": 2},
         projection={"grp": 1, "age": 1, "score": 1, "_id": 0},
@@ -60,13 +60,13 @@ def main() -> None:
     )
     assert got == [{"grp": 2, "age": 0, "score": 20}, {"grp": 2, "age": 1, "score": 21}], got
 
-    # Text index: folding + fraza.
+    # Text index: folding + phrase.
     c.create_text_index("bio")
     assert c.search("bio", "zazolc", limit=10)
     assert len(c.search("bio", '"ala ma"', limit=10)) == 10
     assert c.search("bio", '"ma ala"', limit=10) == []
 
-    # Atomiczny write_batch.
+    # Atomic write_batch.
     res = db.write_batch(
         [
             {"op": "insert", "coll": c.name, "doc": {"_id": "x", "grp": 9, "age": 9}},

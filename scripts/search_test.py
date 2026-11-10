@@ -1,4 +1,4 @@
-"""Test end-to-end: full-text BM25 i fuzzy search przez daemona.
+"""End-to-end test: full-text BM25 and fuzzy search through the daemon.
 
     NONODB_SOCK=/tmp/nonodb.sock python3 scripts/search_test.py
 """
@@ -41,7 +41,7 @@ def main() -> int:
     scores = [h["_score"] for h in hits]
     assert scores == sorted(scores, reverse=True), scores
 
-    # OR-semantyka: "relational" + "database" razem wygrywa z samym "database".
+    # OR semantics: "relational" + "database" together beat "database" alone.
     hits = c.search("body", "relational database")
     assert {h["title"] for h in hits[:2]} == {"PostgreSQL", "MySQL"}, hits
 
@@ -54,7 +54,7 @@ def main() -> int:
     hits = c.search("body", "database", limit=2)
     assert len(hits) == 2
 
-    # update: MongoDB przestaje pasować do "json"
+    # update: MongoDB no longer matches "json"
     c.update({"title": "MongoDB"}, {"$set": {"body": "distributed document store"}})
     assert c.search("body", "json") == []
     assert len(c.search("body", "database")) == 2
@@ -75,12 +75,12 @@ def main() -> int:
 
     assert c.fuzzy("title", "mysql", max_distance=0, filter={"title": "PostgreSQL"}) == []
 
-    # delete usuwa z obu indeksów
+    # delete removes from both indexes
     c.delete({"title": "MySQL"}, multi=False)
     assert c.fuzzy("title", "mysql", max_distance=0) == []
     assert {h["title"] for h in c.search("body", "database")} == {"PostgreSQL"}
 
-    # --- sprzątanie -------------------------------------------------
+    # --- cleanup ----------------------------------------------------
     assert c.drop_text_index("body") is True
     assert c.drop_fuzzy_index("title") is True
     assert c.list_text_indexes() == []

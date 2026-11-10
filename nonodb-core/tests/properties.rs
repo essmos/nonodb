@@ -1,5 +1,5 @@
-//! Testy property-based: kodowanie indeksu musi zachowywać porządek wartości,
-//! a matcher/ścieżki muszą być spójne.
+//! Property-based tests: index encoding must preserve value order,
+//! and the matcher/path helpers must stay consistent.
 
 use proptest::prelude::*;
 use serde_json::json;

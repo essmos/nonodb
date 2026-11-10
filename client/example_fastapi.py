@@ -1,10 +1,10 @@
-"""Przykład integracji nonodb z FastAPI/uvicorn (wielu workerów).
+"""Example nonodb integration with FastAPI/uvicorn (multiple workers).
 
-Uruchomienie (daemon musi działać):
+Run with (the daemon must be running):
     NONODB_SOCK=/tmp/nonodb.sock uvicorn client.example_fastapi:app --workers 12
 
-Każdy worker tworzy własne połączenie do gniazda w `lifespan` — nie współdziel
-klienta między procesami.
+Each worker creates its own socket connection in `lifespan` - do not share
+the client between processes.
 """
 
 from __future__ import annotations

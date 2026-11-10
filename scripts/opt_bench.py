@@ -1,6 +1,6 @@
-"""Benchmark optymalizacji v1.x: count, find_one, update, group commit.
+"""v1.x optimization benchmark: count, find_one, update, group commit.
 
-Uruchomienie (wymaga daemona):
+Run with (requires a daemon):
     NONODB_SOCK=/tmp/nonodb.sock python3 scripts/opt_bench.py --docs 50000
 """
 
@@ -61,11 +61,11 @@ def main() -> int:
 
     rnd = random.Random(7)
 
-    # count: pełny skan (stare zachowanie) vs O(1) (nowe)
+    # count: full scan (old behavior) vs O(1) (new)
     bench("count(seq >= 0)  [pełny skan]", lambda: c.count({"seq": {"$gte": 0}}), 30)
     bench("count({})        [O(1) stat]", lambda: c.count({}), 500)
 
-    # find_one: pełny skan (stare zachowanie) vs wczesne wyjście (nowe)
+    # find_one: full scan (old behavior) vs early exit (new)
     seqs = [rnd.randrange(args.docs) for _ in range(20)]
     bench(
         "find(seq=...) bez limitu [pełny skan]",
@@ -78,7 +78,7 @@ def main() -> int:
         300,
     )
 
-    # indeks: przed zbierano wszystkie trafienia, teraz stop po 1
+    # index: previously collected all matches, now stops after 1
     grps = list(range(100))
     bench(
         "find_one(grp=...) [indeks + early exit]",
@@ -86,7 +86,7 @@ def main() -> int:
         300,
     )
 
-    # update/delete przez indeks vs pełny skan
+    # update/delete through an index vs full scan
     bench(
         "update(grp=..., multi=true) [indeks]",
         lambda: c.update({"grp": rnd.choice(grps)}, {"$inc": {"n": 1}}, True),
@@ -100,9 +100,9 @@ def main() -> int:
         50,
     )
 
-    # --- batch: N odczytów w jednym żądaniu -------------------------
+    # --- batch: N reads in one request ------------------------------
     ids = [d["_id"] for d in c.find({}, projection={"_id": 1}, limit=1000)]
-    db.batch([])  # rozgrzewka połączenia
+    db.batch([])  # warm up the connection
 
     t = time.perf_counter()
     for i in ids:

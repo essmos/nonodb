@@ -1,8 +1,8 @@
-"""Rozszerzone testy wyszukiwania: BM25, fuzzy i operatory zapytań.
+"""Extended search tests: BM25, fuzzy, and query operators.
 
     NONODB_SOCK=/tmp/nonodb.sock python3 scripts/search_variants_test.py
 
-Każda sekcja czyści swoje kolekcje, więc test można uruchamiać wielokrotnie.
+Each section clears its collections, so the test can be run repeatedly.
 """
 
 from __future__ import annotations
@@ -58,44 +58,44 @@ def test_bm25(db: NonoDB) -> None:
     c.create_index("cat")
     c.create_text_index("body")
 
-    # Pojedynczy termin + sortowanie po _score malejąco.
+    # Single term + sorting by _score descending.
     hits = c.search("body", "rust", limit=10)
     assert set(ids(hits)) == {"a", "b", "g"}, hits
-    assert hits[0]["_id"] == "a"  # 3× rust bije pojedyncze wystąpienia
+    assert hits[0]["_id"] == "a"  # 3x rust beats single occurrences
     assert all(h["_score"] > 0 for h in hits)
     assert [h["_score"] for h in hits] == sorted((h["_score"] for h in hits), reverse=True)
 
-    # OR: "async" zawęża czołówkę, ale g nadal pasuje przez samo "rust".
-    # Krótszy dokument z oboma terminami (b) wygrywa z długim (a).
+    # OR: "async" narrows the top results, but g still matches through "rust" alone.
+    # The shorter document with both terms (b) beats the long one (a).
     hits = c.search("body", "rust async", limit=10)
     assert set(ids(hits)) == {"a", "b", "g"}, hits
     assert hits[0]["_id"] == "b"
 
-    # Duplikaty w zapytaniu nie zmieniają wyniku.
+    # Duplicates in the query do not change the result.
     assert ids(c.search("body", "rust rust rust")) == ids(c.search("body", "rust"))
 
-    # Wielkość liter i interpunkcja.
+    # Case and punctuation.
     assert set(ids(c.search("body", "RUST"))) == {"a", "b", "g"}
     assert ids(c.search("body", "state-of-the-art")) == ["g"]
     assert ids(c.search("body", "state of the art")) == ["g"]
     assert ids(c.search("body", "2024")) == ["g"]
 
-    # Unicode: lowercase + folding diakrytyków.
+    # Unicode: lowercase + diacritic folding.
     assert ids(c.search("body", "zażółć")) == ["f"]
     assert ids(c.search("body", "ZAŻÓŁĆ")) == ["f"]
     assert ids(c.search("body", "zazolc")) == ["f"]
 
-    # Frazy wymagają ciągłej sekwencji tokenów.
+    # Phrases require a contiguous token sequence.
     c.insert({"_id": "phrase", "body": "Ala ma kota", "cat": "x"})
     assert ids(c.search("body", '"ala ma"')) == ["phrase"]
     assert c.search("body", '"ma ala"') == []
 
-    # IDF: rzadszy termin ma większą wagę niż powszechny.
+    # IDF: a rarer term has more weight than a common one.
     rare = c.search("body", "postgresql")[0]["_score"]
     common = c.search("body", "database")[0]["_score"]
     assert rare > common, (rare, common)
 
-    # Filtr, skip, limit.
+    # Filter, skip, limit.
     hits = c.search("body", "rust", filter={"cat": "a"})
     assert set(ids(hits)) == {"a", "b"}
     hits = c.search("body", "database", filter={"cat": "b"})
@@ -106,24 +106,24 @@ def test_bm25(db: NonoDB) -> None:
     assert c.search("body", "database", limit=0) == []
     assert c.search("body", "database", skip=99) == []
 
-    # Brak trafień / puste zapytanie / sama interpunkcja.
+    # No hits / empty query / punctuation only.
     assert c.search("body", "nieistniejetermin") == []
     assert c.search("body", "") == []
     assert c.search("body", " ... ,, !! ") == []
     assert c.search("body", "database", filter={"cat": "nie-ma"}) == []
 
-    # Aktualizacja usuwa stare terminy i dodaje nowe.
+    # Update removes old terms and adds new ones.
     c.update({"_id": "a"}, {"$set": {"body": "kot pies"}})
     assert set(ids(c.search("body", "rust"))) == {"b", "g"}
     assert ids(c.search("body", "kot")) == ["a"]
     c.update({"_id": "a"}, {"$set": {"body": "rust"}})
     assert set(ids(c.search("body", "rust"))) == {"a", "b", "g"}
 
-    # Delete czyści postingi i długości.
+    # Delete clears postings and lengths.
     c.delete({"_id": "d"})
     assert set(ids(c.search("body", "database"))) == {"e", "i"}
 
-    # Drugi indeks tekstowy na innym polu działa niezależnie.
+    # A second text index on another field works independently.
     c.create_text_index("title")
     assert set(ids(c.search("title", "rust"))) == set()
     assert ids(c.search("title", "eta")) == ["g"]
@@ -131,13 +131,13 @@ def test_bm25(db: NonoDB) -> None:
     c.drop_text_index("title")
     expect_error(lambda: c.search("title", "eta"), "invalid_query", "text po dropie")
 
-    # Drop + ponowne utworzenie (backfill) działa.
+    # Drop + recreate (backfill) works.
     c.drop_text_index("body")
     expect_error(lambda: c.search("body", "rust"), "invalid_query", "text przed create")
     c.create_text_index("body")
     assert set(ids(c.search("body", "rust"))) == {"a", "b", "g"}
 
-    # Puste zapytanie po usunięciu wszystkich dokumentów.
+    # Empty query after deleting all documents.
     c.delete({}, multi=True)
     assert c.search("body", "rust") == []
 
@@ -148,7 +148,7 @@ def test_bm25_typed_fields(db: NonoDB) -> None:
     c = db.collection("sv_types")
     clear(c)
 
-    # Liczby i bool są indeksowane jako tekst.
+    # Numbers and bools are indexed as text.
     c.insert({"_id": "n1", "code": 42, "flag": True})
     c.insert({"_id": "n2", "code": 7, "flag": False})
     c.create_text_index("code")
@@ -158,7 +158,7 @@ def test_bm25_typed_fields(db: NonoDB) -> None:
     assert ids(c.search("flag", "true")) == ["n1"]
     assert ids(c.search("flag", "false")) == ["n2"]
 
-    # Tablice/obiekty są pomijane przez indeks tekstowy (bez błędu).
+    # Arrays/objects are skipped by the text index (without error).
     a = db.collection("sv_arrays")
     clear(a)
     a.insert({"_id": "arr1", "body": ["rust", "async"], "meta": {"x": 1}})
@@ -188,12 +188,12 @@ def test_fuzzy(db: NonoDB) -> None:
     c.create_index("cat")
     c.create_fuzzy_index("title")
 
-    # Dystans 0 (dokładne dopasowanie, także wielkość liter).
+    # Distance 0 (exact match, including case).
     hits = c.fuzzy("title", "mysql", max_distance=0)
     assert ids(hits) == ["t2"] and hits[0]["_distance"] == 0
     assert ids(c.fuzzy("title", "POSTGRESQL", max_distance=0)) == ["t1"]
 
-    # Literówki i transpozycje.
+    # Typos and transpositions.
     hits = c.fuzzy("title", "mangodb", max_distance=1)
     assert ids(hits) == ["t3"] and hits[0]["_distance"] == 1
     assert c.fuzzy("title", "mangodb", max_distance=0) == []
@@ -203,39 +203,39 @@ def test_fuzzy(db: NonoDB) -> None:
     assert "t5" in ids(hits)
     assert c.fuzzy("title", "pythno", max_distance=1) == []
 
-    # Sortowanie po _distance rosnąco.
+    # Sorting by _distance ascending.
     hits = c.fuzzy("title", "databse", max_distance=2)
     assert hits and hits[0]["_id"] == "t8" and hits[0]["_distance"] == 1
     assert [h["_distance"] for h in hits] == sorted(h["_distance"] for h in hits)
 
-    # Unicode / diakrytyki: folding działa także w fuzzy.
+    # Unicode / diacritics: folding also works in fuzzy search.
     assert ids(c.fuzzy("title", "Zażółć", max_distance=0)) == ["t6"]
     assert ids(c.fuzzy("title", "zażółć gęślą jaźń", max_distance=0)) == ["t6"]
     assert ids(c.fuzzy("title", "zazolc", max_distance=1)) == ["t6"]
 
-    # Interpunkcja i tokeny.
+    # Punctuation and tokens.
     assert ids(c.fuzzy("title", "state-of-the-art", max_distance=0)) == ["t7"]
     assert ids(c.fuzzy("title", "runtime", max_distance=0)) == ["t4"]
 
-    # Filtr i limit.
+    # Filter and limit.
     assert ids(c.fuzzy("title", "mysql", max_distance=0, filter={"cat": "db"})) == ["t2"]
     assert c.fuzzy("title", "mysql", max_distance=0, filter={"cat": "lang"}) == []
     many = c.fuzzy("title", "a", max_distance=2, limit=2)
     assert len(many) <= 2
 
-    # Brak trafień / puste zapytanie / limit 0.
+    # No hits / empty query / limit 0.
     assert c.fuzzy("title", "qqqqqq", max_distance=1) == []
     assert c.fuzzy("title", "", max_distance=1) == []
     assert c.fuzzy("title", "database", limit=0) == []
 
-    # Update i delete utrzymują indeks trigramów.
+    # Update and delete keep the trigram index in sync.
     c.update({"_id": "t2"}, {"$set": {"title": "MariaDB"}})
     assert c.fuzzy("title", "mysql", max_distance=0) == []
     assert ids(c.fuzzy("title", "mariadb", max_distance=0)) == ["t2"]
     c.delete({"_id": "t3"})
     assert c.fuzzy("title", "mangodb", max_distance=2) == []
 
-    # Drop indeksu -> błąd.
+    # Dropped index -> error.
     c.drop_fuzzy_index("title")
     expect_error(lambda: c.fuzzy("title", "mysql"), "invalid_query", "fuzzy po dropie")
 
@@ -254,7 +254,7 @@ def test_query_operators(db: NonoDB) -> None:
 
     assert set(ids(c.find({"a": 1}))) == {"q1"}
     assert set(ids(c.find({"a": {"$eq": 1}}))) == {"q1"}
-    # `$ne`/`$nin` pasują też do null i braku pola (semantyka MongoDB).
+    # `$ne`/`$nin` also match null and missing fields (MongoDB semantics).
     assert set(ids(c.find({"a": {"$ne": 1}}))) == {"q2", "q3", "q4", "q5"}
     assert set(ids(c.find({"a": {"$gt": 1, "$lt": 4}}))) == {"q2"}
     assert set(ids(c.find({"a": {"$gte": 1, "$lte": 3}}))) == {"q1", "q2"}
@@ -269,7 +269,7 @@ def test_query_operators(db: NonoDB) -> None:
     assert set(ids(c.find({"$nor": [{"a": 1}, {"a": 5}]}))) == {"q2", "q3", "q4"}
     assert set(ids(c.find({"$not": {"a": {"$gte": 1}}}))) == {"q3", "q4"}
 
-    # Zagnieżdżone pole i dopasowanie w tablicy.
+    # Nested field and array matching.
     assert set(ids(c.find({"nest.v": "z"}))) == {"q1"}
     c.create_index("nest.v")
     assert set(ids(c.find({"nest.v": "z"}))) == {"q1"}
@@ -277,9 +277,9 @@ def test_query_operators(db: NonoDB) -> None:
     assert set(ids(c.find({"tags": "x"}))) == {"q1"}
     assert set(ids(c.find({"tags": {"$in": ["y"]}}))) == {"q1", "q2"}
 
-    # Sort/projekcja/skip/limit.
+    # Sort/projection/skip/limit.
     got = c.find({}, sort=[("a", 1)], projection={"a": 1, "_id": 1})
-    # null i brak pola sortują się na końcu (brak ostatni).
+    # null and missing fields sort last (missing last).
     assert [d["_id"] for d in got] == ["q1", "q2", "q5", "q3", "q4"]
     assert set(got[2]) == {"_id", "a"}
     got = c.find({}, sort=[("a", -1)], skip=1, limit=2, projection={"a": 0})

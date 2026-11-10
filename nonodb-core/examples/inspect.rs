@@ -14,7 +14,7 @@ fn main() {
     eprintln!("open ok");
     let collections = store.collections().unwrap_or_default();
     eprintln!("collections: {collections:?}");
-    // Kolekcja z argumentu albo pierwsza z bazy (wygodne przy inspekcji kopii).
+    // Collection from the argument, or the first one in the database (handy for inspecting backups).
     let name = std::env::args()
         .nth(2)
         .or_else(|| collections.first().cloned())

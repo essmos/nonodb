@@ -1,4 +1,4 @@
-//! Proste metryki daemona (liczniki atomowe, bez zewnętrznych zależności).
+//! Simple daemon metrics (atomic counters, no external dependencies).
 
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
@@ -9,22 +9,22 @@ pub static ERRORS: AtomicU64 = AtomicU64::new(0);
 pub static READ_OPS: AtomicU64 = AtomicU64::new(0);
 pub static CACHE_HITS: AtomicU64 = AtomicU64::new(0);
 pub static CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
-/// Auto-indeksy: kandydaci, aktywne indeksy i operacje konserwacyjne.
+/// Automatic indexes: candidates, active indexes, and maintenance operations.
 pub static AUTO_INDEX_CANDIDATES: AtomicU64 = AtomicU64::new(0);
 pub static AUTO_INDEX_ACTIVE: AtomicU64 = AtomicU64::new(0);
 pub static AUTO_INDEX_CREATED: AtomicU64 = AtomicU64::new(0);
 pub static AUTO_INDEX_DROPPED: AtomicU64 = AtomicU64::new(0);
 pub static AUTO_INDEX_BUILD_NS: AtomicU64 = AtomicU64::new(0);
 pub static AUTO_INDEX_BUILD_ERRORS: AtomicU64 = AtomicU64::new(0);
-/// Liczba operacji wykonanych w żądaniach `/v1/batch`.
+/// Number of operations executed in `/v1/batch` requests.
 pub static BATCH_OPS: AtomicU64 = AtomicU64::new(0);
 pub static WRITE_OPS: AtomicU64 = AtomicU64::new(0);
 pub static WRITE_BATCHES: AtomicU64 = AtomicU64::new(0);
-/// Łączny czas `commit` (obejmuje `fsync`) w nanosekundach.
+/// Total `commit` time (including `fsync`) in nanoseconds.
 pub static COMMIT_NS: AtomicU64 = AtomicU64::new(0);
-/// Przybliżona długość kolejki zapisów oczekujących na writer.
+/// Approximate length of the write queue waiting for the writer.
 pub static QUEUE_LEN: AtomicU64 = AtomicU64::new(0);
-/// Szczytowa długość kolejki od startu procesu.
+/// Peak queue length since process start.
 pub static QUEUE_PEAK: AtomicU64 = AtomicU64::new(0);
 
 pub fn inc(counter: &AtomicU64) {
@@ -35,12 +35,12 @@ pub fn add(counter: &AtomicU64, n: u64) {
     counter.fetch_add(n, Relaxed);
 }
 
-/// Zapisuje bieżącą długość kolejki jako potencjalny szczyt.
+/// Records the current queue length as a potential peak.
 pub fn note_queue() {
     let _ = QUEUE_PEAK.fetch_max(QUEUE_LEN.load(Relaxed), Relaxed);
 }
 
-/// Bezpieczne (nienegatywne) zmniejszenie licznika.
+/// Safe (non-negative) counter decrement.
 pub fn sub(counter: &AtomicU64, n: u64) {
     let _ = counter.try_update(Relaxed, Relaxed, |v| Some(v.saturating_sub(n)));
 }

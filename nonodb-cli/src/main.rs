@@ -1,4 +1,4 @@
-//! `nonodb-cli` — proste narzędzie administracyjne.
+//! `nonodb-cli` - a simple administrative tool.
 //!
 //! On Unix, connections go through the UDS socket. On Windows, the CLI uses
 //! plaintext HTTP over TCP (`NONODB_URL`). Backup/restore/inspect work on LMDB

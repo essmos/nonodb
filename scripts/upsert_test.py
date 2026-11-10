@@ -1,4 +1,4 @@
-"""Test e2e: upsert, $setOnInsert, $addToSet/$each, $push/$each.
+"""E2E test: upsert, $setOnInsert, $addToSet/$each, $push/$each.
 
     NONODB_SOCK=/tmp/nonodb.sock python3 scripts/upsert_test.py
 """
@@ -19,7 +19,7 @@ def main() -> None:
     c = db.collection("upsert_t")
     c.delete({}, multi=True)
 
-    # Insert przez upsert: equalities z filtra + $setOnInsert + tablice.
+    # Insert via upsert: filter equalities + $setOnInsert + arrays.
     out = c.update_result(
         {"tenant": "a", "key": "mail"},
         {
@@ -38,7 +38,7 @@ def main() -> None:
     assert doc["tags"] == ["x", "y"], doc
     assert doc["ports"] == [25, 587], doc
 
-    # Drugi upsert tylko aktualizuje: bez nowego _id, bez $setOnInsert.
+    # The second upsert only updates: no new _id, no $setOnInsert.
     out = c.update_result(
         {"tenant": "a", "key": "mail"},
         {
@@ -56,12 +56,12 @@ def main() -> None:
     assert doc["tags"] == ["x", "y", "z"], doc
     assert doc["ports"] == [25, 587, 465], doc
 
-    # Replacement upsert także zachowuje equalities z filtra.
+    # Replacement upsert also preserves equalities from the filter.
     out = c.update_result({"tenant": "b", "key": "db"}, {"value": 1}, upsert=True)
     doc = c.find_one({"_id": out["upserted_id"]})
     assert (doc["tenant"], doc["key"], doc["value"]) == ("b", "db", 1), doc
 
-    # Upsert w atomowym write_batch.
+    # Upsert in an atomic write_batch.
     res = db.write_batch(
         [
             {
@@ -76,7 +76,7 @@ def main() -> None:
     assert res[0]["upserted_id"], res
     assert c.count({}) == 3
 
-    # Bez upsert brak trafień nic nie zmienia.
+    # Without upsert, no matches means no change.
     out = c.update_result({"tenant": "none"}, {"$set": {"x": 1}})
     assert out == {"matched": 0, "modified": 0, "upserted_id": None}, out
 

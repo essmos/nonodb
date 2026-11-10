@@ -1,9 +1,9 @@
-//! Automatyczne indeksy wtórne dla często powtarzanych kształtów zapytań.
+//! Automatic secondary indexes for frequently repeated query shapes.
 //!
-//! Mechanizm jest celowo konserwatywny i **domyślnie wyłączony**. Zbiera
-//! wyłącznie informacje o polach i operatorach (nie o konkretnych wartościach),
-//! a indeks tworzy dopiero po przekroczeniu progu trafień. Automatycznie
-//! utworzone indeksy są usuwane po okresie braku zapotrzebowania.
+//! The mechanism is deliberately conservative and **disabled by default**. It collects
+//! only information about fields and operators (not concrete values),
+//! and creates an index only after the hit threshold is exceeded. Automatically
+//! created indexes are dropped after a period without demand.
 
 use std::collections::HashMap;
 use std::fs;
@@ -113,7 +113,7 @@ struct Inner {
     auto: HashMap<String, AutoEntry>,
 }
 
-/// Współdzielony rejestr statystyk i menedżer auto-indeksów.
+/// Shared statistics registry and automatic-index manager.
 pub struct AutoIndexer {
     config: Config,
     store: Arc<Store>,
@@ -124,8 +124,8 @@ pub struct AutoIndexer {
 }
 
 impl AutoIndexer {
-    /// Tworzy rejestr i — jeśli funkcja jest włączona — uruchamia wątek
-    /// konserwacyjny. Gdy `NONODB_AUTO_INDEX=0`, wszystkie metody są no-op.
+    /// Creates the registry and, if the feature is enabled, starts the
+    /// maintenance thread. When `NONODB_AUTO_INDEX=0`, all methods are no-ops.
     pub fn start(
         store: Arc<Store>,
         write_tx: mpsc::Sender<WriteJob>,
@@ -156,8 +156,8 @@ impl AutoIndexer {
         me
     }
 
-    /// Rejestruje zapytanie. `db_work` oznacza, że żądanie nie zostało
-    /// obsłużone przez cache i faktycznie wykona skan/indeks.
+    /// Records a query. `db_work` means the request was not served
+    /// by the cache and will actually perform a scan/index lookup.
     pub fn record(&self, req: &Request, db_work: bool) {
         if !self.config.enabled {
             return;
@@ -184,9 +184,9 @@ impl AutoIndexer {
             entry.hits += 1;
         }
 
-        // Cache hit nadal oznacza zapotrzebowanie na ten kształt zapytania.
-        // Dzięki temu TTL nie usunie indeksu tylko dlatego, że cache chwilowo
-        // obsługiwał wszystkie odczyty.
+        // A cache hit still means demand for this query shape.
+        // This prevents TTL from dropping an index merely because the cache
+        // temporarily served all reads.
         if let Some(auto) = inner.auto.get_mut(&key) {
             auto.last_demand = now;
             self.dirty.store(true, Ordering::Relaxed);
@@ -206,9 +206,9 @@ impl AutoIndexer {
         if !self.config.enabled {
             return Ok(());
         }
-        // Nie budujemy indeksu, gdy writer ma zaległości. Samo budowanie i tak
-        // odbywa się w jednej transakcji, więc ma sens tylko przy spokojnym
-        // ruchu zapisów.
+        // Do not build an index when the writer has a backlog. The build itself
+        // happens in one transaction, so it only makes sense under a quiet
+        // write load.
         let busy = metrics::QUEUE_LEN.load(Ordering::Relaxed) > 32;
 
         self.expire_unused()?;
@@ -255,8 +255,8 @@ impl AutoIndexer {
             if active >= self.config.max_indexes {
                 break;
             }
-            // Ręczny indeks o tym samym kształcie jest już optymalny — nie
-            // twórz duplikatu i przestań liczyć ten kandydat.
+            // A manual index with the same shape is already optimal - do not
+            // create a duplicate and stop counting this candidate.
             if self.index_exists(&coll, &fields)? {
                 self.forget(&key);
                 continue;
@@ -302,7 +302,7 @@ impl AutoIndexer {
                         fields = ?fields,
                         "automatic index creation failed: {e}"
                     );
-                    // Nie próbuj w kółko tym samym kandydatem przy każdym ticku.
+                    // Do not retry the same candidate on every tick.
                     if let Some(entry) = self.inner.lock().unwrap().stats.get_mut(&key) {
                         entry.hits = 0;
                         entry.window_start = Instant::now();
@@ -327,8 +327,8 @@ impl AutoIndexer {
         };
 
         for (key, entry) in tracked {
-            // Indeks mógł zostać usunięty ręcznie albo zniknąć po restarcie.
-            // Wtedy tylko czyścimy rejestr; nie próbujemy ponownie go usuwać.
+            // The index may have been dropped manually or disappeared after a restart.
+            // In that case only clean up the registry; do not try to drop it again.
             if !self.index_exists(&entry.coll, &entry.fields)? {
                 self.forget(&key);
                 tracing::info!(
@@ -399,9 +399,9 @@ impl AutoIndexer {
         Ok(exists)
     }
 
-    /// Sprawdza, czy kolekcja istnieje, ma wystarczająco dużo dokumentów i nie
-    /// ma już indeksu o dokładnie takich polach. Przy okazji usuwa z rejestru
-    /// wpisy o indeksach, których nie ma już w LMDB (np. po ręcznym dropie).
+    /// Checks whether the collection exists, has enough documents, and does not
+    /// already have an index with exactly these fields. It also removes registry
+    /// entries for indexes that no longer exist in LMDB (e.g. after a manual drop).
     fn collection_ready(&self, coll: &str, fields: &[String]) -> Result<bool, String> {
         let rtxn = self.store.read_txn().map_err(|e| e.to_string())?;
         let Some(collection) = self
@@ -489,7 +489,7 @@ impl AutoIndexer {
             .state_path
             .with_extension(format!("tmp.{}", std::process::id()));
         fs::write(&tmp, data).map_err(|e| e.to_string())?;
-        // `rename` nie nadpisuje istniejącego pliku na Windows.
+        // `rename` does not overwrite an existing file on Windows.
         if let Err(first) = fs::rename(&tmp, &self.state_path) {
             let _ = fs::remove_file(&self.state_path);
             fs::rename(&tmp, &self.state_path).map_err(|e| format!("{first}; retry: {e}"))?;
@@ -511,8 +511,8 @@ fn split_candidate_key(key: &str) -> Option<(String, Vec<String>)> {
     Some((coll.to_string(), fields))
 }
 
-/// Wyciąga z filtru kształt indeksu: pola równościowe + jedno pole zakresowe.
-/// Zwraca `None`, jeśli zapytanie nie nadaje się do bezpiecznego auto-indeksu.
+/// Extracts the index shape from a filter: equality fields plus one range field.
+/// Returns `None` if the query is not suitable for a safe automatic index.
 fn candidate_for(req: &Request, max_fields: usize) -> Option<(String, Vec<String>)> {
     let (coll, filter) = match req {
         Request::Find { coll, filter, .. }
@@ -524,7 +524,7 @@ fn candidate_for(req: &Request, max_fields: usize) -> Option<(String, Vec<String
     if obj.is_empty() || obj.keys().any(|k| k.starts_with('$')) {
         return None;
     }
-    // `_id` ma własną, lepszą ścieżkę po kluczu głównym.
+    // `_id` has its own, better path over the primary key.
     if obj.contains_key("_id") {
         return None;
     }
@@ -566,9 +566,9 @@ enum CondKind {
     Range,
 }
 
-/// `None` oznacza warunek, którego nie chcemy indeksować (np. bool/null lub
-/// operator spoza równości/zakresu). `Some(None)` to warunek pomijany, ale
-/// bezpieczny dla reszty zapytania.
+/// `None` means a condition we do not want to index (e.g. bool/null or
+/// an operator outside equality/range). `Some(None)` is a condition that is skipped but
+/// safe for the rest of the query.
 fn condition_kind(value: &Value) -> Option<Option<CondKind>> {
     match value {
         Value::String(_) | Value::Number(_) => Some(Some(CondKind::Eq)),

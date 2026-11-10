@@ -1,4 +1,4 @@
-"""Test atomowego `write_batch`: sukces, rollback, wiele kolekcji."""
+"""Atomic `write_batch` test: success, rollback, multiple collections."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ def main() -> None:
     a.delete({}, multi=True)
     b.delete({}, multi=True)
 
-    # 1) udany batch: insert + insert_many + update + delete
+    # 1) successful batch: insert + insert_many + update + delete
     res = db.write_batch(
         [
             {"op": "insert", "coll": a.name, "doc": {"_id": "a1", "v": 1}},
@@ -42,7 +42,7 @@ def main() -> None:
     assert a.count({}) == 2, a.count({})
     assert a.find_one({"_id": "a2"})["v"] == 20
 
-    # 2) rollback całego batcha po duplikacie `_id`
+    # 2) rollback the whole batch after a duplicate `_id`
     try:
         db.write_batch(
             [
@@ -59,7 +59,7 @@ def main() -> None:
     assert a.find_one({"_id": "a5"}) is None, "rollback nie usunął a5"
     assert a.count({}) == 2
 
-    # 3) rollback obejmuje wiele kolekcji
+    # 3) rollback spans multiple collections
     try:
         db.write_batch(
             [
@@ -75,7 +75,7 @@ def main() -> None:
     assert a.find_one({"_id": "a6"}) is None
     assert b.count({}) == 0
 
-    # 4) batch odczytowy nadal odrzuca zapisy per-operacja
+    # 4) a read batch still rejects writes per operation
     res = db.batch(
         [
             {"op": "insert", "coll": a.name, "doc": {"_id": "bad"}},

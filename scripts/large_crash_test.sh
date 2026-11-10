@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Crash test na dużych danych: zabija daemon podczas 12 równoległych zapisów.
+# Large-data crash test: kills the daemon during 12 parallel writes.
 #
-# Wymaga działającego daemona z danymi w NONODB_DATA.
+# Requires a running daemon with data in NONODB_DATA.
 #   NONODB_SOCK=... NONODB_DATA=... NONODB_PID=... bash scripts/large_crash_test.sh
 set -euo pipefail
 
@@ -87,7 +87,7 @@ d = c.find_one({"src": "crash"})
 assert d is not None, "brak dokumentów zapisanych przed crashem"
 print("sample po restarcie:", d["_id"])
 
-# Spójność indeksu: przebuduj `grp` i porównaj liczności.
+# Index consistency: rebuild `grp` and compare counts.
 groups = [0, 321, 999]
 old = {g: c.count({"grp": g}) for g in groups}
 c.drop_index("grp")

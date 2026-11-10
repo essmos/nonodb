@@ -1,9 +1,9 @@
-//! Opcjonalny cache wyników odczytów.
+//! Optional read-result cache.
 //!
-//! Cache jest współdzielony przez wszystkie połączenia. Każdy udany zapis
-//! zwiększa wersję i czyści wpisy, więc klient nie dostaje danych sprzed
-//! commita. Wersja jest sprawdzana także przy zapisie wpisu: odczyt, który
-//! wystartował przed commitem, nie wstawi już nieaktualnego wyniku.
+//! The cache is shared by all connections. Every successful write
+//! increments the version and clears entries, so clients never receive data from
+//! before the commit. The version is also checked when inserting an entry: a read that
+//! started before the commit cannot insert a stale result.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -150,7 +150,7 @@ mod tests {
 
         cache.invalidate();
         assert!(cache.get(&key).is_none());
-        // Stary odczyt nie może wstawić wyniku po invalidacji.
+        // An old read cannot insert a result after invalidation.
         cache.put(key.clone(), version, json!({"count": 3}));
         assert!(cache.get(&key).is_none());
     }

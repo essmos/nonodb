@@ -1,25 +1,25 @@
-//! Full-text (BM25) i wyszukiwanie przybliżone (trigramy + Levenshtein).
+//! Full-text (BM25) and approximate search (trigrams + Levenshtein).
 //!
-//! Układ danych (sub-bazy LMDB):
-//! - `ft:<coll>:<pole>`   – postings: `term \0 _id` -> `tf` (u32 LE),
-//! - `ftl:<coll>:<pole>`  – długości dokumentów: `_id` -> `dl` (u32 LE),
-//! - `fz:<coll>:<pole>`   – trigramy: `trigram \0 _id` -> empty.
+//! Data layout (LMDB sub-databases):
+//! - `ft:<coll>:<field>`  - postings: `term \0 _id` -> `tf` (u32 LE),
+//! - `ftl:<coll>:<field>`  - document lengths: `_id` -> `dl` (u32 LE),
+//! - `fz:<coll>:<field>`  - trigrams: `trigram \0 _id` -> empty.
 //!
-//! Liczba dokumentów `N` = `ftl.stat().entries`, suma długości = meta
-//! `fttotal:<coll>:<pole>` (u64 LE).
+//! Document count `N` = `ftl.stat().entries`, total length = meta
+//! `fttotal:<coll>:<field>` (u64 LE).
 
 use std::collections::{HashMap, HashSet};
 
 use serde_json::Value;
 use unicode_normalization::{char::is_combining_mark, UnicodeNormalization};
 
-/// Parametry BM25.
+/// BM25 parameters.
 pub const BM25_K1: f64 = 1.2;
 pub const BM25_B: f64 = 0.75;
-/// Domyślny maksymalny dystans Levenshteina.
+/// Default maximum Levenshtein distance.
 pub const DEFAULT_FUZZY_DISTANCE: usize = 2;
 
-// ----------------------------- nazwy ---------------------------------
+// ----------------------------- names ---------------------------------
 
 pub fn text_db_name(coll: &str, field: &str) -> String {
     format!("ft:{coll}:{field}")
@@ -40,9 +40,9 @@ pub fn text_total_key(coll: &str, field: &str) -> String {
     format!("fttotal:{coll}:{field}")
 }
 
-// --------------------------- tekst / tokeny --------------------------
+// --------------------------- text / tokens --------------------------
 
-/// Wartość pola jako tekst (tylko skalary; tablice/obiekty pomijamy).
+/// Field value as text (scalars only; arrays/objects are skipped).
 pub fn field_text(value: &Value) -> Option<String> {
     match value {
         Value::String(s) => Some(s.clone()),
@@ -52,8 +52,8 @@ pub fn field_text(value: &Value) -> Option<String> {
     }
 }
 
-/// Składa znaki diakrytyczne do ASCII (NFD + usunięcie combining marks).
-/// Dodatkowo mapuje litery, których NFD nie rozkłada (np. `ł`, `ø`, `đ`).
+/// Folds diacritics to ASCII (NFD + removal of combining marks).
+/// Also maps letters that NFD does not decompose (e.g. `ł`, `ø`, `đ`).
 pub fn fold_diacritics(s: &str) -> String {
     let lower = s.to_lowercase();
     let mut out = String::with_capacity(lower.len());
@@ -71,7 +71,7 @@ pub fn fold_diacritics(s: &str) -> String {
     out
 }
 
-/// Normalizacja do dopasowań: lowercase, folding diakrytyków, pojedyncze spacje.
+/// Normalization for matching: lowercase, diacritic folding, single spaces.
 pub fn normalize(s: &str) -> String {
     fold_diacritics(s)
         .split_whitespace()
@@ -79,7 +79,7 @@ pub fn normalize(s: &str) -> String {
         .join(" ")
 }
 
-/// Tokenizacja: ciągi znaków alfanumerycznych, lowercase + folding.
+/// Tokenization: alphanumeric runs, lowercase + folding.
 pub fn tokenize(s: &str) -> Vec<String> {
     let folded = fold_diacritics(s);
     let mut out = Vec::new();
@@ -97,7 +97,7 @@ pub fn tokenize(s: &str) -> Vec<String> {
     out
 }
 
-/// Frazy w cudzysłowach, np. `ala "ma kota"` -> `[["ma", "kota"]]`.
+/// Quoted phrases, e.g. `ala "ma kota"` -> `[["ma", "kota"]]`.
 pub fn parse_phrases(query: &str) -> Vec<Vec<String>> {
     let mut out = Vec::new();
     let mut rest = query;
@@ -115,7 +115,7 @@ pub fn parse_phrases(query: &str) -> Vec<Vec<String>> {
     out
 }
 
-/// Czy `needle` występuje w `haystack` jako ciągły podciąg?
+/// Does `needle` occur in `haystack` as a contiguous substring?
 pub fn contains_phrase(haystack: &[String], needle: &[String]) -> bool {
     if needle.is_empty() {
         return true;
@@ -126,7 +126,7 @@ pub fn contains_phrase(haystack: &[String], needle: &[String]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }
 
-/// Częstości terminów w dokumencie.
+/// Term frequencies in a document.
 pub fn term_freqs(tokens: &[String]) -> HashMap<String, u32> {
     let mut map = HashMap::new();
     for t in tokens {
@@ -135,9 +135,9 @@ pub fn term_freqs(tokens: &[String]) -> HashMap<String, u32> {
     map
 }
 
-// ----------------------------- trigramy ------------------------------
+// ----------------------------- trigrams ------------------------------
 
-/// Unikalne trigramy po normalizacji, z dwoma spacjami z przodu i jedną z tyłu.
+/// Unique normalized trigrams, with two leading spaces and one trailing space.
 pub fn trigrams(s: &str) -> Vec<String> {
     let padded: Vec<char> = format!("  {} ", normalize(s)).chars().collect();
     let mut seen = HashSet::new();
@@ -154,7 +154,7 @@ pub fn trigrams(s: &str) -> Vec<String> {
     out
 }
 
-/// Odległość Levenshteina z wczesnym odcięciem (zwraca `None`, gdy > `max`).
+/// Levenshtein distance with early cutoff (returns `None` when > `max`).
 pub fn levenshtein(a: &str, b: &str, max: usize) -> Option<usize> {
     let a: Vec<char> = a.chars().collect();
     let b: Vec<char> = b.chars().collect();
@@ -181,7 +181,7 @@ pub fn levenshtein(a: &str, b: &str, max: usize) -> Option<usize> {
     (d <= max).then_some(d)
 }
 
-/// Najlepszy dystans dla zapytania: cały tekst albo pojedynczy token.
+/// Best distance for a query: the whole text or a single token.
 pub fn fuzzy_distance(value: &str, query: &str, max: usize) -> Option<usize> {
     let v = normalize(value);
     if let Some(d) = levenshtein(&v, query, max) {
@@ -196,9 +196,9 @@ pub fn fuzzy_distance(value: &str, query: &str, max: usize) -> Option<usize> {
     best
 }
 
-// ----------------------------- klucze --------------------------------
+// ----------------------------- keys ----------------------------------
 
-/// Klucz postingu/trigramu: `term \0 id`.
+/// Posting/trigram key: `term \0 id`.
 pub fn postings_key(term: &str, id: &str) -> Vec<u8> {
     let mut k = Vec::with_capacity(term.len() + 1 + id.len());
     k.extend_from_slice(term.as_bytes());
@@ -207,14 +207,14 @@ pub fn postings_key(term: &str, id: &str) -> Vec<u8> {
     k
 }
 
-/// Prefiks wszystkich postingów danego termu/trigramu.
+/// Prefix for all postings of a term/trigram.
 pub fn posting_prefix(term: &str) -> Vec<u8> {
     let mut k = term.as_bytes().to_vec();
     k.push(0);
     k
 }
 
-/// Wyciąga `_id` z klucza postingu.
+/// Extracts `_id` from a posting key.
 pub fn parse_posting(key: &[u8]) -> Option<&str> {
     let pos = key.iter().position(|&b| b == 0)?;
     std::str::from_utf8(&key[pos + 1..]).ok()

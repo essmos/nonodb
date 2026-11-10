@@ -1,8 +1,8 @@
-//! Updater dokumentów w stylu MongoDB (podzbiór).
+//! MongoDB-style document updater (subset).
 //!
-//! Obsługiwane operatory: `$set`, `$unset`, `$inc`, `$push`, `$pull`,
-//! `$addToSet` oraz `$setOnInsert` (tylko przy upsercie).
-//! Aktualizacja bez operatorów (zwykły obiekt) zastępuje dokument, zachowując `_id`.
+//! Supported operators: `$set`, `$unset`, `$inc`, `$push`, `$pull`,
+//! `$addToSet` and `$setOnInsert` (only on upsert).
+//! An update without operators (a plain object) replaces the document while keeping `_id`.
 
 use crate::error::{Error, Result};
 use serde_json::{Map, Value};
@@ -10,8 +10,8 @@ use serde_json::{Map, Value};
 use super::matcher::num_eq;
 use super::path;
 
-/// Buduje bazowy dokument z równościowych warunków filtra (`{a: 1}`,
-/// `{a: {$eq: 1}}`, także wewnątrz `$and`). Reszta warunków jest pomijana.
+/// Builds a base document from equality conditions in the filter (`{a: 1}`,
+/// `{a: {$eq: 1}}`, including inside `$and`). Other conditions are ignored.
 pub fn seed_from_filter(filter: &Value) -> Value {
     let mut doc = Value::Object(Map::new());
     collect_seed(filter, &mut doc);
@@ -53,13 +53,13 @@ fn each_values(v: &Value) -> Option<&Vec<Value>> {
     obj.get("$each")?.as_array()
 }
 
-/// Stosuje `update` do dokumentu `doc` w miejscu.
+/// Applies `update` to `doc` in place.
 pub fn apply(doc: &mut Value, update: &Value) -> Result<()> {
     apply_with(doc, update, false)
 }
 
-/// Jak `apply`, ale z kontekstem insertu (dla `$setOnInsert`). Przy zwykłym
-/// zastąpieniu dokumentu dokłada równościowe pola z filtra upserta.
+/// Like `apply`, but with insert context (for `$setOnInsert`). For a plain
+/// document replacement, it adds equality fields from the upsert filter.
 pub fn apply_upsert(doc: &mut Value, update: &Value) -> Result<()> {
     let Some(obj) = update.as_object() else {
         return Err(Error::Query("update must be an object".into()));
@@ -69,8 +69,8 @@ pub fn apply_upsert(doc: &mut Value, update: &Value) -> Result<()> {
         return apply_with(doc, update, true);
     }
 
-    // Zastąpienie: zachowaj `_id` i pola równościowe z filtra, których nie ma
-    // w nowym dokumencie (semantyka upserta Mongo).
+    // Replacement: keep `_id` and equality fields from the filter that are absent
+    // from the new document (Mongo upsert semantics).
     let mut out = update.clone();
     if let Some(seed) = doc.as_object() {
         for (k, v) in seed {
@@ -199,7 +199,7 @@ fn apply_with(doc: &mut Value, update: &Value, inserting: bool) -> Result<()> {
     Ok(())
 }
 
-/// Zastąpienie całego dokumentu z zachowaniem `_id`.
+/// Replaces the whole document while keeping `_id`.
 #[allow(dead_code)]
 pub fn replace(doc: &mut Value, replacement: &Value) -> Result<()> {
     let _ = Map::<String, Value>::new();
@@ -280,7 +280,7 @@ mod tests {
             doc,
             json!({"tenant": "a", "key": "x", "value": 1, "created": true})
         );
-        // Poza insertem `$setOnInsert` jest ignorowane.
+        // Outside an insert, `$setOnInsert` is ignored.
         let mut existing = json!({"tenant": "a"});
         apply(&mut existing, &json!({"$setOnInsert": {"created": true}})).unwrap();
         assert_eq!(existing, json!({"tenant": "a"}));

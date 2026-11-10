@@ -1,9 +1,9 @@
-"""Testy na dużych danych: ładowanie, indeksy, zapytania, update/delete, tekst.
+"""Large-data tests: loading, indexes, queries, update/delete, text.
 
     NONODB_SOCK=/tmp/nonodb.sock NONODB_PID=1234 \
         python3 scripts/large_test.py --docs 1000000 --text-docs 100000
 
-Wymaga działającego daemona i świeżego katalogu danych (skrypt czyści kolekcje).
+Requires a running daemon and a fresh data directory (the script clears collections).
 """
 
 from __future__ import annotations
@@ -86,7 +86,7 @@ def main() -> int:
     db = NonoDB(SOCK, timeout=float(os.environ.get("NONODB_TIMEOUT", "10")))
     c = db.collection("large")
 
-    # --- ładowanie ---------------------------------------------------
+    # --- loading ----------------------------------------------------
     t = time.perf_counter()
     if c.count({}) > 0:
         print("kolekcja `large` nie jest pusta — czyszczę (może potrwać)...")
@@ -101,7 +101,7 @@ def main() -> int:
     )
     print("  ", resources())
 
-    # --- indeksy -----------------------------------------------------
+    # --- indexes -----------------------------------------------------
     t = time.perf_counter()
     c.create_index("grp")
     c.create_index("age")
@@ -109,7 +109,7 @@ def main() -> int:
     print(f"INDEX 3 pola (backfill) w {time.perf_counter() - t:.1f}s")
     print("  ", resources())
 
-    # --- zapytania ---------------------------------------------------
+    # --- queries -----------------------------------------------------
     rnd = random.Random(42)
     ids = [f"u{rnd.randrange(args.docs):08d}" for _ in range(1000)]
     print("QUERY")
@@ -171,7 +171,7 @@ def main() -> int:
     assert c.count({}) == args.docs - n
     print("  ", resources())
 
-    # --- tekst / fuzzy ----------------------------------------------
+    # --- text / fuzzy -----------------------------------------------
     if args.text:
         t = db.collection("large_text")
         t.delete({}, multi=True)

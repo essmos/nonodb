@@ -1,9 +1,9 @@
-//! Protokół HTTP/JSON: żądania, odpowiedzi i błędy API.
+//! HTTP/JSON protocol: requests, responses, and API errors.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// Żądanie do `/v1/exec`.
+/// Request to `/v1/exec`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
@@ -119,19 +119,19 @@ pub enum Request {
         #[serde(default)]
         limit: Option<usize>,
     },
-    /// Wiele operacji **odczytu** w jednej transakcji LMDB.
+    /// Multiple **read** operations in one LMDB transaction.
     Batch {
         ops: Vec<Request>,
     },
-    /// Atomowy batch zapisów: wszystkie operacje w jednej transakcji LMDB.
-    /// Jeśli którakolwiek zawiedzie, cała transakcja jest wycofywana.
+    /// Atomic write batch: all operations in one LMDB transaction.
+    /// If any operation fails, the whole transaction is rolled back.
     WriteBatch {
         ops: Vec<WriteOp>,
     },
     ListCollections,
 }
 
-/// Operacja zapisu dozwolona w atomowym `write_batch`.
+/// Write operation allowed in an atomic `write_batch`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum WriteOp {
@@ -162,7 +162,7 @@ pub enum WriteOp {
     },
 }
 
-/// Operacje zapisu przekazywane do pojedynczego taska piszącego.
+/// Write operations passed to the single writer task.
 #[derive(Debug)]
 pub enum WriteReq {
     Insert {
@@ -211,7 +211,7 @@ pub enum WriteReq {
         coll: String,
         field: String,
     },
-    /// Atomowy batch zapisów (wszystko albo nic).
+    /// Atomic write batch (all or nothing).
     Batch {
         ops: Vec<WriteReq>,
     },

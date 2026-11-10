@@ -1,12 +1,12 @@
-//! Kopia zapasowa bazy (snapshot LMDB) — bezpieczna także przy działającym
-//! daemonie, bo otwiera środowisko tylko do odczytu.
+//! Database backup (LMDB snapshot) - safe even with a running
+//! daemon because it opens the environment read-only.
 //!
-//! Użycie:
+//! Usage:
 //!     cargo run --release -p nonodb-core --example backup -- ./data ./backup
 //!
-//! `out-dir` to katalog docelowy; plik kopii zapisujemy jako `out-dir/data.mdb`,
-//! żeby dało się go otworzyć normalnie (katalog + `data.mdb` + `lock.mdb`).
-//! `CompactionOption::Enabled` dodatkowo pomija wolne strony (kompaktuje plik).
+//! `out-dir` is the target directory; the backup is written as `out-dir/data.mdb`,
+//! so it can be opened normally (directory + `data.mdb` + `lock.mdb`).
+//! `CompactionOption::Enabled` also skips free pages (compacts the file).
 
 use std::error::Error;
 use std::path::PathBuf;
@@ -20,7 +20,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     std::fs::create_dir_all(&out_dir)?;
     let out = out_dir.join("data.mdb");
 
-    // SAFETY: otwieramy tylko do odczytu, nie modyfikujemy pliku poza LMDB.
+    // SAFETY: opened read-only; the file is not modified outside LMDB.
     let env = unsafe {
         EnvOpenOptions::new()
             .flags(EnvFlags::READ_ONLY)

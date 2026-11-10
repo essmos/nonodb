@@ -1,9 +1,9 @@
 //! Jeden pisarz + group commit.
 //!
-//! Wszystkie operacje zapisu trafiają kanałem `mpsc` do jednego wątku. Wątek
-//! zbiera paczkę żądań (do `MAX_BATCH` sztuk w oknie `BATCH_WINDOW`), wykonuje
-//! je w **jednej** transakcji LMDB i robi **jeden** `commit` — czyli jeden
-//! `fsync` na paczkę. Odpowiedź do klienta leci dopiero po commicie.
+//! All write operations go through an `mpsc` channel to one thread. The thread
+//! collects a batch of requests (up to `MAX_BATCH` in a `BATCH_WINDOW`), executes
+//! them in **one** LMDB transaction and performs **one** `commit` - that is, one
+//! `fsync` per batch. The client response is sent only after the commit.
 
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::Arc;
@@ -17,29 +17,29 @@ use crate::cache::QueryCache;
 use crate::metrics;
 use crate::protocol::{ApiError, WriteReq};
 
-/// Maksymalna liczba operacji w jednej transakcji.
+/// Maximum number of operations in one transaction.
 const MAX_BATCH: usize = 512;
-/// Bazowe okno zbierania paczki (niska kolejka = niska latencja).
+/// Base batch collection window (short queue = low latency).
 const BASE_WINDOW: Duration = Duration::from_millis(1);
-/// Maksymalne okno przy dużym obciążeniu (większy batch = mniej `fsync`).
+/// Maximum window under heavy load (larger batch = fewer `fsync`s).
 const MAX_WINDOW: Duration = Duration::from_millis(5);
 
 pub struct WriteJob {
     pub req: WriteReq,
     pub resp: oneshot::Sender<Result<Value, ApiError>>,
-    /// Tylko ta operacja w transakcji (np. długi backfill auto-indeksu).
+    /// This operation alone in the transaction (e.g. a long auto-index backfill).
     pub isolated: bool,
 }
 
-/// Pętla wątku piszącego. Kończy się, gdy kanał zostanie zamknięty.
+/// Writer thread loop. Ends when the channel is closed.
 pub fn run(store: Arc<Store>, rx: Receiver<WriteJob>, cache: Arc<QueryCache>) {
     while let Ok(first) = rx.recv() {
         let mut jobs = vec![first];
-        // Adaptacyjne okno: im dłuższa kolejka, tym większy batch (mniej fsync),
-        // ale przy pustej kolejce wracamy do 1 ms (niska latencja).
+        // Adaptive window: the longer the queue, the larger the batch (fewer fsyncs),
+        // but with an empty queue we return to 1 ms (low latency).
         let pending = metrics::QUEUE_LEN.load(std::sync::atomic::Ordering::Relaxed);
-        // Progi wysokie: przy małej liczbie klientów 1 ms wystarcza i nie
-        // dodajemy latencji; wydłużamy okno dopiero przy realnym natłoku.
+        // High thresholds: with few clients, 1 ms is enough and does not
+        // add latency; we extend the window only under real pressure.
         let window = if pending >= 256 {
             MAX_WINDOW
         } else if pending >= 64 {
@@ -66,9 +66,9 @@ pub fn run(store: Arc<Store>, rx: Receiver<WriteJob>, cache: Arc<QueryCache>) {
 
 fn run_batch(store: &Store, cache: &QueryCache, jobs: Vec<WriteJob>) {
     metrics::sub(&metrics::QUEUE_LEN, jobs.len() as u64);
-    // Atomowy `write_batch` nie może współdzielić transakcji z innymi
-    // żądaniami: błąd jednej operacji musi wycofać całą jego transakcję, a nie
-    // pozostałe zapisy z grupy. Dlatego taką grupę wykonujemy job po jobie.
+    // An atomic `write_batch` cannot share a transaction with other
+    // requests: one failed operation must roll back the whole batch, not
+    // the other writes in the group. That is why such a group is run job by job.
     if jobs.iter().any(|j| j.req.is_atomic() || j.isolated) {
         for job in jobs {
             run_single(store, cache, job);
@@ -136,7 +136,7 @@ fn run_single(store: &Store, cache: &QueryCache, job: WriteJob) {
             }
         },
         Err(e) => {
-            // Drop `wtxn` = abort; dla `WriteReq::Batch` to gwarantuje
+            // Drop `wtxn` = abort; for `WriteReq::Batch` this guarantees
             // all-or-nothing.
             drop(wtxn);
             let _ = job.resp.send(Err(e));

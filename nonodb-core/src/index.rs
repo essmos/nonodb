@@ -1,15 +1,15 @@
-//! Indeksy wtórne: kodowanie klucza i definicje.
+//! Secondary indexes: key encoding and definitions.
 
 use std::ops::Bound;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// Definicja indeksu zapisywana w `meta` pod `index:<coll>:<nazwa>`.
+/// Index definition stored in `meta` under `index:<coll>:<name>`.
 ///
-/// Obsługuje indeksy pojedyncze (`fields == ["age"]`) i złożone
-/// (`fields == ["grp", "age"]`). `field` jest tylko zgodnością wsteczną dla
-/// baz zapisanych przed wprowadzeniem indeksów złożonych.
+/// Supports single-field (`fields == ["age"]`) and compound
+/// (`fields == ["grp", "age"]`) indexes. `field` exists only for backward
+/// compatibility with databases written before compound indexes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexDef {
     #[serde(default)]
@@ -18,7 +18,7 @@ pub struct IndexDef {
     pub field: String,
     #[serde(default)]
     pub unique: bool,
-    /// Pola dodatkowo kopiowane do wartości indeksu (pokrywanie projekcji).
+    /// Fields additionally copied into the index value (covering projections).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub include: Vec<String>,
 }
@@ -42,7 +42,7 @@ impl IndexDef {
         }
     }
 
-    /// Lista pól w kolejności indeksu (z obsługą starego formatu `field`).
+    /// Fields in index order (with support for the legacy `field` format).
     pub fn effective_fields(&self) -> Vec<String> {
         if !self.fields.is_empty() {
             self.fields.clone()
@@ -53,31 +53,31 @@ impl IndexDef {
         }
     }
 
-    /// Nazwa logiczna: `age` albo `grp+age`.
+    /// Logical name: `age` or `grp+age`.
     pub fn name(&self) -> String {
         self.effective_fields().join("+")
     }
 }
 
-/// Nazwa sub-bazy indeksu.
+/// Index sub-database name.
 pub fn db_name(coll: &str, field: &str) -> String {
     format!("idx:{coll}:{field}")
 }
 
-/// Klucz definicji indeksu w `meta`.
+/// Index definition key in `meta`.
 pub fn def_key(coll: &str, field: &str) -> String {
     format!("index:{coll}:{field}")
 }
 
-/// Wartość pola dokumentu (obsługuje ścieżki `a.b`).
+/// Document field value (supports `a.b` paths).
 pub fn field_value<'a>(doc: &'a Value, field: &str) -> Option<&'a Value> {
     crate::query::path::get(doc, field)
 }
 
-/// Koduje wartość skalarną do bajtów, których porządek leksykograficzny
-/// odpowiada porządkowi wartości. Zwraca `None` dla typów nieindeksowalnych.
+/// Encodes a scalar value into bytes whose lexicographic order
+/// matches value order. Returns `None` for non-indexable types.
 ///
-/// Układ: `[tag] [dane]`.
+/// Layout: `[tag] [data]`.
 pub fn encode_value(v: &Value) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(10);
     match v {
@@ -109,9 +109,9 @@ pub fn encode_value(v: &Value) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Koduje wartości wszystkich pól indeksu (indeks złożony).
-/// Dokument jest pomijany, jeśli brakuje któregokolwiek pola lub jest ono
-/// tablicą/obiektem.
+/// Encodes values of all index fields (compound index).
+/// The document is skipped if any field is missing or is an
+/// array/object.
 pub fn encode_fields(doc: &Value, fields: &[String]) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(fields.len() * 10);
     for field in fields {
@@ -120,9 +120,9 @@ pub fn encode_fields(doc: &Value, fields: &[String]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Wartość wpisu indeksu. Gdy indeks ma pola `include`, wartość zawiera
-/// `_id` oraz kopię pól indeksu i `include` (pokrywanie projekcji). W starym
-/// formacie wartością jest samo `_id`.
+/// Index entry value. When the index has `include` fields, the value contains
+/// `_id` plus a copy of index and `include` fields (covering projections). In the
+/// legacy format the value is just `_id`.
 pub fn encode_index_value(def: &IndexDef, doc: &Value, id: &str) -> Vec<u8> {
     if def.include.is_empty() {
         return id.as_bytes().to_vec();
@@ -143,7 +143,7 @@ pub fn encode_index_value(def: &IndexDef, doc: &Value, id: &str) -> Vec<u8> {
     }
 }
 
-/// Odczyt wartości wpisu indeksu: `(id, opcjonalne pola pokrywające)`.
+/// Reads an index entry value: `(id, optional covering fields)`.
 pub fn decode_index_value(raw: &[u8]) -> Option<(String, Option<serde_json::Map<String, Value>>)> {
     if raw.first() == Some(&0) {
         if let Ok(Value::Object(mut obj)) = serde_json::from_slice::<Value>(&raw[1..]) {
@@ -164,12 +164,12 @@ pub fn decode_index_value(raw: &[u8]) -> Option<(String, Option<serde_json::Map<
 }
 
 fn orderable_f64(f: f64) -> [u8; 8] {
-    // Normalizacja -0.0 -> 0.0: `f64` traktuje je jako równe, więc kodowanie
-    // też musi (inaczej porządek kluczy różniłby się od porównań).
+    // Normalize -0.0 -> 0.0: `f64` treats them as equal, so encoding
+    // must too (otherwise key order would differ from comparisons).
     let f = if f == 0.0 { 0.0 } else { f };
     let bits = f.to_bits();
-    // Porządek: liczby ujemne mają odwrócone bity, dodatnie mają ustawiony
-    // najwyższy bit, więc big-endian porównuje się jak `f64`.
+    // Ordering: negative numbers have inverted bits, positive numbers have the
+    // high bit set, so big-endian comparison matches `f64`.
     let enc = if bits & (1 << 63) != 0 {
         !bits
     } else {
@@ -185,10 +185,10 @@ fn after_value(vb: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Zakres kluczy indeksu dla operatora porównania.
+/// Index key range for a comparison operator.
 ///
-/// Klucz wpisu to `encode_value(wartość) ++ _id`, więc `vb + 0xFF` leży po
-/// wszystkich wpisach o wartości `vb`, a przed każdą większą wartością.
+/// An entry key is `encode_value(value) ++ _id`, so `vb + 0xFF` lies after
+/// all entries with value `vb` and before any larger value.
 pub type RangeBytes = (Bound<Vec<u8>>, Bound<Vec<u8>>);
 
 pub fn bounds(op: &str, value: &Value) -> Option<RangeBytes> {
@@ -206,12 +206,12 @@ pub fn bounds(op: &str, value: &Value) -> Option<RangeBytes> {
     })
 }
 
-/// Zakres dla warunku złożonego, np. `{"$gte": 18, "$lt": 30}`.
+/// Range for a compound condition, e.g. `{"$gte": 18, "$lt": 30}`.
 ///
-/// Obsługuje jeden operator (`$eq`, `$gt`, `$gte`, `$lt`, `$lte`) albo kilka
-/// operatorów zakresu na tym samym polu. Zakres jest ograniczony do tego samego
-/// typu co wartość w warunku — matcher nie porównuje różnych typów, więc bez
-/// tego `$gt: 2` obejmowałoby też stringi/bool z indeksu.
+/// Supports one operator (`$eq`, `$gt`, `$gte`, `$lt`, `$lte`) or several
+/// range operators on the same field. The range is limited to the same
+/// type as the condition value; the matcher does not compare different types, so
+/// otherwise `$gt: 2` would also include strings/bools from the index.
 pub fn bounds_from_cond(cond: &Value) -> Option<RangeBytes> {
     let Some(obj) = cond.as_object() else {
         return bounds("$eq", cond);
@@ -238,7 +238,7 @@ fn range_bounds<'a>(ops: impl Iterator<Item = (&'a str, &'a Value)>) -> Option<R
         let t = *vb.first()?;
         if let Some(prev) = tag {
             if prev != t {
-                return None; // mieszane typy -> pełny skan
+                return None; // mixed types -> full scan
             }
         } else {
             tag = Some(t);
@@ -257,7 +257,7 @@ fn range_bounds<'a>(ops: impl Iterator<Item = (&'a str, &'a Value)>) -> Option<R
     Some((lower, upper))
 }
 
-/// Górna granica typu (wyłącznie): klucze o tagu `tag` są mniejsze.
+/// Type upper bound (exclusive): keys with tag `tag` are smaller.
 fn type_upper(tag: u8) -> Bound<Vec<u8>> {
     if tag < u8::MAX {
         Bound::Excluded(vec![tag + 1])
@@ -273,7 +273,7 @@ fn max_lower(a: Bound<Vec<u8>>, b: Bound<Vec<u8>>) -> Bound<Vec<u8>> {
         _ => match bound_key(&a).cmp(bound_key(&b)) {
             std::cmp::Ordering::Greater => a,
             std::cmp::Ordering::Less => b,
-            // Ten sam klucz: `Included` jest szerszy (mniej restrykcyjny).
+            // Same key: `Included` is wider (less restrictive).
             std::cmp::Ordering::Equal => {
                 if matches!(a, Bound::Included(_)) {
                     a
@@ -292,7 +292,7 @@ fn min_upper(a: Bound<Vec<u8>>, b: Bound<Vec<u8>>) -> Bound<Vec<u8>> {
         _ => match bound_key(&a).cmp(bound_key(&b)) {
             std::cmp::Ordering::Less => a,
             std::cmp::Ordering::Greater => b,
-            // Ten sam klucz: `Included` jest szerszy.
+            // Same key: `Included` is wider.
             std::cmp::Ordering::Equal => {
                 if matches!(a, Bound::Included(_)) {
                     a
@@ -311,7 +311,7 @@ fn bound_key(b: &Bound<Vec<u8>>) -> &[u8] {
     }
 }
 
-/// Dokleja prefiks (wartości wcześniejszych pól indeksu) do granic zakresu.
+/// Prepends the prefix (values of earlier index fields) to range bounds.
 pub fn prefix_bounds(prefix: &[u8], (lo, hi): RangeBytes) -> RangeBytes {
     let map = |b: Bound<Vec<u8>>| match b {
         Bound::Included(mut v) => {
@@ -329,7 +329,7 @@ pub fn prefix_bounds(prefix: &[u8], (lo, hi): RangeBytes) -> RangeBytes {
     (map(lo), map(hi))
 }
 
-/// Zakres dla pełnego prefiksu równościowego (wszystkie składowe `=`).
+/// Range for a full equality prefix (all components are `=`).
 pub fn exact_prefix(prefix: &[u8]) -> RangeBytes {
     (
         Bound::Included(prefix.to_vec()),

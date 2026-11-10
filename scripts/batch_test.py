@@ -1,4 +1,4 @@
-"""Test `/v1/batch`: wiele odczytów w jednej transakcji + zgodność z pojedynczymi.
+"""Test `/v1/batch`: multiple reads in one transaction + parity with individual calls.
 
     NONODB_SOCK=/tmp/nonodb.sock python3 scripts/batch_test.py
 """
@@ -46,7 +46,7 @@ def main() -> int:
     assert len(res) == len(ops)
     assert all(r["ok"] for r in res), res
 
-    # Zgodność z pojedynczymi wywołaniami.
+    # Parity with individual calls.
     assert res[0]["result"] == c.find_one({"_id": ids[7]})
     assert res[1]["result"] == c.find({"grp": 2}, limit=3)
     assert res[2]["result"]["count"] == 100
@@ -60,7 +60,7 @@ def main() -> int:
     assert res[10]["result"] == []
     assert res[11]["result"]["count"] == 0
 
-    # Zapis w batchu jest odrzucany per-operacja, bez przerywania całości.
+    # A write in a batch is rejected per operation without aborting the rest.
     res = db.batch(
         [
             {"op": "insert", "coll": c.name, "doc": {"x": 1}},
@@ -70,15 +70,15 @@ def main() -> int:
     assert res[0]["ok"] is False and res[0]["error"]["code"] == "invalid_query"
     assert res[1]["ok"] is True and res[1]["result"]["count"] == 100
 
-    # get_many: jedno żądanie, wiele dokumentów.
+    # get_many: one request, many documents.
     got = c.get_many(ids[:10])
     assert len(got) == 10
     assert {d["_id"] for d in got} == set(ids[:10])
 
-    # Pusty batch.
+    # Empty batch.
     assert db.batch([]) == []
 
-    # Cache obejmuje batch i jest unieważniany zapisem.
+    # The cache covers batch and is invalidated by writes.
     cached = NonoDB(SOCK, cache_ttl=5.0)
     cc = cached.collection(c.name)
     before = cached.batch([{"op": "count", "coll": c.name, "filter": {}}])[0]["result"]["count"]
