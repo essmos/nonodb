@@ -72,7 +72,7 @@ Implemented:
   projection.
 - `drop_*` leaves named LMDB sub-databases registered; repeated creation and
   dropping of many different names can exhaust `MAX_DBS`.
-- `MAX_DBS=256` means roughly 247 collections plus index/search sub-databases
+- `MAX_DBS=256` means roughly 246 collections plus index/search sub-databases
   before `MDB_DBS_FULL`.
 
 ### Search

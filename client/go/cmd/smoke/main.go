@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
+	"strings"
 	"time"
 
 	nonodb "github.com/essmos/nonodb/client/go"
@@ -89,6 +91,22 @@ func main() {
 
 	if _, err := users.GetMany(ctx, []string{id}); err != nil {
 		log.Fatal(err)
+	}
+
+	switch strings.ToLower(os.Getenv("NONODB_HISTORY")) {
+	case "1", "true", "yes", "on":
+		revisions, err := users.History(ctx, id, 10, true)
+		if err != nil || len(revisions) == 0 {
+			log.Fatalf("history: %v %v", revisions, err)
+		}
+		rev, ok := revisions[len(revisions)-1]["rev"].(float64)
+		if !ok {
+			log.Fatalf("history revision has no rev: %v", revisions)
+		}
+		version, err := users.GetVersion(ctx, id, uint64(rev))
+		if err != nil || version == nil {
+			log.Fatalf("get_version: %v %v", version, err)
+		}
 	}
 	fmt.Println("go client smoke test: ok")
 }

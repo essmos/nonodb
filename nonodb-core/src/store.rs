@@ -7,6 +7,7 @@ use heed::{Database, Env, EnvOpenOptions, RoTxn, RwTxn};
 
 use crate::collection::Collection;
 use crate::error::{Error, Result};
+use crate::history::{self, HistoryConfig, HISTORY_DB};
 
 /// Maximum database file size. This is mmap address space - **not**
 /// a disk or RAM reservation. The file grows on demand up to this limit.
@@ -57,11 +58,24 @@ pub const MAX_DOCUMENT_BYTES: usize = 1024 * 1024;
 /// Database handle. One `Store` = one `Env` = one LMDB file.
 pub struct Store {
     env: Env,
+    history: Database<Bytes, Bytes>,
+    history_config: HistoryConfig,
 }
 
 impl Store {
     /// Opens (or creates) the database in the `path` directory.
+    ///
+    /// History is disabled by default for library users. The daemon enables it
+    /// with the `NONODB_HISTORY` environment setting.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_history(path, HistoryConfig::default())
+    }
+
+    /// Opens the database with explicit history settings.
+    pub fn open_with_history(
+        path: impl AsRef<Path>,
+        history_config: HistoryConfig,
+    ) -> Result<Self> {
         let path = path.as_ref();
         std::fs::create_dir_all(path)?;
 
@@ -74,11 +88,43 @@ impl Store {
                 .open(path)?
         };
 
-        let store = Self { env };
         // After `kill -9`, dead reader slots may remain in the lock table.
-        let _ = store.env.clear_stale_readers();
-        store.init_meta()?;
-        Ok(store)
+        let _ = env.clear_stale_readers();
+        let history = Self::init_meta(&env)?;
+        Ok(Self {
+            env,
+            history,
+            history_config,
+        })
+    }
+
+    /// Current history settings.
+    pub fn history_config(&self) -> HistoryConfig {
+        self.history_config
+    }
+
+    /// Deletes old revisions above the configured per-document limit.
+    ///
+    /// Call only from the writer thread. This does a bounded scan and is meant
+    /// to run periodically, not as part of every write.
+    pub fn prune_history(&self, limit: usize) -> Result<usize> {
+        if !self.history_config.active() {
+            return Ok(0);
+        }
+        let mut wtxn = self.write_txn()?;
+        let meta = self
+            .env
+            .open_database::<Bytes, Bytes>(&wtxn, Some(META_DB))?
+            .ok_or_else(|| Error::Query("meta database missing".into()))?;
+        let deleted = history::prune(
+            &self.history,
+            &meta,
+            &mut wtxn,
+            self.history_config.max_versions,
+            limit,
+        )?;
+        wtxn.commit()?;
+        Ok(deleted)
     }
 
     pub fn env(&self) -> &Env {
@@ -93,9 +139,9 @@ impl Store {
         Ok(self.env.write_txn()?)
     }
 
-    fn init_meta(&self) -> Result<()> {
-        let mut wtxn = self.write_txn()?;
-        let meta: Database<Bytes, Bytes> = self.env.create_database(&mut wtxn, Some(META_DB))?;
+    fn init_meta(env: &Env) -> Result<Database<Bytes, Bytes>> {
+        let mut wtxn = env.write_txn()?;
+        let meta: Database<Bytes, Bytes> = env.create_database(&mut wtxn, Some(META_DB))?;
         if meta.get(&wtxn, b"schema_version")?.is_none() {
             meta.put(
                 &mut wtxn,
@@ -103,8 +149,9 @@ impl Store {
                 SCHEMA_VERSION.to_string().as_bytes(),
             )?;
         }
+        let history: Database<Bytes, Bytes> = env.create_database(&mut wtxn, Some(HISTORY_DB))?;
         wtxn.commit()?;
-        Ok(())
+        Ok(history)
     }
 
     fn validate_name(name: &str) -> Result<()> {
@@ -185,7 +232,14 @@ impl Store {
         db: Database<Bytes, Bytes>,
         meta: Database<Bytes, Bytes>,
     ) -> Collection<'e> {
-        Collection::new(&self.env, db, meta, name.to_string())
+        Collection::new(
+            &self.env,
+            db,
+            meta,
+            self.history,
+            self.history_config,
+            name.to_string(),
+        )
     }
 
     /// List of registered collections.

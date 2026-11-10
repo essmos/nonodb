@@ -24,6 +24,8 @@ cleanup() {
 trap cleanup EXIT
 
 mkdir -p "$TMP/run"
+export NONODB_HISTORY=1
+export NONODB_HISTORY_MAX_VERSIONS=5
 NONODB_DATA="$TMP/data" \
 NONODB_SOCK="$TMP/run/nonodb.sock" \
 RUST_LOG=warn \

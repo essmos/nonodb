@@ -28,7 +28,7 @@ use hyper_util::service::TowerToHyperService;
 use serde_json::{json, Value};
 
 use nonodb_core::heed::RoTxn;
-use nonodb_core::{FindQuery, Store, DEFAULT_FUZZY_DISTANCE};
+use nonodb_core::{FindQuery, HistoryConfig, Store, DEFAULT_FUZZY_DISTANCE};
 use protocol::{ApiError, ApiResponse, Request, WriteReq};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_rustls::rustls::ServerConfig;
@@ -81,7 +81,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let sock =
         PathBuf::from(std::env::var("NONODB_SOCK").unwrap_or_else(|_| "/run/nonodb.sock".into()));
 
-    let store = Arc::new(Store::open(&data)?);
+    let store = Arc::new(Store::open_with_history(&data, HistoryConfig::from_env())?);
 
     // One writer thread, independent of the tokio runtime (LMDB blocks on fsync).
     let (write_tx, write_rx) = mpsc::channel::<WriteJob>();
@@ -493,6 +493,35 @@ async fn exec(
             read_result(joined).await
         }
 
+        Request::History {
+            coll,
+            id,
+            limit,
+            include_docs,
+        } => {
+            let store = state.store.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                let c = store.collection(&coll)?;
+                Ok::<Value, ApiError>(json!({
+                    "revisions": c.history(&id, limit, include_docs)?
+                }))
+            });
+            read_result(joined).await
+        }
+
+        Request::GetVersion { coll, id, version } => {
+            let store = state.store.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                let c = store.collection(&coll)?;
+                let entry = c.get_version(&id, version)?;
+                let value = serde_json::to_value(entry)
+                    .map_err(nonodb_core::Error::from)
+                    .map_err(ApiError::from)?;
+                Ok::<Value, ApiError>(value)
+            });
+            read_result(joined).await
+        }
+
         Request::Batch { ops } => {
             let store = state.store.clone();
             let n = ops.len();
@@ -610,6 +639,8 @@ fn cacheable(req: &Request) -> bool {
             | Request::ListTextIndexes { .. }
             | Request::ListFuzzyIndexes { .. }
             | Request::ListCollections
+            | Request::History { .. }
+            | Request::GetVersion { .. }
     )
 }
 
@@ -748,6 +779,26 @@ fn execute_read(store: &Store, rtxn: &RoTxn<'_>, req: Request) -> Result<Value, 
             Ok(json!({
                 "results": c.fuzzy_search_in(rtxn, &field, &query, distance, &filter, limit)?
             }))
+        }
+        Request::History {
+            coll,
+            id,
+            limit,
+            include_docs,
+        } => {
+            let Some(c) = store.collection_at(rtxn, &coll)? else {
+                return Ok(json!({ "revisions": [] }));
+            };
+            Ok(json!({
+                "revisions": c.history_in(rtxn, &id, limit, include_docs)?
+            }))
+        }
+        Request::GetVersion { coll, id, version } => {
+            let Some(c) = store.collection_at(rtxn, &coll)? else {
+                return Ok(Value::Null);
+            };
+            let entry = c.get_version_in(rtxn, &id, version)?;
+            Ok(serde_json::to_value(entry).map_err(nonodb_core::Error::from)?)
         }
         Request::ListCollections => Ok(json!({ "collections": store.collections_in(rtxn)? })),
         _ => Err(ApiError {

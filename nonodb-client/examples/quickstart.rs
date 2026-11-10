@@ -18,6 +18,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let one = users.find_one(&json!({"_id": id}), None)?;
     println!("one: {}", serde_json::to_string(&one)?);
 
+    if matches!(
+        std::env::var("NONODB_HISTORY")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    ) {
+        let revisions = users.history(&id, Some(10), true)?;
+        println!("revisions: {}", revisions.len());
+        if let Some(first) = revisions.last() {
+            let version = first["rev"].as_u64().expect("revision");
+            let old = users.get_version(&id, version)?;
+            println!("old: {}", serde_json::to_string(&old)?);
+        }
+    }
+
     println!("collections: {:?}", db.collections()?);
     Ok(())
 }

@@ -79,8 +79,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-The Rust client exposes `exec`, `batch`, `write_batch`, `get_many`, indexes,
-text search, and fuzzy search. `Client::from_env()` reads `NONODB_SOCK`,
+The Rust client exposes `exec`, `batch`, `write_batch`, `get_many`, history,
+indexes, text search, and fuzzy search. `Client::from_env()` reads `NONODB_SOCK`,
 `NONODB_URL`, `NONODB_TOKEN`, and `NONODB_TLS_VERIFY`.
 
 ## Node.js
@@ -179,6 +179,7 @@ All clients expose the common document operations:
 - `insert`, `insert_many`, `find`, `find_one`, `update`, `delete`, `count`;
 - `batch` (read-only) and `write_batch` (atomic writes);
 - `get_many` for fetching documents by `_id`;
+- `history` and `get_version` for document revisions (daemon history enabled);
 - single-field, compound, unique, and covering indexes;
 - full-text (`search`) and fuzzy search;
 - text/fuzzy index listing and deletion;

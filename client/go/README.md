@@ -26,3 +26,8 @@ db := nonodb.New(
 See [docs/clients.md](../../docs/clients.md) for the full client guide. Run
 `NONODB_SOCK=/run/nonodb.sock go run ./cmd/smoke` against a daemon for an
 end-to-end check.
+
+## Document history
+
+When the daemon is started with `NONODB_HISTORY=1`, use `History()` and
+`GetVersion()` on a collection.

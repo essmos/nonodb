@@ -341,6 +341,8 @@ fn is_read_op(payload: &Value) -> bool {
                 | "list_fuzzy_indexes"
                 | "search"
                 | "fuzzy"
+                | "history"
+                | "get_version"
                 | "batch"
         )
     )
@@ -522,6 +524,32 @@ impl Collection<'_> {
                 }
             })
             .collect())
+    }
+
+    /// List document revisions, newest first.
+    ///
+    /// History is enabled by the daemon with `NONODB_HISTORY=1`. Revisions use
+    /// global monotonic `rev` values.
+    pub fn history(&self, id: &str, limit: Option<u64>, include_docs: bool) -> Result<Vec<Value>> {
+        let result = self.client.exec(json!({
+            "op": "history",
+            "coll": self.name,
+            "id": id,
+            "limit": limit,
+            "include_docs": include_docs,
+        }))?;
+        value_array(result.get("revisions").cloned().unwrap_or(Value::Null))
+    }
+
+    /// Read one exact document revision.
+    pub fn get_version(&self, id: &str, version: u64) -> Result<Option<Value>> {
+        let result = self.client.exec(json!({
+            "op": "get_version",
+            "coll": self.name,
+            "id": id,
+            "version": version,
+        }))?;
+        Ok((!result.is_null()).then_some(result))
     }
 
     /// Create a full-text index.

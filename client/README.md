@@ -6,3 +6,8 @@
 - [Go](go) — context-aware client; Unix socket or TCP/TLS.
 
 See [docs/clients.md](../docs/clients.md) for installation and examples.
+
+## Document history
+
+When the daemon is started with `NONODB_HISTORY=1`, all clients expose
+history and exact-revision helpers.

@@ -28,6 +28,10 @@ def main() -> int:
     coll.delete({}, multi=True)
 
     doc_id = coll.insert({"name": "counter", "n": 0})
+    if os.environ.get("NONODB_HISTORY", "").lower() in {"1", "true", "yes", "on"}:
+        revisions = coll.history(doc_id, limit=5, include_docs=True)
+        assert len(revisions) == 1 and revisions[0]["op"] == "insert"
+        assert coll.get_version(doc_id, revisions[0]["rev"])["doc"]["n"] == 0
     errors: list[BaseException] = []
 
     def worker() -> None:

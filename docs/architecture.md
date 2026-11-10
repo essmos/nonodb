@@ -87,7 +87,8 @@ An LMDB environment contains named sub-databases. nonodb uses this layout:
 
 | Sub-database | Key | Value | Purpose |
 |---|---|---|---|
-| `meta` | metadata key | JSON or scalar | Collection registry, index definitions, search totals |
+| `meta` | metadata key | JSON or scalar | Collection registry, index definitions, search totals, history sequence |
+| `history` | collection + `_id` + revision | revision JSON | Append-only document history |
 | `coll:<name>` | `_id` bytes | JSON document | Primary collection data |
 | `idx:<coll>:<fields>` | encoded values + `_id` | encoded `_id` / covering payload | Secondary index |
 | `ft:<coll>:<field>` | `term\0_id` | term frequency (u32 LE) | BM25 postings |
@@ -98,8 +99,13 @@ Collection names are validated. The `_id` is always a string and is also the
 primary B+ tree key. Documents are serialized with `serde_json`; reads use
 `sonic-rs` for faster parsing.
 
+The optional `history` sub-database stores immutable revision snapshots. A key
+contains the collection name, `_id`, and a global `rev` assigned by the writer.
+The current collection is never modified by history and history entries are
+not indexed. See [Document history](operations.md#document-history).
+
 Every collection and every index consumes a named LMDB sub-database.
-`MAX_DBS` is 256, which in practice limits a database to roughly 247
+`MAX_DBS` is 256, which in practice limits a database to roughly 246
 collections before `MDB_DBS_FULL` (indexes consume additional slots). Dropping
 an index deletes its contents but the named sub-database remains registered in
 LMDB; see [Operations](operations.md#capacity-and-memory).

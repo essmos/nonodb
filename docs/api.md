@@ -85,6 +85,8 @@ client timeout with `NONODB_TIMEOUT` or the `timeout=` argument.
 | [`fuzzy`](#fuzzy) | Approximate string query |
 | [`batch`](#read-batch) | Multiple read operations, one snapshot |
 | [`write_batch`](#atomic-write-batch) | Atomic group of writes |
+| [`history`](#document-history) | List revisions of one document |
+| [`get_version`](#document-history) | Read one exact document revision |
 | [`list_collections`](#list_collections) | List known collections |
 
 ---
@@ -630,6 +632,74 @@ Semantics:
 - At most 5,000 candidates are scored per query.
 - Only scalar field values are indexed.
 
+## Document history
+
+History is opt-in on the daemon (`NONODB_HISTORY=1`) and is stored separately
+from the current collection. Searches, indexes, `find`, `count`, `update`, and
+`delete` always operate on current documents only. Every write receives a
+global monotonic `rev`; revisions for one document are therefore ordered but
+not necessarily consecutive.
+
+History records inserts, updates, and delete tombstones. The write is atomic
+with the current-document change.
+
+### history
+
+```json
+{
+  "op": "history",
+  "coll": "users",
+  "id": "0b7f...",
+  "limit": 50,
+  "include_docs": true
+}
+```
+
+Result, newest first:
+
+```json
+{
+  "revisions": [
+    {
+      "rev": 1042,
+      "op": "update",
+      "at": 1710000000123,
+      "deleted": false,
+      "doc": {"_id": "0b7f...", "name": "Ala"}
+    },
+    {
+      "rev": 1001,
+      "op": "insert",
+      "at": 1710000000000,
+      "deleted": false,
+      "doc": {"_id": "0b7f...", "name": "Alicja"}
+    }
+  ]
+}
+```
+
+`limit` defaults to 50 and is capped at 1000. With `include_docs: false`,
+metadata is returned without full documents.
+
+### get_version
+
+```json
+{
+  "op": "get_version",
+  "coll": "users",
+  "id": "0b7f...",
+  "version": 1001
+}
+```
+
+`rev` is accepted as an alias for `version`. The result is one revision object,
+or `null` if that revision no longer exists. A deleted document has a tombstone
+with `"deleted": true` and no document body.
+
+History retention is configured with `NONODB_HISTORY_MAX_VERSIONS` (default
+50). Pruning runs in the writer as a bounded background pass; it never adds an
+extra history scan to the hot write path.
+
 ## Read batch
 
 ```json
@@ -661,7 +731,8 @@ Response:
 Rules:
 
 - Allowed operations: `find`, `find_one`, `count`, `list_indexes`,
-  `list_text_indexes`, `list_fuzzy_indexes`, `list_collections`, `search`,
+  `list_text_indexes`, `list_fuzzy_indexes`, `list_collections`, `history`,
+  `get_version`, `search`,
   `fuzzy`.
 - Every operation executes against **one** `RoTxn`, so the batch sees a single
   consistent snapshot.

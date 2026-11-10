@@ -28,6 +28,7 @@ nonodb is a real document database with:
   folding and quoted phrases;
 - fuzzy search using trigrams plus Levenshtein distance;
 - snapshots, online backup, authentication, TLS, metrics and a CLI;
+- document revision history with global revision IDs and configurable retention;
 - a bounded daemon read cache, invalidated after every committed write;
 - optional automatic indexes for frequent query shapes, with TTL cleanup.
 
@@ -159,6 +160,40 @@ footprint.
 - Fuzzy search with trigrams plus bounded Levenshtein distance (`_distance`).
 - Both search indexes are maintained in the same transaction as the document.
 
+### Document history
+
+- Opt-in append-only revision history for inserts, updates, and deletes.
+- Global monotonic revision IDs; no per-document counter lookup on writes.
+- Current documents and indexes are unaffected: search always returns current
+  results.
+- Configurable retention with `NONODB_HISTORY_MAX_VERSIONS` (default `50`).
+- Revisions are written in the same LMDB transaction as the current document.
+- Read revisions with the `history` and `get_version` API operations, or the
+  `history`/`get_version` helpers in the official clients.
+
+Enable it on the daemon:
+
+```bash
+NONODB_HISTORY=1 NONODB_HISTORY_MAX_VERSIONS=50   NONODB_DATA=./data NONODB_SOCK=/tmp/nonodb.sock ./nonodb-daemon
+```
+
+Then inspect a document:
+
+```bash
+curl -s --unix-socket /tmp/nonodb.sock \
+  -H 'content-type: application/json' \
+  -X POST http://localhost/v1/exec \
+  -d '{"op":"history","coll":"users","id":"<id>","include_docs":true}'
+
+curl -s --unix-socket /tmp/nonodb.sock \
+  -H 'content-type: application/json' \
+  -X POST http://localhost/v1/exec \
+  -d '{"op":"get_version","coll":"users","id":"<id>","version":1042}'
+```
+
+See [Document history](docs/api.md#document-history) for the full request and
+retention semantics.
+
 ### Operations
 
 - Single daemon; Unix socket by default, optional TCP.
@@ -274,7 +309,7 @@ unit and installation steps in [Operations](docs/operations.md#deployment-with-s
 Download the archive matching your CPU (`uname -m` prints `arm64` or `x86_64`):
 
 ```bash
-TAG=v0.1.2
+TAG=v0.2.0
 curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/nonodb-$TAG-macos-arm64.tar.gz"
 tar -xzf "nonodb-$TAG-macos-arm64.tar.gz"
 cd "nonodb-$TAG-macos-arm64"
@@ -437,7 +472,7 @@ results. Visit [liveapisec.com](https://liveapisec.com) to learn more.
 
 ## Status
 
-nonodb is an early-stage project (`0.1.2`). Its core storage, query, index,
+nonodb is an early-stage project (`0.2.0`). Its core storage, query, index,
 search, batching, security, snapshot, and operational paths are covered by unit,
 property-based, end-to-end, concurrency, crash, and large-data tests. The API
 may still change before a stable release.

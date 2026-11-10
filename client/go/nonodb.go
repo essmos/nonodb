@@ -306,7 +306,8 @@ func isReadOp(payload map[string]any) bool {
 	op, _ := payload["op"].(string)
 	switch op {
 	case "find", "find_one", "count", "list_indexes", "list_collections",
-		"list_text_indexes", "list_fuzzy_indexes", "search", "fuzzy", "batch":
+		"list_text_indexes", "list_fuzzy_indexes", "search", "fuzzy",
+		"history", "get_version", "batch":
 		return true
 	default:
 		return false
@@ -565,6 +566,52 @@ func (c *Collection) GetMany(ctx context.Context, ids []string) ([]map[string]an
 		documents = append(documents, document)
 	}
 	return documents, nil
+}
+
+// History lists document revisions, newest first.
+func (c *Collection) History(
+	ctx context.Context,
+	id string,
+	limit int,
+	includeDocs bool,
+) ([]map[string]any, error) {
+	raw, err := c.client.execRaw(ctx, map[string]any{
+		"op": "history", "coll": c.Name, "id": id,
+		"limit": limit, "include_docs": includeDocs,
+	})
+	if err != nil {
+		return nil, err
+	}
+	var result struct {
+		Revisions []map[string]any `json:"revisions"`
+	}
+	if err := decodeInto(raw, &result); err != nil {
+		return nil, err
+	}
+	return result.Revisions, nil
+}
+
+// GetVersion reads one exact document revision. It returns nil when the
+// revision does not exist.
+func (c *Collection) GetVersion(
+	ctx context.Context,
+	id string,
+	version uint64,
+) (map[string]any, error) {
+	raw, err := c.client.execRaw(ctx, map[string]any{
+		"op": "get_version", "coll": c.Name, "id": id, "version": version,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if string(raw) == "null" {
+		return nil, nil
+	}
+	var result map[string]any
+	if err := decodeInto(raw, &result); err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 // CreateTextIndex creates a full-text index.

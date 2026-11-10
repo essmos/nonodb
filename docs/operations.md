@@ -38,6 +38,8 @@ All daemon configuration is through environment variables.
 | `NONODB_CACHE_TTL` | `5` | Read-cache TTL in seconds; `0` disables the cache |
 | `NONODB_CACHE_ENTRIES` | `512` | Maximum number of cached read results |
 | `NONODB_CACHE_MAX_BYTES` | `262144` | Maximum serialized size of one cached result |
+| `NONODB_HISTORY` | `0` | Enables append-only document revision history |
+| `NONODB_HISTORY_MAX_VERSIONS` | `50` | Revisions retained per document (`0` disables history writes) |
 | `NONODB_AUTO_INDEX` | `0` | Enables automatic indexes for frequent read shapes |
 | `NONODB_AUTO_INDEX_MIN_HITS` | `50` | Required cache misses in one window before creating an index |
 | `NONODB_AUTO_INDEX_WINDOW` | `300` | Frequency window in seconds |
@@ -80,6 +82,31 @@ read-after-write through the same daemon is fresh. The cache is bounded by
 `NONODB_CACHE_ENTRIES` and `NONODB_CACHE_MAX_BYTES`; oversized results are not
 stored. Set `NONODB_CACHE_TTL=0` to disable it. Metrics expose
 `cache_hits_total` and `cache_misses_total`.
+
+### Document history
+
+Document history is opt-in with `NONODB_HISTORY=1`. When enabled, inserts,
+updates, and deletes also append an immutable revision to the separate
+`history` LMDB sub-database. Current-document writes and history appends share
+one LMDB transaction, so a crash cannot leave them inconsistent.
+
+Searches and secondary indexes never see history entries. This keeps query
+results current and avoids index maintenance for old revisions.
+
+`NONODB_HISTORY_MAX_VERSIONS` controls how many revisions are retained per
+document (default `50`). The writer runs a bounded pruning pass every 30
+seconds; old revisions are removed in small batches rather than during the hot
+write path. Set the value to `0` to stop recording new history.
+
+History is global to the store, not per collection. Enabling it after a
+database already contains documents creates history only for writes performed
+after the daemon restart; there is no retroactive backfill. The `history` and
+`get_version` API operations are documented in [HTTP API](api.md#document-history).
+
+History increases write amplification and disk usage by approximately one
+document copy per write for history-enabled stores. Size `NONODB_MAP_SIZE` and
+backup retention accordingly. Use a smaller `NONODB_HISTORY_MAX_VERSIONS` or
+disable history for write-heavy collections.
 
 ### Automatic indexes
 

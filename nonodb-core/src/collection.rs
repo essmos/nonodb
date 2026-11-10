@@ -10,6 +10,7 @@ use heed::{Database, Env, RoTxn, RwTxn};
 use serde_json::{Map, Value};
 
 use crate::error::{Error, Result};
+use crate::history::{self, HistoryConfig, HistoryEntry};
 use crate::index::{self, IndexDef};
 use crate::query::{apply_update, apply_upsert, matches, path, seed_from_filter};
 use crate::search;
@@ -157,6 +158,8 @@ pub struct FindQuery {
 pub struct Collection<'e> {
     db: Database<Bytes, Bytes>,
     meta: Database<Bytes, Bytes>,
+    history: Database<Bytes, Bytes>,
+    history_config: HistoryConfig,
     name: String,
     env: &'e Env,
 }
@@ -166,11 +169,15 @@ impl<'e> Collection<'e> {
         env: &'e Env,
         db: Database<Bytes, Bytes>,
         meta: Database<Bytes, Bytes>,
+        history: Database<Bytes, Bytes>,
+        history_config: HistoryConfig,
         name: String,
     ) -> Self {
         Self {
             db,
             meta,
+            history,
+            history_config,
             name,
             env,
         }
@@ -1016,6 +1023,7 @@ impl<'e> Collection<'e> {
         self.apply_index_entries(wtxn, None, Some(&doc), &id)?;
         self.apply_text_entries(wtxn, None, Some(&doc), &id)?;
         self.apply_fuzzy_entries(wtxn, None, Some(&doc), &id)?;
+        self.record_history(wtxn, &id, "insert", Some(doc))?;
         Ok(id)
     }
 
@@ -1076,6 +1084,7 @@ impl<'e> Collection<'e> {
             self.apply_index_entries(wtxn, Some(&old), Some(&new), &id)?;
             self.apply_text_entries(wtxn, Some(&old), Some(&new), &id)?;
             self.apply_fuzzy_entries(wtxn, Some(&old), Some(&new), &id)?;
+            self.record_history(wtxn, &id, "update", Some(new))?;
             modified += 1;
         }
         Ok(UpdateOutcome {
@@ -1132,6 +1141,7 @@ impl<'e> Collection<'e> {
             self.apply_index_entries(wtxn, Some(&old), None, &id)?;
             self.apply_text_entries(wtxn, Some(&old), None, &id)?;
             self.apply_fuzzy_entries(wtxn, Some(&old), None, &id)?;
+            self.record_history(wtxn, &id, "delete", None)?;
         }
         Ok(keys.len())
     }
@@ -1141,6 +1151,60 @@ impl<'e> Collection<'e> {
         let n = self.delete_txn(&mut wtxn, filter, multi)?;
         wtxn.commit()?;
         Ok(n)
+    }
+
+    fn record_history(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        id: &str,
+        op: &str,
+        doc: Option<Value>,
+    ) -> Result<()> {
+        if !self.history_config.active() {
+            return Ok(());
+        }
+        history::append(&self.history, &self.meta, wtxn, &self.name, id, op, doc)?;
+        Ok(())
+    }
+
+    /// Reads document revisions, newest first.
+    pub fn history(
+        &self,
+        id: &str,
+        limit: Option<usize>,
+        include_docs: bool,
+    ) -> Result<Vec<HistoryEntry>> {
+        let rtxn = self.read_txn()?;
+        let out = self.history_in(&rtxn, id, limit, include_docs)?;
+        rtxn.commit()?;
+        Ok(out)
+    }
+
+    pub fn history_in(
+        &self,
+        rtxn: &RoTxn<'_>,
+        id: &str,
+        limit: Option<usize>,
+        include_docs: bool,
+    ) -> Result<Vec<HistoryEntry>> {
+        history::list(&self.history, rtxn, &self.name, id, limit, include_docs)
+    }
+
+    /// Reads one exact global revision.
+    pub fn get_version(&self, id: &str, rev: u64) -> Result<Option<HistoryEntry>> {
+        let rtxn = self.read_txn()?;
+        let out = self.get_version_in(&rtxn, id, rev)?;
+        rtxn.commit()?;
+        Ok(out)
+    }
+
+    pub fn get_version_in(
+        &self,
+        rtxn: &RoTxn<'_>,
+        id: &str,
+        rev: u64,
+    ) -> Result<Option<HistoryEntry>> {
+        history::get(&self.history, rtxn, &self.name, id, rev)
     }
 
     /// Collects keys (`_id`) matching the filter.
@@ -2450,6 +2514,113 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
         (dir, store)
+    }
+
+    fn history_store(max_versions: usize) -> (tempfile::TempDir, Store) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_with_history(
+            dir.path(),
+            HistoryConfig {
+                enabled: true,
+                max_versions,
+            },
+        )
+        .unwrap();
+        (dir, store)
+    }
+
+    #[test]
+    fn history_records_versions_and_get_version() {
+        let (_dir, store) = history_store(50);
+        let c = store.collection("users").unwrap();
+
+        let id = c.insert_one(json!({"name": "Ala", "n": 1})).unwrap();
+        let first = c.history(&id, None, true).unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].op, "insert");
+        assert_eq!(first[0].doc.as_ref().unwrap()["n"], 1);
+        let first_rev = first[0].rev;
+
+        assert_eq!(
+            c.update(&json!({"_id": id}), &json!({"$set": {"n": 2}}), false)
+                .unwrap(),
+            1
+        );
+        let versions = c.history(&id, None, true).unwrap();
+        assert_eq!(versions.len(), 2);
+        assert_eq!(versions[0].op, "update");
+        assert_eq!(versions[0].doc.as_ref().unwrap()["n"], 2);
+        assert!(versions[0].rev > first_rev);
+
+        let old = c.get_version(&id, first_rev).unwrap().unwrap();
+        assert_eq!(old.doc.as_ref().unwrap()["n"], 1);
+
+        let metadata = c.history(&id, None, false).unwrap();
+        assert_eq!(metadata.len(), 2);
+        assert!(metadata.iter().all(|v| v.doc.is_none()));
+
+        assert_eq!(c.delete(&json!({"_id": id}), false).unwrap(), 1);
+        let deleted = c.history(&id, None, false).unwrap();
+        assert_eq!(deleted[0].op, "delete");
+        assert!(deleted[0].deleted);
+        assert!(deleted[0].doc.is_none());
+        assert_eq!(
+            c.get_version(&id, versions[0].rev).unwrap().unwrap().op,
+            "update"
+        );
+    }
+
+    #[test]
+    fn history_is_disabled_by_default() {
+        let (_dir, store) = store();
+        let c = store.collection("users").unwrap();
+        let id = c.insert_one(json!({"name": "Ala"})).unwrap();
+        assert!(c.history(&id, None, true).unwrap().is_empty());
+    }
+
+    #[test]
+    fn history_prunes_old_versions() {
+        let (_dir, store) = history_store(2);
+        let c = store.collection("users").unwrap();
+        let id = c.insert_one(json!({"n": 0})).unwrap();
+        for n in 1..=4 {
+            assert_eq!(
+                c.update(&json!({"_id": id}), &json!({"$set": {"n": n}}), false)
+                    .unwrap(),
+                1
+            );
+        }
+        assert_eq!(c.history(&id, None, false).unwrap().len(), 5);
+
+        assert_eq!(store.prune_history(100).unwrap(), 3);
+        let kept = c.history(&id, None, true).unwrap();
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[0].doc.as_ref().unwrap()["n"], 4);
+        assert_eq!(kept[1].doc.as_ref().unwrap()["n"], 3);
+    }
+
+    #[test]
+    fn history_prunes_all_documents_across_passes() {
+        let (_dir, store) = history_store(2);
+        let c = store.collection("users").unwrap();
+        let ids: Vec<String> = (0..3)
+            .map(|n| c.insert_one(json!({"n": n, "v": 0})).unwrap())
+            .collect();
+        for id in &ids {
+            for n in 1..=2 {
+                c.update(&json!({"_id": id}), &json!({"$set": {"v": n}}), false)
+                    .unwrap();
+            }
+        }
+
+        // The deletion limit forces several bounded maintenance passes.
+        while store.prune_history(1).unwrap() > 0 {}
+        for id in &ids {
+            let kept = c.history(id, None, true).unwrap();
+            assert_eq!(kept.len(), 2);
+            assert_eq!(kept[0].doc.as_ref().unwrap()["v"], 2);
+            assert_eq!(kept[1].doc.as_ref().unwrap()["v"], 1);
+        }
     }
 
     #[test]

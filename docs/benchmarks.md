@@ -101,6 +101,20 @@ Same workload on tmpfs, where `fsync` is much cheaper:
 `avg_batch_size` ≈ 8.65, `avg_commit_us` ≈ 54 µs. The ~28% write difference is
 mostly the cost of real durable commits.
 
+### Document history overhead
+
+`scripts/bench.py`, 8 clients, 8,000 writes, 20,000 reads, history retention
+`NONODB_HISTORY_MAX_VERSIONS=5`, ext4:
+
+| Configuration | Writes/s | `find_one` reads/s | Median write latency |
+|---|---:|---:|---:|
+| History disabled | **3,432** | 6,207 | 2.00 ms |
+| History enabled | **3,051** | 6,165 | 2.13 ms |
+
+History added about **11% write overhead** in this small run and no measurable
+read overhead. More history retention, larger documents, or update-heavy
+workloads increase write amplification and storage use.
+
 ## Group commit scaling
 
 12 vs 80 concurrent clients, ext4:

@@ -380,6 +380,17 @@ results = db.batch([
 ])
 ```
 
+Document history is available when the daemon runs with `NONODB_HISTORY=1`:
+
+```python
+revisions = users.history(id, limit=20, include_docs=True)
+old = users.get_version(id, revisions[-1]["rev"])
+```
+
+`history` returns revisions newest first. `rev` values are global and
+monotonic, not per-document `1, 2, 3`. See
+[Document history](api.md#document-history).
+
 A common shortcut is `get_many`, which fetches documents by id through one
 batch:
 

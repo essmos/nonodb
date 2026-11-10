@@ -119,6 +119,20 @@ pub enum Request {
         #[serde(default)]
         limit: Option<usize>,
     },
+    History {
+        coll: String,
+        id: String,
+        #[serde(default)]
+        limit: Option<usize>,
+        #[serde(default)]
+        include_docs: bool,
+    },
+    GetVersion {
+        coll: String,
+        id: String,
+        #[serde(alias = "rev")]
+        version: u64,
+    },
     /// Multiple **read** operations in one LMDB transaction.
     Batch {
         ops: Vec<Request>,

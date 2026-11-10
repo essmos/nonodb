@@ -299,7 +299,7 @@ Use **Actions → Release → Run workflow** and provide:
 
 | Input | Meaning |
 |---|---|
-| `tag` | Tag to publish, e.g. `v0.1.2` or `v0.2.0-rc.1` |
+| `tag` | Tag to publish, e.g. `v0.2.0` or `v0.3.0-rc.1` |
 | `prerelease` | Mark the release as a pre-release |
 | `draft` | Create it as a draft for review |
 

@@ -36,3 +36,8 @@ let db = Client::builder()
 `Client::from_env()` reads `NONODB_SOCK`, `NONODB_URL`, `NONODB_TOKEN`, and
 `NONODB_TLS_VERIFY`. See [docs/clients.md](../docs/clients.md) for the full
 client guide.
+
+## Document history
+
+When the daemon is started with `NONODB_HISTORY=1`, use `history()` and
+`get_version()` on a collection.

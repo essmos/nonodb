@@ -319,6 +319,40 @@ class Collection:
             if r.get("ok") and r.get("result") is not None
         ]
 
+    # -- history -----------------------------------------------------
+    def history(
+        self,
+        doc_id: str,
+        *,
+        limit: int = 50,
+        include_docs: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Returns document revisions, newest first.
+
+        Revisions use global monotonic `rev` values. History is opt-in on the
+        daemon via `NONODB_HISTORY=1`.
+        """
+        return self._db.exec(
+            {
+                "op": "history",
+                "coll": self.name,
+                "id": doc_id,
+                "limit": limit,
+                "include_docs": include_docs,
+            }
+        )["revisions"]
+
+    def get_version(self, doc_id: str, version: int) -> Optional[dict[str, Any]]:
+        """Returns one exact revision, or `None` if it was pruned/not found."""
+        return self._db.exec(
+            {
+                "op": "get_version",
+                "coll": self.name,
+                "id": doc_id,
+                "version": version,
+            }
+        )
+
     # -- full-text / fuzzy -------------------------------------------
     def create_text_index(self, field: str) -> bool:
         self._db.exec(

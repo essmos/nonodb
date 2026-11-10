@@ -300,6 +300,28 @@ class Collection {
       .map((entry) => entry.result);
   }
 
+  /** List document revisions, newest first. History must be enabled on the daemon. */
+  async history(id, { limit = 50, includeDocs = false } = {}) {
+    const result = await this.db.exec({
+      op: 'history',
+      coll: this.name,
+      id,
+      limit,
+      include_docs: includeDocs,
+    });
+    return result.revisions ?? [];
+  }
+
+  /** Read one exact revision, or null if it is not available. */
+  async getVersion(id, version) {
+    return this.db.exec({
+      op: 'get_version',
+      coll: this.name,
+      id,
+      version,
+    });
+  }
+
   async createTextIndex(field) {
     await this.db.exec({ op: 'create_text_index', coll: this.name, field });
     return true;

@@ -44,6 +44,13 @@ async function main() {
 
   assert.equal((await users.getMany([id])).length, 1);
 
+  if (['1', 'true', 'yes', 'on'].includes((process.env.NONODB_HISTORY || '').toLowerCase())) {
+    const revisions = await users.history(id, { limit: 10, includeDocs: true });
+    assert.ok(revisions.length >= 1);
+    const first = await users.getVersion(id, revisions[revisions.length - 1].rev);
+    assert.equal(first.doc.name, 'Ada');
+  }
+
   await users.createIndex(['age', 'name'], { include: ['tags'] });
   assert.ok((await users.listIndexes()).length >= 1);
   await users.dropIndex('age+name');

@@ -23,6 +23,10 @@ const MAX_BATCH: usize = 512;
 const BASE_WINDOW: Duration = Duration::from_millis(1);
 /// Maximum window under heavy load (larger batch = fewer `fsync`s).
 const MAX_WINDOW: Duration = Duration::from_millis(5);
+/// How often the writer checks whether old revisions should be pruned.
+const PRUNE_INTERVAL: Duration = Duration::from_secs(30);
+/// Maximum revisions deleted by one background pruning pass.
+const PRUNE_LIMIT: usize = 1000;
 
 pub struct WriteJob {
     pub req: WriteReq,
@@ -33,7 +37,16 @@ pub struct WriteJob {
 
 /// Writer thread loop. Ends when the channel is closed.
 pub fn run(store: Arc<Store>, rx: Receiver<WriteJob>, cache: Arc<QueryCache>) {
-    while let Ok(first) = rx.recv() {
+    let mut last_prune = Instant::now();
+    loop {
+        let first = match rx.recv_timeout(PRUNE_INTERVAL) {
+            Ok(job) => job,
+            Err(RecvTimeoutError::Timeout) => {
+                maybe_prune_history(&store, &cache, &mut last_prune);
+                continue;
+            }
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
         let mut jobs = vec![first];
         // Adaptive window: the longer the queue, the larger the batch (fewer fsyncs),
         // but with an empty queue we return to 1 ms (low latency).
@@ -61,6 +74,22 @@ pub fn run(store: Arc<Store>, rx: Receiver<WriteJob>, cache: Arc<QueryCache>) {
         }
 
         run_batch(&store, &cache, jobs);
+        maybe_prune_history(&store, &cache, &mut last_prune);
+    }
+}
+
+fn maybe_prune_history(store: &Store, cache: &QueryCache, last_prune: &mut Instant) {
+    if last_prune.elapsed() < PRUNE_INTERVAL || !store.history_config().active() {
+        return;
+    }
+    *last_prune = Instant::now();
+    match store.prune_history(PRUNE_LIMIT) {
+        Ok(0) => {}
+        Ok(n) => {
+            cache.invalidate();
+            tracing::debug!(deleted = n, "pruned old document revisions");
+        }
+        Err(e) => tracing::warn!(?e, "history pruning failed"),
     }
 }
 

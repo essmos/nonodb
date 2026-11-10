@@ -66,6 +66,8 @@ export class Collection {
   dropIndex(field: string): Promise<boolean>;
   listIndexes(): Promise<any[]>;
   getMany(ids: Iterable<string>): Promise<any[]>;
+  history(id: string, options?: { limit?: number; includeDocs?: boolean }): Promise<any[]>;
+  getVersion(id: string, version: number): Promise<any | null>;
   createTextIndex(field: string): Promise<boolean>;
   dropTextIndex(field: string): Promise<boolean>;
   listTextIndexes(): Promise<string[]>;

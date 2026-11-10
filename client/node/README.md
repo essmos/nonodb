@@ -34,3 +34,8 @@ const db = new NonoDB({
 See [docs/clients.md](../../docs/clients.md) for the full client guide. Run
 `NONODB_SOCK=/run/nonodb.sock node smoke_test.js` against a daemon for an
 end-to-end check.
+
+## Document history
+
+When the daemon is started with `NONODB_HISTORY=1`, use `history()` and
+`getVersion()` on a collection.
