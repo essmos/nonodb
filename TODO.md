@@ -14,6 +14,10 @@ limitations are documented in [docs/roadmap.md](docs/roadmap.md).
 - [x] Single-field, compound, unique, and covering indexes
 - [x] Index-only sorted scans, range plans, index-backed count
 - [x] Parallel full scans and parallel index backfill
+- [x] Parallel unsorted scans with adaptive wave-based early exit
+- [x] Primary-key `_id` range scans for find/count/update/delete
+- [x] Raw JSON prefilter for simple string/bool equalities
+- [x] Daemon-level read cache with commit invalidation
 - [x] BM25 full-text search, diacritic folding, quoted phrases
 - [x] Fuzzy search with trigrams and bounded Levenshtein distance
 - [x] Read batches and atomic write batches

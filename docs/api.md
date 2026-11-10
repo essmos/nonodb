@@ -167,6 +167,8 @@ Behavior:
 
 - Without `sort`, results follow the cheapest scan order (index order or
   `_id` order), and execution stops after `skip + limit` matches.
+- Equality or range conditions on `_id` use the primary-key B+ tree directly.
+  Sorting by a single `_id` field can stream that range forwards or backwards.
 - With `sort`, results are ordered by the requested fields. Missing values and
   `null` sort last. Ties are broken deterministically by `_id`.
 - An index can serve the sort when its full field order matches the requested
@@ -419,8 +421,8 @@ last. Equal keys are ordered deterministically by `_id`.
 
 An index can serve the sort only when the requested sort matches the full index
 field order and all directions are the same. Otherwise nonodb performs a scan
-and bounded top-K sort. Full-collection sorts are parallelized for shallow
-queries.
+and bounded top-K sort. Full-collection sorts and selective unsorted scans are
+parallelized for shallow queries.
 
 ---
 

@@ -26,13 +26,89 @@ const PARALLEL_SCAN_MIN_ENTRIES: usize = 200;
 /// jednym wątku i ograniczonym zużyciu pamięci.
 const PARALLEL_SCAN_MAX_WANT: usize = 50_000;
 
+/// Od jakiego `skip + limit` opłaca się równoległy skan bez sortowania.
+/// Dla `find_one` i bardzo małych limitów wczesne wyjście jest zwykle szybsze.
+const PARALLEL_UNSORTED_MIN_WANT: usize = 16;
+
 /// Rozmiar porcji surowych bajtów przekazywanej wątkom roboczym.
 const PARALLEL_SCAN_CHUNK: usize = 8192;
 
 /// Porcja skanu: jeden bufor bajtów + offsety dokumentów (mniej alokacji).
 struct ScanChunk {
+    idx: usize,
     data: Vec<u8>,
     docs: Vec<(usize, u32, u32)>,
+}
+
+/// Tani prefiltr pełnego skanu: dla prostych równości string/bool sprawdza,
+/// czy w surowym JSON w ogóle występuje klucz i wartość. Fałszywe trafienia są
+/// akceptowane (potem i tak działa matcher), ale nie może być fałszywych
+/// pominięć. Liczby i `null` są pomijane, bo ich semantyka/różnice formatowania
+/// wymagają pełnego parsera.
+#[derive(Debug, Clone, Default)]
+struct RawPrefilter {
+    needles: Vec<Vec<u8>>,
+}
+
+impl RawPrefilter {
+    fn matches(&self, bytes: &[u8]) -> bool {
+        self.needles
+            .iter()
+            .all(|needle| memchr::memmem::find(bytes, needle).is_some())
+    }
+}
+
+/// Buduje prefiltr dla bezpiecznych warunków równości. Warunki, których nie
+/// umiemy sprawdzić po bajtach, są ignorowane (filtr to AND, więc to bezpieczne).
+fn raw_prefilter(filter: &Value) -> Option<RawPrefilter> {
+    let obj = filter.as_object()?;
+    let mut needles = Vec::new();
+    for (key, cond) in obj {
+        if key.starts_with('$') {
+            // `$or` / `$not` / `$nor` nie da się bezpiecznie zignorować.
+            return None;
+        }
+        if key.contains('.') || key == "_id" {
+            continue;
+        }
+        let Some(value) = raw_equality_value(cond) else {
+            continue;
+        };
+        let key_bytes = serde_json::to_vec(&Value::String(key.clone())).ok()?;
+        let value_bytes = serde_json::to_vec(value).ok()?;
+        if !needles.contains(&key_bytes) {
+            needles.push(key_bytes);
+        }
+        if !needles.contains(&value_bytes) {
+            needles.push(value_bytes);
+        }
+    }
+    if needles.is_empty() {
+        None
+    } else {
+        Some(RawPrefilter { needles })
+    }
+}
+
+/// Zwraca wartość równości, jeśli da się ją bezpiecznie znaleźć w surowym
+/// JSON. Obsługujemy tylko stringi i boole; resztę zostawiamy parserowi.
+fn raw_equality_value(cond: &Value) -> Option<&Value> {
+    match cond {
+        Value::String(_) | Value::Bool(_) => Some(cond),
+        Value::Object(ops) if ops.len() == 1 => match ops.get("$eq") {
+            Some(Value::String(_)) | Some(Value::Bool(_)) => ops.get("$eq"),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Parsuje dokument tylko wtedy, gdy prefiltr go nie odrzucił.
+fn parse_prefiltered(bytes: &[u8], raw: Option<&RawPrefilter>) -> Result<Option<Value>> {
+    if raw.is_some_and(|r| !r.matches(bytes)) {
+        return Ok(None);
+    }
+    parse_json(bytes).map(Some)
 }
 
 /// Szybkie parsowanie JSON (SIMD) do `serde_json::Value`.
@@ -50,6 +126,7 @@ pub struct UpdateOutcome {
     pub upserted_id: Option<String>,
 }
 type IndexIter<'a> = Box<dyn Iterator<Item = heed::Result<(&'a [u8], &'a [u8])>> + 'a>;
+type IdBounds = (Bound<Vec<u8>>, Bound<Vec<u8>>);
 
 /// Porcja backfillu: bufor z `_id` + dokumentami.
 struct BackfillChunk {
@@ -1072,6 +1149,7 @@ impl<'e> Collection<'e> {
     /// indeks wtórny, a dopiero na końcu pełny skan.
     fn matching_keys(&self, txn: &RoTxn<'_>, filter: &Value, multi: bool) -> Result<Vec<Vec<u8>>> {
         let mut keys = Vec::new();
+        let raw = raw_prefilter(filter);
 
         if let Some(id) = direct_id(filter) {
             if self.db.get(txn, id.as_bytes())?.is_some() {
@@ -1085,7 +1163,9 @@ impl<'e> Collection<'e> {
                 let Some(bytes) = self.db.get(txn, id.as_bytes())? else {
                     continue;
                 };
-                let doc: Value = parse_json(bytes)?;
+                let Some(doc) = parse_prefiltered(bytes, raw.as_ref())? else {
+                    continue;
+                };
                 if matches(&doc, filter) {
                     keys.push(id.into_bytes());
                     if !multi {
@@ -1096,9 +1176,28 @@ impl<'e> Collection<'e> {
             return Ok(keys);
         }
 
+        if let Some((lower, upper)) = id_bounds(filter) {
+            let range = (as_bound(&lower), as_bound(&upper));
+            for item in self.db.range(txn, &range)? {
+                let (key, bytes) = item?;
+                let Some(doc) = parse_prefiltered(bytes, raw.as_ref())? else {
+                    continue;
+                };
+                if matches(&doc, filter) {
+                    keys.push(key.to_vec());
+                    if !multi {
+                        break;
+                    }
+                }
+            }
+            return Ok(keys);
+        }
+
         for item in self.db.iter(txn)? {
             let (key, bytes) = item?;
-            let doc: Value = parse_json(bytes)?;
+            let Some(doc) = parse_prefiltered(bytes, raw.as_ref())? else {
+                continue;
+            };
             if matches(&doc, filter) {
                 keys.push(key.to_vec());
                 if !multi {
@@ -1120,15 +1219,22 @@ impl<'e> Collection<'e> {
         // indeksu, parsowanie JSON i TopK można rozłożyć na wszystkie rdzenie.
         // Snapshot pozostaje spójny: wątek główny czyta jeden `RoTxn` i wysyła
         // wątkom tylko surowe bajty (nie współdzielimy kursora LMDB).
-        let parallel = limit > 0
-            && !query.sort.is_empty()
+        let sorted = !query.sort.is_empty();
+        let parallel_base = limit > 0
             && want <= PARALLEL_SCAN_MAX_WANT
             && self.db.stat(&rtxn)?.entries >= PARALLEL_SCAN_MIN_ENTRIES
             && direct_id(&query.filter).is_none()
+            && id_bounds(&query.filter).is_none()
             && self.index_plan(&rtxn, &query.filter)?.is_none();
+        let parallel = parallel_base
+            && (sorted || (!is_match_all(&query.filter) && want >= PARALLEL_UNSORTED_MIN_WANT));
 
         let out = if parallel {
-            let docs = self.parallel_sorted_scan(&rtxn, query, want)?;
+            let docs = if sorted {
+                self.parallel_sorted_scan(&rtxn, query, want)?
+            } else {
+                self.parallel_unsorted_scan(&rtxn, query, want)?
+            };
             docs.into_iter()
                 .skip(query.skip)
                 .take(limit)
@@ -1281,6 +1387,8 @@ impl<'e> Collection<'e> {
         let (res_tx, res_rx) = std::sync::mpsc::channel::<Result<Vec<(usize, Value)>>>();
         let sort = query.sort.as_slice();
         let filter = &query.filter;
+        let raw = raw_prefilter(filter);
+        let raw = raw.as_ref();
 
         std::thread::scope(|scope| -> Result<Vec<Value>> {
             for _ in 0..workers {
@@ -1298,12 +1406,13 @@ impl<'e> Collection<'e> {
                             Ok(chunk) => {
                                 for (seq, start, len) in chunk.docs {
                                     let bytes = &chunk.data[start as usize..][..len as usize];
-                                    match parse_json(bytes) {
-                                        Ok(doc) => {
+                                    match parse_prefiltered(bytes, raw) {
+                                        Ok(Some(doc)) => {
                                             if matches(&doc, filter) {
                                                 top.push_seq(doc, seq);
                                             }
                                         }
+                                        Ok(None) => {}
                                         Err(e) => {
                                             if !failed {
                                                 failed = true;
@@ -1324,6 +1433,7 @@ impl<'e> Collection<'e> {
             drop(res_tx);
 
             let mut chunk = ScanChunk {
+                idx: 0,
                 data: Vec::new(),
                 docs: Vec::with_capacity(PARALLEL_SCAN_CHUNK),
             };
@@ -1336,6 +1446,7 @@ impl<'e> Collection<'e> {
                     let full = std::mem::replace(
                         &mut chunk,
                         ScanChunk {
+                            idx: 0,
                             data: Vec::new(),
                             docs: Vec::with_capacity(PARALLEL_SCAN_CHUNK),
                         },
@@ -1358,6 +1469,187 @@ impl<'e> Collection<'e> {
         })
     }
 
+    /// Równoległy pełny skan bez sortowania.
+    ///
+    /// Porcje są wysyłane falami: po jednej do każdego wątku. Koordynator
+    /// odbiera całą falę i składa wyniki w kolejności `_id`. Gdy uzbiera
+    /// `want` trafień, przestaje wysyłać kolejne porcje. Dzięki temu szerokie
+    /// filtry zachowują wczesne wyjście, a selektywne skanują równolegle.
+    fn parallel_unsorted_scan(
+        &self,
+        rtxn: &RoTxn<'_>,
+        query: &FindQuery,
+        want: usize,
+    ) -> Result<Vec<Value>> {
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(16);
+        if workers <= 1 || want == 0 {
+            return self.find_in(rtxn, query);
+        }
+
+        let mut job_txs = Vec::with_capacity(workers);
+        let mut job_rxs = Vec::with_capacity(workers);
+        for _ in 0..workers {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<ScanChunk>(1);
+            job_txs.push(tx);
+            job_rxs.push(rx);
+        }
+        let (res_tx, res_rx) = std::sync::mpsc::channel::<Result<(usize, Vec<(usize, Value)>)>>();
+        let filter = &query.filter;
+        let raw = raw_prefilter(filter);
+        let raw = raw.as_ref();
+        // Utwórz iterator przed startem wątków: błąd LMDB nie może zostawić
+        // workerów czekających na kanał, który nigdy nie zostanie zamknięty.
+        let mut iter = self.db.iter(rtxn)?;
+
+        std::thread::scope(|scope| -> Result<Vec<Value>> {
+            for rx in job_rxs {
+                let tx = res_tx.clone();
+                scope.spawn(move || {
+                    let mut failed = false;
+                    loop {
+                        let job = rx.recv();
+                        let Ok(chunk) = job else {
+                            break;
+                        };
+                        let mut out = Vec::new();
+                        if !failed {
+                            for (seq, start, len) in chunk.docs {
+                                let bytes = &chunk.data[start as usize..][..len as usize];
+                                match parse_prefiltered(bytes, raw) {
+                                    Ok(Some(doc)) => {
+                                        if matches(&doc, filter) {
+                                            out.push((seq, doc));
+                                            if out.len() >= want {
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    Ok(None) => {}
+                                    Err(e) => {
+                                        failed = true;
+                                        let _ = tx.send(Err(e));
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if !failed {
+                            let _ = tx.send(Ok((chunk.idx, out)));
+                        }
+                    }
+                });
+            }
+            drop(res_tx);
+
+            let mut merged = TopK::new(&[], want);
+            let mut seq = 0usize;
+            let mut next_chunk = 0usize;
+            let mut expected = 0usize;
+            let mut exhausted = false;
+            let mut error: Option<Error> = None;
+
+            // Pierwsza fala jest mała, żeby szeroki filtr szybko się zatrzymał.
+            // Dopiero gdy nie wystarczy, zwiększamy falę i amortyzujemy
+            // synchronizację przy selektywnym pełnym skanie.
+            let mut rounds = 1usize;
+            'scan: loop {
+                let mut sent = 0usize;
+                'fill: for _ in 0..rounds {
+                    for tx in &job_txs {
+                        if exhausted {
+                            break 'fill;
+                        }
+                        let mut chunk = ScanChunk {
+                            idx: next_chunk,
+                            data: Vec::new(),
+                            docs: Vec::with_capacity(PARALLEL_SCAN_CHUNK),
+                        };
+                        while chunk.docs.len() < PARALLEL_SCAN_CHUNK {
+                            match iter.next() {
+                                Some(item) => match item {
+                                    Ok((_key, bytes)) => {
+                                        let start = chunk.data.len() as u32;
+                                        chunk.data.extend_from_slice(bytes);
+                                        chunk.docs.push((seq, start, bytes.len() as u32));
+                                        seq += 1;
+                                    }
+                                    Err(e) => {
+                                        error = Some(e.into());
+                                        break 'scan;
+                                    }
+                                },
+                                None => {
+                                    exhausted = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if chunk.docs.is_empty() {
+                            break 'fill;
+                        }
+                        next_chunk += 1;
+                        if tx.send(chunk).is_err() {
+                            error = Some(Error::Query("worker skanujący zakończył pracę".into()));
+                            break 'scan;
+                        }
+                        sent += 1;
+                    }
+                }
+                if sent == 0 {
+                    break;
+                }
+
+                let mut slots: Vec<Option<Vec<(usize, Value)>>> = vec![None; sent];
+                for _ in 0..sent {
+                    let msg = match res_rx.recv() {
+                        Ok(msg) => msg,
+                        Err(_) => {
+                            error = Some(Error::Query("brak wyniku skanu równoległego".into()));
+                            break 'scan;
+                        }
+                    };
+                    let (idx, docs) = match msg {
+                        Ok(v) => v,
+                        Err(e) => {
+                            error = Some(e);
+                            break 'scan;
+                        }
+                    };
+                    let pos = idx.checked_sub(expected).unwrap_or(usize::MAX);
+                    if pos >= sent {
+                        error = Some(Error::Query("nieoczekiwana porcja skanu".into()));
+                        break 'scan;
+                    }
+                    slots[pos] = Some(docs);
+                }
+                for docs in slots.into_iter().flatten() {
+                    for (seq, doc) in docs {
+                        merged.push_seq(doc, seq);
+                    }
+                    expected += 1;
+                    if merged.heap.len() >= want {
+                        break 'scan;
+                    }
+                }
+                rounds = if want <= 1024 {
+                    4
+                } else if want <= 4096 {
+                    2
+                } else {
+                    1
+                };
+            }
+            drop(job_txs);
+            match error {
+                Some(e) => Err(e),
+                None => Ok(merged.into_sorted()),
+            }
+        })
+    }
+
     /// Wersja jednowątkowa używana jako fallback (np. 1 rdzeń).
     fn scan_sorted_serial(
         &self,
@@ -1366,9 +1658,12 @@ impl<'e> Collection<'e> {
         want: usize,
     ) -> Result<Vec<Value>> {
         let mut top = TopK::new(&query.sort, want);
+        let raw = raw_prefilter(&query.filter);
         for (seq, item) in self.db.iter(rtxn)?.enumerate() {
             let (_key, bytes) = item?;
-            let doc: Value = parse_json(bytes)?;
+            let Some(doc) = parse_prefiltered(bytes, raw.as_ref())? else {
+                continue;
+            };
             if matches(&doc, &query.filter) {
                 top.push_seq(doc, seq);
             }
@@ -1387,6 +1682,7 @@ impl<'e> Collection<'e> {
         let want = query.skip.saturating_add(limit);
         let mut acc = Acc::new(sorted, &query.sort, want);
         let mut post_skip = query.skip;
+        let raw = raw_prefilter(&query.filter);
 
         // 1) Dokładne `_id` -> bezpośredni get.
         if let Some(id) = direct_id(&query.filter) {
@@ -1422,7 +1718,10 @@ impl<'e> Collection<'e> {
                             let Some(bytes) = self.db.get(rtxn, id.as_bytes())? else {
                                 continue;
                             };
-                            parse_json(bytes)?
+                            let Some(doc) = parse_prefiltered(bytes, raw.as_ref())? else {
+                                continue;
+                            };
+                            doc
                         };
                         if !matches(&doc, &query.filter) {
                             continue;
@@ -1452,7 +1751,9 @@ impl<'e> Collection<'e> {
                     break;
                 }
                 if let Some(bytes) = self.db.get(rtxn, id.as_bytes())? {
-                    let doc: Value = parse_json(bytes)?;
+                    let Some(doc) = parse_prefiltered(bytes, raw.as_ref())? else {
+                        continue;
+                    };
                     // Residual filter: indeks może zwrócić nadmiarowe wpisy.
                     if matches(&doc, &query.filter) {
                         acc.push(doc);
@@ -1460,7 +1761,68 @@ impl<'e> Collection<'e> {
                 }
             }
         }
-        // 3a) Pełny skan bez sortowania: pomijamy `skip` od razu, bez zbierania
+        // 3) Zakres `_id` po kluczu głównym. To nie jest indeks wtórny, ale
+        //    pozwala zawęzić pełny skan do ciągłego przedziału B+drzewa.
+        else if let Some((lower, upper)) = id_bounds(&query.filter) {
+            let range = (as_bound(&lower), as_bound(&upper));
+            let reverse = id_sort_direction(&query.sort).unwrap_or(false);
+            let iter: IndexIter<'_> = if reverse {
+                Box::new(self.db.rev_range(rtxn, &range)?)
+            } else {
+                Box::new(self.db.range(rtxn, &range)?)
+            };
+
+            if !sorted || id_sort_direction(&query.sort).is_some() {
+                let mut skipped = 0usize;
+                let mut out = Vec::new();
+                for item in iter {
+                    let (_key, bytes) = item?;
+                    let Some(doc) = parse_prefiltered(bytes, raw.as_ref())? else {
+                        continue;
+                    };
+                    if !matches(&doc, &query.filter) {
+                        continue;
+                    }
+                    if skipped < query.skip {
+                        skipped += 1;
+                        continue;
+                    }
+                    out.push(doc);
+                    if out.len() >= limit {
+                        break;
+                    }
+                }
+                return Ok(out
+                    .into_iter()
+                    .map(|doc| match &query.projection {
+                        Some(projection) => project(&doc, projection),
+                        None => doc,
+                    })
+                    .collect());
+            }
+
+            let mut top = TopK::new(&query.sort, want);
+            for item in iter {
+                let (_key, bytes) = item?;
+                let Some(doc) = parse_prefiltered(bytes, raw.as_ref())? else {
+                    continue;
+                };
+                if matches(&doc, &query.filter) {
+                    top.push(doc);
+                }
+            }
+            return Ok(top
+                .into_sorted()
+                .into_iter()
+                .skip(query.skip)
+                .take(limit)
+                .map(|doc| match &query.projection {
+                    Some(projection) => project(&doc, projection),
+                    None => doc,
+                })
+                .collect());
+        }
+        // 4) Pełny skan bez sortowania: pomijamy `skip` od razu, bez zbierania
         //     pominiętych dokumentów i bez końcowego sortowania całej paczki.
         else if !sorted {
             post_skip = 0;
@@ -1474,7 +1836,9 @@ impl<'e> Collection<'e> {
                 let mut skipped = 0usize;
                 for item in self.db.iter(rtxn)? {
                     let (_key, bytes) = item?;
-                    let doc: Value = parse_json(bytes)?;
+                    let Some(doc) = parse_prefiltered(bytes, raw.as_ref())? else {
+                        continue;
+                    };
                     if matches(&doc, &query.filter) {
                         if skipped < query.skip {
                             skipped += 1;
@@ -1492,7 +1856,9 @@ impl<'e> Collection<'e> {
         else {
             for item in self.db.iter(rtxn)? {
                 let (_key, bytes) = item?;
-                let doc: Value = parse_json(bytes)?;
+                let Some(doc) = parse_prefiltered(bytes, raw.as_ref())? else {
+                    continue;
+                };
                 if matches(&doc, &query.filter) {
                     acc.push(doc);
                 }
@@ -1554,6 +1920,31 @@ impl<'e> Collection<'e> {
         if let Some(id) = direct_id(filter) {
             return Ok(usize::from(self.db.get(rtxn, id.as_bytes())?.is_some()));
         }
+        // Zakres `_id` po kluczu głównym. Gdy filtr zawiera tylko warunki na
+        // `_id`, wystarczy policzyć wpisy w zakresie bez parsowania JSON.
+        if let Some((lower, upper)) = id_bounds(filter) {
+            let range = (as_bound(&lower), as_bound(&upper));
+            if filter.as_object().is_some_and(|o| o.len() == 1) {
+                let mut n = 0usize;
+                for item in self.db.range(rtxn, &range)? {
+                    item?;
+                    n += 1;
+                }
+                return Ok(n);
+            }
+            let mut n = 0usize;
+            let raw = raw_prefilter(filter);
+            for item in self.db.range(rtxn, &range)? {
+                let (_key, bytes) = item?;
+                let Some(doc) = parse_prefiltered(bytes, raw.as_ref())? else {
+                    continue;
+                };
+                if matches(&doc, filter) {
+                    n += 1;
+                }
+            }
+            return Ok(n);
+        }
         // Filtr w całości pokryty indeksem: policz klucze, bez parsowania JSON.
         if let Some(plan) = self.index_plan(rtxn, filter)? {
             if index_filter_exact(&plan.def, filter) {
@@ -1561,9 +1952,12 @@ impl<'e> Collection<'e> {
             }
         }
         let mut n = 0;
+        let raw = raw_prefilter(filter);
         for item in self.db.iter(rtxn)? {
             let (_key, bytes) = item?;
-            let doc: Value = parse_json(bytes)?;
+            let Some(doc) = parse_prefiltered(bytes, raw.as_ref())? else {
+                continue;
+            };
             if matches(&doc, filter) {
                 n += 1;
             }
@@ -1687,6 +2081,99 @@ fn direct_id(filter: &Value) -> Option<&str> {
         Value::String(id) => Some(id),
         Value::Object(op) if op.len() == 1 => op.get("$eq")?.as_str(),
         _ => None,
+    }
+}
+
+/// Buduje zakres klucza głównego `_id` z warunków `$gt/$gte/$lt/$lte`.
+/// Dokładny `_id` (string albo `{"$eq": ...}`) też jest zakresem, co pozwala
+/// łączyć go z dodatkowymi warunkami bez pełnego skanu.
+fn id_bounds(filter: &Value) -> Option<IdBounds> {
+    let cond = filter.as_object()?.get("_id")?;
+    if let Some(id) = cond.as_str() {
+        let key = id.as_bytes().to_vec();
+        return Some((Bound::Included(key.clone()), Bound::Included(key)));
+    }
+    let ops = cond.as_object()?;
+    if ops.is_empty() {
+        return None;
+    }
+    if let Some(eq) = ops.get("$eq") {
+        if ops.len() != 1 {
+            return None;
+        }
+        let key = eq.as_str()?.as_bytes().to_vec();
+        return Some((Bound::Included(key.clone()), Bound::Included(key)));
+    }
+
+    let mut lower = Bound::Unbounded;
+    let mut upper = Bound::Unbounded;
+    let mut saw = false;
+    for (op, value) in ops {
+        let key = value.as_str()?.as_bytes().to_vec();
+        match op.as_str() {
+            "$gt" => lower = tighter_lower(lower, Bound::Excluded(key)),
+            "$gte" => lower = tighter_lower(lower, Bound::Included(key)),
+            "$lt" => upper = tighter_upper(upper, Bound::Excluded(key)),
+            "$lte" => upper = tighter_upper(upper, Bound::Included(key)),
+            _ => return None,
+        }
+        saw = true;
+    }
+    saw.then_some((lower, upper))
+}
+
+fn tighter_lower(a: Bound<Vec<u8>>, b: Bound<Vec<u8>>) -> Bound<Vec<u8>> {
+    match (a, b) {
+        (Bound::Unbounded, b) => b,
+        (a, Bound::Unbounded) => a,
+        (Bound::Included(a), Bound::Included(b)) => Bound::Included(a.max(b)),
+        (Bound::Excluded(a), Bound::Excluded(b)) => Bound::Excluded(a.max(b)),
+        (Bound::Included(a), Bound::Excluded(b)) => {
+            if a > b {
+                Bound::Included(a)
+            } else {
+                Bound::Excluded(b)
+            }
+        }
+        (Bound::Excluded(a), Bound::Included(b)) => {
+            if b > a {
+                Bound::Included(b)
+            } else {
+                Bound::Excluded(a)
+            }
+        }
+    }
+}
+
+fn tighter_upper(a: Bound<Vec<u8>>, b: Bound<Vec<u8>>) -> Bound<Vec<u8>> {
+    match (a, b) {
+        (Bound::Unbounded, b) => b,
+        (a, Bound::Unbounded) => a,
+        (Bound::Included(a), Bound::Included(b)) => Bound::Included(a.min(b)),
+        (Bound::Excluded(a), Bound::Excluded(b)) => Bound::Excluded(a.min(b)),
+        (Bound::Included(a), Bound::Excluded(b)) => {
+            if a < b {
+                Bound::Included(a)
+            } else {
+                Bound::Excluded(b)
+            }
+        }
+        (Bound::Excluded(a), Bound::Included(b)) => {
+            if b < a {
+                Bound::Included(b)
+            } else {
+                Bound::Excluded(a)
+            }
+        }
+    }
+}
+
+/// Czy sortowanie to pojedyncze `_id`? Zwraca `Some(reverse)` dla `-1`.
+fn id_sort_direction(sort: &[(String, i32)]) -> Option<bool> {
+    if sort.len() == 1 && sort[0].0 == "_id" {
+        Some(sort[0].1 < 0)
+    } else {
+        None
     }
 }
 
@@ -1995,6 +2482,62 @@ mod tests {
     }
 
     #[test]
+    fn raw_prefilter_avoids_false_negatives() {
+        let filter = json!({"name": "a\"b\n", "active": true});
+        let raw = raw_prefilter(&filter).unwrap();
+        let matching = json!({"_id": "1", "name": "a\"b\n", "active": true, "junk": "x"});
+        let bytes = serde_json::to_vec(&matching).unwrap();
+        assert!(raw.matches(&bytes));
+
+        let wrong_bool = json!({"_id": "1", "name": "a\"b\n", "active": false});
+        assert!(!raw.matches(&serde_json::to_vec(&wrong_bool).unwrap()));
+
+        let wrong_string = json!({"_id": "1", "name": "other", "active": true});
+        assert!(!raw.matches(&serde_json::to_vec(&wrong_string).unwrap()));
+
+        // `$or` nie może być użyty jako prefiltr.
+        assert!(raw_prefilter(&json!({"$or": [{"name": "a"}, {"name": "b"}]})).is_none());
+        // Liczba sama w sobie wymaga parsera (np. 1 vs 1.0).
+        assert!(raw_prefilter(&json!({"n": 1})).is_none());
+    }
+
+    #[test]
+    fn raw_prefilter_preserves_string_and_number_semantics() {
+        let (_dir, store) = store();
+        let c = store.collection("items").unwrap();
+        c.insert_one(json!({"_id": "a", "name": "a\"b\n", "n": 1, "tags": ["x"]}))
+            .unwrap();
+        c.insert_one(json!({"_id": "b", "name": "other", "n": 2, "tags": ["y"]}))
+            .unwrap();
+
+        assert_eq!(
+            c.find_one(&json!({"name": "a\"b\n"})).unwrap().unwrap()["_id"],
+            "a"
+        );
+        assert_eq!(
+            c.find_one(&json!({"name": {"$eq": "other"}}))
+                .unwrap()
+                .unwrap()["_id"],
+            "b"
+        );
+        assert_eq!(
+            c.find_one(&json!({"tags": "x"})).unwrap().unwrap()["_id"],
+            "a"
+        );
+        // Prefiltr używa tylko stringa; liczba nadal jest porównywana przez matcher.
+        assert_eq!(
+            c.find_one(&json!({"name": "a\"b\n", "n": 1.0}))
+                .unwrap()
+                .unwrap()["_id"],
+            "a"
+        );
+        assert!(c
+            .find_one(&json!({"name": "a\"b\n", "n": 2}))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
     fn parallel_sorted_scan_matches_serial() {
         let (_dir, store) = store();
         let c = store.collection("items").unwrap();
@@ -2033,6 +2576,126 @@ mod tests {
             );
             assert!(a <= b, "niestabilna kolejność: {a:?} > {b:?}");
         }
+    }
+
+    #[test]
+    fn parallel_unsorted_scan_matches_serial() {
+        let (_dir, store) = store();
+        let c = store.collection("items").unwrap();
+        for i in 0..1000 {
+            c.insert_one(json!({
+                "_id": format!("id{i:04}"),
+                "g": i % 7,
+                "n": i,
+                "junk": "x",
+            }))
+            .unwrap();
+        }
+        let q = FindQuery {
+            filter: json!({"n": {"$gte": 100}}),
+            projection: Some(json!({"g": 1, "n": 1, "_id": 0})),
+            skip: 7,
+            limit: Some(31),
+            ..Default::default()
+        };
+        // `find` bierze równoległy skan bez sortowania.
+        let parallel = c.find(&q).unwrap();
+        let rtxn = store.read_txn().unwrap();
+        let serial = c.find_in(&rtxn, &q).unwrap();
+        rtxn.commit().unwrap();
+        assert_eq!(parallel, serial);
+        assert_eq!(parallel.len(), 31);
+    }
+
+    #[test]
+    fn id_range_uses_primary_key_order() {
+        let (_dir, store) = store();
+        let c = store.collection("items").unwrap();
+        for i in 0..20 {
+            c.insert_one(json!({"_id": format!("id{i:02}"), "n": i}))
+                .unwrap();
+        }
+
+        // Zakres `_id` + dodatkowy warunek; naturalna kolejność `_id`.
+        let q = FindQuery {
+            filter: json!({"_id": {"$gte": "id05", "$lt": "id09"}, "n": {"$gte": 6}}),
+            ..Default::default()
+        };
+        let got = c.find(&q).unwrap();
+        let ids: Vec<_> = got.iter().map(|d| d["_id"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["id06", "id07", "id08"]);
+
+        // Sortowanie po `_id` malejąco nadal korzysta z zakresu.
+        let q = FindQuery {
+            filter: json!({"_id": {"$gt": "id05", "$lte": "id09"}}),
+            sort: vec![("_id".to_string(), -1)],
+            limit: Some(2),
+            ..Default::default()
+        };
+        let got = c.find(&q).unwrap();
+        let ids: Vec<_> = got.iter().map(|d| d["_id"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["id09", "id08"]);
+
+        // Dokładny `_id` z dodatkowym warunkiem nie wymaga pełnego skanu.
+        assert!(c
+            .find_one(&json!({"_id": "id07", "n": 7}))
+            .unwrap()
+            .is_some());
+        assert!(c
+            .find_one(&json!({"_id": "id07", "n": 8}))
+            .unwrap()
+            .is_none());
+
+        assert_eq!(
+            c.count(&json!({"_id": {"$gte": "id05", "$lt": "id09"}}))
+                .unwrap(),
+            4
+        );
+        assert_eq!(
+            c.count(&json!({"_id": {"$gte": "id05", "$lt": "id09"}, "n": {"$gte": 7}}))
+                .unwrap(),
+            2
+        );
+
+        // Pusty lub odwrócony zakres nie może wejść w pełny skan.
+        assert!(c
+            .find(&FindQuery {
+                filter: json!({"_id": {"$gt": "id09", "$lt": "id05"}}),
+                limit: Some(10),
+                ..Default::default()
+            })
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            c.count(&json!({"_id": {"$gt": "id09", "$lt": "id05"}}))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn id_range_update_delete() {
+        let (_dir, store) = store();
+        let c = store.collection("items").unwrap();
+        for i in 0..20 {
+            c.insert_one(json!({"_id": format!("id{i:02}"), "n": i}))
+                .unwrap();
+        }
+        let n = c
+            .update(
+                &json!({"_id": {"$gte": "id05", "$lt": "id09"}}),
+                &json!({"$set": {"flag": true}}),
+                true,
+            )
+            .unwrap();
+        assert_eq!(n, 4);
+        assert_eq!(c.count(&json!({"flag": true})).unwrap(), 4);
+
+        let n = c
+            .delete(&json!({"_id": {"$gte": "id06", "$lte": "id08"}}), true)
+            .unwrap();
+        assert_eq!(n, 3);
+        assert_eq!(c.count(&json!({})).unwrap(), 17);
     }
 
     #[test]

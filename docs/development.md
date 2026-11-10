@@ -112,8 +112,9 @@ This runs:
 - a persistence/reopen integration test;
 - Rust client unit/doc tests.
 
-The latest run before this documentation was written: **49 core unit tests,
-5 property tests, 1 reopen test, and 2 Rust client unit tests**, all passing.
+The latest run before this documentation was written: **54 core unit tests,
+2 daemon cache tests, 5 property tests, 1 reopen test, and 2 Rust client unit
+tests**, all passing.
 
 ### End-to-end scripts
 

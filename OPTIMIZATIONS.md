@@ -113,6 +113,65 @@ Top-K heaps. The coordinator merges them with stable sequence numbers.
 
 Deep skips stay single-threaded to bound memory.
 
+### Parallel unsorted scans and `_id` ranges
+
+Unsorted full scans now use wave-based parallel chunks. Each wave sends one or
+two chunks per worker and merges matches in `_id` order. If the wave produces
+`skip + limit` matches, the remaining collection is not scanned. This keeps
+early exit for broad filters while parallelizing selective filters.
+
+Primary-key equality and `$gt`/`$gte`/`$lt`/`$lte` conditions now use the
+`_id` B+ tree directly in `find`, `count`, `update`, and `delete`. A single
+`_id` sort can stream the range forwards or backwards and stop after
+`skip + limit`.
+
+Measured on 1M documents (~206 MB, no secondary indexes):
+
+| Operation | Result |
+|---|---|
+| Unindexed `find_one(name=missing)` (serial) | ~719 ms |
+| Unindexed `find(name=missing, limit=100)` (parallel) | ~242 ms |
+| Unindexed broad `find(grp=1, limit=100)` (parallel, early exit) | ~38 ms |
+| `find(_id range of 1,000, limit=100)` | ~1.5 ms |
+| `find(_id range, sort _id desc, limit=10)` | ~0.7 ms |
+| `count(_id range of 1,000)` | ~0.9 ms |
+
+Selective parallel scans are roughly 3× faster than serial at 1M; `_id` ranges
+avoid the scan entirely.
+
+### Raw JSON prefilter
+
+For simple string and boolean equalities, full scans now check the raw stored
+JSON for the serialized key and value before deserializing. A missing needle
+skips the document; a hit still runs the full matcher. Numeric and `null`
+conditions stay on the parser path because `1` and `1.0` are equal but have
+different serialized forms.
+
+Measured on the same 1M-document, ~206 MB database with cache disabled:
+
+| Operation | Before prefilter | After prefilter |
+|---|---:|---:|
+| `find_one(name=missing)` serial | ~719 ms | **~187 ms** |
+| `find(name=missing, limit=100)` parallel | ~242 ms | **~99 ms** |
+| `find(name=user 999999, limit=100)` parallel | ~311 ms | **~123 ms** |
+| `find(name=missing, sort name, limit=100)` | ~194 ms | **~117 ms** |
+
+String equality scans are roughly 2–4× faster. Numeric filters still pay full
+JSON parsing.
+
+### Adaptive waves and read cache
+
+The unsorted parallel scheduler starts with one small wave for early exit, then
+enlarges later waves to reduce synchronization overhead on selective scans.
+A daemon-level read cache stores bounded results for `find`, `find_one`,
+`count`, search, fuzzy, and list operations. Every successful write commit
+invalidates the cache and bumps its version; a read that started before the
+commit cannot insert a stale result.
+
+At 1M documents: cold `find` ~208 ms, cached ~2.2 ms; cold `count(grp=1)`
+~783 ms, cached ~1.2 ms. Cache defaults to 5 seconds and is bounded by entry
+count and serialized value size.
+
 ### Parallel index backfill
 
 Index creation reads raw chunks with one read transaction; worker threads parse

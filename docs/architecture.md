@@ -139,7 +139,7 @@ If the sort order exactly matches the full index order, nonodb can stream the
 index without materializing and sorting a result set. This is the `index-only
 sorted scan` path.
 
-### Full scans and parallel sorting
+### Full scans and parallel scans
 
 A full scan iterates primary keys in `_id` order. `find_one` and `find` without
 a sort stop early once `skip + limit` matches have been produced.
@@ -150,6 +150,49 @@ into chunks and parses/filters them on up to 16 worker threads. Each worker
 computes a bounded top-K heap; the coordinator merges them with a stable global
 sequence number. Deep skips stay single-threaded to avoid keeping a large heap
 per worker.
+
+Unsorted scans use the same chunking with an adaptive wave coordinator. The
+first wave is small, receives the results, and merges matches in `_id` order.
+If it produced enough matches for `skip + limit`, the remaining chunks are never
+sent, so broad filters keep the serial early exit. If not, later waves are
+larger to amortize synchronization during a selective full scan. `find_one`
+and very small limits stay on the serial path to avoid thread overhead.
+
+String and boolean equality conditions also get a raw JSON prefilter. Before
+deserializing a document, the scanner checks whether the serialized key and
+value occur in the stored bytes. A miss skips the document entirely; a hit
+still runs the full matcher, so false positives are harmless and there are no
+false negatives. Numeric and `null` conditions are always left to the parser
+because their equality semantics do not map safely to raw bytes.
+
+### Primary-key ranges
+
+An `_id` equality or range (`$gt`, `$gte`, `$lt`, `$lte`) is executed directly
+on the primary B+ tree, even when the filter has additional fields. This is not
+a secondary index, but it narrows a scan to a contiguous key range. `find`,
+`count`, `update`, and `delete` all use this path. Sort by `_id` can stream the
+range in either direction and stop after `skip + limit`.
+
+Clients can split a large non-indexed scan into disjoint `_id` ranges and issue
+them concurrently; each request reads only its range.
+
+### Choosing a read strategy
+
+Use the cheapest access path that fits the query:
+
+1. **Exact `_id`** — direct primary-key lookup, ~sub-millisecond.
+2. **Secondary index** — for equality/range filters and supported sorts.
+3. **`_id` range** — split a large scan by primary key, or cover time-ordered
+   custom ids.
+4. **Partitioned collections** — keep hot tenants, months, or types in separate
+   collections so a query touches only the relevant subset. This is an
+   application-level index with no engine changes.
+5. **Full scan with raw prefilter** — fallback for ad-hoc predicates.
+6. **Daemon read cache** — repeated identical reads, bounded TTL and
+   invalidated after every committed write.
+
+For frequent queries, indexes and collection partitioning remain the only
+approaches that avoid linear scans.
 
 ## Write path and group commit
 
@@ -299,6 +342,8 @@ final Levenshtein comparison is exact within the requested bound.
 - **Read-only `batch` is a snapshot.** All reads in a batch see the same state.
 - **`write_batch` is all-or-nothing.** A failure at any operation rolls back the
   whole batch.
+- **Daemon read cache is shared and invalidated on commit.** It is bounded by
+  TTL, entry count, and value size. It never survives a committed write.
 - **Client cache is opt-in and local.** It is invalidated on writes through the
   same client instance and bounded by a TTL; it cannot provide cross-process
   freshness.

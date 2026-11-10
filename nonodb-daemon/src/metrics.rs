@@ -7,6 +7,8 @@ use serde_json::{json, Value};
 pub static REQUESTS: AtomicU64 = AtomicU64::new(0);
 pub static ERRORS: AtomicU64 = AtomicU64::new(0);
 pub static READ_OPS: AtomicU64 = AtomicU64::new(0);
+pub static CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+pub static CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
 /// Liczba operacji wykonanych w żądaniach `/v1/batch`.
 pub static BATCH_OPS: AtomicU64 = AtomicU64::new(0);
 pub static WRITE_OPS: AtomicU64 = AtomicU64::new(0);
@@ -44,6 +46,8 @@ pub fn snapshot() -> Value {
         "requests_total": REQUESTS.load(Relaxed),
         "errors_total": ERRORS.load(Relaxed),
         "read_ops_total": READ_OPS.load(Relaxed),
+        "cache_hits_total": CACHE_HITS.load(Relaxed),
+        "cache_misses_total": CACHE_MISSES.load(Relaxed),
         "batch_ops_total": BATCH_OPS.load(Relaxed),
         "write_ops_total": write_ops,
         "write_batches_total": WRITE_BATCHES.load(Relaxed),

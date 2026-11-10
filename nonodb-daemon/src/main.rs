@@ -4,6 +4,7 @@
 //! uvicorn) łączą się przez `/run/nonodb.sock` (ścieżki konfigurowalne przez
 //! `NONODB_SOCK` i `NONODB_DATA`).
 
+mod cache;
 mod metrics;
 mod protocol;
 mod writer;
@@ -52,6 +53,7 @@ fn request_timeout() -> Duration {
 struct AppState {
     store: Arc<Store>,
     write_tx: mpsc::Sender<WriteJob>,
+    cache: Arc<cache::QueryCache>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -81,16 +83,22 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // Jeden wątek piszący, niezależny od runtime'u tokio (LMDB blokuje na fsync).
     let (write_tx, write_rx) = mpsc::channel::<WriteJob>();
+    let cache = Arc::new(cache::QueryCache::from_env());
     let writer_store = store.clone();
+    let writer_cache = cache.clone();
     std::thread::Builder::new()
         .name("nonodb-writer".into())
-        .spawn(move || writer::run(writer_store, write_rx))?;
+        .spawn(move || writer::run(writer_store, write_rx, writer_cache))?;
 
     if let Some(dir) = std::env::var_os("NONODB_SNAPSHOT_DIR") {
         spawn_snapshots(store.clone(), PathBuf::from(dir));
     }
 
-    let state = AppState { store, write_tx };
+    let state = AppState {
+        store,
+        write_tx,
+        cache,
+    };
     let app = Router::new()
         .route("/healthz", get(health))
         .route("/metrics", get(metrics_handler))
@@ -337,7 +345,20 @@ async fn exec(
             message: "missing or invalid bearer token".into(),
         }));
     }
-    match req {
+    let cache_key = if cacheable(&req) {
+        state.cache.key(&req)
+    } else {
+        None
+    };
+    let cache_version = state.cache.version();
+    if let Some(key) = cache_key.as_deref() {
+        if let Some(value) = state.cache.get(key) {
+            metrics::inc(&metrics::READ_OPS);
+            return respond(Ok(value));
+        }
+    }
+
+    let response = match req {
         Request::Find {
             coll,
             filter,
@@ -494,7 +515,7 @@ async fn exec(
             let req = WriteReq::Batch {
                 ops: ops.into_iter().map(WriteReq::from).collect(),
             };
-            submit_write(state, req).await
+            submit_write(&state, req).await
         }
 
         write_req => {
@@ -559,12 +580,34 @@ async fn exec(
                 _ => unreachable!("read requests handled above"),
             };
 
-            submit_write(state, req).await
+            submit_write(&state, req).await
+        }
+    };
+
+    if response.0 == StatusCode::OK {
+        if let (Some(key), Some(value)) = (cache_key, response.1 .0.result.clone()) {
+            state.cache.put(key, cache_version, value);
         }
     }
+    response
 }
 
-async fn submit_write(state: AppState, req: WriteReq) -> (StatusCode, Json<ApiResponse>) {
+fn cacheable(req: &Request) -> bool {
+    matches!(
+        req,
+        Request::Find { .. }
+            | Request::FindOne { .. }
+            | Request::Count { .. }
+            | Request::Search { .. }
+            | Request::Fuzzy { .. }
+            | Request::ListIndexes { .. }
+            | Request::ListTextIndexes { .. }
+            | Request::ListFuzzyIndexes { .. }
+            | Request::ListCollections
+    )
+}
+
+async fn submit_write(state: &AppState, req: WriteReq) -> (StatusCode, Json<ApiResponse>) {
     let (tx, rx) = tokio::sync::oneshot::channel();
     metrics::inc(&metrics::WRITE_OPS);
     metrics::inc(&metrics::QUEUE_LEN);

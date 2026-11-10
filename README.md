@@ -27,7 +27,8 @@ nonodb is a real document database with:
 - full-text search with **BM25** ranking, Unicode tokenization, diacritic
   folding and quoted phrases;
 - fuzzy search using trigrams plus Levenshtein distance;
-- snapshots, online backup, authentication, TLS, metrics and a CLI.
+- snapshots, online backup, authentication, TLS, metrics and a CLI;
+- a bounded daemon read cache, invalidated after every committed write.
 
 These are capabilities often split across several services or reserved for
 larger databases and paid enterprise editions. nonodb puts them in one small,
@@ -117,7 +118,8 @@ footprint.
 - Nested paths (`{"user.address.city": "..."}`), array membership, and
   consistent numeric comparison (`30 == 30.0`).
 - Projection, multi-field sort, `skip`, and `limit`.
-- Fast `find_one`/`find` paths that stop after enough matches, and `count({})`
+- Fast `find_one`/`find` paths that stop after enough matches, a raw JSON
+  prefilter for simple string/boolean equalities, and `count({})`
   in O(1).
 
 ### Writes and updates

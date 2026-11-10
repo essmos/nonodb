@@ -58,7 +58,7 @@ At the time of the latest run:
 | `cargo build --release --examples` | OK |
 | `cargo fmt --check` | OK |
 | `cargo clippy --all-targets -- -D warnings` | 0 warnings |
-| `cargo test` | 49 unit + 5 property-based + 1 reopen test, all passing |
+| `cargo test` | 54 core unit + 2 daemon cache + 5 property-based + 1 reopen test, all passing |
 | End-to-end scripts | CRUD, cache, batch, write batch, upsert, search, compound indexes, uvicorn, crash, Docker |
 
 The test suite covers filters, updates/upserts, paths, index encoding, unique
@@ -218,32 +218,38 @@ Query latency p50/p95:
 | `find_one(name=...)` **without index** | **512 ms** | 983 ms |
 | 1,000 batched `find_one` calls | **22.7 ms** | — |
 
-Bulk operations:
+### Parallel unindexed scans, raw prefilter, and `_id` ranges
 
-- `update(grp=7, multi=true)` over 1,000 documents: **50 ms**
-- `delete(grp=8)` over 1,000 documents: **50 ms**
-- Insert of a 900 KiB document: **25.9 ms**
-- Read of that document: **5.9 ms**
+Fresh 1M-document database, ~206 MB, no secondary indexes, ext4, release
+build, daemon read cache disabled. The query field is deliberately unindexed.
 
-## Optimization impact at 1M documents
+| Operation | Result |
+|---|---|
+| Load 1M (`insert_many` chunks of 500) | 12.7 s (79k docs/s) |
+| `find_one(name=missing)` — serial, raw prefilter | p50 **187 ms** |
+| `find(name=missing, limit=100)` — parallel, raw prefilter | p50 **99 ms** |
+| `find(name=user 999999, limit=100)` — parallel, raw prefilter | p50 **123 ms** |
+| `find(grp=1, limit=100)` — numeric filter, no prefilter | p50 **86 ms** |
+| `find(grp=1, limit=1000)` — numeric filter | p50 **264 ms** |
+| `find(_id range of 1,000, limit=100)` | p50 **1.5 ms** |
+| `find(_id range, sort _id desc, limit=10)` | p50 **0.7 ms** |
+| `count(_id range of 1,000)` | p50 **0.9 ms** |
+| `find(name=missing, sort name, limit=100)` — parallel sorted | p50 **117 ms** |
 
-| Query | Before | After | Improvement |
-|---|---|---|---|
-| `count(age ∈ [18,30))` | 1.07 s | **5.6 ms** | ~190× |
-| `find({}, skip=500000, limit=10)` | 1.40 s | **36.6 ms** | ~38× |
-| `find({}, sort score, limit=10)` | 7.18 s | **1.29 s** (then 250–420 ms with parallel sort) | ~5.6× initially |
-| `find(age range, sort score, limit=10)` | 2.58 s | **321 ms** | ~8× |
-| `find(age range, limit=10)` | 0.58 ms | 0.58 ms | no regression |
+Raw prefilter speeds up string equality scans by roughly 2–4×. `_id` ranges
+use the primary B+ tree and avoid the scan entirely.
 
-The main changes:
+### Daemon read cache
 
-- bounded top-K heaps instead of full result collection and sort;
-- `skip` without parsing skipped documents;
-- combined index range bounds with type awareness;
-- limiting index candidates to `skip + limit`;
-- index-only count without materializing ids;
-- parallel full scans for shallow sorted queries;
-- `sonic-rs` parsing on read paths.
+Same database, cache enabled with a 5-second TTL:
+
+| Operation | Cold | Cached |
+|---|---:|---:|
+| `find(name=cache-test-xyz, limit=100)` | 208 ms | **2.2 ms** |
+| `count(grp=1)` | 783 ms | **1.2 ms** |
+
+Every committed write clears the cache and increments its version. A read that
+started before the commit cannot repopulate stale data.
 
 ## 2M, 4M, and 8M documents
 

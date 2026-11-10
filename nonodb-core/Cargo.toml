@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 heed = "0.20"
+memchr = "2"
 serde.workspace = true
 serde_json.workspace = true
 sonic-rs = "0.5"

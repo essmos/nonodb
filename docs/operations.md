@@ -35,6 +35,9 @@ All daemon configuration is through environment variables.
 | `NONODB_SOCK` | `/run/nonodb.sock` | Unix socket path |
 | `NONODB_MAP_SIZE` | `1GiB` | LMDB address-space limit; accepts `4GiB`, `2048MiB`, bytes |
 | `NONODB_REQUEST_TIMEOUT` | `30` | Server-side request timeout in seconds |
+| `NONODB_CACHE_TTL` | `5` | Read-cache TTL in seconds; `0` disables the cache |
+| `NONODB_CACHE_ENTRIES` | `512` | Maximum number of cached read results |
+| `NONODB_CACHE_MAX_BYTES` | `262144` | Maximum serialized size of one cached result |
 | `NONODB_AUTH_TOKEN` | — | Enables bearer-token authentication |
 | `NONODB_ALLOWED_UIDS` | — | Comma-separated Unix uid allow-list for UDS |
 | `NONODB_ALLOWED_GIDS` | — | Comma-separated Unix gid allow-list for UDS |
@@ -60,6 +63,14 @@ Client-side environment variables:
 is **not** a disk or RAM reservation. The file grows as data is written. If the
 database reaches the map limit, writes fail; increase the limit and restart the
 daemon. Existing data remains valid.
+
+The daemon has a shared read cache for `find`, `find_one`, `count`, search,
+fuzzy, and list operations. It is enabled by default for 5 seconds. Every
+successful write commit increments an internal version and clears the cache, so
+read-after-write through the same daemon is fresh. The cache is bounded by
+`NONODB_CACHE_ENTRIES` and `NONODB_CACHE_MAX_BYTES`; oversized results are not
+stored. Set `NONODB_CACHE_TTL=0` to disable it. Metrics expose
+`cache_hits_total` and `cache_misses_total`.
 
 ## Deployment with systemd
 

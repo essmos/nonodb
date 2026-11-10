@@ -13,6 +13,7 @@ use nonodb_core::Store;
 use serde_json::{json, Value};
 use tokio::sync::oneshot;
 
+use crate::cache::QueryCache;
 use crate::metrics;
 use crate::protocol::{ApiError, WriteReq};
 
@@ -29,7 +30,7 @@ pub struct WriteJob {
 }
 
 /// Pętla wątku piszącego. Kończy się, gdy kanał zostanie zamknięty.
-pub fn run(store: Arc<Store>, rx: Receiver<WriteJob>) {
+pub fn run(store: Arc<Store>, rx: Receiver<WriteJob>, cache: Arc<QueryCache>) {
     while let Ok(first) = rx.recv() {
         let mut jobs = vec![first];
         // Adaptacyjne okno: im dłuższa kolejka, tym większy batch (mniej fsync),
@@ -57,18 +58,18 @@ pub fn run(store: Arc<Store>, rx: Receiver<WriteJob>) {
             }
         }
 
-        run_batch(&store, jobs);
+        run_batch(&store, &cache, jobs);
     }
 }
 
-fn run_batch(store: &Store, jobs: Vec<WriteJob>) {
+fn run_batch(store: &Store, cache: &QueryCache, jobs: Vec<WriteJob>) {
     metrics::sub(&metrics::QUEUE_LEN, jobs.len() as u64);
     // Atomowy `write_batch` nie może współdzielić transakcji z innymi
     // żądaniami: błąd jednej operacji musi wycofać całą jego transakcję, a nie
     // pozostałe zapisy z grupy. Dlatego taką grupę wykonujemy job po jobie.
     if jobs.iter().any(|j| j.req.is_atomic()) {
         for job in jobs {
-            run_single(store, job);
+            run_single(store, cache, job);
         }
         return;
     }
@@ -93,6 +94,7 @@ fn run_batch(store: &Store, jobs: Vec<WriteJob>) {
     match wtxn.commit() {
         Ok(()) => {
             metrics::add(&metrics::COMMIT_NS, started.elapsed().as_nanos() as u64);
+            cache.invalidate();
             for (job, res) in jobs.into_iter().zip(results) {
                 let _ = job.resp.send(res);
             }
@@ -107,7 +109,7 @@ fn run_batch(store: &Store, jobs: Vec<WriteJob>) {
     }
 }
 
-fn run_single(store: &Store, job: WriteJob) {
+fn run_single(store: &Store, cache: &QueryCache, job: WriteJob) {
     metrics::inc(&metrics::WRITE_BATCHES);
     let mut wtxn = match store.write_txn() {
         Ok(wtxn) => wtxn,
@@ -121,6 +123,7 @@ fn run_single(store: &Store, job: WriteJob) {
         Ok(value) => match wtxn.commit() {
             Ok(()) => {
                 metrics::add(&metrics::COMMIT_NS, started.elapsed().as_nanos() as u64);
+                cache.invalidate();
                 let _ = job.resp.send(Ok(value));
             }
             Err(e) => {

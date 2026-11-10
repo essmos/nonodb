@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Żądanie do `/v1/exec`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
     Insert {
@@ -132,7 +132,7 @@ pub enum Request {
 }
 
 /// Operacja zapisu dozwolona w atomowym `write_batch`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum WriteOp {
     Insert {
