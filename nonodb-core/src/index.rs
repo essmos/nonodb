@@ -5,6 +5,12 @@ use std::ops::Bound;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::date;
+
+/// Index encoding format. Version 0 means an index created before
+/// BSON-compatible dates existed; date values were skipped in those indexes.
+pub const FORMAT_VERSION: u8 = 2;
+
 /// Index definition stored in `meta` under `index:<coll>:<name>`.
 ///
 /// Supports single-field (`fields == ["age"]`) and compound
@@ -21,6 +27,10 @@ pub struct IndexDef {
     /// Fields additionally copied into the index value (covering projections).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub include: Vec<String>,
+    /// Index key encoding version. Missing in definitions written before date
+    /// support and therefore defaults to 0.
+    #[serde(default)]
+    pub format: u8,
 }
 
 impl IndexDef {
@@ -30,6 +40,7 @@ impl IndexDef {
             field: String::new(),
             unique,
             include: Vec::new(),
+            format: FORMAT_VERSION,
         }
     }
 
@@ -39,7 +50,13 @@ impl IndexDef {
             field: String::new(),
             unique,
             include: include.to_vec(),
+            format: FORMAT_VERSION,
         }
+    }
+
+    /// Whether the index was built with the current key encoding.
+    pub fn current_format(&self) -> bool {
+        self.format >= FORMAT_VERSION
     }
 
     /// Fields in index order (with support for the legacy `field` format).
@@ -104,7 +121,11 @@ pub fn encode_value(v: &Value) -> Option<Vec<u8>> {
             out.push(0x04);
             out.push(u8::from(*b));
         }
-        _ => return None,
+        _ => {
+            let ms = date::parse_value(v)?;
+            out.push(0x05);
+            out.extend_from_slice(&date::encode_ordered(ms));
+        }
     }
     Some(out)
 }
@@ -213,6 +234,9 @@ pub fn bounds(op: &str, value: &Value) -> Option<RangeBytes> {
 /// type as the condition value; the matcher does not compare different types, so
 /// otherwise `$gt: 2` would also include strings/bools from the index.
 pub fn bounds_from_cond(cond: &Value) -> Option<RangeBytes> {
+    if date::is_date(cond) {
+        return bounds("$eq", cond);
+    }
     let Some(obj) = cond.as_object() else {
         return bounds("$eq", cond);
     };
@@ -403,5 +427,35 @@ mod tests {
         .unwrap();
         assert!(a < b);
         assert!(a.starts_with(&enc(json!(1))));
+    }
+
+    #[test]
+    fn dates_encode_in_chronological_order() {
+        let earlier = date::canonical(1_000);
+        let later = date::canonical(2_000);
+        assert!(encode_value(&earlier) < encode_value(&later));
+    }
+
+    #[test]
+    fn date_ranges_use_date_bounds() {
+        let cond = serde_json::json!({
+            "$gte": {"$date": "2026-01-01T01:00:00+01:00"},
+            "$lt": {"$date": "2026-02-01T00:00:00Z"}
+        });
+        let (lower, upper) = bounds_from_cond(&cond).unwrap();
+        assert!(matches!(lower, Bound::Included(_)));
+        assert!(matches!(upper, Bound::Excluded(_)));
+    }
+
+    #[test]
+    fn old_index_defs_default_to_format_zero() {
+        let def: IndexDef = serde_json::from_value(serde_json::json!({
+            "fields": ["created_at"],
+            "unique": false
+        }))
+        .unwrap();
+        assert_eq!(def.format, 0);
+        assert!(!def.current_format());
+        assert!(IndexDef::single("created_at", false).current_format());
     }
 }

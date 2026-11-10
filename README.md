@@ -22,6 +22,7 @@ Low resource use is the starting point, not the whole story. Under the hood,
 nonodb is a real document database with:
 
 - JSON documents, MongoDB-style filters, projections, sorting and updates;
+- BSON-compatible dates with RFC 3339 input, timezone normalization and indexed ranges;
 - single-field, compound, unique and covering secondary indexes;
 - atomic `write_batch` for all-or-nothing groups of writes;
 - full-text search with **BM25** ranking, Unicode tokenization, diacritic
@@ -228,6 +229,26 @@ curl -s --unix-socket /tmp/nonodb.sock \
 
 See [Document history](docs/api.md#document-history) for the full request and
 retention semantics.
+
+### Dates
+
+- Dates are BSON-compatible instants stored as UTC Unix milliseconds.
+- Accepts relaxed Extended JSON (`{"$date": "2026-01-01T00:00:00Z"}`),
+  canonical `$numberLong`, and numeric milliseconds.
+- RFC 3339 offsets are normalized, so different offsets for the same instant
+  compare equal.
+- Standard `$eq`, `$gte`, `$lt`, `$in`, sorting, and secondary indexes work on
+  dates; no special date operators are needed.
+- Naive local datetimes are rejected as ambiguous.
+
+```bash
+curl -s --unix-socket /tmp/nonodb.sock \
+  -H 'content-type: application/json' \
+  -X POST http://localhost/v1/exec \
+  -d '{"op":"insert","coll":"events","doc":{"_id":"e1","at":{"$date":"2026-01-01T01:00:00+01:00"}}}'
+```
+
+See [Dates and time zones](docs/dates.md) for formats, indexes, and limitations.
 
 ### Document TTL
 
@@ -539,6 +560,7 @@ More deployment details: [Operations — Docker](docs/operations.md#docker).
 | [Python client](docs/python-client.md) | `NonoDB`/`Collection` API, caching, retries, TCP/TLS, FastAPI usage |
 | [Vault collections](docs/vault.md) | Optional encrypted tenant data, headers, restrictions, key rotation |
 | [Document TTL](docs/ttl.md) | Collection defaults, per-document expiry, update semantics, maintenance |
+| [Dates and time zones](docs/dates.md) | BSON-compatible dates, RFC 3339 input, filtering, indexes, sorting |
 | [CLI](docs/cli.md) | `ping`, `find`, `count`, `backup`, `restore`, `inspect`, `exec` |
 | [Operations](docs/operations.md) | Configuration, deployment, security, snapshots, monitoring, capacity, troubleshooting |
 | [Benchmarks](docs/benchmarks.md) | Test environment, throughput, latency, large data sets, RAM, reproducibility |

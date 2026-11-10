@@ -13,6 +13,7 @@
 
 pub mod aggregate;
 pub mod collection;
+pub mod date;
 pub mod error;
 pub mod history;
 pub mod index;

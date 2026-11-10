@@ -45,6 +45,19 @@ retried automatically; read operations are retried after a transport failure,
 because retrying a write could duplicate it. Use `write_batch` when several
 writes must succeed or fail together.
 
+## Dates
+
+Clients send dates as Extended JSON objects. Convert native datetimes to an
+RFC 3339 string with `Z` or a numeric offset before calling the client:
+
+```python
+{"at": {"$date": "2026-01-01T01:00:00+01:00"}}
+```
+
+Epoch milliseconds are also accepted. The daemon normalizes the value to
+canonical UTC milliseconds. Filter with the same representation and normal
+operators (`$gte`, `$lt`, ...); see [Dates and time zones](dates.md).
+
 ## Python
 
 The Python client is documented separately in [Python client](python-client.md).

@@ -34,6 +34,9 @@ pub enum Error {
     #[error("invalid TTL: {0}")]
     InvalidTtl(String),
 
+    #[error("invalid date: {0}")]
+    InvalidDate(String),
+
     /// Vault/encryption error with a stable API code.
     #[error("{message}")]
     Vault { code: &'static str, message: String },

@@ -390,6 +390,7 @@ impl From<nonodb_core::Error> for ApiError {
             E::InvalidCollectionName(_) => "invalid_collection",
             E::DocumentTooLarge(_, _) => "document_too_large",
             E::InvalidTtl(_) => "invalid_ttl",
+            E::InvalidDate(_) => "invalid_date",
             E::Json(_) | E::JsonFast(_) => "invalid_json",
             E::Lmdb(_) => "storage",
             E::Io(_) => "io",

@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use nonodb_core::date;
 use nonodb_core::Store;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -579,6 +580,9 @@ enum CondKind {
 /// an operator outside equality/range). `Some(None)` is a condition that is skipped but
 /// safe for the rest of the query.
 fn condition_kind(value: &Value) -> Option<Option<CondKind>> {
+    if date::is_date(value) {
+        return Some(Some(CondKind::Eq));
+    }
     match value {
         Value::String(_) | Value::Number(_) => Some(Some(CondKind::Eq)),
         Value::Bool(_) | Value::Null => Some(None),
@@ -591,13 +595,17 @@ fn condition_kind(value: &Value) -> Option<Option<CondKind>> {
             for (op, value) in ops {
                 match op.as_str() {
                     "$eq" => {
-                        if !matches!(value, Value::String(_) | Value::Number(_)) {
+                        if !matches!(value, Value::String(_) | Value::Number(_))
+                            && !date::is_date(value)
+                        {
                             return Some(None);
                         }
                         eq = true;
                     }
                     "$gt" | "$gte" | "$lt" | "$lte" => {
-                        if !matches!(value, Value::String(_) | Value::Number(_)) {
+                        if !matches!(value, Value::String(_) | Value::Number(_))
+                            && !date::is_date(value)
+                        {
                             return Some(None);
                         }
                         range = true;
@@ -652,6 +660,26 @@ mod tests {
         )
         .unwrap();
         assert_eq!(fields, vec!["kind", "tenant", "created_at"]);
+    }
+
+    #[test]
+    fn extracts_date_equality_and_range() {
+        let (_, fields) = candidate_for(
+            &find(json!({
+                "tenant": "acme",
+                "created_at": {"$gte": {"$date": "2026-01-01T00:00:00Z"}}
+            })),
+            3,
+        )
+        .unwrap();
+        assert_eq!(fields, vec!["tenant", "created_at"]);
+
+        let (_, fields) = candidate_for(
+            &find(json!({"created_at": {"$date": "2026-01-01T00:00:00Z"}})),
+            3,
+        )
+        .unwrap();
+        assert_eq!(fields, vec!["created_at"]);
     }
 
     #[test]

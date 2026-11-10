@@ -9,6 +9,7 @@
 use serde_json::Value;
 use std::cmp::Ordering;
 
+use crate::date;
 use crate::query::path;
 
 /// Does the document match the filter? A non-object filter matches everything.
@@ -40,6 +41,10 @@ pub fn matches(doc: &Value, filter: &Value) -> bool {
 }
 
 fn match_field(actual: Option<&Value>, cond: &Value) -> bool {
+    // Extended JSON dates are objects, not operators.
+    if date::is_date(cond) {
+        return eq_opt(actual, cond);
+    }
     if let Some(ops) = cond.as_object() {
         if !ops.is_empty() && ops.keys().all(|k| k.starts_with('$')) {
             return ops.iter().all(|(op, arg)| match op.as_str() {
@@ -80,6 +85,12 @@ pub(crate) fn eq_opt(actual: Option<&Value>, expected: &Value) -> bool {
 
 /// Value equality with unified number comparison.
 pub(crate) fn num_eq(a: &Value, b: &Value) -> bool {
+    if let (Some(x), Some(y)) = (date::parse_value(a), date::parse_value(b)) {
+        return x == y;
+    }
+    if date::parse_value(a).is_some() || date::parse_value(b).is_some() {
+        return false;
+    }
     match (a, b) {
         (Value::Number(x), Value::Number(y)) => match (x.as_f64(), y.as_f64()) {
             (Some(x), Some(y)) => x == y,
@@ -95,7 +106,7 @@ fn cmp(actual: Option<&Value>, expected: &Value) -> Option<Ordering> {
         (Value::Number(x), Value::Number(y)) => x.as_f64()?.partial_cmp(&y.as_f64()?),
         (Value::String(x), Value::String(y)) => Some(x.cmp(y)),
         (Value::Bool(x), Value::Bool(y)) => Some(x.cmp(y)),
-        _ => None,
+        _ => date::cmp(a, expected),
     }
 }
 
@@ -160,5 +171,30 @@ mod tests {
         assert!(matches(&doc, &json!({"tags": "a"})));
         assert!(!matches(&doc, &json!({"tags": "c"})));
         assert!(matches(&doc, &json!({"tags": {"$in": ["c", "b"]}})));
+    }
+    #[test]
+    fn dates_compare_by_instant_across_offsets() {
+        let doc = json!({"at": {"$date": "2026-01-01T00:00:00Z"}});
+        assert!(matches(
+            &doc,
+            &json!({"at": {"$gte": {"$date": "2026-01-01T01:00:00+01:00"}}})
+        ));
+        assert!(matches(
+            &doc,
+            &json!({"at": {"$eq": {"$date": "2025-12-31T19:00:00-05:00"}}})
+        ));
+        assert!(!matches(
+            &doc,
+            &json!({"at": {"$gt": {"$date": "2026-01-01T00:00:00Z"}}})
+        ));
+    }
+
+    #[test]
+    fn date_and_string_are_different_types() {
+        let doc = json!({"at": {"$date": "2026-01-01T00:00:00Z"}});
+        assert!(!matches(
+            &doc,
+            &json!({"at": {"$gte": "2020-01-01T00:00:00Z"}})
+        ));
     }
 }

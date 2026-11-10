@@ -100,6 +100,13 @@ Collection names are validated. The `_id` is always a string and is also the
 primary B+ tree key. Documents are serialized with `serde_json`; reads use
 `sonic-rs` for faster parsing.
 
+Dates use MongoDB Extended JSON (`{"$date": {"$numberLong": "<ms>"}}`) and are
+canonicalized on write to UTC Unix milliseconds. Index encoding gives dates
+their own type tag and an order-preserving signed integer payload, so range
+filters, sorting, compound indexes, and unique constraints compare instants
+rather than the original string representation. Date strings are not converted
+implicitly. See [Dates and time zones](dates.md).
+
 The optional `history` sub-database stores immutable revision snapshots. A key
 contains the collection name, `_id`, and a global `rev` assigned by the writer.
 The current collection is never modified by history and history entries are
@@ -354,6 +361,8 @@ ordering:
 - scalar values are tagged by type and encoded in an order-preserving form;
 - numbers are encoded through an order-preserving transform of `f64`;
 - strings are escaped UTF-8;
+- Extended JSON dates are encoded as order-preserving signed millisecond
+  integers with a separate type tag;
 - compound keys concatenate encoded fields;
 - the document `_id` is appended to make each key unique.
 
@@ -361,9 +370,16 @@ Because the encoding is ordered, range queries (`$gt`, `$gte`, `$lt`, `$lte`)
 become contiguous LMDB ranges. An index range scan does not deserialize
 documents until candidates are verified.
 
-Only scalar fields are indexed: strings, numbers, booleans, and `null` values
-that are actually present. Arrays and objects are skipped. This applies to
-secondary indexes, text indexes, and fuzzy indexes.
+Secondary indexes accept strings, numbers, booleans, dates, and `null` values
+that are actually present. Arrays and ordinary objects are skipped. Dates are
+canonicalized before indexing, so all offsets for one instant share a key. Text
+and fuzzy indexes search string/number/bool scalar values only; dates are not
+searchable text.
+
+Index definitions record the key-encoding format. Definitions written before
+date support default to format 0 and are not used for filters containing dates,
+because those indexes skipped `$date` objects during backfill. Recreating the
+index upgrades it to the current format.
 
 ### Compound indexes
 

@@ -133,6 +133,8 @@ Response:
 - The reserved top-level `_ttl` field sets a per-document expiry in seconds.
   `_ttl: 0` or `null` disables the collection default. The field is removed
   before storage. See [Document TTL](#document-ttl).
+- Extended JSON `{"$date": ...}` values are normalized to canonical UTC
+  milliseconds before storage. See [Dates and time zones](dates.md).
 
 ## insert_many
 
@@ -535,10 +537,34 @@ object, `null`, or an omitted filter matches every document.
 | `{"$nor": [f1, f2]}` | None of the filters match |
 | `{"$not": f}` | Negate a filter (top level) |
 
+### Dates
+
+Dates are values, not strings. Use Extended JSON in the document and in the
+filter operand:
+
+```json
+{
+  "op": "find",
+  "coll": "events",
+  "filter": {
+    "created_at": {
+      "$gte": {"$date": "2026-01-01T00:00:00Z"},
+      "$lt": {"$date": "2026-02-01T00:00:00+01:00"}
+    }
+  }
+}
+```
+
+Standard `$eq`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`, and `$nin` compare dates
+by instant. Different RFC 3339 offsets for the same instant are equal. Date
+values do not match string values. See [Dates and time zones](dates.md).
+
 ### Semantics
 
 - **Numbers compare by value.** `30` equals `30.0`, including in ranges.
 - **Type-aware ranges.** A numeric `$gt` does not match strings or booleans.
+- **Dates compare by instant.** Offsets are ignored after parsing; date and
+  string values remain different types.
 - **Missing fields are `null` for equality.** `{"missing": null}` matches absent
   fields; `$exists` distinguishes present `null` from absent.
 - **Array membership.** `{"tags": "rust"}` matches a document where `tags` is
@@ -619,8 +645,8 @@ Rules:
 - Provide either `field` (single) or `fields` (ordered list). `fields` is
   preferred for new code.
 - The index name is the fields joined by `+`.
-- Indexable values are scalars: string, number, boolean. Arrays and objects are
-  skipped.
+- Indexable values are scalars: string, number, boolean, and Extended JSON
+  dates. Arrays and ordinary objects are skipped.
 - A unique index enforces uniqueness of the full key. For compound indexes,
   that means the combination, not each field individually.
 - Creating an index on an existing collection performs a synchronous backfill.
@@ -628,6 +654,10 @@ Rules:
 - `include` copies extra fields into index values for covering projections.
   Included fields are not part of the index key or uniqueness constraint.
 - Indexes are maintained transactionally on insert, update, and delete.
+- Dates are indexed by instant and support normal range plans, sorting, and
+  unique constraints. No index type annotation is required.
+- Indexes created before date support are skipped for filters containing dates
+  until they are dropped and recreated. See [Dates and time zones](dates.md).
 
 ## drop_index
 
@@ -782,7 +812,8 @@ Semantics:
 - There is no `skip` parameter for fuzzy search.
 - `limit` defaults to 10 and is capped at 1,000.
 - At most 5,000 candidates are scored per query.
-- Only scalar field values are indexed.
+- Only string/number/bool scalar field values are searched. Arrays, objects, and
+  Extended JSON dates are skipped.
 
 ## Document history
 
@@ -1111,6 +1142,7 @@ Requires the bearer token when authentication is enabled.
 | `duplicate_key` | 400 | Duplicate `_id` or unique-index conflict |
 | `document_too_large` | 413 | Document exceeds 1 MiB |
 | `invalid_ttl` | 400 | Invalid collection default or document `_ttl` value |
+| `invalid_date` | 400 | Invalid `$date` payload, RFC 3339 string, or missing timezone |
 | `unauthorized` | 401 | Missing/invalid bearer token |
 | `timeout` | 500 | Request exceeded the server timeout |
 | `storage` | 500 | LMDB/storage error |

@@ -4,6 +4,7 @@
 //! `$addToSet` and `$setOnInsert` (only on upsert).
 //! An update without operators (a plain object) replaces the document while keeping `_id`.
 
+use crate::date;
 use crate::error::{Error, Result};
 use serde_json::{Map, Value};
 
@@ -36,6 +37,7 @@ fn collect_seed(filter: &Value, doc: &mut Value) {
         }
         let eq = match v {
             Value::Object(inner) if inner.len() == 1 => inner.get("$eq"),
+            Value::Object(_) if date::is_date(v) => Some(v),
             Value::Object(_) => None,
             _ => Some(v),
         };

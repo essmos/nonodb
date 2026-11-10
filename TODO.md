@@ -23,6 +23,7 @@ limitations are documented in [docs/roadmap.md](docs/roadmap.md).
 - [x] Fuzzy search with trigrams and bounded Levenshtein distance
 - [x] Read batches and atomic write batches
 - [x] Document TTL with collection defaults, document overrides, background sweeps
+- [x] BSON-compatible Extended JSON dates, indexed ranges, sorting, and unique constraints
 - [x] Maintenance worker for TTL, history pruning, and automatic-index scheduling
 - [x] Daemon, Unix socket, TCP/TLS, bearer auth, uid/gid allow-lists
 - [x] Group commit, request limits/timeouts, metrics
@@ -43,6 +44,7 @@ limitations are documented in [docs/roadmap.md](docs/roadmap.md).
 ### P2 — query and update surface
 
 - [ ] `$rename`, `$min`, `$max`
+- [ ] Timezone-aware date aggregation expressions (`$dateToString`, `$dateTrunc`, `$dateAdd`)
 - [ ] Conditional `$pull` (query predicate)
 - [ ] `$mul`, `$currentDate`
 - [ ] Nested projections

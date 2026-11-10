@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, HashSet};
 use serde_json::{Map, Value};
 
 use crate::collection::compare_docs;
+use crate::date;
 use crate::error::{Error, Result};
 use crate::query::{matches, path};
 
@@ -644,7 +645,7 @@ fn compare_value(a: &Value, b: &Value) -> Ordering {
         (Value::Null, Value::Null) => Ordering::Equal,
         (Value::Null, _) => Ordering::Greater,
         (_, Value::Null) => Ordering::Less,
-        _ => Ordering::Equal,
+        _ => date::cmp(a, b).unwrap_or(Ordering::Equal),
     }
 }
 

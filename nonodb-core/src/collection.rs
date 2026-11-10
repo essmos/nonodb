@@ -10,6 +10,7 @@ use heed::{Database, Env, RoTxn, RwTxn};
 use serde_json::{Map, Value};
 
 use crate::aggregate;
+use crate::date;
 use crate::error::{Error, Result};
 use crate::history::{self, HistoryConfig, HistoryEntry};
 use crate::index::{self, IndexDef};
@@ -474,8 +475,14 @@ impl<'e> Collection<'e> {
         // Try indexes with the longest field prefix first (most selective).
         let mut defs = self.index_defs(rtxn)?;
         defs.sort_by_key(|d| std::cmp::Reverse(d.effective_fields().len()));
+        let has_date = date::contains_date(filter);
 
         for def in defs {
+            // Pre-date indexes skipped `$date` objects during backfill, so they
+            // cannot answer a date range until they are recreated.
+            if has_date && !def.current_format() {
+                continue;
+            }
             let Some(bounds) = bounds_for_index(&def, obj) else {
                 continue;
             };
@@ -1059,6 +1066,7 @@ impl<'e> Collection<'e> {
     pub fn insert_one_txn(&self, wtxn: &mut RwTxn<'_>, mut doc: Value) -> Result<String> {
         self.ensure_standard()?;
         let ttl_at = ttl::take_insert_ttl(&mut doc, self.ttl_default_seconds)?;
+        date::normalize_document(&mut doc)?;
         let obj = doc
             .as_object_mut()
             .ok_or_else(|| Error::Query("document must be an object".into()))?;
@@ -1145,6 +1153,7 @@ impl<'e> Collection<'e> {
                 TtlUpdate::Clear => None,
                 TtlUpdate::Set(at) => Some(at),
             };
+            date::normalize_document(&mut new)?;
 
             self.validate_unique(&*wtxn, &new, &id)?;
             let bytes = serde_json::to_vec(&new)?;
@@ -1325,6 +1334,7 @@ impl<'e> Collection<'e> {
             return Err(Error::DuplicateKey(id));
         }
         let ttl_at = ttl::take_insert_ttl(&mut doc, self.ttl_default_seconds)?;
+        date::normalize_document(&mut doc)?;
         let envelope = vault::encrypt_document(&doc, key, &self.name, tenant, &id, kid)?;
         let stored = Self::vault_stored(&id, tenant, envelope)?;
         let bytes = Self::check_vault_size(&stored)?;
@@ -1399,6 +1409,7 @@ impl<'e> Collection<'e> {
             TtlUpdate::Clear => None,
             TtlUpdate::Set(at) => Some(at),
         };
+        date::normalize_document(&mut new)?;
         if new.get("_id").and_then(Value::as_str) != Some(id.as_str()) {
             return Err(Error::InvalidId);
         }
@@ -2523,6 +2534,9 @@ impl<'e> Collection<'e> {
 
 /// Equality value from a condition (`5` or `{"$eq": 5}`).
 fn eq_value(cond: &Value) -> Option<&Value> {
+    if date::is_date(cond) {
+        return Some(cond);
+    }
     if let Some(obj) = cond.as_object() {
         if obj.len() == 1 {
             return obj.get("$eq");
@@ -2574,6 +2588,9 @@ fn is_match_all(filter: &Value) -> bool {
 /// We exclude `null` (the matcher treats a missing field as `null`, and missing fields
 /// are not in the index) and operators the index does not support.
 fn count_cond_safe(cond: &Value) -> bool {
+    if date::is_date(cond) {
+        return true;
+    }
     match cond {
         Value::Null => false,
         Value::Object(ops) => {
@@ -2737,7 +2754,7 @@ fn compare_values(a: Option<&Value>, b: Option<&Value>) -> Ordering {
                 .unwrap_or(Ordering::Equal),
             (Value::String(x), Value::String(y)) => x.cmp(y),
             (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
-            _ => Ordering::Equal,
+            _ => date::cmp(a, b).unwrap_or(Ordering::Equal),
         },
     }
 }

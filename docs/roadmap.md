@@ -22,6 +22,7 @@ Implemented:
 - fuzzy search with trigrams and bounded Levenshtein distance;
 - read batches and atomic write batches;
 - document TTL with collection defaults, per-document overrides, and background expiry;
+- BSON-compatible dates with RFC 3339 input, UTC normalization, indexed ranges, and sorting;
 - Unix-socket daemon, optional TCP/TLS and mutual TLS, bearer auth, uid/gid allow-lists;
 - group commit, request limits/timeouts, metrics;
 - snapshots, online backup, restore, inspect, CLI;
@@ -55,6 +56,9 @@ Implemented:
 - TTL is eventual and has no strict read-time filtering.
 - Projection is top-level only, not a nested projection tree.
 - Sorting and filtering use the documented subset; there is no collation API.
+- Dates are instants only. IANA timezone names and timezone-aware aggregation
+  expressions are not implemented; clients must send RFC 3339 with `Z`/offset.
+- Existing ISO 8601 strings are not migrated to dates automatically.
 
 ### Updates
 
@@ -67,7 +71,8 @@ Implemented:
 
 ### Indexes
 
-- Only scalar values are indexed. Arrays and objects are skipped.
+- Only scalar values are indexed. Dates use the Extended JSON date type; arrays
+  and ordinary objects are skipped.
 - No sparse/partial indexes, wildcard indexes, geospatial indexes, vector
   indexes, or text indexes with custom analyzers.
 - No index intersection or cost-based optimizer. The planner uses a simple
@@ -169,18 +174,20 @@ project's target workload.
    objectives.
 8. **Stop words, stemming, and per-index analyzers**; possibly an integration
    with Tantivy for advanced text search.
-9. **Compression and/or CBOR storage** for smaller files and faster parsing,
+9. **Timezone-aware date expressions** for aggregation, including IANA
+   timezone identifiers for local calendar operations.
+10. **Compression and/or CBOR storage** for smaller files and faster parsing,
    with a migration path.
-10. **Expanded aggregation** beyond the current `$match`/`$group`/`$project`/
+11. **Expanded aggregation** beyond the current `$match`/`$group`/`$project`/
     `$sort`/`$limit` subset, including streaming execution and more stages.
 
 ### Lower priority
 
-11. Sparse/partial and wildcard indexes.
-12. Geospatial or vector indexes.
-13. A published Python package and additional language clients.
-14. Benchmark automation in CI.
-15. A web UI or schema browser.
+12. Sparse/partial and wildcard indexes.
+13. Geospatial or vector indexes.
+14. A published Python package and additional language clients.
+15. Benchmark automation in CI.
+16. A web UI or schema browser.
 
 ## Non-goals
 

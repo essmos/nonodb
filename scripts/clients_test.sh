@@ -66,6 +66,9 @@ echo "== Go client"
   go run ./cmd/smoke
 )
 
+echo "== Dates"
+python3 scripts/dates_test.py
+
 echo "== TTL"
 python3 scripts/ttl_test.py
 

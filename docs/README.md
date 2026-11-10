@@ -11,6 +11,7 @@ quick-start instructions, and a feature overview.
 | [HTTP API](api.md) | All client authors | Operations, request/response formats, filters, updates, aggregation, errors |
 | [Vault collections](vault.md) | Application developers, security reviewers | Optional whole-document encryption, tenant keys, restrictions, operations, key rotation |
 | [Document TTL](ttl.md) | Application developers, operators | Collection defaults, per-document overrides, update semantics, background expiry, limits |
+| [Dates and time zones](dates.md) | Application developers | BSON-compatible dates, RFC 3339 input, filtering, indexes, sorting, timezone semantics |
 | [Clients](clients.md) | Application developers | Python, Rust, Node.js and Go: install, connection, CRUD, batches, indexes, search, aggregation |
 | [Mutual TLS](mtls.md) | Operators, security reviewers | Private CA setup, client certificates, fingerprint allow-list, revocation, rotation, troubleshooting |
 | [Python client](python-client.md) | Python developers | Connection, CRUD, upsert, indexes, search, batches, cache, FastAPI |
@@ -32,6 +33,7 @@ quick-start instructions, and a feature overview.
 - **Set up client certificates:** [Mutual TLS](mtls.md)
 - **Store sensitive tenant data encrypted:** [Vault collections](vault.md)
 - **Expire documents automatically:** [Document TTL](ttl.md)
+- **Filter and index timestamps:** [Dates and time zones](dates.md)
 - **Back up and restore:** [Backup and restore](operations.md#backup-and-restore)
 - **Tune timeouts for index builds:** [Timeouts](operations.md#timeouts-and-long-operations)
 - **Understand memory usage:** [Capacity and memory](operations.md#capacity-and-memory)
