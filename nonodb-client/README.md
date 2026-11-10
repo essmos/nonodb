@@ -30,11 +30,14 @@ TCP/TLS:
 let db = Client::builder()
     .base_url("https://127.0.0.1:7878")
     .token("secret")
+    .ca_cert("/etc/nonodb/ca.crt")
+    .client_cert("/etc/nonodb/client.crt", "/etc/nonodb/client.key")
     .build()?;
 ```
 
-`Client::from_env()` reads `NONODB_SOCK`, `NONODB_URL`, `NONODB_TOKEN`, and
-`NONODB_TLS_VERIFY`. See [docs/clients.md](../docs/clients.md) for the full
+`Client::from_env()` reads `NONODB_SOCK`, `NONODB_URL`, `NONODB_TOKEN`,
+`NONODB_TLS_VERIFY`, `NONODB_TLS_CA`, `NONODB_TLS_CLIENT_CERT`, and
+`NONODB_TLS_CLIENT_KEY`. See [docs/clients.md](../docs/clients.md) for the full
 client guide.
 
 ## Document history

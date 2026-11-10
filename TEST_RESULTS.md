@@ -23,6 +23,7 @@ release build.
 | Live backup and restore, 1M and 8M documents | OK |
 | Docker build and named-volume run | OK |
 | Vault encryption regression suite | OK (profiles, headers, isolation, CRUD, history, rejected ops) |
+| mTLS with all official clients | OK (Python, Rust, Node.js, Go; anonymous and revoked certs rejected) |
 
 ## Representative numbers
 

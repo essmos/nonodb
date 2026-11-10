@@ -28,8 +28,14 @@ const db = new NonoDB({
   baseUrl: 'https://127.0.0.1:7878',
   token: 'secret',
   verify: true,
+  caCert: '/etc/nonodb/ca.crt',
+  clientCert: '/etc/nonodb/client.crt',
+  clientKey: '/etc/nonodb/client.key',
 });
 ```
+
+The same values are read from `NONODB_TLS_CA`, `NONODB_TLS_CLIENT_CERT`, and
+`NONODB_TLS_CLIENT_KEY`.
 
 See [docs/clients.md](../../docs/clients.md) for the full client guide. Run
 `NONODB_SOCK=/run/nonodb.sock node smoke_test.js` against a daemon for an

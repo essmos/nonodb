@@ -28,7 +28,7 @@ nonodb is a real document database with:
   folding and quoted phrases;
 - fuzzy search using trigrams plus Levenshtein distance;
 - a read-only aggregation pipeline for reporting and summaries;
-- snapshots, online backup, authentication, TLS, metrics and a CLI;
+- snapshots, online backup, authentication, TLS/mTLS, metrics and a CLI;
 - document revision history with global revision IDs and configurable retention;
 - optional vault collections with whole-document encryption and per-tenant keys;
 - a bounded daemon read cache, invalidated after every committed write;
@@ -272,7 +272,9 @@ rotation, and best-fit guidance.
 
 - Single daemon; Unix socket by default, optional TCP.
 - Optional bearer-token authentication and Unix peer uid/gid allow-lists.
-- Optional TLS for TCP using rustls.
+- Optional TLS for TCP using rustls, including mutual TLS with client
+  certificate verification and a fingerprint allow-list for immediate
+  revocation.
 - Periodic LMDB snapshots with retention.
 - Online backup with compaction; CLI restore and inspection.
 - JSON metrics endpoint and request/queue/commit counters.
@@ -433,9 +435,10 @@ $env:NONODB_TOKEN = "replace-with-a-long-random-token"
 .\nonodb-cli.exe ping
 ```
 
-The Windows CLI uses plaintext HTTP over TCP. For TLS connections, use the
-Python client with `base_url="https://..."` and a proper certificate. Keep the
-listener on `127.0.0.1` unless you terminate TLS in front of it.
+The Windows CLI uses plaintext HTTP over TCP. For TLS or mTLS connections, use
+one of the official clients (`NONODB_URL=https://...`, `NONODB_TLS_CA`,
+`NONODB_TLS_CLIENT_CERT`, `NONODB_TLS_CLIENT_KEY`). Keep the listener on
+`127.0.0.1` unless you terminate TLS in front of it.
 
 ### Run with Docker
 
@@ -506,6 +509,7 @@ More deployment details: [Operations — Docker](docs/operations.md#docker).
 | [Architecture](docs/architecture.md) | Daemon model, LMDB layout, write path, indexes, search, concurrency, crash safety |
 | [HTTP API](docs/api.md) | Every operation, request/response shapes, filters, updates, indexes, search, errors |
 | [Clients](docs/clients.md) | Python, Rust, Node.js and Go clients: install, CRUD, batches, indexes, search, TCP/TLS |
+| [Mutual TLS](docs/mtls.md) | Client certificate setup, private CA, fingerprint allow-list, revocation, rotation |
 | [Python client](docs/python-client.md) | `NonoDB`/`Collection` API, caching, retries, TCP/TLS, FastAPI usage |
 | [Vault collections](docs/vault.md) | Optional encrypted tenant data, headers, restrictions, key rotation |
 | [CLI](docs/cli.md) | `ping`, `find`, `count`, `backup`, `restore`, `inspect`, `exec` |

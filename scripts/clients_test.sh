@@ -71,4 +71,7 @@ python3 scripts/vault_regression_test.py
 echo "== Vault benchmark smoke"
 python3 scripts/vault_bench.py --docs 1000 --iters 100 --payload 64
 
+echo "== mTLS"
+NONODB_BIN="$BIN" bash scripts/mtls_test.sh
+
 echo "all client smoke tests passed"

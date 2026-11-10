@@ -134,6 +134,7 @@ python3 scripts/upsert_test.py               # upsert and array operators
 python3 scripts/vault_test.py                # optional vault encryption end-to-end
 python3 scripts/vault_regression_test.py     # vault API regressions
 python3 scripts/vault_bench.py --docs 5000   # standard vs vault performance
+bash scripts/mtls_test.sh                    # mTLS, client certs, allow-list revocation
 python3 scripts/search_test.py               # BM25 + fuzzy end-to-end
 python3 scripts/search_variants_test.py      # search/query edge cases
 python3 scripts/compound_test.py             # compound/covering indexes, phrases
@@ -204,6 +205,7 @@ scripts are:
 | `scripts/large_crash_test.sh` | Crash during writes on a large database |
 | `scripts/uvicorn_test.sh` | 12 uvicorn workers against one daemon |
 | `scripts/clients_test.sh` | Rust, Node.js, Go client smoke tests |
+| `scripts/mtls_test.sh` | mTLS with generated CA/certs, all clients, revocation |
 | `scripts/concurrency_test.py` | Independent writers/readers and unique indexes |
 
 Put benchmark data on the target filesystem. If `/tmp` is tmpfs, write

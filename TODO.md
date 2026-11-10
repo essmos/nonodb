@@ -50,7 +50,9 @@ limitations are documented in [docs/roadmap.md](docs/roadmap.md).
 ### P3 — security and durability
 
 - [ ] Per-collection tokens or users/roles
-- [ ] Mutual TLS
+- [x] Mutual TLS with client certificate verification and allow-list revocation
+- [ ] Map certificate identities to authorization scopes
+- [ ] CRL/OCSP or per-client token registry
 - [ ] Point-in-time recovery / WAL
 - [ ] Incremental backups
 - [ ] Encryption-at-rest integration guidance

@@ -108,7 +108,9 @@ Implemented:
   queries, or sorting beyond `_id`.
 - Vault key rotation is an operational re-encryption procedure; the daemon does
   not keep a keyring of old keys.
-- No mutual TLS.
+- Mutual TLS is supported, but revocation is limited to an allow-list of
+  certificate fingerprints; there is no CRL or OCSP integration.
+- Client certificates are not mapped to users, collections, or tenants.
 - Unix peer checks use uid and primary gid only, not supplementary groups.
 - TCP requires a token but is plaintext unless TLS is configured.
 
@@ -160,7 +162,8 @@ project's target workload.
 
 ### Medium value
 
-6. **Users and roles**, or at least per-collection tokens and mTLS.
+6. **Users and roles**, or at least per-collection tokens and mapping mTLS
+   certificate identities to authorization scopes.
 7. **Point-in-time recovery / WAL** for stricter durability and recovery
    objectives.
 8. **Stop words, stemming, and per-index analyzers**; possibly an integration

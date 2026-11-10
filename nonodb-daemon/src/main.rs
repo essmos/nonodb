@@ -10,8 +10,9 @@ mod metrics;
 mod protocol;
 mod writer;
 
+use std::collections::HashMap;
 use std::io::BufReader;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,6 +26,7 @@ use axum::{
 use hyper::server::conn::http1;
 use hyper_util::rt::TokioIo;
 use hyper_util::service::TowerToHyperService;
+use ring::digest::{digest, SHA256};
 use serde_json::{json, Value};
 
 use nonodb_core::heed::RoTxn;
@@ -33,7 +35,9 @@ use nonodb_core::{
 };
 use protocol::{ApiError, ApiResponse, Request, VaultAuth, WriteReq};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio_rustls::rustls::ServerConfig;
+use tokio_rustls::rustls::pki_types::CertificateDer;
+use tokio_rustls::rustls::server::WebPkiClientVerifier;
+use tokio_rustls::rustls::{RootCertStore, ServerConfig};
 use tokio_rustls::TlsAcceptor;
 use writer::WriteJob;
 
@@ -128,6 +132,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         ) {
             (Ok(cert), Ok(key)) => Some(tls_acceptor(&cert, &key)?),
             (Err(_), Err(_)) => {
+                if std::env::var_os("NONODB_TLS_CLIENT_CA").is_some() {
+                    return Err(
+                        "NONODB_TLS_CLIENT_CA wymaga NONODB_TLS_CERT i NONODB_TLS_KEY".into(),
+                    );
+                }
                 tracing::warn!("NONODB_TCP bez TLS (brak NONODB_TLS_CERT/KEY)");
                 None
             }
@@ -208,37 +217,218 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-fn tls_acceptor(cert: &str, key: &str) -> Result<TlsAcceptor, Box<dyn std::error::Error>> {
+#[derive(Clone)]
+struct TlsSetup {
+    acceptor: TlsAcceptor,
+    allowlist: Option<Arc<ClientAllowList>>,
+    client_auth: bool,
+}
+
+/// Optional fingerprint allow-list. The file is re-read for every TLS
+/// handshake, so removing an entry revokes that certificate immediately.
+struct ClientAllowList {
+    path: PathBuf,
+}
+
+impl ClientAllowList {
+    fn load(&self) -> Result<HashMap<[u8; 32], String>, String> {
+        let raw = std::fs::read_to_string(&self.path).map_err(|e| {
+            format!(
+                "nie można odczytać NONODB_TLS_CLIENT_ALLOW {}: {e}",
+                self.path.display()
+            )
+        })?;
+        let mut out = HashMap::new();
+        for (line_no, line) in raw.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let mut parts = line.split_whitespace();
+            let raw_fp = parts.next().ok_or_else(|| {
+                format!("{}:{}: brak fingerprintu", self.path.display(), line_no + 1)
+            })?;
+            let raw_fp = raw_fp.strip_prefix("sha256:").unwrap_or(raw_fp);
+            let hex: String = raw_fp.chars().filter(|c| *c != ':').collect();
+            if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err(format!(
+                    "{}:{}: fingerprint musi mieć 64 znaki hex",
+                    self.path.display(),
+                    line_no + 1
+                ));
+            }
+            let mut fp = [0u8; 32];
+            for (i, byte) in fp.iter_mut().enumerate() {
+                *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
+                    .map_err(|e| format!("{}:{}: {e}", self.path.display(), line_no + 1))?;
+            }
+            let label = parts.collect::<Vec<_>>().join(" ");
+            let label = if label.is_empty() {
+                format!("sha256:{hex}")
+            } else {
+                label
+            };
+            out.insert(fp, label);
+        }
+        Ok(out)
+    }
+
+    fn authorize(&self, cert: &CertificateDer<'_>) -> Result<String, String> {
+        let fingerprint = fingerprint(cert);
+        let clients = self.load()?;
+        clients.get(&fingerprint).cloned().ok_or_else(|| {
+            format!(
+                "fingerprint sha256:{} nie jest na allow-liście",
+                hex(&fingerprint)
+            )
+        })
+    }
+}
+
+fn fingerprint(cert: &CertificateDer<'_>) -> [u8; 32] {
+    let digest = digest(&SHA256, cert.as_ref());
+    let mut out = [0u8; 32];
+    out.copy_from_slice(digest.as_ref());
+    out
+}
+
+fn hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+fn read_client_ca(path: &Path) -> Result<Arc<RootCertStore>, Box<dyn std::error::Error>> {
+    let mut reader = BufReader::new(std::fs::File::open(path)?);
+    let certs = rustls_pemfile::certs(&mut reader).collect::<Result<Vec<_>, _>>()?;
+    if certs.is_empty() {
+        return Err(format!("brak certyfikatów CA w {}", path.display()).into());
+    }
+    let mut roots = RootCertStore::empty();
+    for cert in certs {
+        roots.add(cert)?;
+    }
+    Ok(Arc::new(roots))
+}
+
+fn tls_acceptor(cert: &str, key: &str) -> Result<TlsSetup, Box<dyn std::error::Error>> {
     let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
     let mut cert_reader = BufReader::new(std::fs::File::open(cert)?);
     let certs = rustls_pemfile::certs(&mut cert_reader).collect::<Result<Vec<_>, _>>()?;
     let mut key_reader = BufReader::new(std::fs::File::open(key)?);
     let key = rustls_pemfile::private_key(&mut key_reader)?
         .ok_or("brak klucza prywatnego w NONODB_TLS_KEY")?;
-    let config = ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)?;
-    Ok(TlsAcceptor::from(Arc::new(config)))
+
+    let client_ca = std::env::var("NONODB_TLS_CLIENT_CA")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let auth = std::env::var("NONODB_TLS_CLIENT_AUTH")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| {
+            if client_ca.is_some() {
+                "required".into()
+            } else {
+                "off".into()
+            }
+        })
+        .to_ascii_lowercase();
+    if !matches!(auth.as_str(), "off" | "required" | "optional") {
+        return Err("NONODB_TLS_CLIENT_AUTH musi być: off, required lub optional".into());
+    }
+
+    let allowlist = std::env::var_os("NONODB_TLS_CLIENT_ALLOW")
+        .map(PathBuf::from)
+        .map(|path| Arc::new(ClientAllowList { path }));
+    if allowlist.is_some() && client_ca.is_none() {
+        return Err("NONODB_TLS_CLIENT_ALLOW wymaga NONODB_TLS_CLIENT_CA".into());
+    }
+
+    if client_ca.is_some() && auth == "off" {
+        return Err(
+            "NONODB_TLS_CLIENT_AUTH=off nie może być łączone z NONODB_TLS_CLIENT_CA".into(),
+        );
+    }
+
+    let builder = ServerConfig::builder();
+    let client_auth = client_ca.is_some();
+    let config = if let Some(ca) = client_ca {
+        let roots = read_client_ca(Path::new(&ca))?;
+        let mut verifier = WebPkiClientVerifier::builder(roots);
+        if auth == "optional" {
+            verifier = verifier.allow_unauthenticated();
+        }
+        let verifier = verifier.build()?;
+        builder
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(certs, key)?
+    } else {
+        if auth != "off" {
+            return Err("NONODB_TLS_CLIENT_AUTH wymaga NONODB_TLS_CLIENT_CA".into());
+        }
+        builder.with_no_client_auth().with_single_cert(certs, key)?
+    };
+
+    Ok(TlsSetup {
+        acceptor: TlsAcceptor::from(Arc::new(config)),
+        allowlist,
+        client_auth,
+    })
 }
 
 async fn serve_tcp(
     addr: &str,
-    tls: Option<TlsAcceptor>,
+    tls: Option<TlsSetup>,
     app: Router,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!(%addr, tls = tls.is_some(), "TCP listener");
+    tracing::info!(
+        %addr,
+        tls = tls.is_some(),
+        mtls = tls.as_ref().is_some_and(|t| t.client_auth),
+        allowlist = tls.as_ref().is_some_and(|t| t.allowlist.is_some()),
+        "TCP listener"
+    );
     loop {
         let (stream, peer) = listener.accept().await?;
         let app = app.clone();
         let tls = tls.clone();
         tokio::spawn(async move {
-            match tls {
-                Some(acceptor) => match acceptor.accept(stream).await {
-                    Ok(stream) => serve_stream(stream, app).await,
-                    Err(e) => tracing::debug!(?e, %peer, "TLS handshake failed"),
-                },
-                None => serve_stream(stream, app).await,
+            let Some(tls) = tls else {
+                serve_stream(stream, app).await;
+                return;
+            };
+            match tls.acceptor.accept(stream).await {
+                Ok(stream) => {
+                    if let Some(allowlist) = &tls.allowlist {
+                        let cert = stream
+                            .get_ref()
+                            .1
+                            .peer_certificates()
+                            .and_then(|certs| certs.first())
+                            .cloned();
+                        match cert {
+                            Some(cert) => match allowlist.authorize(&cert) {
+                                Ok(client) => {
+                                    tracing::debug!(%peer, %client, "mTLS client accepted");
+                                }
+                                Err(reason) => {
+                                    tracing::warn!(%peer, %reason, "mTLS client rejected");
+                                    return;
+                                }
+                            },
+                            None => {
+                                tracing::warn!(%peer, "mTLS client rejected: brak certyfikatu");
+                                return;
+                            }
+                        }
+                    }
+                    serve_stream(stream, app).await;
+                }
+                Err(e) => tracing::debug!(?e, %peer, "TLS handshake failed"),
             }
         });
     }

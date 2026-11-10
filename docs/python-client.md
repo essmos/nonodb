@@ -58,6 +58,25 @@ db = NonoDB(base_url="https://127.0.0.1:7878", token="secret", verify=False)
 `NONODB_TLS_VERIFY=0` (or `false`/`no`) has the same effect. Do not disable
 verification in production.
 
+### Mutual TLS
+
+Pass a client certificate and key when the daemon requires mTLS. `ca_cert`
+overrides the CA bundle used to verify the daemon certificate.
+
+```python
+db = NonoDB(
+    base_url="https://db.internal:7878",
+    token="secret",
+    ca_cert="/etc/nonodb/ca.crt",
+    client_cert="/etc/nonodb/client.crt",
+    client_key="/etc/nonodb/client.key",
+)
+```
+
+The environment fallbacks are `NONODB_TLS_CA`, `NONODB_TLS_CLIENT_CERT`, and
+`NONODB_TLS_CLIENT_KEY`. The certificate and key must both be provided. See
+[Mutual TLS](mtls.md) for CA generation, server setup, and revocation.
+
 ### Timeouts
 
 The default request timeout is 10 seconds. It can be set per client or through

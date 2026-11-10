@@ -4,8 +4,9 @@
 that talk to the daemon use the Unix socket (`NONODB_SOCK`, default
 `/run/nonodb.sock`) and the optional bearer token (`NONODB_TOKEN`). On Windows,
 daemon-facing commands use plaintext HTTP over TCP (`NONODB_URL`, default
-`http://127.0.0.1:7878`). File commands (`backup`, `inspect`, `restore`) operate
-directly on an LMDB data directory on every platform.
+`http://127.0.0.1:7878`). The CLI does not support TLS or mTLS; use an official
+client for encrypted connections. File commands (`backup`, `inspect`, `restore`)
+operate directly on an LMDB data directory on every platform.
 
 ```bash
 nonodb-cli <command> [arguments]

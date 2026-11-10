@@ -19,6 +19,7 @@
 //! ```
 
 use std::fmt;
+use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -85,6 +86,9 @@ pub struct ClientBuilder {
     token: Option<String>,
     timeout: Option<Duration>,
     verify: Option<bool>,
+    client_cert: Option<PathBuf>,
+    client_key: Option<PathBuf>,
+    ca_cert: Option<PathBuf>,
 }
 
 impl ClientBuilder {
@@ -117,6 +121,26 @@ impl ClientBuilder {
     /// Verify TLS certificates. Defaults to `NONODB_TLS_VERIFY` (enabled).
     pub fn verify(mut self, verify: bool) -> Self {
         self.verify = Some(verify);
+        self
+    }
+
+    /// Client certificate and private key for mutual TLS.
+    ///
+    /// Defaults to `NONODB_TLS_CLIENT_CERT` and `NONODB_TLS_CLIENT_KEY`.
+    pub fn client_cert(
+        mut self,
+        cert_path: impl Into<PathBuf>,
+        key_path: impl Into<PathBuf>,
+    ) -> Self {
+        self.client_cert = Some(cert_path.into());
+        self.client_key = Some(key_path.into());
+        self
+    }
+
+    /// Custom CA certificate for verifying the daemon or client certificates.
+    /// Defaults to `NONODB_TLS_CA`.
+    pub fn ca_cert(mut self, path: impl Into<PathBuf>) -> Self {
+        self.ca_cert = Some(path.into());
         self
     }
 
@@ -163,9 +187,44 @@ impl ClientBuilder {
             .or_else(|| std::env::var("NONODB_TOKEN").ok())
             .filter(|value| !value.is_empty());
 
-        let builder = reqwest::blocking::Client::builder()
+        let client_cert = self
+            .client_cert
+            .or_else(|| std::env::var_os("NONODB_TLS_CLIENT_CERT").map(PathBuf::from));
+        let client_key = self
+            .client_key
+            .or_else(|| std::env::var_os("NONODB_TLS_CLIENT_KEY").map(PathBuf::from));
+        let ca_cert = self
+            .ca_cert
+            .or_else(|| std::env::var_os("NONODB_TLS_CA").map(PathBuf::from));
+
+        let mut builder = reqwest::blocking::Client::builder()
             .timeout(timeout)
             .danger_accept_invalid_certs(!verify);
+        if let Some(path) = ca_cert {
+            let pem = fs::read(&path)
+                .map_err(|e| Error::Config(format!("cannot read {}: {e}", path.display())))?;
+            let cert = reqwest::Certificate::from_pem(&pem)?;
+            builder = builder.add_root_certificate(cert);
+        }
+        match (client_cert, client_key) {
+            (Some(cert), Some(key)) => {
+                let mut pem = fs::read(&cert)
+                    .map_err(|e| Error::Config(format!("cannot read {}: {e}", cert.display())))?;
+                pem.push(b'\n');
+                pem.extend(
+                    fs::read(&key).map_err(|e| {
+                        Error::Config(format!("cannot read {}: {e}", key.display()))
+                    })?,
+                );
+                builder = builder.identity(reqwest::Identity::from_pem(&pem)?);
+            }
+            (None, None) => {}
+            _ => {
+                return Err(Error::Config(
+                    "client_cert and client_key must be provided together".into(),
+                ))
+            }
+        }
 
         #[cfg(unix)]
         let builder = if !base_url_given && std::env::var_os("NONODB_URL").is_none() {

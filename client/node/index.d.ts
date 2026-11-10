@@ -6,6 +6,9 @@ export interface ClientOptions {
   token?: string;
   timeoutMs?: number;
   verify?: boolean;
+  clientCert?: string;
+  clientKey?: string;
+  caCert?: string;
 }
 
 export interface FindOptions {

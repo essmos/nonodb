@@ -1,5 +1,6 @@
 'use strict';
 
+const fs = require('node:fs');
 const http = require('node:http');
 const https = require('node:https');
 
@@ -51,6 +52,13 @@ class NonoDB {
     this.timeoutMs = options.timeoutMs ?? envTimeoutMs();
     this.verify = options.verify ?? envVerify();
     this.vaultHeaders = options.vaultHeaders ?? null;
+    this.clientCert = options.clientCert ?? process.env.NONODB_TLS_CLIENT_CERT;
+    this.clientKey = options.clientKey ?? process.env.NONODB_TLS_CLIENT_KEY;
+    this.caCert = options.caCert ?? process.env.NONODB_TLS_CA;
+    if (!!this.clientCert !== !!this.clientKey) {
+      throw new Error('NONODB_TLS_CLIENT_CERT and NONODB_TLS_CLIENT_KEY must be set together');
+    }
+    this.tlsData = null;
 
     const baseUrl = options.baseUrl ?? (options.socketPath ? undefined : process.env.NONODB_URL);
     if (baseUrl) {
@@ -138,6 +146,15 @@ class NonoDB {
       options.hostname = url.hostname;
       options.port = url.port || (useTls ? 443 : 80);
       options.rejectUnauthorized = this.verify;
+      if (useTls) {
+        if (this.tlsData === null) {
+          this.tlsData = {};
+          if (this.clientCert) this.tlsData.cert = fs.readFileSync(this.clientCert);
+          if (this.clientKey) this.tlsData.key = fs.readFileSync(this.clientKey);
+          if (this.caCert) this.tlsData.ca = fs.readFileSync(this.caCert);
+        }
+        Object.assign(options, this.tlsData);
+      }
     }
 
     return new Promise((resolve, reject) => {

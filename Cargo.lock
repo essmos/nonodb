@@ -1063,6 +1063,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "nonodb-core",
+ "ring",
  "rustls-pemfile",
  "serde",
  "serde_json",

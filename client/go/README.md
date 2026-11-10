@@ -20,8 +20,13 @@ db := nonodb.New(
     nonodb.WithBaseURL("https://127.0.0.1:7878"),
     nonodb.WithToken("secret"),
     nonodb.WithTLSVerify(true),
+    nonodb.WithTLSCA("/etc/nonodb/ca.crt"),
+    nonodb.WithTLSClientCert("/etc/nonodb/client.crt", "/etc/nonodb/client.key"),
 )
 ```
+
+The same values are read from `NONODB_TLS_CA`, `NONODB_TLS_CLIENT_CERT`, and
+`NONODB_TLS_CLIENT_KEY`.
 
 See [docs/clients.md](../../docs/clients.md) for the full client guide. Run
 `NONODB_SOCK=/run/nonodb.sock go run ./cmd/smoke` against a daemon for an

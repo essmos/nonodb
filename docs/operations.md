@@ -55,6 +55,9 @@ All daemon configuration is through environment variables.
 | `NONODB_TCP` | — | TCP listen address, e.g. `127.0.0.1:7878` |
 | `NONODB_TLS_CERT` | — | PEM certificate chain for TCP TLS |
 | `NONODB_TLS_KEY` | — | PEM private key for TCP TLS |
+| `NONODB_TLS_CLIENT_CA` | — | PEM CA bundle used to verify client certificates (mTLS) |
+| `NONODB_TLS_CLIENT_AUTH` | `required` when client CA is set | `required`, `optional`, or `off` |
+| `NONODB_TLS_CLIENT_ALLOW` | — | Optional client certificate fingerprint allow-list; re-read on every handshake |
 | `NONODB_SNAPSHOT_DIR` | — | Enables periodic LMDB snapshots in this directory |
 | `NONODB_SNAPSHOT_INTERVAL` | `300` | Snapshot interval in seconds |
 | `NONODB_SNAPSHOT_KEEP` | `24` | Number of snapshot files to retain |
@@ -69,6 +72,9 @@ Client-side environment variables:
 | `NONODB_TOKEN` | — | Bearer token used by the Python client and CLI |
 | `NONODB_TIMEOUT` | `10` | Client request timeout in seconds |
 | `NONODB_TLS_VERIFY` | `1` | Set to `0`/`false`/`no` to disable certificate verification |
+| `NONODB_TLS_CA` | — | Custom CA bundle for verifying the daemon certificate |
+| `NONODB_TLS_CLIENT_CERT` | — | Client certificate for mTLS |
+| `NONODB_TLS_CLIENT_KEY` | — | Private key for `NONODB_TLS_CLIENT_CERT` |
 
 `NONODB_MAP_SIZE` controls the maximum size of the memory-mapped database. It
 is **not** a disk or RAM reservation. The file grows as data is written. If the
@@ -398,7 +404,16 @@ export NONODB_TLS_KEY=/etc/nonodb/server.key
 - If both certificate and key are provided, TLS is enabled using rustls.
 - If neither is provided, TCP runs in plaintext and logs a warning.
 - Providing only one of cert/key is a startup error.
-- There is no mutual TLS and no certificate-based client identity.
+- Mutual TLS is optional. Set `NONODB_TLS_CLIENT_CA` to enable client
+  certificate verification; it defaults to `required` mode.
+- `NONODB_TLS_CLIENT_AUTH=optional` accepts both authenticated and anonymous
+  clients. Use `required` for mTLS-only access.
+- Set `NONODB_TLS_CLIENT_ALLOW` to an allow-list file to revoke individual
+  client certificates immediately. The file is re-read for every TLS handshake,
+  so removing a fingerprint blocks new connections without restarting the
+  daemon. Existing keep-alive connections remain until they close.
+- There is still no CRL/OCSP integration. Revocation is handled by the
+  fingerprint allow-list or short-lived certificates.
 
 Client:
 
@@ -414,6 +429,87 @@ db = NonoDB(
 
 Certificate verification is enabled by default. Disable it only for local
 testing.
+
+### Mutual TLS
+
+For a complete setup guide, certificate generation, rotation, and
+troubleshooting, see [Mutual TLS](mtls.md).
+
+Server:
+
+```bash
+export NONODB_TLS_CLIENT_CA=/etc/nonodb/client-ca.crt
+export NONODB_TLS_CLIENT_AUTH=required
+export NONODB_TLS_CLIENT_ALLOW=/etc/nonodb/allowed-clients.txt
+```
+
+`allowed-clients.txt` contains one fingerprint per line, optionally followed by
+a label:
+
+```text
+# sha256 fingerprint                         label
+sha256:ab12...  client:acme-app
+sha256:cd34...  client:reporting
+```
+
+The fingerprint is the SHA-256 of the DER-encoded leaf certificate:
+
+```bash
+openssl x509 -in client.crt -outform DER | sha256sum
+```
+
+Python client:
+
+```python
+db = NonoDB(
+    base_url="https://db.internal:7878",
+    token="long-random-token",
+    ca_cert="/etc/nonodb/client-ca.crt",
+    client_cert="/etc/nonodb/client.crt",
+    client_key="/etc/nonodb/client.key",
+)
+```
+
+Rust:
+
+```rust
+let db = Client::builder()
+    .base_url("https://db.internal:7878")
+    .token("long-random-token")
+    .ca_cert("/etc/nonodb/client-ca.crt")
+    .client_cert("/etc/nonodb/client.crt", "/etc/nonodb/client.key")
+    .build()?;
+```
+
+Node.js:
+
+```js
+const db = new NonoDB({
+  baseUrl: 'https://db.internal:7878',
+  token: 'long-random-token',
+  caCert: '/etc/nonodb/client-ca.crt',
+  clientCert: '/etc/nonodb/client.crt',
+  clientKey: '/etc/nonodb/client.key',
+});
+```
+
+Go:
+
+```go
+db := nonodb.New(
+    nonodb.WithBaseURL("https://db.internal:7878"),
+    nonodb.WithToken("long-random-token"),
+    nonodb.WithTLSCA("/etc/nonodb/client-ca.crt"),
+    nonodb.WithTLSClientCert("/etc/nonodb/client.crt", "/etc/nonodb/client.key"),
+)
+```
+
+The same values can be supplied through `NONODB_TLS_CA`,
+`NONODB_TLS_CLIENT_CERT`, and `NONODB_TLS_CLIENT_KEY`.
+
+For local testing, `scripts/mtls_test.sh` generates a throwaway CA, server
+certificate, client certificate, and allow-list, then runs all official clients
+against a daemon with required mTLS.
 
 ## Snapshots
 
@@ -625,6 +721,8 @@ backups.
 | High RSS after a scan | Mapped pages touched | Expected; restart lowers RSS, OS cache remains |
 | Disk usage does not fall after delete | LMDB high-water mark | Compact via `nonodb-cli backup`, restore |
 | TLS handshake fails | Certificate/key mismatch or verification | Check PEM files, hostname, `verify` setting |
+| mTLS client rejected | Missing client cert, untrusted chain, or fingerprint not allow-listed | Check `NONODB_TLS_CLIENT_CA`, client cert/key, and `NONODB_TLS_CLIENT_ALLOW` |
+| Revoked client still connects | Existing keep-alive connection | Close the connection or restart the client; new handshakes are blocked |
 | TCP listener refuses to start | No auth token | Set `NONODB_AUTH_TOKEN` |
 
 ## Security checklist

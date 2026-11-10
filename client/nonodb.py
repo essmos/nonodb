@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import ssl
 import threading
 import time
 from typing import Any, Iterable, Optional
@@ -80,6 +81,9 @@ class NonoDB:
         token: Optional[str] = None,
         base_url: Optional[str] = None,
         verify: Optional[bool] = None,
+        client_cert: Optional[str] = None,
+        client_key: Optional[str] = None,
+        ca_cert: Optional[str] = None,
     ):
         if base_url is None:
             if socket_path is None:
@@ -95,11 +99,30 @@ class NonoDB:
             timeout = float(os.environ.get("NONODB_TIMEOUT", "10"))
         if verify is None:
             verify = os.environ.get("NONODB_TLS_VERIFY", "1") not in ("0", "false", "no")
+        client_cert = client_cert or os.environ.get("NONODB_TLS_CLIENT_CERT")
+        client_key = client_key or os.environ.get("NONODB_TLS_CLIENT_KEY")
+        ca_cert = ca_cert or os.environ.get("NONODB_TLS_CA")
+        if bool(client_cert) != bool(client_key):
+            raise ValueError("client_cert and client_key must be provided together")
+        tls_verify = ca_cert if ca_cert else verify
+        # httpx 0.28 returns early when `verify` is a CA path and then does not
+        # load `cert`. Build the SSL context explicitly so mTLS works reliably.
+        if transport is None and (client_cert or ca_cert):
+            if verify is False:
+                tls_verify = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                tls_verify.check_hostname = False
+                tls_verify.verify_mode = ssl.CERT_NONE
+            elif ca_cert:
+                tls_verify = ssl.create_default_context(cafile=ca_cert)
+            else:
+                tls_verify = ssl.create_default_context()
+            if client_cert:
+                tls_verify.load_cert_chain(client_cert, client_key)
         self._http = httpx.Client(
             transport=transport,
             base_url=self.base_url,
             timeout=timeout,
-            verify=verify if transport is None else True,
+            verify=tls_verify if transport is None else True,
         )
         # Optional read cache. Disabled by default (cache_ttl=0).
         # TTL bounds staleness for data written by other processes;

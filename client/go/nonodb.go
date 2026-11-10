@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -99,6 +100,9 @@ type config struct {
 	token      string
 	timeout    time.Duration
 	verify     bool
+	clientCert string
+	clientKey  string
+	caCert     string
 }
 
 // Option configures a Client.
@@ -130,6 +134,19 @@ func WithTLSVerify(verify bool) Option {
 	return func(c *config) { c.verify = verify }
 }
 
+// WithTLSClientCert configures a client certificate and key for mutual TLS.
+func WithTLSClientCert(certFile, keyFile string) Option {
+	return func(c *config) {
+		c.clientCert = certFile
+		c.clientKey = keyFile
+	}
+}
+
+// WithTLSCA configures a custom CA bundle for server and client validation.
+func WithTLSCA(caFile string) Option {
+	return func(c *config) { c.caCert = caFile }
+}
+
 // Client is a thin nonodb client. It is safe for concurrent use.
 type Client struct {
 	baseURL     string
@@ -138,6 +155,7 @@ type Client struct {
 	vaultKeyID  string
 	vaultKey    string
 	http        *http.Client
+	initErr     error
 }
 
 // New creates a client. Defaults come from NONODB_SOCK, NONODB_URL,
@@ -149,14 +167,42 @@ func New(options ...Option) *Client {
 		token:      os.Getenv("NONODB_TOKEN"),
 		timeout:    envTimeout(),
 		verify:     envVerify(),
+		clientCert: os.Getenv("NONODB_TLS_CLIENT_CERT"),
+		clientKey:  os.Getenv("NONODB_TLS_CLIENT_KEY"),
+		caCert:     os.Getenv("NONODB_TLS_CA"),
 	}
 	for _, option := range options {
 		option(&cfg)
 	}
 
-	transport := &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: !cfg.verify}, //nolint:gosec
+	tlsConfig := &tls.Config{InsecureSkipVerify: !cfg.verify} //nolint:gosec
+	var initErr error
+	if cfg.caCert != "" {
+		pem, err := os.ReadFile(cfg.caCert)
+		if err != nil {
+			initErr = fmt.Errorf("nonodb: read TLS CA %s: %w", cfg.caCert, err)
+		} else {
+			roots := x509.NewCertPool()
+			if !roots.AppendCertsFromPEM(pem) {
+				initErr = fmt.Errorf("nonodb: no certificates in TLS CA %s", cfg.caCert)
+			} else {
+				tlsConfig.RootCAs = roots
+			}
+		}
 	}
+	if cfg.clientCert != "" || cfg.clientKey != "" {
+		if cfg.clientCert == "" || cfg.clientKey == "" {
+			initErr = errors.New("nonodb: TLS client certificate and key must be set together")
+		} else {
+			pair, err := tls.LoadX509KeyPair(cfg.clientCert, cfg.clientKey)
+			if err != nil {
+				initErr = fmt.Errorf("nonodb: load TLS client certificate: %w", err)
+			} else {
+				tlsConfig.Certificates = []tls.Certificate{pair}
+			}
+		}
+	}
+	transport := &http.Transport{TLSClientConfig: tlsConfig}
 	baseURL := cfg.baseURL
 	if baseURL == "" {
 		if cfg.socketPath == "" {
@@ -183,6 +229,7 @@ func New(options ...Option) *Client {
 			Transport: transport,
 			Timeout:   cfg.timeout,
 		},
+		initErr: initErr,
 	}
 }
 
@@ -209,6 +256,9 @@ func envVerify() bool {
 
 // Health checks GET /healthz.
 func (c *Client) Health(ctx context.Context) bool {
+	if c.initErr != nil {
+		return false
+	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/healthz", nil)
 	if err != nil {
 		return false
@@ -232,6 +282,9 @@ func (c *Client) Exec(ctx context.Context, payload map[string]any) (any, error) 
 }
 
 func (c *Client) execRaw(ctx context.Context, payload map[string]any) (json.RawMessage, error) {
+	if c.initErr != nil {
+		return nil, c.initErr
+	}
 	attempts := 1
 	if isReadOp(payload) {
 		attempts = 3

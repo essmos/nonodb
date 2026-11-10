@@ -5,12 +5,12 @@ speak the same HTTP/JSON API and keep no state beyond one HTTP connection. The
 daemon remains responsible for queries, indexes, updates, search, and
 transactions.
 
-| Language | Location | Style | Unix socket | TCP/TLS |
-|---|---|---|---|---|
-| Python | [`client/nonodb.py`](../client/nonodb.py) | sync | yes | yes |
-| Rust | [`nonodb-client`](../nonodb-client) | sync | yes (Unix) | yes |
-| Node.js | [`client/node`](../client/node) | async / Promise | yes (Unix) | yes |
-| Go | [`client/go`](../client/go) | context-aware | yes (Unix) | yes |
+| Language | Location | Style | Unix socket | TCP/TLS | mTLS |
+|---|---|---|---|---|---|
+| Python | [`client/nonodb.py`](../client/nonodb.py) | sync | yes | yes | yes |
+| Rust | [`nonodb-client`](../nonodb-client) | sync | yes (Unix) | yes | yes |
+| Node.js | [`client/node`](../client/node) | async / Promise | yes (Unix) | yes | yes |
+| Go | [`client/go`](../client/go) | context-aware | yes (Unix) | yes | yes |
 
 ## Common configuration
 
@@ -22,8 +22,20 @@ export NONODB_SOCK=/run/nonodb.sock   # default Unix socket
 export NONODB_TOKEN='...'             # required if auth is enabled
 # or:
 export NONODB_URL=https://127.0.0.1:7878
-export NONODB_TLS_VERIFY=0            # only for self-signed development certs
+export NONODB_TLS_CA=/etc/nonodb/ca.crt
+export NONODB_TLS_VERIFY=1
 ```
+
+Mutual TLS uses the same three variables in every client:
+
+```bash
+export NONODB_TLS_CLIENT_CERT=/etc/nonodb/client.crt
+export NONODB_TLS_CLIENT_KEY=/etc/nonodb/client.key
+```
+
+`NONODB_TLS_VERIFY=0` disables certificate verification and must only be used
+for local development. See [Mutual TLS](mtls.md) for a complete mTLS setup,
+revocation, and rotation guide.
 
 Windows has no Unix socket listener in the daemon. Use a base URL and TCP there.
 `NONODB_TOKEN` is required because TCP always requires a bearer token.
@@ -87,7 +99,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 The Rust client exposes `exec`, `batch`, `write_batch`, `get_many`, history,
 aggregation, indexes, text search, and fuzzy search. `Client::from_env()` reads `NONODB_SOCK`,
-`NONODB_URL`, `NONODB_TOKEN`, and `NONODB_TLS_VERIFY`.
+`NONODB_URL`, `NONODB_TOKEN`, `NONODB_TLS_VERIFY`, `NONODB_TLS_CA`,
+`NONODB_TLS_CLIENT_CERT`, and `NONODB_TLS_CLIENT_KEY`. For mTLS:
+
+```rust
+let db = Client::builder()
+    .base_url("https://127.0.0.1:7878")
+    .ca_cert("/etc/nonodb/ca.crt")
+    .client_cert("/etc/nonodb/client.crt", "/etc/nonodb/client.key")
+    .build()?;
+```
 
 ## Node.js
 
@@ -117,13 +138,16 @@ async function main() {
 main().catch(console.error);
 ```
 
-For TCP/TLS:
+For TCP/TLS or mTLS:
 
 ```js
 const db = new NonoDB({
   baseUrl: 'https://127.0.0.1:7878',
   token: 'secret',
   verify: true,
+  caCert: '/etc/nonodb/ca.crt',
+  clientCert: '/etc/nonodb/client.crt',
+  clientKey: '/etc/nonodb/client.key',
 });
 ```
 
@@ -164,13 +188,15 @@ func main() {
 }
 ```
 
-TCP/TLS:
+TCP/TLS or mTLS:
 
 ```go
 db := nonodb.New(
     nonodb.WithBaseURL("https://127.0.0.1:7878"),
     nonodb.WithToken("secret"),
     nonodb.WithTLSVerify(true),
+    nonodb.WithTLSCA("/etc/nonodb/ca.crt"),
+    nonodb.WithTLSClientCert("/etc/nonodb/client.crt", "/etc/nonodb/client.key"),
 )
 ```
 
