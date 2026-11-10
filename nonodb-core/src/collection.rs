@@ -1277,9 +1277,11 @@ impl<'e> Collection<'e> {
 
     /// Runs a read-only aggregation pipeline over this collection.
     ///
-    /// A leading `$match` is pushed into the normal find path so indexes and
-    /// `_id` ranges can be used. Intermediate results are capped by
-    /// [`aggregate::MAX_AGGREGATE_DOCS`].
+    /// A safe prefix (`$match`, `$sort`, `$skip`, `$limit`, simple `$project`)
+    /// is pushed into the normal find path so indexes, `_id` ranges, covering
+    /// projections, and query-level TopK can be used. A lone `$count` becomes a
+    /// `count` call instead of materializing documents. Intermediate results
+    /// are capped by [`aggregate::MAX_AGGREGATE_DOCS`].
     pub fn aggregate(&self, pipeline: &[Value]) -> Result<Vec<Value>> {
         let rtxn = self.read_txn()?;
         let out = self.aggregate_in(&rtxn, pipeline);
@@ -1288,18 +1290,29 @@ impl<'e> Collection<'e> {
     }
 
     pub fn aggregate_in(&self, rtxn: &RoTxn<'_>, pipeline: &[Value]) -> Result<Vec<Value>> {
-        let (filter, remaining) = match pipeline.first() {
-            Some(Value::Object(stage)) if stage.len() == 1 && stage.contains_key("$match") => {
-                (stage["$match"].clone(), &pipeline[1..])
+        let plan = aggregate::pushdown(pipeline)?;
+
+        if let Some(field) = plan.count {
+            let count = self.count_in(rtxn, &plan.filter)?;
+            if count == 0 {
+                return Ok(Vec::new());
             }
-            _ => (Value::Null, pipeline),
-        };
+            return Ok(vec![Value::Object(Map::from_iter([(
+                field,
+                Value::from(count as u64),
+            )]))]);
+        }
+
+        let limit = plan
+            .limit
+            .map(|n| n.min(aggregate::MAX_AGGREGATE_DOCS.saturating_add(1)))
+            .unwrap_or_else(|| aggregate::MAX_AGGREGATE_DOCS.saturating_add(1));
         let query = FindQuery {
-            filter,
-            projection: None,
-            sort: Vec::new(),
-            skip: 0,
-            limit: Some(aggregate::MAX_AGGREGATE_DOCS.saturating_add(1)),
+            filter: plan.filter,
+            projection: plan.projection,
+            sort: plan.sort,
+            skip: plan.skip,
+            limit: Some(limit),
         };
         let docs = self.find_in(rtxn, &query)?;
         if docs.len() > aggregate::MAX_AGGREGATE_DOCS {
@@ -1308,7 +1321,7 @@ impl<'e> Collection<'e> {
                 aggregate::MAX_AGGREGATE_DOCS
             )));
         }
-        aggregate::run(docs, remaining, aggregate::MAX_AGGREGATE_DOCS)
+        aggregate::run(docs, &pipeline[plan.next..], aggregate::MAX_AGGREGATE_DOCS)
     }
 
     pub fn find(&self, query: &FindQuery) -> Result<Vec<Value>> {
@@ -3578,6 +3591,48 @@ mod tests {
             .aggregate(&[json!({"$unwind": "$tags"}), json!({"$count": "rows"})])
             .unwrap();
         assert_eq!(out, vec![json!({"rows": 3})]);
+    }
+
+    #[test]
+    fn aggregate_pushdown_preserves_stage_order() {
+        let (_dir, store) = store();
+        let c = store.collection("pushdown").unwrap();
+        c.insert_one(json!({"_id": "a", "amount": 30, "keep": true}))
+            .unwrap();
+        c.insert_one(json!({"_id": "b", "amount": 10, "keep": false}))
+            .unwrap();
+        c.insert_one(json!({"_id": "c", "amount": 20, "keep": true}))
+            .unwrap();
+
+        // `$limit` before `$sort`: sort only the first two documents.
+        let out = c
+            .aggregate(&[json!({"$limit": 2}), json!({"$sort": {"amount": -1}})])
+            .unwrap();
+        let amounts: Vec<_> = out.iter().map(|d| d["amount"].as_i64().unwrap()).collect();
+        assert_eq!(amounts, vec![30, 10]);
+
+        // `$sort`, `$skip`, `$limit` and a simple `$project` can move together.
+        let out = c
+            .aggregate(&[
+                json!({"$sort": {"amount": -1}}),
+                json!({"$skip": 1}),
+                json!({"$limit": 1}),
+                json!({"$project": {"_id": 0, "amount": 1}}),
+            ])
+            .unwrap();
+        assert_eq!(out, vec![json!({"amount": 20})]);
+
+        // A lone `$count` after `$match` uses the count fast path.
+        let out = c
+            .aggregate(&[json!({"$match": {"keep": true}}), json!({"$count": "rows"})])
+            .unwrap();
+        assert_eq!(out, vec![json!({"rows": 2})]);
+
+        // `{_id: 1}` must not be pushed into `find`, which treats it as an
+        // exclusion projection. Aggregation returns only `_id`.
+        let out = c.aggregate(&[json!({"$project": {"_id": 1}})]).unwrap();
+        assert_eq!(out.len(), 3);
+        assert!(out.iter().all(|d| d.as_object().unwrap().len() == 1));
     }
 }
 

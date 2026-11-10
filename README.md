@@ -170,7 +170,8 @@ footprint.
 - Accumulators: `$sum`, `$avg`, `$min`, `$max`, `$first`, `$last`, `$push`,
   `$addToSet`, and `$count`.
 - A leading `$match` uses the normal query planner, including secondary indexes
-  and `_id` ranges.
+  and `_id` ranges. `$sort`+`$limit`, `$skip`, `$limit`, simple `$project`, and
+  a lone `$count` are also pushed into the query path where semantics allow.
 - Expressions support field references (`"$field"`), `$$ROOT`, `$literal`,
   `$ifNull`, arithmetic, `$concat`, `$cond`, and comparison operators.
 
@@ -189,7 +190,9 @@ curl -s --unix-socket /tmp/nonodb.sock \
 Aggregation is intentionally bounded: an intermediate result may contain at
 most 100,000 documents. It never writes to the database and is available inside
 the read-only `batch` operation. See
-[Aggregation](docs/api.md#aggregation) for the full stage list and semantics.
+[Aggregation](docs/api.md#aggregation) for the full stage list and semantics,
+and [benchmarks](docs/benchmarks.md#aggregation-pipeline) for stage timings and
+optimization notes.
 
 ### Document history
 

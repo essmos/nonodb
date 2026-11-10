@@ -405,7 +405,12 @@ in the read-only `batch` operation. A missing collection produces an empty
 | `$count` | Replace the stream with one document containing the row count |
 
 A leading `$match` is pushed into the normal read path, so indexes and `_id`
-ranges can be used before the remaining pipeline runs.
+ranges can be used before the remaining pipeline runs. The daemon also pushes
+a contiguous prefix of `$sort`+`$skip`/`$limit`, simple `$project`, and `$skip`
+into the query planner when stage order makes that safe. A lone `$count` after
+`$match` is executed as a `count` instead of materializing documents.
+`$sort` without a following `$limit` stays in the in-memory path, where the
+plain sort is cheaper than a full-size TopK heap.
 
 ### Expressions
 

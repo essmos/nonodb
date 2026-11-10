@@ -16,6 +16,120 @@ use crate::query::{matches, path};
 /// Maximum number of documents allowed in an intermediate aggregation result.
 pub const MAX_AGGREGATE_DOCS: usize = 100_000;
 
+/// Parts of a pipeline that can be pushed into the normal `find_in` path.
+#[derive(Debug, Default)]
+pub(crate) struct Pushdown {
+    pub(crate) filter: Value,
+    pub(crate) sort: Vec<(String, i32)>,
+    pub(crate) skip: usize,
+    pub(crate) limit: Option<usize>,
+    pub(crate) projection: Option<Value>,
+    pub(crate) count: Option<String>,
+    pub(crate) next: usize,
+}
+
+/// Extracts a safe prefix of the pipeline for the query planner.
+///
+/// This only moves stages that have exactly the same semantics before and
+/// after the move. The remaining stages are still executed by [`run`].
+pub(crate) fn pushdown(pipeline: &[Value]) -> Result<Pushdown> {
+    let mut plan = Pushdown::default();
+    let mut i = 0;
+
+    if let Some(("$match", arg)) = stage_at(pipeline, i) {
+        plan.filter = arg.clone();
+        i += 1;
+    }
+
+    // `$count` is especially cheap when it is the only remaining stage.
+    if let Some(("$count", arg)) = stage_at(pipeline, i) {
+        if i + 1 == pipeline.len() {
+            plan.count = Some(count_field_name(arg)?);
+            plan.next = i + 1;
+            return Ok(plan);
+        }
+    }
+
+    if let Some(("$sort", arg)) = stage_at(pipeline, i) {
+        // `find_in` uses a bounded TopK. That is a win only when a later
+        // `$limit` keeps the heap small. With no limit, the plain in-memory
+        // `sort_by` used by `run` is faster than a full-size heap.
+        let mut next = i + 1;
+        if matches!(stage_at(pipeline, next), Some(("$skip", _))) {
+            next += 1;
+        }
+        if matches!(stage_at(pipeline, next), Some(("$limit", _))) {
+            plan.sort = parse_sort(arg)?;
+            i += 1;
+        }
+    }
+    if let Some(("$skip", arg)) = stage_at(pipeline, i) {
+        plan.skip = as_usize(arg, "$skip")?;
+        i += 1;
+    }
+    if let Some(("$limit", arg)) = stage_at(pipeline, i) {
+        plan.limit = Some(as_usize(arg, "$limit")?);
+        i += 1;
+    }
+    if let Some(("$project", arg)) = stage_at(pipeline, i) {
+        if let Some(projection) = simple_projection(arg) {
+            plan.projection = Some(projection);
+            i += 1;
+        }
+    }
+
+    plan.next = i;
+    Ok(plan)
+}
+
+fn stage_at(pipeline: &[Value], index: usize) -> Option<(&str, &Value)> {
+    let obj = pipeline.get(index)?.as_object()?;
+    if obj.len() != 1 {
+        return None;
+    }
+    let (name, arg) = obj.iter().next()?;
+    name.starts_with('$').then_some((name.as_str(), arg))
+}
+
+fn simple_projection(spec: &Value) -> Option<Value> {
+    let obj = spec.as_object()?;
+    for (field, value) in obj {
+        // `find` projections are top-level only.
+        if field.contains('.') || field.starts_with('$') {
+            return None;
+        }
+        let simple = match value {
+            Value::Bool(_) => true,
+            Value::Number(n) => n.as_f64().is_some_and(|v| v == 0.0 || v == 1.0),
+            _ => false,
+        };
+        if !simple {
+            return None;
+        }
+    }
+    // `find` has a long-standing special case: `{_id: 1}` alone is treated as
+    // an exclusion projection. Aggregation follows MongoDB and returns only
+    // `_id`. Do not push that form (or mixed `_id` inclusion + exclusions).
+    let non_id_inclusion = obj
+        .iter()
+        .any(|(field, value)| field != "_id" && is_inclusion(value));
+    let id_inclusion = obj.get("_id").is_some_and(is_inclusion);
+    if id_inclusion && !non_id_inclusion {
+        return None;
+    }
+    Some(spec.clone())
+}
+
+fn count_field_name(arg: &Value) -> Result<String> {
+    match arg {
+        Value::String(s) if !s.is_empty() => Ok(s.clone()),
+        Value::Null => Ok("count".to_string()),
+        _ => Err(Error::Query(
+            "$count requires a non-empty string field name".into(),
+        )),
+    }
+}
+
 /// Runs a pipeline over already selected documents.
 pub fn run(mut docs: Vec<Value>, pipeline: &[Value], max_docs: usize) -> Result<Vec<Value>> {
     for stage in pipeline {
@@ -58,15 +172,7 @@ pub fn run(mut docs: Vec<Value>, pipeline: &[Value], max_docs: usize) -> Result<
                 if docs.is_empty() {
                     docs.clear();
                 } else {
-                    let field = match arg {
-                        Value::String(s) if !s.is_empty() => s.clone(),
-                        Value::Null => "count".to_string(),
-                        _ => {
-                            return Err(Error::Query(
-                                "$count requires a non-empty string field name".into(),
-                            ));
-                        }
-                    };
+                    let field = count_field_name(arg)?;
                     let count = docs.len();
                     docs = vec![Value::Object(Map::from_iter([(
                         field,
@@ -210,7 +316,7 @@ fn unset_fields(mut doc: Value, spec: &Value) -> Result<Value> {
     Ok(doc)
 }
 
-fn parse_sort(spec: &Value) -> Result<Vec<(String, i32)>> {
+pub(crate) fn parse_sort(spec: &Value) -> Result<Vec<(String, i32)>> {
     match spec {
         Value::Object(fields) => {
             let mut out = Vec::with_capacity(fields.len());

@@ -185,16 +185,20 @@ them concurrently; each request reads only its range.
 ### Aggregation
 
 Aggregation is implemented in `nonodb-core/src/aggregate.rs` and is strictly
-read-only. The daemon runs it in a blocking task with one `RoTxn`. A leading
-`$match` is extracted and executed through the normal `find_in` path, so
-secondary indexes and primary-key ranges still apply. The remaining stages are
-evaluated in memory. Intermediate results are capped at 100,000 documents to
-keep memory bounded; this is a deliberate first-version limit rather than a
-query-planning restriction.
+read-only. The daemon runs it in a blocking task with one `RoTxn`. A safe
+pipeline prefix is pushed into `find_in`: a leading `$match`, then a contiguous
+`$sort`+`$skip`/`$limit`, a simple `$project`, and `$skip`. This reuses secondary
+indexes, primary-key ranges, covering projections, index-only sorts, and the
+query-level TopK. `$sort` is only pushed when a following `$limit` keeps the
+TopK heap small; otherwise the in-memory `sort_by` path is faster. A lone
+`$count` after `$match` calls `count_in` and never materializes documents.
 
-`$sort` reuses the same document comparator as `find`, and expressions reuse
-the path helpers used by filters and updates. `$addToSet` and grouping keys
-serialize values to canonical JSON strings for deduplication and grouping.
+The remaining stages are evaluated in memory. Intermediate results are capped
+at 100,000 documents to keep memory bounded; this is a deliberate first-version
+limit rather than a query-planning restriction. `$sort` reuses the same document
+comparator as `find`, and expressions reuse the path helpers used by filters and
+updates. `$addToSet` and grouping keys serialize values to canonical JSON
+strings for deduplication and grouping.
 
 ### Choosing a read strategy
 

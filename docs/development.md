@@ -13,7 +13,8 @@ and [HTTP API](api.md).
 │   ├── src/
 │   │   ├── lib.rs
 │   │   ├── store.rs           # LMDB environment and collection registry
-│   │   ├── collection.rs      # CRUD, query planning, backfill, scans
+│   │   ├── collection.rs      # CRUD, query planning, aggregate pushdown, scans
+│   │   ├── aggregate.rs       # read-only aggregation stages and expressions
 │   │   ├── index.rs           # order-preserving index encoding
 │   │   ├── search.rs          # tokenization, BM25, trigrams, Levenshtein
 │   │   ├── error.rs
@@ -112,7 +113,7 @@ This runs:
 - a persistence/reopen integration test;
 - Rust client unit/doc tests.
 
-The latest run before this documentation was written: **54 core unit tests,
+The latest run: **65 core unit tests (including aggregation and pushdown),
 7 daemon tests (cache and automatic-index selection), 5 property tests, 1
 reopen test, and 2 Rust client unit tests**, all passing.
 
@@ -189,6 +190,7 @@ scripts are:
 |---|---|
 | `scripts/bench.py` | Mixed CRUD throughput/latency with multiple processes |
 | `scripts/opt_bench.py` | Count, early exit, index update, batch comparison |
+| `scripts/aggregate_bench.py` | Per-stage aggregation timings and report pipelines |
 | `scripts/cpu_bench.py` | Samples daemon CPU from `/proc` |
 | `scripts/large_test.py` | 1M+ document load, indexes, query latency, RAM |
 | `scripts/large_crash_test.sh` | Crash during writes on a large database |

@@ -58,7 +58,7 @@ At the time of the latest run:
 | `cargo build --release --examples` | OK |
 | `cargo fmt --check` | OK |
 | `cargo clippy --all-targets -- -D warnings` | 0 warnings |
-| `cargo test` | 54 core unit + 7 daemon tests + 5 property-based + 1 reopen test, all passing |
+| `cargo test` | 65 core unit + 7 daemon tests + 5 property-based + 1 reopen test, all passing |
 | End-to-end scripts | CRUD, cache, batch, write batch, upsert, search, compound indexes, uvicorn, crash, Docker |
 
 The test suite covers filters, updates/upserts, paths, index encoding, unique
@@ -204,6 +204,77 @@ BM25 at 1M text documents is a full posting-list scan and ranking operation;
 the text index makes candidate lookup possible but does not make large OR
 queries free. Fuzzy search is cheaper here because trigram candidate selection
 limits the number of documents scored.
+
+## Aggregation pipeline
+
+Measured on 2026-11-10 with `scripts/aggregate_bench.py`, release build, ext4,
+50,000 documents, 10 measured iterations after 2 warmups. The daemon was started
+with `NONODB_CACHE_TTL=0` so the numbers measure execution rather than repeated
+cache hits. Timings include HTTP/Unix-socket transport and JSON decoding in the
+Python client.
+
+Each row is a separate pipeline. `rows` is the number of documents returned by
+that pipeline.
+
+| Pipeline | Rows | p50 | p95 |
+|---|---:|---:|---:|
+| `$match` broad (`active: true`) | 25,000 | 371.92 ms | 413.36 ms |
+| `$match` selective (`seq < 100`, no index) | 100 | 72.10 ms | 117.54 ms |
+| `$project` include | 50,000 | 436.31 ms | 488.21 ms |
+| `$project` computed (`$multiply`) | 50,000 | 420.40 ms | 473.28 ms |
+| `$addFields` computed | 50,000 | 809.15 ms | 847.29 ms |
+| `$unset` two fields | 50,000 | 554.60 ms | 604.68 ms |
+| `$sort` alone | 50,000 | 886.80 ms | 952.60 ms |
+| `$sort` + `$limit 100` | 100 | 73.40 ms | 89.00 ms |
+| `$skip` half the collection | 25,000 | 278.16 ms | 306.71 ms |
+| `$limit 100` | 100 | 1.38 ms | 2.19 ms |
+| `$count` | 1 | 0.51 ms | 0.60 ms |
+| `$group` by 1,000 keys, `$sum`/`$avg` | 1,000 | 172.53 ms | 201.39 ms |
+| `$group` by 100 keys, `$push`/`$addToSet` | 100 | 166.05 ms | 213.90 ms |
+| `$unwind` two-element arrays | 83,333 | 890.01 ms | 1,026.57 ms |
+| Combined `$match` → `$group` → `$sort` → `$limit` → `$project` | 10 | 88.30 ms | 95.91 ms |
+| Same report without the leading `$match` | 10 | 154.20 ms | 158.22 ms |
+
+The early `$match` variants show the value of reducing the working set before
+`$group`: the combined report is **1.75× faster** than the same report over the
+whole collection.
+
+### What the numbers mean
+
+- **`$limit` and a lone `$count` are effectively free after pushdown.** They
+  became 1.38 ms and 0.51 ms respectively, versus roughly 144 ms and 141 ms
+  when the engine still materialized all 50,000 documents first.
+- **`$sort` + `$limit` is much cheaper than `$sort` alone.** The bounded TopK
+  path returned the top 100 in 73 ms; sorting all 50,000 documents took 887 ms.
+  Add `$limit` whenever the application only needs a page of results.
+- **Selective filters without an index still scan.** The 100-row `$match`
+  took 72 ms because `seq` had no index. Create an index for a field used by a
+  repeated leading `$match`; the query planner will then use an index range and
+  avoid parsing every document.
+- **`$addFields`, `$unset`, and `$unwind` are CPU/memory-bound.** They touch
+  every document and, for `$unwind`, can increase the number of rows. Filter
+  and limit before them whenever possible.
+- **`$group` is dominated by scanning and grouping keys.** Reducing input via
+  a leading `$match` is the largest single win. The current implementation uses
+  canonical JSON strings as group keys; a scalar-key fast path and streaming
+  grouping are possible future optimizations.
+- **Use the read cache for repeated reports.** It is disabled in this benchmark
+  to show real execution cost. With the default 5-second TTL, an unchanged
+  pipeline can be served from the daemon cache.
+
+### Reproducing
+
+```bash
+NONODB_CACHE_TTL=0 NONODB_DATA=/tmp/nonodb-agg \
+  NONODB_SOCK=/tmp/nonodb-agg.sock ./target/release/nonodb-daemon
+
+NONODB_SOCK=/tmp/nonodb-agg.sock \
+  python3 scripts/aggregate_bench.py --docs 50000 --iters 10 --warmup 2
+```
+
+The script keeps the data set at or below the 100,000-document aggregation
+input cap. Values vary with page-cache state, CPU frequency, and filesystem;
+compare rows from the same run rather than mixing separate runs.
 
 ## Large data: 1,000,000 documents
 
