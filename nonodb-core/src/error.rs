@@ -31,6 +31,9 @@ pub enum Error {
     #[error("document too large: {0} bytes (limit {1})")]
     DocumentTooLarge(usize, usize),
 
+    #[error("invalid TTL: {0}")]
+    InvalidTtl(String),
+
     /// Vault/encryption error with a stable API code.
     #[error("{message}")]
     Vault { code: &'static str, message: String },

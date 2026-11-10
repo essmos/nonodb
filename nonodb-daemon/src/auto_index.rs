@@ -121,11 +121,12 @@ pub struct AutoIndexer {
     state_path: PathBuf,
     inner: Mutex<Inner>,
     dirty: AtomicBool,
+    last_tick: Mutex<Option<Instant>>,
 }
 
 impl AutoIndexer {
-    /// Creates the registry and, if the feature is enabled, starts the
-    /// maintenance thread. When `NONODB_AUTO_INDEX=0`, all methods are no-ops.
+    /// Creates the registry. The daemon maintenance worker drives `tick_due`.
+    /// When `NONODB_AUTO_INDEX=0`, all methods are no-ops.
     pub fn start(
         store: Arc<Store>,
         write_tx: mpsc::Sender<WriteJob>,
@@ -141,17 +142,11 @@ impl AutoIndexer {
             state_path,
             inner: Mutex::new(inner),
             dirty: AtomicBool::new(false),
+            last_tick: Mutex::new(None),
         });
 
         if me.config.enabled {
             me.load_state();
-            let worker = me.clone();
-            if let Err(e) = std::thread::Builder::new()
-                .name("nonodb-auto-index".into())
-                .spawn(move || worker.run_loop())
-            {
-                tracing::warn!("auto-index thread failed to start: {e}");
-            }
         }
         me
     }
@@ -193,12 +188,22 @@ impl AutoIndexer {
         }
     }
 
-    fn run_loop(self: Arc<Self>) {
-        loop {
-            std::thread::sleep(self.config.interval);
-            if let Err(e) = self.tick() {
-                tracing::warn!("auto-index tick failed: {e}");
+    /// Runs one maintenance tick if the configured interval has elapsed.
+    pub fn tick_due(&self) {
+        if !self.config.enabled {
+            return;
+        }
+        {
+            let mut last = self.last_tick.lock().unwrap();
+            if let Some(at) = *last {
+                if at.elapsed() < self.config.interval {
+                    return;
+                }
             }
+            *last = Some(Instant::now());
+        }
+        if let Err(e) = self.tick() {
+            tracing::warn!("auto-index tick failed: {e}");
         }
     }
 

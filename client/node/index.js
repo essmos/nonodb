@@ -213,8 +213,24 @@ class NonoDB {
   }
 
   /** Create a collection explicitly. Use profile `vault` for encrypted storage. */
-  async createCollection(name, profile = 'standard') {
-    return this.exec({ op: 'create_collection', coll: name, profile });
+  async createCollection(name, profile = 'standard', ttlSeconds = null, purgeHistory = null) {
+    const req = { op: 'create_collection', coll: name, profile };
+    if (ttlSeconds !== null) req.ttl_seconds = ttlSeconds;
+    if (purgeHistory !== null) req.ttl_purge_history = purgeHistory;
+    return this.exec(req);
+  }
+
+  /** Set or clear a collection's default document TTL. */
+  async setCollectionTtl(name, ttlSeconds, purgeHistory = null) {
+    const req = { op: 'set_collection_ttl', coll: name, ttl_seconds: ttlSeconds };
+    if (purgeHistory !== null) req.purge_history = purgeHistory;
+    return this.exec(req);
+  }
+
+  /** Read a collection's default document TTL. */
+  async collectionTtl(name) {
+    const result = await this.exec({ op: 'get_collection_ttl', coll: name });
+    return result?.ttl_seconds ?? null;
   }
 
   /** List collection names. */

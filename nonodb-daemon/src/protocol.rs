@@ -174,6 +174,23 @@ pub enum Request {
         coll: String,
         #[serde(default)]
         profile: Option<String>,
+        #[serde(default)]
+        ttl_seconds: Option<u64>,
+        /// Purge stored history on TTL expiry instead of adding a tombstone.
+        #[serde(default)]
+        ttl_purge_history: Option<bool>,
+    },
+    /// Sets or clears the default document TTL for a collection.
+    SetCollectionTtl {
+        coll: String,
+        #[serde(default)]
+        ttl_seconds: Option<u64>,
+        #[serde(default)]
+        purge_history: Option<bool>,
+    },
+    /// Returns the collection default TTL.
+    GetCollectionTtl {
+        coll: String,
     },
 }
 
@@ -208,6 +225,14 @@ pub enum WriteOp {
     },
 }
 
+/// One due TTL entry passed to the writer's expiry job.
+#[derive(Debug, Clone)]
+pub struct ExpireEntry {
+    pub coll: String,
+    pub id: String,
+    pub expected_ttl_at: u64,
+}
+
 /// Write operations passed to the single writer task.
 #[derive(Debug)]
 pub enum WriteReq {
@@ -238,6 +263,21 @@ pub enum WriteReq {
     CreateCollection {
         coll: String,
         profile: CollectionProfile,
+        ttl_seconds: Option<u64>,
+        ttl_purge_history: Option<bool>,
+    },
+    SetCollectionTtl {
+        coll: String,
+        ttl_seconds: Option<u64>,
+        purge_history: Option<bool>,
+    },
+    /// Internal maintenance: delete expired documents if their TTL still matches.
+    Expire {
+        entries: Vec<ExpireEntry>,
+    },
+    /// Internal maintenance: prune old document revisions.
+    PruneHistory {
+        limit: usize,
     },
     CreateIndex {
         coll: String,
@@ -349,6 +389,7 @@ impl From<nonodb_core::Error> for ApiError {
             E::Query(_) => "invalid_query",
             E::InvalidCollectionName(_) => "invalid_collection",
             E::DocumentTooLarge(_, _) => "document_too_large",
+            E::InvalidTtl(_) => "invalid_ttl",
             E::Json(_) | E::JsonFast(_) => "invalid_json",
             E::Lmdb(_) => "storage",
             E::Io(_) => "io",

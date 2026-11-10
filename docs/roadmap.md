@@ -21,6 +21,7 @@ Implemented:
 - BM25 full-text search with diacritic folding and phrases;
 - fuzzy search with trigrams and bounded Levenshtein distance;
 - read batches and atomic write batches;
+- document TTL with collection defaults, per-document overrides, and background expiry;
 - Unix-socket daemon, optional TCP/TLS and mutual TLS, bearer auth, uid/gid allow-lists;
 - group commit, request limits/timeouts, metrics;
 - snapshots, online backup, restore, inspect, CLI;
@@ -51,7 +52,7 @@ Implemented:
 - No regular-expression filters (`$regex`), `$size`, `$elemMatch`, `$type`,
   `$where`, or `$text` query operator.
 - No joins.
-- No TTL indexes or scheduled document expiry.
+- TTL is eventual and has no strict read-time filtering.
 - Projection is top-level only, not a nested projection tree.
 - Sorting and filtering use the documented subset; there is no collation API.
 
@@ -75,7 +76,7 @@ Implemented:
   projection.
 - `drop_*` leaves named LMDB sub-databases registered; repeated creation and
   dropping of many different names can exhaust `MAX_DBS`.
-- `MAX_DBS=256` means roughly 246 collections plus index/search sub-databases
+- `MAX_DBS=256` means roughly 245 collections plus index/search sub-databases
   before `MDB_DBS_FULL`.
 
 ### Search
@@ -170,17 +171,16 @@ project's target workload.
    with Tantivy for advanced text search.
 9. **Compression and/or CBOR storage** for smaller files and faster parsing,
    with a migration path.
-10. **TTL indexes** and background expiry.
-11. **Expanded aggregation** beyond the current `$match`/`$group`/`$project`/
+10. **Expanded aggregation** beyond the current `$match`/`$group`/`$project`/
     `$sort`/`$limit` subset, including streaming execution and more stages.
 
 ### Lower priority
 
-12. Sparse/partial and wildcard indexes.
-13. Geospatial or vector indexes.
-14. A published Python package and additional language clients.
-15. Benchmark automation in CI.
-16. A web UI or schema browser.
+11. Sparse/partial and wildcard indexes.
+12. Geospatial or vector indexes.
+13. A published Python package and additional language clients.
+14. Benchmark automation in CI.
+15. A web UI or schema browser.
 
 ## Non-goals
 

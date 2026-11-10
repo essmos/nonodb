@@ -89,6 +89,7 @@ An LMDB environment contains named sub-databases. nonodb uses this layout:
 |---|---|---|---|
 | `meta` | metadata key | JSON or scalar | Collection registry, collection profile, index definitions, search totals, history sequence |
 | `history` | collection + `_id` + revision | revision JSON | Append-only document history |
+| `ttl` | expiry index / collection + `_id` | expiry timestamp | Document expiry metadata |
 | `coll:<name>` | `_id` bytes | JSON document | Primary collection data |
 | `idx:<coll>:<fields>` | encoded values + `_id` | encoded `_id` / covering payload | Secondary index |
 | `ft:<coll>:<field>` | `term\0_id` | term frequency (u32 LE) | BM25 postings |
@@ -103,6 +104,14 @@ The optional `history` sub-database stores immutable revision snapshots. A key
 contains the collection name, `_id`, and a global `rev` assigned by the writer.
 The current collection is never modified by history and history entries are
 not indexed. See [Document history](operations.md#document-history).
+
+The `ttl` sub-database stores expiry metadata separately from documents. It has
+two key families in one named database: an expiry-ordered index
+(`e + expire_ms + collection + _id`) for the sweeper and a direct
+collection/`_id` lookup (`i + collection + _id`) for updates and deletes.
+Collection defaults live in `meta` as `ttl:<name>`. TTL entries are written in
+the same transaction as the document, indexes, and history. See
+[Document TTL](ttl.md).
 
 ### Vault collection layout
 
@@ -126,7 +135,7 @@ encryption headers. See [Vault collections](vault.md) for the API contract and
 threat model.
 
 Every collection and every index consumes a named LMDB sub-database.
-`MAX_DBS` is 256, which in practice limits a database to roughly 246
+`MAX_DBS` is 256, which in practice limits a database to roughly 245
 collections before `MDB_DBS_FULL` (indexes consume additional slots). Dropping
 an index deletes its contents but the named sub-database remains registered in
 LMDB; see [Operations](operations.md#capacity-and-memory).
@@ -245,7 +254,8 @@ Automatic indexing is an opt-in optimization layer, not a replacement for
 schema design. It is disabled by default and must be enabled with
 `NONODB_AUTO_INDEX=1`.
 
-The daemon keeps in-memory frequency counters for cache-missed read shapes:
+The daemon maintenance worker keeps in-memory frequency counters for
+cache-missed read shapes:
 
 ```text
 collection + set of indexable fields + equality/range classification
@@ -253,14 +263,14 @@ collection + set of indexable fields + equality/range classification
 
 Concrete values are deliberately not part of the key. A shape becomes a
 candidate after `NONODB_AUTO_INDEX_MIN_HITS` misses inside a rolling window.
-The auto-index worker then checks the collection size, existing indexes, limits,
-and write queue, and asks the normal writer to create the index:
+The maintenance worker then checks the collection size, existing indexes,
+limits, and write queue, and asks the normal writer to create the index:
 
 ```text
 read cache miss ──▶ shape counter ──▶ candidate
                                          │
                                          ▼
-                              auto-index worker
+                         maintenance worker (auto-index)
                                          │ CreateIndex / DropIndex
                                          ▼
                                     writer thread
@@ -275,14 +285,32 @@ those indexes are eligible for TTL eviction; manually created indexes are never
 removed. Demand is recorded even on cache hits so a hot query does not lose its
 index merely because the cache is serving it.
 
+The same maintenance worker also drives TTL sweeps and history pruning. It
+never opens a write transaction itself; every mutation is submitted to the
+single writer.
+
 Important limitations:
 
-- the index is built inside one LMDB write transaction and blocks writes;
+- automatic index creation uses the normal single-writer path; queries keep
+  using the existing scan/cache fallback until the index is available;
 - creation is skipped when the write queue is backlogged;
 - only simple equality/range predicates are considered;
 - there is no selectivity histogram yet, so very broad indexes can be created
   if the query is frequent enough;
 - sorting-only queries and `$or` shapes are not auto-indexed.
+
+## Maintenance worker
+
+One background thread coordinates low-priority maintenance:
+
+- TTL sweeper: reads due entries, submits an `Expire` job to the writer, and
+  re-checks the expected expiry under the write transaction;
+- history pruning: submits a bounded `PruneHistory` job every 30 seconds;
+- automatic indexes: runs the conservative candidate/eviction logic on its own
+  interval.
+
+The worker is intentionally not a second LMDB writer. This keeps the single
+writer model, group commit, and crash-safety guarantees intact.
 
 ## Write path and group commit
 

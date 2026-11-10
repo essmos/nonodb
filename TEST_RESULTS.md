@@ -15,7 +15,7 @@ release build.
 | `cargo build --release --examples` | OK |
 | `cargo fmt --check` | OK |
 | `cargo clippy --all-targets -- -D warnings` | 0 warnings |
-| `cargo test` | 67 unit + 5 property-based + 1 reopen + 2 vault integration tests, all passing |
+| `cargo test` | Core/daemon unit tests, 5 property-based, reopen, TTL, and vault integration tests, all passing |
 | CRUD, cache, batch, write batch, upsert, search, compound indexes | OK |
 | 12-process concurrency and unique-index race tests | OK |
 | `kill -9` during writes | No corruption; committed data readable |
@@ -24,6 +24,7 @@ release build.
 | Docker build and named-volume run | OK |
 | Vault encryption regression suite | OK (profiles, headers, isolation, CRUD, history, rejected ops) |
 | mTLS with all official clients | OK (Python, Rust, Node.js, Go; anonymous and revoked certs rejected) |
+| Document TTL suite | OK (defaults, overrides, update semantics, sweeper, history tombstones/purge, vault) |
 
 ## Representative numbers
 

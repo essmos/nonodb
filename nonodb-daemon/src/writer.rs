@@ -23,11 +23,6 @@ const MAX_BATCH: usize = 512;
 const BASE_WINDOW: Duration = Duration::from_millis(1);
 /// Maximum window under heavy load (larger batch = fewer `fsync`s).
 const MAX_WINDOW: Duration = Duration::from_millis(5);
-/// How often the writer checks whether old revisions should be pruned.
-const PRUNE_INTERVAL: Duration = Duration::from_secs(30);
-/// Maximum revisions deleted by one background pruning pass.
-const PRUNE_LIMIT: usize = 1000;
-
 pub struct WriteJob {
     pub req: WriteReq,
     pub resp: oneshot::Sender<Result<Value, ApiError>>,
@@ -37,15 +32,10 @@ pub struct WriteJob {
 
 /// Writer thread loop. Ends when the channel is closed.
 pub fn run(store: Arc<Store>, rx: Receiver<WriteJob>, cache: Arc<QueryCache>) {
-    let mut last_prune = Instant::now();
     loop {
-        let first = match rx.recv_timeout(PRUNE_INTERVAL) {
+        let first = match rx.recv() {
             Ok(job) => job,
-            Err(RecvTimeoutError::Timeout) => {
-                maybe_prune_history(&store, &cache, &mut last_prune);
-                continue;
-            }
-            Err(RecvTimeoutError::Disconnected) => break,
+            Err(_) => break,
         };
         let mut jobs = vec![first];
         // Adaptive window: the longer the queue, the larger the batch (fewer fsyncs),
@@ -74,22 +64,6 @@ pub fn run(store: Arc<Store>, rx: Receiver<WriteJob>, cache: Arc<QueryCache>) {
         }
 
         run_batch(&store, &cache, jobs);
-        maybe_prune_history(&store, &cache, &mut last_prune);
-    }
-}
-
-fn maybe_prune_history(store: &Store, cache: &QueryCache, last_prune: &mut Instant) {
-    if last_prune.elapsed() < PRUNE_INTERVAL || !store.history_config().active() {
-        return;
-    }
-    *last_prune = Instant::now();
-    match store.prune_history(PRUNE_LIMIT) {
-        Ok(0) => {}
-        Ok(n) => {
-            cache.invalidate();
-            tracing::debug!(deleted = n, "pruned old document revisions");
-        }
-        Err(e) => tracing::warn!(?e, "history pruning failed"),
     }
 }
 
@@ -209,9 +183,55 @@ fn execute(
     req: &WriteReq,
 ) -> Result<Value, ApiError> {
     match req {
-        WriteReq::CreateCollection { coll, profile } => {
-            store.create_collection_in(wtxn, coll, *profile)?;
-            Ok(json!({ "created": coll, "profile": profile.as_str() }))
+        WriteReq::CreateCollection {
+            coll,
+            profile,
+            ttl_seconds,
+            ttl_purge_history,
+        } => {
+            let c = store.create_collection_with_ttl_and_purge_in(
+                wtxn,
+                coll,
+                *profile,
+                *ttl_seconds,
+                *ttl_purge_history,
+            )?;
+            Ok(json!({
+                "created": coll,
+                "profile": profile.as_str(),
+                "ttl_seconds": c.ttl_default_seconds(),
+                "purge_history": c.ttl_purge_history(),
+            }))
+        }
+        WriteReq::SetCollectionTtl {
+            coll,
+            ttl_seconds,
+            purge_history,
+        } => {
+            store.set_collection_ttl_with_purge_in(wtxn, coll, *ttl_seconds, *purge_history)?;
+            Ok(json!({
+                "coll": coll,
+                "ttl_seconds": ttl_seconds,
+                "purge_history": purge_history,
+            }))
+        }
+        WriteReq::Expire { entries } => {
+            let mut expired = 0usize;
+            for entry in entries {
+                if store.collection_profile_in_rw(wtxn, &entry.coll)?.is_none() {
+                    store.ttl_remove_in(wtxn, &entry.coll, &entry.id)?;
+                    continue;
+                }
+                let c = store.collection_in(wtxn, &entry.coll)?;
+                if c.expire_txn(wtxn, &entry.id, entry.expected_ttl_at)? {
+                    expired += 1;
+                }
+            }
+            Ok(json!({ "expired": expired }))
+        }
+        WriteReq::PruneHistory { limit } => {
+            let deleted = store.prune_history_in(wtxn, *limit)?;
+            Ok(json!({ "pruned": deleted }))
         }
         WriteReq::Insert { coll, doc, vault } => {
             let c = write_collection(store, wtxn, coll, vault.as_ref())?;

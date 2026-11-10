@@ -22,6 +22,11 @@ pub static WRITE_OPS: AtomicU64 = AtomicU64::new(0);
 pub static WRITE_BATCHES: AtomicU64 = AtomicU64::new(0);
 /// Total `commit` time (including `fsync`) in nanoseconds.
 pub static COMMIT_NS: AtomicU64 = AtomicU64::new(0);
+/// TTL sweeps, expired documents, errors, and the last due backlog.
+pub static TTL_SWEEPS: AtomicU64 = AtomicU64::new(0);
+pub static TTL_EXPIRED: AtomicU64 = AtomicU64::new(0);
+pub static TTL_SWEEP_ERRORS: AtomicU64 = AtomicU64::new(0);
+pub static TTL_BACKLOG: AtomicU64 = AtomicU64::new(0);
 /// Approximate length of the write queue waiting for the writer.
 pub static QUEUE_LEN: AtomicU64 = AtomicU64::new(0);
 /// Peak queue length since process start.
@@ -33,6 +38,10 @@ pub fn inc(counter: &AtomicU64) {
 
 pub fn add(counter: &AtomicU64, n: u64) {
     counter.fetch_add(n, Relaxed);
+}
+
+pub fn set(counter: &AtomicU64, n: u64) {
+    counter.store(n, Relaxed);
 }
 
 /// Records the current queue length as a potential peak.
@@ -67,6 +76,10 @@ pub fn snapshot() -> Value {
         "queue_len": QUEUE_LEN.load(Relaxed),
         "queue_peak": QUEUE_PEAK.load(Relaxed),
         "commit_ns_total": commit_ns,
+        "ttl_sweeps_total": TTL_SWEEPS.load(Relaxed),
+        "ttl_expired_total": TTL_EXPIRED.load(Relaxed),
+        "ttl_sweep_errors_total": TTL_SWEEP_ERRORS.load(Relaxed),
+        "ttl_backlog": TTL_BACKLOG.load(Relaxed),
         "avg_batch_size": write_ops as f64 / batches as f64,
         "avg_commit_us": commit_ns as f64 / batches as f64 / 1000.0,
     })

@@ -37,6 +37,18 @@ end-to-end check.
 When the daemon is started with `NONODB_HISTORY=1`, use `History()` and
 `GetVersion()` on a collection.
 
+## Document TTL
+
+```go
+ttl := uint64(86400)
+err := client.CreateCollectionWithTTL(ctx, "sessions", "standard", &ttl)
+err = client.SetCollectionTTL(ctx, "sessions", nil)
+current, err := client.CollectionTTL(ctx, "sessions")
+```
+
+Documents use the reserved `_ttl` field for a per-document override. See
+[Document TTL](../../docs/ttl.md).
+
 ## Aggregation
 
 ```go

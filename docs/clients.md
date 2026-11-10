@@ -246,7 +246,11 @@ daemon. See [Vault collections](vault.md).
 
 All clients expose the common document operations:
 
-- `create_collection` for explicit standard/vault collection creation;
+- `create_collection` for explicit standard/vault collection creation, with an
+  optional default TTL (`create_collection_with_ttl` in Rust, an optional
+  argument in Python/Node.js, `CreateCollectionWithTTL` in Go);
+- `set_collection_ttl`/`get_collection_ttl` for collection TTL defaults and
+  optional history purging on expiry;
 - `insert`, `insert_many`, `find`, `find_one`, `update`, `delete`, `count`;
 - `aggregate` for read-only reporting pipelines;
 - `batch` (read-only) and `write_batch` (atomic writes);

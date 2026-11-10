@@ -45,6 +45,17 @@ client guide.
 When the daemon is started with `NONODB_HISTORY=1`, use `history()` and
 `get_version()` on a collection.
 
+## Document TTL
+
+```rust
+client.create_collection_with_ttl("sessions", "standard", Some(86_400))?;
+client.set_collection_ttl("sessions", Some(3_600))?;
+let ttl = client.collection_ttl("sessions")?;
+```
+
+Documents use the reserved `_ttl` field for a per-document override. See
+[Document TTL](../docs/ttl.md).
+
 ## Aggregation
 
 ```rust

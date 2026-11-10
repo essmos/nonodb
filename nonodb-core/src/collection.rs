@@ -16,6 +16,7 @@ use crate::index::{self, IndexDef};
 use crate::query::{apply_update, apply_upsert, matches, path, seed_from_filter};
 use crate::search;
 use crate::store::MAX_DOCUMENT_BYTES;
+use crate::ttl::{self, TtlUpdate};
 use crate::vault::{self, CollectionProfile, VaultKey};
 
 /// Minimum document count for a sorted full scan to use multiple threads.
@@ -161,29 +162,39 @@ pub struct Collection<'e> {
     db: Database<Bytes, Bytes>,
     meta: Database<Bytes, Bytes>,
     history: Database<Bytes, Bytes>,
+    ttl_db: Database<Bytes, Bytes>,
     history_config: HistoryConfig,
     name: String,
     profile: CollectionProfile,
+    ttl_default_seconds: Option<u64>,
+    ttl_purge_history: bool,
     env: &'e Env,
 }
 
 impl<'e> Collection<'e> {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         env: &'e Env,
         db: Database<Bytes, Bytes>,
         meta: Database<Bytes, Bytes>,
         history: Database<Bytes, Bytes>,
+        ttl_db: Database<Bytes, Bytes>,
         history_config: HistoryConfig,
         name: String,
         profile: CollectionProfile,
+        ttl_default_seconds: Option<u64>,
+        ttl_purge_history: bool,
     ) -> Self {
         Self {
             db,
             meta,
             history,
+            ttl_db,
             history_config,
             name,
             profile,
+            ttl_default_seconds,
+            ttl_purge_history,
             env,
         }
     }
@@ -214,6 +225,24 @@ impl<'e> Collection<'e> {
         } else {
             Ok(())
         }
+    }
+
+    fn set_ttl(&self, wtxn: &mut RwTxn<'_>, id: &str, at: Option<u64>) -> Result<()> {
+        ttl::set_entry(&self.ttl_db, wtxn, &self.name, id, at)
+    }
+
+    fn ttl_at(&self, txn: &RoTxn<'_>, id: &str) -> Result<Option<u64>> {
+        ttl::get_entry(&self.ttl_db, txn, &self.name, id)
+    }
+
+    /// Collection default TTL in seconds, if configured.
+    pub fn ttl_default_seconds(&self) -> Option<u64> {
+        self.ttl_default_seconds
+    }
+
+    /// Whether TTL expiry purges stored history instead of appending a tombstone.
+    pub fn ttl_purge_history(&self) -> bool {
+        self.ttl_purge_history
     }
 
     // ----------------------------- indexes -----------------------------
@@ -1029,6 +1058,7 @@ impl<'e> Collection<'e> {
     /// Inserts a document in the given transaction. Assigns `_id` (UUID v4) if missing.
     pub fn insert_one_txn(&self, wtxn: &mut RwTxn<'_>, mut doc: Value) -> Result<String> {
         self.ensure_standard()?;
+        let ttl_at = ttl::take_insert_ttl(&mut doc, self.ttl_default_seconds)?;
         let obj = doc
             .as_object_mut()
             .ok_or_else(|| Error::Query("document must be an object".into()))?;
@@ -1056,6 +1086,7 @@ impl<'e> Collection<'e> {
         self.apply_index_entries(wtxn, None, Some(&doc), &id)?;
         self.apply_text_entries(wtxn, None, Some(&doc), &id)?;
         self.apply_fuzzy_entries(wtxn, None, Some(&doc), &id)?;
+        self.set_ttl(wtxn, &id, ttl_at)?;
         self.record_history(wtxn, &id, "insert", Some(doc))?;
         Ok(id)
     }
@@ -1106,8 +1137,14 @@ impl<'e> Collection<'e> {
                 .ok_or_else(|| Error::Query("document disappeared".into()))?
                 .to_vec();
             let old: Value = parse_json(&raw)?;
+            let old_ttl = self.ttl_at(&*wtxn, &id)?;
             let mut new = old.clone();
             apply_update(&mut new, update)?;
+            let ttl_at = match ttl::take_update_ttl(&mut new)? {
+                TtlUpdate::Preserve => old_ttl,
+                TtlUpdate::Clear => None,
+                TtlUpdate::Set(at) => Some(at),
+            };
 
             self.validate_unique(&*wtxn, &new, &id)?;
             let bytes = serde_json::to_vec(&new)?;
@@ -1118,6 +1155,7 @@ impl<'e> Collection<'e> {
             self.apply_index_entries(wtxn, Some(&old), Some(&new), &id)?;
             self.apply_text_entries(wtxn, Some(&old), Some(&new), &id)?;
             self.apply_fuzzy_entries(wtxn, Some(&old), Some(&new), &id)?;
+            self.set_ttl(wtxn, &id, ttl_at)?;
             self.record_history(wtxn, &id, "update", Some(new))?;
             modified += 1;
         }
@@ -1176,6 +1214,7 @@ impl<'e> Collection<'e> {
             self.apply_index_entries(wtxn, Some(&old), None, &id)?;
             self.apply_text_entries(wtxn, Some(&old), None, &id)?;
             self.apply_fuzzy_entries(wtxn, Some(&old), None, &id)?;
+            self.set_ttl(wtxn, &id, None)?;
             self.record_history(wtxn, &id, "delete", None)?;
         }
         Ok(keys.len())
@@ -1285,10 +1324,12 @@ impl<'e> Collection<'e> {
         if self.db.get(&*wtxn, id.as_bytes())?.is_some() {
             return Err(Error::DuplicateKey(id));
         }
+        let ttl_at = ttl::take_insert_ttl(&mut doc, self.ttl_default_seconds)?;
         let envelope = vault::encrypt_document(&doc, key, &self.name, tenant, &id, kid)?;
         let stored = Self::vault_stored(&id, tenant, envelope)?;
         let bytes = Self::check_vault_size(&stored)?;
         self.db.put(&mut *wtxn, id.as_bytes(), &bytes)?;
+        self.set_ttl(wtxn, &id, ttl_at)?;
         self.record_history(wtxn, &id, "insert", Some(stored))?;
         Ok(id)
     }
@@ -1349,9 +1390,15 @@ impl<'e> Collection<'e> {
             });
         };
         let old_stored: Value = parse_json(raw)?;
+        let old_ttl = self.ttl_at(&*wtxn, &id)?;
         let old = self.decrypt_stored(&old_stored, key, tenant, &id, kid)?;
         let mut new = old.clone();
         apply_update(&mut new, update)?;
+        let ttl_at = match ttl::take_update_ttl(&mut new)? {
+            TtlUpdate::Preserve => old_ttl,
+            TtlUpdate::Clear => None,
+            TtlUpdate::Set(at) => Some(at),
+        };
         if new.get("_id").and_then(Value::as_str) != Some(id.as_str()) {
             return Err(Error::InvalidId);
         }
@@ -1365,6 +1412,7 @@ impl<'e> Collection<'e> {
         let stored = Self::vault_stored(&id, tenant, envelope)?;
         let bytes = Self::check_vault_size(&stored)?;
         self.db.put(&mut *wtxn, id.as_bytes(), &bytes)?;
+        self.set_ttl(wtxn, &id, ttl_at)?;
         self.record_history(wtxn, &id, "update", Some(stored))?;
         Ok(UpdateOutcome {
             matched: 1,
@@ -1398,8 +1446,40 @@ impl<'e> Collection<'e> {
         // Decrypt before deleting: this enforces the tenant/key and catches corruption.
         self.decrypt_stored(&stored, key, tenant, &id, kid)?;
         self.db.delete(&mut *wtxn, id.as_bytes())?;
+        self.set_ttl(wtxn, &id, None)?;
         self.record_history(wtxn, &id, "delete", None)?;
         Ok(1)
+    }
+
+    /// Deletes an expired document without decrypting vault payloads.
+    ///
+    /// The expected expiry must still match the TTL entry; this protects a
+    /// concurrent update that refreshed the TTL after the sweeper read it.
+    pub fn expire_txn(&self, wtxn: &mut RwTxn<'_>, id: &str, expected_ttl_at: u64) -> Result<bool> {
+        let Some(current) = self.ttl_at(&*wtxn, id)? else {
+            return Ok(false);
+        };
+        if current != expected_ttl_at {
+            return Ok(false);
+        }
+        let Some(raw) = self.db.get(&*wtxn, id.as_bytes())? else {
+            self.set_ttl(wtxn, id, None)?;
+            return Ok(false);
+        };
+        let old: Value = parse_json(raw)?;
+        self.db.delete(&mut *wtxn, id.as_bytes())?;
+        if !self.profile.is_vault() {
+            self.apply_index_entries(wtxn, Some(&old), None, id)?;
+            self.apply_text_entries(wtxn, Some(&old), None, id)?;
+            self.apply_fuzzy_entries(wtxn, Some(&old), None, id)?;
+        }
+        self.set_ttl(wtxn, id, None)?;
+        if self.ttl_purge_history {
+            history::purge(&self.history, wtxn, &self.name, id)?;
+        } else {
+            self.record_history(wtxn, id, "delete", None)?;
+        }
+        Ok(true)
     }
 
     /// Reads vault documents. Only `_id`/`tenant_id` filters and `_id` sorting are allowed.

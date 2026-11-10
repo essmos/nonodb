@@ -40,6 +40,9 @@ All daemon configuration is through environment variables.
 | `NONODB_CACHE_MAX_BYTES` | `262144` | Maximum serialized size of one cached result |
 | `NONODB_HISTORY` | `0` | Enables append-only document revision history |
 | `NONODB_HISTORY_MAX_VERSIONS` | `50` | Revisions retained per document (`0` disables history writes) |
+| `NONODB_TTL_SWEEP_INTERVAL` | `5` | Seconds between document TTL sweeps |
+| `NONODB_TTL_SWEEP_LIMIT` | `256` | Maximum due documents processed per TTL sweep |
+| `NONODB_MAINTENANCE_INTERVAL_MS` | `1000` | Maintenance worker heartbeat in milliseconds |
 | `NONODB_AUTO_INDEX` | `0` | Enables automatic indexes for frequent read shapes |
 | `NONODB_AUTO_INDEX_MIN_HITS` | `50` | Required cache misses in one window before creating an index |
 | `NONODB_AUTO_INDEX_WINDOW` | `300` | Frequency window in seconds |
@@ -100,9 +103,9 @@ Searches and secondary indexes never see history entries. This keeps query
 results current and avoids index maintenance for old revisions.
 
 `NONODB_HISTORY_MAX_VERSIONS` controls how many revisions are retained per
-document (default `50`). The writer runs a bounded pruning pass every 30
-seconds; old revisions are removed in small batches rather than during the hot
-write path. Set the value to `0` to stop recording new history.
+document (default `50`). The maintenance worker submits a bounded pruning job
+every 30 seconds; the writer deletes old revisions in small batches rather than
+during the hot write path. Set the value to `0` to stop recording new history.
 
 History is global to the store, not per collection. Enabling it after a
 database already contains documents creates history only for writes performed
@@ -114,7 +117,23 @@ document copy per write for history-enabled stores. Size `NONODB_MAP_SIZE` and
 backup retention accordingly. Use a smaller `NONODB_HISTORY_MAX_VERSIONS` or
 disable history for write-heavy collections.
 
-### Automatic indexes
+### Document TTL
+
+TTL is configured per collection (`ttl_seconds`) and optionally per document
+with the reserved `_ttl` field. Expiry metadata is stored in the `ttl`
+sub-database and written atomically with the document and its indexes.
+
+The maintenance worker submits expiry deletes to the single writer. It processes
+at most `NONODB_TTL_SWEEP_LIMIT` due documents every
+`NONODB_TTL_SWEEP_INTERVAL` seconds. TTL is eventual: a document may remain
+visible briefly after its timestamp. Expiry uses the normal delete path,
+including a history tombstone when history is enabled. Collections can set
+`purge_history` to delete stored revisions instead.
+
+See [Document TTL](ttl.md) for semantics, update behavior, vault support, and
+metrics.
+
+## Automatic indexes
 
 Automatic indexes are opt-in (`NONODB_AUTO_INDEX=1`). The daemon records only
 the *shape* of cache-missed `find`, `find_one`, and `count` requests: collection,
@@ -134,12 +153,13 @@ Only simple string/number equality and range predicates are considered.
 unsupported operators are ignored. Up to `NONODB_AUTO_INDEX_MAX_FIELDS`
 equality fields are used, followed by one range field when space remains.
 
-The index is built by the normal writer, in one LMDB write transaction, so it
-temporarily blocks other writes. The build job is isolated from group commit,
-so it does not share a transaction with unrelated user writes. Creation is
-skipped while more than 32 writes are queued. For large collections, prefer a
-scheduled manual index build over automatic creation.
+Automatic index creation and eviction are submitted to the normal writer by
+the daemon maintenance loop. Creation is skipped while more than 32 writes are
+queued. Queries keep using the existing scan/cache path until the index is
+available. For large collections, prefer a scheduled manual index build over
+automatic creation.
 
+The daemon maintenance worker drives automatic index creation and eviction.
 Automatic indexes are tracked in `auto-index.json` in `NONODB_DATA`. They are
 dropped after `NONODB_AUTO_INDEX_TTL` seconds without demand, but only when
 they are at least `NONODB_AUTO_INDEX_MIN_AGE` old. Manual indexes are never
@@ -604,6 +624,10 @@ Useful signals:
 | `auto_index_created_total` / `auto_index_dropped_total` | Automatic index churn |
 | `auto_index_build_ns_total` | Time spent building automatic indexes |
 | `auto_index_build_errors_total` | Failed automatic index builds |
+| `ttl_sweeps_total` | TTL sweeps performed |
+| `ttl_expired_total` | Documents deleted by TTL |
+| `ttl_sweep_errors_total` | Failed TTL sweeps |
+| `ttl_backlog` | Due entries observed by the last sweep |
 
 The health endpoint is public and cheap:
 

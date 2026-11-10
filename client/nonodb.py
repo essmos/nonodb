@@ -37,6 +37,7 @@ _READ_OPS = {
     "count",
     "list_indexes",
     "list_collections",
+    "get_collection_ttl",
     "list_text_indexes",
     "list_fuzzy_indexes",
     "search",
@@ -244,11 +245,52 @@ class NonoDB:
         """
         return self.exec({"op": "write_batch", "ops": ops})["results"]
 
-    def create_collection(self, name: str, profile: str = "standard") -> dict[str, Any]:
-        """Creates a collection explicitly. Use `profile="vault"` for encrypted storage."""
-        return self.exec(
-            {"op": "create_collection", "coll": name, "profile": profile}
-        )
+    def create_collection(
+        self,
+        name: str,
+        profile: str = "standard",
+        ttl_seconds: int | None = None,
+        ttl_purge_history: bool | None = None,
+    ) -> dict[str, Any]:
+        """Creates a collection explicitly. Use `profile="vault"` for encrypted storage.
+
+        `ttl_seconds` sets a default document TTL; individual documents can
+        override it with a `_ttl` field.
+        """
+        req: dict[str, Any] = {
+            "op": "create_collection",
+            "coll": name,
+            "profile": profile,
+        }
+        if ttl_seconds is not None:
+            req["ttl_seconds"] = ttl_seconds
+        if ttl_purge_history is not None:
+            req["ttl_purge_history"] = ttl_purge_history
+        return self.exec(req)
+
+    def set_collection_ttl(
+        self,
+        name: str,
+        ttl_seconds: int | None,
+        purge_history: bool | None = None,
+    ) -> dict[str, Any]:
+        """Sets the default document TTL, or clears it with `None`.
+
+        `purge_history=True` removes stored revisions when TTL expires a
+        document instead of appending a delete tombstone.
+        """
+        req: dict[str, Any] = {
+            "op": "set_collection_ttl",
+            "coll": name,
+            "ttl_seconds": ttl_seconds,
+        }
+        if purge_history is not None:
+            req["purge_history"] = purge_history
+        return self.exec(req)
+
+    def get_collection_ttl(self, name: str) -> int | None:
+        """Returns the collection default TTL in seconds, or `None`."""
+        return self.exec({"op": "get_collection_ttl", "coll": name})["ttl_seconds"]
 
     def vault(self, tenant: str, key_id: str, key: str) -> "VaultDB":
         """Returns a handle that sends vault encryption headers on every request."""

@@ -8,6 +8,7 @@ use heed::{Database, Env, EnvOpenOptions, RoTxn, RwTxn};
 use crate::collection::Collection;
 use crate::error::{Error, Result};
 use crate::history::{self, HistoryConfig, HISTORY_DB};
+use crate::ttl::{self, TTL_DB};
 use crate::vault::CollectionProfile;
 
 /// Maximum database file size. This is mmap address space - **not**
@@ -60,6 +61,7 @@ pub const MAX_DOCUMENT_BYTES: usize = 1024 * 1024;
 pub struct Store {
     env: Env,
     history: Database<Bytes, Bytes>,
+    ttl: Database<Bytes, Bytes>,
     history_config: HistoryConfig,
 }
 
@@ -91,10 +93,11 @@ impl Store {
 
         // After `kill -9`, dead reader slots may remain in the lock table.
         let _ = env.clear_stale_readers();
-        let history = Self::init_meta(&env)?;
+        let (history, ttl) = Self::init_meta(&env)?;
         Ok(Self {
             env,
             history,
+            ttl,
             history_config,
         })
     }
@@ -109,23 +112,28 @@ impl Store {
     /// Call only from the writer thread. This does a bounded scan and is meant
     /// to run periodically, not as part of every write.
     pub fn prune_history(&self, limit: usize) -> Result<usize> {
+        let mut wtxn = self.write_txn()?;
+        let deleted = self.prune_history_in(&mut wtxn, limit)?;
+        wtxn.commit()?;
+        Ok(deleted)
+    }
+
+    /// History pruning inside an existing writer transaction.
+    pub fn prune_history_in(&self, wtxn: &mut RwTxn<'_>, limit: usize) -> Result<usize> {
         if !self.history_config.active() {
             return Ok(0);
         }
-        let mut wtxn = self.write_txn()?;
         let meta = self
             .env
-            .open_database::<Bytes, Bytes>(&wtxn, Some(META_DB))?
+            .open_database::<Bytes, Bytes>(wtxn, Some(META_DB))?
             .ok_or_else(|| Error::Query("meta database missing".into()))?;
-        let deleted = history::prune(
+        history::prune(
             &self.history,
             &meta,
-            &mut wtxn,
+            wtxn,
             self.history_config.max_versions,
             limit,
-        )?;
-        wtxn.commit()?;
-        Ok(deleted)
+        )
     }
 
     pub fn env(&self) -> &Env {
@@ -140,7 +148,7 @@ impl Store {
         Ok(self.env.write_txn()?)
     }
 
-    fn init_meta(env: &Env) -> Result<Database<Bytes, Bytes>> {
+    fn init_meta(env: &Env) -> Result<(Database<Bytes, Bytes>, Database<Bytes, Bytes>)> {
         let mut wtxn = env.write_txn()?;
         let meta: Database<Bytes, Bytes> = env.create_database(&mut wtxn, Some(META_DB))?;
         if meta.get(&wtxn, b"schema_version")?.is_none() {
@@ -151,8 +159,9 @@ impl Store {
             )?;
         }
         let history: Database<Bytes, Bytes> = env.create_database(&mut wtxn, Some(HISTORY_DB))?;
+        let ttl: Database<Bytes, Bytes> = env.create_database(&mut wtxn, Some(TTL_DB))?;
         wtxn.commit()?;
-        Ok(history)
+        Ok((history, ttl))
     }
 
     fn validate_name(name: &str) -> Result<()> {
@@ -164,6 +173,56 @@ impl Store {
 
     fn profile_key(name: &str) -> String {
         format!("profile:{name}")
+    }
+
+    fn ttl_key(name: &str) -> String {
+        format!("ttl:{name}")
+    }
+
+    fn ttl_purge_key(name: &str) -> String {
+        format!("ttl_purge:{name}")
+    }
+
+    fn ttl_from_ro(
+        meta: Database<Bytes, Bytes>,
+        rtxn: &RoTxn<'_>,
+        name: &str,
+    ) -> Result<Option<u64>> {
+        Ok(meta
+            .get(rtxn, Self::ttl_key(name).as_bytes())?
+            .and_then(|b| std::str::from_utf8(b).ok())
+            .and_then(|s| s.parse::<u64>().ok()))
+    }
+
+    fn ttl_from_rw(
+        meta: Database<Bytes, Bytes>,
+        wtxn: &RwTxn<'_>,
+        name: &str,
+    ) -> Result<Option<u64>> {
+        Ok(meta
+            .get(wtxn, Self::ttl_key(name).as_bytes())?
+            .and_then(|b| std::str::from_utf8(b).ok())
+            .and_then(|s| s.parse::<u64>().ok()))
+    }
+
+    fn ttl_purge_from_ro(
+        meta: Database<Bytes, Bytes>,
+        rtxn: &RoTxn<'_>,
+        name: &str,
+    ) -> Result<bool> {
+        Ok(meta
+            .get(rtxn, Self::ttl_purge_key(name).as_bytes())?
+            .is_some_and(|b| b == b"1"))
+    }
+
+    fn ttl_purge_from_rw(
+        meta: Database<Bytes, Bytes>,
+        wtxn: &RwTxn<'_>,
+        name: &str,
+    ) -> Result<bool> {
+        Ok(meta
+            .get(wtxn, Self::ttl_purge_key(name).as_bytes())?
+            .is_some_and(|b| b == b"1"))
     }
 
     fn profile_from_ro(
@@ -199,8 +258,35 @@ impl Store {
         name: &str,
         profile: CollectionProfile,
     ) -> Result<Collection<'_>> {
+        self.create_collection_with_ttl(name, profile, None)
+    }
+
+    /// Creates a collection with an optional default document TTL.
+    pub fn create_collection_with_ttl(
+        &self,
+        name: &str,
+        profile: CollectionProfile,
+        ttl_seconds: Option<u64>,
+    ) -> Result<Collection<'_>> {
+        self.create_collection_with_ttl_and_purge(name, profile, ttl_seconds, None)
+    }
+
+    /// Creates a collection with TTL settings and optional history purging on expiry.
+    pub fn create_collection_with_ttl_and_purge(
+        &self,
+        name: &str,
+        profile: CollectionProfile,
+        ttl_seconds: Option<u64>,
+        purge_history: Option<bool>,
+    ) -> Result<Collection<'_>> {
         let mut wtxn = self.write_txn()?;
-        let collection = self.create_collection_in(&mut wtxn, name, profile)?;
+        let collection = self.create_collection_with_ttl_and_purge_in(
+            &mut wtxn,
+            name,
+            profile,
+            ttl_seconds,
+            purge_history,
+        )?;
         wtxn.commit()?;
         Ok(collection)
     }
@@ -210,6 +296,27 @@ impl Store {
         wtxn: &mut RwTxn<'_>,
         name: &str,
         profile: CollectionProfile,
+    ) -> Result<Collection<'e>> {
+        self.create_collection_with_ttl_in(wtxn, name, profile, None)
+    }
+
+    pub fn create_collection_with_ttl_in<'e>(
+        &'e self,
+        wtxn: &mut RwTxn<'_>,
+        name: &str,
+        profile: CollectionProfile,
+        ttl_seconds: Option<u64>,
+    ) -> Result<Collection<'e>> {
+        self.create_collection_with_ttl_and_purge_in(wtxn, name, profile, ttl_seconds, None)
+    }
+
+    pub fn create_collection_with_ttl_and_purge_in<'e>(
+        &'e self,
+        wtxn: &mut RwTxn<'_>,
+        name: &str,
+        profile: CollectionProfile,
+        ttl_seconds: Option<u64>,
+        purge_history: Option<bool>,
     ) -> Result<Collection<'e>> {
         Self::validate_name(name)?;
         let db = self
@@ -238,7 +345,119 @@ impl Store {
             Self::profile_key(name).as_bytes(),
             profile.as_str().as_bytes(),
         )?;
-        Ok(self.wrap(name, db, meta, profile))
+        if let Some(seconds) = ttl_seconds {
+            Self::validate_ttl(seconds)?;
+            meta.put(
+                &mut *wtxn,
+                Self::ttl_key(name).as_bytes(),
+                seconds.to_string().as_bytes(),
+            )?;
+        }
+        if let Some(purge) = purge_history {
+            if purge {
+                meta.put(&mut *wtxn, Self::ttl_purge_key(name).as_bytes(), b"1")?;
+            } else {
+                meta.delete(&mut *wtxn, Self::ttl_purge_key(name).as_bytes())?;
+            }
+        }
+        let ttl_default = Self::ttl_from_rw(meta, wtxn, name)?;
+        let purge = Self::ttl_purge_from_rw(meta, wtxn, name)?;
+        Ok(self.wrap(name, db, meta, profile, ttl_default, purge))
+    }
+
+    fn validate_ttl(seconds: u64) -> Result<()> {
+        if seconds == 0 {
+            return Err(Error::InvalidTtl(
+                "collection `ttl_seconds` must be greater than zero".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Sets or clears a collection's default document TTL.
+    pub fn set_collection_ttl(&self, name: &str, ttl_seconds: Option<u64>) -> Result<()> {
+        self.set_collection_ttl_with_purge(name, ttl_seconds, None)
+    }
+
+    /// Sets TTL options; `purge_history: None` preserves the current setting.
+    pub fn set_collection_ttl_with_purge(
+        &self,
+        name: &str,
+        ttl_seconds: Option<u64>,
+        purge_history: Option<bool>,
+    ) -> Result<()> {
+        let mut wtxn = self.write_txn()?;
+        self.set_collection_ttl_with_purge_in(&mut wtxn, name, ttl_seconds, purge_history)?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    /// Sets or clears a collection TTL inside an existing writer transaction.
+    pub fn set_collection_ttl_in(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        name: &str,
+        ttl_seconds: Option<u64>,
+    ) -> Result<()> {
+        self.set_collection_ttl_with_purge_in(wtxn, name, ttl_seconds, None)
+    }
+
+    pub fn set_collection_ttl_with_purge_in(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        name: &str,
+        ttl_seconds: Option<u64>,
+        purge_history: Option<bool>,
+    ) -> Result<()> {
+        Self::validate_name(name)?;
+        if self.collection_profile_in_rw(wtxn, name)?.is_none() {
+            return Err(Error::Query(format!("collection `{name}` does not exist")));
+        }
+        let meta = self
+            .env
+            .create_database::<Bytes, Bytes>(&mut *wtxn, Some(META_DB))?;
+        if let Some(seconds) = ttl_seconds {
+            Self::validate_ttl(seconds)?;
+            meta.put(
+                &mut *wtxn,
+                Self::ttl_key(name).as_bytes(),
+                seconds.to_string().as_bytes(),
+            )?;
+        } else {
+            meta.delete(&mut *wtxn, Self::ttl_key(name).as_bytes())?;
+        }
+        if let Some(purge) = purge_history {
+            if purge {
+                meta.put(&mut *wtxn, Self::ttl_purge_key(name).as_bytes(), b"1")?;
+            } else {
+                meta.delete(&mut *wtxn, Self::ttl_purge_key(name).as_bytes())?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns a collection's default TTL, if any.
+    pub fn collection_ttl(&self, name: &str) -> Result<Option<u64>> {
+        let rtxn = self.read_txn()?;
+        let meta = self
+            .env
+            .open_database::<Bytes, Bytes>(&rtxn, Some(META_DB))?
+            .ok_or_else(|| Error::Query("meta database missing".into()))?;
+        let out = Self::ttl_from_ro(meta, &rtxn, name)?;
+        rtxn.commit()?;
+        Ok(out)
+    }
+
+    /// Whether TTL expiry purges history for this collection.
+    pub fn collection_ttl_purge(&self, name: &str) -> Result<bool> {
+        let rtxn = self.read_txn()?;
+        let meta = self
+            .env
+            .open_database::<Bytes, Bytes>(&rtxn, Some(META_DB))?
+            .ok_or_else(|| Error::Query("meta database missing".into()))?;
+        let out = Self::ttl_purge_from_ro(meta, &rtxn, name)?;
+        rtxn.commit()?;
+        Ok(out)
     }
 
     /// Returns the profile of a collection, or `None` if it does not exist.
@@ -305,8 +524,10 @@ impl Store {
                 // NOTE: heed requires `commit()` on the read transaction in which
                 // the database was opened; otherwise later `db` use fails with EINVAL.
                 let profile = Self::profile_from_ro(meta, &rtxn, name)?;
+                let ttl_default = Self::ttl_from_ro(meta, &rtxn, name)?;
+                let purge = Self::ttl_purge_from_ro(meta, &rtxn, name)?;
                 rtxn.commit()?;
-                return Ok(self.wrap(name, db, meta, profile));
+                return Ok(self.wrap(name, db, meta, profile, ttl_default, purge));
             }
             rtxn.commit()?;
         }
@@ -334,7 +555,9 @@ impl Store {
             meta.put(&mut *wtxn, key.as_bytes(), b"1")?;
         }
         let profile = Self::profile_from_rw(meta, wtxn, name)?;
-        Ok(self.wrap(name, db, meta, profile))
+        let ttl_default = Self::ttl_from_rw(meta, wtxn, name)?;
+        let purge = Self::ttl_purge_from_rw(meta, wtxn, name)?;
+        Ok(self.wrap(name, db, meta, profile, ttl_default, purge))
     }
 
     /// Opens an **existing** collection in the given read transaction.
@@ -353,25 +576,46 @@ impl Store {
             .open_database::<Bytes, Bytes>(rtxn, Some(META_DB))?
             .ok_or_else(|| Error::Query("meta database missing".into()))?;
         let profile = Self::profile_from_ro(meta, rtxn, name)?;
-        Ok(Some(self.wrap(name, db, meta, profile)))
+        let ttl_default = Self::ttl_from_ro(meta, rtxn, name)?;
+        let purge = Self::ttl_purge_from_ro(meta, rtxn, name)?;
+        Ok(Some(self.wrap(name, db, meta, profile, ttl_default, purge)))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn wrap<'e>(
         &'e self,
         name: &str,
         db: Database<Bytes, Bytes>,
         meta: Database<Bytes, Bytes>,
         profile: CollectionProfile,
+        ttl_default: Option<u64>,
+        purge_history: bool,
     ) -> Collection<'e> {
         Collection::new(
             &self.env,
             db,
             meta,
             self.history,
+            self.ttl,
             self.history_config,
             name.to_string(),
             profile,
+            ttl_default,
+            purge_history,
         )
+    }
+
+    /// Reads due TTL entries with a short-lived read transaction.
+    pub fn ttl_due(&self, now: u64, limit: usize) -> Result<Vec<crate::ttl::DueEntry>> {
+        let rtxn = self.read_txn()?;
+        let out = ttl::due_entries(&self.ttl, &rtxn, now, limit)?;
+        rtxn.commit()?;
+        Ok(out)
+    }
+
+    /// Removes stale TTL entries for a collection that no longer exists.
+    pub fn ttl_remove_in(&self, wtxn: &mut RwTxn<'_>, coll: &str, id: &str) -> Result<()> {
+        ttl::remove_entry(&self.ttl, wtxn, coll, id)
     }
 
     /// List of registered collections.

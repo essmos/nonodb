@@ -114,6 +114,25 @@ db.create_collection("vault", "vault")   # encrypted, restricted API
 
 A `Collection` is a lightweight handle around the same `NonoDB` connection.
 
+### Collection TTL
+
+```python
+db.create_collection("sessions", ttl_seconds=86400)
+db.set_collection_ttl("sessions", 3600)
+assert db.get_collection_ttl("sessions") == 3600
+db.set_collection_ttl("sessions", None)   # clear the default
+db.set_collection_ttl("sessions", 3600, purge_history=True)
+
+sessions = db.collection("sessions")
+sessions.insert({"_id": "s1", "user": 7, "_ttl": 300})  # per-document override
+sessions.update({"_id": "s1"}, {"$set": {"_ttl": 0}})   # disable expiry
+```
+
+An update without `_ttl` preserves the current expiry. `purge_history=True`
+removes stored revisions when TTL deletes a document instead of appending a
+tombstone. Expiry is eventual and handled by the daemon maintenance worker.
+See [Document TTL](ttl.md).
+
 ## Vault collections
 
 Use `NonoDB.vault(tenant, key_id, key)` for a tenant/key-bound handle. It sends the

@@ -402,10 +402,62 @@ func (c *Client) Vault(tenant, keyID, key string) *Client {
 // CreateCollection creates a collection explicitly. Use profile "vault" for
 // encrypted storage.
 func (c *Client) CreateCollection(ctx context.Context, name, profile string) error {
-	_, err := c.execRaw(ctx, map[string]any{
+	return c.CreateCollectionWithTTL(ctx, name, profile, nil)
+}
+
+// CreateCollectionWithTTL creates a collection with an optional default TTL.
+func (c *Client) CreateCollectionWithTTL(ctx context.Context, name, profile string, ttlSeconds *uint64) error {
+	return c.CreateCollectionWithTTLAndPurge(ctx, name, profile, ttlSeconds, nil)
+}
+
+// CreateCollectionWithTTLAndPurge also configures history purging on TTL expiry.
+func (c *Client) CreateCollectionWithTTLAndPurge(ctx context.Context, name, profile string, ttlSeconds *uint64, purgeHistory *bool) error {
+	req := map[string]any{
 		"op": "create_collection", "coll": name, "profile": profile,
-	})
+	}
+	if ttlSeconds != nil {
+		req["ttl_seconds"] = *ttlSeconds
+	}
+	if purgeHistory != nil {
+		req["ttl_purge_history"] = *purgeHistory
+	}
+	_, err := c.execRaw(ctx, req)
 	return err
+}
+
+// SetCollectionTTL sets or clears (nil) the collection default TTL.
+func (c *Client) SetCollectionTTL(ctx context.Context, name string, ttlSeconds *uint64) error {
+	return c.SetCollectionTTLWithPurge(ctx, name, ttlSeconds, nil)
+}
+
+// SetCollectionTTLWithPurge also controls history purging on TTL expiry.
+func (c *Client) SetCollectionTTLWithPurge(ctx context.Context, name string, ttlSeconds *uint64, purgeHistory *bool) error {
+	req := map[string]any{"op": "set_collection_ttl", "coll": name}
+	if ttlSeconds == nil {
+		req["ttl_seconds"] = nil
+	} else {
+		req["ttl_seconds"] = *ttlSeconds
+	}
+	if purgeHistory != nil {
+		req["purge_history"] = *purgeHistory
+	}
+	_, err := c.execRaw(ctx, req)
+	return err
+}
+
+// CollectionTTL returns the collection default TTL, or nil if unset.
+func (c *Client) CollectionTTL(ctx context.Context, name string) (*uint64, error) {
+	raw, err := c.execRaw(ctx, map[string]any{"op": "get_collection_ttl", "coll": name})
+	if err != nil {
+		return nil, err
+	}
+	var result struct {
+		TTLSeconds *uint64 `json:"ttl_seconds"`
+	}
+	if err := decodeInto(raw, &result); err != nil {
+		return nil, err
+	}
+	return result.TTLSeconds, nil
 }
 
 // Collections lists collection names.

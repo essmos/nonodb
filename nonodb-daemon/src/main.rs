@@ -6,6 +6,7 @@
 
 mod auto_index;
 mod cache;
+mod maintenance;
 mod metrics;
 mod protocol;
 mod writer;
@@ -98,6 +99,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .name("nonodb-writer".into())
         .spawn(move || writer::run(writer_store, write_rx, writer_cache))?;
     let auto_index = auto_index::AutoIndexer::start(store.clone(), write_tx.clone(), &data);
+    maintenance::start(store.clone(), write_tx.clone(), auto_index.clone());
 
     if let Some(dir) = std::env::var_os("NONODB_SNAPSHOT_DIR") {
         spawn_snapshots(store.clone(), PathBuf::from(dir));
@@ -869,6 +871,20 @@ async fn exec(
             read_result(joined).await
         }
 
+        Request::GetCollectionTtl { coll } => {
+            let store = state.store.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                let ttl = store.collection_ttl(&coll)?;
+                let purge = store.collection_ttl_purge(&coll)?;
+                Ok::<Value, ApiError>(json!({
+                    "coll": coll,
+                    "ttl_seconds": ttl,
+                    "purge_history": purge,
+                }))
+            });
+            read_result(joined).await
+        }
+
         Request::ListCollections => {
             let store = state.store.clone();
             let joined = tokio::task::spawn_blocking(move || {
@@ -925,7 +941,12 @@ async fn exec(
                     multi,
                     vault: vault_auth.clone(),
                 },
-                Request::CreateCollection { coll, profile } => {
+                Request::CreateCollection {
+                    coll,
+                    profile,
+                    ttl_seconds,
+                    ttl_purge_history,
+                } => {
                     let profile = match profile {
                         Some(raw) => match CollectionProfile::parse(&raw) {
                             Ok(p) => p,
@@ -933,8 +954,22 @@ async fn exec(
                         },
                         None => CollectionProfile::Standard,
                     };
-                    WriteReq::CreateCollection { coll, profile }
+                    WriteReq::CreateCollection {
+                        coll,
+                        profile,
+                        ttl_seconds,
+                        ttl_purge_history,
+                    }
                 }
+                Request::SetCollectionTtl {
+                    coll,
+                    ttl_seconds,
+                    purge_history,
+                } => WriteReq::SetCollectionTtl {
+                    coll,
+                    ttl_seconds,
+                    purge_history,
+                },
                 Request::CreateIndex {
                     coll,
                     field,
@@ -996,6 +1031,7 @@ fn cacheable(req: &Request) -> bool {
             | Request::ListTextIndexes { .. }
             | Request::ListFuzzyIndexes { .. }
             | Request::ListCollections
+            | Request::GetCollectionTtl { .. }
             | Request::History { .. }
             | Request::GetVersion { .. }
     )

@@ -46,6 +46,17 @@ end-to-end check.
 When the daemon is started with `NONODB_HISTORY=1`, use `history()` and
 `getVersion()` on a collection.
 
+## Document TTL
+
+```js
+await db.createCollection('sessions', 'standard', 86400);
+await db.setCollectionTtl('sessions', 3600);
+const ttl = await db.collectionTtl('sessions');
+```
+
+Documents use the reserved `_ttl` field for a per-document override. See
+[Document TTL](../../docs/ttl.md).
+
 ## Aggregation
 
 Use `aggregate()` for a read-only reporting pipeline:

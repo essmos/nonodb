@@ -369,11 +369,67 @@ impl Client {
 
     /// Create a collection explicitly (`profile` is `standard` or `vault`).
     pub fn create_collection(&self, name: impl Into<String>, profile: &str) -> Result<Value> {
+        self.create_collection_with_ttl(name, profile, None)
+    }
+
+    /// Create a collection with an optional default document TTL in seconds.
+    pub fn create_collection_with_ttl(
+        &self,
+        name: impl Into<String>,
+        profile: &str,
+        ttl_seconds: Option<u64>,
+    ) -> Result<Value> {
+        self.create_collection_with_ttl_and_purge(name, profile, ttl_seconds, None)
+    }
+
+    /// Create a collection with TTL and optional history purging on expiry.
+    pub fn create_collection_with_ttl_and_purge(
+        &self,
+        name: impl Into<String>,
+        profile: &str,
+        ttl_seconds: Option<u64>,
+        purge_history: Option<bool>,
+    ) -> Result<Value> {
         self.exec(json!({
             "op": "create_collection",
             "coll": name.into(),
             "profile": profile,
+            "ttl_seconds": ttl_seconds,
+            "ttl_purge_history": purge_history,
         }))
+    }
+
+    /// Set or clear a collection's default document TTL.
+    pub fn set_collection_ttl(
+        &self,
+        name: impl Into<String>,
+        ttl_seconds: Option<u64>,
+    ) -> Result<Value> {
+        self.set_collection_ttl_with_purge(name, ttl_seconds, None)
+    }
+
+    /// Set or clear a collection TTL and optionally change history purging.
+    pub fn set_collection_ttl_with_purge(
+        &self,
+        name: impl Into<String>,
+        ttl_seconds: Option<u64>,
+        purge_history: Option<bool>,
+    ) -> Result<Value> {
+        self.exec(json!({
+            "op": "set_collection_ttl",
+            "coll": name.into(),
+            "ttl_seconds": ttl_seconds,
+            "purge_history": purge_history,
+        }))
+    }
+
+    /// Read a collection's default document TTL.
+    pub fn collection_ttl(&self, name: impl Into<String>) -> Result<Option<u64>> {
+        let result = self.exec(json!({
+            "op": "get_collection_ttl",
+            "coll": name.into(),
+        }))?;
+        Ok(result.get("ttl_seconds").and_then(Value::as_u64))
     }
 
     /// List collection names.

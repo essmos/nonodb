@@ -30,6 +30,7 @@ nonodb is a real document database with:
 - a read-only aggregation pipeline for reporting and summaries;
 - snapshots, online backup, authentication, TLS/mTLS, metrics and a CLI;
 - document revision history with global revision IDs and configurable retention;
+- document TTL with collection defaults, per-document overrides, and background expiry;
 - optional vault collections with whole-document encryption and per-tenant keys;
 - a bounded daemon read cache, invalidated after every committed write;
 - optional automatic indexes for frequent query shapes, with TTL cleanup.
@@ -107,8 +108,7 @@ nonodb is deliberately not a general-purpose distributed database. It has:
 - no sharding, replication, or clustering;
 - no general interactive multi-document transactions;
 - no MongoDB wire-protocol compatibility;
-- no cross-collection joins (`$lookup`), write stages (`$merge`/`$out`), or
-  TTL indexes;
+- no cross-collection joins (`$lookup`) or write stages (`$merge`/`$out`);
 - no user/role system beyond a bearer token;
 - a practical subset of MongoDB query and update operators.
 
@@ -228,6 +228,32 @@ curl -s --unix-socket /tmp/nonodb.sock \
 
 See [Document history](docs/api.md#document-history) for the full request and
 retention semantics.
+
+### Document TTL
+
+- Optional collection default (`ttl_seconds`) and per-document `_ttl` override.
+- Expiry metadata is stored outside the document; `_ttl` is not returned by
+  reads.
+- Updates preserve the current TTL unless `_ttl` is explicitly set.
+- Background maintenance sweeps due documents through the single writer.
+- TTL deletes remove index entries and append a history tombstone when history
+  is enabled; collections can opt into purging stored revisions instead.
+- Works for standard and vault collections.
+
+```bash
+curl -s --unix-socket /tmp/nonodb.sock \
+  -H 'content-type: application/json' \
+  -X POST http://localhost/v1/exec \
+  -d '{"op":"create_collection","coll":"sessions","ttl_seconds":86400}'
+
+curl -s --unix-socket /tmp/nonodb.sock \
+  -H 'content-type: application/json' \
+  -X POST http://localhost/v1/exec \
+  -d '{"op":"insert","coll":"sessions","doc":{"_id":"s1","user":7,"_ttl":300}}'
+```
+
+TTL is eventual: a document can be visible briefly after its expiry. See
+[Document TTL](docs/ttl.md) for update semantics, maintenance, and limits.
 
 ### Vault collections (optional encryption)
 
@@ -512,6 +538,7 @@ More deployment details: [Operations — Docker](docs/operations.md#docker).
 | [Mutual TLS](docs/mtls.md) | Client certificate setup, private CA, fingerprint allow-list, revocation, rotation |
 | [Python client](docs/python-client.md) | `NonoDB`/`Collection` API, caching, retries, TCP/TLS, FastAPI usage |
 | [Vault collections](docs/vault.md) | Optional encrypted tenant data, headers, restrictions, key rotation |
+| [Document TTL](docs/ttl.md) | Collection defaults, per-document expiry, update semantics, maintenance |
 | [CLI](docs/cli.md) | `ping`, `find`, `count`, `backup`, `restore`, `inspect`, `exec` |
 | [Operations](docs/operations.md) | Configuration, deployment, security, snapshots, monitoring, capacity, troubleshooting |
 | [Benchmarks](docs/benchmarks.md) | Test environment, throughput, latency, large data sets, RAM, reproducibility |

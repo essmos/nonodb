@@ -45,6 +45,9 @@ export class NonoDB {
   health(): Promise<boolean>;
   exec(payload: Record<string, unknown>): Promise<any>;
   collections(): Promise<string[]>;
+  createCollection(name: string, profile?: string, ttlSeconds?: number | null, purgeHistory?: boolean | null): Promise<any>;
+  setCollectionTtl(name: string, ttlSeconds: number | null, purgeHistory?: boolean | null): Promise<any>;
+  collectionTtl(name: string): Promise<number | null>;
   batch(ops: Record<string, unknown>[]): Promise<any[]>;
   writeBatch(ops: Record<string, unknown>[]): Promise<any[]>;
   collection(name: string): Collection;

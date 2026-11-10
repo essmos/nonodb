@@ -222,6 +222,36 @@ pub(crate) fn get(
     Ok(Some(serde_json::from_slice(raw)?))
 }
 
+/// Deletes every stored revision for one document.
+///
+/// Used only when a collection opts into `ttl_purge_history` for TTL deletes.
+/// The scan is batched so a document with a very long history does not require
+/// one huge temporary vector.
+pub(crate) fn purge(
+    history: &Database<Bytes, Bytes>,
+    wtxn: &mut RwTxn<'_>,
+    coll: &str,
+    id: &str,
+) -> Result<usize> {
+    let prefix = prefix(coll, id);
+    let mut deleted = 0usize;
+    loop {
+        let keys: Vec<Vec<u8>> = history
+            .prefix_iter(&*wtxn, prefix.as_slice())?
+            .take(1000)
+            .map(|item| item.map(|(key, _)| key.to_vec()))
+            .collect::<std::result::Result<_, _>>()?;
+        if keys.is_empty() {
+            break;
+        }
+        for key in &keys {
+            history.delete(&mut *wtxn, key.as_slice())?;
+        }
+        deleted += keys.len();
+    }
+    Ok(deleted)
+}
+
 fn queue_oldest(group: &[Vec<u8>], max_versions: usize, limit: usize, out: &mut Vec<Vec<u8>>) {
     if group.len() <= max_versions {
         return;

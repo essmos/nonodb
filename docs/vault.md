@@ -145,6 +145,7 @@ Details:
 | `delete` | ✅ exactly one document, by `_id` |
 | `history` | ✅ with headers; snapshots are decrypted |
 | `get_version` | ✅ with headers; snapshot is decrypted |
+| `set_collection_ttl` / `get_collection_ttl` | ✅ expiry metadata is plaintext |
 | `search` | ❌ `unsupported_encrypted_operation` |
 | `fuzzy` | ❌ `unsupported_encrypted_operation` |
 | `aggregate` | ❌ `unsupported_encrypted_operation` |
@@ -267,6 +268,14 @@ Upsert with an exact `_id` filter is supported:
 The daemon decrypts the document before deleting it. This verifies the key and
 tenant, and catches corrupted envelopes instead of deleting data that cannot be
 read. The history entry is a tombstone and contains no document snapshot.
+
+## TTL
+
+Vault collections support collection default TTL and the reserved `_ttl` field.
+The document body is encrypted as usual, while the expiry timestamp and
+collection/`_id` remain in the plaintext TTL sub-database. The maintenance
+sweeper deletes an expired vault document without decrypting its envelope. See
+[Document TTL](ttl.md).
 
 ## History
 

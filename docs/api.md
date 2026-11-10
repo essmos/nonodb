@@ -104,6 +104,8 @@ client timeout with `NONODB_TIMEOUT` or the `timeout=` argument.
 | [`get_version`](#document-history) | Read one exact document revision |
 | [`list_collections`](#list_collections) | List known collections |
 | [`create_collection`](#create_collection) | Create a standard or vault collection |
+| [`set_collection_ttl`](#document-ttl) | Set or clear the default document TTL |
+| [`get_collection_ttl`](#document-ttl) | Read the default document TTL |
 
 ---
 
@@ -128,6 +130,9 @@ Response:
 - If `_id` is present it must be a string.
 - A duplicate `_id` or a unique-index conflict fails with `duplicate_key`.
 - `_id` is the primary key. Treat it as immutable.
+- The reserved top-level `_ttl` field sets a per-document expiry in seconds.
+  `_ttl: 0` or `null` disables the collection default. The field is removed
+  before storage. See [Document TTL](#document-ttl).
 
 ## insert_many
 
@@ -844,8 +849,62 @@ or `null` if that revision no longer exists. A deleted document has a tombstone
 with `"deleted": true` and no document body.
 
 History retention is configured with `NONODB_HISTORY_MAX_VERSIONS` (default
-50). Pruning runs in the writer as a bounded background pass; it never adds an
-extra history scan to the hot write path.
+50). The daemon maintenance worker submits bounded pruning jobs to the single
+writer; pruning never scans history on the hot write path.
+
+## Document TTL
+
+TTL is optional and eventual. A document may remain readable briefly after its
+expiry until the maintenance sweeper commits the delete.
+
+Collection default:
+
+```json
+{"op":"create_collection","coll":"sessions","ttl_seconds":86400}
+```
+
+```json
+{"op":"set_collection_ttl","coll":"sessions","ttl_seconds":3600}
+{"op":"set_collection_ttl","coll":"sessions","ttl_seconds":null}
+{"op":"set_collection_ttl","coll":"sessions","ttl_seconds":3600,"purge_history":true}
+{"op":"get_collection_ttl","coll":"sessions"}
+```
+
+`set_collection_ttl` response:
+
+```json
+{"ok":true,"result":{"coll":"sessions","ttl_seconds":3600,"purge_history":false}}
+```
+
+`get_collection_ttl` response:
+
+```json
+{"ok":true,"result":{"coll":"sessions","ttl_seconds":3600,"purge_history":false}}
+```
+
+Per-document override:
+
+```json
+{"op":"insert","coll":"sessions","doc":{"_id":"s1","user":7,"_ttl":300}}
+```
+
+Rules:
+
+- `_ttl` overrides the collection default; `_ttl: 0` or `null` disables expiry.
+- A missing `_ttl` inherits the collection default; without either, the
+  document does not expire.
+- `ttl_seconds` must be positive. Negative, fractional, or non-numeric `_ttl`
+  values return `invalid_ttl`.
+- Updates preserve the existing expiry unless the update result contains an
+  explicit `_ttl`. Replacement updates and upserts follow the same rule.
+- `$unset` of `_ttl` does not clear an expiry; use `$set` with `0` or `null`.
+- Expiry deletes the document through the normal write path and appends a
+  history tombstone when history is enabled. With `purge_history: true`, stored
+  revisions are deleted instead of adding a tombstone.
+- TTL works for vault collections; the sweeper deletes the ciphertext without
+  decrypting it.
+
+See [Document TTL](ttl.md) for maintenance, metrics, and operational details.
 
 ## Read batch
 
@@ -945,12 +1004,25 @@ Rules:
 Response:
 
 ```json
-{"ok": true, "result": {"created": "vault", "profile": "vault"}}
+{"ok": true, "result": {"created": "vault", "profile": "vault", "ttl_seconds": null, "purge_history": false}}
 ```
 
 `profile` is `standard` (default) or `vault`. An existing collection cannot be
 converted between profiles; the request fails with
 `vault_profile_immutable`.
+
+An optional `ttl_seconds` sets the default document TTL for new inserts.
+`ttl_purge_history` controls whether TTL expiry deletes stored history:
+
+```json
+{
+  "op": "create_collection",
+  "coll": "sessions",
+  "profile": "standard",
+  "ttl_seconds": 86400,
+  "ttl_purge_history": false
+}
+```
 
 ## list_collections
 
@@ -1021,6 +1093,10 @@ Requires the bearer token when authentication is enabled.
 | `queue_len` | Current writer queue length |
 | `queue_peak` | Peak writer queue length since start |
 | `commit_ns_total` | Cumulative commit time in nanoseconds |
+| `ttl_sweeps_total` | TTL sweeps performed |
+| `ttl_expired_total` | Documents deleted by TTL |
+| `ttl_sweep_errors_total` | Failed TTL sweeps |
+| `ttl_backlog` | Due entries observed by the last sweep |
 | `avg_batch_size` | Write ops per committed write transaction |
 | `avg_commit_us` | Average commit time in microseconds |
 
@@ -1034,6 +1110,7 @@ Requires the bearer token when authentication is enabled.
 | `invalid_id` | 400 | `_id` is not a string |
 | `duplicate_key` | 400 | Duplicate `_id` or unique-index conflict |
 | `document_too_large` | 413 | Document exceeds 1 MiB |
+| `invalid_ttl` | 400 | Invalid collection default or document `_ttl` value |
 | `unauthorized` | 401 | Missing/invalid bearer token |
 | `timeout` | 500 | Request exceeded the server timeout |
 | `storage` | 500 | LMDB/storage error |

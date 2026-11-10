@@ -15,6 +15,13 @@ certificates.
 When the daemon is started with `NONODB_HISTORY=1`, all clients expose
 history, exact-revision helpers, and aggregation.
 
+## Document TTL
+
+Collection defaults and per-document `_ttl` overrides are available through
+the normal API and the Python `db.create_collection(..., ttl_seconds=...)`,
+`set_collection_ttl`, and `get_collection_ttl` helpers. See
+[Document TTL](../docs/ttl.md).
+
 ## Vault collections
 
 Use `db.vault(tenant, key_id, key)` for a handle that sends the three vault

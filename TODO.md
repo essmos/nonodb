@@ -22,6 +22,8 @@ limitations are documented in [docs/roadmap.md](docs/roadmap.md).
 - [x] BM25 full-text search, diacritic folding, quoted phrases
 - [x] Fuzzy search with trigrams and bounded Levenshtein distance
 - [x] Read batches and atomic write batches
+- [x] Document TTL with collection defaults, document overrides, background sweeps
+- [x] Maintenance worker for TTL, history pruning, and automatic-index scheduling
 - [x] Daemon, Unix socket, TCP/TLS, bearer auth, uid/gid allow-lists
 - [x] Group commit, request limits/timeouts, metrics
 - [x] Snapshots, online backup, restore, inspect, CLI
@@ -44,7 +46,6 @@ limitations are documented in [docs/roadmap.md](docs/roadmap.md).
 - [ ] Conditional `$pull` (query predicate)
 - [ ] `$mul`, `$currentDate`
 - [ ] Nested projections
-- [ ] TTL indexes and background expiry
 - [x] Aggregation subset (`$match`, `$group`, `$project`, `$sort`, `$limit`)
 
 ### P3 — security and durability

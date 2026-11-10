@@ -18,6 +18,7 @@ and [HTTP API](api.md).
 │   │   ├── index.rs           # order-preserving index encoding
 │   │   ├── search.rs          # tokenization, BM25, trigrams, Levenshtein
 │   │   ├── vault.rs           # optional encrypted collections
+│   │   ├── ttl.rs             # expiry metadata and due-entry scan
 │   │   ├── error.rs
 │   │   └── query/
 │   │       ├── matcher.rs     # MongoDB-like filters
@@ -26,6 +27,7 @@ and [HTTP API](api.md).
 │   ├── tests/
 │   │   ├── properties.rs      # proptest
 │   │   ├── reopen.rs          # persistence/reopen
+│   │   ├── ttl.rs             # TTL defaults, overrides, sweeper, vault
 │   │   └── vault.rs           # vault encryption and tenant isolation
 │   └── examples/
 │       ├── backup.rs
@@ -35,6 +37,9 @@ and [HTTP API](api.md).
 │       ├── main.rs            # listeners, auth, TLS, snapshots
 │       ├── protocol.rs        # request/response types
 │       ├── writer.rs          # single writer + group commit
+│       ├── maintenance.rs     # TTL sweeps, history pruning, auto-index drive
+│       ├── auto_index.rs      # automatic index candidates/state
+│       ├── cache.rs           # read cache
 │       └── metrics.rs
 ├── nonodb-cli/                # administrative CLI
 ├── nonodb-client/             # Rust client crate and example
@@ -131,6 +136,7 @@ python3 client/cache_test.py                 # TTL, invalidation, copies
 python3 scripts/batch_test.py                # read batch + get_many + cache
 python3 scripts/write_batch_test.py          # atomic commit/rollback
 python3 scripts/upsert_test.py               # upsert and array operators
+python3 scripts/ttl_test.py                  # TTL sweeps, overrides, history, vault
 python3 scripts/vault_test.py                # optional vault encryption end-to-end
 python3 scripts/vault_regression_test.py     # vault API regressions
 python3 scripts/vault_bench.py --docs 5000   # standard vs vault performance
@@ -197,6 +203,7 @@ scripts are:
 | `scripts/bench.py` | Mixed CRUD throughput/latency with multiple processes |
 | `scripts/opt_bench.py` | Count, early exit, index update, batch comparison |
 | `scripts/aggregate_bench.py` | Per-stage aggregation timings and report pipelines |
+| `scripts/ttl_test.py` | TTL defaults, overrides, update semantics, sweeper, vault |
 | `scripts/vault_test.py` | Vault encryption, tenant isolation, and restricted API |
 | `scripts/vault_regression_test.py` | Vault profiles, headers, filters, CRUD, errors, history |
 | `scripts/vault_bench.py` | Standard vs vault insert/read/update/count performance |
@@ -204,7 +211,7 @@ scripts are:
 | `scripts/large_test.py` | 1M+ document load, indexes, query latency, RAM |
 | `scripts/large_crash_test.sh` | Crash during writes on a large database |
 | `scripts/uvicorn_test.sh` | 12 uvicorn workers against one daemon |
-| `scripts/clients_test.sh` | Rust, Node.js, Go client smoke tests |
+| `scripts/clients_test.sh` | Rust, Node.js, Go client smoke tests, TTL, vault, mTLS |
 | `scripts/mtls_test.sh` | mTLS with generated CA/certs, all clients, revocation |
 | `scripts/concurrency_test.py` | Independent writers/readers and unique indexes |
 
