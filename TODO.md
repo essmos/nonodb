@@ -18,6 +18,7 @@ limitations are documented in [docs/roadmap.md](docs/roadmap.md).
 - [x] Primary-key `_id` range scans for find/count/update/delete
 - [x] Raw JSON prefilter for simple string/bool equalities
 - [x] Daemon-level read cache with commit invalidation
+- [x] Opt-in automatic indexes for frequent read shapes with TTL cleanup
 - [x] BM25 full-text search, diacritic folding, quoted phrases
 - [x] Fuzzy search with trigrams and bounded Levenshtein distance
 - [x] Read batches and atomic write batches

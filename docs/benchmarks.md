@@ -58,7 +58,7 @@ At the time of the latest run:
 | `cargo build --release --examples` | OK |
 | `cargo fmt --check` | OK |
 | `cargo clippy --all-targets -- -D warnings` | 0 warnings |
-| `cargo test` | 54 core unit + 2 daemon cache + 5 property-based + 1 reopen test, all passing |
+| `cargo test` | 54 core unit + 7 daemon tests + 5 property-based + 1 reopen test, all passing |
 | End-to-end scripts | CRUD, cache, batch, write batch, upsert, search, compound indexes, uvicorn, crash, Docker |
 
 The test suite covers filters, updates/upserts, paths, index encoding, unique

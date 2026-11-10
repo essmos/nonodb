@@ -28,7 +28,8 @@ nonodb is a real document database with:
   folding and quoted phrases;
 - fuzzy search using trigrams plus Levenshtein distance;
 - snapshots, online backup, authentication, TLS, metrics and a CLI;
-- a bounded daemon read cache, invalidated after every committed write.
+- a bounded daemon read cache, invalidated after every committed write;
+- optional automatic indexes for frequent query shapes, with TTL cleanup.
 
 These are capabilities often split across several services or reserved for
 larger databases and paid enterprise editions. nonodb puts them in one small,

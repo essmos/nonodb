@@ -9,6 +9,13 @@ pub static ERRORS: AtomicU64 = AtomicU64::new(0);
 pub static READ_OPS: AtomicU64 = AtomicU64::new(0);
 pub static CACHE_HITS: AtomicU64 = AtomicU64::new(0);
 pub static CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
+/// Auto-indeksy: kandydaci, aktywne indeksy i operacje konserwacyjne.
+pub static AUTO_INDEX_CANDIDATES: AtomicU64 = AtomicU64::new(0);
+pub static AUTO_INDEX_ACTIVE: AtomicU64 = AtomicU64::new(0);
+pub static AUTO_INDEX_CREATED: AtomicU64 = AtomicU64::new(0);
+pub static AUTO_INDEX_DROPPED: AtomicU64 = AtomicU64::new(0);
+pub static AUTO_INDEX_BUILD_NS: AtomicU64 = AtomicU64::new(0);
+pub static AUTO_INDEX_BUILD_ERRORS: AtomicU64 = AtomicU64::new(0);
 /// Liczba operacji wykonanych w żądaniach `/v1/batch`.
 pub static BATCH_OPS: AtomicU64 = AtomicU64::new(0);
 pub static WRITE_OPS: AtomicU64 = AtomicU64::new(0);
@@ -48,6 +55,12 @@ pub fn snapshot() -> Value {
         "read_ops_total": READ_OPS.load(Relaxed),
         "cache_hits_total": CACHE_HITS.load(Relaxed),
         "cache_misses_total": CACHE_MISSES.load(Relaxed),
+        "auto_index_candidates": AUTO_INDEX_CANDIDATES.load(Relaxed),
+        "auto_index_active": AUTO_INDEX_ACTIVE.load(Relaxed),
+        "auto_index_created_total": AUTO_INDEX_CREATED.load(Relaxed),
+        "auto_index_dropped_total": AUTO_INDEX_DROPPED.load(Relaxed),
+        "auto_index_build_ns_total": AUTO_INDEX_BUILD_NS.load(Relaxed),
+        "auto_index_build_errors_total": AUTO_INDEX_BUILD_ERRORS.load(Relaxed),
         "batch_ops_total": BATCH_OPS.load(Relaxed),
         "write_ops_total": write_ops,
         "write_batches_total": WRITE_BATCHES.load(Relaxed),

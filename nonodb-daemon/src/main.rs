@@ -4,6 +4,7 @@
 //! uvicorn) łączą się przez `/run/nonodb.sock` (ścieżki konfigurowalne przez
 //! `NONODB_SOCK` i `NONODB_DATA`).
 
+mod auto_index;
 mod cache;
 mod metrics;
 mod protocol;
@@ -54,6 +55,7 @@ struct AppState {
     store: Arc<Store>,
     write_tx: mpsc::Sender<WriteJob>,
     cache: Arc<cache::QueryCache>,
+    auto_index: Arc<auto_index::AutoIndexer>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -89,6 +91,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     std::thread::Builder::new()
         .name("nonodb-writer".into())
         .spawn(move || writer::run(writer_store, write_rx, writer_cache))?;
+    let auto_index = auto_index::AutoIndexer::start(store.clone(), write_tx.clone(), &data);
 
     if let Some(dir) = std::env::var_os("NONODB_SNAPSHOT_DIR") {
         spawn_snapshots(store.clone(), PathBuf::from(dir));
@@ -98,6 +101,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         store,
         write_tx,
         cache,
+        auto_index,
     };
     let app = Router::new()
         .route("/healthz", get(health))
@@ -353,10 +357,12 @@ async fn exec(
     let cache_version = state.cache.version();
     if let Some(key) = cache_key.as_deref() {
         if let Some(value) = state.cache.get(key) {
+            state.auto_index.record(&req, false);
             metrics::inc(&metrics::READ_OPS);
             return respond(Ok(value));
         }
     }
+    state.auto_index.record(&req, true);
 
     let response = match req {
         Request::Find {
@@ -612,7 +618,15 @@ async fn submit_write(state: &AppState, req: WriteReq) -> (StatusCode, Json<ApiR
     metrics::inc(&metrics::WRITE_OPS);
     metrics::inc(&metrics::QUEUE_LEN);
     metrics::note_queue();
-    if state.write_tx.send(WriteJob { req, resp: tx }).is_err() {
+    if state
+        .write_tx
+        .send(WriteJob {
+            req,
+            resp: tx,
+            isolated: false,
+        })
+        .is_err()
+    {
         metrics::sub(&metrics::QUEUE_LEN, 1);
         return respond(Err(ApiError::internal("writer unavailable")));
     }

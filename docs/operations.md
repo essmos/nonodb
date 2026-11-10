@@ -38,6 +38,15 @@ All daemon configuration is through environment variables.
 | `NONODB_CACHE_TTL` | `5` | Read-cache TTL in seconds; `0` disables the cache |
 | `NONODB_CACHE_ENTRIES` | `512` | Maximum number of cached read results |
 | `NONODB_CACHE_MAX_BYTES` | `262144` | Maximum serialized size of one cached result |
+| `NONODB_AUTO_INDEX` | `0` | Enables automatic indexes for frequent read shapes |
+| `NONODB_AUTO_INDEX_MIN_HITS` | `50` | Required cache misses in one window before creating an index |
+| `NONODB_AUTO_INDEX_WINDOW` | `300` | Frequency window in seconds |
+| `NONODB_AUTO_INDEX_MIN_DOCS` | `10000` | Minimum collection size for automatic indexing |
+| `NONODB_AUTO_INDEX_MAX` | `8` | Maximum number of automatic indexes |
+| `NONODB_AUTO_INDEX_MAX_FIELDS` | `3` | Maximum fields in an automatic compound index |
+| `NONODB_AUTO_INDEX_TTL` | `604800` | Drop an automatic index after this many seconds without demand |
+| `NONODB_AUTO_INDEX_MIN_AGE` | `3600` | Minimum age before an automatic index can be dropped |
+| `NONODB_AUTO_INDEX_INTERVAL` | `5` | Maintenance tick interval in seconds |
 | `NONODB_AUTH_TOKEN` | — | Enables bearer-token authentication |
 | `NONODB_ALLOWED_UIDS` | — | Comma-separated Unix uid allow-list for UDS |
 | `NONODB_ALLOWED_GIDS` | — | Comma-separated Unix gid allow-list for UDS |
@@ -71,6 +80,38 @@ read-after-write through the same daemon is fresh. The cache is bounded by
 `NONODB_CACHE_ENTRIES` and `NONODB_CACHE_MAX_BYTES`; oversized results are not
 stored. Set `NONODB_CACHE_TTL=0` to disable it. Metrics expose
 `cache_hits_total` and `cache_misses_total`.
+
+### Automatic indexes
+
+Automatic indexes are opt-in (`NONODB_AUTO_INDEX=1`). The daemon records only
+the *shape* of cache-missed `find`, `find_one`, and `count` requests: collection,
+indexable fields, and equality/range operators. It never records document
+values for this purpose.
+
+An index is created only when:
+
+- the shape reaches `NONODB_AUTO_INDEX_MIN_HITS` within the window;
+- the collection exists and has at least `NONODB_AUTO_INDEX_MIN_DOCS` documents;
+- the same index does not already exist;
+- the automatic-index limit has not been reached;
+- the write queue is not backlogged.
+
+Only simple string/number equality and range predicates are considered.
+`_id`, boolean/null conditions, arrays, `$or`, `$ne`, `$nin`, regex, and
+unsupported operators are ignored. Up to `NONODB_AUTO_INDEX_MAX_FIELDS`
+equality fields are used, followed by one range field when space remains.
+
+The index is built by the normal writer, in one LMDB write transaction, so it
+temporarily blocks other writes. The build job is isolated from group commit,
+so it does not share a transaction with unrelated user writes. Creation is
+skipped while more than 32 writes are queued. For large collections, prefer a
+scheduled manual index build over automatic creation.
+
+Automatic indexes are tracked in `auto-index.json` in `NONODB_DATA`. They are
+dropped after `NONODB_AUTO_INDEX_TTL` seconds without demand, but only when
+they are at least `NONODB_AUTO_INDEX_MIN_AGE` old. Manual indexes are never
+dropped automatically. The state file stores timestamps and index definitions,
+not document values.
 
 ## Deployment with systemd
 
@@ -434,6 +475,12 @@ Useful signals:
 | `avg_commit_us` | Commit latency; storage health indicator |
 | `queue_len` | Pending writes; sustained growth means writer saturation |
 | `queue_peak` | Historical peak queue |
+| `cache_hits_total` / `cache_misses_total` | Read-cache effectiveness |
+| `auto_index_candidates` | Query shapes currently above the frequency threshold |
+| `auto_index_active` | Automatic indexes currently tracked |
+| `auto_index_created_total` / `auto_index_dropped_total` | Automatic index churn |
+| `auto_index_build_ns_total` | Time spent building automatic indexes |
+| `auto_index_build_errors_total` | Failed automatic index builds |
 
 The health endpoint is public and cheap:
 

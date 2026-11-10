@@ -194,6 +194,51 @@ Use the cheapest access path that fits the query:
 For frequent queries, indexes and collection partitioning remain the only
 approaches that avoid linear scans.
 
+### Automatic indexes
+
+Automatic indexing is an opt-in optimization layer, not a replacement for
+schema design. It is disabled by default and must be enabled with
+`NONODB_AUTO_INDEX=1`.
+
+The daemon keeps in-memory frequency counters for cache-missed read shapes:
+
+```text
+collection + set of indexable fields + equality/range classification
+```
+
+Concrete values are deliberately not part of the key. A shape becomes a
+candidate after `NONODB_AUTO_INDEX_MIN_HITS` misses inside a rolling window.
+The auto-index worker then checks the collection size, existing indexes, limits,
+and write queue, and asks the normal writer to create the index:
+
+```text
+read cache miss ──▶ shape counter ──▶ candidate
+                                         │
+                                         ▼
+                              auto-index worker
+                                         │ CreateIndex / DropIndex
+                                         ▼
+                                    writer thread
+```
+
+The full scan path, raw prefilter, and read cache remain in place. If an
+automatic index is dropped or cannot be built, queries still return correct
+results through the fallback path.
+
+Automatic indexes are marked in `auto-index.json` in the data directory. Only
+those indexes are eligible for TTL eviction; manually created indexes are never
+removed. Demand is recorded even on cache hits so a hot query does not lose its
+index merely because the cache is serving it.
+
+Important limitations:
+
+- the index is built inside one LMDB write transaction and blocks writes;
+- creation is skipped when the write queue is backlogged;
+- only simple equality/range predicates are considered;
+- there is no selectivity histogram yet, so very broad indexes can be created
+  if the query is frequent enough;
+- sorting-only queries and `$or` shapes are not auto-indexed.
+
 ## Write path and group commit
 
 All writes go through a channel to one writer thread:

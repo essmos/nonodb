@@ -27,6 +27,8 @@ const MAX_WINDOW: Duration = Duration::from_millis(5);
 pub struct WriteJob {
     pub req: WriteReq,
     pub resp: oneshot::Sender<Result<Value, ApiError>>,
+    /// Tylko ta operacja w transakcji (np. długi backfill auto-indeksu).
+    pub isolated: bool,
 }
 
 /// Pętla wątku piszącego. Kończy się, gdy kanał zostanie zamknięty.
@@ -67,7 +69,7 @@ fn run_batch(store: &Store, cache: &QueryCache, jobs: Vec<WriteJob>) {
     // Atomowy `write_batch` nie może współdzielić transakcji z innymi
     // żądaniami: błąd jednej operacji musi wycofać całą jego transakcję, a nie
     // pozostałe zapisy z grupy. Dlatego taką grupę wykonujemy job po jobie.
-    if jobs.iter().any(|j| j.req.is_atomic()) {
+    if jobs.iter().any(|j| j.req.is_atomic() || j.isolated) {
         for job in jobs {
             run_single(store, cache, job);
         }

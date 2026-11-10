@@ -113,8 +113,8 @@ This runs:
 - Rust client unit/doc tests.
 
 The latest run before this documentation was written: **54 core unit tests,
-2 daemon cache tests, 5 property tests, 1 reopen test, and 2 Rust client unit
-tests**, all passing.
+7 daemon tests (cache and automatic-index selection), 5 property tests, 1
+reopen test, and 2 Rust client unit tests**, all passing.
 
 ### End-to-end scripts
 

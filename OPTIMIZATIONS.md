@@ -172,6 +172,24 @@ At 1M documents: cold `find` ~208 ms, cached ~2.2 ms; cold `count(grp=1)`
 ~783 ms, cached ~1.2 ms. Cache defaults to 5 seconds and is bounded by entry
 count and serialized value size.
 
+### Automatic indexes
+
+Frequent read shapes can be indexed automatically when
+`NONODB_AUTO_INDEX=1`. The daemon counts cache-missed `find`, `find_one`, and
+`count` shapes (collection + fields + equality/range operators), then asks the
+writer to create an index after a configurable hit threshold. Only automatic
+indexes are eligible for TTL eviction after
+`NONODB_AUTO_INDEX_TTL` seconds without demand. Manual indexes are never
+removed.
+
+The worker is conservative: it skips `_id`, booleans, null, arrays, `$or`,
+`$ne`, `$nin`, regex, and unsupported operators; it waits for a small write
+queue; and it enforces collection-size and index-count limits. Index builds
+still use one LMDB write transaction, so automatic creation is intended for
+small and medium collections or quiet periods. The build job is isolated from
+group commit, so unrelated user writes are not held inside the index-build
+transaction.
+
 ### Parallel index backfill
 
 Index creation reads raw chunks with one read transaction; worker threads parse
