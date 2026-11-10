@@ -45,7 +45,7 @@ limitations are documented in [docs/roadmap.md](docs/roadmap.md).
 - [ ] `$mul`, `$currentDate`
 - [ ] Nested projections
 - [ ] TTL indexes and background expiry
-- [ ] Aggregation subset (`$match`, `$group`, `$project`, `$sort`, `$limit`)
+- [x] Aggregation subset (`$match`, `$group`, `$project`, `$sort`, `$limit`)
 
 ### P3 — security and durability
 

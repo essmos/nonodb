@@ -79,4 +79,5 @@ export class Collection {
   find(filter?: Record<string, unknown>, options?: FindOptions): Promise<any[]>;
   findOne(filter?: Record<string, unknown>, options?: { projection?: Record<string, 0 | 1> }): Promise<any | null>;
   count(filter?: Record<string, unknown>): Promise<number>;
+  aggregate(pipeline: Record<string, unknown>[]): Promise<any[]>;
 }

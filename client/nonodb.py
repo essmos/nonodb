@@ -474,3 +474,9 @@ class Collection:
         return self._db.exec(
             {"op": "count", "coll": self.name, "filter": filter or {}}
         )["count"]
+
+    def aggregate(self, pipeline: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Runs a read-only aggregation pipeline and returns its result rows."""
+        return self._db.exec(
+            {"op": "aggregate", "coll": self.name, "pipeline": pipeline}
+        )["results"]

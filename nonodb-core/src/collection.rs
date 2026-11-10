@@ -9,6 +9,7 @@ use heed::types::Bytes;
 use heed::{Database, Env, RoTxn, RwTxn};
 use serde_json::{Map, Value};
 
+use crate::aggregate;
 use crate::error::{Error, Result};
 use crate::history::{self, HistoryConfig, HistoryEntry};
 use crate::index::{self, IndexDef};
@@ -1274,6 +1275,42 @@ impl<'e> Collection<'e> {
 
     // ----------------------------- read ------------------------------
 
+    /// Runs a read-only aggregation pipeline over this collection.
+    ///
+    /// A leading `$match` is pushed into the normal find path so indexes and
+    /// `_id` ranges can be used. Intermediate results are capped by
+    /// [`aggregate::MAX_AGGREGATE_DOCS`].
+    pub fn aggregate(&self, pipeline: &[Value]) -> Result<Vec<Value>> {
+        let rtxn = self.read_txn()?;
+        let out = self.aggregate_in(&rtxn, pipeline);
+        rtxn.commit()?;
+        out
+    }
+
+    pub fn aggregate_in(&self, rtxn: &RoTxn<'_>, pipeline: &[Value]) -> Result<Vec<Value>> {
+        let (filter, remaining) = match pipeline.first() {
+            Some(Value::Object(stage)) if stage.len() == 1 && stage.contains_key("$match") => {
+                (stage["$match"].clone(), &pipeline[1..])
+            }
+            _ => (Value::Null, pipeline),
+        };
+        let query = FindQuery {
+            filter,
+            projection: None,
+            sort: Vec::new(),
+            skip: 0,
+            limit: Some(aggregate::MAX_AGGREGATE_DOCS.saturating_add(1)),
+        };
+        let docs = self.find_in(rtxn, &query)?;
+        if docs.len() > aggregate::MAX_AGGREGATE_DOCS {
+            return Err(Error::Query(format!(
+                "aggregation input exceeds {} documents",
+                aggregate::MAX_AGGREGATE_DOCS
+            )));
+        }
+        aggregate::run(docs, remaining, aggregate::MAX_AGGREGATE_DOCS)
+    }
+
     pub fn find(&self, query: &FindQuery) -> Result<Vec<Value>> {
         let rtxn = self.read_txn()?;
         let limit = query.limit.unwrap_or(usize::MAX);
@@ -2308,7 +2345,7 @@ fn index_matches_sort(def: &IndexDef, sort: &[(String, i32)]) -> Option<bool> {
     Some(!positive)
 }
 
-fn compare_docs(a: &Value, b: &Value, sort: &[(String, i32)]) -> Ordering {
+pub(crate) fn compare_docs(a: &Value, b: &Value, sort: &[(String, i32)]) -> Ordering {
     for (field, dir) in sort {
         let ord = compare_values(value_at(a, field), value_at(b, field));
         if ord != Ordering::Equal {
@@ -3510,6 +3547,37 @@ mod tests {
         );
         assert_eq!(c.delete(&json!({"_id": id}), false).unwrap(), 1);
         assert_eq!(c.count(&json!({})).unwrap(), 1);
+    }
+
+    #[test]
+    fn aggregate_uses_leading_match_and_common_stages() {
+        let (_dir, store) = store();
+        let c = store.collection("orders").unwrap();
+        c.insert_one(json!({"tenant": "a", "amount": 10, "tags": ["x"]}))
+            .unwrap();
+        c.insert_one(json!({"tenant": "a", "amount": 20, "tags": ["x", "y"]}))
+            .unwrap();
+        c.insert_one(json!({"tenant": "b", "amount": 5, "tags": []}))
+            .unwrap();
+
+        let out = c
+            .aggregate(&[
+                json!({"$match": {"amount": {"$gte": 10}}}),
+                json!({"$group": {
+                    "_id": "$tenant",
+                    "total": {"$sum": "$amount"},
+                    "n": {"$sum": 1}
+                }}),
+                json!({"$sort": {"total": -1}}),
+                json!({"$project": {"_id": 0, "tenant": "$_id", "total": 1, "n": 1}}),
+            ])
+            .unwrap();
+        assert_eq!(out, vec![json!({"tenant": "a", "total": 30, "n": 2})]);
+
+        let out = c
+            .aggregate(&[json!({"$unwind": "$tags"}), json!({"$count": "rows"})])
+            .unwrap();
+        assert_eq!(out, vec![json!({"rows": 3})]);
     }
 }
 

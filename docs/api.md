@@ -72,6 +72,7 @@ client timeout with `NONODB_TIMEOUT` or the `timeout=` argument.
 | [`update`](#update) | Update or upsert documents |
 | [`delete`](#delete) | Delete documents |
 | [`count`](#count) | Count matching documents |
+| [`aggregate`](#aggregation) | Read-only aggregation pipeline |
 | [`create_index`](#create_index) | Create a secondary index |
 | [`drop_index`](#drop_index) | Drop a secondary index |
 | [`list_indexes`](#list_indexes) | List secondary indexes |
@@ -351,6 +352,132 @@ Optimizations:
 - A filter exactly matching the fields of an index can be counted from the
   index range without reading documents.
 - Other filters perform a full scan, but `count` does not materialize results.
+
+## aggregate
+
+```json
+{
+  "op": "aggregate",
+  "coll": "orders",
+  "pipeline": [
+    {"$match": {"status": "paid"}},
+    {"$group": {
+      "_id": "$tenant",
+      "total": {"$sum": "$amount"},
+      "n": {"$sum": 1}
+    }},
+    {"$sort": {"total": -1}},
+    {"$limit": 10}
+  ]
+}
+```
+
+Response:
+
+```json
+{
+  "ok": true,
+  "result": {
+    "results": [
+      {"_id": "acme", "total": 4200, "n": 37}
+    ]
+  }
+}
+```
+
+Aggregation is **read-only**. It runs in one LMDB read snapshot and is allowed
+in the read-only `batch` operation. A missing collection produces an empty
+`results` array.
+
+### Supported stages
+
+| Stage | Description |
+|---|---|
+| `$match` | Filter documents with the same filter language as `find` |
+| `$project` | Include/exclude fields, rename fields, or compute expressions |
+| `$addFields` / `$set` | Add or replace fields with expression results |
+| `$unset` | Remove one field or an array of fields |
+| `$unwind` | Expand an array into one document per element |
+| `$group` | Group by an expression and compute accumulators |
+| `$sort` | Sort by one or more fields |
+| `$skip` | Skip documents |
+| `$limit` | Limit documents |
+| `$count` | Replace the stream with one document containing the row count |
+
+A leading `$match` is pushed into the normal read path, so indexes and `_id`
+ranges can be used before the remaining pipeline runs.
+
+### Expressions
+
+Field references use `"$field"` or `"$nested.path"`. `$$ROOT` / `$$CURRENT`
+refer to the current document. Literals can be wrapped in `{"$literal": ...}`.
+
+Supported operators:
+
+- `$ifNull`, `$cond`
+- `$add`, `$subtract`, `$multiply`, `$divide`
+- `$concat`
+- `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`
+
+Projection follows MongoDB-style include/exclude rules. `{"_id": 0}` removes
+`_id`; `{"alias": "$field"}` renames a field; `{"total": {"$sum": ...}}` is not
+valid in `$project` (use `$group` for accumulators).
+
+### Group accumulators
+
+`$group` requires `_id` and accepts one accumulator per output field:
+
+```json
+{
+  "$group": {
+    "_id": "$tenant",
+    "total": {"$sum": "$amount"},
+    "average": {"$avg": "$amount"},
+    "first": {"$first": "$created_at"},
+    "last": {"$last": "$created_at"},
+    "min": {"$min": "$amount"},
+    "max": {"$max": "$amount"},
+    "all_ids": {"$push": "$_id"},
+    "unique_ids": {"$addToSet": "$_id"},
+    "rows": {"$count": {}}
+  }
+}
+```
+
+`$sum` and `$avg` ignore non-numeric values. `$addToSet` deduplicates by JSON
+value equality.
+
+### `$unwind`
+
+```json
+{"$unwind": "$tags"}
+{"$unwind": {"path": "$tags", "preserveNullAndEmptyArrays": true, "includeArrayIndex": "tag_index"}}
+```
+
+### `$sort`
+
+The object form is accepted:
+
+```json
+{"$sort": {"total": -1, "tenant": 1}}
+```
+
+Because JSON object key order is not guaranteed by all clients, the array form
+preserves explicit multi-field order:
+
+```json
+{"$sort": [["total", -1], ["tenant", 1]]}
+```
+
+### Limits
+
+- At most **100,000 documents** may exist in an intermediate result. The call
+  returns `invalid_query` if the limit is exceeded.
+- The normal request timeout (30 seconds by default) applies.
+- Response size is still limited by the HTTP response path and the client's
+  practical memory; use `$limit` and `$project` for large collections.
+- Not supported: `$lookup`, `$graphLookup`, `$facet`, `$bucket`,
+  `$bucketAuto`, `$merge`, `$out`, window functions, and arbitrary JavaScript.
 
 ## Filters
 

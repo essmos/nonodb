@@ -794,6 +794,23 @@ func (c *Collection) Count(ctx context.Context, filter map[string]any) (int64, e
 	return result.Count, nil
 }
 
+// Aggregate runs a read-only aggregation pipeline.
+func (c *Collection) Aggregate(ctx context.Context, pipeline []any) ([]map[string]any, error) {
+	raw, err := c.client.execRaw(ctx, map[string]any{
+		"op": "aggregate", "coll": c.Name, "pipeline": pipeline,
+	})
+	if err != nil {
+		return nil, err
+	}
+	var result struct {
+		Results []map[string]any `json:"results"`
+	}
+	if err := decodeInto(raw, &result); err != nil {
+		return nil, err
+	}
+	return result.Results, nil
+}
+
 func decodeDocuments(raw json.RawMessage) ([]map[string]any, error) {
 	var documents []map[string]any
 	if err := decodeInto(raw, &documents); err != nil {

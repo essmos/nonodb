@@ -44,6 +44,9 @@ with NonoDB("/run/nonodb.sock") as db:
     users = db.collection("users")
     users.insert({"name": "Ada", "age": 36})
     print(users.find({"age": {"$gte": 18}}))
+    print(users.aggregate([
+        {"$group": {"_id": "$tenant", "n": {"$sum": 1}}},
+    ]))
 ```
 
 ## Rust
@@ -74,13 +77,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .sort("age", -1)
         .limit(10);
     let adults = users.find(&query)?;
-    println!("{id}: {adults:?}");
+    let rows = users.aggregate(&[
+        json!({"$group": {"_id": "$tenant", "n": {"$sum": 1}}}),
+    ])?;
+    println!("{id}: {adults:?} {rows:?}");
     Ok(())
 }
 ```
 
 The Rust client exposes `exec`, `batch`, `write_batch`, `get_many`, history,
-indexes, text search, and fuzzy search. `Client::from_env()` reads `NONODB_SOCK`,
+aggregation, indexes, text search, and fuzzy search. `Client::from_env()` reads `NONODB_SOCK`,
 `NONODB_URL`, `NONODB_TOKEN`, and `NONODB_TLS_VERIFY`.
 
 ## Node.js
@@ -177,6 +183,7 @@ method.
 All clients expose the common document operations:
 
 - `insert`, `insert_many`, `find`, `find_one`, `update`, `delete`, `count`;
+- `aggregate` for read-only reporting pipelines;
 - `batch` (read-only) and `write_batch` (atomic writes);
 - `get_many` for fetching documents by `_id`;
 - `history` and `get_version` for document revisions (daemon history enabled);

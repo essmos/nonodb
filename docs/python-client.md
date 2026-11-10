@@ -161,6 +161,25 @@ n = users.count()                 # O(1) total count
 
 `count` returns an integer.
 
+## Aggregation
+
+```python
+rows = users.aggregate([
+    {"$match": {"active": True}},
+    {"$group": {
+        "_id": "$tenant",
+        "total": {"$sum": "$amount"},
+        "n": {"$sum": 1},
+    }},
+    {"$sort": {"total": -1}},
+    {"$limit": 10},
+])
+```
+
+`aggregate` is read-only and returns the pipeline result rows. The supported
+stages, expressions, accumulators, and the 100,000-document intermediate limit
+are documented in [Aggregation](api.md#aggregation).
+
 ### Filters
 
 The full filter language is documented in the [HTTP API](api.md#filters). In
@@ -441,7 +460,7 @@ db = NonoDB("/run/nonodb/nonodb.sock", cache_ttl=0.5)
 Behavior:
 
 - Cached operations: reads understood by the client (`find`, `find_one`,
-  `count`, list operations, `search`, `fuzzy`, `batch`).
+  `count`, `aggregate`, list operations, `search`, `fuzzy`, `batch`).
 - Any write through **this client instance** clears the entire cache.
 - Writes from other processes are not observed until the TTL expires.
 - Values are stored as serialized JSON; each cache hit deserializes a fresh

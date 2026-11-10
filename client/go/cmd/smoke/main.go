@@ -39,6 +39,16 @@ func main() {
 		log.Fatalf("insert_many: %v %v", ids, err)
 	}
 
+	grouped, err := users.Aggregate(ctx, []any{
+		map[string]any{"$match": map[string]any{"age": map[string]any{"$gte": 40}}},
+		map[string]any{"$group": map[string]any{
+			"_id": nil, "n": map[string]any{"$sum": 1},
+		}},
+	})
+	if err != nil || len(grouped) != 1 || grouped[0]["n"] != float64(2) {
+		log.Fatalf("aggregate: %v %v", grouped, err)
+	}
+
 	limit := int64(2)
 	adults, err := users.Find(ctx, nonodb.FindQuery{
 		Filter: map[string]any{"age": map[string]any{"$gte": 40}},

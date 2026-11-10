@@ -57,6 +57,12 @@ pub enum Request {
         #[serde(default)]
         filter: Value,
     },
+    /// Read-only aggregation pipeline.
+    Aggregate {
+        coll: String,
+        #[serde(default)]
+        pipeline: Vec<Value>,
+    },
     CreateIndex {
         coll: String,
         #[serde(default)]

@@ -423,6 +423,16 @@ class Collection {
     const result = await this.db.exec({ op: 'count', coll: this.name, filter });
     return result.count;
   }
+
+  /** Run a read-only aggregation pipeline. */
+  async aggregate(pipeline) {
+    const result = await this.db.exec({
+      op: 'aggregate',
+      coll: this.name,
+      pipeline,
+    });
+    return result.results ?? [];
+  }
 }
 
 module.exports = { NonoDB, NonoDBError, Collection };

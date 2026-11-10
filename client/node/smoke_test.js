@@ -20,6 +20,13 @@ async function main() {
   assert.equal(all.length, 2);
   assert.equal(await users.count({}), 3);
 
+  const grouped = await users.aggregate([
+    { $match: { age: { $gte: 40 } } },
+    { $group: { _id: null, n: { $sum: 1 }, names: { $push: '$name' } } },
+  ]);
+  assert.equal(grouped.length, 1);
+  assert.equal(grouped[0].n, 2);
+
   const adults = await users.find(
     { age: { $gte: 40 } },
     { sort: [['age', -1]], limit: 2 },

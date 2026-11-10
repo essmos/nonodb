@@ -44,7 +44,9 @@ Implemented:
 
 ### Query language
 
-- No aggregation pipeline, `$lookup`, `$graphLookup`, `$facet`, or `$group`.
+- The aggregation pipeline is bounded to 100,000 intermediate documents and
+  has no cross-collection joins (`$lookup`, `$graphLookup`), `$facet`, or write
+  stages (`$merge`, `$out`).
 - No regular-expression filters (`$regex`), `$size`, `$elemMatch`, `$type`,
   `$where`, or `$text` query operator.
 - No joins.
@@ -159,7 +161,8 @@ project's target workload.
 9. **Compression and/or CBOR storage** for smaller files and faster parsing,
    with a migration path.
 10. **TTL indexes** and background expiry.
-11. **Aggregation subset** (`$match`, `$group`, `$project`, `$sort`, `$limit`).
+11. **Expanded aggregation** beyond the current `$match`/`$group`/`$project`/
+    `$sort`/`$limit` subset, including streaming execution and more stages.
 
 ### Lower priority
 

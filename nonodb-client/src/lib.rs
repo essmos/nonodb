@@ -335,6 +335,7 @@ fn is_read_op(payload: &Value) -> bool {
             "find"
                 | "find_one"
                 | "count"
+                | "aggregate"
                 | "list_indexes"
                 | "list_collections"
                 | "list_text_indexes"
@@ -721,6 +722,20 @@ impl Collection<'_> {
             .get("count")
             .and_then(Value::as_u64)
             .ok_or_else(|| Error::InvalidResponse("missing count".into()))
+    }
+
+    /// Run a read-only aggregation pipeline.
+    pub fn aggregate(&self, pipeline: &[Value]) -> Result<Vec<Value>> {
+        let result = self.client.exec(json!({
+            "op": "aggregate",
+            "coll": self.name,
+            "pipeline": pipeline,
+        }))?;
+        result
+            .get("results")
+            .cloned()
+            .map(value_array)
+            .unwrap_or_else(|| Err(Error::InvalidResponse("missing aggregate results".into())))
     }
 }
 

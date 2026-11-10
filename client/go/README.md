@@ -31,3 +31,16 @@ end-to-end check.
 
 When the daemon is started with `NONODB_HISTORY=1`, use `History()` and
 `GetVersion()` on a collection.
+
+## Aggregation
+
+```go
+rows, err := users.Aggregate(ctx, []any{
+    map[string]any{"$match": map[string]any{"active": true}},
+    map[string]any{"$group": map[string]any{
+        "_id": "$tenant", "total": map[string]any{"$sum": "$amount"},
+    }},
+    map[string]any{"$sort": map[string]any{"total": -1}},
+    map[string]any{"$limit": 10},
+})
+```

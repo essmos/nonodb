@@ -417,6 +417,15 @@ async fn exec(
             read_result(joined).await
         }
 
+        Request::Aggregate { coll, pipeline } => {
+            let store = state.store.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                let c = store.collection(&coll)?;
+                Ok::<Value, ApiError>(json!({ "results": c.aggregate(&pipeline)? }))
+            });
+            read_result(joined).await
+        }
+
         Request::ListIndexes { coll } => {
             let store = state.store.clone();
             let joined = tokio::task::spawn_blocking(move || {
@@ -633,6 +642,7 @@ fn cacheable(req: &Request) -> bool {
         Request::Find { .. }
             | Request::FindOne { .. }
             | Request::Count { .. }
+            | Request::Aggregate { .. }
             | Request::Search { .. }
             | Request::Fuzzy { .. }
             | Request::ListIndexes { .. }
@@ -712,6 +722,12 @@ fn execute_read(store: &Store, rtxn: &RoTxn<'_>, req: Request) -> Result<Value, 
                 return Ok(json!({ "count": 0 }));
             };
             Ok(json!({ "count": c.count_in(rtxn, &filter)? }))
+        }
+        Request::Aggregate { coll, pipeline } => {
+            let Some(c) = store.collection_at(rtxn, &coll)? else {
+                return Ok(json!({ "results": [] }));
+            };
+            Ok(json!({ "results": c.aggregate_in(rtxn, &pipeline)? }))
         }
         Request::ListIndexes { coll } => {
             let Some(c) = store.collection_at(rtxn, &coll)? else {

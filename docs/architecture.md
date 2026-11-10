@@ -182,6 +182,20 @@ range in either direction and stop after `skip + limit`.
 Clients can split a large non-indexed scan into disjoint `_id` ranges and issue
 them concurrently; each request reads only its range.
 
+### Aggregation
+
+Aggregation is implemented in `nonodb-core/src/aggregate.rs` and is strictly
+read-only. The daemon runs it in a blocking task with one `RoTxn`. A leading
+`$match` is extracted and executed through the normal `find_in` path, so
+secondary indexes and primary-key ranges still apply. The remaining stages are
+evaluated in memory. Intermediate results are capped at 100,000 documents to
+keep memory bounded; this is a deliberate first-version limit rather than a
+query-planning restriction.
+
+`$sort` reuses the same document comparator as `find`, and expressions reuse
+the path helpers used by filters and updates. `$addToSet` and grouping keys
+serialize values to canonical JSON strings for deduplication and grouping.
+
 ### Choosing a read strategy
 
 Use the cheapest access path that fits the query:

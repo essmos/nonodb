@@ -7,9 +7,9 @@ quick-start instructions, and a feature overview.
 
 | Guide | Audience | Contents |
 |---|---|---|
-| [Architecture](architecture.md) | Maintainers, advanced users | Process model, LMDB layout, write path, indexes, search, crash safety |
-| [HTTP API](api.md) | All client authors | Operations, request/response formats, filters, updates, errors |
-| [Clients](clients.md) | Application developers | Python, Rust, Node.js and Go: install, connection, CRUD, batches, indexes, search |
+| [Architecture](architecture.md) | Maintainers, advanced users | Process model, LMDB layout, write path, indexes, search, aggregation, crash safety |
+| [HTTP API](api.md) | All client authors | Operations, request/response formats, filters, updates, aggregation, errors |
+| [Clients](clients.md) | Application developers | Python, Rust, Node.js and Go: install, connection, CRUD, batches, indexes, search, aggregation |
 | [Python client](python-client.md) | Python developers | Connection, CRUD, upsert, indexes, search, batches, cache, FastAPI |
 | [CLI](cli.md) | Operators | Administration, backup, restore, inspect, raw requests |
 | [Operations](operations.md) | Operators, SRE | Configuration, deployment, security, snapshots, monitoring, capacity, troubleshooting |

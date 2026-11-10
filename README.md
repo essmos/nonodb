@@ -27,6 +27,7 @@ nonodb is a real document database with:
 - full-text search with **BM25** ranking, Unicode tokenization, diacritic
   folding and quoted phrases;
 - fuzzy search using trigrams plus Levenshtein distance;
+- a read-only aggregation pipeline for reporting and summaries;
 - snapshots, online backup, authentication, TLS, metrics and a CLI;
 - document revision history with global revision IDs and configurable retention;
 - a bounded daemon read cache, invalidated after every committed write;
@@ -105,7 +106,8 @@ nonodb is deliberately not a general-purpose distributed database. It has:
 - no sharding, replication, or clustering;
 - no general interactive multi-document transactions;
 - no MongoDB wire-protocol compatibility;
-- no aggregation framework, `$lookup`, or TTL indexes;
+- no cross-collection joins (`$lookup`), write stages (`$merge`/`$out`), or
+  TTL indexes;
 - no user/role system beyond a bearer token;
 - a practical subset of MongoDB query and update operators.
 
@@ -159,6 +161,35 @@ footprint.
 - Quoted phrases requiring contiguous token sequences.
 - Fuzzy search with trigrams plus bounded Levenshtein distance (`_distance`).
 - Both search indexes are maintained in the same transaction as the document.
+
+### Aggregation
+
+- Read-only `aggregate` endpoint for reporting, grouping, and summaries.
+- Stages: `$match`, `$project`, `$addFields`/`$set`, `$unset`, `$unwind`,
+  `$group`, `$sort`, `$skip`, `$limit`, and `$count`.
+- Accumulators: `$sum`, `$avg`, `$min`, `$max`, `$first`, `$last`, `$push`,
+  `$addToSet`, and `$count`.
+- A leading `$match` uses the normal query planner, including secondary indexes
+  and `_id` ranges.
+- Expressions support field references (`"$field"`), `$$ROOT`, `$literal`,
+  `$ifNull`, arithmetic, `$concat`, `$cond`, and comparison operators.
+
+```bash
+curl -s --unix-socket /tmp/nonodb.sock \
+  -H 'content-type: application/json' \
+  -X POST http://localhost/v1/exec \
+  -d '{"op":"aggregate","coll":"orders","pipeline":[
+        {"$match":{"status":"paid"}},
+        {"$group":{"_id":"$tenant","total":{"$sum":"$amount"},"n":{"$sum":1}}},
+        {"$sort":{"total":-1}},
+        {"$limit":10}
+      ]}'
+```
+
+Aggregation is intentionally bounded: an intermediate result may contain at
+most 100,000 documents. It never writes to the database and is available inside
+the read-only `batch` operation. See
+[Aggregation](docs/api.md#aggregation) for the full stage list and semantics.
 
 ### Document history
 

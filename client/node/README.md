@@ -39,3 +39,16 @@ end-to-end check.
 
 When the daemon is started with `NONODB_HISTORY=1`, use `history()` and
 `getVersion()` on a collection.
+
+## Aggregation
+
+Use `aggregate()` for a read-only reporting pipeline:
+
+```js
+const rows = await users.aggregate([
+  { $match: { active: true } },
+  { $group: { _id: '$tenant', total: { $sum: '$amount' } } },
+  { $sort: { total: -1 } },
+  { $limit: 10 },
+]);
+```

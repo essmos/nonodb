@@ -18,6 +18,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let one = users.find_one(&json!({"_id": id}), None)?;
     println!("one: {}", serde_json::to_string(&one)?);
 
+    let rows = users.aggregate(&[
+        json!({"$match": {"age": {"$gte": 18}}}),
+        json!({"$group": {"_id": null, "n": {"$sum": 1}}}),
+    ])?;
+    println!("aggregate: {}", serde_json::to_string(&rows)?);
+
     if matches!(
         std::env::var("NONODB_HISTORY")
             .unwrap_or_default()

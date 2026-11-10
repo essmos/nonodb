@@ -10,4 +10,4 @@ See [docs/clients.md](../docs/clients.md) for installation and examples.
 ## Document history
 
 When the daemon is started with `NONODB_HISTORY=1`, all clients expose
-history and exact-revision helpers.
+history, exact-revision helpers, and aggregation.

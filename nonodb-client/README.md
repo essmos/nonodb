@@ -41,3 +41,14 @@ client guide.
 
 When the daemon is started with `NONODB_HISTORY=1`, use `history()` and
 `get_version()` on a collection.
+
+## Aggregation
+
+```rust
+let rows = users.aggregate(&[
+    json!({"$match": {"active": true}}),
+    json!({"$group": {"_id": "$tenant", "total": {"$sum": "$amount"}}}),
+    json!({"$sort": {"total": -1}}),
+    json!({"$limit": 10}),
+])?;
+```

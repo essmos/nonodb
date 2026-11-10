@@ -11,6 +11,7 @@
 //!   `ft:<coll>:<field>`  - BM25 postings (full-text);
 //!   `fz:<coll>:<field>`  - trigrams (fuzzy search).
 
+pub mod aggregate;
 pub mod collection;
 pub mod error;
 pub mod history;
@@ -19,6 +20,7 @@ pub mod query;
 pub mod search;
 pub mod store;
 
+pub use aggregate::MAX_AGGREGATE_DOCS;
 pub use collection::{Collection, FindQuery, UpdateOutcome};
 pub use error::{Error, Result};
 pub use history::{HistoryConfig, HistoryEntry, DEFAULT_HISTORY_MAX_VERSIONS};
