@@ -7,10 +7,10 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag, e.g. v0.1.0 or v0.1.0-beta.1"
+        description: "Release tag, e.g. v0.3.0 or v0.4.0-beta.1"
         required: true
         type: string
-        default: "v0.1.0"
+        default: "v0.3.0"
       prerelease:
         description: "Mark this release as a pre-release"
         required: false
@@ -54,7 +54,7 @@ jobs:
           PRE="${{ github.event.inputs.prerelease || 'false' }}"
           DRAFT="${{ github.event.inputs.draft || 'false' }}"
 
-          # Tags such as v0.1.0-beta.1 or v0.2.0-rc.1 are pre-releases
+          # Tags such as v0.4.0-beta.1 or v0.4.0-rc.1 are pre-releases
           # automatically, even when the flag was not set manually.
           if [[ "${TAG}" == *-* ]]; then
             PRE=true
