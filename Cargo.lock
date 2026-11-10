@@ -936,7 +936,7 @@ dependencies = [
 
 [[package]]
 name = "nonodb-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "nonodb-core",
  "serde_json",
@@ -944,7 +944,7 @@ dependencies = [
 
 [[package]]
 name = "nonodb-client"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "reqwest",
  "serde",
@@ -953,7 +953,7 @@ dependencies = [
 
 [[package]]
 name = "nonodb-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "heed",
  "memchr",
@@ -969,7 +969,7 @@ dependencies = [
 
 [[package]]
 name = "nonodb-daemon"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "axum",
  "hyper",
