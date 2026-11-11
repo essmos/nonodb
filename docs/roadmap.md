@@ -5,7 +5,7 @@ is deliberately out of scope, and which gaps are candidates for future work.
 
 ## Current status
 
-The project is at `0.7.0`. It is suitable for local and single-host
+The project is at `0.8.0`. It is suitable for local and single-host
 applications that need a small, durable, queryable JSON store and can accept a
 single-writer model.
 
@@ -21,6 +21,8 @@ Implemented:
 - atomic find-and-modify returning the old or new document;
 - `explain` with access path, index/bounds, sort coverage, and actual counts;
 - single-field, compound, unique, and covering indexes;
+- single-field GeoJSON point geo indexes with `$near`, `$geoWithin`, and
+  `$geoIntersects`;
 - index-only sorted scans and index-backed counts;
 - BM25 full-text search with diacritic folding and phrases;
 - fuzzy search with trigrams and bounded Levenshtein distance;
