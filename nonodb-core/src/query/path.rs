@@ -38,6 +38,44 @@ pub fn get<'a>(val: &'a Value, path: &str) -> Option<&'a Value> {
     Some(cur)
 }
 
+/// Reads all values reached by a path, traversing arrays for non-numeric
+/// segments. For example, `items.price` on an array of objects returns the
+/// price from every object that has it.
+pub fn get_values<'a>(val: &'a Value, path: &str) -> Vec<&'a Value> {
+    fn walk<'a>(val: &'a Value, parts: &[&str], out: &mut Vec<&'a Value>) {
+        let Some((part, rest)) = parts.split_first() else {
+            out.push(val);
+            return;
+        };
+        match val {
+            Value::Object(obj) => {
+                if let Some(child) = obj.get(*part) {
+                    walk(child, rest, out);
+                }
+            }
+            Value::Array(items) => {
+                if let Some(index) = array_index(part) {
+                    if let Some(child) = items.get(index) {
+                        walk(child, rest, out);
+                    }
+                } else {
+                    for item in items {
+                        walk(item, parts, out);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let parts: Vec<&str> = path.split('.').collect();
+    if parts.iter().any(|part| part.is_empty()) {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    walk(val, &parts, &mut out);
+    out
+}
+
 /// Mutable read of a value at a path (without creating missing fields).
 pub fn get_mut<'a>(val: &'a mut Value, path: &str) -> Option<&'a mut Value> {
     match path.split_once('.') {
@@ -134,6 +172,19 @@ mod tests {
         assert_eq!(doc["items"][1]["name"], "c");
         assert!(unset(&mut doc, "items.0.name"));
         assert!(doc["items"][0]["name"].is_null());
+    }
+
+    #[test]
+    fn get_values_traverses_arrays() {
+        let doc = json!({
+            "items": [{"price": 5}, {"price": 10}, {"other": 1}],
+            "nested": [[{"v": 2}]],
+            "tags": ["a", "b"]
+        });
+        assert_eq!(get_values(&doc, "items.price"), vec![&json!(5), &json!(10)]);
+        assert_eq!(get_values(&doc, "nested.v"), vec![&json!(2)]);
+        assert_eq!(get_values(&doc, "tags"), vec![&json!(["a", "b"])]);
+        assert!(get_values(&doc, "items.missing").is_empty());
     }
 
     #[test]

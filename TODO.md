@@ -37,6 +37,16 @@ limitations are documented in [docs/roadmap.md](docs/roadmap.md).
 - [x] Group commit, request limits/timeouts, metrics
 - [x] Snapshots, online backup, restore, inspect, CLI
 - [x] Python client, Docker, systemd, crash/concurrency/large-data tests
+- [x] Planner: sort-only index scans, top-level `$or` index union, `$type` index ranges
+- [x] Index-build progress in `/metrics` and a dedicated `NONODB_INDEX_TIMEOUT`
+- [x] `find_cursor`/`aggregate_cursor` keyset pagination with `get_more`/`close_cursor`
+- [x] Aggregation: consecutive `$match` fusion, terminal `$count` fast path, in-place stages
+- [x] Aggregation: bounded top-K `$sort`+`$limit`, fused document-local stages,
+      streaming leading `$group`, configurable `NONODB_AGGREGATE_MAX_DOCS`
+- [x] Multikey indexes for arrays and dotted array paths, immutable-index
+      metadata, indexed `$all`/`$elemMatch`, and multikey sort order
+- [x] Unique multikey indexes: same-document duplicates allowed, cross-document
+      duplicates rejected
 
 ## Next
 
@@ -59,7 +69,8 @@ limitations are documented in [docs/roadmap.md](docs/roadmap.md).
 - [x] Backup/restore verification: SHA-256 manifests, deep document/index
       checks, and an automated restore drill
 - [x] Graceful drain on shutdown and structured logs
-- [ ] Latency histograms and index-build progress in metrics
+- [x] Index-build progress in metrics (`processed`/`total`/`elapsed`)
+- [ ] Latency histograms
 - [ ] Configurable backfill/scan worker counts
 - [ ] Incremental index backfill writes to reduce peak RAM
 - [ ] Raw JSON passthrough for `find` without projection/sort
@@ -83,6 +94,9 @@ limitations are documented in [docs/roadmap.md](docs/roadmap.md).
 - [ ] BSON Timestamp and MinKey/MaxKey
 - [ ] Regular-expression values and legacy BSON value compatibility, excluding
       executable code types
+- [x] Index union for top-level `$or` across indexed fields
+- [x] Use an index for sort-only queries without a filter
+- [x] `$type` index ranges for indexed scalar fields
 - [ ] Non-finite Decimal128 values
 
 ### P1 — durability and operations
@@ -90,6 +104,15 @@ limitations are documented in [docs/roadmap.md](docs/roadmap.md).
 - [ ] Point-in-time recovery / WAL
 - [ ] Incremental backups
 - [ ] Encryption-at-rest integration guidance
+
+### P1 — tooling and administration
+
+- [ ] Add a separate read-only `nonodb-panel` web UI for browsing collections,
+      documents, filters, sort/projection, indexes, collection TTL, health,
+      metrics, and `explain`. Run it outside the daemon, keep the bearer token
+      server-side, bind to loopback by default, and use the existing HTTP/JSON
+      API. Add an explicit, guarded write mode later with confirmations and
+      audit coverage.
 
 ### P2 — indexes, search, and storage
 
@@ -119,6 +142,11 @@ limitations are documented in [docs/roadmap.md](docs/roadmap.md).
   restart; the LMDB file itself only shrinks through a compacting backup/restore.
 - Projection and index covering are top-level only.
 - Search is scalar-field only and has no custom analyzers.
+- Indexes created before format 5 do not contain array entries; recreate them
+  after upgrading if you query or sort array fields.
+- Multikey compound indexes reject parallel arrays. `$size` is not index-backed.
+- Aggregation groups are not spilled to disk; raise
+  `NONODB_AGGREGATE_MAX_DOCS` or reduce group cardinality for very large jobs.
 
 ## Rules of thumb
 

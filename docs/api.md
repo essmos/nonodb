@@ -682,6 +682,79 @@ preserves explicit multi-field order:
 - Not supported: `$lookup`, `$graphLookup`, `$facet`, `$bucket`,
   `$bucketAuto`, `$merge`, `$out`, window functions, and arbitrary JavaScript.
 
+## Cursors
+
+Cursors page large result sets through `_id` keyset pagination. They keep
+server memory bounded and do not hold an LMDB read transaction between requests.
+Batch size defaults to 500 and is clamped to 1–1000.
+
+### cursor_find
+
+```json
+{
+  "op": "cursor_find",
+  "coll": "events",
+  "filter": {"tenant": "acme"},
+  "projection": {"type": 1, "at": 1},
+  "sort": [["_id", 1]],
+  "skip": 0,
+  "limit": 100000,
+  "batch_size": 500
+}
+```
+
+`sort` must be omitted/empty or contain exactly one `_id` field with `1` or
+`-1`. Use a regular `find` for arbitrary sorts. `limit` is the total number of
+documents the cursor may return, not a batch size.
+
+### cursor_aggregate
+
+```json
+{
+  "op": "cursor_aggregate",
+  "coll": "events",
+  "pipeline": [
+    {"$match": {"tenant": "acme"}},
+    {"$project": {"type": 1, "at": 1}}
+  ],
+  "batch_size": 500
+}
+```
+
+Cursor aggregation supports an optional leading `$match`, then only
+document-local stages that preserve one output per input: `$project`,
+`$addFields`/`$set`, and `$unset`. Blocking stages (`$group`, `$unwind`,
+`$sort`, `$count`, `$skip`, `$limit`) require a regular `aggregate`.
+
+Both cursor operations return the first page:
+
+```json
+{
+  "cursor_id": 7,
+  "docs": [{"_id": "a", "type": "login"}],
+  "has_more": true
+}
+```
+
+### get_more
+
+```json
+{"op": "get_more", "cursor_id": 7, "batch_size": 500}
+```
+
+Returns `{cursor_id, docs, has_more}`. A cursor is single-consumer: concurrent
+`get_more` calls return `cursor_busy`. Idle cursors expire after five minutes.
+
+### close_cursor
+
+```json
+{"op": "close_cursor", "cursor_id": 7}
+```
+
+Returns `{cursor_id, closed}`. Closing an unknown or already-closed cursor is
+not an error. Cursors are isolated by principal and are not supported for vault
+collections.
+
 ## Filters
 
 A filter is a JSON object. Multiple fields are combined with AND. An empty
@@ -843,9 +916,9 @@ filter:
 ```
 
 Malformed arguments return `invalid_query`: `$all` must be an array, `$size` a
-non-negative integer, and `$elemMatch` an object. Array fields are not
-secondary-indexed; only a single-value `$all` on a scalar field can use an
-ordinary index. Regex values inside `$all`/`$elemMatch` are not supported.
+non-negative integer, and `$elemMatch` an object. Multikey indexes serve array
+equality, `$all`, ranges, and simple `$elemMatch` conditions; `$size` still
+requires a scan. Regex values inside `$all`/`$elemMatch` are not supported.
 
 ### Semantics
 
@@ -859,7 +932,8 @@ ordinary index. Regex values inside `$all`/`$elemMatch` are not supported.
   fields; `$exists` distinguishes present `null` from absent.
 - **Array membership.** `{"tags": "rust"}` matches a document where `tags` is
   `["rust", "lmdb"]`.
-- **Nested paths.** Dots traverse nested objects: `{"a.b.c": 7}`.
+- **Nested paths.** Dots traverse nested objects (`{"a.b.c": 7}`) and arrays
+  of objects (`{"items.price": {"$gte": 10}}`).
 - **No `$where` or `$text` operator.** Full-text search is a separate
   operation.
 
@@ -890,9 +964,11 @@ Directions: `1` ascending, `-1` descending. Missing values and `null` sort
 last. Equal keys are ordered deterministically by `_id`.
 
 An index can serve the sort only when the requested sort matches the full index
-field order and all directions are the same. Otherwise nonodb performs a scan
-and bounded top-K sort. Full-collection sorts and selective unsorted scans are
-parallelized for shallow queries.
+field order and all directions are the same. A multikey sort uses the lowest
+array element for ascending order and the highest for descending order, with
+same-document duplicates removed. Otherwise nonodb performs a scan and bounded
+top-K sort. Full-collection sorts and selective unsorted scans are parallelized
+for shallow queries.
 
 ---
 
@@ -935,11 +1011,17 @@ Rules:
 - Provide either `field` (single) or `fields` (ordered list). `fields` is
   preferred for new code.
 - The index name is the fields joined by `+`.
-- Indexable values are scalars: string, number, Decimal128, special doubles,
-  boolean, Extended JSON dates, binary/UUID, and ObjectId. Arrays and ordinary
-  objects are skipped.
+- Indexable values are string, number, Decimal128, special doubles, boolean,
+  Extended JSON dates, binary/UUID, and ObjectId. Ordinary objects remain
+  unindexed, but arrays create multikey entries: one key per scalar element.
+  Dotted fields expand arrays of objects, so an index on `items.price` indexes
+  every `price` value.
+- A compound index may contain at most one array field. Parallel arrays are
+  rejected during index creation or write with `invalid_query`.
 - A unique index enforces uniqueness of the full key. For compound indexes,
-  that means the combination, not each field individually.
+  that means the combination, not each field individually. A unique multikey
+  index accepts repeated elements within the same document (`tags: ["x","x"]`)
+  but rejects the same key in another document.
 - Creating an index on an existing collection performs a synchronous backfill.
   Writers are blocked while the backfill write transaction is active.
 - `include` copies extra fields into index values for covering projections.
@@ -949,10 +1031,12 @@ Rules:
   unique constraints. No index type annotation is required.
 - Numbers use an exact, order-preserving decimal encoding. Decimal128 shares
   the numeric type tag, so `1`, `1.0`, and `NumberDecimal("1")` share a key.
-- Index format version 4 adds binary/UUID and ObjectId keys. Indexes created
-  with an older format are skipped for filters containing binary, ObjectId,
-  numbers, or dates; those queries fall back to a scan until the index is
-  recreated. See [BSON scalar types](bson-types.md).
+- Index format version 5 adds multikey array entries. Older indexes do not
+  contain array documents and are not used for planning; recreate them after
+  upgrading. See [BSON scalar types](bson-types.md).
+- Multikey filter ranges deduplicate document ids. `$all` intersects one index
+  range per value, and `$elemMatch` can use a dotted index on the matching
+  element path. `$size` still requires a scan.
 
 ## drop_index
 
@@ -986,12 +1070,19 @@ Response:
         "field": "email",
         "fields": ["email"],
         "unique": true,
-        "include": []
+        "include": [],
+        "format": 5,
+        "multikey_fields": [],
+        "multikey_all_docs": true
       }
     ]
   }
 }
 ```
+
+`multikey_fields` lists indexed fields that produced array entries.
+`multikey_all_docs` is `true` only while every document has at least one entry,
+which is required for an index to provide multikey sort order.
 
 ## Full-text indexes
 
@@ -1464,6 +1555,7 @@ administrator; TCP requires a bearer token or registered client certificate.
 | `ttl_expired_total` | Documents deleted by TTL |
 | `ttl_sweep_errors_total` | Failed TTL sweeps |
 | `ttl_backlog` | Due entries observed by the last sweep |
+| `index_builds` | Active/recent index, text, and fuzzy backfills with processed/total/elapsed |
 | `avg_batch_size` | Write ops per committed write transaction |
 | `avg_commit_us` | Average commit time in microseconds |
 
@@ -1486,6 +1578,8 @@ administrator; TCP requires a bearer token or registered client certificate.
 | `forbidden` | 403 | Principal lacks the required scope |
 | `rate_limited` | 429 | Too many failed logins from this IP; wait and retry |
 | `timeout` | 500 | Request exceeded the server timeout |
+| `cursor_not_found` | 400 | Cursor is unknown, expired, closed, or belongs to another principal |
+| `cursor_busy` | 400 | Another `get_more` is already reading this cursor |
 | `storage` | 500 | LMDB/storage error |
 | `io` | 500 | Filesystem or I/O error |
 | `internal` | 500 | Internal daemon error |

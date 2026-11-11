@@ -111,8 +111,8 @@ items.find({"tags": {"$size": 2}})
 items.find({"items": {"$elemMatch": {"sku": "x", "qty": {"$gt": 5}}}})
 ```
 
-Malformed operator arguments return `invalid_query`. Array fields are not
-secondary-indexed.
+Malformed operator arguments return `invalid_query`. Arrays are supported by
+multikey secondary indexes; `$size` still requires a scan.
 
 ## Python
 

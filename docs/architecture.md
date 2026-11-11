@@ -439,9 +439,9 @@ Index definitions record the key-encoding format. Definitions written before
 date support default to format 0 and are not used for filters containing dates,
 because those indexes skipped `$date` objects during backfill. Version 2 used
 the old `f64` numeric transform; version 3 uses exact numeric keys; version 4
-adds binary/UUID and ObjectId keys. Filters containing numbers, dates, binary,
-or ObjectId values skip older-format indexes and fall back to a scan. Recreating
-the index upgrades it to the current format.
+adds binary/UUID and ObjectId keys; version 5 adds multikey array entries.
+Indexes older than the current format are not used by the planner; recreate
+them after upgrading to include all values.
 
 ### Compound indexes
 
@@ -457,7 +457,9 @@ It does not attempt arbitrary index intersection or multi-index plans.
 
 A unique index rejects a document whose full indexed key already exists. For a
 compound unique index, uniqueness applies to the complete key, not to each
-field separately. Uniqueness is checked during inserts, updates, and backfill.
+field separately. A unique multikey index accepts repeated elements inside the
+same document but rejects the same key in another document. Uniqueness is
+checked during inserts, updates, and backfill.
 
 ### Covering indexes
 

@@ -151,13 +151,23 @@ footprint.
 - Replacement updates preserve `_id`.
 - Atomic `write_batch`: all operations commit or the whole batch rolls back.
 - Read-only `batch`: many reads in one LMDB snapshot and one HTTP round trip.
+- `find_cursor` / `aggregate_cursor`: bounded `_id` keyset pagination with
+  `get_more` and `close_cursor` for large result sets.
 
 ### Indexes
 
 - Single-field and compound secondary indexes.
-- Unique indexes, enforced on insert, update, and index backfill.
+- Multikey indexes: arrays produce one entry per element, including nested
+  paths such as `items.price`; compound indexes reject parallel arrays.
+- Unique indexes, enforced on insert, update, and index backfill. A unique
+  multikey index allows duplicate elements inside one document but not across
+  documents.
 - Order-preserving key encoding for ranges.
-- Index-only sorted scans when a sort matches the full index order.
+- Index-only sorted scans when a sort matches the full index order, including
+  sort-only queries with no filter. Multikey sorts use the lowest array element
+  ascending and the highest descending.
+- Top-level `$or` index union across indexed fields, `$type` index ranges,
+  indexed `$all`, and `$elemMatch` on dotted array paths.
 - Covering indexes with `include`, serving projections without fetching the
   document.
 - Index-backed `count` when the filter exactly matches the indexed fields.
@@ -179,6 +189,11 @@ footprint.
   `$group`, `$sort`, `$skip`, `$limit`, and `$count`.
 - Accumulators: `$sum`, `$avg`, `$min`, `$max`, `$first`, `$last`, `$push`,
   `$addToSet`, and `$count`.
+- Consecutive leading `$match` stages are fused, and a terminal `$count` skips
+  cardinality-preserving stages and unnecessary document materialization.
+- Document-local stages are fused into one pass, `$sort`+`$limit` uses a
+  bounded top-K heap, and a leading `$group` streams documents directly into
+  its accumulators.
 - A leading `$match` uses the normal query planner, including secondary indexes
   and `_id` ranges. `$sort`+`$limit`, `$skip`, `$limit`, simple `$project`, and
   a lone `$count` are also pushed into the query path where semantics allow.

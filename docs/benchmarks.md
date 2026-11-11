@@ -9,7 +9,7 @@ affect the numbers.
 
 | Component | Value |
 |---|---|
-| Date | 2026-11-09 (UTC) |
+| Date | 2026-11-11 (UTC) |
 | OS / kernel | Linux 6.14.0 x86_64 |
 | CPU | Intel Core Processor (Haswell, no TSX) |
 | CPU count | 8 vCPU |
@@ -255,9 +255,12 @@ whole collection.
   every document and, for `$unwind`, can increase the number of rows. Filter
   and limit before them whenever possible.
 - **`$group` is dominated by scanning and grouping keys.** Reducing input via
-  a leading `$match` is the largest single win. The current implementation uses
-  canonical JSON strings as group keys; a scalar-key fast path and streaming
-  grouping are possible future optimizations.
+  a leading `$match` is the largest single win. A leading `$group` now streams
+  documents directly into accumulators; high group cardinality still consumes
+  memory and is not spilled to disk. Raise `NONODB_AGGREGATE_MAX_DOCS` only
+  when the host has enough RAM.
+- **`$sort` followed by `$limit` uses a bounded top-K heap.** Sorting without a
+  following limit still materializes and sorts the whole result.
 - **Use the read cache for repeated reports.** It is disabled in this benchmark
   to show real execution cost. With the default 5-second TTL, an unchanged
   pipeline can be served from the daemon cache.
@@ -272,9 +275,10 @@ NONODB_SOCK=/tmp/nonodb-agg.sock \
   python3 scripts/aggregate_bench.py --docs 50000 --iters 10 --warmup 2
 ```
 
-The script keeps the data set at or below the 100,000-document aggregation
-input cap. Values vary with page-cache state, CPU frequency, and filesystem;
-compare rows from the same run rather than mixing separate runs.
+The script keeps the data set at or below the default 100,000-document
+aggregation budget (`NONODB_AGGREGATE_MAX_DOCS`). Values vary with page-cache
+state, CPU frequency, and filesystem; compare rows from the same run rather
+than mixing separate runs.
 
 ## Vault encryption overhead
 
@@ -424,6 +428,162 @@ Concurrent 12-process workload (24,000 writes + 96,000 reads):
 | 4M | 3,534 ops/s (p50 2.95 ms) | 6,983 ops/s (p50 1.31 ms) |
 | 8M | **3,187 ops/s** (p50 3.24 ms) | **7,669 ops/s** (p50 1.24 ms) |
 
+## 10M documents
+
+Fresh database, 10M documents (~150 bytes), indexes `grp`, `age`, `score`, plus
+500k text documents. `NONODB_MAP_SIZE=32GiB`, ext4, release build.
+
+| Metric | Result |
+|---|---|
+| Load 10M (`insert_many` chunks of 500) | **157.8 s (63,375 docs/s)** |
+| `data.mdb` after 3 indexes | 6.24 GB |
+| Backfill 3 indexes | **75.5 s** |
+| `find_one` by `_id` | 0.64 ms p50, 1.37 ms p95 |
+| `find(grp=x, limit=10)` via index | 1.01 ms p50, 2.09 ms p95 |
+| `find(age range, limit=10)` via index | 0.51 ms p50, 0.84 ms p95 |
+| `count({})` | 0.49 ms p50, 0.86 ms p95 |
+| `count(grp=x)` via index | 4.98 ms p50, 37.43 ms p95 |
+| `find(grp=x, sort age, limit=10)` | 42.72 ms p50, 65.90 ms p95 |
+| `find(name=..., limit=1)` **without index** | 1,269 ms p50, 1,762 ms p95 |
+| 1,000 batched `find_one` | 24.2 ms (41,367 ops/s) |
+| Load 500k text documents | 10.6 s |
+| Text index backfill, 500k docs | 5.0 s |
+| Fuzzy index backfill, 500k docs | 12.6 s |
+| Data file after text/fuzzy indexes | 7.12 GB |
+
+Indexed point reads remain sub-millisecond to low-millisecond at 10M documents.
+Unindexed scans are linear and take over a second at this size. The synchronous
+index backfill on 10M documents takes ~76 s. Index builds use the dedicated
+`NONODB_INDEX_TIMEOUT` (3600 s by default), so they are not cut off by the 30 s
+`NONODB_REQUEST_TIMEOUT`; the client timeout must still cover the build. Before
+this split, the same run failed at the default 30 s request timeout.
+
+## Search and aggregation across BSON types
+
+Fresh collection with 1,000,000 typed documents and 200,000 text documents.
+Each document contains string, int, double, Decimal128, long above `2^53`,
+bool, date, ObjectId, UUID, binary, array, and nested values. Ten secondary
+indexes were created (`grp`, `num`, `dec`, `i64`, `str`, `date`, `oid`, `uuid`,
+`flag`, `nested.v`). `NONODB_MAP_SIZE=8GiB`, `NONODB_CACHE_TTL=0`,
+`NONODB_REQUEST_TIMEOUT=120`, ext4, release build.
+
+| Stage | Result |
+|---|---|
+| Load 1M typed documents | **69.6 s (14,363 docs/s)** |
+| Build 10 indexes | **28.5 s** |
+| Load 200k text documents | 4.4 s |
+| Text index backfill, 200k docs | 1.7 s |
+| Fuzzy index backfill, 200k docs | 4.5 s |
+
+The typed load is slower than the plain 1M/10M loads because every document
+contains several Extended JSON values and nested/array fields.
+
+Indexed lookups by type:
+
+| Query | p50 | p95 |
+|---|---|---|
+| equality, int | 0.61 ms | 1.16 ms |
+| range, int | 0.98 ms | 1.79 ms |
+| equality, Decimal128 | 0.70 ms | 1.37 ms |
+| range, Decimal128 | 1.17 ms | 2.15 ms |
+| equality, long > `2^53` | 0.76 ms | 1.23 ms |
+| equality, string | 0.60 ms | 1.19 ms |
+| prefix `$regex`, string index | 0.91 ms | 1.26 ms |
+| equality, date | 0.73 ms | 2.00 ms |
+| range, date | 0.98 ms | 1.54 ms |
+| equality, ObjectId | 0.71 ms | 1.32 ms |
+| equality, UUID | 0.74 ms | 1.38 ms |
+| equality, bool | 0.92 ms | 1.29 ms |
+| `$in` with 10 ints | 1.70 ms | 2.78 ms |
+
+Other operators and scans:
+
+| Query | p50 | p95 |
+|---|---|---|
+| contains `$regex`, no index | 934.8 ms | 976.4 ms |
+| equality, binary, no index | **4,398 ms** | 4,518 ms |
+| `$or` over two indexed fields | **7,014 ms** | 7,382 ms |
+| null / missing field | 2.14 ms | 4.75 ms |
+| `$exists: true` | 1.43 ms | 1.73 ms |
+| `$all` on array | 1.20 ms | 1.99 ms |
+| `$size` on array | 1.18 ms | 1.20 ms |
+| `$elemMatch` on scalar array | 1.48 ms | 2.02 ms |
+| `$elemMatch` on object array | 6.14 ms | 27.2 ms |
+| `$type` int/long/double/decimal/string/bool/date/objectId/binData | 0.92–1.37 ms | ≤ 2.96 ms |
+
+The `$type` queries return after finding the requested 10 matches, so they are
+not full scans in this dataset. A `$type` query with no matches still scans the
+collection. Array operators also benefit from early exit when a limit is set;
+`count` without an index shows the real scan cost.
+
+Sort, projection, and count:
+
+| Operation | p50 | p95 |
+|---|---|---|
+| sort by indexed `num`, no filter | **1,713 ms** | 2,214 ms |
+| range filter + indexed sort | **0.91 ms** | 1.43 ms |
+| sort by unindexed nested field | 1,828 ms | 1,899 ms |
+| filter `grp` + sort `num` | 11.4 ms | 18.2 ms |
+| deep skip 500 in indexed `grp` | 12.0 ms | 18.5 ms |
+| projection of 3 fields | 0.76 ms | 1.33 ms |
+| `count({})` | 0.54 ms | 1.22 ms |
+| `count(grp=x)` | 0.60 ms | 1.14 ms |
+| `count(num range)` | 0.65 ms | 1.52 ms |
+| `count(tags $all)` without index | **7,165 ms** | 7,217 ms |
+
+`explain` confirms that a sort-only query with no filter currently uses a
+collection scan, while adding a range filter with the same sort switches to an
+index scan with a covered sort. Top-level `$or` across two indexed fields also
+uses a collection scan instead of an index union.
+
+Aggregation over a 100,000-document `_id` range:
+
+| Pipeline | Result rows | p50 | p95 |
+|---|---|---|---|
+| `$match` range + `$count` | 1 | 21.2 ms | 25.1 ms |
+| `$match` indexed `grp=7` + `$count` | 1 | 0.65 ms | 1.29 ms |
+| `$project` include + `$count` | 1 | 1,958 ms | 2,095 ms |
+| `$project` computed expressions + `$count` | 1 | 2,331 ms | 2,602 ms |
+| `$addFields` + `$count` | 1 | 2,830 ms | 3,067 ms |
+| `$unset` + `$count` | 1 | 2,070 ms | 2,198 ms |
+| `$sort` + `$limit 100` | 100 | 943 ms | 1,092 ms |
+| `$skip` half + `$limit 100` | 100 | 412 ms | 435 ms |
+| `$limit 100` | 100 | 5.91 ms | 7.98 ms |
+| `$count` | 1 | 23.6 ms | 33.9 ms |
+| `$group` sum/avg/min/max/first/last/count | 1,000 | 1,981 ms | 2,185 ms |
+| `$group` Decimal128 sum/avg | 1,000 | 2,272 ms | 2,507 ms |
+| `$group` large-long min/max | 1,000 | 2,165 ms | 2,395 ms |
+| date range `$match` + `$group` | 1,000 | 2,077 ms | 2,311 ms |
+| Decimal128 range `$match` + `$count` | 1 | 5.56 ms | 7.99 ms |
+| `$sort` date desc + `$limit 100` | 100 | 968 ms | 1,114 ms |
+| `$group` push/addToSet | 10 | 1,811 ms | 1,951 ms |
+| `$unwind` over 30k docs + `$count` | 1 | 1,454 ms | 1,529 ms |
+| combined filter + group + sort + limit | 10 | 1,796 ms | 1,942 ms |
+| indexed match + group | 10 | 258 ms | 309 ms |
+
+The aggregation timings are dominated by evaluating the 100k-document
+intermediate result. Decimal128 and large-integer grouping add a
+small amount over the mixed numeric group, and indexed `$match` pushdown is
+visible in the sub-millisecond count.
+
+Text and fuzzy search on 200k documents:
+
+| Operation | p50 | p95 |
+|---|---|---|
+| BM25 single term | 151 ms | 190 ms |
+| BM25 two terms | 250 ms | 301 ms |
+| BM25 quoted phrase | 254 ms | 297 ms |
+| BM25 with filter | 136 ms | 157 ms |
+| fuzzy distance 1 | 57.0 ms | 78.1 ms |
+| fuzzy distance 2 | 72.1 ms | 145 ms |
+
+Reproduce with:
+
+```bash
+NONODB_CACHE_TTL=0 NONODB_REQUEST_TIMEOUT=120 \
+  NONODB_SOCK=/run/nonodb.sock python3 scripts/search_aggregate_bench.py
+```
+
 ## CPU usage and parallel sorting
 
 `scripts/cpu_bench.py` samples `/proc/<daemon>/stat` every 50 ms during separate
@@ -470,6 +630,32 @@ Same host, ext4, 1M documents, latest feature set:
 | BM25 100k | p50 62 ms |
 | Fuzzy 100k | p50 40 ms |
 
+## Persistent connection scale
+
+Sustained 10k-connection test on the same host, 200k-document collection with
+an index on `grp`, `NONODB_CACHE_TTL=0`. Every client kept one HTTP connection
+open and sent a mixed workload: 50% `find_one` by `_id`, 25% indexed `find`
+(limit 10), 13% indexed `count`, 5% bounded aggregation, 4% insert, and 3%
+`$inc` on one hot document.
+
+| Transport | Clients | Duration | Requests | Errors | Throughput | p50 | p95 | p99 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| UDS | 10,000 | 300 s | 1,491,594 | 0 | 4,910 req/s | 0.49 ms | 12.5 ms | 73.4 ms |
+| TCP + TLS | 1,000 | 120 s | 59,940 | 0 | 483 req/s | 0.50 ms | 2.19 ms | 3.03 ms |
+| TCP + TLS | 10,000 | 120 s | 582,978 | 0 | 4,148 req/s | 1.93 ms | 132 ms | 238 ms |
+
+The UDS run held 10,013 daemon fds for five minutes, used 493–507 MB RSS and
+78–84% of one CPU core. The 10k TLS run opened all connections in 17.7 s
+(~564 handshakes/s), held 10,014 fds, used 334–359 MB RSS and 88–97% of one
+core. Both returned to 14 fds after close with no request errors or daemon
+warnings.
+
+Aggregation caveat: an unbounded `$match(grp)` → `$group` over the 200k
+collection took ~135–141 ms per query even with only 1,000 matching documents.
+At 5% of the mix it reduced throughput to ~0.5k req/s. Adding `$limit 10`
+before `$group` (or using `$count`) reduced that aggregation to 0.6–0.8 ms.
+The sustained results above use the bounded form.
+
 ## Memory
 
 Representative daemon memory on the benchmark host:
@@ -483,6 +669,8 @@ Representative daemon memory on the benchmark host:
 | 1M documents, peak during parallel backfill | ~552 MB | — |
 | 100k text/fuzzy documents | up to ~788 MB peak | — |
 | 10,000 small documents (earlier test) | ~10 MB | — |
+| 10k persistent UDS clients, 200k docs | ~493–507 MB | — |
+| 10k persistent TLS clients, 200k docs | ~334–359 MB | — |
 
 Virtual size (`VmSize`) is typically 1.6–2.2 GB because `map_size` is 1 GiB and
 libraries are mapped. This is address space, not resident memory. At 8M
@@ -513,14 +701,17 @@ Live backup with compaction:
 |---|---|---|---|
 | 1.023M documents | 685 MB → 615 MB | **1.15 s** | ~600 MB/s |
 | 8M documents + 1M text | 5.1 GB → ~5.0 GB | **9.95 s** | ~510 MB/s |
+| 10M documents + 500k text | 6.7 GB → 6.7 GB | **52.4 s** | ~130 MB/s |
 
 After restoring the 1M backup, counts, indexes, BM25, and fuzzy search all
 verified correctly. After restoring the 8M backup, counts, 3 indexes, text
-search, and BM25 verified correctly.
+search, and BM25 verified correctly. The 10M backup was verified in 2m38s and
+restored with `--verify` in 2m52s; both collections and all indexes were
+reported intact.
 
 ## Interpreting the results
 
-- **Indexed point/range reads scale.** 0.5–1.5 ms from 1M to 8M for the tested
+- **Indexed point/range reads scale.** 0.5–1.5 ms from 1M to 10M for the tested
   workload.
 - **Batches are the biggest client-side win.** One thousand `find_one` calls
   drop from hundreds of milliseconds to about 20 ms.
@@ -558,6 +749,7 @@ NONODB_SOCK=$S python3 scripts/opt_bench.py --docs 50000
 NONODB_SOCK=$S python3 scripts/batch_test.py
 NONODB_SOCK=$S python3 scripts/search_test.py
 NONODB_SOCK=$S python3 scripts/search_variants_test.py
+NONODB_SOCK=$S python3 scripts/search_aggregate_bench.py
 NONODB_SOCK=$S python3 scripts/compound_test.py
 NONODB_SOCK=$S python3 scripts/upsert_test.py
 NONODB_SOCK=$S python3 scripts/write_batch_test.py

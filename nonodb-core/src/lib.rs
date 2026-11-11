@@ -18,6 +18,7 @@ pub mod error;
 pub mod history;
 pub mod index;
 pub mod numeric;
+pub mod progress;
 pub mod query;
 mod regex;
 pub mod search;
@@ -28,7 +29,8 @@ pub mod verify;
 
 pub use aggregate::MAX_AGGREGATE_DOCS;
 pub use collection::{
-    Collection, FindAndModifyOptions, FindAndModifyOutcome, FindQuery, UpdateOutcome,
+    project_document, Collection, FindAndModifyOptions, FindAndModifyOutcome, FindQuery,
+    UpdateOutcome,
 };
 pub use error::{Error, Result};
 pub use history::{HistoryConfig, HistoryEntry, DEFAULT_HISTORY_MAX_VERSIONS};

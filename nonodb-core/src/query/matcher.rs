@@ -34,12 +34,17 @@ pub fn matches(doc: &Value, filter: &Value) -> bool {
         // `$not` at filter level: negates the whole subfilter.
         "$not" => !matches(doc, cond),
         _ => {
-            let actual = if key.contains('.') {
-                path::get(doc, key)
+            if key.contains('.') {
+                let values = path::get_values(doc, key);
+                if values.len() > 1 {
+                    let array = Value::Array(values.into_iter().cloned().collect());
+                    match_field(Some(&array), cond)
+                } else {
+                    match_field(values.first().copied(), cond)
+                }
             } else {
-                doc.get(key)
-            };
-            match_field(actual, cond)
+                match_field(doc.get(key), cond)
+            }
         }
     })
 }
@@ -71,10 +76,14 @@ fn match_simple_op(actual: Option<&Value>, op: &str, arg: &Value) -> bool {
     match op {
         "$eq" => eq_opt(actual, arg),
         "$ne" => !eq_opt(actual, arg),
-        "$gt" => cmp(actual, arg) == Some(Ordering::Greater),
-        "$gte" => matches!(cmp(actual, arg), Some(Ordering::Greater | Ordering::Equal)),
-        "$lt" => cmp(actual, arg) == Some(Ordering::Less),
-        "$lte" => matches!(cmp(actual, arg), Some(Ordering::Less | Ordering::Equal)),
+        "$gt" => cmp_any(actual, arg, |ord| ord == Ordering::Greater),
+        "$gte" => cmp_any(actual, arg, |ord| {
+            matches!(ord, Ordering::Greater | Ordering::Equal)
+        }),
+        "$lt" => cmp_any(actual, arg, |ord| ord == Ordering::Less),
+        "$lte" => cmp_any(actual, arg, |ord| {
+            matches!(ord, Ordering::Less | Ordering::Equal)
+        }),
         "$in" => arg
             .as_array()
             .is_some_and(|arr| arr.iter().any(|x| eq_opt(actual, x))),
@@ -182,6 +191,15 @@ pub(crate) fn num_eq(a: &Value, b: &Value) -> bool {
         return eq;
     }
     a == b
+}
+
+fn cmp_any(actual: Option<&Value>, expected: &Value, accept: impl Fn(Ordering) -> bool) -> bool {
+    match actual {
+        Some(Value::Array(items)) => items
+            .iter()
+            .any(|item| cmp(Some(item), expected).is_some_and(&accept)),
+        _ => cmp(actual, expected).is_some_and(accept),
+    }
 }
 
 fn cmp(actual: Option<&Value>, expected: &Value) -> Option<Ordering> {
@@ -301,6 +319,21 @@ mod tests {
                 "pattern": "^ala$", "options": "i"
             }}}})
         ));
+    }
+
+    #[test]
+    fn dotted_paths_traverse_arrays() {
+        let doc = json!({
+            "items": [{"price": 5}, {"price": 15}, {"other": 1}],
+            "tags": [{"name": "a"}, {"name": "b"}]
+        });
+        assert!(matches(&doc, &json!({"items.price": 5})));
+        assert!(matches(&doc, &json!({"items.price": {"$gt": 10}})));
+        assert!(!matches(&doc, &json!({"items.price": {"$lt": 5}})));
+        assert!(!matches(&doc, &json!({"items.price": {"$ne": 5}})));
+        assert!(matches(&doc, &json!({"tags.name": {"$in": ["b", "c"]}})));
+        assert!(!matches(&doc, &json!({"items.missing": {"$exists": true}})));
+        assert!(matches(&doc, &json!({"items.missing": null})));
     }
 
     #[test]

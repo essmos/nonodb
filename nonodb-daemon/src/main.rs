@@ -9,6 +9,7 @@ mod auth;
 mod authz;
 mod auto_index;
 mod cache;
+mod cursor;
 mod login_guard;
 mod maintenance;
 mod metrics;
@@ -35,8 +36,8 @@ use serde_json::{json, Value};
 
 use nonodb_core::heed::RoTxn;
 use nonodb_core::{
-    vault, CollectionProfile, FindQuery, HistoryConfig, Store, VaultKey, DEFAULT_FUZZY_DISTANCE,
-    PAGE_SIZE,
+    aggregate, project_document, vault, CollectionProfile, FindQuery, HistoryConfig, Store,
+    VaultKey, DEFAULT_FUZZY_DISTANCE, PAGE_SIZE,
 };
 use protocol::{ApiError, ApiResponse, Request, VaultAuth, WriteReq};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -51,6 +52,21 @@ use writer::WriteJob;
 /// Maximum request body size (4 MiB).
 const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 /// Timeout for a single API request.
+/// Timeout for index backfills. Building an index over tens of millions of
+/// documents can take minutes; it must not be aborted by the normal 30s request
+/// timeout. Non-positive values fall back to the default.
+fn index_build_timeout() -> Duration {
+    static TIMEOUT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *TIMEOUT.get_or_init(|| {
+        std::env::var("NONODB_INDEX_TIMEOUT")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&secs| secs > 0)
+            .map(Duration::from_secs)
+            .unwrap_or(Duration::from_secs(3600))
+    })
+}
+
 fn request_timeout() -> Duration {
     static TIMEOUT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
     *TIMEOUT.get_or_init(|| {
@@ -71,6 +87,7 @@ struct AppState {
     auto_index: Arc<auto_index::AutoIndexer>,
     auth: Option<Arc<auth::AuthState>>,
     audit: Option<Arc<audit::AuditLog>>,
+    cursors: Arc<cursor::Registry>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -136,6 +153,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         auto_index,
         auth: auth.clone(),
         audit: audit.clone(),
+        cursors: Arc::new(cursor::Registry::new()),
     };
     let app = Router::new()
         .route("/healthz", get(health))
@@ -854,6 +872,183 @@ fn vault_auth(headers: &HeaderMap) -> Result<Option<VaultAuth>, ApiError> {
     Ok(Some(VaultAuth { key, kid, tenant }))
 }
 
+fn normalize_filter(filter: Value) -> Value {
+    if filter.is_null() {
+        json!({})
+    } else {
+        filter
+    }
+}
+
+fn cursor_sort_direction(sort: &[(String, i32)]) -> Result<bool, ApiError> {
+    match sort {
+        [] => Ok(true),
+        [(field, direction)] if field == "_id" && (*direction == 1 || *direction == -1) => {
+            Ok(*direction > 0)
+        }
+        _ => Err(ApiError {
+            code: "invalid_query".to_string(),
+            message: "cursor find requires an empty sort or a single _id sort".to_string(),
+        }),
+    }
+}
+
+fn cursor_pipeline(pipeline: &[Value]) -> Result<(Value, Vec<Value>), ApiError> {
+    let (filter, stages) = match pipeline.first().and_then(|stage| {
+        stage
+            .as_object()
+            .filter(|obj| obj.len() == 1)
+            .and_then(|obj| obj.get("$match"))
+    }) {
+        Some(arg) => (normalize_filter(arg.clone()), &pipeline[1..]),
+        None => (json!({}), pipeline),
+    };
+    for stage in stages {
+        let obj = stage.as_object().ok_or_else(|| ApiError {
+            code: "invalid_query".to_string(),
+            message: "cursor aggregation stage must be an object".to_string(),
+        })?;
+        if obj.len() != 1 {
+            return Err(ApiError {
+                code: "invalid_query".to_string(),
+                message: "cursor aggregation stage must contain exactly one operator".to_string(),
+            });
+        }
+        let name = obj.keys().next().expect("one entry");
+        if !matches!(name.as_str(), "$project" | "$addFields" | "$set" | "$unset") {
+            return Err(ApiError {
+                code: "invalid_query".to_string(),
+                message: format!(
+                    "cursor aggregation does not support stage `{name}`; use cursor_find or a regular aggregate"
+                ),
+            });
+        }
+    }
+    Ok((filter, stages.to_vec()))
+}
+
+fn cursor_api_error(message: String) -> ApiError {
+    let code = if message.contains("not found") || message.contains("expired") {
+        "cursor_not_found"
+    } else if message.contains("already") {
+        "cursor_busy"
+    } else {
+        "cursor"
+    };
+    ApiError {
+        code: code.to_string(),
+        message,
+    }
+}
+
+fn cursor_filter(base: &Value, last_id: Option<&str>, ascending: bool) -> Value {
+    let mut filters = vec![base.clone()];
+    if let Some(last_id) = last_id {
+        let op = if ascending { "$gt" } else { "$lt" };
+        filters.push(json!({"_id": {op: last_id}}));
+    }
+    if filters.len() == 1 {
+        filters.pop().expect("one filter")
+    } else {
+        json!({"$and": filters})
+    }
+}
+
+fn cursor_page(
+    store: &Store,
+    auth: Option<&VaultAuth>,
+    state: &mut cursor::State,
+    batch_override: Option<usize>,
+) -> Result<(Vec<Value>, bool), ApiError> {
+    if let Some(batch_size) = batch_override {
+        state.batch_size = cursor::normalize_batch(Some(batch_size));
+    }
+    let fetch = state.remaining.map_or(state.batch_size, |remaining| {
+        remaining.min(state.batch_size)
+    });
+    if fetch == 0 {
+        return Ok((Vec::new(), false));
+    }
+
+    let kind = state.kind.clone();
+    let coll = kind.coll().to_string();
+    let c = read_collection(store, &coll, auth)?;
+    if c.profile().is_vault() {
+        return Err(ApiError {
+            code: "unsupported_encrypted_operation".to_string(),
+            message: "cursors are not supported for vault collections".to_string(),
+        });
+    }
+    let ascending = state.ascending();
+    let filter = match &kind {
+        cursor::Kind::Find { filter, .. } => {
+            cursor_filter(filter, state.last_id.as_deref(), ascending)
+        }
+        cursor::Kind::Aggregate { filter, .. } => {
+            cursor_filter(filter, state.last_id.as_deref(), ascending)
+        }
+    };
+    let query = FindQuery {
+        filter,
+        projection: None,
+        sort: vec![("_id".to_string(), if ascending { 1 } else { -1 })],
+        skip: state.skip,
+        limit: Some(fetch),
+    };
+    let docs = c.find(&query)?;
+    state.skip = 0;
+    if docs.is_empty() {
+        return Ok((Vec::new(), false));
+    }
+    state.last_id = docs
+        .last()
+        .and_then(|doc| doc.get("_id"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    if let Some(remaining) = &mut state.remaining {
+        *remaining = remaining.saturating_sub(docs.len());
+    }
+    let has_more = docs.len() == fetch && state.remaining.is_none_or(|remaining| remaining > 0);
+
+    let out = match kind {
+        cursor::Kind::Find { projection, .. } => docs
+            .iter()
+            .map(|doc| project_document(doc, projection.as_ref()))
+            .collect(),
+        cursor::Kind::Aggregate { stages, .. } => {
+            aggregate::run(docs, &stages, aggregate::max_docs())?
+        }
+    };
+    Ok((out, has_more))
+}
+
+async fn open_cursor(
+    state: &AppState,
+    auth: Option<VaultAuth>,
+    mut cursor_state: cursor::State,
+    batch_override: Option<usize>,
+) -> (StatusCode, Json<ApiResponse>) {
+    let registry = state.cursors.clone();
+    let cursor_id = match registry.open(cursor_state.clone()) {
+        Ok(cursor_id) => cursor_id,
+        Err(message) => return respond(Err(cursor_api_error(message))),
+    };
+    let store = state.store.clone();
+    let joined = tokio::task::spawn_blocking(move || {
+        let result = cursor_page(&store, auth.as_ref(), &mut cursor_state, batch_override);
+        let has_more = result.as_ref().map(|(_, more)| *more).unwrap_or(false);
+        registry.finish(cursor_id, cursor_state, has_more);
+        result.map(|(docs, has_more)| {
+            json!({
+                "cursor_id": cursor_id,
+                "docs": docs,
+                "has_more": has_more,
+            })
+        })
+    });
+    read_result(joined).await
+}
+
 async fn exec(
     State(state): State<AppState>,
     Extension(connection): Extension<auth::ConnectionAuth>,
@@ -1010,6 +1205,81 @@ async fn exec(
             read_result(joined).await
         }
 
+        Request::CursorFind {
+            coll,
+            filter,
+            projection,
+            sort,
+            skip,
+            limit,
+            batch_size,
+        } => {
+            let ascending = match cursor_sort_direction(&sort) {
+                Ok(direction) => direction,
+                Err(err) => return respond(Err(err)),
+            };
+            let kind = cursor::Kind::Find {
+                coll,
+                filter: normalize_filter(filter),
+                projection,
+                ascending,
+                skip,
+            };
+            let cursor_state =
+                cursor::State::new(principal.name().to_string(), kind, limit, batch_size);
+            open_cursor(&state, vault_auth.clone(), cursor_state, None).await
+        }
+
+        Request::CursorAggregate {
+            coll,
+            pipeline,
+            limit,
+            batch_size,
+        } => {
+            let (filter, stages) = match cursor_pipeline(&pipeline) {
+                Ok(parts) => parts,
+                Err(err) => return respond(Err(err)),
+            };
+            let kind = cursor::Kind::Aggregate {
+                coll,
+                filter,
+                stages,
+            };
+            let cursor_state =
+                cursor::State::new(principal.name().to_string(), kind, limit, batch_size);
+            open_cursor(&state, vault_auth.clone(), cursor_state, None).await
+        }
+
+        Request::GetMore {
+            cursor_id,
+            batch_size,
+        } => {
+            let owner = principal.name().to_string();
+            let cursors = state.cursors.clone();
+            let store = state.store.clone();
+            let auth = vault_auth.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                let mut cursor_state =
+                    cursors.begin(cursor_id, &owner).map_err(cursor_api_error)?;
+                let result = cursor_page(&store, auth.as_ref(), &mut cursor_state, batch_size);
+                let has_more = result.as_ref().map(|(_, more)| *more).unwrap_or(false);
+                cursors.finish(cursor_id, cursor_state, has_more);
+                result.map(|(docs, has_more)| {
+                    json!({
+                        "cursor_id": cursor_id,
+                        "docs": docs,
+                        "has_more": has_more,
+                    })
+                })
+            });
+            read_result(joined).await
+        }
+
+        Request::CloseCursor { cursor_id } => {
+            let closed = state.cursors.close(cursor_id, principal.name());
+            return respond(Ok(json!({"cursor_id": cursor_id, "closed": closed})));
+        }
+
         Request::Explain {
             coll,
             filter,
@@ -1081,6 +1351,9 @@ async fn exec(
                             "fields": d.effective_fields(),
                             "unique": d.unique,
                             "include": d.include,
+                            "format": d.format,
+                            "multikey_fields": d.multikey_fields,
+                            "multikey_all_docs": d.multikey_all_docs,
                         })
                     })
                     .collect();
@@ -1594,6 +1867,11 @@ fn reject_vault_read(
 }
 
 async fn submit_write(state: &AppState, req: WriteReq) -> (StatusCode, Json<ApiResponse>) {
+    let timeout = if req.is_index_build() {
+        index_build_timeout()
+    } else {
+        request_timeout()
+    };
     let (tx, rx) = tokio::sync::oneshot::channel();
     metrics::inc(&metrics::WRITE_OPS);
     metrics::inc(&metrics::QUEUE_LEN);
@@ -1610,7 +1888,7 @@ async fn submit_write(state: &AppState, req: WriteReq) -> (StatusCode, Json<ApiR
         metrics::sub(&metrics::QUEUE_LEN, 1);
         return respond(Err(ApiError::internal("writer unavailable")));
     }
-    match tokio::time::timeout(request_timeout(), rx).await {
+    match tokio::time::timeout(timeout, rx).await {
         Ok(Ok(res)) => respond(res),
         Ok(Err(_)) => respond(Err(ApiError::internal("writer dropped request"))),
         Err(_) => respond(Err(ApiError::timeout())),

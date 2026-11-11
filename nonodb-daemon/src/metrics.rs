@@ -92,6 +92,7 @@ pub fn snapshot() -> Value {
         "ttl_expired_total": TTL_EXPIRED.load(Relaxed),
         "ttl_sweep_errors_total": TTL_SWEEP_ERRORS.load(Relaxed),
         "ttl_backlog": TTL_BACKLOG.load(Relaxed),
+        "index_builds": nonodb_core::progress::snapshot(),
         "avg_batch_size": write_ops as f64 / batches as f64,
         "avg_commit_us": commit_ns as f64 / batches as f64 / 1000.0,
     })

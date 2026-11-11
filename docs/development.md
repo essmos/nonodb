@@ -37,6 +37,7 @@ and [HTTP API](api.md).
 │   │   ├── dates.rs           # date parsing, filtering, indexes, sorting
 │   │   ├── numerics.rs        # exact numbers, Decimal128, arithmetic, indexes
 │   │   ├── bson_types.rs      # numberInt/Long, $type, binary/UUID, ObjectId
+│   │   ├── progress.rs        # process-local index-backfill progress
 │   │   ├── regex.rs           # $regex/$options, arrays, invalid patterns
 │   │   ├── arrays.rs          # $all, $size, $elemMatch, validation
 │   │   └── vault.rs           # vault encryption and tenant isolation
@@ -55,6 +56,7 @@ and [HTTP API](api.md).
 │       ├── maintenance.rs     # TTL sweeps, history pruning, auto-index drive
 │       ├── auto_index.rs      # automatic index candidates/state
 │       ├── cache.rs           # read cache
+│       ├── cursor.rs          # keyset cursor registry and ownership
 │       └── metrics.rs
 ├── nonodb-cli/                # administrative CLI
 ├── nonodb-client/             # Rust client crate and example

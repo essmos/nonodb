@@ -17,6 +17,8 @@ pub fn authorize_request(principal: &Principal, req: &Request) -> Result<(), Api
         | Request::Explain { coll, .. }
         | Request::Count { coll, .. }
         | Request::Aggregate { coll, .. }
+        | Request::CursorFind { coll, .. }
+        | Request::CursorAggregate { coll, .. }
         | Request::ListIndexes { coll }
         | Request::ListTextIndexes { coll }
         | Request::ListFuzzyIndexes { coll }
@@ -45,6 +47,9 @@ pub fn authorize_request(principal: &Principal, req: &Request) -> Result<(), Api
             }
         }
 
+        // The cursor registry verifies ownership. `get_more`/`close_cursor`
+        // deliberately carry no collection name; the cursor stores it.
+        Request::GetMore { .. } | Request::CloseCursor { .. } => Ok(()),
         Request::ListCollections => Ok(()),
         Request::Batch { ops } => {
             for op in ops {

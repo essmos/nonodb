@@ -1,8 +1,8 @@
 # Python client
 
 `client/nonodb.py` is a thin, synchronous Python client for nonodb. It speaks
-HTTP/JSON to the daemon over a Unix socket or TCP/TLS and keeps no sessions or
-cursors.
+HTTP/JSON to the daemon over a Unix socket or TCP/TLS. Cursors are explicit
+server-side objects created through `find_cursor` and `aggregate_cursor`.
 
 The client is intentionally small: query semantics live in the daemon, so
 Python, curl, the CLI, and any future language client all see the same behavior.
@@ -259,6 +259,43 @@ rows = users.aggregate([
 `aggregate` is read-only and returns the pipeline result rows. The supported
 stages, expressions, accumulators, and the 100,000-document intermediate limit
 are documented in [Aggregation](api.md#aggregation).
+
+## Cursors
+
+Use cursors for result sets that are too large for one response. Pages are
+fetched by `_id` and held in server memory only between requests.
+
+```python
+with users.find_cursor(
+    {"active": True},
+    projection={"name": 1, "email": 1},
+    sort=[("_id", 1)],
+    batch_size=500,
+) as cursor:
+    for user in cursor:
+        process(user)
+```
+
+`find_cursor` requires an empty sort or a single `_id` sort. For aggregation,
+the first stage may be `$match`; the remaining stages must be document-local
+(`$project`, `$addFields`/`$set`, `$unset`):
+
+```python
+cursor = users.aggregate_cursor(
+    [
+        {"$match": {"active": True}},
+        {"$project": {"name": 1, "total": {"$add": ["$a", "$b"]}}},
+    ],
+    batch_size=1000,
+)
+for row in cursor:
+    process(row)
+cursor.close()
+```
+
+`next_batch()` returns the next list of documents and `close()` releases the
+server-side cursor. Iterating automatically fetches more batches and stops when
+`has_more` is false. Idle cursors expire after five minutes.
 
 ### Filters
 

@@ -5,7 +5,8 @@
 //! It never writes documents or indexes.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BinaryHeap, HashSet};
+use std::sync::Arc;
 
 use bigdecimal::num_traits::Zero;
 use bigdecimal::{BigDecimal, FromPrimitive};
@@ -18,8 +19,19 @@ use crate::error::{Error, Result};
 use crate::numeric;
 use crate::query::{matches, path};
 
-/// Maximum number of documents allowed in an intermediate aggregation result.
+/// Default maximum number of documents allowed in an intermediate aggregation
+/// result. Override with `NONODB_AGGREGATE_MAX_DOCS`.
 pub const MAX_AGGREGATE_DOCS: usize = 100_000;
+
+/// Effective aggregation document budget. A missing, invalid, or zero value
+/// falls back to [`MAX_AGGREGATE_DOCS`].
+pub fn max_docs() -> usize {
+    std::env::var("NONODB_AGGREGATE_MAX_DOCS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(MAX_AGGREGATE_DOCS)
+}
 
 /// Parts of a pipeline that can be pushed into the normal `find_in` path.
 #[derive(Debug, Default)]
@@ -41,9 +53,20 @@ pub(crate) fn pushdown(pipeline: &[Value]) -> Result<Pushdown> {
     let mut plan = Pushdown::default();
     let mut i = 0;
 
-    if let Some(("$match", arg)) = stage_at(pipeline, i) {
-        plan.filter = arg.clone();
+    let mut filters = Vec::new();
+    while let Some(("$match", arg)) = stage_at(pipeline, i) {
+        filters.push(arg.clone());
         i += 1;
+    }
+    if !filters.is_empty() {
+        plan.filter = if filters.len() == 1 {
+            filters.pop().expect("one filter")
+        } else {
+            Value::Object(Map::from_iter([(
+                "$and".to_string(),
+                Value::Array(filters),
+            )]))
+        };
     }
 
     // `$count` is especially cheap when it is the only remaining stage.
@@ -135,62 +158,252 @@ fn count_field_name(arg: &Value) -> Result<String> {
     }
 }
 
-/// Runs a pipeline over already selected documents.
-pub fn run(mut docs: Vec<Value>, pipeline: &[Value], max_docs: usize) -> Result<Vec<Value>> {
-    for stage in pipeline {
+/// Detects a terminal `$count` preceded only by stages that preserve document
+/// cardinality and cannot fail after validation. The caller may skip those
+/// stages and count the selected documents directly.
+pub(crate) fn terminal_count_skippable(pipeline: &[Value]) -> Result<Option<String>> {
+    let Some((last_name, last_arg)) = pipeline
+        .last()
+        .and_then(|stage| stage_at(std::slice::from_ref(stage), 0))
+    else {
+        return Ok(None);
+    };
+    if last_name != "$count" {
+        return Ok(None);
+    }
+    for stage in &pipeline[..pipeline.len() - 1] {
         let (name, arg) = parse_stage(stage)?;
         match name {
-            "$match" => docs.retain(|doc| matches(doc, arg)),
             "$project" => {
-                docs = docs
-                    .into_iter()
-                    .map(|doc| project(&doc, arg))
-                    .collect::<Result<Vec<_>>>()?;
-            }
-            "$addFields" | "$set" => {
-                docs = docs
-                    .into_iter()
-                    .map(|doc| add_fields(&doc, arg))
-                    .collect::<Result<Vec<_>>>()?;
-            }
-            "$unset" => {
-                docs = docs
-                    .into_iter()
-                    .map(|doc| unset_fields(doc, arg))
-                    .collect::<Result<Vec<_>>>()?;
-            }
-            "$unwind" => docs = unwind(docs, arg)?,
-            "$sort" => {
-                let sort = parse_sort(arg)?;
-                docs.sort_by(|a, b| compare_docs(a, b, &sort));
-            }
-            "$skip" => {
-                let n = as_usize(arg, "$skip")?.min(docs.len());
-                docs.drain(..n);
-            }
-            "$limit" => {
-                let n = as_usize(arg, "$limit")?;
-                docs.truncate(n);
-            }
-            "$group" => docs = group(docs, arg)?,
-            "$count" => {
-                if docs.is_empty() {
-                    docs.clear();
-                } else {
-                    let field = count_field_name(arg)?;
-                    let count = docs.len();
-                    docs = vec![Value::Object(Map::from_iter([(
-                        field,
-                        Value::from(count as u64),
-                    )]))];
+                if simple_projection(arg).is_none() {
+                    return Ok(None);
                 }
             }
-            other => {
-                return Err(Error::Query(format!(
-                    "unsupported aggregation stage `{other}`"
-                )));
+            "$unset" => validate_unset(arg)?,
+            "$sort" => {
+                parse_sort(arg)?;
+            }
+            _ => return Ok(None),
+        }
+    }
+    Ok(Some(count_field_name(last_arg)?))
+}
+
+fn validate_unset(spec: &Value) -> Result<()> {
+    match spec {
+        Value::String(_) => Ok(()),
+        Value::Array(fields) => fields.iter().try_for_each(|field| {
+            field
+                .as_str()
+                .map(|_| ())
+                .ok_or_else(|| Error::Query("$unset array entries must be field names".into()))
+        }),
+        _ => Err(Error::Query(
+            "$unset requires a field name or array of field names".into(),
+        )),
+    }
+}
+
+struct SortEntry {
+    doc: Value,
+    sort: Arc<Vec<(String, i32)>>,
+    seq: usize,
+}
+
+impl PartialEq for SortEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for SortEntry {}
+
+impl PartialOrd for SortEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for SortEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        compare_docs(&self.doc, &other.doc, &self.sort).then_with(|| self.seq.cmp(&other.seq))
+    }
+}
+
+/// Bounded sort with an optional skip/limit. The heap keeps only the best
+/// `skip + limit` documents, so a `$sort` followed by a small `$limit` does
+/// not sort or retain the whole intermediate result.
+fn sort_top_k(docs: Vec<Value>, sort: Vec<(String, i32)>, skip: usize, limit: usize) -> Vec<Value> {
+    let keep = skip.saturating_add(limit);
+    if keep == 0 {
+        return Vec::new();
+    }
+    if keep >= docs.len() {
+        let mut docs = docs;
+        docs.sort_by(|a, b| compare_docs(a, b, &sort));
+        return docs.into_iter().skip(skip).take(limit).collect();
+    }
+    let sort = Arc::new(sort);
+    let mut heap = BinaryHeap::with_capacity(keep + 1);
+    for (seq, doc) in docs.into_iter().enumerate() {
+        heap.push(SortEntry {
+            doc,
+            sort: Arc::clone(&sort),
+            seq,
+        });
+        if heap.len() > keep {
+            heap.pop();
+        }
+    }
+    heap.into_sorted_vec()
+        .into_iter()
+        .skip(skip)
+        .take(limit)
+        .map(|entry| entry.doc)
+        .collect()
+}
+
+fn is_doc_local_stage(name: &str) -> bool {
+    matches!(
+        name,
+        "$match" | "$project" | "$addFields" | "$set" | "$unset"
+    )
+}
+
+/// Runs a pipeline over already selected documents.
+pub fn run(mut docs: Vec<Value>, pipeline: &[Value], max_docs: usize) -> Result<Vec<Value>> {
+    // A terminal `$count` does not need the transformed documents. Apply the
+    // cardinality-preserving stages one document at a time and keep only the
+    // counter; sorting is irrelevant to the result and is validated separately.
+    if let Some(field) = terminal_count_skippable(pipeline)? {
+        let mut count = 0usize;
+        for mut doc in docs {
+            for stage in &pipeline[..pipeline.len() - 1] {
+                let (name, arg) = parse_stage(stage)?;
+                doc = match name {
+                    "$project" => project(doc, arg)?,
+                    "$unset" => unset_fields(doc, arg)?,
+                    "$sort" => doc,
+                    _ => unreachable!("validated cardinality-preserving stage"),
+                };
+            }
+            count += 1;
+        }
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        return Ok(vec![Value::Object(Map::from_iter([(
+            field,
+            Value::from(count as u64),
+        )]))]);
+    }
+
+    let mut i = 0;
+    while i < pipeline.len() {
+        let (name, arg) = parse_stage(&pipeline[i])?;
+
+        // Fuse consecutive document-local stages into one pass. This avoids
+        // materializing a separate vector for every `$match`/`$project`/
+        // `$addFields`/`$unset` stage.
+        if is_doc_local_stage(name) {
+            let start = i;
+            let mut end = i + 1;
+            while end < pipeline.len() {
+                let (next, _) = parse_stage(&pipeline[end])?;
+                if !is_doc_local_stage(next) {
+                    break;
+                }
+                end += 1;
+            }
+            let mut out = Vec::with_capacity(docs.len());
+            for mut doc in docs {
+                let mut keep = true;
+                for stage in &pipeline[start..end] {
+                    let (name, arg) = parse_stage(stage)?;
+                    doc = match name {
+                        "$match" => {
+                            keep = matches(&doc, arg);
+                            doc
+                        }
+                        "$project" => project(doc, arg)?,
+                        "$addFields" | "$set" => add_fields(doc, arg)?,
+                        "$unset" => unset_fields(doc, arg)?,
+                        _ => unreachable!("document-local stage"),
+                    };
+                    if !keep {
+                        break;
+                    }
+                }
+                if keep {
+                    out.push(doc);
+                }
+            }
+            docs = out;
+            i = end;
+        } else {
+            match name {
+                "$unwind" => {
+                    docs = unwind(docs, arg)?;
+                    i += 1;
+                }
+                "$sort" => {
+                    let sort = parse_sort(arg)?;
+                    let mut next = i + 1;
+                    let skip = if let Some(("$skip", value)) = stage_at(pipeline, next) {
+                        next += 1;
+                        as_usize(value, "$skip")?
+                    } else {
+                        0
+                    };
+                    if let Some(("$limit", value)) = stage_at(pipeline, next) {
+                        let limit = as_usize(value, "$limit")?;
+                        docs = sort_top_k(docs, sort, skip, limit);
+                        i = next + 1;
+                    } else if skip > 0 {
+                        let mut sorted = docs;
+                        sorted.sort_by(|a, b| compare_docs(a, b, &sort));
+                        docs = sorted.into_iter().skip(skip).collect();
+                        i = next;
+                    } else {
+                        docs.sort_by(|a, b| compare_docs(a, b, &sort));
+                        i += 1;
+                    }
+                }
+                "$skip" => {
+                    let n = as_usize(arg, "$skip")?.min(docs.len());
+                    docs.drain(..n);
+                    i += 1;
+                }
+                "$limit" => {
+                    let n = as_usize(arg, "$limit")?;
+                    docs.truncate(n);
+                    i += 1;
+                }
+                "$group" => {
+                    docs = group(docs, arg)?;
+                    i += 1;
+                }
+                "$count" => {
+                    if docs.is_empty() {
+                        docs.clear();
+                    } else {
+                        let field = count_field_name(arg)?;
+                        let count = docs.len();
+                        docs = vec![Value::Object(Map::from_iter([(
+                            field,
+                            Value::from(count as u64),
+                        )]))];
+                    }
+                    i += 1;
+                }
+                other => {
+                    return Err(Error::Query(format!(
+                        "unsupported aggregation stage `{other}`"
+                    )));
+                }
             }
         }
+
         if docs.len() > max_docs {
             return Err(Error::Query(format!(
                 "aggregation intermediate result exceeds {max_docs} documents"
@@ -248,7 +461,7 @@ fn is_inclusion(value: &Value) -> bool {
     matches!(value, Value::Bool(true)) || value.as_f64().is_some_and(|n| n == 1.0)
 }
 
-fn project(doc: &Value, spec: &Value) -> Result<Value> {
+fn project(doc: Value, spec: &Value) -> Result<Value> {
     let spec = spec
         .as_object()
         .ok_or_else(|| Error::Query("$project requires an object".into()))?;
@@ -269,7 +482,7 @@ fn project(doc: &Value, spec: &Value) -> Result<Value> {
                 if is_exclusion(value) || is_inclusion(value) {
                     continue;
                 }
-                let value = eval_expr(doc, value)?;
+                let value = eval_expr(&doc, value)?;
                 path::set(&mut out, field, value)?;
                 continue;
             }
@@ -277,15 +490,15 @@ fn project(doc: &Value, spec: &Value) -> Result<Value> {
                 continue;
             }
             let value = if is_inclusion(value) {
-                path::get(doc, field).cloned().unwrap_or(Value::Null)
+                path::get(&doc, field).cloned().unwrap_or(Value::Null)
             } else {
-                eval_expr(doc, value)?
+                eval_expr(&doc, value)?
             };
             path::set(&mut out, field, value)?;
         }
         Ok(out)
     } else {
-        let mut out = doc.clone();
+        let mut out = doc;
         for (field, value) in spec {
             if is_exclusion(value) {
                 path::unset(&mut out, field);
@@ -295,36 +508,34 @@ fn project(doc: &Value, spec: &Value) -> Result<Value> {
     }
 }
 
-fn add_fields(doc: &Value, spec: &Value) -> Result<Value> {
+fn add_fields(mut doc: Value, spec: &Value) -> Result<Value> {
     let spec = spec
         .as_object()
         .ok_or_else(|| Error::Query("$addFields requires an object".into()))?;
-    let mut out = doc.clone();
+    // Evaluate every expression against the original document first; later
+    // expressions must not observe fields added by earlier entries.
+    let mut updates = Vec::with_capacity(spec.len());
     for (field, expr) in spec {
-        let value = eval_expr(doc, expr)?;
-        path::set(&mut out, field, value)?;
+        updates.push((field, eval_expr(&doc, expr)?));
     }
-    Ok(out)
+    for (field, value) in updates {
+        path::set(&mut doc, field, value)?;
+    }
+    Ok(doc)
 }
 
 fn unset_fields(mut doc: Value, spec: &Value) -> Result<Value> {
+    validate_unset(spec)?;
     match spec {
         Value::String(field) => {
             path::unset(&mut doc, field);
         }
         Value::Array(fields) => {
             for field in fields {
-                let field = field.as_str().ok_or_else(|| {
-                    Error::Query("$unset array entries must be field names".into())
-                })?;
-                path::unset(&mut doc, field);
+                path::unset(&mut doc, field.as_str().expect("validated field"));
             }
         }
-        _ => {
-            return Err(Error::Query(
-                "$unset requires a field name or array of field names".into(),
-            ));
-        }
+        _ => unreachable!("validated $unset"),
     }
     Ok(doc)
 }
@@ -430,65 +641,78 @@ fn unwind(docs: Vec<Value>, spec: &Value) -> Result<Vec<Value>> {
     Ok(out)
 }
 
-fn group(docs: Vec<Value>, spec: &Value) -> Result<Vec<Value>> {
-    let spec = spec
-        .as_object()
-        .ok_or_else(|| Error::Query("$group requires an object".into()))?;
-    let id_expr = spec.get("_id").cloned().unwrap_or(Value::Null);
+pub(crate) struct GroupBuilder {
+    id_expr: Value,
+    accumulators: Vec<(String, String, Value)>,
+    groups: BTreeMap<String, GroupState>,
+}
 
-    let mut accumulators = Vec::new();
-    for (field, value) in spec {
-        if field == "_id" {
-            continue;
-        }
-        let accumulator = value
+#[derive(Default)]
+struct GroupState {
+    id: Value,
+    values: Vec<Accumulator>,
+}
+
+impl GroupBuilder {
+    pub(crate) fn new(spec: &Value) -> Result<Self> {
+        let spec = spec
             .as_object()
-            .filter(|obj| obj.len() == 1)
-            .and_then(|obj| obj.iter().next())
-            .ok_or_else(|| {
-                Error::Query(format!(
-                    "group field `{field}` must contain one accumulator operator"
-                ))
-            })?;
-        let op = accumulator.0.as_str();
-        let arg = accumulator.1.clone();
-        if !matches!(
-            op,
-            "$sum"
-                | "$avg"
-                | "$min"
-                | "$max"
-                | "$first"
-                | "$last"
-                | "$push"
-                | "$addToSet"
-                | "$count"
-        ) {
-            return Err(Error::Query(format!(
-                "unsupported group accumulator `{op}`"
-            )));
+            .ok_or_else(|| Error::Query("$group requires an object".into()))?;
+        let id_expr = spec.get("_id").cloned().unwrap_or(Value::Null);
+
+        let mut accumulators = Vec::new();
+        for (field, value) in spec {
+            if field == "_id" {
+                continue;
+            }
+            let accumulator = value
+                .as_object()
+                .filter(|obj| obj.len() == 1)
+                .and_then(|obj| obj.iter().next())
+                .ok_or_else(|| {
+                    Error::Query(format!(
+                        "group field `{field}` must contain one accumulator operator"
+                    ))
+                })?;
+            let op = accumulator.0.as_str();
+            let arg = accumulator.1.clone();
+            if !matches!(
+                op,
+                "$sum"
+                    | "$avg"
+                    | "$min"
+                    | "$max"
+                    | "$first"
+                    | "$last"
+                    | "$push"
+                    | "$addToSet"
+                    | "$count"
+            ) {
+                return Err(Error::Query(format!(
+                    "unsupported group accumulator `{op}`"
+                )));
+            }
+            accumulators.push((field.clone(), op.to_string(), arg));
         }
-        accumulators.push((field.clone(), op.to_string(), arg));
+        Ok(Self {
+            id_expr,
+            accumulators,
+            groups: BTreeMap::new(),
+        })
     }
 
-    #[derive(Default)]
-    struct Group {
-        id: Value,
-        values: Vec<Accumulator>,
-    }
-
-    let mut groups: BTreeMap<String, Group> = BTreeMap::new();
-    for doc in docs {
-        let id = eval_expr(&doc, &id_expr)?;
+    pub(crate) fn update(&mut self, doc: Value) -> Result<()> {
+        let id = eval_expr(&doc, &self.id_expr)?;
         let key = serde_json::to_string(&id)?;
-        let group = groups.entry(key).or_insert_with(|| Group {
+        let group = self.groups.entry(key).or_insert_with(|| GroupState {
             id: id.clone(),
-            values: accumulators
+            values: self
+                .accumulators
                 .iter()
                 .map(|(_, op, _)| Accumulator::new(op))
                 .collect(),
         });
-        for ((_, op, arg), state) in accumulators.iter().zip(group.values.iter_mut()) {
+        for ((_, op, arg), state) in self.accumulators.iter().zip(group.values.iter_mut()) {
             let value = if op == "$count" {
                 Value::Null
             } else {
@@ -496,19 +720,30 @@ fn group(docs: Vec<Value>, spec: &Value) -> Result<Vec<Value>> {
             };
             state.update(op, &value)?;
         }
+        Ok(())
     }
 
-    groups
-        .into_values()
-        .map(|group| {
-            let mut out = Map::new();
-            out.insert("_id".to_string(), group.id);
-            for ((field, _, _), state) in accumulators.iter().zip(group.values) {
-                out.insert(field.clone(), state.finish()?);
-            }
-            Ok(Value::Object(out))
-        })
-        .collect()
+    pub(crate) fn finish(self) -> Result<Vec<Value>> {
+        self.groups
+            .into_values()
+            .map(|group| {
+                let mut out = Map::new();
+                out.insert("_id".to_string(), group.id);
+                for ((field, _, _), state) in self.accumulators.iter().zip(group.values) {
+                    out.insert(field.clone(), state.finish()?);
+                }
+                Ok(Value::Object(out))
+            })
+            .collect()
+    }
+}
+
+fn group(docs: Vec<Value>, spec: &Value) -> Result<Vec<Value>> {
+    let mut builder = GroupBuilder::new(spec)?;
+    for doc in docs {
+        builder.update(doc)?;
+    }
+    builder.finish()
 }
 
 enum NumericSum {
@@ -915,6 +1150,36 @@ mod tests {
         ];
         let out = run(docs, &pipeline, 100).unwrap();
         assert_eq!(out, vec![json!({"rows": 3})]);
+    }
+
+    #[test]
+    fn top_k_sort_with_skip_and_limit() {
+        let docs: Vec<Value> = (0..20).map(|n| json!({"n": n})).collect();
+        let pipeline = vec![
+            json!({"$sort": {"n": -1}}),
+            json!({"$skip": 2}),
+            json!({"$limit": 3}),
+        ];
+        let out = run(docs, &pipeline, 100).unwrap();
+        assert_eq!(
+            out,
+            vec![json!({"n": 17}), json!({"n": 16}), json!({"n": 15})]
+        );
+    }
+
+    #[test]
+    fn fused_document_local_stages_preserve_order() {
+        let docs: Vec<Value> = (1..=3)
+            .map(|n| json!({"_id": n.to_string(), "n": n}))
+            .collect();
+        let pipeline = vec![
+            json!({"$set": {"x": {"$multiply": ["$n", 2]}}}),
+            json!({"$match": {"x": {"$gte": 4}}}),
+            json!({"$project": {"_id": 0, "x": 1, "n": 1}}),
+            json!({"$unset": "n"}),
+        ];
+        let out = run(docs, &pipeline, 100).unwrap();
+        assert_eq!(out, vec![json!({"x": 4}), json!({"x": 6})]);
     }
 
     #[test]

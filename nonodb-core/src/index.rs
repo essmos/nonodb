@@ -14,8 +14,9 @@ use crate::regex;
 /// BSON-compatible dates existed; date values were skipped in those indexes.
 /// Version 2 used the old `f64` encoding for all numbers; version 3 uses exact
 /// decimal numeric keys and supports Decimal128; version 4 adds Extended JSON
-/// binary/UUID and ObjectId keys.
-pub const FORMAT_VERSION: u8 = 4;
+/// binary/UUID and ObjectId keys; version 5 indexes array elements as multikey
+/// entries.
+pub const FORMAT_VERSION: u8 = 5;
 
 /// Index definition stored in `meta` under `index:<coll>:<name>`.
 ///
@@ -37,6 +38,17 @@ pub struct IndexDef {
     /// support and therefore defaults to 0.
     #[serde(default)]
     pub format: u8,
+    /// Fields that produced more than one index key for at least one document.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub multikey_fields: Vec<String>,
+    /// Whether every document currently has at least one entry in this index.
+    /// This is required before a multikey index can provide sort order.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub multikey_all_docs: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl IndexDef {
@@ -47,6 +59,8 @@ impl IndexDef {
             unique,
             include: Vec::new(),
             format: FORMAT_VERSION,
+            multikey_fields: Vec::new(),
+            multikey_all_docs: false,
         }
     }
 
@@ -57,12 +71,18 @@ impl IndexDef {
             unique,
             include: include.to_vec(),
             format: FORMAT_VERSION,
+            multikey_fields: Vec::new(),
+            multikey_all_docs: false,
         }
     }
 
     /// Whether the index was built with the current key encoding.
     pub fn current_format(&self) -> bool {
         self.format >= FORMAT_VERSION
+    }
+
+    pub fn is_multikey(&self) -> bool {
+        !self.multikey_fields.is_empty()
     }
 
     /// Fields in index order (with support for the legacy `field` format).
@@ -171,6 +191,144 @@ pub fn encode_fields(doc: &Value, fields: &[String]) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// All index keys produced by a document, plus the fields that needed array
+/// expansion. Empty `keys` means the document is not represented in the index.
+#[derive(Debug, Clone)]
+pub struct IndexKeys {
+    pub keys: Vec<Vec<u8>>,
+    pub multikey_fields: Vec<String>,
+}
+
+fn array_index(part: &str) -> Option<usize> {
+    if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    part.parse().ok()
+}
+
+/// Collects all values at a dotted path, expanding arrays encountered before
+/// the final path component. This matches MongoDB's implicit traversal for
+/// fields such as `items.price`.
+fn collect_path_values<'a>(
+    value: &'a Value,
+    parts: &[&str],
+    out: &mut Vec<&'a Value>,
+    saw_array: &mut bool,
+) {
+    let Some((part, rest)) = parts.split_first() else {
+        out.push(value);
+        return;
+    };
+    match value {
+        Value::Object(obj) => {
+            if let Some(child) = obj.get(*part) {
+                collect_path_values(child, rest, out, saw_array);
+            }
+        }
+        Value::Array(items) => {
+            *saw_array = true;
+            if let Some(index) = array_index(part) {
+                if let Some(child) = items.get(index) {
+                    collect_path_values(child, rest, out, saw_array);
+                }
+            } else {
+                for item in items {
+                    if let Value::Object(obj) = item {
+                        if let Some(child) = obj.get(*part) {
+                            collect_path_values(child, rest, out, saw_array);
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn field_values<'a>(doc: &'a Value, field: &str) -> (Vec<&'a Value>, bool) {
+    let parts: Vec<&str> = field.split('.').collect();
+    let mut out = Vec::new();
+    let mut saw_array = false;
+    collect_path_values(doc, &parts, &mut out, &mut saw_array);
+    (out, saw_array)
+}
+
+fn flatten_array<'a>(value: &'a Value, out: &mut Vec<&'a Value>) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                flatten_array(item, out);
+            }
+        }
+        _ => out.push(value),
+    }
+}
+
+/// Encodes every multikey entry for a document.
+///
+/// A scalar field produces one key. An array (or a path that expands through an
+/// array) produces one key per flattened scalar element. Compound indexes may
+/// contain at most one array field, matching MongoDB's parallel-array rule.
+pub fn encode_index_keys(def: &IndexDef, doc: &Value) -> Result<IndexKeys, crate::Error> {
+    let fields = def.effective_fields();
+    let mut per_field: Vec<Vec<Vec<u8>>> = Vec::with_capacity(fields.len());
+    let mut multikey_fields = Vec::new();
+    for field in &fields {
+        let (values, saw_array) = field_values(doc, field);
+        let mut encoded = Vec::new();
+        let mut field_multikey = saw_array || values.len() > 1;
+        for value in &values {
+            let mut flattened = Vec::new();
+            flatten_array(value, &mut flattened);
+            if value.is_array() || flattened.len() > 1 {
+                field_multikey = true;
+            }
+            for value in flattened {
+                if let Some(key) = encode_value(value) {
+                    encoded.push(key);
+                }
+            }
+        }
+        encoded.sort();
+        encoded.dedup();
+        if field_multikey {
+            multikey_fields.push(field.clone());
+        }
+        if encoded.is_empty() {
+            return Ok(IndexKeys {
+                keys: Vec::new(),
+                multikey_fields,
+            });
+        }
+        per_field.push(encoded);
+    }
+    if multikey_fields.len() > 1 {
+        return Err(crate::Error::Query(
+            "cannot index parallel arrays in one compound index".into(),
+        ));
+    }
+
+    let mut keys: Vec<Vec<u8>> = vec![Vec::new()];
+    for encodings in per_field {
+        let mut next = Vec::with_capacity(keys.len().saturating_mul(encodings.len()));
+        for prefix in &keys {
+            for encoding in &encodings {
+                let mut key = Vec::with_capacity(prefix.len() + encoding.len());
+                key.extend_from_slice(prefix);
+                key.extend_from_slice(encoding);
+                next.push(key);
+            }
+        }
+        keys = next;
+    }
+    keys.sort();
+    keys.dedup();
+    Ok(IndexKeys {
+        keys,
+        multikey_fields,
+    })
+}
+
 /// Index entry value. When the index has `include` fields, the value contains
 /// `_id` plus a copy of index and `include` fields (covering projections). In the
 /// legacy format the value is just `_id`.
@@ -242,6 +400,55 @@ pub fn bounds(op: &str, value: &Value) -> Option<RangeBytes> {
     })
 }
 
+/// Index key tag for a BSON type name or numeric code.
+///
+/// Several BSON types share one numeric index bracket. The residual matcher
+/// still verifies the exact type, so using the wider bracket is safe.
+fn type_index_tag(spec: &Value) -> Option<u8> {
+    if let Some(items) = spec.as_array() {
+        if items.is_empty() {
+            return None;
+        }
+        let first = type_index_tag(&items[0])?;
+        return items
+            .iter()
+            .all(|item| type_index_tag(item) == Some(first))
+            .then_some(first);
+    }
+    if let Some(name) = spec.as_str() {
+        return match name.to_ascii_lowercase().as_str() {
+            "double" | "int" | "long" | "decimal" | "number" => Some(0x02),
+            "string" => Some(0x03),
+            "bool" => Some(0x04),
+            "date" => Some(0x05),
+            "bindata" => Some(0x06),
+            "objectid" => Some(0x07),
+            "null" => Some(0x01),
+            _ => None,
+        };
+    }
+    match numeric::integer_value(spec)? {
+        1 | 16 | 18 | 19 => Some(0x02),
+        2 => Some(0x03),
+        8 => Some(0x04),
+        9 => Some(0x05),
+        5 => Some(0x06),
+        7 => Some(0x07),
+        10 => Some(0x01),
+        _ => None,
+    }
+}
+
+/// Range covering all encoded values of a BSON type. Missing fields are not
+/// indexed, so this is safe for `$type` (which never matches a missing field).
+fn type_bounds(spec: &Value) -> Option<RangeBytes> {
+    let tag = type_index_tag(spec)?;
+    Some((
+        Bound::Included(vec![tag]),
+        Bound::Excluded(vec![tag.checked_add(1)?]),
+    ))
+}
+
 /// Range for a compound condition, e.g. `{"$gte": 18, "$lt": 30}`.
 ///
 /// Supports one operator (`$eq`, `$gt`, `$gte`, `$lt`, `$lte`) or several
@@ -249,6 +456,12 @@ pub fn bounds(op: &str, value: &Value) -> Option<RangeBytes> {
 /// type as the condition value; the matcher does not compare different types, so
 /// otherwise `$gt: 2` would also include strings/bools from the index.
 pub fn bounds_from_cond(cond: &Value) -> Option<RangeBytes> {
+    if let Some(spec) = cond
+        .as_object()
+        .and_then(|obj| (obj.len() == 1).then(|| obj.get("$type")).flatten())
+    {
+        return type_bounds(spec);
+    }
     if date::is_date(cond) || numeric::is_numeric(cond) || bson_types::is_bson_value(cond) {
         return bounds("$eq", cond);
     }
@@ -479,6 +692,21 @@ mod tests {
         assert!(lower <= al && al < upper);
         assert!(lower <= ala && ala < upper);
         assert!(bob >= upper);
+    }
+
+    #[test]
+    fn type_conditions_use_type_brackets() {
+        let (lo, hi) = bounds_from_cond(&json!({"$type": "number"})).unwrap();
+        assert_eq!(bound_key(&lo), &[0x02]);
+        assert_eq!(bound_key(&hi), &[0x03]);
+
+        let (lo, hi) = bounds_from_cond(&json!({"$type": "objectId"})).unwrap();
+        assert_eq!(bound_key(&lo), &[0x07]);
+        assert_eq!(bound_key(&hi), &[0x08]);
+
+        assert!(bounds_from_cond(&json!({"$type": ["int", "long", "decimal"]})).is_some());
+        assert!(bounds_from_cond(&json!({"$type": ["int", "string"]})).is_none());
+        assert!(bounds_from_cond(&json!({"$type": "array"})).is_none());
     }
 
     #[test]

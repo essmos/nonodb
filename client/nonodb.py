@@ -28,7 +28,7 @@ try:  # optional faster JSON; falls back to stdlib
 except ImportError:  # pragma: no cover
     _orjson = None
 
-__all__ = ["NonoDB", "VaultDB", "Collection", "NonoDBError"]
+__all__ = ["NonoDB", "VaultDB", "Collection", "Cursor", "NonoDBError"]
 
 # Operations safe to retry after a transport error (idempotent reads).
 _READ_OPS = {
@@ -63,6 +63,79 @@ def _cache_key(payload: dict[str, Any]) -> bytes:
     if _orjson is not None:
         return _orjson.dumps(payload, option=_orjson.OPT_SORT_KEYS)
     return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+
+
+class Cursor:
+    """Bounded, server-side cursor returned by `find_cursor`/`aggregate_cursor`.
+
+    Iterating fetches further batches automatically. Call `close()` (or use the
+    context manager) to release the server-side cursor when stopping early.
+    """
+
+    def __init__(
+        self,
+        db: "NonoDB",
+        payload: dict[str, Any],
+        batch_size: Optional[int] = None,
+    ):
+        self._db = db
+        self._batch_size = batch_size
+        result = db.exec(payload)
+        self.cursor_id: int = result["cursor_id"]
+        self._docs: list[dict[str, Any]] = result["docs"]
+        self._has_more: bool = bool(result["has_more"])
+        self._closed = False
+
+    def __enter__(self) -> "Cursor":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+    def __iter__(self):
+        while True:
+            docs, self._docs = self._docs, []
+            for doc in docs:
+                yield doc
+            if not self._has_more or self._closed:
+                break
+            self._fetch_more()
+
+    def next_batch(self) -> list[dict[str, Any]]:
+        """Returns the next batch, or `[]` when the cursor is exhausted."""
+        if self._docs:
+            docs, self._docs = self._docs, []
+            return docs
+        if not self._has_more or self._closed:
+            return []
+        self._fetch_more()
+        docs, self._docs = self._docs, []
+        return docs
+
+    def _fetch_more(self) -> None:
+        payload: dict[str, Any] = {
+            "op": "get_more",
+            "cursor_id": self.cursor_id,
+        }
+        if self._batch_size is not None:
+            payload["batch_size"] = self._batch_size
+        result = self._db.exec(payload)
+        self._docs = result["docs"]
+        self._has_more = bool(result["has_more"])
+        if not self._docs and self._has_more:
+            # A concurrent writer can move the keyset; never loop forever.
+            self._has_more = False
+
+    def close(self) -> bool:
+        if self._closed:
+            return False
+        self._closed = True
+        self._docs = []
+        self._has_more = False
+        result = self._db.exec(
+            {"op": "close_cursor", "cursor_id": self.cursor_id}
+        )
+        return bool(result.get("closed"))
 
 
 class NonoDBError(Exception):
@@ -706,3 +779,51 @@ class Collection:
         return self._db.exec(
             {"op": "aggregate", "coll": self.name, "pipeline": pipeline}
         )["results"]
+
+    # -- cursors -----------------------------------------------------
+    def find_cursor(
+        self,
+        filter: Optional[dict[str, Any]] = None,
+        *,
+        projection: Optional[dict[str, Any]] = None,
+        sort: Optional[list[tuple[str, int]]] = None,
+        skip: int = 0,
+        limit: Optional[int] = None,
+        batch_size: Optional[int] = None,
+    ) -> Cursor:
+        """Opens a keyset cursor. Sort must be empty or a single `_id` field."""
+        payload: dict[str, Any] = {
+            "op": "cursor_find",
+            "coll": self.name,
+            "filter": filter or {},
+            "skip": skip,
+        }
+        if projection is not None:
+            payload["projection"] = projection
+        if sort is not None:
+            payload["sort"] = sort
+        if limit is not None:
+            payload["limit"] = limit
+        if batch_size is not None:
+            payload["batch_size"] = batch_size
+        return Cursor(self._db, payload, batch_size)
+
+    def aggregate_cursor(
+        self,
+        pipeline: list[dict[str, Any]],
+        *,
+        limit: Optional[int] = None,
+        batch_size: Optional[int] = None,
+    ) -> Cursor:
+        """Opens a cursor over an optional leading `$match` and document-local
+        stages (`$project`, `$addFields`/`$set`, `$unset`)."""
+        payload: dict[str, Any] = {
+            "op": "cursor_aggregate",
+            "coll": self.name,
+            "pipeline": pipeline,
+        }
+        if limit is not None:
+            payload["limit"] = limit
+        if batch_size is not None:
+            payload["batch_size"] = batch_size
+        return Cursor(self._db, payload, batch_size)

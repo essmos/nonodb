@@ -460,7 +460,7 @@ impl<'e> Collection<'e> {
                 "index fields must be non-empty and must not contain `+`".into(),
             ));
         }
-        let def = IndexDef::compound(fields, unique, include);
+        let mut def = IndexDef::compound(fields, unique, include);
         let key = index::def_key(&self.name, &def.name());
         self.meta.put(
             &mut *wtxn,
@@ -470,27 +470,51 @@ impl<'e> Collection<'e> {
         let idx_db = self.index_db_in(wtxn, &def)?;
 
         // Backfill: parallel parsing/encoding, written in one transaction.
-        let fields = def.effective_fields();
+        let total_docs = self.db.stat(wtxn)?.entries as u64;
         let def_ref = &def;
-        let entries: Vec<(Vec<u8>, Vec<u8>, String)> =
-            self.parallel_backfill(wtxn, |id, doc| {
-                Ok(index::encode_fields(&doc, &fields)
-                    .map(|vb| {
-                        let value = index::encode_index_value(def_ref, &doc, &id);
-                        vec![(vb, value, id)]
-                    })
-                    .unwrap_or_default())
+        let entries: Vec<(index::IndexKeys, Vec<u8>, String)> =
+            self.parallel_backfill(wtxn, "index", &def.name(), |id, doc| {
+                let keys = index::encode_index_keys(def_ref, &doc)?;
+                if keys.keys.is_empty() {
+                    return Ok(Vec::new());
+                }
+                let value = index::encode_index_value(def_ref, &doc, &id);
+                Ok(vec![(keys, value, id)])
             })?;
 
-        let mut seen: HashSet<Vec<u8>> = HashSet::new();
-
-        for (vb, value, id) in entries {
-            if unique && !seen.insert(vb.clone()) {
-                return Err(Error::DuplicateKey(id));
+        for (keys, _, _) in &entries {
+            for field in &keys.multikey_fields {
+                if !def.multikey_fields.contains(field) {
+                    def.multikey_fields.push(field.clone());
+                }
             }
-            let mut key = vb;
-            key.extend_from_slice(id.as_bytes());
-            idx_db.put(&mut *wtxn, key.as_slice(), value.as_slice())?;
+        }
+        def.multikey_all_docs = entries.len() as u64 == total_docs;
+        self.meta.put(
+            &mut *wtxn,
+            key.as_bytes(),
+            serde_json::to_vec(&def)?.as_slice(),
+        )?;
+
+        let mut seen: HashMap<Vec<u8>, String> = HashMap::new();
+
+        for (keys, value, id) in entries {
+            for vb in keys.keys {
+                if unique {
+                    match seen.get(&vb) {
+                        Some(existing) if existing != &id => {
+                            return Err(Error::DuplicateKey(id));
+                        }
+                        Some(_) => continue,
+                        None => {
+                            seen.insert(vb.clone(), id.clone());
+                        }
+                    }
+                }
+                let mut key = vb;
+                key.extend_from_slice(id.as_bytes());
+                idx_db.put(&mut *wtxn, key.as_slice(), value.as_slice())?;
+            }
         }
         Ok(())
     }
@@ -548,17 +572,21 @@ impl<'e> Collection<'e> {
             if !def.unique {
                 continue;
             }
-            let fields = def.effective_fields();
-            let Some(vb) = index::encode_fields(doc, &fields) else {
+            let keys = index::encode_index_keys(&def, doc)?;
+            if keys.keys.is_empty() {
                 continue;
-            };
+            }
             let Some(db) = self.index_db(txn, &def)? else {
                 continue;
             };
-            for item in db.prefix_iter(txn, vb.as_slice())? {
-                let (_key, existing) = item?;
-                if existing != id.as_bytes() {
-                    return Err(Error::DuplicateKey(id.to_string()));
+            for vb in keys.keys {
+                for item in db.prefix_iter(txn, vb.as_slice())? {
+                    let (_key, existing) = item?;
+                    if index::decode_index_value(existing)
+                        .is_some_and(|(existing_id, _)| existing_id != id)
+                    {
+                        return Err(Error::DuplicateKey(id.to_string()));
+                    }
                 }
             }
         }
@@ -575,28 +603,60 @@ impl<'e> Collection<'e> {
         id: &str,
     ) -> Result<()> {
         let defs = self.index_defs(&*wtxn)?;
-        for def in defs {
-            let fields = def.effective_fields();
-            let old_vb = old.and_then(|d| index::encode_fields(d, &fields));
-            let new_vb = new.and_then(|d| index::encode_fields(d, &fields));
+        for mut def in defs {
+            let mut old_keys = old
+                .map(|doc| index::encode_index_keys(&def, doc))
+                .transpose()?
+                .unwrap_or(index::IndexKeys {
+                    keys: Vec::new(),
+                    multikey_fields: Vec::new(),
+                });
+            let new_keys = new
+                .map(|doc| index::encode_index_keys(&def, doc))
+                .transpose()?
+                .unwrap_or(index::IndexKeys {
+                    keys: Vec::new(),
+                    multikey_fields: Vec::new(),
+                });
             // With `include`, copied fields must also be compared because they can
             // change without changing the index key.
             let old_value = old.map(|d| index::encode_index_value(&def, d, id));
             let new_value = new.map(|d| index::encode_index_value(&def, d, id));
-            if old_vb == new_vb && old_value == new_value {
+            let mut def_changed = false;
+            for field in &new_keys.multikey_fields {
+                if !def.multikey_fields.contains(field) {
+                    def.multikey_fields.push(field.clone());
+                    def_changed = true;
+                }
+            }
+            if new.is_some() && def.multikey_all_docs && new_keys.keys.is_empty() {
+                def.multikey_all_docs = false;
+                def_changed = true;
+            }
+            if def_changed {
+                let def_key = index::def_key(&self.name, &def.name());
+                self.meta.put(
+                    &mut *wtxn,
+                    def_key.as_bytes(),
+                    serde_json::to_vec(&def)?.as_slice(),
+                )?;
+            }
+            old_keys.keys.sort();
+            old_keys.keys.dedup();
+            if old_keys.keys == new_keys.keys && old_value == new_value {
                 continue;
             }
             let idx_db = self.index_db_in(wtxn, &def)?;
-            if let Some(vb) = old_vb {
+            for vb in old_keys.keys {
                 let mut key = vb;
                 key.extend_from_slice(id.as_bytes());
                 idx_db.delete(&mut *wtxn, key.as_slice())?;
             }
-            if let Some(vb) = new_vb {
+            for vb in new_keys.keys {
                 let mut key = vb;
                 key.extend_from_slice(id.as_bytes());
-                let value = new_value.expect("nowy dokument");
-                idx_db.put(&mut *wtxn, key.as_slice(), value.as_slice())?;
+                let value = new_value.as_deref().expect("nowy dokument");
+                idx_db.put(&mut *wtxn, key.as_slice(), value)?;
             }
         }
         Ok(())
@@ -618,15 +678,11 @@ impl<'e> Collection<'e> {
         // Try indexes with the longest field prefix first (most selective).
         let mut defs = self.index_defs(rtxn)?;
         defs.sort_by_key(|d| std::cmp::Reverse(d.effective_fields().len()));
-        let needs_current_format = date::contains_date(filter)
-            || numeric::contains_numeric(filter)
-            || bson_types::contains_type(filter);
 
         for def in defs {
-            // Older indexes used old numeric keys or skipped Extended JSON
-            // values during backfill. Recreate them before using them for
-            // date/numeric/binary/ObjectId filters.
-            if needs_current_format && !def.current_format() {
+            // Older indexes skipped arrays and some Extended JSON values during
+            // backfill. Only current-format indexes are safe for planning.
+            if !def.current_format() {
                 continue;
             }
             let Some(bounds) = bounds_for_index(&def, obj) else {
@@ -638,6 +694,274 @@ impl<'e> Collection<'e> {
             return Ok(Some(IndexPlan { db, bounds, def }));
         }
         Ok(None)
+    }
+
+    /// Selects an index that can provide a sort-only query order.
+    ///
+    /// Missing fields are absent from secondary indexes, while a sort must place
+    /// them last. The index is therefore usable only when it has one entry for
+    /// every document; otherwise the query falls back to a collection scan.
+    fn sort_index_plan(
+        &self,
+        rtxn: &RoTxn<'_>,
+        sort: &[(String, i32)],
+    ) -> Result<Option<IndexPlan>> {
+        if sort.is_empty() {
+            return Ok(None);
+        }
+        let document_count = self.db.stat(rtxn)?.entries;
+        let mut defs = self.index_defs(rtxn)?;
+        defs.sort_by_key(|d| std::cmp::Reverse(d.effective_fields().len()));
+        for def in defs {
+            if !def.current_format()
+                || def.is_multikey()
+                || index_matches_sort(&def, sort).is_none()
+            {
+                continue;
+            }
+            let Some(db) = self.index_db(rtxn, &def)? else {
+                continue;
+            };
+            if db.stat(rtxn)?.entries != document_count {
+                continue;
+            }
+            return Ok(Some(IndexPlan {
+                db,
+                bounds: (Bound::Unbounded, Bound::Unbounded),
+                def,
+            }));
+        }
+        Ok(None)
+    }
+
+    /// Selects a multikey index for a sort-only query.
+    ///
+    /// The array field must be the last index field. Scanning the index in the
+    /// requested direction and taking the first entry per document then yields
+    /// the minimum (ascending) or maximum (descending) array element, matching
+    /// MongoDB's multikey sort rule. `multikey_all_docs` guarantees that no
+    /// document is missing from the index.
+    fn multikey_sort_plan(
+        &self,
+        rtxn: &RoTxn<'_>,
+        sort: &[(String, i32)],
+    ) -> Result<Option<IndexPlan>> {
+        if sort.is_empty() {
+            return Ok(None);
+        }
+        let mut defs = self.index_defs(rtxn)?;
+        defs.sort_by_key(|d| std::cmp::Reverse(d.effective_fields().len()));
+        for def in defs {
+            if !def.current_format()
+                || !def.is_multikey()
+                || !def.multikey_all_docs
+                || index_matches_sort(&def, sort).is_none()
+            {
+                continue;
+            }
+            let fields = def.effective_fields();
+            let Some(last) = fields.last() else {
+                continue;
+            };
+            if !def.multikey_fields.contains(last) {
+                continue;
+            }
+            let Some(db) = self.index_db(rtxn, &def)? else {
+                continue;
+            };
+            return Ok(Some(IndexPlan {
+                db,
+                bounds: (Bound::Unbounded, Bound::Unbounded),
+                def,
+            }));
+        }
+        Ok(None)
+    }
+
+    /// Sorted match-all find using primary-key or secondary-index order.
+    ///
+    /// Returns `None` when no safe ordered path is available; the caller then
+    /// falls back to the normal collection scan.
+    fn find_sorted_match_all(
+        &self,
+        rtxn: &RoTxn<'_>,
+        query: &FindQuery,
+    ) -> Result<Option<Vec<Value>>> {
+        let limit = query.limit.unwrap_or(usize::MAX);
+        if limit == 0 {
+            return Ok(Some(Vec::new()));
+        }
+        if let Some(reverse) = id_sort_direction(&query.sort) {
+            let iter: IndexIter<'_> = if reverse {
+                Box::new(self.db.rev_iter(rtxn)?)
+            } else {
+                Box::new(self.db.iter(rtxn)?)
+            };
+            let mut out = Vec::new();
+            for item in iter.skip(query.skip) {
+                let (_key, bytes) = item?;
+                out.push(parse_json(bytes)?);
+                if out.len() >= limit {
+                    break;
+                }
+            }
+            return Ok(Some(
+                out.into_iter()
+                    .map(|doc| match &query.projection {
+                        Some(projection) => project(&doc, projection),
+                        None => doc,
+                    })
+                    .collect(),
+            ));
+        }
+
+        let plan = match self.sort_index_plan(rtxn, &query.sort)? {
+            Some(plan) => plan,
+            None => match self.multikey_sort_plan(rtxn, &query.sort)? {
+                Some(plan) => plan,
+                None => return Ok(None),
+            },
+        };
+        let reverse = index_matches_sort(&plan.def, &query.sort).expect("matched sort");
+        let multikey = plan.def.is_multikey();
+        let range = (Bound::Unbounded, Bound::Unbounded);
+        let iter: IndexIter<'_> = if reverse {
+            Box::new(plan.db.rev_range(rtxn, &range)?)
+        } else {
+            Box::new(plan.db.range(rtxn, &range)?)
+        };
+        let mut skipped = 0usize;
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        for item in iter {
+            let (_key, value) = item?;
+            let Some((id, inc)) = index::decode_index_value(value) else {
+                continue;
+            };
+            if multikey && !seen.insert(id.clone()) {
+                continue;
+            }
+            let doc = if !multikey {
+                if let Some(doc) = covering_doc(&id, inc.as_ref(), &query.filter, &query.projection)
+                {
+                    doc
+                } else {
+                    let Some(bytes) = self.db.get(rtxn, id.as_bytes())? else {
+                        continue;
+                    };
+                    parse_json(bytes)?
+                }
+            } else {
+                let Some(bytes) = self.db.get(rtxn, id.as_bytes())? else {
+                    continue;
+                };
+                parse_json(bytes)?
+            };
+            if skipped < query.skip {
+                skipped += 1;
+                continue;
+            }
+            out.push(doc);
+            if out.len() >= limit {
+                break;
+            }
+        }
+        Ok(Some(
+            out.into_iter()
+                .map(|doc| match &query.projection {
+                    Some(projection) => project(&doc, projection),
+                    None => doc,
+                })
+                .collect(),
+        ))
+    }
+
+    /// Returns one index plan per top-level `$or` branch, but only when every
+    /// branch is indexable. A union is not semantics-preserving if any branch
+    /// would require a collection scan.
+    fn or_index_plans(&self, rtxn: &RoTxn<'_>, filter: &Value) -> Result<Option<Vec<IndexPlan>>> {
+        let Some(obj) = filter.as_object() else {
+            return Ok(None);
+        };
+        if obj.len() != 1 {
+            return Ok(None);
+        }
+        let Some(branches) = obj.get("$or").and_then(Value::as_array) else {
+            return Ok(None);
+        };
+        if branches.is_empty() {
+            return Ok(None);
+        }
+        let mut plans = Vec::with_capacity(branches.len());
+        for branch in branches {
+            let Some(plan) = self.index_plan(rtxn, branch)? else {
+                return Ok(None);
+            };
+            plans.push(plan);
+        }
+        Ok(Some(plans))
+    }
+
+    /// Candidate ids for a single-field `$all` filter. Every value must be
+    /// present in the array, so the result is the intersection of the per-value
+    /// index ranges. Returns `None` when no suitable multikey index exists.
+    fn all_index_candidates(
+        &self,
+        rtxn: &RoTxn<'_>,
+        filter: &Value,
+    ) -> Result<Option<Vec<String>>> {
+        let Some(obj) = filter.as_object() else {
+            return Ok(None);
+        };
+        if obj.len() != 1 {
+            return Ok(None);
+        }
+        let Some((field, cond)) = obj.iter().next() else {
+            return Ok(None);
+        };
+        let Some(values) = cond
+            .as_object()
+            .filter(|ops| ops.len() == 1)
+            .and_then(|ops| ops.get("$all"))
+            .and_then(Value::as_array)
+        else {
+            return Ok(None);
+        };
+        if values.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        let mut defs = self.index_defs(rtxn)?;
+        defs.sort_by_key(|d| std::cmp::Reverse(d.effective_fields().len()));
+        let Some(def) = defs.into_iter().find(|def| {
+            def.current_format() && def.effective_fields().as_slice() == [field.as_str()]
+        }) else {
+            return Ok(None);
+        };
+        let Some(db) = self.index_db(rtxn, &def)? else {
+            return Ok(None);
+        };
+        let mut result: Option<HashSet<String>> = None;
+        for value in values {
+            let Some((lower, upper)) = index::bounds("$eq", value) else {
+                return Ok(None);
+            };
+            let range = (as_bound(&lower), as_bound(&upper));
+            let mut ids = HashSet::new();
+            for item in db.range(rtxn, &range)? {
+                let (_key, value) = item?;
+                if let Some((id, _)) = index::decode_index_value(value) {
+                    ids.insert(id);
+                }
+            }
+            result = Some(match result {
+                Some(current) => current.intersection(&ids).cloned().collect(),
+                None => ids,
+            });
+            if result.as_ref().is_some_and(HashSet::is_empty) {
+                break;
+            }
+        }
+        Ok(Some(result.unwrap_or_default().into_iter().collect()))
     }
 
     fn index_candidates(
@@ -653,10 +977,13 @@ impl<'e> Collection<'e> {
         let range = (as_bound(lower), as_bound(upper));
 
         let mut ids = Vec::new();
+        let mut seen = HashSet::new();
         for item in plan.db.range(rtxn, &range)? {
             let (_key, value) = item?;
             if let Some((id, _)) = index::decode_index_value(value) {
-                ids.push(id);
+                if seen.insert(id.clone()) {
+                    ids.push(id);
+                }
             }
             if max.is_some_and(|m| ids.len() >= m) {
                 break;
@@ -675,6 +1002,20 @@ impl<'e> Collection<'e> {
             n += 1;
         }
         Ok(n)
+    }
+
+    /// Counts distinct documents in a multikey index range.
+    fn index_count_unique_plan(&self, rtxn: &RoTxn<'_>, plan: &IndexPlan) -> Result<usize> {
+        let (lower, upper) = &plan.bounds;
+        let range = (as_bound(lower), as_bound(upper));
+        let mut ids = HashSet::new();
+        for item in plan.db.range(rtxn, &range)? {
+            let (_key, value) = item?;
+            if let Some((id, _)) = index::decode_index_value(value) {
+                ids.insert(id);
+            }
+        }
+        Ok(ids.len())
     }
 
     // --------------------------- full-text ----------------------------
@@ -754,15 +1095,17 @@ impl<'e> Collection<'e> {
         }
 
         // Backfill: parallel tokenization, written in one transaction.
-        let entries: Vec<TextBackfillEntry> = self.parallel_backfill(wtxn, |id, doc| {
-            let Some(text) = index::field_value(&doc, field).and_then(search::field_text) else {
-                return Ok(Vec::new());
-            };
-            let tokens = search::tokenize(&text);
-            let dl = tokens.len() as u32;
-            let tf = search::term_freqs(&tokens).into_iter().collect();
-            Ok(vec![(id, tf, dl)])
-        })?;
+        let entries: Vec<TextBackfillEntry> =
+            self.parallel_backfill(wtxn, "text", field, |id, doc| {
+                let Some(text) = index::field_value(&doc, field).and_then(search::field_text)
+                else {
+                    return Ok(Vec::new());
+                };
+                let tokens = search::tokenize(&text);
+                let dl = tokens.len() as u32;
+                let tf = search::term_freqs(&tokens).into_iter().collect();
+                Ok(vec![(id, tf, dl)])
+            })?;
 
         let postings = self.text_postings_in(wtxn, field)?;
         let lens = self.text_len_db_in(wtxn, field)?;
@@ -841,12 +1184,14 @@ impl<'e> Collection<'e> {
             return Ok(());
         }
 
-        let entries: Vec<(String, Vec<String>)> = self.parallel_backfill(wtxn, |id, doc| {
-            let Some(text) = index::field_value(&doc, field).and_then(search::field_text) else {
-                return Ok(Vec::new());
-            };
-            Ok(vec![(id, search::trigrams(&text))])
-        })?;
+        let entries: Vec<(String, Vec<String>)> =
+            self.parallel_backfill(wtxn, "fuzzy", field, |id, doc| {
+                let Some(text) = index::field_value(&doc, field).and_then(search::field_text)
+                else {
+                    return Ok(Vec::new());
+                };
+                Ok(vec![(id, search::trigrams(&text))])
+            })?;
 
         let db = self.fuzzy_db_in(wtxn, field)?;
         db.clear(&mut *wtxn)?;
@@ -2158,10 +2503,58 @@ impl<'e> Collection<'e> {
             )]))]);
         }
 
+        if let Some(field) = aggregate::terminal_count_skippable(&pipeline[plan.next..])? {
+            let count = self.count_in(rtxn, &plan.filter)?;
+            let after_skip = count.saturating_sub(plan.skip);
+            let count = plan.limit.map_or(after_skip, |limit| after_skip.min(limit));
+            if count == 0 {
+                return Ok(Vec::new());
+            }
+            return Ok(vec![Value::Object(Map::from_iter([(
+                field,
+                Value::from(count as u64),
+            )]))]);
+        }
+
+        let max_docs = aggregate::max_docs();
+        let remaining = &pipeline[plan.next..];
+
+        // A pipeline whose remaining prefix is just `$group` does not need an
+        // intermediate vector of every input document. Feed documents directly
+        // into the group accumulators in `_id` order.
+        if plan.sort.is_empty()
+            && plan.skip == 0
+            && plan.limit.is_none()
+            && plan.projection.is_none()
+        {
+            if let Some(group_arg) = remaining
+                .first()
+                .and_then(Value::as_object)
+                .filter(|obj| obj.len() == 1)
+                .and_then(|obj| obj.get("$group"))
+            {
+                let mut builder = aggregate::GroupBuilder::new(group_arg)?;
+                for item in self.db.iter(rtxn)? {
+                    let (_key, raw) = item?;
+                    let doc = parse_json(raw)?;
+                    if matches(&doc, &plan.filter) {
+                        builder.update(doc)?;
+                    }
+                }
+                let grouped = builder.finish()?;
+                if grouped.len() > max_docs {
+                    return Err(Error::Query(format!(
+                        "aggregation intermediate result exceeds {max_docs} documents"
+                    )));
+                }
+                return aggregate::run(grouped, &remaining[1..], max_docs);
+            }
+        }
+
         let limit = plan
             .limit
-            .map(|n| n.min(aggregate::MAX_AGGREGATE_DOCS.saturating_add(1)))
-            .unwrap_or_else(|| aggregate::MAX_AGGREGATE_DOCS.saturating_add(1));
+            .map(|n| n.min(max_docs.saturating_add(1)))
+            .unwrap_or_else(|| max_docs.saturating_add(1));
         let query = FindQuery {
             filter: plan.filter,
             projection: plan.projection,
@@ -2170,13 +2563,12 @@ impl<'e> Collection<'e> {
             limit: Some(limit),
         };
         let docs = self.find_in(rtxn, &query)?;
-        if docs.len() > aggregate::MAX_AGGREGATE_DOCS {
+        if docs.len() > max_docs {
             return Err(Error::Query(format!(
-                "aggregation input exceeds {} documents",
-                aggregate::MAX_AGGREGATE_DOCS
+                "aggregation input exceeds {max_docs} documents"
             )));
         }
-        aggregate::run(docs, &pipeline[plan.next..], aggregate::MAX_AGGREGATE_DOCS)
+        aggregate::run(docs, &pipeline[plan.next..], max_docs)
     }
 
     pub fn find(&self, query: &FindQuery) -> Result<Vec<Value>> {
@@ -2195,7 +2587,13 @@ impl<'e> Collection<'e> {
             && self.db.stat(&rtxn)?.entries >= PARALLEL_SCAN_MIN_ENTRIES
             && direct_id(&query.filter).is_none()
             && id_bounds(&query.filter).is_none()
-            && self.index_plan(&rtxn, &query.filter)?.is_none();
+            && id_sort_direction(&query.sort).is_none()
+            && self.index_plan(&rtxn, &query.filter)?.is_none()
+            && self.or_index_plans(&rtxn, &query.filter)?.is_none()
+            && self.all_index_candidates(&rtxn, &query.filter)?.is_none()
+            && !(is_match_all(&query.filter)
+                && (self.sort_index_plan(&rtxn, &query.sort)?.is_some()
+                    || self.multikey_sort_plan(&rtxn, &query.sort)?.is_some()));
         let parallel = parallel_base
             && (sorted || (!is_match_all(&query.filter) && want >= PARALLEL_UNSORTED_MIN_WANT));
 
@@ -2223,17 +2621,25 @@ impl<'e> Collection<'e> {
     /// Parallel index backfill: the main thread reads one `RwTxn`,
     /// while workers parse JSON and prepare entries. Writing to LMDB
     /// stays on the main thread (one transaction).
-    fn parallel_backfill<T, F>(&self, wtxn: &RwTxn<'_>, f: F) -> Result<Vec<T>>
+    fn parallel_backfill<T, F>(
+        &self,
+        wtxn: &RwTxn<'_>,
+        kind: &str,
+        target: &str,
+        f: F,
+    ) -> Result<Vec<T>>
     where
         T: Send,
         F: Fn(String, Value) -> Result<Vec<T>> + Sync,
     {
+        let total = self.db.stat(wtxn)?.entries as u64;
+        let progress = crate::progress::begin(&self.name, target, kind, total);
         let workers = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1)
             .min(16);
         if workers <= 1 {
-            return self.backfill_serial(wtxn, f);
+            return self.backfill_serial(wtxn, f, &progress);
         }
 
         let (job_tx, job_rx) = std::sync::mpsc::sync_channel::<BackfillChunk>(workers * 2);
@@ -2242,6 +2648,7 @@ impl<'e> Collection<'e> {
         let func = &f;
 
         std::thread::scope(|scope| -> Result<Vec<T>> {
+            let progress_ref = &progress;
             for _ in 0..workers {
                 let rx = Arc::clone(&job_rx);
                 let tx = res_tx.clone();
@@ -2252,6 +2659,7 @@ impl<'e> Collection<'e> {
                     };
                     match job {
                         Ok(chunk) => {
+                            let processed = chunk.docs.len() as u64;
                             let mut out = Vec::new();
                             for (id_start, id_len, doc_start, doc_len) in chunk.docs {
                                 let id = std::str::from_utf8(
@@ -2273,6 +2681,7 @@ impl<'e> Collection<'e> {
                                 }
                             }
                             let _ = tx.send(Ok(out));
+                            progress_ref.advance(processed);
                         }
                         Err(_) => break,
                     }
@@ -2317,7 +2726,12 @@ impl<'e> Collection<'e> {
         })
     }
 
-    fn backfill_serial<T, F>(&self, wtxn: &RwTxn<'_>, f: F) -> Result<Vec<T>>
+    fn backfill_serial<T, F>(
+        &self,
+        wtxn: &RwTxn<'_>,
+        f: F,
+        progress: &crate::progress::BackfillGuard,
+    ) -> Result<Vec<T>>
     where
         F: Fn(String, Value) -> Result<Vec<T>>,
     {
@@ -2329,6 +2743,7 @@ impl<'e> Collection<'e> {
                 .to_string();
             let doc: Value = parse_json(doc_bytes)?;
             out.extend(f(id, doc)?);
+            progress.advance(1);
         }
         Ok(out)
     }
@@ -2655,65 +3070,135 @@ impl<'e> Collection<'e> {
         let mut post_skip = query.skip;
         let raw = raw_prefilter(&query.filter);
 
+        // 0) Ordered match-all queries can walk primary-key or index order
+        //    directly, stopping after `skip + limit` entries.
+        if is_match_all(&query.filter) && sorted {
+            if let Some(out) = self.find_sorted_match_all(rtxn, query)? {
+                return Ok(out);
+            }
+        }
+
+        // 0b) Top-level `$or`: when every branch has an index, merge the
+        //     candidate ids and apply the full filter as a residual.
+        if let Some(plans) = self.or_index_plans(rtxn, &query.filter)? {
+            let mut seen = HashSet::new();
+            'plans: for plan in &plans {
+                let range = (as_bound(&plan.bounds.0), as_bound(&plan.bounds.1));
+                for item in plan.db.range(rtxn, &range)? {
+                    let (_key, value) = item?;
+                    let Some((id, _)) = index::decode_index_value(value) else {
+                        continue;
+                    };
+                    if !seen.insert(id.clone()) {
+                        continue;
+                    }
+                    let Some(bytes) = self.db.get(rtxn, id.as_bytes())? else {
+                        continue;
+                    };
+                    let Some(doc) = parse_prefiltered(bytes, raw.as_ref())? else {
+                        continue;
+                    };
+                    if !matches(&doc, &query.filter) {
+                        continue;
+                    }
+                    acc.push(doc);
+                    if !sorted && acc.len() >= want {
+                        break 'plans;
+                    }
+                }
+            }
+            let docs = acc.finish();
+            return Ok(docs
+                .into_iter()
+                .skip(post_skip)
+                .take(limit)
+                .map(|doc| match &query.projection {
+                    Some(projection) => project(&doc, projection),
+                    None => doc,
+                })
+                .collect());
+        }
+
         // 1) Exact `_id` -> direct get.
         if let Some(id) = direct_id(&query.filter) {
             if let Some(bytes) = self.db.get(rtxn, id.as_bytes())? {
                 acc.push(parse_json(bytes)?);
             }
         }
+        // 1b) Multikey `$all`: intersect the index ranges for every required
+        //     value, then apply the full filter as a residual.
+        else if let Some(ids) = self.all_index_candidates(rtxn, &query.filter)? {
+            for id in ids {
+                if !sorted && acc.len() >= want {
+                    break;
+                }
+                let Some(bytes) = self.db.get(rtxn, id.as_bytes())? else {
+                    continue;
+                };
+                let Some(doc) = parse_prefiltered(bytes, raw.as_ref())? else {
+                    continue;
+                };
+                if matches(&doc, &query.filter) {
+                    acc.push(doc);
+                }
+            }
+        }
         // 2) Secondary index. First the fast "index-only" path: if
         //    the sort exactly matches the index order, we walk the index
         //    and fetch only `skip + limit` documents instead of the whole range.
         else if let Some(plan) = self.index_plan(rtxn, &query.filter)? {
-            if sorted {
-                if let Some(reverse) = index_matches_sort(&plan.def, &query.sort) {
-                    let (lower, upper) = &plan.bounds;
-                    let range = (as_bound(lower), as_bound(upper));
-                    let mut skipped = 0usize;
-                    let mut out = Vec::new();
-                    let iter: IndexIter<'_> = if reverse {
-                        Box::new(plan.db.rev_range(rtxn, &range)?)
-                    } else {
-                        Box::new(plan.db.range(rtxn, &range)?)
+            let sort_match = if sorted && !plan.def.is_multikey() {
+                index_matches_sort(&plan.def, &query.sort)
+            } else {
+                None
+            };
+            if let Some(reverse) = sort_match {
+                let (lower, upper) = &plan.bounds;
+                let range = (as_bound(lower), as_bound(upper));
+                let mut skipped = 0usize;
+                let mut out = Vec::new();
+                let iter: IndexIter<'_> = if reverse {
+                    Box::new(plan.db.rev_range(rtxn, &range)?)
+                } else {
+                    Box::new(plan.db.range(rtxn, &range)?)
+                };
+                for item in iter {
+                    let (_key, value) = item?;
+                    let Some((id, inc)) = index::decode_index_value(value) else {
+                        continue;
                     };
-                    for item in iter {
-                        let (_key, value) = item?;
-                        let Some((id, inc)) = index::decode_index_value(value) else {
+                    let doc = if let Some(doc) =
+                        covering_doc(&id, inc.as_ref(), &query.filter, &query.projection)
+                    {
+                        doc
+                    } else {
+                        let Some(bytes) = self.db.get(rtxn, id.as_bytes())? else {
                             continue;
                         };
-                        let doc = if let Some(doc) =
-                            covering_doc(&id, inc.as_ref(), &query.filter, &query.projection)
-                        {
-                            doc
-                        } else {
-                            let Some(bytes) = self.db.get(rtxn, id.as_bytes())? else {
-                                continue;
-                            };
-                            let Some(doc) = parse_prefiltered(bytes, raw.as_ref())? else {
-                                continue;
-                            };
-                            doc
+                        let Some(doc) = parse_prefiltered(bytes, raw.as_ref())? else {
+                            continue;
                         };
-                        if !matches(&doc, &query.filter) {
-                            continue;
-                        }
-                        if skipped < query.skip {
-                            skipped += 1;
-                            continue;
-                        }
-                        out.push(doc);
-                        if out.len() >= limit {
-                            break;
-                        }
+                        doc
+                    };
+                    if !matches(&doc, &query.filter) {
+                        continue;
                     }
-                    return Ok(out
-                        .into_iter()
-                        .map(|doc| match &query.projection {
-                            Some(projection) => project(&doc, projection),
-                            None => doc,
-                        })
-                        .collect());
+                    if skipped < query.skip {
+                        skipped += 1;
+                        continue;
+                    }
+                    out.push(doc);
+                    if out.len() >= limit {
+                        break;
+                    }
                 }
+                return Ok(out
+                    .into_iter()
+                    .map(|doc| match &query.projection {
+                        Some(projection) => project(&doc, projection),
+                        None => doc,
+                    })
+                    .collect());
             }
 
             let ids = self.index_candidates(rtxn, &query.filter, (!sorted).then_some(want))?;
@@ -2931,6 +3416,40 @@ impl<'e> Collection<'e> {
         out.insert("collection".into(), Value::String(self.name.clone()));
 
         if is_match_all(&query.filter) {
+            let candidates = self.db.stat(rtxn)?.entries as u64;
+            if id_sort_direction(&query.sort).is_some() {
+                out.insert("access_path".into(), Value::String("id_range".into()));
+                out.insert("index_used".into(), Value::Bool(true));
+                out.insert(
+                    "index".into(),
+                    serde_json::json!({"fields": ["_id"], "primary": true}),
+                );
+                out.insert("bounds".into(), Value::Null);
+                out.insert("candidates".into(), Value::from(candidates));
+                out.insert("sort_covered".into(), Value::Bool(true));
+                return Ok(Value::Object(out));
+            }
+            let sort_plan = match self.sort_index_plan(rtxn, &query.sort)? {
+                Some(plan) => Some(plan),
+                None => self.multikey_sort_plan(rtxn, &query.sort)?,
+            };
+            if let Some(plan) = sort_plan {
+                out.insert("access_path".into(), Value::String("index_scan".into()));
+                out.insert("index_used".into(), Value::Bool(true));
+                out.insert(
+                    "index".into(),
+                    serde_json::json!({
+                        "fields": plan.def.effective_fields(),
+                        "unique": plan.def.unique,
+                        "include": plan.def.include,
+                        "multikey": plan.def.multikey_fields,
+                    }),
+                );
+                out.insert("bounds".into(), Value::Null);
+                out.insert("candidates".into(), Value::from(candidates));
+                out.insert("sort_covered".into(), Value::Bool(true));
+                return Ok(Value::Object(out));
+            }
             out.insert(
                 "access_path".into(),
                 Value::String("collection_scan".into()),
@@ -2938,10 +3457,7 @@ impl<'e> Collection<'e> {
             out.insert("index_used".into(), Value::Bool(false));
             out.insert("index".into(), Value::Null);
             out.insert("bounds".into(), Value::Null);
-            out.insert(
-                "candidates".into(),
-                Value::from(self.db.stat(rtxn)?.entries as u64),
-            );
+            out.insert("candidates".into(), Value::from(candidates));
             out.insert("sort_covered".into(), Value::Bool(sort_covered(None)));
             return Ok(Value::Object(out));
         }
@@ -2960,8 +3476,48 @@ impl<'e> Collection<'e> {
             return Ok(Value::Object(out));
         }
 
+        if let Some(ids) = self.all_index_candidates(rtxn, &query.filter)? {
+            out.insert("access_path".into(), Value::String("index_scan".into()));
+            out.insert("index_used".into(), Value::Bool(true));
+            out.insert(
+                "index".into(),
+                serde_json::json!({
+                    "fields": [query.filter.as_object().and_then(|o| o.keys().next())],
+                    "multikey": true,
+                }),
+            );
+            out.insert("bounds".into(), Value::Null);
+            out.insert("candidates".into(), Value::from(ids.len() as u64));
+            out.insert("sort_covered".into(), Value::Bool(sort_covered(None)));
+            return Ok(Value::Object(out));
+        }
+
+        if let Some(plans) = self.or_index_plans(rtxn, &query.filter)? {
+            let mut candidates = 0usize;
+            let mut indexes = Vec::with_capacity(plans.len());
+            for plan in &plans {
+                candidates = candidates.saturating_add(self.index_count_plan(rtxn, plan)?);
+                indexes.push(serde_json::json!({
+                    "fields": plan.def.effective_fields(),
+                    "unique": plan.def.unique,
+                    "include": plan.def.include,
+                }));
+            }
+            out.insert("access_path".into(), Value::String("index_union".into()));
+            out.insert("index_used".into(), Value::Bool(true));
+            out.insert("index".into(), Value::Array(indexes));
+            out.insert("bounds".into(), Value::Null);
+            out.insert("candidates".into(), Value::from(candidates as u64));
+            out.insert("sort_covered".into(), Value::Bool(sort_covered(None)));
+            return Ok(Value::Object(out));
+        }
+
         if let Some(plan) = self.index_plan(rtxn, &query.filter)? {
-            let candidates = self.index_count_plan(rtxn, &plan)?;
+            let candidates = if plan.def.is_multikey() {
+                self.index_count_unique_plan(rtxn, &plan)?
+            } else {
+                self.index_count_plan(rtxn, &plan)?
+            };
             let fields = plan.def.effective_fields();
             out.insert("access_path".into(), Value::String("index_scan".into()));
             out.insert("index_used".into(), Value::Bool(true));
@@ -2971,6 +3527,7 @@ impl<'e> Collection<'e> {
                     "fields": fields,
                     "unique": plan.def.unique,
                     "include": plan.def.include,
+                    "multikey": plan.def.multikey_fields,
                 }),
             );
             out.insert(
@@ -3066,10 +3623,18 @@ impl<'e> Collection<'e> {
             }
             return Ok(n);
         }
+        // Multikey `$all`: the intersection already contains distinct ids.
+        if let Some(ids) = self.all_index_candidates(rtxn, filter)? {
+            return Ok(ids.len());
+        }
         // Filter fully covered by an index: count keys without parsing JSON.
         if let Some(plan) = self.index_plan(rtxn, filter)? {
             if index_filter_exact(&plan.def, filter) {
-                return self.index_count_plan(rtxn, &plan);
+                return if plan.def.is_multikey() {
+                    self.index_count_unique_plan(rtxn, &plan)
+                } else {
+                    self.index_count_plan(rtxn, &plan)
+                };
             }
         }
         let mut n = 0;
@@ -3127,10 +3692,10 @@ impl<'e> Collection<'e> {
                 if !def.current_format() {
                     continue;
                 }
-                let fields = def.effective_fields();
-                let Some(value_bytes) = index::encode_fields(&doc, &fields) else {
+                let keys = index::encode_index_keys(def, &doc)?;
+                if keys.keys.is_empty() {
                     continue;
-                };
+                }
                 let db = self.index_db(rtxn, def)?.ok_or_else(|| {
                     Error::Query(format!(
                         "index `{}` on `{}` is defined but its database is missing",
@@ -3138,24 +3703,26 @@ impl<'e> Collection<'e> {
                         self.name
                     ))
                 })?;
-                let mut index_key = value_bytes;
-                index_key.extend_from_slice(key);
                 let expected = index::encode_index_value(def, &doc, id);
-                let actual = db.get(rtxn, &index_key)?.ok_or_else(|| {
-                    Error::Query(format!(
-                        "index `{}` on `{}` is missing entry for `{id}`",
-                        def.name(),
-                        self.name
-                    ))
-                })?;
-                if actual != expected.as_slice() {
-                    return Err(Error::Query(format!(
-                        "index `{}` on `{}` has a stale entry for `{id}`",
-                        def.name(),
-                        self.name
-                    )));
+                for value_bytes in keys.keys {
+                    let mut index_key = value_bytes;
+                    index_key.extend_from_slice(key);
+                    let actual = db.get(rtxn, &index_key)?.ok_or_else(|| {
+                        Error::Query(format!(
+                            "index `{}` on `{}` is missing entry for `{id}`",
+                            def.name(),
+                            self.name
+                        ))
+                    })?;
+                    if actual != expected.as_slice() {
+                        return Err(Error::Query(format!(
+                            "index `{}` on `{}` has a stale entry for `{id}`",
+                            def.name(),
+                            self.name
+                        )));
+                    }
+                    expected_index[i] += 1;
                 }
-                expected_index[i] += 1;
             }
 
             for (i, field) in text_fields.iter().enumerate() {
@@ -3260,6 +3827,8 @@ impl<'e> Collection<'e> {
                 format: def.format,
                 entries,
                 checked,
+                multikey_fields: def.multikey_fields.clone(),
+                multikey_all_docs: def.multikey_all_docs,
             });
         }
 
@@ -3369,6 +3938,39 @@ fn eq_value(cond: &Value) -> Option<&Value> {
 
 /// Builds an index range for the filter when all definition fields have
 /// conditions and the prefix (everything except the last field) is equality-based.
+fn nested_map_value<'a>(map: &'a Map<String, Value>, path: &str) -> Option<&'a Value> {
+    let mut parts = path.split('.');
+    let mut current = map.get(parts.next()?)?;
+    for part in parts {
+        current = current.as_object()?.get(part)?;
+    }
+    Some(current)
+}
+
+/// Returns the filter condition relevant to an index field. For a dotted field
+/// such as `items.price`, a parent `$elemMatch` is translated into a condition
+/// on that leaf path; the full filter is still applied as a residual.
+fn index_condition<'a>(filter: &'a Map<String, Value>, field: &str) -> Option<&'a Value> {
+    if let Some(cond) = filter.get(field) {
+        if let Some(elem) = cond.as_object().and_then(|o| o.get("$elemMatch")) {
+            if elem
+                .as_object()
+                .is_some_and(|o| o.keys().all(|k| k.starts_with('$')))
+            {
+                return Some(elem);
+            }
+        }
+        return Some(cond);
+    }
+    let (parent, rest) = field.split_once('.')?;
+    let elem = filter
+        .get(parent)?
+        .as_object()?
+        .get("$elemMatch")?
+        .as_object()?;
+    nested_map_value(elem, rest)
+}
+
 fn bounds_for_index(def: &IndexDef, filter: &Map<String, Value>) -> Option<index::RangeBytes> {
     let fields = def.effective_fields();
     if fields.is_empty() {
@@ -3376,7 +3978,7 @@ fn bounds_for_index(def: &IndexDef, filter: &Map<String, Value>) -> Option<index
     }
     let mut prefix = Vec::new();
     for (i, field) in fields.iter().enumerate() {
-        let cond = filter.get(field)?;
+        let cond = index_condition(filter, field)?;
         // `null` also matches a missing field, and missing fields are not in the index.
         if cond.is_null()
             || cond
@@ -3586,27 +4188,66 @@ fn id_sort_direction(sort: &[(String, i32)]) -> Option<bool> {
     }
 }
 
-fn compare_values(a: Option<&Value>, b: Option<&Value>) -> Ordering {
+fn best_array_value(items: &[Value], descending: bool) -> Option<&Value> {
+    let mut best: Option<&Value> = None;
+    for item in items {
+        let candidate = match item {
+            Value::Array(inner) => best_array_value(inner, descending),
+            _ => Some(item),
+        };
+        let Some(candidate) = candidate else {
+            continue;
+        };
+        let replace = match best {
+            None => true,
+            Some(current) => {
+                let ord = compare_scalar_values(candidate, current);
+                if descending {
+                    ord == Ordering::Greater
+                } else {
+                    ord == Ordering::Less
+                }
+            }
+        };
+        if replace {
+            best = Some(candidate);
+        }
+    }
+    best
+}
+
+fn sort_value(value: Option<&Value>, descending: bool) -> Option<&Value> {
+    match value {
+        Some(Value::Array(items)) => best_array_value(items, descending),
+        other => other,
+    }
+}
+
+fn compare_scalar_values(a: &Value, b: &Value) -> Ordering {
+    if let Some(ord) = numeric::cmp_values(a, b) {
+        return ord;
+    }
+    if let Some(ord) = bson_types::cmp_values(a, b) {
+        return ord;
+    }
+    match (a, b) {
+        (Value::Null, Value::Null) => Ordering::Equal,
+        (Value::Null, _) => Ordering::Greater,
+        (_, Value::Null) => Ordering::Less,
+        (Value::String(x), Value::String(y)) => x.cmp(y),
+        (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
+        _ => date::cmp(a, b).unwrap_or(Ordering::Equal),
+    }
+}
+
+fn compare_values(a: Option<&Value>, b: Option<&Value>, descending: bool) -> Ordering {
+    let a = sort_value(a, descending);
+    let b = sort_value(b, descending);
     match (a, b) {
         (None, None) => Ordering::Equal,
         (None, Some(_)) => Ordering::Greater, // missing field sorts last
         (Some(_), None) => Ordering::Less,
-        (Some(a), Some(b)) => {
-            if let Some(ord) = numeric::cmp_values(a, b) {
-                return ord;
-            }
-            if let Some(ord) = bson_types::cmp_values(a, b) {
-                return ord;
-            }
-            match (a, b) {
-                (Value::Null, Value::Null) => Ordering::Equal,
-                (Value::Null, _) => Ordering::Greater,
-                (_, Value::Null) => Ordering::Less,
-                (Value::String(x), Value::String(y)) => x.cmp(y),
-                (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
-                _ => date::cmp(a, b).unwrap_or(Ordering::Equal),
-            }
-        }
+        (Some(a), Some(b)) => compare_scalar_values(a, b),
     }
 }
 
@@ -3659,7 +4300,7 @@ fn index_matches_sort(def: &IndexDef, sort: &[(String, i32)]) -> Option<bool> {
 
 pub(crate) fn compare_docs(a: &Value, b: &Value, sort: &[(String, i32)]) -> Ordering {
     for (field, dir) in sort {
-        let ord = compare_values(value_at(a, field), value_at(b, field));
+        let ord = compare_values(value_at(a, field), value_at(b, field), *dir < 0);
         if ord != Ordering::Equal {
             return if *dir >= 0 { ord } else { ord.reverse() };
         }
@@ -3858,6 +4499,15 @@ fn apply_projection(doc: Value, projection: Option<&Value>) -> Value {
     match projection {
         Some(p) => project(&doc, p),
         None => doc,
+    }
+}
+
+/// Applies a normal `find` projection. Used by streaming cursor pages, which
+/// need the raw `_id` for the next page before hiding it from the caller.
+pub fn project_document(doc: &Value, projection: Option<&Value>) -> Value {
+    match projection {
+        Some(projection) => project(doc, projection),
+        None => doc.clone(),
     }
 }
 
@@ -4307,6 +4957,280 @@ mod tests {
         assert_eq!(got.len(), 3);
         assert_eq!(got[0]["age"], 7);
         assert_eq!(got[2]["age"], 9);
+    }
+
+    #[test]
+    fn sort_only_index_or_union_and_type_plans() {
+        let (_dir, store) = store();
+        let c = store.collection("items").unwrap();
+        for i in 0..10 {
+            c.insert_one(json!({
+                "_id": format!("d{i}"),
+                "n": i,
+                "name": format!("u{i}"),
+            }))
+            .unwrap();
+        }
+        c.create_index("n", false).unwrap();
+        c.create_index("name", false).unwrap();
+
+        let q = FindQuery {
+            filter: json!({}),
+            sort: vec![("n".into(), -1)],
+            limit: Some(3),
+            ..Default::default()
+        };
+        let got = c.find(&q).unwrap();
+        let ns: Vec<_> = got.iter().map(|d| d["n"].as_i64()).collect();
+        assert_eq!(ns, vec![Some(9), Some(8), Some(7)]);
+        let plan = c.explain(&q).unwrap();
+        assert_eq!(plan["access_path"], "index_scan");
+        assert_eq!(plan["sort_covered"], true);
+
+        // A document missing the sort field is not in the index, so the planner
+        // must fall back to a scan and still place it last.
+        c.insert_one(json!({"_id": "missing"})).unwrap();
+        let q = FindQuery {
+            filter: json!({}),
+            sort: vec![("n".into(), 1)],
+            ..Default::default()
+        };
+        let got = c.find(&q).unwrap();
+        assert_eq!(got.len(), 11);
+        assert_eq!(got[10]["_id"], "missing");
+        let plan = c.explain(&q).unwrap();
+        assert_eq!(plan["access_path"], "collection_scan");
+
+        let q = FindQuery {
+            filter: json!({"$or": [{"n": 3}, {"name": "u7"}]}),
+            limit: Some(10),
+            ..Default::default()
+        };
+        let got = c.find(&q).unwrap();
+        assert_eq!(got.len(), 2);
+        let plan = c.explain(&q).unwrap();
+        assert_eq!(plan["access_path"], "index_union");
+
+        let q = FindQuery {
+            filter: json!({"n": {"$type": "int"}}),
+            limit: Some(3),
+            ..Default::default()
+        };
+        assert_eq!(c.find(&q).unwrap().len(), 3);
+        let plan = c.explain(&q).unwrap();
+        assert_eq!(plan["access_path"], "index_scan");
+    }
+
+    #[test]
+    fn multikey_indexes_filter_unique_sort_and_verify() {
+        let (_dir, store) = store();
+        let c = store.collection("mk").unwrap();
+        for (id, tags) in [
+            ("a", json!(["b", "c"])),
+            ("b", json!(["a", "z"])),
+            ("c", json!(["b", "b"])),
+            ("d", json!(["m"])),
+        ] {
+            c.insert_one(json!({"_id": id, "tags": tags})).unwrap();
+        }
+        c.create_index("tags", false).unwrap();
+        let def = c.list_index_defs().unwrap().into_iter().next().unwrap();
+        assert_eq!(def.multikey_fields, vec!["tags".to_string()]);
+        assert!(def.multikey_all_docs);
+
+        let q = FindQuery {
+            filter: json!({"tags": "b"}),
+            ..Default::default()
+        };
+        let mut ids: Vec<_> = c
+            .find(&q)
+            .unwrap()
+            .into_iter()
+            .map(|d| d["_id"].as_str().unwrap().to_string())
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec!["a", "c"]);
+        assert_eq!(c.count(&json!({"tags": "b"})).unwrap(), 2);
+        let plan = c.explain(&q).unwrap();
+        assert_eq!(plan["access_path"], "index_scan");
+        assert_eq!(plan["index"]["multikey"], json!(["tags"]));
+
+        let q = FindQuery {
+            filter: json!({"tags": {"$all": ["b", "c"]}}),
+            ..Default::default()
+        };
+        assert_eq!(c.find(&q).unwrap().len(), 1);
+        assert_eq!(c.count(&json!({"tags": {"$all": ["b", "c"]}})).unwrap(), 1);
+        let plan = c.explain(&q).unwrap();
+        assert_eq!(plan["access_path"], "index_scan");
+
+        let q = FindQuery {
+            filter: json!({}),
+            sort: vec![("tags".into(), 1)],
+            ..Default::default()
+        };
+        let ids: Vec<_> = c
+            .find(&q)
+            .unwrap()
+            .into_iter()
+            .map(|d| d["_id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(ids, vec!["b", "a", "c", "d"]);
+        let plan = c.explain(&q).unwrap();
+        assert_eq!(plan["access_path"], "index_scan");
+        assert_eq!(plan["sort_covered"], true);
+
+        let q = FindQuery {
+            filter: json!({}),
+            sort: vec![("tags".into(), -1)],
+            skip: 1,
+            limit: Some(2),
+            ..Default::default()
+        };
+        let ids: Vec<_> = c
+            .find(&q)
+            .unwrap()
+            .into_iter()
+            .map(|d| d["_id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(ids, vec!["d", "a"]);
+
+        // A document without the indexed field cannot use index sort order.
+        c.insert_one(json!({"_id": "e"})).unwrap();
+        let q = FindQuery {
+            filter: json!({}),
+            sort: vec![("tags".into(), 1)],
+            ..Default::default()
+        };
+        let ids: Vec<_> = c
+            .find(&q)
+            .unwrap()
+            .into_iter()
+            .map(|d| d["_id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(ids, vec!["b", "a", "c", "d", "e"]);
+        {
+            let rtxn = c.env.read_txn().unwrap();
+            c.verify_in(&rtxn).unwrap();
+        }
+
+        // Updating an array replaces all entries for the document.
+        c.update(
+            &json!({"_id": "a"}),
+            &json!({"$set": {"tags": ["q"]}}),
+            false,
+        )
+        .unwrap();
+        assert_eq!(c.count(&json!({"tags": "c"})).unwrap(), 0);
+        assert_eq!(c.count(&json!({"tags": "q"})).unwrap(), 1);
+        {
+            let rtxn = c.env.read_txn().unwrap();
+            c.verify_in(&rtxn).unwrap();
+        }
+
+        // Unique multikey indexes allow duplicate elements in one document,
+        // but reject the same value in a different document.
+        let u = store.collection("mkuniq").unwrap();
+        u.insert_one(json!({"_id": "u1", "tags": ["x", "x"]}))
+            .unwrap();
+        u.insert_one(json!({"_id": "u2", "tags": ["y"]})).unwrap();
+        u.create_index("tags", true).unwrap();
+        assert!(u
+            .update(
+                &json!({"_id": "u2"}),
+                &json!({"$set": {"tags": ["x"]}}),
+                false
+            )
+            .is_err());
+        assert!(u
+            .insert_one(json!({"_id": "u3", "tags": ["y", "y"]}))
+            .is_err());
+        u.insert_one(json!({"_id": "u3", "tags": ["z", "z"]}))
+            .unwrap();
+        u.update(
+            &json!({"_id": "u2"}),
+            &json!({"$set": {"tags": ["y", "w"]}}),
+            false,
+        )
+        .unwrap();
+        {
+            let rtxn = u.env.read_txn().unwrap();
+            u.verify_in(&rtxn).unwrap();
+        }
+
+        // An index created before any writes becomes multikey when arrays are
+        // inserted and remains usable for sort order.
+        let early = store.collection("mkearly").unwrap();
+        early.create_index("tags", false).unwrap();
+        early
+            .insert_one(json!({"_id": "x", "tags": ["b", "d"]}))
+            .unwrap();
+        early
+            .insert_one(json!({"_id": "y", "tags": ["a", "c"]}))
+            .unwrap();
+        let q = FindQuery {
+            filter: json!({}),
+            sort: vec![("tags".into(), 1)],
+            ..Default::default()
+        };
+        let ids: Vec<_> = early
+            .find(&q)
+            .unwrap()
+            .into_iter()
+            .map(|d| d["_id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(ids, vec!["y", "x"]);
+        let plan = early.explain(&q).unwrap();
+        assert_eq!(plan["access_path"], "index_scan");
+
+        let d = store.collection("mkdup").unwrap();
+        d.insert_one(json!({"_id": "a", "tags": ["x"]})).unwrap();
+        d.insert_one(json!({"_id": "b", "tags": ["x", "y"]}))
+            .unwrap();
+        assert!(d.create_index("tags", true).is_err());
+    }
+
+    #[test]
+    fn multikey_elem_match_uses_nested_index() {
+        let (_dir, store) = store();
+        let c = store.collection("mk_elem").unwrap();
+        c.insert_one(json!({"_id": "e1", "items": [{"price": 5}]}))
+            .unwrap();
+        c.insert_one(json!({"_id": "e2", "items": [{"price": 15}]}))
+            .unwrap();
+        c.insert_one(json!({"_id": "e3", "items": [{"price": 20}, {"price": 1}]}))
+            .unwrap();
+        c.create_index("items.price", false).unwrap();
+
+        let q = FindQuery {
+            filter: json!({"items": {"$elemMatch": {"price": {"$gte": 10, "$lt": 18}}}}),
+            ..Default::default()
+        };
+        let ids: Vec<_> = c
+            .find(&q)
+            .unwrap()
+            .into_iter()
+            .map(|d| d["_id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(ids, vec!["e2"]);
+        let plan = c.explain(&q).unwrap();
+        assert_eq!(plan["access_path"], "index_scan");
+        assert_eq!(plan["index"]["multikey"], json!(["items.price"]));
+
+        let q = FindQuery {
+            filter: json!({"items": {"$elemMatch": {"price": 1}}}),
+            ..Default::default()
+        };
+        assert_eq!(c.find(&q).unwrap().len(), 1);
+        assert_eq!(
+            c.count(&json!({"items": {"$elemMatch": {"price": 1}}}))
+                .unwrap(),
+            1
+        );
+        {
+            let rtxn = c.env.read_txn().unwrap();
+            c.verify_in(&rtxn).unwrap();
+        }
     }
 
     #[test]
@@ -4979,6 +5903,41 @@ mod tests {
         let out = c.aggregate(&[json!({"$project": {"_id": 1}})]).unwrap();
         assert_eq!(out.len(), 3);
         assert!(out.iter().all(|d| d.as_object().unwrap().len() == 1));
+
+        // Consecutive leading `$match` stages are combined.
+        let out = c
+            .aggregate(&[
+                json!({"$match": {"keep": true}}),
+                json!({"$match": {"amount": {"$gt": 15}}}),
+                json!({"$count": "rows"}),
+            ])
+            .unwrap();
+        assert_eq!(out, vec![json!({"rows": 2})]);
+
+        // A cardinality-preserving prefix before `$count` can be skipped.
+        let out = c
+            .aggregate(&[
+                json!({"$sort": {"amount": -1}}),
+                json!({"$project": {"_id": 0, "amount": 1}}),
+                json!({"$count": "rows"}),
+            ])
+            .unwrap();
+        assert_eq!(out, vec![json!({"rows": 3})]);
+
+        // Computed stages are still evaluated before counting.
+        let out = c
+            .aggregate(&[
+                json!({"$addFields": {"double": {"$multiply": ["$amount", 2]}}}),
+                json!({"$count": "rows"}),
+            ])
+            .unwrap();
+        assert_eq!(out, vec![json!({"rows": 3})]);
+        assert!(c
+            .aggregate(&[
+                json!({"$project": {"bad": {"$divide": [1, 0]}}}),
+                json!({"$count": "rows"}),
+            ])
+            .is_err());
     }
 }
 

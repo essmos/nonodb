@@ -117,6 +117,40 @@ pub enum Request {
         #[serde(default)]
         pipeline: Vec<Value>,
     },
+    /// Opens a bounded cursor over `find`. Supports an empty sort or `_id`.
+    CursorFind {
+        coll: String,
+        #[serde(default)]
+        filter: Value,
+        #[serde(default)]
+        projection: Option<Value>,
+        #[serde(default)]
+        sort: Vec<(String, i32)>,
+        #[serde(default)]
+        skip: usize,
+        #[serde(default)]
+        limit: Option<usize>,
+        #[serde(default)]
+        batch_size: Option<usize>,
+    },
+    /// Opens a bounded cursor over document-local aggregation stages.
+    CursorAggregate {
+        coll: String,
+        #[serde(default)]
+        pipeline: Vec<Value>,
+        #[serde(default)]
+        limit: Option<usize>,
+        #[serde(default)]
+        batch_size: Option<usize>,
+    },
+    GetMore {
+        cursor_id: u64,
+        #[serde(default)]
+        batch_size: Option<usize>,
+    },
+    CloseCursor {
+        cursor_id: u64,
+    },
     CreateIndex {
         coll: String,
         #[serde(default)]
@@ -425,6 +459,10 @@ impl Request {
             Self::Delete { .. } => "delete",
             Self::Count { .. } => "count",
             Self::Aggregate { .. } => "aggregate",
+            Self::CursorFind { .. } => "cursor_find",
+            Self::CursorAggregate { .. } => "cursor_aggregate",
+            Self::GetMore { .. } => "get_more",
+            Self::CloseCursor { .. } => "close_cursor",
             Self::CreateIndex { .. } => "create_index",
             Self::DropIndex { .. } => "drop_index",
             Self::ListIndexes { .. } => "list_indexes",
@@ -456,6 +494,10 @@ impl Request {
             | Self::Explain { .. }
             | Self::Count { .. }
             | Self::Aggregate { .. }
+            | Self::CursorFind { .. }
+            | Self::CursorAggregate { .. }
+            | Self::GetMore { .. }
+            | Self::CloseCursor { .. }
             | Self::ListIndexes { .. }
             | Self::ListTextIndexes { .. }
             | Self::ListFuzzyIndexes { .. }
@@ -482,6 +524,8 @@ impl Request {
             | Self::Delete { coll, .. }
             | Self::Count { coll, .. }
             | Self::Aggregate { coll, .. }
+            | Self::CursorFind { coll, .. }
+            | Self::CursorAggregate { coll, .. }
             | Self::CreateIndex { coll, .. }
             | Self::DropIndex { coll, .. }
             | Self::ListIndexes { coll }
@@ -506,6 +550,7 @@ impl Request {
                 out
             }
             Self::WriteBatch { ops } => ops.iter().flat_map(|op| op.collections()).collect(),
+            Self::GetMore { .. } | Self::CloseCursor { .. } => Vec::new(),
             Self::ListCollections | Self::MapInfo | Self::ResizeMap { .. } => Vec::new(),
         }
     }
@@ -532,6 +577,16 @@ impl WriteOp {
 }
 
 impl WriteReq {
+    pub(crate) fn is_index_build(&self) -> bool {
+        match self {
+            Self::CreateIndex { .. }
+            | Self::CreateTextIndex { .. }
+            | Self::CreateFuzzyIndex { .. } => true,
+            Self::Batch { ops } => ops.iter().any(Self::is_index_build),
+            _ => false,
+        }
+    }
+
     pub(crate) fn is_atomic(&self) -> bool {
         matches!(self, WriteReq::Batch { .. })
     }

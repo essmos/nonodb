@@ -51,14 +51,16 @@ Implemented:
 
 ### Query language
 
-- The aggregation pipeline is bounded to 100,000 intermediate documents and
-  has no cross-collection joins (`$lookup`, `$graphLookup`), `$facet`, or write
-  stages (`$merge`, `$out`).
+- The aggregation pipeline is bounded by `NONODB_AGGREGATE_MAX_DOCS` (default
+  100,000 intermediate documents) and has no cross-collection joins (`$lookup`,
+  `$graphLookup`), `$facet`, or write stages (`$merge`, `$out`). Group state is
+  held in memory; there is no disk spill.
 - No `$where` or `$text` query operator.
 - `$regex` supports `i`, `m`, `s`, `x`, and `u` options, but not MongoDB's
   PCRE-only constructs; patterns use Rust's non-backtracking regex engine.
 - `$all`/`$elemMatch` do not accept regex literals because regex values are not
-  implemented. Array fields are not secondary-indexed.
+  implemented. Multikey indexes serve array equality, `$all`, ranges, and simple
+  `$elemMatch`; `$size` is not index-backed.
 - No joins.
 - TTL is eventual and has no strict read-time filtering.
 - Projection is top-level only, not a nested projection tree.
@@ -83,10 +85,12 @@ Implemented:
 
 ### Indexes
 
-- Only scalar values are indexed. Numbers use exact decimal keys shared by
-  integers, floats and Decimal128; dates use the Extended JSON date type;
-  binary/UUID and ObjectId use dedicated type tags. Arrays and ordinary objects
-  are skipped.
+- Scalar values and array elements are indexed. Numbers use exact decimal keys
+  shared by integers, floats and Decimal128; dates use the Extended JSON date
+  type; binary/UUID and ObjectId use dedicated type tags. A compound index may
+  contain at most one array field; parallel arrays are rejected. Ordinary
+  objects are skipped. Indexes created before format 5 must be recreated to
+  include array entries.
 - No sparse/partial indexes, wildcard indexes, geospatial indexes, vector
   indexes, or text indexes with custom analyzers.
 - No index intersection or cost-based optimizer. The planner uses a simple

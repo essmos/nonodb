@@ -34,7 +34,9 @@ All daemon configuration is through environment variables.
 | `NONODB_DATA` | `./data` | Directory containing `data.mdb` and `lock.mdb` |
 | `NONODB_SOCK` | `/run/nonodb.sock` | Unix socket path |
 | `NONODB_MAP_SIZE` | `1GiB` | LMDB address-space limit; accepts `4GiB`, `2048MiB`, bytes |
-| `NONODB_REQUEST_TIMEOUT` | `30` | Server-side request timeout in seconds |
+| `NONODB_REQUEST_TIMEOUT` | `30` | Server-side request timeout in seconds for normal operations |
+| `NONODB_INDEX_TIMEOUT` | `3600` | Server-side timeout in seconds for index/text/fuzzy builds |
+| `NONODB_AGGREGATE_MAX_DOCS` | `100000` | Maximum intermediate aggregation result size |
 | `NONODB_CACHE_TTL` | `5` | Read-cache TTL in seconds; `0` disables the cache |
 | `NONODB_CACHE_ENTRIES` | `512` | Maximum number of cached read results |
 | `NONODB_CACHE_MAX_BYTES` | `262144` | Maximum serialized size of one cached result |
@@ -596,6 +598,7 @@ Useful signals:
 | `ttl_expired_total` | Documents deleted by TTL |
 | `ttl_sweep_errors_total` | Failed TTL sweeps |
 | `ttl_backlog` | Due entries observed by the last sweep |
+| `index_builds` | Active/recent index backfills and processed/total/elapsed progress |
 | `auth_failures_total` | Failed authentication attempts |
 | `auth_blocks_total` | IP lockouts started |
 | `auth_blocked_requests_total` | Requests rejected while the IP was blocked |
@@ -669,28 +672,35 @@ restart drops process RSS to a few MB; the OS may keep pages cached.
 
 - Keep hot indexed queries and small collections in memory naturally via page
   cache.
-- Avoid unbounded full scans on large collections in latency-sensitive paths.
+- Avoid unbounded full scans on large collections in latency-sensitive paths;
+  use `find_cursor`/`aggregate_cursor` for large result sets.
 - Deep `skip` on a sorted full scan is intentionally single-threaded.
 - Parallel full sorts are used only when `skip + limit <= 50,000`.
 - Parallel index backfill uses up to 16 worker threads; peak memory grows with
   the number of entries buffered for a chunk.
+- Aggregation top-K bounds `$sort`+`$limit` memory, and a leading `$group`
+  streams input, but group state is held in memory. Lower
+  `NONODB_AGGREGATE_MAX_DOCS` or reduce group cardinality for constrained hosts.
 - If `map_size` is much larger than needed, virtual size grows but RSS does not
   automatically do so.
 
 ## Timeouts and long operations
 
-The daemon defaults to a 30-second request timeout. Large index builds and
-backfills can exceed it.
-
-For a one-off large index creation:
+The daemon defaults to a 30-second timeout for normal requests and a separate
+3600-second timeout for index, text-index, and fuzzy-index builds. The Python
+client must still allow enough time for the response; set `NONODB_TIMEOUT` or
+`NonoDB(timeout=...)` above the expected build duration.
 
 ```bash
-export NONODB_REQUEST_TIMEOUT=600
-export NONODB_TIMEOUT=600
+export NONODB_INDEX_TIMEOUT=7200   # daemon, index builds
+export NONODB_TIMEOUT=7500         # Python client
 ```
 
-Restart the daemon after changing `NONODB_REQUEST_TIMEOUT`. The Python client
-also accepts `timeout=`.
+Restart the daemon after changing timeout environment variables. Progress for
+active backfills is exposed as `index_builds` in `/metrics`, including
+`processed`, `total`, `elapsed_ms`, and `finished`. The build remains one LMDB
+write transaction, so it becomes visible and durable only after completion; an
+interrupted build is rolled back and must be restarted.
 
 Creating a text or fuzzy index backfills synchronously and blocks writers while
 the final write transaction is active. Schedule large index builds during
@@ -751,7 +761,7 @@ backups.
 | `unauthorized` (401) | Token missing/wrong, or credential disabled | Check `NONODB_TOKEN`, `NONODB_AUTH_FILE`, and credential state |
 | `forbidden` (403) | Principal lacks the required scope | Grant `read:`, `write:`, `admin:<coll>`, or `admin:db` |
 | `rate_limited` (429) | Too many failed logins from this IP | Wait for `NONODB_AUTH_BLOCK_SECS`; tune lockout thresholds |
-| `timeout` | Long index build or scan exceeds 30 s | Raise `NONODB_REQUEST_TIMEOUT` and client timeout |
+| `timeout` | Long scan exceeds 30 s, or index build exceeds 1 h | Raise `NONODB_REQUEST_TIMEOUT`, `NONODB_INDEX_TIMEOUT`, and client timeout |
 | `document_too_large` (413) | Document > 1 MiB or request > 4 MiB | Split document/import; batch inserts |
 | `duplicate_key` | Duplicate `_id` or unique-index conflict | Use a new id or update the existing document |
 | `invalid_query` on search | Text/fuzzy index missing | Create the index first |

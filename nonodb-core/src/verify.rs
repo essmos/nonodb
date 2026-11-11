@@ -35,6 +35,12 @@ pub struct IndexVerification {
     pub include: Vec<String>,
     pub format: u8,
     pub entries: u64,
+    /// Fields that contain arrays and therefore produce multiple index entries.
+    #[serde(default)]
+    pub multikey_fields: Vec<String>,
+    /// Whether every document currently has at least one entry in this index.
+    #[serde(default)]
+    pub multikey_all_docs: bool,
     /// Legacy index formats cannot be reconstructed exactly; entries are
     /// counted but not cross-checked.
     pub checked: bool,
