@@ -34,6 +34,9 @@ pub struct IndexRequest {
     pub unique: bool,
     #[serde(default)]
     pub include: Vec<String>,
+    /// Create a GeoJSON point index.
+    #[serde(default)]
+    pub geo: bool,
 }
 
 /// Request to `/v1/exec`.
@@ -174,6 +177,8 @@ pub enum Request {
         unique: bool,
         #[serde(default)]
         include: Vec<String>,
+        #[serde(default)]
+        geo: bool,
     },
     /// Creates several secondary indexes in one collection scan.
     CreateIndexes {
@@ -392,6 +397,7 @@ pub enum WriteReq {
         fields: Vec<String>,
         unique: bool,
         include: Vec<String>,
+        geo: bool,
     },
     CreateIndexes {
         coll: String,

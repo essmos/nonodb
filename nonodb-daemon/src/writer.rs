@@ -365,11 +365,18 @@ fn execute(
             fields,
             unique,
             include,
+            geo,
         } => {
             let c = standard_collection(store, wtxn, coll)?;
-            c.create_index_fields_txn(wtxn, fields, *unique, include)?;
+            c.create_index_fields_txn(wtxn, fields, *unique, include, *geo)?;
             let name = fields.join("+");
-            Ok(json!({ "created": name, "fields": fields, "unique": unique, "include": include }))
+            Ok(json!({
+                "created": name,
+                "fields": fields,
+                "unique": unique,
+                "include": include,
+                "geo": geo
+            }))
         }
         WriteReq::CreateIndexes { coll, indexes } => {
             let c = standard_collection(store, wtxn, coll)?;

@@ -557,11 +557,13 @@ class Collection:
         *,
         fields: Optional[list[str]] = None,
         include: Optional[list[str]] = None,
+        geo: bool = False,
     ) -> bool:
         """Creates a single-field (`field`) or compound (`fields`) index.
 
         `include` copies extra fields into the index, allowing a projection to be covered
-        without reading the document (covering index).
+        without reading the document (covering index). Set `geo=True` to create a
+        single-field GeoJSON point index for `$near` and `$geoWithin`.
         """
         if fields is None:
             if field is None:
@@ -574,6 +576,7 @@ class Collection:
                 "fields": fields,
                 "unique": unique,
                 "include": include or [],
+                "geo": geo,
             }
         )
         return True
@@ -582,7 +585,8 @@ class Collection:
         """Creates several indexes in one collection scan.
 
         Each entry accepts the same keys as :meth:`create_index`:
-        `field` or `fields`, optional `unique`, and optional `include`.
+        `field` or `fields`, optional `unique`, optional `include`, and optional
+        `geo` for a single-field GeoJSON point index.
         """
         result = self._db.exec(
             {

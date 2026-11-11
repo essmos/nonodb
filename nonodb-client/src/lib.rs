@@ -689,6 +689,19 @@ impl Collection<'_> {
         self.create_index(&[field], unique, &[])
     }
 
+    /// Create a single-field GeoJSON point index.
+    pub fn create_geo_index(&self, field: &str) -> Result<bool> {
+        self.client.exec(json!({
+            "op": "create_index",
+            "coll": self.name,
+            "fields": [field],
+            "unique": false,
+            "include": [],
+            "geo": true,
+        }))?;
+        Ok(true)
+    }
+
     /// Drop an index by field name.
     pub fn drop_index(&self, field: &str) -> Result<bool> {
         let result = self.client.exec(json!({

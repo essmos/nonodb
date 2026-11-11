@@ -12,6 +12,7 @@ use std::cmp::Ordering;
 
 use crate::bson_types;
 use crate::date;
+use crate::geo;
 use crate::numeric;
 use crate::query::path;
 use crate::regex;
@@ -95,6 +96,9 @@ fn match_simple_op(actual: Option<&Value>, op: &str, arg: &Value) -> bool {
         "$size" => size_opt(actual, arg),
         "$elemMatch" => elem_match_opt(actual, arg),
         "$type" => actual.is_some_and(|v| bson_types::type_matches(v, arg)),
+        "$near" | "$nearSphere" => geo::match_near(actual, arg),
+        "$geoWithin" => geo::match_within(actual, arg),
+        "$geoIntersects" => geo::match_intersects(actual, arg),
         "$not" => !match_field(actual, arg),
         _ => false,
     }

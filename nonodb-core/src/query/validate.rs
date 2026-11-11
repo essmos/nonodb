@@ -4,6 +4,7 @@ use serde_json::Value;
 
 use crate::bson_types;
 use crate::date;
+use crate::geo;
 use crate::numeric;
 use crate::regex;
 use crate::{Error, Result};
@@ -70,6 +71,9 @@ fn validate_condition(cond: &Value) -> Result<()> {
             "$not" => {
                 regex::validate_condition(arg)?;
                 validate_condition(arg)?;
+            }
+            "$near" | "$nearSphere" | "$geoWithin" | "$geoIntersects" => {
+                geo::validate_condition(op, arg)?;
             }
             _ => {}
         }

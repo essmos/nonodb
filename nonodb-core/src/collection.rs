@@ -14,6 +14,7 @@ use crate::aggregate;
 use crate::bson_types;
 use crate::date;
 use crate::error::{Error, Result};
+use crate::geo;
 use crate::history::{self, HistoryConfig, HistoryEntry};
 use crate::index::{self, IndexDef};
 use crate::numeric;
@@ -212,6 +213,13 @@ struct IndexPlan {
     def: IndexDef,
 }
 
+/// Selected geo index and the cell ranges to scan.
+struct GeoIndexPlan {
+    db: Database<Bytes, Bytes>,
+    ranges: Vec<index::RangeBytes>,
+    def: IndexDef,
+}
+
 /// `find` query parameters.
 #[derive(Debug, Clone, Default)]
 pub struct FindQuery {
@@ -233,6 +241,9 @@ pub struct IndexSpec {
     pub unique: bool,
     #[serde(default)]
     pub include: Vec<String>,
+    /// Single-field GeoJSON point index.
+    #[serde(default)]
+    pub geo: bool,
 }
 
 pub struct Collection<'e> {
@@ -489,7 +500,16 @@ impl<'e> Collection<'e> {
                     "index fields must be non-empty and must not contain `+`".into(),
                 ));
             }
-            let def = IndexDef::compound(&spec.fields, spec.unique, &spec.include);
+            if spec.geo && (spec.fields.len() != 1 || spec.unique || !spec.include.is_empty()) {
+                return Err(Error::Query(
+                    "geo indexes require exactly one field and cannot be unique or covering".into(),
+                ));
+            }
+            let def = if spec.geo {
+                IndexDef::geo(&spec.fields[0])
+            } else {
+                IndexDef::compound(&spec.fields, spec.unique, &spec.include)
+            };
             let name = def.name();
             if !names.insert(name.clone()) {
                 return Err(Error::Query(format!("duplicate index in batch: {name}")));
@@ -543,6 +563,9 @@ impl<'e> Collection<'e> {
             .iter()
             .map(|(_key, def)| self.index_db_in(wtxn, def))
             .collect::<Result<_>>()?;
+        for db in &index_dbs {
+            db.clear(&mut *wtxn)?;
+        }
         let mut seen: Vec<HashMap<Vec<u8>, String>> = defs
             .iter()
             .map(|(_key, def)| HashMap::with_capacity(if def.unique { entries.len() } else { 0 }))
@@ -577,7 +600,19 @@ impl<'e> Collection<'e> {
     }
 
     pub fn create_index_txn(&self, wtxn: &mut RwTxn<'_>, field: &str, unique: bool) -> Result<()> {
-        self.create_index_fields_txn(wtxn, &[field.to_string()], unique, &[])
+        self.create_index_fields_txn(wtxn, &[field.to_string()], unique, &[], false)
+    }
+
+    /// Creates a single-field GeoJSON point index.
+    pub fn create_geo_index(&self, field: &str) -> Result<()> {
+        let mut wtxn = self.write_txn()?;
+        self.create_geo_index_txn(&mut wtxn, field)?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    pub fn create_geo_index_txn(&self, wtxn: &mut RwTxn<'_>, field: &str) -> Result<()> {
+        self.create_index_fields_txn(wtxn, &[field.to_string()], false, &[], true)
     }
 
     /// Creates a compound index. Field order matters: a field prefix can
@@ -589,7 +624,7 @@ impl<'e> Collection<'e> {
         include: &[String],
     ) -> Result<()> {
         let mut wtxn = self.write_txn()?;
-        self.create_index_fields_txn(&mut wtxn, fields, unique, include)?;
+        self.create_index_fields_txn(&mut wtxn, fields, unique, include, false)?;
         wtxn.commit()?;
         Ok(())
     }
@@ -600,6 +635,7 @@ impl<'e> Collection<'e> {
         fields: &[String],
         unique: bool,
         include: &[String],
+        geo: bool,
     ) -> Result<()> {
         self.ensure_standard()?;
         if fields.is_empty() {
@@ -610,7 +646,16 @@ impl<'e> Collection<'e> {
                 "index fields must be non-empty and must not contain `+`".into(),
             ));
         }
-        let mut def = IndexDef::compound(fields, unique, include);
+        if geo && (fields.len() != 1 || unique || !include.is_empty()) {
+            return Err(Error::Query(
+                "geo indexes require exactly one field and cannot be unique or covering".into(),
+            ));
+        }
+        let mut def = if geo {
+            IndexDef::geo(&fields[0])
+        } else {
+            IndexDef::compound(fields, unique, include)
+        };
         let key = index::def_key(&self.name, &def.name());
         self.meta.put(
             &mut *wtxn,
@@ -618,6 +663,7 @@ impl<'e> Collection<'e> {
             serde_json::to_vec(&def)?.as_slice(),
         )?;
         let idx_db = self.index_db_in(wtxn, &def)?;
+        idx_db.clear(&mut *wtxn)?;
 
         // Backfill: parallel parsing/encoding, written in one transaction.
         let total_docs = self.db.stat(wtxn)?.entries as u64;
@@ -830,6 +876,10 @@ impl<'e> Collection<'e> {
         defs.sort_by_key(|d| std::cmp::Reverse(d.effective_fields().len()));
 
         for def in defs {
+            // Geo indexes have their own multi-range plan.
+            if def.geo {
+                continue;
+            }
             // Older indexes skipped arrays and some Extended JSON values during
             // backfill. Only current-format indexes are safe for planning.
             if !def.current_format() {
@@ -844,6 +894,50 @@ impl<'e> Collection<'e> {
             return Ok(Some(IndexPlan { db, bounds, def }));
         }
         Ok(None)
+    }
+
+    /// Selects a geo index and the grid-cell ranges for a geo filter.
+    fn geo_index_plan(&self, rtxn: &RoTxn<'_>, filter: &Value) -> Result<Option<GeoIndexPlan>> {
+        let Some((field, query)) = geo::index_query(filter) else {
+            return Ok(None);
+        };
+        let Some(ranges) = geo::index_ranges(&query, geo::MAX_GEO_RANGES) else {
+            return Ok(None);
+        };
+        let Some(def) = self.index_defs(rtxn)?.into_iter().find(|def| {
+            def.geo && def.current_format() && def.effective_fields().as_slice() == [field.as_str()]
+        }) else {
+            return Ok(None);
+        };
+        let Some(db) = self.index_db(rtxn, &def)? else {
+            return Ok(None);
+        };
+        Ok(Some(GeoIndexPlan { db, ranges, def }))
+    }
+
+    /// Distinct `_id` candidates from all geo index cell ranges.
+    fn geo_index_candidates(
+        &self,
+        rtxn: &RoTxn<'_>,
+        filter: &Value,
+    ) -> Result<Option<Vec<String>>> {
+        let Some(plan) = self.geo_index_plan(rtxn, filter)? else {
+            return Ok(None);
+        };
+        let mut ids = Vec::new();
+        let mut seen = HashSet::new();
+        for (lower, upper) in &plan.ranges {
+            let range = (as_bound(lower), as_bound(upper));
+            for item in plan.db.range(rtxn, &range)? {
+                let (_key, value) = item?;
+                if let Some((id, _)) = index::decode_index_value(value) {
+                    if seen.insert(id.clone()) {
+                        ids.push(id);
+                    }
+                }
+            }
+        }
+        Ok(Some(ids))
     }
 
     /// Selects an index that can provide a sort-only query order.
@@ -863,7 +957,8 @@ impl<'e> Collection<'e> {
         let mut defs = self.index_defs(rtxn)?;
         defs.sort_by_key(|d| std::cmp::Reverse(d.effective_fields().len()));
         for def in defs {
-            if !def.current_format()
+            if def.geo
+                || !def.current_format()
                 || def.is_multikey()
                 || index_matches_sort(&def, sort).is_none()
             {
@@ -902,7 +997,8 @@ impl<'e> Collection<'e> {
         let mut defs = self.index_defs(rtxn)?;
         defs.sort_by_key(|d| std::cmp::Reverse(d.effective_fields().len()));
         for def in defs {
-            if !def.current_format()
+            if def.geo
+                || !def.current_format()
                 || !def.is_multikey()
                 || !def.multikey_all_docs
                 || index_matches_sort(&def, sort).is_none()
@@ -1083,7 +1179,9 @@ impl<'e> Collection<'e> {
         let mut defs = self.index_defs(rtxn)?;
         defs.sort_by_key(|d| std::cmp::Reverse(d.effective_fields().len()));
         let Some(def) = defs.into_iter().find(|def| {
-            def.current_format() && def.effective_fields().as_slice() == [field.as_str()]
+            !def.geo
+                && def.current_format()
+                && def.effective_fields().as_slice() == [field.as_str()]
         }) else {
             return Ok(None);
         };
@@ -2651,6 +2749,21 @@ impl<'e> Collection<'e> {
             return Ok(());
         }
 
+        if let Some(ids) = self.geo_index_candidates(txn, filter)? {
+            for id in ids {
+                let Some(bytes) = self.db.get(txn, id.as_bytes())? else {
+                    continue;
+                };
+                let Some(doc) = parse_prefiltered(bytes, raw.as_ref())? else {
+                    continue;
+                };
+                if matches(&doc, filter) {
+                    f(doc)?;
+                }
+            }
+            return Ok(());
+        }
+
         if let Some(plans) = self.or_index_plans(txn, filter)? {
             let mut seen = HashSet::new();
             for plan in plans {
@@ -3132,6 +3245,9 @@ impl<'e> Collection<'e> {
         if self.all_index_candidates(rtxn, filter)?.is_some() {
             return Ok(true);
         }
+        if self.geo_index_plan(rtxn, filter)?.is_some() {
+            return Ok(true);
+        }
         if self.or_index_plans(rtxn, filter)?.is_some() {
             return Ok(true);
         }
@@ -3463,11 +3579,78 @@ impl<'e> Collection<'e> {
         Ok(top.into_sorted())
     }
 
+    /// `$near` returns documents ordered by distance. A geo index narrows the
+    /// candidate set when `$maxDistance` is present; otherwise the collection
+    /// scan still provides correct ordering.
+    fn find_near(
+        &self,
+        rtxn: &RoTxn<'_>,
+        query: &FindQuery,
+        field: &str,
+        near: &geo::GeoNear,
+    ) -> Result<Vec<Value>> {
+        if !query.sort.is_empty() {
+            return Err(Error::Query(
+                "$near cannot be combined with an explicit sort".into(),
+            ));
+        }
+        let limit = query.limit.unwrap_or(usize::MAX);
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let raw = raw_prefilter(&query.filter);
+        let mut hits: Vec<(f64, Value)> = Vec::new();
+
+        if let Some(ids) = self.geo_index_candidates(rtxn, &query.filter)? {
+            for id in ids {
+                let Some(bytes) = self.db.get(rtxn, id.as_bytes())? else {
+                    continue;
+                };
+                let Some(doc) = parse_prefiltered(bytes, raw.as_ref())? else {
+                    continue;
+                };
+                if !matches(&doc, &query.filter) {
+                    continue;
+                }
+                if let Some(distance) = geo::field_distance(&doc, field, near.center) {
+                    hits.push((distance, doc));
+                }
+            }
+        } else {
+            for item in self.db.iter(rtxn)? {
+                let (_key, bytes) = item?;
+                let Some(doc) = parse_prefiltered(bytes, raw.as_ref())? else {
+                    continue;
+                };
+                if !matches(&doc, &query.filter) {
+                    continue;
+                }
+                if let Some(distance) = geo::field_distance(&doc, field, near.center) {
+                    hits.push((distance, doc));
+                }
+            }
+        }
+
+        hits.sort_by(|a, b| a.0.total_cmp(&b.0));
+        Ok(hits
+            .into_iter()
+            .skip(query.skip)
+            .take(limit)
+            .map(|(_, doc)| match &query.projection {
+                Some(projection) => project(&doc, projection),
+                None => doc,
+            })
+            .collect())
+    }
+
     pub fn find_in(&self, rtxn: &RoTxn<'_>, query: &FindQuery) -> Result<Vec<Value>> {
         crate::query::validate::validate_filter(&query.filter)?;
         let limit = query.limit.unwrap_or(usize::MAX);
         if limit == 0 {
             return Ok(Vec::new());
+        }
+        if let Some((field, near)) = geo::extract_near(&query.filter) {
+            return self.find_near(rtxn, query, &field, &near);
         }
         let sorted = !query.sort.is_empty();
         // Without sorting, `skip + limit` matches are enough (early exit).
@@ -3535,6 +3718,23 @@ impl<'e> Collection<'e> {
         // 1b) Multikey `$all`: intersect the index ranges for every required
         //     value, then apply the full filter as a residual.
         else if let Some(ids) = self.all_index_candidates(rtxn, &query.filter)? {
+            for id in ids {
+                if !sorted && acc.len() >= want {
+                    break;
+                }
+                let Some(bytes) = self.db.get(rtxn, id.as_bytes())? else {
+                    continue;
+                };
+                let Some(doc) = parse_prefiltered(bytes, raw.as_ref())? else {
+                    continue;
+                };
+                if matches(&doc, &query.filter) {
+                    acc.push(doc);
+                }
+            }
+        }
+        // 1c) Geo index cell ranges for `$geoWithin` / `$geoIntersects`.
+        else if let Some(ids) = self.geo_index_candidates(rtxn, &query.filter)? {
             for id in ids {
                 if !sorted && acc.len() >= want {
                     break;
@@ -3899,6 +4099,30 @@ impl<'e> Collection<'e> {
             return Ok(Value::Object(out));
         }
 
+        if let Some(plan) = self.geo_index_plan(rtxn, &query.filter)? {
+            let mut candidates = 0usize;
+            for (lower, upper) in &plan.ranges {
+                let range = (as_bound(lower), as_bound(upper));
+                candidates = candidates.saturating_add(plan.db.range(rtxn, &range)?.count());
+            }
+            out.insert("access_path".into(), Value::String("geo_index_scan".into()));
+            out.insert("index_used".into(), Value::Bool(true));
+            out.insert(
+                "index".into(),
+                serde_json::json!({
+                    "fields": plan.def.effective_fields(),
+                    "geo": true,
+                }),
+            );
+            out.insert(
+                "bounds".into(),
+                serde_json::json!({"ranges": plan.ranges.len()}),
+            );
+            out.insert("candidates".into(), Value::from(candidates as u64));
+            out.insert("sort_covered".into(), Value::Bool(false));
+            return Ok(Value::Object(out));
+        }
+
         if let Some(plans) = self.or_index_plans(rtxn, &query.filter)? {
             let mut candidates = 0usize;
             let mut indexes = Vec::with_capacity(plans.len());
@@ -4033,6 +4257,24 @@ impl<'e> Collection<'e> {
         // Multikey `$all`: the intersection already contains distinct ids.
         if let Some(ids) = self.all_index_candidates(rtxn, filter)? {
             return Ok(ids.len());
+        }
+        // Geo index cell ranges still need the residual matcher because a cell
+        // can contain points outside the requested circle/polygon.
+        if let Some(ids) = self.geo_index_candidates(rtxn, filter)? {
+            let raw = raw_prefilter(filter);
+            let mut n = 0;
+            for id in ids {
+                let Some(bytes) = self.db.get(rtxn, id.as_bytes())? else {
+                    continue;
+                };
+                let Some(doc) = parse_prefiltered(bytes, raw.as_ref())? else {
+                    continue;
+                };
+                if matches(&doc, filter) {
+                    n += 1;
+                }
+            }
+            return Ok(n);
         }
         // Filter fully covered by an index: count keys without parsing JSON.
         if let Some(plan) = self.index_plan(rtxn, filter)? {
@@ -4691,6 +4933,9 @@ fn covering_doc(
 /// the sort uses exactly the same fields (in the same order) and
 /// all directions are ascending (`false`) or all descending (`true`).
 fn index_matches_sort(def: &IndexDef, sort: &[(String, i32)]) -> Option<bool> {
+    if def.geo {
+        return None;
+    }
     let fields = def.effective_fields();
     if fields.len() != sort.len() || sort.is_empty() {
         return None;
@@ -5888,6 +6133,71 @@ mod tests {
     }
 
     #[test]
+    fn geo_index_supports_near_within_and_updates() {
+        let (_dir, store) = store();
+        let c = store.collection("places").unwrap();
+        let near_id = c
+            .insert_one(json!({
+                "_id": "near",
+                "loc": {"type": "Point", "coordinates": [19.94, 50.06]},
+            }))
+            .unwrap();
+        c.insert_one(json!({
+            "_id": "slightly-near",
+            "loc": {"type": "Point", "coordinates": [19.941, 50.06]},
+        }))
+        .unwrap();
+        c.insert_one(json!({
+            "_id": "far",
+            "loc": {"type": "Point", "coordinates": [21.01, 52.23]},
+        }))
+        .unwrap();
+        c.create_geo_index("loc").unwrap();
+
+        let near = FindQuery {
+            filter: json!({
+                "loc": {
+                    "$near": {
+                        "$geometry": {"type": "Point", "coordinates": [19.94, 50.06]},
+                        "$maxDistance": 500
+                    }
+                }
+            }),
+            ..Default::default()
+        };
+        let found = c.find(&near).unwrap();
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0]["_id"], near_id);
+        assert_eq!(found[1]["_id"], "slightly-near");
+
+        let within = json!({"loc": {"$geoWithin": {"$box": [[19.0, 50.0], [20.0, 51.0]]}}});
+        assert_eq!(c.count(&within).unwrap(), 2);
+        let q = FindQuery {
+            filter: within.clone(),
+            ..Default::default()
+        };
+        let explained = c.explain(&q).unwrap();
+        assert_eq!(explained["access_path"], "geo_index_scan");
+        assert_eq!(explained["index_used"], true);
+        assert_eq!(explained["index"]["geo"], true);
+
+        // Updating the point must move its geo index entries.
+        c.update(
+            &json!({"_id": near_id}),
+            &json!({"$set": {"loc": {"type": "Point", "coordinates": [21.0, 52.2]}}}),
+            false,
+        )
+        .unwrap();
+        assert_eq!(c.count(&within).unwrap(), 1);
+        let remaining = c.find(&near).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0]["_id"], "slightly-near");
+        let rtxn = store.read_txn().unwrap();
+        c.verify_in(&rtxn).unwrap();
+        rtxn.commit().unwrap();
+    }
+
+    #[test]
     fn create_indexes_batch_builds_all_indexes_in_one_pass() {
         let (_dir, store) = store();
         let c = store.collection("batch_indexes").unwrap();
@@ -5904,16 +6214,19 @@ mod tests {
                 fields: vec!["grp".into()],
                 unique: false,
                 include: vec![],
+                geo: false,
             },
             IndexSpec {
                 fields: vec!["score".into()],
                 unique: false,
                 include: vec!["grp".into()],
+                geo: false,
             },
             IndexSpec {
                 fields: vec!["tags".into()],
                 unique: false,
                 include: vec![],
+                geo: false,
             },
         ])
         .unwrap();
@@ -5937,6 +6250,7 @@ mod tests {
                 fields: vec!["email".into()],
                 unique: true,
                 include: vec![],
+                geo: false,
             }])
             .is_err());
         assert!(dup.list_indexes().unwrap().is_empty());

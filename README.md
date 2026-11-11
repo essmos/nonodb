@@ -36,7 +36,8 @@ nonodb is a real document database with:
 - document TTL with collection defaults, per-document overrides, and background expiry;
 - optional vault collections with whole-document encryption and per-tenant keys;
 - a bounded daemon read cache, invalidated after every committed write;
-- optional automatic indexes for frequent query shapes, with TTL cleanup.
+- optional automatic indexes for frequent query shapes, with TTL cleanup;
+- single-field GeoJSON point indexes for `$near` and `$geoWithin`.
 
 **Forget about creating indexes — NoNoDB will do it for you if it decides it is
 necessary.** Automatic indexing is opt-in (`NONODB_AUTO_INDEX=1`), conservative,
@@ -173,6 +174,9 @@ footprint.
 - Covering indexes with `include`, serving projections without fetching the
   document.
 - Index-backed `count` when the filter exactly matches the indexed fields.
+- Single-field GeoJSON point indexes with `$near`, `$geoWithin`, and
+  `$geoIntersects`; queries use hierarchical grid ranges plus exact residual
+  checks.
 - Parallel index backfill for existing collections.
 
 ### Search

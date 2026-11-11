@@ -91,8 +91,9 @@ Implemented:
   contain at most one array field; parallel arrays are rejected. Ordinary
   objects are skipped. Indexes created before format 5 must be recreated to
   include array entries.
-- No sparse/partial indexes, wildcard indexes, geospatial indexes, vector
-  indexes, or text indexes with custom analyzers.
+- No sparse/partial indexes, wildcard indexes, vector indexes, or text indexes
+  with custom analyzers. Geo indexes currently cover single-field GeoJSON
+  points; polygon/line document indexes are not implemented.
 - No index intersection or cost-based optimizer. The planner uses a simple
   prefix/range rule.
 - A covering projection requires an explicit `include` list and an inclusive
@@ -214,7 +215,7 @@ project's target workload.
 ### Lower priority
 
 14. Sparse/partial and wildcard indexes.
-15. Geospatial or vector indexes.
+15. Vector indexes and polygon/line document geo indexes.
 16. A published Python package and additional language clients.
 17. Benchmark automation in CI.
 18. A web UI or schema browser.

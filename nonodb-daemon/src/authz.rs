@@ -179,6 +179,7 @@ mod tests {
             fields: None,
             unique: false,
             include: vec![],
+            geo: false,
         };
         assert!(authorize_request(&writer, &index).is_err());
         let admin = principal(&["admin:orders"]);

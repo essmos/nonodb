@@ -18,6 +18,9 @@ use crate::regex;
 /// entries.
 pub const FORMAT_VERSION: u8 = 5;
 
+/// Number of precision levels stored for each geo point.
+const GEO_KEYS_PER_POINT: usize = 4;
+
 /// Index definition stored in `meta` under `index:<coll>:<name>`.
 ///
 /// Supports single-field (`fields == ["age"]`) and compound
@@ -34,6 +37,10 @@ pub struct IndexDef {
     /// Fields additionally copied into the index value (covering projections).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub include: Vec<String>,
+    /// Single-field GeoJSON point index. Geo entries use an internal hierarchy
+    /// of lon/lat grid cells instead of scalar values.
+    #[serde(default)]
+    pub geo: bool,
     /// Index key encoding version. Missing in definitions written before date
     /// support and therefore defaults to 0.
     #[serde(default)]
@@ -58,6 +65,7 @@ impl IndexDef {
             field: String::new(),
             unique,
             include: Vec::new(),
+            geo: false,
             format: FORMAT_VERSION,
             multikey_fields: Vec::new(),
             multikey_all_docs: false,
@@ -70,10 +78,18 @@ impl IndexDef {
             field: String::new(),
             unique,
             include: include.to_vec(),
+            geo: false,
             format: FORMAT_VERSION,
             multikey_fields: Vec::new(),
             multikey_all_docs: false,
         }
+    }
+
+    /// Single-field GeoJSON point index.
+    pub fn geo(field: &str) -> Self {
+        let mut def = Self::single(field, false);
+        def.geo = true;
+        def
     }
 
     /// Whether the index was built with the current key encoding.
@@ -271,6 +287,40 @@ fn flatten_array<'a>(value: &'a Value, out: &mut Vec<&'a Value>) {
 /// contain at most one array field, matching MongoDB's parallel-array rule.
 pub fn encode_index_keys(def: &IndexDef, doc: &Value) -> Result<IndexKeys, crate::Error> {
     let fields = def.effective_fields();
+    if def.geo {
+        if fields.len() != 1 {
+            return Err(crate::Error::Query(
+                "geo indexes require exactly one field".into(),
+            ));
+        }
+        let field = &fields[0];
+        let (values, saw_array) = field_values(doc, field);
+        let mut keys = Vec::new();
+        for value in values {
+            if let Some(point) = crate::geo::parse_point(value) {
+                keys.extend(crate::geo::encode_point_keys(point));
+                continue;
+            }
+            if let Some(items) = value.as_array() {
+                for item in items {
+                    if let Some(point) = crate::geo::parse_point(item) {
+                        keys.extend(crate::geo::encode_point_keys(point));
+                    }
+                }
+            }
+        }
+        keys.sort();
+        keys.dedup();
+        let multikey_fields = if saw_array || keys.len() > GEO_KEYS_PER_POINT {
+            vec![field.clone()]
+        } else {
+            Vec::new()
+        };
+        return Ok(IndexKeys {
+            keys,
+            multikey_fields,
+        });
+    }
     let mut per_field: Vec<Vec<Vec<u8>>> = Vec::with_capacity(fields.len());
     let mut multikey_fields = Vec::new();
     for field in &fields {
@@ -372,7 +422,7 @@ pub fn decode_index_value(raw: &[u8]) -> Option<(String, Option<serde_json::Map<
         .map(|id| (id.to_string(), None))
 }
 
-fn after_value(vb: &[u8]) -> Vec<u8> {
+pub fn after_value(vb: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(vb.len() + 1);
     out.extend_from_slice(vb);
     out.push(0xFF);

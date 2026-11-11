@@ -452,6 +452,15 @@ The legacy positional `field` argument is still accepted:
 users.create_index(field="age")
 ```
 
+### GeoJSON points
+
+```python
+places.create_index("loc", geo=True)
+```
+
+A geo index supports `$near` and `$geoWithin` filters. It is always
+single-field and cannot be unique or covering.
+
 ### Compound and covering
 
 ```python

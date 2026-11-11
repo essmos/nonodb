@@ -313,6 +313,7 @@ impl AutoIndexer {
                     fields: fields.clone(),
                     unique: false,
                     include: Vec::new(),
+                    geo: false,
                 })
                 .collect();
             let names: Vec<Vec<String>> =

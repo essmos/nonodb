@@ -1066,6 +1066,79 @@ Rules:
   range per value, and `$elemMatch` can use a dotted index on the matching
   element path. `$size` still requires a scan.
 
+### Geo index
+
+Create a single-field GeoJSON point index:
+
+```json
+{"op": "create_index", "coll": "places", "field": "loc", "geo": true}
+```
+
+Documents use a GeoJSON `Point`:
+
+```json
+{"_id": "waw", "loc": {"type": "Point", "coordinates": [21.01, 52.23]}}
+```
+
+The `create_indexes` form accepts the same `geo` flag:
+
+```json
+{"op": "create_indexes", "coll": "places",
+ "indexes": [{"field": "loc", "geo": true}]}
+```
+
+Geo indexes must have exactly one field and cannot be unique or covering.
+They are maintained transactionally on insert, update, and delete.
+
+## Geospatial queries
+
+`$near` / `$nearSphere` returns matches ordered by distance. Distances are in
+meters and use a spherical Earth model:
+
+```json
+{
+  "op": "find",
+  "coll": "places",
+  "filter": {
+    "loc": {
+      "$near": {
+        "$geometry": {"type": "Point", "coordinates": [21.01, 52.23]},
+        "$minDistance": 0,
+        "$maxDistance": 5000
+      }
+    }
+  },
+  "limit": 20
+}
+```
+
+With `$maxDistance`, a matching geo index narrows the candidate cells. Without
+`$maxDistance`, the query still returns distance order but falls back to a
+collection scan.
+
+`$geoWithin` accepts:
+
+```json
+{"loc": {"$geoWithin": {"$box": [[20.0, 51.0], [22.0, 53.0]]}}}
+{"loc": {"$geoWithin": {"$centerSphere": [[21.01, 52.23], 0.01]}}}
+{"loc": {"$geoWithin": {"$polygon": [[20, 51], [22, 51], [22, 53], [20, 53]]}}}
+{"loc": {"$geoWithin": {"$geometry": {"type": "Polygon", "coordinates": [[[20,51],[22,51],[22,53],[20,53],[20,51]]]}}}}
+```
+
+`$centerSphere` uses radians for its radius. `$geoIntersects` accepts
+`{"$geometry": ...}` and matches point documents against the supplied geometry.
+
+Geo index rules and limitations:
+
+- Only GeoJSON `Point` documents are indexed. `Polygon` and `MultiPolygon`
+  geometries are supported in query arguments.
+- Point-in-polygon checks use lon/lat planar geometry; distance checks use
+  haversine meters. This is accurate for ordinary city/region queries but is
+  not a full spherical topology engine.
+- A geo index uses a hierarchy of lon/lat grid cells. Large queries may choose
+  a coarser level, so the residual filter always verifies the exact result.
+- `$near` cannot be combined with an explicit `sort`.
+
 ## drop_index
 
 ```json
@@ -1100,6 +1173,7 @@ Response:
         "unique": true,
         "include": [],
         "format": 5,
+        "geo": false,
         "multikey_fields": [],
         "multikey_all_docs": true
       }

@@ -1357,6 +1357,7 @@ async fn exec(
                             "unique": d.unique,
                             "include": d.include,
                             "format": d.format,
+                            "geo": d.geo,
                             "multikey_fields": d.multikey_fields,
                             "multikey_all_docs": d.multikey_all_docs,
                         })
@@ -1683,6 +1684,7 @@ async fn exec(
                     fields,
                     unique,
                     include,
+                    geo,
                 } => {
                     let fields = match (fields, field) {
                         (Some(fields), _) => fields,
@@ -1699,6 +1701,7 @@ async fn exec(
                         fields,
                         unique,
                         include,
+                        geo,
                     }
                 }
                 Request::CreateIndexes { coll, indexes } => {
@@ -1720,6 +1723,7 @@ async fn exec(
                             fields,
                             unique: index.unique,
                             include: index.include,
+                            geo: index.geo,
                         });
                     }
                     WriteReq::CreateIndexes {

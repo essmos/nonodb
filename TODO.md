@@ -127,7 +127,9 @@ limitations are documented in [docs/roadmap.md](docs/roadmap.md).
 - [ ] CBOR/MessagePack storage with migration path
 - [ ] Compression on disk
 - [ ] Published Python package
-- [ ] Geospatial and vector indexes (separate feature area)
+- [x] Single-field GeoJSON point indexes with `$near`, `$geoWithin`, and
+      `$geoIntersects` for point documents
+- [ ] Vector indexes and advanced spherical topology/line/polygon document indexes
 
 ## Known issues and caveats
 
