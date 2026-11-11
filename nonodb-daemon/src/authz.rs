@@ -29,6 +29,7 @@ pub fn authorize_request(principal: &Principal, req: &Request) -> Result<(), Api
         | Request::GetCollectionTtl { coll } => allow(principal, Action::Read, coll, req.op_name()),
 
         Request::CreateIndex { coll, .. }
+        | Request::CreateIndexes { coll, .. }
         | Request::DropIndex { coll, .. }
         | Request::CreateTextIndex { coll, .. }
         | Request::DropTextIndex { coll, .. }

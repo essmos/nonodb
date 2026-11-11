@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use heed::types::Bytes;
 use heed::{Database, Env, RoTxn, RwTxn};
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::aggregate;
@@ -47,6 +48,36 @@ const PARALLEL_UNSORTED_MIN_WANT: usize = 16;
 
 /// Size of the raw-byte chunk passed to worker threads.
 const PARALLEL_SCAN_CHUNK: usize = 8192;
+
+/// Default cap for worker threads on large scans/backfills.
+const DEFAULT_WORKERS: usize = 16;
+/// Hard cap for configurable worker counts, to avoid runaway memory use.
+const MAX_WORKERS: usize = 256;
+
+fn configured_workers(var: &str) -> usize {
+    let detected = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let default = detected.clamp(1, DEFAULT_WORKERS);
+    std::env::var(var)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .map(|value| value.min(MAX_WORKERS))
+        .unwrap_or(default)
+}
+
+fn scan_workers() -> usize {
+    configured_workers("NONODB_SCAN_WORKERS")
+}
+
+fn backfill_workers() -> usize {
+    configured_workers("NONODB_BACKFILL_WORKERS")
+}
+
+fn aggregate_workers() -> usize {
+    configured_workers("NONODB_AGGREGATE_WORKERS")
+}
 
 /// Scan chunk: one byte buffer plus document offsets (fewer allocations).
 struct ScanChunk {
@@ -192,6 +223,16 @@ pub struct FindQuery {
     pub sort: Vec<(String, i32)>,
     pub skip: usize,
     pub limit: Option<usize>,
+}
+
+/// One secondary index to create in a single collection scan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexSpec {
+    pub fields: Vec<String>,
+    #[serde(default)]
+    pub unique: bool,
+    #[serde(default)]
+    pub include: Vec<String>,
 }
 
 pub struct Collection<'e> {
@@ -418,6 +459,115 @@ impl<'e> Collection<'e> {
     fn index_db_in(&self, wtxn: &mut RwTxn<'_>, def: &IndexDef) -> Result<Database<Bytes, Bytes>> {
         let name = index::db_name(&self.name, &def.name());
         self.resource_db_in(wtxn, &name, &name)
+    }
+
+    /// Creates multiple secondary indexes in one collection scan.
+    ///
+    /// Parsing and key encoding run in parallel; all index writes happen in the
+    /// caller's single LMDB write transaction. This is the preferred path for
+    /// migration/backfill jobs that add several indexes at once.
+    pub fn create_indexes(&self, specs: &[IndexSpec]) -> Result<()> {
+        let mut wtxn = self.write_txn()?;
+        self.create_indexes_txn(&mut wtxn, specs)?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    pub fn create_indexes_txn(&self, wtxn: &mut RwTxn<'_>, specs: &[IndexSpec]) -> Result<()> {
+        self.ensure_standard()?;
+        if specs.is_empty() {
+            return Ok(());
+        }
+        let mut defs: Vec<(String, IndexDef)> = Vec::with_capacity(specs.len());
+        let mut names = HashSet::new();
+        for spec in specs {
+            if spec.fields.is_empty() {
+                return Err(Error::Query("index requires at least one field".into()));
+            }
+            if spec.fields.iter().any(|f| f.is_empty() || f.contains('+')) {
+                return Err(Error::Query(
+                    "index fields must be non-empty and must not contain `+`".into(),
+                ));
+            }
+            let def = IndexDef::compound(&spec.fields, spec.unique, &spec.include);
+            let name = def.name();
+            if !names.insert(name.clone()) {
+                return Err(Error::Query(format!("duplicate index in batch: {name}")));
+            }
+            let key = index::def_key(&self.name, &name);
+            self.meta.put(
+                &mut *wtxn,
+                key.as_bytes(),
+                serde_json::to_vec(&def)?.as_slice(),
+            )?;
+            defs.push((key, def));
+        }
+
+        let total_docs = self.db.stat(wtxn)?.entries as u64;
+        let target = format!("{} indexes", defs.len());
+        let defs_ref = &defs;
+        let entries: Vec<(usize, index::IndexKeys, Vec<u8>, String)> =
+            self.parallel_backfill(wtxn, "index", &target, |id, doc| {
+                let mut out = Vec::new();
+                for (slot, (_key, def)) in defs_ref.iter().enumerate() {
+                    let keys = index::encode_index_keys(def, &doc)?;
+                    if keys.keys.is_empty() {
+                        continue;
+                    }
+                    let value = index::encode_index_value(def, &doc, &id);
+                    out.push((slot, keys, value, id.clone()));
+                }
+                Ok(out)
+            })?;
+
+        let mut docs_per_index = vec![0u64; defs.len()];
+        for (slot, keys, _, _) in &entries {
+            docs_per_index[*slot] = docs_per_index[*slot].saturating_add(1);
+            for field in &keys.multikey_fields {
+                if !defs[*slot].1.multikey_fields.contains(field) {
+                    defs[*slot].1.multikey_fields.push(field.clone());
+                }
+            }
+        }
+        for (slot, (_key, def)) in defs.iter_mut().enumerate() {
+            def.multikey_all_docs = docs_per_index[slot] == total_docs;
+            let key = index::def_key(&self.name, &def.name());
+            self.meta.put(
+                &mut *wtxn,
+                key.as_bytes(),
+                serde_json::to_vec(def)?.as_slice(),
+            )?;
+        }
+
+        let index_dbs: Vec<_> = defs
+            .iter()
+            .map(|(_key, def)| self.index_db_in(wtxn, def))
+            .collect::<Result<_>>()?;
+        let mut seen: Vec<HashMap<Vec<u8>, String>> = defs
+            .iter()
+            .map(|(_key, def)| HashMap::with_capacity(if def.unique { entries.len() } else { 0 }))
+            .collect();
+
+        for (slot, keys, value, id) in entries {
+            let unique = defs[slot].1.unique;
+            for vb in keys.keys {
+                if unique {
+                    match seen[slot].get(&vb) {
+                        Some(existing) if existing != &id => {
+                            return Err(Error::DuplicateKey(id));
+                        }
+                        Some(_) => continue,
+                        None => {
+                            seen[slot].insert(vb.clone(), id.clone());
+                        }
+                    }
+                }
+                let mut key = vb;
+                key.extend_from_slice(id.as_bytes());
+                index_dbs[slot].put(&mut *wtxn, key.as_slice(), value.as_slice())?;
+            }
+        }
+        Ok(())
     }
 
     /// Creates a secondary index (single field) and backfills it with existing
@@ -2468,6 +2618,118 @@ impl<'e> Collection<'e> {
         Ok(keys)
     }
 
+    /// Streams documents matching a filter through `f`, using the same
+    /// access paths as `find`/`matching_keys` but without collecting all
+    /// results first. This keeps a leading aggregation `$match` index-backed
+    /// while allowing a streaming `$group` to consume an unbounded input.
+    fn for_each_matching<F>(&self, txn: &RoTxn<'_>, filter: &Value, mut f: F) -> Result<()>
+    where
+        F: FnMut(Value) -> Result<()>,
+    {
+        crate::query::validate::validate_filter(filter)?;
+        let raw = raw_prefilter(filter);
+
+        if let Some(id) = direct_id(filter) {
+            if let Some(bytes) = self.db.get(txn, id.as_bytes())? {
+                f(parse_json(bytes)?)?;
+            }
+            return Ok(());
+        }
+
+        if let Some(ids) = self.all_index_candidates(txn, filter)? {
+            for id in ids {
+                let Some(bytes) = self.db.get(txn, id.as_bytes())? else {
+                    continue;
+                };
+                let Some(doc) = parse_prefiltered(bytes, raw.as_ref())? else {
+                    continue;
+                };
+                if matches(&doc, filter) {
+                    f(doc)?;
+                }
+            }
+            return Ok(());
+        }
+
+        if let Some(plans) = self.or_index_plans(txn, filter)? {
+            let mut seen = HashSet::new();
+            for plan in plans {
+                let (lower, upper) = &plan.bounds;
+                let range = (as_bound(lower), as_bound(upper));
+                for item in plan.db.range(txn, &range)? {
+                    let (_key, value) = item?;
+                    let Some((id, _)) = index::decode_index_value(value) else {
+                        continue;
+                    };
+                    if !seen.insert(id.clone()) {
+                        continue;
+                    }
+                    let Some(bytes) = self.db.get(txn, id.as_bytes())? else {
+                        continue;
+                    };
+                    let Some(doc) = parse_prefiltered(bytes, raw.as_ref())? else {
+                        continue;
+                    };
+                    if matches(&doc, filter) {
+                        f(doc)?;
+                    }
+                }
+            }
+            return Ok(());
+        }
+
+        if let Some(plan) = self.index_plan(txn, filter)? {
+            let (lower, upper) = &plan.bounds;
+            let range = (as_bound(lower), as_bound(upper));
+            let multikey = plan.def.is_multikey();
+            let mut seen = HashSet::new();
+            for item in plan.db.range(txn, &range)? {
+                let (_key, value) = item?;
+                let Some((id, _)) = index::decode_index_value(value) else {
+                    continue;
+                };
+                if multikey && !seen.insert(id.clone()) {
+                    continue;
+                }
+                let Some(bytes) = self.db.get(txn, id.as_bytes())? else {
+                    continue;
+                };
+                let Some(doc) = parse_prefiltered(bytes, raw.as_ref())? else {
+                    continue;
+                };
+                if matches(&doc, filter) {
+                    f(doc)?;
+                }
+            }
+            return Ok(());
+        }
+
+        if let Some((lower, upper)) = id_bounds(filter) {
+            let range = (as_bound(&lower), as_bound(&upper));
+            for item in self.db.range(txn, &range)? {
+                let (_key, bytes) = item?;
+                let Some(doc) = parse_prefiltered(bytes, raw.as_ref())? else {
+                    continue;
+                };
+                if matches(&doc, filter) {
+                    f(doc)?;
+                }
+            }
+            return Ok(());
+        }
+
+        for item in self.db.iter(txn)? {
+            let (_key, bytes) = item?;
+            let Some(doc) = parse_prefiltered(bytes, raw.as_ref())? else {
+                continue;
+            };
+            if matches(&doc, filter) {
+                f(doc)?;
+            }
+        }
+        Ok(())
+    }
+
     // ----------------------------- read ------------------------------
 
     /// Runs a read-only aggregation pipeline over this collection.
@@ -2534,14 +2796,28 @@ impl<'e> Collection<'e> {
                 .and_then(|obj| obj.get("$group"))
             {
                 let mut builder = aggregate::GroupBuilder::new(group_arg)?;
-                for item in self.db.iter(rtxn)? {
-                    let (_key, raw) = item?;
-                    let doc = parse_json(raw)?;
-                    if matches(&doc, &plan.filter) {
-                        builder.update(doc)?;
+                let grouped = if builder.order_independent() {
+                    let total = self.db.stat(rtxn)?.entries;
+                    let parallel = total >= PARALLEL_SCAN_MIN_ENTRIES
+                        && aggregate_workers() > 1
+                        && !self.has_index_path(rtxn, &plan.filter)?;
+                    if parallel {
+                        self.parallel_group_scan(rtxn, &plan.filter, group_arg)?
+                    } else {
+                        self.for_each_matching(rtxn, &plan.filter, |doc| builder.update(doc))?;
+                        builder.finish()?
                     }
-                }
-                let grouped = builder.finish()?;
+                } else {
+                    // `$first`/`$last`/`$push` depend on the natural `_id` order.
+                    for item in self.db.iter(rtxn)? {
+                        let (_key, raw) = item?;
+                        let doc = parse_json(raw)?;
+                        if matches(&doc, &plan.filter) {
+                            builder.update(doc)?;
+                        }
+                    }
+                    builder.finish()?
+                };
                 if grouped.len() > max_docs {
                     return Err(Error::Query(format!(
                         "aggregation intermediate result exceeds {max_docs} documents"
@@ -2634,10 +2910,7 @@ impl<'e> Collection<'e> {
     {
         let total = self.db.stat(wtxn)?.entries as u64;
         let progress = crate::progress::begin(&self.name, target, kind, total);
-        let workers = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-            .min(16);
+        let workers = backfill_workers();
         if workers <= 1 {
             return self.backfill_serial(wtxn, f, &progress);
         }
@@ -2759,10 +3032,7 @@ impl<'e> Collection<'e> {
         query: &FindQuery,
         want: usize,
     ) -> Result<Vec<Value>> {
-        let workers = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-            .min(16);
+        let workers = scan_workers();
         if workers <= 1 || want == 0 {
             return self.scan_sorted_serial(rtxn, query, want);
         }
@@ -2854,6 +3124,146 @@ impl<'e> Collection<'e> {
         })
     }
 
+    /// Returns true when a filter has an index-backed access path.
+    fn has_index_path(&self, rtxn: &RoTxn<'_>, filter: &Value) -> Result<bool> {
+        if direct_id(filter).is_some() || id_bounds(filter).is_some() {
+            return Ok(true);
+        }
+        if self.all_index_candidates(rtxn, filter)?.is_some() {
+            return Ok(true);
+        }
+        if self.or_index_plans(rtxn, filter)?.is_some() {
+            return Ok(true);
+        }
+        Ok(self.index_plan(rtxn, filter)?.is_some())
+    }
+
+    /// Parallel streaming `$group` for order-independent accumulators.
+    ///
+    /// Each worker keeps a local group map and the coordinator merges the
+    /// partial maps once. Order-sensitive accumulators stay on the sequential
+    /// path so `$first`/`$last`/`$push` retain natural `_id` order semantics.
+    fn parallel_group_scan(
+        &self,
+        rtxn: &RoTxn<'_>,
+        filter: &Value,
+        group_spec: &Value,
+    ) -> Result<Vec<Value>> {
+        let workers = aggregate_workers();
+        if workers <= 1 {
+            let mut builder = aggregate::GroupBuilder::new(group_spec)?;
+            self.for_each_matching(rtxn, filter, |doc| builder.update(doc))?;
+            return builder.finish();
+        }
+
+        let (job_tx, job_rx) = std::sync::mpsc::sync_channel::<ScanChunk>(workers * 2);
+        let job_rx = Arc::new(Mutex::new(job_rx));
+        let (res_tx, res_rx) = std::sync::mpsc::channel::<Result<aggregate::GroupBuilder>>();
+        let raw = raw_prefilter(filter);
+        let raw_ref = raw.as_ref();
+
+        std::thread::scope(|scope| -> Result<Vec<Value>> {
+            for _ in 0..workers {
+                let rx = Arc::clone(&job_rx);
+                let tx = res_tx.clone();
+                scope.spawn(move || {
+                    let mut builder = match aggregate::GroupBuilder::new(group_spec) {
+                        Ok(builder) => builder,
+                        Err(e) => {
+                            let _ = tx.send(Err(e));
+                            return;
+                        }
+                    };
+                    let mut failed = false;
+                    loop {
+                        let job = {
+                            let guard = rx.lock().expect("kolejka group scan");
+                            guard.recv()
+                        };
+                        let Ok(chunk) = job else {
+                            break;
+                        };
+                        if failed {
+                            continue;
+                        }
+                        for (_seq, start, len) in chunk.docs {
+                            let bytes = &chunk.data[start as usize..][..len as usize];
+                            match parse_prefiltered(bytes, raw_ref) {
+                                Ok(Some(doc)) => {
+                                    if matches(&doc, filter) {
+                                        if let Err(e) = builder.update(doc) {
+                                            let _ = tx.send(Err(e));
+                                            failed = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(e) => {
+                                    let _ = tx.send(Err(e));
+                                    failed = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if !failed {
+                        let _ = tx.send(Ok(builder));
+                    }
+                });
+            }
+            drop(res_tx);
+
+            let mut chunk = ScanChunk {
+                idx: 0,
+                data: Vec::new(),
+                docs: Vec::with_capacity(PARALLEL_SCAN_CHUNK),
+            };
+            for item in self.db.iter(rtxn)? {
+                let (_key, bytes) = item?;
+                let start = chunk.data.len() as u32;
+                chunk.data.extend_from_slice(bytes);
+                chunk.docs.push((0, start, bytes.len() as u32));
+                if chunk.docs.len() >= PARALLEL_SCAN_CHUNK {
+                    let full = std::mem::replace(
+                        &mut chunk,
+                        ScanChunk {
+                            idx: 0,
+                            data: Vec::new(),
+                            docs: Vec::with_capacity(PARALLEL_SCAN_CHUNK),
+                        },
+                    );
+                    let _ = job_tx.send(full);
+                }
+            }
+            if !chunk.docs.is_empty() {
+                let _ = job_tx.send(chunk);
+            }
+            drop(job_tx);
+
+            let mut merged = aggregate::GroupBuilder::new(group_spec)?;
+            let mut first_error = None;
+            for result in res_rx {
+                match result {
+                    Ok(partial) => {
+                        if first_error.is_none() {
+                            merged.merge(partial)?;
+                        }
+                    }
+                    Err(e) => {
+                        if first_error.is_none() {
+                            first_error = Some(e);
+                        }
+                    }
+                }
+            }
+            match first_error {
+                Some(e) => Err(e),
+                None => merged.finish(),
+            }
+        })
+    }
+
     /// Parallel full scan without sorting.
     ///
     /// Chunks are sent in waves: one to each worker. The coordinator
@@ -2866,10 +3276,7 @@ impl<'e> Collection<'e> {
         query: &FindQuery,
         want: usize,
     ) -> Result<Vec<Value>> {
-        let workers = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-            .min(16);
+        let workers = scan_workers();
         if workers <= 1 || want == 0 {
             return self.find_in(rtxn, query);
         }
@@ -5481,6 +5888,61 @@ mod tests {
     }
 
     #[test]
+    fn create_indexes_batch_builds_all_indexes_in_one_pass() {
+        let (_dir, store) = store();
+        let c = store.collection("batch_indexes").unwrap();
+        for i in 0..300i64 {
+            c.insert_one(json!({
+                "grp": i % 10,
+                "score": i,
+                "tags": [format!("t{}", i % 3), format!("t{}", i % 5)],
+            }))
+            .unwrap();
+        }
+        c.create_indexes(&[
+            IndexSpec {
+                fields: vec!["grp".into()],
+                unique: false,
+                include: vec![],
+            },
+            IndexSpec {
+                fields: vec!["score".into()],
+                unique: false,
+                include: vec!["grp".into()],
+            },
+            IndexSpec {
+                fields: vec!["tags".into()],
+                unique: false,
+                include: vec![],
+            },
+        ])
+        .unwrap();
+        let names: HashSet<_> = c
+            .list_indexes()
+            .unwrap()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert!(names.contains("grp"));
+        assert!(names.contains("score"));
+        assert!(names.contains("tags"));
+        assert_eq!(c.count(&json!({"grp": 3})).unwrap(), 30);
+        assert_eq!(c.count(&json!({"tags": "t1"})).unwrap(), 140);
+
+        let dup = store.collection("batch_unique").unwrap();
+        dup.insert_one(json!({"email": "a@example.com"})).unwrap();
+        dup.insert_one(json!({"email": "a@example.com"})).unwrap();
+        assert!(dup
+            .create_indexes(&[IndexSpec {
+                fields: vec!["email".into()],
+                unique: true,
+                include: vec![],
+            }])
+            .is_err());
+        assert!(dup.list_indexes().unwrap().is_empty());
+    }
+
+    #[test]
     fn text_search_ranks_and_stays_in_sync() {
         let (_dir, store) = store();
         let c = store.collection("docs").unwrap();
@@ -5861,6 +6323,110 @@ mod tests {
             .aggregate(&[json!({"$unwind": "$tags"}), json!({"$count": "rows"})])
             .unwrap();
         assert_eq!(out, vec![json!({"rows": 3})]);
+    }
+
+    #[test]
+    fn aggregate_group_uses_index_and_preserves_order_sensitive_semantics() {
+        let (_dir, store) = store();
+        let c = store.collection("group_index").unwrap();
+        for i in 0..300i64 {
+            c.insert_one(json!({
+                "_id": format!("d{i:04}"),
+                "grp": i % 10,
+                "score": i,
+            }))
+            .unwrap();
+        }
+        c.create_index("grp", false).unwrap();
+
+        let out = c
+            .aggregate(&[
+                json!({"$match": {"grp": 3}}),
+                json!({"$group": {
+                    "_id": "$grp",
+                    "n": {"$sum": 1},
+                    "total": {"$sum": "$score"},
+                    "lo": {"$min": "$score"},
+                    "hi": {"$max": "$score"},
+                }}),
+            ])
+            .unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["n"], 30);
+        assert_eq!(out[0]["lo"], 3);
+        assert_eq!(out[0]["hi"], 293);
+        assert_eq!(out[0]["total"], (3..300).step_by(10).sum::<i64>());
+
+        // `$first`/`$last`/`$push` must keep natural `_id` order even when an
+        // index on the matched field yields a different document order.
+        let ordered = store.collection("group_order").unwrap();
+        ordered.insert_one(json!({"_id": "a", "seq": 3})).unwrap();
+        ordered.insert_one(json!({"_id": "b", "seq": 1})).unwrap();
+        ordered.insert_one(json!({"_id": "c", "seq": 2})).unwrap();
+        ordered.create_index("seq", false).unwrap();
+        let out = ordered
+            .aggregate(&[
+                json!({"$match": {"seq": {"$gte": 0}}}),
+                json!({"$group": {
+                    "_id": null,
+                    "first": {"$first": "$seq"},
+                    "last": {"$last": "$seq"},
+                    "pushed": {"$push": "$seq"},
+                }}),
+            ])
+            .unwrap();
+        assert_eq!(
+            out,
+            vec![json!({
+                "_id": null,
+                "first": 3,
+                "last": 2,
+                "pushed": [3, 1, 2],
+            })]
+        );
+    }
+
+    #[test]
+    fn parallel_group_matches_expected_aggregates() {
+        let (_dir, store) = store();
+        let c = store.collection("group_parallel").unwrap();
+        for i in 0..500i64 {
+            c.insert_one(json!({
+                "_id": format!("p{i:04}"),
+                "grp": i % 7,
+                "score": i,
+                "flag": i % 3 == 0,
+            }))
+            .unwrap();
+        }
+        let out = c
+            .aggregate(&[
+                json!({"$match": {"flag": true}}),
+                json!({"$group": {
+                    "_id": "$grp",
+                    "n": {"$sum": 1},
+                    "total": {"$sum": "$score"},
+                    "lo": {"$min": "$score"},
+                    "hi": {"$max": "$score"},
+                    "avg": {"$avg": "$score"},
+                }}),
+                json!({"$sort": {"_id": 1}}),
+            ])
+            .unwrap();
+        assert_eq!(out.len(), 7);
+        for row in out {
+            let grp = row["_id"].as_i64().unwrap();
+            let expected: Vec<i64> = (0..500).filter(|i| i % 7 == grp && i % 3 == 0).collect();
+            let n = expected.len() as i64;
+            let total: i64 = expected.iter().sum();
+            let lo = *expected.iter().min().unwrap();
+            let hi = *expected.iter().max().unwrap();
+            assert_eq!(row["n"], n);
+            assert_eq!(row["total"], total);
+            assert_eq!(row["lo"], lo);
+            assert_eq!(row["hi"], hi);
+            assert_eq!(row["avg"].as_f64().unwrap(), total as f64 / n as f64);
+        }
     }
 
     #[test]

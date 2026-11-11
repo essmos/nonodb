@@ -37,6 +37,10 @@ All daemon configuration is through environment variables.
 | `NONODB_REQUEST_TIMEOUT` | `30` | Server-side request timeout in seconds for normal operations |
 | `NONODB_INDEX_TIMEOUT` | `3600` | Server-side timeout in seconds for index/text/fuzzy builds |
 | `NONODB_AGGREGATE_MAX_DOCS` | `100000` | Maximum intermediate aggregation result size |
+| `NONODB_SCAN_WORKERS` | min(CPUs, 16) | Workers for parallel full scans/sorts; capped at 256 |
+| `NONODB_BACKFILL_WORKERS` | min(CPUs, 16) | Workers for index/text/fuzzy backfill parsing; capped at 256 |
+| `NONODB_AGGREGATE_WORKERS` | min(CPUs, 16) | Workers for parallel order-independent `$group`; capped at 256 |
+| `NONODB_BLOCKING_THREADS` | `64` | Tokio blocking threads used by LMDB reads/writes |
 | `NONODB_CACHE_TTL` | `5` | Read-cache TTL in seconds; `0` disables the cache |
 | `NONODB_CACHE_ENTRIES` | `512` | Maximum number of cached read results |
 | `NONODB_CACHE_MAX_BYTES` | `262144` | Maximum serialized size of one cached result |
@@ -177,6 +181,11 @@ the daemon maintenance loop. Creation is skipped while more than 32 writes are
 queued. Queries keep using the existing scan/cache path until the index is
 available. For large collections, prefer a scheduled manual index build over
 automatic creation.
+
+Candidates for the same collection are built together with `create_indexes`,
+using one collection scan instead of one scan per index. The build still runs
+through the single writer, so inserts and updates wait until its transaction
+commits.
 
 The daemon maintenance worker drives automatic index creation and eviction.
 Automatic indexes are tracked in `auto-index.json` in `NONODB_DATA`. They are

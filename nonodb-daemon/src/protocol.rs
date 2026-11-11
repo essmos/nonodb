@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use nonodb_core::{CollectionProfile, VaultKey};
+use nonodb_core::{CollectionProfile, IndexSpec, VaultKey};
 
 /// Per-request vault credentials. Never format the key.
 #[derive(Clone)]
@@ -21,6 +21,19 @@ impl std::fmt::Debug for VaultAuth {
             .field("tenant", &self.tenant)
             .finish()
     }
+}
+
+/// One index entry for `create_indexes`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct IndexRequest {
+    #[serde(default)]
+    pub field: Option<String>,
+    #[serde(default)]
+    pub fields: Option<Vec<String>>,
+    #[serde(default)]
+    pub unique: bool,
+    #[serde(default)]
+    pub include: Vec<String>,
 }
 
 /// Request to `/v1/exec`.
@@ -161,6 +174,11 @@ pub enum Request {
         unique: bool,
         #[serde(default)]
         include: Vec<String>,
+    },
+    /// Creates several secondary indexes in one collection scan.
+    CreateIndexes {
+        coll: String,
+        indexes: Vec<IndexRequest>,
     },
     DropIndex {
         coll: String,
@@ -375,6 +393,10 @@ pub enum WriteReq {
         unique: bool,
         include: Vec<String>,
     },
+    CreateIndexes {
+        coll: String,
+        indexes: Vec<IndexSpec>,
+    },
     DropIndex {
         coll: String,
         field: String,
@@ -464,6 +486,7 @@ impl Request {
             Self::GetMore { .. } => "get_more",
             Self::CloseCursor { .. } => "close_cursor",
             Self::CreateIndex { .. } => "create_index",
+            Self::CreateIndexes { .. } => "create_indexes",
             Self::DropIndex { .. } => "drop_index",
             Self::ListIndexes { .. } => "list_indexes",
             Self::CreateTextIndex { .. } => "create_text_index",
@@ -527,6 +550,7 @@ impl Request {
             | Self::CursorFind { coll, .. }
             | Self::CursorAggregate { coll, .. }
             | Self::CreateIndex { coll, .. }
+            | Self::CreateIndexes { coll, .. }
             | Self::DropIndex { coll, .. }
             | Self::ListIndexes { coll }
             | Self::CreateTextIndex { coll, .. }
@@ -580,6 +604,7 @@ impl WriteReq {
     pub(crate) fn is_index_build(&self) -> bool {
         match self {
             Self::CreateIndex { .. }
+            | Self::CreateIndexes { .. }
             | Self::CreateTextIndex { .. }
             | Self::CreateFuzzyIndex { .. } => true,
             Self::Batch { ops } => ops.iter().any(Self::is_index_build),

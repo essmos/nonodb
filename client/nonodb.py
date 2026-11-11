@@ -578,6 +578,21 @@ class Collection:
         )
         return True
 
+    def create_indexes(self, indexes: list[dict[str, Any]]) -> list[str]:
+        """Creates several indexes in one collection scan.
+
+        Each entry accepts the same keys as :meth:`create_index`:
+        `field` or `fields`, optional `unique`, and optional `include`.
+        """
+        result = self._db.exec(
+            {
+                "op": "create_indexes",
+                "coll": self.name,
+                "indexes": indexes,
+            }
+        )
+        return result["created"]
+
     def drop_index(self, field: str) -> bool:
         return self._db.exec(
             {"op": "drop_index", "coll": self.name, "field": field}

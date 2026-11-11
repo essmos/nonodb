@@ -159,6 +159,8 @@ footprint.
 - Single-field and compound secondary indexes.
 - Multikey indexes: arrays produce one entry per element, including nested
   paths such as `items.price`; compound indexes reject parallel arrays.
+- Batch index creation scans the collection once and builds several indexes in
+  one transaction.
 - Unique indexes, enforced on insert, update, and index backfill. A unique
   multikey index allows duplicate elements inside one document but not across
   documents.
@@ -193,7 +195,8 @@ footprint.
   cardinality-preserving stages and unnecessary document materialization.
 - Document-local stages are fused into one pass, `$sort`+`$limit` uses a
   bounded top-K heap, and a leading `$group` streams documents directly into
-  its accumulators.
+  its accumulators. Order-independent groups use the query index when
+  available and fall back to a parallel scan.
 - A leading `$match` uses the normal query planner, including secondary indexes
   and `_id` ranges. `$sort`+`$limit`, `$skip`, `$limit`, simple `$project`, and
   a lone `$count` are also pushed into the query path where semantics allow.

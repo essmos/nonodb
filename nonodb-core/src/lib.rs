@@ -29,7 +29,7 @@ pub mod verify;
 
 pub use aggregate::MAX_AGGREGATE_DOCS;
 pub use collection::{
-    project_document, Collection, FindAndModifyOptions, FindAndModifyOutcome, FindQuery,
+    project_document, Collection, FindAndModifyOptions, FindAndModifyOutcome, FindQuery, IndexSpec,
     UpdateOutcome,
 };
 pub use error::{Error, Result};

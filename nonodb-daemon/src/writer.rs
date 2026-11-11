@@ -371,6 +371,12 @@ fn execute(
             let name = fields.join("+");
             Ok(json!({ "created": name, "fields": fields, "unique": unique, "include": include }))
         }
+        WriteReq::CreateIndexes { coll, indexes } => {
+            let c = standard_collection(store, wtxn, coll)?;
+            c.create_indexes_txn(wtxn, indexes)?;
+            let names: Vec<_> = indexes.iter().map(|index| index.fields.join("+")).collect();
+            Ok(json!({ "created": names }))
+        }
         WriteReq::DropIndex { coll, field } => {
             let c = standard_collection(store, wtxn, coll)?;
             let existed = c.drop_index_txn(wtxn, field)?;

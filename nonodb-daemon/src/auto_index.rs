@@ -15,7 +15,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use nonodb_core::bson_types;
 use nonodb_core::date;
 use nonodb_core::numeric;
-use nonodb_core::Store;
+use nonodb_core::{IndexSpec, Store};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::oneshot;
@@ -92,6 +92,17 @@ fn now_secs() -> u64 {
 struct CandidateStats {
     hits: u64,
     window_start: Instant,
+}
+
+struct BuildCandidate {
+    key: String,
+    coll: String,
+    fields: Vec<String>,
+}
+
+struct BuildGroup {
+    coll: String,
+    entries: Vec<(String, Vec<String>)>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -258,9 +269,17 @@ impl AutoIndexer {
         };
         candidates.sort_by_key(|(_, _, _, hits)| std::cmp::Reverse(*hits));
 
+        let active = self.inner.lock().unwrap().auto.len();
+        let slots = self.config.max_indexes.saturating_sub(active);
+        if slots == 0 {
+            return Ok(());
+        }
+
+        // Validate first, then group by collection. `CreateIndexes` can build
+        // several indexes in one collection scan, but only within one collection.
+        let mut selected: Vec<BuildCandidate> = Vec::new();
         for (key, coll, fields, _) in candidates {
-            let active = self.inner.lock().unwrap().auto.len();
-            if active >= self.config.max_indexes {
+            if selected.len() >= slots {
                 break;
             }
             // A manual index with the same shape is already optimal - do not
@@ -272,48 +291,76 @@ impl AutoIndexer {
             if !self.collection_ready(&coll, &fields)? {
                 continue;
             }
+            selected.push(BuildCandidate { key, coll, fields });
+        }
 
+        let mut groups: Vec<BuildGroup> = Vec::new();
+        for candidate in selected {
+            if let Some(group) = groups.iter_mut().find(|group| group.coll == candidate.coll) {
+                group.entries.push((candidate.key, candidate.fields));
+            } else {
+                groups.push(BuildGroup {
+                    coll: candidate.coll,
+                    entries: vec![(candidate.key, candidate.fields)],
+                });
+            }
+        }
+
+        for BuildGroup { coll, entries } in groups {
+            let specs: Vec<IndexSpec> = entries
+                .iter()
+                .map(|(_, fields)| IndexSpec {
+                    fields: fields.clone(),
+                    unique: false,
+                    include: Vec::new(),
+                })
+                .collect();
+            let names: Vec<Vec<String>> =
+                entries.iter().map(|(_, fields)| fields.clone()).collect();
             let started = Instant::now();
-            match self.send_write(WriteReq::CreateIndex {
+            match self.send_write(WriteReq::CreateIndexes {
                 coll: coll.clone(),
-                fields: fields.clone(),
-                unique: false,
-                include: Vec::new(),
+                indexes: specs,
             }) {
                 Ok(_) => {
-                    metrics::inc(&metrics::AUTO_INDEX_CREATED);
+                    metrics::add(&metrics::AUTO_INDEX_CREATED, entries.len() as u64);
                     metrics::add(
                         &metrics::AUTO_INDEX_BUILD_NS,
                         started.elapsed().as_nanos() as u64,
                     );
-                    let entry = AutoEntry {
-                        coll: coll.clone(),
-                        fields: fields.clone(),
-                        created_at: now,
-                        last_demand: now,
-                    };
                     let mut inner = self.inner.lock().unwrap();
-                    inner.auto.insert(key.clone(), entry);
-                    inner.stats.remove(&key);
+                    for (key, fields) in entries {
+                        let entry = AutoEntry {
+                            coll: coll.clone(),
+                            fields,
+                            created_at: now,
+                            last_demand: now,
+                        };
+                        inner.auto.insert(key.clone(), entry);
+                        inner.stats.remove(&key);
+                    }
                     drop(inner);
                     self.dirty.store(true, Ordering::Relaxed);
                     tracing::info!(
                         collection = %coll,
-                        fields = ?fields,
-                        "created automatic index"
+                        indexes = ?names,
+                        "created automatic indexes"
                     );
                 }
                 Err(e) => {
-                    metrics::inc(&metrics::AUTO_INDEX_BUILD_ERRORS);
+                    metrics::add(&metrics::AUTO_INDEX_BUILD_ERRORS, entries.len() as u64);
                     tracing::warn!(
                         collection = %coll,
-                        fields = ?fields,
+                        indexes = ?names,
                         "automatic index creation failed: {e}"
                     );
-                    // Do not retry the same candidate on every tick.
-                    if let Some(entry) = self.inner.lock().unwrap().stats.get_mut(&key) {
-                        entry.hits = 0;
-                        entry.window_start = Instant::now();
+                    // Do not retry the same candidates on every tick.
+                    let mut inner = self.inner.lock().unwrap();
+                    for (key, _) in entries {
+                        if let Some(entry) = inner.stats.get_mut(&key) {
+                            entry.hits = 0;
+                            entry.window_start = Instant::now();
+                        }
                     }
                 }
             }

@@ -5,6 +5,7 @@
 //! It never writes documents or indexes.
 
 use std::cmp::Ordering;
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BinaryHeap, HashSet};
 use std::sync::Arc;
 
@@ -701,6 +702,16 @@ impl GroupBuilder {
         })
     }
 
+    /// True when the result does not depend on input document order.
+    /// `$first`, `$last`, and `$push` are order-sensitive; `$addToSet` keeps
+    /// set semantics but its array order follows discovery, so it stays on the
+    /// sequential path as well.
+    pub(crate) fn order_independent(&self) -> bool {
+        self.accumulators
+            .iter()
+            .all(|(_, op, _)| matches!(op.as_str(), "$sum" | "$avg" | "$min" | "$max" | "$count"))
+    }
+
     pub(crate) fn update(&mut self, doc: Value) -> Result<()> {
         let id = eval_expr(&doc, &self.id_expr)?;
         let key = serde_json::to_string(&id)?;
@@ -719,6 +730,28 @@ impl GroupBuilder {
                 eval_expr(&doc, arg)?
             };
             state.update(op, &value)?;
+        }
+        Ok(())
+    }
+
+    /// Merges another partial builder into this one. Only used for
+    /// order-independent accumulators, so group iteration order is irrelevant.
+    pub(crate) fn merge(&mut self, other: GroupBuilder) -> Result<()> {
+        for (key, other_group) in other.groups {
+            match self.groups.entry(key) {
+                Entry::Vacant(slot) => {
+                    slot.insert(other_group);
+                }
+                Entry::Occupied(mut slot) => {
+                    let current = slot.get_mut();
+                    if current.values.len() != other_group.values.len() {
+                        return Err(Error::Query("internal group accumulator mismatch".into()));
+                    }
+                    for (left, right) in current.values.iter_mut().zip(other_group.values) {
+                        left.merge(right)?;
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -777,6 +810,23 @@ impl NumericSum {
                     *sum += d;
                 }
             }
+        }
+    }
+
+    fn merge(&mut self, other: NumericSum) {
+        match (&mut *self, other) {
+            (Self::Float(left), Self::Float(right)) => *left += right,
+            (Self::Float(left), Self::Decimal(right)) => {
+                let mut sum = BigDecimal::from_f64(*left).unwrap_or_default();
+                sum += right;
+                *self = Self::Decimal(sum);
+            }
+            (Self::Decimal(left), Self::Float(right)) => {
+                if let Some(value) = BigDecimal::from_f64(right) {
+                    *left += value;
+                }
+            }
+            (Self::Decimal(left), Self::Decimal(right)) => *left += right,
         }
     }
 
@@ -884,6 +934,54 @@ impl Accumulator {
             (Self::Count(count), "$count") => *count += 1,
             _ => {
                 return Err(Error::Query("internal group accumulator mismatch".into()));
+            }
+        }
+        Ok(())
+    }
+
+    fn merge(&mut self, other: Accumulator) -> Result<()> {
+        match (self, other) {
+            (Self::Sum(left), Self::Sum(right)) => left.merge(right),
+            (
+                Self::Avg {
+                    sum: left_sum,
+                    count: left_count,
+                },
+                Self::Avg {
+                    sum: right_sum,
+                    count: right_count,
+                },
+            ) => {
+                left_sum.merge(right_sum);
+                *left_count = left_count.saturating_add(right_count);
+            }
+            (Self::Min(left), Self::Min(right)) => {
+                if let Some(value) = right {
+                    if left
+                        .as_ref()
+                        .map(|current| compare_value(&value, current) == Ordering::Less)
+                        .unwrap_or(true)
+                    {
+                        *left = Some(value);
+                    }
+                }
+            }
+            (Self::Max(left), Self::Max(right)) => {
+                if let Some(value) = right {
+                    if left
+                        .as_ref()
+                        .map(|current| compare_value(&value, current) == Ordering::Greater)
+                        .unwrap_or(true)
+                    {
+                        *left = Some(value);
+                    }
+                }
+            }
+            (Self::Count(left), Self::Count(right)) => *left = left.saturating_add(right),
+            _ => {
+                return Err(Error::Query(
+                    "internal group accumulator merge mismatch".into(),
+                ));
             }
         }
         Ok(())

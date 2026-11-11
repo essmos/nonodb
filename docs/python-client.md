@@ -462,6 +462,20 @@ events.create_index(
 )
 ```
 
+### Batch creation
+
+```python
+created = events.create_indexes([
+    {"field": "tenant"},
+    {"fields": ["tenant", "created_at"]},
+    {"field": "tags", "include": ["status"]},
+])
+# ["tenant", "tenant+created_at", "tags"]
+```
+
+All indexes are built in one collection scan and one write transaction. This
+avoids re-reading and re-parsing the collection once per index.
+
 ### Inspect and drop
 
 ```python

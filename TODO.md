@@ -71,7 +71,10 @@ limitations are documented in [docs/roadmap.md](docs/roadmap.md).
 - [x] Graceful drain on shutdown and structured logs
 - [x] Index-build progress in metrics (`processed`/`total`/`elapsed`)
 - [ ] Latency histograms
-- [ ] Configurable backfill/scan worker counts
+- [x] Configurable scan/backfill/aggregate worker counts and blocking threads
+- [x] Batch index creation (`create_indexes`) in one collection scan
+- [x] Automatic indexes in one batch per collection; isolated index-build transactions
+- [x] Index-backed and parallel order-independent `$group`
 - [ ] Incremental index backfill writes to reduce peak RAM
 - [ ] Raw JSON passthrough for `find` without projection/sort
 

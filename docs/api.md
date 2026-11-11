@@ -103,6 +103,7 @@ client timeout with `NONODB_TIMEOUT` or the `timeout=` argument.
 | [`count`](#count) | Count matching documents |
 | [`aggregate`](#aggregation) | Read-only aggregation pipeline |
 | [`create_index`](#create_index) | Create a secondary index |
+| [`create_indexes`](#create_indexes) | Create several indexes in one scan |
 | [`drop_index`](#drop_index) | Drop a secondary index |
 | [`list_indexes`](#list_indexes) | List secondary indexes |
 | [`create_text_index`](#full-text-indexes) | Create a BM25 index |
@@ -1005,6 +1006,33 @@ Response:
   }
 }
 ```
+
+### create_indexes
+
+Creates several indexes in one collection scan. Parsing and key encoding run in
+parallel; all index writes still happen in one LMDB write transaction.
+
+```json
+{
+  "op": "create_indexes",
+  "coll": "events",
+  "indexes": [
+    {"field": "tenant", "unique": false},
+    {"fields": ["tenant", "created_at"], "unique": false},
+    {"field": "tags", "include": ["status"]}
+  ]
+}
+```
+
+Response:
+
+```json
+{"ok": true, "result": {"created": ["tenant", "tenant+created_at", "tags"]}}
+```
+
+Each entry accepts either `field` or `fields`, plus optional `unique` and
+`include`. Use this for migrations that add multiple indexes at once; it avoids
+re-reading and re-parsing the whole collection for every index.
 
 Rules:
 

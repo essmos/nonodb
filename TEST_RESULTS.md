@@ -111,15 +111,36 @@ Details:
   After close the daemon returned to 14 fds. Its log contained no warnings or
   errors.
 
-### Important aggregation finding
+### Aggregation and index improvements after the run
 
-An unbounded `$match(grp)` → `$group` on the 200k collection took ~135–141 ms
-per query even though only 1,000 documents matched. With that stage in 5% of
-the mix, throughput collapsed to ~0.5k req/s and p50 latency rose to seconds.
-Adding `$limit 10` before `$group`, or using `$count`, reduced the same
-aggregation to 0.6–0.8 ms. The sustained 10k result above uses the bounded
-form. The planner should be checked for missing index pushdown / early
-termination on unbounded `$match` → `$group`.
+The first 10k run exposed that an unbounded `$match(grp)` → `$group` took
+~135–141 ms on 200k documents even though only 1,000 documents matched. The
+sustained result above used a bounded form (`$limit` before `$group`) as a
+workaround.
+
+The current code fixes the underlying paths:
+
+- a leading `$match` now feeds an order-independent `$group` through the normal
+  index/query access paths instead of always scanning the collection;
+- `$first`, `$last`, and `$push` stay on the natural `_id` order path, so their
+  semantics do not change when an index is present;
+- order-independent groups without an index use parallel workers with local
+  group maps and a final merge;
+- `create_indexes` builds several indexes in one collection scan.
+
+Post-fix measurements on 1M documents (1,000 groups):
+
+| Workload | Result |
+|---|---|
+| Full `$group` with `NONODB_AGGREGATE_WORKERS=1` | 1,488 ms p50 |
+| Full `$group` with `NONODB_AGGREGATE_WORKERS=8` | 319 ms p50 (4.7x faster) |
+| Indexed `$match(grp=123)` → `$group`, 1,000 matches | 2.55 ms p50 / 3.80 ms p95 |
+| Three indexes in one batch scan | 4.68 s |
+| Three indexes created sequentially | 4.94 s (1.06x slower) |
+
+The batch index gain is modest because parsing/encoding is already parallel;
+the single LMDB writer and transaction commit dominate. The main index win is
+avoiding repeated collection scans, which will matter more on 10M+ datasets.
 
 ## Representative numbers
 

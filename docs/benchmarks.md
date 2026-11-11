@@ -650,11 +650,27 @@ The UDS run held 10,013 daemon fds for five minutes, used 493–507 MB RSS and
 core. Both returned to 14 fds after close with no request errors or daemon
 warnings.
 
-Aggregation caveat: an unbounded `$match(grp)` → `$group` over the 200k
-collection took ~135–141 ms per query even with only 1,000 matching documents.
-At 5% of the mix it reduced throughput to ~0.5k req/s. Adding `$limit 10`
-before `$group` (or using `$count`) reduced that aggregation to 0.6–0.8 ms.
-The sustained results above use the bounded form.
+The first run exposed an expensive unbounded `$match(grp)` → `$group` plan.
+The current code now pushes a leading `$match` through the index/query path for
+order-independent groups, keeps order-sensitive accumulators on natural `_id`
+order, and parallelizes full-collection groups across worker threads. The
+sustained results above used the earlier bounded form; the post-fix numbers are
+below.
+
+### Post-fix aggregation and batch indexing
+
+1M documents, 1,000 groups, ext4, `NONODB_CACHE_TTL=0`:
+
+| Workload | Result |
+|---|---|
+| Full `$group`, `NONODB_AGGREGATE_WORKERS=1` | 1,488 ms p50 |
+| Full `$group`, `NONODB_AGGREGATE_WORKERS=8` | 319 ms p50 (4.7x) |
+| Indexed `$match(grp=123)` → `$group`, 1,000 matches | 2.55 ms p50 / 3.80 ms p95 |
+| 3 indexes via `create_indexes` | 4.68 s |
+| 3 indexes created sequentially | 4.94 s |
+
+Batch indexing is only ~1.06x faster here because the single writer/commit
+dominates; the avoided collection re-scans will matter more at 10M+ documents.
 
 ## Memory
 

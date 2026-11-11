@@ -93,8 +93,13 @@ struct AppState {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Explicit runtime: limit the blocking thread pool (lower peak VSZ),
     // because LMDB operations run through `spawn_blocking`.
+    let blocking_threads = std::env::var("NONODB_BLOCKING_THREADS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(64);
     let rt = tokio::runtime::Builder::new_multi_thread()
-        .max_blocking_threads(64)
+        .max_blocking_threads(blocking_threads)
         .enable_all()
         .build()?;
     rt.block_on(run())
@@ -1696,6 +1701,32 @@ async fn exec(
                         include,
                     }
                 }
+                Request::CreateIndexes { coll, indexes } => {
+                    let mut specs = Vec::with_capacity(indexes.len());
+                    for index in indexes {
+                        let fields = match (index.fields, index.field) {
+                            (Some(fields), _) => fields,
+                            (None, Some(field)) => vec![field],
+                            (None, None) => {
+                                return respond(Err(ApiError {
+                                    code: "invalid_query".into(),
+                                    message:
+                                        "each create_indexes entry requires `field` or `fields`"
+                                            .into(),
+                                }));
+                            }
+                        };
+                        specs.push(nonodb_core::IndexSpec {
+                            fields,
+                            unique: index.unique,
+                            include: index.include,
+                        });
+                    }
+                    WriteReq::CreateIndexes {
+                        coll,
+                        indexes: specs,
+                    }
+                }
                 Request::DropIndex { coll, field } => WriteReq::DropIndex { coll, field },
                 Request::CreateTextIndex { coll, field } => {
                     WriteReq::CreateTextIndex { coll, field }
@@ -1867,7 +1898,8 @@ fn reject_vault_read(
 }
 
 async fn submit_write(state: &AppState, req: WriteReq) -> (StatusCode, Json<ApiResponse>) {
-    let timeout = if req.is_index_build() {
+    let index_build = req.is_index_build();
+    let timeout = if index_build {
         index_build_timeout()
     } else {
         request_timeout()
@@ -1881,7 +1913,9 @@ async fn submit_write(state: &AppState, req: WriteReq) -> (StatusCode, Json<ApiR
         .send(WriteJob {
             req,
             resp: tx,
-            isolated: false,
+            // A long index backfill must not share a transaction with user
+            // writes; it gets its own commit and cannot roll them back.
+            isolated: index_build,
         })
         .is_err()
     {
