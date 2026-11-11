@@ -7,10 +7,10 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag, e.g. v0.10.0 or v0.10.0-beta.1"
+        description: "Release tag, e.g. v0.11.0 or v0.11.0-beta.1"
         required: true
         type: string
-        default: "v0.10.0"
+        default: "v0.11.0"
       summary:
         description: "Short summary for the release title: vX.Y.Z - <summary>"
         required: false

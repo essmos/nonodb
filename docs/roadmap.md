@@ -5,7 +5,7 @@ is deliberately out of scope, and which gaps are candidates for future work.
 
 ## Current status
 
-The project is at `0.10.0`. It is suitable for local and single-host
+The project is at `0.11.0`. It is suitable for local and single-host
 applications that need a small, durable, queryable JSON store and can accept a
 single-writer model.
 
@@ -31,6 +31,10 @@ Implemented:
 - ordered point lookups by `_id` or a unique single-field or compound index,
   with covering projections, `_id` exclusion, key deduplication, and a response
   size cap;
+- durable background jobs through an ordinary `_jobs` collection and external
+  workers, with leases, retries, and idempotent enqueue;
+- outbox events through an ordinary `_events` collection, with atomic data +
+  event writes, sortable event ids, and per-consumer checkpoints;
 - document TTL with collection defaults, per-document overrides, and background expiry;
 - BSON-compatible dates with RFC 3339 input, UTC normalization, indexed ranges, and sorting;
 - Unix-socket daemon, optional TCP/TLS and mutual TLS, file-based principals and scopes, uid/gid allow-lists;
@@ -69,6 +73,9 @@ Implemented:
   `$elemMatch`; `$size` is not index-backed.
 - No joins. `lookup` is a point/batch lookup, not a general join, and requires a
   matching unique index for non-`_id` keys. Non-unique lookups are not supported.
+- No stored procedures or daemon plugins. Background jobs and outbox events are
+  ordinary client processes. There is no built-in `watch`/change-stream API yet;
+  use the outbox polling helper.
 - TTL is eventual and has no strict read-time filtering.
 - Projection is top-level only, not a nested projection tree.
 - Sorting and filtering use the documented subset; there is no collation API.

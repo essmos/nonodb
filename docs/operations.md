@@ -231,7 +231,7 @@ Download the archive from the matching GitHub Release, verify its checksum, and
 install the two binaries:
 
 ```bash
-TAG=v0.10.0
+TAG=v0.11.0
 ARCHIVE="nonodb-$TAG-linux-x86_64.tar.gz"
 curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/$ARCHIVE"
 curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/$ARCHIVE.sha256"
@@ -293,7 +293,7 @@ Linux `amd64` and `arm64`. Pull a published tag:
 
 ```bash
 # Pin a version in production; latest tracks stable releases.
-docker pull ghcr.io/essmos/nonodb:0.10.0
+docker pull ghcr.io/essmos/nonodb:0.11.0
 ```
 
 If the GHCR package is private, log in before pulling:
@@ -339,7 +339,7 @@ docker run -d --name nonodb \
   --group-add "$(id -g)" \
   -v "$NONODB_AUTH_FILE:/etc/nonodb/auth.json:ro" \
   -v nonodb-data:/var/lib/nonodb \
-  ghcr.io/essmos/nonodb:0.10.0
+  ghcr.io/essmos/nonodb:0.11.0
 ```
 
 Verify it:
@@ -404,7 +404,7 @@ docker volume create nonodb-run
 docker run -d --name nonodb \
   -v nonodb-data:/var/lib/nonodb \
   -v nonodb-run:/run/nonodb \
-  ghcr.io/essmos/nonodb:0.10.0
+  ghcr.io/essmos/nonodb:0.11.0
 ```
 
 The client container mounts the same `nonodb-run` volume and sets:
@@ -433,7 +433,7 @@ docker run -d --name nonodb \
   -v "$NONODB_AUTH_FILE:/etc/nonodb/auth.json:ro" \
   -v /host/certs:/certs:ro \
   -v nonodb-data:/var/lib/nonodb \
-  ghcr.io/essmos/nonodb:0.10.0
+  ghcr.io/essmos/nonodb:0.11.0
 ```
 
 Without a certificate and key pair, TCP runs in plaintext and logs a warning.
@@ -447,7 +447,7 @@ Back up into a separate mounted directory:
 docker run --rm \
   -v nonodb-data:/var/lib/nonodb:ro \
   -v /host/backups:/backups \
-  ghcr.io/essmos/nonodb:0.10.0 \
+  ghcr.io/essmos/nonodb:0.11.0 \
   nonodb-cli backup /var/lib/nonodb /backups/$(date -u +%Y%m%dT%H%M%SZ)
 ```
 

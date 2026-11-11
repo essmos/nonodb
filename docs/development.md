@@ -63,8 +63,9 @@ and [HTTP API](api.md).
 ├── client/                    # Python client and tests
 │   ├── node/                  # zero-dependency Node.js client
 │   └── go/                    # context-aware Go client
+├── workers/python/            # external background-job helper and examples
 ├── scripts/                   # benchmarks, concurrency/crash/search tests
-├── deploy/                    # systemd unit
+├── deploy/                    # systemd units
 ├── docs/                      # documentation
 ├── Dockerfile
 └── README.md
@@ -157,6 +158,7 @@ Start a daemon on a test database first, then run:
 ```bash
 export NONODB_SOCK=/tmp/nonodb.sock
 
+python3 -m unittest discover -s workers/python/tests -v  # job helper units
 python3 client/smoke_test.py                 # CRUD, concurrent $inc, errors
 python3 client/cache_test.py                 # TTL, invalidation, copies
 python3 scripts/batch_test.py                # read batch + get_many + cache
@@ -170,6 +172,9 @@ python3 scripts/arrays_test.py               # $all, $size, $elemMatch, validati
 python3 scripts/array_updates_test.py        # positional/array-filter updates
 python3 scripts/find_and_modify_test.py      # atomic select-update-return
 python3 scripts/explain_test.py              # plans, bounds, actual counts
+PYTHONPATH=client:workers/python python3 workers/python/examples/jobs_smoke.py  # jobs
+PYTHONPATH=client:workers/python python3 workers/python/examples/events_smoke.py  # events
+python3 workers/python/tests/events_integration.py  # events against a spawned daemon
 python3 scripts/db_slots_test.py             # >256 index/search create-drop cycles
 python3 scripts/resize_test.py               # online map growth under concurrent I/O
 python3 scripts/restore_drill.py             # backup -> verify -> restore -> query
@@ -362,12 +367,12 @@ The tag is `vX.Y.Z`; the annotated tag subject and GitHub Release title are
 
 ```bash
 # final release
-git tag -a v0.10.0 -m "v0.10.0 - Ordered lookups and projections"
-git push origin v0.10.0
+git tag -a v0.11.0 -m "v0.11.0 - Background jobs and outbox events"
+git push origin v0.11.0
 
 # pre-release (the hyphen makes it a GitHub pre-release automatically)
-git tag -a v0.10.0-beta.1 -m "v0.10.0-beta.1 - Ordered lookups and projections"
-git push origin v0.10.0-beta.1
+git tag -a v0.11.0-beta.1 -m "v0.11.0-beta.1 - Background jobs and outbox events"
+git push origin v0.11.0-beta.1
 ```
 
 The release workflow reads the tag annotation and publishes the release with
@@ -379,7 +384,7 @@ title and put the full notes in the body.
 The workflow runs the tests, builds release binaries for Linux x86_64, macOS
 Intel, macOS Apple Silicon, and Windows x86_64, attaches checksums, and
 publishes the GitHub Release. Linux and macOS use `.tar.gz`; Windows uses
-`.zip`. Tags such as `v0.10.0-beta.1` and `v0.10.0-rc.1` are marked as
+`.zip`. Tags such as `v0.11.0-beta.1` and `v0.11.0-rc.1` are marked as
 pre-releases automatically.
 
 ### Manual release
@@ -388,7 +393,7 @@ Use **Actions → Release → Run workflow** and provide:
 
 | Input | Meaning |
 |---|---|
-| `tag` | Tag to publish, e.g. `v0.10.0` or `v0.10.0-rc.1` |
+| `tag` | Tag to publish, e.g. `v0.11.0` or `v0.11.0-rc.1` |
 | `summary` | Short title text after the version: `vX.Y.Z - <summary>` |
 | `prerelease` | Mark the release as a pre-release |
 | `draft` | Create it as a draft for review |

@@ -34,6 +34,7 @@ release build. The latest validation also exercised a 10M-document collection,
 | Multikey and aggregation regression | OK (array keys, unique multikey, min/max sort, `$all`/`$elemMatch` plans, top-K sort, streaming `$group`) |
 | Exact vector search suite | OK (cosine/dot/L2, filtered top-K, update/delete, reopen, backup verification) |
 | Ordered lookup benchmark | OK (1M docs; 1/100/1,000 keys; covering, full-document, duplicates) |
+| Background jobs and outbox events | OK (12 Python unit tests; real-daemon integration: atomic rollback, checkpoint restart, retry, late events, 8x100 concurrent producers, CLI) |
 | 10k keepalive mixed workload | OK (5 min UDS at 4.9k req/s; 2 min TLS at 4.1k req/s; 0 errors) |
 
 ## Large-scale and connection-storm run (2026-11-11)

@@ -1,0 +1,25 @@
+[Unit]
+Description=NonoDB background job worker
+After=nonodb.service
+Requires=nonodb.service
+
+[Service]
+Type=simple
+User=nonodb
+Group=nonodb
+Environment=NONODB_SOCK=/run/nonodb/nonodb.sock
+Environment=PYTHONPATH=/opt/nonodb/client:/opt/nonodb/workers/python:/opt/nonodb/jobs
+WorkingDirectory=/opt/nonodb
+# Replace jobs_handlers with the deployed handler module.
+ExecStart=/usr/bin/python3 -m nonodb_worker --module jobs_handlers
+Restart=on-failure
+RestartSec=5
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/nonodb /run/nonodb
+
+[Install]
+WantedBy=multi-user.target

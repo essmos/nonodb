@@ -19,6 +19,8 @@ quick-start instructions, and a feature overview.
 | [Authentication and permissions](auth.md) | Operators, security reviewers | Principals, scopes, hashed tokens, certificate registry, lockout, reloads, audit log |
 | [Mutual TLS](mtls.md) | Operators, security reviewers | Private CA setup, client certificates, fingerprint mapping, revocation, rotation, troubleshooting |
 | [Python client](python-client.md) | Python developers | Connection, CRUD, upsert, indexes, search, batches, cache, FastAPI |
+| [Background jobs](workers.md) | Application developers, operators | Durable jobs, workers, leases, retries, cron/systemd, languages |
+| [Outbox events](events.md) | Application developers, operators | Atomic data + events, polling consumers, checkpoints, event worker CLI, TTL, systemd |
 | [CLI](cli.md) | Operators | Administration, map resize, backup verification, restore drills, inspect, raw requests |
 | [Operations](operations.md) | Operators, SRE | Configuration, deployment, security, snapshots, monitoring, capacity, troubleshooting |
 | [Backup and restore](backup.md) | Operators, SRE | Online backup, snapshots, verification, restore drills, Docker, vault keys, authorization state, recovery |
@@ -34,6 +36,8 @@ quick-start instructions, and a feature overview.
 - **Pick a client:** [Clients](clients.md) — Python, Rust, Node.js, Go
 - **Import data from another database:** [Migration and import](migration.md)
 - **Expose nonodb to Python workers:** [Python client](python-client.md)
+- **Run background jobs and schedulers:** [Background jobs](workers.md)
+- **Consume change events:** [Outbox events](events.md)
 - **Secure a deployment:** [Authentication and authorization](auth.md) and
   [TCP/TLS](operations.md#tcp-and-tls)
 - **Set up client certificates:** [Mutual TLS](mtls.md)

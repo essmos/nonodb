@@ -27,6 +27,9 @@ limitations are documented in [docs/roadmap.md](docs/roadmap.md).
 - [x] Ordered point lookups (`lookup`/`lookup_one`) by `_id` or a unique
       single-field/compound index, with covering projections, `_id` exclusion,
       key deduplication, response-size cap, and batch-client helpers
+- [x] External background jobs/schedulers through a normal `_jobs` collection:
+      atomic claims, leases, retries, idempotent enqueue, Python worker helper,
+      systemd unit, and docs; no daemon plugins or stored procedures
 - [x] Document TTL with collection defaults, document overrides, background sweeps
 - [x] BSON-compatible Extended JSON dates, indexed ranges, sorting, and unique constraints
 - [x] Exact numeric comparison/indexing, Decimal128, special doubles, decimal arithmetic
@@ -104,6 +107,17 @@ limitations are documented in [docs/roadmap.md](docs/roadmap.md).
 - [x] Use an index for sort-only queries without a filter
 - [x] `$type` index ranges for indexed scalar fields
 - [ ] Non-finite Decimal128 values
+
+### P1 — event streams
+
+- [x] Add an outbox/polling helper for change events: atomic `write_batch` of
+      application data plus `events`, sortable ULID `_id`, per-consumer
+      checkpoints, overlap rescan for late-committed lower ids, Python worker
+      CLI, and idempotent handlers
+- [ ] Add an end-to-end test for TTL retention of consumed event collections
+- [ ] Evaluate a small built-in `watch`/change-stream API only if outbox polling
+      becomes operationally insufficient, especially for strict commit-order
+      guarantees across many concurrent producer processes
 
 ### P1 — lookup enhancements
 
