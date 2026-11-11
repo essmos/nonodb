@@ -4,25 +4,28 @@
 //! processes) connect through `/run/nonodb.sock` (paths configurable via
 //! `NONODB_SOCK` i `NONODB_DATA`).
 
+mod audit;
+mod auth;
+mod authz;
 mod auto_index;
 mod cache;
+mod login_guard;
 mod maintenance;
 mod metrics;
 mod protocol;
 mod writer;
 
-use std::collections::HashMap;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::{
     extract::{DefaultBodyLimit, State},
     http::{HeaderMap, StatusCode},
     routing::{get, post},
-    Json, Router,
+    Extension, Json, Router,
 };
 use hyper::server::conn::http1;
 use hyper_util::rt::TokioIo;
@@ -66,6 +69,8 @@ struct AppState {
     write_tx: mpsc::Sender<WriteJob>,
     cache: Arc<cache::QueryCache>,
     auto_index: Arc<auto_index::AutoIndexer>,
+    auth: Option<Arc<auth::AuthState>>,
+    audit: Option<Arc<audit::AuditLog>>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -85,6 +90,19 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(unix)]
     let sock =
         PathBuf::from(std::env::var("NONODB_SOCK").unwrap_or_else(|_| "/run/nonodb.sock".into()));
+    let tcp_addr = std::env::var("NONODB_TCP").ok();
+
+    let auth = match std::env::var_os("NONODB_AUTH_FILE") {
+        Some(path) if !path.is_empty() => Some(auth::AuthState::open(PathBuf::from(path))?),
+        _ => None,
+    };
+    if tcp_addr.is_some() && auth.is_none() {
+        return Err("NONODB_TCP wymaga NONODB_AUTH_FILE".into());
+    }
+    if let Some(auth) = &auth {
+        auth.spawn_watcher();
+    }
+    let audit = audit::AuditLog::from_env()?;
 
     let store = Arc::new(Store::open_with_history(&data, HistoryConfig::from_env())?);
 
@@ -116,6 +134,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         write_tx,
         cache,
         auto_index,
+        auth: auth.clone(),
+        audit: audit.clone(),
     };
     let app = Router::new()
         .route("/healthz", get(health))
@@ -126,21 +146,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .with_state(state);
 
     // Optional TCP listener (with TLS when a certificate and key are provided).
-    let tcp_addr = std::env::var("NONODB_TCP").ok();
     let mut tcp_task: Option<tokio::task::JoinHandle<()>> = None;
     if let Some(addr) = tcp_addr.as_deref() {
-        if std::env::var("NONODB_AUTH_TOKEN")
-            .ok()
-            .filter(|t| !t.is_empty())
-            .is_none()
-        {
-            return Err("NONODB_TCP wymaga NONODB_AUTH_TOKEN".into());
-        }
+        let auth = auth.clone().ok_or("NONODB_TCP wymaga NONODB_AUTH_FILE")?;
         let tls = match (
             std::env::var("NONODB_TLS_CERT"),
             std::env::var("NONODB_TLS_KEY"),
         ) {
-            (Ok(cert), Ok(key)) => Some(tls_acceptor(&cert, &key)?),
+            (Ok(cert), Ok(key)) => Some(tls_acceptor(&cert, &key, auth.clone(), audit.clone())?),
             (Err(_), Err(_)) => {
                 if std::env::var_os("NONODB_TLS_CLIENT_CA").is_some() {
                     return Err(
@@ -223,7 +236,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
 
-            let app = app.clone();
+            let app = app.clone().layer(Extension(auth::ConnectionAuth::unix()));
             let shutdown = shutdown_rx.clone();
             connections.spawn(async move {
                 serve_stream(stream, app, shutdown).await;
@@ -345,84 +358,15 @@ async fn wait_for_writer(timeout: Duration) {
 #[derive(Clone)]
 struct TlsSetup {
     acceptor: TlsAcceptor,
-    allowlist: Option<Arc<ClientAllowList>>,
+    auth: Arc<auth::AuthState>,
     client_auth: bool,
-}
-
-/// Optional fingerprint allow-list. The file is re-read for every TLS
-/// handshake, so removing an entry revokes that certificate immediately.
-struct ClientAllowList {
-    path: PathBuf,
-}
-
-impl ClientAllowList {
-    fn load(&self) -> Result<HashMap<[u8; 32], String>, String> {
-        let raw = std::fs::read_to_string(&self.path).map_err(|e| {
-            format!(
-                "nie można odczytać NONODB_TLS_CLIENT_ALLOW {}: {e}",
-                self.path.display()
-            )
-        })?;
-        let mut out = HashMap::new();
-        for (line_no, line) in raw.lines().enumerate() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            let mut parts = line.split_whitespace();
-            let raw_fp = parts.next().ok_or_else(|| {
-                format!("{}:{}: brak fingerprintu", self.path.display(), line_no + 1)
-            })?;
-            let raw_fp = raw_fp.strip_prefix("sha256:").unwrap_or(raw_fp);
-            let hex: String = raw_fp.chars().filter(|c| *c != ':').collect();
-            if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
-                return Err(format!(
-                    "{}:{}: fingerprint musi mieć 64 znaki hex",
-                    self.path.display(),
-                    line_no + 1
-                ));
-            }
-            let mut fp = [0u8; 32];
-            for (i, byte) in fp.iter_mut().enumerate() {
-                *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
-                    .map_err(|e| format!("{}:{}: {e}", self.path.display(), line_no + 1))?;
-            }
-            let label = parts.collect::<Vec<_>>().join(" ");
-            let label = if label.is_empty() {
-                format!("sha256:{hex}")
-            } else {
-                label
-            };
-            out.insert(fp, label);
-        }
-        Ok(out)
-    }
-
-    fn authorize(&self, cert: &CertificateDer<'_>) -> Result<String, String> {
-        let fingerprint = fingerprint(cert);
-        let clients = self.load()?;
-        clients.get(&fingerprint).cloned().ok_or_else(|| {
-            format!(
-                "fingerprint sha256:{} nie jest na allow-liście",
-                hex(&fingerprint)
-            )
-        })
-    }
+    audit: Option<Arc<audit::AuditLog>>,
 }
 
 fn fingerprint(cert: &CertificateDer<'_>) -> [u8; 32] {
     let digest = digest(&SHA256, cert.as_ref());
     let mut out = [0u8; 32];
     out.copy_from_slice(digest.as_ref());
-    out
-}
-
-fn hex(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        use std::fmt::Write as _;
-        let _ = write!(out, "{byte:02x}");
-    }
     out
 }
 
@@ -439,7 +383,12 @@ fn read_client_ca(path: &Path) -> Result<Arc<RootCertStore>, Box<dyn std::error:
     Ok(Arc::new(roots))
 }
 
-fn tls_acceptor(cert: &str, key: &str) -> Result<TlsSetup, Box<dyn std::error::Error>> {
+fn tls_acceptor(
+    cert: &str,
+    key: &str,
+    auth: Arc<auth::AuthState>,
+    audit: Option<Arc<audit::AuditLog>>,
+) -> Result<TlsSetup, Box<dyn std::error::Error>> {
     let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
     let mut cert_reader = BufReader::new(std::fs::File::open(cert)?);
     let certs = rustls_pemfile::certs(&mut cert_reader).collect::<Result<Vec<_>, _>>()?;
@@ -450,7 +399,7 @@ fn tls_acceptor(cert: &str, key: &str) -> Result<TlsSetup, Box<dyn std::error::E
     let client_ca = std::env::var("NONODB_TLS_CLIENT_CA")
         .ok()
         .filter(|value| !value.is_empty());
-    let auth = std::env::var("NONODB_TLS_CLIENT_AUTH")
+    let client_auth_mode = std::env::var("NONODB_TLS_CLIENT_AUTH")
         .ok()
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| {
@@ -461,18 +410,11 @@ fn tls_acceptor(cert: &str, key: &str) -> Result<TlsSetup, Box<dyn std::error::E
             }
         })
         .to_ascii_lowercase();
-    if !matches!(auth.as_str(), "off" | "required" | "optional") {
+    if !matches!(client_auth_mode.as_str(), "off" | "required" | "optional") {
         return Err("NONODB_TLS_CLIENT_AUTH musi być: off, required lub optional".into());
     }
 
-    let allowlist = std::env::var_os("NONODB_TLS_CLIENT_ALLOW")
-        .map(PathBuf::from)
-        .map(|path| Arc::new(ClientAllowList { path }));
-    if allowlist.is_some() && client_ca.is_none() {
-        return Err("NONODB_TLS_CLIENT_ALLOW wymaga NONODB_TLS_CLIENT_CA".into());
-    }
-
-    if client_ca.is_some() && auth == "off" {
+    if client_ca.is_some() && client_auth_mode == "off" {
         return Err(
             "NONODB_TLS_CLIENT_AUTH=off nie może być łączone z NONODB_TLS_CLIENT_CA".into(),
         );
@@ -483,7 +425,7 @@ fn tls_acceptor(cert: &str, key: &str) -> Result<TlsSetup, Box<dyn std::error::E
     let config = if let Some(ca) = client_ca {
         let roots = read_client_ca(Path::new(&ca))?;
         let mut verifier = WebPkiClientVerifier::builder(roots);
-        if auth == "optional" {
+        if client_auth_mode == "optional" {
             verifier = verifier.allow_unauthenticated();
         }
         let verifier = verifier.build()?;
@@ -491,7 +433,7 @@ fn tls_acceptor(cert: &str, key: &str) -> Result<TlsSetup, Box<dyn std::error::E
             .with_client_cert_verifier(verifier)
             .with_single_cert(certs, key)?
     } else {
-        if auth != "off" {
+        if client_auth_mode != "off" {
             return Err("NONODB_TLS_CLIENT_AUTH wymaga NONODB_TLS_CLIENT_CA".into());
         }
         builder.with_no_client_auth().with_single_cert(certs, key)?
@@ -499,8 +441,9 @@ fn tls_acceptor(cert: &str, key: &str) -> Result<TlsSetup, Box<dyn std::error::E
 
     Ok(TlsSetup {
         acceptor: TlsAcceptor::from(Arc::new(config)),
-        allowlist,
+        auth,
         client_auth,
+        audit,
     })
 }
 
@@ -516,7 +459,6 @@ async fn serve_tcp(
         %addr,
         tls = tls.is_some(),
         mtls = tls.as_ref().is_some_and(|t| t.client_auth),
-        allowlist = tls.as_ref().is_some_and(|t| t.allowlist.is_some()),
         "TCP listener"
     );
     let mut connections = JoinSet::new();
@@ -530,9 +472,31 @@ async fn serve_tcp(
         let shutdown = shutdown.clone();
         connections.spawn(async move {
             let Some(tls) = tls else {
+                let app = app.clone().layer(Extension(auth::ConnectionAuth::tcp(
+                    None,
+                    Some(peer.to_string()),
+                    false,
+                )));
                 serve_stream(stream, app, shutdown).await;
                 return;
             };
+            let connection = auth::ConnectionAuth::tcp(None, Some(peer.to_string()), true);
+            let now = Instant::now();
+            if let Some(block) = tls.auth.block_info(&connection, now) {
+                metrics::inc(&metrics::AUTH_BLOCKED_REQUESTS);
+                let retry_after = block.retry_after.as_secs().max(1);
+                audit_tls(
+                    tls.audit.as_deref(),
+                    peer,
+                    "rate_limited",
+                    Some(audit::AuthAudit {
+                        failures: block.failures,
+                        blocked_for_secs: Some(retry_after),
+                    }),
+                );
+                tracing::warn!(%peer, retry_after, "TLS client blocked after failed logins");
+                return;
+            }
             let mut handshake_shutdown = shutdown.clone();
             let stream = tokio::select! {
                 _ = wait_for_shutdown(&mut handshake_shutdown) => return,
@@ -544,29 +508,55 @@ async fn serve_tcp(
                     }
                 },
             };
-            if let Some(allowlist) = &tls.allowlist {
-                let cert = stream
-                    .get_ref()
-                    .1
-                    .peer_certificates()
-                    .and_then(|certs| certs.first())
-                    .cloned();
-                match cert {
-                    Some(cert) => match allowlist.authorize(&cert) {
-                        Ok(client) => {
-                            tracing::debug!(%peer, %client, "mTLS client accepted");
+            let cert_fingerprint = match stream
+                .get_ref()
+                .1
+                .peer_certificates()
+                .and_then(|certs| certs.first())
+            {
+                Some(cert) => {
+                    let fingerprint = fingerprint(cert);
+                    match tls.auth.registry().authenticate_certificate(&fingerprint) {
+                        Ok(principal) => {
+                            tracing::debug!(
+                                %peer,
+                                principal = principal.name(),
+                                "mTLS client accepted"
+                            );
+                            Some(fingerprint)
                         }
                         Err(reason) => {
+                            let failure = tls.auth.record_auth_failure(&connection, Instant::now());
+                            let audit = failure.map(|failure| audit::AuthAudit {
+                                failures: failure.failures,
+                                blocked_for_secs: failure.blocked_for.map(|d| d.as_secs().max(1)),
+                            });
+                            if let Some(failure) = failure {
+                                if let Some(blocked_for) = failure.blocked_for {
+                                    metrics::inc(&metrics::AUTH_BLOCKED_REQUESTS);
+                                    audit_tls(tls.audit.as_deref(), peer, "rate_limited", audit);
+                                    tracing::warn!(
+                                        %peer,
+                                        %reason,
+                                        retry_after = blocked_for.as_secs().max(1),
+                                        "mTLS client rejected and blocked"
+                                    );
+                                    return;
+                                }
+                            }
+                            audit_tls(tls.audit.as_deref(), peer, "unauthorized", audit);
                             tracing::warn!(%peer, %reason, "mTLS client rejected");
                             return;
                         }
-                    },
-                    None => {
-                        tracing::warn!(%peer, "mTLS client rejected: brak certyfikatu");
-                        return;
                     }
                 }
-            }
+                None => None,
+            };
+            let app = app.clone().layer(Extension(auth::ConnectionAuth::tcp(
+                cert_fingerprint,
+                Some(peer.to_string()),
+                true,
+            )));
             serve_stream(stream, app, shutdown).await;
         });
     }
@@ -686,16 +676,152 @@ async fn health() -> Json<Value> {
     Json(json!({ "ok": true }))
 }
 
-async fn metrics_handler(headers: HeaderMap) -> (StatusCode, Json<Value>) {
-    if !auth_ok(&headers) {
+async fn metrics_handler(
+    State(state): State<AppState>,
+    Extension(connection): Extension<auth::ConnectionAuth>,
+    headers: HeaderMap,
+) -> (StatusCode, Json<Value>) {
+    let started = Instant::now();
+    let principal = match authenticate_with_guard(&state, &connection, &headers) {
+        Ok(principal) => principal,
+        Err((err, auth_audit)) => {
+            let status = error_status(&err);
+            audit_control(
+                &state,
+                &connection,
+                "anonymous",
+                "metrics",
+                false,
+                Some(&err.message),
+                started,
+                auth_audit,
+            );
+            return (status, Json(json!({ "ok": false, "error": err })));
+        }
+    };
+    if !principal.allows_admin_database() {
+        let err = ApiError::forbidden();
+        audit_control(
+            &state,
+            &connection,
+            principal.name(),
+            "metrics",
+            false,
+            Some(&err.message),
+            started,
+            None,
+        );
         return (
-            StatusCode::UNAUTHORIZED,
-            Json(
-                json!({ "ok": false, "error": { "code": "unauthorized", "message": "invalid token" } }),
-            ),
+            StatusCode::FORBIDDEN,
+            Json(json!({ "ok": false, "error": err })),
         );
     }
+    audit_control(
+        &state,
+        &connection,
+        principal.name(),
+        "metrics",
+        true,
+        None,
+        started,
+        None,
+    );
+    if let Some(auth) = &state.auth {
+        auth.refresh_blocked_clients();
+    }
     (StatusCode::OK, Json(metrics::snapshot()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn audit_control(
+    state: &AppState,
+    connection: &auth::ConnectionAuth,
+    principal: &str,
+    op: &str,
+    ok: bool,
+    error: Option<&str>,
+    started: Instant,
+    auth_audit: Option<audit::AuthAudit>,
+) {
+    if let Some(audit) = &state.audit {
+        audit.record(
+            principal,
+            connection.source.as_str(),
+            connection.peer.as_deref(),
+            op,
+            &[],
+            ok,
+            error,
+            started.elapsed().as_secs_f64() * 1000.0,
+            auth_audit,
+        );
+    }
+}
+
+fn audit_tls(
+    audit: Option<&audit::AuditLog>,
+    peer: std::net::SocketAddr,
+    error: &str,
+    auth_audit: Option<audit::AuthAudit>,
+) {
+    if let Some(audit) = audit {
+        audit.record(
+            "anonymous",
+            "tcp-tls",
+            Some(&peer.to_string()),
+            "tls_handshake",
+            &[],
+            false,
+            Some(error),
+            0.0,
+            auth_audit,
+        );
+    }
+}
+
+/// Authenticate one HTTP request and apply the per-IP failed-login guard.
+fn authenticate_with_guard(
+    state: &AppState,
+    connection: &auth::ConnectionAuth,
+    headers: &HeaderMap,
+) -> Result<nonodb_auth::Principal, (ApiError, Option<audit::AuthAudit>)> {
+    let now = Instant::now();
+    if let Some(block) = state
+        .auth
+        .as_ref()
+        .and_then(|auth| auth.block_info(connection, now))
+    {
+        metrics::inc(&metrics::AUTH_BLOCKED_REQUESTS);
+        let retry_after = block.retry_after.as_secs().max(1);
+        return Err((
+            ApiError::rate_limited(retry_after),
+            Some(audit::AuthAudit {
+                failures: block.failures,
+                blocked_for_secs: Some(retry_after),
+            }),
+        ));
+    }
+
+    match auth::authenticate(state.auth.as_deref(), connection, headers) {
+        Ok(principal) => Ok(principal),
+        Err(err) => {
+            let failure = state
+                .auth
+                .as_ref()
+                .and_then(|auth| auth.record_auth_failure(connection, now));
+            let audit = failure.map(|failure| audit::AuthAudit {
+                failures: failure.failures,
+                blocked_for_secs: failure.blocked_for.map(|d| d.as_secs().max(1)),
+            });
+            if let Some(failure) = failure {
+                if let Some(blocked_for) = failure.blocked_for {
+                    metrics::inc(&metrics::AUTH_BLOCKED_REQUESTS);
+                    return Err((ApiError::rate_limited(blocked_for.as_secs().max(1)), audit));
+                }
+            }
+            Err((err, audit))
+        }
+    }
 }
 
 fn header_value(headers: &HeaderMap, name: &str) -> Result<Option<String>, ApiError> {
@@ -730,22 +856,64 @@ fn vault_auth(headers: &HeaderMap) -> Result<Option<VaultAuth>, ApiError> {
 
 async fn exec(
     State(state): State<AppState>,
+    Extension(connection): Extension<auth::ConnectionAuth>,
     headers: HeaderMap,
     Json(req): Json<Request>,
 ) -> (StatusCode, Json<ApiResponse>) {
     metrics::inc(&metrics::REQUESTS);
-    if !auth_ok(&headers) {
-        return respond(Err(ApiError {
-            code: "unauthorized".into(),
-            message: "missing or invalid bearer token".into(),
-        }));
+    let started = std::time::Instant::now();
+    let principal = match authenticate_with_guard(&state, &connection, &headers) {
+        Ok(principal) => principal,
+        Err((err, auth_audit)) => {
+            audit_denied(
+                &state,
+                &connection,
+                "anonymous",
+                &req,
+                &err,
+                started,
+                auth_audit,
+            );
+            return respond(Err(err));
+        }
+    };
+    if let Err(err) = authz::authorize_request(&principal, &req) {
+        audit_denied(
+            &state,
+            &connection,
+            principal.name(),
+            &req,
+            &err,
+            started,
+            None,
+        );
+        return respond(Err(err));
     }
+    let audit_needed = state
+        .audit
+        .as_ref()
+        .is_some_and(|audit| audit.log_reads() || !req.is_read_only());
+    let audit_op = req.op_name();
+    let audit_collections: Vec<String> = req.collections().into_iter().map(str::to_owned).collect();
     let vault_auth = match vault_auth(&headers) {
         Ok(auth) => auth,
-        Err(err) => return respond(Err(err)),
+        Err(err) => {
+            audit_error(
+                &state,
+                &connection,
+                principal.name(),
+                audit_op,
+                &audit_collections,
+                &err,
+                started,
+                audit_needed,
+            );
+            return respond(Err(err));
+        }
     };
+    let auth_generation = state.auth.as_ref().map_or(0, |auth| auth.generation());
     let cache_key = if vault_auth.is_none() && cacheable(&req) {
-        state.cache.key(&req)
+        state.cache.key(&(principal.name(), auth_generation, &req))
     } else {
         None
     };
@@ -756,7 +924,18 @@ async fn exec(
                 state.auto_index.record(&req, false);
             }
             metrics::inc(&metrics::READ_OPS);
-            return respond(Ok(value));
+            let response = respond(Ok(value));
+            audit_response(
+                &state,
+                &connection,
+                principal.name(),
+                audit_op,
+                &audit_collections,
+                &response,
+                started,
+                audit_needed,
+            );
+            return response;
         }
     }
     if vault_auth.is_none() {
@@ -1048,13 +1227,14 @@ async fn exec(
                 ));
             }
             let store = state.store.clone();
+            let principal = principal.clone();
             let n = ops.len();
             metrics::add(&metrics::BATCH_OPS, n as u64);
             let joined = tokio::task::spawn_blocking(move || {
                 let rtxn = store.read_txn()?;
                 let mut results = Vec::with_capacity(ops.len());
                 for op in ops {
-                    results.push(batch_read(&store, &rtxn, op));
+                    results.push(batch_read(&store, &rtxn, op, &principal));
                 }
                 rtxn.commit().map_err(nonodb_core::Error::from)?;
                 Ok::<Value, ApiError>(json!({ "results": results }))
@@ -1078,8 +1258,11 @@ async fn exec(
 
         Request::ListCollections => {
             let store = state.store.clone();
+            let principal = principal.clone();
             let joined = tokio::task::spawn_blocking(move || {
-                Ok::<Value, ApiError>(json!({ "collections": store.collections()? }))
+                let mut collections = store.collections()?;
+                collections.retain(|coll| principal.can_see_collection(coll));
+                Ok::<Value, ApiError>(json!({ "collections": collections }))
             });
             read_result(joined).await
         }
@@ -1261,7 +1444,104 @@ async fn exec(
             state.cache.put(key, cache_version, value);
         }
     }
+    audit_response(
+        &state,
+        &connection,
+        principal.name(),
+        audit_op,
+        &audit_collections,
+        &response,
+        started,
+        audit_needed,
+    );
     response
+}
+
+fn audit_denied(
+    state: &AppState,
+    connection: &auth::ConnectionAuth,
+    principal: &str,
+    req: &Request,
+    err: &ApiError,
+    started: std::time::Instant,
+    auth_audit: Option<audit::AuthAudit>,
+) {
+    let collections: Vec<String> = req.collections().into_iter().map(str::to_owned).collect();
+    let refs: Vec<&str> = collections.iter().map(String::as_str).collect();
+    if let Some(audit) = &state.audit {
+        audit.record(
+            principal,
+            connection.source.as_str(),
+            connection.peer.as_deref(),
+            req.op_name(),
+            &refs,
+            false,
+            Some(&err.code),
+            started.elapsed().as_secs_f64() * 1000.0,
+            auth_audit,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn audit_error(
+    state: &AppState,
+    connection: &auth::ConnectionAuth,
+    principal: &str,
+    op: &str,
+    collections: &[String],
+    err: &ApiError,
+    started: std::time::Instant,
+    enabled: bool,
+) {
+    if !enabled {
+        return;
+    }
+    let refs: Vec<&str> = collections.iter().map(String::as_str).collect();
+    if let Some(audit) = &state.audit {
+        audit.record(
+            principal,
+            connection.source.as_str(),
+            connection.peer.as_deref(),
+            op,
+            &refs,
+            false,
+            Some(&err.code),
+            started.elapsed().as_secs_f64() * 1000.0,
+            None,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn audit_response(
+    state: &AppState,
+    connection: &auth::ConnectionAuth,
+    principal: &str,
+    op: &str,
+    collections: &[String],
+    response: &(StatusCode, Json<ApiResponse>),
+    started: std::time::Instant,
+    enabled: bool,
+) {
+    if !enabled {
+        return;
+    }
+    let refs: Vec<&str> = collections.iter().map(String::as_str).collect();
+    let error = response.1 .0.error.as_ref().map(|e| e.code.as_str());
+    if let Some(audit) = &state.audit {
+        audit.record(
+            principal,
+            connection.source.as_str(),
+            connection.peer.as_deref(),
+            op,
+            &refs,
+            response.0 == StatusCode::OK,
+            error,
+            started.elapsed().as_secs_f64() * 1000.0,
+            None,
+        );
+    }
 }
 
 fn cacheable(req: &Request) -> bool {
@@ -1337,14 +1617,24 @@ async fn submit_write(state: &AppState, req: WriteReq) -> (StatusCode, Json<ApiR
     }
 }
 
-fn batch_read(store: &Store, rtxn: &RoTxn<'_>, req: Request) -> Value {
-    match execute_read(store, rtxn, req) {
+fn batch_read(
+    store: &Store,
+    rtxn: &RoTxn<'_>,
+    req: Request,
+    principal: &nonodb_auth::Principal,
+) -> Value {
+    match execute_read(store, rtxn, req, principal) {
         Ok(value) => json!({ "ok": true, "result": value }),
         Err(e) => json!({ "ok": false, "error": { "code": e.code, "message": e.message } }),
     }
 }
 
-fn execute_read(store: &Store, rtxn: &RoTxn<'_>, req: Request) -> Result<Value, ApiError> {
+fn execute_read(
+    store: &Store,
+    rtxn: &RoTxn<'_>,
+    req: Request,
+    principal: &nonodb_auth::Principal,
+) -> Result<Value, ApiError> {
     match req {
         Request::Find {
             coll,
@@ -1536,7 +1826,11 @@ fn execute_read(store: &Store, rtxn: &RoTxn<'_>, req: Request) -> Result<Value, 
             let entry = c.get_version_in(rtxn, &id, version)?;
             Ok(serde_json::to_value(entry).map_err(nonodb_core::Error::from)?)
         }
-        Request::ListCollections => Ok(json!({ "collections": store.collections_in(rtxn)? })),
+        Request::ListCollections => {
+            let mut collections = store.collections_in(rtxn)?;
+            collections.retain(|coll| principal.can_see_collection(coll));
+            Ok(json!({ "collections": collections }))
+        }
         _ => Err(ApiError {
             code: "invalid_query".to_string(),
             message: "only read ops are allowed in batch".to_string(),
@@ -1563,68 +1857,40 @@ fn flatten_join(
     }
 }
 
+fn error_status(err: &ApiError) -> StatusCode {
+    match err.code.as_str() {
+        "duplicate_key"
+        | "invalid_id"
+        | "invalid_query"
+        | "invalid_json"
+        | "invalid_collection"
+        | "vault_key_required"
+        | "vault_key_unexpected"
+        | "invalid_vault_key"
+        | "tenant_mismatch"
+        | "unsupported_encrypted_operation"
+        | "decryption_failed"
+        | "not_a_vault_collection"
+        | "invalid_vault_filter"
+        | "invalid_vault_document"
+        | "vault_profile_immutable"
+        | "invalid_collection_profile" => StatusCode::BAD_REQUEST,
+        "unauthorized" => StatusCode::UNAUTHORIZED,
+        "forbidden" => StatusCode::FORBIDDEN,
+        "rate_limited" => StatusCode::TOO_MANY_REQUESTS,
+        "document_too_large" => StatusCode::PAYLOAD_TOO_LARGE,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
 fn respond(res: Result<Value, ApiError>) -> (StatusCode, Json<ApiResponse>) {
     match res {
         Ok(value) => (StatusCode::OK, Json(ApiResponse::ok(value))),
         Err(err) => {
             metrics::inc(&metrics::ERRORS);
-            let status = match err.code.as_str() {
-                "duplicate_key"
-                | "invalid_id"
-                | "invalid_query"
-                | "invalid_json"
-                | "invalid_collection"
-                | "vault_key_required"
-                | "vault_key_unexpected"
-                | "invalid_vault_key"
-                | "tenant_mismatch"
-                | "unsupported_encrypted_operation"
-                | "decryption_failed"
-                | "not_a_vault_collection"
-                | "invalid_vault_filter"
-                | "invalid_vault_document"
-                | "vault_profile_immutable"
-                | "invalid_collection_profile" => StatusCode::BAD_REQUEST,
-                "unauthorized" => StatusCode::UNAUTHORIZED,
-                "document_too_large" => StatusCode::PAYLOAD_TOO_LARGE,
-                _ => StatusCode::INTERNAL_SERVER_ERROR,
-            };
-            (status, Json(ApiResponse::err(err)))
+            (error_status(&err), Json(ApiResponse::err(err)))
         }
     }
-}
-
-fn auth_ok(headers: &HeaderMap) -> bool {
-    static TOKEN: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    let expected = TOKEN.get_or_init(|| {
-        std::env::var("NONODB_AUTH_TOKEN")
-            .ok()
-            .filter(|t| !t.is_empty())
-    });
-    let Some(expected) = expected.as_deref() else {
-        return true;
-    };
-    let Some(value) = headers.get(axum::http::header::AUTHORIZATION) else {
-        return false;
-    };
-    let Ok(value) = value.to_str() else {
-        return false;
-    };
-    let Some(provided) = value.strip_prefix("Bearer ") else {
-        return false;
-    };
-    constant_time_eq(provided.as_bytes(), expected.as_bytes())
-}
-
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b) {
-        diff |= x ^ y;
-    }
-    diff == 0
 }
 
 #[cfg(unix)]

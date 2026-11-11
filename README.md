@@ -112,7 +112,7 @@ nonodb is deliberately not a general-purpose distributed database. It has:
 - no general interactive multi-document transactions;
 - no MongoDB wire-protocol compatibility;
 - no cross-collection joins (`$lookup`) or write stages (`$merge`/`$out`);
-- no user/role system beyond a bearer token;
+- no users, roles, or inherited groups beyond per-collection scopes;
 - a practical subset of MongoDB query and update operators.
 
 For a single host, a small-to-medium data set, and a workload dominated by
@@ -347,10 +347,11 @@ rotation, and best-fit guidance.
 ### Operations
 
 - Single daemon; Unix socket by default, optional TCP.
-- Optional bearer-token authentication and Unix peer uid/gid allow-lists.
-- Optional TLS for TCP using rustls, including mutual TLS with client
-  certificate verification and a fingerprint allow-list for immediate
-  revocation.
+- File-based principals, per-collection scopes, hashed bearer tokens, Unix
+  peer uid/gid allow-lists, and configurable per-IP failed-login lockout.
+- Optional TLS for TCP using rustls, including mutual TLS mapped to authorization
+  principals.
+- Append-only JSONL audit log with optional read auditing and fsync.
 - Periodic LMDB snapshots with retention.
 - Online backup with SHA-256 manifests, deep verification, restore drills, and inspection.
 - JSON metrics endpoint and request/queue/commit counters.
@@ -380,7 +381,7 @@ Each archive contains `nonodb-daemon`, `nonodb-cli`, `README.md`, `LICENSE` and
 [releases page](https://github.com/essmos/nonodb/releases).
 
 Linux and macOS use the Unix socket by default. Windows has no Unix socket
-listener, so the Windows daemon requires TCP plus `NONODB_AUTH_TOKEN`.
+listener, so the Windows daemon requires TCP plus `NONODB_AUTH_FILE`.
 
 ### Run on Linux (native)
 
@@ -494,14 +495,16 @@ Then use `nonodb-cli`, `curl --unix-socket`, or the Python client with
 
 ### Run on Windows (TCP only)
 
-Download and extract `nonodb-vX.Y.Z-windows-x86_64.zip`, then start the daemon
-from PowerShell. TCP is mandatory on Windows and always requires a bearer
-token:
+Download and extract `nonodb-vX.Y.Z-windows-x86_64.zip`, create an auth
+registry, then start the daemon from PowerShell. TCP is mandatory on Windows
+and always requires `NONODB_AUTH_FILE`:
 
 ```powershell
 $env:NONODB_DATA = "$PWD\data"
 $env:NONODB_TCP = "127.0.0.1:7878"
-$env:NONODB_AUTH_TOKEN = "replace-with-a-long-random-token"
+$env:NONODB_AUTH_FILE = "$PWD\auth.json"
+.\nonodb-cli.exe auth init
+$TOKEN = .\nonodb-cli.exe auth token create admin
 $env:RUST_LOG = "info"
 .\nonodb-daemon.exe
 ```
@@ -510,7 +513,7 @@ In a second PowerShell window:
 
 ```powershell
 $env:NONODB_URL = "http://127.0.0.1:7878"
-$env:NONODB_TOKEN = "replace-with-a-long-random-token"
+$env:NONODB_TOKEN = "<token printed by auth token create>"
 .\nonodb-cli.exe ping
 ```
 
@@ -530,16 +533,21 @@ cd nonodb
 docker build -t nonodb:local .
 ```
 
-The simplest way to use it from a process on the host is TCP on loopback with a
-bearer token:
+The simplest way to use it from a process on the host is TCP on loopback with
+an auth registry mounted read-only:
 
 ```bash
-docker volume create nonodb-data
+export NONODB_AUTH_FILE="$PWD/nonodb-auth.json"
+nonodb-cli auth init
+export TOKEN=$(nonodb-cli auth token create admin)
 
+docker volume create nonodb-data
 docker run -d --name nonodb \
-  -e NONODB_AUTH_TOKEN='replace-with-a-long-random-token' \
+  -e NONODB_AUTH_FILE=/etc/nonodb/auth.json \
   -e NONODB_TCP=0.0.0.0:7878 \
   -p 127.0.0.1:7878:7878 \
+  --group-add "$(id -g)" \
+  -v "$NONODB_AUTH_FILE:/etc/nonodb/auth.json:ro" \
   -v nonodb-data:/var/lib/nonodb \
   nonodb:local
 ```
@@ -558,7 +566,7 @@ from nonodb import NonoDB
 
 db = NonoDB(
     base_url="http://127.0.0.1:7878",
-    token="replace-with-a-long-random-token",
+    token=os.environ["TOKEN"],
 )
 print(db.collection("users").count())
 db.close()
@@ -575,7 +583,9 @@ be able to access the socket with a matching uid/gid. For host processes, TCP on
 Docker Compose example:
 
 ```bash
-export NONODB_AUTH_TOKEN='replace-with-a-long-random-token'
+export NONODB_AUTH_FILE="$PWD/nonodb-auth.json"
+nonodb-cli auth init
+nonodb-cli auth token create admin
 docker compose -f deploy/docker-compose.yml up -d
 ```
 
@@ -588,14 +598,15 @@ More deployment details: [Operations — Docker](docs/operations.md#docker).
 | [Architecture](docs/architecture.md) | Daemon model, LMDB layout, write path, indexes, search, concurrency, crash safety |
 | [HTTP API](docs/api.md) | Every operation, request/response shapes, filters, updates, indexes, search, errors |
 | [Clients](docs/clients.md) | Python, Rust, Node.js and Go clients: install, CRUD, batches, indexes, search, TCP/TLS |
-| [Mutual TLS](docs/mtls.md) | Client certificate setup, private CA, fingerprint allow-list, revocation, rotation |
+| [Authentication and permissions](docs/auth.md) | Principals, scopes, tokens, certificates, lockout, reloads, audit log |
+| [Mutual TLS](docs/mtls.md) | Client certificate setup, private CA, fingerprint mapping, revocation, rotation |
 | [Python client](docs/python-client.md) | `NonoDB`/`Collection` API, caching, retries, TCP/TLS, FastAPI usage |
 | [Vault collections](docs/vault.md) | Optional encrypted tenant data, headers, restrictions, key rotation |
 | [Document TTL](docs/ttl.md) | Collection defaults, per-document expiry, update semantics, maintenance |
 | [Dates and time zones](docs/dates.md) | BSON-compatible dates, RFC 3339 input, filtering, indexes, sorting |
 | [Numbers and decimals](docs/numerics.md) | Exact numeric comparison, Decimal128, arithmetic, NaN/Infinity, index compatibility, long text limits |
 | [BSON scalar types](docs/bson-types.md) | `$numberInt`/`$numberLong`, `$type`, binary/UUID, ObjectId, index compatibility |
-| [CLI](docs/cli.md) | `ping`, `find`, `count`, `map`, `resize`, `backup`, `verify-backup`, `restore`, `verify`, `inspect`, `exec` |
+| [CLI](docs/cli.md) | `ping`, `find`, `count`, `map`, `resize`, auth management, backup/verify/restore, `exec` |
 | [Operations](docs/operations.md) | Configuration, deployment, security, snapshots, monitoring, capacity, troubleshooting |
 | [Benchmarks](docs/benchmarks.md) | Test environment, throughput, latency, large data sets, RAM, reproducibility |
 | [Development](docs/development.md) | Repository layout, tests, linting, benchmark scripts, contribution notes |

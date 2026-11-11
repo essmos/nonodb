@@ -66,10 +66,12 @@ limitations are documented in [docs/roadmap.md](docs/roadmap.md).
 
 ### P0 — security
 
-- [ ] Per-collection tokens, or users/roles with collection scopes
-- [ ] Map mTLS certificate identities to authorization scopes
-- [ ] Audit log for writes and administrative operations
-- [ ] CRL/OCSP or a per-client token/certificate registry
+- [x] Per-collection scopes and file-based principals
+- [x] Map mTLS certificate identities to authorization scopes
+- [x] Audit log for writes and administrative operations
+- [x] Per-client token/certificate registry with live disable/enable
+- [x] Configurable per-IP failed-login lockout and audit failure counts
+- [ ] Optional CRL/OCSP integration for externally managed PKI
 
 ### P1 — query and update compatibility
 

@@ -3,9 +3,11 @@
 FROM rust:1-slim-bookworm AS builder
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
+COPY nonodb-auth ./nonodb-auth
 COPY nonodb-core ./nonodb-core
 COPY nonodb-daemon ./nonodb-daemon
 COPY nonodb-cli ./nonodb-cli
+COPY nonodb-client ./nonodb-client
 RUN cargo build --release --bin nonodb-daemon --bin nonodb-cli
 
 FROM debian:bookworm-slim

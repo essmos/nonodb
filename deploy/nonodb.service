@@ -10,6 +10,8 @@ RuntimeDirectory=nonodb
 Environment=NONODB_DATA=/var/lib/nonodb
 Environment=NONODB_SOCK=/run/nonodb/nonodb.sock
 Environment=RUST_LOG=info
+# Required when NONODB_TCP is enabled:
+# Environment=NONODB_AUTH_FILE=/etc/nonodb/auth.json
 ExecStart=/usr/local/bin/nonodb-daemon
 Restart=on-failure
 RestartSec=2

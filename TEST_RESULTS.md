@@ -23,6 +23,7 @@ release build.
 | Live backup and restore, 1M and 8M documents | OK |
 | Docker build and named-volume run | OK |
 | Vault encryption regression suite | OK (profiles, headers, isolation, CRUD, history, rejected ops) |
+| Auth registry, scopes, and lockout | OK (tokens, scopes, filtered list, live reload, audit, per-IP blocks) |
 | mTLS with all official clients | OK (Python, Rust, Node.js, Go; anonymous and revoked certs rejected) |
 | Document TTL suite | OK (defaults, overrides, update semantics, sweeper, history tombstones/purge, vault) |
 

@@ -33,6 +33,11 @@ pub static QUEUE_LEN: AtomicU64 = AtomicU64::new(0);
 pub static QUEUE_PEAK: AtomicU64 = AtomicU64::new(0);
 /// 1 while the writer is executing a batch, 0 while idle.
 pub static WRITER_BUSY: AtomicU64 = AtomicU64::new(0);
+/// Authentication failures, lockouts, and rejected requests from blocked peers.
+pub static AUTH_FAILURES: AtomicU64 = AtomicU64::new(0);
+pub static AUTH_BLOCKS: AtomicU64 = AtomicU64::new(0);
+pub static AUTH_BLOCKED_REQUESTS: AtomicU64 = AtomicU64::new(0);
+pub static AUTH_BLOCKED_CLIENTS: AtomicU64 = AtomicU64::new(0);
 
 pub fn inc(counter: &AtomicU64) {
     counter.fetch_add(1, Relaxed);
@@ -78,6 +83,10 @@ pub fn snapshot() -> Value {
         "queue_len": QUEUE_LEN.load(Relaxed),
         "queue_peak": QUEUE_PEAK.load(Relaxed),
         "writer_busy": WRITER_BUSY.load(Relaxed),
+        "auth_failures_total": AUTH_FAILURES.load(Relaxed),
+        "auth_blocks_total": AUTH_BLOCKS.load(Relaxed),
+        "auth_blocked_requests_total": AUTH_BLOCKED_REQUESTS.load(Relaxed),
+        "auth_blocked_clients": AUTH_BLOCKED_CLIENTS.load(Relaxed),
         "commit_ns_total": commit_ns,
         "ttl_sweeps_total": TTL_SWEEPS.load(Relaxed),
         "ttl_expired_total": TTL_EXPIRED.load(Relaxed),

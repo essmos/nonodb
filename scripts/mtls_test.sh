@@ -57,7 +57,31 @@ openssl x509 -req -in "$TMP/client.csr" -CA "$TMP/ca.crt" -CAkey "$TMP/ca.key" \
   -extfile "$TMP/client.ext" >/dev/null 2>&1
 
 CLIENT_FP=$(openssl x509 -in "$TMP/client.crt" -outform DER | openssl dgst -sha256 | awk '{print $NF}')
-printf 'sha256:%s client-a\n' "$CLIENT_FP" >"$TMP/allowed.txt"
+TOKEN_SECRET="mtls-client-secret"
+TOKEN_HASH=$(printf '%s' "$TOKEN_SECRET" | openssl dgst -sha256 | awk '{print $NF}')
+export NONODB_TOKEN="nodb_mtls_${TOKEN_SECRET}"
+python3 - "$TMP/auth.json" "$CLIENT_FP" "$TOKEN_HASH" <<'PY'
+import json, sys
+path, fingerprint, token_hash = sys.argv[1:4]
+doc = {
+    "version": 1,
+    "principals": {"client-a": {"scopes": ["*:*"]}},
+    "tokens": [{
+        "kid": "mtls",
+        "sha256": token_hash,
+        "principal": "client-a",
+        "disabled": False,
+    }],
+    "certificates": [{
+        "sha256": fingerprint.lower(),
+        "principal": "client-a",
+        "disabled": False,
+    }],
+}
+with open(path, "w") as fh:
+    json.dump(doc, fh, indent=2)
+    fh.write("\n")
+PY
 
 # ---------------------------------------------------------------- daemon start
 PORT=$(python3 - <<'PY'
@@ -74,12 +98,11 @@ export NONODB_HISTORY_MAX_VERSIONS=5
 NONODB_DATA="$TMP/data" \
 NONODB_SOCK="$TMP/nonodb.sock" \
 NONODB_TCP="127.0.0.1:$PORT" \
-NONODB_AUTH_TOKEN="mtls-test-token" \
+NONODB_AUTH_FILE="$TMP/auth.json" \
 NONODB_TLS_CERT="$TMP/server.crt" \
 NONODB_TLS_KEY="$TMP/server.key" \
 NONODB_TLS_CLIENT_CA="$TMP/ca.crt" \
 NONODB_TLS_CLIENT_AUTH=required \
-NONODB_TLS_CLIENT_ALLOW="$TMP/allowed.txt" \
 RUST_LOG=warn \
 "$BIN" >"$TMP/daemon.log" 2>&1 &
 PID=$!
@@ -108,7 +131,6 @@ PY
 done
 
 export NONODB_URL="https://localhost:$PORT"
-export NONODB_TOKEN="mtls-test-token"
 export NONODB_TLS_CA="$TMP/ca.crt"
 export NONODB_TLS_CLIENT_CERT="$TMP/client.crt"
 export NONODB_TLS_CLIENT_KEY="$TMP/client.key"
@@ -162,24 +184,35 @@ else
   echo "anonymous TLS connection rejected: ok"
 fi
 
-echo "== allow-list revocation"
-: >"$TMP/allowed.txt"
-sleep 0.1
-if python3 - <<'PY' 2>/dev/null
-import os
-import sys
+echo "== certificate registry revocation on existing connection"
+python3 - "$TMP/auth.json" <<'PY'
+import json, os, sys, time
 sys.path.insert(0, os.path.join(os.environ["PWD"], "client"))
-from nonodb import NonoDB
+from nonodb import NonoDB, NonoDBError
 
+path = sys.argv[1]
 db = NonoDB(base_url=os.environ["NONODB_URL"], token=os.environ["NONODB_TOKEN"])
-db.exec({"op": "list_collections"})
-raise SystemExit(0)
+db.exec({"op": "list_collections"})  # keep-alive connection established
+
+with open(path) as fh:
+    doc = json.load(fh)
+doc["certificates"][0]["disabled"] = True
+tmp = path + ".tmp"
+with open(tmp, "w") as fh:
+    json.dump(doc, fh, indent=2)
+    fh.write("\n")
+os.replace(tmp, path)
+
+time.sleep(2)
+try:
+    db.exec({"op": "list_collections"})
+except NonoDBError as exc:
+    assert exc.code == "unauthorized", (exc.code, exc)
+else:
+    raise SystemExit("revoked client unexpectedly succeeded")
+finally:
+    db.close()
+print("revoked client on existing connection rejected: ok")
 PY
-then
-  echo "revoked client unexpectedly succeeded" >&2
-  exit 1
-else
-  echo "revoked client rejected: ok"
-fi
 
 echo "all mTLS tests passed"

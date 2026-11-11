@@ -59,6 +59,27 @@ A client connection is stateless. There are no sessions, cursors, or
 transactions spanning requests. This is what allows the client to be a thin
 HTTP wrapper and makes worker restarts trivial.
 
+## Authentication and authorization
+
+The daemon keeps the authorization registry outside LMDB in
+`NONODB_AUTH_FILE`. It contains principals, per-collection scopes, token hashes,
+and certificate fingerprints. Token secrets are never stored, and database
+restores cannot roll back revocations.
+
+- Unix sockets authenticate as the local administrator.
+- TCP requires the registry and a bearer token, a registered client
+  certificate, or both resolving to the same principal.
+- Each request is authorized independently; batches are checked per operation
+  before the write transaction starts.
+- TLS handshakes reject unregistered certificates, and every request
+  re-resolves the certificate so disabling an entry affects existing keep-alive
+  connections.
+- A file watcher swaps in valid changes atomically and keeps the last known good
+  registry after an invalid edit.
+- Optional JSONL audit records are append-only and outside the database.
+
+See [Authentication and authorization](auth.md).
+
 ## Storage engine: LMDB
 
 nonodb uses [LMDB](https://www.symas.com/lmdb) through the
@@ -169,7 +190,8 @@ recreated resources use the slot pool. See
 
 At a high level:
 
-1. The HTTP handler checks authentication and parses the request.
+1. The HTTP handler authenticates the connection, authorizes the requested
+   scopes, and parses the request.
 2. A read task opens one `RoTxn` (LMDB read transaction).
 3. The collection resolves the cheapest access path:
    - exact `_id` → direct B+ tree lookup;

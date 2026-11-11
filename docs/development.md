@@ -9,6 +9,7 @@ and [HTTP API](api.md).
 ```text
 .
 ├── Cargo.toml                 # workspace
+├── nonodb-auth/               # auth-file schema, principals, scopes, token hashing
 ├── nonodb-core/               # storage, collections, indexes, query, search
 │   ├── src/
 │   │   ├── lib.rs
@@ -44,7 +45,11 @@ and [HTTP API](api.md).
 │       └── inspect.rs
 ├── nonodb-daemon/             # HTTP server, writer thread, metrics
 │   └── src/
-│       ├── main.rs            # listeners, auth, TLS, snapshots
+│       ├── main.rs            # listeners, TLS handshake, snapshots
+│       ├── auth.rs            # connection identity, token/cert auth, file reload
+│       ├── authz.rs           # request -> required scopes
+│       ├── login_guard.rs     # per-IP failed-login sliding window and lockout
+│       ├── audit.rs           # JSONL audit log
 │       ├── protocol.rs        # request/response types
 │       ├── writer.rs          # single writer + group commit
 │       ├── maintenance.rs     # TTL sweeps, history pruning, auto-index drive
@@ -130,15 +135,18 @@ This runs:
   arrays and array updates, find-and-modify, explain, sub-database slots, online
   map resize, backup verification, TTL, vault, and persistence/reopen;
 - property-based tests with `proptest` for encoding and basic query semantics;
-- daemon tests for cache, automatic-index selection, and shutdown drain helpers;
+- auth-crate tests for schema validation, token hashing, certificate lookup, and
+  scope matching;
+- daemon tests for authorization mapping, cache, automatic-index selection, and
+  shutdown drain helpers;
 - Rust client unit/doc tests.
 
-The latest run: **114 core unit tests, 12 daemon tests, 5 property tests, 15
-date tests, 11 numeric tests, 8 BSON scalar-type tests, 5 regex tests, 5 array
-query tests, 5 array-update tests, 5 find-and-modify tests, 4 explain tests, 3
-sub-database slot tests, 5 online-resize tests, 6 backup-verification tests, 9
-TTL tests, 3 vault tests, 1 reopen test, and 2 Rust client unit tests**, all
-passing.
+The latest run: **5 auth-crate tests, 114 core unit tests, 19 daemon tests, 5
+property tests, 15 date tests, 11 numeric tests, 8 BSON scalar-type tests, 5
+regex tests, 5 array query tests, 5 array-update tests, 5 find-and-modify tests,
+4 explain tests, 3 sub-database slot tests, 5 online-resize tests, 6
+backup-verification tests, 9 TTL tests, 3 vault tests, 1 reopen test, and 2 Rust
+client unit tests**, all passing.
 
 ### End-to-end scripts
 
@@ -164,11 +172,12 @@ python3 scripts/db_slots_test.py             # >256 index/search create-drop cyc
 python3 scripts/resize_test.py               # online map growth under concurrent I/O
 python3 scripts/restore_drill.py             # backup -> verify -> restore -> query
 python3 scripts/shutdown_test.py             # SIGTERM drain, JSON logs, durable in-flight write
+python3 scripts/auth_test.py                 # scopes, token/cert auth, reload, audit, IP lockout
 python3 scripts/ttl_test.py                  # TTL sweeps, overrides, history, vault
 python3 scripts/vault_test.py                # optional vault encryption end-to-end
 python3 scripts/vault_regression_test.py     # vault API regressions
 python3 scripts/vault_bench.py --docs 5000   # standard vs vault performance
-bash scripts/mtls_test.sh                    # mTLS, client certs, allow-list revocation
+bash scripts/mtls_test.sh                    # mTLS, cert registry, live revocation
 python3 scripts/search_test.py               # BM25 + fuzzy end-to-end
 python3 scripts/search_variants_test.py      # search/query edge cases
 python3 scripts/compound_test.py             # compound/covering indexes, phrases
@@ -243,6 +252,7 @@ scripts are:
 | `scripts/resize_test.py` | online map growth, concurrent I/O, rejected shrink |
 | `scripts/restore_drill.py` | live backup, manifest verification, restore, query checks |
 | `scripts/shutdown_test.py` | graceful shutdown with an in-flight atomic write, JSON logs, restart durability |
+| `scripts/auth_test.py` | principals, scopes, filtered collections, token revocation, audit, IP lockout |
 | `scripts/ttl_test.py` | TTL defaults, overrides, update semantics, sweeper, vault |
 | `scripts/vault_test.py` | Vault encryption, tenant isolation, and restricted API |
 | `scripts/vault_regression_test.py` | Vault profiles, headers, filters, CRUD, errors, history |
@@ -251,8 +261,8 @@ scripts are:
 | `scripts/large_test.py` | 1M+ document load, indexes, query latency, RAM |
 | `scripts/large_crash_test.sh` | Crash during writes on a large database |
 | `scripts/uvicorn_test.sh` | 12 uvicorn workers against one daemon |
-| `scripts/clients_test.sh` | Rust, Node.js, Go client smoke tests, dates, TTL, vault, shutdown, mTLS |
-| `scripts/mtls_test.sh` | mTLS with generated CA/certs, all clients, revocation |
+| `scripts/clients_test.sh` | Rust, Node.js, Go client smoke tests, dates, TTL, vault, auth, shutdown, mTLS |
+| `scripts/mtls_test.sh` | mTLS with generated CA/certs, all clients, live revocation |
 | `scripts/concurrency_test.py` | Independent writers/readers and unique indexes |
 
 Put benchmark data on the target filesystem. If `/tmp` is tmpfs, write

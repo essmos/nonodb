@@ -387,6 +387,148 @@ impl ApiError {
             message: "request timed out".to_string(),
         }
     }
+
+    pub fn unauthorized() -> Self {
+        Self {
+            code: "unauthorized".to_string(),
+            message: "missing or invalid credentials".to_string(),
+        }
+    }
+
+    pub fn forbidden() -> Self {
+        Self {
+            code: "forbidden".to_string(),
+            message: "principal is not allowed to perform this operation".to_string(),
+        }
+    }
+
+    pub fn rate_limited(retry_after_secs: u64) -> Self {
+        Self {
+            code: "rate_limited".to_string(),
+            message: format!(
+                "too many failed authentication attempts; retry after {retry_after_secs} s"
+            ),
+        }
+    }
+}
+
+impl Request {
+    pub fn op_name(&self) -> &'static str {
+        match self {
+            Self::Insert { .. } => "insert",
+            Self::InsertMany { .. } => "insert_many",
+            Self::Find { .. } => "find",
+            Self::FindOne { .. } => "find_one",
+            Self::Explain { .. } => "explain",
+            Self::Update { .. } => "update",
+            Self::FindAndModify { .. } => "find_and_modify",
+            Self::Delete { .. } => "delete",
+            Self::Count { .. } => "count",
+            Self::Aggregate { .. } => "aggregate",
+            Self::CreateIndex { .. } => "create_index",
+            Self::DropIndex { .. } => "drop_index",
+            Self::ListIndexes { .. } => "list_indexes",
+            Self::CreateTextIndex { .. } => "create_text_index",
+            Self::DropTextIndex { .. } => "drop_text_index",
+            Self::ListTextIndexes { .. } => "list_text_indexes",
+            Self::CreateFuzzyIndex { .. } => "create_fuzzy_index",
+            Self::DropFuzzyIndex { .. } => "drop_fuzzy_index",
+            Self::ListFuzzyIndexes { .. } => "list_fuzzy_indexes",
+            Self::Search { .. } => "search",
+            Self::Fuzzy { .. } => "fuzzy",
+            Self::History { .. } => "history",
+            Self::GetVersion { .. } => "get_version",
+            Self::Batch { .. } => "batch",
+            Self::WriteBatch { .. } => "write_batch",
+            Self::ListCollections => "list_collections",
+            Self::CreateCollection { .. } => "create_collection",
+            Self::SetCollectionTtl { .. } => "set_collection_ttl",
+            Self::GetCollectionTtl { .. } => "get_collection_ttl",
+            Self::MapInfo => "map_info",
+            Self::ResizeMap { .. } => "resize_map",
+        }
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        match self {
+            Self::Find { .. }
+            | Self::FindOne { .. }
+            | Self::Explain { .. }
+            | Self::Count { .. }
+            | Self::Aggregate { .. }
+            | Self::ListIndexes { .. }
+            | Self::ListTextIndexes { .. }
+            | Self::ListFuzzyIndexes { .. }
+            | Self::Search { .. }
+            | Self::Fuzzy { .. }
+            | Self::History { .. }
+            | Self::GetVersion { .. }
+            | Self::ListCollections
+            | Self::GetCollectionTtl { .. } => true,
+            Self::Batch { ops } => ops.iter().all(Self::is_read_only),
+            _ => false,
+        }
+    }
+
+    pub fn collections(&self) -> Vec<&str> {
+        match self {
+            Self::Insert { coll, .. }
+            | Self::InsertMany { coll, .. }
+            | Self::Find { coll, .. }
+            | Self::FindOne { coll, .. }
+            | Self::Explain { coll, .. }
+            | Self::Update { coll, .. }
+            | Self::FindAndModify { coll, .. }
+            | Self::Delete { coll, .. }
+            | Self::Count { coll, .. }
+            | Self::Aggregate { coll, .. }
+            | Self::CreateIndex { coll, .. }
+            | Self::DropIndex { coll, .. }
+            | Self::ListIndexes { coll }
+            | Self::CreateTextIndex { coll, .. }
+            | Self::DropTextIndex { coll, .. }
+            | Self::ListTextIndexes { coll }
+            | Self::CreateFuzzyIndex { coll, .. }
+            | Self::DropFuzzyIndex { coll, .. }
+            | Self::ListFuzzyIndexes { coll }
+            | Self::Search { coll, .. }
+            | Self::Fuzzy { coll, .. }
+            | Self::History { coll, .. }
+            | Self::GetVersion { coll, .. }
+            | Self::CreateCollection { coll, .. }
+            | Self::SetCollectionTtl { coll, .. }
+            | Self::GetCollectionTtl { coll } => vec![coll],
+            Self::Batch { ops } => {
+                let mut out = Vec::new();
+                for op in ops {
+                    out.extend(op.collections());
+                }
+                out
+            }
+            Self::WriteBatch { ops } => ops.iter().flat_map(|op| op.collections()).collect(),
+            Self::ListCollections | Self::MapInfo | Self::ResizeMap { .. } => Vec::new(),
+        }
+    }
+}
+
+impl WriteOp {
+    pub fn op_name(&self) -> &'static str {
+        match self {
+            Self::Insert { .. } => "insert",
+            Self::InsertMany { .. } => "insert_many",
+            Self::Update { .. } => "update",
+            Self::Delete { .. } => "delete",
+        }
+    }
+
+    pub fn collections(&self) -> Vec<&str> {
+        match self {
+            Self::Insert { coll, .. }
+            | Self::InsertMany { coll, .. }
+            | Self::Update { coll, .. }
+            | Self::Delete { coll, .. } => vec![coll],
+        }
+    }
 }
 
 impl WriteReq {

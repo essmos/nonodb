@@ -7,14 +7,20 @@ services:
     container_name: nonodb
     restart: unless-stopped
     environment:
-      NONODB_AUTH_TOKEN: "${NONODB_AUTH_TOKEN:?Set NONODB_AUTH_TOKEN before starting}"
+      NONODB_AUTH_FILE: "/run/secrets/nonodb_auth"
       NONODB_TCP: "0.0.0.0:7878"
       RUST_LOG: "info"
     ports:
       - "127.0.0.1:7878:7878"
+    secrets:
+      - nonodb_auth
     volumes:
       - nonodb-data:/var/lib/nonodb
       - nonodb-run:/run/nonodb
+
+secrets:
+  nonodb_auth:
+    file: "${NONODB_AUTH_FILE:?Set NONODB_AUTH_FILE to an auth.json path}"
 
 volumes:
   nonodb-data:

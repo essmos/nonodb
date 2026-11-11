@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+nonodb-auth = { path = "../nonodb-auth" }
 nonodb-core = { path = "../nonodb-core" }
 axum = { version = "0.7", features = ["tokio", "json"] }
 hyper = { version = "1", features = ["http1", "server"] }

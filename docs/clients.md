@@ -19,7 +19,7 @@ On Linux and macOS the clients use the Unix socket by default. Set
 
 ```bash
 export NONODB_SOCK=/run/nonodb.sock   # default Unix socket
-export NONODB_TOKEN='...'             # required if auth is enabled
+export NONODB_TOKEN='nodb_...'         # required for TCP unless mTLS identifies you
 # or:
 export NONODB_URL=https://127.0.0.1:7878
 export NONODB_TLS_CA=/etc/nonodb/ca.crt
@@ -38,7 +38,9 @@ for local development. See [Mutual TLS](mtls.md) for a complete mTLS setup,
 revocation, and rotation guide.
 
 Windows has no Unix socket listener in the daemon. Use a base URL and TCP there.
-`NONODB_TOKEN` is required because TCP always requires a bearer token.
+TCP always requires an auth registry. Use `NONODB_TOKEN`, a registered client
+certificate, or both (they must resolve to the same principal). The Unix socket
+does not require a token and maps to the local administrative principal.
 
 All clients return a typed error for daemon errors (`ok: false`). Writes are not
 retried automatically; read operations are retried after a transport failure,

@@ -120,6 +120,7 @@ fn run() -> Result<(), String> {
             let res = http_post("/v1/exec", &json!({"op": "map_info"}))?;
             print_result(&res);
         }
+        "auth" => auth_cmd(&args[1..])?,
         "resize" => {
             let raw = args
                 .get(1)
@@ -222,6 +223,7 @@ fn usage() -> Result<(), String> {
          count <coll> [filtr]       liczba dokumentów\n\
          find <coll> [filtr] [--sort pole:asc|desc] [--limit N] [--skip N]\n\
          indexes <coll>             indeksy kolekcji\n\
+         auth <komenda>             zarządzanie auth.json (init/principal/token/cert/check)\n\
          map                        rozmiar mapy LMDB i zajęte bajty\n\
          resize <rozmiar>           powiększ mapę online, np. 4GiB\n\
          backup <data> <out>        kopia LMDB + manifest.json (także przy działającym daemonie)\n\
@@ -231,7 +233,8 @@ fn usage() -> Result<(), String> {
          restore <backup> <data> [--force] [--verify]  przywróć data.mdb (najpierw zatrzymaj daemona)\n\
          \n\
          Zmienne: NONODB_SOCK (Unix, domyślnie /run/nonodb.sock),\n\
-         NONODB_URL (Windows, domyślnie http://127.0.0.1:7878), NONODB_TOKEN"
+         NONODB_URL (Windows, domyślnie http://127.0.0.1:7878), NONODB_TOKEN,\n\
+         NONODB_AUTH_FILE (domyślnie /etc/nonodb/auth.json)"
     );
     Ok(())
 }
@@ -345,6 +348,282 @@ fn http_request(method: &str, path: &str, body: Option<&Value>) -> Result<Value,
         ));
     }
     serde_json::from_slice(&raw[split + 4..]).map_err(|e| e.to_string())
+}
+
+fn auth_path() -> PathBuf {
+    if let Some(path) = std::env::var_os("NONODB_AUTH_FILE") {
+        if !path.is_empty() {
+            return PathBuf::from(path);
+        }
+    }
+    #[cfg(unix)]
+    {
+        PathBuf::from("/etc/nonodb/auth.json")
+    }
+    #[cfg(not(unix))]
+    {
+        PathBuf::from("auth.json")
+    }
+}
+
+fn auth_cmd(args: &[String]) -> Result<(), String> {
+    let path = auth_path();
+    let Some(cmd) = args.first().map(String::as_str) else {
+        return Err("użycie: nonodb-cli auth <init|check|principal|token|cert> ...".into());
+    };
+    match cmd {
+        "init" => {
+            let force = args.iter().any(|a| a == "--force");
+            if path.exists() && !force {
+                return Err(format!(
+                    "{} already exists; pass --force to replace it",
+                    path.display()
+                ));
+            }
+            ensure_auth_dir(&path)?;
+            let mut file = nonodb_auth::AuthFile::empty();
+            file.principals.insert(
+                "admin".into(),
+                nonodb_auth::PrincipalDef {
+                    scopes: vec!["*:*".into()],
+                },
+            );
+            nonodb_auth::save_atomic(&path, &file)?;
+            eprintln!(
+                "created {}; now run: nonodb-cli auth token create admin",
+                path.display()
+            );
+        }
+        "check" => {
+            let registry = nonodb_auth::Registry::load(&path)?;
+            let tokens = registry.file().tokens.len();
+            let certs = registry.file().certificates.len();
+            let principals: Vec<String> = registry
+                .principals()
+                .map(|p| format!("{} [{}]", p.name(), p.scopes().join(",")))
+                .collect();
+            println!("file: {}", path.display());
+            println!("principals: {}", principals.len());
+            for principal in principals {
+                println!("  {principal}");
+            }
+            println!("tokens: {tokens}");
+            println!("certificates: {certs}");
+        }
+        "principal" => auth_principal(&path, &args[1..])?,
+        "token" => auth_token(&path, &args[1..])?,
+        "cert" => auth_cert(&path, &args[1..])?,
+        other => return Err(format!("nieznana komenda auth: {other}")),
+    }
+    Ok(())
+}
+
+fn ensure_auth_dir(path: &Path) -> Result<(), String> {
+    let Some(dir) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) else {
+        return Ok(());
+    };
+    if dir.is_dir() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(dir)
+        .map_err(|e| format!("cannot create auth directory {}: {e}", dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o750))
+            .map_err(|e| format!("cannot set permissions on {}: {e}", dir.display()))?;
+    }
+    Ok(())
+}
+
+fn auth_load(path: &Path) -> Result<nonodb_auth::AuthFile, String> {
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let file: nonodb_auth::AuthFile =
+        serde_json::from_str(&raw).map_err(|e| format!("cannot parse {}: {e}", path.display()))?;
+    file.validate()?;
+    Ok(file)
+}
+
+fn auth_principal(path: &Path, args: &[String]) -> Result<(), String> {
+    let Some(cmd) = args.first().map(String::as_str) else {
+        return Err("użycie: auth principal <list|add|scopes>".into());
+    };
+    let mut file = auth_load(path)?;
+    match cmd {
+        "list" => {
+            for (name, def) in &file.principals {
+                println!("{name}\t{}", def.scopes.join(","));
+            }
+        }
+        "add" => {
+            let name = args
+                .get(1)
+                .ok_or("użycie: auth principal add <nazwa> <scope,scope>")?;
+            let scopes = parse_scopes(
+                args.get(2)
+                    .ok_or("użycie: auth principal add <nazwa> <scope,scope>")?,
+            )?;
+            if file.principals.contains_key(name) {
+                return Err(format!("principal `{name}` already exists"));
+            }
+            file.principals
+                .insert(name.clone(), nonodb_auth::PrincipalDef { scopes });
+            nonodb_auth::save_atomic(path, &file)?;
+            eprintln!("principal `{name}` added to {}", path.display());
+        }
+        "scopes" => {
+            let name = args
+                .get(1)
+                .ok_or("użycie: auth principal scopes <nazwa> <scope,scope>")?;
+            let scopes = parse_scopes(
+                args.get(2)
+                    .ok_or("użycie: auth principal scopes <nazwa> <scope,scope>")?,
+            )?;
+            let def = file
+                .principals
+                .get_mut(name)
+                .ok_or_else(|| format!("unknown principal `{name}`"))?;
+            def.scopes = scopes;
+            nonodb_auth::save_atomic(path, &file)?;
+            eprintln!("scopes for `{name}` updated in {}", path.display());
+        }
+        other => return Err(format!("nieznana komenda auth principal: {other}")),
+    }
+    Ok(())
+}
+
+fn auth_token(path: &Path, args: &[String]) -> Result<(), String> {
+    let Some(cmd) = args.first().map(String::as_str) else {
+        return Err("użycie: auth token <list|create|disable|enable>".into());
+    };
+    let mut file = auth_load(path)?;
+    match cmd {
+        "list" => {
+            for token in &file.tokens {
+                println!(
+                    "{}\t{}\t{}\t{}",
+                    token.kid,
+                    token.principal,
+                    if token.disabled { "disabled" } else { "active" },
+                    &token.sha256[..16]
+                );
+            }
+        }
+        "create" => {
+            let principal = args
+                .get(1)
+                .ok_or("użycie: auth token create <principal> [kid]")?;
+            if !file.principals.contains_key(principal) {
+                return Err(format!("unknown principal `{principal}`"));
+            }
+            let (kid, token, hash) = nonodb_auth::generate_token(args.get(2).map(String::as_str))?;
+            file.tokens.push(nonodb_auth::TokenEntry {
+                kid: kid.clone(),
+                sha256: hash,
+                principal: principal.clone(),
+                disabled: false,
+            });
+            nonodb_auth::save_atomic(path, &file)?;
+            eprintln!(
+                "created token kid={kid} principal={principal} in {}",
+                path.display()
+            );
+            println!("{token}");
+        }
+        "disable" | "enable" => {
+            let kid = args
+                .get(1)
+                .ok_or("użycie: auth token disable|enable <kid>")?;
+            let token = file
+                .tokens
+                .iter_mut()
+                .find(|token| token.kid == *kid)
+                .ok_or_else(|| format!("unknown token kid `{kid}`"))?;
+            token.disabled = cmd == "disable";
+            nonodb_auth::save_atomic(path, &file)?;
+            eprintln!("token `{kid}` {cmd}d in {}", path.display());
+        }
+        other => return Err(format!("nieznana komenda auth token: {other}")),
+    }
+    Ok(())
+}
+
+fn auth_cert(path: &Path, args: &[String]) -> Result<(), String> {
+    let Some(cmd) = args.first().map(String::as_str) else {
+        return Err("użycie: auth cert <list|add|disable|enable>".into());
+    };
+    let mut file = auth_load(path)?;
+    match cmd {
+        "list" => {
+            for cert in &file.certificates {
+                println!(
+                    "{}\t{}\t{}",
+                    cert.sha256,
+                    cert.principal,
+                    if cert.disabled { "disabled" } else { "active" }
+                );
+            }
+        }
+        "add" => {
+            let fingerprint = args
+                .get(1)
+                .ok_or("użycie: auth cert add <sha256> <principal>")?;
+            let principal = args
+                .get(2)
+                .ok_or("użycie: auth cert add <sha256> <principal>")?;
+            if !file.principals.contains_key(principal) {
+                return Err(format!("unknown principal `{principal}`"));
+            }
+            let fingerprint = nonodb_auth::normalize_fingerprint(fingerprint)?;
+            if file
+                .certificates
+                .iter()
+                .any(|cert| cert.sha256 == fingerprint)
+            {
+                return Err(format!("certificate `{fingerprint}` already exists"));
+            }
+            file.certificates.push(nonodb_auth::CertificateEntry {
+                sha256: fingerprint,
+                principal: principal.clone(),
+                disabled: false,
+            });
+            nonodb_auth::save_atomic(path, &file)?;
+            eprintln!("certificate added for `{principal}` in {}", path.display());
+        }
+        "disable" | "enable" => {
+            let fingerprint = args
+                .get(1)
+                .ok_or("użycie: auth cert disable|enable <sha256>")?;
+            let fingerprint = nonodb_auth::normalize_fingerprint(fingerprint)?;
+            let cert = file
+                .certificates
+                .iter_mut()
+                .find(|cert| cert.sha256 == fingerprint)
+                .ok_or_else(|| format!("unknown certificate `{fingerprint}`"))?;
+            cert.disabled = cmd == "disable";
+            nonodb_auth::save_atomic(path, &file)?;
+            eprintln!("certificate `{fingerprint}` {cmd}d in {}", path.display());
+        }
+        other => return Err(format!("nieznana komenda auth cert: {other}")),
+    }
+    Ok(())
+}
+
+fn parse_scopes(raw: &str) -> Result<Vec<String>, String> {
+    let scopes: Vec<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|scope| !scope.is_empty())
+        .map(str::to_owned)
+        .collect();
+    if scopes.is_empty() {
+        return Err("at least one scope is required".into());
+    }
+    for scope in &scopes {
+        nonodb_auth::Principal::new("check", std::slice::from_ref(scope))?;
+    }
+    Ok(scopes)
 }
 
 fn backup(data: &Path, out_dir: &Path) -> Result<(), String> {

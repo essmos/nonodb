@@ -32,19 +32,32 @@ A failed call returns:
 }
 ```
 
-The HTTP status is usually `200` for success and one of `400`, `401`, `413`,
-or `500` for errors, but clients should rely on the JSON envelope.
+The HTTP status is usually `200` for success and one of `400`, `401`, `403`,
+`413`, `429`, or `500` for errors, but clients should rely on the JSON envelope.
 
 ## Authentication
 
-Authentication is disabled by default. If the daemon has
-`NONODB_AUTH_TOKEN` set, every `/v1/exec` and `/metrics` request must include:
+The Unix socket is a trusted local channel and uses the `local` principal with
+full access.
+
+TCP always requires `NONODB_AUTH_FILE`. Every `/v1/exec` and `/metrics` request
+must use either a registered bearer token:
 
 ```http
-Authorization: Bearer <token>
+Authorization: Bearer nodb_<kid>_<secret>
 ```
 
-`GET /healthz` is always public. TCP listener mode requires a token.
+or a registered client certificate (mTLS). If both are supplied, they must
+resolve to the same principal.
+
+`GET /healthz` is public. `/metrics` requires `admin:db`. Authorization is
+deny-by-default and checked per collection; `write_batch` is checked per
+operation. Missing credentials return `401`; insufficient scope returns `403` with error
+code `forbidden`. Repeated failed authentication can lock the peer IP and return
+`429` with error code `rate_limited`.
+
+See [Authentication and authorization](auth.md) for the registry format,
+scopes, CLI management, mTLS mapping, reload behavior, and audit logging.
 
 ## Vault headers
 
@@ -1417,7 +1430,8 @@ Public, no authentication.
 
 ### GET /metrics
 
-Requires the bearer token when authentication is enabled.
+Requires the `admin:db` scope. The Unix socket authenticates as the local
+administrator; TCP requires a bearer token or registered client certificate.
 
 ```json
 {
@@ -1468,7 +1482,9 @@ Requires the bearer token when authentication is enabled.
 | `invalid_numeric` | 400 | Invalid Extended JSON number or decimal arithmetic overflow |
 | `invalid_binary` | 400 | Invalid `$binary`/`$uuid` payload or base64 |
 | `invalid_object_id` | 400 | `$oid` is not 24 hexadecimal characters |
-| `unauthorized` | 401 | Missing/invalid bearer token |
+| `unauthorized` | 401 | Missing/invalid/disabled credential |
+| `forbidden` | 403 | Principal lacks the required scope |
+| `rate_limited` | 429 | Too many failed logins from this IP; wait and retry |
 | `timeout` | 500 | Request exceeded the server timeout |
 | `storage` | 500 | LMDB/storage error |
 | `io` | 500 | Filesystem or I/O error |

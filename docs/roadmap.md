@@ -27,7 +27,7 @@ Implemented:
 - read batches and atomic write batches;
 - document TTL with collection defaults, per-document overrides, and background expiry;
 - BSON-compatible dates with RFC 3339 input, UTC normalization, indexed ranges, and sorting;
-- Unix-socket daemon, optional TCP/TLS and mutual TLS, bearer auth, uid/gid allow-lists;
+- Unix-socket daemon, optional TCP/TLS and mutual TLS, file-based principals and scopes, uid/gid allow-lists;
 - group commit, request limits/timeouts, metrics;
 - snapshots, online backup, SHA-256 manifests, deep verification, restore drills, CLI;
 - optional vault collections with per-tenant whole-document encryption;
@@ -120,19 +120,25 @@ Implemented:
 
 ### Security
 
-- One global bearer token; no users, roles, per-collection permissions, or
-  audit log.
+- No built-in user directory, role hierarchy, or credential expiry policy;
+  principals and per-collection scopes live in a daemon-managed file.
+- Audit logging is append-only JSONL to a local file; there is no remote log
+  shipping or tamper-evident chain.
+- Failed-login lockout is process-local and keyed by the TCP peer IP. It does
+  not trust proxy headers, share state between daemons, or distinguish users
+  behind one NAT address.
 - Vault encryption is daemon-side, not end-to-end. The daemon sees plaintext
   and the raw key in memory.
 - Vault collections have no searchable encryption, blind indexes, range
   queries, or sorting beyond `_id`.
 - Vault key rotation is an operational re-encryption procedure; the daemon does
   not keep a keyring of old keys.
-- Mutual TLS is supported, but revocation is limited to an allow-list of
-  certificate fingerprints; there is no CRL or OCSP integration.
-- Client certificates are not mapped to users, collections, or tenants.
+- Mutual TLS is supported, but revocation uses the auth registry; there is no
+  CRL or OCSP integration.
+- Client certificates map to a principal with collection scopes, not to a
+  separate user or tenant hierarchy.
 - Unix peer checks use uid and primary gid only, not supplementary groups.
-- TCP requires a token but is plaintext unless TLS is configured.
+- TCP requires `NONODB_AUTH_FILE` but is plaintext unless TLS is configured.
 
 ### Storage and operations
 

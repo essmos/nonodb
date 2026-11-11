@@ -2,11 +2,13 @@
 
 `nonodb-cli` is a small administrative client. On Linux and macOS, commands
 that talk to the daemon use the Unix socket (`NONODB_SOCK`, default
-`/run/nonodb.sock`) and the optional bearer token (`NONODB_TOKEN`). On Windows,
-daemon-facing commands use plaintext HTTP over TCP (`NONODB_URL`, default
-`http://127.0.0.1:7878`). The CLI does not support TLS or mTLS; use an official
-client for encrypted connections. File commands (`backup`, `inspect`, `restore`)
-operate directly on an LMDB data directory on every platform.
+`/run/nonodb.sock`) and, for TCP-backed setups, a bearer token
+(`NONODB_TOKEN`). On Windows, daemon-facing commands use plaintext HTTP over TCP
+(`NONODB_URL`, default `http://127.0.0.1:7878`). The CLI does not support TLS or
+mTLS; use an official client for encrypted connections. File commands
+(`backup`, `inspect`, `restore`) operate directly on an LMDB data directory on
+every platform. The `auth` commands edit the auth registry file directly and do
+not contact the daemon.
 
 ```bash
 nonodb-cli <command> [arguments]
@@ -250,6 +252,66 @@ Rules and warnings:
 - `--verify` deep-checks the restored directory after the copy.
 - Start the daemon after the restore and verify counts and indexes.
 
+## auth
+
+Manage the file-based principal registry. The default path is
+`NONODB_AUTH_FILE`, or `/etc/nonodb/auth.json` on Unix (`auth.json` on Windows).
+All commands validate the complete file and write it atomically.
+
+Create a registry with an `admin` principal (`*:*`):
+
+```bash
+nonodb-cli auth init
+```
+
+It does not create a token. Create one next:
+
+```bash
+nonodb-cli auth token create admin
+```
+
+The printed token (`nodb_<kid>_<secret>`) is shown only once. The file stores
+`kid` plus SHA-256 of the secret.
+
+Principals and scopes:
+
+```bash
+nonodb-cli auth principal list
+nonodb-cli auth principal add app read:orders,write:orders
+nonodb-cli auth principal scopes app read:orders,write:orders,read:customers
+```
+
+Tokens:
+
+```bash
+nonodb-cli auth token list
+nonodb-cli auth token create app [kid]
+nonodb-cli auth token disable <kid>
+nonodb-cli auth token enable <kid>
+```
+
+Certificates (SHA-256 of the DER-encoded leaf certificate, lowercase hex):
+
+```bash
+nonodb-cli auth cert list
+nonodb-cli auth cert add <sha256> app
+nonodb-cli auth cert disable <sha256>
+nonodb-cli auth cert enable <sha256>
+```
+
+Validate the file without changing it:
+
+```bash
+nonodb-cli auth check
+```
+
+Use `auth init --force` only when you intentionally want to replace the whole
+registry. The daemon reloads valid changes within about one second; an invalid
+change is rejected and the daemon keeps the last known good configuration.
+
+See [Authentication and authorization](auth.md) for the file schema, scope
+grammar, audit log, and mTLS setup.
+
 ## Environment
 
 | Variable | Default | Used by |
@@ -257,8 +319,10 @@ Rules and warnings:
 | `NONODB_SOCK` | `/run/nonodb.sock` | Daemon-facing commands on Linux/macOS |
 | `NONODB_URL` | `http://127.0.0.1:7878` | Daemon-facing commands on Windows |
 | `NONODB_TOKEN` | — | Bearer token for daemon-facing commands |
+| `NONODB_AUTH_FILE` | `/etc/nonodb/auth.json` (Unix) | Registry used by `auth` commands |
 
-`backup`, `inspect`, and `restore` do not use the socket or token.
+`backup`, `inspect`, `restore`, and `auth` do not use the socket or token.
+`auth` commands edit the local auth file directly.
 
 ## Typical procedures
 

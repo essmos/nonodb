@@ -13,7 +13,7 @@ A nonodb deployment has:
 - optionally `nonodb-cli` for administration and backups.
 
 Linux and macOS support both Unix sockets and TCP. Windows has no Unix socket
-listener; the daemon requires `NONODB_TCP` and `NONODB_AUTH_TOKEN` there. The
+listener; the daemon requires `NONODB_TCP` and `NONODB_AUTH_FILE` there. The
 Windows CLI connects over plaintext HTTP/TCP using `NONODB_URL`.
 
 The daemon must be the only process that opens the LMDB environment for
@@ -52,7 +52,13 @@ All daemon configuration is through environment variables.
 | `NONODB_AUTO_INDEX_TTL` | `604800` | Drop an automatic index after this many seconds without demand |
 | `NONODB_AUTO_INDEX_MIN_AGE` | `3600` | Minimum age before an automatic index can be dropped |
 | `NONODB_AUTO_INDEX_INTERVAL` | `5` | Maintenance tick interval in seconds |
-| `NONODB_AUTH_TOKEN` | — | Enables bearer-token authentication |
+| `NONODB_AUTH_FILE` | — | Token/certificate registry; mandatory for TCP |
+| `NONODB_AUTH_MAX_FAILURES` | `10` | Failed logins before an IP block; `0` disables |
+| `NONODB_AUTH_FAILURE_WINDOW` | `60` | Sliding failure-count window in seconds |
+| `NONODB_AUTH_BLOCK_SECS` | `300` | IP block duration in seconds; `0` disables |
+| `NONODB_AUDIT_LOG` | — | Append-only JSONL audit log path |
+| `NONODB_AUDIT_READS` | `0` | Set to `1` to audit reads too |
+| `NONODB_AUDIT_FSYNC` | `0` | Set to `1` to fsync every audit line |
 | `NONODB_ALLOWED_UIDS` | — | Comma-separated Unix uid allow-list for UDS |
 | `NONODB_ALLOWED_GIDS` | — | Comma-separated Unix gid allow-list for UDS |
 | `NONODB_TCP` | — | TCP listen address, e.g. `127.0.0.1:7878` |
@@ -60,7 +66,6 @@ All daemon configuration is through environment variables.
 | `NONODB_TLS_KEY` | — | PEM private key for TCP TLS |
 | `NONODB_TLS_CLIENT_CA` | — | PEM CA bundle used to verify client certificates (mTLS) |
 | `NONODB_TLS_CLIENT_AUTH` | `required` when client CA is set | `required`, `optional`, or `off` |
-| `NONODB_TLS_CLIENT_ALLOW` | — | Optional client certificate fingerprint allow-list; re-read on every handshake |
 | `NONODB_SNAPSHOT_DIR` | — | Enables periodic LMDB snapshots in this directory |
 | `NONODB_SNAPSHOT_INTERVAL` | `300` | Snapshot interval in seconds |
 | `NONODB_SNAPSHOT_KEEP` | `24` | Number of snapshot files to retain |
@@ -260,15 +265,20 @@ NONODB_SOCK=/run/nonodb/nonodb.sock
 ### Host access over TCP
 
 The simplest way for a host process to reach a containerized daemon is a
-loopback-only TCP listener with a bearer token:
+loopback-only TCP listener with an auth registry mounted read-only:
 
 ```bash
-docker volume create nonodb-data
+export NONODB_AUTH_FILE="$PWD/nonodb-auth.json"
+nonodb-cli auth init
+export TOKEN=$(nonodb-cli auth token create admin)
 
+docker volume create nonodb-data
 docker run -d --name nonodb \
-  -e NONODB_AUTH_TOKEN='replace-with-a-long-random-token' \
+  -e NONODB_AUTH_FILE=/etc/nonodb/auth.json \
   -e NONODB_TCP=0.0.0.0:7878 \
   -p 127.0.0.1:7878:7878 \
+  --group-add "$(id -g)" \
+  -v "$NONODB_AUTH_FILE:/etc/nonodb/auth.json:ro" \
   -v nonodb-data:/var/lib/nonodb \
   nonodb:local
 ```
@@ -287,13 +297,13 @@ from nonodb import NonoDB
 
 db = NonoDB(
     base_url="http://127.0.0.1:7878",
-    token="replace-with-a-long-random-token",
+    token=os.environ["TOKEN"],
 )
 print(db.collection("users").count())
 db.close()
 ```
 
-TCP requires `NONODB_AUTH_TOKEN`. Keep the published port on `127.0.0.1` unless
+TCP requires `NONODB_AUTH_FILE`. Keep the published port on `127.0.0.1` unless
 you add TLS and intentionally expose the service. See
 [TCP and TLS](#tcp-and-tls).
 
@@ -306,7 +316,9 @@ database.
 The repository includes [`deploy/docker-compose.yml`](../deploy/docker-compose.yml):
 
 ```bash
-export NONODB_AUTH_TOKEN='replace-with-a-long-random-token'
+export NONODB_AUTH_FILE="$PWD/nonodb-auth.json"
+nonodb-cli auth init
+nonodb-cli auth token create admin
 docker compose -f deploy/docker-compose.yml up -d --build
 ```
 
@@ -351,11 +363,13 @@ Mount the certificate and key read-only and set both variables:
 
 ```bash
 docker run -d --name nonodb \
-  -e NONODB_AUTH_TOKEN='replace-with-a-long-random-token' \
+  -e NONODB_AUTH_FILE=/etc/nonodb/auth.json \
   -e NONODB_TCP=0.0.0.0:7878 \
   -e NONODB_TLS_CERT=/certs/server.crt \
   -e NONODB_TLS_KEY=/certs/server.key \
   -p 127.0.0.1:7878:7878 \
+  --group-add "$(id -g)" \
+  -v "$NONODB_AUTH_FILE:/etc/nonodb/auth.json:ro" \
   -v /host/certs:/certs:ro \
   -v nonodb-data:/var/lib/nonodb \
   nonodb:local
@@ -399,149 +413,71 @@ permissions with a shared group rather than the allow-list.
 
 ## Authentication
 
-Set `NONODB_AUTH_TOKEN` to require:
+NoNoDB has a file-based principal registry with per-collection scopes. The file
+is outside LMDB, is never part of database backups, and stores only token
+hashes and certificate fingerprints.
 
-```http
-Authorization: Bearer <token>
+```bash
+export NONODB_AUTH_FILE=/etc/nonodb/auth.json
+nonodb-cli auth init
+nonodb-cli auth principal add app read:orders,write:orders
+nonodb-cli auth token create app
 ```
 
-on `/v1/exec` and `/metrics`. `/healthz` remains public.
+- Unix socket: trusted local `local` principal with `*:*`.
+- TCP: `NONODB_AUTH_FILE` is mandatory; bearer token or registered client
+  certificate required.
+- There is no global static token fallback.
+- Deny-by-default; `write` does not imply `read`.
+- `write_batch` is authorized per operation.
+- `/healthz` is public; `/metrics` requires `admin:db`.
+- Disabled tokens/certificates are re-checked on every request.
+- Failed logins can block a TCP peer IP; thresholds and block duration are
+  configurable.
+- The daemon reloads a valid changed auth file within about one second. An
+  invalid reload keeps the last known good configuration.
 
-Notes:
-
-- The token is global; there are no users or roles.
-- Comparison is constant-time.
-- TCP listener mode refuses to start without a token.
-- The Python client reads `NONODB_TOKEN` or accepts `token=`.
-- The CLI reads `NONODB_TOKEN`.
-- When authentication is disabled (no token), any process that can open the
-  socket can read and write all data. Protect the socket with filesystem
-  permissions.
-
-For stronger deployment isolation, use a private Unix socket directory or
-network namespace.
+Full registry format, scope semantics, CLI commands, audit fields, rotation, and
+failure behavior: [Authentication and authorization](auth.md).
 
 ## TCP and TLS
 
-Enable TCP only when you need it:
+Enable TCP only when needed:
 
 ```bash
-export NONODB_AUTH_TOKEN='long-random-token'
+export NONODB_AUTH_FILE=/etc/nonodb/auth.json
 export NONODB_TCP=127.0.0.1:7878
 export NONODB_TLS_CERT=/etc/nonodb/server.crt
 export NONODB_TLS_KEY=/etc/nonodb/server.key
 ```
 
-- TCP always requires `NONODB_AUTH_TOKEN`.
+- TCP refuses to start without `NONODB_AUTH_FILE`.
 - If both certificate and key are provided, TLS is enabled using rustls.
 - If neither is provided, TCP runs in plaintext and logs a warning.
 - Providing only one of cert/key is a startup error.
-- Mutual TLS is optional. Set `NONODB_TLS_CLIENT_CA` to enable client
-  certificate verification; it defaults to `required` mode.
-- `NONODB_TLS_CLIENT_AUTH=optional` accepts both authenticated and anonymous
-  clients. Use `required` for mTLS-only access.
-- Set `NONODB_TLS_CLIENT_ALLOW` to an allow-list file to revoke individual
-  client certificates immediately. The file is re-read for every TLS handshake,
-  so removing a fingerprint blocks new connections without restarting the
-  daemon. Existing keep-alive connections remain until they close.
-- There is still no CRL/OCSP integration. Revocation is handled by the
-  fingerprint allow-list or short-lived certificates.
+- Mutual TLS is optional. Set `NONODB_TLS_CLIENT_CA` to verify client
+  certificates; it defaults to `required` mode.
+- `NONODB_TLS_CLIENT_AUTH=optional` accepts both certificate-authenticated and
+  anonymous clients; anonymous clients still need a bearer token.
+- Client certificates and bearer tokens live in the same `NONODB_AUTH_FILE`;
+  there is no legacy allow-list or global token.
+- There is no CRL/OCSP. Revocation is handled by disabling the registry entry
+  and using short-lived certificates.
 
-Client:
+Client example:
 
 ```python
 from nonodb import NonoDB
 
 db = NonoDB(
     base_url="https://db.internal:7878",
-    token="long-random-token",
-    timeout=30,
+    token="nodb_...",
+    ca_cert="/etc/nonodb/tls/client-ca.crt",
 )
 ```
 
-Certificate verification is enabled by default. Disable it only for local
-testing.
-
-### Mutual TLS
-
-For a complete setup guide, certificate generation, rotation, and
-troubleshooting, see [Mutual TLS](mtls.md).
-
-Server:
-
-```bash
-export NONODB_TLS_CLIENT_CA=/etc/nonodb/client-ca.crt
-export NONODB_TLS_CLIENT_AUTH=required
-export NONODB_TLS_CLIENT_ALLOW=/etc/nonodb/allowed-clients.txt
-```
-
-`allowed-clients.txt` contains one fingerprint per line, optionally followed by
-a label:
-
-```text
-# sha256 fingerprint                         label
-sha256:ab12...  client:acme-app
-sha256:cd34...  client:reporting
-```
-
-The fingerprint is the SHA-256 of the DER-encoded leaf certificate:
-
-```bash
-openssl x509 -in client.crt -outform DER | sha256sum
-```
-
-Python client:
-
-```python
-db = NonoDB(
-    base_url="https://db.internal:7878",
-    token="long-random-token",
-    ca_cert="/etc/nonodb/client-ca.crt",
-    client_cert="/etc/nonodb/client.crt",
-    client_key="/etc/nonodb/client.key",
-)
-```
-
-Rust:
-
-```rust
-let db = Client::builder()
-    .base_url("https://db.internal:7878")
-    .token("long-random-token")
-    .ca_cert("/etc/nonodb/client-ca.crt")
-    .client_cert("/etc/nonodb/client.crt", "/etc/nonodb/client.key")
-    .build()?;
-```
-
-Node.js:
-
-```js
-const db = new NonoDB({
-  baseUrl: 'https://db.internal:7878',
-  token: 'long-random-token',
-  caCert: '/etc/nonodb/client-ca.crt',
-  clientCert: '/etc/nonodb/client.crt',
-  clientKey: '/etc/nonodb/client.key',
-});
-```
-
-Go:
-
-```go
-db := nonodb.New(
-    nonodb.WithBaseURL("https://db.internal:7878"),
-    nonodb.WithToken("long-random-token"),
-    nonodb.WithTLSCA("/etc/nonodb/client-ca.crt"),
-    nonodb.WithTLSClientCert("/etc/nonodb/client.crt", "/etc/nonodb/client.key"),
-)
-```
-
-The same values can be supplied through `NONODB_TLS_CA`,
-`NONODB_TLS_CLIENT_CERT`, and `NONODB_TLS_CLIENT_KEY`.
-
-For local testing, `scripts/mtls_test.sh` generates a throwaway CA, server
-certificate, client certificate, and allow-list, then runs all official clients
-against a daemon with required mTLS.
+For certificate generation, mTLS setup, rotation, and troubleshooting, see
+[Mutual TLS](mtls.md).
 
 ## Snapshots
 
@@ -659,11 +595,13 @@ valid until a restore has been exercised.
 
 ## Monitoring
 
-Metrics are available at `GET /metrics` on the daemon socket (or TCP) and
-require the bearer token when auth is enabled:
+Metrics are available at `GET /metrics` on the daemon socket (or TCP).
+`/metrics` requires the `admin:db` scope; Unix-socket requests run as the local
+administrator. Over TCP, send a token:
 
 ```bash
 curl -s --unix-socket /run/nonodb/nonodb.sock http://localhost/metrics
+curl -s -H "Authorization: Bearer $NONODB_TOKEN" http://127.0.0.1:7878/metrics
 ```
 
 Useful signals:
@@ -690,6 +628,10 @@ Useful signals:
 | `ttl_expired_total` | Documents deleted by TTL |
 | `ttl_sweep_errors_total` | Failed TTL sweeps |
 | `ttl_backlog` | Due entries observed by the last sweep |
+| `auth_failures_total` | Failed authentication attempts |
+| `auth_blocks_total` | IP lockouts started |
+| `auth_blocked_requests_total` | Requests rejected while the IP was blocked |
+| `auth_blocked_clients` | Currently blocked IPs |
 
 The health endpoint is public and cheap:
 
@@ -838,7 +780,9 @@ backups.
 | Symptom | Likely cause | Action |
 |---|---|---|
 | `connection` error in Python | Wrong socket path, daemon down, permissions | Check `NONODB_SOCK`, socket mode/group, daemon logs |
-| `unauthorized` (401) | Token missing or wrong | Set `NONODB_TOKEN`/`token=` to match daemon |
+| `unauthorized` (401) | Token missing/wrong, or credential disabled | Check `NONODB_TOKEN`, `NONODB_AUTH_FILE`, and credential state |
+| `forbidden` (403) | Principal lacks the required scope | Grant `read:`, `write:`, `admin:<coll>`, or `admin:db` |
+| `rate_limited` (429) | Too many failed logins from this IP | Wait for `NONODB_AUTH_BLOCK_SECS`; tune lockout thresholds |
 | `timeout` | Long index build or scan exceeds 30 s | Raise `NONODB_REQUEST_TIMEOUT` and client timeout |
 | `document_too_large` (413) | Document > 1 MiB or request > 4 MiB | Split document/import; batch inserts |
 | `duplicate_key` | Duplicate `_id` or unique-index conflict | Use a new id or update the existing document |
@@ -849,18 +793,20 @@ backups.
 | High RSS after a scan | Mapped pages touched | Expected; restart lowers RSS, OS cache remains |
 | Disk usage does not fall after delete | LMDB high-water mark | Compact via `nonodb-cli backup`, restore |
 | TLS handshake fails | Certificate/key mismatch or verification | Check PEM files, hostname, `verify` setting |
-| mTLS client rejected | Missing client cert, untrusted chain, or fingerprint not allow-listed | Check `NONODB_TLS_CLIENT_CA`, client cert/key, and `NONODB_TLS_CLIENT_ALLOW` |
-| Revoked client still connects | Existing keep-alive connection | Close the connection or restart the client; new handshakes are blocked |
-| TCP listener refuses to start | No auth token | Set `NONODB_AUTH_TOKEN` |
+| mTLS client rejected | Missing client cert, untrusted chain, or fingerprint not registered | Check `NONODB_TLS_CLIENT_CA`, client cert/key, and `NONODB_AUTH_FILE` |
+| Revoked client still gets data | Auth file reload has not completed | Wait about one second and retry; check auth reload logs |
+| TCP listener refuses to start | No auth registry | Set `NONODB_AUTH_FILE` and create a principal/token |
 
 ## Security checklist
 
 - Run the daemon as a dedicated unprivileged user.
 - Keep the data directory private (`0750` or stricter).
 - Restrict the socket directory and use a shared group for workers.
-- Use `NONODB_AUTH_TOKEN` even on Unix sockets if multiple tenants share the
-  host.
-- Use TCP only with a token and TLS.
+- Protect `NONODB_AUTH_FILE` (`0640`, not in the repository or database backup).
+- Use per-principal scopes for applications; reserve `*:*` for administration.
+- Configure failed-login lockout and monitor `auth_failures_total` and
+  `auth_blocked_clients`.
+- Use TCP only with the auth registry and TLS.
 - Do not disable certificate verification in production.
 - Back up regularly and test restores. Keep vault encryption keys in a separate
   secret manager, not next to the LMDB backup.

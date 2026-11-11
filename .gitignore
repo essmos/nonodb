@@ -7,5 +7,10 @@ __pycache__/
 *.sock
 *.mdb
 .env
+auth.json
+auth.json.lock
+nonodb-auth.json
+nonodb-auth.json.lock
+audit.jsonl
 
 node_modules/

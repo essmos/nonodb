@@ -108,6 +108,9 @@ python3 scripts/vault_regression_test.py
 echo "== Vault benchmark smoke"
 python3 scripts/vault_bench.py --docs 1000 --iters 100 --payload 64
 
+echo "== Authentication and authorization"
+NONODB_DAEMON="$BIN" python3 scripts/auth_test.py
+
 echo "== mTLS"
 NONODB_BIN="$BIN" bash scripts/mtls_test.sh
 
