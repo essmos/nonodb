@@ -275,6 +275,124 @@ The Go client methods take a `context.Context`; use it for cancellation and
 deadlines. `Exec` is available for operations not covered by a convenience
 method.
 
+## Vector search
+
+All four clients expose exact vector search. Embeddings are computed outside
+NonoDB, by the application or a local embedding service. The indexed field must
+be a JSON array of exactly `dims` finite numbers; one vector per document per
+indexed field is supported. Vectors are maintained in the same transaction as
+document writes.
+
+Python:
+
+```python
+articles.create_vector_index("embedding", 384, metric="cosine")
+articles.insert({"title": "Async Rust", "embedding": embed("Async Rust")})
+
+hits = articles.vector_search(
+    "embedding",
+    embed("rust async"),
+    filter={"published": True},
+    skip=0,
+    limit=10,
+)
+for hit in hits:
+    print(hit["_distance"], hit["title"])
+
+print(articles.list_vector_indexes())
+articles.drop_vector_index("embedding")
+```
+
+Rust:
+
+```rust
+use serde_json::json;
+
+let embedding = vec![0.12_f32, -0.03, 0.44];
+articles.create_vector_index("embedding", 3, "cosine")?;
+articles.insert(&json!({
+    "title": "Async Rust",
+    "embedding": embedding.clone(),
+}))?;
+
+let hits = articles.vector_search(
+    "embedding",
+    &embedding,
+    Some(&json!({"published": true})),
+    0,   // skip
+    10,  // limit
+)?;
+for hit in &hits {
+    println!("{} {}", hit["_distance"], hit["title"]);
+}
+
+let indexes = articles.list_vector_indexes()?;
+articles.drop_vector_index("embedding")?;
+```
+
+Node.js:
+
+```js
+const queryVector = [0.12, -0.03, 0.44];
+
+await articles.createVectorIndex('embedding', 3, 'cosine');
+await articles.insert({ title: 'Async Rust', embedding: queryVector });
+
+const hits = await articles.vectorSearch('embedding', queryVector, {
+  filter: { published: true },
+  skip: 0,
+  limit: 10,
+});
+for (const hit of hits) {
+  console.log(hit._distance, hit.title);
+}
+
+const indexes = await articles.listVectorIndexes();
+await articles.dropVectorIndex('embedding');
+```
+
+Go:
+
+```go
+queryVector := []float32{0.12, -0.03, 0.44}
+
+_, err := articles.CreateVectorIndex(ctx, "embedding", 3, "cosine")
+_, err = articles.Insert(ctx, map[string]any{
+    "title": "Async Rust", "embedding": queryVector,
+})
+
+hits, err := articles.VectorSearch(ctx, "embedding", queryVector, nonodb.VectorOptions{
+    Filter: map[string]any{"published": true},
+    Skip:   0,
+    Limit:  10,
+})
+for _, hit := range hits {
+    fmt.Println(hit["_distance"], hit["title"])
+}
+
+indexes, err := articles.ListVectorIndexes(ctx)
+_, err = articles.DropVectorIndex(ctx, "embedding")
+```
+
+Behavior common to all clients:
+
+- `metric` is `cosine` (default), `dot`, or `l2`.
+- `_distance` is lower-is-better: `1 - cosine_similarity`, negative dot
+  product, or squared Euclidean distance.
+- Search is exact and scans the whole vector index, so unfiltered cost is
+  `O(N × dims)`. There is no ANN/recall loss.
+- Missing, malformed, or wrong-length vectors are skipped; writes still succeed.
+- Creating an index backfills existing documents synchronously. Auto-index does
+  not create vector indexes.
+- Exact `_id` and indexed filters use a document-first path. A highly selective
+  filter on an unindexed field can approach a full collection scan.
+- Use the same embedding model, dimensions, and metric for stored vectors and
+  queries. Changing the model requires re-embedding documents and rebuilding the
+  index.
+
+See [HTTP API: vector indexes](api.md#vector-indexes) and
+[HTTP API: vector_search](api.md#vector_search) for the raw protocol.
+
 ## Vault collections
 
 Vault collections require the three encryption headers on every request. Each

@@ -67,6 +67,35 @@ let rows = users.aggregate(&[
 ])?;
 ```
 
+## Vector search
+
+```rust
+use serde_json::json;
+
+let articles = db.collection("articles");
+let embedding = vec![0.12_f32, -0.03, 0.44];
+
+articles.create_vector_index("embedding", 3, "cosine")?;
+articles.insert(&json!({
+    "title": "Async Rust",
+    "embedding": embedding.clone(),
+}))?;
+
+let hits = articles.vector_search(
+    "embedding",
+    &embedding,
+    Some(&json!({"published": true})),
+    0,   // skip
+    10,  // limit
+)?;
+let indexes = articles.list_vector_indexes()?;
+articles.drop_vector_index("embedding")?;
+```
+
+`_distance` is lower-is-better. Search is exact and scans the index. Missing or
+wrong-length vectors are skipped. See [Vector search](../docs/clients.md#vector-search)
+for common semantics and the other clients.
+
 ## Vault collections
 
 ```rust

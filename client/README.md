@@ -10,6 +10,13 @@ examples. All clients accept `NONODB_TLS_CA`, `NONODB_TLS_CLIENT_CERT`, and
 `NONODB_TLS_CLIENT_KEY` when connecting to a daemon that requires client
 certificates.
 
+## Vector search
+
+All clients support exact vector search with `cosine`, `dot`, and `l2` metrics.
+Use the client-specific `create_vector_index` / `vector_search` helpers; see
+[Vector search](../docs/clients.md#vector-search) for examples in Python, Rust,
+Node.js, and Go.
+
 ## Document history
 
 When the daemon is started with `NONODB_HISTORY=1`, all clients expose

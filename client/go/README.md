@@ -62,6 +62,34 @@ rows, err := users.Aggregate(ctx, []any{
 })
 ```
 
+## Vector search
+
+```go
+articles := db.Collection("articles")
+queryVector := []float32{0.12, -0.03, 0.44}
+
+_, err := articles.CreateVectorIndex(ctx, "embedding", 3, "cosine")
+_, err = articles.Insert(ctx, map[string]any{
+    "title": "Async Rust", "embedding": queryVector,
+})
+
+hits, err := articles.VectorSearch(ctx, "embedding", queryVector, nonodb.VectorOptions{
+    Filter: map[string]any{"published": true},
+    Skip:   0,
+    Limit:  10,
+})
+for _, hit := range hits {
+    fmt.Println(hit["_distance"], hit["title"])
+}
+
+indexes, err := articles.ListVectorIndexes(ctx)
+_, err = articles.DropVectorIndex(ctx, "embedding")
+```
+
+`_distance` is lower-is-better. Search is exact and scans the index. Missing or
+wrong-length vectors are skipped. See [Vector search](../../docs/clients.md#vector-search)
+for common semantics and the other clients.
+
 ## Vault collections
 
 ```go

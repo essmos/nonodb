@@ -70,6 +70,28 @@ const rows = await users.aggregate([
 ]);
 ```
 
+## Vector search
+
+```js
+const articles = db.collection('articles');
+const queryVector = [0.12, -0.03, 0.44];
+
+await articles.createVectorIndex('embedding', 3, 'cosine');
+await articles.insert({ title: 'Async Rust', embedding: queryVector });
+
+const hits = await articles.vectorSearch('embedding', queryVector, {
+  filter: { published: true },
+  skip: 0,
+  limit: 10,
+});
+const indexes = await articles.listVectorIndexes();
+await articles.dropVectorIndex('embedding');
+```
+
+`_distance` is lower-is-better. Search is exact and scans the index. Missing or
+wrong-length vectors are skipped. See [Vector search](../../docs/clients.md#vector-search)
+for common semantics and the other clients.
+
 ## Vault collections
 
 ```js
