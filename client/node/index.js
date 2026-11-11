@@ -18,6 +18,8 @@ const READ_OPS = new Set([
   'search',
   'fuzzy',
   'vector_search',
+  'sql',
+  'explain_sql',
   'batch',
 ]);
 
@@ -244,6 +246,20 @@ class NonoDB {
   }
 
   /** Execute read-only operations in one LMDB transaction. */
+  /**
+   * Run a read-only SQL SELECT and return its rows.
+   * Parameters are positional and may use `?` or `$1` placeholders.
+   */
+  async sql(query, params = []) {
+    const result = await this.exec({ op: 'sql', query, params });
+    return result.results ?? [];
+  }
+
+  /** Explain a read-only SQL SELECT. */
+  async explainSql(query, params = []) {
+    return this.exec({ op: 'explain_sql', query, params });
+  }
+
   async batch(ops) {
     const result = await this.exec({ op: 'batch', ops });
     return result?.results ?? [];

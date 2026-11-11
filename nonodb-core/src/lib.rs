@@ -23,6 +23,7 @@ pub mod progress;
 pub mod query;
 mod regex;
 pub mod search;
+pub mod sql;
 pub mod store;
 pub mod ttl;
 pub mod vault;

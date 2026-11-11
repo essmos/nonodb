@@ -1316,7 +1316,7 @@ async fn watch_stream(
     }
     let audit_needed = state.audit.as_ref().is_some_and(|audit| audit.log_reads());
     let audit_op = req.op_name();
-    let audit_collections: Vec<String> = req.collections().into_iter().map(str::to_owned).collect();
+    let audit_collections: Vec<String> = req.collections();
     let vault_auth = match vault_auth(&headers) {
         Ok(auth) => auth,
         Err(err) => {
@@ -1522,7 +1522,7 @@ async fn exec(
         .as_ref()
         .is_some_and(|audit| audit.log_reads() || !req.is_read_only());
     let audit_op = req.op_name();
-    let audit_collections: Vec<String> = req.collections().into_iter().map(str::to_owned).collect();
+    let audit_collections: Vec<String> = req.collections();
     let vault_auth = match vault_auth(&headers) {
         Ok(auth) => auth,
         Err(err) => {
@@ -1875,6 +1875,32 @@ async fn exec(
                 let c = read_collection(&store, &coll, auth.as_ref())?;
                 reject_vault_read(&c, auth.as_ref(), "aggregation")?;
                 Ok::<Value, ApiError>(json!({ "results": c.aggregate(&pipeline)? }))
+            });
+            read_result(joined).await
+        }
+
+        Request::Sql { query, params } => {
+            let store = state.store.clone();
+            let auth = vault_auth.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                let coll = nonodb_core::sql::collection_name(&query)?;
+                let c = read_collection(&store, &coll, auth.as_ref())?;
+                reject_vault_read(&c, auth.as_ref(), "SQL")?;
+                Ok::<Value, ApiError>(
+                    json!({ "results": nonodb_core::sql::execute(&c, &query, &params)? }),
+                )
+            });
+            read_result(joined).await
+        }
+
+        Request::ExplainSql { query, params } => {
+            let store = state.store.clone();
+            let auth = vault_auth.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                let coll = nonodb_core::sql::collection_name(&query)?;
+                let c = read_collection(&store, &coll, auth.as_ref())?;
+                reject_vault_read(&c, auth.as_ref(), "SQL explain")?;
+                Ok::<Value, ApiError>(nonodb_core::sql::explain(&c, &query, &params)?)
             });
             read_result(joined).await
         }
@@ -2369,7 +2395,7 @@ fn audit_denied(
     started: std::time::Instant,
     auth_audit: Option<audit::AuthAudit>,
 ) {
-    let collections: Vec<String> = req.collections().into_iter().map(str::to_owned).collect();
+    let collections: Vec<String> = req.collections();
     let refs: Vec<&str> = collections.iter().map(String::as_str).collect();
     if let Some(audit) = &state.audit {
         audit.record(
@@ -2651,6 +2677,8 @@ fn cacheable(req: &Request) -> bool {
             | Request::Explain { .. }
             | Request::Count { .. }
             | Request::Aggregate { .. }
+            | Request::Sql { .. }
+            | Request::ExplainSql { .. }
             | Request::Search { .. }
             | Request::Fuzzy { .. }
             | Request::ListIndexes { .. }
@@ -2853,6 +2881,28 @@ fn execute_read(
             }
             Ok(json!({ "results": c.aggregate_in(rtxn, &pipeline)? }))
         }
+        Request::Sql { query, params } => {
+            let coll = nonodb_core::sql::collection_name(&query)?;
+            let Some(c) = store.collection_at(rtxn, &coll)? else {
+                return Ok(json!([]));
+            };
+            reject_vault_read(&c, None, "SQL in a read batch")?;
+            Ok(json!({ "results": nonodb_core::sql::execute_in(&c, rtxn, &query, &params)? }))
+        }
+        Request::ExplainSql { query, params } => {
+            let coll = nonodb_core::sql::collection_name(&query)?;
+            let Some(c) = store.collection_at(rtxn, &coll)? else {
+                return Ok(json!({
+                    "collection": coll,
+                    "access_path": "missing_collection",
+                    "candidates": 0,
+                    "actual_matched": 0,
+                    "actual_returned": 0,
+                }));
+            };
+            reject_vault_read(&c, None, "SQL explain in a read batch")?;
+            Ok(nonodb_core::sql::explain_in(&c, rtxn, &query, &params)?)
+        }
         Request::ListIndexes { coll } => {
             let Some(c) = store.collection_at(rtxn, &coll)? else {
                 return Ok(json!({ "indexes": [] }));
@@ -3039,6 +3089,7 @@ fn error_status(err: &ApiError) -> StatusCode {
         "duplicate_key"
         | "invalid_id"
         | "invalid_query"
+        | "invalid_sql"
         | "invalid_json"
         | "invalid_collection"
         | "vault_key_required"

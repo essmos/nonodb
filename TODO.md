@@ -27,6 +27,11 @@ limitations are documented in [docs/roadmap.md](docs/roadmap.md).
 - [x] Ordered point lookups (`lookup`/`lookup_one`) by `_id` or a unique
       single-field/compound index, with covering projections, `_id` exclusion,
       key deduplication, response-size cap, and batch-client helpers
+- [x] Read-only SQL `SELECT` over one collection: `DISTINCT`, `WHERE`,
+      `GROUP BY`, `HAVING`, aggregates, `CASE`, scalar functions, arithmetic,
+      `ORDER BY`, `LIMIT`/`OFFSET`, positional parameters, `explain_sql`,
+      fast `find` path for simple selects, all official clients,
+      daemon/auth/cache/batch integration, and docs
 - [x] External background jobs/schedulers through a normal `_jobs` collection:
       atomic claims, leases, retries, idempotent enqueue, Python worker helper,
       systemd unit, and docs; no daemon plugins or stored procedures
@@ -95,6 +100,9 @@ limitations are documented in [docs/roadmap.md](docs/roadmap.md).
 
 ### P1 — query and update compatibility
 
+- [ ] SQL extensions: joins/subqueries, scalar expressions in grouped
+      `SELECT`, `UNION`/CTE, `INSERT`/`UPDATE`/`DELETE` (if ever needed), and
+      SQL benchmark coverage
 - [ ] `$rename`, `$min`, `$max`, `$mul`, `$currentDate`, `$bit`, `$pop`
 - [ ] Timezone-aware date aggregation expressions (`$dateToString`,
       `$dateTrunc`, `$dateAdd`)

@@ -19,6 +19,9 @@ pub enum Error {
     #[error("invalid query: {0}")]
     Query(String),
 
+    #[error("invalid SQL: {0}")]
+    Sql(String),
+
     #[error("invalid collection name: {0:?}")]
     InvalidCollectionName(String),
 

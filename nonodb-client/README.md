@@ -67,6 +67,18 @@ let rows = users.aggregate(&[
 ])?;
 ```
 
+## SQL
+
+```rust
+let rows = client.sql(
+    "SELECT name, age FROM users WHERE age >= $1 ORDER BY age DESC LIMIT 10",
+    &[json!(18)],
+)?;
+```
+
+SQL is read-only and covers one collection. `client.explain_sql(query, params)`
+returns the selected plan. See [SQL queries](../docs/sql.md).
+
 ## Batch lookups
 
 ```rust

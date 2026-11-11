@@ -90,6 +90,9 @@ python3 scripts/find_and_modify_test.py
 echo "== Explain"
 python3 scripts/explain_test.py
 
+echo "== SQL"
+python3 scripts/sql_test.py
+
 echo "== Sub-database slots"
 python3 scripts/db_slots_test.py
 

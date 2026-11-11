@@ -24,6 +24,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ])?;
     println!("aggregate: {}", serde_json::to_string(&rows)?);
 
+    let sql_rows = db.sql(
+        "SELECT COUNT(*) AS n FROM users WHERE age >= $1",
+        &[json!(18)],
+    )?;
+    println!("sql: {}", serde_json::to_string(&sql_rows)?);
+    let sql_plan = db.explain_sql("SELECT * FROM users WHERE age >= $1", &[json!(18)])?;
+    println!("sql plan: {}", sql_plan["access_path"]);
+
     if matches!(
         std::env::var("NONODB_HISTORY")
             .unwrap_or_default()

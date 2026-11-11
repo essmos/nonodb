@@ -27,6 +27,11 @@ async function main() {
   assert.equal(grouped.length, 1);
   assert.equal(grouped[0].n, 2);
 
+  const sqlRows = await db.sql(`SELECT COUNT(*) AS n FROM ${name}`);
+  assert.equal(sqlRows[0].n, 3);
+  const sqlPlan = await db.explainSql(`SELECT * FROM ${name} WHERE age >= $1`, [40]);
+  assert.equal(typeof sqlPlan.access_path, 'string');
+
   const adults = await users.find(
     { age: { $gte: 40 } },
     { sort: [['age', -1]], limit: 2 },

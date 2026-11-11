@@ -144,12 +144,13 @@ This runs:
   shutdown drain helpers;
 - Rust client unit/doc tests.
 
-The latest run: **5 auth-crate tests, 114 core unit tests, 19 daemon tests, 5
+The latest run: **5 auth-crate tests, 135 core unit tests, 23 daemon tests, 5
 property tests, 15 date tests, 11 numeric tests, 8 BSON scalar-type tests, 5
 regex tests, 5 array query tests, 5 array-update tests, 5 find-and-modify tests,
 4 explain tests, 3 sub-database slot tests, 5 online-resize tests, 6
-backup-verification tests, 9 TTL tests, 3 vault tests, 1 reopen test, and 2 Rust
-client unit tests**, all passing.
+backup-verification tests, 9 TTL tests, 3 vault tests, 14 SQL tests, 1 reopen
+test, and 2 Rust client unit tests**, all passing (284 total including
+doc-tests).
 
 ### End-to-end scripts
 
@@ -172,6 +173,7 @@ python3 scripts/arrays_test.py               # $all, $size, $elemMatch, validati
 python3 scripts/array_updates_test.py        # positional/array-filter updates
 python3 scripts/find_and_modify_test.py      # atomic select-update-return
 python3 scripts/explain_test.py              # plans, bounds, actual counts
+python3 scripts/sql_test.py                  # SQL distinct/having/CASE/functions/explain/params/batch (spawns a daemon)
 PYTHONPATH=client:workers/python python3 workers/python/examples/jobs_smoke.py  # jobs
 PYTHONPATH=client:workers/python python3 workers/python/examples/events_smoke.py  # events
 python3 workers/python/tests/events_integration.py  # events against a spawned daemon
@@ -247,6 +249,7 @@ scripts are:
 | `scripts/bench.py` | Mixed CRUD throughput/latency with multiple processes |
 | `scripts/opt_bench.py` | Count, early exit, index update, batch comparison |
 | `scripts/aggregate_bench.py` | Per-stage aggregation timings and report pipelines |
+| `scripts/sql_test.py` | End-to-end SQL against a disposable daemon |
 | `scripts/dates_test.py` | Date offsets, ranges, indexes, sorting, unique constraints |
 | `scripts/numerics_test.py` | Large integers, Decimal128, special doubles, arithmetic, indexes |
 | `scripts/bson_types_test.py` | `$numberInt`/`$numberLong`, `$type`, binary/UUID, ObjectId |
@@ -367,12 +370,12 @@ The tag is `vX.Y.Z`; the annotated tag subject and GitHub Release title are
 
 ```bash
 # final release
-git tag -a v0.12.0 -m "v0.12.0 - Continuous outbox streams"
-git push origin v0.12.0
+git tag -a v0.13.0 -m "v0.13.0 - Read-only SQL reporting"
+git push origin v0.13.0
 
 # pre-release (the hyphen makes it a GitHub pre-release automatically)
-git tag -a v0.12.0-beta.1 -m "v0.12.0-beta.1 - Continuous outbox streams"
-git push origin v0.12.0-beta.1
+git tag -a v0.13.0-beta.1 -m "v0.13.0-beta.1 - Read-only SQL reporting"
+git push origin v0.13.0-beta.1
 ```
 
 The release workflow reads the tag annotation and publishes the release with
@@ -394,7 +397,7 @@ notes. `--cleanup=verbatim` prevents Git from stripping lines that start with
 The workflow runs the tests, builds release binaries for Linux x86_64, macOS
 Intel, macOS Apple Silicon, and Windows x86_64, attaches checksums, and
 publishes the GitHub Release. Linux and macOS use `.tar.gz`; Windows uses
-`.zip`. Tags such as `v0.12.0-beta.1` and `v0.12.0-rc.1` are marked as
+`.zip`. Tags such as `v0.13.0-beta.1` and `v0.13.0-rc.1` are marked as
 pre-releases automatically.
 
 ### Manual release
@@ -403,7 +406,7 @@ Use **Actions → Release → Run workflow** and provide:
 
 | Input | Meaning |
 |---|---|
-| `tag` | Tag to publish, e.g. `v0.12.0` or `v0.12.0-rc.1` |
+| `tag` | Tag to publish, e.g. `v0.13.0` or `v0.13.0-rc.1` |
 | `summary` | Short title text after the version: `vX.Y.Z - <summary>` |
 | `prerelease` | Mark the release as a pre-release |
 | `draft` | Create it as a draft for review |

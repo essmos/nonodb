@@ -410,7 +410,7 @@ func isReadOp(payload map[string]any) bool {
 	switch op {
 	case "find", "find_one", "lookup", "watch", "count", "list_indexes", "list_collections",
 		"list_text_indexes", "list_fuzzy_indexes", "list_vector_indexes",
-		"search", "fuzzy", "vector_search", "history", "get_version", "batch":
+		"search", "fuzzy", "vector_search", "history", "get_version", "sql", "explain_sql", "batch":
 		return true
 	default:
 		return false
@@ -515,6 +515,45 @@ func (c *Client) Collections(ctx context.Context) ([]string, error) {
 		return nil, err
 	}
 	return result.Collections, nil
+}
+
+// SQL runs a read-only SQL SELECT and returns its rows.
+// Parameters are positional and may use ? or $1 placeholders.
+func (c *Client) SQL(ctx context.Context, query string, params ...any) ([]map[string]any, error) {
+	if params == nil {
+		params = []any{}
+	}
+	raw, err := c.execRaw(ctx, map[string]any{
+		"op": "sql", "query": query, "params": params,
+	})
+	if err != nil {
+		return nil, err
+	}
+	var result struct {
+		Results []map[string]any `json:"results"`
+	}
+	if err := decodeInto(raw, &result); err != nil {
+		return nil, err
+	}
+	return result.Results, nil
+}
+
+// ExplainSQL returns the plan selected for a read-only SQL SELECT.
+func (c *Client) ExplainSQL(ctx context.Context, query string, params ...any) (map[string]any, error) {
+	if params == nil {
+		params = []any{}
+	}
+	raw, err := c.execRaw(ctx, map[string]any{
+		"op": "explain_sql", "query": query, "params": params,
+	})
+	if err != nil {
+		return nil, err
+	}
+	var result map[string]any
+	if err := decodeInto(raw, &result); err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 // Batch executes read-only operations in one LMDB transaction.

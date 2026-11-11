@@ -107,6 +107,8 @@ client timeout with `NONODB_TIMEOUT` or the `timeout=` argument.
 | [`delete`](#delete) | Delete documents |
 | [`count`](#count) | Count matching documents |
 | [`aggregate`](#aggregation) | Read-only aggregation pipeline |
+| [`sql`](#sql) | Read-only SQL `SELECT` over one collection |
+| [`explain_sql`](#explain_sql) | Show the plan for a SQL `SELECT` |
 | [`create_index`](#create_index) | Create a secondary index |
 | [`create_indexes`](#create_indexes) | Create several indexes in one scan |
 | [`drop_index`](#drop_index) | Drop a secondary index |
@@ -839,6 +841,70 @@ preserves explicit multi-field order:
   practical memory; use `$limit` and `$project` for large collections.
 - Not supported: `$lookup`, `$graphLookup`, `$facet`, `$bucket`,
   `$bucketAuto`, `$merge`, `$out`, window functions, and arbitrary JavaScript.
+
+## sql
+
+Runs a read-only SQL `SELECT` over one collection. The collection name is
+parsed from the statement for authorization.
+
+```json
+{
+  "op": "sql",
+  "query": "SELECT team, COUNT(*) AS n, SUM(score) AS total FROM users WHERE age >= $1 GROUP BY team ORDER BY total DESC LIMIT 10",
+  "params": [18]
+}
+```
+
+Response:
+
+```json
+{
+  "ok": true,
+  "result": {
+    "results": [
+      {"team": "core", "n": 3, "total": 60},
+      {"team": "kernel", "n": 2, "total": 30}
+    ]
+  }
+}
+```
+
+Supported clauses and limitations are documented in [SQL queries](sql.md):
+
+- `SELECT [DISTINCT]`, `*`, aliases, `CASE`, scalar functions, and arithmetic;
+- `WHERE` with comparisons, `AND`/`OR`/`NOT`, parentheses, `IN`, `BETWEEN`,
+  `IS NULL`, and `LIKE`;
+- `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, and `OFFSET`;
+- aggregate functions `COUNT`, `SUM`, `AVG`, `MIN`, and `MAX`;
+- positional parameters with `?` or `$1`;
+- one collection, no joins, subqueries, or writes.
+
+Simple field-only selects use the normal `find` path. Grouping, `DISTINCT`,
+computed expressions, and `HAVING` use the aggregation pipeline. SQL is
+read-only and can be used in a read `batch`. Parse and planning errors return
+`invalid_sql` (HTTP 400). A missing collection returns an empty `results`
+array.
+
+## explain_sql
+
+Returns the selected plan for a SQL `SELECT`.
+
+```json
+{
+  "op": "explain_sql",
+  "query": "SELECT team, COUNT(*) AS n FROM users GROUP BY team HAVING COUNT(*) > 1",
+  "params": []
+}
+```
+
+For simple field-only selects this is the normal `find` explain object, including
+`access_path`, `index`, `bounds`, `candidates`, `actual_matched`, and
+`actual_returned`. For grouped, distinct, or computed queries it returns
+`access_path` (`aggregation_group`, `aggregation_distinct`, or `aggregation`)
+and the generated `pipeline`.
+
+`explain_sql` is read-only, available in read `batch`, cacheable, and requires
+`read:<collection>`.
 
 ## Cursors
 
@@ -1902,6 +1968,7 @@ administrator; TCP requires a bearer token or registered client certificate.
 | Code | HTTP | Meaning |
 |---|---|---|
 | `invalid_query` | 400 | Invalid filter/update/index/query shape, write in a read batch, unsupported operator |
+| `invalid_sql` | 400 | SQL parse/planning error or unsupported SQL clause |
 | `invalid_json` | 400 | Malformed JSON document or value |
 | `invalid_collection` | 400 | Invalid collection name |
 | `invalid_id` | 400 | `_id` is not a string |

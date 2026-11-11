@@ -5,7 +5,7 @@ is deliberately out of scope, and which gaps are candidates for future work.
 
 ## Current status
 
-The project is at `0.12.0`. It is suitable for local and single-host
+The project is at `0.13.0`. It is suitable for local and single-host
 applications that need a small, durable, queryable JSON store and can accept a
 single-writer model.
 
@@ -13,6 +13,10 @@ Implemented:
 
 - JSON documents, collections, automatic UUID `_id`;
 - MongoDB-style filters, projections, sorts, `skip`/`limit`;
+- read-only SQL `SELECT` with `DISTINCT`, `WHERE`, `GROUP BY`, `HAVING`,
+  aggregates, `CASE`, scalar functions, `ORDER BY`, `LIMIT`/`OFFSET`,
+  positional parameters, and `explain_sql`; simple field-only queries use the
+  normal indexed `find` path;
 - CRUD, multi-update, replacement updates, upserts;
 - `$set`, `$unset`, `$inc`, `$push`, `$pull`, `$pullAll`, `$addToSet`,
   `$setOnInsert`, `$each`, `$position`, `$slice`, `$sort`;
@@ -74,6 +78,9 @@ Implemented:
   `$elemMatch`; `$size` is not index-backed.
 - No joins. `lookup` is a point/batch lookup, not a general join, and requires a
   matching unique index for non-`_id` keys. Non-unique lookups are not supported.
+- SQL is read-only and covers one collection. Joins, subqueries, scalar
+  expressions in grouped `SELECT`, and `INSERT`/`UPDATE`/`DELETE` are not
+  supported yet.
 - No stored procedures or daemon plugins. Background jobs and outbox events are
   ordinary client processes. `watch` long-polls or streams append-only outbox
   collections; it is not an automatic change stream for arbitrary writes,

@@ -70,6 +70,18 @@ const rows = await users.aggregate([
 ]);
 ```
 
+## SQL
+
+```js
+const rows = await db.sql(
+  'SELECT name, age FROM users WHERE age >= $1 ORDER BY age DESC LIMIT 10',
+  [18],
+);
+```
+
+SQL is read-only and covers one collection. `db.explainSql(query, params)`
+returns the selected plan. See [SQL queries](../../docs/sql.md).
+
 ## Batch lookups
 
 ```js

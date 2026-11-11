@@ -303,6 +303,26 @@ rows = users.aggregate([
 stages, expressions, accumulators, and the 100,000-document intermediate limit
 are documented in [Aggregation](api.md#aggregation).
 
+## SQL
+
+```python
+rows = db.sql(
+    "SELECT team, COUNT(*) AS n, SUM(score) AS total "
+    "FROM users WHERE age >= $1 GROUP BY team HAVING COUNT(*) > 1 "
+    "ORDER BY total DESC LIMIT 10",
+    [18],
+)
+plan = db.explain_sql(
+    "SELECT DISTINCT team FROM users WHERE age >= $1",
+    [18],
+)
+```
+
+`sql` is read-only and returns result objects. `explain_sql` returns the
+selected `find` or aggregation plan. Parameters can use `?` or `$1`
+placeholders. See [SQL queries](sql.md) for the supported `SELECT` grammar,
+`DISTINCT`, `HAVING`, `CASE`, scalar functions, and limitations.
+
 ## Cursors
 
 Use cursors for result sets that are too large for one response. Pages are
@@ -735,7 +755,7 @@ db = NonoDB("/run/nonodb/nonodb.sock", cache_ttl=0.5)
 Behavior:
 
 - Cached operations: reads understood by the client (`find`, `find_one`,
-  `lookup`, `count`, `aggregate`, list operations, `search`, `fuzzy`, `batch`).
+  `lookup`, `count`, `aggregate`, `sql`, `explain_sql`, list operations, `search`, `fuzzy`, `batch`).
 - Any write through **this client instance** clears the entire cache.
 - Writes from other processes are not observed until the TTL expires.
 - Values are stored as serialized JSON; each cache hit deserializes a fresh

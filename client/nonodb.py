@@ -52,6 +52,8 @@ _READ_OPS = {
     "search",
     "fuzzy",
     "vector_search",
+    "sql",
+    "explain_sql",
     "batch",
     "map_info",
 }
@@ -335,6 +337,29 @@ class NonoDB:
 
     def collections(self) -> list[str]:
         return self.exec({"op": "list_collections"})["collections"]
+
+    def sql(
+        self,
+        query: str,
+        params: Optional[list[Any]] = None,
+    ) -> list[dict[str, Any]]:
+        """Runs a read-only SQL SELECT and returns its result rows.
+
+        Parameters are positional and may use `?` or `$1` placeholders.
+        """
+        return self.exec(
+            {"op": "sql", "query": query, "params": list(params or [])}
+        )["results"]
+
+    def explain_sql(
+        self,
+        query: str,
+        params: Optional[list[Any]] = None,
+    ) -> dict[str, Any]:
+        """Returns the plan selected for a read-only SQL SELECT."""
+        return self.exec(
+            {"op": "explain_sql", "query": query, "params": list(params or [])}
+        )
 
     def batch(self, ops: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Executes a list of **reads** in one LMDB transaction.

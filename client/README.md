@@ -44,3 +44,9 @@ Use `db.vault(tenant, key_id, key)` for a handle that sends the three vault
 headers on every request. Vault collections support CRUD by `_id`, list/count
 by `tenant_id`, and history; search, indexes, aggregation, `batch`, and
 `write_batch` are rejected. See [Vault collections](../docs/vault.md).
+
+## SQL
+
+All official clients expose read-only `db.sql(query, params)` / `client.sql(...)`.
+See [SQL queries](../docs/sql.md) and [Clients](../docs/clients.md#sql) for
+language-specific examples.

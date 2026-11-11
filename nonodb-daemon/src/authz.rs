@@ -32,6 +32,14 @@ pub fn authorize_request(principal: &Principal, req: &Request) -> Result<(), Api
         | Request::GetVersion { coll, .. }
         | Request::GetCollectionTtl { coll } => allow(principal, Action::Read, coll, req.op_name()),
 
+        Request::Sql { query, .. } | Request::ExplainSql { query, .. } => {
+            let coll = nonodb_core::sql::collection_name(query).map_err(|e| ApiError {
+                code: "invalid_sql".into(),
+                message: e.to_string(),
+            })?;
+            allow(principal, Action::Read, &coll, req.op_name())
+        }
+
         Request::CreateIndex { coll, .. }
         | Request::CreateIndexes { coll, .. }
         | Request::DropIndex { coll, .. }
@@ -191,6 +199,40 @@ mod tests {
         let admin = principal(&["admin:orders"]);
         assert!(authorize_request(&admin, &index).is_ok());
         assert!(authorize_request(&admin, &Request::MapInfo).is_err());
+    }
+
+    #[test]
+    fn sql_uses_read_scope_from_the_query() {
+        let reader = principal(&["read:orders"]);
+        let ok = Request::Sql {
+            query: "SELECT * FROM orders WHERE id = $1".into(),
+            params: vec![json!(1)],
+        };
+        assert!(authorize_request(&reader, &ok).is_ok());
+
+        let denied = Request::Sql {
+            query: "SELECT * FROM customers".into(),
+            params: vec![],
+        };
+        assert!(authorize_request(&reader, &denied).is_err());
+
+        let explain = Request::ExplainSql {
+            query: "SELECT * FROM orders".into(),
+            params: vec![],
+        };
+        assert!(authorize_request(&reader, &explain).is_ok());
+        let explain_denied = Request::ExplainSql {
+            query: "SELECT * FROM customers".into(),
+            params: vec![],
+        };
+        assert!(authorize_request(&reader, &explain_denied).is_err());
+
+        let bad = Request::Sql {
+            query: "DELETE FROM orders".into(),
+            params: vec![],
+        };
+        let err = authorize_request(&reader, &bad).unwrap_err();
+        assert_eq!(err.code, "invalid_sql");
     }
 
     #[test]

@@ -398,6 +398,53 @@ Shared rules:
 
 See [HTTP API: lookup](api.md#lookup) for the wire format.
 
+## SQL
+
+SQL is read-only and returns an array of result objects. Parameters are
+positional; use `?` or `$1` placeholders. `explain_sql` returns the selected
+plan. See [SQL queries](sql.md) for the full grammar and limitations.
+
+Python:
+
+```python
+rows = db.sql(
+    "SELECT DISTINCT team FROM users WHERE age >= $1 ORDER BY team",
+    [18],
+)
+plan = db.explain_sql(
+    "SELECT team, COUNT(*) AS n FROM users GROUP BY team HAVING COUNT(*) > 1"
+)
+```
+
+Rust:
+
+```rust
+let rows = db.sql(
+    "SELECT team, COUNT(*) AS n FROM users GROUP BY team HAVING COUNT(*) > $1",
+    &[json!(1)],
+)?;
+let plan = db.explain_sql("SELECT * FROM users WHERE age >= $1", &[json!(18)])?;
+```
+
+Node.js:
+
+```js
+const rows = await db.sql(
+  "SELECT CASE WHEN age >= 18 THEN 'adult' ELSE 'minor' END AS band FROM users",
+);
+const plan = await db.explainSql('SELECT * FROM users WHERE age >= $1', [18]);
+```
+
+Go:
+
+```go
+rows, err := db.SQL(ctx,
+    "SELECT DISTINCT team FROM users WHERE age >= $1 ORDER BY team",
+    18,
+)
+plan, err := db.ExplainSQL(ctx, "SELECT * FROM users WHERE age >= $1", 18)
+```
+
 ## Vector search
 
 All four clients expose exact vector search. Embeddings are computed outside

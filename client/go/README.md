@@ -62,6 +62,18 @@ rows, err := users.Aggregate(ctx, []any{
 })
 ```
 
+## SQL
+
+```go
+rows, err := db.SQL(ctx,
+    "SELECT name, age FROM users WHERE age >= $1 ORDER BY age DESC LIMIT 10",
+    18,
+)
+```
+
+SQL is read-only and covers one collection. `db.ExplainSQL(ctx, query, params...)`
+returns the selected plan. See [SQL queries](../../docs/sql.md).
+
 ## Batch lookups
 
 ```go

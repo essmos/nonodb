@@ -186,6 +186,18 @@ pub enum Request {
         #[serde(default)]
         pipeline: Vec<Value>,
     },
+    /// Read-only SQL SELECT over one collection.
+    Sql {
+        query: String,
+        #[serde(default)]
+        params: Vec<Value>,
+    },
+    /// Explain a read-only SQL SELECT.
+    ExplainSql {
+        query: String,
+        #[serde(default)]
+        params: Vec<Value>,
+    },
     /// Opens a bounded cursor over `find`. Supports an empty sort or `_id`.
     CursorFind {
         coll: String,
@@ -577,6 +589,8 @@ impl Request {
             Self::Delete { .. } => "delete",
             Self::Count { .. } => "count",
             Self::Aggregate { .. } => "aggregate",
+            Self::Sql { .. } => "sql",
+            Self::ExplainSql { .. } => "explain_sql",
             Self::CursorFind { .. } => "cursor_find",
             Self::CursorAggregate { .. } => "cursor_aggregate",
             Self::GetMore { .. } => "get_more",
@@ -619,6 +633,8 @@ impl Request {
             | Self::Explain { .. }
             | Self::Count { .. }
             | Self::Aggregate { .. }
+            | Self::Sql { .. }
+            | Self::ExplainSql { .. }
             | Self::CursorFind { .. }
             | Self::CursorAggregate { .. }
             | Self::GetMore { .. }
@@ -639,7 +655,7 @@ impl Request {
         }
     }
 
-    pub fn collections(&self) -> Vec<&str> {
+    pub fn collections(&self) -> Vec<String> {
         match self {
             Self::Insert { coll, .. }
             | Self::InsertMany { coll, .. }
@@ -675,7 +691,12 @@ impl Request {
             | Self::GetVersion { coll, .. }
             | Self::CreateCollection { coll, .. }
             | Self::SetCollectionTtl { coll, .. }
-            | Self::GetCollectionTtl { coll } => vec![coll],
+            | Self::GetCollectionTtl { coll } => vec![coll.clone()],
+            Self::Sql { query, .. } | Self::ExplainSql { query, .. } => {
+                nonodb_core::sql::collection_name(query)
+                    .map(|coll| vec![coll])
+                    .unwrap_or_default()
+            }
             Self::Batch { ops } => {
                 let mut out = Vec::new();
                 for op in ops {
@@ -700,12 +721,12 @@ impl WriteOp {
         }
     }
 
-    pub fn collections(&self) -> Vec<&str> {
+    pub fn collections(&self) -> Vec<String> {
         match self {
             Self::Insert { coll, .. }
             | Self::InsertMany { coll, .. }
             | Self::Update { coll, .. }
-            | Self::Delete { coll, .. } => vec![coll],
+            | Self::Delete { coll, .. } => vec![coll.clone()],
         }
     }
 }
@@ -778,6 +799,7 @@ impl From<nonodb_core::Error> for ApiError {
             E::DuplicateKey(_) => "duplicate_key",
             E::InvalidId => "invalid_id",
             E::Query(_) => "invalid_query",
+            E::Sql(_) => "invalid_sql",
             E::InvalidCollectionName(_) => "invalid_collection",
             E::DocumentTooLarge(_, _) => "document_too_large",
             E::ResultTooLarge(_, _) => "result_too_large",

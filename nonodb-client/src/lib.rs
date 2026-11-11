@@ -454,6 +454,31 @@ impl Client {
             .map(|value| value.unwrap_or_default())
     }
 
+    /// Run a read-only SQL SELECT and return its rows.
+    ///
+    /// Parameters are positional and may use `?` or `$1` placeholders.
+    pub fn sql(&self, query: &str, params: &[Value]) -> Result<Vec<Value>> {
+        let result = self.exec(json!({
+            "op": "sql",
+            "query": query,
+            "params": params,
+        }))?;
+        result
+            .get("results")
+            .cloned()
+            .map(value_array)
+            .unwrap_or_else(|| Err(Error::InvalidResponse("missing SQL results".into())))
+    }
+
+    /// Explain a read-only SQL SELECT and return its selected plan.
+    pub fn explain_sql(&self, query: &str, params: &[Value]) -> Result<Value> {
+        self.exec(json!({
+            "op": "explain_sql",
+            "query": query,
+            "params": params,
+        }))
+    }
+
     /// Execute read-only operations in one LMDB transaction.
     pub fn batch(&self, ops: &[Value]) -> Result<Vec<Value>> {
         let result = self.exec(json!({"op": "batch", "ops": ops}))?;
@@ -515,6 +540,8 @@ fn is_read_op(payload: &Value) -> bool {
                 | "vector_search"
                 | "history"
                 | "get_version"
+                | "sql"
+                | "explain_sql"
                 | "batch"
                 | "map_info"
         )
@@ -1276,6 +1303,8 @@ mod tests {
         assert!(is_read_op(&json!({"op": "find"})));
         assert!(is_read_op(&json!({"op": "watch"})));
         assert!(is_read_op(&json!({"op": "batch"})));
+        assert!(is_read_op(&json!({"op": "sql"})));
+        assert!(is_read_op(&json!({"op": "explain_sql"})));
         assert!(!is_read_op(&json!({"op": "write_batch"})));
         assert!(!is_read_op(&json!({"op": "insert"})));
     }

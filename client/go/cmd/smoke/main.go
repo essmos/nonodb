@@ -49,6 +49,15 @@ func main() {
 		log.Fatalf("aggregate: %v %v", grouped, err)
 	}
 
+	sqlRows, err := db.SQL(ctx, fmt.Sprintf("SELECT COUNT(*) AS n FROM %s", name))
+	if err != nil || len(sqlRows) != 1 || sqlRows[0]["n"] != float64(3) {
+		log.Fatalf("sql: %v %v", sqlRows, err)
+	}
+	sqlPlan, err := db.ExplainSQL(ctx, fmt.Sprintf("SELECT * FROM %s WHERE age >= $1", name), 40)
+	if err != nil || sqlPlan["access_path"] == nil {
+		log.Fatalf("explain_sql: %v %v", sqlPlan, err)
+	}
+
 	limit := int64(2)
 	adults, err := users.Find(ctx, nonodb.FindQuery{
 		Filter: map[string]any{"age": map[string]any{"$gte": 40}},

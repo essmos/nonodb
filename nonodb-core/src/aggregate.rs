@@ -1201,6 +1201,100 @@ fn eval_operator(doc: &Value, obj: &Map<String, Value>) -> Result<Value> {
             };
             Ok(Value::Bool(result))
         }
+        "$and" => {
+            let values = args()?;
+            Ok(Value::Bool(values.iter().all(truthy)))
+        }
+        "$or" => {
+            let values = args()?;
+            Ok(Value::Bool(values.iter().any(truthy)))
+        }
+        "$not" => {
+            let values = args()?;
+            if values.len() != 1 {
+                return Err(Error::Query("$not requires one argument".into()));
+            }
+            Ok(Value::Bool(!truthy(&values[0])))
+        }
+        "$toLower" | "$toUpper" => {
+            let values = args()?;
+            if values.len() != 1 {
+                return Err(Error::Query(format!("{op} requires one argument")));
+            }
+            Ok(match values[0].as_str() {
+                Some(s) if op == "$toLower" => Value::String(s.to_lowercase()),
+                Some(s) => Value::String(s.to_uppercase()),
+                None => Value::Null,
+            })
+        }
+        "$length" => {
+            let values = args()?;
+            if values.len() != 1 {
+                return Err(Error::Query("$length requires one argument".into()));
+            }
+            Ok(match &values[0] {
+                Value::String(s) => Value::from(s.chars().count()),
+                Value::Array(items) => Value::from(items.len()),
+                _ => Value::Null,
+            })
+        }
+        "$substr" => {
+            let values = args()?;
+            if values.len() != 3 {
+                return Err(Error::Query("$substr requires three arguments".into()));
+            }
+            let Some(s) = values[0].as_str() else {
+                return Ok(Value::Null);
+            };
+            let Some(start) = values[1].as_i64() else {
+                return Ok(Value::Null);
+            };
+            let Some(len) = values[2].as_i64() else {
+                return Ok(Value::Null);
+            };
+            let start = start.max(0) as usize;
+            let len = len.max(0) as usize;
+            Ok(Value::String(s.chars().skip(start).take(len).collect()))
+        }
+        "$trim" | "$ltrim" | "$rtrim" => {
+            let values = args()?;
+            if values.len() != 1 {
+                return Err(Error::Query(format!("{op} requires one argument")));
+            }
+            Ok(match values[0].as_str() {
+                Some(s) => Value::String(match op.as_str() {
+                    "$trim" => s.trim().to_string(),
+                    "$ltrim" => s.trim_start().to_string(),
+                    _ => s.trim_end().to_string(),
+                }),
+                None => Value::Null,
+            })
+        }
+        "$abs" | "$ceil" | "$floor" | "$round" => {
+            let values = args()?;
+            if values.is_empty() || values.len() > 2 {
+                return Err(Error::Query(format!("{op} has invalid arity")));
+            }
+            let Some(n) = numeric::as_f64(&values[0]) else {
+                return Ok(Value::Null);
+            };
+            let result = match op.as_str() {
+                "$abs" => n.abs(),
+                "$ceil" => n.ceil(),
+                "$floor" => n.floor(),
+                "$round" => {
+                    let precision = values
+                        .get(1)
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0)
+                        .clamp(-15, 15);
+                    let factor = 10_f64.powi(precision as i32);
+                    (n * factor).round() / factor
+                }
+                _ => unreachable!(),
+            };
+            Ok(number_value(result))
+        }
         _ => Err(Error::Query(format!(
             "unsupported aggregation expression `{op}`"
         ))),

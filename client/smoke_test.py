@@ -28,6 +28,11 @@ def main() -> int:
     coll.delete({}, multi=True)
 
     doc_id = coll.insert({"name": "counter", "n": 0})
+    rows = db.sql(
+        "SELECT COUNT(*) AS n FROM concurrency WHERE name = $1",
+        ["counter"],
+    )
+    assert rows == [{"n": 1}], rows
     if os.environ.get("NONODB_HISTORY", "").lower() in {"1", "true", "yes", "on"}:
         revisions = coll.history(doc_id, limit=5, include_docs=True)
         assert len(revisions) == 1 and revisions[0]["op"] == "insert"

@@ -9,6 +9,12 @@ func TestReadOps(t *testing.T) {
 	if !isReadOp(map[string]any{"op": "batch"}) {
 		t.Fatal("batch should be retryable")
 	}
+	if !isReadOp(map[string]any{"op": "sql"}) {
+		t.Fatal("sql should be retryable")
+	}
+	if !isReadOp(map[string]any{"op": "explain_sql"}) {
+		t.Fatal("explain_sql should be retryable")
+	}
 	if isReadOp(map[string]any{"op": "write_batch"}) {
 		t.Fatal("write_batch must not be retried")
 	}
