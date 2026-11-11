@@ -531,117 +531,35 @@ For certificate generation, mTLS setup, rotation, and troubleshooting, see
 
 ## Snapshots
 
-Periodic snapshots are enabled with:
+Periodic snapshots are enabled with `NONODB_SNAPSHOT_DIR`,
+`NONODB_SNAPSHOT_INTERVAL`, and `NONODB_SNAPSHOT_KEEP`. Snapshots are compacted
+consistent copies named `data-<unix-ms>.mdb`; they are not point-in-time
+recovery and are not verified automatically.
 
-```bash
-export NONODB_SNAPSHOT_DIR=/var/backups/nonodb/snapshots
-export NONODB_SNAPSHOT_INTERVAL=300
-export NONODB_SNAPSHOT_KEEP=24
-```
-
-The daemon writes compacted LMDB snapshots named `data-<unix-ms>.mdb`.
-Snapshots are consistent copies, not a write-ahead log. They provide recovery
-points at the configured interval, not point-in-time recovery to an arbitrary
-operation.
-
-Retention removes the oldest files after each successful snapshot. Snapshot
-files are not automatically verified; test restores regularly.
-
-Snapshots use `copy_to_file(CompactionOption::Enabled)` and `fsync`. On large
-databases, expect the copy to consume I/O and temporary page cache. It does not
-block readers or the writer for the whole copy, but it does add background I/O.
+See [Periodic snapshots](backup.md#periodic-snapshots) for configuration,
+retention, and restore details.
 
 ## Backup and restore
 
-### Online backup
+The full operational guide is [Backup and restore](backup.md). It covers online
+backups, verification, restore, restore drills, retention, Docker, vault
+collections, and the separate authorization state.
 
-`nonodb-cli backup` opens the data directory read-only and creates a compacted
-copy:
-
-```bash
-nonodb-cli backup /var/lib/nonodb /var/backups/nonodb/20261109T120000Z
-```
-
-This is safe while the daemon is running. The output is a directory containing
-`data.mdb` and `manifest.json`. The manifest records the source path, timestamp,
-file size, and SHA-256 checksum.
-
-Verify the backup before relying on it:
+Quick reference:
 
 ```bash
-nonodb-cli verify-backup /var/backups/nonodb/20261109T120000Z
-nonodb-cli verify-backup /var/backups/nonodb/20261109T120000Z --json
-```
+TS=$(date -u +%Y%m%dT%H%M%SZ)
+nonodb-cli backup /var/lib/nonodb "/var/backups/nonodb/$TS"
+nonodb-cli verify-backup "/var/backups/nonodb/$TS"
 
-Verification checks the manifest size and checksum, then streams every document
-and validates `_id` consistency, secondary index entries, and full-text/fuzzy
-posting counts. It is read-only and can run while the daemon is serving. For
-large databases it is I/O-heavy; schedule it like a backup.
-
-`nonodb-cli verify <data-dir>` performs the same deep check without a manifest.
-It is useful for a restored directory or a backup produced by an older release.
-
-### Restore
-
-Stop the daemon first:
-
-```bash
 systemctl stop nonodb
-nonodb-cli restore /var/backups/nonodb/20261109T120000Z /var/lib/nonodb --force
+nonodb-cli restore "/var/backups/nonodb/$TS" /var/lib/nonodb --force --verify
+chown -R nonodb:nonodb /var/lib/nonodb
 systemctl start nonodb
 ```
 
-`restore` copies `data.mdb`, removes a stale `lock.mdb`, and requires `--force`
-when the destination already exists. If the backup has a manifest, restore
-checks its size and SHA-256 before copying. Add `--verify` to deep-check the
-restored directory immediately:
-
-```bash
-nonodb-cli restore /var/backups/nonodb/20261109T120000Z /var/lib/nonodb --force --verify
-```
-
-Never restore over a live database.
-
-After starting the daemon, verify queries and indexes:
-
-```bash
-NONODB_SOCK=/run/nonodb/nonodb.sock nonodb-cli count users
-NONODB_SOCK=/run/nonodb/nonodb.sock nonodb-cli indexes users
-```
-
-### Restore drill
-
-Run an automated drill on a schedule, not only after an incident:
-
-```bash
-cd /opt/nonodb
-python3 scripts/restore_drill.py
-```
-
-The drill creates a temporary source database with documents, secondary,
-text, fuzzy, history, and TTL state, takes a live backup, verifies the
-manifest and index structure, restores with `--verify`, starts a daemon on the
-restored directory, and checks counts, indexed ranges, full-text/fuzzy search,
-history, TTL, and unique-index enforcement.
-
-Example cron entry (weekly, Sunday 03:17):
-
-```cron
-17 3 * * 0 cd /opt/nonodb && NONODB_DAEMON=./target/release/nonodb-daemon NONODB_CLI=./target/release/nonodb-cli python3 scripts/restore_drill.py >>/var/log/nonodb-restore-drill.log 2>&1
-```
-
-A failed drill should page an operator. Do not treat snapshots or backups as
-valid until a restore has been exercised.
-
-### Backup strategy
-
-- Take regular `nonodb-cli backup` copies, not just raw filesystem copies.
-- Keep at least one backup off the host.
-- Run the automated restore drill regularly and keep its logs.
-- Periodically restore into a scratch directory and run `inspect`, `verify`, and
-  a few application queries.
-- Snapshot retention is not a substitute for an independent backup policy.
-- If the database is large, backups are I/O-heavy; schedule them accordingly.
+Never restore over a live database. `auth.json` and the audit log are not part
+of a database backup; protect them separately.
 
 ## Monitoring
 

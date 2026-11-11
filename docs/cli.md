@@ -198,7 +198,7 @@ documents: 1000
 ## restore drill
 
 `scripts/restore_drill.py` automates the full backup → verify → restore →
-query cycle. See [Operations](operations.md#restore-drill).
+query cycle. See [Backup and restore](backup.md#restore-drills).
 
 ## inspect
 

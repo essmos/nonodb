@@ -15,11 +15,13 @@ quick-start instructions, and a feature overview.
 | [Numbers and decimals](numerics.md) | Application developers | Exact numeric comparison, Decimal128, arithmetic, NaN/Infinity, index compatibility, long text limits |
 | [BSON scalar types](bson-types.md) | Application developers | `$numberInt`/`$numberLong`, `$type`, binary/UUID, ObjectId, index compatibility |
 | [Clients](clients.md) | Application developers | Python, Rust, Node.js and Go: install, connection, CRUD, batches, indexes, search, aggregation |
+| [Migration and import](migration.md) | Application developers, operators | MongoDB, PostgreSQL, SQLite, CSV conversion; NDJSON format; import manifest; validation and cutover |
 | [Authentication and permissions](auth.md) | Operators, security reviewers | Principals, scopes, hashed tokens, certificate registry, lockout, reloads, audit log |
 | [Mutual TLS](mtls.md) | Operators, security reviewers | Private CA setup, client certificates, fingerprint mapping, revocation, rotation, troubleshooting |
 | [Python client](python-client.md) | Python developers | Connection, CRUD, upsert, indexes, search, batches, cache, FastAPI |
 | [CLI](cli.md) | Operators | Administration, map resize, backup verification, restore drills, inspect, raw requests |
 | [Operations](operations.md) | Operators, SRE | Configuration, deployment, security, snapshots, monitoring, capacity, troubleshooting |
+| [Backup and restore](backup.md) | Operators, SRE | Online backup, snapshots, verification, restore drills, Docker, vault keys, authorization state, recovery |
 | [Benchmarks](benchmarks.md) | Evaluators, maintainers | Environment, methodology, throughput, latency, memory, large-data results |
 | [Development](development.md) | Contributors | Repository layout, build, tests, scripts, conventions |
 | [Roadmap and limits](roadmap.md) | Everyone | Supported features, deliberate limitations, future work |
@@ -30,6 +32,7 @@ quick-start instructions, and a feature overview.
 - **Run on Linux, macOS or Windows:** [README — Quick start](../README.md#quick-start)
 - **Run with Docker:** [README — Run with Docker](../README.md#run-with-docker)
 - **Pick a client:** [Clients](clients.md) — Python, Rust, Node.js, Go
+- **Import data from another database:** [Migration and import](migration.md)
 - **Expose nonodb to Python workers:** [Python client](python-client.md)
 - **Secure a deployment:** [Authentication and authorization](auth.md) and
   [TCP/TLS](operations.md#tcp-and-tls)
@@ -39,7 +42,7 @@ quick-start instructions, and a feature overview.
 - **Filter and index timestamps:** [Dates and time zones](dates.md)
 - **Store money and exact decimals:** [Numbers and decimals](numerics.md)
 - **Use binary, UUID, ObjectId, or `$type`:** [BSON scalar types](bson-types.md)
-- **Back up and restore:** [Backup and restore](operations.md#backup-and-restore)
+- **Back up and restore:** [Backup and restore](backup.md)
 - **Tune timeouts for index builds:** [Timeouts](operations.md#timeouts-and-long-operations)
 - **Understand memory usage:** [Capacity and memory](operations.md#capacity-and-memory)
 - **Reproduce performance numbers:** [Benchmarks](benchmarks.md#reproducing)

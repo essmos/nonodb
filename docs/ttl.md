@@ -187,7 +187,8 @@ Metrics expose `ttl_sweeps_total`, `ttl_expired_total`,
 TTL timestamps are stored in the same LMDB environment as documents and are
 included in snapshots and backups. Restoring an older snapshot restores its TTL
 entries as well. Documents whose expiry passed during the gap are removed by the
-next maintenance sweep after the daemon starts.
+next maintenance sweep after the daemon starts. See
+[Backup and restore](backup.md).
 
 ## Limits
 

@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/essmos/nonodb/docs/import-manifest.schema.json",
+  "title": "nonodb import manifest",
+  "description": "Describes NDJSON files to import into nonodb collections.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "collections"],
+  "properties": {
+    "version": {
+      "const": 1
+    },
+    "source": {
+      "type": "object",
+      "description": "Optional, non-secret migration metadata.",
+      "additionalProperties": true
+    },
+    "collections": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/collection"
+      }
+    }
+  },
+  "$defs": {
+    "collection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "file"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Target collection name."
+        },
+        "file": {
+          "type": "string",
+          "minLength": 1,
+          "description": "NDJSON file, relative to the manifest directory or absolute."
+        },
+        "ttl_seconds": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "description": "Optional collection default TTL for new documents."
+        },
+        "indexes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/index"
+          }
+        }
+      }
+    },
+    "index": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fields"],
+      "properties": {
+        "fields": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "unique": {
+          "type": "boolean",
+          "default": false
+        },
+        "include": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "description": "Covering-index fields copied into the index."
+        }
+      }
+    }
+  }
+}

@@ -366,7 +366,7 @@ key bytes returns `decryption_failed`.
 - Snapshots and backups contain ciphertext plus `_id`, `tenant_id`, and `kid`.
 - A backup without the tenant key is not readable.
 - Back up keys separately from the database, using a secret manager and a
-  documented recovery procedure.
+  documented recovery procedure. See [Backup and restore](backup.md#vault-collections).
 - Losing the key means losing the document bodies. `_id` and `tenant_id` remain,
   but the encrypted payload cannot be recovered.
 

@@ -293,7 +293,8 @@ rewrite audit history.
 ## Backups
 
 `auth.json` and the audit log are **not** part of `nonodb-cli backup`. Back them
-up separately with filesystem tools and protect them as credentials:
+up separately with filesystem tools and protect them as credentials. The full
+backup procedure is in [Backup and restore](backup.md#authorization-and-audit-state).
 
 ```bash
 install -m 0640 -o root -g nonodb auth.json /var/backups/nonodb/auth.json
