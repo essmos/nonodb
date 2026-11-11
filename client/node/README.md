@@ -70,6 +70,36 @@ const rows = await users.aggregate([
 ]);
 ```
 
+## Batch lookups
+
+```js
+await articles.createIndex(['slug'], {
+  unique: true,
+  include: ['title', 'status'],
+});
+
+const documents = await articles.lookup(
+  'slug',
+  ['async-rust', 'missing', 'lmdb'],
+  { fields: ['title', 'status'] },
+);
+const article = await articles.lookupOne('slug', 'async-rust', {
+  projection: { title: 1, _id: 0 },
+});
+const byId = await articles.getMany(['a', 'b', 'missing']);
+
+await articles.createIndex(['tenant_id', 'slug'], { unique: true });
+const rows = await articles.lookup(
+  ['tenant_id', 'slug'],
+  [['acme', 'async-rust'], ['other', 'async-rust'], ['acme', 'missing']],
+);
+```
+
+Results preserve input order and use `null` for missing keys. A non-`_id` lookup
+requires a unique index with matching field order; compound values are arrays.
+`projection` cannot be combined with `fields`, and the result budget is capped
+at 64 MiB. See [Batch lookups](../../docs/clients.md#batch-lookups).
+
 ## Vector search
 
 ```js

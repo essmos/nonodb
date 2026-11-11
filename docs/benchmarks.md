@@ -165,6 +165,59 @@ On 1M / 2M / 4M / 8M documents, 1,000 batched `find_one` calls took
 **22.7 / 23.9 / 20.0 / 19.3 ms** respectively. Batch performance is dominated by
 request/response serialization rather than database size.
 
+## Ordered point lookups
+
+`scripts/lookup_bench.py`, release daemon, `NONODB_CACHE_TTL=0`, ext4,
+1,000,000 documents, 20% missing keys, single Unix-socket client. The collection
+had a unique index on `email` with `include=["name","status"]`. Warmup was
+excluded; each request fetched 1, 100, or 1,000 keys.
+
+Setup:
+
+| Workload | Result |
+|---|---|
+| Load 1M documents | 15.05 s, **66,440 docs/s** |
+| Build `unique(email)` with `include(name,status)` | 4.06 s, **246,293 docs/s** |
+| `data.mdb` | 440.1 MiB |
+
+Latency is end-to-end through HTTP/JSON/UDS and includes the Python client.
+Throughput is keys per second, so missing keys still count as processed input.
+
+| Workload | Keys/request | p50 | p95 | p99 | Key throughput |
+|---|---:|---:|---:|---:|---:|
+| `lookup(_id)`, full documents | 1 | 0.67 ms | 1.20 ms | 2.10 ms | 1,202 keys/s |
+| `lookup(_id)`, full documents | 100 | 1.73 ms | 3.29 ms | 5.79 ms | 45,457 keys/s |
+| `lookup(_id)`, full documents | 1,000 | **10.46 ms** | 17.83 ms | 40.85 ms | **84,743 keys/s** |
+| `lookup(email)`, covering `name,status` | 1 | 0.80 ms | 1.69 ms | 2.33 ms | 1,081 keys/s |
+| `lookup(email)`, covering `name,status` | 100 | 1.34 ms | 2.65 ms | 5.98 ms | 60,337 keys/s |
+| `lookup(email)`, covering `name,status` | 1,000 | **8.87 ms** | 14.77 ms | 41.28 ms | **98,527 keys/s** |
+| `lookup(email)`, full documents | 1 | 0.72 ms | 2.07 ms | 3.90 ms | 896 keys/s |
+| `lookup(email)`, full documents | 100 | 2.01 ms | 4.45 ms | 6.77 ms | 42,464 keys/s |
+| `lookup(email)`, full documents | 1,000 | 13.47 ms | 20.38 ms | 25.77 ms | 70,759 keys/s |
+| Old `batch(find_one(_id))` | 100 | 2.31 ms | 4.64 ms | 23.58 ms | 33,262 keys/s |
+| Old `batch(find_one(_id))` | 1,000 | 19.01 ms | 31.46 ms | 49.24 ms | 47,878 keys/s |
+| `lookup(_id)`, 1,000 keys, 50% duplicates | 1,000 | 9.62 ms | 18.62 ms | 24.78 ms | 89,540 keys/s |
+
+Interpretation:
+
+- At 1,000 keys, `lookup(_id)` is about **1.8x faster** than the previous
+  `get_many` implementation built from batched `find_one` calls.
+- The covering email lookup avoids loading documents: **8.87 ms** versus
+  **13.47 ms** p50 for full documents, about **1.5x** higher key throughput.
+- Per-key cost falls as the batch grows; request/HTTP overhead dominates at one
+  key. The 1,000-key case processes roughly **85k–99k keys/s** on one client.
+- Repeated keys are deduplicated internally. A 1,000-key request containing 500
+  unique keys completed slightly faster than the all-unique case because it did
+  half the index/document work while still returning 1,000 aligned results.
+- Missing keys are returned as `null` and do not abort the request. A batch of
+  1,000 keys with 20% misses completed in the same range as the all-present
+  cases.
+- The result budget is capped at 64 MiB; oversized results fail with
+  `result_too_large`.
+- These are single-client numbers. Concurrent throughput will depend on the
+  read-only LMDB snapshots, CPU cores, and the JSON payload size. Run-to-run
+  variance on this shared host was roughly ±10–20%.
+
 ## Search performance
 
 ### 5,000 documents

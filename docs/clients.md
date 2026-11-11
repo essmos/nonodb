@@ -166,9 +166,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-The Rust client exposes `exec`, `batch`, `write_batch`, `get_many`, history,
-aggregation, indexes, text search, fuzzy search, vector search, and online map
-resize.
+The Rust client exposes `exec`, `batch`, `write_batch`, `lookup`, `get_many`,
+history, aggregation, indexes, text search, fuzzy search, vector search, and
+online map resize.
 `Client::from_env()` reads `NONODB_SOCK`,
 `NONODB_URL`, `NONODB_TOKEN`, `NONODB_TLS_VERIFY`, `NONODB_TLS_CA`,
 `NONODB_TLS_CLIENT_CERT`, and `NONODB_TLS_CLIENT_KEY`. For mTLS:
@@ -274,6 +274,129 @@ db := nonodb.New(
 The Go client methods take a `context.Context`; use it for cancellation and
 deadlines. `Exec` is available for operations not covered by a convenience
 method.
+
+## Batch lookups
+
+`lookup` fetches documents by `_id` or a unique index in one request,
+preserving input order and returning `null` for missing keys. It is the
+recommended replacement for N separate `find_one` calls. A non-`_id` lookup
+requires a unique index. `by` may be an array for a compound unique index; each
+value must then be an array in the same field order.
+
+Python:
+
+```python
+articles.create_index("slug", unique=True, include=["title", "status"])
+
+docs = articles.lookup(
+    "slug",
+    ["async-rust", "missing", "lmdb"],
+    fields=["title", "status"],
+)
+# [doc, None, doc]
+
+article = articles.lookup_one("slug", "async-rust", projection={"title": 1})
+ids = articles.get_many(["a", "b", "missing"])
+
+# Compound unique index: tenant_id + slug.
+articles.create_index(fields=["tenant_id", "slug"], unique=True)
+rows = articles.lookup(
+    ["tenant_id", "slug"],
+    [["acme", "async-rust"], ["other", "async-rust"], ["acme", "missing"]],
+)
+```
+
+Rust:
+
+```rust
+use serde_json::json;
+
+let slugs = vec!["async-rust", "missing", "lmdb"];
+let docs = articles.lookup(
+    "slug",
+    &slugs,
+    Some(&["title".to_string(), "status".to_string()]),
+)?;
+let article = articles.lookup_one(
+    "slug",
+    &"async-rust",
+    None,
+)?;
+
+// Compound lookup or a projection excluding `_id`.
+let keys = vec![json!(["acme", "async-rust"]), json!(["acme", "missing"])];
+let rows = articles.lookup_with(
+    &["tenant_id", "slug"],
+    &keys,
+    None,
+    Some(&json!({"title": 1, "_id": 0})),
+)?;
+let ids = articles.get_many(["a", "b", "missing"])?;
+```
+
+Node.js:
+
+```js
+await articles.createIndex('slug', { unique: true, include: ['title', 'status'] });
+
+const docs = await articles.lookup('slug', ['async-rust', 'missing', 'lmdb'], {
+  fields: ['title', 'status'],
+});
+const article = await articles.lookupOne('slug', 'async-rust', {
+  projection: { title: 1, _id: 0 },
+});
+const ids = await articles.getMany(['a', 'b', 'missing']);
+
+await articles.createIndex(['tenant_id', 'slug'], { unique: true });
+const rows = await articles.lookup(
+  ['tenant_id', 'slug'],
+  [['acme', 'async-rust'], ['other', 'async-rust'], ['acme', 'missing']],
+);
+```
+
+Go:
+
+```go
+_, err := articles.CreateIndex(ctx, []string{"slug"}, nonodb.IndexOptions{
+    Unique:  true,
+    Include: []string{"title", "status"},
+})
+
+docs, err := articles.Lookup(ctx, "slug", []any{
+    "async-rust", "missing", "lmdb",
+}, nonodb.LookupOptions{Fields: []string{"title", "status"}})
+
+article, err := articles.LookupOne(ctx, "slug", "async-rust", nonodb.LookupOptions{
+    Projection: map[string]any{"title": 1, "_id": 0},
+})
+ids, err := articles.GetMany(ctx, []string{"a", "b", "missing"})
+
+_, err = articles.CreateIndex(ctx, []string{"tenant_id", "slug"}, nonodb.IndexOptions{
+    Unique: true,
+})
+rows, err := articles.Lookup(ctx, []string{"tenant_id", "slug"}, []any{
+    []any{"acme", "async-rust"},
+    []any{"other", "async-rust"},
+    []any{"acme", "missing"},
+}, nonodb.LookupOptions{})
+```
+
+Shared rules:
+
+- `by` defaults to `_id`.
+- `values` is capped at 10,000 per request; the result budget is 64 MiB
+  (`result_too_large`).
+- Missing or malformed compound values become `null`; `get_many` keeps its old
+  behavior and filters them out.
+- `fields` is a top-level inclusive projection. `projection` accepts a normal
+  flat projection, can exclude `_id`, and cannot be combined with `fields`.
+  With a covering index, an inclusive projection avoids reading the document.
+- Duplicate input keys produce duplicate results. Repeated keys are looked up
+  only once internally.
+- `lookup` is not a join and does not accept a filter or sort; use `find` for
+  arbitrary predicates. Non-unique lookups are not supported yet.
+
+See [HTTP API: lookup](api.md#lookup) for the wire format.
 
 ## Vector search
 
@@ -443,7 +566,8 @@ All clients expose the common document operations:
 - `insert`, `insert_many`, `find`, `find_one`, `update`, `delete`, `count`;
 - `aggregate` for read-only reporting pipelines;
 - `batch` (read-only) and `write_batch` (atomic writes);
-- `get_many` for fetching documents by `_id`;
+- `lookup`/`lookup_one` for ordered point lookups by `_id` or a unique index,
+  plus `get_many` for fetching documents by `_id`;
 - `history` and `get_version` for document revisions (daemon history enabled);
 - single-field, compound, unique, and covering indexes;
 - full-text (`search`), fuzzy search, and exact vector search;

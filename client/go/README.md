@@ -62,6 +62,38 @@ rows, err := users.Aggregate(ctx, []any{
 })
 ```
 
+## Batch lookups
+
+```go
+_, err := articles.CreateIndex(ctx, []string{"slug"}, nonodb.IndexOptions{
+    Unique:  true,
+    Include: []string{"title", "status"},
+})
+
+documents, err := articles.Lookup(ctx, "slug", []any{
+    "async-rust", "missing", "lmdb",
+}, nonodb.LookupOptions{Fields: []string{"title", "status"}})
+
+article, err := articles.LookupOne(ctx, "slug", "async-rust", nonodb.LookupOptions{
+    Projection: map[string]any{"title": 1, "_id": 0},
+})
+byID, err := articles.GetMany(ctx, []string{"a", "b", "missing"})
+
+_, err = articles.CreateIndex(ctx, []string{"tenant_id", "slug"}, nonodb.IndexOptions{
+    Unique: true,
+})
+rows, err := articles.Lookup(ctx, []string{"tenant_id", "slug"}, []any{
+    []any{"acme", "async-rust"},
+    []any{"other", "async-rust"},
+    []any{"acme", "missing"},
+}, nonodb.LookupOptions{})
+```
+
+Results preserve input order and use `nil` for missing keys. A non-`_id` lookup
+requires a unique index with matching field order; compound values are arrays.
+`Projection` cannot be combined with `Fields`, and the result budget is capped
+at 64 MiB. See [Batch lookups](../../docs/clients.md#batch-lookups).
+
 ## Vector search
 
 ```go

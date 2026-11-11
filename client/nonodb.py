@@ -19,7 +19,7 @@ import os
 import ssl
 import threading
 import time
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Optional, Union
 
 import httpx
 
@@ -34,6 +34,7 @@ __all__ = ["NonoDB", "VaultDB", "Collection", "Cursor", "NonoDBError"]
 _READ_OPS = {
     "find",
     "find_one",
+    "lookup",
     "count",
     "list_indexes",
     "list_collections",
@@ -607,16 +608,52 @@ class Collection:
     def list_indexes(self) -> list[dict[str, Any]]:
         return self._db.exec({"op": "list_indexes", "coll": self.name})["indexes"]
 
+    def lookup(
+        self,
+        by: Union[str, Iterable[str]],
+        values: Iterable[Any],
+        *,
+        fields: Optional[Iterable[str]] = None,
+        projection: Optional[dict[str, Any]] = None,
+    ) -> list[Optional[dict[str, Any]]]:
+        """Ordered point lookups by `_id` or a unique index.
+
+        `by` is one field name or a list of fields for a compound unique index.
+        For a compound lookup each value must be an array with the same number
+        of elements as `by`. Missing or malformed values produce `None`.
+
+        `fields` is an inclusive projection and can be served from a covering
+        index. `projection` accepts a normal flat projection including `_id: 0`;
+        it cannot be combined with `fields`.
+        """
+        if fields is not None and projection is not None:
+            raise ValueError("lookup accepts either fields or projection, not both")
+        payload: dict[str, Any] = {
+            "op": "lookup",
+            "coll": self.name,
+            "by": by if isinstance(by, str) else list(by),
+            "values": list(values),
+        }
+        if fields is not None:
+            payload["fields"] = list(fields)
+        if projection is not None:
+            payload["projection"] = projection
+        return self._db.exec(payload)["results"]
+
+    def lookup_one(
+        self,
+        by: Union[str, Iterable[str]],
+        value: Any,
+        *,
+        fields: Optional[Iterable[str]] = None,
+        projection: Optional[dict[str, Any]] = None,
+    ) -> Optional[dict[str, Any]]:
+        """Returns one document by `_id` or a unique index."""
+        return self.lookup(by, [value], fields=fields, projection=projection)[0]
+
     def get_many(self, ids: Iterable[str]) -> list[dict[str, Any]]:
-        """Fetches multiple documents by `_id` in one request (batch)."""
-        ops = [
-            {"op": "find_one", "coll": self.name, "filter": {"_id": i}} for i in ids
-        ]
-        return [
-            r["result"]
-            for r in self._db.batch(ops)
-            if r.get("ok") and r.get("result") is not None
-        ]
+        """Fetches multiple documents by `_id` in one lookup request."""
+        return [doc for doc in self.lookup("_id", ids) if doc is not None]
 
     # -- history -----------------------------------------------------
     def history(

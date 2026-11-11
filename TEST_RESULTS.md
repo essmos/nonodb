@@ -16,7 +16,7 @@ release build. The latest validation also exercised a 10M-document collection,
 | `cargo build --release --examples` | OK |
 | `cargo fmt --check` | OK |
 | `cargo clippy --all-targets -- -D warnings` | 0 warnings |
-| `cargo test --workspace` | 261 tests passing |
+| `cargo test --workspace` | 269 tests passing |
 | CRUD, cache, batch, write batch, upsert, search, compound indexes | OK |
 | 12-process concurrency and unique-index race tests | OK |
 | `kill -9` during writes | No corruption; committed data readable |
@@ -33,6 +33,7 @@ release build. The latest validation also exercised a 10M-document collection,
 | Planner and cursor regression | OK (sort-only index, `$or` union, `$type` ranges, cursor paging/ownership) |
 | Multikey and aggregation regression | OK (array keys, unique multikey, min/max sort, `$all`/`$elemMatch` plans, top-K sort, streaming `$group`) |
 | Exact vector search suite | OK (cosine/dot/L2, filtered top-K, update/delete, reopen, backup verification) |
+| Ordered lookup benchmark | OK (1M docs; 1/100/1,000 keys; covering, full-document, duplicates) |
 | 10k keepalive mixed workload | OK (5 min UDS at 4.9k req/s; 2 min TLS at 4.1k req/s; 0 errors) |
 
 ## Large-scale and connection-storm run (2026-11-11)
@@ -61,6 +62,26 @@ temporary data was removed after the run.
 The multikey sort used `index_scan` with `sort_covered=true`. The multikey
 indexes reported `multikey_fields=['tags']` / `['uq']` and
 `multikey_all_docs=true`.
+
+### Ordered lookup benchmark
+
+Release daemon, `NONODB_CACHE_TTL=0`, 1M documents, unique `email` index with
+`include(name,status)`, 20% missing keys, single UDS client. See
+[docs/benchmarks.md](docs/benchmarks.md#ordered-point-lookups) for the full
+methodology.
+
+| Workload | p50 | p95 | p99 | Key throughput |
+|---|---:|---:|---:|---:|
+| `lookup(_id)`, 1,000 keys, full docs | 10.46 ms | 17.83 ms | 40.85 ms | 84,743 keys/s |
+| `lookup(email)`, 1,000 keys, covering | 8.87 ms | 14.77 ms | 41.28 ms | 98,527 keys/s |
+| `lookup(email)`, 1,000 keys, full docs | 13.47 ms | 20.38 ms | 25.77 ms | 70,759 keys/s |
+| Old `batch(find_one)`, 1,000 keys | 19.01 ms | 31.46 ms | 49.24 ms | 47,878 keys/s |
+| `lookup(_id)`, 1,000 keys, 50% duplicates | 9.62 ms | 18.62 ms | 24.78 ms | 89,540 keys/s |
+
+The covering path was faster than loading full documents, and `lookup` was
+about 1.8x faster than the old batch-of-`find_one` implementation at 1,000 keys.
+The result budget is capped at 64 MiB; duplicate keys are looked up once but
+still return aligned duplicate results.
 
 ### 1,000 and 10,000 simultaneous clients
 

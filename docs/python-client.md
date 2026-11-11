@@ -219,6 +219,49 @@ user = users.find_one({"_id": user_id}, projection={"name": 1})
 
 `find_one` returns a document or `None`.
 
+### Point lookups
+
+`lookup` fetches many documents by `_id` or a unique index in one request.
+Results keep input order and use `None` for missing keys.
+
+```python
+users.create_index("email", unique=True, include=["name", "status"])
+
+rows = users.lookup(
+    "email",
+    ["ada@example.com", "missing@example.com"],
+    fields=["name", "status"],
+)
+# [{"_id": ..., "name": "Ada", "status": "active"}, None]
+
+user = users.lookup_one(
+    "email",
+    "ada@example.com",
+    projection={"name": 1, "_id": 0},
+)
+
+# Compound unique lookup.
+users.create_index(fields=["tenant_id", "email"], unique=True)
+rows = users.lookup(
+    ["tenant_id", "email"],
+    [
+        ["acme", "ada@example.com"],
+        ["other", "ada@example.com"],
+        ["acme", "missing@example.com"],
+    ],
+)
+```
+
+A non-`_id` lookup requires a unique index with the same field order as `by`.
+For a compound lookup each value must be an array of the same length. Values are
+limited to 10,000 per request and the result budget to 64 MiB.
+
+`fields` is a top-level inclusive projection; a covering index can satisfy it
+without reading the document. `projection` accepts a normal flat projection,
+allows `"_id": 0`, and cannot be combined with `fields`. Duplicate keys are
+looked up once internally but still produce duplicate results. See
+[HTTP API: lookup](api.md#lookup).
+
 ```python
 n = users.count({"active": True})
 n = users.count()                 # O(1) total count
@@ -643,7 +686,7 @@ monotonic, not per-document `1, 2, 3`. See
 [Document history](api.md#document-history).
 
 A common shortcut is `get_many`, which fetches documents by id through one
-batch:
+`lookup` request:
 
 ```python
 docs = users.get_many([id1, id2, id3])
@@ -692,7 +735,7 @@ db = NonoDB("/run/nonodb/nonodb.sock", cache_ttl=0.5)
 Behavior:
 
 - Cached operations: reads understood by the client (`find`, `find_one`,
-  `count`, `aggregate`, list operations, `search`, `fuzzy`, `batch`).
+  `lookup`, `count`, `aggregate`, list operations, `search`, `fuzzy`, `batch`).
 - Any write through **this client instance** clears the entire cache.
 - Writes from other processes are not observed until the TTL expires.
 - Values are stored as serialized JSON; each cache hit deserializes a fresh

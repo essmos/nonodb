@@ -71,6 +71,22 @@ export class Collection {
   createFieldIndex(field: string, unique?: boolean): Promise<boolean>;
   dropIndex(field: string): Promise<boolean>;
   listIndexes(): Promise<any[]>;
+  lookup(
+    by: string | string[],
+    values: Iterable<unknown>,
+    options?: {
+      fields?: string[];
+      projection?: Record<string, unknown>;
+    },
+  ): Promise<Array<any | null>>;
+  lookupOne(
+    by: string | string[],
+    value: unknown,
+    options?: {
+      fields?: string[];
+      projection?: Record<string, unknown>;
+    },
+  ): Promise<any | null>;
   getMany(ids: Iterable<string>): Promise<any[]>;
   history(id: string, options?: { limit?: number; includeDocs?: boolean }): Promise<any[]>;
   getVersion(id: string, version: number): Promise<any | null>;

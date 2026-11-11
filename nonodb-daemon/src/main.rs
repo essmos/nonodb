@@ -39,7 +39,7 @@ use nonodb_core::{
     aggregate, project_document, vault, CollectionProfile, FindQuery, HistoryConfig, Store,
     VaultKey, DEFAULT_FUZZY_DISTANCE, PAGE_SIZE,
 };
-use protocol::{ApiError, ApiResponse, Request, VaultAuth, WriteReq};
+use protocol::{ApiError, ApiResponse, LookupBy, Request, VaultAuth, WriteReq};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
@@ -1210,6 +1210,29 @@ async fn exec(
             read_result(joined).await
         }
 
+        Request::Lookup {
+            coll,
+            by,
+            values,
+            fields,
+            projection,
+        } => {
+            let store = state.store.clone();
+            let auth = vault_auth.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                let c = read_collection(&store, &coll, auth.as_ref())?;
+                reject_vault_read(&c, auth.as_ref(), "lookup on vault collections")?;
+                let by = by
+                    .unwrap_or(LookupBy::Field("_id".to_string()))
+                    .into_fields();
+                let projection = lookup_projection(fields.as_deref(), projection.as_ref())?;
+                let results = c.lookup_fields(&by, &values, projection.as_ref())?;
+                let found = results.iter().filter(|doc| doc.is_some()).count();
+                Ok::<Value, ApiError>(json!({ "results": results, "found": found }))
+            });
+            read_result(joined).await
+        }
+
         Request::CursorFind {
             coll,
             filter,
@@ -1909,11 +1932,38 @@ fn audit_response(
     }
 }
 
+fn lookup_projection(
+    fields: Option<&[String]>,
+    projection: Option<&Value>,
+) -> Result<Option<Value>, ApiError> {
+    if fields.is_some() && projection.is_some() {
+        return Err(ApiError {
+            code: "invalid_query".to_string(),
+            message: "lookup accepts either `fields` or `projection`, not both".to_string(),
+        });
+    }
+    if let Some(projection) = projection {
+        return Ok(Some(projection.clone()));
+    }
+    let Some(fields) = fields else {
+        return Ok(None);
+    };
+    if fields.is_empty() {
+        return Ok(None);
+    }
+    let mut projection = serde_json::Map::new();
+    for field in fields {
+        projection.insert(field.clone(), Value::from(1));
+    }
+    Ok(Some(Value::Object(projection)))
+}
+
 fn cacheable(req: &Request) -> bool {
     matches!(
         req,
         Request::Find { .. }
             | Request::FindOne { .. }
+            | Request::Lookup { .. }
             | Request::Explain { .. }
             | Request::Count { .. }
             | Request::Aggregate { .. }
@@ -2046,6 +2096,28 @@ fn execute_read(
                 return Err(vault::unsupported("batch reads on vault collections").into());
             }
             Ok(json!(c.find_one_in(rtxn, &filter, projection.as_ref())?))
+        }
+        Request::Lookup {
+            coll,
+            by,
+            values,
+            fields,
+            projection,
+        } => {
+            let Some(c) = store.collection_at(rtxn, &coll)? else {
+                return Ok(json!({
+                    "results": vec![Value::Null; values.len()],
+                    "found": 0,
+                }));
+            };
+            reject_vault_read(&c, None, "lookup on vault collections")?;
+            let by = by
+                .unwrap_or(LookupBy::Field("_id".to_string()))
+                .into_fields();
+            let projection = lookup_projection(fields.as_deref(), projection.as_ref())?;
+            let results = c.lookup_fields_in(rtxn, &by, &values, projection.as_ref())?;
+            let found = results.iter().filter(|doc| doc.is_some()).count();
+            Ok(json!({ "results": results, "found": found }))
         }
         Request::Explain {
             coll,
@@ -2296,6 +2368,7 @@ fn error_status(err: &ApiError) -> StatusCode {
         "forbidden" => StatusCode::FORBIDDEN,
         "rate_limited" => StatusCode::TOO_MANY_REQUESTS,
         "document_too_large" => StatusCode::PAYLOAD_TOO_LARGE,
+        "result_too_large" => StatusCode::PAYLOAD_TOO_LARGE,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }

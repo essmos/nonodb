@@ -39,6 +39,23 @@ pub struct IndexRequest {
     pub geo: bool,
 }
 
+/// Lookup key selector: a single field or a compound field order.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum LookupBy {
+    Field(String),
+    Fields(Vec<String>),
+}
+
+impl LookupBy {
+    pub fn into_fields(self) -> Vec<String> {
+        match self {
+            Self::Field(field) => vec![field],
+            Self::Fields(fields) => fields,
+        }
+    }
+}
+
 /// Request to `/v1/exec`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -68,6 +85,18 @@ pub enum Request {
         coll: String,
         #[serde(default)]
         filter: Value,
+        #[serde(default)]
+        projection: Option<Value>,
+    },
+    /// Ordered point lookups by `_id` or a unique single-field index.
+    Lookup {
+        coll: String,
+        #[serde(default)]
+        by: Option<LookupBy>,
+        #[serde(default)]
+        values: Vec<Value>,
+        #[serde(default)]
+        fields: Option<Vec<String>>,
         #[serde(default)]
         projection: Option<Value>,
     },
@@ -516,6 +545,7 @@ impl Request {
             Self::InsertMany { .. } => "insert_many",
             Self::Find { .. } => "find",
             Self::FindOne { .. } => "find_one",
+            Self::Lookup { .. } => "lookup",
             Self::Explain { .. } => "explain",
             Self::Update { .. } => "update",
             Self::FindAndModify { .. } => "find_and_modify",
@@ -559,6 +589,7 @@ impl Request {
         match self {
             Self::Find { .. }
             | Self::FindOne { .. }
+            | Self::Lookup { .. }
             | Self::Explain { .. }
             | Self::Count { .. }
             | Self::Aggregate { .. }
@@ -588,6 +619,7 @@ impl Request {
             | Self::InsertMany { coll, .. }
             | Self::Find { coll, .. }
             | Self::FindOne { coll, .. }
+            | Self::Lookup { coll, .. }
             | Self::Explain { coll, .. }
             | Self::Update { coll, .. }
             | Self::FindAndModify { coll, .. }
@@ -721,6 +753,7 @@ impl From<nonodb_core::Error> for ApiError {
             E::Query(_) => "invalid_query",
             E::InvalidCollectionName(_) => "invalid_collection",
             E::DocumentTooLarge(_, _) => "document_too_large",
+            E::ResultTooLarge(_, _) => "result_too_large",
             E::InvalidTtl(_) => "invalid_ttl",
             E::InvalidDate(_) => "invalid_date",
             E::InvalidNumeric(_) => "invalid_numeric",

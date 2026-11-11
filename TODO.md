@@ -24,6 +24,9 @@ limitations are documented in [docs/roadmap.md](docs/roadmap.md).
 - [x] BM25 full-text search, diacritic folding, quoted phrases
 - [x] Fuzzy search with trigrams and bounded Levenshtein distance
 - [x] Read batches and atomic write batches
+- [x] Ordered point lookups (`lookup`/`lookup_one`) by `_id` or a unique
+      single-field/compound index, with covering projections, `_id` exclusion,
+      key deduplication, response-size cap, and batch-client helpers
 - [x] Document TTL with collection defaults, document overrides, background sweeps
 - [x] BSON-compatible Extended JSON dates, indexed ranges, sorting, and unique constraints
 - [x] Exact numeric comparison/indexing, Decimal128, special doubles, decimal arithmetic
@@ -101,6 +104,41 @@ limitations are documented in [docs/roadmap.md](docs/roadmap.md).
 - [x] Use an index for sort-only queries without a filter
 - [x] `$type` index ranges for indexed scalar fields
 - [ ] Non-finite Decimal128 values
+
+### P1 — lookup enhancements
+
+- [ ] Serve `_id`-only projections (`fields=["_id"]` or
+      `projection={"_id": 1}`) directly from the unique index without reading
+      the document.
+- [ ] When several unique indexes match `by`, prefer the one whose `include`
+      fields cover the requested projection; otherwise choose the smallest
+      suitable index.
+- [ ] Benchmark a direct `get` on the encoded unique-index key instead of
+      range scan + `decode_index_value`; implement only if it wins for 1, 100,
+      and 1,000-key batches.
+- [ ] Add `lookup_all` for non-unique indexes: array-of-arrays results,
+      `limit_per_key`, total document/byte caps, per-key truncation flags,
+      input-order preservation, key deduplication, and optional residual
+      `filter`.
+- [ ] Add `explain_lookup` with selected index, covering status, key counts,
+      found/missing counts, documents read, bytes returned, and elapsed time.
+      Add aggregate lookup metrics and latency histograms.
+- [ ] Add soft per-request limits (`max_docs`, `max_bytes`) with an explicit
+      overflow policy (`error` or `truncate`) and a continuation marker instead
+      of only the all-or-nothing 64 MiB budget.
+- [ ] Add client-side `lookup_chunked` helpers that split large key lists into
+      bounded requests while preserving input order and missing-key alignment.
+- [ ] Add a client-side `lookup_join` helper for batched foreign-key resolution
+      before considering a server-side join operation.
+- [ ] Optionally report `missing` input indexes (or missing counts) for
+      diagnostics and retry logic.
+- [ ] Validate lookup limits consistently on missing-collection and batch-read
+      paths, matching the normal `lookup` validation.
+- [ ] Consider a per-key cache only for immutable collections or versioned
+      records; invalidation on update/delete must be proven before enabling it.
+- [ ] Evaluate response compression (gzip/brotli) for large lookup payloads.
+- [ ] Consider vault-collection lookup with explicit per-key encryption cost
+      and authorization boundaries; keep it rejected until then.
 
 ### P1 — durability and operations
 

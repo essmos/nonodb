@@ -10,6 +10,15 @@ examples. All clients accept `NONODB_TLS_CA`, `NONODB_TLS_CLIENT_CERT`, and
 `NONODB_TLS_CLIENT_KEY` when connecting to a daemon that requires client
 certificates.
 
+## Batch lookups
+
+All clients expose `lookup`/`lookup_one` for ordered point lookups by `_id` or a
+matching unique single-field or compound index. They support covering fields,
+projection objects, and a 64 MiB result budget. Missing keys produce `null`;
+`get_many` keeps its old filtering behavior. See
+[Batch lookups](../docs/clients.md#batch-lookups) for examples in Python, Rust,
+Node.js, and Go.
+
 ## Vector search
 
 All clients support exact vector search with `cosine`, `dot`, and `l2` metrics.

@@ -67,6 +67,38 @@ let rows = users.aggregate(&[
 ])?;
 ```
 
+## Batch lookups
+
+```rust
+use serde_json::json;
+
+articles.create_index(&["slug"], true, &["title", "status"])?;
+
+let slugs = vec!["async-rust", "missing", "lmdb"];
+let fields = ["title".to_string(), "status".to_string()];
+let documents = articles.lookup("slug", &slugs, Some(&fields))?;
+let article = articles.lookup_one(
+    "slug",
+    &"async-rust",
+    None,
+)?;
+let by_id = articles.get_many(["a", "b", "missing"])?;
+
+// Compound unique index or projection excluding `_id`.
+let keys = vec![json!(["acme", "async-rust"]), json!(["acme", "missing"])];
+let rows = articles.lookup_with(
+    &["tenant_id", "slug"],
+    &keys,
+    None,
+    Some(&json!({"title": 1, "_id": 0})),
+)?;
+```
+
+Results preserve input order and use `Value::Null` for missing keys. A non-`_id`
+lookup requires a unique index with matching field order; compound values are
+arrays. The result budget is capped at 64 MiB. See
+[Batch lookups](../docs/clients.md#batch-lookups).
+
 ## Vector search
 
 ```rust

@@ -32,7 +32,7 @@ pub mod verify;
 pub use aggregate::MAX_AGGREGATE_DOCS;
 pub use collection::{
     project_document, Collection, FindAndModifyOptions, FindAndModifyOutcome, FindQuery, IndexSpec,
-    UpdateOutcome,
+    UpdateOutcome, MAX_LOOKUP_RESPONSE_BYTES, MAX_LOOKUP_VALUES,
 };
 pub use error::{Error, Result};
 pub use history::{HistoryConfig, HistoryEntry, DEFAULT_HISTORY_MAX_VERSIONS};

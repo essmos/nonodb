@@ -33,6 +33,12 @@ const DB_SLOT_META_PREFIX: &str = "\u{1}dbslot:";
 /// Reserve some LMDB sub-database slots for collections and fixed databases.
 const MAX_DB_SLOTS: u32 = crate::store::MAX_DBS - 64;
 
+/// Maximum number of keys accepted by one `lookup` request.
+pub const MAX_LOOKUP_VALUES: usize = 10_000;
+
+/// Maximum serialized size of the `lookup` result payload.
+pub const MAX_LOOKUP_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+
 /// Minimum document count for a sorted full scan to use multiple threads.
 #[cfg(not(test))]
 const PARALLEL_SCAN_MIN_ENTRIES: usize = 50_000;
@@ -4283,6 +4289,227 @@ impl<'e> Collection<'e> {
         Ok(self.find_in(rtxn, &query)?.into_iter().next())
     }
 
+    /// Point lookup by `_id` or a unique single-field index.
+    ///
+    /// Results are returned in input order. A missing key produces `None`.
+    /// `projection` uses the normal include/exclude rules. With a covering
+    /// index, requested fields can be served without reading the document.
+    pub fn lookup(
+        &self,
+        by: &str,
+        values: &[Value],
+        projection: Option<&Value>,
+    ) -> Result<Vec<Option<Value>>> {
+        self.lookup_fields(&[by.to_string()], values, projection)
+    }
+
+    pub fn lookup_in(
+        &self,
+        rtxn: &RoTxn<'_>,
+        by: &str,
+        values: &[Value],
+        projection: Option<&Value>,
+    ) -> Result<Vec<Option<Value>>> {
+        self.lookup_fields_in(rtxn, &[by.to_string()], values, projection)
+    }
+
+    /// Point lookup by one or more fields. A multi-field lookup requires an
+    /// exact unique compound index and every value must be an array of the same
+    /// length as `by`.
+    pub fn lookup_fields(
+        &self,
+        by: &[String],
+        values: &[Value],
+        projection: Option<&Value>,
+    ) -> Result<Vec<Option<Value>>> {
+        let rtxn = self.read_txn()?;
+        let out = self.lookup_fields_in(&rtxn, by, values, projection)?;
+        rtxn.commit()?;
+        Ok(out)
+    }
+
+    pub fn lookup_fields_in(
+        &self,
+        rtxn: &RoTxn<'_>,
+        by: &[String],
+        values: &[Value],
+        projection: Option<&Value>,
+    ) -> Result<Vec<Option<Value>>> {
+        if by.is_empty() || by.iter().any(String::is_empty) {
+            return Err(Error::Query("lookup field must not be empty".into()));
+        }
+        if values.len() > MAX_LOOKUP_VALUES {
+            return Err(Error::Query(format!(
+                "lookup accepts at most {MAX_LOOKUP_VALUES} values"
+            )));
+        }
+        if values.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Deduplicate key work while preserving the original result order.
+        let mut seen: HashMap<LookupKey<'_>, usize> = HashMap::with_capacity(values.len());
+        let mut positions = Vec::with_capacity(values.len());
+        let mut unique_values = Vec::with_capacity(values.len());
+        for value in values {
+            let key = lookup_key(value)?;
+            if let Some(&index) = seen.get(&key) {
+                positions.push(index);
+            } else {
+                let index = unique_values.len();
+                seen.insert(key, index);
+                unique_values.push(value);
+                positions.push(index);
+            }
+        }
+
+        let mut unique_out = Vec::with_capacity(unique_values.len());
+        let mut unique_sizes = Vec::with_capacity(unique_values.len());
+        let mut unique_bytes = 0usize;
+
+        if by.len() == 1 && by[0] == "_id" {
+            for &value in &unique_values {
+                let (doc, size) = match value.as_str() {
+                    Some(id) => match self.db.get(rtxn, id.as_bytes())? {
+                        Some(bytes) => {
+                            let size = bytes.len();
+                            match projection {
+                                Some(projection) => {
+                                    let doc: Value = parse_json(bytes)?;
+                                    (Some(project(&doc, projection)), size)
+                                }
+                                None => (Some(parse_json(bytes)?), size),
+                            }
+                        }
+                        None => (None, 4),
+                    },
+                    None => (None, 4),
+                };
+                push_lookup_result(
+                    &mut unique_out,
+                    &mut unique_sizes,
+                    &mut unique_bytes,
+                    doc,
+                    size,
+                )?;
+            }
+            return finish_lookup(values.len(), unique_out, unique_sizes, &positions);
+        }
+
+        let def = self
+            .index_defs(rtxn)?
+            .into_iter()
+            .find(|def| {
+                def.unique
+                    && !def.geo
+                    && !def.is_multikey()
+                    && def.current_format()
+                    && def.effective_fields().as_slice() == by
+            })
+            .ok_or_else(|| {
+                Error::Query(format!(
+                    "lookup on `{}` requires a unique single-field or compound index",
+                    by.join("+")
+                ))
+            })?;
+        let Some(db) = self.index_db(rtxn, &def)? else {
+            return Err(Error::Query(format!(
+                "lookup on `{}` requires a unique single-field or compound index",
+                by.join("+")
+            )));
+        };
+
+        let covering_projection = projection.cloned();
+        for &value in &unique_values {
+            let parts = if by.len() == 1 {
+                std::slice::from_ref(value)
+            } else {
+                let Some(parts) = value.as_array() else {
+                    push_lookup_result(
+                        &mut unique_out,
+                        &mut unique_sizes,
+                        &mut unique_bytes,
+                        None,
+                        4,
+                    )?;
+                    continue;
+                };
+                if parts.len() != by.len() {
+                    push_lookup_result(
+                        &mut unique_out,
+                        &mut unique_sizes,
+                        &mut unique_bytes,
+                        None,
+                        4,
+                    )?;
+                    continue;
+                }
+                parts.as_slice()
+            };
+            let Some((lower, upper)) = lookup_bounds(parts) else {
+                push_lookup_result(
+                    &mut unique_out,
+                    &mut unique_sizes,
+                    &mut unique_bytes,
+                    None,
+                    4,
+                )?;
+                continue;
+            };
+            let range = (as_bound(&lower), as_bound(&upper));
+            let mut found = None;
+            for item in db.range(rtxn, &range)? {
+                let (_key, raw) = item?;
+                let raw_size = raw.len();
+                let Some((id, inc)) = index::decode_index_value(raw) else {
+                    continue;
+                };
+                let mut filter = Map::new();
+                for (field, part) in by.iter().zip(parts) {
+                    filter.insert(field.clone(), part.clone());
+                }
+                let filter = Value::Object(filter);
+                let (doc, size) = if let Some(doc) =
+                    covering_doc(&id, inc.as_ref(), &filter, &covering_projection)
+                {
+                    (
+                        match projection {
+                            Some(projection) => project(&doc, projection),
+                            None => doc,
+                        },
+                        raw_size,
+                    )
+                } else {
+                    let Some(bytes) = self.db.get(rtxn, id.as_bytes())? else {
+                        continue;
+                    };
+                    let size = bytes.len();
+                    match projection {
+                        Some(projection) => {
+                            let doc: Value = parse_json(bytes)?;
+                            (project(&doc, projection), size)
+                        }
+                        None => (parse_json(bytes)?, size),
+                    }
+                };
+                found = Some((doc, size));
+                break;
+            }
+            let (doc, size) = match found {
+                Some((doc, size)) => (Some(doc), size),
+                None => (None, 4),
+            };
+            push_lookup_result(
+                &mut unique_out,
+                &mut unique_sizes,
+                &mut unique_bytes,
+                doc,
+                size,
+            )?;
+        }
+        finish_lookup(values.len(), unique_out, unique_sizes, &positions)
+    }
+
     /// Explains the access path and actual counts for a `find` query.
     ///
     /// This executes the query so `actual_matched` and `actual_returned` are
@@ -5260,6 +5487,67 @@ fn compare_values(a: Option<&Value>, b: Option<&Value>, descending: bool) -> Ord
         (Some(_), None) => Ordering::Less,
         (Some(a), Some(b)) => compare_scalar_values(a, b),
     }
+}
+
+#[derive(Hash, PartialEq, Eq)]
+enum LookupKey<'a> {
+    Str(&'a str),
+    Json(String),
+}
+
+fn lookup_key(value: &Value) -> Result<LookupKey<'_>> {
+    Ok(match value.as_str() {
+        Some(value) => LookupKey::Str(value),
+        None => LookupKey::Json(serde_json::to_string(value)?),
+    })
+}
+
+fn push_lookup_result(
+    out: &mut Vec<Option<Value>>,
+    sizes: &mut Vec<usize>,
+    bytes: &mut usize,
+    doc: Option<Value>,
+    size: usize,
+) -> Result<()> {
+    *bytes = bytes.saturating_add(size);
+    if *bytes > MAX_LOOKUP_RESPONSE_BYTES {
+        return Err(Error::ResultTooLarge(*bytes, MAX_LOOKUP_RESPONSE_BYTES));
+    }
+    out.push(doc);
+    sizes.push(size);
+    Ok(())
+}
+
+fn finish_lookup(
+    total: usize,
+    unique_out: Vec<Option<Value>>,
+    unique_sizes: Vec<usize>,
+    positions: &[usize],
+) -> Result<Vec<Option<Value>>> {
+    if unique_out.len() == total {
+        return Ok(unique_out);
+    }
+    let mut out = Vec::with_capacity(total);
+    let mut bytes = 0usize;
+    for &index in positions {
+        bytes = bytes.saturating_add(unique_sizes[index]);
+        if bytes > MAX_LOOKUP_RESPONSE_BYTES {
+            return Err(Error::ResultTooLarge(bytes, MAX_LOOKUP_RESPONSE_BYTES));
+        }
+        out.push(unique_out[index].clone());
+    }
+    Ok(out)
+}
+
+fn lookup_bounds(parts: &[Value]) -> Option<crate::index::RangeBytes> {
+    let mut key = Vec::new();
+    for part in parts {
+        key.extend_from_slice(&index::encode_value(part)?);
+    }
+    Some((
+        Bound::Included(key.clone()),
+        Bound::Excluded(index::after_value(&key)),
+    ))
 }
 
 /// Builds a document from covering-index fields when the filter and projection

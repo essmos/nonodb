@@ -31,6 +31,9 @@ pub enum Error {
     #[error("document too large: {0} bytes (limit {1})")]
     DocumentTooLarge(usize, usize),
 
+    #[error("result too large: {0} bytes (limit {1})")]
+    ResultTooLarge(usize, usize),
+
     #[error("invalid TTL: {0}")]
     InvalidTtl(String),
 

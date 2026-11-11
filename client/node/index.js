@@ -7,6 +7,7 @@ const https = require('node:https');
 const READ_OPS = new Set([
   'find',
   'find_one',
+  'lookup',
   'count',
   'list_indexes',
   'list_collections',
@@ -341,17 +342,43 @@ class Collection {
     return result.indexes ?? [];
   }
 
-  /** Fetch many documents by `_id` in one read batch. */
-  async getMany(ids) {
-    const ops = Array.from(ids, (id) => ({
-      op: 'find_one',
+  /**
+   * Ordered point lookups by `_id` or a unique index.
+   * `by` is one field name or an array of fields for a compound unique index.
+   * For compound lookups each value must be an array with the same length.
+   * Missing values produce `null`. `fields` is an inclusive projection and can
+   * be served from a covering index. `projection` accepts a normal flat
+   * projection (including `_id: 0`) and cannot be combined with `fields`.
+   */
+  async lookup(by, values, { fields, projection } = {}) {
+    if (fields !== undefined && projection !== undefined) {
+      throw new Error('lookup accepts either fields or projection, not both');
+    }
+    const payload = {
+      op: 'lookup',
       coll: this.name,
-      filter: { _id: id },
-    }));
-    const results = await this.db.batch(ops);
-    return results
-      .filter((entry) => entry?.ok === true && entry.result != null)
-      .map((entry) => entry.result);
+      by: Array.isArray(by) ? Array.from(by) : by,
+      values: Array.from(values),
+    };
+    if (fields !== undefined) {
+      payload.fields = Array.from(fields);
+    }
+    if (projection !== undefined) {
+      payload.projection = projection;
+    }
+    const result = await this.db.exec(payload);
+    return result.results ?? [];
+  }
+
+  /** Return one document by `_id` or a unique index. */
+  async lookupOne(by, value, options = {}) {
+    const [document] = await this.lookup(by, [value], options);
+    return document ?? null;
+  }
+
+  async getMany(ids) {
+    const results = await this.lookup('_id', ids);
+    return results.filter((document) => document != null);
   }
 
   /** List document revisions, newest first. History must be enabled on the daemon. */

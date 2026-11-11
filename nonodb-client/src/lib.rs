@@ -725,35 +725,90 @@ impl Collection<'_> {
         value_array(result.get("indexes").cloned().unwrap_or(Value::Null))
     }
 
-    /// Fetch many documents by `_id` in one read batch.
+    /// Ordered point lookups by `_id` or a unique single-field index.
+    ///
+    /// Missing values produce `Value::Null`. Non-`_id` lookups require a unique
+    /// single-field index. `fields` uses an inclusive projection and can be
+    /// served from a covering index without reading the document.
+    pub fn lookup<V: Serialize>(
+        &self,
+        by: &str,
+        values: &[V],
+        fields: Option<&[String]>,
+    ) -> Result<Vec<Value>> {
+        self.lookup_with(&[by], values, fields, None)
+    }
+
+    /// General ordered lookup by one or more fields.
+    ///
+    /// For a compound unique index pass all fields in index order. Each value
+    /// must then be an array with the same number of elements as `by`. Missing
+    /// or malformed values produce `Value::Null`. `fields` and `projection`
+    /// are mutually exclusive; `projection` accepts a normal flat projection
+    /// including `_id: 0`.
+    pub fn lookup_with<V: Serialize>(
+        &self,
+        by: &[&str],
+        values: &[V],
+        fields: Option<&[String]>,
+        projection: Option<&Value>,
+    ) -> Result<Vec<Value>> {
+        if fields.is_some() && projection.is_some() {
+            return Err(Error::Config(
+                "lookup accepts either fields or projection, not both".to_string(),
+            ));
+        }
+        let by = if by.len() == 1 {
+            json!(by[0])
+        } else {
+            json!(by)
+        };
+        let result = self.client.exec(json!({
+            "op": "lookup",
+            "coll": self.name,
+            "by": by,
+            "values": values,
+            "fields": fields,
+            "projection": projection,
+        }))?;
+        value_array(result.get("results").cloned().unwrap_or(Value::Null))
+    }
+
+    /// Returns one document by `_id` or a unique index.
+    pub fn lookup_one<V: Serialize>(
+        &self,
+        by: &str,
+        value: &V,
+        fields: Option<&[String]>,
+    ) -> Result<Option<Value>> {
+        self.lookup_one_with(&[by], value, fields, None)
+    }
+
+    /// Returns one document by one or more unique-index fields.
+    pub fn lookup_one_with<V: Serialize>(
+        &self,
+        by: &[&str],
+        value: &V,
+        fields: Option<&[String]>,
+        projection: Option<&Value>,
+    ) -> Result<Option<Value>> {
+        Ok(self
+            .lookup_with(by, std::slice::from_ref(value), fields, projection)?
+            .into_iter()
+            .next()
+            .filter(|value| !value.is_null()))
+    }
+
     pub fn get_many<I, S>(&self, ids: I) -> Result<Vec<Value>>
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        let ops = ids
+        let ids = ids.into_iter().map(Into::into).collect::<Vec<String>>();
+        Ok(self
+            .lookup("_id", &ids, None)?
             .into_iter()
-            .map(|id| {
-                json!({
-                    "op": "find_one",
-                    "coll": self.name,
-                    "filter": {"_id": id.into()},
-                })
-            })
-            .collect::<Vec<_>>();
-        let results = self.client.batch(&ops)?;
-        Ok(results
-            .into_iter()
-            .filter_map(|result| {
-                if result.get("ok").and_then(Value::as_bool) == Some(true) {
-                    result
-                        .get("result")
-                        .cloned()
-                        .filter(|value| !value.is_null())
-                } else {
-                    None
-                }
-            })
+            .filter(|value| !value.is_null())
             .collect())
     }
 

@@ -81,6 +81,8 @@ support only a restricted subset of operations. See
 | Server-side request timeout | 30 s (`timeout` error) |
 | Document size | 1 MiB (`document_too_large`, HTTP 413) |
 | Search/fuzzy/vector `limit` | default 10, maximum 1000 |
+| `lookup` values | maximum 10,000 |
+| `lookup` result budget | 64 MiB (`result_too_large`) |
 | Fuzzy candidates | 5,000 per query |
 | Vector dimensions | 1–65,536 |
 | `write_batch` operations | bounded by request size |
@@ -97,6 +99,7 @@ client timeout with `NONODB_TIMEOUT` or the `timeout=` argument.
 | [`insert_many`](#insert_many) | Insert multiple documents |
 | [`find`](#find) | Query documents |
 | [`find_one`](#find_one) | Return one document |
+| [`lookup`](#lookup) | Ordered point lookups by `_id` or a unique index |
 | [`explain`](#explain) | Show the selected plan, bounds, and actual counts |
 | [`update`](#update) | Update or upsert documents |
 | [`find_and_modify`](#find_and_modify) | Atomically update/remove one document and return it |
@@ -246,6 +249,90 @@ Response: the document or `null`.
 
 `find_one` is `find` with `limit=1` and no sort. It stops as soon as a match is
 found. An exact `_id` filter uses a direct primary-key lookup.
+
+## lookup
+
+Ordered point lookups by `_id` or a unique index. This is the efficient batch
+alternative to N separate `find_one` calls.
+
+```json
+{
+  "op": "lookup",
+  "coll": "users",
+  "by": "email",
+  "values": ["ada@example.com", "missing@example.com", "grace@example.com"],
+  "fields": ["name", "status"]
+}
+```
+
+Response:
+
+```json
+{
+  "ok": true,
+  "result": {
+    "results": [
+      {"_id": "u1", "name": "Ada", "status": "active"},
+      null,
+      {"_id": "u2", "name": "Grace", "status": "inactive"}
+    ],
+    "found": 2
+  }
+}
+```
+
+Semantics:
+
+- `by` defaults to `_id`.
+- A non-`_id` lookup requires a **unique index** whose field order exactly
+  matches `by`; otherwise the request returns `invalid_query`.
+- `by` may be an array for a compound unique index. Each input value must then
+  be an array with the same number of elements, in the same order:
+
+  ```json
+  {
+    "op": "lookup",
+    "coll": "users",
+    "by": ["tenant_id", "email"],
+    "values": [
+      ["acme", "ada@example.com"],
+      ["other", "ada@example.com"],
+      ["acme", "missing@example.com"]
+    ]
+  }
+  ```
+
+  Compound values with the wrong shape return `null`.
+- Results are returned in input order. Missing values and values that cannot be
+  encoded return `null`; `found` is the number of non-null results.
+- Duplicate input values produce duplicate result entries. Repeated keys are
+  looked up only once internally.
+- `values` is limited to 10,000 entries per request.
+- `fields` is a top-level inclusive projection. If every requested field is
+  available in a covering index created with `include`, the document is not
+  read from the main collection. Otherwise the normal document fetch is used.
+- `projection` accepts a normal flat projection and allows excluding `_id`:
+
+  ```json
+  {
+    "op": "lookup",
+    "coll": "users",
+    "by": "email",
+    "values": ["ada@example.com"],
+    "projection": {"name": 1, "_id": 0}
+  }
+  ```
+
+  `fields` and `projection` are mutually exclusive. A covering index is used
+  only for an inclusive `projection` (or `fields`).
+- `_id` is included by default when using `fields`.
+- The result budget is 64 MiB, measured from stored document/index bytes before
+  JSON encoding. Larger responses return `result_too_large`; request fewer keys
+  or use a smaller projection.
+- `lookup` does not accept `filter`, `sort`, `skip`, or `limit`. Use `find` for
+  arbitrary predicates.
+- Non-unique lookups and lookups without a matching index are not supported yet.
+- Vault collections reject `lookup`.
 
 ## explain
 
@@ -1540,7 +1627,7 @@ Response:
 
 Rules:
 
-- Allowed operations: `find`, `find_one`, `count`, `list_indexes`,
+- Allowed operations: `find`, `find_one`, `lookup`, `count`, `list_indexes`,
   `list_text_indexes`, `list_fuzzy_indexes`, `list_vector_indexes`,
   `list_collections`, `history`, `get_version`, `search`, `fuzzy`,
   `vector_search`.
@@ -1755,6 +1842,7 @@ administrator; TCP requires a bearer token or registered client certificate.
 | `invalid_id` | 400 | `_id` is not a string |
 | `duplicate_key` | 400 | Duplicate `_id` or unique-index conflict |
 | `document_too_large` | 413 | Document exceeds 1 MiB |
+| `result_too_large` | 413 | `lookup` result budget exceeds 64 MiB |
 | `invalid_ttl` | 400 | Invalid collection default or document `_ttl` value |
 | `invalid_date` | 400 | Invalid `$date` payload, RFC 3339 string, or missing timezone |
 | `invalid_numeric` | 400 | Invalid Extended JSON number or decimal arithmetic overflow |

@@ -23,7 +23,8 @@ import (
 	"time"
 )
 
-const maxResponseBytes = 8 << 20
+// Slightly above the server lookup result cap to leave room for the JSON envelope.
+const maxResponseBytes = 80 << 20
 
 // APIError is an error returned by the daemon.
 type APIError struct {
@@ -99,6 +100,12 @@ type VectorOptions struct {
 	Filter map[string]any
 	Skip   int64
 	Limit  int64
+}
+
+// LookupOptions controls Lookup.
+type LookupOptions struct {
+	Fields     []string
+	Projection map[string]any
 }
 
 // VectorIndex describes a vector index.
@@ -381,7 +388,7 @@ func (c *Client) execOnce(ctx context.Context, payload map[string]any) (json.Raw
 func isReadOp(payload map[string]any) bool {
 	op, _ := payload["op"].(string)
 	switch op {
-	case "find", "find_one", "count", "list_indexes", "list_collections",
+	case "find", "find_one", "lookup", "count", "list_indexes", "list_collections",
 		"list_text_indexes", "list_fuzzy_indexes", "list_vector_indexes",
 		"search", "fuzzy", "vector_search", "history", "get_version", "batch":
 		return true
@@ -689,28 +696,76 @@ func (c *Collection) ListIndexes(ctx context.Context) ([]map[string]any, error) 
 	return result.Indexes, nil
 }
 
-// GetMany fetches many documents by _id in one read batch.
-func (c *Collection) GetMany(ctx context.Context, ids []string) ([]map[string]any, error) {
-	ops := make([]map[string]any, len(ids))
-	for index, id := range ids {
-		ops[index] = map[string]any{
-			"op": "find_one", "coll": c.Name, "filter": map[string]any{"_id": id},
-		}
+// Lookup performs ordered point lookups by _id or a unique index.
+// by is one field name or a []string for a compound unique index. For a
+// compound lookup each value must be an array with the same number of elements.
+// Missing or malformed values produce a nil document. Fields is an inclusive
+// projection and can be served from a covering index without reading the
+// document. Projection accepts a normal flat projection (including _id: 0) and
+// cannot be combined with Fields.
+func (c *Collection) Lookup(
+	ctx context.Context,
+	by any,
+	values []any,
+	options LookupOptions,
+) ([]map[string]any, error) {
+	if options.Fields != nil && options.Projection != nil {
+		return nil, fmt.Errorf("nonodb: lookup accepts either Fields or Projection, not both")
 	}
-	entries, err := c.client.Batch(ctx, ops)
+	payload := map[string]any{
+		"op": "lookup", "coll": c.Name, "by": by, "values": values,
+	}
+	if options.Fields != nil {
+		payload["fields"] = options.Fields
+	}
+	if options.Projection != nil {
+		payload["projection"] = options.Projection
+	}
+	raw, err := c.client.execRaw(ctx, payload)
 	if err != nil {
 		return nil, err
 	}
-	documents := make([]map[string]any, 0, len(entries))
-	for _, entry := range entries {
-		if !entry.OK || len(entry.Result) == 0 || string(entry.Result) == "null" {
-			continue
+	var result struct {
+		Results []map[string]any `json:"results"`
+	}
+	if err := decodeInto(raw, &result); err != nil {
+		return nil, err
+	}
+	return result.Results, nil
+}
+
+// LookupOne returns one document by _id or a unique index.
+func (c *Collection) LookupOne(
+	ctx context.Context,
+	by any,
+	value any,
+	options LookupOptions,
+) (map[string]any, error) {
+	results, err := c.Lookup(ctx, by, []any{value}, options)
+	if err != nil {
+		return nil, err
+	}
+	if len(results) == 0 {
+		return nil, nil
+	}
+	return results[0], nil
+}
+
+// GetMany fetches many documents by _id in one lookup request.
+func (c *Collection) GetMany(ctx context.Context, ids []string) ([]map[string]any, error) {
+	values := make([]any, len(ids))
+	for index, id := range ids {
+		values[index] = id
+	}
+	results, err := c.Lookup(ctx, "_id", values, LookupOptions{})
+	if err != nil {
+		return nil, err
+	}
+	documents := make([]map[string]any, 0, len(results))
+	for _, document := range results {
+		if document != nil {
+			documents = append(documents, document)
 		}
-		var document map[string]any
-		if err := decodeInto(entry.Result, &document); err != nil {
-			return nil, err
-		}
-		documents = append(documents, document)
 	}
 	return documents, nil
 }
