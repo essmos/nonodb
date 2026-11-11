@@ -58,6 +58,60 @@ Epoch milliseconds are also accepted. The daemon normalizes the value to
 canonical UTC milliseconds. Filter with the same representation and normal
 operators (`$gte`, `$lt`, ...); see [Dates and time zones](dates.md).
 
+## Numbers and decimals
+
+Send Decimal128 values as Extended JSON objects; no client-side decimal
+conversion is required:
+
+```python
+{"price": {"$numberDecimal": "199.99"}}
+```
+
+Use the same form in filters and update values. Ordinary JSON integers and
+floats participate in the same numeric bracket. For `NaN` and `Infinity`, use
+`{"$numberDouble": "NaN"}` or `{"$numberDouble": "Infinity"}`. Integer forms
+`{"$numberInt": "42"}` and `{"$numberLong": "9007199254740993"}` are accepted.
+See [Numbers and decimals](numerics.md).
+
+## Binary, UUID, and ObjectId
+
+Send binary, UUID, and ObjectId values as Extended JSON objects:
+
+```python
+{"payload": {"$binary": {"base64": "YQ==", "subType": "00"}}}
+{"payload": {"$uuid": "00112233-4455-6677-8899-aabbccddeeff"}}
+{"ref": {"$oid": "000000000000000000000001"}}
+```
+
+Use the same form in filters. `$uuid` is canonicalized to binary subtype `04`.
+Query types with `{"$type": "binData"}` or `{"$type": "objectId"}`. See
+[BSON scalar types](bson-types.md).
+
+## Regular expressions
+
+Use `$regex` with optional `$options`:
+
+```python
+users.find({"name": {"$regex": "^ada", "$options": "i"}})
+users.find({"tags": {"$regex": "^rus"}})
+```
+
+Only string values match; arrays are checked element by element. Invalid
+patterns/options return `invalid_query`. See [API filters](api.md#filters).
+
+## Arrays
+
+Array filters use the normal MongoDB operators:
+
+```python
+items.find({"tags": {"$all": ["rust", "lmdb"]}})
+items.find({"tags": {"$size": 2}})
+items.find({"items": {"$elemMatch": {"sku": "x", "qty": {"$gt": 5}}}})
+```
+
+Malformed operator arguments return `invalid_query`. Array fields are not
+secondary-indexed.
+
 ## Python
 
 The Python client is documented separately in [Python client](python-client.md).
@@ -111,7 +165,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 The Rust client exposes `exec`, `batch`, `write_batch`, `get_many`, history,
-aggregation, indexes, text search, and fuzzy search. `Client::from_env()` reads `NONODB_SOCK`,
+aggregation, indexes, text search, fuzzy search, and online map resize.
+`Client::from_env()` reads `NONODB_SOCK`,
 `NONODB_URL`, `NONODB_TOKEN`, `NONODB_TLS_VERIFY`, `NONODB_TLS_CA`,
 `NONODB_TLS_CLIENT_CERT`, and `NONODB_TLS_CLIENT_KEY`. For mTLS:
 
@@ -273,6 +328,7 @@ All clients expose the common document operations:
 - full-text (`search`) and fuzzy search;
 - text/fuzzy index listing and deletion;
 - collection listing and health checks;
+- LMDB map information/growth in Python and Rust (or raw `exec` elsewhere);
 - vault collection handles in Python, Rust, Node.js, and Go.
 
 Use `exec`/`Exec`/`exec` for an operation that does not have a typed wrapper.

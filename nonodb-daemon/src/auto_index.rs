@@ -12,7 +12,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use nonodb_core::bson_types;
 use nonodb_core::date;
+use nonodb_core::numeric;
 use nonodb_core::Store;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -580,7 +582,7 @@ enum CondKind {
 /// an operator outside equality/range). `Some(None)` is a condition that is skipped but
 /// safe for the rest of the query.
 fn condition_kind(value: &Value) -> Option<Option<CondKind>> {
-    if date::is_date(value) {
+    if date::is_date(value) || numeric::is_numeric(value) || bson_types::is_bson_value(value) {
         return Some(Some(CondKind::Eq));
     }
     match value {
@@ -597,6 +599,8 @@ fn condition_kind(value: &Value) -> Option<Option<CondKind>> {
                     "$eq" => {
                         if !matches!(value, Value::String(_) | Value::Number(_))
                             && !date::is_date(value)
+                            && !numeric::is_numeric(value)
+                            && !bson_types::is_bson_value(value)
                         {
                             return Some(None);
                         }
@@ -605,6 +609,8 @@ fn condition_kind(value: &Value) -> Option<Option<CondKind>> {
                     "$gt" | "$gte" | "$lt" | "$lte" => {
                         if !matches!(value, Value::String(_) | Value::Number(_))
                             && !date::is_date(value)
+                            && !numeric::is_numeric(value)
+                            && !bson_types::is_bson_value(value)
                         {
                             return Some(None);
                         }
@@ -680,6 +686,37 @@ mod tests {
         )
         .unwrap();
         assert_eq!(fields, vec!["created_at"]);
+    }
+
+    #[test]
+    fn extracts_decimal_equality_and_range() {
+        let (_, fields) = candidate_for(
+            &find(json!({
+                "price": {"$gte": {"$numberDecimal": "10.00"}}
+            })),
+            3,
+        )
+        .unwrap();
+        assert_eq!(fields, vec!["price"]);
+        let (_, fields) =
+            candidate_for(&find(json!({"price": {"$numberDecimal": "10.00"}})), 3).unwrap();
+        assert_eq!(fields, vec!["price"]);
+    }
+
+    #[test]
+    fn extracts_binary_and_object_id_equality() {
+        let (_, fields) = candidate_for(
+            &find(json!({"blob": {"$binary": {"base64": "eA==", "subType": "00"}}})),
+            3,
+        )
+        .unwrap();
+        assert_eq!(fields, vec!["blob"]);
+        let (_, fields) = candidate_for(
+            &find(json!({"ref": {"$oid": "000000000000000000000001"}})),
+            3,
+        )
+        .unwrap();
+        assert_eq!(fields, vec!["ref"]);
     }
 
     #[test]

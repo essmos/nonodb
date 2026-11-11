@@ -69,6 +69,36 @@ echo "== Go client"
 echo "== Dates"
 python3 scripts/dates_test.py
 
+echo "== Numerics"
+python3 scripts/numerics_test.py
+
+echo "== BSON types"
+python3 scripts/bson_types_test.py
+
+echo "== Regex"
+python3 scripts/regex_test.py
+
+echo "== Arrays"
+python3 scripts/arrays_test.py
+
+echo "== Array updates"
+python3 scripts/array_updates_test.py
+
+echo "== Find and modify"
+python3 scripts/find_and_modify_test.py
+
+echo "== Explain"
+python3 scripts/explain_test.py
+
+echo "== Sub-database slots"
+python3 scripts/db_slots_test.py
+
+echo "== Online map resize"
+python3 scripts/resize_test.py
+
+echo "== Graceful shutdown"
+python3 scripts/shutdown_test.py
+
 echo "== TTL"
 python3 scripts/ttl_test.py
 

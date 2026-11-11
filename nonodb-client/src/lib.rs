@@ -432,6 +432,16 @@ impl Client {
         Ok(result.get("ttl_seconds").and_then(Value::as_u64))
     }
 
+    /// Current LMDB map size and high-water mark.
+    pub fn map_info(&self) -> Result<Value> {
+        self.exec(json!({"op": "map_info"}))
+    }
+
+    /// Grow the LMDB map online. `size` is in bytes and must be page-aligned.
+    pub fn resize_map(&self, size: u64) -> Result<Value> {
+        self.exec(json!({"op": "resize_map", "size": size}))
+    }
+
     /// List collection names.
     pub fn collections(&self) -> Result<Vec<String>> {
         let result = self.exec(json!({"op": "list_collections"}))?;
@@ -503,6 +513,7 @@ fn is_read_op(payload: &Value) -> bool {
                 | "history"
                 | "get_version"
                 | "batch"
+                | "map_info"
         )
     )
 }
@@ -570,6 +581,18 @@ impl Collection<'_> {
         multi: bool,
         upsert: bool,
     ) -> Result<UpdateResult> {
+        self.update_result_with_array_filters(filter, update, multi, upsert, &[])
+    }
+
+    /// Like [`Self::update_result`], with MongoDB-style `arrayFilters`.
+    pub fn update_result_with_array_filters(
+        &self,
+        filter: &Value,
+        update: &Value,
+        multi: bool,
+        upsert: bool,
+        array_filters: &[Value],
+    ) -> Result<UpdateResult> {
         let result = self.client.exec(json!({
             "op": "update",
             "coll": self.name,
@@ -577,7 +600,41 @@ impl Collection<'_> {
             "update": update,
             "multi": multi,
             "upsert": upsert,
+            "array_filters": array_filters,
         }))?;
+        serde_json::from_value(result).map_err(Error::from)
+    }
+
+    /// Atomically update or remove one document, returning its pre-/post-image.
+    #[allow(clippy::too_many_arguments)]
+    pub fn find_and_modify(
+        &self,
+        filter: &Value,
+        update: Option<&Value>,
+        sort: &[(String, i32)],
+        new: bool,
+        upsert: bool,
+        remove: bool,
+        array_filters: &[Value],
+        projection: Option<&Value>,
+    ) -> Result<FindAndModifyResult> {
+        let mut payload = json!({
+            "op": "find_and_modify",
+            "coll": self.name,
+            "filter": filter,
+            "sort": sort,
+            "new": new,
+            "upsert": upsert,
+            "remove": remove,
+            "array_filters": array_filters,
+        });
+        if let Some(update) = update {
+            payload["update"] = update.clone();
+        }
+        if let Some(projection) = projection {
+            payload["projection"] = projection.clone();
+        }
+        let result = self.client.exec(payload)?;
         serde_json::from_value(result).map_err(Error::from)
     }
 
@@ -852,6 +909,26 @@ impl Collection<'_> {
         value_array(self.client.exec(payload)?)
     }
 
+    /// Explain the selected access path and actual counts for a query.
+    pub fn explain(&self, query: &FindQuery) -> Result<Value> {
+        let mut payload = json!({
+            "op": "explain",
+            "coll": self.name,
+            "filter": query.filter,
+            "skip": query.skip,
+        });
+        let object = payload
+            .as_object_mut()
+            .ok_or_else(|| Error::InvalidResponse("payload is not an object".into()))?;
+        if let Some(sort) = &query.sort {
+            object.insert("sort".into(), json!(sort));
+        }
+        if let Some(limit) = query.limit {
+            object.insert("limit".into(), json!(limit));
+        }
+        self.client.exec(payload)
+    }
+
     /// Find one document, or `None`.
     pub fn find_one(&self, filter: &Value, projection: Option<&Value>) -> Result<Option<Value>> {
         let mut payload = json!({
@@ -958,6 +1035,17 @@ impl FindQuery {
         self.limit = Some(limit);
         self
     }
+}
+
+/// Result of an atomic find-and-modify operation.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct FindAndModifyResult {
+    #[serde(default)]
+    pub value: Option<Value>,
+    pub matched: u64,
+    pub modified: u64,
+    #[serde(default)]
+    pub upserted_id: Option<String>,
 }
 
 /// Result of an update or upsert.

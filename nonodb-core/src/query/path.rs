@@ -1,16 +1,39 @@
-//! Document path operations, e.g. `a.b.c`.
+//! Document path operations, e.g. `a.b.c` and `items.0.name`.
 
 use crate::error::{Error, Result};
 use serde_json::Value;
 
-/// Reads a value at a path (dots denote nesting).
+fn array_index(part: &str) -> Option<usize> {
+    if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    part.parse().ok()
+}
+
+fn child<'a>(value: &'a Value, part: &str) -> Option<&'a Value> {
+    match value {
+        Value::Object(obj) => obj.get(part),
+        Value::Array(items) => array_index(part).and_then(|i| items.get(i)),
+        _ => None,
+    }
+}
+
+fn child_mut<'a>(value: &'a mut Value, part: &str) -> Option<&'a mut Value> {
+    match value {
+        Value::Object(obj) => obj.get_mut(part),
+        Value::Array(items) => array_index(part).and_then(|i| items.get_mut(i)),
+        _ => None,
+    }
+}
+
+/// Reads a value at a path (dots denote nesting, decimal segments index arrays).
 pub fn get<'a>(val: &'a Value, path: &str) -> Option<&'a Value> {
     let mut cur = val;
     for part in path.split('.') {
         if part.is_empty() {
             return None;
         }
-        cur = cur.get(part)?;
+        cur = child(cur, part)?;
     }
     Some(cur)
 }
@@ -18,9 +41,9 @@ pub fn get<'a>(val: &'a Value, path: &str) -> Option<&'a Value> {
 /// Mutable read of a value at a path (without creating missing fields).
 pub fn get_mut<'a>(val: &'a mut Value, path: &str) -> Option<&'a mut Value> {
     match path.split_once('.') {
-        None => val.as_object_mut()?.get_mut(path),
+        None => child_mut(val, path),
         Some((head, rest)) => {
-            let child = val.as_object_mut()?.get_mut(head)?;
+            let child = child_mut(val, head)?;
             get_mut(child, rest)
         }
     }
@@ -35,6 +58,25 @@ pub fn set(val: &mut Value, path: &str, new: Value) -> Result<()> {
     if head.is_empty() {
         return Err(Error::Query("empty path".into()));
     }
+
+    if let Value::Array(items) = val {
+        let Some(index) = array_index(head) else {
+            return Err(Error::Query(format!(
+                "array path segment `{head}` is not an index"
+            )));
+        };
+        if index >= items.len() {
+            items.resize(index + 1, Value::Null);
+        }
+        return match rest {
+            None => {
+                items[index] = new;
+                Ok(())
+            }
+            Some(rest) => set(&mut items[index], rest, new),
+        };
+    }
+
     if !val.is_object() {
         *val = Value::Object(Default::default());
     }
@@ -52,15 +94,52 @@ pub fn set(val: &mut Value, path: &str, new: Value) -> Result<()> {
 }
 
 /// Removes a field at a path. Returns `true` if something was removed.
+///
+/// An array element is set to `null` rather than removed, preserving indexes.
 pub fn unset(val: &mut Value, path: &str) -> bool {
     match path.split_once('.') {
-        None => val
-            .as_object_mut()
-            .map(|o| o.remove(path).is_some())
-            .unwrap_or(false),
-        Some((head, rest)) => match val.get_mut(head) {
+        None => match val {
+            Value::Object(obj) => obj.remove(path).is_some(),
+            Value::Array(items) => {
+                let Some(index) = array_index(path) else {
+                    return false;
+                };
+                match items.get_mut(index) {
+                    Some(slot) => {
+                        *slot = Value::Null;
+                        true
+                    }
+                    None => false,
+                }
+            }
+            _ => false,
+        },
+        Some((head, rest)) => match child_mut(val, head) {
             Some(child) => unset(child, rest),
             None => false,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn numeric_array_segments() {
+        let mut doc = json!({"items": [{"name": "a"}, {"name": "b"}]});
+        assert_eq!(get(&doc, "items.1.name"), Some(&json!("b")));
+        set(&mut doc, "items.1.name", json!("c")).unwrap();
+        assert_eq!(doc["items"][1]["name"], "c");
+        assert!(unset(&mut doc, "items.0.name"));
+        assert!(doc["items"][0]["name"].is_null());
+    }
+
+    #[test]
+    fn set_extends_arrays_with_null() {
+        let mut doc = json!({"a": []});
+        set(&mut doc, "a.2", json!(1)).unwrap();
+        assert_eq!(doc, json!({"a": [null, null, 1]}));
     }
 }

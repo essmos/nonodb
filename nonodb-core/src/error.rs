@@ -37,6 +37,15 @@ pub enum Error {
     #[error("invalid date: {0}")]
     InvalidDate(String),
 
+    #[error("invalid numeric: {0}")]
+    InvalidNumeric(String),
+
+    #[error("invalid binary: {0}")]
+    InvalidBinary(String),
+
+    #[error("invalid object id: {0}")]
+    InvalidObjectId(String),
+
     /// Vault/encryption error with a stable API code.
     #[error("{message}")]
     Vault { code: &'static str, message: String },

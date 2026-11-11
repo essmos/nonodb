@@ -70,6 +70,43 @@ nonodb-cli indexes users
 
 The output includes the index name, fields, uniqueness, and `include` fields.
 
+## map
+
+Show the LMDB address-space limit, high-water mark, and page size:
+
+```bash
+nonodb-cli map
+```
+
+```json
+{
+  "map_size": 1073741824,
+  "used_bytes": 7340032,
+  "free_bytes": 1066401792,
+  "page_size": 4096
+}
+```
+
+## resize
+
+Grow the LMDB map without restarting the daemon:
+
+```bash
+nonodb-cli resize 4GiB
+nonodb-cli resize 4294967296
+```
+
+```json
+{"old_size": 1073741824, "map_size": 4294967296}
+```
+
+The size must be page-aligned and at least the current map size. The command
+waits for active transactions; use a longer `NONODB_TIMEOUT` if a large write
+is in progress. It only grows the map. To shrink the reservation, stop the
+daemon, lower `NONODB_MAP_SIZE`, and restart; the file itself only shrinks via a
+compacting backup/restore. Do not run `backup` or `inspect` concurrently with
+an online resize.
+
 ## exec
 
 Send an arbitrary `/v1/exec` request:
@@ -96,6 +133,7 @@ nonodb-cli backup ./data ./backup
 
 ```text
 backup: ./data -> ./backup/data.mdb
+manifest: ./backup/manifest.json (sha256 ...)
 ```
 
 - The source is opened read-only.
@@ -105,15 +143,60 @@ backup: ./data -> ./backup/data.mdb
 - The output directory is created if needed.
 - Only `data.mdb` is copied. `lock.mdb` is not part of the backup.
 - The copy is synced to disk before the command exits.
+- `manifest.json` records the source, timestamp, file size, and SHA-256.
 
-The resulting directory is a valid nonodb data directory. To verify it:
+The resulting directory is a valid nonodb data directory. To inspect and verify it:
 
 ```bash
 nonodb-cli inspect ./backup
-NONODB_DATA=./backup NONODB_SOCK=/tmp/nonodb-restore.sock nonodb-daemon
+nonodb-cli verify-backup ./backup
 ```
 
-Stop that verification daemon before restoring the copy over production data.
+## verify
+
+Deep-check a data directory without a manifest:
+
+```bash
+nonodb-cli verify ./data
+nonodb-cli verify ./data --json
+```
+
+The command opens the database read-only and checks:
+
+- the schema version and collection registry;
+- every document's JSON and `_id` consistency;
+- every secondary index entry against its document;
+- full-text postings, document lengths, and total token counts;
+- fuzzy trigram posting counts;
+- history and TTL entry counts.
+
+Legacy index formats are counted but not reconstructed exactly.
+
+## verify-backup
+
+Verify `manifest.json`, the SHA-256 checksum, and the full database:
+
+```bash
+nonodb-cli verify-backup ./backup
+nonodb-cli verify-backup ./backup --json
+```
+
+The JSON form returns both the manifest and the verification report. A non-zero
+exit status means the backup must not be used.
+
+```text
+manifest: source=./data created_at_ms=... size=... sha256=...
+verified: ./backup
+schema: 1
+collections: 2
+documents: 1000
+...
+```
+
+## restore drill
+
+`scripts/restore_drill.py` automates the full backup → verify → restore →
+query cycle. See [Operations](operations.md#restore-drill).
 
 ## inspect
 
@@ -145,10 +228,13 @@ Restore a backup into a data directory:
 systemctl stop nonodb
 
 nonodb-cli restore ./backup ./data --force
+nonodb-cli restore ./backup ./data --force --verify
 ```
 
 ```text
 restore: ./backup/data.mdb -> ./data/data.mdb
+verified: ./data
+...
 ```
 
 Rules and warnings:
@@ -159,6 +245,9 @@ Rules and warnings:
 - The command removes a stale `lock.mdb` from the destination.
 - The backup can be either a directory containing `data.mdb` or a direct path
   to a `data.mdb` file.
+- If the backup directory has `manifest.json`, its size and SHA-256 are checked
+  before copying.
+- `--verify` deep-checks the restored directory after the copy.
 - Start the daemon after the restore and verify counts and indexes.
 
 ## Environment

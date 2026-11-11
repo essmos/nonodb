@@ -18,6 +18,10 @@ unicode-normalization = "0.1"
 thiserror = "1"
 uuid = { version = "1", features = ["v4"] }
 time = { version = "0.3.55", features = ["parsing"] }
+bson = { version = "3.1.0", default-features = false, features = ["serde", "compat-3-0-0"] }
+bigdecimal = "0.4.11"
+regex = "1"
+sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = "3"

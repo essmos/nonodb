@@ -12,10 +12,12 @@ quick-start instructions, and a feature overview.
 | [Vault collections](vault.md) | Application developers, security reviewers | Optional whole-document encryption, tenant keys, restrictions, operations, key rotation |
 | [Document TTL](ttl.md) | Application developers, operators | Collection defaults, per-document overrides, update semantics, background expiry, limits |
 | [Dates and time zones](dates.md) | Application developers | BSON-compatible dates, RFC 3339 input, filtering, indexes, sorting, timezone semantics |
+| [Numbers and decimals](numerics.md) | Application developers | Exact numeric comparison, Decimal128, arithmetic, NaN/Infinity, index compatibility, long text limits |
+| [BSON scalar types](bson-types.md) | Application developers | `$numberInt`/`$numberLong`, `$type`, binary/UUID, ObjectId, index compatibility |
 | [Clients](clients.md) | Application developers | Python, Rust, Node.js and Go: install, connection, CRUD, batches, indexes, search, aggregation |
 | [Mutual TLS](mtls.md) | Operators, security reviewers | Private CA setup, client certificates, fingerprint allow-list, revocation, rotation, troubleshooting |
 | [Python client](python-client.md) | Python developers | Connection, CRUD, upsert, indexes, search, batches, cache, FastAPI |
-| [CLI](cli.md) | Operators | Administration, backup, restore, inspect, raw requests |
+| [CLI](cli.md) | Operators | Administration, map resize, backup verification, restore drills, inspect, raw requests |
 | [Operations](operations.md) | Operators, SRE | Configuration, deployment, security, snapshots, monitoring, capacity, troubleshooting |
 | [Benchmarks](benchmarks.md) | Evaluators, maintainers | Environment, methodology, throughput, latency, memory, large-data results |
 | [Development](development.md) | Contributors | Repository layout, build, tests, scripts, conventions |
@@ -34,6 +36,8 @@ quick-start instructions, and a feature overview.
 - **Store sensitive tenant data encrypted:** [Vault collections](vault.md)
 - **Expire documents automatically:** [Document TTL](ttl.md)
 - **Filter and index timestamps:** [Dates and time zones](dates.md)
+- **Store money and exact decimals:** [Numbers and decimals](numerics.md)
+- **Use binary, UUID, ObjectId, or `$type`:** [BSON scalar types](bson-types.md)
 - **Back up and restore:** [Backup and restore](operations.md#backup-and-restore)
 - **Tune timeouts for index builds:** [Timeouts](operations.md#timeouts-and-long-operations)
 - **Understand memory usage:** [Capacity and memory](operations.md#capacity-and-memory)

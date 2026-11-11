@@ -64,6 +64,8 @@ All daemon configuration is through environment variables.
 | `NONODB_SNAPSHOT_DIR` | — | Enables periodic LMDB snapshots in this directory |
 | `NONODB_SNAPSHOT_INTERVAL` | `300` | Snapshot interval in seconds |
 | `NONODB_SNAPSHOT_KEEP` | `24` | Number of snapshot files to retain |
+| `NONODB_DRAIN_TIMEOUT` | `30` | Maximum seconds to wait for connections and queued writes during shutdown |
+| `NONODB_LOG_FORMAT` | `text` | `text` for human-readable logs or `json` for structured logs |
 | `RUST_LOG` | `info,nonodb=debug` | `tracing` log filter |
 
 Client-side environment variables:
@@ -81,8 +83,18 @@ Client-side environment variables:
 
 `NONODB_MAP_SIZE` controls the maximum size of the memory-mapped database. It
 is **not** a disk or RAM reservation. The file grows as data is written. If the
-database reaches the map limit, writes fail; increase the limit and restart the
-daemon. Existing data remains valid.
+database reaches the map limit, writes fail. Grow it online:
+
+```bash
+nonodb-cli map
+nonodb-cli resize 4GiB
+```
+
+`resize_map` waits for active LMDB transactions and briefly blocks new ones; it
+does not restart the daemon or rewrite the data. It can only grow the map. The
+new size must be page-aligned. If the request timeout is shorter than a
+long-running transaction, the client may time out even though the resize
+completes afterwards.
 
 The daemon has a shared read cache for `find`, `find_one`, `count`, search,
 fuzzy, and list operations. It is enabled by default for 5 seconds. Every
@@ -565,7 +577,23 @@ nonodb-cli backup /var/lib/nonodb /var/backups/nonodb/20261109T120000Z
 ```
 
 This is safe while the daemon is running. The output is a directory containing
-`data.mdb`, ready to be restored or opened by another daemon.
+`data.mdb` and `manifest.json`. The manifest records the source path, timestamp,
+file size, and SHA-256 checksum.
+
+Verify the backup before relying on it:
+
+```bash
+nonodb-cli verify-backup /var/backups/nonodb/20261109T120000Z
+nonodb-cli verify-backup /var/backups/nonodb/20261109T120000Z --json
+```
+
+Verification checks the manifest size and checksum, then streams every document
+and validates `_id` consistency, secondary index entries, and full-text/fuzzy
+posting counts. It is read-only and can run while the daemon is serving. For
+large databases it is I/O-heavy; schedule it like a backup.
+
+`nonodb-cli verify <data-dir>` performs the same deep check without a manifest.
+It is useful for a restored directory or a backup produced by an older release.
 
 ### Restore
 
@@ -578,21 +606,54 @@ systemctl start nonodb
 ```
 
 `restore` copies `data.mdb`, removes a stale `lock.mdb`, and requires `--force`
-when the destination already exists. Never restore over a live database.
+when the destination already exists. If the backup has a manifest, restore
+checks its size and SHA-256 before copying. Add `--verify` to deep-check the
+restored directory immediately:
 
-After restore, verify:
+```bash
+nonodb-cli restore /var/backups/nonodb/20261109T120000Z /var/lib/nonodb --force --verify
+```
+
+Never restore over a live database.
+
+After starting the daemon, verify queries and indexes:
 
 ```bash
 NONODB_SOCK=/run/nonodb/nonodb.sock nonodb-cli count users
 NONODB_SOCK=/run/nonodb/nonodb.sock nonodb-cli indexes users
 ```
 
+### Restore drill
+
+Run an automated drill on a schedule, not only after an incident:
+
+```bash
+cd /opt/nonodb
+python3 scripts/restore_drill.py
+```
+
+The drill creates a temporary source database with documents, secondary,
+text, fuzzy, history, and TTL state, takes a live backup, verifies the
+manifest and index structure, restores with `--verify`, starts a daemon on the
+restored directory, and checks counts, indexed ranges, full-text/fuzzy search,
+history, TTL, and unique-index enforcement.
+
+Example cron entry (weekly, Sunday 03:17):
+
+```cron
+17 3 * * 0 cd /opt/nonodb && NONODB_DAEMON=./target/release/nonodb-daemon NONODB_CLI=./target/release/nonodb-cli python3 scripts/restore_drill.py >>/var/log/nonodb-restore-drill.log 2>&1
+```
+
+A failed drill should page an operator. Do not treat snapshots or backups as
+valid until a restore has been exercised.
+
 ### Backup strategy
 
 - Take regular `nonodb-cli backup` copies, not just raw filesystem copies.
 - Keep at least one backup off the host.
-- Periodically restore into a scratch directory and run `inspect` and a few
-  queries.
+- Run the automated restore drill regularly and keep its logs.
+- Periodically restore into a scratch directory and run `inspect`, `verify`, and
+  a few application queries.
 - Snapshot retention is not a substitute for an independent backup policy.
 - If the database is large, backups are I/O-heavy; schedule them accordingly.
 
@@ -618,6 +679,7 @@ Useful signals:
 | `avg_commit_us` | Commit latency; storage health indicator |
 | `queue_len` | Pending writes; sustained growth means writer saturation |
 | `queue_peak` | Historical peak queue |
+| `writer_busy` | `1` while a writer transaction is executing |
 | `cache_hits_total` / `cache_misses_total` | Read-cache effectiveness |
 | `auto_index_candidates` | Query shapes currently above the frequency threshold |
 | `auto_index_active` | Automatic indexes currently tracked |
@@ -635,7 +697,17 @@ The health endpoint is public and cheap:
 curl -s --unix-socket /run/nonodb/nonodb.sock http://localhost/healthz
 ```
 
-Logs go to stderr and are controlled by `RUST_LOG`.
+Logs go to stderr and are controlled by `RUST_LOG`. The default format is
+human-readable text. Set `NONODB_LOG_FORMAT=json` for one JSON object per line:
+
+```bash
+NONODB_LOG_FORMAT=json RUST_LOG=info ./nonodb-daemon 2>>/var/log/nonodb.log
+```
+
+JSON logs keep the standard `timestamp`, `level`, `target`, and `message`
+fields. Completed `/v1/exec` requests also log `http.method`, `http.path`,
+`http.status`, and `duration_ms`; `/healthz` and `/metrics` probes are omitted
+to avoid noise.
 
 ## Capacity and memory
 
@@ -647,8 +719,21 @@ The file **does not shrink** after deletes. A compacting backup produces a
 smaller copy; restoring it reduces the live file size.
 
 `map_size` must be larger than the database high-water mark. If writes fail when
-the database grows, increase `NONODB_MAP_SIZE` and restart. There is no online
-resize.
+the database grows, grow the map online with `nonodb-cli resize`, or stop the
+daemon, raise `NONODB_MAP_SIZE`, and start it again. Neither procedure requires
+restoring a backup. Shrinking the map reservation requires a restart, and the
+file itself only shrinks through a compacting backup/restore. Do not run an
+external `backup` or `inspect` process at the same time as an online resize;
+retry administrative file commands after it completes.
+
+### Named databases
+
+Collections and the fixed metadata/history/TTL databases consume named LMDB
+sub-databases. Index, text, and fuzzy resources share a reusable slot pool:
+dropping an index returns its slot, and later indexes reuse it. The environment
+is opened with `MAX_DBS=1024`, leaving 960 slots for index/search resources.
+Legacy resources from older releases may still hold named databases; a
+compacting backup/restore reclaims them.
 
 ### Memory
 
@@ -701,6 +786,25 @@ Creating a text or fuzzy index backfills synchronously and blocks writers while
 the final write transaction is active. Schedule large index builds during
 maintenance windows.
 
+## Graceful shutdown
+
+`SIGTERM` and `SIGINT` trigger a graceful drain:
+
+1. listeners stop accepting new connections;
+2. the Unix socket file is removed;
+3. HTTP/1 connections stop keep-alive and finish in-flight requests;
+4. the writer queue and the currently executing write transaction drain;
+5. the process exits.
+
+No new work is accepted once draining starts. An already accepted request is
+allowed to finish and receive its response. The total wait is bounded by
+`NONODB_DRAIN_TIMEOUT` (default 30 seconds); connections still active after the
+timeout are aborted and this is logged.
+
+`systemctl stop nonodb` sends `SIGTERM`, so normal service restarts and
+deployments use this path. Do not use `SIGKILL` for routine restarts: LMDB
+remains crash-safe, but in-flight clients may lose their responses.
+
 ## Crash recovery
 
 After an unclean shutdown:
@@ -740,7 +844,7 @@ backups.
 | `duplicate_key` | Duplicate `_id` or unique-index conflict | Use a new id or update the existing document |
 | `invalid_query` on search | Text/fuzzy index missing | Create the index first |
 | `MDB_DBS_FULL` | Named database limit reached | Reduce collections/indexes; recreate database with fewer names |
-| Writes fail as data grows | `map_size` reached | Raise `NONODB_MAP_SIZE`, restart |
+| Writes fail as data grows | `map_size` reached | `nonodb-cli resize 4GiB`, or raise `NONODB_MAP_SIZE` and restart |
 | Socket not found after restart | Directory removed | Ensure `RuntimeDirectory=nonodb` or create the socket parent |
 | High RSS after a scan | Mapped pages touched | Expected; restart lowers RSS, OS cache remains |
 | Disk usage does not fall after delete | LMDB high-water mark | Compact via `nonodb-cli backup`, restore |

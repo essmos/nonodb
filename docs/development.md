@@ -20,9 +20,13 @@ and [HTTP API](api.md).
 │   │   ├── vault.rs           # optional encrypted collections
 │   │   ├── ttl.rs             # expiry metadata and due-entry scan
 │   │   ├── date.rs            # BSON-compatible Extended JSON dates
+│   │   ├── numeric.rs         # exact numeric/Decimal128 comparison and indexing
+│   │   ├── bson_types.rs      # binary/UUID, ObjectId, $type helpers
+│   │   ├── regex.rs           # safe $regex compilation and index-prefix hints
 │   │   ├── error.rs
 │   │   └── query/
 │   │       ├── matcher.rs     # MongoDB-like filters
+│   │       ├── validate.rs    # regex and array-operator argument validation
 │   │       ├── updater.rs     # update operators and upsert seeding
 │   │       └── path.rs        # dotted paths
 │   ├── tests/
@@ -30,6 +34,10 @@ and [HTTP API](api.md).
 │   │   ├── reopen.rs          # persistence/reopen
 │   │   ├── ttl.rs             # TTL defaults, overrides, sweeper, vault
 │   │   ├── dates.rs           # date parsing, filtering, indexes, sorting
+│   │   ├── numerics.rs        # exact numbers, Decimal128, arithmetic, indexes
+│   │   ├── bson_types.rs      # numberInt/Long, $type, binary/UUID, ObjectId
+│   │   ├── regex.rs           # $regex/$options, arrays, invalid patterns
+│   │   ├── arrays.rs          # $all, $size, $elemMatch, validation
 │   │   └── vault.rs           # vault encryption and tenant isolation
 │   └── examples/
 │       ├── backup.rs
@@ -116,15 +124,21 @@ cargo test
 This runs:
 
 - unit tests in `nonodb-core` for filters, updates, paths, index encoding,
-  unique constraints, query planning, Top-K, limits, BM25, fuzzy search, and
-  JSON edge cases;
+  unique constraints, query planning, Top-K, limits, BM25, fuzzy search,
+  numbers, decimals, binary/ObjectId, `$type`, and JSON edge cases;
+- integration tests for dates, exact numerics/Decimal128, BSON scalar types,
+  arrays and array updates, find-and-modify, explain, sub-database slots, online
+  map resize, backup verification, TTL, vault, and persistence/reopen;
 - property-based tests with `proptest` for encoding and basic query semantics;
-- a persistence/reopen integration test;
+- daemon tests for cache, automatic-index selection, and shutdown drain helpers;
 - Rust client unit/doc tests.
 
-The latest run: **65 core unit tests (including aggregation and pushdown),
-7 daemon tests (cache and automatic-index selection), 5 property tests, 1
-reopen test, and 2 Rust client unit tests**, all passing.
+The latest run: **114 core unit tests, 12 daemon tests, 5 property tests, 15
+date tests, 11 numeric tests, 8 BSON scalar-type tests, 5 regex tests, 5 array
+query tests, 5 array-update tests, 5 find-and-modify tests, 4 explain tests, 3
+sub-database slot tests, 5 online-resize tests, 6 backup-verification tests, 9
+TTL tests, 3 vault tests, 1 reopen test, and 2 Rust client unit tests**, all
+passing.
 
 ### End-to-end scripts
 
@@ -139,6 +153,17 @@ python3 scripts/batch_test.py                # read batch + get_many + cache
 python3 scripts/write_batch_test.py          # atomic commit/rollback
 python3 scripts/upsert_test.py               # upsert and array operators
 python3 scripts/dates_test.py                # Extended JSON dates, ranges, indexes
+python3 scripts/numerics_test.py             # exact numbers, decimal arithmetic/indexes
+python3 scripts/bson_types_test.py           # numberInt/Long, $type, binary/UUID, ObjectId
+python3 scripts/regex_test.py                # $regex/$options, arrays, errors
+python3 scripts/arrays_test.py               # $all, $size, $elemMatch, validation
+python3 scripts/array_updates_test.py        # positional/array-filter updates
+python3 scripts/find_and_modify_test.py      # atomic select-update-return
+python3 scripts/explain_test.py              # plans, bounds, actual counts
+python3 scripts/db_slots_test.py             # >256 index/search create-drop cycles
+python3 scripts/resize_test.py               # online map growth under concurrent I/O
+python3 scripts/restore_drill.py             # backup -> verify -> restore -> query
+python3 scripts/shutdown_test.py             # SIGTERM drain, JSON logs, durable in-flight write
 python3 scripts/ttl_test.py                  # TTL sweeps, overrides, history, vault
 python3 scripts/vault_test.py                # optional vault encryption end-to-end
 python3 scripts/vault_regression_test.py     # vault API regressions
@@ -207,6 +232,17 @@ scripts are:
 | `scripts/opt_bench.py` | Count, early exit, index update, batch comparison |
 | `scripts/aggregate_bench.py` | Per-stage aggregation timings and report pipelines |
 | `scripts/dates_test.py` | Date offsets, ranges, indexes, sorting, unique constraints |
+| `scripts/numerics_test.py` | Large integers, Decimal128, special doubles, arithmetic, indexes |
+| `scripts/bson_types_test.py` | `$numberInt`/`$numberLong`, `$type`, binary/UUID, ObjectId |
+| `scripts/regex_test.py` | `$regex`/`$options`, arrays, invalid patterns, index prefixes |
+| `scripts/arrays_test.py` | `$all`, `$size`, `$elemMatch`, validation, index/aggregation/search |
+| `scripts/array_updates_test.py` | positional `$`, `$[]`, `arrayFilters`, push modifiers, `$pull` |
+| `scripts/find_and_modify_test.py` | atomic old/new return, sort, upsert, remove, concurrent counters |
+| `scripts/explain_test.py` | access paths, index bounds, sort coverage, actual counts |
+| `scripts/db_slots_test.py` | index/text/fuzzy slot reuse above the legacy 256 limit |
+| `scripts/resize_test.py` | online map growth, concurrent I/O, rejected shrink |
+| `scripts/restore_drill.py` | live backup, manifest verification, restore, query checks |
+| `scripts/shutdown_test.py` | graceful shutdown with an in-flight atomic write, JSON logs, restart durability |
 | `scripts/ttl_test.py` | TTL defaults, overrides, update semantics, sweeper, vault |
 | `scripts/vault_test.py` | Vault encryption, tenant isolation, and restricted API |
 | `scripts/vault_regression_test.py` | Vault profiles, headers, filters, CRUD, errors, history |
@@ -215,7 +251,7 @@ scripts are:
 | `scripts/large_test.py` | 1M+ document load, indexes, query latency, RAM |
 | `scripts/large_crash_test.sh` | Crash during writes on a large database |
 | `scripts/uvicorn_test.sh` | 12 uvicorn workers against one daemon |
-| `scripts/clients_test.sh` | Rust, Node.js, Go client smoke tests, dates, TTL, vault, mTLS |
+| `scripts/clients_test.sh` | Rust, Node.js, Go client smoke tests, dates, TTL, vault, shutdown, mTLS |
 | `scripts/mtls_test.sh` | mTLS with generated CA/certs, all clients, revocation |
 | `scripts/concurrency_test.py` | Independent writers/readers and unique indexes |
 

@@ -43,6 +43,7 @@ _READ_OPS = {
     "search",
     "fuzzy",
     "batch",
+    "map_info",
 }
 
 
@@ -225,6 +226,14 @@ class NonoDB:
             return False
         return resp.status_code == 200 and resp.json().get("ok") is True
 
+    def map_info(self) -> dict[str, Any]:
+        """Current LMDB map size, high-water mark, and page size."""
+        return self.exec({"op": "map_info"})
+
+    def resize_map(self, size: int) -> dict[str, Any]:
+        """Grow the LMDB map online. `size` is in bytes and must be page-aligned."""
+        return self.exec({"op": "resize_map", "size": int(size)})
+
     def collections(self) -> list[str]:
         return self.exec({"op": "list_collections"})["collections"]
 
@@ -368,9 +377,16 @@ class Collection:
         multi: bool = False,
         *,
         upsert: bool = False,
+        array_filters: Optional[list[dict[str, Any]]] = None,
     ) -> int:
         """Updates documents; with `upsert=True`, inserts a new one when nothing matches."""
-        return self.update_result(filter, update, multi=multi, upsert=upsert)["modified"]
+        return self.update_result(
+            filter,
+            update,
+            multi=multi,
+            upsert=upsert,
+            array_filters=array_filters,
+        )["modified"]
 
     def update_result(
         self,
@@ -379,18 +395,75 @@ class Collection:
         multi: bool = False,
         *,
         upsert: bool = False,
+        array_filters: Optional[list[dict[str, Any]]] = None,
     ) -> dict[str, Any]:
         """Returns `{matched, modified, upserted_id}` (useful for upserts)."""
-        return self._db.exec(
-            {
-                "op": "update",
-                "coll": self.name,
-                "filter": filter,
-                "update": update,
-                "multi": multi,
-                "upsert": upsert,
-            }
-        )
+        payload: dict[str, Any] = {
+            "op": "update",
+            "coll": self.name,
+            "filter": filter,
+            "update": update,
+            "multi": multi,
+            "upsert": upsert,
+        }
+        if array_filters is not None:
+            payload["array_filters"] = array_filters
+        return self._db.exec(payload)
+
+    def find_and_modify(
+        self,
+        filter: dict[str, Any],
+        update: Optional[dict[str, Any]] = None,
+        *,
+        remove: bool = False,
+        new: bool = False,
+        upsert: bool = False,
+        sort: Optional[list[tuple[str, int]]] = None,
+        array_filters: Optional[list[dict[str, Any]]] = None,
+        projection: Optional[dict[str, Any]] = None,
+    ) -> Optional[dict[str, Any]]:
+        """Atomically updates/removes one document and returns its old or new image."""
+        return self.find_and_modify_result(
+            filter,
+            update,
+            remove=remove,
+            new=new,
+            upsert=upsert,
+            sort=sort,
+            array_filters=array_filters,
+            projection=projection,
+        )["value"]
+
+    def find_and_modify_result(
+        self,
+        filter: dict[str, Any],
+        update: Optional[dict[str, Any]] = None,
+        *,
+        remove: bool = False,
+        new: bool = False,
+        upsert: bool = False,
+        sort: Optional[list[tuple[str, int]]] = None,
+        array_filters: Optional[list[dict[str, Any]]] = None,
+        projection: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        """Returns `{value, matched, modified, upserted_id}`."""
+        payload: dict[str, Any] = {
+            "op": "find_and_modify",
+            "coll": self.name,
+            "filter": filter,
+            "new": new,
+            "upsert": upsert,
+            "remove": remove,
+        }
+        if update is not None:
+            payload["update"] = update
+        if sort is not None:
+            payload["sort"] = sort
+        if array_filters is not None:
+            payload["array_filters"] = array_filters
+        if projection is not None:
+            payload["projection"] = projection
+        return self._db.exec(payload)
 
     def delete(self, filter: dict[str, Any], multi: bool = False) -> int:
         return self._db.exec(
@@ -580,6 +653,27 @@ class Collection:
         }
         if projection is not None:
             payload["projection"] = projection
+        if sort is not None:
+            payload["sort"] = sort
+        if limit is not None:
+            payload["limit"] = limit
+        return self._db.exec(payload)
+
+    def explain(
+        self,
+        filter: Optional[dict[str, Any]] = None,
+        *,
+        sort: Optional[list[tuple[str, int]]] = None,
+        skip: int = 0,
+        limit: Optional[int] = None,
+    ) -> dict[str, Any]:
+        """Returns the selected access path, index/bounds, and actual counts."""
+        payload: dict[str, Any] = {
+            "op": "explain",
+            "coll": self.name,
+            "filter": filter or {},
+            "skip": skip,
+        }
         if sort is not None:
             payload["sort"] = sort
         if limit is not None:

@@ -23,13 +23,15 @@ nonodb is a real document database with:
 
 - JSON documents, MongoDB-style filters, projections, sorting and updates;
 - BSON-compatible dates with RFC 3339 input, timezone normalization and indexed ranges;
+- exact numeric comparison, BSON Decimal128, binary/UUID and ObjectId values with indexed ranges;
 - single-field, compound, unique and covering secondary indexes;
 - atomic `write_batch` for all-or-nothing groups of writes;
 - full-text search with **BM25** ranking, Unicode tokenization, diacritic
   folding and quoted phrases;
 - fuzzy search using trigrams plus Levenshtein distance;
 - a read-only aggregation pipeline for reporting and summaries;
-- snapshots, online backup, authentication, TLS/mTLS, metrics and a CLI;
+- snapshots, online backup, online LMDB map growth, authentication, TLS/mTLS, metrics and a CLI;
+- graceful shutdown with in-flight request draining and optional JSON logs;
 - document revision history with global revision IDs and configurable retention;
 - document TTL with collection defaults, per-document overrides, and background expiry;
 - optional vault collections with whole-document encryption and per-tenant keys;
@@ -124,9 +126,11 @@ footprint.
 - JSON documents in named collections, stored as JSON on disk.
 - Automatic `_id` generation with UUID v4; custom string `_id` is supported.
 - MongoDB-style filters: equality, `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`,
-  `$in`, `$nin`, `$exists`, `$not`, `$and`, `$or`, `$nor`.
+  `$in`, `$nin`, `$all`, `$size`, `$elemMatch`, `$exists`, `$regex`/`$options`,
+  `$type`, `$not`, `$and`, `$or`, `$nor`.
 - Nested paths (`{"user.address.city": "..."}`), array membership, and
-  consistent numeric comparison (`30 == 30.0`).
+  consistent, exact numeric comparison (`30 == 30.0`; large integers stay
+  distinct).
 - Projection, multi-field sort, `skip`, and `limit`.
 - Fast `find_one`/`find` paths that stop after enough matches, a raw JSON
   prefilter for simple string/boolean equalities, and `count({})`
@@ -140,6 +144,10 @@ footprint.
 - `$each` for `$push` and `$addToSet`.
 - Upsert with filter equality seeding, replacement upserts, and
   `$setOnInsert`.
+- Atomic `find_and_modify`: select with sort, update or remove, and return the
+  old or new document in one transaction.
+- `explain`: selected access path, index/range bounds, sort coverage, and
+  actual matched/returned counts.
 - Replacement updates preserve `_id`.
 - Atomic `write_batch`: all operations commit or the whole batch rolls back.
 - Read-only `batch`: many reads in one LMDB snapshot and one HTTP round trip.
@@ -250,6 +258,27 @@ curl -s --unix-socket /tmp/nonodb.sock \
 
 See [Dates and time zones](docs/dates.md) for formats, indexes, and limitations.
 
+
+### Numbers and decimals
+
+- JSON integers, floats, Decimal128, and `NaN`/`Infinity` share one numeric
+  type bracket.
+- Integers compare and index exactly; values above `2^53` are not collapsed
+  through `f64`.
+- Decimals use Extended JSON: `{"$numberDecimal": "199.9900"}`.
+- Decimal arithmetic is available in `$inc`, `$sum`, `$avg`, `$add`,
+  `$subtract`, `$multiply`, and `$divide`.
+- Special IEEE-754 values use `{"$numberDouble": "NaN"}` or
+  `{"$numberDouble": "Infinity"}`.
+- Integer forms `{"$numberInt": "42"}` / `{"$numberLong": "9007199254740993"}`
+  preserve their BSON type.
+- Binary/UUID (`$binary`, `$uuid`) and ObjectId (`$oid`) values are indexed.
+- The `$type` query operator matches BSON scalar types by name or code.
+- Long text remains a normal string, bounded by the 1 MiB document limit.
+
+See [Numbers and decimals](docs/numerics.md) for storage forms, arithmetic,
+index compatibility, and limits.
+
 ### Document TTL
 
 - Optional collection default (`ttl_seconds`) and per-document `_ttl` override.
@@ -323,8 +352,11 @@ rotation, and best-fit guidance.
   certificate verification and a fingerprint allow-list for immediate
   revocation.
 - Periodic LMDB snapshots with retention.
-- Online backup with compaction; CLI restore and inspection.
+- Online backup with SHA-256 manifests, deep verification, restore drills, and inspection.
 - JSON metrics endpoint and request/queue/commit counters.
+- Graceful `SIGTERM`/`SIGINT` drain: stop accepting, finish in-flight requests,
+  flush the writer queue, and remove the Unix socket.
+- Text or JSON logs with per-request method, path, status, and duration.
 - Group commit with adaptive batching, request size limits, and request
   timeouts.
 - Official thin clients for Python, Rust, Node.js, and Go.
@@ -561,7 +593,9 @@ More deployment details: [Operations — Docker](docs/operations.md#docker).
 | [Vault collections](docs/vault.md) | Optional encrypted tenant data, headers, restrictions, key rotation |
 | [Document TTL](docs/ttl.md) | Collection defaults, per-document expiry, update semantics, maintenance |
 | [Dates and time zones](docs/dates.md) | BSON-compatible dates, RFC 3339 input, filtering, indexes, sorting |
-| [CLI](docs/cli.md) | `ping`, `find`, `count`, `backup`, `restore`, `inspect`, `exec` |
+| [Numbers and decimals](docs/numerics.md) | Exact numeric comparison, Decimal128, arithmetic, NaN/Infinity, index compatibility, long text limits |
+| [BSON scalar types](docs/bson-types.md) | `$numberInt`/`$numberLong`, `$type`, binary/UUID, ObjectId, index compatibility |
+| [CLI](docs/cli.md) | `ping`, `find`, `count`, `map`, `resize`, `backup`, `verify-backup`, `restore`, `verify`, `inspect`, `exec` |
 | [Operations](docs/operations.md) | Configuration, deployment, security, snapshots, monitoring, capacity, troubleshooting |
 | [Benchmarks](docs/benchmarks.md) | Test environment, throughput, latency, large data sets, RAM, reproducibility |
 | [Development](docs/development.md) | Repository layout, tests, linting, benchmark scripts, contribution notes |

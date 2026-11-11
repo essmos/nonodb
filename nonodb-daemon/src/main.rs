@@ -33,9 +33,12 @@ use serde_json::{json, Value};
 use nonodb_core::heed::RoTxn;
 use nonodb_core::{
     vault, CollectionProfile, FindQuery, HistoryConfig, Store, VaultKey, DEFAULT_FUZZY_DISTANCE,
+    PAGE_SIZE,
 };
 use protocol::{ApiError, ApiResponse, Request, VaultAuth, WriteReq};
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::watch;
+use tokio::task::JoinSet;
 use tokio_rustls::rustls::pki_types::CertificateDer;
 use tokio_rustls::rustls::server::WebPkiClientVerifier;
 use tokio_rustls::rustls::{RootCertStore, ServerConfig};
@@ -76,12 +79,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,nonodb=debug".into()),
-        )
-        .init();
+    init_tracing();
 
     let data = PathBuf::from(std::env::var("NONODB_DATA").unwrap_or_else(|_| "./data".into()));
     #[cfg(unix)]
@@ -105,6 +103,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         spawn_snapshots(store.clone(), PathBuf::from(dir));
     }
 
+    let drain_timeout = drain_timeout();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        tracing::info!("shutdown signal received; draining");
+        let _ = shutdown_tx.send(true);
+    });
+
     let state = AppState {
         store,
         write_tx,
@@ -116,10 +122,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .route("/metrics", get(metrics_handler))
         .route("/v1/exec", post(exec))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
+        .layer(axum::middleware::from_fn(http_access_log))
         .with_state(state);
 
     // Optional TCP listener (with TLS when a certificate and key are provided).
     let tcp_addr = std::env::var("NONODB_TCP").ok();
+    let mut tcp_task: Option<tokio::task::JoinHandle<()>> = None;
     if let Some(addr) = tcp_addr.as_deref() {
         if std::env::var("NONODB_AUTH_TOKEN")
             .ok()
@@ -146,11 +154,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         };
         let app_tcp = app.clone();
         let addr = addr.to_string();
-        tokio::spawn(async move {
-            if let Err(e) = serve_tcp(&addr, tls, app_tcp).await {
+        let shutdown = shutdown_rx.clone();
+        tcp_task = Some(tokio::spawn(async move {
+            if let Err(e) = serve_tcp(&addr, tls, app_tcp, shutdown, drain_timeout).await {
                 tracing::error!(?e, %addr, "listener TCP zakończony");
             }
-        });
+        }));
     }
 
     #[cfg(not(unix))]
@@ -163,11 +172,19 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         tracing::info!(
+            version = env!("CARGO_PKG_VERSION"),
             data = %data.display(),
             tcp = tcp_addr.as_deref().unwrap_or(""),
             "nonodb daemon listening"
         );
-        shutdown_signal().await;
+        let mut shutdown = shutdown_rx.clone();
+        wait_for_shutdown(&mut shutdown).await;
+        if let Some(task) = tcp_task {
+            if let Err(e) = task.await {
+                tracing::warn!(?e, "TCP listener task failed during shutdown");
+            }
+        }
+        wait_for_writer(drain_timeout).await;
         tracing::info!("nonodb daemon stopped");
         return Ok(());
     }
@@ -187,15 +204,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         tracing::info!(
+            version = env!("CARGO_PKG_VERSION"),
             data = %data.display(),
             sock = %sock.display(),
             "nonodb daemon listening"
         );
 
-        let mut shutdown = Box::pin(shutdown_signal());
+        let mut shutdown = shutdown_rx.clone();
+        let mut connections = JoinSet::new();
         loop {
             let stream = tokio::select! {
-                _ = &mut shutdown => break,
+                _ = wait_for_shutdown(&mut shutdown) => break,
                 accepted = listener.accept() => accepted?.0,
             };
 
@@ -204,18 +223,122 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
 
-            let io = TokioIo::new(stream);
-            let service = TowerToHyperService::new(app.clone());
-            tokio::spawn(async move {
-                if let Err(err) = http1::Builder::new().serve_connection(io, service).await {
-                    tracing::debug!(?err, "connection closed");
-                }
+            let app = app.clone();
+            let shutdown = shutdown_rx.clone();
+            connections.spawn(async move {
+                serve_stream(stream, app, shutdown).await;
             });
         }
-
+        drop(listener);
         let _ = std::fs::remove_file(&sock);
+
+        drain_connections(connections, drain_timeout, "uds").await;
+        if let Some(task) = tcp_task {
+            if let Err(e) = task.await {
+                tracing::warn!(?e, "TCP listener task failed during shutdown");
+            }
+        }
+        wait_for_writer(drain_timeout).await;
         tracing::info!("nonodb daemon stopped");
         Ok(())
+    }
+}
+
+fn init_tracing() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "info,nonodb=debug".into());
+    let json = std::env::var("NONODB_LOG_FORMAT")
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "json"))
+        .unwrap_or(false);
+    if json {
+        tracing_subscriber::fmt()
+            .json()
+            .flatten_event(true)
+            .with_env_filter(filter)
+            .init();
+    } else {
+        tracing_subscriber::fmt().with_env_filter(filter).init();
+    }
+}
+
+fn drain_timeout() -> Duration {
+    Duration::from_secs(
+        std::env::var("NONODB_DRAIN_TIMEOUT")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(30),
+    )
+}
+
+async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>) {
+    if *shutdown.borrow() {
+        return;
+    }
+    let _ = shutdown.changed().await;
+}
+
+async fn drain_connections(mut connections: JoinSet<()>, timeout: Duration, listener: &str) {
+    if connections.is_empty() {
+        return;
+    }
+    let started = std::time::Instant::now();
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        match tokio::time::timeout_at(deadline, connections.join_next()).await {
+            Ok(Some(Ok(()))) => {}
+            Ok(Some(Err(err))) if err.is_cancelled() => {}
+            Ok(Some(Err(err))) => tracing::debug!(?err, listener, "connection task failed"),
+            Ok(None) => break,
+            Err(_) => {
+                let remaining = connections.len();
+                tracing::warn!(
+                    listener,
+                    remaining,
+                    timeout_secs = timeout.as_secs(),
+                    "graceful drain timed out; aborting connections"
+                );
+                connections.shutdown().await;
+                break;
+            }
+        }
+    }
+    tracing::info!(
+        listener,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "connections drained"
+    );
+}
+
+async fn wait_for_writer(timeout: Duration) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let started = std::time::Instant::now();
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut idle_since = None;
+    loop {
+        let queue = metrics::QUEUE_LEN.load(Relaxed);
+        let busy = metrics::WRITER_BUSY.load(Relaxed);
+        if queue == 0 && busy == 0 {
+            let since = idle_since.get_or_insert_with(std::time::Instant::now);
+            if since.elapsed() >= Duration::from_millis(100) {
+                tracing::info!(
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "writer drained"
+                );
+                return;
+            }
+        } else {
+            idle_since = None;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            tracing::warn!(
+                queue,
+                busy,
+                timeout_secs = timeout.as_secs(),
+                "writer drain timed out"
+            );
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 
@@ -385,6 +508,8 @@ async fn serve_tcp(
     addr: &str,
     tls: Option<TlsSetup>,
     app: Router,
+    mut shutdown: watch::Receiver<bool>,
+    drain_timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(
@@ -394,56 +519,81 @@ async fn serve_tcp(
         allowlist = tls.as_ref().is_some_and(|t| t.allowlist.is_some()),
         "TCP listener"
     );
+    let mut connections = JoinSet::new();
     loop {
-        let (stream, peer) = listener.accept().await?;
+        let (stream, peer) = tokio::select! {
+            _ = wait_for_shutdown(&mut shutdown) => break,
+            accepted = listener.accept() => accepted?,
+        };
         let app = app.clone();
         let tls = tls.clone();
-        tokio::spawn(async move {
+        let shutdown = shutdown.clone();
+        connections.spawn(async move {
             let Some(tls) = tls else {
-                serve_stream(stream, app).await;
+                serve_stream(stream, app, shutdown).await;
                 return;
             };
-            match tls.acceptor.accept(stream).await {
-                Ok(stream) => {
-                    if let Some(allowlist) = &tls.allowlist {
-                        let cert = stream
-                            .get_ref()
-                            .1
-                            .peer_certificates()
-                            .and_then(|certs| certs.first())
-                            .cloned();
-                        match cert {
-                            Some(cert) => match allowlist.authorize(&cert) {
-                                Ok(client) => {
-                                    tracing::debug!(%peer, %client, "mTLS client accepted");
-                                }
-                                Err(reason) => {
-                                    tracing::warn!(%peer, %reason, "mTLS client rejected");
-                                    return;
-                                }
-                            },
-                            None => {
-                                tracing::warn!(%peer, "mTLS client rejected: brak certyfikatu");
-                                return;
-                            }
-                        }
+            let mut handshake_shutdown = shutdown.clone();
+            let stream = tokio::select! {
+                _ = wait_for_shutdown(&mut handshake_shutdown) => return,
+                accepted = tls.acceptor.accept(stream) => match accepted {
+                    Ok(stream) => stream,
+                    Err(e) => {
+                        tracing::debug!(?e, %peer, "TLS handshake failed");
+                        return;
                     }
-                    serve_stream(stream, app).await;
+                },
+            };
+            if let Some(allowlist) = &tls.allowlist {
+                let cert = stream
+                    .get_ref()
+                    .1
+                    .peer_certificates()
+                    .and_then(|certs| certs.first())
+                    .cloned();
+                match cert {
+                    Some(cert) => match allowlist.authorize(&cert) {
+                        Ok(client) => {
+                            tracing::debug!(%peer, %client, "mTLS client accepted");
+                        }
+                        Err(reason) => {
+                            tracing::warn!(%peer, %reason, "mTLS client rejected");
+                            return;
+                        }
+                    },
+                    None => {
+                        tracing::warn!(%peer, "mTLS client rejected: brak certyfikatu");
+                        return;
+                    }
                 }
-                Err(e) => tracing::debug!(?e, %peer, "TLS handshake failed"),
             }
+            serve_stream(stream, app, shutdown).await;
         });
     }
+    drop(listener);
+    drain_connections(connections, drain_timeout, "tcp").await;
+    Ok(())
 }
 
-async fn serve_stream<I>(io: I, app: Router)
+async fn serve_stream<I>(io: I, app: Router, mut shutdown: watch::Receiver<bool>)
 where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let io = TokioIo::new(io);
     let service = TowerToHyperService::new(app);
-    if let Err(err) = http1::Builder::new().serve_connection(io, service).await {
-        tracing::debug!(?err, "connection closed");
+    let mut connection = Box::pin(http1::Builder::new().serve_connection(io, service));
+    tokio::select! {
+        result = &mut connection => {
+            if let Err(err) = result {
+                tracing::debug!(?err, "connection closed");
+            }
+        }
+        _ = wait_for_shutdown(&mut shutdown) => {
+            connection.as_mut().graceful_shutdown();
+            if let Err(err) = connection.await {
+                tracing::debug!(?err, "connection closed during drain");
+            }
+        }
     }
 }
 
@@ -474,10 +624,7 @@ fn spawn_snapshots(store: Arc<Store>, dir: PathBuf) {
                     .map(|d| d.as_millis())
                     .unwrap_or(0);
                 let path = dir.join(format!("data-{stamp}.mdb"));
-                match store
-                    .env()
-                    .copy_to_file(&path, nonodb_core::heed::CompactionOption::Enabled)
-                {
+                match store.copy_to_file(&path, nonodb_core::heed::CompactionOption::Enabled) {
                     Ok(file) => {
                         if let Err(e) = file.sync_all() {
                             tracing::warn!(?e, "fsync snapshotu nie powiódł się");
@@ -513,6 +660,26 @@ fn prune_snapshots(dir: &std::path::Path, keep: usize) {
             tracing::warn!(?e, path = %old.display(), "nie można usunąć starego snapshotu");
         }
     }
+}
+
+async fn http_access_log(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
+    let started = std::time::Instant::now();
+    let response = next.run(request).await;
+    if !matches!(path.as_str(), "/healthz" | "/metrics") {
+        tracing::info!(
+            http.method = %method,
+            http.path = %path,
+            http.status = response.status().as_u16(),
+            duration_ms = started.elapsed().as_secs_f64() * 1000.0,
+            "http request"
+        );
+    }
+    response
 }
 
 async fn health() -> Json<Value> {
@@ -660,6 +827,30 @@ async fn exec(
                     }
                     Ok::<Value, ApiError>(c.find(&query)?.into_iter().next().unwrap_or(Value::Null))
                 }
+            });
+            read_result(joined).await
+        }
+
+        Request::Explain {
+            coll,
+            filter,
+            sort,
+            skip,
+            limit,
+        } => {
+            let store = state.store.clone();
+            let auth = vault_auth.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                let c = read_collection(&store, &coll, auth.as_ref())?;
+                reject_vault_read(&c, auth.as_ref(), "explain")?;
+                let query = FindQuery {
+                    filter,
+                    sort,
+                    skip,
+                    limit,
+                    projection: None,
+                };
+                Ok::<Value, ApiError>(c.explain(&query)?)
             });
             read_result(joined).await
         }
@@ -893,6 +1084,37 @@ async fn exec(
             read_result(joined).await
         }
 
+        Request::MapInfo => {
+            let store = state.store.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                let map_size = store.map_size();
+                let used = store.map_used_bytes();
+                Ok::<Value, ApiError>(json!({
+                    "map_size": map_size,
+                    "used_bytes": used,
+                    "free_bytes": map_size.saturating_sub(used),
+                    "page_size": PAGE_SIZE,
+                }))
+            });
+            read_result(joined).await
+        }
+
+        Request::ResizeMap { size } => {
+            let store = state.store.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                let size = usize::try_from(size).map_err(|_| ApiError {
+                    code: "invalid_query".into(),
+                    message: "map size does not fit in usize".into(),
+                })?;
+                let old_size = store.resize_map_size(size)?;
+                Ok::<Value, ApiError>(json!({
+                    "old_size": old_size,
+                    "map_size": store.map_size(),
+                }))
+            });
+            read_result(joined).await
+        }
+
         Request::WriteBatch { ops } => {
             if vault_auth.is_some() {
                 return respond(Err(
@@ -923,12 +1145,36 @@ async fn exec(
                     update,
                     multi,
                     upsert,
+                    array_filters,
                 } => WriteReq::Update {
                     coll,
                     filter,
                     update,
                     multi,
                     upsert,
+                    array_filters,
+                    vault: vault_auth.clone(),
+                },
+                Request::FindAndModify {
+                    coll,
+                    filter,
+                    update,
+                    sort,
+                    new,
+                    upsert,
+                    remove,
+                    array_filters,
+                    projection,
+                } => WriteReq::FindAndModify {
+                    coll,
+                    filter,
+                    update,
+                    sort,
+                    new,
+                    upsert,
+                    remove,
+                    array_filters,
+                    projection,
                     vault: vault_auth.clone(),
                 },
                 Request::Delete {
@@ -1023,6 +1269,7 @@ fn cacheable(req: &Request) -> bool {
         req,
         Request::Find { .. }
             | Request::FindOne { .. }
+            | Request::Explain { .. }
             | Request::Count { .. }
             | Request::Aggregate { .. }
             | Request::Search { .. }
@@ -1134,6 +1381,34 @@ fn execute_read(store: &Store, rtxn: &RoTxn<'_>, req: Request) -> Result<Value, 
                 return Err(vault::unsupported("batch reads on vault collections").into());
             }
             Ok(json!(c.find_one_in(rtxn, &filter, projection.as_ref())?))
+        }
+        Request::Explain {
+            coll,
+            filter,
+            sort,
+            skip,
+            limit,
+        } => {
+            let Some(c) = store.collection_at(rtxn, &coll)? else {
+                return Ok(json!({
+                    "collection": coll,
+                    "access_path": "missing_collection",
+                    "candidates": 0,
+                    "actual_matched": 0,
+                    "actual_returned": 0,
+                }));
+            };
+            if c.profile().is_vault() {
+                return Err(vault::unsupported("batch reads on vault collections").into());
+            }
+            let query = FindQuery {
+                filter,
+                sort,
+                skip,
+                limit,
+                projection: None,
+            };
+            Ok(c.explain_in(rtxn, &query)?)
         }
         Request::Count { coll, filter } => {
             let Some(c) = store.collection_at(rtxn, &coll)? else {
@@ -1402,5 +1677,31 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => {},
         _ = term => {},
+    }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[tokio::test]
+    async fn drain_waits_for_inflight_connections() {
+        let mut connections = JoinSet::new();
+        connections.spawn(async {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        });
+        let started = Instant::now();
+        drain_connections(connections, Duration::from_secs(1), "test").await;
+        assert!(started.elapsed() >= Duration::from_millis(20));
+    }
+
+    #[tokio::test]
+    async fn drain_aborts_after_timeout() {
+        let mut connections = JoinSet::new();
+        connections.spawn(std::future::pending::<()>());
+        let started = Instant::now();
+        drain_connections(connections, Duration::from_millis(25), "test").await;
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 }

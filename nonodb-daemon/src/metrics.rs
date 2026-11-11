@@ -31,6 +31,8 @@ pub static TTL_BACKLOG: AtomicU64 = AtomicU64::new(0);
 pub static QUEUE_LEN: AtomicU64 = AtomicU64::new(0);
 /// Peak queue length since process start.
 pub static QUEUE_PEAK: AtomicU64 = AtomicU64::new(0);
+/// 1 while the writer is executing a batch, 0 while idle.
+pub static WRITER_BUSY: AtomicU64 = AtomicU64::new(0);
 
 pub fn inc(counter: &AtomicU64) {
     counter.fetch_add(1, Relaxed);
@@ -75,6 +77,7 @@ pub fn snapshot() -> Value {
         "write_batches_total": WRITE_BATCHES.load(Relaxed),
         "queue_len": QUEUE_LEN.load(Relaxed),
         "queue_peak": QUEUE_PEAK.load(Relaxed),
+        "writer_busy": WRITER_BUSY.load(Relaxed),
         "commit_ns_total": commit_ns,
         "ttl_sweeps_total": TTL_SWEEPS.load(Relaxed),
         "ttl_expired_total": TTL_EXPIRED.load(Relaxed),

@@ -1,16 +1,20 @@
 //! MongoDB-style filter matcher (subset).
 //!
 //! Supported operators: `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`,
-//! `$nin`, `$exists`, `$not`, `$and`, `$or`, `$nor`.
+//! `$nin`, `$all`, `$size`, `$elemMatch`, `$exists`, `$regex`/`$options`,
+//! `$type`, `$not`, `$and`, `$or`, `$nor`.
 //!
-//! Comparison rule: numbers are always converted to `f64`, so `30` and `30.0`
-//! compare as equal - consistently for `$eq` and `$gt` (see TODO 3.0).
+//! Numeric comparison is exact (JSON integers are not rounded through `f64`)
+//! and Decimal128 values participate in the same numeric type bracket.
 
 use serde_json::Value;
 use std::cmp::Ordering;
 
+use crate::bson_types;
 use crate::date;
+use crate::numeric;
 use crate::query::path;
+use crate::regex;
 
 /// Does the document match the filter? A non-object filter matches everything.
 pub fn matches(doc: &Value, filter: &Value) -> bool {
@@ -40,34 +44,111 @@ pub fn matches(doc: &Value, filter: &Value) -> bool {
     })
 }
 
-fn match_field(actual: Option<&Value>, cond: &Value) -> bool {
+pub(crate) fn match_field(actual: Option<&Value>, cond: &Value) -> bool {
     // Extended JSON dates are objects, not operators.
-    if date::is_date(cond) {
+    if date::is_date(cond) || numeric::is_numeric(cond) || bson_types::is_bson_value(cond) {
         return eq_opt(actual, cond);
     }
     if let Some(ops) = cond.as_object() {
         if !ops.is_empty() && ops.keys().all(|k| k.starts_with('$')) {
-            return ops.iter().all(|(op, arg)| match op.as_str() {
-                "$eq" => eq_opt(actual, arg),
-                "$ne" => !eq_opt(actual, arg),
-                "$gt" => cmp(actual, arg) == Some(Ordering::Greater),
-                "$gte" => matches!(cmp(actual, arg), Some(Ordering::Greater | Ordering::Equal)),
-                "$lt" => cmp(actual, arg) == Some(Ordering::Less),
-                "$lte" => matches!(cmp(actual, arg), Some(Ordering::Less | Ordering::Equal)),
-                "$in" => arg
-                    .as_array()
-                    .is_some_and(|arr| arr.iter().any(|x| eq_opt(actual, x))),
-                "$nin" => arg
-                    .as_array()
-                    .is_some_and(|arr| !arr.iter().any(|x| eq_opt(actual, x))),
-                "$exists" => actual.is_some() == arg.as_bool().unwrap_or(false),
-                "$not" => !match_field(actual, arg),
-                _ => false,
-            });
+            if let Some(pattern) = ops.get("$regex") {
+                if !regex::is_match(actual, pattern, ops.get("$options")) {
+                    return false;
+                }
+                return ops
+                    .iter()
+                    .filter(|(op, _)| op.as_str() != "$regex" && op.as_str() != "$options")
+                    .all(|(op, arg)| match_simple_op(actual, op, arg));
+            }
+            return ops.iter().all(|(op, arg)| match_simple_op(actual, op, arg));
         }
     }
     // Plain equality: { "name": "Ala" }.
     eq_opt(actual, cond)
+}
+
+fn match_simple_op(actual: Option<&Value>, op: &str, arg: &Value) -> bool {
+    match op {
+        "$eq" => eq_opt(actual, arg),
+        "$ne" => !eq_opt(actual, arg),
+        "$gt" => cmp(actual, arg) == Some(Ordering::Greater),
+        "$gte" => matches!(cmp(actual, arg), Some(Ordering::Greater | Ordering::Equal)),
+        "$lt" => cmp(actual, arg) == Some(Ordering::Less),
+        "$lte" => matches!(cmp(actual, arg), Some(Ordering::Less | Ordering::Equal)),
+        "$in" => arg
+            .as_array()
+            .is_some_and(|arr| arr.iter().any(|x| eq_opt(actual, x))),
+        "$nin" => arg
+            .as_array()
+            .is_some_and(|arr| !arr.iter().any(|x| eq_opt(actual, x))),
+        "$exists" => actual.is_some() == arg.as_bool().unwrap_or(false),
+        "$all" => all_opt(actual, arg),
+        "$size" => size_opt(actual, arg),
+        "$elemMatch" => elem_match_opt(actual, arg),
+        "$type" => actual.is_some_and(|v| bson_types::type_matches(v, arg)),
+        "$not" => !match_field(actual, arg),
+        _ => false,
+    }
+}
+
+fn all_opt(actual: Option<&Value>, arg: &Value) -> bool {
+    let Some(expected) = arg.as_array() else {
+        return false;
+    };
+    // MongoDB treats `$all: []` as matching nothing.
+    !expected.is_empty() && expected.iter().all(|value| eq_opt(actual, value))
+}
+
+fn size_opt(actual: Option<&Value>, arg: &Value) -> bool {
+    let Some(size) = arg.as_u64().and_then(|n| usize::try_from(n).ok()) else {
+        return false;
+    };
+    matches!(actual, Some(Value::Array(items)) if items.len() == size)
+}
+
+fn elem_match_opt(actual: Option<&Value>, arg: &Value) -> bool {
+    let Some(Value::Array(items)) = actual else {
+        return false;
+    };
+    if arg.as_object().is_some_and(|o| o.is_empty()) {
+        return !items.is_empty();
+    }
+    items.iter().any(|item| elem_item_matches(item, arg))
+}
+
+pub(crate) fn elem_item_matches(item: &Value, arg: &Value) -> bool {
+    let Some(query) = arg.as_object() else {
+        return false;
+    };
+    if query.is_empty() {
+        return true;
+    }
+    if elem_match_uses_filter(query) {
+        matches(item, arg)
+    } else {
+        match_field(Some(item), arg)
+    }
+}
+
+fn elem_match_uses_filter(query: &serde_json::Map<String, Value>) -> bool {
+    if query.is_empty() {
+        return false;
+    }
+    if query.keys().any(|key| !key.starts_with('$')) {
+        return true;
+    }
+    if query
+        .keys()
+        .any(|key| matches!(key.as_str(), "$and" | "$or" | "$nor"))
+    {
+        return true;
+    }
+    if let Some(Value::Object(not)) = query.get("$not") {
+        return not
+            .keys()
+            .any(|key| !key.starts_with('$') || matches!(key.as_str(), "$and" | "$or" | "$nor"));
+    }
+    false
 }
 
 /// Equality with MongoDB semantics:
@@ -83,7 +164,7 @@ pub(crate) fn eq_opt(actual: Option<&Value>, expected: &Value) -> bool {
     }
 }
 
-/// Value equality with unified number comparison.
+/// Value equality with unified numeric comparison.
 pub(crate) fn num_eq(a: &Value, b: &Value) -> bool {
     if let (Some(x), Some(y)) = (date::parse_value(a), date::parse_value(b)) {
         return x == y;
@@ -91,19 +172,27 @@ pub(crate) fn num_eq(a: &Value, b: &Value) -> bool {
     if date::parse_value(a).is_some() || date::parse_value(b).is_some() {
         return false;
     }
-    match (a, b) {
-        (Value::Number(x), Value::Number(y)) => match (x.as_f64(), y.as_f64()) {
-            (Some(x), Some(y)) => x == y,
-            _ => x == y,
-        },
-        _ => a == b,
+    if let Some(ord) = numeric::cmp_values(a, b) {
+        return ord == Ordering::Equal;
     }
+    if numeric::is_numeric(a) || numeric::is_numeric(b) {
+        return false;
+    }
+    if let Some(eq) = bson_types::eq_values(a, b) {
+        return eq;
+    }
+    a == b
 }
 
 fn cmp(actual: Option<&Value>, expected: &Value) -> Option<Ordering> {
     let a = actual?;
+    if let Some(ord) = numeric::cmp_values(a, expected) {
+        return Some(ord);
+    }
+    if let Some(ord) = bson_types::cmp_values(a, expected) {
+        return Some(ord);
+    }
     match (a, expected) {
-        (Value::Number(x), Value::Number(y)) => x.as_f64()?.partial_cmp(&y.as_f64()?),
         (Value::String(x), Value::String(y)) => Some(x.cmp(y)),
         (Value::Bool(x), Value::Bool(y)) => Some(x.cmp(y)),
         _ => date::cmp(a, expected),
@@ -166,12 +255,88 @@ mod tests {
     }
 
     #[test]
+    fn type_operator_and_extended_values() {
+        let doc = json!({
+            "s": "x",
+            "n": {"$numberLong": "9007199254740993"},
+            "b": {"$uuid": "00112233-4455-6677-8899-aabbccddeeff"},
+            "o": {"$oid": "000000000000000000000001"}
+        });
+        assert!(matches(&doc, &json!({"s": {"$type": "string"}})));
+        assert!(matches(&doc, &json!({"n": {"$type": "long"}})));
+        assert!(matches(&doc, &json!({"n": {"$type": "number"}})));
+        assert!(matches(&doc, &json!({"b": {"$type": "binData"}})));
+        assert!(matches(
+            &doc,
+            &json!({"o": {"$type": ["objectId", "string"]}})
+        ));
+        assert!(matches(
+            &doc,
+            &json!({"b": {"$uuid": "00112233-4455-6677-8899-aabbccddeeff"}})
+        ));
+    }
+
+    #[test]
     fn array_contains() {
         let doc = json!({"tags": ["a", "b"]});
         assert!(matches(&doc, &json!({"tags": "a"})));
         assert!(!matches(&doc, &json!({"tags": "c"})));
         assert!(matches(&doc, &json!({"tags": {"$in": ["c", "b"]}})));
     }
+    #[test]
+    fn regex_operator_and_options() {
+        let doc = json!({"name": "Ala", "tags": ["kot", "pies"], "n": 42});
+        assert!(matches(&doc, &json!({"name": {"$regex": "^Al"}})));
+        assert!(matches(
+            &doc,
+            &json!({"name": {"$regex": "^ala$", "$options": "i"}})
+        ));
+        assert!(!matches(&doc, &json!({"name": {"$regex": "^ala$"}})));
+        assert!(matches(&doc, &json!({"tags": {"$regex": "^pi"}})));
+        assert!(matches(&doc, &json!({"name": {"$not": {"$regex": "^Bo"}}})));
+        assert!(!matches(&doc, &json!({"n": {"$regex": "42"}})));
+        assert!(matches(
+            &doc,
+            &json!({"name": {"$regex": {"$regularExpression": {
+                "pattern": "^ala$", "options": "i"
+            }}}})
+        ));
+    }
+
+    #[test]
+    fn array_operators() {
+        let doc = json!({
+            "tags": ["a", "b"],
+            "nums": [1, 2, 3],
+            "items": [{"x": 1, "y": 2}, {"x": 2, "y": 3}],
+            "scalar": "a"
+        });
+        assert!(matches(&doc, &json!({"tags": {"$all": ["a", "b"]}})));
+        assert!(!matches(&doc, &json!({"tags": {"$all": ["a", "c"]}})));
+        assert!(!matches(&doc, &json!({"tags": {"$all": []}})));
+        assert!(matches(&doc, &json!({"scalar": {"$all": ["a"]}})));
+        assert!(matches(&doc, &json!({"tags": {"$size": 2}})));
+        assert!(!matches(&doc, &json!({"tags": {"$size": 1}})));
+        assert!(!matches(&doc, &json!({"scalar": {"$size": 1}})));
+        assert!(matches(
+            &doc,
+            &json!({"nums": {"$elemMatch": {"$gt": 2, "$lt": 4}}})
+        ));
+        assert!(matches(
+            &doc,
+            &json!({"items": {"$elemMatch": {"x": 1, "y": {"$gte": 2}}}})
+        ));
+        assert!(!matches(
+            &doc,
+            &json!({"items": {"$elemMatch": {"x": 1, "y": 3}}})
+        ));
+        assert!(matches(
+            &doc,
+            &json!({"items": {"$elemMatch": {"$and": [{"x": 2}, {"y": 3}]}}})
+        ));
+        assert!(!matches(&doc, &json!({"missing": {"$elemMatch": {}}})));
+    }
+
     #[test]
     fn dates_compare_by_instant_across_offsets() {
         let doc = json!({"at": {"$date": "2026-01-01T00:00:00Z"}});

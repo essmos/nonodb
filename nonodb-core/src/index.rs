@@ -5,11 +5,17 @@ use std::ops::Bound;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::bson_types;
 use crate::date;
+use crate::numeric;
+use crate::regex;
 
 /// Index encoding format. Version 0 means an index created before
 /// BSON-compatible dates existed; date values were skipped in those indexes.
-pub const FORMAT_VERSION: u8 = 2;
+/// Version 2 used the old `f64` encoding for all numbers; version 3 uses exact
+/// decimal numeric keys and supports Decimal128; version 4 adds Extended JSON
+/// binary/UUID and ObjectId keys.
+pub const FORMAT_VERSION: u8 = 4;
 
 /// Index definition stored in `meta` under `index:<coll>:<name>`.
 ///
@@ -99,21 +105,13 @@ pub fn encode_value(v: &Value) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(10);
     match v {
         Value::Null => out.push(0x01),
-        Value::Number(n) => {
+        Value::Number(_) => {
             out.push(0x02);
-            out.extend_from_slice(&orderable_f64(n.as_f64()?));
+            out.extend_from_slice(&numeric::encode_ordered(v)?);
         }
         Value::String(s) => {
             out.push(0x03);
-            // Escape NUL: 0x00 -> 0x00 0x01; terminator: 0x00 0x00.
-            for &b in s.as_bytes() {
-                if b == 0 {
-                    out.push(0x00);
-                    out.push(0x01);
-                } else {
-                    out.push(b);
-                }
-            }
+            push_escaped_string(&mut out, s);
             out.push(0x00);
             out.push(0x00);
         }
@@ -122,12 +120,44 @@ pub fn encode_value(v: &Value) -> Option<Vec<u8>> {
             out.push(u8::from(*b));
         }
         _ => {
-            let ms = date::parse_value(v)?;
-            out.push(0x05);
-            out.extend_from_slice(&date::encode_ordered(ms));
+            if let Some(key) = numeric::encode_ordered(v) {
+                out.push(0x02);
+                out.extend_from_slice(&key);
+            } else if let Some(key) = bson_types::binary_key(v) {
+                out.push(0x06);
+                out.extend_from_slice(&key);
+            } else if let Some(id) = bson_types::object_id_key(v) {
+                out.push(0x07);
+                out.extend_from_slice(&id);
+            } else {
+                let ms = date::parse_value(v)?;
+                out.push(0x05);
+                out.extend_from_slice(&date::encode_ordered(ms));
+            }
         }
     }
     Some(out)
+}
+
+fn push_escaped_string(out: &mut Vec<u8>, s: &str) {
+    // Escape NUL: 0x00 -> 0x00 0x01. The string terminator is appended by
+    // `encode_value`; prefix bounds intentionally leave it off.
+    for &b in s.as_bytes() {
+        if b == 0 {
+            out.push(0x00);
+            out.push(0x01);
+        } else {
+            out.push(b);
+        }
+    }
+}
+
+/// Index range for all strings beginning with `prefix` (`^prefix` regex).
+pub fn string_prefix_bounds(prefix: &str) -> RangeBytes {
+    let mut lower = vec![0x03];
+    push_escaped_string(&mut lower, prefix);
+    let upper = after_value(&lower);
+    (Bound::Included(lower), Bound::Excluded(upper))
 }
 
 /// Encodes values of all index fields (compound index).
@@ -184,21 +214,6 @@ pub fn decode_index_value(raw: &[u8]) -> Option<(String, Option<serde_json::Map<
         .map(|id| (id.to_string(), None))
 }
 
-fn orderable_f64(f: f64) -> [u8; 8] {
-    // Normalize -0.0 -> 0.0: `f64` treats them as equal, so encoding
-    // must too (otherwise key order would differ from comparisons).
-    let f = if f == 0.0 { 0.0 } else { f };
-    let bits = f.to_bits();
-    // Ordering: negative numbers have inverted bits, positive numbers have the
-    // high bit set, so big-endian comparison matches `f64`.
-    let enc = if bits & (1 << 63) != 0 {
-        !bits
-    } else {
-        bits ^ (1 << 63)
-    };
-    enc.to_be_bytes()
-}
-
 fn after_value(vb: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(vb.len() + 1);
     out.extend_from_slice(vb);
@@ -234,8 +249,11 @@ pub fn bounds(op: &str, value: &Value) -> Option<RangeBytes> {
 /// type as the condition value; the matcher does not compare different types, so
 /// otherwise `$gt: 2` would also include strings/bools from the index.
 pub fn bounds_from_cond(cond: &Value) -> Option<RangeBytes> {
-    if date::is_date(cond) {
+    if date::is_date(cond) || numeric::is_numeric(cond) || bson_types::is_bson_value(cond) {
         return bounds("$eq", cond);
+    }
+    if let Some(prefix) = regex::condition_prefix(cond) {
+        return Some(string_prefix_bounds(&prefix));
     }
     let Some(obj) = cond.as_object() else {
         return bounds("$eq", cond);
@@ -247,6 +265,14 @@ pub fn bounds_from_cond(cond: &Value) -> Option<RangeBytes> {
         let (op, value) = obj.iter().next()?;
         if op == "$eq" {
             return bounds(op, value);
+        }
+        if op == "$all" {
+            let values = value.as_array()?;
+            return if values.len() == 1 {
+                bounds("$eq", &values[0])
+            } else {
+                None
+            };
         }
         return range_bounds(std::iter::once((op.as_str(), value)));
     }
@@ -437,6 +463,25 @@ mod tests {
     }
 
     #[test]
+    fn string_prefix_bounds_cover_only_the_prefix() {
+        let (lo, hi) = string_prefix_bounds("Al");
+        let ala = enc(json!("Ala"));
+        let al = enc(json!("Al"));
+        let bob = enc(json!("Bob"));
+        let lower = match lo {
+            Bound::Included(v) => v,
+            _ => panic!("expected included lower bound"),
+        };
+        let upper = match hi {
+            Bound::Excluded(v) => v,
+            _ => panic!("expected excluded upper bound"),
+        };
+        assert!(lower <= al && al < upper);
+        assert!(lower <= ala && ala < upper);
+        assert!(bob >= upper);
+    }
+
+    #[test]
     fn date_ranges_use_date_bounds() {
         let cond = serde_json::json!({
             "$gte": {"$date": "2026-01-01T01:00:00+01:00"},
@@ -445,6 +490,45 @@ mod tests {
         let (lower, upper) = bounds_from_cond(&cond).unwrap();
         assert!(matches!(lower, Bound::Included(_)));
         assert!(matches!(upper, Bound::Excluded(_)));
+    }
+
+    #[test]
+    fn large_integers_keep_exact_index_order() {
+        let a = enc(json!(9_007_199_254_740_992i64));
+        let b = enc(json!(9_007_199_254_740_993i64));
+        assert!(a < b);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn decimals_share_numeric_index_bracket() {
+        let one = enc(json!(1));
+        let decimal_one = enc(json!({"$numberDecimal": "1.00"}));
+        let decimal_half = enc(json!({"$numberDecimal": "0.5"}));
+        assert_eq!(one, decimal_one);
+        assert!(decimal_half < one);
+        let (lo, hi) = bounds_from_cond(&json!({
+            "$gte": {"$numberDecimal": "0.5"},
+            "$lt": 2
+        }))
+        .unwrap();
+        assert!(matches!(lo, Bound::Included(_)));
+        assert!(matches!(hi, Bound::Excluded(_)));
+    }
+
+    #[test]
+    fn binary_and_object_id_keep_index_order() {
+        let a = enc(json!({"$oid": "000000000000000000000001"}));
+        let b = enc(json!({"$oid": "000000000000000000000002"}));
+        assert!(a < b);
+
+        let short = enc(json!({"$binary": {"base64": "eA==", "subType": "00"}}));
+        let long = enc(json!({"$binary": {"base64": "eHg=", "subType": "00"}}));
+        assert!(short < long);
+        assert_eq!(
+            enc(json!({"$uuid": "00112233-4455-6677-8899-aabbccddeeff"})),
+            enc(json!({"$binary": {"base64": "ABEiM0RVZneImaq7zN3u/w==", "subType": "04"}}))
+        );
     }
 
     #[test]

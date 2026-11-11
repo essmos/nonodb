@@ -7,11 +7,15 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashSet};
 
+use bigdecimal::num_traits::Zero;
+use bigdecimal::{BigDecimal, FromPrimitive};
 use serde_json::{Map, Value};
 
+use crate::bson_types;
 use crate::collection::compare_docs;
 use crate::date;
 use crate::error::{Error, Result};
+use crate::numeric;
 use crate::query::{matches, path};
 
 /// Maximum number of documents allowed in an intermediate aggregation result.
@@ -222,9 +226,17 @@ fn as_usize(value: &Value, stage: &str) -> Result<usize> {
 fn truthy(value: &Value) -> bool {
     match value {
         Value::Bool(b) => *b,
-        Value::Number(n) => n.as_f64().is_some_and(|v| v != 0.0),
+        Value::Number(_) => numeric::parse_value(value).is_some_and(|n| {
+            !matches!(n.value(), numeric::Numeric::Finite { len: 1, digits, .. } if digits[0] == 0)
+        }),
         Value::Null => false,
-        _ => true,
+        _ => {
+            if let Some(n) = numeric::parse_value(value) {
+                !matches!(n.value(), numeric::Numeric::Finite { len: 1, digits, .. } if digits[0] == 0)
+            } else {
+                true
+            }
+        }
     }
 }
 
@@ -492,17 +504,59 @@ fn group(docs: Vec<Value>, spec: &Value) -> Result<Vec<Value>> {
             let mut out = Map::new();
             out.insert("_id".to_string(), group.id);
             for ((field, _, _), state) in accumulators.iter().zip(group.values) {
-                out.insert(field.clone(), state.finish());
+                out.insert(field.clone(), state.finish()?);
             }
             Ok(Value::Object(out))
         })
         .collect()
 }
 
+enum NumericSum {
+    Float(f64),
+    Decimal(BigDecimal),
+}
+
+impl NumericSum {
+    fn add(&mut self, value: &Value) {
+        if numeric::is_decimal(value) {
+            let Some(d) = numeric::as_bigdecimal(value) else {
+                return;
+            };
+            match self {
+                Self::Float(f) => {
+                    let mut sum = BigDecimal::from_f64(*f).unwrap_or_default();
+                    sum += d;
+                    *self = Self::Decimal(sum);
+                }
+                Self::Decimal(sum) => *sum += d,
+            }
+            return;
+        }
+        let Some(f) = numeric::as_f64(value) else {
+            return;
+        };
+        match self {
+            Self::Float(sum) => *sum += f,
+            Self::Decimal(sum) => {
+                if let Some(d) = BigDecimal::from_f64(f) {
+                    *sum += d;
+                }
+            }
+        }
+    }
+
+    fn finish(self) -> Result<Value> {
+        match self {
+            Self::Float(n) => Ok(number_value(n)),
+            Self::Decimal(n) => numeric::decimal_value(&n),
+        }
+    }
+}
+
 enum Accumulator {
-    Sum(f64),
+    Sum(NumericSum),
     Avg {
-        sum: f64,
+        sum: NumericSum,
         count: u64,
     },
     Min(Option<Value>),
@@ -523,8 +577,11 @@ enum Accumulator {
 impl Accumulator {
     fn new(op: &str) -> Self {
         match op {
-            "$sum" => Self::Sum(0.0),
-            "$avg" => Self::Avg { sum: 0.0, count: 0 },
+            "$sum" => Self::Sum(NumericSum::Float(0.0)),
+            "$avg" => Self::Avg {
+                sum: NumericSum::Float(0.0),
+                count: 0,
+            },
             "$min" => Self::Min(None),
             "$max" => Self::Max(None),
             "$first" => Self::First {
@@ -544,14 +601,10 @@ impl Accumulator {
 
     fn update(&mut self, op: &str, value: &Value) -> Result<()> {
         match (self, op) {
-            (Self::Sum(sum), "$sum") => {
-                if let Some(n) = value.as_f64() {
-                    *sum += n;
-                }
-            }
+            (Self::Sum(sum), "$sum") => sum.add(value),
             (Self::Avg { sum, count }, "$avg") => {
-                if let Some(n) = value.as_f64() {
-                    *sum += n;
+                if numeric::parse_value(value).is_some_and(|n| n.is_finite()) {
+                    sum.add(value);
                     *count += 1;
                 }
             }
@@ -601,27 +654,26 @@ impl Accumulator {
         Ok(())
     }
 
-    fn finish(self) -> Value {
+    fn finish(self) -> Result<Value> {
         match self {
-            Self::Sum(sum) => number_value(sum),
+            Self::Sum(sum) => sum.finish(),
             Self::Avg { sum, count } => {
                 if count == 0 {
-                    Value::Null
+                    Ok(Value::Null)
                 } else {
-                    number_value(sum / count as f64)
+                    match sum {
+                        NumericSum::Float(sum) => Ok(number_value(sum / count as f64)),
+                        NumericSum::Decimal(sum) => {
+                            numeric::decimal_value(&(sum / BigDecimal::from(count)))
+                        }
+                    }
                 }
             }
-            Self::Min(value) | Self::Max(value) => value.unwrap_or(Value::Null),
-            Self::Last(value) => value,
-            Self::First { seen, value } => {
-                if seen {
-                    value
-                } else {
-                    Value::Null
-                }
-            }
-            Self::Push(values) | Self::AddToSet { values, .. } => Value::Array(values),
-            Self::Count(count) => Value::from(count),
+            Self::Min(value) | Self::Max(value) => Ok(value.unwrap_or(Value::Null)),
+            Self::Last(value) => Ok(value),
+            Self::First { seen, value } => Ok(if seen { value } else { Value::Null }),
+            Self::Push(values) | Self::AddToSet { values, .. } => Ok(Value::Array(values)),
+            Self::Count(count) => Ok(Value::from(count)),
         }
     }
 }
@@ -635,11 +687,13 @@ fn number_value(n: f64) -> Value {
 }
 
 fn compare_value(a: &Value, b: &Value) -> Ordering {
+    if let Some(ord) = numeric::cmp_values(a, b) {
+        return ord;
+    }
+    if let Some(ord) = bson_types::cmp_values(a, b) {
+        return ord;
+    }
     match (a, b) {
-        (Value::Number(x), Value::Number(y)) => x
-            .as_f64()
-            .partial_cmp(&y.as_f64())
-            .unwrap_or(Ordering::Equal),
         (Value::String(x), Value::String(y)) => x.cmp(y),
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
         (Value::Null, Value::Null) => Ordering::Equal,
@@ -647,6 +701,36 @@ fn compare_value(a: &Value, b: &Value) -> Ordering {
         (_, Value::Null) => Ordering::Less,
         _ => date::cmp(a, b).unwrap_or(Ordering::Equal),
     }
+}
+
+fn decimal_arithmetic(op: &str, values: &[Value]) -> Result<Value> {
+    let mut nums = Vec::with_capacity(values.len());
+    for value in values {
+        let n = numeric::as_bigdecimal(value)
+            .ok_or_else(|| Error::Query(format!("{op} requires finite numbers")))?;
+        nums.push(n);
+    }
+    let result = match op {
+        "$add" => nums.into_iter().fold(BigDecimal::from(0), |a, b| a + b),
+        "$subtract" => {
+            if nums.len() != 2 {
+                return Err(Error::Query("$subtract requires two arguments".into()));
+            }
+            nums[0].clone() - nums[1].clone()
+        }
+        "$multiply" => nums.into_iter().fold(BigDecimal::from(1), |a, b| a * b),
+        "$divide" => {
+            if nums.len() != 2 {
+                return Err(Error::Query("$divide requires two arguments".into()));
+            }
+            if nums[1].is_zero() {
+                return Err(Error::Query("$divide by zero".into()));
+            }
+            nums[0].clone() / nums[1].clone()
+        }
+        _ => unreachable!(),
+    };
+    numeric::decimal_value(&result)
 }
 
 fn eval_expr(doc: &Value, expr: &Value) -> Result<Value> {
@@ -661,7 +745,11 @@ fn eval_expr(doc: &Value, expr: &Value) -> Result<Value> {
             .collect::<Result<Vec<_>>>()
             .map(Value::Array),
         Value::Object(obj)
-            if obj.len() == 1 && obj.keys().next().is_some_and(|k| k.starts_with('$')) =>
+            if obj.len() == 1
+                && obj.keys().next().is_some_and(|k| k.starts_with('$'))
+                && !date::is_date(expr)
+                && !numeric::is_numeric(expr)
+                && !bson_types::is_bson_value(expr) =>
         {
             eval_operator(doc, obj)
         }
@@ -700,18 +788,19 @@ fn eval_operator(doc: &Value, obj: &Map<String, Value>) -> Result<Value> {
         }
         "$add" | "$subtract" | "$multiply" | "$divide" => {
             let values = args()?;
+            if values.iter().any(numeric::is_decimal) {
+                return decimal_arithmetic(op, &values);
+            }
             if op == "$add" {
-                let sum = values.iter().filter_map(Value::as_f64).sum::<f64>();
+                let sum = values.iter().filter_map(numeric::as_f64).sum::<f64>();
                 return Ok(number_value(sum));
             }
             if values.len() != 2 {
                 return Err(Error::Query(format!("{op} requires two arguments")));
             }
-            let a = values[0]
-                .as_f64()
+            let a = numeric::as_f64(&values[0])
                 .ok_or_else(|| Error::Query(format!("{op} requires numbers")))?;
-            let b = values[1]
-                .as_f64()
+            let b = numeric::as_f64(&values[1])
                 .ok_or_else(|| Error::Query(format!("{op} requires numbers")))?;
             let result = match op.as_str() {
                 "$subtract" => a - b,

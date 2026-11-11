@@ -10,15 +10,25 @@ use heed::{Database, Env, RoTxn, RwTxn};
 use serde_json::{Map, Value};
 
 use crate::aggregate;
+use crate::bson_types;
 use crate::date;
 use crate::error::{Error, Result};
 use crate::history::{self, HistoryConfig, HistoryEntry};
 use crate::index::{self, IndexDef};
-use crate::query::{apply_update, apply_upsert, matches, path, seed_from_filter};
+use crate::numeric;
+use crate::query::{
+    apply_upsert_with_options, apply_with_options, matches, path, seed_from_filter,
+};
 use crate::search;
 use crate::store::MAX_DOCUMENT_BYTES;
 use crate::ttl::{self, TtlUpdate};
 use crate::vault::{self, CollectionProfile, VaultKey};
+use crate::verify::{CollectionVerification, IndexVerification};
+
+/// Meta prefix for reusable physical sub-database slots.
+const DB_SLOT_META_PREFIX: &str = "\u{1}dbslot:";
+/// Reserve some LMDB sub-database slots for collections and fixed databases.
+const MAX_DB_SLOTS: u32 = crate::store::MAX_DBS - 64;
 
 /// Minimum document count for a sorted full scan to use multiple threads.
 #[cfg(not(test))]
@@ -130,6 +140,31 @@ pub struct UpdateOutcome {
     pub modified: usize,
     pub upserted_id: Option<String>,
 }
+
+/// Options for an atomic find-and-modify operation.
+#[derive(Debug, Clone)]
+pub struct FindAndModifyOptions<'a> {
+    pub filter: &'a Value,
+    /// Update document, or `None` when `remove` is set.
+    pub update: Option<&'a Value>,
+    pub sort: &'a [(String, i32)],
+    /// Return the document after the operation instead of before it.
+    pub new: bool,
+    pub upsert: bool,
+    pub remove: bool,
+    pub array_filters: &'a [Value],
+    pub projection: Option<&'a Value>,
+}
+
+/// Result of an atomic find-and-modify operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FindAndModifyOutcome {
+    /// Pre-image when `new = false`, post-image when `new = true`.
+    pub value: Option<Value>,
+    pub matched: usize,
+    pub modified: usize,
+    pub upserted_id: Option<String>,
+}
 type IndexIter<'a> = Box<dyn Iterator<Item = heed::Result<(&'a [u8], &'a [u8])>> + 'a>;
 type IdBounds = (Bound<Vec<u8>>, Bound<Vec<u8>>);
 
@@ -170,6 +205,7 @@ pub struct Collection<'e> {
     ttl_default_seconds: Option<u64>,
     ttl_purge_history: bool,
     env: &'e Env,
+    txn_gate: &'e crate::store::TxnGate,
 }
 
 impl<'e> Collection<'e> {
@@ -185,6 +221,7 @@ impl<'e> Collection<'e> {
         profile: CollectionProfile,
         ttl_default_seconds: Option<u64>,
         ttl_purge_history: bool,
+        txn_gate: &'e crate::store::TxnGate,
     ) -> Self {
         Self {
             db,
@@ -197,6 +234,7 @@ impl<'e> Collection<'e> {
             ttl_default_seconds,
             ttl_purge_history,
             env,
+            txn_gate,
         }
     }
 
@@ -248,6 +286,119 @@ impl<'e> Collection<'e> {
 
     // ----------------------------- indexes -----------------------------
 
+    fn db_slot_map_key(resource: &str) -> String {
+        format!("{DB_SLOT_META_PREFIX}map:{resource}")
+    }
+
+    fn db_slot_owner_key(slot: u32) -> String {
+        format!("{DB_SLOT_META_PREFIX}owner:{slot}")
+    }
+
+    fn db_slot_name(slot: u32) -> String {
+        format!("{DB_SLOT_META_PREFIX}db:{slot}")
+    }
+
+    fn db_slot_for(&self, txn: &RoTxn<'_>, resource: &str) -> Result<Option<u32>> {
+        let key = Self::db_slot_map_key(resource);
+        let Some(bytes) = self.meta.get(txn, key.as_bytes())? else {
+            return Ok(None);
+        };
+        let bytes: [u8; 4] = bytes
+            .try_into()
+            .map_err(|_| Error::Query("invalid sub-database slot mapping".into()))?;
+        Ok(Some(u32::from_le_bytes(bytes)))
+    }
+
+    /// Opens a resource DB by its reusable slot, falling back to the legacy
+    /// logical name for databases created before slot reuse was introduced.
+    fn resource_db(
+        &self,
+        txn: &RoTxn<'_>,
+        resource: &str,
+        legacy_name: &str,
+    ) -> Result<Option<Database<Bytes, Bytes>>> {
+        match self.db_slot_for(txn, resource)? {
+            Some(slot) => Ok(self
+                .env
+                .open_database(txn, Some(&Self::db_slot_name(slot)))?),
+            None => Ok(self.env.open_database(txn, Some(legacy_name))?),
+        }
+    }
+
+    fn resource_db_in(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        resource: &str,
+        legacy_name: &str,
+    ) -> Result<Database<Bytes, Bytes>> {
+        if let Some(slot) = self.db_slot_for(&*wtxn, resource)? {
+            return Ok(self
+                .env
+                .create_database(&mut *wtxn, Some(&Self::db_slot_name(slot)))?);
+        }
+        // Keep using an existing legacy DB until it is dropped. Its LMDB slot
+        // cannot be deregistered by heed, but all newly created resources use
+        // the reusable pool below.
+        if self
+            .env
+            .open_database::<Bytes, Bytes>(&*wtxn, Some(legacy_name))?
+            .is_some()
+        {
+            return Ok(self.env.create_database(&mut *wtxn, Some(legacy_name))?);
+        }
+        let slot = self.allocate_db_slot(wtxn, resource)?;
+        Ok(self
+            .env
+            .create_database(&mut *wtxn, Some(&Self::db_slot_name(slot)))?)
+    }
+
+    fn allocate_db_slot(&self, wtxn: &mut RwTxn<'_>, resource: &str) -> Result<u32> {
+        for slot in 1..=MAX_DB_SLOTS {
+            let owner_key = Self::db_slot_owner_key(slot);
+            if self.meta.get(&*wtxn, owner_key.as_bytes())?.is_some() {
+                continue;
+            }
+            let map_key = Self::db_slot_map_key(resource);
+            self.meta
+                .put(&mut *wtxn, owner_key.as_bytes(), resource.as_bytes())?;
+            self.meta
+                .put(&mut *wtxn, map_key.as_bytes(), &slot.to_le_bytes())?;
+            return Ok(slot);
+        }
+        Err(Error::Query(
+            "LMDB sub-database slot limit reached; drop unused indexes".into(),
+        ))
+    }
+
+    /// Clears a resource DB and returns its slot to the reusable pool.
+    fn drop_resource_db(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        resource: &str,
+        legacy_name: &str,
+    ) -> Result<()> {
+        if let Some(slot) = self.db_slot_for(&*wtxn, resource)? {
+            if let Some(db) = self
+                .env
+                .open_database::<Bytes, Bytes>(&*wtxn, Some(&Self::db_slot_name(slot)))?
+            {
+                db.clear(&mut *wtxn)?;
+            }
+            self.meta
+                .delete(&mut *wtxn, Self::db_slot_map_key(resource).as_bytes())?;
+            self.meta
+                .delete(&mut *wtxn, Self::db_slot_owner_key(slot).as_bytes())?;
+            return Ok(());
+        }
+        if let Some(db) = self
+            .env
+            .open_database::<Bytes, Bytes>(&*wtxn, Some(legacy_name))?
+        {
+            db.clear(&mut *wtxn)?;
+        }
+        Ok(())
+    }
+
     /// Index definitions for this collection (read in the given transaction).
     fn index_defs(&self, txn: &RoTxn<'_>) -> Result<Vec<IndexDef>> {
         let prefix = format!("index:{}:", self.name);
@@ -260,15 +411,13 @@ impl<'e> Collection<'e> {
     }
 
     fn index_db(&self, txn: &RoTxn<'_>, def: &IndexDef) -> Result<Option<Database<Bytes, Bytes>>> {
-        Ok(self
-            .env
-            .open_database(txn, Some(&index::db_name(&self.name, &def.name())))?)
+        let name = index::db_name(&self.name, &def.name());
+        self.resource_db(txn, &name, &name)
     }
 
     fn index_db_in(&self, wtxn: &mut RwTxn<'_>, def: &IndexDef) -> Result<Database<Bytes, Bytes>> {
-        Ok(self
-            .env
-            .create_database(&mut *wtxn, Some(&index::db_name(&self.name, &def.name())))?)
+        let name = index::db_name(&self.name, &def.name());
+        self.resource_db_in(wtxn, &name, &name)
     }
 
     /// Creates a secondary index (single field) and backfills it with existing
@@ -358,14 +507,8 @@ impl<'e> Collection<'e> {
         let key = index::def_key(&self.name, field);
         let existed = self.meta.delete(&mut *wtxn, key.as_bytes())?;
         if existed {
-            if let Some(db) = self
-                .env
-                .open_database::<Bytes, Bytes>(&*wtxn, Some(&index::db_name(&self.name, field)))?
-            {
-                // Clear the entire named sub-database so it does not keep a
-                // `MAX_DBS` slot after repeated create/drop operations.
-                db.clear(&mut *wtxn)?;
-            }
+            let name = index::db_name(&self.name, field);
+            self.drop_resource_db(wtxn, &name, &name)?;
         }
         Ok(existed)
     }
@@ -475,12 +618,15 @@ impl<'e> Collection<'e> {
         // Try indexes with the longest field prefix first (most selective).
         let mut defs = self.index_defs(rtxn)?;
         defs.sort_by_key(|d| std::cmp::Reverse(d.effective_fields().len()));
-        let has_date = date::contains_date(filter);
+        let needs_current_format = date::contains_date(filter)
+            || numeric::contains_numeric(filter)
+            || bson_types::contains_type(filter);
 
         for def in defs {
-            // Pre-date indexes skipped `$date` objects during backfill, so they
-            // cannot answer a date range until they are recreated.
-            if has_date && !def.current_format() {
+            // Older indexes used old numeric keys or skipped Extended JSON
+            // values during backfill. Recreate them before using them for
+            // date/numeric/binary/ObjectId filters.
+            if needs_current_format && !def.current_format() {
                 continue;
             }
             let Some(bounds) = bounds_for_index(&def, obj) else {
@@ -559,9 +705,8 @@ impl<'e> Collection<'e> {
         txn: &RoTxn<'_>,
         field: &str,
     ) -> Result<Option<Database<Bytes, Bytes>>> {
-        Ok(self
-            .env
-            .open_database(txn, Some(&search::text_db_name(&self.name, field)))?)
+        let name = search::text_db_name(&self.name, field);
+        self.resource_db(txn, &name, &name)
     }
 
     fn text_postings_in(
@@ -569,34 +714,28 @@ impl<'e> Collection<'e> {
         wtxn: &mut RwTxn<'_>,
         field: &str,
     ) -> Result<Database<Bytes, Bytes>> {
-        Ok(self
-            .env
-            .create_database(&mut *wtxn, Some(&search::text_db_name(&self.name, field)))?)
+        let name = search::text_db_name(&self.name, field);
+        self.resource_db_in(wtxn, &name, &name)
     }
 
     fn text_len_db(&self, txn: &RoTxn<'_>, field: &str) -> Result<Option<Database<Bytes, Bytes>>> {
-        Ok(self
-            .env
-            .open_database(txn, Some(&search::text_len_db_name(&self.name, field)))?)
+        let name = search::text_len_db_name(&self.name, field);
+        self.resource_db(txn, &name, &name)
     }
 
     fn text_len_db_in(&self, wtxn: &mut RwTxn<'_>, field: &str) -> Result<Database<Bytes, Bytes>> {
-        Ok(self.env.create_database(
-            &mut *wtxn,
-            Some(&search::text_len_db_name(&self.name, field)),
-        )?)
+        let name = search::text_len_db_name(&self.name, field);
+        self.resource_db_in(wtxn, &name, &name)
     }
 
     fn fuzzy_db(&self, txn: &RoTxn<'_>, field: &str) -> Result<Option<Database<Bytes, Bytes>>> {
-        Ok(self
-            .env
-            .open_database(txn, Some(&search::fuzzy_db_name(&self.name, field)))?)
+        let name = search::fuzzy_db_name(&self.name, field);
+        self.resource_db(txn, &name, &name)
     }
 
     fn fuzzy_db_in(&self, wtxn: &mut RwTxn<'_>, field: &str) -> Result<Database<Bytes, Bytes>> {
-        Ok(self
-            .env
-            .create_database(&mut *wtxn, Some(&search::fuzzy_db_name(&self.name, field)))?)
+        let name = search::fuzzy_db_name(&self.name, field);
+        self.resource_db_in(wtxn, &name, &name)
     }
 
     /// Creates a full-text (BM25) index and backfills it with existing documents.
@@ -664,12 +803,10 @@ impl<'e> Collection<'e> {
         let def_key = search::text_def_key(&self.name, field);
         let existed = self.meta.delete(&mut *wtxn, def_key.as_bytes())?;
         if existed {
-            if let Some(db) = self.text_postings(&*wtxn, field)? {
-                db.clear(&mut *wtxn)?;
-            }
-            if let Some(db) = self.text_len_db(&*wtxn, field)? {
-                db.clear(&mut *wtxn)?;
-            }
+            let postings = search::text_db_name(&self.name, field);
+            self.drop_resource_db(wtxn, &postings, &postings)?;
+            let lens = search::text_len_db_name(&self.name, field);
+            self.drop_resource_db(wtxn, &lens, &lens)?;
             self.meta.delete(
                 &mut *wtxn,
                 search::text_total_key(&self.name, field).as_bytes(),
@@ -734,9 +871,8 @@ impl<'e> Collection<'e> {
         let def_key = search::fuzzy_def_key(&self.name, field);
         let existed = self.meta.delete(&mut *wtxn, def_key.as_bytes())?;
         if existed {
-            if let Some(db) = self.fuzzy_db(&*wtxn, field)? {
-                db.clear(&mut *wtxn)?;
-            }
+            let name = search::fuzzy_db_name(&self.name, field);
+            self.drop_resource_db(wtxn, &name, &name)?;
         }
         Ok(existed)
     }
@@ -868,6 +1004,7 @@ impl<'e> Collection<'e> {
         skip: usize,
         limit: Option<usize>,
     ) -> Result<Vec<Value>> {
+        crate::query::validate::validate_filter(filter)?;
         if self
             .meta
             .get(rtxn, search::text_def_key(&self.name, field).as_bytes())?
@@ -990,6 +1127,7 @@ impl<'e> Collection<'e> {
         filter: &Value,
         limit: Option<usize>,
     ) -> Result<Vec<Value>> {
+        crate::query::validate::validate_filter(filter)?;
         if self
             .meta
             .get(rtxn, search::fuzzy_def_key(&self.name, field).as_bytes())?
@@ -1067,6 +1205,8 @@ impl<'e> Collection<'e> {
         self.ensure_standard()?;
         let ttl_at = ttl::take_insert_ttl(&mut doc, self.ttl_default_seconds)?;
         date::normalize_document(&mut doc)?;
+        numeric::normalize_document(&mut doc)?;
+        bson_types::normalize_document(&mut doc)?;
         let obj = doc
             .as_object_mut()
             .ok_or_else(|| Error::Query("document must be an object".into()))?;
@@ -1108,6 +1248,18 @@ impl<'e> Collection<'e> {
         multi: bool,
         upsert: bool,
     ) -> Result<UpdateOutcome> {
+        self.update_opts_txn_filtered(wtxn, filter, update, multi, upsert, &[])
+    }
+
+    pub fn update_opts_txn_filtered(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        filter: &Value,
+        update: &Value,
+        multi: bool,
+        upsert: bool,
+        array_filters: &[Value],
+    ) -> Result<UpdateOutcome> {
         self.ensure_standard()?;
         let keys = self.matching_keys(&*wtxn, filter, multi)?;
         if keys.is_empty() {
@@ -1120,7 +1272,7 @@ impl<'e> Collection<'e> {
             }
             let mut doc = seed_from_filter(filter);
             let filter_id = doc.get("_id").cloned();
-            apply_upsert(&mut doc, update)?;
+            apply_upsert_with_options(&mut doc, update, filter, array_filters)?;
             // `_id` from the filter is immutable; do not let an update lose it.
             if let Some(id) = filter_id {
                 doc["_id"] = id;
@@ -1136,36 +1288,13 @@ impl<'e> Collection<'e> {
         let matched = keys.len();
         let mut modified = 0usize;
         for key in keys {
-            let id = std::str::from_utf8(&key)
-                .map_err(|e| Error::Query(e.to_string()))?
-                .to_string();
             let raw = self
                 .db
                 .get(&*wtxn, key.as_slice())?
                 .ok_or_else(|| Error::Query("document disappeared".into()))?
                 .to_vec();
             let old: Value = parse_json(&raw)?;
-            let old_ttl = self.ttl_at(&*wtxn, &id)?;
-            let mut new = old.clone();
-            apply_update(&mut new, update)?;
-            let ttl_at = match ttl::take_update_ttl(&mut new)? {
-                TtlUpdate::Preserve => old_ttl,
-                TtlUpdate::Clear => None,
-                TtlUpdate::Set(at) => Some(at),
-            };
-            date::normalize_document(&mut new)?;
-
-            self.validate_unique(&*wtxn, &new, &id)?;
-            let bytes = serde_json::to_vec(&new)?;
-            if bytes.len() > MAX_DOCUMENT_BYTES {
-                return Err(Error::DocumentTooLarge(bytes.len(), MAX_DOCUMENT_BYTES));
-            }
-            self.db.put(&mut *wtxn, key.as_slice(), &bytes)?;
-            self.apply_index_entries(wtxn, Some(&old), Some(&new), &id)?;
-            self.apply_text_entries(wtxn, Some(&old), Some(&new), &id)?;
-            self.apply_fuzzy_entries(wtxn, Some(&old), Some(&new), &id)?;
-            self.set_ttl(wtxn, &id, ttl_at)?;
-            self.record_history(wtxn, &id, "update", Some(new))?;
+            self.write_update_one(wtxn, old, filter, update, array_filters)?;
             modified += 1;
         }
         Ok(UpdateOutcome {
@@ -1173,6 +1302,45 @@ impl<'e> Collection<'e> {
             modified,
             upserted_id: None,
         })
+    }
+
+    fn write_update_one(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        old: Value,
+        filter: &Value,
+        update: &Value,
+        array_filters: &[Value],
+    ) -> Result<Value> {
+        let id = old
+            .get("_id")
+            .and_then(Value::as_str)
+            .ok_or(Error::InvalidId)?
+            .to_string();
+        let old_ttl = self.ttl_at(&*wtxn, &id)?;
+        let mut new = old.clone();
+        apply_with_options(&mut new, update, filter, array_filters)?;
+        let ttl_at = match ttl::take_update_ttl(&mut new)? {
+            TtlUpdate::Preserve => old_ttl,
+            TtlUpdate::Clear => None,
+            TtlUpdate::Set(at) => Some(at),
+        };
+        date::normalize_document(&mut new)?;
+        numeric::normalize_document(&mut new)?;
+        bson_types::normalize_document(&mut new)?;
+
+        self.validate_unique(&*wtxn, &new, &id)?;
+        let bytes = serde_json::to_vec(&new)?;
+        if bytes.len() > MAX_DOCUMENT_BYTES {
+            return Err(Error::DocumentTooLarge(bytes.len(), MAX_DOCUMENT_BYTES));
+        }
+        self.db.put(&mut *wtxn, id.as_bytes(), &bytes)?;
+        self.apply_index_entries(wtxn, Some(&old), Some(&new), &id)?;
+        self.apply_text_entries(wtxn, Some(&old), Some(&new), &id)?;
+        self.apply_fuzzy_entries(wtxn, Some(&old), Some(&new), &id)?;
+        self.set_ttl(wtxn, &id, ttl_at)?;
+        self.record_history(wtxn, &id, "update", Some(new.clone()))?;
+        Ok(new)
     }
 
     /// Legacy signature: returns only the number of modified documents.
@@ -1195,8 +1363,20 @@ impl<'e> Collection<'e> {
         multi: bool,
         upsert: bool,
     ) -> Result<UpdateOutcome> {
+        self.update_opts_filtered(filter, update, multi, upsert, &[])
+    }
+
+    pub fn update_opts_filtered(
+        &self,
+        filter: &Value,
+        update: &Value,
+        multi: bool,
+        upsert: bool,
+        array_filters: &[Value],
+    ) -> Result<UpdateOutcome> {
         let mut wtxn = self.write_txn()?;
-        let out = self.update_opts_txn(&mut wtxn, filter, update, multi, upsert)?;
+        let out =
+            self.update_opts_txn_filtered(&mut wtxn, filter, update, multi, upsert, array_filters)?;
         wtxn.commit()?;
         Ok(out)
     }
@@ -1206,6 +1386,192 @@ impl<'e> Collection<'e> {
     }
 
     /// Deletes matching documents. Returns the number deleted.
+    /// Atomically selects one document, applies an update or removes it, and
+    /// returns the pre-image or post-image in the same write transaction.
+    pub fn find_and_modify_txn(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        opts: &FindAndModifyOptions<'_>,
+    ) -> Result<FindAndModifyOutcome> {
+        self.ensure_standard()?;
+        validate_find_and_modify(opts)?;
+        let query = FindQuery {
+            filter: opts.filter.clone(),
+            projection: None,
+            sort: opts.sort.to_vec(),
+            skip: 0,
+            limit: Some(1),
+        };
+        let selected = self.find_in(&*wtxn, &query)?.into_iter().next();
+
+        if opts.remove {
+            let Some(old) = selected else {
+                return Ok(empty_find_and_modify());
+            };
+            let id = old
+                .get("_id")
+                .and_then(Value::as_str)
+                .ok_or(Error::InvalidId)?
+                .to_string();
+            let removed = self.delete_txn(wtxn, &serde_json::json!({"_id": id}), false)?;
+            return Ok(FindAndModifyOutcome {
+                value: Some(apply_projection(old, opts.projection)),
+                matched: removed,
+                modified: removed,
+                upserted_id: None,
+            });
+        }
+
+        let update = opts
+            .update
+            .ok_or_else(|| Error::Query("find_and_modify requires `update` or `remove`".into()))?;
+        if let Some(old) = selected {
+            let new =
+                self.write_update_one(wtxn, old.clone(), opts.filter, update, opts.array_filters)?;
+            return Ok(FindAndModifyOutcome {
+                value: Some(apply_projection(
+                    if opts.new { new } else { old },
+                    opts.projection,
+                )),
+                matched: 1,
+                modified: 1,
+                upserted_id: None,
+            });
+        }
+
+        if !opts.upsert {
+            return Ok(empty_find_and_modify());
+        }
+        let mut doc = seed_from_filter(opts.filter);
+        let filter_id = doc.get("_id").cloned();
+        apply_upsert_with_options(&mut doc, update, opts.filter, opts.array_filters)?;
+        if let Some(id) = filter_id {
+            doc["_id"] = id;
+        }
+        let id = self.insert_one_txn(wtxn, doc)?;
+        let value = if opts.new {
+            let raw = self
+                .db
+                .get(&*wtxn, id.as_bytes())?
+                .ok_or_else(|| Error::Query("upserted document disappeared".into()))?;
+            Some(apply_projection(parse_json(raw)?, opts.projection))
+        } else {
+            None
+        };
+        Ok(FindAndModifyOutcome {
+            value,
+            matched: 0,
+            modified: 0,
+            upserted_id: Some(id),
+        })
+    }
+
+    pub fn find_and_modify(&self, opts: &FindAndModifyOptions<'_>) -> Result<FindAndModifyOutcome> {
+        let mut wtxn = self.write_txn()?;
+        let out = self.find_and_modify_txn(&mut wtxn, opts)?;
+        wtxn.commit()?;
+        Ok(out)
+    }
+
+    /// Vault variant. Vault filters must identify exactly one document.
+    #[allow(clippy::too_many_arguments)]
+    pub fn find_and_modify_vault_txn(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        opts: &FindAndModifyOptions<'_>,
+        key: &VaultKey,
+        tenant: &str,
+        kid: &str,
+    ) -> Result<FindAndModifyOutcome> {
+        self.ensure_vault()?;
+        validate_find_and_modify(opts)?;
+        vault::validate_projection(opts.projection)?;
+        vault::validate_sort(opts.sort)?;
+        let query = FindQuery {
+            filter: opts.filter.clone(),
+            projection: None,
+            sort: opts.sort.to_vec(),
+            skip: 0,
+            limit: Some(1),
+        };
+        let selected = self
+            .find_vault_in(&*wtxn, &query, key, tenant, kid)?
+            .into_iter()
+            .next();
+        if opts.remove {
+            let Some(old) = selected else {
+                return Ok(empty_find_and_modify());
+            };
+            let id = old
+                .get("_id")
+                .and_then(Value::as_str)
+                .ok_or(Error::InvalidId)?
+                .to_string();
+            let filter = serde_json::json!({"_id": id});
+            let removed = self.delete_vault_txn(wtxn, &filter, false, key, tenant, kid)?;
+            return Ok(FindAndModifyOutcome {
+                value: Some(old),
+                matched: removed,
+                modified: removed,
+                upserted_id: None,
+            });
+        }
+        let update = opts
+            .update
+            .ok_or_else(|| Error::Query("find_and_modify requires `update` or `remove`".into()))?;
+        if let Some(old) = selected {
+            let new = self.write_vault_update_one(
+                wtxn,
+                old.clone(),
+                opts.filter,
+                update,
+                opts.array_filters,
+                key,
+                tenant,
+                kid,
+            )?;
+            return Ok(FindAndModifyOutcome {
+                value: Some(if opts.new { new } else { old }),
+                matched: 1,
+                modified: 1,
+                upserted_id: None,
+            });
+        }
+        if !opts.upsert {
+            return Ok(empty_find_and_modify());
+        }
+        let id = vault::exact_id_filter(opts.filter, tenant)?;
+        let mut doc = seed_from_filter(opts.filter);
+        doc["_id"] = Value::String(id.clone());
+        apply_upsert_with_options(&mut doc, update, opts.filter, opts.array_filters)?;
+        let id = self.insert_vault_txn(wtxn, doc, key, tenant, kid)?;
+        let value = if opts.new {
+            self.find_one_vault_in(&*wtxn, &serde_json::json!({"_id": id}), key, tenant, kid)?
+        } else {
+            None
+        };
+        Ok(FindAndModifyOutcome {
+            value,
+            matched: 0,
+            modified: 0,
+            upserted_id: Some(id),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn find_and_modify_vault(
+        &self,
+        opts: &FindAndModifyOptions<'_>,
+        key: &VaultKey,
+        tenant: &str,
+        kid: &str,
+    ) -> Result<FindAndModifyOutcome> {
+        let mut wtxn = self.write_txn()?;
+        let out = self.find_and_modify_vault_txn(&mut wtxn, opts, key, tenant, kid)?;
+        wtxn.commit()?;
+        Ok(out)
+    }
+
     pub fn delete_txn(&self, wtxn: &mut RwTxn<'_>, filter: &Value, multi: bool) -> Result<usize> {
         self.ensure_standard()?;
         let keys = self.matching_keys(&*wtxn, filter, multi)?;
@@ -1335,6 +1701,8 @@ impl<'e> Collection<'e> {
         }
         let ttl_at = ttl::take_insert_ttl(&mut doc, self.ttl_default_seconds)?;
         date::normalize_document(&mut doc)?;
+        numeric::normalize_document(&mut doc)?;
+        bson_types::normalize_document(&mut doc)?;
         let envelope = vault::encrypt_document(&doc, key, &self.name, tenant, &id, kid)?;
         let stored = Self::vault_stored(&id, tenant, envelope)?;
         let bytes = Self::check_vault_size(&stored)?;
@@ -1373,6 +1741,22 @@ impl<'e> Collection<'e> {
         tenant: &str,
         kid: &str,
     ) -> Result<UpdateOutcome> {
+        self.update_vault_txn_filtered(wtxn, filter, update, multi, upsert, key, tenant, kid, &[])
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_vault_txn_filtered(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        filter: &Value,
+        update: &Value,
+        multi: bool,
+        upsert: bool,
+        key: &VaultKey,
+        tenant: &str,
+        kid: &str,
+        array_filters: &[Value],
+    ) -> Result<UpdateOutcome> {
         self.ensure_vault()?;
         if multi {
             return Err(Error::Vault {
@@ -1391,7 +1775,7 @@ impl<'e> Collection<'e> {
             }
             let mut doc = seed_from_filter(filter);
             doc["_id"] = Value::String(id.clone());
-            apply_upsert(&mut doc, update)?;
+            apply_upsert_with_options(&mut doc, update, filter, array_filters)?;
             let id = self.insert_vault_txn(wtxn, doc, key, tenant, kid)?;
             return Ok(UpdateOutcome {
                 matched: 0,
@@ -1400,16 +1784,44 @@ impl<'e> Collection<'e> {
             });
         };
         let old_stored: Value = parse_json(raw)?;
-        let old_ttl = self.ttl_at(&*wtxn, &id)?;
         let old = self.decrypt_stored(&old_stored, key, tenant, &id, kid)?;
+        self.write_vault_update_one(wtxn, old, filter, update, array_filters, key, tenant, kid)?;
+        Ok(UpdateOutcome {
+            matched: 1,
+            modified: 1,
+            upserted_id: None,
+        })
+    }
+
+    /// Deletes exactly one vault document by `_id`.
+    #[allow(clippy::too_many_arguments)]
+    fn write_vault_update_one(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        old: Value,
+        filter: &Value,
+        update: &Value,
+        array_filters: &[Value],
+        key: &VaultKey,
+        tenant: &str,
+        kid: &str,
+    ) -> Result<Value> {
+        let id = old
+            .get("_id")
+            .and_then(Value::as_str)
+            .ok_or(Error::InvalidId)?
+            .to_string();
+        let old_ttl = self.ttl_at(&*wtxn, &id)?;
         let mut new = old.clone();
-        apply_update(&mut new, update)?;
+        apply_with_options(&mut new, update, filter, array_filters)?;
         let ttl_at = match ttl::take_update_ttl(&mut new)? {
             TtlUpdate::Preserve => old_ttl,
             TtlUpdate::Clear => None,
             TtlUpdate::Set(at) => Some(at),
         };
         date::normalize_document(&mut new)?;
+        numeric::normalize_document(&mut new)?;
+        bson_types::normalize_document(&mut new)?;
         if new.get("_id").and_then(Value::as_str) != Some(id.as_str()) {
             return Err(Error::InvalidId);
         }
@@ -1425,14 +1837,9 @@ impl<'e> Collection<'e> {
         self.db.put(&mut *wtxn, id.as_bytes(), &bytes)?;
         self.set_ttl(wtxn, &id, ttl_at)?;
         self.record_history(wtxn, &id, "update", Some(stored))?;
-        Ok(UpdateOutcome {
-            matched: 1,
-            modified: 1,
-            upserted_id: None,
-        })
+        Ok(new)
     }
 
-    /// Deletes exactly one vault document by `_id`.
     pub fn delete_vault_txn(
         &self,
         wtxn: &mut RwTxn<'_>,
@@ -1655,6 +2062,7 @@ impl<'e> Collection<'e> {
     /// Uses the same fast paths as `find`: exact `_id`,
     /// secondary index, and only then a full scan.
     fn matching_keys(&self, txn: &RoTxn<'_>, filter: &Value, multi: bool) -> Result<Vec<Vec<u8>>> {
+        crate::query::validate::validate_filter(filter)?;
         let mut keys = Vec::new();
         let raw = raw_prefilter(filter);
 
@@ -1732,6 +2140,11 @@ impl<'e> Collection<'e> {
     }
 
     pub fn aggregate_in(&self, rtxn: &RoTxn<'_>, pipeline: &[Value]) -> Result<Vec<Value>> {
+        for stage in pipeline {
+            if let Some(filter) = stage.as_object().and_then(|o| o.get("$match")) {
+                crate::query::validate::validate_filter(filter)?;
+            }
+        }
         let plan = aggregate::pushdown(pipeline)?;
 
         if let Some(field) = plan.count {
@@ -1767,6 +2180,7 @@ impl<'e> Collection<'e> {
     }
 
     pub fn find(&self, query: &FindQuery) -> Result<Vec<Value>> {
+        crate::query::validate::validate_filter(&query.filter)?;
         let rtxn = self.read_txn()?;
         let limit = query.limit.unwrap_or(usize::MAX);
         let want = query.skip.saturating_add(limit);
@@ -2228,6 +2642,7 @@ impl<'e> Collection<'e> {
     }
 
     pub fn find_in(&self, rtxn: &RoTxn<'_>, query: &FindQuery) -> Result<Vec<Value>> {
+        crate::query::validate::validate_filter(&query.filter)?;
         let limit = query.limit.unwrap_or(usize::MAX);
         if limit == 0 {
             return Ok(Vec::new());
@@ -2460,6 +2875,155 @@ impl<'e> Collection<'e> {
         Ok(self.find_in(rtxn, &query)?.into_iter().next())
     }
 
+    /// Explains the access path and actual counts for a `find` query.
+    ///
+    /// This executes the query so `actual_matched` and `actual_returned` are
+    /// exact. Use small limits when explaining broad queries.
+    pub fn explain_in(&self, rtxn: &RoTxn<'_>, query: &FindQuery) -> Result<Value> {
+        crate::query::validate::validate_filter(&query.filter)?;
+        let mut out = self.explain_plan(rtxn, query)?;
+        let matched = self.count_in(rtxn, &query.filter)?;
+        let returned = self.find_in(rtxn, query)?.len();
+        let obj = out
+            .as_object_mut()
+            .ok_or_else(|| Error::Query("internal explain error".into()))?;
+        obj.insert("filter".into(), query.filter.clone());
+        obj.insert(
+            "sort".into(),
+            Value::Array(
+                query
+                    .sort
+                    .iter()
+                    .map(|(field, dir)| serde_json::json!([field, dir]))
+                    .collect(),
+            ),
+        );
+        obj.insert("skip".into(), Value::from(query.skip));
+        obj.insert("limit".into(), query.limit.map_or(Value::Null, Value::from));
+        obj.insert(
+            "estimated_documents".into(),
+            Value::from(obj.get("candidates").and_then(Value::as_u64).unwrap_or(0)),
+        );
+        obj.insert("actual_matched".into(), Value::from(matched as u64));
+        obj.insert("actual_returned".into(), Value::from(returned as u64));
+        Ok(out)
+    }
+
+    pub fn explain(&self, query: &FindQuery) -> Result<Value> {
+        let rtxn = self.read_txn()?;
+        let out = self.explain_in(&rtxn, query)?;
+        rtxn.commit()?;
+        Ok(out)
+    }
+
+    fn explain_plan(&self, rtxn: &RoTxn<'_>, query: &FindQuery) -> Result<Value> {
+        let sort_covered = |plan: Option<&IndexDef>| -> bool {
+            if query.sort.is_empty() {
+                return true;
+            }
+            if id_sort_direction(&query.sort).is_some() {
+                return true;
+            }
+            plan.and_then(|def| index_matches_sort(def, &query.sort))
+                .is_some()
+        };
+        let mut out = serde_json::Map::new();
+        out.insert("collection".into(), Value::String(self.name.clone()));
+
+        if is_match_all(&query.filter) {
+            out.insert(
+                "access_path".into(),
+                Value::String("collection_scan".into()),
+            );
+            out.insert("index_used".into(), Value::Bool(false));
+            out.insert("index".into(), Value::Null);
+            out.insert("bounds".into(), Value::Null);
+            out.insert(
+                "candidates".into(),
+                Value::from(self.db.stat(rtxn)?.entries as u64),
+            );
+            out.insert("sort_covered".into(), Value::Bool(sort_covered(None)));
+            return Ok(Value::Object(out));
+        }
+
+        if let Some(id) = direct_id(&query.filter) {
+            let exists = self.db.get(rtxn, id.as_bytes())?.is_some();
+            out.insert("access_path".into(), Value::String("id_lookup".into()));
+            out.insert("index_used".into(), Value::Bool(true));
+            out.insert(
+                "index".into(),
+                serde_json::json!({"fields": ["_id"], "primary": true}),
+            );
+            out.insert("bounds".into(), Value::Null);
+            out.insert("candidates".into(), Value::from(u64::from(exists)));
+            out.insert("sort_covered".into(), Value::Bool(sort_covered(None)));
+            return Ok(Value::Object(out));
+        }
+
+        if let Some(plan) = self.index_plan(rtxn, &query.filter)? {
+            let candidates = self.index_count_plan(rtxn, &plan)?;
+            let fields = plan.def.effective_fields();
+            out.insert("access_path".into(), Value::String("index_scan".into()));
+            out.insert("index_used".into(), Value::Bool(true));
+            out.insert(
+                "index".into(),
+                serde_json::json!({
+                    "fields": fields,
+                    "unique": plan.def.unique,
+                    "include": plan.def.include,
+                }),
+            );
+            out.insert(
+                "bounds".into(),
+                serde_json::json!({
+                    "lower": explain_bound(&plan.bounds.0, false),
+                    "upper": explain_bound(&plan.bounds.1, false),
+                }),
+            );
+            out.insert("candidates".into(), Value::from(candidates as u64));
+            out.insert(
+                "sort_covered".into(),
+                Value::Bool(sort_covered(Some(&plan.def))),
+            );
+            return Ok(Value::Object(out));
+        }
+
+        if let Some((lower, upper)) = id_bounds(&query.filter) {
+            let range = (as_bound(&lower), as_bound(&upper));
+            let candidates = self.db.range(rtxn, &range)?.count();
+            out.insert("access_path".into(), Value::String("id_range".into()));
+            out.insert("index_used".into(), Value::Bool(true));
+            out.insert(
+                "index".into(),
+                serde_json::json!({"fields": ["_id"], "primary": true}),
+            );
+            out.insert(
+                "bounds".into(),
+                serde_json::json!({
+                    "lower": explain_bound(&lower, true),
+                    "upper": explain_bound(&upper, true),
+                }),
+            );
+            out.insert("candidates".into(), Value::from(candidates as u64));
+            out.insert("sort_covered".into(), Value::Bool(sort_covered(None)));
+            return Ok(Value::Object(out));
+        }
+
+        out.insert(
+            "access_path".into(),
+            Value::String("collection_scan".into()),
+        );
+        out.insert("index_used".into(), Value::Bool(false));
+        out.insert("index".into(), Value::Null);
+        out.insert("bounds".into(), Value::Null);
+        out.insert(
+            "candidates".into(),
+            Value::from(self.db.stat(rtxn)?.entries as u64),
+        );
+        out.insert("sort_covered".into(), Value::Bool(sort_covered(None)));
+        Ok(Value::Object(out))
+    }
+
     pub fn count(&self, filter: &Value) -> Result<usize> {
         let rtxn = self.read_txn()?;
         let n = self.count_in(&rtxn, filter)?;
@@ -2468,6 +3032,7 @@ impl<'e> Collection<'e> {
     }
 
     pub fn count_in(&self, rtxn: &RoTxn<'_>, filter: &Value) -> Result<usize> {
+        crate::query::validate::validate_filter(filter)?;
         // `count({})` / `count(null)` -> O(1) from B+tree metadata.
         if is_match_all(filter) {
             return Ok(self.db.stat(rtxn)?.entries);
@@ -2521,12 +3086,261 @@ impl<'e> Collection<'e> {
         Ok(n)
     }
 
-    fn read_txn(&self) -> Result<RoTxn<'_>> {
-        Ok(self.env.read_txn()?)
+    /// Deep-checks documents and all index structures in a read transaction.
+    pub fn verify_in(&self, rtxn: &RoTxn<'_>) -> Result<CollectionVerification> {
+        let defs = self.index_defs(rtxn)?;
+        let text_fields = self.text_defs(rtxn)?;
+        let fuzzy_fields = self.fuzzy_defs(rtxn)?;
+
+        let mut documents = 0u64;
+        let mut bytes = 0u64;
+        let mut expected_index = vec![0u64; defs.len()];
+        let mut expected_postings = vec![0u64; text_fields.len()];
+        let mut expected_lengths = vec![0u64; text_fields.len()];
+        let mut expected_tokens = vec![0u64; text_fields.len()];
+        let mut expected_trigrams = vec![0u64; fuzzy_fields.len()];
+
+        for item in self.db.iter(rtxn)? {
+            let (key, raw) = item?;
+            let id = std::str::from_utf8(key).map_err(|e| {
+                Error::Query(format!("invalid document key in `{}`: {e}", self.name))
+            })?;
+            let doc: Value = serde_json::from_slice(raw).map_err(|e| {
+                Error::Query(format!("invalid JSON for `{}`/`{id}`: {e}", self.name))
+            })?;
+            let Some(obj) = doc.as_object() else {
+                return Err(Error::Query(format!(
+                    "document `{}`/`{id}` is not a JSON object",
+                    self.name
+                )));
+            };
+            if obj.get("_id").and_then(Value::as_str) != Some(id) {
+                return Err(Error::Query(format!(
+                    "document `{}`/`{id}` has a missing or mismatched _id",
+                    self.name
+                )));
+            }
+            documents += 1;
+            bytes += raw.len() as u64;
+
+            for (i, def) in defs.iter().enumerate() {
+                if !def.current_format() {
+                    continue;
+                }
+                let fields = def.effective_fields();
+                let Some(value_bytes) = index::encode_fields(&doc, &fields) else {
+                    continue;
+                };
+                let db = self.index_db(rtxn, def)?.ok_or_else(|| {
+                    Error::Query(format!(
+                        "index `{}` on `{}` is defined but its database is missing",
+                        def.name(),
+                        self.name
+                    ))
+                })?;
+                let mut index_key = value_bytes;
+                index_key.extend_from_slice(key);
+                let expected = index::encode_index_value(def, &doc, id);
+                let actual = db.get(rtxn, &index_key)?.ok_or_else(|| {
+                    Error::Query(format!(
+                        "index `{}` on `{}` is missing entry for `{id}`",
+                        def.name(),
+                        self.name
+                    ))
+                })?;
+                if actual != expected.as_slice() {
+                    return Err(Error::Query(format!(
+                        "index `{}` on `{}` has a stale entry for `{id}`",
+                        def.name(),
+                        self.name
+                    )));
+                }
+                expected_index[i] += 1;
+            }
+
+            for (i, field) in text_fields.iter().enumerate() {
+                let Some(text) = index::field_value(&doc, field).and_then(search::field_text)
+                else {
+                    continue;
+                };
+                let tokens = search::tokenize(&text);
+                let postings = self.text_postings(rtxn, field)?.ok_or_else(|| {
+                    Error::Query(format!(
+                        "text index `{field}` on `{}` is defined but its postings are missing",
+                        self.name
+                    ))
+                })?;
+                let lengths = self.text_len_db(rtxn, field)?.ok_or_else(|| {
+                    Error::Query(format!(
+                        "text index `{field}` on `{}` is defined but its lengths are missing",
+                        self.name
+                    ))
+                })?;
+                for (term, tf) in search::term_freqs(&tokens) {
+                    let key = search::postings_key(&term, id);
+                    let actual = postings.get(rtxn, &key)?.ok_or_else(|| {
+                        Error::Query(format!(
+                            "text index `{field}` on `{}` is missing term `{term}` for `{id}`",
+                            self.name
+                        ))
+                    })?;
+                    if actual != tf.to_le_bytes().as_slice() {
+                        return Err(Error::Query(format!(
+                            "text index `{field}` on `{}` has a stale term `{term}` for `{id}`",
+                            self.name
+                        )));
+                    }
+                    expected_postings[i] += 1;
+                }
+                let actual = lengths.get(rtxn, key)?.ok_or_else(|| {
+                    Error::Query(format!(
+                        "text index `{field}` on `{}` is missing length for `{id}`",
+                        self.name
+                    ))
+                })?;
+                let expected_len = tokens.len() as u32;
+                if actual != expected_len.to_le_bytes().as_slice() {
+                    return Err(Error::Query(format!(
+                        "text index `{field}` on `{}` has a stale length for `{id}`",
+                        self.name
+                    )));
+                }
+                expected_lengths[i] += 1;
+                expected_tokens[i] += expected_len as u64;
+            }
+
+            for (i, field) in fuzzy_fields.iter().enumerate() {
+                let Some(text) = index::field_value(&doc, field).and_then(search::field_text)
+                else {
+                    continue;
+                };
+                let db = self.fuzzy_db(rtxn, field)?.ok_or_else(|| {
+                    Error::Query(format!(
+                        "fuzzy index `{field}` on `{}` is defined but its database is missing",
+                        self.name
+                    ))
+                })?;
+                for gram in search::trigrams(&text) {
+                    let key = search::postings_key(&gram, id);
+                    if db.get(rtxn, &key)?.is_none() {
+                        return Err(Error::Query(format!(
+                            "fuzzy index `{field}` on `{}` is missing trigram `{gram}` for `{id}`",
+                            self.name
+                        )));
+                    }
+                    expected_trigrams[i] += 1;
+                }
+            }
+        }
+
+        let mut indexes = Vec::with_capacity(defs.len());
+        for (i, def) in defs.iter().enumerate() {
+            let db = self.index_db(rtxn, def)?.ok_or_else(|| {
+                Error::Query(format!(
+                    "index `{}` on `{}` is defined but its database is missing",
+                    def.name(),
+                    self.name
+                ))
+            })?;
+            let entries = db.stat(rtxn)?.entries as u64;
+            let checked = def.current_format();
+            if checked && entries != expected_index[i] {
+                return Err(Error::Query(format!(
+                    "index `{}` on `{}` has {entries} entries, expected {}",
+                    def.name(),
+                    self.name,
+                    expected_index[i]
+                )));
+            }
+            indexes.push(IndexVerification {
+                name: def.name(),
+                fields: def.effective_fields(),
+                unique: def.unique,
+                include: def.include.clone(),
+                format: def.format,
+                entries,
+                checked,
+            });
+        }
+
+        for (i, field) in text_fields.iter().enumerate() {
+            let postings = self.text_postings(rtxn, field)?.ok_or_else(|| {
+                Error::Query(format!(
+                    "text index `{field}` on `{}` is defined but its postings are missing",
+                    self.name
+                ))
+            })?;
+            let lengths = self.text_len_db(rtxn, field)?.ok_or_else(|| {
+                Error::Query(format!(
+                    "text index `{field}` on `{}` is defined but its lengths are missing",
+                    self.name
+                ))
+            })?;
+            let postings_entries = postings.stat(rtxn)?.entries as u64;
+            if postings_entries != expected_postings[i] {
+                return Err(Error::Query(format!(
+                    "text index `{field}` on `{}` has {postings_entries} postings, expected {}",
+                    self.name, expected_postings[i]
+                )));
+            }
+            let length_entries = lengths.stat(rtxn)?.entries as u64;
+            if length_entries != expected_lengths[i] {
+                return Err(Error::Query(format!(
+                    "text index `{field}` on `{}` has {length_entries} lengths, expected {}",
+                    self.name, expected_lengths[i]
+                )));
+            }
+            let total_key = search::text_total_key(&self.name, field);
+            let total = match self.meta.get(rtxn, total_key.as_bytes())? {
+                Some(raw) => search::read_u64(raw).ok_or_else(|| {
+                    Error::Query(format!(
+                        "text index `{field}` on `{}` has an invalid total length",
+                        self.name
+                    ))
+                })?,
+                None => 0,
+            };
+            if total != expected_tokens[i] {
+                return Err(Error::Query(format!(
+                    "text index `{field}` on `{}` has total length {total}, expected {}",
+                    self.name, expected_tokens[i]
+                )));
+            }
+        }
+
+        for (i, field) in fuzzy_fields.iter().enumerate() {
+            let db = self.fuzzy_db(rtxn, field)?.ok_or_else(|| {
+                Error::Query(format!(
+                    "fuzzy index `{field}` on `{}` is defined but its database is missing",
+                    self.name
+                ))
+            })?;
+            let entries = db.stat(rtxn)?.entries as u64;
+            if entries != expected_trigrams[i] {
+                return Err(Error::Query(format!(
+                    "fuzzy index `{field}` on `{}` has {entries} trigrams, expected {}",
+                    self.name, expected_trigrams[i]
+                )));
+            }
+        }
+
+        Ok(CollectionVerification {
+            documents,
+            bytes,
+            indexes,
+            text_indexes: text_fields,
+            fuzzy_indexes: fuzzy_fields,
+        })
     }
 
-    fn write_txn(&self) -> Result<RwTxn<'_>> {
-        Ok(self.env.write_txn()?)
+    fn read_txn(&self) -> Result<crate::store::ReadTxn<'_>> {
+        let guard = self.txn_gate.enter();
+        Ok(crate::store::ReadTxn::new(self.env.read_txn()?, guard))
+    }
+
+    fn write_txn(&self) -> Result<crate::store::WriteTxn<'_>> {
+        let guard = self.txn_gate.enter();
+        Ok(crate::store::WriteTxn::new(self.env.write_txn()?, guard))
     }
 }
 
@@ -2534,12 +3348,19 @@ impl<'e> Collection<'e> {
 
 /// Equality value from a condition (`5` or `{"$eq": 5}`).
 fn eq_value(cond: &Value) -> Option<&Value> {
-    if date::is_date(cond) {
+    if date::is_date(cond) || numeric::is_numeric(cond) || bson_types::is_bson_value(cond) {
         return Some(cond);
     }
     if let Some(obj) = cond.as_object() {
         if obj.len() == 1 {
-            return obj.get("$eq");
+            if let Some(value) = obj.get("$eq") {
+                return Some(value);
+            }
+            if let Some(values) = obj.get("$all").and_then(Value::as_array) {
+                if values.len() == 1 {
+                    return values.first();
+                }
+            }
         }
         return None;
     }
@@ -2579,6 +3400,32 @@ fn bounds_for_index(def: &IndexDef, filter: &Map<String, Value>) -> Option<index
     Some(index::exact_prefix(&prefix))
 }
 
+fn explain_bound(bound: &Bound<Vec<u8>>, utf8: bool) -> Value {
+    match bound {
+        Bound::Unbounded => Value::Null,
+        Bound::Included(bytes) => serde_json::json!({
+            "value": explain_bytes(bytes, utf8),
+            "inclusive": true,
+        }),
+        Bound::Excluded(bytes) => serde_json::json!({
+            "value": explain_bytes(bytes, utf8),
+            "inclusive": false,
+        }),
+    }
+}
+
+fn explain_bytes(bytes: &[u8], utf8: bool) -> String {
+    if utf8 {
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write;
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
 fn is_match_all(filter: &Value) -> bool {
     filter.is_null() || filter.as_object().is_some_and(|o| o.is_empty())
 }
@@ -2588,7 +3435,7 @@ fn is_match_all(filter: &Value) -> bool {
 /// We exclude `null` (the matcher treats a missing field as `null`, and missing fields
 /// are not in the index) and operators the index does not support.
 fn count_cond_safe(cond: &Value) -> bool {
-    if date::is_date(cond) {
+    if date::is_date(cond) || numeric::is_numeric(cond) || bson_types::is_bson_value(cond) {
         return true;
     }
     match cond {
@@ -2744,18 +3591,22 @@ fn compare_values(a: Option<&Value>, b: Option<&Value>) -> Ordering {
         (None, None) => Ordering::Equal,
         (None, Some(_)) => Ordering::Greater, // missing field sorts last
         (Some(_), None) => Ordering::Less,
-        (Some(a), Some(b)) => match (a, b) {
-            (Value::Null, Value::Null) => Ordering::Equal,
-            (Value::Null, _) => Ordering::Greater,
-            (_, Value::Null) => Ordering::Less,
-            (Value::Number(x), Value::Number(y)) => x
-                .as_f64()
-                .partial_cmp(&y.as_f64())
-                .unwrap_or(Ordering::Equal),
-            (Value::String(x), Value::String(y)) => x.cmp(y),
-            (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
-            _ => date::cmp(a, b).unwrap_or(Ordering::Equal),
-        },
+        (Some(a), Some(b)) => {
+            if let Some(ord) = numeric::cmp_values(a, b) {
+                return ord;
+            }
+            if let Some(ord) = bson_types::cmp_values(a, b) {
+                return ord;
+            }
+            match (a, b) {
+                (Value::Null, Value::Null) => Ordering::Equal,
+                (Value::Null, _) => Ordering::Greater,
+                (_, Value::Null) => Ordering::Less,
+                (Value::String(x), Value::String(y)) => x.cmp(y),
+                (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
+                _ => date::cmp(a, b).unwrap_or(Ordering::Equal),
+            }
+        }
     }
 }
 
@@ -2956,13 +3807,60 @@ impl<'a> TopK<'a> {
 fn truthy(v: &Value) -> bool {
     match v {
         Value::Bool(b) => *b,
-        Value::Number(n) => n.as_i64().unwrap_or(0) != 0,
+        Value::Number(_) => numeric::parse_value(v)
+            .is_some_and(|n| !matches!(n.value(), numeric::Numeric::Finite { len: 1, digits, .. } if digits[0] == 0)),
         Value::Null => false,
-        _ => true,
+        _ => {
+            if let Some(n) = numeric::parse_value(v) {
+                !matches!(n.value(), numeric::Numeric::Finite { len: 1, digits, .. } if digits[0] == 0)
+            } else {
+                true
+            }
+        }
     }
 }
 
 /// Top-level projection: include or exclude mode (like MongoDB).
+fn validate_find_and_modify(opts: &FindAndModifyOptions<'_>) -> Result<()> {
+    if opts.remove && opts.update.is_some() {
+        return Err(Error::Query(
+            "find_and_modify cannot combine `remove` and `update`".into(),
+        ));
+    }
+    if !opts.remove && opts.update.is_none() {
+        return Err(Error::Query(
+            "find_and_modify requires `update` or `remove`".into(),
+        ));
+    }
+    if opts.remove && opts.upsert {
+        return Err(Error::Query(
+            "find_and_modify cannot combine `remove` and `upsert`".into(),
+        ));
+    }
+    if opts.remove && opts.new {
+        return Err(Error::Query(
+            "find_and_modify cannot return a new document when removing".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn empty_find_and_modify() -> FindAndModifyOutcome {
+    FindAndModifyOutcome {
+        value: None,
+        matched: 0,
+        modified: 0,
+        upserted_id: None,
+    }
+}
+
+fn apply_projection(doc: Value, projection: Option<&Value>) -> Value {
+    match projection {
+        Some(p) => project(&doc, p),
+        None => doc,
+    }
+}
+
 fn project(doc: &Value, projection: &Value) -> Value {
     let Some(p) = projection.as_object() else {
         return doc.clone();

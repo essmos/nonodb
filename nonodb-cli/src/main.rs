@@ -116,6 +116,19 @@ fn run() -> Result<(), String> {
             let res = http_post("/v1/exec", &json!({"op": "list_indexes", "coll": coll}))?;
             print_result(&res);
         }
+        "map" => {
+            let res = http_post("/v1/exec", &json!({"op": "map_info"}))?;
+            print_result(&res);
+        }
+        "resize" => {
+            let raw = args
+                .get(1)
+                .ok_or("użycie: nonodb-cli resize <rozmiar, np. 4GiB>")?;
+            let size = nonodb_core::parse_size(raw)
+                .ok_or_else(|| format!("niepoprawny rozmiar: {raw}"))?;
+            let res = http_post("/v1/exec", &json!({"op": "resize_map", "size": size}))?;
+            print_result(&res);
+        }
         "backup" => {
             let data = PathBuf::from(
                 args.get(1)
@@ -126,6 +139,51 @@ fn run() -> Result<(), String> {
                     .ok_or("użycie: nonodb-cli backup <data-dir> <out-dir>")?,
             );
             backup(&data, &out)?;
+            let manifest =
+                nonodb_core::BackupManifest::from_backup(&out, &data).map_err(|e| e.to_string())?;
+            nonodb_core::verify::write_manifest(&out, &manifest).map_err(|e| e.to_string())?;
+            eprintln!(
+                "manifest: {} (sha256 {})",
+                out.join(nonodb_core::MANIFEST_FILE).display(),
+                manifest.sha256
+            );
+        }
+        "verify" => {
+            let data = PathBuf::from(
+                args.get(1)
+                    .ok_or("użycie: nonodb-cli verify <data-dir> [--json]")?,
+            );
+            let report = nonodb_core::verify_data_dir(&data).map_err(|e| e.to_string())?;
+            if args.iter().any(|a| a == "--json") {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
+                );
+            } else {
+                print_report(&report);
+            }
+        }
+        "verify-backup" => {
+            let backup = PathBuf::from(
+                args.get(1)
+                    .ok_or("użycie: nonodb-cli verify-backup <backup-dir> [--json]")?,
+            );
+            let checked = nonodb_core::verify_backup(&backup).map_err(|e| e.to_string())?;
+            if args.iter().any(|a| a == "--json") {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&checked).map_err(|e| e.to_string())?
+                );
+            } else {
+                eprintln!(
+                    "manifest: source={} created_at_ms={} size={} sha256={}",
+                    checked.manifest.source,
+                    checked.manifest.created_at_ms,
+                    checked.manifest.data_size,
+                    checked.manifest.sha256
+                );
+                print_report(&checked.report);
+            }
         }
         "inspect" => {
             let data = PathBuf::from(
@@ -144,7 +202,8 @@ fn run() -> Result<(), String> {
                     .ok_or("użycie: nonodb-cli restore <backup-dir> <data-dir> [--force]")?,
             );
             let force = args.iter().any(|a| a == "--force");
-            restore(&backup, &data, force)?;
+            let verify = args.iter().any(|a| a == "--verify");
+            restore(&backup, &data, force, verify)?;
         }
         "-h" | "--help" | "help" => return usage(),
         other => return Err(format!("nieznana komenda: {other} (spróbuj `help`)")),
@@ -163,14 +222,44 @@ fn usage() -> Result<(), String> {
          count <coll> [filtr]       liczba dokumentów\n\
          find <coll> [filtr] [--sort pole:asc|desc] [--limit N] [--skip N]\n\
          indexes <coll>             indeksy kolekcji\n\
-         backup <data> <out>        kopia LMDB (także przy działającym daemonie)\n\
+         map                        rozmiar mapy LMDB i zajęte bajty\n\
+         resize <rozmiar>           powiększ mapę online, np. 4GiB\n\
+         backup <data> <out>        kopia LMDB + manifest.json (także przy działającym daemonie)\n\
+         verify <data> [--json]     głęboka weryfikacja dokumentów i indeksów\n\
+         verify-backup <backup> [--json]  sprawdź manifest, sumę SHA-256 i zawartość\n\
          inspect <data> [coll]      statystyki bazy/kolekcji\n\
-         restore <backup> <data> [--force]  przywróć data.mdb (najpierw zatrzymaj daemona)\n\
+         restore <backup> <data> [--force] [--verify]  przywróć data.mdb (najpierw zatrzymaj daemona)\n\
          \n\
          Zmienne: NONODB_SOCK (Unix, domyślnie /run/nonodb.sock),\n\
          NONODB_URL (Windows, domyślnie http://127.0.0.1:7878), NONODB_TOKEN"
     );
     Ok(())
+}
+
+fn print_report(report: &nonodb_core::VerificationReport) {
+    println!("verified: {}", report.path);
+    println!("schema: {}", report.schema_version);
+    println!("collections: {}", report.collections.len());
+    println!("documents: {}", report.documents);
+    println!("document bytes: {}", report.bytes);
+    println!(
+        "secondary index entries: {}",
+        report.secondary_index_entries
+    );
+    println!("text indexes: {}", report.text_indexes);
+    println!("fuzzy indexes: {}", report.fuzzy_indexes);
+    println!("history entries: {}", report.history_entries);
+    println!("ttl entries: {}", report.ttl_entries);
+    for (name, coll) in &report.collections {
+        println!(
+            "  {name}: {} docs, {} bytes, {} secondary, {} text, {} fuzzy",
+            coll.documents,
+            coll.bytes,
+            coll.indexes.len(),
+            coll.text_indexes.len(),
+            coll.fuzzy_indexes.len()
+        );
+    }
 }
 
 fn print_result(res: &Value) {
@@ -279,7 +368,7 @@ fn inspect(data: &Path, only: Option<&str>) -> Result<(), String> {
     let env = unsafe {
         EnvOpenOptions::new()
             .flags(EnvFlags::READ_ONLY)
-            .max_dbs(256)
+            .max_dbs(nonodb_core::MAX_DBS)
             .open(data)
             .map_err(|e| e.to_string())?
     };
@@ -315,7 +404,7 @@ fn inspect(data: &Path, only: Option<&str>) -> Result<(), String> {
     Ok(())
 }
 
-fn restore(backup: &Path, data: &Path, force: bool) -> Result<(), String> {
+fn restore(backup: &Path, data: &Path, force: bool, verify: bool) -> Result<(), String> {
     let src = if backup.join("data.mdb").exists() {
         backup.join("data.mdb")
     } else {
@@ -323,6 +412,27 @@ fn restore(backup: &Path, data: &Path, force: bool) -> Result<(), String> {
     };
     if !src.is_file() {
         return Err(format!("brak pliku kopii: {}", src.display()));
+    }
+    if backup.is_dir() {
+        if let Some(manifest) =
+            nonodb_core::verify::read_manifest(backup).map_err(|e| e.to_string())?
+        {
+            let meta = std::fs::metadata(&src).map_err(|e| e.to_string())?;
+            if meta.len() != manifest.data_size {
+                return Err(format!(
+                    "rozmiar kopii nie zgadza się z manifestem: {} != {}",
+                    meta.len(),
+                    manifest.data_size
+                ));
+            }
+            let digest = nonodb_core::verify::sha256_file(&src).map_err(|e| e.to_string())?;
+            if digest != manifest.sha256 {
+                return Err(format!(
+                    "suma SHA-256 kopii nie zgadza się z manifestem: {digest} != {}",
+                    manifest.sha256
+                ));
+            }
+        }
     }
     std::fs::create_dir_all(data).map_err(|e| e.to_string())?;
     let dst = data.join("data.mdb");
@@ -337,5 +447,9 @@ fn restore(backup: &Path, data: &Path, force: bool) -> Result<(), String> {
     let file = std::fs::File::open(&dst).map_err(|e| e.to_string())?;
     let _ = file.sync_all();
     eprintln!("restore: {} -> {}", src.display(), dst.display());
+    if verify {
+        let report = nonodb_core::verify_data_dir(data).map_err(|e| e.to_string())?;
+        print_report(&report);
+    }
     Ok(())
 }

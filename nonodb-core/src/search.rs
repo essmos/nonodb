@@ -46,9 +46,8 @@ pub fn text_total_key(coll: &str, field: &str) -> String {
 pub fn field_text(value: &Value) -> Option<String> {
     match value {
         Value::String(s) => Some(s.clone()),
-        Value::Number(n) => Some(n.to_string()),
         Value::Bool(b) => Some(b.to_string()),
-        _ => None,
+        _ => crate::numeric::text_value(value),
     }
 }
 
@@ -242,6 +241,7 @@ pub fn bm25_term(tf: f64, dl: f64, avgdl: f64, idf: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn tokenize_lowercases_and_splits() {
@@ -295,6 +295,34 @@ mod tests {
         assert_eq!(fuzzy_distance("quick brown fox", "quik", 2), Some(1));
         assert_eq!(fuzzy_distance("Ala", "ala", 1), Some(0));
         assert_eq!(fuzzy_distance("Ala", "kota", 1), None);
+    }
+
+    #[test]
+    fn field_text_covers_extended_scalars() {
+        assert_eq!(field_text(&json!("Ala")), Some("Ala".into()));
+        assert_eq!(field_text(&json!(true)), Some("true".into()));
+        assert_eq!(field_text(&json!(1.25)), Some("1.25".into()));
+        assert_eq!(
+            field_text(&json!({"$numberLong": "9007199254740993"})),
+            Some("9007199254740993".into())
+        );
+        assert_eq!(
+            field_text(&json!({"$numberDecimal": "199.99"})),
+            Some("199.99".into())
+        );
+        assert_eq!(
+            field_text(&json!({"$numberDouble": "NaN"})),
+            Some("NaN".into())
+        );
+        assert_eq!(field_text(&json!({"$date": {"$numberLong": "0"}})), None);
+        assert_eq!(
+            field_text(&json!({"$oid": "000000000000000000000001"})),
+            None
+        );
+        assert_eq!(
+            field_text(&json!({"$binary": {"base64": "YQ==", "subType": "00"}})),
+            None
+        );
     }
 
     #[test]

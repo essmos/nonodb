@@ -226,6 +226,21 @@ n = users.count()                 # O(1) total count
 
 `count` returns an integer.
 
+### Explaining queries
+
+```python
+plan = users.explain(
+    {"age": {"$gte": 18}},
+    sort=[("age", 1)],
+    limit=20,
+)
+print(plan["access_path"], plan["index_used"], plan["actual_matched"])
+```
+
+`explain` reports the selected access path, index fields and bounds,
+`candidates`, `actual_matched`, `actual_returned`, and whether the sort is
+covered by the access path. It executes the query to obtain exact counts.
+
 ## Aggregation
 
 ```python
@@ -312,9 +327,50 @@ Upsert equality conditions from the filter are copied into the new document.
 ```python
 users.update({"_id": user_id}, {"$push": {"tags": "rust"}})
 users.update({"_id": user_id}, {"$push": {"ports": {"$each": [25, 587]}}})
+users.update({"_id": user_id}, {"$push": {"top": {"$each": [9, 3, 7], "$sort": 1, "$slice": 2}}})
 users.update({"_id": user_id}, {"$addToSet": {"roles": {"$each": ["admin", "editor"]}}})
-users.update({"_id": user_id}, {"$pull": {"tags": "deprecated"}})
+users.update({"_id": user_id}, {"$pull": {"scores": {"$gte": 90}}})
+users.update({"_id": user_id}, {"$pullAll": {"tags": ["draft", "obsolete"]}})
+
+# Positional updates. The filter selects the array element for `$`.
+users.update(
+    {"items": {"$elemMatch": {"sku": "A-1"}}},
+    {"$set": {"items.$.qty": 5}},
+)
+users.update({"_id": user_id}, {"$inc": {"items.$[].qty": 1}})
+users.update(
+    {"_id": user_id},
+    {"$set": {"items.$[i].checked": True}},
+    array_filters=[{"i.sku": "A-1", "i.qty": {"$lt": 5}}],
+)
 ```
+
+### Atomic find-and-modify
+
+`find_and_modify` selects, updates or removes, and returns one document in a
+single write transaction:
+
+```python
+old = users.find_and_modify(
+    {"state": "queued"},
+    {"$set": {"state": "running"}, "$inc": {"attempts": 1}},
+    sort=[("priority", -1)],
+)
+
+new = users.find_and_modify(
+    {"_id": user_id},
+    {"$inc": {"credits": -1}},
+    new=True,
+    projection={"_id": 1, "credits": 1},
+)
+
+removed = users.find_and_modify({"_id": user_id}, remove=True)
+```
+
+Use `find_and_modify_result(...)` when you also need `matched`, `modified`, or
+`upserted_id`. `array_filters=` is supported for `$[identifier]` paths. The
+call is safe for work queues and counters because no read can interleave
+between selection and the write.
 
 ### Replacement
 
@@ -329,9 +385,11 @@ users.update({"_id": user_id}, {"name": "Ada Lovelace", "age": 37})
 
 - `_id` is immutable. Do not modify it with update operators.
 - `$push`/`$addToSet` replace a non-array value with a new array.
-- `$pull` removes exact values only; it does not accept query predicates.
-- `$rename`, `$min`, `$max`, `$mul`, `$currentDate`, positional operators, and
-  array filters are not implemented.
+- `$pull` accepts values or query predicates; `$pullAll` removes listed values.
+- Numeric array indexes (`items.0.qty`), positional `$`, `$[]`, and
+  `$[identifier]` with `array_filters=` are supported.
+- `$rename`, `$min`, `$max`, `$mul`, `$currentDate`, and pipeline updates are
+  not implemented.
 
 ## Deleting
 
@@ -562,6 +620,8 @@ Common error codes are listed in the [HTTP API](api.md#error-codes).
 ```python
 db.health()        # bool
 db.collections()   # list[str]
+db.map_info()      # {"map_size": ..., "used_bytes": ..., "page_size": ...}
+db.resize_map(4 * 1024**3)  # grow the map online, returns old/new sizes
 ```
 
 For operations not wrapped by the client, send a raw request:

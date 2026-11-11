@@ -1,9 +1,11 @@
 //! Opening LMDB and managing collections.
 
+use std::ops::{Deref, DerefMut};
 use std::path::Path;
+use std::sync::{Condvar, Mutex};
 
 use heed::types::Bytes;
-use heed::{Database, Env, EnvOpenOptions, RoTxn, RwTxn};
+use heed::{Database, Env, EnvFlags, EnvOpenOptions, RoTxn, RwTxn};
 
 use crate::collection::Collection;
 use crate::error::{Error, Result};
@@ -25,7 +27,8 @@ fn configured_map_size() -> usize {
         .unwrap_or(MAP_SIZE)
 }
 
-fn parse_size(raw: &str) -> Option<usize> {
+/// Parses sizes such as `4GiB`, `2048MiB`, `1GB`, or a raw byte count.
+pub fn parse_size(raw: &str) -> Option<usize> {
     let s = raw.trim().to_ascii_lowercase();
     const UNITS: [(&str, u64); 6] = [
         ("gib", 1 << 30),
@@ -46,8 +49,12 @@ fn parse_size(raw: &str) -> Option<usize> {
 }
 /// Default LMDB page size (4 KiB).
 pub const PAGE_SIZE: usize = 4096;
-/// Maximum number of sub-databases (collections + meta + indexes).
-pub const MAX_DBS: u32 = 256;
+/// Maximum number of LMDB sub-databases (collections + meta + index slots).
+///
+/// Dropped index/search resources return their reusable slot to the pool, so
+/// normal create/drop cycles do not consume new slots. The higher ceiling also
+/// leaves room for databases created by older releases before slot reuse.
+pub const MAX_DBS: u32 = 1024;
 /// Metadata sub-database name.
 pub const META_DB: &str = "meta";
 /// Data format version (for future migrations).
@@ -57,12 +64,144 @@ pub const SCHEMA_VERSION: u32 = 1;
 /// document means an expensive update (the whole value is rewritten).
 pub const MAX_DOCUMENT_BYTES: usize = 1024 * 1024;
 
+/// Serializes transaction entry with an exclusive resize request.
+///
+/// A resize may only run while no LMDB transaction is active. New transactions
+/// are blocked as soon as a resize is queued, so a stream of readers cannot
+/// starve the resize.
+#[derive(Default)]
+pub(crate) struct TxnGate {
+    inner: Mutex<TxnGateState>,
+    cv: Condvar,
+}
+
+#[derive(Default)]
+struct TxnGateState {
+    active: usize,
+    resize_queued: bool,
+    resizing: bool,
+}
+
+pub(crate) struct TxnGuard<'a> {
+    gate: &'a TxnGate,
+}
+
+impl Drop for TxnGuard<'_> {
+    fn drop(&mut self) {
+        let mut state = self.gate.inner.lock().unwrap_or_else(|e| e.into_inner());
+        state.active = state.active.saturating_sub(1);
+        if state.active == 0 {
+            self.gate.cv.notify_all();
+        }
+    }
+}
+
+struct ResizeGuard<'a> {
+    gate: &'a TxnGate,
+}
+
+impl Drop for ResizeGuard<'_> {
+    fn drop(&mut self) {
+        let mut state = self.gate.inner.lock().unwrap_or_else(|e| e.into_inner());
+        state.resizing = false;
+        self.gate.cv.notify_all();
+    }
+}
+
+impl TxnGate {
+    pub(crate) fn enter(&self) -> TxnGuard<'_> {
+        let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        while state.resizing || state.resize_queued {
+            state = self.cv.wait(state).unwrap_or_else(|e| e.into_inner());
+        }
+        state.active += 1;
+        TxnGuard { gate: self }
+    }
+
+    fn enter_resize(&self) -> ResizeGuard<'_> {
+        let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        state.resize_queued = true;
+        while state.active > 0 || state.resizing {
+            state = self.cv.wait(state).unwrap_or_else(|e| e.into_inner());
+        }
+        state.resize_queued = false;
+        state.resizing = true;
+        ResizeGuard { gate: self }
+    }
+}
+
+/// A read transaction that also holds a transaction gate.
+///
+/// It dereferences to [`heed::RoTxn`], so existing collection methods accept it
+/// unchanged. Keeping the guard alive guarantees that an online map resize
+/// cannot run while the transaction is active.
+pub struct ReadTxn<'a> {
+    txn: RoTxn<'a>,
+    _guard: TxnGuard<'a>,
+}
+
+impl<'a> ReadTxn<'a> {
+    pub(crate) fn new(txn: RoTxn<'a>, guard: TxnGuard<'a>) -> Self {
+        Self { txn, _guard: guard }
+    }
+
+    /// Commits (releases) the read transaction.
+    pub fn commit(self) -> heed::Result<()> {
+        self.txn.commit()
+    }
+}
+
+impl<'a> Deref for ReadTxn<'a> {
+    type Target = RoTxn<'a>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.txn
+    }
+}
+
+/// A write transaction that also holds a transaction gate.
+pub struct WriteTxn<'a> {
+    txn: RwTxn<'a>,
+    _guard: TxnGuard<'a>,
+}
+
+impl<'a> WriteTxn<'a> {
+    pub(crate) fn new(txn: RwTxn<'a>, guard: TxnGuard<'a>) -> Self {
+        Self { txn, _guard: guard }
+    }
+
+    /// Commits the transaction and releases the gate.
+    pub fn commit(self) -> heed::Result<()> {
+        self.txn.commit()
+    }
+
+    /// Aborts the transaction and releases the gate.
+    pub fn abort(self) {
+        self.txn.abort()
+    }
+}
+
+impl<'a> Deref for WriteTxn<'a> {
+    type Target = RwTxn<'a>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.txn
+    }
+}
+
+impl DerefMut for WriteTxn<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.txn
+    }
+}
+
 /// Database handle. One `Store` = one `Env` = one LMDB file.
 pub struct Store {
     env: Env,
     history: Database<Bytes, Bytes>,
     ttl: Database<Bytes, Bytes>,
     history_config: HistoryConfig,
+    txn_gate: TxnGate,
 }
 
 impl Store {
@@ -79,6 +218,22 @@ impl Store {
         path: impl AsRef<Path>,
         history_config: HistoryConfig,
     ) -> Result<Self> {
+        Self::open_with_history_and_map_size(path, history_config, configured_map_size())
+    }
+
+    /// Opens the database with explicit history settings and map size.
+    ///
+    /// Mostly useful for tests, embedded tools, and a controlled offline resize.
+    pub fn open_with_history_and_map_size(
+        path: impl AsRef<Path>,
+        history_config: HistoryConfig,
+        map_size: usize,
+    ) -> Result<Self> {
+        if map_size < PAGE_SIZE {
+            return Err(Error::Query(format!(
+                "map size must be at least one page ({PAGE_SIZE} bytes)"
+            )));
+        }
         let path = path.as_ref();
         std::fs::create_dir_all(path)?;
 
@@ -86,7 +241,7 @@ impl Store {
         // concurrently with another `map_size` (the daemon is the sole owner).
         let env = unsafe {
             EnvOpenOptions::new()
-                .map_size(configured_map_size())
+                .map_size(map_size)
                 .max_dbs(MAX_DBS)
                 .open(path)?
         };
@@ -99,6 +254,45 @@ impl Store {
             history,
             ttl,
             history_config,
+            txn_gate: TxnGate::default(),
+        })
+    }
+
+    /// Opens a standard database with an explicit map size.
+    pub fn open_with_map_size(path: impl AsRef<Path>, map_size: usize) -> Result<Self> {
+        Self::open_with_history_and_map_size(path, HistoryConfig::default(), map_size)
+    }
+
+    /// Opens an existing database read-only for verification and inspection.
+    ///
+    /// Missing history/TTL databases from older releases fall back to the meta
+    /// handle; verification reads those databases directly when present.
+    pub(crate) fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        // SAFETY: read-only mapping; the environment is not modified.
+        let env = unsafe {
+            EnvOpenOptions::new()
+                .flags(EnvFlags::READ_ONLY)
+                .max_dbs(MAX_DBS)
+                .open(path)?
+        };
+        let rtxn = env.read_txn()?;
+        let meta = env
+            .open_database::<Bytes, Bytes>(&rtxn, Some(META_DB))?
+            .ok_or_else(|| Error::Query("meta database missing".into()))?;
+        let history = env
+            .open_database::<Bytes, Bytes>(&rtxn, Some(HISTORY_DB))?
+            .unwrap_or(meta);
+        let ttl = env
+            .open_database::<Bytes, Bytes>(&rtxn, Some(TTL_DB))?
+            .unwrap_or(meta);
+        rtxn.commit()?;
+        Ok(Self {
+            env,
+            history,
+            ttl,
+            history_config: HistoryConfig::default(),
+            txn_gate: TxnGate::default(),
         })
     }
 
@@ -136,16 +330,83 @@ impl Store {
         )
     }
 
+    /// Raw LMDB environment.
+    ///
+    /// Transactions opened directly on this handle bypass the online-resize
+    /// gate. Prefer [`Store::read_txn`] and [`Store::write_txn`], or pause
+    /// external administrative work while resizing.
     pub fn env(&self) -> &Env {
         &self.env
     }
 
-    pub fn read_txn(&self) -> Result<RoTxn<'_>> {
-        Ok(self.env.read_txn()?)
+    pub fn read_txn(&self) -> Result<ReadTxn<'_>> {
+        let guard = self.txn_gate.enter();
+        Ok(ReadTxn::new(self.env.read_txn()?, guard))
     }
 
-    pub fn write_txn(&self) -> Result<RwTxn<'_>> {
-        Ok(self.env.write_txn()?)
+    pub fn write_txn(&self) -> Result<WriteTxn<'_>> {
+        let guard = self.txn_gate.enter();
+        Ok(WriteTxn::new(self.env.write_txn()?, guard))
+    }
+
+    /// Current LMDB map size in bytes.
+    pub fn map_size(&self) -> usize {
+        self.env.info().map_size
+    }
+
+    /// Approximate number of bytes occupied by the database high-water mark.
+    pub fn map_used_bytes(&self) -> usize {
+        let info = self.env.info();
+        let pages = info.last_page_number + 1;
+        pages.saturating_mul(PAGE_SIZE)
+    }
+
+    /// Grows the LMDB map without restarting the process.
+    ///
+    /// The call waits for all gated transactions to finish and prevents new
+    /// ones from starting until LMDB has changed the mapping. It only grows the
+    /// map; shrinking requires an offline restart. Returns the previous size.
+    pub fn resize_map_size(&self, new_size: usize) -> Result<usize> {
+        if new_size < PAGE_SIZE {
+            return Err(Error::Query(format!(
+                "map size must be at least one page ({PAGE_SIZE} bytes)"
+            )));
+        }
+        if !new_size.is_multiple_of(PAGE_SIZE) {
+            return Err(Error::Query(format!(
+                "map size must be a multiple of the page size ({PAGE_SIZE} bytes)"
+            )));
+        }
+        let _guard = self.txn_gate.enter_resize();
+        let old_size = self.env.info().map_size;
+        if new_size < old_size {
+            return Err(Error::Query(format!(
+                "online resize can only grow the map (current {old_size} bytes, requested {new_size})"
+            )));
+        }
+        if new_size == old_size {
+            return Ok(old_size);
+        }
+        if new_size < self.map_used_bytes() {
+            return Err(Error::Query(format!(
+                "map size {new_size} is smaller than the used database high-water mark"
+            )));
+        }
+        // SAFETY: the resize guard excludes every transaction created through
+        // `Store`/`Collection`; in-process snapshots use `copy_to_file`, which
+        // also takes the gate. External processes must be paused by operators.
+        unsafe { self.env.resize(new_size)? };
+        Ok(old_size)
+    }
+
+    /// Makes a consistent LMDB copy while holding the resize gate.
+    pub fn copy_to_file(
+        &self,
+        path: impl AsRef<Path>,
+        option: heed::CompactionOption,
+    ) -> Result<std::fs::File> {
+        let _guard = self.txn_gate.enter();
+        Ok(self.env.copy_to_file(path, option)?)
     }
 
     fn init_meta(env: &Env) -> Result<(Database<Bytes, Bytes>, Database<Bytes, Bytes>)> {
@@ -602,6 +863,7 @@ impl Store {
             profile,
             ttl_default,
             purge_history,
+            &self.txn_gate,
         )
     }
 

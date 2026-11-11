@@ -9,7 +9,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use nonodb_core::{vault, Collection, Store};
+use nonodb_core::{vault, Collection, FindAndModifyOptions, Store};
 use serde_json::{json, Value};
 use tokio::sync::oneshot;
 
@@ -63,7 +63,9 @@ pub fn run(store: Arc<Store>, rx: Receiver<WriteJob>, cache: Arc<QueryCache>) {
             }
         }
 
+        metrics::inc(&metrics::WRITER_BUSY);
         run_batch(&store, &cache, jobs);
+        metrics::sub(&metrics::WRITER_BUSY, 1);
     }
 }
 
@@ -272,12 +274,13 @@ fn execute(
             update,
             multi,
             upsert,
+            array_filters,
             vault,
         } => {
             let c = write_collection(store, wtxn, coll, vault.as_ref())?;
             let out = if c.profile().is_vault() {
                 let auth = vault.as_ref().ok_or_else(vault::key_required)?;
-                c.update_vault_txn(
+                c.update_vault_txn_filtered(
                     wtxn,
                     filter,
                     update,
@@ -286,14 +289,54 @@ fn execute(
                     &auth.key,
                     &auth.tenant,
                     &auth.kid,
+                    array_filters,
                 )?
             } else {
                 if vault.is_some() {
                     return Err(vault::key_unexpected().into());
                 }
-                c.update_opts_txn(wtxn, filter, update, *multi, *upsert)?
+                c.update_opts_txn_filtered(wtxn, filter, update, *multi, *upsert, array_filters)?
             };
             Ok(json!({
+                "matched": out.matched,
+                "modified": out.modified,
+                "upserted_id": out.upserted_id,
+            }))
+        }
+        WriteReq::FindAndModify {
+            coll,
+            filter,
+            update,
+            sort,
+            new,
+            upsert,
+            remove,
+            array_filters,
+            projection,
+            vault,
+        } => {
+            let c = write_collection(store, wtxn, coll, vault.as_ref())?;
+            let opts = FindAndModifyOptions {
+                filter,
+                update: update.as_ref(),
+                sort,
+                new: *new,
+                upsert: *upsert,
+                remove: *remove,
+                array_filters,
+                projection: projection.as_ref(),
+            };
+            let out = if c.profile().is_vault() {
+                let auth = vault.as_ref().ok_or_else(vault::key_required)?;
+                c.find_and_modify_vault_txn(wtxn, &opts, &auth.key, &auth.tenant, &auth.kid)?
+            } else {
+                if vault.is_some() {
+                    return Err(vault::key_unexpected().into());
+                }
+                c.find_and_modify_txn(wtxn, &opts)?
+            };
+            Ok(json!({
+                "value": out.value,
                 "matched": out.matched,
                 "modified": out.modified,
                 "upserted_id": out.upserted_id,

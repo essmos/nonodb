@@ -55,6 +55,18 @@ pub enum Request {
         #[serde(default)]
         projection: Option<Value>,
     },
+    /// Read-only query plan and actual count diagnostics.
+    Explain {
+        coll: String,
+        #[serde(default)]
+        filter: Value,
+        #[serde(default)]
+        sort: Vec<(String, i32)>,
+        #[serde(default)]
+        skip: usize,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
     Update {
         coll: String,
         #[serde(default)]
@@ -64,6 +76,28 @@ pub enum Request {
         multi: bool,
         #[serde(default)]
         upsert: bool,
+        #[serde(default)]
+        array_filters: Vec<Value>,
+    },
+    /// Atomically update or remove one document and return its old/new image.
+    FindAndModify {
+        coll: String,
+        #[serde(default)]
+        filter: Value,
+        #[serde(default)]
+        update: Option<Value>,
+        #[serde(default)]
+        sort: Vec<(String, i32)>,
+        #[serde(default)]
+        new: bool,
+        #[serde(default)]
+        upsert: bool,
+        #[serde(default)]
+        remove: bool,
+        #[serde(default)]
+        array_filters: Vec<Value>,
+        #[serde(default)]
+        projection: Option<Value>,
     },
     Delete {
         coll: String,
@@ -192,6 +226,13 @@ pub enum Request {
     GetCollectionTtl {
         coll: String,
     },
+    /// Returns the current LMDB map size and high-water mark.
+    MapInfo,
+    /// Grows the LMDB map without restarting the daemon.
+    ResizeMap {
+        /// New map size in bytes; must be a multiple of 4096 and >= current.
+        size: u64,
+    },
 }
 
 /// Write operation allowed in an atomic `write_batch`.
@@ -215,6 +256,8 @@ pub enum WriteOp {
         multi: bool,
         #[serde(default)]
         upsert: bool,
+        #[serde(default)]
+        array_filters: Vec<Value>,
     },
     Delete {
         coll: String,
@@ -252,6 +295,19 @@ pub enum WriteReq {
         update: Value,
         multi: bool,
         upsert: bool,
+        array_filters: Vec<Value>,
+        vault: Option<VaultAuth>,
+    },
+    FindAndModify {
+        coll: String,
+        filter: Value,
+        update: Option<Value>,
+        sort: Vec<(String, i32)>,
+        new: bool,
+        upsert: bool,
+        remove: bool,
+        array_filters: Vec<Value>,
+        projection: Option<Value>,
         vault: Option<VaultAuth>,
     },
     Delete {
@@ -358,12 +414,14 @@ impl From<WriteOp> for WriteReq {
                 update,
                 multi,
                 upsert,
+                array_filters,
             } => WriteReq::Update {
                 coll,
                 filter,
                 update,
                 multi,
                 upsert,
+                array_filters,
                 vault: None,
             },
             WriteOp::Delete {
@@ -391,6 +449,9 @@ impl From<nonodb_core::Error> for ApiError {
             E::DocumentTooLarge(_, _) => "document_too_large",
             E::InvalidTtl(_) => "invalid_ttl",
             E::InvalidDate(_) => "invalid_date",
+            E::InvalidNumeric(_) => "invalid_numeric",
+            E::InvalidBinary(_) => "invalid_binary",
+            E::InvalidObjectId(_) => "invalid_object_id",
             E::Json(_) | E::JsonFast(_) => "invalid_json",
             E::Lmdb(_) => "storage",
             E::Io(_) => "io",

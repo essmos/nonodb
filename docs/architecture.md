@@ -91,10 +91,11 @@ An LMDB environment contains named sub-databases. nonodb uses this layout:
 | `history` | collection + `_id` + revision | revision JSON | Append-only document history |
 | `ttl` | expiry index / collection + `_id` | expiry timestamp | Document expiry metadata |
 | `coll:<name>` | `_id` bytes | JSON document | Primary collection data |
-| `idx:<coll>:<fields>` | encoded values + `_id` | encoded `_id` / covering payload | Secondary index |
-| `ft:<coll>:<field>` | `term\0_id` | term frequency (u32 LE) | BM25 postings |
-| `ftl:<coll>:<field>` | `_id` | document length (u32 LE) | BM25 normalization |
-| `fz:<coll>:<field>` | `trigram\0_id` | empty | Fuzzy candidate index |
+| `dbslot:<n>` (index) | encoded values + `_id` | encoded `_id` / covering payload | Secondary index |
+| `dbslot:<n>` (text postings) | `term\0_id` | term frequency (u32 LE) | BM25 postings |
+| `dbslot:<n>` (text lengths) | `_id` | document length (u32 LE) | BM25 normalization |
+| `dbslot:<n>` (fuzzy) | `trigram\0_id` | empty | Fuzzy candidate index |
+| legacy `idx:*`, `ft:*`, `ftl:*`, `fz:*` | as above | as above | Resources created by older releases |
 
 Collection names are validated. The `_id` is always a string and is also the
 primary B+ tree key. Documents are serialized with `serde_json`; reads use
@@ -106,6 +107,18 @@ their own type tag and an order-preserving signed integer payload, so range
 filters, sorting, compound indexes, and unique constraints compare instants
 rather than the original string representation. Date strings are not converted
 implicitly. See [Dates and time zones](dates.md).
+
+Numbers use one numeric type bracket. JSON integers, floats, `$numberInt`,
+`$numberLong`, `$numberDouble`, Decimal128 (`{"$numberDecimal": "..."}`), and
+special doubles (`NaN`/`Infinity`) are normalized to a bounded scientific
+decimal representation for comparison and indexing. Integers are never rounded
+through `f64`; floats use 17 significant digits; Decimal128 keeps up to 34
+digits. See [Numbers and decimals](numerics.md).
+
+Binary/UUID values (`$binary`, `$uuid`) and ObjectId (`$oid`) are stored as
+canonical Extended JSON objects. They have their own index tags and are compared
+by subtype/length/bytes and by the 12 ObjectId bytes respectively. See
+[BSON scalar types](bson-types.md).
 
 The optional `history` sub-database stores immutable revision snapshots. A key
 contains the collection name, `_id`, and a global `rev` assigned by the writer.
@@ -141,11 +154,16 @@ methods reject vault collections, and vault requests require the three
 encryption headers. See [Vault collections](vault.md) for the API contract and
 threat model.
 
-Every collection and every index consumes a named LMDB sub-database.
-`MAX_DBS` is 256, which in practice limits a database to roughly 245
-collections before `MDB_DBS_FULL` (indexes consume additional slots). Dropping
-an index deletes its contents but the named sub-database remains registered in
-LMDB; see [Operations](operations.md#capacity-and-memory).
+Every collection consumes a named LMDB sub-database. Index, text, and fuzzy
+resources are assigned physical **slot databases** (`dbslot:*`) from a reusable
+pool. Dropping a resource clears its slot and returns it to the pool, so
+create/drop cycles do not consume additional LMDB sub-databases. `MAX_DBS` is
+1024; the pool reserves 64 slots for collections and fixed databases.
+
+Index/search resources created by older releases still use their legacy named
+sub-databases. They remain registered until a compacting backup/restore;
+recreated resources use the slot pool. See
+[Operations](operations.md#capacity-and-memory).
 
 ## Read path
 
@@ -168,9 +186,11 @@ batch sees a single point-in-time view.
 
 The optimizer is intentionally simple and conservative. It uses an index when:
 
-- the filter has an equality condition on every field of a compound index
-  prefix, with an optional range on the last field; or
-- a single-field index has an equality or range condition; and
+- the filter has an equality condition (or single-value `$all`) on every field
+  of a compound index prefix, with an optional range or anchored-regex prefix on
+  the last field; or
+- a single-field index has an equality or range condition, a single-value
+  `$all`, or a case-sensitive anchored regex (`^literal`); and
 - the indexed field value is not `null` (because `null` also matches a missing
   field, which is absent from the index).
 
@@ -237,7 +257,19 @@ comparator as `find`, and expressions reuse the path helpers used by filters and
 updates. `$addToSet` and grouping keys serialize values to canonical JSON
 strings for deduplication and grouping.
 
+Updates resolve paths before writing. Numeric segments address array indexes;
+`$` expands from the original update filter, `$[]` expands to every element,
+and `$[identifier]` expands only to elements matching the corresponding
+`arrayFilters` entry. Path expansion happens on a copy of the document inside
+the write transaction, so validation or update errors never persist partial
+changes. `$push` applies `$position`, then `$sort`, then `$slice`, matching
+MongoDB's ordering.
+
 ### Choosing a read strategy
+
+The `explain` operation reports the selected path, index and bounds, sort
+coverage, candidate count, and exact matched/returned counts. It executes the
+query to provide actual counts, so use a small limit for broad filters.
 
 Use the cheapest access path that fits the query:
 
@@ -359,10 +391,13 @@ Secondary index keys are ordered so that LMDB byte ordering matches logical
 ordering:
 
 - scalar values are tagged by type and encoded in an order-preserving form;
-- numbers are encoded through an order-preserving transform of `f64`;
+- numbers are encoded as an exact, order-preserving scientific decimal with
+  one numeric type tag for integers, floats, Decimal128, and special doubles;
 - strings are escaped UTF-8;
 - Extended JSON dates are encoded as order-preserving signed millisecond
   integers with a separate type tag;
+- binary/UUID keys encode subtype, length, and bytes; ObjectId keys encode 12
+  bytes, each with a separate type tag;
 - compound keys concatenate encoded fields;
 - the document `_id` is appended to make each key unique.
 
@@ -370,16 +405,21 @@ Because the encoding is ordered, range queries (`$gt`, `$gte`, `$lt`, `$lte`)
 become contiguous LMDB ranges. An index range scan does not deserialize
 documents until candidates are verified.
 
-Secondary indexes accept strings, numbers, booleans, dates, and `null` values
-that are actually present. Arrays and ordinary objects are skipped. Dates are
-canonicalized before indexing, so all offsets for one instant share a key. Text
-and fuzzy indexes search string/number/bool scalar values only; dates are not
-searchable text.
+Secondary indexes accept strings, numbers, Decimal128, special doubles,
+booleans, dates, binary/UUID, ObjectId, and `null` values that are actually
+present. Arrays and ordinary objects are skipped. Dates are canonicalized
+before indexing, so all offsets for one instant share a key. Text and fuzzy
+indexes search string, boolean, and numeric scalar values, including Extended
+JSON integer/double/decimal forms. Dates, binary/UUID, and ObjectId values are
+not searchable text.
 
 Index definitions record the key-encoding format. Definitions written before
 date support default to format 0 and are not used for filters containing dates,
-because those indexes skipped `$date` objects during backfill. Recreating the
-index upgrades it to the current format.
+because those indexes skipped `$date` objects during backfill. Version 2 used
+the old `f64` numeric transform; version 3 uses exact numeric keys; version 4
+adds binary/UUID and ObjectId keys. Filters containing numbers, dates, binary,
+or ObjectId values skip older-format indexes and fall back to a scan. Recreating
+the index upgrades it to the current format.
 
 ### Compound indexes
 
@@ -471,8 +511,9 @@ final Levenshtein comparison is exact within the requested bound.
   remain valid for active readers.
 - **Writers are serialized.** One writer thread and LMDB's single-writer model.
 - **No cross-request isolation.** A read-modify-write sequence performed as two
-  separate requests can interleave with another client. For atomic updates use
-  update operators such as `$inc`, or group writes in `write_batch`.
+  separate requests can interleave with another client. Use `find_and_modify`
+  for an atomic select-update-return, update operators such as `$inc`, or group
+  writes in `write_batch`.
 - **Read-only `batch` is a snapshot.** All reads in a batch see the same state.
 - **`write_batch` is all-or-nothing.** A failure at any operation rolls back the
   whole batch.

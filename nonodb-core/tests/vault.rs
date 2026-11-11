@@ -178,3 +178,59 @@ fn history_decrypts_snapshots() {
     assert_eq!(entries[1].doc.as_ref().unwrap()["secret"], "v1");
     rtxn.commit().unwrap();
 }
+
+#[test]
+fn vault_find_and_modify_is_atomic() {
+    let (_dir, store) = store();
+    let key = VaultKey::from_bytes([21u8; 32]);
+    let vault = store
+        .create_collection("vault_fam", CollectionProfile::Vault)
+        .unwrap();
+    let mut wtxn = store.write_txn().unwrap();
+    let id = vault
+        .insert_vault_txn(
+            &mut wtxn,
+            json!({"tenant_id":"acme", "secret":"before", "n":1}),
+            &key,
+            "acme",
+            "acme:v1",
+        )
+        .unwrap();
+    wtxn.commit().unwrap();
+
+    let filter = json!({"_id": id});
+    let update = json!({"$inc": {"n": 1}, "$set": {"secret": "after"}});
+    let opts = nonodb_core::FindAndModifyOptions {
+        filter: &filter,
+        update: Some(&update),
+        sort: &[],
+        new: true,
+        upsert: false,
+        remove: false,
+        array_filters: &[],
+        projection: None,
+    };
+    let out = vault
+        .find_and_modify_vault(&opts, &key, "acme", "acme:v1")
+        .unwrap();
+    assert_eq!(
+        out.value,
+        Some(json!({"_id": id, "tenant_id":"acme", "secret":"after", "n":2}))
+    );
+
+    let opts = nonodb_core::FindAndModifyOptions {
+        filter: &filter,
+        update: None,
+        sort: &[],
+        new: false,
+        upsert: false,
+        remove: true,
+        array_filters: &[],
+        projection: None,
+    };
+    let out = vault
+        .find_and_modify_vault(&opts, &key, "acme", "acme:v1")
+        .unwrap();
+    assert_eq!(out.modified, 1);
+    assert_eq!(out.value.unwrap()["secret"], "after");
+}

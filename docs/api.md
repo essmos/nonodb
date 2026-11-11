@@ -70,7 +70,7 @@ support only a restricted subset of operations. See
 | Search/fuzzy `limit` | default 10, maximum 1000 |
 | Fuzzy candidates | 5,000 per query |
 | `write_batch` operations | bounded by request size |
-| LMDB named databases | 256 (`MDB_DBS_FULL` when exhausted) |
+| LMDB named databases | 1024 (`MDB_DBS_FULL` when exhausted) |
 
 The server timeout can be raised with `NONODB_REQUEST_TIMEOUT`; the Python
 client timeout with `NONODB_TIMEOUT` or the `timeout=` argument.
@@ -83,7 +83,9 @@ client timeout with `NONODB_TIMEOUT` or the `timeout=` argument.
 | [`insert_many`](#insert_many) | Insert multiple documents |
 | [`find`](#find) | Query documents |
 | [`find_one`](#find_one) | Return one document |
+| [`explain`](#explain) | Show the selected plan, bounds, and actual counts |
 | [`update`](#update) | Update or upsert documents |
+| [`find_and_modify`](#find_and_modify) | Atomically update/remove one document and return it |
 | [`delete`](#delete) | Delete documents |
 | [`count`](#count) | Count matching documents |
 | [`aggregate`](#aggregation) | Read-only aggregation pipeline |
@@ -106,6 +108,8 @@ client timeout with `NONODB_TIMEOUT` or the `timeout=` argument.
 | [`create_collection`](#create_collection) | Create a standard or vault collection |
 | [`set_collection_ttl`](#document-ttl) | Set or clear the default document TTL |
 | [`get_collection_ttl`](#document-ttl) | Read the default document TTL |
+| [`map_info`](#lmdb-map-size) | Read map size and high-water mark |
+| [`resize_map`](#lmdb-map-size) | Grow the LMDB map online |
 
 ---
 
@@ -135,6 +139,11 @@ Response:
   before storage. See [Document TTL](#document-ttl).
 - Extended JSON `{"$date": ...}` values are normalized to canonical UTC
   milliseconds before storage. See [Dates and time zones](dates.md).
+- Extended JSON numeric objects are validated and stored in canonical form:
+  `$numberInt`, `$numberLong`, `$numberDouble`, and `$numberDecimal`.
+  See [Numbers and decimals](numerics.md).
+- `{"$binary": ...}` / `{"$uuid": ...}` and `{"$oid": ...}` are normalized to
+  canonical Extended JSON. See [BSON scalar types](bson-types.md).
 
 ## insert_many
 
@@ -219,6 +228,64 @@ Response: the document or `null`.
 `find_one` is `find` with `limit=1` and no sort. It stops as soon as a match is
 found. An exact `_id` filter uses a direct primary-key lookup.
 
+## explain
+
+Returns the access path chosen for a `find`-shaped query, index and bounds
+information, and exact document counts.
+
+```json
+{
+  "op": "explain",
+  "coll": "users",
+  "filter": {"age": {"$gte": 18}},
+  "sort": [["age", 1]],
+  "skip": 0,
+  "limit": 20
+}
+```
+
+Example result:
+
+```json
+{
+  "collection": "users",
+  "access_path": "index_scan",
+  "index_used": true,
+  "index": {"fields": ["age"], "unique": false, "include": []},
+  "bounds": {
+    "lower": {"value": "06...", "inclusive": true},
+    "upper": null
+  },
+  "candidates": 42,
+  "estimated_documents": 42,
+  "actual_matched": 40,
+  "actual_returned": 20,
+  "sort_covered": true,
+  "filter": {"age": {"$gte": 18}},
+  "sort": [["age", 1]],
+  "skip": 0,
+  "limit": 20
+}
+```
+
+Fields:
+
+| Field | Meaning |
+|---|---|
+| `access_path` | `id_lookup`, `id_range`, `index_scan`, or `collection_scan` |
+| `index_used` | Whether a primary/secondary index supplies candidates |
+| `index` | Index fields, uniqueness, and included fields (`null` for scans) |
+| `bounds` | Encoded lower/upper index keys; `_id` bounds are literal strings |
+| `candidates` | Index entries or documents considered before filtering |
+| `estimated_documents` | Same candidate count, provided as an estimate field |
+| `actual_matched` | Documents matching the filter |
+| `actual_returned` | Documents returned after `skip`/`limit` |
+| `sort_covered` | Whether the access path already provides the requested order |
+
+`explain` executes the query to produce exact `actual_*` counts. Use a small
+`limit` when explaining a broad query. It is read-only and does not create or
+modify indexes. Vault collections do not support `explain`.
+
 ## update
 
 ```json
@@ -268,8 +335,9 @@ stored key.
 | `$set` | Set one or more paths; creates intermediate objects |
 | `$unset` | Remove one or more paths; no error if absent |
 | `$inc` | Add a number; missing field is treated as 0 |
-| `$push` | Append one value or `{"$each": [...]}` to an array |
-| `$pull` | Remove array elements exactly equal to the given value |
+| `$push` | Append one value or `{"$each": [...]}`; supports `$position`, `$slice`, `$sort` |
+| `$pull` | Remove array elements matching a value or query predicate |
+| `$pullAll` | Remove all occurrences of the listed values |
 | `$addToSet` | Append values that are not already present; supports `$each` |
 | `$setOnInsert` | Apply only when an upsert inserts a new document |
 
@@ -280,9 +348,47 @@ Examples:
 {"$inc": {"counters.requests": 1}}
 {"$push": {"tags": "rust"}}
 {"$push": {"ports": {"$each": [25, 587]}}}
+{"$push": {"top": {"$each": [9, 3, 7], "$sort": 1, "$slice": 2}}}
+{"$push": {"queue": {"$each": ["high"], "$position": 0}}}
 {"$addToSet": {"roles": {"$each": ["admin", "editor", "admin"]}}}
 {"$pull": {"tags": "deprecated"}}
+{"$pull": {"scores": {"$gte": 90}}}
+{"$pullAll": {"tags": ["draft", "obsolete"]}}
 ```
+
+Array paths support numeric indexes and positional updates:
+
+```json
+{"$set": {"items.0.qty": 5}}
+{"$set": {"items.$.qty": 5}}
+{"$inc": {"items.$[].qty": 1}}
+{"$set": {"items.$[i].checked": true}}
+```
+
+The positional `$` uses the first array element matching the update filter.
+Use `$elemMatch` on the array field so the filter can select an element:
+
+```json
+filter: {"items": {"$elemMatch": {"sku": "y"}}}
+update: {"$set": {"items.$.qty": 5}}
+```
+
+`$[identifier]` requires a matching entry in `arrayFilters`. Via the Python
+client:
+
+```python
+coll.update(
+    {"_id": "a"},
+    {"$set": {"items.$[i].checked": True}},
+    array_filters=[{"i.sku": "x", "i.qty": {"$lt": 5}}],
+)
+```
+
+Raw protocol updates accept an optional `array_filters` array. Each entry is
+an object using exactly one identifier; keys are either the identifier itself
+or `identifier.path`. Malformed placeholders, missing identifiers, mixed
+identifiers, and invalid `$push` modifiers return `invalid_query` before any
+write.
 
 Notes:
 
@@ -290,14 +396,18 @@ Notes:
   This is destructive; ensure the field is intended to be an array.
 - `$addToSet` uses the same equality semantics as filters. Numbers compare by
   value (`1 == 1.0`), and objects compare structurally.
-- `$pull` removes exact matching values only. It does not support query
-  predicates inside the array.
-- Nested paths (`a.b.c`) work with `$set`, `$unset`, `$inc`, `$push`, `$pull`,
-  and `$addToSet`.
+- `$pull` accepts either a value or a query predicate (for example `$gte`,
+  `$in`, or a field condition for array elements that are objects).
+- `$push` modifier ordering follows MongoDB: insert at `$position`, then apply
+  `$sort`, then apply `$slice` (positive keeps the first N, negative keeps the
+  last N, zero empties the array).
+- Nested paths (`a.b.c`), numeric array indexes (`a.0.b`), positional `$`,
+  `$[]`, and `$[identifier]` work with the update operators above. Assigning
+  beyond the end of an array pads it with `null`; `$unset` on an array index
+  sets that element to `null`.
 - `_id` is immutable. Do not use `$set`/`$unset`/array operators on `_id`.
 - Unsupported operators such as `$rename`, `$min`, `$max`, `$mul`,
-  `$currentDate`, positional operators, and array filters return
-  `invalid_query`.
+  `$currentDate`, and pipeline updates return `invalid_query`.
 
 ### Upsert
 
@@ -335,6 +445,59 @@ Result when inserting:
 ```
 
 The inserted document contains `tenant`, `key`, `host`, and `created_at`.
+
+## find_and_modify
+
+Atomically selects one document, updates or removes it, and returns its old or
+new image in the same write transaction.
+
+```json
+{
+  "op": "find_and_modify",
+  "coll": "jobs",
+  "filter": {"state": "queued"},
+  "update": {"$set": {"state": "running"}, "$inc": {"attempts": 1}},
+  "sort": [["priority", -1], ["_id", 1]],
+  "new": true,
+  "array_filters": [{"i.ready": true}],
+  "projection": {"_id": 1, "state": 1, "attempts": 1}
+}
+```
+
+Response:
+
+```json
+{
+  "value": {"_id": "job-1", "state": "running", "attempts": 1},
+  "matched": 1,
+  "modified": 1,
+  "upserted_id": null
+}
+```
+
+Fields:
+
+| Field | Behavior |
+|---|---|
+| `filter` | Selects the candidate document |
+| `update` | Update document; required unless `remove=true` |
+| `sort` | Chooses the first matching document by sort order |
+| `new` | Return the post-image instead of the pre-image |
+| `upsert` | Insert a filter-seeded document when nothing matches |
+| `remove` | Remove the selected document instead of updating it |
+| `array_filters` | MongoDB-style filters for `$[identifier]` update paths |
+| `projection` | Flat top-level projection applied to the returned image |
+
+With `upsert=true` and no match, the default (`new=false`) response has
+`"value": null`; with `new=true` it returns the inserted document. For an
+insert, `matched` and `modified` are `0` and `upserted_id` is set.
+
+`remove=true` cannot be combined with `update`, `upsert`, or `new`. Invalid
+combinations and malformed array filters return `invalid_query` without
+changing the document.
+
+Vault collections support the same operation with their normal restriction:
+the filter must identify exactly one `_id` and projection is not supported.
 
 ## delete
 
@@ -526,6 +689,11 @@ object, `null`, or an omitted filter matches every document.
 | `{"a": {"$in": [1, 2]}}` | Equal to one of the values |
 | `{"a": {"$nin": [1, 2]}}` | Equal to none of the values |
 | `{"a": {"$exists": true}}` | Field is present |
+| `{"a": {"$all": [1, 2]}}` | Array contains all listed values |
+| `{"a": {"$size": 2}}` | Array has exactly this length |
+| `{"a": {"$elemMatch": {...}}}` | At least one array element matches |
+| `{"a": {"$regex": "^foo", "$options": "i"}}` | String matches a regular expression |
+| `{"a": {"$type": "string"}}` | Value has a BSON type |
 | `{"a": {"$not": {...}}}` | Negate a field condition |
 
 ### Logical operators
@@ -559,9 +727,118 @@ Standard `$eq`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`, and `$nin` compare dates
 by instant. Different RFC 3339 offsets for the same instant are equal. Date
 values do not match string values. See [Dates and time zones](dates.md).
 
+### Numbers and decimals
+
+Ordinary JSON numbers, Decimal128, and special doubles share one numeric type
+bracket. Use Extended JSON for decimals:
+
+```json
+{
+  "op": "find",
+  "coll": "products",
+  "filter": {
+    "price": {
+      "$gte": {"$numberDecimal": "10.00"},
+      "$lt": {"$numberDecimal": "100.00"}
+    }
+  }
+}
+```
+
+`{"$numberDecimal": "199.99"}` is a finite Decimal128 value.
+`{"$numberDouble": "NaN"}`, `"Infinity"`, and `"-Infinity"` represent values
+that JSON numbers cannot express. `{"$numberInt": "42"}` and
+`{"$numberLong": "9007199254740993"}` preserve their BSON integer type.
+Integer comparison and index keys are exact, including values above `2^53`.
+See [Numbers and decimals](numerics.md).
+
+### BSON scalar types and `$type`
+
+Use Extended JSON for binary, UUID, and ObjectId values:
+
+```json
+{"payload": {"$binary": {"base64": "YQ==", "subType": "00"}}}
+{"payload": {"$uuid": "00112233-4455-6677-8899-aabbccddeeff"}}
+{"ref": {"$oid": "000000000000000000000001"}}
+```
+
+`$uuid` is normalized to binary subtype `04`. ObjectId is currently a field
+value only; `_id` remains a string.
+
+The `$type` operator accepts names, numeric BSON codes, or an array:
+
+```json
+{"op": "find", "coll": "items", "filter": {"payload": {"$type": "binData"}}}
+{"op": "find", "coll": "items", "filter": {"ref": {"$type": ["objectId", 2]}}}
+```
+
+Type names include `double`, `string`, `object`, `array`, `binData`,
+`objectId`, `bool`, `date`, `null`, `int`, `long`, and `decimal`; `number`
+matches any numeric type. Arrays match when the array itself or any element has
+the requested type. See [BSON scalar types](bson-types.md).
+
+### Regular expressions
+
+`$regex` accepts a pattern string and optional `$options`:
+
+```json
+{"name": {"$regex": "^ada", "$options": "i"}}
+{"tags": {"$regex": "^rus"}}
+```
+
+Supported options are `i` (case-insensitive), `m` (multiline), `s` (dot
+matches newline), `x` (ignore whitespace), and `u` (Unicode; already the
+default). Arrays match when any string element matches. Only string values can
+match; missing fields, numbers, booleans, dates, binary, and ObjectId values do
+not.
+
+The compiled-pattern form is also accepted:
+
+```json
+{"name": {"$regex": {"$regularExpression": {"pattern": "^ada", "options": "i"}}}}
+```
+
+Patterns use Rust's non-backtracking regex engine and are limited to 4 KiB.
+Invalid patterns or options return `invalid_query`. Case-sensitive patterns
+anchored with `^` can use a string-index prefix range; the residual matcher
+still verifies every candidate.
+
+### Arrays
+
+`$all` requires the field to contain every listed value:
+
+```json
+{"tags": {"$all": ["rust", "lmdb"]}}
+```
+
+`$all` is equivalent to equality for a single value, so a scalar field also
+matches. An empty `$all` matches nothing.
+
+`$size` requires an exact array length:
+
+```json
+{"tags": {"$size": 2}}
+```
+
+`$elemMatch` requires at least one array element to satisfy all conditions.
+For scalar elements, use field operators; for object elements, use a normal
+filter:
+
+```json
+{"scores": {"$elemMatch": {"$gte": 8, "$lt": 10}}}
+{"items": {"$elemMatch": {"sku": "x", "qty": {"$gt": 5}}}}
+```
+
+Malformed arguments return `invalid_query`: `$all` must be an array, `$size` a
+non-negative integer, and `$elemMatch` an object. Array fields are not
+secondary-indexed; only a single-value `$all` on a scalar field can use an
+ordinary index. Regex values inside `$all`/`$elemMatch` are not supported.
+
 ### Semantics
 
-- **Numbers compare by value.** `30` equals `30.0`, including in ranges.
+- **Numbers compare by value and exactly.** `30` equals `30.0`; Decimal128 and
+  other numeric types participate in the same bracket. Large integers are not
+  rounded through `f64`.
 - **Type-aware ranges.** A numeric `$gt` does not match strings or booleans.
 - **Dates compare by instant.** Offsets are ignored after parsing; date and
   string values remain different types.
@@ -570,8 +847,8 @@ values do not match string values. See [Dates and time zones](dates.md).
 - **Array membership.** `{"tags": "rust"}` matches a document where `tags` is
   `["rust", "lmdb"]`.
 - **Nested paths.** Dots traverse nested objects: `{"a.b.c": 7}`.
-- **No regex, `$size`, `$elemMatch`, `$type`, `$where`, or `$text` operator.**
-  Full-text search is a separate operation.
+- **No `$where` or `$text` operator.** Full-text search is a separate
+  operation.
 
 ## Projection
 
@@ -645,8 +922,9 @@ Rules:
 - Provide either `field` (single) or `fields` (ordered list). `fields` is
   preferred for new code.
 - The index name is the fields joined by `+`.
-- Indexable values are scalars: string, number, boolean, and Extended JSON
-  dates. Arrays and ordinary objects are skipped.
+- Indexable values are scalars: string, number, Decimal128, special doubles,
+  boolean, Extended JSON dates, binary/UUID, and ObjectId. Arrays and ordinary
+  objects are skipped.
 - A unique index enforces uniqueness of the full key. For compound indexes,
   that means the combination, not each field individually.
 - Creating an index on an existing collection performs a synchronous backfill.
@@ -656,8 +934,12 @@ Rules:
 - Indexes are maintained transactionally on insert, update, and delete.
 - Dates are indexed by instant and support normal range plans, sorting, and
   unique constraints. No index type annotation is required.
-- Indexes created before date support are skipped for filters containing dates
-  until they are dropped and recreated. See [Dates and time zones](dates.md).
+- Numbers use an exact, order-preserving decimal encoding. Decimal128 shares
+  the numeric type tag, so `1`, `1.0`, and `NumberDecimal("1")` share a key.
+- Index format version 4 adds binary/UUID and ObjectId keys. Indexes created
+  with an older format are skipped for filters containing binary, ObjectId,
+  numbers, or dates; those queries fall back to a scan until the index is
+  recreated. See [BSON scalar types](bson-types.md).
 
 ## drop_index
 
@@ -672,7 +954,7 @@ For a compound index, pass the generated name (`"grp+age"`). Response:
 ```
 
 `dropped` is `false` if the index did not exist. The index contents are
-removed, but the named LMDB sub-database remains registered.
+removed and its reusable LMDB slot is returned to the pool.
 
 ## list_indexes
 
@@ -812,8 +1094,9 @@ Semantics:
 - There is no `skip` parameter for fuzzy search.
 - `limit` defaults to 10 and is capped at 1,000.
 - At most 5,000 candidates are scored per query.
-- Only string/number/bool scalar field values are searched. Arrays, objects, and
-  Extended JSON dates are skipped.
+- String, boolean, and all numeric scalar values are searched, including
+  `$numberInt`, `$numberLong`, `$numberDouble`, and `$numberDecimal`. Arrays,
+  objects, dates, binary/UUID, and ObjectId values are skipped.
 
 ## Document history
 
@@ -1083,6 +1366,45 @@ See [Vault collections](vault.md).
 
 ---
 
+## LMDB map size
+
+### map_info
+
+```json
+{"op": "map_info"}
+```
+
+Response:
+
+```json
+{"ok": true, "result": {
+  "map_size": 1073741824,
+  "used_bytes": 7340032,
+  "free_bytes": 1066401792,
+  "page_size": 4096
+}}
+```
+
+`map_size` is the address-space limit, not disk or RAM usage. `used_bytes` is
+the LMDB high-water mark.
+
+### resize_map
+
+```json
+{"op": "resize_map", "size": 4294967296}
+```
+
+Response:
+
+```json
+{"ok": true, "result": {"old_size": 1073741824, "map_size": 4294967296}}
+```
+
+`size` is in bytes and must be a multiple of `page_size` and at least the
+current map size. The operation waits for active transactions and temporarily
+blocks new ones. It only grows the map; shrinking requires an offline restart.
+See [Operations](operations.md#capacity-and-memory).
+
 ## Health and metrics
 
 ### GET /healthz
@@ -1143,6 +1465,9 @@ Requires the bearer token when authentication is enabled.
 | `document_too_large` | 413 | Document exceeds 1 MiB |
 | `invalid_ttl` | 400 | Invalid collection default or document `_ttl` value |
 | `invalid_date` | 400 | Invalid `$date` payload, RFC 3339 string, or missing timezone |
+| `invalid_numeric` | 400 | Invalid Extended JSON number or decimal arithmetic overflow |
+| `invalid_binary` | 400 | Invalid `$binary`/`$uuid` payload or base64 |
+| `invalid_object_id` | 400 | `$oid` is not 24 hexadecimal characters |
 | `unauthorized` | 401 | Missing/invalid bearer token |
 | `timeout` | 500 | Request exceeded the server timeout |
 | `storage` | 500 | LMDB/storage error |

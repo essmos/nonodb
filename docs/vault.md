@@ -312,7 +312,7 @@ vault
 Why:
 
 - one collection serves many tenants (organizations, users, workspaces);
-- `MAX_DBS` is 256, so collection-per-tenant would exhaust the limit quickly;
+- `MAX_DBS` is 1024, so collection-per-tenant would exhaust the limit quickly;
 - `_id` is globally unique, so random UUIDs avoid collisions;
 - the tenant header and AAD prevent cross-tenant reads and ciphertext moves.
 
