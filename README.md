@@ -367,7 +367,8 @@ rotation, and best-fit guidance.
 
 ### Prebuilt binaries
 
-Every tagged release contains ready-to-run binaries:
+Every tagged release contains ready-to-run binaries. For normal use, download
+the archive for your platform instead of compiling:
 
 | Platform | Release asset |
 | --- | --- |
@@ -383,27 +384,17 @@ Each archive contains `nonodb-daemon`, `nonodb-cli`, `README.md`, `LICENSE` and
 Linux and macOS use the Unix socket by default. Windows has no Unix socket
 listener, so the Windows daemon requires TCP plus `NONODB_AUTH_FILE`.
 
-### Run on Linux (native)
+### Run on Linux
 
-Requirements:
-
-- Rust stable (2021 edition; latest stable recommended), Cargo, and a C
-  compiler for LMDB.
-- Linux or macOS for the Unix-socket daemon. The Windows daemon is TCP-only.
-- Python 3.9+ only if you want the optional Python client (`httpx`; `orjson`
-  is an optional speedup).
-
-Build the release binaries:
+Download, verify, and extract the x86_64 archive:
 
 ```bash
-cargo build --release
-```
-
-The binaries are:
-
-```text
-target/release/nonodb-daemon
-target/release/nonodb-cli
+TAG=v0.7.0
+curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/nonodb-$TAG-linux-x86_64.tar.gz"
+curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/nonodb-$TAG-linux-x86_64.tar.gz.sha256"
+sha256sum -c "nonodb-$TAG-linux-x86_64.tar.gz.sha256"
+tar -xzf "nonodb-$TAG-linux-x86_64.tar.gz"
+cd "nonodb-$TAG-linux-x86_64"
 ```
 
 Create the data and socket directories and start the daemon in the foreground:
@@ -414,14 +405,14 @@ mkdir -p /tmp/nonodb-data /tmp/nonodb-run
 NONODB_DATA=/tmp/nonodb-data \
 NONODB_SOCK=/tmp/nonodb-run/nonodb.sock \
 RUST_LOG=info \
-./target/release/nonodb-daemon
+./nonodb-daemon
 ```
 
 Leave that terminal running. In a second terminal, verify the daemon:
 
 ```bash
 export NONODB_SOCK=/tmp/nonodb-run/nonodb.sock
-./target/release/nonodb-cli ping
+./nonodb-cli ping
 ```
 
 Insert and query with `curl`:
@@ -436,10 +427,12 @@ curl -s --unix-socket "$NONODB_SOCK" -H 'content-type: application/json' \
   -d '{"op":"find","coll":"users","filter":{"age":{"$gte":18}},"sort":[["age",-1]]}'
 ```
 
-Use the Python client:
+Use the optional Python client. It is not included in the binary archive, so
+clone the repository once and point `PYTHONPATH` at its `client` directory:
 
 ```bash
-export PYTHONPATH="$PWD/client"
+git clone --depth 1 https://github.com/essmos/nonodb.git
+export PYTHONPATH="$PWD/nonodb/client"
 python3 - <<'PY'
 from nonodb import NonoDB
 
@@ -453,22 +446,25 @@ PY
 Use the CLI:
 
 ```bash
-NONODB_SOCK=/tmp/nonodb-run/nonodb.sock ./target/release/nonodb-cli count users '{}'
-NONODB_SOCK=/tmp/nonodb-run/nonodb.sock ./target/release/nonodb-cli find users '{}' --sort age:desc --limit 5
+NONODB_SOCK=/tmp/nonodb-run/nonodb.sock ./nonodb-cli count users '{}'
+NONODB_SOCK=/tmp/nonodb-run/nonodb.sock ./nonodb-cli find users '{}' --sort age:desc --limit 5
 ```
 
 This runs in the foreground. For a production Linux service, use the systemd
 unit and installation steps in [Operations](docs/operations.md#deployment-with-systemd).
 
-### Run on macOS (native)
+### Run on macOS
 
 Download the archive matching your CPU (`uname -m` prints `arm64` or `x86_64`):
 
 ```bash
 TAG=v0.7.0
-curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/nonodb-$TAG-macos-arm64.tar.gz"
-tar -xzf "nonodb-$TAG-macos-arm64.tar.gz"
-cd "nonodb-$TAG-macos-arm64"
+ARCHIVE="nonodb-$TAG-macos-arm64.tar.gz"   # use macos-x86_64 on Intel
+curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/$ARCHIVE"
+curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/$ARCHIVE.sha256"
+shasum -a 256 -c "$ARCHIVE.sha256"
+tar -xzf "$ARCHIVE"
+cd "${ARCHIVE%.tar.gz}"
 ```
 
 Release binaries are not signed or notarized. If Gatekeeper blocks them, remove
@@ -521,6 +517,35 @@ The Windows CLI uses plaintext HTTP over TCP. For TLS or mTLS connections, use
 one of the official clients (`NONODB_URL=https://...`, `NONODB_TLS_CA`,
 `NONODB_TLS_CLIENT_CERT`, `NONODB_TLS_CLIENT_KEY`). Keep the listener on
 `127.0.0.1` unless you terminate TLS in front of it.
+
+### Build from source (alternative)
+
+Use this for development or when no prebuilt archive fits your platform.
+
+Requirements:
+
+- Rust stable (2021 edition; latest stable recommended), Cargo, and a C
+  compiler for LMDB.
+- Linux or macOS for the Unix-socket daemon. The Windows daemon is TCP-only.
+- Python 3.9+ only if you want the optional Python client (`httpx`; `orjson`
+  is an optional speedup).
+
+Build the release binaries:
+
+```bash
+cargo build --release
+```
+
+The binaries are:
+
+```text
+target/release/nonodb-daemon
+target/release/nonodb-cli
+```
+
+Use the same commands as above, replacing `./nonodb-daemon` with
+`./target/release/nonodb-daemon` and `./nonodb-cli` with
+`./target/release/nonodb-cli`.
 
 ### Run with Docker
 

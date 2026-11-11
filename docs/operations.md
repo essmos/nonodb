@@ -214,7 +214,42 @@ ReadWritePaths=/var/lib/nonodb /run/nonodb
 WantedBy=multi-user.target
 ```
 
-Typical installation:
+### Install a prebuilt binary
+
+Download the archive from the matching GitHub Release, verify its checksum, and
+install the two binaries:
+
+```bash
+TAG=v0.7.0
+ARCHIVE="nonodb-$TAG-linux-x86_64.tar.gz"
+curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/$ARCHIVE"
+curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/$ARCHIVE.sha256"
+sha256sum -c "$ARCHIVE.sha256"
+tar -xzf "$ARCHIVE"
+cd "nonodb-$TAG-linux-x86_64"
+
+sudo install -m 0755 nonodb-daemon /usr/local/bin/
+sudo install -m 0755 nonodb-cli /usr/local/bin/
+sudo useradd --system --home /var/lib/nonodb --shell /usr/sbin/nologin nonodb
+sudo mkdir -p /var/lib/nonodb /run/nonodb
+sudo chown nonodb:nonodb /var/lib/nonodb /run/nonodb
+```
+
+The release archive includes `docs/` but not the repository's `deploy/`
+directory. Install the systemd unit from a repository checkout, or copy the
+unit shown above into `/etc/systemd/system/nonodb.service`:
+
+```bash
+git clone --depth 1 https://github.com/essmos/nonodb.git
+sudo install -m 0644 nonodb/deploy/nonodb.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now nonodb
+```
+
+### Build from source (alternative)
+
+Use the prebuilt archive above unless you are developing nonodb or need a
+custom target. Build and install from a repository checkout:
 
 ```bash
 cargo build --release

@@ -14,3 +14,7 @@ nonodb-auth.json.lock
 audit.jsonl
 
 node_modules/
+
+# Local pi instructions and state
+/.pi/
+/AGENTS.md
