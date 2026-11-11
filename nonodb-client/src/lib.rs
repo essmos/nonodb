@@ -502,6 +502,7 @@ fn is_read_op(payload: &Value) -> bool {
         Some(
             "find"
                 | "find_one"
+                | "watch"
                 | "count"
                 | "aggregate"
                 | "list_indexes"
@@ -518,6 +519,21 @@ fn is_read_op(payload: &Value) -> bool {
                 | "map_info"
         )
     )
+}
+
+/// One long-poll batch from an append-only event collection.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WatchBatch {
+    pub events: Vec<Value>,
+    pub next: String,
+    pub timed_out: bool,
+    pub has_more: bool,
+    /// True when `after` is no longer retained and earlier events may be lost.
+    #[serde(default)]
+    pub truncated: bool,
+    /// Oldest retained event id when `truncated` is true.
+    #[serde(default)]
+    pub oldest: Option<String>,
 }
 
 /// A handle for one collection.
@@ -1011,6 +1027,64 @@ impl Collection<'_> {
         value_array(result.get("results").cloned().unwrap_or(Value::Null))
     }
 
+    /// Fetches one long-poll batch from an append-only event collection.
+    pub fn watch(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+        timeout_ms: u64,
+        types: &[&str],
+    ) -> Result<WatchBatch> {
+        self.watch_with(after, limit, timeout_ms, types, None, None)
+    }
+
+    /// Fetches one long-poll batch with an additional filter and projection.
+    ///
+    /// `_id` is always retained by the daemon so `next` remains a valid resume
+    /// token. Check [`WatchBatch::truncated`] to detect an expired cursor.
+    pub fn watch_with(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+        timeout_ms: u64,
+        types: &[&str],
+        filter: Option<&Value>,
+        projection: Option<&Value>,
+    ) -> Result<WatchBatch> {
+        let mut payload = json!({
+            "op": "watch",
+            "coll": self.name,
+            "limit": limit,
+            "timeout_ms": timeout_ms,
+        });
+        if let Some(after) = after {
+            payload
+                .as_object_mut()
+                .expect("object payload")
+                .insert("after".into(), json!(after));
+        }
+        if !types.is_empty() {
+            payload
+                .as_object_mut()
+                .expect("object payload")
+                .insert("types".into(), json!(types));
+        }
+        if let Some(filter) = filter {
+            payload
+                .as_object_mut()
+                .expect("object payload")
+                .insert("filter".into(), filter.clone());
+        }
+        if let Some(projection) = projection {
+            payload
+                .as_object_mut()
+                .expect("object payload")
+                .insert("projection".into(), projection.clone());
+        }
+        let result = self.client.exec(payload)?;
+        serde_json::from_value(result).map_err(Error::Json)
+    }
+
     /// Find documents using a [`FindQuery`].
     pub fn find(&self, query: &FindQuery) -> Result<Vec<Value>> {
         let mut payload = json!({
@@ -1200,6 +1274,7 @@ mod tests {
     #[test]
     fn read_ops_are_retried() {
         assert!(is_read_op(&json!({"op": "find"})));
+        assert!(is_read_op(&json!({"op": "watch"})));
         assert!(is_read_op(&json!({"op": "batch"})));
         assert!(!is_read_op(&json!({"op": "write_batch"})));
         assert!(!is_read_op(&json!({"op": "insert"})));

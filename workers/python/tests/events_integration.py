@@ -12,6 +12,7 @@ concurrent producers, and the event worker CLI.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -27,7 +28,7 @@ ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "client"))
 sys.path.insert(0, str(ROOT / "workers" / "python"))
 
-from nonodb import NonoDB, NonoDBError  # noqa: E402
+from nonodb import NonoDB, NonoDBError, StreamTruncatedError  # noqa: E402
 from nonodb_worker import (  # noqa: E402
     EventConsumer,
     EventProducer,
@@ -411,6 +412,306 @@ def scenario_concurrent_producers(daemon: Daemon) -> None:
     )
 
 
+def scenario_watch_stream(daemon: Daemon) -> None:
+    db = daemon.client()
+    try:
+        events = db.collection("_it_watch_events")
+        clean(events)
+        producer = EventProducer(events)
+        first = producer.emit("watch", {"i": 1})
+        second = producer.emit("watch", {"i": 2})
+
+        batch = events.watch_once(limit=10, timeout_ms=100)
+        assert [event["_id"] for event in batch["events"]] == [first, second]
+        assert batch["next"] == second
+        assert batch["timed_out"] is False
+        assert batch["has_more"] is False
+
+        started = time.monotonic()
+        empty = events.watch_once(batch["next"], timeout_ms=200)
+        assert empty["events"] == []
+        assert empty["timed_out"] is True
+        assert time.monotonic() - started >= 0.15
+
+        thread_errors: list[BaseException] = []
+
+        def emit_later() -> None:
+            try:
+                time.sleep(0.2)
+                other = daemon.client()
+                try:
+                    EventProducer(other.collection("_it_watch_events")).emit(
+                        "watch", {"i": 3}
+                    )
+                finally:
+                    other.close()
+            except BaseException as exc:  # noqa: BLE001 - report from the thread
+                thread_errors.append(exc)
+
+        thread = threading.Thread(target=emit_later)
+        thread.start()
+        started = time.monotonic()
+        live = events.watch_once(second, timeout_ms=2000)
+        thread.join(timeout=5)
+        assert not thread_errors, thread_errors
+        assert len(live["events"]) == 1
+        assert live["events"][0]["payload"] == {"i": 3}
+        assert time.monotonic() - started >= 0.15
+        third = live["next"]
+
+        producer.emit("watch.other", {"i": 4})
+        fourth = producer.emit("watch.target", {"i": 5})
+        filtered = events.watch_once(
+            third,
+            limit=10,
+            timeout_ms=100,
+            types=["watch.target"],
+        )
+        assert [event["_id"] for event in filtered["events"]] == [fourth]
+
+        page_ids = [
+            producer.emit("watch.page", {"i": i}) for i in range(4)
+        ]
+        page = events.watch_once(fourth, limit=2, timeout_ms=100)
+        assert [event["_id"] for event in page["events"]] == page_ids[:2]
+        assert page["has_more"] is True
+        page2 = events.watch_once(page["next"], limit=2, timeout_ms=100)
+        assert [event["_id"] for event in page2["events"]] == page_ids[2:]
+        assert page2["has_more"] is False
+
+        generated_id = producer.emit("watch.page", {"i": 99})
+        generator = events.watch(
+            page2["next"],
+            limit=2,
+            timeout_ms=100,
+            types=["watch.page"],
+        )
+        assert next(generator)["_id"] == generated_id
+        generator.close()
+
+        filtered_id = producer.emit("watch.filtered", {"i": 42}, doc_id="f42")
+        filtered = events.watch_once(
+            fourth,
+            limit=10,
+            timeout_ms=100,
+            filter={"payload.i": 42},
+            projection={"payload": 1, "_id": 0},
+        )
+        assert [event["_id"] for event in filtered["events"]] == [filtered_id]
+        assert filtered["events"][0]["payload"] == {"i": 42}
+        assert "_id" in filtered["events"][0]  # always retained for resume
+
+        truncated_batch = events.watch_once("0", limit=1, timeout_ms=100)
+        assert truncated_batch["truncated"] is True
+        assert truncated_batch["oldest"] == first
+        truncated_generator = events.watch("0", limit=1, timeout_ms=100)
+        try:
+            next(truncated_generator)
+        except StreamTruncatedError as exc:
+            assert exc.oldest == first
+        else:
+            raise AssertionError("old resume cursor should report truncation")
+
+        stream_thread_errors: list[BaseException] = []
+
+        def emit_stream_event() -> None:
+            try:
+                time.sleep(0.2)
+                other = daemon.client()
+                try:
+                    EventProducer(other.collection("_it_watch_events")).emit(
+                        "watch.stream", {"i": 7}
+                    )
+                finally:
+                    other.close()
+            except BaseException as exc:  # noqa: BLE001 - report from the thread
+                stream_thread_errors.append(exc)
+
+        stream_thread = threading.Thread(target=emit_stream_event)
+        stream_thread.start()
+        streamed = events.watch_stream(
+            first,
+            timeout_ms=2000,
+            heartbeat_ms=100,
+            filter={"payload.i": 7},
+            projection={"payload": 1},
+            retry=False,
+        )
+        stream_event = next(streamed)
+        streamed.close()
+        stream_thread.join(timeout=5)
+        assert not stream_thread_errors, stream_thread_errors
+        assert stream_event["payload"] == {"i": 7}
+        assert stream_event["_id"] > first
+
+        sse_thread_errors: list[BaseException] = []
+
+        def emit_sse_event() -> None:
+            try:
+                time.sleep(0.2)
+                other = daemon.client()
+                try:
+                    EventProducer(other.collection("_it_watch_events")).emit(
+                        "watch.sse", {"i": 8}
+                    )
+                finally:
+                    other.close()
+            except BaseException as exc:  # noqa: BLE001 - report from the thread
+                sse_thread_errors.append(exc)
+
+        sse_thread = threading.Thread(target=emit_sse_event)
+        sse_thread.start()
+        sse_event: dict[str, Any] | None = None
+        with db._http.stream(
+            "POST",
+            db.base_url + "/v1/watch",
+            content=json.dumps(
+                {
+                    "op": "watch",
+                    "coll": "_it_watch_events",
+                    "after": first,
+                    "timeout_ms": 2000,
+                    "heartbeat_ms": 100,
+                    "filter": {"payload.i": 8},
+                    "projection": {"payload": 1},
+                },
+                separators=(",", ":"),
+            ).encode(),
+            headers={
+                "content-type": "application/json",
+                "accept": "text/event-stream",
+            },
+            timeout=5,
+        ) as resp:
+            assert resp.status_code == 200
+            assert "text/event-stream" in resp.headers["content-type"]
+            for line in resp.iter_lines():
+                if line.startswith("data: "):
+                    item = json.loads(line[6:])
+                    if "_id" in item:
+                        sse_event = item
+                        break
+        sse_thread.join(timeout=5)
+        assert not sse_thread_errors, sse_thread_errors
+        assert sse_event is not None
+        assert sse_event["payload"] == {"i": 8}
+
+        print(
+            "  server-side watch long-poll, filters, projection, truncation, "
+            "NDJSON and SSE streams, generator OK"
+        )
+    finally:
+        db.close()
+
+
+def scenario_stream_concurrency(daemon: Daemon) -> None:
+    """Concurrent producers and consumers against the real NDJSON stream."""
+    coll = "_it_stream_concurrency"
+    producers = 6
+    per_producer = 100
+    consumers = 6
+    db = daemon.client()
+    try:
+        db.collection(coll).delete({}, multi=True)
+    finally:
+        db.close()
+
+    produced: list[str] = []
+    produced_lock = threading.Lock()
+    expected_ids: set[str] | None = None
+    producer_errors: list[BaseException] = []
+    consumer_errors: list[BaseException] = []
+    consumed: list[list[str]] = [[] for _ in range(consumers)]
+
+    def produce(thread_id: int) -> None:
+        db = daemon.client()
+        try:
+            producer = EventProducer(db.collection(coll))
+            ids = [
+                producer.emit("stress", {"thread": thread_id, "i": i})
+                for i in range(per_producer)
+            ]
+            with produced_lock:
+                produced.extend(ids)
+        except BaseException as exc:  # noqa: BLE001 - report from the thread
+            producer_errors.append(exc)
+        finally:
+            db.close()
+
+    def consume(index: int) -> None:
+        db = daemon.client()
+        try:
+            stream = db.collection(coll).watch_stream(
+                after=None,
+                limit=200,
+                timeout_ms=20_000,
+                heartbeat_ms=200,
+                retry=False,
+            )
+            for event in stream:
+                event_id = event.get("_id")
+                if event_id:
+                    consumed[index].append(event_id)
+                if expected_ids is not None and expected_ids <= set(consumed[index]):
+                    stream.close()
+                    break
+        except BaseException as exc:  # noqa: BLE001 - report from the thread
+            consumer_errors.append(exc)
+        finally:
+            db.close()
+
+    consumer_threads = [
+        threading.Thread(target=consume, args=(index,), name=f"stream-{index}")
+        for index in range(consumers)
+    ]
+    for thread in consumer_threads:
+        thread.start()
+    time.sleep(0.2)
+    with ThreadPoolExecutor(max_workers=producers) as pool:
+        list(pool.map(produce, range(producers)))
+    if producer_errors:
+        raise producer_errors[0]
+
+    # Wake consumers that already reached the end before `expected_ids` was set.
+    expected_ids = set(produced)
+    db = daemon.client()
+    try:
+        EventProducer(db.collection(coll)).emit(
+            "stress.done", {"produced": len(expected_ids)}
+        )
+    finally:
+        db.close()
+    for thread in consumer_threads:
+        thread.join(timeout=25)
+    if any(thread.is_alive() for thread in consumer_threads):
+        raise AssertionError("stream consumers did not finish")
+    if consumer_errors:
+        raise consumer_errors[0]
+
+    for index, ids in enumerate(consumed):
+        unique = set(ids)
+        missing = expected_ids - unique
+        duplicates = len(ids) - len(unique)
+        assert not missing, (
+            f"stream {index} missing {len(missing)} events: "
+            f"{sorted(missing)[:5]}"
+        )
+        assert duplicates == 0, f"stream {index} duplicated {duplicates} events"
+
+    db = daemon.client()
+    try:
+        metrics = db._http.get(db.base_url + "/metrics").json()
+        assert metrics["watch_streams_total"] >= consumers
+        assert metrics["watch_events_total"] >= len(expected_ids) * consumers
+    finally:
+        db.close()
+    print(
+        "  concurrent stream: "
+        f"{len(expected_ids)} events, {consumers} consumers, "
+        "0 missing, 0 duplicate deliveries OK"
+    )
+
+
 def scenario_worker_cli(daemon: Daemon) -> None:
     db = daemon.client()
     try:
@@ -470,6 +771,8 @@ def main() -> int:
             ("late event", scenario_late_out_of_order_event),
             ("independent consumers", scenario_independent_consumers),
             ("concurrent producers", scenario_concurrent_producers),
+            ("watch stream", scenario_watch_stream),
+            ("stream concurrency", scenario_stream_concurrency),
             ("worker CLI", scenario_worker_cli),
         ]
         for name, scenario in scenarios:

@@ -231,7 +231,7 @@ Download the archive from the matching GitHub Release, verify its checksum, and
 install the two binaries:
 
 ```bash
-TAG=v0.11.0
+TAG=v0.12.0
 ARCHIVE="nonodb-$TAG-linux-x86_64.tar.gz"
 curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/$ARCHIVE"
 curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/$ARCHIVE.sha256"
@@ -293,7 +293,7 @@ Linux `amd64` and `arm64`. Pull a published tag:
 
 ```bash
 # Pin a version in production; latest tracks stable releases.
-docker pull ghcr.io/essmos/nonodb:0.11.0
+docker pull ghcr.io/essmos/nonodb:0.12.0
 ```
 
 If the GHCR package is private, log in before pulling:
@@ -339,7 +339,7 @@ docker run -d --name nonodb \
   --group-add "$(id -g)" \
   -v "$NONODB_AUTH_FILE:/etc/nonodb/auth.json:ro" \
   -v nonodb-data:/var/lib/nonodb \
-  ghcr.io/essmos/nonodb:0.11.0
+  ghcr.io/essmos/nonodb:0.12.0
 ```
 
 Verify it:
@@ -404,7 +404,7 @@ docker volume create nonodb-run
 docker run -d --name nonodb \
   -v nonodb-data:/var/lib/nonodb \
   -v nonodb-run:/run/nonodb \
-  ghcr.io/essmos/nonodb:0.11.0
+  ghcr.io/essmos/nonodb:0.12.0
 ```
 
 The client container mounts the same `nonodb-run` volume and sets:
@@ -433,7 +433,7 @@ docker run -d --name nonodb \
   -v "$NONODB_AUTH_FILE:/etc/nonodb/auth.json:ro" \
   -v /host/certs:/certs:ro \
   -v nonodb-data:/var/lib/nonodb \
-  ghcr.io/essmos/nonodb:0.11.0
+  ghcr.io/essmos/nonodb:0.12.0
 ```
 
 Without a certificate and key pair, TCP runs in plaintext and logs a warning.
@@ -447,7 +447,7 @@ Back up into a separate mounted directory:
 docker run --rm \
   -v nonodb-data:/var/lib/nonodb:ro \
   -v /host/backups:/backups \
-  ghcr.io/essmos/nonodb:0.11.0 \
+  ghcr.io/essmos/nonodb:0.12.0 \
   nonodb-cli backup /var/lib/nonodb /backups/$(date -u +%Y%m%dT%H%M%SZ)
 ```
 
@@ -607,6 +607,12 @@ Useful signals:
 | `ttl_expired_total` | Documents deleted by TTL |
 | `ttl_sweep_errors_total` | Failed TTL sweeps |
 | `ttl_backlog` | Due entries observed by the last sweep |
+| `watch_streams_total` | Continuous `/v1/watch` connections opened |
+| `watch_active` | Currently open continuous event streams |
+| `watch_events_total` | Events delivered by watch/stream |
+| `watch_timeouts_total` | Long-poll watch requests that timed out |
+| `watch_truncated_total` | Watch requests with an expired resume cursor |
+| `watch_heartbeats_total` | Keepalive frames sent on streams |
 | `index_builds` | Active/recent index backfills and processed/total/elapsed progress |
 | `auth_failures_total` | Failed authentication attempts |
 | `auth_blocks_total` | IP lockouts started |

@@ -28,6 +28,26 @@ export interface IndexOptions {
   include?: string[];
 }
 
+export interface WatchBatch {
+  events: any[];
+  next: string;
+  timed_out: boolean;
+  has_more: boolean;
+  truncated: boolean;
+  oldest: string | null;
+}
+
+export interface WatchOptions {
+  limit?: number;
+  timeoutMs?: number;
+  types?: Iterable<string>;
+  filter?: Record<string, unknown>;
+  projection?: Record<string, unknown>;
+  retry?: boolean;
+  retryDelayMs?: number;
+  maxRetryDelayMs?: number;
+}
+
 export interface UpdateResult {
   matched: number;
   modified: number;
@@ -37,6 +57,7 @@ export interface UpdateResult {
 export class NonoDBError extends Error {
   code: string;
   statusCode: number;
+  oldest?: string | null;
 }
 
 export class NonoDB {
@@ -102,6 +123,8 @@ export class Collection {
   vectorSearch(field: string, vector: number[], options?: { filter?: Record<string, unknown>; skip?: number; limit?: number }): Promise<any[]>;
   search(field: string, query: string, options?: { filter?: Record<string, unknown>; skip?: number; limit?: number }): Promise<any[]>;
   fuzzy(field: string, query: string, options?: { maxDistance?: number; filter?: Record<string, unknown>; limit?: number }): Promise<any[]>;
+  watchOnce(after?: string | null, options?: WatchOptions): Promise<WatchBatch>;
+  watch(after?: string | null, options?: WatchOptions): AsyncGenerator<any, void, unknown>;
   find(filter?: Record<string, unknown>, options?: FindOptions): Promise<any[]>;
   findOne(filter?: Record<string, unknown>, options?: { projection?: Record<string, 0 | 1> }): Promise<any | null>;
   count(filter?: Record<string, unknown>): Promise<number>;

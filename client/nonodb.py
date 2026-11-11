@@ -19,7 +19,7 @@ import os
 import ssl
 import threading
 import time
-from typing import Any, Iterable, Optional, Union
+from typing import Any, Iterable, Iterator, Optional, Union
 
 import httpx
 
@@ -28,7 +28,14 @@ try:  # optional faster JSON; falls back to stdlib
 except ImportError:  # pragma: no cover
     _orjson = None
 
-__all__ = ["NonoDB", "VaultDB", "Collection", "Cursor", "NonoDBError"]
+__all__ = [
+    "NonoDB",
+    "VaultDB",
+    "Collection",
+    "Cursor",
+    "NonoDBError",
+    "StreamTruncatedError",
+]
 
 # Operations safe to retry after a transport error (idempotent reads).
 _READ_OPS = {
@@ -48,6 +55,9 @@ _READ_OPS = {
     "batch",
     "map_info",
 }
+
+# Reads are safe to retry. `watch` is long-polling and must not be cached.
+_RETRY_OPS = _READ_OPS | {"watch"}
 
 
 def _dumps(obj: Any) -> bytes:
@@ -148,6 +158,19 @@ class NonoDBError(Exception):
         super().__init__(f"{code}: {message}")
         self.code = code
         self.message = message
+
+
+class StreamTruncatedError(NonoDBError):
+    """The resume cursor is older than the events retained by the server."""
+
+    def __init__(self, oldest: Optional[str], cursor: Optional[str] = None):
+        self.oldest = oldest
+        self.cursor = cursor
+        super().__init__(
+            "stream_truncated",
+            f"events before {oldest or cursor or 'the oldest retained id'} "
+            "are no longer retained",
+        )
 
 
 class NonoDB:
@@ -262,7 +285,7 @@ class NonoDB:
         extra_headers: Optional[dict[str, str]] = None,
     ) -> Any:
         # Reads are retried after a transport error; writes are not (duplicate risk).
-        retries = 2 if op in _READ_OPS else 0
+        retries = 2 if op in _RETRY_OPS else 0
         attempt = 0
         while True:
             try:
@@ -823,6 +846,193 @@ class Collection:
         )["results"]
 
     # -- read --------------------------------------------------------
+    def watch_once(
+        self,
+        after: Optional[str] = None,
+        *,
+        limit: int = 100,
+        timeout_ms: int = 1000,
+        types: Optional[Iterable[str]] = None,
+        filter: Optional[dict[str, Any]] = None,
+        projection: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        """Fetches one long-poll batch from an append-only event collection.
+
+        Results are ordered by `_id`. `next` is the resume token for the next
+        request. `timed_out` is true when no event arrived before the timeout.
+        `truncated` means `after` is older than retained events; `oldest` is the
+        oldest event id still available.
+        """
+        payload: dict[str, Any] = {
+            "op": "watch",
+            "coll": self.name,
+            "limit": limit,
+            "timeout_ms": timeout_ms,
+        }
+        if after:
+            payload["after"] = after
+        if types is not None:
+            payload["types"] = list(types)
+        if filter is not None:
+            payload["filter"] = filter
+        if projection is not None:
+            payload["projection"] = projection
+        return self._db.exec(payload)
+
+    def watch(
+        self,
+        after: Optional[str] = None,
+        *,
+        limit: int = 100,
+        timeout_ms: int = 1000,
+        types: Optional[Iterable[str]] = None,
+        filter: Optional[dict[str, Any]] = None,
+        projection: Optional[dict[str, Any]] = None,
+        retry: bool = True,
+        retry_delay: float = 1.0,
+        max_retry_delay: float = 30.0,
+    ) -> Iterator[dict[str, Any]]:
+        """Yields events from an append-only collection as they arrive.
+
+        This is a long-polling generator. It reconnects after transport errors
+        with exponential backoff. It raises `StreamTruncatedError` when the
+        resume cursor is older than retained events. `after` is the last
+        processed event `_id`, or `None` to start from the beginning.
+        """
+        cursor = after
+        delay = max(0.001, retry_delay)
+        while True:
+            try:
+                batch = self.watch_once(
+                    cursor,
+                    limit=limit,
+                    timeout_ms=timeout_ms,
+                    types=types,
+                    filter=filter,
+                    projection=projection,
+                )
+                if batch.get("truncated"):
+                    raise StreamTruncatedError(batch.get("oldest"), cursor)
+                for event in batch.get("events", []):
+                    yield event
+                cursor = batch.get("next") or cursor
+                delay = max(0.001, retry_delay)
+            except NonoDBError as exc:
+                if not retry or exc.code != "connection":
+                    raise
+                time.sleep(delay)
+                delay = min(max_retry_delay, delay * 2)
+
+    def watch_stream(
+        self,
+        after: Optional[str] = None,
+        *,
+        limit: int = 100,
+        types: Optional[Iterable[str]] = None,
+        filter: Optional[dict[str, Any]] = None,
+        projection: Optional[dict[str, Any]] = None,
+        heartbeat_ms: Optional[int] = None,
+        timeout_ms: Optional[int] = None,
+        overlap_ms: Optional[int] = None,
+        retry: bool = True,
+        retry_delay: float = 1.0,
+        max_retry_delay: float = 30.0,
+    ) -> Iterator[dict[str, Any]]:
+        """Yields events from the NDJSON `/v1/watch` stream.
+
+        This is a true streaming connection, not long polling. It reconnects
+        from the last event `_id` after transport errors and raises
+        `StreamTruncatedError` when the server reports a gap. Vault collections
+        are not streamable and are rejected by the daemon.
+        """
+        db = self._db
+        http = getattr(db, "_http", None)
+        if http is None:
+            raise NonoDBError(
+                "unsupported_encrypted_operation",
+                "watch_stream is not supported for vault collections",
+            )
+        cursor = after
+        delay = max(0.001, retry_delay)
+        while True:
+            payload: dict[str, Any] = {
+                "op": "watch",
+                "coll": self.name,
+                "limit": limit,
+            }
+            if cursor:
+                payload["after"] = cursor
+            if types is not None:
+                payload["types"] = list(types)
+            if filter is not None:
+                payload["filter"] = filter
+            if projection is not None:
+                payload["projection"] = projection
+            if heartbeat_ms is not None:
+                payload["heartbeat_ms"] = heartbeat_ms
+            if timeout_ms is not None:
+                payload["timeout_ms"] = timeout_ms
+            if overlap_ms is not None:
+                payload["overlap_ms"] = overlap_ms
+            headers = {
+                "content-type": "application/json",
+                "accept": "application/x-ndjson",
+            }
+            token = getattr(db, "token", None)
+            if token:
+                headers["authorization"] = f"Bearer {token}"
+            try:
+                with http.stream(
+                    "POST",
+                    db.base_url + "/v1/watch",
+                    content=_dumps(payload),
+                    headers=headers,
+                    timeout=None,
+                ) as resp:
+                    if resp.status_code != 200:
+                        raw = resp.read()
+                        try:
+                            body = _loads(raw)
+                            err = body.get("error") or {}
+                        except ValueError:
+                            err = {}
+                        raise NonoDBError(
+                            err.get("code", "http_error"),
+                            err.get("message", f"HTTP {resp.status_code}"),
+                        )
+                    for raw_line in resp.iter_lines():
+                        line = raw_line.strip()
+                        if not line:
+                            continue
+                        item = _loads(line)
+                        if "heartbeat" in item:
+                            continue
+                        if "error" in item:
+                            err = item.get("error") or {}
+                            raise NonoDBError(
+                                err.get("code", "error"), err.get("message", "")
+                            )
+                        if "stream" in item:
+                            info = item["stream"]
+                            if info.get("truncated"):
+                                raise StreamTruncatedError(
+                                    info.get("oldest"), cursor
+                                )
+                            continue
+                        event_id = item.get("_id")
+                        if event_id:
+                            cursor = event_id
+                        yield item
+                if not retry:
+                    return
+                delay = max(0.001, retry_delay)
+                time.sleep(delay)
+            except httpx.TransportError as exc:
+                if not retry:
+                    raise NonoDBError("connection", str(exc)) from exc
+                time.sleep(delay)
+                delay = min(max_retry_delay, delay * 2)
+
     def find(
         self,
         filter: Optional[dict[str, Any]] = None,

@@ -15,6 +15,7 @@ pub fn authorize_request(principal: &Principal, req: &Request) -> Result<(), Api
         Request::Find { coll, .. }
         | Request::FindOne { coll, .. }
         | Request::Lookup { coll, .. }
+        | Request::Watch { coll, .. }
         | Request::Explain { coll, .. }
         | Request::Count { coll, .. }
         | Request::Aggregate { coll, .. }

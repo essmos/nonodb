@@ -176,6 +176,21 @@ Helpers:
 - `new_event_id()` — generate a sortable event id.
 - `event_timestamp_ms(event_id)` — extract the embedded timestamp.
 
+## Server-side watch
+
+Use the daemon-side [`watch`](streams.md) long-poll or the continuous
+`/v1/watch` NDJSON/SSE stream when you want the server to push events to a
+consumer. `watch` returns `_id`-ordered batches with a `next` resume token; the
+stream adds heartbeats and keeps the connection open. Neither replaces the
+checkpointing consumer described below.
+
+```python
+batch = db.collection("_events").watch_once(after=None, timeout_ms=1000)
+for event in batch["events"]:
+    handle(event)
+after = batch["next"]
+```
+
 ## Event worker CLI
 
 ```bash

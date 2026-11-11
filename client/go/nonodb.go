@@ -108,6 +108,26 @@ type LookupOptions struct {
 	Projection map[string]any
 }
 
+// WatchOptions controls Watch.
+type WatchOptions struct {
+	After      string
+	Limit      int
+	TimeoutMs  int
+	Types      []string
+	Filter     map[string]any
+	Projection map[string]any
+}
+
+// WatchBatch is one long-poll batch from an append-only event collection.
+type WatchBatch struct {
+	Events    []map[string]any `json:"events"`
+	Next      string           `json:"next"`
+	TimedOut  bool             `json:"timed_out"`
+	HasMore   bool             `json:"has_more"`
+	Truncated bool             `json:"truncated"`
+	Oldest    string           `json:"oldest"`
+}
+
 // VectorIndex describes a vector index.
 type VectorIndex struct {
 	Field  string `json:"field"`
@@ -388,7 +408,7 @@ func (c *Client) execOnce(ctx context.Context, payload map[string]any) (json.Raw
 func isReadOp(payload map[string]any) bool {
 	op, _ := payload["op"].(string)
 	switch op {
-	case "find", "find_one", "lookup", "count", "list_indexes", "list_collections",
+	case "find", "find_one", "lookup", "watch", "count", "list_indexes", "list_collections",
 		"list_text_indexes", "list_fuzzy_indexes", "list_vector_indexes",
 		"search", "fuzzy", "vector_search", "history", "get_version", "batch":
 		return true
@@ -985,6 +1005,43 @@ func (c *Collection) Fuzzy(
 		return nil, err
 	}
 	return decodeResults(raw)
+}
+
+// Watch fetches one long-poll batch from an append-only event collection.
+func (c *Collection) Watch(ctx context.Context, options WatchOptions) (WatchBatch, error) {
+	limit := options.Limit
+	if limit <= 0 {
+		limit = 100
+	}
+	timeout := options.TimeoutMs
+	if timeout <= 0 {
+		timeout = 1000
+	}
+	payload := map[string]any{
+		"op": "watch", "coll": c.Name,
+		"limit": limit, "timeout_ms": timeout,
+	}
+	if options.After != "" {
+		payload["after"] = options.After
+	}
+	if len(options.Types) > 0 {
+		payload["types"] = options.Types
+	}
+	if options.Filter != nil {
+		payload["filter"] = options.Filter
+	}
+	if options.Projection != nil {
+		payload["projection"] = options.Projection
+	}
+	raw, err := c.client.execRaw(ctx, payload)
+	if err != nil {
+		return WatchBatch{}, err
+	}
+	var batch WatchBatch
+	if err := decodeInto(raw, &batch); err != nil {
+		return WatchBatch{}, err
+	}
+	return batch, nil
 }
 
 // Find runs a find query.

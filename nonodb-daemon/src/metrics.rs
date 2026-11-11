@@ -16,6 +16,13 @@ pub static AUTO_INDEX_CREATED: AtomicU64 = AtomicU64::new(0);
 pub static AUTO_INDEX_DROPPED: AtomicU64 = AtomicU64::new(0);
 pub static AUTO_INDEX_BUILD_NS: AtomicU64 = AtomicU64::new(0);
 pub static AUTO_INDEX_BUILD_ERRORS: AtomicU64 = AtomicU64::new(0);
+/// Outbox watch/stream counters.
+pub static WATCH_STREAMS: AtomicU64 = AtomicU64::new(0);
+pub static WATCH_ACTIVE: AtomicU64 = AtomicU64::new(0);
+pub static WATCH_EVENTS: AtomicU64 = AtomicU64::new(0);
+pub static WATCH_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
+pub static WATCH_TRUNCATED: AtomicU64 = AtomicU64::new(0);
+pub static WATCH_HEARTBEATS: AtomicU64 = AtomicU64::new(0);
 /// Number of operations executed in `/v1/batch` requests.
 pub static BATCH_OPS: AtomicU64 = AtomicU64::new(0);
 pub static WRITE_OPS: AtomicU64 = AtomicU64::new(0);
@@ -77,6 +84,12 @@ pub fn snapshot() -> Value {
         "auto_index_dropped_total": AUTO_INDEX_DROPPED.load(Relaxed),
         "auto_index_build_ns_total": AUTO_INDEX_BUILD_NS.load(Relaxed),
         "auto_index_build_errors_total": AUTO_INDEX_BUILD_ERRORS.load(Relaxed),
+        "watch_streams_total": WATCH_STREAMS.load(Relaxed),
+        "watch_active": WATCH_ACTIVE.load(Relaxed),
+        "watch_events_total": WATCH_EVENTS.load(Relaxed),
+        "watch_timeouts_total": WATCH_TIMEOUTS.load(Relaxed),
+        "watch_truncated_total": WATCH_TRUNCATED.load(Relaxed),
+        "watch_heartbeats_total": WATCH_HEARTBEATS.load(Relaxed),
         "batch_ops_total": BATCH_OPS.load(Relaxed),
         "write_ops_total": write_ops,
         "write_batches_total": WRITE_BATCHES.load(Relaxed),

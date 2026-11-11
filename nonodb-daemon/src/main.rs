@@ -16,6 +16,7 @@ mod metrics;
 mod protocol;
 mod writer;
 
+use std::collections::HashMap;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -23,8 +24,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::{
+    body::{Body, Bytes},
     extract::{DefaultBodyLimit, State},
-    http::{HeaderMap, StatusCode},
+    http::{
+        header::{ACCEPT, CACHE_CONTROL},
+        HeaderMap, HeaderValue, StatusCode,
+    },
+    response::{IntoResponse, Response},
     routing::{get, post},
     Extension, Json, Router,
 };
@@ -164,6 +170,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .route("/healthz", get(health))
         .route("/metrics", get(metrics_handler))
         .route("/v1/exec", post(exec))
+        .route("/v1/watch", post(watch_stream))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .layer(axum::middleware::from_fn(http_access_log))
         .with_state(state);
@@ -1054,6 +1061,427 @@ async fn open_cursor(
     read_result(joined).await
 }
 
+/// One frame for the streaming `/v1/watch` endpoint.
+fn watch_frame(sse: bool, event: &Value) -> Bytes {
+    let data = serde_json::to_string(event).unwrap_or_else(|_| "{}".to_string());
+    if sse {
+        let id = event
+            .get("_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .replace(['\r', '\n'], "");
+        Bytes::from(format!("event: message\nid: {id}\ndata: {data}\n\n"))
+    } else {
+        Bytes::from(format!("{data}\n"))
+    }
+}
+
+fn watch_control(sse: bool, name: &str, value: &Value) -> Bytes {
+    if sse {
+        let data = serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string());
+        return Bytes::from(format!("event: {name}\ndata: {data}\n\n"));
+    }
+    let value = if name == "ready" {
+        json!({"stream": value})
+    } else {
+        value.clone()
+    };
+    let data = serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string());
+    Bytes::from(format!("{data}\n"))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn watch_stream_loop(
+    store: Arc<Store>,
+    coll: String,
+    auth: Option<VaultAuth>,
+    mut after: String,
+    limit: usize,
+    types: Vec<String>,
+    filter: Value,
+    projection: Option<Value>,
+    heartbeat: Duration,
+    overlap: Duration,
+    deadline: Option<Instant>,
+    sse: bool,
+    truncated: bool,
+    oldest: Option<String>,
+    tx: tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
+) -> Result<(), ApiError> {
+    let mut ready = serde_json::Map::new();
+    ready.insert("truncated".into(), Value::Bool(truncated));
+    ready.insert(
+        "oldest".into(),
+        serde_json::to_value(oldest).unwrap_or(Value::Null),
+    );
+    if tx
+        .send(Ok(watch_control(sse, "ready", &Value::Object(ready))))
+        .await
+        .is_err()
+    {
+        return Ok(());
+    }
+
+    let overlap_ms = overlap.as_millis() as u64;
+    let seen_ttl = overlap * 2 + Duration::from_secs(5);
+    let mut seen: HashMap<String, Instant> = HashMap::new();
+    let mut last_late_scan = Instant::now() - Duration::from_secs(1);
+    let mut last_write = Instant::now();
+    loop {
+        if tx.is_closed() {
+            return Ok(());
+        }
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Ok(());
+        }
+        let store_now = store.clone();
+        let coll_now = coll.clone();
+        let auth_now = auth.clone();
+        let after_now = after.clone();
+        let types_now = types.clone();
+        let filter_now = filter.clone();
+        let projection_now = projection.clone();
+        let joined = tokio::task::spawn_blocking(move || {
+            watch_once(
+                &store_now,
+                &coll_now,
+                auth_now.as_ref(),
+                &after_now,
+                limit,
+                &types_now,
+                Some(&filter_now),
+                projection_now.as_ref(),
+            )
+        });
+        let (main_events, next, has_more) = match joined.await {
+            Ok(Ok(value)) => value,
+            Ok(Err(err)) => {
+                let _ = tx
+                    .send(Ok(watch_control(sse, "error", &json!({"error": err}))))
+                    .await;
+                return Err(err);
+            }
+            Err(e) => {
+                let err = ApiError::internal(format!("join error: {e}"));
+                let _ = tx
+                    .send(Ok(watch_control(sse, "error", &json!({"error": err}))))
+                    .await;
+                return Err(err);
+            }
+        };
+        let main_len = main_events.len();
+        let mut events = main_events;
+
+        // Concurrent producers can commit lower event ids after a higher id was
+        // already delivered. Rescan a short recent window and suppress repeats.
+        if overlap_ms > 0
+            && !after.is_empty()
+            && last_late_scan.elapsed() >= Duration::from_millis(200)
+        {
+            let after_ts = event_timestamp_ms(&after).unwrap_or(now_ms() as u64);
+            let floor = event_id_from_ms(after_ts.saturating_sub(overlap_ms));
+            let store_now = store.clone();
+            let coll_now = coll.clone();
+            let auth_now = auth.clone();
+            let after_now = after.clone();
+            let types_now = types.clone();
+            let filter_now = filter.clone();
+            let projection_now = projection.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                watch_late_scan(
+                    &store_now,
+                    &coll_now,
+                    auth_now.as_ref(),
+                    &floor,
+                    &after_now,
+                    10_000,
+                    &types_now,
+                    Some(&filter_now),
+                    projection_now.as_ref(),
+                )
+            });
+            match joined.await {
+                Ok(Ok(late)) => events.extend(late),
+                Ok(Err(err)) => {
+                    let _ = tx
+                        .send(Ok(watch_control(sse, "error", &json!({"error": err}))))
+                        .await;
+                    return Err(err);
+                }
+                Err(e) => {
+                    let err = ApiError::internal(format!("join error: {e}"));
+                    let _ = tx
+                        .send(Ok(watch_control(sse, "error", &json!({"error": err}))))
+                        .await;
+                    return Err(err);
+                }
+            }
+            last_late_scan = Instant::now();
+        }
+
+        let now = Instant::now();
+        seen.retain(|_, expires| *expires > now);
+        events.sort_by(|left, right| {
+            left.get("_id")
+                .and_then(Value::as_str)
+                .cmp(&right.get("_id").and_then(Value::as_str))
+        });
+        events.retain(|event| {
+            let Some(event_id) = event.get("_id").and_then(Value::as_str) else {
+                return false;
+            };
+            if seen.contains_key(event_id) {
+                return false;
+            }
+            seen.insert(event_id.to_string(), now + seen_ttl);
+            true
+        });
+        if !events.is_empty() {
+            for event in &events {
+                if tx.send(Ok(watch_frame(sse, event))).await.is_err() {
+                    return Ok(());
+                }
+            }
+            metrics::add(&metrics::WATCH_EVENTS, events.len() as u64);
+            last_write = Instant::now();
+        }
+        if main_len > 0 {
+            after = next;
+            if has_more {
+                continue;
+            }
+        }
+
+        if last_write.elapsed() >= heartbeat {
+            let value = json!({"heartbeat": true, "ts_ms": now_ms()});
+            if tx
+                .send(Ok(watch_control(sse, "heartbeat", &value)))
+                .await
+                .is_err()
+            {
+                return Ok(());
+            }
+            metrics::inc(&metrics::WATCH_HEARTBEATS);
+            last_write = Instant::now();
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+fn now_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0)
+}
+
+/// Streaming sibling of the long-poll `watch` operation.
+///
+/// `Accept: text/event-stream` selects SSE; otherwise the response is NDJSON.
+/// The stream stays open until the client disconnects or `timeout_ms` expires.
+async fn watch_stream(
+    State(state): State<AppState>,
+    Extension(connection): Extension<auth::ConnectionAuth>,
+    headers: HeaderMap,
+    Json(req): Json<Request>,
+) -> Response {
+    metrics::inc(&metrics::REQUESTS);
+    let started = Instant::now();
+    let principal = match authenticate_with_guard(&state, &connection, &headers) {
+        Ok(principal) => principal,
+        Err((err, auth_audit)) => {
+            audit_denied(
+                &state,
+                &connection,
+                "anonymous",
+                &req,
+                &err,
+                started,
+                auth_audit,
+            );
+            return respond(Err(err)).into_response();
+        }
+    };
+    if let Err(err) = authz::authorize_request(&principal, &req) {
+        audit_denied(
+            &state,
+            &connection,
+            principal.name(),
+            &req,
+            &err,
+            started,
+            None,
+        );
+        return respond(Err(err)).into_response();
+    }
+    let audit_needed = state.audit.as_ref().is_some_and(|audit| audit.log_reads());
+    let audit_op = req.op_name();
+    let audit_collections: Vec<String> = req.collections().into_iter().map(str::to_owned).collect();
+    let vault_auth = match vault_auth(&headers) {
+        Ok(auth) => auth,
+        Err(err) => {
+            audit_error(
+                &state,
+                &connection,
+                principal.name(),
+                audit_op,
+                &audit_collections,
+                &err,
+                started,
+                audit_needed,
+            );
+            return respond(Err(err)).into_response();
+        }
+    };
+    let Request::Watch {
+        coll,
+        after,
+        limit,
+        timeout_ms,
+        types,
+        filter,
+        projection,
+        heartbeat_ms,
+        overlap_ms,
+    } = req
+    else {
+        let err = ApiError {
+            code: "invalid_request".to_string(),
+            message: "/v1/watch accepts only the `watch` operation".to_string(),
+        };
+        audit_error(
+            &state,
+            &connection,
+            principal.name(),
+            audit_op,
+            &audit_collections,
+            &err,
+            started,
+            audit_needed,
+        );
+        return respond(Err(err)).into_response();
+    };
+
+    let limit = limit.unwrap_or(100).clamp(1, 1_000);
+    let heartbeat = Duration::from_millis(heartbeat_ms.unwrap_or(15_000).clamp(100, 60_000));
+    let overlap = Duration::from_millis(overlap_ms.unwrap_or(2_000).min(60_000));
+    let deadline = timeout_ms
+        .filter(|timeout| *timeout > 0)
+        .and_then(|timeout| Instant::now().checked_add(Duration::from_millis(timeout)));
+    let types = types.unwrap_or_default();
+    let after = after.unwrap_or_default();
+    let filter = filter.unwrap_or_else(|| json!({}));
+
+    let status_store = state.store.clone();
+    let status_coll = coll.clone();
+    let status_auth = vault_auth.clone();
+    let status_after = after.clone();
+    let status = tokio::task::spawn_blocking(move || {
+        watch_status(
+            &status_store,
+            &status_coll,
+            status_auth.as_ref(),
+            &status_after,
+        )
+    })
+    .await;
+    let (truncated, oldest) = match status {
+        Ok(Ok(value)) => value,
+        Ok(Err(err)) => {
+            audit_error(
+                &state,
+                &connection,
+                principal.name(),
+                audit_op,
+                &audit_collections,
+                &err,
+                started,
+                audit_needed,
+            );
+            return respond(Err(err)).into_response();
+        }
+        Err(e) => {
+            let err = ApiError::internal(format!("join error: {e}"));
+            return respond(Err(err)).into_response();
+        }
+    };
+    if truncated {
+        metrics::inc(&metrics::WATCH_TRUNCATED);
+    }
+
+    let sse = headers
+        .get(ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.contains("text/event-stream"));
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
+    let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|item| (item, rx))
+    });
+
+    metrics::inc(&metrics::READ_OPS);
+    metrics::inc(&metrics::WATCH_STREAMS);
+    metrics::inc(&metrics::WATCH_ACTIVE);
+    let task_state = state.clone();
+    let task_coll = coll.clone();
+    let audit_connection = connection.clone();
+    let audit_principal = principal.name().to_string();
+    tokio::spawn(async move {
+        let result = watch_stream_loop(
+            task_state.store.clone(),
+            coll,
+            vault_auth,
+            after,
+            limit,
+            types,
+            filter,
+            projection,
+            heartbeat,
+            overlap,
+            deadline,
+            sse,
+            truncated,
+            oldest,
+            tx,
+        )
+        .await;
+        metrics::sub(&metrics::WATCH_ACTIVE, 1);
+        if audit_needed {
+            if let Some(audit) = &task_state.audit {
+                audit.record(
+                    &audit_principal,
+                    audit_connection.source.as_str(),
+                    audit_connection.peer.as_deref(),
+                    "watch_stream",
+                    &[&task_coll],
+                    result.is_ok(),
+                    result.as_ref().err().map(|err| err.code.as_str()),
+                    started.elapsed().as_secs_f64() * 1000.0,
+                    None,
+                );
+            }
+        }
+    });
+
+    let content_type = if sse {
+        "text/event-stream"
+    } else {
+        "application/x-ndjson"
+    };
+    let mut response = Body::from_stream(stream).into_response();
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        HeaderValue::from_static(content_type),
+    );
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response.headers_mut().insert(
+        axum::http::header::HeaderName::from_static("x-accel-buffering"),
+        HeaderValue::from_static("no"),
+    );
+    response
+}
+
 async fn exec(
     State(state): State<AppState>,
     Extension(connection): Extension<auth::ConnectionAuth>,
@@ -1176,6 +1604,93 @@ async fn exec(
                 }
             });
             read_result(joined).await
+        }
+
+        Request::Watch {
+            coll,
+            after,
+            limit,
+            timeout_ms,
+            types,
+            filter,
+            projection,
+            heartbeat_ms: _,
+            overlap_ms: _,
+        } => {
+            let store = state.store.clone();
+            let auth = vault_auth.clone();
+            let limit = limit.unwrap_or(100).clamp(1, 1_000);
+            let timeout_ms = timeout_ms.unwrap_or(1_000).min(25_000);
+            let types = types.unwrap_or_default();
+            let after = after.unwrap_or_default();
+            let status_store = store.clone();
+            let status_coll = coll.clone();
+            let status_auth = auth.clone();
+            let status_after = after.clone();
+            let status = tokio::task::spawn_blocking(move || {
+                watch_status(
+                    &status_store,
+                    &status_coll,
+                    status_auth.as_ref(),
+                    &status_after,
+                )
+            })
+            .await;
+            let (truncated, oldest) = match status {
+                Ok(Ok(value)) => value,
+                Ok(Err(err)) => return respond(Err(err)),
+                Err(e) => return respond(Err(ApiError::internal(format!("join error: {e}")))),
+            };
+            if truncated {
+                metrics::inc(&metrics::WATCH_TRUNCATED);
+            }
+            let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+            loop {
+                let store = store.clone();
+                let coll = coll.clone();
+                let auth = auth.clone();
+                let after_now = after.clone();
+                let types_now = types.clone();
+                let filter_now = filter.clone();
+                let projection_now = projection.clone();
+                let joined = tokio::task::spawn_blocking(move || {
+                    watch_once(
+                        &store,
+                        &coll,
+                        auth.as_ref(),
+                        &after_now,
+                        limit,
+                        &types_now,
+                        filter_now.as_ref(),
+                        projection_now.as_ref(),
+                    )
+                });
+                let result = match joined.await {
+                    Ok(inner) => inner,
+                    Err(e) => return respond(Err(ApiError::internal(format!("join error: {e}")))),
+                };
+                let (events, next, has_more) = match result {
+                    Ok(value) => value,
+                    Err(err) => return respond(Err(err)),
+                };
+                if !events.is_empty() || has_more || Instant::now() >= deadline {
+                    metrics::inc(&metrics::READ_OPS);
+                    let timed_out = events.is_empty() && !has_more;
+                    if timed_out {
+                        metrics::inc(&metrics::WATCH_TIMEOUTS);
+                    }
+                    metrics::add(&metrics::WATCH_EVENTS, events.len() as u64);
+                    return respond(Ok(json!({
+                        "events": events,
+                        "next": next,
+                        "timed_out": timed_out,
+                        "has_more": has_more,
+                        "truncated": truncated,
+                        "oldest": oldest,
+                    })));
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
         }
 
         Request::FindOne {
@@ -1958,6 +2473,175 @@ fn lookup_projection(
     Ok(Some(Value::Object(projection)))
 }
 
+fn watch_filter(after: &str, types: &[String], filter: Option<&Value>) -> Value {
+    let mut clauses = Vec::new();
+    if !after.is_empty() {
+        clauses.push(json!({"_id": {"$gt": after}}));
+    }
+    if !types.is_empty() {
+        clauses.push(json!({"type": {"$in": types}}));
+    }
+    if let Some(filter) = filter {
+        if !filter.as_object().is_some_and(|object| object.is_empty()) && !filter.is_null() {
+            clauses.push(filter.clone());
+        }
+    }
+    match clauses.len() {
+        0 => json!({}),
+        1 => clauses.pop().unwrap_or_else(|| json!({})),
+        _ => json!({"$and": clauses}),
+    }
+}
+
+/// `watch` always needs `_id` to advance its resume token.
+fn watch_projection(projection: Option<&Value>) -> Option<Value> {
+    let mut projection = projection?.clone();
+    if let Some(object) = projection.as_object_mut() {
+        object.insert("_id".to_string(), Value::from(1));
+        Some(projection)
+    } else {
+        None
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+
+/// Extracts the millisecond timestamp from a 26-character ULID-style id.
+fn event_timestamp_ms(event_id: &str) -> Option<u64> {
+    if event_id.len() != 26 {
+        return None;
+    }
+    let mut value: u64 = 0;
+    for byte in event_id.as_bytes().iter().take(10) {
+        let digit = CROCKFORD
+            .iter()
+            .position(|candidate| candidate.eq_ignore_ascii_case(byte))?;
+        value = (value << 5) | digit as u64;
+    }
+    Some(value)
+}
+
+/// Encodes the lowest ULID-style id for a millisecond timestamp.
+fn event_id_from_ms(milliseconds: u64) -> String {
+    let mut value = ((milliseconds & ((1u64 << 48) - 1)) as u128) << 80;
+    let mut chars = [b'0'; 26];
+    for index in (0..26).rev() {
+        chars[index] = CROCKFORD[(value & 31) as usize];
+        value >>= 5;
+    }
+    String::from_utf8_lossy(&chars).into_owned()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn watch_late_scan(
+    store: &Store,
+    coll: &str,
+    auth: Option<&VaultAuth>,
+    floor: &str,
+    after: &str,
+    limit: usize,
+    types: &[String],
+    filter: Option<&Value>,
+    projection: Option<&Value>,
+) -> Result<Vec<Value>, ApiError> {
+    let c = read_collection(store, coll, auth)?;
+    reject_vault_read(&c, auth, "watch on vault collections")?;
+    let mut clauses = vec![json!({"_id": {"$gt": floor, "$lte": after}})];
+    if !types.is_empty() {
+        clauses.push(json!({"type": {"$in": types}}));
+    }
+    if let Some(filter) = filter {
+        if !filter.as_object().is_some_and(|object| object.is_empty()) && !filter.is_null() {
+            clauses.push(filter.clone());
+        }
+    }
+    let query = FindQuery {
+        filter: if clauses.len() == 1 {
+            clauses.pop().unwrap_or_else(|| json!({}))
+        } else {
+            json!({"$and": clauses})
+        },
+        projection: watch_projection(projection),
+        sort: vec![("_id".to_string(), 1)],
+        skip: 0,
+        limit: Some(limit),
+    };
+    Ok(c.find(&query)?)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn watch_once(
+    store: &Store,
+    coll: &str,
+    auth: Option<&VaultAuth>,
+    after: &str,
+    limit: usize,
+    types: &[String],
+    filter: Option<&Value>,
+    projection: Option<&Value>,
+) -> Result<(Vec<Value>, String, bool), ApiError> {
+    let c = read_collection(store, coll, auth)?;
+    reject_vault_read(&c, auth, "watch on vault collections")?;
+    let query = FindQuery {
+        filter: watch_filter(after, types, filter),
+        projection: watch_projection(projection),
+        sort: vec![("_id".to_string(), 1)],
+        skip: 0,
+        limit: Some(limit + 1),
+    };
+    let mut events = c.find(&query)?;
+    let has_more = events.len() > limit;
+    if has_more {
+        events.truncate(limit);
+    }
+    let next = events
+        .last()
+        .and_then(|event| event.get("_id"))
+        .and_then(Value::as_str)
+        .unwrap_or(after)
+        .to_string();
+    Ok((events, next, has_more))
+}
+
+/// Returns `(truncated, oldest_retained_id)` when `after` is no longer present
+/// and events older than it may have expired or been deleted.
+fn watch_status(
+    store: &Store,
+    coll: &str,
+    auth: Option<&VaultAuth>,
+    after: &str,
+) -> Result<(bool, Option<String>), ApiError> {
+    let c = read_collection(store, coll, auth)?;
+    reject_vault_read(&c, auth, "watch on vault collections")?;
+    if after.is_empty() {
+        return Ok((false, None));
+    }
+    let exists = c.find(&FindQuery {
+        filter: json!({"_id": after}),
+        projection: Some(json!({"_id": 1})),
+        sort: Vec::new(),
+        skip: 0,
+        limit: Some(1),
+    })?;
+    if !exists.is_empty() {
+        return Ok((false, None));
+    }
+    let oldest = c.find(&FindQuery {
+        filter: json!({}),
+        projection: Some(json!({"_id": 1})),
+        sort: vec![("_id".to_string(), 1)],
+        skip: 0,
+        limit: Some(1),
+    })?;
+    let oldest = oldest
+        .first()
+        .and_then(|event| event.get("_id"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    Ok((oldest.as_deref().is_some_and(|id| id > after), oldest))
+}
+
 fn cacheable(req: &Request) -> bool {
     matches!(
         req,
@@ -2061,6 +2745,10 @@ fn execute_read(
     principal: &nonodb_auth::Principal,
 ) -> Result<Value, ApiError> {
     match req {
+        Request::Watch { .. } => Err(ApiError {
+            code: "invalid_query".to_string(),
+            message: "watch is not supported inside a read batch".to_string(),
+        }),
         Request::Find {
             coll,
             filter,

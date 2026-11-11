@@ -115,9 +115,15 @@ limitations are documented in [docs/roadmap.md](docs/roadmap.md).
       checkpoints, overlap rescan for late-committed lower ids, Python worker
       CLI, and idempotent handlers
 - [ ] Add an end-to-end test for TTL retention of consumed event collections
-- [ ] Evaluate a small built-in `watch`/change-stream API only if outbox polling
-      becomes operationally insufficient, especially for strict commit-order
-      guarantees across many concurrent producer processes
+- [x] Add a small server-side `watch` long-poll for append-only outbox event
+      collections, with `after`/`next` resume tokens, type filters, batching, and
+      Python/Rust/Node.js/Go clients
+- [x] Add continuous NDJSON/SSE `/v1/watch` streams with heartbeats, payload
+      filters/projections, truncation detection, stream metrics, and Python
+      reconnect helpers
+- [ ] Evaluate an automatic change feed for arbitrary writes only if explicit
+      outbox events are insufficient for strict commit-order guarantees across
+      many concurrent producer processes
 
 ### P1 — lookup enhancements
 

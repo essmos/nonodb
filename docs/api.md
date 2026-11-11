@@ -100,6 +100,7 @@ client timeout with `NONODB_TIMEOUT` or the `timeout=` argument.
 | [`find`](#find) | Query documents |
 | [`find_one`](#find_one) | Return one document |
 | [`lookup`](#lookup) | Ordered point lookups by `_id` or a unique index |
+| [`watch`](#watch) | Long-poll append-only events by sortable `_id` |
 | [`explain`](#explain) | Show the selected plan, bounds, and actual counts |
 | [`update`](#update) | Update or upsert documents |
 | [`find_and_modify`](#find_and_modify) | Atomically update/remove one document and return it |
@@ -333,6 +334,70 @@ Semantics:
   arbitrary predicates.
 - Non-unique lookups and lookups without a matching index are not supported yet.
 - Vault collections reject `lookup`.
+
+## watch
+
+Long-polls an append-only event collection by sortable `_id`. Use it for outbox
+event collections such as `_events`; it is not an automatic change stream for
+arbitrary updates and deletes.
+
+```json
+{
+  "op": "watch",
+  "coll": "_events",
+  "after": "01J...",
+  "limit": 100,
+  "timeout_ms": 1000,
+  "types": ["order.paid"],
+  "filter": {"payload.total": {"$gte": 1000}},
+  "projection": {"type": 1, "payload": 1}
+}
+```
+
+Response:
+
+```json
+{
+  "events": [
+    {"_id": "01J...", "type": "order.paid", "payload": {"total": 1200}}
+  ],
+  "next": "01J...",
+  "timed_out": false,
+  "has_more": false,
+  "truncated": false,
+  "oldest": null
+}
+```
+
+- `after` is optional. Omit it to start from the beginning of the collection.
+- `limit` defaults to `100`; values are clamped to `1..=1000`.
+- `timeout_ms` defaults to `1000`; values are clamped to `0..=25000`.
+- `types` filters event documents by their `type` field.
+- `filter` applies an additional MongoDB-style filter.
+- `projection` is optional; `_id` is always retained for the resume token.
+- `next` is the last returned `_id`, or `after` when no event arrived.
+- `timed_out` is true only when the timeout expired with no events.
+- `has_more` is true when another page is immediately available.
+- `truncated` is true when `after` is older than retained events; `oldest` is the
+  oldest event id still available.
+- `watch` requires read scope on `coll`, is not cacheable, and is rejected inside
+  a read `batch`. Vault collections are rejected.
+
+### Continuous stream
+
+`POST /v1/watch` accepts the same body and streams events continuously. The
+default response is `application/x-ndjson`; `Accept: text/event-stream` selects
+SSE. Optional fields:
+
+- `heartbeat_ms` — keepalive interval, default `15,000`, range `100..60,000`;
+- `timeout_ms` — maximum stream lifetime; absent or `0` means no limit;
+- `overlap_ms` — late-commit rescan window, default `2,000`, max `60,000`.
+
+NDJSON starts with `{"stream":{"truncated":false,"oldest":null}}`, then sends one
+event per line and periodic `{"heartbeat":true,"ts_ms":...}` frames. SSE emits
+`ready`, `message`, `heartbeat`, and `error` events. See
+[Streaming outbox events](streams.md) for full client examples, reconnect
+handling, and checkpoint guidance.
 
 ## explain
 

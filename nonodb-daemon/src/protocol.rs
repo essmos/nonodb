@@ -100,6 +100,30 @@ pub enum Request {
         #[serde(default)]
         projection: Option<Value>,
     },
+    /// Long-polls an append-only event collection after a sortable `_id`.
+    Watch {
+        coll: String,
+        #[serde(default)]
+        after: Option<String>,
+        #[serde(default)]
+        limit: Option<usize>,
+        #[serde(default)]
+        timeout_ms: Option<u64>,
+        #[serde(default)]
+        types: Option<Vec<String>>,
+        /// Additional MongoDB-style filter applied to event documents.
+        #[serde(default)]
+        filter: Option<Value>,
+        /// Optional projection. `_id` is always retained for resume tokens.
+        #[serde(default)]
+        projection: Option<Value>,
+        /// Keepalive interval for `/v1/watch` streaming. Ignored by long-poll.
+        #[serde(default)]
+        heartbeat_ms: Option<u64>,
+        /// Late-commit rescan window for the continuous stream, in milliseconds.
+        #[serde(default)]
+        overlap_ms: Option<u64>,
+    },
     /// Read-only query plan and actual count diagnostics.
     Explain {
         coll: String,
@@ -546,6 +570,7 @@ impl Request {
             Self::Find { .. } => "find",
             Self::FindOne { .. } => "find_one",
             Self::Lookup { .. } => "lookup",
+            Self::Watch { .. } => "watch",
             Self::Explain { .. } => "explain",
             Self::Update { .. } => "update",
             Self::FindAndModify { .. } => "find_and_modify",
@@ -590,6 +615,7 @@ impl Request {
             Self::Find { .. }
             | Self::FindOne { .. }
             | Self::Lookup { .. }
+            | Self::Watch { .. }
             | Self::Explain { .. }
             | Self::Count { .. }
             | Self::Aggregate { .. }
@@ -620,6 +646,7 @@ impl Request {
             | Self::Find { coll, .. }
             | Self::FindOne { coll, .. }
             | Self::Lookup { coll, .. }
+            | Self::Watch { coll, .. }
             | Self::Explain { coll, .. }
             | Self::Update { coll, .. }
             | Self::FindAndModify { coll, .. }

@@ -568,6 +568,9 @@ All clients expose the common document operations:
 - `batch` (read-only) and `write_batch` (atomic writes);
 - `lookup`/`lookup_one` for ordered point lookups by `_id` or a unique index,
   plus `get_many` for fetching documents by `_id`;
+- `watch`/`watch_once` for append-only outbox events, with filters, projections,
+  resume tokens, and reconnect helpers; Python also exposes `watch_stream` for
+  continuous NDJSON ([details](streams.md));
 - `history` and `get_version` for document revisions (daemon history enabled);
 - single-field, compound, unique, and covering indexes;
 - full-text (`search`), fuzzy search, and exact vector search;

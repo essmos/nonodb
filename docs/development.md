@@ -367,12 +367,12 @@ The tag is `vX.Y.Z`; the annotated tag subject and GitHub Release title are
 
 ```bash
 # final release
-git tag -a v0.11.0 -m "v0.11.0 - Background jobs and outbox events"
-git push origin v0.11.0
+git tag -a v0.12.0 -m "v0.12.0 - Continuous outbox streams"
+git push origin v0.12.0
 
 # pre-release (the hyphen makes it a GitHub pre-release automatically)
-git tag -a v0.11.0-beta.1 -m "v0.11.0-beta.1 - Background jobs and outbox events"
-git push origin v0.11.0-beta.1
+git tag -a v0.12.0-beta.1 -m "v0.12.0-beta.1 - Continuous outbox streams"
+git push origin v0.12.0-beta.1
 ```
 
 The release workflow reads the tag annotation and publishes the release with
@@ -381,10 +381,20 @@ release notes, the workflow uses that body as the GitHub Release description;
 otherwise it falls back to GitHub-generated notes. Keep the subject as the
 title and put the full notes in the body.
 
+When the notes are stored in a file, preserve Markdown headings with:
+
+```bash
+git tag -a vX.Y.Z -F /tmp/nonodb-vX.Y.Z-tag.txt --cleanup=verbatim
+```
+
+The file should start with `vX.Y.Z - Short summary`, then a blank line, then the
+notes. `--cleanup=verbatim` prevents Git from stripping lines that start with
+`#`.
+
 The workflow runs the tests, builds release binaries for Linux x86_64, macOS
 Intel, macOS Apple Silicon, and Windows x86_64, attaches checksums, and
 publishes the GitHub Release. Linux and macOS use `.tar.gz`; Windows uses
-`.zip`. Tags such as `v0.11.0-beta.1` and `v0.11.0-rc.1` are marked as
+`.zip`. Tags such as `v0.12.0-beta.1` and `v0.12.0-rc.1` are marked as
 pre-releases automatically.
 
 ### Manual release
@@ -393,7 +403,7 @@ Use **Actions → Release → Run workflow** and provide:
 
 | Input | Meaning |
 |---|---|
-| `tag` | Tag to publish, e.g. `v0.11.0` or `v0.11.0-rc.1` |
+| `tag` | Tag to publish, e.g. `v0.12.0` or `v0.12.0-rc.1` |
 | `summary` | Short title text after the version: `vX.Y.Z - <summary>` |
 | `prerelease` | Mark the release as a pre-release |
 | `draft` | Create it as a draft for review |

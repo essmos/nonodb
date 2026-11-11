@@ -8,6 +8,7 @@ const READ_OPS = new Set([
   'find',
   'find_one',
   'lookup',
+  'watch',
   'count',
   'list_indexes',
   'list_collections',
@@ -526,6 +527,79 @@ class Collection {
   }
 
   /** Find documents. `options` accepts projection, sort, skip and limit. */
+  /** One long-poll batch from an append-only event collection. */
+  async watchOnce(after = null, {
+    limit = 100,
+    timeoutMs = 1000,
+    types,
+    filter,
+    projection,
+  } = {}) {
+    const payload = {
+      op: 'watch',
+      coll: this.name,
+      limit,
+      timeout_ms: timeoutMs,
+    };
+    if (after) payload.after = after;
+    if (types != null) payload.types = Array.from(types);
+    if (filter != null) payload.filter = filter;
+    if (projection != null) payload.projection = projection;
+    return this.db.exec(payload);
+  }
+
+  /**
+   * Async generator over an append-only event collection.
+   *
+   * Reconnects after transport errors with exponential backoff. Throws
+   * `stream_truncated` when the resume cursor is older than retained events.
+   */
+  async *watch(after = null, {
+    limit = 100,
+    timeoutMs = 1000,
+    types,
+    filter,
+    projection,
+    retry = true,
+    retryDelayMs = 1000,
+    maxRetryDelayMs = 30000,
+  } = {}) {
+    let cursor = after;
+    let delay = Math.max(1, retryDelayMs);
+    for (;;) {
+      try {
+        const batch = await this.watchOnce(cursor, {
+          limit,
+          timeoutMs,
+          types,
+          filter,
+          projection,
+        });
+        if (batch.truncated) {
+          const error = new NonoDBError(
+            'stream_truncated',
+            `events before ${batch.oldest ?? cursor} are no longer retained`,
+          );
+          error.oldest = batch.oldest ?? null;
+          throw error;
+        }
+        for (const event of batch.events ?? []) yield event;
+        cursor = batch.next || cursor;
+        delay = Math.max(1, retryDelayMs);
+      } catch (error) {
+        if (
+          !retry ||
+          !(error instanceof NonoDBError) ||
+          error.code !== 'connection'
+        ) {
+          throw error;
+        }
+        await new Promise((resolve) => setTimeout(resolve, delay));
+        delay = Math.min(maxRetryDelayMs, delay * 2);
+      }
+    }
+  }
+
   async find(filter = {}, { projection, sort, skip = 0, limit } = {}) {
     const payload = {
       op: 'find',
