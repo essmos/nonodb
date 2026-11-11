@@ -1,9 +1,6 @@
 services:
   nonodb:
-    build:
-      context: ..
-      dockerfile: Dockerfile
-    image: nonodb:local
+    image: ${NONODB_IMAGE:-ghcr.io/essmos/nonodb:0.7.0}
     container_name: nonodb
     restart: unless-stopped
     environment:

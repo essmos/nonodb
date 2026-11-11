@@ -549,13 +549,18 @@ Use the same commands as above, replacing `./nonodb-daemon` with
 
 ### Run with Docker
 
-A published Docker image is not currently provided; build it from the
-repository:
+The Docker workflow publishes versioned images to GitHub Container Registry for
+Linux `amd64` and `arm64`. Pull a published tag:
 
 ```bash
-git clone https://github.com/essmos/nonodb.git
-cd nonodb
-docker build -t nonodb:local .
+docker pull ghcr.io/essmos/nonodb:0.7.0
+```
+
+Pin a version in production. The `latest` tag follows stable releases. If the
+package is private, authenticate first:
+
+```bash
+echo "$GHCR_TOKEN" | docker login ghcr.io -u YOUR_GITHUB_USER --password-stdin
 ```
 
 The simplest way to use it from a process on the host is TCP on loopback with
@@ -574,7 +579,7 @@ docker run -d --name nonodb \
   --group-add "$(id -g)" \
   -v "$NONODB_AUTH_FILE:/etc/nonodb/auth.json:ro" \
   -v nonodb-data:/var/lib/nonodb \
-  nonodb:local
+  ghcr.io/essmos/nonodb:0.7.0
 ```
 
 Check health and logs:
@@ -613,6 +618,10 @@ nonodb-cli auth init
 nonodb-cli auth token create admin
 docker compose -f deploy/docker-compose.yml up -d
 ```
+
+Set `NONODB_IMAGE` to pin another image tag. To build the image from source
+instead, use `docker build -t nonodb:local .` and set
+`NONODB_IMAGE=nonodb:local`.
 
 More deployment details: [Operations — Docker](docs/operations.md#docker).
 

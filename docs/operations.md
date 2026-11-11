@@ -277,8 +277,21 @@ stop. The socket itself is recreated by the daemon at startup.
 
 ## Docker
 
-A public Docker image is not currently published. Build the image from the
-repository:
+The Docker workflow publishes versioned images to GitHub Container Registry for
+Linux `amd64` and `arm64`. Pull a published tag:
+
+```bash
+# Pin a version in production; latest tracks stable releases.
+docker pull ghcr.io/essmos/nonodb:0.7.0
+```
+
+If the GHCR package is private, log in before pulling:
+
+```bash
+echo "$GHCR_TOKEN" | docker login ghcr.io -u YOUR_GITHUB_USER --password-stdin
+```
+
+To build the image from source instead, use:
 
 ```bash
 git clone https://github.com/essmos/nonodb.git
@@ -315,7 +328,7 @@ docker run -d --name nonodb \
   --group-add "$(id -g)" \
   -v "$NONODB_AUTH_FILE:/etc/nonodb/auth.json:ro" \
   -v nonodb-data:/var/lib/nonodb \
-  nonodb:local
+  ghcr.io/essmos/nonodb:0.7.0
 ```
 
 Verify it:
@@ -354,9 +367,11 @@ The repository includes [`deploy/docker-compose.yml`](../deploy/docker-compose.y
 export NONODB_AUTH_FILE="$PWD/nonodb-auth.json"
 nonodb-cli auth init
 nonodb-cli auth token create admin
-docker compose -f deploy/docker-compose.yml up -d --build
+docker compose -f deploy/docker-compose.yml up -d
 ```
 
+Set `NONODB_IMAGE` to pin a different tag. For a locally built image, use
+`NONODB_IMAGE=nonodb:local docker compose -f deploy/docker-compose.yml up -d`.
 Check and stop it:
 
 ```bash
@@ -378,7 +393,7 @@ docker volume create nonodb-run
 docker run -d --name nonodb \
   -v nonodb-data:/var/lib/nonodb \
   -v nonodb-run:/run/nonodb \
-  nonodb:local
+  ghcr.io/essmos/nonodb:0.7.0
 ```
 
 The client container mounts the same `nonodb-run` volume and sets:
@@ -407,7 +422,7 @@ docker run -d --name nonodb \
   -v "$NONODB_AUTH_FILE:/etc/nonodb/auth.json:ro" \
   -v /host/certs:/certs:ro \
   -v nonodb-data:/var/lib/nonodb \
-  nonodb:local
+  ghcr.io/essmos/nonodb:0.7.0
 ```
 
 Without a certificate and key pair, TCP runs in plaintext and logs a warning.
@@ -421,7 +436,7 @@ Back up into a separate mounted directory:
 docker run --rm \
   -v nonodb-data:/var/lib/nonodb:ro \
   -v /host/backups:/backups \
-  nonodb:local \
+  ghcr.io/essmos/nonodb:0.7.0 \
   nonodb-cli backup /var/lib/nonodb /backups/$(date -u +%Y%m%dT%H%M%SZ)
 ```
 
