@@ -72,6 +72,13 @@ jobs:
             PRE=true
           fi
 
+          # actions/checkout rewrites the tag ref to a lightweight tag.
+          # Fetch the annotated tag object again so its subject can be used
+          # as the release title summary.
+          if ! git cat-file -e "refs/tags/${TAG}^{tag}" 2>/dev/null; then
+            git fetch --force --no-tags origin "refs/tags/${TAG}:refs/tags/${TAG}" >/dev/null 2>&1 || true
+          fi
+
           SUMMARY="${SUMMARY_INPUT}"
           if [[ -z "${SUMMARY}" ]] && git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
             SUMMARY="$(git tag -l --format='%(contents:subject)' "${TAG}")"
