@@ -205,6 +205,32 @@ the text index makes candidate lookup possible but does not make large OR
 queries free. Fuzzy search is cheaper here because trigram candidate selection
 limits the number of documents scored.
 
+### 1,000,000 vectors (128 dimensions, exact cosine)
+
+Release daemon, ext4, `NONODB_CACHE_TTL=0`, `NONODB_MAP_SIZE=6GiB`.
+Each document carried one deterministic 128-dimensional vector. Inserts used
+batches of 500 through the Python client; query vectors were supplied by the
+client.
+
+| Operation | Result |
+|---|---|
+| Insert 1M documents with vectors | 99.35 s, **10,066 docs/s** including client JSON/UDS overhead |
+| Vector index backfill | 8.08 s, **123,746 docs/s** |
+| `data.mdb` after documents | 3,935 MiB |
+| `data.mdb` after vector + two secondary indexes | 4,767 MiB |
+| `vector_search`, no filter, limit 10 | p50 **298.9 ms**, p95 349.7 ms, p99 376.5 ms |
+| `vector_search`, no filter, limit 100 | p50 **306.8 ms**, p95 346.0 ms |
+| Filter by indexed `cat` (~10k matches) | p50 **118.5 ms**, p95 157.2 ms |
+| Filter by indexed exact `n` (1 match) | p50 **0.82 ms**, p95 1.17 ms |
+| Filter by exact `_id` | p50 **0.75 ms**, p95 1.44 ms |
+| Filter by unindexed exact `title` (worst case) | **8.88 s** for one query |
+| Daemon RSS after searches | ~5.6 GiB (includes resident LMDB mapped pages) |
+
+The unfiltered cost is the expected exact scan: roughly one million vectors ×
+128 components per query. The vector engine uses an exact `_id` or a secondary
+index for selective filters when available; an unindexed highly selective filter
+can inspect most documents and approach a full collection scan.
+
 ## Aggregation pipeline
 
 Measured on 2026-11-10 with `scripts/aggregate_bench.py`, release build, ext4,

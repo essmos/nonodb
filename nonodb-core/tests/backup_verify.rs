@@ -23,13 +23,19 @@ fn fixture() -> (tempfile::TempDir, tempfile::TempDir) {
     store.set_collection_ttl("users", Some(3600)).unwrap();
     let users = store.collection("users").unwrap();
     users
-        .insert_one(json!({"_id": "u1", "grp": "a", "age": 30, "bio": "Rust developer"}))
+        .insert_one(
+            json!({"_id": "u1", "grp": "a", "age": 30, "bio": "Rust developer", "embedding": [1.0, 0.0]}),
+        )
         .unwrap();
     users
-        .insert_one(json!({"_id": "u2", "grp": "a", "age": 42, "bio": "Go developer"}))
+        .insert_one(
+            json!({"_id": "u2", "grp": "a", "age": 42, "bio": "Go developer", "embedding": [0.0, 1.0]}),
+        )
         .unwrap();
     users
-        .insert_one(json!({"_id": "u3", "grp": "b", "age": 25, "bio": "Rust and SQL"}))
+        .insert_one(
+            json!({"_id": "u3", "grp": "b", "age": 25, "bio": "Rust and SQL", "embedding": [0.9, 0.1]}),
+        )
         .unwrap();
     users
         .create_index_fields(&["grp".into(), "age".into()], false, &[])
@@ -37,6 +43,9 @@ fn fixture() -> (tempfile::TempDir, tempfile::TempDir) {
     users.create_index("age", false).unwrap();
     users.create_text_index("bio").unwrap();
     users.create_fuzzy_index("bio").unwrap();
+    users
+        .create_vector_index("embedding", 2, nonodb_core::VectorMetric::Cosine)
+        .unwrap();
     users
         .update(&json!({"_id": "u1"}), &json!({"$inc": {"age": 1}}), false)
         .unwrap();
@@ -65,6 +74,11 @@ fn backup_manifest_and_deep_verification_succeed() {
     assert_eq!(report.collections["users"].indexes.len(), 2);
     assert_eq!(report.collections["users"].text_indexes, vec!["bio"]);
     assert_eq!(report.collections["users"].fuzzy_indexes, vec!["bio"]);
+    assert_eq!(
+        report.collections["users"].vector_indexes,
+        vec!["embedding"]
+    );
+    assert_eq!(report.vector_indexes, 1);
     assert!(report.history_entries >= 4);
     assert!(report.ttl_entries >= 3);
 

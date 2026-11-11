@@ -29,6 +29,8 @@ nonodb is a real document database with:
 - full-text search with **BM25** ranking, Unicode tokenization, diacritic
   folding and quoted phrases;
 - fuzzy search using trigrams plus Levenshtein distance;
+- exact vector search with cosine, dot, and L2 metrics, stored and queried
+  inside the same LMDB file;
 - a read-only aggregation pipeline for reporting and summaries;
 - snapshots, online backup, online LMDB map growth, authentication, TLS/mTLS, metrics and a CLI;
 - graceful shutdown with in-flight request draining and optional JSON logs;
@@ -186,7 +188,10 @@ footprint.
   (`zażółć` → `zazolc`).
 - Quoted phrases requiring contiguous token sequences.
 - Fuzzy search with trigrams plus bounded Levenshtein distance (`_distance`).
-- Both search indexes are maintained in the same transaction as the document.
+- Exact vector search with `cosine`, `dot`, and `l2` metrics. Vectors are
+  stored in LMDB and queried with a brute-force top-K scan; no external vector
+  service is required. Results include `_distance`, lowest first.
+- All search indexes are maintained in the same transaction as the document.
 
 ### Aggregation
 
@@ -411,7 +416,7 @@ listener, so the Windows daemon requires TCP plus `NONODB_AUTH_FILE`.
 Download, verify, and extract the x86_64 archive:
 
 ```bash
-TAG=v0.8.0
+TAG=v0.9.0
 curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/nonodb-$TAG-linux-x86_64.tar.gz"
 curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/nonodb-$TAG-linux-x86_64.tar.gz.sha256"
 sha256sum -c "nonodb-$TAG-linux-x86_64.tar.gz.sha256"
@@ -480,7 +485,7 @@ unit and installation steps in [Operations](docs/operations.md#deployment-with-s
 Download the archive matching your CPU (`uname -m` prints `arm64` or `x86_64`):
 
 ```bash
-TAG=v0.8.0
+TAG=v0.9.0
 ARCHIVE="nonodb-$TAG-macos-arm64.tar.gz"   # use macos-x86_64 on Intel
 curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/$ARCHIVE"
 curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/$ARCHIVE.sha256"
@@ -575,7 +580,7 @@ The Docker workflow publishes versioned images to GitHub Container Registry for
 Linux `amd64` and `arm64`. Pull a published tag:
 
 ```bash
-docker pull ghcr.io/essmos/nonodb:0.8.0
+docker pull ghcr.io/essmos/nonodb:0.9.0
 ```
 
 Pin a version in production. The `latest` tag follows stable releases. If the
@@ -601,7 +606,7 @@ docker run -d --name nonodb \
   --group-add "$(id -g)" \
   -v "$NONODB_AUTH_FILE:/etc/nonodb/auth.json:ro" \
   -v nonodb-data:/var/lib/nonodb \
-  ghcr.io/essmos/nonodb:0.8.0
+  ghcr.io/essmos/nonodb:0.9.0
 ```
 
 Check health and logs:
@@ -703,7 +708,7 @@ results. Visit [liveapisec.com](https://liveapisec.com) to learn more.
 
 ## Status
 
-nonodb is an early-stage project (`0.8.0`). Its core storage, query, index,
+nonodb is an early-stage project (`0.9.0`). Its core storage, query, index,
 search, batching, security, snapshot, and operational paths are covered by unit,
 property-based, end-to-end, concurrency, crash, and large-data tests. The API
 may still change before a stable release.

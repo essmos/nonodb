@@ -80,6 +80,10 @@ export class Collection {
   createFuzzyIndex(field: string): Promise<boolean>;
   dropFuzzyIndex(field: string): Promise<boolean>;
   listFuzzyIndexes(): Promise<string[]>;
+  createVectorIndex(field: string, dims: number, metric?: 'cosine' | 'dot' | 'l2'): Promise<boolean>;
+  dropVectorIndex(field: string): Promise<boolean>;
+  listVectorIndexes(): Promise<Array<{ field: string; dims: number; metric: string; format: number }>>;
+  vectorSearch(field: string, vector: number[], options?: { filter?: Record<string, unknown>; skip?: number; limit?: number }): Promise<any[]>;
   search(field: string, query: string, options?: { filter?: Record<string, unknown>; skip?: number; limit?: number }): Promise<any[]>;
   fuzzy(field: string, query: string, options?: { maxDistance?: number; filter?: Record<string, unknown>; limit?: number }): Promise<any[]>;
   find(filter?: Record<string, unknown>, options?: FindOptions): Promise<any[]>;

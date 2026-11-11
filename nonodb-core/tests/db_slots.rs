@@ -1,4 +1,4 @@
-use nonodb_core::{FindQuery, Store};
+use nonodb_core::{FindQuery, Store, VectorMetric};
 use serde_json::json;
 use tempfile::TempDir;
 
@@ -53,12 +53,17 @@ fn index_create_drop_cycles_reuse_sub_database_slots() {
 }
 
 #[test]
-fn text_and_fuzzy_create_drop_cycles_reuse_slots() {
+fn search_and_vector_create_drop_cycles_reuse_slots() {
     let dir = TempDir::new().unwrap();
     let store = Store::open(dir.path()).unwrap();
     let c = store.collection("search_slots").unwrap();
-    c.insert_one(json!({"_id": "a", "title": "hello world", "body": "hello fuzzy"}))
-        .unwrap();
+    c.insert_one(json!({
+        "_id": "a",
+        "title": "hello world",
+        "body": "hello fuzzy",
+        "embedding": [1.0, 0.0],
+    }))
+    .unwrap();
 
     for i in 0..270 {
         let field = format!("t{i}");
@@ -69,6 +74,12 @@ fn text_and_fuzzy_create_drop_cycles_reuse_slots() {
         let field = format!("z{i}");
         c.create_fuzzy_index(&field).unwrap();
         c.drop_fuzzy_index(&field).unwrap();
+    }
+    for i in 0..270 {
+        let field = format!("v{i}");
+        c.create_vector_index(&field, 2, VectorMetric::Cosine)
+            .unwrap();
+        c.drop_vector_index(&field).unwrap();
     }
 
     c.create_text_index("title").unwrap();
@@ -110,6 +121,35 @@ fn text_and_fuzzy_create_drop_cycles_reuse_slots() {
         1
     );
     assert!(c.drop_fuzzy_index("body").unwrap());
+
+    c.create_vector_index("embedding", 2, VectorMetric::Cosine)
+        .unwrap();
+    assert_eq!(
+        c.vector_search("embedding", &[1.0, 0.0], &json!({}), 0, Some(10))
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(c.drop_vector_index("embedding").unwrap());
+
+    // Recreating a vector index in a reused slot must not retain old vectors.
+    c.update(
+        &json!({"_id": "a"}),
+        &json!({"$set": {"embedding": [0.0, 1.0]}}),
+        false,
+    )
+    .unwrap();
+    c.create_vector_index("embedding", 2, VectorMetric::Cosine)
+        .unwrap();
+    let results = c
+        .vector_search("embedding", &[1.0, 0.0], &json!({}), 0, Some(10))
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    let distance = results[0]["_distance"].as_f64().unwrap();
+    assert!(
+        distance > 0.99,
+        "stale vector survived slot reuse: {distance}"
+    );
 }
 
 #[test]

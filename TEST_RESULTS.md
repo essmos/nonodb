@@ -16,7 +16,7 @@ release build. The latest validation also exercised a 10M-document collection,
 | `cargo build --release --examples` | OK |
 | `cargo fmt --check` | OK |
 | `cargo clippy --all-targets -- -D warnings` | 0 warnings |
-| `cargo test --workspace --all-targets --all-features` | 242 tests passing |
+| `cargo test --workspace` | 261 tests passing |
 | CRUD, cache, batch, write batch, upsert, search, compound indexes | OK |
 | 12-process concurrency and unique-index race tests | OK |
 | `kill -9` during writes | No corruption; committed data readable |
@@ -32,6 +32,7 @@ release build. The latest validation also exercised a 10M-document collection,
 | 1M typed search/aggregation matrix | OK (10 indexes, 200k text docs; typed lookups 0.6–1.2 ms) |
 | Planner and cursor regression | OK (sort-only index, `$or` union, `$type` ranges, cursor paging/ownership) |
 | Multikey and aggregation regression | OK (array keys, unique multikey, min/max sort, `$all`/`$elemMatch` plans, top-K sort, streaming `$group`) |
+| Exact vector search suite | OK (cosine/dot/L2, filtered top-K, update/delete, reopen, backup verification) |
 | 10k keepalive mixed workload | OK (5 min UDS at 4.9k req/s; 2 min TLS at 4.1k req/s; 0 errors) |
 
 ## Large-scale and connection-storm run (2026-11-11)
@@ -141,6 +142,34 @@ Post-fix measurements on 1M documents (1,000 groups):
 The batch index gain is modest because parsing/encoding is already parallel;
 the single LMDB writer and transaction commit dominate. The main index win is
 avoiding repeated collection scans, which will matter more on 10M+ datasets.
+
+## Vector search large-data run (2026-11-11)
+
+Host: 8 vCPU, 22.9 GiB RAM, ext4, release daemon, `NONODB_CACHE_TTL=0`,
+`NONODB_MAP_SIZE=6GiB`. Dataset: 1,000,000 documents with one deterministic
+128-dimensional vector each, inserted through the Python client in batches of
+500. Query vectors were sent by the client; there is no embedding model inside
+NonoDB.
+
+| Phase | Result |
+|---|---|
+| Insert 1M documents with 128-d vectors | 99.35 s, 10,066 docs/s including client JSON/UDS overhead |
+| Create exact cosine vector index (backfill) | 8.08 s, 123,746 docs/s |
+| `data.mdb` after documents | 3,935 MiB |
+| `data.mdb` after vector + two secondary indexes | 4,767 MiB |
+| Exact-vector correctness | queried document was first, `_distance` ~0 |
+| `vector_search`, no filter, limit 10 | 298.9 ms p50 / 349.7 ms p95 / 376.5 ms p99 |
+| `vector_search`, no filter, limit 100 | 306.8 ms p50 / 346.0 ms p95 |
+| Filtered by indexed `cat` (~10k matches) | 118.5 ms p50 / 157.2 ms p95 |
+| Filtered by indexed exact `n` (1 match) | 0.82 ms p50 / 1.17 ms p95 |
+| Filtered by exact `_id` | 0.75 ms p50 / 1.44 ms p95 |
+| Filtered by unindexed exact `title` (worst case) | 8.88 s for one query |
+| Daemon RSS after searches | ~5.6 GiB (includes resident LMDB mapped pages) |
+
+The unfiltered scan is CPU-bound at roughly `1M × 128` component comparisons
+per query, which is the expected cost of the exact MVP. Selective filters should
+use an indexed field or `_id`; an unindexed highly selective filter may inspect
+most documents and approach a full collection scan.
 
 ## Representative numbers
 

@@ -12,8 +12,10 @@ const READ_OPS = new Set([
   'list_collections',
   'list_text_indexes',
   'list_fuzzy_indexes',
+  'list_vector_indexes',
   'search',
   'fuzzy',
+  'vector_search',
   'batch',
 ]);
 
@@ -416,6 +418,52 @@ class Collection {
       coll: this.name,
     });
     return result.fuzzy_indexes ?? [];
+  }
+
+  async createVectorIndex(field, dims, metric = 'cosine') {
+    await this.db.exec({
+      op: 'create_vector_index',
+      coll: this.name,
+      field,
+      dims,
+      metric,
+    });
+    return true;
+  }
+
+  async dropVectorIndex(field) {
+    const result = await this.db.exec({
+      op: 'drop_vector_index',
+      coll: this.name,
+      field,
+    });
+    return result.dropped;
+  }
+
+  async listVectorIndexes() {
+    const result = await this.db.exec({
+      op: 'list_vector_indexes',
+      coll: this.name,
+    });
+    return result.vector_indexes ?? [];
+  }
+
+  /** Exact vector search. Results contain `_distance`, lowest first. */
+  async vectorSearch(
+    field,
+    vector,
+    { filter = {}, skip = 0, limit = 10 } = {},
+  ) {
+    const result = await this.db.exec({
+      op: 'vector_search',
+      coll: this.name,
+      field,
+      vector,
+      filter,
+      skip,
+      limit,
+    });
+    return result.results ?? [];
   }
 
   /** BM25 full-text search. Results contain `_score`, highest first. */

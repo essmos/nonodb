@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use nonodb_core::{CollectionProfile, IndexSpec, VaultKey};
+use nonodb_core::{CollectionProfile, IndexSpec, VaultKey, VectorMetric};
 
 /// Per-request vault credentials. Never format the key.
 #[derive(Clone)]
@@ -214,6 +214,31 @@ pub enum Request {
     ListFuzzyIndexes {
         coll: String,
     },
+    CreateVectorIndex {
+        coll: String,
+        field: String,
+        dims: usize,
+        #[serde(default)]
+        metric: Option<VectorMetric>,
+    },
+    DropVectorIndex {
+        coll: String,
+        field: String,
+    },
+    ListVectorIndexes {
+        coll: String,
+    },
+    VectorSearch {
+        coll: String,
+        field: String,
+        vector: Vec<f32>,
+        #[serde(default)]
+        filter: Value,
+        #[serde(default)]
+        skip: usize,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
     Search {
         coll: String,
         field: String,
@@ -423,6 +448,16 @@ pub enum WriteReq {
         coll: String,
         field: String,
     },
+    CreateVectorIndex {
+        coll: String,
+        field: String,
+        dims: usize,
+        metric: VectorMetric,
+    },
+    DropVectorIndex {
+        coll: String,
+        field: String,
+    },
     /// Atomic write batch (all or nothing).
     Batch {
         ops: Vec<WriteReq>,
@@ -503,6 +538,10 @@ impl Request {
             Self::ListFuzzyIndexes { .. } => "list_fuzzy_indexes",
             Self::Search { .. } => "search",
             Self::Fuzzy { .. } => "fuzzy",
+            Self::CreateVectorIndex { .. } => "create_vector_index",
+            Self::DropVectorIndex { .. } => "drop_vector_index",
+            Self::ListVectorIndexes { .. } => "list_vector_indexes",
+            Self::VectorSearch { .. } => "vector_search",
             Self::History { .. } => "history",
             Self::GetVersion { .. } => "get_version",
             Self::Batch { .. } => "batch",
@@ -530,6 +569,8 @@ impl Request {
             | Self::ListIndexes { .. }
             | Self::ListTextIndexes { .. }
             | Self::ListFuzzyIndexes { .. }
+            | Self::ListVectorIndexes { .. }
+            | Self::VectorSearch { .. }
             | Self::Search { .. }
             | Self::Fuzzy { .. }
             | Self::History { .. }
@@ -565,6 +606,10 @@ impl Request {
             | Self::CreateFuzzyIndex { coll, .. }
             | Self::DropFuzzyIndex { coll, .. }
             | Self::ListFuzzyIndexes { coll }
+            | Self::CreateVectorIndex { coll, .. }
+            | Self::DropVectorIndex { coll, .. }
+            | Self::ListVectorIndexes { coll }
+            | Self::VectorSearch { coll, .. }
             | Self::Search { coll, .. }
             | Self::Fuzzy { coll, .. }
             | Self::History { coll, .. }
@@ -612,7 +657,8 @@ impl WriteReq {
             Self::CreateIndex { .. }
             | Self::CreateIndexes { .. }
             | Self::CreateTextIndex { .. }
-            | Self::CreateFuzzyIndex { .. } => true,
+            | Self::CreateFuzzyIndex { .. }
+            | Self::CreateVectorIndex { .. } => true,
             Self::Batch { ops } => ops.iter().any(Self::is_index_build),
             _ => false,
         }

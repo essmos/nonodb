@@ -80,8 +80,9 @@ support only a restricted subset of operations. See
 | Request body | 4 MiB (`413` when exceeded) |
 | Server-side request timeout | 30 s (`timeout` error) |
 | Document size | 1 MiB (`document_too_large`, HTTP 413) |
-| Search/fuzzy `limit` | default 10, maximum 1000 |
+| Search/fuzzy/vector `limit` | default 10, maximum 1000 |
 | Fuzzy candidates | 5,000 per query |
+| Vector dimensions | 1–65,536 |
 | `write_batch` operations | bounded by request size |
 | LMDB named databases | 1024 (`MDB_DBS_FULL` when exhausted) |
 
@@ -112,8 +113,12 @@ client timeout with `NONODB_TIMEOUT` or the `timeout=` argument.
 | [`create_fuzzy_index`](#fuzzy-indexes) | Create a fuzzy index |
 | [`drop_fuzzy_index`](#fuzzy-indexes) | Drop a fuzzy index |
 | [`list_fuzzy_indexes`](#fuzzy-indexes) | List fuzzy indexes |
+| [`create_vector_index`](#vector-indexes) | Create an exact vector index |
+| [`drop_vector_index`](#vector-indexes) | Drop a vector index |
+| [`list_vector_indexes`](#vector-indexes) | List vector indexes |
 | [`search`](#search) | BM25 full-text query |
 | [`fuzzy`](#fuzzy) | Approximate string query |
+| [`vector_search`](#vector-search) | Exact top-K vector query |
 | [`batch`](#read-batch) | Multiple read operations, one snapshot |
 | [`write_batch`](#atomic-write-batch) | Atomic group of writes |
 | [`history`](#document-history) | List revisions of one document |
@@ -531,7 +536,7 @@ Response:
 ```
 
 `multi` defaults to `false`, which deletes only the first match. Deletion
-removes secondary, text, and fuzzy index entries in the same write transaction.
+removes secondary, text, fuzzy, and vector index entries in the same write transaction.
 
 ## count
 
@@ -1304,6 +1309,85 @@ Semantics:
   `$numberInt`, `$numberLong`, `$numberDouble`, and `$numberDecimal`. Arrays,
   objects, dates, binary/UUID, and ObjectId values are skipped.
 
+## Vector indexes
+
+Create, drop, and list:
+
+```json
+{"op": "create_vector_index", "coll": "articles", "field": "embedding", "dims": 384, "metric": "cosine"}
+{"op": "drop_vector_index", "coll": "articles", "field": "embedding"}
+{"op": "list_vector_indexes", "coll": "articles"}
+```
+
+Responses:
+
+```json
+{"ok": true, "result": {"created": "embedding", "kind": "vector", "dims": 384, "metric": "cosine"}}
+{"ok": true, "result": {"dropped": true, "kind": "vector"}}
+{"ok": true, "result": {"vector_indexes": [{"field": "embedding", "dims": 384, "metric": "cosine", "format": 1}]}}
+```
+
+Semantics:
+
+- `dims` is required and must be between 1 and 65,536.
+- `metric` is `cosine` (default), `dot`, or `l2`.
+- The document field must be a JSON array of exactly `dims` finite numbers.
+  Missing, malformed, or wrong-length vectors are not indexed; writes still
+  succeed.
+- One vector per document per index is supported.
+- The index is maintained in the same transaction as document inserts,
+  updates, deletes, TTL expiry, and restores.
+- Creating the index backfills existing documents synchronously.
+
+## vector_search
+
+```json
+{
+  "op": "vector_search",
+  "coll": "articles",
+  "field": "embedding",
+  "vector": [0.12, -0.03, 0.44],
+  "filter": {"published": true},
+  "skip": 0,
+  "limit": 10
+}
+```
+
+Response:
+
+```json
+{
+  "ok": true,
+  "result": {
+    "results": [
+      {"_id": "...", "title": "...", "embedding": [0.12, -0.03, 0.44], "_distance": 0.08}
+    ]
+  }
+}
+```
+
+Semantics:
+
+- The vector index must exist; otherwise `invalid_query`.
+- The query vector must have exactly the indexed `dims`.
+- Search is exact and scans the whole index: `O(N × dims)` per query. There is
+  no approximate index or recall loss.
+- `_distance` is added to each result; lower is better:
+  - `cosine`: `1 - cosine_similarity` (0 is identical),
+  - `dot`: negative dot product,
+  - `l2`: squared Euclidean distance.
+- Results are sorted by `_distance`, then `_id`.
+- `filter` is a normal document filter applied before final selection. If it is
+  an exact `_id` or can use a secondary index with at most 50,000 candidates,
+  the matching documents are checked first. Otherwise the vector index is
+  scanned and candidates are checked until enough matches are found.
+- A highly selective filter on an unindexed field can inspect most documents
+  and approach a full collection scan. Create a secondary index for selective
+  filters.
+- `skip` and `limit` apply after ranking. `limit` defaults to 10 and is capped
+  at 1,000.
+- Vectors are stored in LMDB; no external vector service is used.
+
 ## Document history
 
 History is opt-in on the daemon (`NONODB_HISTORY=1`) and is stored separately
@@ -1457,9 +1541,9 @@ Response:
 Rules:
 
 - Allowed operations: `find`, `find_one`, `count`, `list_indexes`,
-  `list_text_indexes`, `list_fuzzy_indexes`, `list_collections`, `history`,
-  `get_version`, `search`,
-  `fuzzy`.
+  `list_text_indexes`, `list_fuzzy_indexes`, `list_vector_indexes`,
+  `list_collections`, `history`, `get_version`, `search`, `fuzzy`,
+  `vector_search`.
 - Every operation executes against **one** `RoTxn`, so the batch sees a single
   consistent snapshot.
 - An error in one operation does not stop the others. Each result has its own
@@ -1657,7 +1741,7 @@ administrator; TCP requires a bearer token or registered client certificate.
 | `ttl_expired_total` | Documents deleted by TTL |
 | `ttl_sweep_errors_total` | Failed TTL sweeps |
 | `ttl_backlog` | Due entries observed by the last sweep |
-| `index_builds` | Active/recent index, text, and fuzzy backfills with processed/total/elapsed |
+| `index_builds` | Active/recent index, text, fuzzy, and vector backfills with processed/total/elapsed |
 | `avg_batch_size` | Write ops per committed write transaction |
 | `avg_commit_us` | Average commit time in microseconds |
 

@@ -19,7 +19,7 @@ Use vault collections when:
 
 Do **not** use vault collections when:
 
-- you need full-text or fuzzy search over the encrypted data;
+- you need full-text, fuzzy, or vector search over the encrypted data;
 - you need range queries, sorting, or aggregation on encrypted fields;
 - you need per-field encryption while keeping some fields queryable (this MVP
   encrypts the whole document body);
@@ -152,7 +152,7 @@ Details:
 | `create_index` | ❌ `unsupported_encrypted_operation` |
 | `create_text_index` | ❌ `unsupported_encrypted_operation` |
 | `create_fuzzy_index` | ❌ `unsupported_encrypted_operation` |
-| `list_indexes` / text / fuzzy | ❌ `unsupported_encrypted_operation` |
+| `list_indexes` / text / fuzzy / vector | ❌ `unsupported_encrypted_operation` |
 | `batch` | ❌ vault collections cannot be read through `batch` |
 | `write_batch` | ❌ vault collections cannot be written through `write_batch` |
 | `list_collections` | ✅ shows collection names |

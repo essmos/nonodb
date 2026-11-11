@@ -94,6 +94,21 @@ type FuzzyOptions struct {
 	Limit       int64
 }
 
+// VectorOptions controls VectorSearch.
+type VectorOptions struct {
+	Filter map[string]any
+	Skip   int64
+	Limit  int64
+}
+
+// VectorIndex describes a vector index.
+type VectorIndex struct {
+	Field  string `json:"field"`
+	Dims   int    `json:"dims"`
+	Metric string `json:"metric"`
+	Format int    `json:"format"`
+}
+
 type config struct {
 	socketPath string
 	baseURL    string
@@ -367,8 +382,8 @@ func isReadOp(payload map[string]any) bool {
 	op, _ := payload["op"].(string)
 	switch op {
 	case "find", "find_one", "count", "list_indexes", "list_collections",
-		"list_text_indexes", "list_fuzzy_indexes", "search", "fuzzy",
-		"history", "get_version", "batch":
+		"list_text_indexes", "list_fuzzy_indexes", "list_vector_indexes",
+		"search", "fuzzy", "vector_search", "history", "get_version", "batch":
 		return true
 	default:
 		return false
@@ -814,6 +829,65 @@ func (c *Collection) listFieldIndexes(
 		return nil, err
 	}
 	return result[key], nil
+}
+
+// CreateVectorIndex creates an exact vector index.
+func (c *Collection) CreateVectorIndex(
+	ctx context.Context,
+	field string,
+	dims int,
+	metric string,
+) (bool, error) {
+	payload := map[string]any{
+		"op": "create_vector_index", "coll": c.Name, "field": field, "dims": dims,
+	}
+	if metric != "" {
+		payload["metric"] = metric
+	}
+	_, err := c.client.execRaw(ctx, payload)
+	return err == nil, err
+}
+
+// DropVectorIndex drops a vector index.
+func (c *Collection) DropVectorIndex(ctx context.Context, field string) (bool, error) {
+	return c.dropFieldIndex(ctx, "drop_vector_index", field)
+}
+
+// ListVectorIndexes lists vector index definitions.
+func (c *Collection) ListVectorIndexes(ctx context.Context) ([]VectorIndex, error) {
+	raw, err := c.client.execRaw(ctx, map[string]any{
+		"op": "list_vector_indexes", "coll": c.Name,
+	})
+	if err != nil {
+		return nil, err
+	}
+	var result struct {
+		Indexes []VectorIndex `json:"vector_indexes"`
+	}
+	if err := decodeInto(raw, &result); err != nil {
+		return nil, err
+	}
+	return result.Indexes, nil
+}
+
+// VectorSearch runs exact top-K vector search.
+func (c *Collection) VectorSearch(
+	ctx context.Context,
+	field string,
+	vector []float32,
+	options VectorOptions,
+) ([]map[string]any, error) {
+	if options.Limit == 0 {
+		options.Limit = 10
+	}
+	raw, err := c.client.execRaw(ctx, map[string]any{
+		"op": "vector_search", "coll": c.Name, "field": field, "vector": vector,
+		"filter": nonNilMap(options.Filter), "skip": options.Skip, "limit": options.Limit,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return decodeResults(raw)
 }
 
 // Search runs BM25 full-text search.

@@ -40,8 +40,10 @@ _READ_OPS = {
     "get_collection_ttl",
     "list_text_indexes",
     "list_fuzzy_indexes",
+    "list_vector_indexes",
     "search",
     "fuzzy",
+    "vector_search",
     "batch",
     "map_info",
 }
@@ -723,6 +725,62 @@ class Collection:
                 "query": query,
                 "max_distance": max_distance,
                 "filter": filter or {},
+                "limit": limit,
+            }
+        )["results"]
+
+    # -- vector search ----------------------------------------------
+    def create_vector_index(
+        self,
+        field: str,
+        dims: int,
+        metric: str = "cosine",
+    ) -> bool:
+        """Creates an exact vector index.
+
+        `metric` is `cosine` (default), `dot`, or `l2`. Vectors must be JSON
+        arrays of exactly `dims` finite numbers. Missing or invalid vectors are
+        not indexed.
+        """
+        self._db.exec(
+            {
+                "op": "create_vector_index",
+                "coll": self.name,
+                "field": field,
+                "dims": dims,
+                "metric": metric,
+            }
+        )
+        return True
+
+    def drop_vector_index(self, field: str) -> bool:
+        return self._db.exec(
+            {"op": "drop_vector_index", "coll": self.name, "field": field}
+        )["dropped"]
+
+    def list_vector_indexes(self) -> list[dict[str, Any]]:
+        return self._db.exec(
+            {"op": "list_vector_indexes", "coll": self.name}
+        )["vector_indexes"]
+
+    def vector_search(
+        self,
+        field: str,
+        vector: list[float],
+        *,
+        filter: Optional[dict[str, Any]] = None,
+        skip: int = 0,
+        limit: int = 10,
+    ) -> list[dict[str, Any]]:
+        """Exact vector search. Results include `_distance`, lowest first."""
+        return self._db.exec(
+            {
+                "op": "vector_search",
+                "coll": self.name,
+                "field": field,
+                "vector": vector,
+                "filter": filter or {},
+                "skip": skip,
                 "limit": limit,
             }
         )["results"]

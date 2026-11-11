@@ -129,7 +129,7 @@ expiry; use `$set` with `0` or `null`.
 An expired document is deleted through the normal write path:
 
 - the document is removed from the primary collection;
-- secondary, text, and fuzzy index entries are removed;
+- secondary, text, fuzzy, and vector index entries are removed;
 - TTL metadata is removed;
 - when document history is enabled, a `delete` tombstone is appended, unless
   the collection has `purge_history: true`, in which case all stored revisions

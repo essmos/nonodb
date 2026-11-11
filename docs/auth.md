@@ -84,7 +84,7 @@ version make the file invalid.
 |---|---|
 | `read:<collection>` | find, find_one, count, aggregate, explain, search, fuzzy, history, get_version, get_collection_ttl, list indexes |
 | `write:<collection>` | insert, insert_many, update, find_and_modify, delete |
-| `admin:<collection>` | create/drop collection, create/drop secondary/text/fuzzy index, set collection TTL |
+| `admin:<collection>` | create/drop collection, create/drop secondary/text/fuzzy/vector index, set collection TTL |
 | `admin:db` | map_info, resize_map, `/metrics` |
 | `read:*` / `write:*` / `admin:*` | The action on every collection |
 | `*:*` | Everything |

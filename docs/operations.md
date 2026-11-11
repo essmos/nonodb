@@ -35,10 +35,10 @@ All daemon configuration is through environment variables.
 | `NONODB_SOCK` | `/run/nonodb.sock` | Unix socket path |
 | `NONODB_MAP_SIZE` | `1GiB` | LMDB address-space limit; accepts `4GiB`, `2048MiB`, bytes |
 | `NONODB_REQUEST_TIMEOUT` | `30` | Server-side request timeout in seconds for normal operations |
-| `NONODB_INDEX_TIMEOUT` | `3600` | Server-side timeout in seconds for index/text/fuzzy builds |
+| `NONODB_INDEX_TIMEOUT` | `3600` | Server-side timeout in seconds for index/text/fuzzy/vector builds |
 | `NONODB_AGGREGATE_MAX_DOCS` | `100000` | Maximum intermediate aggregation result size |
 | `NONODB_SCAN_WORKERS` | min(CPUs, 16) | Workers for parallel full scans/sorts; capped at 256 |
-| `NONODB_BACKFILL_WORKERS` | min(CPUs, 16) | Workers for index/text/fuzzy backfill parsing; capped at 256 |
+| `NONODB_BACKFILL_WORKERS` | min(CPUs, 16) | Workers for index/text/fuzzy/vector backfill parsing; capped at 256 |
 | `NONODB_AGGREGATE_WORKERS` | min(CPUs, 16) | Workers for parallel order-independent `$group`; capped at 256 |
 | `NONODB_BLOCKING_THREADS` | `64` | Tokio blocking threads used by LMDB reads/writes |
 | `NONODB_CACHE_TTL` | `5` | Read-cache TTL in seconds; `0` disables the cache |
@@ -108,7 +108,7 @@ long-running transaction, the client may time out even though the resize
 completes afterwards.
 
 The daemon has a shared read cache for `find`, `find_one`, `count`, search,
-fuzzy, and list operations. It is enabled by default for 5 seconds. Every
+fuzzy, vector search, and list operations. It is enabled by default for 5 seconds. Every
 successful write commit increments an internal version and clears the cache, so
 read-after-write through the same daemon is fresh. The cache is bounded by
 `NONODB_CACHE_ENTRIES` and `NONODB_CACHE_MAX_BYTES`; oversized results are not
@@ -231,7 +231,7 @@ Download the archive from the matching GitHub Release, verify its checksum, and
 install the two binaries:
 
 ```bash
-TAG=v0.8.0
+TAG=v0.9.0
 ARCHIVE="nonodb-$TAG-linux-x86_64.tar.gz"
 curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/$ARCHIVE"
 curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/$ARCHIVE.sha256"
@@ -293,7 +293,7 @@ Linux `amd64` and `arm64`. Pull a published tag:
 
 ```bash
 # Pin a version in production; latest tracks stable releases.
-docker pull ghcr.io/essmos/nonodb:0.8.0
+docker pull ghcr.io/essmos/nonodb:0.9.0
 ```
 
 If the GHCR package is private, log in before pulling:
@@ -339,7 +339,7 @@ docker run -d --name nonodb \
   --group-add "$(id -g)" \
   -v "$NONODB_AUTH_FILE:/etc/nonodb/auth.json:ro" \
   -v nonodb-data:/var/lib/nonodb \
-  ghcr.io/essmos/nonodb:0.8.0
+  ghcr.io/essmos/nonodb:0.9.0
 ```
 
 Verify it:
@@ -404,7 +404,7 @@ docker volume create nonodb-run
 docker run -d --name nonodb \
   -v nonodb-data:/var/lib/nonodb \
   -v nonodb-run:/run/nonodb \
-  ghcr.io/essmos/nonodb:0.8.0
+  ghcr.io/essmos/nonodb:0.9.0
 ```
 
 The client container mounts the same `nonodb-run` volume and sets:
@@ -433,7 +433,7 @@ docker run -d --name nonodb \
   -v "$NONODB_AUTH_FILE:/etc/nonodb/auth.json:ro" \
   -v /host/certs:/certs:ro \
   -v nonodb-data:/var/lib/nonodb \
-  ghcr.io/essmos/nonodb:0.8.0
+  ghcr.io/essmos/nonodb:0.9.0
 ```
 
 Without a certificate and key pair, TCP runs in plaintext and logs a warning.
@@ -447,7 +447,7 @@ Back up into a separate mounted directory:
 docker run --rm \
   -v nonodb-data:/var/lib/nonodb:ro \
   -v /host/backups:/backups \
-  ghcr.io/essmos/nonodb:0.8.0 \
+  ghcr.io/essmos/nonodb:0.9.0 \
   nonodb-cli backup /var/lib/nonodb /backups/$(date -u +%Y%m%dT%H%M%SZ)
 ```
 
@@ -636,7 +636,7 @@ to avoid noise.
 ### Disk
 
 The LMDB file is approximately the size of the document data plus indexes plus
-free pages. Indexes and full-text/fuzzy structures add substantial overhead.
+free pages. Indexes, full-text/fuzzy, and vector structures add substantial overhead.
 The file **does not shrink** after deletes. A compacting backup produces a
 smaller copy; restoring it reduces the live file size.
 
@@ -651,7 +651,7 @@ retry administrative file commands after it completes.
 ### Named databases
 
 Collections and the fixed metadata/history/TTL databases consume named LMDB
-sub-databases. Index, text, and fuzzy resources share a reusable slot pool:
+sub-databases. Index, text, fuzzy, and vector resources share a reusable slot pool:
 dropping an index returns its slot, and later indexes reuse it. The environment
 is opened with `MAX_DBS=1024`, leaving 960 slots for index/search resources.
 Legacy resources from older releases may still hold named databases; a
@@ -696,7 +696,7 @@ restart drops process RSS to a few MB; the OS may keep pages cached.
 ## Timeouts and long operations
 
 The daemon defaults to a 30-second timeout for normal requests and a separate
-3600-second timeout for index, text-index, and fuzzy-index builds. The Python
+3600-second timeout for index, text-index, fuzzy-index, and vector-index builds. The Python
 client must still allow enough time for the response; set `NONODB_TIMEOUT` or
 `NonoDB(timeout=...)` above the expected build duration.
 
@@ -711,7 +711,7 @@ active backfills is exposed as `index_builds` in `/metrics`, including
 write transaction, so it becomes visible and durable only after completion; an
 interrupted build is rolled back and must be restarted.
 
-Creating a text or fuzzy index backfills synchronously and blocks writers while
+Creating a text, fuzzy, or vector index backfills synchronously and blocks writers while
 the final write transaction is active. Schedule large index builds during
 maintenance windows.
 
@@ -773,7 +773,7 @@ backups.
 | `timeout` | Long scan exceeds 30 s, or index build exceeds 1 h | Raise `NONODB_REQUEST_TIMEOUT`, `NONODB_INDEX_TIMEOUT`, and client timeout |
 | `document_too_large` (413) | Document > 1 MiB or request > 4 MiB | Split document/import; batch inserts |
 | `duplicate_key` | Duplicate `_id` or unique-index conflict | Use a new id or update the existing document |
-| `invalid_query` on search | Text/fuzzy index missing | Create the index first |
+| `invalid_query` on search | Text/fuzzy/vector index missing | Create the index first |
 | `MDB_DBS_FULL` | Named database limit reached | Reduce collections/indexes; recreate database with fewer names |
 | Writes fail as data grows | `map_size` reached | `nonodb-cli resize 4GiB`, or raise `NONODB_MAP_SIZE` and restart |
 | Socket not found after restart | Directory removed | Ensure `RuntimeDirectory=nonodb` or create the socket parent |

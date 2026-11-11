@@ -22,6 +22,8 @@ pub fn authorize_request(principal: &Principal, req: &Request) -> Result<(), Api
         | Request::ListIndexes { coll }
         | Request::ListTextIndexes { coll }
         | Request::ListFuzzyIndexes { coll }
+        | Request::ListVectorIndexes { coll }
+        | Request::VectorSearch { coll, .. }
         | Request::Search { coll, .. }
         | Request::Fuzzy { coll, .. }
         | Request::History { coll, .. }
@@ -35,6 +37,8 @@ pub fn authorize_request(principal: &Principal, req: &Request) -> Result<(), Api
         | Request::DropTextIndex { coll, .. }
         | Request::CreateFuzzyIndex { coll, .. }
         | Request::DropFuzzyIndex { coll, .. }
+        | Request::CreateVectorIndex { coll, .. }
+        | Request::DropVectorIndex { coll, .. }
         | Request::CreateCollection { coll, .. }
         | Request::SetCollectionTtl { coll, .. } => {
             allow(principal, Action::AdminCollection, coll, req.op_name())

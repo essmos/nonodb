@@ -25,6 +25,7 @@ use crate::search;
 use crate::store::MAX_DOCUMENT_BYTES;
 use crate::ttl::{self, TtlUpdate};
 use crate::vault::{self, CollectionProfile, VaultKey};
+use crate::vector::{self, Candidate, VectorDef, VectorMetric};
 use crate::verify::{CollectionVerification, IndexVerification};
 
 /// Meta prefix for reusable physical sub-database slots.
@@ -1327,6 +1328,317 @@ impl<'e> Collection<'e> {
         self.resource_db_in(wtxn, &name, &name)
     }
 
+    fn vector_db(&self, txn: &RoTxn<'_>, field: &str) -> Result<Option<Database<Bytes, Bytes>>> {
+        let name = vector::db_name(&self.name, field);
+        self.resource_db(txn, &name, &name)
+    }
+
+    fn vector_db_in(&self, wtxn: &mut RwTxn<'_>, field: &str) -> Result<Database<Bytes, Bytes>> {
+        let name = vector::db_name(&self.name, field);
+        self.resource_db_in(wtxn, &name, &name)
+    }
+
+    fn vector_defs(&self, txn: &RoTxn<'_>) -> Result<Vec<VectorDef>> {
+        let prefix = format!("vecdef:{}:", self.name);
+        let mut out = Vec::new();
+        for item in self.meta.prefix_iter(txn, prefix.as_bytes())? {
+            let (_key, value) = item?;
+            out.push(serde_json::from_slice(value)?);
+        }
+        Ok(out)
+    }
+
+    /// Creates an exact vector index and backfills it with existing documents.
+    pub fn create_vector_index(
+        &self,
+        field: &str,
+        dims: usize,
+        metric: VectorMetric,
+    ) -> Result<()> {
+        let mut wtxn = self.write_txn()?;
+        self.create_vector_index_txn(&mut wtxn, field, dims, metric)?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    pub fn create_vector_index_txn(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        field: &str,
+        dims: usize,
+        metric: VectorMetric,
+    ) -> Result<()> {
+        self.ensure_standard()?;
+        if field.is_empty() || field.contains('+') {
+            return Err(Error::Query(
+                "vector index field must be non-empty and must not contain `+`".into(),
+            ));
+        }
+        if dims == 0 || dims > vector::MAX_VECTOR_DIMS {
+            return Err(Error::Query(format!(
+                "vector index dimensions must be between 1 and {}",
+                vector::MAX_VECTOR_DIMS
+            )));
+        }
+        let def_key = vector::def_key(&self.name, field);
+        if let Some(bytes) = self.meta.get(&*wtxn, def_key.as_bytes())? {
+            let existing: VectorDef = serde_json::from_slice(bytes)?;
+            if existing.dims == dims && existing.metric == metric {
+                return Ok(());
+            }
+            return Err(Error::Query(format!(
+                "vector index on `{field}` already exists with different dimensions or metric; drop it first"
+            )));
+        }
+
+        let entries: Vec<(String, Vec<u8>)> =
+            self.parallel_backfill(wtxn, "vector", field, |id, doc| {
+                let Some(vector) =
+                    index::field_value(&doc, field).and_then(|v| vector::parse_vector(v, dims))
+                else {
+                    return Ok(Vec::new());
+                };
+                Ok(vec![(id, vector::encode_vector(&vector))])
+            })?;
+
+        let db = self.vector_db_in(wtxn, field)?;
+        db.clear(&mut *wtxn)?;
+        let def = VectorDef::new(field, dims, metric);
+        self.meta.put(
+            &mut *wtxn,
+            def_key.as_bytes(),
+            serde_json::to_vec(&def)?.as_slice(),
+        )?;
+        for (id, value) in entries {
+            db.put(&mut *wtxn, id.as_bytes(), value.as_slice())?;
+        }
+        Ok(())
+    }
+
+    /// Drops a vector index and its stored vectors.
+    pub fn drop_vector_index(&self, field: &str) -> Result<bool> {
+        let mut wtxn = self.write_txn()?;
+        let existed = self.drop_vector_index_txn(&mut wtxn, field)?;
+        wtxn.commit()?;
+        Ok(existed)
+    }
+
+    pub fn drop_vector_index_txn(&self, wtxn: &mut RwTxn<'_>, field: &str) -> Result<bool> {
+        let def_key = vector::def_key(&self.name, field);
+        let existed = self.meta.delete(&mut *wtxn, def_key.as_bytes())?;
+        if existed {
+            let name = vector::db_name(&self.name, field);
+            self.drop_resource_db(wtxn, &name, &name)?;
+        }
+        Ok(existed)
+    }
+
+    pub fn list_vector_indexes(&self) -> Result<Vec<VectorDef>> {
+        let rtxn = self.read_txn()?;
+        let out = self.list_vector_indexes_in(&rtxn)?;
+        rtxn.commit()?;
+        Ok(out)
+    }
+
+    pub fn list_vector_indexes_in(&self, rtxn: &RoTxn<'_>) -> Result<Vec<VectorDef>> {
+        self.vector_defs(rtxn)
+    }
+
+    /// Maintains vector indexes on an `old -> new` change.
+    fn apply_vector_entries(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        old: Option<&Value>,
+        new: Option<&Value>,
+        id: &str,
+    ) -> Result<()> {
+        for def in self.vector_defs(&*wtxn)? {
+            let old_vector = old
+                .and_then(|doc| index::field_value(doc, &def.field))
+                .and_then(|value| vector::parse_vector(value, def.dims));
+            let new_vector = new
+                .and_then(|doc| index::field_value(doc, &def.field))
+                .and_then(|value| vector::parse_vector(value, def.dims));
+            if old_vector == new_vector {
+                continue;
+            }
+            let db = self.vector_db_in(wtxn, &def.field)?;
+            if old_vector.is_some() {
+                db.delete(&mut *wtxn, id.as_bytes())?;
+            }
+            if let Some(vector) = new_vector {
+                db.put(
+                    &mut *wtxn,
+                    id.as_bytes(),
+                    vector::encode_vector(&vector).as_slice(),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Exact top-K vector search. Results include `_distance`, lowest first.
+    pub fn vector_search(
+        &self,
+        field: &str,
+        query: &[f32],
+        filter: &Value,
+        skip: usize,
+        limit: Option<usize>,
+    ) -> Result<Vec<Value>> {
+        let rtxn = self.read_txn()?;
+        let out = self.vector_search_in(&rtxn, field, query, filter, skip, limit)?;
+        rtxn.commit()?;
+        Ok(out)
+    }
+
+    pub fn vector_search_in(
+        &self,
+        rtxn: &RoTxn<'_>,
+        field: &str,
+        query: &[f32],
+        filter: &Value,
+        skip: usize,
+        limit: Option<usize>,
+    ) -> Result<Vec<Value>> {
+        crate::query::validate::validate_filter(filter)?;
+        let def_key = vector::def_key(&self.name, field);
+        let Some(raw_def) = self.meta.get(rtxn, def_key.as_bytes())? else {
+            return Err(Error::Query(format!("no vector index on field `{field}`")));
+        };
+        let def: VectorDef = serde_json::from_slice(raw_def)?;
+        if query.len() != def.dims {
+            return Err(Error::Query(format!(
+                "vector query has {} dimensions; index `{field}` expects {}",
+                query.len(),
+                def.dims
+            )));
+        }
+        if query.iter().any(|value| !value.is_finite()) {
+            return Err(Error::Query(
+                "vector query contains a non-finite component".into(),
+            ));
+        }
+        let Some(db) = self.vector_db(rtxn, field)? else {
+            return Err(Error::Query(format!("no vector index on field `{field}`")));
+        };
+
+        let limit = limit.unwrap_or(10).min(1000);
+        let want = limit.saturating_add(skip);
+        if want == 0 {
+            return Ok(Vec::new());
+        }
+        let query_norm = vector::norm(query);
+        let filter_active =
+            !(filter.is_null() || filter.as_object().is_some_and(|object| object.is_empty()));
+        if filter_active {
+            const FILTER_INDEX_LIMIT: usize = 50_000;
+            let ids = if let Some(id) = direct_id(filter) {
+                Some(vec![id.to_string()])
+            } else {
+                self.index_candidates(rtxn, filter, Some(FILTER_INDEX_LIMIT + 1))?
+                    .filter(|ids| ids.len() <= FILTER_INDEX_LIMIT)
+            };
+            if let Some(ids) = ids {
+                let mut heap: BinaryHeap<Candidate> = BinaryHeap::new();
+                for id in ids {
+                    let Some(raw_doc) = self.db.get(rtxn, id.as_bytes())? else {
+                        continue;
+                    };
+                    let doc: Value = parse_json(raw_doc)?;
+                    if !matches(&doc, filter) {
+                        continue;
+                    }
+                    let Some(value) = db.get(rtxn, id.as_bytes())? else {
+                        continue;
+                    };
+                    let Some(distance) =
+                        vector::distance_from_bytes(def.metric, query, query_norm, value, def.dims)
+                    else {
+                        continue;
+                    };
+                    heap.push(Candidate { distance, id });
+                    if heap.len() > want {
+                        heap.pop();
+                    }
+                }
+                return self.vector_results_from_heap(rtxn, heap, skip, limit);
+            }
+        }
+        let mut heap: BinaryHeap<Candidate> = BinaryHeap::new();
+        for item in db.iter(rtxn)? {
+            let (key, value) = item?;
+            let Ok(id) = std::str::from_utf8(key) else {
+                continue;
+            };
+            let Some(distance) =
+                vector::distance_from_bytes(def.metric, query, query_norm, value, def.dims)
+            else {
+                continue;
+            };
+            // Once we have enough results, candidates that cannot beat the
+            // current worst entry are irrelevant. This matters most for
+            // filtered searches: without the bound we would load and parse a
+            // document for every indexed vector.
+            if heap.len() >= want {
+                let worst = heap.peek().expect("non-empty vector heap");
+                if distance > worst.distance
+                    || (distance == worst.distance && id >= worst.id.as_str())
+                {
+                    continue;
+                }
+            }
+            if filter_active {
+                let Some(raw_doc) = self.db.get(rtxn, key)? else {
+                    continue;
+                };
+                let doc: Value = parse_json(raw_doc)?;
+                if !matches(&doc, filter) {
+                    continue;
+                }
+            }
+            heap.push(Candidate {
+                distance,
+                id: id.to_string(),
+            });
+            if heap.len() > want {
+                heap.pop();
+            }
+        }
+
+        self.vector_results_from_heap(rtxn, heap, skip, limit)
+    }
+
+    fn vector_results_from_heap(
+        &self,
+        rtxn: &RoTxn<'_>,
+        heap: BinaryHeap<Candidate>,
+        skip: usize,
+        limit: usize,
+    ) -> Result<Vec<Value>> {
+        let mut ranked = heap.into_vec();
+        ranked.sort_by(|a, b| {
+            a.distance
+                .total_cmp(&b.distance)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        let mut out = Vec::new();
+        for candidate in ranked.into_iter().skip(skip).take(limit) {
+            let Some(bytes) = self.db.get(rtxn, candidate.id.as_bytes())? else {
+                continue;
+            };
+            let mut doc: Value = parse_json(bytes)?;
+            if let Some(object) = doc.as_object_mut() {
+                object.insert(
+                    "_distance".to_string(),
+                    serde_json::json!(f64::from(candidate.distance)),
+                );
+            }
+            out.push(doc);
+        }
+        Ok(out)
+    }
+
     /// Creates a full-text (BM25) index and backfills it with existing documents.
     pub fn create_text_index(&self, field: &str) -> Result<()> {
         let mut wtxn = self.write_txn()?;
@@ -1827,6 +2139,7 @@ impl<'e> Collection<'e> {
         self.apply_index_entries(wtxn, None, Some(&doc), &id)?;
         self.apply_text_entries(wtxn, None, Some(&doc), &id)?;
         self.apply_fuzzy_entries(wtxn, None, Some(&doc), &id)?;
+        self.apply_vector_entries(wtxn, None, Some(&doc), &id)?;
         self.set_ttl(wtxn, &id, ttl_at)?;
         self.record_history(wtxn, &id, "insert", Some(doc))?;
         Ok(id)
@@ -1931,6 +2244,7 @@ impl<'e> Collection<'e> {
         self.apply_index_entries(wtxn, Some(&old), Some(&new), &id)?;
         self.apply_text_entries(wtxn, Some(&old), Some(&new), &id)?;
         self.apply_fuzzy_entries(wtxn, Some(&old), Some(&new), &id)?;
+        self.apply_vector_entries(wtxn, Some(&old), Some(&new), &id)?;
         self.set_ttl(wtxn, &id, ttl_at)?;
         self.record_history(wtxn, &id, "update", Some(new.clone()))?;
         Ok(new)
@@ -2182,6 +2496,7 @@ impl<'e> Collection<'e> {
             self.apply_index_entries(wtxn, Some(&old), None, &id)?;
             self.apply_text_entries(wtxn, Some(&old), None, &id)?;
             self.apply_fuzzy_entries(wtxn, Some(&old), None, &id)?;
+            self.apply_vector_entries(wtxn, Some(&old), None, &id)?;
             self.set_ttl(wtxn, &id, None)?;
             self.record_history(wtxn, &id, "delete", None)?;
         }
@@ -2483,6 +2798,7 @@ impl<'e> Collection<'e> {
             self.apply_index_entries(wtxn, Some(&old), None, id)?;
             self.apply_text_entries(wtxn, Some(&old), None, id)?;
             self.apply_fuzzy_entries(wtxn, Some(&old), None, id)?;
+            self.apply_vector_entries(wtxn, Some(&old), None, id)?;
         }
         self.set_ttl(wtxn, id, None)?;
         if self.ttl_purge_history {
@@ -4305,6 +4621,7 @@ impl<'e> Collection<'e> {
         let defs = self.index_defs(rtxn)?;
         let text_fields = self.text_defs(rtxn)?;
         let fuzzy_fields = self.fuzzy_defs(rtxn)?;
+        let vector_fields = self.vector_defs(rtxn)?;
 
         let mut documents = 0u64;
         let mut bytes = 0u64;
@@ -4313,6 +4630,7 @@ impl<'e> Collection<'e> {
         let mut expected_lengths = vec![0u64; text_fields.len()];
         let mut expected_tokens = vec![0u64; text_fields.len()];
         let mut expected_trigrams = vec![0u64; fuzzy_fields.len()];
+        let mut expected_vectors = vec![0u64; vector_fields.len()];
 
         for item in self.db.iter(rtxn)? {
             let (key, raw) = item?;
@@ -4447,6 +4765,33 @@ impl<'e> Collection<'e> {
                     expected_trigrams[i] += 1;
                 }
             }
+
+            for (i, def) in vector_fields.iter().enumerate() {
+                let Some(vector) = index::field_value(&doc, &def.field)
+                    .and_then(|value| vector::parse_vector(value, def.dims))
+                else {
+                    continue;
+                };
+                let db = self.vector_db(rtxn, &def.field)?.ok_or_else(|| {
+                    Error::Query(format!(
+                        "vector index `{}` on `{}` is defined but its database is missing",
+                        def.field, self.name
+                    ))
+                })?;
+                let actual = db.get(rtxn, key)?.ok_or_else(|| {
+                    Error::Query(format!(
+                        "vector index `{}` on `{}` is missing entry for `{id}`",
+                        def.field, self.name
+                    ))
+                })?;
+                if actual != vector::encode_vector(&vector).as_slice() {
+                    return Err(Error::Query(format!(
+                        "vector index `{}` on `{}` has a stale entry for `{id}`",
+                        def.field, self.name
+                    )));
+                }
+                expected_vectors[i] += 1;
+            }
         }
 
         let mut indexes = Vec::with_capacity(defs.len());
@@ -4542,12 +4887,29 @@ impl<'e> Collection<'e> {
             }
         }
 
+        for (i, def) in vector_fields.iter().enumerate() {
+            let db = self.vector_db(rtxn, &def.field)?.ok_or_else(|| {
+                Error::Query(format!(
+                    "vector index `{}` on `{}` is defined but its database is missing",
+                    def.field, self.name
+                ))
+            })?;
+            let entries = db.stat(rtxn)?.entries as u64;
+            if entries != expected_vectors[i] {
+                return Err(Error::Query(format!(
+                    "vector index `{}` on `{}` has {entries} entries, expected {}",
+                    def.field, self.name, expected_vectors[i]
+                )));
+            }
+        }
+
         Ok(CollectionVerification {
             documents,
             bytes,
             indexes,
             text_indexes: text_fields,
             fuzzy_indexes: fuzzy_fields,
+            vector_indexes: vector_fields.into_iter().map(|def| def.field).collect(),
         })
     }
 

@@ -129,7 +129,28 @@ limitations are documented in [docs/roadmap.md](docs/roadmap.md).
 - [ ] Published Python package
 - [x] Single-field GeoJSON point indexes with `$near`, `$geoWithin`, and
       `$geoIntersects` for point documents
-- [ ] Vector indexes and advanced spherical topology/line/polygon document indexes
+- [x] Exact brute-force vector indexes (`vector_search`, cosine/dot/L2) with
+      in-transaction maintenance, filtering, and backup verification
+- [ ] Approximate vector indexes (HNSW/IVF/PQ) if brute-force scans become limiting
+- [ ] Advanced spherical topology/line/polygon document indexes
+
+## Deferred scaling work
+
+These items are intentionally deferred; do not start them now. Revisit only
+with measured evidence that one node cannot hold the dataset or that sustained
+writes are capped by the single writer after vertical scaling, batching,
+indexing, and profiling.
+
+- [ ] **Database-level partitioning (database → owner node).** The first, lighter
+  option to revisit for multi-tenant scale. Assign each database to one owner;
+  this preserves per-database consistency and can raise aggregate write
+  throughput, but it does not accelerate one hot database.
+- [ ] **Full sharding of a single database.** Only consider after database-level
+  partitioning is insufficient. Requires shard keys, routing, rebalancing,
+  fencing, and an explicit policy for cross-shard queries, unique indexes, and
+  transactions.
+- **Million-transactions-per-second workloads are not a target.** The measured
+  10k-client runs validate connection concurrency, not extreme write throughput.
 
 ## Known issues and caveats
 

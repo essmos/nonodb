@@ -54,6 +54,8 @@ pub struct CollectionVerification {
     pub indexes: Vec<IndexVerification>,
     pub text_indexes: Vec<String>,
     pub fuzzy_indexes: Vec<String>,
+    #[serde(default)]
+    pub vector_indexes: Vec<String>,
 }
 
 /// Full verification report for a data directory.
@@ -67,6 +69,8 @@ pub struct VerificationReport {
     pub secondary_index_entries: u64,
     pub text_indexes: u64,
     pub fuzzy_indexes: u64,
+    #[serde(default)]
+    pub vector_indexes: u64,
     pub history_entries: u64,
     pub ttl_entries: u64,
 }
@@ -220,6 +224,7 @@ pub fn verify_data_dir(path: impl AsRef<Path>) -> Result<VerificationReport> {
     let mut secondary_index_entries = 0u64;
     let mut text_indexes = 0u64;
     let mut fuzzy_indexes = 0u64;
+    let mut vector_indexes = 0u64;
 
     for name in store.collections_in(&rtxn)? {
         let collection = store.collection_at(&rtxn, &name)?.ok_or_else(|| {
@@ -231,6 +236,7 @@ pub fn verify_data_dir(path: impl AsRef<Path>) -> Result<VerificationReport> {
         secondary_index_entries += report.indexes.iter().map(|i| i.entries).sum::<u64>();
         text_indexes += report.text_indexes.len() as u64;
         fuzzy_indexes += report.fuzzy_indexes.len() as u64;
+        vector_indexes += report.vector_indexes.len() as u64;
         collections.insert(name, report);
     }
 
@@ -247,6 +253,7 @@ pub fn verify_data_dir(path: impl AsRef<Path>) -> Result<VerificationReport> {
         secondary_index_entries,
         text_indexes,
         fuzzy_indexes,
+        vector_indexes,
         history_entries,
         ttl_entries,
     })

@@ -26,6 +26,7 @@ pub mod search;
 pub mod store;
 pub mod ttl;
 pub mod vault;
+pub mod vector;
 pub mod verify;
 
 pub use aggregate::MAX_AGGREGATE_DOCS;
@@ -42,6 +43,7 @@ pub use store::{
 };
 pub use ttl::DueEntry;
 pub use vault::{CollectionProfile, VaultKey};
+pub use vector::{VectorDef, VectorMetric, MAX_VECTOR_DIMS};
 pub use verify::{
     verify_backup, verify_data_dir, BackupManifest, BackupVerification, CollectionVerification,
     IndexVerification, VerificationReport, MANIFEST_FILE, MANIFEST_VERSION,

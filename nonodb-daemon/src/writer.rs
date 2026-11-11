@@ -409,6 +409,26 @@ fn execute(
             let existed = c.drop_fuzzy_index_txn(wtxn, field)?;
             Ok(json!({ "dropped": existed, "kind": "fuzzy" }))
         }
+        WriteReq::CreateVectorIndex {
+            coll,
+            field,
+            dims,
+            metric,
+        } => {
+            let c = standard_collection(store, wtxn, coll)?;
+            c.create_vector_index_txn(wtxn, field, *dims, *metric)?;
+            Ok(json!({
+                "created": field,
+                "kind": "vector",
+                "dims": dims,
+                "metric": metric.as_str()
+            }))
+        }
+        WriteReq::DropVectorIndex { coll, field } => {
+            let c = standard_collection(store, wtxn, coll)?;
+            let existed = c.drop_vector_index_txn(wtxn, field)?;
+            Ok(json!({ "dropped": existed, "kind": "vector" }))
+        }
         WriteReq::Batch { ops } => {
             let mut results = Vec::with_capacity(ops.len());
             for (idx, op) in ops.iter().enumerate() {

@@ -1390,6 +1390,49 @@ async fn exec(
             read_result(joined).await
         }
 
+        Request::ListVectorIndexes { coll } => {
+            let store = state.store.clone();
+            let auth = vault_auth.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                let c = read_collection(&store, &coll, auth.as_ref())?;
+                reject_vault_read(&c, auth.as_ref(), "vector index listing")?;
+                let list: Vec<Value> = c
+                    .list_vector_indexes()?
+                    .into_iter()
+                    .map(|d| {
+                        json!({
+                            "field": d.field,
+                            "dims": d.dims,
+                            "metric": d.metric.as_str(),
+                            "format": d.format,
+                        })
+                    })
+                    .collect();
+                Ok::<Value, ApiError>(json!({ "vector_indexes": list }))
+            });
+            read_result(joined).await
+        }
+
+        Request::VectorSearch {
+            coll,
+            field,
+            vector,
+            filter,
+            skip,
+            limit,
+        } => {
+            let store = state.store.clone();
+            let auth = vault_auth.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                let c = read_collection(&store, &coll, auth.as_ref())?;
+                reject_vault_read(&c, auth.as_ref(), "vector search")?;
+                Ok::<Value, ApiError>(json!({
+                    "results": c.vector_search(&field, &vector, &filter, skip, limit)?
+                }))
+            });
+            read_result(joined).await
+        }
+
         Request::Search {
             coll,
             field,
@@ -1740,6 +1783,20 @@ async fn exec(
                     WriteReq::CreateFuzzyIndex { coll, field }
                 }
                 Request::DropFuzzyIndex { coll, field } => WriteReq::DropFuzzyIndex { coll, field },
+                Request::CreateVectorIndex {
+                    coll,
+                    field,
+                    dims,
+                    metric,
+                } => WriteReq::CreateVectorIndex {
+                    coll,
+                    field,
+                    dims,
+                    metric: metric.unwrap_or_default(),
+                },
+                Request::DropVectorIndex { coll, field } => {
+                    WriteReq::DropVectorIndex { coll, field }
+                }
                 _ => unreachable!("read requests handled above"),
             };
 
@@ -1865,6 +1922,8 @@ fn cacheable(req: &Request) -> bool {
             | Request::ListIndexes { .. }
             | Request::ListTextIndexes { .. }
             | Request::ListFuzzyIndexes { .. }
+            | Request::ListVectorIndexes { .. }
+            | Request::VectorSearch { .. }
             | Request::ListCollections
             | Request::GetCollectionTtl { .. }
             | Request::History { .. }
@@ -2072,6 +2131,48 @@ fn execute_read(
                 return Err(vault::unsupported("batch reads on vault collections").into());
             }
             Ok(json!({ "fuzzy_indexes": c.list_fuzzy_indexes_in(rtxn)? }))
+        }
+        Request::ListVectorIndexes { coll } => {
+            let Some(c) = store.collection_at(rtxn, &coll)? else {
+                return Ok(json!({ "vector_indexes": [] }));
+            };
+            if c.profile().is_vault() {
+                return Err(vault::unsupported("batch reads on vault collections").into());
+            }
+            let list: Vec<Value> = c
+                .list_vector_indexes_in(rtxn)?
+                .into_iter()
+                .map(|d| {
+                    json!({
+                        "field": d.field,
+                        "dims": d.dims,
+                        "metric": d.metric.as_str(),
+                        "format": d.format,
+                    })
+                })
+                .collect();
+            Ok(json!({ "vector_indexes": list }))
+        }
+        Request::VectorSearch {
+            coll,
+            field,
+            vector,
+            filter,
+            skip,
+            limit,
+        } => {
+            let Some(c) = store.collection_at(rtxn, &coll)? else {
+                return Err(nonodb_core::Error::Query(format!(
+                    "collection `{coll}` does not exist"
+                ))
+                .into());
+            };
+            if c.profile().is_vault() {
+                return Err(vault::unsupported("batch reads on vault collections").into());
+            }
+            Ok(json!({
+                "results": c.vector_search_in(rtxn, &field, &vector, &filter, skip, limit)?
+            }))
         }
         Request::Search {
             coll,

@@ -5,7 +5,7 @@ is deliberately out of scope, and which gaps are candidates for future work.
 
 ## Current status
 
-The project is at `0.8.0`. It is suitable for local and single-host
+The project is at `0.9.0`. It is suitable for local and single-host
 applications that need a small, durable, queryable JSON store and can accept a
 single-writer model.
 
@@ -26,6 +26,7 @@ Implemented:
 - index-only sorted scans and index-backed counts;
 - BM25 full-text search with diacritic folding and phrases;
 - fuzzy search with trigrams and bounded Levenshtein distance;
+- exact brute-force vector search with cosine, dot, and L2 metrics;
 - read batches and atomic write batches;
 - document TTL with collection defaults, per-document overrides, and background expiry;
 - BSON-compatible dates with RFC 3339 input, UTC normalization, indexed ranges, and sorting;
@@ -93,9 +94,16 @@ Implemented:
   contain at most one array field; parallel arrays are rejected. Ordinary
   objects are skipped. Indexes created before format 5 must be recreated to
   include array entries.
-- No sparse/partial indexes, wildcard indexes, vector indexes, or text indexes
-  with custom analyzers. Geo indexes currently cover single-field GeoJSON
-  points; polygon/line document indexes are not implemented.
+- No sparse/partial indexes, wildcard indexes, or text indexes with custom
+  analyzers. Geo indexes currently cover single-field GeoJSON points;
+  polygon/line document indexes are not implemented.
+- Vector indexes store one vector per document and scan the whole index for
+  each query. There is no ANN (HNSW/IVF/PQ), multi-vector document index, or
+  built-in embedding model; clients send ready vectors. Auto-index does not
+  create vector indexes automatically.
+- Filtered vector search uses an exact `_id` or a secondary index when one is
+  available. A highly selective filter on an unindexed field may require a full
+  document scan.
 - No index intersection or cost-based optimizer. The planner uses a simple
   prefix/range rule.
 - A covering projection requires an explicit `include` list and an inclusive
@@ -217,7 +225,7 @@ project's target workload.
 ### Lower priority
 
 14. Sparse/partial and wildcard indexes.
-15. Vector indexes and polygon/line document geo indexes.
+15. Approximate vector indexes (HNSW/IVF/PQ) and polygon/line document geo indexes.
 16. A published Python package and additional language clients.
 17. Benchmark automation in CI.
 18. A web UI or schema browser.

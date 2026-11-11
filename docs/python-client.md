@@ -562,11 +562,60 @@ Collection.fuzzy(
 - There is no `skip` parameter.
 - The index must exist.
 
+## Vector search
+
+Vectors are computed outside NonoDB, by the application or a local embedding
+service. NonoDB stores the ready vectors and performs exact top-K search.
+
+```python
+articles.create_vector_index("embedding", 384, metric="cosine")
+
+articles.insert({
+    "title": "Async Rust",
+    "embedding": embed("Async Rust"),
+})
+
+results = articles.vector_search(
+    "embedding",
+    embed("rust async"),
+    filter={"published": True},
+    limit=10,
+)
+for doc in results:
+    print(doc["_distance"], doc["title"])
+```
+
+Signatures:
+
+```python
+Collection.create_vector_index(
+    field,
+    dims,
+    metric="cosine",       # "cosine", "dot", or "l2"
+) -> bool
+
+Collection.vector_search(
+    field,
+    vector,
+    *,
+    filter=None,
+    skip=0,
+    limit=10,
+) -> list[dict]
+```
+
+- `_distance` is lower-is-better: `1 - cosine`, `-dot`, or squared L2.
+- Search is exact and scans the whole index; it is not approximate.
+- One vector per document per index.
+- Missing or wrong-length vectors are not indexed.
+- The same model and dimensions must be used for stored vectors and queries.
+
 ## Listing indexes
 
 ```python
-articles.list_text_indexes()   # ["body"]
-articles.list_fuzzy_indexes()  # ["title"]
+articles.list_text_indexes()    # ["body"]
+articles.list_fuzzy_indexes()   # ["title"]
+articles.list_vector_indexes()  # [{"field": "embedding", "dims": 384, ...}]
 ```
 
 ## Read batches

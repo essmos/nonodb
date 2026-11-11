@@ -14,7 +14,7 @@ data.mdb       consistent, compacted LMDB environment
 manifest.json  source, timestamp, size, and SHA-256
 ```
 
-The LMDB environment includes documents, indexes, full-text and fuzzy data,
+The LMDB environment includes documents, indexes, full-text, fuzzy, and vector data,
 history, TTL metadata, collection profiles, and database slots. A backup does
 **not** include:
 
@@ -112,6 +112,7 @@ This checks:
 - secondary index entries against their documents;
 - full-text postings, document lengths, and token totals;
 - fuzzy trigram posting counts;
+- vector index entries against the stored document vectors;
 - history and TTL entry counts.
 
 For a backup or restored directory without a manifest, use:
@@ -187,7 +188,7 @@ python3 scripts/restore_drill.py
 The drill creates a temporary source database with documents, secondary, text,
 fuzzy, history, and TTL state, takes a live backup, verifies the manifest and
 index structure, restores with `--verify`, starts a daemon on the restored
-directory, and checks counts, indexed ranges, full-text/fuzzy search, history,
+directory, and checks counts, indexed ranges, full-text/fuzzy/vector search, history,
 TTL, and unique-index enforcement.
 
 Weekly cron example:
@@ -231,7 +232,7 @@ mkdir -p /host/backups
 docker run --rm \
   -v nonodb-data:/var/lib/nonodb:ro \
   -v /host/backups:/backups \
-  ghcr.io/essmos/nonodb:0.8.0 \
+  ghcr.io/essmos/nonodb:0.9.0 \
   nonodb-cli backup /var/lib/nonodb "/backups/$(date -u +%Y%m%dT%H%M%SZ)"
 ```
 
@@ -243,7 +244,7 @@ docker compose -f deploy/docker-compose.yml stop
 docker run --rm \
   -v nonodb-data:/var/lib/nonodb \
   -v /host/backups:/backups \
-  ghcr.io/essmos/nonodb:0.8.0 \
+  ghcr.io/essmos/nonodb:0.9.0 \
   nonodb-cli restore /backups/20261109T120000Z /var/lib/nonodb --force --verify
 
 docker compose -f deploy/docker-compose.yml up -d

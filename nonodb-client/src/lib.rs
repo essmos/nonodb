@@ -508,8 +508,10 @@ fn is_read_op(payload: &Value) -> bool {
                 | "list_collections"
                 | "list_text_indexes"
                 | "list_fuzzy_indexes"
+                | "list_vector_indexes"
                 | "search"
                 | "fuzzy"
+                | "vector_search"
                 | "history"
                 | "get_version"
                 | "batch"
@@ -894,6 +896,61 @@ impl Collection<'_> {
             "query": query,
             "max_distance": max_distance,
             "filter": filter.cloned().unwrap_or_else(|| json!({})),
+            "limit": limit,
+        }))?;
+        value_array(result.get("results").cloned().unwrap_or(Value::Null))
+    }
+
+    /// Create an exact vector index.
+    pub fn create_vector_index(&self, field: &str, dims: usize, metric: &str) -> Result<bool> {
+        self.client.exec(json!({
+            "op": "create_vector_index",
+            "coll": self.name,
+            "field": field,
+            "dims": dims,
+            "metric": metric,
+        }))?;
+        Ok(true)
+    }
+
+    /// Drop a vector index.
+    pub fn drop_vector_index(&self, field: &str) -> Result<bool> {
+        let result = self.client.exec(json!({
+            "op": "drop_vector_index",
+            "coll": self.name,
+            "field": field,
+        }))?;
+        result
+            .get("dropped")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| Error::InvalidResponse("missing dropped".into()))
+    }
+
+    /// List vector index definitions.
+    pub fn list_vector_indexes(&self) -> Result<Vec<Value>> {
+        let result = self.client.exec(json!({
+            "op": "list_vector_indexes",
+            "coll": self.name,
+        }))?;
+        value_array(result.get("vector_indexes").cloned().unwrap_or(Value::Null))
+    }
+
+    /// Exact vector search. Results contain `_distance`, lowest first.
+    pub fn vector_search(
+        &self,
+        field: &str,
+        vector: &[f32],
+        filter: Option<&Value>,
+        skip: u64,
+        limit: u64,
+    ) -> Result<Vec<Value>> {
+        let result = self.client.exec(json!({
+            "op": "vector_search",
+            "coll": self.name,
+            "field": field,
+            "vector": vector,
+            "filter": filter.cloned().unwrap_or_else(|| json!({})),
+            "skip": skip,
             "limit": limit,
         }))?;
         value_array(result.get("results").cloned().unwrap_or(Value::Null))

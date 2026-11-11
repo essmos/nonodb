@@ -167,7 +167,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 The Rust client exposes `exec`, `batch`, `write_batch`, `get_many`, history,
-aggregation, indexes, text search, fuzzy search, and online map resize.
+aggregation, indexes, text search, fuzzy search, vector search, and online map
+resize.
 `Client::from_env()` reads `NONODB_SOCK`,
 `NONODB_URL`, `NONODB_TOKEN`, `NONODB_TLS_VERIFY`, `NONODB_TLS_CA`,
 `NONODB_TLS_CLIENT_CERT`, and `NONODB_TLS_CLIENT_KEY`. For mTLS:
@@ -327,8 +328,8 @@ All clients expose the common document operations:
 - `get_many` for fetching documents by `_id`;
 - `history` and `get_version` for document revisions (daemon history enabled);
 - single-field, compound, unique, and covering indexes;
-- full-text (`search`) and fuzzy search;
-- text/fuzzy index listing and deletion;
+- full-text (`search`), fuzzy search, and exact vector search;
+- text/fuzzy/vector index listing and deletion;
 - collection listing and health checks;
 - LMDB map information/growth in Python and Rust (or raw `exec` elsewhere);
 - vault collection handles in Python, Rust, Node.js, and Go.
