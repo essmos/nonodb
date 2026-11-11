@@ -7,10 +7,15 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag, e.g. v0.6.0 or v0.6.0-beta.1"
+        description: "Release tag, e.g. v0.7.0 or v0.7.0-beta.1"
         required: true
         type: string
-        default: "v0.6.0"
+        default: "v0.7.0"
+      summary:
+        description: "Short summary for the release title: vX.Y.Z - <summary>"
+        required: false
+        type: string
+        default: ""
       prerelease:
         description: "Mark this release as a pre-release"
         required: false
@@ -35,11 +40,18 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.meta.outputs.tag }}
+      title: ${{ steps.meta.outputs.title }}
       prerelease: ${{ steps.meta.outputs.prerelease }}
       draft: ${{ steps.meta.outputs.draft }}
     env:
       TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+      SUMMARY_INPUT: ${{ github.event.inputs.summary }}
     steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
       - name: Resolve release metadata
         id: meta
         shell: bash
@@ -60,13 +72,25 @@ jobs:
             PRE=true
           fi
 
+          SUMMARY="${SUMMARY_INPUT}"
+          if [[ -z "${SUMMARY}" ]] && git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            SUMMARY="$(git tag -l --format='%(contents:subject)' "${TAG}")"
+            SUMMARY="${SUMMARY#"${TAG}"}"
+            SUMMARY="$(printf '%s' "${SUMMARY}" | sed -E 's/^[[:space:]]*[-—:][[:space:]]*//')"
+          fi
+          if [[ -z "${SUMMARY}" ]]; then
+            SUMMARY="Release"
+          fi
+          TITLE="${TAG} - ${SUMMARY}"
+
           {
             echo "tag=${TAG}"
+            echo "title=${TITLE}"
             echo "prerelease=${PRE}"
             echo "draft=${DRAFT}"
           } >> "${GITHUB_OUTPUT}"
 
-          echo "Releasing ${TAG} (prerelease=${PRE}, draft=${DRAFT})"
+          echo "Releasing ${TAG} as '${TITLE}' (prerelease=${PRE}, draft=${DRAFT})"
 
   test:
     name: Test on Linux
@@ -183,6 +207,7 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       TAG: ${{ needs.prepare.outputs.tag }}
+      TITLE: ${{ needs.prepare.outputs.title }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v5
@@ -221,7 +246,7 @@ jobs:
 
             gh release create "${TAG}" "${ASSETS[@]}" \
               --target "${GITHUB_SHA}" \
-              --title "${TAG}" \
+              --title "${TITLE}" \
               --generate-notes \
               "${FLAGS[@]}"
           fi

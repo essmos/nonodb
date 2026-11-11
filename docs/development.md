@@ -345,22 +345,34 @@ There are two supported flows.
 
 ### Release from a tag
 
-Create and push an annotated tag:
+GitHub Actions builds every release artifact. Do not build or upload release
+binaries locally.
+
+Use one title format everywhere:
+
+```text
+vX.Y.Z - Short summary
+```
+
+The tag is `vX.Y.Z`; the annotated tag subject and GitHub Release title are
+`vX.Y.Z - Short summary`:
 
 ```bash
 # final release
-git tag -a v0.6.0 -m "nonodb v0.6.0"
-git push origin v0.6.0
+git tag -a v0.7.0 -m "v0.7.0 - Authorization, audit, and IP lockout"
+git push origin v0.7.0
 
 # pre-release (the hyphen makes it a GitHub pre-release automatically)
-git tag -a v0.6.0-beta.1 -m "nonodb v0.6.0-beta.1"
-git push origin v0.6.0-beta.1
+git tag -a v0.7.0-beta.1 -m "v0.7.0-beta.1 - Authorization, audit, and IP lockout"
+git push origin v0.7.0-beta.1
 ```
 
-The workflow runs the tests, builds release binaries for Linux x86_64, macOS
-Intel, macOS Apple Silicon, and Windows x86_64, attaches checksums, and publishes
-a GitHub Release. Linux and macOS use `.tar.gz`; Windows uses `.zip`. Tags such
-as `v0.6.0-beta.1` and `v0.6.0-rc.1` are marked as pre-releases automatically.
+The release workflow reads the tag annotation and publishes the release with
+the same `vX.Y.Z - Short summary` title. It runs the tests, builds release
+binaries for Linux x86_64, macOS Intel, macOS Apple Silicon, and Windows x86_64,
+attaches checksums, and publishes the GitHub Release. Linux and macOS use
+`.tar.gz`; Windows uses `.zip`. Tags such as `v0.7.0-beta.1` and
+`v0.7.0-rc.1` are marked as pre-releases automatically.
 
 ### Manual release
 
@@ -368,9 +380,13 @@ Use **Actions → Release → Run workflow** and provide:
 
 | Input | Meaning |
 |---|---|
-| `tag` | Tag to publish, e.g. `v0.6.0` or `v0.6.0-rc.1` |
+| `tag` | Tag to publish, e.g. `v0.7.0` or `v0.7.0-rc.1` |
+| `summary` | Short title text after the version: `vX.Y.Z - <summary>` |
 | `prerelease` | Mark the release as a pre-release |
 | `draft` | Create it as a draft for review |
+
+If `summary` is empty, the workflow uses the annotated tag subject. If neither
+provides a summary, the title falls back to `vX.Y.Z - Release`.
 
 If the tag does not exist, `gh release create` creates it at the commit that was
 checked out. For a new release, this is normally the current `main` commit.

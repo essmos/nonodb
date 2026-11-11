@@ -465,7 +465,7 @@ unit and installation steps in [Operations](docs/operations.md#deployment-with-s
 Download the archive matching your CPU (`uname -m` prints `arm64` or `x86_64`):
 
 ```bash
-TAG=v0.6.0
+TAG=v0.7.0
 curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/nonodb-$TAG-macos-arm64.tar.gz"
 tar -xzf "nonodb-$TAG-macos-arm64.tar.gz"
 cd "nonodb-$TAG-macos-arm64"
@@ -645,7 +645,7 @@ results. Visit [liveapisec.com](https://liveapisec.com) to learn more.
 
 ## Status
 
-nonodb is an early-stage project (`0.6.0`). Its core storage, query, index,
+nonodb is an early-stage project (`0.7.0`). Its core storage, query, index,
 search, batching, security, snapshot, and operational paths are covered by unit,
 property-based, end-to-end, concurrency, crash, and large-data tests. The API
 may still change before a stable release.

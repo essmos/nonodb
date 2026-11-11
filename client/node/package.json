@@ -1,6 +1,6 @@
 {
   "name": "nonodb-client",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "Thin Node.js client for nonodb over Unix sockets or TCP/TLS",
   "license": "MIT",
   "type": "commonjs",
