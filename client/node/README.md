@@ -79,7 +79,7 @@ const rows = await db.sql(
 );
 ```
 
-SQL supports `SELECT`, `INSERT`, and `UPDATE` over one collection. `db.explainSql(query, params)`
+SQL supports `SELECT`, `INSERT`, `UPDATE`, and `DELETE` over one collection. `db.explainSql(query, params)`
 returns the selected `SELECT` plan. See [SQL queries](../../docs/sql.md).
 
 ## Batch lookups

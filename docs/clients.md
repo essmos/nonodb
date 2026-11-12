@@ -401,9 +401,10 @@ See [HTTP API: lookup](api.md#lookup) for the wire format.
 ## SQL
 
 SQL returns an array of result objects. Parameters are positional; use `?` or
-`$1` placeholders. `SELECT` is read-only; `INSERT` and `UPDATE` use the single
-writer and return `inserted`/`inserted_ids` or `matched`/`modified`.
-`explain_sql` returns the selected plan. See [SQL queries](sql.md) for the full
+`$1` placeholders. `SELECT` is read-only; `INSERT`, `UPDATE`, and `DELETE` use the single
+writer and return `inserted`/`inserted_ids`, `matched`/`modified`, or
+`deleted`. `UPDATE SET` supports document expressions. `explain_sql` returns
+the selected `SELECT` plan. See [SQL queries](sql.md) for the full
 grammar and limitations.
 
 Python:
@@ -421,9 +422,10 @@ inserted = db.sql(
     ["Ada", 36],
 )
 updated = db.sql(
-    "UPDATE users SET age = $1 WHERE name = $2",
-    [37, "Ada"],
+    "UPDATE users SET age = age + 1 WHERE name = $1",
+    ["Ada"],
 )
+deleted = db.sql("DELETE FROM users WHERE age < $1", [18])
 ```
 
 Rust:

@@ -894,19 +894,21 @@ impl Accumulator {
                 }
             }
             (Self::Min(current), "$min") => {
-                if current
-                    .as_ref()
-                    .map(|old| compare_value(value, old) == Ordering::Less)
-                    .unwrap_or(true)
+                if !value.is_null()
+                    && current
+                        .as_ref()
+                        .map(|old| compare_value(value, old) == Ordering::Less)
+                        .unwrap_or(true)
                 {
                     *current = Some(value.clone());
                 }
             }
             (Self::Max(current), "$max") => {
-                if current
-                    .as_ref()
-                    .map(|old| compare_value(value, old) == Ordering::Greater)
-                    .unwrap_or(true)
+                if !value.is_null()
+                    && current
+                        .as_ref()
+                        .map(|old| compare_value(value, old) == Ordering::Greater)
+                        .unwrap_or(true)
                 {
                     *current = Some(value.clone());
                 }
@@ -956,7 +958,7 @@ impl Accumulator {
                 *left_count = left_count.saturating_add(right_count);
             }
             (Self::Min(left), Self::Min(right)) => {
-                if let Some(value) = right {
+                if let Some(value) = right.filter(|value| !value.is_null()) {
                     if left
                         .as_ref()
                         .map(|current| compare_value(&value, current) == Ordering::Less)
@@ -967,7 +969,7 @@ impl Accumulator {
                 }
             }
             (Self::Max(left), Self::Max(right)) => {
-                if let Some(value) = right {
+                if let Some(value) = right.filter(|value| !value.is_null()) {
                     if left
                         .as_ref()
                         .map(|current| compare_value(&value, current) == Ordering::Greater)
@@ -1066,7 +1068,7 @@ fn decimal_arithmetic(op: &str, values: &[Value]) -> Result<Value> {
     numeric::decimal_value(&result)
 }
 
-fn eval_expr(doc: &Value, expr: &Value) -> Result<Value> {
+pub(crate) fn eval_expr(doc: &Value, expr: &Value) -> Result<Value> {
     match expr {
         Value::String(s) if s == "$$ROOT" || s == "$$CURRENT" => Ok(doc.clone()),
         Value::String(s) if s.starts_with('$') => {
@@ -1227,10 +1229,10 @@ fn eval_operator(doc: &Value, obj: &Map<String, Value>) -> Result<Value> {
                 None => Value::Null,
             })
         }
-        "$length" => {
+        "$length" | "$size" => {
             let values = args()?;
             if values.len() != 1 {
-                return Err(Error::Query("$length requires one argument".into()));
+                return Err(Error::Query(format!("{op} requires one argument")));
             }
             Ok(match &values[0] {
                 Value::String(s) => Value::from(s.chars().count()),
@@ -1269,6 +1271,28 @@ fn eval_operator(doc: &Value, obj: &Map<String, Value>) -> Result<Value> {
                 }),
                 None => Value::Null,
             })
+        }
+        "$setDifference" => {
+            let values = args()?;
+            if values.len() != 2 {
+                return Err(Error::Query("$setDifference requires two arrays".into()));
+            }
+            let (Value::Array(left), Value::Array(right)) = (&values[0], &values[1]) else {
+                return Err(Error::Query("$setDifference requires arrays".into()));
+            };
+            let mut removed = HashSet::new();
+            for value in right {
+                removed.insert(serde_json::to_string(value)?);
+            }
+            let mut seen = HashSet::new();
+            let mut out = Vec::new();
+            for value in left {
+                let key = serde_json::to_string(value)?;
+                if !removed.contains(&key) && seen.insert(key) {
+                    out.push(value.clone());
+                }
+            }
+            Ok(Value::Array(out))
         }
         "$abs" | "$ceil" | "$floor" | "$round" => {
             let values = args()?;

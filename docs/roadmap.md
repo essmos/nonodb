@@ -5,7 +5,7 @@ is deliberately out of scope, and which gaps are candidates for future work.
 
 ## Current status
 
-The project is at `0.14.0`. It is suitable for local and single-host
+The project is at `0.15.0`. It is suitable for local and single-host
 applications that need a small, durable, queryable JSON store and can accept a
 single-writer model.
 
@@ -13,11 +13,12 @@ Implemented:
 
 - JSON documents, collections, automatic UUID `_id`;
 - MongoDB-style filters, projections, sorts, `skip`/`limit`;
-- SQL `SELECT`, `INSERT`, and `UPDATE` over one collection; `SELECT` supports
-  `DISTINCT`, `WHERE`, `GROUP BY`, `HAVING`, aggregates, `CASE`, scalar
-  functions, `ORDER BY`, `LIMIT`/`OFFSET`, positional parameters, and
-  `explain_sql`; simple field-only queries use the normal indexed `find` path,
-  while writes use the single writer and are atomic per statement;
+- SQL `SELECT`, `INSERT`, `UPDATE`, and `DELETE` over one collection; `SELECT`
+  supports `DISTINCT`, `WHERE`, `GROUP BY`, `HAVING`, aggregates including
+  `COUNT(DISTINCT field)`, `CASE`, scalar functions, `ORDER BY`,
+  `LIMIT`/`OFFSET`, positional parameters, and `explain_sql`; simple field-only
+  queries use the normal indexed `find` path, while writes use the single writer
+  and are atomic per statement, including `UPDATE SET` expressions;
 - CRUD, multi-update, replacement updates, upserts;
 - `$set`, `$unset`, `$inc`, `$push`, `$pull`, `$pullAll`, `$addToSet`,
   `$setOnInsert`, `$each`, `$position`, `$slice`, `$sort`;
@@ -80,8 +81,8 @@ Implemented:
 - No joins. `lookup` is a point/batch lookup, not a general join, and requires a
   matching unique index for non-`_id` keys. Non-unique lookups are not supported.
 - SQL covers one collection. Joins, subqueries, scalar expressions in grouped
-  `SELECT`, `DELETE`, `RETURNING`, `INSERT ... SELECT`, and `UPDATE ... FROM`
-  are not supported yet. `COUNT(DISTINCT field)` is not supported yet.
+  `SELECT`, `RETURNING`, `INSERT ... SELECT`, and `UPDATE ... FROM` are not
+  supported yet. Aggregate `DISTINCT` is limited to `COUNT(DISTINCT field)`.
 - No stored procedures or daemon plugins. Background jobs and outbox events are
   ordinary client processes. `watch` long-polls or streams append-only outbox
   collections; it is not an automatic change stream for arbitrary writes,

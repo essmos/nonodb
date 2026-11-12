@@ -23,6 +23,13 @@ pub static WATCH_EVENTS: AtomicU64 = AtomicU64::new(0);
 pub static WATCH_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
 pub static WATCH_TRUNCATED: AtomicU64 = AtomicU64::new(0);
 pub static WATCH_HEARTBEATS: AtomicU64 = AtomicU64::new(0);
+/// SQL statement counters and total execution time.
+pub static SQL_SELECT: AtomicU64 = AtomicU64::new(0);
+pub static SQL_INSERT: AtomicU64 = AtomicU64::new(0);
+pub static SQL_UPDATE: AtomicU64 = AtomicU64::new(0);
+pub static SQL_DELETE: AtomicU64 = AtomicU64::new(0);
+pub static SQL_ERRORS: AtomicU64 = AtomicU64::new(0);
+pub static SQL_DURATION_NS: AtomicU64 = AtomicU64::new(0);
 /// Number of operations executed in `/v1/batch` requests.
 pub static BATCH_OPS: AtomicU64 = AtomicU64::new(0);
 pub static WRITE_OPS: AtomicU64 = AtomicU64::new(0);
@@ -68,6 +75,21 @@ pub fn sub(counter: &AtomicU64, n: u64) {
     let _ = counter.try_update(Relaxed, Relaxed, |v| Some(v.saturating_sub(n)));
 }
 
+pub fn record_sql(kind: &str, elapsed: std::time::Duration, ok: bool) {
+    let counter = match kind {
+        "select" => &SQL_SELECT,
+        "insert" => &SQL_INSERT,
+        "update" => &SQL_UPDATE,
+        "delete" => &SQL_DELETE,
+        _ => &SQL_SELECT,
+    };
+    inc(counter);
+    add(&SQL_DURATION_NS, elapsed.as_nanos() as u64);
+    if !ok {
+        inc(&SQL_ERRORS);
+    }
+}
+
 pub fn snapshot() -> Value {
     let batches = WRITE_BATCHES.load(Relaxed).max(1);
     let commit_ns = COMMIT_NS.load(Relaxed);
@@ -90,6 +112,12 @@ pub fn snapshot() -> Value {
         "watch_timeouts_total": WATCH_TIMEOUTS.load(Relaxed),
         "watch_truncated_total": WATCH_TRUNCATED.load(Relaxed),
         "watch_heartbeats_total": WATCH_HEARTBEATS.load(Relaxed),
+        "sql_select_total": SQL_SELECT.load(Relaxed),
+        "sql_insert_total": SQL_INSERT.load(Relaxed),
+        "sql_update_total": SQL_UPDATE.load(Relaxed),
+        "sql_delete_total": SQL_DELETE.load(Relaxed),
+        "sql_errors_total": SQL_ERRORS.load(Relaxed),
+        "sql_duration_ns_total": SQL_DURATION_NS.load(Relaxed),
         "batch_ops_total": BATCH_OPS.load(Relaxed),
         "write_ops_total": write_ops,
         "write_batches_total": WRITE_BATCHES.load(Relaxed),

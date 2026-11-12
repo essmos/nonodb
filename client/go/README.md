@@ -71,7 +71,7 @@ rows, err := db.SQL(ctx,
 )
 ```
 
-SQL supports `SELECT`, `INSERT`, and `UPDATE` over one collection. `db.ExplainSQL(ctx, query, params...)`
+SQL supports `SELECT`, `INSERT`, `UPDATE`, and `DELETE` over one collection. `db.ExplainSQL(ctx, query, params...)`
 returns the selected `SELECT` plan. See [SQL queries](../../docs/sql.md).
 
 ## Batch lookups

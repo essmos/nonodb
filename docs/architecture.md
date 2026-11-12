@@ -289,10 +289,12 @@ field-only selects skip the aggregation engine entirely and call the normal
 `find` path, inheriting its index bounds, early exit, and explain output.
 `explain_sql` returns either the find plan or the generated pipeline.
 
-`INSERT` and `UPDATE` are translated to `insert_one_txn` and the normal update
-operators. The writer executes each SQL write statement in its own isolated LMDB
-transaction, so a multi-row `INSERT` or a multi-document `UPDATE` is atomic and
-still goes through the single writer. SQL therefore shares index maintenance,
+`INSERT`, `UPDATE`, and `DELETE` are translated to `insert_one_txn`, the normal
+update operators, and `delete_txn`. `UPDATE SET` expressions are evaluated per
+document using the aggregation expression evaluator when they reference document
+fields. The writer executes each SQL write statement in its own isolated LMDB
+transaction, so a multi-row `INSERT`, a multi-document `UPDATE`, or a `DELETE` is
+atomic and still goes through the single writer. SQL therefore shares index maintenance,
 TTL handling, history, aggregation limits, and authorization with the JSON API.
 
 Updates resolve paths before writing. Numeric segments address array indexes;

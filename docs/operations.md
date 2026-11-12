@@ -40,6 +40,7 @@ All daemon configuration is through environment variables.
 | `NONODB_SCAN_WORKERS` | min(CPUs, 16) | Workers for parallel full scans/sorts; capped at 256 |
 | `NONODB_BACKFILL_WORKERS` | min(CPUs, 16) | Workers for index/text/fuzzy/vector backfill parsing; capped at 256 |
 | `NONODB_AGGREGATE_WORKERS` | min(CPUs, 16) | Workers for parallel order-independent `$group`; capped at 256 |
+| `NONODB_SQL_SLOW_MS` | `0` | Log SQL statements slower than this; `0` disables slow-SQL logging |
 | `NONODB_BLOCKING_THREADS` | `64` | Tokio blocking threads used by LMDB reads/writes |
 | `NONODB_CACHE_TTL` | `5` | Read-cache TTL in seconds; `0` disables the cache |
 | `NONODB_CACHE_ENTRIES` | `512` | Maximum number of cached read results |
@@ -231,7 +232,7 @@ Download the archive from the matching GitHub Release, verify its checksum, and
 install the two binaries:
 
 ```bash
-TAG=v0.14.0
+TAG=v0.15.0
 ARCHIVE="nonodb-$TAG-linux-x86_64.tar.gz"
 curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/$ARCHIVE"
 curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/$ARCHIVE.sha256"
@@ -293,7 +294,7 @@ Linux `amd64` and `arm64`. Pull a published tag:
 
 ```bash
 # Pin a version in production; latest tracks stable releases.
-docker pull ghcr.io/essmos/nonodb:0.14.0
+docker pull ghcr.io/essmos/nonodb:0.15.0
 ```
 
 If the GHCR package is private, log in before pulling:
@@ -339,7 +340,7 @@ docker run -d --name nonodb \
   --group-add "$(id -g)" \
   -v "$NONODB_AUTH_FILE:/etc/nonodb/auth.json:ro" \
   -v nonodb-data:/var/lib/nonodb \
-  ghcr.io/essmos/nonodb:0.14.0
+  ghcr.io/essmos/nonodb:0.15.0
 ```
 
 Verify it:
@@ -404,7 +405,7 @@ docker volume create nonodb-run
 docker run -d --name nonodb \
   -v nonodb-data:/var/lib/nonodb \
   -v nonodb-run:/run/nonodb \
-  ghcr.io/essmos/nonodb:0.14.0
+  ghcr.io/essmos/nonodb:0.15.0
 ```
 
 The client container mounts the same `nonodb-run` volume and sets:
@@ -433,7 +434,7 @@ docker run -d --name nonodb \
   -v "$NONODB_AUTH_FILE:/etc/nonodb/auth.json:ro" \
   -v /host/certs:/certs:ro \
   -v nonodb-data:/var/lib/nonodb \
-  ghcr.io/essmos/nonodb:0.14.0
+  ghcr.io/essmos/nonodb:0.15.0
 ```
 
 Without a certificate and key pair, TCP runs in plaintext and logs a warning.
@@ -447,7 +448,7 @@ Back up into a separate mounted directory:
 docker run --rm \
   -v nonodb-data:/var/lib/nonodb:ro \
   -v /host/backups:/backups \
-  ghcr.io/essmos/nonodb:0.14.0 \
+  ghcr.io/essmos/nonodb:0.15.0 \
   nonodb-cli backup /var/lib/nonodb /backups/$(date -u +%Y%m%dT%H%M%SZ)
 ```
 
@@ -613,6 +614,9 @@ Useful signals:
 | `watch_timeouts_total` | Long-poll watch requests that timed out |
 | `watch_truncated_total` | Watch requests with an expired resume cursor |
 | `watch_heartbeats_total` | Keepalive frames sent on streams |
+| `sql_select_total` / `sql_insert_total` / `sql_update_total` / `sql_delete_total` | SQL statements by category |
+| `sql_errors_total` | SQL parse/execution errors |
+| `sql_duration_ns_total` | Total SQL execution time in nanoseconds |
 | `index_builds` | Active/recent index backfills and processed/total/elapsed progress |
 | `auth_failures_total` | Failed authentication attempts |
 | `auth_blocks_total` | IP lockouts started |

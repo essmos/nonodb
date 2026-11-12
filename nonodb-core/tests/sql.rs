@@ -419,3 +419,91 @@ fn sql_statement_access_distinguishes_reads_and_writes() {
     )
     .is_err());
 }
+
+#[test]
+fn delete_statement_removes_matching_documents() {
+    let (_dir, store) = fixture();
+    let c = store.collection("users").unwrap();
+    let stmt = sql::PreparedSql::parse("DELETE FROM users AS u WHERE u.team = $1").unwrap();
+    assert!(!stmt.is_read_only());
+    assert_eq!(stmt.kind(), sql::SqlKind::Delete);
+    let mut wtxn = store.write_txn().unwrap();
+    let out = stmt
+        .execute_write(&c, &mut wtxn, &[json!("kernel")])
+        .unwrap();
+    wtxn.commit().unwrap();
+    assert_eq!(out["deleted"], 2);
+    let rows = sql::execute(&c, "SELECT name FROM users ORDER BY name", &[]).unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            json!({"name": "Ada"}),
+            json!({"name": "Grace"}),
+            json!({"name": "Noor"}),
+        ]
+    );
+}
+
+#[test]
+fn update_set_supports_document_expressions() {
+    let (_dir, store) = fixture();
+    let c = store.collection("users").unwrap();
+    let stmt = sql::PreparedSql::parse(
+        "UPDATE users SET age = age + 1, score = COALESCE(score, 0) + $1 \
+         WHERE team = $2",
+    )
+    .unwrap();
+    let mut wtxn = store.write_txn().unwrap();
+    let out = stmt
+        .execute_write(&c, &mut wtxn, &[json!(5), json!("core")])
+        .unwrap();
+    wtxn.commit().unwrap();
+    assert_eq!(out["matched"], 3);
+    assert_eq!(out["modified"], 3);
+    let rows = sql::execute(
+        &c,
+        "SELECT name, age, COALESCE(score, 0) AS score FROM users \
+         WHERE team = 'core' ORDER BY name",
+        &[],
+    )
+    .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            json!({"name": "Ada", "age": 37, "score": 15}),
+            json!({"name": "Grace", "age": 32, "score": 25}),
+            json!({"name": "Noor", "age": 37, "score": 5}),
+        ]
+    );
+}
+
+#[test]
+fn count_distinct_aggregate_works() {
+    let (_dir, store) = fixture();
+    let c = store.collection("users").unwrap();
+    let rows = sql::execute(
+        &c,
+        "SELECT COUNT(DISTINCT team) AS teams, COUNT(DISTINCT city) AS cities FROM users",
+        &[],
+    )
+    .unwrap();
+    assert_eq!(rows, vec![json!({"teams": 2, "cities": 3})]);
+
+    let rows = sql::execute(
+        &c,
+        "SELECT team, COUNT(DISTINCT city) AS cities FROM users \
+         GROUP BY team ORDER BY team",
+        &[],
+    )
+    .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            json!({"team": "core", "cities": 2}),
+            json!({"team": "kernel", "cities": 2}),
+        ]
+    );
+
+    let err = sql::execute(&c, "SELECT SUM(DISTINCT score) FROM users", &[]).unwrap_err();
+    assert!(err.to_string().contains("only COUNT(DISTINCT"), "{err}");
+}

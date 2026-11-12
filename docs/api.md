@@ -107,7 +107,7 @@ client timeout with `NONODB_TIMEOUT` or the `timeout=` argument.
 | [`delete`](#delete) | Delete documents |
 | [`count`](#count) | Count matching documents |
 | [`aggregate`](#aggregation) | Read-only aggregation pipeline |
-| [`sql`](#sql) | SQL `SELECT`, `INSERT`, or `UPDATE` over one collection |
+| [`sql`](#sql) | SQL `SELECT`, `INSERT`, `UPDATE`, or `DELETE` over one collection |
 | [`explain_sql`](#explain_sql) | Show the plan for a SQL `SELECT` |
 | [`create_index`](#create_index) | Create a secondary index |
 | [`create_indexes`](#create_indexes) | Create several indexes in one scan |
@@ -844,8 +844,8 @@ preserves explicit multi-field order:
 
 ## sql
 
-Runs a SQL `SELECT`, `INSERT`, or `UPDATE` over one collection. The collection
-name is parsed from the statement for authorization.
+Runs a SQL `SELECT`, `INSERT`, `UPDATE`, or `DELETE` over one collection. The
+collection name is parsed from the statement for authorization.
 
 ```json
 {
@@ -875,20 +875,23 @@ Supported clauses and limitations are documented in [SQL queries](sql.md):
 - `WHERE` with comparisons, `AND`/`OR`/`NOT`, parentheses, `IN`, `BETWEEN`,
   `IS NULL`, and `LIKE`;
 - `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, and `OFFSET`;
-- aggregate functions `COUNT`, `SUM`, `AVG`, `MIN`, and `MAX`;
+- aggregate functions `COUNT`, `COUNT(DISTINCT field)`, `SUM`, `AVG`, `MIN`, and
+  `MAX`;
 - positional parameters with `?` or `$1`;
 - one collection, no joins or subqueries;
 - `INSERT INTO collection (columns...) VALUES (...)` with one or more rows;
-- `UPDATE collection SET column = value... [WHERE ...]`.
+- `UPDATE collection SET column = value... [WHERE ...]`, including expressions;
+- `DELETE FROM collection [WHERE ...]`.
 
 Simple field-only selects use the normal `find` path. Grouping, `DISTINCT`,
-computed expressions, and `HAVING` use the aggregation pipeline. `INSERT` and
-`UPDATE` run through the single writer in one isolated LMDB transaction and
-return `inserted`/`inserted_ids` or `matched`/`modified` inside `results`.
+computed expressions, and `HAVING` use the aggregation pipeline. `INSERT`, `UPDATE`, and
+`DELETE` run through the single writer in one isolated LMDB transaction and
+return `inserted`/`inserted_ids`, `matched`/`modified`, or `deleted` inside
+`results`.
 
 `SELECT` is read-only and can be used in a read `batch`; write statements are
-rejected there. `SELECT` requires `read:<collection>`, while `INSERT` and
-`UPDATE` require `write:<collection>`. Parse and planning errors return
+rejected there. `SELECT` requires `read:<collection>`, while `INSERT`, `UPDATE`, and `DELETE`
+require `write:<collection>`. Parse and planning errors return
 `invalid_sql` (HTTP 400). A missing collection returns an empty `results`
 array for `SELECT`.
 

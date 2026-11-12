@@ -76,7 +76,7 @@ let rows = client.sql(
 )?;
 ```
 
-SQL supports `SELECT`, `INSERT`, and `UPDATE` over one collection. `client.explain_sql(query, params)`
+SQL supports `SELECT`, `INSERT`, `UPDATE`, and `DELETE` over one collection. `client.explain_sql(query, params)`
 returns the selected `SELECT` plan. See [SQL queries](../docs/sql.md).
 
 ## Batch lookups

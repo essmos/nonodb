@@ -92,6 +92,7 @@ python3 scripts/explain_test.py
 
 echo "== SQL"
 python3 scripts/sql_test.py
+python3 scripts/sql_matrix_test.py
 
 echo "== Sub-database slots"
 python3 scripts/db_slots_test.py

@@ -5,7 +5,7 @@
 //! files and do not require a running daemon (backup/inspect open the database
 //! read-only).
 
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
 #[cfg(not(unix))]
 use std::net::TcpStream;
 #[cfg(unix)]
@@ -120,6 +120,8 @@ fn run() -> Result<(), String> {
             let res = http_post("/v1/exec", &json!({"op": "map_info"}))?;
             print_result(&res);
         }
+        "sql" => sql_cmd(&args[1..])?,
+        "shell" => sql_shell()?,
         "auth" => auth_cmd(&args[1..])?,
         "resize" => {
             let raw = args
@@ -263,6 +265,81 @@ fn print_report(report: &nonodb_core::VerificationReport) {
             coll.fuzzy_indexes.len()
         );
     }
+}
+
+fn sql_cmd(args: &[String]) -> Result<(), String> {
+    let mut query = None;
+    let mut file = None;
+    let mut params = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--param" => {
+                let raw = args.get(i + 1).ok_or("--param wymaga wartości")?;
+                params
+                    .push(serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.clone())));
+                i += 2;
+            }
+            "--file" => {
+                file = Some(args.get(i + 1).ok_or("--file wymaga ścieżki")?.to_string());
+                i += 2;
+            }
+            other if other.starts_with("--") => return Err(format!("nieznana opcja: {other}")),
+            other => {
+                if query.is_some() {
+                    return Err("sql przyjmuje jedno zapytanie; użyj --file dla pliku".into());
+                }
+                query = Some(other.to_string());
+                i += 1;
+            }
+        }
+    }
+    let query = match (query, file) {
+        (Some(_), Some(_)) => {
+            return Err("użyj zapytania albo --file, nie obu jednocześnie".into());
+        }
+        (Some(query), None) => query,
+        (None, Some(path)) => {
+            std::fs::read_to_string(&path).map_err(|e| format!("cannot read {path}: {e}"))?
+        }
+        (None, None) => {
+            return Err("użycie: nonodb-cli sql <zapytanie> [--param JSON]... [--file plik]".into())
+        }
+    };
+    let res = http_post(
+        "/v1/exec",
+        &json!({"op": "sql", "query": query, "params": params}),
+    )?;
+    print_result(&res);
+    Ok(())
+}
+
+fn sql_shell() -> Result<(), String> {
+    let stdin = std::io::stdin();
+    let mut lines = stdin.lock().lines();
+    loop {
+        eprint!("nonodb> ");
+        let Some(Ok(line)) = lines.next() else {
+            break;
+        };
+        let query = line.trim();
+        if query.is_empty() || query.starts_with("--") {
+            continue;
+        }
+        if matches!(query, ".quit" | ".exit" | "quit" | "exit" | "\\q") {
+            break;
+        }
+        let res = http_post(
+            "/v1/exec",
+            &json!({"op": "sql", "query": query, "params": []}),
+        )?;
+        if res.get("ok").and_then(Value::as_bool) == Some(true) {
+            println!("{}", serde_json::to_string_pretty(&res["result"]).unwrap());
+        } else {
+            eprintln!("{}", serde_json::to_string_pretty(&res).unwrap());
+        }
+    }
+    Ok(())
 }
 
 fn print_result(res: &Value) {

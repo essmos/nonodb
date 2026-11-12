@@ -140,11 +140,11 @@ def main() -> int:
         assert batch[2]["ok"] and batch[2]["result"]["access_path"] == "aggregation_distinct", batch
 
         try:
-            db.sql("DELETE FROM users")
+            db.sql("CREATE TABLE users (id INT)")
         except NonoDBError as exc:
             assert exc.code == "invalid_sql", exc
         else:
-            raise AssertionError("write SQL must be rejected")
+            raise AssertionError("DDL must be rejected")
 
         missing = db.sql("SELECT * FROM missing_collection")
         assert missing == [], missing

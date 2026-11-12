@@ -318,8 +318,9 @@ plan = db.explain_sql(
 )
 ```
 
-`sql` returns result objects. `SELECT` is read-only; `INSERT` and `UPDATE` use
-the single writer and return `inserted`/`inserted_ids` or `matched`/`modified`.
+`sql` returns result objects. `SELECT` is read-only; `INSERT`, `UPDATE`, and
+`DELETE` use the single writer and return `inserted`/`inserted_ids`,
+`matched`/`modified`, or `deleted`. `UPDATE SET` supports document expressions.
 `explain_sql` returns the selected `find` or aggregation plan for a `SELECT`.
 Parameters can use `?` or `$1` placeholders. See [SQL queries](sql.md) for the
 supported grammar, `DISTINCT`, `HAVING`, `CASE`, scalar functions, writes, and

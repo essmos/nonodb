@@ -73,6 +73,18 @@ fn index_build_timeout() -> Duration {
     })
 }
 
+fn sql_slow_threshold() -> Duration {
+    static THRESHOLD: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *THRESHOLD.get_or_init(|| {
+        std::env::var("NONODB_SQL_SLOW_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&ms| ms > 0)
+            .map(Duration::from_millis)
+            .unwrap_or_default()
+    })
+}
+
 fn request_timeout() -> Duration {
     static TIMEOUT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
     *TIMEOUT.get_or_init(|| {
@@ -1880,24 +1892,45 @@ async fn exec(
         }
 
         Request::Sql { query, params } => {
+            let started = Instant::now();
             let prepared = match nonodb_core::sql::PreparedSql::parse(&query) {
                 Ok(prepared) => prepared,
-                Err(err) => return respond(Err(ApiError::from(err))),
+                Err(err) => {
+                    metrics::inc(&metrics::SQL_ERRORS);
+                    return respond(Err(ApiError::from(err)));
+                }
             };
-            if !prepared.is_read_only() {
-                return submit_write(&state, WriteReq::Sql { query, params }).await;
+            let kind = prepared.kind();
+            let collection = prepared.collection().to_string();
+            let response = if !prepared.is_read_only() {
+                submit_write(&state, WriteReq::Sql { query, params }).await
+            } else {
+                let store = state.store.clone();
+                let auth = vault_auth.clone();
+                let joined = tokio::task::spawn_blocking(move || {
+                    let coll = prepared.collection().to_string();
+                    let c = read_collection(&store, &coll, auth.as_ref())?;
+                    reject_vault_read(&c, auth.as_ref(), "SQL")?;
+                    Ok::<Value, ApiError>(json!({
+                        "results": prepared.execute(&c, &params)?,
+                    }))
+                });
+                read_result(joined).await
+            };
+            let elapsed = started.elapsed();
+            let ok = response.1 .0.ok;
+            metrics::record_sql(kind.as_str(), elapsed, ok);
+            let slow = sql_slow_threshold();
+            if !slow.is_zero() && elapsed >= slow {
+                tracing::warn!(
+                    sql_kind = kind.as_str(),
+                    collection = %collection,
+                    duration_ms = elapsed.as_millis(),
+                    ok,
+                    "slow SQL statement"
+                );
             }
-            let store = state.store.clone();
-            let auth = vault_auth.clone();
-            let joined = tokio::task::spawn_blocking(move || {
-                let coll = prepared.collection().to_string();
-                let c = read_collection(&store, &coll, auth.as_ref())?;
-                reject_vault_read(&c, auth.as_ref(), "SQL")?;
-                Ok::<Value, ApiError>(json!({
-                    "results": prepared.execute(&c, &params)?,
-                }))
-            });
-            read_result(joined).await
+            response
         }
 
         Request::ExplainSql { query, params } => {

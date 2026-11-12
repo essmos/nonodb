@@ -4,7 +4,8 @@ NonoDB supports a practical SQL subset over one collection:
 
 - read-only `SELECT`;
 - one-collection `INSERT`;
-- one-collection `UPDATE`.
+- one-collection `UPDATE`;
+- one-collection `DELETE`.
 
 SQL is a translation layer on top of the normal storage paths, not a second
 storage engine. `SELECT` uses the same filters, indexes, TTL handling, LMDB
@@ -13,8 +14,8 @@ snapshots, aggregation limits, and authorization as the JSON API. `INSERT` and
 a statement is atomic and never bypasses indexes, TTL, history, or vault checks.
 
 Use SQL for reporting jobs, BI tools, ad-hoc operators, and simple maintenance.
-Use the JSON API for `DELETE`, `find_and_modify`, upserts, pipeline updates,
-joins, and features such as full-text, fuzzy, geo, and vector search.
+Use the JSON API for `find_and_modify`, upserts, pipeline updates, joins, and
+features such as full-text, fuzzy, geo, and vector search.
 
 ## SELECT
 
@@ -107,17 +108,48 @@ Response:
 `UPDATE` supports:
 
 - dotted assignment paths, e.g. `SET profile.level = 9`;
-- literal values and positional parameters;
+- literal values, positional parameters, and document expressions such as
+  `SET age = age + 1` or `SET name = LOWER(name)`;
 - `WHERE` using the same conditions as `SELECT`;
 - a table alias, e.g. `UPDATE users AS u SET u.age = $1 WHERE u.team = $2`.
 
-`UPDATE` affects every matching document. There is no `LIMIT` on `UPDATE`, no
-`RETURNING`, no upsert, and no `SET column = column + 1` expression syntax. Use
-the JSON API for those cases.
+`UPDATE` affects every matching document. Expressions are evaluated per
+document; statements that do not reference document fields use the normal
+single-statement update path. There is no `LIMIT` on `UPDATE`, no `RETURNING`,
+and no upsert. Use the JSON API for those cases.
 
 All assignments are applied in one writer transaction and `$set` semantics are
 used. `matched` is the number of matching documents; `modified` is the number
 whose stored value changed.
+
+## DELETE
+
+```json
+{
+  "op": "sql",
+  "query": "DELETE FROM users WHERE age < $1",
+  "params": [18]
+}
+```
+
+Response:
+
+```json
+{
+  "ok": true,
+  "result": {
+    "results": [
+      {
+        "deleted": 3
+      }
+    ]
+  }
+}
+```
+
+`DELETE` supports the same `WHERE` conditions and optional table aliases as
+`SELECT`/`UPDATE`. It deletes every matching document in one writer transaction.
+There is no `LIMIT`, `RETURNING`, or truncate shortcut.
 
 ## Supported SELECT syntax
 
@@ -252,8 +284,9 @@ SELECT DISTINCT team, COUNT(*) AS n FROM users GROUP BY team HAVING COUNT(*) > 1
 `SELECT DISTINCT *` is allowed but is effectively a no-op because `SELECT *`
 always includes the unique `_id`.
 
-`COUNT(DISTINCT field)` and other aggregate `DISTINCT` forms are not supported
-yet. Apply `DISTINCT` to the result instead, or use the aggregation API.
+`COUNT(DISTINCT field)` is supported and ignores missing/`NULL` values.
+`SUM(DISTINCT ...)`, `AVG(DISTINCT ...)`, `MIN(DISTINCT ...)`, and
+`MAX(DISTINCT ...)` are not supported yet.
 
 ### Projection semantics
 
@@ -310,12 +343,12 @@ same `access_path`, `index`, `bounds`, `candidates`, and actual counts as
 - A `WHERE` clause becomes a leading aggregation `$match`, so secondary
   indexes, `_id` ranges, and index-backed sorting can be used by the normal
   planner.
-- `INSERT` and `UPDATE` are executed by the daemon's single writer. Each SQL
-  write statement is isolated in its own transaction; a failed multi-row
-  `INSERT` or `UPDATE` rolls back entirely.
-- `INSERT` and `UPDATE` accept only standard collections, not vault collections.
+- `INSERT`, `UPDATE`, and `DELETE` are executed by the daemon's single writer.
+  Each SQL write statement is isolated in its own transaction; a failed
+  multi-row `INSERT`, `UPDATE`, or `DELETE` rolls back entirely.
+- SQL writes accept only standard collections, not vault collections.
 - SQL writes are not allowed inside a read `batch`; use a normal `sql` request.
-- `DELETE`, `CREATE`, `DROP`, transactions, joins, subqueries, `RETURNING`,
+- `CREATE`, `DROP`, transactions, joins, subqueries, `RETURNING`,
   `INSERT ... SELECT`, and `UPDATE ... FROM` are not supported.
 - One statement reads or writes one collection.
 - Scalar expressions in a grouped `SELECT` are not supported yet. Use a
@@ -334,7 +367,7 @@ same `access_path`, `index`, `bounds`, `candidates`, and actual counts as
 The collection name is parsed from the statement before execution.
 
 - `SELECT` and `explain_sql` require `read:<collection>`.
-- `INSERT` and `UPDATE` require `write:<collection>`.
+- `INSERT`, `UPDATE`, and `DELETE` require `write:<collection>`.
 
 A matching wildcard scope also works. Parse errors return `invalid_sql` with
 HTTP 400.
@@ -359,6 +392,7 @@ updated = db.sql(
     "UPDATE users SET age = $1 WHERE name = $2",
     [37, "Ada"],
 )
+deleted = db.sql("DELETE FROM users WHERE age < $1", [18])
 ```
 
 Rust:
@@ -411,6 +445,32 @@ curl -s --unix-socket /run/nonodb.sock \
   -d '{"op":"sql","query":"UPDATE users SET age = ? WHERE name = ?","params":[37,"Ada"]}'
 ```
 
+## CLI
+
+```bash
+nonodb-cli sql "SELECT team, COUNT(*) AS n FROM users GROUP BY team"
+nonodb-cli sql "SELECT name FROM users WHERE age >= $1" --param 18
+nonodb-cli sql --file report.sql
+nonodb-cli shell
+```
+
+See [Command-line interface](cli.md) for all options.
+
+## Metrics and slow SQL
+
+`GET /metrics` includes:
+
+- `sql_select_total`
+- `sql_insert_total`
+- `sql_update_total`
+- `sql_delete_total`
+- `sql_errors_total`
+- `sql_duration_ns_total`
+
+Set `NONODB_SQL_SLOW_MS` to a positive number to log statements slower than that
+threshold. The log includes the statement category, collection, duration, and
+success flag; it does not include parameters or document bodies.
+
 ## Error codes
 
 SQL parse and planning failures return `invalid_sql` (HTTP 400), for example:
@@ -426,5 +486,5 @@ SQL parse and planning failures return `invalid_sql` (HTTP 400), for example:
 ```
 
 Missing parameters, unsupported clauses, malformed values, invalid
-`GROUP BY`/`HAVING`/`ORDER BY` references, and write attempts inside a read
-batch all use this code.
+`GROUP BY`/`HAVING`/`ORDER BY` references, failed write statements, and write
+attempts inside a read batch all use this code.

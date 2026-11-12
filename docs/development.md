@@ -148,8 +148,8 @@ The latest run: **5 auth-crate tests, 135 core unit tests, 23 daemon tests, 5
 property tests, 15 date tests, 11 numeric tests, 8 BSON scalar-type tests, 5
 regex tests, 5 array query tests, 5 array-update tests, 5 find-and-modify tests,
 4 explain tests, 3 sub-database slot tests, 5 online-resize tests, 6
-backup-verification tests, 9 TTL tests, 3 vault tests, 17 SQL tests, 1 reopen
-test, and 2 Rust client unit tests**, all passing (287 total including
+backup-verification tests, 9 TTL tests, 3 vault tests, 20 SQL tests, 2 SQL parser fuzz tests, 1 reopen
+test, and 2 Rust client unit tests**, all passing (292 total including
 doc-tests).
 
 ### End-to-end scripts
@@ -174,6 +174,7 @@ python3 scripts/array_updates_test.py        # positional/array-filter updates
 python3 scripts/find_and_modify_test.py      # atomic select-update-return
 python3 scripts/explain_test.py              # plans, bounds, actual counts
 python3 scripts/sql_test.py                  # SQL SELECT/INSERT/UPDATE/distinct/having/explain/params/batch (spawns a daemon)
+python3 scripts/sql_matrix_test.py           # exhaustive SQL matrix, concurrency, restart, metrics, CLI (spawns a daemon)
 PYTHONPATH=client:workers/python python3 workers/python/examples/jobs_smoke.py  # jobs
 PYTHONPATH=client:workers/python python3 workers/python/examples/events_smoke.py  # events
 python3 workers/python/tests/events_integration.py  # events against a spawned daemon
@@ -370,12 +371,12 @@ The tag is `vX.Y.Z`; the annotated tag subject and GitHub Release title are
 
 ```bash
 # final release
-git tag -a v0.14.0 -m "v0.14.0 - SQL writes and DISTINCT"
-git push origin v0.14.0
+git tag -a v0.15.0 -m "v0.15.0 - SQL delete, expressions, and hardening"
+git push origin v0.15.0
 
 # pre-release (the hyphen makes it a GitHub pre-release automatically)
-git tag -a v0.14.0-beta.1 -m "v0.14.0-beta.1 - SQL writes and DISTINCT"
-git push origin v0.14.0-beta.1
+git tag -a v0.15.0-beta.1 -m "v0.15.0-beta.1 - SQL delete, expressions, and hardening"
+git push origin v0.15.0-beta.1
 ```
 
 The release workflow reads the tag annotation and publishes the release with
@@ -397,7 +398,7 @@ notes. `--cleanup=verbatim` prevents Git from stripping lines that start with
 The workflow runs the tests, builds release binaries for Linux x86_64, macOS
 Intel, macOS Apple Silicon, and Windows x86_64, attaches checksums, and
 publishes the GitHub Release. Linux and macOS use `.tar.gz`; Windows uses
-`.zip`. Tags such as `v0.14.0-beta.1` and `v0.14.0-rc.1` are marked as
+`.zip`. Tags such as `v0.15.0-beta.1` and `v0.15.0-rc.1` are marked as
 pre-releases automatically.
 
 ### Manual release
@@ -406,7 +407,7 @@ Use **Actions → Release → Run workflow** and provide:
 
 | Input | Meaning |
 |---|---|
-| `tag` | Tag to publish, e.g. `v0.14.0` or `v0.14.0-rc.1` |
+| `tag` | Tag to publish, e.g. `v0.15.0` or `v0.15.0-rc.1` |
 | `summary` | Short title text after the version: `vX.Y.Z - <summary>` |
 | `prerelease` | Mark the release as a pre-release |
 | `draft` | Create it as a draft for review |

@@ -62,6 +62,30 @@ nonodb-cli find users '{"tenant":"acme"}' --sort created_at:desc --skip 40 --lim
 The filter must come before options. Defaults: no filter, `limit=100`, `skip=0`.
 The output is pretty-printed JSON.
 
+## sql
+
+Run a SQL statement through the daemon:
+
+```bash
+nonodb-cli sql "SELECT team, COUNT(*) AS n FROM users GROUP BY team"
+nonodb-cli sql "SELECT name FROM users WHERE age >= $1" --param 18
+nonodb-cli sql --file report.sql
+```
+
+`--param` is repeatable and accepts JSON values; unquoted values are treated as
+strings. `--file` reads the statement from a file. The command prints the
+`result` envelope and exits non-zero on an error.
+
+Use `shell` for an interactive line-oriented SQL prompt:
+
+```bash
+nonodb-cli shell
+nonodb> SELECT COUNT(*) AS n FROM users;
+nonodb> .quit
+```
+
+Each line is one statement. Use `.quit`, `.exit`, `quit`, or `exit` to leave.
+
 ## indexes
 
 List secondary indexes for a collection:

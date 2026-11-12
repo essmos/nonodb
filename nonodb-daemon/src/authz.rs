@@ -253,8 +253,15 @@ mod tests {
         };
         assert!(authorize_request(&reader, &explain_denied).is_err());
 
+        let delete = Request::Sql {
+            query: "DELETE FROM orders WHERE id = $1".into(),
+            params: vec![json!(1)],
+        };
+        assert!(authorize_request(&principal(&["write:orders"]), &delete).is_ok());
+        assert!(authorize_request(&reader, &delete).is_err());
+
         let bad = Request::Sql {
-            query: "DELETE FROM orders".into(),
+            query: "CREATE TABLE orders (id INT)".into(),
             params: vec![],
         };
         let err = authorize_request(&reader, &bad).unwrap_err();

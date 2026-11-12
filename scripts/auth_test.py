@@ -180,6 +180,16 @@ def main() -> None:
                 lambda: app.sql("UPDATE customers SET name = 'X' WHERE _id = 'c1'"),
                 "forbidden",
             )
+            assert app.sql(
+                "INSERT INTO orders (_id, total) VALUES ('sql_tmp', 1)"
+            )[0]["inserted"] == 1
+            assert app.sql(
+                "DELETE FROM orders WHERE _id = 'sql_tmp'"
+            )[0]["deleted"] == 1
+            expect_code(
+                lambda: reader.sql("DELETE FROM orders WHERE _id = 'o2'"),
+                "forbidden",
+            )
             expect_code(
                 lambda: app.collection("customers").insert({"name": "Grace"}),
                 "forbidden",

@@ -141,12 +141,13 @@ footprint.
 - Ordered `lookup` for up to 10,000 keys by `_id` or a unique single-field or
   compound index, with covering projections, `_id` exclusion, internal key
   deduplication, a 64 MiB response cap, and `null` for missing keys.
-- SQL `SELECT`, `INSERT`, and `UPDATE` over one collection. `SELECT` supports
-  `DISTINCT`, `WHERE`, `GROUP BY`, `HAVING`, aggregates, `CASE`, scalar
-  functions, `ORDER BY`, `LIMIT`/`OFFSET`, positional parameters, and
-  `explain_sql`; simple field-only queries use the normal indexed `find` path.
-  Writes use the single writer and are atomic per statement; there are no joins
-  or `DELETE` statements.
+- SQL `SELECT`, `INSERT`, `UPDATE`, and `DELETE` over one collection. `SELECT`
+  supports `DISTINCT`, `WHERE`, `GROUP BY`, `HAVING`, aggregates including
+  `COUNT(DISTINCT field)`, `CASE`, scalar functions, `ORDER BY`,
+  `LIMIT`/`OFFSET`, positional parameters, and `explain_sql`; simple field-only
+  queries use the normal indexed `find` path. Writes use the single writer and
+  are atomic per statement, including document expressions in `UPDATE SET`;
+  there are no joins.
 
 ### Writes and updates
 
@@ -431,7 +432,7 @@ listener, so the Windows daemon requires TCP plus `NONODB_AUTH_FILE`.
 Download, verify, and extract the x86_64 archive:
 
 ```bash
-TAG=v0.14.0
+TAG=v0.15.0
 curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/nonodb-$TAG-linux-x86_64.tar.gz"
 curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/nonodb-$TAG-linux-x86_64.tar.gz.sha256"
 sha256sum -c "nonodb-$TAG-linux-x86_64.tar.gz.sha256"
@@ -500,7 +501,7 @@ unit and installation steps in [Operations](docs/operations.md#deployment-with-s
 Download the archive matching your CPU (`uname -m` prints `arm64` or `x86_64`):
 
 ```bash
-TAG=v0.14.0
+TAG=v0.15.0
 ARCHIVE="nonodb-$TAG-macos-arm64.tar.gz"   # use macos-x86_64 on Intel
 curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/$ARCHIVE"
 curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/$ARCHIVE.sha256"
@@ -595,7 +596,7 @@ The Docker workflow publishes versioned images to GitHub Container Registry for
 Linux `amd64` and `arm64`. Pull a published tag:
 
 ```bash
-docker pull ghcr.io/essmos/nonodb:0.14.0
+docker pull ghcr.io/essmos/nonodb:0.15.0
 ```
 
 Pin a version in production. The `latest` tag follows stable releases. If the
@@ -621,7 +622,7 @@ docker run -d --name nonodb \
   --group-add "$(id -g)" \
   -v "$NONODB_AUTH_FILE:/etc/nonodb/auth.json:ro" \
   -v nonodb-data:/var/lib/nonodb \
-  ghcr.io/essmos/nonodb:0.14.0
+  ghcr.io/essmos/nonodb:0.15.0
 ```
 
 Check health and logs:
@@ -673,7 +674,7 @@ More deployment details: [Operations — Docker](docs/operations.md#docker).
 |---|---|
 | [Architecture](docs/architecture.md) | Daemon model, LMDB layout, write path, indexes, search, concurrency, crash safety |
 | [HTTP API](docs/api.md) | Every operation, request/response shapes, filters, updates, indexes, search, errors |
-| [SQL queries](docs/sql.md) | `SELECT`, `INSERT`, `UPDATE`, `DISTINCT`, `HAVING`, `CASE`, functions, aggregates, `explain_sql`, parameters, limits, client examples |
+| [SQL queries](docs/sql.md) | `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `DISTINCT`, `HAVING`, `CASE`, functions, aggregates, `explain_sql`, parameters, limits, client examples |
 | [Clients](docs/clients.md) | Python, Rust, Node.js and Go clients: install, CRUD, batches, indexes, search, TCP/TLS |
 | [Migration and import](docs/migration.md) | MongoDB, PostgreSQL, SQLite and CSV migration, NDJSON format, import manifest, cutover |
 | [Authentication and permissions](docs/auth.md) | Principals, scopes, tokens, certificates, lockout, reloads, audit log |
@@ -727,7 +728,7 @@ results. Visit [liveapisec.com](https://liveapisec.com) to learn more.
 
 ## Status
 
-nonodb is an early-stage project (`0.14.0`). Its core storage, query, index,
+nonodb is an early-stage project (`0.15.0`). Its core storage, query, index,
 search, batching, security, snapshot, and operational paths are covered by unit,
 property-based, end-to-end, concurrency, crash, and large-data tests. The API
 may still change before a stable release.

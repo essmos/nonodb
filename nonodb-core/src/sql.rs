@@ -10,10 +10,31 @@ use std::collections::{HashMap, HashSet};
 
 use serde_json::{json, Map, Value};
 
+use crate::aggregate;
 use crate::collection::{Collection, FindQuery};
 use crate::error::{Error, Result};
 use crate::heed::{RoTxn, RwTxn};
 use crate::query::path;
+
+/// SQL statement category used by authorization and metrics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SqlKind {
+    Select,
+    Insert,
+    Update,
+    Delete,
+}
+
+impl SqlKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Select => "select",
+            Self::Insert => "insert",
+            Self::Update => "update",
+            Self::Delete => "delete",
+        }
+    }
+}
 
 /// A parsed SQL statement that can be executed or explained.
 #[derive(Debug, Clone)]
@@ -35,6 +56,10 @@ impl PreparedSql {
     /// True when the statement is a `SELECT`.
     pub fn is_read_only(&self) -> bool {
         self.parsed.is_read_only()
+    }
+
+    pub fn kind(&self) -> SqlKind {
+        self.parsed.kind()
     }
 
     /// Execute a `SELECT` against the collection's normal read path. Simple
@@ -78,6 +103,7 @@ impl PreparedSql {
         match &self.parsed {
             ParsedStatement::Insert(insert) => insert.execute(c, wtxn, params),
             ParsedStatement::Update(update) => update.execute(c, wtxn, params),
+            ParsedStatement::Delete(delete) => delete.execute(c, wtxn, params),
             ParsedStatement::Select(_) => Err(Error::Sql("statement is not a write".into())),
         }
     }
@@ -123,6 +149,11 @@ pub fn statement_access(query: &str) -> Result<(String, bool)> {
     Ok((parsed.collection().to_string(), parsed.is_read_only()))
 }
 
+/// Return the statement category without parameter values.
+pub fn statement_kind(query: &str) -> Result<SqlKind> {
+    Ok(parse(query)?.kind())
+}
+
 /// Return whether a SQL statement only reads.
 pub fn is_read_only(query: &str) -> Result<bool> {
     Ok(parse(query)?.is_read_only())
@@ -163,6 +194,7 @@ enum ParsedStatement {
     Select(ParsedSql),
     Insert(InsertSql),
     Update(UpdateSql),
+    Delete(DeleteSql),
 }
 
 impl ParsedStatement {
@@ -171,11 +203,21 @@ impl ParsedStatement {
             Self::Select(parsed) => &parsed.collection,
             Self::Insert(parsed) => &parsed.collection,
             Self::Update(parsed) => &parsed.collection,
+            Self::Delete(parsed) => &parsed.collection,
         }
     }
 
     fn is_read_only(&self) -> bool {
         matches!(self, Self::Select(_))
+    }
+
+    fn kind(&self) -> SqlKind {
+        match self {
+            Self::Select(_) => SqlKind::Select,
+            Self::Insert(_) => SqlKind::Insert,
+            Self::Update(_) => SqlKind::Update,
+            Self::Delete(_) => SqlKind::Delete,
+        }
     }
 }
 
@@ -206,26 +248,92 @@ impl InsertSql {
 #[derive(Debug, Clone)]
 struct UpdateSql {
     collection: String,
-    assignments: Vec<(String, ValueExpr)>,
+    assignments: Vec<(String, ScalarExpr)>,
     filter: Option<WhereExpr>,
 }
 
 impl UpdateSql {
     fn execute(&self, c: &Collection<'_>, wtxn: &mut RwTxn<'_>, params: &[Value]) -> Result<Value> {
-        let mut set = Map::new();
-        for (field, value) in &self.assignments {
-            set.insert(field.clone(), value.resolve(params)?);
-        }
         let filter = match &self.filter {
             Some(expr) => expr.to_filter(params)?,
             None => json!({}),
         };
-        let out =
-            c.update_opts_txn_filtered(wtxn, &filter, &json!({ "$set": set }), true, false, &[])?;
+        let uses_document = self
+            .assignments
+            .iter()
+            .any(|(_, expr)| expr.uses_document());
+
+        if !uses_document {
+            let mut set = Map::new();
+            for (field, expr) in &self.assignments {
+                set.insert(field.clone(), expr.eval(&json!({}), params)?);
+            }
+            let out = c.update_opts_txn_filtered(
+                wtxn,
+                &filter,
+                &json!({ "$set": set }),
+                true,
+                false,
+                &[],
+            )?;
+            return Ok(json!({
+                "matched": out.matched,
+                "modified": out.modified,
+            }));
+        }
+
+        let docs = c.find_in(
+            wtxn,
+            &FindQuery {
+                filter,
+                projection: None,
+                sort: Vec::new(),
+                skip: 0,
+                limit: None,
+            },
+        )?;
+        let mut modified = 0usize;
+        for doc in &docs {
+            let mut set = Map::new();
+            for (field, expr) in &self.assignments {
+                set.insert(field.clone(), expr.eval(doc, params)?);
+            }
+            let id = doc
+                .get("_id")
+                .and_then(Value::as_str)
+                .ok_or(Error::InvalidId)?
+                .to_string();
+            let out = c.update_opts_txn_filtered(
+                wtxn,
+                &json!({ "_id": id }),
+                &json!({ "$set": set }),
+                false,
+                false,
+                &[],
+            )?;
+            modified += out.modified;
+        }
         Ok(json!({
-            "matched": out.matched,
-            "modified": out.modified,
+            "matched": docs.len(),
+            "modified": modified,
         }))
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DeleteSql {
+    collection: String,
+    filter: Option<WhereExpr>,
+}
+
+impl DeleteSql {
+    fn execute(&self, c: &Collection<'_>, wtxn: &mut RwTxn<'_>, params: &[Value]) -> Result<Value> {
+        let filter = match &self.filter {
+            Some(expr) => expr.to_filter(params)?,
+            None => json!({}),
+        };
+        let deleted = c.delete_txn(wtxn, &filter, true)?;
+        Ok(json!({ "deleted": deleted }))
     }
 }
 
@@ -263,6 +371,7 @@ enum SelectItem {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum AggregateKind {
     Count,
+    CountDistinct,
     Sum,
     Avg,
     Min,
@@ -505,6 +614,15 @@ impl ParsedSql {
         let filter = self.filter_value(params)?;
         let sort = self.source_sort_fields()?;
         let projection = self.project_stage(params)?;
+        // `find` keeps a long-standing special case where `{_id: 1}` alone is
+        // an exclusion projection. SQL must return only `_id`, so use the
+        // aggregation path for that shape instead.
+        if projection.as_ref().is_some_and(|p| {
+            p.as_object()
+                .is_some_and(|obj| obj.len() == 1 && obj.contains_key("_id"))
+        }) {
+            return Ok(None);
+        }
         Ok(Some(FindQuery {
             filter,
             projection,
@@ -803,7 +921,7 @@ impl ParsedSql {
                     let key = names[select_idx].clone();
                     select_idx += 1;
                     group.insert(key.clone(), aggregate_spec(*kind, field.as_deref())?);
-                    project.insert(key.clone(), json!(format!("${key}")));
+                    project.insert(key.clone(), aggregate_projection(*kind, &key));
                     output_map.insert(aggregate_key(*kind, field.as_deref()), key.clone());
                     if let Some(alias) = alias {
                         alias_to_agg.insert(alias.clone(), (*kind, field.clone()));
@@ -854,7 +972,7 @@ impl ParsedSql {
                 }
                 let key = unique_hidden_name("__sql_h", &mut used_names);
                 group.insert(key.clone(), aggregate_spec(kind, field.as_deref())?);
-                project.insert(key.clone(), json!(format!("${key}")));
+                project.insert(key.clone(), aggregate_projection(kind, &key));
                 output_map.insert(agg_key, key.clone());
                 hidden.push(key);
             }
@@ -1007,7 +1125,7 @@ fn aggregate_base_name(
     match alias {
         Some(a) => a.to_string(),
         None => match (kind, field) {
-            (AggregateKind::Count, _) => "count".to_string(),
+            (AggregateKind::Count | AggregateKind::CountDistinct, _) => "count".to_string(),
             (AggregateKind::Sum, Some(f)) => format!("sum_{}", sanitize_name(f)),
             (AggregateKind::Avg, Some(f)) => format!("avg_{}", sanitize_name(f)),
             (AggregateKind::Min, Some(f)) => format!("min_{}", sanitize_name(f)),
@@ -1022,6 +1140,7 @@ fn aggregate_key(kind: AggregateKind, field: Option<&str>) -> String {
         "{}:{}",
         match kind {
             AggregateKind::Count => "count",
+            AggregateKind::CountDistinct => "count_distinct",
             AggregateKind::Sum => "sum",
             AggregateKind::Avg => "avg",
             AggregateKind::Min => "min",
@@ -1046,6 +1165,30 @@ fn unique_hidden_name(base: &str, used: &mut HashSet<String>) -> String {
 }
 
 impl ScalarExpr {
+    fn uses_document(&self) -> bool {
+        match self {
+            Self::Field(_) | Self::Aggregate(..) => true,
+            Self::Unary { expr, .. } => expr.uses_document(),
+            Self::Binary { left, right, .. } => left.uses_document() || right.uses_document(),
+            Self::Call { args, .. } => args.iter().any(Self::uses_document),
+            Self::Case {
+                when_then,
+                else_expr,
+            } => {
+                when_then
+                    .iter()
+                    .any(|(when, then)| when.uses_document() || then.uses_document())
+                    || else_expr.as_deref().is_some_and(Self::uses_document)
+            }
+            Self::Literal(_) => false,
+        }
+    }
+
+    fn eval(&self, doc: &Value, params: &[Value]) -> Result<Value> {
+        let expr = self.to_agg(None, params)?;
+        aggregate::eval_expr(doc, &expr)
+    }
+
     fn to_agg(&self, fields: Option<&HashMap<String, String>>, params: &[Value]) -> Result<Value> {
         Ok(match self {
             Self::Literal(value) => json!({ "$literal": value.resolve(params)? }),
@@ -1407,6 +1550,14 @@ fn strip_scalar(expr: &mut ScalarExpr, alias: &str) {
     }
 }
 
+fn aggregate_projection(kind: AggregateKind, key: &str) -> Value {
+    if kind == AggregateKind::CountDistinct {
+        json!({ "$size": [ { "$setDifference": [ format!("${key}"), [null] ] } ] })
+    } else {
+        json!(format!("${key}"))
+    }
+}
+
 fn aggregate_spec(kind: AggregateKind, field: Option<&str>) -> Result<Value> {
     match kind {
         AggregateKind::Count => match field {
@@ -1415,6 +1566,11 @@ fn aggregate_spec(kind: AggregateKind, field: Option<&str>) -> Result<Value> {
                 "$sum": { "$cond": [ { "$ne": [ format!("${f}"), null ] }, 1, 0 ] }
             })),
         },
+        AggregateKind::CountDistinct => {
+            let f =
+                field.ok_or_else(|| Error::Sql("COUNT(DISTINCT ...) requires a field".into()))?;
+            Ok(json!({ "$addToSet": format!("${f}") }))
+        }
         AggregateKind::Sum | AggregateKind::Avg | AggregateKind::Min | AggregateKind::Max => {
             let f =
                 field.ok_or_else(|| Error::Sql("aggregate function requires a field".into()))?;
@@ -1423,7 +1579,7 @@ fn aggregate_spec(kind: AggregateKind, field: Option<&str>) -> Result<Value> {
                 AggregateKind::Avg => "$avg",
                 AggregateKind::Min => "$min",
                 AggregateKind::Max => "$max",
-                AggregateKind::Count => unreachable!(),
+                AggregateKind::Count | AggregateKind::CountDistinct => unreachable!(),
             };
             Ok(json!({ op: format!("${f}") }))
         }
@@ -1836,6 +1992,9 @@ impl Parser {
         if self.eat_kw("UPDATE") {
             return Ok(ParsedStatement::Update(self.parse_update()?));
         }
+        if self.eat_kw("DELETE") {
+            return Ok(ParsedStatement::Delete(self.parse_delete()?));
+        }
         self.expect_kw("SELECT")?;
         Ok(ParsedStatement::Select(self.parse_select()?))
     }
@@ -2007,7 +2166,10 @@ impl Parser {
                 return Err(Error::Sql(format!("duplicate UPDATE column `{field}`")));
             }
             self.expect_tok(&Tok::Eq)?;
-            let value = self.parse_value()?;
+            let mut value = self.parse_scalar_or()?;
+            if let Some(alias) = table_alias.as_deref() {
+                strip_scalar(&mut value, alias);
+            }
             assignments.push((field, value));
             if !self.eat_tok(&Tok::Comma) {
                 break;
@@ -2028,6 +2190,30 @@ impl Parser {
             assignments,
             filter,
         })
+    }
+
+    fn parse_delete(&mut self) -> Result<DeleteSql> {
+        self.expect_kw("FROM")?;
+        let collection = self.parse_ident()?;
+        let mut table_alias = None;
+        if self.eat_kw("AS") {
+            table_alias = Some(self.parse_ident()?);
+        } else if let Some(Tok::Ident(s) | Tok::QuotedIdent(s)) = self.peek_tok() {
+            if !is_reserved_keyword(s) {
+                table_alias = Some(self.parse_ident()?);
+            }
+        }
+        let mut filter = None;
+        if self.eat_kw("WHERE") {
+            filter = Some(self.parse_or()?);
+        }
+        if let (Some(alias), Some(filter)) = (table_alias.as_deref(), filter.as_mut()) {
+            let mut wrapped = Some(filter.clone());
+            strip_all(&mut wrapped, alias);
+            *filter = wrapped.expect("filter exists");
+        }
+        self.finish_statement()?;
+        Ok(DeleteSql { collection, filter })
     }
 
     fn finish_statement(&mut self) -> Result<()> {
@@ -2256,6 +2442,9 @@ impl Parser {
             self.expect_tok(&Tok::RParen)?;
             return Ok(expr);
         }
+        if let Some(Tok::QuotedIdent(_)) = self.peek_tok() {
+            return Ok(ScalarExpr::Field(self.parse_field()?));
+        }
         if let Some(Tok::Ident(name)) = self.peek_tok().cloned() {
             let upper = name.to_ascii_uppercase();
             if upper == "CASE" {
@@ -2266,17 +2455,21 @@ impl Parser {
             }
             if matches!(self.peek_n(1), Some(Tok::LParen)) {
                 self.pos += 2;
-                if let Some(kind) = aggregate_kind(&upper) {
+                if let Some(mut kind) = aggregate_kind(&upper) {
                     let field = if self.eat_tok(&Tok::Star) {
                         if kind != AggregateKind::Count {
                             return Err(Error::Sql(format!("{upper}(*) is not valid")));
                         }
                         None
                     } else {
-                        if self.eat_kw("DISTINCT") {
-                            return Err(Error::Sql(
-                                "aggregate DISTINCT is not supported yet".into(),
-                            ));
+                        let distinct = self.eat_kw("DISTINCT");
+                        if distinct {
+                            if kind != AggregateKind::Count {
+                                return Err(Error::Sql(
+                                    "only COUNT(DISTINCT field) is supported".into(),
+                                ));
+                            }
+                            kind = AggregateKind::CountDistinct;
                         }
                         Some(self.parse_field()?)
                     };
