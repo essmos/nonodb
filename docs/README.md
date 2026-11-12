@@ -8,6 +8,7 @@ quick-start instructions, and a feature overview.
 | Guide | Audience | Contents |
 |---|---|---|
 | [Architecture](architecture.md) | Maintainers, advanced users | Process model, LMDB layout, write path, indexes, search, aggregation, crash safety |
+| [GUI console](gui.md) | Operators, application developers | Embedded local React console, data editing, collection settings, SQL, map/metrics |
 | [HTTP API](api.md) | All client authors | Operations, request/response formats, filters, updates, aggregation, errors |
 | [SQL queries](sql.md) | Analysts, reporting jobs, application developers | `SELECT`, `INSERT`, `UPDATE`, `DELETE`, filters, aggregates, parameters, limits, client examples |
 | [Vault collections](vault.md) | Application developers, security reviewers | Optional whole-document encryption, tenant keys, restrictions, operations, key rotation |
@@ -36,6 +37,7 @@ quick-start instructions, and a feature overview.
 - **Download prebuilt binaries:** [README — Prebuilt binaries](../README.md#prebuilt-binaries)
 - **Run on Linux, macOS or Windows:** [README — Quick start](../README.md#quick-start)
 - **Run with Docker:** [README — Run with Docker](../README.md#run-with-docker)
+- **Open the local GUI:** [GUI console](gui.md)
 - **Pick a client:** [Clients](clients.md) — Python, Rust, Node.js, Go
 - **Run a SQL query or simple write:** [SQL queries](sql.md)
 - **Import data from another database:** [Migration and import](migration.md)

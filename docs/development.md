@@ -76,16 +76,22 @@ and [HTTP API](api.md).
 - Rust stable with Cargo and a C compiler for LMDB.
 - Linux or macOS for the Unix-socket daemon. Windows builds are TCP-only.
 - Python 3.9+ and `httpx` for client tests. `orjson` is optional.
-- Node.js 18+ for the Node client; Go 1.22+ for the Go client.
+- Node.js 22+ for the GUI and Node client; Go 1.22+ for the Go client.
 - For large benchmarks: enough disk space and a real filesystem (`ext4`), not
   tmpfs.
 
 ## Build
 
+Rebuild the embedded GUI assets before compiling the CLI:
+
 ```bash
+(cd gui && npm ci && npm run build)
 cargo build --release
 cargo build --release --examples
 ```
+
+CI and Docker build the GUI automatically before Cargo. A fresh checkout contains
+`gui/dist/.gitkeep`, so Cargo can compile even before the frontend build runs.
 
 Binaries:
 
@@ -188,6 +194,7 @@ python3 scripts/history_test.py              # per-collection history enable/dis
 python3 scripts/events_auto_test.py          # automatic collection events, field filters, thresholds, CLI
 python3 scripts/subscriptions_test.py        # persistent conditional subscriptions, count, once, SQL, restart
 python3 scripts/live_watch_test.py           # connection-scoped live mode, direct SSE delivery, no _events
+python3 scripts/gui_test.py                  # embedded GUI assets and local API proxy
 python3 scripts/vault_test.py                # optional vault encryption end-to-end
 python3 scripts/vault_regression_test.py     # vault API regressions
 python3 scripts/vault_bench.py --docs 5000   # standard vs vault performance
@@ -377,12 +384,12 @@ The tag is `vX.Y.Z`; the annotated tag subject and GitHub Release title are
 
 ```bash
 # final release
-git tag -a v0.18.0 -m "v0.18.0 - Automatic collection events"
-git push origin v0.18.0
+git tag -a v0.19.0 -m "v0.19.0 - Embedded GUI console"
+git push origin v0.19.0
 
 # pre-release (the hyphen makes it a GitHub pre-release automatically)
-git tag -a v0.18.0-beta.1 -m "v0.18.0-beta.1 - Automatic collection events"
-git push origin v0.18.0-beta.1
+git tag -a v0.19.0-beta.1 -m "v0.19.0-beta.1 - Embedded GUI console"
+git push origin v0.19.0-beta.1
 ```
 
 The release workflow reads the tag annotation and publishes the release with
@@ -404,7 +411,7 @@ notes. `--cleanup=verbatim` prevents Git from stripping lines that start with
 The workflow runs the tests, builds release binaries for Linux x86_64, macOS
 Intel, macOS Apple Silicon, and Windows x86_64, attaches checksums, and
 publishes the GitHub Release. Linux and macOS use `.tar.gz`; Windows uses
-`.zip`. Tags such as `v0.18.0-beta.1` and `v0.18.0-rc.1` are marked as
+`.zip`. Tags such as `v0.19.0-beta.1` and `v0.19.0-rc.1` are marked as
 pre-releases automatically.
 
 ### Manual release
@@ -413,7 +420,7 @@ Use **Actions → Release → Run workflow** and provide:
 
 | Input | Meaning |
 |---|---|
-| `tag` | Tag to publish, e.g. `v0.18.0` or `v0.18.0-rc.1` |
+| `tag` | Tag to publish, e.g. `v0.19.0` or `v0.19.0-rc.1` |
 | `summary` | Short title text after the version: `vX.Y.Z - <summary>` |
 | `prerelease` | Mark the release as a pre-release |
 | `draft` | Create it as a draft for review |

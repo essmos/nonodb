@@ -8,3 +8,5 @@ license.workspace = true
 nonodb-auth = { path = "../nonodb-auth" }
 nonodb-core = { path = "../nonodb-core" }
 serde_json.workspace = true
+rust-embed = { version = "8", features = ["interpolate-folder-path"] }
+mime_guess = "2"

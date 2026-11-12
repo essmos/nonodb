@@ -5,7 +5,7 @@ is deliberately out of scope, and which gaps are candidates for future work.
 
 ## Current status
 
-The project is at `0.18.0`. It is suitable for local and single-host
+The project is at `0.19.0`. It is suitable for local and single-host
 applications that need a small, durable, queryable JSON store and can accept a
 single-writer model.
 
@@ -50,6 +50,8 @@ Implemented:
   edge-triggered (`once`) mode;
 - connection-scoped live subscriptions (`watch` with `mode:"live"`) that push
   matching changes directly to SSE/NDJSON without writing to `_events`;
+- an embedded local web console (`nonodb-cli gui`) with document CRUD, collection
+  settings, indexes, SQL, map settings, and metrics;
 - per-collection append-only document revision history with retention (`0` disables);
 - document TTL with collection defaults, per-document overrides, and background expiry;
 - BSON-compatible dates with RFC 3339 input, UTC normalization, indexed ranges, and sorting;

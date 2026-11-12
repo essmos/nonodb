@@ -144,6 +144,9 @@ limitations are documented in [docs/roadmap.md](docs/roadmap.md).
 - [x] Add connection-scoped live subscriptions (`mode:"live"`) with direct
       SSE/NDJSON delivery, server heartbeat, disconnect cleanup, and no
       `_events` growth
+- [x] Add an embedded local GUI (`nonodb-cli gui`) with React, document CRUD,
+      collection settings, indexes, SQL, map settings, metrics, local API proxy,
+      CI/Docker asset builds, and an end-to-end GUI test
 
 ### P1 — lookup enhancements
 

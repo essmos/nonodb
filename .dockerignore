@@ -1,4 +1,6 @@
 target
+gui/node_modules
+gui/dist
 .git
 .github
 data

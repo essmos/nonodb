@@ -16,6 +16,22 @@ nonodb-cli <command> [arguments]
 
 Run `nonodb-cli help` for a summary.
 
+## gui
+
+Starts the embedded local web console and opens the browser:
+
+```bash
+nonodb-cli gui
+nonodb-cli gui --port 8788
+nonodb-cli gui --no-open
+nonodb-cli gui --host 0.0.0.0 --allow-remote
+```
+
+The server listens on `127.0.0.1` by default. Non-loopback binds require
+`--allow-remote` and should sit behind TLS/auth. It proxies `/v1/exec`,
+`/healthz`, and `/metrics` to the daemon. The React assets are embedded in the CLI binary. See
+[GUI console](gui.md).
+
 ## ping
 
 Check that the daemon is reachable and healthy:

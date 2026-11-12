@@ -446,7 +446,7 @@ listener, so the Windows daemon requires TCP plus `NONODB_AUTH_FILE`.
 Download, verify, and extract the x86_64 archive:
 
 ```bash
-TAG=v0.18.0
+TAG=v0.19.0
 curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/nonodb-$TAG-linux-x86_64.tar.gz"
 curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/nonodb-$TAG-linux-x86_64.tar.gz.sha256"
 sha256sum -c "nonodb-$TAG-linux-x86_64.tar.gz.sha256"
@@ -515,7 +515,7 @@ unit and installation steps in [Operations](docs/operations.md#deployment-with-s
 Download the archive matching your CPU (`uname -m` prints `arm64` or `x86_64`):
 
 ```bash
-TAG=v0.18.0
+TAG=v0.19.0
 ARCHIVE="nonodb-$TAG-macos-arm64.tar.gz"   # use macos-x86_64 on Intel
 curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/$ARCHIVE"
 curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/$ARCHIVE.sha256"
@@ -610,7 +610,7 @@ The Docker workflow publishes versioned images to GitHub Container Registry for
 Linux `amd64` and `arm64`. Pull a published tag:
 
 ```bash
-docker pull ghcr.io/essmos/nonodb:0.18.0
+docker pull ghcr.io/essmos/nonodb:0.19.0
 ```
 
 Pin a version in production. The `latest` tag follows stable releases. If the
@@ -636,7 +636,7 @@ docker run -d --name nonodb \
   --group-add "$(id -g)" \
   -v "$NONODB_AUTH_FILE:/etc/nonodb/auth.json:ro" \
   -v nonodb-data:/var/lib/nonodb \
-  ghcr.io/essmos/nonodb:0.18.0
+  ghcr.io/essmos/nonodb:0.19.0
 ```
 
 Check health and logs:
@@ -682,6 +682,27 @@ instead, use `docker build -t nonodb:local .` and set
 
 More deployment details: [Operations — Docker](docs/operations.md#docker).
 
+## GUI console
+
+`nonodb-cli` ships with an embedded local web console:
+
+```bash
+nonodb-cli gui
+```
+
+It opens `http://127.0.0.1:8787`, serves the embedded React application, and
+proxies API calls to the daemon over the local socket. For Docker, enable the
+optional GUI profile:
+
+```bash
+docker compose -f deploy/docker-compose.yml --profile gui up -d
+``` The GUI supports document
+browsing and editing, collection settings, TTL/history/events, secondary indexes,
+SQL, LMDB map settings, and metrics. Node.js is only needed to build the GUI, not
+to run it.
+
+See [GUI console](docs/gui.md).
+
 ## Documentation
 
 | Document | What it covers |
@@ -703,7 +724,8 @@ More deployment details: [Operations — Docker](docs/operations.md#docker).
 | [Dates and time zones](docs/dates.md) | BSON-compatible dates, RFC 3339 input, filtering, indexes, sorting |
 | [Numbers and decimals](docs/numerics.md) | Exact numeric comparison, Decimal128, arithmetic, NaN/Infinity, index compatibility, long text limits |
 | [BSON scalar types](docs/bson-types.md) | `$numberInt`/`$numberLong`, `$type`, binary/UUID, ObjectId, index compatibility |
-| [CLI](docs/cli.md) | `ping`, `find`, `count`, `map`, `resize`, auth management, backup/verify/restore, `exec` |
+| [GUI console](docs/gui.md) | Embedded local React console, data editing, collection settings, SQL, map/metrics |
+| [CLI](docs/cli.md) | `ping`, `gui`, `find`, `count`, `map`, `resize`, auth management, backup/verify/restore, `exec` |
 | [Operations](docs/operations.md) | Configuration, deployment, security, snapshots, monitoring, capacity, troubleshooting |
 | [Backup and restore](docs/backup.md) | Online backup, snapshots, verification, restore drills, retention, Docker, vault keys, authorization state |
 | [Benchmarks](docs/benchmarks.md) | Test environment, throughput, latency, large data sets, RAM, reproducibility |
@@ -743,7 +765,7 @@ results. Visit [liveapisec.com](https://liveapisec.com) to learn more.
 
 ## Status
 
-nonodb is an early-stage project (`0.18.0`). Its core storage, query, index,
+nonodb is an early-stage project (`0.19.0`). Its core storage, query, index,
 search, batching, security, snapshot, and operational paths are covered by unit,
 property-based, end-to-end, concurrency, crash, and large-data tests. The API
 may still change before a stable release.

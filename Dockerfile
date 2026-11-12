@@ -1,5 +1,12 @@
 # syntax=docker/dockerfile:1
 
+FROM node:22-slim AS gui
+WORKDIR /src/gui
+COPY gui/package.json gui/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+COPY gui ./
+RUN npm run build
+
 FROM rust:1-slim-bookworm AS builder
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
@@ -8,6 +15,7 @@ COPY nonodb-core ./nonodb-core
 COPY nonodb-daemon ./nonodb-daemon
 COPY nonodb-cli ./nonodb-cli
 COPY nonodb-client ./nonodb-client
+COPY --from=gui /src/gui/dist ./gui/dist
 RUN cargo build --release --bin nonodb-daemon --bin nonodb-cli
 
 FROM debian:bookworm-slim
@@ -22,6 +30,7 @@ ENV NONODB_DATA=/var/lib/nonodb \
     RUST_LOG=info
 
 USER nonodb
+EXPOSE 8787
 VOLUME ["/var/lib/nonodb"]
 # Gniazdo jest plikiem w /run/nonodb — montuj katalog, nie plik.
 CMD ["/usr/local/bin/nonodb-daemon"]

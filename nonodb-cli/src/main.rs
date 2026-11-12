@@ -16,6 +16,8 @@ use nonodb_core::heed::types::Bytes;
 use nonodb_core::heed::{CompactionOption, EnvFlags, EnvOpenOptions};
 use serde_json::{json, Value};
 
+mod gui;
+
 fn main() {
     if let Err(err) = run() {
         eprintln!("nonodb-cli: {err}");
@@ -29,6 +31,7 @@ fn run() -> Result<(), String> {
         return usage();
     };
     match cmd {
+        "gui" => gui::run(&args[1..])?,
         "ping" => {
             let res = http_get("/healthz")?;
             println!("{}", serde_json::to_string_pretty(&res).unwrap());
@@ -314,6 +317,7 @@ fn usage() -> Result<(), String> {
         "nonodb-cli <komenda>\n\
          \n\
          Komendy:\n\
+         gui [--port N] [--no-open]  lokalne GUI w przeglądarce\n\
          ping                       sprawdź daemona\n\
          exec '<json>'              dowolne żądanie /v1/exec\n\
          collections                lista kolekcji\n\

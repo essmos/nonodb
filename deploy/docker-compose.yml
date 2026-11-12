@@ -1,6 +1,6 @@
 services:
   nonodb:
-    image: ${NONODB_IMAGE:-ghcr.io/essmos/nonodb:0.18.0}
+    image: ${NONODB_IMAGE:-ghcr.io/essmos/nonodb:0.19.0}
     container_name: nonodb
     restart: unless-stopped
     environment:
@@ -13,6 +13,30 @@ services:
       - nonodb_auth
     volumes:
       - nonodb-data:/var/lib/nonodb
+      - nonodb-run:/run/nonodb
+
+  nonodb-gui:
+    image: ${NONODB_IMAGE:-ghcr.io/essmos/nonodb:0.19.0}
+    container_name: nonodb-gui
+    profiles: ["gui"]
+    restart: unless-stopped
+    command:
+      - nonodb-cli
+      - gui
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8787"
+      - --allow-remote
+      - --no-open
+    environment:
+      NONODB_SOCK: "/run/nonodb/nonodb.sock"
+      RUST_LOG: "info"
+    ports:
+      - "127.0.0.1:8787:8787"
+    depends_on:
+      - nonodb
+    volumes:
       - nonodb-run:/run/nonodb
 
 secrets:
