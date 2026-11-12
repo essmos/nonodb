@@ -32,7 +32,20 @@ pub fn authorize_request(principal: &Principal, req: &Request) -> Result<(), Api
         | Request::GetVersion { coll, .. }
         | Request::GetCollectionTtl { coll } => allow(principal, Action::Read, coll, req.op_name()),
 
-        Request::Sql { query, .. } | Request::ExplainSql { query, .. } => {
+        Request::Sql { query, .. } => {
+            let (coll, read_only) =
+                nonodb_core::sql::statement_access(query).map_err(|e| ApiError {
+                    code: "invalid_sql".into(),
+                    message: e.to_string(),
+                })?;
+            let action = if read_only {
+                Action::Read
+            } else {
+                Action::Write
+            };
+            allow(principal, action, &coll, req.op_name())
+        }
+        Request::ExplainSql { query, .. } => {
             let coll = nonodb_core::sql::collection_name(query).map_err(|e| ApiError {
                 code: "invalid_sql".into(),
                 message: e.to_string(),
@@ -215,6 +228,19 @@ mod tests {
             params: vec![],
         };
         assert!(authorize_request(&reader, &denied).is_err());
+
+        let write = Request::Sql {
+            query: "INSERT INTO orders (id) VALUES ($1)".into(),
+            params: vec![json!(1)],
+        };
+        assert!(authorize_request(&principal(&["write:orders"]), &write).is_ok());
+        assert!(authorize_request(&reader, &write).is_err());
+        let update = Request::Sql {
+            query: "UPDATE orders SET id = $1 WHERE id = $2".into(),
+            params: vec![json!(2), json!(1)],
+        };
+        assert!(authorize_request(&principal(&["write:orders"]), &update).is_ok());
+        assert!(authorize_request(&reader, &update).is_err());
 
         let explain = Request::ExplainSql {
             query: "SELECT * FROM orders".into(),

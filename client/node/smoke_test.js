@@ -31,6 +31,16 @@ async function main() {
   assert.equal(sqlRows[0].n, 3);
   const sqlPlan = await db.explainSql(`SELECT * FROM ${name} WHERE age >= $1`, [40]);
   assert.equal(typeof sqlPlan.access_path, 'string');
+  const sqlInsert = await db.sql(
+    `INSERT INTO ${name} (name, age) VALUES ($1, $2)`,
+    ['SQL', 22],
+  );
+  assert.equal(sqlInsert[0].inserted, 1);
+  const sqlUpdate = await db.sql(
+    `UPDATE ${name} SET age = $1 WHERE name = $2`,
+    [23, 'SQL'],
+  );
+  assert.deepEqual(sqlUpdate[0], { matched: 1, modified: 1 });
 
   const adults = await users.find(
     { age: { $gte: 40 } },

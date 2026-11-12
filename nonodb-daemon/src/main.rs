@@ -1880,15 +1880,22 @@ async fn exec(
         }
 
         Request::Sql { query, params } => {
+            let prepared = match nonodb_core::sql::PreparedSql::parse(&query) {
+                Ok(prepared) => prepared,
+                Err(err) => return respond(Err(ApiError::from(err))),
+            };
+            if !prepared.is_read_only() {
+                return submit_write(&state, WriteReq::Sql { query, params }).await;
+            }
             let store = state.store.clone();
             let auth = vault_auth.clone();
             let joined = tokio::task::spawn_blocking(move || {
-                let coll = nonodb_core::sql::collection_name(&query)?;
+                let coll = prepared.collection().to_string();
                 let c = read_collection(&store, &coll, auth.as_ref())?;
                 reject_vault_read(&c, auth.as_ref(), "SQL")?;
-                Ok::<Value, ApiError>(
-                    json!({ "results": nonodb_core::sql::execute(&c, &query, &params)? }),
-                )
+                Ok::<Value, ApiError>(json!({
+                    "results": prepared.execute(&c, &params)?,
+                }))
             });
             read_result(joined).await
         }
@@ -2669,6 +2676,11 @@ fn watch_status(
 }
 
 fn cacheable(req: &Request) -> bool {
+    if let Request::Sql { query, .. } = req {
+        if !nonodb_core::sql::is_read_only(query).unwrap_or(false) {
+            return false;
+        }
+    }
     matches!(
         req,
         Request::Find { .. }
@@ -2882,12 +2894,19 @@ fn execute_read(
             Ok(json!({ "results": c.aggregate_in(rtxn, &pipeline)? }))
         }
         Request::Sql { query, params } => {
-            let coll = nonodb_core::sql::collection_name(&query)?;
+            let prepared = nonodb_core::sql::PreparedSql::parse(&query)?;
+            if !prepared.is_read_only() {
+                return Err(ApiError {
+                    code: "invalid_sql".into(),
+                    message: "SQL writes are not allowed in a read batch".into(),
+                });
+            }
+            let coll = prepared.collection().to_string();
             let Some(c) = store.collection_at(rtxn, &coll)? else {
-                return Ok(json!([]));
+                return Ok(json!({ "results": [] }));
             };
             reject_vault_read(&c, None, "SQL in a read batch")?;
-            Ok(json!({ "results": nonodb_core::sql::execute_in(&c, rtxn, &query, &params)? }))
+            Ok(json!({ "results": prepared.execute_in(&c, rtxn, &params)? }))
         }
         Request::ExplainSql { query, params } => {
             let coll = nonodb_core::sql::collection_name(&query)?;

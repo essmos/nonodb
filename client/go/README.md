@@ -71,8 +71,8 @@ rows, err := db.SQL(ctx,
 )
 ```
 
-SQL is read-only and covers one collection. `db.ExplainSQL(ctx, query, params...)`
-returns the selected plan. See [SQL queries](../../docs/sql.md).
+SQL supports `SELECT`, `INSERT`, and `UPDATE` over one collection. `db.ExplainSQL(ctx, query, params...)`
+returns the selected `SELECT` plan. See [SQL queries](../../docs/sql.md).
 
 ## Batch lookups
 

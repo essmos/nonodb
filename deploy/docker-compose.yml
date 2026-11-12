@@ -1,6 +1,6 @@
 services:
   nonodb:
-    image: ${NONODB_IMAGE:-ghcr.io/essmos/nonodb:0.13.0}
+    image: ${NONODB_IMAGE:-ghcr.io/essmos/nonodb:0.14.0}
     container_name: nonodb
     restart: unless-stopped
     environment:

@@ -318,10 +318,23 @@ plan = db.explain_sql(
 )
 ```
 
-`sql` is read-only and returns result objects. `explain_sql` returns the
-selected `find` or aggregation plan. Parameters can use `?` or `$1`
-placeholders. See [SQL queries](sql.md) for the supported `SELECT` grammar,
-`DISTINCT`, `HAVING`, `CASE`, scalar functions, and limitations.
+`sql` returns result objects. `SELECT` is read-only; `INSERT` and `UPDATE` use
+the single writer and return `inserted`/`inserted_ids` or `matched`/`modified`.
+`explain_sql` returns the selected `find` or aggregation plan for a `SELECT`.
+Parameters can use `?` or `$1` placeholders. See [SQL queries](sql.md) for the
+supported grammar, `DISTINCT`, `HAVING`, `CASE`, scalar functions, writes, and
+limitations.
+
+```python
+inserted = db.sql(
+    "INSERT INTO users (name, age) VALUES ($1, $2)",
+    ["Ada", 36],
+)
+updated = db.sql(
+    "UPDATE users SET age = $1 WHERE name = $2",
+    [37, "Ada"],
+)
+```
 
 ## Cursors
 

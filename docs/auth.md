@@ -82,8 +82,8 @@ version make the file invalid.
 
 | Scope | Allows |
 |---|---|
-| `read:<collection>` | find, find_one, lookup, count, aggregate, sql, explain_sql, explain, search, fuzzy, vector search, history, get_version, get_collection_ttl, list indexes |
-| `write:<collection>` | insert, insert_many, update, find_and_modify, delete |
+| `read:<collection>` | find, find_one, lookup, count, aggregate, SQL `SELECT`, explain_sql, explain, search, fuzzy, vector search, history, get_version, get_collection_ttl, list indexes |
+| `write:<collection>` | insert, insert_many, update, find_and_modify, delete, SQL `INSERT`/`UPDATE` |
 | `admin:<collection>` | create/drop collection, create/drop secondary/text/fuzzy/vector index, set collection TTL |
 | `admin:db` | map_info, resize_map, `/metrics` |
 | `read:*` / `write:*` / `admin:*` | The action on every collection |

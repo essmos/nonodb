@@ -309,3 +309,113 @@ fn explain_uses_find_for_simple_selects_and_pipeline_for_groups() {
     assert_eq!(plan["has_having"], true, "{plan}");
     assert!(plan["pipeline"].as_array().is_some_and(|p| !p.is_empty()));
 }
+
+#[test]
+fn distinct_can_combine_with_group_by_and_having() {
+    let (_dir, store) = fixture();
+    let c = store.collection("users").unwrap();
+
+    let rows = sql::execute(
+        &c,
+        "SELECT DISTINCT team, COUNT(*) AS n FROM users GROUP BY team HAVING COUNT(*) > 2",
+        &[],
+    )
+    .unwrap();
+    assert_eq!(rows, vec![json!({"team": "core", "n": 3})]);
+
+    let rows = sql::execute(
+        &c,
+        "SELECT DISTINCT team FROM users GROUP BY team HAVING COUNT(*) >= 2 ORDER BY team",
+        &[],
+    )
+    .unwrap();
+    assert_eq!(
+        rows,
+        vec![json!({"team": "core"}), json!({"team": "kernel"})]
+    );
+
+    let rows = sql::execute(&c, "SELECT DISTINCT * FROM users WHERE team = 'core'", &[]).unwrap();
+    assert_eq!(rows.len(), 3);
+}
+
+#[test]
+fn insert_and_update_statements_write_documents() {
+    let (_dir, store) = fixture();
+    let c = store.collection("users").unwrap();
+
+    let insert = sql::PreparedSql::parse(
+        "INSERT INTO users (name, age, team, profile.score) \
+         VALUES ('New', 20, 'ops', 5), ('Other', ?, 'ops', 7)",
+    )
+    .unwrap();
+    assert!(!insert.is_read_only());
+    let mut wtxn = store.write_txn().unwrap();
+    let out = insert.execute_write(&c, &mut wtxn, &[json!(30)]).unwrap();
+    wtxn.commit().unwrap();
+    assert_eq!(out["inserted"], 2);
+    assert_eq!(out["inserted_ids"].as_array().unwrap().len(), 2);
+
+    let rows = sql::execute(
+        &c,
+        "SELECT name, age, profile.score AS score FROM users WHERE team = 'ops' ORDER BY name",
+        &[],
+    )
+    .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            json!({"name": "New", "age": 20, "score": 5}),
+            json!({"name": "Other", "age": 30, "score": 7}),
+        ]
+    );
+
+    let update = sql::PreparedSql::parse(
+        "UPDATE users AS u SET u.age = $1, u.profile.score = $2 WHERE u.team = $3",
+    )
+    .unwrap();
+    assert!(!update.is_read_only());
+    let mut wtxn = store.write_txn().unwrap();
+    let out = update
+        .execute_write(&c, &mut wtxn, &[json!(40), json!(9), json!("ops")])
+        .unwrap();
+    wtxn.commit().unwrap();
+    assert_eq!(out["matched"], 2);
+    assert_eq!(out["modified"], 2);
+
+    let rows = sql::execute(
+        &c,
+        "SELECT name, age, profile.score AS score FROM users WHERE team = 'ops' ORDER BY name",
+        &[],
+    )
+    .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            json!({"name": "New", "age": 40, "score": 9}),
+            json!({"name": "Other", "age": 40, "score": 9}),
+        ]
+    );
+
+    let err = sql::execute(&c, "UPDATE users SET age = 1", &[]).unwrap_err();
+    assert!(err.to_string().contains("not a SELECT"), "{err}");
+}
+
+#[test]
+fn sql_statement_access_distinguishes_reads_and_writes() {
+    assert!(sql::is_read_only("SELECT * FROM users").unwrap());
+    assert!(!sql::is_read_only("INSERT INTO users (name) VALUES ('Ada')").unwrap());
+    assert!(!sql::is_read_only("UPDATE users SET name = 'Ada'").unwrap());
+    assert_eq!(
+        sql::statement_access("UPDATE users SET name = 'Ada'").unwrap(),
+        ("users".to_string(), false)
+    );
+    assert!(sql::explain(
+        &Store::open(TempDir::new().unwrap().path())
+            .unwrap()
+            .collection("users")
+            .unwrap(),
+        "INSERT INTO users (name) VALUES ('Ada')",
+        &[]
+    )
+    .is_err());
+}

@@ -429,6 +429,18 @@ fn execute(
             let existed = c.drop_vector_index_txn(wtxn, field)?;
             Ok(json!({ "dropped": existed, "kind": "vector" }))
         }
+        WriteReq::Sql { query, params } => {
+            let prepared = nonodb_core::sql::PreparedSql::parse(query)?;
+            if prepared.is_read_only() {
+                return Err(ApiError {
+                    code: "invalid_sql".into(),
+                    message: "SQL writes require INSERT or UPDATE".into(),
+                });
+            }
+            let c = standard_collection(store, wtxn, prepared.collection())?;
+            let result = prepared.execute_write(&c, wtxn, params)?;
+            Ok(json!({ "results": [result] }))
+        }
         WriteReq::Batch { ops } => {
             let mut results = Vec::with_capacity(ops.len());
             for (idx, op) in ops.iter().enumerate() {

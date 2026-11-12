@@ -1,15 +1,22 @@
-# SQL queries
+# SQL queries and writes
 
-NonoDB supports a **read-only SQL `SELECT`** over one collection. SQL is a
-translation layer on top of the normal read path, not a second storage engine:
-it uses the same filters, indexes, TTL handling, LMDB snapshots, aggregation
-limits, authorization, and response encoding as the JSON API.
+NonoDB supports a practical SQL subset over one collection:
 
-Use SQL when a reporting job, BI tool, or ad-hoc operator already speaks SQL.
-Use the JSON API for writes, aggregation stages that SQL does not expose, and
-features such as full-text, fuzzy, geo, and vector search.
+- read-only `SELECT`;
+- one-collection `INSERT`;
+- one-collection `UPDATE`.
 
-## Request
+SQL is a translation layer on top of the normal storage paths, not a second
+storage engine. `SELECT` uses the same filters, indexes, TTL handling, LMDB
+snapshots, aggregation limits, and authorization as the JSON API. `INSERT` and
+`UPDATE` run through the normal single writer and one LMDB write transaction, so
+a statement is atomic and never bypasses indexes, TTL, history, or vault checks.
+
+Use SQL for reporting jobs, BI tools, ad-hoc operators, and simple maintenance.
+Use the JSON API for `DELETE`, `find_and_modify`, upserts, pipeline updates,
+joins, and features such as full-text, fuzzy, geo, and vector search.
+
+## SELECT
 
 ```json
 {
@@ -37,7 +44,82 @@ Response:
 be `?` or `$1`-style; `$1` is the first parameter. Do not mix the two styles in
 one statement.
 
-## Supported syntax
+## INSERT
+
+```json
+{
+  "op": "sql",
+  "query": "INSERT INTO users (name, age, team) VALUES ('Ada', $1, 'core'), ('Grace', 31, 'core')",
+  "params": [36]
+}
+```
+
+Response:
+
+```json
+{
+  "ok": true,
+  "result": {
+    "results": [
+      {
+        "inserted": 2,
+        "inserted_ids": ["...", "..."]
+      }
+    ]
+  }
+}
+```
+
+`INSERT` requires a column list. Columns may be dotted paths such as
+`profile.city`; missing intermediate objects are created. Values may be string,
+number, boolean, `NULL`, or positional parameters. A multi-row `INSERT` is
+atomic: if any row fails, the whole statement is rolled back.
+
+`_id` may be supplied explicitly with a string value. If omitted, NonoDB
+generates the normal UUID `_id`.
+
+## UPDATE
+
+```json
+{
+  "op": "sql",
+  "query": "UPDATE users SET age = $1, active = TRUE WHERE team = $2",
+  "params": [37, "core"]
+}
+```
+
+Response:
+
+```json
+{
+  "ok": true,
+  "result": {
+    "results": [
+      {
+        "matched": 3,
+        "modified": 3
+      }
+    ]
+  }
+}
+```
+
+`UPDATE` supports:
+
+- dotted assignment paths, e.g. `SET profile.level = 9`;
+- literal values and positional parameters;
+- `WHERE` using the same conditions as `SELECT`;
+- a table alias, e.g. `UPDATE users AS u SET u.age = $1 WHERE u.team = $2`.
+
+`UPDATE` affects every matching document. There is no `LIMIT` on `UPDATE`, no
+`RETURNING`, no upsert, and no `SET column = column + 1` expression syntax. Use
+the JSON API for those cases.
+
+All assignments are applied in one writer transaction and `$set` semantics are
+used. `matched` is the number of matching documents; `modified` is the number
+whose stored value changed.
+
+## Supported SELECT syntax
 
 ```sql
 SELECT [DISTINCT] select_list
@@ -143,8 +225,7 @@ Rules:
 
 - An aggregate function without `GROUP BY` returns one row.
 - Every non-aggregate selected field must appear in `GROUP BY`.
-- `SELECT *` cannot be combined with `GROUP BY`, aggregate functions, or
-  `DISTINCT`.
+- `SELECT *` cannot be combined with `GROUP BY` or aggregate functions.
 - `ORDER BY` in a grouped query must reference a selected output column. A
   `GROUP BY` field counts only when it is selected (possibly under an alias).
 - Aggregate output columns use the alias when provided. Otherwise generated
@@ -161,11 +242,18 @@ Rules:
 ```sql
 SELECT DISTINCT team FROM users ORDER BY team;
 SELECT DISTINCT LOWER(city) AS city FROM users WHERE city IS NOT NULL;
+SELECT DISTINCT team, COUNT(*) AS n FROM users GROUP BY team HAVING COUNT(*) > 1;
 ```
 
-`DISTINCT` is applied before `ORDER BY`, `OFFSET`, and `LIMIT`. It requires an
-explicit select list; `SELECT DISTINCT *` and `DISTINCT` with aggregates are not
-supported yet.
+`DISTINCT` is applied after `WHERE`, grouping, and `HAVING`, and before
+`ORDER BY`, `OFFSET`, and `LIMIT`. It can be combined with `GROUP BY` and
+`HAVING`.
+
+`SELECT DISTINCT *` is allowed but is effectively a no-op because `SELECT *`
+always includes the unique `_id`.
+
+`COUNT(DISTINCT field)` and other aggregate `DISTINCT` forms are not supported
+yet. Apply `DISTINCT` to the result instead, or use the aggregation API.
 
 ### Projection semantics
 
@@ -180,7 +268,7 @@ supported yet.
 
 ## EXPLAIN
 
-Use `explain_sql` to inspect the selected plan without changing the query:
+Use `explain_sql` to inspect the selected plan without executing the query:
 
 ```json
 {
@@ -210,6 +298,8 @@ same `access_path`, `index`, `bounds`, `candidates`, and actual counts as
 }
 ```
 
+`explain_sql` accepts only `SELECT`.
+
 ## Execution and limits
 
 - Simple field-only `SELECT` statements use `find` directly. They are **not**
@@ -220,25 +310,34 @@ same `access_path`, `index`, `bounds`, `candidates`, and actual counts as
 - A `WHERE` clause becomes a leading aggregation `$match`, so secondary
   indexes, `_id` ranges, and index-backed sorting can be used by the normal
   planner.
-- SQL is **read-only**. `INSERT`, `UPDATE`, `DELETE`, `CREATE`, `DROP`, and
-  transaction statements are rejected with `invalid_sql`.
-- One statement reads one collection. Joins and subqueries are not supported.
+- `INSERT` and `UPDATE` are executed by the daemon's single writer. Each SQL
+  write statement is isolated in its own transaction; a failed multi-row
+  `INSERT` or `UPDATE` rolls back entirely.
+- `INSERT` and `UPDATE` accept only standard collections, not vault collections.
+- SQL writes are not allowed inside a read `batch`; use a normal `sql` request.
+- `DELETE`, `CREATE`, `DROP`, transactions, joins, subqueries, `RETURNING`,
+  `INSERT ... SELECT`, and `UPDATE ... FROM` are not supported.
+- One statement reads or writes one collection.
 - Scalar expressions in a grouped `SELECT` are not supported yet. Use a
   selected `GROUP BY` field or an aggregate alias.
 - Ordering a grouped query by a `GROUP BY` field that is not selected is not
   supported yet.
-- Results are returned as an array of JSON objects. The same request limits and
-  timeouts as other read operations apply.
-- A missing collection returns an empty `results` array, consistent with
-  `aggregate`.
-- SQL and `explain_sql` are available in read `batch` operations. They are
-  cacheable in clients that enable the read cache.
+- A missing collection returns an empty `results` array for `SELECT`, consistent
+  with `aggregate`.
+- `SELECT` and `explain_sql` are available in read `batch` operations and are
+  cacheable in clients that enable the read cache. Write statements are never
+  cached.
+- SQL parse and planning failures return `invalid_sql` (HTTP 400).
 
 ## Authorization
 
-The collection name is parsed from the statement before execution. A principal
-must have `read:<collection>` (or a matching wildcard) for that collection.
-Parse errors return `invalid_sql` with HTTP 400.
+The collection name is parsed from the statement before execution.
+
+- `SELECT` and `explain_sql` require `read:<collection>`.
+- `INSERT` and `UPDATE` require `write:<collection>`.
+
+A matching wildcard scope also works. Parse errors return `invalid_sql` with
+HTTP 400.
 
 ## Client examples
 
@@ -252,6 +351,14 @@ rows = db.sql(
 plan = db.explain_sql(
     "SELECT team, COUNT(*) AS n FROM users GROUP BY team HAVING COUNT(*) > 1"
 )
+inserted = db.sql(
+    "INSERT INTO users (name, age) VALUES ($1, $2)",
+    ["Ada", 36],
+)
+updated = db.sql(
+    "UPDATE users SET age = $1 WHERE name = $2",
+    [37, "Ada"],
+)
 ```
 
 Rust:
@@ -261,9 +368,10 @@ let rows = db.sql(
     "SELECT team, COUNT(*) AS n FROM users GROUP BY team HAVING COUNT(*) > $1",
     &[json!(1)],
 )?;
-let plan = db.explain_sql(
-    "SELECT * FROM users WHERE age >= $1",
-    &[json!(18)],
+let plan = db.explain_sql("SELECT * FROM users WHERE age >= $1", &[json!(18)])?;
+let inserted = db.sql(
+    "INSERT INTO users (name, age) VALUES ($1, $2)",
+    &[json!("Ada"), json!(36)],
 )?;
 ```
 
@@ -271,9 +379,13 @@ Node.js:
 
 ```js
 const rows = await db.sql(
-  'SELECT CASE WHEN age >= 18 THEN \'adult\' ELSE \'minor\' END AS band FROM users',
+  "SELECT DISTINCT team FROM users GROUP BY team HAVING COUNT(*) > 1",
 );
 const plan = await db.explainSql('SELECT * FROM users WHERE age >= $1', [18]);
+const inserted = await db.sql(
+  'INSERT INTO users (name, age) VALUES ($1, $2)',
+  ['Ada', 36],
+);
 ```
 
 Go:
@@ -284,6 +396,10 @@ rows, err := db.SQL(ctx,
     1,
 )
 plan, err := db.ExplainSQL(ctx, "SELECT * FROM users WHERE age >= $1", 18)
+inserted, err := db.SQL(ctx,
+    "INSERT INTO users (name, age) VALUES ($1, $2)",
+    "Ada", 36,
+)
 ```
 
 ## Raw HTTP
@@ -292,7 +408,7 @@ plan, err := db.ExplainSQL(ctx, "SELECT * FROM users WHERE age >= $1", 18)
 curl -s --unix-socket /run/nonodb.sock \
   -H 'content-type: application/json' \
   -X POST http://localhost/v1/exec \
-  -d '{"op":"sql","query":"SELECT name, age FROM users WHERE age >= ? ORDER BY age DESC","params":[18]}'
+  -d '{"op":"sql","query":"UPDATE users SET age = ? WHERE name = ?","params":[37,"Ada"]}'
 ```
 
 ## Error codes
@@ -304,10 +420,11 @@ SQL parse and planning failures return `invalid_sql` (HTTP 400), for example:
   "ok": false,
   "error": {
     "code": "invalid_sql",
-    "message": "invalid SQL: expected keyword `SELECT`"
+    "message": "invalid SQL: expected keyword `SET`"
   }
 }
 ```
 
-Missing parameters, unsupported clauses, malformed values, and invalid
-`GROUP BY`/`HAVING`/`ORDER BY` references all use this code.
+Missing parameters, unsupported clauses, malformed values, invalid
+`GROUP BY`/`HAVING`/`ORDER BY` references, and write attempts inside a read
+batch all use this code.

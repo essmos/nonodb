@@ -76,8 +76,8 @@ let rows = client.sql(
 )?;
 ```
 
-SQL is read-only and covers one collection. `client.explain_sql(query, params)`
-returns the selected plan. See [SQL queries](../docs/sql.md).
+SQL supports `SELECT`, `INSERT`, and `UPDATE` over one collection. `client.explain_sql(query, params)`
+returns the selected `SELECT` plan. See [SQL queries](../docs/sql.md).
 
 ## Batch lookups
 

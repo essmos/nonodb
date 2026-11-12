@@ -400,9 +400,11 @@ See [HTTP API: lookup](api.md#lookup) for the wire format.
 
 ## SQL
 
-SQL is read-only and returns an array of result objects. Parameters are
-positional; use `?` or `$1` placeholders. `explain_sql` returns the selected
-plan. See [SQL queries](sql.md) for the full grammar and limitations.
+SQL returns an array of result objects. Parameters are positional; use `?` or
+`$1` placeholders. `SELECT` is read-only; `INSERT` and `UPDATE` use the single
+writer and return `inserted`/`inserted_ids` or `matched`/`modified`.
+`explain_sql` returns the selected plan. See [SQL queries](sql.md) for the full
+grammar and limitations.
 
 Python:
 
@@ -414,6 +416,14 @@ rows = db.sql(
 plan = db.explain_sql(
     "SELECT team, COUNT(*) AS n FROM users GROUP BY team HAVING COUNT(*) > 1"
 )
+inserted = db.sql(
+    "INSERT INTO users (name, age) VALUES ($1, $2)",
+    ["Ada", 36],
+)
+updated = db.sql(
+    "UPDATE users SET age = $1 WHERE name = $2",
+    [37, "Ada"],
+)
 ```
 
 Rust:
@@ -424,15 +434,23 @@ let rows = db.sql(
     &[json!(1)],
 )?;
 let plan = db.explain_sql("SELECT * FROM users WHERE age >= $1", &[json!(18)])?;
+let inserted = db.sql(
+    "INSERT INTO users (name, age) VALUES ($1, $2)",
+    &[json!("Ada"), json!(36)],
+)?;
 ```
 
 Node.js:
 
 ```js
 const rows = await db.sql(
-  "SELECT CASE WHEN age >= 18 THEN 'adult' ELSE 'minor' END AS band FROM users",
+  "SELECT DISTINCT team FROM users GROUP BY team HAVING COUNT(*) > 1",
 );
 const plan = await db.explainSql('SELECT * FROM users WHERE age >= $1', [18]);
+const inserted = await db.sql(
+  'INSERT INTO users (name, age) VALUES ($1, $2)',
+  ['Ada', 36],
+);
 ```
 
 Go:
@@ -443,6 +461,10 @@ rows, err := db.SQL(ctx,
     18,
 )
 plan, err := db.ExplainSQL(ctx, "SELECT * FROM users WHERE age >= $1", 18)
+inserted, err := db.SQL(ctx,
+    "INSERT INTO users (name, age) VALUES ($1, $2)",
+    "Ada", 36,
+)
 ```
 
 ## Vector search

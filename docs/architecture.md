@@ -280,17 +280,20 @@ comparator as `find`, and expressions reuse the path helpers used by filters and
 updates. `$addToSet` and grouping keys serialize values to canonical JSON
 strings for deduplication and grouping.
 
-SQL is a thin parser and translator in `nonodb-core/src/sql.rs`. A read-only
-`SELECT` becomes a normal aggregation pipeline: `WHERE` becomes a leading
-`$match`, `GROUP BY`/aggregates become `$group`, `DISTINCT` becomes a grouping
-stage, `HAVING` becomes a post-group `$match`, and expressions translate to
-aggregation expressions. The final stages project, sort, skip, and limit.
-Simple field-only selects skip the aggregation engine entirely and call the
-normal `find` path, inheriting its index bounds, early exit, and explain output.
-`explain_sql` returns either the find plan or the generated pipeline. SQL
-therefore shares the same index planning, snapshot, aggregation cap, and
-authorization path as the JSON API. SQL never bypasses the single-writer model
-because it cannot write.
+SQL is a thin parser and translator in `nonodb-core/src/sql.rs`. A `SELECT`
+becomes a normal aggregation pipeline: `WHERE` becomes a leading `$match`,
+`GROUP BY`/aggregates become `$group`, `DISTINCT` becomes a grouping stage,
+`HAVING` becomes a post-group `$match`, and expressions translate to aggregation
+expressions. The final stages project, distinct, sort, skip, and limit. Simple
+field-only selects skip the aggregation engine entirely and call the normal
+`find` path, inheriting its index bounds, early exit, and explain output.
+`explain_sql` returns either the find plan or the generated pipeline.
+
+`INSERT` and `UPDATE` are translated to `insert_one_txn` and the normal update
+operators. The writer executes each SQL write statement in its own isolated LMDB
+transaction, so a multi-row `INSERT` or a multi-document `UPDATE` is atomic and
+still goes through the single writer. SQL therefore shares index maintenance,
+TTL handling, history, aggregation limits, and authorization with the JSON API.
 
 Updates resolve paths before writing. Numeric segments address array indexes;
 `$` expands from the original update filter, `$[]` expands to every element,

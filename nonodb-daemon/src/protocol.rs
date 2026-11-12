@@ -523,6 +523,11 @@ pub enum WriteReq {
         coll: String,
         field: String,
     },
+    /// SQL `INSERT` or `UPDATE` executed in one writer transaction.
+    Sql {
+        query: String,
+        params: Vec<Value>,
+    },
     /// Atomic write batch (all or nothing).
     Batch {
         ops: Vec<WriteReq>,
@@ -633,7 +638,6 @@ impl Request {
             | Self::Explain { .. }
             | Self::Count { .. }
             | Self::Aggregate { .. }
-            | Self::Sql { .. }
             | Self::ExplainSql { .. }
             | Self::CursorFind { .. }
             | Self::CursorAggregate { .. }
@@ -650,6 +654,7 @@ impl Request {
             | Self::GetVersion { .. }
             | Self::ListCollections
             | Self::GetCollectionTtl { .. } => true,
+            Self::Sql { query, .. } => nonodb_core::sql::is_read_only(query).unwrap_or(false),
             Self::Batch { ops } => ops.iter().all(Self::is_read_only),
             _ => false,
         }
@@ -745,7 +750,7 @@ impl WriteReq {
     }
 
     pub(crate) fn is_atomic(&self) -> bool {
-        matches!(self, WriteReq::Batch { .. })
+        matches!(self, WriteReq::Batch { .. } | WriteReq::Sql { .. })
     }
 }
 

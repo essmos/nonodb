@@ -158,9 +158,28 @@ def main() -> None:
             )
             expect_code(lambda: reader.collection("customers").find({}), "forbidden")
             expect_code(lambda: reader.map_info(), "forbidden")
+            assert reader.sql("SELECT COUNT(*) AS n FROM orders")[0]["n"] == 1
+            expect_code(
+                lambda: reader.sql("UPDATE orders SET total = 99 WHERE _id = 'o1'"),
+                "forbidden",
+            )
+            expect_code(
+                lambda: reader.sql("INSERT INTO orders (total) VALUES (99)"),
+                "forbidden",
+            )
 
             # App: read/write orders, but not admin or another collection.
             app.collection("orders").insert({"_id": "o2", "total": 20})
+            updated = app.sql(
+                "UPDATE orders SET total = $1 WHERE _id = $2",
+                [11, "o1"],
+            )
+            assert updated[0]["matched"] == 1, updated
+            assert app.collection("orders").find_one({"_id": "o1"})["total"] == 11
+            expect_code(
+                lambda: app.sql("UPDATE customers SET name = 'X' WHERE _id = 'c1'"),
+                "forbidden",
+            )
             expect_code(
                 lambda: app.collection("customers").insert({"name": "Grace"}),
                 "forbidden",

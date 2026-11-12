@@ -57,6 +57,16 @@ func main() {
 	if err != nil || sqlPlan["access_path"] == nil {
 		log.Fatalf("explain_sql: %v %v", sqlPlan, err)
 	}
+	inserted, err := db.SQL(ctx,
+		fmt.Sprintf("INSERT INTO %s (name, age) VALUES ($1, $2)", name), "SQL", 22)
+	if err != nil || len(inserted) != 1 || inserted[0]["inserted"] != float64(1) {
+		log.Fatalf("sql insert: %v %v", inserted, err)
+	}
+	updated, err := db.SQL(ctx,
+		fmt.Sprintf("UPDATE %s SET age = $1 WHERE name = $2", name), 23, "SQL")
+	if err != nil || len(updated) != 1 || updated[0]["matched"] != float64(1) {
+		log.Fatalf("sql update: %v %v", updated, err)
+	}
 
 	limit := int64(2)
 	adults, err := users.Find(ctx, nonodb.FindQuery{

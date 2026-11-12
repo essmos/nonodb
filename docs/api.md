@@ -107,7 +107,7 @@ client timeout with `NONODB_TIMEOUT` or the `timeout=` argument.
 | [`delete`](#delete) | Delete documents |
 | [`count`](#count) | Count matching documents |
 | [`aggregate`](#aggregation) | Read-only aggregation pipeline |
-| [`sql`](#sql) | Read-only SQL `SELECT` over one collection |
+| [`sql`](#sql) | SQL `SELECT`, `INSERT`, or `UPDATE` over one collection |
 | [`explain_sql`](#explain_sql) | Show the plan for a SQL `SELECT` |
 | [`create_index`](#create_index) | Create a secondary index |
 | [`create_indexes`](#create_indexes) | Create several indexes in one scan |
@@ -844,8 +844,8 @@ preserves explicit multi-field order:
 
 ## sql
 
-Runs a read-only SQL `SELECT` over one collection. The collection name is
-parsed from the statement for authorization.
+Runs a SQL `SELECT`, `INSERT`, or `UPDATE` over one collection. The collection
+name is parsed from the statement for authorization.
 
 ```json
 {
@@ -877,13 +877,20 @@ Supported clauses and limitations are documented in [SQL queries](sql.md):
 - `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, and `OFFSET`;
 - aggregate functions `COUNT`, `SUM`, `AVG`, `MIN`, and `MAX`;
 - positional parameters with `?` or `$1`;
-- one collection, no joins, subqueries, or writes.
+- one collection, no joins or subqueries;
+- `INSERT INTO collection (columns...) VALUES (...)` with one or more rows;
+- `UPDATE collection SET column = value... [WHERE ...]`.
 
 Simple field-only selects use the normal `find` path. Grouping, `DISTINCT`,
-computed expressions, and `HAVING` use the aggregation pipeline. SQL is
-read-only and can be used in a read `batch`. Parse and planning errors return
+computed expressions, and `HAVING` use the aggregation pipeline. `INSERT` and
+`UPDATE` run through the single writer in one isolated LMDB transaction and
+return `inserted`/`inserted_ids` or `matched`/`modified` inside `results`.
+
+`SELECT` is read-only and can be used in a read `batch`; write statements are
+rejected there. `SELECT` requires `read:<collection>`, while `INSERT` and
+`UPDATE` require `write:<collection>`. Parse and planning errors return
 `invalid_sql` (HTTP 400). A missing collection returns an empty `results`
-array.
+array for `SELECT`.
 
 ## explain_sql
 
@@ -903,8 +910,8 @@ For simple field-only selects this is the normal `find` explain object, includin
 `access_path` (`aggregation_group`, `aggregation_distinct`, or `aggregation`)
 and the generated `pipeline`.
 
-`explain_sql` is read-only, available in read `batch`, cacheable, and requires
-`read:<collection>`.
+`explain_sql` accepts only `SELECT`, is available in read `batch`, cacheable,
+and requires `read:<collection>`.
 
 ## Cursors
 

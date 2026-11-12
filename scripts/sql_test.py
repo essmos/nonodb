@@ -215,8 +215,50 @@ def main() -> int:
             }
         ], rows
 
+        written = db.sql(
+            "INSERT INTO sql_write (name, age, team, profile.level) "
+            "VALUES ('Ada', 36, 'core', 3), ('Grace', $1, 'core', 4)",
+            [41],
+        )
+        assert written[0]["inserted"] == 2, written
+        assert len(written[0]["inserted_ids"]) == 2, written
+
+        updated = db.sql(
+            "UPDATE sql_write AS w SET w.age = $1, w.profile.level = $2 "
+            "WHERE w.name = $3",
+            [37, 9, "Ada"],
+        )
+        assert updated[0] == {"matched": 1, "modified": 1}, updated
+
+        rows = db.sql(
+            "SELECT name, age, profile.level AS level FROM sql_write ORDER BY name"
+        )
+        assert rows == [
+            {"name": "Ada", "age": 37, "level": 9},
+            {"name": "Grace", "age": 41, "level": 4},
+        ], rows
+
+        rejected = db.batch(
+            [
+                {
+                    "op": "sql",
+                    "query": "INSERT INTO sql_write (name) VALUES ('Batch')",
+                    "params": [],
+                }
+            ]
+        )
+        assert rejected[0]["ok"] is False, rejected
+        assert rejected[0]["error"]["code"] == "invalid_sql", rejected
+
+        try:
+            db.explain_sql("UPDATE sql_write SET age = 1")
+        except NonoDBError as exc:
+            assert exc.code == "invalid_sql", exc
+        else:
+            raise AssertionError("explain_sql must reject writes")
+
         db.close()
-        print("OK: SQL real-daemon 10k-row distinct/having/CASE/functions/index/explain/params/batch/errors")
+        print("OK: SQL real-daemon 10k-row distinct/having/CASE/functions/index/insert/update/explain/params/batch/errors")
         return 0
     finally:
         proc.terminate()

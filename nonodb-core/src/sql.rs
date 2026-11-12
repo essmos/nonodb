@@ -1,9 +1,10 @@
-//! Read-only SQL over document collections.
+//! SQL over document collections.
 //!
-//! The SQL layer is deliberately small and translates a SELECT statement into
-//! the same aggregation pipeline used by the JSON API. It is not a second
-//! storage engine: indexes, TTL filtering, LMDB snapshots, and aggregation
-//! limits are all inherited from the normal read path.
+//! `SELECT` translates to the same `find` and aggregation paths used by the
+//! JSON API. `INSERT` and `UPDATE` translate to the normal single-writer
+//! operations and stay inside one LMDB write transaction. This is not a second
+//! storage engine: indexes, TTL filtering, snapshots, and aggregation limits
+//! are inherited from the normal paths.
 
 use std::collections::{HashMap, HashSet};
 
@@ -11,12 +12,13 @@ use serde_json::{json, Map, Value};
 
 use crate::collection::{Collection, FindQuery};
 use crate::error::{Error, Result};
-use crate::heed::RoTxn;
+use crate::heed::{RoTxn, RwTxn};
+use crate::query::path;
 
-/// A parsed, read-only SQL statement that can be executed or explained.
+/// A parsed SQL statement that can be executed or explained.
 #[derive(Debug, Clone)]
 pub struct PreparedSql {
-    parsed: ParsedSql,
+    parsed: ParsedStatement,
 }
 
 impl PreparedSql {
@@ -27,61 +29,103 @@ impl PreparedSql {
     }
 
     pub fn collection(&self) -> &str {
-        &self.parsed.collection
+        self.parsed.collection()
     }
 
-    /// Execute against the collection's normal read path. Simple field-only
-    /// selects use `find` directly; grouping/distinct/expressions use the
-    /// aggregation pipeline.
+    /// True when the statement is a `SELECT`.
+    pub fn is_read_only(&self) -> bool {
+        self.parsed.is_read_only()
+    }
+
+    /// Execute a `SELECT` against the collection's normal read path. Simple
+    /// field-only selects use `find` directly; grouping/distinct/expressions
+    /// use the aggregation pipeline.
     pub fn execute(&self, c: &Collection<'_>, params: &[Value]) -> Result<Vec<Value>> {
-        if let Some(query) = self.parsed.fast_find(params)? {
+        let ParsedStatement::Select(parsed) = &self.parsed else {
+            return Err(Error::Sql("statement is not a SELECT".into()));
+        };
+        if let Some(query) = parsed.fast_find(params)? {
             c.find(&query)
         } else {
-            c.aggregate(&self.parsed.pipeline(params)?)
+            c.aggregate(&parsed.pipeline(params)?)
         }
     }
 
-    /// Execute inside an existing read transaction.
+    /// Execute a `SELECT` inside an existing read transaction.
     pub fn execute_in(
         &self,
         c: &Collection<'_>,
         rtxn: &RoTxn<'_>,
         params: &[Value],
     ) -> Result<Vec<Value>> {
-        if let Some(query) = self.parsed.fast_find(params)? {
+        let ParsedStatement::Select(parsed) = &self.parsed else {
+            return Err(Error::Sql("statement is not a SELECT".into()));
+        };
+        if let Some(query) = parsed.fast_find(params)? {
             c.find_in(rtxn, &query)
         } else {
-            c.aggregate_in(rtxn, &self.parsed.pipeline(params)?)
+            c.aggregate_in(rtxn, &parsed.pipeline(params)?)
+        }
+    }
+
+    /// Execute an `INSERT` or `UPDATE` inside the writer's transaction.
+    pub fn execute_write(
+        &self,
+        c: &Collection<'_>,
+        wtxn: &mut RwTxn<'_>,
+        params: &[Value],
+    ) -> Result<Value> {
+        match &self.parsed {
+            ParsedStatement::Insert(insert) => insert.execute(c, wtxn, params),
+            ParsedStatement::Update(update) => update.execute(c, wtxn, params),
+            ParsedStatement::Select(_) => Err(Error::Sql("statement is not a write".into())),
         }
     }
 
     /// Return the selected plan. Simple selects delegate to the normal
     /// `explain`; grouped/distinct/expression queries expose the SQL pipeline.
     pub fn explain(&self, c: &Collection<'_>, params: &[Value]) -> Result<Value> {
-        if let Some(query) = self.parsed.fast_find(params)? {
+        let ParsedStatement::Select(parsed) = &self.parsed else {
+            return Err(Error::Sql("only SELECT statements can be explained".into()));
+        };
+        if let Some(query) = parsed.fast_find(params)? {
             return c.explain(&query);
         }
-        self.parsed.explain_pipeline(params)
+        parsed.explain_pipeline(params)
     }
 
-    /// Explain inside an existing read transaction.
+    /// Explain a `SELECT` inside an existing read transaction.
     pub fn explain_in(
         &self,
         c: &Collection<'_>,
         rtxn: &RoTxn<'_>,
         params: &[Value],
     ) -> Result<Value> {
-        if let Some(query) = self.parsed.fast_find(params)? {
+        let ParsedStatement::Select(parsed) = &self.parsed else {
+            return Err(Error::Sql("only SELECT statements can be explained".into()));
+        };
+        if let Some(query) = parsed.fast_find(params)? {
             return c.explain_in(rtxn, &query);
         }
-        self.parsed.explain_pipeline(params)
+        parsed.explain_pipeline(params)
     }
 }
 
 /// Parse the collection name out of a SQL statement without needing parameter
 /// values. This is used for authorization and auditing before execution.
 pub fn collection_name(query: &str) -> Result<String> {
-    Ok(parse(query)?.collection)
+    Ok(parse(query)?.collection().to_string())
+}
+
+/// Return the target collection and whether the statement is read-only.
+pub fn statement_access(query: &str) -> Result<(String, bool)> {
+    let parsed = parse(query)?;
+    Ok((parsed.collection().to_string(), parsed.is_read_only()))
+}
+
+/// Return whether a SQL statement only reads.
+pub fn is_read_only(query: &str) -> Result<bool> {
+    Ok(parse(query)?.is_read_only())
 }
 
 /// Execute a read-only SELECT statement against one collection.
@@ -112,6 +156,77 @@ pub fn explain_in(
     params: &[Value],
 ) -> Result<Value> {
     PreparedSql::parse(query)?.explain_in(c, rtxn, params)
+}
+
+#[derive(Debug, Clone)]
+enum ParsedStatement {
+    Select(ParsedSql),
+    Insert(InsertSql),
+    Update(UpdateSql),
+}
+
+impl ParsedStatement {
+    fn collection(&self) -> &str {
+        match self {
+            Self::Select(parsed) => &parsed.collection,
+            Self::Insert(parsed) => &parsed.collection,
+            Self::Update(parsed) => &parsed.collection,
+        }
+    }
+
+    fn is_read_only(&self) -> bool {
+        matches!(self, Self::Select(_))
+    }
+}
+
+#[derive(Debug, Clone)]
+struct InsertSql {
+    collection: String,
+    columns: Vec<String>,
+    rows: Vec<Vec<ValueExpr>>,
+}
+
+impl InsertSql {
+    fn execute(&self, c: &Collection<'_>, wtxn: &mut RwTxn<'_>, params: &[Value]) -> Result<Value> {
+        let mut inserted_ids = Vec::with_capacity(self.rows.len());
+        for row in &self.rows {
+            let mut doc = json!({});
+            for (column, value) in self.columns.iter().zip(row) {
+                path::set(&mut doc, column, value.resolve(params)?)?;
+            }
+            inserted_ids.push(c.insert_one_txn(wtxn, doc)?);
+        }
+        Ok(json!({
+            "inserted": inserted_ids.len(),
+            "inserted_ids": inserted_ids,
+        }))
+    }
+}
+
+#[derive(Debug, Clone)]
+struct UpdateSql {
+    collection: String,
+    assignments: Vec<(String, ValueExpr)>,
+    filter: Option<WhereExpr>,
+}
+
+impl UpdateSql {
+    fn execute(&self, c: &Collection<'_>, wtxn: &mut RwTxn<'_>, params: &[Value]) -> Result<Value> {
+        let mut set = Map::new();
+        for (field, value) in &self.assignments {
+            set.insert(field.clone(), value.resolve(params)?);
+        }
+        let filter = match &self.filter {
+            Some(expr) => expr.to_filter(params)?,
+            None => json!({}),
+        };
+        let out =
+            c.update_opts_txn_filtered(wtxn, &filter, &json!({ "$set": set }), true, false, &[])?;
+        Ok(json!({
+            "matched": out.matched,
+            "modified": out.modified,
+        }))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -322,10 +437,10 @@ impl ParsedSql {
             .select
             .iter()
             .any(|item| matches!(item, SelectItem::Star))
-            && (self.grouped() || self.distinct)
+            && self.grouped()
         {
             return Err(Error::Sql(
-                "SELECT * cannot be combined with GROUP BY, aggregates, or DISTINCT".into(),
+                "SELECT * cannot be combined with GROUP BY or aggregates".into(),
             ));
         }
         if self.grouped()
@@ -343,12 +458,6 @@ impl ParsedSql {
                 "HAVING requires GROUP BY or an aggregate function".into(),
             ));
         }
-        if self.having.is_some() && self.distinct {
-            return Err(Error::Sql("DISTINCT with HAVING is not supported".into()));
-        }
-        if self.distinct && !self.group_by.is_empty() {
-            return Err(Error::Sql("DISTINCT with GROUP BY is not supported".into()));
-        }
         Ok(())
     }
 
@@ -357,6 +466,20 @@ impl ParsedSql {
             Some(expr) => expr.to_filter(params),
             None => Ok(json!({})),
         }
+    }
+
+    /// `SELECT DISTINCT *` is a no-op because `SELECT *` always includes the
+    /// unique `_id`. Keep `DISTINCT` for every other select list.
+    fn distinct_is_noop(&self) -> bool {
+        self.distinct
+            && self
+                .select
+                .iter()
+                .any(|item| matches!(item, SelectItem::Star))
+    }
+
+    fn effective_distinct(&self) -> bool {
+        self.distinct && !self.distinct_is_noop()
     }
 
     /// Simple field-only SELECTs can avoid the aggregation pipeline and its
@@ -369,7 +492,7 @@ impl ParsedSql {
             _ => false,
         });
         if self.grouped()
-            || self.distinct
+            || self.effective_distinct()
             || self.having.is_some()
             || needs_alias_projection
             || self
@@ -396,6 +519,7 @@ impl ParsedSql {
         let filter = self.filter_value(params)?;
         let filter_empty = matches!(&filter, Value::Object(map) if map.is_empty());
         let grouped = self.grouped();
+        let distinct = self.effective_distinct();
         let has_expr = self
             .select
             .iter()
@@ -418,6 +542,11 @@ impl ParsedSql {
             if !hidden.is_empty() {
                 stages.push(json!({ "$unset": hidden }));
             }
+            if distinct {
+                let names = self.output_names()?;
+                stages.push(self.output_distinct_group(&names));
+                stages.push(self.output_distinct_project(&names));
+            }
             if !self.order_by.is_empty() {
                 let names: HashSet<String> = output_map.values().cloned().collect();
                 stages.push(json!({ "$sort": self.sort_object(&names, true)? }));
@@ -428,7 +557,7 @@ impl ParsedSql {
             if let Some(limit) = self.limit {
                 stages.push(json!({ "$limit": limit }));
             }
-        } else if self.distinct {
+        } else if distinct {
             let (group_stage, project_stage, output_names) = self.distinct_stages(params)?;
             stages.push(group_stage);
             stages.push(project_stage);
@@ -485,12 +614,12 @@ impl ParsedSql {
             "collection": self.collection,
             "access_path": if self.grouped() {
                 "aggregation_group"
-            } else if self.distinct {
+            } else if self.effective_distinct() {
                 "aggregation_distinct"
             } else {
                 "aggregation"
             },
-            "distinct": self.distinct,
+            "distinct": self.effective_distinct(),
             "grouped": self.grouped(),
             "has_having": self.having.is_some(),
             "has_filter": filtered,
@@ -566,6 +695,23 @@ impl ParsedSql {
             project.insert("_id".into(), json!(0));
         }
         Ok(Some(Value::Object(project)))
+    }
+
+    fn output_distinct_group(&self, names: &[String]) -> Value {
+        let mut id = Map::new();
+        for (idx, name) in names.iter().enumerate() {
+            id.insert(format!("d{idx}"), json!(format!("${name}")));
+        }
+        json!({ "$group": { "_id": Value::Object(id) } })
+    }
+
+    fn output_distinct_project(&self, names: &[String]) -> Value {
+        let mut project = Map::new();
+        project.insert("_id".into(), json!(0));
+        for (idx, name) in names.iter().enumerate() {
+            project.insert(name.clone(), json!(format!("$_id.d{idx}")));
+        }
+        json!({ "$project": Value::Object(project) })
     }
 
     fn distinct_stages(&self, params: &[Value]) -> Result<(Value, Value, HashSet<String>)> {
@@ -1683,8 +1829,18 @@ impl Parser {
         Self { tokens, pos: 0 }
     }
 
-    fn parse(mut self) -> Result<ParsedSql> {
+    fn parse(mut self) -> Result<ParsedStatement> {
+        if self.eat_kw("INSERT") {
+            return Ok(ParsedStatement::Insert(self.parse_insert()?));
+        }
+        if self.eat_kw("UPDATE") {
+            return Ok(ParsedStatement::Update(self.parse_update()?));
+        }
         self.expect_kw("SELECT")?;
+        Ok(ParsedStatement::Select(self.parse_select()?))
+    }
+
+    fn parse_select(&mut self) -> Result<ParsedSql> {
         let distinct = self.eat_kw("DISTINCT");
         let mut select = Vec::new();
         loop {
@@ -1770,12 +1926,117 @@ impl Parser {
         if let Some(alias) = table_alias.as_deref() {
             parsed.apply_table_alias(alias);
         }
+        self.finish_statement()?;
+        Ok(parsed)
+    }
+
+    fn parse_insert(&mut self) -> Result<InsertSql> {
+        self.expect_kw("INTO")?;
+        let collection = self.parse_ident()?;
+        self.expect_tok(&Tok::LParen)?;
+        let mut columns = Vec::new();
+        let mut seen = HashSet::new();
+        loop {
+            let column = self.parse_field()?;
+            if !seen.insert(column.clone()) {
+                return Err(Error::Sql(format!("duplicate INSERT column `{column}`")));
+            }
+            columns.push(column);
+            if !self.eat_tok(&Tok::Comma) {
+                break;
+            }
+        }
+        self.expect_tok(&Tok::RParen)?;
+        if columns.is_empty() {
+            return Err(Error::Sql("INSERT requires at least one column".into()));
+        }
+        self.expect_kw("VALUES")?;
+        let mut rows = Vec::new();
+        loop {
+            self.expect_tok(&Tok::LParen)?;
+            let mut row = Vec::new();
+            loop {
+                row.push(self.parse_value()?);
+                if !self.eat_tok(&Tok::Comma) {
+                    break;
+                }
+            }
+            self.expect_tok(&Tok::RParen)?;
+            if row.len() != columns.len() {
+                return Err(Error::Sql(format!(
+                    "INSERT row has {} values but {} columns",
+                    row.len(),
+                    columns.len()
+                )));
+            }
+            rows.push(row);
+            if !self.eat_tok(&Tok::Comma) {
+                break;
+            }
+        }
+        self.finish_statement()?;
+        Ok(InsertSql {
+            collection,
+            columns,
+            rows,
+        })
+    }
+
+    fn parse_update(&mut self) -> Result<UpdateSql> {
+        let collection = self.parse_ident()?;
+        let mut table_alias = None;
+        if self.eat_kw("AS") {
+            table_alias = Some(self.parse_ident()?);
+        } else if let Some(Tok::Ident(s) | Tok::QuotedIdent(s)) = self.peek_tok() {
+            if !is_reserved_keyword(s) {
+                table_alias = Some(self.parse_ident()?);
+            }
+        }
+        self.expect_kw("SET")?;
+        let mut assignments = Vec::new();
+        let mut seen = HashSet::new();
+        loop {
+            let mut field = self.parse_field()?;
+            if let Some(alias) = table_alias.as_deref() {
+                let prefix = format!("{alias}.");
+                if let Some(rest) = field.strip_prefix(&prefix) {
+                    field = rest.to_string();
+                }
+            }
+            if !seen.insert(field.clone()) {
+                return Err(Error::Sql(format!("duplicate UPDATE column `{field}`")));
+            }
+            self.expect_tok(&Tok::Eq)?;
+            let value = self.parse_value()?;
+            assignments.push((field, value));
+            if !self.eat_tok(&Tok::Comma) {
+                break;
+            }
+        }
+        let mut filter = None;
+        if self.eat_kw("WHERE") {
+            filter = Some(self.parse_or()?);
+        }
+        if let (Some(alias), Some(filter)) = (table_alias.as_deref(), filter.as_mut()) {
+            let mut wrapped = Some(filter.clone());
+            strip_all(&mut wrapped, alias);
+            *filter = wrapped.expect("filter exists");
+        }
+        self.finish_statement()?;
+        Ok(UpdateSql {
+            collection,
+            assignments,
+            filter,
+        })
+    }
+
+    fn finish_statement(&mut self) -> Result<()> {
         self.eat_tok(&Tok::Semi);
         if self.pos != self.tokens.len() {
             let t = &self.tokens[self.pos];
             return Err(sql_err(t.pos, "unexpected trailing SQL token"));
         }
-        Ok(parsed)
+        Ok(())
     }
 
     fn parse_select_item(&mut self) -> Result<SelectItem> {
@@ -2319,6 +2580,9 @@ fn is_reserved_keyword(s: &str) -> bool {
     matches!(
         s.to_ascii_uppercase().as_str(),
         "WHERE"
+            | "SET"
+            | "VALUES"
+            | "INTO"
             | "GROUP"
             | "ORDER"
             | "LIMIT"
@@ -2340,7 +2604,7 @@ fn is_reserved_keyword(s: &str) -> bool {
     )
 }
 
-fn parse(query: &str) -> Result<ParsedSql> {
+fn parse(query: &str) -> Result<ParsedStatement> {
     let tokens = Lexer::new(query).lex()?;
     if tokens.is_empty() {
         return Err(Error::Sql("empty SQL statement".into()));

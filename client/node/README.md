@@ -79,8 +79,8 @@ const rows = await db.sql(
 );
 ```
 
-SQL is read-only and covers one collection. `db.explainSql(query, params)`
-returns the selected plan. See [SQL queries](../../docs/sql.md).
+SQL supports `SELECT`, `INSERT`, and `UPDATE` over one collection. `db.explainSql(query, params)`
+returns the selected `SELECT` plan. See [SQL queries](../../docs/sql.md).
 
 ## Batch lookups
 

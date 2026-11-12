@@ -9,7 +9,7 @@ quick-start instructions, and a feature overview.
 |---|---|---|
 | [Architecture](architecture.md) | Maintainers, advanced users | Process model, LMDB layout, write path, indexes, search, aggregation, crash safety |
 | [HTTP API](api.md) | All client authors | Operations, request/response formats, filters, updates, aggregation, errors |
-| [SQL queries](sql.md) | Analysts, reporting jobs, application developers | Read-only `SELECT`, filters, aggregates, parameters, limits, client examples |
+| [SQL queries](sql.md) | Analysts, reporting jobs, application developers | `SELECT`, `INSERT`, `UPDATE`, filters, aggregates, parameters, limits, client examples |
 | [Vault collections](vault.md) | Application developers, security reviewers | Optional whole-document encryption, tenant keys, restrictions, operations, key rotation |
 | [Document TTL](ttl.md) | Application developers, operators | Collection defaults, per-document overrides, update semantics, background expiry, limits |
 | [Dates and time zones](dates.md) | Application developers | BSON-compatible dates, RFC 3339 input, filtering, indexes, sorting, timezone semantics |
@@ -36,7 +36,7 @@ quick-start instructions, and a feature overview.
 - **Run on Linux, macOS or Windows:** [README — Quick start](../README.md#quick-start)
 - **Run with Docker:** [README — Run with Docker](../README.md#run-with-docker)
 - **Pick a client:** [Clients](clients.md) — Python, Rust, Node.js, Go
-- **Run a read-only SQL query:** [SQL queries](sql.md)
+- **Run a SQL query or simple write:** [SQL queries](sql.md)
 - **Import data from another database:** [Migration and import](migration.md)
 - **Expose nonodb to Python workers:** [Python client](python-client.md)
 - **Run background jobs and schedulers:** [Background jobs](workers.md)

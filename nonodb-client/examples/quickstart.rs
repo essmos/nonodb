@@ -31,6 +31,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("sql: {}", serde_json::to_string(&sql_rows)?);
     let sql_plan = db.explain_sql("SELECT * FROM users WHERE age >= $1", &[json!(18)])?;
     println!("sql plan: {}", sql_plan["access_path"]);
+    let sql_insert = db.sql(
+        "INSERT INTO users (name, age) VALUES ($1, $2)",
+        &[json!("Grace"), json!(31)],
+    )?;
+    println!("sql insert: {}", serde_json::to_string(&sql_insert)?);
+    let sql_update = db.sql(
+        "UPDATE users SET age = $1 WHERE name = $2",
+        &[json!(32), json!("Grace")],
+    )?;
+    println!("sql update: {}", serde_json::to_string(&sql_update)?);
 
     if matches!(
         std::env::var("NONODB_HISTORY")
