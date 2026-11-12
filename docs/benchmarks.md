@@ -104,7 +104,7 @@ mostly the cost of real durable commits.
 ### Document history overhead
 
 `scripts/bench.py`, 8 clients, 8,000 writes, 20,000 reads, history retention
-`NONODB_HISTORY_MAX_VERSIONS=5`, ext4:
+per-collection history retention `5`, ext4:
 
 | Configuration | Writes/s | `find_one` reads/s | Median write latency |
 |---|---:|---:|---:|

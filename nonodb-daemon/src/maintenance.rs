@@ -80,9 +80,7 @@ fn run(
             }
         }
 
-        if last_prune.is_none_or(|at| at.elapsed() >= HISTORY_PRUNE_INTERVAL)
-            && store.history_config().active()
-        {
+        if last_prune.is_none_or(|at| at.elapsed() >= HISTORY_PRUNE_INTERVAL) {
             last_prune = Some(Instant::now());
             if let Err(e) = submit(
                 &write_tx,

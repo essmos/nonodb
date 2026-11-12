@@ -46,6 +46,7 @@ _READ_OPS = {
     "list_indexes",
     "list_collections",
     "get_collection_ttl",
+    "get_collection_history",
     "list_text_indexes",
     "list_fuzzy_indexes",
     "list_vector_indexes",
@@ -425,6 +426,22 @@ class NonoDB:
         """Returns the collection default TTL in seconds, or `None`."""
         return self.exec({"op": "get_collection_ttl", "coll": name})["ttl_seconds"]
 
+    def set_collection_history(self, name: str, max_versions: int) -> dict[str, Any]:
+        """Sets per-collection revision history retention. `0` disables it."""
+        return self.exec(
+            {
+                "op": "set_collection_history",
+                "coll": name,
+                "max_versions": max_versions,
+            }
+        )
+
+    def get_collection_history(self, name: str) -> int:
+        """Returns the collection revision history retention. `0` means disabled."""
+        return self.exec({"op": "get_collection_history", "coll": name})[
+            "max_versions"
+        ]
+
     def vault(self, tenant: str, key_id: str, key: str) -> "VaultDB":
         """Returns a handle that sends vault encryption headers on every request."""
         return VaultDB(self, tenant, key_id, key)
@@ -714,7 +731,7 @@ class Collection:
         """Returns document revisions, newest first.
 
         Revisions use global monotonic `rev` values. History is opt-in on the
-        daemon via `NONODB_HISTORY=1`.
+        daemon by setting per-collection history retention.
         """
         return self._db.exec(
             {

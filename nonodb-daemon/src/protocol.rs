@@ -373,6 +373,15 @@ pub enum Request {
     GetCollectionTtl {
         coll: String,
     },
+    /// Set per-collection revision history retention. `0` disables it.
+    SetCollectionHistory {
+        coll: String,
+        max_versions: usize,
+    },
+    /// Read per-collection revision history retention.
+    GetCollectionHistory {
+        coll: String,
+    },
     /// Returns the current LMDB map size and high-water mark.
     MapInfo,
     /// Grows the LMDB map without restarting the daemon.
@@ -473,6 +482,10 @@ pub enum WriteReq {
         coll: String,
         ttl_seconds: Option<u64>,
         purge_history: Option<bool>,
+    },
+    SetCollectionHistory {
+        coll: String,
+        max_versions: usize,
     },
     /// Internal maintenance: delete expired documents if their TTL still matches.
     Expire {
@@ -624,6 +637,8 @@ impl Request {
             Self::CreateCollection { .. } => "create_collection",
             Self::SetCollectionTtl { .. } => "set_collection_ttl",
             Self::GetCollectionTtl { .. } => "get_collection_ttl",
+            Self::SetCollectionHistory { .. } => "set_collection_history",
+            Self::GetCollectionHistory { .. } => "get_collection_history",
             Self::MapInfo => "map_info",
             Self::ResizeMap { .. } => "resize_map",
         }
@@ -653,7 +668,8 @@ impl Request {
             | Self::History { .. }
             | Self::GetVersion { .. }
             | Self::ListCollections
-            | Self::GetCollectionTtl { .. } => true,
+            | Self::GetCollectionTtl { .. }
+            | Self::GetCollectionHistory { .. } => true,
             Self::Sql { query, .. } => nonodb_core::sql::is_read_only(query).unwrap_or(false),
             Self::Batch { ops } => ops.iter().all(Self::is_read_only),
             _ => false,
@@ -696,7 +712,9 @@ impl Request {
             | Self::GetVersion { coll, .. }
             | Self::CreateCollection { coll, .. }
             | Self::SetCollectionTtl { coll, .. }
-            | Self::GetCollectionTtl { coll } => vec![coll.clone()],
+            | Self::GetCollectionTtl { coll }
+            | Self::SetCollectionHistory { coll, .. }
+            | Self::GetCollectionHistory { coll } => vec![coll.clone()],
             Self::Sql { query, .. } | Self::ExplainSql { query, .. } => {
                 nonodb_core::sql::collection_name(query)
                     .map(|coll| vec![coll])

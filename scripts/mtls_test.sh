@@ -93,8 +93,6 @@ s.close()
 PY
 )
 
-export NONODB_HISTORY=1
-export NONODB_HISTORY_MAX_VERSIONS=5
 NONODB_DATA="$TMP/data" \
 NONODB_SOCK="$TMP/nonodb.sock" \
 NONODB_TCP="127.0.0.1:$PORT" \

@@ -4,7 +4,7 @@ Run against a daemon:
 
     NONODB_SOCK=/tmp/nonodb.sock python3 scripts/vault_regression_test.py
 
-Set NONODB_HISTORY=1 on the daemon to exercise vault history as well.
+Vault history is exercised when the collection history setting is enabled.
 """
 
 from __future__ import annotations
@@ -39,6 +39,7 @@ def expect(code: str, fn):
 
 def reset(db: NonoDB, vault) -> None:
     db.create_collection(VAULT, "vault")
+    db.set_collection_history(VAULT, 20)
     db.create_collection(STANDARD, "standard")
     db.collection(STANDARD).delete({}, multi=True)
     vc = vault.collection(VAULT)

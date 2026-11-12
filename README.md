@@ -34,7 +34,7 @@ nonodb is a real document database with:
 - a read-only aggregation pipeline for reporting and summaries;
 - snapshots, online backup, online LMDB map growth, authentication, TLS/mTLS, metrics and a CLI;
 - graceful shutdown with in-flight request draining and optional JSON logs;
-- document revision history with global revision IDs and configurable retention;
+- per-collection document revision history with global revision IDs and configurable retention (`0` disables);
 - document TTL with collection defaults, per-document overrides, and background expiry;
 - optional vault collections with whole-document encryption and per-tenant keys;
 - a bounded daemon read cache, invalidated after every committed write;
@@ -243,19 +243,26 @@ optimization notes.
 
 ### Document history
 
-- Opt-in append-only revision history for inserts, updates, and deletes.
+- Per-collection append-only revision history for inserts, updates, and deletes.
+- History is enabled at collection level with one setting: the number of
+  revisions to retain per document. `0` disables new history writes.
 - Global monotonic revision IDs; no per-document counter lookup on writes.
 - Current documents and indexes are unaffected: search always returns current
   results.
-- Configurable retention with `NONODB_HISTORY_MAX_VERSIONS` (default `50`).
 - Revisions are written in the same LMDB transaction as the current document.
 - Read revisions with the `history` and `get_version` API operations, or the
   `history`/`get_version` helpers in the official clients.
 
-Enable it on the daemon:
+Enable it for one collection:
 
 ```bash
-NONODB_HISTORY=1 NONODB_HISTORY_MAX_VERSIONS=50   NONODB_DATA=./data NONODB_SOCK=/tmp/nonodb.sock ./nonodb-daemon
+nonodb-cli history users 50
+```
+
+or with the API:
+
+```json
+{"op":"set_collection_history","coll":"users","max_versions":50}
 ```
 
 Then inspect a document:
@@ -432,7 +439,7 @@ listener, so the Windows daemon requires TCP plus `NONODB_AUTH_FILE`.
 Download, verify, and extract the x86_64 archive:
 
 ```bash
-TAG=v0.15.0
+TAG=v0.16.0
 curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/nonodb-$TAG-linux-x86_64.tar.gz"
 curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/nonodb-$TAG-linux-x86_64.tar.gz.sha256"
 sha256sum -c "nonodb-$TAG-linux-x86_64.tar.gz.sha256"
@@ -501,7 +508,7 @@ unit and installation steps in [Operations](docs/operations.md#deployment-with-s
 Download the archive matching your CPU (`uname -m` prints `arm64` or `x86_64`):
 
 ```bash
-TAG=v0.15.0
+TAG=v0.16.0
 ARCHIVE="nonodb-$TAG-macos-arm64.tar.gz"   # use macos-x86_64 on Intel
 curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/$ARCHIVE"
 curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/$ARCHIVE.sha256"
@@ -596,7 +603,7 @@ The Docker workflow publishes versioned images to GitHub Container Registry for
 Linux `amd64` and `arm64`. Pull a published tag:
 
 ```bash
-docker pull ghcr.io/essmos/nonodb:0.15.0
+docker pull ghcr.io/essmos/nonodb:0.16.0
 ```
 
 Pin a version in production. The `latest` tag follows stable releases. If the
@@ -622,7 +629,7 @@ docker run -d --name nonodb \
   --group-add "$(id -g)" \
   -v "$NONODB_AUTH_FILE:/etc/nonodb/auth.json:ro" \
   -v nonodb-data:/var/lib/nonodb \
-  ghcr.io/essmos/nonodb:0.15.0
+  ghcr.io/essmos/nonodb:0.16.0
 ```
 
 Check health and logs:
@@ -728,7 +735,7 @@ results. Visit [liveapisec.com](https://liveapisec.com) to learn more.
 
 ## Status
 
-nonodb is an early-stage project (`0.15.0`). Its core storage, query, index,
+nonodb is an early-stage project (`0.16.0`). Its core storage, query, index,
 search, batching, security, snapshot, and operational paths are covered by unit,
 property-based, end-to-end, concurrency, crash, and large-data tests. The API
 may still change before a stable release.

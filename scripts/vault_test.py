@@ -2,7 +2,7 @@
 
     NONODB_SOCK=/tmp/nonodb.sock python3 scripts/vault_test.py
 
-History is optional; run the daemon with NONODB_HISTORY=1 to exercise it.
+History is optional; enable it per collection to exercise it.
 """
 
 from __future__ import annotations

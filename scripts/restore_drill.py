@@ -47,7 +47,6 @@ class Daemon:
             NONODB_DATA=str(data),
             NONODB_SOCK=str(sock),
             NONODB_MAP_SIZE="64MiB",
-            NONODB_HISTORY="1",
             RUST_LOG="warn",
         )
         self.fh = log.open("wb")
@@ -88,6 +87,7 @@ def run_cli(cli: Path, *args: str, parse_json: bool = False):
 
 def fixture(db: NonoDB) -> None:
     db.create_collection(COLL, ttl_seconds=3600)
+    db.set_collection_history(COLL, 5)
     c = db.collection(COLL)
     c.insert_many(
         [

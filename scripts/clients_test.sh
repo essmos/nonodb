@@ -24,8 +24,6 @@ cleanup() {
 trap cleanup EXIT
 
 mkdir -p "$TMP/run"
-export NONODB_HISTORY=1
-export NONODB_HISTORY_MAX_VERSIONS=5
 export NONODB_TTL_SWEEP_INTERVAL=1
 NONODB_DATA="$TMP/data" \
 NONODB_SOCK="$TMP/run/nonodb.sock" \
@@ -105,6 +103,9 @@ python3 scripts/shutdown_test.py
 
 echo "== TTL"
 python3 scripts/ttl_test.py
+
+echo "== Per-collection history"
+python3 scripts/history_test.py
 
 echo "== Vault regression"
 python3 scripts/vault_regression_test.py

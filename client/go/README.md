@@ -34,7 +34,7 @@ end-to-end check.
 
 ## Document history
 
-When the daemon is started with `NONODB_HISTORY=1`, use `History()` and
+Enable history per collection with `set_collection_history(coll, max_versions)`, then use `History()` and
 `GetVersion()` on a collection.
 
 ## Document TTL

@@ -15,7 +15,7 @@ use crate::bson_types;
 use crate::date;
 use crate::error::{Error, Result};
 use crate::geo;
-use crate::history::{self, HistoryConfig, HistoryEntry};
+use crate::history::{self, HistoryEntry};
 use crate::index::{self, IndexDef};
 use crate::numeric;
 use crate::query::{
@@ -258,7 +258,7 @@ pub struct Collection<'e> {
     meta: Database<Bytes, Bytes>,
     history: Database<Bytes, Bytes>,
     ttl_db: Database<Bytes, Bytes>,
-    history_config: HistoryConfig,
+    history_max_versions: usize,
     name: String,
     profile: CollectionProfile,
     ttl_default_seconds: Option<u64>,
@@ -275,7 +275,7 @@ impl<'e> Collection<'e> {
         meta: Database<Bytes, Bytes>,
         history: Database<Bytes, Bytes>,
         ttl_db: Database<Bytes, Bytes>,
-        history_config: HistoryConfig,
+        history_max_versions: usize,
         name: String,
         profile: CollectionProfile,
         ttl_default_seconds: Option<u64>,
@@ -287,7 +287,7 @@ impl<'e> Collection<'e> {
             meta,
             history,
             ttl_db,
-            history_config,
+            history_max_versions,
             name,
             profile,
             ttl_default_seconds,
@@ -2925,7 +2925,7 @@ impl<'e> Collection<'e> {
         op: &str,
         doc: Option<Value>,
     ) -> Result<()> {
-        if !self.history_config.active() {
+        if self.history_max_versions == 0 {
             return Ok(());
         }
         history::append(&self.history, &self.meta, wtxn, &self.name, id, op, doc)?;
@@ -5866,14 +5866,11 @@ mod tests {
 
     fn history_store(max_versions: usize) -> (tempfile::TempDir, Store) {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open_with_history(
-            dir.path(),
-            HistoryConfig {
-                enabled: true,
-                max_versions,
-            },
-        )
-        .unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store
+            .create_collection("users", crate::vault::CollectionProfile::Standard)
+            .unwrap();
+        store.set_collection_history("users", max_versions).unwrap();
         (dir, store)
     }
 
@@ -5927,6 +5924,30 @@ mod tests {
     }
 
     #[test]
+    fn history_is_configured_per_collection() {
+        let (_dir, store) = store();
+        let _ = store.collection("enabled").unwrap();
+        let disabled = store.collection("disabled").unwrap();
+        store.set_collection_history("enabled", 3).unwrap();
+        let enabled = store.collection("enabled").unwrap();
+        assert_eq!(store.collection_history("enabled").unwrap(), 3);
+        assert_eq!(store.collection_history("disabled").unwrap(), 0);
+
+        let eid = enabled.insert_one(json!({"n": 1})).unwrap();
+        let did = disabled.insert_one(json!({"n": 1})).unwrap();
+        assert_eq!(enabled.history(&eid, None, true).unwrap().len(), 1);
+        assert!(disabled.history(&did, None, true).unwrap().is_empty());
+
+        store.set_collection_history("enabled", 0).unwrap();
+        let enabled = store.collection("enabled").unwrap();
+        assert_eq!(store.collection_history("enabled").unwrap(), 0);
+        enabled
+            .update(&json!({"_id": eid}), &json!({"$set": {"n": 2}}), false)
+            .unwrap();
+        assert_eq!(enabled.history(&eid, None, true).unwrap().len(), 1);
+    }
+
+    #[test]
     fn history_prunes_old_versions() {
         let (_dir, store) = history_store(2);
         let c = store.collection("users").unwrap();
@@ -5945,6 +5966,31 @@ mod tests {
         assert_eq!(kept.len(), 2);
         assert_eq!(kept[0].doc.as_ref().unwrap()["n"], 4);
         assert_eq!(kept[1].doc.as_ref().unwrap()["n"], 3);
+    }
+
+    #[test]
+    fn history_prunes_with_per_collection_limits() {
+        let (_dir, store) = store();
+        for name in ["a", "b"] {
+            store
+                .create_collection(name, crate::vault::CollectionProfile::Standard)
+                .unwrap();
+        }
+        store.set_collection_history("a", 2).unwrap();
+        store.set_collection_history("b", 1).unwrap();
+        let a = store.collection("a").unwrap();
+        let b = store.collection("b").unwrap();
+        let aid = a.insert_one(json!({"n": 0})).unwrap();
+        let bid = b.insert_one(json!({"n": 0})).unwrap();
+        for n in 1..=4 {
+            a.update(&json!({"_id": aid}), &json!({"$set": {"n": n}}), false)
+                .unwrap();
+            b.update(&json!({"_id": bid}), &json!({"$set": {"n": n}}), false)
+                .unwrap();
+        }
+        assert_eq!(store.prune_history(100).unwrap(), 7);
+        assert_eq!(a.history(&aid, None, true).unwrap().len(), 2);
+        assert_eq!(b.history(&bid, None, true).unwrap().len(), 1);
     }
 
     #[test]

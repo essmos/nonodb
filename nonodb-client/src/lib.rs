@@ -432,6 +432,31 @@ impl Client {
         Ok(result.get("ttl_seconds").and_then(Value::as_u64))
     }
 
+    /// Set per-collection revision history retention. `0` disables it.
+    pub fn set_collection_history(
+        &self,
+        name: impl Into<String>,
+        max_versions: usize,
+    ) -> Result<Value> {
+        self.exec(json!({
+            "op": "set_collection_history",
+            "coll": name.into(),
+            "max_versions": max_versions,
+        }))
+    }
+
+    /// Read per-collection revision history retention. `0` means disabled.
+    pub fn collection_history(&self, name: impl Into<String>) -> Result<usize> {
+        let result = self.exec(json!({
+            "op": "get_collection_history",
+            "coll": name.into(),
+        }))?;
+        Ok(result
+            .get("max_versions")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize)
+    }
+
     /// Current LMDB map size and high-water mark.
     pub fn map_info(&self) -> Result<Value> {
         self.exec(json!({"op": "map_info"}))
@@ -857,7 +882,7 @@ impl Collection<'_> {
 
     /// List document revisions, newest first.
     ///
-    /// History is enabled by the daemon with `NONODB_HISTORY=1`. Revisions use
+    /// History is enabled per collection with `set_collection_history`. Revisions use
     /// global monotonic `rev` values.
     pub fn history(&self, id: &str, limit: Option<u64>, include_docs: bool) -> Result<Vec<Value>> {
         let result = self.client.exec(json!({

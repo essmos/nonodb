@@ -113,6 +113,18 @@ nonodb-cli map
 }
 ```
 
+## history
+
+Show or set per-collection revision history retention:
+
+```bash
+nonodb-cli history users       # show the current setting
+nonodb-cli history users 50    # retain up to 50 revisions per document
+nonodb-cli history users 0     # disable new history writes
+```
+
+History is configured per collection. There is no daemon-wide history switch.
+
 ## resize
 
 Grow the LMDB map without restarting the daemon:

@@ -279,7 +279,7 @@ sweeper deletes an expired vault document without decrypting its envelope. See
 
 ## History
 
-When document history is enabled (`NONODB_HISTORY=1`), vault history stores
+When document history is enabled for a vault collection, vault history stores
 **ciphertext snapshots** in LMDB. The `history` and `get_version` responses
 decrypt snapshots for the authenticated tenant:
 

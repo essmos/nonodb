@@ -1,17 +1,10 @@
-use nonodb_core::{ttl, CollectionProfile, FindQuery, HistoryConfig, Store, VaultKey};
+use nonodb_core::{ttl, CollectionProfile, FindQuery, Store, VaultKey};
 use serde_json::json;
 use tempfile::TempDir;
 
 fn store() -> (TempDir, Store) {
     let dir = TempDir::new().unwrap();
-    let store = Store::open_with_history(
-        dir.path(),
-        HistoryConfig {
-            enabled: true,
-            max_versions: 10,
-        },
-    )
-    .unwrap();
+    let store = Store::open(dir.path()).unwrap();
     (dir, store)
 }
 
@@ -83,9 +76,11 @@ fn update_preserves_or_refreshes_ttl() {
 #[test]
 fn expiry_deletes_document_and_records_tombstone() {
     let (_dir, store) = store();
-    let c = store
+    store
         .create_collection_with_ttl("events", CollectionProfile::Standard, Some(1))
         .unwrap();
+    store.set_collection_history("events", 10).unwrap();
+    let c = store.collection("events").unwrap();
     c.insert_one(json!({"_id": "gone", "n": 1})).unwrap();
     let due = store.ttl_due(ttl::now_ms() + 2_000, 10).unwrap();
     let entry = due.iter().find(|e| e.id == "gone").unwrap();
@@ -135,7 +130,7 @@ fn stale_expiry_does_not_delete_refreshed_document() {
 #[test]
 fn expiry_can_purge_history() {
     let (_dir, store) = store();
-    let c = store
+    store
         .create_collection_with_ttl_and_purge(
             "events",
             CollectionProfile::Standard,
@@ -143,6 +138,8 @@ fn expiry_can_purge_history() {
             Some(true),
         )
         .unwrap();
+    store.set_collection_history("events", 10).unwrap();
+    let c = store.collection("events").unwrap();
     assert!(c.ttl_purge_history());
     c.insert_one(json!({"_id": "gone", "n": 1})).unwrap();
     assert_eq!(c.history("gone", Some(10), false).unwrap().len(), 1);

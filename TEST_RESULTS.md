@@ -16,7 +16,7 @@ release build. The latest validation also exercised a 10M-document collection,
 | `cargo build --release --examples` | OK |
 | `cargo fmt --check` | OK |
 | `cargo clippy --all-targets -- -D warnings` | 0 warnings |
-| `cargo test --workspace` | 292 tests passing |
+| `cargo test --workspace` | 293 tests passing |
 | CRUD, cache, batch, write batch, upsert, search, compound indexes | OK |
 | 12-process concurrency and unique-index race tests | OK |
 | `kill -9` during writes | No corruption; committed data readable |
@@ -27,6 +27,7 @@ release build. The latest validation also exercised a 10M-document collection,
 | Auth registry, scopes, and lockout | OK (tokens, scopes, filtered list, live reload, audit, per-IP blocks) |
 | mTLS with all official clients | OK (Python, Rust, Node.js, Go; anonymous and revoked certs rejected) |
 | Document TTL suite | OK (defaults, overrides, update semantics, sweeper, history tombstones/purge, vault) |
+| Per-collection history suite | OK (default `0`, enable/disable per collection, isolation, restart persistence, delete tombstones, CLI) |
 | 10M-document load and 3 index backfills | OK (157.8 s load; 75.5 s indexes) |
 | 10M-document backup, verify, restore, and inspect | OK (6.7 GB backup; 52 s backup; 2m38s verify; 2m52s restore+verify) |
 | 1M typed search/aggregation matrix | OK (10 indexes, 200k text docs; typed lookups 0.6–1.2 ms) |

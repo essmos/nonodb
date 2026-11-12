@@ -4,8 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"os"
-	"strings"
 	"time"
 
 	nonodb "github.com/essmos/nonodb/client/go"
@@ -21,6 +19,12 @@ func main() {
 	}
 
 	name := fmt.Sprintf("go_client_test_%d", time.Now().UnixNano())
+	if err := db.CreateCollection(ctx, name, "standard"); err != nil {
+		log.Fatal(err)
+	}
+	if _, err := db.SetCollectionHistory(ctx, name, 5); err != nil {
+		log.Fatal(err)
+	}
 	users := db.Collection(name)
 
 	id, err := users.Insert(ctx, map[string]any{
@@ -122,20 +126,17 @@ func main() {
 		log.Fatal(err)
 	}
 
-	switch strings.ToLower(os.Getenv("NONODB_HISTORY")) {
-	case "1", "true", "yes", "on":
-		revisions, err := users.History(ctx, id, 10, true)
-		if err != nil || len(revisions) == 0 {
-			log.Fatalf("history: %v %v", revisions, err)
-		}
-		rev, ok := revisions[len(revisions)-1]["rev"].(float64)
-		if !ok {
-			log.Fatalf("history revision has no rev: %v", revisions)
-		}
-		version, err := users.GetVersion(ctx, id, uint64(rev))
-		if err != nil || version == nil {
-			log.Fatalf("get_version: %v %v", version, err)
-		}
+	revisions, err := users.History(ctx, id, 10, true)
+	if err != nil || len(revisions) == 0 {
+		log.Fatalf("history: %v %v", revisions, err)
+	}
+	rev, ok := revisions[len(revisions)-1]["rev"].(float64)
+	if !ok {
+		log.Fatalf("history revision has no rev: %v", revisions)
+	}
+	version, err := users.GetVersion(ctx, id, uint64(rev))
+	if err != nil || version == nil {
+		log.Fatalf("get_version: %v %v", version, err)
 	}
 	fmt.Println("go client smoke test: ok")
 }

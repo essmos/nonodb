@@ -5,6 +5,7 @@
 //! revisions assigned by the single writer; no per-document counter is read or
 //! updated on the write path.
 
+use std::collections::HashMap;
 use std::ops::Bound;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -23,58 +24,10 @@ const HISTORY_SEQ_KEY: &[u8] = b"history_seq";
 const HISTORY_PRUNE_CURSOR_KEY: &[u8] = b"history_prune_cursor";
 /// Maximum history keys inspected by one pruning pass.
 const PRUNE_SCAN_LIMIT: usize = 50_000;
-/// Default number of revisions kept per document.
-pub const DEFAULT_HISTORY_MAX_VERSIONS: usize = 50;
+/// Default number of revisions kept per document. `0` disables history writes.
+pub const DEFAULT_HISTORY_MAX_VERSIONS: usize = 0;
 /// Maximum number of revisions returned by one `history` request.
 const MAX_HISTORY_PAGE: usize = 1000;
-
-/// History behavior for a store.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HistoryConfig {
-    pub enabled: bool,
-    pub max_versions: usize,
-}
-
-impl Default for HistoryConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            max_versions: DEFAULT_HISTORY_MAX_VERSIONS,
-        }
-    }
-}
-
-impl HistoryConfig {
-    /// Reads history settings from the environment.
-    ///
-    /// `NONODB_HISTORY=1` enables history. `NONODB_HISTORY_MAX_VERSIONS`
-    /// controls how many revisions are retained per document (`0` disables
-    /// retention writes as well).
-    pub fn from_env() -> Self {
-        let enabled = std::env::var("NONODB_HISTORY")
-            .ok()
-            .is_some_and(|v| env_truthy(&v));
-        let max_versions = std::env::var("NONODB_HISTORY_MAX_VERSIONS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(DEFAULT_HISTORY_MAX_VERSIONS);
-        Self {
-            enabled,
-            max_versions,
-        }
-    }
-
-    pub fn active(self) -> bool {
-        self.enabled && self.max_versions > 0
-    }
-}
-
-fn env_truthy(raw: &str) -> bool {
-    matches!(
-        raw.trim().to_ascii_lowercase().as_str(),
-        "1" | "true" | "yes" | "on"
-    )
-}
 
 /// One immutable document revision.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -269,7 +222,7 @@ pub(crate) fn prune(
     history: &Database<Bytes, Bytes>,
     meta: &Database<Bytes, Bytes>,
     wtxn: &mut RwTxn<'_>,
-    max_versions: usize,
+    max_versions_for: &HashMap<String, usize>,
     limit: usize,
 ) -> Result<usize> {
     if limit == 0 {
@@ -285,6 +238,7 @@ pub(crate) fn prune(
     let mut deletions: Vec<Vec<u8>> = Vec::new();
     let mut group_keys: Vec<Vec<u8>> = Vec::new();
     let mut group_prefix: Option<Vec<u8>> = None;
+    let mut group_coll: Option<String> = None;
     let mut committed: Option<Vec<u8>> = None;
     let mut scanned = 0usize;
     let mut stop_after_group = false;
@@ -297,6 +251,11 @@ pub(crate) fn prune(
         let p = prefix(coll, id);
         if group_prefix.as_ref() != Some(&p) {
             if !group_keys.is_empty() {
+                let max_versions = group_coll
+                    .as_deref()
+                    .and_then(|coll| max_versions_for.get(coll))
+                    .copied()
+                    .unwrap_or(0);
                 queue_oldest(&group_keys, max_versions, limit, &mut deletions);
                 committed = group_keys.last().cloned();
                 group_keys.clear();
@@ -305,6 +264,7 @@ pub(crate) fn prune(
                 break;
             }
             group_prefix = Some(p);
+            group_coll = Some(coll.to_string());
         }
         group_keys.push(raw_key.to_vec());
         scanned += 1;
@@ -314,6 +274,11 @@ pub(crate) fn prune(
     }
 
     if !group_keys.is_empty() {
+        let max_versions = group_coll
+            .as_deref()
+            .and_then(|coll| max_versions_for.get(coll))
+            .copied()
+            .unwrap_or(0);
         queue_oldest(&group_keys, max_versions, limit, &mut deletions);
         committed = group_keys.last().cloned();
     }
@@ -337,14 +302,6 @@ pub(crate) fn prune(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn history_config_reads_defaults() {
-        let config = HistoryConfig::default();
-        assert!(!config.enabled);
-        assert!(!config.active());
-        assert_eq!(config.max_versions, DEFAULT_HISTORY_MAX_VERSIONS);
-    }
 
     #[test]
     fn key_roundtrip() {

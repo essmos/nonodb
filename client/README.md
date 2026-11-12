@@ -28,7 +28,7 @@ Node.js, and Go.
 
 ## Document history
 
-When the daemon is started with `NONODB_HISTORY=1`, all clients expose
+Enable history per collection with `set_collection_history(coll, max_versions)`. All clients expose
 history, exact-revision helpers, and aggregation.
 
 ## Document TTL

@@ -36,7 +36,7 @@ pub use collection::{
     UpdateOutcome, MAX_LOOKUP_RESPONSE_BYTES, MAX_LOOKUP_VALUES,
 };
 pub use error::{Error, Result};
-pub use history::{HistoryConfig, HistoryEntry, DEFAULT_HISTORY_MAX_VERSIONS};
+pub use history::{HistoryEntry, DEFAULT_HISTORY_MAX_VERSIONS};
 pub use index::{IndexDef, RangeBytes};
 pub use search::DEFAULT_FUZZY_DISTANCE;
 pub use store::{

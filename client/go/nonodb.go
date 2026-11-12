@@ -410,7 +410,7 @@ func isReadOp(payload map[string]any) bool {
 	switch op {
 	case "find", "find_one", "lookup", "watch", "count", "list_indexes", "list_collections",
 		"list_text_indexes", "list_fuzzy_indexes", "list_vector_indexes",
-		"search", "fuzzy", "vector_search", "history", "get_version", "sql", "explain_sql", "batch":
+		"search", "fuzzy", "vector_search", "history", "get_version", "get_collection_history", "sql", "explain_sql", "batch":
 		return true
 	default:
 		return false
@@ -500,6 +500,39 @@ func (c *Client) CollectionTTL(ctx context.Context, name string) (*uint64, error
 		return nil, err
 	}
 	return result.TTLSeconds, nil
+}
+
+// SetCollectionHistory sets per-collection revision history retention.
+// Zero disables new history writes.
+func (c *Client) SetCollectionHistory(ctx context.Context, name string, maxVersions int) (map[string]any, error) {
+	raw, err := c.execRaw(ctx, map[string]any{
+		"op": "set_collection_history", "coll": name, "max_versions": maxVersions,
+	})
+	if err != nil {
+		return nil, err
+	}
+	var result map[string]any
+	if err := decodeInto(raw, &result); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// CollectionHistory returns per-collection revision history retention.
+func (c *Client) CollectionHistory(ctx context.Context, name string) (int, error) {
+	raw, err := c.execRaw(ctx, map[string]any{
+		"op": "get_collection_history", "coll": name,
+	})
+	if err != nil {
+		return 0, err
+	}
+	var result struct {
+		MaxVersions int `json:"max_versions"`
+	}
+	if err := decodeInto(raw, &result); err != nil {
+		return 0, err
+	}
+	return result.MaxVersions, nil
 }
 
 // Collections lists collection names.

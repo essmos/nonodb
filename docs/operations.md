@@ -45,8 +45,6 @@ All daemon configuration is through environment variables.
 | `NONODB_CACHE_TTL` | `5` | Read-cache TTL in seconds; `0` disables the cache |
 | `NONODB_CACHE_ENTRIES` | `512` | Maximum number of cached read results |
 | `NONODB_CACHE_MAX_BYTES` | `262144` | Maximum serialized size of one cached result |
-| `NONODB_HISTORY` | `0` | Enables append-only document revision history |
-| `NONODB_HISTORY_MAX_VERSIONS` | `50` | Revisions retained per document (`0` disables history writes) |
 | `NONODB_TTL_SWEEP_INTERVAL` | `5` | Seconds between document TTL sweeps |
 | `NONODB_TTL_SWEEP_LIMIT` | `256` | Maximum due documents processed per TTL sweep |
 | `NONODB_MAINTENANCE_INTERVAL_MS` | `1000` | Maintenance worker heartbeat in milliseconds |
@@ -118,28 +116,36 @@ stored. Set `NONODB_CACHE_TTL=0` to disable it. Metrics expose
 
 ### Document history
 
-Document history is opt-in with `NONODB_HISTORY=1`. When enabled, inserts,
-updates, and deletes also append an immutable revision to the separate
-`history` LMDB sub-database. Current-document writes and history appends share
-one LMDB transaction, so a crash cannot leave them inconsistent.
+Document history is configured per collection with one setting: the maximum
+number of revisions retained per document. `0` disables new history writes for
+that collection. There is no daemon-wide history switch.
+
+```bash
+nonodb-cli history users 50     # retain up to 50 revisions per document
+nonodb-cli history users 0      # disable new history writes
+nonodb-cli history users        # show the current setting
+```
+
+When enabled, inserts, updates, and deletes also append an immutable revision to
+the separate `history` LMDB sub-database. Current-document writes and history
+appends share one LMDB transaction, so a crash cannot leave them inconsistent.
 
 Searches and secondary indexes never see history entries. This keeps query
 results current and avoids index maintenance for old revisions.
 
-`NONODB_HISTORY_MAX_VERSIONS` controls how many revisions are retained per
-document (default `50`). The maintenance worker submits a bounded pruning job
-every 30 seconds; the writer deletes old revisions in small batches rather than
-during the hot write path. Set the value to `0` to stop recording new history.
+The maintenance worker submits a bounded pruning job every 30 seconds; the
+writer deletes old revisions in small batches rather than during the hot write
+path. Retention limits are evaluated per collection.
 
-History is global to the store, not per collection. Enabling it after a
-database already contains documents creates history only for writes performed
-after the daemon restart; there is no retroactive backfill. The `history` and
-`get_version` API operations are documented in [HTTP API](api.md#document-history).
+Enabling history after a collection already contains documents creates history
+only for writes performed after the setting is applied; there is no retroactive
+backfill. The `history` and `get_version` API operations are documented in
+[HTTP API](api.md#document-history).
 
 History increases write amplification and disk usage by approximately one
-document copy per write for history-enabled stores. Size `NONODB_MAP_SIZE` and
-backup retention accordingly. Use a smaller `NONODB_HISTORY_MAX_VERSIONS` or
-disable history for write-heavy collections.
+document copy per write for history-enabled collections. Size
+`NONODB_MAP_SIZE` and backup retention accordingly. Use a smaller retention
+value or disable history for write-heavy collections.
 
 ### Document TTL
 
@@ -232,7 +238,7 @@ Download the archive from the matching GitHub Release, verify its checksum, and
 install the two binaries:
 
 ```bash
-TAG=v0.15.0
+TAG=v0.16.0
 ARCHIVE="nonodb-$TAG-linux-x86_64.tar.gz"
 curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/$ARCHIVE"
 curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/$ARCHIVE.sha256"
@@ -294,7 +300,7 @@ Linux `amd64` and `arm64`. Pull a published tag:
 
 ```bash
 # Pin a version in production; latest tracks stable releases.
-docker pull ghcr.io/essmos/nonodb:0.15.0
+docker pull ghcr.io/essmos/nonodb:0.16.0
 ```
 
 If the GHCR package is private, log in before pulling:
@@ -340,7 +346,7 @@ docker run -d --name nonodb \
   --group-add "$(id -g)" \
   -v "$NONODB_AUTH_FILE:/etc/nonodb/auth.json:ro" \
   -v nonodb-data:/var/lib/nonodb \
-  ghcr.io/essmos/nonodb:0.15.0
+  ghcr.io/essmos/nonodb:0.16.0
 ```
 
 Verify it:
@@ -405,7 +411,7 @@ docker volume create nonodb-run
 docker run -d --name nonodb \
   -v nonodb-data:/var/lib/nonodb \
   -v nonodb-run:/run/nonodb \
-  ghcr.io/essmos/nonodb:0.15.0
+  ghcr.io/essmos/nonodb:0.16.0
 ```
 
 The client container mounts the same `nonodb-run` volume and sets:
@@ -434,7 +440,7 @@ docker run -d --name nonodb \
   -v "$NONODB_AUTH_FILE:/etc/nonodb/auth.json:ro" \
   -v /host/certs:/certs:ro \
   -v nonodb-data:/var/lib/nonodb \
-  ghcr.io/essmos/nonodb:0.15.0
+  ghcr.io/essmos/nonodb:0.16.0
 ```
 
 Without a certificate and key pair, TCP runs in plaintext and logs a warning.
@@ -448,7 +454,7 @@ Back up into a separate mounted directory:
 docker run --rm \
   -v nonodb-data:/var/lib/nonodb:ro \
   -v /host/backups:/backups \
-  ghcr.io/essmos/nonodb:0.15.0 \
+  ghcr.io/essmos/nonodb:0.16.0 \
   nonodb-cli backup /var/lib/nonodb /backups/$(date -u +%Y%m%dT%H%M%SZ)
 ```
 

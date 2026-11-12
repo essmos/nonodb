@@ -3,24 +3,17 @@ use std::io::Write;
 
 use nonodb_core::heed::types::Bytes;
 use nonodb_core::heed::{CompactionOption, Database, EnvOpenOptions};
-use nonodb_core::{verify_backup, verify_data_dir, BackupManifest, HistoryConfig, Store, MAX_DBS};
+use nonodb_core::{verify_backup, verify_data_dir, BackupManifest, Store, MAX_DBS};
 use serde_json::{json, Value};
 use tempfile::tempdir;
 
 fn fixture() -> (tempfile::TempDir, tempfile::TempDir) {
     let data = tempdir().unwrap();
     let backup = tempdir().unwrap();
-    let store = Store::open_with_history_and_map_size(
-        data.path(),
-        HistoryConfig {
-            enabled: true,
-            max_versions: 5,
-        },
-        16 * 1024 * 1024,
-    )
-    .unwrap();
+    let store = Store::open_with_map_size(data.path(), 16 * 1024 * 1024).unwrap();
     let _ = store.collection("users").unwrap();
     store.set_collection_ttl("users", Some(3600)).unwrap();
+    store.set_collection_history("users", 5).unwrap();
     let users = store.collection("users").unwrap();
     users
         .insert_one(

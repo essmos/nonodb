@@ -708,9 +708,11 @@ results = db.batch([
 ])
 ```
 
-Document history is available when the daemon runs with `NONODB_HISTORY=1`:
+Document history is enabled per collection:
 
 ```python
+db.set_collection_history("users", 50)   # 0 disables it
+assert db.get_collection_history("users") == 50
 revisions = users.history(id, limit=20, include_docs=True)
 old = users.get_version(id, revisions[-1]["rev"])
 ```

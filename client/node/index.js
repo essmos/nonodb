@@ -239,6 +239,21 @@ class NonoDB {
     return result?.ttl_seconds ?? null;
   }
 
+  /** Set a collection's revision history retention. Zero disables it. */
+  async setCollectionHistory(name, maxVersions) {
+    return this.exec({
+      op: 'set_collection_history',
+      coll: name,
+      max_versions: maxVersions,
+    });
+  }
+
+  /** Read a collection's revision history retention. Zero means disabled. */
+  async collectionHistory(name) {
+    const result = await this.exec({ op: 'get_collection_history', coll: name });
+    return result?.max_versions ?? 0;
+  }
+
   /** List collection names. */
   async collections() {
     const result = await this.exec({ op: 'list_collections' });

@@ -24,6 +24,8 @@ ITERS = int(os.environ.get("ITERS", "100"))
 
 def main() -> int:
     db = NonoDB(SOCK)
+    db.create_collection("concurrency")
+    db.set_collection_history("concurrency", 5)
     coll = db.collection("concurrency")
     coll.delete({}, multi=True)
 
@@ -33,10 +35,9 @@ def main() -> int:
         ["counter"],
     )
     assert rows == [{"n": 1}], rows
-    if os.environ.get("NONODB_HISTORY", "").lower() in {"1", "true", "yes", "on"}:
-        revisions = coll.history(doc_id, limit=5, include_docs=True)
-        assert len(revisions) == 1 and revisions[0]["op"] == "insert"
-        assert coll.get_version(doc_id, revisions[0]["rev"])["doc"]["n"] == 0
+    revisions = coll.history(doc_id, limit=5, include_docs=True)
+    assert len(revisions) == 1 and revisions[0]["op"] == "insert"
+    assert coll.get_version(doc_id, revisions[0]["rev"])["doc"]["n"] == 0
     errors: list[BaseException] = []
 
     def worker() -> None:

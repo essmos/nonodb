@@ -1,18 +1,11 @@
 use nonodb_core::heed::types::Bytes;
-use nonodb_core::{CollectionProfile, FindQuery, HistoryConfig, Store, VaultKey};
+use nonodb_core::{CollectionProfile, FindQuery, Store, VaultKey};
 use serde_json::json;
 use tempfile::TempDir;
 
 fn store() -> (TempDir, Store) {
     let dir = TempDir::new().unwrap();
-    let store = Store::open_with_history(
-        dir.path(),
-        HistoryConfig {
-            enabled: true,
-            max_versions: 10,
-        },
-    )
-    .unwrap();
+    let store = Store::open(dir.path()).unwrap();
     (dir, store)
 }
 
@@ -142,9 +135,11 @@ fn vault_round_trip_and_isolation() {
 fn history_decrypts_snapshots() {
     let (_dir, store) = store();
     let key = VaultKey::from_bytes([13u8; 32]);
-    let vault = store
+    store
         .create_collection("vault", CollectionProfile::Vault)
         .unwrap();
+    store.set_collection_history("vault", 10).unwrap();
+    let vault = store.collection("vault").unwrap();
     let mut wtxn = store.write_txn().unwrap();
     let id = vault
         .insert_vault_txn(

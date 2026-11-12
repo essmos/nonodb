@@ -8,6 +8,8 @@ async function main() {
   assert.equal(await db.health(), true, 'daemon is not healthy');
 
   const name = `node_client_test_${Date.now()}`;
+  await db.createCollection(name);
+  await db.setCollectionHistory(name, 5);
   const users = db.collection(name);
 
   const id = await users.insert({ name: 'Ada', age: 36, tags: ['db', 'node'] });
@@ -66,12 +68,10 @@ async function main() {
 
   assert.equal((await users.getMany([id])).length, 1);
 
-  if (['1', 'true', 'yes', 'on'].includes((process.env.NONODB_HISTORY || '').toLowerCase())) {
-    const revisions = await users.history(id, { limit: 10, includeDocs: true });
-    assert.ok(revisions.length >= 1);
-    const first = await users.getVersion(id, revisions[revisions.length - 1].rev);
-    assert.equal(first.doc.name, 'Ada');
-  }
+  const revisions = await users.history(id, { limit: 10, includeDocs: true });
+  assert.ok(revisions.length >= 1);
+  const first = await users.getVersion(id, revisions[revisions.length - 1].rev);
+  assert.equal(first.doc.name, 'Ada');
 
   await users.createIndex(['age', 'name'], { include: ['tags'] });
   assert.ok((await users.listIndexes()).length >= 1);

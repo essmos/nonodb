@@ -2,7 +2,7 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use nonodb_core::{FindQuery, HistoryConfig, Store, PAGE_SIZE};
+use nonodb_core::{FindQuery, Store, PAGE_SIZE};
 use serde_json::json;
 use tempfile::tempdir;
 
@@ -120,14 +120,7 @@ fn resize_rejects_invalid_sizes() {
 #[test]
 fn concurrent_io_survives_repeated_resizes() {
     let dir = tempdir().unwrap();
-    let store = Arc::new(
-        Store::open_with_history_and_map_size(
-            dir.path(),
-            HistoryConfig::default(),
-            PAGE_SIZE * 256,
-        )
-        .unwrap(),
-    );
+    let store = Arc::new(Store::open_with_map_size(dir.path(), PAGE_SIZE * 256).unwrap());
     store
         .collection("items")
         .unwrap()

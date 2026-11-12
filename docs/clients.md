@@ -642,7 +642,7 @@ All clients expose the common document operations:
 - `watch`/`watch_once` for append-only outbox events, with filters, projections,
   resume tokens, and reconnect helpers; Python also exposes `watch_stream` for
   continuous NDJSON ([details](streams.md));
-- `history` and `get_version` for document revisions (daemon history enabled);
+- `history` and `get_version` for document revisions (per-collection history enabled);
 - single-field, compound, unique, and covering indexes;
 - full-text (`search`), fuzzy search, and exact vector search;
 - text/fuzzy/vector index listing and deletion;

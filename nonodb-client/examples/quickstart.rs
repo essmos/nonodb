@@ -3,6 +3,8 @@ use serde_json::json;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db = Client::from_env()?;
+    db.create_collection("users", "standard")?;
+    db.set_collection_history("users", 5)?;
     let users = db.collection("users");
 
     let id = users.insert(&json!({"name": "Ada", "age": 36, "tags": ["db", "rust"]}))?;
@@ -42,20 +44,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     println!("sql update: {}", serde_json::to_string(&sql_update)?);
 
-    if matches!(
-        std::env::var("NONODB_HISTORY")
-            .unwrap_or_default()
-            .to_ascii_lowercase()
-            .as_str(),
-        "1" | "true" | "yes" | "on"
-    ) {
-        let revisions = users.history(&id, Some(10), true)?;
-        println!("revisions: {}", revisions.len());
-        if let Some(first) = revisions.last() {
-            let version = first["rev"].as_u64().expect("revision");
-            let old = users.get_version(&id, version)?;
-            println!("old: {}", serde_json::to_string(&old)?);
-        }
+    let revisions = users.history(&id, Some(10), true)?;
+    println!("revisions: {}", revisions.len());
+    if let Some(first) = revisions.last() {
+        let version = first["rev"].as_u64().expect("revision");
+        let old = users.get_version(&id, version)?;
+        println!("old: {}", serde_json::to_string(&old)?);
     }
 
     println!("collections: {:?}", db.collections()?);

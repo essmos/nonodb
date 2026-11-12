@@ -44,7 +44,7 @@ limitations are documented in [docs/roadmap.md](docs/roadmap.md).
 - [x] Extended JSON `$numberInt`/`$numberLong`, `$type`, binary/UUID, ObjectId
 - [x] `$regex`/`$options` with safe regex, compiled cache, anchored-index prefixes
 - [x] Array query operators `$all`, `$size`, `$elemMatch`
-- [x] Maintenance worker for TTL, history pruning, and automatic-index scheduling
+- [x] Maintenance worker for TTL, per-collection history pruning, and automatic-index scheduling
 - [x] Read-only aggregation subset (`$match`, `$group`, `$project`, `$sort`, `$limit`)
 - [x] Daemon, Unix socket, TCP/TLS, bearer auth, uid/gid allow-lists
 - [x] Mutual TLS with client certificate verification and allow-list revocation

@@ -217,6 +217,10 @@ fn execute(
                 "purge_history": purge_history,
             }))
         }
+        WriteReq::SetCollectionHistory { coll, max_versions } => {
+            store.set_collection_history_in(wtxn, coll, *max_versions)?;
+            Ok(json!({ "coll": coll, "max_versions": max_versions }))
+        }
         WriteReq::Expire { entries } => {
             let mut expired = 0usize;
             for entry in entries {

@@ -133,6 +133,8 @@ client timeout with `NONODB_TIMEOUT` or the `timeout=` argument.
 | [`create_collection`](#create_collection) | Create a standard or vault collection |
 | [`set_collection_ttl`](#document-ttl) | Set or clear the default document TTL |
 | [`get_collection_ttl`](#document-ttl) | Read the default document TTL |
+| [`set_collection_history`](#set_collection_history) | Set per-collection history retention (`0` disables) |
+| [`get_collection_history`](#get_collection_history) | Read per-collection history retention |
 | [`map_info`](#lmdb-map-size) | Read map size and high-water mark |
 | [`resize_map`](#lmdb-map-size) | Grow the LMDB map online |
 
@@ -1618,14 +1620,15 @@ Semantics:
 
 ## Document history
 
-History is opt-in on the daemon (`NONODB_HISTORY=1`) and is stored separately
-from the current collection. Searches, indexes, `find`, `count`, `update`, and
+History is configured per collection and is stored separately from the current
+collection. Searches, indexes, `find`, `count`, `update`, and
 `delete` always operate on current documents only. Every write receives a
 global monotonic `rev`; revisions for one document are therefore ordered but
 not necessarily consecutive.
 
-History records inserts, updates, and delete tombstones. The write is atomic
-with the current-document change.
+For a history-enabled collection, inserts, updates, and deletes record
+revisions or delete tombstones. The history append is atomic with the
+current-document change.
 
 ### history
 
@@ -1680,9 +1683,28 @@ metadata is returned without full documents.
 or `null` if that revision no longer exists. A deleted document has a tombstone
 with `"deleted": true` and no document body.
 
-History retention is configured with `NONODB_HISTORY_MAX_VERSIONS` (default
-50). The daemon maintenance worker submits bounded pruning jobs to the single
-writer; pruning never scans history on the hot write path.
+History retention is configured per collection with `set_collection_history`.
+`0` disables new history writes. The daemon maintenance worker submits bounded
+pruning jobs to the single writer; pruning never scans history on the hot write
+path.
+
+### set_collection_history
+
+```json
+{"op":"set_collection_history","coll":"users","max_versions":50}
+```
+
+Sets how many revisions are retained per document in that collection. `0`
+disables new history writes. Requires `admin:<collection>`.
+
+### get_collection_history
+
+```json
+{"op":"get_collection_history","coll":"users"}
+```
+
+Returns `{"coll":"users","max_versions":50}`. Requires
+`read:<collection>`.
 
 ## Document TTL
 
@@ -1855,6 +1877,9 @@ An optional `ttl_seconds` sets the default document TTL for new inserts.
   "ttl_purge_history": false
 }
 ```
+
+History is configured separately per collection with `set_collection_history`;
+new collections start with retention `0` (disabled).
 
 ## list_collections
 

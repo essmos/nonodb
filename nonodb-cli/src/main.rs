@@ -120,6 +120,28 @@ fn run() -> Result<(), String> {
             let res = http_post("/v1/exec", &json!({"op": "map_info"}))?;
             print_result(&res);
         }
+        "history" => {
+            let coll = args
+                .get(1)
+                .ok_or("użycie: nonodb-cli history <kolekcja> [max_wersji]")?;
+            let res = if let Some(raw) = args.get(2) {
+                let max_versions: usize = raw.parse().map_err(|e| format!("max_wersji: {e}"))?;
+                http_post(
+                    "/v1/exec",
+                    &json!({
+                        "op": "set_collection_history",
+                        "coll": coll,
+                        "max_versions": max_versions,
+                    }),
+                )?
+            } else {
+                http_post(
+                    "/v1/exec",
+                    &json!({"op": "get_collection_history", "coll": coll}),
+                )?
+            };
+            print_result(&res);
+        }
         "sql" => sql_cmd(&args[1..])?,
         "shell" => sql_shell()?,
         "auth" => auth_cmd(&args[1..])?,

@@ -149,7 +149,7 @@ property tests, 15 date tests, 11 numeric tests, 8 BSON scalar-type tests, 5
 regex tests, 5 array query tests, 5 array-update tests, 5 find-and-modify tests,
 4 explain tests, 3 sub-database slot tests, 5 online-resize tests, 6
 backup-verification tests, 9 TTL tests, 3 vault tests, 20 SQL tests, 2 SQL parser fuzz tests, 1 reopen
-test, and 2 Rust client unit tests**, all passing (292 total including
+test, and 2 Rust client unit tests**, all passing (293 total including
 doc-tests).
 
 ### End-to-end scripts
@@ -184,6 +184,7 @@ python3 scripts/restore_drill.py             # backup -> verify -> restore -> qu
 python3 scripts/shutdown_test.py             # SIGTERM drain, JSON logs, durable in-flight write
 python3 scripts/auth_test.py                 # scopes, token/cert auth, reload, audit, IP lockout
 python3 scripts/ttl_test.py                  # TTL sweeps, overrides, history, vault
+python3 scripts/history_test.py              # per-collection history enable/disable, restart, CLI
 python3 scripts/vault_test.py                # optional vault encryption end-to-end
 python3 scripts/vault_regression_test.py     # vault API regressions
 python3 scripts/vault_bench.py --docs 5000   # standard vs vault performance
@@ -267,6 +268,7 @@ scripts are:
 | `scripts/ttl_test.py` | TTL defaults, overrides, update semantics, sweeper, vault |
 | `scripts/vault_test.py` | Vault encryption, tenant isolation, and restricted API |
 | `scripts/vault_regression_test.py` | Vault profiles, headers, filters, CRUD, errors, history |
+| `scripts/history_test.py` | Per-collection history retention, isolation, restart durability, CLI |
 | `scripts/vault_bench.py` | Standard vs vault insert/read/update/count performance |
 | `scripts/cpu_bench.py` | Samples daemon CPU from `/proc` |
 | `scripts/large_test.py` | 1M+ document load, indexes, query latency, RAM |
@@ -371,12 +373,12 @@ The tag is `vX.Y.Z`; the annotated tag subject and GitHub Release title are
 
 ```bash
 # final release
-git tag -a v0.15.0 -m "v0.15.0 - SQL delete, expressions, and hardening"
-git push origin v0.15.0
+git tag -a v0.16.0 -m "v0.16.0 - Per-collection history"
+git push origin v0.16.0
 
 # pre-release (the hyphen makes it a GitHub pre-release automatically)
-git tag -a v0.15.0-beta.1 -m "v0.15.0-beta.1 - SQL delete, expressions, and hardening"
-git push origin v0.15.0-beta.1
+git tag -a v0.16.0-beta.1 -m "v0.16.0-beta.1 - Per-collection history"
+git push origin v0.16.0-beta.1
 ```
 
 The release workflow reads the tag annotation and publishes the release with
@@ -398,7 +400,7 @@ notes. `--cleanup=verbatim` prevents Git from stripping lines that start with
 The workflow runs the tests, builds release binaries for Linux x86_64, macOS
 Intel, macOS Apple Silicon, and Windows x86_64, attaches checksums, and
 publishes the GitHub Release. Linux and macOS use `.tar.gz`; Windows uses
-`.zip`. Tags such as `v0.15.0-beta.1` and `v0.15.0-rc.1` are marked as
+`.zip`. Tags such as `v0.16.0-beta.1` and `v0.16.0-rc.1` are marked as
 pre-releases automatically.
 
 ### Manual release
@@ -407,7 +409,7 @@ Use **Actions → Release → Run workflow** and provide:
 
 | Input | Meaning |
 |---|---|
-| `tag` | Tag to publish, e.g. `v0.15.0` or `v0.15.0-rc.1` |
+| `tag` | Tag to publish, e.g. `v0.16.0` or `v0.16.0-rc.1` |
 | `summary` | Short title text after the version: `vX.Y.Z - <summary>` |
 | `prerelease` | Mark the release as a pre-release |
 | `draft` | Create it as a draft for review |

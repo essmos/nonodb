@@ -42,8 +42,8 @@ use serde_json::{json, Value};
 
 use nonodb_core::heed::RoTxn;
 use nonodb_core::{
-    aggregate, project_document, vault, CollectionProfile, FindQuery, HistoryConfig, Store,
-    VaultKey, DEFAULT_FUZZY_DISTANCE, PAGE_SIZE,
+    aggregate, project_document, vault, CollectionProfile, FindQuery, Store, VaultKey,
+    DEFAULT_FUZZY_DISTANCE, PAGE_SIZE,
 };
 use protocol::{ApiError, ApiResponse, LookupBy, Request, VaultAuth, WriteReq};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -144,7 +144,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     let audit = audit::AuditLog::from_env()?;
 
-    let store = Arc::new(Store::open_with_history(&data, HistoryConfig::from_env())?);
+    let store = Arc::new(Store::open(&data)?);
 
     // One writer thread, independent of the tokio runtime (LMDB blocks on fsync).
     let (write_tx, write_rx) = mpsc::channel::<WriteJob>();
@@ -2182,6 +2182,18 @@ async fn exec(
             read_result(joined).await
         }
 
+        Request::GetCollectionHistory { coll } => {
+            let store = state.store.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                let max_versions = store.collection_history(&coll)?;
+                Ok::<Value, ApiError>(json!({
+                    "coll": coll,
+                    "max_versions": max_versions,
+                }))
+            });
+            read_result(joined).await
+        }
+
         Request::ListCollections => {
             let store = state.store.clone();
             let principal = principal.clone();
@@ -2325,6 +2337,9 @@ async fn exec(
                     ttl_seconds,
                     purge_history,
                 },
+                Request::SetCollectionHistory { coll, max_versions } => {
+                    WriteReq::SetCollectionHistory { coll, max_versions }
+                }
                 Request::CreateIndex {
                     coll,
                     field,
@@ -2733,6 +2748,7 @@ fn cacheable(req: &Request) -> bool {
             | Request::VectorSearch { .. }
             | Request::ListCollections
             | Request::GetCollectionTtl { .. }
+            | Request::GetCollectionHistory { .. }
             | Request::History { .. }
             | Request::GetVersion { .. }
     )
@@ -2954,6 +2970,10 @@ fn execute_read(
             };
             reject_vault_read(&c, None, "SQL explain in a read batch")?;
             Ok(nonodb_core::sql::explain_in(&c, rtxn, &query, &params)?)
+        }
+        Request::GetCollectionHistory { coll } => {
+            let max_versions = store.collection_history(&coll)?;
+            Ok(json!({ "coll": coll, "max_versions": max_versions }))
         }
         Request::ListIndexes { coll } => {
             let Some(c) = store.collection_at(rtxn, &coll)? else {

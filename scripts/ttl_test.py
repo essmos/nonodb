@@ -33,6 +33,7 @@ def main() -> None:
     c = db.collection(name)
     c.delete({}, multi=True)
     db.create_collection(name, ttl_seconds=1)
+    db.set_collection_history(name, 10)
     assert db.get_collection_ttl(name) == 1
 
     inherited = c.insert({"_id": "inherited", "v": 1})
@@ -66,14 +67,14 @@ def main() -> None:
 
     # TTL deletion records a history tombstone when history is enabled.
     hist = c.history(later)
-    if hist:
-        assert hist[0]["op"] == "delete", hist
+    assert hist and hist[0]["op"] == "delete", hist
 
     # Opt-in history purge on TTL deletion.
     purge_name = "ttl_purge_e2e"
     db.create_collection(
         purge_name, ttl_seconds=1, ttl_purge_history=True
     )
+    db.set_collection_history(purge_name, 10)
     pc = db.collection(purge_name)
     purge_id = pc.insert({"_id": "purged", "v": 1})
     wait_for(lambda: pc.find_one({"_id": purge_id}) is None)

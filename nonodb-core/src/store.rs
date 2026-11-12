@@ -1,5 +1,6 @@
 //! Opening LMDB and managing collections.
 
+use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
 use std::sync::{Condvar, Mutex};
@@ -9,7 +10,7 @@ use heed::{Database, Env, EnvFlags, EnvOpenOptions, RoTxn, RwTxn};
 
 use crate::collection::Collection;
 use crate::error::{Error, Result};
-use crate::history::{self, HistoryConfig, HISTORY_DB};
+use crate::history::{self, DEFAULT_HISTORY_MAX_VERSIONS, HISTORY_DB};
 use crate::ttl::{self, TTL_DB};
 use crate::vault::CollectionProfile;
 
@@ -200,35 +201,19 @@ pub struct Store {
     env: Env,
     history: Database<Bytes, Bytes>,
     ttl: Database<Bytes, Bytes>,
-    history_config: HistoryConfig,
     txn_gate: TxnGate,
 }
 
 impl Store {
     /// Opens (or creates) the database in the `path` directory.
-    ///
-    /// History is disabled by default for library users. The daemon enables it
-    /// with the `NONODB_HISTORY` environment setting.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        Self::open_with_history(path, HistoryConfig::default())
+        Self::open_with_map_size(path, configured_map_size())
     }
 
-    /// Opens the database with explicit history settings.
-    pub fn open_with_history(
-        path: impl AsRef<Path>,
-        history_config: HistoryConfig,
-    ) -> Result<Self> {
-        Self::open_with_history_and_map_size(path, history_config, configured_map_size())
-    }
-
-    /// Opens the database with explicit history settings and map size.
+    /// Opens the database with an explicit map size.
     ///
     /// Mostly useful for tests, embedded tools, and a controlled offline resize.
-    pub fn open_with_history_and_map_size(
-        path: impl AsRef<Path>,
-        history_config: HistoryConfig,
-        map_size: usize,
-    ) -> Result<Self> {
+    pub fn open_with_map_size(path: impl AsRef<Path>, map_size: usize) -> Result<Self> {
         if map_size < PAGE_SIZE {
             return Err(Error::Query(format!(
                 "map size must be at least one page ({PAGE_SIZE} bytes)"
@@ -253,14 +238,8 @@ impl Store {
             env,
             history,
             ttl,
-            history_config,
             txn_gate: TxnGate::default(),
         })
-    }
-
-    /// Opens a standard database with an explicit map size.
-    pub fn open_with_map_size(path: impl AsRef<Path>, map_size: usize) -> Result<Self> {
-        Self::open_with_history_and_map_size(path, HistoryConfig::default(), map_size)
     }
 
     /// Opens an existing database read-only for verification and inspection.
@@ -291,17 +270,11 @@ impl Store {
             env,
             history,
             ttl,
-            history_config: HistoryConfig::default(),
             txn_gate: TxnGate::default(),
         })
     }
 
-    /// Current history settings.
-    pub fn history_config(&self) -> HistoryConfig {
-        self.history_config
-    }
-
-    /// Deletes old revisions above the configured per-document limit.
+    /// Deletes old revisions above each collection's configured per-document limit.
     ///
     /// Call only from the writer thread. This does a bounded scan and is meant
     /// to run periodically, not as part of every write.
@@ -314,20 +287,27 @@ impl Store {
 
     /// History pruning inside an existing writer transaction.
     pub fn prune_history_in(&self, wtxn: &mut RwTxn<'_>, limit: usize) -> Result<usize> {
-        if !self.history_config.active() {
-            return Ok(0);
-        }
         let meta = self
             .env
             .open_database::<Bytes, Bytes>(wtxn, Some(META_DB))?
             .ok_or_else(|| Error::Query("meta database missing".into()))?;
-        history::prune(
-            &self.history,
-            &meta,
-            wtxn,
-            self.history_config.max_versions,
-            limit,
-        )
+        let mut limits = HashMap::new();
+        for item in meta.iter(&*wtxn)? {
+            let (key, value) = item?;
+            let Some(name) = std::str::from_utf8(key)
+                .ok()
+                .and_then(|k| k.strip_prefix("history:"))
+            else {
+                continue;
+            };
+            if let Some(max) = std::str::from_utf8(value)
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+            {
+                limits.insert(name.to_string(), max);
+            }
+        }
+        history::prune(&self.history, &meta, wtxn, &limits, limit)
     }
 
     /// Raw LMDB environment.
@@ -434,6 +414,34 @@ impl Store {
 
     fn profile_key(name: &str) -> String {
         format!("profile:{name}")
+    }
+
+    fn history_key(name: &str) -> String {
+        format!("history:{name}")
+    }
+
+    fn history_from_ro(
+        meta: Database<Bytes, Bytes>,
+        rtxn: &RoTxn<'_>,
+        name: &str,
+    ) -> Result<usize> {
+        Ok(meta
+            .get(rtxn, Self::history_key(name).as_bytes())?
+            .and_then(|b| std::str::from_utf8(b).ok())
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_HISTORY_MAX_VERSIONS))
+    }
+
+    fn history_from_rw(
+        meta: Database<Bytes, Bytes>,
+        wtxn: &RwTxn<'_>,
+        name: &str,
+    ) -> Result<usize> {
+        Ok(meta
+            .get(wtxn, Self::history_key(name).as_bytes())?
+            .and_then(|b| std::str::from_utf8(b).ok())
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_HISTORY_MAX_VERSIONS))
     }
 
     fn ttl_key(name: &str) -> String {
@@ -623,7 +631,8 @@ impl Store {
         }
         let ttl_default = Self::ttl_from_rw(meta, wtxn, name)?;
         let purge = Self::ttl_purge_from_rw(meta, wtxn, name)?;
-        Ok(self.wrap(name, db, meta, profile, ttl_default, purge))
+        let history = Self::history_from_rw(meta, wtxn, name)?;
+        Ok(self.wrap(name, db, meta, profile, ttl_default, purge, history))
     }
 
     fn validate_ttl(seconds: u64) -> Result<()> {
@@ -721,6 +730,52 @@ impl Store {
         Ok(out)
     }
 
+    /// Sets the per-collection history retention. `0` disables new history writes.
+    pub fn set_collection_history(&self, name: &str, max_versions: usize) -> Result<()> {
+        let mut wtxn = self.write_txn()?;
+        self.set_collection_history_in(&mut wtxn, name, max_versions)?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    /// Sets per-collection history retention inside an existing writer transaction.
+    pub fn set_collection_history_in(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        name: &str,
+        max_versions: usize,
+    ) -> Result<()> {
+        Self::validate_name(name)?;
+        if self.collection_profile_in_rw(wtxn, name)?.is_none() {
+            return Err(Error::Query(format!("collection `{name}` does not exist")));
+        }
+        let meta = self
+            .env
+            .create_database::<Bytes, Bytes>(&mut *wtxn, Some(META_DB))?;
+        if max_versions == 0 {
+            meta.delete(&mut *wtxn, Self::history_key(name).as_bytes())?;
+        } else {
+            meta.put(
+                &mut *wtxn,
+                Self::history_key(name).as_bytes(),
+                max_versions.to_string().as_bytes(),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Returns the per-collection history retention. `0` means disabled.
+    pub fn collection_history(&self, name: &str) -> Result<usize> {
+        let rtxn = self.read_txn()?;
+        let meta = self
+            .env
+            .open_database::<Bytes, Bytes>(&rtxn, Some(META_DB))?
+            .ok_or_else(|| Error::Query("meta database missing".into()))?;
+        let out = Self::history_from_ro(meta, &rtxn, name)?;
+        rtxn.commit()?;
+        Ok(out)
+    }
+
     /// Returns the profile of a collection, or `None` if it does not exist.
     pub fn collection_profile(&self, name: &str) -> Result<Option<CollectionProfile>> {
         let rtxn = self.read_txn()?;
@@ -787,8 +842,9 @@ impl Store {
                 let profile = Self::profile_from_ro(meta, &rtxn, name)?;
                 let ttl_default = Self::ttl_from_ro(meta, &rtxn, name)?;
                 let purge = Self::ttl_purge_from_ro(meta, &rtxn, name)?;
+                let history = Self::history_from_ro(meta, &rtxn, name)?;
                 rtxn.commit()?;
-                return Ok(self.wrap(name, db, meta, profile, ttl_default, purge));
+                return Ok(self.wrap(name, db, meta, profile, ttl_default, purge, history));
             }
             rtxn.commit()?;
         }
@@ -818,7 +874,8 @@ impl Store {
         let profile = Self::profile_from_rw(meta, wtxn, name)?;
         let ttl_default = Self::ttl_from_rw(meta, wtxn, name)?;
         let purge = Self::ttl_purge_from_rw(meta, wtxn, name)?;
-        Ok(self.wrap(name, db, meta, profile, ttl_default, purge))
+        let history = Self::history_from_rw(meta, wtxn, name)?;
+        Ok(self.wrap(name, db, meta, profile, ttl_default, purge, history))
     }
 
     /// Opens an **existing** collection in the given read transaction.
@@ -839,7 +896,16 @@ impl Store {
         let profile = Self::profile_from_ro(meta, rtxn, name)?;
         let ttl_default = Self::ttl_from_ro(meta, rtxn, name)?;
         let purge = Self::ttl_purge_from_ro(meta, rtxn, name)?;
-        Ok(Some(self.wrap(name, db, meta, profile, ttl_default, purge)))
+        let history = Self::history_from_ro(meta, rtxn, name)?;
+        Ok(Some(self.wrap(
+            name,
+            db,
+            meta,
+            profile,
+            ttl_default,
+            purge,
+            history,
+        )))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -851,6 +917,7 @@ impl Store {
         profile: CollectionProfile,
         ttl_default: Option<u64>,
         purge_history: bool,
+        history_max_versions: usize,
     ) -> Collection<'e> {
         Collection::new(
             &self.env,
@@ -858,7 +925,7 @@ impl Store {
             meta,
             self.history,
             self.ttl,
-            self.history_config,
+            history_max_versions,
             name.to_string(),
             profile,
             ttl_default,

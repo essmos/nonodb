@@ -30,7 +30,10 @@ pub fn authorize_request(principal: &Principal, req: &Request) -> Result<(), Api
         | Request::Fuzzy { coll, .. }
         | Request::History { coll, .. }
         | Request::GetVersion { coll, .. }
-        | Request::GetCollectionTtl { coll } => allow(principal, Action::Read, coll, req.op_name()),
+        | Request::GetCollectionTtl { coll }
+        | Request::GetCollectionHistory { coll } => {
+            allow(principal, Action::Read, coll, req.op_name())
+        }
 
         Request::Sql { query, .. } => {
             let (coll, read_only) =
@@ -63,7 +66,8 @@ pub fn authorize_request(principal: &Principal, req: &Request) -> Result<(), Api
         | Request::CreateVectorIndex { coll, .. }
         | Request::DropVectorIndex { coll, .. }
         | Request::CreateCollection { coll, .. }
-        | Request::SetCollectionTtl { coll, .. } => {
+        | Request::SetCollectionTtl { coll, .. }
+        | Request::SetCollectionHistory { coll, .. } => {
             allow(principal, Action::AdminCollection, coll, req.op_name())
         }
 
