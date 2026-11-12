@@ -25,7 +25,11 @@ nonodb-cli gui
 nonodb-cli gui --port 8788
 nonodb-cli gui --no-open
 nonodb-cli gui --host 0.0.0.0 --allow-remote
+nonodb-cli gui --url http://127.0.0.1:7879
 ```
+
+`--url` makes the GUI proxy use daemon TCP with bearer-token authentication;
+the Unix socket path is treated as trusted local admin.
 
 The server listens on `127.0.0.1` by default. Non-loopback binds require
 `--allow-remote` and should sit behind TLS/auth. It proxies `/v1/exec`,

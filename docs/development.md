@@ -384,12 +384,12 @@ The tag is `vX.Y.Z`; the annotated tag subject and GitHub Release title are
 
 ```bash
 # final release
-git tag -a v0.19.0 -m "v0.19.0 - Embedded GUI console"
-git push origin v0.19.0
+git tag -a v0.20.0 -m "v0.20.0 - GUI login and authentication"
+git push origin v0.20.0
 
 # pre-release (the hyphen makes it a GitHub pre-release automatically)
-git tag -a v0.19.0-beta.1 -m "v0.19.0-beta.1 - Embedded GUI console"
-git push origin v0.19.0-beta.1
+git tag -a v0.20.0-beta.1 -m "v0.20.0-beta.1 - Embedded GUI console"
+git push origin v0.20.0-beta.1
 ```
 
 The release workflow reads the tag annotation and publishes the release with
@@ -411,7 +411,7 @@ notes. `--cleanup=verbatim` prevents Git from stripping lines that start with
 The workflow runs the tests, builds release binaries for Linux x86_64, macOS
 Intel, macOS Apple Silicon, and Windows x86_64, attaches checksums, and
 publishes the GitHub Release. Linux and macOS use `.tar.gz`; Windows uses
-`.zip`. Tags such as `v0.19.0-beta.1` and `v0.19.0-rc.1` are marked as
+`.zip`. Tags such as `v0.20.0-beta.1` and `v0.20.0-rc.1` are marked as
 pre-releases automatically.
 
 ### Manual release
@@ -420,7 +420,7 @@ Use **Actions → Release → Run workflow** and provide:
 
 | Input | Meaning |
 |---|---|
-| `tag` | Tag to publish, e.g. `v0.19.0` or `v0.19.0-rc.1` |
+| `tag` | Tag to publish, e.g. `v0.20.0` or `v0.20.0-rc.1` |
 | `summary` | Short title text after the version: `vX.Y.Z - <summary>` |
 | `prerelease` | Mark the release as a pre-release |
 | `draft` | Create it as a draft for review |

@@ -14,7 +14,6 @@ struct Assets;
 enum Target {
     #[cfg(unix)]
     Unix(String),
-    #[cfg(not(unix))]
     Tcp(String),
 }
 
@@ -36,6 +35,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
     let mut port = 8787u16;
     let mut open = true;
     let mut allow_remote = false;
+    let mut url: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -58,6 +58,14 @@ pub fn run(args: &[String]) -> Result<(), String> {
                 allow_remote = true;
                 i += 1;
             }
+            "--url" => {
+                url = Some(
+                    args.get(i + 1)
+                        .ok_or("--url wymaga adresu, np. http://127.0.0.1:7879")?
+                        .clone(),
+                );
+                i += 2;
+            }
             "--no-open" => {
                 open = false;
                 i += 1;
@@ -78,7 +86,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
         );
     }
 
-    let target = target()?;
+    let target = target(url.as_deref())?;
     let listener = TcpListener::bind((host.as_str(), port))
         .map_err(|e| format!("cannot bind {host}:{port}: {e}"))?;
     let browser_host = match host.as_str() {
@@ -107,7 +115,15 @@ pub fn run(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn target() -> Result<Target, String> {
+fn target(url: Option<&str>) -> Result<Target, String> {
+    if let Some(url) = url {
+        let addr = url
+            .strip_prefix("http://")
+            .ok_or("--url must start with http://")?
+            .trim_end_matches('/')
+            .to_string();
+        return Ok(Target::Tcp(addr));
+    }
     #[cfg(unix)]
     {
         Ok(Target::Unix(
@@ -117,12 +133,7 @@ fn target() -> Result<Target, String> {
     #[cfg(not(unix))]
     {
         let url = std::env::var("NONODB_URL").unwrap_or_else(|_| "http://127.0.0.1:7878".into());
-        let addr = url
-            .strip_prefix("http://")
-            .ok_or("NONODB_URL must start with http://")?
-            .trim_end_matches('/')
-            .to_string();
-        Ok(Target::Tcp(addr))
+        target(Some(&url))
     }
 }
 
@@ -135,6 +146,17 @@ fn handle(mut client: TcpStream, target: &Target) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     let request = read_request(&mut client)?;
 
+    if request.path == "/gui/session" {
+        let token = std::env::var("NONODB_TOKEN").unwrap_or_default();
+        let body = serde_json::json!({ "token": token }).to_string();
+        return write_response(
+            &mut client,
+            200,
+            "application/json; charset=utf-8",
+            body.as_bytes(),
+            false,
+        );
+    }
     if request.path.starts_with("/v1/watch") {
         return proxy_stream(client, target, &request);
     }
@@ -297,7 +319,6 @@ fn connect(target: &Target) -> Result<Upstream, String> {
                 .map_err(|e| format!("connect: {e}"))?;
             Ok(Box::new(stream))
         }
-        #[cfg(not(unix))]
         Target::Tcp(addr) => {
             let stream = TcpStream::connect(addr).map_err(|e| format!("connect {addr}: {e}"))?;
             stream

@@ -210,3 +210,14 @@ export async function watchStream(
     }
   }
 }
+
+export async function sessionDefaults(): Promise<{ token: string }> {
+  try {
+    const response = await fetch('/gui/session', { headers: { accept: 'application/json' } });
+    if (!response.ok) return { token: '' };
+    const payload = await response.json();
+    return { token: typeof payload?.token === 'string' ? payload.token : '' };
+  } catch {
+    return { token: '' };
+  }
+}

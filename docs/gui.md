@@ -23,14 +23,29 @@ must pass both `--host` and `--allow-remote`:
 nonodb-cli gui --host 0.0.0.0 --allow-remote
 ```
 
+To enforce daemon bearer-token authentication, point the GUI proxy at the
+daemon's TCP listener instead of the trusted Unix socket:
+
+```bash
+nonodb-cli gui --url http://127.0.0.1:7879
+```
+
+Unix sockets are treated as trusted local admin connections, so token auth is not
+enforced on that path.
+
 Exposing the GUI beyond loopback is only safe with TLS, authentication, and a
 trusted reverse proxy or tunnel. The GUI itself does not terminate TLS.
 
 ## Connection
 
-The default endpoint is the local GUI origin. When authentication is enabled,
-enter a bearer token on the Connect screen. Vault collections additionally need
-the tenant, key id, and vault key.
+The GUI uses the same database credential as the CLI and API: a NonoDB bearer
+token. There is no separate GUI account.
+
+- Local GUI connects without a token when daemon authorization is disabled.
+- If the GUI process has `NONODB_TOKEN`, the local GUI session endpoint fills
+  the token automatically.
+- Otherwise enter the token in the single **Database token** field.
+- Vault tenant, key id, key, endpoint, and saved profiles are under **Advanced**.
 
 Credentials are kept in browser `sessionStorage` for the active session. Saved
 connection profiles use browser `localStorage`; do not save production tokens on
@@ -185,7 +200,7 @@ docker run -d --name nonodb-gui \
   -p 127.0.0.1:8787:8787 \
   -v nonodb-run:/run/nonodb \
   -e NONODB_SOCK=/run/nonodb/nonodb.sock \
-  ghcr.io/essmos/nonodb:0.19.0 \
+  ghcr.io/essmos/nonodb:0.20.0 \
   nonodb-cli gui --host 0.0.0.0 --port 8787 --allow-remote --no-open
 ```
 

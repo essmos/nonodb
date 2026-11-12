@@ -16,6 +16,7 @@ import {
   metrics,
   saveConnection,
   saveProfiles,
+  sessionDefaults,
   type ConnectionProfile,
   subscribeTiming,
   watchStream,
@@ -216,7 +217,7 @@ function ConnectView({ onConnected }: { onConnected: (connection: Connection) =>
   const [connection, setConnection] = useState<Connection>(() => loadConnection());
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
-  const [showVault, setShowVault] = useState(false);
+  const [advanced, setAdvanced] = useState(false);
   const [profiles, setProfiles] = useState<ConnectionProfile[]>(() => loadProfiles());
   const [profileName, setProfileName] = useState('');
 
@@ -258,108 +259,120 @@ function ConnectView({ onConnected }: { onConnected: (connection: Connection) =>
         <div className="brand large">
           <span className="brand-mark">N</span>
           <div>
-            <h1>NonoDB Console</h1>
-            <p>Local-first database administration</p>
+            <h1>Connect to NonoDB</h1>
+            <p>Use the same database token as the CLI or API</p>
           </div>
         </div>
-        {profiles.length > 0 && (
-          <label>
-            Saved profile
-            <div className="inline-control">
-              <select
-                value=""
-                onChange={(e) => {
-                  const profile = profiles.find((item) => item.name === e.target.value);
-                  if (profile) {
-                    setConnection(profile.connection);
-                    setProfileName(profile.name);
-                  }
-                }}
-              >
-                <option value="">Choose a saved connection…</option>
-                {profiles.map((profile) => (
-                  <option key={profile.name} value={profile.name}>
-                    {profile.name} — {profile.connection.endpoint}
-                  </option>
-                ))}
-              </select>
-              {profileName && (
-                <button className="small" onClick={() => removeProfile(profileName)}>
-                  Remove
-                </button>
-              )}
-            </div>
-          </label>
-        )}
         <label>
-          Endpoint
-          <input
-            value={connection.endpoint}
-            onChange={(e) => setConnection({ ...connection, endpoint: e.target.value })}
-            placeholder="http://127.0.0.1:8787"
-            autoComplete="url"
-          />
-        </label>
-        <label>
-          Token
+          Database token
           <input
             type="password"
             value={connection.token}
             onChange={(e) => setConnection({ ...connection, token: e.target.value })}
-            placeholder="Optional when auth is disabled"
+            placeholder="nodb_..."
             autoComplete="off"
+            autoFocus
           />
+          <span className="field-hint">
+            Leave empty when the daemon runs without authorization. This is the same
+            `NONODB_TOKEN` you use with `nonodb-cli` or API clients.
+          </span>
         </label>
-        <div className="inline-control">
-          <input
-            value={profileName}
-            onChange={(e) => setProfileName(e.target.value)}
-            placeholder="Profile name"
-          />
-          <button className="small" onClick={rememberProfile}>
-            Save profile
-          </button>
+        <div className="connect-summary">
+          <span>Server</span>
+          <code>{connection.endpoint}</code>
         </div>
-        <p className="hint">
-          Profiles are stored in browser localStorage. Do not save production tokens on a
-          shared machine.
-        </p>
-        <button className="link-button" onClick={() => setShowVault(!showVault)}>
-          {showVault ? 'Hide vault credentials' : 'Vault credentials'}
-        </button>
-        {showVault && (
-          <div className="vault-fields">
-            <label>
-              Tenant
-              <input
-                value={connection.tenant}
-                onChange={(e) => setConnection({ ...connection, tenant: e.target.value })}
-              />
-            </label>
-            <label>
-              Key id
-              <input
-                value={connection.keyId}
-                onChange={(e) => setConnection({ ...connection, keyId: e.target.value })}
-              />
-            </label>
-            <label>
-              Vault key
-              <input
-                type="password"
-                value={connection.key}
-                onChange={(e) => setConnection({ ...connection, key: e.target.value })}
-                autoComplete="off"
-              />
-            </label>
-          </div>
-        )}
-        {error && <div className="error-box">{error}</div>}
         <button className="primary wide" onClick={connect} disabled={busy}>
           {busy ? 'Connecting…' : 'Connect'}
         </button>
+        {error && <div className="error-box">{error}</div>}
+        <button className="link-button" onClick={() => setAdvanced(!advanced)}>
+          {advanced ? 'Hide advanced options' : 'Advanced: endpoint, profiles, vault'}
+        </button>
+        {advanced && (
+          <div className="advanced-panel">
+            <label>
+              Endpoint
+              <input
+                value={connection.endpoint}
+                onChange={(e) => setConnection({ ...connection, endpoint: e.target.value })}
+                placeholder="http://127.0.0.1:8787"
+              />
+            </label>
+            {profiles.length > 0 && (
+              <label>
+                Saved profile
+                <div className="inline-control">
+                  <select
+                    value=""
+                    onChange={(e) => {
+                      const profile = profiles.find((item) => item.name === e.target.value);
+                      if (profile) {
+                        setConnection(profile.connection);
+                        setProfileName(profile.name);
+                      }
+                    }}
+                  >
+                    <option value="">Choose a saved connection…</option>
+                    {profiles.map((profile) => (
+                      <option key={profile.name} value={profile.name}>
+                        {profile.name} — {profile.connection.endpoint}
+                      </option>
+                    ))}
+                  </select>
+                  {profileName && (
+                    <button className="small" onClick={() => removeProfile(profileName)}>
+                      Remove
+                    </button>
+                  )}
+                </div>
+              </label>
+            )}
+            <div className="inline-control">
+              <input
+                value={profileName}
+                onChange={(e) => setProfileName(e.target.value)}
+                placeholder="Profile name"
+              />
+              <button className="small" onClick={rememberProfile}>
+                Save profile
+              </button>
+            </div>
+            <p className="hint">
+              Saved profiles use browser localStorage. Do not save production tokens on a
+              shared machine.
+            </p>
+            <div className="vault-fields">
+              <strong className="small">Vault collection credentials (optional)</strong>
+              <label>
+                Tenant
+                <input
+                  value={connection.tenant}
+                  onChange={(e) => setConnection({ ...connection, tenant: e.target.value })}
+                />
+              </label>
+              <label>
+                Key id
+                <input
+                  value={connection.keyId}
+                  onChange={(e) => setConnection({ ...connection, keyId: e.target.value })}
+                />
+              </label>
+              <label>
+                Vault key
+                <input
+                  type="password"
+                  value={connection.key}
+                  onChange={(e) => setConnection({ ...connection, key: e.target.value })}
+                  autoComplete="off"
+                />
+              </label>
+            </div>
+          </div>
+        )}
         <p className="hint">
-          Tip: run <code>nonodb-cli gui</code> and open the printed local URL.
+          Tip: run <code>nonodb-cli gui</code>. On a local host with
+          <code> NONODB_TOKEN</code> set, the token is filled automatically.
         </p>
       </div>
     </div>
@@ -2444,10 +2457,9 @@ function Shell({
 }
 
 export default function App() {
-  const [initialConnection] = useState<Connection>(() => loadConnection());
-  const [connection, setConnection] = useState<Connection>(initialConnection);
+  const [connection, setConnection] = useState<Connection>(() => loadConnection());
   const [connected, setConnected] = useState(false);
-  const [checking, setChecking] = useState(Boolean(initialConnection.endpoint));
+  const [checking, setChecking] = useState(true);
   const [lastTiming, setLastTiming] = useState<ApiTiming | null>(null);
   const [timings, setTimings] = useState<ApiTiming[]>([]);
   const [showActivity, setShowActivity] = useState(false);
@@ -2463,18 +2475,33 @@ export default function App() {
 
   useEffect(() => {
     let cancelled = false;
-    if (!initialConnection.endpoint) {
-      setChecking(false);
-      return;
-    }
-    exec(initialConnection, { op: 'list_collections' })
-      .then(() => !cancelled && setConnected(true))
-      .catch(() => !cancelled && setConnected(false))
-      .finally(() => !cancelled && setChecking(false));
+    const boot = async () => {
+      let current = loadConnection();
+      const defaults = await sessionDefaults();
+      if (!current.token && defaults.token) {
+        current = { ...current, token: defaults.token };
+        saveConnection(current);
+      }
+      if (cancelled) return;
+      setConnection(current);
+      if (!current.endpoint) {
+        setChecking(false);
+        return;
+      }
+      try {
+        await exec(current, { op: 'list_collections' });
+        if (!cancelled) setConnected(true);
+      } catch {
+        if (!cancelled) setConnected(false);
+      } finally {
+        if (!cancelled) setChecking(false);
+      }
+    };
+    void boot();
     return () => {
       cancelled = true;
     };
-  }, [initialConnection]);
+  }, []);
 
   let content: ReactNode;
   if (checking) {
@@ -2518,7 +2545,7 @@ export default function App() {
       {showActivity && (
         <Modal
           title="Recent operations"
-          subtitle="Client-side timings for this GUI session"
+          subtitle="Backend timings for this GUI session"
           onClose={() => setShowActivity(false)}
           wide
         >
