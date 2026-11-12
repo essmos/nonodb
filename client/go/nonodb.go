@@ -410,7 +410,7 @@ func isReadOp(payload map[string]any) bool {
 	switch op {
 	case "find", "find_one", "lookup", "watch", "count", "list_indexes", "list_collections",
 		"list_text_indexes", "list_fuzzy_indexes", "list_vector_indexes",
-		"search", "fuzzy", "vector_search", "history", "get_version", "get_collection_history", "get_collection_events", "sql", "explain_sql", "batch":
+		"search", "fuzzy", "vector_search", "history", "get_version", "get_collection_history", "get_collection_events", "list_subscriptions", "sql", "explain_sql", "batch":
 		return true
 	default:
 		return false
@@ -567,6 +567,76 @@ func (c *Client) CollectionEvents(ctx context.Context, name string) (map[string]
 		return nil, err
 	}
 	return result, nil
+}
+
+// CreateSubscription creates or replaces a conditional subscription.
+func (c *Client) CreateSubscription(ctx context.Context, coll string, subscription map[string]any) (map[string]any, error) {
+	req := make(map[string]any, len(subscription)+2)
+	for k, v := range subscription {
+		req[k] = v
+	}
+	req["op"] = "create_subscription"
+	req["coll"] = coll
+	raw, err := c.execRaw(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	var result map[string]any
+	if err := decodeInto(raw, &result); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// RenewSubscription renews a persistent subscription lease.
+func (c *Client) RenewSubscription(ctx context.Context, coll, name string, leaseSeconds *uint64) (map[string]any, error) {
+	req := map[string]any{"op": "renew_subscription", "coll": coll, "name": name}
+	if leaseSeconds != nil {
+		req["lease_seconds"] = *leaseSeconds
+	}
+	raw, err := c.execRaw(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	var result struct {
+		Subscription map[string]any `json:"subscription"`
+	}
+	if err := decodeInto(raw, &result); err != nil {
+		return nil, err
+	}
+	return result.Subscription, nil
+}
+
+// DeleteSubscription removes a conditional subscription.
+func (c *Client) DeleteSubscription(ctx context.Context, coll, name string) (bool, error) {
+	raw, err := c.execRaw(ctx, map[string]any{
+		"op": "delete_subscription", "coll": coll, "name": name,
+	})
+	if err != nil {
+		return false, err
+	}
+	var result struct {
+		Deleted bool `json:"deleted"`
+	}
+	if err := decodeInto(raw, &result); err != nil {
+		return false, err
+	}
+	return result.Deleted, nil
+}
+
+// ListSubscriptions lists conditional subscriptions on a collection.
+func (c *Client) ListSubscriptions(ctx context.Context, coll string) ([]map[string]any, error) {
+	raw, err := c.execRaw(ctx, map[string]any{"op": "list_subscriptions", "coll": coll})
+	if err != nil {
+		return nil, err
+	}
+	var result struct {
+		Subscriptions []map[string]any `json:"subscriptions"`
+	}
+	if err := decodeInto(raw, &result); err != nil {
+		return nil, err
+	}
+	return result.Subscriptions, nil
 }
 
 // Collections lists collection names.

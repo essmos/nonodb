@@ -130,6 +130,26 @@ nonodb-cli events tail --once             # print one batch and exit
 Events are written to `_events` in the same transaction as the data change.
 See [Outbox events](events.md).
 
+## subscriptions
+
+Persistent conditions over collection state, evaluated by the writer:
+
+```bash
+nonodb-cli subscribe orders paid --filter '{"status":"paid"}' --lease 600
+nonodb-cli subscribe orders many --count '{"filter":{"total":{"$gt":100}},"gt":100}'
+nonodb-cli subscribe orders high_once --filter '{"total":{"$gt":100}}' --once
+nonodb-cli subscribe orders changed --ops update --type custom.orders_changed
+nonodb-cli subscription-ping orders paid 600
+nonodb-cli subscriptions orders
+nonodb-cli unsubscribe orders paid
+```
+
+By default every matching write emits. `--once` is optional and switches to
+edge-triggered (`false -> true`). Persistent subscriptions have a client lease
+(default 600 seconds); run `subscription-ping` before it expires. Events are
+stored in `_events` with type `subscription.<name>` unless `--type` is given. See
+[Conditional subscriptions](subscriptions.md).
+
 ## history
 
 Show or set per-collection revision history retention:

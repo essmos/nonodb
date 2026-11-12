@@ -48,6 +48,7 @@ _READ_OPS = {
     "get_collection_ttl",
     "get_collection_history",
     "get_collection_events",
+    "list_subscriptions",
     "list_text_indexes",
     "list_fuzzy_indexes",
     "list_vector_indexes",
@@ -478,6 +479,77 @@ class NonoDB:
     def get_collection_events(self, name: str) -> dict[str, Any]:
         """Returns automatic change-event settings for a collection."""
         return self.exec({"op": "get_collection_events", "coll": name})
+
+    def create_subscription(
+        self,
+        coll: str,
+        name: str,
+        *,
+        filter: Optional[dict[str, Any]] = None,
+        count: Optional[dict[str, Any]] = None,
+        ops: Optional[list[str]] = None,
+        once: bool = False,
+        event_type: Optional[str] = None,
+        lease_seconds: int = 600,
+    ) -> dict[str, Any]:
+        """Creates/replaces a conditional subscription on a collection.
+
+        The client must renew the lease before it expires; the default is
+        10 minutes. Use `renew_subscription` from a keepalive task.
+        """
+        payload: dict[str, Any] = {
+            "op": "create_subscription",
+            "coll": coll,
+            "name": name,
+            "ops": list(ops or []),
+            "filter": filter or {},
+            "once": once,
+            "lease_seconds": lease_seconds,
+        }
+        if count is not None:
+            payload["count"] = count
+        if event_type is not None:
+            payload["event_type"] = event_type
+        return self.exec(payload)
+
+    def renew_subscription(
+        self,
+        coll: str,
+        name: str,
+        *,
+        lease_seconds: Optional[int] = None,
+    ) -> Optional[dict[str, Any]]:
+        """Renews a persistent subscription lease. Returns ``None`` if gone."""
+        payload: dict[str, Any] = {
+            "op": "renew_subscription",
+            "coll": coll,
+            "name": name,
+        }
+        if lease_seconds is not None:
+            payload["lease_seconds"] = lease_seconds
+        return self.exec(payload).get("subscription")
+
+    def ping_subscription(
+        self,
+        coll: str,
+        name: str,
+        *,
+        lease_seconds: Optional[int] = None,
+    ) -> Optional[dict[str, Any]]:
+        """Alias for `renew_subscription`."""
+        return self.renew_subscription(coll, name, lease_seconds=lease_seconds)
+
+    def delete_subscription(self, coll: str, name: str) -> bool:
+        """Deletes a conditional subscription."""
+        return self.exec(
+            {"op": "delete_subscription", "coll": coll, "name": name}
+        )["deleted"]
+
+    def list_subscriptions(self, coll: str) -> list[dict[str, Any]]:
+        """Lists conditional subscriptions on a collection."""
+        return self.exec({"op": "list_subscriptions", "coll": coll})[
+            "subscriptions"
+        ]
 
     def vault(self, tenant: str, key_id: str, key: str) -> "VaultDB":
         """Returns a handle that sends vault encryption headers on every request."""
@@ -1014,6 +1086,12 @@ class Collection:
         timeout_ms: Optional[int] = None,
         overlap_ms: Optional[int] = None,
         threshold: Optional[dict[str, Any]] = None,
+        mode: Optional[str] = None,
+        ops: Optional[Iterable[str]] = None,
+        count: Optional[dict[str, Any]] = None,
+        once: bool = False,
+        name: Optional[str] = None,
+        event_type: Optional[str] = None,
         retry: bool = True,
         retry_delay: float = 1.0,
         max_retry_delay: float = 30.0,
@@ -1035,27 +1113,41 @@ class Collection:
         cursor = after
         delay = max(0.001, retry_delay)
         while True:
+            live = mode == "live"
             payload: dict[str, Any] = {
                 "op": "watch",
                 "coll": self.name,
                 "limit": limit,
             }
-            if cursor:
+            if live:
+                payload["mode"] = "live"
+            elif cursor:
                 payload["after"] = cursor
-            if types is not None:
+            if types is not None and not live:
                 payload["types"] = list(types)
             if filter is not None:
                 payload["filter"] = filter
-            if projection is not None:
+            if projection is not None and not live:
                 payload["projection"] = projection
             if heartbeat_ms is not None:
                 payload["heartbeat_ms"] = heartbeat_ms
             if timeout_ms is not None:
                 payload["timeout_ms"] = timeout_ms
-            if overlap_ms is not None:
+            if overlap_ms is not None and not live:
                 payload["overlap_ms"] = overlap_ms
-            if threshold is not None:
+            if threshold is not None and not live:
                 payload["threshold"] = threshold
+            if live:
+                if ops is not None:
+                    payload["ops"] = list(ops)
+                if count is not None:
+                    payload["count"] = count
+                if once:
+                    payload["once"] = True
+                if name is not None:
+                    payload["name"] = name
+                if event_type is not None:
+                    payload["event_type"] = event_type
             headers = {
                 "content-type": "application/json",
                 "accept": "application/x-ndjson",
@@ -1114,6 +1206,42 @@ class Collection:
                     raise NonoDBError("connection", str(exc)) from exc
                 time.sleep(delay)
                 delay = min(max_retry_delay, delay * 2)
+
+    def watch_live(
+        self,
+        *,
+        filter: Optional[dict[str, Any]] = None,
+        count: Optional[dict[str, Any]] = None,
+        ops: Optional[Iterable[str]] = None,
+        once: bool = False,
+        heartbeat_ms: int = 10_000,
+        timeout_ms: Optional[int] = None,
+        name: Optional[str] = None,
+        event_type: Optional[str] = None,
+        retry: bool = True,
+        retry_delay: float = 1.0,
+        max_retry_delay: float = 30.0,
+    ) -> Iterator[dict[str, Any]]:
+        """Yields matching changes over a connection-scoped live SSE stream.
+
+        The subscription exists only while the stream is connected and is
+        removed immediately on disconnect (or after a short idle grace period
+        for half-open connections). Live events are not written to `_events`.
+        """
+        return self.watch_stream(
+            mode="live",
+            filter=filter,
+            count=count,
+            ops=ops,
+            once=once,
+            heartbeat_ms=heartbeat_ms,
+            timeout_ms=timeout_ms,
+            name=name,
+            event_type=event_type,
+            retry=retry,
+            retry_delay=retry_delay,
+            max_retry_delay=max_retry_delay,
+        )
 
     def find(
         self,

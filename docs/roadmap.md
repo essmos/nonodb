@@ -5,7 +5,7 @@ is deliberately out of scope, and which gaps are candidates for future work.
 
 ## Current status
 
-The project is at `0.17.0`. It is suitable for local and single-host
+The project is at `0.18.0`. It is suitable for local and single-host
 applications that need a small, durable, queryable JSON store and can accept a
 single-writer model.
 
@@ -45,6 +45,11 @@ Implemented:
   server-side `watch` long-polling and continuous NDJSON/SSE streaming;
 - server-side stream filtering by topic and payload, plus count thresholds with
   grouping and time windows;
+- persistent conditional subscriptions with document filters, index-backed
+  count conditions, level-triggered delivery by default, and optional
+  edge-triggered (`once`) mode;
+- connection-scoped live subscriptions (`watch` with `mode:"live"`) that push
+  matching changes directly to SSE/NDJSON without writing to `_events`;
 - per-collection append-only document revision history with retention (`0` disables);
 - document TTL with collection defaults, per-document overrides, and background expiry;
 - BSON-compatible dates with RFC 3339 input, UTC normalization, indexed ranges, and sorting;

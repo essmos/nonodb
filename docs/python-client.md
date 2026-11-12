@@ -759,6 +759,39 @@ Operations run in order, and later operations see earlier changes in the same
 transaction. On failure, `NonoDBError` is raised and nothing from the batch is
 committed.
 
+## Live subscriptions
+
+`watch_live` opens a streaming connection and yields matching changes while the
+connection remains open. The subscription lives only for that connection and is
+not written to `_events`.
+
+```python
+for event in db.collection("orders").watch_live(
+    filter={"status": "paid"},
+    heartbeat_ms=10_000,
+):
+    print(event["payload"]["op"], event["payload"]["after"])
+```
+
+Count conditions and edge-triggered mode are supported:
+
+```python
+for event in db.collection("orders").watch_live(
+    count={"filter": {"total": {"$gt": 100}}, "gt": 100},
+):
+    print("many high-value orders:", event["payload"]["count"])
+
+for event in db.collection("orders").watch_live(
+    filter={"total": {"$gt": 100}},
+    once=True,
+):
+    print("crossed the threshold")
+```
+
+There is no replay cursor. After a disconnect, reconnect creates a new
+subscription; take a snapshot if you need to cover the gap. See
+[Conditional subscriptions](subscriptions.md#connection-scoped-live-mode).
+
 ## Cache
 
 The client has an optional per-process read cache, disabled by default. Enable

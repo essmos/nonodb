@@ -32,7 +32,8 @@ pub fn authorize_request(principal: &Principal, req: &Request) -> Result<(), Api
         | Request::GetVersion { coll, .. }
         | Request::GetCollectionTtl { coll }
         | Request::GetCollectionHistory { coll }
-        | Request::GetCollectionEvents { coll } => {
+        | Request::GetCollectionEvents { coll }
+        | Request::ListSubscriptions { coll } => {
             allow(principal, Action::Read, coll, req.op_name())
         }
 
@@ -69,7 +70,10 @@ pub fn authorize_request(principal: &Principal, req: &Request) -> Result<(), Api
         | Request::CreateCollection { coll, .. }
         | Request::SetCollectionTtl { coll, .. }
         | Request::SetCollectionHistory { coll, .. }
-        | Request::SetCollectionEvents { coll, .. } => {
+        | Request::SetCollectionEvents { coll, .. }
+        | Request::CreateSubscription { coll, .. }
+        | Request::RenewSubscription { coll, .. }
+        | Request::DeleteSubscription { coll, .. } => {
             allow(principal, Action::AdminCollection, coll, req.op_name())
         }
 

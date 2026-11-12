@@ -12,6 +12,7 @@ mod authz;
 mod auto_index;
 mod cache;
 mod cursor;
+mod live;
 mod login_guard;
 mod maintenance;
 mod metrics;
@@ -147,6 +148,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let audit = audit::AuditLog::from_env()?;
 
     let store = Arc::new(Store::open(&data)?);
+    live::install_observer();
+    live::registry().start_janitor();
 
     // One writer thread, independent of the tokio runtime (LMDB blocks on fsync).
     let (write_tx, write_rx) = mpsc::channel::<WriteJob>();
@@ -1177,6 +1180,56 @@ impl ThresholdState {
 }
 
 #[allow(clippy::too_many_arguments)]
+async fn live_stream_loop(
+    mut live_rx: tokio::sync::mpsc::Receiver<Value>,
+    live_id: u64,
+    heartbeat: Duration,
+    deadline: Option<Instant>,
+    sse: bool,
+    tx: tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
+) -> Result<(), ApiError> {
+    let ready = json!({"mode": "live", "subscription": live_id});
+    if tx
+        .send(Ok(watch_control(sse, "ready", &ready)))
+        .await
+        .is_err()
+    {
+        return Ok(());
+    }
+    let mut last_sent = Instant::now();
+    loop {
+        if tx.is_closed() {
+            return Ok(());
+        }
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Ok(());
+        }
+        let wait = heartbeat.saturating_sub(last_sent.elapsed());
+        tokio::select! {
+            item = live_rx.recv() => {
+                let Some(event) = item else {
+                    return Ok(());
+                };
+                if tx.send(Ok(watch_frame(sse, &event))).await.is_err() {
+                    return Ok(());
+                }
+                metrics::inc(&metrics::WATCH_EVENTS);
+                last_sent = Instant::now();
+            }
+            _ = tokio::time::sleep(wait) => {
+                let value = json!({"heartbeat": true, "ts_ms": now_ms()});
+                if tx.send(Ok(watch_control(sse, "heartbeat", &value))).await.is_err() {
+                    return Ok(());
+                }
+                live::registry().touch(live_id);
+                metrics::inc(&metrics::WATCH_HEARTBEATS);
+                last_sent = Instant::now();
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn watch_stream_loop(
     store: Arc<Store>,
     coll: String,
@@ -1439,6 +1492,12 @@ async fn watch_stream(
         heartbeat_ms,
         overlap_ms,
         threshold,
+        mode,
+        ops,
+        count,
+        once,
+        event_type,
+        name,
     } = req
     else {
         let err = ApiError {
@@ -1457,6 +1516,132 @@ async fn watch_stream(
         );
         return respond(Err(err)).into_response();
     };
+
+    if mode.as_deref() == Some("live") {
+        if after.is_some() || types.is_some() || threshold.is_some() {
+            let err = ApiError {
+                code: "invalid_request".into(),
+                message: "live mode does not support after/types/threshold".into(),
+            };
+            audit_error(
+                &state,
+                &connection,
+                principal.name(),
+                audit_op,
+                &audit_collections,
+                &err,
+                started,
+                audit_needed,
+            );
+            return respond(Err(err)).into_response();
+        }
+        let profile = match state.store.collection_profile(&coll) {
+            Ok(Some(profile)) => profile,
+            Ok(None) => {
+                let err = ApiError {
+                    code: "invalid_request".into(),
+                    message: format!("collection `{coll}` does not exist"),
+                };
+                return respond(Err(err)).into_response();
+            }
+            Err(err) => return respond(Err(ApiError::from(err))).into_response(),
+        };
+        if profile.is_vault() {
+            let err = ApiError {
+                code: "invalid_request".into(),
+                message: "live subscriptions are not supported for vault collections".into(),
+            };
+            return respond(Err(err)).into_response();
+        }
+        let mut subscription = nonodb_core::subscriptions::Subscription {
+            name: name.unwrap_or_else(|| "live".into()),
+            ops: ops.unwrap_or_default(),
+            filter: filter.unwrap_or_else(|| json!({})),
+            count,
+            once: once.unwrap_or(false),
+            event_type,
+            last_matched: false,
+            lease_seconds: 0,
+            expires_at: 0,
+        };
+        if subscription.filter.is_null() {
+            subscription.filter = json!({});
+        }
+        if let Some(count) = &mut subscription.count {
+            if count.filter.is_null() {
+                count.filter = json!({});
+            }
+        }
+        if let Err(err) = subscription.validate() {
+            let err = ApiError::from(err);
+            audit_error(
+                &state,
+                &connection,
+                principal.name(),
+                audit_op,
+                &audit_collections,
+                &err,
+                started,
+                audit_needed,
+            );
+            return respond(Err(err)).into_response();
+        }
+        let heartbeat = Duration::from_millis(heartbeat_ms.unwrap_or(10_000).clamp(100, 10_000));
+        let deadline = timeout_ms
+            .filter(|timeout| *timeout > 0)
+            .and_then(|timeout| Instant::now().checked_add(Duration::from_millis(timeout)));
+        let sse = headers
+            .get(ACCEPT)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.contains("text/event-stream"));
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
+        let (live_tx, live_rx) = tokio::sync::mpsc::channel::<Value>(64);
+        let (live_id, guard) = live::registry().register(coll.clone(), subscription, live_tx);
+        let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        });
+        metrics::inc(&metrics::READ_OPS);
+        metrics::inc(&metrics::WATCH_STREAMS);
+        metrics::inc(&metrics::WATCH_ACTIVE);
+        tokio::spawn(async move {
+            let result = live_stream_loop(live_rx, live_id, heartbeat, deadline, sse, tx).await;
+            drop(guard);
+            metrics::sub(&metrics::WATCH_ACTIVE, 1);
+            if audit_needed {
+                if let Some(audit) = &state.audit {
+                    audit.record(
+                        principal.name(),
+                        connection.source.as_str(),
+                        connection.peer.as_deref(),
+                        "watch_stream",
+                        &[&coll],
+                        result.is_ok(),
+                        result.as_ref().err().map(|err| err.code.as_str()),
+                        started.elapsed().as_secs_f64() * 1000.0,
+                        None,
+                    );
+                }
+            }
+        });
+        let content_type = if sse {
+            "text/event-stream"
+        } else {
+            "application/x-ndjson"
+        };
+        let mut response = Body::from_stream(stream).into_response();
+        response.headers_mut().insert(
+            axum::http::header::CONTENT_TYPE,
+            HeaderValue::from_static(content_type),
+        );
+        response
+            .headers_mut()
+            .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        response.headers_mut().insert(
+            axum::http::header::HeaderName::from_static("x-accel-buffering"),
+            HeaderValue::from_static("no"),
+        );
+        return response;
+    }
 
     let limit = limit.unwrap_or(100).clamp(1, 1_000);
     let heartbeat = Duration::from_millis(heartbeat_ms.unwrap_or(15_000).clamp(100, 60_000));
@@ -1714,7 +1899,15 @@ async fn exec(
             heartbeat_ms: _,
             overlap_ms: _,
             threshold,
+            mode,
+            ..
         } => {
+            if mode.as_deref() == Some("live") {
+                return respond(Err(ApiError {
+                    code: "invalid_request".into(),
+                    message: "live mode requires POST /v1/watch".into(),
+                }));
+            }
             if threshold.is_some() {
                 return respond(Err(ApiError {
                     code: "invalid_query".into(),
@@ -2304,6 +2497,15 @@ async fn exec(
             read_result(joined).await
         }
 
+        Request::ListSubscriptions { coll } => {
+            let store = state.store.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                let list = store.list_subscriptions(&coll)?;
+                Ok::<Value, ApiError>(json!({ "subscriptions": list }))
+            });
+            read_result(joined).await
+        }
+
         Request::ListCollections => {
             let store = state.store.clone();
             let principal = principal.clone();
@@ -2469,6 +2671,41 @@ async fn exec(
                     include_after,
                     projection,
                 },
+                Request::CreateSubscription {
+                    coll,
+                    name,
+                    ops,
+                    filter,
+                    count,
+                    once,
+                    event_type,
+                    lease_seconds,
+                } => WriteReq::CreateSubscription {
+                    coll,
+                    subscription: nonodb_core::subscriptions::Subscription {
+                        name,
+                        ops,
+                        filter,
+                        count,
+                        once,
+                        event_type,
+                        last_matched: false,
+                        lease_seconds: lease_seconds.unwrap_or(600),
+                        expires_at: 0,
+                    },
+                },
+                Request::RenewSubscription {
+                    coll,
+                    name,
+                    lease_seconds,
+                } => WriteReq::RenewSubscription {
+                    coll,
+                    name,
+                    lease_seconds,
+                },
+                Request::DeleteSubscription { coll, name } => {
+                    WriteReq::DeleteSubscription { coll, name }
+                }
                 Request::CreateIndex {
                     coll,
                     field,
@@ -2879,6 +3116,7 @@ fn cacheable(req: &Request) -> bool {
             | Request::GetCollectionTtl { .. }
             | Request::GetCollectionHistory { .. }
             | Request::GetCollectionEvents { .. }
+            | Request::ListSubscriptions { .. }
             | Request::History { .. }
             | Request::GetVersion { .. }
     )
@@ -3117,6 +3355,10 @@ fn execute_read(
                 "include_after": config.include_after,
                 "projection": config.projection,
             }))
+        }
+        Request::ListSubscriptions { coll } => {
+            let list = store.list_subscriptions(&coll)?;
+            Ok(json!({ "subscriptions": list }))
         }
         Request::ListIndexes { coll } => {
             let Some(c) = store.collection_at(rtxn, &coll)? else {

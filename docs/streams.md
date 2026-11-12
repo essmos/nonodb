@@ -8,10 +8,88 @@ NonoDB can tail **append-only event collections** in two ways:
 Both are designed for collections such as `_events`, where documents are
 inserted with sortable ULID `_id` values by the outbox producer.
 
-They tail existing documents by `_id`; they are **not** automatic change streams
-for arbitrary collections. Updates and deletes are not emitted. For change
-notification, write an event document explicitly with
-[`EventProducer`](events.md#produce-atomically).
+The normal mode tails existing documents by `_id`. It is **not** an automatic
+change stream for arbitrary collections; updates and deletes are not emitted.
+For change notification, write an event document explicitly with
+[`EventProducer`](events.md#produce-atomically), or use the connection-scoped
+[live mode](#live-subscriptions-connection-scoped).
+
+## Live subscriptions (connection-scoped)
+
+`POST /v1/watch` also supports `mode:"live"`. This does **not** tail `_events`.
+It registers an in-memory subscription for the lifetime of the HTTP connection,
+evaluates a condition in the writer, and pushes matching changes directly to the
+stream.
+
+```json
+{
+  "op": "watch",
+  "coll": "orders",
+  "mode": "live",
+  "filter": {"status": "paid"},
+  "ops": ["insert", "update", "delete"],
+  "heartbeat_ms": 10000
+}
+```
+
+Optional live fields:
+
+| Field | Meaning |
+|---|---|
+| `filter` | Condition on the after document (`insert`/`update`) or before document (`delete`) |
+| `ops` | `insert`/`update`/`delete`; empty means all |
+| `count` | Count condition over current collection state, e.g. `{"filter":{"total":{"$gt":100}},"gt":100}` |
+| `once` | Optional edge-triggered mode (`false -> true`); default emits every matching write |
+| `name` | Subscription name used in the default event type |
+| `event_type` | Optional delivered event type; default `subscription.<name>` |
+| `heartbeat_ms` | Server heartbeat, default `10,000`, max `10,000` in live mode |
+| `timeout_ms` | Optional maximum stream lifetime |
+
+Live events look like ordinary subscription events:
+
+```json
+{
+  "_id": "01J...",
+  "type": "subscription.live",
+  "doc_id": "o1",
+  "payload": {
+    "subscription": "live",
+    "coll": "orders",
+    "op": "update",
+    "before": {"_id": "o1", "status": "new"},
+    "after": {"_id": "o1", "status": "paid"},
+    "count": null
+  }
+}
+```
+
+Semantics:
+
+- the subscription exists only while the stream is connected;
+- closing the stream removes it immediately;
+- a janitor removes half-open connections after `30` seconds without a
+  successful heartbeat;
+- live events are **not written to `_events`**, so they do not grow the database;
+- there is no replay: after a disconnect, run a snapshot/`find` and then open a
+  new live stream if needed;
+- slow consumers are disconnected instead of buffering without bound;
+- `after`, `types`, and `threshold` are rejected in live mode;
+- vault collections are rejected;
+- SQL writes, `find_and_modify`, TTL expiry, and normal writes all trigger live
+  evaluation.
+
+Python:
+
+```python
+for event in db.collection("orders").watch_live(
+    filter={"status": "paid"},
+    heartbeat_ms=10_000,
+):
+    print(event["payload"]["after"])
+```
+
+Because the subscription is tied to the connection, `watch_live` does not have a
+resume cursor. Reconnect creates a fresh subscription.
 
 ## Long-poll request
 

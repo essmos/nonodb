@@ -268,7 +268,9 @@ impl UpdateSql {
             .any(|(_, expr)| expr.uses_document());
 
         if !uses_document {
-            let events_enabled = c.events_enabled_in(wtxn)?.is_some();
+            let events_enabled = c.events_enabled_in(wtxn)?.is_some()
+                || c.has_subscriptions_in(wtxn)?
+                || crate::observer::is_active();
             let before_docs = if events_enabled {
                 c.find_in(
                     &*wtxn,
@@ -365,7 +367,9 @@ impl DeleteSql {
             Some(expr) => expr.to_filter(params)?,
             None => json!({}),
         };
-        let events_enabled = c.events_enabled_in(wtxn)?.is_some();
+        let events_enabled = c.events_enabled_in(wtxn)?.is_some()
+            || c.has_subscriptions_in(wtxn)?
+            || crate::observer::is_active();
         let before_docs = if events_enabled {
             c.find_in(
                 &*wtxn,

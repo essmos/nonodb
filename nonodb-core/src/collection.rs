@@ -24,6 +24,7 @@ use crate::query::{
 };
 use crate::search;
 use crate::store::MAX_DOCUMENT_BYTES;
+use crate::subscriptions::{self, Subscription};
 use crate::ttl::{self, TtlUpdate};
 use crate::vault::{self, CollectionProfile, VaultKey};
 use crate::vector::{self, Candidate, VectorDef, VectorMetric};
@@ -2940,12 +2941,18 @@ impl<'e> Collection<'e> {
         before: Option<&Value>,
         after: Option<&Value>,
     ) -> Result<()> {
+        self.evaluate_subscriptions(wtxn, op, id, before, after)?;
+        crate::observer::notify(self, wtxn, op, id, before, after)?;
         let Some(config) = self.events_enabled_in(wtxn)? else {
             return Ok(());
         };
         let Some(event) = events::change_event(&self.name, op, id, before, after, &config) else {
             return Ok(());
         };
+        self.append_outbox_event(wtxn, event)
+    }
+
+    fn append_outbox_event(&self, wtxn: &mut RwTxn<'_>, event: Value) -> Result<()> {
         let db = self
             .env
             .create_database::<Bytes, Bytes>(&mut *wtxn, Some(EVENTS_COLLECTION))?;
@@ -2963,6 +2970,81 @@ impl<'e> Collection<'e> {
             self.txn_gate,
         );
         outbox.insert_one_txn(wtxn, event)?;
+        Ok(())
+    }
+
+    pub fn has_subscriptions_in(&self, wtxn: &RwTxn<'_>) -> Result<bool> {
+        if self.name == EVENTS_COLLECTION || self.profile.is_vault() {
+            return Ok(false);
+        }
+        Ok(self
+            .meta
+            .get(wtxn, subscriptions::meta_key(&self.name).as_bytes())?
+            .is_some())
+    }
+
+    pub fn evaluate_subscriptions(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        op: &str,
+        id: &str,
+        before: Option<&Value>,
+        after: Option<&Value>,
+    ) -> Result<()> {
+        if self.name == EVENTS_COLLECTION || self.profile.is_vault() {
+            return Ok(());
+        }
+        let key = subscriptions::meta_key(&self.name);
+        let Some(raw) = self.meta.get(&*wtxn, key.as_bytes())? else {
+            return Ok(());
+        };
+        let mut list: Vec<Subscription> =
+            serde_json::from_slice(raw).map_err(|e| Error::Query(format!("subscriptions: {e}")))?;
+        let now = subscriptions::now_ms();
+        let original_len = list.len();
+        list.retain(|subscription| !subscription.is_expired(now));
+        let mut changed = list.len() != original_len;
+        if list.is_empty() {
+            self.meta.delete(&mut *wtxn, key.as_bytes())?;
+            return Ok(());
+        }
+        let mut events = Vec::new();
+        for subscription in &mut list {
+            if !subscription.watches_op(op) {
+                continue;
+            }
+            let condition_doc = if op == "delete" { before } else { after };
+            let doc_matches = subscription.filter.is_null()
+                || subscription
+                    .filter
+                    .as_object()
+                    .is_some_and(|object| object.is_empty())
+                || condition_doc
+                    .is_some_and(|doc| crate::query::matches(doc, &subscription.filter));
+            let (count_matches, count) = match &subscription.count {
+                Some(condition) => {
+                    let count = self.count_in(wtxn, &condition.filter)? as u64;
+                    (condition.matches(count), Some(count))
+                }
+                None => (true, None),
+            };
+            let matched = doc_matches && count_matches;
+            let should_emit = matched && (!subscription.once || !subscription.last_matched);
+            if should_emit {
+                events.push(subscription.event(&self.name, op, id, before, after, count));
+            }
+            if subscription.last_matched != matched {
+                subscription.last_matched = matched;
+                changed = true;
+            }
+        }
+        for event in events {
+            self.append_outbox_event(wtxn, event)?;
+        }
+        if changed {
+            let raw = serde_json::to_vec(&list)?;
+            self.meta.put(&mut *wtxn, key.as_bytes(), &raw)?;
+        }
         Ok(())
     }
 

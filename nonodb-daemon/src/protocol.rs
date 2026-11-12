@@ -72,6 +72,7 @@ pub struct WatchThreshold {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
 pub enum Request {
     Insert {
         coll: String,
@@ -139,6 +140,21 @@ pub enum Request {
         /// Optional server-side event count threshold. Continuous stream only.
         #[serde(default)]
         threshold: Option<WatchThreshold>,
+        /// `live` evaluates a condition on `coll` and delivers only to this
+        /// connection, without writing to `_events`.
+        #[serde(default)]
+        mode: Option<String>,
+        #[serde(default)]
+        ops: Option<Vec<String>>,
+        #[serde(default)]
+        count: Option<nonodb_core::subscriptions::CountCondition>,
+        /// Edge-triggered live subscription (`false -> true`).
+        #[serde(default)]
+        once: Option<bool>,
+        #[serde(default)]
+        event_type: Option<String>,
+        #[serde(default)]
+        name: Option<String>,
     },
     /// Read-only query plan and actual count diagnostics.
     Explain {
@@ -419,6 +435,36 @@ pub enum Request {
     GetCollectionEvents {
         coll: String,
     },
+    CreateSubscription {
+        coll: String,
+        name: String,
+        #[serde(default)]
+        ops: Vec<String>,
+        #[serde(default)]
+        filter: Value,
+        #[serde(default)]
+        count: Option<nonodb_core::subscriptions::CountCondition>,
+        #[serde(default)]
+        once: bool,
+        #[serde(default)]
+        event_type: Option<String>,
+        /// Client lease in seconds; default 600. The client must renew it.
+        #[serde(default)]
+        lease_seconds: Option<u64>,
+    },
+    RenewSubscription {
+        coll: String,
+        name: String,
+        #[serde(default)]
+        lease_seconds: Option<u64>,
+    },
+    DeleteSubscription {
+        coll: String,
+        name: String,
+    },
+    ListSubscriptions {
+        coll: String,
+    },
     /// Returns the current LMDB map size and high-water mark.
     MapInfo,
     /// Grows the LMDB map without restarting the daemon.
@@ -534,6 +580,21 @@ pub enum WriteReq {
         include_after: bool,
         projection: Option<Value>,
     },
+    CreateSubscription {
+        coll: String,
+        subscription: nonodb_core::subscriptions::Subscription,
+    },
+    RenewSubscription {
+        coll: String,
+        name: String,
+        lease_seconds: Option<u64>,
+    },
+    DeleteSubscription {
+        coll: String,
+        name: String,
+    },
+    /// Internal maintenance: delete expired subscriptions.
+    PruneSubscriptions,
     /// Internal maintenance: delete expired documents if their TTL still matches.
     Expire {
         entries: Vec<ExpireEntry>,
@@ -688,6 +749,10 @@ impl Request {
             Self::GetCollectionHistory { .. } => "get_collection_history",
             Self::SetCollectionEvents { .. } => "set_collection_events",
             Self::GetCollectionEvents { .. } => "get_collection_events",
+            Self::CreateSubscription { .. } => "create_subscription",
+            Self::RenewSubscription { .. } => "renew_subscription",
+            Self::DeleteSubscription { .. } => "delete_subscription",
+            Self::ListSubscriptions { .. } => "list_subscriptions",
             Self::MapInfo => "map_info",
             Self::ResizeMap { .. } => "resize_map",
         }
@@ -719,7 +784,8 @@ impl Request {
             | Self::ListCollections
             | Self::GetCollectionTtl { .. }
             | Self::GetCollectionHistory { .. }
-            | Self::GetCollectionEvents { .. } => true,
+            | Self::GetCollectionEvents { .. }
+            | Self::ListSubscriptions { .. } => true,
             Self::Sql { query, .. } => nonodb_core::sql::is_read_only(query).unwrap_or(false),
             Self::Batch { ops } => ops.iter().all(Self::is_read_only),
             _ => false,
@@ -766,7 +832,11 @@ impl Request {
             | Self::SetCollectionHistory { coll, .. }
             | Self::GetCollectionHistory { coll }
             | Self::SetCollectionEvents { coll, .. }
-            | Self::GetCollectionEvents { coll } => vec![coll.clone()],
+            | Self::GetCollectionEvents { coll }
+            | Self::CreateSubscription { coll, .. }
+            | Self::RenewSubscription { coll, .. }
+            | Self::DeleteSubscription { coll, .. }
+            | Self::ListSubscriptions { coll } => vec![coll.clone()],
             Self::Sql { query, .. } | Self::ExplainSql { query, .. } => {
                 nonodb_core::sql::collection_name(query)
                     .map(|coll| vec![coll])

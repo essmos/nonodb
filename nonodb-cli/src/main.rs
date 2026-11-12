@@ -150,6 +150,49 @@ fn run() -> Result<(), String> {
             };
             print_result(&res);
         }
+        "subscriptions" => {
+            let coll = args
+                .get(1)
+                .ok_or("użycie: nonodb-cli subscriptions <kolekcja>")?;
+            let res = http_post(
+                "/v1/exec",
+                &json!({"op": "list_subscriptions", "coll": coll}),
+            )?;
+            print_result(&res);
+        }
+        "subscribe" => subscribe_cmd(&args[1..])?,
+        "subscription-ping" => {
+            let coll = args
+                .get(1)
+                .ok_or("użycie: nonodb-cli subscription-ping <kolekcja> <nazwa> [sekundy]")?;
+            let name = args
+                .get(2)
+                .ok_or("użycie: nonodb-cli subscription-ping <kolekcja> <nazwa> [sekundy]")?;
+            let mut payload = json!({
+                "op": "renew_subscription",
+                "coll": coll,
+                "name": name,
+            });
+            if let Some(raw) = args.get(3) {
+                let lease: u64 = raw.parse().map_err(|e| format!("sekundy: {e}"))?;
+                payload["lease_seconds"] = json!(lease);
+            }
+            let res = http_post("/v1/exec", &payload)?;
+            print_result(&res);
+        }
+        "unsubscribe" => {
+            let coll = args
+                .get(1)
+                .ok_or("użycie: nonodb-cli unsubscribe <kolekcja> <nazwa>")?;
+            let name = args
+                .get(2)
+                .ok_or("użycie: nonodb-cli unsubscribe <kolekcja> <nazwa>")?;
+            let res = http_post(
+                "/v1/exec",
+                &json!({"op": "delete_subscription", "coll": coll, "name": name}),
+            )?;
+            print_result(&res);
+        }
         "history" => {
             let coll = args
                 .get(1)
@@ -317,6 +360,82 @@ fn print_report(report: &nonodb_core::VerificationReport) {
             coll.fuzzy_indexes.len()
         );
     }
+}
+
+fn subscribe_cmd(args: &[String]) -> Result<(), String> {
+    let coll = args
+        .first()
+        .ok_or("użycie: nonodb-cli subscribe <kolekcja> <nazwa> [opcje]")?;
+    let name = args
+        .get(1)
+        .ok_or("użycie: nonodb-cli subscribe <kolekcja> <nazwa> [opcje]")?;
+    let mut filter = json!({});
+    let mut count = None;
+    let mut ops = Vec::new();
+    let mut once = false;
+    let mut event_type = None;
+    let mut lease_seconds: Option<u64> = None;
+    let mut i = 2;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--filter" => {
+                filter = serde_json::from_str(args.get(i + 1).ok_or("--filter wymaga JSON")?)
+                    .map_err(|e| e.to_string())?;
+                i += 2;
+            }
+            "--count" => {
+                count = Some(
+                    serde_json::from_str(args.get(i + 1).ok_or("--count wymaga JSON")?)
+                        .map_err(|e| e.to_string())?,
+                );
+                i += 2;
+            }
+            "--ops" => {
+                ops = args
+                    .get(i + 1)
+                    .ok_or("--ops wymaga listy insert,update,delete")?
+                    .split(',')
+                    .filter(|part| !part.is_empty())
+                    .map(str::to_string)
+                    .collect();
+                i += 2;
+            }
+            "--once" => {
+                once = true;
+                i += 1;
+            }
+            "--type" => {
+                event_type = Some(args.get(i + 1).ok_or("--type wymaga nazwy")?.clone());
+                i += 2;
+            }
+            "--lease" => {
+                let raw = args.get(i + 1).ok_or("--lease wymaga sekund")?;
+                lease_seconds = Some(raw.parse::<u64>().map_err(|e| format!("lease: {e}"))?);
+                i += 2;
+            }
+            other => return Err(format!("nieznana opcja: {other}")),
+        }
+    }
+    let mut payload = json!({
+        "op": "create_subscription",
+        "coll": coll,
+        "name": name,
+        "filter": filter,
+        "ops": ops,
+        "once": once,
+    });
+    if let Some(count) = count {
+        payload["count"] = count;
+    }
+    if let Some(event_type) = event_type {
+        payload["event_type"] = json!(event_type);
+    }
+    if let Some(lease_seconds) = lease_seconds {
+        payload["lease_seconds"] = json!(lease_seconds);
+    }
+    let res = http_post("/v1/exec", &payload)?;
+    print_result(&res);
+    Ok(())
 }
 
 fn events_tail(args: &[String]) -> Result<(), String> {

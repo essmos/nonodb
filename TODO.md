@@ -137,6 +137,13 @@ limitations are documented in [docs/roadmap.md](docs/roadmap.md).
       controls, and real-daemon tests
 - [x] Add server-side stream count thresholds with grouping and time windows
 - [x] Automatic events for `find_and_modify` and TTL expiry
+- [x] Add persistent conditional subscriptions over collection state with
+      document filters, count conditions, default level-triggered emission,
+      optional edge-triggered `once`, client-renewed leases with automatic
+      expiry, SQL/write hooks, clients, CLI, docs, and real-daemon tests
+- [x] Add connection-scoped live subscriptions (`mode:"live"`) with direct
+      SSE/NDJSON delivery, server heartbeat, disconnect cleanup, and no
+      `_events` growth
 
 ### P1 — lookup enhancements
 

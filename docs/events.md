@@ -13,7 +13,10 @@ There are two producers:
 
 Automatic events are also ordinary outbox documents in `_events`, so existing
 consumers and `watch` filters work unchanged. This keeps the single-writer LMDB
-model and authorization boundaries unchanged. For durable retrying work, see
+model and authorization boundaries unchanged. For persistent conditions over collection data, see
+[Conditional subscriptions](subscriptions.md).
+
+For durable retrying work, see
 [Background jobs](workers.md).
 
 ## Model

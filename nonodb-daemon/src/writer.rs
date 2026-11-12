@@ -16,6 +16,7 @@ use serde_json::{json, Value};
 use tokio::sync::oneshot;
 
 use crate::cache::QueryCache;
+use crate::live;
 use crate::metrics;
 use crate::protocol::{ApiError, WriteReq};
 
@@ -104,12 +105,14 @@ fn run_batch(store: &Store, cache: &QueryCache, jobs: Vec<WriteJob>) {
         Ok(()) => {
             metrics::add(&metrics::COMMIT_NS, started.elapsed().as_nanos() as u64);
             cache.invalidate();
+            live::dispatch_pending();
             for (job, res) in jobs.into_iter().zip(results) {
                 let _ = job.resp.send(res);
             }
         }
         Err(e) => {
             metrics::add(&metrics::COMMIT_NS, started.elapsed().as_nanos() as u64);
+            live::discard_pending();
             let err = ApiError::from(nonodb_core::Error::from(e));
             for job in jobs {
                 let _ = job.resp.send(Err(err.clone()));
@@ -133,10 +136,12 @@ fn run_single(store: &Store, cache: &QueryCache, job: WriteJob) {
             Ok(()) => {
                 metrics::add(&metrics::COMMIT_NS, started.elapsed().as_nanos() as u64);
                 cache.invalidate();
+                live::dispatch_pending();
                 let _ = job.resp.send(Ok(value));
             }
             Err(e) => {
                 metrics::add(&metrics::COMMIT_NS, started.elapsed().as_nanos() as u64);
+                live::discard_pending();
                 let _ = job
                     .resp
                     .send(Err(ApiError::from(nonodb_core::Error::from(e))));
@@ -146,6 +151,7 @@ fn run_single(store: &Store, cache: &QueryCache, job: WriteJob) {
             // Drop `wtxn` = abort; for `WriteReq::Batch` this guarantees
             // all-or-nothing.
             drop(wtxn);
+            live::discard_pending();
             let _ = job.resp.send(Err(e));
         }
     }
@@ -195,7 +201,14 @@ fn event_config(
         return Ok(None);
     }
     let config = store.collection_events_in_rw(wtxn, coll)?;
-    Ok(config.active().then_some(config))
+    if config.active()
+        || store.has_subscriptions_in_rw(wtxn, coll)?
+        || live::registry().has_coll(coll)
+    {
+        Ok(Some(config))
+    } else {
+        Ok(None)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -209,6 +222,9 @@ fn emit_event(
     after: Option<&Value>,
     config: &events::EventConfig,
 ) -> Result<(), ApiError> {
+    let target = store.collection_in(wtxn, coll)?;
+    target.evaluate_subscriptions(wtxn, op, id, before, after)?;
+    live::collect_pending(&target, wtxn, coll, op, id, before, after)?;
     let Some(event) = events::change_event(coll, op, id, before, after, config) else {
         return Ok(());
     };
@@ -304,6 +320,26 @@ fn execute(
                 "include_after": include_after,
                 "projection": projection,
             }))
+        }
+        WriteReq::CreateSubscription { coll, subscription } => {
+            let out = store.create_subscription_in(wtxn, coll, subscription)?;
+            Ok(serde_json::to_value(out).map_err(nonodb_core::Error::from)?)
+        }
+        WriteReq::RenewSubscription {
+            coll,
+            name,
+            lease_seconds,
+        } => {
+            let out = store.renew_subscription_in(wtxn, coll, name, *lease_seconds)?;
+            Ok(json!({ "subscription": out }))
+        }
+        WriteReq::PruneSubscriptions => {
+            let removed = store.prune_expired_subscriptions_in(wtxn)?;
+            Ok(json!({ "removed": removed }))
+        }
+        WriteReq::DeleteSubscription { coll, name } => {
+            let deleted = store.delete_subscription_in(wtxn, coll, name)?;
+            Ok(json!({ "deleted": deleted }))
         }
         WriteReq::Expire { entries } => {
             let mut expired = 0usize;

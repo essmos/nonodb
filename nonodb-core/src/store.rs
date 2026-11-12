@@ -12,6 +12,7 @@ use crate::collection::Collection;
 use crate::error::{Error, Result};
 use crate::events::EventConfig;
 use crate::history::{self, DEFAULT_HISTORY_MAX_VERSIONS, HISTORY_DB};
+use crate::subscriptions::{self, Subscription};
 use crate::ttl::{self, TTL_DB};
 use crate::vault::CollectionProfile;
 
@@ -59,6 +60,7 @@ pub const PAGE_SIZE: usize = 4096;
 pub const MAX_DBS: u32 = 1024;
 /// Metadata sub-database name.
 pub const META_DB: &str = "meta";
+const DEFAULT_SUBSCRIPTION_LEASE_SECONDS: u64 = 600;
 /// Data format version (for future migrations).
 pub const SCHEMA_VERSION: u32 = 1;
 /// Soft document size limit (serialized JSON).
@@ -820,6 +822,239 @@ impl Store {
             meta.delete(&mut *wtxn, Self::events_key(name).as_bytes())?;
         }
         Ok(())
+    }
+
+    fn subscriptions_from_ro(
+        meta: Database<Bytes, Bytes>,
+        rtxn: &RoTxn<'_>,
+        coll: &str,
+    ) -> Result<Vec<Subscription>> {
+        Ok(meta
+            .get(rtxn, subscriptions::meta_key(coll).as_bytes())?
+            .and_then(|raw| serde_json::from_slice(raw).ok())
+            .unwrap_or_default())
+    }
+
+    fn subscriptions_from_rw(
+        meta: Database<Bytes, Bytes>,
+        wtxn: &RwTxn<'_>,
+        coll: &str,
+    ) -> Result<Vec<Subscription>> {
+        Ok(meta
+            .get(wtxn, subscriptions::meta_key(coll).as_bytes())?
+            .and_then(|raw| serde_json::from_slice(raw).ok())
+            .unwrap_or_default())
+    }
+
+    /// Creates or replaces a subscription on a collection.
+    pub fn create_subscription(
+        &self,
+        coll: &str,
+        subscription: &Subscription,
+    ) -> Result<Subscription> {
+        let mut wtxn = self.write_txn()?;
+        let out = self.create_subscription_in(&mut wtxn, coll, subscription)?;
+        wtxn.commit()?;
+        Ok(out)
+    }
+
+    /// Creates or replaces a subscription inside the writer transaction.
+    pub fn create_subscription_in(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        coll: &str,
+        subscription: &Subscription,
+    ) -> Result<Subscription> {
+        Self::validate_name(coll)?;
+        if self.collection_profile_in_rw(wtxn, coll)?.is_none() {
+            return Err(Error::Query(format!("collection `{coll}` does not exist")));
+        }
+        let mut subscription = subscription.clone();
+        subscription.validate()?;
+        if subscription.filter.is_null() {
+            subscription.filter = serde_json::json!({});
+        }
+        if let Some(count) = &mut subscription.count {
+            if count.filter.is_null() {
+                count.filter = serde_json::json!({});
+            }
+        }
+        if subscription.lease_seconds == 0 {
+            subscription.lease_seconds = DEFAULT_SUBSCRIPTION_LEASE_SECONDS;
+        }
+        subscription.lease_seconds = subscription.lease_seconds.clamp(1, 2_592_000);
+        subscription.expires_at =
+            subscriptions::now_ms() + subscription.lease_seconds.saturating_mul(1000);
+        let meta = self
+            .env
+            .create_database::<Bytes, Bytes>(&mut *wtxn, Some(META_DB))?;
+        let mut list = Self::subscriptions_from_rw(meta, wtxn, coll)?;
+        if let Some(existing) = list.iter_mut().find(|item| item.name == subscription.name) {
+            *existing = subscription.clone();
+        } else {
+            list.push(subscription.clone());
+        }
+        let raw = serde_json::to_vec(&list)?;
+        meta.put(&mut *wtxn, subscriptions::meta_key(coll).as_bytes(), &raw)?;
+        Ok(subscription)
+    }
+
+    /// Deletes a subscription. Returns whether it existed.
+    pub fn delete_subscription(&self, coll: &str, name: &str) -> Result<bool> {
+        let mut wtxn = self.write_txn()?;
+        let existed = self.delete_subscription_in(&mut wtxn, coll, name)?;
+        wtxn.commit()?;
+        Ok(existed)
+    }
+
+    pub fn delete_subscription_in(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        coll: &str,
+        name: &str,
+    ) -> Result<bool> {
+        Self::validate_name(coll)?;
+        let meta = self
+            .env
+            .create_database::<Bytes, Bytes>(&mut *wtxn, Some(META_DB))?;
+        let mut list = Self::subscriptions_from_rw(meta, wtxn, coll)?;
+        let before = list.len();
+        list.retain(|item| item.name != name);
+        if list.len() == before {
+            return Ok(false);
+        }
+        if list.is_empty() {
+            meta.delete(&mut *wtxn, subscriptions::meta_key(coll).as_bytes())?;
+        } else {
+            let raw = serde_json::to_vec(&list)?;
+            meta.put(&mut *wtxn, subscriptions::meta_key(coll).as_bytes(), &raw)?;
+        }
+        Ok(true)
+    }
+
+    /// Whether a collection has any conditional subscriptions.
+    pub fn has_subscriptions_in_rw(&self, wtxn: &RwTxn<'_>, coll: &str) -> Result<bool> {
+        if coll == crate::events::EVENTS_COLLECTION {
+            return Ok(false);
+        }
+        let meta = self
+            .env
+            .open_database::<Bytes, Bytes>(wtxn, Some(META_DB))?
+            .ok_or_else(|| Error::Query("meta database missing".into()))?;
+        Ok(meta
+            .get(wtxn, subscriptions::meta_key(coll).as_bytes())?
+            .is_some())
+    }
+
+    /// Renews a subscription lease. Returns `None` if it does not exist.
+    pub fn renew_subscription(
+        &self,
+        coll: &str,
+        name: &str,
+        lease_seconds: Option<u64>,
+    ) -> Result<Option<Subscription>> {
+        let mut wtxn = self.write_txn()?;
+        let out = self.renew_subscription_in(&mut wtxn, coll, name, lease_seconds)?;
+        wtxn.commit()?;
+        Ok(out)
+    }
+
+    pub fn renew_subscription_in(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        coll: &str,
+        name: &str,
+        lease_seconds: Option<u64>,
+    ) -> Result<Option<Subscription>> {
+        let meta = self
+            .env
+            .create_database::<Bytes, Bytes>(&mut *wtxn, Some(META_DB))?;
+        let mut list = Self::subscriptions_from_rw(meta, wtxn, coll)?;
+        let now = subscriptions::now_ms();
+        let Some(index) = list.iter().position(|item| item.name == name) else {
+            return Ok(None);
+        };
+        if list[index].is_expired(now) {
+            list.remove(index);
+            if list.is_empty() {
+                meta.delete(&mut *wtxn, subscriptions::meta_key(coll).as_bytes())?;
+            } else {
+                let raw = serde_json::to_vec(&list)?;
+                meta.put(&mut *wtxn, subscriptions::meta_key(coll).as_bytes(), &raw)?;
+            }
+            return Ok(None);
+        }
+        let subscription = &mut list[index];
+        if let Some(lease) = lease_seconds {
+            subscription.lease_seconds = lease.clamp(1, 2_592_000);
+        }
+        if subscription.lease_seconds == 0 {
+            subscription.lease_seconds = DEFAULT_SUBSCRIPTION_LEASE_SECONDS;
+        }
+        subscription.expires_at =
+            subscriptions::now_ms() + subscription.lease_seconds.saturating_mul(1000);
+        let out = subscription.clone();
+        let raw = serde_json::to_vec(&list)?;
+        meta.put(&mut *wtxn, subscriptions::meta_key(coll).as_bytes(), &raw)?;
+        Ok(Some(out))
+    }
+
+    /// Deletes expired subscriptions from every collection.
+    pub fn prune_expired_subscriptions_in(&self, wtxn: &mut RwTxn<'_>) -> Result<usize> {
+        let meta = self
+            .env
+            .create_database::<Bytes, Bytes>(&mut *wtxn, Some(META_DB))?;
+        let now = subscriptions::now_ms();
+        let mut keys = Vec::new();
+        for item in meta.iter(&*wtxn)? {
+            let (key, _) = item?;
+            if std::str::from_utf8(key)
+                .ok()
+                .is_some_and(|key| key.starts_with("subscriptions:"))
+            {
+                keys.push(key.to_vec());
+            }
+        }
+        let mut removed = 0usize;
+        for key in keys {
+            let Some(raw) = meta.get(&*wtxn, &key)? else {
+                continue;
+            };
+            let mut list: Vec<Subscription> = serde_json::from_slice(raw)?;
+            let before = list.len();
+            list.retain(|subscription| !subscription.is_expired(now));
+            if list.len() == before {
+                continue;
+            }
+            removed += before - list.len();
+            if list.is_empty() {
+                meta.delete(&mut *wtxn, &key)?;
+            } else {
+                let raw = serde_json::to_vec(&list)?;
+                meta.put(&mut *wtxn, &key, &raw)?;
+            }
+        }
+        Ok(removed)
+    }
+
+    /// Deletes all expired subscriptions.
+    pub fn prune_expired_subscriptions(&self) -> Result<usize> {
+        let mut wtxn = self.write_txn()?;
+        let removed = self.prune_expired_subscriptions_in(&mut wtxn)?;
+        wtxn.commit()?;
+        Ok(removed)
+    }
+
+    /// Lists subscriptions for one collection.
+    pub fn list_subscriptions(&self, coll: &str) -> Result<Vec<Subscription>> {
+        let rtxn = self.read_txn()?;
+        let meta = self
+            .env
+            .open_database::<Bytes, Bytes>(&rtxn, Some(META_DB))?
+            .ok_or_else(|| Error::Query("meta database missing".into()))?;
+        let out = Self::subscriptions_from_ro(meta, &rtxn, coll)?;
+        rtxn.commit()?;
+        Ok(out)
     }
 
     /// Returns the automatic change-event configuration for a collection.

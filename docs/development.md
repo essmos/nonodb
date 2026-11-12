@@ -186,6 +186,8 @@ python3 scripts/auth_test.py                 # scopes, token/cert auth, reload, 
 python3 scripts/ttl_test.py                  # TTL sweeps, overrides, history, vault
 python3 scripts/history_test.py              # per-collection history enable/disable, restart, CLI
 python3 scripts/events_auto_test.py          # automatic collection events, field filters, thresholds, CLI
+python3 scripts/subscriptions_test.py        # persistent conditional subscriptions, count, once, SQL, restart
+python3 scripts/live_watch_test.py           # connection-scoped live mode, direct SSE delivery, no _events
 python3 scripts/vault_test.py                # optional vault encryption end-to-end
 python3 scripts/vault_regression_test.py     # vault API regressions
 python3 scripts/vault_bench.py --docs 5000   # standard vs vault performance
@@ -375,12 +377,12 @@ The tag is `vX.Y.Z`; the annotated tag subject and GitHub Release title are
 
 ```bash
 # final release
-git tag -a v0.17.0 -m "v0.17.0 - Automatic collection events"
-git push origin v0.17.0
+git tag -a v0.18.0 -m "v0.18.0 - Automatic collection events"
+git push origin v0.18.0
 
 # pre-release (the hyphen makes it a GitHub pre-release automatically)
-git tag -a v0.17.0-beta.1 -m "v0.17.0-beta.1 - Automatic collection events"
-git push origin v0.17.0-beta.1
+git tag -a v0.18.0-beta.1 -m "v0.18.0-beta.1 - Automatic collection events"
+git push origin v0.18.0-beta.1
 ```
 
 The release workflow reads the tag annotation and publishes the release with
@@ -402,7 +404,7 @@ notes. `--cleanup=verbatim` prevents Git from stripping lines that start with
 The workflow runs the tests, builds release binaries for Linux x86_64, macOS
 Intel, macOS Apple Silicon, and Windows x86_64, attaches checksums, and
 publishes the GitHub Release. Linux and macOS use `.tar.gz`; Windows uses
-`.zip`. Tags such as `v0.17.0-beta.1` and `v0.17.0-rc.1` are marked as
+`.zip`. Tags such as `v0.18.0-beta.1` and `v0.18.0-rc.1` are marked as
 pre-releases automatically.
 
 ### Manual release
@@ -411,7 +413,7 @@ Use **Actions → Release → Run workflow** and provide:
 
 | Input | Meaning |
 |---|---|
-| `tag` | Tag to publish, e.g. `v0.17.0` or `v0.17.0-rc.1` |
+| `tag` | Tag to publish, e.g. `v0.18.0` or `v0.18.0-rc.1` |
 | `summary` | Short title text after the version: `vX.Y.Z - <summary>` |
 | `prerelease` | Mark the release as a pre-release |
 | `draft` | Create it as a draft for review |

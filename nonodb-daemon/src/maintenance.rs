@@ -19,6 +19,7 @@ use crate::writer::WriteJob;
 
 const HISTORY_PRUNE_INTERVAL: Duration = Duration::from_secs(30);
 const HISTORY_PRUNE_LIMIT: usize = 1000;
+const SUBSCRIPTION_PRUNE_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone)]
 struct Config {
@@ -68,6 +69,7 @@ fn run(
     // Sweep once shortly after startup, then at the configured cadence.
     let mut last_ttl: Option<Instant> = None;
     let mut last_prune: Option<Instant> = None;
+    let mut last_subscription_prune: Option<Instant> = None;
 
     loop {
         std::thread::sleep(config.interval);
@@ -90,6 +92,13 @@ fn run(
                 false,
             ) {
                 tracing::warn!(?e, "history pruning failed");
+            }
+        }
+
+        if last_subscription_prune.is_none_or(|at| at.elapsed() >= SUBSCRIPTION_PRUNE_INTERVAL) {
+            last_subscription_prune = Some(Instant::now());
+            if let Err(e) = submit(&write_tx, WriteReq::PruneSubscriptions, false) {
+                tracing::warn!(?e, "subscription pruning failed");
             }
         }
 

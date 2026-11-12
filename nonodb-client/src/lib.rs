@@ -483,6 +483,73 @@ impl Client {
         }))
     }
 
+    /// Creates or replaces a conditional subscription on a collection.
+    pub fn create_subscription(
+        &self,
+        coll: impl Into<String>,
+        subscription: Value,
+    ) -> Result<Value> {
+        let mut payload = subscription;
+        let object = payload
+            .as_object_mut()
+            .ok_or_else(|| Error::Config("subscription must be an object".into()))?;
+        object.insert("op".into(), json!("create_subscription"));
+        object.insert("coll".into(), json!(coll.into()));
+        self.exec(payload)
+    }
+
+    /// Deletes a conditional subscription. Returns whether it existed.
+    pub fn delete_subscription(
+        &self,
+        coll: impl Into<String>,
+        name: impl Into<String>,
+    ) -> Result<bool> {
+        let result = self.exec(json!({
+            "op": "delete_subscription",
+            "coll": coll.into(),
+            "name": name.into(),
+        }))?;
+        Ok(result
+            .get("deleted")
+            .and_then(Value::as_bool)
+            .unwrap_or(false))
+    }
+
+    /// Renews a persistent conditional subscription lease.
+    pub fn renew_subscription(
+        &self,
+        coll: impl Into<String>,
+        name: impl Into<String>,
+        lease_seconds: Option<u64>,
+    ) -> Result<Option<Value>> {
+        let mut payload = json!({
+            "op": "renew_subscription",
+            "coll": coll.into(),
+            "name": name.into(),
+        });
+        if let Some(lease_seconds) = lease_seconds {
+            payload["lease_seconds"] = json!(lease_seconds);
+        }
+        let result = self.exec(payload)?;
+        Ok(result
+            .get("subscription")
+            .cloned()
+            .filter(|value| !value.is_null()))
+    }
+
+    /// Lists conditional subscriptions on a collection.
+    pub fn list_subscriptions(&self, coll: impl Into<String>) -> Result<Vec<Value>> {
+        let result = self.exec(json!({
+            "op": "list_subscriptions",
+            "coll": coll.into(),
+        }))?;
+        Ok(result
+            .get("subscriptions")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default())
+    }
+
     /// Current LMDB map size and high-water mark.
     pub fn map_info(&self) -> Result<Value> {
         self.exec(json!({"op": "map_info"}))

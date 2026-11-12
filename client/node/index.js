@@ -269,6 +269,28 @@ class NonoDB {
     return this.exec({ op: 'get_collection_events', coll: name });
   }
 
+  /** Create or replace a conditional subscription on a collection. */
+  async createSubscription(coll, subscription) {
+    return this.exec({ ...subscription, op: 'create_subscription', coll });
+  }
+
+  async renewSubscription(coll, name, leaseSeconds) {
+    const payload = { op: 'renew_subscription', coll, name };
+    if (leaseSeconds != null) payload.lease_seconds = leaseSeconds;
+    const result = await this.exec(payload);
+    return result.subscription ?? null;
+  }
+
+  async deleteSubscription(coll, name) {
+    const result = await this.exec({ op: 'delete_subscription', coll, name });
+    return result.deleted;
+  }
+
+  async listSubscriptions(coll) {
+    const result = await this.exec({ op: 'list_subscriptions', coll });
+    return result.subscriptions ?? [];
+  }
+
   /** List collection names. */
   async collections() {
     const result = await this.exec({ op: 'list_collections' });

@@ -137,6 +137,10 @@ client timeout with `NONODB_TIMEOUT` or the `timeout=` argument.
 | [`get_collection_history`](#get_collection_history) | Read per-collection history retention |
 | [`set_collection_events`](#set_collection_events) | Enable/disable automatic collection change events |
 | [`get_collection_events`](#get_collection_events) | Read automatic change-event settings |
+| [`create_subscription`](#conditional-subscriptions) | Create/replace a conditional collection subscription |
+| [`renew_subscription`](#conditional-subscriptions) | Renew a subscription client lease |
+| [`delete_subscription`](#conditional-subscriptions) | Delete a conditional subscription |
+| [`list_subscriptions`](#conditional-subscriptions) | List conditional subscriptions |
 | [`map_info`](#lmdb-map-size) | Read map size and high-water mark |
 | [`resize_map`](#lmdb-map-size) | Grow the LMDB map online |
 
@@ -344,8 +348,9 @@ Semantics:
 ## watch
 
 Long-polls an append-only event collection by sortable `_id`. Use it for outbox
-event collections such as `_events`; it is not an automatic change stream for
-arbitrary updates and deletes.
+event collections such as `_events`; the long-poll form is not an automatic
+change stream. Streaming `mode:"live"` provides connection-scoped change
+notifications, including updates and deletes.
 
 ```json
 {
@@ -399,7 +404,17 @@ SSE. Optional fields:
 - `timeout_ms` — maximum stream lifetime; absent or `0` means no limit;
 - `overlap_ms` — late-commit rescan window, default `2,000`, max `60,000`;
 - `threshold` — optional server-side event count threshold:
-  `{"count":100,"window_ms":60000,"group_by":["payload.tenant"]}`.
+  `{"count":100,"window_ms":60000,"group_by":["payload.tenant"]}`;
+- `mode` — set to `"live"` for a connection-scoped condition over `coll`;
+- `ops`, `count`, `once`, `name`, `event_type` — live-mode condition fields.
+
+Live mode does not tail `_events`. It registers an in-memory subscription for the
+connection, evaluates `filter`/`count` in the writer, and pushes matching events
+directly. Closing the stream removes it; half-open connections are cleaned up
+after 30 seconds without a heartbeat. Live events are not stored in `_events`.
+`after`, `types`, and `threshold` are rejected in live mode, and vault
+collections are not supported. See
+[Streaming outbox events](streams.md#live-subscriptions-connection-scoped).
 
 NDJSON starts with `{"stream":{"truncated":false,"oldest":null}}`, then sends one
 event per line and periodic `{"heartbeat":true,"ts_ms":...}` frames. SSE emits
@@ -1750,6 +1765,42 @@ Response:
 `set_collection_events` requires `admin:<collection>`;
 `get_collection_events` requires `read:<collection>`. See
 [Outbox events](events.md).
+
+## Conditional subscriptions
+
+Persistent subscriptions evaluate a client-defined condition over collection
+state on every write. They are different from event-count stream thresholds and
+from automatic events.
+
+```json
+{"op":"create_subscription","coll":"orders","name":"paid","ops":["insert","update","delete"],"filter":{"status":"paid"},"lease_seconds":600}
+{"op":"renew_subscription","coll":"orders","name":"paid","lease_seconds":600}
+{"op":"create_subscription","coll":"orders","name":"many","count":{"filter":{"total":{"$gt":100}},"gt":100}}
+{"op":"create_subscription","coll":"orders","name":"high_once","filter":{"total":{"$gt":100}},"once":true}
+{"op":"list_subscriptions","coll":"orders"}
+{"op":"delete_subscription","coll":"orders","name":"paid"}
+```
+
+By default **every write whose condition is true** emits an event. The optional
+`once:true` flag changes this to edge-triggered (`false -> true`). `ops=[]` means
+all operations. `filter` applies to the after document for insert/update and the
+before document for delete. `count` is evaluated over current collection state
+after the write; support comparisons `gt`, `gte`, `lt`, `lte`, `eq`, default
+`gt:0`.
+
+Events are stored in `_events` with default type `subscription.<name>` (or the
+optional `event_type`) and payload fields `subscription`, `coll`, `op`, `before`,
+`after`, and `count`. They commit atomically with the write and can be consumed
+with `watch`, `/v1/watch`, or `EventConsumer`.
+
+Persistent subscriptions are leased. `lease_seconds` defaults to `600`; the
+client must call `renew_subscription` before expiry. Expired subscriptions stop
+evaluating conditions and are removed by the writer or the maintenance sweep.
+Expiry removes the subscription only, not existing `_events` documents.
+
+`create_subscription`, `renew_subscription`, and `delete_subscription` require
+`admin:<collection>`; `list_subscriptions` requires `read:<collection>`. See
+[Conditional subscriptions](subscriptions.md).
 
 ## Document TTL
 
