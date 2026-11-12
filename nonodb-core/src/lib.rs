@@ -15,6 +15,7 @@ pub mod bson_types;
 pub mod collection;
 pub mod date;
 pub mod error;
+pub mod events;
 pub mod geo;
 pub mod history;
 pub mod index;

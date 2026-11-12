@@ -23,6 +23,8 @@ pub static WATCH_EVENTS: AtomicU64 = AtomicU64::new(0);
 pub static WATCH_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
 pub static WATCH_TRUNCATED: AtomicU64 = AtomicU64::new(0);
 pub static WATCH_HEARTBEATS: AtomicU64 = AtomicU64::new(0);
+pub static WATCH_THRESHOLD_EMITTED: AtomicU64 = AtomicU64::new(0);
+pub static WATCH_THRESHOLD_SUPPRESSED: AtomicU64 = AtomicU64::new(0);
 /// SQL statement counters and total execution time.
 pub static SQL_SELECT: AtomicU64 = AtomicU64::new(0);
 pub static SQL_INSERT: AtomicU64 = AtomicU64::new(0);
@@ -94,6 +96,7 @@ pub fn snapshot() -> Value {
     let batches = WRITE_BATCHES.load(Relaxed).max(1);
     let commit_ns = COMMIT_NS.load(Relaxed);
     let write_ops = WRITE_OPS.load(Relaxed);
+    let (event_emitted, event_suppressed) = nonodb_core::events::stats();
     json!({
         "requests_total": REQUESTS.load(Relaxed),
         "errors_total": ERRORS.load(Relaxed),
@@ -112,6 +115,10 @@ pub fn snapshot() -> Value {
         "watch_timeouts_total": WATCH_TIMEOUTS.load(Relaxed),
         "watch_truncated_total": WATCH_TRUNCATED.load(Relaxed),
         "watch_heartbeats_total": WATCH_HEARTBEATS.load(Relaxed),
+        "watch_threshold_emitted_total": WATCH_THRESHOLD_EMITTED.load(Relaxed),
+        "watch_threshold_suppressed_total": WATCH_THRESHOLD_SUPPRESSED.load(Relaxed),
+        "collection_events_emitted_total": event_emitted,
+        "collection_events_suppressed_total": event_suppressed,
         "sql_select_total": SQL_SELECT.load(Relaxed),
         "sql_insert_total": SQL_INSERT.load(Relaxed),
         "sql_update_total": SQL_UPDATE.load(Relaxed),

@@ -5,7 +5,7 @@ is deliberately out of scope, and which gaps are candidates for future work.
 
 ## Current status
 
-The project is at `0.16.0`. It is suitable for local and single-host
+The project is at `0.17.0`. It is suitable for local and single-host
 applications that need a small, durable, queryable JSON store and can accept a
 single-writer model.
 
@@ -40,8 +40,11 @@ Implemented:
 - durable background jobs through an ordinary `_jobs` collection and external
   workers, with leases, retries, and idempotent enqueue;
 - outbox events through an ordinary `_events` collection, with atomic data +
-  event writes, sortable event ids, per-consumer checkpoints, and server-side
-  `watch` long-polling and continuous NDJSON/SSE streaming;
+  event writes, automatic per-collection insert/update/delete events, optional
+  field-change filtering, sortable event ids, per-consumer checkpoints, and
+  server-side `watch` long-polling and continuous NDJSON/SSE streaming;
+- server-side stream filtering by topic and payload, plus count thresholds with
+  grouping and time windows;
 - per-collection append-only document revision history with retention (`0` disables);
 - document TTL with collection defaults, per-document overrides, and background expiry;
 - BSON-compatible dates with RFC 3339 input, UTC normalization, indexed ranges, and sorting;

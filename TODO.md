@@ -132,9 +132,11 @@ limitations are documented in [docs/roadmap.md](docs/roadmap.md).
 - [x] Add continuous NDJSON/SSE `/v1/watch` streams with heartbeats, payload
       filters/projections, truncation detection, stream metrics, and Python
       reconnect helpers
-- [ ] Evaluate an automatic change feed for arbitrary writes only if explicit
-      outbox events are insufficient for strict commit-order guarantees across
-      many concurrent producer processes
+- [x] Add automatic per-collection insert/update/delete change events with
+      optional field-change filters, atomic outbox writes, API/CLI/client
+      controls, and real-daemon tests
+- [x] Add server-side stream count thresholds with grouping and time windows
+- [x] Automatic events for `find_and_modify` and TTL expiry
 
 ### P1 — lookup enhancements
 

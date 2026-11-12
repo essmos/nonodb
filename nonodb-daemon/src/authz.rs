@@ -31,7 +31,8 @@ pub fn authorize_request(principal: &Principal, req: &Request) -> Result<(), Api
         | Request::History { coll, .. }
         | Request::GetVersion { coll, .. }
         | Request::GetCollectionTtl { coll }
-        | Request::GetCollectionHistory { coll } => {
+        | Request::GetCollectionHistory { coll }
+        | Request::GetCollectionEvents { coll } => {
             allow(principal, Action::Read, coll, req.op_name())
         }
 
@@ -67,7 +68,8 @@ pub fn authorize_request(principal: &Principal, req: &Request) -> Result<(), Api
         | Request::DropVectorIndex { coll, .. }
         | Request::CreateCollection { coll, .. }
         | Request::SetCollectionTtl { coll, .. }
-        | Request::SetCollectionHistory { coll, .. } => {
+        | Request::SetCollectionHistory { coll, .. }
+        | Request::SetCollectionEvents { coll, .. } => {
             allow(principal, Action::AdminCollection, coll, req.op_name())
         }
 

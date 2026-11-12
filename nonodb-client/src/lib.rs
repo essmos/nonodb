@@ -457,6 +457,32 @@ impl Client {
             .unwrap_or(0) as usize)
     }
 
+    /// Enables automatic change events for a collection.
+    ///
+    /// When `fields` is non-empty, updates emit only when at least one listed
+    /// field changed. Empty `fields` means any field change.
+    pub fn set_collection_events(
+        &self,
+        name: impl Into<String>,
+        enabled: bool,
+        fields: &[&str],
+    ) -> Result<Value> {
+        self.exec(json!({
+            "op": "set_collection_events",
+            "coll": name.into(),
+            "enabled": enabled,
+            "fields": fields,
+        }))
+    }
+
+    /// Reads automatic change-event settings for a collection.
+    pub fn collection_events(&self, name: impl Into<String>) -> Result<Value> {
+        self.exec(json!({
+            "op": "get_collection_events",
+            "coll": name.into(),
+        }))
+    }
+
     /// Current LMDB map size and high-water mark.
     pub fn map_info(&self) -> Result<Value> {
         self.exec(json!({"op": "map_info"}))

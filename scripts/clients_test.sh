@@ -107,6 +107,9 @@ python3 scripts/ttl_test.py
 echo "== Per-collection history"
 python3 scripts/history_test.py
 
+echo "== Automatic collection events"
+python3 scripts/events_auto_test.py
+
 echo "== Vault regression"
 python3 scripts/vault_regression_test.py
 

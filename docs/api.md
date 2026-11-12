@@ -135,6 +135,8 @@ client timeout with `NONODB_TIMEOUT` or the `timeout=` argument.
 | [`get_collection_ttl`](#document-ttl) | Read the default document TTL |
 | [`set_collection_history`](#set_collection_history) | Set per-collection history retention (`0` disables) |
 | [`get_collection_history`](#get_collection_history) | Read per-collection history retention |
+| [`set_collection_events`](#set_collection_events) | Enable/disable automatic collection change events |
+| [`get_collection_events`](#get_collection_events) | Read automatic change-event settings |
 | [`map_info`](#lmdb-map-size) | Read map size and high-water mark |
 | [`resize_map`](#lmdb-map-size) | Grow the LMDB map online |
 
@@ -395,7 +397,9 @@ SSE. Optional fields:
 
 - `heartbeat_ms` — keepalive interval, default `15,000`, range `100..60,000`;
 - `timeout_ms` — maximum stream lifetime; absent or `0` means no limit;
-- `overlap_ms` — late-commit rescan window, default `2,000`, max `60,000`.
+- `overlap_ms` — late-commit rescan window, default `2,000`, max `60,000`;
+- `threshold` — optional server-side event count threshold:
+  `{"count":100,"window_ms":60000,"group_by":["payload.tenant"]}`.
 
 NDJSON starts with `{"stream":{"truncated":false,"oldest":null}}`, then sends one
 event per line and periodic `{"heartbeat":true,"ts_ms":...}` frames. SSE emits
@@ -1705,6 +1709,47 @@ disables new history writes. Requires `admin:<collection>`.
 
 Returns `{"coll":"users","max_versions":50}`. Requires
 `read:<collection>`.
+
+## Automatic collection events
+
+Configure automatic `insert`/`update`/`delete` events for a standard collection:
+
+```json
+{
+  "op": "set_collection_events",
+  "coll": "orders",
+  "enabled": true,
+  "ops": ["insert", "update"],
+  "fields": ["status", "total"],
+  "filter": {"payload.after.status": "paid"},
+  "include_before": false,
+  "include_after": true,
+  "projection": {"status": 1, "total": 1}
+}
+```
+
+`fields=[]` means any changed top-level field. With a non-empty list, `update`
+events are emitted only when at least one listed field changed. `ops=[]` means
+all operations. `filter` suppresses non-matching events before they are stored.
+`include_before`/`include_after` and `projection` control the stored payload. Events are written atomically to `_events` as
+`<collection>.<insert|update|delete>` documents. Vault collections are not
+auto-evented.
+
+Read the setting:
+
+```json
+{"op":"get_collection_events","coll":"orders"}
+```
+
+Response:
+
+```json
+{"coll":"orders","enabled":true,"fields":["status","total"]}
+```
+
+`set_collection_events` requires `admin:<collection>`;
+`get_collection_events` requires `read:<collection>`. See
+[Outbox events](events.md).
 
 ## Document TTL
 

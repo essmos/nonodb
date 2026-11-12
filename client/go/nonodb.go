@@ -410,7 +410,7 @@ func isReadOp(payload map[string]any) bool {
 	switch op {
 	case "find", "find_one", "lookup", "watch", "count", "list_indexes", "list_collections",
 		"list_text_indexes", "list_fuzzy_indexes", "list_vector_indexes",
-		"search", "fuzzy", "vector_search", "history", "get_version", "get_collection_history", "sql", "explain_sql", "batch":
+		"search", "fuzzy", "vector_search", "history", "get_version", "get_collection_history", "get_collection_events", "sql", "explain_sql", "batch":
 		return true
 	default:
 		return false
@@ -533,6 +533,40 @@ func (c *Client) CollectionHistory(ctx context.Context, name string) (int, error
 		return 0, err
 	}
 	return result.MaxVersions, nil
+}
+
+// SetCollectionEvents enables or disables automatic change events for a collection.
+func (c *Client) SetCollectionEvents(ctx context.Context, name string, enabled bool, fields []string) (map[string]any, error) {
+	if fields == nil {
+		fields = []string{}
+	}
+	raw, err := c.execRaw(ctx, map[string]any{
+		"op": "set_collection_events", "coll": name,
+		"enabled": enabled, "fields": fields,
+	})
+	if err != nil {
+		return nil, err
+	}
+	var result map[string]any
+	if err := decodeInto(raw, &result); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// CollectionEvents returns automatic change-event settings for a collection.
+func (c *Client) CollectionEvents(ctx context.Context, name string) (map[string]any, error) {
+	raw, err := c.execRaw(ctx, map[string]any{
+		"op": "get_collection_events", "coll": name,
+	})
+	if err != nil {
+		return nil, err
+	}
+	var result map[string]any
+	if err := decodeInto(raw, &result); err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 // Collections lists collection names.

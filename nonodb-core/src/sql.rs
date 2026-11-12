@@ -236,7 +236,11 @@ impl InsertSql {
             for (column, value) in self.columns.iter().zip(row) {
                 path::set(&mut doc, column, value.resolve(params)?)?;
             }
-            inserted_ids.push(c.insert_one_txn(wtxn, doc)?);
+            let id = c.insert_one_txn(wtxn, doc)?;
+            if let Some(after) = c.find_one_in(&*wtxn, &json!({ "_id": id }), None)? {
+                c.append_change_event(wtxn, "insert", &id, None, Some(&after))?;
+            }
+            inserted_ids.push(id);
         }
         Ok(json!({
             "inserted": inserted_ids.len(),
@@ -264,6 +268,21 @@ impl UpdateSql {
             .any(|(_, expr)| expr.uses_document());
 
         if !uses_document {
+            let events_enabled = c.events_enabled_in(wtxn)?.is_some();
+            let before_docs = if events_enabled {
+                c.find_in(
+                    &*wtxn,
+                    &FindQuery {
+                        filter: filter.clone(),
+                        projection: None,
+                        sort: Vec::new(),
+                        skip: 0,
+                        limit: None,
+                    },
+                )?
+            } else {
+                Vec::new()
+            };
             let mut set = Map::new();
             for (field, expr) in &self.assignments {
                 set.insert(field.clone(), expr.eval(&json!({}), params)?);
@@ -276,6 +295,16 @@ impl UpdateSql {
                 false,
                 &[],
             )?;
+            if events_enabled {
+                for before in &before_docs {
+                    let id = before
+                        .get("_id")
+                        .and_then(Value::as_str)
+                        .ok_or(Error::InvalidId)?;
+                    let after = c.find_one_in(&*wtxn, &json!({ "_id": id }), None)?;
+                    c.append_change_event(wtxn, "update", id, Some(before), after.as_ref())?;
+                }
+            }
             return Ok(json!({
                 "matched": out.matched,
                 "modified": out.modified,
@@ -311,6 +340,10 @@ impl UpdateSql {
                 false,
                 &[],
             )?;
+            if out.modified > 0 {
+                let after = c.find_one_in(&*wtxn, &json!({ "_id": id }), None)?;
+                c.append_change_event(wtxn, "update", &id, Some(doc), after.as_ref())?;
+            }
             modified += out.modified;
         }
         Ok(json!({
@@ -332,7 +365,31 @@ impl DeleteSql {
             Some(expr) => expr.to_filter(params)?,
             None => json!({}),
         };
+        let events_enabled = c.events_enabled_in(wtxn)?.is_some();
+        let before_docs = if events_enabled {
+            c.find_in(
+                &*wtxn,
+                &FindQuery {
+                    filter: filter.clone(),
+                    projection: None,
+                    sort: Vec::new(),
+                    skip: 0,
+                    limit: None,
+                },
+            )?
+        } else {
+            Vec::new()
+        };
         let deleted = c.delete_txn(wtxn, &filter, true)?;
+        if events_enabled {
+            for before in &before_docs {
+                let id = before
+                    .get("_id")
+                    .and_then(Value::as_str)
+                    .ok_or(Error::InvalidId)?;
+                c.append_change_event(wtxn, "delete", id, Some(before), None)?;
+            }
+        }
         Ok(json!({ "deleted": deleted }))
     }
 }

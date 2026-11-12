@@ -254,6 +254,21 @@ class NonoDB {
     return result?.max_versions ?? 0;
   }
 
+  /** Enable or disable automatic change events for a collection. */
+  async setCollectionEvents(name, enabled, fields = []) {
+    return this.exec({
+      op: 'set_collection_events',
+      coll: name,
+      enabled: Boolean(enabled),
+      fields,
+    });
+  }
+
+  /** Read automatic change-event settings for a collection. */
+  async collectionEvents(name) {
+    return this.exec({ op: 'get_collection_events', coll: name });
+  }
+
   /** List collection names. */
   async collections() {
     const result = await this.exec({ op: 'list_collections' });

@@ -21,7 +21,7 @@ quick-start instructions, and a feature overview.
 | [Mutual TLS](mtls.md) | Operators, security reviewers | Private CA setup, client certificates, fingerprint mapping, revocation, rotation, troubleshooting |
 | [Python client](python-client.md) | Python developers | Connection, CRUD, upsert, indexes, search, batches, cache, FastAPI |
 | [Background jobs](workers.md) | Application developers, operators | Durable jobs, workers, leases, retries, cron/systemd, languages |
-| [Outbox events](events.md) | Application developers, operators | Atomic data + events, polling consumers, checkpoints, event worker CLI, TTL, systemd |
+| [Outbox events](events.md) | Application developers, operators | Atomic data + events, automatic collection events, source-side filters, polling consumers, checkpoints, event worker CLI, TTL, systemd |
 | [Streaming outbox events](streams.md) | Application developers | Long-poll `watch`, NDJSON/SSE streams, resume tokens, filters, truncation, Python/Rust/Node.js/Go examples |
 | [CLI](cli.md) | Operators | Administration, map resize, backup verification, restore drills, inspect, raw requests |
 | [Operations](operations.md) | Operators, SRE | Configuration, deployment, security, snapshots, monitoring, capacity, troubleshooting |

@@ -10,6 +10,7 @@ use heed::{Database, Env, EnvFlags, EnvOpenOptions, RoTxn, RwTxn};
 
 use crate::collection::Collection;
 use crate::error::{Error, Result};
+use crate::events::EventConfig;
 use crate::history::{self, DEFAULT_HISTORY_MAX_VERSIONS, HISTORY_DB};
 use crate::ttl::{self, TTL_DB};
 use crate::vault::CollectionProfile;
@@ -420,6 +421,32 @@ impl Store {
         format!("history:{name}")
     }
 
+    fn events_key(name: &str) -> String {
+        format!("events:{name}")
+    }
+
+    fn events_from_ro(
+        meta: Database<Bytes, Bytes>,
+        rtxn: &RoTxn<'_>,
+        name: &str,
+    ) -> Result<EventConfig> {
+        Ok(meta
+            .get(rtxn, Self::events_key(name).as_bytes())?
+            .and_then(|raw| serde_json::from_slice(raw).ok())
+            .unwrap_or_default())
+    }
+
+    fn events_from_rw(
+        meta: Database<Bytes, Bytes>,
+        wtxn: &RwTxn<'_>,
+        name: &str,
+    ) -> Result<EventConfig> {
+        Ok(meta
+            .get(wtxn, Self::events_key(name).as_bytes())?
+            .and_then(|raw| serde_json::from_slice(raw).ok())
+            .unwrap_or_default())
+    }
+
     fn history_from_ro(
         meta: Database<Bytes, Bytes>,
         rtxn: &RoTxn<'_>,
@@ -762,6 +789,59 @@ impl Store {
             )?;
         }
         Ok(())
+    }
+
+    /// Configures automatic change events for one collection.
+    pub fn set_collection_events(&self, name: &str, config: &EventConfig) -> Result<()> {
+        let mut wtxn = self.write_txn()?;
+        self.set_collection_events_in(&mut wtxn, name, config)?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    /// Configures automatic change events inside an existing writer transaction.
+    pub fn set_collection_events_in(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        name: &str,
+        config: &EventConfig,
+    ) -> Result<()> {
+        Self::validate_name(name)?;
+        if self.collection_profile_in_rw(wtxn, name)?.is_none() {
+            return Err(Error::Query(format!("collection `{name}` does not exist")));
+        }
+        let meta = self
+            .env
+            .create_database::<Bytes, Bytes>(&mut *wtxn, Some(META_DB))?;
+        if config.enabled {
+            let raw = serde_json::to_vec(config)?;
+            meta.put(&mut *wtxn, Self::events_key(name).as_bytes(), &raw)?;
+        } else {
+            meta.delete(&mut *wtxn, Self::events_key(name).as_bytes())?;
+        }
+        Ok(())
+    }
+
+    /// Returns the automatic change-event configuration for a collection.
+    pub fn collection_events(&self, name: &str) -> Result<EventConfig> {
+        let rtxn = self.read_txn()?;
+        let meta = self
+            .env
+            .open_database::<Bytes, Bytes>(&rtxn, Some(META_DB))?
+            .ok_or_else(|| Error::Query("meta database missing".into()))?;
+        let out = Self::events_from_ro(meta, &rtxn, name)?;
+        rtxn.commit()?;
+        Ok(out)
+    }
+
+    /// Reads event settings inside the writer transaction.
+    pub fn collection_events_in_rw(&self, wtxn: &RwTxn<'_>, name: &str) -> Result<EventConfig> {
+        Self::validate_name(name)?;
+        let meta = self
+            .env
+            .open_database::<Bytes, Bytes>(wtxn, Some(META_DB))?
+            .ok_or_else(|| Error::Query("meta database missing".into()))?;
+        Self::events_from_rw(meta, wtxn, name)
     }
 
     /// Returns the per-collection history retention. `0` means disabled.

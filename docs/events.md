@@ -1,12 +1,20 @@
 # Outbox events
 
 NonoDB does not run user code inside the daemon and does not emit events from
-`find` or `aggregate`. Events use the **outbox pattern**: application data and an
-event document are written in one atomic `write_batch`, then an external consumer
-polls the event collection and runs Python handlers.
+`find` or `aggregate`. Events use the **outbox pattern**: an event document is
+written in the same transaction as the data change, then an external consumer
+polls or streams the event collection and runs application handlers.
 
-This keeps the single-writer LMDB model and authorization boundaries unchanged.
-For durable retrying work, see [Background jobs](workers.md).
+There are two producers:
+
+- an application can write data and an event atomically with `write_batch`;
+- or a collection can enable **automatic change events** in the writer. The
+  daemon then appends `insert`/`update`/`delete` events for that collection.
+
+Automatic events are also ordinary outbox documents in `_events`, so existing
+consumers and `watch` filters work unchanged. This keeps the single-writer LMDB
+model and authorization boundaries unchanged. For durable retrying work, see
+[Background jobs](workers.md).
 
 ## Model
 
@@ -78,6 +86,94 @@ To emit only an event, omit `data_ops`:
 
 ```python
 producer.emit("cache.invalidate", {"key": "catalog"})
+```
+
+## Automatic collection change events
+
+Enable events for one collection:
+
+```json
+{
+  "op": "set_collection_events",
+  "coll": "orders",
+  "enabled": true,
+  "ops": ["insert", "update"],
+  "fields": ["status", "total"],
+  "filter": {"payload.after.status": "paid"},
+  "include_before": false,
+  "include_after": true,
+  "projection": {"status": 1, "total": 1}
+}
+```
+
+- `fields=[]` emits updates for any changed top-level field.
+- A non-empty `fields` list limits `update` events to changes in those fields.
+- `ops=[]` means all operations; otherwise only the listed
+  `insert`/`update`/`delete` operations are emitted.
+- `filter` is matched against the complete event document before it is stored.
+  Non-matching events never reach `_events`.
+- `include_before` / `include_after` control whether the payload contains the
+  before/after document.
+- `projection` limits which before/after fields are stored in the event.
+- With the default `fields=[]` and no filter, every `insert`/`update`/`delete`
+  emits when events are enabled.
+- The event is written in the same writer transaction as the data change.
+- Events are written to `_events`; vault collections are not auto-evented.
+- `insert`, `insert_many`, `update`, `delete`, `find_and_modify`, TTL expiry,
+  and SQL `INSERT`/`UPDATE`/`DELETE` emit events.
+- No global daemon switch is required.
+
+Event shape:
+
+```json
+{
+  "_id": "01J...",
+  "type": "orders.update",
+  "doc_id": "o1",
+  "payload": {
+    "coll": "orders",
+    "op": "update",
+    "before": {"_id": "o1", "status": "new", "total": 10},
+    "after": {"_id": "o1", "status": "paid", "total": 10},
+    "changed_fields": ["status"]
+  },
+  "created_at": 1762800000000
+}
+```
+
+Read the current setting:
+
+```bash
+nonodb-cli events orders
+nonodb-cli events orders on status total
+nonodb-cli events orders off
+```
+
+API:
+
+```json
+{"op":"set_collection_events","coll":"orders","enabled":true,"fields":["status"]}
+{"op":"get_collection_events","coll":"orders"}
+```
+
+`set_collection_events` requires `admin:<collection>`;
+`get_collection_events` requires `read:<collection>`.
+
+### Server-side topics and filters
+
+Use event `type` as the topic and `filter` for payload conditions. Filtering is
+done in Rust before bytes are sent to the consumer:
+
+```json
+{
+  "op": "watch",
+  "coll": "_events",
+  "types": ["orders.insert", "orders.update"],
+  "filter": {
+    "payload.tenant": "abc",
+    "payload.after.status": "paid"
+  }
+}
 ```
 
 ## Consume with checkpoints

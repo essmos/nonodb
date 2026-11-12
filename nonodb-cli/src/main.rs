@@ -120,6 +120,36 @@ fn run() -> Result<(), String> {
             let res = http_post("/v1/exec", &json!({"op": "map_info"}))?;
             print_result(&res);
         }
+        "events" => {
+            if args.get(1).map(String::as_str) == Some("tail") {
+                return events_tail(&args[2..]);
+            }
+            let coll = args
+                .get(1)
+                .ok_or("użycie: nonodb-cli events <kolekcja> [on|off] [pole...]")?;
+            let res = match args.get(2).map(String::as_str) {
+                None => http_post(
+                    "/v1/exec",
+                    &json!({"op": "get_collection_events", "coll": coll}),
+                )?,
+                Some(state @ ("on" | "off")) => {
+                    let fields = args[3..].to_vec();
+                    http_post(
+                        "/v1/exec",
+                        &json!({
+                            "op": "set_collection_events",
+                            "coll": coll,
+                            "enabled": state == "on",
+                            "fields": fields,
+                        }),
+                    )?
+                }
+                Some(other) => {
+                    return Err(format!("nieznany stan `{other}`; użyj `on` albo `off`"))
+                }
+            };
+            print_result(&res);
+        }
         "history" => {
             let coll = args
                 .get(1)
@@ -286,6 +316,72 @@ fn print_report(report: &nonodb_core::VerificationReport) {
             coll.text_indexes.len(),
             coll.fuzzy_indexes.len()
         );
+    }
+}
+
+fn events_tail(args: &[String]) -> Result<(), String> {
+    let mut coll = "_events".to_string();
+    let mut after: Option<String> = None;
+    let mut types = Vec::new();
+    let mut filter = json!({});
+    let mut once = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--coll" => {
+                coll = args.get(i + 1).ok_or("--coll wymaga nazwy")?.clone();
+                i += 2;
+            }
+            "--after" => {
+                after = Some(args.get(i + 1).ok_or("--after wymaga id")?.clone());
+                i += 2;
+            }
+            "--type" => {
+                types.push(args.get(i + 1).ok_or("--type wymaga nazwy")?.clone());
+                i += 2;
+            }
+            "--filter" => {
+                let raw = args.get(i + 1).ok_or("--filter wymaga JSON")?;
+                filter = serde_json::from_str(raw).map_err(|e| e.to_string())?;
+                i += 2;
+            }
+            "--once" => {
+                once = true;
+                i += 1;
+            }
+            other => return Err(format!("nieznana opcja: {other}")),
+        }
+    }
+    loop {
+        let mut payload = json!({
+            "op": "watch",
+            "coll": coll,
+            "limit": 100,
+            "timeout_ms": 1000,
+            "filter": filter,
+        });
+        if let Some(after) = &after {
+            payload["after"] = json!(after);
+        }
+        if !types.is_empty() {
+            payload["types"] = json!(types);
+        }
+        let res = http_post("/v1/exec", &payload)?;
+        let result = res.get("result").cloned().unwrap_or(Value::Null);
+        for event in result
+            .get("events")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            println!("{}", serde_json::to_string(event).unwrap());
+            if let Some(id) = event.get("_id").and_then(Value::as_str) {
+                after = Some(id.to_string());
+            }
+        }
+        if once {
+            return Ok(());
+        }
     }
 }
 

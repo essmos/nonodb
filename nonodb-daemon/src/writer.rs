@@ -9,7 +9,9 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use nonodb_core::{vault, Collection, FindAndModifyOptions, Store};
+use nonodb_core::{
+    events, vault, Collection, CollectionProfile, FindAndModifyOptions, FindQuery, Store,
+};
 use serde_json::{json, Value};
 use tokio::sync::oneshot;
 
@@ -179,6 +181,57 @@ fn standard_collection<'a>(
     write_collection(store, wtxn, coll, None)
 }
 
+fn event_config(
+    store: &Store,
+    wtxn: &nonodb_core::heed::RwTxn<'_>,
+    coll: &str,
+) -> Result<Option<events::EventConfig>, ApiError> {
+    if coll == events::EVENTS_COLLECTION
+        || matches!(
+            store.collection_profile_in_rw(wtxn, coll)?,
+            Some(CollectionProfile::Vault)
+        )
+    {
+        return Ok(None);
+    }
+    let config = store.collection_events_in_rw(wtxn, coll)?;
+    Ok(config.active().then_some(config))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_event(
+    store: &Store,
+    wtxn: &mut nonodb_core::heed::RwTxn<'_>,
+    coll: &str,
+    op: &str,
+    id: &str,
+    before: Option<&Value>,
+    after: Option<&Value>,
+    config: &events::EventConfig,
+) -> Result<(), ApiError> {
+    let Some(event) = events::change_event(coll, op, id, before, after, config) else {
+        return Ok(());
+    };
+    let outbox = store.collection_in(wtxn, events::EVENTS_COLLECTION)?;
+    outbox.insert_one_txn(wtxn, event)?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_by_id(
+    store: &Store,
+    wtxn: &mut nonodb_core::heed::RwTxn<'_>,
+    target: &Collection<'_>,
+    coll: &str,
+    op: &str,
+    id: &str,
+    before: Option<&Value>,
+    config: &events::EventConfig,
+) -> Result<(), ApiError> {
+    let after = target.find_one_in(&*wtxn, &json!({ "_id": id }), None)?;
+    emit_event(store, wtxn, coll, op, id, before, after.as_ref(), config)
+}
+
 fn execute(
     store: &Store,
     wtxn: &mut nonodb_core::heed::RwTxn<'_>,
@@ -221,6 +274,37 @@ fn execute(
             store.set_collection_history_in(wtxn, coll, *max_versions)?;
             Ok(json!({ "coll": coll, "max_versions": max_versions }))
         }
+        WriteReq::SetCollectionEvents {
+            coll,
+            enabled,
+            fields,
+            ops,
+            filter,
+            include_before,
+            include_after,
+            projection,
+        } => {
+            let config = events::EventConfig {
+                enabled: *enabled,
+                fields: fields.clone(),
+                ops: ops.clone(),
+                filter: filter.clone(),
+                include_before: *include_before,
+                include_after: *include_after,
+                projection: projection.clone(),
+            };
+            store.set_collection_events_in(wtxn, coll, &config)?;
+            Ok(json!({
+                "coll": coll,
+                "enabled": enabled,
+                "fields": fields,
+                "ops": ops,
+                "filter": filter,
+                "include_before": include_before,
+                "include_after": include_after,
+                "projection": projection,
+            }))
+        }
         WriteReq::Expire { entries } => {
             let mut expired = 0usize;
             for entry in entries {
@@ -229,7 +313,25 @@ fn execute(
                     continue;
                 }
                 let c = store.collection_in(wtxn, &entry.coll)?;
+                let config = event_config(store, wtxn, &entry.coll)?;
+                let before = if config.is_some() && !c.profile().is_vault() {
+                    c.find_one_in(&*wtxn, &json!({ "_id": entry.id }), None)?
+                } else {
+                    None
+                };
                 if c.expire_txn(wtxn, &entry.id, entry.expected_ttl_at)? {
+                    if let (Some(config), Some(before)) = (&config, before.as_ref()) {
+                        emit_event(
+                            store,
+                            wtxn,
+                            &entry.coll,
+                            "delete",
+                            &entry.id,
+                            Some(before),
+                            None,
+                            config,
+                        )?;
+                    }
                     expired += 1;
                 }
             }
@@ -241,6 +343,7 @@ fn execute(
         }
         WriteReq::Insert { coll, doc, vault } => {
             let c = write_collection(store, wtxn, coll, vault.as_ref())?;
+            let config = event_config(store, wtxn, coll)?;
             if c.profile().is_vault() {
                 let auth = vault.as_ref().ok_or_else(vault::key_required)?;
                 let id =
@@ -251,11 +354,15 @@ fn execute(
                     return Err(vault::key_unexpected().into());
                 }
                 let id = c.insert_one_txn(wtxn, doc.clone())?;
+                if let Some(config) = &config {
+                    emit_by_id(store, wtxn, &c, coll, "insert", &id, None, config)?;
+                }
                 Ok(json!({ "inserted_id": id }))
             }
         }
         WriteReq::InsertMany { coll, docs, vault } => {
             let c = write_collection(store, wtxn, coll, vault.as_ref())?;
+            let config = event_config(store, wtxn, coll)?;
             if c.profile().is_vault() {
                 let auth = vault.as_ref().ok_or_else(vault::key_required)?;
                 let ids =
@@ -268,6 +375,11 @@ fn execute(
                 let mut ids = Vec::with_capacity(docs.len());
                 for doc in docs {
                     ids.push(c.insert_one_txn(wtxn, doc.clone())?);
+                }
+                if let Some(config) = &config {
+                    for id in &ids {
+                        emit_by_id(store, wtxn, &c, coll, "insert", id, None, config)?;
+                    }
                 }
                 Ok(json!({ "inserted_ids": ids }))
             }
@@ -282,6 +394,21 @@ fn execute(
             vault,
         } => {
             let c = write_collection(store, wtxn, coll, vault.as_ref())?;
+            let config = event_config(store, wtxn, coll)?;
+            let before_docs = if config.is_some() && !c.profile().is_vault() {
+                c.find_in(
+                    &*wtxn,
+                    &FindQuery {
+                        filter: filter.clone(),
+                        projection: None,
+                        sort: Vec::new(),
+                        skip: 0,
+                        limit: if *multi { None } else { Some(1) },
+                    },
+                )?
+            } else {
+                Vec::new()
+            };
             let out = if c.profile().is_vault() {
                 let auth = vault.as_ref().ok_or_else(vault::key_required)?;
                 c.update_vault_txn_filtered(
@@ -301,6 +428,24 @@ fn execute(
                 }
                 c.update_opts_txn_filtered(wtxn, filter, update, *multi, *upsert, array_filters)?
             };
+            if let Some(config) = &config {
+                if !c.profile().is_vault() {
+                    if let Some(id) = &out.upserted_id {
+                        emit_by_id(store, wtxn, &c, coll, "insert", id, None, config)?;
+                    } else {
+                        for before in &before_docs {
+                            let id =
+                                before.get("_id").and_then(Value::as_str).ok_or_else(|| {
+                                    ApiError {
+                                        code: "invalid_id".into(),
+                                        message: "document has no string _id".into(),
+                                    }
+                                })?;
+                            emit_by_id(store, wtxn, &c, coll, "update", id, Some(before), config)?;
+                        }
+                    }
+                }
+            }
             Ok(json!({
                 "matched": out.matched,
                 "modified": out.modified,
@@ -320,6 +465,23 @@ fn execute(
             vault,
         } => {
             let c = write_collection(store, wtxn, coll, vault.as_ref())?;
+            let config = event_config(store, wtxn, coll)?;
+            let before = if config.is_some() && !c.profile().is_vault() {
+                c.find_in(
+                    &*wtxn,
+                    &FindQuery {
+                        filter: filter.clone(),
+                        projection: None,
+                        sort: sort.clone(),
+                        skip: 0,
+                        limit: Some(1),
+                    },
+                )?
+                .into_iter()
+                .next()
+            } else {
+                None
+            };
             let opts = FindAndModifyOptions {
                 filter,
                 update: update.as_ref(),
@@ -339,6 +501,36 @@ fn execute(
                 }
                 c.find_and_modify_txn(wtxn, &opts)?
             };
+            if let Some(config) = &config {
+                if !c.profile().is_vault() {
+                    if let Some(id) = &out.upserted_id {
+                        emit_by_id(store, wtxn, &c, coll, "insert", id, None, config)?;
+                    } else if let Some(before) = &before {
+                        let id =
+                            before
+                                .get("_id")
+                                .and_then(Value::as_str)
+                                .ok_or_else(|| ApiError {
+                                    code: "invalid_id".into(),
+                                    message: "document has no string _id".into(),
+                                })?;
+                        if *remove {
+                            emit_event(
+                                store,
+                                wtxn,
+                                coll,
+                                "delete",
+                                id,
+                                Some(before),
+                                None,
+                                config,
+                            )?;
+                        } else if out.modified > 0 {
+                            emit_by_id(store, wtxn, &c, coll, "update", id, Some(before), config)?;
+                        }
+                    }
+                }
+            }
             Ok(json!({
                 "value": out.value,
                 "matched": out.matched,
@@ -353,6 +545,21 @@ fn execute(
             vault,
         } => {
             let c = write_collection(store, wtxn, coll, vault.as_ref())?;
+            let config = event_config(store, wtxn, coll)?;
+            let before_docs = if config.is_some() && !c.profile().is_vault() {
+                c.find_in(
+                    &*wtxn,
+                    &FindQuery {
+                        filter: filter.clone(),
+                        projection: None,
+                        sort: Vec::new(),
+                        skip: 0,
+                        limit: if *multi { None } else { Some(1) },
+                    },
+                )?
+            } else {
+                Vec::new()
+            };
             let n = if c.profile().is_vault() {
                 let auth = vault.as_ref().ok_or_else(vault::key_required)?;
                 c.delete_vault_txn(wtxn, filter, *multi, &auth.key, &auth.tenant, &auth.kid)?
@@ -362,6 +569,21 @@ fn execute(
                 }
                 c.delete_txn(wtxn, filter, *multi)?
             };
+            if let Some(config) = &config {
+                if !c.profile().is_vault() {
+                    for before in &before_docs {
+                        let id =
+                            before
+                                .get("_id")
+                                .and_then(Value::as_str)
+                                .ok_or_else(|| ApiError {
+                                    code: "invalid_id".into(),
+                                    message: "document has no string _id".into(),
+                                })?;
+                        emit_event(store, wtxn, coll, "delete", id, Some(before), None, config)?;
+                    }
+                }
+            }
             Ok(json!({ "deleted": n }))
         }
         WriteReq::CreateIndex {

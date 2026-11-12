@@ -14,6 +14,7 @@ use crate::aggregate;
 use crate::bson_types;
 use crate::date;
 use crate::error::{Error, Result};
+use crate::events::{self, EventConfig, EVENTS_COLLECTION};
 use crate::geo;
 use crate::history::{self, HistoryEntry};
 use crate::index::{self, IndexDef};
@@ -2916,6 +2917,53 @@ impl<'e> Collection<'e> {
             }
         }
         Ok(entry)
+    }
+
+    pub(crate) fn events_enabled_in(&self, wtxn: &RwTxn<'_>) -> Result<Option<EventConfig>> {
+        if self.name == EVENTS_COLLECTION || self.profile.is_vault() {
+            return Ok(None);
+        }
+        let key = format!("events:{}", self.name);
+        let config = self
+            .meta
+            .get(wtxn, key.as_bytes())?
+            .and_then(|raw| serde_json::from_slice::<EventConfig>(raw).ok())
+            .unwrap_or_default();
+        Ok(config.active().then_some(config))
+    }
+
+    pub(crate) fn append_change_event(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        op: &str,
+        id: &str,
+        before: Option<&Value>,
+        after: Option<&Value>,
+    ) -> Result<()> {
+        let Some(config) = self.events_enabled_in(wtxn)? else {
+            return Ok(());
+        };
+        let Some(event) = events::change_event(&self.name, op, id, before, after, &config) else {
+            return Ok(());
+        };
+        let db = self
+            .env
+            .create_database::<Bytes, Bytes>(&mut *wtxn, Some(EVENTS_COLLECTION))?;
+        let outbox = Collection::new(
+            self.env,
+            db,
+            self.meta,
+            self.history,
+            self.ttl_db,
+            0,
+            EVENTS_COLLECTION.to_string(),
+            crate::vault::CollectionProfile::Standard,
+            None,
+            false,
+            self.txn_gate,
+        );
+        outbox.insert_one_txn(wtxn, event)?;
+        Ok(())
     }
 
     fn record_history(

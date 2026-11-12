@@ -113,6 +113,23 @@ nonodb-cli map
 }
 ```
 
+## events
+
+Show or configure automatic collection change events:
+
+```bash
+nonodb-cli events orders                  # show
+nonodb-cli events orders on status total  # enable, only status/total updates
+nonodb-cli events orders on               # enable for any field
+nonodb-cli events orders off              # disable
+nonodb-cli events tail                    # poll _events forever
+nonodb-cli events tail --type orders.update --filter '{"payload.after.status":"paid"}'
+nonodb-cli events tail --once             # print one batch and exit
+```
+
+Events are written to `_events` in the same transaction as the data change.
+See [Outbox events](events.md).
+
 ## history
 
 Show or set per-collection revision history retention:

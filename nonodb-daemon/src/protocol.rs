@@ -57,6 +57,19 @@ impl LookupBy {
 }
 
 /// Request to `/v1/exec`.
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct WatchThreshold {
+    pub count: usize,
+    #[serde(default)]
+    pub window_ms: Option<u64>,
+    #[serde(default)]
+    pub group_by: Vec<String>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
@@ -123,6 +136,9 @@ pub enum Request {
         /// Late-commit rescan window for the continuous stream, in milliseconds.
         #[serde(default)]
         overlap_ms: Option<u64>,
+        /// Optional server-side event count threshold. Continuous stream only.
+        #[serde(default)]
+        threshold: Option<WatchThreshold>,
     },
     /// Read-only query plan and actual count diagnostics.
     Explain {
@@ -382,6 +398,27 @@ pub enum Request {
     GetCollectionHistory {
         coll: String,
     },
+    /// Configure automatic collection change events.
+    SetCollectionEvents {
+        coll: String,
+        enabled: bool,
+        #[serde(default)]
+        fields: Vec<String>,
+        #[serde(default)]
+        ops: Vec<String>,
+        #[serde(default)]
+        filter: Value,
+        #[serde(default = "default_true")]
+        include_before: bool,
+        #[serde(default = "default_true")]
+        include_after: bool,
+        #[serde(default)]
+        projection: Option<Value>,
+    },
+    /// Read automatic collection change-event settings.
+    GetCollectionEvents {
+        coll: String,
+    },
     /// Returns the current LMDB map size and high-water mark.
     MapInfo,
     /// Grows the LMDB map without restarting the daemon.
@@ -486,6 +523,16 @@ pub enum WriteReq {
     SetCollectionHistory {
         coll: String,
         max_versions: usize,
+    },
+    SetCollectionEvents {
+        coll: String,
+        enabled: bool,
+        fields: Vec<String>,
+        ops: Vec<String>,
+        filter: Value,
+        include_before: bool,
+        include_after: bool,
+        projection: Option<Value>,
     },
     /// Internal maintenance: delete expired documents if their TTL still matches.
     Expire {
@@ -639,6 +686,8 @@ impl Request {
             Self::GetCollectionTtl { .. } => "get_collection_ttl",
             Self::SetCollectionHistory { .. } => "set_collection_history",
             Self::GetCollectionHistory { .. } => "get_collection_history",
+            Self::SetCollectionEvents { .. } => "set_collection_events",
+            Self::GetCollectionEvents { .. } => "get_collection_events",
             Self::MapInfo => "map_info",
             Self::ResizeMap { .. } => "resize_map",
         }
@@ -669,7 +718,8 @@ impl Request {
             | Self::GetVersion { .. }
             | Self::ListCollections
             | Self::GetCollectionTtl { .. }
-            | Self::GetCollectionHistory { .. } => true,
+            | Self::GetCollectionHistory { .. }
+            | Self::GetCollectionEvents { .. } => true,
             Self::Sql { query, .. } => nonodb_core::sql::is_read_only(query).unwrap_or(false),
             Self::Batch { ops } => ops.iter().all(Self::is_read_only),
             _ => false,
@@ -714,7 +764,9 @@ impl Request {
             | Self::SetCollectionTtl { coll, .. }
             | Self::GetCollectionTtl { coll }
             | Self::SetCollectionHistory { coll, .. }
-            | Self::GetCollectionHistory { coll } => vec![coll.clone()],
+            | Self::GetCollectionHistory { coll }
+            | Self::SetCollectionEvents { coll, .. }
+            | Self::GetCollectionEvents { coll } => vec![coll.clone()],
             Self::Sql { query, .. } | Self::ExplainSql { query, .. } => {
                 nonodb_core::sql::collection_name(query)
                     .map(|coll| vec![coll])

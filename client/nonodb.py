@@ -47,6 +47,7 @@ _READ_OPS = {
     "list_collections",
     "get_collection_ttl",
     "get_collection_history",
+    "get_collection_events",
     "list_text_indexes",
     "list_fuzzy_indexes",
     "list_vector_indexes",
@@ -441,6 +442,42 @@ class NonoDB:
         return self.exec({"op": "get_collection_history", "coll": name})[
             "max_versions"
         ]
+
+    def set_collection_events(
+        self,
+        name: str,
+        enabled: bool,
+        fields: Optional[list[str]] = None,
+        *,
+        ops: Optional[list[str]] = None,
+        filter: Optional[dict[str, Any]] = None,
+        include_before: bool = True,
+        include_after: bool = True,
+        projection: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        """Enables automatic change events for a collection.
+
+        `fields` limits update events to changed fields. `ops` limits event
+        operations. `filter` is matched against the complete event document
+        before it is stored. `projection` is applied to before/after payloads.
+        """
+        payload: dict[str, Any] = {
+            "op": "set_collection_events",
+            "coll": name,
+            "enabled": bool(enabled),
+            "fields": list(fields or []),
+            "ops": list(ops or []),
+            "filter": filter or {},
+            "include_before": include_before,
+            "include_after": include_after,
+        }
+        if projection is not None:
+            payload["projection"] = projection
+        return self.exec(payload)
+
+    def get_collection_events(self, name: str) -> dict[str, Any]:
+        """Returns automatic change-event settings for a collection."""
+        return self.exec({"op": "get_collection_events", "coll": name})
 
     def vault(self, tenant: str, key_id: str, key: str) -> "VaultDB":
         """Returns a handle that sends vault encryption headers on every request."""
@@ -976,6 +1013,7 @@ class Collection:
         heartbeat_ms: Optional[int] = None,
         timeout_ms: Optional[int] = None,
         overlap_ms: Optional[int] = None,
+        threshold: Optional[dict[str, Any]] = None,
         retry: bool = True,
         retry_delay: float = 1.0,
         max_retry_delay: float = 30.0,
@@ -1016,6 +1054,8 @@ class Collection:
                 payload["timeout_ms"] = timeout_ms
             if overlap_ms is not None:
                 payload["overlap_ms"] = overlap_ms
+            if threshold is not None:
+                payload["threshold"] = threshold
             headers = {
                 "content-type": "application/json",
                 "accept": "application/x-ndjson",

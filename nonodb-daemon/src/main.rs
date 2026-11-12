@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 //! nonodb daemon: HTTP/JSON over a Unix socket.
 //!
 //! One process is the sole owner of the LMDB file. Clients (e.g. uvicorn
@@ -1102,6 +1104,78 @@ fn watch_control(sse: bool, name: &str, value: &Value) -> Bytes {
     Bytes::from(format!("{data}\n"))
 }
 
+struct ThresholdWindow {
+    started: Instant,
+    count: usize,
+    emitted: bool,
+}
+
+struct ThresholdState {
+    spec: Option<protocol::WatchThreshold>,
+    groups: HashMap<String, ThresholdWindow>,
+}
+
+impl ThresholdState {
+    fn new(spec: Option<protocol::WatchThreshold>) -> Self {
+        Self {
+            spec: spec.filter(|spec| spec.count > 0),
+            groups: HashMap::new(),
+        }
+    }
+
+    fn apply(&mut self, event: &Value) -> Option<Value> {
+        let Some(spec) = &self.spec else {
+            return Some(event.clone());
+        };
+        let now = Instant::now();
+        let window = Duration::from_millis(spec.window_ms.unwrap_or(60_000).max(1));
+        let mut key_parts = Vec::new();
+        for field in &spec.group_by {
+            key_parts.push(
+                nonodb_core::query::path::get(event, field)
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            );
+        }
+        let key = serde_json::to_string(&key_parts).unwrap_or_else(|_| "[]".to_string());
+        let window_state = self
+            .groups
+            .entry(key.clone())
+            .or_insert_with(|| ThresholdWindow {
+                started: now,
+                count: 0,
+                emitted: false,
+            });
+        if now.duration_since(window_state.started) >= window {
+            *window_state = ThresholdWindow {
+                started: now,
+                count: 0,
+                emitted: false,
+            };
+        }
+        window_state.count += 1;
+        if window_state.emitted || window_state.count < spec.count {
+            metrics::inc(&metrics::WATCH_THRESHOLD_SUPPRESSED);
+            return None;
+        }
+        window_state.emitted = true;
+        metrics::inc(&metrics::WATCH_THRESHOLD_EMITTED);
+        let mut out = event.clone();
+        if let Some(object) = out.as_object_mut() {
+            object.insert(
+                "threshold".into(),
+                json!({
+                    "count": window_state.count,
+                    "window_ms": spec.window_ms.unwrap_or(60_000),
+                    "group_by": spec.group_by,
+                    "group": key_parts,
+                }),
+            );
+        }
+        Some(out)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn watch_stream_loop(
     store: Arc<Store>,
@@ -1115,6 +1189,7 @@ async fn watch_stream_loop(
     heartbeat: Duration,
     overlap: Duration,
     deadline: Option<Instant>,
+    threshold: Option<protocol::WatchThreshold>,
     sse: bool,
     truncated: bool,
     oldest: Option<String>,
@@ -1139,6 +1214,7 @@ async fn watch_stream_loop(
     let mut seen: HashMap<String, Instant> = HashMap::new();
     let mut last_late_scan = Instant::now() - Duration::from_secs(1);
     let mut last_write = Instant::now();
+    let mut thresholds = ThresholdState::new(threshold);
     loop {
         if tx.is_closed() {
             return Ok(());
@@ -1249,13 +1325,20 @@ async fn watch_stream_loop(
             true
         });
         if !events.is_empty() {
+            let mut sent = 0usize;
             for event in &events {
-                if tx.send(Ok(watch_frame(sse, event))).await.is_err() {
+                let Some(event) = thresholds.apply(event) else {
+                    continue;
+                };
+                if tx.send(Ok(watch_frame(sse, &event))).await.is_err() {
                     return Ok(());
                 }
+                sent += 1;
             }
-            metrics::add(&metrics::WATCH_EVENTS, events.len() as u64);
-            last_write = Instant::now();
+            if sent > 0 {
+                metrics::add(&metrics::WATCH_EVENTS, sent as u64);
+                last_write = Instant::now();
+            }
         }
         if main_len > 0 {
             after = next;
@@ -1355,6 +1438,7 @@ async fn watch_stream(
         projection,
         heartbeat_ms,
         overlap_ms,
+        threshold,
     } = req
     else {
         let err = ApiError {
@@ -1450,6 +1534,7 @@ async fn watch_stream(
             heartbeat,
             overlap,
             deadline,
+            threshold,
             sse,
             truncated,
             oldest,
@@ -1628,7 +1713,14 @@ async fn exec(
             projection,
             heartbeat_ms: _,
             overlap_ms: _,
+            threshold,
         } => {
+            if threshold.is_some() {
+                return respond(Err(ApiError {
+                    code: "invalid_query".into(),
+                    message: "threshold is only supported by /v1/watch streaming".into(),
+                }));
+            }
             let store = state.store.clone();
             let auth = vault_auth.clone();
             let limit = limit.unwrap_or(100).clamp(1, 1_000);
@@ -2194,6 +2286,24 @@ async fn exec(
             read_result(joined).await
         }
 
+        Request::GetCollectionEvents { coll } => {
+            let store = state.store.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                let config = store.collection_events(&coll)?;
+                Ok::<Value, ApiError>(json!({
+                    "coll": coll,
+                    "enabled": config.enabled,
+                    "fields": config.fields,
+                    "ops": config.ops,
+                    "filter": config.filter,
+                    "include_before": config.include_before,
+                    "include_after": config.include_after,
+                    "projection": config.projection,
+                }))
+            });
+            read_result(joined).await
+        }
+
         Request::ListCollections => {
             let store = state.store.clone();
             let principal = principal.clone();
@@ -2340,6 +2450,25 @@ async fn exec(
                 Request::SetCollectionHistory { coll, max_versions } => {
                     WriteReq::SetCollectionHistory { coll, max_versions }
                 }
+                Request::SetCollectionEvents {
+                    coll,
+                    enabled,
+                    fields,
+                    ops,
+                    filter,
+                    include_before,
+                    include_after,
+                    projection,
+                } => WriteReq::SetCollectionEvents {
+                    coll,
+                    enabled,
+                    fields,
+                    ops,
+                    filter,
+                    include_before,
+                    include_after,
+                    projection,
+                },
                 Request::CreateIndex {
                     coll,
                     field,
@@ -2749,6 +2878,7 @@ fn cacheable(req: &Request) -> bool {
             | Request::ListCollections
             | Request::GetCollectionTtl { .. }
             | Request::GetCollectionHistory { .. }
+            | Request::GetCollectionEvents { .. }
             | Request::History { .. }
             | Request::GetVersion { .. }
     )
@@ -2974,6 +3104,19 @@ fn execute_read(
         Request::GetCollectionHistory { coll } => {
             let max_versions = store.collection_history(&coll)?;
             Ok(json!({ "coll": coll, "max_versions": max_versions }))
+        }
+        Request::GetCollectionEvents { coll } => {
+            let config = store.collection_events(&coll)?;
+            Ok(json!({
+                "coll": coll,
+                "enabled": config.enabled,
+                "fields": config.fields,
+                "ops": config.ops,
+                "filter": config.filter,
+                "include_before": config.include_before,
+                "include_after": config.include_after,
+                "projection": config.projection,
+            }))
         }
         Request::ListIndexes { coll } => {
             let Some(c) = store.collection_at(rtxn, &coll)? else {

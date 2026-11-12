@@ -316,6 +316,47 @@ cannot be replayed; `watch` reports that condition as `truncated`.
 For the higher-level Python consumer with an overlap rescan for late-committed
 lower ids, use `EventConsumer` from `nonodb_worker`.
 
+## Event thresholds
+
+The continuous `/v1/watch` stream can collapse many matching events into one
+threshold event. This keeps ordinary events in the outbox but reduces the number
+of frames sent to the consumer.
+
+```json
+{
+  "op": "watch",
+  "coll": "_events",
+  "types": ["orders.insert"],
+  "threshold": {
+    "count": 100,
+    "window_ms": 60000,
+    "group_by": ["payload.tenant"]
+  }
+}
+```
+
+Semantics:
+
+- `count` must be positive; `threshold` is ignored when it is `0` or absent.
+- Events are counted per `group_by` key and per `window_ms` window.
+- When a group reaches `count`, the triggering event is sent with a
+  `threshold` field and all later matching events in that window are suppressed.
+- The window resets after `window_ms`, so a later window can emit again.
+- `group_by` paths are read from the event document; missing values group as
+  `null`.
+- Threshold state is in memory for one stream connection. Reconnecting starts a
+  new window. Delivery remains at-least-once and is not a replacement for
+  durable business counters.
+- Long-poll `watch` does not support `threshold`; use `/v1/watch`.
+
+```python
+for event in events.watch_stream(
+    types=["orders.insert"],
+    threshold={"count": 100, "window_ms": 60_000, "group_by": ["payload.tenant"]},
+):
+    print(event["threshold"], event["payload"])
+```
+
 ## Metrics
 
 `/metrics` exposes stream counters:
@@ -328,6 +369,10 @@ lower ids, use `EventConsumer` from `nonodb_worker`.
 | `watch_timeouts_total` | Long-poll requests that returned no event |
 | `watch_truncated_total` | Watch requests with an expired/unknown resume cursor |
 | `watch_heartbeats_total` | Keepalive frames sent |
+| `watch_threshold_emitted_total` | Threshold events sent |
+| `watch_threshold_suppressed_total` | Events suppressed by thresholds |
+| `collection_events_emitted_total` | Automatic collection events written |
+| `collection_events_suppressed_total` | Events suppressed by source-side filters |
 
 ## Validation
 
