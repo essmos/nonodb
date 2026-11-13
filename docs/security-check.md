@@ -8,9 +8,9 @@ Security checking is split into two layers:
 1. **Local regression checks** (`scripts/security_check.py`) — run in CI and
    before a release. They start an isolated daemon with a temporary auth
    registry and verify the security invariants that must not regress.
-2. **External black-box audits** — optional LiveAPISec scans against a
-   development/staging daemon. They are not part of CI because they require an
-   external account and a tunnel.
+2. **External black-box audits** — LiveAPISec scans against an isolated
+   development daemon. A separate workflow runs them after successful CI on
+   `main`, on a weekly schedule, and on manual dispatch.
 
 Neither layer replaces TLS termination, network isolation, secret management,
 or a deployment-specific threat model.
@@ -83,6 +83,34 @@ python3 scripts/security_check.py
 
 The CI job uses release binaries and never calls an external service.
 
+### LiveAPISec workflow
+
+`.github/workflows/liveapisec.yml` runs the external scan:
+
+- after a successful `CI` workflow on `main`,
+- weekly on a schedule,
+- manually through **Actions → LiveAPISec → Run workflow**.
+
+Required repository configuration:
+
+| Name | Kind | Purpose |
+|---|---|---|
+| `LIVEAPISEC_API_KEY` | secret | Developer API key used by the CLI |
+| `LIVEAPISEC_PROJECT` | variable | Existing LiveAPISec project id or slug |
+
+If `LIVEAPISEC_API_KEY` is missing, the workflow reports a notice and skips the
+scan instead of failing unrelated CI. The scan runs against a temporary daemon
+on `127.0.0.1:7889`, uses a temporary admin token, and removes both afterwards.
+The JSON scan and report are uploaded as the `liveapisec-report` artifact.
+
+The workflow gates on `--fail-on critical`, so critical findings fail the job.
+Lower-severity findings remain visible in the report. The local
+`security_check.py` remains the mandatory per-push gate; LiveAPISec adds an
+external black-box layer.
+
+Rotate `LIVEAPISEC_API_KEY` before it expires and update the repository secret.
+Do not reuse a production database admin token for external scans.
+
 ## External LiveAPISec audit
 
 LiveAPISec is an external black-box API scanner. Use it only against a
@@ -124,10 +152,13 @@ liveapisec scan-code \
   --base-url http://127.0.0.1:7889 \
   --access internal \
   --auth-type bearer \
-  --auth-token "$AUDIT_TOKEN"
+  --auth-token "$AUDIT_TOKEN" \
+  --project <project-id>
 ```
 
-Start the reverse tunnel in another terminal:
+Omit `--project` only when creating the project for the first time; keep the
+printed project id for subsequent scans. Start the reverse tunnel in another
+terminal:
 
 ```bash
 liveapisec connect --project <project-id>

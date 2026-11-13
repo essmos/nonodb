@@ -1,0 +1,202 @@
+name: LiveAPISec
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: liveapisec-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  prepare:
+    name: Check LiveAPISec configuration
+    runs-on: ubuntu-latest
+    outputs:
+      enabled: ${{ steps.check.outputs.enabled }}
+    steps:
+      - name: Check secret
+        id: check
+        env:
+          LIVEAPISEC_API_KEY: ${{ secrets.LIVEAPISEC_API_KEY }}
+        run: |
+          if [[ -z "${LIVEAPISEC_API_KEY}" ]]; then
+            echo "enabled=false" >> "${GITHUB_OUTPUT}"
+            echo "::notice::LIVEAPISEC_API_KEY is not configured; skipping external scan."
+          else
+            echo "enabled=true" >> "${GITHUB_OUTPUT}"
+          fi
+
+  scan:
+    name: External API scan
+    needs: prepare
+    if: |
+      needs.prepare.outputs.enabled == 'true' &&
+      (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success')
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+      LIVEAPISEC_API_KEY: ${{ secrets.LIVEAPISEC_API_KEY }}
+      LIVEAPISEC_PROJECT: ${{ vars.LIVEAPISEC_PROJECT || 'nonodb-security-audit' }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Python test dependencies
+        run: python3 -m pip install --disable-pip-version-check httpx liveapisec==0.1.50
+
+      - name: Build daemon and CLI
+        run: cargo build --locked --bins
+
+      - name: Start isolated audit daemon
+        run: |
+          set -euo pipefail
+          AUDIT_DIR="${RUNNER_TEMP}/nonodb-liveapisec"
+          mkdir -p "${AUDIT_DIR}/data"
+          export NONODB_AUTH_FILE="${AUDIT_DIR}/auth.json"
+
+          ./target/debug/nonodb-cli auth init >/dev/null
+          ./target/debug/nonodb-cli auth token create admin > "${AUDIT_DIR}/admin-token.txt"
+          chmod 600 "${AUDIT_DIR}/admin-token.txt"
+
+          NONODB_DATA="${AUDIT_DIR}/data" \
+          NONODB_SOCK="${AUDIT_DIR}/nonodb.sock" \
+          NONODB_TCP=127.0.0.1:7889 \
+          NONODB_AUTH_FILE="${AUDIT_DIR}/auth.json" \
+          NONODB_LOG_FORMAT=json \
+          ./target/debug/nonodb-daemon > "${AUDIT_DIR}/daemon.log" 2>&1 &
+          echo $! > "${AUDIT_DIR}/daemon.pid"
+
+          for _ in $(seq 1 100); do
+            if curl -fsS -m 1 http://127.0.0.1:7889/healthz >/dev/null 2>&1; then
+              break
+            fi
+            sleep 0.1
+          done
+          curl -fsS -m 3 http://127.0.0.1:7889/healthz >/dev/null
+
+          echo "AUDIT_DIR=${AUDIT_DIR}" >> "${GITHUB_ENV}"
+
+      - name: Push endpoint spec and configure auth
+        run: |
+          set -euo pipefail
+          TOKEN="$(cat "${AUDIT_DIR}/admin-token.txt")"
+          liveapisec scan-code \
+            --dir . \
+            --framework rust \
+            --name nonodb-security-audit \
+            --base-url http://127.0.0.1:7889 \
+            --access internal \
+            --auth-type bearer \
+            --auth-token "${TOKEN}" \
+            --project "${LIVEAPISEC_PROJECT}"
+
+      - name: Start LiveAPISec tunnel
+        run: |
+          set -euo pipefail
+          nohup liveapisec connect --project "${LIVEAPISEC_PROJECT}" \
+            > "${AUDIT_DIR}/tunnel.log" 2>&1 &
+          echo $! > "${AUDIT_DIR}/tunnel.pid"
+          for _ in $(seq 1 100); do
+            if grep -qi "waiting for scan requests" "${AUDIT_DIR}/tunnel.log"; then
+              exit 0
+            fi
+            sleep 0.2
+          done
+          cat "${AUDIT_DIR}/tunnel.log" >&2
+          exit 1
+
+      - name: Run LiveAPISec scan
+        run: |
+          set -euo pipefail
+          liveapisec --json scan \
+            --project "${LIVEAPISEC_PROJECT}" \
+            --tunnel \
+            --wait \
+            --timeout 1200 \
+            --fail-on critical \
+            > "${AUDIT_DIR}/scan.json"
+
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          raw = Path(os.environ["AUDIT_DIR"], "scan.json").read_text()
+          decoder = json.JSONDecoder()
+          index = 0
+          objects = []
+          while index < len(raw):
+              while index < len(raw) and raw[index].isspace():
+                  index += 1
+              if index >= len(raw):
+                  break
+              obj, index = decoder.raw_decode(raw, index)
+              objects.append(obj)
+          if not objects:
+              raise SystemExit("LiveAPISec produced no scan result")
+          scan = objects[-1]
+          scan_id = scan.get("scan_id")
+          if not scan_id:
+              raise SystemExit(f"missing scan_id in result: {scan}")
+          print(f"scan_id={scan_id}")
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as fh:
+              fh.write(f"LIVEAPISEC_SCAN_ID={scan_id}\n")
+          summary = scan.get("summary", {})
+          print("findings:", json.dumps(summary.get("by_severity", {}), sort_keys=True))
+          print("tests:", summary.get("tests_run", "n/a"))
+          PY
+
+      - name: Save LiveAPISec report
+        if: always()
+        run: |
+          set -euo pipefail
+          if [[ -z "${LIVEAPISEC_SCAN_ID:-}" ]]; then
+            echo "No completed scan id; skipping report."
+            exit 0
+          fi
+          liveapisec report \
+            --project "${LIVEAPISEC_PROJECT}" \
+            --scan "${LIVEAPISEC_SCAN_ID}" \
+            --format json \
+            --output "${AUDIT_DIR}/report.json"
+
+      - name: Upload LiveAPISec report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: liveapisec-report
+          path: |
+            ${{ runner.temp }}/nonodb-liveapisec/scan.json
+            ${{ runner.temp }}/nonodb-liveapisec/report.json
+          if-no-files-found: ignore
+
+      - name: Stop audit daemon and tunnel
+        if: always()
+        run: |
+          for file in tunnel.pid daemon.pid; do
+            if [[ -f "${AUDIT_DIR}/${file}" ]]; then
+              kill "$(cat "${AUDIT_DIR}/${file}")" 2>/dev/null || true
+            fi
+          done
+          sleep 1
+          for file in tunnel.pid daemon.pid; do
+            if [[ -f "${AUDIT_DIR}/${file}" ]]; then
+              kill -9 "$(cat "${AUDIT_DIR}/${file}")" 2>/dev/null || true
+            fi
+          done
+          rm -rf "${AUDIT_DIR}"
