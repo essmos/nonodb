@@ -60,6 +60,9 @@ jobs:
       - name: Check Python syntax
         run: python3 -m compileall -q client scripts
 
+      - name: Install Python test dependencies
+        run: python3 -m pip install --disable-pip-version-check httpx
+
       - name: Check Node.js client
         run: |
           node --check client/node/index.js

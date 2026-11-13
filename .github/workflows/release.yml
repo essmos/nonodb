@@ -120,6 +120,18 @@ jobs:
       - name: Run tests
         run: cargo test --locked --all-targets --all-features
 
+      - name: Install Python test dependencies
+        run: python3 -m pip install --disable-pip-version-check httpx
+
+      - name: Build debug binaries for security checks
+        run: cargo build --locked --bins
+
+      - name: Run security regression checks
+        env:
+          NONODB_DAEMON: target/debug/nonodb-daemon
+          NONODB_CLI: target/debug/nonodb-cli
+        run: python3 scripts/security_check.py
+
   build:
     name: Build ${{ matrix.asset }}
     needs: [prepare, test]
