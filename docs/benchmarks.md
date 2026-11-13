@@ -729,6 +729,34 @@ The UDS run held 10,013 daemon fds for five minutes, used 493–507 MB RSS and
 core. Both returned to 14 fds after close with no request errors or daemon
 warnings.
 
+### Connections versus write concurrency
+
+The 10,000-client result demonstrates **connection scalability**, not 10,000
+simultaneous durable writes. All clients held their sockets open and sent a
+mixed workload, but writes still pass through the single writer and are grouped
+into commits.
+
+That buffering is the deliberate trade-off:
+
+| Workload | Write throughput | Write p50 | Batching effect |
+|---|---:|---:|---|
+| 12 clients | ~2,600–3,400 writes/s | ~3.4–3.6 ms | small batches, lower queueing delay |
+| 80 clients | ~3,900 writes/s | higher under load | ~25 requests per commit, ~965 commits |
+
+With 10,000 open clients the mixed workload reached **4,910 req/s over UDS** and
+**4,148 req/s over TCP + TLS**, with zero errors. The UDS p50 was 0.49 ms and p99
+73.4 ms; TLS p50 was 1.93 ms and p99 238 ms. Individual durable writes remain in
+the low-single-digit millisecond range at normal concurrency, not at 10,000
+concurrent writers.
+
+So the accurate description is:
+
+- NonoDB handles 10,000 concurrent connections well.
+- Reads and mixed traffic scale across those connections.
+- Durable writes are intentionally buffered through one writer and group commit.
+- This achieves a compromise between high client concurrency and write
+  throughput, at the cost of some per-write queueing latency under load.
+
 The first run exposed an expensive unbounded `$match(grp)` → `$group` plan.
 The current code now pushes a leading `$match` through the index/query path for
 order-independent groups, keeps order-sensitive accumulators on natural `_id`
