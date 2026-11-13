@@ -13,7 +13,6 @@ mod auto_index;
 mod cache;
 mod cursor;
 mod databases;
-mod index_worker;
 mod live;
 mod login_guard;
 mod maintenance;

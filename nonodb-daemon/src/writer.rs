@@ -431,10 +431,6 @@ fn execute(
             let deleted = store.prune_history_in(wtxn, *limit)?;
             Ok(json!({ "pruned": deleted }))
         }
-        WriteReq::ProcessIndexQueue { limit } => {
-            let processed = store.process_index_queue(wtxn, *limit)?;
-            Ok(json!({ "processed": processed }))
-        }
         WriteReq::Insert { coll, doc, vault } => {
             let c = write_collection(store, wtxn, coll, vault.as_ref())?;
             let config = event_config(store, wtxn, coll)?;

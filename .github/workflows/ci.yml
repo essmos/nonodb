@@ -94,7 +94,6 @@ jobs:
           python3 scripts/multi_database_test.py
           python3 scripts/multi_database_features_test.py
           python3 scripts/durability_test.py
-          python3 scripts/async_index_test.py
           python3 scripts/gui_test.py
           python3 scripts/live_watch_test.py
 

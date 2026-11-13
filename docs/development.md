@@ -279,7 +279,6 @@ scripts are:
 | `scripts/shutdown_test.py` | graceful shutdown with an in-flight atomic write, JSON logs, restart durability |
 | `scripts/auth_test.py` | principals, scopes, filtered collections, token revocation, audit, IP lockout |
 | `scripts/security_check.py` | isolated auth gates, database-qualified scopes, CORS, malformed input, security headers, lockout |
-| `scripts/async_index_test.py` | deferred non-unique index queue, scan fallback, unique constraints, restart drain |
 | `scripts/writer_window_bench.py` | adaptive/fixed group-commit window latency and throughput comparison |
 | `scripts/ttl_test.py` | TTL defaults, overrides, update semantics, sweeper, vault |
 | `scripts/vault_test.py` | Vault encryption, tenant isolation, and restricted API |
