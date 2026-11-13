@@ -232,6 +232,7 @@ pub struct Store {
     history: Database<Bytes, Bytes>,
     ttl: Database<Bytes, Bytes>,
     txn_gate: TxnGate,
+    async_indexes: bool,
 }
 
 impl Store {
@@ -283,6 +284,9 @@ impl Store {
             history,
             ttl,
             txn_gate: TxnGate::default(),
+            async_indexes: std::env::var("NONODB_ASYNC_INDEXES")
+                .ok()
+                .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on")),
         })
     }
 
@@ -315,6 +319,7 @@ impl Store {
             history,
             ttl,
             txn_gate: TxnGate::default(),
+            async_indexes: false,
         })
     }
 
@@ -1306,6 +1311,7 @@ impl Store {
             ttl_default,
             purge_history,
             &self.txn_gate,
+            self.async_indexes,
         )
     }
 
@@ -1336,6 +1342,78 @@ impl Store {
     }
 
     /// List of collections in the given read transaction.
+    /// Number of deferred index changes waiting for the index worker.
+    pub fn pending_index_count(&self, rtxn: &RoTxn<'_>) -> Result<u64> {
+        let meta = self
+            .env
+            .open_database::<Bytes, Bytes>(rtxn, Some(META_DB))?
+            .ok_or_else(|| Error::Query("meta database missing".into()))?;
+        Ok(meta
+            .get(rtxn, crate::collection::INDEX_QUEUE_PENDING_KEY.as_bytes())?
+            .and_then(|raw| raw.try_into().ok().map(u64::from_be_bytes))
+            .unwrap_or(0))
+    }
+
+    /// Applies a bounded batch of deferred non-unique index changes.
+    ///
+    /// Queue entries are written in the same transaction as the document, so a
+    /// crash cannot lose them. The worker sends this through the normal writer.
+    pub fn process_index_queue(&self, wtxn: &mut RwTxn<'_>, limit: usize) -> Result<usize> {
+        let meta = self
+            .env
+            .open_database::<Bytes, Bytes>(wtxn, Some(META_DB))?
+            .ok_or_else(|| Error::Query("meta database missing".into()))?;
+        let prefix = crate::collection::INDEX_QUEUE_PREFIX.as_bytes();
+        let mut keys = Vec::new();
+        for item in meta.prefix_iter(&*wtxn, prefix)? {
+            let (key, _) = item?;
+            keys.push(key.to_vec());
+            if keys.len() >= limit {
+                break;
+            }
+        }
+        let mut processed = 0usize;
+        for key in keys {
+            let raw = meta
+                .get(&*wtxn, key.as_slice())?
+                .ok_or_else(|| Error::Query("index queue entry disappeared".into()))?
+                .to_vec();
+            let entry: serde_json::Value = serde_json::from_slice(&raw)?;
+            let coll_name = entry
+                .get("coll")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| Error::Query("index queue entry has no collection".into()))?
+                .to_string();
+            let id = entry
+                .get("id")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| Error::Query("index queue entry has no id".into()))?
+                .to_string();
+            let old = entry.get("old").filter(|v| !v.is_null()).cloned();
+            let new = entry.get("new").filter(|v| !v.is_null()).cloned();
+            let collection = self.collection_in(wtxn, &coll_name)?;
+            collection.apply_deferred_index_change(wtxn, old.as_ref(), new.as_ref(), &id)?;
+            meta.delete(&mut *wtxn, key.as_slice())?;
+            processed += 1;
+        }
+        if processed > 0 {
+            let pending = meta
+                .get(
+                    &*wtxn,
+                    crate::collection::INDEX_QUEUE_PENDING_KEY.as_bytes(),
+                )?
+                .and_then(|raw| raw.try_into().ok().map(u64::from_be_bytes))
+                .unwrap_or(0)
+                .saturating_sub(processed as u64);
+            meta.put(
+                &mut *wtxn,
+                crate::collection::INDEX_QUEUE_PENDING_KEY.as_bytes(),
+                &pending.to_be_bytes(),
+            )?;
+        }
+        Ok(processed)
+    }
+
     pub fn collections_in(&self, rtxn: &RoTxn<'_>) -> Result<Vec<String>> {
         let meta: Database<Bytes, Bytes> = self
             .env

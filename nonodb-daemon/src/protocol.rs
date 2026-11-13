@@ -645,6 +645,10 @@ pub enum WriteReq {
     PruneHistory {
         limit: usize,
     },
+    /// Internal maintenance: apply deferred non-unique index changes.
+    ProcessIndexQueue {
+        limit: usize,
+    },
     CreateIndex {
         coll: String,
         fields: Vec<String>,

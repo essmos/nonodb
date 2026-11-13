@@ -32,6 +32,10 @@ use crate::verify::{CollectionVerification, IndexVerification};
 
 /// Meta prefix for reusable physical sub-database slots.
 const DB_SLOT_META_PREFIX: &str = "\u{1}dbslot:";
+/// Deferred non-unique index changes written in the document transaction.
+pub(crate) const INDEX_QUEUE_PREFIX: &str = "\u{1}idxq:e";
+pub(crate) const INDEX_QUEUE_PENDING_KEY: &str = "\u{1}idxq:pending";
+const INDEX_QUEUE_SEQ_KEY: &str = "\u{1}idxq:seq";
 /// Reserve some LMDB sub-database slots for collections and fixed databases.
 const MAX_DB_SLOTS: u32 = crate::store::MAX_DBS - 64;
 
@@ -267,6 +271,7 @@ pub struct Collection<'e> {
     ttl_purge_history: bool,
     env: &'e Env,
     txn_gate: &'e crate::store::TxnGate,
+    async_indexes: bool,
 }
 
 impl<'e> Collection<'e> {
@@ -283,6 +288,7 @@ impl<'e> Collection<'e> {
         ttl_default_seconds: Option<u64>,
         ttl_purge_history: bool,
         txn_gate: &'e crate::store::TxnGate,
+        async_indexes: bool,
     ) -> Self {
         Self {
             db,
@@ -296,6 +302,7 @@ impl<'e> Collection<'e> {
             ttl_purge_history,
             env,
             txn_gate,
+            async_indexes,
         }
     }
 
@@ -803,6 +810,68 @@ impl<'e> Collection<'e> {
         Ok(())
     }
 
+    /// True when deferred non-unique index changes have not reached the index yet.
+    pub(crate) fn has_pending_indexes(&self, txn: &RoTxn<'_>) -> Result<bool> {
+        Ok(self
+            .meta
+            .get(txn, INDEX_QUEUE_PENDING_KEY.as_bytes())?
+            .and_then(|raw| raw.try_into().ok().map(u64::from_be_bytes))
+            .unwrap_or(0)
+            > 0)
+    }
+
+    fn enqueue_index_change(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        old: Option<&Value>,
+        new: Option<&Value>,
+        id: &str,
+    ) -> Result<()> {
+        let seq = self
+            .meta
+            .get(&*wtxn, INDEX_QUEUE_SEQ_KEY.as_bytes())?
+            .and_then(|raw| raw.try_into().ok().map(u64::from_be_bytes))
+            .unwrap_or(0)
+            .saturating_add(1);
+        self.meta.put(
+            &mut *wtxn,
+            INDEX_QUEUE_SEQ_KEY.as_bytes(),
+            &seq.to_be_bytes(),
+        )?;
+        let pending = self
+            .meta
+            .get(&*wtxn, INDEX_QUEUE_PENDING_KEY.as_bytes())?
+            .and_then(|raw| raw.try_into().ok().map(u64::from_be_bytes))
+            .unwrap_or(0)
+            .saturating_add(1);
+        self.meta.put(
+            &mut *wtxn,
+            INDEX_QUEUE_PENDING_KEY.as_bytes(),
+            &pending.to_be_bytes(),
+        )?;
+        let key = format!("{INDEX_QUEUE_PREFIX}{seq:020}");
+        let entry = serde_json::json!({
+            "coll": self.name,
+            "id": id,
+            "old": old.cloned().unwrap_or(Value::Null),
+            "new": new.cloned().unwrap_or(Value::Null),
+        });
+        self.meta
+            .put(&mut *wtxn, key.as_bytes(), &serde_json::to_vec(&entry)?)?;
+        Ok(())
+    }
+
+    /// Applies a queued non-unique index change from the index worker.
+    pub(crate) fn apply_deferred_index_change(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        old: Option<&Value>,
+        new: Option<&Value>,
+        id: &str,
+    ) -> Result<()> {
+        self.apply_index_entries_inner(wtxn, old, new, id, true, false)
+    }
+
     /// Updates index entries for an `old -> new` change (insert: `old=None`,
     /// delete: `new=None`).
     fn apply_index_entries(
@@ -812,8 +881,29 @@ impl<'e> Collection<'e> {
         new: Option<&Value>,
         id: &str,
     ) -> Result<()> {
+        if self.async_indexes {
+            let defs = self.index_defs(&*wtxn)?;
+            if defs.iter().any(|def| !def.unique) {
+                self.enqueue_index_change(wtxn, old, new, id)?;
+            }
+        }
+        self.apply_index_entries_inner(wtxn, old, new, id, false, self.async_indexes)
+    }
+
+    fn apply_index_entries_inner(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        old: Option<&Value>,
+        new: Option<&Value>,
+        id: &str,
+        non_unique_only: bool,
+        skip_non_unique: bool,
+    ) -> Result<()> {
         let defs = self.index_defs(&*wtxn)?;
         for mut def in defs {
+            if (non_unique_only && def.unique) || (skip_non_unique && !def.unique) {
+                continue;
+            }
             let mut old_keys = old
                 .map(|doc| index::encode_index_keys(&def, doc))
                 .transpose()?
@@ -878,6 +968,9 @@ impl<'e> Collection<'e> {
     /// all fields, with every field except the last being equality conditions
     /// (`a: 1` or `a: {$eq: 1}`). The last field may have a range condition.
     fn index_plan(&self, rtxn: &RoTxn<'_>, filter: &Value) -> Result<Option<IndexPlan>> {
+        if self.has_pending_indexes(rtxn)? {
+            return Ok(None);
+        }
         let Some(obj) = filter.as_object() else {
             return Ok(None);
         };
@@ -912,6 +1005,9 @@ impl<'e> Collection<'e> {
 
     /// Selects a geo index and the grid-cell ranges for a geo filter.
     fn geo_index_plan(&self, rtxn: &RoTxn<'_>, filter: &Value) -> Result<Option<GeoIndexPlan>> {
+        if self.has_pending_indexes(rtxn)? {
+            return Ok(None);
+        }
         let Some((field, query)) = geo::index_query(filter) else {
             return Ok(None);
         };
@@ -964,7 +1060,7 @@ impl<'e> Collection<'e> {
         rtxn: &RoTxn<'_>,
         sort: &[(String, i32)],
     ) -> Result<Option<IndexPlan>> {
-        if sort.is_empty() {
+        if sort.is_empty() || self.has_pending_indexes(rtxn)? {
             return Ok(None);
         }
         let document_count = self.db.stat(rtxn)?.entries;
@@ -2973,6 +3069,7 @@ impl<'e> Collection<'e> {
             None,
             false,
             self.txn_gate,
+            false,
         );
         outbox.insert_one_txn(wtxn, event)?;
         Ok(())

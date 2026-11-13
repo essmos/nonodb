@@ -45,11 +45,15 @@ pub struct DatabaseRuntime {
     stop: Arc<AtomicBool>,
     writer: Mutex<Option<std::thread::JoinHandle<()>>>,
     maintenance: Mutex<Option<std::thread::JoinHandle<()>>>,
+    index_worker: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl Drop for DatabaseRuntime {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.index_worker.lock().expect("index worker lock").take() {
+            let _ = handle.join();
+        }
         if let Some(handle) = self.maintenance.lock().expect("maintenance lock").take() {
             let _ = handle.join();
         }
@@ -258,6 +262,7 @@ fn start_runtime(root: &Path, name: &str) -> Result<DatabaseRuntime, String> {
         auto_index.clone(),
         stop.clone(),
     );
+    let index_worker = crate::index_worker::start(store.clone(), write_tx.clone(), stop.clone());
     if let Some(dir) = std::env::var_os("NONODB_SNAPSHOT_DIR") {
         crate::spawn_snapshots(store.clone(), PathBuf::from(dir).join(name));
     }
@@ -269,6 +274,7 @@ fn start_runtime(root: &Path, name: &str) -> Result<DatabaseRuntime, String> {
         stop,
         writer: Mutex::new(Some(writer)),
         maintenance: Mutex::new(Some(maintenance)),
+        index_worker: Mutex::new(Some(index_worker)),
     })
 }
 

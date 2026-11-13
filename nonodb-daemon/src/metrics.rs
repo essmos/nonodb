@@ -49,6 +49,12 @@ pub static QUEUE_LEN: AtomicU64 = AtomicU64::new(0);
 pub static QUEUE_PEAK: AtomicU64 = AtomicU64::new(0);
 /// 1 while the writer is executing a batch, 0 while idle.
 pub static WRITER_BUSY: AtomicU64 = AtomicU64::new(0);
+/// Current adaptive group-commit window in microseconds.
+pub static WRITER_WINDOW_US: AtomicU64 = AtomicU64::new(0);
+/// Deferred non-unique index changes waiting for the index worker.
+pub static INDEX_QUEUE_PENDING: AtomicU64 = AtomicU64::new(0);
+/// Deferred index changes applied since process start.
+pub static INDEX_QUEUE_PROCESSED: AtomicU64 = AtomicU64::new(0);
 /// Authentication failures, lockouts, and rejected requests from blocked peers.
 pub static AUTH_FAILURES: AtomicU64 = AtomicU64::new(0);
 pub static AUTH_BLOCKS: AtomicU64 = AtomicU64::new(0);
@@ -131,6 +137,9 @@ pub fn snapshot() -> Value {
         "queue_len": QUEUE_LEN.load(Relaxed),
         "queue_peak": QUEUE_PEAK.load(Relaxed),
         "writer_busy": WRITER_BUSY.load(Relaxed),
+        "writer_window_us": WRITER_WINDOW_US.load(Relaxed),
+        "index_queue_pending": INDEX_QUEUE_PENDING.load(Relaxed),
+        "index_queue_processed_total": INDEX_QUEUE_PROCESSED.load(Relaxed),
         "auth_failures_total": AUTH_FAILURES.load(Relaxed),
         "auth_blocks_total": AUTH_BLOCKS.load(Relaxed),
         "auth_blocked_requests_total": AUTH_BLOCKED_REQUESTS.load(Relaxed),

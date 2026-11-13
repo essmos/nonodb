@@ -22,10 +22,22 @@ use crate::protocol::{ApiError, Durability, WriteReq};
 
 /// Maximum number of operations in one transaction.
 const MAX_BATCH: usize = 512;
-/// Base batch collection window (short queue = low latency).
-const BASE_WINDOW: Duration = Duration::from_millis(1);
-/// Maximum window under heavy load (larger batch = fewer `fsync`s).
-const MAX_WINDOW: Duration = Duration::from_millis(5);
+fn env_micros(name: &str, default_us: u64) -> Duration {
+    Duration::from_micros(
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(default_us),
+    )
+}
+
+fn window_config() -> (Duration, Duration, Duration) {
+    let base = env_micros("NONODB_WRITER_WINDOW_US", 1000);
+    let max = env_micros("NONODB_WRITER_WINDOW_MAX_US", 5000).max(base);
+    let idle = env_micros("NONODB_WRITER_WINDOW_IDLE_US", 100).min(base);
+    (idle, base, max)
+}
 pub struct WriteJob {
     pub req: WriteReq,
     pub resp: oneshot::Sender<Result<Value, ApiError>>,
@@ -42,6 +54,7 @@ pub fn run(
     cache: Arc<QueryCache>,
     stop: Arc<std::sync::atomic::AtomicBool>,
 ) {
+    let (idle_window, base_window, max_window) = window_config();
     loop {
         let first = match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(job) => job,
@@ -54,18 +67,23 @@ pub fn run(
             Err(RecvTimeoutError::Disconnected) => break,
         };
         let mut jobs = vec![first];
-        // Adaptive window: the longer the queue, the larger the batch (fewer fsyncs),
-        // but with an empty queue we return to 1 ms (low latency).
-        let pending = metrics::QUEUE_LEN.load(std::sync::atomic::Ordering::Relaxed);
-        // High thresholds: with few clients, 1 ms is enough and does not
-        // add latency; we extend the window only under real pressure.
+        // Adaptive window: use the fast path when no other writes are queued,
+        // grow with queue pressure, and use the base window for a small
+        // backlog. QUEUE_LEN still includes the job we just received; only the
+        // remainder is useful for choosing the window.
+        let pending = metrics::QUEUE_LEN
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .saturating_sub(1);
         let window = if pending >= 256 {
-            MAX_WINDOW
+            max_window
         } else if pending >= 64 {
-            Duration::from_millis(3)
+            max_window.min(Duration::from_millis(3))
+        } else if pending == 0 {
+            idle_window
         } else {
-            BASE_WINDOW
+            base_window
         };
+        metrics::set(&metrics::WRITER_WINDOW_US, window.as_micros() as u64);
         let deadline = Instant::now() + window;
 
         while jobs.len() < MAX_BATCH {
@@ -412,6 +430,10 @@ fn execute(
         WriteReq::PruneHistory { limit } => {
             let deleted = store.prune_history_in(wtxn, *limit)?;
             Ok(json!({ "pruned": deleted }))
+        }
+        WriteReq::ProcessIndexQueue { limit } => {
+            let processed = store.process_index_queue(wtxn, *limit)?;
+            Ok(json!({ "processed": processed }))
         }
         WriteReq::Insert { coll, doc, vault } => {
             let c = write_collection(store, wtxn, coll, vault.as_ref())?;
