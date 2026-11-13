@@ -9,6 +9,7 @@ quick-start instructions, and a feature overview.
 |---|---|---|
 | [Architecture](architecture.md) | Maintainers, advanced users | Process model, LMDB layout, write path, indexes, search, aggregation, crash safety |
 | [Multiple databases](multi-database.md) | Operators, application developers | Separate LMDB environments, URL routing, create/drop, CLI, GUI, migration, backup |
+| [Adaptive writer](adaptive-writer.md) | Operators, performance reviewers | Adaptive group-commit window, latency/throughput tuning, metrics and limits |
 | [GUI console](gui.md) | Operators, application developers | Embedded local React console, data editing, collection settings, SQL, map/metrics |
 | [HTTP API](api.md) | All client authors | Operations, request/response formats, filters, updates, aggregation, errors |
 | [SQL queries](sql.md) | Analysts, reporting jobs, application developers | `SELECT`, `INSERT`, `UPDATE`, `DELETE`, filters, aggregates, parameters, limits, client examples |
@@ -52,6 +53,7 @@ quick-start instructions, and a feature overview.
 - **Secure a deployment:** [Authentication and authorization](auth.md) and
   [TCP/TLS](operations.md#tcp-and-tls)
 - **Run security checks:** [Security checks](security-check.md)
+- **Tune writer latency:** [Adaptive writer](adaptive-writer.md)
 - **Set up client certificates:** [Mutual TLS](mtls.md)
 - **Store sensitive tenant data encrypted:** [Vault collections](vault.md)
 - **Expire documents automatically:** [Document TTL](ttl.md)

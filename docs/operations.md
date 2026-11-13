@@ -36,6 +36,10 @@ All daemon configuration is through environment variables.
 | `NONODB_DATA` | `./data` | Instance root containing `<database>/data.mdb` and `<database>/lock.mdb` |
 | `NONODB_MAX_OPEN_DATABASES` | `64` | Maximum open LMDB environments/writers; idle databases are evicted |
 | `NONODB_ALLOW_UNSAFE_WRITES` | unset | Enables opt-in `durability:"unsafe"` writes using LMDB `MDB_NOSYNC` |
+| `NONODB_WRITER_WINDOW_US` | `1000` | Group-commit window when the writer has a backlog |
+| `NONODB_WRITER_WINDOW_PRESSURE_US` | `3000` | Window when 64+ writes are queued |
+| `NONODB_WRITER_WINDOW_MAX_US` | `5000` | Maximum adaptive group-commit window |
+| `NONODB_WRITER_WINDOW_IDLE_US` | `100` | Fast-path window when no other writes are queued |
 | `NONODB_SOCK` | `/run/nonodb.sock` | Unix socket path |
 | `NONODB_MAP_SIZE` | `1GiB` | LMDB address-space limit; accepts `4GiB`, `2048MiB`, bytes |
 | `NONODB_REQUEST_TIMEOUT` | `30` | Server-side request timeout in seconds for normal operations |
