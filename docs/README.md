@@ -20,6 +20,7 @@ quick-start instructions, and a feature overview.
 | [Clients](clients.md) | Application developers | Python, Rust, Node.js and Go: install, connection, CRUD, batches, indexes, search, aggregation |
 | [Migration and import](migration.md) | Application developers, operators | MongoDB, PostgreSQL, SQLite, CSV conversion; NDJSON format; import manifest; validation and cutover |
 | [Authentication and permissions](auth.md) | Operators, security reviewers | Principals, scopes, hashed tokens, certificate registry, lockout, reloads, audit log |
+| [Security checks](security-check.md) | Operators, security reviewers, maintainers | Local security regression checks, LiveAPISec audit method, results, hardening gaps, production checklist |
 | [Mutual TLS](mtls.md) | Operators, security reviewers | Private CA setup, client certificates, fingerprint mapping, revocation, rotation, troubleshooting |
 | [Python client](python-client.md) | Python developers | Connection, CRUD, upsert, indexes, search, batches, cache, FastAPI |
 | [Background jobs](workers.md) | Application developers, operators | Durable jobs, workers, leases, retries, cron/systemd, languages |
@@ -50,6 +51,7 @@ quick-start instructions, and a feature overview.
 - **Stream events with a resume token:** [Streaming outbox events](streams.md)
 - **Secure a deployment:** [Authentication and authorization](auth.md) and
   [TCP/TLS](operations.md#tcp-and-tls)
+- **Run security checks:** [Security checks](security-check.md)
 - **Set up client certificates:** [Mutual TLS](mtls.md)
 - **Store sensitive tenant data encrypted:** [Vault collections](vault.md)
 - **Expire documents automatically:** [Document TTL](ttl.md)

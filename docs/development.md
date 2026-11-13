@@ -278,6 +278,7 @@ scripts are:
 | `scripts/restore_drill.py` | live backup, manifest verification, restore, query checks |
 | `scripts/shutdown_test.py` | graceful shutdown with an in-flight atomic write, JSON logs, restart durability |
 | `scripts/auth_test.py` | principals, scopes, filtered collections, token revocation, audit, IP lockout |
+| `scripts/security_check.py` | isolated auth gates, database-qualified scopes, CORS, malformed input, security headers, lockout |
 | `scripts/ttl_test.py` | TTL defaults, overrides, update semantics, sweeper, vault |
 | `scripts/vault_test.py` | Vault encryption, tenant isolation, and restricted API |
 | `scripts/vault_regression_test.py` | Vault profiles, headers, filters, CRUD, errors, history |

@@ -91,6 +91,12 @@ jobs:
           python3 scripts/gui_test.py
           python3 scripts/live_watch_test.py
 
+      - name: Run security regression checks
+        env:
+          NONODB_DAEMON: target/release/nonodb-daemon
+          NONODB_CLI: target/release/nonodb-cli
+        run: python3 scripts/security_check.py
+
   gui:
     name: Build GUI
     runs-on: ubuntu-latest
