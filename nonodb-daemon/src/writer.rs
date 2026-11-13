@@ -32,11 +32,14 @@ fn env_micros(name: &str, default_us: u64) -> Duration {
     )
 }
 
-fn window_config() -> (Duration, Duration, Duration) {
+fn window_config() -> (Duration, Duration, Duration, Duration) {
     let base = env_micros("NONODB_WRITER_WINDOW_US", 1000);
     let max = env_micros("NONODB_WRITER_WINDOW_MAX_US", 5000).max(base);
     let idle = env_micros("NONODB_WRITER_WINDOW_IDLE_US", 100).min(base);
-    (idle, base, max)
+    let pressure = env_micros("NONODB_WRITER_WINDOW_PRESSURE_US", 3000)
+        .max(base)
+        .min(max);
+    (idle, base, pressure, max)
 }
 pub struct WriteJob {
     pub req: WriteReq,
@@ -54,7 +57,7 @@ pub fn run(
     cache: Arc<QueryCache>,
     stop: Arc<std::sync::atomic::AtomicBool>,
 ) {
-    let (idle_window, base_window, max_window) = window_config();
+    let (idle_window, base_window, pressure_window, max_window) = window_config();
     loop {
         let first = match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(job) => job,
@@ -74,15 +77,17 @@ pub fn run(
         let pending = metrics::QUEUE_LEN
             .load(std::sync::atomic::Ordering::Relaxed)
             .saturating_sub(1);
-        let window = if pending >= 256 {
-            max_window
+        let (window, window_counter) = if pending >= 256 {
+            (max_window, &metrics::WRITER_MAX_WINDOWS)
         } else if pending >= 64 {
-            max_window.min(Duration::from_millis(3))
+            (pressure_window, &metrics::WRITER_PRESSURE_WINDOWS)
         } else if pending == 0 {
-            idle_window
+            (idle_window, &metrics::WRITER_IDLE_WINDOWS)
         } else {
-            base_window
+            (base_window, &metrics::WRITER_BASE_WINDOWS)
         };
+        metrics::inc(window_counter);
+        metrics::add(&metrics::WRITER_WINDOW_NS_TOTAL, window.as_nanos() as u64);
         metrics::set(&metrics::WRITER_WINDOW_US, window.as_micros() as u64);
         let deadline = Instant::now() + window;
 
@@ -97,6 +102,7 @@ pub fn run(
             }
         }
 
+        metrics::set(&metrics::WRITER_LAST_BATCH_SIZE, jobs.len() as u64);
         metrics::inc(&metrics::WRITER_BUSY);
         run_batch(&store, &cache, jobs);
         metrics::sub(&metrics::WRITER_BUSY, 1);

@@ -51,6 +51,13 @@ pub static QUEUE_PEAK: AtomicU64 = AtomicU64::new(0);
 pub static WRITER_BUSY: AtomicU64 = AtomicU64::new(0);
 /// Current adaptive group-commit window in microseconds.
 pub static WRITER_WINDOW_US: AtomicU64 = AtomicU64::new(0);
+/// Window-selection counters and the last batch size.
+pub static WRITER_IDLE_WINDOWS: AtomicU64 = AtomicU64::new(0);
+pub static WRITER_BASE_WINDOWS: AtomicU64 = AtomicU64::new(0);
+pub static WRITER_PRESSURE_WINDOWS: AtomicU64 = AtomicU64::new(0);
+pub static WRITER_MAX_WINDOWS: AtomicU64 = AtomicU64::new(0);
+pub static WRITER_LAST_BATCH_SIZE: AtomicU64 = AtomicU64::new(0);
+pub static WRITER_WINDOW_NS_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// Authentication failures, lockouts, and rejected requests from blocked peers.
 pub static AUTH_FAILURES: AtomicU64 = AtomicU64::new(0);
 pub static AUTH_BLOCKS: AtomicU64 = AtomicU64::new(0);
@@ -98,6 +105,21 @@ pub fn snapshot() -> Value {
     let batches = WRITE_BATCHES.load(Relaxed).max(1);
     let commit_ns = COMMIT_NS.load(Relaxed);
     let write_ops = WRITE_OPS.load(Relaxed);
+    let idle_windows = WRITER_IDLE_WINDOWS.load(Relaxed);
+    let total_windows = idle_windows
+        + WRITER_BASE_WINDOWS.load(Relaxed)
+        + WRITER_PRESSURE_WINDOWS.load(Relaxed)
+        + WRITER_MAX_WINDOWS.load(Relaxed);
+    let fast_path_ratio = if total_windows == 0 {
+        0.0
+    } else {
+        idle_windows as f64 / total_windows as f64
+    };
+    let avg_window_us = if total_windows == 0 {
+        0.0
+    } else {
+        WRITER_WINDOW_NS_TOTAL.load(Relaxed) as f64 / total_windows as f64 / 1000.0
+    };
     let (event_emitted, event_suppressed) = nonodb_core::events::stats();
     json!({
         "requests_total": REQUESTS.load(Relaxed),
@@ -134,6 +156,13 @@ pub fn snapshot() -> Value {
         "queue_peak": QUEUE_PEAK.load(Relaxed),
         "writer_busy": WRITER_BUSY.load(Relaxed),
         "writer_window_us": WRITER_WINDOW_US.load(Relaxed),
+        "writer_avg_window_us": avg_window_us,
+        "writer_last_batch_size": WRITER_LAST_BATCH_SIZE.load(Relaxed),
+        "writer_idle_windows_total": WRITER_IDLE_WINDOWS.load(Relaxed),
+        "writer_base_windows_total": WRITER_BASE_WINDOWS.load(Relaxed),
+        "writer_pressure_windows_total": WRITER_PRESSURE_WINDOWS.load(Relaxed),
+        "writer_max_windows_total": WRITER_MAX_WINDOWS.load(Relaxed),
+        "writer_fast_path_ratio": fast_path_ratio,
         "auth_failures_total": AUTH_FAILURES.load(Relaxed),
         "auth_blocks_total": AUTH_BLOCKS.load(Relaxed),
         "auth_blocked_requests_total": AUTH_BLOCKED_REQUESTS.load(Relaxed),

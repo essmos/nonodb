@@ -10,7 +10,7 @@ The window is now adaptive:
 |---|---|
 | no other writes queued | `NONODB_WRITER_WINDOW_IDLE_US` (default `100`) |
 | small backlog | `NONODB_WRITER_WINDOW_US` (default `1000`) |
-| 64+ waiting | up to 3 ms |
+| 64+ waiting | `NONODB_WRITER_WINDOW_PRESSURE_US` (default `3000`) |
 | 256+ waiting | `NONODB_WRITER_WINDOW_MAX_US` (default `5000`) |
 
 The queue length includes the job the writer just received. The adaptive check
@@ -21,6 +21,7 @@ adjustment the idle fast path is effectively unreachable.
 
 ```text
 NONODB_WRITER_WINDOW_US=1000
+NONODB_WRITER_WINDOW_PRESSURE_US=3000
 NONODB_WRITER_WINDOW_MAX_US=5000
 NONODB_WRITER_WINDOW_IDLE_US=100
 ```
@@ -48,11 +49,60 @@ the single-writer model.
 
 ## Metrics
 
-`/metrics` exposes:
+`/metrics` exposes the selected window and counters for each path:
 
 ```text
 writer_window_us
+writer_avg_window_us
+writer_last_batch_size
+writer_idle_windows_total
+writer_base_windows_total
+writer_pressure_windows_total
+writer_max_windows_total
+writer_fast_path_ratio
 ```
+
+Interpretation:
+
+- `writer_idle_windows_total` — no other writes were queued; fast path used.
+- `writer_base_windows_total` — a small backlog used the normal window.
+- `writer_pressure_windows_total` — 64+ writes were waiting; the pressure window
+  was used for more batching.
+- `writer_max_windows_total` — 256+ writes were waiting; the maximum window was
+  used.
+- `writer_fast_path_ratio` — fraction of writer batches chosen through the idle
+  fast path.
+- `writer_last_batch_size` and `writer_window_us` show the most recent decision;
+  `writer_avg_window_us` is the cumulative average and is the better signal after
+  a long run.
+
+## Observed path selection
+
+Example runs from the release daemon (`scripts/bench.py`, 24,000 writes and
+96,000 reads, cache disabled). Host load varies, so compare shapes rather than
+exact numbers.
+
+| Run | Writes | Write p50 | Avg batch | Fast-path ratio | Pressure batches |
+|---|---:|---:|---:|---:|---:|
+| 12 clients, default | 3,331/s | 2.67 ms | 5.17 | 49.6% | 0 |
+| 12 clients, base 5 ms | 1,617/s | 7.06 ms | 8.89 | 30.9% | 0 |
+| 80 clients, default | 2,718/s | 19.10 ms | 16.15 | 27.1% | 27 |
+| 80 clients, pressure 10 ms | 3,247/s | 16.87 ms | 18.38 | 19.8% | 18 |
+
+Interpretation:
+
+- With 12 clients the writer frequently sees an idle queue, so the fast path is
+  used often. Raising the **base** window to 5 ms made batching larger but
+  reduced throughput, because each batch waited longer without enough extra
+  requests to amortize it.
+- With 80 clients the queue is consistently busy. Raising only the **pressure**
+  window to 10 ms increased batch size and write throughput; this is the useful
+  tuning knob for sustained write-heavy traffic.
+- `writer_fast_path_ratio` falling from ~50% (12 clients) to ~20% (80 clients)
+  is expected: more clients means more requests are batched instead of using the
+  idle fast path.
+- Reads were measured in the same mixed runs and are shown here only to make the
+  trade-off visible; they are not a pure read benchmark.
 
 ## Benchmark
 
