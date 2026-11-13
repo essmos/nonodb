@@ -23,6 +23,15 @@ only process allowed to touch the database files. Application workers connect
 to it through a Unix socket and use a thin client. One daemon can host several
 independent databases.
 
+<p align="center">
+  <a href="docs/gui.md">
+    <img src="docs/assets/gui/documents-1m.png" alt="NoNoDB GUI browsing one million documents" width="900">
+  </a>
+</p>
+
+<p align="center"><em>The embedded GUI browsing a 1,000,000-document database.
+<a href="docs/gui.md">See the GUI guide</a>.</em></p>
+
 Low resource use is the starting point, not the whole story. Under the hood,
 nonodb is a real document database with:
 
@@ -718,7 +727,7 @@ Node.js is only needed to build the GUI, not to run it.
 
 <p align="center">
   <img src="docs/assets/gui/overview.png" alt="NonoDB GUI overview with database selector" width="49%">
-  <img src="docs/assets/gui/documents-1m.png" alt="NonoDB GUI browsing one million documents" width="49%">
+  <img src="docs/assets/gui/search-1m.png" alt="NonoDB GUI text search over one million documents" width="49%">
 </p>
 
 The screenshots use the `perf1` database with one million documents and the
