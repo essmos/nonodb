@@ -469,7 +469,7 @@ listener, so the Windows daemon requires TCP plus `NONODB_AUTH_FILE`.
 Download, verify, and extract the x86_64 archive:
 
 ```bash
-TAG=v0.20.0
+TAG=v0.21.0
 curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/nonodb-$TAG-linux-x86_64.tar.gz"
 curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/nonodb-$TAG-linux-x86_64.tar.gz.sha256"
 sha256sum -c "nonodb-$TAG-linux-x86_64.tar.gz.sha256"
@@ -538,7 +538,7 @@ unit and installation steps in [Operations](docs/operations.md#deployment-with-s
 Download the archive matching your CPU (`uname -m` prints `arm64` or `x86_64`):
 
 ```bash
-TAG=v0.20.0
+TAG=v0.21.0
 ARCHIVE="nonodb-$TAG-macos-arm64.tar.gz"   # use macos-x86_64 on Intel
 curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/$ARCHIVE"
 curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/$ARCHIVE.sha256"
@@ -633,7 +633,7 @@ The Docker workflow publishes versioned images to GitHub Container Registry for
 Linux `amd64` and `arm64`. Pull a published tag:
 
 ```bash
-docker pull ghcr.io/essmos/nonodb:0.20.0
+docker pull ghcr.io/essmos/nonodb:0.21.0
 ```
 
 Pin a version in production. The `latest` tag follows stable releases. If the
@@ -659,7 +659,7 @@ docker run -d --name nonodb \
   --group-add "$(id -g)" \
   -v "$NONODB_AUTH_FILE:/etc/nonodb/auth.json:ro" \
   -v nonodb-data:/var/lib/nonodb \
-  ghcr.io/essmos/nonodb:0.20.0
+  ghcr.io/essmos/nonodb:0.21.0
 ```
 
 Check health and logs:
@@ -799,7 +799,7 @@ results. Visit [liveapisec.com](https://liveapisec.com) to learn more.
 
 ## Status
 
-nonodb is an early-stage project (`0.20.0`). Its core storage, query, index,
+nonodb is an early-stage project (`0.21.0`). Its core storage, query, index,
 search, batching, security, snapshot, and operational paths are covered by unit,
 property-based, end-to-end, concurrency, crash, and large-data tests. The API
 may still change before a stable release.
