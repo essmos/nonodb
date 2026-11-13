@@ -5,7 +5,7 @@ is deliberately out of scope, and which gaps are candidates for future work.
 
 ## Current status
 
-The project is at `0.21.0`. It is suitable for local and single-host
+The project is at `0.22.0`. It is suitable for local and single-host
 applications that need a small, durable, queryable JSON store and can accept a
 single-writer model.
 
@@ -51,13 +51,18 @@ Implemented:
 - connection-scoped live subscriptions (`watch` with `mode:"live"`) that push
   matching changes directly to SSE/NDJSON without writing to `_events`;
 - an embedded local web console (`nonodb-cli gui`) with document CRUD, collection
-  settings, indexes, SQL, map settings, and metrics;
+  settings, indexes, SQL, map settings, per-collection metrics, and authorization
+  management;
 - per-collection append-only document revision history with retention (`0` disables);
 - document TTL with collection defaults, per-document overrides, and background expiry;
 - BSON-compatible dates with RFC 3339 input, UTC normalization, indexed ranges, and sorting;
 - Unix-socket daemon, optional TCP/TLS and mutual TLS, file-based principals and scopes, uid/gid allow-lists;
-- group commit, request limits/timeouts, metrics;
+- group commit, request limits/timeouts, JSON and Prometheus metrics, health/readiness, disk and snapshot monitoring;
 - snapshots, online backup, SHA-256 manifests, deep verification, restore drills, CLI;
+- GUI backup jobs with full/restic engines, multi-database selection, exclusions,
+  gzip compression, age/restic encryption, local/S3/R2 destinations, and
+  `backup-info.txt`;
+- admin-only staged import from local folders or S3/R2 into a new database;
 - optional vault collections with per-tenant whole-document encryption;
 - Python client, Docker image, systemd unit;
 - unit, property, integration, concurrency, crash, search, and large-data tests.
@@ -195,10 +200,11 @@ Implemented:
   restore to reclaim space.
 - `map_size` can grow online; shrinking the reservation requires a restart and
   the file itself only shrinks through a compacting backup/restore.
-- No write-ahead log, point-in-time recovery, or incremental backup. Snapshots
-  and backups are periodic consistent copies.
+- No write-ahead log or point-in-time recovery. Snapshots and native backups
+  are periodic full consistent copies; deduplicated incremental repositories
+  use the restic engine.
 - No online schema migration framework.
-- No compression at rest.
+- No native compression at rest; restic repositories compress their own data.
 - No storage encryption; use filesystem/volume encryption if needed.
 - No multi-tenant isolation inside one database.
 - No built-in TLS certificate rotation or secret management.
@@ -225,11 +231,11 @@ project's target workload.
 
 1. **Database management from the GUI.** Create/drop databases, not just select
    them.
-2. **Daemon-side auth and backup APIs.** Let the GUI manage principals, tokens,
-   backup verification, and restore without direct filesystem access.
+2. **Backup verification and restore APIs.** Let the GUI verify manifests and
+   show restore instructions without direct filesystem access.
 3. **Multiple daemon tabs.** Keep several profiles connected simultaneously.
-4. **Per-collection metrics and import progress.** Add collection-level counters,
-   cancellable/resumable imports, and virtualized large result sets.
+4. **Import progress and large result sets.** Cancellable/resumable imports and
+   virtualized large result sets.
 5. **Accessibility and theming.** Keyboard navigation, screen-reader labels, and
    an optional light theme.
 
@@ -245,9 +251,9 @@ project's target workload.
    `$mul`, `$currentDate`.
 4. **Reindex tooling.** A command to rebuild text/fuzzy indexes after analyzer
    changes, with progress and timeout handling.
-5. **Operational hardening.** Readiness/liveness separation and more metrics
-   (latency histograms, index build status). Structured logs and graceful drain
-   are implemented.
+5. **Operational hardening.** More metrics such as latency histograms and
+   per-stage query timings. Health/readiness, index-build status, structured logs,
+   and graceful drain are implemented.
 
 ### Medium value
 

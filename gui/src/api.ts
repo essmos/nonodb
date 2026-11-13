@@ -167,6 +167,397 @@ export async function metrics(connection: Connection): Promise<Record<string, un
   return (payload?.result ?? payload) as Record<string, unknown>;
 }
 
+
+export type AuthPrincipal = {
+  name: string;
+  scopes: string[];
+  tokens: number;
+  certificates: number;
+};
+
+export type AuthToken = {
+  kid: string;
+  principal: string;
+  disabled: boolean;
+};
+
+export type AuthCertificate = {
+  sha256: string;
+  principal: string;
+  disabled: boolean;
+};
+
+export type AuthSummary = {
+  generation: number;
+  principals: AuthPrincipal[];
+  tokens: AuthToken[];
+  certificates: AuthCertificate[];
+};
+
+async function authRequest<T>(
+  connection: Connection,
+  path: string,
+  method = 'GET',
+  body?: Record<string, unknown>,
+): Promise<T> {
+  const response = await fetch(endpointFor(connection, path), {
+    method,
+    headers: headers(connection),
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+  });
+  let payload: any = null;
+  try {
+    payload = await response.json();
+  } catch {
+    throw new ApiError('invalid_response', `HTTP ${response.status}`, response.status);
+  }
+  if (!response.ok || payload?.ok === false) {
+    const error = payload?.error ?? {};
+    throw new ApiError(
+      error.code ?? 'http_error',
+      error.message ?? `HTTP ${response.status}`,
+      response.status,
+    );
+  }
+  return payload?.result as T;
+}
+
+export function authSummary(connection: Connection): Promise<AuthSummary> {
+  return authRequest<AuthSummary>(connection, '/v1/auth');
+}
+
+export function createPrincipal(
+  connection: Connection,
+  name: string,
+  scopes: string[],
+): Promise<AuthPrincipal> {
+  return authRequest<AuthPrincipal>(connection, '/v1/auth/principals', 'POST', {
+    name,
+    scopes,
+  });
+}
+
+export function updatePrincipal(
+  connection: Connection,
+  name: string,
+  scopes: string[],
+): Promise<AuthPrincipal> {
+  return authRequest<AuthPrincipal>(
+    connection,
+    `/v1/auth/principals/${encodeURIComponent(name)}`,
+    'PUT',
+    { scopes },
+  );
+}
+
+export function deletePrincipal(connection: Connection, name: string): Promise<unknown> {
+  return authRequest(
+    connection,
+    `/v1/auth/principals/${encodeURIComponent(name)}`,
+    'DELETE',
+  );
+}
+
+export function createAuthToken(
+  connection: Connection,
+  principal: string,
+  kid?: string,
+): Promise<{ kid: string; principal: string; token: string }> {
+  return authRequest(connection, '/v1/auth/tokens', 'POST', {
+    principal,
+    ...(kid ? { kid } : {}),
+  });
+}
+
+export function updateAuthToken(
+  connection: Connection,
+  kid: string,
+  disabled: boolean,
+): Promise<AuthToken> {
+  return authRequest<AuthToken>(
+    connection,
+    `/v1/auth/tokens/${encodeURIComponent(kid)}`,
+    'PATCH',
+    { disabled },
+  );
+}
+
+export function createCertificate(
+  connection: Connection,
+  sha256: string,
+  principal: string,
+): Promise<AuthCertificate> {
+  return authRequest<AuthCertificate>(connection, '/v1/auth/certificates', 'POST', {
+    sha256,
+    principal,
+  });
+}
+
+export function updateCertificate(
+  connection: Connection,
+  sha256: string,
+  disabled: boolean,
+): Promise<AuthCertificate> {
+  return authRequest<AuthCertificate>(
+    connection,
+    `/v1/auth/certificates/${encodeURIComponent(sha256)}`,
+    'PATCH',
+    { disabled },
+  );
+}
+
+export function collectionMetrics(
+  connection: Connection,
+  collection: string,
+): Promise<Record<string, unknown>> {
+  return exec<Record<string, unknown>>(connection, {
+    op: 'get_collection_metrics',
+    coll: collection,
+  });
+}
+
+export type CollectionStorageStats = {
+  collection: string;
+  records: number;
+  data_bytes: number;
+  index_bytes: number;
+  indexes: number;
+  history_bytes: number;
+  ttl_bytes: number;
+  total_bytes: number;
+  requests_last_minute: number;
+  avg_requests_per_second: number;
+};
+
+export type DatabaseStorageStats = {
+  database: string;
+  map_size: number;
+  used_bytes: number;
+  free_bytes: number;
+  page_size: number;
+  total_records: number;
+  collection_bytes: number;
+  collections: CollectionStorageStats[];
+};
+
+export function databaseStats(connection: Connection): Promise<DatabaseStorageStats> {
+  return exec<DatabaseStorageStats>(connection, { op: 'database_stats' });
+}
+
+export type BackupDestination =
+  | { kind: 'local'; path: string }
+  | {
+      kind: 's3';
+      endpoint: string;
+      bucket: string;
+      region: string;
+      prefix: string;
+      access_key_env: string;
+      secret_key_env: string;
+      session_token_env?: string;
+    }
+  | {
+      kind: 'restic';
+      repository: string;
+      password_file: string;
+      binary: string;
+    };
+
+export type BackupEncryption = {
+  kind: 'age';
+  recipient_file: string;
+};
+
+export type BackupJob = {
+  id: string;
+  database: string;
+  databases?: string[];
+  enabled: boolean;
+  every_minutes: number;
+  destination: BackupDestination;
+  encryption?: BackupEncryption;
+  keep_last: number;
+  verify: boolean;
+  compression?: 'none' | 'gzip';
+  exclude_collections?: string[];
+};
+
+export type BackupJobState = {
+  last_run_unix: number;
+  next_run_unix: number;
+  last_status: string;
+  last_error?: string | null;
+  last_size_bytes: number;
+  last_duration_ms: number;
+  last_destination: string;
+  running: boolean;
+};
+
+export type BackupItem = {
+  job: BackupJob;
+  state: BackupJobState;
+};
+
+export type BackupsView = {
+  config_path: string;
+  staging_path: string;
+  key_dir: string;
+  default_identity_file: string;
+  default_recipient_file: string;
+  default_restic_password_file: string;
+  default_local_path: string;
+  default_restic_repository: string;
+  jobs: BackupItem[];
+};
+
+async function backupRequest<T>(
+  connection: Connection,
+  path: string,
+  method = 'GET',
+  body?: Record<string, unknown>,
+): Promise<T> {
+  const response = await fetch(endpointFor(connection, path), {
+    method,
+    headers: headers(connection),
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+  });
+  let payload: any = null;
+  try {
+    payload = await response.json();
+  } catch {
+    throw new ApiError('invalid_response', `HTTP ${response.status}`, response.status);
+  }
+  if (!response.ok || payload?.ok === false) {
+    const error = payload?.error ?? {};
+    throw new ApiError(
+      error.code ?? 'http_error',
+      error.message ?? `HTTP ${response.status}`,
+      response.status,
+    );
+  }
+  return payload?.result as T;
+}
+
+export function backupsList(connection: Connection): Promise<BackupsView> {
+  return backupRequest<BackupsView>(connection, '/v1/backups');
+}
+
+export function saveBackupJob(connection: Connection, job: BackupJob): Promise<BackupItem> {
+  return backupRequest<BackupItem>(connection, '/v1/backups/jobs', 'POST', job as unknown as Record<string, unknown>);
+}
+
+export function deleteBackupJob(connection: Connection, id: string): Promise<unknown> {
+  return backupRequest(connection, `/v1/backups/jobs/${encodeURIComponent(id)}`, 'DELETE');
+}
+
+export function runBackupJob(connection: Connection, id: string): Promise<unknown> {
+  return backupRequest(connection, `/v1/backups/jobs/${encodeURIComponent(id)}/run`, 'POST');
+}
+
+export type BackupKey = {
+  identity_file: string;
+  recipient_file: string;
+  recipient: string;
+};
+
+export function generateBackupKey(
+  connection: Connection,
+  identity_file: string,
+  recipient_file: string,
+): Promise<BackupKey> {
+  return backupRequest<BackupKey>(connection, '/v1/backups/keygen', 'POST', {
+    identity_file,
+    recipient_file,
+  });
+}
+
+export function generateBackupSecret(
+  connection: Connection,
+  path: string,
+): Promise<{ path: string }> {
+  return backupRequest<{ path: string }>(connection, '/v1/backups/secret', 'POST', { path });
+}
+
+export type ImportSource =
+  | { kind: 'local'; path: string }
+  | {
+      kind: 's3';
+      endpoint: string;
+      bucket: string;
+      region: string;
+      prefix: string;
+      access_key_env: string;
+      secret_key_env: string;
+      session_token_env?: string;
+    };
+
+export type DiscoveredImport = {
+  location: string;
+  manifest: {
+    version: number;
+    created_at_ms: number;
+    source: string;
+    job_id?: string;
+    excluded_collections?: string[];
+    data_file: string;
+    data_size: number;
+    sha256: string;
+    plain_sha256?: string;
+    plain_size?: number;
+    encryption?: { kind: string };
+    compression?: { kind: string };
+  };
+  info?: string | null;
+};
+
+export type ImportStatus = {
+  id: string;
+  status: string;
+  source: string;
+  location: string;
+  target_database: string;
+  error?: string | null;
+  bytes: number;
+  started_at_ms: number;
+  finished_at_ms?: number | null;
+};
+
+export type ImportOverview = {
+  roots: string[];
+  default_root?: string | null;
+  jobs: ImportStatus[];
+};
+
+export function importOverview(connection: Connection): Promise<ImportOverview> {
+  return backupRequest<ImportOverview>(connection, '/v1/import');
+}
+
+export function browseImports(
+  connection: Connection,
+  source: ImportSource,
+): Promise<{ backups: DiscoveredImport[] }> {
+  return backupRequest<{ backups: DiscoveredImport[] }>(connection, '/v1/import/browse', 'POST', {
+    source,
+  });
+}
+
+export function runImport(
+  connection: Connection,
+  source: ImportSource,
+  location: string,
+  target_database: string,
+): Promise<ImportStatus> {
+  return backupRequest<ImportStatus>(connection, '/v1/import/run', 'POST', {
+    source,
+    location,
+    target_database,
+  });
+}
+
+export function importStatus(connection: Connection, id: string): Promise<ImportStatus> {
+  return backupRequest<ImportStatus>(connection, `/v1/import/status/${encodeURIComponent(id)}`);
+}
+
 export function errorText(error: unknown): string {
   if (error instanceof ApiError) return `${error.code}: ${error.message}`;
   if (error instanceof Error) return error.message;

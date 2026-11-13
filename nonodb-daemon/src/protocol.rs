@@ -412,6 +412,8 @@ pub enum Request {
         durability: Option<Durability>,
     },
     ListCollections,
+    /// Per-collection record counts and storage estimates for this database.
+    DatabaseStats,
     /// Creates a collection explicitly. `profile` is `standard` (default) or `vault`.
     CreateCollection {
         coll: String,
@@ -463,6 +465,11 @@ pub enum Request {
     },
     /// Read automatic collection change-event settings.
     GetCollectionEvents {
+        coll: String,
+    },
+    /// Runtime request, read/write, cache, error, and latency counters for one
+    /// collection. Requires read access to the collection.
+    GetCollectionMetrics {
         coll: String,
     },
     CreateSubscription {
@@ -784,6 +791,7 @@ impl Request {
             Self::Batch { .. } => "batch",
             Self::WriteBatch { .. } => "write_batch",
             Self::ListCollections => "list_collections",
+            Self::DatabaseStats => "database_stats",
             Self::CreateCollection { .. } => "create_collection",
             Self::SetCollectionTtl { .. } => "set_collection_ttl",
             Self::GetCollectionTtl { .. } => "get_collection_ttl",
@@ -791,6 +799,7 @@ impl Request {
             Self::GetCollectionHistory { .. } => "get_collection_history",
             Self::SetCollectionEvents { .. } => "set_collection_events",
             Self::GetCollectionEvents { .. } => "get_collection_events",
+            Self::GetCollectionMetrics { .. } => "get_collection_metrics",
             Self::CreateSubscription { .. } => "create_subscription",
             Self::RenewSubscription { .. } => "renew_subscription",
             Self::DeleteSubscription { .. } => "delete_subscription",
@@ -842,9 +851,11 @@ impl Request {
             | Self::History { .. }
             | Self::GetVersion { .. }
             | Self::ListCollections
+            | Self::DatabaseStats
             | Self::GetCollectionTtl { .. }
             | Self::GetCollectionHistory { .. }
             | Self::GetCollectionEvents { .. }
+            | Self::GetCollectionMetrics { .. }
             | Self::ListSubscriptions { .. }
             | Self::ListDatabases => true,
             Self::Sql { query, .. } => nonodb_core::sql::is_read_only(query).unwrap_or(false),
@@ -894,6 +905,7 @@ impl Request {
             | Self::GetCollectionHistory { coll }
             | Self::SetCollectionEvents { coll, .. }
             | Self::GetCollectionEvents { coll }
+            | Self::GetCollectionMetrics { coll }
             | Self::CreateSubscription { coll, .. }
             | Self::RenewSubscription { coll, .. }
             | Self::DeleteSubscription { coll, .. }
@@ -913,6 +925,7 @@ impl Request {
             Self::WriteBatch { ops, .. } => ops.iter().flat_map(|op| op.collections()).collect(),
             Self::GetMore { .. } | Self::CloseCursor { .. } => Vec::new(),
             Self::ListCollections
+            | Self::DatabaseStats
             | Self::ListDatabases
             | Self::CreateDatabase { .. }
             | Self::DropDatabase { .. }

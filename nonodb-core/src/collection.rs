@@ -269,6 +269,19 @@ pub struct Collection<'e> {
     txn_gate: &'e crate::store::TxnGate,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct CollectionStorageStats {
+    pub records: u64,
+    pub data_bytes: u64,
+    pub index_bytes: u64,
+    pub indexes: u64,
+}
+
+fn stat_bytes(stat: &heed::DatabaseStat) -> u64 {
+    let pages = stat.branch_pages + stat.leaf_pages + stat.overflow_pages;
+    pages as u64 * stat.page_size as u64
+}
+
 impl<'e> Collection<'e> {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
@@ -311,6 +324,67 @@ impl<'e> Collection<'e> {
     /// Collection profile (`standard` or `vault`).
     pub fn profile(&self) -> CollectionProfile {
         self.profile
+    }
+
+    /// Storage summary for this collection. Data and index bytes come from
+    /// LMDB B-tree page allocation; shared history/TTL bytes are added by the
+    /// store-level aggregation.
+    pub fn storage_stats(&self, txn: &RoTxn<'_>) -> Result<CollectionStorageStats> {
+        let data = self.db.stat(txn)?;
+        let mut index_bytes = 0u64;
+        let mut indexes = 0u64;
+
+        for def in self.index_defs(txn)? {
+            let resource = index::db_name(&self.name, &def.name());
+            if let Some(bytes) = self.resource_db_bytes(txn, &resource, &resource)? {
+                index_bytes = index_bytes.saturating_add(bytes);
+                indexes += 1;
+            }
+        }
+        for field in self.text_defs(txn)? {
+            for resource in [
+                search::text_db_name(&self.name, &field),
+                search::text_len_db_name(&self.name, &field),
+            ] {
+                if let Some(bytes) = self.resource_db_bytes(txn, &resource, &resource)? {
+                    index_bytes = index_bytes.saturating_add(bytes);
+                    indexes += 1;
+                }
+            }
+        }
+        for field in self.fuzzy_defs(txn)? {
+            let resource = search::fuzzy_db_name(&self.name, &field);
+            if let Some(bytes) = self.resource_db_bytes(txn, &resource, &resource)? {
+                index_bytes = index_bytes.saturating_add(bytes);
+                indexes += 1;
+            }
+        }
+        for def in self.vector_defs(txn)? {
+            let resource = vector::db_name(&self.name, &def.field);
+            if let Some(bytes) = self.resource_db_bytes(txn, &resource, &resource)? {
+                index_bytes = index_bytes.saturating_add(bytes);
+                indexes += 1;
+            }
+        }
+
+        Ok(CollectionStorageStats {
+            records: data.entries as u64,
+            data_bytes: stat_bytes(&data),
+            index_bytes,
+            indexes,
+        })
+    }
+
+    fn resource_db_bytes(
+        &self,
+        txn: &RoTxn<'_>,
+        resource: &str,
+        legacy_name: &str,
+    ) -> Result<Option<u64>> {
+        let Some(db) = self.resource_db(txn, resource, legacy_name)? else {
+            return Ok(None);
+        };
+        Ok(Some(stat_bytes(&db.stat(txn)?)))
     }
 
     fn ensure_vault(&self) -> Result<()> {
@@ -3497,7 +3571,7 @@ impl<'e> Collection<'e> {
                 let tx = res_tx.clone();
                 scope.spawn(move || loop {
                     let job = {
-                        let guard = rx.lock().expect("kolejka backfillu");
+                        let guard = rx.lock().expect("backfill queue");
                         guard.recv()
                     };
                     match job {
@@ -3624,7 +3698,7 @@ impl<'e> Collection<'e> {
                     let mut failed = false;
                     loop {
                         let job = {
-                            let guard = rx.lock().expect("kolejka zadań");
+                            let guard = rx.lock().expect("job queue");
                             guard.recv()
                         };
                         match job {
@@ -3750,7 +3824,7 @@ impl<'e> Collection<'e> {
                     let mut failed = false;
                     loop {
                         let job = {
-                            let guard = rx.lock().expect("kolejka group scan");
+                            let guard = rx.lock().expect("group scan queue");
                             guard.recv()
                         };
                         let Ok(chunk) = job else {
@@ -3957,7 +4031,7 @@ impl<'e> Collection<'e> {
                         }
                         next_chunk += 1;
                         if tx.send(chunk).is_err() {
-                            error = Some(Error::Query("worker skanujący zakończył pracę".into()));
+                            error = Some(Error::Query("parallel scan worker stopped".into()));
                             break 'scan;
                         }
                         sent += 1;
@@ -3972,7 +4046,7 @@ impl<'e> Collection<'e> {
                     let msg = match res_rx.recv() {
                         Ok(msg) => msg,
                         Err(_) => {
-                            error = Some(Error::Query("brak wyniku skanu równoległego".into()));
+                            error = Some(Error::Query("parallel scan returned no result".into()));
                             break 'scan;
                         }
                     };
@@ -3985,7 +4059,7 @@ impl<'e> Collection<'e> {
                     };
                     let pos = idx.checked_sub(expected).unwrap_or(usize::MAX);
                     if pos >= sent {
-                        error = Some(Error::Query("nieoczekiwana porcja skanu".into()));
+                        error = Some(Error::Query("unexpected parallel scan chunk".into()));
                         break 'scan;
                     }
                     slots[pos] = Some(docs);

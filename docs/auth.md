@@ -1,7 +1,8 @@
 # Authentication and authorization
 
-NoNoDB uses a small JSON authorization registry managed by `nonodb-cli` and
-watched by the daemon. It is deliberately **outside LMDB**:
+NoNoDB uses a small JSON authorization registry managed by `nonodb-cli`, the
+HTTP API, or the GUI, and watched by the daemon. It is deliberately **outside
+LMDB**:
 
 - it survives database restores and cannot be rolled back with an old backup;
 - it remains available when the database is unavailable;
@@ -82,10 +83,11 @@ version make the file invalid.
 
 | Scope | Allows |
 |---|---|
-| `read:<collection>` | find, find_one, lookup, count, aggregate, SQL `SELECT`, explain_sql, explain, search, fuzzy, vector search, history, get_version, get_collection_ttl, get_collection_history, get_collection_events, list_subscriptions, list indexes |
+| `read:<collection>` | find, find_one, lookup, count, aggregate, SQL `SELECT`, explain_sql, explain, search, fuzzy, vector search, history, get_version, get_collection_ttl, get_collection_history, get_collection_events, get_collection_metrics, list_subscriptions, list indexes |
 | `write:<collection>` | insert, insert_many, update, find_and_modify, delete, SQL `INSERT`/`UPDATE` |
 | `admin:<collection>` | create/drop collection, create/drop secondary/text/fuzzy/vector index, set collection TTL, set collection history, set collection events, create/renew/delete subscription |
-| `admin:db` | Instance-wide administration: `list_databases`, `create_database`, `drop_database`, map operations, `sync`, and `/metrics`; collection actions still use collection scopes |
+| `admin:db` | Instance-wide administration: `list_databases`, `create_database`, `drop_database`, map operations, `sync`, metrics, and auth management; collection actions still use collection scopes |
+| `metrics:read` | Read `/metrics` and `/metrics/prometheus` without granting database administration |
 | `read:*` / `write:*` / `admin:*` | The action on every collection in every database |
 | `read:<database>/<collection>` | Same read actions, limited to one database |
 | `write:<database>/<collection>` | Same write actions, limited to one database |
@@ -107,7 +109,8 @@ Rules:
   scope. A principal with `read:orders` does not learn that `customers` exists.
 - Database management (`create_database`, `drop_database`, `map_info`,
   `resize_map`, `/metrics`) still requires global `admin:db` or `*:*`.
-- `/healthz` is public. `/metrics` requires `admin:db`.
+- `/healthz` and `/readyz` are public. `/metrics` and `/metrics/prometheus`
+  require `metrics:read`, `admin:db`, or `*:*`.
 - If both a client certificate and a bearer token are used, they must resolve to
   the same principal.
 
@@ -191,6 +194,37 @@ The CLI writes the file atomically under an exclusive lock:
 3. `fsync` the file;
 4. rename over the old file;
 5. `fsync` the directory.
+
+## HTTP API and GUI
+
+The daemon exposes the same registry operations over HTTP:
+
+```text
+GET    /v1/auth
+POST   /v1/auth/principals
+PUT    /v1/auth/principals/{name}
+DELETE /v1/auth/principals/{name}
+POST   /v1/auth/tokens
+PATCH  /v1/auth/tokens/{kid}
+POST   /v1/auth/certificates
+PATCH  /v1/auth/certificates/{sha256}
+```
+
+All routes require an enabled `admin:db` principal. The GUI exposes them in the
+**Authorization** tab. Mutations use the same cross-process lock as the CLI,
+then reload the registry immediately. The API does not expose token hashes, and
+a newly created plaintext token is returned only once.
+
+Safety rules enforced by the HTTP API:
+
+- invalid scopes and duplicate token IDs are rejected;
+- a principal referenced by a token or certificate cannot be deleted;
+- a change that would leave no enabled administrator token or certificate is
+  rejected with HTTP `409`;
+- audit logging records the operation and principal, never the token body.
+
+The CLI remains the recovery path if the last administrator is lost or the
+registry file must be repaired while the daemon is stopped.
 
 ## Reload and failure behavior
 

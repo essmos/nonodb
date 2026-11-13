@@ -46,7 +46,7 @@ nonodb is a real document database with:
 - exact vector search with cosine, dot, and L2 metrics, stored and queried
   inside the same LMDB file;
 - a read-only aggregation pipeline for reporting and summaries;
-- snapshots, online backup, online LMDB map growth, authentication, TLS/mTLS, metrics and a CLI;
+- snapshots, scheduled native or restic backups with GUI, gzip/age encryption, backup-info files, local/S3/R2 export, staged import as new databases, online LMDB map growth, authentication, TLS/mTLS, metrics and a CLI;
 - graceful shutdown with in-flight request draining and optional JSON logs;
 - per-collection document revision history with global revision IDs and configurable retention (`0` disables);
 - document TTL with collection defaults, per-document overrides, and background expiry;
@@ -421,7 +421,7 @@ rotation, and best-fit guidance.
 - Append-only JSONL audit log with optional read auditing and fsync.
 - Periodic LMDB snapshots with retention.
 - Online backup with SHA-256 manifests, deep verification, restore drills, and inspection.
-- JSON metrics endpoint and request/queue/commit counters.
+- JSON and Prometheus metrics endpoints with daemon-wide/per-collection counters, disk, snapshot, and readiness signals.
 - Graceful `SIGTERM`/`SIGINT` drain: stop accepting, finish in-flight requests,
   flush the writer queue, and remove the Unix socket.
 - Text or JSON logs with per-request method, path, status, and duration.
@@ -469,7 +469,7 @@ listener, so the Windows daemon requires TCP plus `NONODB_AUTH_FILE`.
 Download, verify, and extract the x86_64 archive:
 
 ```bash
-TAG=v0.21.0
+TAG=v0.22.0
 curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/nonodb-$TAG-linux-x86_64.tar.gz"
 curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/nonodb-$TAG-linux-x86_64.tar.gz.sha256"
 sha256sum -c "nonodb-$TAG-linux-x86_64.tar.gz.sha256"
@@ -538,7 +538,7 @@ unit and installation steps in [Operations](docs/operations.md#deployment-with-s
 Download the archive matching your CPU (`uname -m` prints `arm64` or `x86_64`):
 
 ```bash
-TAG=v0.21.0
+TAG=v0.22.0
 ARCHIVE="nonodb-$TAG-macos-arm64.tar.gz"   # use macos-x86_64 on Intel
 curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/$ARCHIVE"
 curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/$ARCHIVE.sha256"
@@ -633,7 +633,7 @@ The Docker workflow publishes versioned images to GitHub Container Registry for
 Linux `amd64` and `arm64`. Pull a published tag:
 
 ```bash
-docker pull ghcr.io/essmos/nonodb:0.21.0
+docker pull ghcr.io/essmos/nonodb:0.22.0
 ```
 
 Pin a version in production. The `latest` tag follows stable releases. If the
@@ -659,7 +659,7 @@ docker run -d --name nonodb \
   --group-add "$(id -g)" \
   -v "$NONODB_AUTH_FILE:/etc/nonodb/auth.json:ro" \
   -v nonodb-data:/var/lib/nonodb \
-  ghcr.io/essmos/nonodb:0.21.0
+  ghcr.io/essmos/nonodb:0.22.0
 ```
 
 Check health and logs:
@@ -722,7 +722,8 @@ docker compose -f deploy/docker-compose.yml --profile gui up -d
 ```
 
 The GUI supports document browsing and editing, collection settings,
-TTL/history/events, secondary indexes, SQL, LMDB map settings, and metrics.
+TTL/history/events, secondary indexes, SQL, LMDB map settings, per-collection
+metrics, authorization management, and scheduled backups.
 Node.js is only needed to build the GUI, not to run it.
 
 <p align="center">
@@ -746,7 +747,7 @@ documentation.
 | [SQL queries](docs/sql.md) | `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `DISTINCT`, `HAVING`, `CASE`, functions, aggregates, `explain_sql`, parameters, limits, client examples |
 | [Clients](docs/clients.md) | Python, Rust, Node.js and Go clients: install, CRUD, batches, indexes, search, TCP/TLS |
 | [Migration and import](docs/migration.md) | MongoDB, PostgreSQL, SQLite and CSV migration, NDJSON format, import manifest, cutover |
-| [Authentication and permissions](docs/auth.md) | Principals, scopes, tokens, certificates, lockout, reloads, audit log |
+| [Authentication and permissions](docs/auth.md) | Principals, scopes, tokens, certificates, CLI/API/GUI management, lockout, reloads, audit log |
 | [Security checks](docs/security-check.md) | Local security regression checks, LiveAPISec audit method, results, hardening gaps, production checklist |
 | [Mutual TLS](docs/mtls.md) | Client certificate setup, private CA, fingerprint mapping, revocation, rotation |
 | [Python client](docs/python-client.md) | `NonoDB`/`Collection` API, caching, retries, TCP/TLS, FastAPI usage |
@@ -759,7 +760,7 @@ documentation.
 | [Dates and time zones](docs/dates.md) | BSON-compatible dates, RFC 3339 input, filtering, indexes, sorting |
 | [Numbers and decimals](docs/numerics.md) | Exact numeric comparison, Decimal128, arithmetic, NaN/Infinity, index compatibility, long text limits |
 | [BSON scalar types](docs/bson-types.md) | `$numberInt`/`$numberLong`, `$type`, binary/UUID, ObjectId, index compatibility |
-| [GUI console](docs/gui.md) | Embedded local React console, data editing, collection settings, SQL, map/metrics |
+| [GUI console](docs/gui.md) | Embedded local React console, data editing, collection settings, SQL, map/metrics, authorization |
 | [CLI](docs/cli.md) | `ping`, `gui`, `find`, `count`, `map`, `resize`, auth management, backup/verify/restore, `exec` |
 | [Operations](docs/operations.md) | Configuration, deployment, security, snapshots, monitoring, capacity, troubleshooting |
 | [Backup and restore](docs/backup.md) | Online backup, snapshots, verification, restore drills, retention, Docker, vault keys, authorization state |
@@ -800,7 +801,7 @@ results. Visit [liveapisec.com](https://liveapisec.com) to learn more.
 
 ## Status
 
-nonodb is an early-stage project (`0.21.0`). Its core storage, query, index,
+nonodb is an early-stage project (`0.22.0`). Its core storage, query, index,
 search, batching, security, snapshot, and operational paths are covered by unit,
 property-based, end-to-end, concurrency, crash, and large-data tests. The API
 may still change before a stable release.

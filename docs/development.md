@@ -189,6 +189,8 @@ python3 scripts/resize_test.py               # online map growth under concurren
 python3 scripts/restore_drill.py             # backup -> verify -> restore -> query
 python3 scripts/shutdown_test.py             # SIGTERM drain, JSON logs, durable in-flight write
 python3 scripts/auth_test.py                 # scopes, token/cert auth, reload, audit, IP lockout
+python3 scripts/auth_api_test.py             # auth API, Prometheus, disk/snapshot metrics, readiness
+python3 scripts/backup_api_test.py           # backups, exclusions, keygen, age, local restore, S3/R2, restic
 python3 scripts/ttl_test.py                  # TTL sweeps, overrides, history, vault
 python3 scripts/history_test.py              # per-collection history enable/disable, restart, CLI
 python3 scripts/events_auto_test.py          # automatic collection events, field filters, thresholds, CLI
@@ -278,6 +280,8 @@ scripts are:
 | `scripts/restore_drill.py` | live backup, manifest verification, restore, query checks |
 | `scripts/shutdown_test.py` | graceful shutdown with an in-flight atomic write, JSON logs, restart durability |
 | `scripts/auth_test.py` | principals, scopes, filtered collections, token revocation, audit, IP lockout |
+| `scripts/auth_api_test.py` | admin-only auth API, one-time tokens, last-admin protection, certificates, Prometheus endpoint, disk/snapshot metrics, readiness |
+| `scripts/backup_api_test.py` | multi-database backups, backup-info, excluded collections, age keygen, local/S3 import, restore, SigV4, and restic command flow |
 | `scripts/security_check.py` | isolated auth gates, database-qualified scopes, CORS, malformed input, security headers, lockout |
 | `scripts/writer_window_bench.py` | adaptive/fixed group-commit window latency and throughput comparison |
 | `scripts/ttl_test.py` | TTL defaults, overrides, update semantics, sweeper, vault |
@@ -389,12 +393,12 @@ The tag is `vX.Y.Z`; the annotated tag subject and GitHub Release title are
 
 ```bash
 # final release
-git tag -a v0.21.0 -m "v0.21.0 - GUI login and authentication"
-git push origin v0.21.0
+git tag -a v0.22.0 -m "v0.22.0 - GUI login and authentication"
+git push origin v0.22.0
 
 # pre-release (the hyphen makes it a GitHub pre-release automatically)
-git tag -a v0.21.0-beta.1 -m "v0.21.0-beta.1 - Embedded GUI console"
-git push origin v0.21.0-beta.1
+git tag -a v0.22.0-beta.1 -m "v0.22.0-beta.1 - Embedded GUI console"
+git push origin v0.22.0-beta.1
 ```
 
 The release workflow reads the tag annotation and publishes the release with
@@ -416,7 +420,7 @@ notes. `--cleanup=verbatim` prevents Git from stripping lines that start with
 The workflow runs the tests, builds release binaries for Linux x86_64, macOS
 Intel, macOS Apple Silicon, and Windows x86_64, attaches checksums, and
 publishes the GitHub Release. Linux and macOS use `.tar.gz`; Windows uses
-`.zip`. Tags such as `v0.21.0-beta.1` and `v0.21.0-rc.1` are marked as
+`.zip`. Tags such as `v0.22.0-beta.1` and `v0.22.0-rc.1` are marked as
 pre-releases automatically.
 
 ### Manual release
@@ -425,7 +429,7 @@ Use **Actions → Release → Run workflow** and provide:
 
 | Input | Meaning |
 |---|---|
-| `tag` | Tag to publish, e.g. `v0.21.0` or `v0.21.0-rc.1` |
+| `tag` | Tag to publish, e.g. `v0.22.0` or `v0.22.0-rc.1` |
 | `summary` | Short title text after the version: `vX.Y.Z - <summary>` |
 | `prerelease` | Mark the release as a pre-release |
 | `draft` | Create it as a draft for review |

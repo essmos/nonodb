@@ -63,7 +63,7 @@ fn key(coll: &str, id: &str, rev: u64) -> Vec<u8> {
     out
 }
 
-fn parse_key(raw: &[u8]) -> Option<(&str, &str, u64)> {
+pub(crate) fn parse_key(raw: &[u8]) -> Option<(&str, &str, u64)> {
     if raw.len() < 6 {
         return None;
     }

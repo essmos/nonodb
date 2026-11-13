@@ -60,6 +60,25 @@ Runtime metrics and time-series samples:
 
 ![NonoDB GUI metrics](assets/gui/metrics-1m.png)
 
+Backup jobs, the required disclaimer, and the last destination path:
+
+![NonoDB GUI backups](assets/gui/backups.png)
+
+Backup job form with multi-database selection, backup type, destination,
+compression, encryption, and excluded collections:
+
+![NonoDB GUI backup form](assets/gui/backup-form.png)
+
+Import wizard showing local/S3 discovery, compression/encryption/partial
+status, and `backup-info.txt` availability:
+
+![NonoDB GUI import](assets/gui/import.png)
+
+Import plan with target database, selected backup, and the generated
+`backup-info.txt` details:
+
+![NonoDB GUI import plan](assets/gui/import-plan.png)
+
 A short walkthrough of switching databases and opening collections:
 
 [Download the GUI walkthrough video (MP4, 16 s)](assets/gui/demo.mp4)
@@ -77,6 +96,13 @@ token. There is no separate GUI account.
   **Advanced**.
 - The sidebar database selector switches between databases in the same daemon.
   Requests are routed as `/<database>/v1/exec` and `/<database>/v1/watch`.
+- The collection list stays visible in the sidebar on every tab. **Dashboard**
+  shows the selected database overview and metrics; choosing a collection opens
+  its document view.
+- The database icon next to the selector opens the **Storage** view with total
+  database usage and a per-collection table: records, data, indexes, history,
+  TTL, total estimated size, and rolling one-minute traffic. Click a collection
+  row to open that collection's **Metrics** tab.
 
 Credentials are kept in browser `sessionStorage` for the active session. Saved
 connection profiles use browser `localStorage`; do not save production tokens on
@@ -148,19 +174,99 @@ Text, fuzzy, and vector search require the corresponding index on the field.
 
 ### Metrics
 
-- daemon-wide request/read/write/cache/error counters;
+Metrics for the selected database are shown on the **Dashboard**, not in
+Database settings.
+
+- database-wide counters, queue, commit, batch, and TTL signals;
+- data-disk utilization and snapshot age;
 - graphical bars and time-series samples with optional 5-second auto-refresh;
-- average commit time, batch size, queue length, and TTL backlog;
-- collection-level document/index/TTL/versioning state;
 - raw metrics JSON.
+
+Per-collection request/read/write/cache/error counters and latency live in the
+selected collection's **Metrics** tab, not on the dashboard.
 
 ### Database
 
 - LMDB map size, used/free bytes, and page size;
 - online map resize;
 - database-wide JSON import/export;
-- command helper for backup, restore, verification, and auth CLI operations;
-- a note explaining that each database is a separate LMDB environment and the selector switches between them.
+- command helper for backup, restore, and verification CLI operations;
+- a note explaining that each database is a separate LMDB environment and the selector switches between them;
+- The database icon opens the **Storage** view with per-collection record counts, space usage, and last-minute traffic for the selected database.
+
+### Backups
+
+- create, edit, delete, and manually run backup jobs;
+- **Save & run now** next to **Create job** to save and immediately test a job;
+- multi-select database list for backing up several databases in one job;
+- multi-select excluded collections, applied to every selected database copy;
+- a required backup disclaimer acknowledgment before creating or running jobs;
+- **Backup type** first (full native copy or restic incremental/deduplicated),
+  then **Where** (local filesystem or S3/Cloudflare R2);
+- **Compression** option for native jobs: none or gzip, applied before optional
+  age encryption; restic compresses automatically;
+- local paths default to `<NONODB_DATA>/backups` and
+  `<NONODB_DATA>/restic-repo`, so the daemon can write them without root;
+- optional age encryption for native destinations, or restic-managed
+  encryption and deduplication;
+- one-time age key or restic password generation; private key material is never
+  displayed or editable in the GUI;
+- interval schedule in minutes, retention count, and deep verification;
+- last/next run, size, duration, last destination path, and errors;
+- automatic refresh while a backup is running and a completion notice with the
+  destination path;
+- credentials are read from configured environment-variable names and never
+  stored in the GUI.
+
+#### Backup workflow
+
+1. Open **Backups** and accept the disclaimer.
+2. Select one or more databases.
+3. Choose **Backup type**: full native copy or restic incremental/deduplicated.
+4. Choose **Where**: local filesystem or S3/Cloudflare R2.
+5. For native jobs choose **Compression** and optional age encryption.
+6. Optionally exclude collections; exclusions apply to every selected database.
+7. Click **Create job** to schedule it, or **Save & run now** to test it
+   immediately.
+8. After a run, inspect the badge, size, and **Destination** path.
+
+The local destination and key directory default inside `NONODB_DATA`, so the
+daemon can write them without root. In Docker, mount every local destination and
+`NONODB_BACKUP_KEY_DIR` as persistent volumes.
+
+### Import
+
+- browse local folders under `NONODB_IMPORT_ROOTS` or an S3/R2 prefix;
+- see database, timestamp, size, gzip, age, job, and partial-exclusion status;
+- read the generated `backup-info.txt` when available;
+- import as a new database with checksum, decryption, decompression, and deep
+  LMDB verification;
+- existing databases are never overwritten.
+
+#### Import workflow
+
+1. Open **Import**.
+2. Choose **Local folder** or **S3 / Cloudflare R2**.
+3. For local imports, use a path under `NONODB_IMPORT_ROOTS` (default
+   `<NONODB_DATA>/backups`). In Docker this is a container path and must be
+   mounted.
+4. Click **Browse backups**.
+5. Select the database backup. Check compression, encryption, partial scope, and
+   `backup-info.txt`.
+6. Enter a new target database name.
+7. Click **Verify & import as new database**.
+
+The importer verifies the checksum, decrypts age with
+`NONODB_BACKUP_IDENTITY_FILE` when needed, decompresses gzip, verifies the LMDB
+database, and refuses to overwrite an existing database.
+
+### Authorization
+
+- principal list with database-qualified scopes and edit/delete controls;
+- one-time bearer token creation with an explicit copy-once warning;
+- token enable/disable;
+- mTLS certificate registration and enable/disable;
+- last-enabled-administrator protection and referenced-principal checks.
 
 ### Navigation
 
@@ -193,8 +299,9 @@ active database and the GUI routes requests to
 `/<database>/v1/exec` and `/<database>/v1/watch`; `default` uses the same
 routes. No second daemon, socket, port, or GUI instance is needed.
 
-Databases are created and dropped with the CLI or the management API. The GUI
-can select them but does not yet expose a "new database" button:
+Databases are created and dropped with the CLI or the management API, and the
+Import wizard can create one by importing a backup. The GUI does not expose a
+standalone "new database" button:
 
 ```bash
 nonodb-cli databases create app1
@@ -231,7 +338,7 @@ docker run -d --name nonodb-gui \
   -p 127.0.0.1:8787:8787 \
   -v nonodb-run:/run/nonodb \
   -e NONODB_SOCK=/run/nonodb/nonodb.sock \
-  ghcr.io/essmos/nonodb:0.21.0 \
+  ghcr.io/essmos/nonodb:0.22.0 \
   nonodb-cli gui --host 0.0.0.0 --port 8787 --allow-remote --no-open
 ```
 
@@ -281,10 +388,10 @@ runs.
 ## Limitations
 
 - Whole-collection deletion is not exposed yet.
-- Auth management and backup/restore are CLI-only because the HTTP API does not
-  expose auth-file writes or filesystem paths.
+- Import currently supports full-database import from native local/S3 backups;
+  selective collection import, restic repository import, and replace-in-place
+  restore are not exposed in the GUI.
 - Multi-connection profiles exist, but simultaneous multi-daemon tabs do not.
-- Runtime metrics are daemon-wide; per-collection counters are not exposed yet.
 - A light theme is not included.
 
 ## Future GUI work
@@ -293,16 +400,11 @@ These are planned improvements, not current features.
 
 - **Database management in the GUI.** Create and drop databases directly from
   the console; today the GUI can select databases but creation/drop is CLI-only.
-- **Auth management without file writes.** Add daemon APIs for principal/token
-  management and expose them in the GUI. The current GUI deliberately cannot
-  edit `auth.json` because the HTTP API does not write auth-file paths.
 - **Backup and restore UI.** Trigger online backups, list manifests, verify
   checksums, and show restore instructions. Restore itself remains CLI-only
   until a safe daemon-side restore flow exists.
 - **Multiple daemon tabs.** Keep several connection profiles open at once
   instead of switching one active connection.
-- **Per-collection metrics.** Show collection-level request, write, cache, and
-  index-build counters; current runtime metrics are daemon-wide.
 - **Progress and resume for large imports.** Stream import progress, allow
   cancellation, and resume large JSON/NDJSON/CSV imports.
 - **Better large-result handling.** Virtualized document lists and resumable

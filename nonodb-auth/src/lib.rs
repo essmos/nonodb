@@ -141,6 +141,7 @@ enum ScopeRule {
     Write(Resource),
     AdminCollection(Resource),
     AdminDatabase,
+    MetricsRead,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -173,6 +174,9 @@ impl ScopeRule {
         }
         if action == "admin" && resource == "db" {
             return Ok(Self::AdminDatabase);
+        }
+        if action == "metrics" && resource == "read" {
+            return Ok(Self::MetricsRead);
         }
         let resource = parse_resource(resource)?;
         match action {
@@ -275,6 +279,17 @@ impl Principal {
             .any(|rule| matches!(rule, ScopeRule::All | ScopeRule::AdminDatabase))
     }
 
+    /// Metrics are instance-wide and reveal cross-collection load. They require
+    /// an explicit `metrics:read`, `admin:db`, or `*:*` grant.
+    pub fn allows_metrics(&self) -> bool {
+        self.scopes.iter().any(|rule| {
+            matches!(
+                rule,
+                ScopeRule::All | ScopeRule::AdminDatabase | ScopeRule::MetricsRead
+            )
+        })
+    }
+
     /// Collection metadata visibility: any collection scope or full admin.
     pub fn can_see_collection(&self, database: &str, coll: &str) -> bool {
         self.allows(Action::Read, database, coll)
@@ -295,6 +310,7 @@ impl Principal {
                 ScopeRule::Write(resource) => format!("write:{}", resource.display()),
                 ScopeRule::AdminCollection(resource) => format!("admin:{}", resource.display()),
                 ScopeRule::AdminDatabase => "admin:db".to_string(),
+                ScopeRule::MetricsRead => "metrics:read".to_string(),
             })
             .collect()
     }
@@ -474,7 +490,33 @@ pub fn normalize_fingerprint(raw: &str) -> Result<String, String> {
 }
 
 pub fn save_atomic(path: &Path, file: &AuthFile) -> Result<(), String> {
-    file.validate()?;
+    let dir = auth_dir(path)?;
+    let lock = lock_auth_file(path)?;
+    let result = write_atomic_locked(path, dir, file);
+    let _ = lock.unlock();
+    result
+}
+
+/// Applies a mutation while holding the same cross-process lock used by
+/// `save_atomic`. The closure receives the freshly loaded file, so GUI and CLI
+/// updates cannot silently overwrite each other.
+pub fn update_atomic<T, F>(path: &Path, mutate: F) -> Result<T, String>
+where
+    F: FnOnce(&mut AuthFile) -> Result<T, String>,
+{
+    let dir = auth_dir(path)?;
+    let lock = lock_auth_file(path)?;
+    let result = (|| {
+        let mut file = read_auth_file(path)?;
+        let output = mutate(&mut file)?;
+        write_atomic_locked(path, dir, &file)?;
+        Ok(output)
+    })();
+    let _ = lock.unlock();
+    result
+}
+
+fn auth_dir(path: &Path) -> Result<&Path, String> {
     let dir = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -482,7 +524,10 @@ pub fn save_atomic(path: &Path, file: &AuthFile) -> Result<(), String> {
     if !dir.is_dir() {
         return Err(format!("auth directory {} does not exist", dir.display()));
     }
+    Ok(dir)
+}
 
+fn lock_auth_file(path: &Path) -> Result<File, String> {
     let lock_path = lock_path(path);
     let lock = OpenOptions::new()
         .create(true)
@@ -493,10 +538,16 @@ pub fn save_atomic(path: &Path, file: &AuthFile) -> Result<(), String> {
         .map_err(|e| format!("cannot open auth lock {}: {e}", lock_path.display()))?;
     lock.lock_exclusive()
         .map_err(|e| format!("cannot lock auth file: {e}"))?;
+    Ok(lock)
+}
 
-    let result = write_atomic_locked(path, dir, file);
-    let _ = lock.unlock();
-    result
+fn read_auth_file(path: &Path) -> Result<AuthFile, String> {
+    let mut raw = String::new();
+    File::open(path)
+        .and_then(|mut file| file.read_to_string(&mut raw))
+        .map_err(|e| format!("cannot read auth file {}: {e}", path.display()))?;
+    serde_json::from_str(&raw)
+        .map_err(|e| format!("cannot parse auth file {}: {e}", path.display()))
 }
 
 fn write_atomic_locked(path: &Path, dir: &Path, file: &AuthFile) -> Result<(), String> {
@@ -676,8 +727,32 @@ mod tests {
         assert!(!principal.allows(Action::Read, "default", "customers"));
         assert!(principal.allows(Action::Write, "default", "orders"));
         assert!(!principal.allows_admin_database());
+        assert!(!principal.allows_metrics());
         assert!(principal.can_see_collection("default", "orders"));
         assert!(!principal.can_see_collection("default", "customers"));
+    }
+
+    #[test]
+    fn metrics_scope_is_explicit() {
+        let mut file = AuthFile::empty();
+        file.principals.insert(
+            "prometheus".into(),
+            PrincipalDef {
+                scopes: vec!["metrics:read".into()],
+            },
+        );
+        let (kid, token, hash) = generate_token(Some("metrics")).unwrap();
+        file.tokens.push(TokenEntry {
+            kid,
+            sha256: hash,
+            principal: "prometheus".into(),
+            disabled: false,
+        });
+        let registry = Registry::from_file(file).unwrap();
+        let principal = registry.authenticate_token(&token).unwrap();
+        assert!(principal.allows_metrics());
+        assert!(!principal.allows_admin_database());
+        assert!(!principal.allows(Action::Read, "default", "orders"));
     }
 
     #[test]
@@ -714,6 +789,7 @@ mod tests {
         assert!(ScopeRule::parse("read:app1/orders/extra").is_err());
         assert!(ScopeRule::parse("read:bad db/orders").is_err());
         assert!(ScopeRule::parse("admin:db").is_ok());
+        assert!(ScopeRule::parse("metrics:read").is_ok());
         assert!(ScopeRule::parse("read:").is_err());
         assert!(ScopeRule::parse("*:orders").is_err());
         assert!(ScopeRule::parse("read:orders:extra").is_err());
@@ -760,5 +836,47 @@ mod tests {
             disabled: false,
         });
         assert!(file.validate().is_err());
+    }
+}
+
+#[cfg(test)]
+mod update_tests {
+    use super::*;
+
+    #[test]
+    fn update_atomic_reads_the_latest_file() {
+        let path = std::env::temp_dir().join(format!(
+            "nonodb-auth-update-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut file = AuthFile::empty();
+        file.principals.insert(
+            "admin".into(),
+            PrincipalDef {
+                scopes: vec!["admin:db".into()],
+            },
+        );
+        save_atomic(&path, &file).unwrap();
+
+        update_atomic(&path, |file| {
+            file.principals.insert(
+                "reader".into(),
+                PrincipalDef {
+                    scopes: vec!["read:orders".into()],
+                },
+            );
+            Ok(())
+        })
+        .unwrap();
+
+        let loaded = Registry::load(&path).unwrap();
+        assert!(loaded.principal("admin").is_some());
+        assert!(loaded.principal("reader").is_some());
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(lock_path(&path));
     }
 }

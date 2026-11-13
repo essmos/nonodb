@@ -1,0 +1,101 @@
+groups:
+  - name: nonodb
+    rules:
+      - alert: NonoDBDown
+        expr: up{job="nonodb"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: NonoDB scrape target is down
+          description: Prometheus cannot scrape NonoDB for more than one minute.
+
+      - alert: NonoDBHighErrorRate
+        expr: rate(nonodb_errors_total[5m]) > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: NonoDB request errors are elevated
+          description: More than one request error per second for five minutes.
+
+      - alert: NonoDBWriterQueueBacklog
+        expr: nonodb_queue_len > 256
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: NonoDB writer queue is backing up
+          description: The single-writer queue has stayed above 256 pending writes for five minutes.
+
+      - alert: NonoDBWriterSaturated
+        expr: avg_over_time(nonodb_writer_busy[5m]) > 0.9
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: NonoDB writer is saturated
+          description: The writer spent more than 90% of the last five minutes executing batches.
+
+      - alert: NonoDBDiskUsageHigh
+        expr: nonodb_disk_used_ratio{mount="data"} > 0.85
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: NonoDB data disk is above 85%
+          description: Free space on the data volume is running low; resizing the LMDB map will not help if the filesystem is full.
+
+      - alert: NonoDBDiskUsageCritical
+        expr: nonodb_disk_used_ratio{mount="data"} > 0.95
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: NonoDB data disk is above 95%
+          description: The data volume is nearly full. Writes can fail with ENOSPC.
+
+      - alert: NonoDBSnapshotStale
+        expr: nonodb_snapshot_age_seconds > 3600
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: NonoDB snapshots are stale
+          description: The newest successful snapshot is more than one hour old. Check NONODB_SNAPSHOT_DIR and daemon logs.
+
+      - alert: NonoDBSnapshotFailing
+        expr: increase(nonodb_snapshot_failures_total[15m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: NonoDB snapshot failures detected
+          description: At least one snapshot attempt failed in the last 15 minutes.
+
+      - alert: NonoDBAuthFailures
+        expr: rate(nonodb_auth_failures_total[5m]) > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Elevated NonoDB authentication failures
+          description: More than one failed authentication per second for five minutes.
+
+      - alert: NonoDBAuthLockout
+        expr: increase(nonodb_auth_blocks_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: NonoDB blocked a client IP
+          description: Failed-login lockout triggered within the last five minutes.
+
+      - alert: NonoDBCollectionErrors
+        expr: rate(nonodb_collection_errors_total[5m]) > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: NonoDB collection errors are elevated
+          description: Collection {{ $labels.database }}/{{ $labels.collection }} is producing more than one error per second.

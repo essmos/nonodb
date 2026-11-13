@@ -15,6 +15,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -101,6 +102,26 @@ def main() -> int:
             assert match, index[:500]
             asset = fetch(base + match.group(1))
             assert len(asset) > 1000
+            for marker in (
+                b"Save & run now",
+                b"Select one or more databases",
+                b"Backup type",
+                b"Incremental + deduplication",
+                b"Where",
+                b"Compression",
+                b"Gzip",
+                b"Backup disclaimer",
+                b"as-is, without warranty",
+                b"I understand and accept",
+                b"Browse backups",
+                b"Verify & import as new database",
+                b"/v1/import/browse",
+                b"Excluded collections",
+                b"Generate key",
+                b"/v1/backups/keygen",
+            ):
+                assert marker in asset, marker
+            assert b"New database name" not in asset
 
             result = json.loads(fetch(base + "/v1/exec", data={"op": "list_collections"}))
             assert result["ok"] is True, result
@@ -119,6 +140,19 @@ def main() -> int:
 
             health = json.loads(fetch(base + "/healthz"))
             assert health, health
+            ready = json.loads(fetch(base + "/readyz"))
+            assert ready["ok"] is True, ready
+            backups = json.loads(fetch(base + "/v1/backups"))
+            assert "jobs" in backups["result"], backups
+            try:
+                fetch(base + "/v1/auth")
+            except HTTPError as exc:
+                # Authorization is intentionally disabled in this test. The
+                # point is that the GUI proxy does not return its 501 fallback.
+                assert exc.code == 400, exc.code
+                assert exc.headers.get("content-type", "").startswith("application/json")
+            else:
+                raise AssertionError("auth endpoint unexpectedly succeeded without auth file")
 
             fetch(base + "/v1/exec", data={"op": "create_database", "name": "app1"})
             fetch(

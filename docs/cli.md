@@ -67,6 +67,21 @@ NONODB_SOCK=/tmp/nonodb.sock nonodb-cli ping
 {"ok": true}
 ```
 
+## ready
+
+Check readiness: the writer thread is running and LMDB can serve a read
+transaction. Docker uses this command as its `HEALTHCHECK`.
+
+```bash
+NONODB_SOCK=/tmp/nonodb.sock nonodb-cli ready
+```
+
+```json
+{"ok":true,"checks":{"writer":true,"storage":true,"storage_error":null}}
+```
+
+Exit status is non-zero when the daemon returns HTTP `503`.
+
 ## collections
 
 List known collections:
@@ -252,6 +267,18 @@ nonodb-cli exec '{"op":"write_batch","ops":[
 
 This is the escape hatch for operations not wrapped by a dedicated command. It
 prints the full response envelope.
+
+## backup-keygen
+
+Generate an age X25519 identity and recipient for encrypted backups:
+
+```bash
+nonodb-cli backup-keygen /etc/nonodb/backup-identity.txt
+```
+
+The identity is written to the file with mode `0600`; the public
+`age1...` recipient is printed to stdout. Store the identity outside the daemon
+and set `NONODB_BACKUP_IDENTITY_FILE` when restoring an encrypted backup.
 
 ## backup
 
@@ -470,6 +497,11 @@ nonodb-cli auth check
 Use `auth init --force` only when you intentionally want to replace the whole
 registry. The daemon reloads valid changes within about one second; an invalid
 change is rejected and the daemon keeps the last known good configuration.
+
+The same principals, tokens, and certificates can be managed with the
+`/v1/auth` HTTP API or the GUI **Authorization** tab when the daemon has an
+enabled `admin:db` credential. CLI commands keep working directly on the file
+and are the recovery path.
 
 See [Authentication and authorization](auth.md) for the file schema, scope
 grammar, audit log, and mTLS setup.

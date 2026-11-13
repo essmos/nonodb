@@ -37,6 +37,32 @@ fn run() -> Result<(), String> {
             let res = http_get("/healthz")?;
             println!("{}", serde_json::to_string_pretty(&res).unwrap());
         }
+        "ready" => {
+            let res = http_get("/readyz")?;
+            println!("{}", serde_json::to_string_pretty(&res).unwrap());
+        }
+        "backup-keygen" => {
+            let path = PathBuf::from(
+                args.get(1)
+                    .ok_or("usage: nonodb-cli backup-keygen <identity-file>")?,
+            );
+            let (identity, recipient) = nonodb_core::backup_crypto::generate_keypair();
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options
+                .open(&path)
+                .map_err(|e| format!("create {}: {e}", path.display()))?;
+            file.write_all(format!("{identity}\n").as_bytes())
+                .map_err(|e| e.to_string())?;
+            file.sync_all().map_err(|e| e.to_string())?;
+            println!("{recipient}");
+            eprintln!("identity: {}", path.display());
+        }
         "databases" => {
             let action = args.get(1).map(String::as_str).unwrap_or("list");
             let payload = match action {
@@ -266,6 +292,7 @@ fn run() -> Result<(), String> {
             let manifest = nonodb_core::BackupManifest::from_backup(&out, &source)
                 .map_err(|e| e.to_string())?;
             nonodb_core::verify::write_manifest(&out, &manifest).map_err(|e| e.to_string())?;
+            nonodb_core::backup_info::write(&out, &manifest).map_err(|e| e.to_string())?;
             eprintln!(
                 "manifest: {} (sha256 {})",
                 out.join(nonodb_core::MANIFEST_FILE).display(),
@@ -380,6 +407,7 @@ fn usage() -> Result<(), String> {
          sync                       wymuś fsync wybranej bazy\n\
          resize <rozmiar>           powiększ mapę online, np. 4GiB\n\
          backup <data> <out>        kopia wybranej bazy (--db) + manifest.json\n\
+         backup-keygen <plik>      generuje parę kluczy age do backupów\n\
          backup-all <data> <out>    kopia wszystkich baz + manifest instancji\n\
          verify <data> [--json]     głęboka weryfikacja wybranej bazy i indeksów\n\
          verify-backup <backup> [--json]  sprawdź manifest, sumę SHA-256 i zawartość\n\
@@ -1150,6 +1178,7 @@ fn backup_all(data: &Path, out_dir: &Path) -> Result<(), String> {
         let manifest = nonodb_core::BackupManifest::from_backup(&db_out, &source)
             .map_err(|e| e.to_string())?;
         nonodb_core::verify::write_manifest(&db_out, &manifest).map_err(|e| e.to_string())?;
+        nonodb_core::backup_info::write(&db_out, &manifest).map_err(|e| e.to_string())?;
         entries.push(json!({
             "name": name,
             "sha256": manifest.sha256,
@@ -1287,45 +1316,100 @@ fn restore(backup: &Path, data: &Path, force: bool, verify: bool) -> Result<(), 
 }
 
 fn restore_into(backup: &Path, data: &Path, force: bool, verify: bool) -> Result<(), String> {
-    let src = if backup.join("data.mdb").exists() {
+    let manifest = if backup.is_dir() {
+        nonodb_core::verify::read_manifest(backup).map_err(|e| e.to_string())?
+    } else {
+        None
+    };
+    let src = if let Some(manifest) = &manifest {
+        nonodb_core::verify::manifest_data_path(backup, manifest).map_err(|e| e.to_string())?
+    } else if backup.join("data.mdb").exists() {
         backup.join("data.mdb")
     } else {
         backup.to_path_buf()
     };
     if !src.is_file() {
-        return Err(format!("brak pliku kopii: {}", src.display()));
+        return Err(format!("missing backup file: {}", src.display()));
     }
-    if backup.is_dir() {
-        if let Some(manifest) =
-            nonodb_core::verify::read_manifest(backup).map_err(|e| e.to_string())?
-        {
-            let meta = std::fs::metadata(&src).map_err(|e| e.to_string())?;
-            if meta.len() != manifest.data_size {
-                return Err(format!(
-                    "rozmiar kopii nie zgadza się z manifestem: {} != {}",
-                    meta.len(),
-                    manifest.data_size
-                ));
-            }
-            let digest = nonodb_core::verify::sha256_file(&src).map_err(|e| e.to_string())?;
-            if digest != manifest.sha256 {
-                return Err(format!(
-                    "suma SHA-256 kopii nie zgadza się z manifestem: {digest} != {}",
-                    manifest.sha256
-                ));
-            }
+    if let Some(manifest) = &manifest {
+        let meta = std::fs::metadata(&src).map_err(|e| e.to_string())?;
+        if meta.len() != manifest.data_size {
+            return Err(format!(
+                "backup size does not match manifest: {} != {}",
+                meta.len(),
+                manifest.data_size
+            ));
+        }
+        let digest = nonodb_core::verify::sha256_file(&src).map_err(|e| e.to_string())?;
+        if digest != manifest.sha256 {
+            return Err(format!(
+                "backup SHA-256 does not match manifest: {digest} != {}",
+                manifest.sha256
+            ));
         }
     }
     std::fs::create_dir_all(data).map_err(|e| e.to_string())?;
     let dst = data.join("data.mdb");
     if dst.exists() && !force {
         return Err(format!(
-            "{} istnieje; użyj --force po zatrzymaniu daemona",
+            "{} already exists; use --force after stopping the daemon",
             dst.display()
         ));
     }
+    let encrypted = manifest
+        .as_ref()
+        .is_some_and(|manifest| manifest.encryption.is_some());
+    let compressed = manifest
+        .as_ref()
+        .is_some_and(|manifest| manifest.compression.is_some());
+    let tmp = data.join(format!(".restore-data.mdb.tmp.{}", std::process::id()));
+    let raw = data.join(format!(".restore-source.tmp.{}", std::process::id()));
+    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(&raw);
+    if encrypted {
+        let key_path = std::env::var_os("NONODB_BACKUP_IDENTITY_FILE")
+            .map(PathBuf::from)
+            .ok_or("encrypted backup requires NONODB_BACKUP_IDENTITY_FILE")?;
+        let identity =
+            nonodb_core::backup_crypto::read_key_file(&key_path).map_err(|e| e.to_string())?;
+        nonodb_core::backup_crypto::decrypt_file(&src, &raw, &identity)
+            .map_err(|e| e.to_string())?;
+    } else {
+        std::fs::copy(&src, &raw).map_err(|e| e.to_string())?;
+    }
+    let plain = if compressed {
+        nonodb_core::backup_compress::gunzip_file(&raw, &tmp)
+            .map_err(|e| format!("decompress backup: {e}"))?;
+        let _ = std::fs::remove_file(&raw);
+        &tmp
+    } else {
+        &raw
+    };
+    if encrypted || compressed {
+        if let Some(manifest) = &manifest {
+            let meta = std::fs::metadata(plain).map_err(|e| e.to_string())?;
+            if let Some(size) = manifest.plain_size {
+                if meta.len() != size {
+                    let _ = std::fs::remove_file(plain);
+                    return Err(format!(
+                        "restored size does not match manifest: {} != {size}",
+                        meta.len()
+                    ));
+                }
+            }
+            if let Some(expected) = &manifest.plain_sha256 {
+                let digest = nonodb_core::verify::sha256_file(plain).map_err(|e| e.to_string())?;
+                if &digest != expected {
+                    let _ = std::fs::remove_file(plain);
+                    return Err(format!(
+                        "restored SHA-256 does not match manifest: {digest} != {expected}"
+                    ));
+                }
+            }
+        }
+    }
     let _ = std::fs::remove_file(data.join("lock.mdb"));
-    std::fs::copy(&src, &dst).map_err(|e| e.to_string())?;
+    std::fs::rename(plain, &dst).map_err(|e| e.to_string())?;
     let file = std::fs::File::open(&dst).map_err(|e| e.to_string())?;
     let _ = file.sync_all();
     eprintln!("restore: {} -> {}", src.display(), dst.display());

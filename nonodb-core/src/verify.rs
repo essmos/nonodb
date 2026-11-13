@@ -81,9 +81,35 @@ pub struct BackupManifest {
     pub version: u32,
     pub created_at_ms: u64,
     pub source: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub job_id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub excluded_collections: Vec<String>,
     pub data_file: String,
     pub data_size: u64,
     pub sha256: String,
+    /// Plaintext checksum before optional age encryption.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plain_sha256: Option<String>,
+    /// Plaintext size before optional age encryption.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plain_size: Option<u64>,
+    /// Encryption metadata. Absent for unencrypted backups.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encryption: Option<BackupEncryption>,
+    /// Compression metadata. Absent for uncompressed backups.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compression: Option<BackupCompression>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackupEncryption {
+    pub kind: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackupCompression {
+    pub kind: String,
 }
 
 /// A verified backup and its database report.
@@ -103,9 +129,15 @@ impl BackupManifest {
             version: MANIFEST_VERSION,
             created_at_ms: now_ms(),
             source: source.as_ref().display().to_string(),
+            job_id: String::new(),
+            excluded_collections: Vec::new(),
             data_file: DATA_FILE.to_string(),
             data_size: meta.len(),
             sha256: sha256_file(&path)?,
+            plain_sha256: None,
+            plain_size: None,
+            encryption: None,
+            compression: None,
         })
     }
 }
@@ -125,6 +157,26 @@ pub fn backup_data_path(dir: impl AsRef<Path>) -> Result<PathBuf> {
             "missing {} in {}",
             DATA_FILE,
             dir.as_ref().display()
+        )));
+    }
+    Ok(path)
+}
+
+/// Returns the payload path named by a manifest. The manifest is untrusted
+/// input, so only a single file name is accepted.
+pub fn manifest_data_path(dir: impl AsRef<Path>, manifest: &BackupManifest) -> Result<PathBuf> {
+    let name = Path::new(&manifest.data_file);
+    if name.components().count() != 1 || manifest.data_file.is_empty() {
+        return Err(Error::Query(format!(
+            "invalid backup data file name `{}`",
+            manifest.data_file
+        )));
+    }
+    let path = dir.as_ref().join(name);
+    if !path.is_file() {
+        return Err(Error::Query(format!(
+            "missing backup payload {}",
+            path.display()
         )));
     }
     Ok(path)
@@ -179,7 +231,7 @@ pub fn verify_backup(backup_dir: impl AsRef<Path>) -> Result<BackupVerification>
             manifest.version
         )));
     }
-    let data = backup_data_path(dir)?;
+    let data = manifest_data_path(dir, &manifest)?;
     let meta = fs::metadata(&data)?;
     if meta.len() != manifest.data_size {
         return Err(Error::Query(format!(
@@ -195,7 +247,28 @@ pub fn verify_backup(backup_dir: impl AsRef<Path>) -> Result<BackupVerification>
             manifest.sha256
         )));
     }
-    let report = verify_data_dir(dir)?;
+    if manifest.encryption.is_some() {
+        return Err(Error::Query(
+            "verify-backup does not support encrypted backups; restore it with NONODB_BACKUP_IDENTITY_FILE"
+                .into(),
+        ));
+    }
+    let report = if manifest.compression.is_some() {
+        let temp =
+            std::env::temp_dir().join(format!("nonodb-verify-{}-{}", std::process::id(), now_ms()));
+        let _ = fs::remove_dir_all(&temp);
+        fs::create_dir_all(&temp)?;
+        let result = (|| {
+            crate::backup_compress::gunzip_file(&data, &temp.join(DATA_FILE))?;
+            verify_data_dir(&temp)
+        })();
+        let _ = fs::remove_dir_all(&temp);
+        let mut report = result?;
+        report.path = dir.display().to_string();
+        report
+    } else {
+        verify_data_dir(dir)?
+    };
     Ok(BackupVerification { manifest, report })
 }
 

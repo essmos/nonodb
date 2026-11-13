@@ -8,16 +8,22 @@
 
 mod audit;
 mod auth;
+mod auth_api;
 mod authz;
 mod auto_index;
+mod backups;
+mod backups_api;
 mod cache;
 mod cursor;
 mod databases;
+mod imports;
+mod imports_api;
 mod live;
 mod login_guard;
 mod maintenance;
 mod metrics;
 mod protocol;
+mod s3_import;
 mod writer;
 
 use std::collections::HashMap;
@@ -31,11 +37,11 @@ use axum::{
     body::{Body, Bytes},
     extract::{DefaultBodyLimit, OriginalUri, State},
     http::{
-        header::{ACCEPT, CACHE_CONTROL},
+        header::{ACCEPT, CACHE_CONTROL, CONTENT_TYPE},
         HeaderMap, HeaderValue, StatusCode, Uri,
     },
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, patch, post, put},
     Extension, Json, Router,
 };
 use hyper::server::conn::http1;
@@ -109,8 +115,10 @@ struct AppState {
     auto_index: Arc<auto_index::AutoIndexer>,
     _runtime: Arc<databases::DatabaseRuntime>,
     databases: Arc<databases::Databases>,
-    auth: Option<Arc<auth::AuthState>>,
-    audit: Option<Arc<audit::AuditLog>>,
+    pub(crate) backups: Arc<backups::BackupManager>,
+    pub(crate) imports: Arc<imports::ImportManager>,
+    pub(crate) auth: Option<Arc<auth::AuthState>>,
+    pub(crate) audit: Option<Arc<audit::AuditLog>>,
     cursors: Arc<cursor::Registry>,
 }
 
@@ -124,6 +132,8 @@ impl AppState {
             auto_index: runtime.auto_index.clone(),
             _runtime: runtime,
             databases: self.databases.clone(),
+            backups: self.backups.clone(),
+            imports: self.imports.clone(),
             auth: self.auth.clone(),
             audit: self.audit.clone(),
             cursors: self.cursors.clone(),
@@ -174,7 +184,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         _ => None,
     };
     if tcp_addr.is_some() && auth.is_none() {
-        return Err("NONODB_TCP wymaga NONODB_AUTH_FILE".into());
+        return Err("NONODB_TCP requires NONODB_AUTH_FILE".into());
     }
     if let Some(auth) = &auth {
         auth.spawn_watcher();
@@ -182,6 +192,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let audit = audit::AuditLog::from_env()?;
 
     let databases = databases::Databases::open(&data)
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    metrics::set_disk_paths(
+        data.clone(),
+        std::env::var_os("NONODB_SNAPSHOT_DIR").map(PathBuf::from),
+    );
+    let backups = backups::BackupManager::open(&data, databases.clone())
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    backups.start_scheduler();
+    let imports = imports::ImportManager::open(&data, databases.clone())
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
     live::install_observer();
     live::registry().start_janitor();
@@ -205,13 +224,46 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         auto_index: default.auto_index.clone(),
         _runtime: default.clone(),
         databases: databases.clone(),
+        backups,
+        imports,
         auth: auth.clone(),
         audit: audit.clone(),
         cursors: Arc::new(cursor::Registry::new()),
     };
+    let auth_routes = Router::new()
+        .route("/v1/auth", get(auth_api::summary))
+        .route("/v1/auth/principals", post(auth_api::create_principal))
+        .route(
+            "/v1/auth/principals/:name",
+            put(auth_api::update_principal).delete(auth_api::delete_principal),
+        )
+        .route("/v1/auth/tokens", post(auth_api::create_token))
+        .route("/v1/auth/tokens/:kid", patch(auth_api::update_token))
+        .route("/v1/auth/certificates", post(auth_api::create_certificate))
+        .route(
+            "/v1/auth/certificates/:fingerprint",
+            patch(auth_api::update_certificate),
+        )
+        .layer(axum::middleware::from_fn(no_store));
     let app = Router::new()
         .route("/healthz", get(health))
+        .route("/readyz", get(ready))
         .route("/metrics", get(metrics_handler))
+        .route("/metrics/prometheus", get(prometheus_handler))
+        .merge(auth_routes)
+        .route("/v1/backups", get(backups_api::list))
+        .route("/v1/backups/jobs", post(backups_api::upsert))
+        .route(
+            "/v1/backups/jobs/:id",
+            axum::routing::delete(backups_api::delete),
+        )
+        .route("/v1/backups/jobs/:id/run", post(backups_api::run))
+        .route("/v1/backups/keygen", post(backups_api::keygen))
+        .route("/v1/backups/secret", post(backups_api::secret))
+        .route("/v1/import", get(imports_api::view))
+        .route("/v1/import/browse", post(imports_api::browse))
+        .route("/v1/import/run", post(imports_api::run))
+        .route("/v1/import/status/:id", get(imports_api::status))
         .route("/v1/exec", post(exec))
         .route("/v1/watch", post(watch_stream))
         .route("/:database/v1/exec", post(exec))
@@ -223,7 +275,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Optional TCP listener (with TLS when a certificate and key are provided).
     let mut tcp_task: Option<tokio::task::JoinHandle<()>> = None;
     if let Some(addr) = tcp_addr.as_deref() {
-        let auth = auth.clone().ok_or("NONODB_TCP wymaga NONODB_AUTH_FILE")?;
+        let auth = auth.clone().ok_or("NONODB_TCP requires NONODB_AUTH_FILE")?;
         let tls = match (
             std::env::var("NONODB_TLS_CERT"),
             std::env::var("NONODB_TLS_KEY"),
@@ -232,20 +284,20 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             (Err(_), Err(_)) => {
                 if std::env::var_os("NONODB_TLS_CLIENT_CA").is_some() {
                     return Err(
-                        "NONODB_TLS_CLIENT_CA wymaga NONODB_TLS_CERT i NONODB_TLS_KEY".into(),
+                        "NONODB_TLS_CLIENT_CA requires NONODB_TLS_CERT and NONODB_TLS_KEY".into(),
                     );
                 }
-                tracing::warn!("NONODB_TCP bez TLS (brak NONODB_TLS_CERT/KEY)");
+                tracing::warn!("NONODB_TCP without TLS (missing NONODB_TLS_CERT/KEY)");
                 None
             }
-            _ => return Err("podaj oba: NONODB_TLS_CERT i NONODB_TLS_KEY".into()),
+            _ => return Err("provide both NONODB_TLS_CERT and NONODB_TLS_KEY".into()),
         };
         let app_tcp = app.clone();
         let addr = addr.to_string();
         let shutdown = shutdown_rx.clone();
         tcp_task = Some(tokio::spawn(async move {
             if let Err(e) = serve_tcp(&addr, tls, app_tcp, shutdown, drain_timeout).await {
-                tracing::error!(?e, %addr, "listener TCP zakończony");
+                tracing::error!(?e, %addr, "TCP listener stopped");
             }
         }));
     }
@@ -307,7 +359,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             if !peer_allowed(&stream) {
-                tracing::warn!("odrzucono połączenie UDS: niedozwolony uid/gid");
+                tracing::warn!("rejected UDS connection: disallowed uid/gid");
                 continue;
             }
 
@@ -449,7 +501,7 @@ fn read_client_ca(path: &Path) -> Result<Arc<RootCertStore>, Box<dyn std::error:
     let mut reader = BufReader::new(std::fs::File::open(path)?);
     let certs = rustls_pemfile::certs(&mut reader).collect::<Result<Vec<_>, _>>()?;
     if certs.is_empty() {
-        return Err(format!("brak certyfikatów CA w {}", path.display()).into());
+        return Err(format!("no CA certificates in {}", path.display()).into());
     }
     let mut roots = RootCertStore::empty();
     for cert in certs {
@@ -468,8 +520,8 @@ fn tls_acceptor(
     let mut cert_reader = BufReader::new(std::fs::File::open(cert)?);
     let certs = rustls_pemfile::certs(&mut cert_reader).collect::<Result<Vec<_>, _>>()?;
     let mut key_reader = BufReader::new(std::fs::File::open(key)?);
-    let key = rustls_pemfile::private_key(&mut key_reader)?
-        .ok_or("brak klucza prywatnego w NONODB_TLS_KEY")?;
+    let key =
+        rustls_pemfile::private_key(&mut key_reader)?.ok_or("no private key in NONODB_TLS_KEY")?;
 
     let client_ca = std::env::var("NONODB_TLS_CLIENT_CA")
         .ok()
@@ -486,12 +538,12 @@ fn tls_acceptor(
         })
         .to_ascii_lowercase();
     if !matches!(client_auth_mode.as_str(), "off" | "required" | "optional") {
-        return Err("NONODB_TLS_CLIENT_AUTH musi być: off, required lub optional".into());
+        return Err("NONODB_TLS_CLIENT_AUTH must be one of: off, required, optional".into());
     }
 
     if client_ca.is_some() && client_auth_mode == "off" {
         return Err(
-            "NONODB_TLS_CLIENT_AUTH=off nie może być łączone z NONODB_TLS_CLIENT_CA".into(),
+            "NONODB_TLS_CLIENT_AUTH=off cannot be combined with NONODB_TLS_CLIENT_CA".into(),
         );
     }
 
@@ -509,7 +561,7 @@ fn tls_acceptor(
             .with_single_cert(certs, key)?
     } else {
         if client_auth_mode != "off" {
-            return Err("NONODB_TLS_CLIENT_AUTH wymaga NONODB_TLS_CLIENT_CA".into());
+            return Err("NONODB_TLS_CLIENT_AUTH requires NONODB_TLS_CLIENT_CA".into());
         }
         builder.with_no_client_auth().with_single_cert(certs, key)?
     };
@@ -664,7 +716,7 @@ where
 
 /// Periodic LMDB snapshots (consistent copies without stopping writes).
 /// This is not full PITR with a WAL - it provides restore points every N seconds.
-pub(crate) fn spawn_snapshots(store: Arc<Store>, dir: PathBuf) {
+pub(crate) fn spawn_snapshots(store: Arc<Store>, dir: PathBuf, database: String) {
     let interval = std::env::var("NONODB_SNAPSHOT_INTERVAL")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
@@ -680,7 +732,8 @@ pub(crate) fn spawn_snapshots(store: Arc<Store>, dir: PathBuf) {
         .name("nonodb-snapshots".into())
         .spawn(move || {
             if let Err(e) = std::fs::create_dir_all(&dir) {
-                tracing::error!(?e, dir = %dir.display(), "nie można utworzyć katalogu snapshotów");
+                metrics::record_snapshot_failure(&database);
+                tracing::error!(?e, dir = %dir.display(), "cannot create snapshot directory");
                 return;
             }
             loop {
@@ -689,15 +742,22 @@ pub(crate) fn spawn_snapshots(store: Arc<Store>, dir: PathBuf) {
                     .map(|d| d.as_millis())
                     .unwrap_or(0);
                 let path = dir.join(format!("data-{stamp}.mdb"));
+                let started = std::time::Instant::now();
                 match store.copy_to_file(&path, nonodb_core::heed::CompactionOption::Enabled) {
                     Ok(file) => {
                         if let Err(e) = file.sync_all() {
-                            tracing::warn!(?e, "fsync snapshotu nie powiódł się");
+                            metrics::record_snapshot_failure(&database);
+                            tracing::warn!(?e, "snapshot fsync failed");
+                        } else {
+                            metrics::record_snapshot_success(&database, started.elapsed());
+                            tracing::info!(path = %path.display(), "snapshot zapisany");
+                            prune_snapshots(&dir, keep);
                         }
-                        tracing::info!(path = %path.display(), "snapshot zapisany");
-                        prune_snapshots(&dir, keep);
                     }
-                    Err(e) => tracing::error!(?e, "snapshot nie powiódł się"),
+                    Err(e) => {
+                        metrics::record_snapshot_failure(&database);
+                        tracing::error!(?e, "snapshot failed");
+                    }
                 }
                 std::thread::sleep(interval);
             }
@@ -722,9 +782,17 @@ fn prune_snapshots(dir: &std::path::Path, keep: usize) {
     let excess = files.len().saturating_sub(keep);
     for old in files.into_iter().take(excess) {
         if let Err(e) = std::fs::remove_file(&old) {
-            tracing::warn!(?e, path = %old.display(), "nie można usunąć starego snapshotu");
+            tracing::warn!(?e, path = %old.display(), "cannot remove old snapshot");
         }
     }
+}
+
+async fn no_store(request: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let mut response = next.run(request).await;
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
 }
 
 async fn http_access_log(
@@ -751,6 +819,40 @@ async fn health() -> Json<Value> {
     Json(json!({ "ok": true }))
 }
 
+/// Readiness checks the writer and a real LMDB read transaction. Liveness stays
+/// cheap and public at `/healthz`; orchestrators should use `/readyz`.
+async fn ready(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
+    let writer_ok = state._runtime.writer_alive();
+    let store = state.store.clone();
+    let storage = tokio::task::spawn_blocking(move || {
+        let txn = store.read_txn().map_err(|err| err.to_string())?;
+        txn.commit().map_err(|err| err.to_string())
+    })
+    .await;
+    let (storage_ok, storage_error) = match storage {
+        Ok(Ok(())) => (true, None),
+        Ok(Err(err)) => (false, Some(err)),
+        Err(err) => (false, Some(format!("readiness task failed: {err}"))),
+    };
+    let ok = writer_ok && storage_ok;
+    let status = if ok {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        status,
+        Json(json!({
+            "ok": ok,
+            "checks": {
+                "writer": writer_ok,
+                "storage": storage_ok,
+                "storage_error": storage_error,
+            }
+        })),
+    )
+}
+
 async fn metrics_handler(
     State(state): State<AppState>,
     Extension(connection): Extension<auth::ConnectionAuth>,
@@ -774,7 +876,7 @@ async fn metrics_handler(
             return (status, Json(json!({ "ok": false, "error": err })));
         }
     };
-    if !principal.allows_admin_database() {
+    if !principal.allows_metrics() {
         let err = ApiError::forbidden();
         audit_control(
             &state,
@@ -807,8 +909,72 @@ async fn metrics_handler(
     (StatusCode::OK, Json(metrics::snapshot()))
 }
 
+async fn prometheus_handler(
+    State(state): State<AppState>,
+    Extension(connection): Extension<auth::ConnectionAuth>,
+    headers: HeaderMap,
+) -> Response {
+    let started = Instant::now();
+    let principal = match authenticate_with_guard(&state, &connection, &headers) {
+        Ok(principal) => principal,
+        Err((err, auth_audit)) => {
+            let status = error_status(&err);
+            audit_control(
+                &state,
+                &connection,
+                "anonymous",
+                "metrics_prometheus",
+                false,
+                Some(&err.message),
+                started,
+                auth_audit,
+            );
+            return (status, Json(json!({ "ok": false, "error": err }))).into_response();
+        }
+    };
+    if !principal.allows_metrics() {
+        let err = ApiError::forbidden();
+        audit_control(
+            &state,
+            &connection,
+            principal.name(),
+            "metrics_prometheus",
+            false,
+            Some(&err.message),
+            started,
+            None,
+        );
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "ok": false, "error": err })),
+        )
+            .into_response();
+    }
+    audit_control(
+        &state,
+        &connection,
+        principal.name(),
+        "metrics_prometheus",
+        true,
+        None,
+        started,
+        None,
+    );
+    if let Some(auth) = &state.auth {
+        auth.refresh_blocked_clients();
+    }
+    (
+        [(
+            CONTENT_TYPE,
+            HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
+        )],
+        metrics::prometheus(),
+    )
+        .into_response()
+}
+
 #[allow(clippy::too_many_arguments)]
-fn audit_control(
+pub(crate) fn audit_control(
     state: &AppState,
     connection: &auth::ConnectionAuth,
     principal: &str,
@@ -855,7 +1021,7 @@ fn audit_tls(
 }
 
 /// Authenticate one HTTP request and apply the per-IP failed-login guard.
-fn authenticate_with_guard(
+pub(crate) fn authenticate_with_guard(
     state: &AppState,
     connection: &auth::ConnectionAuth,
     headers: &HeaderMap,
@@ -1464,6 +1630,36 @@ async fn watch_stream(
 ) -> Response {
     metrics::inc(&metrics::REQUESTS);
     let started = Instant::now();
+    let database = database_from_uri(&uri);
+    let collections = req.collections();
+    let response = watch_stream_inner(
+        State(state),
+        Extension(connection),
+        OriginalUri(uri),
+        headers,
+        Json(req),
+    )
+    .await;
+    if response.status() != StatusCode::UNAUTHORIZED && response.status() != StatusCode::FORBIDDEN {
+        metrics::record_collection_request(
+            &database,
+            &collections,
+            true,
+            response.status().is_success(),
+            started.elapsed(),
+        );
+    }
+    response
+}
+
+async fn watch_stream_inner(
+    State(state): State<AppState>,
+    Extension(connection): Extension<auth::ConnectionAuth>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    Json(req): Json<Request>,
+) -> Response {
+    let started = Instant::now();
     let principal = match authenticate_with_guard(&state, &connection, &headers) {
         Ok(principal) => principal,
         Err((err, auth_audit)) => {
@@ -1808,6 +2004,39 @@ async fn exec(
 ) -> (StatusCode, Json<ApiResponse>) {
     metrics::inc(&metrics::REQUESTS);
     let started = std::time::Instant::now();
+    let database = database_from_uri(&uri);
+    let collections = req.collections();
+    let read_only = req.is_read_only();
+    let response = exec_inner(
+        State(state),
+        Extension(connection),
+        OriginalUri(uri),
+        headers,
+        Json(req),
+    )
+    .await;
+    // Do not create per-collection series for unauthenticated/unauthorized
+    // names. The global request/error counters still see those attempts.
+    if response.0 != StatusCode::UNAUTHORIZED && response.0 != StatusCode::FORBIDDEN {
+        metrics::record_collection_request(
+            &database,
+            &collections,
+            read_only,
+            response.1.ok,
+            started.elapsed(),
+        );
+    }
+    response
+}
+
+async fn exec_inner(
+    State(state): State<AppState>,
+    Extension(connection): Extension<auth::ConnectionAuth>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    Json(req): Json<Request>,
+) -> (StatusCode, Json<ApiResponse>) {
+    let started = std::time::Instant::now();
     let principal = match authenticate_with_guard(&state, &connection, &headers) {
         Ok(principal) => principal,
         Err((err, auth_audit)) => {
@@ -1874,6 +2103,7 @@ async fn exec(
             if vault_auth.is_none() {
                 state.auto_index.record(&req, false);
             }
+            metrics::record_collection_cache(&database, &audit_collections, true);
             metrics::inc(&metrics::READ_OPS);
             let response = respond(Ok(value));
             audit_response(
@@ -1888,6 +2118,9 @@ async fn exec(
             );
             return response;
         }
+    }
+    if cache_key.is_some() {
+        metrics::record_collection_cache(&database, &audit_collections, false);
     }
     if vault_auth.is_none() {
         state.auto_index.record(&req, true);
@@ -2562,6 +2795,35 @@ async fn exec(
                     "include_after": config.include_after,
                     "projection": config.projection,
                 }))
+            });
+            read_result(joined).await
+        }
+
+        Request::GetCollectionMetrics { coll } => {
+            respond(Ok(metrics::collection_snapshot(&database, &coll)))
+        }
+
+        Request::DatabaseStats => {
+            let store = state.store.clone();
+            let principal = principal.clone();
+            let database = database.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                let mut stats = store.storage_stats()?;
+                stats
+                    .collections
+                    .retain(|item| principal.can_see_collection(&database, &item.collection));
+                for item in &mut stats.collections {
+                    let (last_minute, avg_per_second) =
+                        metrics::collection_traffic(&database, &item.collection);
+                    item.requests_last_minute = last_minute;
+                    item.avg_requests_per_second = avg_per_second;
+                }
+                stats.total_records = stats.collections.iter().map(|item| item.records).sum();
+                stats.collection_bytes =
+                    stats.collections.iter().map(|item| item.total_bytes).sum();
+                let mut value = serde_json::to_value(stats).map_err(nonodb_core::Error::from)?;
+                value["database"] = json!(database);
+                Ok::<Value, ApiError>(value)
             });
             read_result(joined).await
         }
@@ -3501,6 +3763,11 @@ fn execute_read(
                 "projection": config.projection,
             }))
         }
+        Request::GetCollectionMetrics { coll } => Ok(metrics::collection_snapshot(database, &coll)),
+        Request::DatabaseStats => Err(ApiError {
+            code: "invalid_query".into(),
+            message: "database_stats is not supported inside a read batch".into(),
+        }),
         Request::ListSubscriptions { coll } => {
             let list = store.list_subscriptions(&coll)?;
             Ok(json!({ "subscriptions": list }))
@@ -3690,7 +3957,7 @@ fn flatten_join(
     }
 }
 
-fn error_status(err: &ApiError) -> StatusCode {
+pub(crate) fn error_status(err: &ApiError) -> StatusCode {
     match err.code.as_str() {
         "duplicate_key"
         | "invalid_id"

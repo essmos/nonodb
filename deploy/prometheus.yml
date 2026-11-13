@@ -1,0 +1,21 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - prometheus-alerts.yml
+
+scrape_configs:
+  - job_name: nonodb
+    metrics_path: /metrics/prometheus
+    scheme: http
+    authorization:
+      type: Bearer
+      # Generate this with:
+      #   nonodb-cli auth principal add prometheus metrics:read
+      #   nonodb-cli auth token create prometheus
+      credentials_file: /etc/nonodb/prometheus-token
+    static_configs:
+      - targets: ["127.0.0.1:7878"]
+        labels:
+          instance: nonodb

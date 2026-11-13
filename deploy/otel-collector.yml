@@ -1,0 +1,39 @@
+# OpenTelemetry Collector example that scrapes NonoDB's Prometheus endpoint.
+#
+# The Collector's prometheus receiver is the bridge to OTLP. This keeps the
+# daemon dependency-free; point the exporter at your OTLP backend in production.
+receivers:
+  prometheus:
+    config:
+      scrape_configs:
+        - job_name: nonodb
+          scrape_interval: 15s
+          metrics_path: /metrics/prometheus
+          authorization:
+            type: Bearer
+            credentials_file: /etc/nonodb/prometheus-token
+          static_configs:
+            - targets: ["127.0.0.1:7878"]
+
+processors:
+  batch: {}
+
+exporters:
+  debug:
+    verbosity: basic
+  # Enable one of these for a real backend:
+  # otlphttp:
+  #   endpoint: ${env:OTEL_EXPORTER_OTLP_ENDPOINT}
+  #   headers:
+  #     authorization: ${env:OTEL_EXPORTER_OTLP_HEADERS}
+  # otlp:
+  #   endpoint: ${env:OTEL_EXPORTER_OTLP_ENDPOINT}
+  #   tls:
+  #     insecure: false
+
+service:
+  pipelines:
+    metrics:
+      receivers: [prometheus]
+      processors: [batch]
+      exporters: [debug]

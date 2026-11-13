@@ -47,6 +47,17 @@ pub struct DatabaseRuntime {
     maintenance: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
+impl DatabaseRuntime {
+    /// True while the dedicated writer thread is still running.
+    pub fn writer_alive(&self) -> bool {
+        self.writer
+            .lock()
+            .ok()
+            .and_then(|handle| handle.as_ref().map(|handle| !handle.is_finished()))
+            .unwrap_or(false)
+    }
+}
+
 impl Drop for DatabaseRuntime {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
@@ -195,6 +206,56 @@ impl Databases {
         Ok(())
     }
 
+    /// Installs a verified `data.mdb` as a new database without replacing or
+    /// opening a live environment. The caller must verify the file first.
+    pub async fn import_database(&self, name: &str, source: &Path) -> Result<(), ApiError> {
+        validate_name(name).map_err(invalid)?;
+        let _guard = self.open_lock.lock().await;
+        if self.known.read().await.contains(name) {
+            return Err(invalid(format!("database `{name}` already exists")));
+        }
+        let target = self.root.join(name);
+        if target.exists() {
+            return Err(invalid(format!("database `{name}` already exists")));
+        }
+        let staging = self
+            .root
+            .join(format!(".import-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&staging);
+        fs::create_dir_all(&staging)
+            .map_err(|e| ApiError::internal(format!("create import staging: {e}")))?;
+        let staging_data = staging.join("data.mdb");
+        fs::copy(source, &staging_data)
+            .map_err(|e| ApiError::internal(format!("copy imported data: {e}")))?;
+        let result = tokio::task::spawn_blocking({
+            let staging = staging.clone();
+            move || -> Result<(), String> {
+                let store = Store::open(&staging).map_err(|e| e.to_string())?;
+                let env = store.env().clone();
+                drop(store);
+                env.prepare_for_closing().wait();
+                let _ = fs::remove_file(staging.join("lock.mdb"));
+                Ok(())
+            }
+        })
+        .await
+        .map_err(|e| ApiError::internal(format!("import validation task: {e}")))?;
+        if let Err(error) = result {
+            let _ = fs::remove_dir_all(&staging);
+            return Err(ApiError::internal(format!(
+                "open imported database: {error}"
+            )));
+        }
+        if let Err(error) = fs::rename(&staging, &target) {
+            let _ = fs::remove_dir_all(&staging);
+            return Err(ApiError::internal(format!(
+                "install imported database: {error}"
+            )));
+        }
+        self.known.write().await.insert(name.to_string());
+        Ok(())
+    }
+
     pub async fn drop_database(&self, name: &str) -> Result<bool, ApiError> {
         validate_name(name).map_err(invalid)?;
         if name == DEFAULT_DATABASE {
@@ -259,7 +320,11 @@ fn start_runtime(root: &Path, name: &str) -> Result<DatabaseRuntime, String> {
         stop.clone(),
     );
     if let Some(dir) = std::env::var_os("NONODB_SNAPSHOT_DIR") {
-        crate::spawn_snapshots(store.clone(), PathBuf::from(dir).join(name));
+        crate::spawn_snapshots(
+            store.clone(),
+            PathBuf::from(dir).join(name),
+            name.to_string(),
+        );
     }
     Ok(DatabaseRuntime {
         store,

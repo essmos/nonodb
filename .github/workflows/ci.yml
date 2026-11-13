@@ -96,6 +96,8 @@ jobs:
           python3 scripts/durability_test.py
           python3 scripts/gui_test.py
           python3 scripts/live_watch_test.py
+          python3 scripts/auth_api_test.py
+          python3 scripts/backup_api_test.py
 
       - name: Run security regression checks
         env:

@@ -83,6 +83,12 @@ secrets.
 | `NONODB_TLS_CLIENT_CA` | — | PEM CA bundle used to verify client certificates (mTLS) |
 | `NONODB_TLS_CLIENT_AUTH` | `required` when client CA is set | `required`, `optional`, or `off` |
 | `NONODB_SNAPSHOT_DIR` | — | Enables periodic LMDB snapshots in this directory |
+| `NONODB_BACKUP_CONFIG` | `<NONODB_DATA>/backups.json` | Scheduled backup job configuration |
+| `NONODB_BACKUP_STAGING` | `<NONODB_DATA>/.backup-staging` | Temporary backup staging directory |
+| `NONODB_BACKUP_SCHEDULER_INTERVAL` | `15` | Scheduler polling interval in seconds |
+| `NONODB_BACKUP_KEY_DIR` | `<NONODB_DATA>/backup-keys` | Directory for generated age keys and restic password files, mode `0700` |
+| `NONODB_IMPORT_ROOTS` | `<NONODB_DATA>/backups` | Allowed local roots for the backup Import wizard |
+| `NONODB_BACKUP_IDENTITY_FILE` | — | age identity file used by encrypted restore |
 | `NONODB_SNAPSHOT_INTERVAL` | `300` | Snapshot interval in seconds |
 | `NONODB_SNAPSHOT_KEEP` | `24` | Number of snapshot files to retain |
 | `NONODB_DRAIN_TIMEOUT` | `30` | Maximum seconds to wait for connections and queued writes during shutdown |
@@ -250,7 +256,7 @@ Download the archive from the matching GitHub Release, verify its checksum, and
 install the two binaries:
 
 ```bash
-TAG=v0.21.0
+TAG=v0.22.0
 ARCHIVE="nonodb-$TAG-linux-x86_64.tar.gz"
 curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/$ARCHIVE"
 curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/$ARCHIVE.sha256"
@@ -312,7 +318,7 @@ Linux `amd64` and `arm64`. Pull a published tag:
 
 ```bash
 # Pin a version in production; latest tracks stable releases.
-docker pull ghcr.io/essmos/nonodb:0.21.0
+docker pull ghcr.io/essmos/nonodb:0.22.0
 ```
 
 If the GHCR package is private, log in before pulling:
@@ -358,7 +364,7 @@ docker run -d --name nonodb \
   --group-add "$(id -g)" \
   -v "$NONODB_AUTH_FILE:/etc/nonodb/auth.json:ro" \
   -v nonodb-data:/var/lib/nonodb \
-  ghcr.io/essmos/nonodb:0.21.0
+  ghcr.io/essmos/nonodb:0.22.0
 ```
 
 Verify it:
@@ -430,7 +436,7 @@ docker volume create nonodb-run
 docker run -d --name nonodb \
   -v nonodb-data:/var/lib/nonodb \
   -v nonodb-run:/run/nonodb \
-  ghcr.io/essmos/nonodb:0.21.0
+  ghcr.io/essmos/nonodb:0.22.0
 ```
 
 The client container mounts the same `nonodb-run` volume and sets:
@@ -459,7 +465,7 @@ docker run -d --name nonodb \
   -v "$NONODB_AUTH_FILE:/etc/nonodb/auth.json:ro" \
   -v /host/certs:/certs:ro \
   -v nonodb-data:/var/lib/nonodb \
-  ghcr.io/essmos/nonodb:0.21.0
+  ghcr.io/essmos/nonodb:0.22.0
 ```
 
 Without a certificate and key pair, TCP runs in plaintext and logs a warning.
@@ -473,13 +479,40 @@ Back up into a separate mounted directory:
 docker run --rm \
   -v nonodb-data:/var/lib/nonodb:ro \
   -v /host/backups:/backups \
-  ghcr.io/essmos/nonodb:0.21.0 \
+  ghcr.io/essmos/nonodb:0.22.0 \
   nonodb-cli backup-all /var/lib/nonodb /backups/$(date -u +%Y%m%dT%H%M%SZ)
 ```
 
 `backup-all` opens each database read-only and writes a compacted `data.mdb`
 plus a per-database `manifest.json`, then an instance manifest. For one
 database, use `nonodb-cli --db app1 backup /var/lib/nonodb OUT`.
+
+In Docker, scheduled GUI backups use **container paths**, not host paths. Mount
+every local destination directory as a volume:
+
+```bash
+docker run -d --name nonodb \
+  -e NONODB_AUTH_FILE=/etc/nonodb/auth.json \
+  -e NONODB_TCP=0.0.0.0:7878 \
+  -e NONODB_BACKUP_KEY_DIR=/var/lib/nonodb/backup-keys \
+  -p 127.0.0.1:7878:7878 \
+  -v "$NONODB_AUTH_FILE:/etc/nonodb/auth.json:ro" \
+  -v nonodb-data:/var/lib/nonodb \
+  -v /host/backups:/var/backups/nonodb \
+  ghcr.io/essmos/nonodb:0.22.0
+```
+
+Then use `/var/backups/nonodb` in the GUI. By default keys live in
+`/var/lib/nonodb/backup-keys` inside the `nonodb-data` volume. For a separate key
+volume, set `NONODB_BACKUP_KEY_DIR=/backup-keys` and mount it:
+
+```bash
+-v nonodb-backup-keys:/backup-keys
+```
+
+The restic binary is already included in the image. Restic repositories may be
+local volumes or S3/R2 URLs; AWS credentials should be passed as container
+environment variables or Docker secrets, never stored in `backups.json`.
 
 ## Permissions
 
@@ -519,6 +552,11 @@ nonodb-cli auth token create app
 - Deny-by-default; `write` does not imply `read`.
 - `write_batch` is authorized per operation.
 - `/healthz` is public; `/metrics` requires `admin:db`.
+- Per-collection runtime counters are available through
+  `{"op":"get_collection_metrics","coll":"..."}` to principals with
+  `read:<collection>`. The full `/metrics` snapshot requires `admin:db`.
+- Authorization can be managed with `nonodb-cli auth`, the `/v1/auth` HTTP API,
+  or the GUI **Authorization** tab. All HTTP mutations require `admin:db`.
 - Disabled tokens/certificates are re-checked on every request.
 - Failed logins can block a TCP peer IP; thresholds and block duration are
   configurable.
@@ -605,14 +643,24 @@ separately.
 
 ## Monitoring
 
-Metrics are available at `GET /metrics` on the daemon socket (or TCP).
-`/metrics` requires the `admin:db` scope; Unix-socket requests run as the local
-administrator. Over TCP, send a token:
+Metrics are available at `GET /metrics` (JSON) and
+`GET /metrics/prometheus` (Prometheus text) on the daemon socket or TCP.
+Both require `metrics:read`, `admin:db`, or `*:*`; Unix-socket requests run as
+the local administrator. Over TCP, send a token:
 
 ```bash
 curl -s --unix-socket /run/nonodb/nonodb.sock http://localhost/metrics
 curl -s -H "Authorization: Bearer $NONODB_TOKEN" http://127.0.0.1:7878/metrics
+curl -s -H "Authorization: Bearer $NONODB_TOKEN" http://127.0.0.1:7878/metrics/prometheus
 ```
+
+Use a dedicated `metrics:read` token for Prometheus or an OpenTelemetry
+Collector. See [Monitoring and alerting](monitoring.md) for scrape configs,
+alert rules, and the Collector bridge.
+
+`GET /readyz` checks the writer thread and a real LMDB read transaction. It is
+public and returns `503` when either check fails. Docker uses
+`nonodb-cli ready` as its health check.
 
 Useful signals:
 
@@ -652,6 +700,10 @@ Useful signals:
 | `sql_errors_total` | SQL parse/execution errors |
 | `sql_duration_ns_total` | Total SQL execution time in nanoseconds |
 | `index_builds` | Active/recent index backfills and processed/total/elapsed progress |
+| `collection_metrics` | Per-`database/collection` requests, reads, writes, cache, errors, and latency |
+| `collection_metrics_overflow_total` | Requests omitted after the 4096-series metrics cap |
+| `disk` / `nonodb_disk_*` | Filesystem capacity, free, used, and used ratio for data and snapshots |
+| `snapshots` / `nonodb_snapshot_*` | Per-database snapshot success, failures, age, and duration |
 | `auth_failures_total` | Failed authentication attempts |
 | `auth_blocks_total` | IP lockouts started |
 | `auth_blocked_requests_total` | Requests rejected while the IP was blocked |

@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime};
 
 use axum::http::{header::AUTHORIZATION, HeaderMap};
-use nonodb_auth::{Principal, Registry};
+use nonodb_auth::{AuthFile, Principal, Registry};
 
 use crate::login_guard::{BlockInfo, FailureInfo, LoginGuard};
 use crate::protocol::ApiError;
@@ -169,6 +169,27 @@ impl AuthState {
         }
     }
 
+    /// Atomically mutates the registry file, reloads it, and refuses changes
+    /// that would leave no enabled administrator credential.
+    pub fn mutate<T, F>(&self, mutate: F) -> Result<T, String>
+    where
+        F: FnOnce(&mut AuthFile) -> Result<T, String>,
+    {
+        let output = nonodb_auth::update_atomic(&self.path, |file| {
+            let output = mutate(file)?;
+            if !has_enabled_admin(file) {
+                return Err(
+                    "operation would remove the last enabled administrator credential".into(),
+                );
+            }
+            Ok(output)
+        })?;
+        if !self.reload() {
+            return Err("auth file updated but could not be reloaded".into());
+        }
+        Ok(output)
+    }
+
     fn reload_if_changed(&self) {
         let Ok(stamp) = file_stamp(&self.path) else {
             return;
@@ -258,6 +279,26 @@ pub fn authenticate(
         (None, Some(token)) => Ok(token),
         (None, None) => Err(ApiError::unauthorized()),
     }
+}
+
+fn has_enabled_admin(file: &AuthFile) -> bool {
+    let admins: std::collections::HashSet<&str> = file
+        .principals
+        .iter()
+        .filter(|(name, def)| {
+            Principal::new((*name).clone(), &def.scopes)
+                .map(|principal| principal.allows_admin_database())
+                .unwrap_or(false)
+        })
+        .map(|(name, _)| name.as_str())
+        .collect();
+    file.tokens
+        .iter()
+        .any(|token| !token.disabled && admins.contains(token.principal.as_str()))
+        || file
+            .certificates
+            .iter()
+            .any(|cert| !cert.disabled && admins.contains(cert.principal.as_str()))
 }
 
 fn bearer_token(headers: &HeaderMap) -> Result<Option<String>, ApiError> {

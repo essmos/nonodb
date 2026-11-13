@@ -39,6 +39,7 @@ pub fn authorize_request(
         | Request::GetCollectionTtl { coll }
         | Request::GetCollectionHistory { coll }
         | Request::GetCollectionEvents { coll }
+        | Request::GetCollectionMetrics { coll }
         | Request::ListSubscriptions { coll } => {
             allow(principal, Action::Read, database, coll, req.op_name())
         }
@@ -103,7 +104,7 @@ pub fn authorize_request(
         // The cursor registry verifies ownership. `get_more`/`close_cursor`
         // deliberately carry no collection name; the cursor stores it.
         Request::GetMore { .. } | Request::CloseCursor { .. } => Ok(()),
-        Request::ListCollections => Ok(()),
+        Request::ListCollections | Request::DatabaseStats => Ok(()),
         Request::Batch { ops } => {
             for op in ops {
                 authorize_request(principal, op, database)?;

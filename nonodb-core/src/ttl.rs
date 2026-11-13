@@ -64,7 +64,7 @@ fn expiry_key(at: u64, coll: &str, id: &str) -> Vec<u8> {
     out
 }
 
-fn parse_expiry_key(raw: &[u8]) -> Option<(u64, &str, &str)> {
+pub(crate) fn parse_expiry_key(raw: &[u8]) -> Option<(u64, &str, &str)> {
     if raw.len() < 1 + 8 + 2 + 4 || raw[0] != EXPIRY_PREFIX {
         return None;
     }
@@ -89,6 +89,32 @@ fn parse_expiry_key(raw: &[u8]) -> Option<(u64, &str, &str)> {
     let coll = std::str::from_utf8(&raw[coll_start..coll_end]).ok()?;
     let id = std::str::from_utf8(&raw[id_start..id_end]).ok()?;
     Some((at, coll, id))
+}
+
+pub(crate) fn parse_id_key(raw: &[u8]) -> Option<(&str, &str)> {
+    if raw.len() < 1 + 2 + 4 || raw[0] != ID_PREFIX {
+        return None;
+    }
+    let coll_len = u16::from_be_bytes([raw[1], raw[2]]) as usize;
+    let coll_start: usize = 3;
+    let coll_end = coll_start.checked_add(coll_len)?;
+    if raw.len() < coll_end + 4 {
+        return None;
+    }
+    let id_len = u32::from_be_bytes([
+        raw[coll_end],
+        raw[coll_end + 1],
+        raw[coll_end + 2],
+        raw[coll_end + 3],
+    ]) as usize;
+    let id_start = coll_end + 4;
+    let id_end = id_start.checked_add(id_len)?;
+    if raw.len() != id_end {
+        return None;
+    }
+    let coll = std::str::from_utf8(&raw[coll_start..coll_end]).ok()?;
+    let id = std::str::from_utf8(&raw[id_start..id_end]).ok()?;
+    Some((coll, id))
 }
 
 fn parse_at(raw: &[u8]) -> Option<u64> {

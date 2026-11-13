@@ -1,7 +1,7 @@
 # HTTP API
 
-nonodb exposes one JSON operation endpoint per database, plus health and
-metrics endpoints.
+nonodb exposes one JSON operation endpoint per database, plus health, metrics,
+and authorization-management endpoints.
 
 - Base URL over a Unix socket: `http://localhost`
 - Default socket: `/run/nonodb.sock`
@@ -10,7 +10,9 @@ metrics endpoints.
 - Stream endpoint: `POST /v1/watch` (alias for `/default/v1/watch`)
 - Database-scoped stream: `POST /{database}/v1/watch`
 - Health: `GET /healthz`
-- Metrics: `GET /metrics`
+- Metrics: `GET /metrics` (JSON) and `GET /metrics/prometheus` (Prometheus text)
+- Readiness: `GET /readyz`
+- Authorization management: `/v1/auth`, `/v1/auth/principals`, `/v1/auth/tokens`, `/v1/auth/certificates`
 
 The API is JSON over HTTP/1.1. It is **not** MongoDB wire-protocol compatible.
 See [Multiple databases](multi-database.md) for database routing and
@@ -103,7 +105,8 @@ Authorization: Bearer nodb_<kid>_<secret>
 or a registered client certificate (mTLS). If both are supplied, they must
 resolve to the same principal.
 
-`GET /healthz` is public. `/metrics` requires `admin:db`. Authorization is
+`GET /healthz` and `GET /readyz` are public. `/metrics` and
+`/metrics/prometheus` require `metrics:read`, `admin:db`, or `*:*`. Authorization is
 deny-by-default and checked per database/collection; `write_batch` is checked
 per operation. Scopes may be database-qualified, for example
 `read:app1/orders`. Missing credentials return `401`; insufficient scope returns `403` with error
@@ -188,6 +191,7 @@ client timeout with `NONODB_TIMEOUT` or the `timeout=` argument.
 | [`history`](#document-history) | List revisions of one document |
 | [`get_version`](#document-history) | Read one exact document revision |
 | [`list_collections`](#list_collections) | List known collections |
+| [`database_stats`](#database_stats) | Record counts and storage estimates per collection |
 | [`create_collection`](#create_collection) | Create a standard or vault collection |
 | [`set_collection_ttl`](#document-ttl) | Set or clear the default document TTL |
 | [`get_collection_ttl`](#document-ttl) | Read the default document TTL |
@@ -195,6 +199,7 @@ client timeout with `NONODB_TIMEOUT` or the `timeout=` argument.
 | [`get_collection_history`](#get_collection_history) | Read per-collection history retention |
 | [`set_collection_events`](#set_collection_events) | Enable/disable automatic collection change events |
 | [`get_collection_events`](#get_collection_events) | Read automatic change-event settings |
+| [`get_collection_metrics`](#per-collection-metrics) | Read runtime counters for one collection |
 | [`create_subscription`](#conditional-subscriptions) | Create/replace a conditional collection subscription |
 | [`renew_subscription`](#conditional-subscriptions) | Renew a subscription client lease |
 | [`delete_subscription`](#conditional-subscriptions) | Delete a conditional subscription |
@@ -2050,6 +2055,53 @@ Response:
 Standard collections are created on first write. Vault collections should be
 created explicitly with `create_collection`.
 
+## database_stats
+
+```json
+{"op": "database_stats"}
+```
+
+Returns record counts and storage estimates for every collection visible to the
+caller. It requires no database-admin scope; collections outside the caller's
+scopes are omitted and the totals are recalculated.
+
+```json
+{
+  "ok": true,
+  "result": {
+    "database": "default",
+    "map_size": 1073741824,
+    "used_bytes": 734003200,
+    "free_bytes": 339738624,
+    "page_size": 4096,
+    "total_records": 1000000,
+    "collection_bytes": 612000000,
+    "collections": [
+      {
+        "collection": "records",
+        "records": 1000000,
+        "data_bytes": 512000000,
+        "index_bytes": 96000000,
+        "indexes": 7,
+        "history_bytes": 0,
+        "ttl_bytes": 0,
+        "total_bytes": 608000000,
+        "requests_last_minute": 240,
+        "avg_requests_per_second": 4.0
+      }
+    ]
+  }
+}
+```
+
+`data_bytes` and `index_bytes` are allocated LMDB B-tree pages
+(`(branch + leaf + overflow) * page_size`). `history_bytes` and `ttl_bytes` are
+estimated from shared history/TTL keys and values. `requests_last_minute` is a
+rolling 60-second request count and `avg_requests_per_second` is that count
+divided by 60. `used_bytes` is the LMDB file high-water mark and can exceed the
+sum of collection totals because LMDB keeps freed pages and does not shrink the
+file.
+
 ### Vault operation summary
 
 For a vault collection, `insert`, `insert_many`, `find`, `find_one`, `count`,
@@ -2112,10 +2164,49 @@ Public, no authentication.
 {"ok": true}
 ```
 
+### Per-collection metrics
+
+Runtime counters are tracked separately for every `database/collection` pair.
+Collection-level reads require only `read:<collection>`; the full daemon-wide
+snapshot at `GET /metrics` still requires `admin:db`.
+
+```json
+{"op":"get_collection_metrics","coll":"orders"}
+```
+
+```json
+{
+  "ok": true,
+  "result": {
+    "database": "default",
+    "collection": "orders",
+    "requests_total": 1200,
+    "read_ops_total": 900,
+    "write_requests_total": 300,
+    "cache_hits_total": 540,
+    "cache_misses_total": 360,
+    "errors_total": 2,
+    "request_ns_total": 1840000000,
+    "last_request_us": 620.4,
+    "avg_request_us": 1533.3
+  }
+}
+```
+
+`requests_total` counts requests that touched the collection. Batch requests
+count once per collection. `read_ops_total` and `write_requests_total` count
+successful read and write requests; `errors_total` counts failed requests.
+`avg_request_us` and `last_request_us` are wall-clock request durations.
+Counters reset when the daemon restarts and are capped at 4096 distinct
+collection series to bound memory; `collection_metrics_overflow_total` reports
+requests for series beyond the cap.
+
 ### GET /metrics
 
-Requires the `admin:db` scope. The Unix socket authenticates as the local
-administrator; TCP requires a bearer token or registered client certificate.
+Requires `metrics:read`, `admin:db`, or `*:*`. The Unix socket authenticates as
+the local administrator; TCP requires a bearer token or registered client
+certificate. `GET /metrics/prometheus` exposes the same counters in Prometheus
+text format and uses the same scopes. See [Monitoring](monitoring.md).
 
 ```json
 {
@@ -2129,13 +2220,27 @@ administrator; TCP requires a bearer token or registered client certificate.
   "queue_peak": 80,
   "commit_ns_total": 182000000,
   "avg_batch_size": 8.0,
-  "avg_commit_us": 728.0
+  "avg_commit_us": 728.0,
+  "collection_metrics": [
+    {
+      "database": "default",
+      "collection": "orders",
+      "requests_total": 1200,
+      "read_ops_total": 900,
+      "write_requests_total": 300,
+      "cache_hits_total": 540,
+      "cache_misses_total": 360,
+      "errors_total": 2,
+      "avg_request_us": 1533.3
+    }
+  ],
+  "collection_metrics_overflow_total": 0
 }
 ```
 
 | Metric | Meaning |
 |---|---|
-| `requests_total` | HTTP `/v1/exec` requests |
+| `requests_total` | HTTP `/v1/exec` and `/v1/watch` requests |
 | `errors_total` | Error responses |
 | `read_ops_total` | Read operations handled |
 | `batch_ops_total` | Operations inside read batches |
@@ -2149,8 +2254,198 @@ administrator; TCP requires a bearer token or registered client certificate.
 | `ttl_sweep_errors_total` | Failed TTL sweeps |
 | `ttl_backlog` | Due entries observed by the last sweep |
 | `index_builds` | Active/recent index, text, fuzzy, and vector backfills with processed/total/elapsed |
+| `collection_metrics` | Per-`database/collection` requests, reads, writes, cache, errors, and latency |
+| `collection_metrics_overflow_total` | Requests omitted after the 4096-series cap |
 | `avg_batch_size` | Write ops per committed write transaction |
 | `avg_commit_us` | Average commit time in microseconds |
+
+## Authorization management API
+
+These endpoints manage the same `NONODB_AUTH_FILE` used by `nonodb-cli auth`.
+They require an enabled `admin:db` principal. Plaintext bearer tokens are
+returned only once by `POST /v1/auth/tokens`; the registry stores only their
+SHA-256 hashes. The daemon never logs token bodies.
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/v1/auth` | Registry generation, principals, token metadata, certificate metadata |
+| `POST` | `/v1/auth/principals` | Create a principal (`{"name","scopes"}`) |
+| `PUT` | `/v1/auth/principals/{name}` | Replace a principal's scopes (`{"scopes"}`) |
+| `DELETE` | `/v1/auth/principals/{name}` | Delete an unreferenced principal |
+| `POST` | `/v1/auth/tokens` | Create a token (`{"principal","kid"?}`); returns plaintext once |
+| `PATCH` | `/v1/auth/tokens/{kid}` | Enable/disable a token (`{"disabled":true|false}`) |
+| `POST` | `/v1/auth/certificates` | Register a client certificate (`{"sha256","principal"}`) |
+| `PATCH` | `/v1/auth/certificates/{sha256}` | Enable/disable a certificate (`{"disabled":true|false}`) |
+
+Example:
+
+```bash
+curl -s -H "Authorization: Bearer $NONODB_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{"name":"reporting","scopes":["read:app1/orders"]}' \
+  http://127.0.0.1:7878/v1/auth/principals
+```
+
+Mutations are validated and written atomically under the auth-file lock, then
+reloaded immediately. The API refuses changes that would leave no enabled
+administrator credential. A principal still referenced by a token or certificate
+cannot be deleted. All successful and failed mutations are written to the audit
+log when audit logging is enabled.
+
+### GET /readyz
+
+Public. Checks the writer thread and a real LMDB read transaction.
+
+```json
+{"ok":true,"checks":{"writer":true,"storage":true,"storage_error":null}}
+```
+
+Returns HTTP `503` with the same shape when the writer has stopped or LMDB
+cannot serve a read transaction.
+
+## Backup jobs API
+
+Scheduled backup jobs are managed under `/v1/backups`. All routes require
+`admin:db` or `*:*` because backup configuration can expose data and paths.
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/v1/backups` | Configured jobs plus last/next run, status, size, and errors |
+| `POST` | `/v1/backups/jobs` | Create or replace a job (`BackupJob` JSON) |
+| `DELETE` | `/v1/backups/jobs/{id}` | Delete a job and its state entry |
+| `POST` | `/v1/backups/jobs/{id}/run` | Start a job asynchronously |
+| `POST` | `/v1/backups/keygen` | Write a new age identity/recipient pair; returns only the public recipient |
+| `POST` | `/v1/backups/secret` | Write a generated restic password file with mode `0600` |
+
+`GET /v1/backups` also returns `key_dir`, `default_identity_file`,
+`default_recipient_file`, and `default_restic_password_file`. Key files default
+to `<NONODB_DATA>/backup-keys`, overridable with `NONODB_BACKUP_KEY_DIR`.
+
+Example job:
+
+```json
+{
+  "id": "nightly-default",
+  "databases": ["default", "app1"],
+  "enabled": true,
+  "every_minutes": 1440,
+  "destination": {
+    "kind": "local",
+    "path": "/var/backups/nonodb"
+  },
+  "encryption": {
+    "kind": "age",
+    "recipient_file": "/etc/nonodb/backup-recipient.txt"
+  },
+  "keep_last": 14,
+  "verify": true,
+  "compression": "gzip",
+  "exclude_collections": ["audit_scratch"]
+}
+```
+
+`compression` may be `none` (default) or `gzip`. It applies to native local/S3
+jobs and runs before optional age encryption. Restic manages its own
+compression. `databases` selects one or more databases for the job. The legacy `database`
+field is still accepted for existing configs; when both are present, `databases`
+wins. `exclude_collections` removes those collections from every selected
+database copy, including their indexes, history, TTL, events, and subscription
+metadata. The live databases are unchanged.
+
+`destination.kind` may be `local`, `s3`, or `restic`:
+
+```json
+{
+  "kind": "s3",
+  "endpoint": "https://<account>.r2.cloudflarestorage.com",
+  "bucket": "nonodb-backups",
+  "region": "auto",
+  "prefix": "prod/nonodb",
+  "access_key_env": "AWS_ACCESS_KEY_ID",
+  "secret_key_env": "AWS_SECRET_ACCESS_KEY",
+  "session_token_env": "AWS_SESSION_TOKEN"
+}
+```
+
+Restic destination:
+
+```json
+{
+  "kind": "restic",
+  "repository": "s3:https://<account>.r2.cloudflarestorage.com/bucket/prefix",
+  "password_file": "/etc/nonodb/restic-password",
+  "binary": "restic"
+}
+```
+
+Restic jobs must not also set `encryption`; restic handles encryption itself.
+
+Key generation:
+
+```json
+POST /v1/backups/keygen
+{"identity_file":"/etc/nonodb/backup-identity.txt","recipient_file":"/etc/nonodb/backup-recipient.txt"}
+```
+
+Returns `identity_file`, `recipient_file`, and the public `recipient`. Both files
+must not already exist. The identity is written with mode `0600` and is never
+returned.
+
+```json
+POST /v1/backups/secret
+{"path":"/etc/nonodb/restic-password"}
+```
+
+Writes a random restic password with mode `0600` and returns only the path.
+
+See [Backup and restore](backup.md#scheduled-backups-from-the-daemon-and-gui)
+for encryption keys, layouts, retention, and restore.
+
+## Import API
+
+Admin-only staged import of native backups into a new database. The live
+database is never replaced.
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/v1/import` | Allowed local roots and recent import jobs |
+| `POST` | `/v1/import/browse` | Discover backups in a local folder or S3/R2 prefix |
+| `POST` | `/v1/import/run` | Start a staged import into a new database |
+| `GET` | `/v1/import/status/{id}` | Import status and error |
+
+Browse example:
+
+```json
+POST /v1/import/browse
+{
+  "source": {
+    "kind": "s3",
+    "endpoint": "https://<account>.r2.cloudflarestorage.com",
+    "bucket": "nonodb-backups",
+    "region": "auto",
+    "prefix": "prod/nonodb",
+    "access_key_env": "AWS_ACCESS_KEY_ID",
+    "secret_key_env": "AWS_SECRET_ACCESS_KEY"
+  }
+}
+```
+
+Run example:
+
+```json
+POST /v1/import/run
+{
+  "source": {"kind": "local", "path": "/var/lib/nonodb/backups"},
+  "location": "/var/lib/nonodb/backups/nightly-default/1794599334414/default",
+  "target_database": "restored-default"
+}
+```
+
+Local locations must be under `NONODB_IMPORT_ROOTS` (default
+`<NONODB_DATA>/backups`). Encrypted imports require
+`NONODB_BACKUP_IDENTITY_FILE` in the daemon environment. The importer verifies
+the manifest checksum, decrypts/decompresses, runs deep LMDB verification, and
+refuses to overwrite an existing database.
 
 ## Error codes
 
@@ -2171,6 +2466,8 @@ administrator; TCP requires a bearer token or registered client certificate.
 | `invalid_numeric` | 400 | Invalid Extended JSON number or decimal arithmetic overflow |
 | `invalid_binary` | 400 | Invalid `$binary`/`$uuid` payload or base64 |
 | `invalid_object_id` | 400 | `$oid` is not 24 hexadecimal characters |
+| `invalid_auth_request` | 400/409 | Invalid auth mutation, referenced principal, or last-admin protection |
+| `auth_disabled` | 400 | Authorization registry is not configured |
 | `unauthorized` | 401 | Missing/invalid/disabled credential |
 | `forbidden` | 403 | Principal lacks the required scope |
 | `rate_limited` | 429 | Too many failed logins from this IP; wait and retry |

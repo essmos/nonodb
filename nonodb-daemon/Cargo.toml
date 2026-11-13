@@ -19,6 +19,10 @@ tokio = { version = "1", features = [
     "time",
 ] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
+fs2 = "0.4"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream"] }
+tokio-util = { version = "0.7", features = ["io"] }
+time = { version = "0.3", features = ["formatting"] }
 serde.workspace = true
 serde_json.workspace = true
 tracing = "0.1"

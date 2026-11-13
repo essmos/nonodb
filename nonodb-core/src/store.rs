@@ -7,6 +7,7 @@ use std::sync::{Condvar, Mutex};
 
 use heed::types::Bytes;
 use heed::{Database, Env, EnvFlags, EnvOpenOptions, RoTxn, RwTxn};
+use serde::Serialize;
 
 use crate::collection::Collection;
 use crate::error::{Error, Result};
@@ -67,6 +68,31 @@ pub const SCHEMA_VERSION: u32 = 1;
 /// LMDB technically supports larger values (overflow pages), but a large
 /// document means an expensive update (the whole value is rewritten).
 pub const MAX_DOCUMENT_BYTES: usize = 1024 * 1024;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CollectionSpace {
+    pub collection: String,
+    pub records: u64,
+    pub data_bytes: u64,
+    pub index_bytes: u64,
+    pub indexes: u64,
+    pub history_bytes: u64,
+    pub ttl_bytes: u64,
+    pub total_bytes: u64,
+    pub requests_last_minute: u64,
+    pub avg_requests_per_second: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DatabaseSpace {
+    pub map_size: u64,
+    pub used_bytes: u64,
+    pub free_bytes: u64,
+    pub page_size: u64,
+    pub total_records: u64,
+    pub collection_bytes: u64,
+    pub collections: Vec<CollectionSpace>,
+}
 
 /// Serializes transaction entry with an exclusive resize request.
 ///
@@ -1327,12 +1353,200 @@ impl Store {
         &self.env as *const _ as usize
     }
 
+    /// Drops a collection and its indexes, history, TTL, events, and
+    /// subscription metadata. The collection sub-database is cleared; callers
+    /// that need to reclaim file space must compact the environment afterwards.
+    ///
+    /// This is an offline/admin operation. The daemon should quiesce direct
+    /// access to the collection while it runs.
+    pub fn drop_collection(&self, name: &str) -> Result<bool> {
+        Self::validate_name(name)?;
+        let rtxn = self.read_txn()?;
+        let meta: Database<Bytes, Bytes> = self
+            .env
+            .open_database(&rtxn, Some(META_DB))?
+            .ok_or_else(|| Error::Query("meta database missing".into()))?;
+        if meta
+            .get(&rtxn, format!("collection:{name}").as_bytes())?
+            .is_none()
+        {
+            rtxn.commit()?;
+            return Ok(false);
+        }
+        let Some(collection) = self.collection_at(&rtxn, name)? else {
+            rtxn.commit()?;
+            return Ok(false);
+        };
+        let indexes = collection.index_defs_in(&rtxn)?;
+        let vectors = collection.list_vector_indexes_in(&rtxn)?;
+        let texts = collection.list_text_indexes_in(&rtxn)?;
+        let fuzzies = collection.list_fuzzy_indexes_in(&rtxn)?;
+        rtxn.commit()?;
+
+        let collection = self.collection(name)?;
+        for def in indexes {
+            collection.drop_index(&def.name())?;
+        }
+        for def in vectors {
+            collection.drop_vector_index(&def.field)?;
+        }
+        for field in texts {
+            collection.drop_text_index(&field)?;
+        }
+        for field in fuzzies {
+            collection.drop_fuzzy_index(&field)?;
+        }
+
+        let mut wtxn = self.write_txn()?;
+        if let Some(db) = self.env.open_database::<Bytes, Bytes>(&wtxn, Some(name))? {
+            db.clear(&mut wtxn)?;
+        }
+        let meta: Database<Bytes, Bytes> = self.env.create_database(&mut wtxn, Some(META_DB))?;
+        let exact = [
+            format!("collection:{name}"),
+            format!("profile:{name}"),
+            format!("history:{name}"),
+            format!("events:{name}"),
+            format!("ttl:{name}"),
+            format!("ttl_purge:{name}"),
+            subscriptions::meta_key(name),
+        ];
+        let prefixes = [
+            format!("index:{name}:"),
+            format!("vecdef:{name}:"),
+            format!("text:{name}:"),
+            format!("fuzzy:{name}:"),
+            format!("fttotal:{name}:"),
+        ];
+        let mut meta_keys = Vec::new();
+        for item in meta.iter(&wtxn)? {
+            let (key, _) = item?;
+            if exact.iter().any(|item| item.as_bytes() == key)
+                || prefixes
+                    .iter()
+                    .any(|prefix| key.starts_with(prefix.as_bytes()))
+            {
+                meta_keys.push(key.to_vec());
+            }
+        }
+        for key in meta_keys {
+            meta.delete(&mut wtxn, key.as_slice())?;
+        }
+
+        let mut history_keys = Vec::new();
+        for item in self.history.iter(&wtxn)? {
+            let (key, _) = item?;
+            if history::parse_key(key).is_some_and(|(coll, _, _)| coll == name) {
+                history_keys.push(key.to_vec());
+            }
+        }
+        for key in history_keys {
+            self.history.delete(&mut wtxn, key.as_slice())?;
+        }
+
+        let mut ttl_keys = Vec::new();
+        for item in self.ttl.iter(&wtxn)? {
+            let (key, _) = item?;
+            let matches = ttl::parse_expiry_key(key).is_some_and(|(_, coll, _)| coll == name)
+                || ttl::parse_id_key(key).is_some_and(|(coll, _)| coll == name);
+            if matches {
+                ttl_keys.push(key.to_vec());
+            }
+        }
+        for key in ttl_keys {
+            self.ttl.delete(&mut wtxn, key.as_slice())?;
+        }
+
+        wtxn.commit()?;
+        Ok(true)
+    }
+
     /// List of registered collections.
     pub fn collections(&self) -> Result<Vec<String>> {
         let rtxn = self.read_txn()?;
         let out = self.collections_in(&rtxn)?;
         rtxn.commit()?;
         Ok(out)
+    }
+
+    /// Per-collection record counts and storage estimates for the current
+    /// database. Data/index bytes use LMDB B-tree page allocation; history and
+    /// TTL bytes are measured from shared key/value entries. The file
+    /// high-water mark can be larger because LMDB does not shrink the file and
+    /// freed pages may remain allocated.
+    pub fn storage_stats(&self) -> Result<DatabaseSpace> {
+        let rtxn = self.read_txn()?;
+        let names = self.collections_in(&rtxn)?;
+        let history_db: Option<Database<Bytes, Bytes>> =
+            self.env.open_database(&rtxn, Some(HISTORY_DB))?;
+        let ttl_db: Option<Database<Bytes, Bytes>> = self.env.open_database(&rtxn, Some(TTL_DB))?;
+        let mut history = HashMap::<String, u64>::new();
+        let mut ttl = HashMap::<String, u64>::new();
+
+        if let Some(db) = history_db {
+            for item in db.iter(&rtxn)? {
+                let (key, value) = item?;
+                if let Some((collection, _, _)) = history::parse_key(key) {
+                    let bytes = (key.len() + value.len()) as u64;
+                    *history.entry(collection.to_string()).or_default() += bytes;
+                }
+            }
+        }
+        if let Some(db) = ttl_db {
+            for item in db.iter(&rtxn)? {
+                let (key, value) = item?;
+                let collection = ttl::parse_expiry_key(key)
+                    .map(|(_, collection, _)| collection)
+                    .or_else(|| ttl::parse_id_key(key).map(|(collection, _)| collection));
+                if let Some(collection) = collection {
+                    let bytes = (key.len() + value.len()) as u64;
+                    *ttl.entry(collection.to_string()).or_default() += bytes;
+                }
+            }
+        }
+
+        let mut collections = Vec::with_capacity(names.len());
+        let mut total_records = 0u64;
+        let mut collection_bytes = 0u64;
+        for name in names {
+            let Some(collection) = self.collection_at(&rtxn, &name)? else {
+                continue;
+            };
+            let stats = collection.storage_stats(&rtxn)?;
+            let history_bytes = history.get(&name).copied().unwrap_or(0);
+            let ttl_bytes = ttl.get(&name).copied().unwrap_or(0);
+            let total = stats
+                .data_bytes
+                .saturating_add(stats.index_bytes)
+                .saturating_add(history_bytes)
+                .saturating_add(ttl_bytes);
+            total_records = total_records.saturating_add(stats.records);
+            collection_bytes = collection_bytes.saturating_add(total);
+            collections.push(CollectionSpace {
+                collection: name,
+                records: stats.records,
+                data_bytes: stats.data_bytes,
+                index_bytes: stats.index_bytes,
+                indexes: stats.indexes,
+                history_bytes,
+                ttl_bytes,
+                total_bytes: total,
+                requests_last_minute: 0,
+                avg_requests_per_second: 0.0,
+            });
+        }
+        let map_size = self.map_size() as u64;
+        let used_bytes = self.map_used_bytes() as u64;
+        rtxn.commit()?;
+        Ok(DatabaseSpace {
+            map_size,
+            used_bytes,
+            free_bytes: map_size.saturating_sub(used_bytes),
+            page_size: PAGE_SIZE as u64,
+            total_records,
+            collection_bytes,
+            collections,
+        })
     }
 
     /// List of collections in the given read transaction.
@@ -1358,6 +1572,38 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::parse_size;
+
+    #[test]
+    fn drop_collection_removes_data_indexes_and_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = super::Store::open(dir.path()).unwrap();
+        let users = store
+            .create_collection("users", crate::vault::CollectionProfile::Standard)
+            .unwrap();
+        users
+            .insert_one(serde_json::json!({"name": "Ala"}))
+            .unwrap();
+        users.create_index("name", true).unwrap();
+        store.set_collection_history("users", 5).unwrap();
+        let orders = store
+            .create_collection("orders", crate::vault::CollectionProfile::Standard)
+            .unwrap();
+        orders.insert_one(serde_json::json!({"n": 1})).unwrap();
+
+        assert!(store.drop_collection("users").unwrap());
+        assert_eq!(store.collections().unwrap(), vec!["orders".to_string()]);
+        assert!(!store.drop_collection("users").unwrap());
+        let env = store.env().clone();
+        drop(users);
+        drop(orders);
+        drop(store);
+        env.prepare_for_closing().wait();
+
+        let report = crate::verify_data_dir(dir.path()).unwrap();
+        assert!(report.collections.contains_key("orders"));
+        assert!(!report.collections.contains_key("users"));
+        assert_eq!(report.history_entries, 0);
+    }
 
     #[test]
     fn parses_map_sizes() {

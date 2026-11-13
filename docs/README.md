@@ -22,6 +22,7 @@ quick-start instructions, and a feature overview.
 | [Migration and import](migration.md) | Application developers, operators | MongoDB, PostgreSQL, SQLite, CSV conversion; NDJSON format; import manifest; validation and cutover |
 | [Authentication and permissions](auth.md) | Operators, security reviewers | Principals, scopes, hashed tokens, certificate registry, lockout, reloads, audit log |
 | [Security checks](security-check.md) | Operators, security reviewers, maintainers | Local security regression checks, LiveAPISec audit method, results, hardening gaps, production checklist |
+| [Monitoring and alerting](monitoring.md) | Operators, SRE | Health/readiness, Prometheus endpoint, metrics:read token, OpenTelemetry Collector, disk/snapshot metrics, alerts |
 | [Mutual TLS](mtls.md) | Operators, security reviewers | Private CA setup, client certificates, fingerprint mapping, revocation, rotation, troubleshooting |
 | [Python client](python-client.md) | Python developers | Connection, CRUD, upsert, indexes, search, batches, cache, FastAPI |
 | [Background jobs](workers.md) | Application developers, operators | Durable jobs, workers, leases, retries, cron/systemd, languages |
@@ -30,7 +31,7 @@ quick-start instructions, and a feature overview.
 | [Streaming outbox events](streams.md) | Application developers | Long-poll `watch`, NDJSON/SSE streams, resume tokens, filters, truncation, Python/Rust/Node.js/Go examples |
 | [CLI](cli.md) | Operators | Administration, map resize, backup verification, restore drills, inspect, raw requests |
 | [Operations](operations.md) | Operators, SRE | Configuration, deployment, security, snapshots, monitoring, capacity, troubleshooting |
-| [Backup and restore](backup.md) | Operators, SRE | Online backup, snapshots, verification, restore drills, Docker, vault keys, authorization state, recovery |
+| [Backup and restore](backup.md) | Operators, SRE | Online backup, GUI backup/import, snapshots, verification, restore drills, Docker, vault keys, authorization state, recovery |
 | [Benchmarks](benchmarks.md) | Evaluators, maintainers | Environment, methodology, throughput, latency, memory, large-data results |
 | [Development](development.md) | Contributors | Repository layout, build, tests, scripts, conventions |
 | [Roadmap and limits](roadmap.md) | Everyone | Supported features, deliberate limitations, future work |
@@ -61,6 +62,7 @@ quick-start instructions, and a feature overview.
 - **Store money and exact decimals:** [Numbers and decimals](numerics.md)
 - **Use binary, UUID, ObjectId, or `$type`:** [BSON scalar types](bson-types.md)
 - **Back up and restore:** [Backup and restore](backup.md)
+- **Import a backup as a new database:** [Import wizard](backup.md#import-wizard)
 - **Tune timeouts for index builds:** [Timeouts](operations.md#timeouts-and-long-operations)
 - **Understand memory usage:** [Capacity and memory](operations.md#capacity-and-memory)
 - **Reproduce performance numbers:** [Benchmarks](benchmarks.md#reproducing)

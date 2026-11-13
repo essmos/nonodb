@@ -19,7 +19,10 @@ COPY --from=gui /src/gui/dist ./gui/dist
 RUN cargo build --release --bin nonodb-daemon --bin nonodb-cli
 
 FROM debian:bookworm-slim
-RUN useradd --system --home /var/lib/nonodb --shell /usr/sbin/nologin nonodb \
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates restic \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --home /var/lib/nonodb --shell /usr/sbin/nologin nonodb \
     && mkdir -p /var/lib/nonodb /run/nonodb \
     && chown -R nonodb:nonodb /var/lib/nonodb /run/nonodb
 COPY --from=builder /src/target/release/nonodb-daemon /usr/local/bin/nonodb-daemon
@@ -32,5 +35,7 @@ ENV NONODB_DATA=/var/lib/nonodb \
 USER nonodb
 EXPOSE 8787
 VOLUME ["/var/lib/nonodb"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD ["/usr/local/bin/nonodb-cli", "ready"]
 # Gniazdo jest plikiem w /run/nonodb — montuj katalog, nie plik.
 CMD ["/usr/local/bin/nonodb-daemon"]
