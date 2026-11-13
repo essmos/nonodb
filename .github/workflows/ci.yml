@@ -79,6 +79,9 @@ jobs:
           go test ./...
           go vet ./...
 
+      - name: Build debug binaries for integration tests
+        run: cargo build --locked --bins
+
       - name: Run client integration smoke tests
         run: bash scripts/clients_test.sh
 
