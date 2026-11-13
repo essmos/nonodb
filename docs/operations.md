@@ -29,7 +29,10 @@ by the uid/gid allow-list).
 
 ## Configuration
 
-All daemon configuration is through environment variables.
+All daemon configuration is through environment variables. A grouped template
+is available at [`.env.example`](../.env.example); copy it to `.env` and adjust
+the values for the host. `.env` is ignored by git and must not contain committed
+secrets.
 
 | Variable | Default | Description |
 |---|---|---|
