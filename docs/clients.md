@@ -275,6 +275,29 @@ The Go client methods take a `context.Context`; use it for cancellation and
 deadlines. `Exec` is available for operations not covered by a convenience
 method.
 
+## Write durability
+
+All write payloads accept an optional `durability` field:
+
+```json
+{"op":"insert_many","coll":"imports","docs":[...],"durability":"relaxed"}
+```
+
+Python helpers expose it directly:
+
+```python
+users.insert(doc, durability="relaxed")
+users.insert_many(docs, durability="relaxed")
+users.update(filter, {"$set": {"x": 1}}, durability="full")
+db.write_batch(ops, durability="relaxed")
+db.sync()
+```
+
+Rust, Node.js, and Go clients can send the same field through their normal
+`exec`/`Exec` payload. `full` is the default. `unsafe` requires
+`NONODB_ALLOW_UNSAFE_WRITES=1` on the daemon. See
+[Write durability](api.md#write-durability) for guarantees and risks.
+
 ## Batch lookups
 
 `lookup` fetches documents by `_id` or a unique index in one request,

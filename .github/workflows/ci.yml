@@ -79,6 +79,18 @@ jobs:
       - name: Run client integration smoke tests
         run: bash scripts/clients_test.sh
 
+      - name: Run multi-database, GUI, and live-stream tests
+        env:
+          NONODB_BIN: target/release/nonodb-daemon
+          NONODB_DAEMON: target/release/nonodb-daemon
+          NONODB_CLI: target/release/nonodb-cli
+        run: |
+          python3 scripts/multi_database_test.py
+          python3 scripts/multi_database_features_test.py
+          python3 scripts/durability_test.py
+          python3 scripts/gui_test.py
+          python3 scripts/live_watch_test.py
+
   gui:
     name: Build GUI
     runs-on: ubuntu-latest

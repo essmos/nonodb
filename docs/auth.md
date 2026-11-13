@@ -86,7 +86,11 @@ version make the file invalid.
 | `write:<collection>` | insert, insert_many, update, find_and_modify, delete, SQL `INSERT`/`UPDATE` |
 | `admin:<collection>` | create/drop collection, create/drop secondary/text/fuzzy/vector index, set collection TTL, set collection history, set collection events, create/renew/delete subscription |
 | `admin:db` | map_info, resize_map, `/metrics` |
-| `read:*` / `write:*` / `admin:*` | The action on every collection |
+| `read:*` / `write:*` / `admin:*` | The action on every collection in every database |
+| `read:<database>/<collection>` | Same read actions, limited to one database |
+| `write:<database>/<collection>` | Same write actions, limited to one database |
+| `admin:<database>/<collection>` | Collection administration, limited to one database |
+| `read:<database>/*` | Read every collection in one database |
 | `*:*` | Everything |
 
 Rules:
@@ -96,8 +100,12 @@ Rules:
 - `admin:<collection>` does not imply `read` or `write`.
 - `write_batch` is checked per operation; one forbidden collection rejects the
   whole request before any write happens.
+- Unqualified collection scopes such as `read:orders` apply to that collection
+  name in every database. Use `read:app1/orders` to restrict one database.
 - `list_collections` returns only collections visible through any collection
   scope. A principal with `read:orders` does not learn that `customers` exists.
+- Database management (`create_database`, `drop_database`, `map_info`,
+  `resize_map`, `/metrics`) still requires global `admin:db` or `*:*`.
 - `/healthz` is public. `/metrics` requires `admin:db`.
 - If both a client certificate and a bearer token are used, they must resolve to
   the same principal.

@@ -43,14 +43,16 @@ Non-goals are listed in [Roadmap and limits](roadmap.md).
                                               │  └──────────┬───────────┘  │
                                               └─────────────┼──────────────┘
                                                             │
-                                                   ┌────────▼────────┐
-                                                   │ LMDB environment│
-                                                   │ data.mdb        │
-                                                   │ lock.mdb        │
-                                                   └─────────────────┘
+                                                   ┌────────▼─────────────────┐
+                                                   │ LMDB environment per DB  │
+                                                   │ <db>/data.mdb, lock.mdb  │
+                                                   └──────────────────────────┘
 ```
 
-Only `nonodb-daemon` opens the LMDB environment. Read requests are executed on
+Only `nonodb-daemon` opens LMDB environments. Each database has its own
+environment and writer thread; there is never more than one writer per
+environment. With multiple databases, reads and writes in different databases
+are independent. See [Multiple databases](multi-database.md). Read requests are executed on
 blocking worker threads (Tokio's `spawn_blocking`); write requests are sent to a
 dedicated writer thread over an `mpsc` channel. The HTTP layer never performs
 storage work on the async runtime.

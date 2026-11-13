@@ -299,6 +299,11 @@ impl<'e> Collection<'e> {
         }
     }
 
+    /// Identifier of the owning LMDB environment.
+    pub fn store_id(&self) -> usize {
+        self.env as *const _ as usize
+    }
+
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -5277,7 +5282,12 @@ impl<'e> Collection<'e> {
 
     fn write_txn(&self) -> Result<crate::store::WriteTxn<'_>> {
         let guard = self.txn_gate.enter();
-        Ok(crate::store::WriteTxn::new(self.env.write_txn()?, guard))
+        Ok(crate::store::WriteTxn::new(
+            self.env.write_txn()?,
+            guard,
+            self.env,
+            true,
+        ))
     }
 }
 

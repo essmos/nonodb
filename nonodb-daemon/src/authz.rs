@@ -4,13 +4,19 @@ use nonodb_auth::{Action, Principal};
 
 use crate::protocol::{ApiError, Request, WriteOp};
 
-pub fn authorize_request(principal: &Principal, req: &Request) -> Result<(), ApiError> {
+pub fn authorize_request(
+    principal: &Principal,
+    req: &Request,
+    database: &str,
+) -> Result<(), ApiError> {
     match req {
         Request::Insert { coll, .. }
         | Request::InsertMany { coll, .. }
         | Request::Update { coll, .. }
         | Request::FindAndModify { coll, .. }
-        | Request::Delete { coll, .. } => allow(principal, Action::Write, coll, req.op_name()),
+        | Request::Delete { coll, .. } => {
+            allow(principal, Action::Write, database, coll, req.op_name())
+        }
 
         Request::Find { coll, .. }
         | Request::FindOne { coll, .. }
@@ -34,7 +40,7 @@ pub fn authorize_request(principal: &Principal, req: &Request) -> Result<(), Api
         | Request::GetCollectionHistory { coll }
         | Request::GetCollectionEvents { coll }
         | Request::ListSubscriptions { coll } => {
-            allow(principal, Action::Read, coll, req.op_name())
+            allow(principal, Action::Read, database, coll, req.op_name())
         }
 
         Request::Sql { query, .. } => {
@@ -48,14 +54,14 @@ pub fn authorize_request(principal: &Principal, req: &Request) -> Result<(), Api
             } else {
                 Action::Write
             };
-            allow(principal, action, &coll, req.op_name())
+            allow(principal, action, database, &coll, req.op_name())
         }
         Request::ExplainSql { query, .. } => {
             let coll = nonodb_core::sql::collection_name(query).map_err(|e| ApiError {
                 code: "invalid_sql".into(),
                 message: e.to_string(),
             })?;
-            allow(principal, Action::Read, &coll, req.op_name())
+            allow(principal, Action::Read, database, &coll, req.op_name())
         }
 
         Request::CreateIndex { coll, .. }
@@ -73,11 +79,20 @@ pub fn authorize_request(principal: &Principal, req: &Request) -> Result<(), Api
         | Request::SetCollectionEvents { coll, .. }
         | Request::CreateSubscription { coll, .. }
         | Request::RenewSubscription { coll, .. }
-        | Request::DeleteSubscription { coll, .. } => {
-            allow(principal, Action::AdminCollection, coll, req.op_name())
-        }
+        | Request::DeleteSubscription { coll, .. } => allow(
+            principal,
+            Action::AdminCollection,
+            database,
+            coll,
+            req.op_name(),
+        ),
 
-        Request::MapInfo | Request::ResizeMap { .. } => {
+        Request::ListDatabases => Ok(()),
+        Request::CreateDatabase { .. }
+        | Request::DropDatabase { .. }
+        | Request::Sync
+        | Request::MapInfo
+        | Request::ResizeMap { .. } => {
             if principal.allows_admin_database() {
                 Ok(())
             } else {
@@ -91,41 +106,47 @@ pub fn authorize_request(principal: &Principal, req: &Request) -> Result<(), Api
         Request::ListCollections => Ok(()),
         Request::Batch { ops } => {
             for op in ops {
-                authorize_request(principal, op)?;
+                authorize_request(principal, op, database)?;
             }
             Ok(())
         }
-        Request::WriteBatch { ops } => {
+        Request::WriteBatch { ops, .. } => {
             for op in ops {
-                authorize_write_op(principal, op)?;
+                authorize_write_op(principal, op, database)?;
             }
             Ok(())
         }
     }
 }
 
-pub fn authorize_write_op(principal: &Principal, op: &WriteOp) -> Result<(), ApiError> {
+pub fn authorize_write_op(
+    principal: &Principal,
+    op: &WriteOp,
+    database: &str,
+) -> Result<(), ApiError> {
     let coll = match op {
         WriteOp::Insert { coll, .. }
         | WriteOp::InsertMany { coll, .. }
         | WriteOp::Update { coll, .. }
         | WriteOp::Delete { coll, .. } => coll,
     };
-    allow(principal, Action::Write, coll, op.op_name())
+    allow(principal, Action::Write, database, coll, op.op_name())
 }
 
 fn allow(
     principal: &Principal,
     action: Action,
+    database: &str,
     coll: &str,
     op: &'static str,
 ) -> Result<(), ApiError> {
-    if principal.allows(action, coll) {
+    if principal.allows(action, database, coll) {
         Ok(())
     } else {
         tracing::warn!(
             principal = principal.name(),
             op,
+            database,
             coll,
             "authorization denied"
         );
@@ -147,14 +168,15 @@ mod tests {
         Request::Insert {
             coll: coll.into(),
             doc: json!({"x": 1}),
+            durability: None,
         }
     }
 
     #[test]
     fn collection_scopes_are_enforced() {
         let app = principal(&["read:orders", "write:orders", "admin:db"]);
-        assert!(authorize_request(&app, &insert("orders")).is_ok());
-        assert!(authorize_request(&app, &insert("customers")).is_err());
+        assert!(authorize_request(&app, &insert("orders"), "default").is_ok());
+        assert!(authorize_request(&app, &insert("customers"), "default").is_err());
         assert!(authorize_request(
             &app,
             &Request::Find {
@@ -164,7 +186,8 @@ mod tests {
                 sort: vec![],
                 skip: 0,
                 limit: None,
-            }
+            },
+            "default"
         )
         .is_ok());
         assert!(authorize_request(
@@ -176,23 +199,26 @@ mod tests {
                 sort: vec![],
                 skip: 0,
                 limit: None,
-            }
+            },
+            "default"
         )
         .is_err());
-        assert!(authorize_request(&app, &Request::MapInfo).is_ok());
+        assert!(authorize_request(&app, &Request::MapInfo, "default").is_ok());
     }
 
     #[test]
     fn write_batch_is_checked_per_operation() {
         let app = principal(&["write:orders"]);
         let ok = Request::WriteBatch {
+            durability: None,
             ops: vec![WriteOp::Insert {
                 coll: "orders".into(),
                 doc: json!({"x": 1}),
             }],
         };
-        assert!(authorize_request(&app, &ok).is_ok());
+        assert!(authorize_request(&app, &ok, "default").is_ok());
         let mixed = Request::WriteBatch {
+            durability: None,
             ops: vec![
                 WriteOp::Insert {
                     coll: "orders".into(),
@@ -204,7 +230,7 @@ mod tests {
                 },
             ],
         };
-        assert!(authorize_request(&app, &mixed).is_err());
+        assert!(authorize_request(&app, &mixed, "default").is_err());
     }
 
     #[test]
@@ -218,10 +244,10 @@ mod tests {
             include: vec![],
             geo: false,
         };
-        assert!(authorize_request(&writer, &index).is_err());
+        assert!(authorize_request(&writer, &index, "default").is_err());
         let admin = principal(&["admin:orders"]);
-        assert!(authorize_request(&admin, &index).is_ok());
-        assert!(authorize_request(&admin, &Request::MapInfo).is_err());
+        assert!(authorize_request(&admin, &index, "default").is_ok());
+        assert!(authorize_request(&admin, &Request::MapInfo, "default").is_err());
     }
 
     #[test]
@@ -230,61 +256,67 @@ mod tests {
         let ok = Request::Sql {
             query: "SELECT * FROM orders WHERE id = $1".into(),
             params: vec![json!(1)],
+            durability: None,
         };
-        assert!(authorize_request(&reader, &ok).is_ok());
+        assert!(authorize_request(&reader, &ok, "default").is_ok());
 
         let denied = Request::Sql {
             query: "SELECT * FROM customers".into(),
             params: vec![],
+            durability: None,
         };
-        assert!(authorize_request(&reader, &denied).is_err());
+        assert!(authorize_request(&reader, &denied, "default").is_err());
 
         let write = Request::Sql {
             query: "INSERT INTO orders (id) VALUES ($1)".into(),
             params: vec![json!(1)],
+            durability: None,
         };
-        assert!(authorize_request(&principal(&["write:orders"]), &write).is_ok());
-        assert!(authorize_request(&reader, &write).is_err());
+        assert!(authorize_request(&principal(&["write:orders"]), &write, "default").is_ok());
+        assert!(authorize_request(&reader, &write, "default").is_err());
         let update = Request::Sql {
             query: "UPDATE orders SET id = $1 WHERE id = $2".into(),
             params: vec![json!(2), json!(1)],
+            durability: None,
         };
-        assert!(authorize_request(&principal(&["write:orders"]), &update).is_ok());
-        assert!(authorize_request(&reader, &update).is_err());
+        assert!(authorize_request(&principal(&["write:orders"]), &update, "default").is_ok());
+        assert!(authorize_request(&reader, &update, "default").is_err());
 
         let explain = Request::ExplainSql {
             query: "SELECT * FROM orders".into(),
             params: vec![],
         };
-        assert!(authorize_request(&reader, &explain).is_ok());
+        assert!(authorize_request(&reader, &explain, "default").is_ok());
         let explain_denied = Request::ExplainSql {
             query: "SELECT * FROM customers".into(),
             params: vec![],
         };
-        assert!(authorize_request(&reader, &explain_denied).is_err());
+        assert!(authorize_request(&reader, &explain_denied, "default").is_err());
 
         let delete = Request::Sql {
             query: "DELETE FROM orders WHERE id = $1".into(),
             params: vec![json!(1)],
+            durability: None,
         };
-        assert!(authorize_request(&principal(&["write:orders"]), &delete).is_ok());
-        assert!(authorize_request(&reader, &delete).is_err());
+        assert!(authorize_request(&principal(&["write:orders"]), &delete, "default").is_ok());
+        assert!(authorize_request(&reader, &delete, "default").is_err());
 
         let bad = Request::Sql {
             query: "CREATE TABLE orders (id INT)".into(),
             params: vec![],
+            durability: None,
         };
-        let err = authorize_request(&reader, &bad).unwrap_err();
+        let err = authorize_request(&reader, &bad, "default").unwrap_err();
         assert_eq!(err.code, "invalid_sql");
     }
 
     #[test]
     fn wildcard_scopes_work() {
         let all = principal(&["*:*"]);
-        assert!(authorize_request(&all, &insert("anything")).is_ok());
-        assert!(authorize_request(&all, &Request::MapInfo).is_ok());
+        assert!(authorize_request(&all, &insert("anything"), "default").is_ok());
+        assert!(authorize_request(&all, &Request::MapInfo, "default").is_ok());
         let reader = principal(&["read:*"]);
-        assert!(authorize_request(&reader, &insert("anything")).is_err());
+        assert!(authorize_request(&reader, &insert("anything"), "default").is_err());
         assert!(authorize_request(
             &reader,
             &Request::Find {
@@ -294,7 +326,41 @@ mod tests {
                 sort: vec![],
                 skip: 0,
                 limit: None,
-            }
+            },
+            "default"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn database_qualified_scopes_are_enforced() {
+        let app = principal(&["read:app1/orders", "write:app1/orders", "admin:app2/*"]);
+        assert!(authorize_request(&app, &insert("orders"), "app1").is_ok());
+        assert!(authorize_request(&app, &insert("orders"), "app2").is_err());
+        assert!(authorize_request(&app, &insert("customers"), "app1").is_err());
+        let index = Request::CreateIndex {
+            coll: "anything".into(),
+            field: Some("x".into()),
+            fields: None,
+            unique: false,
+            include: vec![],
+            geo: false,
+        };
+        assert!(authorize_request(&app, &index, "app2").is_ok());
+        assert!(authorize_request(&app, &index, "app1").is_err());
+        let legacy = principal(&["read:orders"]);
+        assert!(authorize_request(&legacy, &insert("orders"), "app1").is_err());
+        assert!(authorize_request(
+            &legacy,
+            &Request::Find {
+                coll: "orders".into(),
+                filter: json!({}),
+                projection: None,
+                sort: vec![],
+                skip: 0,
+                limit: None,
+            },
+            "app1"
         )
         .is_ok());
     }

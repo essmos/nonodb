@@ -26,7 +26,8 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    strip_db_flag(&mut args)?;
     let Some(cmd) = args.first().map(String::as_str) else {
         return usage();
     };
@@ -35,6 +36,23 @@ fn run() -> Result<(), String> {
         "ping" => {
             let res = http_get("/healthz")?;
             println!("{}", serde_json::to_string_pretty(&res).unwrap());
+        }
+        "databases" => {
+            let action = args.get(1).map(String::as_str).unwrap_or("list");
+            let payload = match action {
+                "list" => json!({"op": "list_databases"}),
+                "create" => json!({
+                    "op": "create_database",
+                    "name": args.get(2).ok_or("użycie: nonodb-cli databases create <nazwa>")?,
+                }),
+                "drop" => json!({
+                    "op": "drop_database",
+                    "name": args.get(2).ok_or("użycie: nonodb-cli databases drop <nazwa>")?,
+                }),
+                other => return Err(format!("nieznana akcja databases: {other}")),
+            };
+            let res = http_post("/v1/exec", &payload)?;
+            print_result(&res);
         }
         "exec" => {
             let raw = args.get(1).ok_or("użycie: nonodb-cli exec '<json>'")?;
@@ -121,6 +139,10 @@ fn run() -> Result<(), String> {
         }
         "map" => {
             let res = http_post("/v1/exec", &json!({"op": "map_info"}))?;
+            print_result(&res);
+        }
+        "sync" => {
+            let res = http_post("/v1/exec", &json!({"op": "sync"}))?;
             print_result(&res);
         }
         "events" => {
@@ -239,9 +261,10 @@ fn run() -> Result<(), String> {
                 args.get(2)
                     .ok_or("użycie: nonodb-cli backup <data-dir> <out-dir>")?,
             );
-            backup(&data, &out)?;
-            let manifest =
-                nonodb_core::BackupManifest::from_backup(&out, &data).map_err(|e| e.to_string())?;
+            let source = database_dir(&data)?;
+            backup(&source, &out)?;
+            let manifest = nonodb_core::BackupManifest::from_backup(&out, &source)
+                .map_err(|e| e.to_string())?;
             nonodb_core::verify::write_manifest(&out, &manifest).map_err(|e| e.to_string())?;
             eprintln!(
                 "manifest: {} (sha256 {})",
@@ -249,12 +272,37 @@ fn run() -> Result<(), String> {
                 manifest.sha256
             );
         }
+        "backup-all" => {
+            let data = PathBuf::from(
+                args.get(1)
+                    .ok_or("użycie: nonodb-cli backup-all <data-root> <out-dir>")?,
+            );
+            let out = PathBuf::from(
+                args.get(2)
+                    .ok_or("użycie: nonodb-cli backup-all <data-root> <out-dir>")?,
+            );
+            backup_all(&data, &out)?;
+        }
+        "restore-all" => {
+            let backup = PathBuf::from(
+                args.get(1)
+                    .ok_or("użycie: nonodb-cli restore-all <backup-dir> <data-root> [--force]")?,
+            );
+            let data = PathBuf::from(
+                args.get(2)
+                    .ok_or("użycie: nonodb-cli restore-all <backup-dir> <data-root> [--force]")?,
+            );
+            let force = args.iter().any(|a| a == "--force");
+            let verify = args.iter().any(|a| a == "--verify");
+            restore_all(&backup, &data, force, verify)?;
+        }
         "verify" => {
             let data = PathBuf::from(
                 args.get(1)
                     .ok_or("użycie: nonodb-cli verify <data-dir> [--json]")?,
             );
-            let report = nonodb_core::verify_data_dir(&data).map_err(|e| e.to_string())?;
+            let source = database_dir(&data)?;
+            let report = nonodb_core::verify_data_dir(&source).map_err(|e| e.to_string())?;
             if args.iter().any(|a| a == "--json") {
                 println!(
                     "{}",
@@ -291,7 +339,8 @@ fn run() -> Result<(), String> {
                 args.get(1)
                     .ok_or("użycie: nonodb-cli inspect <data-dir> [kolekcja]")?,
             );
-            inspect(&data, args.get(2).map(String::as_str))?;
+            let source = database_dir(&data)?;
+            inspect(&source, args.get(2).map(String::as_str))?;
         }
         "restore" => {
             let backup = PathBuf::from(
@@ -304,7 +353,8 @@ fn run() -> Result<(), String> {
             );
             let force = args.iter().any(|a| a == "--force");
             let verify = args.iter().any(|a| a == "--verify");
-            restore(&backup, &data, force, verify)?;
+            let target = database_target(&data)?;
+            restore(&backup, &target, force, verify)?;
         }
         "-h" | "--help" | "help" => return usage(),
         other => return Err(format!("nieznana komenda: {other} (spróbuj `help`)")),
@@ -320,21 +370,27 @@ fn usage() -> Result<(), String> {
          gui [--port N] [--no-open]  lokalne GUI w przeglądarce\n\
          ping                       sprawdź daemona\n\
          exec '<json>'              dowolne żądanie /v1/exec\n\
+         databases [list|create <nazwa>|drop <nazwa>]  bazy w jednym daemonie\n\
          collections                lista kolekcji\n\
          count <coll> [filtr]       liczba dokumentów\n\
          find <coll> [filtr] [--sort pole:asc|desc] [--limit N] [--skip N]\n\
          indexes <coll>             indeksy kolekcji\n\
          auth <komenda>             zarządzanie auth.json (init/principal/token/cert/check)\n\
          map                        rozmiar mapy LMDB i zajęte bajty\n\
+         sync                       wymuś fsync wybranej bazy\n\
          resize <rozmiar>           powiększ mapę online, np. 4GiB\n\
-         backup <data> <out>        kopia LMDB + manifest.json (także przy działającym daemonie)\n\
-         verify <data> [--json]     głęboka weryfikacja dokumentów i indeksów\n\
+         backup <data> <out>        kopia wybranej bazy (--db) + manifest.json\n\
+         backup-all <data> <out>    kopia wszystkich baz + manifest instancji\n\
+         verify <data> [--json]     głęboka weryfikacja wybranej bazy i indeksów\n\
          verify-backup <backup> [--json]  sprawdź manifest, sumę SHA-256 i zawartość\n\
-         inspect <data> [coll]      statystyki bazy/kolekcji\n\
-         restore <backup> <data> [--force] [--verify]  przywróć data.mdb (najpierw zatrzymaj daemona)\n\
+         inspect <data> [coll]      statystyki bazy/kolekcji (--db wybiera bazę)\n\
+         restore <backup> <data> [--force] [--verify]  przywróć bazę (najpierw zatrzymaj daemona)\n\
+         restore-all <backup> <data> [--force] [--verify]  przywróć wszystkie bazy\n\
          \n\
+         Opcje: --db <nazwa> wybiera bazę (albo NONODB_DB).\n\
          Zmienne: NONODB_SOCK (Unix, domyślnie /run/nonodb.sock),\n\
          NONODB_URL (Windows, domyślnie http://127.0.0.1:7878), NONODB_TOKEN,\n\
+         NONODB_DB (domyślnie default),\n\
          NONODB_AUTH_FILE (domyślnie /etc/nonodb/auth.json)"
     );
     Ok(())
@@ -617,6 +673,35 @@ fn tcp_addr() -> Result<String, String> {
     Ok(rest.to_string())
 }
 
+fn strip_db_flag(args: &mut Vec<String>) -> Result<(), String> {
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--db" {
+            let value = args.get(i + 1).ok_or("--db wymaga nazwy bazy")?.clone();
+            args.drain(i..=i + 1);
+            std::env::set_var("NONODB_DB", value);
+            continue;
+        }
+        if let Some(value) = args[i].strip_prefix("--db=") {
+            let value = value.to_string();
+            args.remove(i);
+            std::env::set_var("NONODB_DB", value);
+            continue;
+        }
+        i += 1;
+    }
+    Ok(())
+}
+
+fn db_prefix() -> String {
+    let db = std::env::var("NONODB_DB").unwrap_or_else(|_| "default".into());
+    if db.is_empty() || db == "default" {
+        String::new()
+    } else {
+        format!("/{db}")
+    }
+}
+
 fn http_get(path: &str) -> Result<Value, String> {
     http_request("GET", path, None)
 }
@@ -626,6 +711,12 @@ fn http_post(path: &str, body: &Value) -> Result<Value, String> {
 }
 
 fn http_request(method: &str, path: &str, body: Option<&Value>) -> Result<Value, String> {
+    let path = if path.starts_with("/v1/") {
+        format!("{}{}", db_prefix(), path)
+    } else {
+        path.to_string()
+    };
+    let path = path.as_str();
     #[cfg(unix)]
     let mut stream = UnixStream::connect(sock_path()).map_err(|e| format!("connect: {e}"))?;
     #[cfg(not(unix))]
@@ -944,6 +1035,195 @@ fn parse_scopes(raw: &str) -> Result<Vec<String>, String> {
     Ok(scopes)
 }
 
+fn selected_database() -> String {
+    std::env::var("NONODB_DB")
+        .ok()
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "default".into())
+}
+
+/// Resolves a data root or an explicit database directory to one LMDB env.
+fn database_dir(data: &Path) -> Result<PathBuf, String> {
+    if data.join("data.mdb").is_file() {
+        return Ok(data.to_path_buf());
+    }
+    let selected = data.join(selected_database());
+    if selected.join("data.mdb").is_file() {
+        return Ok(selected);
+    }
+    let default = data.join("default");
+    if default.join("data.mdb").is_file() {
+        return Ok(default);
+    }
+    Err(format!(
+        "brak data.mdb w {} (szukano też {}/<baza>/data.mdb; użyj --db albo podaj katalog bazy)",
+        data.display(),
+        data.display()
+    ))
+}
+
+/// Target directory for restore. A new root receives `default/data.mdb`.
+fn database_target(data: &Path) -> Result<PathBuf, String> {
+    if data.join("data.mdb").is_file() {
+        return Ok(data.to_path_buf());
+    }
+    let entries = std::fs::read_dir(data)
+        .ok()
+        .map(|entries| entries.filter_map(Result::ok).collect::<Vec<_>>())
+        .unwrap_or_default();
+    if data.join("default").is_dir()
+        || entries
+            .iter()
+            .any(|entry| entry.path().join("data.mdb").is_file())
+    {
+        return Ok(data.join(selected_database()));
+    }
+    if data
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == "default")
+        || data.join("lock.mdb").exists()
+        || data.join("auto-index.json").exists()
+        || !entries.is_empty()
+    {
+        // An explicit database directory, not an empty instance root.
+        return Ok(data.to_path_buf());
+    }
+    Ok(data.join("default"))
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn validate_database_name(name: &str) -> Result<(), String> {
+    if name.is_empty() || name.len() > 64 {
+        return Err(format!("invalid database name `{name}`"));
+    }
+    if matches!(name, "v1" | "healthz" | "metrics" | "gui" | "db" | "api") {
+        return Err(format!("reserved database name `{name}`"));
+    }
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return Err(format!("invalid database name `{name}`"));
+    };
+    if !first.is_ascii_alphanumeric()
+        || !chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+    {
+        return Err(format!("invalid database name `{name}`"));
+    }
+    Ok(())
+}
+
+fn instance_databases(data: &Path) -> Result<Vec<(String, PathBuf)>, String> {
+    if data.join("data.mdb").is_file() {
+        return Ok(vec![("default".to_string(), data.to_path_buf())]);
+    }
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(data).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        if !entry.file_type().map_err(|e| e.to_string())?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if validate_database_name(&name).is_ok() && entry.path().join("data.mdb").is_file() {
+            out.push((name, entry.path()));
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    if out.is_empty() {
+        return Err(format!("no databases found in {}", data.display()));
+    }
+    Ok(out)
+}
+
+fn backup_all(data: &Path, out_dir: &Path) -> Result<(), String> {
+    let databases = instance_databases(data)?;
+    std::fs::create_dir_all(out_dir).map_err(|e| e.to_string())?;
+    let mut entries = Vec::new();
+    for (name, source) in databases {
+        let db_out = out_dir.join(&name);
+        backup(&source, &db_out)?;
+        let manifest = nonodb_core::BackupManifest::from_backup(&db_out, &source)
+            .map_err(|e| e.to_string())?;
+        nonodb_core::verify::write_manifest(&db_out, &manifest).map_err(|e| e.to_string())?;
+        entries.push(json!({
+            "name": name,
+            "sha256": manifest.sha256,
+            "data_size": manifest.data_size,
+            "created_at_ms": manifest.created_at_ms,
+        }));
+        eprintln!(
+            "database: {name} -> {} (sha256 {})",
+            db_out.join("data.mdb").display(),
+            manifest.sha256
+        );
+    }
+    let instance = json!({
+        "version": 1,
+        "kind": "nonodb-instance-backup",
+        "created_at_ms": now_ms(),
+        "source": data.display().to_string(),
+        "databases": entries,
+    });
+    let manifest_path = out_dir.join("manifest.json");
+    let raw = serde_json::to_vec_pretty(&instance).map_err(|e| e.to_string())?;
+    let tmp = out_dir.join(".manifest.json.tmp");
+    std::fs::write(&tmp, raw).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &manifest_path).map_err(|e| e.to_string())?;
+    eprintln!("instance manifest: {}", manifest_path.display());
+    Ok(())
+}
+
+fn restore_all(backup: &Path, data: &Path, force: bool, verify: bool) -> Result<(), String> {
+    let manifest_path = backup.join("manifest.json");
+    let raw = std::fs::read(&manifest_path)
+        .map_err(|e| format!("read {}: {e}", manifest_path.display()))?;
+    let manifest: Value = serde_json::from_slice(&raw).map_err(|e| e.to_string())?;
+    if manifest.get("kind").and_then(Value::as_str) != Some("nonodb-instance-backup") {
+        return Err(format!(
+            "{} is not a nonodb instance backup",
+            manifest_path.display()
+        ));
+    }
+    if manifest.get("version").and_then(Value::as_u64) != Some(1) {
+        return Err("unsupported instance backup manifest version".into());
+    }
+    let databases = manifest
+        .get("databases")
+        .and_then(Value::as_array)
+        .ok_or("instance manifest has no databases")?;
+    if databases.is_empty() {
+        return Err("instance backup contains no databases".into());
+    }
+    std::fs::create_dir_all(data).map_err(|e| e.to_string())?;
+    for item in databases {
+        let name = item
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or("database entry has no name")?;
+        validate_database_name(name)?;
+        let source = backup.join(name);
+        if !source.join("data.mdb").is_file() {
+            return Err(format!(
+                "missing backup database `{name}`: {}",
+                source.display()
+            ));
+        }
+        let target = data.join(name);
+        restore_into(&source, &target, force, verify)?;
+    }
+    eprintln!(
+        "restore-all: {} databases -> {}",
+        databases.len(),
+        data.display()
+    );
+    Ok(())
+}
+
 fn backup(data: &Path, out_dir: &Path) -> Result<(), String> {
     std::fs::create_dir_all(out_dir).map_err(|e| e.to_string())?;
     let out = out_dir.join("data.mdb");
@@ -1002,6 +1282,11 @@ fn inspect(data: &Path, only: Option<&str>) -> Result<(), String> {
 }
 
 fn restore(backup: &Path, data: &Path, force: bool, verify: bool) -> Result<(), String> {
+    let target = database_target(data)?;
+    restore_into(backup, &target, force, verify)
+}
+
+fn restore_into(backup: &Path, data: &Path, force: bool, verify: bool) -> Result<(), String> {
     let src = if backup.join("data.mdb").exists() {
         backup.join("data.mdb")
     } else {

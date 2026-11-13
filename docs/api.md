@@ -5,11 +5,15 @@ metrics endpoints.
 
 - Base URL over a Unix socket: `http://localhost`
 - Default socket: `/run/nonodb.sock`
-- Data endpoint: `POST /v1/exec`
+- Data endpoint: `POST /v1/exec` (alias for `/default/v1/exec`)
+- Database-scoped endpoint: `POST /{database}/v1/exec`
+- Database-scoped stream: `POST /{database}/v1/watch`
 - Health: `GET /healthz`
 - Metrics: `GET /metrics`
 
 The API is JSON over HTTP/1.1. It is **not** MongoDB wire-protocol compatible.
+See [Multiple databases](multi-database.md) for database routing and
+`list_databases`, `create_database`, and `drop_database`.
 
 ## Envelope
 
@@ -35,6 +39,53 @@ A failed call returns:
 The HTTP status is usually `200` for success and one of `400`, `401`, `403`,
 `413`, `429`, or `500` for errors, but clients should rely on the JSON envelope.
 
+## Write durability
+
+Every write is always atomic: the document, indexes, history, events, TTL
+metadata, and subscriptions in one write commit or roll back together.
+`insert`, `insert_many`, `update`, `find_and_modify`, `delete`, `sql` writes,
+and `write_batch` accept an optional `durability` field:
+
+```json
+{"op":"insert_many","coll":"imports","docs":[...],"durability":"relaxed"}
+```
+
+| Mode | Behavior | Guarantee |
+|---|---|---|
+| `full` | Default. Force data and metadata to stable storage before replying | Acknowledged writes survive a crash |
+| `relaxed` | Commit with LMDB `NO_META_SYNC`; data is flushed, metadata is not forced every commit | Database stays consistent, but the last commits can be lost after a power failure |
+| `unsafe` | Skip the extra sync. Requires daemon opt-in | Fastest; recent writes can be lost on a crash/power failure |
+
+`unsafe` is rejected unless the daemon is started with:
+
+```bash
+NONODB_ALLOW_UNSAFE_WRITES=1
+```
+
+With that opt-in the LMDB environment uses `MDB_NOSYNC`; in that mode both
+`relaxed` and `unsafe` skip the forced sync. Without it, the environment uses
+`MDB_NOMETASYNC`, so `relaxed` still flushes data but not the metadata page.
+`full` calls `mdb_env_sync` after the writer transaction commits.
+
+When the writer groups several requests into one commit, the strictest mode in
+the group wins: a single `full` request forces an fsync for the whole group.
+Background maintenance, auto-index builds, TTL expiry, and event writes always
+use `full` durability.
+
+Force a checkpoint after a relaxed batch or import:
+
+```json
+{"op":"sync"}
+```
+
+```json
+{"ok":true,"result":{"synced":true}}
+```
+
+`sync` requires database-admin scope. Do not use `relaxed` or `unsafe` for
+payments, audit records, authentication state, vault material, or any data whose
+loss is unacceptable.
+
 ## Authentication
 
 The Unix socket is a trusted local channel and uses the `local` principal with
@@ -51,8 +102,9 @@ or a registered client certificate (mTLS). If both are supplied, they must
 resolve to the same principal.
 
 `GET /healthz` is public. `/metrics` requires `admin:db`. Authorization is
-deny-by-default and checked per collection; `write_batch` is checked per
-operation. Missing credentials return `401`; insufficient scope returns `403` with error
+deny-by-default and checked per database/collection; `write_batch` is checked
+per operation. Scopes may be database-qualified, for example
+`read:app1/orders`. Missing credentials return `401`; insufficient scope returns `403` with error
 code `forbidden`. Repeated failed authentication can lock the peer IP and return
 `429` with error code `rate_limited`.
 
@@ -95,6 +147,10 @@ client timeout with `NONODB_TIMEOUT` or the `timeout=` argument.
 
 | `op` | Purpose |
 |---|---|
+| [`list_databases`](multi-database.md#management-api) | List databases |
+| [`create_database`](multi-database.md#management-api) | Create a database |
+| [`drop_database`](multi-database.md#management-api) | Drop a non-default database |
+| [`sync`](#write-durability) | Force an fsync of the selected database |
 | [`insert`](#insert) | Insert one document |
 | [`insert_many`](#insert_many) | Insert multiple documents |
 | [`find`](#find) | Query documents |
@@ -2099,6 +2155,8 @@ administrator; TCP requires a bearer token or registered client certificate.
 | Code | HTTP | Meaning |
 |---|---|---|
 | `invalid_query` | 400 | Invalid filter/update/index/query shape, write in a read batch, unsupported operator |
+| `unsafe_durability_disabled` | 400 | `durability:"unsafe"` without `NONODB_ALLOW_UNSAFE_WRITES=1` |
+| `database_limit` | 503 | Too many open databases and no idle environment can be evicted |
 | `invalid_sql` | 400 | SQL parse/planning error or unsupported SQL clause |
 | `invalid_json` | 400 | Malformed JSON document or value |
 | `invalid_collection` | 400 | Invalid collection name |

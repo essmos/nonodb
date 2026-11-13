@@ -150,8 +150,18 @@ def main():
     for row in cases:
         print(json.dumps(row, sort_keys=True))
 
-    data = os.path.join(os.environ["NONODB_DATA"], "data.mdb")
-    print(f"\nDATA {data} {os.path.getsize(data)/1024/1024:.1f} MiB")
+    root = os.environ.get("NONODB_DATA", "")
+    database = os.environ.get("NONODB_DB", "default")
+    candidates = [
+        os.path.join(root, database, "data.mdb"),
+        os.path.join(root, "default", "data.mdb"),
+        os.path.join(root, "data.mdb"),
+    ]
+    data = next((path for path in candidates if path and os.path.isfile(path)), "")
+    if data:
+        print(f"\nDATA {data} {os.path.getsize(data)/1024/1024:.1f} MiB")
+    else:
+        print("\nDATA unavailable (set NONODB_DATA to the instance root)")
     db.close()
     return 0
 

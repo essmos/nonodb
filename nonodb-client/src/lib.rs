@@ -83,6 +83,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub struct ClientBuilder {
     socket_path: Option<PathBuf>,
     base_url: Option<String>,
+    database: Option<String>,
     token: Option<String>,
     timeout: Option<Duration>,
     verify: Option<bool>,
@@ -103,6 +104,13 @@ impl ClientBuilder {
     /// When `base_url` is set, it takes precedence over `socket_path`.
     pub fn base_url(mut self, url: impl Into<String>) -> Self {
         self.base_url = Some(url.into());
+        self
+    }
+
+    /// Select a database inside a multi-database daemon.
+    /// Defaults to `NONODB_DB`, then `default`.
+    pub fn database(mut self, database: impl Into<String>) -> Self {
+        self.database = Some(database.into());
         self
     }
 
@@ -182,6 +190,12 @@ impl ClientBuilder {
             )
         });
 
+        let database = self
+            .database
+            .or_else(|| std::env::var("NONODB_DB").ok())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "default".to_string());
+
         let token = self
             .token
             .or_else(|| std::env::var("NONODB_TOKEN").ok())
@@ -237,6 +251,7 @@ impl ClientBuilder {
         Ok(Client {
             http,
             base_url,
+            database,
             token,
             vault: None,
         })
@@ -255,6 +270,7 @@ struct VaultHeaders {
 pub struct Client {
     http: reqwest::blocking::Client,
     base_url: String,
+    database: String,
     token: Option<String>,
     vault: Option<VaultHeaders>,
 }
@@ -307,10 +323,18 @@ impl Client {
             .unwrap_or_else(|| Error::InvalidResponse("request failed without an error".into())))
     }
 
+    fn data_path(&self, path: &str) -> String {
+        if self.database.is_empty() || self.database == "default" {
+            path.to_string()
+        } else {
+            format!("/{}{}", self.database, path)
+        }
+    }
+
     fn exec_once(&self, payload: &Value) -> Result<Value> {
         let mut request = self
             .http
-            .post(format!("{}/v1/exec", self.base_url))
+            .post(format!("{}{}", self.base_url, self.data_path("/v1/exec")))
             .json(payload);
         if let Some(token) = &self.token {
             request = request.bearer_auth(token);
@@ -1414,6 +1438,24 @@ mod tests {
         assert_eq!(query.sort, Some(vec![("age".into(), -1)]));
         assert_eq!(query.skip, 10);
         assert_eq!(query.limit, Some(5));
+    }
+
+    #[test]
+    fn database_prefixes_only_data_paths() {
+        let client = Client {
+            http: reqwest::blocking::Client::new(),
+            base_url: "http://localhost".into(),
+            database: "app1".into(),
+            token: None,
+            vault: None,
+        };
+        assert_eq!(client.data_path("/v1/exec"), "/app1/v1/exec");
+        assert_eq!(client.data_path("/healthz"), "/app1/healthz");
+        let default = Client {
+            database: "default".into(),
+            ..client
+        };
+        assert_eq!(default.data_path("/v1/exec"), "/v1/exec");
     }
 
     #[test]

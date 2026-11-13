@@ -52,12 +52,17 @@ fn env_usize(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
-pub fn start(store: Arc<Store>, write_tx: mpsc::Sender<WriteJob>, auto_index: Arc<AutoIndexer>) {
+pub fn start(
+    store: Arc<Store>,
+    write_tx: mpsc::Sender<WriteJob>,
+    auto_index: Arc<AutoIndexer>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+) -> std::thread::JoinHandle<()> {
     let config = Config::from_env();
     std::thread::Builder::new()
         .name("nonodb-maintenance".into())
-        .spawn(move || run(store, write_tx, auto_index, config))
-        .expect("failed to start maintenance worker");
+        .spawn(move || run(store, write_tx, auto_index, config, stop))
+        .expect("failed to start maintenance worker")
 }
 
 fn run(
@@ -65,6 +70,7 @@ fn run(
     write_tx: mpsc::Sender<WriteJob>,
     auto_index: Arc<AutoIndexer>,
     config: Config,
+    stop: Arc<std::sync::atomic::AtomicBool>,
 ) {
     // Sweep once shortly after startup, then at the configured cadence.
     let mut last_ttl: Option<Instant> = None;
@@ -72,7 +78,18 @@ fn run(
     let mut last_subscription_prune: Option<Instant> = None;
 
     loop {
-        std::thread::sleep(config.interval);
+        let deadline = Instant::now() + config.interval;
+        while Instant::now() < deadline {
+            if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+            std::thread::sleep(
+                Duration::from_millis(100).min(deadline.saturating_duration_since(Instant::now())),
+            );
+        }
+        if stop.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
 
         if last_ttl.is_none_or(|at| at.elapsed() >= config.ttl_interval) {
             last_ttl = Some(Instant::now());
@@ -142,6 +159,7 @@ fn submit(
             req,
             resp,
             isolated,
+            durability: crate::protocol::Durability::Full,
         })
         .is_err()
     {

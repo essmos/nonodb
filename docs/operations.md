@@ -8,7 +8,9 @@ capacity planning, and troubleshooting for a nonodb daemon.
 A nonodb deployment has:
 
 - one `nonodb-daemon` process per data directory;
-- one LMDB environment in that directory (`data.mdb`, `lock.mdb`);
+- one or more LMDB environments under that directory, each in its own
+  subdirectory (`<database>/data.mdb`, `<database>/lock.mdb`); the `default`
+  database is always present;
 - one or more application processes connecting over a Unix socket or TCP;
 - optionally `nonodb-cli` for administration and backups.
 
@@ -31,7 +33,9 @@ All daemon configuration is through environment variables.
 
 | Variable | Default | Description |
 |---|---|---|
-| `NONODB_DATA` | `./data` | Directory containing `data.mdb` and `lock.mdb` |
+| `NONODB_DATA` | `./data` | Instance root containing `<database>/data.mdb` and `<database>/lock.mdb` |
+| `NONODB_MAX_OPEN_DATABASES` | `64` | Maximum open LMDB environments/writers; idle databases are evicted |
+| `NONODB_ALLOW_UNSAFE_WRITES` | unset | Enables opt-in `durability:"unsafe"` writes using LMDB `MDB_NOSYNC` |
 | `NONODB_SOCK` | `/run/nonodb.sock` | Unix socket path |
 | `NONODB_MAP_SIZE` | `1GiB` | LMDB address-space limit; accepts `4GiB`, `2048MiB`, bytes |
 | `NONODB_REQUEST_TIMEOUT` | `30` | Server-side request timeout in seconds for normal operations |
@@ -195,7 +199,8 @@ through the single writer, so inserts and updates wait until its transaction
 commits.
 
 The daemon maintenance worker drives automatic index creation and eviction.
-Automatic indexes are tracked in `auto-index.json` in `NONODB_DATA`. They are
+Automatic indexes are tracked in `auto-index.json` in each database directory
+(for example `NONODB_DATA/default/auto-index.json`). They are
 dropped after `NONODB_AUTO_INDEX_TTL` seconds without demand, but only when
 they are at least `NONODB_AUTO_INDEX_MIN_AGE` old. Manual indexes are never
 dropped automatically. The state file stores timestamps and index definitions,
@@ -810,6 +815,28 @@ backups.
 | mTLS client rejected | Missing client cert, untrusted chain, or fingerprint not registered | Check `NONODB_TLS_CLIENT_CA`, client cert/key, and `NONODB_AUTH_FILE` |
 | Revoked client still gets data | Auth file reload has not completed | Wait about one second and retry; check auth reload logs |
 | TCP listener refuses to start | No auth registry | Set `NONODB_AUTH_FILE` and create a principal/token |
+
+## Write durability
+
+Writes are always ACID-atomic inside LMDB. Atomicity is not configurable; the
+optional durability modes control whether an acknowledged write has been forced
+to disk.
+
+| Mode | Request value | Effect |
+|---|---|---|
+| Durable | `full` (default) | `fsync` data and metadata after the writer commit |
+| Relaxed | `relaxed` | `MDB_NOMETASYNC`: data flushed, metadata not forced every commit |
+| Unsafe | `unsafe` | No forced sync; requires `NONODB_ALLOW_UNSAFE_WRITES=1` |
+
+`relaxed` can lose the most recent commits after a power failure while keeping
+the database consistent. `unsafe` can lose more recent writes and should only be
+used for imports, caches, telemetry, or rebuildable data. `full` remains the
+default for every normal insert/update/delete and for all background workers.
+
+Group commit uses the strictest request in the batch: if any operation asks for
+`full`, the whole batch is fsynced. Use the `sync` operation to force a
+checkpoint after relaxed/unsafe bulk writes. The authorization registry and
+vault key material are outside LMDB and are never affected by this setting.
 
 ## Security checklist
 

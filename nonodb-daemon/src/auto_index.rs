@@ -493,6 +493,7 @@ impl AutoIndexer {
             req,
             resp: tx,
             isolated: true,
+            durability: crate::protocol::Durability::Full,
         }) {
             metrics::sub(&metrics::QUEUE_LEN, 1);
             return Err(format!("writer channel closed: {e}"));

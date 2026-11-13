@@ -257,7 +257,7 @@ function ConnectView({ onConnected }: { onConnected: (connection: Connection) =>
     <div className="connect-page">
       <div className="connect-card">
         <div className="brand large">
-          <span className="brand-mark">N</span>
+          <span className="brand-mark"><img src="/nonodb-mark.svg" alt="" /></span>
           <div>
             <h1>Connect to NonoDB</h1>
             <p>Use the same database token as the CLI or API</p>
@@ -298,6 +298,15 @@ function ConnectView({ onConnected }: { onConnected: (connection: Connection) =>
                 onChange={(e) => setConnection({ ...connection, endpoint: e.target.value })}
                 placeholder="http://127.0.0.1:8787"
               />
+            </label>
+            <label>
+              Database
+              <input
+                value={connection.database}
+                onChange={(e) => setConnection({ ...connection, database: e.target.value })}
+                placeholder="default"
+              />
+              <span className="field-hint">Use `default` or a database created with `nonodb-cli databases create`.</span>
             </label>
             {profiles.length > 0 && (
               <label>
@@ -2188,9 +2197,11 @@ function DatabaseView({ connection }: { connection: Connection }) {
 
 function Shell({
   connection,
+  onConnectionChange,
   onDisconnect,
 }: {
   connection: Connection;
+  onConnectionChange: (connection: Connection) => void;
   onDisconnect: () => void;
 }) {
   const [collections, setCollections] = useState<string[]>([]);
@@ -2205,6 +2216,28 @@ function Shell({
   const [profile, setProfile] = useState<'standard' | 'vault'>('standard');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
+  const [databases, setDatabases] = useState<string[]>([]);
+
+  useEffect(() => {
+    let cancelled = false;
+    exec<{ databases: string[] }>(connection, { op: 'list_databases' })
+      .then((result) => {
+        if (!cancelled) setDatabases(result.databases ?? []);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [connection]);
+
+  const switchDatabase = (database: string) => {
+    if (!database || database === connection.database) return;
+    const next = { ...connection, database };
+    saveConnection(next);
+    setSelected(null);
+    setTab('collections');
+    onConnectionChange(next);
+  };
 
   const refreshCollections = useCallback(async () => {
     try {
@@ -2272,7 +2305,7 @@ function Shell({
     <div className="app-shell">
       <aside className="sidebar">
         <div className="brand">
-          <span className="brand-mark">N</span>
+          <span className="brand-mark"><img src="/nonodb-mark.svg" alt="" /></span>
           <div>
             <strong>NonoDB</strong>
             <small>Console</small>
@@ -2298,10 +2331,23 @@ function Shell({
         {tab === 'collections' && (
           <>
             <div className="sidebar-section">
-              <span>Databases</span>
+              <span>Database</span>
               <button className="icon-button" onClick={() => void refreshCollections()} title="Refresh">
                 ↻
               </button>
+            </div>
+            <select
+              className="database-select"
+              value={connection.database || 'default'}
+              onChange={(e) => switchDatabase(e.target.value)}
+              title="Switch database"
+            >
+              {[...new Set(['default', connection.database || 'default', ...databases])].map((name) => (
+                <option key={name} value={name}>{name}</option>
+              ))}
+            </select>
+            <div className="sidebar-section">
+              <span>Collections</span>
             </div>
             <div className="collection-list">
               {collections.map((name) => (
@@ -2519,6 +2565,7 @@ export default function App() {
     content = (
       <Shell
         connection={connection}
+        onConnectionChange={(next) => setConnection(next)}
         onDisconnect={() => {
           clearConnection();
           setConnection(defaultConnection());

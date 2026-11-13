@@ -55,6 +55,7 @@ class NonoDB {
     if (typeof options === 'string') options = { socketPath: options };
 
     this.token = options.token ?? process.env.NONODB_TOKEN ?? '';
+    this.database = (options.database ?? process.env.NONODB_DB ?? 'default').trim() || 'default';
     this.timeoutMs = options.timeoutMs ?? envTimeoutMs();
     this.verify = options.verify ?? envVerify();
     this.vaultHeaders = options.vaultHeaders ?? null;
@@ -136,7 +137,11 @@ class NonoDB {
     if (this.token) headers.authorization = `Bearer ${this.token}`;
     if (this.vaultHeaders) Object.assign(headers, this.vaultHeaders);
 
-    const url = new URL(path, this.baseUrl);
+    const dataPath =
+      path.startsWith('/v1/') && this.database !== 'default'
+        ? `/${encodeURIComponent(this.database)}${path}`
+        : path;
+    const url = new URL(dataPath, this.baseUrl);
     const useTls = !this.socketPath && url.protocol === 'https:';
     const transport = useTls ? https : http;
     const options = {

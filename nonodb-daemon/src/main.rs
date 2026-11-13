@@ -12,6 +12,7 @@ mod authz;
 mod auto_index;
 mod cache;
 mod cursor;
+mod databases;
 mod live;
 mod login_guard;
 mod maintenance;
@@ -28,10 +29,10 @@ use std::time::{Duration, Instant};
 
 use axum::{
     body::{Body, Bytes},
-    extract::{DefaultBodyLimit, State},
+    extract::{DefaultBodyLimit, OriginalUri, State},
     http::{
         header::{ACCEPT, CACHE_CONTROL},
-        HeaderMap, HeaderValue, StatusCode,
+        HeaderMap, HeaderValue, StatusCode, Uri,
     },
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -48,7 +49,7 @@ use nonodb_core::{
     aggregate, project_document, vault, CollectionProfile, FindQuery, Store, VaultKey,
     DEFAULT_FUZZY_DISTANCE, PAGE_SIZE,
 };
-use protocol::{ApiError, ApiResponse, LookupBy, Request, VaultAuth, WriteReq};
+use protocol::{ApiError, ApiResponse, Durability, LookupBy, Request, VaultAuth, WriteReq};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
@@ -106,9 +107,42 @@ struct AppState {
     write_tx: mpsc::Sender<WriteJob>,
     cache: Arc<cache::QueryCache>,
     auto_index: Arc<auto_index::AutoIndexer>,
+    _runtime: Arc<databases::DatabaseRuntime>,
+    databases: Arc<databases::Databases>,
     auth: Option<Arc<auth::AuthState>>,
     audit: Option<Arc<audit::AuditLog>>,
     cursors: Arc<cursor::Registry>,
+}
+
+impl AppState {
+    async fn for_database(&self, name: &str) -> Result<Self, ApiError> {
+        let runtime = self.databases.get(name).await?;
+        Ok(Self {
+            store: runtime.store.clone(),
+            write_tx: runtime.write_tx.clone(),
+            cache: runtime.cache.clone(),
+            auto_index: runtime.auto_index.clone(),
+            _runtime: runtime,
+            databases: self.databases.clone(),
+            auth: self.auth.clone(),
+            audit: self.audit.clone(),
+            cursors: self.cursors.clone(),
+        })
+    }
+}
+
+fn database_from_uri(uri: &Uri) -> String {
+    let first = uri
+        .path()
+        .trim_start_matches('/')
+        .split('/')
+        .next()
+        .unwrap_or("");
+    if first.is_empty() || first == "v1" {
+        databases::DEFAULT_DATABASE.to_string()
+    } else {
+        first.to_string()
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -147,24 +181,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     let audit = audit::AuditLog::from_env()?;
 
-    let store = Arc::new(Store::open(&data)?);
+    let databases = databases::Databases::open(&data)
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
     live::install_observer();
     live::registry().start_janitor();
-
-    // One writer thread, independent of the tokio runtime (LMDB blocks on fsync).
-    let (write_tx, write_rx) = mpsc::channel::<WriteJob>();
-    let cache = Arc::new(cache::QueryCache::from_env());
-    let writer_store = store.clone();
-    let writer_cache = cache.clone();
-    std::thread::Builder::new()
-        .name("nonodb-writer".into())
-        .spawn(move || writer::run(writer_store, write_rx, writer_cache))?;
-    let auto_index = auto_index::AutoIndexer::start(store.clone(), write_tx.clone(), &data);
-    maintenance::start(store.clone(), write_tx.clone(), auto_index.clone());
-
-    if let Some(dir) = std::env::var_os("NONODB_SNAPSHOT_DIR") {
-        spawn_snapshots(store.clone(), PathBuf::from(dir));
-    }
+    let default = databases
+        .default_runtime()
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error> { e.message.into() })?;
 
     let drain_timeout = drain_timeout();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -175,10 +199,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let state = AppState {
-        store,
-        write_tx,
-        cache,
-        auto_index,
+        store: default.store.clone(),
+        write_tx: default.write_tx.clone(),
+        cache: default.cache.clone(),
+        auto_index: default.auto_index.clone(),
+        _runtime: default.clone(),
+        databases: databases.clone(),
         auth: auth.clone(),
         audit: audit.clone(),
         cursors: Arc::new(cursor::Registry::new()),
@@ -188,6 +214,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .route("/metrics", get(metrics_handler))
         .route("/v1/exec", post(exec))
         .route("/v1/watch", post(watch_stream))
+        .route("/:database/v1/exec", post(exec))
+        .route("/:database/v1/watch", post(watch_stream))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .layer(axum::middleware::from_fn(http_access_log))
         .with_state(state);
@@ -636,7 +664,7 @@ where
 
 /// Periodic LMDB snapshots (consistent copies without stopping writes).
 /// This is not full PITR with a WAL - it provides restore points every N seconds.
-fn spawn_snapshots(store: Arc<Store>, dir: PathBuf) {
+pub(crate) fn spawn_snapshots(store: Arc<Store>, dir: PathBuf) {
     let interval = std::env::var("NONODB_SNAPSHOT_INTERVAL")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
@@ -1430,6 +1458,7 @@ fn now_ms() -> u128 {
 async fn watch_stream(
     State(state): State<AppState>,
     Extension(connection): Extension<auth::ConnectionAuth>,
+    OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
     Json(req): Json<Request>,
 ) -> Response {
@@ -1450,7 +1479,8 @@ async fn watch_stream(
             return respond(Err(err)).into_response();
         }
     };
-    if let Err(err) = authz::authorize_request(&principal, &req) {
+    let database = database_from_uri(&uri);
+    if let Err(err) = authz::authorize_request(&principal, &req, &database) {
         audit_denied(
             &state,
             &connection,
@@ -1462,6 +1492,10 @@ async fn watch_stream(
         );
         return respond(Err(err)).into_response();
     }
+    let state = match state.for_database(&database).await {
+        Ok(state) => state,
+        Err(err) => return respond(Err(err)).into_response(),
+    };
     let audit_needed = state.audit.as_ref().is_some_and(|audit| audit.log_reads());
     let audit_op = req.op_name();
     let audit_collections: Vec<String> = req.collections();
@@ -1596,7 +1630,8 @@ async fn watch_stream(
             .is_some_and(|value| value.contains("text/event-stream"));
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
         let (live_tx, live_rx) = tokio::sync::mpsc::channel::<Value>(64);
-        let (live_id, guard) = live::registry().register(coll.clone(), subscription, live_tx);
+        let (live_id, guard) =
+            live::registry().register(state.store.id(), coll.clone(), subscription, live_tx);
         let stream = futures_util::stream::unfold(rx, |mut rx| async move {
             rx.recv().await.map(|item| (item, rx))
         });
@@ -1767,6 +1802,7 @@ async fn watch_stream(
 async fn exec(
     State(state): State<AppState>,
     Extension(connection): Extension<auth::ConnectionAuth>,
+    OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
     Json(req): Json<Request>,
 ) -> (StatusCode, Json<ApiResponse>) {
@@ -1787,7 +1823,8 @@ async fn exec(
             return respond(Err(err));
         }
     };
-    if let Err(err) = authz::authorize_request(&principal, &req) {
+    let database = database_from_uri(&uri);
+    if let Err(err) = authz::authorize_request(&principal, &req, &database) {
         audit_denied(
             &state,
             &connection,
@@ -1799,6 +1836,10 @@ async fn exec(
         );
         return respond(Err(err));
     }
+    let state = match state.for_database(&database).await {
+        Ok(state) => state,
+        Err(err) => return respond(Err(err)),
+    };
     let audit_needed = state
         .audit
         .as_ref()
@@ -2065,8 +2106,13 @@ async fn exec(
                 ascending,
                 skip,
             };
-            let cursor_state =
-                cursor::State::new(principal.name().to_string(), kind, limit, batch_size);
+            let cursor_state = cursor::State::new(
+                principal.name().to_string(),
+                database.clone(),
+                kind,
+                limit,
+                batch_size,
+            );
             open_cursor(&state, vault_auth.clone(), cursor_state, None).await
         }
 
@@ -2085,8 +2131,13 @@ async fn exec(
                 filter,
                 stages,
             };
-            let cursor_state =
-                cursor::State::new(principal.name().to_string(), kind, limit, batch_size);
+            let cursor_state = cursor::State::new(
+                principal.name().to_string(),
+                database.clone(),
+                kind,
+                limit,
+                batch_size,
+            );
             open_cursor(&state, vault_auth.clone(), cursor_state, None).await
         }
 
@@ -2096,11 +2147,20 @@ async fn exec(
         } => {
             let owner = principal.name().to_string();
             let cursors = state.cursors.clone();
-            let store = state.store.clone();
+            let mut cursor_state = match cursors.begin(cursor_id, &owner) {
+                Ok(state) => state,
+                Err(err) => return respond(Err(cursor_api_error(err))),
+            };
+            let runtime = match state.databases.get(&cursor_state.database).await {
+                Ok(runtime) => runtime,
+                Err(err) => {
+                    cursors.finish(cursor_id, cursor_state, true);
+                    return respond(Err(err));
+                }
+            };
+            let store = runtime.store.clone();
             let auth = vault_auth.clone();
             let joined = tokio::task::spawn_blocking(move || {
-                let mut cursor_state =
-                    cursors.begin(cursor_id, &owner).map_err(cursor_api_error)?;
                 let result = cursor_page(&store, auth.as_ref(), &mut cursor_state, batch_size);
                 let has_more = result.as_ref().map(|(_, more)| *more).unwrap_or(false);
                 cursors.finish(cursor_id, cursor_state, has_more);
@@ -2176,7 +2236,11 @@ async fn exec(
             read_result(joined).await
         }
 
-        Request::Sql { query, params } => {
+        Request::Sql {
+            query,
+            params,
+            durability,
+        } => {
             let started = Instant::now();
             let prepared = match nonodb_core::sql::PreparedSql::parse(&query) {
                 Ok(prepared) => prepared,
@@ -2188,7 +2252,12 @@ async fn exec(
             let kind = prepared.kind();
             let collection = prepared.collection().to_string();
             let response = if !prepared.is_read_only() {
-                submit_write(&state, WriteReq::Sql { query, params }).await
+                submit_write(
+                    &state,
+                    WriteReq::Sql { query, params },
+                    durability.unwrap_or_default(),
+                )
+                .await
             } else {
                 let store = state.store.clone();
                 let auth = vault_auth.clone();
@@ -2445,7 +2514,7 @@ async fn exec(
                 let rtxn = store.read_txn()?;
                 let mut results = Vec::with_capacity(ops.len());
                 for op in ops {
-                    results.push(batch_read(&store, &rtxn, op, &principal));
+                    results.push(batch_read(&store, &rtxn, op, &principal, &database));
                 }
                 rtxn.commit().map_err(nonodb_core::Error::from)?;
                 Ok::<Value, ApiError>(json!({ "results": results }))
@@ -2511,8 +2580,61 @@ async fn exec(
             let principal = principal.clone();
             let joined = tokio::task::spawn_blocking(move || {
                 let mut collections = store.collections()?;
-                collections.retain(|coll| principal.can_see_collection(coll));
+                collections.retain(|coll| principal.can_see_collection(&database, coll));
                 Ok::<Value, ApiError>(json!({ "collections": collections }))
+            });
+            read_result(joined).await
+        }
+
+        Request::ListDatabases => {
+            let mut names = state.databases.names().await;
+            if !names.iter().any(|name| name == databases::DEFAULT_DATABASE) {
+                names.push(databases::DEFAULT_DATABASE.to_string());
+                names.sort();
+            }
+            respond(Ok(json!({
+                "default": databases::DEFAULT_DATABASE,
+                "databases": names,
+            })))
+        }
+
+        Request::CreateDatabase { name } => {
+            if name == database {
+                return respond(Err(ApiError {
+                    code: "invalid_query".into(),
+                    message: "cannot create the currently selected database".into(),
+                }));
+            }
+            match state.databases.create(&name).await {
+                Ok(()) => respond(Ok(json!({
+                    "name": name,
+                    "created": true,
+                }))),
+                Err(err) => respond(Err(err)),
+            }
+        }
+
+        Request::DropDatabase { name } => {
+            if name == database {
+                return respond(Err(ApiError {
+                    code: "invalid_query".into(),
+                    message: "cannot drop the currently selected database".into(),
+                }));
+            }
+            match state.databases.drop_database(&name).await {
+                Ok(dropped) => respond(Ok(json!({
+                    "name": name,
+                    "dropped": dropped,
+                }))),
+                Err(err) => respond(Err(err)),
+            }
+        }
+
+        Request::Sync => {
+            let store = state.store.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                store.force_sync()?;
+                Ok::<Value, ApiError>(json!({ "synced": true }))
             });
             read_result(joined).await
         }
@@ -2548,7 +2670,7 @@ async fn exec(
             read_result(joined).await
         }
 
-        Request::WriteBatch { ops } => {
+        Request::WriteBatch { ops, durability } => {
             if vault_auth.is_some() {
                 return respond(Err(
                     vault::unsupported("write_batch on vault collections").into()
@@ -2557,17 +2679,18 @@ async fn exec(
             let req = WriteReq::Batch {
                 ops: ops.into_iter().map(WriteReq::from).collect(),
             };
-            submit_write(&state, req).await
+            submit_write(&state, req, durability.unwrap_or_default()).await
         }
 
         write_req => {
+            let durability = write_req.write_durability();
             let req = match write_req {
-                Request::Insert { coll, doc } => WriteReq::Insert {
+                Request::Insert { coll, doc, .. } => WriteReq::Insert {
                     coll,
                     doc,
                     vault: vault_auth.clone(),
                 },
-                Request::InsertMany { coll, docs } => WriteReq::InsertMany {
+                Request::InsertMany { coll, docs, .. } => WriteReq::InsertMany {
                     coll,
                     docs,
                     vault: vault_auth.clone(),
@@ -2579,6 +2702,7 @@ async fn exec(
                     multi,
                     upsert,
                     array_filters,
+                    ..
                 } => WriteReq::Update {
                     coll,
                     filter,
@@ -2598,6 +2722,7 @@ async fn exec(
                     remove,
                     array_filters,
                     projection,
+                    ..
                 } => WriteReq::FindAndModify {
                     coll,
                     filter,
@@ -2614,6 +2739,7 @@ async fn exec(
                     coll,
                     filter,
                     multi,
+                    ..
                 } => WriteReq::Delete {
                     coll,
                     filter,
@@ -2785,7 +2911,7 @@ async fn exec(
                 _ => unreachable!("read requests handled above"),
             };
 
-            submit_write(&state, req).await
+            submit_write(&state, req, durability).await
         }
     };
 
@@ -3151,7 +3277,23 @@ fn reject_vault_read(
     Ok(())
 }
 
-async fn submit_write(state: &AppState, req: WriteReq) -> (StatusCode, Json<ApiResponse>) {
+fn unsafe_writes_enabled() -> bool {
+    std::env::var("NONODB_ALLOW_UNSAFE_WRITES")
+        .ok()
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
+}
+
+async fn submit_write(
+    state: &AppState,
+    req: WriteReq,
+    durability: Durability,
+) -> (StatusCode, Json<ApiResponse>) {
+    if durability == Durability::Unsafe && !unsafe_writes_enabled() {
+        return respond(Err(ApiError {
+            code: "unsafe_durability_disabled".into(),
+            message: "unsafe durability requires NONODB_ALLOW_UNSAFE_WRITES=1".into(),
+        }));
+    }
     let index_build = req.is_index_build();
     let timeout = if index_build {
         index_build_timeout()
@@ -3170,6 +3312,7 @@ async fn submit_write(state: &AppState, req: WriteReq) -> (StatusCode, Json<ApiR
             // A long index backfill must not share a transaction with user
             // writes; it gets its own commit and cannot roll them back.
             isolated: index_build,
+            durability,
         })
         .is_err()
     {
@@ -3188,8 +3331,9 @@ fn batch_read(
     rtxn: &RoTxn<'_>,
     req: Request,
     principal: &nonodb_auth::Principal,
+    database: &str,
 ) -> Value {
-    match execute_read(store, rtxn, req, principal) {
+    match execute_read(store, rtxn, req, principal, database) {
         Ok(value) => json!({ "ok": true, "result": value }),
         Err(e) => json!({ "ok": false, "error": { "code": e.code, "message": e.message } }),
     }
@@ -3200,6 +3344,7 @@ fn execute_read(
     rtxn: &RoTxn<'_>,
     req: Request,
     principal: &nonodb_auth::Principal,
+    database: &str,
 ) -> Result<Value, ApiError> {
     match req {
         Request::Watch { .. } => Err(ApiError {
@@ -3310,7 +3455,7 @@ fn execute_read(
             }
             Ok(json!({ "results": c.aggregate_in(rtxn, &pipeline)? }))
         }
-        Request::Sql { query, params } => {
+        Request::Sql { query, params, .. } => {
             let prepared = nonodb_core::sql::PreparedSql::parse(&query)?;
             if !prepared.is_read_only() {
                 return Err(ApiError {
@@ -3376,6 +3521,10 @@ fn execute_read(
                         "fields": d.effective_fields(),
                         "unique": d.unique,
                         "include": d.include,
+                        "format": d.format,
+                        "geo": d.geo,
+                        "multikey_fields": d.multikey_fields,
+                        "multikey_all_docs": d.multikey_all_docs,
                     })
                 })
                 .collect();
@@ -3512,7 +3661,7 @@ fn execute_read(
         }
         Request::ListCollections => {
             let mut collections = store.collections_in(rtxn)?;
-            collections.retain(|coll| principal.can_see_collection(coll));
+            collections.retain(|coll| principal.can_see_collection(database, coll));
             Ok(json!({ "collections": collections }))
         }
         _ => Err(ApiError {
@@ -3560,6 +3709,9 @@ fn error_status(err: &ApiError) -> StatusCode {
         | "invalid_vault_document"
         | "vault_profile_immutable"
         | "invalid_collection_profile" => StatusCode::BAD_REQUEST,
+        "not_found" => StatusCode::NOT_FOUND,
+        "database_limit" => StatusCode::SERVICE_UNAVAILABLE,
+        "unsafe_durability_disabled" => StatusCode::BAD_REQUEST,
         "unauthorized" => StatusCode::UNAUTHORIZED,
         "forbidden" => StatusCode::FORBIDDEN,
         "rate_limited" => StatusCode::TOO_MANY_REQUESTS,

@@ -190,6 +190,7 @@ class NonoDB:
         client_cert: Optional[str] = None,
         client_key: Optional[str] = None,
         ca_cert: Optional[str] = None,
+        database: Optional[str] = None,
     ):
         if base_url is None:
             if socket_path is None:
@@ -200,6 +201,11 @@ class NonoDB:
             self.base_url = base_url.rstrip("/")
             transport = None
         self.socket_path = socket_path
+        self.database = (
+            database
+            if database is not None
+            else os.environ.get("NONODB_DB", "default")
+        ).strip() or "default"
         self.token = token if token is not None else os.environ.get("NONODB_TOKEN")
         if timeout is None:
             timeout = float(os.environ.get("NONODB_TIMEOUT", "10"))
@@ -252,6 +258,15 @@ class NonoDB:
         with self._cache_lock:
             self._cache.clear()
 
+    def sync(self) -> dict[str, Any]:
+        """Force an fsync of the selected database."""
+        return self.exec({"op": "sync"})
+
+    def _data_path(self, path: str) -> str:
+        if not self.database or self.database == "default":
+            return path
+        return f"/{self.database}{path}"
+
     # -- core --------------------------------------------------------
     def exec(
         self,
@@ -300,7 +315,7 @@ class NonoDB:
                 if self.token:
                     headers["authorization"] = f"Bearer {self.token}"
                 resp = self._http.post(
-                    self.base_url + "/v1/exec",
+                    self.base_url + self._data_path("/v1/exec"),
                     content=_dumps(payload),
                     headers=headers,
                 )
@@ -373,13 +388,22 @@ class NonoDB:
         """
         return self.exec({"op": "batch", "ops": ops})["results"]
 
-    def write_batch(self, ops: list[dict[str, Any]]) -> list[Any]:
+    def write_batch(
+        self,
+        ops: list[dict[str, Any]],
+        *,
+        durability: Optional[str] = None,
+    ) -> list[Any]:
         """Atomic write batch: all or nothing.
 
         Allowed operations: `insert`, `insert_many`, `update`, `delete`.
         Each must contain `coll`. Returns results in operation order.
+        `durability` is `full` (default), `relaxed`, or `unsafe`.
         """
-        return self.exec({"op": "write_batch", "ops": ops})["results"]
+        payload: dict[str, Any] = {"op": "write_batch", "ops": ops}
+        if durability is not None:
+            payload["durability"] = durability
+        return self.exec(payload)["results"]
 
     def create_collection(
         self,
@@ -610,15 +634,26 @@ class Collection:
         self.name = name
 
     # -- write -------------------------------------------------------
-    def insert(self, doc: dict[str, Any]) -> str:
-        return self._db.exec({"op": "insert", "coll": self.name, "doc": doc})[
-            "inserted_id"
-        ]
+    def insert(self, doc: dict[str, Any], *, durability: Optional[str] = None) -> str:
+        payload: dict[str, Any] = {"op": "insert", "coll": self.name, "doc": doc}
+        if durability is not None:
+            payload["durability"] = durability
+        return self._db.exec(payload)["inserted_id"]
 
-    def insert_many(self, docs: Iterable[dict[str, Any]]) -> list[str]:
-        return self._db.exec(
-            {"op": "insert_many", "coll": self.name, "docs": list(docs)}
-        )["inserted_ids"]
+    def insert_many(
+        self,
+        docs: Iterable[dict[str, Any]],
+        *,
+        durability: Optional[str] = None,
+    ) -> list[str]:
+        payload: dict[str, Any] = {
+            "op": "insert_many",
+            "coll": self.name,
+            "docs": list(docs),
+        }
+        if durability is not None:
+            payload["durability"] = durability
+        return self._db.exec(payload)["inserted_ids"]
 
     def update(
         self,
@@ -628,6 +663,7 @@ class Collection:
         *,
         upsert: bool = False,
         array_filters: Optional[list[dict[str, Any]]] = None,
+        durability: Optional[str] = None,
     ) -> int:
         """Updates documents; with `upsert=True`, inserts a new one when nothing matches."""
         return self.update_result(
@@ -636,6 +672,7 @@ class Collection:
             multi=multi,
             upsert=upsert,
             array_filters=array_filters,
+            durability=durability,
         )["modified"]
 
     def update_result(
@@ -646,6 +683,7 @@ class Collection:
         *,
         upsert: bool = False,
         array_filters: Optional[list[dict[str, Any]]] = None,
+        durability: Optional[str] = None,
     ) -> dict[str, Any]:
         """Returns `{matched, modified, upserted_id}` (useful for upserts)."""
         payload: dict[str, Any] = {
@@ -658,6 +696,8 @@ class Collection:
         }
         if array_filters is not None:
             payload["array_filters"] = array_filters
+        if durability is not None:
+            payload["durability"] = durability
         return self._db.exec(payload)
 
     def find_and_modify(
@@ -715,15 +755,33 @@ class Collection:
             payload["projection"] = projection
         return self._db.exec(payload)
 
-    def delete(self, filter: dict[str, Any], multi: bool = False) -> int:
-        return self._db.exec(
-            {"op": "delete", "coll": self.name, "filter": filter, "multi": multi}
-        )["deleted"]
+    def delete(
+        self,
+        filter: dict[str, Any],
+        multi: bool = False,
+        *,
+        durability: Optional[str] = None,
+    ) -> int:
+        payload: dict[str, Any] = {
+            "op": "delete",
+            "coll": self.name,
+            "filter": filter,
+            "multi": multi,
+        }
+        if durability is not None:
+            payload["durability"] = durability
+        return self._db.exec(payload)["deleted"]
 
-    def write_batch(self, ops: list[dict[str, Any]]) -> list[Any]:
+    def write_batch(
+        self,
+        ops: list[dict[str, Any]],
+        *,
+        durability: Optional[str] = None,
+    ) -> list[Any]:
         """Atomic write batch in this collection (`coll` is added automatically)."""
         return self._db.write_batch(
-            [{**op, "coll": op.get("coll", self.name)} for op in ops]
+            [{**op, "coll": op.get("coll", self.name)} for op in ops],
+            durability=durability,
         )
 
     # -- indexes -----------------------------------------------------
@@ -1158,7 +1216,7 @@ class Collection:
             try:
                 with http.stream(
                     "POST",
-                    db.base_url + "/v1/watch",
+                    db.base_url + db._data_path("/v1/watch"),
                     content=_dumps(payload),
                     headers=headers,
                     timeout=None,

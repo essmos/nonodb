@@ -22,3 +22,14 @@ func TestReadOps(t *testing.T) {
 		t.Fatal("insert must not be retried")
 	}
 }
+
+func TestDatabasePath(t *testing.T) {
+	c := &Client{database: "app1"}
+	if got := c.dataPath("/v1/exec"); got != "/app1/v1/exec" {
+		t.Fatalf("dataPath = %q", got)
+	}
+	c.database = "default"
+	if got := c.dataPath("/v1/exec"); got != "/v1/exec" {
+		t.Fatalf("default dataPath = %q", got)
+	}
+}

@@ -70,6 +70,22 @@ pub struct WatchThreshold {
     pub group_by: Vec<String>,
 }
 
+/// Write durability requested for one operation.
+///
+/// Atomicity is always preserved. These modes only control when LMDB forces
+/// data/metadata to stable storage.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "lowercase")]
+pub enum Durability {
+    /// Force data and metadata fsync before replying.
+    #[default]
+    Full,
+    /// Commit normally, without an explicit metadata fsync.
+    Relaxed,
+    /// Skip the extra sync entirely. Requires NONODB_ALLOW_UNSAFE_WRITES=1.
+    Unsafe,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 #[allow(clippy::large_enum_variant)]
@@ -77,10 +93,14 @@ pub enum Request {
     Insert {
         coll: String,
         doc: Value,
+        #[serde(default)]
+        durability: Option<Durability>,
     },
     InsertMany {
         coll: String,
         docs: Vec<Value>,
+        #[serde(default)]
+        durability: Option<Durability>,
     },
     Find {
         coll: String,
@@ -179,6 +199,8 @@ pub enum Request {
         upsert: bool,
         #[serde(default)]
         array_filters: Vec<Value>,
+        #[serde(default)]
+        durability: Option<Durability>,
     },
     /// Atomically update or remove one document and return its old/new image.
     FindAndModify {
@@ -199,6 +221,8 @@ pub enum Request {
         array_filters: Vec<Value>,
         #[serde(default)]
         projection: Option<Value>,
+        #[serde(default)]
+        durability: Option<Durability>,
     },
     Delete {
         coll: String,
@@ -206,6 +230,8 @@ pub enum Request {
         filter: Value,
         #[serde(default)]
         multi: bool,
+        #[serde(default)]
+        durability: Option<Durability>,
     },
     Count {
         coll: String,
@@ -223,6 +249,8 @@ pub enum Request {
         query: String,
         #[serde(default)]
         params: Vec<Value>,
+        #[serde(default)]
+        durability: Option<Durability>,
     },
     /// Explain a read-only SQL SELECT.
     ExplainSql {
@@ -380,6 +408,8 @@ pub enum Request {
     /// If any operation fails, the whole transaction is rolled back.
     WriteBatch {
         ops: Vec<WriteOp>,
+        #[serde(default)]
+        durability: Option<Durability>,
     },
     ListCollections,
     /// Creates a collection explicitly. `profile` is `standard` (default) or `vault`.
@@ -465,6 +495,18 @@ pub enum Request {
     ListSubscriptions {
         coll: String,
     },
+    /// Lists databases in this daemon.
+    ListDatabases,
+    /// Creates a database. Names are case-sensitive and validated.
+    CreateDatabase {
+        name: String,
+    },
+    /// Drops a non-default database and its files.
+    DropDatabase {
+        name: String,
+    },
+    /// Forces an fsync of this database, making all prior relaxed commits durable.
+    Sync,
     /// Returns the current LMDB map size and high-water mark.
     MapInfo,
     /// Grows the LMDB map without restarting the daemon.
@@ -753,8 +795,26 @@ impl Request {
             Self::RenewSubscription { .. } => "renew_subscription",
             Self::DeleteSubscription { .. } => "delete_subscription",
             Self::ListSubscriptions { .. } => "list_subscriptions",
+            Self::ListDatabases => "list_databases",
+            Self::CreateDatabase { .. } => "create_database",
+            Self::DropDatabase { .. } => "drop_database",
+            Self::Sync => "sync",
             Self::MapInfo => "map_info",
             Self::ResizeMap { .. } => "resize_map",
+        }
+    }
+
+    /// Effective durability for this request. Non-write requests are Full.
+    pub fn write_durability(&self) -> Durability {
+        match self {
+            Self::Insert { durability, .. }
+            | Self::InsertMany { durability, .. }
+            | Self::Update { durability, .. }
+            | Self::FindAndModify { durability, .. }
+            | Self::Delete { durability, .. }
+            | Self::Sql { durability, .. }
+            | Self::WriteBatch { durability, .. } => durability.unwrap_or_default(),
+            _ => Durability::Full,
         }
     }
 
@@ -785,7 +845,8 @@ impl Request {
             | Self::GetCollectionTtl { .. }
             | Self::GetCollectionHistory { .. }
             | Self::GetCollectionEvents { .. }
-            | Self::ListSubscriptions { .. } => true,
+            | Self::ListSubscriptions { .. }
+            | Self::ListDatabases => true,
             Self::Sql { query, .. } => nonodb_core::sql::is_read_only(query).unwrap_or(false),
             Self::Batch { ops } => ops.iter().all(Self::is_read_only),
             _ => false,
@@ -849,9 +910,15 @@ impl Request {
                 }
                 out
             }
-            Self::WriteBatch { ops } => ops.iter().flat_map(|op| op.collections()).collect(),
+            Self::WriteBatch { ops, .. } => ops.iter().flat_map(|op| op.collections()).collect(),
             Self::GetMore { .. } | Self::CloseCursor { .. } => Vec::new(),
-            Self::ListCollections | Self::MapInfo | Self::ResizeMap { .. } => Vec::new(),
+            Self::ListCollections
+            | Self::ListDatabases
+            | Self::CreateDatabase { .. }
+            | Self::DropDatabase { .. }
+            | Self::Sync
+            | Self::MapInfo
+            | Self::ResizeMap { .. } => Vec::new(),
         }
     }
 }

@@ -804,6 +804,184 @@ search, and BM25 verified correctly. The 10M backup was verified in 2m38s and
 restored with `--verify` in 2m52s; both collections and all indexes were
 reported intact.
 
+## Multi-database performance run (2026-11-13)
+
+This run validates the multi-database implementation and refreshes representative
+numbers. It is not a controlled comparison with the 2026-11-11 baseline: the same
+8 vCPU Haswell host had about 14 GiB of swap in use and was not exclusively
+dedicated during this run.
+
+Environment: release build, `NONODB_CACHE_TTL=0`, `NONODB_MAP_SIZE=8GiB`,
+`NONODB_MAX_OPEN_DATABASES=8`, ext4 under `/var/tmp`, one Unix socket, Python
+clients on the same host. The daemon reported **0 errors** over 268,837 requests
+(44,833 write operations, 224,046 read operations); the final writer queue was 0.
+
+### Single database and two concurrent databases
+
+`scripts/bench.py`, 12 worker processes unless noted.
+
+| Workload | Writes | Write p50/p95/p99 | Reads | Read p50/p95/p99 |
+|---|---:|---:|---:|---:|
+| One `default` DB | 2,707 ops/s | 3.40 / 7.28 / 25.97 ms | 5,211 ops/s | 1.45 / 4.12 / 10.90 ms |
+| `app1`, 6 workers | 1,680 ops/s | 2.90 / 5.69 / 11.96 ms | 3,158 ops/s | 1.38 / 3.42 / 7.55 ms |
+| `app2`, 6 workers, concurrent | 1,608 ops/s | 3.08 / 6.00 / 13.98 ms | 3,059 ops/s | 1.39 / 3.59 / 8.40 ms |
+| `app1` + `app2` aggregate | ~3,217 ops/s | — | ~6,122 ops/s | — |
+
+Two databases use independent writer threads and overlap their writes. The
+aggregate is higher than one database but not 2x on this host, which is CPU- and
+fsync-bound and was under memory pressure.
+
+### One million documents
+
+`scripts/large_test.py`, one collection, three secondary indexes.
+
+| Phase / query | Result |
+|---|---|
+| Load 1,000,000 documents | 16.4 s, **61,050 docs/s** |
+| Create 3 indexes | 5.5 s |
+| `find_one` by `_id` | 0.58 ms p50 / 1.11 ms p95 |
+| indexed `find(grp, limit 10)` | 0.66 / 1.31 ms |
+| indexed range `age`, limit 10 | 0.70 / 1.34 ms |
+| `count({})` | 0.60 / 1.23 ms |
+| indexed `count(grp)` | 0.76 / 1.68 ms |
+| deep indexed skip 500 | 2.39 / 4.94 ms |
+| indexed filter + sort by `age` | 3.74 / 4.57 ms |
+| unindexed `find_one(name)` | 78.68 / 181.78 ms |
+| 1,000 point reads in batches of 100 | 23.49 ms, **42,568 ops/s** |
+| Update / delete 1,000 indexed documents | 0.03 s / 0.05 s |
+| Daemon RSS after load/index/queries | ~1.69 GiB |
+
+The final `default/data.mdb` after the large, typed-search, vector, and backup
+tests was **1.7 GiB**. RSS includes mapped LMDB pages; it is not all heap.
+
+### Typed filters, aggregation, BM25, and fuzzy search
+
+`scripts/search_aggregate_bench.py --docs 250000 --text-docs 50000`.
+
+| Phase / operation | Result |
+|---|---|
+| Load 250,000 typed documents | 15.90 s, **15,724 docs/s** |
+| Create 10 typed indexes | 7.13 s |
+| Load 50,000 text documents | 0.96 s |
+| Text index / fuzzy index build | 0.46 s / 0.87 s |
+| Indexed equality, int/decimal/string/date/ObjectId/UUID/Long | ~0.62–0.78 ms p50 |
+| Indexed int/date/decimal range | ~0.92–1.15 ms p50 |
+| Prefix regex using string index | 1.25 ms p50 |
+| Unindexed contains regex | 871.56 ms p50 |
+| Unindexed binary equality | 1,808.75 ms p50 |
+| `$type` filters, indexed available types | ~0.90–1.17 ms p50 |
+| Indexed sort, limit 10 | 0.91 ms p50 |
+| Unindexed sort, limit 10 | 543.18 ms p50 |
+| Filtered + indexed sort, limit 10 | 3.30 ms p50 |
+| `count({})` / indexed count | 0.62 / ~0.65–0.67 ms p50 |
+| BM25 single term / phrase | 31.45 / 57.53 ms p50 |
+| Fuzzy distance 2 | 43.48 ms p50 |
+| `$group` 1,000 groups over 250k | 1,885.77 ms p50 |
+| Indexed match + group | 23.37 ms p50 |
+
+`scripts/aggregate_bench.py --docs 50000`:
+
+| Pipeline | p50 | p95 |
+|---|---:|---:|
+| `$count` | 0.56 ms | 0.65 ms |
+| `$limit 100` | 1.40 ms | 3.08 ms |
+| `$group` sum/avg into 1,000 groups | 40.21 ms | 69.37 ms |
+| `$group push/addToSet` into 100 groups | 127.57 ms | 188.73 ms |
+| `$sort + $limit 100` | 84.88 ms | 102.41 ms |
+| `$unwind`, 83,333 output rows | 946.24 ms | 1,041.62 ms |
+
+### Exact vector search
+
+200,000 deterministic 64-dimensional vectors, exact cosine index.
+
+| Operation | Result |
+|---|---|
+| Load vectors | 11.85 s, **16,874 docs/s** |
+| Build exact vector index | 0.67 s |
+| Search, no filter, limit 10 | 31.36 ms p50 / 69.86 ms p95 |
+| Search, indexed `cat` filter, limit 10 | 57.57 / 61.95 ms |
+| Search, exact `_id` filter | 0.62 / 1.13 ms |
+
+The last row exercises the exact `_id` fast path. The indexed category filter
+still has to evaluate many candidates and is not a selective vector shortcut.
+
+### Ordered lookup
+
+250,000 documents, unique `email` index with covering fields, 20% missing keys.
+
+| Workload | p50 / p95 / p99 | Key throughput |
+|---|---:|---:|
+| `lookup(_id)`, 1 key | 0.59 / 1.23 / 2.55 ms | ~1,430 keys/s |
+| `lookup(email)` covering, 1 key | 0.59 / 1.18 / 1.98 ms | ~1,480 keys/s |
+| `lookup(_id)`, 1,000 keys | 10.98 / 17.02 / 64.62 ms | **79,241 keys/s** |
+| `lookup(email)` covering, 1,000 keys | 7.45 / 12.70 / 31.53 ms | **119,777 keys/s** |
+| `lookup(email)` full docs, 1,000 keys | 11.98 / 17.84 / 28.86 ms | **77,430 keys/s** |
+| old `batch(find_one)`, 1,000 keys | 18.41 / 28.09 / 36.88 ms | 50,117 keys/s |
+| `lookup(_id)`, 1,000 keys, 50% duplicates | 7.60 / 12.66 / 29.15 ms | 114,610 keys/s |
+
+### Vault overhead
+
+5,000 documents, 500 iterations, 256-byte payload, cache disabled.
+
+| Operation | Standard | Vault | Overhead |
+|---|---:|---:|---:|
+| Insert throughput | 26,207 docs/s | 23,157 docs/s | 1.13x |
+| `find_one(_id)` p50 | 0.61 ms | 0.75 ms | 1.24x |
+| `find` by tenant p50 | 1.18 ms | 1.76 ms | 1.49x |
+| `count` by tenant p50 | 8.02 ms | 11.86 ms | 1.48x |
+| `update(_id)` p50 | 2.28 ms | 2.43 ms | 1.06x |
+
+### Whole-instance backup
+
+With three open databases and a 1.7 GiB instance:
+
+| Operation | Result |
+|---|---|
+| `backup-all`, all databases while daemon is live | **12.56 s**, ~1.7 GiB copied |
+| Backup process peak RSS | ~1.37 GiB |
+| `verify-backup` default DB | 25.64 s, deep document/index checks |
+| `verify-backup` app DBs | ~0.02 s each |
+
+The backup writes a per-database manifest and SHA-256 plus an instance manifest.
+Restore was exercised separately in `scripts/multi_database_test.py`.
+
+### Write durability modes
+
+`scripts/durability_test.py`, release daemon, ext4, same data directory,
+cache disabled. This is a correctness/crash test with an informational timing
+section; the host was under load.
+
+| Workload | Throughput |
+|---|---:|
+| 1,000 individual inserts, `full` | 337–351 docs/s |
+| 1,000 individual inserts, `relaxed` | 364–407 docs/s |
+| 1,000 individual inserts, `unsafe` | 379–399 docs/s |
+| 10,000 inserts in batches of 1,000, `full` | ~25,000–26,800 docs/s |
+| 10,000 inserts in batches of 1,000, `relaxed` | ~24,300–28,800 docs/s |
+| 10,000 inserts in batches of 1,000, `unsafe` | ~27,300–28,600 docs/s |
+
+A separate controlled comparison on the same host, binary, 64-byte payload,
+2,000 individual inserts per round, three rounds and median, gave:
+
+| Binary / mode | Median |
+|---|---:|
+| pre-durability release (default sync) | 419 docs/s |
+| new release, `full` | 414 docs/s |
+| new release, `relaxed` | 437 docs/s |
+| new release, `full` with unsafe opt-in | 440 docs/s |
+| new release, `unsafe` | 526 docs/s |
+
+This confirms that the earlier 337–351 docs/s figures were host-load variance,
+not a durability regression. `full` is within noise of the previous release;
+`unsafe` is the only mode with a clear single-insert gain.
+
+Batch size dominates the result: with 1,000-document batches there are only ten
+commits, so durability mode changes little. Individual writes still pay one
+writer transaction per request; `unsafe` removes only the final sync. The test
+also verifies that `full` and explicitly `sync`ed writes survive `SIGKILL`, that
+`unsafe` is rejected without opt-in, and that it works with
+`NONODB_ALLOW_UNSAFE_WRITES=1`.
+
 ## Interpreting the results
 
 - **Indexed point/range reads scale.** 0.5–1.5 ms from 1M to 10M for the tested

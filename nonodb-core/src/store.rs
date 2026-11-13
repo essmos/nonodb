@@ -167,15 +167,42 @@ impl<'a> Deref for ReadTxn<'a> {
 pub struct WriteTxn<'a> {
     txn: RwTxn<'a>,
     _guard: TxnGuard<'a>,
+    env: &'a Env,
+    sync_on_commit: bool,
 }
 
 impl<'a> WriteTxn<'a> {
-    pub(crate) fn new(txn: RwTxn<'a>, guard: TxnGuard<'a>) -> Self {
-        Self { txn, _guard: guard }
+    pub(crate) fn new(
+        txn: RwTxn<'a>,
+        guard: TxnGuard<'a>,
+        env: &'a Env,
+        sync_on_commit: bool,
+    ) -> Self {
+        Self {
+            txn,
+            _guard: guard,
+            env,
+            sync_on_commit,
+        }
     }
 
-    /// Commits the transaction and releases the gate.
+    /// Commits the transaction, optionally forcing an `fsync`.
     pub fn commit(self) -> heed::Result<()> {
+        let Self {
+            txn,
+            _guard,
+            env,
+            sync_on_commit,
+        } = self;
+        txn.commit()?;
+        if sync_on_commit {
+            env.force_sync()?;
+        }
+        Ok(())
+    }
+
+    /// Commits without forcing `fsync`; the caller decides when to sync.
+    pub fn commit_unsynced(self) -> heed::Result<()> {
         self.txn.commit()
     }
 
@@ -227,8 +254,22 @@ impl Store {
 
         // SAFETY: the file is not modified outside LMDB and is not opened
         // concurrently with another `map_size` (the daemon is the sole owner).
+        // LMDB sync flags are environment-wide, not transaction-wide. We open
+        // with NO_META_SYNC and force a full sync for durable commits. This
+        // allows per-request `relaxed` writes without changing the default
+        // durability of ordinary writes. Unsafe mode is opt-in because NO_SYNC
+        // can lose recent transactions on a crash.
+        let flags = if std::env::var("NONODB_ALLOW_UNSAFE_WRITES")
+            .ok()
+            .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
+        {
+            EnvFlags::NO_SYNC
+        } else {
+            EnvFlags::NO_META_SYNC
+        };
         let env = unsafe {
             EnvOpenOptions::new()
+                .flags(flags)
                 .map_size(map_size)
                 .max_dbs(MAX_DBS)
                 .open(path)?
@@ -329,7 +370,25 @@ impl Store {
 
     pub fn write_txn(&self) -> Result<WriteTxn<'_>> {
         let guard = self.txn_gate.enter();
-        Ok(WriteTxn::new(self.env.write_txn()?, guard))
+        Ok(WriteTxn::new(self.env.write_txn()?, guard, &self.env, true))
+    }
+
+    /// Writer-only transaction that leaves the final sync decision to the
+    /// caller. Used by group commit to implement per-request durability.
+    pub fn write_txn_unsynced(&self) -> Result<WriteTxn<'_>> {
+        let guard = self.txn_gate.enter();
+        Ok(WriteTxn::new(
+            self.env.write_txn()?,
+            guard,
+            &self.env,
+            false,
+        ))
+    }
+
+    /// Flushes the LMDB environment to stable storage.
+    pub fn force_sync(&self) -> Result<()> {
+        self.env.force_sync()?;
+        Ok(())
     }
 
     /// Current LMDB map size in bytes.
@@ -405,6 +464,7 @@ impl Store {
         let history: Database<Bytes, Bytes> = env.create_database(&mut wtxn, Some(HISTORY_DB))?;
         let ttl: Database<Bytes, Bytes> = env.create_database(&mut wtxn, Some(TTL_DB))?;
         wtxn.commit()?;
+        env.force_sync()?;
         Ok((history, ttl))
     }
 
@@ -1260,6 +1320,11 @@ impl Store {
     /// Removes stale TTL entries for a collection that no longer exists.
     pub fn ttl_remove_in(&self, wtxn: &mut RwTxn<'_>, coll: &str, id: &str) -> Result<()> {
         ttl::remove_entry(&self.ttl, wtxn, coll, id)
+    }
+
+    /// Stable process-local identifier for this LMDB environment.
+    pub fn id(&self) -> usize {
+        &self.env as *const _ as usize
     }
 
     /// List of registered collections.

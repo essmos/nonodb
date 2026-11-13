@@ -52,16 +52,28 @@ fi
 export NONODB_SOCK="$TMP/run/nonodb.sock"
 unset NONODB_URL NONODB_TOKEN NONODB_TLS_VERIFY
 
-echo "== Rust client"
-cargo run -q -p nonodb-client --example quickstart
+python3 - <<'PY'
+import os
+import sys
+sys.path.insert(0, os.path.join(os.getcwd(), "client"))
+from nonodb import NonoDB
+db = NonoDB(os.environ["NONODB_SOCK"])
+try:
+    db.exec({"op": "create_database", "name": "app1"})
+finally:
+    db.close()
+PY
 
-echo "== Node.js client"
-node client/node/smoke_test.js
+echo "== Rust client (database app1)"
+NONODB_DB=app1 cargo run -q -p nonodb-client --example quickstart
 
-echo "== Go client"
+echo "== Node.js client (database app1)"
+NONODB_DB=app1 node client/node/smoke_test.js
+
+echo "== Go client (database app1)"
 (
   cd client/go
-  go run ./cmd/smoke
+  NONODB_DB=app1 go run ./cmd/smoke
 )
 
 echo "== Dates"

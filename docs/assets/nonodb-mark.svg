@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title">
+  <title id="title">NonoDB mark</title>
+  <defs>
+    <linearGradient id="n" x1="70" y1="72" x2="188" y2="186" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#58A6FF"/>
+      <stop offset="1" stop-color="#2EA043"/>
+    </linearGradient>
+    <linearGradient id="bg" x1="24" y1="18" x2="228" y2="240" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#161B22"/>
+      <stop offset="1" stop-color="#0D1117"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="240" height="240" rx="58" fill="url(#bg)"/>
+  <rect x="9.5" y="9.5" width="237" height="237" rx="56.5" fill="none" stroke="#30363D" stroke-width="3"/>
+  <path d="M76 184V72L180 184V72" fill="none" stroke="url(#n)" stroke-width="28" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M60 204h136" stroke="#58A6FF" stroke-opacity=".28" stroke-width="5" stroke-linecap="round"/>
+</svg>

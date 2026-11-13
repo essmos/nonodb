@@ -16,6 +16,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"runtime"
 	"strconv"
@@ -139,6 +140,7 @@ type VectorIndex struct {
 type config struct {
 	socketPath string
 	baseURL    string
+	database   string
 	token      string
 	timeout    time.Duration
 	verify     bool
@@ -159,6 +161,11 @@ func WithSocketPath(path string) Option {
 // socket path.
 func WithBaseURL(url string) Option {
 	return func(c *config) { c.baseURL = strings.TrimRight(url, "/") }
+}
+
+// WithDatabase selects a database inside a multi-database daemon.
+func WithDatabase(database string) Option {
+	return func(c *config) { c.database = database }
 }
 
 // WithToken sets the bearer token.
@@ -192,6 +199,7 @@ func WithTLSCA(caFile string) Option {
 // Client is a thin nonodb client. It is safe for concurrent use.
 type Client struct {
 	baseURL     string
+	database    string
 	token       string
 	vaultTenant string
 	vaultKeyID  string
@@ -206,6 +214,7 @@ func New(options ...Option) *Client {
 	cfg := config{
 		socketPath: os.Getenv("NONODB_SOCK"),
 		baseURL:    strings.TrimRight(os.Getenv("NONODB_URL"), "/"),
+		database:   os.Getenv("NONODB_DB"),
 		token:      os.Getenv("NONODB_TOKEN"),
 		timeout:    envTimeout(),
 		verify:     envVerify(),
@@ -264,9 +273,14 @@ func New(options ...Option) *Client {
 		}
 	}
 
+	database := cfg.database
+	if database == "" {
+		database = "default"
+	}
 	return &Client{
-		baseURL: strings.TrimRight(baseURL, "/"),
-		token:   cfg.token,
+		baseURL:  strings.TrimRight(baseURL, "/"),
+		database: database,
+		token:    cfg.token,
 		http: &http.Client{
 			Transport: transport,
 			Timeout:   cfg.timeout,
@@ -314,6 +328,13 @@ func (c *Client) Health(ctx context.Context) bool {
 	return response.StatusCode == http.StatusOK
 }
 
+func (c *Client) dataPath(path string) string {
+	if c.database == "" || c.database == "default" {
+		return path
+	}
+	return "/" + url.PathEscape(c.database) + path
+}
+
 // Exec executes an arbitrary /v1/exec payload and returns its result.
 func (c *Client) Exec(ctx context.Context, payload map[string]any) (any, error) {
 	raw, err := c.execRaw(ctx, payload)
@@ -359,7 +380,7 @@ func (c *Client) execOnce(ctx context.Context, payload map[string]any) (json.Raw
 	request, err := http.NewRequestWithContext(
 		ctx,
 		http.MethodPost,
-		c.baseURL+"/v1/exec",
+		c.baseURL+c.dataPath("/v1/exec"),
 		bytes.NewReader(body),
 	)
 	if err != nil {

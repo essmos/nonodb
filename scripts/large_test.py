@@ -51,8 +51,14 @@ def bench(label: str, fn, n: int) -> None:
 def resources() -> str:
     parts = []
     if DATA:
-        f = os.path.join(DATA, "data.mdb")
-        if os.path.exists(f):
+        database = os.environ.get("NONODB_DB", "default")
+        candidates = [
+            os.path.join(DATA, database, "data.mdb"),
+            os.path.join(DATA, "default", "data.mdb"),
+            os.path.join(DATA, "data.mdb"),
+        ]
+        f = next((path for path in candidates if os.path.isfile(path)), "")
+        if f:
             parts.append(f"data.mdb={os.path.getsize(f) / 1e6:.1f} MB")
     if PID and os.path.exists(f"/proc/{PID}/status"):
         with open(f"/proc/{PID}/status") as fh:

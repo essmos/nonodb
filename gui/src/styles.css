@@ -205,15 +205,27 @@ h3 {
   border-radius: 6px;
   display: grid;
   place-items: center;
-  font-weight: 800;
-  color: #ffffff;
-  background: #1f6feb;
+  overflow: hidden;
+  flex: 0 0 auto;
+}
+
+.brand-mark img {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+.brand strong {
+  display: block;
+  line-height: 1.05;
 }
 
 .brand small,
 .brand p {
+  display: block;
   color: var(--muted);
   font-size: 0.8rem;
+  margin-top: 2px;
 }
 
 .link-button {
@@ -1483,4 +1495,16 @@ select {
   gap: 0.7rem;
   border-top: 1px solid var(--border);
   padding-top: 0.8rem;
+}
+
+
+.database-select {
+  width: calc(100% - 24px);
+  margin: 0 12px 12px;
+  padding: 7px 9px;
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font: inherit;
 }

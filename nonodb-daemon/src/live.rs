@@ -101,6 +101,7 @@ struct Inner {
 }
 
 struct LiveSub {
+    store_id: usize,
     coll: String,
     subscription: Subscription,
     tx: mpsc::Sender<Value>,
@@ -135,6 +136,7 @@ impl LiveRegistry {
 
     pub fn register(
         self: &Arc<Self>,
+        store_id: usize,
         coll: String,
         mut subscription: Subscription,
         tx: mpsc::Sender<Value>,
@@ -148,6 +150,7 @@ impl LiveRegistry {
         inner.subs.insert(
             id,
             LiveSub {
+                store_id,
                 coll,
                 subscription,
                 tx,
@@ -166,9 +169,12 @@ impl LiveRegistry {
         !inner.subs.is_empty()
     }
 
-    pub fn has_coll(&self, coll: &str) -> bool {
+    pub fn has_coll(&self, store_id: usize, coll: &str) -> bool {
         let inner = self.inner.lock().expect("live registry poisoned");
-        inner.subs.values().any(|sub| sub.coll == coll)
+        inner
+            .subs
+            .values()
+            .any(|sub| sub.store_id == store_id && sub.coll == coll)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -182,13 +188,14 @@ impl LiveRegistry {
         before: Option<&Value>,
         after: Option<&Value>,
     ) -> Result<Vec<PendingLive>, ApiError> {
+        let store_id = target.store_id();
         let mut inner = self.inner.lock().expect("live registry poisoned");
         if inner.subs.is_empty() {
             return Ok(Vec::new());
         }
         let mut pending = Vec::new();
         for (id, sub) in &mut inner.subs {
-            if sub.coll != coll || !sub.subscription.watches_op(op) {
+            if sub.store_id != store_id || sub.coll != coll || !sub.subscription.watches_op(op) {
                 continue;
             }
             let condition_doc = if op == "delete" { before } else { after };

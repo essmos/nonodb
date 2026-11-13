@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/assets/nonodb-logo.svg" alt="NonoDB" width="360">
+</p>
+
 # NoNoDB
 
 [![CI](https://github.com/essmos/nonodb/actions/workflows/ci.yml/badge.svg)](https://github.com/essmos/nonodb/actions/workflows/ci.yml)
@@ -121,6 +125,14 @@ nonodb is deliberately not a general-purpose distributed database. It has:
 For a single host, a small-to-medium data set, and a workload dominated by
 indexed reads and modest writes, those trade-offs buy a very small operational
 footprint.
+
+## Multiple databases
+
+One daemon can host several independent databases under `NONODB_DATA`:
+`default`, `app1`, and so on. Use `/<database>/v1/exec` (or `/v1/exec` for
+`default`), `nonodb-cli --db <name>`, or the GUI database selector. Legacy
+single-database directories are migrated to `default/` on startup. See
+[Multiple databases](docs/multi-database.md).
 
 ## Features
 
@@ -696,12 +708,23 @@ optional GUI profile:
 
 ```bash
 docker compose -f deploy/docker-compose.yml --profile gui up -d
-``` The GUI supports document
-browsing and editing, collection settings, TTL/history/events, secondary indexes,
-SQL, LMDB map settings, and metrics. Node.js is only needed to build the GUI, not
-to run it.
+```
 
-See [GUI console](docs/gui.md).
+The GUI supports document browsing and editing, collection settings,
+TTL/history/events, secondary indexes, SQL, LMDB map settings, and metrics.
+Node.js is only needed to build the GUI, not to run it.
+
+<p align="center">
+  <img src="docs/assets/gui/overview.png" alt="NonoDB GUI overview with database selector" width="49%">
+  <img src="docs/assets/gui/documents-1m.png" alt="NonoDB GUI browsing one million documents" width="49%">
+</p>
+
+The screenshots use the `perf1` database with one million documents and the
+database selector introduced by the multi-database implementation. More views
+and a short walkthrough video are in the [GUI console](docs/gui.md#screenshots)
+documentation.
+
+[Watch the 16-second GUI walkthrough](docs/assets/gui/demo.mp4).
 
 ## Documentation
 

@@ -36,6 +36,34 @@ enforced on that path.
 Exposing the GUI beyond loopback is only safe with TLS, authentication, and a
 trusted reverse proxy or tunnel. The GUI itself does not terminate TLS.
 
+## Screenshots
+
+Overview with the database selector; the example below uses `perf1` with one
+million documents:
+
+![NonoDB GUI overview](assets/gui/overview.png)
+
+Documents browser with keyset pagination, filters, sorting, and the document
+editor:
+
+![NonoDB GUI documents](assets/gui/documents-1m.png)
+
+Index management, including the automatic index state and text/vector indexes:
+
+![NonoDB GUI indexes](assets/gui/indexes-1m.png)
+
+Search console for full-text/fuzzy/vector queries:
+
+![NonoDB GUI search](assets/gui/search-1m.png)
+
+Runtime metrics and time-series samples:
+
+![NonoDB GUI metrics](assets/gui/metrics-1m.png)
+
+A short walkthrough of switching databases and opening collections:
+
+[Download the GUI walkthrough video (MP4, 16 s)](assets/gui/demo.mp4)
+
 ## Connection
 
 The GUI uses the same database credential as the CLI and API: a NonoDB bearer
@@ -45,7 +73,10 @@ token. There is no separate GUI account.
 - If the GUI process has `NONODB_TOKEN`, the local GUI session endpoint fills
   the token automatically.
 - Otherwise enter the token in the single **Database token** field.
-- Vault tenant, key id, key, endpoint, and saved profiles are under **Advanced**.
+- Vault tenant, key id, key, endpoint, database, and saved profiles are under
+  **Advanced**.
+- The sidebar database selector switches between databases in the same daemon.
+  Requests are routed as `/<database>/v1/exec` and `/<database>/v1/watch`.
 
 Credentials are kept in browser `sessionStorage` for the active session. Saved
 connection profiles use browser `localStorage`; do not save production tokens on

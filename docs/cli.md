@@ -16,6 +16,25 @@ nonodb-cli <command> [arguments]
 
 Run `nonodb-cli help` for a summary.
 
+Every daemon-facing command accepts `--db <name>` or `NONODB_DB=<name>` to select
+a database. Without it, `default` is used. See
+[Multiple databases](multi-database.md).
+
+## databases
+
+Manage databases in one daemon:
+
+```bash
+nonodb-cli databases list
+nonodb-cli databases create app1
+nonodb-cli --db app1 find orders '{}'
+nonodb-cli databases drop app1
+```
+
+`list`, `create`, and `drop` call `list_databases`, `create_database`, and
+`drop_database`. A non-default database cannot be dropped while another active
+request is using it.
+
 ## gui
 
 Starts the embedded local web console and opens the browser:
@@ -32,8 +51,8 @@ nonodb-cli gui --url http://127.0.0.1:7879
 the Unix socket path is treated as trusted local admin.
 
 The server listens on `127.0.0.1` by default. Non-loopback binds require
-`--allow-remote` and should sit behind TLS/auth. It proxies `/v1/exec`,
-`/healthz`, and `/metrics` to the daemon. The React assets are embedded in the CLI binary. See
+`--allow-remote` and should sit behind TLS/auth. It proxies `/v1/exec`, database-scoped
+`/<database>/v1/exec`, `/v1/watch`, `/healthz`, and `/metrics` to the daemon. The React assets are embedded in the CLI binary. See
 [GUI console](gui.md).
 
 ## ping
@@ -202,6 +221,22 @@ daemon, lower `NONODB_MAP_SIZE`, and restart; the file itself only shrinks via a
 compacting backup/restore. Do not run `backup` or `inspect` concurrently with
 an online resize.
 
+## sync
+
+Force an fsync of the selected database:
+
+```bash
+nonodb-cli --db app1 sync
+```
+
+```json
+{"synced": true}
+```
+
+Use it after a bulk import written with `durability="relaxed"` or `"unsafe"`.
+The operation requires database-admin scope and is separate from per-request
+durability in the HTTP API.
+
 ## exec
 
 Send an arbitrary `/v1/exec` request:
@@ -220,10 +255,11 @@ prints the full response envelope.
 
 ## backup
 
-Create a consistent, compacted copy of an LMDB data directory:
+Create a consistent, compacted copy of one database. In the multi-database
+layout the source is `./data/<database>/` (or legacy `./data/`):
 
 ```bash
-nonodb-cli backup ./data ./backup
+nonodb-cli --db app1 backup ./data ./backup
 ```
 
 ```text
@@ -247,13 +283,35 @@ nonodb-cli inspect ./backup
 nonodb-cli verify-backup ./backup
 ```
 
+## backup-all
+
+Back up every database under an instance root:
+
+```bash
+nonodb-cli backup-all /var/lib/nonodb /var/backups/nonodb/instance
+```
+
+It writes `instance/manifest.json` plus `<database>/data.mdb` and
+`<database>/manifest.json` for each database. The auth registry is not copied.
+
+## restore-all
+
+Restore every database listed in an instance manifest:
+
+```bash
+nonodb-cli restore-all /var/backups/nonodb/instance /var/lib/nonodb --force --verify
+```
+
+Stop the daemon first. Existing database files require `--force`; databases not
+listed in the manifest are left untouched.
+
 ## verify
 
 Deep-check a data directory without a manifest:
 
 ```bash
-nonodb-cli verify ./data
-nonodb-cli verify ./data --json
+nonodb-cli --db app1 verify ./data
+nonodb-cli --db app1 verify ./data --json
 ```
 
 The command opens the database read-only and checks:
@@ -337,6 +395,8 @@ Rules and warnings:
 - **Stop the daemon before restoring.** Replacing `data.mdb` under a running
   process is unsafe.
 - `--force` is required when the destination `data.mdb` already exists.
+- With a multi-database root, the default target is `default/data.mdb`; use
+  `--db` to restore another database.
 - The command removes a stale `lock.mdb` from the destination.
 - The backup can be either a directory containing `data.mdb` or a direct path
   to a `data.mdb` file.

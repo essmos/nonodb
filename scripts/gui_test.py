@@ -119,6 +119,26 @@ def main() -> int:
 
             health = json.loads(fetch(base + "/healthz"))
             assert health, health
+
+            fetch(base + "/v1/exec", data={"op": "create_database", "name": "app1"})
+            fetch(
+                base + "/app1/v1/exec",
+                data={"op": "insert", "coll": "gui_orders", "doc": {"_id": "a1", "n": 2}},
+            )
+            result = json.loads(
+                fetch(
+                    base + "/app1/v1/exec",
+                    data={"op": "find", "coll": "gui_orders", "filter": {}},
+                )
+            )
+            assert result["result"] == [{"_id": "a1", "n": 2}], result
+            result = json.loads(
+                fetch(
+                    base + "/v1/exec",
+                    data={"op": "find", "coll": "gui_orders", "filter": {}},
+                )
+            )
+            assert result["result"] == [{"_id": "o1", "n": 1}], result
             print("gui e2e: ok")
             return 0
         finally:

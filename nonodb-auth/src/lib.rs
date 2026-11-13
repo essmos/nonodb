@@ -137,10 +137,16 @@ pub enum Action {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ScopeRule {
     All,
-    Read(String),
-    Write(String),
-    AdminCollection(String),
+    Read(Resource),
+    Write(Resource),
+    AdminCollection(Resource),
     AdminDatabase,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Resource {
+    database: Option<String>,
+    collection: String,
 }
 
 impl ScopeRule {
@@ -168,13 +174,7 @@ impl ScopeRule {
         if action == "admin" && resource == "db" {
             return Ok(Self::AdminDatabase);
         }
-        let resource = match resource {
-            "*" => "*".to_string(),
-            name => {
-                validate_collection_name(name)?;
-                name.to_string()
-            }
-        };
+        let resource = parse_resource(resource)?;
         match action {
             "read" => Ok(Self::Read(resource)),
             "write" => Ok(Self::Write(resource)),
@@ -183,15 +183,61 @@ impl ScopeRule {
         }
     }
 
-    fn matches_collection(&self, action: Action, coll: &str) -> bool {
+    fn matches_collection(&self, action: Action, database: &str, coll: &str) -> bool {
         match (self, action) {
             (Self::All, _) => true,
             (Self::Read(rule), Action::Read)
             | (Self::Write(rule), Action::Write)
-            | (Self::AdminCollection(rule), Action::AdminCollection) => rule == "*" || rule == coll,
+            | (Self::AdminCollection(rule), Action::AdminCollection) => {
+                rule.matches(database, coll)
+            }
             _ => false,
         }
     }
+}
+
+impl Resource {
+    fn matches(&self, database: &str, coll: &str) -> bool {
+        let database_matches = self
+            .database
+            .as_deref()
+            .is_none_or(|rule| rule == "*" || rule == database);
+        let collection_matches = self.collection == "*" || self.collection == coll;
+        database_matches && collection_matches
+    }
+
+    fn display(&self) -> String {
+        match &self.database {
+            Some(database) => format!("{database}/{}", self.collection),
+            None => self.collection.clone(),
+        }
+    }
+}
+
+fn parse_resource(raw: &str) -> Result<Resource, String> {
+    let (database, collection) = match raw.split_once('/') {
+        Some((database, collection)) => {
+            if collection.contains('/') {
+                return Err(format!(
+                    "invalid scope resource `{raw}` (expected database/collection)"
+                ));
+            }
+            validate_database_name(database)?;
+            (Some(database.to_string()), collection)
+        }
+        None => (None, raw),
+    };
+    let collection = match collection {
+        "*" => "*".to_string(),
+        name => {
+            validate_collection_name(name)?;
+            name.to_string()
+        }
+    };
+    Ok(Resource {
+        database,
+        collection,
+    })
 }
 
 impl Principal {
@@ -217,10 +263,10 @@ impl Principal {
         &self.name
     }
 
-    pub fn allows(&self, action: Action, coll: &str) -> bool {
+    pub fn allows(&self, action: Action, database: &str, coll: &str) -> bool {
         self.scopes
             .iter()
-            .any(|rule| rule.matches_collection(action, coll))
+            .any(|rule| rule.matches_collection(action, database, coll))
     }
 
     pub fn allows_admin_database(&self) -> bool {
@@ -230,10 +276,10 @@ impl Principal {
     }
 
     /// Collection metadata visibility: any collection scope or full admin.
-    pub fn can_see_collection(&self, coll: &str) -> bool {
-        self.allows(Action::Read, coll)
-            || self.allows(Action::Write, coll)
-            || self.allows(Action::AdminCollection, coll)
+    pub fn can_see_collection(&self, database: &str, coll: &str) -> bool {
+        self.allows(Action::Read, database, coll)
+            || self.allows(Action::Write, database, coll)
+            || self.allows(Action::AdminCollection, database, coll)
             || self
                 .scopes
                 .iter()
@@ -245,9 +291,9 @@ impl Principal {
             .iter()
             .map(|rule| match rule {
                 ScopeRule::All => "*:*".to_string(),
-                ScopeRule::Read(resource) => format!("read:{resource}"),
-                ScopeRule::Write(resource) => format!("write:{resource}"),
-                ScopeRule::AdminCollection(resource) => format!("admin:{resource}"),
+                ScopeRule::Read(resource) => format!("read:{}", resource.display()),
+                ScopeRule::Write(resource) => format!("write:{}", resource.display()),
+                ScopeRule::AdminCollection(resource) => format!("admin:{}", resource.display()),
                 ScopeRule::AdminDatabase => "admin:db".to_string(),
             })
             .collect()
@@ -552,6 +598,25 @@ fn validate_name(kind: &str, name: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_database_name(name: &str) -> Result<(), String> {
+    if name == "*" {
+        return Ok(());
+    }
+    if name.is_empty() || name.len() > 64 {
+        return Err(format!("invalid database name in scope `{name}`"));
+    }
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return Err(format!("invalid database name in scope `{name}`"));
+    };
+    if !first.is_ascii_alphanumeric()
+        || !chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+    {
+        return Err(format!("invalid database name in scope `{name}`"));
+    }
+    Ok(())
+}
+
 fn validate_collection_name(name: &str) -> Result<(), String> {
     if name.is_empty() || name.len() > 255 || name == "db" {
         return Err(format!("invalid collection name in scope `{name}`"));
@@ -607,12 +672,12 @@ mod tests {
             Err(AuthError::InvalidToken)
         );
         let principal = registry.authenticate_token(&token).unwrap();
-        assert!(principal.allows(Action::Read, "orders"));
-        assert!(!principal.allows(Action::Read, "customers"));
-        assert!(principal.allows(Action::Write, "orders"));
+        assert!(principal.allows(Action::Read, "default", "orders"));
+        assert!(!principal.allows(Action::Read, "default", "customers"));
+        assert!(principal.allows(Action::Write, "default", "orders"));
         assert!(!principal.allows_admin_database());
-        assert!(principal.can_see_collection("orders"));
-        assert!(!principal.can_see_collection("customers"));
+        assert!(principal.can_see_collection("default", "orders"));
+        assert!(!principal.can_see_collection("default", "customers"));
     }
 
     #[test]
@@ -643,6 +708,11 @@ mod tests {
         assert!(ScopeRule::parse("*:*").is_ok());
         assert!(ScopeRule::parse("read:orders").is_ok());
         assert!(ScopeRule::parse("read:*").is_ok());
+        assert!(ScopeRule::parse("read:app1/orders").is_ok());
+        assert!(ScopeRule::parse("write:*/orders").is_ok());
+        assert!(ScopeRule::parse("read:app1/*").is_ok());
+        assert!(ScopeRule::parse("read:app1/orders/extra").is_err());
+        assert!(ScopeRule::parse("read:bad db/orders").is_err());
         assert!(ScopeRule::parse("admin:db").is_ok());
         assert!(ScopeRule::parse("read:").is_err());
         assert!(ScopeRule::parse("*:orders").is_err());

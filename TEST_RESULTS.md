@@ -40,6 +40,26 @@ release build. The latest validation also exercised a 10M-document collection,
 | Background jobs and outbox events | OK (12 Python unit tests; real-daemon integration: atomic rollback, checkpoint restart, retry, late events, 8x100 concurrent producers, watch long-poll, filters/projection, truncation, NDJSON/SSE streams, concurrent stream delivery (6×100 integration; 16×1000 manual stress, 0 missing/duplicate), CLI) |
 | 10k keepalive mixed workload | OK (5 min UDS at 4.9k req/s; 2 min TLS at 4.1k req/s; 0 errors) |
 
+## Multi-database performance run (2026-11-13)
+
+Release daemon, 8 vCPU Haswell, 22 GiB RAM, ext4, cache disabled, 8 GiB map.
+The host had heavy swap use and was not exclusively dedicated, so treat these as
+current-host measurements rather than a comparison with the older baseline.
+Full tables: [docs/benchmarks.md](docs/benchmarks.md#multi-database-performance-run-2026-11-13).
+
+| Workload | Result |
+|---|---|
+| One database, 12 clients | 2,707 writes/s, 5,211 `_id` reads/s |
+| Two databases, 6 clients each | ~3,217 writes/s and ~6,122 reads/s aggregate |
+| 1M documents | 16.4 s load, 61,050 docs/s; 3 indexes in 5.5 s |
+| 1M indexed point/range/count | ~0.58–0.76 ms p50 |
+| 250k typed documents + 50k text | 10 indexes; BM25 31–58 ms; fuzzy 43 ms |
+| 200k × 64-d vectors | 0.67 s index; unfiltered search 31 ms p50 |
+| 250k lookup, 1,000 covering keys | 119,777 keys/s |
+| Vault overhead | 1.06–1.24x on point operations |
+| `backup-all`, 1.7 GiB / 3 DBs | 12.56 s live backup; 25.64 s deep verify |
+| Errors | 0 over 268,837 requests |
+
 ## Large-scale and connection-storm run (2026-11-11)
 
 Host: 8 vCPU, 22.9 GiB RAM, ext4. Release daemon, `NONODB_CACHE_TTL=0`,

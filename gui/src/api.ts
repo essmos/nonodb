@@ -1,5 +1,6 @@
 export type Connection = {
   endpoint: string;
+  database: string;
   token: string;
   tenant: string;
   keyId: string;
@@ -48,6 +49,7 @@ export type ConnectionProfile = {
 export function defaultConnection(): Connection {
   return {
     endpoint: window.location.origin,
+    database: 'default',
     token: '',
     tenant: '',
     keyId: '',
@@ -99,6 +101,12 @@ function endpointFor(connection: Connection, path: string): string {
   return `${endpoint}${path}`;
 }
 
+function scopedPath(connection: Connection, path: string): string {
+  const database = (connection.database ?? 'default').trim();
+  if (!database || database === 'default') return path;
+  return `/${encodeURIComponent(database)}${path}`;
+}
+
 export async function exec<T = unknown>(
   connection: Connection,
   body: Record<string, unknown>,
@@ -106,7 +114,7 @@ export async function exec<T = unknown>(
   const started = performance.now();
   const op = typeof body.op === 'string' ? body.op : 'request';
   try {
-    const response = await fetch(endpointFor(connection, '/v1/exec'), {
+    const response = await fetch(endpointFor(connection, scopedPath(connection, '/v1/exec')), {
       method: 'POST',
       headers: headers(connection),
       body: JSON.stringify(body),
@@ -171,7 +179,7 @@ export async function watchStream(
   onEvent: (event: Record<string, unknown>) => void,
   signal: AbortSignal,
 ): Promise<void> {
-  const response = await fetch(endpointFor(connection, '/v1/watch'), {
+  const response = await fetch(endpointFor(connection, scopedPath(connection, '/v1/watch')), {
     method: 'POST',
     headers: { ...headers(connection), accept: 'application/x-ndjson' },
     body: JSON.stringify(body),

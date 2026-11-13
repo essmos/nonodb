@@ -44,6 +44,7 @@ impl Kind {
 #[derive(Clone)]
 pub struct State {
     pub owner: String,
+    pub database: String,
     pub kind: Kind,
     pub last_id: Option<String>,
     pub remaining: Option<usize>,
@@ -54,13 +55,20 @@ pub struct State {
 }
 
 impl State {
-    pub fn new(owner: String, kind: Kind, limit: Option<usize>, batch_size: Option<usize>) -> Self {
+    pub fn new(
+        owner: String,
+        database: String,
+        kind: Kind,
+        limit: Option<usize>,
+        batch_size: Option<usize>,
+    ) -> Self {
         let skip = match &kind {
             Kind::Find { skip, .. } => *skip,
             Kind::Aggregate { .. } => 0,
         };
         Self {
             owner,
+            database,
             kind,
             last_id: None,
             remaining: limit,
@@ -169,6 +177,7 @@ mod tests {
     fn state(owner: &str) -> State {
         State::new(
             owner.to_string(),
+            "default".to_string(),
             Kind::Find {
                 coll: "items".to_string(),
                 filter: json!({}),

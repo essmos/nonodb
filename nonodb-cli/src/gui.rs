@@ -157,17 +157,23 @@ fn handle(mut client: TcpStream, target: &Target) -> Result<(), String> {
             false,
         );
     }
-    if request.path.starts_with("/v1/watch") {
+    let plain_path = request.path.split('?').next().unwrap_or("");
+    let segments: Vec<&str> = plain_path.trim_start_matches('/').split('/').collect();
+    let database_scoped = segments.len() == 3
+        && !segments[0].is_empty()
+        && segments[0] != "v1"
+        && segments[1] == "v1";
+    if plain_path == "/v1/watch" || (database_scoped && segments[2] == "watch") {
         return proxy_stream(client, target, &request);
     }
-    if request.path == "/v1/exec"
-        || request.path == "/healthz"
-        || request.path == "/metrics"
-        || request.path.starts_with("/v1/exec?")
+    if plain_path == "/v1/exec"
+        || plain_path == "/healthz"
+        || plain_path == "/metrics"
+        || (database_scoped && segments[2] == "exec")
     {
         return proxy(client, target, &request);
     }
-    if request.path.starts_with("/v1/") {
+    if plain_path.starts_with("/v1/") {
         return write_response(
             &mut client,
             501,

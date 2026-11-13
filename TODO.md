@@ -62,6 +62,31 @@ limitations are documented in [docs/roadmap.md](docs/roadmap.md).
 - [x] Unique multikey indexes: same-document duplicates allowed, cross-document
       duplicates rejected
 
+## In progress — multi-database architecture
+
+- [x] Database = separate LMDB environment (`<root>/<db>/data.mdb`) with its own writer.
+- [x] Root layout discovery and `default` migration from the legacy single `data.mdb`.
+- [x] Routing `/{database}/v1/exec` and `/{database}/v1/watch`; `/v1/exec` aliases `default`.
+- [x] Global endpoints: list/create/drop databases.
+- [x] Per-database store, writer, cache, auto-index, maintenance, TTL/history/events/subscriptions.
+- [x] Per-database cursors and live subscriptions.
+- [x] Database-aware auth scopes: `read:db/collection`, `write:db/collection`; global `admin:db` remains instance-wide.
+- [x] CLI `--db`, `databases list|create|drop` (info via exec).
+- [x] GUI database selector, one endpoint/port.
+- [x] Backup/restore per database with manifest (`--db`).
+- [x] Whole-instance online backup/restore command for all databases.
+- [x] Lazy open/close and `NONODB_MAX_OPEN_DATABASES`; sharded writer pool remains future work.
+- [x] Database option in official Python, Rust, Node.js, and Go clients; `NONODB_DB` support.
+- [x] Multi-database, GUI, and live-stream tests wired into CI.
+- [x] Feature matrix inside a non-default database: CRUD, complex filters, lookup,
+      aggregation, BM25, fuzzy, vector search, TTL, history/versioning, events,
+      subscriptions, jobs, and automatic indexes.
+- [x] Per-request write durability (`full`/`relaxed`/`unsafe`), group-commit sync rules,
+      opt-in unsafe mode, `sync` operation, CLI, docs, and crash tests.
+- [x] Documentation and migration guide.
+- [ ] Shared sharded writer pool for much higher write concurrency (future scaling step).
+- [ ] Per-database metrics, quotas, and a per-database administrator role.
+
 ## Next
 
 ### P0 — query and update compatibility

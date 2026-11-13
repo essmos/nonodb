@@ -18,7 +18,7 @@ use tokio::sync::oneshot;
 use crate::cache::QueryCache;
 use crate::live;
 use crate::metrics;
-use crate::protocol::{ApiError, WriteReq};
+use crate::protocol::{ApiError, Durability, WriteReq};
 
 /// Maximum number of operations in one transaction.
 const MAX_BATCH: usize = 512;
@@ -31,14 +31,27 @@ pub struct WriteJob {
     pub resp: oneshot::Sender<Result<Value, ApiError>>,
     /// This operation alone in the transaction (e.g. a long auto-index backfill).
     pub isolated: bool,
+    /// Requested durability. A group commit uses the strictest mode in the batch.
+    pub durability: Durability,
 }
 
 /// Writer thread loop. Ends when the channel is closed.
-pub fn run(store: Arc<Store>, rx: Receiver<WriteJob>, cache: Arc<QueryCache>) {
+pub fn run(
+    store: Arc<Store>,
+    rx: Receiver<WriteJob>,
+    cache: Arc<QueryCache>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+) {
     loop {
-        let first = match rx.recv() {
+        let first = match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(job) => job,
-            Err(_) => break,
+            Err(RecvTimeoutError::Timeout) => {
+                if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                continue;
+            }
+            Err(RecvTimeoutError::Disconnected) => break,
         };
         let mut jobs = vec![first];
         // Adaptive window: the longer the queue, the larger the batch (fewer fsyncs),
@@ -84,7 +97,8 @@ fn run_batch(store: &Store, cache: &QueryCache, jobs: Vec<WriteJob>) {
         return;
     }
     metrics::inc(&metrics::WRITE_BATCHES);
-    let mut wtxn = match store.write_txn() {
+    let sync = jobs.iter().any(|job| job.durability == Durability::Full);
+    let mut wtxn = match store.write_txn_unsynced() {
         Ok(wtxn) => wtxn,
         Err(e) => {
             let err = ApiError::from(e);
@@ -101,8 +115,21 @@ fn run_batch(store: &Store, cache: &QueryCache, jobs: Vec<WriteJob>) {
     }
 
     let started = Instant::now();
-    match wtxn.commit() {
+    match wtxn.commit_unsynced() {
         Ok(()) => {
+            if sync {
+                if let Err(e) = store.force_sync() {
+                    // The transaction is committed and visible; only durability
+                    // failed. Invalidate reads and dispatch live events anyway.
+                    cache.invalidate();
+                    live::dispatch_pending();
+                    let err = ApiError::from(e);
+                    for job in jobs {
+                        let _ = job.resp.send(Err(err.clone()));
+                    }
+                    return;
+                }
+            }
             metrics::add(&metrics::COMMIT_NS, started.elapsed().as_nanos() as u64);
             cache.invalidate();
             live::dispatch_pending();
@@ -123,7 +150,8 @@ fn run_batch(store: &Store, cache: &QueryCache, jobs: Vec<WriteJob>) {
 
 fn run_single(store: &Store, cache: &QueryCache, job: WriteJob) {
     metrics::inc(&metrics::WRITE_BATCHES);
-    let mut wtxn = match store.write_txn() {
+    let sync = job.durability == Durability::Full;
+    let mut wtxn = match store.write_txn_unsynced() {
         Ok(wtxn) => wtxn,
         Err(e) => {
             let _ = job.resp.send(Err(ApiError::from(e)));
@@ -132,8 +160,16 @@ fn run_single(store: &Store, cache: &QueryCache, job: WriteJob) {
     };
     let started = Instant::now();
     match execute(store, &mut wtxn, &job.req) {
-        Ok(value) => match wtxn.commit() {
+        Ok(value) => match wtxn.commit_unsynced() {
             Ok(()) => {
+                if sync {
+                    if let Err(e) = store.force_sync() {
+                        cache.invalidate();
+                        live::dispatch_pending();
+                        let _ = job.resp.send(Err(ApiError::from(e)));
+                        return;
+                    }
+                }
                 metrics::add(&metrics::COMMIT_NS, started.elapsed().as_nanos() as u64);
                 cache.invalidate();
                 live::dispatch_pending();
@@ -203,7 +239,7 @@ fn event_config(
     let config = store.collection_events_in_rw(wtxn, coll)?;
     if config.active()
         || store.has_subscriptions_in_rw(wtxn, coll)?
-        || live::registry().has_coll(coll)
+        || live::registry().has_coll(store.id(), coll)
     {
         Ok(Some(config))
     } else {
