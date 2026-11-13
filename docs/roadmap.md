@@ -74,8 +74,9 @@ Implemented:
   Use `find_and_modify`, atomic update operators (`$inc`), or `write_batch`.
 - **One writer.** All writes are serialized. This is a design choice, not a
   temporary limitation.
-- **No replication, sharding, or clustering.** One daemon owns one data
-  directory.
+- **No replication, sharding, or clustering.** One daemon owns one instance
+  root containing independent LMDB databases; there are no cross-database
+  transactions or queries.
 
 ### Query language
 
@@ -220,6 +221,18 @@ Implemented:
 These are not commitments. They are ordered roughly by expected value for the
 project's target workload.
 
+### GUI and operator experience
+
+1. **Database management from the GUI.** Create/drop databases, not just select
+   them.
+2. **Daemon-side auth and backup APIs.** Let the GUI manage principals, tokens,
+   backup verification, and restore without direct filesystem access.
+3. **Multiple daemon tabs.** Keep several profiles connected simultaneously.
+4. **Per-collection metrics and import progress.** Add collection-level counters,
+   cancellable/resumable imports, and virtualized large result sets.
+5. **Accessibility and theming.** Keyboard navigation, screen-reader labels, and
+   an optional light theme.
+
 ### High value
 
 1. **Raw JSON passthrough for simple reads.** For `find` without projection or
@@ -261,7 +274,7 @@ project's target workload.
 15. Approximate vector indexes (HNSW/IVF/PQ) and polygon/line document geo indexes.
 16. A published Python package and additional language clients.
 17. Benchmark automation in CI.
-18. A web UI or schema browser.
+18. Shared or hosted web administration beyond the embedded local GUI.
 
 ## Non-goals
 
@@ -269,8 +282,9 @@ project's target workload.
 - Distributed consensus, replication, or sharding.
 - A general-purpose OLAP engine.
 - Full MongoDB feature parity.
-- Running multiple writers against one data directory.
-- Network filesystems for the data directory.
+- Running multiple writers against one LMDB environment.
+- Cross-database queries or transactions.
+- Network filesystems for the instance root.
 
 ## Versioning
 

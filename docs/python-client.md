@@ -92,6 +92,27 @@ export NONODB_TIMEOUT=300
 
 Use a larger timeout for index creation and large backfills.
 
+### Databases
+
+One daemon can host several independent databases. Pass `database=` or set
+`NONODB_DB`; the default is `default`:
+
+```python
+db = NonoDB("/run/nonodb.sock", database="app1")
+```
+
+```bash
+export NONODB_DB=app1
+```
+
+The client routes requests to `/<database>/v1/exec`. A base URL may also include
+the database prefix, for example `http://127.0.0.1:7878/app1`, if `database` is
+left at its default. Do not specify the same database in both places.
+
+Collections, indexes, subscriptions, TTL, history, and events are isolated per
+database. There are no cross-database queries or transactions. See
+[Multiple databases](multi-database.md).
+
 ### Lifecycle
 
 `NonoDB` owns an `httpx.Client`. Close it when the process or application

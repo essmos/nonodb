@@ -7,7 +7,7 @@ capacity planning, and troubleshooting for a nonodb daemon.
 
 A nonodb deployment has:
 
-- one `nonodb-daemon` process per data directory;
+- one `nonodb-daemon` process per instance root (`NONODB_DATA`);
 - one or more LMDB environments under that directory, each in its own
   subdirectory (`<database>/data.mdb`, `<database>/lock.mdb`); the `default`
   database is always present;
@@ -18,9 +18,9 @@ Linux and macOS support both Unix sockets and TCP. Windows has no Unix socket
 listener; the daemon requires `NONODB_TCP` and `NONODB_AUTH_FILE` there. The
 Windows CLI connects over plaintext HTTP/TCP using `NONODB_URL`.
 
-The daemon must be the only process that opens the LMDB environment for
-writing. Do not run two daemons against the same data directory. Do not place
-the data directory on NFS, SMB, or other network filesystems that do not provide
+The daemon must be the only process that opens the LMDB environments for
+writing. Do not run two daemons against the same instance root. Do not place
+the instance root on NFS, SMB, or other network filesystems that do not provide
 reliable POSIX locking and mmap semantics.
 
 The daemon creates the socket with mode `0660`. The application workers must be
@@ -467,18 +467,19 @@ docker run --rm \
   -v nonodb-data:/var/lib/nonodb:ro \
   -v /host/backups:/backups \
   ghcr.io/essmos/nonodb:0.20.0 \
-  nonodb-cli backup /var/lib/nonodb /backups/$(date -u +%Y%m%dT%H%M%SZ)
+  nonodb-cli backup-all /var/lib/nonodb /backups/$(date -u +%Y%m%dT%H%M%SZ)
 ```
 
-The backup command opens the source read-only and writes a compacted
-`data.mdb` into the destination directory.
+`backup-all` opens each database read-only and writes a compacted `data.mdb`
+plus a per-database `manifest.json`, then an instance manifest. For one
+database, use `nonodb-cli --db app1 backup /var/lib/nonodb OUT`.
 
 ## Permissions
 
 Recommended Unix permissions:
 
 - data directory: owned by `nonodb:nonodb`, mode `0750` or stricter;
-- `data.mdb` and `lock.mdb`: owned by `nonodb`;
+- `<database>/data.mdb` and `<database>/lock.mdb`: owned by `nonodb`;
 - socket: created by the daemon with mode `0660`;
 - application processes: members of the `nonodb` group.
 
@@ -562,9 +563,10 @@ For certificate generation, mTLS setup, rotation, and troubleshooting, see
 ## Snapshots
 
 Periodic snapshots are enabled with `NONODB_SNAPSHOT_DIR`,
-`NONODB_SNAPSHOT_INTERVAL`, and `NONODB_SNAPSHOT_KEEP`. Snapshots are compacted
-consistent copies named `data-<unix-ms>.mdb`; they are not point-in-time
-recovery and are not verified automatically.
+`NONODB_SNAPSHOT_INTERVAL`, and `NONODB_SNAPSHOT_KEEP`. Each database writes
+compacted, consistent copies below its own directory:
+`<snapshot-dir>/<database>/data-<unix-ms>.mdb`. Snapshots are not point-in-time
+recovery, are not atomic across databases, and are not verified automatically.
 
 See [Periodic snapshots](backup.md#periodic-snapshots) for configuration,
 retention, and restore details.
@@ -579,17 +581,20 @@ Quick reference:
 
 ```bash
 TS=$(date -u +%Y%m%dT%H%M%SZ)
-nonodb-cli backup /var/lib/nonodb "/var/backups/nonodb/$TS"
-nonodb-cli verify-backup "/var/backups/nonodb/$TS"
+nonodb-cli backup-all /var/lib/nonodb "/var/backups/nonodb/$TS"
+nonodb-cli verify-backup "/var/backups/nonodb/$TS/default"
+# Verify every other <database>/manifest.json the same way.
 
 systemctl stop nonodb
-nonodb-cli restore "/var/backups/nonodb/$TS" /var/lib/nonodb --force --verify
+nonodb-cli restore-all "/var/backups/nonodb/$TS" /var/lib/nonodb --force --verify
 chown -R nonodb:nonodb /var/lib/nonodb
 systemctl start nonodb
 ```
 
-Never restore over a live database. `auth.json` and the audit log are not part
-of a database backup; protect them separately.
+For one database, use `nonodb-cli --db app1 backup ...` and
+`nonodb-cli --db app1 restore ...`. Never restore over a live database.
+`auth.json` and the audit log are not part of a database backup; protect them
+separately.
 
 ## Monitoring
 

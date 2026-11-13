@@ -173,6 +173,19 @@ limitations are documented in [docs/roadmap.md](docs/roadmap.md).
       collection settings, indexes, SQL, map settings, metrics, local API proxy,
       CI/Docker asset builds, and an end-to-end GUI test
 
+### P2 — GUI and operator experience
+
+- [ ] Create/drop databases directly in the GUI.
+- [ ] Daemon-side auth management APIs and GUI principals/tokens management.
+- [ ] Online backup and manifest verification from the GUI.
+- [ ] Simultaneous multi-daemon connection tabs.
+- [ ] Per-collection metrics in the GUI.
+- [ ] Cancellable, resumable large imports with progress.
+- [ ] Virtualized document lists and resumable cursors for very large results.
+- [ ] Optional light theme.
+- [ ] Accessibility audit and expanded keyboard navigation.
+- [ ] Export/import of saved views and filters without credentials.
+
 ### P1 — lookup enhancements
 
 - [ ] Serve `_id`-only projections (`fields=["_id"]` or

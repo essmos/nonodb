@@ -10,6 +10,32 @@ examples. All clients accept `NONODB_TLS_CA`, `NONODB_TLS_CLIENT_CERT`, and
 `NONODB_TLS_CLIENT_KEY` when connecting to a daemon that requires client
 certificates.
 
+## Databases
+
+All clients accept an explicit database and read `NONODB_DB` as a fallback. The
+default is `default`. Collections and queries never span databases.
+
+```python
+db = NonoDB("/run/nonodb.sock", database="app1")
+```
+
+```rust
+let db = Client::builder()
+    .socket_path("/run/nonodb.sock")
+    .database("app1")
+    .build()?;
+```
+
+```js
+const db = new NonoDB({ socketPath: '/run/nonodb.sock', database: 'app1' });
+```
+
+```go
+db := nonodb.New(nonodb.WithDatabase("app1"))
+```
+
+See [Multiple databases](../docs/multi-database.md).
+
 ## Batch lookups
 
 All clients expose `lookup`/`lookup_one` for ordered point lookups by `_id` or a

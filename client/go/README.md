@@ -28,6 +28,20 @@ db := nonodb.New(
 The same values are read from `NONODB_TLS_CA`, `NONODB_TLS_CLIENT_CERT`, and
 `NONODB_TLS_CLIENT_KEY`.
 
+## Databases
+
+One daemon can host several independent databases. Select one with
+`WithDatabase`, or set `NONODB_DB`; the default is `default`:
+
+```go
+db := nonodb.New(
+    nonodb.WithSocketPath("/run/nonodb.sock"),
+    nonodb.WithDatabase("app1"),
+)
+```
+
+See [Multiple databases](../../docs/multi-database.md).
+
 See [docs/clients.md](../../docs/clients.md) for the full client guide. Run
 `NONODB_SOCK=/run/nonodb.sock go run ./cmd/smoke` against a daemon for an
 end-to-end check.

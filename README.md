@@ -13,14 +13,15 @@ large feature set under the hood.**
 **Idle daemon memory: about 5 MB RAM.** That is measured with a 1M-document
 database and three indexes after a restart. The on-disk LMDB file grows with
 the data and indexes; the ~5 MB figure is process memory, not the database
-file. Hot data stays in the OS page cache instead of the daemon heap.
+files. Hot data stays in the OS page cache instead of the daemon heap.
 
 NoNoDB is a local NoSQL document store written in Rust. It needs no external
 database server and runs comfortably on small VMs, edge boxes, and developer
 machines. It speaks a practical subset of MongoDB's query language over
 HTTP/JSON, stores documents in LMDB, and runs as a single daemon that is the
-only process allowed to touch the database file. Application workers connect
-to it through a Unix socket and use a thin client.
+only process allowed to touch the database files. Application workers connect
+to it through a Unix socket and use a thin client. One daemon can host several
+independent databases.
 
 Low resource use is the starting point, not the whole story. Under the hood,
 nonodb is a real document database with:
@@ -61,11 +62,11 @@ MongoDB, or Redis, nonodb is aimed at you.
 │ uvicorn worker 1 │──┐
 │ uvicorn worker 2 │──┤   HTTP/JSON over Unix socket   ┌───────────────┐
 │ ...              │──┼───────────────────────────────▶│ nonodb-daemon │
-│ uvicorn worker N │──┘                                │ 1 writer      │
-└──────────────────┘                                   │ 1 LMDB env    │
+│ uvicorn worker N │──┘                                │ 1 writer / DB │
+└──────────────────┘                                   │ N LMDB envs   │
                                                        └───────┬───────┘
                                                                │
-                                                         ./data (LMDB)
+                                                   ./data/<database>/ (LMDB)
 ```
 
 ## Why nonodb exists
@@ -93,11 +94,12 @@ The usual answers are heavier than the problem:
   would otherwise open the same environment independently.
 
 nonodb takes the SQLite philosophy — embedded, zero-administration, one local
-file — and applies it to JSON documents. It separates the database engine from
-its clients:
+data directory — and applies it to JSON documents. It separates the database
+engine from its clients:
 
-1. **One daemon owns the LMDB environment.** No other process opens the data
-   file. This removes multi-process mmap, `fork()`, and stale-reader problems.
+1. **One daemon owns every LMDB environment.** No other process opens the data
+   files. This removes multi-process mmap, `fork()`, and stale-reader problems.
+   Databases are isolated from each other while sharing one daemon and port.
 2. **Clients are thin.** Application workers talk HTTP/JSON over a Unix socket.
    A Python client wraps this in a small, familiar API.
 3. **Writes are serialized and grouped.** One writer thread batches requests and

@@ -263,7 +263,7 @@ nonodb-cli --db app1 backup ./data ./backup
 ```
 
 ```text
-backup: ./data -> ./backup/data.mdb
+backup: ./data/app1 -> ./backup/data.mdb
 manifest: ./backup/manifest.json (sha256 ...)
 ```
 
@@ -272,11 +272,13 @@ manifest: ./backup/manifest.json (sha256 ...)
 - `CompactionOption::Enabled` omits free pages, so the backup is usually smaller
   than the live `data.mdb`.
 - The output directory is created if needed.
-- Only `data.mdb` is copied. `lock.mdb` is not part of the backup.
+- Only the selected database's `data.mdb` is copied. `lock.mdb` is not part of
+  the backup.
 - The copy is synced to disk before the command exits.
 - `manifest.json` records the source, timestamp, file size, and SHA-256.
 
-The resulting directory is a valid nonodb data directory. To inspect and verify it:
+The resulting directory is a one-database backup, not an instance root. To
+inspect and verify it directly:
 
 ```bash
 nonodb-cli inspect ./backup
@@ -292,7 +294,9 @@ nonodb-cli backup-all /var/lib/nonodb /var/backups/nonodb/instance
 ```
 
 It writes `instance/manifest.json` plus `<database>/data.mdb` and
-`<database>/manifest.json` for each database. The auth registry is not copied.
+`<database>/manifest.json` for each database. Each database copy is consistent
+on its own, but the set is not atomic across databases. The auth registry is
+not copied.
 
 ## restore-all
 
@@ -356,7 +360,8 @@ query cycle. See [Backup and restore](backup.md#restore-drills).
 Print database and per-collection document counts without starting the daemon:
 
 ```bash
-nonodb-cli inspect ./data
+nonodb-cli inspect ./data              # default database
+nonodb-cli --db app1 inspect ./data
 nonodb-cli inspect ./data users
 ```
 
@@ -366,6 +371,10 @@ collections: 2
   users: 1000
   settings: 12
 ```
+
+With a multi-database instance root, add `--db` or pass the database directory
+directly (for example `./data/app1`). Without `--db`, the command resolves the
+legacy root or `default/`.
 
 If a collection is given, only that collection is printed. The command opens
 the environment read-only with room for all named databases. The daemon should
@@ -385,8 +394,8 @@ nonodb-cli restore ./backup ./data --force --verify
 ```
 
 ```text
-restore: ./backup/data.mdb -> ./data/data.mdb
-verified: ./data
+restore: ./backup/data.mdb -> ./data/default/data.mdb
+verified: ./data/default
 ...
 ```
 
@@ -473,6 +482,7 @@ grammar, audit log, and mTLS setup.
 | `NONODB_URL` | `http://127.0.0.1:7878` | Daemon-facing commands on Windows |
 | `NONODB_TOKEN` | — | Bearer token for daemon-facing commands |
 | `NONODB_AUTH_FILE` | `/etc/nonodb/auth.json` (Unix) | Registry used by `auth` commands |
+| `NONODB_DB` | `default` | Database selected by daemon-facing commands |
 
 `backup`, `inspect`, `restore`, and `auth` do not use the socket or token.
 `auth` commands edit the local auth file directly.
@@ -483,17 +493,20 @@ grammar, audit log, and mTLS setup.
 
 ```bash
 TS=$(date -u +%Y%m%dT%H%M%SZ)
-nonodb-cli backup /var/lib/nonodb /var/backups/nonodb/$TS
-nonodb-cli inspect /var/backups/nonodb/$TS
+nonodb-cli backup-all /var/lib/nonodb /var/backups/nonodb/$TS
+nonodb-cli inspect /var/backups/nonodb/$TS/default
 ```
+
+For a single database, use `nonodb-cli --db app1 backup ...`.
 
 ### Restore after an incident
 
 ```bash
 systemctl stop nonodb
-nonodb-cli restore /var/backups/nonodb/20261109T120000Z /var/lib/nonodb --force
+nonodb-cli restore-all \
+  /var/backups/nonodb/20261109T120000Z /var/lib/nonodb --force --verify
 systemctl start nonodb
-NONODB_SOCK=/run/nonodb/nonodb.sock nonodb-cli count users
+NONODB_SOCK=/run/nonodb/nonodb.sock nonodb-cli --db app1 count users
 ```
 
 ### Raw query for automation

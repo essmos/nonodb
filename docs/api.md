@@ -1,12 +1,13 @@
 # HTTP API
 
-nonodb exposes a single JSON endpoint for data operations, plus health and
+nonodb exposes one JSON operation endpoint per database, plus health and
 metrics endpoints.
 
 - Base URL over a Unix socket: `http://localhost`
 - Default socket: `/run/nonodb.sock`
 - Data endpoint: `POST /v1/exec` (alias for `/default/v1/exec`)
 - Database-scoped endpoint: `POST /{database}/v1/exec`
+- Stream endpoint: `POST /v1/watch` (alias for `/default/v1/watch`)
 - Database-scoped stream: `POST /{database}/v1/watch`
 - Health: `GET /healthz`
 - Metrics: `GET /metrics`
@@ -17,8 +18,8 @@ See [Multiple databases](multi-database.md) for database routing and
 
 ## Envelope
 
-Every `/v1/exec` request is a JSON object with an `op` field. A successful
-call returns:
+Every request to `/v1/exec` or `/{database}/v1/exec` is a JSON object with an
+`op` field. A successful call returns:
 
 ```json
 {"ok": true, "result": ...}
@@ -91,8 +92,9 @@ loss is unacceptable.
 The Unix socket is a trusted local channel and uses the `local` principal with
 full access.
 
-TCP always requires `NONODB_AUTH_FILE`. Every `/v1/exec` and `/metrics` request
-must use either a registered bearer token:
+TCP always requires `NONODB_AUTH_FILE`. Every data request (`/v1/exec` or
+`/{database}/v1/exec`) and every `/metrics` request must use either a registered
+bearer token:
 
 ```http
 Authorization: Bearer nodb_<kid>_<secret>

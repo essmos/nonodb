@@ -36,9 +36,23 @@ let db = Client::builder()
 ```
 
 `Client::from_env()` reads `NONODB_SOCK`, `NONODB_URL`, `NONODB_TOKEN`,
-`NONODB_TLS_VERIFY`, `NONODB_TLS_CA`, `NONODB_TLS_CLIENT_CERT`, and
+`NONODB_DB`, `NONODB_TLS_VERIFY`, `NONODB_TLS_CA`, `NONODB_TLS_CLIENT_CERT`, and
 `NONODB_TLS_CLIENT_KEY`. See [docs/clients.md](../docs/clients.md) for the full
 client guide.
+
+## Databases
+
+One daemon can host several independent databases. Select one in the builder,
+or set `NONODB_DB`; the default is `default`:
+
+```rust
+let db = Client::builder()
+    .socket_path("/run/nonodb.sock")
+    .database("app1")
+    .build()?;
+```
+
+See [Multiple databases](../docs/multi-database.md).
 
 ## Document history
 

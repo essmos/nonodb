@@ -9,8 +9,9 @@ you only want to use nonodb, start with the [README](../README.md) and the
 
 nonodb is built around a small set of explicit goals:
 
-1. **One local database, no external service.** A single daemon owns the data
-   directory. Clients do not open LMDB.
+1. **One local deployment, multiple databases, no external service.** A single
+   daemon owns the instance root and all of its database directories. Clients do
+   not open LMDB.
 2. **Safe for preforking servers.** Any number of uvicorn/Gunicorn workers can
    connect over a Unix socket without sharing file descriptors or mmap state.
 3. **Crash safety by default.** A process kill must not corrupt the database.
@@ -49,9 +50,10 @@ Non-goals are listed in [Roadmap and limits](roadmap.md).
                                                    └──────────────────────────┘
 ```
 
-Only `nonodb-daemon` opens LMDB environments. Each database has its own
-environment and writer thread; there is never more than one writer per
-environment. With multiple databases, reads and writes in different databases
+`nonodb-daemon` is the only writer. Administrative CLI commands may open a
+database read-only for backup, inspection, or verification; restore runs with
+the daemon stopped. Each database has its own environment and writer thread;
+there is never more than one writer per environment. With multiple databases, reads and writes in different databases
 are independent. See [Multiple databases](multi-database.md). Read requests are executed on
 blocking worker threads (Tokio's `spawn_blocking`); write requests are sent to a
 dedicated writer thread over an `mpsc` channel. The HTTP layer never performs
@@ -361,7 +363,8 @@ The full scan path, raw prefilter, and read cache remain in place. If an
 automatic index is dropped or cannot be built, queries still return correct
 results through the fallback path.
 
-Automatic indexes are marked in `auto-index.json` in the data directory. Only
+Automatic indexes are marked in `auto-index.json` in each database directory
+(for example `NONODB_DATA/default/auto-index.json`). Only
 those indexes are eligible for TTL eviction; manually created indexes are never
 removed. Demand is recorded even on cache hits so a hot query does not lose its
 index merely because the cache is serving it.

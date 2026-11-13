@@ -85,12 +85,13 @@ version make the file invalid.
 | `read:<collection>` | find, find_one, lookup, count, aggregate, SQL `SELECT`, explain_sql, explain, search, fuzzy, vector search, history, get_version, get_collection_ttl, get_collection_history, get_collection_events, list_subscriptions, list indexes |
 | `write:<collection>` | insert, insert_many, update, find_and_modify, delete, SQL `INSERT`/`UPDATE` |
 | `admin:<collection>` | create/drop collection, create/drop secondary/text/fuzzy/vector index, set collection TTL, set collection history, set collection events, create/renew/delete subscription |
-| `admin:db` | map_info, resize_map, `/metrics` |
+| `admin:db` | Instance-wide administration: `list_databases`, `create_database`, `drop_database`, map operations, `sync`, and `/metrics`; collection actions still use collection scopes |
 | `read:*` / `write:*` / `admin:*` | The action on every collection in every database |
 | `read:<database>/<collection>` | Same read actions, limited to one database |
 | `write:<database>/<collection>` | Same write actions, limited to one database |
 | `admin:<database>/<collection>` | Collection administration, limited to one database |
 | `read:<database>/*` | Read every collection in one database |
+| `write:<database>/*` / `admin:<database>/*` | Write or administer every collection in one database |
 | `*:*` | Everything |
 
 Rules:

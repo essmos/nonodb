@@ -20,6 +20,7 @@ On Linux and macOS the clients use the Unix socket by default. Set
 ```bash
 export NONODB_SOCK=/run/nonodb.sock   # default Unix socket
 export NONODB_TOKEN='nodb_...'         # required for TCP unless mTLS identifies you
+export NONODB_DB=app1                  # optional database inside one daemon
 # or:
 export NONODB_URL=https://127.0.0.1:7878
 export NONODB_TLS_CA=/etc/nonodb/ca.crt
@@ -46,6 +47,40 @@ All clients return a typed error for daemon errors (`ok: false`). Writes are not
 retried automatically; read operations are retried after a transport failure,
 because retrying a write could duplicate it. Use `write_batch` when several
 writes must succeed or fail together.
+
+## Databases
+
+One daemon can host several independent databases. Every official client accepts
+an explicit database and falls back to `NONODB_DB`, then `default`. Requests are
+routed to `/<database>/v1/exec`; `default` may also use `/v1/exec`.
+
+```python
+db = NonoDB("/run/nonodb.sock", database="app1")
+```
+
+```rust
+let db = Client::builder()
+    .socket_path("/run/nonodb.sock")
+    .database("app1")
+    .build()?;
+```
+
+```js
+const db = new NonoDB({ socketPath: '/run/nonodb.sock', database: 'app1' });
+```
+
+```go
+db := nonodb.New(
+    nonodb.WithSocketPath("/run/nonodb.sock"),
+    nonodb.WithDatabase("app1"),
+)
+```
+
+Database names are case-sensitive and are not collections. Collections,
+indexes, subscriptions, history, TTL, and events are isolated per database.
+There are no cross-database queries, transactions, or joins. See
+[Multiple databases](multi-database.md) for routing, management, limits, and
+backup commands.
 
 ## Dates
 
@@ -170,8 +205,9 @@ The Rust client exposes `exec`, `batch`, `write_batch`, `lookup`, `get_many`,
 history, aggregation, indexes, text search, fuzzy search, vector search, and
 online map resize.
 `Client::from_env()` reads `NONODB_SOCK`,
-`NONODB_URL`, `NONODB_TOKEN`, `NONODB_TLS_VERIFY`, `NONODB_TLS_CA`,
-`NONODB_TLS_CLIENT_CERT`, and `NONODB_TLS_CLIENT_KEY`. For mTLS:
+`NONODB_URL`, `NONODB_TOKEN`, `NONODB_DB`, `NONODB_TLS_VERIFY`,
+`NONODB_TLS_CA`, `NONODB_TLS_CLIENT_CERT`, and `NONODB_TLS_CLIENT_KEY`. For
+mTLS:
 
 ```rust
 let db = Client::builder()
@@ -194,7 +230,7 @@ npm install /path/to/nonodb/client/node
 const { NonoDB } = require('nonodb-client');
 
 async function main() {
-  const db = new NonoDB(); // NONODB_SOCK on Unix, or NONODB_URL on Windows
+  const db = new NonoDB(); // NONODB_SOCK/NONODB_URL and NONODB_DB
   const users = db.collection('users');
 
   const id = await users.insert({ name: 'Ada', age: 36 });
@@ -240,7 +276,7 @@ import (
 
 func main() {
     ctx := context.Background()
-    db := nonodb.New() // NONODB_SOCK, or NONODB_URL on Windows
+    db := nonodb.New() // NONODB_SOCK/NONODB_URL and NONODB_DB
     users := db.Collection("users")
 
     id, err := users.Insert(ctx, map[string]any{"name": "Ada", "age": 36})

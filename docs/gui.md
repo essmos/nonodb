@@ -160,7 +160,7 @@ Text, fuzzy, and vector search require the corresponding index on the field.
 - online map resize;
 - database-wide JSON import/export;
 - command helper for backup, restore, verification, and auth CLI operations;
-- a note explaining that one daemon serves one LMDB database.
+- a note explaining that each database is a separate LMDB environment and the selector switches between them.
 
 ### Navigation
 
@@ -187,23 +187,23 @@ Settings are edited in a focused dialog:
 
 ## Multiple databases
 
-NonoDB runs **one LMDB database per daemon process**. The GUI therefore has no
-"new database" button; adding a database means starting another daemon with a
-separate data directory and socket, then pointing another GUI instance at it:
+One daemon can host several independent databases, each with its own LMDB
+environment under `NONODB_DATA/<database>/`. The sidebar selector switches the
+active database and the GUI routes requests to
+`/<database>/v1/exec` and `/<database>/v1/watch`; `default` uses the same
+routes. No second daemon, socket, port, or GUI instance is needed.
+
+Databases are created and dropped with the CLI or the management API. The GUI
+can select them but does not yet expose a "new database" button:
 
 ```bash
-NONODB_DATA=/var/lib/nonodb-2 \
-NONODB_SOCK=/run/nonodb/nonodb-2.sock \
-nonodb-daemon
+nonodb-cli databases create app1
+nonodb-cli databases list
+nonodb-cli databases drop app1
 ```
 
-```bash
-NONODB_SOCK=/run/nonodb/nonodb-2.sock \
-nonodb-cli gui --port 8788
-```
-
-Use a second Compose service with separate `NONODB_DATA`, socket, and GUI port
-for a containerised second database.
+Each database has separate collections, indexes, TTL/history/event settings,
+and subscriptions. Collections and queries never span databases.
 
 ## Docker
 
@@ -286,6 +286,32 @@ runs.
 - Multi-connection profiles exist, but simultaneous multi-daemon tabs do not.
 - Runtime metrics are daemon-wide; per-collection counters are not exposed yet.
 - A light theme is not included.
+
+## Future GUI work
+
+These are planned improvements, not current features.
+
+- **Database management in the GUI.** Create and drop databases directly from
+  the console; today the GUI can select databases but creation/drop is CLI-only.
+- **Auth management without file writes.** Add daemon APIs for principal/token
+  management and expose them in the GUI. The current GUI deliberately cannot
+  edit `auth.json` because the HTTP API does not write auth-file paths.
+- **Backup and restore UI.** Trigger online backups, list manifests, verify
+  checksums, and show restore instructions. Restore itself remains CLI-only
+  until a safe daemon-side restore flow exists.
+- **Multiple daemon tabs.** Keep several connection profiles open at once
+  instead of switching one active connection.
+- **Per-collection metrics.** Show collection-level request, write, cache, and
+  index-build counters; current runtime metrics are daemon-wide.
+- **Progress and resume for large imports.** Stream import progress, allow
+  cancellation, and resume large JSON/NDJSON/CSV imports.
+- **Better large-result handling.** Virtualized document lists and resumable
+  cursors for very large collections.
+- **Light theme.** The current console is intentionally dark-only.
+- **Accessibility and keyboard navigation.** Improve focus management, ARIA
+  labels, and shortcuts beyond the command palette.
+- **Shareable saved views and filters.** Export/import saved views without
+  sharing credentials.
 
 ## Security notes
 

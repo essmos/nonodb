@@ -54,8 +54,9 @@ curl -s http://127.0.0.1:7878/app1/v1/exec \
   -d '{"op":"find","coll":"orders","filter":{}}'
 ```
 
-`/v1/exec` is an alias for `/default/v1/exec`. `/healthz` and `/metrics` remain
-instance-wide and are not prefixed.
+`/v1/exec` is an alias for `/default/v1/exec`, and `/v1/watch` is an alias for
+`/default/v1/watch`. `/healthz` and `/metrics` remain instance-wide and are not
+prefixed.
 
 HTTP clients that build URLs from a base URL can select a database there:
 
@@ -131,8 +132,9 @@ nonodb-cli databases drop app1
 
 The embedded GUI has a **Database** field in Advanced connection settings and a
 database selector in the collection sidebar. The browser always talks to one
-GUI origin and one daemon port; the selected database is added to `/v1/exec`
-and `/v1/watch` paths.
+GUI origin and one daemon port; the selected database is added as
+`/<database>/v1/exec` and `/<database>/v1/watch`. The `default` database may also
+use the unprefixed aliases.
 
 ## Backup and restore
 
@@ -161,13 +163,14 @@ instance/app1/data.mdb
 instance/app1/manifest.json
 ```
 
-The instance manifest lists every database and its per-database SHA-256. The
-auth registry is intentionally not part of the backup; keep `NONODB_AUTH_FILE`
-under separate backup.
+The instance manifest lists every database and its per-database SHA-256. Each
+database copy is consistent, but `backup-all` is sequential and not an atomic
+snapshot across databases. The auth registry is intentionally not part of the
+backup; keep `NONODB_AUTH_FILE` under separate backup.
 
 For a restore, stop the daemon first. Without `--db`, the single-database
 commands resolve a legacy `data.mdb` root, then `default/data.mdb`, then
-`data/<NONODB_DB>/data.mdb`.
+`ROOT/<NONODB_DB>/data.mdb`.
 
 ## Open database lifecycle
 

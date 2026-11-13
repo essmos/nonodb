@@ -37,6 +37,20 @@ const db = new NonoDB({
 The same values are read from `NONODB_TLS_CA`, `NONODB_TLS_CLIENT_CERT`, and
 `NONODB_TLS_CLIENT_KEY`.
 
+## Databases
+
+One daemon can host several independent databases. Pass `database`, or set
+`NONODB_DB`; the default is `default`:
+
+```js
+const db = new NonoDB({
+  socketPath: '/run/nonodb.sock',
+  database: 'app1',
+});
+```
+
+See [Multiple databases](../../docs/multi-database.md).
+
 See [docs/clients.md](../../docs/clients.md) for the full client guide. Run
 `NONODB_SOCK=/run/nonodb.sock node smoke_test.js` against a daemon for an
 end-to-end check.
