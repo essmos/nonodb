@@ -230,7 +230,8 @@ writes without the required standby/quorum.
 - [x] Writer replication integration test.
 - [x] SQL write capture.
 - [ ] Vault write capture.
-- [ ] Lag and sequence metrics.
+- [x] Role, capture, origin, and head metrics.
+- [ ] Applied sequence, lag, transport, and apply-error metrics.
 
 ### Phase 2 — primary → replica
 

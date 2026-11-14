@@ -142,6 +142,21 @@ Periodic snapshots expose per-database series:
 For external backups, write a timestamp marker in your backup script and alert
 on the marker's age, or use the target's native backup monitoring.
 
+## Replication metrics
+
+Replication-log metrics are exposed when the daemon has any known databases.
+They are cheap gauges read from LMDB; they do not scan documents.
+
+| Metric | Meaning |
+|---|---|
+| `nonodb_replication_enabled` | `1` when durable writer capture is enabled |
+| `nonodb_replication_role{role}` | Configured role, usually `primary` |
+| `nonodb_replication_origin_info{origin}` | Configured node identity |
+| `nonodb_replication_head{database}` | Highest allocated replication sequence |
+
+`nonodb_replication_head` is the source-side log head. Applied sequence, lag,
+and transport errors will be added with replica apply.
+
 ## Recommended alerts
 
 At minimum, alert on:

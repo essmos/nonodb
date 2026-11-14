@@ -113,7 +113,9 @@ Design: [docs/replication.md](docs/replication.md).
       or rebuilt.
 - [x] Add a read-only GUI Replication tab showing role, origin, head, and recent
       transactions.
-- [ ] Add Prometheus replication role, head, applied, lag, and error metrics.
+- [x] Add Prometheus replication enabled, role, origin, and head metrics.
+- [ ] Add applied sequence, lag, transport errors, and apply errors after the
+      replica transport exists.
 
 ### Phase 2 — primary → replica
 

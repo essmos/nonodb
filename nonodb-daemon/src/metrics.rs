@@ -538,6 +538,63 @@ fn prom_sample(out: &mut String, name: &str, labels: &[(&str, &str)], value: &Va
 /// Native Prometheus/OpenMetrics-compatible text exposition. The endpoint is
 /// intentionally generated from the same snapshot as `/metrics` so the two
 /// representations cannot drift.
+/// Appends per-database replication metrics gathered by the HTTP handler.
+pub fn append_replication_metrics(
+    out: &mut String,
+    enabled: bool,
+    origin: Option<&str>,
+    role: &str,
+    heads: &[(String, u64)],
+) {
+    prom_header(
+        out,
+        "nonodb_replication_enabled",
+        "gauge",
+        "Whether durable replication-log capture is enabled.",
+    );
+    prom_sample(
+        out,
+        "nonodb_replication_enabled",
+        &[],
+        &json!(u8::from(enabled)),
+    );
+    prom_header(
+        out,
+        "nonodb_replication_role",
+        "gauge",
+        "Configured node replication role.",
+    );
+    prom_sample(out, "nonodb_replication_role", &[("role", role)], &json!(1));
+    if let Some(origin) = origin {
+        prom_header(
+            out,
+            "nonodb_replication_origin_info",
+            "gauge",
+            "Configured replication origin node identity.",
+        );
+        prom_sample(
+            out,
+            "nonodb_replication_origin_info",
+            &[("origin", origin)],
+            &json!(1),
+        );
+    }
+    prom_header(
+        out,
+        "nonodb_replication_head",
+        "gauge",
+        "Highest replication sequence allocated in the database.",
+    );
+    for (database, head) in heads {
+        prom_sample(
+            out,
+            "nonodb_replication_head",
+            &[("database", database)],
+            &json!(head),
+        );
+    }
+}
+
 pub fn prometheus() -> String {
     let snapshot = snapshot();
     let mut out = String::with_capacity(16 * 1024);

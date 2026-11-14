@@ -113,6 +113,12 @@ def main() -> int:
             exec({"op": "sql", "query": "UPDATE orders SET n = 5 WHERE _id = 'o4'"})
             exec({"op": "sql", "query": "DELETE FROM orders WHERE _id = 'o4'"})
 
+            metrics = client.get("/metrics/prometheus", headers=headers).text
+            assert 'nonodb_replication_enabled 1' in metrics, metrics[-1000:]
+            assert 'nonodb_replication_role{role="primary"} 1' in metrics, metrics[-1000:]
+            assert 'nonodb_replication_origin_info{origin="test-node"} 1' in metrics, metrics[-1000:]
+            assert 'nonodb_replication_head{database="default"}' in metrics, metrics[-1000:]
+
             status = client.get("/v1/replication/status", headers=headers)
             assert status.status_code == 200, status.text
             status = status.json()["result"]

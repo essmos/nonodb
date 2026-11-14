@@ -980,12 +980,33 @@ async fn prometheus_handler(
     if let Some(auth) = &state.auth {
         auth.refresh_blocked_clients();
     }
+    let mut heads = Vec::new();
+    for name in state.databases.names().await {
+        if let Ok(runtime) = state.databases.get(&name).await {
+            if let Ok(head) = runtime.store.replication_head() {
+                heads.push((name, head));
+            }
+        }
+    }
+    let origin = writer::replication_origin();
+    let role = std::env::var("NONODB_REPLICATION_ROLE")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "primary".to_string());
+    let mut body = metrics::prometheus();
+    metrics::append_replication_metrics(
+        &mut body,
+        origin.is_some(),
+        origin.as_deref(),
+        &role,
+        &heads,
+    );
     (
         [(
             CONTENT_TYPE,
             HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
         )],
-        metrics::prometheus(),
+        body,
     )
         .into_response()
 }
