@@ -109,8 +109,8 @@ def main() -> int:
         role = promoted.json()["result"]["role"]
         assert role["role"] == "primary", role
         assert role["epoch"] == 1, role
-        assert (temp / "primary-data" / "replication-vote.json").is_file()
-        assert (temp / "replica-data" / "replication-vote.json").is_file()
+        assert (temp / "primary-data" / ".node" / "data.mdb").is_file()
+        assert (temp / "replica-data" / ".node" / "data.mdb").is_file()
 
         old = primary.get("/v1/replication/status", headers=headers).json()["result"]
         assert old["role"] == "replica", old

@@ -145,13 +145,22 @@ impl ControlPlane {
             }
         }
         let path = self.databases.root().join("cluster-peer-token");
-        if let Ok(token) = std::fs::read_to_string(&path) {
-            let token = token.trim().to_string();
-            if !token.is_empty() {
-                replicator::set_cluster_peer_token(Some(token.clone()));
-                *self.peer_token.lock().unwrap_or_else(|p| p.into_inner()) = Some(token.clone());
-                return Ok(Some(token));
+        let legacy = std::fs::read_to_string(&path)
+            .ok()
+            .map(|token| token.trim().to_string())
+            .filter(|token| !token.is_empty());
+        let token = crate::node_state::get_json::<String>("replication:peer_token")
+            .ok()
+            .flatten()
+            .or(legacy);
+        if let Some(token) = token {
+            if path.is_file() {
+                let _ = crate::node_state::put_json("replication:peer_token", &token);
+                let _ = std::fs::remove_file(&path);
             }
+            replicator::set_cluster_peer_token(Some(token.clone()));
+            *self.peer_token.lock().unwrap_or_else(|p| p.into_inner()) = Some(token.clone());
+            return Ok(Some(token));
         }
         let Some(auth) = &self.auth else {
             return Ok(None);
@@ -175,7 +184,7 @@ impl ControlPlane {
             });
             Ok(token)
         })?;
-        write_secret(&path, &token)?;
+        crate::node_state::put_json("replication:peer_token", &token)?;
         replicator::set_cluster_peer_token(Some(token.clone()));
         *self.peer_token.lock().unwrap_or_else(|p| p.into_inner()) = Some(token.clone());
         Ok(Some(token))
@@ -312,7 +321,7 @@ impl ControlPlane {
             }
         }
         if let Some(token) = &snapshot.peer_token {
-            write_secret(&self.databases.root().join("cluster-peer-token"), token)?;
+            crate::node_state::put_json("replication:peer_token", token)?;
             replicator::set_cluster_peer_token(Some(token.clone()));
             *self.peer_token.lock().unwrap_or_else(|p| p.into_inner()) = Some(token.clone());
             if !replicator::role_is_primary() {
@@ -383,22 +392,6 @@ fn read_control_doc(store: &nonodb_core::Store) -> Result<Option<Value>, String>
         .map_err(|error| error.to_string());
     rtxn.commit().map_err(|error| error.to_string())?;
     doc
-}
-
-fn write_secret(path: &std::path::Path, value: &str) -> Result<(), String> {
-    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
-    std::fs::create_dir_all(parent)
-        .map_err(|error| format!("create {}: {error}", parent.display()))?;
-    let temp = path.with_extension(format!("tmp-{}", std::process::id()));
-    std::fs::write(&temp, value).map_err(|error| format!("write {}: {error}", temp.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600))
-            .map_err(|error| format!("chmod {}: {error}", temp.display()))?;
-    }
-    std::fs::rename(&temp, path).map_err(|error| format!("replace {}: {error}", path.display()))?;
-    Ok(())
 }
 
 fn unix_ms() -> u64 {

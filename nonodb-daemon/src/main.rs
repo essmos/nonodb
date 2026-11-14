@@ -25,6 +25,7 @@ mod live;
 mod login_guard;
 mod maintenance;
 mod metrics;
+mod node_state;
 mod pairing;
 mod pairing_api;
 mod protocol;
@@ -184,6 +185,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     init_tracing();
 
     let data = PathBuf::from(std::env::var("NONODB_DATA").unwrap_or_else(|_| "./data".into()));
+    node_state::open(&data)?;
     #[cfg(unix)]
     let sock =
         PathBuf::from(std::env::var("NONODB_SOCK").unwrap_or_else(|_| "/run/nonodb.sock".into()));

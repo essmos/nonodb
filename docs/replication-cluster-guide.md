@@ -1,6 +1,6 @@
 # Replication and cluster guide
 
-This is the practical operator guide for NonoDB replication in `0.23.0` and
+This is the practical operator guide for NonoDB replication in `0.24.0` and
 later. It covers a primary, read replicas, hot standby, quorum failover, the CLI,
 the GUI Cluster view, monitoring, and the common failure modes.
 
@@ -133,6 +133,97 @@ Non-voting followers receive the new primary URL after an election.
 - Allow enough disk for the database, replication log, and a temporary snapshot.
 - Keep clocks synchronized (NTP) for lease and subscription expiry semantics.
 
+### 4.1 Install and start NonoDB from scratch
+
+Install the released binaries on every node (see [Operations](operations.md#install-a-prebuilt-binary)
+for the full systemd and Docker variants):
+
+```bash
+TAG=v0.24.0
+ARCHIVE="nonodb-$TAG-linux-x86_64.tar.gz"
+curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/$ARCHIVE"
+curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/$ARCHIVE.sha256"
+sha256sum -c "$ARCHIVE.sha256"
+tar -xzf "$ARCHIVE"
+sudo install -m 0755 "nonodb-$TAG-linux-x86_64/nonodb-daemon" /usr/local/bin/
+sudo install -m 0755 "nonodb-$TAG-linux-x86_64/nonodb-cli" /usr/local/bin/
+
+sudo useradd --system --home /var/lib/nonodb --shell /usr/sbin/nologin nonodb
+sudo install -d -o nonodb -g nonodb /var/lib/nonodb /run/nonodb
+sudo install -d -m 0750 -o nonodb -g nonodb /etc/nonodb
+```
+
+Create the auth registry before starting a TCP listener:
+
+```bash
+sudo -u nonodb env NONODB_AUTH_FILE=/etc/nonodb/auth.json nonodb-cli auth init
+sudo -u nonodb env NONODB_AUTH_FILE=/etc/nonodb/auth.json nonodb-cli auth token create admin
+```
+
+Save the printed token in a secret manager or a root-owned `0600` environment
+file. Start the daemon in the foreground for a first test:
+
+```bash
+sudo -u nonodb env \
+  NONODB_DATA=/var/lib/nonodb \
+  NONODB_AUTH_FILE=/etc/nonodb/auth.json \
+  NONODB_TCP=0.0.0.0:7878 \
+  NONODB_REPLICATION_ENABLED=1 \
+  NONODB_REPLICATION_ORIGIN=primary-eu \
+  NONODB_REPLICATION_ADVERTISE_URL=https://primary.example.com:7878 \
+  nonodb-daemon
+```
+
+For a service, install `deploy/nonodb.service`, put the same variables in an
+`EnvironmentFile`, then run `systemctl enable --now nonodb`. The GUI is served
+by the same daemon when enabled; open `http://<node>:7878/gui` and log in with
+the cluster bearer token. See [GUI guide](gui.md).
+
+### 4.2 How a replica finds the primary after a failover
+
+The source URL is not the only copy of the topology. Every node persists its
+current source in the hidden node metadata collection. Rediscovery works in
+three layers:
+
+1. **Normal source switch**: when the stored source is alive but has been
+   demoted, its `/v1/replication/status` returns `successor`. The replica
+   switches immediately.
+2. **Source is unreachable**: after three failed pull cycles the replica queries
+   `NONODB_REPLICATION_SEEDS`, then the configured voters and followers, at
+   `GET /v1/replication/primary`. The first node that reports `role=primary`
+   becomes the new source.
+3. **No local source at all**: a replica or replacement node with no source
+   configuration also uses the seed/voter list to join the current primary
+   automatically.
+
+A replica that was offline for a long time therefore needs at least one stable
+address that still exists. Use DNS names, a load balancer, or a small seed list;
+a fixed IP of a node that no longer exists cannot be rediscovered.
+
+```env
+# Stable discovery addresses, comma-separated. Include voters or a DNS name
+# that follows the current primary.
+NONODB_REPLICATION_SEEDS=https://db-1.example.com:7878,https://db-2.example.com:7878
+
+# The source token is used for discovery when no voter/peer token is set.
+# Use the same cluster-admin credential for both.
+NONODB_REPLICATION_VOTER_TOKEN=<cluster-admin-token>
+```
+
+Prefer pairing for credentials: `nonodb-cli replication join` writes the source
+and token into the hidden collection. Seeds are only addresses; they do not
+grant access.
+
+### 4.3 Where replication state is stored
+
+Replication role, source, vote, lease, and cluster peer token are stored in the
+hidden LMDB system collection `<NONODB_DATA>/.node` (sub-database `meta`). They
+are node-local, atomic, and never copied into database snapshots. Legacy
+`replication-role.json`, `replication-source.json`, `replication-vote.json`,
+`replication-lease.json`, and `cluster-peer-token` files from older versions
+are imported once and removed. Back up `NONODB_DATA`, but do not copy `.node`
+to another node: it identifies this node's role and current source.
+
 ## 5. Quick start: existing database becomes primary
 
 Suppose the existing database is on `primary.example.com` and the new replica
@@ -153,8 +244,8 @@ NONODB_REPLICATION_ADVERTISE_URL=https://primary.example.com:7878
 ```
 
 The origin must be unique and must never change after the node starts
-replicating. The role is persisted in
-`<NONODB_DATA>/replication-role.json`; after the first start, the file wins over
+replicating. The role is persisted in the hidden node metadata collection
+`<NONODB_DATA>/.node`; after the first start it wins over
 `NONODB_REPLICATION_ROLE`.
 
 ### 5.2 Preferred: pair the replica with an 8-character code
@@ -165,23 +256,25 @@ cluster credential plus the full control-plane snapshot.
 On the primary:
 
 ```bash
-nonodb-cli replication pair replica-eu default
+nonodb-cli replication add-replica replica-eu default
 ```
 
-This prints a code such as `K7M4-P9QX`, valid for 10 minutes. You can also use
+`pair` is an alias for the same command. It prints a code such as `K7M4-P9QX`,
+valid for 10 minutes, plus the exact `join` command. You can also use
 **GUI → Replication → Add replica**.
 
 On the new replica, with its own `NONODB_AUTH_FILE` already initialized:
 
 ```bash
 export NONODB_SOCK=/run/nonodb-replica.sock
-nonodb-cli replication join https://primary.example.com:7878
+nonodb-cli replication join https://primary.example.com:7878 K7M4P9QX
 ```
 
-Enter the code when prompted. The daemon:
+The code can be passed as the third argument or entered when prompted. The
+daemon:
 
 1. redeems the code on the primary;
-2. stores the returned source and token in `replication-source.json` (0600);
+2. stores the returned source and token in the hidden node metadata collection;
 3. becomes a read-only replica;
 4. applies the primary auth registry, backup configuration, and database
    catalog through the control plane;
@@ -380,10 +473,10 @@ nonodb-cli replication demote <epoch> replica [successor-url]
 | `acks` | Replica acknowledgement sequences and ages. |
 | `source <url> [dbs] [interval]` | Change the pull source without restarting. |
 | `prune <seq> [--require-acks]` | Remove old log records, optionally refusing to pass the minimum ack. |
-| `pair <name> [dbs]` | Create a one-time 8-character pairing code on the primary. |
+| `add-replica <name> [dbs]` (alias `pair`) | Create a one-time 8-character pairing code on the primary. |
 | `pairings` | List pending pairing codes. |
 | `revoke <code>` | Revoke a pending pairing code. |
-| `join <primary-url>` | Redeem a code on the replica and install the source/control plane. |
+| `join <primary-url> [code]` | Redeem a code on the replica and install the source/control plane. |
 | `promote <epoch>` | Manual promotion. Requires the expected epoch. |
 | `demote <epoch> replica [successor]` | Manual demotion, optionally advertising a successor. |
 
@@ -396,7 +489,7 @@ TLS paths, or retention. Those are startup environment settings.
 |---|---|---|
 | `NONODB_REPLICATION_ENABLED` | `0` | Enable durable log capture on a writer. |
 | `NONODB_REPLICATION_ORIGIN` | node id / `local` | Stable writer identity. |
-| `NONODB_REPLICATION_ROLE` | `primary` | Seeds `replication-role.json`: `primary`, `replica`, or `standby`. |
+| `NONODB_REPLICATION_ROLE` | `primary` | Seeds the hidden role state: `primary`, `replica`, or `standby`. |
 | `NONODB_REPLICATION_NODE_ID` | node id / `local` | Replica identity used in acks. |
 | `NONODB_REPLICATION_SOURCE` | unset | Source base URL. |
 | `NONODB_REPLICATION_SOURCE_TOKEN` | unset | Bearer token for source replication API. |
@@ -409,6 +502,7 @@ TLS paths, or retention. Those are startup environment settings.
 | `NONODB_REPLICATION_VOTERS` | unset | Comma-separated voter URLs. Empty disables quorum and leases. |
 | `NONODB_REPLICATION_VOTER_TOKEN` | unset | Shared token used to call voter endpoints. |
 | `NONODB_REPLICATION_FOLLOWERS` | unset | Non-voting nodes that receive the new primary URL. |
+| `NONODB_REPLICATION_SEEDS` | unset | Stable addresses queried to rediscover the primary when the stored source is unreachable. |
 | `NONODB_REPLICATION_LEASE_INTERVAL` | `5` | Primary quorum lease renewal interval. |
 | `NONODB_REPLICATION_LEASE_TTL` | `15` | Time without majority before a primary self-demotes. |
 | `NONODB_REPLICATION_AUTO_FAILOVER` | `0` | Enable candidate election. |
@@ -565,9 +659,17 @@ The **Replication** page on a primary contains an **Add replica** panel:
 
 1. enter the replica name and initial databases;
 2. choose **Create pairing code**;
-3. copy the 8-character code and run the shown `replication join` command on the
-   new node;
+3. copy the 8-character code, then on the new node start the daemon with
+   `NONODB_REPLICATION_ROLE=replica` and run
+   `nonodb-cli replication join <primary-api-url> <code>` (or paste the code
+   when prompted). Use the URL shown under **Write URL** (default daemon port
+   `7878`; a custom `NONODB_TCP` port is valid). Do **not** use the GUI proxy
+   port (`8787` by default) — `replication join` talks to the daemon API;
 4. the pending list shows unused codes and lets you revoke them.
+
+![Add replica panel with the join command and Write URL](assets/gui/replication-add-replica.png)
+
+![One-time pairing code and generated join command](assets/gui/replication-pairing.png)
 
 The replica receives the auth registry and backup configuration automatically.
 The control plane is dormant until the node is promoted.
@@ -709,8 +811,8 @@ Keep both. Take regular snapshots even when a replica is healthy.
   before promotion. Divergent writes from an isolated old primary are discarded
   on resync, not merged.
 - The cluster peer token is stored in the control plane so every node can follow
-  a new primary. It is written to `cluster-peer-token` with mode `0600`; protect
-  the data directory accordingly.
+  a new primary. It is kept in the hidden local metadata collection
+  `<NONODB_DATA>/.node`; protect the data directory accordingly.
 - A hard resync resets local collections and replication state in place. If the
   source log was pruned, use snapshot bootstrap or restart with
   `NONODB_REPLICATION_EXIT_ON_GAP=1`.
@@ -727,6 +829,7 @@ python3 scripts/replication_election_test.py
 python3 scripts/replication_cluster_test.py
 python3 scripts/replication_metadata_test.py
 python3 scripts/replication_control_plane_test.py
+python3 scripts/replication_discovery_test.py
 python3 scripts/replication_lease_gate_test.py
 python3 scripts/replication_partition_test.py
 python3 scripts/replication_load_test.py --docs 200000 --keep
@@ -745,9 +848,9 @@ enforces memory limits.
 - Pairing issues a per-replica `admin:db` credential. This cluster model is
   deliberately cluster-wide administration: every full member can become
   primary and can read the replicated data.
-- The cluster peer token is replicated in the control plane and stored as
-  `cluster-peer-token` with mode `0600`. Protect every node's data directory as
-  an administrator-equivalent secret.
+- The cluster peer token is replicated in the control plane and kept in the
+  hidden local metadata collection. Protect every node's data directory as an
+  administrator-equivalent secret.
 - Store manual tokens in a secret manager or a `0600` environment file.
 - Restrict source access by firewall or private network.
 - Rotate certificates and tokens.

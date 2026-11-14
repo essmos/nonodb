@@ -16,7 +16,7 @@ use std::{
 
 use futures_util::StreamExt;
 use nonodb_core::{replication::ReplicationTxn, Store};
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 use tokio::{io::AsyncWriteExt, sync::watch};
 
@@ -28,14 +28,14 @@ use crate::{
 static PROMOTION_READY: AtomicBool = AtomicBool::new(false);
 static LEASE_VALID: AtomicBool = AtomicBool::new(false);
 static CLUSTER_PEER_TOKEN: OnceLock<std::sync::RwLock<Option<String>>> = OnceLock::new();
+fn cluster_peer_slot() -> &'static std::sync::RwLock<Option<String>> {
+    CLUSTER_PEER_TOKEN.get_or_init(|| std::sync::RwLock::new(None))
+}
+
 static SOURCE_CONFIG_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn source_config_lock() -> &'static Mutex<()> {
     SOURCE_CONFIG_LOCK.get_or_init(|| Mutex::new(()))
-}
-
-fn cluster_peer_slot() -> &'static std::sync::RwLock<Option<String>> {
-    CLUSTER_PEER_TOKEN.get_or_init(|| std::sync::RwLock::new(None))
 }
 
 pub fn set_cluster_peer_token(token: Option<String>) {
@@ -96,8 +96,28 @@ fn default_bootstrap() -> String {
     "auto".to_string()
 }
 
-fn source_config_path(data_root: &std::path::Path) -> std::path::PathBuf {
-    data_root.join("replication-source.json")
+fn read_state<T: DeserializeOwned + Serialize>(
+    key: &str,
+    legacy_name: &str,
+    data_root: &std::path::Path,
+) -> Result<Option<T>, String> {
+    if let Some(value) = crate::node_state::get_json(key)? {
+        return Ok(Some(value));
+    }
+    let path = crate::node_state::legacy_path(data_root, legacy_name);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let raw = fs::read(&path).map_err(|error| format!("read legacy {legacy_name}: {error}"))?;
+    let value: T = serde_json::from_slice(&raw)
+        .map_err(|error| format!("parse legacy {legacy_name}: {error}"))?;
+    crate::node_state::put_json(key, &value)?;
+    let _ = fs::remove_file(path);
+    Ok(Some(value))
+}
+
+fn write_state<T: Serialize + ?Sized>(key: &str, value: &T) -> Result<(), String> {
+    crate::node_state::put_json(key, value)
 }
 
 impl Config {
@@ -160,11 +180,11 @@ impl Config {
 
     fn load(data_root: &std::path::Path) -> Result<Option<Self>, String> {
         let mut config = Self::from_env()?;
-        let path = source_config_path(data_root);
-        if path.is_file() {
-            let raw = fs::read(&path).map_err(|error| format!("read source config: {error}"))?;
-            let persisted: PersistedSource = serde_json::from_slice(&raw)
-                .map_err(|error| format!("parse source config: {error}"))?;
+        if let Some(persisted) = read_state::<PersistedSource>(
+            "replication:source",
+            "replication-source.json",
+            data_root,
+        )? {
             config.source = persisted.source.trim().trim_end_matches('/').to_string();
             if persisted
                 .token
@@ -243,10 +263,6 @@ struct PersistedLease {
     expires_at_ms: u64,
 }
 
-fn lease_path(data_root: &std::path::Path) -> std::path::PathBuf {
-    data_root.join("replication-lease.json")
-}
-
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -266,36 +282,19 @@ pub fn cast_lease(
     if !cast_vote(data_root, epoch, candidate)? {
         return Ok(false);
     }
-    let path = lease_path(data_root);
-    let encoded = serde_json::to_vec_pretty(&PersistedLease {
-        epoch,
-        candidate: Some(candidate.to_string()),
-        expires_at_ms: now_ms().saturating_add(ttl_seconds.max(1) * 1000),
-    })
-    .map_err(|error| error.to_string())?;
-    let temp = path.with_extension(format!("tmp-{}", std::process::id()));
-    fs::write(&temp, encoded).map_err(|error| format!("write lease state: {error}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&temp, fs::Permissions::from_mode(0o600))
-            .map_err(|error| format!("chmod lease state: {error}"))?;
-    }
-    fs::rename(&temp, &path).map_err(|error| format!("replace lease state: {error}"))?;
+    write_state(
+        "replication:lease",
+        &PersistedLease {
+            epoch,
+            candidate: Some(candidate.to_string()),
+            expires_at_ms: now_ms().saturating_add(ttl_seconds.max(1) * 1000),
+        },
+    )?;
     Ok(true)
 }
 
-fn vote_path(data_root: &std::path::Path) -> std::path::PathBuf {
-    data_root.join("replication-vote.json")
-}
-
 fn load_vote(data_root: &std::path::Path) -> Result<PersistedVote, String> {
-    let path = vote_path(data_root);
-    if !path.is_file() {
-        return Ok(PersistedVote::default());
-    }
-    let raw = fs::read(&path).map_err(|error| format!("read vote state: {error}"))?;
-    serde_json::from_slice(&raw).map_err(|error| format!("parse vote state: {error}"))
+    Ok(read_state("replication:vote", "replication-vote.json", data_root)?.unwrap_or_default())
 }
 
 pub fn cast_vote(data_root: &std::path::Path, epoch: u64, candidate: &str) -> Result<bool, String> {
@@ -314,21 +313,13 @@ pub fn cast_vote(data_root: &std::path::Path, epoch: u64, candidate: &str) -> Re
     {
         return Ok(false);
     }
-    let path = vote_path(data_root);
-    let encoded = serde_json::to_vec_pretty(&PersistedVote {
-        epoch,
-        candidate: Some(candidate.to_string()),
-    })
-    .map_err(|error| error.to_string())?;
-    let temp = path.with_extension(format!("tmp-{}", std::process::id()));
-    fs::write(&temp, encoded).map_err(|error| format!("write vote state: {error}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&temp, fs::Permissions::from_mode(0o600))
-            .map_err(|error| format!("chmod vote state: {error}"))?;
-    }
-    fs::rename(&temp, &path).map_err(|error| format!("replace vote state: {error}"))?;
+    write_state(
+        "replication:vote",
+        &PersistedVote {
+            epoch,
+            candidate: Some(candidate.to_string()),
+        },
+    )?;
     Ok(true)
 }
 
@@ -360,6 +351,29 @@ fn follower_urls() -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Stable addresses used to rediscover the current primary after a source
+/// address becomes unreachable. Seeds are configured with
+/// `NONODB_REPLICATION_SEEDS`; voters and followers are also queried. In
+/// production these should be DNS names or a load balancer, not fixed IPs.
+pub(crate) fn discovery_urls() -> Vec<String> {
+    let mut urls = std::env::var("NONODB_REPLICATION_SEEDS")
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .map(|item| item.trim_end_matches('/').to_string())
+                .filter(|item| !item.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    urls.extend(voter_urls());
+    urls.extend(follower_urls());
+    urls.sort();
+    urls.dedup();
+    urls
+}
+
 pub(crate) fn voter_token() -> Option<String> {
     non_empty_env("NONODB_REPLICATION_VOTER_TOKEN").or_else(cluster_peer_token)
 }
@@ -368,7 +382,6 @@ struct RoleCell {
     role: String,
     epoch: u64,
     successor: Option<String>,
-    path: std::path::PathBuf,
 }
 
 fn role_cell() -> &'static Mutex<RoleCell> {
@@ -382,7 +395,6 @@ fn role_cell() -> &'static Mutex<RoleCell> {
                 .unwrap_or_else(|| "primary".to_string()),
             epoch: 0,
             successor: None,
-            path: std::path::PathBuf::new(),
         })
     })
 }
@@ -391,66 +403,54 @@ fn valid_role(value: &str) -> bool {
     matches!(value, "primary" | "replica" | "standby")
 }
 
-fn write_role(
-    path: &std::path::Path,
-    role: &str,
-    epoch: u64,
-    successor: Option<&str>,
-) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|error| format!("create role state dir: {error}"))?;
-    }
-    let temp = path.with_extension(format!("tmp-{}", std::process::id()));
-    let encoded = serde_json::to_vec_pretty(&PersistedRole {
-        role: role.to_string(),
-        epoch,
-        successor: successor.map(str::to_string),
-    })
-    .map_err(|error| error.to_string())?;
-    fs::write(&temp, encoded).map_err(|error| format!("write role state: {error}"))?;
-    fs::rename(&temp, path).map_err(|error| format!("replace role state: {error}"))?;
-    Ok(())
+fn write_role(role: &str, epoch: u64, successor: Option<&str>) -> Result<(), String> {
+    write_state(
+        "replication:role",
+        &PersistedRole {
+            role: role.to_string(),
+            epoch,
+            successor: successor.map(str::to_string),
+        },
+    )
 }
 
 /// Loads the persisted role before any database writer starts. The role file
 /// wins over `NONODB_REPLICATION_ROLE`; env seeds a brand-new installation.
 pub fn init_role(data: &std::path::Path) -> Result<(), String> {
-    let path = data.join("replication-role.json");
     let env_role = std::env::var("NONODB_REPLICATION_ROLE")
         .ok()
         .map(|value| value.trim().to_ascii_lowercase())
         .filter(|value| valid_role(value))
         .unwrap_or_else(|| "primary".to_string());
-    let state = if path.is_file() {
-        let raw = fs::read(&path).map_err(|error| format!("read role state: {error}"))?;
-        let persisted: PersistedRole =
-            serde_json::from_slice(&raw).map_err(|error| format!("parse role state: {error}"))?;
-        if !valid_role(&persisted.role) {
-            return Err(format!(
-                "invalid persisted replication role `{}`",
-                persisted.role
-            ));
-        }
-        persisted
-    } else {
-        let state = PersistedRole {
-            role: env_role,
-            epoch: 0,
-            successor: None,
+    let state: PersistedRole =
+        match read_state::<PersistedRole>("replication:role", "replication-role.json", data)? {
+            Some(persisted) => {
+                if !valid_role(&persisted.role) {
+                    return Err(format!(
+                        "invalid persisted replication role `{}`",
+                        persisted.role
+                    ));
+                }
+                persisted
+            }
+            None => {
+                let state = PersistedRole {
+                    role: env_role,
+                    epoch: 0,
+                    successor: None,
+                };
+                write_role(&state.role, state.epoch, None)?;
+                state
+            }
         };
-        write_role(&path, &state.role, state.epoch, None)?;
-        state
-    };
     let mut cell = role_cell()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     cell.role = state.role;
     cell.epoch = state.epoch;
     cell.successor = state.successor;
-    cell.path = path;
     Ok(())
 }
-
 #[derive(Debug, Clone, Serialize)]
 pub struct RoleView {
     pub role: String,
@@ -502,7 +502,7 @@ fn change_role(
     } else {
         successor.map(str::to_string)
     };
-    if let Err(error) = write_role(&cell.path, next, epoch, successor.as_deref()) {
+    if let Err(error) = write_role(next, epoch, successor.as_deref()) {
         cell.role = previous;
         cell.successor = previous_successor;
         return Err(("role_state_error".to_string(), error));
@@ -852,7 +852,7 @@ pub fn observe_epoch(epoch: u64) -> Result<(), String> {
     if epoch <= cell.epoch {
         return Ok(());
     }
-    write_role(&cell.path, &cell.role, epoch, cell.successor.as_deref())?;
+    write_role(&cell.role, epoch, cell.successor.as_deref())?;
     cell.epoch = epoch;
     Ok(())
 }
@@ -1019,12 +1019,11 @@ pub fn set_source(
 
 /// Replaces the bearer token in an existing source configuration.
 pub fn set_source_token(data_root: &std::path::Path, token: &str) -> Result<(), String> {
-    let path = source_config_path(data_root);
-    let Ok(raw) = fs::read(&path) else {
+    let Some(persisted) =
+        read_state::<PersistedSource>("replication:source", "replication-source.json", data_root)?
+    else {
         return Ok(());
     };
-    let persisted: PersistedSource =
-        serde_json::from_slice(&raw).map_err(|error| format!("parse source config: {error}"))?;
     set_source_with_token(
         data_root,
         &persisted.source,
@@ -1043,12 +1042,11 @@ pub fn ensure_source_databases(
     data_root: &std::path::Path,
     names: &[String],
 ) -> Result<(), String> {
-    let path = source_config_path(data_root);
-    let Ok(raw) = fs::read(&path) else {
+    let Some(mut persisted) =
+        read_state::<PersistedSource>("replication:source", "replication-source.json", data_root)?
+    else {
         return Ok(());
     };
-    let mut persisted: PersistedSource =
-        serde_json::from_slice(&raw).map_err(|error| format!("parse source config: {error}"))?;
     let mut desired = vec![DEFAULT_DATABASE.to_string()];
     for name in names {
         if name != DEFAULT_DATABASE && !desired.iter().any(|item| item == name) {
@@ -1087,7 +1085,7 @@ pub fn set_source_with_token(
 ) -> Result<Value, String> {
     let _guard = source_config_lock()
         .lock()
-        .unwrap_or_else(|p| p.into_inner());
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let source = source.trim().trim_end_matches('/');
     if !source.starts_with("http://") && !source.starts_with("https://") {
         return Err("source must start with http:// or https://".into());
@@ -1104,9 +1102,9 @@ pub fn set_source_with_token(
     // an existing credential. Preserve the current token when the caller does
     // not supply one.
     let token = token.filter(|value| !value.trim().is_empty()).or_else(|| {
-        fs::read(source_config_path(data_root))
+        read_state::<PersistedSource>("replication:source", "replication-source.json", data_root)
             .ok()
-            .and_then(|raw| serde_json::from_slice::<PersistedSource>(&raw).ok())
+            .flatten()
             .and_then(|persisted| persisted.token)
     });
     let persisted = PersistedSource {
@@ -1117,20 +1115,7 @@ pub fn set_source_with_token(
         batch: batch.clamp(1, 1000),
         bootstrap: bootstrap.to_string(),
     };
-    let encoded = serde_json::to_vec_pretty(&persisted).map_err(|error| error.to_string())?;
-    let path = source_config_path(data_root);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|error| format!("create data dir: {error}"))?;
-    }
-    let temp = path.with_extension(format!("tmp-{}", std::process::id()));
-    fs::write(&temp, encoded).map_err(|error| format!("write source config: {error}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&temp, fs::Permissions::from_mode(0o600))
-            .map_err(|error| format!("chmod source config: {error}"))?;
-    }
-    fs::rename(&temp, &path).map_err(|error| format!("replace source config: {error}"))?;
+    write_state("replication:source", &persisted)?;
     record_source(&persisted);
     Ok(serde_json::json!({
         "source": persisted.source,
@@ -1508,6 +1493,7 @@ pub fn start(
 ) -> Result<(), String> {
     tokio::spawn(async move {
         let mut shutdown = shutdown;
+        let mut consecutive_failures = 0u32;
         loop {
             if *shutdown.borrow() {
                 break;
@@ -1515,8 +1501,8 @@ pub fn start(
             let config = match Config::load(&data_root) {
                 Ok(Some(config)) => config,
                 Ok(None) => {
-                    if !role_is_primary() && !voter_urls().is_empty() {
-                        if let Ok(Some(source)) = discover_primary().await {
+                    if !role_is_primary() && !discovery_urls().is_empty() {
+                        if let Ok(Some(source)) = discover_primary(&data_root).await {
                             if let Some(token) = voter_token() {
                                 let databases = default_databases();
                                 match set_source_with_token(
@@ -1568,6 +1554,7 @@ pub fn start(
                         continue;
                     }
                 };
+                let mut cycle_failed = false;
                 for database in &config.databases {
                     if let Err(error) = pull_database(
                         &client,
@@ -1579,7 +1566,42 @@ pub fn start(
                     )
                     .await
                     {
+                        cycle_failed = true;
                         tracing::warn!(database, error = %error, "replication pull failed");
+                    }
+                }
+                if cycle_failed {
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                } else {
+                    consecutive_failures = 0;
+                }
+                if consecutive_failures >= 3 {
+                    consecutive_failures = 0;
+                    match discover_primary(&data_root).await {
+                        Ok(Some(source)) if source != config.source => {
+                            match set_source(
+                                &data_root,
+                                &source,
+                                &config.databases,
+                                config.interval.as_secs(),
+                                config.limit,
+                                &config.bootstrap,
+                            ) {
+                                Ok(_) => tracing::warn!(
+                                    old_source = %config.source,
+                                    new_source = %source,
+                                    "rediscovered primary using configured seeds/voters"
+                                ),
+                                Err(error) => tracing::warn!(
+                                    error = %error,
+                                    "rediscovered primary could not be installed"
+                                ),
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            tracing::warn!(error = %error, "primary discovery failed");
+                        }
                     }
                 }
             }
@@ -1593,12 +1615,19 @@ pub fn start(
     Ok(())
 }
 
-async fn discover_primary() -> Result<Option<String>, String> {
-    let token = voter_token().ok_or("no voter or cluster peer token configured")?;
+async fn discover_primary(data_root: &std::path::Path) -> Result<Option<String>, String> {
+    let token = voter_token()
+        .or_else(|| {
+            Config::load(data_root)
+                .ok()
+                .flatten()
+                .and_then(|config| config.token)
+        })
+        .ok_or("no voter, cluster peer, or source token configured")?;
     let config = Config::from_env()?;
     let client = config.client()?;
     let self_url = advertise_url();
-    for voter in voter_urls() {
+    for voter in discovery_urls() {
         let response = client
             .get(format!("{voter}/v1/replication/primary"))
             .bearer_auth(&token)

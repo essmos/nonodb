@@ -1927,10 +1927,11 @@ function ReplicationPage({ connection }: { connection: Connection }) {
           </div>
           <p className="field-hint">
             Creates a short-lived 8-character code. Run
-            <code> nonodb-cli replication join &lt;this-primary-url&gt; </code>
-            on the new node and enter the code there. The replica receives the
-            cluster auth registry and backup configuration automatically; they stay
-            dormant until this node is promoted.
+            <code> nonodb-cli replication join {status.write_url ?? "<primary-api-url>"} &lt;pairing-code&gt; </code>
+            on the new node and enter the code there. Use the daemon API URL from
+            <strong> Write URL</strong> (default port 7878, not the GUI proxy port 8787).
+            The replica receives the cluster auth registry and backup configuration
+            automatically; they stay dormant until this node is promoted.
           </p>
           <div className="form-grid">
             <label>Replica name<input value={pairName} onChange={(e) => setPairName(e.target.value)} placeholder="replica-eu" />
@@ -1953,7 +1954,7 @@ function ReplicationPage({ connection }: { connection: Connection }) {
                 The code is single-use. The replica receives a cluster credential and
                 the full control-plane snapshot after joining.
               </p>
-              <code>nonodb-cli replication join &lt;this-primary-url&gt;</code>
+              <code>nonodb-cli replication join {status.write_url ?? "<primary-api-url>"} {pairing.code}</code>
             </div>
           )}
           {pendingPairings.length > 0 && (

@@ -109,6 +109,17 @@ panel is shown when connected to a primary):
 
 ![NonoDB GUI replication](assets/gui/replication.png)
 
+Add replica panel. The command uses this node's **Write URL** (here
+`http://127.0.0.1:7902`), not the GUI proxy port:
+
+![Add replica panel](assets/gui/replication-add-replica.png)
+
+One-time pairing code and the generated join command. The code is redacted in
+the documentation; the real code is shown only in the GUI and expires after
+10 minutes:
+
+![Pairing code and join command](assets/gui/replication-pairing.png)
+
 Cluster tab showing every configured node at once: a primary and two live
 replicas, all online and caught up:
 
@@ -300,7 +311,8 @@ database, and refuses to overwrite an existing database.
 The Replication tab exposes:
 
 - **Add replica**: a one-time 8-character pairing code, join command, and
-  pending-code revocation;
+  pending-code revocation. On the new node set `NONODB_REPLICATION_ROLE=replica`,
+  start it, then run `nonodb-cli replication join <primary-api-url> <code>`;
 - node role badge and origin;
 - durable log capture status;
 - head sequence;
@@ -308,10 +320,42 @@ The Replication tab exposes:
 - current `write_url` for client/load-balancer routing;
 - transport source, bootstrap mode, poll interval, last success, and last
   transport/apply error;
-- editable source settings saved to `replication-source.json`;
+- editable source settings saved to the hidden node metadata collection;
 - manual promote/demote with expected epoch, successor URL, and confirmation;
 - replica acknowledgements and minimum safe sequence;
 - recent replication transactions with grouped collection/op/id changes.
+
+#### Add a replica from the GUI
+
+The **Add replica** panel creates a one-time code and shows the exact join
+command for this primary. Use the URL shown under **Write URL** — for example
+`http://127.0.0.1:7902` in a local demo. The default daemon API port is `7878`,
+but a non-default `NONODB_TCP` port is valid. Never use the GUI proxy port
+(`8787` by default): `replication join` talks to the daemon API, not the GUI.
+
+![Add replica panel with the join command and Write URL](assets/gui/replication-add-replica.png)
+
+1. Open **Replication** on the primary.
+2. Enter a replica name and the initial databases (comma-separated).
+3. Click **Create pairing code**.
+4. Copy the join command and the one-time code.
+
+![Pairing code and generated join command](assets/gui/replication-pairing.png)
+
+5. On the new node, start the daemon with `NONODB_REPLICATION_ROLE=replica` and
+   its own empty `NONODB_DATA`.
+6. Run the copied command:
+
+   ```bash
+   NONODB_SOCK=/run/nonodb-replica.sock \
+     nonodb-cli replication join http://<primary-host>:<daemon-port> <code>
+   ```
+
+7. The replica becomes read-only, receives the cluster auth registry, backup
+   configuration, database catalog, and starts pulling. Verify with
+   `nonodb-cli replication status` and `nonodb-cli ready`.
+8. Revoke unused codes in the **Pending pairings** list. Codes are single-use
+   and expire after 10 minutes.
 
 Replicas also receive the cluster auth registry, backup jobs/state, database
 catalog, and cluster peer token. They remain read-only and do not run backup,
@@ -397,7 +441,7 @@ docker run -d --name nonodb-gui \
   -p 127.0.0.1:8787:8787 \
   -v nonodb-run:/run/nonodb \
   -e NONODB_SOCK=/run/nonodb/nonodb.sock \
-  ghcr.io/essmos/nonodb:0.23.0 \
+  ghcr.io/essmos/nonodb:0.24.0 \
   nonodb-cli gui --host 0.0.0.0 --port 8787 --allow-remote --no-open
 ```
 

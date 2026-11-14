@@ -2481,8 +2481,9 @@ All routes require `admin:db` or `*:*`. Snapshot and prune are intended for
 replica bootstrap and controlled retention. Prune accepts
 `{"through": N, "require_acks": true}` and refuses to advance past the minimum
 acknowledged replica sequence. Promote/demote are instance-wide
-role changes persisted in `<NONODB_DATA>/replication-role.json`. The pull source
-is persisted in `<NONODB_DATA>/replication-source.json`.
+role changes persisted in the hidden node metadata collection
+`<NONODB_DATA>/.node`. The pull source, vote, lease, and peer token are stored
+there as well.
 
 The primary publishes a hidden `__nonodb_control` document through the durable
 replication log. It contains the auth registry snapshot (token hashes and

@@ -95,12 +95,16 @@ limitations are documented in [docs/roadmap.md](docs/roadmap.md).
 - [x] Replicate database catalog and update the replica source list dynamically.
 - [x] Replicate encrypted vault envelopes; tenant keys remain client-side.
 - [x] Add a cluster peer token and source discovery for rejoin.
+- [x] Add stable seed rediscovery when the stored source is unreachable.
+- [x] Store role, source, vote, lease, peer token, and pairings in the hidden
+      `.node` LMDB system collection instead of loose JSON files.
 - [x] Add one-time 8-character replica pairing in CLI and GUI.
 - [x] Gate client writes on a valid quorum lease, including startup.
 - [x] Make promotion readiness require the control-plane snapshot.
 - [x] Wait out the old lease before automatic election.
 - [x] Hard-reset a divergent replica log in place and re-pull the source.
-- [x] Add partition, control-plane, pairing, lease-gate, and vault replication tests.
+- [x] Add partition, control-plane, discovery, pairing, lease-gate, and vault
+      replication tests.
 - [ ] Replicate TLS/import/node-local settings (deliberately local today).
 - [ ] Add GUI controls for cluster peer token rotation and control revision.
 - [ ] Add full automatic rejoin test coverage for multi-database catalogs.

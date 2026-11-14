@@ -10,7 +10,7 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ring::rand::{SecureRandom, SystemRandom};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 const CODE_LEN: usize = 8;
 const CODE_TTL_SECS: u64 = 600;
@@ -26,7 +26,7 @@ pub struct PairingView {
     pub expires_at_ms: u64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Pending {
     code: String,
     name: String,
@@ -47,8 +47,18 @@ pub struct PairingManager {
 
 impl PairingManager {
     pub fn new() -> Self {
+        let pending = crate::node_state::get_json::<Vec<Pending>>("replication:pairings")
+            .ok()
+            .flatten()
+            .map(|items| {
+                items
+                    .into_iter()
+                    .map(|item| (item.code.clone(), item))
+                    .collect::<HashMap<_, _>>()
+            })
+            .unwrap_or_default();
         Self {
-            pending: Mutex::new(HashMap::new()),
+            pending: Mutex::new(pending),
             failures: Mutex::new(HashMap::new()),
         }
     }
@@ -83,6 +93,7 @@ impl PairingManager {
                 expires_at_ms,
             },
         );
+        save_pending(&pending);
         Ok(view)
     }
 
@@ -104,11 +115,12 @@ impl PairingManager {
 
     pub fn revoke(&self, code: &str) -> bool {
         let code = normalize_code(code);
-        self.pending
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .remove(&code)
-            .is_some()
+        let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
+        let removed = pending.remove(&code).is_some();
+        if removed {
+            save_pending(&pending);
+        }
+        removed
     }
 
     /// Redeems a one-time code. A wrong code counts against the peer's failure
@@ -137,6 +149,7 @@ impl PairingManager {
             state.count = state.count.saturating_add(1);
             return Err("invalid or expired pairing code".into());
         };
+        save_pending(&pending);
         {
             let mut failures = self.failures.lock().unwrap_or_else(|p| p.into_inner());
             failures.remove(peer);
@@ -152,6 +165,11 @@ impl Pending {
     pub fn databases(&self) -> &[String] {
         &self.databases
     }
+}
+
+fn save_pending(pending: &HashMap<String, Pending>) {
+    let items: Vec<_> = pending.values().cloned().collect();
+    let _ = crate::node_state::put_json("replication:pairings", &items);
 }
 
 fn generate_code() -> Result<String, String> {

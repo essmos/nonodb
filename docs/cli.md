@@ -542,6 +542,33 @@ Change the pull source without restarting the daemon:
 nonodb-cli replication source https://new-primary:7878 default,app1 1
 ```
 
+Create a one-time 8-character code on the primary and enroll a new replica:
+
+```bash
+# primary
+nonodb-cli replication add-replica replica-eu default
+# alias: nonodb-cli replication pair replica-eu default
+
+# new replica, after starting its daemon with NONODB_REPLICATION_ROLE=replica
+nonodb-cli replication join https://primary.example.com:7878 K7M4-P9QX
+```
+
+Use the primary's daemon API URL, not the GUI proxy. The default API port is
+`7878`; if `NONODB_TCP` uses another port, use that port (the GUI **Write URL**
+field shows the effective value). The CLI prints the same URL when it creates a
+pairing code.
+
+The code can be omitted from `join`; the CLI prompts for it. List and revoke
+pending codes with:
+
+```bash
+nonodb-cli replication pairings
+nonodb-cli replication revoke K7M4-P9QX
+```
+
+The code is single-use, valid for 10 minutes, and only bootstraps a cluster
+credential.
+
 Manually switch roles with an expected epoch:
 
 ```bash
@@ -554,8 +581,8 @@ nonodb-cli replication demote 1 replica https://new-primary:7878
 The optional successor URL is stored on the demoted node. Replicas pulling
 from it switch their source automatically.
 
-A stale epoch is rejected with `409`. The role is persisted in
-`<NONODB_DATA>/replication-role.json`; the file wins over
+A stale epoch is rejected with `409`. The role is persisted in the hidden node
+metadata collection `<NONODB_DATA>/.node`; it wins over
 `NONODB_REPLICATION_ROLE` after the first start.
 
 `NONODB_DB=app1` or `--db app1` selects another database. Status includes role,

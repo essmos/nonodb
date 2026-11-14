@@ -91,12 +91,13 @@ secrets.
 | `NONODB_IMPORT_ROOTS` | `<NONODB_DATA>/backups` | Allowed local roots for the backup Import wizard |
 | `NONODB_REPLICATION_ENABLED` | `0` | Enable durable writer replication-log capture |
 | `NONODB_REPLICATION_ORIGIN` | `NONODB_NODE_ID` or `local` | Stable node identity written into replication records |
-| `NONODB_REPLICATION_ROLE` | `primary` | Seeds `replication-role.json`: `primary`, `replica`, or `standby`; replicas are read-only |
+| `NONODB_REPLICATION_ROLE` | `primary` | Seeds hidden role state: `primary`, `replica`, or `standby`; replicas are read-only |
 | `NONODB_REPLICATION_NODE_ID` | `NONODB_NODE_ID` or `local` | Replica identity used in retention acknowledgements |
 | `NONODB_REPLICATION_ADVERTISE_URL` | unset | Public URL used to demote the old source and advertise this node on promotion |
 | `NONODB_REPLICATION_VOTERS` | unset | Comma-separated voter URLs required for quorum promotion |
 | `NONODB_REPLICATION_VOTER_TOKEN` | unset | Bearer token used to call voter endpoints |
 | `NONODB_REPLICATION_FOLLOWERS` | unset | Non-voting replica URLs that receive source updates after promotion |
+| `NONODB_REPLICATION_SEEDS` | unset | Stable URLs queried to rediscover the current primary when the stored source is unreachable |
 | `NONODB_REPLICATION_LEASE_INTERVAL` | `5` | Seconds between primary quorum-lease renewals |
 | `NONODB_REPLICATION_LEASE_TTL` | `15` | Seconds without a majority before the primary self-demotes |
 | `NONODB_REPLICATION_AUTO_FAILOVER` | `0` | Enable automatic candidate election |
@@ -284,7 +285,7 @@ Download the archive from the matching GitHub Release, verify its checksum, and
 install the two binaries:
 
 ```bash
-TAG=v0.23.0
+TAG=v0.24.0
 ARCHIVE="nonodb-$TAG-linux-x86_64.tar.gz"
 curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/$ARCHIVE"
 curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/$ARCHIVE.sha256"
@@ -346,7 +347,7 @@ Linux `amd64` and `arm64`. Pull a published tag:
 
 ```bash
 # Pin a version in production; latest tracks stable releases.
-docker pull ghcr.io/essmos/nonodb:0.23.0
+docker pull ghcr.io/essmos/nonodb:0.24.0
 ```
 
 If the GHCR package is private, log in before pulling:
@@ -392,7 +393,7 @@ docker run -d --name nonodb \
   --group-add "$(id -g)" \
   -v "$NONODB_AUTH_FILE:/etc/nonodb/auth.json:ro" \
   -v nonodb-data:/var/lib/nonodb \
-  ghcr.io/essmos/nonodb:0.23.0
+  ghcr.io/essmos/nonodb:0.24.0
 ```
 
 Verify it:
@@ -464,7 +465,7 @@ docker volume create nonodb-run
 docker run -d --name nonodb \
   -v nonodb-data:/var/lib/nonodb \
   -v nonodb-run:/run/nonodb \
-  ghcr.io/essmos/nonodb:0.23.0
+  ghcr.io/essmos/nonodb:0.24.0
 ```
 
 The client container mounts the same `nonodb-run` volume and sets:
@@ -493,7 +494,7 @@ docker run -d --name nonodb \
   -v "$NONODB_AUTH_FILE:/etc/nonodb/auth.json:ro" \
   -v /host/certs:/certs:ro \
   -v nonodb-data:/var/lib/nonodb \
-  ghcr.io/essmos/nonodb:0.23.0
+  ghcr.io/essmos/nonodb:0.24.0
 ```
 
 Without a certificate and key pair, TCP runs in plaintext and logs a warning.
@@ -507,7 +508,7 @@ Back up into a separate mounted directory:
 docker run --rm \
   -v nonodb-data:/var/lib/nonodb:ro \
   -v /host/backups:/backups \
-  ghcr.io/essmos/nonodb:0.23.0 \
+  ghcr.io/essmos/nonodb:0.24.0 \
   nonodb-cli backup-all /var/lib/nonodb /backups/$(date -u +%Y%m%dT%H%M%SZ)
 ```
 
@@ -527,7 +528,7 @@ docker run -d --name nonodb \
   -v "$NONODB_AUTH_FILE:/etc/nonodb/auth.json:ro" \
   -v nonodb-data:/var/lib/nonodb \
   -v /host/backups:/var/backups/nonodb \
-  ghcr.io/essmos/nonodb:0.23.0
+  ghcr.io/essmos/nonodb:0.24.0
 ```
 
 Then use `/var/backups/nonodb` in the GUI. By default keys live in

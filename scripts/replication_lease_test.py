@@ -120,7 +120,7 @@ def main() -> int:
         else:
             raise RuntimeError(f"primary did not self-demote after losing quorum: {status}")
         assert status["read_only"] is True, status
-        assert (temp / "primary-data" / "replication-lease.json").is_file()
+        assert (temp / "primary-data" / ".node" / "data.mdb").is_file()
         print(json.dumps({"ok": True, "role": status["role"], "epoch": status["epoch"]}))
         return 0
     finally:

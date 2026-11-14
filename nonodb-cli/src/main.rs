@@ -99,10 +99,10 @@ fn run() -> Result<(), String> {
                     let res = http_get("/v1/replication/acks")?;
                     println!("{}", serde_json::to_string_pretty(&res).unwrap());
                 }
-                "pair" => {
+                "pair" | "add-replica" | "add_replica" | "enroll" => {
                     let name = args
                         .get(2)
-                        .ok_or("usage: nonodb-cli replication pair <name> [databases]")?;
+                        .ok_or("usage: nonodb-cli replication add-replica <name> [databases]")?;
                     let databases = args
                         .get(3)
                         .map(|value| {
@@ -118,7 +118,23 @@ fn run() -> Result<(), String> {
                         "/v1/replication/pairings",
                         &json!({ "name": name, "databases": databases }),
                     )?;
-                    print_result(&res);
+                    if let Some(code) = res.pointer("/result/code").and_then(|v| v.as_str()) {
+                        let join_url = http_get("/v1/replication/primary")
+                            .ok()
+                            .and_then(|value| {
+                                value
+                                    .pointer("/result/write_url")
+                                    .and_then(|url| url.as_str())
+                                    .map(str::to_string)
+                            })
+                            .unwrap_or_else(|| "<primary-api-url>".to_string());
+                        println!("Pairing code: {code}");
+                        println!("On the replica, run:");
+                        println!("  nonodb-cli replication join {join_url} {code}");
+                        println!("Use the daemon API URL (default port 7878, not GUI proxy 8787).");
+                    } else {
+                        print_result(&res);
+                    }
                 }
                 "pairings" => {
                     let res = http_get("/v1/replication/pairings")?;
@@ -135,13 +151,18 @@ fn run() -> Result<(), String> {
                 "join" => {
                     let url = args
                         .get(2)
-                        .ok_or("usage: nonodb-cli replication join <primary-url>")?;
-                    eprintln!("Enter the one-time pairing code shown on the primary:");
-                    let mut code = String::new();
-                    std::io::stdin()
-                        .read_line(&mut code)
-                        .map_err(|error| format!("read pairing code: {error}"))?;
-                    let code = code.trim();
+                        .ok_or("usage: nonodb-cli replication join <primary-url> [pairing-code]")?;
+                    let code = match args.get(3) {
+                        Some(code) => code.trim().to_string(),
+                        None => {
+                            eprintln!("Paste the 8-character pairing code shown on the primary:");
+                            let mut code = String::new();
+                            std::io::stdin()
+                                .read_line(&mut code)
+                                .map_err(|error| format!("read pairing code: {error}"))?;
+                            code.trim().to_string()
+                        }
+                    };
                     if code.is_empty() {
                         return Err("pairing code is empty".into());
                     }
@@ -550,7 +571,7 @@ fn usage() -> Result<(), String> {
          ping                       sprawdź daemona\n\
          exec '<json>'              dowolne żądanie /v1/exec\n\
          databases [list|create <nazwa>|drop <nazwa>]  bazy w jednym daemonie\n\
-         replication [status|changes [after] [limit]|source <url> [dbs] [interval]|acks|prune <seq> [--require-acks]|promote <epoch> [--force]|demote <epoch> [role] [successor]|pair <name> [dbs]|pairings|revoke <code>|join <primary-url>]\n\
+         replication [status|changes [after] [limit]|source <url> [dbs] [interval]|acks|prune <seq> [--require-acks]|promote <epoch> [--force]|demote <epoch> [role] [successor]|add-replica <name> [dbs]|pairings|revoke <code>|join <primary-url> [code]]\n\
          collections                lista kolekcji\n\
          count <coll> [filtr]       liczba dokumentów\n\
          find <coll> [filtr] [--sort pole:asc|desc] [--limit N] [--skip N]\n\

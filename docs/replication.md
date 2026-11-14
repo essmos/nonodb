@@ -305,8 +305,8 @@ replica manually. Hot resync inside one process is still future work.
 
 ### Changing the source
 
-The active pull source is reloaded from `<NONODB_DATA>/replication-source.json`
-on every loop. Update it without restarting:
+The active pull source is reloaded from the hidden node metadata collection
+`<NONODB_DATA>/.node` on every loop. Update it without restarting:
 
 ```http
 PUT /v1/replication/source
@@ -318,8 +318,12 @@ PUT /v1/replication/source
 }
 ```
 
-Env values seed a new installation; the persisted file wins afterwards. Token,
-CA, client certificate, and key remain environment settings. The new source
+Env values seed a new installation; the persisted source wins afterwards.
+Role, source, vote, lease, and peer-token state live in the hidden LMDB
+collection `<NONODB_DATA>/.node`; legacy JSON files are migrated once. Token,
+CA, client certificate, and key remain environment settings. If the source is
+unreachable, the replica queries `NONODB_REPLICATION_SEEDS`, voters, and
+followers at `/v1/replication/primary` and switches to the reported primary. The new source
 must expose a compatible sequence/epoch stream, or the replica must be restarted
 so startup bootstrap can install a fresh snapshot.
 
@@ -355,8 +359,9 @@ only the current primary is selected for writes.
 
 ## Manual role changes
 
-Roles are persisted in `<NONODB_DATA>/replication-role.json`. The env var seeds
-a new installation; after that the file wins.
+Roles are persisted in the hidden node metadata collection
+`<NONODB_DATA>/.node`. The env var seeds a new installation; after that the
+persisted role wins.
 
 ```http
 POST /v1/replication/promote   {"expected_epoch": 0}
@@ -376,13 +381,13 @@ NONODB_REPLICATION_VOTERS=https://eu-1:7878,https://eu-2:7878,https://eu-3:7878
 NONODB_REPLICATION_VOTER_TOKEN=<shared-admin-token>
 ```
 
-Each voter persists the highest granted `(epoch, candidate)` in
-`replication-vote.json`; conflicting candidates at the same epoch are rejected.
+Each voter persists the highest granted `(epoch, candidate)` in the hidden node
+metadata collection; conflicting candidates at the same epoch are rejected.
 Promotion fails with `quorum_not_reached` without a majority.
 
 A primary with voters configured renews a lease every
-`NONODB_REPLICATION_LEASE_INTERVAL` seconds. Voters persist
-`replication-lease.json`. If the primary cannot reach a majority for
+`NONODB_REPLICATION_LEASE_INTERVAL` seconds. Voters persist the lease in the
+hidden node metadata collection. If the primary cannot reach a majority for
 `NONODB_REPLICATION_LEASE_TTL` seconds, it self-demotes to `replica` and stops
 accepting writes. This fences an old primary that is partitioned from the
 quorum.
@@ -459,8 +464,8 @@ maintenance — only run while the node is a writable primary.
 Promotion readiness requires both the data head and the control-plane snapshot.
 A candidate that is behind either one refuses automatic promotion.
 
-The cluster peer token is stored in the control document and written to
-`cluster-peer-token` with mode `0600`. This is a deliberate cluster-wide
+The cluster peer token is stored in the control document and in the hidden
+local metadata collection `<NONODB_DATA>/.node`. This is a deliberate cluster-wide
 administration model: every fully joined node can become primary and has the
 credentials needed to accept clients and follow the next primary.
 

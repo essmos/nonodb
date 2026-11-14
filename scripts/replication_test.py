@@ -415,7 +415,7 @@ def main() -> int:
                     },
                 )
                 assert source_update.status_code == 200, source_update.text
-                assert (replica_data / "replication-source.json").is_file()
+                assert (replica_data / ".node" / "data.mdb").is_file()
                 updated_status = replica.get(
                     "/v1/replication/status", headers=headers
                 ).json()["result"]
