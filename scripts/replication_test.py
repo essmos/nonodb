@@ -277,10 +277,46 @@ def main() -> int:
                 assert blocked.status_code == 403, blocked.text
                 assert blocked.json()["error"]["code"] == "read_only", blocked.text
 
+                promoted = replica.post(
+                    "/v1/replication/promote",
+                    headers=headers,
+                    json={"expected_epoch": 0},
+                )
+                assert promoted.status_code == 200, promoted.text
+                promoted_role = promoted.json()["result"]["role"]
+                assert promoted_role["role"] == "primary", promoted_role
+                assert promoted_role["epoch"] == 1, promoted_role
+                assert promoted_role["read_only"] is False, promoted_role
+                writable = replica.post(
+                    "/v1/exec",
+                    headers=headers,
+                    json={"op": "insert", "coll": "orders", "doc": {"_id": "promoted", "n": 1}},
+                )
+                assert writable.status_code == 200, writable.text
+
+                demote = subprocess.run(
+                    [str(CLI), "replication", "demote", "1", "replica"],
+                    env={**os.environ, "NONODB_SOCK": str(temp / "replica.sock")},
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                assert demote.returncode == 0, demote.stderr
+                demoted = json.loads(demote.stdout)["role"]
+                assert demoted["role"] == "replica", demoted
+                assert demoted["epoch"] == 2, demoted
+                blocked_again = replica.post(
+                    "/v1/exec",
+                    headers=headers,
+                    json={"op": "insert", "coll": "orders", "doc": {"_id": "blocked-2"}},
+                )
+                assert blocked_again.status_code == 403, blocked_again.text
+
                 replica_status = replica.get(
                     "/v1/replication/status", headers=headers
                 ).json()["result"]
                 assert replica_status["role"] == "replica", replica_status
+                assert replica_status["epoch"] == 2, replica_status
                 assert replica_status["read_only"] is True, replica_status
                 assert replica_status["applied"], replica_status
                 assert replica_status["applied"][0]["origin"] == "test-node", replica_status
@@ -299,6 +335,7 @@ def main() -> int:
                 ).text
                 assert 'nonodb_replication_applied{database="default",origin="test-node"}' in replica_metrics, replica_metrics[-1000:]
                 assert 'nonodb_replication_lag{database="default",origin="test-node"} 0' in replica_metrics, replica_metrics[-1000:]
+                assert "nonodb_replication_epoch 2" in replica_metrics, replica_metrics[-1000:]
                 applied_total = re.search(
                     r"nonodb_replication_applied_total (\d+)", replica_metrics
                 )

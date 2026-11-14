@@ -253,8 +253,25 @@ on every start; `never` disables bootstrap. The snapshot's own replication head
 becomes the initial applied sequence, so changes after that point are pulled
 normally.
 
-Epochs, promotion, and automatic resync after an expired source log are not
-implemented yet, so this is not yet a production failover mechanism.
+### Manual role changes
+
+Roles are persisted in `<NONODB_DATA>/replication-role.json`. The env var seeds
+a new installation; after that the file wins.
+
+```http
+POST /v1/replication/promote   {"expected_epoch": 0}
+POST /v1/replication/demote    {"expected_epoch": 1, "role": "replica"}
+```
+
+Each successful change increments `epoch`. A stale `expected_epoch` returns
+`409` to prevent an operator acting on outdated role information. Promotion
+stops the replica pull loop and enables the writer. Demotion makes the node
+read-only again.
+
+This is **manual** promotion, not quorum failover. The old primary must be
+demoted or stopped to avoid split-brain, and the epoch is not yet carried in
+transaction records for cross-node rejection. Lease-based promotion and
+enforced fencing remain future work.
 
 ## Implementation phases
 
@@ -291,7 +308,8 @@ implemented yet, so this is not yet a production failover mechanism.
 - [x] Role-aware `/readyz` and `nonodb-cli replication` status/changes/prune.
 - [ ] Peer wizard and full role banner.
 - [ ] Add peer, test connection, pause/resume, resync.
-- [ ] Promote/demote with confirmation and audit.
+- [x] Manual promote/demote with persisted role, expected epoch, and audit.
+- [ ] Promotion confirmation workflow in GUI.
 - [ ] Certificate expiry and lag dashboards.
 - [ ] Alert rules.
 

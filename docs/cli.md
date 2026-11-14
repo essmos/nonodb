@@ -521,6 +521,17 @@ Prune a known-acked range:
 nonodb-cli replication prune 1234
 ```
 
+Manually switch roles with an expected epoch:
+
+```bash
+nonodb-cli replication promote 0
+nonodb-cli replication demote 1 replica
+```
+
+A stale epoch is rejected with `409`. The role is persisted in
+`<NONODB_DATA>/replication-role.json`; the file wins over
+`NONODB_REPLICATION_ROLE` after the first start.
+
 `NONODB_DB=app1` or `--db app1` selects another database. Status includes role,
 read-only mode, source URL, bootstrap mode, applied sources, lag, and the last
 transport/apply error. Pruning is an administrative retention action; do not

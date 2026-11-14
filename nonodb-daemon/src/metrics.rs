@@ -553,6 +553,7 @@ pub fn append_replication_metrics(
     enabled: bool,
     origin: Option<&str>,
     role: &str,
+    epoch: u64,
     heads: &[(String, u64)],
     applied: &[(String, String, u64, u64)],
 ) {
@@ -575,6 +576,13 @@ pub fn append_replication_metrics(
         "Configured node replication role.",
     );
     prom_sample(out, "nonodb_replication_role", &[("role", role)], &json!(1));
+    prom_header(
+        out,
+        "nonodb_replication_epoch",
+        "gauge",
+        "Current persisted replication role epoch.",
+    );
+    prom_sample(out, "nonodb_replication_epoch", &[], &json!(epoch));
     if let Some(origin) = origin {
         prom_header(
             out,

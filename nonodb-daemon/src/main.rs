@@ -192,6 +192,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         auth.spawn_watcher();
     }
     let audit = audit::AuditLog::from_env()?;
+    replicator::init_role(&data).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
     replicator::bootstrap_startup(&data)
         .await
@@ -287,6 +288,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             "/v1/replication/prune",
             post(replication_api::prune_default),
         )
+        .route("/v1/replication/promote", post(replication_api::promote))
+        .route("/v1/replication/demote", post(replication_api::demote))
         .route(
             "/:database/v1/replication/status",
             get(replication_api::status),
@@ -1033,6 +1036,7 @@ async fn prometheus_handler(
         origin.is_some(),
         origin.as_deref(),
         &role,
+        replicator::epoch(),
         &heads,
         &applied,
     );

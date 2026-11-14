@@ -150,7 +150,8 @@ They are cheap gauges read from LMDB; they do not scan documents.
 | Metric | Meaning |
 |---|---|
 | `nonodb_replication_enabled` | `1` when durable writer capture is enabled |
-| `nonodb_replication_role{role}` | Configured role, usually `primary` |
+| `nonodb_replication_role{role}` | Current persisted role |
+| `nonodb_replication_epoch` | Current role epoch |
 | `nonodb_replication_origin_info{origin}` | Configured node identity |
 | `nonodb_replication_head{database}` | Highest allocated replication sequence |
 | `nonodb_replication_applied{database,origin}` | Highest applied source sequence |

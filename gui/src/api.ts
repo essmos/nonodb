@@ -563,9 +563,12 @@ export type ReplicationStatus = {
   enabled: boolean;
   origin?: string | null;
   role: string;
+  epoch?: number;
   read_only?: boolean;
   head: number;
   replication?: {
+    role?: string;
+    epoch?: number;
     source?: string | null;
     databases?: string[];
     interval_secs?: number;

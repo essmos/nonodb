@@ -34,6 +34,13 @@ pub struct PruneBody {
     pub through: u64,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct RoleBody {
+    pub expected_epoch: u64,
+    #[serde(default)]
+    pub role: Option<String>,
+}
+
 pub async fn status(
     State(state): State<AppState>,
     Extension(connection): Extension<auth::ConnectionAuth>,
@@ -93,6 +100,7 @@ pub async fn status(
                 "enabled": origin.is_some(),
                 "origin": origin,
                 "role": crate::replicator::role(),
+                "epoch": crate::replicator::epoch(),
                 "read_only": !crate::replicator::writable(),
                 "head": head,
                 "applied": applied,
@@ -159,6 +167,110 @@ pub async fn changes(
             error.to_string(),
         ),
     }
+}
+
+pub async fn promote(
+    State(state): State<AppState>,
+    Extension(connection): Extension<auth::ConnectionAuth>,
+    headers: HeaderMap,
+    Json(body): Json<RoleBody>,
+) -> AuthResponse {
+    let (principal, started) =
+        match start_admin(&state, &connection, &headers, "replication_promote") {
+            Ok(value) => value,
+            Err(response) => return response,
+        };
+    match crate::replicator::promote(body.expected_epoch) {
+        Ok(role) => {
+            audit_control(
+                &state,
+                &connection,
+                principal.name(),
+                "replication_promote",
+                true,
+                None,
+                started,
+                None,
+            );
+            ok(serde_json::json!({ "role": role }))
+        }
+        Err((code, message)) => role_failure(
+            &state,
+            &connection,
+            principal.name(),
+            "replication_promote",
+            started,
+            code,
+            message,
+        ),
+    }
+}
+
+pub async fn demote(
+    State(state): State<AppState>,
+    Extension(connection): Extension<auth::ConnectionAuth>,
+    headers: HeaderMap,
+    Json(body): Json<RoleBody>,
+) -> AuthResponse {
+    let (principal, started) =
+        match start_admin(&state, &connection, &headers, "replication_demote") {
+            Ok(value) => value,
+            Err(response) => return response,
+        };
+    let role = body.role.as_deref().unwrap_or("replica");
+    match crate::replicator::demote(body.expected_epoch, role) {
+        Ok(role) => {
+            audit_control(
+                &state,
+                &connection,
+                principal.name(),
+                "replication_demote",
+                true,
+                None,
+                started,
+                None,
+            );
+            ok(serde_json::json!({ "role": role }))
+        }
+        Err((code, message)) => role_failure(
+            &state,
+            &connection,
+            principal.name(),
+            "replication_demote",
+            started,
+            code,
+            message,
+        ),
+    }
+}
+
+fn role_failure(
+    state: &AppState,
+    connection: &auth::ConnectionAuth,
+    principal: &str,
+    op: &str,
+    started: std::time::Instant,
+    code: String,
+    message: String,
+) -> AuthResponse {
+    let status = if code == "epoch_mismatch" {
+        StatusCode::CONFLICT
+    } else if code == "role_state_error" {
+        StatusCode::INTERNAL_SERVER_ERROR
+    } else {
+        StatusCode::BAD_REQUEST
+    };
+    audit_control(
+        state,
+        connection,
+        principal,
+        op,
+        false,
+        Some(&message),
+        started,
+        None,
+    );
+    failure(status, &code, message)
 }
 
 pub async fn snapshot(

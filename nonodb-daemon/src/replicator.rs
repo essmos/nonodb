@@ -13,6 +13,7 @@ use std::{
 
 use futures_util::StreamExt;
 use nonodb_core::{replication::ReplicationTxn, Store};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::{io::AsyncWriteExt, sync::watch};
 
@@ -125,6 +126,158 @@ impl Config {
     }
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PersistedRole {
+    role: String,
+    epoch: u64,
+}
+
+struct RoleCell {
+    role: String,
+    epoch: u64,
+    path: std::path::PathBuf,
+}
+
+fn role_cell() -> &'static Mutex<RoleCell> {
+    static ROLE: OnceLock<Mutex<RoleCell>> = OnceLock::new();
+    ROLE.get_or_init(|| {
+        Mutex::new(RoleCell {
+            role: std::env::var("NONODB_REPLICATION_ROLE")
+                .ok()
+                .map(|value| value.trim().to_ascii_lowercase())
+                .filter(|value| matches!(value.as_str(), "primary" | "replica" | "standby"))
+                .unwrap_or_else(|| "primary".to_string()),
+            epoch: 0,
+            path: std::path::PathBuf::new(),
+        })
+    })
+}
+
+fn valid_role(value: &str) -> bool {
+    matches!(value, "primary" | "replica" | "standby")
+}
+
+fn write_role(path: &std::path::Path, role: &str, epoch: u64) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| format!("create role state dir: {error}"))?;
+    }
+    let temp = path.with_extension(format!("tmp-{}", std::process::id()));
+    let encoded = serde_json::to_vec_pretty(&PersistedRole {
+        role: role.to_string(),
+        epoch,
+    })
+    .map_err(|error| error.to_string())?;
+    fs::write(&temp, encoded).map_err(|error| format!("write role state: {error}"))?;
+    fs::rename(&temp, path).map_err(|error| format!("replace role state: {error}"))?;
+    Ok(())
+}
+
+/// Loads the persisted role before any database writer starts. The role file
+/// wins over `NONODB_REPLICATION_ROLE`; env seeds a brand-new installation.
+pub fn init_role(data: &std::path::Path) -> Result<(), String> {
+    let path = data.join("replication-role.json");
+    let env_role = std::env::var("NONODB_REPLICATION_ROLE")
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| valid_role(value))
+        .unwrap_or_else(|| "primary".to_string());
+    let state = if path.is_file() {
+        let raw = fs::read(&path).map_err(|error| format!("read role state: {error}"))?;
+        let persisted: PersistedRole =
+            serde_json::from_slice(&raw).map_err(|error| format!("parse role state: {error}"))?;
+        if !valid_role(&persisted.role) {
+            return Err(format!(
+                "invalid persisted replication role `{}`",
+                persisted.role
+            ));
+        }
+        persisted
+    } else {
+        let state = PersistedRole {
+            role: env_role,
+            epoch: 0,
+        };
+        write_role(&path, &state.role, state.epoch)?;
+        state
+    };
+    let mut cell = role_cell()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cell.role = state.role;
+    cell.epoch = state.epoch;
+    cell.path = path;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RoleView {
+    pub role: String,
+    pub epoch: u64,
+    pub read_only: bool,
+}
+
+fn role_view(cell: &RoleCell) -> RoleView {
+    RoleView {
+        role: cell.role.clone(),
+        epoch: cell.epoch,
+        read_only: cell.role != "primary",
+    }
+}
+
+fn change_role(next: &str, expected_epoch: u64) -> Result<RoleView, (String, String)> {
+    if !valid_role(next) {
+        return Err((
+            "invalid_role".to_string(),
+            format!("role must be primary, replica, or standby, got `{next}`"),
+        ));
+    }
+    let mut cell = role_cell()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if cell.role == next {
+        return Ok(role_view(&cell));
+    }
+    if expected_epoch != cell.epoch {
+        return Err((
+            "epoch_mismatch".to_string(),
+            format!(
+                "expected epoch {expected_epoch}, current epoch is {}",
+                cell.epoch
+            ),
+        ));
+    }
+    let previous = cell.role.clone();
+    let epoch = cell.epoch.saturating_add(1);
+    if let Err(error) = write_role(&cell.path, next, epoch) {
+        cell.role = previous;
+        return Err(("role_state_error".to_string(), error));
+    }
+    cell.role = next.to_string();
+    cell.epoch = epoch;
+    Ok(role_view(&cell))
+}
+
+pub fn promote(expected_epoch: u64) -> Result<RoleView, (String, String)> {
+    change_role("primary", expected_epoch)
+}
+
+pub fn demote(expected_epoch: u64, role: &str) -> Result<RoleView, (String, String)> {
+    if role == "primary" {
+        return Err((
+            "invalid_role".to_string(),
+            "demote requires replica or standby".to_string(),
+        ));
+    }
+    change_role(role, expected_epoch)
+}
+
+pub fn epoch() -> u64 {
+    role_cell()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .epoch
+}
+
 #[derive(Clone, Debug, Default)]
 struct RuntimeStatus {
     source: Option<String>,
@@ -183,6 +336,7 @@ pub fn status_json() -> Value {
         .clone();
     serde_json::json!({
         "role": role(),
+        "epoch": epoch(),
         "read_only": !writable(),
         "source": status.source,
         "databases": status.databases,
@@ -210,11 +364,11 @@ fn non_empty_env(name: &str) -> Option<String> {
 }
 
 pub fn role() -> String {
-    std::env::var("NONODB_REPLICATION_ROLE")
-        .ok()
-        .map(|value| value.trim().to_ascii_lowercase())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "primary".to_string())
+    role_cell()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .role
+        .clone()
 }
 
 /// Client writes are accepted only on the primary. Standbys receive writes
@@ -480,6 +634,9 @@ async fn pull_database(
     };
 
     for _ in 0..100 {
+        if writable() {
+            return Ok(());
+        }
         let status = get_json(client, config, database, "status", &[]).await?;
         let origin = status
             .get("origin")
@@ -519,6 +676,9 @@ async fn pull_database(
         }
         let mut applied_any = false;
         for value in batch {
+            if writable() {
+                return Ok(());
+            }
             let txn: ReplicationTxn = serde_json::from_value(value.clone())
                 .map_err(|error| format!("decode replication transaction: {error}"))?;
             match runtime.store.apply_replication_txn(&txn) {

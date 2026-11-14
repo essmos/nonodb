@@ -1559,6 +1559,7 @@ function ReplicationPage({ connection }: { connection: Connection }) {
             <div className="stat"><span>Database</span><strong>{status.database}</strong></div>
             <div className="stat"><span>Log capture</span><strong>{status.enabled ? 'enabled' : 'disabled'}</strong></div>
             <div className="stat"><span>Origin</span><strong className="mono">{status.origin ?? '—'}</strong></div>
+            <div className="stat"><span>Epoch</span><strong>{status.epoch ?? status.replication?.epoch ?? 0}</strong></div>
             <div className="stat"><span>Head sequence</span><strong>{status.head.toLocaleString()}</strong></div>
           </div>
         ) : (

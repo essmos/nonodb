@@ -126,7 +126,9 @@ Design: [docs/replication.md](docs/replication.md).
       snapshot bootstrap with recorded sequence.
 - [x] Add replica apply path with idempotence `(origin, seq)`.
 - [x] Preserve transaction atomicity on the replica and reject client writes.
-- [ ] Add epoch fencing for source changes and promotion.
+- [x] Add persisted role state and manual promote/demote with expected epoch.
+- [ ] Carry the epoch in replication transactions and reject stale epochs.
+- [ ] Add lease-based automatic promotion and fencing.
 - [ ] Add automatic resync when the source log was pruned too far.
 - [x] Add role-aware `/readyz` and replication fields to status/GUI.
 
