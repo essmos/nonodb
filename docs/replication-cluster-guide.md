@@ -51,7 +51,8 @@ Data-plane operations:
 - automatic event settings;
 - secondary, compound, geo, text, fuzzy, and vector indexes;
 - conditional subscription definitions and renewals;
-- `_events` outbox documents.
+- `_events` outbox documents;
+- encrypted vault envelopes (the tenant key is supplied by clients).
 
 Control-plane operations:
 
