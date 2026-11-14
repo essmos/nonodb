@@ -283,7 +283,7 @@ scripts are:
 | `scripts/auth_test.py` | principals, scopes, filtered collections, token revocation, audit, IP lockout |
 | `scripts/auth_api_test.py` | admin-only auth API, one-time tokens, last-admin protection, certificates, Prometheus endpoint, disk/snapshot metrics, readiness |
 | `scripts/backup_api_test.py` | multi-database backups, backup-info, excluded collections, age keygen, local/S3 import, restore, SigV4, and restic command flow |
-| `scripts/replication_test.py` | writer log capture, snapshot bootstrap, prune, pull apply, local applied log, global sequence, read-only replica, promote/demote epoch, stale-epoch rejection, source reload, startup auto-resync, apply metrics, and lag |
+| `scripts/replication_test.py` | writer log capture, snapshot bootstrap, prune with replica acks, pull apply, local applied log, global sequence, read-only replica, promote/demote epoch, stale-epoch rejection, source reload, startup auto-resync, apply metrics, and lag |
 | `scripts/security_check.py` | isolated auth gates, database-qualified scopes, CORS, malformed input, security headers, lockout |
 | `scripts/writer_window_bench.py` | adaptive/fixed group-commit window latency and throughput comparison |
 | `scripts/ttl_test.py` | TTL defaults, overrides, update semantics, sweeper, vault |

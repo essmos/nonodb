@@ -2462,12 +2462,16 @@ Transport, replica apply, promotion, and GUI management are still planned.
 | `POST` | `/v1/replication/prune` | Delete log entries through `{ "through": N }` |
 | `GET` | `/{database}/v1/replication/snapshot` | Snapshot for a selected database |
 | `POST` | `/{database}/v1/replication/prune` | Prune a selected database |
+| `POST` | `/v1/replication/ack` | Record a replica applied-sequence acknowledgement |
+| `GET` | `/v1/replication/acks` | List replica acknowledgements and the minimum safe sequence |
 | `POST` | `/v1/replication/promote` | Manually promote to primary using `expected_epoch` |
 | `POST` | `/v1/replication/demote` | Manually demote with `expected_epoch` and optional `role` |
 | `PUT` | `/v1/replication/source` | Persist a new pull source and reload the loop |
 
 All routes require `admin:db` or `*:*`. Snapshot and prune are intended for
-replica bootstrap and controlled retention. Promote/demote are instance-wide
+replica bootstrap and controlled retention. Prune accepts
+`{"through": N, "require_acks": true}` and refuses to advance past the minimum
+acknowledged replica sequence. Promote/demote are instance-wide
 role changes persisted in `<NONODB_DATA>/replication-role.json`. The pull source
 is persisted in `<NONODB_DATA>/replication-source.json`. A change transaction contains an
 `origin`, `seq`, `epoch`, `created_at_ms`, and grouped `changes` with

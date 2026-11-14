@@ -32,6 +32,21 @@ fn default_limit() -> usize {
 #[derive(Debug, Deserialize)]
 pub struct PruneBody {
     pub through: u64,
+    #[serde(default)]
+    pub require_acks: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AckBody {
+    pub node: String,
+    pub origin: String,
+    pub seq: u64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AcksQuery {
+    #[serde(default)]
+    pub origin: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -452,6 +467,117 @@ pub async fn snapshot(
     response
 }
 
+pub async fn ack(
+    State(state): State<AppState>,
+    Extension(connection): Extension<auth::ConnectionAuth>,
+    headers: HeaderMap,
+    Path(database): Path<String>,
+    Json(body): Json<AckBody>,
+) -> AuthResponse {
+    let (principal, started) = match start_admin(&state, &connection, &headers, "replication_ack") {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let database = if database.is_empty() {
+        crate::databases::DEFAULT_DATABASE.to_string()
+    } else {
+        database
+    };
+    let store = match state.databases.get(&database).await {
+        Ok(runtime) => runtime.store.clone(),
+        Err(error) => return failure(StatusCode::BAD_REQUEST, &error.code, error.message),
+    };
+    match store.record_replica_ack(&body.origin, &body.node, body.seq) {
+        Ok(()) => {
+            audit_control(
+                &state,
+                &connection,
+                principal.name(),
+                "replication_ack",
+                true,
+                None,
+                started,
+                None,
+            );
+            ok(serde_json::json!({
+                "database": database,
+                "node": body.node,
+                "origin": body.origin,
+                "seq": body.seq,
+            }))
+        }
+        Err(error) => failure(
+            StatusCode::BAD_REQUEST,
+            "replication_error",
+            error.to_string(),
+        ),
+    }
+}
+
+pub async fn acks(
+    State(state): State<AppState>,
+    Extension(connection): Extension<auth::ConnectionAuth>,
+    headers: HeaderMap,
+    Path(database): Path<String>,
+    Query(query): Query<AcksQuery>,
+) -> AuthResponse {
+    let (principal, started) = match start_admin(&state, &connection, &headers, "replication_acks")
+    {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let database = if database.is_empty() {
+        crate::databases::DEFAULT_DATABASE.to_string()
+    } else {
+        database
+    };
+    let store = match state.databases.get(&database).await {
+        Ok(runtime) => runtime.store.clone(),
+        Err(error) => return failure(StatusCode::BAD_REQUEST, &error.code, error.message),
+    };
+    let origin = query
+        .origin
+        .or_else(crate::writer::replication_origin)
+        .unwrap_or_default();
+    if origin.is_empty() {
+        return failure(
+            StatusCode::BAD_REQUEST,
+            "replication_disabled",
+            "replication origin is not configured",
+        );
+    }
+    match (store.replica_acks(&origin), store.replication_head()) {
+        (Ok(acks), Ok(head)) => {
+            let min = acks.iter().map(|(_, seq)| *seq).min().unwrap_or(0);
+            audit_control(
+                &state,
+                &connection,
+                principal.name(),
+                "replication_acks",
+                true,
+                None,
+                started,
+                None,
+            );
+            ok(serde_json::json!({
+                "database": database,
+                "origin": origin,
+                "head": head,
+                "min_ack": min,
+                "acks": acks
+                    .into_iter()
+                    .map(|(node, seq)| serde_json::json!({ "node": node, "seq": seq }))
+                    .collect::<Vec<_>>(),
+            }))
+        }
+        (Err(error), _) | (_, Err(error)) => failure(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "replication_error",
+            error.to_string(),
+        ),
+    }
+}
+
 pub async fn prune(
     State(state): State<AppState>,
     Extension(connection): Extension<auth::ConnectionAuth>,
@@ -473,7 +599,40 @@ pub async fn prune(
         Ok(runtime) => runtime.store.clone(),
         Err(error) => return failure(StatusCode::BAD_REQUEST, &error.code, error.message),
     };
-    let through = body.through.min(store.replication_head().unwrap_or(0));
+    let mut through = body.through.min(store.replication_head().unwrap_or(0));
+    let mut min_ack = None;
+    if body.require_acks {
+        let origin = match crate::writer::replication_origin() {
+            Some(origin) => origin,
+            None => {
+                return failure(
+                    StatusCode::BAD_REQUEST,
+                    "replication_disabled",
+                    "replication origin is not configured",
+                )
+            }
+        };
+        let acks = match store.replica_acks(&origin) {
+            Ok(acks) => acks,
+            Err(error) => {
+                return failure(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "replication_error",
+                    error.to_string(),
+                )
+            }
+        };
+        if acks.is_empty() {
+            return failure(
+                StatusCode::CONFLICT,
+                "no_replica_acks",
+                "no replica has acknowledged this source yet",
+            );
+        }
+        let ack = acks.iter().map(|(_, seq)| *seq).min().unwrap_or(0);
+        min_ack = Some(ack);
+        through = through.min(ack);
+    }
     match store.prune_replication_through(through) {
         Ok(deleted) => {
             audit_control(
@@ -490,6 +649,8 @@ pub async fn prune(
                 "database": database,
                 "through": through,
                 "deleted": deleted,
+                "require_acks": body.require_acks,
+                "min_ack": min_ack,
             }))
         }
         Err(error) => failure(
@@ -498,6 +659,38 @@ pub async fn prune(
             error.to_string(),
         ),
     }
+}
+
+pub async fn ack_default(
+    State(state): State<AppState>,
+    Extension(connection): Extension<auth::ConnectionAuth>,
+    headers: HeaderMap,
+    Json(body): Json<AckBody>,
+) -> AuthResponse {
+    ack(
+        State(state),
+        Extension(connection),
+        headers,
+        Path(crate::databases::DEFAULT_DATABASE.to_string()),
+        Json(body),
+    )
+    .await
+}
+
+pub async fn acks_default(
+    State(state): State<AppState>,
+    Extension(connection): Extension<auth::ConnectionAuth>,
+    headers: HeaderMap,
+    Query(query): Query<AcksQuery>,
+) -> AuthResponse {
+    acks(
+        State(state),
+        Extension(connection),
+        headers,
+        Path(crate::databases::DEFAULT_DATABASE.to_string()),
+        Query(query),
+    )
+    .await
 }
 
 pub async fn snapshot_default(

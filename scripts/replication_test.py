@@ -154,6 +154,13 @@ def main() -> int:
             source_head = client.get(
                 "/v1/replication/status", headers=headers
             ).json()["result"]["head"]
+            no_acks = client.post(
+                "/v1/replication/prune",
+                headers=headers,
+                json={"through": source_head, "require_acks": True},
+            )
+            assert no_acks.status_code == 409, no_acks.text
+            assert no_acks.json()["error"]["code"] == "no_replica_acks", no_acks.text
             pruned = client.post(
                 "/v1/replication/prune",
                 headers=headers,
@@ -173,6 +180,7 @@ def main() -> int:
                 NONODB_AUTH_FILE=str(auth),
                 NONODB_REPLICATION_ROLE="replica",
                 NONODB_REPLICATION_ENABLED="1",
+                NONODB_REPLICATION_NODE_ID="replica-1",
                 NONODB_REPLICATION_SOURCE=f"http://127.0.0.1:{port}",
                 NONODB_REPLICATION_SOURCE_TOKEN=admin,
                 NONODB_REPLICATION_DATABASES="default",
@@ -296,6 +304,32 @@ def main() -> int:
                     time.sleep(0.1)
                 else:
                     raise RuntimeError("replica did not apply a new-epoch change")
+
+                deadline = time.monotonic() + 20
+                source_head_now = client.get(
+                    "/v1/replication/status", headers=headers
+                ).json()["result"]["head"]
+                while time.monotonic() < deadline:
+                    acks = client.get(
+                        "/v1/replication/acks", headers=headers
+                    ).json()["result"]["acks"]
+                    if any(
+                        ack["node"] == "replica-1" and ack["seq"] >= source_head_now
+                        for ack in acks
+                    ):
+                        break
+                    time.sleep(0.1)
+                else:
+                    raise RuntimeError(f"replica ack did not reach the source: {acks}")
+                pruned_with_acks = client.post(
+                    "/v1/replication/prune",
+                    headers=headers,
+                    json={"through": source_head_now, "require_acks": True},
+                )
+                assert pruned_with_acks.status_code == 200, pruned_with_acks.text
+                assert pruned_with_acks.json()["result"]["min_ack"] >= source_head_now, (
+                    pruned_with_acks.text
+                )
 
                 blocked = replica.post(
                     "/v1/exec",

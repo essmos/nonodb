@@ -81,11 +81,19 @@ fn run() -> Result<(), String> {
                 "prune" => {
                     let through: u64 = args
                         .get(2)
-                        .ok_or("usage: nonodb-cli replication prune <through>")?
+                        .ok_or("usage: nonodb-cli replication prune <through> [--require-acks]")?
                         .parse()
                         .map_err(|e| format!("through: {e}"))?;
-                    let res = http_post("/v1/replication/prune", &json!({ "through": through }))?;
+                    let require_acks = args.iter().any(|arg| arg == "--require-acks");
+                    let res = http_post(
+                        "/v1/replication/prune",
+                        &json!({ "through": through, "require_acks": require_acks }),
+                    )?;
                     print_result(&res);
+                }
+                "acks" => {
+                    let res = http_get("/v1/replication/acks")?;
+                    println!("{}", serde_json::to_string_pretty(&res).unwrap());
                 }
                 "source" => {
                     let source = args.get(2).ok_or(
@@ -482,7 +490,7 @@ fn usage() -> Result<(), String> {
          ping                       sprawdź daemona\n\
          exec '<json>'              dowolne żądanie /v1/exec\n\
          databases [list|create <nazwa>|drop <nazwa>]  bazy w jednym daemonie\n\
-         replication [status|changes [after] [limit]|source <url> [dbs] [interval]|prune <seq>|promote <epoch>|demote <epoch> [role]]\n\
+         replication [status|changes [after] [limit]|source <url> [dbs] [interval]|acks|prune <seq> [--require-acks]|promote <epoch>|demote <epoch> [role]]\n\
          collections                lista kolekcji\n\
          count <coll> [filtr]       liczba dokumentów\n\
          find <coll> [filtr] [--sort pole:asc|desc] [--limit N] [--skip N]\n\

@@ -288,6 +288,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             "/v1/replication/prune",
             post(replication_api::prune_default),
         )
+        .route("/v1/replication/ack", post(replication_api::ack_default))
+        .route("/v1/replication/acks", get(replication_api::acks_default))
         .route("/v1/replication/promote", post(replication_api::promote))
         .route("/v1/replication/demote", post(replication_api::demote))
         .route(
@@ -310,6 +312,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             "/:database/v1/replication/prune",
             post(replication_api::prune),
         )
+        .route("/:database/v1/replication/ack", post(replication_api::ack))
+        .route("/:database/v1/replication/acks", get(replication_api::acks))
         .route("/v1/exec", post(exec))
         .route("/v1/watch", post(watch_stream))
         .route("/:database/v1/exec", post(exec))

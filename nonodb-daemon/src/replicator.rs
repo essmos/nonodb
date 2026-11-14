@@ -424,6 +424,13 @@ fn non_empty_env(name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn node_id() -> String {
+    non_empty_env("NONODB_REPLICATION_NODE_ID")
+        .or_else(|| non_empty_env("NONODB_NODE_ID"))
+        .or_else(|| non_empty_env("NONODB_REPLICATION_ORIGIN"))
+        .unwrap_or_else(|| "local".to_string())
+}
+
 pub fn role() -> String {
     role_cell()
         .lock()
@@ -558,6 +565,9 @@ pub async fn bootstrap_startup(data_root: &std::path::Path) -> Result<(), String
         {
             Ok(head) => {
                 record_success();
+                if let Err(error) = send_ack(&client, &config, database, &origin, head).await {
+                    tracing::warn!(database, error = %error, "replication bootstrap ack failed");
+                }
                 tracing::info!(database, origin, head, "replication snapshot installed");
             }
             Err(error) => {
@@ -885,12 +895,67 @@ async fn pull_database(
             runtime.cache.invalidate();
             metrics::set(&metrics::REPLICATION_LAST_SUCCESS_UNIX, unix_now());
             record_success();
+            let acked = runtime
+                .store
+                .replication_applied_global()
+                .map_err(|error| error.to_string())?;
+            if let Err(error) = send_ack(client, config, database, &origin, acked).await {
+                tracing::warn!(database, error = %error, "replication ack failed");
+            }
         }
         if batch.len() < config.limit {
             return Ok(());
         }
     }
     Err("replication catch-up exceeded 100 batches".into())
+}
+
+async fn send_ack(
+    client: &reqwest::Client,
+    config: &Config,
+    database: &str,
+    origin: &str,
+    seq: u64,
+) -> Result<(), String> {
+    let path = if database == DEFAULT_DATABASE {
+        "/v1/replication/ack".to_string()
+    } else {
+        format!("/{database}/v1/replication/ack")
+    };
+    let body = serde_json::to_vec(&serde_json::json!({
+        "node": node_id(),
+        "origin": origin,
+        "seq": seq,
+    }))
+    .map_err(|error| error.to_string())?;
+    let mut request = client
+        .post(format!("{}{}", config.source, path))
+        .header(reqwest::header::ACCEPT, "application/json")
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body);
+    if let Some(token) = &config.token {
+        request = request.bearer_auth(token);
+    }
+    let response = request.send().await.map_err(|error| {
+        metrics::inc(&metrics::REPLICATION_TRANSPORT_ERRORS);
+        let message = format!("request {path}: {error}");
+        record_transport_error(&message);
+        message
+    })?;
+    let status = response.status();
+    let body = response.text().await.map_err(|error| {
+        metrics::inc(&metrics::REPLICATION_TRANSPORT_ERRORS);
+        let message = format!("read {path} response: {error}");
+        record_transport_error(&message);
+        message
+    })?;
+    if !status.is_success() {
+        metrics::inc(&metrics::REPLICATION_TRANSPORT_ERRORS);
+        let message = format!("{path} -> HTTP {}: {}", status.as_u16(), body);
+        record_transport_error(&message);
+        return Err(message);
+    }
+    Ok(())
 }
 
 async fn get_json(

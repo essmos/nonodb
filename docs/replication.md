@@ -252,6 +252,19 @@ GET /v1/replication/snapshot
 POST /v1/replication/prune   {"through": N}
 ```
 
+Replicas acknowledge the applied sequence to the source after each successful
+batch. The source records acks per node and origin. Prune can require them:
+
+```http
+POST /v1/replication/prune
+{"through": 1234, "require_acks": true}
+```
+
+The effective prune point is capped at the minimum acknowledged replica
+sequence. If no replica has acknowledged the source, the request fails with
+`no_replica_acks`. Set `NONODB_REPLICATION_NODE_ID` on every replica so acks are
+distinguishable.
+
 `NONODB_REPLICATION_BOOTSTRAP=auto` installs a snapshot when the local database
 is fresh, or when the source log no longer contains the next sequence the
 replica needs. `always` installs one on every start; `never` disables bootstrap.

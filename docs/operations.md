@@ -91,6 +91,7 @@ secrets.
 | `NONODB_REPLICATION_ENABLED` | `0` | Enable durable writer replication-log capture |
 | `NONODB_REPLICATION_ORIGIN` | `NONODB_NODE_ID` or `local` | Stable node identity written into replication records |
 | `NONODB_REPLICATION_ROLE` | `primary` | Seeds `replication-role.json`: `primary`, `replica`, or `standby`; replicas are read-only |
+| `NONODB_REPLICATION_NODE_ID` | `NONODB_NODE_ID` or `local` | Replica identity used in retention acknowledgements |
 | `NONODB_REPLICATION_SOURCE` | unset | Source base URL for replica/standby pull |
 | `NONODB_REPLICATION_SOURCE_TOKEN` | unset | Bearer token used to read the source replication API |
 | `NONODB_REPLICATION_DATABASES` | `default` | Comma-separated databases to pull |

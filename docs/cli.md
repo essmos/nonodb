@@ -515,10 +515,16 @@ nonodb-cli replication status
 nonodb-cli replication changes 0 100
 ```
 
-Prune a known-acked range:
+Inspect replica acknowledgements:
 
 ```bash
-nonodb-cli replication prune 1234
+nonodb-cli replication acks
+```
+
+Prune a known-acked range, refusing to pass the minimum replica ack:
+
+```bash
+nonodb-cli replication prune 1234 --require-acks
 ```
 
 Change the pull source without restarting the daemon:

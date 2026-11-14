@@ -1590,6 +1590,54 @@ impl Store {
         Ok(())
     }
 
+    /// Records a replica's acknowledged source sequence for `origin`.
+    pub fn record_replica_ack(&self, origin: &str, node: &str, seq: u64) -> Result<()> {
+        if origin.trim().is_empty() || node.trim().is_empty() {
+            return Err(Error::Query("replication ack origin/node is empty".into()));
+        }
+        let key = format!("replication:ack:{origin}:{node}");
+        let mut wtxn = self.write_txn()?;
+        let meta: Database<Bytes, Bytes> = self.env.create_database(&mut wtxn, Some(META_DB))?;
+        let current = meta
+            .get(&wtxn, key.as_bytes())?
+            .and_then(|raw| std::str::from_utf8(raw).ok())
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .unwrap_or(0);
+        if seq > current {
+            meta.put(&mut wtxn, key.as_bytes(), seq.to_string().as_bytes())?;
+        }
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    /// Returns `(node, acked sequence)` for all replicas of `origin`.
+    pub fn replica_acks(&self, origin: &str) -> Result<Vec<(String, u64)>> {
+        let prefix = format!("replication:ack:{origin}:");
+        let rtxn = self.read_txn()?;
+        let meta: Database<Bytes, Bytes> = self
+            .env
+            .open_database(&rtxn, Some(META_DB))?
+            .ok_or_else(|| Error::Query("meta database missing".into()))?;
+        let mut out = Vec::new();
+        for item in meta.iter(&rtxn)? {
+            let (key, value) = item?;
+            let Some(node) = key.strip_prefix(prefix.as_bytes()) else {
+                continue;
+            };
+            let Ok(node) = std::str::from_utf8(node) else {
+                continue;
+            };
+            let seq = std::str::from_utf8(value)
+                .ok()
+                .and_then(|raw| raw.parse::<u64>().ok())
+                .unwrap_or(0);
+            out.push((node.to_string(), seq));
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        rtxn.commit()?;
+        Ok(out)
+    }
+
     /// Sets the applied sequence and observed source head for a bootstrap.
     pub fn set_replication_state(
         &self,
