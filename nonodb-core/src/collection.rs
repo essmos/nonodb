@@ -2715,6 +2715,61 @@ impl<'e> Collection<'e> {
         Ok(bytes)
     }
 
+    /// Reads the encrypted stored envelope for a vault document.
+    pub fn vault_stored_txn(&self, wtxn: &RwTxn<'_>, id: &str) -> Result<Option<Value>> {
+        self.ensure_vault()?;
+        let Some(raw) = self.db.get(wtxn, id.as_bytes())? else {
+            return Ok(None);
+        };
+        parse_json(raw).map(Some)
+    }
+
+    /// Applies an already-encrypted vault envelope from the replication log.
+    pub fn apply_vault_replication_txn(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        op: &str,
+        id: &str,
+        after: Option<&Value>,
+    ) -> Result<()> {
+        self.ensure_vault()?;
+        match op {
+            "insert" | "update" | "upsert" => {
+                let stored = after.ok_or_else(|| {
+                    Error::Query("vault replication change is missing stored document".into())
+                })?;
+                if stored.get("_id").and_then(Value::as_str) != Some(id) {
+                    return Err(Error::Query(
+                        "vault replication stored document id does not match".into(),
+                    ));
+                }
+                if vault::stored_tenant(stored).is_none() {
+                    return Err(Error::Query(
+                        "vault replication stored document has no tenant".into(),
+                    ));
+                }
+                let bytes = Self::check_vault_size(stored)?;
+                self.db.put(&mut *wtxn, id.as_bytes(), &bytes)?;
+                self.record_history(
+                    wtxn,
+                    id,
+                    if op == "insert" { "insert" } else { "update" },
+                    Some(stored.clone()),
+                )?;
+                Ok(())
+            }
+            "delete" => {
+                self.db.delete(&mut *wtxn, id.as_bytes())?;
+                self.set_ttl(wtxn, id, None)?;
+                self.record_history(wtxn, id, "delete", None)?;
+                Ok(())
+            }
+            other => Err(Error::Query(format!(
+                "unsupported vault replication operation `{other}`"
+            ))),
+        }
+    }
+
     /// Inserts a document into a vault collection in the given transaction.
     pub fn insert_vault_txn(
         &self,

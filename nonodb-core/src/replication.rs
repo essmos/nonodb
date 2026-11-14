@@ -31,6 +31,10 @@ pub struct ReplicationChange {
     pub before: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub after: Option<Value>,
+    /// The payload is an already-encrypted vault envelope; apply it directly
+    /// instead of routing it through the standard document write path.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub vault: bool,
 }
 
 /// One ordered logical operation in a replication transaction.
@@ -197,6 +201,7 @@ mod tests {
                     id: "o1".into(),
                     before: None,
                     after: Some(serde_json::json!({"_id": "o1", "total": 10})),
+                    vault: false,
                 }],
             )
             .unwrap();
@@ -214,6 +219,7 @@ mod tests {
                         id: "o1".into(),
                         before: Some(serde_json::json!({"_id": "o1", "total": 10})),
                         after: Some(serde_json::json!({"_id": "o1", "total": 20})),
+                        vault: false,
                     },
                     ReplicationChange {
                         collection: "payments".into(),
@@ -221,6 +227,7 @@ mod tests {
                         id: "p1".into(),
                         before: None,
                         after: Some(serde_json::json!({"_id": "p1", "total": 20})),
+                        vault: false,
                     },
                 ],
             )
@@ -250,6 +257,7 @@ mod tests {
             id: id.into(),
             before: None,
             after: Some(serde_json::json!({"_id": id})),
+            vault: false,
         };
         let first = ReplicationTxn::new_with_epoch(1, "node-a", 2, vec![change("o1")]);
         assert!(store.apply_replication_txn(&first).unwrap());
@@ -275,6 +283,7 @@ mod tests {
                 id: "o1".into(),
                 before: None,
                 after: Some(serde_json::json!({"_id": "o1", "total": 10})),
+                vault: false,
             }],
         );
         assert!(store.apply_replication_txn(&insert).unwrap());
@@ -301,6 +310,7 @@ mod tests {
                 id: "o1".into(),
                 before: Some(serde_json::json!({"_id": "o1", "total": 10})),
                 after: Some(serde_json::json!({"_id": "o1", "total": 20})),
+                vault: false,
             }],
         );
         assert!(store.apply_replication_txn(&update).unwrap());
@@ -329,6 +339,7 @@ mod tests {
                 id: "o1".into(),
                 before: Some(serde_json::json!({"_id": "o1", "total": 20})),
                 after: None,
+                vault: false,
             }],
         );
         assert!(store.apply_replication_txn(&delete).unwrap());

@@ -468,8 +468,8 @@ Database create/drop is part of the catalog. Replicas create missing databases
 and, by default, drop databases that disappear from the catalog. Set
 `NONODB_CLUSTER_PRUNE_DATABASES=0` to keep removed local databases.
 
-Vault payloads and keys remain outside this control plane because vault uses
-client-supplied encryption material.
+Vault payloads are replicated as encrypted envelopes. Tenant keys are
+client-supplied and remain outside the control plane.
 
 ## Implementation phases
 
@@ -482,7 +482,7 @@ client-supplied encryption material.
 - [x] Read-only replication status and changes endpoints.
 - [x] Writer replication integration test.
 - [x] SQL write capture.
-- [ ] Vault write capture.
+- [x] Vault encrypted-envelope write capture.
 - [x] Role, capture, origin, and head metrics.
 - [x] Applied sequence and lag metrics.
 - [x] Transport and apply-error counters.
@@ -597,7 +597,8 @@ inspection work; client writes are rejected with `read_only`.
 | Auth registry, admin tokens, certificates | Yes | Replicated as hashes/fingerprints on every node; the same client token works after promotion. |
 | Backup jobs and run state | Yes | Replicated; only the primary runs the scheduler. |
 | Database catalog | Yes | Create/drop replicated; local databases follow the catalog. |
-| Vault payloads/keys | No | Vault remains a local encrypted store. |
+| Vault payloads | Yes | Encrypted envelopes are replicated; the tenant key remains client-side. |
+| Vault keys | No | Never stored by NonoDB. |
 | Replication status/changes/acks/promote/demote APIs | Yes | Administrative endpoints remain available on replicas. |
 
 Metadata and outbox operations are idempotent through the applied sequence. A

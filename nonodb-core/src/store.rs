@@ -1880,12 +1880,21 @@ impl Store {
                     Error::Query("replication document index out of range".into())
                 })?;
                 let collection = self.collection_in(wtxn, &change.collection)?;
-                collection.apply_replication_change_txn(
-                    wtxn,
-                    &change.op,
-                    &change.id,
-                    change.after.as_ref(),
-                )
+                if change.vault {
+                    collection.apply_vault_replication_txn(
+                        wtxn,
+                        &change.op,
+                        &change.id,
+                        change.after.as_ref(),
+                    )
+                } else {
+                    collection.apply_replication_change_txn(
+                        wtxn,
+                        &change.op,
+                        &change.id,
+                        change.after.as_ref(),
+                    )
+                }
             }
             ReplicationOp::CollectionCreate {
                 name,

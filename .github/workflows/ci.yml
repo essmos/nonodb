@@ -101,6 +101,7 @@ jobs:
           python3 scripts/replication_control_plane_test.py
           python3 scripts/replication_lease_gate_test.py
           python3 scripts/replication_partition_test.py
+          python3 scripts/replication_vault_test.py
 
       - name: Run security regression checks
         env:

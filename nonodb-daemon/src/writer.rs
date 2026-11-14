@@ -51,6 +51,30 @@ impl ReplicationContext {
             id: id.to_string(),
             before: before.cloned(),
             after: after.cloned(),
+            vault: false,
+        });
+        self.ops.push(ReplicationOp::Document { change });
+    }
+
+    fn capture_vault(
+        &mut self,
+        collection: &str,
+        op: &str,
+        id: &str,
+        before: Option<&Value>,
+        after: Option<&Value>,
+    ) {
+        if self.origin.is_none() {
+            return;
+        }
+        let change = self.changes.len();
+        self.changes.push(ReplicationChange {
+            collection: collection.to_string(),
+            op: op.to_string(),
+            id: id.to_string(),
+            before: before.cloned(),
+            after: after.cloned(),
+            vault: true,
         });
         self.ops.push(ReplicationOp::Document { change });
     }
@@ -124,6 +148,7 @@ pub(crate) fn capture_sql_replication(
             id: id.to_string(),
             before: before.cloned(),
             after: after.cloned(),
+            vault: false,
         });
     });
 }
@@ -654,12 +679,26 @@ fn execute(
                 }
                 let c = store.collection_in(wtxn, &entry.coll)?;
                 let config = event_config(store, wtxn, &entry.coll)?;
+                let vault_before = if c.profile().is_vault() {
+                    c.vault_stored_txn(&*wtxn, &entry.id)?
+                } else {
+                    None
+                };
                 let before = if config.is_some() && !c.profile().is_vault() {
                     c.find_one_in(&*wtxn, &json!({ "_id": entry.id }), None)?
                 } else {
                     None
                 };
                 if c.expire_txn(wtxn, &entry.id, entry.expected_ttl_at)? {
+                    if let Some(before) = vault_before.as_ref() {
+                        replication.capture_vault(
+                            &entry.coll,
+                            "delete",
+                            &entry.id,
+                            Some(before),
+                            None,
+                        );
+                    }
                     if let (Some(config), Some(before)) = (&config, before.as_ref()) {
                         emit_event(
                             store,
@@ -689,6 +728,9 @@ fn execute(
                 let auth = vault.as_ref().ok_or_else(vault::key_required)?;
                 let id =
                     c.insert_vault_txn(wtxn, doc.clone(), &auth.key, &auth.tenant, &auth.kid)?;
+                if let Some(after) = c.vault_stored_txn(&*wtxn, &id)? {
+                    replication.capture_vault(coll, "insert", &id, None, Some(&after));
+                }
                 Ok(json!({ "inserted_id": id }))
             } else {
                 if vault.is_some() {
@@ -718,6 +760,11 @@ fn execute(
                 let auth = vault.as_ref().ok_or_else(vault::key_required)?;
                 let ids =
                     c.insert_many_vault_txn(wtxn, docs, &auth.key, &auth.tenant, &auth.kid)?;
+                for id in &ids {
+                    if let Some(after) = c.vault_stored_txn(&*wtxn, id)? {
+                        replication.capture_vault(coll, "insert", id, None, Some(&after));
+                    }
+                }
                 Ok(json!({ "inserted_ids": ids }))
             } else {
                 if vault.is_some() {
@@ -769,6 +816,16 @@ fn execute(
                 )?
             } else {
                 Vec::new()
+            };
+            let vault_before = if c.profile().is_vault() {
+                let auth = vault.as_ref().ok_or_else(vault::key_required)?;
+                let id = vault::exact_id_filter(filter, &auth.tenant).ok();
+                match id {
+                    Some(id) => c.vault_stored_txn(&*wtxn, &id)?.map(|doc| (id, doc)),
+                    None => None,
+                }
+            } else {
+                None
             };
             let out = if c.profile().is_vault() {
                 let auth = vault.as_ref().ok_or_else(vault::key_required)?;
@@ -827,6 +884,27 @@ fn execute(
                     }
                 }
             }
+            if c.profile().is_vault() {
+                let id = out
+                    .upserted_id
+                    .clone()
+                    .or_else(|| vault_before.as_ref().map(|(id, _)| id.clone()));
+                if let Some(id) = id {
+                    let after = c.vault_stored_txn(&*wtxn, &id)?;
+                    let op = if vault_before.is_some() {
+                        "update"
+                    } else {
+                        "insert"
+                    };
+                    replication.capture_vault(
+                        coll,
+                        op,
+                        &id,
+                        vault_before.as_ref().map(|(_, doc)| doc),
+                        after.as_ref(),
+                    );
+                }
+            }
             Ok(json!({
                 "matched": out.matched,
                 "modified": out.modified,
@@ -872,6 +950,16 @@ fn execute(
                 remove: *remove,
                 array_filters,
                 projection: projection.as_ref(),
+            };
+            let vault_before = if c.profile().is_vault() {
+                let auth = vault.as_ref().ok_or_else(vault::key_required)?;
+                let id = vault::exact_id_filter(filter, &auth.tenant).ok();
+                match id {
+                    Some(id) => c.vault_stored_txn(&*wtxn, &id)?.map(|doc| (id, doc)),
+                    None => None,
+                }
+            } else {
+                None
             };
             let out = if c.profile().is_vault() {
                 let auth = vault.as_ref().ok_or_else(vault::key_required)?;
@@ -933,6 +1021,29 @@ fn execute(
                     }
                 }
             }
+            if c.profile().is_vault() {
+                let id = out
+                    .upserted_id
+                    .clone()
+                    .or_else(|| vault_before.as_ref().map(|(id, _)| id.clone()));
+                if let Some(id) = id {
+                    let after = c.vault_stored_txn(&*wtxn, &id)?;
+                    let op = if *remove {
+                        "delete"
+                    } else if vault_before.is_some() {
+                        "update"
+                    } else {
+                        "insert"
+                    };
+                    replication.capture_vault(
+                        coll,
+                        op,
+                        &id,
+                        vault_before.as_ref().map(|(_, doc)| doc),
+                        after.as_ref(),
+                    );
+                }
+            }
             Ok(json!({
                 "value": out.value,
                 "matched": out.matched,
@@ -961,6 +1072,16 @@ fn execute(
                 )?
             } else {
                 Vec::new()
+            };
+            let vault_before = if c.profile().is_vault() {
+                let auth = vault.as_ref().ok_or_else(vault::key_required)?;
+                let id = vault::exact_id_filter(filter, &auth.tenant).ok();
+                match id {
+                    Some(id) => c.vault_stored_txn(&*wtxn, &id)?.map(|doc| (id, doc)),
+                    None => None,
+                }
+            } else {
+                None
             };
             let n = if c.profile().is_vault() {
                 let auth = vault.as_ref().ok_or_else(vault::key_required)?;
@@ -994,6 +1115,11 @@ fn execute(
                             replication,
                         )?;
                     }
+                }
+            }
+            if c.profile().is_vault() {
+                if let Some((id, before)) = vault_before.as_ref() {
+                    replication.capture_vault(coll, "delete", id, Some(before), None);
                 }
             }
             Ok(json!({ "deleted": n }))

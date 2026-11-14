@@ -71,8 +71,8 @@ the node becomes primary.
 
 Not replicated:
 
-- vault document payloads and vault keys (vault remains a local encrypted
-  datastore);
+- vault keys: vault payloads are replicated as encrypted envelopes, but the
+  tenant key is supplied by the client and is not stored by NonoDB;
 - local backup artifacts — copy them to S3/R2, restic, or shared storage if the
   new primary must read them;
 - node transport identity: bind address, data directory, socket path, and TLS
@@ -528,6 +528,7 @@ The network-partition test covers this path:
 
 ```bash
 python3 scripts/replication_partition_test.py
+python3 scripts/replication_vault_test.py
 ```
 
 It cuts a live primary from voters and replicas, verifies it self-demotes and
@@ -688,8 +689,9 @@ Keep both. Take regular snapshots even when a replica is healthy.
 
 ## 13. Known limitations
 
-- Vault document payloads and keys are not part of replication. Vault remains a
-  local encrypted datastore.
+- Vault payloads are replicated as encrypted envelopes; tenant keys are
+  client-supplied and are never stored in the control plane. A replica can read
+  the data only with the same key.
 - Auth, backup jobs, and the database catalog are replicated; TLS transport
   identity, data/socket paths, log level, worker counts, and other node-local
   settings are not.
