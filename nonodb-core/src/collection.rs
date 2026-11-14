@@ -2232,6 +2232,74 @@ impl<'e> Collection<'e> {
         Ok(id)
     }
 
+    /// Applies a replicated document change without generating history or
+    /// automatic events. Used only by the replica apply path.
+    pub fn apply_replication_change_txn(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        op: &str,
+        id: &str,
+        after: Option<&Value>,
+    ) -> Result<()> {
+        self.ensure_standard()?;
+        let existing = self.db.get(&*wtxn, id.as_bytes())?.map(|raw| raw.to_vec());
+        let old = existing.as_deref().map(parse_json).transpose()?;
+
+        match op {
+            "insert" | "update" => {
+                let after = after
+                    .ok_or_else(|| Error::Query("replication change is missing `after`".into()))?;
+                if after.get("_id").and_then(Value::as_str) != Some(id) {
+                    return Err(Error::Query(
+                        "replication document `_id` does not match change id".into(),
+                    ));
+                }
+                if op == "insert" && old.is_some() {
+                    return Err(Error::DuplicateKey(id.to_string()));
+                }
+                if op == "update" && old.is_none() {
+                    return Err(Error::Query(format!(
+                        "replication update target `{id}` does not exist"
+                    )));
+                }
+                if let Some(old) = &old {
+                    self.apply_index_entries(wtxn, Some(old), None, id)?;
+                    self.apply_text_entries(wtxn, Some(old), None, id)?;
+                    self.apply_fuzzy_entries(wtxn, Some(old), None, id)?;
+                    self.apply_vector_entries(wtxn, Some(old), None, id)?;
+                    self.set_ttl(wtxn, id, None)?;
+                }
+                self.validate_unique(&*wtxn, after, id)?;
+                let bytes = serde_json::to_vec(after)?;
+                if bytes.len() > MAX_DOCUMENT_BYTES {
+                    return Err(Error::DocumentTooLarge(bytes.len(), MAX_DOCUMENT_BYTES));
+                }
+                self.db.put(&mut *wtxn, id.as_bytes(), &bytes)?;
+                self.apply_index_entries(wtxn, None, Some(after), id)?;
+                self.apply_text_entries(wtxn, None, Some(after), id)?;
+                self.apply_fuzzy_entries(wtxn, None, Some(after), id)?;
+                self.apply_vector_entries(wtxn, None, Some(after), id)?;
+                self.set_ttl(wtxn, id, None)?;
+            }
+            "delete" => {
+                if let Some(old) = &old {
+                    self.db.delete(&mut *wtxn, id.as_bytes())?;
+                    self.apply_index_entries(wtxn, Some(old), None, id)?;
+                    self.apply_text_entries(wtxn, Some(old), None, id)?;
+                    self.apply_fuzzy_entries(wtxn, Some(old), None, id)?;
+                    self.apply_vector_entries(wtxn, Some(old), None, id)?;
+                    self.set_ttl(wtxn, id, None)?;
+                }
+            }
+            other => {
+                return Err(Error::Query(format!(
+                    "unknown replication operation `{other}`"
+                )))
+            }
+        }
+        Ok(())
+    }
+
     /// Update with optional upsert; returns the full operation result.
     pub fn update_opts_txn(
         &self,

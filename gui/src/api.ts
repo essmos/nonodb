@@ -564,6 +564,12 @@ export type ReplicationStatus = {
   origin?: string | null;
   role: string;
   head: number;
+  applied?: Array<{
+    origin: string;
+    applied: number;
+    source_head: number;
+    lag: number;
+  }>;
 };
 
 export type ReplicationChangeTxn = {

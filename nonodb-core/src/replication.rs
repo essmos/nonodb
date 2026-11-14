@@ -118,4 +118,78 @@ mod tests {
         assert_eq!(store.prune_replication_through(1).unwrap(), 1);
         assert_eq!(store.replication_after(0, 10).unwrap().len(), 1);
     }
+
+    #[test]
+    fn apply_replication_txn_is_atomic_and_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let insert = ReplicationTxn::new(
+            1,
+            "node-a",
+            vec![ReplicationChange {
+                collection: "orders".into(),
+                op: "insert".into(),
+                id: "o1".into(),
+                before: None,
+                after: Some(serde_json::json!({"_id": "o1", "total": 10})),
+            }],
+        );
+        assert!(store.apply_replication_txn(&insert).unwrap());
+        assert!(!store.apply_replication_txn(&insert).unwrap());
+        assert_eq!(store.replication_applied("node-a").unwrap(), 1);
+        assert_eq!(
+            store
+                .collection("orders")
+                .unwrap()
+                .find_one(&serde_json::json!({"_id": "o1"}))
+                .unwrap()
+                .unwrap()["total"],
+            10
+        );
+
+        let update = ReplicationTxn::new(
+            2,
+            "node-a",
+            vec![ReplicationChange {
+                collection: "orders".into(),
+                op: "update".into(),
+                id: "o1".into(),
+                before: Some(serde_json::json!({"_id": "o1", "total": 10})),
+                after: Some(serde_json::json!({"_id": "o1", "total": 20})),
+            }],
+        );
+        assert!(store.apply_replication_txn(&update).unwrap());
+        assert_eq!(store.replication_applied("node-a").unwrap(), 2);
+        assert_eq!(
+            store
+                .collection("orders")
+                .unwrap()
+                .find_one(&serde_json::json!({"_id": "o1"}))
+                .unwrap()
+                .unwrap()["total"],
+            20
+        );
+
+        let gap = ReplicationTxn::new(4, "node-a", update.changes.clone());
+        assert!(store.apply_replication_txn(&gap).is_err());
+
+        let delete = ReplicationTxn::new(
+            3,
+            "node-a",
+            vec![ReplicationChange {
+                collection: "orders".into(),
+                op: "delete".into(),
+                id: "o1".into(),
+                before: Some(serde_json::json!({"_id": "o1", "total": 20})),
+                after: None,
+            }],
+        );
+        assert!(store.apply_replication_txn(&delete).unwrap());
+        assert!(store
+            .collection("orders")
+            .unwrap()
+            .find_one(&serde_json::json!({"_id": "o1"}))
+            .unwrap()
+            .is_none());
+    }
 }

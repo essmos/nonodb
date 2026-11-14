@@ -218,6 +218,27 @@ Alerts:
 bootstrapping or above its allowed lag threshold; a primary is not ready for
 writes without the required standby/quorum.
 
+## Current pull replica
+
+A node with `NONODB_REPLICATION_ROLE=replica` or `standby` rejects client writes
+and pulls from `NONODB_REPLICATION_SOURCE`:
+
+```text
+GET /v1/replication/status
+GET /v1/replication/changes?after=N&limit=500
+```
+
+`NONODB_REPLICATION_SOURCE_TOKEN` is optional when the source authenticates the
+client certificate. `NONODB_REPLICATION_CA_FILE`,
+`NONODB_REPLICATION_CERT_FILE`, and `NONODB_REPLICATION_KEY_FILE` enable mTLS.
+
+Apply is atomic per source transaction and idempotent for `(origin, seq)`.
+Replicas record the source head and expose `applied`/`lag` in status and
+Prometheus. A gap returns an error instead of skipping transactions.
+
+Snapshot bootstrap, epochs, and promotion are not implemented yet, so this is
+not yet a production failover mechanism.
+
 ## Implementation phases
 
 ### Phase 1 — log and status
@@ -231,13 +252,17 @@ writes without the required standby/quorum.
 - [x] SQL write capture.
 - [ ] Vault write capture.
 - [x] Role, capture, origin, and head metrics.
-- [ ] Applied sequence, lag, transport, and apply-error metrics.
+- [x] Applied sequence and lag metrics.
+- [ ] Transport and apply-error counters.
 
 ### Phase 2 — primary → replica
 
-- [ ] Pull transport over mTLS.
+- [x] Pull transport with HTTP, optional TLS, and optional client mTLS.
+- [x] Apply path with per-origin `(origin, seq)` idempotence.
+- [x] Read-only replica write gating.
+- [x] Applied sequence and lag status/metrics.
 - [ ] Snapshot bootstrap.
-- [ ] Apply path with idempotence and epochs.
+- [ ] Epoch fencing and source changes.
 - [ ] Resync and truncation handling.
 - [ ] Replica readiness policy.
 

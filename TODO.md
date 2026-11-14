@@ -114,16 +114,18 @@ Design: [docs/replication.md](docs/replication.md).
 - [x] Add a read-only GUI Replication tab showing role, origin, head, and recent
       transactions.
 - [x] Add Prometheus replication enabled, role, origin, and head metrics.
-- [ ] Add applied sequence, lag, transport errors, and apply errors after the
-      replica transport exists.
+- [x] Add applied sequence and lag to status and Prometheus metrics.
+- [ ] Add transport and apply-error counters.
 
 ### Phase 2 — primary → replica
 
-- [ ] Add pull transport over TLS 1.3 + mTLS.
-- [ ] Add node identity, CA paths, certificate rotation, and optional pinning.
+- [x] Add pull transport with optional TLS and client mTLS.
+- [x] Add CA path and client certificate/key configuration.
+- [ ] Add certificate rotation and optional pinning.
 - [ ] Add snapshot bootstrap with recorded sequence.
-- [ ] Add replica apply path with idempotence `(origin, seq)` and epoch fencing.
-- [ ] Preserve transaction atomicity and tombstones on the replica.
+- [x] Add replica apply path with idempotence `(origin, seq)`.
+- [x] Preserve transaction atomicity on the replica and reject client writes.
+- [ ] Add epoch fencing for source changes and promotion.
 - [ ] Add resume tokens, retention, and resync after truncation.
 - [ ] Add role-aware `/readyz`.
 

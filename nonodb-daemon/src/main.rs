@@ -24,6 +24,7 @@ mod maintenance;
 mod metrics;
 mod protocol;
 mod replication_api;
+mod replicator;
 mod s3_import;
 mod writer;
 
@@ -217,6 +218,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!("shutdown signal received; draining");
         let _ = shutdown_tx.send(true);
     });
+    replicator::start(databases.clone(), shutdown_rx.clone())
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
     let state = AppState {
         store: default.store.clone(),
@@ -981,18 +984,22 @@ async fn prometheus_handler(
         auth.refresh_blocked_clients();
     }
     let mut heads = Vec::new();
+    let mut applied = Vec::new();
     for name in state.databases.names().await {
         if let Ok(runtime) = state.databases.get(&name).await {
             if let Ok(head) = runtime.store.replication_head() {
-                heads.push((name, head));
+                heads.push((name.clone(), head));
+            }
+            if let Ok(origins) = runtime.store.replication_applied_origins() {
+                for (origin, seq) in origins {
+                    let source_head = runtime.store.replication_source_head(&origin).unwrap_or(0);
+                    applied.push((name.clone(), origin, seq, source_head));
+                }
             }
         }
     }
     let origin = writer::replication_origin();
-    let role = std::env::var("NONODB_REPLICATION_ROLE")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "primary".to_string());
+    let role = replicator::role();
     let mut body = metrics::prometheus();
     metrics::append_replication_metrics(
         &mut body,
@@ -1000,6 +1007,7 @@ async fn prometheus_handler(
         origin.as_deref(),
         &role,
         &heads,
+        &applied,
     );
     (
         [(
@@ -4018,7 +4026,7 @@ pub(crate) fn error_status(err: &ApiError) -> StatusCode {
         "database_limit" => StatusCode::SERVICE_UNAVAILABLE,
         "unsafe_durability_disabled" => StatusCode::BAD_REQUEST,
         "unauthorized" => StatusCode::UNAUTHORIZED,
-        "forbidden" => StatusCode::FORBIDDEN,
+        "forbidden" | "read_only" => StatusCode::FORBIDDEN,
         "rate_limited" => StatusCode::TOO_MANY_REQUESTS,
         "document_too_large" => StatusCode::PAYLOAD_TOO_LARGE,
         "result_too_large" => StatusCode::PAYLOAD_TOO_LARGE,

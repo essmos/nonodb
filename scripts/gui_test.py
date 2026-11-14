@@ -117,6 +117,7 @@ def main() -> int:
                 b"Verify & import as new database",
                 b"/v1/import/browse",
                 b"Recent replication transactions",
+                b"Applied sources",
                 b"Log capture",
                 b"Excluded collections",
                 b"Generate key",

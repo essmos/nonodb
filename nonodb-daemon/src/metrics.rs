@@ -545,6 +545,7 @@ pub fn append_replication_metrics(
     origin: Option<&str>,
     role: &str,
     heads: &[(String, u64)],
+    applied: &[(String, String, u64, u64)],
 ) {
     prom_header(
         out,
@@ -591,6 +592,34 @@ pub fn append_replication_metrics(
             "nonodb_replication_head",
             &[("database", database)],
             &json!(head),
+        );
+    }
+    prom_header(
+        out,
+        "nonodb_replication_applied",
+        "gauge",
+        "Highest source sequence applied on this replica.",
+    );
+    for (database, origin, seq, _) in applied {
+        prom_sample(
+            out,
+            "nonodb_replication_applied",
+            &[("database", database), ("origin", origin)],
+            &json!(seq),
+        );
+    }
+    prom_header(
+        out,
+        "nonodb_replication_lag",
+        "gauge",
+        "Source log head minus the applied sequence.",
+    );
+    for (database, origin, seq, source_head) in applied {
+        prom_sample(
+            out,
+            "nonodb_replication_lag",
+            &[("database", database), ("origin", origin)],
+            &json!(source_head.saturating_sub(*seq)),
         );
     }
 }

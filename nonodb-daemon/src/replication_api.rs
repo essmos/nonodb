@@ -52,9 +52,24 @@ pub async fn status(
             )
         }
     };
-    match store.replication_head() {
-        Ok(head) => {
+    match (
+        store.replication_head(),
+        store.replication_applied_origins(),
+    ) {
+        (Ok(head), Ok(applied)) => {
             let origin = crate::writer::replication_origin();
+            let applied = applied
+                .into_iter()
+                .map(|(origin, seq)| {
+                    let source_head = store.replication_source_head(&origin).unwrap_or(0);
+                    serde_json::json!({
+                        "origin": origin,
+                        "applied": seq,
+                        "source_head": source_head,
+                        "lag": source_head.saturating_sub(seq),
+                    })
+                })
+                .collect::<Vec<_>>();
             audit_control(
                 &state,
                 &connection,
@@ -69,11 +84,12 @@ pub async fn status(
                 "database": database,
                 "enabled": origin.is_some(),
                 "origin": origin,
-                "role": std::env::var("NONODB_REPLICATION_ROLE").unwrap_or_else(|_| "primary".into()),
+                "role": crate::replicator::role(),
                 "head": head,
+                "applied": applied,
             }))
         }
-        Err(error) => failure(
+        (Err(error), _) | (_, Err(error)) => failure(
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             "replication_error",
             error.to_string(),

@@ -197,6 +197,16 @@ pub fn run(
 
 fn run_batch(store: &Store, cache: &QueryCache, jobs: Vec<WriteJob>) {
     metrics::sub(&metrics::QUEUE_LEN, jobs.len() as u64);
+    if !crate::replicator::writable() {
+        let err = ApiError {
+            code: "read_only".to_string(),
+            message: "replica is read-only; promote this node before accepting writes".to_string(),
+        };
+        for job in jobs {
+            let _ = job.resp.send(Err(err.clone()));
+        }
+        return;
+    }
     // An atomic `write_batch` cannot share a transaction with other
     // requests: one failed operation must roll back the whole batch, not
     // the other writes in the group. That is why such a group is run job by job.

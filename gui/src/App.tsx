@@ -1571,6 +1571,26 @@ function ReplicationPage({ connection }: { connection: Connection }) {
           </p>
         )}
       </section>
+      {status?.applied && status.applied.length > 0 && (
+        <section className="panel">
+          <div className="panel-title"><h3>Applied sources</h3><span>{status.applied.length}</span></div>
+          <div className="index-list">
+            {status.applied.map((source) => (
+              <div key={source.origin} className="index-row">
+                <div>
+                  <strong className="mono">{source.origin}</strong>
+                  <span className={`badge ${source.lag > 0 ? 'danger-badge' : ''}`}>
+                    lag {source.lag}
+                  </span>
+                </div>
+                <span className="muted small">
+                  applied {source.applied.toLocaleString()} / head {source.source_head.toLocaleString()}
+                </span>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
       <section className="panel">
         <div className="panel-title"><h3>Recent replication transactions</h3><span>{changes.length}</span></div>
         {changes.length === 0 ? (

@@ -51,7 +51,9 @@ def main() -> int:
     data.mkdir()
     auth = temp / "auth.json"
     proc: subprocess.Popen | None = None
+    replica_proc: subprocess.Popen | None = None
     log = None
+    replica_log = None
     try:
         run_cli(auth, "auth", "init")
         admin = run_cli(auth, "auth", "token", "create", "admin")
@@ -113,6 +115,106 @@ def main() -> int:
             exec({"op": "sql", "query": "UPDATE orders SET n = 5 WHERE _id = 'o4'"})
             exec({"op": "sql", "query": "DELETE FROM orders WHERE _id = 'o4'"})
 
+            replica_data = temp / "replica-data"
+            replica_data.mkdir()
+            replica_port = free_port()
+            replica_env = os.environ.copy()
+            replica_env.update(
+                NONODB_DATA=str(replica_data),
+                NONODB_SOCK=str(temp / "replica.sock"),
+                NONODB_TCP=f"127.0.0.1:{replica_port}",
+                NONODB_AUTH_FILE=str(auth),
+                NONODB_REPLICATION_ROLE="replica",
+                NONODB_REPLICATION_SOURCE=f"http://127.0.0.1:{port}",
+                NONODB_REPLICATION_SOURCE_TOKEN=admin,
+                NONODB_REPLICATION_DATABASES="default",
+                NONODB_REPLICATION_POLL_INTERVAL="1",
+                NONODB_LOG="warn",
+            )
+            replica_log = open(temp / "replica.log", "w", encoding="utf-8")
+            replica_proc = subprocess.Popen(
+                [str(DAEMON)], env=replica_env, stdout=replica_log, stderr=subprocess.STDOUT
+            )
+            replica = httpx.Client(
+                base_url=f"http://127.0.0.1:{replica_port}", timeout=30.0
+            )
+            try:
+                deadline = time.monotonic() + 15
+                while time.monotonic() < deadline:
+                    if replica_proc.poll() is not None:
+                        raise RuntimeError(
+                            f"replica daemon exited with {replica_proc.returncode}"
+                        )
+                    try:
+                        if replica.get("/healthz").status_code == 200:
+                            break
+                    except httpx.HTTPError:
+                        pass
+                    time.sleep(0.05)
+                else:
+                    raise RuntimeError("replica daemon did not become healthy")
+
+                def replica_exec(payload: dict) -> dict:
+                    response = replica.post("/v1/exec", headers=headers, json=payload)
+                    assert response.status_code == 200, response.text
+                    return response.json()["result"]
+
+                deadline = time.monotonic() + 20
+                while time.monotonic() < deadline:
+                    doc = replica_exec(
+                        {"op": "find_one", "coll": "orders", "filter": {"_id": "o1"}}
+                    )
+                    if doc and doc.get("n") == 2:
+                        break
+                    time.sleep(0.1)
+                else:
+                    raise RuntimeError("replica did not apply the initial snapshot")
+
+                assert replica_exec(
+                    {"op": "find_one", "coll": "orders", "filter": {"_id": "o2"}}
+                ) is None
+                assert replica_exec(
+                    {"op": "find_one", "coll": "orders", "filter": {"_id": "o3"}}
+                ) is not None
+                assert replica_exec(
+                    {"op": "find_one", "coll": "orders", "filter": {"_id": "o4"}}
+                ) is None
+
+                exec({"op": "insert", "coll": "orders", "doc": {"_id": "o5", "n": 5}})
+                deadline = time.monotonic() + 20
+                while time.monotonic() < deadline:
+                    doc = replica_exec(
+                        {"op": "find_one", "coll": "orders", "filter": {"_id": "o5"}}
+                    )
+                    if doc and doc.get("n") == 5:
+                        break
+                    time.sleep(0.1)
+                else:
+                    raise RuntimeError("replica did not apply the live change")
+
+                blocked = replica.post(
+                    "/v1/exec",
+                    headers=headers,
+                    json={"op": "insert", "coll": "orders", "doc": {"_id": "blocked"}},
+                )
+                assert blocked.status_code == 403, blocked.text
+                assert blocked.json()["error"]["code"] == "read_only", blocked.text
+
+                replica_status = replica.get(
+                    "/v1/replication/status", headers=headers
+                ).json()["result"]
+                assert replica_status["role"] == "replica", replica_status
+                assert replica_status["applied"], replica_status
+                assert replica_status["applied"][0]["origin"] == "test-node", replica_status
+                assert replica_status["applied"][0]["lag"] == 0, replica_status
+                replica_metrics = replica.get(
+                    "/metrics/prometheus", headers=headers
+                ).text
+                assert 'nonodb_replication_applied{database="default",origin="test-node"}' in replica_metrics, replica_metrics[-1000:]
+                assert 'nonodb_replication_lag{database="default",origin="test-node"} 0' in replica_metrics, replica_metrics[-1000:]
+            finally:
+                replica.close()
+
             metrics = client.get("/metrics/prometheus", headers=headers).text
             assert 'nonodb_replication_enabled 1' in metrics, metrics[-1000:]
             assert 'nonodb_replication_role{role="primary"} 1' in metrics, metrics[-1000:]
@@ -143,9 +245,17 @@ def main() -> int:
             batch = next(txn for txn in txns if len(txn["changes"]) == 2)
             assert {change["id"] for change in batch["changes"]} == {"o2", "o3"}
 
-            print("PASS  writer replication log: CRUD, batch, delete, SQL")
+            print("PASS  replication log, pull apply, read-only replica")
             return 0
     finally:
+        if replica_proc is not None:
+            replica_proc.terminate()
+            try:
+                replica_proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                replica_proc.kill()
+        if replica_log is not None:
+            replica_log.close()
         if proc is not None:
             proc.terminate()
             try:

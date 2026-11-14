@@ -1464,6 +1464,130 @@ impl Store {
         Ok(true)
     }
 
+    /// Returns the highest source sequence applied for `origin`.
+    pub fn replication_applied(&self, origin: &str) -> Result<u64> {
+        let rtxn = self.read_txn()?;
+        let meta: Database<Bytes, Bytes> = self
+            .env
+            .open_database(&rtxn, Some(META_DB))?
+            .ok_or_else(|| Error::Query("meta database missing".into()))?;
+        let key = format!("replication:applied:{origin}");
+        let applied = meta
+            .get(&rtxn, key.as_bytes())?
+            .and_then(|raw| std::str::from_utf8(raw).ok())
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .unwrap_or(0);
+        rtxn.commit()?;
+        Ok(applied)
+    }
+
+    /// Returns all `(origin, applied sequence)` pairs recorded on this node.
+    pub fn replication_applied_origins(&self) -> Result<Vec<(String, u64)>> {
+        const PREFIX: &[u8] = b"replication:applied:";
+        let rtxn = self.read_txn()?;
+        let meta: Database<Bytes, Bytes> = self
+            .env
+            .open_database(&rtxn, Some(META_DB))?
+            .ok_or_else(|| Error::Query("meta database missing".into()))?;
+        let mut out = Vec::new();
+        for item in meta.iter(&rtxn)? {
+            let (key, value) = item?;
+            let Some(origin) = key.strip_prefix(PREFIX) else {
+                continue;
+            };
+            let Ok(origin) = std::str::from_utf8(origin) else {
+                continue;
+            };
+            let seq = std::str::from_utf8(value)
+                .ok()
+                .and_then(|raw| raw.parse::<u64>().ok())
+                .unwrap_or(0);
+            out.push((origin.to_string(), seq));
+        }
+        rtxn.commit()?;
+        Ok(out)
+    }
+
+    /// Last source head observed for `origin` by the pull loop.
+    pub fn replication_source_head(&self, origin: &str) -> Result<u64> {
+        let rtxn = self.read_txn()?;
+        let meta: Database<Bytes, Bytes> = self
+            .env
+            .open_database(&rtxn, Some(META_DB))?
+            .ok_or_else(|| Error::Query("meta database missing".into()))?;
+        let key = format!("replication:source_head:{origin}");
+        let head = meta
+            .get(&rtxn, key.as_bytes())?
+            .and_then(|raw| std::str::from_utf8(raw).ok())
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .unwrap_or(0);
+        rtxn.commit()?;
+        Ok(head)
+    }
+
+    /// Records the latest source head observed by the pull loop.
+    pub fn set_replication_source_head(&self, origin: &str, head: u64) -> Result<()> {
+        if head == self.replication_source_head(origin)? {
+            return Ok(());
+        }
+        let mut wtxn = self.write_txn()?;
+        let meta: Database<Bytes, Bytes> = self.env.create_database(&mut wtxn, Some(META_DB))?;
+        let key = format!("replication:source_head:{origin}");
+        meta.put(&mut wtxn, key.as_bytes(), head.to_string().as_bytes())?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    /// Applies one source replication transaction atomically and idempotently.
+    ///
+    /// The replica requires contiguous sequences for each origin. Re-applying
+    /// an already applied sequence is a no-op.
+    pub fn apply_replication_txn(&self, txn: &ReplicationTxn) -> Result<bool> {
+        if txn.origin.trim().is_empty() {
+            return Err(Error::Query("replication origin is empty".into()));
+        }
+        if txn.seq == 0 {
+            return Err(Error::Query("replication sequence must be positive".into()));
+        }
+        if txn.changes.is_empty() {
+            return Err(Error::Query(
+                "replication transaction must contain at least one change".into(),
+            ));
+        }
+        let mut wtxn = self.write_txn()?;
+        let meta: Database<Bytes, Bytes> = self.env.create_database(&mut wtxn, Some(META_DB))?;
+        let key = format!("replication:applied:{}", txn.origin);
+        let applied = meta
+            .get(&wtxn, key.as_bytes())?
+            .and_then(|raw| std::str::from_utf8(raw).ok())
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .unwrap_or(0);
+        if txn.seq <= applied {
+            wtxn.commit()?;
+            return Ok(false);
+        }
+        if txn.seq != applied + 1 {
+            return Err(Error::Query(format!(
+                "replication gap for {}: expected {}, got {}",
+                txn.origin,
+                applied + 1,
+                txn.seq
+            )));
+        }
+        for change in &txn.changes {
+            let collection = self.collection_in(&mut wtxn, &change.collection)?;
+            collection.apply_replication_change_txn(
+                &mut wtxn,
+                &change.op,
+                &change.id,
+                change.after.as_ref(),
+            )?;
+        }
+        meta.put(&mut wtxn, key.as_bytes(), txn.seq.to_string().as_bytes())?;
+        wtxn.commit()?;
+        Ok(true)
+    }
+
     /// Appends one committed transaction to the durable replication log.
     ///
     /// The caller must use the same LMDB write transaction as the data writes,

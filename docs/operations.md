@@ -90,7 +90,15 @@ secrets.
 | `NONODB_IMPORT_ROOTS` | `<NONODB_DATA>/backups` | Allowed local roots for the backup Import wizard |
 | `NONODB_REPLICATION_ENABLED` | `0` | Enable durable writer replication-log capture |
 | `NONODB_REPLICATION_ORIGIN` | `NONODB_NODE_ID` or `local` | Stable node identity written into replication records |
-| `NONODB_REPLICATION_ROLE` | `primary` | Reported node role: `primary`, `replica`, or `standby` |
+| `NONODB_REPLICATION_ROLE` | `primary` | Node role: `primary`, `replica`, or `standby`; replicas are read-only |
+| `NONODB_REPLICATION_SOURCE` | unset | Source base URL for replica/standby pull |
+| `NONODB_REPLICATION_SOURCE_TOKEN` | unset | Bearer token used to read the source replication API |
+| `NONODB_REPLICATION_DATABASES` | `default` | Comma-separated databases to pull |
+| `NONODB_REPLICATION_POLL_INTERVAL` | `1` | Pull interval in seconds |
+| `NONODB_REPLICATION_BATCH` | `500` | Maximum transactions per request, 1–1000 |
+| `NONODB_REPLICATION_CA_FILE` | unset | CA bundle for source TLS verification |
+| `NONODB_REPLICATION_CERT_FILE` | unset | Client certificate for source mTLS |
+| `NONODB_REPLICATION_KEY_FILE` | unset | Client private key for source mTLS |
 | `NONODB_BACKUP_IDENTITY_FILE` | — | age identity file used by encrypted restore |
 | `NONODB_SNAPSHOT_INTERVAL` | `300` | Snapshot interval in seconds |
 | `NONODB_SNAPSHOT_KEEP` | `24` | Number of snapshot files to retain |

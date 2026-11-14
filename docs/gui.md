@@ -267,6 +267,7 @@ The current branch exposes a read-only replication foundation:
 - node role badge and origin;
 - durable log capture status;
 - head sequence;
+- applied source sequences and lag on replicas;
 - recent replication transactions with grouped collection/op/id changes.
 
 Network transport, peer setup, replica apply, and promote/demote are still
