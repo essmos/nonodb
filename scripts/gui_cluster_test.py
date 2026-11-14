@@ -129,7 +129,7 @@ def main() -> int:
         asset = index.split(marker, 1)[1].split('"', 1)[0]
         with urllib.request.urlopen(f"{base}{asset}") as response:
             javascript = response.read()
-        assert b"All configured nodes" in javascript
+        assert b"One row per node" in javascript
         assert b"Max lag" in javascript
         print(json.dumps({"ok": True, "online": ["one", "two"], "offline": ["dead"]}))
         return 0

@@ -1515,6 +1515,26 @@ function ImportsPage({ connection }: { connection: Connection }) {
   );
 }
 
+function RepStat({
+  label,
+  value,
+  help,
+  danger = false,
+}: {
+  label: string;
+  value: ReactNode;
+  help: string;
+  danger?: boolean;
+}) {
+  return (
+    <div className="stat" title={help}>
+      <span>{label}</span>
+      <strong className={danger ? 'danger-text' : undefined}>{value}</strong>
+      <small className="stat-note">{help}</small>
+    </div>
+  );
+}
+
 function ClusterPage({ connection }: { connection: Connection }) {
   const [cluster, setCluster] = useState<ClusterStatus | null>(null);
   const [error, setError] = useState('');
@@ -1554,7 +1574,11 @@ function ClusterPage({ connection }: { connection: Connection }) {
       <header className="page-header">
         <div>
           <h2>Cluster</h2>
-          <p>All configured nodes, replication roles, lag, write routing, and live node metrics.</p>
+          <p>
+            One row per node. The primary accepts writes; replicas pull changes from
+            their source and are read-only. Lag is how many replication transactions
+            a node is behind.
+          </p>
         </div>
         <div className="actions">
           <button onClick={() => void load()} disabled={loading}>{loading ? 'Refreshing…' : 'Refresh'}</button>
@@ -1563,14 +1587,14 @@ function ClusterPage({ connection }: { connection: Connection }) {
       {error && <div className="error-box">{error}</div>}
       {cluster?.message && <div className="panel"><p className="muted">{cluster.message}</p></div>}
       <div className="stat-grid">
-        <div className="stat"><span>Nodes</span><strong>{nodes.length}</strong></div>
-        <div className="stat"><span>Online</span><strong>{online.length}</strong></div>
-        <div className="stat"><span>Primary</span><strong>{primaries.map((node) => node.name).join(', ') || 'none'}</strong></div>
-        <div className="stat"><span>Max lag</span><strong>{maxLag.toLocaleString()}</strong></div>
-        <div className="stat"><span>Replicas</span><strong>{replicas.length}</strong></div>
-        <div className="stat"><span>Unhealthy</span><strong>{nodes.length - online.length}</strong></div>
-        <div className="stat"><span>Stale acks</span><strong>{staleAcks.length}</strong></div>
-        <div className="stat"><span>Updated</span><strong>{cluster?.generated_at_ms ? new Date(cluster.generated_at_ms).toLocaleTimeString() : '—'}</strong></div>
+        <RepStat label="Nodes" value={nodes.length} help="Configured nodes in the cluster view." />
+        <RepStat label="Online" value={online.length} help="Nodes that answered the last probe." />
+        <RepStat label="Primary" value={primaries.map((node) => node.name).join(', ') || 'none'} help="Node that currently accepts client writes." />
+        <RepStat label="Max lag" value={maxLag.toLocaleString()} help="Largest replication-transaction gap across all replicas." danger={maxLag > 0} />
+        <RepStat label="Replicas" value={replicas.length} help="Read-only nodes that pull changes from a primary." />
+        <RepStat label="Unhealthy" value={nodes.length - online.length} help="Nodes that are offline or failed the probe." danger={nodes.length > online.length} />
+        <RepStat label="Stale acks" value={staleAcks.length} help="Replica acknowledgements older than 60 seconds." danger={staleAcks.length > 0} />
+        <RepStat label="Updated" value={cluster?.generated_at_ms ? new Date(cluster.generated_at_ms).toLocaleTimeString() : '—'} help="Time of the last cluster probe." />
       </div>
       <div className="cluster-grid">
         {nodes.map((node) => {
@@ -1594,14 +1618,14 @@ function ClusterPage({ connection }: { connection: Connection }) {
               ) : (
                 <>
                   <div className="stat-grid cluster-stats">
-                    <div className="stat"><span>Epoch</span><strong>{status?.epoch ?? 0}</strong></div>
-                    <div className="stat"><span>Head</span><strong>{(status?.head ?? 0).toLocaleString()}</strong></div>
-                    <div className="stat"><span>Lag</span><strong className={lag > 0 ? 'danger-text' : ''}>{lag.toLocaleString()}</strong></div>
-                    <div className="stat"><span>Acks</span><strong>{acks.length}</strong></div>
-                    <div className="stat"><span>Applied</span><strong>{metric(node, 'replication_applied_total').toLocaleString()}</strong></div>
-                    <div className="stat"><span>Transport errors</span><strong>{metric(node, 'replication_transport_errors_total').toLocaleString()}</strong></div>
-                    <div className="stat"><span>Write ops</span><strong>{metric(node, 'write_ops_total').toLocaleString()}</strong></div>
-                    <div className="stat"><span>Avg commit</span><strong>{metric(node, 'avg_commit_us').toFixed(1)} µs</strong></div>
+                    <RepStat label="Epoch" value={status?.epoch ?? 0} help="Fencing generation. A higher epoch wins and rejects the old primary." />
+                    <RepStat label="Head" value={(status?.head ?? 0).toLocaleString()} help="Last replication transaction stored on this node." />
+                    <RepStat label="Lag" value={lag.toLocaleString()} help="Transactions this node still has to apply from its source." danger={lag > 0} />
+                    <RepStat label="Acks" value={acks.length} help="Replicas that have acknowledged this node as their source." />
+                    <RepStat label="Applied" value={metric(node, 'replication_applied_total').toLocaleString()} help="Replication transactions applied since the daemon started." />
+                    <RepStat label="Transport errors" value={metric(node, 'replication_transport_errors_total').toLocaleString()} help="Cumulative source connection or HTTP errors." danger={metric(node, 'replication_transport_errors_total') > 0} />
+                    <RepStat label="Write ops" value={metric(node, 'write_ops_total').toLocaleString()} help="Documents written locally since startup." />
+                    <RepStat label="Avg commit" value={`${metric(node, 'avg_commit_us').toFixed(1)} µs`} help="Average LMDB commit time for local writes." />
                   </div>
                   <div className="cluster-detail"><span>Source</span><strong className="mono">{status?.replication?.source ?? '—'}</strong></div>
                   <div className="cluster-detail"><span>Write URL</span><strong className="mono">{status?.write_url ?? '—'}</strong></div>
@@ -1723,12 +1747,18 @@ function ReplicationPage({ connection }: { connection: Connection }) {
     }
   };
 
+  const replicationError = activeReplicationError(status?.replication);
+
   return (
     <div className="page">
       <header className="page-header">
         <div>
           <h2>Replication</h2>
-          <p>Live replication role, write routing, applied sources, replica acknowledgements, and transport health.</p>
+          <p>
+            State of the node you are connected to. A primary accepts writes; a
+            replica is read-only and pulls committed transactions from its source.
+            Open <strong>Cluster</strong> to see every node at once.
+          </p>
         </div>
         <div className="actions">
           <button onClick={() => void load()} disabled={loading}>{loading ? 'Loading…' : 'Refresh'}</button>
@@ -1736,18 +1766,33 @@ function ReplicationPage({ connection }: { connection: Connection }) {
       </header>
       {error && <div className="error-box">{error}</div>}
       <section className="panel">
+        <div className="panel-title"><h3>How to read this page</h3><span>glossary</span></div>
+        <div className="replication-glossary">
+          <div><strong>Primary</strong><span>Accepts client writes and appends them to the replication log.</span></div>
+          <div><strong>Replica</strong><span>Read-only node that pulls committed transactions from a primary.</span></div>
+          <div><strong>Source</strong><span>The node this replica fetches changes from.</span></div>
+          <div><strong>Epoch</strong><span>Fencing generation. A newer primary has a higher epoch; stale writers are rejected.</span></div>
+          <div><strong>Head sequence</strong><span>Last replication transaction number on this node, not a document count.</span></div>
+          <div><strong>Applied / lag</strong><span>How many transactions were applied per origin, and how many are still missing.</span></div>
+          <div><strong>Ack</strong><span>A replica's confirmation that it applied changes up to a sequence number.</span></div>
+          <div><strong>Bootstrap</strong><span>Initial snapshot copy used when a new replica joins or is too far behind.</span></div>
+          <div><strong>Write URL</strong><span>Endpoint clients should use for writes: the primary or its announced successor.</span></div>
+          <div><strong>Origin</strong><span>Stable node identity stored in every replicated transaction.</span></div>
+        </div>
+      </section>
+      <section className="panel">
         <div className="panel-title">
           <h3>Node status</h3>
           {status && <span className={`badge ${status.role === 'primary' ? '' : 'danger-badge'}`}>{status.role}</span>}
         </div>
         {status ? (
           <div className="stat-grid">
-            <div className="stat"><span>Database</span><strong>{status.database}</strong></div>
-            <div className="stat"><span>Log capture</span><strong>{status.enabled ? 'enabled' : 'disabled'}</strong></div>
-            <div className="stat"><span>Origin</span><strong className="mono">{status.origin ?? '—'}</strong></div>
-            <div className="stat"><span>Epoch</span><strong>{status.epoch ?? status.replication?.epoch ?? 0}</strong></div>
-            <div className="stat"><span>Write URL</span><strong className="mono">{status.write_url ?? '—'}</strong></div>
-            <div className="stat"><span>Head sequence</span><strong>{status.head.toLocaleString()}</strong></div>
+            <RepStat label="Database" value={status.database} help="Database whose replication log is shown on this page." />
+            <RepStat label="Log capture" value={status.enabled ? 'enabled' : 'disabled'} help="Whether committed writes are recorded in the durable replication log." />
+            <RepStat label="Origin" value={<span className="mono">{status.origin ?? '—'}</span>} help="Stable node identity written into each replication transaction." />
+            <RepStat label="Epoch" value={status.epoch ?? status.replication?.epoch ?? 0} help="Fencing generation. Higher epochs reject writes from older primaries." />
+            <RepStat label="Write URL" value={<span className="mono">{status.write_url ?? '—'}</span>} help="Where clients should send writes. On a replica this points at the primary or successor." />
+            <RepStat label="Head sequence" value={status.head.toLocaleString()} help="Last replication transaction number on this node. It is not the document count." />
           </div>
         ) : (
           <p className="muted">No status available.</p>
@@ -1763,29 +1808,41 @@ function ReplicationPage({ connection }: { connection: Connection }) {
         <section className="panel">
           <div className="panel-title"><h3>Transport health</h3></div>
           <div className="stat-grid">
-            <div className="stat"><span>Source</span><strong className="mono">{status.replication.source ?? '—'}</strong></div>
-            <div className="stat"><span>Bootstrap</span><strong>{status.replication.bootstrap ?? '—'}</strong></div>
-            <div className="stat"><span>Poll interval</span><strong>{status.replication.interval_secs ?? 0}s</strong></div>
-            <div className="stat"><span>Mode</span><strong>{status.read_only ? 'read-only' : 'writable'}</strong></div>
-            <div className="stat"><span>Last success</span><strong>{status.replication.last_success_unix ? new Date(status.replication.last_success_unix * 1000).toLocaleString() : '—'}</strong></div>
-            <div className="stat"><span>Databases</span><strong className="mono">{(status.replication.databases ?? []).join(', ') || '—'}</strong></div>
+            <RepStat label="Source" value={<span className="mono">{status.replication.source ?? '—'}</span>} help="Primary URL this node pulls replication changes from." />
+            <RepStat label="Bootstrap" value={status.replication.bootstrap ?? '—'} help="Snapshot policy: auto copies a snapshot when needed, always forces it, never pulls only the log." />
+            <RepStat label="Poll interval" value={`${status.replication.interval_secs ?? 0}s`} help="How often this node asks the source for new transactions." />
+            <RepStat label="Mode" value={status.read_only ? 'read-only' : 'writable'} help="Only the primary is writable. Replicas and standbys reject client writes." />
+            <RepStat label="Last success" value={status.replication.last_success_unix ? new Date(status.replication.last_success_unix * 1000).toLocaleString() : '—'} help="Last successful pull/apply/ack cycle. Errors older than this are hidden." />
+            <RepStat label="Databases" value={<span className="mono">{(status.replication.databases ?? []).join(', ') || '—'}</span>} help="Databases included in this replication source configuration." />
           </div>
-          {activeReplicationError(status.replication).transport && (
-            <div className="error-box">transport: {activeReplicationError(status.replication).transport}</div>
+          {replicationError.transport && (
+            <div className="error-box">transport: {replicationError.transport}</div>
           )}
-          {activeReplicationError(status.replication).apply && (
-            <div className="error-box">apply: {activeReplicationError(status.replication).apply}</div>
+          {replicationError.apply && (
+            <div className="error-box">apply: {replicationError.apply}</div>
           )}
           <div className="panel-title"><h3>Source settings</h3></div>
+          <p className="field-hint">
+            These settings tell a replica where to pull from. Saving them updates the
+            source without restarting the daemon. Use only on a replica/standby.
+          </p>
           <div className="form-grid">
-            <label>Source URL<input value={sourceDraft} onChange={(e) => setSourceDraft(e.target.value)} placeholder="https://primary:7878" /></label>
-            <label>Databases<input value={databasesDraft} onChange={(e) => setDatabasesDraft(e.target.value)} placeholder="default, app1" /></label>
-            <label>Poll interval (s)<input type="number" min="1" value={intervalDraft} onChange={(e) => setIntervalDraft(e.target.value)} /></label>
+            <label>Source URL<input value={sourceDraft} onChange={(e) => setSourceDraft(e.target.value)} placeholder="https://primary:7878" />
+              <span className="field-hint">Primary base URL. Replicas call its replication endpoints.</span>
+            </label>
+            <label>Databases<input value={databasesDraft} onChange={(e) => setDatabasesDraft(e.target.value)} placeholder="default, app1" />
+              <span className="field-hint">Comma-separated databases to replicate. Empty means the default database.</span>
+            </label>
+            <label>Poll interval (s)<input type="number" min="1" value={intervalDraft} onChange={(e) => setIntervalDraft(e.target.value)} />
+              <span className="field-hint">Seconds between pulls. Lower means lower lag but more requests.</span>
+            </label>
             <label>Bootstrap<select value={bootstrapDraft} onChange={(e) => setBootstrapDraft(e.target.value)}>
               <option value="auto">auto</option>
               <option value="always">always</option>
               <option value="never">never</option>
-            </select></label>
+            </select>
+              <span className="field-hint">auto: snapshot only when needed. always: replace local data from a snapshot. never: log only.</span>
+            </label>
           </div>
           <div className="actions">
             <button onClick={() => void saveSource()} disabled={savingSource || !sourceDraft.trim()}>
@@ -1793,59 +1850,90 @@ function ReplicationPage({ connection }: { connection: Connection }) {
             </button>
           </div>
           <div className="panel-title"><h3>Role control</h3><span>epoch {status.epoch ?? 0}</span></div>
+          <p className="field-hint">
+            Promote makes this node writable and increments the epoch. Demote makes it
+            read-only. Manual role changes should only happen during controlled failover.
+          </p>
           <div className="form-grid">
-            <label>Expected epoch<input type="number" min="0" value={epochDraft} onChange={(e) => setEpochDraft(e.target.value)} /></label>
-            <label>Successor URL<input value={successorDraft} onChange={(e) => setSuccessorDraft(e.target.value)} placeholder="https://new-primary:7878" /></label>
+            <label>Expected epoch<input type="number" min="0" value={epochDraft} onChange={(e) => setEpochDraft(e.target.value)} />
+              <span className="field-hint">Safety check. Must equal the current epoch shown above; prevents acting on stale state.</span>
+            </label>
+            <label>Successor URL<input value={successorDraft} onChange={(e) => setSuccessorDraft(e.target.value)} placeholder="https://new-primary:7878" />
+              <span className="field-hint">Optional address advertised to clients after this primary is demoted.</span>
+            </label>
           </div>
           <div className="actions">
-            <button onClick={() => void changeRole('promote')} disabled={changingRole || status.role === 'primary'}>Promote</button>
-            <button className="danger" onClick={() => void changeRole('demote')} disabled={changingRole || status.role !== 'primary'}>Demote</button>
+            <button onClick={() => void changeRole('promote')} disabled={changingRole || status.role === 'primary'}>Promote to primary</button>
+            <button className="danger" onClick={() => void changeRole('demote')} disabled={changingRole || status.role !== 'primary'}>Demote to replica</button>
           </div>
-          <p className="field-hint">Manual failover only. Demote or stop the old primary to avoid split-brain.</p>
+          <p className="field-hint">Quorum promotion still requires a voter majority. Demote or stop the old primary to avoid split-brain.</p>
         </section>
       )}
-      {status?.acks && status.acks.length > 0 && (
+      {status && (
         <section className="panel">
           <div className="panel-title"><h3>Replica acknowledgements</h3><span>min ack {status.min_ack ?? 0}</span></div>
-          <div className="index-list">
-            {status.acks.map((ack) => (
-              <div key={ack.node} className="index-row">
-                <div><strong className="mono">{ack.node}</strong><span className="badge">seq {ack.seq.toLocaleString()}</span></div>
-                <span className="muted small">{ack.age_seconds.toFixed(1)}s ago</span>
-              </div>
-            ))}
-          </div>
+          <p className="field-hint">
+            Each replica periodically reports the last sequence it applied. The primary
+            uses these acks for safe pruning. An age above 60 seconds is considered stale.
+            This list is normally empty when you are viewing a replica.
+          </p>
+          {status.acks && status.acks.length > 0 ? (
+            <div className="index-list">
+              {status.acks.map((ack) => (
+                <div key={ack.node} className="index-row" title="Replica identity, applied sequence, and time since its last acknowledgement.">
+                  <div><strong className="mono">{ack.node}</strong><span className="badge">seq {ack.seq.toLocaleString()}</span></div>
+                  <span className={`muted small ${ack.age_seconds > 60 ? 'danger-text' : ''}`}>{ack.age_seconds.toFixed(1)}s ago</span>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="muted">No replica acknowledgements recorded on this node yet.</p>
+          )}
         </section>
       )}
-      {status?.applied && status.applied.length > 0 && (
+      {status && (
         <section className="panel">
-          <div className="panel-title"><h3>Applied sources</h3><span>{status.applied.length}</span></div>
-          <div className="index-list">
-            {status.applied.map((source) => (
-              <div key={source.origin} className="index-row">
-                <div>
-                  <strong className="mono">{source.origin}</strong>
-                  <span className="badge">epoch {source.epoch ?? 0}</span>
-                  <span className={`badge ${source.lag > 0 ? 'danger-badge' : ''}`}>
-                    lag {source.lag}
+          <div className="panel-title"><h3>Applied sources</h3><span>{status.applied?.length ?? 0}</span></div>
+          <p className="field-hint">
+            Each origin is a node that wrote transactions. Applied is how many of that
+            origin's transactions this node has stored; source head is the origin's latest
+            sequence. Lag above zero means this node is still behind.
+          </p>
+          {status.applied && status.applied.length > 0 ? (
+            <div className="index-list">
+              {status.applied.map((source) => (
+                <div key={source.origin} className="index-row" title="Origin, role epoch, applied position, source head, and remaining lag.">
+                  <div>
+                    <strong className="mono">{source.origin}</strong>
+                    <span className="badge">epoch {source.epoch ?? 0}</span>
+                    <span className={`badge ${source.lag > 0 ? 'danger-badge' : ''}`}>
+                      lag {source.lag}
+                    </span>
+                  </div>
+                  <span className="muted small">
+                    applied {source.applied.toLocaleString()} / head {source.source_head.toLocaleString()}
                   </span>
                 </div>
-                <span className="muted small">
-                  applied {source.applied.toLocaleString()} / head {source.source_head.toLocaleString()}
-                </span>
-              </div>
-            ))}
-          </div>
+              ))}
+            </div>
+          ) : (
+            <p className="muted">No applied source history on this node yet.</p>
+          )}
         </section>
       )}
       <section className="panel">
         <div className="panel-title"><h3>Recent replication transactions</h3><span>{changes.length}</span></div>
+        <p className="field-hint">
+          One row is one committed write transaction. seq is the global replication order,
+          origin is the node that produced it, and the last line lists each collection and
+          document changed by that transaction.
+        </p>
         {changes.length === 0 ? (
           <p className="muted">No replicated transactions captured.</p>
         ) : (
           <div className="index-list">
             {changes.slice().reverse().map((txn) => (
-              <div key={txn.seq} className="index-row replication-row">
+              <div key={txn.seq} className="index-row replication-row" title="A single committed write transaction in replication order.">
                 <div>
                   <strong>seq {txn.seq}</strong>
                   <span className="badge">{txn.origin}</span>
