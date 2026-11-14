@@ -9,6 +9,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use nonodb_core::replication::ReplicationChange;
 use nonodb_core::{
     events, vault, Collection, CollectionProfile, FindAndModifyOptions, FindQuery, Store,
 };
@@ -22,6 +23,57 @@ use crate::protocol::{ApiError, Durability, WriteReq};
 
 /// Maximum number of operations in one transaction.
 const MAX_BATCH: usize = 512;
+
+#[derive(Default)]
+struct ReplicationContext {
+    origin: Option<String>,
+    changes: Vec<ReplicationChange>,
+}
+
+impl ReplicationContext {
+    fn capture(
+        &mut self,
+        collection: &str,
+        op: &str,
+        id: &str,
+        before: Option<&Value>,
+        after: Option<&Value>,
+    ) {
+        if self.origin.is_none() {
+            return;
+        }
+        self.changes.push(ReplicationChange {
+            collection: collection.to_string(),
+            op: op.to_string(),
+            id: id.to_string(),
+            before: before.cloned(),
+            after: after.cloned(),
+        });
+    }
+}
+
+pub(crate) fn replication_origin() -> Option<String> {
+    static ORIGIN: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    ORIGIN
+        .get_or_init(|| {
+            let enabled = std::env::var("NONODB_REPLICATION_ENABLED")
+                .ok()
+                .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"));
+            if !enabled {
+                return None;
+            }
+            Some(
+                std::env::var("NONODB_REPLICATION_ORIGIN")
+                    .or_else(|_| std::env::var("NONODB_NODE_ID"))
+                    .unwrap_or_else(|_| "local".to_string()),
+            )
+        })
+        .clone()
+}
+
+fn replication_enabled() -> bool {
+    replication_origin().is_some()
+}
 fn env_micros(name: &str, default_us: u64) -> Duration {
     Duration::from_micros(
         std::env::var(name)
@@ -133,9 +185,28 @@ fn run_batch(store: &Store, cache: &QueryCache, jobs: Vec<WriteJob>) {
         }
     };
 
+    let mut replication = ReplicationContext {
+        origin: replication_origin(),
+        changes: Vec::new(),
+    };
     let mut results = Vec::with_capacity(jobs.len());
     for job in &jobs {
-        results.push(execute(store, &mut wtxn, &job.req));
+        results.push(execute(store, &mut wtxn, &job.req, &mut replication));
+    }
+    if let Some(origin) = &replication.origin {
+        if !replication.changes.is_empty() {
+            if let Err(error) =
+                store.append_replication_txn_in(&mut wtxn, origin, replication.changes)
+            {
+                drop(wtxn);
+                live::discard_pending();
+                let err = ApiError::from(error);
+                for job in jobs {
+                    let _ = job.resp.send(Err(err.clone()));
+                }
+                return;
+            }
+        }
     }
 
     let started = Instant::now();
@@ -182,31 +253,49 @@ fn run_single(store: &Store, cache: &QueryCache, job: WriteJob) {
             return;
         }
     };
+    let mut replication = ReplicationContext {
+        origin: replication_origin(),
+        changes: Vec::new(),
+    };
     let started = Instant::now();
-    match execute(store, &mut wtxn, &job.req) {
-        Ok(value) => match wtxn.commit_unsynced() {
-            Ok(()) => {
-                if sync {
-                    if let Err(e) = store.force_sync() {
-                        cache.invalidate();
-                        live::dispatch_pending();
-                        let _ = job.resp.send(Err(ApiError::from(e)));
+    match execute(store, &mut wtxn, &job.req, &mut replication) {
+        Ok(value) => {
+            if let Some(origin) = &replication.origin {
+                if !replication.changes.is_empty() {
+                    if let Err(error) =
+                        store.append_replication_txn_in(&mut wtxn, origin, replication.changes)
+                    {
+                        drop(wtxn);
+                        live::discard_pending();
+                        let _ = job.resp.send(Err(ApiError::from(error)));
                         return;
                     }
                 }
-                metrics::add(&metrics::COMMIT_NS, started.elapsed().as_nanos() as u64);
-                cache.invalidate();
-                live::dispatch_pending();
-                let _ = job.resp.send(Ok(value));
             }
-            Err(e) => {
-                metrics::add(&metrics::COMMIT_NS, started.elapsed().as_nanos() as u64);
-                live::discard_pending();
-                let _ = job
-                    .resp
-                    .send(Err(ApiError::from(nonodb_core::Error::from(e))));
+            match wtxn.commit_unsynced() {
+                Ok(()) => {
+                    if sync {
+                        if let Err(e) = store.force_sync() {
+                            cache.invalidate();
+                            live::dispatch_pending();
+                            let _ = job.resp.send(Err(ApiError::from(e)));
+                            return;
+                        }
+                    }
+                    metrics::add(&metrics::COMMIT_NS, started.elapsed().as_nanos() as u64);
+                    cache.invalidate();
+                    live::dispatch_pending();
+                    let _ = job.resp.send(Ok(value));
+                }
+                Err(e) => {
+                    metrics::add(&metrics::COMMIT_NS, started.elapsed().as_nanos() as u64);
+                    live::discard_pending();
+                    let _ = job
+                        .resp
+                        .send(Err(ApiError::from(nonodb_core::Error::from(e))));
+                }
             }
-        },
+        }
         Err(e) => {
             // Drop `wtxn` = abort; for `WriteReq::Batch` this guarantees
             // all-or-nothing.
@@ -264,6 +353,7 @@ fn event_config(
     if config.active()
         || store.has_subscriptions_in_rw(wtxn, coll)?
         || live::registry().has_coll(store.id(), coll)
+        || replication_enabled()
     {
         Ok(Some(config))
     } else {
@@ -281,10 +371,12 @@ fn emit_event(
     before: Option<&Value>,
     after: Option<&Value>,
     config: &events::EventConfig,
+    replication: &mut ReplicationContext,
 ) -> Result<(), ApiError> {
     let target = store.collection_in(wtxn, coll)?;
     target.evaluate_subscriptions(wtxn, op, id, before, after)?;
     live::collect_pending(&target, wtxn, coll, op, id, before, after)?;
+    replication.capture(coll, op, id, before, after);
     let Some(event) = events::change_event(coll, op, id, before, after, config) else {
         return Ok(());
     };
@@ -303,15 +395,27 @@ fn emit_by_id(
     id: &str,
     before: Option<&Value>,
     config: &events::EventConfig,
+    replication: &mut ReplicationContext,
 ) -> Result<(), ApiError> {
     let after = target.find_one_in(&*wtxn, &json!({ "_id": id }), None)?;
-    emit_event(store, wtxn, coll, op, id, before, after.as_ref(), config)
+    emit_event(
+        store,
+        wtxn,
+        coll,
+        op,
+        id,
+        before,
+        after.as_ref(),
+        config,
+        replication,
+    )
 }
 
 fn execute(
     store: &Store,
     wtxn: &mut nonodb_core::heed::RwTxn<'_>,
     req: &WriteReq,
+    replication: &mut ReplicationContext,
 ) -> Result<Value, ApiError> {
     match req {
         WriteReq::CreateCollection {
@@ -426,6 +530,7 @@ fn execute(
                             Some(before),
                             None,
                             config,
+                            replication,
                         )?;
                     }
                     expired += 1;
@@ -451,7 +556,17 @@ fn execute(
                 }
                 let id = c.insert_one_txn(wtxn, doc.clone())?;
                 if let Some(config) = &config {
-                    emit_by_id(store, wtxn, &c, coll, "insert", &id, None, config)?;
+                    emit_by_id(
+                        store,
+                        wtxn,
+                        &c,
+                        coll,
+                        "insert",
+                        &id,
+                        None,
+                        config,
+                        replication,
+                    )?;
                 }
                 Ok(json!({ "inserted_id": id }))
             }
@@ -474,7 +589,17 @@ fn execute(
                 }
                 if let Some(config) = &config {
                     for id in &ids {
-                        emit_by_id(store, wtxn, &c, coll, "insert", id, None, config)?;
+                        emit_by_id(
+                            store,
+                            wtxn,
+                            &c,
+                            coll,
+                            "insert",
+                            id,
+                            None,
+                            config,
+                            replication,
+                        )?;
                     }
                 }
                 Ok(json!({ "inserted_ids": ids }))
@@ -527,7 +652,17 @@ fn execute(
             if let Some(config) = &config {
                 if !c.profile().is_vault() {
                     if let Some(id) = &out.upserted_id {
-                        emit_by_id(store, wtxn, &c, coll, "insert", id, None, config)?;
+                        emit_by_id(
+                            store,
+                            wtxn,
+                            &c,
+                            coll,
+                            "insert",
+                            id,
+                            None,
+                            config,
+                            replication,
+                        )?;
                     } else {
                         for before in &before_docs {
                             let id =
@@ -537,7 +672,17 @@ fn execute(
                                         message: "document has no string _id".into(),
                                     }
                                 })?;
-                            emit_by_id(store, wtxn, &c, coll, "update", id, Some(before), config)?;
+                            emit_by_id(
+                                store,
+                                wtxn,
+                                &c,
+                                coll,
+                                "update",
+                                id,
+                                Some(before),
+                                config,
+                                replication,
+                            )?;
                         }
                     }
                 }
@@ -600,7 +745,17 @@ fn execute(
             if let Some(config) = &config {
                 if !c.profile().is_vault() {
                     if let Some(id) = &out.upserted_id {
-                        emit_by_id(store, wtxn, &c, coll, "insert", id, None, config)?;
+                        emit_by_id(
+                            store,
+                            wtxn,
+                            &c,
+                            coll,
+                            "insert",
+                            id,
+                            None,
+                            config,
+                            replication,
+                        )?;
                     } else if let Some(before) = &before {
                         let id =
                             before
@@ -620,9 +775,20 @@ fn execute(
                                 Some(before),
                                 None,
                                 config,
+                                replication,
                             )?;
                         } else if out.modified > 0 {
-                            emit_by_id(store, wtxn, &c, coll, "update", id, Some(before), config)?;
+                            emit_by_id(
+                                store,
+                                wtxn,
+                                &c,
+                                coll,
+                                "update",
+                                id,
+                                Some(before),
+                                config,
+                                replication,
+                            )?;
                         }
                     }
                 }
@@ -676,7 +842,17 @@ fn execute(
                                     code: "invalid_id".into(),
                                     message: "document has no string _id".into(),
                                 })?;
-                        emit_event(store, wtxn, coll, "delete", id, Some(before), None, config)?;
+                        emit_event(
+                            store,
+                            wtxn,
+                            coll,
+                            "delete",
+                            id,
+                            Some(before),
+                            None,
+                            config,
+                            replication,
+                        )?;
                     }
                 }
             }
@@ -766,7 +942,7 @@ fn execute(
         WriteReq::Batch { ops } => {
             let mut results = Vec::with_capacity(ops.len());
             for (idx, op) in ops.iter().enumerate() {
-                match execute(store, wtxn, op) {
+                match execute(store, wtxn, op, replication) {
                     Ok(value) => results.push(value),
                     Err(e) => {
                         return Err(ApiError {

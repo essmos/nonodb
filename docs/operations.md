@@ -88,6 +88,9 @@ secrets.
 | `NONODB_BACKUP_SCHEDULER_INTERVAL` | `15` | Scheduler polling interval in seconds |
 | `NONODB_BACKUP_KEY_DIR` | `<NONODB_DATA>/backup-keys` | Directory for generated age keys and restic password files, mode `0700` |
 | `NONODB_IMPORT_ROOTS` | `<NONODB_DATA>/backups` | Allowed local roots for the backup Import wizard |
+| `NONODB_REPLICATION_ENABLED` | `0` | Enable durable writer replication-log capture |
+| `NONODB_REPLICATION_ORIGIN` | `NONODB_NODE_ID` or `local` | Stable node identity written into replication records |
+| `NONODB_REPLICATION_ROLE` | `primary` | Reported node role: `primary`, `replica`, or `standby` |
 | `NONODB_BACKUP_IDENTITY_FILE` | — | age identity file used by encrypted restore |
 | `NONODB_SNAPSHOT_INTERVAL` | `300` | Snapshot interval in seconds |
 | `NONODB_SNAPSHOT_KEEP` | `24` | Number of snapshot files to retain |

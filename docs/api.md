@@ -2447,6 +2447,23 @@ Local locations must be under `NONODB_IMPORT_ROOTS` (default
 the manifest checksum, decrypts/decompresses, runs deep LMDB verification, and
 refuses to overwrite an existing database.
 
+## Replication API
+
+The current branch exposes read-only inspection of the durable writer log.
+Transport, replica apply, promotion, and GUI management are still planned.
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/v1/replication/status` | Current database replication enabled flag, origin, role, and head sequence |
+| `GET` | `/v1/replication/changes?after=0&limit=100` | Read committed replication transactions after a sequence |
+| `GET` | `/{database}/v1/replication/status` | Same status for a selected database |
+| `GET` | `/{database}/v1/replication/changes` | Changes for a selected database |
+
+All routes require `admin:db` or `*:*`. A change transaction contains an
+`origin`, `seq`, `created_at_ms`, and grouped `changes` with collection, op, id,
+and before/after documents. Replication is disabled unless
+`NONODB_REPLICATION_ENABLED=1`.
+
 ## Error codes
 
 | Code | HTTP | Meaning |

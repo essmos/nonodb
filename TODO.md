@@ -101,12 +101,15 @@ Design: [docs/replication.md](docs/replication.md).
 - [x] Add `Store::append_replication_txn_in`, `replication_after`,
       `replication_head`, and `prune_replication_through`.
 - [x] Add a core test for transaction grouping, ordering, reads, and retention.
-- [ ] Wire the daemon writer so every logical write transaction appends changes
-      in the same LMDB transaction as the data.
-- [ ] Add durable per-database sequence allocation to the writer transaction.
-- [ ] Decide whether index/TTL/history/config changes are replicated or rebuilt.
-- [ ] Add `GET /v1/replication/status` with role, node, region, source, epoch,
-      head/applied sequence, lag, and write readiness.
+- [x] Wire the daemon writer for normal CRUD, atomic write batches, and TTL
+      expiry so changes append in the same LMDB transaction as the data.
+- [x] Add durable per-database sequence allocation to the writer transaction.
+- [x] Add `GET /v1/replication/status` with role, origin, enabled, and head.
+- [x] Add `GET /v1/replication/changes?after=...` for log inspection.
+- [x] Add `scripts/replication_test.py` for insert/update/batch/delete capture.
+- [ ] Capture SQL writes in the replication log.
+- [ ] Decide whether vault writes, index/history/config changes are replicated
+      or rebuilt.
 - [ ] Add Prometheus replication role, head, applied, lag, and error metrics.
 
 ### Phase 2 — primary → replica

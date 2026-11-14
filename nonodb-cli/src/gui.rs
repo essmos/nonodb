@@ -177,6 +177,8 @@ fn handle(mut client: TcpStream, target: &Target) -> Result<(), String> {
         || plain_path.starts_with("/v1/backups/")
         || plain_path == "/v1/import"
         || plain_path.starts_with("/v1/import/")
+        || plain_path == "/v1/replication"
+        || plain_path.starts_with("/v1/replication/")
         || (database_scoped && segments[2] == "exec")
     {
         return proxy(client, target, &request);

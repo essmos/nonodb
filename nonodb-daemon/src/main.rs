@@ -23,6 +23,7 @@ mod login_guard;
 mod maintenance;
 mod metrics;
 mod protocol;
+mod replication_api;
 mod s3_import;
 mod writer;
 
@@ -264,6 +265,22 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/import/browse", post(imports_api::browse))
         .route("/v1/import/run", post(imports_api::run))
         .route("/v1/import/status/:id", get(imports_api::status))
+        .route(
+            "/v1/replication/status",
+            get(replication_api::status_default),
+        )
+        .route(
+            "/v1/replication/changes",
+            get(replication_api::changes_default),
+        )
+        .route(
+            "/:database/v1/replication/status",
+            get(replication_api::status),
+        )
+        .route(
+            "/:database/v1/replication/changes",
+            get(replication_api::changes),
+        )
         .route("/v1/exec", post(exec))
         .route("/v1/watch", post(watch_stream))
         .route("/:database/v1/exec", post(exec))

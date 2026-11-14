@@ -96,8 +96,17 @@ Implemented core primitives:
 - `Store::replication_head()`
 - `Store::prune_replication_through()`
 
-The next step is wiring the daemon writer so every logical write transaction
-appends its changes in the *same* LMDB transaction as the data.
+The daemon writer now appends normal CRUD, atomic batch, and TTL-expiry changes
+in the same LMDB transaction as the data. SQL writes and vault writes are not yet
+captured. Set `NONODB_REPLICATION_ENABLED=1` and `NONODB_REPLICATION_ORIGIN` to
+enable logging.
+
+Read-only inspection endpoints:
+
+```text
+GET /v1/replication/status
+GET /v1/replication/changes?after=0&limit=100
+```
 
 ## Replica apply rules
 
@@ -215,9 +224,12 @@ writes without the required standby/quorum.
 
 - [x] Core replication record and `_replication` sub-database.
 - [x] Append/read/prune core primitives and tests.
-- [ ] Writer integration for all document writes.
-- [ ] Durable transaction sequence per database.
-- [ ] Replication status endpoint.
+- [x] Writer integration for normal CRUD, atomic write batches, and TTL expiry.
+- [x] Durable transaction sequence per database.
+- [x] Read-only replication status and changes endpoints.
+- [x] Writer replication integration test.
+- [ ] SQL write capture.
+- [ ] Vault write capture.
 - [ ] Lag and sequence metrics.
 
 ### Phase 2 — primary → replica
