@@ -339,6 +339,68 @@ fn change_role(
     Ok(role_view(&cell))
 }
 
+/// Promotes this node after attempting to demote the current source and point
+/// it at this node's advertised replication URL.
+pub async fn promote_with_fence(
+    data_root: &std::path::Path,
+    expected_epoch: u64,
+    force: bool,
+) -> Result<RoleView, (String, String)> {
+    let advertise = non_empty_env("NONODB_REPLICATION_ADVERTISE_URL")
+        .map(|value| value.trim().trim_end_matches('/').to_string());
+    if let Some(advertise) = advertise {
+        if !advertise.starts_with("http://") && !advertise.starts_with("https://") {
+            return Err((
+                "invalid_advertise_url".to_string(),
+                "NONODB_REPLICATION_ADVERTISE_URL must start with http:// or https://".to_string(),
+            ));
+        }
+        match Config::load(data_root) {
+            Ok(Some(config)) if config.source != advertise => {
+                let client = config
+                    .client()
+                    .map_err(|error| ("replication_client".to_string(), error))?;
+                let status = get_json(&client, &config, DEFAULT_DATABASE, "status", &[]).await;
+                match status {
+                    Ok(status) => {
+                        let source_role = status.get("role").and_then(Value::as_str).unwrap_or("");
+                        if source_role == "primary" {
+                            let source_epoch =
+                                status.get("epoch").and_then(Value::as_u64).unwrap_or(0);
+                            let body = serde_json::json!({
+                                "expected_epoch": source_epoch,
+                                "role": "replica",
+                                "successor": advertise,
+                            });
+                            if let Err(error) =
+                                post_json(&client, &config, DEFAULT_DATABASE, "demote", &body).await
+                            {
+                                if !force {
+                                    return Err(("source_fence_failed".to_string(), error));
+                                }
+                                tracing::warn!(error = %error, "source fence failed; forcing promotion");
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        if !force {
+                            return Err(("source_fence_failed".to_string(), error));
+                        }
+                        tracing::warn!(error = %error, "source fence status failed; forcing promotion");
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(error) => {
+                if !force {
+                    return Err(("source_fence_failed".to_string(), error));
+                }
+            }
+        }
+    }
+    promote(expected_epoch)
+}
+
 pub fn promote(expected_epoch: u64) -> Result<RoleView, (String, String)> {
     change_role("primary", expected_epoch, None)
 }
@@ -1029,6 +1091,65 @@ fn maybe_restart_for_gap(config: &Config, error: &str, shutdown_tx: &watch::Send
         "replication needs snapshot resync; requesting graceful restart"
     );
     let _ = shutdown_tx.send(true);
+}
+
+async fn post_json(
+    client: &reqwest::Client,
+    config: &Config,
+    database: &str,
+    action: &str,
+    body: &Value,
+) -> Result<Value, String> {
+    let path = if database == DEFAULT_DATABASE {
+        format!("/v1/replication/{action}")
+    } else {
+        format!("/{database}/v1/replication/{action}")
+    };
+    let encoded = serde_json::to_vec(body).map_err(|error| error.to_string())?;
+    let mut request = client
+        .post(format!("{}{}", config.source, path))
+        .header(reqwest::header::ACCEPT, "application/json")
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(encoded);
+    if let Some(token) = &config.token {
+        request = request.bearer_auth(token);
+    }
+    let response = request.send().await.map_err(|error| {
+        metrics::inc(&metrics::REPLICATION_TRANSPORT_ERRORS);
+        let message = format!("request {path}: {error}");
+        record_transport_error(&message);
+        message
+    })?;
+    let status = response.status();
+    let body = response.text().await.map_err(|error| {
+        metrics::inc(&metrics::REPLICATION_TRANSPORT_ERRORS);
+        let message = format!("read {path} response: {error}");
+        record_transport_error(&message);
+        message
+    })?;
+    let payload: Value = serde_json::from_str(&body).map_err(|error| {
+        metrics::inc(&metrics::REPLICATION_TRANSPORT_ERRORS);
+        let message = format!("decode {path} response: {error}");
+        record_transport_error(&message);
+        message
+    })?;
+    if !status.is_success() || payload.get("ok").and_then(Value::as_bool) == Some(false) {
+        let code = payload
+            .pointer("/error/code")
+            .and_then(Value::as_str)
+            .unwrap_or("replication_error");
+        let message = payload
+            .pointer("/error/message")
+            .and_then(Value::as_str)
+            .unwrap_or("replication request failed");
+        let message = format!("{path} -> HTTP {} {code}: {message}", status.as_u16());
+        record_transport_error(&message);
+        return Err(message);
+    }
+    payload
+        .get("result")
+        .cloned()
+        .ok_or_else(|| format!("{path} response is missing `result`"))
 }
 
 async fn send_ack(

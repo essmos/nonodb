@@ -537,6 +537,7 @@ Manually switch roles with an expected epoch:
 
 ```bash
 nonodb-cli replication promote 0
+nonodb-cli replication promote 0 --force   # only when the old source is unreachable
 nonodb-cli replication demote 1 replica
 nonodb-cli replication demote 1 replica https://new-primary:7878
 ```

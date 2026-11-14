@@ -56,6 +56,8 @@ pub struct RoleBody {
     pub role: Option<String>,
     #[serde(default)]
     pub successor: Option<String>,
+    #[serde(default)]
+    pub force: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -289,7 +291,13 @@ pub async fn promote(
             Ok(value) => value,
             Err(response) => return response,
         };
-    match crate::replicator::promote(body.expected_epoch) {
+    match crate::replicator::promote_with_fence(
+        state.databases.root(),
+        body.expected_epoch,
+        body.force,
+    )
+    .await
+    {
         Ok(role) => {
             audit_control(
                 &state,

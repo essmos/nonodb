@@ -133,9 +133,10 @@ fn run() -> Result<(), String> {
                         .ok_or("usage: nonodb-cli replication promote <expected-epoch>")?
                         .parse()
                         .map_err(|e| format!("expected epoch: {e}"))?;
+                    let force = args.iter().any(|arg| arg == "--force");
                     let res = http_post(
                         "/v1/replication/promote",
-                        &json!({ "expected_epoch": expected }),
+                        &json!({ "expected_epoch": expected, "force": force }),
                     )?;
                     print_result(&res);
                 }
@@ -495,7 +496,7 @@ fn usage() -> Result<(), String> {
          ping                       sprawdź daemona\n\
          exec '<json>'              dowolne żądanie /v1/exec\n\
          databases [list|create <nazwa>|drop <nazwa>]  bazy w jednym daemonie\n\
-         replication [status|changes [after] [limit]|source <url> [dbs] [interval]|acks|prune <seq> [--require-acks]|promote <epoch>|demote <epoch> [role] [successor]]\n\
+         replication [status|changes [after] [limit]|source <url> [dbs] [interval]|acks|prune <seq> [--require-acks]|promote <epoch> [--force]|demote <epoch> [role] [successor]]\n\
          collections                lista kolekcji\n\
          count <coll> [filtr]       liczba dokumentów\n\
          find <coll> [filtr] [--sort pole:asc|desc] [--limit N] [--skip N]\n\

@@ -325,6 +325,11 @@ Each successful change increments `epoch`. A stale `expected_epoch` returns
 stops the replica pull loop and enables the writer. Demotion makes the node
 read-only again.
 
+When `NONODB_REPLICATION_ADVERTISE_URL` is set, promotion first asks the
+current source to demote itself with this node as `successor`. The promotion is
+aborted if that fence request fails; use `"force": true` (CLI `--force`) only
+when the old primary is unreachable and you accept the split-brain risk.
+
 Demote accepts an optional successor URL:
 
 ```http
