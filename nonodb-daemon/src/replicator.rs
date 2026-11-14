@@ -186,11 +186,14 @@ impl Config {
 struct PersistedRole {
     role: String,
     epoch: u64,
+    #[serde(default)]
+    successor: Option<String>,
 }
 
 struct RoleCell {
     role: String,
     epoch: u64,
+    successor: Option<String>,
     path: std::path::PathBuf,
 }
 
@@ -204,6 +207,7 @@ fn role_cell() -> &'static Mutex<RoleCell> {
                 .filter(|value| matches!(value.as_str(), "primary" | "replica" | "standby"))
                 .unwrap_or_else(|| "primary".to_string()),
             epoch: 0,
+            successor: None,
             path: std::path::PathBuf::new(),
         })
     })
@@ -213,7 +217,12 @@ fn valid_role(value: &str) -> bool {
     matches!(value, "primary" | "replica" | "standby")
 }
 
-fn write_role(path: &std::path::Path, role: &str, epoch: u64) -> Result<(), String> {
+fn write_role(
+    path: &std::path::Path,
+    role: &str,
+    epoch: u64,
+    successor: Option<&str>,
+) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| format!("create role state dir: {error}"))?;
     }
@@ -221,6 +230,7 @@ fn write_role(path: &std::path::Path, role: &str, epoch: u64) -> Result<(), Stri
     let encoded = serde_json::to_vec_pretty(&PersistedRole {
         role: role.to_string(),
         epoch,
+        successor: successor.map(str::to_string),
     })
     .map_err(|error| error.to_string())?;
     fs::write(&temp, encoded).map_err(|error| format!("write role state: {error}"))?;
@@ -252,8 +262,9 @@ pub fn init_role(data: &std::path::Path) -> Result<(), String> {
         let state = PersistedRole {
             role: env_role,
             epoch: 0,
+            successor: None,
         };
-        write_role(&path, &state.role, state.epoch)?;
+        write_role(&path, &state.role, state.epoch, None)?;
         state
     };
     let mut cell = role_cell()
@@ -261,6 +272,7 @@ pub fn init_role(data: &std::path::Path) -> Result<(), String> {
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     cell.role = state.role;
     cell.epoch = state.epoch;
+    cell.successor = state.successor;
     cell.path = path;
     Ok(())
 }
@@ -270,6 +282,7 @@ pub struct RoleView {
     pub role: String,
     pub epoch: u64,
     pub read_only: bool,
+    pub successor: Option<String>,
 }
 
 fn role_view(cell: &RoleCell) -> RoleView {
@@ -277,10 +290,15 @@ fn role_view(cell: &RoleCell) -> RoleView {
         role: cell.role.clone(),
         epoch: cell.epoch,
         read_only: cell.role != "primary",
+        successor: cell.successor.clone(),
     }
 }
 
-fn change_role(next: &str, expected_epoch: u64) -> Result<RoleView, (String, String)> {
+fn change_role(
+    next: &str,
+    expected_epoch: u64,
+    successor: Option<&str>,
+) -> Result<RoleView, (String, String)> {
     if !valid_role(next) {
         return Err((
             "invalid_role".to_string(),
@@ -303,28 +321,56 @@ fn change_role(next: &str, expected_epoch: u64) -> Result<RoleView, (String, Str
         ));
     }
     let previous = cell.role.clone();
+    let previous_successor = cell.successor.clone();
     let epoch = cell.epoch.saturating_add(1);
-    if let Err(error) = write_role(&cell.path, next, epoch) {
+    let successor = if next == "primary" {
+        None
+    } else {
+        successor.map(str::to_string)
+    };
+    if let Err(error) = write_role(&cell.path, next, epoch, successor.as_deref()) {
         cell.role = previous;
+        cell.successor = previous_successor;
         return Err(("role_state_error".to_string(), error));
     }
     cell.role = next.to_string();
     cell.epoch = epoch;
+    cell.successor = successor;
     Ok(role_view(&cell))
 }
 
 pub fn promote(expected_epoch: u64) -> Result<RoleView, (String, String)> {
-    change_role("primary", expected_epoch)
+    change_role("primary", expected_epoch, None)
 }
 
-pub fn demote(expected_epoch: u64, role: &str) -> Result<RoleView, (String, String)> {
+pub fn demote(
+    expected_epoch: u64,
+    role: &str,
+    successor: Option<&str>,
+) -> Result<RoleView, (String, String)> {
     if role == "primary" {
         return Err((
             "invalid_role".to_string(),
             "demote requires replica or standby".to_string(),
         ));
     }
-    change_role(role, expected_epoch)
+    if let Some(successor) = successor {
+        if !successor.starts_with("http://") && !successor.starts_with("https://") {
+            return Err((
+                "invalid_successor".to_string(),
+                "successor must start with http:// or https://".to_string(),
+            ));
+        }
+    }
+    change_role(role, expected_epoch, successor)
+}
+
+pub fn successor() -> Option<String> {
+    role_cell()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .successor
+        .clone()
 }
 
 pub fn epoch() -> u64 {
@@ -404,6 +450,11 @@ pub fn status_json() -> Value {
         "role": role(),
         "epoch": epoch(),
         "read_only": !writable(),
+        "successor": role_cell()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .successor
+            .clone(),
         "source": status.source,
         "databases": status.databases,
         "interval_secs": status.interval_secs,
@@ -798,8 +849,15 @@ pub fn start(
                     }
                 };
                 for database in &config.databases {
-                    if let Err(error) =
-                        pull_database(&client, &config, &databases, database, &shutdown_tx).await
+                    if let Err(error) = pull_database(
+                        &client,
+                        &config,
+                        &data_root,
+                        &databases,
+                        database,
+                        &shutdown_tx,
+                    )
+                    .await
                     {
                         tracing::warn!(database, error = %error, "replication pull failed");
                     }
@@ -818,6 +876,7 @@ pub fn start(
 async fn pull_database(
     client: &reqwest::Client,
     config: &Config,
+    data_root: &std::path::Path,
     databases: &Databases,
     database: &str,
     shutdown_tx: &watch::Sender<bool>,
@@ -841,6 +900,32 @@ async fn pull_database(
             return Ok(());
         }
         let status = get_json(client, config, database, "status", &[]).await?;
+        let source_role = status.get("role").and_then(Value::as_str).unwrap_or("");
+        let successor = status
+            .get("successor")
+            .and_then(Value::as_str)
+            .map(|value| value.trim().trim_end_matches('/'))
+            .filter(|value| !value.is_empty());
+        if source_role != "primary" {
+            if let Some(successor) = successor {
+                if successor != config.source {
+                    set_source(
+                        data_root,
+                        successor,
+                        &config.databases,
+                        config.interval.as_secs(),
+                        config.limit,
+                        &config.bootstrap,
+                    )?;
+                    tracing::warn!(
+                        old_source = %config.source,
+                        new_source = successor,
+                        "source was demoted; switching replication source to successor"
+                    );
+                    return Ok(());
+                }
+            }
+        }
         let origin = status
             .get("origin")
             .and_then(Value::as_str)

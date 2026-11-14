@@ -538,7 +538,11 @@ Manually switch roles with an expected epoch:
 ```bash
 nonodb-cli replication promote 0
 nonodb-cli replication demote 1 replica
+nonodb-cli replication demote 1 replica https://new-primary:7878
 ```
+
+The optional successor URL is stored on the demoted node. Replicas pulling
+from it switch their source automatically.
 
 A stale epoch is rejected with `409`. The role is persisted in
 `<NONODB_DATA>/replication-role.json`; the file wins over

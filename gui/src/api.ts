@@ -607,10 +607,12 @@ export function demoteReplication(
   connection: Connection,
   expectedEpoch: number,
   role = 'replica',
+  successor?: string,
 ): Promise<Record<string, unknown>> {
   return replicationWrite(connection, '/v1/replication/demote', 'POST', {
     expected_epoch: expectedEpoch,
     role,
+    successor: successor || null,
   });
 }
 

@@ -54,6 +54,8 @@ pub struct RoleBody {
     pub expected_epoch: u64,
     #[serde(default)]
     pub role: Option<String>,
+    #[serde(default)]
+    pub successor: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -105,7 +107,11 @@ pub async fn status(
                 .as_deref()
                 .and_then(|origin| store.replica_ack_details(origin).ok())
                 .unwrap_or_default();
-            let min_ack = ack_details.iter().map(|(_, seq, _)| *seq).min().unwrap_or(0);
+            let min_ack = ack_details
+                .iter()
+                .map(|(_, seq, _)| *seq)
+                .min()
+                .unwrap_or(0);
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|duration| duration.as_millis() as u64)
@@ -152,6 +158,7 @@ pub async fn status(
                 "role": crate::replicator::role(),
                 "epoch": crate::replicator::epoch(),
                 "read_only": !crate::replicator::writable(),
+                "successor": crate::replicator::successor(),
                 "head": head,
                 "applied": applied,
                 "acks": acks,
@@ -320,7 +327,7 @@ pub async fn demote(
             Err(response) => return response,
         };
     let role = body.role.as_deref().unwrap_or("replica");
-    match crate::replicator::demote(body.expected_epoch, role) {
+    match crate::replicator::demote(body.expected_epoch, role, body.successor.as_deref()) {
         Ok(role) => {
             audit_control(
                 &state,

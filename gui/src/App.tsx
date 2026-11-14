@@ -1524,6 +1524,7 @@ function ReplicationPage({ connection }: { connection: Connection }) {
   const [bootstrapDraft, setBootstrapDraft] = useState('auto');
   const [savingSource, setSavingSource] = useState(false);
   const [epochDraft, setEpochDraft] = useState('0');
+  const [successorDraft, setSuccessorDraft] = useState('');
   const [changingRole, setChangingRole] = useState(false);
 
   const load = useCallback(async () => {
@@ -1561,7 +1562,7 @@ function ReplicationPage({ connection }: { connection: Connection }) {
       if (action === 'promote') {
         await promoteReplication(connection, Number(epochDraft) || 0);
       } else {
-        await demoteReplication(connection, Number(epochDraft) || 0);
+        await demoteReplication(connection, Number(epochDraft) || 0, 'replica', successorDraft);
       }
       await load();
     } catch (err) {
@@ -1657,6 +1658,7 @@ function ReplicationPage({ connection }: { connection: Connection }) {
           <div className="panel-title"><h3>Role control</h3><span>epoch {status.epoch ?? 0}</span></div>
           <div className="form-grid">
             <label>Expected epoch<input type="number" min="0" value={epochDraft} onChange={(e) => setEpochDraft(e.target.value)} /></label>
+            <label>Successor URL<input value={successorDraft} onChange={(e) => setSuccessorDraft(e.target.value)} placeholder="https://new-primary:7878" /></label>
           </div>
           <div className="actions">
             <button onClick={() => void changeRole('promote')} disabled={changingRole || status.role === 'primary'}>Promote</button>

@@ -523,6 +523,38 @@ def main() -> int:
 
             assert status["head"] >= new_head, status
 
+            successor = "http://127.0.0.1:1"
+            demote_source = client.post(
+                "/v1/replication/demote",
+                headers=headers,
+                json={
+                    "expected_epoch": 2,
+                    "role": "replica",
+                    "successor": successor,
+                },
+            )
+            assert demote_source.status_code == 200, demote_source.text
+            assert demote_source.json()["result"]["role"]["successor"] == successor
+
+            replica_final = httpx.Client(
+                base_url=f"http://127.0.0.1:{replica_port}", timeout=30.0
+            )
+            try:
+                deadline = time.monotonic() + 20
+                while time.monotonic() < deadline:
+                    current = replica_final.get(
+                        "/v1/replication/status", headers=headers
+                    ).json()["result"]
+                    if current["replication"]["source"] == successor:
+                        break
+                    time.sleep(0.1)
+                else:
+                    raise RuntimeError(
+                        f"replica did not switch to the demoted source successor: {current}"
+                    )
+            finally:
+                replica_final.close()
+
             print("PASS  replication snapshot, pull, epoch fence, auto-resync")
             return 0
     finally:

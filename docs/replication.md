@@ -325,6 +325,17 @@ Each successful change increments `epoch`. A stale `expected_epoch` returns
 stops the replica pull loop and enables the writer. Demotion makes the node
 read-only again.
 
+Demote accepts an optional successor URL:
+
+```http
+POST /v1/replication/demote
+{"expected_epoch": 2, "role": "replica", "successor": "https://new-primary:7878"}
+```
+
+Replicas pulling from a non-primary source with a successor automatically
+persist that successor as their new source and reload the pull loop. Promotion
+clears the successor.
+
 This is **manual** promotion, not quorum failover. The old primary must be
 demoted or stopped to avoid split-brain.
 

@@ -146,9 +146,14 @@ fn run() -> Result<(), String> {
                         .parse()
                         .map_err(|e| format!("expected epoch: {e}"))?;
                     let role = args.get(3).map(String::as_str).unwrap_or("replica");
+                    let successor = args.get(4).map(String::as_str);
                     let res = http_post(
                         "/v1/replication/demote",
-                        &json!({ "expected_epoch": expected, "role": role }),
+                        &json!({
+                            "expected_epoch": expected,
+                            "role": role,
+                            "successor": successor,
+                        }),
                     )?;
                     print_result(&res);
                 }
@@ -490,7 +495,7 @@ fn usage() -> Result<(), String> {
          ping                       sprawdź daemona\n\
          exec '<json>'              dowolne żądanie /v1/exec\n\
          databases [list|create <nazwa>|drop <nazwa>]  bazy w jednym daemonie\n\
-         replication [status|changes [after] [limit]|source <url> [dbs] [interval]|acks|prune <seq> [--require-acks]|promote <epoch>|demote <epoch> [role]]\n\
+         replication [status|changes [after] [limit]|source <url> [dbs] [interval]|acks|prune <seq> [--require-acks]|promote <epoch>|demote <epoch> [role] [successor]]\n\
          collections                lista kolekcji\n\
          count <coll> [filtr]       liczba dokumentów\n\
          find <coll> [filtr] [--sort pole:asc|desc] [--limit N] [--skip N]\n\
