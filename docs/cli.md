@@ -512,6 +512,7 @@ Inspect the durable log and replica status for the selected database:
 
 ```bash
 nonodb-cli replication status
+nonodb-cli replication primary
 nonodb-cli replication changes 0 100
 ```
 

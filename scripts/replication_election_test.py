@@ -167,6 +167,11 @@ def main() -> int:
             raise RuntimeError(f"candidate did not win the election: {status}")
         assert status["read_only"] is False, status
         assert status["epoch"] == 1, status
+        assert status["write_url"] == f"http://127.0.0.1:{ports['candidate']}", status
+        primary_info = candidate.get(
+            "/v1/replication/primary", headers=headers
+        ).json()["result"]
+        assert primary_info["write_url"] == f"http://127.0.0.1:{ports['candidate']}", primary_info
         voter_client = clients["voter"]
         deadline = time.monotonic() + 10
         voter_status = None

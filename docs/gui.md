@@ -268,6 +268,7 @@ The current branch exposes a read-only replication foundation:
 - durable log capture status;
 - head sequence;
 - applied source sequences and lag on replicas;
+- current `write_url` for client/load-balancer routing;
 - transport source, bootstrap mode, poll interval, last success, and last
   transport/apply error;
 - editable source settings saved to `replication-source.json`;

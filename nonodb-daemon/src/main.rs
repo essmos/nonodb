@@ -306,6 +306,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/replication/ack", post(replication_api::ack_default))
         .route("/v1/replication/acks", get(replication_api::acks_default))
         .route("/v1/replication/vote", post(replication_api::vote))
+        .route("/v1/replication/primary", get(replication_api::primary))
         .route("/v1/replication/lease", post(replication_api::lease))
         .route("/v1/replication/promote", post(replication_api::promote))
         .route("/v1/replication/demote", post(replication_api::demote))
@@ -1012,6 +1013,7 @@ async fn ready(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
             "replication": {
                 "role": role,
                 "read_only": read_only,
+                "write_url": replicator::write_url(state.databases.root()).unwrap_or(None),
             }
         })),
     )

@@ -565,6 +565,7 @@ export type ReplicationStatus = {
   role: string;
   epoch?: number;
   read_only?: boolean;
+  write_url?: string | null;
   head: number;
   replication?: {
     role?: string;

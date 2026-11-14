@@ -310,7 +310,24 @@ CA, client certificate, and key remain environment settings. The new source
 must expose a compatible sequence/epoch stream, or the replica must be restarted
 so startup bootstrap can install a fresh snapshot.
 
-### Manual role changes
+#### Write routing
+
+`GET /v1/replication/primary` returns the best-known write endpoint:
+
+```json
+{
+  "role": "replica",
+  "epoch": 2,
+  "write_url": "https://new-primary:7878"
+}
+```
+
+The same value is exposed as `write_url` in replication status and
+`/readyz.replication.write_url`. A load balancer or client can poll a stable
+node and route writes to this URL. The endpoint requires `admin:db`; `/readyz`
+is unauthenticated for lightweight health routing.
+
+## Manual role changes
 
 Roles are persisted in `<NONODB_DATA>/replication-role.json`. The env var seeds
 a new installation; after that the file wins.

@@ -70,6 +70,10 @@ fn run() -> Result<(), String> {
                     let res = http_get("/v1/replication/status")?;
                     println!("{}", serde_json::to_string_pretty(&res).unwrap());
                 }
+                "primary" => {
+                    let res = http_get("/v1/replication/primary")?;
+                    println!("{}", serde_json::to_string_pretty(&res).unwrap());
+                }
                 "changes" => {
                     let after = args.get(2).map(String::as_str).unwrap_or("0");
                     let limit = args.get(3).map(String::as_str).unwrap_or("100");

@@ -737,6 +737,17 @@ pub fn demote(
     change_role(role, expected_epoch, successor)
 }
 
+/// Best-known write endpoint for load balancers and clients.
+pub fn write_url(data_root: &std::path::Path) -> Result<Option<String>, String> {
+    if writable() {
+        return Ok(advertise_url());
+    }
+    if let Some(successor) = successor() {
+        return Ok(Some(successor));
+    }
+    Ok(Config::load(data_root)?.map(|config| config.source))
+}
+
 pub(crate) fn advertise_url() -> Option<String> {
     non_empty_env("NONODB_REPLICATION_ADVERTISE_URL")
         .map(|value| value.trim().trim_end_matches('/').to_string())

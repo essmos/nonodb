@@ -117,6 +117,9 @@ def main() -> int:
         assert old["epoch"] == 1, old
         assert old["successor"] == f"http://127.0.0.1:{replica_port}", old
 
+        assert old["write_url"] == f"http://127.0.0.1:{replica_port}", old
+        new_primary = replica.get("/v1/replication/primary", headers=headers).json()["result"]
+        assert new_primary["write_url"] == f"http://127.0.0.1:{replica_port}", new_primary
         insert = replica.post(
             "/v1/exec",
             headers=headers,

@@ -2454,7 +2454,8 @@ Transport, replica apply, promotion, and GUI management are still planned.
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/v1/replication/status` | Replication role, epoch, origin, head, applied sources, and replica acks |
+| `GET` | `/v1/replication/status` | Replication role, epoch, origin, head, applied sources, acks, and `write_url` |
+| `GET` | `/v1/replication/primary` | Admin-only current write endpoint and role |
 | `GET` | `/v1/replication/changes?after=0&limit=100` | Read committed replication transactions after a sequence |
 | `GET` | `/{database}/v1/replication/status` | Same status for a selected database |
 | `GET` | `/{database}/v1/replication/changes` | Changes for a selected database |

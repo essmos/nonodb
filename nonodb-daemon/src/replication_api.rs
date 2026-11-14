@@ -179,6 +179,7 @@ pub async fn status(
                 "epoch": crate::replicator::epoch(),
                 "read_only": !crate::replicator::writable(),
                 "successor": crate::replicator::successor(),
+                "write_url": crate::replicator::write_url(state.databases.root()).unwrap_or(None),
                 "head": head,
                 "applied": applied,
                 "acks": acks,
@@ -283,6 +284,43 @@ pub async fn lease(
             }))
         }
         Err(message) => failure(StatusCode::BAD_REQUEST, "invalid_lease", message),
+    }
+}
+
+pub async fn primary(
+    State(state): State<AppState>,
+    Extension(connection): Extension<auth::ConnectionAuth>,
+    headers: HeaderMap,
+) -> AuthResponse {
+    let (principal, started) =
+        match start_admin(&state, &connection, &headers, "replication_primary") {
+            Ok(value) => value,
+            Err(response) => return response,
+        };
+    let write_url = crate::replicator::write_url(state.databases.root());
+    match write_url {
+        Ok(write_url) => {
+            audit_control(
+                &state,
+                &connection,
+                principal.name(),
+                "replication_primary",
+                true,
+                None,
+                started,
+                None,
+            );
+            ok(serde_json::json!({
+                "role": crate::replicator::role(),
+                "epoch": crate::replicator::epoch(),
+                "write_url": write_url,
+            }))
+        }
+        Err(message) => failure(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "replication_error",
+            message,
+        ),
     }
 }
 
