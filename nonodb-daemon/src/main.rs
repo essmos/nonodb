@@ -268,6 +268,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             patch(auth_api::update_certificate),
         )
         .layer(axum::middleware::from_fn(no_store));
+    let redirect_state = state.clone();
     let app = Router::new()
         .route("/healthz", get(health))
         .route("/readyz", get(ready))
@@ -339,6 +340,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .route("/:database/v1/watch", post(watch_stream))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .layer(axum::middleware::from_fn(http_access_log))
+        .layer(axum::middleware::from_fn_with_state(
+            redirect_state,
+            write_location,
+        ))
         .with_state(state);
 
     // Optional TCP listener (with TLS when a certificate and key are provided).
@@ -1018,6 +1023,44 @@ async fn ready(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
             }
         })),
     )
+}
+
+async fn write_location(
+    State(state): State<AppState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let response = next.run(request).await;
+    if response.status() != StatusCode::FORBIDDEN || replicator::writable() {
+        return response;
+    }
+    let write_url = match replicator::write_url(state.databases.root()) {
+        Ok(Some(write_url)) => write_url,
+        _ => return response,
+    };
+    let (parts, body) = response.into_parts();
+    let bytes = match axum::body::to_bytes(body, 64 * 1024).await {
+        Ok(bytes) => bytes,
+        Err(_) => return Response::from_parts(parts, Body::empty()),
+    };
+    let read_only = serde_json::from_slice::<Value>(&bytes)
+        .ok()
+        .and_then(|payload| {
+            payload
+                .pointer("/error/code")
+                .and_then(Value::as_str)
+                .map(|code| code == "read_only")
+        })
+        .unwrap_or(false);
+    let mut response = Response::from_parts(parts, Body::from(bytes));
+    if read_only {
+        if let Ok(value) = HeaderValue::from_str(&write_url) {
+            response
+                .headers_mut()
+                .insert(axum::http::header::LOCATION, value);
+        }
+    }
+    response
 }
 
 async fn ready_write(State(state): State<AppState>) -> axum::response::Response {

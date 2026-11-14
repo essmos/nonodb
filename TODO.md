@@ -134,7 +134,7 @@ Design: [docs/replication.md](docs/replication.md).
 - [x] Add automatic candidate election after the source failure timeout.
 - [x] Propagate the elected primary to every configured voter.
 - [x] Add source propagation for non-voting followers.
-- [x] Expose the current write endpoint and `/readyz/write` for load balancers.
+- [x] Expose the current write endpoint, `/readyz/write`, and `Location` on `read_only`.
 - [x] Add automatic snapshot resync at startup when the source log was pruned.
 - [ ] Add hot resync without restarting the replica.
 - [x] Add role-aware `/readyz` and replication fields to status/GUI.

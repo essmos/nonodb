@@ -139,6 +139,7 @@ def main() -> int:
         )
         assert blocked.status_code == 403, blocked.text
         assert blocked.json()["error"]["code"] == "read_only", blocked.text
+        assert blocked.headers.get("location") == f"http://127.0.0.1:{replica_port}"
 
         print(json.dumps({"ok": True, "new_epoch": role["epoch"], "old_role": old["role"]}))
         return 0
