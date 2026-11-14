@@ -33,6 +33,7 @@ struct Config {
     cert_file: Option<String>,
     key_file: Option<String>,
     bootstrap: String,
+    restart_on_gap: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -104,6 +105,9 @@ impl Config {
                 "provide both NONODB_REPLICATION_CERT_FILE and NONODB_REPLICATION_KEY_FILE".into(),
             );
         }
+        let restart_on_gap = std::env::var("NONODB_REPLICATION_EXIT_ON_GAP")
+            .ok()
+            .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"));
         let bootstrap = std::env::var("NONODB_REPLICATION_BOOTSTRAP")
             .ok()
             .map(|value| value.trim().to_ascii_lowercase())
@@ -119,6 +123,7 @@ impl Config {
             cert_file,
             key_file,
             bootstrap,
+            restart_on_gap,
         })
     }
 
@@ -753,6 +758,7 @@ pub fn start(
     databases: Arc<Databases>,
     data_root: std::path::PathBuf,
     shutdown: watch::Receiver<bool>,
+    shutdown_tx: watch::Sender<bool>,
 ) -> Result<(), String> {
     tokio::spawn(async move {
         let mut shutdown = shutdown;
@@ -792,7 +798,8 @@ pub fn start(
                     }
                 };
                 for database in &config.databases {
-                    if let Err(error) = pull_database(&client, &config, &databases, database).await
+                    if let Err(error) =
+                        pull_database(&client, &config, &databases, database, &shutdown_tx).await
                     {
                         tracing::warn!(database, error = %error, "replication pull failed");
                     }
@@ -813,6 +820,7 @@ async fn pull_database(
     config: &Config,
     databases: &Databases,
     database: &str,
+    shutdown_tx: &watch::Sender<bool>,
 ) -> Result<(), String> {
     let runtime = match databases.get(database).await {
         Ok(runtime) => runtime,
@@ -870,6 +878,15 @@ async fn pull_database(
             .and_then(Value::as_array)
             .ok_or("source changes response is missing `changes`")?;
         if batch.is_empty() {
+            if applied < status_head {
+                let message = format!(
+                    "replication gap: no changes available after {applied}, source head {status_head}"
+                );
+                metrics::inc(&metrics::REPLICATION_APPLY_ERRORS);
+                record_apply_error(&message);
+                maybe_restart_for_gap(config, &message, shutdown_tx);
+                return Err(message);
+            }
             return Ok(());
         }
         let mut applied_any = false;
@@ -890,6 +907,7 @@ async fn pull_database(
                     metrics::inc(&metrics::REPLICATION_APPLY_ERRORS);
                     let message = format!("apply replication transaction {}: {error}", txn.seq);
                     record_apply_error(&message);
+                    maybe_restart_for_gap(config, &message, shutdown_tx);
                     return Err(message);
                 }
             }
@@ -911,6 +929,21 @@ async fn pull_database(
         }
     }
     Err("replication catch-up exceeded 100 batches".into())
+}
+
+fn maybe_restart_for_gap(config: &Config, error: &str, shutdown_tx: &watch::Sender<bool>) {
+    if !config.restart_on_gap
+        || !(error.contains("replication gap")
+            || error.contains("sequence mismatch")
+            || error.contains("stale replication epoch"))
+    {
+        return;
+    }
+    tracing::error!(
+        error,
+        "replication needs snapshot resync; requesting graceful restart"
+    );
+    let _ = shutdown_tx.send(true);
 }
 
 async fn send_ack(

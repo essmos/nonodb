@@ -284,8 +284,11 @@ The snapshot's own replication head becomes the initial applied sequence, so
 changes after that point are pulled normally.
 
 The gap check runs at startup, before the runtime opens. If a gap appears while
-the daemon is running, the pull loop reports an error; restart the replica to
-trigger auto-resync. Hot resync without restart is still future work.
+the daemon is running, the pull loop reports an error. With
+`NONODB_REPLICATION_EXIT_ON_GAP=1` it also requests a graceful shutdown; a
+supervisor such as systemd, Docker, or Kubernetes restarts the replica and the
+startup gap check installs a fresh snapshot. Without a supervisor, restart the
+replica manually. Hot resync inside one process is still future work.
 
 ### Changing the source
 
@@ -362,7 +365,8 @@ work.
 - [x] Global applied sequence supports mixed origins.
 - [ ] Epoch fencing and source changes.
 - [x] Automatic snapshot resync at startup when the source log was pruned too far.
-- [ ] Hot resync without a daemon restart.
+- [x] Graceful restart on a runtime gap when `NONODB_REPLICATION_EXIT_ON_GAP=1`.
+- [ ] Hot resync without a process restart.
 - [ ] Replica readiness policy.
 
 ### Phase 3 — operations and GUI

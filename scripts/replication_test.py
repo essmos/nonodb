@@ -183,6 +183,7 @@ def main() -> int:
                 NONODB_REPLICATION_ROLE="replica",
                 NONODB_REPLICATION_ENABLED="1",
                 NONODB_REPLICATION_NODE_ID="replica-1",
+                NONODB_REPLICATION_EXIT_ON_GAP="1",
                 NONODB_REPLICATION_SOURCE=f"http://127.0.0.1:{port}",
                 NONODB_REPLICATION_SOURCE_TOKEN=admin,
                 NONODB_REPLICATION_DATABASES="default",
@@ -442,10 +443,6 @@ def main() -> int:
             finally:
                 replica.close()
 
-            replica_proc.terminate()
-            replica_proc.wait(timeout=10)
-            replica_log.close()
-
             exec({"op": "insert", "coll": "orders", "doc": {"_id": "o7", "n": 7}})
             new_head = client.get(
                 "/v1/replication/status", headers=headers
@@ -456,6 +453,18 @@ def main() -> int:
                 json={"through": new_head},
             )
             assert pruned.status_code == 200, pruned.text
+
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline:
+                if replica_proc.poll() is not None:
+                    break
+                time.sleep(0.1)
+            else:
+                replica_proc.terminate()
+                replica_proc.wait(timeout=10)
+                raise RuntimeError("replica did not request a restart after the log gap")
+            assert replica_proc.returncode == 0, replica_proc.returncode
+            replica_log.close()
 
             replica_log = open(temp / "replica.log", "a", encoding="utf-8")
             replica_proc = subprocess.Popen(

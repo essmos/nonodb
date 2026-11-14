@@ -99,6 +99,7 @@ secrets.
 | `NONODB_REPLICATION_POLL_INTERVAL` | `1` | Pull interval in seconds |
 | `NONODB_REPLICATION_BATCH` | `500` | Maximum transactions per request, 1–1000 |
 | `NONODB_REPLICATION_BOOTSTRAP` | `auto` | Snapshot bootstrap mode: `auto`, `always`, or `never` |
+| `NONODB_REPLICATION_EXIT_ON_GAP` | `0` | Request a graceful exit on a runtime log gap so a supervisor can restart and resync |
 | `NONODB_REPLICATION_PRUNE_INTERVAL` | `0` | Automatic retention interval in seconds; `0` disables |
 | `NONODB_REPLICATION_RETENTION_KEEP` | `0` | Extra sequences retained behind the minimum replica ack |
 | `NONODB_REPLICATION_CA_FILE` | unset | CA bundle for source TLS verification |

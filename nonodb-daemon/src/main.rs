@@ -218,13 +218,19 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let drain_timeout = drain_timeout();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let replication_shutdown = shutdown_tx.clone();
     tokio::spawn(async move {
         shutdown_signal().await;
         tracing::info!("shutdown signal received; draining");
         let _ = shutdown_tx.send(true);
     });
-    replicator::start(databases.clone(), data.clone(), shutdown_rx.clone())
-        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    replicator::start(
+        databases.clone(),
+        data.clone(),
+        shutdown_rx.clone(),
+        replication_shutdown,
+    )
+    .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
     retention::start(databases.clone(), shutdown_rx.clone())
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
