@@ -313,4 +313,5 @@ Validated on the development branch:
 | Primary with unreachable voters | pass; read-only until quorum lease |
 | Lease-gated write rejection | pass (`403 read_only`) |
 | Multi-host failover | pass; one primary, source propagation, convergence |
+| Network partition | pass; live primary self-demotes, new primary elected, old primary rejoins and resyncs |
 | Large-load smoke, 15k docs, 2 failovers | pass; election 21.6 s / 31.2 s, convergence 0.01 s |

@@ -1475,6 +1475,41 @@ impl Store {
         Ok(true)
     }
 
+    /// Clears all user collections and replication state from a replica.
+    ///
+    /// This is an in-place hard resync: the LMDB environment and writer stay
+    /// open, so a replica can rejoin a new primary without a process restart.
+    pub fn reset_replica_state(&self) -> Result<()> {
+        let mut names = self.collections()?;
+        let rtxn = self.read_txn()?;
+        let has_control = self.collection_at(&rtxn, CONTROL_DB)?.is_some();
+        rtxn.commit()?;
+        if has_control {
+            names.push(CONTROL_DB.to_string());
+        }
+        for name in names {
+            let _ = self.drop_collection(&name)?;
+        }
+        let mut wtxn = self.write_txn()?;
+        let meta: Database<Bytes, Bytes> = self.env.create_database(&mut wtxn, Some(META_DB))?;
+        let replication: Database<Bytes, Bytes> =
+            self.env.create_database(&mut wtxn, Some(REPLICATION_DB))?;
+        replication.clear(&mut wtxn)?;
+        meta.delete(&mut wtxn, REPLICATION_SEQ_KEY)?;
+        let keys: Vec<Vec<u8>> = meta
+            .iter(&wtxn)?
+            .filter_map(|item| {
+                let (key, _) = item.ok()?;
+                key.starts_with(b"replication:").then(|| key.to_vec())
+            })
+            .collect();
+        for key in keys {
+            meta.delete(&mut wtxn, key.as_slice())?;
+        }
+        wtxn.commit()?;
+        Ok(())
+    }
+
     /// Returns the highest source sequence applied for `origin`.
     pub fn replication_applied(&self, origin: &str) -> Result<u64> {
         let rtxn = self.read_txn()?;

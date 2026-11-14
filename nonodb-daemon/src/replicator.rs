@@ -28,6 +28,11 @@ use crate::{
 static PROMOTION_READY: AtomicBool = AtomicBool::new(false);
 static LEASE_VALID: AtomicBool = AtomicBool::new(false);
 static CLUSTER_PEER_TOKEN: OnceLock<std::sync::RwLock<Option<String>>> = OnceLock::new();
+static SOURCE_CONFIG_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn source_config_lock() -> &'static Mutex<()> {
+    SOURCE_CONFIG_LOCK.get_or_init(|| Mutex::new(()))
+}
 
 fn cluster_peer_slot() -> &'static std::sync::RwLock<Option<String>> {
     CLUSTER_PEER_TOKEN.get_or_init(|| std::sync::RwLock::new(None))
@@ -1001,14 +1006,10 @@ pub fn set_source(
     batch: usize,
     bootstrap: &str,
 ) -> Result<Value, String> {
-    let token = fs::read(source_config_path(data_root))
-        .ok()
-        .and_then(|raw| serde_json::from_slice::<PersistedSource>(&raw).ok())
-        .and_then(|persisted| persisted.token);
     set_source_with_token(
         data_root,
         source,
-        token,
+        None,
         databases,
         interval_secs,
         batch,
@@ -1084,6 +1085,9 @@ pub fn set_source_with_token(
     batch: usize,
     bootstrap: &str,
 ) -> Result<Value, String> {
+    let _guard = source_config_lock()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let source = source.trim().trim_end_matches('/');
     if !source.starts_with("http://") && !source.starts_with("https://") {
         return Err("source must start with http:// or https://".into());
@@ -1096,9 +1100,18 @@ pub fn set_source_with_token(
     if !matches!(bootstrap, "auto" | "always" | "never") {
         return Err("bootstrap must be auto, always, or never".into());
     }
+    // A source update (for example catalog/source propagation) must not erase
+    // an existing credential. Preserve the current token when the caller does
+    // not supply one.
+    let token = token.filter(|value| !value.trim().is_empty()).or_else(|| {
+        fs::read(source_config_path(data_root))
+            .ok()
+            .and_then(|raw| serde_json::from_slice::<PersistedSource>(&raw).ok())
+            .and_then(|persisted| persisted.token)
+    });
     let persisted = PersistedSource {
         source: source.to_string(),
-        token: token.filter(|value| !value.trim().is_empty()),
+        token,
         databases,
         interval_secs: interval_secs.max(1),
         batch: batch.clamp(1, 1000),
@@ -1623,6 +1636,19 @@ async fn discover_primary() -> Result<Option<String>, String> {
     Ok(None)
 }
 
+/// Hard-resync a replica database whose local log diverged from the current
+/// source. The data is recreated and the full source log is pulled again.
+async fn reset_replicated_database(databases: &Databases, database: &str) -> Result<(), String> {
+    let runtime = databases
+        .get(database)
+        .await
+        .map_err(|error| format!("{}: {}", error.code, error.message))?;
+    runtime
+        .store
+        .reset_replica_state()
+        .map_err(|error| error.to_string())
+}
+
 async fn pull_database(
     client: &reqwest::Client,
     config: &Config,
@@ -1751,6 +1777,20 @@ async fn pull_database(
                     metrics::inc(&metrics::REPLICATION_APPLY_ERRORS);
                     let message = format!("apply replication transaction {}: {error}", txn.seq);
                     record_apply_error(&message);
+                    if message.contains("sequence mismatch")
+                        || message.contains("stale replication epoch")
+                    {
+                        tracing::error!(
+                            database,
+                            error = %message,
+                            "local replication log diverged from source; resetting replica database"
+                        );
+                        drop(runtime);
+                        if let Err(reset) = reset_replicated_database(databases, database).await {
+                            tracing::error!(database, error = %reset, "replica database reset failed");
+                        }
+                        return Err(message);
+                    }
                     maybe_restart_for_gap(config, &message, shutdown_tx);
                     return Err(message);
                 }

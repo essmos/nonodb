@@ -515,6 +515,25 @@ nonodb-cli replication promote <epoch>
 Without voters there is no quorum. Stop or demote the old primary before
 promoting a replica.
 
+### 8.6 Returning old primary
+
+When a partitioned primary loses its lease it self-demotes and becomes
+read-only. After connectivity returns, source discovery queries the voters for
+the current primary and installs it as the source. If the old log diverged, the
+replica resets its local replication state in place and re-pulls the source log;
+divergent local writes are discarded rather than merged. If the source log has
+already been pruned, the normal gap/snapshot recovery applies.
+
+The network-partition test covers this path:
+
+```bash
+python3 scripts/replication_partition_test.py
+```
+
+It cuts a live primary from voters and replicas, verifies it self-demotes and
+rejects writes, waits for a new quorum primary, restores the links, and checks
+that the old primary rejoins as a read-only replica.
+
 ## 9. GUI guide
 
 The GUI has two relevant pages: **Replication** for the connected node and
@@ -684,10 +703,14 @@ Keep both. Take regular snapshots even when a replica is healthy.
   field. Upgrade all nodes before relying on metadata replication.
 - Cluster GUI probes currently use HTTP URLs; use a local TLS proxy for HTTPS.
 - Failover is asynchronous. A small RPO window exists unless writes are stopped
-  before promotion.
+  before promotion. Divergent writes from an isolated old primary are discarded
+  on resync, not merged.
 - The cluster peer token is stored in the control plane so every node can follow
   a new primary. It is written to `cluster-peer-token` with mode `0600`; protect
   the data directory accordingly.
+- A hard resync resets local collections and replication state in place. If the
+  source log was pruned, use snapshot bootstrap or restart with
+  `NONODB_REPLICATION_EXIT_ON_GAP=1`.
 
 ## 14. Validation scripts
 
@@ -702,6 +725,7 @@ python3 scripts/replication_cluster_test.py
 python3 scripts/replication_metadata_test.py
 python3 scripts/replication_control_plane_test.py
 python3 scripts/replication_lease_gate_test.py
+python3 scripts/replication_partition_test.py
 python3 scripts/replication_load_test.py --docs 200000 --keep
 python3 scripts/tls_reload_test.py
 python3 scripts/gui_cluster_test.py
