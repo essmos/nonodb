@@ -46,7 +46,7 @@ nonodb is a real document database with:
 - exact vector search with cosine, dot, and L2 metrics, stored and queried
   inside the same LMDB file;
 - a read-only aggregation pipeline for reporting and summaries;
-- asynchronous primary/replica replication with durable ordered operations, snapshot bootstrap, replicated indexes/history/TTL/events/subscriptions, a replicated cluster control plane (auth, backup jobs, database catalog), 8-character one-time pairing, lease-gated writes, quorum promotion, automatic election, write routing and a cluster-wide GUI;
+- asynchronous primary/replica replication with durable ordered operations, snapshot bootstrap, replicated indexes/history/TTL/events/subscriptions and encrypted vault envelopes, a replicated cluster control plane (auth, backup jobs, database catalog), 8-character one-time pairing, lease-gated writes, quorum promotion, automatic election, partition rejoin, write routing and a cluster-wide GUI;
 - snapshots, scheduled native or restic backups with GUI, gzip/age encryption, backup-info files, local/S3/R2 export, staged import as new databases, online LMDB map growth, authentication, TLS/mTLS, metrics and a CLI;
 - graceful shutdown with in-flight request draining and optional JSON logs;
 - per-collection document revision history with global revision IDs and configurable retention (`0` disables);

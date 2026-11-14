@@ -87,6 +87,24 @@ limitations are documented in [docs/roadmap.md](docs/roadmap.md).
 - [ ] Shared sharded writer pool for much higher write concurrency (future scaling step).
 - [ ] Per-database metrics, quotas, and a per-database administrator role.
 
+## Cluster control plane and failover hardening
+
+- [x] Replicate the auth registry as token hashes, scopes, principals, and
+      certificate fingerprints.
+- [x] Replicate backup jobs and run state; backup scheduler runs only on primary.
+- [x] Replicate database catalog and update the replica source list dynamically.
+- [x] Replicate encrypted vault envelopes; tenant keys remain client-side.
+- [x] Add a cluster peer token and source discovery for rejoin.
+- [x] Add one-time 8-character replica pairing in CLI and GUI.
+- [x] Gate client writes on a valid quorum lease, including startup.
+- [x] Make promotion readiness require the control-plane snapshot.
+- [x] Wait out the old lease before automatic election.
+- [x] Hard-reset a divergent replica log in place and re-pull the source.
+- [x] Add partition, control-plane, pairing, lease-gate, and vault replication tests.
+- [ ] Replicate TLS/import/node-local settings (deliberately local today).
+- [ ] Add GUI controls for cluster peer token rotation and control revision.
+- [ ] Add full automatic rejoin test coverage for multi-database catalogs.
+
 ## In progress — replication foundation
 
 Branch: `feature/replication`
@@ -109,8 +127,8 @@ Design: [docs/replication.md](docs/replication.md).
 - [x] Add `scripts/replication_test.py` for CRUD, atomic batch, delete, and SQL capture.
 - [x] Capture SQL writes in the replication log by merging the core observer
       output into the writer transaction.
-- [ ] Decide whether vault writes, index/history/config changes are replicated
-      or rebuilt.
+- [x] Vault encrypted-envelope writes, index/history/config changes are replicated
+      incrementally.
 - [x] Add a read-only GUI Replication tab showing role, origin, head, and recent
       transactions.
 - [x] Add Prometheus replication enabled, role, origin, and head metrics.
@@ -136,7 +154,7 @@ Design: [docs/replication.md](docs/replication.md).
 - [x] Add source propagation for non-voting followers.
 - [x] Expose the current write endpoint, `/readyz/write`, and `Location` on `read_only`.
 - [x] Add automatic snapshot resync at startup when the source log was pruned.
-- [ ] Add hot resync without restarting the replica.
+- [x] Add in-place hard resync for a divergent replica log.
 - [x] Add role-aware `/readyz` and replication fields to status/GUI.
 
 ### Phase 3 — GUI and monitoring
