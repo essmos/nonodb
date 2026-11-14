@@ -337,6 +337,13 @@ Each voter persists the highest granted `(epoch, candidate)` in
 `replication-vote.json`; conflicting candidates at the same epoch are rejected.
 Promotion fails with `quorum_not_reached` without a majority.
 
+A primary with voters configured renews a lease every
+`NONODB_REPLICATION_LEASE_INTERVAL` seconds. Voters persist
+`replication-lease.json`. If the primary cannot reach a majority for
+`NONODB_REPLICATION_LEASE_TTL` seconds, it self-demotes to `replica` and stops
+accepting writes. This fences an old primary that is partitioned from the
+quorum. It does not automatically choose or promote a successor.
+
 When `NONODB_REPLICATION_ADVERTISE_URL` is set, promotion then asks the current
 source to demote itself with this node as `successor`. The promotion is aborted
 if that fence request fails; use `"force": true` (CLI `--force`) only when the

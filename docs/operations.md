@@ -96,6 +96,8 @@ secrets.
 | `NONODB_REPLICATION_ADVERTISE_URL` | unset | Public URL used to demote the old source and advertise this node on promotion |
 | `NONODB_REPLICATION_VOTERS` | unset | Comma-separated voter URLs required for quorum promotion |
 | `NONODB_REPLICATION_VOTER_TOKEN` | unset | Bearer token used to call voter endpoints |
+| `NONODB_REPLICATION_LEASE_INTERVAL` | `5` | Seconds between primary quorum-lease renewals |
+| `NONODB_REPLICATION_LEASE_TTL` | `15` | Seconds without a majority before the primary self-demotes |
 | `NONODB_REPLICATION_SOURCE` | unset | Source base URL for replica/standby pull |
 | `NONODB_REPLICATION_SOURCE_TOKEN` | unset | Bearer token used to read the source replication API |
 | `NONODB_REPLICATION_DATABASES` | `default` | Comma-separated databases to pull |

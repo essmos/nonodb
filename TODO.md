@@ -129,7 +129,8 @@ Design: [docs/replication.md](docs/replication.md).
 - [x] Add persisted role state and manual promote/demote with expected epoch.
 - [x] Carry the epoch in replication transactions and reject stale epochs.
 - [x] Require a voter majority before promotion.
-- [ ] Add lease expiry and automatic candidate election.
+- [x] Add primary quorum leases and self-demotion on lease loss.
+- [ ] Add automatic candidate election after lease expiry.
 - [x] Add automatic snapshot resync at startup when the source log was pruned.
 - [ ] Add hot resync without restarting the replica.
 - [x] Add role-aware `/readyz` and replication fields to status/GUI.
@@ -148,7 +149,8 @@ Design: [docs/replication.md](docs/replication.md).
 ### Phase 4 — failover and policies
 
 - [x] Add quorum voting for promotion.
-- [ ] Add lease expiry and automatic candidate election.
+- [x] Add primary quorum leases and self-demotion on lease loss.
+- [ ] Add automatic candidate election after lease expiry.
 - [ ] Add primary epoch/fencing and old-primary rejection.
 - [ ] Add synchronous standby option.
 - [ ] Add per-collection consistency profiles.

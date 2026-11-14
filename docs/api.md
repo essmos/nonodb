@@ -2468,6 +2468,7 @@ Transport, replica apply, promotion, and GUI management are still planned.
 | `POST` | `/v1/replication/demote` | Manually demote with `expected_epoch`, optional `role`, and optional `successor` URL |
 | `PUT` | `/v1/replication/source` | Persist a new pull source and reload the loop |
 | `POST` | `/v1/replication/vote` | Cast or inspect a quorum vote for `(epoch, candidate)` |
+| `POST` | `/v1/replication/lease` | Renew a candidate's quorum lease |
 
 All routes require `admin:db` or `*:*`. Snapshot and prune are intended for
 replica bootstrap and controlled retention. Prune accepts

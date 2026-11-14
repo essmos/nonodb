@@ -18,6 +18,7 @@ mod cursor;
 mod databases;
 mod imports;
 mod imports_api;
+mod lease;
 mod live;
 mod login_guard;
 mod maintenance;
@@ -233,6 +234,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
     retention::start(databases.clone(), shutdown_rx.clone())
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    lease::start(data.clone(), shutdown_rx.clone())
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
     let state = AppState {
         store: default.store.clone(),
@@ -300,6 +303,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/replication/ack", post(replication_api::ack_default))
         .route("/v1/replication/acks", get(replication_api::acks_default))
         .route("/v1/replication/vote", post(replication_api::vote))
+        .route("/v1/replication/lease", post(replication_api::lease))
         .route("/v1/replication/promote", post(replication_api::promote))
         .route("/v1/replication/demote", post(replication_api::demote))
         .route(

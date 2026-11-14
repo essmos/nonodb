@@ -197,6 +197,56 @@ struct PersistedVote {
     candidate: Option<String>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+struct PersistedLease {
+    epoch: u64,
+    #[serde(default)]
+    candidate: Option<String>,
+    expires_at_ms: u64,
+}
+
+fn lease_path(data_root: &std::path::Path) -> std::path::PathBuf {
+    data_root.join("replication-lease.json")
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Records a lease after a successful vote. The lease is advisory fencing:
+/// voters only grant renewals to the same candidate/epoch until a higher epoch
+/// wins a new vote.
+pub fn cast_lease(
+    data_root: &std::path::Path,
+    epoch: u64,
+    candidate: &str,
+    ttl_seconds: u64,
+) -> Result<bool, String> {
+    if !cast_vote(data_root, epoch, candidate)? {
+        return Ok(false);
+    }
+    let path = lease_path(data_root);
+    let encoded = serde_json::to_vec_pretty(&PersistedLease {
+        epoch,
+        candidate: Some(candidate.to_string()),
+        expires_at_ms: now_ms().saturating_add(ttl_seconds.max(1) * 1000),
+    })
+    .map_err(|error| error.to_string())?;
+    let temp = path.with_extension(format!("tmp-{}", std::process::id()));
+    fs::write(&temp, encoded).map_err(|error| format!("write lease state: {error}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&temp, fs::Permissions::from_mode(0o600))
+            .map_err(|error| format!("chmod lease state: {error}"))?;
+    }
+    fs::rename(&temp, &path).map_err(|error| format!("replace lease state: {error}"))?;
+    Ok(true)
+}
+
 fn vote_path(data_root: &std::path::Path) -> std::path::PathBuf {
     data_root.join("replication-vote.json")
 }
@@ -247,7 +297,7 @@ pub fn cast_vote(data_root: &std::path::Path, epoch: u64, candidate: &str) -> Re
     Ok(true)
 }
 
-fn voter_urls() -> Vec<String> {
+pub(crate) fn voter_urls() -> Vec<String> {
     std::env::var("NONODB_REPLICATION_VOTERS")
         .ok()
         .map(|value| {
@@ -261,7 +311,7 @@ fn voter_urls() -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn voter_token() -> Option<String> {
+pub(crate) fn voter_token() -> Option<String> {
     non_empty_env("NONODB_REPLICATION_VOTER_TOKEN")
 }
 
@@ -575,6 +625,17 @@ pub fn demote(
         }
     }
     change_role(role, expected_epoch, successor)
+}
+
+pub(crate) fn advertise_url() -> Option<String> {
+    non_empty_env("NONODB_REPLICATION_ADVERTISE_URL")
+        .map(|value| value.trim().trim_end_matches('/').to_string())
+}
+
+/// Locally fences a primary that has lost its quorum lease.
+pub fn self_demote() -> Result<RoleView, (String, String)> {
+    let epoch = epoch();
+    change_role("replica", epoch, None)
 }
 
 pub fn successor() -> Option<String> {

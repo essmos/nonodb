@@ -56,6 +56,18 @@ pub struct VoteBody {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct LeaseBody {
+    pub epoch: u64,
+    pub candidate: String,
+    #[serde(default = "default_lease_ttl")]
+    pub ttl_seconds: u64,
+}
+
+fn default_lease_ttl() -> u64 {
+    15
+}
+
+#[derive(Debug, Deserialize)]
 pub struct RoleBody {
     pub expected_epoch: u64,
     #[serde(default)]
@@ -233,6 +245,44 @@ pub async fn changes(
             "replication_error",
             error.to_string(),
         ),
+    }
+}
+
+pub async fn lease(
+    State(state): State<AppState>,
+    Extension(connection): Extension<auth::ConnectionAuth>,
+    headers: HeaderMap,
+    Json(body): Json<LeaseBody>,
+) -> AuthResponse {
+    let (principal, started) = match start_admin(&state, &connection, &headers, "replication_lease")
+    {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    match crate::replicator::cast_lease(
+        state.databases.root(),
+        body.epoch,
+        &body.candidate,
+        body.ttl_seconds,
+    ) {
+        Ok(granted) => {
+            audit_control(
+                &state,
+                &connection,
+                principal.name(),
+                "replication_lease",
+                true,
+                None,
+                started,
+                None,
+            );
+            ok(serde_json::json!({
+                "granted": granted,
+                "epoch": body.epoch,
+                "candidate": body.candidate,
+            }))
+        }
+        Err(message) => failure(StatusCode::BAD_REQUEST, "invalid_lease", message),
     }
 }
 
