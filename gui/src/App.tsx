@@ -4469,7 +4469,12 @@ export default function App() {
     const boot = async () => {
       let current = loadConnection();
       const defaults = await sessionDefaults();
-      if (!current.token && defaults.token) {
+      const sameOrigin =
+        current.endpoint.replace(/\/$/, '') === window.location.origin.replace(/\/$/, '');
+      // The CLI injects the active daemon token into /gui/session. When the GUI
+      // is served from the same origin, this token is authoritative and must
+      // replace a stale token cached by an earlier cluster on the same port.
+      if (defaults.token && (sameOrigin || !current.token)) {
         current = { ...current, token: defaults.token };
         saveConnection(current);
       }
