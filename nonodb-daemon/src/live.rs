@@ -47,6 +47,7 @@ impl nonodb_core::observer::ChangeObserver for LiveObserver {
         before: Option<&Value>,
         after: Option<&Value>,
     ) -> nonodb_core::Result<()> {
+        crate::writer::capture_sql_replication(collection.name(), op, id, before, after);
         collect_pending(collection, wtxn, collection.name(), op, id, before, after)
             .map_err(|err| nonodb_core::Error::Query(err.message))
     }

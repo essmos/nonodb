@@ -109,6 +109,9 @@ def main() -> int:
                 }
             )
             exec({"op": "delete", "coll": "orders", "filter": {"_id": "o2"}})
+            exec({"op": "sql", "query": "INSERT INTO orders (_id, n) VALUES ('o4', 4)"})
+            exec({"op": "sql", "query": "UPDATE orders SET n = 5 WHERE _id = 'o4'"})
+            exec({"op": "sql", "query": "DELETE FROM orders WHERE _id = 'o4'"})
 
             status = client.get("/v1/replication/status", headers=headers)
             assert status.status_code == 200, status.text
@@ -126,10 +129,15 @@ def main() -> int:
             assert all(txn["origin"] == "test-node" for txn in txns)
             ops = [change["op"] for txn in txns for change in txn["changes"]]
             assert "insert" in ops and "update" in ops and "delete" in ops, ops
+            assert any(
+                change["id"] == "o4"
+                for txn in txns
+                for change in txn["changes"]
+            ), txns
             batch = next(txn for txn in txns if len(txn["changes"]) == 2)
             assert {change["id"] for change in batch["changes"]} == {"o2", "o3"}
 
-            print("PASS  writer replication log: insert, update, batch, delete")
+            print("PASS  writer replication log: CRUD, batch, delete, SQL")
             return 0
     finally:
         if proc is not None:

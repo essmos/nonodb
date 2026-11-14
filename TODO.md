@@ -106,8 +106,9 @@ Design: [docs/replication.md](docs/replication.md).
 - [x] Add durable per-database sequence allocation to the writer transaction.
 - [x] Add `GET /v1/replication/status` with role, origin, enabled, and head.
 - [x] Add `GET /v1/replication/changes?after=...` for log inspection.
-- [x] Add `scripts/replication_test.py` for insert/update/batch/delete capture.
-- [ ] Capture SQL writes in the replication log.
+- [x] Add `scripts/replication_test.py` for CRUD, atomic batch, delete, and SQL capture.
+- [x] Capture SQL writes in the replication log by merging the core observer
+      output into the writer transaction.
 - [ ] Decide whether vault writes, index/history/config changes are replicated
       or rebuilt.
 - [x] Add a read-only GUI Replication tab showing role, origin, head, and recent

@@ -5,6 +5,7 @@
 //! them in **one** LMDB transaction and performs **one** `commit` - that is, one
 //! `fsync` per batch. The client response is sent only after the commit.
 
+use std::cell::RefCell;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -73,6 +74,39 @@ pub(crate) fn replication_origin() -> Option<String> {
 
 fn replication_enabled() -> bool {
     replication_origin().is_some()
+}
+
+thread_local! {
+    /// SQL writes reach the daemon through the core observer rather than the
+    /// writer's direct emit_event path. This buffer merges them into the same
+    /// replication transaction as the surrounding writer batch.
+    static SQL_REPLICATION_CHANGES: RefCell<Vec<ReplicationChange>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+pub(crate) fn capture_sql_replication(
+    collection: &str,
+    op: &str,
+    id: &str,
+    before: Option<&Value>,
+    after: Option<&Value>,
+) {
+    if !replication_enabled() {
+        return;
+    }
+    SQL_REPLICATION_CHANGES.with(|slot| {
+        slot.borrow_mut().push(ReplicationChange {
+            collection: collection.to_string(),
+            op: op.to_string(),
+            id: id.to_string(),
+            before: before.cloned(),
+            after: after.cloned(),
+        });
+    });
+}
+
+fn take_sql_replication_changes() -> Vec<ReplicationChange> {
+    SQL_REPLICATION_CHANGES.with(|slot| std::mem::take(&mut *slot.borrow_mut()))
 }
 fn env_micros(name: &str, default_us: u64) -> Duration {
     Duration::from_micros(
@@ -189,10 +223,12 @@ fn run_batch(store: &Store, cache: &QueryCache, jobs: Vec<WriteJob>) {
         origin: replication_origin(),
         changes: Vec::new(),
     };
+    let _ = take_sql_replication_changes();
     let mut results = Vec::with_capacity(jobs.len());
     for job in &jobs {
         results.push(execute(store, &mut wtxn, &job.req, &mut replication));
     }
+    replication.changes.extend(take_sql_replication_changes());
     if let Some(origin) = &replication.origin {
         if !replication.changes.is_empty() {
             if let Err(error) =
@@ -257,9 +293,11 @@ fn run_single(store: &Store, cache: &QueryCache, job: WriteJob) {
         origin: replication_origin(),
         changes: Vec::new(),
     };
+    let _ = take_sql_replication_changes();
     let started = Instant::now();
     match execute(store, &mut wtxn, &job.req, &mut replication) {
         Ok(value) => {
+            replication.changes.extend(take_sql_replication_changes());
             if let Some(origin) = &replication.origin {
                 if !replication.changes.is_empty() {
                     if let Err(error) =
@@ -299,6 +337,7 @@ fn run_single(store: &Store, cache: &QueryCache, job: WriteJob) {
         Err(e) => {
             // Drop `wtxn` = abort; for `WriteReq::Batch` this guarantees
             // all-or-nothing.
+            let _ = take_sql_replication_changes();
             drop(wtxn);
             live::discard_pending();
             let _ = job.resp.send(Err(e));

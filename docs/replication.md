@@ -96,9 +96,9 @@ Implemented core primitives:
 - `Store::replication_head()`
 - `Store::prune_replication_through()`
 
-The daemon writer now appends normal CRUD, atomic batch, and TTL-expiry changes
-in the same LMDB transaction as the data. SQL writes and vault writes are not yet
-captured. Set `NONODB_REPLICATION_ENABLED=1` and `NONODB_REPLICATION_ORIGIN` to
+The daemon writer now appends normal CRUD, SQL, atomic batch, and TTL-expiry
+changes in the same LMDB transaction as the data. Vault writes and some internal
+configuration changes are not yet captured. Set `NONODB_REPLICATION_ENABLED=1` and `NONODB_REPLICATION_ORIGIN` to
 enable logging.
 
 Read-only inspection endpoints:
@@ -228,7 +228,7 @@ writes without the required standby/quorum.
 - [x] Durable transaction sequence per database.
 - [x] Read-only replication status and changes endpoints.
 - [x] Writer replication integration test.
-- [ ] SQL write capture.
+- [x] SQL write capture.
 - [ ] Vault write capture.
 - [ ] Lag and sequence metrics.
 
