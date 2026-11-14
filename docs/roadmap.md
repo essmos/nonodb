@@ -79,8 +79,10 @@ Implemented:
   Use `find_and_modify`, atomic update operators (`$inc`), or `write_batch`.
 - **One writer.** All writes are serialized. This is a design choice, not a
   temporary limitation.
-- **No replication, sharding, or clustering.** One daemon owns one instance
-  root containing independent LMDB databases; there are no cross-database
+- **No network replication, sharding, or clustering yet.** The core has durable
+  replication-log primitives and a design in [Replication](replication.md), but
+  transport, replica apply, failover, and GUI management are not implemented.
+  One daemon still owns one instance root; there are no cross-database
   transactions or queries.
 
 ### Query language
@@ -285,7 +287,7 @@ project's target workload.
 ## Non-goals
 
 - MongoDB wire-protocol compatibility.
-- Distributed consensus, replication, or sharding.
+- Distributed consensus or sharding. Cross-region replication is planned separately in [Replication](replication.md).
 - A general-purpose OLAP engine.
 - Full MongoDB feature parity.
 - Running multiple writers against one LMDB environment.

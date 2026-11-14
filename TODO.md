@@ -87,6 +87,61 @@ limitations are documented in [docs/roadmap.md](docs/roadmap.md).
 - [ ] Shared sharded writer pool for much higher write concurrency (future scaling step).
 - [ ] Per-database metrics, quotas, and a per-database administrator role.
 
+## In progress — replication foundation
+
+Branch: `feature/replication`
+
+Design: [docs/replication.md](docs/replication.md).
+
+### Phase 1 — durable log and status
+
+- [x] Add core `_replication` LMDB sub-database.
+- [x] Add `ReplicationTxn`/`ReplicationChange` types with sequence, origin,
+      timestamp, before/after, and transaction grouping.
+- [x] Add `Store::append_replication_txn_in`, `replication_after`,
+      `replication_head`, and `prune_replication_through`.
+- [x] Add a core test for transaction grouping, ordering, reads, and retention.
+- [ ] Wire the daemon writer so every logical write transaction appends changes
+      in the same LMDB transaction as the data.
+- [ ] Add durable per-database sequence allocation to the writer transaction.
+- [ ] Decide whether index/TTL/history/config changes are replicated or rebuilt.
+- [ ] Add `GET /v1/replication/status` with role, node, region, source, epoch,
+      head/applied sequence, lag, and write readiness.
+- [ ] Add Prometheus replication role, head, applied, lag, and error metrics.
+
+### Phase 2 — primary → replica
+
+- [ ] Add pull transport over TLS 1.3 + mTLS.
+- [ ] Add node identity, CA paths, certificate rotation, and optional pinning.
+- [ ] Add snapshot bootstrap with recorded sequence.
+- [ ] Add replica apply path with idempotence `(origin, seq)` and epoch fencing.
+- [ ] Preserve transaction atomicity and tombstones on the replica.
+- [ ] Add resume tokens, retention, and resync after truncation.
+- [ ] Add role-aware `/readyz`.
+
+### Phase 3 — GUI and monitoring
+
+- [ ] Add role banner: primary, replica, standby, fenced, bootstrapping.
+- [ ] Add Replication tab with peer status, lag, sequence, certificate expiry,
+      last error, and pause/resume.
+- [ ] Add peer setup wizard using daemon/container certificate paths only.
+- [ ] Add promote/demote, resync, and test-connection actions with confirmations
+      and audit entries.
+- [ ] Add lag charts and replication alerts.
+- [ ] Document same-port operation and per-node GUI access.
+
+### Phase 4 — failover and policies
+
+- [ ] Add lease-based ownership and promotion.
+- [ ] Add primary epoch/fencing and old-primary rejection.
+- [ ] Add synchronous standby option.
+- [ ] Add per-collection consistency profiles.
+- [ ] Design orders policy: home-region owner + sync replica.
+- [ ] Design payments policy: leader per account/payment shard, quorum writes,
+      idempotency keys, append-only ledger, and external reconciliation.
+- [ ] Evaluate external sink adapters (PostgreSQL/Kafka/webhook) from the same
+      replication stream.
+
 ## Next
 
 ### P0 — query and update compatibility

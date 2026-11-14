@@ -13,6 +13,7 @@ use crate::collection::Collection;
 use crate::error::{Error, Result};
 use crate::events::EventConfig;
 use crate::history::{self, DEFAULT_HISTORY_MAX_VERSIONS, HISTORY_DB};
+use crate::replication::{ReplicationChange, ReplicationTxn, REPLICATION_DB, REPLICATION_SEQ_KEY};
 use crate::subscriptions::{self, Subscription};
 use crate::ttl::{self, TTL_DB};
 use crate::vault::CollectionProfile;
@@ -489,6 +490,8 @@ impl Store {
         }
         let history: Database<Bytes, Bytes> = env.create_database(&mut wtxn, Some(HISTORY_DB))?;
         let ttl: Database<Bytes, Bytes> = env.create_database(&mut wtxn, Some(TTL_DB))?;
+        let _replication: Database<Bytes, Bytes> =
+            env.create_database(&mut wtxn, Some(REPLICATION_DB))?;
         wtxn.commit()?;
         env.force_sync()?;
         Ok((history, ttl))
@@ -1459,6 +1462,112 @@ impl Store {
 
         wtxn.commit()?;
         Ok(true)
+    }
+
+    /// Appends one committed transaction to the durable replication log.
+    ///
+    /// The caller must use the same LMDB write transaction as the data writes,
+    /// so data and replication log commit atomically.
+    pub fn append_replication_txn_in(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        origin: &str,
+        changes: Vec<ReplicationChange>,
+    ) -> Result<ReplicationTxn> {
+        if changes.is_empty() {
+            return Err(Error::Query(
+                "replication transaction must contain at least one change".into(),
+            ));
+        }
+        let meta: Database<Bytes, Bytes> = self.env.create_database(&mut *wtxn, Some(META_DB))?;
+        let previous = meta
+            .get(&*wtxn, REPLICATION_SEQ_KEY)?
+            .and_then(|raw| std::str::from_utf8(raw).ok())
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .unwrap_or(0);
+        let seq = previous
+            .checked_add(1)
+            .ok_or_else(|| Error::Query("replication sequence overflow".into()))?;
+        let txn = ReplicationTxn::new(seq, origin, changes);
+        let encoded = serde_json::to_vec(&txn)?;
+        let db: Database<Bytes, Bytes> =
+            self.env.create_database(&mut *wtxn, Some(REPLICATION_DB))?;
+        db.put(&mut *wtxn, &seq.to_be_bytes(), &encoded)?;
+        meta.put(&mut *wtxn, REPLICATION_SEQ_KEY, seq.to_string().as_bytes())?;
+        Ok(txn)
+    }
+
+    /// Returns the highest allocated replication sequence, or zero.
+    pub fn replication_head(&self) -> Result<u64> {
+        let rtxn = self.read_txn()?;
+        let meta: Database<Bytes, Bytes> = self
+            .env
+            .open_database(&rtxn, Some(META_DB))?
+            .ok_or_else(|| Error::Query("meta database missing".into()))?;
+        let head = meta
+            .get(&rtxn, REPLICATION_SEQ_KEY)?
+            .and_then(|raw| std::str::from_utf8(raw).ok())
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .unwrap_or(0);
+        rtxn.commit()?;
+        Ok(head)
+    }
+
+    /// Reads replication transactions strictly after `after`, in sequence order.
+    pub fn replication_after(&self, after: u64, limit: usize) -> Result<Vec<ReplicationTxn>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let rtxn = self.read_txn()?;
+        let db: Option<Database<Bytes, Bytes>> =
+            self.env.open_database(&rtxn, Some(REPLICATION_DB))?;
+        let Some(db) = db else {
+            rtxn.commit()?;
+            return Ok(Vec::new());
+        };
+        let start = after.saturating_add(1).to_be_bytes();
+        let mut out = Vec::new();
+        for item in db.range(
+            &rtxn,
+            &(
+                std::ops::Bound::Included(start.as_slice()),
+                std::ops::Bound::Unbounded,
+            ),
+        )? {
+            let (_key, value) = item?;
+            out.push(serde_json::from_slice(value)?);
+            if out.len() >= limit {
+                break;
+            }
+        }
+        rtxn.commit()?;
+        Ok(out)
+    }
+
+    /// Deletes replication records at or below `seq`. Intended for retention
+    /// after every replica has acknowledged the sequence.
+    pub fn prune_replication_through(&self, seq: u64) -> Result<usize> {
+        let mut wtxn = self.write_txn()?;
+        let db: Option<Database<Bytes, Bytes>> =
+            self.env.open_database(&wtxn, Some(REPLICATION_DB))?;
+        let Some(db) = db else {
+            wtxn.commit()?;
+            return Ok(0);
+        };
+        let keys: Vec<Vec<u8>> = db
+            .iter(&wtxn)?
+            .filter_map(|item| {
+                let (key, _) = item.ok()?;
+                let value = u64::from_be_bytes(key.try_into().ok()?);
+                (value <= seq).then(|| key.to_vec())
+            })
+            .collect();
+        let deleted = keys.len();
+        for key in keys {
+            db.delete(&mut wtxn, key.as_slice())?;
+        }
+        wtxn.commit()?;
+        Ok(deleted)
     }
 
     /// List of registered collections.
