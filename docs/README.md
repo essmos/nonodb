@@ -32,7 +32,8 @@ quick-start instructions, and a feature overview.
 | [CLI](cli.md) | Operators | Administration, map resize, backup verification, restore drills, inspect, raw requests |
 | [Operations](operations.md) | Operators, SRE | Configuration, deployment, security, snapshots, monitoring, capacity, troubleshooting |
 | [Backup and restore](backup.md) | Operators, SRE | Online backup, GUI backup/import, snapshots, verification, restore drills, Docker, vault keys, authorization state, recovery |
-| [Replication](replication.md) | Operators, SRE, maintainers | Planned primary/replica replication, durable log, mTLS, failover, GUI, monitoring, orders/payments policies |
+| [Replication and cluster guide](replication-cluster-guide.md) | Operators, SRE | Primary/replica setup, TLS, CLI, GUI, quorum failover, monitoring, backup differences, troubleshooting |
+| [Replication design](replication.md) | Maintainers, advanced users | Ordered operation log, apply rules, epochs, snapshots, quorum design, metrics |
 | [Benchmarks](benchmarks.md) | Evaluators, maintainers | Environment, methodology, throughput, latency, memory, large-data results |
 | [Development](development.md) | Contributors | Repository layout, build, tests, scripts, conventions |
 | [Roadmap and limits](roadmap.md) | Everyone | Supported features, deliberate limitations, future work |
@@ -63,7 +64,7 @@ quick-start instructions, and a feature overview.
 - **Store money and exact decimals:** [Numbers and decimals](numerics.md)
 - **Use binary, UUID, ObjectId, or `$type`:** [BSON scalar types](bson-types.md)
 - **Back up and restore:** [Backup and restore](backup.md)
-- **Plan multi-region replication:** [Replication](replication.md)
+- **Set up replication and a cluster:** [Replication and cluster guide](replication-cluster-guide.md)
 - **Import a backup as a new database:** [Import wizard](backup.md#import-wizard)
 - **Tune timeouts for index builds:** [Timeouts](operations.md#timeouts-and-long-operations)
 - **Understand memory usage:** [Capacity and memory](operations.md#capacity-and-memory)

@@ -5,9 +5,9 @@ is deliberately out of scope, and which gaps are candidates for future work.
 
 ## Current status
 
-The project is at `0.22.0`. It is suitable for local and single-host
-applications that need a small, durable, queryable JSON store and can accept a
-single-writer model.
+The project is at `0.23.0`. It is suitable for local, single-host, and
+primary/replica deployments that need a small, durable, queryable JSON store
+and can accept a single-writer model per database.
 
 Implemented:
 
@@ -64,6 +64,10 @@ Implemented:
   `backup-info.txt`;
 - admin-only staged import from local folders or S3/R2 into a new database;
 - optional vault collections with per-tenant whole-document encryption;
+- asynchronous primary/replica replication over HTTP/TLS with durable ordered
+  operations, snapshot bootstrap, metadata/index/history/events/subscriptions,
+  replica acks, retention, quorum promotion, leases, automatic election, write
+  routing, and a cluster-wide GUI;
 - Python client, Docker image, systemd unit;
 - unit, property, integration, concurrency, crash, search, and large-data tests.
 
@@ -79,11 +83,10 @@ Implemented:
   Use `find_and_modify`, atomic update operators (`$inc`), or `write_batch`.
 - **One writer.** All writes are serialized. This is a design choice, not a
   temporary limitation.
-- **No network replication, sharding, or clustering yet.** The core has durable
-  replication-log primitives and a design in [Replication](replication.md), but
-  transport, replica apply, failover, and GUI management are not implemented.
-  One daemon still owns one instance root; there are no cross-database
-  transactions or queries.
+- **Replication is asynchronous and primary/replica, not multi-writer.** Sharding
+  and cross-database transactions are not implemented. Vault data, auth, backup
+  jobs, and database create/drop are not replicated. See the
+  [replication and cluster guide](replication-cluster-guide.md).
 
 ### Query language
 
@@ -287,7 +290,9 @@ project's target workload.
 ## Non-goals
 
 - MongoDB wire-protocol compatibility.
-- Distributed consensus or sharding. Cross-region replication is planned separately in [Replication](replication.md).
+- Distributed consensus, multi-writer clusters, or sharding. Asynchronous
+  primary/replica replication is supported; see the
+  [replication and cluster guide](replication-cluster-guide.md).
 - A general-purpose OLAP engine.
 - Full MongoDB feature parity.
 - Running multiple writers against one LMDB environment.

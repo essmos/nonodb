@@ -57,6 +57,9 @@ Use `NONODB_CLUSTER_TOKEN` when the cluster nodes require a different bearer
 token than the GUI's own `NONODB_TOKEN`. Cluster probes currently require
 `http://` URLs; use a local TLS-terminating proxy for HTTPS deployments.
 
+See the [Replication and cluster guide](replication-cluster-guide.md) for the
+full primary/replica setup, CLI, failover, and troubleshooting workflow.
+
 ## Screenshots
 
 Overview with the database selector; the example below uses `perf1` with one
@@ -389,7 +392,7 @@ docker run -d --name nonodb-gui \
   -p 127.0.0.1:8787:8787 \
   -v nonodb-run:/run/nonodb \
   -e NONODB_SOCK=/run/nonodb/nonodb.sock \
-  ghcr.io/essmos/nonodb:0.22.0 \
+  ghcr.io/essmos/nonodb:0.23.0 \
   nonodb-cli gui --host 0.0.0.0 --port 8787 --allow-remote --no-open
 ```
 

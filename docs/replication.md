@@ -1,8 +1,12 @@
 # Replication design
 
-This page describes the planned multi-region replication model. It is separate
-from [backup and restore](backup.md): backups protect against history, while
-replication keeps independent NonoDB nodes close to users.
+This page describes the replication design and wire model. For deployment,
+configuration, CLI, GUI, failover, and troubleshooting, use the
+[Replication and cluster guide](replication-cluster-guide.md).
+
+Replication is separate from [backup and restore](backup.md): backups protect
+against history, while replication keeps independent NonoDB nodes close to
+users.
 
 ## Goals
 
