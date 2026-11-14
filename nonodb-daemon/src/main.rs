@@ -861,7 +861,10 @@ async fn health() -> Json<Value> {
 /// Readiness checks the writer and a real LMDB read transaction. Liveness stays
 /// cheap and public at `/healthz`; orchestrators should use `/readyz`.
 async fn ready(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
-    let writer_ok = state._runtime.writer_alive();
+    let role = replicator::role();
+    let read_only = !replicator::writable();
+    let writer_required = !read_only;
+    let writer_ok = !writer_required || state._runtime.writer_alive();
     let store = state.store.clone();
     let storage = tokio::task::spawn_blocking(move || {
         let txn = store.read_txn().map_err(|err| err.to_string())?;
@@ -885,8 +888,13 @@ async fn ready(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
             "ok": ok,
             "checks": {
                 "writer": writer_ok,
+                "writer_required": writer_required,
                 "storage": storage_ok,
                 "storage_error": storage_error,
+            },
+            "replication": {
+                "role": role,
+                "read_only": read_only,
             }
         })),
     )

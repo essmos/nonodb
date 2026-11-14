@@ -134,6 +134,16 @@ def main() -> int:
             initial_batch = next(txn for txn in initial_txns if len(txn["changes"]) == 2)
             assert {change["id"] for change in initial_batch["changes"]} == {"o2", "o3"}
 
+            cli_status = subprocess.run(
+                [str(CLI), "replication", "status"],
+                env={**os.environ, "NONODB_SOCK": str(temp / "nonodb.sock")},
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            assert cli_status.returncode == 0, cli_status.stderr
+            assert json.loads(cli_status.stdout)["result"]["origin"] == "test-node"
+
             snapshot = client.get("/v1/replication/snapshot", headers=headers)
             assert snapshot.status_code == 200, snapshot.text
             assert len(snapshot.content) > 4096, len(snapshot.content)
@@ -271,9 +281,19 @@ def main() -> int:
                     "/v1/replication/status", headers=headers
                 ).json()["result"]
                 assert replica_status["role"] == "replica", replica_status
+                assert replica_status["read_only"] is True, replica_status
                 assert replica_status["applied"], replica_status
                 assert replica_status["applied"][0]["origin"] == "test-node", replica_status
                 assert replica_status["applied"][0]["lag"] == 0, replica_status
+                assert replica_status["replication"]["source"].startswith(
+                    "http://127.0.0.1:"
+                ), replica_status
+                assert replica_status["replication"]["bootstrap"] == "auto", replica_status
+                assert replica_status["replication"]["last_success_unix"] > 0, replica_status
+                assert replica_status["replication"]["last_apply_error"] is None, replica_status
+                ready = replica.get("/readyz").json()
+                assert ready["checks"]["writer_required"] is False, ready
+                assert ready["replication"]["role"] == "replica", ready
                 replica_metrics = replica.get(
                     "/metrics/prometheus", headers=headers
                 ).text

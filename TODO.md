@@ -128,7 +128,7 @@ Design: [docs/replication.md](docs/replication.md).
 - [x] Preserve transaction atomicity on the replica and reject client writes.
 - [ ] Add epoch fencing for source changes and promotion.
 - [ ] Add automatic resync when the source log was pruned too far.
-- [ ] Add role-aware `/readyz`.
+- [x] Add role-aware `/readyz` and replication fields to status/GUI.
 
 ### Phase 3 — GUI and monitoring
 

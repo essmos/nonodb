@@ -93,8 +93,10 @@ pub async fn status(
                 "enabled": origin.is_some(),
                 "origin": origin,
                 "role": crate::replicator::role(),
+                "read_only": !crate::replicator::writable(),
                 "head": head,
                 "applied": applied,
+                "replication": crate::replicator::status_json(),
             }))
         }
         (Err(error), _) | (_, Err(error)) => failure(

@@ -268,6 +268,8 @@ The current branch exposes a read-only replication foundation:
 - durable log capture status;
 - head sequence;
 - applied source sequences and lag on replicas;
+- transport source, bootstrap mode, poll interval, last success, and last
+  transport/apply error;
 - recent replication transactions with grouped collection/op/id changes.
 
 Network transport, peer setup, replica apply, and promote/demote are still

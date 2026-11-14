@@ -506,6 +506,26 @@ and are the recovery path.
 See [Authentication and authorization](auth.md) for the file schema, scope
 grammar, audit log, and mTLS setup.
 
+## replication
+
+Inspect the durable log and replica status for the selected database:
+
+```bash
+nonodb-cli replication status
+nonodb-cli replication changes 0 100
+```
+
+Prune a known-acked range:
+
+```bash
+nonodb-cli replication prune 1234
+```
+
+`NONODB_DB=app1` or `--db app1` selects another database. Status includes role,
+read-only mode, source URL, bootstrap mode, applied sources, lag, and the last
+transport/apply error. Pruning is an administrative retention action; do not
+prune sequences that replicas still need.
+
 ## Environment
 
 | Variable | Default | Used by |

@@ -63,6 +63,33 @@ fn run() -> Result<(), String> {
             println!("{recipient}");
             eprintln!("identity: {}", path.display());
         }
+        "replication" => {
+            let action = args.get(1).map(String::as_str).unwrap_or("status");
+            match action {
+                "status" => {
+                    let res = http_get("/v1/replication/status")?;
+                    println!("{}", serde_json::to_string_pretty(&res).unwrap());
+                }
+                "changes" => {
+                    let after = args.get(2).map(String::as_str).unwrap_or("0");
+                    let limit = args.get(3).map(String::as_str).unwrap_or("100");
+                    let res = http_get(&format!(
+                        "/v1/replication/changes?after={after}&limit={limit}"
+                    ))?;
+                    println!("{}", serde_json::to_string_pretty(&res).unwrap());
+                }
+                "prune" => {
+                    let through: u64 = args
+                        .get(2)
+                        .ok_or("usage: nonodb-cli replication prune <through>")?
+                        .parse()
+                        .map_err(|e| format!("through: {e}"))?;
+                    let res = http_post("/v1/replication/prune", &json!({ "through": through }))?;
+                    print_result(&res);
+                }
+                other => return Err(format!("unknown replication action: {other}")),
+            }
+        }
         "databases" => {
             let action = args.get(1).map(String::as_str).unwrap_or("list");
             let payload = match action {
@@ -398,6 +425,7 @@ fn usage() -> Result<(), String> {
          ping                       sprawdź daemona\n\
          exec '<json>'              dowolne żądanie /v1/exec\n\
          databases [list|create <nazwa>|drop <nazwa>]  bazy w jednym daemonie\n\
+         replication [status|changes [after] [limit]|prune <seq>]  replikacja\n\
          collections                lista kolekcji\n\
          count <coll> [filtr]       liczba dokumentów\n\
          find <coll> [filtr] [--sort pole:asc|desc] [--limit N] [--skip N]\n\

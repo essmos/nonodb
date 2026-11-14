@@ -5,7 +5,11 @@
 //! transactions and applies them atomically. Writes are rejected while the
 //! node role is not `primary`.
 
-use std::{fs, sync::Arc, time::Duration};
+use std::{
+    fs,
+    sync::{Arc, Mutex, OnceLock},
+    time::Duration,
+};
 
 use futures_util::StreamExt;
 use nonodb_core::{replication::ReplicationTxn, Store};
@@ -121,6 +125,76 @@ impl Config {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+struct RuntimeStatus {
+    source: Option<String>,
+    databases: Vec<String>,
+    interval_secs: u64,
+    bootstrap: String,
+    last_success_unix: u64,
+    last_error_unix: u64,
+    last_transport_error: Option<String>,
+    last_apply_error: Option<String>,
+}
+
+fn runtime_status() -> &'static Mutex<RuntimeStatus> {
+    static STATUS: OnceLock<Mutex<RuntimeStatus>> = OnceLock::new();
+    STATUS.get_or_init(|| Mutex::new(RuntimeStatus::default()))
+}
+
+fn record_config(config: &Config) {
+    let mut status = runtime_status()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    status.source = Some(config.source.clone());
+    status.databases = config.databases.clone();
+    status.interval_secs = config.interval.as_secs();
+    status.bootstrap = config.bootstrap.clone();
+}
+
+fn record_success() {
+    let mut status = runtime_status()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    status.last_success_unix = unix_now();
+}
+
+fn record_transport_error(message: &str) {
+    let mut status = runtime_status()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    status.last_error_unix = unix_now();
+    status.last_transport_error = Some(message.chars().take(500).collect());
+}
+
+fn record_apply_error(message: &str) {
+    let mut status = runtime_status()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    status.last_error_unix = unix_now();
+    status.last_apply_error = Some(message.chars().take(500).collect());
+}
+
+/// Returns the current replication runtime view for the admin status API/GUI.
+pub fn status_json() -> Value {
+    let status = runtime_status()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    serde_json::json!({
+        "role": role(),
+        "read_only": !writable(),
+        "source": status.source,
+        "databases": status.databases,
+        "interval_secs": status.interval_secs,
+        "bootstrap": status.bootstrap,
+        "last_success_unix": status.last_success_unix,
+        "last_error_unix": status.last_error_unix,
+        "last_transport_error": status.last_transport_error,
+        "last_apply_error": status.last_apply_error,
+    })
+}
+
 fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -158,6 +232,7 @@ pub async fn bootstrap_startup(data_root: &std::path::Path) -> Result<(), String
     if config.bootstrap == "never" {
         return Ok(());
     }
+    record_config(&config);
     let client = config.client()?;
     for database in &config.databases {
         if config.bootstrap == "auto" && !bootstrap_fresh(data_root, database).await? {
@@ -181,6 +256,7 @@ pub async fn bootstrap_startup(data_root: &std::path::Path) -> Result<(), String
         }
         match bootstrap_database(&client, &config, data_root, database, &origin).await {
             Ok(head) => {
+                record_success();
                 tracing::info!(database, origin, head, "replication snapshot installed");
             }
             Err(error) => {
@@ -353,6 +429,7 @@ pub fn start(databases: Arc<Databases>, shutdown: watch::Receiver<bool>) -> Resu
     let Some(config) = Config::from_env()? else {
         return Ok(());
     };
+    record_config(&config);
     let client = config.client()?;
     tracing::info!(
         role = %role(),
@@ -453,16 +530,16 @@ async fn pull_database(
                 }
                 Err(error) => {
                     metrics::inc(&metrics::REPLICATION_APPLY_ERRORS);
-                    return Err(format!(
-                        "apply replication transaction {}: {error}",
-                        txn.seq
-                    ));
+                    let message = format!("apply replication transaction {}: {error}", txn.seq);
+                    record_apply_error(&message);
+                    return Err(message);
                 }
             }
         }
         if applied_any {
             runtime.cache.invalidate();
             metrics::set(&metrics::REPLICATION_LAST_SUCCESS_UNIX, unix_now());
+            record_success();
         }
         if batch.len() < config.limit {
             return Ok(());
@@ -503,16 +580,22 @@ async fn get_json(
     }
     let response = request.send().await.map_err(|error| {
         metrics::inc(&metrics::REPLICATION_TRANSPORT_ERRORS);
-        format!("request {path}: {error}")
+        let message = format!("request {path}: {error}");
+        record_transport_error(&message);
+        message
     })?;
     let status = response.status();
     let body = response.text().await.map_err(|error| {
         metrics::inc(&metrics::REPLICATION_TRANSPORT_ERRORS);
-        format!("read {path} response: {error}")
+        let message = format!("read {path} response: {error}");
+        record_transport_error(&message);
+        message
     })?;
     let payload: Value = serde_json::from_str(&body).map_err(|error| {
         metrics::inc(&metrics::REPLICATION_TRANSPORT_ERRORS);
-        format!("decode {path} response: {error}")
+        let message = format!("decode {path} response: {error}");
+        record_transport_error(&message);
+        message
     })?;
     if !status.is_success() || payload.get("ok").and_then(Value::as_bool) == Some(false) {
         metrics::inc(&metrics::REPLICATION_TRANSPORT_ERRORS);

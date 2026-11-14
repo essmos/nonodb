@@ -118,6 +118,7 @@ def main() -> int:
                 b"/v1/import/browse",
                 b"Recent replication transactions",
                 b"Applied sources",
+                b"Transport health",
                 b"Log capture",
                 b"Excluded collections",
                 b"Generate key",

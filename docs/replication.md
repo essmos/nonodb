@@ -235,7 +235,9 @@ client certificate. `NONODB_REPLICATION_CA_FILE`,
 Apply is atomic per source transaction and idempotent for `(origin, seq)`.
 Replicas record the source head and expose `applied`/`lag` in status and
 Prometheus. A gap returns an error instead of skipping transactions. Apply
-invalidates the replica query cache, and transport/apply failures are counted.
+invalidates the replica query cache, and transport/apply failures are counted
+and exposed through status/GUI. `/readyz` reports the role and does not require
+the writer on a read-only replica.
 
 Before the daemon opens its runtime, a fresh replica can install a consistent
 source snapshot:
@@ -284,8 +286,10 @@ implemented yet, so this is not yet a production failover mechanism.
 
 ### Phase 3 — operations and GUI
 
-- [x] Read-only Replication tab with role, origin, head, and recent log entries.
-- [ ] Peer wizard, full role banner, and write-control gating.
+- [x] Replication tab with role, source, bootstrap, applied/lag, transport
+      health, and recent log entries.
+- [x] Role-aware `/readyz` and `nonodb-cli replication` status/changes/prune.
+- [ ] Peer wizard and full role banner.
 - [ ] Add peer, test connection, pause/resume, resync.
 - [ ] Promote/demote with confirmation and audit.
 - [ ] Certificate expiry and lag dashboards.

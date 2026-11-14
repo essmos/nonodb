@@ -1571,6 +1571,21 @@ function ReplicationPage({ connection }: { connection: Connection }) {
           </p>
         )}
       </section>
+      {status?.replication && (
+        <section className="panel">
+          <div className="panel-title"><h3>Transport health</h3></div>
+          <div className="stat-grid">
+            <div className="stat"><span>Source</span><strong className="mono">{status.replication.source ?? '—'}</strong></div>
+            <div className="stat"><span>Bootstrap</span><strong>{status.replication.bootstrap ?? '—'}</strong></div>
+            <div className="stat"><span>Poll interval</span><strong>{status.replication.interval_secs ?? 0}s</strong></div>
+            <div className="stat"><span>Mode</span><strong>{status.read_only ? 'read-only' : 'writable'}</strong></div>
+            <div className="stat"><span>Last success</span><strong>{status.replication.last_success_unix ? new Date(status.replication.last_success_unix * 1000).toLocaleString() : '—'}</strong></div>
+            <div className="stat"><span>Databases</span><strong className="mono">{(status.replication.databases ?? []).join(', ') || '—'}</strong></div>
+          </div>
+          {status.replication.last_transport_error && <div className="error-box">transport: {status.replication.last_transport_error}</div>}
+          {status.replication.last_apply_error && <div className="error-box">apply: {status.replication.last_apply_error}</div>}
+        </section>
+      )}
       {status?.applied && status.applied.length > 0 && (
         <section className="panel">
           <div className="panel-title"><h3>Applied sources</h3><span>{status.applied.length}</span></div>
