@@ -55,7 +55,7 @@ pub fn start(data_root: std::path::PathBuf, shutdown: watch::Receiver<bool>) -> 
                 break;
             }
             if replicator::writable() {
-                let epoch = replicator::epoch().max(1);
+                let epoch = replicator::epoch();
                 let majority = config.voters.len() / 2 + 1;
                 let mut granted = 0usize;
                 if config.voters.iter().any(|voter| voter == &config.advertise)

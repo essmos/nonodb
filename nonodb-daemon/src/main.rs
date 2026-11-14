@@ -16,6 +16,7 @@ mod backups_api;
 mod cache;
 mod cursor;
 mod databases;
+mod election;
 mod imports;
 mod imports_api;
 mod lease;
@@ -235,6 +236,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     retention::start(databases.clone(), shutdown_rx.clone())
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
     lease::start(data.clone(), shutdown_rx.clone())
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    election::start(data.clone(), shutdown_rx.clone())
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
     let state = AppState {

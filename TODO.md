@@ -130,7 +130,8 @@ Design: [docs/replication.md](docs/replication.md).
 - [x] Carry the epoch in replication transactions and reject stale epochs.
 - [x] Require a voter majority before promotion.
 - [x] Add primary quorum leases and self-demotion on lease loss.
-- [ ] Add automatic candidate election after lease expiry.
+- [x] Add automatic candidate election after the source failure timeout.
+- [ ] Propagate the elected primary to every non-voting replica.
 - [x] Add automatic snapshot resync at startup when the source log was pruned.
 - [ ] Add hot resync without restarting the replica.
 - [x] Add role-aware `/readyz` and replication fields to status/GUI.

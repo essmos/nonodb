@@ -342,7 +342,23 @@ A primary with voters configured renews a lease every
 `replication-lease.json`. If the primary cannot reach a majority for
 `NONODB_REPLICATION_LEASE_TTL` seconds, it self-demotes to `replica` and stops
 accepting writes. This fences an old primary that is partitioned from the
-quorum. It does not automatically choose or promote a successor.
+quorum.
+
+Automatic election is opt-in on selected replicas:
+
+```env
+NONODB_REPLICATION_AUTO_FAILOVER=1
+NONODB_REPLICATION_CANDIDATE=1
+NONODB_REPLICATION_ELECTION_INTERVAL=5
+NONODB_REPLICATION_FAILOVER_TIMEOUT=30
+NONODB_REPLICATION_ADVERTISE_URL=https://eu-2:7878
+```
+
+After the source has been unavailable for the timeout, a candidate calls the
+same quorum/fence promotion path. Voters reject a second candidate at the same
+epoch, so only one candidate can obtain a majority. Set the candidate flag only
+on replicas that should be allowed to lead. Other replicas still need source
+discovery or a successor update to follow the new primary automatically.
 
 When `NONODB_REPLICATION_ADVERTISE_URL` is set, promotion then asks the current
 source to demote itself with this node as `successor`. The promotion is aborted

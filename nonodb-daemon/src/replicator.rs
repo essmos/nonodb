@@ -261,9 +261,6 @@ fn load_vote(data_root: &std::path::Path) -> Result<PersistedVote, String> {
 }
 
 pub fn cast_vote(data_root: &std::path::Path, epoch: u64, candidate: &str) -> Result<bool, String> {
-    if epoch == 0 {
-        return Err("vote epoch must be positive".into());
-    }
     if !candidate.starts_with("http://") && !candidate.starts_with("https://") {
         return Err("candidate must start with http:// or https://".into());
     }
@@ -462,6 +459,32 @@ fn change_role(
     cell.epoch = epoch;
     cell.successor = successor;
     Ok(role_view(&cell))
+}
+
+#[derive(Debug, Clone)]
+pub struct SourceHealth {
+    pub role: String,
+    pub successor: Option<String>,
+}
+
+/// Reads the configured source status for the auto-election worker.
+pub async fn source_health(data_root: &std::path::Path) -> Result<Option<SourceHealth>, String> {
+    let Some(config) = Config::load(data_root)? else {
+        return Ok(None);
+    };
+    let client = config.client()?;
+    let status = get_json(&client, &config, DEFAULT_DATABASE, "status", &[]).await?;
+    Ok(Some(SourceHealth {
+        role: status
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string(),
+        successor: status
+            .get("successor")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    }))
 }
 
 async fn acquire_quorum(

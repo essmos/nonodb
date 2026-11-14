@@ -98,6 +98,10 @@ secrets.
 | `NONODB_REPLICATION_VOTER_TOKEN` | unset | Bearer token used to call voter endpoints |
 | `NONODB_REPLICATION_LEASE_INTERVAL` | `5` | Seconds between primary quorum-lease renewals |
 | `NONODB_REPLICATION_LEASE_TTL` | `15` | Seconds without a majority before the primary self-demotes |
+| `NONODB_REPLICATION_AUTO_FAILOVER` | `0` | Enable automatic candidate election |
+| `NONODB_REPLICATION_CANDIDATE` | `0` | Mark this replica as an election candidate |
+| `NONODB_REPLICATION_ELECTION_INTERVAL` | `5` | Election polling interval in seconds |
+| `NONODB_REPLICATION_FAILOVER_TIMEOUT` | `30` | Source failure duration before a candidate starts an election |
 | `NONODB_REPLICATION_SOURCE` | unset | Source base URL for replica/standby pull |
 | `NONODB_REPLICATION_SOURCE_TOKEN` | unset | Bearer token used to read the source replication API |
 | `NONODB_REPLICATION_DATABASES` | `default` | Comma-separated databases to pull |
