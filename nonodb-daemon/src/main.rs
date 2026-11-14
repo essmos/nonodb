@@ -1044,9 +1044,9 @@ async fn prometheus_handler(
                 }
             }
             if let Some(origin) = &origin {
-                if let Ok(replica_acks) = runtime.store.replica_acks(origin) {
-                    for (node, seq) in replica_acks {
-                        acks.push((name.clone(), origin.clone(), node, seq));
+                if let Ok(replica_acks) = runtime.store.replica_ack_details(origin) {
+                    for (node, seq, at_ms) in replica_acks {
+                        acks.push((name.clone(), origin.clone(), node, seq, at_ms));
                     }
                 }
             }

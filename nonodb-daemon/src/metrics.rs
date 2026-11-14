@@ -561,7 +561,7 @@ pub fn append_replication_metrics(
     epoch: u64,
     heads: &[(String, u64)],
     applied: &[(String, String, u64, u64, u64)],
-    acks: &[(String, String, String, u64)],
+    acks: &[(String, String, String, u64, u64)],
 ) {
     prom_header(
         out,
@@ -673,7 +673,7 @@ pub fn append_replication_metrics(
     );
     let mut groups: std::collections::BTreeMap<(String, String), Vec<u64>> =
         std::collections::BTreeMap::new();
-    for (database, origin, _node, seq) in acks {
+    for (database, origin, _node, seq, _at_ms) in acks {
         groups
             .entry((database.clone(), origin.clone()))
             .or_default()
@@ -700,12 +700,30 @@ pub fn append_replication_metrics(
         "gauge",
         "Applied sequence acknowledged by each replica.",
     );
-    for (database, origin, node, seq) in acks {
+    for (database, origin, node, seq, _at_ms) in acks {
         prom_sample(
             out,
             "nonodb_replication_ack_seq",
             &[("database", database), ("origin", origin), ("node", node)],
             &json!(seq),
+        );
+    }
+    prom_header(
+        out,
+        "nonodb_replication_ack_age_seconds",
+        "gauge",
+        "Age of the last acknowledgement from each replica.",
+    );
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0);
+    for (database, origin, node, _seq, at_ms) in acks {
+        prom_sample(
+            out,
+            "nonodb_replication_ack_age_seconds",
+            &[("database", database), ("origin", origin), ("node", node)],
+            &json!(now_ms.saturating_sub(*at_ms) as f64 / 1000.0),
         );
     }
 }

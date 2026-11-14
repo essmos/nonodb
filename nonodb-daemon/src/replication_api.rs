@@ -546,9 +546,13 @@ pub async fn acks(
             "replication origin is not configured",
         );
     }
-    match (store.replica_acks(&origin), store.replication_head()) {
+    match (store.replica_ack_details(&origin), store.replication_head()) {
         (Ok(acks), Ok(head)) => {
-            let min = acks.iter().map(|(_, seq)| *seq).min().unwrap_or(0);
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_millis() as u64)
+                .unwrap_or(0);
+            let min = acks.iter().map(|(_, seq, _)| *seq).min().unwrap_or(0);
             audit_control(
                 &state,
                 &connection,
@@ -566,7 +570,12 @@ pub async fn acks(
                 "min_ack": min,
                 "acks": acks
                     .into_iter()
-                    .map(|(node, seq)| serde_json::json!({ "node": node, "seq": seq }))
+                    .map(|(node, seq, at_ms)| serde_json::json!({
+                        "node": node,
+                        "seq": seq,
+                        "at_ms": at_ms,
+                        "age_seconds": now_ms.saturating_sub(at_ms) as f64 / 1000.0,
+                    }))
                     .collect::<Vec<_>>(),
             }))
         }

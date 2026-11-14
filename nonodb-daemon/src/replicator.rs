@@ -849,6 +849,9 @@ async fn pull_database(
             .set_replication_source_head(&origin, status_head)
             .map_err(|error| error.to_string())?;
         if applied >= status_head {
+            if let Err(error) = send_ack(client, config, database, &origin, applied).await {
+                tracing::warn!(database, error = %error, "replication idle ack failed");
+            }
             return Ok(());
         }
         let changes = get_json(

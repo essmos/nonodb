@@ -2463,7 +2463,7 @@ Transport, replica apply, promotion, and GUI management are still planned.
 | `GET` | `/{database}/v1/replication/snapshot` | Snapshot for a selected database |
 | `POST` | `/{database}/v1/replication/prune` | Prune a selected database |
 | `POST` | `/v1/replication/ack` | Record a replica applied-sequence acknowledgement |
-| `GET` | `/v1/replication/acks` | List replica acknowledgements and the minimum safe sequence |
+| `GET` | `/v1/replication/acks` | List replica acknowledgements, ages, and the minimum safe sequence |
 | `POST` | `/v1/replication/promote` | Manually promote to primary using `expected_epoch` |
 | `POST` | `/v1/replication/demote` | Manually demote with `expected_epoch` and optional `role` |
 | `PUT` | `/v1/replication/source` | Persist a new pull source and reload the loop |

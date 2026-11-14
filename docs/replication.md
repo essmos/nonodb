@@ -261,7 +261,8 @@ POST /v1/replication/prune
 ```
 
 The effective prune point is capped at the minimum acknowledged replica
-sequence. If no replica has acknowledged the source, the request fails with
+sequence. Replicas refresh their acknowledgement while idle, so
+`ack_age_seconds` reflects liveness rather than just write activity. If no replica has acknowledged the source, the request fails with
 `no_replica_acks`. Set `NONODB_REPLICATION_NODE_ID` on every replica so acks are
 distinguishable.
 

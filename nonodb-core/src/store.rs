@@ -1596,6 +1596,11 @@ impl Store {
             return Err(Error::Query("replication ack origin/node is empty".into()));
         }
         let key = format!("replication:ack:{origin}:{node}");
+        let at_key = format!("replication:ack_at:{origin}:{node}");
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as u64)
+            .unwrap_or(0);
         let mut wtxn = self.write_txn()?;
         let meta: Database<Bytes, Bytes> = self.env.create_database(&mut wtxn, Some(META_DB))?;
         let current = meta
@@ -1606,6 +1611,7 @@ impl Store {
         if seq > current {
             meta.put(&mut wtxn, key.as_bytes(), seq.to_string().as_bytes())?;
         }
+        meta.put(&mut wtxn, at_key.as_bytes(), now_ms.to_string().as_bytes())?;
         wtxn.commit()?;
         Ok(())
     }
@@ -1632,6 +1638,52 @@ impl Store {
                 .and_then(|raw| raw.parse::<u64>().ok())
                 .unwrap_or(0);
             out.push((node.to_string(), seq));
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        rtxn.commit()?;
+        Ok(out)
+    }
+
+    /// Returns `(node, acked sequence, ack timestamp ms)` for all replicas.
+    pub fn replica_ack_details(&self, origin: &str) -> Result<Vec<(String, u64, u64)>> {
+        let prefix = format!("replication:ack:{origin}:");
+        let at_prefix = format!("replication:ack_at:{origin}:");
+        let rtxn = self.read_txn()?;
+        let meta: Database<Bytes, Bytes> = self
+            .env
+            .open_database(&rtxn, Some(META_DB))?
+            .ok_or_else(|| Error::Query("meta database missing".into()))?;
+        let mut times = std::collections::HashMap::new();
+        for item in meta.iter(&rtxn)? {
+            let (key, value) = item?;
+            let Some(node) = key.strip_prefix(at_prefix.as_bytes()) else {
+                continue;
+            };
+            let Ok(node) = std::str::from_utf8(node) else {
+                continue;
+            };
+            times.insert(
+                node.to_string(),
+                std::str::from_utf8(value)
+                    .ok()
+                    .and_then(|raw| raw.parse::<u64>().ok())
+                    .unwrap_or(0),
+            );
+        }
+        let mut out = Vec::new();
+        for item in meta.iter(&rtxn)? {
+            let (key, value) = item?;
+            let Some(node) = key.strip_prefix(prefix.as_bytes()) else {
+                continue;
+            };
+            let Ok(node) = std::str::from_utf8(node) else {
+                continue;
+            };
+            let seq = std::str::from_utf8(value)
+                .ok()
+                .and_then(|raw| raw.parse::<u64>().ok())
+                .unwrap_or(0);
+            out.push((node.to_string(), seq, times.get(node).copied().unwrap_or(0)));
         }
         out.sort_by(|a, b| a.0.cmp(&b.0));
         rtxn.commit()?;

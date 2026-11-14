@@ -126,3 +126,12 @@ groups:
         annotations:
           summary: NonoDB replication apply failures
           description: A replica failed to apply a replication transaction. Check logs and status for the failing sequence.
+
+      - alert: NonoDBReplicationAckStale
+        expr: nonodb_replication_ack_age_seconds > 300
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: NonoDB replica acknowledgement is stale
+          description: Replica {{ $labels.node }} has not acknowledged {{ $labels.database }}/{{ $labels.origin }} for more than five minutes.

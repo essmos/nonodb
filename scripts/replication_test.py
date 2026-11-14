@@ -433,6 +433,7 @@ def main() -> int:
                 assert 'nonodb_replication_lag{database="default",origin="test-node"} 0' in replica_metrics, replica_metrics[-1000:]
                 assert 'nonodb_replication_applied_epoch{database="default",origin="test-node"} 2' in replica_metrics, replica_metrics[-1000:]
                 assert "nonodb_replication_epoch 2" in replica_metrics, replica_metrics[-1000:]
+                assert "nonodb_replication_ack_age_seconds" in replica_metrics, replica_metrics[-1000:]
                 applied_total = re.search(
                     r"nonodb_replication_applied_total (\d+)", replica_metrics
                 )
