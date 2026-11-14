@@ -1806,3 +1806,49 @@ select {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
+
+
+.test-progress {
+  display: grid;
+  gap: 0.7rem;
+  border-color: #1f6feb55;
+}
+
+.test-progress-live {
+  box-shadow: 0 0 0 1px #1f6feb44, 0 0 24px #1f6feb14;
+}
+
+.test-progress-line,
+.test-progress-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.8rem;
+  flex-wrap: wrap;
+}
+
+.test-progress-line strong {
+  text-transform: capitalize;
+}
+
+.test-progress-meta {
+  color: var(--muted);
+  font-size: 0.78rem;
+  justify-content: flex-start;
+  gap: 1.2rem;
+}
+
+.progress-track {
+  height: 10px;
+  border-radius: 999px;
+  background: #0d1117;
+  border: 1px solid var(--border);
+  overflow: hidden;
+}
+
+.progress-track span {
+  display: block;
+  height: 100%;
+  background: linear-gradient(90deg, #1f6feb, #58a6ff);
+  transition: width 0.3s ease;
+}

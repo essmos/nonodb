@@ -610,6 +610,36 @@ export type ClusterStatus = {
   message?: string;
 };
 
+export type TestProgress = {
+  active: boolean;
+  phase: string;
+  message?: string;
+  loaded?: number;
+  total?: number;
+  docs_per_second?: number;
+  elapsed_seconds?: number;
+  nodes_online?: number;
+  new_primary?: string;
+  epoch?: number;
+  written?: number;
+  result_file?: string;
+  started_at_ms?: number;
+  updated_at_ms?: number;
+};
+
+export async function testProgress(connection: Connection): Promise<TestProgress | null> {
+  try {
+    const response = await fetch(endpointFor(connection, '/gui/test/progress'), {
+      headers: headers(connection),
+    });
+    if (!response.ok) return null;
+    const payload: any = await response.json();
+    return (payload?.progress ?? null) as TestProgress | null;
+  } catch {
+    return null;
+  }
+}
+
 export async function clusterStatus(connection: Connection): Promise<ClusterStatus> {
   const response = await fetch(endpointFor(connection, '/gui/cluster/status'), {
     headers: headers(connection),

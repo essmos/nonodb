@@ -9,6 +9,7 @@ import {
   authSummary,
   backupsList,
   clusterStatus,
+  testProgress,
   browseImports,
   clearConnection,
   collectionMetrics as fetchCollectionMetrics,
@@ -45,6 +46,7 @@ import {
   type BackupJob,
   type BackupsView,
   type ClusterStatus,
+  type TestProgress,
   type ConnectionProfile,
   type DiscoveredImport,
   type ImportSource,
@@ -1537,12 +1539,18 @@ function RepStat({
 
 function ClusterPage({ connection }: { connection: Connection }) {
   const [cluster, setCluster] = useState<ClusterStatus | null>(null);
+  const [progress, setProgress] = useState<TestProgress | null>(null);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      setCluster(await clusterStatus(connection));
+      const [nextCluster, nextProgress] = await Promise.all([
+        clusterStatus(connection),
+        testProgress(connection),
+      ]);
+      setCluster(nextCluster);
+      setProgress(nextProgress);
       setError('');
     } catch (err) {
       setError(errorText(err));
@@ -1568,6 +1576,14 @@ function ClusterPage({ connection }: { connection: Connection }) {
   const staleAcks = online.flatMap((node) => node.status?.acks ?? []).filter((ack) => ack.age_seconds > 60);
   const metric = (node: ClusterStatus['nodes'][number], key: string): number =>
     Number(node.metrics?.[key] ?? 0);
+  const progressPercent =
+    progress?.total && progress.total > 0
+      ? Math.min(100, Math.round(((progress.loaded ?? 0) / progress.total) * 100))
+      : 0;
+  const progressAge = progress?.updated_at_ms
+    ? Math.max(0, (Date.now() - progress.updated_at_ms) / 1000)
+    : null;
+  const progressStale = progressAge !== null && progressAge > 15;
 
   return (
     <div className="page">
@@ -1586,6 +1602,52 @@ function ClusterPage({ connection }: { connection: Connection }) {
       </header>
       {error && <div className="error-box">{error}</div>}
       {cluster?.message && <div className="panel"><p className="muted">{cluster.message}</p></div>}
+      {progress && (
+        <section className={`panel test-progress ${progress.active ? 'test-progress-live' : ''}`}>
+          <div className="panel-title">
+            <div>
+              <h3>Live load test</h3>
+              <span className="muted small">
+                {progress.active
+                  ? progressStale
+                    ? `progress is ${progressAge?.toFixed(0)}s old — the test may be in a long phase`
+                    : 'updating from the running benchmark'
+                  : 'last benchmark finished'}
+              </span>
+            </div>
+            <span className={`badge ${progress.active ? '' : 'danger-badge'}`}>
+              {progress.active ? progress.phase : 'complete'}
+            </span>
+          </div>
+          <div className="test-progress-line">
+            <strong>{progress.message ?? progress.phase.replaceAll('_', ' ')}</strong>
+            {progress.elapsed_seconds !== undefined && (
+              <span className="muted small">{progress.elapsed_seconds.toFixed(1)}s elapsed</span>
+            )}
+          </div>
+          {progress.total !== undefined && (
+            <>
+              <div className="progress-track" title="Documents loaded during this benchmark.">
+                <span style={{ width: `${progressPercent}%` }} />
+              </div>
+              <div className="test-progress-meta">
+                <span>{(progress.loaded ?? 0).toLocaleString()} / {progress.total.toLocaleString()} docs</span>
+                <span>{progressPercent}%</span>
+                {progress.docs_per_second !== undefined && (
+                  <span>{progress.docs_per_second.toLocaleString()} docs/s</span>
+                )}
+                {progress.nodes_online !== undefined && <span>{progress.nodes_online} nodes online</span>}
+              </div>
+            </>
+          )}
+          <div className="test-progress-meta">
+            {progress.written !== undefined && <span>{progress.written.toLocaleString()} writes</span>}
+            {progress.new_primary && <span>primary: {progress.new_primary}</span>}
+            {progress.epoch !== undefined && <span>epoch {progress.epoch}</span>}
+            {progress.result_file && <span className="mono small">{progress.result_file}</span>}
+          </div>
+        </section>
+      )}
       <div className="stat-grid">
         <RepStat label="Nodes" value={nodes.length} help="Configured nodes in the cluster view." />
         <RepStat label="Online" value={online.length} help="Nodes that answered the last probe." />
@@ -1602,6 +1664,10 @@ function ClusterPage({ connection }: { connection: Connection }) {
           const applied = status?.applied ?? [];
           const lag = Math.max(0, ...applied.map((item) => item.lag ?? 0));
           const acks = status?.acks ?? [];
+          const nodeError =
+            status?.role === 'primary'
+              ? { transport: null, apply: null }
+              : activeReplicationError(status?.replication);
           return (
             <section key={`${node.name}:${node.url}`} className={`panel cluster-card ${node.ok ? '' : 'cluster-down'}`}>
               <div className="panel-title">
@@ -1623,11 +1689,18 @@ function ClusterPage({ connection }: { connection: Connection }) {
                     <RepStat label="Lag" value={lag.toLocaleString()} help="Transactions this node still has to apply from its source." danger={lag > 0} />
                     <RepStat label="Acks" value={acks.length} help="Replicas that have acknowledged this node as their source." />
                     <RepStat label="Applied" value={metric(node, 'replication_applied_total').toLocaleString()} help="Replication transactions applied since the daemon started." />
-                    <RepStat label="Transport errors" value={metric(node, 'replication_transport_errors_total').toLocaleString()} help="Cumulative source connection or HTTP errors." danger={metric(node, 'replication_transport_errors_total') > 0} />
+                    <RepStat label="Transport errors (total)" value={metric(node, 'replication_transport_errors_total').toLocaleString()} help="Cumulative source connection or HTTP errors since startup; historical failover errors can remain." />
                     <RepStat label="Write ops" value={metric(node, 'write_ops_total').toLocaleString()} help="Documents written locally since startup." />
                     <RepStat label="Avg commit" value={`${metric(node, 'avg_commit_us').toFixed(1)} µs`} help="Average LMDB commit time for local writes." />
                   </div>
-                  <div className="cluster-detail"><span>Source</span><strong className="mono">{status?.replication?.source ?? '—'}</strong></div>
+                  <div className="cluster-detail">
+                    <span>Source</span>
+                    <strong className="mono">
+                      {status?.role === 'primary'
+                        ? 'not used while primary'
+                        : status?.replication?.source ?? '—'}
+                    </strong>
+                  </div>
                   <div className="cluster-detail"><span>Write URL</span><strong className="mono">{status?.write_url ?? '—'}</strong></div>
                   <div className="cluster-detail"><span>Mode</span><strong>{status?.read_only ? 'read-only' : 'writable'} · interval {status?.replication?.interval_secs ?? 0}s · {status?.replication?.bootstrap || 'no bootstrap'}</strong></div>
                   <div className="cluster-detail"><span>Databases</span><strong className="mono">{(status?.replication?.databases ?? []).join(', ') || '—'}</strong></div>
@@ -1635,12 +1708,8 @@ function ClusterPage({ connection }: { connection: Connection }) {
                   <div className="cluster-detail"><span>Reads</span><strong>{metric(node, 'read_ops_total').toLocaleString()}</strong></div>
                   <div className="cluster-detail"><span>Errors</span><strong>{metric(node, 'errors_total').toLocaleString()}</strong></div>
                   <div className="cluster-detail"><span>Disk used</span><strong>{(Number(node.metrics?.disk?.data?.used_ratio ?? 0) * 100).toFixed(1)}%</strong></div>
-                  {activeReplicationError(status?.replication).transport && (
-                    <div className="error-box">transport: {activeReplicationError(status?.replication).transport}</div>
-                  )}
-                  {activeReplicationError(status?.replication).apply && (
-                    <div className="error-box">apply: {activeReplicationError(status?.replication).apply}</div>
-                  )}
+                  {nodeError.transport && <div className="error-box">transport: {nodeError.transport}</div>}
+                  {nodeError.apply && <div className="error-box">apply: {nodeError.apply}</div>}
                 </>
               )}
             </section>
@@ -1747,7 +1816,10 @@ function ReplicationPage({ connection }: { connection: Connection }) {
     }
   };
 
-  const replicationError = activeReplicationError(status?.replication);
+  const replicationError =
+    status?.role === 'primary'
+      ? { transport: null, apply: null }
+      : activeReplicationError(status?.replication);
 
   return (
     <div className="page">
@@ -1806,7 +1878,17 @@ function ReplicationPage({ connection }: { connection: Connection }) {
       </section>
       {status?.replication && (
         <section className="panel">
-          <div className="panel-title"><h3>Transport health</h3></div>
+          <div className="panel-title">
+            <h3>Transport health</h3>
+            {status.role === 'primary' && <span>not used while primary</span>}
+          </div>
+          {status.role === 'primary' ? (
+            <p className="field-hint">
+              This node is the primary and accepts client writes, so it does not pull
+              from a source. Source settings below are kept for if this node is demoted.
+            </p>
+          ) : (
+            <>
           <div className="stat-grid">
             <RepStat label="Source" value={<span className="mono">{status.replication.source ?? '—'}</span>} help="Primary URL this node pulls replication changes from." />
             <RepStat label="Bootstrap" value={status.replication.bootstrap ?? '—'} help="Snapshot policy: auto copies a snapshot when needed, always forces it, never pulls only the log." />
@@ -1820,6 +1902,8 @@ function ReplicationPage({ connection }: { connection: Connection }) {
           )}
           {replicationError.apply && (
             <div className="error-box">apply: {replicationError.apply}</div>
+          )}
+            </>
           )}
           <div className="panel-title"><h3>Source settings</h3></div>
           <p className="field-hint">

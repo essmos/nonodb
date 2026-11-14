@@ -96,6 +96,7 @@ def main() -> int:
     parser.add_argument("--min-available-mb", type=int, default=1200)
     parser.add_argument("--max-node-rss-mb", type=int, default=2500)
     parser.add_argument("--max-total-rss-mb", type=int, default=6000)
+    parser.add_argument("--phase-pause", type=float, default=0.0)
     parser.add_argument("--keep", action="store_true", help="leave the cluster and GUI running")
     args = parser.parse_args()
     if not DAEMON.is_file() or not CLI.is_file():
@@ -103,6 +104,10 @@ def main() -> int:
 
     temp = Path(tempfile.mkdtemp(prefix="nonodb-load-", dir="/var/tmp"))
     auth = temp / "auth.json"
+    progress_path = temp / "progress.json"
+    progress_started = time.monotonic()
+    progress_started_wall = time.time()
+    progress_lock = threading.Lock()
     nodes: dict[str, Node] = {}
     procs: list[subprocess.Popen] = []
     start_errors: list[str] = []
@@ -123,6 +128,26 @@ def main() -> int:
         text=True,
     ).stdout.strip()
     headers = {"Authorization": f"Bearer {token}"}
+
+    def emit_progress(phase: str, active: bool = True, **extra) -> None:
+        payload = {
+            "active": active,
+            "phase": phase,
+            "started_at_ms": int(progress_started_wall * 1000),
+            "updated_at_ms": int(time.time() * 1000),
+            "elapsed_seconds": round(time.monotonic() - progress_started, 3),
+        }
+        payload.update(extra)
+        with progress_lock:
+            tmp = progress_path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(payload))
+            tmp.replace(progress_path)
+
+    def phase_pause() -> None:
+        if args.phase_pause > 0:
+            time.sleep(args.phase_pause)
+
+    emit_progress("starting", message="Preparing auth, ports, and cluster processes")
 
     ports = {
         "primary": free_port(7901),
@@ -324,6 +349,7 @@ def main() -> int:
             NONODB_AUTH_FILE=str(auth),
             NONODB_TOKEN=token,
             NONODB_CLUSTER_TOKEN=token,
+            NONODB_GUI_TEST_PROGRESS=str(progress_path),
             NONODB_SOCK=nodes["candidate3"].sock
             if "candidate3" in nodes
             else str(temp / "candidate3.sock"),
@@ -414,6 +440,13 @@ def main() -> int:
         monitor_thread = threading.Thread(target=monitor_memory, daemon=True)
         monitor_thread.start()
         print(f"GUI cluster view: http://10.0.0.10:{args.gui_port}/")
+        emit_progress(
+            "starting",
+            message="Cluster starting; nodes will join during the load",
+            total=args.docs,
+            loaded=0,
+            nodes_online=1,
+        )
 
         # Bulk load while nodes join at different points. Starts are serialized
         # so snapshots bootstrap one at a time instead of saturating disk I/O.
@@ -470,6 +503,20 @@ def main() -> int:
             loaded += len(documents)
             check_memory()
             launch_milestone(loaded)
+            if (start // args.batch) % 20 == 0 or loaded == args.docs:
+                elapsed = max(time.perf_counter() - load_started, 1e-9)
+                emit_progress(
+                    "bulk_load",
+                    message=f"Loading documents ({loaded:,} / {args.docs:,})",
+                    loaded=loaded,
+                    total=args.docs,
+                    docs_per_second=round(loaded / elapsed, 1),
+                    nodes_online=sum(
+                        1
+                        for item in list(nodes.values())
+                        if item.proc is not None and item.proc.poll() is None
+                    ),
+                )
         # Make sure every configured node exists even if a milestone was skipped.
         for name, priority in (
             ("candidate1", 0),
@@ -487,6 +534,17 @@ def main() -> int:
         if start_errors:
             raise RuntimeError("; ".join(start_errors))
         load_elapsed = time.perf_counter() - load_started
+        emit_progress(
+            "replication_convergence",
+            message="Bulk load complete; waiting for every replica to catch up",
+            loaded=args.docs,
+            total=args.docs,
+            docs_per_second=round(args.docs / max(load_elapsed, 1e-9), 1),
+            nodes_online=sum(
+                1 for item in list(nodes.values()) if item.proc is not None and item.proc.poll() is None
+            ),
+        )
+        phase_pause()
         results["phases"]["bulk_load"] = {
             "documents": args.docs,
             "seconds": round(load_elapsed, 3),
@@ -509,6 +567,8 @@ def main() -> int:
             "seconds": round(convergence, 3),
             "nodes": counts,
         }
+        emit_progress("index_build", message="Building the tenant index on the primary")
+        phase_pause()
         index_started = time.perf_counter()
         exec_node(
             primary,
@@ -521,6 +581,8 @@ def main() -> int:
             "seconds": round(index_elapsed, 3),
         }
 
+        emit_progress("read_latency", message="Measuring point and indexed read latency")
+        phase_pause()
         # Read latency on the primary.
         ids = [f"d{rnd.randrange(args.docs):08d}" for _ in range(args.query_samples)]
         latencies: list[float] = []
@@ -567,6 +629,15 @@ def main() -> int:
             },
         }
 
+        emit_progress(
+            "concurrent_writes",
+            message=f"Running {args.writers} concurrent writers",
+            written=0,
+            nodes_online=sum(
+                1 for item in list(nodes.values()) if item.proc is not None and item.proc.poll() is None
+            ),
+        )
+        phase_pause()
         # Concurrent writes for a fixed duration.
         write_latencies: list[float] = []
         write_errors: list[str] = []
@@ -609,7 +680,15 @@ def main() -> int:
             thread.start()
         barrier.wait()
         write_started = time.perf_counter()
-        time.sleep(args.write_seconds)
+        write_deadline = time.monotonic() + args.write_seconds
+        while time.monotonic() < write_deadline:
+            time.sleep(0.5)
+            emit_progress(
+                "concurrent_writes",
+                message=f"Running {args.writers} concurrent writers",
+                written=sum(write_counts),
+                elapsed_seconds=round(time.monotonic() - progress_started, 3),
+            )
         stop.set()
         for thread in threads:
             thread.join()
@@ -633,6 +712,11 @@ def main() -> int:
         }
 
         # First failover: primary -> candidate1.
+        emit_progress(
+            "failover_1",
+            message="Killing the primary; waiting for candidate1 to win quorum",
+        )
+        phase_pause()
         primary_m = metrics_node(primary)
         assert procs and primary.proc is not None
         failover_started = time.monotonic()
@@ -647,6 +731,13 @@ def main() -> int:
         alive = [nodes[name] for name in ("candidate1", "candidate2", "candidate3", "candidate4", "follower1", "follower2")]
         count_seconds, failover_counts = wait_counts(alive, expected, timeout=300)
         failover_total = time.monotonic() - failover_started
+        emit_progress(
+            "failover_1",
+            message="candidate1 elected; replicas switched source",
+            new_primary="candidate1",
+            epoch=elected.get("epoch"),
+            nodes_online=len(alive),
+        )
         results["phases"]["failover_1"] = {
             "killed": "primary",
             "new_primary": "candidate1",
@@ -675,6 +766,14 @@ def main() -> int:
         post_elapsed = time.perf_counter() - post_started
         expected += 5000
         post_convergence, post_counts = wait_counts(alive, expected, timeout=300)
+        emit_progress(
+            "post_failover_1_writes",
+            message="Writing and replicating through the new primary",
+            written=5000,
+            new_primary="candidate1",
+            epoch=elected.get("epoch"),
+        )
+        phase_pause()
         results["phases"]["post_failover_1_writes"] = {
             "documents": 5000,
             "seconds": round(post_elapsed, 3),
@@ -684,6 +783,13 @@ def main() -> int:
         }
 
         # Second failover: candidate1 -> candidate2.
+        emit_progress(
+            "failover_2",
+            message="Killing candidate1; waiting for candidate2 to win quorum",
+            new_primary="candidate1",
+            epoch=elected.get("epoch"),
+        )
+        phase_pause()
         failover2_started = time.monotonic()
         assert c1.proc is not None
         c1.proc.send_signal(signal.SIGKILL)
@@ -697,6 +803,13 @@ def main() -> int:
         alive2 = [nodes[name] for name in ("candidate2", "candidate3", "candidate4", "follower1", "follower2")]
         count2_seconds, failover2_counts = wait_counts(alive2, expected, timeout=300)
         failover2_total = time.monotonic() - failover2_started
+        emit_progress(
+            "failover_2",
+            message="candidate2 elected; replicas switched source",
+            new_primary="candidate2",
+            epoch=elected2.get("epoch"),
+            nodes_online=len(alive2),
+        )
         results["phases"]["failover_2"] = {
             "killed": "candidate1",
             "new_primary": "candidate2",
@@ -792,6 +905,16 @@ def main() -> int:
             "results": results,
         }
         (temp / "state.json").write_text(json.dumps(state, indent=2))
+        emit_progress(
+            "complete",
+            active=False,
+            message=f"Benchmark complete: {expected:,} documents, primary candidate2",
+            loaded=expected,
+            total=expected,
+            new_primary="candidate2",
+            epoch=elected2.get("epoch"),
+            result_file=str(temp / "results.json"),
+        )
         results["memory"] = {
             "peak_rss_mb": {name: round(value, 1) for name, value in peak_rss.items()},
             "available_mb_at_end": round(available_mb(), 1),
@@ -806,6 +929,12 @@ def main() -> int:
         else:
             print("cluster left running; pass --keep to make this explicit")
         return 0
+    except Exception as exc:
+        try:
+            emit_progress("failed", active=False, message=str(exc))
+        except OSError:
+            pass
+        raise
     finally:
         monitor_stop.set()
         if not args.keep or not completed:

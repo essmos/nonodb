@@ -472,6 +472,9 @@ fn change_role(
     cell.role = next.to_string();
     cell.epoch = epoch;
     cell.successor = successor;
+    if next == "primary" {
+        clear_replication_errors();
+    }
     Ok(role_view(&cell))
 }
 
@@ -838,6 +841,15 @@ fn record_success() {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     status.last_success_unix = unix_now();
+    status.last_error_unix = 0;
+    status.last_transport_error = None;
+    status.last_apply_error = None;
+}
+
+fn clear_replication_errors() {
+    let mut status = runtime_status()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     status.last_error_unix = 0;
     status.last_transport_error = None;
     status.last_apply_error = None;

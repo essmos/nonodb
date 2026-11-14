@@ -86,6 +86,18 @@ def main() -> int:
                 f"dead=http://127.0.0.1:{dead_port}",
             ]
         )
+        progress_file = tmp / "progress.json"
+        progress_file.write_text(
+            json.dumps(
+                {
+                    "active": True,
+                    "phase": "bulk_load",
+                    "loaded": 5,
+                    "total": 10,
+                    "docs_per_second": 42.0,
+                }
+            )
+        )
         gui_env = os.environ.copy()
         gui_env.update(
             NONODB_AUTH_FILE=str(auth),
@@ -104,6 +116,8 @@ def main() -> int:
                     f"http://127.0.0.1:{ports[0]}",
                     "--cluster",
                     cluster,
+                    "--progress-file",
+                    str(progress_file),
                 ],
                 env=gui_env,
                 stdout=subprocess.DEVNULL,
@@ -123,6 +137,10 @@ def main() -> int:
             assert nodes[name]["metrics"]["requests_total"] >= 0, nodes[name]
         assert nodes["dead"]["ok"] is False, nodes["dead"]
         assert "error" in nodes["dead"], nodes["dead"]
+        with urllib.request.urlopen(f"{base}/gui/test/progress", timeout=10) as response:
+            progress = json.load(response)["progress"]
+        assert progress["phase"] == "bulk_load", progress
+        assert progress["loaded"] == 5 and progress["total"] == 10, progress
         with urllib.request.urlopen(f"{base}/") as response:
             index = response.read().decode()
         marker = "src=\""
@@ -131,6 +149,7 @@ def main() -> int:
             javascript = response.read()
         assert b"One row per node" in javascript
         assert b"Max lag" in javascript
+        assert b"Live load test" in javascript
         print(json.dumps({"ok": True, "online": ["one", "two"], "offline": ["dead"]}))
         return 0
     finally:

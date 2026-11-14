@@ -100,6 +100,16 @@ Import plan with target database, selected backup, and the generated
 
 ![NonoDB GUI import plan](assets/gui/import-plan.png)
 
+Replication tab with the node status, glossary, transport health, source
+settings, role controls, acknowledgements, and applied sources:
+
+![NonoDB GUI replication](assets/gui/replication.png)
+
+Cluster tab showing every configured node at once, including a primary, live
+replicas, and two offline nodes after failover testing:
+
+![NonoDB GUI cluster](assets/gui/cluster.png)
+
 A short walkthrough of switching databases and opening collections:
 
 [Download the GUI walkthrough video (MP4, 16 s)](assets/gui/demo.mp4)

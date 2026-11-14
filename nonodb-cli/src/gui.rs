@@ -2,6 +2,7 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use rust_embed::RustEmbed;
@@ -43,6 +44,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
     let mut allow_remote = false;
     let mut url: Option<String> = None;
     let mut cluster_spec: Option<String> = None;
+    let mut progress_file: Option<PathBuf> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -81,6 +83,12 @@ pub fn run(args: &[String]) -> Result<(), String> {
                 );
                 i += 2;
             }
+            "--progress-file" => {
+                progress_file = Some(PathBuf::from(
+                    args.get(i + 1).ok_or("--progress-file wymaga ścieżki")?,
+                ));
+                i += 2;
+            }
             "--no-open" => {
                 open = false;
                 i += 1;
@@ -105,6 +113,12 @@ pub fn run(args: &[String]) -> Result<(), String> {
         Some(raw) if !raw.trim().is_empty() => parse_cluster(&raw)?,
         _ => Vec::new(),
     };
+    let progress_file = progress_file.or_else(|| {
+        std::env::var("NONODB_GUI_TEST_PROGRESS")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(PathBuf::from)
+    });
     let target = target(url.as_deref())?;
     let listener = TcpListener::bind((host.as_str(), port))
         .map_err(|e| format!("cannot bind {host}:{port}: {e}"))?;
@@ -123,8 +137,9 @@ pub fn run(args: &[String]) -> Result<(), String> {
             Ok(stream) => {
                 let target = target.clone();
                 let cluster = cluster.clone();
+                let progress_file = progress_file.clone();
                 std::thread::spawn(move || {
-                    if let Err(err) = handle(stream, &target, &cluster) {
+                    if let Err(err) = handle(stream, &target, &cluster, progress_file.as_deref()) {
                         eprintln!("gui request: {err}");
                     }
                 });
@@ -185,7 +200,12 @@ fn target(url: Option<&str>) -> Result<Target, String> {
     }
 }
 
-fn handle(mut client: TcpStream, target: &Target, cluster: &[ClusterNode]) -> Result<(), String> {
+fn handle(
+    mut client: TcpStream,
+    target: &Target,
+    cluster: &[ClusterNode],
+    progress_file: Option<&Path>,
+) -> Result<(), String> {
     client
         .set_read_timeout(Some(Duration::from_secs(30)))
         .map_err(|e| e.to_string())?;
@@ -196,6 +216,9 @@ fn handle(mut client: TcpStream, target: &Target, cluster: &[ClusterNode]) -> Re
 
     if request.path == "/gui/cluster/status" {
         return serve_cluster(client, cluster);
+    }
+    if request.path == "/gui/test/progress" {
+        return serve_test_progress(client, progress_file);
     }
     if request.path == "/gui/session" {
         let token = std::env::var("NONODB_TOKEN").unwrap_or_default();
@@ -288,6 +311,24 @@ fn read_request(client: &mut TcpStream) -> Result<IncomingRequest, String> {
         headers,
         body,
     })
+}
+
+fn serve_test_progress(mut client: TcpStream, progress_file: Option<&Path>) -> Result<(), String> {
+    let progress = progress_file
+        .and_then(|path| std::fs::read(path).ok())
+        .and_then(|raw| serde_json::from_slice::<serde_json::Value>(&raw).ok());
+    let body = serde_json::to_vec(&serde_json::json!({
+        "ok": true,
+        "progress": progress,
+    }))
+    .map_err(|e| e.to_string())?;
+    write_response(
+        &mut client,
+        200,
+        "application/json; charset=utf-8",
+        &body,
+        false,
+    )
 }
 
 fn serve_cluster(mut client: TcpStream, nodes: &[ClusterNode]) -> Result<(), String> {
