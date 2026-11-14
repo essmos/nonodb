@@ -607,6 +607,49 @@ export function replicationStatus(connection: Connection): Promise<ReplicationSt
   );
 }
 
+export function updateReplicationSource(
+  connection: Connection,
+  source: string,
+  databases: string[],
+  intervalSecs: number,
+  bootstrap: string,
+): Promise<Record<string, unknown>> {
+  return replicationWrite(connection, '/v1/replication/source', 'PUT', {
+    source,
+    databases,
+    interval_secs: intervalSecs,
+    bootstrap,
+  });
+}
+
+async function replicationWrite(
+  connection: Connection,
+  path: string,
+  method: string,
+  body: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  const response = await fetch(endpointFor(connection, scopedPath(connection, path)), {
+    method,
+    headers: { ...headers(connection), 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  let payload: any = null;
+  try {
+    payload = await response.json();
+  } catch {
+    throw new ApiError('invalid_response', `HTTP ${response.status}`, response.status);
+  }
+  if (!response.ok || payload?.ok === false) {
+    const error = payload?.error ?? {};
+    throw new ApiError(
+      error.code ?? 'http_error',
+      error.message ?? `HTTP ${response.status}`,
+      response.status,
+    );
+  }
+  return payload?.result as Record<string, unknown>;
+}
+
 export function replicationChanges(
   connection: Connection,
   after = 0,

@@ -111,6 +111,10 @@ impl Databases {
         Ok(me)
     }
 
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     pub async fn get(&self, name: &str) -> Result<Arc<DatabaseRuntime>, ApiError> {
         validate_name(name).map_err(invalid)?;
         if let Some(runtime) = self.runtimes.read().await.get(name).cloned() {

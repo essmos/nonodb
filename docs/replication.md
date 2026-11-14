@@ -257,6 +257,26 @@ The gap check runs at startup, before the runtime opens. If a gap appears while
 the daemon is running, the pull loop reports an error; restart the replica to
 trigger auto-resync. Hot resync without restart is still future work.
 
+### Changing the source
+
+The active pull source is reloaded from `<NONODB_DATA>/replication-source.json`
+on every loop. Update it without restarting:
+
+```http
+PUT /v1/replication/source
+{
+  "source": "https://new-primary:7878",
+  "databases": ["default", "app1"],
+  "interval_secs": 1,
+  "bootstrap": "auto"
+}
+```
+
+Env values seed a new installation; the persisted file wins afterwards. Token,
+CA, client certificate, and key remain environment settings. The new source
+must expose a compatible sequence/epoch stream, or the replica must be restarted
+so startup bootstrap can install a fresh snapshot.
+
 ### Manual role changes
 
 Roles are persisted in `<NONODB_DATA>/replication-role.json`. The env var seeds
@@ -319,7 +339,8 @@ work.
       health, and recent log entries.
 - [x] Role-aware `/readyz` and `nonodb-cli replication` status/changes/prune.
 - [ ] Peer wizard and full role banner.
-- [ ] Add peer, test connection, pause/resume, resync.
+- [x] Persist and reload the pull source without restart.
+- [ ] Add peer test-connection, pause/resume, and hot resync.
 - [x] Manual promote/demote with persisted role, expected epoch, and audit.
 - [ ] Promotion confirmation workflow in GUI.
 - [ ] Certificate expiry and lag dashboards.

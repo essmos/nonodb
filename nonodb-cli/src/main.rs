@@ -87,6 +87,38 @@ fn run() -> Result<(), String> {
                     let res = http_post("/v1/replication/prune", &json!({ "through": through }))?;
                     print_result(&res);
                 }
+                "source" => {
+                    let source = args.get(2).ok_or(
+                        "usage: nonodb-cli replication source <url> [databases] [interval]",
+                    )?;
+                    let databases = args
+                        .get(3)
+                        .map(|value| {
+                            value
+                                .split(',')
+                                .map(str::trim)
+                                .filter(|item| !item.is_empty())
+                                .map(str::to_string)
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    let interval = args
+                        .get(4)
+                        .map(|value| value.parse::<u64>())
+                        .transpose()
+                        .map_err(|error| format!("interval: {error}"))?
+                        .unwrap_or(1);
+                    let res = http_request(
+                        "PUT",
+                        "/v1/replication/source",
+                        Some(&json!({
+                            "source": source,
+                            "databases": databases,
+                            "interval_secs": interval,
+                        })),
+                    )?;
+                    print_result(&res);
+                }
                 "promote" => {
                     let expected: u64 = args
                         .get(2)
@@ -450,7 +482,7 @@ fn usage() -> Result<(), String> {
          ping                       sprawdź daemona\n\
          exec '<json>'              dowolne żądanie /v1/exec\n\
          databases [list|create <nazwa>|drop <nazwa>]  bazy w jednym daemonie\n\
-         replication [status|changes [after] [limit]|prune <seq>|promote <epoch>|demote <epoch> [role]]\n\
+         replication [status|changes [after] [limit]|source <url> [dbs] [interval]|prune <seq>|promote <epoch>|demote <epoch> [role]]\n\
          collections                lista kolekcji\n\
          count <coll> [filtr]       liczba dokumentów\n\
          find <coll> [filtr] [--sort pole:asc|desc] [--limit N] [--skip N]\n\

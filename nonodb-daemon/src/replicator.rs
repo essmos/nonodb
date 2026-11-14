@@ -35,20 +35,45 @@ struct Config {
     bootstrap: String,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PersistedSource {
+    source: String,
+    #[serde(default = "default_databases")]
+    databases: Vec<String>,
+    #[serde(default = "default_interval")]
+    interval_secs: u64,
+    #[serde(default = "default_batch")]
+    batch: usize,
+    #[serde(default = "default_bootstrap")]
+    bootstrap: String,
+}
+
+fn default_databases() -> Vec<String> {
+    vec![DEFAULT_DATABASE.to_string()]
+}
+
+fn default_interval() -> u64 {
+    1
+}
+
+fn default_batch() -> usize {
+    500
+}
+
+fn default_bootstrap() -> String {
+    "auto".to_string()
+}
+
+fn source_config_path(data_root: &std::path::Path) -> std::path::PathBuf {
+    data_root.join("replication-source.json")
+}
+
 impl Config {
-    fn from_env() -> Result<Option<Self>, String> {
-        let role = role();
-        if role != "replica" && role != "standby" {
-            return Ok(None);
-        }
+    fn from_env() -> Result<Self, String> {
         let source = std::env::var("NONODB_REPLICATION_SOURCE")
             .ok()
             .map(|value| value.trim().trim_end_matches('/').to_string())
-            .filter(|value| !value.is_empty())
-            .ok_or("NONODB_REPLICATION_SOURCE is required for replica/standby role")?;
-        if !source.starts_with("http://") && !source.starts_with("https://") {
-            return Err("NONODB_REPLICATION_SOURCE must start with http:// or https://".into());
-        }
+            .unwrap_or_default();
         let databases = std::env::var("NONODB_REPLICATION_DATABASES")
             .ok()
             .map(|value| {
@@ -60,17 +85,16 @@ impl Config {
                     .collect::<Vec<_>>()
             })
             .filter(|items| !items.is_empty())
-            .unwrap_or_else(|| vec![DEFAULT_DATABASE.to_string()]);
+            .unwrap_or_else(default_databases);
         let interval = std::env::var("NONODB_REPLICATION_POLL_INTERVAL")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
             .filter(|value| *value > 0)
-            .map(Duration::from_secs)
-            .unwrap_or(Duration::from_secs(1));
+            .unwrap_or_else(default_interval);
         let limit = std::env::var("NONODB_REPLICATION_BATCH")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(500)
+            .unwrap_or_else(default_batch)
             .clamp(1, 1000);
         let ca_file = non_empty_env("NONODB_REPLICATION_CA_FILE");
         let cert_file = non_empty_env("NONODB_REPLICATION_CERT_FILE");
@@ -84,18 +108,45 @@ impl Config {
             .ok()
             .map(|value| value.trim().to_ascii_lowercase())
             .filter(|value| matches!(value.as_str(), "auto" | "always" | "never"))
-            .unwrap_or_else(|| "auto".to_string());
-        Ok(Some(Self {
+            .unwrap_or_else(default_bootstrap);
+        Ok(Self {
             source,
             token: non_empty_env("NONODB_REPLICATION_SOURCE_TOKEN"),
             databases,
-            interval,
+            interval: Duration::from_secs(interval),
             limit,
             ca_file,
             cert_file,
             key_file,
             bootstrap,
-        }))
+        })
+    }
+
+    fn load(data_root: &std::path::Path) -> Result<Option<Self>, String> {
+        let mut config = Self::from_env()?;
+        let path = source_config_path(data_root);
+        if path.is_file() {
+            let raw = fs::read(&path).map_err(|error| format!("read source config: {error}"))?;
+            let persisted: PersistedSource = serde_json::from_slice(&raw)
+                .map_err(|error| format!("parse source config: {error}"))?;
+            config.source = persisted.source.trim().trim_end_matches('/').to_string();
+            config.databases = persisted.databases;
+            config.interval = Duration::from_secs(persisted.interval_secs.max(1));
+            config.limit = persisted.batch.clamp(1, 1000);
+            if matches!(persisted.bootstrap.as_str(), "auto" | "always" | "never") {
+                config.bootstrap = persisted.bootstrap;
+            }
+        }
+        if config.source.is_empty() {
+            return Ok(None);
+        }
+        if !config.source.starts_with("http://") && !config.source.starts_with("https://") {
+            return Err("replication source must start with http:// or https://".into());
+        }
+        if config.databases.is_empty() {
+            config.databases = default_databases();
+        }
+        Ok(Some(config))
     }
 
     fn client(&self) -> Result<reqwest::Client, String> {
@@ -305,6 +356,16 @@ fn record_config(config: &Config) {
     status.bootstrap = config.bootstrap.clone();
 }
 
+fn record_source(source: &PersistedSource) {
+    let mut status = runtime_status()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    status.source = Some(source.source.clone());
+    status.databases = source.databases.clone();
+    status.interval_secs = source.interval_secs;
+    status.bootstrap = source.bootstrap.clone();
+}
+
 fn record_success() {
     let mut status = runtime_status()
         .lock()
@@ -377,10 +438,65 @@ pub fn writable() -> bool {
     role() == "primary"
 }
 
+/// Persists a new pull source. The active loop reloads it on the next cycle.
+pub fn set_source(
+    data_root: &std::path::Path,
+    source: &str,
+    databases: &[String],
+    interval_secs: u64,
+    batch: usize,
+    bootstrap: &str,
+) -> Result<Value, String> {
+    let source = source.trim().trim_end_matches('/');
+    if !source.starts_with("http://") && !source.starts_with("https://") {
+        return Err("source must start with http:// or https://".into());
+    }
+    let databases = if databases.is_empty() {
+        default_databases()
+    } else {
+        databases.to_vec()
+    };
+    if !matches!(bootstrap, "auto" | "always" | "never") {
+        return Err("bootstrap must be auto, always, or never".into());
+    }
+    let persisted = PersistedSource {
+        source: source.to_string(),
+        databases,
+        interval_secs: interval_secs.max(1),
+        batch: batch.clamp(1, 1000),
+        bootstrap: bootstrap.to_string(),
+    };
+    let encoded = serde_json::to_vec_pretty(&persisted).map_err(|error| error.to_string())?;
+    let path = source_config_path(data_root);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| format!("create data dir: {error}"))?;
+    }
+    let temp = path.with_extension(format!("tmp-{}", std::process::id()));
+    fs::write(&temp, encoded).map_err(|error| format!("write source config: {error}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&temp, fs::Permissions::from_mode(0o600))
+            .map_err(|error| format!("chmod source config: {error}"))?;
+    }
+    fs::rename(&temp, &path).map_err(|error| format!("replace source config: {error}"))?;
+    record_source(&persisted);
+    Ok(serde_json::json!({
+        "source": persisted.source,
+        "databases": persisted.databases,
+        "interval_secs": persisted.interval_secs,
+        "batch": persisted.batch,
+        "bootstrap": persisted.bootstrap,
+    }))
+}
+
 /// Optionally installs a source snapshot before the daemon opens its default
 /// runtime. This is the only safe point to replace a live database directory.
 pub async fn bootstrap_startup(data_root: &std::path::Path) -> Result<(), String> {
-    let Some(config) = Config::from_env()? else {
+    if !matches!(role().as_str(), "replica" | "standby") {
+        return Ok(());
+    }
+    let Some(config) = Config::load(data_root)? else {
         return Ok(());
     };
     if config.bootstrap == "never" {
@@ -625,28 +741,53 @@ async fn install_bootstrap_snapshot(
     Ok(())
 }
 
-pub fn start(databases: Arc<Databases>, shutdown: watch::Receiver<bool>) -> Result<(), String> {
-    let Some(config) = Config::from_env()? else {
-        return Ok(());
-    };
-    record_config(&config);
-    let client = config.client()?;
-    tracing::info!(
-        role = %role(),
-        source = %config.source,
-        databases = ?config.databases,
-        interval_secs = config.interval.as_secs(),
-        "replication pull loop started"
-    );
+pub fn start(
+    databases: Arc<Databases>,
+    data_root: std::path::PathBuf,
+    shutdown: watch::Receiver<bool>,
+) -> Result<(), String> {
     tokio::spawn(async move {
         let mut shutdown = shutdown;
         loop {
             if *shutdown.borrow() {
                 break;
             }
-            for database in &config.databases {
-                if let Err(error) = pull_database(&client, &config, &databases, database).await {
-                    tracing::warn!(database, error = %error, "replication pull failed");
+            let config = match Config::load(&data_root) {
+                Ok(Some(config)) => config,
+                Ok(None) => {
+                    tokio::select! {
+                        _ = shutdown.changed() => break,
+                        _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                    }
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, "replication source config reload failed");
+                    tokio::select! {
+                        _ = shutdown.changed() => break,
+                        _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                    }
+                    continue;
+                }
+            };
+            record_config(&config);
+            if !writable() {
+                let client = match config.client() {
+                    Ok(client) => client,
+                    Err(error) => {
+                        tracing::warn!(error = %error, "replication client config failed");
+                        tokio::select! {
+                            _ = shutdown.changed() => break,
+                            _ = tokio::time::sleep(config.interval) => {}
+                        }
+                        continue;
+                    }
+                };
+                for database in &config.databases {
+                    if let Err(error) = pull_database(&client, &config, &databases, database).await
+                    {
+                        tracing::warn!(database, error = %error, "replication pull failed");
+                    }
                 }
             }
             tokio::select! {

@@ -353,6 +353,24 @@ def main() -> int:
                     "http://127.0.0.1:"
                 ), replica_status
                 assert replica_status["replication"]["bootstrap"] == "auto", replica_status
+                source_update = replica.put(
+                    "/v1/replication/source",
+                    headers=headers,
+                    json={
+                        "source": f"http://127.0.0.1:{port}",
+                        "databases": ["default"],
+                        "interval_secs": 1,
+                        "bootstrap": "auto",
+                    },
+                )
+                assert source_update.status_code == 200, source_update.text
+                assert (replica_data / "replication-source.json").is_file()
+                updated_status = replica.get(
+                    "/v1/replication/status", headers=headers
+                ).json()["result"]
+                assert updated_status["replication"]["source"] == (
+                    f"http://127.0.0.1:{port}"
+                ), updated_status
                 assert replica_status["replication"]["last_success_unix"] > 0, replica_status
                 assert replica_status["replication"]["last_apply_error"] is None, replica_status
                 ready = replica.get("/readyz").json()

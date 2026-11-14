@@ -28,6 +28,7 @@ import {
   replicationChanges,
   replicationStatus,
   runImport,
+  updateReplicationSource,
   loadConnection,
   loadProfiles,
   metrics,
@@ -1515,6 +1516,11 @@ function ReplicationPage({ connection }: { connection: Connection }) {
   const [changes, setChanges] = useState<ReplicationChangeTxn[]>([]);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
+  const [sourceDraft, setSourceDraft] = useState('');
+  const [databasesDraft, setDatabasesDraft] = useState('default');
+  const [intervalDraft, setIntervalDraft] = useState('1');
+  const [bootstrapDraft, setBootstrapDraft] = useState('auto');
+  const [savingSource, setSavingSource] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -1526,6 +1532,10 @@ function ReplicationPage({ connection }: { connection: Connection }) {
       ]);
       setStatus(nextStatus);
       setChanges(nextChanges.changes);
+      setSourceDraft(nextStatus.replication?.source ?? '');
+      setDatabasesDraft((nextStatus.replication?.databases ?? ['default']).join(', '));
+      setIntervalDraft(String(nextStatus.replication?.interval_secs ?? 1));
+      setBootstrapDraft(nextStatus.replication?.bootstrap ?? 'auto');
     } catch (err) {
       setError(errorText(err));
     } finally {
@@ -1536,6 +1546,25 @@ function ReplicationPage({ connection }: { connection: Connection }) {
   useEffect(() => {
     void load();
   }, [load]);
+
+  const saveSource = async () => {
+    setSavingSource(true);
+    setError('');
+    try {
+      await updateReplicationSource(
+        connection,
+        sourceDraft,
+        databasesDraft.split(',').map((item) => item.trim()).filter(Boolean),
+        Math.max(1, Number(intervalDraft) || 1),
+        bootstrapDraft,
+      );
+      await load();
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setSavingSource(false);
+    }
+  };
 
   return (
     <div className="page">
@@ -1585,6 +1614,22 @@ function ReplicationPage({ connection }: { connection: Connection }) {
           </div>
           {status.replication.last_transport_error && <div className="error-box">transport: {status.replication.last_transport_error}</div>}
           {status.replication.last_apply_error && <div className="error-box">apply: {status.replication.last_apply_error}</div>}
+          <div className="panel-title"><h3>Source settings</h3></div>
+          <div className="form-grid">
+            <label>Source URL<input value={sourceDraft} onChange={(e) => setSourceDraft(e.target.value)} placeholder="https://primary:7878" /></label>
+            <label>Databases<input value={databasesDraft} onChange={(e) => setDatabasesDraft(e.target.value)} placeholder="default, app1" /></label>
+            <label>Poll interval (s)<input type="number" min="1" value={intervalDraft} onChange={(e) => setIntervalDraft(e.target.value)} /></label>
+            <label>Bootstrap<select value={bootstrapDraft} onChange={(e) => setBootstrapDraft(e.target.value)}>
+              <option value="auto">auto</option>
+              <option value="always">always</option>
+              <option value="never">never</option>
+            </select></label>
+          </div>
+          <div className="actions">
+            <button onClick={() => void saveSource()} disabled={savingSource || !sourceDraft.trim()}>
+              {savingSource ? 'Saving…' : 'Save source'}
+            </button>
+          </div>
         </section>
       )}
       {status?.applied && status.applied.length > 0 && (

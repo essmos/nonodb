@@ -41,6 +41,19 @@ pub struct RoleBody {
     pub role: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct SourceBody {
+    pub source: String,
+    #[serde(default)]
+    pub databases: Option<Vec<String>>,
+    #[serde(default)]
+    pub interval_secs: Option<u64>,
+    #[serde(default)]
+    pub batch: Option<usize>,
+    #[serde(default)]
+    pub bootstrap: Option<String>,
+}
+
 pub async fn status(
     State(state): State<AppState>,
     Extension(connection): Extension<auth::ConnectionAuth>,
@@ -168,6 +181,56 @@ pub async fn changes(
             "replication_error",
             error.to_string(),
         ),
+    }
+}
+
+pub async fn update_source(
+    State(state): State<AppState>,
+    Extension(connection): Extension<auth::ConnectionAuth>,
+    headers: HeaderMap,
+    Json(body): Json<SourceBody>,
+) -> AuthResponse {
+    let (principal, started) =
+        match start_admin(&state, &connection, &headers, "replication_source_update") {
+            Ok(value) => value,
+            Err(response) => return response,
+        };
+    let databases = body.databases.unwrap_or_default();
+    let result = crate::replicator::set_source(
+        state.databases.root(),
+        &body.source,
+        &databases,
+        body.interval_secs.unwrap_or(1),
+        body.batch.unwrap_or(500),
+        body.bootstrap.as_deref().unwrap_or("auto"),
+    );
+    match result {
+        Ok(source) => {
+            audit_control(
+                &state,
+                &connection,
+                principal.name(),
+                "replication_source_update",
+                true,
+                None,
+                started,
+                None,
+            );
+            ok(serde_json::json!({ "source": source }))
+        }
+        Err(message) => {
+            audit_control(
+                &state,
+                &connection,
+                principal.name(),
+                "replication_source_update",
+                false,
+                Some(&message),
+                started,
+                None,
+            );
+            failure(StatusCode::BAD_REQUEST, "invalid_source", message)
+        }
     }
 }
 

@@ -222,7 +222,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!("shutdown signal received; draining");
         let _ = shutdown_tx.send(true);
     });
-    replicator::start(databases.clone(), shutdown_rx.clone())
+    replicator::start(databases.clone(), data.clone(), shutdown_rx.clone())
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
     let state = AppState {
@@ -290,6 +290,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         )
         .route("/v1/replication/promote", post(replication_api::promote))
         .route("/v1/replication/demote", post(replication_api::demote))
+        .route(
+            "/v1/replication/source",
+            axum::routing::put(replication_api::update_source),
+        )
         .route(
             "/:database/v1/replication/status",
             get(replication_api::status),

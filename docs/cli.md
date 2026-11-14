@@ -521,6 +521,12 @@ Prune a known-acked range:
 nonodb-cli replication prune 1234
 ```
 
+Change the pull source without restarting the daemon:
+
+```bash
+nonodb-cli replication source https://new-primary:7878 default,app1 1
+```
+
 Manually switch roles with an expected epoch:
 
 ```bash

@@ -119,6 +119,7 @@ def main() -> int:
                 b"Recent replication transactions",
                 b"Applied sources",
                 b"Transport health",
+                b"Source settings",
                 b"Log capture",
                 b"Excluded collections",
                 b"Generate key",
