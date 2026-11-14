@@ -1722,3 +1722,56 @@ select {
   color: var(--muted);
   font-weight: 600;
 }
+
+
+.cluster-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+  gap: 1rem;
+}
+
+.cluster-card {
+  display: grid;
+  gap: 0.8rem;
+  align-content: start;
+}
+
+.cluster-card .panel-title > div {
+  display: grid;
+  gap: 0.2rem;
+}
+
+.cluster-stats {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.cluster-stats .stat strong {
+  font-size: 1rem;
+}
+
+.cluster-detail {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 0.35rem;
+  font-size: 0.82rem;
+}
+
+.cluster-detail span {
+  color: var(--muted);
+}
+
+.cluster-down {
+  border-color: #4a202a;
+}
+
+.danger-text {
+  color: #f85149;
+}
+
+@media (max-width: 900px) {
+  .cluster-stats {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}

@@ -45,14 +45,22 @@ nonodb-cli gui --port 8788
 nonodb-cli gui --no-open
 nonodb-cli gui --host 0.0.0.0 --allow-remote
 nonodb-cli gui --url http://127.0.0.1:7879
+nonodb-cli gui --cluster primary=http://127.0.0.1:7879,replica=http://127.0.0.1:7880
 ```
 
 `--url` makes the GUI proxy use daemon TCP with bearer-token authentication;
 the Unix socket path is treated as trusted local admin.
 
+`--cluster` enables the GUI **Cluster** tab and accepts a comma-separated list
+of `name=url` nodes. The same list can be supplied through
+`NONODB_GUI_CLUSTER`. Cluster probes use `NONODB_CLUSTER_TOKEN`, falling back to
+`NONODB_TOKEN`. Cluster URLs currently must use `http://`; terminate TLS in a
+local reverse proxy if the nodes require HTTPS.
+
 The server listens on `127.0.0.1` by default. Non-loopback binds require
 `--allow-remote` and should sit behind TLS/auth. It proxies `/v1/exec`, database-scoped
-`/<database>/v1/exec`, `/v1/watch`, `/healthz`, and `/metrics` to the daemon. The React assets are embedded in the CLI binary. See
+`/<database>/v1/exec`, `/v1/watch`, `/healthz`, `/metrics`, and replication API
+paths to the daemon. The React assets are embedded in the CLI binary. See
 [GUI console](gui.md).
 
 ## ping

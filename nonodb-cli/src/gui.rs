@@ -1,7 +1,7 @@
 //! Local GUI server with embedded React assets and a same-origin API proxy.
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
 use rust_embed::RustEmbed;
@@ -9,6 +9,12 @@ use rust_embed::RustEmbed;
 #[derive(RustEmbed)]
 #[folder = "$CARGO_MANIFEST_DIR/../gui/dist"]
 struct Assets;
+
+#[derive(Clone)]
+struct ClusterNode {
+    name: String,
+    url: String,
+}
 
 #[derive(Clone)]
 enum Target {
@@ -36,6 +42,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
     let mut open = true;
     let mut allow_remote = false;
     let mut url: Option<String> = None;
+    let mut cluster_spec: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -66,6 +73,14 @@ pub fn run(args: &[String]) -> Result<(), String> {
                 );
                 i += 2;
             }
+            "--cluster" => {
+                cluster_spec = Some(
+                    args.get(i + 1)
+                        .ok_or("--cluster wymaga listy name=url,name=url")?
+                        .clone(),
+                );
+                i += 2;
+            }
             "--no-open" => {
                 open = false;
                 i += 1;
@@ -86,6 +101,10 @@ pub fn run(args: &[String]) -> Result<(), String> {
         );
     }
 
+    let cluster = match cluster_spec.or_else(|| std::env::var("NONODB_GUI_CLUSTER").ok()) {
+        Some(raw) if !raw.trim().is_empty() => parse_cluster(&raw)?,
+        _ => Vec::new(),
+    };
     let target = target(url.as_deref())?;
     let listener = TcpListener::bind((host.as_str(), port))
         .map_err(|e| format!("cannot bind {host}:{port}: {e}"))?;
@@ -103,8 +122,9 @@ pub fn run(args: &[String]) -> Result<(), String> {
         match stream {
             Ok(stream) => {
                 let target = target.clone();
+                let cluster = cluster.clone();
                 std::thread::spawn(move || {
-                    if let Err(err) = handle(stream, &target) {
+                    if let Err(err) = handle(stream, &target, &cluster) {
                         eprintln!("gui request: {err}");
                     }
                 });
@@ -113,6 +133,34 @@ pub fn run(args: &[String]) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn parse_cluster(raw: &str) -> Result<Vec<ClusterNode>, String> {
+    let mut nodes = Vec::new();
+    for (index, part) in raw
+        .split(',')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .enumerate()
+    {
+        let (name, url) = match part.split_once('=') {
+            Some((name, url)) => (name.trim().to_string(), url.trim().to_string()),
+            None => (format!("node{}", index + 1), part.to_string()),
+        };
+        if name.is_empty() || url.is_empty() {
+            return Err(format!("invalid --cluster entry: {part}"));
+        }
+        if !url.starts_with("http://") {
+            return Err(format!(
+                "cluster node {name}: only http:// URLs are supported"
+            ));
+        }
+        nodes.push(ClusterNode { name, url });
+    }
+    if nodes.is_empty() {
+        return Err("--cluster requires at least one name=url entry".into());
+    }
+    Ok(nodes)
 }
 
 fn target(url: Option<&str>) -> Result<Target, String> {
@@ -137,7 +185,7 @@ fn target(url: Option<&str>) -> Result<Target, String> {
     }
 }
 
-fn handle(mut client: TcpStream, target: &Target) -> Result<(), String> {
+fn handle(mut client: TcpStream, target: &Target, cluster: &[ClusterNode]) -> Result<(), String> {
     client
         .set_read_timeout(Some(Duration::from_secs(30)))
         .map_err(|e| e.to_string())?;
@@ -146,6 +194,9 @@ fn handle(mut client: TcpStream, target: &Target) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     let request = read_request(&mut client)?;
 
+    if request.path == "/gui/cluster/status" {
+        return serve_cluster(client, cluster);
+    }
     if request.path == "/gui/session" {
         let token = std::env::var("NONODB_TOKEN").unwrap_or_default();
         let body = serde_json::json!({ "token": token }).to_string();
@@ -237,6 +288,174 @@ fn read_request(client: &mut TcpStream) -> Result<IncomingRequest, String> {
         headers,
         body,
     })
+}
+
+fn serve_cluster(mut client: TcpStream, nodes: &[ClusterNode]) -> Result<(), String> {
+    let token = std::env::var("NONODB_CLUSTER_TOKEN")
+        .or_else(|_| std::env::var("NONODB_TOKEN"))
+        .ok();
+    let payload = if nodes.is_empty() {
+        serde_json::json!({
+            "ok": true,
+            "nodes": [],
+            "message": "cluster view is not configured; start gui with --cluster name=url,name=url",
+        })
+    } else {
+        let probed: Vec<serde_json::Value> = std::thread::scope(|scope| {
+            let handles: Vec<_> = nodes
+                .iter()
+                .map(|node| {
+                    let token = token.as_deref();
+                    scope.spawn(move || probe_node(node, token))
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle.join().unwrap_or_else(
+                        |_| serde_json::json!({"ok": false, "error": "probe panicked"}),
+                    )
+                })
+                .collect()
+        });
+        serde_json::json!({
+            "ok": true,
+            "nodes": probed,
+            "generated_at_ms": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+        })
+    };
+    let body = serde_json::to_vec(&payload).map_err(|e| e.to_string())?;
+    write_response(
+        &mut client,
+        200,
+        "application/json; charset=utf-8",
+        &body,
+        false,
+    )
+}
+
+fn probe_node(node: &ClusterNode, token: Option<&str>) -> serde_json::Value {
+    let status = match http_json(
+        &format!("{}/v1/replication/status", node.url.trim_end_matches('/')),
+        token,
+    ) {
+        Ok(value) => value,
+        Err(err) => {
+            return serde_json::json!({
+                "name": node.name,
+                "url": node.url,
+                "ok": false,
+                "error": err,
+            });
+        }
+    };
+    let metrics = http_json(
+        &format!("{}/metrics", node.url.trim_end_matches('/')),
+        token,
+    )
+    .ok();
+    let status = status.get("result").cloned().unwrap_or(status);
+    serde_json::json!({
+        "name": node.name,
+        "url": node.url,
+        "ok": true,
+        "status": status,
+        "metrics": metrics,
+    })
+}
+
+fn http_json(url: &str, token: Option<&str>) -> Result<serde_json::Value, String> {
+    let rest = url
+        .strip_prefix("http://")
+        .ok_or_else(|| "only http:// cluster URLs are supported".to_string())?;
+    let (authority, path) = match rest.split_once('/') {
+        Some((authority, path)) => (authority, format!("/{path}")),
+        None => (rest, "/".to_string()),
+    };
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) => (
+            host.trim_matches(['[', ']']),
+            port.parse::<u16>().map_err(|e| e.to_string())?,
+        ),
+        None => (authority, 80),
+    };
+    let mut addrs = (host, port)
+        .to_socket_addrs()
+        .map_err(|e| format!("resolve {host}:{port}: {e}"))?;
+    let addr = addrs
+        .next()
+        .ok_or_else(|| format!("resolve {host}:{port}: no address"))?;
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(3))
+        .map_err(|e| format!("connect {authority}: {e}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .map_err(|e| e.to_string())?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(3)))
+        .map_err(|e| e.to_string())?;
+    let mut request = format!(
+        "GET {path} HTTP/1.1\r\nHost: {authority}\r\nAccept: application/json\r\nConnection: close\r\n"
+    );
+    if let Some(token) = token.filter(|token| !token.is_empty()) {
+        request.push_str(&format!("Authorization: Bearer {token}\r\n"));
+    }
+    request.push_str("\r\n");
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|e| e.to_string())?;
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .map_err(|e| e.to_string())?;
+    let split = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or_else(|| "malformed HTTP response".to_string())?;
+    let head = String::from_utf8_lossy(&response[..split]);
+    let status_code = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok())
+        .ok_or_else(|| "missing HTTP status".to_string())?;
+    if status_code != 200 {
+        return Err(format!("HTTP {status_code}"));
+    }
+    let mut body = response[split + 4..].to_vec();
+    if head
+        .to_ascii_lowercase()
+        .contains("transfer-encoding: chunked")
+    {
+        body = decode_chunked(&body)?;
+    }
+    serde_json::from_slice(&body).map_err(|e| format!("invalid JSON: {e}"))
+}
+
+fn decode_chunked(body: &[u8]) -> Result<Vec<u8>, String> {
+    let mut decoded = Vec::new();
+    let mut offset = 0;
+    loop {
+        let line_end = body[offset..]
+            .windows(2)
+            .position(|window| window == b"\r\n")
+            .map(|pos| offset + pos)
+            .ok_or_else(|| "malformed chunked response".to_string())?;
+        let line = String::from_utf8_lossy(&body[offset..line_end]);
+        let size = usize::from_str_radix(line.split(';').next().unwrap_or("").trim(), 16)
+            .map_err(|e| format!("invalid chunk size: {e}"))?;
+        offset = line_end + 2;
+        if size == 0 {
+            return Ok(decoded);
+        }
+        if offset + size + 2 > body.len() {
+            return Err("truncated chunked response".into());
+        }
+        decoded.extend_from_slice(&body[offset..offset + size]);
+        offset += size + 2;
+    }
 }
 
 fn proxy(mut client: TcpStream, target: &Target, request: &IncomingRequest) -> Result<(), String> {

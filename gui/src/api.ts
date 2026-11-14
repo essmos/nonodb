@@ -595,6 +595,37 @@ export type ReplicationStatus = {
   min_ack?: number;
 };
 
+export type ClusterNode = {
+  name: string;
+  url: string;
+  ok: boolean;
+  error?: string;
+  status?: ReplicationStatus;
+  metrics?: Record<string, any>;
+};
+
+export type ClusterStatus = {
+  nodes: ClusterNode[];
+  generated_at_ms?: number;
+  message?: string;
+};
+
+export async function clusterStatus(connection: Connection): Promise<ClusterStatus> {
+  const response = await fetch(endpointFor(connection, '/gui/cluster/status'), {
+    headers: headers(connection),
+  });
+  let payload: any = null;
+  try {
+    payload = await response.json();
+  } catch {
+    throw new ApiError('invalid_response', `HTTP ${response.status}`, response.status);
+  }
+  if (!response.ok || payload?.ok === false) {
+    throw new ApiError('cluster_error', `HTTP ${response.status}`, response.status);
+  }
+  return payload as ClusterStatus;
+}
+
 export function promoteReplication(
   connection: Connection,
   expectedEpoch: number,

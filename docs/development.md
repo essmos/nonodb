@@ -202,7 +202,8 @@ python3 scripts/history_test.py              # per-collection history enable/dis
 python3 scripts/events_auto_test.py          # automatic collection events, field filters, thresholds, CLI
 python3 scripts/subscriptions_test.py        # persistent conditional subscriptions, count, once, SQL, restart
 python3 scripts/live_watch_test.py           # connection-scoped live mode, direct SSE delivery, no _events
-python3 scripts/gui_test.py                  # embedded GUI assets and local API proxy
+python3 scripts/gui_test.py
+python3 scripts/gui_cluster_test.py                  # embedded GUI assets and local API proxy
 python3 scripts/multi_database_test.py       # routing, isolation, cursors, restart, drop
 python3 scripts/multi_database_features_test.py  # full feature matrix inside app1
 python3 scripts/durability_test.py             # full/relaxed/unsafe, sync, crash/restart

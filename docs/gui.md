@@ -36,6 +36,27 @@ enforced on that path.
 Exposing the GUI beyond loopback is only safe with TLS, authentication, and a
 trusted reverse proxy or tunnel. The GUI itself does not terminate TLS.
 
+## Cluster view
+
+The **Cluster** tab shows every node passed to the GUI with `--cluster` or
+`NONODB_GUI_CLUSTER` in one place:
+
+```bash
+nonodb-cli gui --cluster \
+  primary=http://127.0.0.1:7879,\
+  candidate1=http://127.0.0.1:7880,\
+  follower1=http://127.0.0.1:7881
+```
+
+For each node it displays role, epoch, head sequence, replica lag, applied
+transactions, transport/apply errors, source URL, write URL, disk usage, request
+counts, and average commit time. The view refreshes automatically and marks
+unreachable nodes as offline.
+
+Use `NONODB_CLUSTER_TOKEN` when the cluster nodes require a different bearer
+token than the GUI's own `NONODB_TOKEN`. Cluster probes currently require
+`http://` URLs; use a local TLS-terminating proxy for HTTPS deployments.
+
 ## Screenshots
 
 Overview with the database selector; the example below uses `perf1` with one

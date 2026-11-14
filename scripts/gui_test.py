@@ -122,6 +122,8 @@ def main() -> int:
                 b"Source settings",
                 b"Role control",
                 b"Replica acknowledgements",
+                b"All configured nodes",
+                b"Max lag",
                 b"Log capture",
                 b"Excluded collections",
                 b"Generate key",

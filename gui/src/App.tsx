@@ -8,6 +8,7 @@ import QueryBuilder from './QueryBuilder';
 import {
   authSummary,
   backupsList,
+  clusterStatus,
   browseImports,
   clearConnection,
   collectionMetrics as fetchCollectionMetrics,
@@ -43,6 +44,7 @@ import {
   type BackupItem,
   type BackupJob,
   type BackupsView,
+  type ClusterStatus,
   type ConnectionProfile,
   type DiscoveredImport,
   type ImportSource,
@@ -1509,6 +1511,119 @@ function ImportsPage({ connection }: { connection: Connection }) {
           <p className="muted">No imports yet.</p>
         )}
       </section>
+    </div>
+  );
+}
+
+function ClusterPage({ connection }: { connection: Connection }) {
+  const [cluster, setCluster] = useState<ClusterStatus | null>(null);
+  const [error, setError] = useState('');
+  const [loading, setLoading] = useState(false);
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      setCluster(await clusterStatus(connection));
+      setError('');
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setLoading(false);
+    }
+  }, [connection]);
+
+  useEffect(() => {
+    void load();
+    const timer = window.setInterval(() => void load(), 3000);
+    return () => window.clearInterval(timer);
+  }, [load]);
+
+  const nodes = cluster?.nodes ?? [];
+  const online = nodes.filter((node) => node.ok);
+  const primaries = online.filter((node) => node.status?.role === 'primary');
+  const replicas = online.filter((node) => node.status?.role !== 'primary');
+  const maxLag = Math.max(
+    0,
+    ...online.flatMap((node) => (node.status?.applied ?? []).map((applied) => applied.lag ?? 0)),
+  );
+  const staleAcks = online.flatMap((node) => node.status?.acks ?? []).filter((ack) => ack.age_seconds > 60);
+  const metric = (node: ClusterStatus['nodes'][number], key: string): number =>
+    Number(node.metrics?.[key] ?? 0);
+
+  return (
+    <div className="page">
+      <header className="page-header">
+        <div>
+          <h2>Cluster</h2>
+          <p>All configured nodes, replication roles, lag, write routing, and live node metrics.</p>
+        </div>
+        <div className="actions">
+          <button onClick={() => void load()} disabled={loading}>{loading ? 'Refreshing…' : 'Refresh'}</button>
+        </div>
+      </header>
+      {error && <div className="error-box">{error}</div>}
+      {cluster?.message && <div className="panel"><p className="muted">{cluster.message}</p></div>}
+      <div className="stat-grid">
+        <div className="stat"><span>Nodes</span><strong>{nodes.length}</strong></div>
+        <div className="stat"><span>Online</span><strong>{online.length}</strong></div>
+        <div className="stat"><span>Primary</span><strong>{primaries.map((node) => node.name).join(', ') || 'none'}</strong></div>
+        <div className="stat"><span>Max lag</span><strong>{maxLag.toLocaleString()}</strong></div>
+        <div className="stat"><span>Replicas</span><strong>{replicas.length}</strong></div>
+        <div className="stat"><span>Unhealthy</span><strong>{nodes.length - online.length}</strong></div>
+        <div className="stat"><span>Stale acks</span><strong>{staleAcks.length}</strong></div>
+        <div className="stat"><span>Updated</span><strong>{cluster?.generated_at_ms ? new Date(cluster.generated_at_ms).toLocaleTimeString() : '—'}</strong></div>
+      </div>
+      <div className="cluster-grid">
+        {nodes.map((node) => {
+          const status = node.status;
+          const applied = status?.applied ?? [];
+          const lag = Math.max(0, ...applied.map((item) => item.lag ?? 0));
+          const acks = status?.acks ?? [];
+          return (
+            <section key={`${node.name}:${node.url}`} className={`panel cluster-card ${node.ok ? '' : 'cluster-down'}`}>
+              <div className="panel-title">
+                <div>
+                  <h3>{node.name}</h3>
+                  <span className="mono small">{node.url}</span>
+                </div>
+                <span className={`badge ${status?.role === 'primary' ? '' : 'danger-badge'}`}>
+                  {node.ok ? status?.role ?? 'unknown' : 'offline'}
+                </span>
+              </div>
+              {!node.ok ? (
+                <div className="error-box">{node.error ?? 'node unreachable'}</div>
+              ) : (
+                <>
+                  <div className="stat-grid cluster-stats">
+                    <div className="stat"><span>Epoch</span><strong>{status?.epoch ?? 0}</strong></div>
+                    <div className="stat"><span>Head</span><strong>{(status?.head ?? 0).toLocaleString()}</strong></div>
+                    <div className="stat"><span>Lag</span><strong className={lag > 0 ? 'danger-text' : ''}>{lag.toLocaleString()}</strong></div>
+                    <div className="stat"><span>Acks</span><strong>{acks.length}</strong></div>
+                    <div className="stat"><span>Applied</span><strong>{metric(node, 'replication_applied_total').toLocaleString()}</strong></div>
+                    <div className="stat"><span>Transport errors</span><strong>{metric(node, 'replication_transport_errors_total').toLocaleString()}</strong></div>
+                    <div className="stat"><span>Write ops</span><strong>{metric(node, 'write_ops_total').toLocaleString()}</strong></div>
+                    <div className="stat"><span>Avg commit</span><strong>{metric(node, 'avg_commit_us').toFixed(1)} µs</strong></div>
+                  </div>
+                  <div className="cluster-detail"><span>Source</span><strong className="mono">{status?.replication?.source ?? '—'}</strong></div>
+                  <div className="cluster-detail"><span>Write URL</span><strong className="mono">{status?.write_url ?? '—'}</strong></div>
+                  <div className="cluster-detail"><span>Mode</span><strong>{status?.read_only ? 'read-only' : 'writable'} · interval {status?.replication?.interval_secs ?? 0}s · {status?.replication?.bootstrap || 'no bootstrap'}</strong></div>
+                  <div className="cluster-detail"><span>Databases</span><strong className="mono">{(status?.replication?.databases ?? []).join(', ') || '—'}</strong></div>
+                  <div className="cluster-detail"><span>Requests</span><strong>{metric(node, 'requests_total').toLocaleString()}</strong></div>
+                  <div className="cluster-detail"><span>Reads</span><strong>{metric(node, 'read_ops_total').toLocaleString()}</strong></div>
+                  <div className="cluster-detail"><span>Errors</span><strong>{metric(node, 'errors_total').toLocaleString()}</strong></div>
+                  <div className="cluster-detail"><span>Disk used</span><strong>{(Number(node.metrics?.disk?.data?.used_ratio ?? 0) * 100).toFixed(1)}%</strong></div>
+                  {status?.replication?.last_transport_error && <div className="error-box">transport: {status.replication.last_transport_error}</div>}
+                  {status?.replication?.last_apply_error && <div className="error-box">apply: {status.replication.last_apply_error}</div>}
+                </>
+              )}
+            </section>
+          );
+        })}
+      </div>
+      {nodes.length === 0 && (
+        <div className="panel">
+          <p className="muted">No nodes configured. Start the GUI with <code>--cluster name=url,name=url</code> or set <code>NONODB_GUI_CLUSTER</code>.</p>
+        </div>
+      )}
     </div>
   );
 }
@@ -3983,7 +4098,7 @@ function Shell({
 }) {
   const [collections, setCollections] = useState<string[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
-  const [tab, setTab] = useState<'dashboard' | 'storage' | 'sql' | 'database' | 'backups' | 'import' | 'replication' | 'auth'>('dashboard');
+  const [tab, setTab] = useState<'dashboard' | 'storage' | 'sql' | 'database' | 'backups' | 'import' | 'replication' | 'cluster' | 'auth'>('dashboard');
   const [showNewCollection, setShowNewCollection] = useState(false);
   const [showPalette, setShowPalette] = useState(false);
   const [paletteQuery, setPaletteQuery] = useState('');
@@ -4117,6 +4232,9 @@ function Shell({
           <button className={tab === 'replication' ? 'active' : ''} onClick={() => setTab('replication')}>
             Replication
           </button>
+          <button className={tab === 'cluster' ? 'active' : ''} onClick={() => setTab('cluster')}>
+            Cluster
+          </button>
           <button className={tab === 'auth' ? 'active' : ''} onClick={() => setTab('auth')}>
             Authorization
           </button>
@@ -4199,6 +4317,8 @@ function Shell({
           <ImportsPage connection={connection} />
         ) : tab === 'replication' ? (
           <ReplicationPage connection={connection} />
+        ) : tab === 'cluster' ? (
+          <ClusterPage connection={connection} />
         ) : tab === 'auth' ? (
           <AuthView connection={connection} />
         ) : selected ? (
@@ -4233,6 +4353,7 @@ function Shell({
               { label: 'Open Backups', run: () => setTab('backups') },
               { label: 'Open Import', run: () => setTab('import') },
               { label: 'Open Replication', run: () => setTab('replication') },
+              { label: 'Open Cluster', run: () => setTab('cluster') },
               { label: 'Open Authorization', run: () => setTab('auth') },
               { label: 'New collection', run: () => setShowNewCollection(true) },
               ...collections.map((coll) => ({ label: `Open collection: ${coll}`, run: () => openCollection(coll) })),
