@@ -290,7 +290,7 @@ scripts are:
 | `scripts/replication_test.py` | writer log capture, snapshot bootstrap, manual and automatic prune with replica acks, ack age, pull apply, local applied log, global sequence, read-only replica, promote/demote epoch, stale-epoch rejection, source reload, successor source switch, graceful restart on runtime gap, startup auto-resync, apply metrics, and lag |
 | `scripts/replication_failover_test.py` | quorum promotion demotes and fences the old source, persists votes, and rejects writes on the demoted node |
 | `scripts/replication_lease_test.py` | primary renews a quorum lease and self-demotes after losing voter majority |
-| `scripts/replication_election_test.py` | candidate wins a quorum election after the primary process disappears and propagates itself to voters and followers |
+| `scripts/replication_election_test.py` | preferred candidate wins a quorum election after the primary disappears, while a delayed candidate and followers switch source |
 | `scripts/tls_reload_test.py` | server certificate rotation picked up without restarting the daemon |
 | `scripts/security_check.py` | isolated auth gates, database-qualified scopes, CORS, malformed input, security headers, lockout |
 | `scripts/writer_window_bench.py` | adaptive/fixed group-commit window latency and throughput comparison |

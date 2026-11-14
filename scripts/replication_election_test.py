@@ -44,7 +44,7 @@ def main() -> int:
 
         ports = {
             name: free_port()
-            for name in ("primary", "candidate", "voter", "follower")
+            for name in ("primary", "candidate", "candidate2", "voter", "follower")
         }
         voters = ",".join(
             f"http://127.0.0.1:{ports[name]}"
@@ -64,7 +64,20 @@ def main() -> int:
                 "NONODB_REPLICATION_CANDIDATE": "1",
                 "NONODB_REPLICATION_ELECTION_INTERVAL": "1",
                 "NONODB_REPLICATION_FAILOVER_TIMEOUT": "3",
-                "NONODB_REPLICATION_FOLLOWERS": f"http://127.0.0.1:{ports['follower']}",
+                "NONODB_REPLICATION_FOLLOWERS": (
+                    f"http://127.0.0.1:{ports['follower']},"
+                    f"http://127.0.0.1:{ports['candidate2']}"
+                ),
+            },
+            "candidate2": {
+                "NONODB_REPLICATION_SOURCE": f"http://127.0.0.1:{ports['primary']}",
+                "NONODB_REPLICATION_SOURCE_TOKEN": token,
+                "NONODB_REPLICATION_ADVERTISE_URL": f"http://127.0.0.1:{ports['candidate2']}",
+                "NONODB_REPLICATION_AUTO_FAILOVER": "1",
+                "NONODB_REPLICATION_CANDIDATE": "1",
+                "NONODB_REPLICATION_CANDIDATE_PRIORITY": "5",
+                "NONODB_REPLICATION_ELECTION_INTERVAL": "1",
+                "NONODB_REPLICATION_FAILOVER_TIMEOUT": "3",
             },
             "voter": {
                 "NONODB_REPLICATION_SOURCE": f"http://127.0.0.1:{ports['primary']}",
@@ -186,6 +199,13 @@ def main() -> int:
             raise RuntimeError(
                 f"follower did not switch to the elected primary: {follower_status}"
             )
+        second = clients["candidate2"].get(
+            "/v1/replication/status", headers=headers
+        ).json()["result"]
+        assert second["role"] == "replica", second
+        assert second["replication"].get("source") == (
+            f"http://127.0.0.1:{ports['candidate']}"
+        ), second
         insert = candidate.post(
             "/v1/exec",
             headers=headers,

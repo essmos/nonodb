@@ -349,6 +349,7 @@ Automatic election is opt-in on selected replicas:
 ```env
 NONODB_REPLICATION_AUTO_FAILOVER=1
 NONODB_REPLICATION_CANDIDATE=1
+NONODB_REPLICATION_CANDIDATE_PRIORITY=0
 NONODB_REPLICATION_ELECTION_INTERVAL=5
 NONODB_REPLICATION_FAILOVER_TIMEOUT=30
 NONODB_REPLICATION_ADVERTISE_URL=https://eu-2:7878
@@ -357,7 +358,10 @@ NONODB_REPLICATION_ADVERTISE_URL=https://eu-2:7878
 After the source has been unavailable for the timeout, a candidate calls the
 same quorum/fence promotion path. Voters reject a second candidate at the same
 epoch, so only one candidate can obtain a majority. Set the candidate flag only
-on replicas that should be allowed to lead. After a successful promotion, the
+on replicas that should be allowed to lead. Lower
+`NONODB_REPLICATION_CANDIDATE_PRIORITY` values campaign earlier; quorum voting
+still ensures that only one candidate at a given epoch can win. After a
+successful promotion, the
 new primary pushes itself as the configured source to every voter URL and every
 URL in `NONODB_REPLICATION_FOLLOWERS`, so both groups reload their pull source
 automatically. Followers do not vote, so use them for read replicas that must
