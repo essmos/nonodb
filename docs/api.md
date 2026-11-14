@@ -2458,8 +2458,13 @@ Transport, replica apply, promotion, and GUI management are still planned.
 | `GET` | `/v1/replication/changes?after=0&limit=100` | Read committed replication transactions after a sequence |
 | `GET` | `/{database}/v1/replication/status` | Same status for a selected database |
 | `GET` | `/{database}/v1/replication/changes` | Changes for a selected database |
+| `GET` | `/v1/replication/snapshot` | Stream a consistent compacted LMDB snapshot |
+| `POST` | `/v1/replication/prune` | Delete log entries through `{ "through": N }` |
+| `GET` | `/{database}/v1/replication/snapshot` | Snapshot for a selected database |
+| `POST` | `/{database}/v1/replication/prune` | Prune a selected database |
 
-All routes require `admin:db` or `*:*`. A change transaction contains an
+All routes require `admin:db` or `*:*`. Snapshot and prune are intended for
+replica bootstrap and controlled retention. A change transaction contains an
 `origin`, `seq`, `created_at_ms`, and grouped `changes` with collection, op, id,
 and before/after documents. Replication is disabled unless
 `NONODB_REPLICATION_ENABLED=1`.

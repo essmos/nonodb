@@ -193,6 +193,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     let audit = audit::AuditLog::from_env()?;
 
+    replicator::bootstrap_startup(&data)
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
     let databases = databases::Databases::open(&data)
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
     metrics::set_disk_paths(
@@ -277,12 +280,28 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             get(replication_api::changes_default),
         )
         .route(
+            "/v1/replication/snapshot",
+            get(replication_api::snapshot_default),
+        )
+        .route(
+            "/v1/replication/prune",
+            post(replication_api::prune_default),
+        )
+        .route(
             "/:database/v1/replication/status",
             get(replication_api::status),
         )
         .route(
             "/:database/v1/replication/changes",
             get(replication_api::changes),
+        )
+        .route(
+            "/:database/v1/replication/snapshot",
+            get(replication_api::snapshot),
+        )
+        .route(
+            "/:database/v1/replication/prune",
+            post(replication_api::prune),
         )
         .route("/v1/exec", post(exec))
         .route("/v1/watch", post(watch_stream))

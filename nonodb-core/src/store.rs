@@ -1538,6 +1538,34 @@ impl Store {
         Ok(())
     }
 
+    /// Sets the applied sequence and observed source head for a bootstrap.
+    pub fn set_replication_state(
+        &self,
+        origin: &str,
+        applied: u64,
+        source_head: u64,
+    ) -> Result<()> {
+        if origin.trim().is_empty() {
+            return Err(Error::Query("replication origin is empty".into()));
+        }
+        let mut wtxn = self.write_txn()?;
+        let meta: Database<Bytes, Bytes> = self.env.create_database(&mut wtxn, Some(META_DB))?;
+        let applied_key = format!("replication:applied:{origin}");
+        let head_key = format!("replication:source_head:{origin}");
+        meta.put(
+            &mut wtxn,
+            applied_key.as_bytes(),
+            applied.to_string().as_bytes(),
+        )?;
+        meta.put(
+            &mut wtxn,
+            head_key.as_bytes(),
+            source_head.to_string().as_bytes(),
+        )?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
     /// Applies one source replication transaction atomically and idempotently.
     ///
     /// The replica requires contiguous sequences for each origin. Re-applying

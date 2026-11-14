@@ -96,6 +96,7 @@ secrets.
 | `NONODB_REPLICATION_DATABASES` | `default` | Comma-separated databases to pull |
 | `NONODB_REPLICATION_POLL_INTERVAL` | `1` | Pull interval in seconds |
 | `NONODB_REPLICATION_BATCH` | `500` | Maximum transactions per request, 1–1000 |
+| `NONODB_REPLICATION_BOOTSTRAP` | `auto` | Snapshot bootstrap mode: `auto`, `always`, or `never` |
 | `NONODB_REPLICATION_CA_FILE` | unset | CA bundle for source TLS verification |
 | `NONODB_REPLICATION_CERT_FILE` | unset | Client certificate for source mTLS |
 | `NONODB_REPLICATION_KEY_FILE` | unset | Client private key for source mTLS |

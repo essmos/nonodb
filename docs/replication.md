@@ -237,8 +237,22 @@ Replicas record the source head and expose `applied`/`lag` in status and
 Prometheus. A gap returns an error instead of skipping transactions. Apply
 invalidates the replica query cache, and transport/apply failures are counted.
 
-Snapshot bootstrap, epochs, and promotion are not implemented yet, so this is
-not yet a production failover mechanism.
+Before the daemon opens its runtime, a fresh replica can install a consistent
+source snapshot:
+
+```text
+GET /v1/replication/snapshot
+POST /v1/replication/prune   {"through": N}
+```
+
+`NONODB_REPLICATION_BOOTSTRAP=auto` installs a snapshot only when the local
+database has no applied state and no user collections. `always` installs one
+on every start; `never` disables bootstrap. The snapshot's own replication head
+becomes the initial applied sequence, so changes after that point are pulled
+normally.
+
+Epochs, promotion, and automatic resync after an expired source log are not
+implemented yet, so this is not yet a production failover mechanism.
 
 ## Implementation phases
 
@@ -263,9 +277,9 @@ not yet a production failover mechanism.
 - [x] Apply path with per-origin `(origin, seq)` idempotence.
 - [x] Read-only replica write gating.
 - [x] Applied sequence and lag status/metrics.
-- [ ] Snapshot bootstrap.
+- [x] Snapshot bootstrap with recorded sequence.
 - [ ] Epoch fencing and source changes.
-- [ ] Resync and truncation handling.
+- [ ] Automatic resync when the source log was pruned too far.
 - [ ] Replica readiness policy.
 
 ### Phase 3 — operations and GUI

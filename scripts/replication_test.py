@@ -116,6 +116,41 @@ def main() -> int:
             exec({"op": "sql", "query": "UPDATE orders SET n = 5 WHERE _id = 'o4'"})
             exec({"op": "sql", "query": "DELETE FROM orders WHERE _id = 'o4'"})
 
+            initial_changes = client.get(
+                "/v1/replication/changes?after=0&limit=100", headers=headers
+            )
+            assert initial_changes.status_code == 200, initial_changes.text
+            initial_txns = initial_changes.json()["result"]["changes"]
+            initial_ops = [
+                change["op"] for txn in initial_txns for change in txn["changes"]
+            ]
+            assert "insert" in initial_ops and "update" in initial_ops, initial_ops
+            assert "delete" in initial_ops, initial_ops
+            assert any(
+                change["id"] == "o4"
+                for txn in initial_txns
+                for change in txn["changes"]
+            ), initial_txns
+            initial_batch = next(txn for txn in initial_txns if len(txn["changes"]) == 2)
+            assert {change["id"] for change in initial_batch["changes"]} == {"o2", "o3"}
+
+            snapshot = client.get("/v1/replication/snapshot", headers=headers)
+            assert snapshot.status_code == 200, snapshot.text
+            assert len(snapshot.content) > 4096, len(snapshot.content)
+            assert snapshot.headers["x-nonodb-replication-origin"] == "test-node"
+            assert int(snapshot.headers["x-nonodb-replication-head"]) >= 4
+
+            source_head = client.get(
+                "/v1/replication/status", headers=headers
+            ).json()["result"]["head"]
+            pruned = client.post(
+                "/v1/replication/prune",
+                headers=headers,
+                json={"through": source_head},
+            )
+            assert pruned.status_code == 200, pruned.text
+            assert pruned.json()["result"]["deleted"] == source_head, pruned.text
+
             replica_data = temp / "replica-data"
             replica_data.mkdir()
             replica_port = free_port()
@@ -130,6 +165,7 @@ def main() -> int:
                 NONODB_REPLICATION_SOURCE_TOKEN=admin,
                 NONODB_REPLICATION_DATABASES="default",
                 NONODB_REPLICATION_POLL_INTERVAL="1",
+                NONODB_REPLICATION_BOOTSTRAP="auto",
                 NONODB_LOG="warn",
             )
             replica_log = open(temp / "replica.log", "w", encoding="utf-8")
@@ -161,6 +197,7 @@ def main() -> int:
                     return response.json()["result"]
 
                 deadline = time.monotonic() + 20
+                doc = None
                 while time.monotonic() < deadline:
                     doc = replica_exec(
                         {"op": "find_one", "coll": "orders", "filter": {"_id": "o1"}}
@@ -169,7 +206,17 @@ def main() -> int:
                         break
                     time.sleep(0.1)
                 else:
-                    raise RuntimeError("replica did not apply the initial snapshot")
+                    replica_log.flush()
+                    lines = (temp / "replica.log").read_text(encoding="utf-8").splitlines()
+                    tail = "\n".join(
+                        line for line in lines if "replication" in line.lower() or "ERROR" in line or "WARN" in line
+                    )[-8000:]
+                    collections = replica_exec({"op": "list_collections"})
+                    all_docs = replica_exec({"op": "find", "coll": "orders", "filter": {}})
+                    count = replica_exec({"op": "count", "coll": "orders", "filter": {}})
+                    raise RuntimeError(
+                        f"replica did not apply the initial snapshot: doc={doc} count={count} all={all_docs} collections={collections}\n{tail}"
+                    )
 
                 assert replica_exec(
                     {"op": "find_one", "coll": "orders", "filter": {"_id": "o2"}}
@@ -235,7 +282,7 @@ def main() -> int:
                 applied_total = re.search(
                     r"nonodb_replication_applied_total (\d+)", replica_metrics
                 )
-                assert applied_total and int(applied_total.group(1)) >= 7, replica_metrics[-1000:]
+                assert applied_total and int(applied_total.group(1)) >= 2, replica_metrics[-1000:]
                 assert "nonodb_replication_apply_errors_total 0" in replica_metrics, replica_metrics[-1000:]
             finally:
                 replica.close()
@@ -261,16 +308,14 @@ def main() -> int:
             assert txns, changes.text
             assert all(txn["origin"] == "test-node" for txn in txns)
             ops = [change["op"] for txn in txns for change in txn["changes"]]
-            assert "insert" in ops and "update" in ops and "delete" in ops, ops
+            assert "insert" in ops and "update" in ops, ops
             assert any(
-                change["id"] == "o4"
+                change["id"] == "o5"
                 for txn in txns
                 for change in txn["changes"]
             ), txns
-            batch = next(txn for txn in txns if len(txn["changes"]) == 2)
-            assert {change["id"] for change in batch["changes"]} == {"o2", "o3"}
 
-            print("PASS  replication log, pull apply, read-only replica")
+            print("PASS  replication snapshot, pull apply, read-only replica")
             return 0
     finally:
         if replica_proc is not None:
@@ -291,7 +336,10 @@ def main() -> int:
             log.close()
         import shutil
 
-        shutil.rmtree(temp, ignore_errors=True)
+        if os.environ.get("NONODB_KEEP_REPLICATION_TEMP"):
+            print(f"kept replication test directory: {temp}")
+        else:
+            shutil.rmtree(temp, ignore_errors=True)
 
 
 if __name__ == "__main__":

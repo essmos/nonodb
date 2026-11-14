@@ -7,9 +7,10 @@
 
 use std::{fs, sync::Arc, time::Duration};
 
-use nonodb_core::replication::ReplicationTxn;
+use futures_util::StreamExt;
+use nonodb_core::{replication::ReplicationTxn, Store};
 use serde_json::Value;
-use tokio::sync::watch;
+use tokio::{io::AsyncWriteExt, sync::watch};
 
 use crate::{
     databases::{Databases, DEFAULT_DATABASE},
@@ -26,6 +27,7 @@ struct Config {
     ca_file: Option<String>,
     cert_file: Option<String>,
     key_file: Option<String>,
+    bootstrap: String,
 }
 
 impl Config {
@@ -73,6 +75,11 @@ impl Config {
                 "provide both NONODB_REPLICATION_CERT_FILE and NONODB_REPLICATION_KEY_FILE".into(),
             );
         }
+        let bootstrap = std::env::var("NONODB_REPLICATION_BOOTSTRAP")
+            .ok()
+            .map(|value| value.trim().to_ascii_lowercase())
+            .filter(|value| matches!(value.as_str(), "auto" | "always" | "never"))
+            .unwrap_or_else(|| "auto".to_string());
         Ok(Some(Self {
             source,
             token: non_empty_env("NONODB_REPLICATION_SOURCE_TOKEN"),
@@ -82,6 +89,7 @@ impl Config {
             ca_file,
             cert_file,
             key_file,
+            bootstrap,
         }))
     }
 
@@ -139,6 +147,206 @@ pub fn role() -> String {
 /// through the replication apply path, which bypasses the writer queue.
 pub fn writable() -> bool {
     role() == "primary"
+}
+
+/// Optionally installs a source snapshot before the daemon opens its default
+/// runtime. This is the only safe point to replace a live database directory.
+pub async fn bootstrap_startup(data_root: &std::path::Path) -> Result<(), String> {
+    let Some(config) = Config::from_env()? else {
+        return Ok(());
+    };
+    if config.bootstrap == "never" {
+        return Ok(());
+    }
+    let client = config.client()?;
+    for database in &config.databases {
+        if config.bootstrap == "auto" && !bootstrap_fresh(data_root, database).await? {
+            continue;
+        }
+        let status = match get_json(&client, &config, database, "status", &[]).await {
+            Ok(status) => status,
+            Err(error) => {
+                tracing::warn!(database, error = %error, "replication bootstrap status failed");
+                continue;
+            }
+        };
+        let origin = status
+            .get("origin")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .unwrap_or_default()
+            .to_string();
+        if origin.is_empty() {
+            continue;
+        }
+        match bootstrap_database(&client, &config, data_root, database, &origin).await {
+            Ok(head) => {
+                tracing::info!(database, origin, head, "replication snapshot installed");
+            }
+            Err(error) => {
+                tracing::warn!(database, error = %error, "replication bootstrap failed");
+                if config.bootstrap == "always" {
+                    return Err(error);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn bootstrap_fresh(data_root: &std::path::Path, database: &str) -> Result<bool, String> {
+    let path = data_root.join(database);
+    if !path.join("data.mdb").is_file() {
+        return Ok(true);
+    }
+    let path_for_open = path.clone();
+    let result = tokio::task::spawn_blocking(move || -> Result<(bool, bool), String> {
+        let store = Store::open(&path_for_open).map_err(|error| error.to_string())?;
+        let applied = store
+            .replication_applied_origins()
+            .map_err(|error| error.to_string())?;
+        let collections = store.collections().map_err(|error| error.to_string())?;
+        let env = store.env().clone();
+        drop(store);
+        env.prepare_for_closing().wait();
+        Ok((
+            !applied.is_empty(),
+            collections.iter().any(|name| !name.starts_with('_')),
+        ))
+    })
+    .await
+    .map_err(|error| format!("inspect existing replica data: {error}"))??;
+    Ok(!result.0 && !result.1)
+}
+
+async fn bootstrap_database(
+    client: &reqwest::Client,
+    config: &Config,
+    data_root: &std::path::Path,
+    database: &str,
+    origin: &str,
+) -> Result<u64, String> {
+    let temp = std::env::temp_dir().join(format!(
+        "nonodb-replication-bootstrap-{}-{}-{}",
+        std::process::id(),
+        database,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0)
+    ));
+    tokio::fs::create_dir_all(&temp)
+        .await
+        .map_err(|error| format!("create bootstrap temp dir: {error}"))?;
+    let data_file = temp.join("data.mdb");
+    let result = async {
+        let path = if database == DEFAULT_DATABASE {
+            "/v1/replication/snapshot".to_string()
+        } else {
+            format!("/{database}/v1/replication/snapshot")
+        };
+        let mut request = client
+            .get(format!("{}{}", config.source, path))
+            .header(reqwest::header::ACCEPT, "application/octet-stream");
+        if let Some(token) = &config.token {
+            request = request.bearer_auth(token);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|error| format!("request {path}: {error}"))?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(format!(
+                "{path} -> HTTP {}: {}",
+                status.as_u16(),
+                body.chars().take(500).collect::<String>()
+            ));
+        }
+        let mut file = tokio::fs::File::create(&data_file)
+            .await
+            .map_err(|error| format!("create snapshot file: {error}"))?;
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|error| format!("read snapshot stream: {error}"))?;
+            file.write_all(&chunk)
+                .await
+                .map_err(|error| format!("write snapshot file: {error}"))?;
+        }
+        file.flush()
+            .await
+            .map_err(|error| format!("flush snapshot file: {error}"))?;
+        drop(file);
+
+        let snapshot_dir = temp.clone();
+        let snapshot_head = tokio::task::spawn_blocking(move || -> Result<u64, String> {
+            let store = Store::open(&snapshot_dir).map_err(|error| error.to_string())?;
+            let head = store
+                .replication_head()
+                .map_err(|error| error.to_string())?;
+            let env = store.env().clone();
+            drop(store);
+            env.prepare_for_closing().wait();
+            Ok(head)
+        })
+        .await
+        .map_err(|error| format!("open snapshot: {error}"))??;
+        if snapshot_head == 0 {
+            return Err("source snapshot has no replication head".into());
+        }
+        install_bootstrap_snapshot(data_root, database, origin, snapshot_head, &data_file).await?;
+        Ok(snapshot_head)
+    }
+    .await;
+    let _ = tokio::fs::remove_dir_all(&temp).await;
+    result
+}
+
+async fn install_bootstrap_snapshot(
+    data_root: &std::path::Path,
+    database: &str,
+    origin: &str,
+    head: u64,
+    source: &std::path::Path,
+) -> Result<(), String> {
+    let target = data_root.join(database);
+    let backup = data_root.join(format!(".bootstrap-{database}-{}", std::process::id()));
+    let _ = tokio::fs::remove_dir_all(&backup).await;
+    if target.exists() {
+        tokio::fs::rename(&target, &backup)
+            .await
+            .map_err(|error| format!("move old replica database aside: {error}"))?;
+    }
+    tokio::fs::create_dir_all(&target)
+        .await
+        .map_err(|error| format!("create replica database directory: {error}"))?;
+    if let Err(error) = tokio::fs::copy(source, target.join("data.mdb")).await {
+        let _ = tokio::fs::remove_dir_all(&target).await;
+        let _ = tokio::fs::rename(&backup, &target).await;
+        return Err(format!("install snapshot data: {error}"));
+    }
+    let target_for_open = target.clone();
+    let origin = origin.to_string();
+    let result = tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let store = Store::open(&target_for_open).map_err(|error| error.to_string())?;
+        store
+            .set_replication_state(&origin, head, head)
+            .map_err(|error| error.to_string())?;
+        let env = store.env().clone();
+        drop(store);
+        env.prepare_for_closing().wait();
+        Ok(())
+    })
+    .await
+    .map_err(|error| format!("finalize snapshot: {error}"))?;
+    if let Err(error) = result {
+        let _ = tokio::fs::remove_dir_all(&target).await;
+        let _ = tokio::fs::rename(&backup, &target).await;
+        return Err(format!("finalize snapshot: {error}"));
+    }
+    let _ = tokio::fs::remove_dir_all(&backup).await;
+    Ok(())
 }
 
 pub fn start(databases: Arc<Databases>, shutdown: watch::Receiver<bool>) -> Result<(), String> {

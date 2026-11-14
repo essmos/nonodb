@@ -122,11 +122,12 @@ Design: [docs/replication.md](docs/replication.md).
 - [x] Add pull transport with optional TLS and client mTLS.
 - [x] Add CA path and client certificate/key configuration.
 - [ ] Add certificate rotation and optional pinning.
-- [ ] Add snapshot bootstrap with recorded sequence.
+- [x] Add replication snapshot endpoint, prune endpoint, and fresh-replica
+      snapshot bootstrap with recorded sequence.
 - [x] Add replica apply path with idempotence `(origin, seq)`.
 - [x] Preserve transaction atomicity on the replica and reject client writes.
 - [ ] Add epoch fencing for source changes and promotion.
-- [ ] Add resume tokens, retention, and resync after truncation.
+- [ ] Add automatic resync when the source log was pruned too far.
 - [ ] Add role-aware `/readyz`.
 
 ### Phase 3 — GUI and monitoring
