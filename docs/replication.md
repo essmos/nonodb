@@ -495,3 +495,13 @@ work.
 writes while replicas join dynamically. It verifies snapshot catch-up, replica
 acks, quorum election, source propagation to voters and followers, and that all
 nodes converge after the primary is stopped.
+
+`scripts/replication_load_test.py` runs a seven-host, one-million-document load
+with six nodes joining during the load, eight concurrent writers, and two
+quorum failovers. It also enforces memory limits and uses small replication
+batches so a large transaction does not create an unbounded `/changes`
+response.
+
+Replicas advance their persisted role epoch when they observe a newer epoch in
+the applied stream. This is required for a second failover: the next candidate
+proposes an epoch above the votes cast for the previous primary.

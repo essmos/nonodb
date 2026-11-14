@@ -40,6 +40,35 @@ release build. The latest validation also exercised a 10M-document collection,
 | Background jobs and outbox events | OK (12 Python unit tests; real-daemon integration: atomic rollback, checkpoint restart, retry, late events, 8x100 concurrent producers, watch long-poll, filters/projection, truncation, NDJSON/SSE streams, concurrent stream delivery (6×100 integration; 16×1000 manual stress, 0 missing/duplicate), CLI) |
 | 10k keepalive mixed workload | OK (5 min UDS at 4.9k req/s; 2 min TLS at 4.1k req/s; 0 errors) |
 
+## Multi-host replication load and failover (2026-11-14)
+
+Release binaries, 8 vCPU, 22 GiB RAM, ext4. Seven hosts: primary, four voters,
+and two followers. Five voters provide quorum through two successive failovers.
+The load used 1,000,000 documents, batch size 500, full durability, replication
+batch 10, eight concurrent writers, and a 1,200 MB available-memory guard.
+
+| Workload | Result |
+|---|---|
+| Bulk load, 1M documents | 56.7 s, 17,651 docs/s |
+| Replication convergence to six nodes | 1.09 s after load |
+| Index backfill on `tenant` | 1.45 s |
+| `_id` point reads | 943.8 ops/s, p50 0.79 ms, p95 1.69 ms |
+| Indexed `tenant` reads | p50 0.87 ms, p95 1.74 ms |
+| 8 concurrent writers, 10 s | 8,454 docs, 841.7 docs/s, p50 7.9 ms, p95 18.4 ms |
+| Writer replication convergence | 0.85 s |
+| Failover 1: kill primary | 10.95 s election, 1.03 s source propagation/convergence |
+| Writes after failover 1 | 5,000 docs, 47,459 docs/s |
+| Failover 2: kill candidate1 | 20.82 s election at priority 10, 1.31 s source propagation/convergence |
+| Writes after failover 2 | 5,000 docs, 32,200 docs/s |
+| Final size | 1,018,454 documents on five surviving nodes |
+| Peak RSS | primary 775 MB; replicas 244–306 MB |
+| Data files | ~294 MB per replica, 351 MB primary |
+| Errors | 0 |
+
+Failover 1 elected epoch 1; failover 2 elected epoch 2 after replicas persisted
+the observed epoch. The GUI **Cluster** tab showed five online nodes, two
+offline nodes, and the new primary.
+
 ## Multi-database performance run (2026-11-13)
 
 Release daemon, 8 vCPU Haswell, 22 GiB RAM, ext4, cache disabled, 8 GiB map.

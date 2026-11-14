@@ -774,6 +774,24 @@ pub fn epoch() -> u64 {
         .epoch
 }
 
+/// Advances the local role epoch after observing a newer epoch from the
+/// replication stream. Replicas must remember the source epoch so a later
+/// promotion proposes an epoch higher than every vote already cast.
+pub fn observe_epoch(epoch: u64) -> Result<(), String> {
+    if epoch == 0 {
+        return Ok(());
+    }
+    let mut cell = role_cell()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if epoch <= cell.epoch {
+        return Ok(());
+    }
+    write_role(&cell.path, &cell.role, epoch, cell.successor.as_deref())?;
+    cell.epoch = epoch;
+    Ok(())
+}
+
 #[derive(Clone, Debug, Default)]
 struct RuntimeStatus {
     source: Option<String>,
@@ -1369,12 +1387,14 @@ async fn pull_database(
             return Ok(());
         }
         let mut applied_any = false;
+        let mut observed_epoch = 0u64;
         for value in batch {
             if writable() {
                 return Ok(());
             }
             let txn: ReplicationTxn = serde_json::from_value(value.clone())
                 .map_err(|error| format!("decode replication transaction: {error}"))?;
+            observed_epoch = observed_epoch.max(txn.epoch);
             match runtime.store.apply_replication_txn(&txn) {
                 Ok(applied) => {
                     if applied {
@@ -1390,6 +1410,14 @@ async fn pull_database(
                     return Err(message);
                 }
             }
+        }
+        if observed_epoch > 0 {
+            observe_epoch(observed_epoch).map_err(|error| {
+                metrics::inc(&metrics::REPLICATION_APPLY_ERRORS);
+                let message = format!("persist observed replication epoch: {error}");
+                record_apply_error(&message);
+                message
+            })?;
         }
         if applied_any {
             runtime.cache.invalidate();
