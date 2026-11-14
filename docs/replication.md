@@ -487,3 +487,11 @@ work.
 - How long are tombstones and replication records retained?
 - Should the replication API be on the same listener or a dedicated port?
 - How are vault collections keyed across regions?
+
+
+## Multi-host validation
+
+`scripts/replication_cluster_test.py` runs a five-host cluster with continuous
+writes while replicas join dynamically. It verifies snapshot catch-up, replica
+acks, quorum election, source propagation to voters and followers, and that all
+nodes converge after the primary is stopped.
