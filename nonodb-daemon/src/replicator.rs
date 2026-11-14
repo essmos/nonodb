@@ -389,9 +389,6 @@ pub async fn bootstrap_startup(data_root: &std::path::Path) -> Result<(), String
     record_config(&config);
     let client = config.client()?;
     for database in &config.databases {
-        if config.bootstrap == "auto" && !bootstrap_fresh(data_root, database).await? {
-            continue;
-        }
         let status = match get_json(&client, &config, database, "status", &[]).await {
             Ok(status) => status,
             Err(error) => {
@@ -406,8 +403,40 @@ pub async fn bootstrap_startup(data_root: &std::path::Path) -> Result<(), String
             .unwrap_or_default()
             .to_string();
         let source_epoch = status.get("epoch").and_then(Value::as_u64).unwrap_or(0);
-        if origin.is_empty() {
+        let head = status.get("head").and_then(Value::as_u64).unwrap_or(0);
+        if origin.is_empty() || head == 0 {
             continue;
+        }
+        if config.bootstrap == "auto" {
+            let (fresh, applied) = bootstrap_state(data_root, database, &origin).await?;
+            if !fresh {
+                if applied >= head {
+                    continue;
+                }
+                let changes = get_json(
+                    &client,
+                    &config,
+                    database,
+                    "changes",
+                    &[("after", applied.to_string()), ("limit", "1".into())],
+                )
+                .await?;
+                let first = changes
+                    .get("changes")
+                    .and_then(Value::as_array)
+                    .and_then(|items| items.first())
+                    .and_then(|txn| txn.get("seq"))
+                    .and_then(Value::as_u64);
+                if first == Some(applied + 1) {
+                    continue;
+                }
+                tracing::warn!(
+                    database,
+                    applied,
+                    head,
+                    "replication log gap detected; resyncing from snapshot"
+                );
+            }
         }
         match bootstrap_database(&client, &config, data_root, database, &origin, source_epoch).await
         {
@@ -426,29 +455,34 @@ pub async fn bootstrap_startup(data_root: &std::path::Path) -> Result<(), String
     Ok(())
 }
 
-async fn bootstrap_fresh(data_root: &std::path::Path, database: &str) -> Result<bool, String> {
+async fn bootstrap_state(
+    data_root: &std::path::Path,
+    database: &str,
+    origin: &str,
+) -> Result<(bool, u64), String> {
     let path = data_root.join(database);
     if !path.join("data.mdb").is_file() {
-        return Ok(true);
+        return Ok((true, 0));
     }
     let path_for_open = path.clone();
-    let result = tokio::task::spawn_blocking(move || -> Result<(bool, bool), String> {
+    let origin = origin.to_string();
+    tokio::task::spawn_blocking(move || -> Result<(bool, u64), String> {
         let store = Store::open(&path_for_open).map_err(|error| error.to_string())?;
-        let applied = store
+        let origins = store
             .replication_applied_origins()
             .map_err(|error| error.to_string())?;
         let collections = store.collections().map_err(|error| error.to_string())?;
+        let applied = store
+            .replication_applied(&origin)
+            .map_err(|error| error.to_string())?;
         let env = store.env().clone();
         drop(store);
         env.prepare_for_closing().wait();
-        Ok((
-            !applied.is_empty(),
-            collections.iter().any(|name| !name.starts_with('_')),
-        ))
+        let fresh = origins.is_empty() && !collections.iter().any(|name| !name.starts_with('_'));
+        Ok((fresh, applied))
     })
     .await
-    .map_err(|error| format!("inspect existing replica data: {error}"))??;
-    Ok(!result.0 && !result.1)
+    .map_err(|error| format!("inspect existing replica data: {error}"))?
 }
 
 async fn bootstrap_database(

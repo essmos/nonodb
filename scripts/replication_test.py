@@ -373,6 +373,51 @@ def main() -> int:
             finally:
                 replica.close()
 
+            replica_proc.terminate()
+            replica_proc.wait(timeout=10)
+            replica_log.close()
+
+            exec({"op": "insert", "coll": "orders", "doc": {"_id": "o7", "n": 7}})
+            new_head = client.get(
+                "/v1/replication/status", headers=headers
+            ).json()["result"]["head"]
+            pruned = client.post(
+                "/v1/replication/prune",
+                headers=headers,
+                json={"through": new_head},
+            )
+            assert pruned.status_code == 200, pruned.text
+
+            replica_log = open(temp / "replica.log", "a", encoding="utf-8")
+            replica_proc = subprocess.Popen(
+                [str(DAEMON)], env=replica_env, stdout=replica_log, stderr=subprocess.STDOUT
+            )
+            replica = httpx.Client(base_url=f"http://127.0.0.1:{replica_port}", timeout=30.0)
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline:
+                if replica_proc.poll() is not None:
+                    raise RuntimeError(
+                        f"resynced replica exited with {replica_proc.returncode}"
+                    )
+                try:
+                    if replica.get("/healthz").status_code == 200:
+                        doc = replica.post(
+                            "/v1/exec",
+                            headers=headers,
+                            json={"op": "find_one", "coll": "orders", "filter": {"_id": "o7"}},
+                        ).json()["result"]
+                        if doc and doc.get("n") == 7:
+                            break
+                except (httpx.HTTPError, KeyError):
+                    pass
+                time.sleep(0.1)
+            else:
+                raise RuntimeError("replica did not auto-resync after a log gap")
+            resynced = replica.get("/v1/replication/status", headers=headers).json()["result"]
+            assert resynced["applied"][0]["applied"] >= new_head, resynced
+            assert resynced["applied"][0]["epoch"] == 2, resynced
+            replica.close()
+
             metrics = client.get("/metrics/prometheus", headers=headers).text
             assert 'nonodb_replication_enabled 1' in metrics, metrics[-1000:]
             assert 'nonodb_replication_role{role="primary"} 1' in metrics, metrics[-1000:]
@@ -386,22 +431,9 @@ def main() -> int:
             assert status["origin"] == "test-node", status
             assert status["head"] >= 4, status
 
-            changes = client.get(
-                "/v1/replication/changes?after=0&limit=100", headers=headers
-            )
-            assert changes.status_code == 200, changes.text
-            txns = changes.json()["result"]["changes"]
-            assert txns, changes.text
-            assert all(txn["origin"] == "test-node" for txn in txns)
-            ops = [change["op"] for txn in txns for change in txn["changes"]]
-            assert "insert" in ops and "update" in ops, ops
-            assert any(
-                change["id"] == "o5"
-                for txn in txns
-                for change in txn["changes"]
-            ), txns
+            assert status["head"] >= new_head, status
 
-            print("PASS  replication snapshot, pull apply, read-only replica")
+            print("PASS  replication snapshot, pull, epoch fence, auto-resync")
             return 0
     finally:
         if replica_proc is not None:

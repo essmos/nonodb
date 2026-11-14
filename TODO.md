@@ -129,7 +129,8 @@ Design: [docs/replication.md](docs/replication.md).
 - [x] Add persisted role state and manual promote/demote with expected epoch.
 - [x] Carry the epoch in replication transactions and reject stale epochs.
 - [ ] Add lease-based automatic promotion and fencing.
-- [ ] Add automatic resync when the source log was pruned too far.
+- [x] Add automatic snapshot resync at startup when the source log was pruned.
+- [ ] Add hot resync without restarting the replica.
 - [x] Add role-aware `/readyz` and replication fields to status/GUI.
 
 ### Phase 3 — GUI and monitoring

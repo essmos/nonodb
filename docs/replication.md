@@ -247,11 +247,15 @@ GET /v1/replication/snapshot
 POST /v1/replication/prune   {"through": N}
 ```
 
-`NONODB_REPLICATION_BOOTSTRAP=auto` installs a snapshot only when the local
-database has no applied state and no user collections. `always` installs one
-on every start; `never` disables bootstrap. The snapshot's own replication head
-becomes the initial applied sequence, so changes after that point are pulled
-normally.
+`NONODB_REPLICATION_BOOTSTRAP=auto` installs a snapshot when the local database
+is fresh, or when the source log no longer contains the next sequence the
+replica needs. `always` installs one on every start; `never` disables bootstrap.
+The snapshot's own replication head becomes the initial applied sequence, so
+changes after that point are pulled normally.
+
+The gap check runs at startup, before the runtime opens. If a gap appears while
+the daemon is running, the pull loop reports an error; restart the replica to
+trigger auto-resync. Hot resync without restart is still future work.
 
 ### Manual role changes
 
@@ -305,7 +309,8 @@ work.
 - [x] Applied sequence and lag status/metrics.
 - [x] Snapshot bootstrap with recorded sequence.
 - [ ] Epoch fencing and source changes.
-- [ ] Automatic resync when the source log was pruned too far.
+- [x] Automatic snapshot resync at startup when the source log was pruned too far.
+- [ ] Hot resync without a daemon restart.
 - [ ] Replica readiness policy.
 
 ### Phase 3 — operations and GUI
