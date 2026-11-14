@@ -121,7 +121,8 @@ Design: [docs/replication.md](docs/replication.md).
 
 - [x] Add pull transport with optional TLS and client mTLS.
 - [x] Add CA path and client certificate/key configuration.
-- [ ] Add certificate rotation and optional pinning.
+- [x] Add hot rotation for server TLS and replication client credentials.
+- [ ] Add optional certificate pinning.
 - [x] Add replication snapshot endpoint, prune endpoint, and fresh-replica
       snapshot bootstrap with recorded sequence.
 - [x] Add replica apply path with idempotence `(origin, seq)`.
@@ -131,7 +132,8 @@ Design: [docs/replication.md](docs/replication.md).
 - [x] Require a voter majority before promotion.
 - [x] Add primary quorum leases and self-demotion on lease loss.
 - [x] Add automatic candidate election after the source failure timeout.
-- [ ] Propagate the elected primary to every non-voting replica.
+- [x] Propagate the elected primary to every configured voter.
+- [ ] Add discovery for replicas that are not voters.
 - [x] Add automatic snapshot resync at startup when the source log was pruned.
 - [ ] Add hot resync without restarting the replica.
 - [x] Add role-aware `/readyz` and replication fields to status/GUI.

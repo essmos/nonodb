@@ -561,6 +561,70 @@ async fn acquire_quorum(
     Ok(())
 }
 
+/// Pushes the new primary URL to every configured voter.
+async fn propagate_source(data_root: &std::path::Path, advertise: &str) {
+    let voters = voter_urls();
+    if voters.is_empty() {
+        return;
+    }
+    let config = match Config::load(data_root) {
+        Ok(Some(config)) => config,
+        _ => return,
+    };
+    let token = voter_token();
+    let client = match reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(10))
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => {
+            tracing::warn!(error = %error, "source propagation client failed");
+            return;
+        }
+    };
+    for voter in voters.iter().filter(|voter| *voter != advertise) {
+        let path = "/v1/replication/source";
+        let body = serde_json::to_vec(&serde_json::json!({
+            "source": advertise,
+            "databases": config.databases,
+            "interval_secs": config.interval.as_secs(),
+            "batch": config.limit,
+            "bootstrap": config.bootstrap,
+        }));
+        let body = match body {
+            Ok(body) => body,
+            Err(error) => {
+                tracing::warn!(error = %error, "source propagation body failed");
+                return;
+            }
+        };
+        let mut request = client
+            .put(format!("{voter}{path}"))
+            .header(reqwest::header::ACCEPT, "application/json")
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body);
+        if let Some(token) = &token {
+            request = request.bearer_auth(token);
+        }
+        match request.send().await {
+            Ok(response) if response.status().is_success() => {
+                tracing::info!(voter, source = advertise, "replication source propagated");
+            }
+            Ok(response) => {
+                tracing::warn!(
+                    voter,
+                    status = response.status().as_u16(),
+                    "replication source propagation rejected"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(voter, error = %error, "replication source propagation failed");
+            }
+        }
+    }
+}
+
 /// Promotes this node after attempting to demote the current source and point
 /// it at this node's advertised replication URL.
 pub async fn promote_with_fence(
@@ -570,7 +634,7 @@ pub async fn promote_with_fence(
 ) -> Result<RoleView, (String, String)> {
     let advertise = non_empty_env("NONODB_REPLICATION_ADVERTISE_URL")
         .map(|value| value.trim().trim_end_matches('/').to_string());
-    if let Some(advertise) = advertise {
+    if let Some(advertise) = advertise.clone() {
         if !advertise.starts_with("http://") && !advertise.starts_with("https://") {
             return Err((
                 "invalid_advertise_url".to_string(),
@@ -621,7 +685,11 @@ pub async fn promote_with_fence(
             }
         }
     }
-    promote(expected_epoch)
+    let role = promote(expected_epoch)?;
+    if let Some(advertise) = advertise {
+        propagate_source(data_root, &advertise).await;
+    }
+    Ok(role)
 }
 
 pub fn promote(expected_epoch: u64) -> Result<RoleView, (String, String)> {

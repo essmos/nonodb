@@ -142,6 +142,22 @@ def main() -> int:
             raise RuntimeError(f"candidate did not win the election: {status}")
         assert status["read_only"] is False, status
         assert status["epoch"] == 1, status
+        voter_client = clients["voter"]
+        deadline = time.monotonic() + 10
+        voter_status = None
+        while time.monotonic() < deadline:
+            voter_status = voter_client.get(
+                "/v1/replication/status", headers=headers
+            ).json()["result"]
+            if voter_status["replication"].get("source") == (
+                f"http://127.0.0.1:{ports['candidate']}"
+            ):
+                break
+            time.sleep(0.2)
+        else:
+            raise RuntimeError(
+                f"voter did not switch to the elected primary: {voter_status}"
+            )
         insert = candidate.post(
             "/v1/exec",
             headers=headers,
