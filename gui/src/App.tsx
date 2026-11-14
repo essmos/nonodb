@@ -1611,8 +1611,12 @@ function ClusterPage({ connection }: { connection: Connection }) {
                   <div className="cluster-detail"><span>Reads</span><strong>{metric(node, 'read_ops_total').toLocaleString()}</strong></div>
                   <div className="cluster-detail"><span>Errors</span><strong>{metric(node, 'errors_total').toLocaleString()}</strong></div>
                   <div className="cluster-detail"><span>Disk used</span><strong>{(Number(node.metrics?.disk?.data?.used_ratio ?? 0) * 100).toFixed(1)}%</strong></div>
-                  {status?.replication?.last_transport_error && <div className="error-box">transport: {status.replication.last_transport_error}</div>}
-                  {status?.replication?.last_apply_error && <div className="error-box">apply: {status.replication.last_apply_error}</div>}
+                  {activeReplicationError(status?.replication).transport && (
+                    <div className="error-box">transport: {activeReplicationError(status?.replication).transport}</div>
+                  )}
+                  {activeReplicationError(status?.replication).apply && (
+                    <div className="error-box">apply: {activeReplicationError(status?.replication).apply}</div>
+                  )}
                 </>
               )}
             </section>
@@ -1626,6 +1630,19 @@ function ClusterPage({ connection }: { connection: Connection }) {
       )}
     </div>
   );
+}
+
+function activeReplicationError(
+  replication: ReplicationStatus['replication'] | undefined,
+): { transport: string | null; apply: string | null } {
+  if (!replication) return { transport: null, apply: null };
+  const errorIsNewer =
+    (replication.last_error_unix ?? 0) > (replication.last_success_unix ?? 0);
+  if (!errorIsNewer) return { transport: null, apply: null };
+  return {
+    transport: replication.last_transport_error ?? null,
+    apply: replication.last_apply_error ?? null,
+  };
 }
 
 function ReplicationPage({ connection }: { connection: Connection }) {
@@ -1753,8 +1770,12 @@ function ReplicationPage({ connection }: { connection: Connection }) {
             <div className="stat"><span>Last success</span><strong>{status.replication.last_success_unix ? new Date(status.replication.last_success_unix * 1000).toLocaleString() : '—'}</strong></div>
             <div className="stat"><span>Databases</span><strong className="mono">{(status.replication.databases ?? []).join(', ') || '—'}</strong></div>
           </div>
-          {status.replication.last_transport_error && <div className="error-box">transport: {status.replication.last_transport_error}</div>}
-          {status.replication.last_apply_error && <div className="error-box">apply: {status.replication.last_apply_error}</div>}
+          {activeReplicationError(status.replication).transport && (
+            <div className="error-box">transport: {activeReplicationError(status.replication).transport}</div>
+          )}
+          {activeReplicationError(status.replication).apply && (
+            <div className="error-box">apply: {activeReplicationError(status.replication).apply}</div>
+          )}
           <div className="panel-title"><h3>Source settings</h3></div>
           <div className="form-grid">
             <label>Source URL<input value={sourceDraft} onChange={(e) => setSourceDraft(e.target.value)} placeholder="https://primary:7878" /></label>

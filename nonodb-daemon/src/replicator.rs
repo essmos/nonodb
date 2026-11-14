@@ -827,6 +827,10 @@ fn record_source(source: &PersistedSource) {
     status.databases = source.databases.clone();
     status.interval_secs = source.interval_secs;
     status.bootstrap = source.bootstrap.clone();
+    status.last_success_unix = 0;
+    status.last_error_unix = 0;
+    status.last_transport_error = None;
+    status.last_apply_error = None;
 }
 
 fn record_success() {
@@ -834,6 +838,9 @@ fn record_success() {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     status.last_success_unix = unix_now();
+    status.last_error_unix = 0;
+    status.last_transport_error = None;
+    status.last_apply_error = None;
 }
 
 fn record_transport_error(message: &str) {
