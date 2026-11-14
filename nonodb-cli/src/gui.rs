@@ -159,7 +159,7 @@ fn handle(mut client: TcpStream, target: &Target) -> Result<(), String> {
     }
     let plain_path = request.path.split('?').next().unwrap_or("");
     let segments: Vec<&str> = plain_path.trim_start_matches('/').split('/').collect();
-    let database_scoped = segments.len() == 3
+    let database_scoped = segments.len() >= 3
         && !segments[0].is_empty()
         && segments[0] != "v1"
         && segments[1] == "v1";
@@ -179,6 +179,7 @@ fn handle(mut client: TcpStream, target: &Target) -> Result<(), String> {
         || plain_path.starts_with("/v1/import/")
         || plain_path == "/v1/replication"
         || plain_path.starts_with("/v1/replication/")
+        || (database_scoped && segments[2] == "replication")
         || (database_scoped && segments[2] == "exec")
     {
         return proxy(client, target, &request);

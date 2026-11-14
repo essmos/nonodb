@@ -1596,7 +1596,7 @@ function ReplicationPage({ connection }: { connection: Connection }) {
       <header className="page-header">
         <div>
           <h2>Replication</h2>
-          <p>Durable writer log and node role. Network transport and replica apply are not enabled yet.</p>
+          <p>Live replication role, write routing, applied sources, replica acknowledgements, and transport health.</p>
         </div>
         <div className="actions">
           <button onClick={() => void load()} disabled={loading}>{loading ? 'Loading…' : 'Refresh'}</button>

@@ -180,6 +180,10 @@ def main() -> int:
                 )
             )
             assert result["result"] == [{"_id": "o1", "n": 1}], result
+            replication = json.loads(
+                fetch(base + "/app1/v1/replication/status")
+            )
+            assert replication["result"]["database"] == "app1", replication
             print("gui e2e: ok")
             return 0
         finally:

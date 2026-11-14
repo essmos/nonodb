@@ -658,7 +658,8 @@ async function replicationWrite(
   method: string,
   body: Record<string, unknown>,
 ): Promise<Record<string, unknown>> {
-  const response = await fetch(endpointFor(connection, scopedPath(connection, path)), {
+  // Role/source controls are instance-wide; do not database-scope them.
+  const response = await fetch(endpointFor(connection, path), {
     method,
     headers: { ...headers(connection), 'content-type': 'application/json' },
     body: JSON.stringify(body),
