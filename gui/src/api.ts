@@ -558,6 +558,64 @@ export function importStatus(connection: Connection, id: string): Promise<Import
   return backupRequest<ImportStatus>(connection, `/v1/import/status/${encodeURIComponent(id)}`);
 }
 
+export type ReplicationStatus = {
+  database: string;
+  enabled: boolean;
+  origin?: string | null;
+  role: string;
+  head: number;
+};
+
+export type ReplicationChangeTxn = {
+  seq: number;
+  origin: string;
+  created_at_ms: number;
+  changes: Array<{
+    collection: string;
+    op: string;
+    id: string;
+    before?: Record<string, unknown> | null;
+    after?: Record<string, unknown> | null;
+  }>;
+};
+
+export function replicationStatus(connection: Connection): Promise<ReplicationStatus> {
+  return replicationRequest<ReplicationStatus>(
+    connection,
+    scopedPath(connection, '/v1/replication/status'),
+  );
+}
+
+export function replicationChanges(
+  connection: Connection,
+  after = 0,
+  limit = 50,
+): Promise<{ database: string; after: number; changes: ReplicationChangeTxn[] }> {
+  return replicationRequest(
+    connection,
+    `${scopedPath(connection, '/v1/replication/changes')}?after=${after}&limit=${limit}`,
+  );
+}
+
+async function replicationRequest<T>(connection: Connection, path: string): Promise<T> {
+  const response = await fetch(endpointFor(connection, path), { headers: headers(connection) });
+  let payload: any = null;
+  try {
+    payload = await response.json();
+  } catch {
+    throw new ApiError('invalid_response', `HTTP ${response.status}`, response.status);
+  }
+  if (!response.ok || payload?.ok === false) {
+    const error = payload?.error ?? {};
+    throw new ApiError(
+      error.code ?? 'http_error',
+      error.message ?? `HTTP ${response.status}`,
+      response.status,
+    );
+  }
+  return payload?.result as T;
+}
+
 export function errorText(error: unknown): string {
   if (error instanceof ApiError) return `${error.code}: ${error.message}`;
   if (error instanceof Error) return error.message;

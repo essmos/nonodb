@@ -25,6 +25,8 @@ import {
   health,
   importOverview,
   importStatus,
+  replicationChanges,
+  replicationStatus,
   runImport,
   loadConnection,
   loadProfiles,
@@ -43,6 +45,8 @@ import {
   type ImportSource,
   type ImportStatus,
   type ImportOverview,
+  type ReplicationChangeTxn,
+  type ReplicationStatus,
   type DatabaseStorageStats,
   subscribeTiming,
   updateAuthToken,
@@ -1500,6 +1504,97 @@ function ImportsPage({ connection }: { connection: Connection }) {
           </div>
         ) : (
           <p className="muted">No imports yet.</p>
+        )}
+      </section>
+    </div>
+  );
+}
+
+function ReplicationPage({ connection }: { connection: Connection }) {
+  const [status, setStatus] = useState<ReplicationStatus | null>(null);
+  const [changes, setChanges] = useState<ReplicationChangeTxn[]>([]);
+  const [error, setError] = useState('');
+  const [loading, setLoading] = useState(false);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    setError('');
+    try {
+      const [nextStatus, nextChanges] = await Promise.all([
+        replicationStatus(connection),
+        replicationChanges(connection, 0, 50),
+      ]);
+      setStatus(nextStatus);
+      setChanges(nextChanges.changes);
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setLoading(false);
+    }
+  }, [connection]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  return (
+    <div className="page">
+      <header className="page-header">
+        <div>
+          <h2>Replication</h2>
+          <p>Durable writer log and node role. Network transport and replica apply are not enabled yet.</p>
+        </div>
+        <div className="actions">
+          <button onClick={() => void load()} disabled={loading}>{loading ? 'Loading…' : 'Refresh'}</button>
+        </div>
+      </header>
+      {error && <div className="error-box">{error}</div>}
+      <section className="panel">
+        <div className="panel-title">
+          <h3>Node status</h3>
+          {status && <span className={`badge ${status.role === 'primary' ? '' : 'danger-badge'}`}>{status.role}</span>}
+        </div>
+        {status ? (
+          <div className="stat-grid">
+            <div className="stat"><span>Database</span><strong>{status.database}</strong></div>
+            <div className="stat"><span>Log capture</span><strong>{status.enabled ? 'enabled' : 'disabled'}</strong></div>
+            <div className="stat"><span>Origin</span><strong className="mono">{status.origin ?? '—'}</strong></div>
+            <div className="stat"><span>Head sequence</span><strong>{status.head.toLocaleString()}</strong></div>
+          </div>
+        ) : (
+          <p className="muted">No status available.</p>
+        )}
+        {status && !status.enabled && (
+          <p className="field-hint">
+            Set <code>NONODB_REPLICATION_ENABLED=1</code> and
+            <code> NONODB_REPLICATION_ORIGIN</code> on the daemon to capture changes.
+          </p>
+        )}
+      </section>
+      <section className="panel">
+        <div className="panel-title"><h3>Recent replication transactions</h3><span>{changes.length}</span></div>
+        {changes.length === 0 ? (
+          <p className="muted">No replicated transactions captured.</p>
+        ) : (
+          <div className="index-list">
+            {changes.slice().reverse().map((txn) => (
+              <div key={txn.seq} className="index-row replication-row">
+                <div>
+                  <strong>seq {txn.seq}</strong>
+                  <span className="badge">{txn.origin}</span>
+                  <div className="muted small">{new Date(txn.created_at_ms).toLocaleString()}</div>
+                  <div className="muted small">
+                    {txn.changes.map((change, index) => (
+                      <span key={`${txn.seq}:${index}`} className="replication-change">
+                        {change.op} {change.collection}/{change.id}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+                <span className="muted small">{txn.changes.length} change{txn.changes.length === 1 ? '' : 's'}</span>
+              </div>
+            ))}
+          </div>
         )}
       </section>
     </div>
@@ -3757,7 +3852,7 @@ function Shell({
 }) {
   const [collections, setCollections] = useState<string[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
-  const [tab, setTab] = useState<'dashboard' | 'storage' | 'sql' | 'database' | 'backups' | 'import' | 'auth'>('dashboard');
+  const [tab, setTab] = useState<'dashboard' | 'storage' | 'sql' | 'database' | 'backups' | 'import' | 'replication' | 'auth'>('dashboard');
   const [showNewCollection, setShowNewCollection] = useState(false);
   const [showPalette, setShowPalette] = useState(false);
   const [paletteQuery, setPaletteQuery] = useState('');
@@ -3888,6 +3983,9 @@ function Shell({
           <button className={tab === 'import' ? 'active' : ''} onClick={() => setTab('import')}>
             Import
           </button>
+          <button className={tab === 'replication' ? 'active' : ''} onClick={() => setTab('replication')}>
+            Replication
+          </button>
           <button className={tab === 'auth' ? 'active' : ''} onClick={() => setTab('auth')}>
             Authorization
           </button>
@@ -3968,6 +4066,8 @@ function Shell({
           <BackupsPage connection={connection} />
         ) : tab === 'import' ? (
           <ImportsPage connection={connection} />
+        ) : tab === 'replication' ? (
+          <ReplicationPage connection={connection} />
         ) : tab === 'auth' ? (
           <AuthView connection={connection} />
         ) : selected ? (
@@ -4001,6 +4101,7 @@ function Shell({
               { label: 'Open Database settings', run: () => setTab('database') },
               { label: 'Open Backups', run: () => setTab('backups') },
               { label: 'Open Import', run: () => setTab('import') },
+              { label: 'Open Replication', run: () => setTab('replication') },
               { label: 'Open Authorization', run: () => setTab('auth') },
               { label: 'New collection', run: () => setShowNewCollection(true) },
               ...collections.map((coll) => ({ label: `Open collection: ${coll}`, run: () => openCollection(coll) })),

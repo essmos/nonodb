@@ -110,6 +110,8 @@ Design: [docs/replication.md](docs/replication.md).
 - [ ] Capture SQL writes in the replication log.
 - [ ] Decide whether vault writes, index/history/config changes are replicated
       or rebuilt.
+- [x] Add a read-only GUI Replication tab showing role, origin, head, and recent
+      transactions.
 - [ ] Add Prometheus replication role, head, applied, lag, and error metrics.
 
 ### Phase 2 — primary → replica

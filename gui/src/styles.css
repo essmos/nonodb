@@ -650,6 +650,16 @@ h3 {
   box-shadow: 0 0 0 1px var(--accent);
 }
 
+.replication-row {
+  align-items: flex-start;
+}
+
+.replication-change {
+  display: inline-block;
+  margin-right: 0.55rem;
+  white-space: nowrap;
+}
+
 .badge {
   margin-left: 0.5rem;
   border-radius: 999px;

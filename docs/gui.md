@@ -260,6 +260,19 @@ The importer verifies the checksum, decrypts age with
 `NONODB_BACKUP_IDENTITY_FILE` when needed, decompresses gzip, verifies the LMDB
 database, and refuses to overwrite an existing database.
 
+### Replication
+
+The current branch exposes a read-only replication foundation:
+
+- node role badge and origin;
+- durable log capture status;
+- head sequence;
+- recent replication transactions with grouped collection/op/id changes.
+
+Network transport, peer setup, replica apply, and promote/demote are still
+planned. When log capture is disabled, the tab shows the required
+`NONODB_REPLICATION_ENABLED` and `NONODB_REPLICATION_ORIGIN` settings.
+
 ### Authorization
 
 - principal list with database-qualified scopes and edit/delete controls;

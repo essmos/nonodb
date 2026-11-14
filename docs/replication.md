@@ -242,7 +242,8 @@ writes without the required standby/quorum.
 
 ### Phase 3 — operations and GUI
 
-- [ ] Replication tab, peer wizard, role banner.
+- [x] Read-only Replication tab with role, origin, head, and recent log entries.
+- [ ] Peer wizard, full role banner, and write-control gating.
 - [ ] Add peer, test connection, pause/resume, resync.
 - [ ] Promote/demote with confirmation and audit.
 - [ ] Certificate expiry and lag dashboards.
