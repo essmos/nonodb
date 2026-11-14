@@ -11,7 +11,10 @@ use nonodb_core::replication::ReplicationTxn;
 use serde_json::Value;
 use tokio::sync::watch;
 
-use crate::databases::{Databases, DEFAULT_DATABASE};
+use crate::{
+    databases::{Databases, DEFAULT_DATABASE},
+    metrics,
+};
 
 #[derive(Clone, Debug)]
 struct Config {
@@ -108,6 +111,13 @@ impl Config {
             .build()
             .map_err(|error| format!("build replication HTTP client: {error}"))
     }
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
 }
 
 fn non_empty_env(name: &str) -> Option<String> {
@@ -222,13 +232,29 @@ async fn pull_database(
         if batch.is_empty() {
             return Ok(());
         }
+        let mut applied_any = false;
         for value in batch {
             let txn: ReplicationTxn = serde_json::from_value(value.clone())
                 .map_err(|error| format!("decode replication transaction: {error}"))?;
-            runtime
-                .store
-                .apply_replication_txn(&txn)
-                .map_err(|error| format!("apply replication transaction {}: {error}", txn.seq))?;
+            match runtime.store.apply_replication_txn(&txn) {
+                Ok(applied) => {
+                    if applied {
+                        applied_any = true;
+                        metrics::inc(&metrics::REPLICATION_APPLIED_TOTAL);
+                    }
+                }
+                Err(error) => {
+                    metrics::inc(&metrics::REPLICATION_APPLY_ERRORS);
+                    return Err(format!(
+                        "apply replication transaction {}: {error}",
+                        txn.seq
+                    ));
+                }
+            }
+        }
+        if applied_any {
+            runtime.cache.invalidate();
+            metrics::set(&metrics::REPLICATION_LAST_SUCCESS_UNIX, unix_now());
         }
         if batch.len() < config.limit {
             return Ok(());
@@ -267,18 +293,21 @@ async fn get_json(
     if let Some(token) = &config.token {
         request = request.bearer_auth(token);
     }
-    let response = request
-        .send()
-        .await
-        .map_err(|error| format!("request {path}: {error}"))?;
+    let response = request.send().await.map_err(|error| {
+        metrics::inc(&metrics::REPLICATION_TRANSPORT_ERRORS);
+        format!("request {path}: {error}")
+    })?;
     let status = response.status();
-    let body = response
-        .text()
-        .await
-        .map_err(|error| format!("read {path} response: {error}"))?;
-    let payload: Value =
-        serde_json::from_str(&body).map_err(|error| format!("decode {path} response: {error}"))?;
+    let body = response.text().await.map_err(|error| {
+        metrics::inc(&metrics::REPLICATION_TRANSPORT_ERRORS);
+        format!("read {path} response: {error}")
+    })?;
+    let payload: Value = serde_json::from_str(&body).map_err(|error| {
+        metrics::inc(&metrics::REPLICATION_TRANSPORT_ERRORS);
+        format!("decode {path} response: {error}")
+    })?;
     if !status.is_success() || payload.get("ok").and_then(Value::as_bool) == Some(false) {
+        metrics::inc(&metrics::REPLICATION_TRANSPORT_ERRORS);
         let code = payload
             .pointer("/error/code")
             .and_then(Value::as_str)

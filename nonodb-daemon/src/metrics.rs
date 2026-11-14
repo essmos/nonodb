@@ -68,6 +68,11 @@ pub static AUTH_BLOCKS: AtomicU64 = AtomicU64::new(0);
 pub static AUTH_BLOCKED_REQUESTS: AtomicU64 = AtomicU64::new(0);
 pub static AUTH_BLOCKED_CLIENTS: AtomicU64 = AtomicU64::new(0);
 
+pub static REPLICATION_TRANSPORT_ERRORS: AtomicU64 = AtomicU64::new(0);
+pub static REPLICATION_APPLY_ERRORS: AtomicU64 = AtomicU64::new(0);
+pub static REPLICATION_APPLIED_TOTAL: AtomicU64 = AtomicU64::new(0);
+pub static REPLICATION_LAST_SUCCESS_UNIX: AtomicU64 = AtomicU64::new(0);
+
 #[derive(Clone, Debug, Default)]
 struct SnapshotCounters {
     success_total: u64,
@@ -464,6 +469,10 @@ pub fn snapshot() -> Value {
         "auth_blocks_total": AUTH_BLOCKS.load(Relaxed),
         "auth_blocked_requests_total": AUTH_BLOCKED_REQUESTS.load(Relaxed),
         "auth_blocked_clients": AUTH_BLOCKED_CLIENTS.load(Relaxed),
+        "replication_transport_errors_total": REPLICATION_TRANSPORT_ERRORS.load(Relaxed),
+        "replication_apply_errors_total": REPLICATION_APPLY_ERRORS.load(Relaxed),
+        "replication_applied_total": REPLICATION_APPLIED_TOTAL.load(Relaxed),
+        "replication_last_success_unix": REPLICATION_LAST_SUCCESS_UNIX.load(Relaxed),
         "collection_metrics": collection_metrics,
         "collection_metrics_overflow_total": COLLECTION_METRICS_OVERFLOW.load(Relaxed),
         "commit_ns_total": commit_ns,
@@ -873,6 +882,26 @@ pub fn prometheus() -> String {
             "nonodb_auth_blocked_clients",
             "auth_blocked_clients",
             "Currently blocked client IPs.",
+        ),
+        (
+            "nonodb_replication_transport_errors_total",
+            "replication_transport_errors_total",
+            "Replication pull transport or decode errors.",
+        ),
+        (
+            "nonodb_replication_apply_errors_total",
+            "replication_apply_errors_total",
+            "Replication apply errors.",
+        ),
+        (
+            "nonodb_replication_applied_total",
+            "replication_applied_total",
+            "Replication transactions applied successfully.",
+        ),
+        (
+            "nonodb_replication_last_success_unix",
+            "replication_last_success_unix",
+            "Unix time of the last successful replication pull.",
         ),
         (
             "nonodb_ttl_backlog",

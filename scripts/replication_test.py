@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import socket
 import subprocess
 import tempfile
@@ -180,6 +181,25 @@ def main() -> int:
                     {"op": "find_one", "coll": "orders", "filter": {"_id": "o4"}}
                 ) is None
 
+                exec(
+                    {
+                        "op": "update",
+                        "coll": "orders",
+                        "filter": {"_id": "o1"},
+                        "update": {"$set": {"n": 3}},
+                    }
+                )
+                deadline = time.monotonic() + 20
+                while time.monotonic() < deadline:
+                    doc = replica_exec(
+                        {"op": "find_one", "coll": "orders", "filter": {"_id": "o1"}}
+                    )
+                    if doc and doc.get("n") == 3:
+                        break
+                    time.sleep(0.1)
+                else:
+                    raise RuntimeError("replica served a stale cached read after apply")
+
                 exec({"op": "insert", "coll": "orders", "doc": {"_id": "o5", "n": 5}})
                 deadline = time.monotonic() + 20
                 while time.monotonic() < deadline:
@@ -212,6 +232,11 @@ def main() -> int:
                 ).text
                 assert 'nonodb_replication_applied{database="default",origin="test-node"}' in replica_metrics, replica_metrics[-1000:]
                 assert 'nonodb_replication_lag{database="default",origin="test-node"} 0' in replica_metrics, replica_metrics[-1000:]
+                applied_total = re.search(
+                    r"nonodb_replication_applied_total (\d+)", replica_metrics
+                )
+                assert applied_total and int(applied_total.group(1)) >= 7, replica_metrics[-1000:]
+                assert "nonodb_replication_apply_errors_total 0" in replica_metrics, replica_metrics[-1000:]
             finally:
                 replica.close()
 

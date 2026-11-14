@@ -234,7 +234,8 @@ client certificate. `NONODB_REPLICATION_CA_FILE`,
 
 Apply is atomic per source transaction and idempotent for `(origin, seq)`.
 Replicas record the source head and expose `applied`/`lag` in status and
-Prometheus. A gap returns an error instead of skipping transactions.
+Prometheus. A gap returns an error instead of skipping transactions. Apply
+invalidates the replica query cache, and transport/apply failures are counted.
 
 Snapshot bootstrap, epochs, and promotion are not implemented yet, so this is
 not yet a production failover mechanism.
@@ -253,7 +254,8 @@ not yet a production failover mechanism.
 - [ ] Vault write capture.
 - [x] Role, capture, origin, and head metrics.
 - [x] Applied sequence and lag metrics.
-- [ ] Transport and apply-error counters.
+- [x] Transport and apply-error counters.
+- [x] Cache invalidation after replica apply.
 
 ### Phase 2 — primary → replica
 

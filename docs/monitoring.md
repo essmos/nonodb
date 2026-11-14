@@ -155,10 +155,15 @@ They are cheap gauges read from LMDB; they do not scan documents.
 | `nonodb_replication_head{database}` | Highest allocated replication sequence |
 | `nonodb_replication_applied{database,origin}` | Highest applied source sequence |
 | `nonodb_replication_lag{database,origin}` | Source head minus applied sequence |
+| `nonodb_replication_applied_total` | Transactions applied successfully |
+| `nonodb_replication_transport_errors_total` | Pull transport, HTTP, or decode errors |
+| `nonodb_replication_apply_errors_total` | Failed replica applies |
+| `nonodb_replication_last_success_unix` | Unix time of the last successful pull |
 
 `nonodb_replication_head` is the local log head. On a replica,
 `nonodb_replication_applied` and `nonodb_replication_lag` track the configured
-source. Transport and apply-error counters are not implemented yet.
+source. Apply also invalidates the replica query cache so reads do not serve
+stale documents.
 
 ## Recommended alerts
 

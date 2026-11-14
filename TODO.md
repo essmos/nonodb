@@ -115,7 +115,7 @@ Design: [docs/replication.md](docs/replication.md).
       transactions.
 - [x] Add Prometheus replication enabled, role, origin, and head metrics.
 - [x] Add applied sequence and lag to status and Prometheus metrics.
-- [ ] Add transport and apply-error counters.
+- [x] Add transport and apply-error counters and cache invalidation on apply.
 
 ### Phase 2 — primary → replica
 
