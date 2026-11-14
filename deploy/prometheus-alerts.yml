@@ -99,3 +99,30 @@ groups:
         annotations:
           summary: NonoDB collection errors are elevated
           description: Collection {{ $labels.database }}/{{ $labels.collection }} is producing more than one error per second.
+
+      - alert: NonoDBReplicationLagHigh
+        expr: max by (database, origin) (nonodb_replication_lag) > 100
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: NonoDB replica lag is high
+          description: Replica {{ $labels.database }}/{{ $labels.origin }} is more than 100 sequences behind.
+
+      - alert: NonoDBReplicationTransportErrors
+        expr: increase(nonodb_replication_transport_errors_total[10m]) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: NonoDB replication transport errors
+          description: The pull loop reported transport, HTTP, or decode errors in the last ten minutes.
+
+      - alert: NonoDBReplicationApplyErrors
+        expr: increase(nonodb_replication_apply_errors_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: NonoDB replication apply failures
+          description: A replica failed to apply a replication transaction. Check logs and status for the failing sequence.

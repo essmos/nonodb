@@ -552,6 +552,7 @@ fn prom_sample(out: &mut String, name: &str, labels: &[(&str, &str)], value: &Va
 /// intentionally generated from the same snapshot as `/metrics` so the two
 /// representations cannot drift.
 /// Appends per-database replication metrics gathered by the HTTP handler.
+#[allow(clippy::too_many_arguments)]
 pub fn append_replication_metrics(
     out: &mut String,
     enabled: bool,
@@ -560,6 +561,7 @@ pub fn append_replication_metrics(
     epoch: u64,
     heads: &[(String, u64)],
     applied: &[(String, String, u64, u64, u64)],
+    acks: &[(String, String, String, u64)],
 ) {
     prom_header(
         out,
@@ -655,6 +657,55 @@ pub fn append_replication_metrics(
             "nonodb_replication_lag",
             &[("database", database), ("origin", origin)],
             &json!(source_head.saturating_sub(*seq)),
+        );
+    }
+    prom_header(
+        out,
+        "nonodb_replication_min_ack",
+        "gauge",
+        "Minimum acknowledged source sequence across replicas.",
+    );
+    prom_header(
+        out,
+        "nonodb_replication_ack_nodes",
+        "gauge",
+        "Number of replicas that acknowledged the source.",
+    );
+    let mut groups: std::collections::BTreeMap<(String, String), Vec<u64>> =
+        std::collections::BTreeMap::new();
+    for (database, origin, _node, seq) in acks {
+        groups
+            .entry((database.clone(), origin.clone()))
+            .or_default()
+            .push(*seq);
+    }
+    for ((database, origin), values) in &groups {
+        let labels = [("database", database.as_str()), ("origin", origin.as_str())];
+        prom_sample(
+            out,
+            "nonodb_replication_min_ack",
+            &labels,
+            &json!(values.iter().copied().min().unwrap_or(0)),
+        );
+        prom_sample(
+            out,
+            "nonodb_replication_ack_nodes",
+            &labels,
+            &json!(values.len()),
+        );
+    }
+    prom_header(
+        out,
+        "nonodb_replication_ack_seq",
+        "gauge",
+        "Applied sequence acknowledged by each replica.",
+    );
+    for (database, origin, node, seq) in acks {
+        prom_sample(
+            out,
+            "nonodb_replication_ack_seq",
+            &[("database", database), ("origin", origin), ("node", node)],
+            &json!(seq),
         );
     }
 }

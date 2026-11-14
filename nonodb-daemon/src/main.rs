@@ -1026,6 +1026,8 @@ async fn prometheus_handler(
     }
     let mut heads = Vec::new();
     let mut applied = Vec::new();
+    let mut acks = Vec::new();
+    let origin = writer::replication_origin();
     for name in state.databases.names().await {
         if let Ok(runtime) = state.databases.get(&name).await {
             if let Ok(head) = runtime.store.replication_head() {
@@ -1041,9 +1043,15 @@ async fn prometheus_handler(
                     applied.push((name.clone(), origin, seq, source_head, epoch));
                 }
             }
+            if let Some(origin) = &origin {
+                if let Ok(replica_acks) = runtime.store.replica_acks(origin) {
+                    for (node, seq) in replica_acks {
+                        acks.push((name.clone(), origin.clone(), node, seq));
+                    }
+                }
+            }
         }
     }
-    let origin = writer::replication_origin();
     let role = replicator::role();
     let mut body = metrics::prometheus();
     metrics::append_replication_metrics(
@@ -1054,6 +1062,7 @@ async fn prometheus_handler(
         replicator::epoch(),
         &heads,
         &applied,
+        &acks,
     );
     (
         [(

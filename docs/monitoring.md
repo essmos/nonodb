@@ -109,7 +109,8 @@ Tempo/Mimir, Honeycomb, Datadog, and self-hosted OpenTelemetry Collectors.
 - data disk above 85% and 95%;
 - stale snapshots and snapshot failures;
 - elevated authentication failures and IP lockouts;
-- per-collection error rate.
+- per-collection error rate;
+- replica lag, replication transport errors, and apply failures.
 
 Tune thresholds and `for:` durations for the deployment. The disk alerts use
 `mount="data"`; snapshot alerts only fire when periodic snapshots are enabled
@@ -163,6 +164,9 @@ They are cheap gauges read from LMDB; they do not scan documents.
 | `nonodb_replication_last_success_unix` | Unix time of the last successful pull |
 | `nonodb_replication_retention_runs_total` | Retention passes with replica acks |
 | `nonodb_replication_pruned_total` | Log entries removed by automatic retention |
+| `nonodb_replication_min_ack{database,origin}` | Minimum acknowledged replica sequence |
+| `nonodb_replication_ack_nodes{database,origin}` | Number of replicas that acknowledged the source |
+| `nonodb_replication_ack_seq{database,origin,node}` | Sequence acknowledged by one replica |
 
 `nonodb_replication_head` is the local log head. On a replica,
 `nonodb_replication_applied` and `nonodb_replication_lag` track the configured

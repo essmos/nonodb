@@ -492,6 +492,9 @@ def main() -> int:
             assert 'nonodb_replication_role{role="primary"} 1' in metrics, metrics[-1000:]
             assert 'nonodb_replication_origin_info{origin="test-node"} 1' in metrics, metrics[-1000:]
             assert 'nonodb_replication_head{database="default"}' in metrics, metrics[-1000:]
+            assert 'nonodb_replication_ack_seq{database="default",origin="test-node",node="replica-1"}' in metrics, metrics[-1000:]
+            assert 'nonodb_replication_min_ack{database="default",origin="test-node"}' in metrics, metrics[-1000:]
+            assert 'nonodb_replication_ack_nodes{database="default",origin="test-node"} 1' in metrics, metrics[-1000:]
             pruned_total = re.search(
                 r"nonodb_replication_pruned_total (\d+)", metrics
             )
