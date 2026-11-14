@@ -265,6 +265,17 @@ sequence. If no replica has acknowledged the source, the request fails with
 `no_replica_acks`. Set `NONODB_REPLICATION_NODE_ID` on every replica so acks are
 distinguishable.
 
+Automatic retention is opt-in:
+
+```env
+NONODB_REPLICATION_PRUNE_INTERVAL=60
+NONODB_REPLICATION_RETENTION_KEEP=0
+```
+
+Every interval the primary prunes through `min_ack - keep`, but never beyond
+the current log head. With no replica acks nothing is pruned. Set `keep` above
+zero for a safety margin.
+
 `NONODB_REPLICATION_BOOTSTRAP=auto` installs a snapshot when the local database
 is fresh, or when the source log no longer contains the next sequence the
 replica needs. `always` installs one on every start; `never` disables bootstrap.

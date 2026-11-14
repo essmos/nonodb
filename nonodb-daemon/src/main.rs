@@ -25,6 +25,7 @@ mod metrics;
 mod protocol;
 mod replication_api;
 mod replicator;
+mod retention;
 mod s3_import;
 mod writer;
 
@@ -223,6 +224,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         let _ = shutdown_tx.send(true);
     });
     replicator::start(databases.clone(), data.clone(), shutdown_rx.clone())
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    retention::start(databases.clone(), shutdown_rx.clone())
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
     let state = AppState {

@@ -72,6 +72,8 @@ pub static REPLICATION_TRANSPORT_ERRORS: AtomicU64 = AtomicU64::new(0);
 pub static REPLICATION_APPLY_ERRORS: AtomicU64 = AtomicU64::new(0);
 pub static REPLICATION_APPLIED_TOTAL: AtomicU64 = AtomicU64::new(0);
 pub static REPLICATION_LAST_SUCCESS_UNIX: AtomicU64 = AtomicU64::new(0);
+pub static REPLICATION_RETENTION_RUNS: AtomicU64 = AtomicU64::new(0);
+pub static REPLICATION_PRUNED_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Default)]
 struct SnapshotCounters {
@@ -473,6 +475,8 @@ pub fn snapshot() -> Value {
         "replication_apply_errors_total": REPLICATION_APPLY_ERRORS.load(Relaxed),
         "replication_applied_total": REPLICATION_APPLIED_TOTAL.load(Relaxed),
         "replication_last_success_unix": REPLICATION_LAST_SUCCESS_UNIX.load(Relaxed),
+        "replication_retention_runs_total": REPLICATION_RETENTION_RUNS.load(Relaxed),
+        "replication_pruned_total": REPLICATION_PRUNED_TOTAL.load(Relaxed),
         "collection_metrics": collection_metrics,
         "collection_metrics_overflow_total": COLLECTION_METRICS_OVERFLOW.load(Relaxed),
         "commit_ns_total": commit_ns,
@@ -924,6 +928,16 @@ pub fn prometheus() -> String {
             "nonodb_replication_last_success_unix",
             "replication_last_success_unix",
             "Unix time of the last successful replication pull.",
+        ),
+        (
+            "nonodb_replication_retention_runs_total",
+            "replication_retention_runs_total",
+            "Automatic retention passes with at least one replica ack.",
+        ),
+        (
+            "nonodb_replication_pruned_total",
+            "replication_pruned_total",
+            "Replication log entries removed by automatic retention.",
         ),
         (
             "nonodb_ttl_backlog",

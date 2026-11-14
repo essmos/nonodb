@@ -161,6 +161,8 @@ They are cheap gauges read from LMDB; they do not scan documents.
 | `nonodb_replication_transport_errors_total` | Pull transport, HTTP, or decode errors |
 | `nonodb_replication_apply_errors_total` | Failed replica applies |
 | `nonodb_replication_last_success_unix` | Unix time of the last successful pull |
+| `nonodb_replication_retention_runs_total` | Retention passes with replica acks |
+| `nonodb_replication_pruned_total` | Log entries removed by automatic retention |
 
 `nonodb_replication_head` is the local log head. On a replica,
 `nonodb_replication_applied` and `nonodb_replication_lag` track the configured

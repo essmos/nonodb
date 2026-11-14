@@ -67,6 +67,8 @@ def main() -> int:
             NONODB_AUTH_FILE=str(auth),
             NONODB_REPLICATION_ENABLED="1",
             NONODB_REPLICATION_ORIGIN="test-node",
+            NONODB_REPLICATION_PRUNE_INTERVAL="1",
+            NONODB_REPLICATION_RETENTION_KEEP="0",
             NONODB_LOG="warn",
         )
         log = open(temp / "daemon.log", "w", encoding="utf-8")
@@ -490,6 +492,14 @@ def main() -> int:
             assert 'nonodb_replication_role{role="primary"} 1' in metrics, metrics[-1000:]
             assert 'nonodb_replication_origin_info{origin="test-node"} 1' in metrics, metrics[-1000:]
             assert 'nonodb_replication_head{database="default"}' in metrics, metrics[-1000:]
+            pruned_total = re.search(
+                r"nonodb_replication_pruned_total (\d+)", metrics
+            )
+            assert pruned_total and int(pruned_total.group(1)) > 0, metrics[-1000:]
+            retention_runs = re.search(
+                r"nonodb_replication_retention_runs_total (\d+)", metrics
+            )
+            assert retention_runs and int(retention_runs.group(1)) > 0, metrics[-1000:]
 
             status = client.get("/v1/replication/status", headers=headers)
             assert status.status_code == 200, status.text
