@@ -271,6 +271,8 @@ The current branch exposes a read-only replication foundation:
 - transport source, bootstrap mode, poll interval, last success, and last
   transport/apply error;
 - editable source settings saved to `replication-source.json`;
+- manual promote/demote with expected epoch and confirmation;
+- replica acknowledgements and minimum safe sequence;
 - recent replication transactions with grouped collection/op/id changes.
 
 Network transport, peer setup, replica apply, and promote/demote are still

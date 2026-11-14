@@ -378,7 +378,7 @@ work.
 - [x] Persist and reload the pull source without restart.
 - [ ] Add peer test-connection, pause/resume, and hot resync.
 - [x] Manual promote/demote with persisted role, expected epoch, and audit.
-- [ ] Promotion confirmation workflow in GUI.
+- [x] Promotion/demote confirmation workflow in the GUI.
 - [ ] Certificate expiry and lag dashboards.
 - [ ] Alert rules.
 

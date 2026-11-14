@@ -585,7 +585,34 @@ export type ReplicationStatus = {
     lag: number;
     epoch?: number;
   }>;
+  acks?: Array<{
+    node: string;
+    seq: number;
+    at_ms: number;
+    age_seconds: number;
+  }>;
+  min_ack?: number;
 };
+
+export function promoteReplication(
+  connection: Connection,
+  expectedEpoch: number,
+): Promise<Record<string, unknown>> {
+  return replicationWrite(connection, '/v1/replication/promote', 'POST', {
+    expected_epoch: expectedEpoch,
+  });
+}
+
+export function demoteReplication(
+  connection: Connection,
+  expectedEpoch: number,
+  role = 'replica',
+): Promise<Record<string, unknown>> {
+  return replicationWrite(connection, '/v1/replication/demote', 'POST', {
+    expected_epoch: expectedEpoch,
+    role,
+  });
+}
 
 export type ReplicationChangeTxn = {
   seq: number;

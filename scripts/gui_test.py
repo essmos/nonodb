@@ -120,6 +120,8 @@ def main() -> int:
                 b"Applied sources",
                 b"Transport health",
                 b"Source settings",
+                b"Role control",
+                b"Replica acknowledgements",
                 b"Log capture",
                 b"Excluded collections",
                 b"Generate key",

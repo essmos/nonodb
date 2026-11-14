@@ -25,6 +25,8 @@ import {
   health,
   importOverview,
   importStatus,
+  demoteReplication,
+  promoteReplication,
   replicationChanges,
   replicationStatus,
   runImport,
@@ -1521,6 +1523,8 @@ function ReplicationPage({ connection }: { connection: Connection }) {
   const [intervalDraft, setIntervalDraft] = useState('1');
   const [bootstrapDraft, setBootstrapDraft] = useState('auto');
   const [savingSource, setSavingSource] = useState(false);
+  const [epochDraft, setEpochDraft] = useState('0');
+  const [changingRole, setChangingRole] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -1536,6 +1540,7 @@ function ReplicationPage({ connection }: { connection: Connection }) {
       setDatabasesDraft((nextStatus.replication?.databases ?? ['default']).join(', '));
       setIntervalDraft(String(nextStatus.replication?.interval_secs ?? 1));
       setBootstrapDraft(nextStatus.replication?.bootstrap ?? 'auto');
+      setEpochDraft(String(nextStatus.epoch ?? 0));
     } catch (err) {
       setError(errorText(err));
     } finally {
@@ -1546,6 +1551,25 @@ function ReplicationPage({ connection }: { connection: Connection }) {
   useEffect(() => {
     void load();
   }, [load]);
+
+  const changeRole = async (action: 'promote' | 'demote') => {
+    const label = action === 'promote' ? 'Promote this node to primary?' : 'Demote this node to replica?';
+    if (!window.confirm(`${label}\n\nExpected epoch: ${epochDraft}`)) return;
+    setChangingRole(true);
+    setError('');
+    try {
+      if (action === 'promote') {
+        await promoteReplication(connection, Number(epochDraft) || 0);
+      } else {
+        await demoteReplication(connection, Number(epochDraft) || 0);
+      }
+      await load();
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setChangingRole(false);
+    }
+  };
 
   const saveSource = async () => {
     setSavingSource(true);
@@ -1629,6 +1653,28 @@ function ReplicationPage({ connection }: { connection: Connection }) {
             <button onClick={() => void saveSource()} disabled={savingSource || !sourceDraft.trim()}>
               {savingSource ? 'Saving…' : 'Save source'}
             </button>
+          </div>
+          <div className="panel-title"><h3>Role control</h3><span>epoch {status.epoch ?? 0}</span></div>
+          <div className="form-grid">
+            <label>Expected epoch<input type="number" min="0" value={epochDraft} onChange={(e) => setEpochDraft(e.target.value)} /></label>
+          </div>
+          <div className="actions">
+            <button onClick={() => void changeRole('promote')} disabled={changingRole || status.role === 'primary'}>Promote</button>
+            <button className="danger" onClick={() => void changeRole('demote')} disabled={changingRole || status.role !== 'primary'}>Demote</button>
+          </div>
+          <p className="field-hint">Manual failover only. Demote or stop the old primary to avoid split-brain.</p>
+        </section>
+      )}
+      {status?.acks && status.acks.length > 0 && (
+        <section className="panel">
+          <div className="panel-title"><h3>Replica acknowledgements</h3><span>min ack {status.min_ack ?? 0}</span></div>
+          <div className="index-list">
+            {status.acks.map((ack) => (
+              <div key={ack.node} className="index-row">
+                <div><strong className="mono">{ack.node}</strong><span className="badge">seq {ack.seq.toLocaleString()}</span></div>
+                <span className="muted small">{ack.age_seconds.toFixed(1)}s ago</span>
+              </div>
+            ))}
           </div>
         </section>
       )}

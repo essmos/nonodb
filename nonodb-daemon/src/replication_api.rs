@@ -101,6 +101,26 @@ pub async fn status(
     ) {
         (Ok(head), Ok(applied)) => {
             let origin = crate::writer::replication_origin();
+            let ack_details = origin
+                .as_deref()
+                .and_then(|origin| store.replica_ack_details(origin).ok())
+                .unwrap_or_default();
+            let min_ack = ack_details.iter().map(|(_, seq, _)| *seq).min().unwrap_or(0);
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_millis() as u64)
+                .unwrap_or(0);
+            let acks = ack_details
+                .into_iter()
+                .map(|(node, seq, at_ms)| {
+                    serde_json::json!({
+                        "node": node,
+                        "seq": seq,
+                        "at_ms": at_ms,
+                        "age_seconds": now_ms.saturating_sub(at_ms) as f64 / 1000.0,
+                    })
+                })
+                .collect::<Vec<_>>();
             let applied = applied
                 .into_iter()
                 .map(|(origin, seq)| {
@@ -134,6 +154,8 @@ pub async fn status(
                 "read_only": !crate::replicator::writable(),
                 "head": head,
                 "applied": applied,
+                "acks": acks,
+                "min_ack": min_ack,
                 "replication": crate::replicator::status_json(),
             }))
         }
