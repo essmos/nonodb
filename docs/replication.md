@@ -358,9 +358,10 @@ After the source has been unavailable for the timeout, a candidate calls the
 same quorum/fence promotion path. Voters reject a second candidate at the same
 epoch, so only one candidate can obtain a majority. Set the candidate flag only
 on replicas that should be allowed to lead. After a successful promotion, the
-new primary pushes itself as the configured source to every voter URL, so those
-replicas reload their pull source automatically. Nodes that are not voters still
-need external source discovery or configuration.
+new primary pushes itself as the configured source to every voter URL and every
+URL in `NONODB_REPLICATION_FOLLOWERS`, so both groups reload their pull source
+automatically. Followers do not vote, so use them for read replicas that must
+not participate in quorum decisions.
 
 When `NONODB_REPLICATION_ADVERTISE_URL` is set, promotion then asks the current
 source to demote itself with this node as `successor`. The promotion is aborted

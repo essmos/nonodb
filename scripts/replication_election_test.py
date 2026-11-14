@@ -42,8 +42,14 @@ def main() -> int:
             text=True,
         ).stdout.strip()
 
-        ports = {name: free_port() for name in ("primary", "candidate", "voter")}
-        voters = ",".join(f"http://127.0.0.1:{ports[name]}" for name in ports)
+        ports = {
+            name: free_port()
+            for name in ("primary", "candidate", "voter", "follower")
+        }
+        voters = ",".join(
+            f"http://127.0.0.1:{ports[name]}"
+            for name in ("primary", "candidate", "voter")
+        )
         definitions = {
             "primary": {
                 "NONODB_REPLICATION_ADVERTISE_URL": f"http://127.0.0.1:{ports['primary']}",
@@ -58,11 +64,17 @@ def main() -> int:
                 "NONODB_REPLICATION_CANDIDATE": "1",
                 "NONODB_REPLICATION_ELECTION_INTERVAL": "1",
                 "NONODB_REPLICATION_FAILOVER_TIMEOUT": "3",
+                "NONODB_REPLICATION_FOLLOWERS": f"http://127.0.0.1:{ports['follower']}",
             },
             "voter": {
                 "NONODB_REPLICATION_SOURCE": f"http://127.0.0.1:{ports['primary']}",
                 "NONODB_REPLICATION_SOURCE_TOKEN": token,
                 "NONODB_REPLICATION_ADVERTISE_URL": f"http://127.0.0.1:{ports['voter']}",
+            },
+            "follower": {
+                "NONODB_REPLICATION_SOURCE": f"http://127.0.0.1:{ports['primary']}",
+                "NONODB_REPLICATION_SOURCE_TOKEN": token,
+                "NONODB_REPLICATION_ADVERTISE_URL": f"http://127.0.0.1:{ports['follower']}",
             },
         }
         for name, extra in definitions.items():
@@ -157,6 +169,22 @@ def main() -> int:
         else:
             raise RuntimeError(
                 f"voter did not switch to the elected primary: {voter_status}"
+            )
+        follower_client = clients["follower"]
+        deadline = time.monotonic() + 10
+        follower_status = None
+        while time.monotonic() < deadline:
+            follower_status = follower_client.get(
+                "/v1/replication/status", headers=headers
+            ).json()["result"]
+            if follower_status["replication"].get("source") == (
+                f"http://127.0.0.1:{ports['candidate']}"
+            ):
+                break
+            time.sleep(0.2)
+        else:
+            raise RuntimeError(
+                f"follower did not switch to the elected primary: {follower_status}"
             )
         insert = candidate.post(
             "/v1/exec",

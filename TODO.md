@@ -133,7 +133,7 @@ Design: [docs/replication.md](docs/replication.md).
 - [x] Add primary quorum leases and self-demotion on lease loss.
 - [x] Add automatic candidate election after the source failure timeout.
 - [x] Propagate the elected primary to every configured voter.
-- [ ] Add discovery for replicas that are not voters.
+- [x] Add source propagation for non-voting followers.
 - [x] Add automatic snapshot resync at startup when the source log was pruned.
 - [ ] Add hot resync without restarting the replica.
 - [x] Add role-aware `/readyz` and replication fields to status/GUI.

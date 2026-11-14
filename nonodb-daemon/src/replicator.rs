@@ -308,6 +308,20 @@ pub(crate) fn voter_urls() -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn follower_urls() -> Vec<String> {
+    std::env::var("NONODB_REPLICATION_FOLLOWERS")
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .map(|item| item.trim_end_matches('/').to_string())
+                .filter(|item| !item.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
 pub(crate) fn voter_token() -> Option<String> {
     non_empty_env("NONODB_REPLICATION_VOTER_TOKEN")
 }
@@ -563,8 +577,13 @@ async fn acquire_quorum(
 
 /// Pushes the new primary URL to every configured voter.
 async fn propagate_source(data_root: &std::path::Path, advertise: &str) {
-    let voters = voter_urls();
-    if voters.is_empty() {
+    let mut targets = voter_urls();
+    for follower in follower_urls() {
+        if !targets.contains(&follower) {
+            targets.push(follower);
+        }
+    }
+    if targets.is_empty() {
         return;
     }
     let config = match Config::load(data_root) {
@@ -583,7 +602,7 @@ async fn propagate_source(data_root: &std::path::Path, advertise: &str) {
             return;
         }
     };
-    for voter in voters.iter().filter(|voter| *voter != advertise) {
+    for voter in targets.iter().filter(|voter| *voter != advertise) {
         let path = "/v1/replication/source";
         let body = serde_json::to_vec(&serde_json::json!({
             "source": advertise,

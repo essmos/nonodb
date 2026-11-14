@@ -96,6 +96,7 @@ secrets.
 | `NONODB_REPLICATION_ADVERTISE_URL` | unset | Public URL used to demote the old source and advertise this node on promotion |
 | `NONODB_REPLICATION_VOTERS` | unset | Comma-separated voter URLs required for quorum promotion |
 | `NONODB_REPLICATION_VOTER_TOKEN` | unset | Bearer token used to call voter endpoints |
+| `NONODB_REPLICATION_FOLLOWERS` | unset | Non-voting replica URLs that receive source updates after promotion |
 | `NONODB_REPLICATION_LEASE_INTERVAL` | `5` | Seconds between primary quorum-lease renewals |
 | `NONODB_REPLICATION_LEASE_TTL` | `15` | Seconds without a majority before the primary self-demotes |
 | `NONODB_REPLICATION_AUTO_FAILOVER` | `0` | Enable automatic candidate election |
