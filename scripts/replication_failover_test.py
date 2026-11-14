@@ -120,6 +120,12 @@ def main() -> int:
         assert old["write_url"] == f"http://127.0.0.1:{replica_port}", old
         new_primary = replica.get("/v1/replication/primary", headers=headers).json()["result"]
         assert new_primary["write_url"] == f"http://127.0.0.1:{replica_port}", new_primary
+        old_write = primary.get("/readyz/write")
+        assert old_write.status_code == 503, old_write.text
+        assert old_write.headers.get("location") == f"http://127.0.0.1:{replica_port}"
+        new_write = replica.get("/readyz/write")
+        assert new_write.status_code == 200, new_write.text
+        assert new_write.json()["write_url"] == f"http://127.0.0.1:{replica_port}"
         insert = replica.post(
             "/v1/exec",
             headers=headers,

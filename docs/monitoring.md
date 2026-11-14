@@ -50,8 +50,14 @@ curl -fsS http://127.0.0.1:7878/readyz
 ```
 
 `/readyz` checks that the writer thread is still running and opens a real LMDB
-read transaction. It returns HTTP `503` with per-check details when either check
-fails. The Docker image uses `nonodb-cli ready` as its `HEALTHCHECK`.
+read transaction. On replicas the writer is not required. It returns HTTP `503`
+with per-check details when a required check fails. The Docker image uses
+`nonodb-cli ready` as its `HEALTHCHECK`.
+
+`/readyz/write` is the write-pool health check: `200` only on a writable
+primary, otherwise `503` with `Location` set to the known primary URL. Use it
+with `option httpchk GET /readyz/write` / `http-check expect status 200` so only
+the current primary receives writes.
 
 ## Prometheus
 

@@ -271,6 +271,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let app = Router::new()
         .route("/healthz", get(health))
         .route("/readyz", get(ready))
+        .route("/readyz/write", get(ready_write))
         .route("/metrics", get(metrics_handler))
         .route("/metrics/prometheus", get(prometheus_handler))
         .merge(auth_routes)
@@ -1017,6 +1018,39 @@ async fn ready(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
             }
         })),
     )
+}
+
+async fn ready_write(State(state): State<AppState>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let writable = replicator::writable();
+    let write_url = replicator::write_url(state.databases.root()).unwrap_or(None);
+    let status = if writable {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    let mut response = (
+        status,
+        Json(json!({
+            "ok": writable,
+            "role": replicator::role(),
+            "epoch": replicator::epoch(),
+            "write_url": write_url,
+        })),
+    )
+        .into_response();
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store"),
+    );
+    if let Some(write_url) = write_url {
+        if let Ok(value) = HeaderValue::from_str(&write_url) {
+            response
+                .headers_mut()
+                .insert(axum::http::header::LOCATION, value);
+        }
+    }
+    response
 }
 
 async fn metrics_handler(

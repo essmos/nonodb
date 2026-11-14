@@ -327,6 +327,17 @@ The same value is exposed as `write_url` in replication status and
 node and route writes to this URL. The endpoint requires `admin:db`; `/readyz`
 is unauthenticated for lightweight health routing.
 
+For write pools, use:
+
+```text
+GET /readyz/write
+```
+
+It returns `200` only on a writable primary. A replica returns `503` and sets
+`Location` to the known primary URL. For example, an HAProxy backend check can
+use `option httpchk GET /readyz/write` with `http-check expect status 200`, so
+only the current primary is selected for writes.
+
 ## Manual role changes
 
 Roles are persisted in `<NONODB_DATA>/replication-role.json`. The env var seeds

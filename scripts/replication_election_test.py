@@ -211,6 +211,13 @@ def main() -> int:
         assert second["replication"].get("source") == (
             f"http://127.0.0.1:{ports['candidate']}"
         ), second
+        elected_write = candidate.get("/readyz/write")
+        assert elected_write.status_code == 200, elected_write.text
+        follower_write = follower_client.get("/readyz/write")
+        assert follower_write.status_code == 503, follower_write.text
+        assert follower_write.headers.get("location") == (
+            f"http://127.0.0.1:{ports['candidate']}"
+        )
         insert = candidate.post(
             "/v1/exec",
             headers=headers,

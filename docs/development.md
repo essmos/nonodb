@@ -288,9 +288,9 @@ scripts are:
 | `scripts/auth_api_test.py` | admin-only auth API, one-time tokens, last-admin protection, certificates, Prometheus endpoint, disk/snapshot metrics, readiness |
 | `scripts/backup_api_test.py` | multi-database backups, backup-info, excluded collections, age keygen, local/S3 import, restore, SigV4, and restic command flow |
 | `scripts/replication_test.py` | writer log capture, snapshot bootstrap, manual and automatic prune with replica acks, ack age, pull apply, local applied log, global sequence, read-only replica, promote/demote epoch, stale-epoch rejection, source reload, successor source switch, graceful restart on runtime gap, startup auto-resync, apply metrics, and lag |
-| `scripts/replication_failover_test.py` | quorum promotion demotes and fences the old source, exposes the new `write_url`, persists votes, and rejects writes on the demoted node |
+| `scripts/replication_failover_test.py` | quorum promotion demotes and fences the old source, exposes the new `write_url`, validates `/readyz/write` routing, persists votes, and rejects writes on the demoted node |
 | `scripts/replication_lease_test.py` | primary renews a quorum lease and self-demotes after losing voter majority |
-| `scripts/replication_election_test.py` | preferred candidate wins a quorum election after the primary disappears, exposes `write_url`, while a delayed candidate and followers switch source |
+| `scripts/replication_election_test.py` | preferred candidate wins a quorum election after the primary disappears, exposes `write_url`/`readyz/write`, while a delayed candidate and followers switch source |
 | `scripts/tls_reload_test.py` | server certificate rotation picked up without restarting the daemon |
 | `scripts/security_check.py` | isolated auth gates, database-qualified scopes, CORS, malformed input, security headers, lockout |
 | `scripts/writer_window_bench.py` | adaptive/fixed group-commit window latency and throughput comparison |
