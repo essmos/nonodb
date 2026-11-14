@@ -157,8 +157,15 @@ NONODB_TLS_CLIENT_KEY=/etc/nonodb/tls/acme-app.key
 - Disable a token: `nonodb-cli auth token disable "$KID"`.
 - Changes are picked up within about one second without restarting the daemon.
 - There is no CRL/OCSP; the registry is the revocation mechanism.
-- Rotate by registering the new fingerprint, deploying the new certificate, and
-  disabling the old fingerprint.
+- Rotate client certificates by registering the new fingerprint, deploying the
+  new certificate, and disabling the old fingerprint.
+- Server certificates, keys, and `NONODB_TLS_CLIENT_CA` are checked every
+  `NONODB_TLS_RELOAD_INTERVAL` seconds. After an atomic file replace, a changed
+  mtime triggers a reload; new connections use the new certificate and existing
+  connections keep their old TLS session until they reconnect. A failed reload
+  keeps the previous certificate active.
+- Replication pull clients rebuild their TLS configuration every loop, so
+  rotated CA/client certificate/key files are picked up without a restart.
 
 ## Troubleshooting
 

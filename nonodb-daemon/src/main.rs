@@ -33,7 +33,7 @@ use std::collections::HashMap;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use axum::{
@@ -345,6 +345,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             _ => return Err("provide both NONODB_TLS_CERT and NONODB_TLS_KEY".into()),
         };
+        if let Some(setup) = &tls {
+            spawn_tls_reload(setup.clone(), shutdown_rx.clone());
+        }
         let app_tcp = app.clone();
         let addr = addr.to_string();
         let shutdown = shutdown_rx.clone();
@@ -537,7 +540,10 @@ async fn wait_for_writer(timeout: Duration) {
 
 #[derive(Clone)]
 struct TlsSetup {
-    acceptor: TlsAcceptor,
+    acceptor: Arc<RwLock<TlsAcceptor>>,
+    cert: String,
+    key: String,
+    client_ca: Option<String>,
     auth: Arc<auth::AuthState>,
     client_auth: bool,
     audit: Option<Arc<audit::AuditLog>>,
@@ -569,6 +575,29 @@ fn tls_acceptor(
     auth: Arc<auth::AuthState>,
     audit: Option<Arc<audit::AuditLog>>,
 ) -> Result<TlsSetup, Box<dyn std::error::Error>> {
+    let client_ca = std::env::var("NONODB_TLS_CLIENT_CA")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let (acceptor, client_auth) =
+        build_tls_acceptor(cert, key, client_ca.as_deref(), auth.clone(), audit.clone())?;
+    Ok(TlsSetup {
+        acceptor: Arc::new(RwLock::new(acceptor)),
+        cert: cert.to_string(),
+        key: key.to_string(),
+        client_ca,
+        auth,
+        client_auth,
+        audit,
+    })
+}
+
+fn build_tls_acceptor(
+    cert: &str,
+    key: &str,
+    client_ca: Option<&str>,
+    _auth: Arc<auth::AuthState>,
+    _audit: Option<Arc<audit::AuditLog>>,
+) -> Result<(TlsAcceptor, bool), Box<dyn std::error::Error>> {
     let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
     let mut cert_reader = BufReader::new(std::fs::File::open(cert)?);
     let certs = rustls_pemfile::certs(&mut cert_reader).collect::<Result<Vec<_>, _>>()?;
@@ -576,9 +605,6 @@ fn tls_acceptor(
     let key =
         rustls_pemfile::private_key(&mut key_reader)?.ok_or("no private key in NONODB_TLS_KEY")?;
 
-    let client_ca = std::env::var("NONODB_TLS_CLIENT_CA")
-        .ok()
-        .filter(|value| !value.is_empty());
     let client_auth_mode = std::env::var("NONODB_TLS_CLIENT_AUTH")
         .ok()
         .filter(|value| !value.is_empty())
@@ -593,7 +619,6 @@ fn tls_acceptor(
     if !matches!(client_auth_mode.as_str(), "off" | "required" | "optional") {
         return Err("NONODB_TLS_CLIENT_AUTH must be one of: off, required, optional".into());
     }
-
     if client_ca.is_some() && client_auth_mode == "off" {
         return Err(
             "NONODB_TLS_CLIENT_AUTH=off cannot be combined with NONODB_TLS_CLIENT_CA".into(),
@@ -601,9 +626,8 @@ fn tls_acceptor(
     }
 
     let builder = ServerConfig::builder();
-    let client_auth = client_ca.is_some();
     let config = if let Some(ca) = client_ca {
-        let roots = read_client_ca(Path::new(&ca))?;
+        let roots = read_client_ca(Path::new(ca))?;
         let mut verifier = WebPkiClientVerifier::builder(roots);
         if client_auth_mode == "optional" {
             verifier = verifier.allow_unauthenticated();
@@ -618,13 +642,73 @@ fn tls_acceptor(
         }
         builder.with_no_client_auth().with_single_cert(certs, key)?
     };
+    Ok((TlsAcceptor::from(Arc::new(config)), client_ca.is_some()))
+}
 
-    Ok(TlsSetup {
-        acceptor: TlsAcceptor::from(Arc::new(config)),
-        auth,
-        client_auth,
-        audit,
-    })
+fn tls_signature(setup: &TlsSetup) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for path in std::iter::once(setup.cert.as_str())
+        .chain(std::iter::once(setup.key.as_str()))
+        .chain(setup.client_ca.as_deref())
+    {
+        path.hash(&mut hasher);
+        if let Ok(metadata) = std::fs::metadata(path) {
+            metadata.len().hash(&mut hasher);
+            if let Ok(modified) = metadata.modified() {
+                if let Ok(duration) = modified.duration_since(std::time::UNIX_EPOCH) {
+                    duration.as_nanos().hash(&mut hasher);
+                }
+            }
+        }
+    }
+    hasher.finish()
+}
+
+fn spawn_tls_reload(setup: TlsSetup, mut shutdown: watch::Receiver<bool>) {
+    let interval = std::env::var("NONODB_TLS_RELOAD_INTERVAL")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(30);
+    if interval == 0 {
+        return;
+    }
+    tokio::spawn(async move {
+        let mut signature = tls_signature(&setup);
+        loop {
+            tokio::select! {
+                _ = wait_for_shutdown(&mut shutdown) => break,
+                _ = tokio::time::sleep(Duration::from_secs(interval)) => {}
+            }
+            let next = tls_signature(&setup);
+            if next == signature {
+                continue;
+            }
+            match build_tls_acceptor(
+                &setup.cert,
+                &setup.key,
+                setup.client_ca.as_deref(),
+                setup.auth.clone(),
+                setup.audit.clone(),
+            ) {
+                Ok((acceptor, _client_auth)) => {
+                    *setup
+                        .acceptor
+                        .write()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = acceptor;
+                    signature = next;
+                    tracing::info!("TLS certificate reloaded");
+                }
+                Err(error) => {
+                    tracing::error!(
+                        ?error,
+                        "TLS certificate reload failed; keeping previous certificate"
+                    );
+                }
+            }
+        }
+        tracing::info!("TLS reload watcher stopped");
+    });
 }
 
 async fn serve_tcp(
@@ -677,10 +761,15 @@ async fn serve_tcp(
                 tracing::warn!(%peer, retry_after, "TLS client blocked after failed logins");
                 return;
             }
+            let acceptor = tls
+                .acceptor
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
             let mut handshake_shutdown = shutdown.clone();
             let stream = tokio::select! {
                 _ = wait_for_shutdown(&mut handshake_shutdown) => return,
-                accepted = tls.acceptor.accept(stream) => match accepted {
+                accepted = acceptor.accept(stream) => match accepted {
                     Ok(stream) => stream,
                     Err(e) => {
                         tracing::debug!(?e, %peer, "TLS handshake failed");

@@ -82,6 +82,7 @@ secrets.
 | `NONODB_TLS_KEY` | — | PEM private key for TCP TLS |
 | `NONODB_TLS_CLIENT_CA` | — | PEM CA bundle used to verify client certificates (mTLS) |
 | `NONODB_TLS_CLIENT_AUTH` | `required` when client CA is set | `required`, `optional`, or `off` |
+| `NONODB_TLS_RELOAD_INTERVAL` | `30` | Seconds between server cert/key/CA reload checks; `0` disables |
 | `NONODB_SNAPSHOT_DIR` | — | Enables periodic LMDB snapshots in this directory |
 | `NONODB_BACKUP_CONFIG` | `<NONODB_DATA>/backups.json` | Scheduled backup job configuration |
 | `NONODB_BACKUP_STAGING` | `<NONODB_DATA>/.backup-staging` | Temporary backup staging directory |
