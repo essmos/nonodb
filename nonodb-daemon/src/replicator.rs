@@ -190,6 +190,81 @@ struct PersistedRole {
     successor: Option<String>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+struct PersistedVote {
+    epoch: u64,
+    #[serde(default)]
+    candidate: Option<String>,
+}
+
+fn vote_path(data_root: &std::path::Path) -> std::path::PathBuf {
+    data_root.join("replication-vote.json")
+}
+
+fn load_vote(data_root: &std::path::Path) -> Result<PersistedVote, String> {
+    let path = vote_path(data_root);
+    if !path.is_file() {
+        return Ok(PersistedVote::default());
+    }
+    let raw = fs::read(&path).map_err(|error| format!("read vote state: {error}"))?;
+    serde_json::from_slice(&raw).map_err(|error| format!("parse vote state: {error}"))
+}
+
+pub fn cast_vote(data_root: &std::path::Path, epoch: u64, candidate: &str) -> Result<bool, String> {
+    if epoch == 0 {
+        return Err("vote epoch must be positive".into());
+    }
+    if !candidate.starts_with("http://") && !candidate.starts_with("https://") {
+        return Err("candidate must start with http:// or https://".into());
+    }
+    let current = load_vote(data_root)?;
+    if epoch < current.epoch {
+        return Ok(false);
+    }
+    if epoch == current.epoch
+        && current
+            .candidate
+            .as_deref()
+            .is_some_and(|value| value != candidate)
+    {
+        return Ok(false);
+    }
+    let path = vote_path(data_root);
+    let encoded = serde_json::to_vec_pretty(&PersistedVote {
+        epoch,
+        candidate: Some(candidate.to_string()),
+    })
+    .map_err(|error| error.to_string())?;
+    let temp = path.with_extension(format!("tmp-{}", std::process::id()));
+    fs::write(&temp, encoded).map_err(|error| format!("write vote state: {error}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&temp, fs::Permissions::from_mode(0o600))
+            .map_err(|error| format!("chmod vote state: {error}"))?;
+    }
+    fs::rename(&temp, &path).map_err(|error| format!("replace vote state: {error}"))?;
+    Ok(true)
+}
+
+fn voter_urls() -> Vec<String> {
+    std::env::var("NONODB_REPLICATION_VOTERS")
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .map(|item| item.trim_end_matches('/').to_string())
+                .filter(|item| !item.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn voter_token() -> Option<String> {
+    non_empty_env("NONODB_REPLICATION_VOTER_TOKEN")
+}
+
 struct RoleCell {
     role: String,
     epoch: u64,
@@ -339,6 +414,80 @@ fn change_role(
     Ok(role_view(&cell))
 }
 
+async fn acquire_quorum(
+    data_root: &std::path::Path,
+    expected_epoch: u64,
+    advertise: &str,
+) -> Result<(), (String, String)> {
+    let voters = voter_urls();
+    if voters.is_empty() {
+        return Ok(());
+    }
+    let proposal = expected_epoch.saturating_add(1);
+    let majority = voters.len() / 2 + 1;
+    let mut granted = 0usize;
+    if voters.iter().any(|voter| voter == advertise)
+        && cast_vote(data_root, proposal, advertise)
+            .map_err(|error| ("quorum_vote".to_string(), error))?
+    {
+        granted += 1;
+    }
+    let token = voter_token();
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|error| ("quorum_vote".to_string(), error.to_string()))?;
+    for voter in voters.iter().filter(|voter| *voter != advertise) {
+        let path = "/v1/replication/vote";
+        let body = serde_json::to_vec(&serde_json::json!({
+            "epoch": proposal,
+            "candidate": advertise,
+        }))
+        .map_err(|error| ("quorum_vote".to_string(), error.to_string()))?;
+        let mut request = client
+            .post(format!("{voter}{path}"))
+            .header(reqwest::header::ACCEPT, "application/json")
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body);
+        if let Some(token) = &token {
+            request = request.bearer_auth(token);
+        }
+        match request.send().await {
+            Ok(response) if response.status().is_success() => {
+                let body = response.text().await.unwrap_or_default();
+                let granted_vote = serde_json::from_str::<Value>(&body)
+                    .ok()
+                    .and_then(|payload| payload.pointer("/result/granted").and_then(Value::as_bool))
+                    .unwrap_or(false);
+                if granted_vote {
+                    granted += 1;
+                }
+            }
+            Ok(response) => {
+                tracing::warn!(
+                    voter,
+                    status = response.status().as_u16(),
+                    "quorum voter rejected request"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(voter, error = %error, "quorum voter unreachable");
+            }
+        }
+    }
+    if granted < majority {
+        return Err((
+            "quorum_not_reached".to_string(),
+            format!(
+                "promotion needs {majority} votes, received {granted} from {} voters",
+                voters.len()
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Promotes this node after attempting to demote the current source and point
 /// it at this node's advertised replication URL.
 pub async fn promote_with_fence(
@@ -355,6 +504,7 @@ pub async fn promote_with_fence(
                 "NONODB_REPLICATION_ADVERTISE_URL must start with http:// or https://".to_string(),
             ));
         }
+        acquire_quorum(data_root, expected_epoch, &advertise).await?;
         match Config::load(data_root) {
             Ok(Some(config)) if config.source != advertise => {
                 let client = config

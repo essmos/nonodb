@@ -299,6 +299,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         )
         .route("/v1/replication/ack", post(replication_api::ack_default))
         .route("/v1/replication/acks", get(replication_api::acks_default))
+        .route("/v1/replication/vote", post(replication_api::vote))
         .route("/v1/replication/promote", post(replication_api::promote))
         .route("/v1/replication/demote", post(replication_api::demote))
         .route(

@@ -50,6 +50,12 @@ pub struct AcksQuery {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct VoteBody {
+    pub epoch: u64,
+    pub candidate: String,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct RoleBody {
     pub expected_epoch: u64,
     #[serde(default)]
@@ -227,6 +233,39 @@ pub async fn changes(
             "replication_error",
             error.to_string(),
         ),
+    }
+}
+
+pub async fn vote(
+    State(state): State<AppState>,
+    Extension(connection): Extension<auth::ConnectionAuth>,
+    headers: HeaderMap,
+    Json(body): Json<VoteBody>,
+) -> AuthResponse {
+    let (principal, started) = match start_admin(&state, &connection, &headers, "replication_vote")
+    {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    match crate::replicator::cast_vote(state.databases.root(), body.epoch, &body.candidate) {
+        Ok(granted) => {
+            audit_control(
+                &state,
+                &connection,
+                principal.name(),
+                "replication_vote",
+                true,
+                None,
+                started,
+                None,
+            );
+            ok(serde_json::json!({
+                "granted": granted,
+                "epoch": body.epoch,
+                "candidate": body.candidate,
+            }))
+        }
+        Err(message) => failure(StatusCode::BAD_REQUEST, "invalid_vote", message),
     }
 }
 

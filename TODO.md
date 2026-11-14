@@ -128,7 +128,8 @@ Design: [docs/replication.md](docs/replication.md).
 - [x] Preserve transaction atomicity on the replica and reject client writes.
 - [x] Add persisted role state and manual promote/demote with expected epoch.
 - [x] Carry the epoch in replication transactions and reject stale epochs.
-- [ ] Add lease-based automatic promotion and fencing.
+- [x] Require a voter majority before promotion.
+- [ ] Add lease expiry and automatic candidate election.
 - [x] Add automatic snapshot resync at startup when the source log was pruned.
 - [ ] Add hot resync without restarting the replica.
 - [x] Add role-aware `/readyz` and replication fields to status/GUI.
@@ -146,7 +147,8 @@ Design: [docs/replication.md](docs/replication.md).
 
 ### Phase 4 — failover and policies
 
-- [ ] Add lease-based ownership and promotion.
+- [x] Add quorum voting for promotion.
+- [ ] Add lease expiry and automatic candidate election.
 - [ ] Add primary epoch/fencing and old-primary rejection.
 - [ ] Add synchronous standby option.
 - [ ] Add per-collection consistency profiles.

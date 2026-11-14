@@ -325,10 +325,23 @@ Each successful change increments `epoch`. A stale `expected_epoch` returns
 stops the replica pull loop and enables the writer. Demotion makes the node
 read-only again.
 
-When `NONODB_REPLICATION_ADVERTISE_URL` is set, promotion first asks the
-current source to demote itself with this node as `successor`. The promotion is
-aborted if that fence request fails; use `"force": true` (CLI `--force`) only
-when the old primary is unreachable and you accept the split-brain risk.
+When `NONODB_REPLICATION_VOTERS` is set, promotion first requests votes from a
+majority of the configured voter URLs:
+
+```env
+NONODB_REPLICATION_VOTERS=https://eu-1:7878,https://eu-2:7878,https://eu-3:7878
+NONODB_REPLICATION_VOTER_TOKEN=<shared-admin-token>
+```
+
+Each voter persists the highest granted `(epoch, candidate)` in
+`replication-vote.json`; conflicting candidates at the same epoch are rejected.
+Promotion fails with `quorum_not_reached` without a majority.
+
+When `NONODB_REPLICATION_ADVERTISE_URL` is set, promotion then asks the current
+source to demote itself with this node as `successor`. The promotion is aborted
+if that fence request fails; use `"force": true` (CLI `--force`) only when the
+old primary is unreachable and you accept the split-brain risk. `force` does not
+bypass quorum voting.
 
 Demote accepts an optional successor URL:
 

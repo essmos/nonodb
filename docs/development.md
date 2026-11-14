@@ -192,7 +192,7 @@ python3 scripts/auth_test.py                 # scopes, token/cert auth, reload, 
 python3 scripts/auth_api_test.py             # auth API, Prometheus, disk/snapshot metrics, readiness
 python3 scripts/backup_api_test.py           # backups, exclusions, keygen, age, local restore, S3/R2, restic
 python3 scripts/replication_test.py         # replication log, snapshot bootstrap, pull, read-only
-python3 scripts/replication_failover_test.py # promotion fences and demotes the old source
+python3 scripts/replication_failover_test.py # quorum promotion fences and demotes the old source
 python3 scripts/tls_reload_test.py           # TLS server certificate hot reload
 python3 scripts/ttl_test.py                  # TTL sweeps, overrides, history, vault
 python3 scripts/history_test.py              # per-collection history enable/disable, restart, CLI
@@ -286,7 +286,7 @@ scripts are:
 | `scripts/auth_api_test.py` | admin-only auth API, one-time tokens, last-admin protection, certificates, Prometheus endpoint, disk/snapshot metrics, readiness |
 | `scripts/backup_api_test.py` | multi-database backups, backup-info, excluded collections, age keygen, local/S3 import, restore, SigV4, and restic command flow |
 | `scripts/replication_test.py` | writer log capture, snapshot bootstrap, manual and automatic prune with replica acks, ack age, pull apply, local applied log, global sequence, read-only replica, promote/demote epoch, stale-epoch rejection, source reload, successor source switch, graceful restart on runtime gap, startup auto-resync, apply metrics, and lag |
-| `scripts/replication_failover_test.py` | promotion demotes and fences the old source, and rejects writes on the demoted node |
+| `scripts/replication_failover_test.py` | quorum promotion demotes and fences the old source, persists votes, and rejects writes on the demoted node |
 | `scripts/tls_reload_test.py` | server certificate rotation picked up without restarting the daemon |
 | `scripts/security_check.py` | isolated auth gates, database-qualified scopes, CORS, malformed input, security headers, lockout |
 | `scripts/writer_window_bench.py` | adaptive/fixed group-commit window latency and throughput comparison |

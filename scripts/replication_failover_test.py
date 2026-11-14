@@ -69,6 +69,10 @@ def main() -> int:
                 NONODB_REPLICATION_ENABLED="1",
                 NONODB_REPLICATION_ORIGIN=f"{name}-origin",
                 NONODB_REPLICATION_ROLE=role,
+                NONODB_REPLICATION_VOTERS=(
+                    f"http://127.0.0.1:{primary_port},http://127.0.0.1:{replica_port}"
+                ),
+                NONODB_REPLICATION_VOTER_TOKEN=token,
                 NONODB_REPLICATION_POLL_INTERVAL="1",
                 NONODB_LOG="warn",
                 **extra,
@@ -105,6 +109,8 @@ def main() -> int:
         role = promoted.json()["result"]["role"]
         assert role["role"] == "primary", role
         assert role["epoch"] == 1, role
+        assert (temp / "primary-data" / "replication-vote.json").is_file()
+        assert (temp / "replica-data" / "replication-vote.json").is_file()
 
         old = primary.get("/v1/replication/status", headers=headers).json()["result"]
         assert old["role"] == "replica", old
