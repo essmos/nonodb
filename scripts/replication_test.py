@@ -172,6 +172,7 @@ def main() -> int:
                 NONODB_TCP=f"127.0.0.1:{replica_port}",
                 NONODB_AUTH_FILE=str(auth),
                 NONODB_REPLICATION_ROLE="replica",
+                NONODB_REPLICATION_ENABLED="1",
                 NONODB_REPLICATION_SOURCE=f"http://127.0.0.1:{port}",
                 NONODB_REPLICATION_SOURCE_TOKEN=admin,
                 NONODB_REPLICATION_DATABASES="default",
@@ -349,6 +350,19 @@ def main() -> int:
                 assert replica_status["applied"][0]["origin"] == "test-node", replica_status
                 assert replica_status["applied"][0]["lag"] == 0, replica_status
                 assert replica_status["applied"][0]["epoch"] == 2, replica_status
+                source_head_now = client.get(
+                    "/v1/replication/status", headers=headers
+                ).json()["result"]["head"]
+                assert replica_status["head"] >= source_head_now, replica_status
+                replica_txns = replica.get(
+                    "/v1/replication/changes?after=0&limit=100", headers=headers
+                ).json()["result"]["changes"]
+                assert replica_txns, "replica should keep a local replication log"
+                assert any(
+                    change["id"] == "promoted"
+                    for txn in replica_txns
+                    for change in txn["changes"]
+                ), replica_txns
                 assert replica_status["replication"]["source"].startswith(
                     "http://127.0.0.1:"
                 ), replica_status
@@ -434,6 +448,7 @@ def main() -> int:
             resynced = replica.get("/v1/replication/status", headers=headers).json()["result"]
             assert resynced["applied"][0]["applied"] >= new_head, resynced
             assert resynced["applied"][0]["epoch"] == 2, resynced
+            assert resynced["head"] == new_head, resynced
             replica.close()
 
             metrics = client.get("/metrics/prometheus", headers=headers).text

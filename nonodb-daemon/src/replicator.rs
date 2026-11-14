@@ -524,7 +524,7 @@ pub async fn bootstrap_startup(data_root: &std::path::Path) -> Result<(), String
             continue;
         }
         if config.bootstrap == "auto" {
-            let (fresh, applied) = bootstrap_state(data_root, database, &origin).await?;
+            let (fresh, applied) = bootstrap_state(data_root, database).await?;
             if !fresh {
                 if applied >= head {
                     continue;
@@ -574,14 +574,12 @@ pub async fn bootstrap_startup(data_root: &std::path::Path) -> Result<(), String
 async fn bootstrap_state(
     data_root: &std::path::Path,
     database: &str,
-    origin: &str,
 ) -> Result<(bool, u64), String> {
     let path = data_root.join(database);
     if !path.join("data.mdb").is_file() {
         return Ok((true, 0));
     }
     let path_for_open = path.clone();
-    let origin = origin.to_string();
     tokio::task::spawn_blocking(move || -> Result<(bool, u64), String> {
         let store = Store::open(&path_for_open).map_err(|error| error.to_string())?;
         let origins = store
@@ -589,7 +587,7 @@ async fn bootstrap_state(
             .map_err(|error| error.to_string())?;
         let collections = store.collections().map_err(|error| error.to_string())?;
         let applied = store
-            .replication_applied(&origin)
+            .replication_applied_global()
             .map_err(|error| error.to_string())?;
         let env = store.env().clone();
         drop(store);
@@ -833,7 +831,7 @@ async fn pull_database(
             .to_string();
         let applied = runtime
             .store
-            .replication_applied(&origin)
+            .replication_applied_global()
             .map_err(|error| error.to_string())?;
         let status_head = status.get("head").and_then(Value::as_u64).unwrap_or(0);
         runtime

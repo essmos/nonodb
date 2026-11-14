@@ -232,12 +232,17 @@ GET /v1/replication/changes?after=N&limit=500
 client certificate. `NONODB_REPLICATION_CA_FILE`,
 `NONODB_REPLICATION_CERT_FILE`, and `NONODB_REPLICATION_KEY_FILE` enable mTLS.
 
-Apply is atomic per source transaction and idempotent for `(origin, seq)`.
-Replicas record the source head and expose `applied`/`lag` in status and
-Prometheus. A gap returns an error instead of skipping transactions. Apply
-invalidates the replica query cache, and transport/apply failures are counted
-and exposed through status/GUI. `/readyz` reports the role and does not require
-the writer on a read-only replica.
+Apply is atomic per source transaction and idempotent for the global source
+sequence. Replicas append each applied transaction to their own local log, so a
+promoted replica can serve downstream replicas. The local log sequence matches
+the source sequence. A gap returns an error instead of skipping transactions.
+Apply invalidates the replica query cache, and transport/apply failures are
+counted and exposed through status/GUI. `/readyz` reports the role and does not
+require the writer on a read-only replica.
+
+A promoted replica that should act as a source for other replicas must have
+`NONODB_REPLICATION_ENABLED=1` so new local writes are captured. Mixed origins
+are supported by the global applied sequence; epochs are tracked per origin.
 
 Before the daemon opens its runtime, a fresh replica can install a consistent
 source snapshot:
@@ -328,6 +333,8 @@ work.
 - [x] Read-only replica write gating.
 - [x] Applied sequence and lag status/metrics.
 - [x] Snapshot bootstrap with recorded sequence.
+- [x] Replicas keep a local log of applied transactions for promotion.
+- [x] Global applied sequence supports mixed origins.
 - [ ] Epoch fencing and source changes.
 - [x] Automatic snapshot resync at startup when the source log was pruned too far.
 - [ ] Hot resync without a daemon restart.

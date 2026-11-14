@@ -151,6 +151,7 @@ mod tests {
         let error = store.apply_replication_txn(&stale).unwrap_err().to_string();
         assert!(error.contains("stale replication epoch"), "{error}");
         assert_eq!(store.replication_applied("node-a").unwrap(), 1);
+        assert_eq!(store.replication_head().unwrap(), 1);
     }
 
     #[test]
@@ -171,6 +172,8 @@ mod tests {
         assert!(store.apply_replication_txn(&insert).unwrap());
         assert!(!store.apply_replication_txn(&insert).unwrap());
         assert_eq!(store.replication_applied("node-a").unwrap(), 1);
+        assert_eq!(store.replication_applied_global().unwrap(), 1);
+        assert_eq!(store.replication_head().unwrap(), 1);
         assert_eq!(
             store
                 .collection("orders")
@@ -194,6 +197,8 @@ mod tests {
         );
         assert!(store.apply_replication_txn(&update).unwrap());
         assert_eq!(store.replication_applied("node-a").unwrap(), 2);
+        assert_eq!(store.replication_applied_global().unwrap(), 2);
+        assert_eq!(store.replication_head().unwrap(), 2);
         assert_eq!(
             store
                 .collection("orders")
@@ -219,6 +224,8 @@ mod tests {
             }],
         );
         assert!(store.apply_replication_txn(&delete).unwrap());
+        assert_eq!(store.replication_applied_global().unwrap(), 3);
+        assert_eq!(store.replication_head().unwrap(), 3);
         assert!(store
             .collection("orders")
             .unwrap()

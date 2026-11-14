@@ -1498,6 +1498,41 @@ impl Store {
         Ok(epoch)
     }
 
+    /// Global highest source sequence applied on this replica, across origins.
+    pub fn replication_applied_global(&self) -> Result<u64> {
+        let rtxn = self.read_txn()?;
+        let meta: Database<Bytes, Bytes> = self
+            .env
+            .open_database(&rtxn, Some(META_DB))?
+            .ok_or_else(|| Error::Query("meta database missing".into()))?;
+        if let Some(raw) = meta.get(&rtxn, b"replication:applied_seq")? {
+            let seq = std::str::from_utf8(raw)
+                .ok()
+                .and_then(|raw| raw.parse::<u64>().ok())
+                .unwrap_or(0);
+            rtxn.commit()?;
+            return Ok(seq);
+        }
+        let mut max = 0u64;
+        for item in meta.iter(&rtxn)? {
+            let (key, value) = item?;
+            let Some(origin) = key.strip_prefix(b"replication:applied:") else {
+                continue;
+            };
+            if origin.is_empty() {
+                continue;
+            }
+            max = max.max(
+                std::str::from_utf8(value)
+                    .ok()
+                    .and_then(|raw| raw.parse::<u64>().ok())
+                    .unwrap_or(0),
+            );
+        }
+        rtxn.commit()?;
+        Ok(max)
+    }
+
     /// Returns all `(origin, applied sequence)` pairs recorded on this node.
     pub fn replication_applied_origins(&self) -> Result<Vec<(String, u64)>> {
         const PREFIX: &[u8] = b"replication:applied:";
@@ -1573,6 +1608,11 @@ impl Store {
         let epoch_key = format!("replication:epoch:{origin}");
         meta.put(
             &mut wtxn,
+            b"replication:applied_seq",
+            applied.to_string().as_bytes(),
+        )?;
+        meta.put(
+            &mut wtxn,
             applied_key.as_bytes(),
             applied.to_string().as_bytes(),
         )?;
@@ -1609,11 +1649,7 @@ impl Store {
         let mut wtxn = self.write_txn()?;
         let meta: Database<Bytes, Bytes> = self.env.create_database(&mut wtxn, Some(META_DB))?;
         let key = format!("replication:applied:{}", txn.origin);
-        let applied = meta
-            .get(&wtxn, key.as_bytes())?
-            .and_then(|raw| std::str::from_utf8(raw).ok())
-            .and_then(|raw| raw.parse::<u64>().ok())
-            .unwrap_or(0);
+        let applied = self.replication_applied_global().unwrap_or(0);
         let epoch_key = format!("replication:epoch:{}", txn.origin);
         let applied_epoch = meta
             .get(&wtxn, epoch_key.as_bytes())?
@@ -1638,6 +1674,17 @@ impl Store {
                 txn.seq
             )));
         }
+        let local_head = meta
+            .get(&wtxn, REPLICATION_SEQ_KEY)?
+            .and_then(|raw| std::str::from_utf8(raw).ok())
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .unwrap_or(0);
+        if local_head + 1 != txn.seq {
+            return Err(Error::Query(format!(
+                "replica log sequence mismatch: local head {}, source seq {}",
+                local_head, txn.seq
+            )));
+        }
         for change in &txn.changes {
             let collection = self.collection_in(&mut wtxn, &change.collection)?;
             collection.apply_replication_change_txn(
@@ -1647,6 +1694,17 @@ impl Store {
                 change.after.as_ref(),
             )?;
         }
+        self.append_replication_txn_with_epoch_in(
+            &mut wtxn,
+            &txn.origin,
+            txn.epoch,
+            txn.changes.clone(),
+        )?;
+        meta.put(
+            &mut wtxn,
+            b"replication:applied_seq",
+            txn.seq.to_string().as_bytes(),
+        )?;
         meta.put(&mut wtxn, key.as_bytes(), txn.seq.to_string().as_bytes())?;
         meta.put(
             &mut wtxn,
