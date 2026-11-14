@@ -559,8 +559,8 @@ A stale epoch is rejected with `409`. The role is persisted in
 `NONODB_REPLICATION_ROLE` after the first start.
 
 `NONODB_DB=app1` or `--db app1` selects another database. Status includes role,
-read-only mode, source URL, bootstrap mode, applied sources, lag, and the last
-transport/apply error. Pruning is an administrative retention action; do not
+read-only mode, source URL, bootstrap mode, applied sources, lag, promotion
+readiness, and the last transport/apply error. Pruning is an administrative retention action; do not
 prune sequences that replicas still need.
 
 ## Environment

@@ -8,12 +8,15 @@ use std::sync::{Condvar, Mutex};
 use heed::types::Bytes;
 use heed::{Database, Env, EnvFlags, EnvOpenOptions, RoTxn, RwTxn};
 use serde::Serialize;
+use serde_json::Value;
 
 use crate::collection::Collection;
 use crate::error::{Error, Result};
 use crate::events::EventConfig;
 use crate::history::{self, DEFAULT_HISTORY_MAX_VERSIONS, HISTORY_DB};
-use crate::replication::{ReplicationChange, ReplicationTxn, REPLICATION_DB, REPLICATION_SEQ_KEY};
+use crate::replication::{
+    ReplicationChange, ReplicationOp, ReplicationTxn, REPLICATION_DB, REPLICATION_SEQ_KEY,
+};
 use crate::subscriptions::{self, Subscription};
 use crate::ttl::{self, TTL_DB};
 use crate::vault::CollectionProfile;
@@ -500,6 +503,11 @@ impl Store {
     fn validate_name(name: &str) -> Result<()> {
         if name.is_empty() || name.len() > 200 || name.contains('\0') {
             return Err(Error::InvalidCollectionName(name.to_string()));
+        }
+        if matches!(name, META_DB | HISTORY_DB | TTL_DB | REPLICATION_DB) {
+            return Err(Error::InvalidCollectionName(format!(
+                "{name} is reserved for internal metadata"
+            )));
         }
         Ok(())
     }
@@ -1741,7 +1749,7 @@ impl Store {
         if txn.seq == 0 {
             return Err(Error::Query("replication sequence must be positive".into()));
         }
-        if txn.changes.is_empty() {
+        if txn.changes.is_empty() && txn.ops.is_empty() {
             return Err(Error::Query(
                 "replication transaction must contain at least one change".into(),
             ));
@@ -1785,20 +1793,27 @@ impl Store {
                 local_head, txn.seq
             )));
         }
-        for change in &txn.changes {
-            let collection = self.collection_in(&mut wtxn, &change.collection)?;
-            collection.apply_replication_change_txn(
-                &mut wtxn,
-                &change.op,
-                &change.id,
-                change.after.as_ref(),
-            )?;
+        if txn.ops.is_empty() {
+            for change in &txn.changes {
+                let collection = self.collection_in(&mut wtxn, &change.collection)?;
+                collection.apply_replication_change_txn(
+                    &mut wtxn,
+                    &change.op,
+                    &change.id,
+                    change.after.as_ref(),
+                )?;
+            }
+        } else {
+            for op in &txn.ops {
+                self.apply_replication_op_in(&mut wtxn, &txn.changes, op)?;
+            }
         }
-        self.append_replication_txn_with_epoch_in(
+        self.append_replication_txn_ops_with_epoch_in(
             &mut wtxn,
             &txn.origin,
             txn.epoch,
             txn.changes.clone(),
+            txn.ops.clone(),
         )?;
         meta.put(
             &mut wtxn,
@@ -1813,6 +1828,118 @@ impl Store {
         )?;
         wtxn.commit()?;
         Ok(true)
+    }
+
+    fn apply_replication_op_in(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        changes: &[ReplicationChange],
+        op: &ReplicationOp,
+    ) -> Result<()> {
+        match op {
+            ReplicationOp::Document { change } => {
+                let change = changes.get(*change).ok_or_else(|| {
+                    Error::Query("replication document index out of range".into())
+                })?;
+                let collection = self.collection_in(wtxn, &change.collection)?;
+                collection.apply_replication_change_txn(
+                    wtxn,
+                    &change.op,
+                    &change.id,
+                    change.after.as_ref(),
+                )
+            }
+            ReplicationOp::CollectionCreate {
+                name,
+                profile,
+                ttl_seconds,
+                ttl_purge_history,
+            } => {
+                let profile = CollectionProfile::parse(profile)?;
+                self.create_collection_with_ttl_and_purge_in(
+                    wtxn,
+                    name,
+                    profile,
+                    *ttl_seconds,
+                    *ttl_purge_history,
+                )?;
+                Ok(())
+            }
+            ReplicationOp::CollectionTtl {
+                coll,
+                ttl_seconds,
+                purge_history,
+            } => self.set_collection_ttl_with_purge_in(wtxn, coll, *ttl_seconds, *purge_history),
+            ReplicationOp::CollectionHistory { coll, max_versions } => {
+                self.set_collection_history_in(wtxn, coll, *max_versions)
+            }
+            ReplicationOp::CollectionEvents { coll, config } => {
+                self.set_collection_events_in(wtxn, coll, config)
+            }
+            ReplicationOp::IndexCreate {
+                coll,
+                fields,
+                unique,
+                include,
+                geo,
+            } => {
+                let collection = self.collection_in(wtxn, coll)?;
+                collection.create_index_fields_txn(wtxn, fields, *unique, include, *geo)
+            }
+            ReplicationOp::IndexDrop { coll, field } => {
+                let collection = self.collection_in(wtxn, coll)?;
+                collection.drop_index_txn(wtxn, field).map(|_| ())
+            }
+            ReplicationOp::TextIndexCreate { coll, field } => {
+                let collection = self.collection_in(wtxn, coll)?;
+                collection.create_text_index_txn(wtxn, field)
+            }
+            ReplicationOp::TextIndexDrop { coll, field } => {
+                let collection = self.collection_in(wtxn, coll)?;
+                collection.drop_text_index_txn(wtxn, field).map(|_| ())
+            }
+            ReplicationOp::FuzzyIndexCreate { coll, field } => {
+                let collection = self.collection_in(wtxn, coll)?;
+                collection.create_fuzzy_index_txn(wtxn, field)
+            }
+            ReplicationOp::FuzzyIndexDrop { coll, field } => {
+                let collection = self.collection_in(wtxn, coll)?;
+                collection.drop_fuzzy_index_txn(wtxn, field).map(|_| ())
+            }
+            ReplicationOp::VectorIndexCreate {
+                coll,
+                field,
+                dims,
+                metric,
+            } => {
+                let collection = self.collection_in(wtxn, coll)?;
+                collection.create_vector_index_txn(wtxn, field, *dims, *metric)
+            }
+            ReplicationOp::VectorIndexDrop { coll, field } => {
+                let collection = self.collection_in(wtxn, coll)?;
+                collection.drop_vector_index_txn(wtxn, field).map(|_| ())
+            }
+            ReplicationOp::SubscriptionUpsert { coll, subscription } => {
+                self.create_subscription_in(wtxn, coll, subscription)?;
+                Ok(())
+            }
+            ReplicationOp::SubscriptionDelete { coll, name } => {
+                self.delete_subscription_in(wtxn, coll, name)?;
+                Ok(())
+            }
+            ReplicationOp::EventAppend { doc } => {
+                let id = doc
+                    .get("_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| Error::Query("replication event has no string _id".into()))?;
+                let collection = self.collection_in(wtxn, crate::events::EVENTS_COLLECTION)?;
+                collection.apply_replication_change_txn(wtxn, "insert", id, Some(doc))
+            }
+            ReplicationOp::EventDelete { id } => {
+                let collection = self.collection_in(wtxn, crate::events::EVENTS_COLLECTION)?;
+                collection.apply_replication_change_txn(wtxn, "delete", id, None)
+            }
+        }
     }
 
     /// Appends one committed transaction to the durable replication log.
@@ -1836,7 +1963,21 @@ impl Store {
         epoch: u64,
         changes: Vec<ReplicationChange>,
     ) -> Result<ReplicationTxn> {
-        if changes.is_empty() {
+        self.append_replication_txn_ops_with_epoch_in(wtxn, origin, epoch, changes, Vec::new())
+    }
+
+    /// Appends a transaction with ordered logical operations. Document payloads
+    /// stay in `changes`; `ops` carries metadata, index, subscription, and
+    /// outbox operations at their exact position.
+    pub fn append_replication_txn_ops_with_epoch_in(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        origin: &str,
+        epoch: u64,
+        changes: Vec<ReplicationChange>,
+        ops: Vec<ReplicationOp>,
+    ) -> Result<ReplicationTxn> {
+        if changes.is_empty() && ops.is_empty() {
             return Err(Error::Query(
                 "replication transaction must contain at least one change".into(),
             ));
@@ -1850,7 +1991,7 @@ impl Store {
         let seq = previous
             .checked_add(1)
             .ok_or_else(|| Error::Query("replication sequence overflow".into()))?;
-        let txn = ReplicationTxn::new_with_epoch(seq, origin, epoch, changes);
+        let txn = ReplicationTxn::new_with_ops(seq, origin, epoch, changes, ops);
         let encoded = serde_json::to_vec(&txn)?;
         let db: Database<Bytes, Bytes> =
             self.env.create_database(&mut *wtxn, Some(REPLICATION_DB))?;

@@ -2280,6 +2280,7 @@ impl<'e> Collection<'e> {
                 self.apply_fuzzy_entries(wtxn, None, Some(after), id)?;
                 self.apply_vector_entries(wtxn, None, Some(after), id)?;
                 self.set_ttl(wtxn, id, None)?;
+                self.record_history(wtxn, id, op, Some(after.clone()))?;
             }
             "delete" => {
                 if let Some(old) = &old {
@@ -2289,6 +2290,7 @@ impl<'e> Collection<'e> {
                     self.apply_fuzzy_entries(wtxn, Some(old), None, id)?;
                     self.apply_vector_entries(wtxn, Some(old), None, id)?;
                     self.set_ttl(wtxn, id, None)?;
+                    self.record_history(wtxn, id, "delete", None)?;
                 }
             }
             other => {
@@ -3088,7 +3090,7 @@ impl<'e> Collection<'e> {
         before: Option<&Value>,
         after: Option<&Value>,
     ) -> Result<()> {
-        self.evaluate_subscriptions(wtxn, op, id, before, after)?;
+        let _ = self.evaluate_subscriptions(wtxn, op, id, before, after)?;
         crate::observer::notify(self, wtxn, op, id, before, after)?;
         let Some(config) = self.events_enabled_in(wtxn)? else {
             return Ok(());
@@ -3099,7 +3101,7 @@ impl<'e> Collection<'e> {
         self.append_outbox_event(wtxn, event)
     }
 
-    fn append_outbox_event(&self, wtxn: &mut RwTxn<'_>, event: Value) -> Result<()> {
+    pub fn append_outbox_event(&self, wtxn: &mut RwTxn<'_>, event: Value) -> Result<()> {
         let db = self
             .env
             .create_database::<Bytes, Bytes>(&mut *wtxn, Some(EVENTS_COLLECTION))?;
@@ -3116,7 +3118,8 @@ impl<'e> Collection<'e> {
             false,
             self.txn_gate,
         );
-        outbox.insert_one_txn(wtxn, event)?;
+        outbox.insert_one_txn(wtxn, event.clone())?;
+        crate::observer::notify_outbox(&event);
         Ok(())
     }
 
@@ -3137,13 +3140,13 @@ impl<'e> Collection<'e> {
         id: &str,
         before: Option<&Value>,
         after: Option<&Value>,
-    ) -> Result<()> {
+    ) -> Result<Vec<Value>> {
         if self.name == EVENTS_COLLECTION || self.profile.is_vault() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let key = subscriptions::meta_key(&self.name);
         let Some(raw) = self.meta.get(&*wtxn, key.as_bytes())? else {
-            return Ok(());
+            return Ok(Vec::new());
         };
         let mut list: Vec<Subscription> =
             serde_json::from_slice(raw).map_err(|e| Error::Query(format!("subscriptions: {e}")))?;
@@ -3153,7 +3156,7 @@ impl<'e> Collection<'e> {
         let mut changed = list.len() != original_len;
         if list.is_empty() {
             self.meta.delete(&mut *wtxn, key.as_bytes())?;
-            return Ok(());
+            return Ok(Vec::new());
         }
         let mut events = Vec::new();
         for subscription in &mut list {
@@ -3185,14 +3188,14 @@ impl<'e> Collection<'e> {
                 changed = true;
             }
         }
-        for event in events {
-            self.append_outbox_event(wtxn, event)?;
+        for event in &events {
+            self.append_outbox_event(wtxn, event.clone())?;
         }
         if changed {
             let raw = serde_json::to_vec(&list)?;
             self.meta.put(&mut *wtxn, key.as_bytes(), &raw)?;
         }
-        Ok(())
+        Ok(events)
     }
 
     fn record_history(

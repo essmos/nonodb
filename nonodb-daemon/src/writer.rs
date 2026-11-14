@@ -10,7 +10,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use nonodb_core::replication::ReplicationChange;
+use nonodb_core::replication::{ReplicationChange, ReplicationOp};
 use nonodb_core::{
     events, vault, Collection, CollectionProfile, FindAndModifyOptions, FindQuery, Store,
 };
@@ -29,6 +29,7 @@ const MAX_BATCH: usize = 512;
 struct ReplicationContext {
     origin: Option<String>,
     changes: Vec<ReplicationChange>,
+    ops: Vec<ReplicationOp>,
 }
 
 impl ReplicationContext {
@@ -43,6 +44,7 @@ impl ReplicationContext {
         if self.origin.is_none() {
             return;
         }
+        let change = self.changes.len();
         self.changes.push(ReplicationChange {
             collection: collection.to_string(),
             op: op.to_string(),
@@ -50,6 +52,26 @@ impl ReplicationContext {
             before: before.cloned(),
             after: after.cloned(),
         });
+        self.ops.push(ReplicationOp::Document { change });
+    }
+
+    fn capture_op(&mut self, op: ReplicationOp) {
+        if self.origin.is_some() {
+            self.ops.push(op);
+        }
+    }
+
+    fn capture_event(&mut self, event: &Value) {
+        if self.origin.is_some() {
+            self.ops
+                .push(ReplicationOp::EventAppend { doc: event.clone() });
+        }
+    }
+
+    fn capture_sql_changes(&mut self, start: usize) {
+        for change in start..self.changes.len() {
+            self.ops.push(ReplicationOp::Document { change });
+        }
     }
 }
 
@@ -82,6 +104,7 @@ thread_local! {
     /// replication transaction as the surrounding writer batch.
     static SQL_REPLICATION_CHANGES: RefCell<Vec<ReplicationChange>> =
         const { RefCell::new(Vec::new()) };
+    static OUTBOX_REPLICATION_EVENTS: RefCell<Vec<Value>> = const { RefCell::new(Vec::new()) };
 }
 
 pub(crate) fn capture_sql_replication(
@@ -107,6 +130,14 @@ pub(crate) fn capture_sql_replication(
 
 fn take_sql_replication_changes() -> Vec<ReplicationChange> {
     SQL_REPLICATION_CHANGES.with(|slot| std::mem::take(&mut *slot.borrow_mut()))
+}
+
+pub(crate) fn capture_outbox_event(event: &Value) {
+    OUTBOX_REPLICATION_EVENTS.with(|slot| slot.borrow_mut().push(event.clone()));
+}
+
+fn take_outbox_events() -> Vec<Value> {
+    OUTBOX_REPLICATION_EVENTS.with(|slot| std::mem::take(&mut *slot.borrow_mut()))
 }
 fn env_micros(name: &str, default_us: u64) -> Duration {
     Duration::from_micros(
@@ -232,20 +263,27 @@ fn run_batch(store: &Store, cache: &QueryCache, jobs: Vec<WriteJob>) {
     let mut replication = ReplicationContext {
         origin: replication_origin(),
         changes: Vec::new(),
+        ops: Vec::new(),
     };
     let _ = take_sql_replication_changes();
     let mut results = Vec::with_capacity(jobs.len());
     for job in &jobs {
         results.push(execute(store, &mut wtxn, &job.req, &mut replication));
     }
+    let sql_start = replication.changes.len();
     replication.changes.extend(take_sql_replication_changes());
+    replication.capture_sql_changes(sql_start);
+    for event in take_outbox_events() {
+        replication.capture_event(&event);
+    }
     if let Some(origin) = &replication.origin {
-        if !replication.changes.is_empty() {
-            if let Err(error) = store.append_replication_txn_with_epoch_in(
+        if !replication.changes.is_empty() || !replication.ops.is_empty() {
+            if let Err(error) = store.append_replication_txn_ops_with_epoch_in(
                 &mut wtxn,
                 origin,
                 crate::replicator::epoch(),
                 replication.changes,
+                replication.ops,
             ) {
                 drop(wtxn);
                 live::discard_pending();
@@ -305,19 +343,26 @@ fn run_single(store: &Store, cache: &QueryCache, job: WriteJob) {
     let mut replication = ReplicationContext {
         origin: replication_origin(),
         changes: Vec::new(),
+        ops: Vec::new(),
     };
     let _ = take_sql_replication_changes();
     let started = Instant::now();
     match execute(store, &mut wtxn, &job.req, &mut replication) {
         Ok(value) => {
+            let sql_start = replication.changes.len();
             replication.changes.extend(take_sql_replication_changes());
+            replication.capture_sql_changes(sql_start);
+            for event in take_outbox_events() {
+                replication.capture_event(&event);
+            }
             if let Some(origin) = &replication.origin {
-                if !replication.changes.is_empty() {
-                    if let Err(error) = store.append_replication_txn_with_epoch_in(
+                if !replication.changes.is_empty() || !replication.ops.is_empty() {
+                    if let Err(error) = store.append_replication_txn_ops_with_epoch_in(
                         &mut wtxn,
                         origin,
                         crate::replicator::epoch(),
                         replication.changes,
+                        replication.ops,
                     ) {
                         drop(wtxn);
                         live::discard_pending();
@@ -396,13 +441,18 @@ fn event_config(
     wtxn: &nonodb_core::heed::RwTxn<'_>,
     coll: &str,
 ) -> Result<Option<events::EventConfig>, ApiError> {
-    if coll == events::EVENTS_COLLECTION
-        || matches!(
-            store.collection_profile_in_rw(wtxn, coll)?,
-            Some(CollectionProfile::Vault)
-        )
-    {
+    if matches!(
+        store.collection_profile_in_rw(wtxn, coll)?,
+        Some(CollectionProfile::Vault)
+    ) {
         return Ok(None);
+    }
+    if coll == events::EVENTS_COLLECTION {
+        return if replication_enabled() {
+            Ok(Some(events::EventConfig::default()))
+        } else {
+            Ok(None)
+        };
     }
     let config = store.collection_events_in_rw(wtxn, coll)?;
     if config.active()
@@ -429,14 +479,14 @@ fn emit_event(
     replication: &mut ReplicationContext,
 ) -> Result<(), ApiError> {
     let target = store.collection_in(wtxn, coll)?;
-    target.evaluate_subscriptions(wtxn, op, id, before, after)?;
-    live::collect_pending(&target, wtxn, coll, op, id, before, after)?;
+    let subscription_events = target.evaluate_subscriptions(wtxn, op, id, before, after)?;
+    live::collect_pending(&target, &*wtxn, coll, op, id, before, after)?;
     replication.capture(coll, op, id, before, after);
+    let _ = subscription_events;
     let Some(event) = events::change_event(coll, op, id, before, after, config) else {
         return Ok(());
     };
-    let outbox = store.collection_in(wtxn, events::EVENTS_COLLECTION)?;
-    outbox.insert_one_txn(wtxn, event)?;
+    target.append_outbox_event(wtxn, event)?;
     Ok(())
 }
 
@@ -486,6 +536,12 @@ fn execute(
                 *ttl_seconds,
                 *ttl_purge_history,
             )?;
+            replication.capture_op(ReplicationOp::CollectionCreate {
+                name: coll.clone(),
+                profile: profile.as_str().to_string(),
+                ttl_seconds: *ttl_seconds,
+                ttl_purge_history: *ttl_purge_history,
+            });
             Ok(json!({
                 "created": coll,
                 "profile": profile.as_str(),
@@ -499,6 +555,11 @@ fn execute(
             purge_history,
         } => {
             store.set_collection_ttl_with_purge_in(wtxn, coll, *ttl_seconds, *purge_history)?;
+            replication.capture_op(ReplicationOp::CollectionTtl {
+                coll: coll.clone(),
+                ttl_seconds: *ttl_seconds,
+                purge_history: *purge_history,
+            });
             Ok(json!({
                 "coll": coll,
                 "ttl_seconds": ttl_seconds,
@@ -507,6 +568,10 @@ fn execute(
         }
         WriteReq::SetCollectionHistory { coll, max_versions } => {
             store.set_collection_history_in(wtxn, coll, *max_versions)?;
+            replication.capture_op(ReplicationOp::CollectionHistory {
+                coll: coll.clone(),
+                max_versions: *max_versions,
+            });
             Ok(json!({ "coll": coll, "max_versions": max_versions }))
         }
         WriteReq::SetCollectionEvents {
@@ -529,6 +594,10 @@ fn execute(
                 projection: projection.clone(),
             };
             store.set_collection_events_in(wtxn, coll, &config)?;
+            replication.capture_op(ReplicationOp::CollectionEvents {
+                coll: coll.clone(),
+                config: config.clone(),
+            });
             Ok(json!({
                 "coll": coll,
                 "enabled": enabled,
@@ -542,6 +611,10 @@ fn execute(
         }
         WriteReq::CreateSubscription { coll, subscription } => {
             let out = store.create_subscription_in(wtxn, coll, subscription)?;
+            replication.capture_op(ReplicationOp::SubscriptionUpsert {
+                coll: coll.clone(),
+                subscription: out.clone(),
+            });
             Ok(serde_json::to_value(out).map_err(nonodb_core::Error::from)?)
         }
         WriteReq::RenewSubscription {
@@ -550,6 +623,12 @@ fn execute(
             lease_seconds,
         } => {
             let out = store.renew_subscription_in(wtxn, coll, name, *lease_seconds)?;
+            if let Some(subscription) = &out {
+                replication.capture_op(ReplicationOp::SubscriptionUpsert {
+                    coll: coll.clone(),
+                    subscription: subscription.clone(),
+                });
+            }
             Ok(json!({ "subscription": out }))
         }
         WriteReq::PruneSubscriptions => {
@@ -558,6 +637,12 @@ fn execute(
         }
         WriteReq::DeleteSubscription { coll, name } => {
             let deleted = store.delete_subscription_in(wtxn, coll, name)?;
+            if deleted {
+                replication.capture_op(ReplicationOp::SubscriptionDelete {
+                    coll: coll.clone(),
+                    name: name.clone(),
+                });
+            }
             Ok(json!({ "deleted": deleted }))
         }
         WriteReq::Expire { entries } => {
@@ -922,6 +1007,13 @@ fn execute(
         } => {
             let c = standard_collection(store, wtxn, coll)?;
             c.create_index_fields_txn(wtxn, fields, *unique, include, *geo)?;
+            replication.capture_op(ReplicationOp::IndexCreate {
+                coll: coll.clone(),
+                fields: fields.clone(),
+                unique: *unique,
+                include: include.clone(),
+                geo: *geo,
+            });
             let name = fields.join("+");
             Ok(json!({
                 "created": name,
@@ -934,32 +1026,67 @@ fn execute(
         WriteReq::CreateIndexes { coll, indexes } => {
             let c = standard_collection(store, wtxn, coll)?;
             c.create_indexes_txn(wtxn, indexes)?;
+            for index in indexes {
+                replication.capture_op(ReplicationOp::IndexCreate {
+                    coll: coll.clone(),
+                    fields: index.fields.clone(),
+                    unique: index.unique,
+                    include: index.include.clone(),
+                    geo: index.geo,
+                });
+            }
             let names: Vec<_> = indexes.iter().map(|index| index.fields.join("+")).collect();
             Ok(json!({ "created": names }))
         }
         WriteReq::DropIndex { coll, field } => {
             let c = standard_collection(store, wtxn, coll)?;
             let existed = c.drop_index_txn(wtxn, field)?;
+            if existed {
+                replication.capture_op(ReplicationOp::IndexDrop {
+                    coll: coll.clone(),
+                    field: field.clone(),
+                });
+            }
             Ok(json!({ "dropped": existed }))
         }
         WriteReq::CreateTextIndex { coll, field } => {
             let c = standard_collection(store, wtxn, coll)?;
             c.create_text_index_txn(wtxn, field)?;
+            replication.capture_op(ReplicationOp::TextIndexCreate {
+                coll: coll.clone(),
+                field: field.clone(),
+            });
             Ok(json!({ "created": field, "kind": "text" }))
         }
         WriteReq::DropTextIndex { coll, field } => {
             let c = standard_collection(store, wtxn, coll)?;
             let existed = c.drop_text_index_txn(wtxn, field)?;
+            if existed {
+                replication.capture_op(ReplicationOp::TextIndexDrop {
+                    coll: coll.clone(),
+                    field: field.clone(),
+                });
+            }
             Ok(json!({ "dropped": existed, "kind": "text" }))
         }
         WriteReq::CreateFuzzyIndex { coll, field } => {
             let c = standard_collection(store, wtxn, coll)?;
             c.create_fuzzy_index_txn(wtxn, field)?;
+            replication.capture_op(ReplicationOp::FuzzyIndexCreate {
+                coll: coll.clone(),
+                field: field.clone(),
+            });
             Ok(json!({ "created": field, "kind": "fuzzy" }))
         }
         WriteReq::DropFuzzyIndex { coll, field } => {
             let c = standard_collection(store, wtxn, coll)?;
             let existed = c.drop_fuzzy_index_txn(wtxn, field)?;
+            if existed {
+                replication.capture_op(ReplicationOp::FuzzyIndexDrop {
+                    coll: coll.clone(),
+                    field: field.clone(),
+                });
+            }
             Ok(json!({ "dropped": existed, "kind": "fuzzy" }))
         }
         WriteReq::CreateVectorIndex {
@@ -970,6 +1097,12 @@ fn execute(
         } => {
             let c = standard_collection(store, wtxn, coll)?;
             c.create_vector_index_txn(wtxn, field, *dims, *metric)?;
+            replication.capture_op(ReplicationOp::VectorIndexCreate {
+                coll: coll.clone(),
+                field: field.clone(),
+                dims: *dims,
+                metric: *metric,
+            });
             Ok(json!({
                 "created": field,
                 "kind": "vector",
@@ -980,6 +1113,12 @@ fn execute(
         WriteReq::DropVectorIndex { coll, field } => {
             let c = standard_collection(store, wtxn, coll)?;
             let existed = c.drop_vector_index_txn(wtxn, field)?;
+            if existed {
+                replication.capture_op(ReplicationOp::VectorIndexDrop {
+                    coll: coll.clone(),
+                    field: field.clone(),
+                });
+            }
             Ok(json!({ "dropped": existed, "kind": "vector" }))
         }
         WriteReq::Sql { query, params } => {

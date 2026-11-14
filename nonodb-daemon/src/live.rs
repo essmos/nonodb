@@ -15,7 +15,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-use nonodb_core::{heed::RwTxn, subscriptions::Subscription, Collection};
+use nonodb_core::{
+    heed::{RoTxn, RwTxn},
+    replication::ReplicationChange,
+    subscriptions::Subscription,
+    Collection, Store,
+};
 use serde_json::Value;
 use tokio::sync::mpsc;
 
@@ -32,6 +37,14 @@ thread_local! {
 }
 
 struct LiveObserver;
+
+struct OutboxObserver;
+
+impl nonodb_core::observer::OutboxObserver for OutboxObserver {
+    fn observe_outbox(&self, event: &Value) {
+        crate::writer::capture_outbox_event(event);
+    }
+}
 
 impl nonodb_core::observer::ChangeObserver for LiveObserver {
     fn active(&self) -> bool {
@@ -56,6 +69,7 @@ impl nonodb_core::observer::ChangeObserver for LiveObserver {
 /// Installs the daemon observer used by SQL writes.
 pub fn install_observer() {
     nonodb_core::observer::set_change_observer(Some(Arc::new(LiveObserver)));
+    nonodb_core::observer::set_outbox_observer(Some(Arc::new(OutboxObserver)));
 }
 
 pub fn registry() -> &'static Arc<LiveRegistry> {
@@ -90,6 +104,41 @@ pub fn dispatch_pending() {
 /// Drops collected live events when the transaction aborts.
 pub fn discard_pending() {
     PENDING.with(|slot| slot.borrow_mut().clear());
+}
+
+/// Notifies local live streams after a replica applied a replication
+/// transaction. This never writes `_events` and never re-evaluates persistent
+/// subscriptions; the primary already produced those events.
+pub fn notify_applied(store: &Store, changes: &[ReplicationChange]) -> Result<(), String> {
+    if !registry().has_any() {
+        return Ok(());
+    }
+    let rtxn = store.read_txn().map_err(|error| error.to_string())?;
+    let mut pending = Vec::new();
+    for change in changes {
+        let Some(target) = store
+            .collection_at(&rtxn, &change.collection)
+            .map_err(|error| error.to_string())?
+        else {
+            continue;
+        };
+        pending.extend(
+            registry()
+                .collect(
+                    &target,
+                    &rtxn,
+                    &change.collection,
+                    &change.op,
+                    &change.id,
+                    change.before.as_ref(),
+                    change.after.as_ref(),
+                )
+                .map_err(|error| error.message)?,
+        );
+    }
+    rtxn.commit().map_err(|error| error.to_string())?;
+    registry().dispatch(pending);
+    Ok(())
 }
 
 pub struct LiveRegistry {
@@ -182,7 +231,7 @@ impl LiveRegistry {
     pub fn collect(
         &self,
         target: &Collection<'_>,
-        wtxn: &RwTxn<'_>,
+        wtxn: &RoTxn<'_>,
         coll: &str,
         op: &str,
         doc_id: &str,

@@ -10,6 +10,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::events::EventConfig;
+use crate::subscriptions::Subscription;
+use crate::vector::VectorMetric;
+
 /// Internal LMDB sub-database for replication records.
 pub const REPLICATION_DB: &str = "_replication";
 
@@ -29,6 +33,95 @@ pub struct ReplicationChange {
     pub after: Option<Value>,
 }
 
+/// One ordered logical operation in a replication transaction.
+///
+/// `Document { change }` references an entry in [`ReplicationTxn::changes`] so
+/// document payloads are not duplicated. Metadata, index, subscription, and
+/// outbox operations are applied at their exact position in the transaction.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ReplicationOp {
+    /// Apply the document change at `changes[change]`.
+    Document {
+        change: usize,
+    },
+    CollectionCreate {
+        name: String,
+        profile: String,
+        ttl_seconds: Option<u64>,
+        ttl_purge_history: Option<bool>,
+    },
+    CollectionTtl {
+        coll: String,
+        ttl_seconds: Option<u64>,
+        purge_history: Option<bool>,
+    },
+    CollectionHistory {
+        coll: String,
+        max_versions: usize,
+    },
+    CollectionEvents {
+        coll: String,
+        config: EventConfig,
+    },
+    IndexCreate {
+        coll: String,
+        fields: Vec<String>,
+        #[serde(default)]
+        unique: bool,
+        #[serde(default)]
+        include: Vec<String>,
+        #[serde(default)]
+        geo: bool,
+    },
+    IndexDrop {
+        coll: String,
+        field: String,
+    },
+    TextIndexCreate {
+        coll: String,
+        field: String,
+    },
+    TextIndexDrop {
+        coll: String,
+        field: String,
+    },
+    FuzzyIndexCreate {
+        coll: String,
+        field: String,
+    },
+    FuzzyIndexDrop {
+        coll: String,
+        field: String,
+    },
+    VectorIndexCreate {
+        coll: String,
+        field: String,
+        dims: usize,
+        metric: VectorMetric,
+    },
+    VectorIndexDrop {
+        coll: String,
+        field: String,
+    },
+    SubscriptionUpsert {
+        coll: String,
+        subscription: Subscription,
+    },
+    SubscriptionDelete {
+        coll: String,
+        name: String,
+    },
+    /// Append one outbox document to `_events`.
+    EventAppend {
+        doc: Value,
+    },
+    /// Delete one outbox document from `_events`.
+    EventDelete {
+        id: String,
+    },
+}
+
 /// One committed write transaction in the replication log.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ReplicationTxn {
@@ -41,6 +134,10 @@ pub struct ReplicationTxn {
     pub epoch: u64,
     pub created_at_ms: u64,
     pub changes: Vec<ReplicationChange>,
+    /// Ordered operations. Older logs without this field fall back to applying
+    /// `changes` sequentially.
+    #[serde(default)]
+    pub ops: Vec<ReplicationOp>,
 }
 
 impl ReplicationTxn {
@@ -54,6 +151,16 @@ impl ReplicationTxn {
         epoch: u64,
         changes: Vec<ReplicationChange>,
     ) -> Self {
+        Self::new_with_ops(seq, origin, epoch, changes, Vec::new())
+    }
+
+    pub fn new_with_ops(
+        seq: u64,
+        origin: impl Into<String>,
+        epoch: u64,
+        changes: Vec<ReplicationChange>,
+        ops: Vec<ReplicationOp>,
+    ) -> Self {
         Self {
             seq,
             origin: origin.into(),
@@ -63,6 +170,7 @@ impl ReplicationTxn {
                 .map(|duration| duration.as_millis() as u64)
                 .unwrap_or(0),
             changes,
+            ops,
         }
     }
 }

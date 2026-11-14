@@ -40,6 +40,33 @@ release build. The latest validation also exercised a 10M-document collection,
 | Background jobs and outbox events | OK (12 Python unit tests; real-daemon integration: atomic rollback, checkpoint restart, retry, late events, 8x100 concurrent producers, watch long-poll, filters/projection, truncation, NDJSON/SSE streams, concurrent stream delivery (6×100 integration; 16×1000 manual stress, 0 missing/duplicate), CLI) |
 | 10k keepalive mixed workload | OK (5 min UDS at 4.9k req/s; 2 min TLS at 4.1k req/s; 0 errors) |
 
+## Replicated metadata and outbox (2026-11-14)
+
+A primary and replica exercised ordered replication operations introduced for
+metadata, indexes, history, events, subscriptions, TTL, and live watch:
+
+| Check | Result |
+|---|---|
+| Collection creation replicated | OK |
+| Secondary index replicated | OK |
+| Text index replicated | OK |
+| Fuzzy index replicated | OK |
+| Vector index replicated | OK |
+| Per-collection history setting replicated | OK |
+| History generated on the replica | OK (2 revisions) |
+| Event config replicated | OK |
+| Subscription definition replicated | OK |
+| `_events` outbox replicated | OK (4 replicated events) |
+| Long-poll `watch` on replica `_events` | OK |
+| Live `/v1/watch` on replica | OK |
+| TTL setting replicated | OK |
+| TTL expiry delete replicated | OK |
+
+A 200k-document, seven-host load and two-failover run with the new operation log
+also kept the `tenant` index on every surviving node and completed with zero
+apply errors. Automatic election now waits for `promotion_ready` (candidate has
+applied the last observed source head).
+
 ## Multi-host replication load and failover (2026-11-14)
 
 Release binaries, 8 vCPU, 22 GiB RAM, ext4. Seven hosts: primary, four voters,

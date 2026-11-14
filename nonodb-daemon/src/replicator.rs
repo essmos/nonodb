@@ -7,7 +7,10 @@
 
 use std::{
     fs,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, OnceLock,
+    },
     time::Duration,
 };
 
@@ -21,6 +24,8 @@ use crate::{
     databases::{Databases, DEFAULT_DATABASE},
     metrics,
 };
+
+static PROMOTION_READY: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Debug)]
 struct Config {
@@ -777,6 +782,10 @@ pub fn epoch() -> u64 {
         .epoch
 }
 
+pub fn promotion_ready() -> bool {
+    writable() || PROMOTION_READY.load(Ordering::Relaxed)
+}
+
 /// Advances the local role epoch after observing a newer epoch from the
 /// replication stream. Replicas must remember the source epoch so a later
 /// promotion proposes an epoch higher than every vote already cast.
@@ -864,6 +873,7 @@ fn record_transport_error(message: &str) {
 }
 
 fn record_apply_error(message: &str) {
+    PROMOTION_READY.store(false, Ordering::Relaxed);
     let mut status = runtime_status()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -881,6 +891,7 @@ pub fn status_json() -> Value {
         "role": role(),
         "epoch": epoch(),
         "read_only": !writable(),
+        "promotion_ready": promotion_ready(),
         "successor": role_cell()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1373,11 +1384,13 @@ async fn pull_database(
             .set_replication_source_head(&origin, status_head)
             .map_err(|error| error.to_string())?;
         if applied >= status_head {
+            PROMOTION_READY.store(true, Ordering::Relaxed);
             if let Err(error) = send_ack(client, config, database, &origin, applied).await {
                 tracing::warn!(database, error = %error, "replication idle ack failed");
             }
             return Ok(());
         }
+        PROMOTION_READY.store(false, Ordering::Relaxed);
         let changes = get_json(
             client,
             config,
@@ -1419,6 +1432,11 @@ async fn pull_database(
                     if applied {
                         applied_any = true;
                         metrics::inc(&metrics::REPLICATION_APPLIED_TOTAL);
+                        if let Err(error) =
+                            crate::live::notify_applied(&runtime.store, &txn.changes)
+                        {
+                            tracing::warn!(seq = txn.seq, error = %error, "live apply notification failed");
+                        }
                     }
                 }
                 Err(error) => {
@@ -1450,6 +1468,11 @@ async fn pull_database(
                 tracing::warn!(database, error = %error, "replication ack failed");
             }
         }
+        let local = runtime
+            .store
+            .replication_applied_global()
+            .map_err(|error| error.to_string())?;
+        PROMOTION_READY.store(local >= status_head, Ordering::Relaxed);
         if batch.len() < config.limit {
             return Ok(());
         }

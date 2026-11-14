@@ -96,10 +96,12 @@ Implemented core primitives:
 - `Store::replication_head()`
 - `Store::prune_replication_through()`
 
-The daemon writer now appends normal CRUD, SQL, atomic batch, and TTL-expiry
-changes in the same LMDB transaction as the data. Vault writes and some internal
-configuration changes are not yet captured. Set `NONODB_REPLICATION_ENABLED=1` and `NONODB_REPLICATION_ORIGIN` to
-enable logging.
+The daemon writer appends ordered logical operations in the same LMDB
+transaction as the data. `changes` carries document payloads; `ops` carries the
+exact order of document, metadata, index, subscription, and outbox operations.
+Older logs without `ops` still apply document changes sequentially. Vault
+writes remain outside replication. Set `NONODB_REPLICATION_ENABLED=1` and
+`NONODB_REPLICATION_ORIGIN` to enable logging.
 
 Read-only inspection endpoints:
 
@@ -114,9 +116,16 @@ GET /v1/replication/changes?after=0&limit=100
 - Reject older `owner_epoch` values after failover.
 - Apply `(origin, seq)` idempotently.
 - Preserve deletes with tombstones.
-- Do not regenerate local application events during replication apply unless
-  explicitly configured.
-- Rebuild indexes on the replica.
+- Apply metadata and indexes at their exact position in the transaction.
+- Apply replicated `_events` outbox documents; do not re-evaluate persistent
+  subscriptions or generate a second set of events.
+- Generate local document history from the replicated `before`/`after` values
+  when the collection history setting is active.
+- Notify connection-scoped live streams after commit; never write live events
+  into `_events` on the replica.
+- Build or backfill indexes on the replica after the metadata operation.
+- Expose `promotion_ready`; automatic election refuses to promote a candidate
+  that has not applied the last observed source head.
 - Deep-verify snapshots before installing them.
 
 ## Bootstrap and resync
@@ -504,63 +513,55 @@ whole topology, including offline members.
 
 There are three different mechanisms:
 
-1. **Replication log** — every committed write on a primary is appended to
-   `_replication` as a transaction containing collection, operation, document
-   id, and before/after values. Replicas pull this log.
+1. **Replication log** — every committed write is appended as an ordered set of
+   logical operations: document changes, collection metadata, indexes,
+   subscriptions, and outbox events.
 2. **Application events** — when enabled, the primary writes event documents to
-   `_events`; conditional subscriptions also write there. These are a separate
-   outbox, not the replication log.
-3. **Watch/streams** — long-poll `watch`, NDJSON, and SSE read `_events` or use
-   connection-scoped `mode:"live"` notifications. They do not read the
-   replication log.
+   `_events`. Those documents are replicated as `event_append` operations in the
+   same transaction. Subscription definitions are replicated as metadata.
+3. **Watch/streams** — long-poll `watch`, NDJSON, and SSE read replicated
+   `_events`; connection-scoped `mode:"live"` notifications are dispatched by
+   the replica apply path after commit.
 
-On a replica, the apply path writes the document and updates local indexes and
-the local replication log, but it does not call the event/subscription/live
-notification code. As a result:
+On a replica:
 
-- replicated writes do **not** create new `_events` documents on the replica;
-- long-poll `watch` on a replica's `_events` stays empty for replicated writes;
-- live `/v1/watch`, NDJSON, SSE, thresholds, and conditional-subscription
-  notifications do not fire for replicated writes;
-- the primary's `_events` and subscription metadata are not replicated.
-
-For cross-node consumers, subscribe to `/v1/replication/changes` and keep an
-`after` checkpoint. This is the supported replica-aware stream. Watch/event
-consumers should target the primary.
+- replicated writes produce the same `_events` documents as the primary;
+- long-poll `watch` on `_events` sees replicated events;
+- live `/v1/watch`, NDJSON, and SSE receive replicated document changes;
+- persistent subscriptions are **not** re-evaluated on the replica, avoiding
+  duplicate outbox events; they remain active for when the node is promoted;
+- the local replication log is still available at
+  `GET /v1/replication/changes` for checkpoint-based consumers.
 
 ## Replica feature support
 
-The replica is intentionally read-only. Reads and administrative inspection work;
-client writes are rejected with `read_only`. Metadata changes and outbox events
-are not yet part of the replication stream, so the following matrix applies to a
-replica that joined before those settings were created. A snapshot bootstrap
-copies the metadata that exists at the moment the snapshot is taken, but later
-index, TTL, history, event, and subscription changes are not replicated.
+The replica remains intentionally read-only for clients. Reads and administrative
+inspection work; client writes are rejected with `read_only`.
 
 | Feature | On a replica | Notes |
 |---|---|---|
 | `find`, `find_one`, `count`, `aggregate`, SQL `SELECT` | Yes | Replicated documents are readable. |
 | `insert`, `update`, `delete`, `batch`, SQL writes, import | No | Rejected with HTTP 403 `read_only`. |
 | Primary `_id` lookup | Yes | `_id` is built into every collection. |
-| Secondary, text, fuzzy, vector, geo indexes | Snapshot-only | Definitions created after the replica joined are absent. Text/vector/geo searches fail without the index; standard filters still work by scan. |
-| Unique index enforcement | Snapshot-only | A promoted replica without the index will not enforce uniqueness. |
-| TTL | Primary-driven | The primary expires and replicates a delete. The replica has no local TTL metadata and cannot expire documents itself. |
-| Document history | No | History is generated by the writer; replica history is empty. |
-| Automatic collection events | Primary-only | `_events` documents are not replicated. The replica's event count stays empty. |
-| Conditional subscriptions | Primary-only | Subscription definitions are metadata and are not replicated; new subscriptions require writes. |
-| Long-poll `watch` on `_events` | No new events | It can only read `_events` documents already present locally. |
-| Live `/v1/watch`, NDJSON, SSE | Local writes only | Replication apply bypasses the live registry, so replica clients do not receive replicated changes. |
+| Collection creation, TTL, history, event settings | Yes | Replicated as ordered metadata operations. |
+| Secondary, text, fuzzy, vector, geo indexes | Yes | Created and backfilled on the replica; subsequent applies maintain them. |
+| Unique index enforcement | Yes | The definition is replicated, so a promoted replica keeps enforcing it. |
+| TTL | Config replicated | Expiry runs on the primary and is replicated as a delete. The replica does not run a local TTL sweeper; after promotion the TTL setting is already present. |
+| Document history | Yes | Generated locally from replicated before/after values and the replicated history setting. History pruning is paused while read-only and resumes after promotion. |
+| Automatic collection events | Yes | `_events` documents are replicated atomically with the source transaction. |
+| Conditional subscriptions | Yes | Definitions and renewals are replicated; evaluation happens only on the primary. |
+| Long-poll `watch` on `_events` | Yes | Replicated outbox documents are readable. |
+| Live `/v1/watch`, NDJSON, SSE, thresholds | Yes | Apply dispatches local live notifications after commit. |
 | Background jobs / workers | Must target primary | Workers claim jobs with writes; a replica rejects the claim. |
-| Backup, verify, export | Yes | These are read-only operations over the local database files. |
+| Backup, verify, export | Yes | Read-only operations over local database files. |
 | Metrics, readiness, GUI monitoring | Yes | Metrics and the Replication/Cluster tabs work on replicas. |
 | GUI data editing, imports, role-independent writes | No | The same `read_only` gate applies. |
 | Multi-database reads | Yes | Only databases listed in `NONODB_REPLICATION_DATABASES` are applied. |
 | Replication status/changes/acks/promote/demote APIs | Yes | Administrative endpoints remain available on replicas. |
 
-Use the replication log (`GET /v1/replication/changes`) for replica-aware
-consumers instead of `watch` on a replica. To make indexes, TTL, history,
-events, or subscriptions survive promotion, they must be recreated after
-promotion or included in a future metadata replication stream.
+Metadata and outbox operations are idempotent through the applied sequence. A
+replica that joins by snapshot receives all metadata present in that snapshot;
+metadata created later arrives through the operation log.
 
 ## Configuring and monitoring with the CLI
 
@@ -601,3 +602,8 @@ response.
 Replicas advance their persisted role epoch when they observe a newer epoch in
 the applied stream. This is required for a second failover: the next candidate
 proposes an epoch above the votes cast for the previous primary.
+
+`replication status` also exposes `promotion_ready`. Automatic election requires
+the candidate to have applied the last observed source head; a lagging candidate
+waits instead of promoting stale data. Manual `promote --force` remains an
+explicit operator override.

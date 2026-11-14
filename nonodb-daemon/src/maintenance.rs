@@ -90,6 +90,11 @@ fn run(
         if stop.load(std::sync::atomic::Ordering::Relaxed) {
             return;
         }
+        if !crate::replicator::writable() {
+            // Replicas receive TTL deletes and metadata from the primary. Local
+            // maintenance writes would be rejected by the read-only writer.
+            continue;
+        }
 
         if last_ttl.is_none_or(|at| at.elapsed() >= config.ttl_interval) {
             last_ttl = Some(Instant::now());

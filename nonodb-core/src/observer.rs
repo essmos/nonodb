@@ -28,10 +28,33 @@ pub trait ChangeObserver: Send + Sync {
     ) -> Result<()>;
 }
 
+pub trait OutboxObserver: Send + Sync {
+    fn observe_outbox(&self, event: &Value);
+}
+
 static OBSERVER: OnceLock<Mutex<Option<Arc<dyn ChangeObserver>>>> = OnceLock::new();
+static OUTBOX_OBSERVER: OnceLock<Mutex<Option<Arc<dyn OutboxObserver>>>> = OnceLock::new();
 
 fn slot() -> &'static Mutex<Option<Arc<dyn ChangeObserver>>> {
     OBSERVER.get_or_init(|| Mutex::new(None))
+}
+
+fn outbox_slot() -> &'static Mutex<Option<Arc<dyn OutboxObserver>>> {
+    OUTBOX_OBSERVER.get_or_init(|| Mutex::new(None))
+}
+
+pub fn set_outbox_observer(observer: Option<Arc<dyn OutboxObserver>>) {
+    *outbox_slot().lock().expect("outbox observer poisoned") = observer;
+}
+
+pub(crate) fn notify_outbox(event: &Value) {
+    let observer = outbox_slot()
+        .lock()
+        .expect("outbox observer poisoned")
+        .clone();
+    if let Some(observer) = observer {
+        observer.observe_outbox(event);
+    }
 }
 
 pub fn set_change_observer(observer: Option<Arc<dyn ChangeObserver>>) {

@@ -76,6 +76,13 @@ pub fn start(data_root: std::path::PathBuf, shutdown: watch::Receiver<bool>) -> 
                     Ok(_) | Err(_) => {
                         let since = *failed_since.get_or_insert_with(Instant::now);
                         if since.elapsed() >= config.timeout + config.priority {
+                            if !replicator::promotion_ready() {
+                                tracing::warn!(
+                                    "candidate is not caught up with the last observed source head; refusing automatic promotion"
+                                );
+                                failed_since = Some(Instant::now());
+                                continue;
+                            }
                             tracing::warn!(
                                 timeout_secs = config.timeout.as_secs(),
                                 priority_secs = config.priority.as_secs(),
