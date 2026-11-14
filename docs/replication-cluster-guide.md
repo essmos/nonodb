@@ -778,6 +778,7 @@ Keep both. Take regular snapshots even when a replica is healthy.
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
+| `connect: No such file or directory` on `replication join` | Local replica daemon/socket is missing, or `NONODB_SOCK` is wrong | Start the replica daemon and set `NONODB_SOCK` to its socket. `join` talks to the local daemon; the primary URL is only the source. On macOS/Linux use the Unix socket, not `NONODB_URL`. |
 | `401 unauthorized` / `403 forbidden` on replication | Source token missing or lacks `admin:db` | Create a dedicated `admin:db` token on the source. |
 | `read_only` on every write | Node is a replica/standby | Write to primary or promote the node. |
 | `promotion_ready=false` | Candidate is behind the last observed source head | Wait for lag to reach zero; check `/v1/replication/changes`. |

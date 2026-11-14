@@ -558,6 +558,21 @@ Use the primary's daemon API URL, not the GUI proxy. The default API port is
 field shows the effective value). The CLI prints the same URL when it creates a
 pairing code.
 
+`replication join` is a **local admin command**: the CLI talks to the local
+replica daemon, and that daemon redeems the code against `<primary-api-url>`.
+It does not connect directly to the primary URL. If you see:
+
+```text
+nonodb-cli: connect: No such file or directory (os error 2)
+```
+
+the local daemon socket is missing or `NONODB_SOCK` points at the wrong path.
+Start the replica daemon first, or set `NONODB_SOCK` to its actual socket
+(e.g. `/run/nonodb-replica.sock` or `/tmp/nonodb.sock`). On macOS/Linux the CLI
+uses the Unix socket; `NONODB_URL` is the Windows TCP path and is ignored on
+Unix. If the daemon runs in Docker, run the command inside the container with
+the container's socket path.
+
 The code can be omitted from `join`; the CLI prompts for it. List and revoke
 pending codes with:
 
