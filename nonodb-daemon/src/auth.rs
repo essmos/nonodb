@@ -8,6 +8,7 @@ use std::time::{Duration, SystemTime};
 
 use axum::http::{header::AUTHORIZATION, HeaderMap};
 use nonodb_auth::{AuthFile, Principal, Registry};
+use serde_json::Value;
 
 use crate::login_guard::{BlockInfo, FailureInfo, LoginGuard};
 use crate::protocol::ApiError;
@@ -105,6 +106,25 @@ impl AuthState {
 
     pub fn registry(&self) -> Arc<Registry> {
         self.registry.read().expect("auth registry lock").clone()
+    }
+
+    /// Applies a replicated cluster auth snapshot. The file stores only token
+    /// hashes and certificate fingerprints, so the snapshot never contains a
+    /// plaintext bearer token.
+    pub fn apply_control_snapshot(&self, value: &Value) -> Result<(), String> {
+        let file: nonodb_auth::AuthFile = serde_json::from_value(value.clone())
+            .map_err(|error| format!("parse replicated auth snapshot: {error}"))?;
+        file.validate()?;
+        let current = serde_json::to_value(self.registry().file())
+            .map_err(|error| format!("serialize local auth snapshot: {error}"))?;
+        if current == *value {
+            return Ok(());
+        }
+        nonodb_auth::save_atomic(&self.path, &file)?;
+        if !self.reload() {
+            return Err("replicated auth snapshot was written but could not be reloaded".into());
+        }
+        Ok(())
     }
 
     /// Monotonically increasing registry version. Cache keys include it so a

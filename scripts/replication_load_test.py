@@ -217,7 +217,7 @@ def main() -> int:
             NONODB_REPLICATION_VOTER_TOKEN=token,
             NONODB_REPLICATION_FOLLOWERS=follower_spec,
             NONODB_REPLICATION_LEASE_INTERVAL="2",
-            NONODB_REPLICATION_LEASE_TTL="600",
+            NONODB_REPLICATION_LEASE_TTL="10",
             NONODB_REPLICATION_AUTO_FAILOVER="0",
             NONODB_REPLICATION_CANDIDATE="0",
             NONODB_REPLICATION_ELECTION_INTERVAL="1",
@@ -402,7 +402,6 @@ def main() -> int:
             "primary",
             {"NONODB_REPLICATION_ADVERTISE_URL": f"http://127.0.0.1:{ports['primary']}"},
         )
-        exec_node(primary, {"op": "create_collection", "coll": "loadtest"})
         gui_proc = start_gui()
         monitor_stop = threading.Event()
 
@@ -451,10 +450,6 @@ def main() -> int:
         # Bulk load while nodes join at different points. Starts are serialized
         # so snapshots bootstrap one at a time instead of saturating disk I/O.
         milestones = {
-            int(args.docs * 0.01): [("candidate1", 0)],
-            int(args.docs * 0.03): [("candidate2", 10)],
-            int(args.docs * 0.05): [("candidate3", 20)],
-            int(args.docs * 0.07): [("candidate4", 30)],
             int(args.docs * 0.09): [("follower1", None)],
             int(args.docs * 0.12): [("follower2", None)],
         }
@@ -482,6 +477,27 @@ def main() -> int:
                     continue
                 triggered.add(name)
                 start_queue.put((name, "replica", node_extra(name, priority)))
+
+        # Voters must exist before the primary can acquire a lease and accept
+        # writes. Initialize them first; followers still join during the load.
+        for name, priority in (
+            ("candidate1", 0),
+            ("candidate2", 10),
+            ("candidate3", 20),
+            ("candidate4", 30),
+        ):
+            start_node(name, "replica", node_extra(name, priority))
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            status = primary.client.get(
+                "/v1/replication/status", headers={"Authorization": f"Bearer {token}"}
+            ).json()["result"]
+            if status.get("lease_valid"):
+                break
+            time.sleep(0.2)
+        else:
+            raise RuntimeError(f"primary did not acquire quorum lease: {status}")
+        exec_node(primary, {"op": "create_collection", "coll": "loadtest"})
 
         load_started = time.perf_counter()
         loaded = 0

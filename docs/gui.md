@@ -103,13 +103,14 @@ Import plan with target database, selected backup, and the generated
 
 ![NonoDB GUI import plan](assets/gui/import-plan.png)
 
-Replication tab with the node status, glossary, transport health, source
-settings, role controls, acknowledgements, and applied sources:
+Replication tab with node status, glossary, transport health, source settings,
+role controls, acknowledgements, and applied sources (the Add replica pairing
+panel is shown when connected to a primary):
 
 ![NonoDB GUI replication](assets/gui/replication.png)
 
-Cluster tab showing every configured node at once, including a primary, live
-replicas, and two offline nodes after failover testing:
+Cluster tab showing every configured node at once: a primary and two live
+replicas, all online and caught up:
 
 ![NonoDB GUI cluster](assets/gui/cluster.png)
 
@@ -296,8 +297,10 @@ database, and refuses to overwrite an existing database.
 
 ### Replication
 
-The current branch exposes a read-only replication foundation:
+The Replication tab exposes:
 
+- **Add replica**: a one-time 8-character pairing code, join command, and
+  pending-code revocation;
 - node role badge and origin;
 - durable log capture status;
 - head sequence;
@@ -310,9 +313,11 @@ The current branch exposes a read-only replication foundation:
 - replica acknowledgements and minimum safe sequence;
 - recent replication transactions with grouped collection/op/id changes.
 
-Network transport, peer setup, replica apply, and promote/demote are still
-planned. When log capture is disabled, the tab shows the required
-`NONODB_REPLICATION_ENABLED` and `NONODB_REPLICATION_ORIGIN` settings.
+Replicas also receive the cluster auth registry, backup jobs/state, database
+catalog, and cluster peer token. They remain read-only and do not run backup,
+TTL, history-pruning, or subscription services until promoted. When log capture
+is disabled, the tab shows the required `NONODB_REPLICATION_ENABLED` and
+`NONODB_REPLICATION_ORIGIN` settings.
 
 ### Authorization
 

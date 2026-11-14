@@ -178,6 +178,7 @@ pub async fn status(
                 "role": crate::replicator::role(),
                 "epoch": crate::replicator::epoch(),
                 "read_only": !crate::replicator::writable(),
+                "lease_valid": crate::replicator::lease_valid(),
                 "successor": crate::replicator::successor(),
                 "write_url": crate::replicator::write_url(state.databases.root()).unwrap_or(None),
                 "head": head,

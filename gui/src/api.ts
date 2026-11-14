@@ -565,6 +565,7 @@ export type ReplicationStatus = {
   role: string;
   epoch?: number;
   read_only?: boolean;
+  lease_valid?: boolean;
   write_url?: string | null;
   head: number;
   replication?: {
@@ -696,6 +697,41 @@ export function replicationStatus(connection: Connection): Promise<ReplicationSt
     connection,
     scopedPath(connection, '/v1/replication/status'),
   );
+}
+
+export type PairingView = {
+  code: string;
+  name: string;
+  databases: string[];
+  expires_at_ms: number;
+  join_command?: string;
+};
+
+export function createReplicaPairing(
+  connection: Connection,
+  name: string,
+  databases: string[],
+): Promise<PairingView> {
+  return replicationWrite(connection, '/v1/replication/pairings', 'POST', {
+    name,
+    databases,
+  }) as Promise<PairingView>;
+}
+
+export function listReplicaPairings(connection: Connection): Promise<{ pending: PairingView[] }> {
+  return replicationRequest(connection, '/v1/replication/pairings');
+}
+
+export function revokeReplicaPairing(
+  connection: Connection,
+  code: string,
+): Promise<{ revoked: boolean }> {
+  return replicationWrite(
+    connection,
+    `/v1/replication/pairings/${encodeURIComponent(code)}`,
+    'DELETE',
+    {},
+  ) as Promise<{ revoked: boolean }>;
 }
 
 export function updateReplicationSource(

@@ -436,8 +436,40 @@ epoch with `stale replication epoch`. Promoting a source therefore fences
 replicas against transactions produced before the promotion, as long as they
 pull from the demoted node under the same origin.
 
-Lease-based automatic promotion and a fully quorum-enforced fence remain future
-work.
+Lease-gated writes, quorum promotion, leases, candidate election, and the
+cluster control plane are implemented. See the
+[replication and cluster guide](replication-cluster-guide.md) for operation.
+
+## Cluster control plane
+
+The current primary publishes one hidden `__nonodb_control` document through the
+normal durable replication log. It contains:
+
+- the auth registry snapshot (principals, scopes, token hashes, certificate
+  fingerprints);
+- backup job definitions and run state;
+- the non-default database catalog;
+- the cluster peer token used for cross-node source/vote authentication.
+
+Replicas apply the snapshot immediately, so every node has the same admin
+credentials and configuration. Write-side owners — TTL sweeper, history pruning,
+subscription evaluation, automatic events, backup scheduler, retention, and
+maintenance — only run while the node is a writable primary.
+
+Promotion readiness requires both the data head and the control-plane snapshot.
+A candidate that is behind either one refuses automatic promotion.
+
+The cluster peer token is stored in the control document and written to
+`cluster-peer-token` with mode `0600`. This is a deliberate cluster-wide
+administration model: every fully joined node can become primary and has the
+credentials needed to accept clients and follow the next primary.
+
+Database create/drop is part of the catalog. Replicas create missing databases
+and, by default, drop databases that disappear from the catalog. Set
+`NONODB_CLUSTER_PRUNE_DATABASES=0` to keep removed local databases.
+
+Vault payloads and keys remain outside this control plane because vault uses
+client-supplied encryption material.
 
 ## Implementation phases
 
@@ -465,20 +497,21 @@ work.
 - [x] Snapshot bootstrap with recorded sequence.
 - [x] Replicas keep a local log of applied transactions for promotion.
 - [x] Global applied sequence supports mixed origins.
-- [ ] Epoch fencing and source changes.
+- [x] Epoch fencing and source changes.
 - [x] Automatic snapshot resync at startup when the source log was pruned too far.
 - [x] Graceful restart on a runtime gap when `NONODB_REPLICATION_EXIT_ON_GAP=1`.
 - [ ] Hot resync without a process restart.
-- [ ] Replica readiness policy.
+- [x] Replica readiness policy includes data and control-plane head.
 
 ### Phase 3 — operations and GUI
 
 - [x] Replication tab with role, source, bootstrap, applied/lag, transport
       health, and recent log entries.
 - [x] Role-aware `/readyz` and `nonodb-cli replication` status/changes/prune.
-- [ ] Peer wizard and full role banner.
+- [x] Peer wizard with one-time pairing codes and full role banner.
 - [x] Persist and reload the pull source without restart.
-- [ ] Add peer test-connection, pause/resume, and hot resync.
+- [x] Add peer pairing, revoke, source validation, and control-plane snapshot.
+- [ ] Pause/resume and hot resync.
 - [x] Manual promote/demote with persisted role, expected epoch, and audit.
 - [x] Promotion/demote confirmation workflow in the GUI.
 - [ ] Certificate expiry and lag dashboards.
@@ -486,9 +519,9 @@ work.
 
 ### Phase 4 — failover and stronger policies
 
-- [ ] Lease-based promotion.
-- [ ] Fencing epochs.
-- [ ] Sync standby.
+- [x] Lease-based promotion and lease-gated writes.
+- [x] Fencing epochs.
+- [ ] Synchronous quorum writes / zero-RPO standby.
 - [ ] Per-collection consistency profiles.
 - [ ] Quorum payments design.
 
@@ -560,7 +593,11 @@ inspection work; client writes are rejected with `read_only`.
 | Backup, verify, export | Yes | Read-only operations over local database files. |
 | Metrics, readiness, GUI monitoring | Yes | Metrics and the Replication/Cluster tabs work on replicas. |
 | GUI data editing, imports, role-independent writes | No | The same `read_only` gate applies. |
-| Multi-database reads | Yes | Only databases listed in `NONODB_REPLICATION_DATABASES` are applied. |
+| Multi-database reads | Yes | The replicated catalog adds databases to the source list automatically; explicit `NONODB_REPLICATION_DATABASES` is a seed. |
+| Auth registry, admin tokens, certificates | Yes | Replicated as hashes/fingerprints on every node; the same client token works after promotion. |
+| Backup jobs and run state | Yes | Replicated; only the primary runs the scheduler. |
+| Database catalog | Yes | Create/drop replicated; local databases follow the catalog. |
+| Vault payloads/keys | No | Vault remains a local encrypted store. |
 | Replication status/changes/acks/promote/demote APIs | Yes | Administrative endpoints remain available on replicas. |
 
 Metadata and outbox operations are idempotent through the applied sequence. A

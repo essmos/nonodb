@@ -185,11 +185,6 @@ def main() -> int:
             },
         )
         primary = clients["primary"]
-        primary.post(
-            "/v1/exec",
-            headers=headers,
-            json={"op": "create_collection", "coll": "events"},
-        )
 
         def writer() -> None:
             next_id = 0
@@ -210,10 +205,6 @@ def main() -> int:
                         writer_errors.append(response.text)
                     next_id += 1
                     time.sleep(0.02)
-
-        thread = threading.Thread(target=writer, daemon=True)
-        thread.start()
-        time.sleep(0.4)
 
         start(
             "candidate1",
@@ -264,6 +255,22 @@ def main() -> int:
                 "NONODB_REPLICATION_ADVERTISE_URL": f"http://127.0.0.1:{ports['follower2']}",
             },
         )
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            status = primary.get("/v1/replication/status", headers=headers).json()["result"]
+            if status.get("lease_valid"):
+                break
+            time.sleep(0.2)
+        else:
+            raise RuntimeError(f"primary did not acquire quorum lease: {status}")
+        created = primary.post(
+            "/v1/exec",
+            headers=headers,
+            json={"op": "create_collection", "coll": "events"},
+        )
+        assert created.status_code == 200, created.text
+        thread = threading.Thread(target=writer, daemon=True)
+        thread.start()
         time.sleep(2)
 
         writer_stop.set()

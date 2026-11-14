@@ -49,7 +49,8 @@ pub use index::{IndexDef, RangeBytes};
 pub use replication::{ReplicationChange, ReplicationTxn, REPLICATION_DB};
 pub use search::DEFAULT_FUZZY_DISTANCE;
 pub use store::{
-    parse_size, ReadTxn, Store, WriteTxn, MAP_SIZE, MAX_DBS, MAX_DOCUMENT_BYTES, META_DB, PAGE_SIZE,
+    parse_size, ReadTxn, Store, WriteTxn, CONTROL_DB, MAP_SIZE, MAX_DBS, MAX_DOCUMENT_BYTES,
+    META_DB, PAGE_SIZE,
 };
 pub use ttl::DueEntry;
 pub use vault::{CollectionProfile, VaultKey};

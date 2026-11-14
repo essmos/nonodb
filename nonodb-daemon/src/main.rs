@@ -14,6 +14,7 @@ mod auto_index;
 mod backups;
 mod backups_api;
 mod cache;
+mod control_plane;
 mod cursor;
 mod databases;
 mod election;
@@ -24,6 +25,8 @@ mod live;
 mod login_guard;
 mod maintenance;
 mod metrics;
+mod pairing;
+mod pairing_api;
 mod protocol;
 mod replication_api;
 mod replicator;
@@ -124,6 +127,7 @@ struct AppState {
     pub(crate) imports: Arc<imports::ImportManager>,
     pub(crate) auth: Option<Arc<auth::AuthState>>,
     pub(crate) audit: Option<Arc<audit::AuditLog>>,
+    pub(crate) pairings: Arc<pairing::PairingManager>,
     cursors: Arc<cursor::Registry>,
 }
 
@@ -141,6 +145,7 @@ impl AppState {
             imports: self.imports.clone(),
             auth: self.auth.clone(),
             audit: self.audit.clone(),
+            pairings: self.pairings.clone(),
             cursors: self.cursors.clone(),
         })
     }
@@ -221,6 +226,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let drain_timeout = drain_timeout();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let replication_shutdown = shutdown_tx.clone();
+    let control =
+        control_plane::ControlPlane::new(databases.clone(), auth.clone(), backups.clone());
+    control_plane::install(control.clone());
+    control.start(shutdown_rx.clone());
     tokio::spawn(async move {
         shutdown_signal().await;
         tracing::info!("shutdown signal received; draining");
@@ -251,6 +260,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         imports,
         auth: auth.clone(),
         audit: audit.clone(),
+        pairings: Arc::new(pairing::PairingManager::new()),
         cursors: Arc::new(cursor::Registry::new()),
     };
     let auth_routes = Router::new()
@@ -309,6 +319,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/replication/acks", get(replication_api::acks_default))
         .route("/v1/replication/vote", post(replication_api::vote))
         .route("/v1/replication/primary", get(replication_api::primary))
+        .route(
+            "/v1/replication/pairings",
+            get(pairing_api::list).post(pairing_api::create),
+        )
+        .route(
+            "/v1/replication/pairings/:code",
+            axum::routing::delete(pairing_api::revoke),
+        )
+        .route("/v1/replication/pair", post(pairing_api::pair))
+        .route("/v1/replication/join", post(pairing_api::join))
         .route("/v1/replication/lease", post(replication_api::lease))
         .route("/v1/replication/promote", post(replication_api::promote))
         .route("/v1/replication/demote", post(replication_api::demote))
@@ -986,9 +1006,11 @@ async fn health() -> Json<Value> {
 /// cheap and public at `/healthz`; orchestrators should use `/readyz`.
 async fn ready(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
     let role = replicator::role();
-    let read_only = !replicator::writable();
-    let writer_required = !read_only;
-    let writer_ok = !writer_required || state._runtime.writer_alive();
+    let writable = replicator::writable();
+    let lease_valid = replicator::lease_valid();
+    let read_only = !writable;
+    let writer_required = replicator::role_is_primary();
+    let writer_ok = !writer_required || (writable && state._runtime.writer_alive());
     let store = state.store.clone();
     let storage = tokio::task::spawn_blocking(move || {
         let txn = store.read_txn().map_err(|err| err.to_string())?;
@@ -1013,6 +1035,7 @@ async fn ready(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
             "checks": {
                 "writer": writer_ok,
                 "writer_required": writer_required,
+                "lease_valid": lease_valid,
                 "storage": storage_ok,
                 "storage_error": storage_error,
             },

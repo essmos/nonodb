@@ -16,6 +16,7 @@ import {
   createAuthToken,
   createCertificate,
   createPrincipal,
+  createReplicaPairing,
   databaseStats,
   defaultConnection,
   deleteBackupJob,
@@ -29,8 +30,10 @@ import {
   importStatus,
   demoteReplication,
   promoteReplication,
+  listReplicaPairings,
   replicationChanges,
   replicationStatus,
+  revokeReplicaPairing,
   runImport,
   updateReplicationSource,
   loadConnection,
@@ -52,6 +55,7 @@ import {
   type ImportSource,
   type ImportStatus,
   type ImportOverview,
+  type PairingView,
   type ReplicationChangeTxn,
   type ReplicationStatus,
   type DatabaseStorageStats,
@@ -1751,17 +1755,24 @@ function ReplicationPage({ connection }: { connection: Connection }) {
   const [epochDraft, setEpochDraft] = useState('0');
   const [successorDraft, setSuccessorDraft] = useState('');
   const [changingRole, setChangingRole] = useState(false);
+  const [pairName, setPairName] = useState('');
+  const [pairDatabases, setPairDatabases] = useState('default');
+  const [pairing, setPairing] = useState<PairingView | null>(null);
+  const [pendingPairings, setPendingPairings] = useState<PairingView[]>([]);
+  const [pairingBusy, setPairingBusy] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
     setError('');
     try {
-      const [nextStatus, nextChanges] = await Promise.all([
+      const [nextStatus, nextChanges, pending] = await Promise.all([
         replicationStatus(connection),
         replicationChanges(connection, 0, 50),
+        listReplicaPairings(connection).catch(() => ({ pending: [] })),
       ]);
       setStatus(nextStatus);
       setChanges(nextChanges.changes);
+      setPendingPairings(pending.pending ?? []);
       setSourceDraft(nextStatus.replication?.source ?? '');
       setDatabasesDraft((nextStatus.replication?.databases ?? ['default']).join(', '));
       setIntervalDraft(String(nextStatus.replication?.interval_secs ?? 1));
@@ -1813,6 +1824,38 @@ function ReplicationPage({ connection }: { connection: Connection }) {
       setError(errorText(err));
     } finally {
       setSavingSource(false);
+    }
+  };
+
+  const createPairing = async () => {
+    setPairingBusy(true);
+    setError('');
+    try {
+      const result = await createReplicaPairing(
+        connection,
+        pairName.trim(),
+        pairDatabases.split(',').map((item) => item.trim()).filter(Boolean),
+      );
+      setPairing(result);
+      setPendingPairings((current) => [...current, result]);
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setPairingBusy(false);
+    }
+  };
+
+  const revokePairing = async (code: string) => {
+    setPairingBusy(true);
+    setError('');
+    try {
+      await revokeReplicaPairing(connection, code);
+      setPendingPairings((current) => current.filter((item) => item.code !== code));
+      if (pairing?.code === code) setPairing(null);
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setPairingBusy(false);
     }
   };
 
@@ -1876,6 +1919,58 @@ function ReplicationPage({ connection }: { connection: Connection }) {
           </p>
         )}
       </section>
+      {status?.role === 'primary' && (
+        <section className="panel">
+          <div className="panel-title">
+            <h3>Add replica</h3>
+            <span>one-time pairing</span>
+          </div>
+          <p className="field-hint">
+            Creates a short-lived 8-character code. Run
+            <code> nonodb-cli replication join &lt;this-primary-url&gt; </code>
+            on the new node and enter the code there. The replica receives the
+            cluster auth registry and backup configuration automatically; they stay
+            dormant until this node is promoted.
+          </p>
+          <div className="form-grid">
+            <label>Replica name<input value={pairName} onChange={(e) => setPairName(e.target.value)} placeholder="replica-eu" />
+              <span className="field-hint">Used for the replicated principal name and audit records.</span>
+            </label>
+            <label>Databases<input value={pairDatabases} onChange={(e) => setPairDatabases(e.target.value)} placeholder="default, app1" />
+              <span className="field-hint">Comma-separated databases the new replica should pull initially.</span>
+            </label>
+          </div>
+          <div className="actions">
+            <button onClick={() => void createPairing()} disabled={pairingBusy || !pairName.trim()}>
+              {pairingBusy ? 'Working…' : 'Create pairing code'}
+            </button>
+          </div>
+          {pairing && (
+            <div className="pairing-box">
+              <div className="pairing-code">{pairing.code}</div>
+              <p className="field-hint">
+                Expires {new Date(pairing.expires_at_ms).toLocaleTimeString()}.
+                The code is single-use. The replica receives a cluster credential and
+                the full control-plane snapshot after joining.
+              </p>
+              <code>nonodb-cli replication join &lt;this-primary-url&gt;</code>
+            </div>
+          )}
+          {pendingPairings.length > 0 && (
+            <>
+              <div className="panel-title"><h3>Pending pairings</h3><span>{pendingPairings.length}</span></div>
+              <div className="index-list">
+                {pendingPairings.map((item) => (
+                  <div className="index-row" key={item.code}>
+                    <div><strong className="mono">{item.code}</strong><span className="muted"> · {item.name} · {(item.databases ?? []).join(', ')}</span></div>
+                    <button className="danger" disabled={pairingBusy} onClick={() => void revokePairing(item.code)}>Revoke</button>
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
+        </section>
+      )}
       {status?.replication && (
         <section className="panel">
           <div className="panel-title">

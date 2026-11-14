@@ -99,6 +99,56 @@ fn run() -> Result<(), String> {
                     let res = http_get("/v1/replication/acks")?;
                     println!("{}", serde_json::to_string_pretty(&res).unwrap());
                 }
+                "pair" => {
+                    let name = args
+                        .get(2)
+                        .ok_or("usage: nonodb-cli replication pair <name> [databases]")?;
+                    let databases = args
+                        .get(3)
+                        .map(|value| {
+                            value
+                                .split(',')
+                                .map(str::trim)
+                                .filter(|item| !item.is_empty())
+                                .map(str::to_string)
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    let res = http_post(
+                        "/v1/replication/pairings",
+                        &json!({ "name": name, "databases": databases }),
+                    )?;
+                    print_result(&res);
+                }
+                "pairings" => {
+                    let res = http_get("/v1/replication/pairings")?;
+                    println!("{}", serde_json::to_string_pretty(&res).unwrap());
+                }
+                "revoke" => {
+                    let code = args
+                        .get(2)
+                        .ok_or("usage: nonodb-cli replication revoke <pairing-code>")?;
+                    let res =
+                        http_request("DELETE", &format!("/v1/replication/pairings/{code}"), None)?;
+                    print_result(&res);
+                }
+                "join" => {
+                    let url = args
+                        .get(2)
+                        .ok_or("usage: nonodb-cli replication join <primary-url>")?;
+                    eprintln!("Enter the one-time pairing code shown on the primary:");
+                    let mut code = String::new();
+                    std::io::stdin()
+                        .read_line(&mut code)
+                        .map_err(|error| format!("read pairing code: {error}"))?;
+                    let code = code.trim();
+                    if code.is_empty() {
+                        return Err("pairing code is empty".into());
+                    }
+                    let res =
+                        http_post("/v1/replication/join", &json!({ "url": url, "code": code }))?;
+                    print_result(&res);
+                }
                 "source" => {
                     let source = args.get(2).ok_or(
                         "usage: nonodb-cli replication source <url> [databases] [interval]",
@@ -500,7 +550,7 @@ fn usage() -> Result<(), String> {
          ping                       sprawdź daemona\n\
          exec '<json>'              dowolne żądanie /v1/exec\n\
          databases [list|create <nazwa>|drop <nazwa>]  bazy w jednym daemonie\n\
-         replication [status|changes [after] [limit]|source <url> [dbs] [interval]|acks|prune <seq> [--require-acks]|promote <epoch> [--force]|demote <epoch> [role] [successor]]\n\
+         replication [status|changes [after] [limit]|source <url> [dbs] [interval]|acks|prune <seq> [--require-acks]|promote <epoch> [--force]|demote <epoch> [role] [successor]|pair <name> [dbs]|pairings|revoke <code>|join <primary-url>]\n\
          collections                lista kolekcji\n\
          count <coll> [filtr]       liczba dokumentów\n\
          find <coll> [filtr] [--sort pole:asc|desc] [--limit N] [--skip N]\n\

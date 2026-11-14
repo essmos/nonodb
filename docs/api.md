@@ -2471,13 +2471,25 @@ Transport, replica apply, promotion, and GUI management are still planned.
 | `PUT` | `/v1/replication/source` | Persist a new pull source and reload the loop |
 | `POST` | `/v1/replication/vote` | Cast or inspect a quorum vote for `(epoch, candidate)` |
 | `POST` | `/v1/replication/lease` | Renew a candidate's quorum lease |
+| `GET` | `/v1/replication/pairings` | List pending one-time replica pairing codes (admin) |
+| `POST` | `/v1/replication/pairings` | Create an 8-character pairing code for a replica (admin) |
+| `DELETE` | `/v1/replication/pairings/{code}` | Revoke a pending pairing code (admin) |
+| `POST` | `/v1/replication/pair` | Redeem a one-time pairing code and issue a cluster credential |
+| `POST` | `/v1/replication/join` | Local admin endpoint used by `nonodb-cli replication join` |
 
 All routes require `admin:db` or `*:*`. Snapshot and prune are intended for
 replica bootstrap and controlled retention. Prune accepts
 `{"through": N, "require_acks": true}` and refuses to advance past the minimum
 acknowledged replica sequence. Promote/demote are instance-wide
 role changes persisted in `<NONODB_DATA>/replication-role.json`. The pull source
-is persisted in `<NONODB_DATA>/replication-source.json`. A change transaction contains an
+is persisted in `<NONODB_DATA>/replication-source.json`.
+
+The primary publishes a hidden `__nonodb_control` document through the durable
+replication log. It contains the auth registry snapshot (token hashes and
+certificate fingerprints), backup jobs/state, database catalog, and cluster peer
+token. Replicas apply it immediately but only run write-side services after
+promotion. A primary with configured voters is read-only until it acquires a
+quorum lease. A change transaction contains an
 `origin`, `seq`, `epoch`, `created_at_ms`, and grouped `changes` with
 collection, op, id, and before/after documents. Replicas reject stale epochs. Replication is disabled unless
 `NONODB_REPLICATION_ENABLED=1`.

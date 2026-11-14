@@ -26,6 +26,25 @@ use crate::{
 };
 
 static PROMOTION_READY: AtomicBool = AtomicBool::new(false);
+static LEASE_VALID: AtomicBool = AtomicBool::new(false);
+static CLUSTER_PEER_TOKEN: OnceLock<std::sync::RwLock<Option<String>>> = OnceLock::new();
+
+fn cluster_peer_slot() -> &'static std::sync::RwLock<Option<String>> {
+    CLUSTER_PEER_TOKEN.get_or_init(|| std::sync::RwLock::new(None))
+}
+
+pub fn set_cluster_peer_token(token: Option<String>) {
+    *cluster_peer_slot()
+        .write()
+        .unwrap_or_else(|p| p.into_inner()) = token;
+}
+
+fn cluster_peer_token() -> Option<String> {
+    cluster_peer_slot()
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone()
+}
 
 #[derive(Clone, Debug)]
 struct Config {
@@ -44,6 +63,8 @@ struct Config {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct PersistedSource {
     source: String,
+    #[serde(default)]
+    token: Option<String>,
     #[serde(default = "default_databases")]
     databases: Vec<String>,
     #[serde(default = "default_interval")]
@@ -140,6 +161,13 @@ impl Config {
             let persisted: PersistedSource = serde_json::from_slice(&raw)
                 .map_err(|error| format!("parse source config: {error}"))?;
             config.source = persisted.source.trim().trim_end_matches('/').to_string();
+            if persisted
+                .token
+                .as_deref()
+                .is_some_and(|token| !token.trim().is_empty())
+            {
+                config.token = persisted.token;
+            }
             config.databases = persisted.databases;
             config.interval = Duration::from_secs(persisted.interval_secs.max(1));
             config.limit = persisted.batch.clamp(1, 1000);
@@ -328,7 +356,7 @@ fn follower_urls() -> Vec<String> {
 }
 
 pub(crate) fn voter_token() -> Option<String> {
-    non_empty_env("NONODB_REPLICATION_VOTER_TOKEN")
+    non_empty_env("NONODB_REPLICATION_VOTER_TOKEN").or_else(cluster_peer_token)
 }
 
 struct RoleCell {
@@ -478,6 +506,7 @@ fn change_role(
     cell.epoch = epoch;
     cell.successor = successor;
     if next == "primary" {
+        set_lease_valid(false);
         clear_replication_errors();
     }
     Ok(role_view(&cell))
@@ -713,6 +742,10 @@ pub async fn promote_with_fence(
         }
     }
     let role = promote(expected_epoch)?;
+    // The promotion path already acquired a voter majority (or has no voters).
+    // Treat that as the initial lease so clients can use the new writer at once;
+    // the lease loop extends it or fences this node after the TTL.
+    set_lease_valid(true);
     if let Some(advertise) = advertise {
         propagate_source(data_root, &advertise).await;
     }
@@ -763,6 +796,7 @@ pub(crate) fn advertise_url() -> Option<String> {
 
 /// Locally fences a primary that has lost its quorum lease.
 pub fn self_demote() -> Result<RoleView, (String, String)> {
+    set_lease_valid(false);
     let epoch = epoch();
     change_role("replica", epoch, None)
 }
@@ -783,7 +817,21 @@ pub fn epoch() -> u64 {
 }
 
 pub fn promotion_ready() -> bool {
-    writable() || PROMOTION_READY.load(Ordering::Relaxed)
+    role_is_primary() || (PROMOTION_READY.load(Ordering::Relaxed) && crate::control_plane::ready())
+}
+
+/// Role alone, without the quorum-lease gate. Used by role owners such as the
+/// lease loop and election loop; request writers must use [`writable`].
+pub fn role_is_primary() -> bool {
+    role() == "primary"
+}
+
+pub fn lease_valid() -> bool {
+    voter_urls().is_empty() || LEASE_VALID.load(Ordering::Relaxed)
+}
+
+pub fn set_lease_valid(valid: bool) {
+    LEASE_VALID.store(valid, Ordering::Relaxed);
 }
 
 /// Advances the local role epoch after observing a newer epoch from the
@@ -891,6 +939,7 @@ pub fn status_json() -> Value {
         "role": role(),
         "epoch": epoch(),
         "read_only": !writable(),
+        "lease_valid": lease_valid(),
         "promotion_ready": promotion_ready(),
         "successor": role_cell()
             .lock()
@@ -940,13 +989,96 @@ pub fn role() -> String {
 /// Client writes are accepted only on the primary. Standbys receive writes
 /// through the replication apply path, which bypasses the writer queue.
 pub fn writable() -> bool {
-    role() == "primary"
+    role_is_primary() && lease_valid()
 }
 
 /// Persists a new pull source. The active loop reloads it on the next cycle.
 pub fn set_source(
     data_root: &std::path::Path,
     source: &str,
+    databases: &[String],
+    interval_secs: u64,
+    batch: usize,
+    bootstrap: &str,
+) -> Result<Value, String> {
+    let token = fs::read(source_config_path(data_root))
+        .ok()
+        .and_then(|raw| serde_json::from_slice::<PersistedSource>(&raw).ok())
+        .and_then(|persisted| persisted.token);
+    set_source_with_token(
+        data_root,
+        source,
+        token,
+        databases,
+        interval_secs,
+        batch,
+        bootstrap,
+    )
+}
+
+/// Replaces the bearer token in an existing source configuration.
+pub fn set_source_token(data_root: &std::path::Path, token: &str) -> Result<(), String> {
+    let path = source_config_path(data_root);
+    let Ok(raw) = fs::read(&path) else {
+        return Ok(());
+    };
+    let persisted: PersistedSource =
+        serde_json::from_slice(&raw).map_err(|error| format!("parse source config: {error}"))?;
+    set_source_with_token(
+        data_root,
+        &persisted.source,
+        Some(token.to_string()),
+        &persisted.databases,
+        persisted.interval_secs,
+        persisted.batch,
+        &persisted.bootstrap,
+    )?;
+    Ok(())
+}
+
+/// Adds database names discovered in the replicated catalog to the active
+/// source configuration, preserving the existing source/token/interval.
+pub fn ensure_source_databases(
+    data_root: &std::path::Path,
+    names: &[String],
+) -> Result<(), String> {
+    let path = source_config_path(data_root);
+    let Ok(raw) = fs::read(&path) else {
+        return Ok(());
+    };
+    let mut persisted: PersistedSource =
+        serde_json::from_slice(&raw).map_err(|error| format!("parse source config: {error}"))?;
+    let mut desired = vec![DEFAULT_DATABASE.to_string()];
+    for name in names {
+        if name != DEFAULT_DATABASE && !desired.iter().any(|item| item == name) {
+            desired.push(name.clone());
+        }
+    }
+    desired.sort();
+    desired.dedup();
+    let mut current = persisted.databases.clone();
+    current.sort();
+    current.dedup();
+    if current == desired {
+        return Ok(());
+    }
+    persisted.databases = desired;
+    set_source_with_token(
+        data_root,
+        &persisted.source,
+        persisted.token,
+        &persisted.databases,
+        persisted.interval_secs,
+        persisted.batch,
+        &persisted.bootstrap,
+    )?;
+    Ok(())
+}
+
+pub fn set_source_with_token(
+    data_root: &std::path::Path,
+    source: &str,
+    token: Option<String>,
     databases: &[String],
     interval_secs: u64,
     batch: usize,
@@ -966,6 +1098,7 @@ pub fn set_source(
     }
     let persisted = PersistedSource {
         source: source.to_string(),
+        token: token.filter(|value| !value.trim().is_empty()),
         databases,
         interval_secs: interval_secs.max(1),
         batch: batch.clamp(1, 1000),
@@ -992,6 +1125,113 @@ pub fn set_source(
         "interval_secs": persisted.interval_secs,
         "batch": persisted.batch,
         "bootstrap": persisted.bootstrap,
+    }))
+}
+
+/// Redeems an 8-character pairing code on a remote primary and installs the
+/// returned source configuration locally. Used by `nonodb-cli replication join`
+/// through the local daemon, so the CLI does not need its own TLS client.
+pub async fn join_remote(
+    data_root: &std::path::Path,
+    url: &str,
+    code: &str,
+    node_id: Option<&str>,
+    advertise_url: Option<&str>,
+) -> Result<Value, String> {
+    let url = url.trim().trim_end_matches('/');
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return Err("pairing URL must start with http:// or https://".into());
+    }
+    if code.trim().is_empty() {
+        return Err("pairing code is required".into());
+    }
+    let config = Config::from_env()?;
+    let client = config.client()?;
+    let node_id = node_id
+        .map(str::to_string)
+        .or_else(|| non_empty_env("NONODB_REPLICATION_NODE_ID"))
+        .or_else(|| non_empty_env("NONODB_REPLICATION_ORIGIN"))
+        .unwrap_or_else(|| "local".to_string());
+    let advertise_url = advertise_url
+        .map(str::to_string)
+        .or_else(|| non_empty_env("NONODB_REPLICATION_ADVERTISE_URL"));
+    let body = serde_json::json!({
+        "code": code.trim(),
+        "node_id": node_id,
+        "advertise_url": advertise_url,
+    });
+    let response = client
+        .post(format!("{url}/v1/replication/pair"))
+        .header(reqwest::header::ACCEPT, "application/json")
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .timeout(Duration::from_secs(20))
+        .body(serde_json::to_vec(&body).map_err(|error| error.to_string())?)
+        .send()
+        .await
+        .map_err(|error| format!("pair request: {error}"))?;
+    let status = response.status();
+    let raw = response
+        .text()
+        .await
+        .map_err(|error| format!("read pair response: {error}"))?;
+    if !status.is_success() {
+        return Err(format!(
+            "pair request failed: HTTP {}: {raw}",
+            status.as_u16()
+        ));
+    }
+    let payload: Value =
+        serde_json::from_str(&raw).map_err(|error| format!("decode pair response: {error}"))?;
+    let result = payload
+        .get("result")
+        .ok_or("pair response is missing result")?;
+    let token = result
+        .get("token")
+        .and_then(Value::as_str)
+        .ok_or("pair response is missing token")?
+        .to_string();
+    let source = result
+        .get("source")
+        .and_then(Value::as_str)
+        .ok_or("pair response is missing source")?
+        .to_string();
+    let databases: Vec<String> = result
+        .get("databases")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .filter(|items: &Vec<String>| !items.is_empty())
+        .unwrap_or_else(default_databases);
+    let interval = result
+        .get("interval_secs")
+        .and_then(Value::as_u64)
+        .unwrap_or(1);
+    let batch = result.get("batch").and_then(Value::as_u64).unwrap_or(500) as usize;
+    let bootstrap = result
+        .get("bootstrap")
+        .and_then(Value::as_str)
+        .unwrap_or("auto");
+    let configured = set_source_with_token(
+        data_root,
+        &source,
+        Some(token),
+        &databases,
+        interval,
+        batch,
+        bootstrap,
+    )?;
+    if writable() {
+        demote(epoch(), "replica", None).map_err(|(code, message)| format!("{code}: {message}"))?;
+    }
+    Ok(serde_json::json!({
+        "ok": true,
+        "source": configured,
+        "node_id": node_id,
     }))
 }
 
@@ -1262,6 +1502,31 @@ pub fn start(
             let config = match Config::load(&data_root) {
                 Ok(Some(config)) => config,
                 Ok(None) => {
+                    if !role_is_primary() && !voter_urls().is_empty() {
+                        if let Ok(Some(source)) = discover_primary().await {
+                            if let Some(token) = voter_token() {
+                                let databases = default_databases();
+                                match set_source_with_token(
+                                    &data_root,
+                                    &source,
+                                    Some(token),
+                                    &databases,
+                                    1,
+                                    500,
+                                    "auto",
+                                ) {
+                                    Ok(_) => tracing::warn!(
+                                        source = %source,
+                                        "discovered current primary for automatic rejoin"
+                                    ),
+                                    Err(error) => tracing::warn!(
+                                        error = %error,
+                                        "automatic rejoin source install failed"
+                                    ),
+                                }
+                            }
+                        }
+                    }
                     tokio::select! {
                         _ = shutdown.changed() => break,
                         _ = tokio::time::sleep(Duration::from_secs(1)) => {}
@@ -1315,6 +1580,49 @@ pub fn start(
     Ok(())
 }
 
+async fn discover_primary() -> Result<Option<String>, String> {
+    let token = voter_token().ok_or("no voter or cluster peer token configured")?;
+    let config = Config::from_env()?;
+    let client = config.client()?;
+    let self_url = advertise_url();
+    for voter in voter_urls() {
+        let response = client
+            .get(format!("{voter}/v1/replication/primary"))
+            .bearer_auth(&token)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await;
+        let Ok(response) = response else {
+            continue;
+        };
+        if !response.status().is_success() {
+            continue;
+        }
+        let Ok(payload) = response.json::<Value>().await else {
+            continue;
+        };
+        let Some(url) = payload
+            .pointer("/result/write_url")
+            .and_then(Value::as_str)
+            .map(|url| url.trim_end_matches('/'))
+            .filter(|url| !url.is_empty())
+        else {
+            continue;
+        };
+        if self_url.as_deref() == Some(url) {
+            continue;
+        }
+        let role = payload
+            .pointer("/result/role")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if role == "primary" {
+            return Ok(Some(url.to_string()));
+        }
+    }
+    Ok(None)
+}
+
 async fn pull_database(
     client: &reqwest::Client,
     config: &Config,
@@ -1338,7 +1646,7 @@ async fn pull_database(
     };
 
     for _ in 0..100 {
-        if writable() {
+        if role_is_primary() {
             return Ok(());
         }
         let status = get_json(client, config, database, "status", &[]).await?;
@@ -1421,7 +1729,7 @@ async fn pull_database(
         let mut applied_any = false;
         let mut observed_epoch = 0u64;
         for value in batch {
-            if writable() {
+            if role_is_primary() {
                 return Ok(());
             }
             let txn: ReplicationTxn = serde_json::from_value(value.clone())
@@ -1458,6 +1766,12 @@ async fn pull_database(
         }
         if applied_any {
             runtime.cache.invalidate();
+            if let Err(error) = crate::control_plane::apply_remote().await {
+                metrics::inc(&metrics::REPLICATION_APPLY_ERRORS);
+                let message = format!("apply replicated control plane: {error}");
+                record_apply_error(&message);
+                return Err(message);
+            }
             metrics::set(&metrics::REPLICATION_LAST_SUCCESS_UNIX, unix_now());
             record_success();
             let acked = runtime

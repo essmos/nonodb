@@ -65,6 +65,9 @@ pub const PAGE_SIZE: usize = 4096;
 pub const MAX_DBS: u32 = 1024;
 /// Metadata sub-database name.
 pub const META_DB: &str = "meta";
+/// Internal cluster control-plane collection. Hidden from normal collection
+/// listings and backup exclusions; replicated like ordinary documents.
+pub const CONTROL_DB: &str = "__nonodb_control";
 const DEFAULT_SUBSCRIPTION_LEASE_SECONDS: u64 = 600;
 /// Data format version (for future migrations).
 pub const SCHEMA_VERSION: u32 = 1;
@@ -2172,7 +2175,9 @@ impl Store {
             let (key, _) = item?;
             if let Ok(k) = std::str::from_utf8(key) {
                 if let Some(name) = k.strip_prefix("collection:") {
-                    out.push(name.to_string());
+                    if name != CONTROL_DB {
+                        out.push(name.to_string());
+                    }
                 }
             }
         }

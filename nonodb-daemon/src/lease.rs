@@ -47,6 +47,9 @@ pub fn start(data_root: std::path::PathBuf, shutdown: watch::Receiver<bool>) -> 
     let Some(config) = Config::from_env() else {
         return Ok(());
     };
+    // A primary with configured voters starts read-only until it proves it has
+    // a quorum lease. This closes the startup split-brain window.
+    replicator::set_lease_valid(false);
     tokio::spawn(async move {
         let mut shutdown = shutdown;
         let mut last_ok = Instant::now();
@@ -54,7 +57,7 @@ pub fn start(data_root: std::path::PathBuf, shutdown: watch::Receiver<bool>) -> 
             if *shutdown.borrow() {
                 break;
             }
-            if replicator::writable() {
+            if replicator::role_is_primary() {
                 let epoch = replicator::epoch();
                 let majority = config.voters.len() / 2 + 1;
                 let mut granted = 0usize;
@@ -89,8 +92,10 @@ pub fn start(data_root: std::path::PathBuf, shutdown: watch::Receiver<bool>) -> 
                     }
                 }
                 if granted >= majority {
+                    replicator::set_lease_valid(true);
                     last_ok = Instant::now();
                 } else if last_ok.elapsed() >= config.ttl {
+                    replicator::set_lease_valid(false);
                     tracing::error!(
                         granted,
                         majority,
@@ -109,6 +114,7 @@ pub fn start(data_root: std::path::PathBuf, shutdown: watch::Receiver<bool>) -> 
                     last_ok = Instant::now();
                 }
             } else {
+                replicator::set_lease_valid(false);
                 last_ok = Instant::now();
             }
             tokio::select! {

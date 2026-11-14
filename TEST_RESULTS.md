@@ -298,3 +298,19 @@ most documents and approach a full collection scan.
 
 Detailed tables, caveats, and reproduction commands:
 [docs/benchmarks.md](docs/benchmarks.md).
+
+## Cluster control plane
+
+Validated on the development branch:
+
+| Check | Result |
+|---|---|
+| One-time 8-character pairing | pass; wrong and reused codes rejected |
+| Separate auth registries | pass; primary auth registry replicated to replica |
+| Client admin token after promotion | pass |
+| Backup job/state replication | pass |
+| Database catalog replication | pass (`app1` created and pulled automatically) |
+| Primary with unreachable voters | pass; read-only until quorum lease |
+| Lease-gated write rejection | pass (`403 read_only`) |
+| Multi-host failover | pass; one primary, source propagation, convergence |
+| Large-load smoke, 15k docs, 2 failovers | pass; election 21.6 s / 31.2 s, convergence 0.01 s |

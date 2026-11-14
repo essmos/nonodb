@@ -23,7 +23,10 @@ The lower-level design and log format are described in
 | Lag | `source_head - applied`; zero means caught up. |
 | Ack | A replica's report that it applied up to a sequence. The primary uses acks for safe pruning. |
 | Bootstrap | Initial snapshot copy used when a fresh replica joins or is too far behind. |
-| Promotion ready | Replica has applied the last observed source head and may be promoted automatically. |
+| Promotion ready | Replica has applied the last observed source head and control-plane snapshot and may be promoted automatically. |
+| Control plane | Replicated auth registry, backup jobs/state, database catalog, and cluster peer token. |
+| Dormant services | Backup scheduler, TTL, history pruning, subscriptions, and maintenance are loaded on replicas but only run on the primary. |
+| Pairing code | Short-lived 8-character bootstrap secret used to enroll a new replica. |
 
 Replication is **pull-based**:
 
@@ -35,7 +38,9 @@ The primary does not need to connect back to a replica.
 
 ## 2. What is replicated
 
-The ordered replication stream covers:
+The ordered replication stream covers documents and the cluster control plane.
+
+Data-plane operations:
 
 - document `insert`, `update`, and `delete`;
 - atomic batch and SQL writes;
@@ -48,17 +53,30 @@ The ordered replication stream covers:
 - conditional subscription definitions and renewals;
 - `_events` outbox documents.
 
+Control-plane operations:
+
+- the auth registry snapshot: principals, scopes, token hashes, and certificate
+  fingerprints;
+- backup job definitions and run state;
+- the database catalog (`create_database` / `drop_database`);
+- the cluster peer token.
+
 Outbox documents and index definitions are applied in the same replication
 transaction as the data that produced them. Replicas build or backfill indexes
 locally and maintain them on subsequent applies.
 
+Replicas apply the control plane immediately so every node has the same admin
+credentials, backup jobs, and catalog. Write-side services stay dormant until
+the node becomes primary.
+
 Not replicated:
 
-- vault document contents (vault collections remain local);
-- authentication registry and tokens;
-- backup job configuration;
-- `create_database` / `drop_database` (configure the same database list on
-  each node);
+- vault document payloads and vault keys (vault remains a local encrypted
+  datastore);
+- local backup artifacts — copy them to S3/R2, restic, or shared storage if the
+  new primary must read them;
+- node transport identity: bind address, data directory, socket path, and TLS
+  server key;
 - background job claims — workers must point at the primary or `write_url`.
 
 ## 3. Topologies
@@ -138,9 +156,45 @@ replicating. The role is persisted in
 `<NONODB_DATA>/replication-role.json`; after the first start, the file wins over
 `NONODB_REPLICATION_ROLE`.
 
-### 5.2 Create a replication token on the primary
+### 5.2 Preferred: pair the replica with an 8-character code
 
-Use a dedicated principal, not the root administrator token:
+The primary creates a one-time code. The replica redeems it and receives a
+cluster credential plus the full control-plane snapshot.
+
+On the primary:
+
+```bash
+nonodb-cli replication pair replica-eu default
+```
+
+This prints a code such as `K7M4-P9QX`, valid for 10 minutes. You can also use
+**GUI → Replication → Add replica**.
+
+On the new replica, with its own `NONODB_AUTH_FILE` already initialized:
+
+```bash
+export NONODB_SOCK=/run/nonodb-replica.sock
+nonodb-cli replication join https://primary.example.com:7878
+```
+
+Enter the code when prompted. The daemon:
+
+1. redeems the code on the primary;
+2. stores the returned source and token in `replication-source.json` (0600);
+3. becomes a read-only replica;
+4. applies the primary auth registry, backup configuration, and database
+   catalog through the control plane;
+5. starts pulling data.
+
+The old local replica admin token is replaced by the replicated cluster auth
+registry. Use the primary's cluster admin token from then on.
+
+The code is single-use, expires after 10 minutes, and is rate-limited. It is an
+8-character code from an unambiguous 32-character alphabet, not 8 digits.
+
+### 5.3 Manual token alternative
+
+You can still provision a token manually:
 
 ```bash
 export NONODB_AUTH_FILE=/etc/nonodb/auth.json
@@ -152,7 +206,7 @@ nonodb-cli auth token create replication
 Store the printed token in a secret manager or a `0600` environment file. It is
 used by replicas as `NONODB_REPLICATION_SOURCE_TOKEN`.
 
-### 5.3 Open the network path
+### 5.4 Open the network path
 
 Allow the replica IP to reach port `7878` on the primary. Prefer one of:
 
@@ -162,7 +216,7 @@ Allow the replica IP to reach port `7878` on the primary. Prefer one of:
 
 Do not expose plaintext replication to the public internet.
 
-### 5.4 Replica environment
+### 5.5 Replica environment
 
 Use a **new, empty data directory**:
 
@@ -191,6 +245,9 @@ NONODB_REPLICATION_ADVERTISE_URL=https://replica.example.com:7878
 can make a `/v1/replication/changes` response very large when a single write
 transaction contains many documents.
 
+If you use pairing, `SOURCE` and `SOURCE_TOKEN` are written by
+`replication join`; you do not need to put them in the environment.
+
 Create a local auth file for the replica's own CLI/GUI:
 
 ```bash
@@ -201,7 +258,7 @@ nonodb-cli auth init
 Do not copy the primary's auth registry unless you intentionally want the same
 tokens on both nodes.
 
-### 5.5 Start and verify
+### 5.6 Start and verify
 
 Start the primary first, then the replica.
 
@@ -250,7 +307,7 @@ Writes are rejected:
 The first start downloads a full snapshot when the local database is fresh.
 Large databases can take a long time and require temporary disk space.
 
-### 5.6 Reversed direction
+### 5.7 Reversed direction
 
 If the server on the other side must be primary, swap the roles:
 
@@ -322,6 +379,10 @@ nonodb-cli replication demote <epoch> replica [successor-url]
 | `acks` | Replica acknowledgement sequences and ages. |
 | `source <url> [dbs] [interval]` | Change the pull source without restarting. |
 | `prune <seq> [--require-acks]` | Remove old log records, optionally refusing to pass the minimum ack. |
+| `pair <name> [dbs]` | Create a one-time 8-character pairing code on the primary. |
+| `pairings` | List pending pairing codes. |
+| `revoke <code>` | Revoke a pending pairing code. |
+| `join <primary-url>` | Redeem a code on the replica and install the source/control plane. |
 | `promote <epoch>` | Manual promotion. Requires the expected epoch. |
 | `demote <epoch> replica [successor]` | Manual demotion, optionally advertising a successor. |
 
@@ -359,6 +420,7 @@ TLS paths, or retention. Those are startup environment settings.
 | `NONODB_REPLICATION_CA_FILE` | unset | CA bundle for source TLS. |
 | `NONODB_REPLICATION_CERT_FILE` | unset | Client certificate for source mTLS. |
 | `NONODB_REPLICATION_KEY_FILE` | unset | Client private key. |
+| `NONODB_CLUSTER_PRUNE_DATABASES` | `1` | Drop local non-default databases that disappear from the replicated catalog. Set `0` to keep them. |
 
 ## 8. Quorum and failover
 
@@ -374,10 +436,15 @@ NONODB_REPLICATION_VOTER_TOKEN=__SHARED_ADMIN_TOKEN__
 Set the same voter list on every voter. Set `NONODB_REPLICATION_ADVERTISE_URL`
 on every node.
 
-### 8.2 Lease
+### 8.2 Lease-gated writes
 
-The primary renews a quorum lease. If it loses the voter majority for
-`NONODB_REPLICATION_LEASE_TTL`, it self-demotes and becomes read-only.
+The primary renews a quorum lease. Client writes are accepted only when the
+node is both `primary` and holds a valid lease. A primary with configured voters
+starts read-only; it does not accept writes until it reaches a voter majority.
+
+If it loses the voter majority for `NONODB_REPLICATION_LEASE_TTL`, it
+self-demotes and becomes read-only. Automatic candidates also wait out the lease
+TTL before campaigning, so a fast election cannot create two writers.
 
 ```env
 NONODB_REPLICATION_LEASE_INTERVAL=5
@@ -400,8 +467,9 @@ Lower priority campaigns first. A higher priority waits longer, so the preferred
 candidate normally wins.
 
 Automatic election requires `promotion_ready=true`: the candidate must have
-applied the last observed source head. A lagging candidate waits instead of
-promoting stale data.
+applied the last observed source head **and** the replicated control-plane
+snapshot. A lagging candidate waits instead of promoting stale data or missing
+auth/backup configuration.
 
 ### 8.4 Write routing
 
@@ -470,7 +538,20 @@ remote probes; it falls back to `NONODB_TOKEN`.
 Cluster probes currently require `http://` URLs. Put HTTPS nodes behind a local
 TLS-terminating proxy, or access them over a private network.
 
-### 9.2 Replication page
+### 9.2 Add replica
+
+The **Replication** page on a primary contains an **Add replica** panel:
+
+1. enter the replica name and initial databases;
+2. choose **Create pairing code**;
+3. copy the 8-character code and run the shown `replication join` command on the
+   new node;
+4. the pending list shows unused codes and lets you revoke them.
+
+The replica receives the auth registry and backup configuration automatically.
+The control plane is dormant until the node is promoted.
+
+### 9.3 Replication page
 
 ![Replication tab](assets/gui/replication.png)
 
@@ -488,7 +569,7 @@ Use this page to inspect the node you are connected to:
 The page includes an inline glossary and a description under every field.
 On a primary, transport source fields are marked as not used while primary.
 
-### 9.3 Cluster page
+### 9.4 Cluster page
 
 ![Cluster tab](assets/gui/cluster.png)
 
@@ -508,7 +589,7 @@ The Cluster tab probes every configured node in parallel and shows:
 
 The view refreshes automatically. Unreachable nodes are shown as `offline`.
 
-### 9.4 Live load test panel
+### 9.5 Live load test panel
 
 When a benchmark is running and the GUI is started with
 `--progress-file <path>` or `NONODB_GUI_TEST_PROGRESS`, the Cluster tab also
@@ -588,19 +669,25 @@ Keep both. Take regular snapshots even when a replica is healthy.
 
 ## 13. Known limitations
 
-- Vault document data is not replicated.
-- Auth registry, backup jobs, and node-local configuration are not replicated.
-- Database create/drop is not part of the cluster catalog; configure the same
-  `NONODB_REPLICATION_DATABASES` list on each node.
+- Vault document payloads and keys are not part of replication. Vault remains a
+  local encrypted datastore.
+- Auth, backup jobs, and the database catalog are replicated; TLS transport
+  identity, data/socket paths, log level, worker counts, and other node-local
+  settings are not.
+- Backup job definitions and run state are replicated, but backup artifacts are
+  not. Use S3/R2, restic, or shared storage if a new primary must read them.
 - Background workers must target the primary/`write_url`; job claims are writes.
 - History pruning is paused while a node is read-only. It resumes after
-  promotion.
+  promotion. The backup scheduler is also primary-only.
 - Subscription lease expiry can shift slightly when recreated on a replica.
 - Mixed-version rolling upgrades: old replicas ignore the new metadata operation
   field. Upgrade all nodes before relying on metadata replication.
 - Cluster GUI probes currently use HTTP URLs; use a local TLS proxy for HTTPS.
 - Failover is asynchronous. A small RPO window exists unless writes are stopped
   before promotion.
+- The cluster peer token is stored in the control plane so every node can follow
+  a new primary. It is written to `cluster-peer-token` with mode `0600`; protect
+  the data directory accordingly.
 
 ## 14. Validation scripts
 
@@ -613,6 +700,8 @@ python3 scripts/replication_lease_test.py
 python3 scripts/replication_election_test.py
 python3 scripts/replication_cluster_test.py
 python3 scripts/replication_metadata_test.py
+python3 scripts/replication_control_plane_test.py
+python3 scripts/replication_lease_gate_test.py
 python3 scripts/replication_load_test.py --docs 200000 --keep
 python3 scripts/tls_reload_test.py
 python3 scripts/gui_cluster_test.py
@@ -626,8 +715,13 @@ enforces memory limits.
 
 - Use TLS/mTLS between nodes.
 - Never expose the replication API directly to the public internet.
-- Use a dedicated `admin:db` token for replication, not the root token.
-- Store tokens in a secret manager or a `0600` environment file.
+- Pairing issues a per-replica `admin:db` credential. This cluster model is
+  deliberately cluster-wide administration: every full member can become
+  primary and can read the replicated data.
+- The cluster peer token is replicated in the control plane and stored as
+  `cluster-peer-token` with mode `0600`. Protect every node's data directory as
+  an administrator-equivalent secret.
+- Store manual tokens in a secret manager or a `0600` environment file.
 - Restrict source access by firewall or private network.
 - Rotate certificates and tokens.
 - Keep NTP enabled.

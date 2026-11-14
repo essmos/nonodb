@@ -9,6 +9,13 @@ pub fn authorize_request(
     req: &Request,
     database: &str,
 ) -> Result<(), ApiError> {
+    if req
+        .collections()
+        .iter()
+        .any(|coll| coll == nonodb_core::CONTROL_DB)
+    {
+        return Err(ApiError::forbidden());
+    }
     match req {
         Request::Insert { coll, .. }
         | Request::InsertMany { coll, .. }

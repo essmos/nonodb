@@ -150,6 +150,26 @@ def main() -> int:
             raise RuntimeError(
                 f"replicas did not attach to the primary: {candidate_status} {voter_status}"
             )
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            primary_status = clients["primary"].get(
+                "/v1/replication/status", headers=headers
+            ).json()["result"]
+            if primary_status.get("lease_valid"):
+                break
+            time.sleep(0.2)
+        else:
+            raise RuntimeError(f"primary did not acquire lease: {primary_status}")
+        # Let replicas apply the control-plane document and first data
+        # transaction before the source disappears.
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            state = clients["candidate"].get(
+                "/v1/replication/status", headers=headers
+            ).json()["result"]
+            if state.get("head", 0) > 0 and state.get("replication", {}).get("last_success_unix"):
+                break
+            time.sleep(0.2)
         time.sleep(1)
 
         procs["primary"].terminate()
@@ -157,7 +177,7 @@ def main() -> int:
         clients["primary"].close()
 
         candidate = clients["candidate"]
-        deadline = time.monotonic() + 20
+        deadline = time.monotonic() + 40
         while time.monotonic() < deadline:
             status = candidate.get("/v1/replication/status", headers=headers).json()["result"]
             if status["role"] == "primary":

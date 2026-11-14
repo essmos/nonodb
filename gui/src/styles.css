@@ -1852,3 +1852,19 @@ select {
   background: linear-gradient(90deg, #1f6feb, #58a6ff);
   transition: width 0.3s ease;
 }
+
+.pairing-box {
+  margin-top: 14px;
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel-2);
+}
+.pairing-code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 32px;
+  letter-spacing: 0.18em;
+  font-weight: 700;
+  color: var(--accent);
+  margin-bottom: 8px;
+}

@@ -415,13 +415,73 @@ impl BackupManager {
         let manager = self.clone();
         tokio::spawn(async move {
             loop {
-                let due = manager.due_jobs();
-                for id in due {
-                    manager.execute(&id).await;
+                // Cluster control-plane replication gives every node the same
+                // backup jobs, but only the current primary may execute them.
+                if crate::replicator::writable() {
+                    let due = manager.due_jobs();
+                    for id in due {
+                        manager.execute(&id).await;
+                    }
                 }
                 tokio::time::sleep(Duration::from_secs(interval)).await;
             }
         });
+    }
+
+    /// Cluster control-plane snapshot. It contains job definitions and run
+    /// state, not backup artifacts or secret values (S3 keys are env names).
+    pub fn control_snapshot(&self) -> Value {
+        let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        json!({
+            "config": inner.config,
+            "state": inner.state,
+        })
+    }
+
+    /// Replaces local backup configuration/state from a replicated control
+    /// snapshot. Running jobs are marked interrupted because the execution
+    /// thread belongs to the previous owner.
+    pub fn apply_control_snapshot(&self, value: &Value) -> Result<(), String> {
+        let config_value = value
+            .get("config")
+            .ok_or("control backup snapshot is missing `config`")?;
+        let state_value = value
+            .get("state")
+            .ok_or("control backup snapshot is missing `state`")?;
+        let mut config: BackupConfig = serde_json::from_value(config_value.clone())
+            .map_err(|error| format!("parse replicated backup config: {error}"))?;
+        if config.version != CONFIG_VERSION {
+            return Err(format!(
+                "unsupported replicated backup config version {} (expected {})",
+                config.version, CONFIG_VERSION
+            ));
+        }
+        validate_config(&config)?;
+        // Keep deterministic ordering for stable snapshots.
+        config.jobs.sort_by(|a, b| a.id.cmp(&b.id));
+        let mut state: StateFile = serde_json::from_value(state_value.clone())
+            .map_err(|error| format!("parse replicated backup state: {error}"))?;
+        for job_state in state.jobs.values_mut() {
+            if job_state.running {
+                job_state.running = false;
+                job_state.last_status = "interrupted".into();
+                job_state.last_error = Some("control plane ownership changed".into());
+            }
+        }
+        {
+            let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            let same = serde_json::to_value(&inner.config).ok()
+                == serde_json::to_value(&config).ok()
+                && serde_json::to_value(&inner.state).ok() == serde_json::to_value(&state).ok();
+            if same {
+                return Ok(());
+            }
+            atomic_json(&self.config_path, &config)?;
+            atomic_json(&self.state_path, &state)?;
+            inner.config = config;
+            inner.state = state;
+        }
+        Ok(())
     }
 
     fn due_jobs(&self) -> Vec<String> {

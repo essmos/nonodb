@@ -11,6 +11,7 @@ struct Config {
     interval: Duration,
     timeout: Duration,
     priority: Duration,
+    lease_safety: Duration,
 }
 
 impl Config {
@@ -41,10 +42,18 @@ impl Config {
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(0);
+        // Never promote while the old primary's quorum lease may still be
+        // valid. Without this delay a fast election can create two writers.
+        let lease_safety = std::env::var("NONODB_REPLICATION_LEASE_TTL")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(15);
         Some(Self {
             interval: Duration::from_secs(interval),
             timeout: Duration::from_secs(timeout),
             priority: Duration::from_secs(priority),
+            lease_safety: Duration::from_secs(lease_safety),
         })
     }
 }
@@ -63,7 +72,7 @@ pub fn start(data_root: std::path::PathBuf, shutdown: watch::Receiver<bool>) -> 
             if *shutdown.borrow() {
                 break;
             }
-            if replicator::writable() {
+            if replicator::role_is_primary() {
                 failed_since = None;
             } else {
                 match replicator::source_health(&data_root).await {
@@ -75,7 +84,8 @@ pub fn start(data_root: std::path::PathBuf, shutdown: watch::Receiver<bool>) -> 
                     }
                     Ok(_) | Err(_) => {
                         let since = *failed_since.get_or_insert_with(Instant::now);
-                        if since.elapsed() >= config.timeout + config.priority {
+                        if since.elapsed() >= config.timeout + config.priority + config.lease_safety
+                        {
                             if !replicator::promotion_ready() {
                                 tracing::warn!(
                                     "candidate is not caught up with the last observed source head; refusing automatic promotion"
