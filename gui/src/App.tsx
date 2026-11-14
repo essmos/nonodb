@@ -1595,6 +1595,7 @@ function ReplicationPage({ connection }: { connection: Connection }) {
               <div key={source.origin} className="index-row">
                 <div>
                   <strong className="mono">{source.origin}</strong>
+                  <span className="badge">epoch {source.epoch ?? 0}</span>
                   <span className={`badge ${source.lag > 0 ? 'danger-badge' : ''}`}>
                     lag {source.lag}
                   </span>

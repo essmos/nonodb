@@ -241,9 +241,12 @@ fn run_batch(store: &Store, cache: &QueryCache, jobs: Vec<WriteJob>) {
     replication.changes.extend(take_sql_replication_changes());
     if let Some(origin) = &replication.origin {
         if !replication.changes.is_empty() {
-            if let Err(error) =
-                store.append_replication_txn_in(&mut wtxn, origin, replication.changes)
-            {
+            if let Err(error) = store.append_replication_txn_with_epoch_in(
+                &mut wtxn,
+                origin,
+                crate::replicator::epoch(),
+                replication.changes,
+            ) {
                 drop(wtxn);
                 live::discard_pending();
                 let err = ApiError::from(error);
@@ -310,9 +313,12 @@ fn run_single(store: &Store, cache: &QueryCache, job: WriteJob) {
             replication.changes.extend(take_sql_replication_changes());
             if let Some(origin) = &replication.origin {
                 if !replication.changes.is_empty() {
-                    if let Err(error) =
-                        store.append_replication_txn_in(&mut wtxn, origin, replication.changes)
-                    {
+                    if let Err(error) = store.append_replication_txn_with_epoch_in(
+                        &mut wtxn,
+                        origin,
+                        crate::replicator::epoch(),
+                        replication.changes,
+                    ) {
                         drop(wtxn);
                         live::discard_pending();
                         let _ = job.resp.send(Err(ApiError::from(error)));

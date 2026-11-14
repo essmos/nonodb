@@ -36,15 +36,28 @@ pub struct ReplicationTxn {
     pub seq: u64,
     /// Stable node identity that produced the transaction.
     pub origin: String,
+    /// Role epoch active on the writer when this transaction was produced.
+    #[serde(default)]
+    pub epoch: u64,
     pub created_at_ms: u64,
     pub changes: Vec<ReplicationChange>,
 }
 
 impl ReplicationTxn {
     pub fn new(seq: u64, origin: impl Into<String>, changes: Vec<ReplicationChange>) -> Self {
+        Self::new_with_epoch(seq, origin, 0, changes)
+    }
+
+    pub fn new_with_epoch(
+        seq: u64,
+        origin: impl Into<String>,
+        epoch: u64,
+        changes: Vec<ReplicationChange>,
+    ) -> Self {
         Self {
             seq,
             origin: origin.into(),
+            epoch,
             created_at_ms: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|duration| duration.as_millis() as u64)
@@ -117,6 +130,27 @@ mod tests {
 
         assert_eq!(store.prune_replication_through(1).unwrap(), 1);
         assert_eq!(store.replication_after(0, 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn apply_rejects_stale_epoch() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let change = |id: &str| ReplicationChange {
+            collection: "orders".into(),
+            op: "insert".into(),
+            id: id.into(),
+            before: None,
+            after: Some(serde_json::json!({"_id": id})),
+        };
+        let first = ReplicationTxn::new_with_epoch(1, "node-a", 2, vec![change("o1")]);
+        assert!(store.apply_replication_txn(&first).unwrap());
+        assert_eq!(store.replication_applied_epoch("node-a").unwrap(), 2);
+
+        let stale = ReplicationTxn::new_with_epoch(2, "node-a", 1, vec![change("o2")]);
+        let error = store.apply_replication_txn(&stale).unwrap_err().to_string();
+        assert!(error.contains("stale replication epoch"), "{error}");
+        assert_eq!(store.replication_applied("node-a").unwrap(), 1);
     }
 
     #[test]

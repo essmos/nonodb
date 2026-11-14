@@ -1023,7 +1023,11 @@ async fn prometheus_handler(
             if let Ok(origins) = runtime.store.replication_applied_origins() {
                 for (origin, seq) in origins {
                     let source_head = runtime.store.replication_source_head(&origin).unwrap_or(0);
-                    applied.push((name.clone(), origin, seq, source_head));
+                    let epoch = runtime
+                        .store
+                        .replication_applied_epoch(&origin)
+                        .unwrap_or(0);
+                    applied.push((name.clone(), origin, seq, source_head, epoch));
                 }
             }
         }

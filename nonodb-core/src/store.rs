@@ -1481,6 +1481,23 @@ impl Store {
         Ok(applied)
     }
 
+    /// Returns the highest source role epoch applied for `origin`.
+    pub fn replication_applied_epoch(&self, origin: &str) -> Result<u64> {
+        let rtxn = self.read_txn()?;
+        let meta: Database<Bytes, Bytes> = self
+            .env
+            .open_database(&rtxn, Some(META_DB))?
+            .ok_or_else(|| Error::Query("meta database missing".into()))?;
+        let key = format!("replication:epoch:{origin}");
+        let epoch = meta
+            .get(&rtxn, key.as_bytes())?
+            .and_then(|raw| std::str::from_utf8(raw).ok())
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .unwrap_or(0);
+        rtxn.commit()?;
+        Ok(epoch)
+    }
+
     /// Returns all `(origin, applied sequence)` pairs recorded on this node.
     pub fn replication_applied_origins(&self) -> Result<Vec<(String, u64)>> {
         const PREFIX: &[u8] = b"replication:applied:";
@@ -1544,6 +1561,7 @@ impl Store {
         origin: &str,
         applied: u64,
         source_head: u64,
+        epoch: u64,
     ) -> Result<()> {
         if origin.trim().is_empty() {
             return Err(Error::Query("replication origin is empty".into()));
@@ -1552,6 +1570,7 @@ impl Store {
         let meta: Database<Bytes, Bytes> = self.env.create_database(&mut wtxn, Some(META_DB))?;
         let applied_key = format!("replication:applied:{origin}");
         let head_key = format!("replication:source_head:{origin}");
+        let epoch_key = format!("replication:epoch:{origin}");
         meta.put(
             &mut wtxn,
             applied_key.as_bytes(),
@@ -1561,6 +1580,11 @@ impl Store {
             &mut wtxn,
             head_key.as_bytes(),
             source_head.to_string().as_bytes(),
+        )?;
+        meta.put(
+            &mut wtxn,
+            epoch_key.as_bytes(),
+            epoch.to_string().as_bytes(),
         )?;
         wtxn.commit()?;
         Ok(())
@@ -1590,9 +1614,21 @@ impl Store {
             .and_then(|raw| std::str::from_utf8(raw).ok())
             .and_then(|raw| raw.parse::<u64>().ok())
             .unwrap_or(0);
+        let epoch_key = format!("replication:epoch:{}", txn.origin);
+        let applied_epoch = meta
+            .get(&wtxn, epoch_key.as_bytes())?
+            .and_then(|raw| std::str::from_utf8(raw).ok())
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .unwrap_or(0);
         if txn.seq <= applied {
             wtxn.commit()?;
             return Ok(false);
+        }
+        if txn.epoch < applied_epoch {
+            return Err(Error::Query(format!(
+                "stale replication epoch for {}: applied {}, got {}",
+                txn.origin, applied_epoch, txn.epoch
+            )));
         }
         if txn.seq != applied + 1 {
             return Err(Error::Query(format!(
@@ -1612,6 +1648,11 @@ impl Store {
             )?;
         }
         meta.put(&mut wtxn, key.as_bytes(), txn.seq.to_string().as_bytes())?;
+        meta.put(
+            &mut wtxn,
+            epoch_key.as_bytes(),
+            txn.epoch.to_string().as_bytes(),
+        )?;
         wtxn.commit()?;
         Ok(true)
     }
@@ -1624,6 +1665,17 @@ impl Store {
         &self,
         wtxn: &mut RwTxn<'_>,
         origin: &str,
+        changes: Vec<ReplicationChange>,
+    ) -> Result<ReplicationTxn> {
+        self.append_replication_txn_with_epoch_in(wtxn, origin, 0, changes)
+    }
+
+    /// Appends a transaction with the writer's active role epoch.
+    pub fn append_replication_txn_with_epoch_in(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        origin: &str,
+        epoch: u64,
         changes: Vec<ReplicationChange>,
     ) -> Result<ReplicationTxn> {
         if changes.is_empty() {
@@ -1640,7 +1692,7 @@ impl Store {
         let seq = previous
             .checked_add(1)
             .ok_or_else(|| Error::Query("replication sequence overflow".into()))?;
-        let txn = ReplicationTxn::new(seq, origin, changes);
+        let txn = ReplicationTxn::new_with_epoch(seq, origin, epoch, changes);
         let encoded = serde_json::to_vec(&txn)?;
         let db: Database<Bytes, Bytes> =
             self.env.create_database(&mut *wtxn, Some(REPLICATION_DB))?;

@@ -555,7 +555,7 @@ pub fn append_replication_metrics(
     role: &str,
     epoch: u64,
     heads: &[(String, u64)],
-    applied: &[(String, String, u64, u64)],
+    applied: &[(String, String, u64, u64, u64)],
 ) {
     prom_header(
         out,
@@ -617,7 +617,7 @@ pub fn append_replication_metrics(
         "gauge",
         "Highest source sequence applied on this replica.",
     );
-    for (database, origin, seq, _) in applied {
+    for (database, origin, seq, _, _) in applied {
         prom_sample(
             out,
             "nonodb_replication_applied",
@@ -627,11 +627,25 @@ pub fn append_replication_metrics(
     }
     prom_header(
         out,
+        "nonodb_replication_applied_epoch",
+        "gauge",
+        "Highest source role epoch applied on this replica.",
+    );
+    for (database, origin, _, _, epoch) in applied {
+        prom_sample(
+            out,
+            "nonodb_replication_applied_epoch",
+            &[("database", database), ("origin", origin)],
+            &json!(epoch),
+        );
+    }
+    prom_header(
+        out,
         "nonodb_replication_lag",
         "gauge",
         "Source log head minus the applied sequence.",
     );
-    for (database, origin, seq, source_head) in applied {
+    for (database, origin, seq, source_head, _) in applied {
         prom_sample(
             out,
             "nonodb_replication_lag",

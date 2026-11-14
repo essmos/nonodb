@@ -77,11 +77,13 @@ pub async fn status(
                 .into_iter()
                 .map(|(origin, seq)| {
                     let source_head = store.replication_source_head(&origin).unwrap_or(0);
+                    let epoch = store.replication_applied_epoch(&origin).unwrap_or(0);
                     serde_json::json!({
                         "origin": origin,
                         "applied": seq,
                         "source_head": source_head,
                         "lag": source_head.saturating_sub(seq),
+                        "epoch": epoch,
                     })
                 })
                 .collect::<Vec<_>>();

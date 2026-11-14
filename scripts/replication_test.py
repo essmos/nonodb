@@ -121,6 +121,7 @@ def main() -> int:
             )
             assert initial_changes.status_code == 200, initial_changes.text
             initial_txns = initial_changes.json()["result"]["changes"]
+            assert all(txn["epoch"] == 0 for txn in initial_txns), initial_txns
             initial_ops = [
                 change["op"] for txn in initial_txns for change in txn["changes"]
             ]
@@ -269,6 +270,32 @@ def main() -> int:
                 else:
                     raise RuntimeError("replica did not apply the live change")
 
+                source_demote = client.post(
+                    "/v1/replication/demote",
+                    headers=headers,
+                    json={"expected_epoch": 0, "role": "replica"},
+                )
+                assert source_demote.status_code == 200, source_demote.text
+                assert source_demote.json()["result"]["role"]["epoch"] == 1
+                source_promote = client.post(
+                    "/v1/replication/promote",
+                    headers=headers,
+                    json={"expected_epoch": 1},
+                )
+                assert source_promote.status_code == 200, source_promote.text
+                assert source_promote.json()["result"]["role"]["epoch"] == 2
+                exec({"op": "insert", "coll": "orders", "doc": {"_id": "o6", "n": 6}})
+                deadline = time.monotonic() + 20
+                while time.monotonic() < deadline:
+                    doc = replica_exec(
+                        {"op": "find_one", "coll": "orders", "filter": {"_id": "o6"}}
+                    )
+                    if doc and doc.get("n") == 6:
+                        break
+                    time.sleep(0.1)
+                else:
+                    raise RuntimeError("replica did not apply a new-epoch change")
+
                 blocked = replica.post(
                     "/v1/exec",
                     headers=headers,
@@ -321,6 +348,7 @@ def main() -> int:
                 assert replica_status["applied"], replica_status
                 assert replica_status["applied"][0]["origin"] == "test-node", replica_status
                 assert replica_status["applied"][0]["lag"] == 0, replica_status
+                assert replica_status["applied"][0]["epoch"] == 2, replica_status
                 assert replica_status["replication"]["source"].startswith(
                     "http://127.0.0.1:"
                 ), replica_status
@@ -335,6 +363,7 @@ def main() -> int:
                 ).text
                 assert 'nonodb_replication_applied{database="default",origin="test-node"}' in replica_metrics, replica_metrics[-1000:]
                 assert 'nonodb_replication_lag{database="default",origin="test-node"} 0' in replica_metrics, replica_metrics[-1000:]
+                assert 'nonodb_replication_applied_epoch{database="default",origin="test-node"} 2' in replica_metrics, replica_metrics[-1000:]
                 assert "nonodb_replication_epoch 2" in replica_metrics, replica_metrics[-1000:]
                 applied_total = re.search(
                     r"nonodb_replication_applied_total (\d+)", replica_metrics

@@ -269,9 +269,16 @@ stops the replica pull loop and enables the writer. Demotion makes the node
 read-only again.
 
 This is **manual** promotion, not quorum failover. The old primary must be
-demoted or stopped to avoid split-brain, and the epoch is not yet carried in
-transaction records for cross-node rejection. Lease-based promotion and
-enforced fencing remain future work.
+demoted or stopped to avoid split-brain.
+
+Replication transactions carry the writer's role epoch. A replica records the
+highest applied epoch per origin and rejects any transaction from an older
+epoch with `stale replication epoch`. Promoting a source therefore fences
+replicas against transactions produced before the promotion, as long as they
+pull from the demoted node under the same origin.
+
+Lease-based automatic promotion and a fully quorum-enforced fence remain future
+work.
 
 ## Implementation phases
 

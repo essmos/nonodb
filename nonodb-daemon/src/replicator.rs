@@ -405,10 +405,12 @@ pub async fn bootstrap_startup(data_root: &std::path::Path) -> Result<(), String
             .filter(|value| !value.is_empty())
             .unwrap_or_default()
             .to_string();
+        let source_epoch = status.get("epoch").and_then(Value::as_u64).unwrap_or(0);
         if origin.is_empty() {
             continue;
         }
-        match bootstrap_database(&client, &config, data_root, database, &origin).await {
+        match bootstrap_database(&client, &config, data_root, database, &origin, source_epoch).await
+        {
             Ok(head) => {
                 record_success();
                 tracing::info!(database, origin, head, "replication snapshot installed");
@@ -455,6 +457,7 @@ async fn bootstrap_database(
     data_root: &std::path::Path,
     database: &str,
     origin: &str,
+    source_epoch: u64,
 ) -> Result<u64, String> {
     let temp = std::env::temp_dir().join(format!(
         "nonodb-replication-bootstrap-{}-{}-{}",
@@ -525,7 +528,15 @@ async fn bootstrap_database(
         if snapshot_head == 0 {
             return Err("source snapshot has no replication head".into());
         }
-        install_bootstrap_snapshot(data_root, database, origin, snapshot_head, &data_file).await?;
+        install_bootstrap_snapshot(
+            data_root,
+            database,
+            origin,
+            snapshot_head,
+            source_epoch,
+            &data_file,
+        )
+        .await?;
         Ok(snapshot_head)
     }
     .await;
@@ -538,6 +549,7 @@ async fn install_bootstrap_snapshot(
     database: &str,
     origin: &str,
     head: u64,
+    epoch: u64,
     source: &std::path::Path,
 ) -> Result<(), String> {
     let target = data_root.join(database);
@@ -561,7 +573,7 @@ async fn install_bootstrap_snapshot(
     let result = tokio::task::spawn_blocking(move || -> Result<(), String> {
         let store = Store::open(&target_for_open).map_err(|error| error.to_string())?;
         store
-            .set_replication_state(&origin, head, head)
+            .set_replication_state(&origin, head, head, epoch)
             .map_err(|error| error.to_string())?;
         let env = store.env().clone();
         drop(store);

@@ -583,6 +583,7 @@ export type ReplicationStatus = {
     applied: number;
     source_head: number;
     lag: number;
+    epoch?: number;
   }>;
 };
 
