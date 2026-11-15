@@ -7,6 +7,54 @@ the GUI Cluster view, monitoring, and the common failure modes.
 The lower-level design and log format are described in
 [Replication design](replication.md).
 
+## Quick start: one primary code, one Docker replica
+
+On the primary, generate a one-time pairing code with the CLI:
+
+```bash
+nonodb-cli replication add-replica replica-docker default
+# Pairing code: K7M4P9QX
+# On the replica, run:
+#   nonodb-cli replication join http://10.0.0.10:7878 K7M4P9QX
+```
+
+On the client, prepare a Docker replica and redeem the code through its local
+daemon:
+
+```bash
+docker volume create nonodb-replica-data
+docker volume create nonodb-replica-run
+
+docker run --rm \
+  -v nonodb-replica-data:/var/lib/nonodb \
+  -e NONODB_AUTH_FILE=/var/lib/nonodb/auth.json \
+  ghcr.io/essmos/nonodb:0.25.0-rc.3 \
+  nonodb-cli auth init
+
+docker run -d --name nonodb-replica \
+  -p 7912:7878 \
+  -v nonodb-replica-data:/var/lib/nonodb \
+  -v nonodb-replica-run:/run/nonodb \
+  -e NONODB_AUTH_FILE=/var/lib/nonodb/auth.json \
+  -e NONODB_TCP=0.0.0.0:7878 \
+  -e NONODB_REPLICATION_ROLE=replica \
+  -e NONODB_REPLICATION_NODE_ID=replica-docker \
+  -e NONODB_REPLICATION_ADVERTISE_URL=http://10.0.0.3:7912 \
+  ghcr.io/essmos/nonodb:0.25.0-rc.3
+
+docker exec nonodb-replica nonodb-cli replication join \
+  http://10.0.0.10:7878 K7M4P9QX
+
+docker exec nonodb-replica nonodb-cli replication status
+```
+
+The replica environment does **not** need `NONODB_REPLICATION_SOURCE` or
+`NONODB_REPLICATION_SOURCE_TOKEN`; `join` installs them from the primary. Set
+`NONODB_REPLICATION_ADVERTISE_URL` explicitly behind Docker, NAT, a reverse
+proxy, or TLS termination. The detailed pairing flow is in
+[section 5.2](#52-preferred-create-the-replica-with-a-pairing-code), and Docker
+is covered in [section 5.8](#58-docker-replica).
+
 ## 1. Concepts
 
 | Term | Meaning |
