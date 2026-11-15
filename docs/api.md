@@ -2183,6 +2183,13 @@ Public, no authentication.
 {"ok": true}
 ```
 
+### DELETE /v1/replication/acks/{node}
+
+Removes the stored acknowledgement for one replica from the selected database
+(default database when unscoped). This only removes the row; it does not stop a
+running replica. A live replica reappears after its next ACK. Use this to clear
+a stale row after the replica was paused or disconnected.
+
 ### POST /v1/replication/pause / resume / disconnect
 
 Admin-only replica controls:

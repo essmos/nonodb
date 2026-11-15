@@ -574,6 +574,15 @@ nonodb-cli replication resume
 nonodb-cli replication disconnect
 ```
 
+Remove a stale acknowledgement from the primary after a replica is disconnected (GUI: **Remove replica**):
+
+```bash
+nonodb-cli replication forget replica-prod
+```
+
+This deletes the ACK row only. A replica that is still running will reappear after
+its next ACK; use `pause` or `disconnect` on that replica first.
+
 `pause` keeps the source and token; `resume` continues from the stored source.
 `disconnect` removes both and leaves the node read-only. Promote it separately
 with `replication promote <epoch>` if it should become standalone.

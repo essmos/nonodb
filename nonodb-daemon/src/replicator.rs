@@ -60,6 +60,17 @@ pub fn record_replica_url(node: &str, url: &str) -> Result<(), String> {
     crate::node_state::put_json("replication:replica_urls", &urls)
 }
 
+pub fn forget_replica_url(node: &str) -> Result<(), String> {
+    let mut urls = crate::node_state::get_json::<std::collections::HashMap<String, String>>(
+        "replication:replica_urls",
+    )?
+    .unwrap_or_default();
+    if urls.remove(node).is_some() {
+        crate::node_state::put_json("replication:replica_urls", &urls)?;
+    }
+    Ok(())
+}
+
 pub fn replica_url(node: &str) -> Option<String> {
     crate::node_state::get_json::<std::collections::HashMap<String, String>>(
         "replication:replica_urls",

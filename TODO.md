@@ -105,6 +105,8 @@ limitations are documented in [docs/roadmap.md](docs/roadmap.md).
 - [x] Add a cluster peer token and source discovery for rejoin.
 - [x] Add stable seed rediscovery when the stored source is unreachable.
 - [x] Add replica pause/resume/disconnect controls in the GUI, CLI, and API.
+- [x] Remove stale replica acknowledgements from the GUI, CLI, and API.
+- [x] Keep pairing codes visible until used, expired, or explicitly revoked.
 - [x] Store role, source, vote, lease, peer token, and pairings in the hidden
       `.node` LMDB system collection instead of loose JSON files.
 - [x] Add one-time 8-character replica pairing in CLI and GUI.

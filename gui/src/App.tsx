@@ -26,6 +26,7 @@ import {
   disconnectReplication,
   errorText,
   exec,
+  forgetReplicaAck,
   generateBackupKey,
   generateBackupSecret,
   health,
@@ -1580,6 +1581,19 @@ function ClusterPage({ connection }: { connection: Connection }) {
     return () => window.clearInterval(timer);
   }, [load]);
 
+  const forgetClusterAck = async (node: string) => {
+    if (!window.confirm(
+      `Remove replica ${node} from the primary view?\n\n` +
+      'This deletes its last ACK. A still-running replica will reappear on its next ACK; pause or disconnect it first.',
+    )) return;
+    try {
+      await forgetReplicaAck(connection, node);
+      await load();
+    } catch (err) {
+      setError(errorText(err));
+    }
+  };
+
   const nodes = cluster?.nodes ?? [];
   const online = nodes.filter((node) => node.ok);
   const primaries = online.filter((node) => node.status?.role === 'primary');
@@ -1759,6 +1773,9 @@ function ClusterPage({ connection }: { connection: Connection }) {
                 <span className={`muted small ${ack.age_seconds > 60 ? 'danger-text' : ''}`}>
                   {ack.age_seconds.toFixed(1)}s ago
                 </span>
+                <button className="danger" onClick={() => void forgetClusterAck(ack.node)}>
+                  Remove replica
+                </button>
               </div>
             ))}
           </div>
@@ -1811,18 +1828,24 @@ function ReplicationPage({ connection }: { connection: Connection }) {
     setLoading(true);
     setError('');
     try {
-      const [nextStatus, nextChanges, pending] = await Promise.all([
+      const [nextStatus, nextChanges, pendingState] = await Promise.all([
         replicationStatus(connection),
         replicationChanges(connection, 0, 50),
-        listReplicaPairings(connection).catch(() => ({ pending: [] })),
+        listReplicaPairings(connection)
+          .then((value) => ({ ok: true, pending: value.pending ?? [] }))
+          .catch(() => ({ ok: false, pending: [] as PairingView[] })),
       ]);
       setStatus(nextStatus);
       setChanges(nextChanges.changes);
-      const pendingItems = pending.pending ?? [];
-      setPendingPairings(pendingItems);
-      setPairing((current) =>
-        current && pendingItems.some((item) => item.code === current.code) ? current : null,
-      );
+      const pendingItems = pendingState.pending;
+      if (pendingState.ok) {
+        setPendingPairings(pendingItems);
+        setPairing((current) => {
+          if (!current) return null;
+          if (Date.now() >= current.expires_at_ms) return null;
+          return pendingItems.some((item) => item.code === current.code) ? current : null;
+        });
+      }
       setSourceDraft(nextStatus.replication?.source ?? '');
       setDatabasesDraft((nextStatus.replication?.databases ?? ['default']).join(', '));
       setIntervalDraft(String(nextStatus.replication?.interval_secs ?? 1));
@@ -1842,6 +1865,25 @@ function ReplicationPage({ connection }: { connection: Connection }) {
     }, 3000);
     return () => window.clearInterval(timer);
   }, [load]);
+
+  const forgetAck = async (node: string) => {
+    if (!window.confirm(
+      `Remove replica ${node} from the primary view?\n\n` +
+      'This deletes its last ACK on the primary. If the replica is still running, it will reappear after its next ACK; pause or disconnect it first.',
+    )) return;
+    setReplicationBusy(true);
+    setError('');
+    setReplicationNotice('');
+    try {
+      await forgetReplicaAck(connection, node);
+      setReplicationNotice(`Forgot replica ${node}.`);
+      await load();
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setReplicationBusy(false);
+    }
+  };
 
   const pauseOrResume = async (pause: boolean) => {
     setReplicationBusy(true);
@@ -2192,6 +2234,13 @@ function ReplicationPage({ connection }: { connection: Connection }) {
                   <span className={`muted small ${ack.age_seconds > 60 ? 'danger-text' : ''}`}>
                     {ack.age_seconds.toFixed(1)}s ago
                   </span>
+                  <button
+                    className="danger"
+                    disabled={replicationBusy}
+                    onClick={() => void forgetAck(ack.node)}
+                  >
+                    Remove replica
+                  </button>
                 </div>
               ))}
             </div>

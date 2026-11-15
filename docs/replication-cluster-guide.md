@@ -139,7 +139,7 @@ Install the released binaries on every node (see [Operations](operations.md#inst
 for the full systemd and Docker variants):
 
 ```bash
-TAG=v0.25.0-rc.1
+TAG=v0.25.0-rc.2
 ARCHIVE="nonodb-$TAG-linux-x86_64.tar.gz"
 curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/$ARCHIVE"
 curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/$ARCHIVE.sha256"
@@ -475,6 +475,7 @@ nonodb-cli replication demote <epoch> replica [successor-url]
 | `pause` | Stop pulling/applying while keeping the source and token. |
 | `resume` | Resume a paused replica from the stored source. |
 | `disconnect` | Remove source/token and leave the node read-only; data is kept. |
+| `forget <node>` | Remove a stale ACK row on the primary. |
 | `prune <seq> [--require-acks]` | Remove old log records, optionally refusing to pass the minimum ack. |
 | `add-replica <name> [dbs]` (alias `pair`) | Create a one-time 8-character pairing code on the primary. |
 | `pairings` | List pending pairing codes. |

@@ -344,7 +344,8 @@ The Replication tab exposes:
 - pause/resume and disconnect controls that do not delete local data;
 - manual promote/demote with expected epoch, successor URL, and confirmation;
 - replica connections with fresh/stale acknowledgements, a **connected** badge,
-  and the minimum safe sequence; the panel refreshes every 3 seconds;
+  the minimum safe sequence, and a **Forget** action for stale rows; the panel
+  refreshes every 3 seconds;
 - recent replication transactions with grouped collection/op/id changes.
 
 #### Pause and disconnect
@@ -499,7 +500,7 @@ docker run -d --name nonodb-gui \
   -p 127.0.0.1:8787:8787 \
   -v nonodb-run:/run/nonodb \
   -e NONODB_SOCK=/run/nonodb/nonodb.sock \
-  ghcr.io/essmos/nonodb:0.25.0-rc.1 \
+  ghcr.io/essmos/nonodb:0.25.0-rc.2 \
   nonodb-cli gui --host 0.0.0.0 --port 8787 --allow-remote --no-open
 ```
 

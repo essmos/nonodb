@@ -255,6 +255,14 @@ fn run() -> Result<(), String> {
                     }
                     println!("The primary GUI shows this replica after its first acknowledgement.");
                 }
+                "forget" | "remove" => {
+                    let node = args
+                        .get(2)
+                        .ok_or("usage: nonodb-cli replication forget <node-id>")?;
+                    let res =
+                        http_request("DELETE", &format!("/v1/replication/acks/{node}"), None)?;
+                    print_result(&res);
+                }
                 "pause" => {
                     let res = http_post("/v1/replication/pause", &json!({}))?;
                     print_result(&res);
@@ -669,7 +677,7 @@ fn usage() -> Result<(), String> {
          server                     rzeczywiste adresy nasłuchu (TCP/UDS)\n\
          exec '<json>'              dowolne żądanie /v1/exec\n\
          databases [list|create <nazwa>|drop <nazwa>]  bazy w jednym daemonie\n\
-         replication [status|changes [after] [limit]|source <url> [dbs] [interval]|pause|resume|disconnect|acks|prune <seq> [--require-acks]|promote <epoch> [--force]|demote <epoch> [role] [successor]|add-replica <name> [dbs]|pairings|revoke <code>|join <primary-url> [code]]\n\
+         replication [status|changes [after] [limit]|source <url> [dbs] [interval]|pause|resume|disconnect|forget <node>|acks|prune <seq> [--require-acks]|promote <epoch> [--force]|demote <epoch> [role] [successor]|add-replica <name> [dbs]|pairings|revoke <code>|join <primary-url> [code]]\n\
          collections                lista kolekcji\n\
          count <coll> [filtr]       liczba dokumentów\n\
          find <coll> [filtr] [--sort pole:asc|desc] [--limit N] [--skip N]\n\

@@ -784,6 +784,85 @@ pub async fn ack(
     }
 }
 
+pub async fn forget_ack(
+    State(state): State<AppState>,
+    Extension(connection): Extension<auth::ConnectionAuth>,
+    headers: HeaderMap,
+    Path((database, node)): Path<(String, String)>,
+) -> AuthResponse {
+    let (principal, started) =
+        match start_admin(&state, &connection, &headers, "replication_ack_forget") {
+            Ok(value) => value,
+            Err(response) => return response,
+        };
+    let node = node.trim().to_string();
+    if node.is_empty() || node.len() > 128 {
+        return failure(
+            StatusCode::BAD_REQUEST,
+            "invalid_replica",
+            "replica node id must be 1..=128 characters",
+        );
+    }
+    let database = if database.is_empty() {
+        crate::databases::DEFAULT_DATABASE.to_string()
+    } else {
+        database
+    };
+    let store = match state.databases.get(&database).await {
+        Ok(runtime) => runtime.store.clone(),
+        Err(error) => return failure(StatusCode::BAD_REQUEST, &error.code, error.message),
+    };
+    let Some(origin) = crate::writer::replication_origin() else {
+        return failure(
+            StatusCode::BAD_REQUEST,
+            "replication_disabled",
+            "this node is not a replication source",
+        );
+    };
+    match store.remove_replica_ack(&origin, &node) {
+        Ok(removed) => {
+            if let Err(error) = crate::replicator::forget_replica_url(&node) {
+                tracing::warn!(node = %node, error = %error, "forget replica URL failed");
+            }
+            audit_control(
+                &state,
+                &connection,
+                principal.name(),
+                "replication_ack_forget",
+                true,
+                None,
+                started,
+                None,
+            );
+            ok(serde_json::json!({
+                "database": database,
+                "node": node,
+                "removed": removed,
+            }))
+        }
+        Err(error) => failure(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "replication_error",
+            error.to_string(),
+        ),
+    }
+}
+
+pub async fn forget_ack_default(
+    State(state): State<AppState>,
+    Extension(connection): Extension<auth::ConnectionAuth>,
+    headers: HeaderMap,
+    Path(node): Path<String>,
+) -> AuthResponse {
+    forget_ack(
+        State(state),
+        Extension(connection),
+        headers,
+        Path((crate::databases::DEFAULT_DATABASE.to_string(), node)),
+    )
+    .await
+}
+
 pub async fn acks(
     State(state): State<AppState>,
     Extension(connection): Extension<auth::ConnectionAuth>,

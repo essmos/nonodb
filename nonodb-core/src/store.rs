@@ -1662,6 +1662,22 @@ impl Store {
         Ok(())
     }
 
+    /// Removes one replica acknowledgement and its timestamp.
+    pub fn remove_replica_ack(&self, origin: &str, node: &str) -> Result<bool> {
+        if origin.trim().is_empty() || node.trim().is_empty() {
+            return Err(Error::Query("replication ack origin/node is empty".into()));
+        }
+        let key = format!("replication:ack:{origin}:{node}");
+        let at_key = format!("replication:ack_at:{origin}:{node}");
+        let mut wtxn = self.write_txn()?;
+        let meta: Database<Bytes, Bytes> = self.env.create_database(&mut wtxn, Some(META_DB))?;
+        let existed = meta.get(&wtxn, key.as_bytes())?.is_some();
+        meta.delete(&mut wtxn, key.as_bytes())?;
+        meta.delete(&mut wtxn, at_key.as_bytes())?;
+        wtxn.commit()?;
+        Ok(existed)
+    }
+
     /// Returns `(node, acked sequence)` for all replicas of `origin`.
     pub fn replica_acks(&self, origin: &str) -> Result<Vec<(String, u64)>> {
         let prefix = format!("replication:ack:{origin}:");

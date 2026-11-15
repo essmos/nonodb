@@ -53,7 +53,7 @@ use axum::{
         HeaderMap, HeaderValue, StatusCode, Uri,
     },
     response::{IntoResponse, Response},
-    routing::{get, patch, post, put},
+    routing::{delete, get, patch, post, put},
     Extension, Json, Router,
 };
 use hyper::server::conn::http1;
@@ -338,6 +338,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         )
         .route("/v1/replication/ack", post(replication_api::ack_default))
         .route("/v1/replication/acks", get(replication_api::acks_default))
+        .route(
+            "/v1/replication/acks/:node",
+            delete(replication_api::forget_ack_default),
+        )
         .route("/v1/replication/vote", post(replication_api::vote))
         .route("/v1/replication/primary", get(replication_api::primary))
         .route(
@@ -381,6 +385,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         )
         .route("/:database/v1/replication/ack", post(replication_api::ack))
         .route("/:database/v1/replication/acks", get(replication_api::acks))
+        .route(
+            "/:database/v1/replication/acks/:node",
+            delete(replication_api::forget_ack),
+        )
         .route("/v1/exec", post(exec))
         .route("/v1/watch", post(watch_stream))
         .route("/:database/v1/exec", post(exec))

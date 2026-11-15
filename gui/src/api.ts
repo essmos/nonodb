@@ -810,6 +810,14 @@ export function revokeReplicaPairing(
   ) as Promise<{ revoked: boolean }>;
 }
 
+export function forgetReplicaAck(connection: Connection, node: string): Promise<unknown> {
+  return authRequest(
+    connection,
+    `/v1/replication/acks/${encodeURIComponent(node)}`,
+    'DELETE',
+  );
+}
+
 export function pauseReplication(connection: Connection): Promise<unknown> {
   return authRequest(connection, '/v1/replication/pause', 'POST', {});
 }
