@@ -108,8 +108,15 @@ Dates can be set or replaced with normal update operators:
 }
 ```
 
-`$currentDate` is not implemented. Write an explicit date, or generate the
-current timestamp in the application.
+`$currentDate` sets the current UTC date:
+
+```json
+{"op": "update", "coll": "events", "filter": {"_id": "e1"},
+ "update": {"$currentDate": {"updated_at": true}}}
+```
+
+BSON Timestamp values (`{"$type": "timestamp"}`) are not implemented; use a
+date.
 
 ## Time zones and civil dates
 
@@ -117,10 +124,42 @@ Timezone identifiers such as `Europe/Warsaw` are not part of the stored value.
 Convert local times to an RFC 3339 instant in the client. This is also how the
 MongoDB BSON Date type works.
 
-Timezone-aware aggregation expressions (`$dateToString`, `$dateFromParts`,
-`$dateTrunc`, `$dateAdd`, `$dateSubtract`, `$dateDiff`, and `$dateFromString`)
-are not implemented yet. If you need "a local calendar day" rather than an
-instant, store the intended local date or day key as a separate string field.
+## Date expressions
+
+The aggregation expression evaluator supports:
+
+- `$dateAdd` and `$dateSubtract` with `year`, `quarter`, `month`, `week`,
+  `day`, `hour`, `minute`, `second`, and `millisecond` units;
+- `$dateTrunc` with `binSize` and `startOfWeek`;
+- `$dateToString` with the common format specifiers;
+- `$dateFromString` for RFC 3339 input;
+- `$dateFromParts` and `$dateToParts`, including ISO week fields.
+
+They work in `$expr`, `$project`, `$addFields`, `$group`, `$bucket`, and
+pipeline updates.
+
+```json
+{
+  "$project": {
+    "day": {
+      "$dateTrunc": {"date": "$created_at", "unit": "day"}
+    },
+    "label": {
+      "$dateToString": {
+        "date": "$created_at",
+        "format": "%Y-%m-%d",
+        "timezone": "+01:00"
+      }
+    }
+  }
+}
+```
+
+Time zones are UTC (`Z`, `UTC`, `GMT`) or fixed offsets such as `+02:00` and
+`-05:00`. IANA names such as `Europe/Warsaw` are not implemented.
+
+Not yet supported: `$dateDiff`, `$dateFromString` custom `format`, IANA time
+zone identifiers, and BSON Timestamp.
 
 ## Existing documents and imports
 

@@ -13,6 +13,7 @@ use bigdecimal::num_traits::Zero;
 use bigdecimal::{BigDecimal, FromPrimitive};
 use rand::seq::SliceRandom;
 use serde_json::{Map, Value};
+use time::{Date, Duration, Month, OffsetDateTime, Time, UtcOffset, Weekday};
 
 use crate::bson_types;
 use crate::collection::compare_docs;
@@ -1440,6 +1441,12 @@ fn eval_operator(
     };
 
     match op.as_str() {
+        "$dateAdd" | "$dateSubtract" => date_add_op(doc, arg, vars, op == "$dateSubtract"),
+        "$dateTrunc" => date_trunc_op(doc, arg, vars),
+        "$dateToString" => date_to_string_op(doc, arg, vars),
+        "$dateFromString" => date_from_string_op(doc, arg, vars),
+        "$dateFromParts" => date_from_parts_op(doc, arg, vars),
+        "$dateToParts" => date_to_parts_op(doc, arg, vars),
         "$literal" => Ok(arg.clone()),
         "$ifNull" => {
             let values = args()?;
@@ -2105,6 +2112,485 @@ fn eval_operator(
     }
 }
 
+fn date_millis(value: &Value) -> Result<i64> {
+    date::parse_value(value)
+        .ok_or_else(|| Error::InvalidDate("expected an Extended JSON date".into()))
+}
+
+fn date_from_millis(ms: i64) -> Result<OffsetDateTime> {
+    OffsetDateTime::from_unix_timestamp_nanos(i128::from(ms) * 1_000_000)
+        .map_err(|_| Error::InvalidDate("date is out of range".into()))
+}
+
+fn date_to_millis(value: OffsetDateTime) -> Result<i64> {
+    let ms = value.unix_timestamp_nanos().div_euclid(1_000_000);
+    i64::try_from(ms).map_err(|_| Error::InvalidDate("date is out of range".into()))
+}
+
+fn date_timezone(
+    obj: &Map<String, Value>,
+    doc: &Value,
+    vars: &BTreeMap<String, Value>,
+) -> Result<UtcOffset> {
+    let Some(value) = obj.get("timezone") else {
+        return Ok(UtcOffset::UTC);
+    };
+    let value = eval_expr_vars(doc, value, vars)?;
+    parse_timezone_value(&value)
+}
+
+fn parse_timezone_value(value: &Value) -> Result<UtcOffset> {
+    let Some(raw) = value.as_str() else {
+        return Err(Error::Query("timezone must be a string".into()));
+    };
+    let raw = raw.trim();
+    let upper = raw.to_ascii_uppercase();
+    if matches!(upper.as_str(), "Z" | "UTC" | "GMT") {
+        return Ok(UtcOffset::UTC);
+    }
+    let offset = upper
+        .strip_prefix("UTC")
+        .or_else(|| upper.strip_prefix("GMT"))
+        .unwrap_or(&upper);
+    let bytes = offset.as_bytes();
+    let (sign, rest) = match bytes.first() {
+        Some(b'+') => (1, &offset[1..]),
+        Some(b'-') => (-1, &offset[1..]),
+        _ => {
+            return Err(Error::Query(format!(
+                "unsupported timezone `{raw}`; use UTC or a fixed +HH:MM offset"
+            )))
+        }
+    };
+    let (hours, minutes) = match rest.len() {
+        5 if rest.as_bytes()[2] == b':' => (&rest[..2], &rest[3..]),
+        4 => (&rest[..2], &rest[2..]),
+        2 => (rest, "0"),
+        _ => return Err(Error::Query(format!("invalid timezone offset `{raw}`"))),
+    };
+    let hours = hours
+        .parse::<i8>()
+        .map_err(|_| Error::Query(format!("invalid timezone offset `{raw}`")))?;
+    let minutes = minutes
+        .parse::<i8>()
+        .map_err(|_| Error::Query(format!("invalid timezone offset `{raw}`")))?;
+    UtcOffset::from_hms(sign * hours, sign * minutes, 0)
+        .map_err(|_| Error::Query(format!("invalid timezone offset `{raw}`")))
+}
+
+fn add_date_months(value: OffsetDateTime, months: i64) -> Result<OffsetDateTime> {
+    let total = i64::from(value.year())
+        .checked_mul(12)
+        .and_then(|v| v.checked_add(i64::from(u8::from(value.month())) - 1))
+        .and_then(|v| v.checked_add(months))
+        .ok_or_else(|| Error::InvalidDate("date arithmetic overflow".into()))?;
+    let year = i32::try_from(total.div_euclid(12))
+        .map_err(|_| Error::InvalidDate("date is out of range".into()))?;
+    let month = Month::try_from((total.rem_euclid(12) + 1) as u8)
+        .map_err(|_| Error::InvalidDate("date is out of range".into()))?;
+    let day = value.day().min(month.length(year));
+    let date = Date::from_calendar_date(year, month, day)
+        .map_err(|_| Error::InvalidDate("date is out of range".into()))?;
+    Ok(value.replace_date(date))
+}
+
+fn date_add_op(
+    doc: &Value,
+    arg: &Value,
+    vars: &BTreeMap<String, Value>,
+    subtract: bool,
+) -> Result<Value> {
+    let Some(obj) = arg.as_object() else {
+        return Err(Error::Query("$dateAdd requires an object".into()));
+    };
+    let start = obj
+        .get("startDate")
+        .ok_or_else(|| Error::Query("$dateAdd requires `startDate`".into()))?;
+    let start = eval_expr_vars(doc, start, vars)?;
+    let start = date_millis(&start)?;
+    let unit = obj
+        .get("unit")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::Query("$dateAdd requires `unit`".into()))?;
+    let amount = obj
+        .get("amount")
+        .ok_or_else(|| Error::Query("$dateAdd requires `amount`".into()))?;
+    let amount = eval_expr_vars(doc, amount, vars)?;
+    let amount =
+        expr_i64(&amount).ok_or_else(|| Error::Query("`amount` must be an integer".into()))?;
+    let amount = if subtract {
+        amount
+            .checked_neg()
+            .ok_or_else(|| Error::InvalidDate("date arithmetic overflow".into()))?
+    } else {
+        amount
+    };
+    let timezone = date_timezone(obj, doc, vars)?;
+    let value = date_from_millis(start)?.to_offset(timezone);
+    let result = match unit {
+        "year" => add_date_months(
+            value,
+            amount
+                .checked_mul(12)
+                .ok_or_else(|| Error::InvalidDate("date arithmetic overflow".into()))?,
+        )?,
+        "quarter" => add_date_months(
+            value,
+            amount
+                .checked_mul(3)
+                .ok_or_else(|| Error::InvalidDate("date arithmetic overflow".into()))?,
+        )?,
+        "month" => add_date_months(value, amount)?,
+        "week" => value
+            .checked_add(Duration::weeks(amount))
+            .ok_or_else(|| Error::InvalidDate("date arithmetic overflow".into()))?,
+        "day" => value
+            .checked_add(Duration::days(amount))
+            .ok_or_else(|| Error::InvalidDate("date arithmetic overflow".into()))?,
+        "hour" => value
+            .checked_add(Duration::hours(amount))
+            .ok_or_else(|| Error::InvalidDate("date arithmetic overflow".into()))?,
+        "minute" => value
+            .checked_add(Duration::minutes(amount))
+            .ok_or_else(|| Error::InvalidDate("date arithmetic overflow".into()))?,
+        "second" => value
+            .checked_add(Duration::seconds(amount))
+            .ok_or_else(|| Error::InvalidDate("date arithmetic overflow".into()))?,
+        "millisecond" => value
+            .checked_add(Duration::milliseconds(amount))
+            .ok_or_else(|| Error::InvalidDate("date arithmetic overflow".into()))?,
+        _ => return Err(Error::Query(format!("unsupported date unit `{unit}`"))),
+    };
+    Ok(date::canonical(date_to_millis(result)?))
+}
+
+fn parse_start_of_week(value: Option<&Value>) -> Result<Weekday> {
+    let Some(value) = value else {
+        return Ok(Weekday::Sunday);
+    };
+    let Some(name) = value.as_str() else {
+        return Err(Error::Query("`startOfWeek` must be a string".into()));
+    };
+    match name.to_ascii_lowercase().as_str() {
+        "monday" => Ok(Weekday::Monday),
+        "tuesday" => Ok(Weekday::Tuesday),
+        "wednesday" => Ok(Weekday::Wednesday),
+        "thursday" => Ok(Weekday::Thursday),
+        "friday" => Ok(Weekday::Friday),
+        "saturday" => Ok(Weekday::Saturday),
+        "sunday" => Ok(Weekday::Sunday),
+        _ => Err(Error::Query(format!("invalid startOfWeek `{name}`"))),
+    }
+}
+
+fn week_reference_millis(start: Weekday, _timezone: UtcOffset) -> Result<i64> {
+    let base = Date::from_calendar_date(2000, Month::January, 1)
+        .map_err(|_| Error::InvalidDate("invalid reference date".into()))?;
+    let offset_days = (i64::from(start.number_days_from_sunday())
+        - i64::from(base.weekday().number_days_from_sunday()))
+    .rem_euclid(7);
+    let reference = base
+        .checked_add(Duration::days(offset_days))
+        .ok_or_else(|| Error::InvalidDate("invalid reference date".into()))?;
+    let local = OffsetDateTime::new_in_offset(reference, Time::MIDNIGHT, UtcOffset::UTC);
+    date_to_millis(local)
+}
+
+fn truncate_date(
+    value: OffsetDateTime,
+    unit: &str,
+    bin_size: i64,
+    start_of_week: Weekday,
+) -> Result<i64> {
+    let timezone = value.offset();
+    if matches!(unit, "year" | "quarter" | "month") {
+        let months_per_bin = match unit {
+            "year" => 12,
+            "quarter" => 3,
+            _ => 1,
+        } * bin_size;
+        let total = i64::from(value.year()) * 12 + i64::from(u8::from(value.month())) - 1;
+        let reference = 2000 * 12;
+        let truncated = reference + (total - reference).div_euclid(months_per_bin) * months_per_bin;
+        let year = i32::try_from(truncated.div_euclid(12))
+            .map_err(|_| Error::InvalidDate("date is out of range".into()))?;
+        let month = Month::try_from((truncated.rem_euclid(12) + 1) as u8)
+            .map_err(|_| Error::InvalidDate("date is out of range".into()))?;
+        let date = Date::from_calendar_date(year, month, 1)
+            .map_err(|_| Error::InvalidDate("date is out of range".into()))?;
+        let local = OffsetDateTime::new_in_offset(date, Time::MIDNIGHT, timezone);
+        return date_to_millis(local);
+    }
+
+    let offset_ms = i64::from(timezone.whole_seconds()) * 1000;
+    let local_ms = date_to_millis(value)? + offset_ms;
+    let unit_ms: i64 = match unit {
+        "week" => 7 * 86_400_000,
+        "day" => 86_400_000,
+        "hour" => 3_600_000,
+        "minute" => 60_000,
+        "second" => 1_000,
+        "millisecond" => 1,
+        _ => return Err(Error::Query(format!("unsupported date unit `{unit}`"))),
+    };
+    let width = unit_ms
+        .checked_mul(bin_size)
+        .ok_or_else(|| Error::InvalidDate("date arithmetic overflow".into()))?;
+    let reference = if unit == "week" {
+        week_reference_millis(start_of_week, timezone)?
+    } else {
+        946_684_800_000
+    };
+    let truncated = reference + (local_ms - reference).div_euclid(width) * width;
+    Ok(truncated - offset_ms)
+}
+
+fn date_trunc_op(doc: &Value, arg: &Value, vars: &BTreeMap<String, Value>) -> Result<Value> {
+    let Some(obj) = arg.as_object() else {
+        return Err(Error::Query("$dateTrunc requires an object".into()));
+    };
+    let date = obj
+        .get("date")
+        .ok_or_else(|| Error::Query("$dateTrunc requires `date`".into()))?;
+    let date = eval_expr_vars(doc, date, vars)?;
+    let date = date_millis(&date)?;
+    let unit = obj
+        .get("unit")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::Query("$dateTrunc requires `unit`".into()))?;
+    let bin_size = match obj.get("binSize") {
+        None => 1,
+        Some(value) => {
+            let value = eval_expr_vars(doc, value, vars)?;
+            expr_i64(&value)
+                .filter(|n| *n > 0)
+                .ok_or_else(|| Error::Query("`binSize` must be a positive integer".into()))?
+        }
+    };
+    let timezone = date_timezone(obj, doc, vars)?;
+    let start_of_week = parse_start_of_week(obj.get("startOfWeek"))?;
+    let value = date_from_millis(date)?.to_offset(timezone);
+    let truncated = truncate_date(value, unit, bin_size, start_of_week)?;
+    Ok(date::canonical(truncated))
+}
+
+fn format_date(value: OffsetDateTime, format: &str) -> Result<String> {
+    let date = value.date();
+    let time = value.time();
+    let iso = date.to_iso_week_date();
+    let offset_seconds = i64::from(value.offset().whole_seconds());
+    let offset_sign = if offset_seconds < 0 { '-' } else { '+' };
+    let offset_abs = offset_seconds.unsigned_abs();
+    let offset_hours = offset_abs / 3600;
+    let offset_minutes = (offset_abs % 3600) / 60;
+    let mut out = String::new();
+    let mut chars = format.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '%' {
+            out.push(ch);
+            continue;
+        }
+        let Some(spec) = chars.next() else {
+            return Err(Error::Query("incomplete date format".into()));
+        };
+        match spec {
+            '%' => out.push('%'),
+            'Y' => out.push_str(&format!("{:04}", date.year())),
+            'G' => out.push_str(&format!("{:04}", iso.0)),
+            'g' => out.push_str(&format!("{:02}", iso.0.rem_euclid(100))),
+            'm' => out.push_str(&format!("{:02}", u8::from(date.month()))),
+            'd' => out.push_str(&format!("{:02}", date.day())),
+            'H' => out.push_str(&format!("{:02}", time.hour())),
+            'M' => out.push_str(&format!("{:02}", time.minute())),
+            'S' => out.push_str(&format!("{:02}", time.second())),
+            'L' => out.push_str(&format!("{:03}", time.millisecond())),
+            'j' => out.push_str(&format!("{:03}", date.ordinal())),
+            'w' => out.push_str(&format!("{}", date.weekday().number_days_from_sunday() + 1)),
+            'u' => out.push_str(&format!("{}", date.weekday().number_days_from_monday() + 1)),
+            'U' => {
+                let week = (i32::from(date.ordinal())
+                    - i32::from(date.weekday().number_days_from_sunday())
+                    + 6)
+                    / 7;
+                out.push_str(&format!("{week:02}"));
+            }
+            'V' => out.push_str(&format!("{:02}", iso.1)),
+            'z' => out.push_str(&format!(
+                "{offset_sign}{offset_hours:02}{offset_minutes:02}"
+            )),
+            'Z' => out.push_str(&format!("{}", offset_seconds / 60)),
+            other => {
+                return Err(Error::Query(format!(
+                    "unsupported date format specifier `%{other}`"
+                )))
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn date_to_string_op(doc: &Value, arg: &Value, vars: &BTreeMap<String, Value>) -> Result<Value> {
+    let Some(obj) = arg.as_object() else {
+        return Err(Error::Query("$dateToString requires an object".into()));
+    };
+    let date = obj
+        .get("date")
+        .ok_or_else(|| Error::Query("$dateToString requires `date`".into()))?;
+    let date = eval_expr_vars(doc, date, vars)?;
+    if date.is_null() {
+        return match obj.get("onNull") {
+            Some(on_null) => eval_expr_vars(doc, on_null, vars),
+            None => Ok(Value::Null),
+        };
+    }
+    let date = date_millis(&date)?;
+    let format = obj
+        .get("format")
+        .and_then(Value::as_str)
+        .unwrap_or("%Y-%m-%dT%H:%M:%S.%LZ");
+    let timezone = date_timezone(obj, doc, vars)?;
+    let value = date_from_millis(date)?.to_offset(timezone);
+    Ok(Value::String(format_date(value, format)?))
+}
+
+fn date_from_string_op(doc: &Value, arg: &Value, vars: &BTreeMap<String, Value>) -> Result<Value> {
+    let Some(obj) = arg.as_object() else {
+        return Err(Error::Query("$dateFromString requires an object".into()));
+    };
+    let raw = obj
+        .get("dateString")
+        .ok_or_else(|| Error::Query("$dateFromString requires `dateString`".into()))?;
+    let raw = eval_expr_vars(doc, raw, vars)?;
+    if raw.is_null() {
+        return match obj.get("onNull") {
+            Some(on_null) => eval_expr_vars(doc, on_null, vars),
+            None => Ok(Value::Null),
+        };
+    }
+    if obj.contains_key("format") {
+        return Err(Error::Query(
+            "$dateFromString custom `format` is not supported".into(),
+        ));
+    }
+    let parsed = raw
+        .as_str()
+        .and_then(date::parse_rfc3339_ms)
+        .map(date::canonical);
+    match parsed {
+        Some(value) => Ok(value),
+        None => match obj.get("onError") {
+            Some(on_error) => eval_expr_vars(doc, on_error, vars),
+            None => Err(Error::Query(
+                "$dateFromString could not parse the date string".into(),
+            )),
+        },
+    }
+}
+
+fn date_part_i64(
+    obj: &Map<String, Value>,
+    field: &str,
+    doc: &Value,
+    vars: &BTreeMap<String, Value>,
+    default: i64,
+) -> Result<i64> {
+    let Some(value) = obj.get(field) else {
+        return Ok(default);
+    };
+    let value = eval_expr_vars(doc, value, vars)?;
+    expr_i64(&value).ok_or_else(|| Error::Query(format!("`{field}` must be an integer")))
+}
+
+fn date_from_parts_op(doc: &Value, arg: &Value, vars: &BTreeMap<String, Value>) -> Result<Value> {
+    let Some(obj) = arg.as_object() else {
+        return Err(Error::Query("$dateFromParts requires an object".into()));
+    };
+    let timezone = date_timezone(obj, doc, vars)?;
+    let date = if obj.contains_key("isoWeekYear") {
+        let year = i32::try_from(date_part_i64(obj, "isoWeekYear", doc, vars, 1970)?)
+            .map_err(|_| Error::InvalidDate("date is out of range".into()))?;
+        let week = u8::try_from(date_part_i64(obj, "isoWeek", doc, vars, 1)?)
+            .map_err(|_| Error::InvalidDate("invalid ISO week".into()))?;
+        let day = date_part_i64(obj, "isoDayOfWeek", doc, vars, 1)?;
+        let day = u8::try_from(day)
+            .ok()
+            .filter(|day| (1..=7).contains(day))
+            .ok_or_else(|| Error::InvalidDate("invalid ISO day of week".into()))?;
+        let weekday = match day {
+            1 => Weekday::Monday,
+            2 => Weekday::Tuesday,
+            3 => Weekday::Wednesday,
+            4 => Weekday::Thursday,
+            5 => Weekday::Friday,
+            6 => Weekday::Saturday,
+            7 => Weekday::Sunday,
+            _ => return Err(Error::InvalidDate("invalid ISO day of week".into())),
+        };
+        Date::from_iso_week_date(year, week, weekday)
+            .map_err(|_| Error::InvalidDate("invalid ISO date".into()))?
+    } else {
+        let year = i32::try_from(date_part_i64(obj, "year", doc, vars, 1970)?)
+            .map_err(|_| Error::InvalidDate("date is out of range".into()))?;
+        let month = u8::try_from(date_part_i64(obj, "month", doc, vars, 1)?)
+            .ok()
+            .and_then(|month| Month::try_from(month).ok())
+            .ok_or_else(|| Error::InvalidDate("invalid month".into()))?;
+        let day = u8::try_from(date_part_i64(obj, "day", doc, vars, 1)?)
+            .map_err(|_| Error::InvalidDate("invalid day".into()))?;
+        Date::from_calendar_date(year, month, day)
+            .map_err(|_| Error::InvalidDate("invalid calendar date".into()))?
+    };
+    let hour = u8::try_from(date_part_i64(obj, "hour", doc, vars, 0)?)
+        .map_err(|_| Error::InvalidDate("invalid hour".into()))?;
+    let minute = u8::try_from(date_part_i64(obj, "minute", doc, vars, 0)?)
+        .map_err(|_| Error::InvalidDate("invalid minute".into()))?;
+    let second = u8::try_from(date_part_i64(obj, "second", doc, vars, 0)?)
+        .map_err(|_| Error::InvalidDate("invalid second".into()))?;
+    let millisecond = u16::try_from(date_part_i64(obj, "millisecond", doc, vars, 0)?)
+        .map_err(|_| Error::InvalidDate("invalid millisecond".into()))?;
+    let time = Time::from_hms_milli(hour, minute, second, millisecond)
+        .map_err(|_| Error::InvalidDate("invalid time".into()))?;
+    let value = OffsetDateTime::new_in_offset(date, time, timezone);
+    Ok(date::canonical(date_to_millis(value)?))
+}
+
+fn date_to_parts_op(doc: &Value, arg: &Value, vars: &BTreeMap<String, Value>) -> Result<Value> {
+    let Some(obj) = arg.as_object() else {
+        return Err(Error::Query("$dateToParts requires an object".into()));
+    };
+    let date = obj
+        .get("date")
+        .ok_or_else(|| Error::Query("$dateToParts requires `date`".into()))?;
+    let date = eval_expr_vars(doc, date, vars)?;
+    let date = date_millis(&date)?;
+    let timezone = date_timezone(obj, doc, vars)?;
+    let value = date_from_millis(date)?.to_offset(timezone);
+    let date = value.date();
+    let time = value.time();
+    let mut out = Map::new();
+    if obj
+        .get("iso8601")
+        .is_some_and(|v| v.is_boolean() && v.as_bool() == Some(true))
+    {
+        let (year, week, weekday) = date.to_iso_week_date();
+        out.insert("isoWeekYear".to_string(), Value::from(year));
+        out.insert("isoWeek".to_string(), Value::from(week));
+        out.insert(
+            "isoDayOfWeek".to_string(),
+            Value::from(weekday.number_days_from_monday() + 1),
+        );
+    } else {
+        out.insert("year".to_string(), Value::from(date.year()));
+        out.insert("month".to_string(), Value::from(u8::from(date.month())));
+        out.insert("day".to_string(), Value::from(date.day()));
+    }
+    out.insert("hour".to_string(), Value::from(time.hour()));
+    out.insert("minute".to_string(), Value::from(time.minute()));
+    out.insert("second".to_string(), Value::from(time.second()));
+    out.insert("millisecond".to_string(), Value::from(time.millisecond()));
+    Ok(Value::Object(out))
+}
+
 fn expr_i64(value: &Value) -> Option<i64> {
     if let Some(number) = value.as_i64() {
         return Some(number);
@@ -2273,6 +2759,151 @@ mod tests {
             json!({"a": 1, "b": 2})
         );
         assert_eq!(eval(json!({"$type": "$name"})), json!("string"));
+    }
+
+    #[test]
+    fn date_expression_operators() {
+        let doc = json!({"at": {"$date": "2024-01-31T23:45:12.345Z"}});
+        let eval = |expr: Value| eval_expr(&doc, &expr).unwrap();
+        let canonical = |raw: &str| {
+            let value = json!({"$date": raw});
+            date::canonical(date::parse_value(&value).unwrap())
+        };
+
+        assert_eq!(
+            eval(json!({"$dateAdd": {
+                "startDate": "$at",
+                "unit": "month",
+                "amount": 1
+            }})),
+            canonical("2024-02-29T23:45:12.345Z")
+        );
+        assert_eq!(
+            eval(json!({"$dateAdd": {
+                "startDate": "$at",
+                "unit": "year",
+                "amount": 1
+            }})),
+            canonical("2025-01-31T23:45:12.345Z")
+        );
+        assert_eq!(
+            eval(json!({"$dateSubtract": {
+                "startDate": "$at",
+                "unit": "day",
+                "amount": 1
+            }})),
+            canonical("2024-01-30T23:45:12.345Z")
+        );
+        assert_eq!(
+            eval(json!({"$dateTrunc": {
+                "date": "$at",
+                "unit": "day"
+            }})),
+            canonical("2024-01-31T00:00:00Z")
+        );
+        assert_eq!(
+            eval(json!({"$dateTrunc": {
+                "date": {"$date": "2024-03-07T12:00:00Z"},
+                "unit": "week",
+                "startOfWeek": "monday"
+            }})),
+            canonical("2024-03-04T00:00:00Z")
+        );
+        assert_eq!(
+            eval(json!({"$dateTrunc": {
+                "date": {"$date": "2024-01-01T00:30:00+01:00"},
+                "unit": "day",
+                "timezone": "+01:00"
+            }})),
+            canonical("2023-12-31T23:00:00Z")
+        );
+        assert_eq!(
+            eval(json!({"$dateToString": {
+                "date": {"$date": "2024-03-05T06:07:08.009Z"},
+                "format": "%Y-%m-%d %H:%M:%S.%L %z %Z"
+            }})),
+            json!("2024-03-05 06:07:08.009 +0000 0")
+        );
+        assert_eq!(
+            eval(json!({"$dateToString": {
+                "date": {"$date": "2024-03-05T06:07:08.009Z"},
+                "format": "%H:%M %z %Z",
+                "timezone": "+02:00"
+            }})),
+            json!("08:07 +0200 120")
+        );
+        assert_eq!(
+            eval(json!({"$dateFromString": {
+                "dateString": "2024-03-05T06:07:08.009Z"
+            }})),
+            canonical("2024-03-05T06:07:08.009Z")
+        );
+        assert_eq!(
+            eval(json!({"$dateFromString": {
+                "dateString": "not a date",
+                "onError": "bad"
+            }})),
+            json!("bad")
+        );
+        assert_eq!(
+            eval(json!({"$dateFromString": {
+                "dateString": null,
+                "onNull": "none"
+            }})),
+            json!("none")
+        );
+        assert_eq!(
+            eval(json!({"$dateFromParts": {
+                "year": 2024,
+                "month": 2,
+                "day": 29,
+                "hour": 23,
+                "minute": 45,
+                "second": 12,
+                "millisecond": 345,
+                "timezone": "+02:00"
+            }})),
+            canonical("2024-02-29T21:45:12.345Z")
+        );
+        assert_eq!(
+            eval(json!({"$dateToParts": {
+                "date": {"$date": "2024-02-29T21:45:12.345Z"},
+                "timezone": "+02:00"
+            }})),
+            json!({
+                "year": 2024,
+                "month": 2,
+                "day": 29,
+                "hour": 23,
+                "minute": 45,
+                "second": 12,
+                "millisecond": 345
+            })
+        );
+        assert_eq!(
+            eval(json!({"$dateToParts": {
+                "date": {"$date": "2024-01-01T00:00:00Z"},
+                "iso8601": true
+            }})),
+            json!({
+                "isoWeekYear": 2024,
+                "isoWeek": 1,
+                "isoDayOfWeek": 1,
+                "hour": 0,
+                "minute": 0,
+                "second": 0,
+                "millisecond": 0
+            })
+        );
+        assert!(eval_expr(
+            &doc,
+            &json!({"$dateAdd": {
+                "startDate": "$at",
+                "unit": "fortnight",
+                "amount": 1
+            }})
+        )
+        .is_err());
     }
 
     #[test]

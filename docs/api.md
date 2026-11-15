@@ -1229,8 +1229,14 @@ The expression evaluator supports comparison and boolean operators, arithmetic
 `$objectToArray`, `$arrayToObject`, `$mergeObjects`, string operators
 (`$concat`, `$toLower`, `$toUpper`, `$substr`, `$substrCP`, `$strLenCP`,
 `$split`, `$indexOfCP`, `$trim`/`$ltrim`/`$rtrim`), `$regexMatch`, `$min`,
-`$max`, `$type`, and `$literal`. Variables use `$$name` or `$$name.path`
-syntax inside `$let`, `$map`, `$filter`, and `$reduce`.
+`$max`, `$type`, and `$literal`. Date operators are `$dateAdd`,
+`$dateSubtract`, `$dateTrunc`, `$dateToString`, `$dateFromString`,
+`$dateFromParts`, and `$dateToParts`; time zones use UTC or fixed offsets such
+as `+02:00`. Variables use `$$name` or `$$name.path` syntax inside `$let`,
+`$map`, `$filter`, and `$reduce`.
+
+Date expressions are not yet available for `$dateDiff`, custom
+`$dateFromString` formats, or IANA time zone identifiers.
 
 Regex operands are accepted inside `$in`, `$nin`, and `$all`:
 

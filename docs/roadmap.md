@@ -105,9 +105,10 @@ Implemented:
 - No `$where` or `$text` query operator.
 - `$jsonSchema` supports the common validation keywords but not every JSON
   Schema draft feature.
-- `$expr` uses the aggregation expression evaluator, including variables and
-  common comparison, array, string, and conditional operators. Expression
-  errors do not match the document instead of aborting the query.
+- `$expr` uses the aggregation expression evaluator, including variables,
+  common comparison, array, string, conditional, and date operators. Date time
+  zones support UTC and fixed offsets, not IANA identifiers. Expression errors
+  do not match the document instead of aborting the query.
 - Projection supports top-level fields, `$slice`, and `$elemMatch`; nested
   projections, positional `$`, and `$meta` are not implemented.
 - `$regex` supports `i`, `m`, `s`, `x`, and `u` options, but not MongoDB's

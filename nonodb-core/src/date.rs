@@ -130,7 +130,7 @@ fn number_to_i64(n: &serde_json::Number) -> Option<i64> {
         .or_else(|| n.as_u64().and_then(|v| i64::try_from(v).ok()))
 }
 
-fn parse_rfc3339_ms(raw: &str) -> Option<i64> {
+pub(crate) fn parse_rfc3339_ms(raw: &str) -> Option<i64> {
     let dt = OffsetDateTime::parse(raw, &Rfc3339).ok()?;
     let ms = dt.unix_timestamp_nanos().div_euclid(1_000_000);
     i64::try_from(ms).ok()

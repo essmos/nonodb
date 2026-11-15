@@ -328,7 +328,11 @@ retention semantics.
 - RFC 3339 offsets are normalized, so different offsets for the same instant
   compare equal.
 - Standard `$eq`, `$gte`, `$lt`, `$in`, sorting, and secondary indexes work on
-  dates; no special date operators are needed.
+  dates.
+- Aggregation expressions include `$dateAdd`, `$dateSubtract`, `$dateTrunc`,
+  `$dateToString`, `$dateFromString`, `$dateFromParts`, and `$dateToParts`.
+  Time zones use UTC or fixed `+HH:MM` offsets; IANA zone names are not
+  implemented.
 - Naive local datetimes are rejected as ambiguous.
 
 ```bash

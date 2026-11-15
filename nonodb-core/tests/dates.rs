@@ -467,3 +467,48 @@ fn negative_and_fractional_dates_are_supported() {
         1
     );
 }
+
+#[test]
+fn date_expressions_work_in_find_and_aggregate() {
+    let (_dir, store) = store();
+    let c = store.collection("date_expressions").unwrap();
+    c.insert_one(json!({
+        "_id": "a",
+        "at": {"$date": "2024-01-31T23:45:12.345Z"}
+    }))
+    .unwrap();
+
+    let docs = find(
+        &c,
+        json!({"$expr": {
+            "$eq": [
+                {"$dateTrunc": {"date": "$at", "unit": "day"}},
+                {"$date": "2024-01-31T00:00:00Z"}
+            ]
+        }}),
+    );
+    assert_eq!(docs.len(), 1);
+
+    let docs = c
+        .aggregate(&[json!({"$addFields": {
+            "next_month": {
+                "$dateAdd": {
+                    "startDate": "$at",
+                    "unit": "month",
+                    "amount": 1
+                }
+            },
+            "label": {
+                "$dateToString": {
+                    "date": "$at",
+                    "format": "%Y-%m-%d"
+                }
+            }
+        }})])
+        .unwrap();
+    assert_eq!(
+        docs[0]["next_month"],
+        json!({"$date": {"$numberLong": "1709250312345"}})
+    );
+    assert_eq!(docs[0]["label"], "2024-01-31");
+}
