@@ -1,0 +1,60 @@
+# NonoDB on a small or free-tier VM.
+#
+# This compose file keeps the database on a named Docker volume and exposes
+# only a loopback TCP port by default. Put applications on the same Docker
+# network, use an SSH tunnel, or place a TLS reverse proxy in front when remote
+# clients need access.
+#
+# Prepare the auth registry and start:
+#   mkdir -p config
+#   export NONODB_AUTH_FILE="$PWD/config/auth.json"
+#   docker run --rm -u "$(id -u):$(id -g)" \
+#     -e NONODB_AUTH_FILE=/config/auth.json \
+#     -v "$PWD/config:/config" \
+#     ghcr.io/essmos/nonodb:0.25.0 nonodb-cli auth init
+#   docker run --rm -u "$(id -u):$(id -g)" \
+#     -e NONODB_AUTH_FILE=/config/auth.json \
+#     -v "$PWD/config:/config" \
+#     ghcr.io/essmos/nonodb:0.25.0 nonodb-cli auth token create admin
+#   docker compose -f deploy/docker-compose.free-tier.yml up -d
+#
+# R2/S3 credentials are read from the host environment and passed through.
+# Do not put secrets in this file.
+
+services:
+  nonodb:
+    image: ${NONODB_IMAGE:-ghcr.io/essmos/nonodb:0.25.0}
+    container_name: nonodb
+    restart: unless-stopped
+    environment:
+      NONODB_DATA: /var/lib/nonodb
+      NONODB_PROFILE: ${NONODB_PROFILE:-small}
+      NONODB_AUTH_FILE: /run/secrets/nonodb_auth
+      NONODB_TCP: 0.0.0.0:7878
+      RUST_LOG: ${RUST_LOG:-info}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-auto}
+    ports:
+      # Loopback by default. Set NONODB_BIND=0.0.0.0 only behind a firewall
+      # and a TLS reverse proxy.
+      - "${NONODB_BIND:-127.0.0.1}:7878:7878"
+    secrets:
+      - nonodb_auth
+    volumes:
+      - "${NONODB_DATA_DIR:-nonodb-data}:/var/lib/nonodb"
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/nonodb-cli", "ready"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+
+secrets:
+  nonodb_auth:
+    file: "${NONODB_AUTH_FILE:?Set NONODB_AUTH_FILE to the host auth.json path}"
+
+volumes:
+  nonodb-data:
+    name: nonodb-data

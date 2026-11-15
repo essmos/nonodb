@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "jobs": [
+    {
+      "id": "daily-default",
+      "databases": ["default"],
+      "enabled": true,
+      "every_minutes": 1440,
+      "destination": {
+        "kind": "s3",
+        "endpoint": "https://fra1.digitaloceanspaces.com",
+        "bucket": "nonodb-backups",
+        "region": "fra1",
+        "prefix": "nonodb",
+        "access_key_env": "AWS_ACCESS_KEY_ID",
+        "secret_key_env": "AWS_SECRET_ACCESS_KEY"
+      },
+      "keep_last": 7,
+      "verify": true,
+      "compression": "gzip"
+    }
+  ]
+}

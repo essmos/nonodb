@@ -10,6 +10,8 @@ RuntimeDirectory=nonodb
 Environment=NONODB_DATA=/var/lib/nonodb
 Environment=NONODB_SOCK=/run/nonodb/nonodb.sock
 Environment=RUST_LOG=info
+# On a 512 MB-2 GB VM, uncomment the small-host profile:
+# Environment=NONODB_PROFILE=small
 # Required when NONODB_TCP is enabled:
 # Environment=NONODB_AUTH_FILE=/etc/nonodb/auth.json
 ExecStart=/usr/local/bin/nonodb-daemon

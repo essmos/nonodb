@@ -31,6 +31,7 @@ mod network_api;
 mod node_state;
 mod pairing;
 mod pairing_api;
+mod profile;
 mod protocol;
 mod replication_api;
 mod replicator;
@@ -171,6 +172,8 @@ fn database_from_uri(uri: &Uri) -> String {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    profile::apply().map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+
     // Explicit runtime: limit the blocking thread pool (lower peak VSZ),
     // because LMDB operations run through `spawn_blocking`.
     let blocking_threads = std::env::var("NONODB_BLOCKING_THREADS")
@@ -187,6 +190,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     init_tracing();
+    if let Ok(profile) = std::env::var("NONODB_PROFILE") {
+        if !profile.is_empty() {
+            tracing::info!(profile, "deployment profile active");
+        }
+    }
 
     let data = PathBuf::from(std::env::var("NONODB_DATA").unwrap_or_else(|_| "./data".into()));
     node_state::open(&data)?;

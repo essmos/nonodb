@@ -49,6 +49,7 @@ nonodb is a real document database with:
 - asynchronous primary/replica replication with durable ordered operations, snapshot bootstrap, replicated indexes/history/TTL/events/subscriptions and encrypted vault envelopes, a replicated cluster control plane (auth, backup jobs, database catalog), 8-character one-time pairing, lease-gated writes, quorum promotion, automatic election, partition rejoin, write routing and a cluster-wide GUI;
 - snapshots, scheduled native or restic backups with GUI, gzip/age encryption, backup-info files, local/S3/R2 export, staged import as new databases, online LMDB map growth, authentication, TLS/mTLS, metrics and a CLI;
 - graceful shutdown with in-flight request draining and optional JSON logs;
+- `NONODB_PROFILE=small|tiny` presets for 512 MB–2 GB VMs, with every value still overridable;
 - per-collection document revision history with global revision IDs and configurable retention (`0` disables);
 - document TTL with collection defaults, per-document overrides, and background expiry;
 - optional vault collections with whole-document encryption and per-tenant keys;
@@ -455,6 +456,11 @@ rotation, and best-fit guidance.
 
 ## Quick start
 
+For a free-tier or low-cost VM with persistent storage, see
+[Free-tier and low-cost VM deployment](docs/free-tier-deployment.md). It covers
+Oracle Cloud Always Free, Google Cloud, AWS, and DigitalOcean, the `small`
+profile, and DigitalOcean Spaces backups.
+
 ### Prebuilt binaries
 
 Every tagged release contains ready-to-run binaries. For normal use, download
@@ -734,6 +740,11 @@ instead, use `docker build -t nonodb:local .` and set
 
 More deployment details: [Operations — Docker](docs/operations.md#docker).
 
+For a free-tier or low-cost VM with a persistent volume, see
+[Free-tier and low-cost VM deployment](docs/free-tier-deployment.md). It includes
+the `NONODB_PROFILE=small` tuning, a DigitalOcean Spaces backup job, and the
+supported Cloud Run read-replica shape.
+
 ## GUI console
 
 `nonodb-cli` ships with an embedded local web console:
@@ -793,6 +804,7 @@ documentation.
 | [Replication and cluster guide](docs/replication-cluster-guide.md) | Primary/replica setup, TLS, CLI, GUI Cluster view, quorum failover, monitoring, troubleshooting |
 | [CLI](docs/cli.md) | `ping`, `gui`, `find`, `count`, `map`, `resize`, auth management, backup/verify/restore, `exec` |
 | [Operations](docs/operations.md) | Configuration, deployment, security, snapshots, monitoring, capacity, troubleshooting |
+| [Free-tier and low-cost VM deployment](docs/free-tier-deployment.md) | Oracle Cloud, GCP, AWS, DigitalOcean, small profile, Cloud Run read replicas, Spaces backups |
 | [Backup and restore](docs/backup.md) | Online backup, snapshots, verification, restore drills, retention, Docker, vault keys, authorization state |
 | [Benchmarks](docs/benchmarks.md) | Test environment, throughput, latency, large data sets, RAM, reproducibility |
 | [Development](docs/development.md) | Repository layout, tests, linting, benchmark scripts, contribution notes |

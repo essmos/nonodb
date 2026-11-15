@@ -150,13 +150,9 @@ This runs:
   shutdown drain helpers;
 - Rust client unit/doc tests.
 
-The latest run: **5 auth-crate tests, 135 core unit tests, 23 daemon tests, 5
-property tests, 15 date tests, 11 numeric tests, 8 BSON scalar-type tests, 5
-regex tests, 5 array query tests, 5 array-update tests, 5 find-and-modify tests,
-4 explain tests, 3 sub-database slot tests, 5 online-resize tests, 6
-backup-verification tests, 9 TTL tests, 3 vault tests, 20 SQL tests, 2 SQL parser fuzz tests, 1 reopen
-test, and 2 Rust client unit tests**, all passing (295 total including
-doc-tests).
+The latest run: **7 auth-crate tests, 143 core unit tests, 36 daemon tests,
+126 integration/property tests, 7 Rust client unit tests, and 1 client
+doc-test**, all passing (320 total).
 
 ### End-to-end scripts
 

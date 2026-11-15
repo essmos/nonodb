@@ -37,6 +37,7 @@ secrets.
 | Variable | Default | Description |
 |---|---|---|
 | `NONODB_DATA` | `./data` | Instance root containing `<database>/data.mdb` and `<database>/lock.mdb` |
+| `NONODB_PROFILE` | unset | `small` or `tiny` fills unset small-host defaults; explicit variables win |
 | `NONODB_MAX_OPEN_DATABASES` | `64` | Maximum open LMDB environments/writers; idle databases are evicted |
 | `NONODB_ALLOW_UNSAFE_WRITES` | unset | Enables opt-in `durability:"unsafe"` writes using LMDB `MDB_NOSYNC` |
 | `NONODB_WRITER_WINDOW_US` | `1000` | Group-commit window when the writer has a backlog |
@@ -139,6 +140,32 @@ Client-side environment variables:
 | `NONODB_TLS_CA` | — | Custom CA bundle for verifying the daemon certificate |
 | `NONODB_TLS_CLIENT_CERT` | — | Client certificate for mTLS |
 | `NONODB_TLS_CLIENT_KEY` | — | Private key for `NONODB_TLS_CLIENT_CERT` |
+
+### Small deployment profiles
+
+On a 512 MB–2 GB VM, start with `NONODB_PROFILE=small` or `tiny`. The profile
+only fills variables that are not already set:
+
+```bash
+NONODB_PROFILE=small
+```
+
+| Setting | `small` | `tiny` |
+|---|---:|---:|
+| `NONODB_BLOCKING_THREADS` | 8 | 4 |
+| `NONODB_MAX_OPEN_DATABASES` | 8 | 4 |
+| `NONODB_CACHE_ENTRIES` | 128 | 64 |
+| `NONODB_CACHE_MAX_BYTES` | 65536 | 32768 |
+| `NONODB_SCAN_WORKERS` | 2 | 1 |
+| `NONODB_BACKFILL_WORKERS` | 1 | 1 |
+| `NONODB_AGGREGATE_WORKERS` | 1 | 1 |
+| `NONODB_TTL_SWEEP_INTERVAL` | 10 | 15 |
+| `NONODB_TTL_SWEEP_LIMIT` | 128 | 64 |
+
+The profile does not change `NONODB_MAP_SIZE`. If the database approaches the
+map limit, resize it online. See
+[Free-tier and low-cost VM deployment](free-tier-deployment.md) for a complete
+Docker, Cloud Run read-replica, and DigitalOcean Spaces backup recipe.
 
 `NONODB_MAP_SIZE` controls the maximum size of the memory-mapped database. It
 is **not** a disk or RAM reservation. The file grows as data is written. If the
