@@ -175,9 +175,9 @@ sudo -u nonodb env \
 ```
 
 For a service, install `deploy/nonodb.service`, put the same variables in an
-`EnvironmentFile`, then run `systemctl enable --now nonodb`. The GUI is served
-by the same daemon when enabled; open `http://<node>:7878/gui` and log in with
-the cluster bearer token. See [GUI guide](gui.md).
+`EnvironmentFile`, then run `systemctl enable --now nonodb`. The GUI is a
+separate `nonodb-cli gui` process; it is not served by the daemon. See
+[GUI guide](gui.md).
 
 ### 4.2 How a replica finds the primary after a failover
 
@@ -210,9 +210,10 @@ NONODB_REPLICATION_SEEDS=https://db-1.example.com:7878,https://db-2.example.com:
 NONODB_REPLICATION_VOTER_TOKEN=<cluster-admin-token>
 ```
 
-Prefer pairing for credentials: `nonodb-cli replication join` writes the source
-and token into the hidden collection. Seeds are only addresses; they do not
-grant access.
+Prefer pairing for credentials: `nonodb-cli replication join` writes the source,
+source token, selected databases, poll interval, batch size, and bootstrap mode
+into the hidden collection. You do not need to copy those values into the
+replica environment. Seeds are only addresses; they do not grant access.
 
 ### 4.3 Where replication state is stored
 
@@ -248,10 +249,13 @@ replicating. The role is persisted in the hidden node metadata collection
 `<NONODB_DATA>/.node`; after the first start it wins over
 `NONODB_REPLICATION_ROLE`.
 
-### 5.2 Preferred: pair the replica with an 8-character code
+### 5.2 Preferred: create the replica with a pairing code
 
-The primary creates a one-time code. The replica redeems it and receives a
-cluster credential plus the full control-plane snapshot.
+Pairing is the supported onboarding flow. The primary creates a one-time code;
+the replica redeems it and receives its source, token, database selection,
+poll interval, batch size, bootstrap mode, and the full control-plane snapshot.
+Do not copy `NONODB_REPLICATION_SOURCE` or `NONODB_REPLICATION_SOURCE_TOKEN` into
+the replica environment when you use pairing.
 
 On the primary:
 
@@ -259,23 +263,27 @@ On the primary:
 nonodb-cli replication add-replica replica-eu default
 ```
 
-`pair` is an alias for the same command. It prints a code such as `K7M4-P9QX`,
-valid for 10 minutes, plus the exact `join` command. You can also use
+`pair` is an alias for the same command. It prints an 8-character code such as
+`K7M4P9QX`, valid for 10 minutes, plus the exact `join` command. You can also use
 **GUI → Replication → Add replica**.
 
-On the new replica, with its own `NONODB_AUTH_FILE` already initialized:
+On the new replica, start the daemon first with an empty data directory, its own
+`NONODB_AUTH_FILE`, and the initial replica role. Then run `join` against the
+local daemon socket:
 
 ```bash
+export NONODB_AUTH_FILE=/etc/nonodb/replica-auth.json
 export NONODB_SOCK=/run/nonodb-replica.sock
 nonodb-cli replication join https://primary.example.com:7878 K7M4P9QX
 ```
 
 The code can be passed as the third argument or entered when prompted. The
-daemon:
+local daemon:
 
 1. redeems the code on the primary;
-2. stores the returned source and token in the hidden node metadata collection;
-3. becomes a read-only replica;
+2. installs the returned source, token, databases, poll interval, batch size,
+   and bootstrap mode in the hidden node metadata collection;
+3. demotes itself to a read-only replica if it was a writer;
 4. applies the primary auth registry, backup configuration, and database
    catalog through the control plane;
 5. starts pulling data.
@@ -283,10 +291,24 @@ daemon:
 The old local replica admin token is replaced by the replicated cluster auth
 registry. Use the primary's cluster admin token from then on.
 
+Pairing installs these settings on the replica:
+
+| Installed by `join` | Still configured locally |
+|---|---|
+| source URL | data directory |
+| source token | auth file |
+| initial database list | TCP bind and TLS server identity |
+| poll interval | initial role on first start |
+| batch size | node id |
+| bootstrap mode | advertised replication URL |
+
 The code is single-use, expires after 10 minutes, and is rate-limited. It is an
 8-character code from an unambiguous 32-character alphabet, not 8 digits.
 
-### 5.3 Manual token alternative
+### 5.3 Legacy manual source configuration
+
+Use this only when pairing is not available. It does not install the control
+plane automatically and is not the recommended path.
 
 You can still provision a token manually:
 
@@ -297,8 +319,17 @@ nonodb-cli auth principal add replication admin:db
 nonodb-cli auth token create replication
 ```
 
-Store the printed token in a secret manager or a `0600` environment file. It is
-used by replicas as `NONODB_REPLICATION_SOURCE_TOKEN`.
+Store the printed token in a secret manager or a `0600` environment file. Set
+the source and token explicitly on the replica:
+
+```env
+NONODB_REPLICATION_SOURCE=https://primary.example.com:7878
+NONODB_REPLICATION_SOURCE_TOKEN=__REPLICATION_TOKEN__
+NONODB_REPLICATION_DATABASES=default
+```
+
+A later `replication join` overwrites these values with the values returned by
+the primary.
 
 ### 5.4 Open the network path
 
@@ -312,37 +343,27 @@ Do not expose plaintext replication to the public internet.
 
 ### 5.5 Replica environment
 
-Use a **new, empty data directory**:
+Use a **new, empty data directory**. With pairing, the replica environment only
+needs node-local transport settings:
 
 ```env
 NONODB_DATA=/var/lib/nonodb-replica
 NONODB_TCP=0.0.0.0:7878
 NONODB_AUTH_FILE=/etc/nonodb/replica-auth.json
 
-NONODB_REPLICATION_ENABLED=1
-NONODB_REPLICATION_ORIGIN=replica-eu
+# Initial role only. The role is persisted in .node after the first start.
 NONODB_REPLICATION_ROLE=replica
 NONODB_REPLICATION_NODE_ID=replica-eu
 
-NONODB_REPLICATION_SOURCE=https://primary.example.com:7878
-NONODB_REPLICATION_SOURCE_TOKEN=__REPLICATION_TOKEN__
-
-NONODB_REPLICATION_DATABASES=default
-NONODB_REPLICATION_POLL_INTERVAL=1
-NONODB_REPLICATION_BATCH=20
-NONODB_REPLICATION_BOOTSTRAP=auto
-
+# Optional. Auto-detected on a flat LAN when unset.
 NONODB_REPLICATION_ADVERTISE_URL=https://replica.example.com:7878
 ```
 
-`BATCH=20` is a safe default for large transactions. The older default of 500
-can make a `/v1/replication/changes` response very large when a single write
-transaction contains many documents.
+Do **not** set `NONODB_REPLICATION_SOURCE`,
+`NONODB_REPLICATION_SOURCE_TOKEN`, or `NONODB_REPLICATION_DATABASES` for a
+paired replica. `replication join` installs them from the pairing response.
 
-If you use pairing, `SOURCE` and `SOURCE_TOKEN` are written by
-`replication join`; you do not need to put them in the environment.
-
-Create a local auth file for the replica's own CLI/GUI:
+Create a local auth file before starting the replica daemon:
 
 ```bash
 export NONODB_AUTH_FILE=/etc/nonodb/replica-auth.json
@@ -350,24 +371,37 @@ nonodb-cli auth init
 ```
 
 Do not copy the primary's auth registry unless you intentionally want the same
-tokens on both nodes.
+tokens on both nodes; pairing applies the replicated registry after join.
+
+`NONODB_REPLICATION_BATCH` is selected by the primary and copied into the
+pairing response. Set it on the primary before creating the pairing code when
+the source has very large transactions:
+
+```env
+# On the primary, before creating the pairing code.
+NONODB_REPLICATION_BATCH=20
+```
+
+The older default of 500 can make a `/v1/replication/changes` response very
+large when a single write transaction contains many documents.
 
 ### 5.6 Start and verify
 
-Start the primary first, then the replica.
-
-On the replica:
+Start the primary first, then the replica. On the replica, run `join` only after
+the local daemon is listening on its socket:
 
 ```bash
 export NONODB_SOCK=/run/nonodb.sock
 
+nonodb-cli replication join https://primary.example.com:7878 K7M4P9QX
 nonodb-cli replication status
 nonodb-cli replication changes 0 5
 nonodb-cli replication acks
 nonodb-cli ready
 ```
 
-Expected status:
+The `join` command prints the installed source, node id, databases, and first
+pull result. Expected status:
 
 ```json
 {
@@ -403,16 +437,64 @@ Large databases can take a long time and require temporary disk space.
 
 ### 5.7 Reversed direction
 
-If the server on the other side must be primary, swap the roles:
+If the remote server must be primary, do not reverse any local source settings:
+create the pairing code on the remote primary and redeem it from the local
+replica.
 
 ```text
 remote server = primary, accepts writes
-local server  = replica, pulls from the remote source
+local server  = replica, pulls from the remote primary
 ```
 
-Set `NONODB_REPLICATION_ROLE=replica` and
-`NONODB_REPLICATION_SOURCE=https://remote-primary:7878` on the local node, and
-the primary settings on the remote node.
+Start the local daemon with `NONODB_REPLICATION_ROLE=replica` and its own auth
+file, then run:
+
+```bash
+nonodb-cli replication join https://remote-primary:7878 <pairing-code>
+```
+
+`join` installs the source URL, token, databases, interval, batch, and bootstrap
+mode. You do not set `NONODB_REPLICATION_SOURCE` manually for a paired replica.
+
+### 5.8 Docker replica
+
+For Docker, publish the replica API on a host port and set
+`NONODB_REPLICATION_ADVERTISE_URL` to the Docker host's LAN address. Do not
+advertise the container's `172.x` address; Docker NAT also prevents the
+automatic LAN fallback.
+
+```bash
+docker volume create nonodb-replica-data
+docker volume create nonodb-replica-run
+
+docker run --rm \
+  -v nonodb-replica-data:/var/lib/nonodb \
+  -e NONODB_AUTH_FILE=/var/lib/nonodb/auth.json \
+  ghcr.io/essmos/nonodb:0.25.0-rc.3 \
+  nonodb-cli auth init
+
+docker run -d --name nonodb-replica \
+  -p 7912:7878 \
+  -v nonodb-replica-data:/var/lib/nonodb \
+  -v nonodb-replica-run:/run/nonodb \
+  -e NONODB_AUTH_FILE=/var/lib/nonodb/auth.json \
+  -e NONODB_TCP=0.0.0.0:7878 \
+  -e NONODB_REPLICATION_ROLE=replica \
+  -e NONODB_REPLICATION_NODE_ID=replica-docker \
+  -e NONODB_REPLICATION_ADVERTISE_URL=http://DOCKER_HOST_IP:7912 \
+  ghcr.io/essmos/nonodb:0.25.0-rc.3
+
+docker exec nonodb-replica nonodb-cli replication join \
+  http://PRIMARY_HOST:7878 PAIRING-CODE
+
+docker exec nonodb-replica nonodb-cli replication status
+```
+
+Replace `DOCKER_HOST_IP` with the Docker host's LAN address,
+`PRIMARY_HOST` with the primary's daemon API host (not the GUI proxy), and
+`PAIRING-CODE` with the code created on the primary. The join command runs
+inside the container because it talks to the local daemon socket. See
+[GUI guide](gui.md#add-a-replica-from-the-gui) for the same steps in the GUI.
 
 ## 6. TLS and mTLS
 
@@ -434,8 +516,10 @@ NONODB_TLS_CLIENT_AUTH=required
 
 ### 6.3 Replica client settings
 
+The source URL and token are installed by `replication join`. Only the TLS
+client material is configured locally:
+
 ```env
-NONODB_REPLICATION_SOURCE=https://primary.example.com:7878
 NONODB_REPLICATION_CA_FILE=/etc/nonodb/tls/ca.crt
 NONODB_REPLICATION_CERT_FILE=/etc/nonodb/tls/replica.crt
 NONODB_REPLICATION_KEY_FILE=/etc/nonodb/tls/replica.key
@@ -463,6 +547,9 @@ nonodb-cli replication source https://primary.example.com:7878 default,app1 1
 nonodb-cli replication prune 1234 --require-acks
 nonodb-cli replication promote <epoch>
 nonodb-cli replication demote <epoch> replica [successor-url]
+nonodb-cli instances
+nonodb-cli --instance <pid|node_id> replication status
+nonodb-cli --socket /run/nonodb-replica.sock replication status
 ```
 
 | Command | Purpose |
@@ -483,6 +570,9 @@ nonodb-cli replication demote <epoch> replica [successor-url]
 | `join <primary-url> [code]` | Redeem a code on the replica and install the source/control plane. |
 | `promote <epoch>` | Manual promotion. Requires the expected epoch. |
 | `demote <epoch> replica [successor]` | Manual demotion, optionally advertising a successor. |
+| `instances` | List registered local daemons with node id, role, socket, TCP, advertise URL, and data directory. |
+| `--instance <pid\|node_id>` | Send a CLI command to a specific registered daemon. |
+| `--socket <path>` | Send a CLI command to a specific daemon socket. |
 
 The CLI does **not** configure voters, followers, leases, candidate priorities,
 TLS paths, or retention. Those are startup environment settings.
@@ -493,13 +583,13 @@ TLS paths, or retention. Those are startup environment settings.
 |---|---|---|
 | `NONODB_REPLICATION_ENABLED` | `0` | Enable durable log capture on a writer. |
 | `NONODB_REPLICATION_ORIGIN` | node id / `local` | Stable writer identity. |
-| `NONODB_REPLICATION_ROLE` | `primary` | Seeds the hidden role state: `primary`, `replica`, or `standby`. |
+| `NONODB_REPLICATION_ROLE` | `primary` | Seeds the hidden role state on first start: `primary`, `replica`, or `standby`. Pairing demotes a writer to replica. |
 | `NONODB_REPLICATION_NODE_ID` | node id / `local` | Replica identity used in acks. |
-| `NONODB_REPLICATION_SOURCE` | unset | Source base URL. |
-| `NONODB_REPLICATION_SOURCE_TOKEN` | unset | Bearer token for source replication API. |
-| `NONODB_REPLICATION_DATABASES` | `default` | Comma-separated databases to pull. |
+| `NONODB_REPLICATION_SOURCE` | unset | Source base URL. Legacy manual configuration; `join` installs it automatically. |
+| `NONODB_REPLICATION_SOURCE_TOKEN` | unset | Bearer token for source replication API. Legacy manual configuration; `join` installs it automatically. |
+| `NONODB_REPLICATION_DATABASES` | `default` | Comma-separated databases to pull. Legacy manual configuration; pairing selects them on the primary. |
 | `NONODB_REPLICATION_POLL_INTERVAL` | `1` | Seconds between pulls. |
-| `NONODB_REPLICATION_BATCH` | `500` | Transactions per `/changes` request, clamped to 1–1000. |
+| `NONODB_REPLICATION_BATCH` | `500` | Transactions per `/changes` request, clamped to 1–1000. Pairing copies the primary's value to the replica. |
 | `NONODB_REPLICATION_BOOTSTRAP` | `auto` | `auto`, `always`, or `never`. |
 | `NONODB_REPLICATION_EXIT_ON_GAP` | `0` | Ask the supervisor to restart on a runtime gap so startup can resync. |
 | `NONODB_REPLICATION_ADVERTISE_URL` | unset | Public URL used for write routing and promotion. Replicas auto-detect a LAN URL from the actual TCP listener or `NONODB_TCP` and the route to the primary when unset. |
@@ -520,6 +610,7 @@ TLS paths, or retention. Those are startup environment settings.
 | `NONODB_REPLICATION_CERT_FILE` | unset | Client certificate for source mTLS. |
 | `NONODB_REPLICATION_KEY_FILE` | unset | Client private key. |
 | `NONODB_CLUSTER_PRUNE_DATABASES` | `1` | Drop local non-default databases that disappear from the replicated catalog. Set `0` to keep them. |
+| `NONODB_INSTANCE_DIR` | platform runtime dir | Per-user instance registry directory used by `nonodb-cli instances`. |
 
 ## 8. Quorum and failover
 
@@ -665,13 +756,22 @@ The **Replication** page on a primary contains an **Add replica** panel:
 
 1. enter the replica name and initial databases;
 2. choose **Create pairing code**;
-3. copy the 8-character code, then on the new node start the daemon with
-   `NONODB_REPLICATION_ROLE=replica` and run
-   `nonodb-cli replication join <primary-api-url> <code>` (or paste the code
-   when prompted). Use the URL shown under **Write URL** (default daemon port
-   `7878`; a custom `NONODB_TCP` port is valid). Do **not** use the GUI proxy
-   port (`8787` by default) — `replication join` talks to the daemon API;
+3. copy the 8-character code, then on the new node start the daemon with an
+   empty data directory, its own `NONODB_AUTH_FILE`, and
+   `NONODB_REPLICATION_ROLE=replica`. Do not set source or source-token
+   variables. Run `nonodb-cli replication join <primary-api-url> <code>` (or
+   paste the code when prompted). Use the URL shown under **Write URL** (default
+   daemon port `7878`; a custom `NONODB_TCP` port is valid). Do **not** use the
+   GUI proxy port (`8787` by default) — `replication join` talks to the local
+   daemon, and the local daemon contacts the primary;
 4. the pending list shows unused codes and lets you revoke them.
+
+If more than one daemon runs on the host, select the replica with
+`nonodb-cli --instance <pid|node_id> replication join ...` or
+`nonodb-cli --socket <path> replication join ...`. See `nonodb-cli instances`.
+
+Docker requires an explicit `NONODB_REPLICATION_ADVERTISE_URL` on a host port;
+see [Docker replica](#58-docker-replica).
 
 ![Add replica panel with the join command and Write URL](assets/gui/replication-add-replica.png)
 
@@ -742,7 +842,7 @@ After disconnecting, **Remove replica** on the primary deletes the ACK and block
 that node id. A live replica gets `403 replica_removed` until a new pairing code
 is redeemed for the same id.
 
-### 9.6 Network tab
+### 9.7 Network tab
 
 A replica should set `NONODB_REPLICATION_ADVERTISE_URL` to an address reachable
 from the primary/GUI host. The URL is carried in replication acknowledgements.
@@ -766,7 +866,7 @@ Firewall apply is opt-in with `NONODB_FIREWALL_MANAGE=1`; on a non-root service
 use `NONODB_FIREWALL_SUDO=1` with passwordless sudo. The managed table is
 separate from SSH and general host policy. See [Operations](operations.md#host-firewall-nftables).
 
-## 10. Monitoring## 10. Monitoring
+## 10. Monitoring
 
 Prometheus exposes replication metrics at `/metrics/prometheus` with a
 `metrics:read`, `admin:db`, or `*:*` token. JSON metrics are also available at
@@ -827,11 +927,14 @@ Keep both. Take regular snapshots even when a replica is healthy.
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | `connect: No such file or directory` on `replication join` | Local replica daemon/socket is missing, or `NONODB_SOCK` is wrong | Start the replica daemon and set `NONODB_SOCK` to its socket. `join` talks to the local daemon; the primary URL is only the source. On macOS/Linux use the Unix socket, not `NONODB_URL`. |
+| `join` connects to the wrong daemon | More than one daemon is running on the host | Run `nonodb-cli instances`, then select one with `--instance <pid\|node_id>` or `--socket <path>`. |
+| Source/token variables seem ignored | Pairing installs the source and token itself | Remove stale `NONODB_REPLICATION_SOURCE` and `NONODB_REPLICATION_SOURCE_TOKEN` from a paired replica. A later `join` overwrites the stored values. |
+| Replica has an ACK but the GUI shows no metrics | Advertised URL is missing or unreachable | Set `NONODB_REPLICATION_ADVERTISE_URL` to the replica's reachable host address. Docker/NAT cannot use the automatic fallback; never advertise the container `172.x` address. |
 | `401 unauthorized` / `403 forbidden` on replication | Source token missing or lacks `admin:db` | Create a dedicated `admin:db` token on the source. |
 | `read_only` on every write | Node is a replica/standby | Write to primary or promote the node. |
 | `promotion_ready=false` | Candidate is behind the last observed source head | Wait for lag to reach zero; check `/v1/replication/changes`. |
 | `replication gap` or snapshot resync loop | Source log gap or pruned records | Use `BOOTSTRAP=auto`, allow snapshot; keep enough retention. |
-| Large memory spike on primary | `/changes` response is too large | Set `NONODB_REPLICATION_BATCH=10` or `20`, reduce write batch size. |
+| Large memory spike on primary | `/changes` response is too large | Set `NONODB_REPLICATION_BATCH=10` or `20` on the primary before creating the pairing code; reduce write batch size. |
 | High lag during bulk load | Replica index build or disk I/O | Check apply errors, disk, index progress; increase poll frequency only after fixing the bottleneck. |
 | Transport error points at an old node | Historical error from before source switch | Check `last_success_unix`; the GUI hides stale errors. |
 | `epoch_mismatch` | Manual promote/demote used a stale epoch | Read current epoch from `replication status` and retry. |

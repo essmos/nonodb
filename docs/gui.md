@@ -398,9 +398,17 @@ but a non-default `NONODB_TCP` port is valid. Never use the GUI proxy port
 
 ![Pairing code and generated join command](assets/gui/replication-pairing.png)
 
-5. On the new node, start the daemon with `NONODB_REPLICATION_ROLE=replica` and
-   its own empty `NONODB_DATA`.
-6. Run the copied command:
+5. On the new node, create its own auth file, then start the daemon with
+   `NONODB_REPLICATION_ROLE=replica` and an empty `NONODB_DATA`:
+
+   ```bash
+   NONODB_AUTH_FILE=/etc/nonodb/replica-auth.json nonodb-cli auth init
+   ```
+
+   Do not set `NONODB_REPLICATION_SOURCE`,
+   `NONODB_REPLICATION_SOURCE_TOKEN`, or `NONODB_REPLICATION_DATABASES` for a
+   paired replica. The join command installs them from the primary.
+6. Run the copied command against the local replica daemon:
 
    ```bash
    NONODB_SOCK=/run/nonodb-replica.sock \
