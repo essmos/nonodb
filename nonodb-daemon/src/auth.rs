@@ -306,9 +306,14 @@ fn has_enabled_admin(file: &AuthFile) -> bool {
         .principals
         .iter()
         .filter(|(name, def)| {
-            Principal::new((*name).clone(), &def.scopes)
-                .map(|principal| principal.allows_admin_database())
-                .unwrap_or(false)
+            // Internal cluster credentials must not satisfy the "last human
+            // administrator" guard. Otherwise a generated peer/replica token
+            // could silently outlive the last operator-managed admin token.
+            *name != "cluster-peer"
+                && !name.starts_with("replica-")
+                && Principal::new((*name).clone(), &def.scopes)
+                    .map(|principal| principal.allows_admin_database())
+                    .unwrap_or(false)
         })
         .map(|(name, _)| name.as_str())
         .collect();
