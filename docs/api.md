@@ -973,9 +973,10 @@ Joins documents from another collection:
 - An optional `pipeline` runs on the matching foreign documents. A pipeline-only
   lookup (no `localField`/`foreignField`) scans the foreign collection and then
   applies the pipeline.
+- `let` binds per-input-document variables that the sub-pipeline can read as
+  `$$name`, including inside `$expr`.
+- Nested `$lookup` stages are supported in the sub-pipeline.
 - Missing foreign collections produce empty arrays.
-- `let` variables and a nested `$lookup` inside the lookup sub-pipeline are not
-  supported.
 - The result is written to `as` as an array. The aggregate intermediate-document
   limit still applies.
 
@@ -986,8 +987,7 @@ Joins documents from another collection:
 - The normal request timeout (30 seconds by default) applies.
 - Response size is still limited by the HTTP response path and the client's
   practical memory; use `$limit` and `$project` for large collections.
-- Not supported: `$graphLookup`, `$lookup` `let` variables, nested `$lookup`
-  inside a lookup sub-pipeline, `$merge`, `$out`, window functions, and
+- Not supported: `$graphLookup`, `$merge`, `$out`, window functions, and
   arbitrary JavaScript.
 
 ## sql

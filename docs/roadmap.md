@@ -98,11 +98,10 @@ Implemented:
 ### Query language
 
 - The aggregation pipeline is bounded by `NONODB_AGGREGATE_MAX_DOCS` (default
-  100,000 intermediate documents). It supports basic equality `$lookup` joins,
-  `$facet`, `$bucket`, and `$bucketAuto`, but not `$graphLookup`, `$lookup`
-  `let` variables, nested `$lookup` inside a lookup sub-pipeline, or write
-  stages (`$merge`, `$out`). Group state is held in memory; there is no disk
-  spill.
+  100,000 intermediate documents). It supports equality `$lookup` joins,
+  `$lookup` `let` variables, nested lookups, `$facet`, `$bucket`, and
+  `$bucketAuto`, but not `$graphLookup` or write stages (`$merge`, `$out`).
+  Group state is held in memory; there is no disk spill.
 - No `$where` or `$text` query operator.
 - `$jsonSchema` supports the common validation keywords but not every JSON
   Schema draft feature.

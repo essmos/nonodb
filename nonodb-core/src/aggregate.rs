@@ -19,7 +19,8 @@ use crate::collection::compare_docs;
 use crate::date;
 use crate::error::{Error, Result};
 use crate::numeric;
-use crate::query::{matches, path};
+use crate::query::matcher::matches_with_vars;
+use crate::query::path;
 
 /// Default maximum number of documents allowed in an intermediate aggregation
 /// result. Override with `NONODB_AGGREGATE_MAX_DOCS`.
@@ -274,19 +275,34 @@ fn is_doc_local_stage(name: &str) -> bool {
 
 /// Host callback used by stages that need access to another collection.
 pub(crate) trait AggregateHost {
-    fn lookup(&self, docs: Vec<Value>, spec: &Value) -> Result<Vec<Value>>;
+    fn lookup(
+        &self,
+        docs: Vec<Value>,
+        spec: &Value,
+        vars: &BTreeMap<String, Value>,
+    ) -> Result<Vec<Value>>;
 }
 
 /// Runs a pipeline over already selected documents.
 pub fn run(docs: Vec<Value>, pipeline: &[Value], max_docs: usize) -> Result<Vec<Value>> {
-    run_with_host(docs, pipeline, max_docs, None)
+    run_with_host_vars(docs, pipeline, max_docs, None, &BTreeMap::new())
 }
 
 pub(crate) fn run_with_host(
+    docs: Vec<Value>,
+    pipeline: &[Value],
+    max_docs: usize,
+    host: Option<&dyn AggregateHost>,
+) -> Result<Vec<Value>> {
+    run_with_host_vars(docs, pipeline, max_docs, host, &BTreeMap::new())
+}
+
+pub(crate) fn run_with_host_vars(
     mut docs: Vec<Value>,
     pipeline: &[Value],
     max_docs: usize,
     host: Option<&dyn AggregateHost>,
+    vars: &BTreeMap<String, Value>,
 ) -> Result<Vec<Value>> {
     // A terminal `$count` does not need the transformed documents. Apply the
     // cardinality-preserving stages one document at a time and keep only the
@@ -297,7 +313,7 @@ pub(crate) fn run_with_host(
             for stage in &pipeline[..pipeline.len() - 1] {
                 let (name, arg) = parse_stage(stage)?;
                 doc = match name {
-                    "$project" => project(doc, arg)?,
+                    "$project" => project(doc, arg, vars)?,
                     "$unset" => unset_fields(doc, arg)?,
                     "$sort" => doc,
                     _ => unreachable!("validated cardinality-preserving stage"),
@@ -338,11 +354,11 @@ pub(crate) fn run_with_host(
                     let (name, arg) = parse_stage(stage)?;
                     doc = match name {
                         "$match" => {
-                            keep = matches(&doc, arg);
+                            keep = matches_with_vars(&doc, arg, vars);
                             doc
                         }
-                        "$project" => project(doc, arg)?,
-                        "$addFields" | "$set" => add_fields(doc, arg)?,
+                        "$project" => project(doc, arg, vars)?,
+                        "$addFields" | "$set" => add_fields(doc, arg, vars)?,
                         "$unset" => unset_fields(doc, arg)?,
                         _ => unreachable!("document-local stage"),
                     };
@@ -402,7 +418,7 @@ pub(crate) fn run_with_host(
                         .ok_or_else(|| Error::Query("$replaceRoot requires `newRoot`".into()))?;
                     docs = docs
                         .into_iter()
-                        .map(|doc| match eval_expr(&doc, expression)? {
+                        .map(|doc| match eval_expr_vars(&doc, expression, vars)? {
                             value @ Value::Object(_) => Ok(value),
                             _ => Err(Error::Query(
                                 "$replaceRoot expression must evaluate to an object".into(),
@@ -414,7 +430,7 @@ pub(crate) fn run_with_host(
                 "$replaceWith" => {
                     docs = docs
                         .into_iter()
-                        .map(|doc| match eval_expr(&doc, arg)? {
+                        .map(|doc| match eval_expr_vars(&doc, arg, vars)? {
                             value @ Value::Object(_) => Ok(value),
                             _ => Err(Error::Query(
                                 "$replaceWith expression must evaluate to an object".into(),
@@ -441,7 +457,7 @@ pub(crate) fn run_with_host(
                             Value::Object(Map::from_iter([("$sum".to_string(), Value::from(1))])),
                         ),
                     ]));
-                    docs = group(docs, &group_arg)?;
+                    docs = group(docs, &group_arg, vars)?;
                     let sort = parse_sort(&Value::Object(Map::from_iter([
                         ("count".to_string(), Value::from(-1)),
                         ("_id".to_string(), Value::from(1)),
@@ -453,7 +469,7 @@ pub(crate) fn run_with_host(
                     let host = host.ok_or_else(|| {
                         Error::Query("$lookup requires a collection-aware host".into())
                     })?;
-                    docs = host.lookup(docs, arg)?;
+                    docs = host.lookup(docs, arg, vars)?;
                     i += 1;
                 }
                 "$facet" => {
@@ -474,15 +490,15 @@ pub(crate) fn run_with_host(
                     i += 1;
                 }
                 "$bucket" => {
-                    docs = bucket(docs, arg)?;
+                    docs = bucket(docs, arg, vars)?;
                     i += 1;
                 }
                 "$bucketAuto" => {
-                    docs = bucket_auto(docs, arg)?;
+                    docs = bucket_auto(docs, arg, vars)?;
                     i += 1;
                 }
                 "$group" => {
-                    docs = group(docs, arg)?;
+                    docs = group(docs, arg, vars)?;
                     i += 1;
                 }
                 "$count" => {
@@ -563,7 +579,7 @@ fn is_inclusion(value: &Value) -> bool {
     matches!(value, Value::Bool(true)) || value.as_f64().is_some_and(|n| n == 1.0)
 }
 
-fn project(doc: Value, spec: &Value) -> Result<Value> {
+fn project(doc: Value, spec: &Value, vars: &BTreeMap<String, Value>) -> Result<Value> {
     let spec = spec
         .as_object()
         .ok_or_else(|| Error::Query("$project requires an object".into()))?;
@@ -584,7 +600,7 @@ fn project(doc: Value, spec: &Value) -> Result<Value> {
                 if is_exclusion(value) || is_inclusion(value) {
                     continue;
                 }
-                let value = eval_expr(&doc, value)?;
+                let value = eval_expr_vars(&doc, value, vars)?;
                 path::set(&mut out, field, value)?;
                 continue;
             }
@@ -594,7 +610,7 @@ fn project(doc: Value, spec: &Value) -> Result<Value> {
             let value = if is_inclusion(value) {
                 path::get(&doc, field).cloned().unwrap_or(Value::Null)
             } else {
-                eval_expr(&doc, value)?
+                eval_expr_vars(&doc, value, vars)?
             };
             path::set(&mut out, field, value)?;
         }
@@ -610,7 +626,7 @@ fn project(doc: Value, spec: &Value) -> Result<Value> {
     }
 }
 
-fn add_fields(mut doc: Value, spec: &Value) -> Result<Value> {
+fn add_fields(mut doc: Value, spec: &Value, vars: &BTreeMap<String, Value>) -> Result<Value> {
     let spec = spec
         .as_object()
         .ok_or_else(|| Error::Query("$addFields requires an object".into()))?;
@@ -618,7 +634,7 @@ fn add_fields(mut doc: Value, spec: &Value) -> Result<Value> {
     // expressions must not observe fields added by earlier entries.
     let mut updates = Vec::with_capacity(spec.len());
     for (field, expr) in spec {
-        updates.push((field, eval_expr(&doc, expr)?));
+        updates.push((field, eval_expr_vars(&doc, expr, vars)?));
     }
     for (field, value) in updates {
         path::set(&mut doc, field, value)?;
@@ -747,6 +763,7 @@ pub(crate) struct GroupBuilder {
     id_expr: Value,
     accumulators: Vec<(String, String, Value)>,
     groups: BTreeMap<String, GroupState>,
+    vars: BTreeMap<String, Value>,
 }
 
 #[derive(Default)]
@@ -757,6 +774,10 @@ struct GroupState {
 
 impl GroupBuilder {
     pub(crate) fn new(spec: &Value) -> Result<Self> {
+        Self::new_with_vars(spec, &BTreeMap::new())
+    }
+
+    pub(crate) fn new_with_vars(spec: &Value, vars: &BTreeMap<String, Value>) -> Result<Self> {
         let spec = spec
             .as_object()
             .ok_or_else(|| Error::Query("$group requires an object".into()))?;
@@ -800,6 +821,7 @@ impl GroupBuilder {
             id_expr,
             accumulators,
             groups: BTreeMap::new(),
+            vars: vars.clone(),
         })
     }
 
@@ -814,7 +836,7 @@ impl GroupBuilder {
     }
 
     pub(crate) fn update(&mut self, doc: Value) -> Result<()> {
-        let id = eval_expr(&doc, &self.id_expr)?;
+        let id = eval_expr_vars(&doc, &self.id_expr, &self.vars)?;
         let key = serde_json::to_string(&id)?;
         let group = self.groups.entry(key).or_insert_with(|| GroupState {
             id: id.clone(),
@@ -828,7 +850,7 @@ impl GroupBuilder {
             let value = if op == "$count" {
                 Value::Null
             } else {
-                eval_expr(&doc, arg)?
+                eval_expr_vars(&doc, arg, &self.vars)?
             };
             state.update(op, &value)?;
         }
@@ -907,7 +929,7 @@ fn with_bucket_key(mut doc: Value, key: Value) -> Result<Value> {
     Ok(doc)
 }
 
-fn bucket(docs: Vec<Value>, spec: &Value) -> Result<Vec<Value>> {
+fn bucket(docs: Vec<Value>, spec: &Value, vars: &BTreeMap<String, Value>) -> Result<Vec<Value>> {
     let spec = spec
         .as_object()
         .ok_or_else(|| Error::Query("$bucket requires an object".into()))?;
@@ -940,9 +962,9 @@ fn bucket(docs: Vec<Value>, spec: &Value) -> Result<Vec<Value>> {
         }
     }
     let group_spec = bucket_output_spec(spec.get("output"))?;
-    let mut builder = GroupBuilder::new(&group_spec)?;
+    let mut builder = GroupBuilder::new_with_vars(&group_spec, vars)?;
     for doc in docs {
-        let value = eval_expr(&doc, group_by)?;
+        let value = eval_expr_vars(&doc, group_by, vars)?;
         let mut bucket = None;
         for pair in boundaries.windows(2) {
             if compare_value(&value, &pair[0]) != Ordering::Less
@@ -980,7 +1002,11 @@ fn bucket(docs: Vec<Value>, spec: &Value) -> Result<Vec<Value>> {
     Ok(out)
 }
 
-fn bucket_auto(docs: Vec<Value>, spec: &Value) -> Result<Vec<Value>> {
+fn bucket_auto(
+    docs: Vec<Value>,
+    spec: &Value,
+    vars: &BTreeMap<String, Value>,
+) -> Result<Vec<Value>> {
     let spec = spec
         .as_object()
         .ok_or_else(|| Error::Query("$bucketAuto requires an object".into()))?;
@@ -997,14 +1023,14 @@ fn bucket_auto(docs: Vec<Value>, spec: &Value) -> Result<Vec<Value>> {
     let group_spec = bucket_output_spec(spec.get("output"))?;
     let mut entries = docs
         .into_iter()
-        .map(|doc| Ok((eval_expr(&doc, group_by)?, doc)))
+        .map(|doc| Ok((eval_expr_vars(&doc, group_by, vars)?, doc)))
         .collect::<Result<Vec<_>>>()?;
     if entries.is_empty() {
         return Ok(Vec::new());
     }
     entries.sort_by(|a, b| compare_value(&a.0, &b.0));
     let groups = buckets.min(entries.len());
-    let mut builder = GroupBuilder::new(&group_spec)?;
+    let mut builder = GroupBuilder::new_with_vars(&group_spec, vars)?;
     for index in 0..groups {
         let start = index * entries.len() / groups;
         let end = (index + 1) * entries.len() / groups;
@@ -1035,8 +1061,8 @@ fn bucket_auto(docs: Vec<Value>, spec: &Value) -> Result<Vec<Value>> {
     Ok(out)
 }
 
-fn group(docs: Vec<Value>, spec: &Value) -> Result<Vec<Value>> {
-    let mut builder = GroupBuilder::new(spec)?;
+fn group(docs: Vec<Value>, spec: &Value, vars: &BTreeMap<String, Value>) -> Result<Vec<Value>> {
+    let mut builder = GroupBuilder::new_with_vars(spec, vars)?;
     for doc in docs {
         builder.update(doc)?;
     }
@@ -1336,7 +1362,11 @@ pub(crate) fn eval_expr(doc: &Value, expr: &Value) -> Result<Value> {
     eval_expr_vars(doc, expr, &BTreeMap::new())
 }
 
-fn eval_expr_vars(doc: &Value, expr: &Value, vars: &BTreeMap<String, Value>) -> Result<Value> {
+pub(crate) fn eval_expr_vars(
+    doc: &Value,
+    expr: &Value,
+    vars: &BTreeMap<String, Value>,
+) -> Result<Value> {
     match expr {
         Value::String(s) if s == "$$ROOT" || s == "$$CURRENT" => Ok(doc.clone()),
         Value::String(s) if s.starts_with("$$") => {

@@ -10,6 +10,7 @@
 
 use serde_json::Value;
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 
 use crate::bson_types;
 use crate::date;
@@ -20,43 +21,56 @@ use crate::regex;
 
 /// Does the document match the filter? A non-object filter matches everything.
 pub fn matches(doc: &Value, filter: &Value) -> bool {
+    matches_with_vars(doc, filter, &BTreeMap::new())
+}
+
+/// Matches a filter with aggregation variables available to `$expr`.
+pub(crate) fn matches_with_vars(
+    doc: &Value,
+    filter: &Value,
+    vars: &BTreeMap<String, Value>,
+) -> bool {
     let Some(obj) = filter.as_object() else {
         return true;
     };
     obj.iter().all(|(key, cond)| match key.as_str() {
         "$and" => cond
             .as_array()
-            .is_some_and(|arr| arr.iter().all(|f| matches(doc, f))),
+            .is_some_and(|arr| arr.iter().all(|f| matches_with_vars(doc, f, vars))),
         "$or" => cond
             .as_array()
-            .is_some_and(|arr| arr.iter().any(|f| matches(doc, f))),
+            .is_some_and(|arr| arr.iter().any(|f| matches_with_vars(doc, f, vars))),
         "$nor" => cond
             .as_array()
-            .is_some_and(|arr| !arr.iter().any(|f| matches(doc, f))),
+            .is_some_and(|arr| !arr.iter().any(|f| matches_with_vars(doc, f, vars))),
         // `$expr` evaluates an aggregation expression against the document.
-        "$expr" => crate::aggregate::eval_expr(doc, cond)
+        "$expr" => crate::aggregate::eval_expr_vars(doc, cond, vars)
             .ok()
             .is_some_and(|value| crate::aggregate::truthy(&value)),
         "$jsonSchema" => crate::query::schema::matches(doc, cond),
         // `$not` at filter level: negates the whole subfilter.
-        "$not" => !matches(doc, cond),
+        "$not" => !matches_with_vars(doc, cond, vars),
         _ => {
             if key.contains('.') {
                 let values = path::get_values(doc, key);
                 if values.len() > 1 {
                     let array = Value::Array(values.into_iter().cloned().collect());
-                    match_field(Some(&array), cond)
+                    match_field_vars(Some(&array), cond, vars)
                 } else {
-                    match_field(values.first().copied(), cond)
+                    match_field_vars(values.first().copied(), cond, vars)
                 }
             } else {
-                match_field(doc.get(key), cond)
+                match_field_vars(doc.get(key), cond, vars)
             }
         }
     })
 }
 
 pub(crate) fn match_field(actual: Option<&Value>, cond: &Value) -> bool {
+    match_field_vars(actual, cond, &BTreeMap::new())
+}
+
+fn match_field_vars(actual: Option<&Value>, cond: &Value, vars: &BTreeMap<String, Value>) -> bool {
     // Extended JSON dates are objects, not operators.
     if date::is_date(cond) || numeric::is_numeric(cond) || bson_types::is_bson_value(cond) {
         return eq_opt(actual, cond);
@@ -70,16 +84,23 @@ pub(crate) fn match_field(actual: Option<&Value>, cond: &Value) -> bool {
                 return ops
                     .iter()
                     .filter(|(op, _)| op.as_str() != "$regex" && op.as_str() != "$options")
-                    .all(|(op, arg)| match_simple_op(actual, op, arg));
+                    .all(|(op, arg)| match_simple_op(actual, op, arg, vars));
             }
-            return ops.iter().all(|(op, arg)| match_simple_op(actual, op, arg));
+            return ops
+                .iter()
+                .all(|(op, arg)| match_simple_op(actual, op, arg, vars));
         }
     }
     // Plain equality: { "name": "Ala" }.
     eq_opt(actual, cond)
 }
 
-fn match_simple_op(actual: Option<&Value>, op: &str, arg: &Value) -> bool {
+fn match_simple_op(
+    actual: Option<&Value>,
+    op: &str,
+    arg: &Value,
+    vars: &BTreeMap<String, Value>,
+) -> bool {
     match op {
         "$eq" => eq_opt(actual, arg),
         "$ne" => !eq_opt(actual, arg),
@@ -105,12 +126,12 @@ fn match_simple_op(actual: Option<&Value>, op: &str, arg: &Value) -> bool {
         "$bitsAnySet" => bits_opt(actual, arg, BitTest::AnySet),
         "$all" => all_opt(actual, arg),
         "$size" => size_opt(actual, arg),
-        "$elemMatch" => elem_match_opt(actual, arg),
+        "$elemMatch" => elem_match_opt(actual, arg, vars),
         "$type" => actual.is_some_and(|v| bson_types::type_matches(v, arg)),
         "$near" | "$nearSphere" => geo::match_near(actual, arg),
         "$geoWithin" => geo::match_within(actual, arg),
         "$geoIntersects" => geo::match_intersects(actual, arg),
-        "$not" => !match_field(actual, arg),
+        "$not" => !match_field_vars(actual, arg, vars),
         _ => false,
     }
 }
@@ -234,17 +255,23 @@ fn size_opt(actual: Option<&Value>, arg: &Value) -> bool {
     matches!(actual, Some(Value::Array(items)) if items.len() == size)
 }
 
-fn elem_match_opt(actual: Option<&Value>, arg: &Value) -> bool {
+fn elem_match_opt(actual: Option<&Value>, arg: &Value, vars: &BTreeMap<String, Value>) -> bool {
     let Some(Value::Array(items)) = actual else {
         return false;
     };
     if arg.as_object().is_some_and(|o| o.is_empty()) {
         return !items.is_empty();
     }
-    items.iter().any(|item| elem_item_matches(item, arg))
+    items
+        .iter()
+        .any(|item| elem_item_matches_vars(item, arg, vars))
 }
 
 pub(crate) fn elem_item_matches(item: &Value, arg: &Value) -> bool {
+    elem_item_matches_vars(item, arg, &BTreeMap::new())
+}
+
+fn elem_item_matches_vars(item: &Value, arg: &Value, vars: &BTreeMap<String, Value>) -> bool {
     let Some(query) = arg.as_object() else {
         return false;
     };
@@ -252,9 +279,9 @@ pub(crate) fn elem_item_matches(item: &Value, arg: &Value) -> bool {
         return true;
     }
     if elem_match_uses_filter(query) {
-        matches(item, arg)
+        matches_with_vars(item, arg, vars)
     } else {
-        match_field(Some(item), arg)
+        match_field_vars(Some(item), arg, vars)
     }
 }
 

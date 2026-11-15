@@ -134,8 +134,7 @@ provide:
   [replication and cluster guide](docs/replication-cluster-guide.md);
 - general interactive multi-document transactions;
 - MongoDB wire-protocol compatibility;
-- recursive joins (`$graphLookup`), full `$lookup` features (`let` variables),
-  or aggregation write stages (`$merge`/`$out`);
+- recursive joins (`$graphLookup`) or aggregation write stages (`$merge`/`$out`);
 - a role hierarchy or inherited groups; authorization uses principals and
   database-qualified scopes;
 - the full MongoDB query and update language; it implements a practical subset.

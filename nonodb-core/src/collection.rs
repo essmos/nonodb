@@ -1,7 +1,7 @@
 //! Document collection operations.
 
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::ops::Bound;
 use std::sync::{Arc, Mutex};
 
@@ -3745,13 +3745,19 @@ impl<'e> Collection<'e> {
         rtxn: &RoTxn<'_>,
         docs: Vec<Value>,
         spec: &Value,
+        vars: &BTreeMap<String, Value>,
     ) -> Result<Vec<Value>> {
         let Some(spec) = spec.as_object() else {
             return Err(Error::Query("$lookup requires an object".into()));
         };
-        if spec.contains_key("let") {
-            return Err(Error::Query("$lookup `let` is not supported".into()));
-        }
+        let let_vars = match spec.get("let") {
+            Some(value) => Some(
+                value
+                    .as_object()
+                    .ok_or_else(|| Error::Query("$lookup `let` must be an object".into()))?,
+            ),
+            None => None,
+        };
         let from = spec
             .get("from")
             .and_then(Value::as_str)
@@ -3778,8 +3784,18 @@ impl<'e> Collection<'e> {
             .ok_or_else(|| Error::Query("$lookup requires a store-backed collection".into()))?;
         let foreign_coll = store.collection_at(rtxn, from)?;
         let max_docs = aggregate::max_docs();
+        let host = LookupHost { coll: self, rtxn };
         let mut out = Vec::with_capacity(docs.len());
         for mut doc in docs {
+            let mut doc_vars = vars.clone();
+            if let Some(let_vars) = let_vars {
+                for (name, expression) in let_vars {
+                    doc_vars.insert(
+                        name.clone(),
+                        aggregate::eval_expr_vars(&doc, expression, vars)?,
+                    );
+                }
+            }
             let filter = match (local, foreign) {
                 (Some(local), Some(foreign)) => {
                     let mut values = Vec::new();
@@ -3817,7 +3833,13 @@ impl<'e> Collection<'e> {
                 )));
             }
             if let Some(pipeline) = pipeline {
-                matched = aggregate::run(matched, pipeline, max_docs)?;
+                matched = aggregate::run_with_host_vars(
+                    matched,
+                    pipeline,
+                    max_docs,
+                    Some(&host),
+                    &doc_vars,
+                )?;
             }
             path::set(&mut doc, as_field, Value::Array(matched))?;
             out.push(doc);
@@ -6554,8 +6576,13 @@ struct LookupHost<'a, 'e, 'r> {
 }
 
 impl aggregate::AggregateHost for LookupHost<'_, '_, '_> {
-    fn lookup(&self, docs: Vec<Value>, spec: &Value) -> Result<Vec<Value>> {
-        self.coll.lookup_stage_in(self.rtxn, docs, spec)
+    fn lookup(
+        &self,
+        docs: Vec<Value>,
+        spec: &Value,
+        vars: &BTreeMap<String, Value>,
+    ) -> Result<Vec<Value>> {
+        self.coll.lookup_stage_in(self.rtxn, docs, spec, vars)
     }
 }
 
@@ -8234,15 +8261,29 @@ mod tests {
     #[test]
     fn lookup_stage_joins_and_filters() {
         let (_dir, store) = store();
+        let suppliers = store.collection("lookup_suppliers").unwrap();
+        suppliers
+            .insert_one(json!({"_id": "s1", "supplier": "Acme"}))
+            .unwrap();
+        suppliers
+            .insert_one(json!({"_id": "s2", "supplier": "Beta"}))
+            .unwrap();
+
         let items = store.collection("lookup_items").unwrap();
         items
-            .insert_one(json!({"_id": "i1", "sku": "a", "name": "A", "active": true}))
+            .insert_one(json!({
+                "_id": "i1", "sku": "a", "name": "A", "active": true, "supplier_id": "s1"
+            }))
             .unwrap();
         items
-            .insert_one(json!({"_id": "i2", "sku": "b", "name": "B", "active": false}))
+            .insert_one(json!({
+                "_id": "i2", "sku": "b", "name": "B", "active": false, "supplier_id": "s1"
+            }))
             .unwrap();
         items
-            .insert_one(json!({"_id": "i3", "sku": "c", "name": "C", "active": true}))
+            .insert_one(json!({
+                "_id": "i3", "sku": "c", "name": "C", "active": true, "supplier_id": "s2"
+            }))
             .unwrap();
         items
             .insert_one(json!({"_id": "i4", "name": "missing sku"}))
@@ -8326,13 +8367,75 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0]["joined"][0]["items"][1]["name"], "B");
 
+        let out = orders
+            .aggregate(&[
+                json!({"$sort": {"_id": 1}}),
+                json!({"$lookup": {
+                    "from": "lookup_items",
+                    "let": {"wanted": "$sku"},
+                    "pipeline": [
+                        {"$match": {"$expr": {"$eq": ["$sku", "$$wanted"]}}},
+                        {"$project": {"_id": 0, "name": 1, "wanted": "$$wanted"}}
+                    ],
+                    "as": "let_match"
+                }}),
+            ])
+            .unwrap();
+        assert_eq!(out[0]["let_match"], json!([{"name": "A", "wanted": "a"}]));
+        assert_eq!(out[1]["let_match"], json!([{"name": "C", "wanted": "c"}]));
+        assert_eq!(
+            out[2]["let_match"],
+            json!([{"name": "missing sku", "wanted": null}])
+        );
+
+        let out = orders
+            .aggregate(&[
+                json!({"$sort": {"_id": 1}}),
+                json!({"$lookup": {
+                    "from": "lookup_items",
+                    "let": {"wanted": "$sku"},
+                    "pipeline": [
+                        {"$match": {"$expr": {"$eq": ["$sku", "$$wanted"]}}},
+                        {"$group": {"_id": "$$wanted", "n": {"$sum": 1}}}
+                    ],
+                    "as": "let_group"
+                }}),
+            ])
+            .unwrap();
+        assert_eq!(out[0]["let_group"], json!([{"_id": "a", "n": 1}]));
+        assert_eq!(out[1]["let_group"], json!([{"_id": "c", "n": 1}]));
+
+        let out = orders
+            .aggregate(&[
+                json!({"$sort": {"_id": 1}}),
+                json!({"$lookup": {
+                    "from": "lookup_items",
+                    "localField": "skus",
+                    "foreignField": "sku",
+                    "pipeline": [
+                        {"$lookup": {
+                            "from": "lookup_suppliers",
+                            "localField": "supplier_id",
+                            "foreignField": "_id",
+                            "as": "supplier"
+                        }},
+                        {"$project": {"_id": 0, "name": 1, "supplier": 1}}
+                    ],
+                    "as": "nested"
+                }}),
+            ])
+            .unwrap();
+        assert_eq!(out[0]["nested"][0]["name"], "A");
+        assert_eq!(out[0]["nested"][0]["supplier"][0]["supplier"], "Acme");
+        assert_eq!(out[0]["nested"][1]["supplier"][0]["supplier"], "Acme");
+
         assert!(orders
             .aggregate(&[json!({"$lookup": {
                 "from": "lookup_items",
                 "localField": "sku",
                 "foreignField": "sku",
                 "as": "x",
-                "let": {"v": "$sku"}
+                "let": 1
             }})])
             .is_err());
         assert!(orders
