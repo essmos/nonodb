@@ -215,6 +215,7 @@ Design: [docs/replication.md](docs/replication.md).
       `$natural` sort order for `find`, cursors, and `explain`
 - [x] `comment` and `max_time_ms` for `count` and `aggregate`, including
       pushed-down find/count and grouped-scan paths
+- [x] `comment` and `max_time_ms` for `cursor_aggregate` page requests
 
 ### P0 — operations and durability
 

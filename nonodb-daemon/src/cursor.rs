@@ -33,6 +33,8 @@ pub enum Kind {
         coll: String,
         filter: Value,
         stages: Vec<Value>,
+        comment: Option<String>,
+        max_time_ms: Option<u64>,
     },
 }
 

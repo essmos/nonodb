@@ -315,6 +315,10 @@ pub enum Request {
         limit: Option<usize>,
         #[serde(default)]
         batch_size: Option<usize>,
+        #[serde(default)]
+        comment: Option<String>,
+        #[serde(default)]
+        max_time_ms: Option<u64>,
     },
     GetMore {
         cursor_id: u64,

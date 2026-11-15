@@ -1137,7 +1137,9 @@ documents the cursor may return, not a batch size. `comment`, `max_time_ms`, and
     {"$match": {"tenant": "acme"}},
     {"$project": {"type": 1, "at": 1}}
   ],
-  "batch_size": 500
+  "batch_size": 500,
+  "comment": "export",
+  "max_time_ms": 5000
 }
 ```
 
@@ -1145,6 +1147,10 @@ Cursor aggregation supports an optional leading `$match`, then only
 document-local stages that preserve one output per input: `$project`,
 `$addFields`/`$set`, and `$unset`. Blocking stages (`$group`, `$unwind`,
 `$sort`, `$count`, `$skip`, `$limit`) require a regular `aggregate`.
+
+`comment` and `max_time_ms` are stored with the cursor and applied to every
+page request. The deadline covers the `$match`/page `find` and is checked after
+the document-local stages.
 
 `$facet` accepts an object whose values are sub-pipelines and returns one
 document containing an array of results for each name. `$sample` is random and

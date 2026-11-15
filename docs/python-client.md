@@ -437,14 +437,17 @@ cursor = users.aggregate_cursor(
         {"$project": {"name": 1, "total": {"$add": ["$a", "$b"]}}},
     ],
     batch_size=1000,
+    comment="export",
+    max_time_ms=5000,
 )
 for row in cursor:
     process(row)
 cursor.close()
 ```
 
-`next_batch()` returns the next list of documents and `close()` releases the
-server-side cursor. Iterating automatically fetches more batches and stops when
+`aggregate_cursor` also accepts `comment=` and `max_time_ms=`, applied to each
+page request. `next_batch()` returns the next list of documents and `close()`
+releases the server-side cursor. Iterating automatically fetches more batches and stops when
 `has_more` is false. Idle cursors expire after five minutes.
 
 ### Filters

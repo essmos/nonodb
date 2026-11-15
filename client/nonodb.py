@@ -1616,6 +1616,8 @@ class Collection:
         *,
         limit: Optional[int] = None,
         batch_size: Optional[int] = None,
+        comment: Optional[str] = None,
+        max_time_ms: Optional[int] = None,
     ) -> Cursor:
         """Opens a cursor over an optional leading `$match` and document-local
         stages (`$project`, `$addFields`/`$set`, `$unset`)."""
@@ -1628,4 +1630,8 @@ class Collection:
             payload["limit"] = limit
         if batch_size is not None:
             payload["batch_size"] = batch_size
+        if comment is not None:
+            payload["comment"] = comment
+        if max_time_ms is not None:
+            payload["max_time_ms"] = max_time_ms
         return Cursor(self._db, payload, batch_size)

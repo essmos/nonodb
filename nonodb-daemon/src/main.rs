@@ -1620,8 +1620,16 @@ fn cursor_page(
             hint,
             ..
         } => (comment.clone(), *max_time_ms, hint.clone()),
-        cursor::Kind::Aggregate { .. } => (None, None, None),
+        cursor::Kind::Aggregate {
+            comment,
+            max_time_ms,
+            ..
+        } => (comment.clone(), *max_time_ms, None),
     };
+    let deadline = max_time_ms
+        .filter(|ms| *ms > 0)
+        .and_then(|ms| Instant::now().checked_add(Duration::from_millis(ms)));
+    check_cursor_deadline(deadline)?;
     let query = FindQuery {
         filter,
         projection: None,
@@ -1653,10 +1661,20 @@ fn cursor_page(
             .map(|doc| project_document(doc, projection.as_ref()))
             .collect(),
         cursor::Kind::Aggregate { stages, .. } => {
-            aggregate::run(docs, &stages, aggregate::max_docs())?
+            let out = aggregate::run(docs, &stages, aggregate::max_docs())?;
+            check_cursor_deadline(deadline)?;
+            out
         }
     };
     Ok((out, has_more))
+}
+
+fn check_cursor_deadline(deadline: Option<Instant>) -> Result<(), ApiError> {
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        Err(nonodb_core::Error::Timeout("operation exceeded maxTimeMS".into()).into())
+    } else {
+        Ok(())
+    }
 }
 
 async fn open_cursor(
@@ -2786,6 +2804,8 @@ async fn exec_inner(
             pipeline,
             limit,
             batch_size,
+            comment,
+            max_time_ms,
         } => {
             let (filter, stages) = match cursor_pipeline(&pipeline) {
                 Ok(parts) => parts,
@@ -2795,6 +2815,8 @@ async fn exec_inner(
                 coll,
                 filter,
                 stages,
+                comment,
+                max_time_ms,
             };
             let cursor_state = cursor::State::new(
                 principal.name().to_string(),

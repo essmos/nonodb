@@ -197,7 +197,8 @@ single-database directories are migrated to `default/` on startup. See
   actual matched/returned counts. `find`, `find_one`, cursor pages, `explain`,
   `count`, and `aggregate` accept `comment` and `max_time_ms`; find-shaped
   queries also accept `hint`, `$natural` selects natural order, and expired
-  budgets return the `timeout` error code.
+  budgets return the `timeout` error code. Both find and aggregation cursors
+  carry `comment`/`max_time_ms` across their pages.
 - Replacement updates preserve `_id`.
 - Atomic `write_batch`: all operations commit or the whole batch rolls back.
 - Read-only `batch`: many reads in one LMDB snapshot and one HTTP round trip.
