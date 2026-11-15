@@ -272,8 +272,22 @@ fn is_doc_local_stage(name: &str) -> bool {
     )
 }
 
+/// Host callback used by stages that need access to another collection.
+pub(crate) trait AggregateHost {
+    fn lookup(&self, docs: Vec<Value>, spec: &Value) -> Result<Vec<Value>>;
+}
+
 /// Runs a pipeline over already selected documents.
-pub fn run(mut docs: Vec<Value>, pipeline: &[Value], max_docs: usize) -> Result<Vec<Value>> {
+pub fn run(docs: Vec<Value>, pipeline: &[Value], max_docs: usize) -> Result<Vec<Value>> {
+    run_with_host(docs, pipeline, max_docs, None)
+}
+
+pub(crate) fn run_with_host(
+    mut docs: Vec<Value>,
+    pipeline: &[Value],
+    max_docs: usize,
+    host: Option<&dyn AggregateHost>,
+) -> Result<Vec<Value>> {
     // A terminal `$count` does not need the transformed documents. Apply the
     // cardinality-preserving stages one document at a time and keep only the
     // counter; sorting is irrelevant to the result and is validated separately.
@@ -435,6 +449,13 @@ pub fn run(mut docs: Vec<Value>, pipeline: &[Value], max_docs: usize) -> Result<
                     docs.sort_by(|a, b| compare_docs(a, b, &sort));
                     i += 1;
                 }
+                "$lookup" => {
+                    let host = host.ok_or_else(|| {
+                        Error::Query("$lookup requires a collection-aware host".into())
+                    })?;
+                    docs = host.lookup(docs, arg)?;
+                    i += 1;
+                }
                 "$facet" => {
                     let Some(facets) = arg.as_object() else {
                         return Err(Error::Query("$facet requires an object".into()));
@@ -446,7 +467,7 @@ pub fn run(mut docs: Vec<Value>, pipeline: &[Value], max_docs: usize) -> Result<
                         };
                         out.insert(
                             name.clone(),
-                            Value::Array(run(docs.clone(), pipeline, max_docs)?),
+                            Value::Array(run_with_host(docs.clone(), pipeline, max_docs, host)?),
                         );
                     }
                     docs = vec![Value::Object(out)];
@@ -2368,7 +2389,7 @@ mod tests {
 
     #[test]
     fn rejects_unknown_stage() {
-        let err = run(vec![], &[json!({"$lookup": {}})], 100).unwrap_err();
+        let err = run(vec![], &[json!({"$geoNear": {}})], 100).unwrap_err();
         assert!(err.to_string().contains("unsupported aggregation stage"));
     }
 }

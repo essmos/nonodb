@@ -1335,6 +1335,7 @@ impl Store {
         history_max_versions: usize,
     ) -> Collection<'e> {
         Collection::new(
+            Some(self),
             &self.env,
             db,
             meta,

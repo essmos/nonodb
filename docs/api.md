@@ -628,6 +628,20 @@ Examples:
 {"$pullAll": {"tags": ["draft", "obsolete"]}}
 ```
 
+Updates can also be an aggregation pipeline. Only stages that produce one
+document per input are allowed: `$set`/`$addFields`, `$unset`, `$project`,
+`$replaceRoot`, and `$replaceWith`. Pipeline updates cannot change or remove
+`_id`, and unsupported stages such as `$match`, `$group`, or `$limit` are
+rejected.
+
+```json
+[
+  {"$set": {"total": {"$add": ["$subtotal", "$tax"]}}},
+  {"$unset": "temporary"},
+  {"$project": {"_id": 1, "total": 1}}
+]
+```
+
 Array paths support numeric indexes and positional updates:
 
 ```json
@@ -679,7 +693,8 @@ Notes:
   sets that element to `null`.
 - `_id` is immutable. Do not use `$set`/`$unset`/array operators on `_id`.
 - `$currentDate` supports dates but not BSON Timestamp (`{"$type": "timestamp"}`).
-- Pipeline updates are not supported and return `invalid_query`.
+- Update pipelines support the stages listed above; other stages return
+  `invalid_query`.
 
 ### Upsert
 
@@ -937,6 +952,33 @@ preserves explicit multi-field order:
 {"$sort": [["total", -1], ["tenant", 1]]}
 ```
 
+### `$lookup`
+
+Joins documents from another collection:
+
+```json
+{
+  "$lookup": {
+    "from": "items",
+    "localField": "sku",
+    "foreignField": "sku",
+    "as": "item"
+  }
+}
+```
+
+- `localField` may be an array; each element is matched against `foreignField`.
+- A missing local field is treated as `null`, matching foreign documents whose
+  field is `null` or missing.
+- An optional `pipeline` runs on the matching foreign documents. A pipeline-only
+  lookup (no `localField`/`foreignField`) scans the foreign collection and then
+  applies the pipeline.
+- Missing foreign collections produce empty arrays.
+- `let` variables and a nested `$lookup` inside the lookup sub-pipeline are not
+  supported.
+- The result is written to `as` as an array. The aggregate intermediate-document
+  limit still applies.
+
 ### Limits
 
 - At most **100,000 documents** may exist in an intermediate result. The call
@@ -944,8 +986,9 @@ preserves explicit multi-field order:
 - The normal request timeout (30 seconds by default) applies.
 - Response size is still limited by the HTTP response path and the client's
   practical memory; use `$limit` and `$project` for large collections.
-- Not supported: `$lookup`, `$graphLookup`, `$facet`, `$bucket`,
-  `$bucketAuto`, `$merge`, `$out`, window functions, and arbitrary JavaScript.
+- Not supported: `$graphLookup`, `$lookup` `let` variables, nested `$lookup`
+  inside a lookup sub-pipeline, `$merge`, `$out`, window functions, and
+  arbitrary JavaScript.
 
 ## sql
 

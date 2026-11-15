@@ -277,6 +277,7 @@ pub struct IndexSpec {
 }
 
 pub struct Collection<'e> {
+    store: Option<&'e crate::store::Store>,
     db: Database<Bytes, Bytes>,
     meta: Database<Bytes, Bytes>,
     history: Database<Bytes, Bytes>,
@@ -306,6 +307,7 @@ fn stat_bytes(stat: &heed::DatabaseStat) -> u64 {
 impl<'e> Collection<'e> {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
+        store: Option<&'e crate::store::Store>,
         env: &'e Env,
         db: Database<Bytes, Bytes>,
         meta: Database<Bytes, Bytes>,
@@ -319,6 +321,7 @@ impl<'e> Collection<'e> {
         txn_gate: &'e crate::store::TxnGate,
     ) -> Self {
         Self {
+            store,
             db,
             meta,
             history,
@@ -3279,6 +3282,7 @@ impl<'e> Collection<'e> {
             .env
             .create_database::<Bytes, Bytes>(&mut *wtxn, Some(EVENTS_COLLECTION))?;
         let outbox = Collection::new(
+            None,
             self.env,
             db,
             self.meta,
@@ -3667,6 +3671,7 @@ impl<'e> Collection<'e> {
         }
 
         let max_docs = aggregate::max_docs();
+        let host = LookupHost { coll: self, rtxn };
         let remaining = &pipeline[plan.next..];
 
         // A pipeline whose remaining prefix is just `$group` does not need an
@@ -3711,7 +3716,7 @@ impl<'e> Collection<'e> {
                         "aggregation intermediate result exceeds {max_docs} documents"
                     )));
                 }
-                return aggregate::run(grouped, &remaining[1..], max_docs);
+                return aggregate::run_with_host(grouped, &remaining[1..], max_docs, Some(&host));
             }
         }
 
@@ -3732,7 +3737,92 @@ impl<'e> Collection<'e> {
                 "aggregation input exceeds {max_docs} documents"
             )));
         }
-        aggregate::run(docs, &pipeline[plan.next..], max_docs)
+        aggregate::run_with_host(docs, &pipeline[plan.next..], max_docs, Some(&host))
+    }
+
+    fn lookup_stage_in(
+        &self,
+        rtxn: &RoTxn<'_>,
+        docs: Vec<Value>,
+        spec: &Value,
+    ) -> Result<Vec<Value>> {
+        let Some(spec) = spec.as_object() else {
+            return Err(Error::Query("$lookup requires an object".into()));
+        };
+        if spec.contains_key("let") {
+            return Err(Error::Query("$lookup `let` is not supported".into()));
+        }
+        let from = spec
+            .get("from")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::Query("$lookup requires `from`".into()))?;
+        let as_field = spec
+            .get("as")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::Query("$lookup requires `as`".into()))?;
+        let local = spec.get("localField").and_then(Value::as_str);
+        let foreign = spec.get("foreignField").and_then(Value::as_str);
+        if local.is_some() != foreign.is_some() {
+            return Err(Error::Query(
+                "$lookup requires both localField and foreignField".into(),
+            ));
+        }
+        let pipeline = spec.get("pipeline").and_then(Value::as_array);
+        if local.is_none() && pipeline.is_none() {
+            return Err(Error::Query(
+                "$lookup requires localField/foreignField or a pipeline".into(),
+            ));
+        }
+        let store = self
+            .store
+            .ok_or_else(|| Error::Query("$lookup requires a store-backed collection".into()))?;
+        let foreign_coll = store.collection_at(rtxn, from)?;
+        let max_docs = aggregate::max_docs();
+        let mut out = Vec::with_capacity(docs.len());
+        for mut doc in docs {
+            let filter = match (local, foreign) {
+                (Some(local), Some(foreign)) => {
+                    let mut values = Vec::new();
+                    for value in path::get_values(&doc, local) {
+                        match value {
+                            Value::Array(items) => values.extend(items.iter().cloned()),
+                            value => values.push(value.clone()),
+                        }
+                    }
+                    let condition = if values.is_empty() {
+                        Value::Null
+                    } else if values.len() == 1 {
+                        values.pop().expect("one value")
+                    } else {
+                        Value::Object(Map::from_iter([("$in".to_string(), Value::Array(values))]))
+                    };
+                    Value::Object(Map::from_iter([(foreign.to_string(), condition)]))
+                }
+                _ => Value::Object(Map::new()),
+            };
+            let mut matched = match &foreign_coll {
+                Some(foreign_coll) => foreign_coll.find_in(
+                    rtxn,
+                    &FindQuery {
+                        filter,
+                        limit: Some(max_docs.saturating_add(1)),
+                        ..Default::default()
+                    },
+                )?,
+                None => Vec::new(),
+            };
+            if matched.len() > max_docs {
+                return Err(Error::Query(format!(
+                    "$lookup result exceeds {max_docs} documents"
+                )));
+            }
+            if let Some(pipeline) = pipeline {
+                matched = aggregate::run(matched, pipeline, max_docs)?;
+            }
+            path::set(&mut doc, as_field, Value::Array(matched))?;
+            out.push(doc);
+        }
+        Ok(out)
     }
 
     pub fn find(&self, query: &FindQuery) -> Result<Vec<Value>> {
@@ -6458,6 +6548,17 @@ fn project(doc: &Value, projection: &Value) -> Value {
     }
 }
 
+struct LookupHost<'a, 'e, 'r> {
+    coll: &'a Collection<'e>,
+    rtxn: &'a RoTxn<'r>,
+}
+
+impl aggregate::AggregateHost for LookupHost<'_, '_, '_> {
+    fn lookup(&self, docs: Vec<Value>, spec: &Value) -> Result<Vec<Value>> {
+        self.coll.lookup_stage_in(self.rtxn, docs, spec)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7407,6 +7508,65 @@ mod tests {
     }
 
     #[test]
+    fn pipeline_update_maintains_indexes_and_upserts() {
+        let (_dir, store) = store();
+        let c = store.collection("pipeline_updates").unwrap();
+        c.create_index("total", false).unwrap();
+        c.insert_one(json!({"_id": "a", "a": 2, "b": 4, "remove": true}))
+            .unwrap();
+
+        let out = c
+            .update_opts(
+                &json!({"_id": "a"}),
+                &json!([
+                    {"$set": {"total": {"$add": ["$a", "$b"]}}},
+                    {"$unset": "remove"},
+                    {"$project": {"_id": 1, "total": 1}}
+                ]),
+                false,
+                false,
+            )
+            .unwrap();
+        assert_eq!((out.matched, out.modified), (1, 1));
+        let doc = c.find_one(&json!({"_id": "a"})).unwrap().unwrap();
+        assert_eq!(doc, json!({"_id": "a", "total": 6}));
+        assert_eq!(c.count(&json!({"total": 6})).unwrap(), 1);
+        {
+            let rtxn = c.env.read_txn().unwrap();
+            c.verify_in(&rtxn).unwrap();
+        }
+
+        let out = c
+            .update_opts(
+                &json!({"_id": "b", "tenant": "t"}),
+                &json!([{"$set": {"total": 10}}]),
+                false,
+                true,
+            )
+            .unwrap();
+        assert_eq!(out.upserted_id.as_deref(), Some("b"));
+        assert_eq!(
+            c.find_one(&json!({"_id": "b"})).unwrap().unwrap(),
+            json!({"_id": "b", "tenant": "t", "total": 10})
+        );
+
+        assert!(c
+            .update(&json!({"_id": "a"}), &json!([{"$match": {}}]), false)
+            .is_err());
+        assert!(c
+            .update(
+                &json!({"_id": "a"}),
+                &json!([{"$set": {"_id": "changed"}}]),
+                false
+            )
+            .is_err());
+        assert_eq!(
+            c.find_one(&json!({"_id": "a"})).unwrap().unwrap()["total"],
+            6
+        );
+    }
+
+    #[test]
     fn update_upsert_and_array_operators() {
         let (_dir, store) = store();
         let c = store.collection("cfg").unwrap();
@@ -8069,6 +8229,115 @@ mod tests {
         );
         assert_eq!(c.delete(&json!({"_id": id}), false).unwrap(), 1);
         assert_eq!(c.count(&json!({})).unwrap(), 1);
+    }
+
+    #[test]
+    fn lookup_stage_joins_and_filters() {
+        let (_dir, store) = store();
+        let items = store.collection("lookup_items").unwrap();
+        items
+            .insert_one(json!({"_id": "i1", "sku": "a", "name": "A", "active": true}))
+            .unwrap();
+        items
+            .insert_one(json!({"_id": "i2", "sku": "b", "name": "B", "active": false}))
+            .unwrap();
+        items
+            .insert_one(json!({"_id": "i3", "sku": "c", "name": "C", "active": true}))
+            .unwrap();
+        items
+            .insert_one(json!({"_id": "i4", "name": "missing sku"}))
+            .unwrap();
+
+        let orders = store.collection("lookup_orders").unwrap();
+        orders
+            .insert_one(json!({"_id": "o1", "skus": ["a", "b"], "sku": "a"}))
+            .unwrap();
+        orders
+            .insert_one(json!({"_id": "o2", "sku": "c", "skus": ["c"]}))
+            .unwrap();
+        orders.insert_one(json!({"_id": "o3"})).unwrap();
+
+        let out = orders
+            .aggregate(&[
+                json!({"$sort": {"_id": 1}}),
+                json!({"$lookup": {
+                    "from": "lookup_items",
+                    "localField": "skus",
+                    "foreignField": "sku",
+                    "as": "items"
+                }}),
+            ])
+            .unwrap();
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0]["items"][0]["name"], "A");
+        assert_eq!(out[0]["items"][1]["name"], "B");
+        assert_eq!(out[1]["items"][0]["name"], "C");
+        assert_eq!(out[2]["items"][0]["name"], "missing sku");
+
+        let out = orders
+            .aggregate(&[
+                json!({"$sort": {"_id": 1}}),
+                json!({"$lookup": {
+                    "from": "lookup_items",
+                    "localField": "sku",
+                    "foreignField": "sku",
+                    "as": "active",
+                    "pipeline": [
+                        {"$match": {"active": true}},
+                        {"$project": {"_id": 0, "name": 1}}
+                    ]
+                }}),
+            ])
+            .unwrap();
+        assert_eq!(out[0]["active"], json!([{"name": "A"}]));
+        assert_eq!(out[1]["active"], json!([{"name": "C"}]));
+
+        let out = orders
+            .aggregate(&[
+                json!({"$sort": {"_id": 1}}),
+                json!({"$lookup": {
+                    "from": "lookup_items",
+                    "pipeline": [
+                        {"$match": {"active": true}},
+                        {"$project": {"_id": 0, "name": 1}}
+                    ],
+                    "as": "all_active"
+                }}),
+            ])
+            .unwrap();
+        assert_eq!(out[0]["all_active"], json!([{"name": "A"}, {"name": "C"}]));
+
+        let out = orders
+            .aggregate(&[
+                json!({"$sort": {"_id": 1}}),
+                json!({"$facet": {
+                    "joined": [
+                        {"$match": {"_id": "o1"}},
+                        {"$lookup": {
+                            "from": "lookup_items",
+                            "localField": "skus",
+                            "foreignField": "sku",
+                            "as": "items"
+                        }}
+                    ]
+                }}),
+            ])
+            .unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["joined"][0]["items"][1]["name"], "B");
+
+        assert!(orders
+            .aggregate(&[json!({"$lookup": {
+                "from": "lookup_items",
+                "localField": "sku",
+                "foreignField": "sku",
+                "as": "x",
+                "let": {"v": "$sku"}
+            }})])
+            .is_err());
+        assert!(orders
+            .aggregate(&[json!({"$lookup": {"from": "lookup_items", "as": "x"}})])
+            .is_err());
     }
 
     #[test]

@@ -134,7 +134,8 @@ provide:
   [replication and cluster guide](docs/replication-cluster-guide.md);
 - general interactive multi-document transactions;
 - MongoDB wire-protocol compatibility;
-- cross-collection joins (`$lookup`) or write stages (`$merge`/`$out`);
+- recursive joins (`$graphLookup`), full `$lookup` features (`let` variables),
+  or aggregation write stages (`$merge`/`$out`);
 - a role hierarchy or inherited groups; authorization uses principals and
   database-qualified scopes;
 - the full MongoDB query and update language; it implements a practical subset.
@@ -187,6 +188,8 @@ single-database directories are migrated to `default/` on startup. See
   `$rename`, `$currentDate`, `$bit`, `$pop`, `$push`, `$pull`, `$pullAll`,
   `$addToSet`, `$setOnInsert`.
 - `$each` for `$push` and `$addToSet`.
+- Pipeline updates with `$set`/`$addFields`, `$unset`, `$project`,
+  `$replaceRoot`, and `$replaceWith`.
 - Upsert with filter equality seeding, replacement upserts, and
   `$setOnInsert`.
 - Atomic `find_and_modify`: select with sort, update or remove, and return the

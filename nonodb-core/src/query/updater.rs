@@ -2,7 +2,9 @@
 //!
 //! Supported operators: `$set`, `$unset`, `$inc`, `$mul`, `$min`, `$max`,
 //! `$rename`, `$currentDate`, `$bit`, `$pop`, `$push`, `$pull`, `$pullAll`,
-//! `$addToSet` and `$setOnInsert` (only on upsert).
+//! `$addToSet` and `$setOnInsert` (only on upsert). Updates may also be an
+//! array of pipeline stages using `$set`/`$addFields`, `$unset`, `$project`,
+//! `$replaceRoot`, and `$replaceWith`.
 //! An update without operators (a plain object) replaces the document while keeping `_id`.
 
 use std::cmp::Ordering;
@@ -108,8 +110,11 @@ fn apply_upsert_with(
     filter: Option<&Value>,
     array_filters: &[Value],
 ) -> Result<()> {
+    if update.is_array() {
+        return apply_with(doc, update, true, filter, array_filters);
+    }
     let Some(obj) = update.as_object() else {
-        return Err(Error::Query("update must be an object".into()));
+        return Err(Error::Query("update must be an object or pipeline".into()));
     };
     let has_op = obj.keys().any(|k| k.starts_with('$'));
     if has_op {
@@ -142,8 +147,11 @@ fn apply_with(
     filter: Option<&Value>,
     array_filters: &[Value],
 ) -> Result<()> {
+    if let Some(pipeline) = update.as_array() {
+        return apply_pipeline(doc, pipeline);
+    }
     let Some(obj) = update.as_object() else {
-        return Err(Error::Query("update must be an object".into()));
+        return Err(Error::Query("update must be an object or pipeline".into()));
     };
     if obj.is_empty() {
         return Ok(());
@@ -374,6 +382,47 @@ fn apply_with(
             }
         }
     }
+    Ok(())
+}
+
+fn apply_pipeline(doc: &mut Value, pipeline: &[Value]) -> Result<()> {
+    for stage in pipeline {
+        let Some(obj) = stage.as_object() else {
+            return Err(Error::Query(
+                "update pipeline stages must be objects".into(),
+            ));
+        };
+        if obj.len() != 1 {
+            return Err(Error::Query(
+                "update pipeline stages must contain exactly one operator".into(),
+            ));
+        }
+        let (name, _) = obj.iter().next().expect("one entry");
+        if !matches!(
+            name.as_str(),
+            "$set" | "$addFields" | "$unset" | "$project" | "$replaceRoot" | "$replaceWith"
+        ) {
+            return Err(Error::Query(format!(
+                "unsupported update pipeline stage `{name}`"
+            )));
+        }
+    }
+    let old_id = doc.get("_id").cloned();
+    let mut docs = crate::aggregate::run(vec![doc.clone()], pipeline, 1)?;
+    if docs.len() != 1 {
+        return Err(Error::Query(
+            "update pipeline must produce exactly one document".into(),
+        ));
+    }
+    let next = docs.pop().expect("one document");
+    if let Some(id) = old_id {
+        if next.get("_id") != Some(&id) {
+            return Err(Error::Query(
+                "update pipeline cannot modify or remove `_id`".into(),
+            ));
+        }
+    }
+    *doc = next;
     Ok(())
 }
 
@@ -1051,6 +1100,43 @@ mod tests {
         let mut doc = json!({"_id": "1", "a": 1});
         apply(&mut doc, &json!({"b": 2})).unwrap();
         assert_eq!(doc, json!({"_id": "1", "b": 2}));
+    }
+
+    #[test]
+    fn pipeline_updates_and_immutable_id() {
+        let mut doc = json!({"_id": "1", "a": 2, "b": 3, "old": true});
+        apply(
+            &mut doc,
+            &json!([
+                {"$set": {"total": {"$add": ["$a", "$b"]}}},
+                {"$unset": "old"},
+                {"$project": {"_id": 1, "a": 1, "b": 1, "total": 1}}
+            ]),
+        )
+        .unwrap();
+        assert_eq!(doc, json!({"_id": "1", "a": 2, "b": 3, "total": 5}));
+
+        apply(
+            &mut doc,
+            &json!([{"$replaceWith": {
+                "$mergeObjects": ["$$ROOT", {"kind": "pipeline"}]
+            }}]),
+        )
+        .unwrap();
+        assert_eq!(doc["kind"], "pipeline");
+        assert_eq!(doc["_id"], "1");
+
+        let before = doc.clone();
+        assert!(apply(&mut doc, &json!([{"$set": {"_id": "2"}}])).is_err());
+        assert_eq!(doc, before);
+        assert!(apply(&mut doc, &json!([{"$match": {}}])).is_err());
+        assert!(apply(&mut doc, &json!([{"$limit": 1}])).is_err());
+        assert!(apply(&mut doc, &json!([{"$set": {"a": 1}, "b": 2}])).is_err());
+        assert!(apply(&mut doc, &json!([])).is_ok());
+
+        let mut inserted = json!({"_id": "3"});
+        apply_upsert(&mut inserted, &json!([{"$set": {"created": true}}])).unwrap();
+        assert_eq!(inserted, json!({"_id": "3", "created": true}));
     }
 
     #[test]
