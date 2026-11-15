@@ -125,17 +125,17 @@ application, but behaves like a shared database to a preforking web server.
 
 ## What nonodb is not
 
-nonodb is deliberately not a general-purpose distributed database. It has:
+nonodb is deliberately not a general-purpose distributed database. It does not
+provide:
 
-- no sharding or multi-primary clustering; replication is optional, built in,
-  and primary/replica/standby with quorum failover rather than a separate
-  cluster service;
-- no general interactive multi-document transactions;
-- no MongoDB wire-protocol compatibility;
-- no cross-collection joins (`$lookup`) or write stages (`$merge`/`$out`);
-- no role hierarchy or inherited groups; authorization uses principals and
+- sharding or multi-primary clustering. The built-in replication model is one
+  primary with read replicas or a hot standby, with quorum failover;
+- general interactive multi-document transactions;
+- MongoDB wire-protocol compatibility;
+- cross-collection joins (`$lookup`) or write stages (`$merge`/`$out`);
+- a role hierarchy or inherited groups; authorization uses principals and
   database-qualified scopes;
-- a practical subset of MongoDB query and update operators.
+- the full MongoDB query and update language; it implements a practical subset.
 
 For a single host, a small-to-medium data set, and a workload dominated by
 indexed reads and modest writes, those trade-offs buy a very small operational
