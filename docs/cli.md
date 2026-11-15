@@ -75,6 +75,36 @@ NONODB_SOCK=/tmp/nonodb.sock nonodb-cli ping
 {"ok": true}
 ```
 
+## server
+
+Show the daemon's **actual listener addresses**, including the resolved port
+when `NONODB_TCP` uses `:0`, the Unix socket path, TLS state, and the advertised
+replication URL:
+
+```bash
+NONODB_SOCK=/tmp/nonodb.sock nonodb-cli server
+```
+
+```json
+{
+  "ok": true,
+  "result": {
+    "version": "0.25.0",
+    "tcp": {
+      "configured": "127.0.0.1:7902",
+      "bound": "127.0.0.1:7902",
+      "tls": false
+    },
+    "unix": "/tmp/nonodb.sock",
+    "advertise_url": "http://10.0.0.10:7902"
+  }
+}
+```
+
+This is the reliable way to distinguish a process that works locally but is not
+reachable from another host. `configured` is the environment value; `bound` is
+what the kernel actually accepted.
+
 ## ready
 
 Check readiness: the writer thread is running and LMDB can serve a read
@@ -536,6 +566,18 @@ Prune a known-acked range, refusing to pass the minimum replica ack:
 nonodb-cli replication prune 1234 --require-acks
 ```
 
+Pause, resume, or disconnect a replica without deleting data:
+
+```bash
+nonodb-cli replication pause
+nonodb-cli replication resume
+nonodb-cli replication disconnect
+```
+
+`pause` keeps the source and token; `resume` continues from the stored source.
+`disconnect` removes both and leaves the node read-only. Promote it separately
+with `replication promote <epoch>` if it should become standalone.
+
 Change the pull source without restarting the daemon:
 
 ```bash
@@ -572,6 +614,21 @@ Start the replica daemon first, or set `NONODB_SOCK` to its actual socket
 uses the Unix socket; `NONODB_URL` is the Windows TCP path and is ignored on
 Unix. If the daemon runs in Docker, run the command inside the container with
 the container's socket path.
+
+On success the CLI prints a short confirmation instead of raw JSON:
+
+```text
+Connected to the cluster.
+  node_id:   replica-eu
+  source:    https://primary.example.com:7878
+  databases: default,app1
+  role:      replica
+  pulling:   https://primary.example.com:7878
+The primary GUI shows this replica after its first acknowledgement.
+```
+
+Set `NONODB_REPLICATION_ADVERTISE_URL` on the replica if the primary GUI should
+automatically probe its metrics in the Cluster view.
 
 The code can be omitted from `join`; the CLI prompts for it. List and revoke
 pending codes with:

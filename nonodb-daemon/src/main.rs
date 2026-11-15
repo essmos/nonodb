@@ -25,6 +25,8 @@ mod live;
 mod login_guard;
 mod maintenance;
 mod metrics;
+mod network;
+mod network_api;
 mod node_state;
 mod pairing;
 mod pairing_api;
@@ -33,6 +35,7 @@ mod replication_api;
 mod replicator;
 mod retention;
 mod s3_import;
+mod server_info;
 mod writer;
 
 use std::collections::HashMap;
@@ -190,6 +193,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let sock =
         PathBuf::from(std::env::var("NONODB_SOCK").unwrap_or_else(|_| "/run/nonodb.sock".into()));
     let tcp_addr = std::env::var("NONODB_TCP").ok();
+    server_info::set_advertise_url(
+        std::env::var("NONODB_REPLICATION_ADVERTISE_URL")
+            .ok()
+            .map(|value| value.trim().trim_end_matches('/').to_string())
+            .filter(|value| !value.is_empty()),
+    );
 
     let auth = match std::env::var_os("NONODB_AUTH_FILE") {
         Some(path) if !path.is_empty() => Some(auth::AuthState::open(PathBuf::from(path))?),
@@ -283,6 +292,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let redirect_state = state.clone();
     let app = Router::new()
         .route("/healthz", get(health))
+        .route("/v1/server", get(server))
+        .route("/v1/network", get(network_api::view))
+        .route(
+            "/v1/network/firewall",
+            put(network_api::save_firewall).delete(network_api::disable_firewall),
+        )
+        .route(
+            "/v1/network/firewall/apply",
+            post(network_api::apply_firewall),
+        )
         .route("/readyz", get(ready))
         .route("/readyz/write", get(ready_write))
         .route("/metrics", get(metrics_handler))
@@ -332,6 +351,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/replication/pair", post(pairing_api::pair))
         .route("/v1/replication/join", post(pairing_api::join))
         .route("/v1/replication/lease", post(replication_api::lease))
+        .route("/v1/replication/pause", post(replication_api::pause))
+        .route("/v1/replication/resume", post(replication_api::resume))
+        .route(
+            "/v1/replication/disconnect",
+            post(replication_api::disconnect),
+        )
         .route("/v1/replication/promote", post(replication_api::promote))
         .route("/v1/replication/demote", post(replication_api::demote))
         .route(
@@ -437,6 +462,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         let _ = std::fs::remove_file(&sock);
 
         let listener = tokio::net::UnixListener::bind(&sock)?;
+        server_info::set_unix(&sock);
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o660))?;
@@ -762,6 +788,8 @@ async fn serve_tcp(
     drain_timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
+    let bound = listener.local_addr()?.to_string();
+    server_info::set_tcp(addr, &bound, tls.is_some());
     tracing::info!(
         %addr,
         tls = tls.is_some(),
@@ -1002,6 +1030,33 @@ async fn http_access_log(
 
 async fn health() -> Json<Value> {
     Json(json!({ "ok": true }))
+}
+
+/// Returns the actual listener addresses of this daemon (admin only).
+async fn server(
+    State(state): State<AppState>,
+    Extension(connection): Extension<auth::ConnectionAuth>,
+    headers: HeaderMap,
+) -> (StatusCode, Json<Value>) {
+    let (principal, started) =
+        match auth_api::start_admin(&state, &connection, &headers, "server_info") {
+            Ok(value) => value,
+            Err(response) => return response,
+        };
+    audit_control(
+        &state,
+        &connection,
+        principal.name(),
+        "server_info",
+        true,
+        None,
+        started,
+        None,
+    );
+    (
+        StatusCode::OK,
+        Json(json!({ "ok": true, "result": server_info::snapshot() })),
+    )
 }
 
 /// Readiness checks the writer and a real LMDB read transaction. Liveness stays

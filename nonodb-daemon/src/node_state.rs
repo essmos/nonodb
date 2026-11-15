@@ -89,6 +89,20 @@ pub fn put(key: &str, value: &[u8]) -> Result<(), String> {
     wtxn.commit().map_err(|error| error.to_string())
 }
 
+pub fn remove(key: &str) -> Result<(), String> {
+    let state = global()?.clone();
+    let _guard = state
+        .write_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut wtxn = state._env.write_txn().map_err(|error| error.to_string())?;
+    state
+        .db
+        .delete(&mut wtxn, key.as_bytes())
+        .map_err(|error| error.to_string())?;
+    wtxn.commit().map_err(|error| error.to_string())
+}
+
 pub fn get_json<T: DeserializeOwned>(key: &str) -> Result<Option<T>, String> {
     match get(key)? {
         Some(bytes) => serde_json::from_slice(&bytes)

@@ -132,6 +132,9 @@ def main() -> int:
                 b"Excluded collections",
                 b"Generate key",
                 b"/v1/backups/keygen",
+                b"actual bind",
+                b"Host firewall",
+                b"Generated nftables rules",
             ):
                 assert marker in asset, marker
             assert b"New database name" not in asset
@@ -166,6 +169,17 @@ def main() -> int:
                 assert exc.headers.get("content-type", "").startswith("application/json")
             else:
                 raise AssertionError("auth endpoint unexpectedly succeeded without auth file")
+
+            for protected in ("/v1/server", "/v1/network"):
+                try:
+                    payload = json.loads(fetch(base + protected))
+                    assert payload["result"], payload
+                except HTTPError as exc:
+                    # With auth enabled these endpoints require an admin token; a
+                    # 400 still proves that the GUI proxy forwarded the request
+                    # instead of returning its 501 fallback.
+                    assert exc.code == 400, (protected, exc.code)
+                    assert exc.headers.get("content-type", "").startswith("application/json")
 
             fetch(base + "/v1/exec", data={"op": "create_database", "name": "app1"})
             fetch(

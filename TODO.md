@@ -87,6 +87,14 @@ limitations are documented in [docs/roadmap.md](docs/roadmap.md).
 - [ ] Shared sharded writer pool for much higher write concurrency (future scaling step).
 - [ ] Per-database metrics, quotas, and a per-database administrator role.
 
+## Network and host firewall
+
+- [x] Add a Network tab with actual listener bind/advertise details.
+- [x] Add an admin `/v1/network` API and network CLI visibility.
+- [x] Generate dedicated nftables rules for selected NonoDB ports and source CIDRs.
+- [x] Add opt-in apply/disable controls with validation and audit records.
+- [ ] Add firewalld/ufw backends and per-database listener policies.
+
 ## Cluster control plane and failover hardening
 
 - [x] Replicate the auth registry as token hashes, scopes, principals, and
@@ -96,6 +104,7 @@ limitations are documented in [docs/roadmap.md](docs/roadmap.md).
 - [x] Replicate encrypted vault envelopes; tenant keys remain client-side.
 - [x] Add a cluster peer token and source discovery for rejoin.
 - [x] Add stable seed rediscovery when the stored source is unreachable.
+- [x] Add replica pause/resume/disconnect controls in the GUI, CLI, and API.
 - [x] Store role, source, vote, lease, peer token, and pairings in the hidden
       `.node` LMDB system collection instead of loose JSON files.
 - [x] Add one-time 8-character replica pairing in CLI and GUI.

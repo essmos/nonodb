@@ -6,6 +6,7 @@ import { oneDark } from '@codemirror/theme-one-dark';
 import { autocompletion, type CompletionContext } from '@codemirror/autocomplete';
 import QueryBuilder from './QueryBuilder';
 import {
+  applyFirewall,
   authSummary,
   backupsList,
   clusterStatus,
@@ -18,9 +19,11 @@ import {
   createPrincipal,
   createReplicaPairing,
   databaseStats,
+  disableFirewall,
   defaultConnection,
   deleteBackupJob,
   deletePrincipal,
+  disconnectReplication,
   errorText,
   exec,
   generateBackupKey,
@@ -31,8 +34,11 @@ import {
   demoteReplication,
   promoteReplication,
   listReplicaPairings,
+  networkInfo,
+  pauseReplication,
   replicationChanges,
   replicationStatus,
+  resumeReplication,
   revokeReplicaPairing,
   runImport,
   updateReplicationSource,
@@ -40,6 +46,7 @@ import {
   loadProfiles,
   metrics,
   saveConnection,
+  saveFirewall,
   saveProfiles,
   saveBackupJob,
   runBackupJob,
@@ -57,6 +64,7 @@ import {
   type ImportOverview,
   type PairingView,
   type ReplicationChangeTxn,
+  type NetworkInfo,
   type ReplicationStatus,
   type DatabaseStorageStats,
   subscribeTiming,
@@ -1544,17 +1552,20 @@ function RepStat({
 function ClusterPage({ connection }: { connection: Connection }) {
   const [cluster, setCluster] = useState<ClusterStatus | null>(null);
   const [progress, setProgress] = useState<TestProgress | null>(null);
+  const [replication, setReplication] = useState<ReplicationStatus | null>(null);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      const [nextCluster, nextProgress] = await Promise.all([
+      const [nextCluster, nextProgress, nextReplication] = await Promise.all([
         clusterStatus(connection),
         testProgress(connection),
+        replicationStatus(connection).catch(() => null),
       ]);
       setCluster(nextCluster);
       setProgress(nextProgress);
+      setReplication(nextReplication);
       setError('');
     } catch (err) {
       setError(errorText(err));
@@ -1578,6 +1589,9 @@ function ClusterPage({ connection }: { connection: Connection }) {
     ...online.flatMap((node) => (node.status?.applied ?? []).map((applied) => applied.lag ?? 0)),
   );
   const staleAcks = online.flatMap((node) => node.status?.acks ?? []).filter((ack) => ack.age_seconds > 60);
+  const configuredNames = new Set(nodes.map((node) => node.name));
+  const dynamicAcks = (replication?.acks ?? []).filter((ack) => !configuredNames.has(ack.node));
+  const connectedDynamic = dynamicAcks.filter((ack) => ack.age_seconds <= 60).length;
   const metric = (node: ClusterStatus['nodes'][number], key: string): number =>
     Number(node.metrics?.[key] ?? 0);
   const progressPercent =
@@ -1660,6 +1674,7 @@ function ClusterPage({ connection }: { connection: Connection }) {
         <RepStat label="Replicas" value={replicas.length} help="Read-only nodes that pull changes from a primary." />
         <RepStat label="Unhealthy" value={nodes.length - online.length} help="Nodes that are offline or failed the probe." danger={nodes.length > online.length} />
         <RepStat label="Stale acks" value={staleAcks.length} help="Replica acknowledgements older than 60 seconds." danger={staleAcks.length > 0} />
+        <RepStat label="Dynamic replicas" value={dynamicAcks.length} help="Replicas that acknowledged the primary but are not in the configured --cluster probe list." />
         <RepStat label="Updated" value={cluster?.generated_at_ms ? new Date(cluster.generated_at_ms).toLocaleTimeString() : '—'} help="Time of the last cluster probe." />
       </div>
       <div className="cluster-grid">
@@ -1720,6 +1735,35 @@ function ClusterPage({ connection }: { connection: Connection }) {
           );
         })}
       </div>
+      {dynamicAcks.length > 0 && (
+        <section className="panel">
+          <div className="panel-title">
+            <h3>Dynamic replica connections</h3>
+            <span>{connectedDynamic} connected / {dynamicAcks.length} total</span>
+          </div>
+          <p className="field-hint">
+            Replicas that acknowledged the primary but are not in this GUI's
+            <code> --cluster</code> probe list. They are connected and synchronized
+            through replication; their URL is not known here, so only ACK data is
+            shown. Add them to <code>--cluster</code> to probe metrics and disk.
+          </p>
+          <div className="index-list">
+            {dynamicAcks.map((ack) => (
+              <div key={ack.node} className="index-row">
+                <div>
+                  <strong className="mono">{ack.node}</strong>
+                  <span className="badge">seq {ack.seq.toLocaleString()}</span>
+                  {ack.age_seconds <= 60 && <span className="badge">connected</span>}
+                  {ack.url && <span className="muted small mono"> · {ack.url}</span>}
+                </div>
+                <span className={`muted small ${ack.age_seconds > 60 ? 'danger-text' : ''}`}>
+                  {ack.age_seconds.toFixed(1)}s ago
+                </span>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
       {nodes.length === 0 && (
         <div className="panel">
           <p className="muted">No nodes configured. Start the GUI with <code>--cluster name=url,name=url</code> or set <code>NONODB_GUI_CLUSTER</code>.</p>
@@ -1760,6 +1804,8 @@ function ReplicationPage({ connection }: { connection: Connection }) {
   const [pairing, setPairing] = useState<PairingView | null>(null);
   const [pendingPairings, setPendingPairings] = useState<PairingView[]>([]);
   const [pairingBusy, setPairingBusy] = useState(false);
+  const [replicationBusy, setReplicationBusy] = useState(false);
+  const [replicationNotice, setReplicationNotice] = useState('');
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -1772,7 +1818,11 @@ function ReplicationPage({ connection }: { connection: Connection }) {
       ]);
       setStatus(nextStatus);
       setChanges(nextChanges.changes);
-      setPendingPairings(pending.pending ?? []);
+      const pendingItems = pending.pending ?? [];
+      setPendingPairings(pendingItems);
+      setPairing((current) =>
+        current && pendingItems.some((item) => item.code === current.code) ? current : null,
+      );
       setSourceDraft(nextStatus.replication?.source ?? '');
       setDatabasesDraft((nextStatus.replication?.databases ?? ['default']).join(', '));
       setIntervalDraft(String(nextStatus.replication?.interval_secs ?? 1));
@@ -1787,7 +1837,46 @@ function ReplicationPage({ connection }: { connection: Connection }) {
 
   useEffect(() => {
     void load();
+    const timer = window.setInterval(() => {
+      void load();
+    }, 3000);
+    return () => window.clearInterval(timer);
   }, [load]);
+
+  const pauseOrResume = async (pause: boolean) => {
+    setReplicationBusy(true);
+    setError('');
+    setReplicationNotice('');
+    try {
+      if (pause) await pauseReplication(connection);
+      else await resumeReplication(connection);
+      setReplicationNotice(pause ? 'Replication paused.' : 'Replication resumed.');
+      await load();
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setReplicationBusy(false);
+    }
+  };
+
+  const disconnect = async () => {
+    if (!window.confirm(
+      'Disconnect this node from its replication source?\n\n' +
+      'The source and token are removed, pulling stops, and the node stays read-only until promoted.',
+    )) return;
+    setReplicationBusy(true);
+    setError('');
+    setReplicationNotice('');
+    try {
+      await disconnectReplication(connection);
+      setReplicationNotice('Disconnected from the replication source. The node remains read-only.');
+      await load();
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setReplicationBusy(false);
+    }
+  };
 
   const changeRole = async (action: 'promote' | 'demote') => {
     const label = action === 'promote' ? 'Promote this node to primary?' : 'Demote this node to replica?';
@@ -1972,6 +2061,31 @@ function ReplicationPage({ connection }: { connection: Connection }) {
           )}
         </section>
       )}
+      {replicationNotice && <div className="notice-box">{replicationNotice}</div>}
+      {status && status.role !== 'primary' && (
+        <section className="panel">
+          <div className="panel-title">
+            <h3>Replication control</h3>
+            <span>{status.replication?.paused ? 'paused' : 'running'}</span>
+          </div>
+          <p className="field-hint">
+            Pause stops applying new transactions but keeps the source for resume.
+            Disconnect removes the source and token and leaves this node read-only.
+            Neither action promotes the node or deletes local data.
+          </p>
+          <div className="actions">
+            <button
+              onClick={() => void pauseOrResume(!status.replication?.paused)}
+              disabled={replicationBusy || !status.replication?.source}
+            >
+              {status.replication?.paused ? 'Resume replication' : 'Pause replication'}
+            </button>
+            <button className="danger" onClick={() => void disconnect()} disabled={replicationBusy || !status.replication?.source}>
+              Disconnect from source
+            </button>
+          </div>
+        </section>
+      )}
       {status?.replication && (
         <section className="panel">
           <div className="panel-title">
@@ -2051,23 +2165,38 @@ function ReplicationPage({ connection }: { connection: Connection }) {
       )}
       {status && (
         <section className="panel">
-          <div className="panel-title"><h3>Replica acknowledgements</h3><span>min ack {status.min_ack ?? 0}</span></div>
+          <div className="panel-title">
+            <h3>Replica connections</h3>
+            <span>
+              {(status.acks ?? []).filter((ack) => ack.age_seconds <= 60).length} connected
+              {" / "}
+              {(status.acks ?? []).length} total
+            </span>
+          </div>
           <p className="field-hint">
             Each replica periodically reports the last sequence it applied. The primary
-            uses these acks for safe pruning. An age above 60 seconds is considered stale.
-            This list is normally empty when you are viewing a replica.
+            uses these acks for safe pruning. A fresh acknowledgement means the replica is
+            connected; an age above 60 seconds is considered stale. Newly joined replicas
+            appear here after their first successful pull.
           </p>
           {status.acks && status.acks.length > 0 ? (
             <div className="index-list">
               {status.acks.map((ack) => (
                 <div key={ack.node} className="index-row" title="Replica identity, applied sequence, and time since its last acknowledgement.">
-                  <div><strong className="mono">{ack.node}</strong><span className="badge">seq {ack.seq.toLocaleString()}</span></div>
-                  <span className={`muted small ${ack.age_seconds > 60 ? 'danger-text' : ''}`}>{ack.age_seconds.toFixed(1)}s ago</span>
+                  <div>
+                    <strong className="mono">{ack.node}</strong>
+                    <span className="badge">seq {ack.seq.toLocaleString()}</span>
+                    {ack.age_seconds <= 60 && <span className="badge">connected</span>}
+                    {ack.url && <span className="muted small mono"> · {ack.url}</span>}
+                  </div>
+                  <span className={`muted small ${ack.age_seconds > 60 ? 'danger-text' : ''}`}>
+                    {ack.age_seconds.toFixed(1)}s ago
+                  </span>
                 </div>
               ))}
             </div>
           ) : (
-            <p className="muted">No replica acknowledgements recorded on this node yet.</p>
+            <p className="muted">No replica acknowledgements recorded on this node yet. Waiting for the first replica pull…</p>
           )}
         </section>
       )}
@@ -2246,6 +2375,178 @@ function StorageView({
           </section>
         </>
       )}
+    </div>
+  );
+}
+
+function NetworkView({ connection }: { connection: Connection }) {
+  const [data, setData] = useState<NetworkInfo | null>(null);
+  const [allowedText, setAllowedText] = useState('');
+  const [portsText, setPortsText] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
+
+  const applyData = useCallback((next: NetworkInfo) => {
+    setData(next);
+    setAllowedText(next.allowed.join(", "));
+    setPortsText(next.ports.join(", "));
+  }, []);
+
+  const load = useCallback(async () => {
+    setBusy(true);
+    setError('');
+    try {
+      applyData(await networkInfo(connection));
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setBusy(false);
+    }
+  }, [applyData, connection]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  const parsed = () => {
+    const allowed = allowedText
+      .split(/[,\n]/)
+      .map((value) => value.trim())
+      .filter(Boolean);
+    const ports = portsText
+      .split(/[,\n]/)
+      .map((value) => value.trim())
+      .filter(Boolean)
+      .map((value) => Number(value));
+    if (ports.some((port) => !Number.isInteger(port) || port < 1 || port > 65535)) {
+      throw new Error("Ports must be integers between 1 and 65535.");
+    }
+    return { allowed, ports };
+  };
+
+  const save = async () => {
+    setBusy(true);
+    setError('');
+    setNotice('');
+    try {
+      const values = parsed();
+      const next = await saveFirewall(connection, values.allowed, values.ports);
+      applyData(next);
+      setNotice("Saved firewall preview.");
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const apply = async () => {
+    setBusy(true);
+    setError('');
+    setNotice('');
+    try {
+      const values = parsed();
+      await saveFirewall(connection, values.allowed, values.ports);
+      applyData(await applyFirewall(connection));
+      setNotice("Firewall rules applied.");
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const disable = async () => {
+    setBusy(true);
+    setError('');
+    setNotice('');
+    try {
+      applyData(await disableFirewall(connection));
+      setNotice("Managed firewall table removed.");
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="page">
+      <header className="page-header">
+        <div>
+          <h2>Network</h2>
+          <p>Listener addresses and host firewall for NonoDB ports</p>
+        </div>
+        <div className="actions">
+          <button onClick={() => void load()} disabled={busy}>Refresh</button>
+        </div>
+      </header>
+      {error && <div className="error-box">{error}</div>}
+      {notice && <div className="notice-box">{notice}</div>}
+
+      <section className="panel">
+        <div className="panel-title"><h3>Listeners</h3><span>actual bind</span></div>
+        {data ? (
+          <>
+            <div className="cluster-detail"><span>TCP</span><strong className="mono">{data.listeners.tcp?.bound ?? "disabled"}{data.listeners.tcp?.tls ? " · TLS" : ""}</strong></div>
+            <div className="cluster-detail"><span>Configured</span><strong className="mono">{data.listeners.tcp?.configured ?? "—"}</strong></div>
+            <div className="cluster-detail"><span>Unix socket</span><strong className="mono">{data.listeners.unix ?? "disabled"}</strong></div>
+            <div className="cluster-detail"><span>Advertise URL</span><strong className="mono">{data.listeners.advertise_url ?? "—"}</strong></div>
+            {data.listeners.tcp?.bound?.startsWith("127.") && (
+              <div className="error-box">TCP is loopback-only. Remote replicas cannot connect until the daemon listens on 0.0.0.0 or a LAN address.</div>
+            )}
+          </>
+        ) : <p className="muted">Loading listener details…</p>}
+      </section>
+
+      <section className="panel">
+        <div className="panel-title"><h3>Host firewall</h3><span>nftables</span></div>
+        <p className="field-hint">
+          Creates a dedicated <code>{data?.firewall.table ?? "inet nonodb_firewall"}</code> table and
+          restricts only the listed NonoDB TCP ports. SSH, the GUI port, and unrelated host
+          services are not touched. Loopback is always allowed.
+        </p>
+        {data && (
+          <>
+            <div className="cluster-detail"><span>Backend</span><strong>{data.firewall.backend} · {data.firewall.available ? "available" : "unavailable"}</strong></div>
+            <div className="cluster-detail"><span>Apply</span><strong>{data.firewall.apply_enabled ? "enabled" : "disabled (preview only)"}</strong></div>
+            <div className="cluster-detail"><span>Managed table</span><strong>{data.firewall.managed ? "active" : "not active"}</strong></div>
+            {!data.firewall.apply_enabled && (
+              <div className="error-box">
+                Apply is disabled. Set <code>NONODB_FIREWALL_MANAGE=1</code> on the daemon and restart it.
+                The rules below are still generated for review.
+              </div>
+            )}
+            {data.firewall.error && <div className="error-box">{data.firewall.error}</div>}
+          </>
+        )}
+        <div className="form-grid">
+          <label>Allowed addresses
+            <textarea
+              value={allowedText}
+              onChange={(event) => setAllowedText(event.target.value)}
+              placeholder={"10.0.0.0/24\n192.168.1.20"}
+              rows={4}
+            />
+            <span className="field-hint">Comma- or newline-separated IPv4/IPv6 addresses or CIDRs. Empty means loopback only.</span>
+          </label>
+          <label>TCP ports
+            <input value={portsText} onChange={(event) => setPortsText(event.target.value)} placeholder="7902" />
+            <span className="field-hint">Ports used by NonoDB API/replication. Do not add SSH or the GUI port.</span>
+          </label>
+        </div>
+        <div className="actions">
+          <button onClick={() => void save()} disabled={busy}>Save &amp; preview</button>
+          <button className="primary" onClick={() => void apply()} disabled={busy || !data?.firewall.apply_enabled}>Apply firewall</button>
+          <button className="danger" onClick={() => void disable()} disabled={busy || !data?.firewall.available}>Disable managed firewall</button>
+        </div>
+        <div className="panel-title"><h3>Generated nftables rules</h3><span>review before apply</span></div>
+        <pre className="result">{data?.preview ?? ""}</pre>
+        {data?.firewall.status && (
+          <details><summary>Current managed table</summary><pre className="result">{data.firewall.status}</pre></details>
+        )}
+      </section>
     </div>
   );
 }
@@ -4387,7 +4688,7 @@ function Shell({
 }) {
   const [collections, setCollections] = useState<string[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
-  const [tab, setTab] = useState<'dashboard' | 'storage' | 'sql' | 'database' | 'backups' | 'import' | 'replication' | 'cluster' | 'auth'>('dashboard');
+  const [tab, setTab] = useState<'dashboard' | 'storage' | 'sql' | 'database' | 'backups' | 'import' | 'replication' | 'cluster' | 'network' | 'auth'>('dashboard');
   const [showNewCollection, setShowNewCollection] = useState(false);
   const [showPalette, setShowPalette] = useState(false);
   const [paletteQuery, setPaletteQuery] = useState('');
@@ -4524,6 +4825,9 @@ function Shell({
           <button className={tab === 'cluster' ? 'active' : ''} onClick={() => setTab('cluster')}>
             Cluster
           </button>
+          <button className={tab === 'network' ? 'active' : ''} onClick={() => setTab('network')}>
+            Network
+          </button>
           <button className={tab === 'auth' ? 'active' : ''} onClick={() => setTab('auth')}>
             Authorization
           </button>
@@ -4608,6 +4912,8 @@ function Shell({
           <ReplicationPage connection={connection} />
         ) : tab === 'cluster' ? (
           <ClusterPage connection={connection} />
+        ) : tab === 'network' ? (
+          <NetworkView connection={connection} />
         ) : tab === 'auth' ? (
           <AuthView connection={connection} />
         ) : selected ? (
@@ -4643,6 +4949,7 @@ function Shell({
               { label: 'Open Import', run: () => setTab('import') },
               { label: 'Open Replication', run: () => setTab('replication') },
               { label: 'Open Cluster', run: () => setTab('cluster') },
+              { label: 'Open Network', run: () => setTab('network') },
               { label: 'Open Authorization', run: () => setTab('auth') },
               { label: 'New collection', run: () => setShowNewCollection(true) },
               ...collections.map((coll) => ({ label: `Open collection: ${coll}`, run: () => openCollection(coll) })),

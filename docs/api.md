@@ -2156,6 +2156,25 @@ See [Operations](operations.md#capacity-and-memory).
 
 ## Health and metrics
 
+### GET /v1/server
+
+Authenticated admin endpoint. Returns the daemon's real listener state:
+
+```json
+{
+  "ok": true,
+  "result": {
+    "version": "0.25.0",
+    "tcp": {"configured": "0.0.0.0:7902", "bound": "0.0.0.0:7902", "tls": false},
+    "unix": "/run/nonodb.sock",
+    "advertise_url": "http://10.0.0.10:7902"
+  }
+}
+```
+
+`bound` is the resolved socket address. Use it to verify that a remote replica
+can reach this node before generating a pairing code.
+
 ### GET /healthz
 
 Public, no authentication.
@@ -2163,6 +2182,62 @@ Public, no authentication.
 ```json
 {"ok": true}
 ```
+
+### POST /v1/replication/pause / resume / disconnect
+
+Admin-only replica controls:
+
+```http
+POST /v1/replication/pause
+POST /v1/replication/resume
+POST /v1/replication/disconnect
+```
+
+`pause` sets a persisted paused flag; the source and token remain. `resume`
+clears it and the pull loop continues from the stored source. `disconnect`
+removes the source and token from the hidden node state, stops pulling, and
+keeps the node read-only. None of these operations delete local data or promote
+the node.
+
+### GET /v1/network
+
+Authenticated admin endpoint. Returns listener state, firewall backend status,
+saved allow-list/ports, and generated nftables rules:
+
+```json
+{
+  "ok": true,
+  "result": {
+    "listeners": {"tcp": {"configured": "0.0.0.0:7902", "bound": "0.0.0.0:7902", "tls": false}},
+    "firewall": {"available": true, "backend": "nftables", "apply_enabled": false, "managed": false},
+    "allowed": ["10.0.0.0/24"],
+    "ports": [7902],
+    "preview": "table inet nonodb_firewall { ... }"
+  }
+}
+```
+
+### PUT /v1/network/firewall
+
+Validates and saves the allow-list and ports, then returns the updated
+`/v1/network` view. Body:
+
+```json
+{"allowed": ["10.0.0.0/24", "192.168.1.20"], "ports": [7902, 7912]}
+```
+
+Bare addresses are normalized to `/32` or `/128`. Invalid CIDRs, ports, or an
+unreasonably large list return `400 invalid_firewall`.
+
+### POST /v1/network/firewall/apply
+
+Applies the saved rules to the dedicated `inet nonodb_firewall` table. Requires
+`NONODB_FIREWALL_MANAGE=1` on the daemon and nftables privileges. The daemon
+validates the rules with `nft --check` before replacing the table.
+
+### DELETE /v1/network/firewall
+
+Removes the dedicated managed table. Other host firewall rules are untouched.
 
 ### Per-collection metrics
 
@@ -2469,6 +2544,9 @@ Transport, replica apply, promotion, and GUI management are still planned.
 | `POST` | `/v1/replication/promote` | Promote to primary using `expected_epoch`; optionally fence the old source, or `force` |
 | `POST` | `/v1/replication/demote` | Manually demote with `expected_epoch`, optional `role`, and optional `successor` URL |
 | `PUT` | `/v1/replication/source` | Persist a new pull source and reload the loop |
+| `POST` | `/v1/replication/pause` | Pause pulling while keeping the source and token |
+| `POST` | `/v1/replication/resume` | Resume pulling from the stored source |
+| `POST` | `/v1/replication/disconnect` | Remove source/token, stop pulling, keep the node read-only |
 | `POST` | `/v1/replication/vote` | Cast or inspect a quorum vote for `(epoch, candidate)` |
 | `POST` | `/v1/replication/lease` | Renew a candidate's quorum lease |
 | `GET` | `/v1/replication/pairings` | List pending one-time replica pairing codes (admin) |

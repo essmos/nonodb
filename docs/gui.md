@@ -218,6 +218,24 @@ Text, fuzzy, and vector search require the corresponding index on the field.
 - query history stored in browser localStorage;
 - JSON and CSV result export.
 
+### Network
+
+The **Network** tab is the only place for listener and host-firewall management:
+
+- **Listeners** — actual TCP bind, configured `NONODB_TCP`, Unix socket, TLS
+  state, and advertised replication URL;
+- **Host firewall** — allowed IPv4/IPv6 addresses/CIDRs, NonoDB TCP ports,
+  generated nftables rules, apply/disable controls, and current managed table.
+
+The firewall panel edits only a dedicated `inet nonodb_firewall` table. It does
+not modify SSH or general host policy. Applying requires
+`NONODB_FIREWALL_MANAGE=1` on the daemon; without it the GUI only previews
+rules. If the daemon runs as a non-root service, use `NONODB_FIREWALL_SUDO=1`
+with passwordless sudo for `nft`.
+
+Always check that the TCP bind is `0.0.0.0` or a LAN address before adding a
+remote replica. A `127.0.0.1` bind cannot be reached from another host.
+
 ### Metrics
 
 Metrics for the selected database are shown on the **Dashboard**, not in
@@ -318,12 +336,49 @@ The Replication tab exposes:
 - head sequence;
 - applied source sequences and lag on replicas;
 - current `write_url` for client/load-balancer routing;
-- transport source, bootstrap mode, poll interval, last success, and last
-  transport/apply error;
+- transport source, bootstrap mode, poll interval, paused state, last success,
+  and last transport/apply error;
+- **Pause replication** / **Resume replication** and **Disconnect from source**
+  controls on a replica or standby;
 - editable source settings saved to the hidden node metadata collection;
+- pause/resume and disconnect controls that do not delete local data;
 - manual promote/demote with expected epoch, successor URL, and confirmation;
-- replica acknowledgements and minimum safe sequence;
+- replica connections with fresh/stale acknowledgements, a **connected** badge,
+  and the minimum safe sequence; the panel refreshes every 3 seconds;
 - recent replication transactions with grouped collection/op/id changes.
+
+#### Pause and disconnect
+
+On a replica or standby, **Replication → Replication control** provides:
+
+- **Pause replication** — stops pulling and applying new transactions while
+  keeping the source and token for resume;
+- **Resume replication** — restarts the pull loop immediately;
+- **Disconnect from source** — removes the source and token, stops pulling, and
+  leaves the node read-only. Local collections and history are not deleted.
+  Use **Promote to primary** separately if the node should become standalone.
+
+Reconnecting after a disconnect requires a new pairing code or a manually
+configured source. The primary's `Replica connections` entry becomes stale
+until the replica reconnects.
+
+#### Cluster discovery and replica URLs
+
+A replica can advertise its own API URL in every acknowledgement:
+
+```env
+NONODB_REPLICATION_ADVERTISE_URL=http://10.0.0.50:7912
+```
+
+When set, the primary stores the URL with the ACK. The GUI asks the primary for
+the current replica roster and automatically probes advertised `http://` URLs,
+so a dynamically joined replica can get a full Cluster card without being
+listed in `--cluster` at GUI startup.
+
+If the replica has no advertise URL, or the URL is not reachable from the GUI
+host, it still appears under **Replication → Replica connections** and under
+**Cluster → Dynamic replica connections** with node id, sequence, and ACK age,
+but without metrics or disk details.
 
 #### Add a replica from the GUI
 
@@ -352,8 +407,11 @@ but a non-default `NONODB_TCP` port is valid. Never use the GUI proxy port
    ```
 
 7. The replica becomes read-only, receives the cluster auth registry, backup
-   configuration, database catalog, and starts pulling. Verify with
-   `nonodb-cli replication status` and `nonodb-cli ready`.
+   configuration, database catalog, and starts pulling. The CLI prints
+   `Connected to the cluster.` with the node id, source, databases, and local
+   role. Verify with `nonodb-cli replication status` and `nonodb-cli ready`.
+   The primary's **Replica connections** panel updates within a few seconds and
+   shows the node as **connected** after its first acknowledgement.
 8. Revoke unused codes in the **Pending pairings** list. Codes are single-use
    and expire after 10 minutes.
 
@@ -441,7 +499,7 @@ docker run -d --name nonodb-gui \
   -p 127.0.0.1:8787:8787 \
   -v nonodb-run:/run/nonodb \
   -e NONODB_SOCK=/run/nonodb/nonodb.sock \
-  ghcr.io/essmos/nonodb:0.24.0 \
+  ghcr.io/essmos/nonodb:0.25.0-rc.1 \
   nonodb-cli gui --host 0.0.0.0 --port 8787 --allow-remote --no-open
 ```
 

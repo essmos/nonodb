@@ -25,6 +25,7 @@ tokio-util = { version = "0.7", features = ["io"] }
 time = { version = "0.3", features = ["formatting"] }
 serde.workspace = true
 serde_json.workspace = true
+ipnet = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }

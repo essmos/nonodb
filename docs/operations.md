@@ -89,6 +89,8 @@ secrets.
 | `NONODB_BACKUP_SCHEDULER_INTERVAL` | `15` | Scheduler polling interval in seconds |
 | `NONODB_BACKUP_KEY_DIR` | `<NONODB_DATA>/backup-keys` | Directory for generated age keys and restic password files, mode `0700` |
 | `NONODB_IMPORT_ROOTS` | `<NONODB_DATA>/backups` | Allowed local roots for the backup Import wizard |
+| `NONODB_FIREWALL_MANAGE` | `0` | Enable applying the managed nftables firewall from the Network tab/API |
+| `NONODB_FIREWALL_SUDO` | `0` | Run `nft` through `sudo -n` when the daemon is not root |
 | `NONODB_REPLICATION_ENABLED` | `0` | Enable durable writer replication-log capture |
 | `NONODB_REPLICATION_ORIGIN` | `NONODB_NODE_ID` or `local` | Stable node identity written into replication records |
 | `NONODB_REPLICATION_ROLE` | `primary` | Seeds hidden role state: `primary`, `replica`, or `standby`; replicas are read-only |
@@ -285,7 +287,7 @@ Download the archive from the matching GitHub Release, verify its checksum, and
 install the two binaries:
 
 ```bash
-TAG=v0.24.0
+TAG=v0.25.0-rc.1
 ARCHIVE="nonodb-$TAG-linux-x86_64.tar.gz"
 curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/$ARCHIVE"
 curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/$ARCHIVE.sha256"
@@ -347,7 +349,7 @@ Linux `amd64` and `arm64`. Pull a published tag:
 
 ```bash
 # Pin a version in production; latest tracks stable releases.
-docker pull ghcr.io/essmos/nonodb:0.24.0
+docker pull ghcr.io/essmos/nonodb:0.25.0-rc.1
 ```
 
 If the GHCR package is private, log in before pulling:
@@ -393,7 +395,7 @@ docker run -d --name nonodb \
   --group-add "$(id -g)" \
   -v "$NONODB_AUTH_FILE:/etc/nonodb/auth.json:ro" \
   -v nonodb-data:/var/lib/nonodb \
-  ghcr.io/essmos/nonodb:0.24.0
+  ghcr.io/essmos/nonodb:0.25.0-rc.1
 ```
 
 Verify it:
@@ -465,7 +467,7 @@ docker volume create nonodb-run
 docker run -d --name nonodb \
   -v nonodb-data:/var/lib/nonodb \
   -v nonodb-run:/run/nonodb \
-  ghcr.io/essmos/nonodb:0.24.0
+  ghcr.io/essmos/nonodb:0.25.0-rc.1
 ```
 
 The client container mounts the same `nonodb-run` volume and sets:
@@ -494,7 +496,7 @@ docker run -d --name nonodb \
   -v "$NONODB_AUTH_FILE:/etc/nonodb/auth.json:ro" \
   -v /host/certs:/certs:ro \
   -v nonodb-data:/var/lib/nonodb \
-  ghcr.io/essmos/nonodb:0.24.0
+  ghcr.io/essmos/nonodb:0.25.0-rc.1
 ```
 
 Without a certificate and key pair, TCP runs in plaintext and logs a warning.
@@ -508,7 +510,7 @@ Back up into a separate mounted directory:
 docker run --rm \
   -v nonodb-data:/var/lib/nonodb:ro \
   -v /host/backups:/backups \
-  ghcr.io/essmos/nonodb:0.24.0 \
+  ghcr.io/essmos/nonodb:0.25.0-rc.1 \
   nonodb-cli backup-all /var/lib/nonodb /backups/$(date -u +%Y%m%dT%H%M%SZ)
 ```
 
@@ -528,7 +530,7 @@ docker run -d --name nonodb \
   -v "$NONODB_AUTH_FILE:/etc/nonodb/auth.json:ro" \
   -v nonodb-data:/var/lib/nonodb \
   -v /host/backups:/var/backups/nonodb \
-  ghcr.io/essmos/nonodb:0.24.0
+  ghcr.io/essmos/nonodb:0.25.0-rc.1
 ```
 
 Then use `/var/backups/nonodb` in the GUI. By default keys live in
@@ -669,6 +671,39 @@ For one database, use `nonodb-cli --db app1 backup ...` and
 `nonodb-cli --db app1 restore ...`. Never restore over a live database.
 `auth.json` and the audit log are not part of a database backup; protect them
 separately.
+
+## Host firewall (nftables)
+
+The **Network** tab and `GET /v1/network` can generate a dedicated nftables
+table for NonoDB's TCP ports. Rule generation works without privileges; apply
+is disabled unless the daemon runs with:
+
+```env
+NONODB_FIREWALL_MANAGE=1
+```
+
+If the daemon is not root and the host allows passwordless sudo for `nft`:
+
+```env
+NONODB_FIREWALL_SUDO=1
+```
+
+The managed table is fixed:
+
+```text
+table inet nonodb_firewall
+  chain input
+```
+
+It only accepts loopback and the configured source CIDRs on the selected
+NonoDB ports, then drops other traffic to those ports. It does not alter SSH,
+the GUI proxy port, or a general host input policy. Deleting the table from the
+Network tab reopens those ports.
+
+Before applying, verify the listener bind and advertise URL in the same tab.
+A rule that omits the administrator's source address can lock that client out
+of the NonoDB API and replication; the GUI proxy on its separate port is not
+affected. Prefer a management network/VPN and keep SSH access independent.
 
 ## Monitoring
 

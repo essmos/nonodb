@@ -152,6 +152,79 @@ export async function exec<T = unknown>(
   }
 }
 
+export type ServerInfo = {
+  version: string;
+  tcp?: {
+    configured: string;
+    bound: string;
+    tls: boolean;
+  } | null;
+  unix?: string | null;
+  advertise_url?: string | null;
+};
+
+export async function serverInfo(connection: Connection): Promise<ServerInfo> {
+  const response = await fetch(endpointFor(connection, '/v1/server'), {
+    headers: headers(connection),
+  });
+  let payload: any = null;
+  try {
+    payload = await response.json();
+  } catch {
+    throw new ApiError('invalid_response', `HTTP ${response.status}`, response.status);
+  }
+  if (!response.ok || payload?.ok === false) {
+    const error = payload?.error ?? {};
+    throw new ApiError(
+      error.code ?? 'http_error',
+      error.message ?? `HTTP ${response.status}`,
+      response.status,
+    );
+  }
+  return payload.result as ServerInfo;
+}
+
+export type FirewallState = {
+  available: boolean;
+  backend: string;
+  apply_enabled: boolean;
+  managed: boolean;
+  status?: string | null;
+  error?: string | null;
+  table: string;
+};
+
+export type NetworkInfo = {
+  listeners: ServerInfo;
+  firewall: FirewallState;
+  allowed: string[];
+  ports: number[];
+  preview: string;
+};
+
+export function networkInfo(connection: Connection): Promise<NetworkInfo> {
+  return authRequest<NetworkInfo>(connection, '/v1/network');
+}
+
+export function saveFirewall(
+  connection: Connection,
+  allowed: string[],
+  ports: number[],
+): Promise<NetworkInfo> {
+  return authRequest<NetworkInfo>(connection, '/v1/network/firewall', 'PUT', {
+    allowed,
+    ports,
+  });
+}
+
+export function applyFirewall(connection: Connection): Promise<NetworkInfo> {
+  return authRequest<NetworkInfo>(connection, '/v1/network/firewall/apply', 'POST', {});
+}
+
+export function disableFirewall(connection: Connection): Promise<NetworkInfo> {
+  return authRequest<NetworkInfo>(connection, '/v1/network/firewall', 'DELETE');
+}
+
 export async function health(connection: Connection): Promise<unknown> {
   const response = await fetch(endpointFor(connection, '/healthz'));
   if (!response.ok) throw new ApiError('http_error', `HTTP ${response.status}`, response.status);
@@ -568,8 +641,10 @@ export type ReplicationStatus = {
   lease_valid?: boolean;
   write_url?: string | null;
   head: number;
+  paused?: boolean;
   replication?: {
     role?: string;
+    paused?: boolean;
     epoch?: number;
     source?: string | null;
     databases?: string[];
@@ -592,6 +667,7 @@ export type ReplicationStatus = {
     seq: number;
     at_ms: number;
     age_seconds: number;
+    url?: string | null;
   }>;
   min_ack?: number;
 };
@@ -732,6 +808,18 @@ export function revokeReplicaPairing(
     'DELETE',
     {},
   ) as Promise<{ revoked: boolean }>;
+}
+
+export function pauseReplication(connection: Connection): Promise<unknown> {
+  return authRequest(connection, '/v1/replication/pause', 'POST', {});
+}
+
+export function resumeReplication(connection: Connection): Promise<unknown> {
+  return authRequest(connection, '/v1/replication/resume', 'POST', {});
+}
+
+export function disconnectReplication(connection: Connection): Promise<unknown> {
+  return authRequest(connection, '/v1/replication/disconnect', 'POST', {});
 }
 
 export function updateReplicationSource(

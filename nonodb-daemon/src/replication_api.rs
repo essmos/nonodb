@@ -41,6 +41,8 @@ pub struct AckBody {
     pub node: String,
     pub origin: String,
     pub seq: u64,
+    #[serde(default)]
+    pub advertise_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -139,11 +141,13 @@ pub async fn status(
             let acks = ack_details
                 .into_iter()
                 .map(|(node, seq, at_ms)| {
+                    let url = crate::replicator::replica_url(&node);
                     serde_json::json!({
                         "node": node,
                         "seq": seq,
                         "at_ms": at_ms,
                         "age_seconds": now_ms.saturating_sub(at_ms) as f64 / 1000.0,
+                        "url": url,
                     })
                 })
                 .collect::<Vec<_>>();
@@ -408,6 +412,97 @@ pub async fn update_source(
     }
 }
 
+async fn set_paused(
+    state: &AppState,
+    connection: &auth::ConnectionAuth,
+    headers: &HeaderMap,
+    op: &str,
+    value: bool,
+) -> AuthResponse {
+    let (principal, started) = match start_admin(state, connection, headers, op) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    match crate::replicator::set_paused(value) {
+        Ok(()) => {
+            audit_control(
+                state,
+                connection,
+                principal.name(),
+                op,
+                true,
+                None,
+                started,
+                None,
+            );
+            ok(serde_json::json!({
+                "paused": value,
+                "role": crate::replicator::role(),
+                "source": crate::replicator::status_json().get("source").cloned(),
+            }))
+        }
+        Err(message) => failure(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "replication_pause",
+            message,
+        ),
+    }
+}
+
+pub async fn pause(
+    State(state): State<AppState>,
+    Extension(connection): Extension<auth::ConnectionAuth>,
+    headers: HeaderMap,
+) -> AuthResponse {
+    set_paused(&state, &connection, &headers, "replication_pause", true).await
+}
+
+pub async fn resume(
+    State(state): State<AppState>,
+    Extension(connection): Extension<auth::ConnectionAuth>,
+    headers: HeaderMap,
+) -> AuthResponse {
+    set_paused(&state, &connection, &headers, "replication_resume", false).await
+}
+
+pub async fn disconnect(
+    State(state): State<AppState>,
+    Extension(connection): Extension<auth::ConnectionAuth>,
+    headers: HeaderMap,
+) -> AuthResponse {
+    let (principal, started) =
+        match start_admin(&state, &connection, &headers, "replication_disconnect") {
+            Ok(value) => value,
+            Err(response) => return response,
+        };
+    match crate::replicator::disconnect(state.databases.root()) {
+        Ok(()) => {
+            audit_control(
+                &state,
+                &connection,
+                principal.name(),
+                "replication_disconnect",
+                true,
+                None,
+                started,
+                None,
+            );
+            ok(serde_json::json!({
+                "disconnected": true,
+                "paused": true,
+                "role": crate::replicator::role(),
+                "source": null,
+                "read_only": !crate::replicator::writable(),
+            }))
+        }
+        Err(message) => failure(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "replication_disconnect",
+            message,
+        ),
+    }
+}
+
 pub async fn promote(
     State(state): State<AppState>,
     Extension(connection): Extension<auth::ConnectionAuth>,
@@ -652,6 +747,16 @@ pub async fn ack(
         Ok(runtime) => runtime.store.clone(),
         Err(error) => return failure(StatusCode::BAD_REQUEST, &error.code, error.message),
     };
+    if let Some(url) = body
+        .advertise_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+    {
+        if let Err(message) = crate::replicator::record_replica_url(&body.node, url) {
+            return failure(StatusCode::BAD_REQUEST, "invalid_advertise_url", message);
+        }
+    }
     match store.record_replica_ack(&body.origin, &body.node, body.seq) {
         Ok(()) => {
             audit_control(

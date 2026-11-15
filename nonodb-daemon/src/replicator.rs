@@ -38,6 +38,60 @@ fn source_config_lock() -> &'static Mutex<()> {
     SOURCE_CONFIG_LOCK.get_or_init(|| Mutex::new(()))
 }
 
+/// Stores the URL a replica advertises in its ACK. This is node-local: a new
+/// primary learns the roster again from fresh ACKs after failover.
+pub fn record_replica_url(node: &str, url: &str) -> Result<(), String> {
+    let node = node.trim();
+    if node.is_empty() || node.len() > 128 {
+        return Err("replica node id must be 1..=128 characters".into());
+    }
+    let url = url.trim().trim_end_matches('/');
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return Err("replica advertise URL must start with http:// or https://".into());
+    }
+    if url.len() > 2048 || url.chars().any(char::is_whitespace) {
+        return Err("replica advertise URL is invalid".into());
+    }
+    let mut urls = crate::node_state::get_json::<std::collections::HashMap<String, String>>(
+        "replication:replica_urls",
+    )?
+    .unwrap_or_default();
+    urls.insert(node.to_string(), url.to_string());
+    crate::node_state::put_json("replication:replica_urls", &urls)
+}
+
+pub fn replica_url(node: &str) -> Option<String> {
+    crate::node_state::get_json::<std::collections::HashMap<String, String>>(
+        "replication:replica_urls",
+    )
+    .ok()
+    .flatten()
+    .and_then(|urls| urls.get(node).cloned())
+}
+
+const PAUSED_KEY: &str = "replication:paused";
+
+pub fn paused() -> bool {
+    crate::node_state::get_json::<bool>(PAUSED_KEY)
+        .ok()
+        .flatten()
+        .unwrap_or(false)
+}
+
+pub fn set_paused(value: bool) -> Result<(), String> {
+    crate::node_state::put_json(PAUSED_KEY, &value)
+}
+
+/// Stops pulling and removes the source configuration. The node remains
+/// read-only until explicitly promoted.
+pub fn disconnect(data_root: &std::path::Path) -> Result<(), String> {
+    set_paused(true)?;
+    crate::node_state::remove("replication:source")?;
+    clear_source_status();
+    let _ = data_root;
+    Ok(())
+}
+
 pub fn set_cluster_peer_token(token: Option<String>) {
     *cluster_peer_slot()
         .write()
@@ -898,6 +952,20 @@ fn record_source(source: &PersistedSource) {
     status.last_apply_error = None;
 }
 
+fn clear_source_status() {
+    let mut status = runtime_status()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    status.source = None;
+    status.databases.clear();
+    status.interval_secs = 0;
+    status.bootstrap.clear();
+    status.last_success_unix = 0;
+    status.last_error_unix = 0;
+    status.last_transport_error = None;
+    status.last_apply_error = None;
+}
+
 fn record_success() {
     let mut status = runtime_status()
         .lock()
@@ -946,6 +1014,7 @@ pub fn status_json() -> Value {
         "read_only": !writable(),
         "lease_valid": lease_valid(),
         "promotion_ready": promotion_ready(),
+        "paused": paused(),
         "successor": role_cell()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1116,6 +1185,7 @@ pub fn set_source_with_token(
         bootstrap: bootstrap.to_string(),
     };
     write_state("replication:source", &persisted)?;
+    let _ = set_paused(false);
     record_source(&persisted);
     Ok(serde_json::json!({
         "source": persisted.source,
@@ -1501,7 +1571,7 @@ pub fn start(
             let config = match Config::load(&data_root) {
                 Ok(Some(config)) => config,
                 Ok(None) => {
-                    if !role_is_primary() && !discovery_urls().is_empty() {
+                    if !role_is_primary() && !paused() && !discovery_urls().is_empty() {
                         if let Ok(Some(source)) = discover_primary(&data_root).await {
                             if let Some(token) = voter_token() {
                                 let databases = default_databases();
@@ -1542,6 +1612,13 @@ pub fn start(
                 }
             };
             record_config(&config);
+            if paused() {
+                tokio::select! {
+                    _ = shutdown.changed() => break,
+                    _ = tokio::time::sleep(config.interval) => {}
+                }
+                continue;
+            }
             if !writable() {
                 let client = match config.client() {
                     Ok(client) => client,
@@ -1949,12 +2026,15 @@ async fn send_ack(
     } else {
         format!("/{database}/v1/replication/ack")
     };
-    let body = serde_json::to_vec(&serde_json::json!({
+    let mut payload = serde_json::json!({
         "node": node_id(),
         "origin": origin,
         "seq": seq,
-    }))
-    .map_err(|error| error.to_string())?;
+    });
+    if let Some(advertise) = non_empty_env("NONODB_REPLICATION_ADVERTISE_URL") {
+        payload["advertise_url"] = advertise.trim().trim_end_matches('/').into();
+    }
+    let body = serde_json::to_vec(&payload).map_err(|error| error.to_string())?;
     let mut request = client
         .post(format!("{}{}", config.source, path))
         .header(reqwest::header::ACCEPT, "application/json")

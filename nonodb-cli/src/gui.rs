@@ -215,7 +215,7 @@ fn handle(
     let request = read_request(&mut client)?;
 
     if request.path == "/gui/cluster/status" {
-        return serve_cluster(client, cluster);
+        return serve_cluster(client, cluster, target);
     }
     if request.path == "/gui/test/progress" {
         return serve_test_progress(client, progress_file);
@@ -242,6 +242,9 @@ fn handle(
     }
     if plain_path == "/v1/exec"
         || plain_path == "/healthz"
+        || plain_path == "/v1/server"
+        || plain_path == "/v1/network"
+        || plain_path.starts_with("/v1/network/")
         || plain_path == "/readyz"
         || plain_path == "/metrics"
         || plain_path == "/metrics/prometheus"
@@ -331,10 +334,24 @@ fn serve_test_progress(mut client: TcpStream, progress_file: Option<&Path>) -> R
     )
 }
 
-fn serve_cluster(mut client: TcpStream, nodes: &[ClusterNode]) -> Result<(), String> {
+fn serve_cluster(
+    mut client: TcpStream,
+    nodes: &[ClusterNode],
+    target: &Target,
+) -> Result<(), String> {
     let token = std::env::var("NONODB_CLUSTER_TOKEN")
         .or_else(|_| std::env::var("NONODB_TOKEN"))
         .ok();
+    let mut merged = nodes.to_vec();
+    for node in dynamic_cluster_nodes(target, token.as_deref()) {
+        if !merged
+            .iter()
+            .any(|existing| existing.name == node.name || existing.url == node.url)
+        {
+            merged.push(node);
+        }
+    }
+    let nodes = merged.as_slice();
     let payload = if nodes.is_empty() {
         serde_json::json!({
             "ok": true,
@@ -376,6 +393,79 @@ fn serve_cluster(mut client: TcpStream, nodes: &[ClusterNode]) -> Result<(), Str
         &body,
         false,
     )
+}
+
+fn dynamic_cluster_nodes(target: &Target, token: Option<&str>) -> Vec<ClusterNode> {
+    let Ok(status) = http_json_target(target, "/v1/replication/status", token) else {
+        return Vec::new();
+    };
+    let Some(acks) = status
+        .pointer("/result/acks")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return Vec::new();
+    };
+    acks.iter()
+        .filter_map(|ack| {
+            let name = ack.get("node").and_then(serde_json::Value::as_str)?;
+            let url = ack.get("url").and_then(serde_json::Value::as_str)?;
+            if !url.starts_with("http://") {
+                return None;
+            }
+            Some(ClusterNode {
+                name: name.to_string(),
+                url: url.trim_end_matches('/').to_string(),
+            })
+        })
+        .collect()
+}
+
+fn http_json_target(
+    target: &Target,
+    path: &str,
+    token: Option<&str>,
+) -> Result<serde_json::Value, String> {
+    let mut stream = connect(target)?;
+    let mut request = format!(
+        "GET {path} HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\nConnection: close\r\n"
+    );
+    if let Some(token) = token.filter(|token| !token.is_empty()) {
+        request.push_str(&format!("Authorization: Bearer {token}\r\n"));
+    }
+    request.push_str("\r\n");
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|e| e.to_string())?;
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .map_err(|e| e.to_string())?;
+    parse_http_json(&response)
+}
+
+fn parse_http_json(response: &[u8]) -> Result<serde_json::Value, String> {
+    let split = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or_else(|| "malformed HTTP response".to_string())?;
+    let head = String::from_utf8_lossy(&response[..split]);
+    let status_code = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok())
+        .ok_or_else(|| "missing HTTP status".to_string())?;
+    if status_code != 200 {
+        return Err(format!("HTTP {status_code}"));
+    }
+    let mut body = response[split + 4..].to_vec();
+    if head
+        .to_ascii_lowercase()
+        .contains("transfer-encoding: chunked")
+    {
+        body = decode_chunked(&body)?;
+    }
+    serde_json::from_slice(&body).map_err(|e| format!("invalid JSON: {e}"))
 }
 
 fn probe_node(node: &ClusterNode, token: Option<&str>) -> serde_json::Value {

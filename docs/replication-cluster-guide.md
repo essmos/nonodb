@@ -1,6 +1,6 @@
 # Replication and cluster guide
 
-This is the practical operator guide for NonoDB replication in `0.24.0` and
+This is the practical operator guide for NonoDB replication in `0.25.0` and
 later. It covers a primary, read replicas, hot standby, quorum failover, the CLI,
 the GUI Cluster view, monitoring, and the common failure modes.
 
@@ -139,7 +139,7 @@ Install the released binaries on every node (see [Operations](operations.md#inst
 for the full systemd and Docker variants):
 
 ```bash
-TAG=v0.24.0
+TAG=v0.25.0-rc.1
 ARCHIVE="nonodb-$TAG-linux-x86_64.tar.gz"
 curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/$ARCHIVE"
 curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/$ARCHIVE.sha256"
@@ -472,6 +472,9 @@ nonodb-cli replication demote <epoch> replica [successor-url]
 | `changes [after] [limit]` | Read the durable replication log. Use an `after` checkpoint for consumers. |
 | `acks` | Replica acknowledgement sequences and ages. |
 | `source <url> [dbs] [interval]` | Change the pull source without restarting. |
+| `pause` | Stop pulling/applying while keeping the source and token. |
+| `resume` | Resume a paused replica from the stored source. |
+| `disconnect` | Remove source/token and leave the node read-only; data is kept. |
 | `prune <seq> [--require-acks]` | Remove old log records, optionally refusing to pass the minimum ack. |
 | `add-replica <name> [dbs]` (alias `pair`) | Create a one-time 8-character pairing code on the primary. |
 | `pairings` | List pending pairing codes. |
@@ -719,7 +722,42 @@ When a benchmark is running and the GUI is started with
 shows a **Live load test** panel with phase, loaded documents, percent, rate,
 nodes online, writes, primary, and epoch.
 
-## 10. Monitoring
+### 9.6 Pause and disconnect
+
+A replica or standby can be paused without losing its source:
+
+```bash
+nonodb-cli replication pause
+nonodb-cli replication resume
+```
+
+`disconnect` is stronger: it removes the source and token and leaves the node
+read-only. It does not delete collections or history. Promote the node separately
+if it should become standalone, and use a new pairing code to reconnect it later.
+The **Replication** page exposes the same controls with confirmation.
+
+### 9.6 Network tab
+
+A replica should set `NONODB_REPLICATION_ADVERTISE_URL` to an address reachable
+from the primary/GUI host. The URL is carried in replication acknowledgements.
+The primary stores it, and the GUI automatically probes advertised `http://`
+replicas for full Cluster metrics. Without it, the replica still appears through
+its ACK but only with node id, sequence, and freshness.
+
+The **Network** tab contains the actual listener bind and the host firewall
+controls. This is where you verify that the primary is reachable before adding
+a remote replica:
+
+- TCP bind must be `0.0.0.0` or a LAN address, not `127.0.0.1`;
+- the advertised replication URL must be reachable from replicas;
+- the managed nftables table can allow only selected source CIDRs on the NonoDB
+  ports.
+
+Firewall apply is opt-in with `NONODB_FIREWALL_MANAGE=1`; on a non-root service
+use `NONODB_FIREWALL_SUDO=1` with passwordless sudo. The managed table is
+separate from SSH and general host policy. See [Operations](operations.md#host-firewall-nftables).
+
+## 10. Monitoring## 10. Monitoring
 
 Prometheus exposes replication metrics at `/metrics/prometheus` with a
 `metrics:read`, `admin:db`, or `*:*` token. JSON metrics are also available at
@@ -853,7 +891,9 @@ enforces memory limits.
   hidden local metadata collection. Protect every node's data directory as an
   administrator-equivalent secret.
 - Store manual tokens in a secret manager or a `0600` environment file.
-- Restrict source access by firewall or private network.
+- Restrict source access by firewall or private network. The **Network** tab
+  generates a dedicated nftables table for NonoDB ports; never replace the
+  general host firewall from an automated UI.
 - Rotate certificates and tokens.
 - Keep NTP enabled.
 - Back up the database even with a healthy replica.

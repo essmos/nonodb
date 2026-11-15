@@ -11,6 +11,7 @@ use std::net::TcpStream;
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use nonodb_core::heed::types::Bytes;
 use nonodb_core::heed::{CompactionOption, EnvFlags, EnvOpenOptions};
@@ -39,6 +40,10 @@ fn run() -> Result<(), String> {
         }
         "ready" => {
             let res = http_get("/readyz")?;
+            println!("{}", serde_json::to_string_pretty(&res).unwrap());
+        }
+        "server" | "bind" | "binds" => {
+            let res = http_get("/v1/server")?;
             println!("{}", serde_json::to_string_pretty(&res).unwrap());
         }
         "backup-keygen" => {
@@ -168,6 +173,98 @@ fn run() -> Result<(), String> {
                     }
                     let res =
                         http_post("/v1/replication/join", &json!({ "url": url, "code": code }))?;
+                    let body = res.get("result").unwrap_or(&res);
+                    let source = body
+                        .pointer("/source/source")
+                        .and_then(Value::as_str)
+                        .unwrap_or(url);
+                    let databases = body
+                        .pointer("/source/databases")
+                        .and_then(Value::as_array)
+                        .map(|items| {
+                            items
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        })
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or_else(|| "default".to_string());
+                    let node_id = body
+                        .get("node_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("local");
+                    println!("Connected to the cluster.");
+                    println!("  node_id:   {node_id}");
+                    println!("  source:    {source}");
+                    println!("  databases: {databases}");
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    let mut connected = false;
+                    let mut printed_status = false;
+                    let mut last_error: Option<String> = None;
+                    loop {
+                        if let Ok(status) = http_get("/v1/replication/status") {
+                            if let Some(result) = status.get("result") {
+                                let role = result
+                                    .get("role")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("replica");
+                                let local_source = result
+                                    .pointer("/replication/source")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or(source);
+                                if !printed_status {
+                                    println!("  role:      {role}");
+                                    println!("  pulling:   {local_source}");
+                                    printed_status = true;
+                                }
+                                last_error = result
+                                    .pointer("/replication/last_transport_error")
+                                    .and_then(Value::as_str)
+                                    .filter(|value| !value.is_empty())
+                                    .map(str::to_string)
+                                    .or_else(|| {
+                                        result
+                                            .pointer("/replication/last_apply_error")
+                                            .and_then(Value::as_str)
+                                            .filter(|value| !value.is_empty())
+                                            .map(str::to_string)
+                                    });
+                                connected = result
+                                    .pointer("/replication/promotion_ready")
+                                    .and_then(Value::as_bool)
+                                    .unwrap_or(false);
+                                if connected {
+                                    break;
+                                }
+                            }
+                        }
+                        if Instant::now() >= deadline {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(250));
+                    }
+                    if connected {
+                        println!("Replication connected and caught up.");
+                    } else {
+                        println!("Join accepted; the first pull is still in progress.");
+                        if let Some(error) = last_error {
+                            println!("  last error: {error}");
+                        }
+                        println!("  Check with: nonodb-cli replication status");
+                    }
+                    println!("The primary GUI shows this replica after its first acknowledgement.");
+                }
+                "pause" => {
+                    let res = http_post("/v1/replication/pause", &json!({}))?;
+                    print_result(&res);
+                }
+                "resume" => {
+                    let res = http_post("/v1/replication/resume", &json!({}))?;
+                    print_result(&res);
+                }
+                "disconnect" => {
+                    let res = http_post("/v1/replication/disconnect", &json!({}))?;
                     print_result(&res);
                 }
                 "source" => {
@@ -569,9 +666,10 @@ fn usage() -> Result<(), String> {
          Komendy:\n\
          gui [--port N] [--no-open]  lokalne GUI w przeglądarce\n\
          ping                       sprawdź daemona\n\
+         server                     rzeczywiste adresy nasłuchu (TCP/UDS)\n\
          exec '<json>'              dowolne żądanie /v1/exec\n\
          databases [list|create <nazwa>|drop <nazwa>]  bazy w jednym daemonie\n\
-         replication [status|changes [after] [limit]|source <url> [dbs] [interval]|acks|prune <seq> [--require-acks]|promote <epoch> [--force]|demote <epoch> [role] [successor]|add-replica <name> [dbs]|pairings|revoke <code>|join <primary-url> [code]]\n\
+         replication [status|changes [after] [limit]|source <url> [dbs] [interval]|pause|resume|disconnect|acks|prune <seq> [--require-acks]|promote <epoch> [--force]|demote <epoch> [role] [successor]|add-replica <name> [dbs]|pairings|revoke <code>|join <primary-url> [code]]\n\
          collections                lista kolekcji\n\
          count <coll> [filtr]       liczba dokumentów\n\
          find <coll> [filtr] [--sort pole:asc|desc] [--limit N] [--skip N]\n\
@@ -920,7 +1018,10 @@ fn http_request(method: &str, path: &str, body: Option<&Value>) -> Result<Value,
     };
     let path = path.as_str();
     #[cfg(unix)]
-    let mut stream = UnixStream::connect(sock_path()).map_err(|e| format!("connect: {e}"))?;
+    let socket = sock_path();
+    #[cfg(unix)]
+    let mut stream = UnixStream::connect(&socket)
+        .map_err(|e| format!("connect {socket}: {e} (set NONODB_SOCK to the daemon socket)"))?;
     #[cfg(not(unix))]
     let mut stream = {
         let addr = tcp_addr()?;
