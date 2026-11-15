@@ -95,7 +95,8 @@ secrets.
 | `NONODB_REPLICATION_ORIGIN` | `NONODB_NODE_ID` or `local` | Stable node identity written into replication records |
 | `NONODB_REPLICATION_ROLE` | `primary` | Seeds hidden role state: `primary`, `replica`, or `standby`; replicas are read-only |
 | `NONODB_REPLICATION_NODE_ID` | `NONODB_NODE_ID` or `local` | Replica identity used in retention acknowledgements |
-| `NONODB_REPLICATION_ADVERTISE_URL` | unset | Public URL used to demote the old source and advertise this node on promotion |
+| `NONODB_REPLICATION_ADVERTISE_URL` | unset | Public URL used to demote the old source and advertise this node on promotion. On a replica, if unset, the daemon falls back to the local interface that routes to the primary plus the actual TCP listener (or `NONODB_TCP`) for ACK/GUI metrics; set it explicitly behind NAT or a port forward |
+| `NONODB_INSTANCE_DIR` | user runtime dir | Override the per-user directory used by `nonodb-cli instances` |
 | `NONODB_REPLICATION_VOTERS` | unset | Comma-separated voter URLs required for quorum promotion |
 | `NONODB_REPLICATION_VOTER_TOKEN` | unset | Bearer token used to call voter endpoints |
 | `NONODB_REPLICATION_FOLLOWERS` | unset | Non-voting replica URLs that receive source updates after promotion |
@@ -287,7 +288,7 @@ Download the archive from the matching GitHub Release, verify its checksum, and
 install the two binaries:
 
 ```bash
-TAG=v0.25.0-rc.2
+TAG=v0.25.0-rc.3
 ARCHIVE="nonodb-$TAG-linux-x86_64.tar.gz"
 curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/$ARCHIVE"
 curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/$ARCHIVE.sha256"
@@ -349,7 +350,7 @@ Linux `amd64` and `arm64`. Pull a published tag:
 
 ```bash
 # Pin a version in production; latest tracks stable releases.
-docker pull ghcr.io/essmos/nonodb:0.25.0-rc.2
+docker pull ghcr.io/essmos/nonodb:0.25.0-rc.3
 ```
 
 If the GHCR package is private, log in before pulling:
@@ -395,7 +396,7 @@ docker run -d --name nonodb \
   --group-add "$(id -g)" \
   -v "$NONODB_AUTH_FILE:/etc/nonodb/auth.json:ro" \
   -v nonodb-data:/var/lib/nonodb \
-  ghcr.io/essmos/nonodb:0.25.0-rc.2
+  ghcr.io/essmos/nonodb:0.25.0-rc.3
 ```
 
 Verify it:
@@ -467,7 +468,7 @@ docker volume create nonodb-run
 docker run -d --name nonodb \
   -v nonodb-data:/var/lib/nonodb \
   -v nonodb-run:/run/nonodb \
-  ghcr.io/essmos/nonodb:0.25.0-rc.2
+  ghcr.io/essmos/nonodb:0.25.0-rc.3
 ```
 
 The client container mounts the same `nonodb-run` volume and sets:
@@ -496,7 +497,7 @@ docker run -d --name nonodb \
   -v "$NONODB_AUTH_FILE:/etc/nonodb/auth.json:ro" \
   -v /host/certs:/certs:ro \
   -v nonodb-data:/var/lib/nonodb \
-  ghcr.io/essmos/nonodb:0.25.0-rc.2
+  ghcr.io/essmos/nonodb:0.25.0-rc.3
 ```
 
 Without a certificate and key pair, TCP runs in plaintext and logs a warning.
@@ -510,7 +511,7 @@ Back up into a separate mounted directory:
 docker run --rm \
   -v nonodb-data:/var/lib/nonodb:ro \
   -v /host/backups:/backups \
-  ghcr.io/essmos/nonodb:0.25.0-rc.2 \
+  ghcr.io/essmos/nonodb:0.25.0-rc.3 \
   nonodb-cli backup-all /var/lib/nonodb /backups/$(date -u +%Y%m%dT%H%M%SZ)
 ```
 
@@ -530,7 +531,7 @@ docker run -d --name nonodb \
   -v "$NONODB_AUTH_FILE:/etc/nonodb/auth.json:ro" \
   -v nonodb-data:/var/lib/nonodb \
   -v /host/backups:/var/backups/nonodb \
-  ghcr.io/essmos/nonodb:0.25.0-rc.2
+  ghcr.io/essmos/nonodb:0.25.0-rc.3
 ```
 
 Then use `/var/backups/nonodb` in the GUI. By default keys live in

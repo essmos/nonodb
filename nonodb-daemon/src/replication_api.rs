@@ -747,6 +747,13 @@ pub async fn ack(
         Ok(runtime) => runtime.store.clone(),
         Err(error) => return failure(StatusCode::BAD_REQUEST, &error.code, error.message),
     };
+    if crate::replicator::replica_blocked(&body.node) {
+        return failure(
+            StatusCode::FORBIDDEN,
+            "replica_removed",
+            "this replica was removed on the primary; generate a new pairing code to re-add it",
+        );
+    }
     if let Some(url) = body
         .advertise_url
         .as_deref()
@@ -821,6 +828,9 @@ pub async fn forget_ack(
     };
     match store.remove_replica_ack(&origin, &node) {
         Ok(removed) => {
+            if let Err(error) = crate::replicator::block_replica(&node) {
+                tracing::warn!(node = %node, error = %error, "block removed replica failed");
+            }
             if let Err(error) = crate::replicator::forget_replica_url(&node) {
                 tracing::warn!(node = %node, error = %error, "forget replica URL failed");
             }
@@ -838,6 +848,7 @@ pub async fn forget_ack(
                 "database": database,
                 "node": node,
                 "removed": removed,
+                "blocked": true,
             }))
         }
         Err(error) => failure(

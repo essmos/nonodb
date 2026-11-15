@@ -22,6 +22,7 @@ pub mod events;
 pub mod geo;
 pub mod history;
 pub mod index;
+pub mod instance;
 pub mod numeric;
 pub mod observer;
 pub mod progress;

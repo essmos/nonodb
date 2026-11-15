@@ -37,6 +37,8 @@ pub fn set_tcp(configured: &str, bound: &str, tls: bool) {
         bound: bound.to_string(),
         tls,
     });
+    drop(info);
+    crate::instance::set_tcp(configured, bound, tls);
 }
 
 pub fn set_unix(path: &std::path::Path) {
@@ -46,7 +48,9 @@ pub fn set_unix(path: &std::path::Path) {
 
 pub fn set_advertise_url(value: Option<String>) {
     let mut info = slot().write().unwrap_or_else(|p| p.into_inner());
-    info.advertise_url = value;
+    info.advertise_url = value.clone();
+    drop(info);
+    crate::instance::set_advertise_url(value);
 }
 
 pub fn snapshot() -> ServerInfo {

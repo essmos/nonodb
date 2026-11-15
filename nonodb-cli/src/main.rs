@@ -28,12 +28,14 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
+    strip_instance_flags(&mut args)?;
     strip_db_flag(&mut args)?;
     let Some(cmd) = args.first().map(String::as_str) else {
         return usage();
     };
     match cmd {
         "gui" => gui::run(&args[1..])?,
+        "instances" => instances_cmd(&args[1..])?,
         "ping" => {
             let res = http_get("/healthz")?;
             println!("{}", serde_json::to_string_pretty(&res).unwrap());
@@ -678,6 +680,7 @@ fn usage() -> Result<(), String> {
          exec '<json>'              dowolne żądanie /v1/exec\n\
          databases [list|create <nazwa>|drop <nazwa>]  bazy w jednym daemonie\n\
          replication [status|changes [after] [limit]|source <url> [dbs] [interval]|pause|resume|disconnect|forget <node>|acks|prune <seq> [--require-acks]|promote <epoch> [--force]|demote <epoch> [role] [successor]|add-replica <name> [dbs]|pairings|revoke <code>|join <primary-url> [code]]\n\
+         instances [--json] [prune] lista lokalnych daemonów\n\
          collections                lista kolekcji\n\
          count <coll> [filtr]       liczba dokumentów\n\
          find <coll> [filtr] [--sort pole:asc|desc] [--limit N] [--skip N]\n\
@@ -696,6 +699,8 @@ fn usage() -> Result<(), String> {
          restore-all <backup> <data> [--force] [--verify]  przywróć wszystkie bazy\n\
          \n\
          Opcje: --db <nazwa> wybiera bazę (albo NONODB_DB).\n\
+         --socket <ścieżka> wybiera daemona po sockecie (Unix),\n\
+         --instance <pid|node_id> wybiera instancję z rejestru.\n\
          Zmienne: NONODB_SOCK (Unix, domyślnie /run/nonodb.sock),\n\
          NONODB_URL (Windows, domyślnie http://127.0.0.1:7878), NONODB_TOKEN,\n\
          NONODB_DB (domyślnie default),\n\
@@ -979,6 +984,131 @@ fn tcp_addr() -> Result<String, String> {
         return Err("NONODB_URL nie zawiera adresu host:port".into());
     }
     Ok(rest.to_string())
+}
+
+fn strip_instance_flags(args: &mut Vec<String>) -> Result<(), String> {
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--socket" {
+            let value = args.get(i + 1).ok_or("--socket wymaga ścieżki")?.clone();
+            args.drain(i..=i + 1);
+            #[cfg(unix)]
+            std::env::set_var("NONODB_SOCK", value);
+            #[cfg(not(unix))]
+            return Err("--socket jest dostępny tylko na Unix; użyj NONODB_URL".into());
+            continue;
+        }
+        if let Some(value) = args[i].strip_prefix("--socket=") {
+            let value = value.to_string();
+            args.remove(i);
+            #[cfg(unix)]
+            std::env::set_var("NONODB_SOCK", value);
+            #[cfg(not(unix))]
+            return Err("--socket jest dostępny tylko na Unix; użyj NONODB_URL".into());
+            continue;
+        }
+        if args[i] == "--instance" {
+            let selector = args
+                .get(i + 1)
+                .ok_or("--instance wymaga PID albo node_id")?
+                .clone();
+            args.drain(i..=i + 1);
+            apply_instance(&selector)?;
+            continue;
+        }
+        if let Some(selector) = args[i].strip_prefix("--instance=") {
+            let selector = selector.to_string();
+            args.remove(i);
+            apply_instance(&selector)?;
+            continue;
+        }
+        i += 1;
+    }
+    Ok(())
+}
+
+fn apply_instance(selector: &str) -> Result<(), String> {
+    let entry = nonodb_core::instance::resolve(selector)?;
+    #[cfg(unix)]
+    {
+        let socket = entry
+            .record
+            .socket
+            .as_deref()
+            .ok_or("wybrana instancja nie ma socketu Unix; użyj GUI/API przez TCP")?;
+        std::env::set_var("NONODB_SOCK", socket);
+    }
+    #[cfg(not(unix))]
+    {
+        let tcp = entry
+            .record
+            .tcp_bound
+            .as_deref()
+            .or(entry.record.tcp_configured.as_deref())
+            .ok_or("wybrana instancja nie ma adresu TCP")?;
+        std::env::set_var("NONODB_URL", format!("http://{tcp}"));
+    }
+    Ok(())
+}
+
+fn instances_cmd(args: &[String]) -> Result<(), String> {
+    if args.first().map(String::as_str) == Some("prune") {
+        let removed = nonodb_core::instance::prune_stale()?;
+        println!("removed {removed} stale instance record(s)");
+        return Ok(());
+    }
+    let entries = nonodb_core::instance::list()?;
+    if args.iter().any(|arg| arg == "--json") {
+        let rows: Vec<Value> = entries
+            .iter()
+            .map(|entry| {
+                json!({
+                    "pid": entry.record.pid,
+                    "alive": entry.alive,
+                    "node_id": entry.record.node_id,
+                    "role": entry.record.role,
+                    "version": entry.record.version,
+                    "data": entry.record.data,
+                    "socket": entry.record.socket,
+                    "tcp": entry.record.tcp_bound.as_ref().or(entry.record.tcp_configured.as_ref()),
+                    "advertise_url": entry.record.advertise_url,
+                    "started_at_ms": entry.record.started_at_ms,
+                    "record": entry.path,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&rows).unwrap_or_else(|_| "[]".into())
+        );
+        return Ok(());
+    }
+    if entries.is_empty() {
+        println!("no nonodb instances registered");
+        return Ok(());
+    }
+    println!(
+        "{:<7} {:<18} {:<9} {:<8} {:<24} {:<28} DATA",
+        "PID", "NODE", "ROLE", "ALIVE", "SOCKET", "TCP"
+    );
+    for entry in entries {
+        println!(
+            "{:<7} {:<18} {:<9} {:<8} {:<24} {:<28} {}",
+            entry.record.pid,
+            entry.record.node_id,
+            entry.record.role,
+            if entry.alive { "yes" } else { "stale" },
+            entry.record.socket.as_deref().unwrap_or("-"),
+            entry
+                .record
+                .tcp_bound
+                .as_deref()
+                .or(entry.record.tcp_configured.as_deref())
+                .unwrap_or("-"),
+            entry.record.data
+        );
+    }
+    Ok(())
 }
 
 fn strip_db_flag(args: &mut Vec<String>) -> Result<(), String> {

@@ -20,6 +20,19 @@ Every daemon-facing command accepts `--db <name>` or `NONODB_DB=<name>` to selec
 a database. Without it, `default` is used. See
 [Multiple databases](multi-database.md).
 
+When several daemons run on one host, select one explicitly:
+
+```bash
+nonodb-cli instances
+nonodb-cli --instance 11727 server
+nonodb-cli --socket /tmp/nonodb.sock replication status
+```
+
+`--instance` accepts a PID or replication node id from the instance registry.
+`--socket` sets the Unix socket directly. The registry is per-user and lives in
+`$XDG_RUNTIME_DIR/nonodb/instances`, `$HOME/.nonodb/instances`, or the directory
+named by `NONODB_INSTANCE_DIR`.
+
 ## databases
 
 Manage databases in one daemon:
@@ -104,6 +117,32 @@ NONODB_SOCK=/tmp/nonodb.sock nonodb-cli server
 This is the reliable way to distinguish a process that works locally but is not
 reachable from another host. `configured` is the environment value; `bound` is
 what the kernel actually accepted.
+
+## instances
+
+List daemons that registered themselves in the per-user runtime registry:
+
+```bash
+nonodb-cli instances
+nonodb-cli instances --json
+nonodb-cli instances prune
+```
+
+Each row includes PID, node id, role, liveness, Unix socket, TCP listener,
+advertised replication URL, and data directory. `prune` removes records whose
+process has exited. Registry files are runtime metadata only; they are not
+backups and never contain tokens.
+
+Choose one instance for a command with either selector:
+
+```bash
+nonodb-cli --instance 11727 replication status
+nonodb-cli --instance liveapisec-local replication status
+nonodb-cli --socket /Users/me/nd-replica/run/nonodb.sock replication status
+```
+
+`--instance` and `--socket` are global options and can be placed before the
+command.
 
 ## ready
 
@@ -580,8 +619,9 @@ Remove a stale acknowledgement from the primary after a replica is disconnected 
 nonodb-cli replication forget replica-prod
 ```
 
-This deletes the ACK row only. A replica that is still running will reappear after
-its next ACK; use `pause` or `disconnect` on that replica first.
+This deletes the ACK row and blocks further ACKs from that node id until a new
+pairing code is redeemed. A still-running replica will receive
+`403 replica_removed`; use `pause` or `disconnect` on that replica to stop it.
 
 `pause` keeps the source and token; `resume` continues from the stored source.
 `disconnect` removes both and leaves the node read-only. Promote it separately
@@ -676,6 +716,7 @@ prune sequences that replicas still need.
 | Variable | Default | Used by |
 |---|---|---|
 | `NONODB_SOCK` | `/run/nonodb.sock` | Daemon-facing commands on Linux/macOS |
+| `NONODB_INSTANCE_DIR` | user runtime dir | Override the local instance registry directory |
 | `NONODB_URL` | `http://127.0.0.1:7878` | Daemon-facing commands on Windows |
 | `NONODB_TOKEN` | — | Bearer token for daemon-facing commands |
 | `NONODB_AUTH_FILE` | `/etc/nonodb/auth.json` (Unix) | Registry used by `auth` commands |

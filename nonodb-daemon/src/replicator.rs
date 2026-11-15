@@ -7,6 +7,7 @@
 
 use std::{
     fs,
+    net::ToSocketAddrs,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex, OnceLock,
@@ -80,6 +81,41 @@ pub fn replica_url(node: &str) -> Option<String> {
     .and_then(|urls| urls.get(node).cloned())
 }
 
+const BLOCKED_REPLICAS_KEY: &str = "replication:blocked_replicas";
+
+fn blocked_replicas() -> std::collections::HashSet<String> {
+    crate::node_state::get_json::<Vec<String>>(BLOCKED_REPLICAS_KEY)
+        .ok()
+        .flatten()
+        .unwrap_or_default()
+        .into_iter()
+        .collect()
+}
+
+pub fn replica_blocked(node: &str) -> bool {
+    blocked_replicas().contains(node)
+}
+
+pub fn block_replica(node: &str) -> Result<(), String> {
+    let mut blocked = blocked_replicas();
+    if blocked.insert(node.to_string()) {
+        let mut values: Vec<_> = blocked.into_iter().collect();
+        values.sort();
+        crate::node_state::put_json(BLOCKED_REPLICAS_KEY, &values)?;
+    }
+    Ok(())
+}
+
+pub fn unblock_replica(node: &str) -> Result<(), String> {
+    let mut blocked = blocked_replicas();
+    if blocked.remove(node) {
+        let mut values: Vec<_> = blocked.into_iter().collect();
+        values.sort();
+        crate::node_state::put_json(BLOCKED_REPLICAS_KEY, &values)?;
+    }
+    Ok(())
+}
+
 const PAUSED_KEY: &str = "replication:paused";
 
 pub fn paused() -> bool {
@@ -101,6 +137,78 @@ pub fn disconnect(data_root: &std::path::Path) -> Result<(), String> {
     clear_source_status();
     let _ = data_root;
     Ok(())
+}
+
+/// Best-effort URL for the replica's own HTTP API. Explicit
+/// `NONODB_REPLICATION_ADVERTISE_URL` always wins. Otherwise use the local
+/// interface that routes to the primary plus the configured TCP listen port.
+/// This works on a flat LAN but cannot guess NAT/port-forward mappings.
+fn inferred_advertise_url(config: &Config) -> Option<String> {
+    if let Some(url) = non_empty_env("NONODB_REPLICATION_ADVERTISE_URL") {
+        return Some(url.trim().trim_end_matches('/').to_string());
+    }
+    let tcp = crate::server_info::snapshot()
+        .tcp
+        .map(|listener| listener.bound)
+        .or_else(|| {
+            std::env::var("NONODB_TCP")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })?;
+    let tls = std::env::var_os("NONODB_TLS_CERT").is_some()
+        && std::env::var_os("NONODB_TLS_KEY").is_some();
+    inferred_advertise_url_for(&config.source, &tcp, tls)
+}
+
+fn inferred_advertise_url_for(source_url: &str, tcp: &str, tls: bool) -> Option<String> {
+    let (host, port) = tcp.rsplit_once(':')?;
+    let port = port.parse::<u16>().ok().filter(|port| *port > 0)?;
+    let host = host.trim_matches(['[', ']']);
+    if matches!(host, "127.0.0.1" | "localhost" | "::1") {
+        return None;
+    }
+    let host = if host.is_empty() || matches!(host, "0.0.0.0" | "::") {
+        let source = source_url
+            .strip_prefix("http://")
+            .or_else(|| source_url.strip_prefix("https://"))?;
+        let authority = source.split('/').next()?;
+        let default_port = if source_url.starts_with("https://") {
+            443
+        } else {
+            80
+        };
+        let (source_host, source_port) = if let Some(rest) = authority.strip_prefix('[') {
+            match rest.split_once("]:") {
+                Some((host, port)) => (host.to_string(), port.parse::<u16>().ok()?),
+                None => (rest.trim_end_matches(']').to_string(), default_port),
+            }
+        } else {
+            match authority.rsplit_once(':') {
+                Some((host, port)) => (host.to_string(), port.parse::<u16>().ok()?),
+                None => (authority.to_string(), default_port),
+            }
+        };
+        let target = format!("{source_host}:{source_port}")
+            .to_socket_addrs()
+            .ok()?
+            .find(|addr| addr.is_ipv4())?;
+        let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+        socket.connect(target).ok()?;
+        let ip = socket.local_addr().ok()?.ip();
+        if ip.is_loopback() || ip.is_unspecified() {
+            return None;
+        }
+        ip.to_string()
+    } else {
+        host.to_string()
+    };
+    let scheme = if tls { "https" } else { "http" };
+    let host = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host
+    };
+    Some(format!("{scheme}://{host}:{port}"))
 }
 
 pub fn set_cluster_peer_token(token: Option<String>) {
@@ -1056,7 +1164,7 @@ fn non_empty_env(name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn node_id() -> String {
+pub(crate) fn node_id() -> String {
     non_empty_env("NONODB_REPLICATION_NODE_ID")
         .or_else(|| non_empty_env("NONODB_NODE_ID"))
         .or_else(|| non_empty_env("NONODB_REPLICATION_ORIGIN"))
@@ -2042,8 +2150,9 @@ async fn send_ack(
         "origin": origin,
         "seq": seq,
     });
-    if let Some(advertise) = non_empty_env("NONODB_REPLICATION_ADVERTISE_URL") {
-        payload["advertise_url"] = advertise.trim().trim_end_matches('/').into();
+    if let Some(advertise) = inferred_advertise_url(config) {
+        crate::server_info::set_advertise_url(Some(advertise.clone()));
+        payload["advertise_url"] = advertise.into();
     }
     let body = serde_json::to_vec(&payload).map_err(|error| error.to_string())?;
     let mut request = client
@@ -2144,4 +2253,33 @@ async fn get_json(
         .get("result")
         .cloned()
         .ok_or_else(|| format!("{path} response is missing `result`"))
+}
+
+#[cfg(test)]
+mod advertise_tests {
+    use super::inferred_advertise_url_for;
+
+    #[test]
+    fn explicit_lan_address_is_advertised() {
+        assert_eq!(
+            inferred_advertise_url_for("http://10.0.0.10:7902", "10.0.0.50:7912", false),
+            Some("http://10.0.0.50:7912".into())
+        );
+        assert_eq!(
+            inferred_advertise_url_for("https://10.0.0.10:7902", "10.0.0.50:7912", true),
+            Some("https://10.0.0.50:7912".into())
+        );
+    }
+
+    #[test]
+    fn loopback_is_not_advertised() {
+        assert_eq!(
+            inferred_advertise_url_for("http://10.0.0.10:7902", "127.0.0.1:7912", false),
+            None
+        );
+        assert_eq!(
+            inferred_advertise_url_for("http://127.0.0.1:7902", "0.0.0.0:7912", false),
+            None
+        );
+    }
 }

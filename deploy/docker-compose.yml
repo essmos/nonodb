@@ -1,6 +1,6 @@
 services:
   nonodb:
-    image: ${NONODB_IMAGE:-ghcr.io/essmos/nonodb:0.25.0-rc.2}
+    image: ${NONODB_IMAGE:-ghcr.io/essmos/nonodb:0.25.0-rc.3}
     container_name: nonodb
     restart: unless-stopped
     environment:
@@ -16,7 +16,7 @@ services:
       - nonodb-run:/run/nonodb
 
   nonodb-gui:
-    image: ${NONODB_IMAGE:-ghcr.io/essmos/nonodb:0.25.0-rc.2}
+    image: ${NONODB_IMAGE:-ghcr.io/essmos/nonodb:0.25.0-rc.3}
     container_name: nonodb-gui
     profiles: ["gui"]
     restart: unless-stopped

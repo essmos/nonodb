@@ -2185,10 +2185,11 @@ Public, no authentication.
 
 ### DELETE /v1/replication/acks/{node}
 
-Removes the stored acknowledgement for one replica from the selected database
-(default database when unscoped). This only removes the row; it does not stop a
-running replica. A live replica reappears after its next ACK. Use this to clear
-a stale row after the replica was paused or disconnected.
+Removes the stored acknowledgement and remembered URL for one replica from the
+selected database (default database when unscoped), and blocks further ACKs from
+that node id. A live replica receives `403 replica_removed`. Redeeming a new
+pairing code for the same node id clears the block. This does not stop the
+remote process or delete its data.
 
 ### POST /v1/replication/pause / resume / disconnect
 

@@ -189,6 +189,11 @@ pub async fn pair(
             );
         }
     }
+    if let Some(node_id) = body.node_id.as_deref() {
+        if let Err(error) = crate::replicator::unblock_replica(node_id) {
+            tracing::warn!(node_id = %node_id, error = %error, "unblock replica failed");
+        }
+    }
     let auth = match auth_state(&state) {
         Ok(auth) => auth,
         Err(response) => return response,

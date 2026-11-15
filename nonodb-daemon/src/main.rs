@@ -20,6 +20,7 @@ mod databases;
 mod election;
 mod imports;
 mod imports_api;
+mod instance;
 mod lease;
 mod live;
 mod login_guard;
@@ -260,6 +261,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     election::start(data.clone(), shutdown_rx.clone())
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
+    #[cfg(unix)]
+    let instance_socket = Some(sock.as_path());
+    #[cfg(not(unix))]
+    let instance_socket = None;
+    instance::start(&data, instance_socket, tcp_addr.as_deref())
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+
     let state = AppState {
         store: default.store.clone(),
         write_tx: default.write_tx.clone(),
@@ -457,6 +465,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         wait_for_writer(drain_timeout).await;
+        instance::stop();
         tracing::info!("nonodb daemon stopped");
         return Ok(());
     }
@@ -512,6 +521,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         wait_for_writer(drain_timeout).await;
+        instance::stop();
         tracing::info!("nonodb daemon stopped");
         Ok(())
     }

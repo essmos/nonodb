@@ -139,7 +139,7 @@ Install the released binaries on every node (see [Operations](operations.md#inst
 for the full systemd and Docker variants):
 
 ```bash
-TAG=v0.25.0-rc.2
+TAG=v0.25.0-rc.3
 ARCHIVE="nonodb-$TAG-linux-x86_64.tar.gz"
 curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/$ARCHIVE"
 curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/$ARCHIVE.sha256"
@@ -475,7 +475,7 @@ nonodb-cli replication demote <epoch> replica [successor-url]
 | `pause` | Stop pulling/applying while keeping the source and token. |
 | `resume` | Resume a paused replica from the stored source. |
 | `disconnect` | Remove source/token and leave the node read-only; data is kept. |
-| `forget <node>` | Remove a stale ACK row on the primary. |
+| `forget <node>` | Remove the ACK row and block that node id until re-paired. |
 | `prune <seq> [--require-acks]` | Remove old log records, optionally refusing to pass the minimum ack. |
 | `add-replica <name> [dbs]` (alias `pair`) | Create a one-time 8-character pairing code on the primary. |
 | `pairings` | List pending pairing codes. |
@@ -502,7 +502,7 @@ TLS paths, or retention. Those are startup environment settings.
 | `NONODB_REPLICATION_BATCH` | `500` | Transactions per `/changes` request, clamped to 1–1000. |
 | `NONODB_REPLICATION_BOOTSTRAP` | `auto` | `auto`, `always`, or `never`. |
 | `NONODB_REPLICATION_EXIT_ON_GAP` | `0` | Ask the supervisor to restart on a runtime gap so startup can resync. |
-| `NONODB_REPLICATION_ADVERTISE_URL` | unset | Public URL used for write routing and promotion. |
+| `NONODB_REPLICATION_ADVERTISE_URL` | unset | Public URL used for write routing and promotion. Replicas auto-detect a LAN URL from the actual TCP listener or `NONODB_TCP` and the route to the primary when unset. |
 | `NONODB_REPLICATION_VOTERS` | unset | Comma-separated voter URLs. Empty disables quorum and leases. |
 | `NONODB_REPLICATION_VOTER_TOKEN` | unset | Shared token used to call voter endpoints. |
 | `NONODB_REPLICATION_FOLLOWERS` | unset | Non-voting nodes that receive the new primary URL. |
@@ -736,14 +736,20 @@ nonodb-cli replication resume
 read-only. It does not delete collections or history. Promote the node separately
 if it should become standalone, and use a new pairing code to reconnect it later.
 The **Replication** page exposes the same controls with confirmation.
+After disconnecting, **Remove replica** on the primary deletes the ACK and blocks
+that node id. A live replica gets `403 replica_removed` until a new pairing code
+is redeemed for the same id.
 
 ### 9.6 Network tab
 
 A replica should set `NONODB_REPLICATION_ADVERTISE_URL` to an address reachable
 from the primary/GUI host. The URL is carried in replication acknowledgements.
 The primary stores it, and the GUI automatically probes advertised `http://`
-replicas for full Cluster metrics. Without it, the replica still appears through
-its ACK but only with node id, sequence, and freshness.
+replicas for full Cluster metrics. If the variable is unset, the daemon tries a
+LAN fallback: it uses the local interface that routes to the primary and the
+actual TCP listener (or `NONODB_TCP`). Set the variable explicitly behind NAT,
+Docker, a reverse proxy, or a port forward. Without a usable URL, the replica still appears
+through its ACK but only with node id, sequence, and freshness.
 
 The **Network** tab contains the actual listener bind and the host firewall
 controls. This is where you verify that the primary is reachable before adding
