@@ -1457,6 +1457,8 @@ class Collection:
         sort: Optional[list[tuple[str, int]]] = None,
         skip: int = 0,
         limit: Optional[int] = None,
+        comment: Optional[str] = None,
+        max_time_ms: Optional[int] = None,
     ) -> list[dict[str, Any]]:
         payload: dict[str, Any] = {
             "op": "find",
@@ -1470,6 +1472,10 @@ class Collection:
             payload["sort"] = sort
         if limit is not None:
             payload["limit"] = limit
+        if comment is not None:
+            payload["comment"] = comment
+        if max_time_ms is not None:
+            payload["max_time_ms"] = max_time_ms
         return self._db.exec(payload)
 
     def explain(
@@ -1479,6 +1485,8 @@ class Collection:
         sort: Optional[list[tuple[str, int]]] = None,
         skip: int = 0,
         limit: Optional[int] = None,
+        comment: Optional[str] = None,
+        max_time_ms: Optional[int] = None,
     ) -> dict[str, Any]:
         """Returns the selected access path, index/bounds, and actual counts."""
         payload: dict[str, Any] = {
@@ -1491,6 +1499,10 @@ class Collection:
             payload["sort"] = sort
         if limit is not None:
             payload["limit"] = limit
+        if comment is not None:
+            payload["comment"] = comment
+        if max_time_ms is not None:
+            payload["max_time_ms"] = max_time_ms
         return self._db.exec(payload)
 
     def find_one(
@@ -1498,6 +1510,8 @@ class Collection:
         filter: Optional[dict[str, Any]] = None,
         *,
         projection: Optional[dict[str, Any]] = None,
+        comment: Optional[str] = None,
+        max_time_ms: Optional[int] = None,
     ) -> Optional[dict[str, Any]]:
         payload: dict[str, Any] = {
             "op": "find_one",
@@ -1506,6 +1520,10 @@ class Collection:
         }
         if projection is not None:
             payload["projection"] = projection
+        if comment is not None:
+            payload["comment"] = comment
+        if max_time_ms is not None:
+            payload["max_time_ms"] = max_time_ms
         result = self._db.exec(payload)
         return result if result is not None else None
 
@@ -1530,6 +1548,8 @@ class Collection:
         skip: int = 0,
         limit: Optional[int] = None,
         batch_size: Optional[int] = None,
+        comment: Optional[str] = None,
+        max_time_ms: Optional[int] = None,
     ) -> Cursor:
         """Opens a keyset cursor. Sort must be empty or a single `_id` field."""
         payload: dict[str, Any] = {
@@ -1546,6 +1566,10 @@ class Collection:
             payload["limit"] = limit
         if batch_size is not None:
             payload["batch_size"] = batch_size
+        if comment is not None:
+            payload["comment"] = comment
+        if max_time_ms is not None:
+            payload["max_time_ms"] = max_time_ms
         return Cursor(self._db, payload, batch_size)
 
     def aggregate_cursor(

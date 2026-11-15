@@ -208,6 +208,9 @@ Design: [docs/replication.md](docs/replication.md).
       or new document, without a separate read request
 - [x] `explain` endpoint with the selected plan, index usage, scan/range bounds,
       and estimated/actual document counts
+- [x] `comment` and `max_time_ms` query options for `find`, `find_one`,
+      `explain`, and cursor pages, with deadline checks in serial, parallel,
+      sorted, and geo scan paths
 
 ### P0 — operations and durability
 

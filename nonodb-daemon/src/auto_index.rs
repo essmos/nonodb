@@ -693,6 +693,8 @@ mod tests {
             sort: Vec::new(),
             skip: 0,
             limit: Some(100),
+            comment: None,
+            max_time_ms: None,
         }
     }
 

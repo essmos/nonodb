@@ -280,6 +280,8 @@ impl UpdateSql {
                         sort: Vec::new(),
                         skip: 0,
                         limit: None,
+                        comment: None,
+                        max_time_ms: None,
                     },
                 )?
             } else {
@@ -321,6 +323,8 @@ impl UpdateSql {
                 sort: Vec::new(),
                 skip: 0,
                 limit: None,
+                comment: None,
+                max_time_ms: None,
             },
         )?;
         let mut modified = 0usize;
@@ -379,6 +383,8 @@ impl DeleteSql {
                     sort: Vec::new(),
                     skip: 0,
                     limit: None,
+                    comment: None,
+                    max_time_ms: None,
                 },
             )?
         } else {
@@ -690,6 +696,8 @@ impl ParsedSql {
             sort,
             skip: self.offset,
             limit: self.limit,
+            comment: None,
+            max_time_ms: None,
         }))
     }
 

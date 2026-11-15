@@ -812,6 +812,8 @@ fn execute(
                         sort: Vec::new(),
                         skip: 0,
                         limit: if *multi { None } else { Some(1) },
+                        comment: None,
+                        max_time_ms: None,
                     },
                 )?
             } else {
@@ -934,6 +936,8 @@ fn execute(
                         sort: sort.clone(),
                         skip: 0,
                         limit: Some(1),
+                        comment: None,
+                        max_time_ms: None,
                     },
                 )?
                 .into_iter()
@@ -1068,6 +1072,8 @@ fn execute(
                         sort: Vec::new(),
                         skip: 0,
                         limit: if *multi { None } else { Some(1) },
+                        comment: None,
+                        max_time_ms: None,
                     },
                 )?
             } else {

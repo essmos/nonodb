@@ -25,6 +25,8 @@ pub enum Kind {
         projection: Option<Value>,
         ascending: bool,
         skip: usize,
+        comment: Option<String>,
+        max_time_ms: Option<u64>,
     },
     Aggregate {
         coll: String,
@@ -184,6 +186,8 @@ mod tests {
                 projection: None,
                 ascending: true,
                 skip: 0,
+                comment: None,
+                max_time_ms: None,
             },
             None,
             None,

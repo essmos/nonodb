@@ -24,6 +24,8 @@ fn query(filter: serde_json::Value) -> FindQuery {
         sort: Vec::new(),
         skip: 0,
         limit: None,
+        comment: None,
+        max_time_ms: None,
     }
 }
 

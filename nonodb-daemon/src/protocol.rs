@@ -114,6 +114,10 @@ pub enum Request {
         skip: usize,
         #[serde(default)]
         limit: Option<usize>,
+        #[serde(default)]
+        comment: Option<String>,
+        #[serde(default)]
+        max_time_ms: Option<u64>,
     },
     FindOne {
         coll: String,
@@ -121,6 +125,10 @@ pub enum Request {
         filter: Value,
         #[serde(default)]
         projection: Option<Value>,
+        #[serde(default)]
+        comment: Option<String>,
+        #[serde(default)]
+        max_time_ms: Option<u64>,
     },
     /// Ordered point lookups by `_id` or a unique single-field index.
     Lookup {
@@ -187,6 +195,10 @@ pub enum Request {
         skip: usize,
         #[serde(default)]
         limit: Option<usize>,
+        #[serde(default)]
+        comment: Option<String>,
+        #[serde(default)]
+        max_time_ms: Option<u64>,
     },
     Update {
         coll: String,
@@ -273,6 +285,10 @@ pub enum Request {
         limit: Option<usize>,
         #[serde(default)]
         batch_size: Option<usize>,
+        #[serde(default)]
+        comment: Option<String>,
+        #[serde(default)]
+        max_time_ms: Option<u64>,
     },
     /// Opens a bounded cursor over document-local aggregation stages.
     CursorAggregate {
@@ -1033,6 +1049,7 @@ impl From<nonodb_core::Error> for ApiError {
             E::DuplicateKey(_) => "duplicate_key",
             E::InvalidId => "invalid_id",
             E::Query(_) => "invalid_query",
+            E::Timeout(_) => "timeout",
             E::Sql(_) => "invalid_sql",
             E::InvalidCollectionName(_) => "invalid_collection",
             E::DocumentTooLarge(_, _) => "document_too_large",

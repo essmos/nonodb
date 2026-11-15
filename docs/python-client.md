@@ -260,20 +260,24 @@ Collection.find(
     filter=None,
     *,
     projection=None,
-    sort=None,      # list[tuple[str, int]]
+    sort=None,          # list[tuple[str, int]]
     skip=0,
     limit=None,
+    comment=None,       # echoed by explain
+    max_time_ms=None,   # server-side execution budget
 ) -> list[dict]
 ```
 
-`find(None)` and `find({})` match everything.
+`find(None)` and `find({})` match everything. When `max_time_ms` expires the
+request raises `NonoDBError` with code `timeout`.
 
 ```python
 user = users.find_one({"email": "ada@example.com"})
 user = users.find_one({"_id": user_id}, projection={"name": 1})
 ```
 
-`find_one` returns a document or `None`.
+`find_one` returns a document or `None`. It also accepts `comment=` and
+`max_time_ms=`.
 
 ### Point lookups
 
@@ -332,6 +336,8 @@ plan = users.explain(
     {"age": {"$gte": 18}},
     sort=[("age", 1)],
     limit=20,
+    comment="nightly report",
+    max_time_ms=5000,
 )
 print(plan["access_path"], plan["index_used"], plan["actual_matched"])
 ```
@@ -409,8 +415,10 @@ with users.find_cursor(
         process(user)
 ```
 
-`find_cursor` requires an empty sort or a single `_id` sort. For aggregation,
-the first stage may be `$match`; the remaining stages must be document-local
+`find_cursor` requires an empty sort or a single `_id` sort. It also accepts
+`comment=` and `max_time_ms=`, which are applied to every page request. For
+aggregation, the first stage may be `$match`; the remaining stages must be
+document-local
 (`$project`, `$addFields`/`$set`, `$unset`):
 
 ```python

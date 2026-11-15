@@ -195,6 +195,8 @@ mod tests {
                 sort: vec![],
                 skip: 0,
                 limit: None,
+                comment: None,
+                max_time_ms: None,
             },
             "default"
         )
@@ -208,6 +210,8 @@ mod tests {
                 sort: vec![],
                 skip: 0,
                 limit: None,
+                comment: None,
+                max_time_ms: None,
             },
             "default"
         )
@@ -335,6 +339,8 @@ mod tests {
                 sort: vec![],
                 skip: 0,
                 limit: None,
+                comment: None,
+                max_time_ms: None,
             },
             "default"
         )
@@ -368,6 +374,8 @@ mod tests {
                 sort: vec![],
                 skip: 0,
                 limit: None,
+                comment: None,
+                max_time_ms: None,
             },
             "app1"
         )

@@ -4,6 +4,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::ops::Bound;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use heed::types::Bytes;
 use heed::{Database, Env, RoTxn, RwTxn};
@@ -252,6 +253,25 @@ pub struct FindQuery {
     pub sort: Vec<(String, i32)>,
     pub skip: usize,
     pub limit: Option<usize>,
+    /// Optional application comment, echoed by `explain`.
+    pub comment: Option<String>,
+    /// Maximum server-side execution time in milliseconds.
+    pub max_time_ms: Option<u64>,
+}
+
+fn find_deadline(query: &FindQuery) -> Option<Instant> {
+    query
+        .max_time_ms
+        .filter(|ms| *ms > 0)
+        .and_then(|ms| Instant::now().checked_add(Duration::from_millis(ms)))
+}
+
+fn check_find_deadline(deadline: Option<Instant>) -> Result<()> {
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        Err(Error::Timeout("operation exceeded maxTimeMS".into()))
+    } else {
+        Ok(())
+    }
 }
 
 /// Summary of a full collection reindex.
@@ -1227,6 +1247,8 @@ impl<'e> Collection<'e> {
         if limit == 0 {
             return Ok(Some(Vec::new()));
         }
+        let deadline = find_deadline(query);
+        check_find_deadline(deadline)?;
         if let Some(reverse) = id_sort_direction(&query.sort) {
             let iter: IndexIter<'_> = if reverse {
                 Box::new(self.db.rev_iter(rtxn)?)
@@ -1235,6 +1257,7 @@ impl<'e> Collection<'e> {
             };
             let mut out = Vec::new();
             for item in iter.skip(query.skip) {
+                check_find_deadline(deadline)?;
                 let (_key, bytes) = item?;
                 out.push(parse_json(bytes)?);
                 if out.len() >= limit {
@@ -1270,6 +1293,7 @@ impl<'e> Collection<'e> {
         let mut out = Vec::new();
         let mut seen = HashSet::new();
         for item in iter {
+            check_find_deadline(deadline)?;
             let (_key, value) = item?;
             let Some((id, inc)) = index::decode_index_value(value) else {
                 continue;
@@ -2586,6 +2610,8 @@ impl<'e> Collection<'e> {
             sort: opts.sort.to_vec(),
             skip: 0,
             limit: Some(1),
+            comment: None,
+            max_time_ms: None,
         };
         let selected = self.find_in(&*wtxn, &query)?.into_iter().next();
 
@@ -2678,6 +2704,8 @@ impl<'e> Collection<'e> {
             sort: opts.sort.to_vec(),
             skip: 0,
             limit: Some(1),
+            comment: None,
+            max_time_ms: None,
         };
         let selected = self
             .find_vault_in(&*wtxn, &query, key, tenant, kid)?
@@ -3161,6 +3189,8 @@ impl<'e> Collection<'e> {
             sort: query.sort.clone(),
             skip: query.skip,
             limit: query.limit,
+            comment: query.comment.clone(),
+            max_time_ms: query.max_time_ms,
         };
         let stored = self.find_in(rtxn, &stored_query)?;
         let mut out = Vec::with_capacity(stored.len());
@@ -3191,6 +3221,8 @@ impl<'e> Collection<'e> {
             sort: Vec::new(),
             skip: 0,
             limit: Some(1),
+            comment: None,
+            max_time_ms: None,
         };
         Ok(self.find_vault_in(rtxn, &query, key, tenant, kid)?.pop())
     }
@@ -3730,6 +3762,8 @@ impl<'e> Collection<'e> {
             sort: plan.sort,
             skip: plan.skip,
             limit: Some(limit),
+            comment: None,
+            max_time_ms: None,
         };
         let docs = self.find_in(rtxn, &query)?;
         if docs.len() > max_docs {
@@ -4129,6 +4163,8 @@ impl<'e> Collection<'e> {
         let filter = &query.filter;
         let raw = raw_prefilter(filter);
         let raw = raw.as_ref();
+        let deadline = find_deadline(query);
+        check_find_deadline(deadline)?;
 
         std::thread::scope(|scope| -> Result<Vec<Value>> {
             for _ in 0..workers {
@@ -4178,6 +4214,7 @@ impl<'e> Collection<'e> {
                 docs: Vec::with_capacity(PARALLEL_SCAN_CHUNK),
             };
             for (seq, item) in self.db.iter(rtxn)?.enumerate() {
+                check_find_deadline(deadline)?;
                 let (_key, bytes) = item?;
                 let start = chunk.data.len() as u32;
                 chunk.data.extend_from_slice(bytes);
@@ -4380,6 +4417,8 @@ impl<'e> Collection<'e> {
         let filter = &query.filter;
         let raw = raw_prefilter(filter);
         let raw = raw.as_ref();
+        let deadline = find_deadline(query);
+        check_find_deadline(deadline)?;
         // Create the iterator before starting workers: an LMDB error must not leave
         // workers waiting on a channel that is never closed.
         let mut iter = self.db.iter(rtxn)?;
@@ -4436,6 +4475,7 @@ impl<'e> Collection<'e> {
             // synchronization on a selective full scan.
             let mut rounds = 1usize;
             'scan: loop {
+                check_find_deadline(deadline)?;
                 let mut sent = 0usize;
                 'fill: for _ in 0..rounds {
                     for tx in &job_txs {
@@ -4448,6 +4488,7 @@ impl<'e> Collection<'e> {
                             docs: Vec::with_capacity(PARALLEL_SCAN_CHUNK),
                         };
                         while chunk.docs.len() < PARALLEL_SCAN_CHUNK {
+                            check_find_deadline(deadline)?;
                             match iter.next() {
                                 Some(item) => match item {
                                     Ok((_key, bytes)) => {
@@ -4539,7 +4580,9 @@ impl<'e> Collection<'e> {
     ) -> Result<Vec<Value>> {
         let mut top = TopK::new(&query.sort, want);
         let raw = raw_prefilter(&query.filter);
+        let deadline = find_deadline(query);
         for (seq, item) in self.db.iter(rtxn)?.enumerate() {
+            check_find_deadline(deadline)?;
             let (_key, bytes) = item?;
             let Some(doc) = parse_prefiltered(bytes, raw.as_ref())? else {
                 continue;
@@ -4572,9 +4615,12 @@ impl<'e> Collection<'e> {
         }
         let raw = raw_prefilter(&query.filter);
         let mut hits: Vec<(f64, Value)> = Vec::new();
+        let deadline = find_deadline(query);
+        check_find_deadline(deadline)?;
 
         if let Some(ids) = self.geo_index_candidates(rtxn, &query.filter)? {
             for id in ids {
+                check_find_deadline(deadline)?;
                 let Some(bytes) = self.db.get(rtxn, id.as_bytes())? else {
                     continue;
                 };
@@ -4590,6 +4636,7 @@ impl<'e> Collection<'e> {
             }
         } else {
             for item in self.db.iter(rtxn)? {
+                check_find_deadline(deadline)?;
                 let (_key, bytes) = item?;
                 let Some(doc) = parse_prefiltered(bytes, raw.as_ref())? else {
                     continue;
@@ -4621,6 +4668,8 @@ impl<'e> Collection<'e> {
         if limit == 0 {
             return Ok(Vec::new());
         }
+        let deadline = find_deadline(query);
+        check_find_deadline(deadline)?;
         if let Some((field, near)) = geo::extract_near(&query.filter) {
             return self.find_near(rtxn, query, &field, &near);
         }
@@ -4647,6 +4696,7 @@ impl<'e> Collection<'e> {
             'plans: for plan in &plans {
                 let range = (as_bound(&plan.bounds.0), as_bound(&plan.bounds.1));
                 for item in plan.db.range(rtxn, &range)? {
+                    check_find_deadline(deadline)?;
                     let (_key, value) = item?;
                     let Some((id, _)) = index::decode_index_value(value) else {
                         continue;
@@ -4691,6 +4741,7 @@ impl<'e> Collection<'e> {
         //     value, then apply the full filter as a residual.
         else if let Some(ids) = self.all_index_candidates(rtxn, &query.filter)? {
             for id in ids {
+                check_find_deadline(deadline)?;
                 if !sorted && acc.len() >= want {
                     break;
                 }
@@ -4708,6 +4759,7 @@ impl<'e> Collection<'e> {
         // 1c) Geo index cell ranges for `$geoWithin` / `$geoIntersects`.
         else if let Some(ids) = self.geo_index_candidates(rtxn, &query.filter)? {
             for id in ids {
+                check_find_deadline(deadline)?;
                 if !sorted && acc.len() >= want {
                     break;
                 }
@@ -4742,6 +4794,7 @@ impl<'e> Collection<'e> {
                     Box::new(plan.db.range(rtxn, &range)?)
                 };
                 for item in iter {
+                    check_find_deadline(deadline)?;
                     let (_key, value) = item?;
                     let Some((id, inc)) = index::decode_index_value(value) else {
                         continue;
@@ -4781,7 +4834,9 @@ impl<'e> Collection<'e> {
             }
 
             let ids = self.index_candidates(rtxn, &query.filter, (!sorted).then_some(want))?;
+            check_find_deadline(deadline)?;
             for id in ids.into_iter().flatten() {
+                check_find_deadline(deadline)?;
                 if !sorted && acc.len() >= want {
                     break;
                 }
@@ -4811,6 +4866,7 @@ impl<'e> Collection<'e> {
                 let mut skipped = 0usize;
                 let mut out = Vec::new();
                 for item in iter {
+                    check_find_deadline(deadline)?;
                     let (_key, bytes) = item?;
                     let Some(doc) = parse_prefiltered(bytes, raw.as_ref())? else {
                         continue;
@@ -4838,6 +4894,7 @@ impl<'e> Collection<'e> {
 
             let mut top = TopK::new(&query.sort, want);
             for item in iter {
+                check_find_deadline(deadline)?;
                 let (_key, bytes) = item?;
                 let Some(doc) = parse_prefiltered(bytes, raw.as_ref())? else {
                     continue;
@@ -4864,12 +4921,14 @@ impl<'e> Collection<'e> {
             if is_match_all(&query.filter) {
                 // Natural order is `_id`; skipped documents do not need parsing.
                 for item in self.db.iter(rtxn)?.skip(query.skip).take(limit) {
+                    check_find_deadline(deadline)?;
                     let (_key, bytes) = item?;
                     acc.push(parse_json(bytes)?);
                 }
             } else {
                 let mut skipped = 0usize;
                 for item in self.db.iter(rtxn)? {
+                    check_find_deadline(deadline)?;
                     let (_key, bytes) = item?;
                     let Some(doc) = parse_prefiltered(bytes, raw.as_ref())? else {
                         continue;
@@ -4890,6 +4949,7 @@ impl<'e> Collection<'e> {
         // 3b) Full scan with sorting: collect matches through TopK.
         else {
             for item in self.db.iter(rtxn)? {
+                check_find_deadline(deadline)?;
                 let (_key, bytes) = item?;
                 let Some(doc) = parse_prefiltered(bytes, raw.as_ref())? else {
                     continue;
@@ -4919,6 +4979,8 @@ impl<'e> Collection<'e> {
             skip: 0,
             limit: Some(1),
             projection: None,
+            comment: None,
+            max_time_ms: None,
         };
         Ok(self.find(&query)?.into_iter().next())
     }
@@ -4935,6 +4997,8 @@ impl<'e> Collection<'e> {
             skip: 0,
             limit: Some(1),
             projection: projection.cloned(),
+            comment: None,
+            max_time_ms: None,
         };
         Ok(self.find_in(rtxn, &query)?.into_iter().next())
     }
@@ -5185,6 +5249,12 @@ impl<'e> Collection<'e> {
         );
         obj.insert("skip".into(), Value::from(query.skip));
         obj.insert("limit".into(), query.limit.map_or(Value::Null, Value::from));
+        if let Some(comment) = &query.comment {
+            obj.insert("comment".into(), Value::String(comment.clone()));
+        }
+        if let Some(max_time_ms) = query.max_time_ms {
+            obj.insert("maxTimeMS".into(), Value::from(max_time_ms));
+        }
         obj.insert(
             "estimated_documents".into(),
             Value::from(obj.get("candidates").and_then(Value::as_u64).unwrap_or(0)),
@@ -6928,6 +6998,8 @@ mod tests {
             sort: vec![("g".to_string(), 1), ("n".to_string(), -1)],
             skip: 7,
             limit: Some(31),
+            comment: None,
+            max_time_ms: None,
         };
         // `find` takes the parallel path (1000 entries > test threshold).
         let parallel = c.find(&q).unwrap();
@@ -7084,6 +7156,8 @@ mod tests {
             sort: vec![("i".to_string(), -1)],
             skip: 1,
             limit: Some(2),
+            comment: None,
+            max_time_ms: None,
         };
         let got = c.find(&q).unwrap();
         assert_eq!(got, vec![json!({"i": 3}), json!({"i": 2})]);
@@ -8653,6 +8727,39 @@ mod tests {
                 json!({"$count": "rows"}),
             ])
             .is_err());
+    }
+
+    #[test]
+    fn find_query_comment_and_max_time_ms() {
+        let (_dir, store) = store();
+        let c = store.collection("queries").unwrap();
+        c.insert_one(json!({"_id": "a", "n": 1})).unwrap();
+
+        let q = FindQuery {
+            filter: json!({"n": 1}),
+            projection: None,
+            sort: Vec::new(),
+            skip: 0,
+            limit: None,
+            comment: Some("test query".into()),
+            max_time_ms: Some(5_000),
+        };
+        assert_eq!(c.find(&q).unwrap().len(), 1);
+        let explained = c.explain(&q).unwrap();
+        assert_eq!(explained["comment"], "test query");
+        assert_eq!(explained["maxTimeMS"], 5_000);
+
+        assert!(check_find_deadline(None).is_ok());
+        assert!(matches!(
+            check_find_deadline(Some(Instant::now())),
+            Err(Error::Timeout(_))
+        ));
+        assert!(find_deadline(&q).is_some());
+        assert!(find_deadline(&FindQuery {
+            max_time_ms: Some(0),
+            ..FindQuery::default()
+        })
+        .is_none());
     }
 }
 

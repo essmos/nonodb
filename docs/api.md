@@ -293,9 +293,14 @@ Fields:
 | `sort` | none | Array of `[field, direction]`; `1` ascending, `-1` descending |
 | `skip` | `0` | Number of matching documents to skip |
 | `limit` | none | Maximum number of results; unlimited when omitted |
+| `comment` | none | Optional application comment; echoed by `explain` |
+| `max_time_ms` | none | Server-side execution budget in milliseconds; `0` or omitted means no limit |
 
 Behavior:
 
+- `max_time_ms` is enforced during collection/index scans, including parallel
+  scans, sorted scans, and `$near` candidates. When the budget expires, the
+  request fails with error code `timeout`.
 - Without `sort`, results follow the cheapest scan order (index order or
   `_id` order), and execution stops after `skip + limit` matches.
 - Equality or range conditions on `_id` use the primary-key B+ tree directly.
@@ -323,7 +328,8 @@ Behavior:
 Response: the document or `null`.
 
 `find_one` is `find` with `limit=1` and no sort. It stops as soon as a match is
-found. An exact `_id` filter uses a direct primary-key lookup.
+found. An exact `_id` filter uses a direct primary-key lookup. It accepts the
+same optional `comment` and `max_time_ms` fields as `find`.
 
 ## lookup
 
@@ -498,7 +504,9 @@ information, and exact document counts.
   "filter": {"age": {"$gte": 18}},
   "sort": [["age", 1]],
   "skip": 0,
-  "limit": 20
+  "limit": 20,
+  "comment": "nightly report",
+  "max_time_ms": 5000
 }
 ```
 
@@ -522,7 +530,9 @@ Example result:
   "filter": {"age": {"$gte": 18}},
   "sort": [["age", 1]],
   "skip": 0,
-  "limit": 20
+  "limit": 20,
+  "comment": "nightly report",
+  "maxTimeMS": 5000
 }
 ```
 
@@ -539,6 +549,8 @@ Fields:
 | `actual_matched` | Documents matching the filter |
 | `actual_returned` | Documents returned after `skip`/`limit` |
 | `sort_covered` | Whether the access path already provides the requested order |
+| `comment` | Present when the request supplied `comment` |
+| `maxTimeMS` | Present when the request supplied a non-zero `max_time_ms` |
 
 `explain` executes the query to produce exact `actual_*` counts. Use a small
 `limit` when explaining a broad query. It is read-only and does not create or
@@ -1081,13 +1093,16 @@ Batch size defaults to 500 and is clamped to 1–1000.
   "sort": [["_id", 1]],
   "skip": 0,
   "limit": 100000,
-  "batch_size": 500
+  "batch_size": 500,
+  "comment": "export",
+  "max_time_ms": 5000
 }
 ```
 
 `sort` must be omitted/empty or contain exactly one `_id` field with `1` or
 `-1`. Use a regular `find` for arbitrary sorts. `limit` is the total number of
-documents the cursor may return, not a batch size.
+documents the cursor may return, not a batch size. `comment` and `max_time_ms`
+are stored with the cursor and applied to every page request.
 
 ### cursor_aggregate
 

@@ -1611,12 +1611,22 @@ fn cursor_page(
             cursor_filter(filter, state.last_id.as_deref(), ascending)
         }
     };
+    let (comment, max_time_ms) = match &kind {
+        cursor::Kind::Find {
+            comment,
+            max_time_ms,
+            ..
+        } => (comment.clone(), *max_time_ms),
+        cursor::Kind::Aggregate { .. } => (None, None),
+    };
     let query = FindQuery {
         filter,
         projection: None,
         sort: vec![("_id".to_string(), if ascending { 1 } else { -1 })],
         skip: state.skip,
         limit: Some(fetch),
+        comment,
+        max_time_ms,
     };
     let docs = c.find(&query)?;
     state.skip = 0;
@@ -2534,6 +2544,8 @@ async fn exec_inner(
             sort,
             skip,
             limit,
+            comment,
+            max_time_ms,
         } => {
             let store = state.store.clone();
             let auth = vault_auth.clone();
@@ -2545,6 +2557,8 @@ async fn exec_inner(
                     sort,
                     skip,
                     limit,
+                    comment,
+                    max_time_ms,
                 };
                 if c.profile().is_vault() {
                     let auth = auth.as_ref().ok_or_else(vault::key_required)?;
@@ -2668,6 +2682,8 @@ async fn exec_inner(
             coll,
             filter,
             projection,
+            comment,
+            max_time_ms,
         } => {
             let store = state.store.clone();
             let auth = vault_auth.clone();
@@ -2679,6 +2695,8 @@ async fn exec_inner(
                     sort: Vec::new(),
                     skip: 0,
                     limit: Some(1),
+                    comment,
+                    max_time_ms,
                 };
                 if c.profile().is_vault() {
                     let auth = auth.as_ref().ok_or_else(vault::key_required)?;
@@ -2727,6 +2745,8 @@ async fn exec_inner(
             skip,
             limit,
             batch_size,
+            comment,
+            max_time_ms,
         } => {
             let ascending = match cursor_sort_direction(&sort) {
                 Ok(direction) => direction,
@@ -2738,6 +2758,8 @@ async fn exec_inner(
                 projection,
                 ascending,
                 skip,
+                comment,
+                max_time_ms,
             };
             let cursor_state = cursor::State::new(
                 principal.name().to_string(),
@@ -2819,6 +2841,8 @@ async fn exec_inner(
             sort,
             skip,
             limit,
+            comment,
+            max_time_ms,
         } => {
             let store = state.store.clone();
             let auth = vault_auth.clone();
@@ -2831,6 +2855,8 @@ async fn exec_inner(
                     skip,
                     limit,
                     projection: None,
+                    comment,
+                    max_time_ms,
                 };
                 Ok::<Value, ApiError>(c.explain(&query)?)
             });
@@ -3802,6 +3828,8 @@ fn watch_late_scan(
         sort: vec![("_id".to_string(), 1)],
         skip: 0,
         limit: Some(limit),
+        comment: None,
+        max_time_ms: None,
     };
     Ok(c.find(&query)?)
 }
@@ -3825,6 +3853,8 @@ fn watch_once(
         sort: vec![("_id".to_string(), 1)],
         skip: 0,
         limit: Some(limit + 1),
+        comment: None,
+        max_time_ms: None,
     };
     let mut events = c.find(&query)?;
     let has_more = events.len() > limit;
@@ -3859,6 +3889,8 @@ fn watch_status(
         sort: Vec::new(),
         skip: 0,
         limit: Some(1),
+        comment: None,
+        max_time_ms: None,
     })?;
     if !exists.is_empty() {
         return Ok((false, None));
@@ -3869,6 +3901,8 @@ fn watch_status(
         sort: vec![("_id".to_string(), 1)],
         skip: 0,
         limit: Some(1),
+        comment: None,
+        max_time_ms: None,
     })?;
     let oldest = oldest
         .first()
@@ -4021,6 +4055,8 @@ fn execute_read(
             sort,
             skip,
             limit,
+            comment,
+            max_time_ms,
         } => {
             let Some(c) = store.collection_at(rtxn, &coll)? else {
                 return Ok(json!([]));
@@ -4034,6 +4070,8 @@ fn execute_read(
                 sort,
                 skip,
                 limit,
+                comment,
+                max_time_ms,
             };
             Ok(json!(c.find_in(rtxn, &query)?))
         }
@@ -4041,6 +4079,8 @@ fn execute_read(
             coll,
             filter,
             projection,
+            comment,
+            max_time_ms,
         } => {
             let Some(c) = store.collection_at(rtxn, &coll)? else {
                 return Ok(Value::Null);
@@ -4048,7 +4088,19 @@ fn execute_read(
             if c.profile().is_vault() {
                 return Err(vault::unsupported("batch reads on vault collections").into());
             }
-            Ok(json!(c.find_one_in(rtxn, &filter, projection.as_ref())?))
+            let query = FindQuery {
+                filter,
+                projection,
+                sort: Vec::new(),
+                skip: 0,
+                limit: Some(1),
+                comment,
+                max_time_ms,
+            };
+            Ok(c.find_in(rtxn, &query)?
+                .into_iter()
+                .next()
+                .unwrap_or(Value::Null))
         }
         Request::Lookup {
             coll,
@@ -4078,6 +4130,8 @@ fn execute_read(
             sort,
             skip,
             limit,
+            comment,
+            max_time_ms,
         } => {
             let Some(c) = store.collection_at(rtxn, &coll)? else {
                 return Ok(json!({
@@ -4097,6 +4151,8 @@ fn execute_read(
                 skip,
                 limit,
                 projection: None,
+                comment,
+                max_time_ms,
             };
             Ok(c.explain_in(rtxn, &query)?)
         }
