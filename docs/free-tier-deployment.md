@@ -24,6 +24,7 @@ Typical targets:
 | Oracle Cloud Always Free | Ampere A1, 1–4 OCPU, 6–24 GB RAM | ARM64 image; generous for NonoDB |
 | Google Cloud free tier | `e2-micro`, 1 GB RAM, 30 GB standard PD | Only in eligible regions |
 | AWS free tier | `t3.micro`/`t4g.micro`, EBS volume | Limits and eligibility change; check current terms |
+| Azure free account | B1s, 750 hours/month for 12 months | Not always free; managed disks and egress may be billed separately |
 | DigitalOcean | Small Droplet + block volume | Not free tier; low monthly cost; Spaces for backups |
 
 Free-tier limits change. Verify the current CPU, RAM, disk, transfer, and
@@ -180,6 +181,59 @@ multi-architecture and includes `linux/arm64`.
 
 Do not open port `7878` to the internet unless you have a TLS proxy and a
 restrictive firewall rule.
+
+### Azure free account (12 months)
+
+Azure's free account includes 750 hours per month of a B1s Linux VM for the
+first 12 months. This is useful if you already use Azure, but it is not an
+always-free tier: after 12 months normal rates apply, and managed disks, public
+IPs, bandwidth, and backups may be billed separately.
+
+Use a separate managed data disk for the database. The VM's temporary disk is
+ephemeral and must not hold the only copy.
+
+1. Create a B1s Ubuntu 24.04 VM. Keep the OS disk small and attach a separate
+   managed data disk for `/mnt/nonodb-data`.
+2. In the Azure network security group, allow inbound SSH only. Do not open
+   `7878` to the internet.
+3. On the VM, find the data disk:
+
+```bash
+lsblk
+ls -l /dev/disk/by-id/
+```
+
+4. Format and mount the new disk. Replace `/dev/disk/by-id/...` with the data
+   disk, never the OS disk:
+
+```bash
+sudo mkfs.ext4 /dev/disk/by-id/DATA_DISK_ID
+sudo mkdir -p /mnt/nonodb-data
+sudo mount /dev/disk/by-id/DATA_DISK_ID /mnt/nonodb-data
+
+echo '/dev/disk/by-id/DATA_DISK_ID /mnt/nonodb-data ext4 defaults,nofail,discard 0 2' \
+  | sudo tee -a /etc/fstab
+```
+
+5. Install Docker Engine and the Compose plugin.
+6. Follow the Google Cloud steps above for auth, `.env`, and Compose, but add
+   the data-disk path:
+
+```dotenv
+NONODB_DATA_DIR=/mnt/nonodb-data
+```
+
+7. Make the mounted volume writable by the container user:
+
+```bash
+docker run --rm --user root \
+  -v /mnt/nonodb-data:/var/lib/nonodb \
+  ghcr.io/essmos/nonodb:0.25.0 \
+  chown -R nonodb:nonodb /var/lib/nonodb
+```
+
+8. Start and verify with the same Compose commands. If you delete and recreate
+   the VM, keep or reattach the managed data disk; do not delete it with the VM.
 
 ## DigitalOcean
 
