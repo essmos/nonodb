@@ -439,7 +439,7 @@ docker volume create nonodb-replica-run
 docker run --rm \
   -v nonodb-replica-data:/var/lib/nonodb \
   -e NONODB_AUTH_FILE=/var/lib/nonodb/auth.json \
-  ghcr.io/essmos/nonodb:0.25.0-rc.3 \
+  ghcr.io/essmos/nonodb:0.25.0 \
   nonodb-cli auth init
 
 docker run -d --name nonodb-replica \
@@ -451,7 +451,7 @@ docker run -d --name nonodb-replica \
   -e NONODB_REPLICATION_ROLE=replica \
   -e NONODB_REPLICATION_NODE_ID=replica-docker \
   -e NONODB_REPLICATION_ADVERTISE_URL=http://DOCKER_HOST_IP:7912 \
-  ghcr.io/essmos/nonodb:0.25.0-rc.3
+  ghcr.io/essmos/nonodb:0.25.0
 
 docker exec nonodb-replica nonodb-cli replication join \
   http://PRIMARY_HOST:7878 PAIRING-CODE
@@ -547,7 +547,7 @@ docker run -d --name nonodb-gui \
   -p 127.0.0.1:8787:8787 \
   -v nonodb-run:/run/nonodb \
   -e NONODB_SOCK=/run/nonodb/nonodb.sock \
-  ghcr.io/essmos/nonodb:0.25.0-rc.3 \
+  ghcr.io/essmos/nonodb:0.25.0 \
   nonodb-cli gui --host 0.0.0.0 --port 8787 --allow-remote --no-open
 ```
 
