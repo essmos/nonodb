@@ -1536,16 +1536,42 @@ class Collection:
         result = self._db.exec(payload)
         return result if result is not None else None
 
-    def count(self, filter: Optional[dict[str, Any]] = None) -> int:
-        return self._db.exec(
-            {"op": "count", "coll": self.name, "filter": filter or {}}
-        )["count"]
+    def count(
+        self,
+        filter: Optional[dict[str, Any]] = None,
+        *,
+        comment: Optional[str] = None,
+        max_time_ms: Optional[int] = None,
+    ) -> int:
+        payload: dict[str, Any] = {
+            "op": "count",
+            "coll": self.name,
+            "filter": filter or {},
+        }
+        if comment is not None:
+            payload["comment"] = comment
+        if max_time_ms is not None:
+            payload["max_time_ms"] = max_time_ms
+        return self._db.exec(payload)["count"]
 
-    def aggregate(self, pipeline: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def aggregate(
+        self,
+        pipeline: list[dict[str, Any]],
+        *,
+        comment: Optional[str] = None,
+        max_time_ms: Optional[int] = None,
+    ) -> list[dict[str, Any]]:
         """Runs a read-only aggregation pipeline and returns its result rows."""
-        return self._db.exec(
-            {"op": "aggregate", "coll": self.name, "pipeline": pipeline}
-        )["results"]
+        payload: dict[str, Any] = {
+            "op": "aggregate",
+            "coll": self.name,
+            "pipeline": pipeline,
+        }
+        if comment is not None:
+            payload["comment"] = comment
+        if max_time_ms is not None:
+            payload["max_time_ms"] = max_time_ms
+        return self._db.exec(payload)["results"]
 
     # -- cursors -----------------------------------------------------
     def find_cursor(

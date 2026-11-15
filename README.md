@@ -194,10 +194,10 @@ single-database directories are migrated to `default/` on startup. See
 - Atomic `find_and_modify`: select with sort, update or remove, and return the
   old or new document in one transaction.
 - `explain`: selected access path, index/range bounds, sort coverage, and
-  actual matched/returned counts. `find`, `find_one`, cursor pages, and
-  `explain` accept `comment`, `max_time_ms`, and `hint`; `$natural` sort and
-  hint select natural order, and expired budgets return the `timeout` error
-  code.
+  actual matched/returned counts. `find`, `find_one`, cursor pages, `explain`,
+  `count`, and `aggregate` accept `comment` and `max_time_ms`; find-shaped
+  queries also accept `hint`, `$natural` selects natural order, and expired
+  budgets return the `timeout` error code.
 - Replacement updates preserve `_id`.
 - Atomic `write_batch`: all operations commit or the whole batch rolls back.
 - Read-only `batch`: many reads in one LMDB snapshot and one HTTP round trip.

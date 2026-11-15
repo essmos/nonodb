@@ -2875,7 +2875,12 @@ async fn exec_inner(
             read_result(joined).await
         }
 
-        Request::Count { coll, filter } => {
+        Request::Count {
+            coll,
+            filter,
+            comment: _,
+            max_time_ms,
+        } => {
             let store = state.store.clone();
             let auth = vault_auth.clone();
             let joined = tokio::task::spawn_blocking(move || {
@@ -2890,19 +2895,28 @@ async fn exec_inner(
                     if auth.is_some() {
                         return Err(vault::key_unexpected().into());
                     }
-                    Ok::<Value, ApiError>(json!({ "count": c.count(&filter)? }))
+                    Ok::<Value, ApiError>(
+                        json!({ "count": c.count_with_options(&filter, max_time_ms)? }),
+                    )
                 }
             });
             read_result(joined).await
         }
 
-        Request::Aggregate { coll, pipeline } => {
+        Request::Aggregate {
+            coll,
+            pipeline,
+            comment: _,
+            max_time_ms,
+        } => {
             let store = state.store.clone();
             let auth = vault_auth.clone();
             let joined = tokio::task::spawn_blocking(move || {
                 let c = read_collection(&store, &coll, auth.as_ref())?;
                 reject_vault_read(&c, auth.as_ref(), "aggregation")?;
-                Ok::<Value, ApiError>(json!({ "results": c.aggregate(&pipeline)? }))
+                Ok::<Value, ApiError>(
+                    json!({ "results": c.aggregate_with_options(&pipeline, max_time_ms)? }),
+                )
             });
             read_result(joined).await
         }
@@ -4178,23 +4192,33 @@ fn execute_read(
             };
             Ok(c.explain_in(rtxn, &query)?)
         }
-        Request::Count { coll, filter } => {
+        Request::Count {
+            coll,
+            filter,
+            comment: _,
+            max_time_ms,
+        } => {
             let Some(c) = store.collection_at(rtxn, &coll)? else {
                 return Ok(json!({ "count": 0 }));
             };
             if c.profile().is_vault() {
                 return Err(vault::unsupported("batch reads on vault collections").into());
             }
-            Ok(json!({ "count": c.count_in(rtxn, &filter)? }))
+            Ok(json!({ "count": c.count_in_with_options(rtxn, &filter, max_time_ms)? }))
         }
-        Request::Aggregate { coll, pipeline } => {
+        Request::Aggregate {
+            coll,
+            pipeline,
+            comment: _,
+            max_time_ms,
+        } => {
             let Some(c) = store.collection_at(rtxn, &coll)? else {
                 return Ok(json!({ "results": [] }));
             };
             if c.profile().is_vault() {
                 return Err(vault::unsupported("batch reads on vault collections").into());
             }
-            Ok(json!({ "results": c.aggregate_in(rtxn, &pipeline)? }))
+            Ok(json!({ "results": c.aggregate_in_with_options(rtxn, &pipeline, max_time_ms)? }))
         }
         Request::Sql { query, params, .. } => {
             let prepared = nonodb_core::sql::PreparedSql::parse(&query)?;

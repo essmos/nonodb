@@ -262,11 +262,26 @@ pub struct FindQuery {
     pub hint: Option<Value>,
 }
 
-fn find_deadline(query: &FindQuery) -> Option<Instant> {
-    query
-        .max_time_ms
+fn operation_deadline(max_time_ms: Option<u64>) -> Option<Instant> {
+    max_time_ms
         .filter(|ms| *ms > 0)
         .and_then(|ms| Instant::now().checked_add(Duration::from_millis(ms)))
+}
+
+fn find_deadline(query: &FindQuery) -> Option<Instant> {
+    operation_deadline(query.max_time_ms)
+}
+
+fn deadline_remaining_ms(deadline: Option<Instant>) -> Option<u64> {
+    deadline.map(|deadline| {
+        u64::try_from(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX)
+        .max(1)
+    })
 }
 
 fn check_find_deadline(deadline: Option<Instant>) -> Result<()> {
@@ -3695,11 +3710,18 @@ impl<'e> Collection<'e> {
     /// access paths as `find`/`matching_keys` but without collecting all
     /// results first. This keeps a leading aggregation `$match` index-backed
     /// while allowing a streaming `$group` to consume an unbounded input.
-    fn for_each_matching<F>(&self, txn: &RoTxn<'_>, filter: &Value, mut f: F) -> Result<()>
+    fn for_each_matching<F>(
+        &self,
+        txn: &RoTxn<'_>,
+        filter: &Value,
+        deadline: Option<Instant>,
+        mut f: F,
+    ) -> Result<()>
     where
         F: FnMut(Value) -> Result<()>,
     {
         crate::query::validate::validate_filter(filter)?;
+        check_find_deadline(deadline)?;
         let raw = raw_prefilter(filter);
 
         if let Some(id) = direct_id(filter) {
@@ -3710,7 +3732,9 @@ impl<'e> Collection<'e> {
         }
 
         if let Some(ids) = self.all_index_candidates(txn, filter)? {
+            check_find_deadline(deadline)?;
             for id in ids {
+                check_find_deadline(deadline)?;
                 let Some(bytes) = self.db.get(txn, id.as_bytes())? else {
                     continue;
                 };
@@ -3725,7 +3749,9 @@ impl<'e> Collection<'e> {
         }
 
         if let Some(ids) = self.geo_index_candidates(txn, filter)? {
+            check_find_deadline(deadline)?;
             for id in ids {
+                check_find_deadline(deadline)?;
                 let Some(bytes) = self.db.get(txn, id.as_bytes())? else {
                     continue;
                 };
@@ -3745,6 +3771,7 @@ impl<'e> Collection<'e> {
                 let (lower, upper) = &plan.bounds;
                 let range = (as_bound(lower), as_bound(upper));
                 for item in plan.db.range(txn, &range)? {
+                    check_find_deadline(deadline)?;
                     let (_key, value) = item?;
                     let Some((id, _)) = index::decode_index_value(value) else {
                         continue;
@@ -3772,6 +3799,7 @@ impl<'e> Collection<'e> {
             let multikey = plan.def.is_multikey();
             let mut seen = HashSet::new();
             for item in plan.db.range(txn, &range)? {
+                check_find_deadline(deadline)?;
                 let (_key, value) = item?;
                 let Some((id, _)) = index::decode_index_value(value) else {
                     continue;
@@ -3795,6 +3823,7 @@ impl<'e> Collection<'e> {
         if let Some((lower, upper)) = id_bounds(filter) {
             let range = (as_bound(&lower), as_bound(&upper));
             for item in self.db.range(txn, &range)? {
+                check_find_deadline(deadline)?;
                 let (_key, bytes) = item?;
                 let Some(doc) = parse_prefiltered(bytes, raw.as_ref())? else {
                     continue;
@@ -3807,6 +3836,7 @@ impl<'e> Collection<'e> {
         }
 
         for item in self.db.iter(txn)? {
+            check_find_deadline(deadline)?;
             let (_key, bytes) = item?;
             let Some(doc) = parse_prefiltered(bytes, raw.as_ref())? else {
                 continue;
@@ -3828,22 +3858,51 @@ impl<'e> Collection<'e> {
     /// `count` call instead of materializing documents. Intermediate results
     /// are capped by [`aggregate::MAX_AGGREGATE_DOCS`].
     pub fn aggregate(&self, pipeline: &[Value]) -> Result<Vec<Value>> {
+        self.aggregate_with_options(pipeline, None)
+    }
+
+    pub fn aggregate_with_options(
+        &self,
+        pipeline: &[Value],
+        max_time_ms: Option<u64>,
+    ) -> Result<Vec<Value>> {
         let rtxn = self.read_txn()?;
-        let out = self.aggregate_in(&rtxn, pipeline);
+        let out = self.aggregate_in_with_options(&rtxn, pipeline, max_time_ms);
         rtxn.commit()?;
         out
     }
 
     pub fn aggregate_in(&self, rtxn: &RoTxn<'_>, pipeline: &[Value]) -> Result<Vec<Value>> {
+        self.aggregate_in_with_options(rtxn, pipeline, None)
+    }
+
+    pub fn aggregate_in_with_options(
+        &self,
+        rtxn: &RoTxn<'_>,
+        pipeline: &[Value],
+        max_time_ms: Option<u64>,
+    ) -> Result<Vec<Value>> {
+        let deadline = operation_deadline(max_time_ms);
+        self.aggregate_in_deadline(rtxn, pipeline, deadline)
+    }
+
+    fn aggregate_in_deadline(
+        &self,
+        rtxn: &RoTxn<'_>,
+        pipeline: &[Value],
+        deadline: Option<Instant>,
+    ) -> Result<Vec<Value>> {
+        check_find_deadline(deadline)?;
         for stage in pipeline {
             if let Some(filter) = stage.as_object().and_then(|o| o.get("$match")) {
                 crate::query::validate::validate_filter(filter)?;
             }
         }
         let plan = aggregate::pushdown(pipeline)?;
+        check_find_deadline(deadline)?;
 
         if let Some(field) = plan.count {
-            let count = self.count_in(rtxn, &plan.filter)?;
+            let count = self.count_in_deadline(rtxn, &plan.filter, deadline)?;
             if count == 0 {
                 return Ok(Vec::new());
             }
@@ -3854,7 +3913,7 @@ impl<'e> Collection<'e> {
         }
 
         if let Some(field) = aggregate::terminal_count_skippable(&pipeline[plan.next..])? {
-            let count = self.count_in(rtxn, &plan.filter)?;
+            let count = self.count_in_deadline(rtxn, &plan.filter, deadline)?;
             let after_skip = count.saturating_sub(plan.skip);
             let count = plan.limit.map_or(after_skip, |limit| after_skip.min(limit));
             if count == 0 {
@@ -3891,14 +3950,17 @@ impl<'e> Collection<'e> {
                         && aggregate_workers() > 1
                         && !self.has_index_path(rtxn, &plan.filter)?;
                     if parallel {
-                        self.parallel_group_scan(rtxn, &plan.filter, group_arg)?
+                        self.parallel_group_scan(rtxn, &plan.filter, group_arg, deadline)?
                     } else {
-                        self.for_each_matching(rtxn, &plan.filter, |doc| builder.update(doc))?;
+                        self.for_each_matching(rtxn, &plan.filter, deadline, |doc| {
+                            builder.update(doc)
+                        })?;
                         builder.finish()?
                     }
                 } else {
                     // `$first`/`$last`/`$push` depend on the natural `_id` order.
                     for item in self.db.iter(rtxn)? {
+                        check_find_deadline(deadline)?;
                         let (_key, raw) = item?;
                         let doc = parse_json(raw)?;
                         if matches(&doc, &plan.filter) {
@@ -3912,7 +3974,10 @@ impl<'e> Collection<'e> {
                         "aggregation intermediate result exceeds {max_docs} documents"
                     )));
                 }
-                return aggregate::run_with_host(grouped, &remaining[1..], max_docs, Some(&host));
+                let out =
+                    aggregate::run_with_host(grouped, &remaining[1..], max_docs, Some(&host))?;
+                check_find_deadline(deadline)?;
+                return Ok(out);
             }
         }
 
@@ -3927,7 +3992,7 @@ impl<'e> Collection<'e> {
             skip: plan.skip,
             limit: Some(limit),
             comment: None,
-            max_time_ms: None,
+            max_time_ms: deadline_remaining_ms(deadline),
             hint: None,
         };
         let docs = self.find_in(rtxn, &query)?;
@@ -3936,7 +4001,9 @@ impl<'e> Collection<'e> {
                 "aggregation input exceeds {max_docs} documents"
             )));
         }
-        aggregate::run_with_host(docs, &pipeline[plan.next..], max_docs, Some(&host))
+        let out = aggregate::run_with_host(docs, &pipeline[plan.next..], max_docs, Some(&host))?;
+        check_find_deadline(deadline)?;
+        Ok(out)
     }
 
     fn lookup_stage_in(
@@ -4441,13 +4508,15 @@ impl<'e> Collection<'e> {
         rtxn: &RoTxn<'_>,
         filter: &Value,
         group_spec: &Value,
+        deadline: Option<Instant>,
     ) -> Result<Vec<Value>> {
         let workers = aggregate_workers();
         if workers <= 1 {
             let mut builder = aggregate::GroupBuilder::new(group_spec)?;
-            self.for_each_matching(rtxn, filter, |doc| builder.update(doc))?;
+            self.for_each_matching(rtxn, filter, deadline, |doc| builder.update(doc))?;
             return builder.finish();
         }
+        check_find_deadline(deadline)?;
 
         let (job_tx, job_rx) = std::sync::mpsc::sync_channel::<ScanChunk>(workers * 2);
         let job_rx = Arc::new(Mutex::new(job_rx));
@@ -4513,6 +4582,7 @@ impl<'e> Collection<'e> {
                 docs: Vec::with_capacity(PARALLEL_SCAN_CHUNK),
             };
             for item in self.db.iter(rtxn)? {
+                check_find_deadline(deadline)?;
                 let (_key, bytes) = item?;
                 let start = chunk.data.len() as u32;
                 chunk.data.extend_from_slice(bytes);
@@ -5695,14 +5765,38 @@ impl<'e> Collection<'e> {
     }
 
     pub fn count(&self, filter: &Value) -> Result<usize> {
+        self.count_with_options(filter, None)
+    }
+
+    pub fn count_with_options(&self, filter: &Value, max_time_ms: Option<u64>) -> Result<usize> {
         let rtxn = self.read_txn()?;
-        let n = self.count_in(&rtxn, filter)?;
+        let n = self.count_in_with_options(&rtxn, filter, max_time_ms)?;
         rtxn.commit()?;
         Ok(n)
     }
 
     pub fn count_in(&self, rtxn: &RoTxn<'_>, filter: &Value) -> Result<usize> {
+        self.count_in_with_options(rtxn, filter, None)
+    }
+
+    pub fn count_in_with_options(
+        &self,
+        rtxn: &RoTxn<'_>,
+        filter: &Value,
+        max_time_ms: Option<u64>,
+    ) -> Result<usize> {
+        let deadline = operation_deadline(max_time_ms);
+        self.count_in_deadline(rtxn, filter, deadline)
+    }
+
+    fn count_in_deadline(
+        &self,
+        rtxn: &RoTxn<'_>,
+        filter: &Value,
+        deadline: Option<Instant>,
+    ) -> Result<usize> {
         crate::query::validate::validate_filter(filter)?;
+        check_find_deadline(deadline)?;
         // `count({})` / `count(null)` -> O(1) from B+tree metadata.
         if is_match_all(filter) {
             return Ok(self.db.stat(rtxn)?.entries);
@@ -5718,6 +5812,7 @@ impl<'e> Collection<'e> {
             if filter.as_object().is_some_and(|o| o.len() == 1) {
                 let mut n = 0usize;
                 for item in self.db.range(rtxn, &range)? {
+                    check_find_deadline(deadline)?;
                     item?;
                     n += 1;
                 }
@@ -5726,6 +5821,7 @@ impl<'e> Collection<'e> {
             let mut n = 0usize;
             let raw = raw_prefilter(filter);
             for item in self.db.range(rtxn, &range)? {
+                check_find_deadline(deadline)?;
                 let (_key, bytes) = item?;
                 let Some(doc) = parse_prefiltered(bytes, raw.as_ref())? else {
                     continue;
@@ -5738,6 +5834,7 @@ impl<'e> Collection<'e> {
         }
         // Multikey `$all`: the intersection already contains distinct ids.
         if let Some(ids) = self.all_index_candidates(rtxn, filter)? {
+            check_find_deadline(deadline)?;
             return Ok(ids.len());
         }
         // Geo index cell ranges still need the residual matcher because a cell
@@ -5746,6 +5843,7 @@ impl<'e> Collection<'e> {
             let raw = raw_prefilter(filter);
             let mut n = 0;
             for id in ids {
+                check_find_deadline(deadline)?;
                 let Some(bytes) = self.db.get(rtxn, id.as_bytes())? else {
                     continue;
                 };
@@ -5760,6 +5858,7 @@ impl<'e> Collection<'e> {
         }
         // Filter fully covered by an index: count keys without parsing JSON.
         if let Some(plan) = self.index_plan(rtxn, filter)? {
+            check_find_deadline(deadline)?;
             if index_filter_exact(&plan.def, filter) {
                 return if plan.def.is_multikey() {
                     self.index_count_unique_plan(rtxn, &plan)
@@ -5771,6 +5870,7 @@ impl<'e> Collection<'e> {
         let mut n = 0;
         let raw = raw_prefilter(filter);
         for item in self.db.iter(rtxn)? {
+            check_find_deadline(deadline)?;
             let (_key, bytes) = item?;
             let Some(doc) = parse_prefiltered(bytes, raw.as_ref())? else {
                 continue;
@@ -9047,6 +9147,43 @@ mod tests {
         q.filter = json!({"y": "d"});
         q.hint = Some(json!({"x": 1}));
         assert!(c.find(&q).is_err());
+    }
+
+    #[test]
+    fn count_and_aggregate_max_time_ms() {
+        let (_dir, store) = store();
+        let c = store.collection("bounded").unwrap();
+        for i in 0..3 {
+            c.insert_one(json!({"_id": format!("id{i}"), "g": i % 2}))
+                .unwrap();
+        }
+
+        assert_eq!(
+            c.count_with_options(&json!({"g": 1}), Some(5_000)).unwrap(),
+            1
+        );
+        let grouped = c
+            .aggregate_with_options(
+                &[json!({"$group": {"_id": "$g", "n": {"$sum": 1}}})],
+                Some(5_000),
+            )
+            .unwrap();
+        assert_eq!(grouped.len(), 2);
+
+        let rtxn = store.read_txn().unwrap();
+        assert!(matches!(
+            c.count_in_deadline(&rtxn, &json!({"g": 1}), Some(Instant::now())),
+            Err(Error::Timeout(_))
+        ));
+        assert!(matches!(
+            c.aggregate_in_deadline(
+                &rtxn,
+                &[json!({"$group": {"_id": "$g", "n": {"$sum": 1}}})],
+                Some(Instant::now())
+            ),
+            Err(Error::Timeout(_))
+        ));
+        rtxn.commit().unwrap();
     }
 }
 

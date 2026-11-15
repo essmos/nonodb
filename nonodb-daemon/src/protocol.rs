@@ -255,12 +255,20 @@ pub enum Request {
         coll: String,
         #[serde(default)]
         filter: Value,
+        #[serde(default)]
+        comment: Option<String>,
+        #[serde(default)]
+        max_time_ms: Option<u64>,
     },
     /// Read-only aggregation pipeline.
     Aggregate {
         coll: String,
         #[serde(default)]
         pipeline: Vec<Value>,
+        #[serde(default)]
+        comment: Option<String>,
+        #[serde(default)]
+        max_time_ms: Option<u64>,
     },
     /// Read-only SQL SELECT over one collection.
     Sql {

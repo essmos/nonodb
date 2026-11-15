@@ -213,6 +213,8 @@ Design: [docs/replication.md](docs/replication.md).
       sorted, and geo scan paths
 - [x] `hint` by index name/key object or `{"$natural": 1}`, plus
       `$natural` sort order for `find`, cursors, and `explain`
+- [x] `comment` and `max_time_ms` for `count` and `aggregate`, including
+      pushed-down find/count and grouped-scan paths
 
 ### P0 — operations and durability
 

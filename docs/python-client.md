@@ -327,9 +327,11 @@ looked up once internally but still produce duplicate results. See
 ```python
 n = users.count({"active": True})
 n = users.count()                 # O(1) total count
+n = users.count({"active": True}, max_time_ms=5000, comment="dashboard")
 ```
 
-`count` returns an integer.
+`count` returns an integer. `max_time_ms` raises `NonoDBError` with code
+`timeout` when the budget expires.
 
 ### Explaining queries
 
@@ -352,16 +354,20 @@ covered by the access path. It executes the query to obtain exact counts.
 ## Aggregation
 
 ```python
-rows = users.aggregate([
-    {"$match": {"active": True}},
-    {"$group": {
-        "_id": "$tenant",
-        "total": {"$sum": "$amount"},
-        "n": {"$sum": 1},
-    }},
-    {"$sort": {"total": -1}},
-    {"$limit": 10},
-])
+rows = users.aggregate(
+    [
+        {"$match": {"active": True}},
+        {"$group": {
+            "_id": "$tenant",
+            "total": {"$sum": "$amount"},
+            "n": {"$sum": 1},
+        }},
+        {"$sort": {"total": -1}},
+        {"$limit": 10},
+    ],
+    max_time_ms=5000,
+    comment="monthly report",
+)
 ```
 
 `aggregate` is read-only and returns the pipeline result rows. The supported

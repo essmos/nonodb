@@ -578,7 +578,7 @@ fn candidate_for(req: &Request, max_fields: usize) -> Option<(String, Vec<String
     let (coll, filter) = match req {
         Request::Find { coll, filter, .. }
         | Request::FindOne { coll, filter, .. }
-        | Request::Count { coll, filter } => (coll, filter),
+        | Request::Count { coll, filter, .. } => (coll, filter),
         _ => return None,
     };
     let obj = filter.as_object()?;

@@ -830,7 +830,13 @@ removes secondary, text, fuzzy, and vector index entries in the same write trans
 ## count
 
 ```json
-{"op": "count", "coll": "users", "filter": {"active": true}}
+{
+  "op": "count",
+  "coll": "users",
+  "filter": {"active": true},
+  "comment": "dashboard",
+  "max_time_ms": 5000
+}
 ```
 
 Response:
@@ -845,6 +851,9 @@ Optimizations:
 - A filter exactly matching the fields of an index can be counted from the
   index range without reading documents.
 - Other filters perform a full scan, but `count` does not materialize results.
+- `max_time_ms` bounds index and collection scanning and returns the `timeout`
+  error code when the budget expires. `comment` is accepted for request
+  correlation but is not stored.
 
 ## aggregate
 
@@ -861,7 +870,9 @@ Optimizations:
     }},
     {"$sort": {"total": -1}},
     {"$limit": 10}
-  ]
+  ],
+  "comment": "monthly report",
+  "max_time_ms": 5000
 }
 ```
 
@@ -880,7 +891,9 @@ Response:
 
 Aggregation is **read-only**. It runs in one LMDB read snapshot and is allowed
 in the read-only `batch` operation. A missing collection produces an empty
-`results` array.
+`results` array. `max_time_ms` bounds the pushed-down `find`/`count` phase and is
+rechecked before and after the remaining pipeline; expiry returns the `timeout`
+error code. `comment` is accepted for correlation but is not stored.
 
 ### Supported stages
 
