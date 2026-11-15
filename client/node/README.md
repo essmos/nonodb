@@ -51,6 +51,9 @@ const db = new NonoDB({
 
 See [Multiple databases](../../docs/multi-database.md).
 
+`find`/`findOne` accept `comment`, `maxTimeMS`, and `hint`; `count` and
+`aggregate` accept `comment` and `maxTimeMS`.
+
 See [docs/clients.md](../../docs/clients.md) for the full client guide. Run
 `NONODB_SOCK=/run/nonodb.sock node smoke_test.js` against a daemon for an
 end-to-end check.

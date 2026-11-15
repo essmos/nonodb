@@ -15,11 +15,22 @@ export interface ClientOptions {
   autoPrimary?: boolean;
 }
 
-export interface FindOptions {
+export interface QueryOptions {
+  comment?: string;
+  maxTimeMS?: number;
+}
+
+export interface FindOptions extends QueryOptions {
   projection?: Record<string, 0 | 1>;
   sort?: Array<[string, 1 | -1]>;
   skip?: number;
   limit?: number;
+  hint?: string | Record<string, 1 | -1>;
+}
+
+export interface FindOneOptions extends QueryOptions {
+  projection?: Record<string, 0 | 1>;
+  hint?: string | Record<string, 1 | -1>;
 }
 
 export interface UpdateOptions {
@@ -134,7 +145,7 @@ export class Collection {
   watchOnce(after?: string | null, options?: WatchOptions): Promise<WatchBatch>;
   watch(after?: string | null, options?: WatchOptions): AsyncGenerator<any, void, unknown>;
   find(filter?: Record<string, unknown>, options?: FindOptions): Promise<any[]>;
-  findOne(filter?: Record<string, unknown>, options?: { projection?: Record<string, 0 | 1> }): Promise<any | null>;
-  count(filter?: Record<string, unknown>): Promise<number>;
-  aggregate(pipeline: Record<string, unknown>[]): Promise<any[]>;
+  findOne(filter?: Record<string, unknown>, options?: FindOneOptions): Promise<any | null>;
+  count(filter?: Record<string, unknown>, options?: QueryOptions): Promise<number>;
+  aggregate(pipeline: Record<string, unknown>[], options?: QueryOptions): Promise<any[]>;
 }

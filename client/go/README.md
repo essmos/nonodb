@@ -42,6 +42,9 @@ db := nonodb.New(
 
 See [Multiple databases](../../docs/multi-database.md).
 
+Read options are available on `FindQuery` (`Comment`, `MaxTimeMS`, `Hint`) and
+through `CountWithOptions`, `AggregateWithOptions`, and `FindOneWithOptions`.
+
 See [docs/clients.md](../../docs/clients.md) for the full client guide. Run
 `NONODB_SOCK=/run/nonodb.sock go run ./cmd/smoke` against a daemon for an
 end-to-end check.

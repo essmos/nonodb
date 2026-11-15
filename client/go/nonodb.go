@@ -76,6 +76,23 @@ type FindQuery struct {
 	Sort       []SortField
 	Skip       int64
 	Limit      *int64
+	Comment    *string
+	MaxTimeMS  *int64
+	Hint       any
+}
+
+// QueryOptions controls server-side query execution for reads.
+type QueryOptions struct {
+	Comment   *string
+	MaxTimeMS *int64
+}
+
+// FindOneOptions controls FindOneWithOptions.
+type FindOneOptions struct {
+	Projection map[string]any
+	Comment    *string
+	MaxTimeMS  *int64
+	Hint       any
 }
 
 // IndexOptions controls CreateIndex.
@@ -1468,6 +1485,15 @@ func (c *Collection) Find(ctx context.Context, query FindQuery) ([]map[string]an
 	if query.Limit != nil {
 		payload["limit"] = *query.Limit
 	}
+	if query.Comment != nil {
+		payload["comment"] = *query.Comment
+	}
+	if query.MaxTimeMS != nil {
+		payload["max_time_ms"] = *query.MaxTimeMS
+	}
+	if query.Hint != nil {
+		payload["hint"] = query.Hint
+	}
 	raw, err := c.client.execRaw(ctx, payload)
 	if err != nil {
 		return nil, err
@@ -1480,11 +1506,29 @@ func (c *Collection) FindOne(
 	ctx context.Context,
 	filter, projection map[string]any,
 ) (map[string]any, error) {
+	return c.FindOneWithOptions(ctx, filter, FindOneOptions{Projection: projection})
+}
+
+// FindOneWithOptions returns one document or nil with query options.
+func (c *Collection) FindOneWithOptions(
+	ctx context.Context,
+	filter map[string]any,
+	options FindOneOptions,
+) (map[string]any, error) {
 	payload := map[string]any{
 		"op": "find_one", "coll": c.Name, "filter": nonNilMap(filter),
 	}
-	if projection != nil {
-		payload["projection"] = projection
+	if options.Projection != nil {
+		payload["projection"] = options.Projection
+	}
+	if options.Comment != nil {
+		payload["comment"] = *options.Comment
+	}
+	if options.MaxTimeMS != nil {
+		payload["max_time_ms"] = *options.MaxTimeMS
+	}
+	if options.Hint != nil {
+		payload["hint"] = options.Hint
 	}
 	raw, err := c.client.execRaw(ctx, payload)
 	if err != nil {
@@ -1502,9 +1546,25 @@ func (c *Collection) FindOne(
 
 // Count counts documents matching a filter.
 func (c *Collection) Count(ctx context.Context, filter map[string]any) (int64, error) {
-	raw, err := c.client.execRaw(ctx, map[string]any{
+	return c.CountWithOptions(ctx, filter, QueryOptions{})
+}
+
+// CountWithOptions counts documents with server-side query options.
+func (c *Collection) CountWithOptions(
+	ctx context.Context,
+	filter map[string]any,
+	options QueryOptions,
+) (int64, error) {
+	payload := map[string]any{
 		"op": "count", "coll": c.Name, "filter": nonNilMap(filter),
-	})
+	}
+	if options.Comment != nil {
+		payload["comment"] = *options.Comment
+	}
+	if options.MaxTimeMS != nil {
+		payload["max_time_ms"] = *options.MaxTimeMS
+	}
+	raw, err := c.client.execRaw(ctx, payload)
 	if err != nil {
 		return 0, err
 	}
@@ -1519,9 +1579,25 @@ func (c *Collection) Count(ctx context.Context, filter map[string]any) (int64, e
 
 // Aggregate runs a read-only aggregation pipeline.
 func (c *Collection) Aggregate(ctx context.Context, pipeline []any) ([]map[string]any, error) {
-	raw, err := c.client.execRaw(ctx, map[string]any{
+	return c.AggregateWithOptions(ctx, pipeline, QueryOptions{})
+}
+
+// AggregateWithOptions runs an aggregation pipeline with query options.
+func (c *Collection) AggregateWithOptions(
+	ctx context.Context,
+	pipeline []any,
+	options QueryOptions,
+) ([]map[string]any, error) {
+	payload := map[string]any{
 		"op": "aggregate", "coll": c.Name, "pipeline": pipeline,
-	})
+	}
+	if options.Comment != nil {
+		payload["comment"] = *options.Comment
+	}
+	if options.MaxTimeMS != nil {
+		payload["max_time_ms"] = *options.MaxTimeMS
+	}
+	raw, err := c.client.execRaw(ctx, payload)
 	if err != nil {
 		return nil, err
 	}

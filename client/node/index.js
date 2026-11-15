@@ -769,7 +769,10 @@ class Collection {
     }
   }
 
-  async find(filter = {}, { projection, sort, skip = 0, limit } = {}) {
+  async find(
+    filter = {},
+    { projection, sort, skip = 0, limit, comment, maxTimeMS, hint } = {},
+  ) {
     const payload = {
       op: 'find',
       coll: this.name,
@@ -779,28 +782,43 @@ class Collection {
     if (projection !== undefined) payload.projection = projection;
     if (sort !== undefined) payload.sort = sort;
     if (limit !== undefined) payload.limit = limit;
+    if (comment !== undefined) payload.comment = comment;
+    if (maxTimeMS !== undefined) payload.max_time_ms = maxTimeMS;
+    if (hint !== undefined) payload.hint = hint;
     return this.db.exec(payload);
   }
 
-  async findOne(filter = {}, { projection } = {}) {
+  async findOne(
+    filter = {},
+    { projection, comment, maxTimeMS, hint } = {},
+  ) {
     const payload = { op: 'find_one', coll: this.name, filter };
     if (projection !== undefined) payload.projection = projection;
+    if (comment !== undefined) payload.comment = comment;
+    if (maxTimeMS !== undefined) payload.max_time_ms = maxTimeMS;
+    if (hint !== undefined) payload.hint = hint;
     const result = await this.db.exec(payload);
     return result ?? null;
   }
 
-  async count(filter = {}) {
-    const result = await this.db.exec({ op: 'count', coll: this.name, filter });
+  async count(filter = {}, { comment, maxTimeMS } = {}) {
+    const payload = { op: 'count', coll: this.name, filter };
+    if (comment !== undefined) payload.comment = comment;
+    if (maxTimeMS !== undefined) payload.max_time_ms = maxTimeMS;
+    const result = await this.db.exec(payload);
     return result.count;
   }
 
   /** Run a read-only aggregation pipeline. */
-  async aggregate(pipeline) {
-    const result = await this.db.exec({
+  async aggregate(pipeline, { comment, maxTimeMS } = {}) {
+    const payload = {
       op: 'aggregate',
       coll: this.name,
       pipeline,
-    });
+    };
+    if (comment !== undefined) payload.comment = comment;
+    if (maxTimeMS !== undefined) payload.max_time_ms = maxTimeMS;
+    const result = await this.db.exec(payload);
     return result.results ?? [];
   }
 }

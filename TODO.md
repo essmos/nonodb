@@ -216,6 +216,8 @@ Design: [docs/replication.md](docs/replication.md).
 - [x] `comment` and `max_time_ms` for `count` and `aggregate`, including
       pushed-down find/count and grouped-scan paths
 - [x] `comment` and `max_time_ms` for `cursor_aggregate` page requests
+- [x] Go and Node.js client parity for `comment`, `maxTimeMS`, and `hint` on
+      find/count/aggregate helpers
 
 ### P0 — operations and durability
 

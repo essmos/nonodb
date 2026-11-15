@@ -303,9 +303,16 @@ async function main() {
   const id = await users.insert({ name: 'Ada', age: 36 });
   const adults = await users.find(
     { age: { $gte: 18 } },
-    { sort: [['age', -1]], limit: 10 },
+    {
+      sort: [['age', -1]],
+      limit: 10,
+      comment: 'dashboard',
+      maxTimeMS: 5000,
+      hint: 'age',
+    },
   );
-  console.log(id, adults);
+  const total = await users.count({}, { maxTimeMS: 5000 });
+  console.log(id, adults, total);
   db.close();
 }
 
@@ -375,8 +382,10 @@ db := nonodb.New(
 ```
 
 The Go client methods take a `context.Context`; use it for cancellation and
-deadlines. `Exec` is available for operations not covered by a convenience
-method.
+deadlines. `FindQuery` also accepts `Comment`, `MaxTimeMS`, and `Hint`; use
+`CountWithOptions`, `AggregateWithOptions`, and `FindOneWithOptions` for the
+corresponding read options. `Exec` is available for operations not covered by a
+convenience method.
 
 ## Write durability
 
