@@ -118,6 +118,8 @@ pub enum Request {
         comment: Option<String>,
         #[serde(default)]
         max_time_ms: Option<u64>,
+        #[serde(default)]
+        hint: Option<Value>,
     },
     FindOne {
         coll: String,
@@ -129,6 +131,8 @@ pub enum Request {
         comment: Option<String>,
         #[serde(default)]
         max_time_ms: Option<u64>,
+        #[serde(default)]
+        hint: Option<Value>,
     },
     /// Ordered point lookups by `_id` or a unique single-field index.
     Lookup {
@@ -199,6 +203,8 @@ pub enum Request {
         comment: Option<String>,
         #[serde(default)]
         max_time_ms: Option<u64>,
+        #[serde(default)]
+        hint: Option<Value>,
     },
     Update {
         coll: String,
@@ -289,6 +295,8 @@ pub enum Request {
         comment: Option<String>,
         #[serde(default)]
         max_time_ms: Option<u64>,
+        #[serde(default)]
+        hint: Option<Value>,
     },
     /// Opens a bounded cursor over document-local aggregation stages.
     CursorAggregate {

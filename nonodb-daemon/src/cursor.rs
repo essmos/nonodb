@@ -27,6 +27,7 @@ pub enum Kind {
         skip: usize,
         comment: Option<String>,
         max_time_ms: Option<u64>,
+        hint: Option<Value>,
     },
     Aggregate {
         coll: String,
@@ -188,6 +189,7 @@ mod tests {
                 skip: 0,
                 comment: None,
                 max_time_ms: None,
+                hint: None,
             },
             None,
             None,

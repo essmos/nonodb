@@ -26,6 +26,7 @@ fn query(filter: serde_json::Value) -> FindQuery {
         limit: None,
         comment: None,
         max_time_ms: None,
+        hint: None,
     }
 }
 

@@ -1459,6 +1459,7 @@ class Collection:
         limit: Optional[int] = None,
         comment: Optional[str] = None,
         max_time_ms: Optional[int] = None,
+        hint: Optional[Union[str, dict[str, Any]]] = None,
     ) -> list[dict[str, Any]]:
         payload: dict[str, Any] = {
             "op": "find",
@@ -1476,6 +1477,8 @@ class Collection:
             payload["comment"] = comment
         if max_time_ms is not None:
             payload["max_time_ms"] = max_time_ms
+        if hint is not None:
+            payload["hint"] = hint
         return self._db.exec(payload)
 
     def explain(
@@ -1487,6 +1490,7 @@ class Collection:
         limit: Optional[int] = None,
         comment: Optional[str] = None,
         max_time_ms: Optional[int] = None,
+        hint: Optional[Union[str, dict[str, Any]]] = None,
     ) -> dict[str, Any]:
         """Returns the selected access path, index/bounds, and actual counts."""
         payload: dict[str, Any] = {
@@ -1503,6 +1507,8 @@ class Collection:
             payload["comment"] = comment
         if max_time_ms is not None:
             payload["max_time_ms"] = max_time_ms
+        if hint is not None:
+            payload["hint"] = hint
         return self._db.exec(payload)
 
     def find_one(
@@ -1512,6 +1518,7 @@ class Collection:
         projection: Optional[dict[str, Any]] = None,
         comment: Optional[str] = None,
         max_time_ms: Optional[int] = None,
+        hint: Optional[Union[str, dict[str, Any]]] = None,
     ) -> Optional[dict[str, Any]]:
         payload: dict[str, Any] = {
             "op": "find_one",
@@ -1524,6 +1531,8 @@ class Collection:
             payload["comment"] = comment
         if max_time_ms is not None:
             payload["max_time_ms"] = max_time_ms
+        if hint is not None:
+            payload["hint"] = hint
         result = self._db.exec(payload)
         return result if result is not None else None
 
@@ -1550,6 +1559,7 @@ class Collection:
         batch_size: Optional[int] = None,
         comment: Optional[str] = None,
         max_time_ms: Optional[int] = None,
+        hint: Optional[Union[str, dict[str, Any]]] = None,
     ) -> Cursor:
         """Opens a keyset cursor. Sort must be empty or a single `_id` field."""
         payload: dict[str, Any] = {
@@ -1570,6 +1580,8 @@ class Collection:
             payload["comment"] = comment
         if max_time_ms is not None:
             payload["max_time_ms"] = max_time_ms
+        if hint is not None:
+            payload["hint"] = hint
         return Cursor(self._db, payload, batch_size)
 
     def aggregate_cursor(

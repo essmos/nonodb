@@ -265,19 +265,21 @@ Collection.find(
     limit=None,
     comment=None,       # echoed by explain
     max_time_ms=None,   # server-side execution budget
+    hint=None,          # "index_name", {"field": 1}, or {"$natural": 1}
 ) -> list[dict]
 ```
 
 `find(None)` and `find({})` match everything. When `max_time_ms` expires the
-request raises `NonoDBError` with code `timeout`.
+request raises `NonoDBError` with code `timeout`. Use `sort=[("$natural", -1)]`
+for reverse natural order.
 
 ```python
 user = users.find_one({"email": "ada@example.com"})
 user = users.find_one({"_id": user_id}, projection={"name": 1})
 ```
 
-`find_one` returns a document or `None`. It also accepts `comment=` and
-`max_time_ms=`.
+`find_one` returns a document or `None`. It also accepts `comment=`,
+`max_time_ms=`, and `hint=`.
 
 ### Point lookups
 
@@ -338,6 +340,7 @@ plan = users.explain(
     limit=20,
     comment="nightly report",
     max_time_ms=5000,
+    hint="age",
 )
 print(plan["access_path"], plan["index_used"], plan["actual_matched"])
 ```
@@ -415,10 +418,10 @@ with users.find_cursor(
         process(user)
 ```
 
-`find_cursor` requires an empty sort or a single `_id` sort. It also accepts
-`comment=` and `max_time_ms=`, which are applied to every page request. For
-aggregation, the first stage may be `$match`; the remaining stages must be
-document-local
+`find_cursor` requires an empty sort or a single `_id`/`$natural` sort. It also
+accepts `comment=`, `max_time_ms=`, and `hint=`, which are applied to every page
+request. For aggregation, the first stage may be `$match`; the remaining stages
+must be document-local
 (`$project`, `$addFields`/`$set`, `$unset`):
 
 ```python

@@ -282,6 +282,7 @@ impl UpdateSql {
                         limit: None,
                         comment: None,
                         max_time_ms: None,
+                        hint: None,
                     },
                 )?
             } else {
@@ -325,6 +326,7 @@ impl UpdateSql {
                 limit: None,
                 comment: None,
                 max_time_ms: None,
+                hint: None,
             },
         )?;
         let mut modified = 0usize;
@@ -385,6 +387,7 @@ impl DeleteSql {
                     limit: None,
                     comment: None,
                     max_time_ms: None,
+                    hint: None,
                 },
             )?
         } else {
@@ -698,6 +701,7 @@ impl ParsedSql {
             limit: self.limit,
             comment: None,
             max_time_ms: None,
+            hint: None,
         }))
     }
 

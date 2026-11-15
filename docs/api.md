@@ -295,12 +295,20 @@ Fields:
 | `limit` | none | Maximum number of results; unlimited when omitted |
 | `comment` | none | Optional application comment; echoed by `explain` |
 | `max_time_ms` | none | Server-side execution budget in milliseconds; `0` or omitted means no limit |
+| `hint` | none | Force an index by name or key object, or use `{"$natural": 1}` for a collection scan |
 
 Behavior:
 
 - `max_time_ms` is enforced during collection/index scans, including parallel
   scans, sorted scans, and `$near` candidates. When the budget expires, the
   request fails with error code `timeout`.
+- `hint` accepts `"index_name"` (the logical name, for example `"age"` or
+  `"group+age"`) or a key object such as `{"age": 1, "name": -1}`. The hinted
+  index must exist and be usable for the filter; otherwise the request fails
+  with `invalid_query` rather than silently choosing another plan. For compound
+  indexes, prefer the logical name (`"group+age"`) so field order is explicit.
+- `{"$natural": 1}` forces a collection scan. A sort by `[("$natural", 1)]`
+  or `[("$natural", -1)]` uses the collection's natural `_id` order.
 - Without `sort`, results follow the cheapest scan order (index order or
   `_id` order), and execution stops after `skip + limit` matches.
 - Equality or range conditions on `_id` use the primary-key B+ tree directly.
@@ -329,7 +337,7 @@ Response: the document or `null`.
 
 `find_one` is `find` with `limit=1` and no sort. It stops as soon as a match is
 found. An exact `_id` filter uses a direct primary-key lookup. It accepts the
-same optional `comment` and `max_time_ms` fields as `find`.
+same optional `comment`, `max_time_ms`, and `hint` fields as `find`.
 
 ## lookup
 
@@ -551,6 +559,7 @@ Fields:
 | `sort_covered` | Whether the access path already provides the requested order |
 | `comment` | Present when the request supplied `comment` |
 | `maxTimeMS` | Present when the request supplied a non-zero `max_time_ms` |
+| `hint` | Present when the request supplied `hint` |
 
 `explain` executes the query to produce exact `actual_*` counts. Use a small
 `limit` when explaining a broad query. It is read-only and does not create or
@@ -1095,14 +1104,15 @@ Batch size defaults to 500 and is clamped to 1–1000.
   "limit": 100000,
   "batch_size": 500,
   "comment": "export",
-  "max_time_ms": 5000
+  "max_time_ms": 5000,
+  "hint": "tenant"
 }
 ```
 
-`sort` must be omitted/empty or contain exactly one `_id` field with `1` or
-`-1`. Use a regular `find` for arbitrary sorts. `limit` is the total number of
-documents the cursor may return, not a batch size. `comment` and `max_time_ms`
-are stored with the cursor and applied to every page request.
+`sort` must be omitted/empty or contain exactly one `_id`/`$natural` field with
+`1` or `-1`. Use a regular `find` for arbitrary sorts. `limit` is the total number of
+documents the cursor may return, not a batch size. `comment`, `max_time_ms`, and
+`hint` are stored with the cursor and applied to every page request.
 
 ### cursor_aggregate
 

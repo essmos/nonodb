@@ -1506,12 +1506,14 @@ fn normalize_filter(filter: Value) -> Value {
 fn cursor_sort_direction(sort: &[(String, i32)]) -> Result<bool, ApiError> {
     match sort {
         [] => Ok(true),
-        [(field, direction)] if field == "_id" && (*direction == 1 || *direction == -1) => {
+        [(field, direction)]
+            if (field == "_id" || field == "$natural") && (*direction == 1 || *direction == -1) =>
+        {
             Ok(*direction > 0)
         }
         _ => Err(ApiError {
             code: "invalid_query".to_string(),
-            message: "cursor find requires an empty sort or a single _id sort".to_string(),
+            message: "cursor find requires an empty sort or a single _id/$natural sort".to_string(),
         }),
     }
 }
@@ -1611,13 +1613,14 @@ fn cursor_page(
             cursor_filter(filter, state.last_id.as_deref(), ascending)
         }
     };
-    let (comment, max_time_ms) = match &kind {
+    let (comment, max_time_ms, hint) = match &kind {
         cursor::Kind::Find {
             comment,
             max_time_ms,
+            hint,
             ..
-        } => (comment.clone(), *max_time_ms),
-        cursor::Kind::Aggregate { .. } => (None, None),
+        } => (comment.clone(), *max_time_ms, hint.clone()),
+        cursor::Kind::Aggregate { .. } => (None, None, None),
     };
     let query = FindQuery {
         filter,
@@ -1627,6 +1630,7 @@ fn cursor_page(
         limit: Some(fetch),
         comment,
         max_time_ms,
+        hint,
     };
     let docs = c.find(&query)?;
     state.skip = 0;
@@ -2546,6 +2550,7 @@ async fn exec_inner(
             limit,
             comment,
             max_time_ms,
+            hint,
         } => {
             let store = state.store.clone();
             let auth = vault_auth.clone();
@@ -2559,6 +2564,7 @@ async fn exec_inner(
                     limit,
                     comment,
                     max_time_ms,
+                    hint,
                 };
                 if c.profile().is_vault() {
                     let auth = auth.as_ref().ok_or_else(vault::key_required)?;
@@ -2684,6 +2690,7 @@ async fn exec_inner(
             projection,
             comment,
             max_time_ms,
+            hint,
         } => {
             let store = state.store.clone();
             let auth = vault_auth.clone();
@@ -2697,6 +2704,7 @@ async fn exec_inner(
                     limit: Some(1),
                     comment,
                     max_time_ms,
+                    hint,
                 };
                 if c.profile().is_vault() {
                     let auth = auth.as_ref().ok_or_else(vault::key_required)?;
@@ -2747,6 +2755,7 @@ async fn exec_inner(
             batch_size,
             comment,
             max_time_ms,
+            hint,
         } => {
             let ascending = match cursor_sort_direction(&sort) {
                 Ok(direction) => direction,
@@ -2760,6 +2769,7 @@ async fn exec_inner(
                 skip,
                 comment,
                 max_time_ms,
+                hint,
             };
             let cursor_state = cursor::State::new(
                 principal.name().to_string(),
@@ -2843,6 +2853,7 @@ async fn exec_inner(
             limit,
             comment,
             max_time_ms,
+            hint,
         } => {
             let store = state.store.clone();
             let auth = vault_auth.clone();
@@ -2857,6 +2868,7 @@ async fn exec_inner(
                     projection: None,
                     comment,
                     max_time_ms,
+                    hint,
                 };
                 Ok::<Value, ApiError>(c.explain(&query)?)
             });
@@ -3830,6 +3842,7 @@ fn watch_late_scan(
         limit: Some(limit),
         comment: None,
         max_time_ms: None,
+        hint: None,
     };
     Ok(c.find(&query)?)
 }
@@ -3855,6 +3868,7 @@ fn watch_once(
         limit: Some(limit + 1),
         comment: None,
         max_time_ms: None,
+        hint: None,
     };
     let mut events = c.find(&query)?;
     let has_more = events.len() > limit;
@@ -3891,6 +3905,7 @@ fn watch_status(
         limit: Some(1),
         comment: None,
         max_time_ms: None,
+        hint: None,
     })?;
     if !exists.is_empty() {
         return Ok((false, None));
@@ -3903,6 +3918,7 @@ fn watch_status(
         limit: Some(1),
         comment: None,
         max_time_ms: None,
+        hint: None,
     })?;
     let oldest = oldest
         .first()
@@ -4057,6 +4073,7 @@ fn execute_read(
             limit,
             comment,
             max_time_ms,
+            hint,
         } => {
             let Some(c) = store.collection_at(rtxn, &coll)? else {
                 return Ok(json!([]));
@@ -4072,6 +4089,7 @@ fn execute_read(
                 limit,
                 comment,
                 max_time_ms,
+                hint,
             };
             Ok(json!(c.find_in(rtxn, &query)?))
         }
@@ -4081,6 +4099,7 @@ fn execute_read(
             projection,
             comment,
             max_time_ms,
+            hint,
         } => {
             let Some(c) = store.collection_at(rtxn, &coll)? else {
                 return Ok(Value::Null);
@@ -4096,6 +4115,7 @@ fn execute_read(
                 limit: Some(1),
                 comment,
                 max_time_ms,
+                hint,
             };
             Ok(c.find_in(rtxn, &query)?
                 .into_iter()
@@ -4132,6 +4152,7 @@ fn execute_read(
             limit,
             comment,
             max_time_ms,
+            hint,
         } => {
             let Some(c) = store.collection_at(rtxn, &coll)? else {
                 return Ok(json!({
@@ -4153,6 +4174,7 @@ fn execute_read(
                 projection: None,
                 comment,
                 max_time_ms,
+                hint,
             };
             Ok(c.explain_in(rtxn, &query)?)
         }

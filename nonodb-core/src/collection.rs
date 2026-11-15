@@ -1,5 +1,6 @@
 //! Document collection operations.
 
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::ops::Bound;
@@ -257,6 +258,8 @@ pub struct FindQuery {
     pub comment: Option<String>,
     /// Maximum server-side execution time in milliseconds.
     pub max_time_ms: Option<u64>,
+    /// Optional index hint (`"name"`, `{"field": 1}`, or `{"$natural": 1}`).
+    pub hint: Option<Value>,
 }
 
 fn find_deadline(query: &FindQuery) -> Option<Instant> {
@@ -272,6 +275,69 @@ fn check_find_deadline(deadline: Option<Instant>) -> Result<()> {
     } else {
         Ok(())
     }
+}
+
+/// Parsed MongoDB-style index hint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum IndexHint {
+    Natural,
+    Name(String),
+    Fields(Vec<String>),
+}
+
+fn parse_index_hint(hint: &Value) -> Result<IndexHint> {
+    match hint {
+        Value::String(name) if !name.is_empty() => Ok(IndexHint::Name(name.clone())),
+        Value::Object(obj) => {
+            if let Some(direction) = obj.get("$natural") {
+                if obj.len() != 1 || !matches!(direction.as_i64(), Some(1 | -1)) {
+                    return Err(Error::Query(
+                        "$natural hint must be {\"$natural\": 1} or {\"$natural\": -1}".into(),
+                    ));
+                }
+                return Ok(IndexHint::Natural);
+            }
+            if obj.is_empty() {
+                return Err(Error::Query("index hint cannot be empty".into()));
+            }
+            for key in obj.keys() {
+                if key.starts_with('$') {
+                    return Err(Error::Query(format!(
+                        "unsupported index hint operator `{key}`"
+                    )));
+                }
+            }
+            Ok(IndexHint::Fields(obj.keys().cloned().collect()))
+        }
+        _ => Err(Error::Query(
+            "index hint must be a string, an object, or {$natural: 1}".into(),
+        )),
+    }
+}
+
+fn normalize_natural_sort(sort: &[(String, i32)]) -> Result<Option<Vec<(String, i32)>>> {
+    if !sort.iter().any(|(field, _)| field == "$natural") {
+        return Ok(None);
+    }
+    if sort.len() != 1 {
+        return Err(Error::Query("$natural must be the only sort key".into()));
+    }
+    let direction = sort[0].1;
+    if direction != 1 && direction != -1 {
+        return Err(Error::Query(
+            "$natural sort direction must be 1 or -1".into(),
+        ));
+    }
+    Ok(Some(vec![("_id".to_string(), direction)]))
+}
+
+fn normalized_find_query(query: &FindQuery) -> Result<Cow<'_, FindQuery>> {
+    let Some(sort) = normalize_natural_sort(&query.sort)? else {
+        return Ok(Cow::Borrowed(query));
+    };
+    let mut normalized = query.clone();
+    normalized.sort = sort;
+    Ok(Cow::Owned(normalized))
 }
 
 /// Summary of a full collection reindex.
@@ -1073,6 +1139,91 @@ impl<'e> Collection<'e> {
     /// A compound index `[a, b, c]` is used when the filter has conditions for
     /// all fields, with every field except the last being equality conditions
     /// (`a: 1` or `a: {$eq: 1}`). The last field may have a range condition.
+    fn query_index_plan(
+        &self,
+        rtxn: &RoTxn<'_>,
+        filter: &Value,
+        hint: Option<&IndexHint>,
+    ) -> Result<Option<IndexPlan>> {
+        match hint {
+            None => self.index_plan(rtxn, filter),
+            Some(IndexHint::Natural) => Ok(None),
+            Some(hint) => self.hinted_index_plan(rtxn, filter, hint),
+        }
+    }
+
+    fn hinted_index_plan(
+        &self,
+        rtxn: &RoTxn<'_>,
+        filter: &Value,
+        hint: &IndexHint,
+    ) -> Result<Option<IndexPlan>> {
+        let defs = self.index_defs(rtxn)?;
+        let def = defs.into_iter().find(|def| match hint {
+            IndexHint::Natural => false,
+            IndexHint::Name(name) => {
+                def.name() == *name
+                    || (def.effective_fields().len() == 1 && def.effective_fields()[0] == *name)
+            }
+            IndexHint::Fields(fields) => def.effective_fields() == *fields,
+        });
+        let Some(def) = def else {
+            let label = match hint {
+                IndexHint::Natural => "$natural".to_string(),
+                IndexHint::Name(name) => name.clone(),
+                IndexHint::Fields(fields) => format!("{{{}}}", fields.join(": 1, ")),
+            };
+            return Err(Error::Query(format!("hint index not found: {label}")));
+        };
+        if def.geo {
+            return Err(Error::Query(
+                "hint on a geo index is not supported; use $near/$geoWithin/$geoIntersects without a hint"
+                    .into(),
+            ));
+        }
+        if !def.current_format() {
+            return Err(Error::Query(format!(
+                "hint index `{}` uses an older format and must be reindexed",
+                def.name()
+            )));
+        }
+        let Some(db) = self.index_db(rtxn, &def)? else {
+            return Err(Error::Query(format!(
+                "hint index `{}` is missing its storage",
+                def.name()
+            )));
+        };
+
+        let bounds = filter
+            .as_object()
+            .filter(|obj| !obj.keys().any(|key| key.starts_with('$')))
+            .and_then(|obj| bounds_for_index(&def, obj));
+        if let Some(bounds) = bounds {
+            return Ok(Some(IndexPlan { db, bounds, def }));
+        }
+
+        // An index that omits documents cannot be used for a residual scan:
+        // those documents would never be visited. A full index scan is safe
+        // only when every document has at least one entry.
+        let document_count = self.db.stat(rtxn)?.entries;
+        let covers_all = if def.is_multikey() {
+            def.multikey_all_docs
+        } else {
+            db.stat(rtxn)?.entries == document_count
+        };
+        if !covers_all {
+            return Err(Error::Query(format!(
+                "hint index `{}` cannot be used for this filter because it does not contain every document",
+                def.name()
+            )));
+        }
+        Ok(Some(IndexPlan {
+            db,
+            bounds: (Bound::Unbounded, Bound::Unbounded),
+            def,
+        }))
+    }
+
     fn index_plan(&self, rtxn: &RoTxn<'_>, filter: &Value) -> Result<Option<IndexPlan>> {
         let Some(obj) = filter.as_object() else {
             return Ok(None);
@@ -1435,6 +1586,15 @@ impl<'e> Collection<'e> {
         let Some(plan) = self.index_plan(rtxn, filter)? else {
             return Ok(None);
         };
+        Ok(Some(self.index_plan_candidates(rtxn, &plan, max)?))
+    }
+
+    fn index_plan_candidates(
+        &self,
+        rtxn: &RoTxn<'_>,
+        plan: &IndexPlan,
+        max: Option<usize>,
+    ) -> Result<Vec<String>> {
         let (lower, upper) = &plan.bounds;
         let range = (as_bound(lower), as_bound(upper));
 
@@ -1451,7 +1611,7 @@ impl<'e> Collection<'e> {
                 break;
             }
         }
-        Ok(Some(ids))
+        Ok(ids)
     }
 
     /// Counts index entries in a range without allocating an `_id` list.
@@ -2612,6 +2772,7 @@ impl<'e> Collection<'e> {
             limit: Some(1),
             comment: None,
             max_time_ms: None,
+            hint: None,
         };
         let selected = self.find_in(&*wtxn, &query)?.into_iter().next();
 
@@ -2706,6 +2867,7 @@ impl<'e> Collection<'e> {
             limit: Some(1),
             comment: None,
             max_time_ms: None,
+            hint: None,
         };
         let selected = self
             .find_vault_in(&*wtxn, &query, key, tenant, kid)?
@@ -3191,6 +3353,7 @@ impl<'e> Collection<'e> {
             limit: query.limit,
             comment: query.comment.clone(),
             max_time_ms: query.max_time_ms,
+            hint: query.hint.clone(),
         };
         let stored = self.find_in(rtxn, &stored_query)?;
         let mut out = Vec::with_capacity(stored.len());
@@ -3223,6 +3386,7 @@ impl<'e> Collection<'e> {
             limit: Some(1),
             comment: None,
             max_time_ms: None,
+            hint: None,
         };
         Ok(self.find_vault_in(rtxn, &query, key, tenant, kid)?.pop())
     }
@@ -3764,6 +3928,7 @@ impl<'e> Collection<'e> {
             limit: Some(limit),
             comment: None,
             max_time_ms: None,
+            hint: None,
         };
         let docs = self.find_in(rtxn, &query)?;
         if docs.len() > max_docs {
@@ -3882,6 +4047,8 @@ impl<'e> Collection<'e> {
     }
 
     pub fn find(&self, query: &FindQuery) -> Result<Vec<Value>> {
+        let normalized = normalized_find_query(query)?;
+        let query = normalized.as_ref();
         crate::query::validate::validate_filter(&query.filter)?;
         let rtxn = self.read_txn()?;
         let limit = query.limit.unwrap_or(usize::MAX);
@@ -3892,7 +4059,8 @@ impl<'e> Collection<'e> {
         // The snapshot stays consistent: the main thread reads one `RoTxn` and sends
         // only raw bytes to workers (the LMDB cursor is not shared).
         let sorted = !query.sort.is_empty();
-        let parallel_base = limit > 0
+        let parallel_base = query.hint.is_none()
+            && limit > 0
             && want <= PARALLEL_SCAN_MAX_WANT
             && self.db.stat(&rtxn)?.entries >= PARALLEL_SCAN_MIN_ENTRIES
             && direct_id(&query.filter).is_none()
@@ -4663,7 +4831,10 @@ impl<'e> Collection<'e> {
     }
 
     pub fn find_in(&self, rtxn: &RoTxn<'_>, query: &FindQuery) -> Result<Vec<Value>> {
+        let normalized = normalized_find_query(query)?;
+        let query = normalized.as_ref();
         crate::query::validate::validate_filter(&query.filter)?;
+        let hint = query.hint.as_ref().map(parse_index_hint).transpose()?;
         let limit = query.limit.unwrap_or(usize::MAX);
         if limit == 0 {
             return Ok(Vec::new());
@@ -4683,7 +4854,7 @@ impl<'e> Collection<'e> {
 
         // 0) Ordered match-all queries can walk primary-key or index order
         //    directly, stopping after `skip + limit` entries.
-        if is_match_all(&query.filter) && sorted {
+        if query.hint.is_none() && is_match_all(&query.filter) && sorted {
             if let Some(out) = self.find_sorted_match_all(rtxn, query)? {
                 return Ok(out);
             }
@@ -4691,7 +4862,11 @@ impl<'e> Collection<'e> {
 
         // 0b) Top-level `$or`: when every branch has an index, merge the
         //     candidate ids and apply the full filter as a residual.
-        if let Some(plans) = self.or_index_plans(rtxn, &query.filter)? {
+        if let Some(plans) = if query.hint.is_none() {
+            self.or_index_plans(rtxn, &query.filter)?
+        } else {
+            None
+        } {
             let mut seen = HashSet::new();
             'plans: for plan in &plans {
                 let range = (as_bound(&plan.bounds.0), as_bound(&plan.bounds.1));
@@ -4732,14 +4907,22 @@ impl<'e> Collection<'e> {
         }
 
         // 1) Exact `_id` -> direct get.
-        if let Some(id) = direct_id(&query.filter) {
+        if let Some(id) = if query.hint.is_none() {
+            direct_id(&query.filter)
+        } else {
+            None
+        } {
             if let Some(bytes) = self.db.get(rtxn, id.as_bytes())? {
                 acc.push(parse_json(bytes)?);
             }
         }
         // 1b) Multikey `$all`: intersect the index ranges for every required
         //     value, then apply the full filter as a residual.
-        else if let Some(ids) = self.all_index_candidates(rtxn, &query.filter)? {
+        else if let Some(ids) = if query.hint.is_none() {
+            self.all_index_candidates(rtxn, &query.filter)?
+        } else {
+            None
+        } {
             for id in ids {
                 check_find_deadline(deadline)?;
                 if !sorted && acc.len() >= want {
@@ -4757,7 +4940,11 @@ impl<'e> Collection<'e> {
             }
         }
         // 1c) Geo index cell ranges for `$geoWithin` / `$geoIntersects`.
-        else if let Some(ids) = self.geo_index_candidates(rtxn, &query.filter)? {
+        else if let Some(ids) = if query.hint.is_none() {
+            self.geo_index_candidates(rtxn, &query.filter)?
+        } else {
+            None
+        } {
             for id in ids {
                 check_find_deadline(deadline)?;
                 if !sorted && acc.len() >= want {
@@ -4777,7 +4964,7 @@ impl<'e> Collection<'e> {
         // 2) Secondary index. First the fast "index-only" path: if
         //    the sort exactly matches the index order, we walk the index
         //    and fetch only `skip + limit` documents instead of the whole range.
-        else if let Some(plan) = self.index_plan(rtxn, &query.filter)? {
+        else if let Some(plan) = self.query_index_plan(rtxn, &query.filter, hint.as_ref())? {
             let sort_match = if sorted && !plan.def.is_multikey() {
                 index_matches_sort(&plan.def, &query.sort)
             } else {
@@ -4833,9 +5020,9 @@ impl<'e> Collection<'e> {
                     .collect());
             }
 
-            let ids = self.index_candidates(rtxn, &query.filter, (!sorted).then_some(want))?;
+            let ids = self.index_plan_candidates(rtxn, &plan, (!sorted).then_some(want))?;
             check_find_deadline(deadline)?;
-            for id in ids.into_iter().flatten() {
+            for id in ids {
                 check_find_deadline(deadline)?;
                 if !sorted && acc.len() >= want {
                     break;
@@ -4853,7 +5040,11 @@ impl<'e> Collection<'e> {
         }
         // 3) `_id` range over the primary key. This is not a secondary index, but
         //    it narrows the full scan to a contiguous B+tree interval.
-        else if let Some((lower, upper)) = id_bounds(&query.filter) {
+        else if let Some((lower, upper)) = if query.hint.is_none() {
+            id_bounds(&query.filter)
+        } else {
+            None
+        } {
             let range = (as_bound(&lower), as_bound(&upper));
             let reverse = id_sort_direction(&query.sort).unwrap_or(false);
             let iter: IndexIter<'_> = if reverse {
@@ -4981,6 +5172,7 @@ impl<'e> Collection<'e> {
             projection: None,
             comment: None,
             max_time_ms: None,
+            hint: None,
         };
         Ok(self.find(&query)?.into_iter().next())
     }
@@ -4999,6 +5191,7 @@ impl<'e> Collection<'e> {
             projection: projection.cloned(),
             comment: None,
             max_time_ms: None,
+            hint: None,
         };
         Ok(self.find_in(rtxn, &query)?.into_iter().next())
     }
@@ -5229,6 +5422,8 @@ impl<'e> Collection<'e> {
     /// This executes the query so `actual_matched` and `actual_returned` are
     /// exact. Use small limits when explaining broad queries.
     pub fn explain_in(&self, rtxn: &RoTxn<'_>, query: &FindQuery) -> Result<Value> {
+        let normalized = normalized_find_query(query)?;
+        let query = normalized.as_ref();
         crate::query::validate::validate_filter(&query.filter)?;
         let mut out = self.explain_plan(rtxn, query)?;
         let matched = self.count_in(rtxn, &query.filter)?;
@@ -5254,6 +5449,9 @@ impl<'e> Collection<'e> {
         }
         if let Some(max_time_ms) = query.max_time_ms {
             obj.insert("maxTimeMS".into(), Value::from(max_time_ms));
+        }
+        if let Some(hint) = &query.hint {
+            obj.insert("hint".into(), hint.clone());
         }
         obj.insert(
             "estimated_documents".into(),
@@ -5284,8 +5482,9 @@ impl<'e> Collection<'e> {
         };
         let mut out = serde_json::Map::new();
         out.insert("collection".into(), Value::String(self.name.clone()));
+        let hint = query.hint.as_ref().map(parse_index_hint).transpose()?;
 
-        if is_match_all(&query.filter) {
+        if query.hint.is_none() && is_match_all(&query.filter) {
             let candidates = self.db.stat(rtxn)?.entries as u64;
             if id_sort_direction(&query.sort).is_some() {
                 out.insert("access_path".into(), Value::String("id_range".into()));
@@ -5332,7 +5531,11 @@ impl<'e> Collection<'e> {
             return Ok(Value::Object(out));
         }
 
-        if let Some(id) = direct_id(&query.filter) {
+        if let Some(id) = if query.hint.is_none() {
+            direct_id(&query.filter)
+        } else {
+            None
+        } {
             let exists = self.db.get(rtxn, id.as_bytes())?.is_some();
             out.insert("access_path".into(), Value::String("id_lookup".into()));
             out.insert("index_used".into(), Value::Bool(true));
@@ -5346,7 +5549,11 @@ impl<'e> Collection<'e> {
             return Ok(Value::Object(out));
         }
 
-        if let Some(ids) = self.all_index_candidates(rtxn, &query.filter)? {
+        if let Some(ids) = if query.hint.is_none() {
+            self.all_index_candidates(rtxn, &query.filter)?
+        } else {
+            None
+        } {
             out.insert("access_path".into(), Value::String("index_scan".into()));
             out.insert("index_used".into(), Value::Bool(true));
             out.insert(
@@ -5362,7 +5569,11 @@ impl<'e> Collection<'e> {
             return Ok(Value::Object(out));
         }
 
-        if let Some(plan) = self.geo_index_plan(rtxn, &query.filter)? {
+        if let Some(plan) = if query.hint.is_none() {
+            self.geo_index_plan(rtxn, &query.filter)?
+        } else {
+            None
+        } {
             let mut candidates = 0usize;
             for (lower, upper) in &plan.ranges {
                 let range = (as_bound(lower), as_bound(upper));
@@ -5386,7 +5597,11 @@ impl<'e> Collection<'e> {
             return Ok(Value::Object(out));
         }
 
-        if let Some(plans) = self.or_index_plans(rtxn, &query.filter)? {
+        if let Some(plans) = if query.hint.is_none() {
+            self.or_index_plans(rtxn, &query.filter)?
+        } else {
+            None
+        } {
             let mut candidates = 0usize;
             let mut indexes = Vec::with_capacity(plans.len());
             for plan in &plans {
@@ -5406,7 +5621,7 @@ impl<'e> Collection<'e> {
             return Ok(Value::Object(out));
         }
 
-        if let Some(plan) = self.index_plan(rtxn, &query.filter)? {
+        if let Some(plan) = self.query_index_plan(rtxn, &query.filter, hint.as_ref())? {
             let candidates = if plan.def.is_multikey() {
                 self.index_count_unique_plan(rtxn, &plan)?
             } else {
@@ -5439,7 +5654,11 @@ impl<'e> Collection<'e> {
             return Ok(Value::Object(out));
         }
 
-        if let Some((lower, upper)) = id_bounds(&query.filter) {
+        if let Some((lower, upper)) = if query.hint.is_none() {
+            id_bounds(&query.filter)
+        } else {
+            None
+        } {
             let range = (as_bound(&lower), as_bound(&upper));
             let candidates = self.db.range(rtxn, &range)?.count();
             out.insert("access_path".into(), Value::String("id_range".into()));
@@ -7000,6 +7219,7 @@ mod tests {
             limit: Some(31),
             comment: None,
             max_time_ms: None,
+            hint: None,
         };
         // `find` takes the parallel path (1000 entries > test threshold).
         let parallel = c.find(&q).unwrap();
@@ -7158,6 +7378,7 @@ mod tests {
             limit: Some(2),
             comment: None,
             max_time_ms: None,
+            hint: None,
         };
         let got = c.find(&q).unwrap();
         assert_eq!(got, vec![json!({"i": 3}), json!({"i": 2})]);
@@ -8743,6 +8964,7 @@ mod tests {
             limit: None,
             comment: Some("test query".into()),
             max_time_ms: Some(5_000),
+            hint: None,
         };
         assert_eq!(c.find(&q).unwrap().len(), 1);
         let explained = c.explain(&q).unwrap();
@@ -8760,6 +8982,71 @@ mod tests {
             ..FindQuery::default()
         })
         .is_none());
+    }
+
+    #[test]
+    fn index_hints_and_natural_sort() {
+        let (_dir, store) = store();
+        let c = store.collection("hinted").unwrap();
+        for id in ["a", "b", "c"] {
+            c.insert_one(json!({"_id": id, "x": 1, "y": id})).unwrap();
+        }
+        c.create_index("x", false).unwrap();
+
+        let mut q = FindQuery {
+            filter: json!({"y": {"$ne": "a"}}),
+            projection: None,
+            sort: Vec::new(),
+            skip: 0,
+            limit: None,
+            comment: None,
+            max_time_ms: None,
+            hint: Some(json!({"x": 1})),
+        };
+        let ids = |docs: Vec<Value>| -> Vec<String> {
+            docs.into_iter()
+                .map(|doc| doc["_id"].as_str().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(ids(c.find(&q).unwrap()), vec!["b", "c"]);
+
+        q.hint = Some(json!("x"));
+        assert_eq!(ids(c.find(&q).unwrap()), vec!["b", "c"]);
+        let explained = c.explain(&q).unwrap();
+        assert_eq!(explained["access_path"], "index_scan");
+        assert_eq!(explained["index"]["fields"], json!(["x"]));
+
+        let mut natural = FindQuery {
+            filter: json!({}),
+            projection: None,
+            sort: vec![("$natural".to_string(), -1)],
+            skip: 0,
+            limit: None,
+            comment: None,
+            max_time_ms: None,
+            hint: Some(json!({"$natural": 1})),
+        };
+        assert_eq!(ids(c.find(&natural).unwrap()), vec!["c", "b", "a"]);
+        assert_eq!(
+            c.explain(&natural).unwrap()["access_path"],
+            "collection_scan"
+        );
+
+        q.hint = Some(json!("missing-index"));
+        assert!(c.find(&q).is_err());
+
+        natural.sort = vec![("$natural".to_string(), 1), ("y".to_string(), 1)];
+        assert!(c.find(&natural).is_err());
+        natural.sort = vec![("$natural".to_string(), -1)];
+        natural.hint = None;
+        assert_eq!(ids(c.find(&natural).unwrap()), vec!["c", "b", "a"]);
+
+        // A hinted index that omits a document cannot be used for a full
+        // residual scan, because that document would never be visited.
+        c.insert_one(json!({"_id": "d", "y": "d"})).unwrap();
+        q.filter = json!({"y": "d"});
+        q.hint = Some(json!({"x": 1}));
+        assert!(c.find(&q).is_err());
     }
 }
 

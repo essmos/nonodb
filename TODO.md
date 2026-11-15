@@ -211,6 +211,8 @@ Design: [docs/replication.md](docs/replication.md).
 - [x] `comment` and `max_time_ms` query options for `find`, `find_one`,
       `explain`, and cursor pages, with deadline checks in serial, parallel,
       sorted, and geo scan paths
+- [x] `hint` by index name/key object or `{"$natural": 1}`, plus
+      `$natural` sort order for `find`, cursors, and `explain`
 
 ### P0 — operations and durability
 

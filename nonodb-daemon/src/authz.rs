@@ -197,6 +197,7 @@ mod tests {
                 limit: None,
                 comment: None,
                 max_time_ms: None,
+                hint: None,
             },
             "default"
         )
@@ -212,6 +213,7 @@ mod tests {
                 limit: None,
                 comment: None,
                 max_time_ms: None,
+                hint: None,
             },
             "default"
         )
@@ -341,6 +343,7 @@ mod tests {
                 limit: None,
                 comment: None,
                 max_time_ms: None,
+                hint: None,
             },
             "default"
         )
@@ -376,6 +379,7 @@ mod tests {
                 limit: None,
                 comment: None,
                 max_time_ms: None,
+                hint: None,
             },
             "app1"
         )

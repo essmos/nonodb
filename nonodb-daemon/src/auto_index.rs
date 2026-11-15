@@ -695,6 +695,7 @@ mod tests {
             limit: Some(100),
             comment: None,
             max_time_ms: None,
+            hint: None,
         }
     }
 

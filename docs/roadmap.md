@@ -27,6 +27,8 @@ Implemented:
   `arrayFilters`;
 - atomic find-and-modify returning the old or new document;
 - `explain` with access path, index/bounds, sort coverage, and actual counts;
+- `comment`, `maxTimeMS`, index hints, and `$natural` sort for find queries and
+  cursors;
 - single-field, compound, unique, and covering indexes;
 - single-field GeoJSON point geo indexes with `$near`, `$geoWithin`, and
   `$geoIntersects`;

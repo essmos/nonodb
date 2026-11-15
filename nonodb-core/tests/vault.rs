@@ -57,6 +57,7 @@ fn vault_round_trip_and_isolation() {
                 projection: None,
                 comment: None,
                 max_time_ms: None,
+                hint: None,
             },
             &key,
             "acme",

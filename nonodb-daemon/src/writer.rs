@@ -814,6 +814,7 @@ fn execute(
                         limit: if *multi { None } else { Some(1) },
                         comment: None,
                         max_time_ms: None,
+                        hint: None,
                     },
                 )?
             } else {
@@ -938,6 +939,7 @@ fn execute(
                         limit: Some(1),
                         comment: None,
                         max_time_ms: None,
+                        hint: None,
                     },
                 )?
                 .into_iter()
@@ -1074,6 +1076,7 @@ fn execute(
                         limit: if *multi { None } else { Some(1) },
                         comment: None,
                         max_time_ms: None,
+                        hint: None,
                     },
                 )?
             } else {
