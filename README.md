@@ -128,8 +128,9 @@ application, but behaves like a shared database to a preforking web server.
 nonodb is deliberately not a general-purpose distributed database. It does not
 provide:
 
-- sharding or multi-primary clustering. The built-in replication model is one
-  primary with read replicas or a hot standby, with quorum failover;
+- sharding, or a multi-writer cluster with more than one primary. A
+  primary/replica/standby cluster with quorum failover is supported; see the
+  [replication and cluster guide](docs/replication-cluster-guide.md);
 - general interactive multi-document transactions;
 - MongoDB wire-protocol compatibility;
 - cross-collection joins (`$lookup`) or write stages (`$merge`/`$out`);
