@@ -255,13 +255,14 @@ project's target workload.
 1. **Raw JSON passthrough for simple reads.** For `find` without projection or
    sorting, stream stored JSON bytes directly into the response instead of
    parsing to `Value` and reserializing. Expected read-path win.
-2. **Incremental index backfill writes.** Keep configurable worker counts, but
-   write index entries incrementally instead of buffering many entries,
-   reducing peak RAM on very large builds.
+2. **Incremental index backfill writes (implemented).** Backfill streams chunks
+   capped by document count and raw bytes, applies entries as each chunk
+   completes, and avoids collection-sized unique-key maps.
 3. **More update operators.** `$rename`, `$min`, `$max`,
    `$mul`, `$currentDate`.
-4. **Reindex tooling.** A command to rebuild text/fuzzy indexes after analyzer
-   changes, with progress and timeout handling.
+4. **Reindex tooling (implemented).** The `reindex` operation and CLI/GUI/Python
+   entry points rebuild secondary, text, fuzzy, and vector indexes in one write
+   transaction.
 5. **Operational hardening.** More metrics such as latency histograms and
    per-stage query timings. Health/readiness, index-build status, structured logs,
    and graceful drain are implemented.

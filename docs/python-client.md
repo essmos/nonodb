@@ -618,15 +618,23 @@ created = events.create_indexes([
 All indexes are built in one collection scan and one write transaction. This
 avoids re-reading and re-parsing the collection once per index.
 
-### Inspect and drop
+### Inspect, rebuild, and drop
 
 ```python
 indexes = users.list_indexes()
 # [{"field": "email", "fields": ["email"], "unique": True, "include": []}]
 
+# One-click migration/repair: rebuild every index on the collection.
+report = events.reindex()
+# {"reindexed": "events", "secondary": [...], "text": [...], ...}
+
 users.drop_index("email")
 users.drop_index("tenant+created_at")
 ```
+
+`reindex()` keeps the existing index definitions and rebuilds their data. Use it
+after an index-format upgrade or when index contents are suspected to be
+incomplete. It runs in one write transaction and rolls back on failure.
 
 Creating an index backfills existing documents synchronously. On large
 collections this can take seconds to minutes and blocks writers; raise

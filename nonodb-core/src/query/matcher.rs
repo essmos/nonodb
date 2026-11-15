@@ -167,6 +167,10 @@ fn elem_match_uses_filter(query: &serde_json::Map<String, Value>) -> bool {
 /// Equality with MongoDB semantics:
 /// - missing field == `null`,
 /// - `{tags: "x"}` matches when `tags` is an array containing `x`.
+///
+/// Negation follows from this: `$ne: 1` matches a missing field, while
+/// `$ne: null` does not match a missing/null field. `$nin` behaves the same
+/// way because it negates `$in`.
 pub(crate) fn eq_opt(actual: Option<&Value>, expected: &Value) -> bool {
     match actual {
         None => expected.is_null(),
@@ -262,6 +266,11 @@ mod tests {
         assert!(matches(&doc, &json!({"a": null})));
         assert!(matches(&doc, &json!({"missing": null})));
         assert!(!matches(&doc, &json!({"missing": {"$exists": true}})));
+        assert!(matches(&doc, &json!({"missing": {"$ne": 1}})));
+        assert!(!matches(&doc, &json!({"missing": {"$ne": null}})));
+        assert!(!matches(&doc, &json!({"a": {"$ne": null}})));
+        assert!(matches(&doc, &json!({"missing": {"$nin": [1, 2]}})));
+        assert!(!matches(&doc, &json!({"missing": {"$nin": [null, 2]}})));
     }
 
     #[test]

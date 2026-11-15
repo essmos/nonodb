@@ -80,6 +80,7 @@ pub fn authorize_request(
         | Request::CreateFuzzyIndex { coll, .. }
         | Request::DropFuzzyIndex { coll, .. }
         | Request::CreateVectorIndex { coll, .. }
+        | Request::Reindex { coll }
         | Request::DropVectorIndex { coll, .. }
         | Request::CreateCollection { coll, .. }
         | Request::SetCollectionTtl { coll, .. }

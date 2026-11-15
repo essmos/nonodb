@@ -346,6 +346,9 @@ pub enum Request {
         #[serde(default)]
         metric: Option<VectorMetric>,
     },
+    Reindex {
+        coll: String,
+    },
     DropVectorIndex {
         coll: String,
         field: String,
@@ -689,6 +692,9 @@ pub enum WriteReq {
         dims: usize,
         metric: VectorMetric,
     },
+    Reindex {
+        coll: String,
+    },
     DropVectorIndex {
         coll: String,
         field: String,
@@ -783,6 +789,7 @@ impl Request {
             Self::Search { .. } => "search",
             Self::Fuzzy { .. } => "fuzzy",
             Self::CreateVectorIndex { .. } => "create_vector_index",
+            Self::Reindex { .. } => "reindex",
             Self::DropVectorIndex { .. } => "drop_vector_index",
             Self::ListVectorIndexes { .. } => "list_vector_indexes",
             Self::VectorSearch { .. } => "vector_search",
@@ -891,6 +898,7 @@ impl Request {
             | Self::DropFuzzyIndex { coll, .. }
             | Self::ListFuzzyIndexes { coll }
             | Self::CreateVectorIndex { coll, .. }
+            | Self::Reindex { coll }
             | Self::DropVectorIndex { coll, .. }
             | Self::ListVectorIndexes { coll }
             | Self::VectorSearch { coll, .. }
@@ -963,7 +971,8 @@ impl WriteReq {
             | Self::CreateIndexes { .. }
             | Self::CreateTextIndex { .. }
             | Self::CreateFuzzyIndex { .. }
-            | Self::CreateVectorIndex { .. } => true,
+            | Self::CreateVectorIndex { .. }
+            | Self::Reindex { .. } => true,
             Self::Batch { ops } => ops.iter().any(Self::is_index_build),
             _ => false,
         }

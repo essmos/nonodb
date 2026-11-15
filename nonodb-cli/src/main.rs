@@ -443,6 +443,11 @@ fn run() -> Result<(), String> {
             let res = http_post("/v1/exec", &json!({"op": "list_indexes", "coll": coll}))?;
             print_result(&res);
         }
+        "reindex" => {
+            let coll = args.get(1).ok_or("użycie: nonodb-cli reindex <kolekcja>")?;
+            let res = http_post("/v1/exec", &json!({"op": "reindex", "coll": coll}))?;
+            print_result(&res);
+        }
         "map" => {
             let res = http_post("/v1/exec", &json!({"op": "map_info"}))?;
             print_result(&res);

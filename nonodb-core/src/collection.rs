@@ -59,6 +59,10 @@ const PARALLEL_UNSORTED_MIN_WANT: usize = 16;
 /// Size of the raw-byte chunk passed to worker threads.
 const PARALLEL_SCAN_CHUNK: usize = 8192;
 
+/// Soft byte cap for one index-backfill chunk. Large documents stop a chunk
+/// early so the bounded worker queue cannot hold gigabytes of raw documents.
+const BACKFILL_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+
 /// Default cap for worker threads on large scans/backfills.
 const DEFAULT_WORKERS: usize = 16;
 /// Hard cap for configurable worker counts, to avoid runaway memory use.
@@ -172,8 +176,6 @@ fn parse_json(bytes: &[u8]) -> Result<Value> {
     sonic_rs::from_slice::<Value>(bytes).map_err(|e| Error::JsonFast(e.to_string()))
 }
 
-type TextBackfillEntry = (String, Vec<(String, u32)>, u32);
-
 /// `update` operation result (with optional upsert).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdateOutcome {
@@ -215,6 +217,16 @@ struct BackfillChunk {
     docs: Vec<(u32, u32, u32, u32)>, // id_start, id_len, doc_start, doc_len
 }
 
+fn push_backfill_doc(chunk: &mut BackfillChunk, id_bytes: &[u8], doc_bytes: &[u8]) {
+    let id_start = chunk.data.len() as u32;
+    chunk.data.extend_from_slice(id_bytes);
+    let id_len = id_bytes.len() as u32;
+    let doc_start = chunk.data.len() as u32;
+    chunk.data.extend_from_slice(doc_bytes);
+    let doc_len = doc_bytes.len() as u32;
+    chunk.docs.push((id_start, id_len, doc_start, doc_len));
+}
+
 /// Selected index and key range for a filter.
 struct IndexPlan {
     db: Database<Bytes, Bytes>,
@@ -240,6 +252,15 @@ pub struct FindQuery {
     pub sort: Vec<(String, i32)>,
     pub skip: usize,
     pub limit: Option<usize>,
+}
+
+/// Summary of a full collection reindex.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ReindexReport {
+    pub secondary: Vec<String>,
+    pub text: Vec<String>,
+    pub fuzzy: Vec<String>,
+    pub vector: Vec<String>,
 }
 
 /// One secondary index to create in a single collection scan.
@@ -612,10 +633,22 @@ impl<'e> Collection<'e> {
         }
 
         let total_docs = self.db.stat(wtxn)?.entries as u64;
+        let index_dbs: Vec<_> = defs
+            .iter()
+            .map(|(_key, def)| self.index_db_in(wtxn, def))
+            .collect::<Result<_>>()?;
+        for db in &index_dbs {
+            db.clear(&mut *wtxn)?;
+        }
+        let mut docs_per_index = vec![0u64; defs.len()];
+        let mut multikey_fields: Vec<Vec<String>> = vec![Vec::new(); defs.len()];
         let target = format!("{} indexes", defs.len());
         let defs_ref = &defs;
-        let entries: Vec<(usize, index::IndexKeys, Vec<u8>, String)> =
-            self.parallel_backfill(wtxn, "index", &target, |id, doc| {
+        self.parallel_backfill_apply(
+            wtxn,
+            "index",
+            &target,
+            |id, doc| {
                 let mut out = Vec::new();
                 for (slot, (_key, def)) in defs_ref.iter().enumerate() {
                     let keys = index::encode_index_keys(def, &doc)?;
@@ -626,18 +659,46 @@ impl<'e> Collection<'e> {
                     out.push((slot, keys, value, id.clone()));
                 }
                 Ok(out)
-            })?;
+            },
+            |wtxn, entries| {
+                for (slot, keys, value, id) in entries {
+                    docs_per_index[slot] = docs_per_index[slot].saturating_add(1);
+                    for field in &keys.multikey_fields {
+                        if !multikey_fields[slot].contains(field) {
+                            multikey_fields[slot].push(field.clone());
+                        }
+                    }
+                    let unique = defs_ref[slot].1.unique;
+                    for vb in keys.keys {
+                        if unique {
+                            let range = index::exact_prefix(&vb);
+                            let bounds = (as_bound(&range.0), as_bound(&range.1));
+                            for item in index_dbs[slot].range(&*wtxn, &bounds)? {
+                                let (_existing_key, existing_value) = item?;
+                                if let Some((existing_id, _)) =
+                                    index::decode_index_value(existing_value)
+                                {
+                                    if existing_id != id {
+                                        return Err(Error::DuplicateKey(id));
+                                    }
+                                }
+                            }
+                        }
+                        let mut key = vb;
+                        key.extend_from_slice(id.as_bytes());
+                        index_dbs[slot].put(&mut *wtxn, key.as_slice(), value.as_slice())?;
+                    }
+                }
+                Ok(())
+            },
+        )?;
 
-        let mut docs_per_index = vec![0u64; defs.len()];
-        for (slot, keys, _, _) in &entries {
-            docs_per_index[*slot] = docs_per_index[*slot].saturating_add(1);
-            for field in &keys.multikey_fields {
-                if !defs[*slot].1.multikey_fields.contains(field) {
-                    defs[*slot].1.multikey_fields.push(field.clone());
+        for (slot, (_key, def)) in defs.iter_mut().enumerate() {
+            for field in &multikey_fields[slot] {
+                if !def.multikey_fields.contains(field) {
+                    def.multikey_fields.push(field.clone());
                 }
             }
-        }
-        for (slot, (_key, def)) in defs.iter_mut().enumerate() {
             def.multikey_all_docs = docs_per_index[slot] == total_docs;
             let key = index::def_key(&self.name, &def.name());
             self.meta.put(
@@ -646,39 +707,67 @@ impl<'e> Collection<'e> {
                 serde_json::to_vec(def)?.as_slice(),
             )?;
         }
-
-        let index_dbs: Vec<_> = defs
-            .iter()
-            .map(|(_key, def)| self.index_db_in(wtxn, def))
-            .collect::<Result<_>>()?;
-        for db in &index_dbs {
-            db.clear(&mut *wtxn)?;
-        }
-        let mut seen: Vec<HashMap<Vec<u8>, String>> = defs
-            .iter()
-            .map(|(_key, def)| HashMap::with_capacity(if def.unique { entries.len() } else { 0 }))
-            .collect();
-
-        for (slot, keys, value, id) in entries {
-            let unique = defs[slot].1.unique;
-            for vb in keys.keys {
-                if unique {
-                    match seen[slot].get(&vb) {
-                        Some(existing) if existing != &id => {
-                            return Err(Error::DuplicateKey(id));
-                        }
-                        Some(_) => continue,
-                        None => {
-                            seen[slot].insert(vb.clone(), id.clone());
-                        }
-                    }
-                }
-                let mut key = vb;
-                key.extend_from_slice(id.as_bytes());
-                index_dbs[slot].put(&mut *wtxn, key.as_slice(), value.as_slice())?;
-            }
-        }
         Ok(())
+    }
+
+    /// Rebuilds every secondary, text, fuzzy, and vector index on this
+    /// collection from the current documents.
+    ///
+    /// The whole operation runs in the caller's write transaction, so a failed
+    /// rebuild rolls back to the previous index definitions and data.
+    pub fn reindex(&self) -> Result<ReindexReport> {
+        let mut wtxn = self.write_txn()?;
+        let report = self.reindex_txn(&mut wtxn)?;
+        wtxn.commit()?;
+        Ok(report)
+    }
+
+    pub fn reindex_txn(&self, wtxn: &mut RwTxn<'_>) -> Result<ReindexReport> {
+        self.ensure_standard()?;
+        let secondary = self.index_defs(&*wtxn)?;
+        let text = self.text_defs(&*wtxn)?;
+        let fuzzy = self.fuzzy_defs(&*wtxn)?;
+        let vector = self.vector_defs(&*wtxn)?;
+        let report = ReindexReport {
+            secondary: secondary.iter().map(IndexDef::name).collect(),
+            text: text.clone(),
+            fuzzy: fuzzy.clone(),
+            vector: vector.iter().map(|def| def.field.clone()).collect(),
+        };
+
+        for def in &secondary {
+            self.drop_index_txn(wtxn, &def.name())?;
+        }
+        for field in &text {
+            self.drop_text_index_txn(wtxn, field)?;
+        }
+        for field in &fuzzy {
+            self.drop_fuzzy_index_txn(wtxn, field)?;
+        }
+        for def in &vector {
+            self.drop_vector_index_txn(wtxn, &def.field)?;
+        }
+
+        let secondary_specs: Vec<IndexSpec> = secondary
+            .iter()
+            .map(|def| IndexSpec {
+                fields: def.effective_fields(),
+                unique: def.unique,
+                include: def.include.clone(),
+                geo: def.geo,
+            })
+            .collect();
+        self.create_indexes_txn(wtxn, &secondary_specs)?;
+        for field in &text {
+            self.create_text_index_txn(wtxn, field)?;
+        }
+        for field in &fuzzy {
+            self.create_fuzzy_index_txn(wtxn, field)?;
+        }
+        for def in &vector {
+            self.create_vector_index_txn(wtxn, &def.field, def.dims, def.metric)?;
+        }
+        Ok(report)
     }
 
     /// Creates a secondary index (single field) and backfills it with existing
@@ -753,53 +842,63 @@ impl<'e> Collection<'e> {
         let idx_db = self.index_db_in(wtxn, &def)?;
         idx_db.clear(&mut *wtxn)?;
 
-        // Backfill: parallel parsing/encoding, written in one transaction.
+        // Backfill incrementally: workers parse/encode, the main thread writes
+        // each completed chunk into the index immediately.
         let total_docs = self.db.stat(wtxn)?.entries as u64;
         let def_ref = &def;
-        let entries: Vec<(index::IndexKeys, Vec<u8>, String)> =
-            self.parallel_backfill(wtxn, "index", &def.name(), |id, doc| {
+        let mut docs = 0u64;
+        let mut multikey_fields: Vec<String> = Vec::new();
+        self.parallel_backfill_apply(
+            wtxn,
+            "index",
+            &def.name(),
+            |id, doc| {
                 let keys = index::encode_index_keys(def_ref, &doc)?;
                 if keys.keys.is_empty() {
                     return Ok(Vec::new());
                 }
                 let value = index::encode_index_value(def_ref, &doc, &id);
                 Ok(vec![(keys, value, id)])
-            })?;
-
-        for (keys, _, _) in &entries {
-            for field in &keys.multikey_fields {
-                if !def.multikey_fields.contains(field) {
-                    def.multikey_fields.push(field.clone());
+            },
+            |wtxn, entries| {
+                for (keys, value, id) in entries {
+                    docs = docs.saturating_add(1);
+                    for field in &keys.multikey_fields {
+                        if !multikey_fields.contains(field) {
+                            multikey_fields.push(field.clone());
+                        }
+                    }
+                    for vb in keys.keys {
+                        if def_ref.unique {
+                            let range = index::exact_prefix(&vb);
+                            let bounds = (as_bound(&range.0), as_bound(&range.1));
+                            for item in idx_db.range(&*wtxn, &bounds)? {
+                                let (_existing_key, existing_value) = item?;
+                                if let Some((existing_id, _)) =
+                                    index::decode_index_value(existing_value)
+                                {
+                                    if existing_id != id {
+                                        return Err(Error::DuplicateKey(id));
+                                    }
+                                }
+                            }
+                        }
+                        let mut key = vb;
+                        key.extend_from_slice(id.as_bytes());
+                        idx_db.put(&mut *wtxn, key.as_slice(), value.as_slice())?;
+                    }
                 }
-            }
-        }
-        def.multikey_all_docs = entries.len() as u64 == total_docs;
+                Ok(())
+            },
+        )?;
+
+        def.multikey_fields = multikey_fields;
+        def.multikey_all_docs = docs == total_docs;
         self.meta.put(
             &mut *wtxn,
             key.as_bytes(),
             serde_json::to_vec(&def)?.as_slice(),
         )?;
-
-        let mut seen: HashMap<Vec<u8>, String> = HashMap::new();
-
-        for (keys, value, id) in entries {
-            for vb in keys.keys {
-                if unique {
-                    match seen.get(&vb) {
-                        Some(existing) if existing != &id => {
-                            return Err(Error::DuplicateKey(id));
-                        }
-                        Some(_) => continue,
-                        None => {
-                            seen.insert(vb.clone(), id.clone());
-                        }
-                    }
-                }
-                let mut key = vb;
-                key.extend_from_slice(id.as_bytes());
-                idx_db.put(&mut *wtxn, key.as_slice(), value.as_slice())?;
-            }
-        }
         Ok(())
     }
 
@@ -1478,27 +1577,34 @@ impl<'e> Collection<'e> {
             )));
         }
 
-        let entries: Vec<(String, Vec<u8>)> =
-            self.parallel_backfill(wtxn, "vector", field, |id, doc| {
+        let db = self.vector_db_in(wtxn, field)?;
+        db.clear(&mut *wtxn)?;
+        self.parallel_backfill_apply(
+            wtxn,
+            "vector",
+            field,
+            |id, doc| {
                 let Some(vector) =
                     index::field_value(&doc, field).and_then(|v| vector::parse_vector(v, dims))
                 else {
                     return Ok(Vec::new());
                 };
                 Ok(vec![(id, vector::encode_vector(&vector))])
-            })?;
+            },
+            |wtxn, entries| {
+                for (id, value) in entries {
+                    db.put(&mut *wtxn, id.as_bytes(), value.as_slice())?;
+                }
+                Ok(())
+            },
+        )?;
 
-        let db = self.vector_db_in(wtxn, field)?;
-        db.clear(&mut *wtxn)?;
         let def = VectorDef::new(field, dims, metric);
         self.meta.put(
             &mut *wtxn,
             def_key.as_bytes(),
             serde_json::to_vec(&def)?.as_slice(),
         )?;
-        for (id, value) in entries {
-            db.put(&mut *wtxn, id.as_bytes(), value.as_slice())?;
-        }
         Ok(())
     }
 
@@ -1741,36 +1847,42 @@ impl<'e> Collection<'e> {
             return Ok(());
         }
 
-        // Backfill: parallel tokenization, written in one transaction.
-        let entries: Vec<TextBackfillEntry> =
-            self.parallel_backfill(wtxn, "text", field, |id, doc| {
+        // Backfill incrementally: tokenize in workers, write postings and
+        // document lengths as each chunk completes.
+        let postings = self.text_postings_in(wtxn, field)?;
+        let lens = self.text_len_db_in(wtxn, field)?;
+        postings.clear(&mut *wtxn)?;
+        lens.clear(&mut *wtxn)?;
+        let mut total = 0u64;
+        self.parallel_backfill_apply(
+            wtxn,
+            "text",
+            field,
+            |id, doc| {
                 let Some(text) = index::field_value(&doc, field).and_then(search::field_text)
                 else {
                     return Ok(Vec::new());
                 };
                 let tokens = search::tokenize(&text);
                 let dl = tokens.len() as u32;
-                let tf = search::term_freqs(&tokens).into_iter().collect();
+                let tf: HashMap<String, u32> = search::term_freqs(&tokens).into_iter().collect();
                 Ok(vec![(id, tf, dl)])
-            })?;
-
-        let postings = self.text_postings_in(wtxn, field)?;
-        let lens = self.text_len_db_in(wtxn, field)?;
-        postings.clear(&mut *wtxn)?;
-        lens.clear(&mut *wtxn)?;
-
-        let mut total = 0u64;
-        for (id, tf, dl) in entries {
-            lens.put(&mut *wtxn, id.as_bytes(), &dl.to_le_bytes())?;
-            total += u64::from(dl);
-            for (term, tf) in tf {
-                postings.put(
-                    &mut *wtxn,
-                    search::postings_key(&term, &id).as_slice(),
-                    &tf.to_le_bytes(),
-                )?;
-            }
-        }
+            },
+            |wtxn, entries| {
+                for (id, tf, dl) in entries {
+                    lens.put(&mut *wtxn, id.as_bytes(), &dl.to_le_bytes())?;
+                    total = total.saturating_add(u64::from(dl));
+                    for (term, tf) in tf {
+                        postings.put(
+                            &mut *wtxn,
+                            search::postings_key(&term, &id).as_slice(),
+                            &tf.to_le_bytes(),
+                        )?;
+                    }
+                }
+                Ok(())
+            },
+        )?;
 
         self.meta.put(&mut *wtxn, def_key.as_bytes(), b"1")?;
         self.meta.put(
@@ -1831,22 +1943,28 @@ impl<'e> Collection<'e> {
             return Ok(());
         }
 
-        let entries: Vec<(String, Vec<String>)> =
-            self.parallel_backfill(wtxn, "fuzzy", field, |id, doc| {
+        let db = self.fuzzy_db_in(wtxn, field)?;
+        db.clear(&mut *wtxn)?;
+        self.parallel_backfill_apply(
+            wtxn,
+            "fuzzy",
+            field,
+            |id, doc| {
                 let Some(text) = index::field_value(&doc, field).and_then(search::field_text)
                 else {
                     return Ok(Vec::new());
                 };
                 Ok(vec![(id, search::trigrams(&text))])
-            })?;
-
-        let db = self.fuzzy_db_in(wtxn, field)?;
-        db.clear(&mut *wtxn)?;
-        for (id, grams) in entries {
-            for gram in grams {
-                db.put(&mut *wtxn, search::postings_key(&gram, &id).as_slice(), &[])?;
-            }
-        }
+            },
+            |wtxn, entries| {
+                for (id, grams) in entries {
+                    for gram in grams {
+                        db.put(&mut *wtxn, search::postings_key(&gram, &id).as_slice(), &[])?;
+                    }
+                }
+                Ok(())
+            },
+        )?;
 
         self.meta.put(&mut *wtxn, def_key.as_bytes(), b"1")?;
         Ok(())
@@ -3664,25 +3782,67 @@ impl<'e> Collection<'e> {
         Ok(out)
     }
 
-    /// Parallel index backfill: the main thread reads one `RwTxn`,
-    /// while workers parse JSON and prepare entries. Writing to LMDB
-    /// stays on the main thread (one transaction).
-    fn parallel_backfill<T, F>(
+    /// Reads one bounded backfill chunk after the last processed `_id`.
+    ///
+    /// Using a fresh range/iterator per chunk releases the LMDB iterator borrow
+    /// before the caller writes index entries, so backfill can stream instead of
+    /// collecting every entry in memory.
+    fn read_backfill_chunk(&self, txn: &RoTxn<'_>, after: Option<&[u8]>) -> Result<BackfillChunk> {
+        let mut chunk = BackfillChunk {
+            data: Vec::new(),
+            docs: Vec::with_capacity(PARALLEL_SCAN_CHUNK),
+        };
+        if let Some(after) = after {
+            let range = (Bound::Excluded(after), Bound::Unbounded);
+            for item in self.db.range(txn, &range)? {
+                let (id_bytes, doc_bytes) = item?;
+                push_backfill_doc(&mut chunk, id_bytes, doc_bytes);
+                if chunk.docs.len() >= PARALLEL_SCAN_CHUNK
+                    || chunk.data.len() >= BACKFILL_CHUNK_BYTES
+                {
+                    break;
+                }
+            }
+        } else {
+            for item in self.db.iter(txn)? {
+                let (id_bytes, doc_bytes) = item?;
+                push_backfill_doc(&mut chunk, id_bytes, doc_bytes);
+                if chunk.docs.len() >= PARALLEL_SCAN_CHUNK
+                    || chunk.data.len() >= BACKFILL_CHUNK_BYTES
+                {
+                    break;
+                }
+            }
+        }
+        Ok(chunk)
+    }
+
+    /// Parallel index backfill with incremental application.
+    ///
+    /// The main thread reads one `RwTxn` and feeds bounded chunks to workers.
+    /// Workers parse JSON and produce index entries. The main thread applies
+    /// each completed chunk immediately instead of accumulating every entry in
+    /// memory first. Chunks are bounded by both document count and raw bytes,
+    /// so peak Rust heap usage is bounded by the worker queue rather than the
+    /// collection size.
+    fn parallel_backfill_apply<T, F, A>(
         &self,
-        wtxn: &RwTxn<'_>,
+        wtxn: &mut RwTxn<'_>,
         kind: &str,
         target: &str,
         f: F,
-    ) -> Result<Vec<T>>
+        mut apply: A,
+    ) -> Result<()>
     where
         T: Send,
         F: Fn(String, Value) -> Result<Vec<T>> + Sync,
+        A: FnMut(&mut RwTxn<'_>, Vec<T>) -> Result<()>,
     {
         let total = self.db.stat(wtxn)?.entries as u64;
         let progress = crate::progress::begin(&self.name, target, kind, total);
         let workers = backfill_workers();
         if workers <= 1 {
-            return self.backfill_serial(wtxn, f, &progress);
+            return self.backfill_serial_apply(wtxn, f, &progress, apply);
         }
 
         let (job_tx, job_rx) = std::sync::mpsc::sync_channel::<BackfillChunk>(workers * 2);
@@ -3690,7 +3850,7 @@ impl<'e> Collection<'e> {
         let (res_tx, res_rx) = std::sync::mpsc::channel::<Result<Vec<T>>>();
         let func = &f;
 
-        std::thread::scope(|scope| -> Result<Vec<T>> {
+        std::thread::scope(|scope| -> Result<()> {
             let progress_ref = &progress;
             for _ in 0..workers {
                 let rx = Arc::clone(&job_rx);
@@ -3732,63 +3892,106 @@ impl<'e> Collection<'e> {
             }
             drop(res_tx);
 
-            let mut chunk = BackfillChunk {
-                data: Vec::new(),
-                docs: Vec::with_capacity(PARALLEL_SCAN_CHUNK),
-            };
-            for item in self.db.iter(&*wtxn)? {
-                let (id_bytes, doc_bytes) = item?;
-                let id_start = chunk.data.len() as u32;
-                chunk.data.extend_from_slice(id_bytes);
-                let id_len = id_bytes.len() as u32;
-                let doc_start = chunk.data.len() as u32;
-                chunk.data.extend_from_slice(doc_bytes);
-                let doc_len = doc_bytes.len() as u32;
-                chunk.docs.push((id_start, id_len, doc_start, doc_len));
-                if chunk.docs.len() >= PARALLEL_SCAN_CHUNK {
-                    let full = std::mem::replace(
-                        &mut chunk,
-                        BackfillChunk {
-                            data: Vec::new(),
-                            docs: Vec::with_capacity(PARALLEL_SCAN_CHUNK),
-                        },
-                    );
-                    let _ = job_tx.send(full);
+            // Keep at most the worker queue plus a small number of completed
+            // chunks in memory. Apply results while producing jobs rather than
+            // buffering all entries until the scan is over.
+            let mut send_chunk = |wtxn: &mut RwTxn<'_>, mut chunk: BackfillChunk| -> Result<()> {
+                loop {
+                    match job_tx.try_send(chunk) {
+                        Ok(()) => break,
+                        Err(std::sync::mpsc::TrySendError::Full(returned)) => {
+                            chunk = returned;
+                            let result = res_rx.recv().map_err(|_| {
+                                Error::Query("index backfill worker stopped unexpectedly".into())
+                            })??;
+                            apply(wtxn, result)?;
+                        }
+                        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                            return Err(Error::Query(
+                                "index backfill worker stopped unexpectedly".into(),
+                            ));
+                        }
+                    }
                 }
-            }
-            if !chunk.docs.is_empty() {
-                let _ = job_tx.send(chunk);
-            }
+                while let Ok(result) = res_rx.try_recv() {
+                    apply(wtxn, result?)?;
+                }
+                Ok(())
+            };
+
+            let scan_result = (|| -> Result<()> {
+                let mut after: Option<Vec<u8>> = None;
+                loop {
+                    let chunk = self.read_backfill_chunk(&*wtxn, after.as_deref())?;
+                    if chunk.docs.is_empty() {
+                        break;
+                    }
+                    let (id_start, id_len, _, _) = *chunk.docs.last().expect("non-empty chunk");
+                    after = Some(
+                        chunk.data[id_start as usize..id_start as usize + id_len as usize].to_vec(),
+                    );
+                    send_chunk(&mut *wtxn, chunk)?;
+                }
+                Ok(())
+            })();
+            drop(send_chunk);
             drop(job_tx);
 
-            let mut all = Vec::new();
-            for res in res_rx {
-                all.extend(res?);
+            if scan_result.is_err() {
+                // Workers may still be blocked sending results. Drain them so
+                // the scope can join instead of deadlocking on a full channel.
+                for _ in res_rx {}
+                return scan_result;
             }
-            Ok(all)
+
+            // Apply the remaining chunks. Keep draining after the first error
+            // so workers never block on a receiver that is about to be dropped.
+            let mut result = Ok(());
+            for chunk in res_rx {
+                match chunk {
+                    Ok(entries) if result.is_ok() => {
+                        if let Err(e) = apply(wtxn, entries) {
+                            result = Err(e);
+                        }
+                    }
+                    Err(e) if result.is_ok() => result = Err(e),
+                    _ => {}
+                }
+            }
+            result
         })
     }
 
-    fn backfill_serial<T, F>(
+    fn backfill_serial_apply<T, F, A>(
         &self,
-        wtxn: &RwTxn<'_>,
+        wtxn: &mut RwTxn<'_>,
         f: F,
         progress: &crate::progress::BackfillGuard,
-    ) -> Result<Vec<T>>
+        mut apply: A,
+    ) -> Result<()>
     where
         F: Fn(String, Value) -> Result<Vec<T>>,
+        A: FnMut(&mut RwTxn<'_>, Vec<T>) -> Result<()>,
     {
-        let mut out = Vec::new();
-        for item in self.db.iter(wtxn)? {
-            let (id_bytes, doc_bytes) = item?;
-            let id = std::str::from_utf8(id_bytes)
-                .map_err(|e| Error::Query(e.to_string()))?
-                .to_string();
-            let doc: Value = parse_json(doc_bytes)?;
-            out.extend(f(id, doc)?);
-            progress.advance(1);
+        let mut after: Option<Vec<u8>> = None;
+        loop {
+            let chunk = self.read_backfill_chunk(&*wtxn, after.as_deref())?;
+            if chunk.docs.is_empty() {
+                break;
+            }
+            let (id_start, id_len, _, _) = *chunk.docs.last().expect("non-empty chunk");
+            after =
+                Some(chunk.data[id_start as usize..id_start as usize + id_len as usize].to_vec());
+            for (id_start, id_len, doc_start, doc_len) in chunk.docs {
+                let id = std::str::from_utf8(&chunk.data[id_start as usize..][..id_len as usize])
+                    .map_err(|e| Error::Query(e.to_string()))?
+                    .to_string();
+                let doc: Value = parse_json(&chunk.data[doc_start as usize..][..doc_len as usize])?;
+                apply(wtxn, f(id, doc)?)?;
+                progress.advance(1);
+            }
         }
-        Ok(out)
+        Ok(())
     }
 
     /// Parallel full scan with sorting.
@@ -7290,6 +7493,54 @@ mod tests {
             }])
             .is_err());
         assert!(dup.list_indexes().unwrap().is_empty());
+    }
+
+    #[test]
+    fn reindex_rebuilds_every_index_type() {
+        let (_dir, store) = store();
+        let c = store.collection("reindexed").unwrap();
+        c.insert_one(json!({
+            "_id": "a", "grp": 1, "score": 10, "tags": ["x"],
+            "body": "rust database engine", "name": "hello",
+            "embedding": [1.0, 0.0], "email": "a@example.com"
+        }))
+        .unwrap();
+        c.insert_one(json!({
+            "_id": "b", "grp": 2, "score": 20, "tags": ["y"],
+            "body": "python web framework", "name": "world",
+            "embedding": [0.0, 1.0], "email": "b@example.com"
+        }))
+        .unwrap();
+        c.create_index_fields(&["grp".into()], false, &["score".into()])
+            .unwrap();
+        c.create_text_index("body").unwrap();
+        c.create_fuzzy_index("name").unwrap();
+        c.create_vector_index("embedding", 2, VectorMetric::Cosine)
+            .unwrap();
+
+        let report = c.reindex().unwrap();
+        assert_eq!(report.secondary, vec!["grp".to_string()]);
+        assert_eq!(report.text, vec!["body".to_string()]);
+        assert_eq!(report.fuzzy, vec!["name".to_string()]);
+        assert_eq!(report.vector, vec!["embedding".to_string()]);
+
+        assert_eq!(c.count(&json!({"grp": 1})).unwrap(), 1);
+        assert_eq!(
+            c.search("body", "rust", &json!({}), 0, Some(10))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            c.fuzzy_search("name", "helo", 2, &json!({}), Some(10))
+                .unwrap()
+                .len(),
+            1
+        );
+        let vector = c
+            .vector_search("embedding", &[1.0, 0.0], &json!({}), 0, Some(10))
+            .unwrap();
+        assert_eq!(vector[0]["_id"], "a");
     }
 
     #[test]

@@ -3296,6 +3296,21 @@ function CollectionView({
     }
   };
 
+  const reindexIndexes = async () => {
+    if (!window.confirm('Rebuild all indexes for this collection? This scans every document.')) return;
+    setBusy(true);
+    setError('');
+    try {
+      await exec(connection, { op: 'reindex', coll: name });
+      setNotice('Indexes rebuilt');
+      await load();
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const runExplain = async () => {
     setBusy(true);
     setError('');
@@ -3817,6 +3832,7 @@ function CollectionView({
               </>
             )}
             <button onClick={() => void createIndex()} disabled={busy}>Create</button>
+            <button onClick={() => void reindexIndexes()} disabled={busy || indexes.length + textIndexes.length + fuzzyIndexes.length + vectorIndexes.length === 0}>Reindex all</button>
           </div>
           <div className="index-list">
             {indexes.map((index) => (

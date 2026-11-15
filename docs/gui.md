@@ -178,7 +178,10 @@ a shared machine. Use **Disconnect** to clear the active session.
 - text/BM25 indexes;
 - fuzzy indexes;
 - vector indexes with dimensions and metric;
-- index listing and removal for every supported type.
+- index listing and removal for every supported type;
+- **Reindex all**, which rebuilds every index on the selected collection in one
+  write transaction. The GUI asks for confirmation because the rebuild scans
+  the whole collection and blocks writers while it runs.
 
 ### Events
 

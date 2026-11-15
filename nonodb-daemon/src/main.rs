@@ -3567,6 +3567,7 @@ async fn exec_inner(
                     dims,
                     metric: metric.unwrap_or_default(),
                 },
+                Request::Reindex { coll } => WriteReq::Reindex { coll },
                 Request::DropVectorIndex { coll, field } => {
                     WriteReq::DropVectorIndex { coll, field }
                 }

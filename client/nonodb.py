@@ -971,6 +971,15 @@ class Collection:
         )
         return result["created"]
 
+    def reindex(self) -> dict[str, Any]:
+        """Rebuilds every secondary, text, fuzzy, and vector index.
+
+        Drops and recreates the existing index definitions in one write
+        transaction. The call scans the whole collection and blocks writers;
+        increase the request timeout for large collections.
+        """
+        return self._db.exec({"op": "reindex", "coll": self.name})
+
     def drop_index(self, field: str) -> bool:
         return self._db.exec(
             {"op": "drop_index", "coll": self.name, "field": field}

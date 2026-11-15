@@ -183,6 +183,7 @@ client timeout with `NONODB_TIMEOUT` or the `timeout=` argument.
 | [`create_vector_index`](#vector-indexes) | Create an exact vector index |
 | [`drop_vector_index`](#vector-indexes) | Drop a vector index |
 | [`list_vector_indexes`](#vector-indexes) | List vector indexes |
+| [`reindex`](#reindex) | Rebuild every index on a collection |
 | [`search`](#search) | BM25 full-text query |
 | [`fuzzy`](#fuzzy) | Approximate string query |
 | [`vector_search`](#vector-search) | Exact top-K vector query |
@@ -1100,6 +1101,27 @@ object, `null`, or an omitted filter matches every document.
 | `{"a": {"$type": "string"}}` | Value has a BSON type |
 | `{"a": {"$not": {...}}}` | Negate a field condition |
 
+### Missing fields and negation
+
+Field-condition matching treats a missing field as `null` for equality:
+
+- `{"a": null}` and `{"a": {"$eq": null}}` match when `a` is `null` **or absent**.
+- `{"a": {"$ne": 1}}` matches when `a` is absent, because a missing field is not
+  equal to `1`.
+- `{"a": {"$ne": null}}` does **not** match when `a` is absent or `null`; it only
+  matches documents where `a` is present and non-null.
+- `{"a": {"$nin": [1, 2]}}` follows the same rule: missing fields match unless
+  `null` is one of the listed values.
+
+Use `$exists` when presence itself matters:
+
+```json
+{"a": {"$exists": true}, "a": {"$ne": null}}
+```
+
+This matches only documents where `a` is present and non-null. Use
+`{"a": {"$exists": false}}` to match documents where `a` is absent.
+
 ### Logical operators
 
 | Operator | Meaning |
@@ -1382,6 +1404,41 @@ Rules:
 - Multikey filter ranges deduplicate document ids. `$all` intersects one index
   range per value, and `$elemMatch` can use a dotted index on the matching
   element path. `$size` still requires a scan.
+
+### reindex
+
+Rebuild every secondary, text, fuzzy, and vector index on one collection from
+the current documents:
+
+```json
+{"op": "reindex", "coll": "events"}
+```
+
+Response:
+
+```json
+{
+  "ok": true,
+  "result": {
+    "reindexed": "events",
+    "secondary": ["tenant", "tenant+created_at"],
+    "text": ["body"],
+    "fuzzy": ["name"],
+    "vector": ["embedding"]
+  }
+}
+```
+
+`reindex` drops and recreates each existing index definition in a single write
+transaction. It is the one-click migration path after an index-format upgrade or
+when index data is suspected to be incomplete. The operation scans every
+document and blocks writers for the duration; it does not change index
+definitions, uniqueness, `include`, `geo`, vector dimensions, or metrics. If the
+rebuild fails, the transaction rolls back and the previous indexes remain
+usable.
+
+Use `create_indexes` when adding new indexes, and `reindex` when rebuilding the
+existing set.
 
 ### Geo index
 

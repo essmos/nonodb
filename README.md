@@ -218,7 +218,10 @@ single-database directories are migrated to `default/` on startup. See
 - Single-field GeoJSON point indexes with `$near`, `$geoWithin`, and
   `$geoIntersects`; queries use hierarchical grid ranges plus exact residual
   checks.
-- Parallel index backfill for existing collections.
+- Parallel index backfill for existing collections, with bounded chunks so peak
+  memory does not grow with collection size.
+- One-click `reindex` for all index types (API, CLI, GUI, and Python client),
+  rebuilding existing definitions transactionally after an upgrade.
 
 ### Search
 

@@ -878,8 +878,11 @@ restart drops process RSS to a few MB; the OS may keep pages cached.
   use `find_cursor`/`aggregate_cursor` for large result sets.
 - Deep `skip` on a sorted full scan is intentionally single-threaded.
 - Parallel full sorts are used only when `skip + limit <= 50,000`.
-- Parallel index backfill uses up to 16 worker threads; peak memory grows with
-  the number of entries buffered for a chunk.
+- Parallel index backfill uses up to 16 worker threads. Chunks are bounded by
+  both document count and 4 MiB of raw document bytes, the worker queue is
+  bounded, and unique checks read LMDB prefix ranges instead of keeping an
+  in-memory key map. Peak memory is therefore bounded by the queue size, not by
+  the collection size.
 - Aggregation top-K bounds `$sort`+`$limit` memory, and a leading `$group`
   streams input, but group state is held in memory. Lower
   `NONODB_AGGREGATE_MAX_DOCS` or reduce group cardinality for constrained hosts.

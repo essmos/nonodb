@@ -224,7 +224,7 @@ Design: [docs/replication.md](docs/replication.md).
 - [x] Batch index creation (`create_indexes`) in one collection scan
 - [x] Automatic indexes in one batch per collection; isolated index-build transactions
 - [x] Index-backed and parallel order-independent `$group`
-- [ ] Incremental index backfill writes to reduce peak RAM
+- [x] Incremental index backfill writes to reduce peak RAM
 - [ ] Raw JSON passthrough for `find` without projection/sort
 
 ### P0 — security
@@ -350,7 +350,8 @@ Design: [docs/replication.md](docs/replication.md).
 
 - [ ] Sparse/partial indexes
 - [ ] Wildcard indexes
-- [ ] Reindex command for text/fuzzy indexes
+- [x] One-click reindex for secondary, text, fuzzy, and vector indexes
+      (`reindex` op, CLI, GUI, and Python client)
 - [ ] Stop words, stemming, synonyms, and per-index analyzers
 - [ ] Optional Tantivy integration
 - [ ] CBOR/MessagePack storage with migration path

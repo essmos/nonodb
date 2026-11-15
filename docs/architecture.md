@@ -499,10 +499,15 @@ needs the full document.
 Indexes are updated in the same transaction as the document. Creating an index
 on a non-empty collection triggers a synchronous backfill:
 
-- the main thread reads raw key/value chunks through the active write
+- the main thread reads bounded raw key/value chunks through the active write
   transaction;
 - worker threads parse JSON and encode index entries in parallel;
-- the main thread applies entries in that same write transaction;
+- the main thread applies each completed chunk immediately in that same write
+  transaction instead of buffering all entries;
+- chunks are capped by document count and 4 MiB of raw bytes, and the worker
+  queue is bounded, so peak heap does not grow with collection size;
+- unique indexes detect duplicates by reading the LMDB prefix that is already
+  written, avoiding a collection-sized in-memory key map;
 - duplicate-key and parse errors are reported without deadlocking workers.
 
 Because the index build holds a write transaction, it blocks other writers for

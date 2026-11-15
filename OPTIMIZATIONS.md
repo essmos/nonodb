@@ -225,8 +225,9 @@ At 1M documents:
 ## Remaining opportunities
 
 - Raw JSON passthrough for reads without projection/sort.
-- Configurable backfill workers and incremental backfill writes to lower peak
-  memory.
+- Configurable backfill workers are implemented; backfill now streams bounded
+  chunks and applies entries incrementally, so peak memory no longer grows with
+  collection size.
 - Lower-overhead client framing than HTTP/JSON over UDS, if transport becomes
   the bottleneck.
 - CBOR or compression on disk.

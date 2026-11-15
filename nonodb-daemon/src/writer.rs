@@ -1236,6 +1236,17 @@ fn execute(
                 "metric": metric.as_str()
             }))
         }
+        WriteReq::Reindex { coll } => {
+            let c = standard_collection(store, wtxn, coll)?;
+            let report = c.reindex_txn(wtxn)?;
+            Ok(json!({
+                "reindexed": coll,
+                "secondary": report.secondary,
+                "text": report.text,
+                "fuzzy": report.fuzzy,
+                "vector": report.vector,
+            }))
+        }
         WriteReq::DropVectorIndex { coll, field } => {
             let c = standard_collection(store, wtxn, coll)?;
             let existed = c.drop_vector_index_txn(wtxn, field)?;

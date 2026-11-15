@@ -227,6 +227,18 @@ nonodb-cli indexes users
 
 The output includes the index name, fields, uniqueness, and `include` fields.
 
+## reindex
+
+Rebuild all secondary, text, fuzzy, and vector indexes for a collection:
+
+```bash
+nonodb-cli reindex users
+```
+
+This is the one-click migration/repair path after an index-format upgrade. It
+scans every document and blocks writes while the rebuild transaction runs. The
+command prints the rebuilt index names for each index type.
+
 ## map
 
 Show the LMDB address-space limit, high-water mark, and page size:
