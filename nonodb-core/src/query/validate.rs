@@ -29,6 +29,8 @@ fn validate_array_filter(filter: &Value) -> Result<()> {
                 }
             }
             "$not" => validate_array_filter(cond)?,
+            "$expr" => {}
+            "$jsonSchema" => crate::query::schema::validate(cond)?,
             _ => validate_condition(cond)?,
         }
     }
@@ -57,6 +59,20 @@ fn validate_condition(cond: &Value) -> Result<()> {
                     return Err(Error::Query("$all requires an array".into()));
                 }
             }
+            "$mod" => {
+                let Some(values) = arg.as_array() else {
+                    return Err(Error::Query("$mod requires [divisor, remainder]".into()));
+                };
+                if values.len() != 2 || values.iter().any(|v| numeric::parse_value(v).is_none()) {
+                    return Err(Error::Query("$mod requires two numeric arguments".into()));
+                }
+                if numeric::as_bigdecimal(&values[0]) == Some(0.into()) {
+                    return Err(Error::Query("$mod divisor cannot be zero".into()));
+                }
+            }
+            "$bitsAllClear" | "$bitsAllSet" | "$bitsAnyClear" | "$bitsAnySet" => {
+                validate_bit_mask(arg)?;
+            }
             "$elemMatch" => {
                 let Some(query) = arg.as_object() else {
                     return Err(Error::Query("$elemMatch requires an object".into()));
@@ -81,6 +97,33 @@ fn validate_condition(cond: &Value) -> Result<()> {
     Ok(())
 }
 
+fn validate_bit_mask(arg: &Value) -> Result<()> {
+    if let Some(positions) = arg.as_array() {
+        if positions.iter().any(|p| !is_bit_position(p)) {
+            return Err(Error::Query(
+                "bit positions must be integers between 0 and 63".into(),
+            ));
+        }
+        return Ok(());
+    }
+    if numeric::as_bigdecimal(arg).is_some() {
+        return Ok(());
+    }
+    Err(Error::Query(
+        "bit mask must be an integer or an array of bit positions".into(),
+    ))
+}
+
+fn is_bit_position(value: &Value) -> bool {
+    let Some(number) = numeric::as_bigdecimal(value) else {
+        return false;
+    };
+    if number != number.with_scale(0) {
+        return false;
+    }
+    bigdecimal::num_traits::ToPrimitive::to_u64(&number).is_some_and(|position| position < 64)
+}
+
 fn elem_match_uses_filter(query: &serde_json::Map<String, Value>) -> bool {
     if query.is_empty() {
         return false;
@@ -88,10 +131,12 @@ fn elem_match_uses_filter(query: &serde_json::Map<String, Value>) -> bool {
     if query.keys().any(|key| !key.starts_with('$')) {
         return true;
     }
-    if query
-        .keys()
-        .any(|key| matches!(key.as_str(), "$and" | "$or" | "$nor"))
-    {
+    if query.keys().any(|key| {
+        matches!(
+            key.as_str(),
+            "$and" | "$or" | "$nor" | "$expr" | "$jsonSchema"
+        )
+    }) {
         return true;
     }
     if let Some(Value::Object(not)) = query.get("$not") {

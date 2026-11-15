@@ -1,5 +1,6 @@
 pub mod matcher;
 pub mod path;
+mod schema;
 pub mod updater;
 pub(crate) mod validate;
 

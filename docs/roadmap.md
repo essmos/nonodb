@@ -20,7 +20,8 @@ Implemented:
   queries use the normal indexed `find` path, while writes use the single writer
   and are atomic per statement, including `UPDATE SET` expressions;
 - CRUD, multi-update, replacement updates, upserts;
-- `$set`, `$unset`, `$inc`, `$push`, `$pull`, `$pullAll`, `$addToSet`,
+- `$set`, `$unset`, `$inc`, `$mul`, `$min`, `$max`, `$rename`,
+  `$currentDate`, `$bit`, `$pop`, `$push`, `$pull`, `$pullAll`, `$addToSet`,
   `$setOnInsert`, `$each`, `$position`, `$slice`, `$sort`;
 - array updates with positional `$`, `$[]`, `$[identifier]`, and
   `arrayFilters`;
@@ -101,11 +102,18 @@ Implemented:
   `$graphLookup`), `$facet`, or write stages (`$merge`, `$out`). Group state is
   held in memory; there is no disk spill.
 - No `$where` or `$text` query operator.
+- `$jsonSchema` supports the common validation keywords but not every JSON
+  Schema draft feature.
+- `$expr` uses the aggregation expression evaluator, including variables and
+  common comparison, array, string, and conditional operators. Expression
+  errors do not match the document instead of aborting the query.
+- Projection supports top-level fields, `$slice`, and `$elemMatch`; nested
+  projections, positional `$`, and `$meta` are not implemented.
 - `$regex` supports `i`, `m`, `s`, `x`, and `u` options, but not MongoDB's
   PCRE-only constructs; patterns use Rust's non-backtracking regex engine.
-- `$all`/`$elemMatch` do not accept regex literals because regex values are not
-  implemented. Multikey indexes serve array equality, `$all`, ranges, and simple
-  `$elemMatch`; `$size` is not index-backed.
+- `$in`, `$nin`, `$all`, and `$elemMatch` accept `{"$regex": ...}` operands, but
+  stored BSON regex values are not implemented. Multikey indexes serve array
+  equality, `$all`, ranges, and simple `$elemMatch`; `$size` is not index-backed.
 - No joins. `lookup` is a point/batch lookup, not a general join, and requires a
   matching unique index for non-`_id` keys. Non-unique lookups are not supported.
 - SQL covers one collection. Joins, subqueries, scalar expressions in grouped
@@ -231,7 +239,7 @@ Implemented:
 | Simple optimizer | Predictable; misses some multi-index opportunities |
 | Global token auth | Simple; insufficient for multi-tenant roles |
 | Snapshot-based backup | Simple; not PITR |
-| Top-level projection | Simple; less expressive than MongoDB |
+| Flat projection model | `$slice`/`$elemMatch` work, but nested and positional projections do not |
 
 ## Candidate future work
 
@@ -258,12 +266,10 @@ project's target workload.
 2. **Incremental index backfill writes (implemented).** Backfill streams chunks
    capped by document count and raw bytes, applies entries as each chunk
    completes, and avoids collection-sized unique-key maps.
-3. **More update operators.** `$rename`, `$min`, `$max`,
-   `$mul`, `$currentDate`.
-4. **Reindex tooling (implemented).** The `reindex` operation and CLI/GUI/Python
+3. **Reindex tooling (implemented).** The `reindex` operation and CLI/GUI/Python
    entry points rebuild secondary, text, fuzzy, and vector indexes in one write
    transaction.
-5. **Operational hardening.** More metrics such as latency histograms and
+4. **Operational hardening.** More metrics such as latency histograms and
    per-stage query timings. Health/readiness, index-build status, structured logs,
    and graceful drain are implemented.
 
@@ -283,8 +289,9 @@ project's target workload.
     global sentinel range behavior.
 12. **Compression and/or CBOR storage** for smaller files and faster parsing,
    with a migration path.
-13. **Expanded aggregation** beyond the current `$match`/`$group`/`$project`/
-    `$sort`/`$limit` subset, including streaming execution and more stages.
+13. **Expanded aggregation** beyond the current `$match`/`$group`/`$bucket`/
+    `$bucketAuto`/`$project`/`$sort`/`$limit`/`$facet`/`$sample` subset,
+    including streaming execution, joins, and window stages.
 
 ### Lower priority
 

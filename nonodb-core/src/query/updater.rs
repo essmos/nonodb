@@ -1,8 +1,11 @@
 //! MongoDB-style document updater (subset).
 //!
-//! Supported operators: `$set`, `$unset`, `$inc`, `$push`, `$pull`,
+//! Supported operators: `$set`, `$unset`, `$inc`, `$mul`, `$min`, `$max`,
+//! `$rename`, `$currentDate`, `$bit`, `$pop`, `$push`, `$pull`, `$pullAll`,
 //! `$addToSet` and `$setOnInsert` (only on upsert).
 //! An update without operators (a plain object) replaces the document while keeping `_id`.
+
+use std::cmp::Ordering;
 
 use bigdecimal::BigDecimal;
 use serde_json::{Map, Value};
@@ -203,6 +206,113 @@ fn apply_with(
                     }
                 }
             }
+            "$mul" => {
+                for (p, v) in args {
+                    for target in resolve_paths(doc, p, &ctx)? {
+                        mul_path(doc, &target, v)?;
+                    }
+                }
+            }
+            "$min" | "$max" => {
+                for (p, v) in args {
+                    for target in resolve_paths(doc, p, &ctx)? {
+                        let replace = match path::get(doc, &target) {
+                            None => true,
+                            Some(current) => {
+                                let ord = crate::aggregate::compare_value(v, current);
+                                if op == "$min" {
+                                    ord == Ordering::Less
+                                } else {
+                                    ord == Ordering::Greater
+                                }
+                            }
+                        };
+                        if replace {
+                            path::set(doc, &target, v.clone())?;
+                        }
+                    }
+                }
+            }
+            "$rename" => {
+                for (p, v) in args {
+                    let Some(new_path) = v.as_str() else {
+                        return Err(Error::Query("$rename target must be a string".into()));
+                    };
+                    if p == "_id" || new_path == "_id" || p == new_path {
+                        return Err(Error::Query(
+                            "$rename cannot target _id or the same path".into(),
+                        ));
+                    }
+                    for target in resolve_paths(doc, p, &ctx)? {
+                        let Some(value) = path::get(doc, &target).cloned() else {
+                            continue;
+                        };
+                        path::unset(doc, &target);
+                        path::set(doc, new_path, value)?;
+                    }
+                }
+            }
+            "$currentDate" => {
+                let now = date::canonical(now_millis());
+                for (p, v) in args {
+                    let valid = match v {
+                        Value::Bool(true) => true,
+                        Value::Bool(false) => false,
+                        Value::Object(spec) if spec.len() == 1 => match spec.get("$type") {
+                            Some(Value::String(kind)) if kind == "date" => true,
+                            Some(Value::String(kind)) if kind == "timestamp" => {
+                                return Err(Error::Query(
+                                    "$currentDate timestamp values are not supported".into(),
+                                ))
+                            }
+                            _ => false,
+                        },
+                        _ => false,
+                    };
+                    if !valid {
+                        return Err(Error::Query(
+                            "$currentDate expects true or {$type: \"date\"}".into(),
+                        ));
+                    }
+                    for target in resolve_paths(doc, p, &ctx)? {
+                        path::set(doc, &target, now.clone())?;
+                    }
+                }
+            }
+            "$bit" => {
+                for (p, v) in args {
+                    for target in resolve_paths(doc, p, &ctx)? {
+                        bit_path(doc, &target, v)?;
+                    }
+                }
+            }
+            "$pop" => {
+                for (p, v) in args {
+                    let direction = v
+                        .as_i64()
+                        .ok_or_else(|| Error::Query("$pop expects 1 or -1".into()))?;
+                    if direction != 1 && direction != -1 {
+                        return Err(Error::Query("$pop expects 1 or -1".into()));
+                    }
+                    for target in resolve_paths(doc, p, &ctx)? {
+                        match path::get_mut(doc, &target) {
+                            Some(Value::Array(items)) => {
+                                if !items.is_empty() {
+                                    if direction == 1 {
+                                        items.pop();
+                                    } else {
+                                        items.remove(0);
+                                    }
+                                }
+                            }
+                            Some(_) => {
+                                return Err(Error::Query("$pop target must be an array".into()))
+                            }
+                            None => {}
+                        }
+                    }
+                }
+            }
             "$push" => {
                 for (p, v) in args {
                     let spec = parse_push(v)?;
@@ -325,6 +435,115 @@ fn inc_path(doc: &mut Value, target: &str, v: &Value) -> Result<()> {
         Value::from(next)
     };
     path::set(doc, target, out)
+}
+
+fn mul_path(doc: &mut Value, target: &str, v: &Value) -> Result<()> {
+    let current_value = path::get(doc, target).cloned();
+    if numeric::is_decimal(v) || current_value.as_ref().is_some_and(numeric::is_decimal) {
+        let mut current = match current_value.as_ref() {
+            Some(value) => numeric::as_bigdecimal(value)
+                .ok_or_else(|| Error::Query("$mul current value is not a finite number".into()))?,
+            None => BigDecimal::from(0),
+        };
+        let factor = numeric::as_bigdecimal(v)
+            .ok_or_else(|| Error::Query("$mul expects finite numbers".into()))?;
+        current *= factor;
+        path::set(doc, target, numeric::decimal_value(&current)?)?;
+        return Ok(());
+    }
+    if let Some(factor) = numeric::integer_value(v) {
+        let current = current_value.as_ref().and_then(numeric::integer_value);
+        if current_value
+            .as_ref()
+            .is_none_or(|value| numeric::integer_value(value).is_some())
+        {
+            let current = current.unwrap_or(0);
+            let next = current
+                .checked_mul(factor)
+                .ok_or_else(|| Error::InvalidNumeric("$mul integer overflow".into()))?;
+            let kind = match (
+                current_value
+                    .as_ref()
+                    .and_then(numeric::extended_integer_kind),
+                numeric::extended_integer_kind(v),
+            ) {
+                (Some(numeric::NumericKind::Long), _) | (_, Some(numeric::NumericKind::Long)) => {
+                    Some(numeric::NumericKind::Long)
+                }
+                (Some(numeric::NumericKind::Int), _) | (_, Some(numeric::NumericKind::Int)) => {
+                    Some(numeric::NumericKind::Int)
+                }
+                _ => None,
+            };
+            let result = match kind {
+                Some(kind) => numeric::integer_result(next, kind)?,
+                None => numeric::integer_json(next)?,
+            };
+            path::set(doc, target, result)?;
+            return Ok(());
+        }
+    }
+    let factor = numeric::as_f64(v).ok_or_else(|| Error::Query("$mul expects numbers".into()))?;
+    let current = match current_value.as_ref() {
+        Some(value) => numeric::as_f64(value)
+            .ok_or_else(|| Error::Query("$mul current value is not a number".into()))?,
+        None => 0.0,
+    };
+    path::set(doc, target, Value::from(current * factor))
+}
+
+fn bit_path(doc: &mut Value, target: &str, v: &Value) -> Result<()> {
+    let Some(spec) = v.as_object() else {
+        return Err(Error::Query("$bit expects {and|or|xor: integer}".into()));
+    };
+    if spec.len() != 1 {
+        return Err(Error::Query(
+            "$bit expects exactly one of and, or, xor".into(),
+        ));
+    }
+    let (op, operand) = spec.iter().next().expect("one entry");
+    if !matches!(op.as_str(), "and" | "or" | "xor") {
+        return Err(Error::Query(format!("unsupported $bit operation {op}")));
+    }
+    let operand = numeric::integer_value(operand)
+        .ok_or_else(|| Error::Query("$bit operand must be an integer".into()))?;
+    let current_value = path::get(doc, target).cloned();
+    let current = match current_value.as_ref() {
+        Some(value) => numeric::integer_value(value)
+            .ok_or_else(|| Error::Query("$bit current value must be an integer".into()))?,
+        None => 0,
+    };
+    let next = match op.as_str() {
+        "and" => current & operand,
+        "or" => current | operand,
+        "xor" => current ^ operand,
+        _ => unreachable!(),
+    };
+    let kind = match (
+        current_value
+            .as_ref()
+            .and_then(numeric::extended_integer_kind),
+        spec.values()
+            .next()
+            .and_then(numeric::extended_integer_kind),
+    ) {
+        (Some(numeric::NumericKind::Long), _) | (_, Some(numeric::NumericKind::Long)) => {
+            Some(numeric::NumericKind::Long)
+        }
+        (Some(numeric::NumericKind::Int), _) | (_, Some(numeric::NumericKind::Int)) => {
+            Some(numeric::NumericKind::Int)
+        }
+        _ => None,
+    };
+    let result = match kind {
+        Some(kind) => numeric::integer_result(next, kind)?,
+        None => numeric::integer_json(next)?,
+    };
+    path::set(doc, target, result)
+}
+
+fn now_millis() -> i64 {
+    (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64
 }
 
 struct PushSpec {
@@ -769,6 +988,54 @@ mod tests {
         let mut doc = json!({"a": {"b": 1, "c": 2}});
         apply(&mut doc, &json!({"$unset": {"a.b": ""}})).unwrap();
         assert_eq!(doc, json!({"a": {"c": 2}}));
+    }
+
+    #[test]
+    fn mul_min_max_rename_date_bit_and_pop() {
+        let mut doc = json!({
+            "n": 4,
+            "low": 10,
+            "high": 1,
+            "old": "v",
+            "bits": 0b1010,
+            "arr": [1, 2, 3]
+        });
+        apply(
+            &mut doc,
+            &json!({
+                "$mul": {"n": 3, "missing": 5},
+                "$min": {"low": 5, "newlow": 7},
+                "$max": {"high": 8, "newhigh": 9},
+                "$rename": {"old": "new"},
+                "$bit": {"bits": {"xor": 0b0101}},
+                "$pop": {"arr": -1}
+            }),
+        )
+        .unwrap();
+        assert_eq!(doc["n"], 12);
+        assert_eq!(doc["missing"], 0);
+        assert_eq!(doc["low"], 5);
+        assert_eq!(doc["newlow"], 7);
+        assert_eq!(doc["high"], 8);
+        assert_eq!(doc["newhigh"], 9);
+        assert!(doc.get("old").is_none());
+        assert_eq!(doc["new"], "v");
+        assert_eq!(doc["bits"], 15);
+        assert_eq!(doc["arr"], json!([2, 3]));
+
+        apply(&mut doc, &json!({"$pop": {"arr": 1}})).unwrap();
+        assert_eq!(doc["arr"], json!([2]));
+        apply(&mut doc, &json!({"$currentDate": {"at": true}})).unwrap();
+        assert!(date::is_date(&doc["at"]));
+
+        assert!(apply(&mut doc, &json!({"$rename": {"old": "_id"}})).is_err());
+        assert!(apply(
+            &mut doc,
+            &json!({"$currentDate": {"at": {"$type": "timestamp"}}})
+        )
+        .is_err());
+        assert!(apply(&mut doc, &json!({"$pop": {"n": 1}})).is_err());
+        assert!(apply(&mut doc, &json!({"$bit": {"n": {"and": "x"}}})).is_err());
     }
 
     #[test]

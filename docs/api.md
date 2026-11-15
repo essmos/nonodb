@@ -593,6 +593,13 @@ stored key.
 | `$set` | Set one or more paths; creates intermediate objects |
 | `$unset` | Remove one or more paths; no error if absent |
 | `$inc` | Add a number; missing field is treated as 0 |
+| `$mul` | Multiply a number; missing field becomes 0 |
+| `$min` | Set the field only if the new value is lower, or the field is missing |
+| `$max` | Set the field only if the new value is higher, or the field is missing |
+| `$rename` | Move a field to a new name |
+| `$currentDate` | Set the current UTC date; `true` or `{"$type": "date"}` |
+| `$bit` | Bitwise `and`, `or`, or `xor` on an integer field |
+| `$pop` | Remove the first (`-1`) or last (`1`) array element |
 | `$push` | Append one value or `{"$each": [...]}`; supports `$position`, `$slice`, `$sort` |
 | `$pull` | Remove array elements matching a value or query predicate |
 | `$pullAll` | Remove all occurrences of the listed values |
@@ -604,6 +611,13 @@ Examples:
 ```json
 {"$set": {"profile.theme": "dark"}}
 {"$inc": {"counters.requests": 1}}
+{"$mul": {"prices.total": 1.2}}
+{"$min": {"lowest": 12}}
+{"$max": {"highest": 99}}
+{"$rename": {"old_name": "new_name"}}
+{"$currentDate": {"updated_at": true}}
+{"$bit": {"flags": {"or": 4}}}
+{"$pop": {"queue": -1}}
 {"$push": {"tags": "rust"}}
 {"$push": {"ports": {"$each": [25, 587]}}}
 {"$push": {"top": {"$each": [9, 3, 7], "$sort": 1, "$slice": 2}}}
@@ -664,8 +678,8 @@ Notes:
   beyond the end of an array pads it with `null`; `$unset` on an array index
   sets that element to `null`.
 - `_id` is immutable. Do not use `$set`/`$unset`/array operators on `_id`.
-- Unsupported operators such as `$rename`, `$min`, `$max`, `$mul`,
-  `$currentDate`, and pipeline updates return `invalid_query`.
+- `$currentDate` supports dates but not BSON Timestamp (`{"$type": "timestamp"}`).
+- Pipeline updates are not supported and return `invalid_query`.
 
 ### Upsert
 
@@ -842,6 +856,12 @@ in the read-only `batch` operation. A missing collection produces an empty
 | `$unset` | Remove one field or an array of fields |
 | `$unwind` | Expand an array into one document per element |
 | `$group` | Group by an expression and compute accumulators |
+| `$bucket` | Group values into explicit boundary buckets |
+| `$bucketAuto` | Group values into a requested number of buckets |
+| `$sortByCount` | Group by an expression and sort by descending count |
+| `$replaceRoot` / `$replaceWith` | Replace each document with an evaluated object |
+| `$sample` | Return a random sample of the requested size |
+| `$facet` | Run multiple sub-pipelines over the same input documents |
 | `$sort` | Sort by one or more fields |
 | `$skip` | Skip documents |
 | `$limit` | Limit documents |
@@ -1045,6 +1065,14 @@ document-local stages that preserve one output per input: `$project`,
 `$addFields`/`$set`, and `$unset`. Blocking stages (`$group`, `$unwind`,
 `$sort`, `$count`, `$skip`, `$limit`) require a regular `aggregate`.
 
+`$facet` accepts an object whose values are sub-pipelines and returns one
+document containing an array of results for each name. `$sample` is random and
+does not have a deterministic order. `$replaceRoot`/`$replaceWith` fail if the
+expression does not evaluate to an object. `$bucket` requires strictly ascending
+boundaries and an optional `default` for values outside them. `$bucketAuto`
+supports `groupBy`, `buckets`, and `output`; the `granularity` option is not
+implemented.
+
 Both cursor operations return the first page:
 
 ```json
@@ -1100,6 +1128,11 @@ object, `null`, or an omitted filter matches every document.
 | `{"a": {"$regex": "^foo", "$options": "i"}}` | String matches a regular expression |
 | `{"a": {"$type": "string"}}` | Value has a BSON type |
 | `{"a": {"$not": {...}}}` | Negate a field condition |
+| `{"a": {"$mod": [4, 1]}}` | Numeric remainder |
+| `{"a": {"$bitsAllSet": [1, 3]}}` | All listed bits are set |
+| `{"a": {"$bitsAnySet": 1}}` | At least one mask bit is set |
+| `{"$expr": {"$gt": ["$a", "$b"]}}` | Evaluate an aggregation expression |
+| `{"$jsonSchema": {...}}` | Validate the document against a JSON Schema subset |
 
 ### Missing fields and negation
 
@@ -1130,6 +1163,63 @@ This matches only documents where `a` is present and non-null. Use
 | `{"$or": [f1, f2]}` | At least one filter matches |
 | `{"$nor": [f1, f2]}` | None of the filters match |
 | `{"$not": f}` | Negate a filter (top level) |
+
+### Expressions with `$expr`
+
+`$expr` evaluates the aggregation expression language against the current
+document, so filters can compare fields or compute values:
+
+```json
+{"$expr": {"$gt": ["$spent", "$budget"]}}
+{"$expr": {"$eq": [{"$add": ["$subtotal", "$tax"]}, "$total"]}}
+```
+
+Missing fields evaluate to `null`. Invalid expressions and runtime errors (for
+example division by zero) do not match the document. `$expr` conditions are
+always applied by the matcher; indexes may still narrow the candidates using
+ordinary field conditions in the same filter.
+
+The expression evaluator supports comparison and boolean operators, arithmetic
+(`$add`, `$subtract`, `$multiply`, `$divide`, `$mod`, `$pow`, `$abs`, `$ceil`,
+`$floor`, `$round`), `$cond`, `$switch`, `$ifNull`, `$let`, `$map`, `$filter`,
+`$reduce`, `$in`, `$isArray`, `$arrayElemAt`, `$slice`, `$concatArrays`,
+`$objectToArray`, `$arrayToObject`, `$mergeObjects`, string operators
+(`$concat`, `$toLower`, `$toUpper`, `$substr`, `$substrCP`, `$strLenCP`,
+`$split`, `$indexOfCP`, `$trim`/`$ltrim`/`$rtrim`), `$regexMatch`, `$min`,
+`$max`, `$type`, and `$literal`. Variables use `$$name` or `$$name.path`
+syntax inside `$let`, `$map`, `$filter`, and `$reduce`.
+
+Regex operands are accepted inside `$in`, `$nin`, and `$all`:
+
+```json
+{"name": {"$in": [{"$regex": "^Al"}]}}
+{"tags": {"$all": [{"$regex": "^prod-"}]}}
+```
+
+### `$jsonSchema`
+
+`$jsonSchema` filters documents using a JSON Schema subset. Missing fields only
+fail when listed in `required`; property schemas apply when the field exists.
+
+```json
+{"$jsonSchema": {
+  "bsonType": "object",
+  "required": ["name", "age"],
+  "properties": {
+    "name": {"bsonType": "string", "minLength": 2, "pattern": "^A"},
+    "age": {"bsonType": "number", "minimum": 18},
+    "tags": {"bsonType": "array", "items": {"bsonType": "string"}}
+  }
+}}
+```
+
+Supported keywords: `bsonType`, `required`, `properties`, `patternProperties`,
+`additionalProperties`, `items`, `enum`, `const`, `minLength`, `maxLength`,
+`pattern`, `minimum`, `maximum`, `exclusiveMinimum`, `exclusiveMaximum`,
+`multipleOf`, `minItems`, `maxItems`, `uniqueItems`, `minProperties`,
+`maxProperties`, `allOf`, `anyOf`, `oneOf`, and `not`. Invalid schema shapes,
+type names, and regexes are rejected before the query runs. Unknown JSON Schema
+keywords are ignored.
 
 ### Dates
 
@@ -1288,7 +1378,13 @@ Projection is a top-level include/exclude map:
 - If any non-`_id` field has a truthy value, the projection is inclusive.
 - Otherwise it is exclusive; listed fields are removed.
 - `_id` is included by default. `"_id": 0` excludes it.
+- `$slice` returns a prefix/suffix of an array or a window:
+  `{"tags": {"$slice": 3}}`, `{"tags": {"$slice": -2}}`, and
+  `{"tags": {"$slice": [2, 3]}}`.
+- `$elemMatch` projection returns the first array element matching the
+  condition: `{"items": {"$elemMatch": {"qty": {"$gt": 5}}}}`.
 - Nested projections are not supported.
+- `$meta` projection and positional `$` projection are not supported.
 - Covering indexes can satisfy an inclusive projection using indexed and
   `include`d fields without fetching the document.
 

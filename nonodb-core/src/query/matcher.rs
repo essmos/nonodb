@@ -2,7 +2,8 @@
 //!
 //! Supported operators: `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`,
 //! `$nin`, `$all`, `$size`, `$elemMatch`, `$exists`, `$regex`/`$options`,
-//! `$type`, `$not`, `$and`, `$or`, `$nor`.
+//! `$type`, `$mod`, `$bitsAllClear`/`$bitsAllSet`/`$bitsAnyClear`/
+//! `$bitsAnySet`, `$expr`, `$not`, `$and`, `$or`, `$nor`.
 //!
 //! Numeric comparison is exact (JSON integers are not rounded through `f64`)
 //! and Decimal128 values participate in the same numeric type bracket.
@@ -32,6 +33,11 @@ pub fn matches(doc: &Value, filter: &Value) -> bool {
         "$nor" => cond
             .as_array()
             .is_some_and(|arr| !arr.iter().any(|f| matches(doc, f))),
+        // `$expr` evaluates an aggregation expression against the document.
+        "$expr" => crate::aggregate::eval_expr(doc, cond)
+            .ok()
+            .is_some_and(|value| crate::aggregate::truthy(&value)),
+        "$jsonSchema" => crate::query::schema::matches(doc, cond),
         // `$not` at filter level: negates the whole subfilter.
         "$not" => !matches(doc, cond),
         _ => {
@@ -87,11 +93,16 @@ fn match_simple_op(actual: Option<&Value>, op: &str, arg: &Value) -> bool {
         }),
         "$in" => arg
             .as_array()
-            .is_some_and(|arr| arr.iter().any(|x| eq_opt(actual, x))),
+            .is_some_and(|arr| arr.iter().any(|x| operand_opt(actual, x))),
         "$nin" => arg
             .as_array()
-            .is_some_and(|arr| !arr.iter().any(|x| eq_opt(actual, x))),
+            .is_some_and(|arr| !arr.iter().any(|x| operand_opt(actual, x))),
         "$exists" => actual.is_some() == arg.as_bool().unwrap_or(false),
+        "$mod" => mod_opt(actual, arg),
+        "$bitsAllClear" => bits_opt(actual, arg, BitTest::AllClear),
+        "$bitsAllSet" => bits_opt(actual, arg, BitTest::AllSet),
+        "$bitsAnyClear" => bits_opt(actual, arg, BitTest::AnyClear),
+        "$bitsAnySet" => bits_opt(actual, arg, BitTest::AnySet),
         "$all" => all_opt(actual, arg),
         "$size" => size_opt(actual, arg),
         "$elemMatch" => elem_match_opt(actual, arg),
@@ -109,7 +120,111 @@ fn all_opt(actual: Option<&Value>, arg: &Value) -> bool {
         return false;
     };
     // MongoDB treats `$all: []` as matching nothing.
-    !expected.is_empty() && expected.iter().all(|value| eq_opt(actual, value))
+    !expected.is_empty() && expected.iter().all(|value| operand_opt(actual, value))
+}
+
+/// Matches an `$in`/`$all` operand, including regex-shaped operands.
+fn operand_opt(actual: Option<&Value>, expected: &Value) -> bool {
+    if let Some(ops) = expected.as_object() {
+        if let Some(pattern) = ops.get("$regex") {
+            return regex::is_match(actual, pattern, ops.get("$options"));
+        }
+    }
+    eq_opt(actual, expected)
+}
+
+fn mod_opt(actual: Option<&Value>, arg: &Value) -> bool {
+    let Some(values) = arg.as_array() else {
+        return false;
+    };
+    if values.len() != 2 {
+        return false;
+    }
+    let Some(divisor) = numeric::as_bigdecimal(&values[0]) else {
+        return false;
+    };
+    if divisor == 0 {
+        return false;
+    }
+    let Some(remainder) = numeric::as_bigdecimal(&values[1]) else {
+        return false;
+    };
+    let matches_value = |value: &Value| {
+        numeric::as_bigdecimal(value).is_some_and(|number| number % &divisor == remainder)
+    };
+    match actual {
+        Some(Value::Array(items)) => items.iter().any(matches_value),
+        Some(value) => matches_value(value),
+        None => false,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum BitTest {
+    AllClear,
+    AllSet,
+    AnyClear,
+    AnySet,
+}
+
+fn bits_opt(actual: Option<&Value>, arg: &Value, test: BitTest) -> bool {
+    let Some(mask) = bit_mask(arg) else {
+        return false;
+    };
+    let matches_value = |value: &Value| {
+        let Some(number) = bit_value(value) else {
+            return false;
+        };
+        let set = number & mask;
+        match test {
+            BitTest::AllClear => set == 0,
+            BitTest::AllSet => set == mask,
+            BitTest::AnyClear => set != mask,
+            BitTest::AnySet => set != 0,
+        }
+    };
+    match actual {
+        Some(Value::Array(items)) => items.iter().any(matches_value),
+        Some(value) => matches_value(value),
+        None => false,
+    }
+}
+
+fn bit_mask(arg: &Value) -> Option<u64> {
+    if let Some(positions) = arg.as_array() {
+        let mut mask = 0u64;
+        for position in positions {
+            mask |= 1u64 << bit_position(position)?;
+        }
+        return Some(mask);
+    }
+    bit_value(arg)
+}
+
+fn bit_position(value: &Value) -> Option<u64> {
+    let number = numeric::as_bigdecimal(value)?;
+    if number != number.with_scale(0) {
+        return None;
+    }
+    let position = bigdecimal::num_traits::ToPrimitive::to_u64(&number)?;
+    (position < 64).then_some(position)
+}
+
+fn bit_value(value: &Value) -> Option<u64> {
+    if let Some(number) = value.as_u64() {
+        return Some(number);
+    }
+    if let Some(number) = value.as_i64() {
+        return Some(number as u64);
+    }
+    let number = numeric::as_bigdecimal(value)?;
+    if number != number.with_scale(0) {
+        return None;
+    }
+    if let Some(number) = bigdecimal::num_traits::ToPrimitive::to_i64(&number) {
+        return Some(number as u64);
+    }
+    bigdecimal::num_traits::ToPrimitive::to_u64(&number)
 }
 
 fn size_opt(actual: Option<&Value>, arg: &Value) -> bool {
@@ -150,10 +265,12 @@ fn elem_match_uses_filter(query: &serde_json::Map<String, Value>) -> bool {
     if query.keys().any(|key| !key.starts_with('$')) {
         return true;
     }
-    if query
-        .keys()
-        .any(|key| matches!(key.as_str(), "$and" | "$or" | "$nor"))
-    {
+    if query.keys().any(|key| {
+        matches!(
+            key.as_str(),
+            "$and" | "$or" | "$nor" | "$expr" | "$jsonSchema"
+        )
+    }) {
         return true;
     }
     if let Some(Value::Object(not)) = query.get("$not") {
@@ -314,6 +431,102 @@ mod tests {
         assert!(!matches(&doc, &json!({"tags": "c"})));
         assert!(matches(&doc, &json!({"tags": {"$in": ["c", "b"]}})));
     }
+    #[test]
+    fn expr_mod_bitwise_and_regex_operands() {
+        let doc = json!({
+            "a": 5,
+            "b": 3,
+            "name": "Ala",
+            "tags": ["alpha", "beta"],
+            "bits": 0b1010,
+            "nums": [3, 7, 11]
+        });
+        assert!(matches(&doc, &json!({"$expr": {"$gt": ["$a", "$b"]}})));
+        assert!(matches(
+            &doc,
+            &json!({"$expr": {"$eq": [{"$add": ["$b", 2]}, "$a"]}})
+        ));
+        assert!(!matches(&doc, &json!({"$expr": {"$lt": ["$a", "$b"]}})));
+        assert!(matches(&doc, &json!({"$expr": {"$in": [7, "$nums"]}})));
+        assert!(matches(
+            &doc,
+            &json!({"$expr": {"$gt": [{"$arrayElemAt": ["$nums", -1]}, 9]}})
+        ));
+        assert!(matches(
+            &doc,
+            &json!({"$expr": {"$regexMatch": {"input": "$name", "regex": "^Al"}}})
+        ));
+
+        assert!(matches(&doc, &json!({"a": {"$mod": [2, 1]}})));
+        assert!(!matches(&doc, &json!({"a": {"$mod": [2, 0]}})));
+        assert!(matches(&doc, &json!({"nums": {"$mod": [4, 3]}})));
+
+        assert!(matches(&doc, &json!({"bits": {"$bitsAllSet": [1, 3]}})));
+        assert!(matches(&doc, &json!({"bits": {"$bitsAnySet": [1]}})));
+        assert!(matches(&doc, &json!({"bits": {"$bitsAllClear": [0, 2]}})));
+        assert!(matches(&doc, &json!({"bits": {"$bitsAnyClear": 1}})));
+
+        assert!(matches(
+            &doc,
+            &json!({"name": {"$in": [{"$regex": "^Al"}]}})
+        ));
+        assert!(matches(
+            &doc,
+            &json!({"tags": {"$all": [{"$regex": "^al"}]}})
+        ));
+        assert!(!matches(
+            &doc,
+            &json!({"name": {"$nin": [{"$regex": "^Al"}]}})
+        ));
+    }
+
+    #[test]
+    fn json_schema_keywords_and_combinators() {
+        let doc = json!({
+            "name": "Ala",
+            "age": 30,
+            "tags": ["a", "b"],
+            "meta": {"active": true, "score": 4.5}
+        });
+        let schema = json!({
+            "bsonType": "object",
+            "required": ["name", "age", "tags"],
+            "properties": {
+                "name": {"bsonType": "string", "minLength": 2, "pattern": "^A"},
+                "age": {"bsonType": "number", "minimum": 18, "maximum": 40},
+                "tags": {
+                    "bsonType": "array",
+                    "minItems": 2,
+                    "uniqueItems": true,
+                    "items": {"bsonType": "string"}
+                },
+                "meta": {
+                    "bsonType": "object",
+                    "properties": {
+                        "active": {"bsonType": "bool"},
+                        "score": {"bsonType": "number", "multipleOf": 0.5}
+                    }
+                }
+            },
+            "allOf": [{"required": ["meta"]}],
+            "anyOf": [{"properties": {"age": {"minimum": 21}}}, {"required": ["missing"]}],
+            "not": {"required": ["forbidden"]}
+        });
+        assert!(matches(&doc, &json!({"$jsonSchema": schema})));
+        assert!(!matches(
+            &doc,
+            &json!({"$jsonSchema": {"required": ["forbidden"]}})
+        ));
+        assert!(!matches(
+            &doc,
+            &json!({"$jsonSchema": {"properties": {"age": {"maximum": 20}}}})
+        ));
+        assert!(!matches(
+            &doc,
+            &json!({"$jsonSchema": {"properties": {"tags": {"uniqueItems": true, "items": {"bsonType": "number"}}}}})
+        ));
+    }
+
     #[test]
     fn regex_operator_and_options() {
         let doc = json!({"name": "Ala", "tags": ["kot", "pies"], "n": 42});

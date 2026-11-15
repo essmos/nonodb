@@ -6356,6 +6356,55 @@ pub fn project_document(doc: &Value, projection: Option<&Value>) -> Value {
     }
 }
 
+fn slice_projection(value: &Value, arg: &Value) -> Value {
+    let Some(items) = value.as_array() else {
+        return value.clone();
+    };
+    let len = items.len();
+    let (skip, limit) = if let Some(n) = arg.as_i64() {
+        if n >= 0 {
+            (0usize, usize::try_from(n).unwrap_or(usize::MAX).min(len))
+        } else {
+            let take = usize::try_from(n.unsigned_abs())
+                .unwrap_or(usize::MAX)
+                .min(len);
+            (len - take, take)
+        }
+    } else if let Some(pair) = arg.as_array() {
+        if pair.len() != 2 {
+            return value.clone();
+        }
+        let Some(skip) = pair[0].as_i64() else {
+            return value.clone();
+        };
+        let Some(limit) = pair[1].as_i64() else {
+            return value.clone();
+        };
+        if limit <= 0 {
+            return Value::Array(Vec::new());
+        }
+        let start = if skip >= 0 {
+            usize::try_from(skip).unwrap_or(usize::MAX).min(len)
+        } else {
+            len.saturating_sub(
+                usize::try_from(skip.unsigned_abs())
+                    .unwrap_or(usize::MAX)
+                    .min(len),
+            )
+        };
+        (
+            start,
+            usize::try_from(limit)
+                .unwrap_or(usize::MAX)
+                .min(len.saturating_sub(start)),
+        )
+    } else {
+        return value.clone();
+    };
+    let end = skip.saturating_add(limit).min(len);
+    Value::Array(items[skip..end].to_vec())
+}
+
 fn project(doc: &Value, projection: &Value) -> Value {
     let Some(p) = projection.as_object() else {
         return doc.clone();
@@ -6379,7 +6428,21 @@ fn project(doc: &Value, projection: &Value) -> Value {
             if k == "_id" || !truthy(v) {
                 continue;
             }
-            if let Some(val) = doc.get(k) {
+            let Some(val) = doc.get(k) else {
+                continue;
+            };
+            if let Some(slice) = v.as_object().and_then(|o| o.get("$slice")) {
+                out.insert(k.clone(), slice_projection(val, slice));
+            } else if let Some(elem) = v.as_object().and_then(|o| o.get("$elemMatch")) {
+                if let Value::Array(items) = val {
+                    if let Some(found) = items
+                        .iter()
+                        .find(|item| crate::query::matcher::elem_item_matches(item, elem))
+                    {
+                        out.insert(k.clone(), Value::Array(vec![found.clone()]));
+                    }
+                }
+            } else {
                 out.insert(k.clone(), val.clone());
             }
         }
@@ -6587,6 +6650,79 @@ mod tests {
         let d = c.delete(&json!({"age": {"$lt": 18}}), true).unwrap();
         assert_eq!(d, 1);
         assert_eq!(c.count(&json!({})).unwrap(), 1);
+    }
+
+    #[test]
+    fn expr_mod_and_bitwise_filters_run_through_find() {
+        let (_dir, store) = store();
+        let c = store.collection("exprs").unwrap();
+        c.insert_one(json!({"_id": "a", "spent": 12, "budget": 10, "flags": 0b1010}))
+            .unwrap();
+        c.insert_one(json!({"_id": "b", "spent": 7, "budget": 10, "flags": 0b0101}))
+            .unwrap();
+
+        let over = c
+            .find(&FindQuery {
+                filter: json!({"$expr": {"$gt": ["$spent", "$budget"]}}),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(over.len(), 1);
+        assert_eq!(over[0]["_id"], "a");
+        assert_eq!(c.count(&json!({"spent": {"$mod": [5, 2]}})).unwrap(), 2);
+        assert_eq!(
+            c.count(&json!({"flags": {"$bitsAllSet": [1, 3]}})).unwrap(),
+            1
+        );
+        assert!(c
+            .find(&FindQuery {
+                filter: json!({"spent": {"$mod": [0, 0]}}),
+                ..Default::default()
+            })
+            .is_err());
+        assert!(c
+            .find(&FindQuery {
+                filter: json!({"flags": {"$bitsAllSet": [64]}}),
+                ..Default::default()
+            })
+            .is_err());
+    }
+
+    #[test]
+    fn json_schema_filter_and_validation() {
+        let (_dir, store) = store();
+        let c = store.collection("schemas").unwrap();
+        c.insert_one(json!({"_id": "a", "name": "Ala", "age": 30}))
+            .unwrap();
+        c.insert_one(json!({"_id": "b", "name": "Bob"})).unwrap();
+
+        let found = c
+            .find(&FindQuery {
+                filter: json!({"$jsonSchema": {
+                    "required": ["age"],
+                    "properties": {
+                        "name": {"bsonType": "string", "minLength": 2},
+                        "age": {"bsonType": "number", "minimum": 18}
+                    }
+                }}),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0]["_id"], "a");
+
+        assert!(c
+            .find(&FindQuery {
+                filter: json!({"$jsonSchema": {"required": "age"}}),
+                ..Default::default()
+            })
+            .is_err());
+        assert!(c
+            .find(&FindQuery {
+                filter: json!({"$jsonSchema": {"bsonType": "not-a-type"}}),
+                ..Default::default()
+            })
+            .is_err());
     }
 
     #[test]
@@ -6823,6 +6959,46 @@ mod tests {
         };
         let got = c.find(&q).unwrap();
         assert_eq!(got, vec![json!({"i": 3}), json!({"i": 2})]);
+    }
+
+    #[test]
+    fn projection_slice_and_elem_match() {
+        let (_dir, store) = store();
+        let c = store.collection("projected").unwrap();
+        c.insert_one(json!({
+            "_id": "a",
+            "tags": ["a", "b", "c", "d"],
+            "items": [{"sku": "x", "qty": 1}, {"sku": "y", "qty": 5}]
+        }))
+        .unwrap();
+
+        let first = c
+            .find(&FindQuery {
+                filter: json!({}),
+                projection: Some(json!({
+                    "tags": {"$slice": 2},
+                    "items": {"$elemMatch": {"qty": {"$gt": 3}}},
+                    "_id": 0
+                })),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            first,
+            vec![json!({
+                "tags": ["a", "b"],
+                "items": [{"sku": "y", "qty": 5}]
+            })]
+        );
+
+        let last = c
+            .find(&FindQuery {
+                filter: json!({}),
+                projection: Some(json!({"tags": {"$slice": [-2, 1]}, "_id": 0})),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(last, vec![json!({"tags": ["c"]})]);
     }
 
     #[test]

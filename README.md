@@ -159,11 +159,13 @@ single-database directories are migrated to `default/` on startup. See
 - Automatic `_id` generation with UUID v4; custom string `_id` is supported.
 - MongoDB-style filters: equality, `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`,
   `$in`, `$nin`, `$all`, `$size`, `$elemMatch`, `$exists`, `$regex`/`$options`,
-  `$type`, `$not`, `$and`, `$or`, `$nor`.
+  `$type`, `$mod`, `$bitsAllClear`/`$bitsAllSet`/`$bitsAnyClear`/`$bitsAnySet`,
+  `$expr`, `$jsonSchema`, `$not`, `$and`, `$or`, `$nor`.
 - Nested paths (`{"user.address.city": "..."}`), array membership, and
   consistent, exact numeric comparison (`30 == 30.0`; large integers stay
   distinct).
-- Projection, multi-field sort, `skip`, and `limit`.
+- Projection including `$slice` and `$elemMatch`, multi-field sort, `skip`, and
+  `limit`.
 - Fast `find_one`/`find` paths that stop after enough matches, a raw JSON
   prefilter for simple string/boolean equalities, and `count({})`
   in O(1).
@@ -181,8 +183,9 @@ single-database directories are migrated to `default/` on startup. See
 ### Writes and updates
 
 - `insert`, `insert_many`, `update`, `delete`, with optional `multi`.
-- Update operators: `$set`, `$unset`, `$inc`, `$push`, `$pull`, `$addToSet`,
-  `$setOnInsert`.
+- Update operators: `$set`, `$unset`, `$inc`, `$mul`, `$min`, `$max`,
+  `$rename`, `$currentDate`, `$bit`, `$pop`, `$push`, `$pull`, `$pullAll`,
+  `$addToSet`, `$setOnInsert`.
 - `$each` for `$push` and `$addToSet`.
 - Upsert with filter equality seeding, replacement upserts, and
   `$setOnInsert`.
@@ -239,7 +242,8 @@ single-database directories are migrated to `default/` on startup. See
 
 - Read-only `aggregate` endpoint for reporting, grouping, and summaries.
 - Stages: `$match`, `$project`, `$addFields`/`$set`, `$unset`, `$unwind`,
-  `$group`, `$sort`, `$skip`, `$limit`, and `$count`.
+  `$group`, `$bucket`, `$bucketAuto`, `$sortByCount`, `$replaceRoot`/
+  `$replaceWith`, `$sample`, `$facet`, `$sort`, `$skip`, `$limit`, and `$count`.
 - Accumulators: `$sum`, `$avg`, `$min`, `$max`, `$first`, `$last`, `$push`,
   `$addToSet`, and `$count`.
 - Consecutive leading `$match` stages are fused, and a terminal `$count` skips

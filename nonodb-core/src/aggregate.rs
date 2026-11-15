@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use bigdecimal::num_traits::Zero;
 use bigdecimal::{BigDecimal, FromPrimitive};
+use rand::seq::SliceRandom;
 use serde_json::{Map, Value};
 
 use crate::bson_types;
@@ -380,6 +381,85 @@ pub fn run(mut docs: Vec<Value>, pipeline: &[Value], max_docs: usize) -> Result<
                     docs.truncate(n);
                     i += 1;
                 }
+                "$replaceRoot" => {
+                    let expression = arg
+                        .as_object()
+                        .and_then(|obj| obj.get("newRoot"))
+                        .ok_or_else(|| Error::Query("$replaceRoot requires `newRoot`".into()))?;
+                    docs = docs
+                        .into_iter()
+                        .map(|doc| match eval_expr(&doc, expression)? {
+                            value @ Value::Object(_) => Ok(value),
+                            _ => Err(Error::Query(
+                                "$replaceRoot expression must evaluate to an object".into(),
+                            )),
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    i += 1;
+                }
+                "$replaceWith" => {
+                    docs = docs
+                        .into_iter()
+                        .map(|doc| match eval_expr(&doc, arg)? {
+                            value @ Value::Object(_) => Ok(value),
+                            _ => Err(Error::Query(
+                                "$replaceWith expression must evaluate to an object".into(),
+                            )),
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    i += 1;
+                }
+                "$sample" => {
+                    let size = arg
+                        .as_object()
+                        .and_then(|obj| obj.get("size"))
+                        .ok_or_else(|| Error::Query("$sample requires `size`".into()))
+                        .and_then(|size| as_usize(size, "$sample"))?;
+                    docs.shuffle(&mut rand::thread_rng());
+                    docs.truncate(size);
+                    i += 1;
+                }
+                "$sortByCount" => {
+                    let group_arg = Value::Object(Map::from_iter([
+                        ("_id".to_string(), arg.clone()),
+                        (
+                            "count".to_string(),
+                            Value::Object(Map::from_iter([("$sum".to_string(), Value::from(1))])),
+                        ),
+                    ]));
+                    docs = group(docs, &group_arg)?;
+                    let sort = parse_sort(&Value::Object(Map::from_iter([
+                        ("count".to_string(), Value::from(-1)),
+                        ("_id".to_string(), Value::from(1)),
+                    ])))?;
+                    docs.sort_by(|a, b| compare_docs(a, b, &sort));
+                    i += 1;
+                }
+                "$facet" => {
+                    let Some(facets) = arg.as_object() else {
+                        return Err(Error::Query("$facet requires an object".into()));
+                    };
+                    let mut out = Map::new();
+                    for (name, pipeline) in facets {
+                        let Some(pipeline) = pipeline.as_array() else {
+                            return Err(Error::Query("$facet pipelines must be arrays".into()));
+                        };
+                        out.insert(
+                            name.clone(),
+                            Value::Array(run(docs.clone(), pipeline, max_docs)?),
+                        );
+                    }
+                    docs = vec![Value::Object(out)];
+                    i += 1;
+                }
+                "$bucket" => {
+                    docs = bucket(docs, arg)?;
+                    i += 1;
+                }
+                "$bucketAuto" => {
+                    docs = bucket_auto(docs, arg)?;
+                    i += 1;
+                }
                 "$group" => {
                     docs = group(docs, arg)?;
                     i += 1;
@@ -437,7 +517,7 @@ fn as_usize(value: &Value, stage: &str) -> Result<usize> {
         .ok_or_else(|| Error::Query(format!("{stage} requires a non-negative integer")))
 }
 
-fn truthy(value: &Value) -> bool {
+pub(crate) fn truthy(value: &Value) -> bool {
     match value {
         Value::Bool(b) => *b,
         Value::Number(_) => numeric::parse_value(value).is_some_and(|n| {
@@ -771,6 +851,169 @@ impl GroupBuilder {
     }
 }
 
+const BUCKET_KEY_FIELD: &str = "__nonodb_bucket_key__";
+
+fn bucket_output_spec(output: Option<&Value>) -> Result<Value> {
+    let mut spec = Map::new();
+    spec.insert(
+        "_id".to_string(),
+        Value::String(format!("${BUCKET_KEY_FIELD}")),
+    );
+    match output {
+        Some(output) => {
+            let Some(output) = output.as_object() else {
+                return Err(Error::Query("bucket output must be an object".into()));
+            };
+            for (field, value) in output {
+                if field == "_id" {
+                    return Err(Error::Query("bucket output cannot contain `_id`".into()));
+                }
+                spec.insert(field.clone(), value.clone());
+            }
+        }
+        None => {
+            spec.insert(
+                "count".to_string(),
+                Value::Object(Map::from_iter([("$sum".to_string(), Value::from(1))])),
+            );
+        }
+    }
+    Ok(Value::Object(spec))
+}
+
+fn with_bucket_key(mut doc: Value, key: Value) -> Result<Value> {
+    path::set(&mut doc, BUCKET_KEY_FIELD, key)?;
+    Ok(doc)
+}
+
+fn bucket(docs: Vec<Value>, spec: &Value) -> Result<Vec<Value>> {
+    let spec = spec
+        .as_object()
+        .ok_or_else(|| Error::Query("$bucket requires an object".into()))?;
+    let group_by = spec
+        .get("groupBy")
+        .ok_or_else(|| Error::Query("$bucket requires `groupBy`".into()))?;
+    let Some(boundaries) = spec.get("boundaries").and_then(Value::as_array) else {
+        return Err(Error::Query("$bucket requires a boundaries array".into()));
+    };
+    if boundaries.len() < 2 {
+        return Err(Error::Query(
+            "$bucket boundaries must contain at least two values".into(),
+        ));
+    }
+    for pair in boundaries.windows(2) {
+        if compare_value(&pair[0], &pair[1]) != Ordering::Less {
+            return Err(Error::Query(
+                "$bucket boundaries must be strictly ascending".into(),
+            ));
+        }
+    }
+    let default = spec.get("default").cloned();
+    if let Some(default) = &default {
+        if compare_value(default, &boundaries[0]) == Ordering::Greater
+            && compare_value(default, boundaries.last().expect("boundaries")) == Ordering::Less
+        {
+            return Err(Error::Query(
+                "$bucket default must fall outside the boundaries".into(),
+            ));
+        }
+    }
+    let group_spec = bucket_output_spec(spec.get("output"))?;
+    let mut builder = GroupBuilder::new(&group_spec)?;
+    for doc in docs {
+        let value = eval_expr(&doc, group_by)?;
+        let mut bucket = None;
+        for pair in boundaries.windows(2) {
+            if compare_value(&value, &pair[0]) != Ordering::Less
+                && compare_value(&value, &pair[1]) == Ordering::Less
+            {
+                bucket = Some(pair[0].clone());
+                break;
+            }
+        }
+        let key = match bucket {
+            Some(key) => key,
+            None => match &default {
+                Some(default) => default.clone(),
+                None => {
+                    return Err(Error::Query(
+                        "$bucket value is outside the boundaries and no default is set".into(),
+                    ))
+                }
+            },
+        };
+        builder.update(with_bucket_key(doc, key)?)?;
+    }
+    let mut out = builder.finish()?;
+    out.sort_by(|a, b| {
+        let a = a.get("_id").unwrap_or(&Value::Null);
+        let b = b.get("_id").unwrap_or(&Value::Null);
+        let rank = |value: &Value| {
+            boundaries
+                .iter()
+                .position(|boundary| value == boundary)
+                .unwrap_or(boundaries.len())
+        };
+        rank(a).cmp(&rank(b)).then_with(|| compare_value(a, b))
+    });
+    Ok(out)
+}
+
+fn bucket_auto(docs: Vec<Value>, spec: &Value) -> Result<Vec<Value>> {
+    let spec = spec
+        .as_object()
+        .ok_or_else(|| Error::Query("$bucketAuto requires an object".into()))?;
+    let group_by = spec
+        .get("groupBy")
+        .ok_or_else(|| Error::Query("$bucketAuto requires `groupBy`".into()))?;
+    let buckets = spec
+        .get("buckets")
+        .ok_or_else(|| Error::Query("$bucketAuto requires `buckets`".into()))
+        .and_then(|value| as_usize(value, "$bucketAuto buckets"))?;
+    if buckets == 0 {
+        return Err(Error::Query("$bucketAuto buckets must be positive".into()));
+    }
+    let group_spec = bucket_output_spec(spec.get("output"))?;
+    let mut entries = docs
+        .into_iter()
+        .map(|doc| Ok((eval_expr(&doc, group_by)?, doc)))
+        .collect::<Result<Vec<_>>>()?;
+    if entries.is_empty() {
+        return Ok(Vec::new());
+    }
+    entries.sort_by(|a, b| compare_value(&a.0, &b.0));
+    let groups = buckets.min(entries.len());
+    let mut builder = GroupBuilder::new(&group_spec)?;
+    for index in 0..groups {
+        let start = index * entries.len() / groups;
+        let end = (index + 1) * entries.len() / groups;
+        let min = entries[start].0.clone();
+        let max = if end < entries.len() {
+            entries[end].0.clone()
+        } else {
+            entries[end - 1].0.clone()
+        };
+        let id = Value::Object(Map::from_iter([
+            ("min".to_string(), min),
+            ("max".to_string(), max),
+        ]));
+        for (_, doc) in &entries[start..end] {
+            builder.update(with_bucket_key(doc.clone(), id.clone())?)?;
+        }
+    }
+    let mut out = builder.finish()?;
+    out.sort_by(|a, b| {
+        let value = |doc: &Value| {
+            doc.get("_id")
+                .and_then(|id| id.get("min"))
+                .cloned()
+                .unwrap_or(Value::Null)
+        };
+        compare_value(&value(a), &value(b))
+    });
+    Ok(out)
+}
+
 fn group(docs: Vec<Value>, spec: &Value) -> Result<Vec<Value>> {
     let mut builder = GroupBuilder::new(spec)?;
     for doc in docs {
@@ -1021,7 +1264,7 @@ fn number_value(n: f64) -> Value {
     }
 }
 
-fn compare_value(a: &Value, b: &Value) -> Ordering {
+pub(crate) fn compare_value(a: &Value, b: &Value) -> Ordering {
     if let Some(ord) = numeric::cmp_values(a, b) {
         return ord;
     }
@@ -1069,14 +1312,34 @@ fn decimal_arithmetic(op: &str, values: &[Value]) -> Result<Value> {
 }
 
 pub(crate) fn eval_expr(doc: &Value, expr: &Value) -> Result<Value> {
+    eval_expr_vars(doc, expr, &BTreeMap::new())
+}
+
+fn eval_expr_vars(doc: &Value, expr: &Value, vars: &BTreeMap<String, Value>) -> Result<Value> {
     match expr {
         Value::String(s) if s == "$$ROOT" || s == "$$CURRENT" => Ok(doc.clone()),
+        Value::String(s) if s.starts_with("$$") => {
+            let reference = &s[2..];
+            let mut parts = reference.split('.');
+            let Some(name) = parts.next() else {
+                return Ok(Value::Null);
+            };
+            let Some(value) = vars.get(name) else {
+                return Ok(Value::Null);
+            };
+            let tail = parts.collect::<Vec<_>>().join(".");
+            if tail.is_empty() {
+                Ok(value.clone())
+            } else {
+                Ok(path::get(value, &tail).cloned().unwrap_or(Value::Null))
+            }
+        }
         Value::String(s) if s.starts_with('$') => {
             Ok(path::get(doc, &s[1..]).cloned().unwrap_or(Value::Null))
         }
         Value::Array(items) => items
             .iter()
-            .map(|item| eval_expr(doc, item))
+            .map(|item| eval_expr_vars(doc, item, vars))
             .collect::<Result<Vec<_>>>()
             .map(Value::Array),
         Value::Object(obj)
@@ -1086,12 +1349,12 @@ pub(crate) fn eval_expr(doc: &Value, expr: &Value) -> Result<Value> {
                 && !numeric::is_numeric(expr)
                 && !bson_types::is_bson_value(expr) =>
         {
-            eval_operator(doc, obj)
+            eval_operator(doc, obj, vars)
         }
         Value::Object(obj) => {
             let mut out = Map::new();
             for (key, value) in obj {
-                out.insert(key.clone(), eval_expr(doc, value)?);
+                out.insert(key.clone(), eval_expr_vars(doc, value, vars)?);
             }
             Ok(Value::Object(out))
         }
@@ -1099,13 +1362,30 @@ pub(crate) fn eval_expr(doc: &Value, expr: &Value) -> Result<Value> {
     }
 }
 
-fn eval_operator(doc: &Value, obj: &Map<String, Value>) -> Result<Value> {
+fn eval_operator(
+    doc: &Value,
+    obj: &Map<String, Value>,
+    vars: &BTreeMap<String, Value>,
+) -> Result<Value> {
     let (op, arg) = obj.iter().next().expect("one entry");
     let args = || -> Result<Vec<Value>> {
         let values = arg
             .as_array()
             .ok_or_else(|| Error::Query(format!("{op} requires an array of arguments")))?;
-        values.iter().map(|v| eval_expr(doc, v)).collect()
+        values
+            .iter()
+            .map(|v| eval_expr_vars(doc, v, vars))
+            .collect()
+    };
+    let one_arg = || -> Result<Value> {
+        if let Value::Array(items) = arg {
+            if items.len() != 1 {
+                return Err(Error::Query(format!("{op} requires one argument")));
+            }
+            eval_expr_vars(doc, &items[0], vars)
+        } else {
+            eval_expr_vars(doc, arg, vars)
+        }
     };
 
     match op.as_str() {
@@ -1164,7 +1444,7 @@ fn eval_operator(doc: &Value, obj: &Map<String, Value>) -> Result<Value> {
         "$cond" => {
             let (condition, yes, no) = match arg {
                 Value::Array(items) if items.len() == 3 => {
-                    (eval_expr(doc, &items[0])?, &items[1], &items[2])
+                    (eval_expr_vars(doc, &items[0], vars)?, &items[1], &items[2])
                 }
                 Value::Object(obj) => {
                     let condition = obj
@@ -1176,14 +1456,14 @@ fn eval_operator(doc: &Value, obj: &Map<String, Value>) -> Result<Value> {
                     let no = obj
                         .get("else")
                         .ok_or_else(|| Error::Query("$cond requires `else`".into()))?;
-                    (eval_expr(doc, condition)?, yes, no)
+                    (eval_expr_vars(doc, condition, vars)?, yes, no)
                 }
                 _ => return Err(Error::Query("$cond requires three arguments".into())),
             };
             if truthy(&condition) {
-                eval_expr(doc, yes)
+                eval_expr_vars(doc, yes, vars)
             } else {
-                eval_expr(doc, no)
+                eval_expr_vars(doc, no, vars)
             }
         }
         "$eq" | "$ne" | "$gt" | "$gte" | "$lt" | "$lte" => {
@@ -1319,10 +1599,470 @@ fn eval_operator(doc: &Value, obj: &Map<String, Value>) -> Result<Value> {
             };
             Ok(number_value(result))
         }
+        "$in" => {
+            let values = args()?;
+            if values.len() != 2 {
+                return Err(Error::Query("$in requires two arguments".into()));
+            }
+            let Some(items) = values[1].as_array() else {
+                return Err(Error::Query(
+                    "$in requires an array as its second argument".into(),
+                ));
+            };
+            Ok(Value::Bool(items.iter().any(|item| {
+                compare_value(&values[0], item) == Ordering::Equal
+            })))
+        }
+        "$isArray" => Ok(Value::Bool(one_arg()?.is_array())),
+        "$arrayElemAt" => {
+            let values = args()?;
+            if values.len() != 2 {
+                return Err(Error::Query("$arrayElemAt requires two arguments".into()));
+            }
+            let Some(items) = values[0].as_array() else {
+                return Ok(Value::Null);
+            };
+            let Some(index) = expr_i64(&values[1]) else {
+                return Err(Error::Query(
+                    "$arrayElemAt requires an integer index".into(),
+                ));
+            };
+            let index = if index < 0 {
+                items.len() as i64 + index
+            } else {
+                index
+            };
+            Ok(usize::try_from(index)
+                .ok()
+                .and_then(|index| items.get(index))
+                .cloned()
+                .unwrap_or(Value::Null))
+        }
+        "$concatArrays" => {
+            let values = args()?;
+            let mut out = Vec::new();
+            for value in values {
+                if value.is_null() {
+                    return Ok(Value::Null);
+                }
+                let Some(items) = value.as_array() else {
+                    return Err(Error::Query("$concatArrays requires arrays".into()));
+                };
+                out.extend(items.iter().cloned());
+            }
+            Ok(Value::Array(out))
+        }
+        "$slice" => {
+            let values = args()?;
+            if values.len() != 2 && values.len() != 3 {
+                return Err(Error::Query(
+                    "$slice requires two or three arguments".into(),
+                ));
+            }
+            let Some(items) = values[0].as_array() else {
+                return Ok(Value::Null);
+            };
+            let (skip, limit) = if values.len() == 2 {
+                let Some(count) = expr_i64(&values[1]) else {
+                    return Err(Error::Query("$slice requires an integer count".into()));
+                };
+                if count >= 0 {
+                    (0usize, usize::try_from(count).unwrap_or(usize::MAX))
+                } else {
+                    let take = usize::try_from(count.unsigned_abs()).unwrap_or(usize::MAX);
+                    (items.len().saturating_sub(take.min(items.len())), take)
+                }
+            } else {
+                let Some(skip) = expr_i64(&values[1]) else {
+                    return Err(Error::Query("$slice requires an integer position".into()));
+                };
+                let Some(count) = expr_i64(&values[2]) else {
+                    return Err(Error::Query("$slice requires an integer count".into()));
+                };
+                if count <= 0 {
+                    return Ok(Value::Array(Vec::new()));
+                }
+                let start = if skip >= 0 {
+                    usize::try_from(skip).unwrap_or(usize::MAX).min(items.len())
+                } else {
+                    items.len().saturating_sub(
+                        usize::try_from(skip.unsigned_abs())
+                            .unwrap_or(usize::MAX)
+                            .min(items.len()),
+                    )
+                };
+                (
+                    start,
+                    usize::try_from(count)
+                        .unwrap_or(usize::MAX)
+                        .min(items.len().saturating_sub(start)),
+                )
+            };
+            let end = skip.saturating_add(limit).min(items.len());
+            Ok(Value::Array(items[skip..end].to_vec()))
+        }
+        "$switch" => {
+            let Some(obj) = arg.as_object() else {
+                return Err(Error::Query("$switch requires an object".into()));
+            };
+            let Some(branches) = obj.get("branches").and_then(Value::as_array) else {
+                return Err(Error::Query("$switch requires a branches array".into()));
+            };
+            for branch in branches {
+                let Some(branch) = branch.as_object() else {
+                    return Err(Error::Query("$switch branches must be objects".into()));
+                };
+                let Some(case) = branch.get("case") else {
+                    return Err(Error::Query("$switch branch requires `case`".into()));
+                };
+                let case = eval_expr_vars(doc, case, vars)?;
+                if truthy(&case) {
+                    let then = branch
+                        .get("then")
+                        .ok_or_else(|| Error::Query("$switch branch requires `then`".into()))?;
+                    return eval_expr_vars(doc, then, vars);
+                }
+            }
+            match obj.get("default") {
+                Some(default) => eval_expr_vars(doc, default, vars),
+                None => Err(Error::Query("$switch found no matching branch".into())),
+            }
+        }
+        "$let" => {
+            let Some(obj) = arg.as_object() else {
+                return Err(Error::Query("$let requires an object".into()));
+            };
+            let Some(bindings) = obj.get("vars").and_then(Value::as_object) else {
+                return Err(Error::Query("$let requires a vars object".into()));
+            };
+            let Some(in_expr) = obj.get("in") else {
+                return Err(Error::Query("$let requires `in`".into()));
+            };
+            let mut scope = vars.clone();
+            for (name, value) in bindings {
+                scope.insert(name.clone(), eval_expr_vars(doc, value, vars)?);
+            }
+            eval_expr_vars(doc, in_expr, &scope)
+        }
+        "$map" => {
+            let Some(obj) = arg.as_object() else {
+                return Err(Error::Query("$map requires an object".into()));
+            };
+            let Some(input) = obj.get("input") else {
+                return Err(Error::Query("$map requires `input`".into()));
+            };
+            let Some(in_expr) = obj.get("in") else {
+                return Err(Error::Query("$map requires `in`".into()));
+            };
+            let input = eval_expr_vars(doc, input, vars)?;
+            let Some(items) = input.as_array() else {
+                return Ok(Value::Null);
+            };
+            let name = obj.get("as").and_then(Value::as_str).unwrap_or("this");
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                let mut scope = vars.clone();
+                scope.insert(name.to_string(), item.clone());
+                out.push(eval_expr_vars(doc, in_expr, &scope)?);
+            }
+            Ok(Value::Array(out))
+        }
+        "$filter" => {
+            let Some(obj) = arg.as_object() else {
+                return Err(Error::Query("$filter requires an object".into()));
+            };
+            let Some(input) = obj.get("input") else {
+                return Err(Error::Query("$filter requires `input`".into()));
+            };
+            let Some(cond) = obj.get("cond") else {
+                return Err(Error::Query("$filter requires `cond`".into()));
+            };
+            let input = eval_expr_vars(doc, input, vars)?;
+            let Some(items) = input.as_array() else {
+                return Ok(Value::Null);
+            };
+            let name = obj.get("as").and_then(Value::as_str).unwrap_or("this");
+            let limit = match obj.get("limit") {
+                Some(limit) => expr_i64(&eval_expr_vars(doc, limit, vars)?)
+                    .filter(|limit| *limit >= 0)
+                    .map(|limit| limit as usize),
+                None => None,
+            };
+            if limit == Some(0) {
+                return Ok(Value::Array(Vec::new()));
+            }
+            let mut out = Vec::new();
+            for item in items {
+                let mut scope = vars.clone();
+                scope.insert(name.to_string(), item.clone());
+                if truthy(&eval_expr_vars(doc, cond, &scope)?) {
+                    out.push(item.clone());
+                    if limit.is_some_and(|limit| out.len() >= limit) {
+                        break;
+                    }
+                }
+            }
+            Ok(Value::Array(out))
+        }
+        "$reduce" => {
+            let Some(obj) = arg.as_object() else {
+                return Err(Error::Query("$reduce requires an object".into()));
+            };
+            let Some(input) = obj.get("input") else {
+                return Err(Error::Query("$reduce requires `input`".into()));
+            };
+            let Some(initial) = obj.get("initialValue") else {
+                return Err(Error::Query("$reduce requires `initialValue`".into()));
+            };
+            let Some(in_expr) = obj.get("in") else {
+                return Err(Error::Query("$reduce requires `in`".into()));
+            };
+            let input = eval_expr_vars(doc, input, vars)?;
+            let Some(items) = input.as_array() else {
+                return Ok(Value::Null);
+            };
+            let mut value = eval_expr_vars(doc, initial, vars)?;
+            for item in items {
+                let mut scope = vars.clone();
+                scope.insert("value".to_string(), value);
+                scope.insert("this".to_string(), item.clone());
+                value = eval_expr_vars(doc, in_expr, &scope)?;
+            }
+            Ok(value)
+        }
+        "$mod" | "$pow" => {
+            let values = args()?;
+            if values.len() != 2 {
+                return Err(Error::Query(format!("{op} requires two arguments")));
+            }
+            if op == "$mod" {
+                if values.iter().any(numeric::is_decimal) {
+                    let a = numeric::as_bigdecimal(&values[0])
+                        .ok_or_else(|| Error::Query("$mod requires numbers".into()))?;
+                    let b = numeric::as_bigdecimal(&values[1])
+                        .ok_or_else(|| Error::Query("$mod requires numbers".into()))?;
+                    if b.is_zero() {
+                        return Err(Error::Query("$mod divisor cannot be zero".into()));
+                    }
+                    return numeric::decimal_value(&(a % b));
+                }
+                let a = numeric::as_f64(&values[0])
+                    .ok_or_else(|| Error::Query("$mod requires numbers".into()))?;
+                let b = numeric::as_f64(&values[1])
+                    .ok_or_else(|| Error::Query("$mod requires numbers".into()))?;
+                if b == 0.0 {
+                    return Err(Error::Query("$mod divisor cannot be zero".into()));
+                }
+                return Ok(number_value(a % b));
+            }
+            let a = numeric::as_f64(&values[0])
+                .ok_or_else(|| Error::Query("$pow requires numbers".into()))?;
+            let b = numeric::as_f64(&values[1])
+                .ok_or_else(|| Error::Query("$pow requires numbers".into()))?;
+            Ok(number_value(a.powf(b)))
+        }
+        "$min" | "$max" => {
+            let mut values = if arg.is_array() {
+                args()?
+            } else {
+                vec![eval_expr_vars(doc, arg, vars)?]
+            };
+            if values.len() == 1 {
+                if let Some(items) = values[0].as_array() {
+                    values = items.clone();
+                }
+            }
+            let mut best: Option<Value> = None;
+            for value in values {
+                if value.is_null() {
+                    continue;
+                }
+                let replace = best.as_ref().is_none_or(|current| {
+                    let ord = compare_value(&value, current);
+                    if op == "$min" {
+                        ord == Ordering::Less
+                    } else {
+                        ord == Ordering::Greater
+                    }
+                });
+                if replace {
+                    best = Some(value);
+                }
+            }
+            Ok(best.unwrap_or(Value::Null))
+        }
+        "$regexMatch" => {
+            let Some(obj) = arg.as_object() else {
+                return Err(Error::Query("$regexMatch requires an object".into()));
+            };
+            let input = obj
+                .get("input")
+                .ok_or_else(|| Error::Query("$regexMatch requires `input`".into()))?;
+            let regex = obj
+                .get("regex")
+                .ok_or_else(|| Error::Query("$regexMatch requires `regex`".into()))?;
+            let input = eval_expr_vars(doc, input, vars)?;
+            let regex = eval_expr_vars(doc, regex, vars)?;
+            let options = match obj.get("options") {
+                Some(options) => Some(eval_expr_vars(doc, options, vars)?),
+                None => None,
+            };
+            Ok(Value::Bool(crate::regex::is_match(
+                Some(&input),
+                &regex,
+                options.as_ref(),
+            )))
+        }
+        "$strLenCP" => Ok(match one_arg()?.as_str() {
+            Some(s) => Value::from(s.chars().count()),
+            None => Value::Null,
+        }),
+        "$substrCP" => {
+            let values = args()?;
+            if values.len() != 3 {
+                return Err(Error::Query("$substrCP requires three arguments".into()));
+            }
+            let Some(s) = values[0].as_str() else {
+                return Ok(Value::Null);
+            };
+            let Some(start) = expr_i64(&values[1]) else {
+                return Ok(Value::Null);
+            };
+            let Some(count) = expr_i64(&values[2]) else {
+                return Ok(Value::Null);
+            };
+            Ok(Value::String(
+                s.chars()
+                    .skip(start.max(0) as usize)
+                    .take(count.max(0) as usize)
+                    .collect(),
+            ))
+        }
+        "$split" => {
+            let values = args()?;
+            if values.len() != 2 {
+                return Err(Error::Query("$split requires two arguments".into()));
+            }
+            let (Some(s), Some(delimiter)) = (values[0].as_str(), values[1].as_str()) else {
+                return Ok(Value::Null);
+            };
+            if delimiter.is_empty() {
+                return Err(Error::Query("$split delimiter cannot be empty".into()));
+            }
+            Ok(Value::Array(s.split(delimiter).map(Value::from).collect()))
+        }
+        "$indexOfCP" => {
+            let values = args()?;
+            if values.len() < 2 || values.len() > 4 {
+                return Err(Error::Query(
+                    "$indexOfCP requires two to four arguments".into(),
+                ));
+            }
+            let (Some(s), Some(search)) = (values[0].as_str(), values[1].as_str()) else {
+                return Ok(Value::Null);
+            };
+            let start = values.get(2).and_then(expr_i64).unwrap_or(0).max(0) as usize;
+            let end = values
+                .get(3)
+                .and_then(expr_i64)
+                .map(|end| end.max(0) as usize);
+            let chars: Vec<char> = s.chars().collect();
+            let start = start.min(chars.len());
+            let end = end.unwrap_or(chars.len()).min(chars.len()).max(start);
+            let haystack: String = chars[start..end].iter().collect();
+            Ok(match haystack.find(search) {
+                Some(byte_index) => Value::from(start + haystack[..byte_index].chars().count()),
+                None => Value::from(-1),
+            })
+        }
+        "$objectToArray" => {
+            let value = one_arg()?;
+            let Some(obj) = value.as_object() else {
+                return Ok(Value::Null);
+            };
+            Ok(Value::Array(
+                obj.iter()
+                    .map(|(key, value)| {
+                        Value::Object(Map::from_iter([
+                            ("k".to_string(), Value::String(key.clone())),
+                            ("v".to_string(), value.clone()),
+                        ]))
+                    })
+                    .collect(),
+            ))
+        }
+        "$arrayToObject" => {
+            let value = one_arg()?;
+            let Some(items) = value.as_array() else {
+                return Ok(Value::Null);
+            };
+            let mut out = Map::new();
+            for item in items {
+                let (key, value) = match item {
+                    Value::Object(obj) => {
+                        let key = obj.get("k").and_then(Value::as_str);
+                        let value = obj.get("v");
+                        match (key, value) {
+                            (Some(key), Some(value)) => (key.to_string(), value.clone()),
+                            _ => {
+                                return Err(Error::Query(
+                                    "$arrayToObject entries require k and v".into(),
+                                ))
+                            }
+                        }
+                    }
+                    Value::Array(pair) if pair.len() == 2 => {
+                        let Some(key) = pair[0].as_str() else {
+                            return Err(Error::Query("$arrayToObject keys must be strings".into()));
+                        };
+                        (key.to_string(), pair[1].clone())
+                    }
+                    _ => {
+                        return Err(Error::Query(
+                            "$arrayToObject requires {k,v} objects or [k,v] pairs".into(),
+                        ))
+                    }
+                };
+                out.insert(key, value);
+            }
+            Ok(Value::Object(out))
+        }
+        "$mergeObjects" => {
+            let values = args()?;
+            let mut out = Map::new();
+            for value in values {
+                if value.is_null() {
+                    continue;
+                }
+                let Some(obj) = value.as_object() else {
+                    return Err(Error::Query("$mergeObjects requires objects".into()));
+                };
+                for (key, value) in obj {
+                    out.insert(key.clone(), value.clone());
+                }
+            }
+            Ok(Value::Object(out))
+        }
+        "$type" => Ok(Value::String(
+            bson_types::type_name(&one_arg()?)
+                .unwrap_or("null")
+                .to_string(),
+        )),
         _ => Err(Error::Query(format!(
             "unsupported aggregation expression `{op}`"
         ))),
     }
+}
+
+fn expr_i64(value: &Value) -> Option<i64> {
+    if let Some(number) = value.as_i64() {
+        return Some(number);
+    }
+    let number = numeric::as_bigdecimal(value)?;
+    if number != number.with_scale(0) {
+        return None;
+    }
+    bigdecimal::num_traits::ToPrimitive::to_i64(&number)
 }
 
 #[cfg(test)]
@@ -1396,6 +2136,234 @@ mod tests {
         ];
         let out = run(docs, &pipeline, 100).unwrap();
         assert_eq!(out, vec![json!({"x": 4}), json!({"x": 6})]);
+    }
+
+    #[test]
+    fn expression_compatibility_operators() {
+        let doc = json!({
+            "name": "Ala",
+            "nums": [3, 7, 11],
+            "items": [{"qty": 2}, {"qty": 5}],
+            "obj": {"a": 1},
+            "other": 4
+        });
+        let eval = |expr: Value| eval_expr(&doc, &expr).unwrap();
+
+        assert_eq!(eval(json!({"$in": [7, "$nums"]})), json!(true));
+        assert_eq!(eval(json!({"$isArray": "$nums"})), json!(true));
+        assert_eq!(eval(json!({"$arrayElemAt": ["$nums", -1]})), json!(11));
+        assert_eq!(eval(json!({"$slice": ["$nums", 1, 2]})), json!([7, 11]));
+        assert_eq!(
+            eval(json!({"$concatArrays": [[1, 2], [3]]})),
+            json!([1, 2, 3])
+        );
+        assert_eq!(
+            eval(json!({"$map": {
+                "input": "$nums",
+                "as": "n",
+                "in": {"$multiply": ["$$n", 2]}
+            }})),
+            json!([6, 14, 22])
+        );
+        assert_eq!(
+            eval(json!({"$filter": {
+                "input": "$nums",
+                "as": "n",
+                "cond": {"$gt": ["$$n", 4]}
+            }})),
+            json!([7, 11])
+        );
+        assert_eq!(
+            eval(json!({"$reduce": {
+                "input": "$nums",
+                "initialValue": 0,
+                "in": {"$add": ["$$value", "$$this"]}
+            }})),
+            json!(21)
+        );
+        assert_eq!(
+            eval(json!({"$let": {
+                "vars": {"x": 5},
+                "in": {"$add": ["$$x", 1]}
+            }})),
+            json!(6)
+        );
+        assert_eq!(
+            eval(json!({"$switch": {
+                "branches": [
+                    {"case": {"$gte": ["$other", 5]}, "then": "high"},
+                    {"case": true, "then": "low"}
+                ]
+            }})),
+            json!("low")
+        );
+        assert_eq!(eval(json!({"$mod": [7, 3]})), json!(1));
+        assert_eq!(eval(json!({"$pow": [2, 5]})), json!(32));
+        assert_eq!(eval(json!({"$min": "$nums"})), json!(3));
+        assert_eq!(eval(json!({"$max": "$nums"})), json!(11));
+        assert_eq!(
+            eval(json!({"$regexMatch": {"input": "$name", "regex": "^Al"}})),
+            json!(true)
+        );
+        assert_eq!(eval(json!({"$strLenCP": "$name"})), json!(3));
+        assert_eq!(eval(json!({"$substrCP": ["$name", 1, 1]})), json!("l"));
+        assert_eq!(eval(json!({"$split": ["a,b", ","]})), json!(["a", "b"]));
+        assert_eq!(eval(json!({"$indexOfCP": ["$name", "l"]})), json!(1));
+        assert_eq!(
+            eval(json!({"$objectToArray": "$obj"})),
+            json!([{"k": "a", "v": 1}])
+        );
+        assert_eq!(
+            eval(json!({"$arrayToObject": [[["b", 2]]]})),
+            json!({"b": 2})
+        );
+        assert_eq!(
+            eval(json!({"$mergeObjects": [{"a": 1}, {"b": 2}]})),
+            json!({"a": 1, "b": 2})
+        );
+        assert_eq!(eval(json!({"$type": "$name"})), json!("string"));
+    }
+
+    #[test]
+    fn replace_sample_sort_by_count_and_facet() {
+        let docs = vec![
+            json!({"_id": "1", "cat": "a", "n": 1, "nested": {"x": 1}}),
+            json!({"_id": "2", "cat": "a", "n": 2, "nested": {"x": 2}}),
+            json!({"_id": "3", "cat": "b", "n": 3, "nested": {"x": 3}}),
+        ];
+
+        assert_eq!(
+            run(docs.clone(), &[json!({"$replaceWith": "$nested"})], 100).unwrap(),
+            vec![json!({"x": 1}), json!({"x": 2}), json!({"x": 3})]
+        );
+        assert_eq!(
+            run(
+                docs.clone(),
+                &[json!({"$replaceRoot": {"newRoot": "$nested"}})],
+                100
+            )
+            .unwrap(),
+            vec![json!({"x": 1}), json!({"x": 2}), json!({"x": 3})]
+        );
+        assert_eq!(
+            run(docs.clone(), &[json!({"$sortByCount": "$cat"})], 100).unwrap(),
+            vec![
+                json!({"_id": "a", "count": 2}),
+                json!({"_id": "b", "count": 1})
+            ]
+        );
+
+        let faceted = run(
+            docs.clone(),
+            &[json!({"$facet": {
+                "by_cat": [{"$sortByCount": "$cat"}],
+                "total": [{"$count": "n"}],
+                "top": [{"$sort": {"n": -1}}, {"$limit": 1}, {"$project": {"_id": 1}}]
+            }})],
+            100,
+        )
+        .unwrap();
+        assert_eq!(faceted.len(), 1);
+        assert_eq!(faceted[0]["total"], json!([{"n": 3}]));
+        assert_eq!(faceted[0]["top"], json!([{"_id": "3"}]));
+        assert_eq!(
+            faceted[0]["by_cat"],
+            json!([
+                {"_id": "a", "count": 2},
+                {"_id": "b", "count": 1}
+            ])
+        );
+
+        for size in [0usize, 1, 3, 10] {
+            let out = run(docs.clone(), &[json!({"$sample": {"size": size}})], 100).unwrap();
+            assert_eq!(out.len(), size.min(docs.len()));
+        }
+    }
+
+    #[test]
+    fn bucket_and_bucket_auto() {
+        let docs = vec![
+            json!({"_id": "1", "v": 1}),
+            json!({"_id": "2", "v": 5}),
+            json!({"_id": "3", "v": 10}),
+            json!({"_id": "4", "v": 15}),
+            json!({"_id": "5", "v": 35}),
+        ];
+        assert_eq!(
+            run(
+                docs.clone(),
+                &[json!({"$bucket": {
+                    "groupBy": "$v",
+                    "boundaries": [0, 10, 20, 30],
+                    "default": "other",
+                    "output": {
+                        "count": {"$sum": 1},
+                        "total": {"$sum": "$v"}
+                    }
+                }})],
+                100
+            )
+            .unwrap(),
+            vec![
+                json!({"_id": 0, "count": 2, "total": 6}),
+                json!({"_id": 10, "count": 2, "total": 25}),
+                json!({"_id": "other", "count": 1, "total": 35})
+            ]
+        );
+        assert!(run(
+            docs.clone(),
+            &[json!({"$bucket": {
+                "groupBy": "$v",
+                "boundaries": [0, 10, 20, 30]
+            }})],
+            100
+        )
+        .is_err());
+        assert!(run(
+            docs.clone(),
+            &[json!({"$bucket": {
+                "groupBy": "$v",
+                "boundaries": [10, 0]
+            }})],
+            100
+        )
+        .is_err());
+
+        let auto_docs: Vec<Value> = (1..=6)
+            .map(|v| json!({"_id": v.to_string(), "v": v}))
+            .collect();
+        assert_eq!(
+            run(
+                auto_docs,
+                &[json!({"$bucketAuto": {
+                    "groupBy": "$v",
+                    "buckets": 2,
+                    "output": {"count": {"$sum": 1}, "total": {"$sum": "$v"}}
+                }})],
+                100
+            )
+            .unwrap(),
+            vec![
+                json!({"_id": {"min": 1, "max": 4}, "count": 3, "total": 6}),
+                json!({"_id": {"min": 4, "max": 6}, "count": 3, "total": 15})
+            ]
+        );
+        assert!(run(
+            docs.clone(),
+            &[json!({"$bucketAuto": {"groupBy": "$v", "buckets": 0}})],
+            100
+        )
+        .is_err());
+        assert!(run(
+            docs,
+            &[json!({"$bucket": {
+                "groupBy": "$v",
+                "boundaries": [0, 10],
+                "output": {"_id": {"$sum": 1}}
+            }})],
+            100
+        )
+        .is_err());
     }
 
     #[test]

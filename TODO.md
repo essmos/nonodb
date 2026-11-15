@@ -241,10 +241,10 @@ Design: [docs/replication.md](docs/replication.md).
 - [ ] SQL extensions: joins/subqueries, scalar expressions in grouped
       `SELECT`, `UNION`/CTE, `RETURNING`, `INSERT ... SELECT`, `UPDATE ... FROM`,
       `SUM`/`AVG`/`MIN`/`MAX(DISTINCT ...)`, and SQL benchmark coverage
-- [ ] `$rename`, `$min`, `$max`, `$mul`, `$currentDate`, `$bit`, `$pop`
+- [x] `$rename`, `$min`, `$max`, `$mul`, `$currentDate`, `$bit`, `$pop`
 - [ ] Timezone-aware date aggregation expressions (`$dateToString`,
       `$dateTrunc`, `$dateAdd`)
-- [ ] Nested projections and `$slice`
+- [ ] Nested projections, positional `$`, and `$meta` projections
 - [ ] ObjectId as `_id` (currently field values only)
 - [ ] BSON Timestamp and MinKey/MaxKey
 - [ ] Regular-expression values and legacy BSON value compatibility, excluding
