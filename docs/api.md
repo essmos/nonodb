@@ -2532,8 +2532,10 @@ refuses to overwrite an existing database.
 
 ## Replication API
 
-The current branch exposes read-only inspection of the durable writer log.
-Transport, replica apply, promotion, and GUI management are still planned.
+Replication is built in. A primary captures one ordered record per committed
+write transaction; replicas pull over HTTP, TLS, or mutual TLS and stay
+read-only until promoted. These endpoints expose the log, source management,
+pause/resume/disconnect controls, bootstrap, promotion, and cluster status.
 
 | Method | Path | Purpose |
 |---|---|---|
@@ -2604,6 +2606,7 @@ collection, op, id, and before/after documents. Replicas reject stale epochs. Re
 | `auth_disabled` | 400 | Authorization registry is not configured |
 | `unauthorized` | 401 | Missing/invalid/disabled credential |
 | `forbidden` | 403 | Principal lacks the required scope |
+| `read_only` | 403 | Replica/standby rejected a write; response includes `Location` and `error.write_url` for the primary |
 | `rate_limited` | 429 | Too many failed logins from this IP; wait and retry |
 | `timeout` | 500 | Request exceeded the server timeout |
 | `cursor_not_found` | 400 | Cursor is unknown, expired, closed, or belongs to another principal |

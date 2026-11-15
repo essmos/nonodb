@@ -127,11 +127,14 @@ application, but behaves like a shared database to a preforking web server.
 
 nonodb is deliberately not a general-purpose distributed database. It has:
 
-- no sharding or multi-primary clustering; replication is optional primary/replica/standby with quorum failover;
+- no sharding or multi-primary clustering; replication is optional, built in,
+  and primary/replica/standby with quorum failover rather than a separate
+  cluster service;
 - no general interactive multi-document transactions;
 - no MongoDB wire-protocol compatibility;
 - no cross-collection joins (`$lookup`) or write stages (`$merge`/`$out`);
-- no users, roles, or inherited groups beyond per-collection scopes;
+- no role hierarchy or inherited groups; authorization uses principals and
+  database-qualified scopes;
 - a practical subset of MongoDB query and update operators.
 
 For a single host, a small-to-medium data set, and a workload dominated by
@@ -421,6 +424,10 @@ rotation, and best-fit guidance.
   principals.
 - Append-only JSONL audit log with optional read auditing and fsync.
 - Periodic LMDB snapshots with retention.
+- Optional Network GUI/API for TCP, TLS, advertised replica URLs, and a
+  dedicated nftables firewall table.
+- Per-user instance registry and `--instance`/`--socket` selection for
+  multi-daemon shells.
 - Online backup with SHA-256 manifests, deep verification, restore drills, and inspection.
 - JSON and Prometheus metrics endpoints with daemon-wide/per-collection counters, disk, snapshot, and readiness signals.
 - Graceful `SIGTERM`/`SIGINT` drain: stop accepting, finish in-flight requests,
@@ -428,7 +435,8 @@ rotation, and best-fit guidance.
 - Text or JSON logs with per-request method, path, status, and duration.
 - Group commit with adaptive batching, request size limits, and request
   timeouts.
-- Official thin clients for Python, Rust, Node.js, and Go.
+- Official thin clients for Python, Rust, Node.js, and Go, with optional
+  read-replica write routing.
 - Background jobs through a normal `_jobs` collection and outbox events through
   `_events`, both handled by external workers; no stored procedures or daemon
   plugins.
@@ -533,6 +541,25 @@ NONODB_SOCK=/tmp/nonodb-run/nonodb.sock ./nonodb-cli find users '{}' --sort age:
 
 This runs in the foreground. For a production Linux service, use the systemd
 unit and installation steps in [Operations](docs/operations.md#deployment-with-systemd).
+
+### Read replicas and write routing
+
+Point reads at a replica and opt in to write routing when you do not want to
+maintain two clients:
+
+```python
+from nonodb import NonoDB
+
+with NonoDB(base_url="http://10.0.0.3:7912", auto_primary=True) as db:
+    db.collection("users").insert({"name": "Ada"})
+    # Reads stay on the replica and are eventually consistent.
+    print(db.collection("users").find_one({"name": "Ada"}))
+```
+
+`auto_primary` follows the replica's advertised `write_url` and retries exactly
+once only after an explicit `403 read_only`; it never retries timeouts,
+connection failures, or `5xx`. You can also set `write_url` explicitly. See
+[Clients: routing writes to the primary](docs/clients.md#routing-writes-to-the-primary).
 
 ### Run on macOS
 
@@ -746,7 +773,7 @@ documentation.
 | [Architecture](docs/architecture.md) | Daemon model, LMDB layout, write path, indexes, search, concurrency, crash safety |
 | [HTTP API](docs/api.md) | Every operation, request/response shapes, filters, updates, indexes, search, errors |
 | [SQL queries](docs/sql.md) | `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `DISTINCT`, `HAVING`, `CASE`, functions, aggregates, `explain_sql`, parameters, limits, client examples |
-| [Clients](docs/clients.md) | Python, Rust, Node.js and Go clients: install, CRUD, batches, indexes, search, TCP/TLS |
+| [Clients](docs/clients.md) | Python, Rust, Node.js and Go clients: install, CRUD, batches, indexes, search, TCP/TLS, read-replica write routing |
 | [Migration and import](docs/migration.md) | MongoDB, PostgreSQL, SQLite and CSV migration, NDJSON format, import manifest, cutover |
 | [Authentication and permissions](docs/auth.md) | Principals, scopes, tokens, certificates, CLI/API/GUI management, lockout, reloads, audit log |
 | [Security checks](docs/security-check.md) | Local security regression checks, LiveAPISec audit method, results, hardening gaps, production checklist |

@@ -2064,6 +2064,57 @@ function ReplicationPage({ connection }: { connection: Connection }) {
             The replica receives the cluster auth registry and backup configuration
             automatically; they stay dormant until this node is promoted.
           </p>
+          <details className="docker-help" open>
+            <summary>Run the new replica in Docker</summary>
+            <ol>
+              <li>Create the pairing code above and keep the one-time code.</li>
+              <li>
+                Prepare a writable auth file in the container's data volume. The replica
+                receives the primary's auth registry after joining, but TCP requires
+                <code> NONODB_AUTH_FILE</code> at startup.
+              </li>
+              <li>
+                Publish the replica API on a host port and set
+                <code> NONODB_REPLICATION_ADVERTISE_URL</code> to that host address.
+                Do not advertise the container IP (<code>172.x</code>): the primary
+                cannot reach it. Docker NAT also prevents the automatic LAN fallback.
+              </li>
+              <li>
+                Run the join command inside the container. The daemon must already be
+                running; the CLI talks to its Unix socket, not to the primary directly.
+              </li>
+            </ol>
+            <pre className="docker-command">{`docker volume create nonodb-replica-data
+docker volume create nonodb-replica-run
+
+docker run --rm \
+  -v nonodb-replica-data:/var/lib/nonodb \
+  -e NONODB_AUTH_FILE=/var/lib/nonodb/auth.json \
+  ghcr.io/essmos/nonodb:0.25.0-rc.3 \
+  nonodb-cli auth init
+
+docker run -d --name nonodb-replica \
+  -p 7912:7878 \
+  -v nonodb-replica-data:/var/lib/nonodb \
+  -v nonodb-replica-run:/run/nonodb \
+  -e NONODB_AUTH_FILE=/var/lib/nonodb/auth.json \
+  -e NONODB_TCP=0.0.0.0:7878 \
+  -e NONODB_REPLICATION_ROLE=replica \
+  -e NONODB_REPLICATION_NODE_ID=replica-docker \
+  -e NONODB_REPLICATION_ADVERTISE_URL=http://DOCKER_HOST_IP:7912 \
+  ghcr.io/essmos/nonodb:0.25.0-rc.3
+
+docker exec nonodb-replica nonodb-cli replication join \
+  http://PRIMARY_HOST:7878 PAIRING-CODE
+
+docker exec nonodb-replica nonodb-cli replication status`}</pre>
+            <p className="field-hint">
+              Replace <code>DOCKER_HOST_IP</code> with the Docker host's LAN address,
+              <code> PRIMARY_HOST</code> with the primary's API host (not the GUI proxy),
+              and <code>PAIRING-CODE</code> with the code above. The primary GUI adds the
+              replica after its first acknowledgement and probes it for metrics.
+            </p>
+          </details>
           <div className="form-grid">
             <label>Replica name<input value={pairName} onChange={(e) => setPairName(e.target.value)} placeholder="replica-eu" />
               <span className="field-hint">Used for the replicated principal name and audit records.</span>

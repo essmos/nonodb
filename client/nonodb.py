@@ -43,6 +43,13 @@ _READ_OPS = {
     "find_one",
     "lookup",
     "count",
+    "aggregate",
+    "cursor_aggregate",
+    "cursor_find",
+    "get_more",
+    "close_cursor",
+    "watch",
+    "explain",
     "list_indexes",
     "list_collections",
     "get_collection_ttl",
@@ -75,6 +82,24 @@ def _loads(data: bytes) -> Any:
     if _orjson is not None:
         return _orjson.loads(data)
     return json.loads(data)
+
+
+def _sql_is_read(query: Any) -> bool:
+    """Best-effort classification for `/v1/exec` SQL writes."""
+    if not isinstance(query, str):
+        return False
+    text = query.lstrip()
+    while True:
+        if text.startswith("--"):
+            newline = text.find("\n")
+            text = "" if newline < 0 else text[newline + 1 :].lstrip()
+        elif text.startswith("/*"):
+            end = text.find("*/", 2)
+            text = "" if end < 0 else text[end + 2 :].lstrip()
+        else:
+            return text.split(None, 1)[0].lower() in {
+                "select", "explain", "show", "values"
+            } if text else False
 
 
 def _cache_key(payload: dict[str, Any]) -> bytes:
@@ -159,10 +184,13 @@ class Cursor:
 class NonoDBError(Exception):
     """Error returned by the daemon (`ok: false`)."""
 
-    def __init__(self, code: str, message: str):
+    def __init__(self, code: str, message: str, write_url: Optional[str] = None):
         super().__init__(f"{code}: {message}")
         self.code = code
         self.message = message
+        # Set for `read_only`: the primary/write endpoint advertised by the
+        # replica. Callers can use it for their own routing or display.
+        self.write_url = write_url
 
 
 class StreamTruncatedError(NonoDBError):
@@ -191,6 +219,8 @@ class NonoDB:
         client_key: Optional[str] = None,
         ca_cert: Optional[str] = None,
         database: Optional[str] = None,
+        write_url: Optional[str] = None,
+        auto_primary: Optional[bool] = None,
     ):
         if base_url is None:
             if socket_path is None:
@@ -219,7 +249,9 @@ class NonoDB:
         tls_verify = ca_cert if ca_cert else verify
         # httpx 0.28 returns early when `verify` is a CA path and then does not
         # load `cert`. Build the SSL context explicitly so mTLS works reliably.
-        if transport is None and (client_cert or ca_cert):
+        # This also applies to a TCP write endpoint when the read endpoint uses
+        # a Unix socket.
+        if client_cert or ca_cert:
             if verify is False:
                 tls_verify = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
                 tls_verify.check_hostname = False
@@ -230,12 +262,28 @@ class NonoDB:
                 tls_verify = ssl.create_default_context()
             if client_cert:
                 tls_verify.load_cert_chain(client_cert, client_key)
+        self._timeout = timeout
+        # Used by the optional TCP write client even when reads use a socket.
+        self._tls_verify = tls_verify
         self._http = httpx.Client(
             transport=transport,
             base_url=self.base_url,
             timeout=timeout,
-            verify=tls_verify if transport is None else True,
+            verify=self._tls_verify,
         )
+        if write_url is None:
+            write_url = os.environ.get("NONODB_WRITE_URL")
+        self._write_base_url = write_url.rstrip("/") if write_url else None
+        if auto_primary is None:
+            auto_primary = os.environ.get("NONODB_AUTO_PRIMARY", "").lower() in (
+                "1", "true", "yes", "on"
+            )
+        self._auto_primary = bool(auto_primary)
+        self._write_http: Optional[httpx.Client] = None
+        self._retired_write_http: list[httpx.Client] = []
+        self._write_lock = threading.Lock()
+        if self._write_base_url:
+            self._write_http = self._make_http(self._write_base_url)
         # Optional read cache. Disabled by default (cache_ttl=0).
         # TTL bounds staleness for data written by other processes;
         # every write through this instance clears the whole cache.
@@ -247,6 +295,70 @@ class NonoDB:
     # -- lifecycle ---------------------------------------------------
     def close(self) -> None:
         self._http.close()
+        if self._write_http is not None and self._write_http is not self._http:
+            self._write_http.close()
+        for client in self._retired_write_http:
+            client.close()
+        self._retired_write_http.clear()
+
+    def _make_http(self, base_url: str) -> httpx.Client:
+        return httpx.Client(
+            base_url=base_url,
+            timeout=self._timeout,
+            verify=self._tls_verify,
+        )
+
+    def _set_write_url(self, url: str) -> None:
+        url = url.strip().rstrip("/")
+        if not url or url == self._write_base_url:
+            return
+        with self._write_lock:
+            if url == self._write_base_url:
+                return
+            old = self._write_http
+            self._write_base_url = url
+            # A replica's write URL is always a TCP endpoint; never reuse the
+            # Unix-socket transport for it.
+            self._write_http = self._make_http(url)
+            if old is not None and old is not self._http:
+                # Keep in-flight redirected requests alive; close on shutdown.
+                self._retired_write_http.append(old)
+
+    def _discover_write_url(self) -> Optional[str]:
+        """Read the advertised primary endpoint from the connected replica."""
+        try:
+            resp = self._http.get(self.base_url + "/readyz")
+        except httpx.HTTPError:
+            return None
+        if resp.status_code != 200:
+            return None
+        try:
+            body = _loads(resp.content)
+        except ValueError:
+            return None
+        replication = body.get("replication") or {}
+        url = replication.get("write_url") or body.get("write_url")
+        return str(url).rstrip("/") if url else None
+
+    def _write_target(self) -> tuple[httpx.Client, str]:
+        if self._write_http is None and self._auto_primary:
+            url = self._discover_write_url()
+            if url:
+                self._set_write_url(url)
+        if self._write_http is not None and self._write_base_url:
+            return self._write_http, self._write_base_url
+        # No separate write endpoint: use the connected node. If it is a
+        # replica, the daemon returns read_only with a write_url hint.
+        return self._http, self.base_url
+
+    def _is_write(self, payload: dict[str, Any]) -> bool:
+        op = payload.get("op")
+        if op == "batch":
+            ops = payload.get("ops") or []
+            return any(self._is_write(item) for item in ops if isinstance(item, dict))
+        if op == "sql":
+            return not _sql_is_read(payload.get("query"))
+        return op not in _READ_OPS
 
     def __enter__(self) -> "NonoDB":
         return self
@@ -307,19 +419,23 @@ class NonoDB:
         # Reads are retried after a transport error; writes are not (duplicate risk).
         retries = 2 if op in _RETRY_OPS else 0
         attempt = 0
+        redirected = False
         while True:
+            is_write = self._is_write(payload)
+            client, base_url = (
+                self._write_target() if is_write else (self._http, self.base_url)
+            )
             try:
                 headers = {"content-type": "application/json"}
                 if extra_headers:
                     headers.update(extra_headers)
                 if self.token:
                     headers["authorization"] = f"Bearer {self.token}"
-                resp = self._http.post(
-                    self.base_url + self._data_path("/v1/exec"),
+                resp = client.post(
+                    base_url + self._data_path("/v1/exec"),
                     content=_dumps(payload),
                     headers=headers,
                 )
-                break
             except httpx.TransportError as exc:
                 if attempt >= retries:
                     # Daemon unavailable / broken connection - always our own type,
@@ -327,16 +443,39 @@ class NonoDB:
                     raise NonoDBError("connection", str(exc)) from exc
                 attempt += 1
                 time.sleep(0.01 * attempt)
-        try:
-            body = _loads(resp.content)
-        except ValueError:
-            raise NonoDBError(
-                "invalid_response", f"HTTP {resp.status_code}: {resp.text[:200]}"
-            )
-        if not body.get("ok"):
+                continue
+
+            try:
+                body = _loads(resp.content)
+            except ValueError:
+                raise NonoDBError(
+                    "invalid_response", f"HTTP {resp.status_code}: {resp.text[:200]}"
+                )
+            if body.get("ok"):
+                return body.get("result")
+
             err = body.get("error") or {}
-            raise NonoDBError(err.get("code", "error"), err.get("message", ""))
-        return body.get("result")
+            write_url = err.get("write_url") or resp.headers.get("location")
+            # A replica explicitly rejected the write without applying it.
+            # Retry exactly once against the advertised primary. Never do this
+            # for transport errors or 5xx responses, where the write may have
+            # committed but the response was lost.
+            if (
+                is_write
+                and err.get("code") == "read_only"
+                and write_url
+                and not redirected
+                and (self._auto_primary or self._write_base_url is not None)
+                and str(write_url).rstrip("/") != base_url.rstrip("/")
+            ):
+                self._set_write_url(str(write_url))
+                redirected = True
+                continue
+            raise NonoDBError(
+                err.get("code", "error"),
+                err.get("message", ""),
+                write_url=str(write_url).rstrip("/") if write_url else None,
+            )
 
     def health(self) -> bool:
         try:

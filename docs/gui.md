@@ -416,6 +416,45 @@ but a non-default `NONODB_TCP` port is valid. Never use the GUI proxy port
 8. Revoke unused codes in the **Pending pairings** list. Codes are single-use
    and expire after 10 minutes.
 
+#### Replica in Docker
+
+Docker NAT hides the container's `172.x` address from the primary, so set
+`NONODB_REPLICATION_ADVERTISE_URL` to the Docker host's LAN address and publish
+the daemon API port. Initialize an auth file before starting the daemon because
+TCP requires `NONODB_AUTH_FILE` at startup; the cluster auth registry replaces
+it after the replica joins.
+
+```bash
+docker volume create nonodb-replica-data
+docker volume create nonodb-replica-run
+
+docker run --rm \
+  -v nonodb-replica-data:/var/lib/nonodb \
+  -e NONODB_AUTH_FILE=/var/lib/nonodb/auth.json \
+  ghcr.io/essmos/nonodb:0.25.0-rc.3 \
+  nonodb-cli auth init
+
+docker run -d --name nonodb-replica \
+  -p 7912:7878 \
+  -v nonodb-replica-data:/var/lib/nonodb \
+  -v nonodb-replica-run:/run/nonodb \
+  -e NONODB_AUTH_FILE=/var/lib/nonodb/auth.json \
+  -e NONODB_TCP=0.0.0.0:7878 \
+  -e NONODB_REPLICATION_ROLE=replica \
+  -e NONODB_REPLICATION_NODE_ID=replica-docker \
+  -e NONODB_REPLICATION_ADVERTISE_URL=http://DOCKER_HOST_IP:7912 \
+  ghcr.io/essmos/nonodb:0.25.0-rc.3
+
+docker exec nonodb-replica nonodb-cli replication join \
+  http://PRIMARY_HOST:7878 PAIRING-CODE
+
+docker exec nonodb-replica nonodb-cli replication status
+```
+
+Replace `DOCKER_HOST_IP`, `PRIMARY_HOST`, and `PAIRING-CODE` with the values for
+your network. Do not advertise `127.0.0.1` or the container's `172.x` address,
+and use the primary daemon API port, not the GUI proxy port.
+
 Replicas also receive the cluster auth registry, backup jobs/state, database
 catalog, and cluster peer token. They remain read-only and do not run backup,
 TTL, history-pruning, or subscription services until promoted. When log capture

@@ -580,8 +580,10 @@ GET /readyz/write
 ```
 
 `GET /readyz/write` returns the write URL and readiness. A read-only node also
-returns a `Location` header on rejected writes, so clients and proxies can
-retry against the new primary.
+returns a `Location` header and `error.write_url` on rejected writes. The
+official clients support `write_url`/`auto_primary`; see
+[Clients](clients.md#routing-writes-to-the-primary). Proxies can retry once
+against the new primary.
 
 Example load-balancer rule:
 
@@ -774,16 +776,17 @@ Important metrics:
 
 ```text
 nonodb_replication_enabled
-nonodb_replication_head
 nonodb_replication_role{role="primary|replica|standby"}
-nonodb_replication_applied{origin="..."}
-nonodb_replication_applied_epoch{origin="..."}
-nonodb_replication_lag{origin="..."}
-nonodb_replication_source_head{origin="..."}
-nonodb_replication_ack_nodes
-nonodb_replication_min_ack
-nonodb_replication_ack_seq{node="..."}
-nonodb_replication_ack_age_seconds{node="..."}
+nonodb_replication_epoch
+nonodb_replication_origin_info{origin="..."}
+nonodb_replication_head{database="..."}
+nonodb_replication_applied{database="...",origin="..."}
+nonodb_replication_applied_epoch{database="...",origin="..."}
+nonodb_replication_lag{database="...",origin="..."}
+nonodb_replication_ack_nodes{database="...",origin="..."}
+nonodb_replication_min_ack{database="...",origin="..."}
+nonodb_replication_ack_seq{database="...",origin="...",node="..."}
+nonodb_replication_ack_age_seconds{database="...",origin="...",node="..."}
 nonodb_replication_transport_errors_total
 nonodb_replication_apply_errors_total
 nonodb_replication_applied_total

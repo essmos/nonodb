@@ -66,9 +66,13 @@ Implemented:
 - optional vault collections with per-tenant whole-document encryption;
 - asynchronous primary/replica replication over HTTP/TLS with durable ordered
   operations, snapshot bootstrap, metadata/index/history/events/subscriptions,
-  replica acks, retention, quorum promotion, leases, automatic election, write
-  routing, and a cluster-wide GUI;
-- Python client, Docker image, systemd unit;
+  replica acks, retention, quorum promotion, leases, automatic election,
+  in-place hard resync, pause/resume/disconnect, write routing, and a
+  cluster-wide GUI;
+- configurable parallel index backfill and automatic index builds;
+- optional Network GUI/API with a dedicated nftables table, advertised replica
+  URL discovery, and a per-user daemon instance registry;
+- Python, Rust, Node.js, and Go clients, Docker image, systemd unit;
 - unit, property, integration, concurrency, crash, search, and large-data tests.
 
 ## Deliberate limitations
@@ -84,8 +88,10 @@ Implemented:
 - **One writer.** All writes are serialized. This is a design choice, not a
   temporary limitation.
 - **Replication is asynchronous and primary/replica, not multi-writer.** Sharding
-  and cross-database transactions are not implemented. Vault data, auth, backup
-  jobs, and database create/drop are not replicated. See the
+  and cross-database transactions are not implemented. The control plane
+  replicates auth, backup jobs/state, the database catalog, and the cluster peer
+  token; encrypted vault envelopes also replicate. Backup artifacts, TLS private
+  keys, mode files, node-local settings, and audit logs do not. See the
   [replication and cluster guide](replication-cluster-guide.md).
 
 ### Query language
@@ -249,9 +255,9 @@ project's target workload.
 1. **Raw JSON passthrough for simple reads.** For `find` without projection or
    sorting, stream stored JSON bytes directly into the response instead of
    parsing to `Value` and reserializing. Expected read-path win.
-2. **Backfill memory and thread controls.** Add configurable worker counts and
-   incremental writes instead of buffering many entries, reducing peak RAM on
-   very large index builds.
+2. **Incremental index backfill writes.** Keep configurable worker counts, but
+   write index entries incrementally instead of buffering many entries,
+   reducing peak RAM on very large builds.
 3. **More update operators.** `$rename`, `$min`, `$max`,
    `$mul`, `$currentDate`.
 4. **Reindex tooling.** A command to rebuild text/fuzzy indexes after analyzer
@@ -262,8 +268,8 @@ project's target workload.
 
 ### Medium value
 
-6. **Users and roles**, or at least per-collection tokens and mapping mTLS
-   certificate identities to authorization scopes.
+6. **Role hierarchy and inherited groups.** Principal tokens, database-qualified
+   scopes, and mTLS-to-principal mapping already exist.
 7. **Point-in-time recovery / WAL** for stricter durability and recovery
    objectives.
 8. **Stop words, stemming, and per-index analyzers**; possibly an integration
@@ -283,7 +289,8 @@ project's target workload.
 
 14. Sparse/partial and wildcard indexes.
 15. Approximate vector indexes (HNSW/IVF/PQ) and polygon/line document geo indexes.
-16. A published Python package and additional language clients.
+16. Published package-registry releases for the existing Python, Rust, Node.js,
+    and Go clients.
 17. Benchmark automation in CI.
 18. Shared or hosted web administration beyond the embedded local GUI.
 

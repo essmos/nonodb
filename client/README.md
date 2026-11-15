@@ -10,6 +10,18 @@ examples. All clients accept `NONODB_TLS_CA`, `NONODB_TLS_CLIENT_CERT`, and
 `NONODB_TLS_CLIENT_KEY` when connecting to a daemon that requires client
 certificates.
 
+## Write routing
+
+All clients accept a separate primary endpoint for writes and can discover it
+from a replica's `/readyz`. Reads continue to use the socket/base URL. See
+[Clients](../docs/clients.md#routing-writes-to-the-primary).
+
+```bash
+export NONODB_WRITE_URL=https://primary.internal:7878
+export NONODB_AUTO_PRIMARY=1
+export NONODB_TOKEN='nodb_...'
+```
+
 ## Databases
 
 All clients accept an explicit database and read `NONODB_DB` as a fallback. The

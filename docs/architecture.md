@@ -20,7 +20,7 @@ nonodb is built around a small set of explicit goals:
 5. **A familiar document API.** JSON documents, MongoDB-like filters, and a
    practical subset of update operators.
 6. **Small operational footprint.** One binary, one data directory, one socket,
-   no JVM, no cluster, no separate cache.
+   no JVM, no external cluster service, no separate cache.
 7. **Explicit write semantics.** One writer, group commit, and an explicit
    all-or-nothing `write_batch` instead of general interactive transactions.
 

@@ -43,10 +43,77 @@ TCP always requires an auth registry. Use `NONODB_TOKEN`, a registered client
 certificate, or both (they must resolve to the same principal). The Unix socket
 does not require a token and maps to the local administrative principal.
 
-All clients return a typed error for daemon errors (`ok: false`). Writes are not
-retried automatically; read operations are retried after a transport failure,
-because retrying a write could duplicate it. Use `write_batch` when several
-writes must succeed or fail together.
+All clients return a typed error for daemon errors (`ok: false`). Read
+operations are retried after a transport failure. Writes are never retried after
+an ambiguous transport error or `5xx`, because the write may have committed and
+only the response was lost. Use `write_batch` when several writes must succeed
+or fail together.
+
+## Routing writes to the primary
+
+A replica rejects writes with HTTP 403 and `error.code = "read_only"`. The
+response includes the current primary in the `Location` header and in
+`error.write_url`. Clients can use a custom write endpoint, or discover it from
+the replica automatically:
+
+```bash
+export NONODB_WRITE_URL=https://primary.internal:7878
+export NONODB_AUTO_PRIMARY=1
+export NONODB_TOKEN='nodb_...'
+```
+
+When `write_url` is configured, reads keep using the socket/base URL and writes
+go directly to the primary. When `auto_primary` is enabled, the client reads
+`/readyz.replication.write_url`; if a stale write endpoint still answers
+`read_only`, the client retries that single write once against the advertised
+primary.
+
+A retry only happens after an explicit `403 read_only`, which guarantees the
+replica did not apply the write. It never happens after a timeout, a connection
+error, or `5xx`. The primary endpoint normally requires a bearer token, so a
+Unix-socket client must also be given `NONODB_TOKEN` or `token`/`WithToken` to
+write remotely.
+
+```python
+db = NonoDB(
+    "/run/nonodb.sock",             # reads from the local replica
+    write_url="https://primary.internal:7878",
+    token="nodb_...",
+    auto_primary=True,              # or omit write_url and discover it
+)
+```
+
+```rust
+let db = Client::builder()
+    .socket_path("/run/nonodb.sock")
+    .write_url("https://primary.internal:7878")
+    .token("nodb_...")
+    .auto_primary(true)
+    .build()?;
+```
+
+```js
+const db = new NonoDB({
+  socketPath: '/run/nonodb.sock',
+  writeUrl: 'https://primary.internal:7878',
+  token: 'nodb_...',
+  autoPrimary: true,
+});
+```
+
+```go
+db := nonodb.New(
+    nonodb.WithSocketPath("/run/nonodb.sock"),
+    nonodb.WithWriteURL("https://primary.internal:7878"),
+    nonodb.WithToken("nodb_..."),
+    nonodb.WithAutoPrimary(true),
+)
+```
+
+Cursor operations (`cursor_find`, `cursor_aggregate`, `get_more`,
+`close_cursor`) and subscriptions stay on the node that created them; route
+those workloads to the same node. A mixed `batch` containing any write is sent
+to the primary as a whole.
 
 ## Databases
 

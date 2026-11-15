@@ -1853,6 +1853,41 @@ select {
   transition: width 0.3s ease;
 }
 
+.docker-help {
+  margin-top: 14px;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel-2);
+}
+.docker-help summary {
+  cursor: pointer;
+  color: var(--accent);
+  font-weight: 600;
+}
+.docker-help ol {
+  margin: 10px 0 0 1.2rem;
+  padding: 0;
+  color: var(--muted);
+  font-size: 0.82rem;
+  line-height: 1.5;
+}
+.docker-help li + li {
+  margin-top: 5px;
+}
+.docker-command {
+  margin: 12px 0 0;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #010409;
+  color: var(--text);
+  overflow: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.76rem;
+  line-height: 1.45;
+}
+
 .pairing-box {
   margin-top: 14px;
   padding: 16px;

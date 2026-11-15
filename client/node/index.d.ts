@@ -9,6 +9,10 @@ export interface ClientOptions {
   clientCert?: string;
   clientKey?: string;
   caCert?: string;
+  /** Separate primary endpoint for writes; reads keep using socketPath/baseUrl. */
+  writeUrl?: string;
+  /** Discover `/readyz.replication.write_url` and retry one write after read_only. */
+  autoPrimary?: boolean;
 }
 
 export interface FindOptions {
@@ -58,6 +62,8 @@ export class NonoDBError extends Error {
   code: string;
   statusCode: number;
   oldest?: string | null;
+  /** Primary endpoint advertised on `read_only`. */
+  writeUrl?: string;
 }
 
 export class NonoDB {
@@ -79,7 +85,7 @@ export class NonoDB {
 export interface BatchEntry {
   ok: boolean;
   result?: any;
-  error?: { code: string; message: string };
+  error?: { code: string; message: string; write_url?: string };
 }
 
 export class Collection {

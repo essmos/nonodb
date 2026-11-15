@@ -21,6 +21,7 @@
 use std::fmt;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -30,7 +31,12 @@ use serde_json::{json, Value};
 #[derive(Debug)]
 pub enum Error {
     /// The daemon returned `{"ok": false, "error": {"code", "message"}}`.
-    Api { code: String, message: String },
+    Api {
+        code: String,
+        message: String,
+        /// Primary endpoint advertised for `read_only` errors.
+        write_url: Option<String>,
+    },
     /// Transport or HTTP-layer error.
     Http(reqwest::Error),
     /// JSON serialization/deserialization error.
@@ -44,7 +50,7 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::Api { code, message } => write!(f, "{code}: {message}"),
+            Error::Api { code, message, .. } => write!(f, "{code}: {message}"),
             Error::Http(err) => write!(f, "{err}"),
             Error::Json(err) => write!(f, "{err}"),
             Error::InvalidResponse(message) => write!(f, "invalid response: {message}"),
@@ -90,6 +96,8 @@ pub struct ClientBuilder {
     client_cert: Option<PathBuf>,
     client_key: Option<PathBuf>,
     ca_cert: Option<PathBuf>,
+    write_url: Option<String>,
+    auto_primary: Option<bool>,
 }
 
 impl ClientBuilder {
@@ -152,6 +160,20 @@ impl ClientBuilder {
         self
     }
 
+    /// Route writes to a separate primary endpoint while reads keep using the
+    /// configured socket or base URL. Defaults to `NONODB_WRITE_URL`.
+    pub fn write_url(mut self, url: impl Into<String>) -> Self {
+        self.write_url = Some(url.into().trim_end_matches('/').to_string());
+        self
+    }
+
+    /// Discover the write endpoint from `/readyz` and retry a write once after
+    /// an explicit `read_only` response. Defaults to `NONODB_AUTO_PRIMARY`.
+    pub fn auto_primary(mut self, enabled: bool) -> Self {
+        self.auto_primary = Some(enabled);
+        self
+    }
+
     /// Build the client.
     pub fn build(self) -> Result<Client> {
         let base_url_given = self.base_url.is_some();
@@ -210,6 +232,13 @@ impl ClientBuilder {
         let ca_cert = self
             .ca_cert
             .or_else(|| std::env::var_os("NONODB_TLS_CA").map(PathBuf::from));
+        let write_config = WriteConfig {
+            timeout,
+            verify,
+            client_cert: client_cert.clone(),
+            client_key: client_key.clone(),
+            ca_cert: ca_cert.clone(),
+        };
 
         let mut builder = reqwest::blocking::Client::builder()
             .timeout(timeout)
@@ -248,14 +277,84 @@ impl ClientBuilder {
         };
 
         let http = builder.build()?;
+        let write_url = self
+            .write_url
+            .or_else(|| std::env::var("NONODB_WRITE_URL").ok())
+            .map(|url| url.trim_end_matches('/').to_string())
+            .filter(|url| !url.is_empty());
+        let auto_primary = self.auto_primary.unwrap_or_else(|| {
+            matches!(
+                std::env::var("NONODB_AUTO_PRIMARY")
+                    .unwrap_or_default()
+                    .to_ascii_lowercase()
+                    .as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        });
+        let write_http = match &write_url {
+            Some(_) => Some(build_tcp_client(&write_config)?),
+            None => None,
+        };
         Ok(Client {
             http,
             base_url,
             database,
             token,
             vault: None,
+            write: Arc::new(RwLock::new(WriteRoute {
+                base_url: write_url.unwrap_or_default(),
+                http: write_http,
+            })),
+            write_config,
+            auto_primary,
         })
     }
+}
+
+#[derive(Clone, Default)]
+struct WriteConfig {
+    timeout: Duration,
+    verify: bool,
+    client_cert: Option<PathBuf>,
+    client_key: Option<PathBuf>,
+    ca_cert: Option<PathBuf>,
+}
+
+#[derive(Clone, Default)]
+struct WriteRoute {
+    base_url: String,
+    http: Option<reqwest::blocking::Client>,
+}
+
+fn build_tcp_client(config: &WriteConfig) -> Result<reqwest::blocking::Client> {
+    let mut builder = reqwest::blocking::Client::builder()
+        .timeout(config.timeout)
+        .danger_accept_invalid_certs(!config.verify);
+    if let Some(path) = &config.ca_cert {
+        let pem = fs::read(path)
+            .map_err(|e| Error::Config(format!("cannot read {}: {e}", path.display())))?;
+        let cert = reqwest::Certificate::from_pem(&pem)?;
+        builder = builder.add_root_certificate(cert);
+    }
+    match (&config.client_cert, &config.client_key) {
+        (Some(cert), Some(key)) => {
+            let mut pem = fs::read(cert)
+                .map_err(|e| Error::Config(format!("cannot read {}: {e}", cert.display())))?;
+            pem.push(b'\n');
+            pem.extend(
+                fs::read(key)
+                    .map_err(|e| Error::Config(format!("cannot read {}: {e}", key.display())))?,
+            );
+            builder = builder.identity(reqwest::Identity::from_pem(&pem)?);
+        }
+        (None, None) => {}
+        _ => {
+            return Err(Error::Config(
+                "client_cert and client_key must be provided together".into(),
+            ))
+        }
+    }
+    Ok(builder.build()?)
 }
 
 #[derive(Clone)]
@@ -273,6 +372,9 @@ pub struct Client {
     database: String,
     token: Option<String>,
     vault: Option<VaultHeaders>,
+    write: Arc<RwLock<WriteRoute>>,
+    write_config: WriteConfig,
+    auto_primary: bool,
 }
 
 impl Client {
@@ -307,20 +409,105 @@ impl Client {
 
     /// Execute an arbitrary `/v1/exec` payload and return its `result`.
     pub fn exec(&self, payload: Value) -> Result<Value> {
-        let attempts = if is_read_op(&payload) { 3 } else { 1 };
+        let is_write = is_write_op(&payload);
+        let attempts = if is_write { 1 } else { 3 };
+        let mut redirected = false;
+        let mut attempt = 0;
         let mut last_error = None;
-        for attempt in 0..attempts {
-            match self.exec_once(&payload) {
+        while attempt < attempts {
+            let (base_url, http) = if is_write {
+                self.write_target()?
+            } else {
+                (self.base_url.clone(), self.http.clone())
+            };
+            match self.exec_once(&payload, &base_url, &http) {
                 Ok(result) => return Ok(result),
-                Err(Error::Http(err)) if attempt + 1 < attempts => {
+                Err(Error::Api {
+                    code,
+                    write_url,
+                    message,
+                }) if is_write
+                    && code == "read_only"
+                    && write_url.is_some()
+                    && !redirected
+                    && (self.auto_primary || self.has_write_route()) =>
+                {
+                    let url = write_url.unwrap_or_default();
+                    let url = url.trim_end_matches('/').to_string();
+                    if !url.is_empty() && url != base_url.trim_end_matches('/') {
+                        self.set_write_url(&url)?;
+                        redirected = true;
+                        // This is a redirect, not one of the read retries.
+                        continue;
+                    }
+                    return Err(Error::Api {
+                        code,
+                        message,
+                        write_url: Some(url),
+                    });
+                }
+                Err(Error::Http(err)) if !is_write && attempt + 1 < attempts => {
                     last_error = Some(Error::Http(err));
-                    std::thread::sleep(Duration::from_millis(10 * (attempt as u64 + 1)));
+                    attempt += 1;
+                    std::thread::sleep(Duration::from_millis(10 * (attempt as u64)));
                 }
                 Err(err) => return Err(err),
             }
+            attempt += 1;
         }
         Err(last_error
             .unwrap_or_else(|| Error::InvalidResponse("request failed without an error".into())))
+    }
+
+    fn has_write_route(&self) -> bool {
+        let route = self.write.read().unwrap_or_else(|err| err.into_inner());
+        !route.base_url.is_empty()
+    }
+
+    fn discover_write_url(&self) -> Option<String> {
+        let response = self
+            .http
+            .get(format!("{}/readyz", self.base_url))
+            .send()
+            .ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        let body: Value = response.json().ok()?;
+        let url = body
+            .pointer("/replication/write_url")
+            .or_else(|| body.get("write_url"))
+            .and_then(Value::as_str)?;
+        Some(url.trim_end_matches('/').to_string())
+    }
+
+    fn set_write_url(&self, url: &str) -> Result<()> {
+        let http = build_tcp_client(&self.write_config)?;
+        let mut route = self.write.write().unwrap_or_else(|err| err.into_inner());
+        route.base_url = url.trim_end_matches('/').to_string();
+        route.http = Some(http);
+        Ok(())
+    }
+
+    fn write_target(&self) -> Result<(String, reqwest::blocking::Client)> {
+        {
+            let route = self.write.read().unwrap_or_else(|err| err.into_inner());
+            if !route.base_url.is_empty() {
+                if let Some(http) = &route.http {
+                    return Ok((route.base_url.clone(), http.clone()));
+                }
+            }
+        }
+        if self.auto_primary {
+            if let Some(url) = self.discover_write_url() {
+                self.set_write_url(&url)?;
+                let route = self.write.read().unwrap_or_else(|err| err.into_inner());
+                if let Some(http) = &route.http {
+                    return Ok((route.base_url.clone(), http.clone()));
+                }
+            }
+        }
+        Ok((self.base_url.clone(), self.http.clone()))
     }
 
     fn data_path(&self, path: &str) -> String {
@@ -331,10 +518,14 @@ impl Client {
         }
     }
 
-    fn exec_once(&self, payload: &Value) -> Result<Value> {
-        let mut request = self
-            .http
-            .post(format!("{}{}", self.base_url, self.data_path("/v1/exec")))
+    fn exec_once(
+        &self,
+        payload: &Value,
+        base_url: &str,
+        http: &reqwest::blocking::Client,
+    ) -> Result<Value> {
+        let mut request = http
+            .post(format!("{}{}", base_url, self.data_path("/v1/exec")))
             .json(payload);
         if let Some(token) = &self.token {
             request = request.bearer_auth(token);
@@ -347,6 +538,11 @@ impl Client {
         }
         let response = request.send()?;
         let status = response.status();
+        let location = response
+            .headers()
+            .get("location")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
         let bytes = response.bytes()?;
         let body: Value = serde_json::from_slice(&bytes).map_err(|_| {
             Error::InvalidResponse(format!(
@@ -356,6 +552,11 @@ impl Client {
         })?;
         if body.get("ok").and_then(Value::as_bool) != Some(true) {
             let error = body.get("error").cloned().unwrap_or(Value::Null);
+            let write_url = error
+                .get("write_url")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or(location);
             return Err(Error::Api {
                 code: error
                     .get("code")
@@ -367,6 +568,7 @@ impl Client {
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string(),
+                write_url,
             });
         }
         Ok(body.get("result").cloned().unwrap_or(Value::Null))
@@ -663,15 +865,56 @@ fn value_array(value: Value) -> Result<Vec<Value>> {
     }
 }
 
+fn sql_is_read(query: Option<&str>) -> bool {
+    let Some(mut text) = query else {
+        return false;
+    };
+    loop {
+        text = text.trim_start();
+        if let Some(rest) = text.strip_prefix("--") {
+            text = rest.split_once('\n').map_or("", |(_, tail)| tail);
+        } else if let Some(rest) = text.strip_prefix("/*") {
+            text = rest.split_once("*/").map_or("", |(_, tail)| tail);
+        } else {
+            break;
+        }
+    }
+    text.split_whitespace().next().is_some_and(|keyword| {
+        matches!(
+            keyword.to_ascii_lowercase().as_str(),
+            "select" | "explain" | "show" | "values"
+        )
+    })
+}
+
+fn is_write_op(payload: &Value) -> bool {
+    if payload.get("op").and_then(Value::as_str) == Some("sql") {
+        return !sql_is_read(payload.get("query").and_then(Value::as_str));
+    }
+    if payload.get("op").and_then(Value::as_str) == Some("batch") {
+        return payload
+            .get("ops")
+            .and_then(Value::as_array)
+            .is_some_and(|ops| ops.iter().any(is_write_op));
+    }
+    !is_read_op(payload)
+}
+
 fn is_read_op(payload: &Value) -> bool {
     matches!(
         payload.get("op").and_then(Value::as_str),
         Some(
             "find"
                 | "find_one"
+                | "lookup"
                 | "watch"
                 | "count"
                 | "aggregate"
+                | "cursor_aggregate"
+                | "cursor_find"
+                | "get_more"
+                | "close_cursor"
+                | "explain"
                 | "list_indexes"
                 | "list_collections"
                 | "list_text_indexes"
@@ -682,6 +925,10 @@ fn is_read_op(payload: &Value) -> bool {
                 | "vector_search"
                 | "history"
                 | "get_version"
+                | "get_collection_ttl"
+                | "get_collection_history"
+                | "get_collection_events"
+                | "list_subscriptions"
                 | "sql"
                 | "explain_sql"
                 | "batch"
@@ -1448,6 +1695,9 @@ mod tests {
             database: "app1".into(),
             token: None,
             vault: None,
+            write: Arc::new(RwLock::new(WriteRoute::default())),
+            write_config: WriteConfig::default(),
+            auto_primary: false,
         };
         assert_eq!(client.data_path("/v1/exec"), "/app1/v1/exec");
         assert_eq!(client.data_path("/healthz"), "/app1/healthz");
@@ -1467,5 +1717,55 @@ mod tests {
         assert!(is_read_op(&json!({"op": "explain_sql"})));
         assert!(!is_read_op(&json!({"op": "write_batch"})));
         assert!(!is_read_op(&json!({"op": "insert"})));
+    }
+
+    #[test]
+    fn sql_writes_are_writes() {
+        assert!(is_write_op(
+            &json!({"op": "sql", "query": "INSERT INTO c (x) VALUES (1)"})
+        ));
+        assert!(is_write_op(&json!({
+            "op": "sql",
+            "query": "/* c */ WITH x AS (SELECT 1) INSERT INTO c SELECT * FROM x"
+        })));
+        assert!(!is_write_op(
+            &json!({"op": "sql", "query": " -- c\n SELECT * FROM c"})
+        ));
+    }
+
+    #[test]
+    fn batch_with_write_is_write() {
+        assert!(is_write_op(&json!({
+            "op": "batch",
+            "ops": [{"op": "find"}, {"op": "insert"}]
+        })));
+        assert!(!is_write_op(&json!({
+            "op": "batch",
+            "ops": [{"op": "find"}, {"op": "count"}]
+        })));
+    }
+
+    #[test]
+    fn cursor_operations_are_reads() {
+        for op in [
+            "get_more",
+            "close_cursor",
+            "cursor_find",
+            "cursor_aggregate",
+        ] {
+            assert!(!is_write_op(&json!({"op": op})), "{op}");
+        }
+    }
+
+    #[test]
+    fn write_url_can_be_configured_without_connecting() {
+        let client = Client::builder()
+            .base_url("http://127.0.0.1:1")
+            .write_url("http://127.0.0.1:2")
+            .auto_primary(true)
+            .build()
+            .unwrap();
+        assert!(client.has_write_route());
+        assert!(client.auto_primary);
     }
 }

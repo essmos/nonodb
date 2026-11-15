@@ -773,6 +773,11 @@ Useful signals:
 | `auth_blocks_total` | IP lockouts started |
 | `auth_blocked_requests_total` | Requests rejected while the IP was blocked |
 | `auth_blocked_clients` | Currently blocked IPs |
+| `nonodb_replication_role{role}` | Configured primary, replica, or standby role |
+| `nonodb_replication_applied` / `nonodb_replication_lag` | Applied source sequence and lag per `database`/`origin` |
+| `nonodb_replication_ack_seq` / `nonodb_replication_ack_age_seconds` | Replica acknowledgements and their age |
+| `nonodb_replication_apply_errors_total` | Replica apply and divergence errors |
+| `nonodb_replication_pruned_total` / `nonodb_replication_retention_runs_total` | Log retention activity |
 
 The health endpoint is public and cheap:
 

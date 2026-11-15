@@ -1141,22 +1141,33 @@ async fn write_location(
         Ok(bytes) => bytes,
         Err(_) => return Response::from_parts(parts, Body::empty()),
     };
-    let read_only = serde_json::from_slice::<Value>(&bytes)
-        .ok()
-        .and_then(|payload| {
-            payload
-                .pointer("/error/code")
-                .and_then(Value::as_str)
-                .map(|code| code == "read_only")
-        })
-        .unwrap_or(false);
-    let mut response = Response::from_parts(parts, Body::from(bytes));
+    let mut payload = serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null);
+    let read_only = payload
+        .pointer("/error/code")
+        .and_then(Value::as_str)
+        .is_some_and(|code| code == "read_only");
+    if read_only {
+        if let Some(object) = payload.get_mut("error").and_then(Value::as_object_mut) {
+            object.insert("write_url".to_string(), Value::String(write_url.clone()));
+        } else if let Some(object) = payload.as_object_mut() {
+            object.insert("write_url".to_string(), Value::String(write_url.clone()));
+        }
+    }
+    let body = if read_only {
+        serde_json::to_vec(&payload).unwrap_or_else(|_| bytes.to_vec())
+    } else {
+        bytes.to_vec()
+    };
+    let mut response = Response::from_parts(parts, Body::from(body));
     if read_only {
         if let Ok(value) = HeaderValue::from_str(&write_url) {
             response
                 .headers_mut()
                 .insert(axum::http::header::LOCATION, value);
         }
+        response
+            .headers_mut()
+            .remove(axum::http::header::CONTENT_LENGTH);
     }
     response
 }

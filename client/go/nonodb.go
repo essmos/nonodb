@@ -21,6 +21,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -31,6 +32,7 @@ const maxResponseBytes = 80 << 20
 type APIError struct {
 	Code       string `json:"code"`
 	Message    string `json:"message"`
+	WriteURL   string `json:"write_url,omitempty"`
 	StatusCode int    `json:"-"`
 }
 
@@ -138,15 +140,17 @@ type VectorIndex struct {
 }
 
 type config struct {
-	socketPath string
-	baseURL    string
-	database   string
-	token      string
-	timeout    time.Duration
-	verify     bool
-	clientCert string
-	clientKey  string
-	caCert     string
+	socketPath  string
+	baseURL     string
+	database    string
+	token       string
+	timeout     time.Duration
+	verify      bool
+	clientCert  string
+	clientKey   string
+	caCert      string
+	writeURL    string
+	autoPrimary bool
 }
 
 // Option configures a Client.
@@ -196,6 +200,25 @@ func WithTLSCA(caFile string) Option {
 	return func(c *config) { c.caCert = caFile }
 }
 
+// WithWriteURL routes writes to a separate primary endpoint while reads keep
+// using the configured socket or base URL.
+func WithWriteURL(url string) Option {
+	return func(c *config) { c.writeURL = strings.TrimRight(url, "/") }
+}
+
+// WithAutoPrimary discovers the write endpoint from the connected replica
+// (`/readyz`) and retries a write once after an explicit read_only response.
+func WithAutoPrimary(enabled bool) Option {
+	return func(c *config) { c.autoPrimary = enabled }
+}
+
+// writeRoute holds the optional primary endpoint used for writes.
+type writeRoute struct {
+	mu      sync.RWMutex
+	baseURL string
+	http    *http.Client
+}
+
 // Client is a thin nonodb client. It is safe for concurrent use.
 type Client struct {
 	baseURL     string
@@ -205,6 +228,10 @@ type Client struct {
 	vaultKeyID  string
 	vaultKey    string
 	http        *http.Client
+	write       *writeRoute
+	autoPrimary bool
+	tlsConfig   *tls.Config
+	timeout     time.Duration
 	initErr     error
 }
 
@@ -212,15 +239,17 @@ type Client struct {
 // NONODB_TOKEN, NONODB_TIMEOUT, and NONODB_TLS_VERIFY.
 func New(options ...Option) *Client {
 	cfg := config{
-		socketPath: os.Getenv("NONODB_SOCK"),
-		baseURL:    strings.TrimRight(os.Getenv("NONODB_URL"), "/"),
-		database:   os.Getenv("NONODB_DB"),
-		token:      os.Getenv("NONODB_TOKEN"),
-		timeout:    envTimeout(),
-		verify:     envVerify(),
-		clientCert: os.Getenv("NONODB_TLS_CLIENT_CERT"),
-		clientKey:  os.Getenv("NONODB_TLS_CLIENT_KEY"),
-		caCert:     os.Getenv("NONODB_TLS_CA"),
+		socketPath:  os.Getenv("NONODB_SOCK"),
+		baseURL:     strings.TrimRight(os.Getenv("NONODB_URL"), "/"),
+		database:    os.Getenv("NONODB_DB"),
+		token:       os.Getenv("NONODB_TOKEN"),
+		timeout:     envTimeout(),
+		verify:      envVerify(),
+		clientCert:  os.Getenv("NONODB_TLS_CLIENT_CERT"),
+		clientKey:   os.Getenv("NONODB_TLS_CLIENT_KEY"),
+		caCert:      os.Getenv("NONODB_TLS_CA"),
+		writeURL:    strings.TrimRight(os.Getenv("NONODB_WRITE_URL"), "/"),
+		autoPrimary: envBool("NONODB_AUTO_PRIMARY"),
 	}
 	for _, option := range options {
 		option(&cfg)
@@ -277,6 +306,13 @@ func New(options ...Option) *Client {
 	if database == "" {
 		database = "default"
 	}
+	route := &writeRoute{baseURL: cfg.writeURL}
+	if route.baseURL != "" {
+		route.http = &http.Client{
+			Transport: &http.Transport{TLSClientConfig: tlsConfig},
+			Timeout:   cfg.timeout,
+		}
+	}
 	return &Client{
 		baseURL:  strings.TrimRight(baseURL, "/"),
 		database: database,
@@ -285,8 +321,90 @@ func New(options ...Option) *Client {
 			Transport: transport,
 			Timeout:   cfg.timeout,
 		},
-		initErr: initErr,
+		write:       route,
+		autoPrimary: cfg.autoPrimary,
+		tlsConfig:   tlsConfig,
+		timeout:     cfg.timeout,
+		initErr:     initErr,
 	}
+}
+
+func envBool(name string) bool {
+	switch strings.ToLower(os.Getenv(name)) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+func (c *Client) setWriteURL(url string) {
+	url = strings.TrimRight(url, "/")
+	if url == "" {
+		return
+	}
+	c.write.mu.Lock()
+	defer c.write.mu.Unlock()
+	if url == c.write.baseURL {
+		return
+	}
+	c.write.baseURL = url
+	c.write.http = &http.Client{
+		Transport: &http.Transport{TLSClientConfig: c.tlsConfig},
+		Timeout:   c.timeout,
+	}
+}
+
+func (c *Client) writeConfigured() bool {
+	c.write.mu.RLock()
+	defer c.write.mu.RUnlock()
+	return c.write.baseURL != ""
+}
+
+func (c *Client) discoverWriteURL(ctx context.Context) string {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/readyz", nil)
+	if err != nil {
+		return ""
+	}
+	response, err := c.http.Do(request)
+	if err != nil {
+		return ""
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return ""
+	}
+	var body struct {
+		WriteURL    string `json:"write_url"`
+		Replication struct {
+			WriteURL string `json:"write_url"`
+		} `json:"replication"`
+	}
+	if err := json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&body); err != nil {
+		return ""
+	}
+	if body.Replication.WriteURL != "" {
+		return strings.TrimRight(body.Replication.WriteURL, "/")
+	}
+	return strings.TrimRight(body.WriteURL, "/")
+}
+
+func (c *Client) writeTarget(ctx context.Context) (string, *http.Client) {
+	c.write.mu.RLock()
+	baseURL, client := c.write.baseURL, c.write.http
+	c.write.mu.RUnlock()
+	if baseURL == "" && c.autoPrimary {
+		if url := c.discoverWriteURL(ctx); url != "" {
+			c.setWriteURL(url)
+			c.write.mu.RLock()
+			baseURL, client = c.write.baseURL, c.write.http
+			c.write.mu.RUnlock()
+		}
+	}
+	if baseURL == "" || client == nil {
+		return c.baseURL, c.http
+	}
+	return baseURL, client
 }
 
 func envTimeout() time.Duration {
@@ -348,18 +466,38 @@ func (c *Client) execRaw(ctx context.Context, payload map[string]any) (json.RawM
 	if c.initErr != nil {
 		return nil, c.initErr
 	}
+	isWrite := isWriteOp(payload)
 	attempts := 1
-	if isReadOp(payload) {
+	if !isWrite {
 		attempts = 3
 	}
+	redirected := false
 	var lastError error
 	for attempt := 0; attempt < attempts; attempt++ {
-		raw, err := c.execOnce(ctx, payload)
+		baseURL, client := c.baseURL, c.http
+		if isWrite {
+			baseURL, client = c.writeTarget(ctx)
+		}
+		raw, err := c.execOnce(ctx, payload, baseURL, client)
 		if err == nil {
 			return raw, nil
 		}
 		var apiError *APIError
-		if errors.As(err, &apiError) || attempt+1 >= attempts {
+		if errors.As(err, &apiError) {
+			// A replica rejected the write without applying it. Retry exactly
+			// once against the advertised primary; never retry ambiguous
+			// transport or 5xx failures, where the write may have committed.
+			if isWrite && apiError.Code == "read_only" && apiError.WriteURL != "" && !redirected &&
+				(c.autoPrimary || c.writeConfigured()) &&
+				strings.TrimRight(apiError.WriteURL, "/") != strings.TrimRight(baseURL, "/") {
+				c.setWriteURL(apiError.WriteURL)
+				redirected = true
+				attempt-- // the redirect is not one of the read retries
+				continue
+			}
+			return nil, err
+		}
+		if attempt+1 >= attempts {
 			return nil, err
 		}
 		lastError = err
@@ -372,7 +510,12 @@ func (c *Client) execRaw(ctx context.Context, payload map[string]any) (json.RawM
 	return nil, lastError
 }
 
-func (c *Client) execOnce(ctx context.Context, payload map[string]any) (json.RawMessage, error) {
+func (c *Client) execOnce(
+	ctx context.Context,
+	payload map[string]any,
+	baseURL string,
+	client *http.Client,
+) (json.RawMessage, error) {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return nil, err
@@ -380,7 +523,7 @@ func (c *Client) execOnce(ctx context.Context, payload map[string]any) (json.Raw
 	request, err := http.NewRequestWithContext(
 		ctx,
 		http.MethodPost,
-		c.baseURL+c.dataPath("/v1/exec"),
+		baseURL+c.dataPath("/v1/exec"),
 		bytes.NewReader(body),
 	)
 	if err != nil {
@@ -395,7 +538,7 @@ func (c *Client) execOnce(ctx context.Context, payload map[string]any) (json.Raw
 		request.Header.Set("x-nonodb-key-id", c.vaultKeyID)
 		request.Header.Set("x-nonodb-key", c.vaultKey)
 	}
-	response, err := c.http.Do(request)
+	response, err := client.Do(request)
 	if err != nil {
 		return nil, err
 	}
@@ -420,18 +563,83 @@ func (c *Client) execOnce(ctx context.Context, payload map[string]any) (json.Raw
 				Message: http.StatusText(response.StatusCode),
 			}
 		}
+		if envelope.Error.WriteURL == "" {
+			envelope.Error.WriteURL = response.Header.Get("Location")
+		}
 		envelope.Error.StatusCode = response.StatusCode
 		return nil, envelope.Error
 	}
 	return envelope.Result, nil
 }
 
+func sqlIsRead(query any) bool {
+	text, ok := query.(string)
+	if !ok {
+		return false
+	}
+	for {
+		text = strings.TrimSpace(text)
+		if strings.HasPrefix(text, "--") {
+			if newline := strings.IndexByte(text, '\n'); newline >= 0 {
+				text = text[newline+1:]
+				continue
+			}
+			return false
+		}
+		if strings.HasPrefix(text, "/*") {
+			if end := strings.Index(text[2:], "*/"); end >= 0 {
+				text = text[2+end+2:]
+				continue
+			}
+			return false
+		}
+		break
+	}
+	fields := strings.Fields(text)
+	if len(fields) == 0 {
+		return false
+	}
+	switch strings.ToLower(fields[0]) {
+	case "select", "explain", "show", "values":
+		return true
+	default:
+		return false
+	}
+}
+
+func isWriteOp(payload map[string]any) bool {
+	if payload["op"] == "sql" {
+		return !sqlIsRead(payload["query"])
+	}
+	if payload["op"] == "batch" {
+		switch ops := payload["ops"].(type) {
+		case []any:
+			for _, item := range ops {
+				if operation, ok := item.(map[string]any); ok && isWriteOp(operation) {
+					return true
+				}
+			}
+		case []map[string]any:
+			for _, operation := range ops {
+				if isWriteOp(operation) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	return !isReadOp(payload)
+}
+
 func isReadOp(payload map[string]any) bool {
 	op, _ := payload["op"].(string)
 	switch op {
-	case "find", "find_one", "lookup", "watch", "count", "list_indexes", "list_collections",
+	case "find", "find_one", "lookup", "watch", "count", "aggregate", "cursor_aggregate", "cursor_find",
+		"get_more", "close_cursor", "explain", "list_indexes", "list_collections",
 		"list_text_indexes", "list_fuzzy_indexes", "list_vector_indexes",
-		"search", "fuzzy", "vector_search", "history", "get_version", "get_collection_history", "get_collection_events", "list_subscriptions", "sql", "explain_sql", "batch":
+		"search", "fuzzy", "vector_search", "history", "get_version",
+		"get_collection_ttl", "get_collection_history", "get_collection_events",
+		"list_subscriptions", "sql", "explain_sql", "map_info", "batch":
 		return true
 	default:
 		return false

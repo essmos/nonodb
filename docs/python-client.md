@@ -113,6 +113,41 @@ Collections, indexes, subscriptions, TTL, history, and events are isolated per
 database. There are no cross-database queries or transactions. See
 [Multiple databases](multi-database.md).
 
+### Write routing
+
+A read replica rejects writes with `403 read_only` and advertises the current
+primary in `Location` and `error.write_url`. Configure a separate write endpoint
+for a local socket client:
+
+```python
+db = NonoDB(
+    "/run/nonodb.sock",                      # reads from the local replica
+    write_url="https://primary.internal:7878",
+    token="nodb_...",                        # primary TCP requires auth
+)
+```
+
+Or let the client discover the primary from `/readyz`:
+
+```python
+db = NonoDB(
+    "/run/nonodb.sock",
+    token="nodb_...",
+    auto_primary=True,
+)
+```
+
+With either option, reads stay on the socket/replica and writes go to the
+primary. If an endpoint still answers `read_only`, the client updates its cached
+primary and retries that one write once. It never retries after a timeout,
+connection failure, or `5xx`, because the write may already have committed.
+`NonoDBError.write_url` is also populated on `read_only` errors for callers that
+want to handle routing themselves.
+
+Environment fallbacks are `NONODB_WRITE_URL` and `NONODB_AUTO_PRIMARY=1`.
+The primary endpoint normally requires `NONODB_TOKEN`, even when reads use the
+Unix socket.
+
 ### Lifecycle
 
 `NonoDB` owns an `httpx.Client`. Close it when the process or application
@@ -837,8 +872,14 @@ Use `cache_ttl=0` for strictly fresh reads.
 ## Retries and errors
 
 The client retries **read operations** up to two times after a transport error,
-with a short backoff. It does **not** retry writes, because a lost response may
-mean the write succeeded and a retry could duplicate it.
+with a short backoff. It does **not** retry writes after an ambiguous transport
+error or `5xx`, because a lost response may mean the write succeeded and a retry
+could duplicate it.
+
+The only automatic write retry is an explicit `403 read_only` response when
+`auto_primary`/`write_url` is configured (or after a stale configured write
+endpoint). In that case the replica did not apply the write, so one retry
+against the advertised primary is safe.
 
 Daemon errors raise `NonoDBError`:
 
@@ -850,6 +891,7 @@ try:
 except NonoDBError as exc:
     print(exc.code)     # e.g. "duplicate_key"
     print(exc.message)
+    print(exc.write_url)  # set for "read_only" if a primary is known
 ```
 
 Transport failures are reported as `NonoDBError("connection", ...)`. Invalid

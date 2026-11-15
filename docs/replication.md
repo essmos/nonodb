@@ -195,25 +195,27 @@ browser.
 
 ## Monitoring
 
-Planned metrics:
+Prometheus metrics are exposed at `/metrics/prometheus` with a `metrics:read`,
+`admin:db`, or `*:*` token. JSON metrics are available at `/metrics`.
 
 ```text
-nonodb_replication_role{node,region}
-nonodb_replication_peer_connected{peer,region}
-nonodb_replication_lag_seconds{peer,region}
-nonodb_replication_lag_bytes{peer,region}
-nonodb_replication_last_sent_seq{peer}
-nonodb_replication_last_applied_seq{peer}
-nonodb_replication_pending_changes{peer}
-nonodb_replication_apply_errors_total{peer}
-nonodb_replication_retries_total{peer}
-nonodb_replication_bytes_total{peer}
-nonodb_replication_tls_handshake_errors_total{peer}
-nonodb_replication_cert_expiry_seconds{peer}
-nonodb_replication_failovers_total
-nonodb_replication_conflicts_total
-nonodb_replication_bootstrap_progress{peer}
-nonodb_replication_log_retention_bytes
+nonodb_replication_enabled
+nonodb_replication_role{role="primary|replica|standby"}
+nonodb_replication_epoch
+nonodb_replication_origin_info{origin="..."}
+nonodb_replication_head{database="..."}
+nonodb_replication_applied{database="...",origin="..."}
+nonodb_replication_applied_epoch{database="...",origin="..."}
+nonodb_replication_lag{database="...",origin="..."}
+nonodb_replication_ack_nodes{database="...",origin="..."}
+nonodb_replication_min_ack{database="...",origin="..."}
+nonodb_replication_ack_seq{database="...",origin="...",node="..."}
+nonodb_replication_ack_age_seconds{database="...",origin="...",node="..."}
+nonodb_replication_transport_errors_total
+nonodb_replication_apply_errors_total
+nonodb_replication_applied_total
+nonodb_replication_pruned_total
+nonodb_replication_retention_runs_total
 ```
 
 Alerts:
@@ -296,12 +298,20 @@ replica needs. `always` installs one on every start; `never` disables bootstrap.
 The snapshot's own replication head becomes the initial applied sequence, so
 changes after that point are pulled normally.
 
-The gap check runs at startup, before the runtime opens. If a gap appears while
+The gap check runs at startup, before the runtime opens. A pruned source log
+therefore installs a fresh snapshot on the next start. If a gap appears while
 the daemon is running, the pull loop reports an error. With
 `NONODB_REPLICATION_EXIT_ON_GAP=1` it also requests a graceful shutdown; a
 supervisor such as systemd, Docker, or Kubernetes restarts the replica and the
 startup gap check installs a fresh snapshot. Without a supervisor, restart the
-replica manually. Hot resync inside one process is still future work.
+replica manually.
+
+A different failure, a sequence mismatch or stale epoch, means the local
+replication log diverged from the source. The replica then performs an in-place
+hard resync: it recreates the affected database and pulls the source log again
+without restarting the process. This is not a zero-downtime snapshot restore;
+serving reads pause while the database is reset. A hot snapshot resync while
+the daemon keeps serving reads is still future work.
 
 ### Changing the source
 
@@ -352,8 +362,11 @@ GET /readyz/write
 
 It returns `200` only on a writable primary. A replica returns `503` and sets
 `Location` to the known primary URL. A write request that reaches a replica and
-fails with `read_only` also includes the same `Location` header, so clients and
-proxies can retry against the current primary. For example, an HAProxy backend check can
+fails with `read_only` also includes the same `Location` header and
+`error.write_url` in the response body, so clients and proxies can retry against
+the current primary. The official clients support `write_url`/`auto_primary` for
+this; see [Clients](clients.md#routing-writes-to-the-primary). For example, an
+HAProxy backend check can
 use `option httpchk GET /readyz/write` with `http-check expect status 200`, so
 only the current primary is selected for writes.
 
@@ -505,7 +518,8 @@ client-supplied and remain outside the control plane.
 - [x] Epoch fencing and source changes.
 - [x] Automatic snapshot resync at startup when the source log was pruned too far.
 - [x] Graceful restart on a runtime gap when `NONODB_REPLICATION_EXIT_ON_GAP=1`.
-- [ ] Hot resync without a process restart.
+- [x] In-place hard resync when the local log diverges from the source.
+- [ ] Hot snapshot resync while the daemon keeps serving reads.
 - [x] Replica readiness policy includes data and control-plane head.
 
 ### Phase 3 — operations and GUI
@@ -516,7 +530,7 @@ client-supplied and remain outside the control plane.
 - [x] Peer wizard with one-time pairing codes and full role banner.
 - [x] Persist and reload the pull source without restart.
 - [x] Add peer pairing, revoke, source validation, and control-plane snapshot.
-- [ ] Pause/resume and hot resync.
+- [x] Pause/resume/disconnect controls and in-place hard resync.
 - [x] Manual promote/demote with persisted role, expected epoch, and audit.
 - [x] Promotion/demote confirmation workflow in the GUI.
 - [ ] Certificate expiry and lag dashboards.

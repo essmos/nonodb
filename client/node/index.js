@@ -10,6 +10,12 @@ const READ_OPS = new Set([
   'lookup',
   'watch',
   'count',
+  'aggregate',
+  'cursor_aggregate',
+  'cursor_find',
+  'get_more',
+  'close_cursor',
+  'explain',
   'list_indexes',
   'list_collections',
   'list_text_indexes',
@@ -18,20 +24,60 @@ const READ_OPS = new Set([
   'search',
   'fuzzy',
   'vector_search',
+  'history',
+  'get_version',
+  'get_collection_ttl',
+  'get_collection_history',
+  'get_collection_events',
+  'list_subscriptions',
   'sql',
   'explain_sql',
+  'map_info',
   'batch',
 ]);
 
 /** Error returned by the daemon or by the transport. */
 class NonoDBError extends Error {
-  constructor(code, message, statusCode = 0) {
+  constructor(code, message, statusCode = 0, writeUrl = undefined) {
     super(`${code}: ${message}`);
     this.name = 'NonoDBError';
     this.code = code;
     this.message = message;
     this.statusCode = statusCode;
+    // Set for read_only: the primary/write endpoint advertised by a replica.
+    this.writeUrl = writeUrl;
   }
+}
+
+function envAutoPrimary() {
+  return ['1', 'true', 'yes', 'on'].includes(
+    (process.env.NONODB_AUTO_PRIMARY ?? '').toLowerCase(),
+  );
+}
+
+function sqlIsRead(query) {
+  if (typeof query !== 'string') return false;
+  let text = query.trimStart();
+  for (;;) {
+    if (text.startsWith('--')) {
+      const newline = text.indexOf('\n');
+      text = newline < 0 ? '' : text.slice(newline + 1).trimStart();
+    } else if (text.startsWith('/*')) {
+      const end = text.indexOf('*/', 2);
+      text = end < 0 ? '' : text.slice(end + 2).trimStart();
+    } else {
+      const keyword = text.split(/\s+/, 1)[0]?.toLowerCase();
+      return ['select', 'explain', 'show', 'values'].includes(keyword);
+    }
+  }
+}
+
+function isWritePayload(payload) {
+  if (payload?.op === 'batch') {
+    return (payload.ops ?? []).some((item) => isWritePayload(item));
+  }
+  if (payload?.op === 'sql') return !sqlIsRead(payload.query);
+  return !READ_OPS.has(payload?.op);
 }
 
 function envVerify() {
@@ -56,6 +102,9 @@ class NonoDB {
 
     this.token = options.token ?? process.env.NONODB_TOKEN ?? '';
     this.database = (options.database ?? process.env.NONODB_DB ?? 'default').trim() || 'default';
+    this.writeBaseUrl = (options.writeUrl ?? process.env.NONODB_WRITE_URL ?? '')
+      .replace(/\/+$/, '');
+    this.autoPrimary = options.autoPrimary ?? envAutoPrimary();
     this.timeoutMs = options.timeoutMs ?? envTimeoutMs();
     this.verify = options.verify ?? envVerify();
     this.vaultHeaders = options.vaultHeaders ?? null;
@@ -101,20 +150,43 @@ class NonoDB {
   /** Execute an arbitrary /v1/exec payload and return its `result`. */
   async exec(payload) {
     if (this.closed) throw new NonoDBError('closed', 'client is closed');
-    const attempts = READ_OPS.has(payload?.op) ? 3 : 1;
+    const isWrite = isWritePayload(payload);
+    const attempts = isWrite ? 1 : 3;
     let lastError;
+    let redirected = false;
     for (let attempt = 0; attempt < attempts; attempt += 1) {
+      const target = isWrite ? await this._writeTarget() : null;
       try {
-        const body = await this._request('POST', '/v1/exec', payload);
+        const body = await this._request('POST', '/v1/exec', payload, target);
         if (body?.ok !== true) {
           const error = body?.error ?? {};
-          throw new NonoDBError(error.code ?? 'error', error.message ?? '', 0);
+          throw new NonoDBError(
+            error.code ?? 'error',
+            error.message ?? '',
+            0,
+            error.write_url,
+          );
         }
         return body.result ?? null;
       } catch (error) {
         if (
+          isWrite &&
+          error instanceof NonoDBError &&
+          error.code === 'read_only' &&
+          error.writeUrl &&
+          !redirected &&
+          (this.autoPrimary || Boolean(this.writeBaseUrl)) &&
+          error.writeUrl.replace(/\/+$/, '') !== (target?.baseUrl ?? this.baseUrl)
+        ) {
+          this.writeBaseUrl = error.writeUrl.replace(/\/+$/, '');
+          redirected = true;
+          attempt -= 1;
+          continue;
+        }
+        if (
           error instanceof NonoDBError &&
           error.code === 'connection' &&
+          !isWrite &&
           attempt + 1 < attempts
         ) {
           lastError = error;
@@ -127,7 +199,30 @@ class NonoDB {
     throw lastError;
   }
 
-  async _request(method, path, body) {
+  async _discoverWriteUrl() {
+    try {
+      const body = await this._request('GET', '/readyz');
+      const url = body?.replication?.write_url ?? body?.write_url;
+      return typeof url === 'string' ? url.replace(/\/+$/, '') : '';
+    } catch {
+      return '';
+    }
+  }
+
+  async _writeTarget() {
+    if (!this.writeBaseUrl && this.autoPrimary) {
+      const url = await this._discoverWriteUrl();
+      if (url) this.writeBaseUrl = url;
+    }
+    if (this.writeBaseUrl) {
+      return { baseUrl: this.writeBaseUrl, socketPath: undefined };
+    }
+    return { baseUrl: this.baseUrl, socketPath: this.socketPath };
+  }
+
+  async _request(method, path, body, target = null) {
+    const baseUrl = target?.baseUrl ?? this.baseUrl;
+    const socketPath = target ? target.socketPath : this.socketPath;
     const payload = body === undefined ? undefined : Buffer.from(JSON.stringify(body));
     const headers = {};
     if (payload) {
@@ -141,8 +236,8 @@ class NonoDB {
       path.startsWith('/v1/') && this.database !== 'default'
         ? `/${encodeURIComponent(this.database)}${path}`
         : path;
-    const url = new URL(dataPath, this.baseUrl);
-    const useTls = !this.socketPath && url.protocol === 'https:';
+    const url = new URL(dataPath, baseUrl);
+    const useTls = !socketPath && url.protocol === 'https:';
     const transport = useTls ? https : http;
     const options = {
       method,
@@ -150,8 +245,8 @@ class NonoDB {
       headers,
       timeout: this.timeoutMs,
     };
-    if (this.socketPath) {
-      options.socketPath = this.socketPath;
+    if (socketPath) {
+      options.socketPath = socketPath;
       options.host = 'localhost';
     } else {
       options.hostname = url.hostname;
@@ -197,6 +292,7 @@ class NonoDB {
                 error.code ?? 'http_error',
                 error.message ?? `HTTP ${response.statusCode}`,
                 response.statusCode,
+                error.write_url ?? response.headers.location,
               ),
             );
             return;
