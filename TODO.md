@@ -242,11 +242,11 @@ Design: [docs/replication.md](docs/replication.md).
       `SELECT`, `UNION`/CTE, `RETURNING`, `INSERT ... SELECT`, `UPDATE ... FROM`,
       `SUM`/`AVG`/`MIN`/`MAX(DISTINCT ...)`, and SQL benchmark coverage
 - [x] `$rename`, `$min`, `$max`, `$mul`, `$currentDate`, `$bit`, `$pop`
-- [x] Date aggregation expressions (`$dateAdd`, `$dateSubtract`,
+- [x] Date aggregation expressions (`$dateAdd`, `$dateSubtract`, `$dateDiff`,
       `$dateTrunc`, `$dateToString`, `$dateFromString`, `$dateFromParts`,
-      `$dateToParts`) with UTC and fixed-offset time zones
-- [ ] Remaining date expressions: `$dateDiff`, `$dateFromString` custom
-      `format`, and IANA time zone identifiers
+      `$dateToParts`) with UTC and fixed-offset time zones, custom
+      `$dateFromString` formats, and ISO week fields
+- [ ] IANA time zone identifiers for date expressions
 - [ ] Nested projections, positional `$`, and `$meta` projections
 - [ ] ObjectId as `_id` (currently field values only)
 - [ ] BSON Timestamp and MinKey/MaxKey

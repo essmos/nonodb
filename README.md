@@ -329,8 +329,9 @@ retention semantics.
   compare equal.
 - Standard `$eq`, `$gte`, `$lt`, `$in`, sorting, and secondary indexes work on
   dates.
-- Aggregation expressions include `$dateAdd`, `$dateSubtract`, `$dateTrunc`,
-  `$dateToString`, `$dateFromString`, `$dateFromParts`, and `$dateToParts`.
+- Aggregation expressions include `$dateAdd`, `$dateSubtract`, `$dateDiff`,
+  `$dateTrunc`, `$dateToString`, `$dateFromString`, `$dateFromParts`, and
+  `$dateToParts`.
   Time zones use UTC or fixed `+HH:MM` offsets; IANA zone names are not
   implemented.
 - Naive local datetimes are rejected as ambiguous.

@@ -130,9 +130,11 @@ The aggregation expression evaluator supports:
 
 - `$dateAdd` and `$dateSubtract` with `year`, `quarter`, `month`, `week`,
   `day`, `hour`, `minute`, `second`, and `millisecond` units;
+- `$dateDiff` with the same units and optional `startOfWeek`;
 - `$dateTrunc` with `binSize` and `startOfWeek`;
 - `$dateToString` with the common format specifiers;
-- `$dateFromString` for RFC 3339 input;
+- `$dateFromString` for RFC 3339 input, custom formats, and naive input with an
+  explicit timezone;
 - `$dateFromParts` and `$dateToParts`, including ISO week fields.
 
 They work in `$expr`, `$project`, `$addFields`, `$group`, `$bucket`, and
@@ -158,8 +160,7 @@ pipeline updates.
 Time zones are UTC (`Z`, `UTC`, `GMT`) or fixed offsets such as `+02:00` and
 `-05:00`. IANA names such as `Europe/Warsaw` are not implemented.
 
-Not yet supported: `$dateDiff`, `$dateFromString` custom `format`, IANA time
-zone identifiers, and BSON Timestamp.
+Not yet supported: IANA time zone identifiers and BSON Timestamp.
 
 ## Existing documents and imports
 

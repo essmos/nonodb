@@ -1442,6 +1442,7 @@ fn eval_operator(
 
     match op.as_str() {
         "$dateAdd" | "$dateSubtract" => date_add_op(doc, arg, vars, op == "$dateSubtract"),
+        "$dateDiff" => date_diff_op(doc, arg, vars),
         "$dateTrunc" => date_trunc_op(doc, arg, vars),
         "$dateToString" => date_to_string_op(doc, arg, vars),
         "$dateFromString" => date_from_string_op(doc, arg, vars),
@@ -2264,6 +2265,76 @@ fn date_add_op(
     Ok(date::canonical(date_to_millis(result)?))
 }
 
+fn week_reference_date(start: Weekday) -> Result<Date> {
+    let base = Date::from_calendar_date(2000, Month::January, 1)
+        .map_err(|_| Error::InvalidDate("invalid reference date".into()))?;
+    let offset_days = (i64::from(start.number_days_from_sunday())
+        - i64::from(base.weekday().number_days_from_sunday()))
+    .rem_euclid(7);
+    base.checked_add(Duration::days(offset_days))
+        .ok_or_else(|| Error::InvalidDate("invalid reference date".into()))
+}
+
+fn date_diff_op(doc: &Value, arg: &Value, vars: &BTreeMap<String, Value>) -> Result<Value> {
+    let Some(obj) = arg.as_object() else {
+        return Err(Error::Query("$dateDiff requires an object".into()));
+    };
+    let start = obj
+        .get("startDate")
+        .ok_or_else(|| Error::Query("$dateDiff requires `startDate`".into()))?;
+    let end = obj
+        .get("endDate")
+        .ok_or_else(|| Error::Query("$dateDiff requires `endDate`".into()))?;
+    let start = date_millis(&eval_expr_vars(doc, start, vars)?)?;
+    let end = date_millis(&eval_expr_vars(doc, end, vars)?)?;
+    let unit = obj
+        .get("unit")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::Query("$dateDiff requires `unit`".into()))?;
+    let timezone = date_timezone(obj, doc, vars)?;
+    let start = date_from_millis(start)?.to_offset(timezone);
+    let end = date_from_millis(end)?.to_offset(timezone);
+    let start_date = start.date();
+    let end_date = end.date();
+    let diff = match unit {
+        "year" => i64::from(end_date.year()) - i64::from(start_date.year()),
+        "quarter" => {
+            (i64::from(end_date.year()) * 4 + (i64::from(u8::from(end_date.month())) - 1) / 3)
+                - (i64::from(start_date.year()) * 4
+                    + (i64::from(u8::from(start_date.month())) - 1) / 3)
+        }
+        "month" => {
+            (i64::from(end_date.year()) * 12 + i64::from(u8::from(end_date.month())) - 1)
+                - (i64::from(start_date.year()) * 12 + i64::from(u8::from(start_date.month())) - 1)
+        }
+        "week" => {
+            let reference = week_reference_date(parse_start_of_week(obj.get("startOfWeek"))?)?;
+            let start_week = (i64::from(start_date.to_julian_day())
+                - i64::from(reference.to_julian_day()))
+            .div_euclid(7);
+            let end_week = (i64::from(end_date.to_julian_day())
+                - i64::from(reference.to_julian_day()))
+            .div_euclid(7);
+            end_week - start_week
+        }
+        "day" => i64::from(end_date.to_julian_day()) - i64::from(start_date.to_julian_day()),
+        "hour" | "minute" | "second" | "millisecond" => {
+            let offset_ms = i64::from(timezone.whole_seconds()) * 1000;
+            let start_ms = date_to_millis(start)? + offset_ms;
+            let end_ms = date_to_millis(end)? + offset_ms;
+            let width = match unit {
+                "hour" => 3_600_000,
+                "minute" => 60_000,
+                "second" => 1_000,
+                _ => 1,
+            };
+            end_ms.div_euclid(width) - start_ms.div_euclid(width)
+        }
+        _ => return Err(Error::Query(format!("unsupported date unit `{unit}`"))),
+    };
+    Ok(Value::from(diff))
+}
+
 fn parse_start_of_week(value: Option<&Value>) -> Result<Weekday> {
     let Some(value) = value else {
         return Ok(Weekday::Sunday);
@@ -2284,14 +2355,7 @@ fn parse_start_of_week(value: Option<&Value>) -> Result<Weekday> {
 }
 
 fn week_reference_millis(start: Weekday, _timezone: UtcOffset) -> Result<i64> {
-    let base = Date::from_calendar_date(2000, Month::January, 1)
-        .map_err(|_| Error::InvalidDate("invalid reference date".into()))?;
-    let offset_days = (i64::from(start.number_days_from_sunday())
-        - i64::from(base.weekday().number_days_from_sunday()))
-    .rem_euclid(7);
-    let reference = base
-        .checked_add(Duration::days(offset_days))
-        .ok_or_else(|| Error::InvalidDate("invalid reference date".into()))?;
+    let reference = week_reference_date(start)?;
     let local = OffsetDateTime::new_in_offset(reference, Time::MIDNIGHT, UtcOffset::UTC);
     date_to_millis(local)
 }
@@ -2453,6 +2517,125 @@ fn date_to_string_op(doc: &Value, arg: &Value, vars: &BTreeMap<String, Value>) -
     Ok(Value::String(format_date(value, format)?))
 }
 
+fn take_date_digits(input: &str, position: &mut usize, min: usize, max: usize) -> Option<i64> {
+    let bytes = input.as_bytes();
+    let start = *position;
+    while *position < bytes.len() && bytes[*position].is_ascii_digit() && *position - start < max {
+        *position += 1;
+    }
+    let digits = *position - start;
+    if digits < min {
+        return None;
+    }
+    input[start..*position].parse().ok()
+}
+
+fn take_date_offset(input: &str, position: &mut usize) -> Option<UtcOffset> {
+    let bytes = input.as_bytes();
+    let sign = match bytes.get(*position)? {
+        b'+' => 1,
+        b'-' => -1,
+        _ => return None,
+    };
+    *position += 1;
+    let hours = take_date_digits(input, position, 2, 2)?;
+    if bytes.get(*position) == Some(&b':') {
+        *position += 1;
+    }
+    let minutes = take_date_digits(input, position, 2, 2)?;
+    UtcOffset::from_hms(
+        i8::try_from(sign * hours).ok()?,
+        i8::try_from(sign * minutes).ok()?,
+        0,
+    )
+    .ok()
+}
+
+fn parse_date_with_format(input: &str, format: &str, default_timezone: UtcOffset) -> Option<i64> {
+    let format_bytes = format.as_bytes();
+    let input_bytes = input.as_bytes();
+    let mut fi = 0usize;
+    let mut pi = 0usize;
+    let mut year = 1970i32;
+    let mut month = 1u8;
+    let mut day = 1u8;
+    let mut ordinal: Option<u16> = None;
+    let mut hour = 0u8;
+    let mut minute = 0u8;
+    let mut second = 0u8;
+    let mut millisecond = 0u16;
+    let mut timezone = default_timezone;
+    while fi < format_bytes.len() {
+        if format_bytes[fi] != b'%' {
+            if input_bytes.get(pi) != Some(&format_bytes[fi]) {
+                return None;
+            }
+            fi += 1;
+            pi += 1;
+            continue;
+        }
+        fi += 1;
+        let spec = *format_bytes.get(fi)?;
+        fi += 1;
+        match spec {
+            b'%' => {
+                if input_bytes.get(pi) != Some(&b'%') {
+                    return None;
+                }
+                pi += 1;
+            }
+            b'Y' => year = i32::try_from(take_date_digits(input, &mut pi, 4, 4)?).ok()?,
+            b'm' => month = u8::try_from(take_date_digits(input, &mut pi, 2, 2)?).ok()?,
+            b'd' => day = u8::try_from(take_date_digits(input, &mut pi, 2, 2)?).ok()?,
+            b'j' => ordinal = Some(u16::try_from(take_date_digits(input, &mut pi, 3, 3)?).ok()?),
+            b'H' => hour = u8::try_from(take_date_digits(input, &mut pi, 2, 2)?).ok()?,
+            b'M' => minute = u8::try_from(take_date_digits(input, &mut pi, 2, 2)?).ok()?,
+            b'S' => second = u8::try_from(take_date_digits(input, &mut pi, 2, 2)?).ok()?,
+            b'L' => millisecond = u16::try_from(take_date_digits(input, &mut pi, 3, 3)?).ok()?,
+            b'f' => {
+                let start = pi;
+                let value = take_date_digits(input, &mut pi, 1, 9)?;
+                let digits = pi - start;
+                let scaled = if digits >= 3 {
+                    value / 10_i64.pow((digits - 3) as u32)
+                } else {
+                    value * 10_i64.pow((3 - digits) as u32)
+                };
+                millisecond = u16::try_from(scaled).ok()?;
+            }
+            b'z' => timezone = take_date_offset(input, &mut pi)?,
+            _ => return None,
+        }
+    }
+    if pi != input_bytes.len() {
+        return None;
+    }
+    let date = if let Some(ordinal) = ordinal {
+        Date::from_ordinal_date(year, ordinal).ok()?
+    } else {
+        let month = Month::try_from(month).ok()?;
+        Date::from_calendar_date(year, month, day).ok()?
+    };
+    let time = Time::from_hms_milli(hour, minute, second, millisecond).ok()?;
+    let value = OffsetDateTime::new_in_offset(date, time, timezone);
+    date_to_millis(value).ok()
+}
+
+fn parse_date_string(input: &str, format: Option<&str>, timezone: UtcOffset) -> Option<i64> {
+    if let Some(format) = format {
+        return parse_date_with_format(input, format, timezone);
+    }
+    if let Some(ms) = date::parse_rfc3339_ms(input) {
+        return Some(ms);
+    }
+    for format in ["%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"] {
+        if let Some(ms) = parse_date_with_format(input, format, timezone) {
+            return Some(ms);
+        }
+    }
+    None
+}
+
 fn date_from_string_op(doc: &Value, arg: &Value, vars: &BTreeMap<String, Value>) -> Result<Value> {
     let Some(obj) = arg.as_object() else {
         return Err(Error::Query("$dateFromString requires an object".into()));
@@ -2467,14 +2650,11 @@ fn date_from_string_op(doc: &Value, arg: &Value, vars: &BTreeMap<String, Value>)
             None => Ok(Value::Null),
         };
     }
-    if obj.contains_key("format") {
-        return Err(Error::Query(
-            "$dateFromString custom `format` is not supported".into(),
-        ));
-    }
+    let timezone = date_timezone(obj, doc, vars)?;
+    let format = obj.get("format").and_then(Value::as_str);
     let parsed = raw
         .as_str()
-        .and_then(date::parse_rfc3339_ms)
+        .and_then(|raw| parse_date_string(raw, format, timezone))
         .map(date::canonical);
     match parsed {
         Some(value) => Ok(value),
@@ -2837,6 +3017,61 @@ mod tests {
                 "dateString": "2024-03-05T06:07:08.009Z"
             }})),
             canonical("2024-03-05T06:07:08.009Z")
+        );
+        assert_eq!(
+            eval(json!({"$dateFromString": {
+                "dateString": "05/03/2024 06:07:08.009",
+                "format": "%d/%m/%Y %H:%M:%S.%L",
+                "timezone": "+02:00"
+            }})),
+            canonical("2024-03-05T04:07:08.009Z")
+        );
+        assert_eq!(
+            eval(json!({"$dateFromString": {
+                "dateString": "2024-03-05T06:07:08+02:00",
+                "format": "%Y-%m-%dT%H:%M:%S%z"
+            }})),
+            canonical("2024-03-05T04:07:08Z")
+        );
+        assert_eq!(
+            eval(json!({"$dateFromString": {
+                "dateString": "2024-03-05T06:07:08.009",
+                "timezone": "+02:00"
+            }})),
+            canonical("2024-03-05T04:07:08.009Z")
+        );
+        assert_eq!(
+            eval(json!({"$dateDiff": {
+                "startDate": "$at",
+                "endDate": {"$date": "2024-03-01T00:00:00Z"},
+                "unit": "month"
+            }})),
+            json!(2)
+        );
+        assert_eq!(
+            eval(json!({"$dateDiff": {
+                "startDate": {"$date": "2024-01-31T23:30:00Z"},
+                "endDate": {"$date": "2024-02-01T00:15:00Z"},
+                "unit": "day"
+            }})),
+            json!(1)
+        );
+        assert_eq!(
+            eval(json!({"$dateDiff": {
+                "startDate": {"$date": "2024-01-31T10:30:00Z"},
+                "endDate": {"$date": "2024-01-31T11:15:00Z"},
+                "unit": "hour"
+            }})),
+            json!(1)
+        );
+        assert_eq!(
+            eval(json!({"$dateDiff": {
+                "startDate": {"$date": "2024-03-11T00:00:00Z"},
+                "endDate": {"$date": "2024-03-04T00:00:00Z"},
+                "unit": "week",
+                "startOfWeek": "monday"
+            }})),
+            json!(-1)
         );
         assert_eq!(
             eval(json!({"$dateFromString": {

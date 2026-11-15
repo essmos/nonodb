@@ -1230,13 +1230,14 @@ The expression evaluator supports comparison and boolean operators, arithmetic
 (`$concat`, `$toLower`, `$toUpper`, `$substr`, `$substrCP`, `$strLenCP`,
 `$split`, `$indexOfCP`, `$trim`/`$ltrim`/`$rtrim`), `$regexMatch`, `$min`,
 `$max`, `$type`, and `$literal`. Date operators are `$dateAdd`,
-`$dateSubtract`, `$dateTrunc`, `$dateToString`, `$dateFromString`,
+`$dateSubtract`, `$dateDiff`, `$dateTrunc`, `$dateToString`, `$dateFromString`,
 `$dateFromParts`, and `$dateToParts`; time zones use UTC or fixed offsets such
 as `+02:00`. Variables use `$$name` or `$$name.path` syntax inside `$let`,
 `$map`, `$filter`, and `$reduce`.
 
-Date expressions are not yet available for `$dateDiff`, custom
-`$dateFromString` formats, or IANA time zone identifiers.
+`$dateFromString` accepts RFC 3339, custom formats such as `%d/%m/%Y %H:%M:%S`,
+and naive input when `timezone` is provided. IANA time zone identifiers are not
+supported.
 
 Regex operands are accepted inside `$in`, `$nin`, and `$all`:
 
