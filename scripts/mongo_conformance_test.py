@@ -111,6 +111,31 @@ def check(name, function, nonodb_db, mongodb_db):
     return True
 
 
+TEXT_DOCS = [
+    {"_id": "t1", "n": 1, "title": "Alpha beta", "body": "gamma delta"},
+    {"_id": "t2", "n": 2, "title": "Alpha", "body": "beta gamma"},
+    {"_id": "t3", "n": 3, "title": "Delta", "body": "epsilon"},
+    {"_id": "t4", "n": 4, "title": "alpha beta gamma", "body": "delta"},
+]
+
+
+def text_ids(db, query):
+    return sorted(
+        doc["_id"]
+        for doc in db.text_items.find(
+            {"$text": {"$search": query}}, {"_id": 1}
+        )
+    )
+
+
+def create_text_index(db):
+    return db.text_items.create_index(
+        [("title", "text"), ("body", "text")],
+        weights={"title": 2, "body": 1},
+        default_language="none",
+    )
+
+
 def command_error_code(function):
     def run(db):
         try:
@@ -202,6 +227,58 @@ def main() -> int:
             lambda db: db.items.insert_many(DOCS).inserted_ids,
         )
         check_both("find all", lambda db: sorted_docs(db))
+        check_both(
+            "insert text documents",
+            lambda db: db.text_items.insert_many(TEXT_DOCS).inserted_ids,
+        )
+        check_both("create text index", create_text_index)
+        check_both(
+            "text phrases",
+            lambda db: text_ids(db, '"alpha beta"'),
+        )
+        check_both("text or terms", lambda db: text_ids(db, "alpha gamma"))
+        check_both("text negation", lambda db: text_ids(db, "delta -epsilon"))
+        check_both(
+            "text count with residual filter",
+            lambda db: db.command(
+                {
+                    "count": "text_items",
+                    "query": {
+                        "$text": {"$search": "alpha"},
+                        "n": {"$gte": 2},
+                    },
+                }
+            )["n"],
+        )
+        check_both(
+            "text distinct with residual filter",
+            lambda db: sorted(
+                db.command(
+                    {
+                        "distinct": "text_items",
+                        "key": "n",
+                        "query": {"$text": {"$search": "alpha"}},
+                    }
+                )["values"]
+            ),
+        )
+        check_both(
+            "text leading aggregate match",
+            lambda db: sorted(
+                doc["n"]
+                for doc in db.text_items.aggregate(
+                    [
+                        {
+                            "$match": {
+                                "$text": {"$search": "alpha"},
+                                "n": {"$gte": 2},
+                            }
+                        },
+                        {"$project": {"_id": 0, "n": 1}},
+                    ]
+                )
+            ),
+        )
         check_both(
             "duplicate _id error",
             command_error_code(lambda db: db.items.insert_one({"_id": "a"})),

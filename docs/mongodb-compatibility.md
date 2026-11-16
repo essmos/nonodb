@@ -27,7 +27,7 @@ The assessment below is verified against NonoDB `0.25.x`.
 | Area | Approximate practical coverage | Main caveat |
 |---|---:|---|
 | CRUD and find semantics | ~90% | No MongoDB sessions, retryable writes, or multi-document transactions |
-| Query filters | ~80% | No `$where`, `$text`, or collation; BSON regex values work as read filters but cannot be stored |
+| Query filters | ~82% | No `$where` or collation; `$text` is a documented lexical subset; BSON regex values work as read filters but cannot be stored |
 | Projection | ~75% | `$meta` is approximate; no arbitrary computed projection expressions |
 | Updates | ~85% | Pipeline updates support a subset of stages |
 | Aggregation stages | ~70% | Many common stages work; system, search, geoNear, and change-stream stages are absent |
@@ -116,6 +116,19 @@ evaluated once and then paged from a materialized result. Without a `cursor`
 option the full result is returned in the first batch. Upserts without an `_id`
 in the filter receive a driver-style ObjectId, matching MongoDB.
 
+MongoDB-style text search is available through `createIndexes` with `key`
+values of `"text"`. A collection can have one text index; multiple fields are
+scored with BM25 and optional `weights`, and `default_language` must be absent or
+`"none"`. `listIndexes` and `dropIndexes` understand text keys and names.
+`$text` is accepted by `find`, `count`, `distinct`, and a leading aggregate
+`$match`. Positive terms and quoted phrases are ORed, `-term` and `"-phrase"`
+exclude matches, and at least one positive clause is required. `$meta:
+"textScore"` is available in projections and `$meta` sorts; other sorts with
+`$text` are rejected. `$text` is not supported in update/delete filters,
+`$or`/`$nor`, or non-leading aggregation stages. The analyzer is
+lowercase/diacritic-folding tokenization without stemming or stop-word removal,
+so ranking and language behavior are approximate rather than MongoDB-identical.
+
 Driver-facing options are checked instead of silently ignored. The listener
 accepts non-empty `filter` documents for `listCollections` and `listDatabases`,
 and honors `nameOnly` for both. It accepts `readConcern` levels `local` and
@@ -141,8 +154,8 @@ scripts/mongo_drivers_test.sh
 
 The checks cover insert/find/update/delete, filters, sort, projection,
 distinct, count, index creation/listing, streamed and blocking aggregation with
-`batchSize`, and BSON ObjectId, Date, Decimal128, Binary, Timestamp, MinKey, and
-MaxKey round-trips. Node.js uses the official `mongodb` 6.x package and Go uses
+`batchSize`, MongoDB-style text indexes and `$text`, and BSON ObjectId, Date,
+Decimal128, Binary, Timestamp, MinKey, and MaxKey round-trips. Node.js uses the official `mongodb` 6.x package and Go uses
 `go.mongodb.org/mongo-driver` 1.17.x.
 
 ### Export and portability
@@ -285,7 +298,7 @@ allowed. Other BSON types are not accepted as `_id`.
 | `$jsonSchema` | 🟡 | Common keywords and combinators; not every JSON Schema draft feature |
 | `$and`, `$or`, `$nor`, `$not` | ✅ | |
 | `$where` | ❌ | No JavaScript execution |
-| `$text` | ❌ | Full-text search is a separate NonoDB search API |
+| `$text` | 🟡 | Lexical BM25 subset over one MongoDB-style text index; terms and phrases are ORed, negative terms/phrases exclude, and at least one positive clause is required. No stemming, stop words, or non-`none` languages |
 | `$comment` as a filter operator | ❌ | `comment` is available as a query option |
 | `$rand` | ❌ | |
 | Collation | ❌ | No per-query or per-index collation |
@@ -301,9 +314,9 @@ allowed. Other BSON types are not accepted as `_id`.
 | Positional `$` | ✅ | Selects the first matching array element |
 | `$slice` | ✅ | Number, negative, and `[skip, limit]` forms |
 | `$elemMatch` projection | ✅ | |
-| `$meta` | 🟡 | Pragmatic mapping from internal fields; no computed full-text score |
+| `$meta` | 🟡 | Pragmatic mapping from internal fields; `textScore` is computed for `$text` queries |
 | Arbitrary computed projection expressions | ❌ | Use `$addFields`/`$set` in aggregation |
-| `$meta: "textScore"` | 🟡 | Available without a full MongoDB text index |
+| `$meta: "textScore"` | 🟡 | Computed for `$text` in `find` projections and `$meta` sorts; score formula is BM25 rather than MongoDB TF-IDF |
 
 ## Update operators
 
@@ -376,7 +389,7 @@ allowed. Other BSON types are not accepted as `_id`.
 | Unique indexes | ✅ | Including unique multikey semantics |
 | Covered queries / `include` | ✅ | Top-level inclusive projections only |
 | Geospatial indexes | 🟡 | GeoJSON point indexes only; no polygon/line indexes |
-| Text search indexes | 🟡 | Custom BM25/fuzzy search, not MongoDB `$text` |
+| Text search indexes | 🟡 | One MongoDB-style text index per collection through `createIndexes`/`listIndexes`/`dropIndexes`; multi-field weights and leading-`$match` `$text`. No compound mixed text/non-text keys |
 | Vector indexes | 🟡 | NonoDB-specific exact/vector search |
 | Sparse indexes | ❌ | |
 | Partial indexes | ❌ | |
@@ -430,7 +443,7 @@ A migration from MongoDB to NonoDB should check these items first:
 3. **Transactions and sessions** — redesign around atomic `write_batch`,
    idempotent operations, or application-level compensation.
 4. **Change streams** — replace with outbox events, `watch`, or subscriptions.
-5. **`$text` and Atlas Search** — use NonoDB's separate search API.
+5. **Atlas Search** — use NonoDB's native search API. MongoDB `$text` is supported only for the documented lexical subset.
 6. **Collation** — normalize strings or enforce ordering in the application.
 7. **Sparse/partial/TTL indexes** — remodel as collection settings, separate
    indexes, or application logic.

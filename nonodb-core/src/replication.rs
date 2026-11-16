@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::events::EventConfig;
+use crate::search::{SearchIndexDef, SearchKind};
 use crate::subscriptions::Subscription;
 use crate::vector::VectorMetric;
 
@@ -84,6 +85,15 @@ pub enum ReplicationOp {
     IndexDrop {
         coll: String,
         field: String,
+    },
+    SearchIndexCreate {
+        coll: String,
+        index: SearchIndexDef,
+    },
+    SearchIndexDrop {
+        coll: String,
+        index_kind: SearchKind,
+        name: String,
     },
     TextIndexCreate {
         coll: String,

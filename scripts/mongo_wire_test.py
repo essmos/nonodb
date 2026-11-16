@@ -298,6 +298,127 @@ def main() -> int:
         ]
         assert db.command({"dropIndexes": coll.name, "index": "group_1"})["ok"] == 1.0
 
+        text_coll = db[f"text_smoke_{uuid.uuid4().hex[:8]}"]
+        text_coll.insert_many(
+            [
+                {"n": 1, "title": "Alpha beta", "body": "gamma delta"},
+                {"n": 2, "title": "Alpha", "body": "beta gamma"},
+                {"n": 3, "title": "Delta", "body": "epsilon"},
+                {"n": 4, "title": "alpha beta gamma", "body": "delta"},
+            ]
+        )
+        text_name = text_coll.create_index(
+            [("title", "text"), ("body", "text")],
+            weights={"title": 2, "body": 1},
+            default_language="none",
+        )
+        assert text_name == "title_text_body_text"
+        text_index = next(
+            index for index in text_coll.list_indexes() if index["name"] == text_name
+        )
+        assert list(text_index["key"].items()) == [("title", "text"), ("body", "text")]
+        assert text_index["default_language"] == "none"
+        assert text_index["weights"] == {"title": 2.0, "body": 1.0}
+        assert sorted(
+            doc["n"]
+            for doc in text_coll.find(
+                {"$text": {"$search": '"alpha beta"'}}, {"n": 1, "_id": 0}
+            )
+        ) == [1, 4]
+        assert len(
+            list(
+                text_coll.find(
+                    {"$text": {"$search": "alpha gamma"}}, {"n": 1, "_id": 0}
+                )
+            )
+        ) == 3
+        assert sorted(
+            doc["n"]
+            for doc in text_coll.find(
+                {"$text": {"$search": "delta -epsilon"}}, {"n": 1, "_id": 0}
+            )
+        ) == [1, 4]
+        scored = list(
+            text_coll.find(
+                {"$text": {"$search": "alpha beta"}},
+                {"n": 1, "_id": 0, "score": {"$meta": "textScore"}},
+                sort=[("score", {"$meta": "textScore"})],
+            )
+        )
+        assert sorted(doc["n"] for doc in scored) == [1, 2, 4]
+        scores = [doc["score"] for doc in scored]
+        assert scores == sorted(scores, reverse=True)
+        assert all(score >= 0 for score in scores)
+        assert (
+            db.command(
+                {
+                    "count": text_coll.name,
+                    "query": {
+                        "$text": {"$search": "alpha"},
+                        "n": {"$gte": 2},
+                    },
+                }
+            )["n"]
+            == 2
+        )
+        assert sorted(
+            db.command(
+                {
+                    "distinct": text_coll.name,
+                    "key": "n",
+                    "query": {"$text": {"$search": "alpha"}},
+                }
+            )["values"]
+        ) == [1, 2, 4]
+        try:
+            list(
+                text_coll.find(
+                    {"$text": {"$search": "alpha"}}, max_time_ms=1000
+                )
+            )
+        except OperationFailure as error:
+            assert error.code == 2, error
+        else:
+            raise AssertionError("maxTimeMS with $text was accepted")
+        assert sorted(
+            doc["n"]
+            for doc in text_coll.aggregate(
+                [
+                    {
+                        "$match": {
+                            "$text": {"$search": "alpha"},
+                            "n": {"$gte": 2},
+                        }
+                    },
+                    {"$project": {"_id": 0, "n": 1}},
+                ]
+            )
+        ) == [2, 4]
+        try:
+            list(
+                text_coll.aggregate(
+                    [
+                        {"$match": {"n": {"$gte": 1}}},
+                        {"$match": {"$text": {"$search": "alpha"}}},
+                    ]
+                )
+            )
+        except OperationFailure as error:
+            assert error.code == 2, error
+        else:
+            raise AssertionError("non-leading aggregate $text was accepted")
+        assert (
+            db.command(
+                {
+                    "dropIndexes": text_coll.name,
+                    "index": {"title": "text", "body": "text"},
+                }
+            )["ok"]
+            == 1.0
+        )
+        assert text_name not in [index["name"] for index in text_coll.list_indexes()]
+        text_coll.drop()
+
         assert coll.delete_one({"group": "smoke"}).deleted_count == 1
         assert coll.delete_many({"group": "smoke"}).deleted_count == 9
         rows = list(

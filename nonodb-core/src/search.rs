@@ -1,15 +1,17 @@
 //! Full-text (BM25) and approximate search (trigrams + Levenshtein).
 //!
+//! Search indexes are collection-level definitions with one or more fields.
 //! Data layout (LMDB sub-databases):
-//! - `ft:<coll>:<field>`  - postings: `term \0 _id` -> `tf` (u32 LE),
-//! - `ftl:<coll>:<field>`  - document lengths: `_id` -> `dl` (u32 LE),
-//! - `fz:<coll>:<field>`  - trigrams: `trigram \0 _id` -> empty.
+//! - `ft:<coll>:<index>:<field>`  - postings: `term \0 _id` -> `tf` (u32 LE),
+//! - `ftl:<coll>:<index>:<field>` - document lengths: `_id` -> `dl` (u32 LE),
+//! - `fz:<coll>:<index>:<field>`  - trigrams: `trigram \0 _id` -> empty.
 //!
 //! Document count `N` = `ftl.stat().entries`, total length = meta
-//! `fttotal:<coll>:<field>` (u64 LE).
+//! `fttotal:<coll>:<index>:<field>` (u64 LE).
 
 use std::collections::{HashMap, HashSet};
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use unicode_normalization::{char::is_combining_mark, UnicodeNormalization};
 
@@ -19,25 +21,137 @@ pub const BM25_B: f64 = 0.75;
 /// Default maximum Levenshtein distance.
 pub const DEFAULT_FUZZY_DISTANCE: usize = 2;
 
+// ----------------------------- definitions ---------------------------
+
+/// Search index kind. Text uses term postings and BM25; fuzzy uses trigrams.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SearchKind {
+    Text,
+    Fuzzy,
+}
+
+impl SearchKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Fuzzy => "fuzzy",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "text" => Some(Self::Text),
+            "fuzzy" => Some(Self::Fuzzy),
+            _ => None,
+        }
+    }
+}
+
+fn default_weight() -> f64 {
+    1.0
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SearchField {
+    pub path: String,
+    #[serde(default = "default_weight")]
+    pub weight: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SearchIndexDef {
+    pub name: String,
+    pub kind: SearchKind,
+    pub fields: Vec<SearchField>,
+}
+
+impl SearchIndexDef {
+    pub fn single(kind: SearchKind, field: &str) -> Self {
+        Self {
+            name: field.to_string(),
+            kind,
+            fields: vec![SearchField {
+                path: field.to_string(),
+                weight: 1.0,
+            }],
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.name.is_empty() {
+            return Err("search index name cannot be empty".into());
+        }
+        if self.name.len() > 127 || self.name.contains('\0') {
+            return Err(
+                "search index name must be at most 127 bytes and must not contain NUL".into(),
+            );
+        }
+        if self.fields.is_empty() {
+            return Err("search index must contain at least one field".into());
+        }
+        let mut seen = HashSet::new();
+        for field in &self.fields {
+            if field.path.is_empty() {
+                return Err("search index field cannot be empty".into());
+            }
+            if field.path.contains('\0') {
+                return Err("search index field must not contain NUL".into());
+            }
+            if !seen.insert(field.path.as_str()) {
+                return Err(format!("duplicate search index field `{}`", field.path));
+            }
+            if !field.weight.is_finite() || field.weight <= 0.0 {
+                return Err(format!(
+                    "search index weight for `{}` must be positive and finite",
+                    field.path
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn field_paths(&self) -> Vec<String> {
+        self.fields.iter().map(|field| field.path.clone()).collect()
+    }
+}
+
+/// Query parsing mode. Native search requires all quoted phrases and at least
+/// one unquoted term. MongoDB text search treats terms and phrases as ORed
+/// positive clauses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextQueryMode {
+    Native,
+    Mongo,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TextQuery {
+    pub positive_terms: Vec<String>,
+    pub phrases: Vec<Vec<String>>,
+    pub negative_terms: Vec<String>,
+    pub negative_phrases: Vec<Vec<String>>,
+}
+
 // ----------------------------- names ---------------------------------
 
-pub fn text_db_name(coll: &str, field: &str) -> String {
-    format!("ft:{coll}:{field}")
+pub fn text_db_name(coll: &str, index: &str, field: &str) -> String {
+    format!("ft:{coll}:{index}:{field}")
 }
-pub fn text_len_db_name(coll: &str, field: &str) -> String {
-    format!("ftl:{coll}:{field}")
+pub fn text_len_db_name(coll: &str, index: &str, field: &str) -> String {
+    format!("ftl:{coll}:{index}:{field}")
 }
-pub fn fuzzy_db_name(coll: &str, field: &str) -> String {
-    format!("fz:{coll}:{field}")
+pub fn fuzzy_db_name(coll: &str, index: &str, field: &str) -> String {
+    format!("fz:{coll}:{index}:{field}")
 }
-pub fn text_def_key(coll: &str, field: &str) -> String {
-    format!("text:{coll}:{field}")
+pub fn def_key(coll: &str, kind: SearchKind, name: &str) -> String {
+    format!("search:{coll}:{}:{name}", kind.as_str())
 }
-pub fn fuzzy_def_key(coll: &str, field: &str) -> String {
-    format!("fuzzy:{coll}:{field}")
+pub fn def_prefix(coll: &str) -> String {
+    format!("search:{coll}:")
 }
-pub fn text_total_key(coll: &str, field: &str) -> String {
-    format!("fttotal:{coll}:{field}")
+pub fn text_total_key(coll: &str, index: &str, field: &str) -> String {
+    format!("fttotal:{coll}:{index}:{field}")
 }
 
 // --------------------------- text / tokens --------------------------
@@ -98,19 +212,85 @@ pub fn tokenize(s: &str) -> Vec<String> {
 
 /// Quoted phrases, e.g. `ala "ma kota"` -> `[["ma", "kota"]]`.
 pub fn parse_phrases(query: &str) -> Vec<Vec<String>> {
-    let mut out = Vec::new();
-    let mut rest = query;
-    while let Some(start) = rest.find('"') {
-        let after = &rest[start + 1..];
-        let Some(end) = after.find('"') else {
-            break;
-        };
-        let phrase = tokenize(&after[..end]);
-        if !phrase.is_empty() {
-            out.push(phrase);
+    parse_text_query(query).phrases
+}
+
+/// Parses text search syntax with quoted phrases and `-` negation.
+pub fn parse_text_query(query: &str) -> TextQuery {
+    let mut out = TextQuery::default();
+    let mut word = String::new();
+    let mut phrase = String::new();
+    let mut in_quote = false;
+    let mut negative = false;
+    let mut at_start = true;
+
+    let flush_word = |word: &mut String, negative: bool, out: &mut TextQuery| {
+        for term in tokenize(word) {
+            if negative {
+                out.negative_terms.push(term);
+            } else {
+                out.positive_terms.push(term);
+            }
         }
-        rest = &after[end + 1..];
+        word.clear();
+    };
+
+    for ch in query.chars() {
+        if in_quote {
+            if ch == '"' {
+                let tokens = tokenize(&phrase);
+                if !tokens.is_empty() {
+                    if negative {
+                        out.negative_phrases.push(tokens);
+                    } else {
+                        out.phrases.push(tokens);
+                    }
+                }
+                phrase.clear();
+                in_quote = false;
+                negative = false;
+                at_start = true;
+            } else {
+                phrase.push(ch);
+            }
+            continue;
+        }
+        match ch {
+            '"' => {
+                flush_word(&mut word, negative, &mut out);
+                negative = false;
+                in_quote = true;
+            }
+            '-' if at_start && word.is_empty() => {
+                negative = true;
+                at_start = false;
+            }
+            ch if ch.is_alphanumeric() => {
+                word.push(ch);
+                at_start = false;
+            }
+            _ => {
+                flush_word(&mut word, negative, &mut out);
+                negative = false;
+                at_start = true;
+            }
+        }
     }
+    if in_quote {
+        let tokens = tokenize(&phrase);
+        if !tokens.is_empty() {
+            if negative {
+                out.negative_phrases.push(tokens);
+            } else {
+                out.phrases.push(tokens);
+            }
+        }
+    }
+    flush_word(&mut word, negative, &mut out);
+    out.positive_terms.sort();
+    out.positive_terms.dedup();
+    out.negative_terms.sort();
+    out.negative_terms.dedup();
     out
 }
 

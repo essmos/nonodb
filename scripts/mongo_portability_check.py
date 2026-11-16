@@ -72,6 +72,7 @@ FILTER_OPERATORS = {
     "$or",
     "$regex",
     "$size",
+    "$text",
     "$type",
 }
 PROJECTION_OPERATORS = {"$elemMatch", "$meta", "$slice"}
@@ -234,7 +235,6 @@ UNSUPPORTED_OPERATORS = {
     "$search",
     "$searchMeta",
     "$setField",
-    "$text",
     "$unsetField",
     "$vectorSearch",
     "$where",
@@ -255,7 +255,6 @@ UNSUPPORTED_OPTIONS = {
     "showRecordId",
     "sparse",
     "tailable",
-    "weights",
     "wildcardProjection",
 }
 UNSUPPORTED_METHODS = {
@@ -551,6 +550,10 @@ def check_index_keys(
         if direction in (1, -1):
             continue
         if direction == "2dsphere" and len(items) == 1:
+            continue
+        if direction == "text" and all(
+            item_direction == "text" for _, item_direction in items
+        ):
             continue
         add_issue(
             issues,

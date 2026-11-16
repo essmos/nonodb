@@ -123,6 +123,32 @@ async function main() {
     const deleted = await items.deleteMany({ n: { $gte: 11 } });
     assert(deleted.deletedCount === 1, "deleteMany");
 
+    const textItems = db.collection("text_items");
+    await textItems.insertMany([
+      { _id: "t1", n: 1, title: "Alpha beta", body: "gamma delta" },
+      { _id: "t2", n: 2, title: "Alpha", body: "beta gamma" },
+      { _id: "t3", n: 3, title: "Delta", body: "epsilon" },
+      { _id: "t4", n: 4, title: "alpha beta gamma", body: "delta" },
+    ]);
+    const textIndex = await textItems.createIndex(
+      { title: "text", body: "text" },
+      { weights: { title: 2, body: 1 }, default_language: "none" }
+    );
+    assert(textIndex === "title_text_body_text", "text index name");
+    const phrase = await textItems
+      .find(
+        { $text: { $search: '"alpha beta"' } },
+        { projection: { _id: 1, score: { $meta: "textScore" } } }
+      )
+      .sort({ score: { $meta: "textScore" } })
+      .toArray();
+    assert(phrase.map((doc) => doc._id).sort().join(",") === "t1,t4", "text phrase");
+    assert(phrase.every((doc) => typeof doc.score === "number"), "text score");
+    assert(
+      (await textItems.countDocuments({ $text: { $search: "delta -epsilon" } })) === 2,
+      "text count and negation"
+    );
+
     const upserts = db.collection("upserts");
     const upserted = await upserts.updateOne(
       { key: "generated" },

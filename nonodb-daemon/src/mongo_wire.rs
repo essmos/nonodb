@@ -347,7 +347,7 @@ pub async fn serve(
             bound = %bound,
             tls = tls_enabled,
             max_connections = limits.max_connections,
-            "experimental unauthenticated MongoDB wire listener enabled; handshake plus insert/find/getMore/killCursors only"
+            "experimental unauthenticated MongoDB wire listener enabled; documented MongoDB-compatible subset only"
         );
     }
     let auth = auth.map(Arc::new);
@@ -1217,20 +1217,52 @@ async fn count_command(state: &super::AppState, body: &Document) -> Result<Docum
         .map_err(|_| bad_value("count must name a collection"))?
         .to_string();
     let database = database_name(body);
-    let filter = document_field(body, "query")?.unwrap_or_else(|| json!({}));
+    let raw_filter = document_field(body, "query")?.unwrap_or_else(|| json!({}));
+    let (text_query, filter) = extract_text_filter(&raw_filter)?;
     let skip = non_negative(body, "skip")?.unwrap_or(0);
     let limit = non_negative(body, "limit")?.unwrap_or(0);
     let max_time_ms = int_field(body, "maxTimeMS")
         .filter(|value| *value > 0)
         .map(|value| value as u64);
+    if text_query.is_some() && max_time_ms.is_some() {
+        return Err(bad_value("maxTimeMS is not supported with $text by NonoDB"));
+    }
     let Some(runtime) = database_for_read(state, &database).await else {
         return Ok(bson::doc! {"n": 0i64, "ok": 1.0});
     };
     let store = runtime.store.clone();
     let coll = collection.clone();
     let count = tokio::task::spawn_blocking(move || {
-        let c = store.collection(&coll)?;
-        c.count_with_options(&filter, max_time_ms)
+        if let Some(query) = text_query {
+            let rtxn = store.read_txn()?;
+            let Some(c) = store.collection_at(&rtxn, &coll)? else {
+                rtxn.commit()?;
+                return Ok::<usize, nonodb_core::Error>(0);
+            };
+            let Some(def) = c
+                .search_index_defs_in(&rtxn)?
+                .into_iter()
+                .find(|def| def.kind == nonodb_core::SearchKind::Text)
+            else {
+                return Err(nonodb_core::Error::Query(
+                    "text index required for $text query".into(),
+                ));
+            };
+            let docs = c.search_text_index_in(
+                &rtxn,
+                &def.name,
+                &query,
+                &filter,
+                0,
+                None,
+                nonodb_core::TextQueryMode::Mongo,
+            )?;
+            rtxn.commit()?;
+            Ok(docs.len())
+        } else {
+            let c = store.collection(&coll)?;
+            c.count_with_options(&filter, max_time_ms)
+        }
     })
     .await
     .map_err(|error| ApiError::internal(format!("count join error: {error}")))??;
@@ -1254,10 +1286,14 @@ async fn distinct_command(state: &super::AppState, body: &Document) -> Result<Do
         .get_str("key")
         .map_err(|_| bad_value("distinct requires a key"))?
         .to_string();
-    let filter = document_field(body, "query")?.unwrap_or_else(|| json!({}));
+    let raw_filter = document_field(body, "query")?.unwrap_or_else(|| json!({}));
+    let (text_query, filter) = extract_text_filter(&raw_filter)?;
     let max_time_ms = int_field(body, "maxTimeMS")
         .filter(|value| *value > 0)
         .map(|value| value as u64);
+    if text_query.is_some() && max_time_ms.is_some() {
+        return Err(bad_value("maxTimeMS is not supported with $text by NonoDB"));
+    }
     let Some(runtime) = database_for_read(state, &database).await else {
         return Ok(bson::doc! {"values": Bson::Array(Vec::new()), "ok": 1.0});
     };
@@ -1270,6 +1306,50 @@ async fn distinct_command(state: &super::AppState, body: &Document) -> Result<Do
     let store = runtime.store.clone();
     let coll = collection.clone();
     let values = tokio::task::spawn_blocking(move || {
+        if let Some(query) = text_query {
+            let rtxn = store.read_txn()?;
+            let Some(c) = store.collection_at(&rtxn, &coll)? else {
+                rtxn.commit()?;
+                return Ok::<Vec<Value>, nonodb_core::Error>(Vec::new());
+            };
+            let Some(def) = c
+                .search_index_defs_in(&rtxn)?
+                .into_iter()
+                .find(|def| def.kind == nonodb_core::SearchKind::Text)
+            else {
+                return Err(nonodb_core::Error::Query(
+                    "text index required for $text query".into(),
+                ));
+            };
+            let docs = c.search_text_index_in(
+                &rtxn,
+                &def.name,
+                &query,
+                &filter,
+                0,
+                None,
+                nonodb_core::TextQueryMode::Mongo,
+            )?;
+            rtxn.commit()?;
+            let mut values = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+            for doc in docs {
+                let Some(value) = nonodb_core::query::path::get(&doc, &key) else {
+                    continue;
+                };
+                let items: Vec<Value> = match value {
+                    Value::Array(items) => items.clone(),
+                    value => vec![value.clone()],
+                };
+                for value in items {
+                    let marker = serde_json::to_string(&value)?;
+                    if seen.insert(marker) {
+                        values.push(value);
+                    }
+                }
+            }
+            return Ok(values);
+        }
         let c = store.collection(&coll)?;
         let docs = c.aggregate_with_options(&pipeline, max_time_ms)?;
         Ok::<Vec<Value>, nonodb_core::Error>(
@@ -1324,6 +1404,94 @@ async fn aggregate_command(
     } else {
         cursor::normalize_batch(Some(raw_batch_size))
     };
+    let mut remaining = pipeline.clone();
+    let mut text_query = None;
+    let mut text_residual = json!({});
+    if let Some(filter) = pipeline.first().and_then(|stage| stage.get("$match")) {
+        let (found, residual) = extract_text_filter(filter)?;
+        if found.is_some() {
+            text_query = found;
+            text_residual = residual.clone();
+            remaining = Vec::new();
+            if residual != json!({}) {
+                remaining.push(json!({"$match": residual}));
+            }
+            remaining.extend(pipeline.iter().skip(1).cloned());
+        }
+    }
+    if text_query.is_none() && pipeline.iter().any(value_contains_text) {
+        return Err(bad_value(
+            "$text is only supported in a leading aggregate $match by NonoDB",
+        ));
+    }
+    if let Some(query) = text_query {
+        if max_time_ms.is_some() {
+            return Err(bad_value("maxTimeMS is not supported with $text by NonoDB"));
+        }
+        if nonodb_core::aggregate::write_stage_spec(&remaining)?.is_some() {
+            return Err(bad_value("$out and $merge are not supported with $text"));
+        }
+        let namespace = format!("{database}.{collection}");
+        let Some(runtime) = database_for_read(state, &database).await else {
+            return Ok(cursor_reply(0, &namespace, Vec::new(), true));
+        };
+        let store = runtime.store.clone();
+        let coll = collection.clone();
+        let docs = tokio::task::spawn_blocking(move || {
+            let rtxn = store.read_txn()?;
+            let Some(c) = store.collection_at(&rtxn, &coll)? else {
+                rtxn.commit()?;
+                return Ok::<Vec<Value>, nonodb_core::Error>(Vec::new());
+            };
+            let Some(def) = c
+                .search_index_defs_in(&rtxn)?
+                .into_iter()
+                .find(|def| def.kind == nonodb_core::SearchKind::Text)
+            else {
+                return Err(nonodb_core::Error::Query(
+                    "text index required for $text query".into(),
+                ));
+            };
+            let docs = c.search_text_index_in(
+                &rtxn,
+                &def.name,
+                &query,
+                &text_residual,
+                0,
+                None,
+                nonodb_core::TextQueryMode::Mongo,
+            )?;
+            rtxn.commit()?;
+            Ok(docs)
+        })
+        .await
+        .map_err(|error| ApiError::internal(format!("aggregate $text join error: {error}")))??;
+        let docs = if remaining.is_empty() {
+            docs
+        } else {
+            nonodb_core::aggregate::run(
+                docs,
+                &remaining,
+                nonodb_core::aggregate::MAX_AGGREGATE_DOCS,
+            )?
+        };
+        if !cursor_options.requested {
+            return Ok(cursor_reply(0, &namespace, values_to_bson(docs)?, true));
+        }
+        let cursor_state = cursor::State::new(
+            format!("mongo:{connection_id}"),
+            database,
+            cursor::Kind::MaterializedAggregate {
+                coll: collection,
+                docs: Arc::new(docs),
+                offset: 0,
+            },
+            None,
+            Some(batch_size),
+        );
+        return aggregate_cursor_page(state, &runtime, &namespace, cursor_state, empty_first_batch)
+            .await;
+    }
     if nonodb_core::aggregate::write_stage_spec(&pipeline)?.is_some() {
         let runtime = database_for_write(state, &database).await?;
         let (_, response) = super::submit_write(
@@ -1703,6 +1871,7 @@ async fn create_indexes_command(
         .get_array("indexes")
         .map_err(|_| bad_value("createIndexes requires an indexes array"))?;
     let mut specs = Vec::with_capacity(indexes.len());
+    let mut text_specs: Vec<nonodb_core::SearchIndexDef> = Vec::new();
     for item in indexes {
         let Bson::Document(spec) = item else {
             return Err(bad_value("index specification must be a document"));
@@ -1713,6 +1882,110 @@ async fn create_indexes_command(
         if key.is_empty() {
             return Err(bad_value("index key document cannot be empty"));
         }
+        let text_fields: Vec<&String> = key
+            .iter()
+            .filter(|(_, direction)| matches!(direction, Bson::String(value) if value == "text"))
+            .map(|(field, _)| field)
+            .collect();
+        if !text_fields.is_empty() {
+            if text_fields.len() != key.len() {
+                return Err(bad_value(
+                    "NonoDB text indexes cannot mix text and non-text fields",
+                ));
+            }
+            if !text_specs.is_empty() {
+                return Err(bad_value(
+                    "createIndexes can create at most one text index at a time",
+                ));
+            }
+            for unsupported in [
+                "partialFilterExpression",
+                "collation",
+                "expireAfterSeconds",
+                "wildcardProjection",
+                "language_override",
+            ] {
+                if spec.contains_key(unsupported) {
+                    return Err(bad_value(format!(
+                        "text index option `{unsupported}` is not supported by NonoDB"
+                    )));
+                }
+            }
+            if let Some(language) = spec.get("default_language") {
+                if language.as_str() != Some("none") {
+                    return Err(bad_value(
+                        "only default_language: \"none\" is supported for text indexes",
+                    ));
+                }
+            }
+            if spec.get_bool("unique").unwrap_or(false) {
+                return Err(bad_value("text indexes cannot be unique"));
+            }
+            if spec.get_bool("sparse").unwrap_or(false) {
+                return Err(bad_value("sparse indexes are not supported by NonoDB"));
+            }
+            if spec.get_bool("hidden").unwrap_or(false) {
+                return Err(bad_value("hidden indexes are not supported by NonoDB"));
+            }
+            let weights = match spec.get("weights") {
+                Some(Bson::Document(weights)) => Some(weights),
+                Some(_) => return Err(bad_value("text index weights must be a document")),
+                None => None,
+            };
+            let mut fields = Vec::with_capacity(key.len());
+            for field in &text_fields {
+                let weight = match weights.and_then(|weights| weights.get(*field)) {
+                    Some(value) => {
+                        let Some(weight) = bson_number(value) else {
+                            return Err(bad_value(format!(
+                                "text index weight for `{field}` must be a number"
+                            )));
+                        };
+                        if !weight.is_finite() || weight <= 0.0 {
+                            return Err(bad_value(format!(
+                                "text index weight for `{field}` must be positive and finite"
+                            )));
+                        }
+                        weight
+                    }
+                    None => 1.0,
+                };
+                fields.push(nonodb_core::SearchField {
+                    path: (*field).clone(),
+                    weight,
+                });
+            }
+            if let Some(weights) = weights {
+                for field in weights.keys() {
+                    if !key.contains_key(field) {
+                        return Err(bad_value(format!(
+                            "text index weight refers to unknown field `{field}`"
+                        )));
+                    }
+                }
+            }
+            let default_name = text_fields
+                .iter()
+                .map(|field| format!("{field}_text"))
+                .collect::<Vec<_>>()
+                .join("_");
+            let name = spec.get_str("name").unwrap_or(&default_name);
+            if name.is_empty() {
+                return Err(bad_value("index name cannot be empty"));
+            }
+            if name.len() > 127 || name.contains('\0') {
+                return Err(bad_value(
+                    "index name must be at most 127 bytes and must not contain NUL",
+                ));
+            }
+            text_specs.push(nonodb_core::SearchIndexDef {
+                name: name.to_string(),
+                kind: nonodb_core::SearchKind::Text,
+                fields,
+            });
+            continue;
+        }
+
         let mut fields = Vec::with_capacity(key.len());
         let mut directions = Vec::with_capacity(key.len());
         let mut default_parts = Vec::with_capacity(key.len());
@@ -1725,6 +1998,9 @@ async fn create_indexes_command(
                 Bson::String(value) if value == "2dsphere" && key.len() == 1 => {
                     geo = true;
                     (1, value.clone())
+                }
+                Bson::String(value) if value == "text" => {
+                    return Err(bad_value("text index fields must all use the text type"))
                 }
                 _ => {
                     return Err(bad_value(format!(
@@ -1777,19 +2053,63 @@ async fn create_indexes_command(
             geo,
         });
     }
+    if !text_specs.is_empty() && !specs.is_empty() {
+        return Err(bad_value(
+            "NonoDB cannot create text and non-text indexes in one createIndexes call",
+        ));
+    }
     let runtime = database_for_write(state, &database).await?;
-    let (_, response) = super::submit_write(
-        &runtime,
-        WriteReq::CreateIndexes {
-            coll: collection,
-            indexes: specs,
-        },
-        Durability::Full,
-    )
-    .await;
-    let api = response.0;
-    if let Some(error) = api.error {
-        return Err(error);
+    if let Some(def) = text_specs.pop() {
+        let store = runtime.store.clone();
+        let coll = collection.clone();
+        let name = def.name.clone();
+        let existing = tokio::task::spawn_blocking(move || {
+            let rtxn = store.read_txn()?;
+            let Some(c) = store.collection_at(&rtxn, &coll)? else {
+                rtxn.commit()?;
+                return Ok::<Vec<nonodb_core::SearchIndexDef>, nonodb_core::Error>(Vec::new());
+            };
+            let defs = c.search_index_defs_in(&rtxn)?;
+            rtxn.commit()?;
+            Ok(defs
+                .into_iter()
+                .filter(|def| def.kind == nonodb_core::SearchKind::Text)
+                .collect())
+        })
+        .await
+        .map_err(|error| ApiError::internal(format!("createIndexes join error: {error}")))??;
+        if existing.iter().any(|index| index.name != name) {
+            return Err(bad_value(
+                "only one text index is supported per collection; drop the existing text index first",
+            ));
+        }
+        let (_, response) = super::submit_write(
+            &runtime,
+            WriteReq::CreateSearchIndex {
+                coll: collection,
+                index: def,
+            },
+            Durability::Full,
+        )
+        .await;
+        let api = response.0;
+        if let Some(error) = api.error {
+            return Err(error);
+        }
+    } else {
+        let (_, response) = super::submit_write(
+            &runtime,
+            WriteReq::CreateIndexes {
+                coll: collection,
+                indexes: specs,
+            },
+            Durability::Full,
+        )
+        .await;
+        let api = response.0;
+        if let Some(error) = api.error {
+            return Err(error);
+        }
     }
     Ok(bson::doc! {
         "createdCollectionAutomatically": false,
@@ -1797,6 +2117,15 @@ async fn create_indexes_command(
         "numIndexesAfter": 1i32,
         "ok": 1.0,
     })
+}
+
+fn bson_number(value: &Bson) -> Option<f64> {
+    match value {
+        Bson::Int32(value) => Some(f64::from(*value)),
+        Bson::Int64(value) => Some(*value as f64),
+        Bson::Double(value) => Some(*value),
+        _ => None,
+    }
 }
 
 async fn list_indexes_command(
@@ -1818,15 +2147,19 @@ async fn list_indexes_command(
         let rtxn = store.read_txn()?;
         let Some(c) = store.collection_at(&rtxn, &coll)? else {
             rtxn.commit()?;
-            return Ok::<Option<Vec<nonodb_core::IndexDef>>, nonodb_core::Error>(None);
+            return Ok::<
+                Option<(Vec<nonodb_core::IndexDef>, Vec<nonodb_core::SearchIndexDef>)>,
+                nonodb_core::Error,
+            >(None);
         };
         let defs = c.index_defs_in(&rtxn)?;
+        let search = c.search_index_defs_in(&rtxn)?;
         rtxn.commit()?;
-        Ok(Some(defs))
+        Ok(Some((defs, search)))
     })
     .await
     .map_err(|error| ApiError::internal(format!("listIndexes join error: {error}")))??;
-    let Some(defs) = defs else {
+    let Some((defs, search_defs)) = defs else {
         let mut error = mongo_error(&ApiError {
             code: "not_found".into(),
             message: format!("ns not found: {namespace}"),
@@ -1867,6 +2200,31 @@ async fn list_indexes_command(
         }
         batch.push(Bson::Document(doc));
     }
+    for def in search_defs
+        .into_iter()
+        .filter(|def| def.kind == nonodb_core::SearchKind::Text)
+    {
+        let mut key = Document::new();
+        let mut weights = Document::new();
+        let mut custom_weights = false;
+        for field in &def.fields {
+            key.insert(field.path.clone(), "text");
+            weights.insert(field.path.clone(), field.weight);
+            custom_weights |= (field.weight - 1.0).abs() > f64::EPSILON;
+        }
+        let mut doc = bson::doc! {
+            "v": 2i32,
+            "key": Bson::Document(key),
+            "name": def.name,
+            "ns": namespace.clone(),
+            "default_language": "none",
+            "textIndexVersion": 3i32,
+        };
+        if custom_weights {
+            doc.insert("weights", Bson::Document(weights));
+        }
+        batch.push(Bson::Document(doc));
+    }
     Ok(cursor_reply(0, &namespace, batch, true))
 }
 
@@ -1886,79 +2244,118 @@ async fn drop_indexes_command(
         let rtxn = store.read_txn()?;
         let Some(c) = store.collection_at(&rtxn, &coll)? else {
             rtxn.commit()?;
-            return Ok::<Option<Vec<nonodb_core::IndexDef>>, nonodb_core::Error>(None);
+            return Ok::<
+                Option<(Vec<nonodb_core::IndexDef>, Vec<nonodb_core::SearchIndexDef>)>,
+                nonodb_core::Error,
+            >(None);
         };
         let defs = c.index_defs_in(&rtxn)?;
+        let search = c.search_index_defs_in(&rtxn)?;
         rtxn.commit()?;
-        Ok(Some(defs))
+        Ok(Some((defs, search)))
     })
     .await
     .map_err(|error| ApiError::internal(format!("dropIndexes join error: {error}")))??;
-    let Some(defs) = defs else {
+    let Some((defs, search_defs)) = defs else {
         return Err(ApiError {
             code: "not_found".into(),
             message: format!("ns not found: {database}.{collection}"),
         });
     };
-    let before = defs.len() as i32 + 1;
+    let text_defs: Vec<_> = search_defs
+        .into_iter()
+        .filter(|def| def.kind == nonodb_core::SearchKind::Text)
+        .collect();
+    let before = defs.len() as i32 + text_defs.len() as i32 + 1;
     let target = body
         .get("index")
         .ok_or_else(|| bad_value("dropIndexes requires an index name, key document, or `*`"))?;
-    let targets: Vec<String> = match target {
-        Bson::String(name) if name == "*" => defs.iter().map(|def| def.name()).collect(),
+    #[derive(Clone)]
+    enum DropTarget {
+        Secondary(String),
+        Text(String),
+    }
+    let targets: Vec<DropTarget> = match target {
+        Bson::String(name) if name == "*" => defs
+            .iter()
+            .map(|def| DropTarget::Secondary(def.name()))
+            .chain(
+                text_defs
+                    .iter()
+                    .map(|def| DropTarget::Text(def.name.clone())),
+            )
+            .collect(),
         Bson::String(name) => {
             if name == "_id_" {
                 return Err(bad_value("the _id index cannot be dropped"));
             }
-            let found = defs.iter().find(|def| def.name() == *name);
-            match found {
-                Some(def) => vec![def.name()],
-                None => {
-                    return Err(ApiError {
-                        code: "index_not_found".into(),
-                        message: format!("index not found with name [{name}]"),
-                    })
-                }
+            if let Some(def) = defs.iter().find(|def| def.name() == *name) {
+                vec![DropTarget::Secondary(def.name())]
+            } else if let Some(def) = text_defs.iter().find(|def| def.name == *name) {
+                vec![DropTarget::Text(def.name.clone())]
+            } else {
+                return Err(ApiError {
+                    code: "index_not_found".into(),
+                    message: format!("index not found with name [{name}]"),
+                });
             }
         }
         Bson::Document(key) => {
             let mut fields = Vec::new();
+            let mut text = false;
             for (field, direction) in key {
-                if !matches!(
-                    direction,
+                match direction {
+                    Bson::String(value) if value == "text" => text = true,
                     Bson::Int32(1)
-                        | Bson::Int32(-1)
-                        | Bson::Int64(1)
-                        | Bson::Int64(-1)
-                        | Bson::Double(1.0)
-                        | Bson::Double(-1.0)
-                ) && !matches!(direction, Bson::String(value) if value == "2dsphere")
-                {
-                    return Err(bad_value("index key direction must be 1, -1, or 2dsphere"));
+                    | Bson::Int32(-1)
+                    | Bson::Int64(1)
+                    | Bson::Int64(-1)
+                    | Bson::Double(1.0)
+                    | Bson::Double(-1.0) => {}
+                    Bson::String(value) if value == "2dsphere" => {}
+                    _ => {
+                        return Err(bad_value(
+                            "index key direction must be 1, -1, 2dsphere, or text",
+                        ))
+                    }
                 }
                 fields.push(field.clone());
             }
-            let found = defs
-                .iter()
-                .find(|def| def.effective_fields() == fields)
-                .ok_or_else(|| ApiError {
-                    code: "index_not_found".into(),
-                    message: "index not found".into(),
-                })?;
-            vec![found.name()]
+            if text {
+                let found = text_defs
+                    .iter()
+                    .find(|def| def.field_paths() == fields)
+                    .ok_or_else(|| ApiError {
+                        code: "index_not_found".into(),
+                        message: "index not found".into(),
+                    })?;
+                vec![DropTarget::Text(found.name.clone())]
+            } else {
+                let found = defs
+                    .iter()
+                    .find(|def| def.effective_fields() == fields)
+                    .ok_or_else(|| ApiError {
+                        code: "index_not_found".into(),
+                        message: "index not found".into(),
+                    })?;
+                vec![DropTarget::Secondary(found.name())]
+            }
         }
         _ => return Err(bad_value("dropIndexes index must be a name, key, or `*`")),
     };
-    for name in &targets {
-        let (_, response) = super::submit_write(
-            &runtime,
-            WriteReq::DropIndex {
+    for target in &targets {
+        let request = match target {
+            DropTarget::Secondary(name) => WriteReq::DropIndex {
                 coll: collection.clone(),
                 field: name.clone(),
             },
-            Durability::Full,
-        )
-        .await;
+            DropTarget::Text(name) => WriteReq::DropSearchIndex {
+                coll: collection.clone(),
+                kind: nonodb_core::SearchKind::Text,
+                name: name.clone(),
+            },
+        };
+        let (_, response) = super::submit_write(&runtime, request, Durability::Full).await;
         let api = response.0;
         if let Some(error) = api.error {
             return Err(error);
@@ -2016,6 +2413,131 @@ async fn resolve_internal_id(
     .flatten()
 }
 
+fn value_contains_text(value: &Value) -> bool {
+    match value {
+        Value::Object(map) => {
+            map.keys().any(|key| key == "$text") || map.values().any(value_contains_text)
+        }
+        Value::Array(items) => items.iter().any(value_contains_text),
+        _ => false,
+    }
+}
+
+fn parse_text_spec(value: &Value) -> Result<String, ApiError> {
+    let Some(spec) = value.as_object() else {
+        return Err(bad_value("$text must be a document"));
+    };
+    let Some(search) = spec.get("$search").and_then(Value::as_str) else {
+        return Err(bad_value("$text requires a string $search"));
+    };
+    for (key, value) in spec {
+        match key.as_str() {
+            "$search" => {}
+            "$language" => {
+                if value.as_str() != Some("none") {
+                    return Err(bad_value("only $language: \"none\" is supported for $text"));
+                }
+            }
+            "$caseSensitive" | "$diacriticSensitive" => {
+                if value.as_bool() != Some(false) {
+                    return Err(bad_value(format!(
+                        "$text option `{key}` can only be false in NonoDB"
+                    )));
+                }
+            }
+            _ => return Err(bad_value(format!("unsupported $text option `{key}`"))),
+        }
+    }
+    Ok(search.to_string())
+}
+
+fn extract_text_filter(filter: &Value) -> Result<(Option<String>, Value), ApiError> {
+    let Value::Object(object) = filter else {
+        return Ok((None, filter.clone()));
+    };
+    let mut residual = serde_json::Map::new();
+    let mut text = None;
+    for (key, value) in object {
+        match key.as_str() {
+            "$text" => {
+                if text.is_some() {
+                    return Err(bad_value("$text can appear only once in a filter"));
+                }
+                text = Some(parse_text_spec(value)?);
+            }
+            "$and" => {
+                let Value::Array(items) = value else {
+                    return Err(bad_value("$and must be an array"));
+                };
+                let mut residuals = Vec::with_capacity(items.len());
+                for item in items {
+                    let (found, residual) = extract_text_filter(item)?;
+                    if let Some(found) = found {
+                        if text.is_some() {
+                            return Err(bad_value("$text can appear only once in a filter"));
+                        }
+                        text = Some(found);
+                    }
+                    residuals.push(residual);
+                }
+                residual.insert("$and".to_string(), Value::Array(residuals));
+            }
+            "$or" | "$nor" => {
+                if value_contains_text(value) {
+                    return Err(bad_value(
+                        "$text is not supported inside $or or $nor by NonoDB",
+                    ));
+                }
+                residual.insert(key.clone(), value.clone());
+            }
+            _ => {
+                if value_contains_text(value) {
+                    return Err(bad_value(
+                        "$text is only supported at the filter top level or inside $and",
+                    ));
+                }
+                residual.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    Ok((text, Value::Object(residual)))
+}
+
+fn validate_text_sort(body: &Document) -> Result<(), ApiError> {
+    let Some(value) = body.get("sort") else {
+        return Ok(());
+    };
+    let Bson::Document(sort) = value else {
+        return Err(bad_value("sort must be a document"));
+    };
+    for (field, direction) in sort {
+        let Bson::Document(meta) = direction else {
+            return Err(bad_value(format!(
+                "text queries can only sort by $meta: \"textScore\" (field `{field}`)"
+            )));
+        };
+        if meta.get_str("$meta").ok() != Some("textScore") {
+            return Err(bad_value(format!(
+                "text queries can only sort by $meta: \"textScore\" (field `{field}`)"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn projection_uses_text_score(value: &Value) -> bool {
+    match value {
+        Value::Object(map) => {
+            if map.get("$meta").and_then(Value::as_str) == Some("textScore") {
+                return true;
+            }
+            map.values().any(projection_uses_text_score)
+        }
+        Value::Array(items) => items.iter().any(projection_uses_text_score),
+        _ => false,
+    }
+}
+
 async fn find_command(
     state: &super::AppState,
     connection_id: u64,
@@ -2026,15 +2548,27 @@ async fn find_command(
         .map_err(|_| bad_value("find must name a collection"))?
         .to_string();
     let database = database_name(body);
-    let filter = document_field(body, "filter")?.unwrap_or_else(|| json!({}));
+    let raw_filter = document_field(body, "filter")?.unwrap_or_else(|| json!({}));
+    let (text_query, filter) = extract_text_filter(&raw_filter)?;
     let projection = document_field(body, "projection")?;
-    let hint = if let Some(value) = body.get("hint") {
+    let hint = if text_query.is_some() {
+        if body.contains_key("hint") {
+            return Err(bad_value("$text queries do not support hint in NonoDB"));
+        }
+        None
+    } else if let Some(value) = body.get("hint") {
         Some(bson_map::bson_to_value(value).map_err(bad_value)?)
     } else {
         None
     };
-    let sort = sort_fields(body)?;
-    let ascending = id_sort_ascending(&sort)?;
+    let (sort, ascending) = if text_query.is_some() {
+        validate_text_sort(body)?;
+        (Vec::new(), true)
+    } else {
+        let sort = sort_fields(body)?;
+        let ascending = id_sort_ascending(&sort)?;
+        (sort, ascending)
+    };
     let skip = non_negative(body, "skip")?.unwrap_or(0);
     let raw_limit = int_field(body, "limit").unwrap_or(0);
     let single_batch = body.get_bool("singleBatch").unwrap_or(false) || raw_limit < 0;
@@ -2052,8 +2586,123 @@ async fn find_command(
     let max_time_ms = int_field(body, "maxTimeMS")
         .filter(|value| *value > 0)
         .map(|value| value as u64);
+    if text_query.is_some() && max_time_ms.is_some() {
+        return Err(bad_value("maxTimeMS is not supported with $text by NonoDB"));
+    }
     let namespace = format!("{database}.{collection}");
     let owner = format!("mongo:{connection_id}");
+    let Some(runtime) = database_for_read(state, &database).await else {
+        return Ok(cursor_reply(0, &namespace, Vec::new(), true));
+    };
+    let store = runtime.store.clone();
+    if let Some(query) = text_query {
+        let coll = collection.clone();
+        let search_store = store.clone();
+        let docs = tokio::task::spawn_blocking(move || {
+            let rtxn = search_store.read_txn()?;
+            let Some(c) = search_store.collection_at(&rtxn, &coll)? else {
+                rtxn.commit()?;
+                return Ok::<Vec<Value>, nonodb_core::Error>(Vec::new());
+            };
+            let Some(def) = c
+                .search_index_defs_in(&rtxn)?
+                .into_iter()
+                .find(|def| def.kind == nonodb_core::SearchKind::Text)
+            else {
+                return Err(nonodb_core::Error::Query(
+                    "text index required for $text query".into(),
+                ));
+            };
+            let docs = c.search_text_index_in(
+                &rtxn,
+                &def.name,
+                &query,
+                &filter,
+                0,
+                None,
+                nonodb_core::TextQueryMode::Mongo,
+            )?;
+            rtxn.commit()?;
+            Ok(docs)
+        })
+        .await
+        .map_err(|error| ApiError::internal(format!("find $text join error: {error}")))??;
+        let uses_meta = projection.as_ref().is_some_and(projection_uses_text_score);
+        let docs: Vec<Value> = docs
+            .into_iter()
+            .map(|mut doc| {
+                let score = doc.get("_score").cloned();
+                if let Some(object) = doc.as_object_mut() {
+                    object.remove("_score");
+                }
+                if let Some(projection) = projection.as_ref() {
+                    if uses_meta {
+                        if let (Some(score), Some(object)) = (score, doc.as_object_mut()) {
+                            object.insert("_score".to_string(), score);
+                        }
+                    }
+                    doc = nonodb_core::project_document(&doc, Some(projection));
+                }
+                if let Some(object) = doc.as_object_mut() {
+                    object.remove("_score");
+                }
+                doc
+            })
+            .skip(skip)
+            .take(limit.unwrap_or(usize::MAX))
+            .collect();
+        let docs = if single_batch {
+            docs.into_iter().take(batch_size).collect()
+        } else {
+            docs
+        };
+        let mut cursor_state = cursor::State::new(
+            owner,
+            database,
+            cursor::Kind::MaterializedAggregate {
+                coll: collection,
+                docs: Arc::new(docs),
+                offset: 0,
+            },
+            None,
+            Some(batch_size),
+        );
+        if batch_size == 0 {
+            let id = state
+                .cursors
+                .open(cursor_state)
+                .map_err(|message| ApiError {
+                    code: "cursor".into(),
+                    message,
+                })?;
+            return Ok(cursor_reply(id as i64, &namespace, Vec::new(), true));
+        }
+        let page = tokio::task::spawn_blocking(move || {
+            super::cursor_page(&store, None, &mut cursor_state, None)
+                .map(|(docs, has_more)| (docs, has_more, cursor_state))
+        })
+        .await
+        .map_err(|error| ApiError::internal(format!("find $text page join error: {error}")))??;
+        let (docs, has_more, cursor_state) = page;
+        let cursor_id = if has_more && !single_batch {
+            state
+                .cursors
+                .open(cursor_state)
+                .map_err(|message| ApiError {
+                    code: "cursor".into(),
+                    message,
+                })? as i64
+        } else {
+            0
+        };
+        return Ok(cursor_reply(
+            cursor_id,
+            &namespace,
+            values_to_bson(docs)?,
+            true,
+        ));
+    }
+
     let mut cursor_state = cursor::State::new(
         owner,
         database.clone(),
@@ -2071,9 +2720,6 @@ async fn find_command(
         limit,
         Some(batch_size),
     );
-    let Some(runtime) = database_for_read(state, &database).await else {
-        return Ok(cursor_reply(0, &namespace, Vec::new(), true));
-    };
     if batch_size == 0 {
         let id = state
             .cursors
@@ -2084,7 +2730,6 @@ async fn find_command(
             })?;
         return Ok(cursor_reply(id as i64, &namespace, Vec::new(), true));
     }
-    let store = runtime.store.clone();
     let page = tokio::task::spawn_blocking(move || {
         super::cursor_page(&store, None, &mut cursor_state, None)
             .map(|(docs, has_more)| (docs, has_more, cursor_state))

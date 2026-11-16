@@ -23,6 +23,9 @@ limitations are documented in [docs/roadmap.md](docs/roadmap.md).
 - [x] Opt-in automatic indexes for frequent read shapes with TTL cleanup
 - [x] BM25 full-text search, diacritic folding, quoted phrases
 - [x] Fuzzy search with trigrams and bounded Levenshtein distance
+- [x] Unified multi-field search index definitions with weighted BM25
+- [x] MongoDB wire `$text`: one text index, weights, phrase/negative clauses,
+      `$meta: "textScore"`, find/count/distinct/leading aggregate `$match`
 - [x] Read batches and atomic write batches
 - [x] Ordered point lookups (`lookup`/`lookup_one`) by `_id` or a unique
       single-field/compound index, with covering projections, `_id` exclusion,

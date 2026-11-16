@@ -1401,8 +1401,7 @@ impl Store {
         };
         let indexes = collection.index_defs_in(&*wtxn)?;
         let vectors = collection.list_vector_indexes_in(&*wtxn)?;
-        let texts = collection.list_text_indexes_in(&*wtxn)?;
-        let fuzzies = collection.list_fuzzy_indexes_in(&*wtxn)?;
+        let search = collection.search_index_defs_in(&*wtxn)?;
 
         for def in indexes {
             collection.drop_index_txn(wtxn, &def.name())?;
@@ -1410,11 +1409,8 @@ impl Store {
         for def in vectors {
             collection.drop_vector_index_txn(wtxn, &def.field)?;
         }
-        for field in texts {
-            collection.drop_text_index_txn(wtxn, &field)?;
-        }
-        for field in fuzzies {
-            collection.drop_fuzzy_index_txn(wtxn, &field)?;
+        for def in search {
+            collection.drop_search_index_txn(wtxn, def.kind, &def.name)?;
         }
 
         if let Some(db) = self.env.open_database::<Bytes, Bytes>(&*wtxn, Some(name))? {
@@ -1432,6 +1428,7 @@ impl Store {
         let prefixes = [
             format!("index:{name}:"),
             format!("vecdef:{name}:"),
+            format!("search:{name}:"),
             format!("text:{name}:"),
             format!("fuzzy:{name}:"),
             format!("fttotal:{name}:"),
@@ -1958,6 +1955,20 @@ impl Store {
             ReplicationOp::IndexDrop { coll, field } => {
                 let collection = self.collection_in(wtxn, coll)?;
                 collection.drop_index_txn(wtxn, field).map(|_| ())
+            }
+            ReplicationOp::SearchIndexCreate { coll, index } => {
+                let collection = self.collection_in(wtxn, coll)?;
+                collection.create_search_index_txn(wtxn, index)
+            }
+            ReplicationOp::SearchIndexDrop {
+                coll,
+                index_kind,
+                name,
+            } => {
+                let collection = self.collection_in(wtxn, coll)?;
+                collection
+                    .drop_search_index_txn(wtxn, *index_kind, name)
+                    .map(|_| ())
             }
             ReplicationOp::TextIndexCreate { coll, field } => {
                 let collection = self.collection_in(wtxn, coll)?;

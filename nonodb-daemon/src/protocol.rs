@@ -717,6 +717,15 @@ pub enum WriteReq {
         coll: String,
         indexes: Vec<IndexSpec>,
     },
+    CreateSearchIndex {
+        coll: String,
+        index: nonodb_core::SearchIndexDef,
+    },
+    DropSearchIndex {
+        coll: String,
+        kind: nonodb_core::SearchKind,
+        name: String,
+    },
     DropIndex {
         coll: String,
         field: String,
@@ -1039,6 +1048,7 @@ impl WriteReq {
         match self {
             Self::CreateIndex { .. }
             | Self::CreateIndexes { .. }
+            | Self::CreateSearchIndex { .. }
             | Self::CreateTextIndex { .. }
             | Self::CreateFuzzyIndex { .. }
             | Self::CreateVectorIndex { .. }

@@ -1581,6 +1581,31 @@ fn execute(
             let names: Vec<_> = indexes.iter().map(|index| index.fields.join("+")).collect();
             Ok(json!({ "created": names }))
         }
+        WriteReq::CreateSearchIndex { coll, index } => {
+            let c = standard_collection(store, wtxn, coll)?;
+            c.create_search_index_txn(wtxn, index)?;
+            replication.capture_op(ReplicationOp::SearchIndexCreate {
+                coll: coll.clone(),
+                index: index.clone(),
+            });
+            Ok(json!({
+                "created": index.name,
+                "kind": index.kind.as_str(),
+                "fields": index.fields
+            }))
+        }
+        WriteReq::DropSearchIndex { coll, kind, name } => {
+            let c = standard_collection(store, wtxn, coll)?;
+            let existed = c.drop_search_index_txn(wtxn, *kind, name)?;
+            if existed {
+                replication.capture_op(ReplicationOp::SearchIndexDrop {
+                    coll: coll.clone(),
+                    index_kind: *kind,
+                    name: name.clone(),
+                });
+            }
+            Ok(json!({ "dropped": existed, "kind": kind.as_str(), "name": name }))
+        }
         WriteReq::DropIndex { coll, field } => {
             let c = standard_collection(store, wtxn, coll)?;
             let existed = c.drop_index_txn(wtxn, field)?;
@@ -1594,40 +1619,44 @@ fn execute(
         }
         WriteReq::CreateTextIndex { coll, field } => {
             let c = standard_collection(store, wtxn, coll)?;
-            c.create_text_index_txn(wtxn, field)?;
-            replication.capture_op(ReplicationOp::TextIndexCreate {
+            let index = nonodb_core::SearchIndexDef::single(nonodb_core::SearchKind::Text, field);
+            c.create_search_index_txn(wtxn, &index)?;
+            replication.capture_op(ReplicationOp::SearchIndexCreate {
                 coll: coll.clone(),
-                field: field.clone(),
+                index,
             });
             Ok(json!({ "created": field, "kind": "text" }))
         }
         WriteReq::DropTextIndex { coll, field } => {
             let c = standard_collection(store, wtxn, coll)?;
-            let existed = c.drop_text_index_txn(wtxn, field)?;
+            let existed = c.drop_search_index_txn(wtxn, nonodb_core::SearchKind::Text, field)?;
             if existed {
-                replication.capture_op(ReplicationOp::TextIndexDrop {
+                replication.capture_op(ReplicationOp::SearchIndexDrop {
                     coll: coll.clone(),
-                    field: field.clone(),
+                    index_kind: nonodb_core::SearchKind::Text,
+                    name: field.clone(),
                 });
             }
             Ok(json!({ "dropped": existed, "kind": "text" }))
         }
         WriteReq::CreateFuzzyIndex { coll, field } => {
             let c = standard_collection(store, wtxn, coll)?;
-            c.create_fuzzy_index_txn(wtxn, field)?;
-            replication.capture_op(ReplicationOp::FuzzyIndexCreate {
+            let index = nonodb_core::SearchIndexDef::single(nonodb_core::SearchKind::Fuzzy, field);
+            c.create_search_index_txn(wtxn, &index)?;
+            replication.capture_op(ReplicationOp::SearchIndexCreate {
                 coll: coll.clone(),
-                field: field.clone(),
+                index,
             });
             Ok(json!({ "created": field, "kind": "fuzzy" }))
         }
         WriteReq::DropFuzzyIndex { coll, field } => {
             let c = standard_collection(store, wtxn, coll)?;
-            let existed = c.drop_fuzzy_index_txn(wtxn, field)?;
+            let existed = c.drop_search_index_txn(wtxn, nonodb_core::SearchKind::Fuzzy, field)?;
             if existed {
-                replication.capture_op(ReplicationOp::FuzzyIndexDrop {
+                replication.capture_op(ReplicationOp::SearchIndexDrop {
                     coll: coll.clone(),
-                    field: field.clone(),
+                    index_kind: nonodb_core::SearchKind::Fuzzy,
+                    name: field.clone(),
                 });
             }
             Ok(json!({ "dropped": existed, "kind": "fuzzy" }))

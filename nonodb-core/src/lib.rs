@@ -49,7 +49,9 @@ pub use error::{Error, Result};
 pub use history::{HistoryEntry, DEFAULT_HISTORY_MAX_VERSIONS};
 pub use index::{IndexDef, RangeBytes};
 pub use replication::{ReplicationChange, ReplicationTxn, REPLICATION_DB};
-pub use search::DEFAULT_FUZZY_DISTANCE;
+pub use search::{
+    SearchField, SearchIndexDef, SearchKind, TextQuery, TextQueryMode, DEFAULT_FUZZY_DISTANCE,
+};
 pub use store::{
     parse_size, ReadTxn, Store, WriteTxn, CONTROL_DB, MAP_SIZE, MAX_DBS, MAX_DOCUMENT_BYTES,
     META_DB, PAGE_SIZE,

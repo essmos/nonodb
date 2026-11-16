@@ -109,7 +109,7 @@ comparison and practical migration caveats.
   `$densify`, `$fill`, `$out`, `$merge` with `let` and `whenMatched` pipelines,
   `$facet`, `$bucket`, and `$bucketAuto`. Group state is held in memory; there
   is no disk spill.
-- No `$where` or `$text` query operator.
+- No `$where` query operator. The HTTP/core query language has no `$text`; MongoDB wire `$text` is a documented lexical subset backed by MongoDB-style text indexes.
 - `$jsonSchema` supports the common validation keywords but not every JSON
   Schema draft feature.
 - `$expr` uses the aggregation expression evaluator, including variables,

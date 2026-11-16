@@ -968,6 +968,11 @@ backups.
 - If tokenization or search analysis changes between versions, drop and recreate
   text and fuzzy indexes. Old index entries use the old analyzer and will not
   match new normalization rules.
+- Search index definitions are now stored as unified `SearchIndexDef` entries
+  under `search:<collection>:<kind>:<name>`. Data directories created by an
+  older release that used per-field `text:`/`fuzzy:` definition keys must drop
+  and recreate their text and fuzzy indexes; the old definitions are not read
+  automatically.
 - Schema version is stored in metadata. There is currently no automatic
   migration framework; changes are handled by explicit commands and releases.
 

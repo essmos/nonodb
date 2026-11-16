@@ -1731,7 +1731,8 @@ traverse arrays of objects:
   be the final path segment.
 - `$meta` supports `textScore`/`searchScore` (from `_score`),
   `indexKey` (from `_indexKey`), and `sortKey` (from `_sortKey`). NonoDB does
-  not compute full-text scores yet, so `textScore` defaults to `0.0`.
+  uses the `_score` produced by native search; documents without `_score`
+  project `textScore` as `0.0`.
 - Covering indexes can satisfy a top-level inclusive projection using indexed
   and `include`d fields without fetching the document. Nested and positional
   projections fetch the full document.
