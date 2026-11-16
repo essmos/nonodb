@@ -12,7 +12,7 @@ quick-start instructions, and a feature overview.
 | [Adaptive writer](adaptive-writer.md) | Operators, performance reviewers | Adaptive group-commit window, latency/throughput tuning, metrics and limits |
 | [GUI console](gui.md) | Operators, application developers | Embedded local React console, data editing, collection settings, SQL, map/metrics |
 | [HTTP API](api.md) | All client authors | Operations, request/response formats, filters, updates, aggregation, errors |
-| [MongoDB compatibility](mongodb-compatibility.md) | Evaluators, migrating teams | Supported MongoDB features, known differences, practical compatibility assessment |
+| [MongoDB compatibility](mongodb-compatibility.md) | Evaluators, migrating teams | Documented MongoDB-compatible subset, supported drivers, known differences, and migration assessment |
 | [SQL queries](sql.md) | Analysts, reporting jobs, application developers | `SELECT`, `INSERT`, `UPDATE`, `DELETE`, filters, aggregates, parameters, limits, client examples |
 | [Vault collections](vault.md) | Application developers, security reviewers | Optional whole-document encryption, tenant keys, restrictions, operations, key rotation |
 | [Document TTL](ttl.md) | Application developers, operators | Collection defaults, per-document overrides, update semantics, background expiry, limits |

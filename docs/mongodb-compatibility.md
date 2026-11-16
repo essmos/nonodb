@@ -1,14 +1,16 @@
 # MongoDB compatibility
 
-This page compares NonoDB's MongoDB-compatible API with MongoDB itself. It is a
-practical map, not a claim of drop-in replacement.
+This page documents NonoDB's **MongoDB-compatible subset** and compares it with
+MongoDB itself. It is a practical compatibility map, not a claim of drop-in
+replacement.
 
-> **Short answer:** NonoDB is an HTTP/JSON document database with a MongoDB-like
-> query language. It also has an **experimental MongoDB wire listener** for a
-> practical CRUD subset, with optional SCRAM-SHA-256/SHA-1 authentication. That
-> listener is not a drop-in MongoDB replacement: it does not yet implement
-> sessions, transactions, or change streams. The HTTP API and the
-> Python/Rust/Node.js/Go clients remain the supported interfaces.
+> **Short answer:** NonoDB provides a documented MongoDB-compatible subset
+> through an optional wire listener. Ordinary driver-based CRUD, cursors,
+> indexes, basic aggregation, ObjectId/BSON values, SCRAM authentication, and
+> TLS work with PyMongo, Node.js, and Go. The listener is not a drop-in MongoDB
+> replacement: sessions, multi-document transactions, change streams, and full
+> MongoDB parity remain out of scope. The HTTP API and the
+> Python/Rust/Node.js/Go clients remain the native interfaces.
 
 The assessment below is verified against NonoDB `0.25.x`.
 
@@ -32,7 +34,7 @@ The assessment below is verified against NonoDB `0.25.x`.
 | Aggregation expressions | ~70% | Broad but not exhaustive; no IANA time zones or user-defined JavaScript |
 | Indexes | ~65% | No sparse/partial/wildcard indexes, collation, or TTL index options |
 | BSON scalar types | ~75% | ObjectId `_id`, Date, Decimal128, Binary/UUID, Timestamp, MinKey/MaxKey, and numeric mapping |
-| Wire protocol and drivers | ~55% | Experimental handshake plus CRUD, sorted cursors, count, distinct, aggregate, index DDL, collection DDL, dropDatabase, SCRAM auth, and TLS; no sessions or transactions |
+| Wire protocol and drivers | ~70% | Documented MongoDB-compatible subset: handshake, CRUD, sorted cursors, count, distinct, aggregate, index DDL, collection DDL, dropDatabase, SCRAM auth, and TLS; no sessions or transactions |
 | Transactions and change streams | ~10% | Atomic write batches and outbox events exist, but not MongoDB APIs |
 
 These percentages are editorial estimates of the language/API surface that a
@@ -48,10 +50,10 @@ direct migration target.
 
 | Feature | Status | Notes |
 |---|---|---|
-| MongoDB wire protocol | 🟡 | Experimental listener with handshake, CRUD, cursors, count, distinct, aggregate, index DDL, collection DDL, SCRAM auth, and TLS; no sessions |
-| Official MongoDB drivers | 🟡 | PyMongo, Node.js, and Go drivers tested for CRUD, cursors, aggregation, indexes, BSON types, and SCRAM auth; Java is not yet in the automated matrix |
+| MongoDB wire protocol | ✅ | Documented MongoDB-compatible subset: handshake, CRUD, cursors, count, distinct, aggregate, index DDL, collection DDL, SCRAM auth, and TLS; no sessions or transactions |
+| Official MongoDB drivers | ✅ | PyMongo, Node.js, and Go drivers tested for CRUD, cursors, aggregation, indexes, BSON types, and SCRAM auth; Java is not yet in the automated matrix |
 | `mongosh` | ❌ | Use the NonoDB CLI, GUI, or HTTP API |
-| MongoDB URI / `mongodb://` | 🟡 | Single direct connection to `NONODB_MONGO_ADDR`; username/password works with SCRAM-SHA-256 or SCRAM-SHA-1 when configured; no replica-set URIs |
+| MongoDB URI / `mongodb://` | 🟡 | Single-host connection to `NONODB_MONGO_ADDR`; plain `mongodb://host:port/` works, `directConnection=true` is optional; username/password uses SCRAM-SHA-256 or SCRAM-SHA-1; no replica-set URIs |
 | Sessions | ❌ | No server sessions or causal consistency |
 | Retryable writes | ❌ | Writes are routed to the single writer |
 | Change streams | ❌ | Outbox events, `watch`, and subscriptions are separate APIs |
@@ -61,10 +63,12 @@ direct migration target.
 
 ## MongoDB wire listener
 
-Set `NONODB_MONGO_ADDR=127.0.0.1:27017` and connect with a MongoDB driver using
-`directConnection=true`. The listener is experimental. By default it is
-unauthenticated; set both `NONODB_MONGO_USERNAME` and
-`NONODB_MONGO_PASSWORD` to require SCRAM authentication. Both
+Set `NONODB_MONGO_ADDR=127.0.0.1:27017` and connect with a supported MongoDB
+driver. A plain single-host URI such as `mongodb://127.0.0.1:27017/` works;
+`directConnection=true` is optional. The listener implements the documented
+MongoDB-compatible subset. By default it is unauthenticated; set both
+`NONODB_MONGO_USERNAME` and `NONODB_MONGO_PASSWORD` to require SCRAM
+authentication. Both
 `SCRAM-SHA-256` and legacy `SCRAM-SHA-1` are supported; drivers normally choose
 SHA-256. Set `NONODB_MONGO_PRINCIPAL` to map the SCRAM account to an auth-file
 principal; its read/write/admin scopes are enforced by wire commands, and
@@ -233,10 +237,15 @@ python3 scripts/mongo_conformance_test.py
 
 For a replica set, point `MONGODB_CONFORMANCE_URL` at the writable primary. The
 harness covers BSON scalar round-trips, CRUD, filters, projections, sorting,
-updates, upserts, deletes, indexes, aggregation cursors, collection listing,
-duplicate-key errors, and unknown-command errors. It creates unique temporary
-databases and drops them at the end. Set `MONGODB_CONFORMANCE_KEEP=1` to retain
-them for investigation.
+updates, upserts, deletes, indexes, aggregation cursors, collection listing, and
+error codes for duplicate keys, missing namespaces, missing cursors, invalid
+options, and unknown commands. It creates unique temporary databases and drops
+them at the end. Set `MONGODB_CONFORMANCE_KEEP=1` to retain them for
+investigation.
+
+CI runs this harness, the wire smoke test, the official Node.js/Go drivers, and
+the SCRAM authorization test in the `mongodb-compat` job, against a real MongoDB
+service container.
 
 ## CRUD
 
@@ -414,9 +423,10 @@ allowed. Other BSON types are not accepted as `_id`.
 A migration from MongoDB to NonoDB should check these items first:
 
 1. **ObjectId `_id`** — supported, including default driver-generated ObjectIds.
-2. **Drivers** — the experimental wire listener covers CRUD, cursors, count,
-   distinct, aggregate, index DDL, and collection DDL only; use a NonoDB client
-   for authentication and server administration.
+2. **Drivers** — the documented MongoDB-compatible wire listener covers CRUD,
+   cursors, count, distinct, aggregate, index DDL, and collection DDL; use a
+   NonoDB client for native search, vault, replication, and server
+   administration.
 3. **Transactions and sessions** — redesign around atomic `write_batch`,
    idempotent operations, or application-level compensation.
 4. **Change streams** — replace with outbox events, `watch`, or subscriptions.

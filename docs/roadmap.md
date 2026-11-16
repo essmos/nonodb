@@ -196,14 +196,15 @@ comparison and practical migration caveats.
 
 ### Protocol and clients
 
-- The MongoDB wire listener is experimental. It supports handshake, CRUD,
-  cursors, count, distinct, aggregate, index DDL, collection DDL, optional
-  SCRAM-SHA-256/SCRAM-SHA-1 authentication, authSource validation, auth-file
-  principal scopes, aggregate cursor batching, strict rejection of unsupported
-  driver options, mongoexport/mongodump-compatible export, Node.js/Go driver
-  checks, and TLS.
-  It does not support client-certificate authentication, sessions, transactions,
-  or change streams.
+- The optional MongoDB-compatible wire listener implements a documented subset
+  for official drivers: handshake, CRUD, cursors, count, distinct, aggregate,
+  index DDL, collection DDL, SCRAM-SHA-256/SCRAM-SHA-1 authentication,
+  authSource validation, auth-file principal scopes, aggregate cursor batching,
+  strict rejection of unsupported driver options, mongoexport/mongodump-compatible
+  export, PyMongo/Node.js/Go conformance, and TLS.
+  It does not support client-certificate authentication, sessions,
+  multi-document transactions, change streams, collation, or full MongoDB
+  feature parity.
 - The supported API is HTTP/JSON; no gRPC, binary framing, or CBOR API.
 - The Python client is a single module, not a published package.
 - The CLI covers common administration, not every possible operation.
@@ -322,8 +323,9 @@ project's target workload.
 
 ## Non-goals
 
-- Full MongoDB wire-protocol compatibility. The narrow driver-compatible subset
-  is an experiment, not a replacement for the NonoDB API.
+- Full MongoDB feature parity. The documented MongoDB-compatible subset targets
+  common driver workloads and deliberately excludes sessions, multi-document
+  transactions, change streams, collation, and other advanced MongoDB features.
 - Distributed consensus, multi-writer clusters, or sharding. Asynchronous
   primary/replica replication is supported; see the
   [replication and cluster guide](replication-cluster-guide.md).

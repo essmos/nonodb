@@ -14,9 +14,9 @@ and authorization-management endpoints.
 - Readiness: `GET /readyz`
 - Authorization management: `/v1/auth`, `/v1/auth/principals`, `/v1/auth/tokens`, `/v1/auth/certificates`
 
-The API is JSON over HTTP/1.1. It is **not** MongoDB wire-protocol compatible.
-See [MongoDB compatibility](mongodb-compatibility.md) for the supported feature
-map and known differences. See [Multiple databases](multi-database.md) for
+The API is JSON over HTTP/1.1. It is **not** the MongoDB wire protocol. An
+optional [MongoDB-compatible wire listener](mongodb-compatibility.md) can be
+enabled with `NONODB_MONGO_ADDR` for official MongoDB drivers. See [Multiple databases](multi-database.md) for
 database routing and `list_databases`, `create_database`, and `drop_database`.
 
 ## Envelope

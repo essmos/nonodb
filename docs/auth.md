@@ -172,7 +172,7 @@ short-lived client certificates.
 
 ## MongoDB wire authentication
 
-The experimental MongoDB listener uses the same SCRAM credential for every
+The MongoDB-compatible wire listener uses the same SCRAM credential for every
 connection:
 
 - `NONODB_MONGO_USERNAME` / `NONODB_MONGO_PASSWORD` configure the SCRAM account.

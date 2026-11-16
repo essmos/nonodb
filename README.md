@@ -18,9 +18,10 @@ files. Hot data stays in the OS page cache instead of the daemon heap.
 NoNoDB is a local NoSQL document store written in Rust. It needs no external
 database server and runs comfortably on small VMs, edge boxes, and developer
 machines. It speaks a practical subset of MongoDB's query language over
-HTTP/JSON, stores documents in LMDB, and runs as a single daemon that is the
-only process allowed to touch the database files. Application workers connect
-to it through a Unix socket and use a thin client. One daemon can host several
+HTTP/JSON, exposes a documented MongoDB-compatible wire endpoint for official
+drivers, stores documents in LMDB, and runs as a single daemon that is the only
+process allowed to touch the database files. Application workers connect to it
+through a Unix socket and use a thin client. One daemon can host several
 independent databases.
 
 <p align="center">
@@ -36,6 +37,9 @@ Low resource use is the starting point, not the whole story. Under the hood,
 nonodb is a real document database with:
 
 - JSON documents, MongoDB-style filters, projections, sorting and updates;
+- an optional MongoDB-compatible wire endpoint for PyMongo, Node.js, and Go
+  drivers: CRUD, cursors, basic aggregation, index and collection DDL, BSON
+  types, SCRAM authentication, and TLS;
 - BSON-compatible dates with RFC 3339 input, timezone normalization and indexed ranges;
 - exact numeric comparison, BSON Decimal128, binary/UUID and ObjectId values with indexed ranges;
 - single-field, compound, unique and covering secondary indexes;
@@ -134,10 +138,11 @@ provide:
   primary/replica/standby cluster with quorum failover is supported; see the
   [replication and cluster guide](docs/replication-cluster-guide.md);
 - general interactive multi-document transactions;
-- full MongoDB wire-protocol compatibility; an experimental listener covers
-  CRUD, cursors, aggregation, index DDL, collection DDL, optional
-  SCRAM-SHA-256/SCRAM-SHA-1 login with auth-file scopes, and TLS, but not
-  sessions or transactions;
+- full MongoDB feature parity or a drop-in MongoDB server. It provides a
+  documented MongoDB-compatible subset through an optional wire listener:
+  CRUD, cursors, basic aggregation, index and collection DDL, ObjectId and BSON
+  values, SCRAM authentication, and TLS, but not sessions, multi-document
+  transactions, or change streams;
 - a role hierarchy or inherited groups; authorization uses principals and
   database-qualified scopes;
 - the full MongoDB query and update language; it implements a practical subset.
