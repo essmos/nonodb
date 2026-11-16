@@ -48,6 +48,20 @@ def main() -> int:
         assert coll.count_documents({"group": "smoke"}) == 10
         assert coll.estimated_document_count() == 10
         assert sorted(coll.distinct("tags")) == ["a", "b"]
+        streamed = list(
+            coll.aggregate(
+                [{"$match": {"group": "smoke"}}, {"$project": {"i": 1}}],
+                batch_size=3,
+            )
+        )
+        assert len(streamed) == 10
+        grouped = list(
+            coll.aggregate(
+                [{"$group": {"_id": "$group", "n": {"$sum": 1}}}],
+                batch_size=1,
+            )
+        )
+        assert grouped == [{"_id": "smoke", "n": 10}]
         assert [
             item["name"]
             for item in db.list_collections(filter={"name": coll.name})
@@ -68,8 +82,14 @@ def main() -> int:
                 ),
             ),
             (
-                "aggregate batchSize",
-                lambda: list(coll.aggregate([{"$match": {}}], batchSize=5)),
+                "aggregate cursor option",
+                lambda: db.command(
+                    {
+                        "aggregate": coll.name,
+                        "pipeline": [],
+                        "cursor": {"collation": {}},
+                    }
+                ),
             ),
             (
                 "writeConcern majority",

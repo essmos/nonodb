@@ -434,7 +434,7 @@ async fn dispatch_command(
         Some("findAndModify") | Some("findandmodify") => find_and_modify_command(state, body).await,
         Some("count") => count_command(state, body).await,
         Some("distinct") => distinct_command(state, body).await,
-        Some("aggregate") => aggregate_command(state, body).await,
+        Some("aggregate") => aggregate_command(state, connection_id, body).await,
         Some("createIndexes") => create_indexes_command(state, body).await,
         Some("listIndexes") => list_indexes_command(state, body).await,
         Some("dropIndexes") => drop_indexes_command(state, body).await,
@@ -1154,7 +1154,11 @@ async fn distinct_command(state: &super::AppState, body: &Document) -> Result<Do
     })
 }
 
-async fn aggregate_command(state: &super::AppState, body: &Document) -> Result<Document, ApiError> {
+async fn aggregate_command(
+    state: &super::AppState,
+    connection_id: u64,
+    body: &Document,
+) -> Result<Document, ApiError> {
     let collection = body
         .get_str("aggregate")
         .map_err(|_| bad_value("aggregate must name a collection"))?;
@@ -1176,6 +1180,17 @@ async fn aggregate_command(state: &super::AppState, body: &Document) -> Result<D
     let max_time_ms = int_field(body, "maxTimeMS")
         .filter(|value| *value > 0)
         .map(|value| value as u64);
+    let comment = body.get_str("comment").ok().map(str::to_string);
+    let cursor_options = aggregate_cursor_options(body)?;
+    let raw_batch_size = cursor_options
+        .batch_size
+        .unwrap_or(cursor::DEFAULT_BATCH_SIZE);
+    let empty_first_batch = cursor_options.batch_size == Some(0);
+    let batch_size = if raw_batch_size == 0 {
+        cursor::DEFAULT_BATCH_SIZE
+    } else {
+        cursor::normalize_batch(Some(raw_batch_size))
+    };
     if nonodb_core::aggregate::write_stage_spec(&pipeline)?.is_some() {
         let runtime = database_for_write(state, &database).await?;
         let (_, response) = super::submit_write(
@@ -1200,14 +1215,36 @@ async fn aggregate_command(state: &super::AppState, body: &Document) -> Result<D
             true,
         ));
     }
+    let namespace = format!("{database}.{collection}");
     let Some(runtime) = database_for_read(state, &database).await else {
-        return Ok(cursor_reply(
-            0,
-            &format!("{database}.{collection}"),
-            Vec::new(),
-            true,
-        ));
+        return Ok(cursor_reply(0, &namespace, Vec::new(), true));
     };
+    let owner = format!("mongo:{connection_id}");
+    if cursor_options.requested {
+        if let Some((filter, stages)) = streamable_aggregate_pipeline(&pipeline) {
+            let cursor_state = cursor::State::new(
+                owner,
+                database.clone(),
+                cursor::Kind::Aggregate {
+                    coll: collection,
+                    filter,
+                    stages,
+                    comment,
+                    max_time_ms,
+                },
+                None,
+                Some(batch_size),
+            );
+            return aggregate_cursor_page(
+                state,
+                &runtime,
+                &namespace,
+                cursor_state,
+                empty_first_batch,
+            )
+            .await;
+        }
+    }
     let store = runtime.store.clone();
     let coll = collection.clone();
     let docs = tokio::task::spawn_blocking(move || {
@@ -1216,13 +1253,122 @@ async fn aggregate_command(state: &super::AppState, body: &Document) -> Result<D
     })
     .await
     .map_err(|error| ApiError::internal(format!("aggregate join error: {error}")))??;
+    if !cursor_options.requested {
+        let docs = values_to_bson(docs)?;
+        return Ok(cursor_reply(0, &namespace, docs, true));
+    }
+    let cursor_state = cursor::State::new(
+        owner,
+        database,
+        cursor::Kind::MaterializedAggregate {
+            coll: collection,
+            docs: Arc::new(docs),
+            offset: 0,
+        },
+        None,
+        Some(batch_size),
+    );
+    aggregate_cursor_page(state, &runtime, &namespace, cursor_state, empty_first_batch).await
+}
+
+async fn aggregate_cursor_page(
+    state: &super::AppState,
+    runtime: &super::AppState,
+    namespace: &str,
+    mut cursor_state: cursor::State,
+    empty_first_batch: bool,
+) -> Result<Document, ApiError> {
+    if empty_first_batch {
+        let id = state
+            .cursors
+            .open(cursor_state)
+            .map_err(|message| ApiError {
+                code: "cursor".into(),
+                message,
+            })?;
+        return Ok(cursor_reply(id as i64, namespace, Vec::new(), true));
+    }
+    let store = runtime.store.clone();
+    let page = tokio::task::spawn_blocking(move || {
+        super::cursor_page(&store, None, &mut cursor_state, None)
+            .map(|(docs, has_more)| (docs, has_more, cursor_state))
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("aggregate cursor join error: {error}")))??;
+    let (docs, has_more, cursor_state) = page;
+    let cursor_id = if has_more {
+        state
+            .cursors
+            .open(cursor_state)
+            .map_err(|message| ApiError {
+                code: "cursor".into(),
+                message,
+            })? as i64
+    } else {
+        0
+    };
     let docs = values_to_bson(docs)?;
-    Ok(cursor_reply(
-        0,
-        &format!("{database}.{collection}"),
-        docs,
-        true,
-    ))
+    Ok(cursor_reply(cursor_id, namespace, docs, true))
+}
+
+struct AggregateCursorOptions {
+    requested: bool,
+    batch_size: Option<usize>,
+}
+
+fn aggregate_cursor_options(body: &Document) -> Result<AggregateCursorOptions, ApiError> {
+    match body.get("cursor") {
+        None | Some(Bson::Null) => Ok(AggregateCursorOptions {
+            requested: false,
+            batch_size: None,
+        }),
+        Some(Bson::Document(cursor)) => {
+            for key in cursor.keys() {
+                if key != "batchSize" {
+                    return Err(bad_value(format!(
+                        "aggregate cursor option `{key}` is not supported"
+                    )));
+                }
+            }
+            let batch_size = match cursor.get("batchSize") {
+                None => None,
+                Some(value) => {
+                    Some(bson_int(value).filter(|value| *value >= 0).ok_or_else(|| {
+                        bad_value("aggregate cursor.batchSize must be a non-negative integer")
+                    })? as usize)
+                }
+            };
+            Ok(AggregateCursorOptions {
+                requested: true,
+                batch_size,
+            })
+        }
+        Some(_) => Err(bad_value("aggregate cursor option must be a document")),
+    }
+}
+
+fn streamable_aggregate_pipeline(pipeline: &[Value]) -> Option<(Value, Vec<Value>)> {
+    let (filter, stages) = match pipeline.first().and_then(|stage| {
+        stage
+            .as_object()
+            .filter(|object| object.len() == 1)
+            .and_then(|object| object.get("$match"))
+    }) {
+        Some(filter) if filter.is_null() => (json!({}), &pipeline[1..]),
+        Some(filter) => (filter.clone(), &pipeline[1..]),
+        None => (json!({}), pipeline),
+    };
+    for stage in stages {
+        let object = stage.as_object()?;
+        if object.len() != 1 {
+            return None;
+        }
+        let name = object.keys().next()?;
+        if !matches!(name.as_str(), "$project" | "$addFields" | "$set" | "$unset") {
+            return None;
+        }
+    }
+    Some((filter, stages.to_vec()))
 }
 
 async fn create_collection_command(
@@ -1979,7 +2125,6 @@ fn validate_mongo_options(command: &str, body: &Document) -> Result<(), ApiError
                 &["explain"],
                 "not supported by the wire aggregate command",
             )?;
-            reject_cursor_batching(body, "aggregate")?;
             validate_concerns(body)
         }
         "count" => {
@@ -2941,11 +3086,6 @@ mod tests {
                 "returnKey",
             ),
             (
-                "aggregate",
-                bson::doc! { "aggregate": "items", "pipeline": [], "cursor": { "batchSize": 10 } },
-                "cursor.batchSize",
-            ),
-            (
                 "insert",
                 bson::doc! { "insert": "items", "documents": [], "bypassDocumentValidation": true },
                 "bypassDocumentValidation",
@@ -2990,6 +3130,38 @@ mod tests {
             &bson::doc! { "listCollections": 1, "filter": { "name": "items" } }
         )
         .is_ok());
+    }
+
+    #[test]
+    fn aggregate_cursor_support_is_explicit() {
+        let streamable = vec![
+            json!({"$match": {"tenant": "acme"}}),
+            json!({"$project": {"name": 1}}),
+        ];
+        let (filter, stages) = streamable_aggregate_pipeline(&streamable).unwrap();
+        assert_eq!(filter, json!({"tenant": "acme"}));
+        assert_eq!(stages.len(), 1);
+
+        assert!(streamable_aggregate_pipeline(&[
+            json!({"$match": {}}),
+            json!({"$group": {"_id": "$tenant"}}),
+        ])
+        .is_none());
+
+        let options = aggregate_cursor_options(
+            &bson::doc! { "aggregate": "items", "cursor": { "batchSize": 7 } },
+        )
+        .unwrap();
+        assert!(options.requested);
+        assert_eq!(options.batch_size, Some(7));
+        assert!(aggregate_cursor_options(
+            &bson::doc! { "aggregate": "items", "cursor": { "batchSize": -1 } }
+        )
+        .is_err());
+        assert!(aggregate_cursor_options(
+            &bson::doc! { "aggregate": "items", "cursor": { "collation": {} } }
+        )
+        .is_err());
     }
 
     #[test]

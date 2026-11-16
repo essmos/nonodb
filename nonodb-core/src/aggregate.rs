@@ -857,9 +857,14 @@ fn parse_stage(stage: &Value) -> Result<(&str, &Value)> {
 }
 
 fn as_usize(value: &Value, stage: &str) -> Result<usize> {
+    if let Some(value) = numeric::integer_value(value) {
+        return usize::try_from(value)
+            .map_err(|_| Error::Query(format!("{stage} requires a non-negative integer")));
+    }
     value
-        .as_u64()
-        .and_then(|n| usize::try_from(n).ok())
+        .as_f64()
+        .filter(|value| value.is_finite() && value.fract() == 0.0 && *value >= 0.0)
+        .and_then(|value| usize::try_from(value as u64).ok())
         .ok_or_else(|| Error::Query(format!("{stage} requires a non-negative integer")))
 }
 
@@ -881,11 +886,11 @@ pub(crate) fn truthy(value: &Value) -> bool {
 }
 
 fn is_exclusion(value: &Value) -> bool {
-    matches!(value, Value::Bool(false)) || value.as_f64().is_some_and(|n| n == 0.0)
+    matches!(value, Value::Bool(false)) || crate::numeric::as_f64(value).is_some_and(|n| n == 0.0)
 }
 
 fn is_inclusion(value: &Value) -> bool {
-    matches!(value, Value::Bool(true)) || value.as_f64().is_some_and(|n| n == 1.0)
+    matches!(value, Value::Bool(true)) || crate::numeric::as_f64(value).is_some_and(|n| n == 1.0)
 }
 
 fn project(doc: Value, spec: &Value, vars: &BTreeMap<String, Value>) -> Result<Value> {
@@ -972,9 +977,8 @@ pub(crate) fn parse_sort(spec: &Value) -> Result<Vec<(String, i32)>> {
         Value::Object(fields) => {
             let mut out = Vec::with_capacity(fields.len());
             for (field, dir) in fields {
-                let dir = dir
-                    .as_i64()
-                    .filter(|d| *d == 1 || *d == -1)
+                let dir = numeric::as_f64(dir)
+                    .filter(|d| *d == 1.0 || *d == -1.0)
                     .ok_or_else(|| Error::Query("$sort direction must be 1 or -1".into()))?;
                 out.push((field.clone(), dir as i32));
             }
@@ -4538,6 +4542,24 @@ mod tests {
         ];
         let out = run(docs, &pipeline, 100).unwrap();
         assert_eq!(out, vec![json!({"tenant": "a", "total": 30, "n": 2})]);
+    }
+
+    #[test]
+    fn project_accepts_extended_json_numeric_inclusions() {
+        let docs = vec![json!({
+            "_id": "a",
+            "n": {"$numberInt": "7"},
+            "drop": {"$numberLong": "9"},
+        })];
+        let pipeline = vec![json!({
+            "$project": {
+                "_id": {"$numberInt": "1"},
+                "n": {"$numberInt": "1"},
+                "drop": {"$numberInt": "0"},
+            }
+        })];
+        let out = run(docs, &pipeline, 100).unwrap();
+        assert_eq!(out, vec![json!({"_id": "a", "n": {"$numberInt": "7"}})]);
     }
 
     #[test]

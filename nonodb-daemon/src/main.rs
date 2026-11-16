@@ -1639,6 +1639,18 @@ fn cursor_page(
     if fetch == 0 {
         return Ok((Vec::new(), false));
     }
+    if let cursor::Kind::MaterializedAggregate { docs, offset, .. } = &mut state.kind {
+        let start = (*offset).min(docs.len());
+        let take = fetch.min(docs.len() - start);
+        let out = docs[start..start + take].to_vec();
+        *offset = start + take;
+        let has_more =
+            *offset < docs.len() && state.remaining.is_none_or(|remaining| remaining > take);
+        if let Some(remaining) = &mut state.remaining {
+            *remaining = remaining.saturating_sub(take);
+        }
+        return Ok((out, has_more));
+    }
 
     let kind = state.kind.clone();
     let coll = kind.coll().to_string();
@@ -1663,6 +1675,9 @@ fn cursor_page(
         cursor::Kind::Aggregate { filter, .. } => {
             cursor_filter(filter, state.last_id.as_ref(), ascending)
         }
+        cursor::Kind::MaterializedAggregate { .. } => {
+            unreachable!("materialized cursors are paged before reading the collection")
+        }
     };
     let (comment, max_time_ms, hint, sort) = match &kind {
         cursor::Kind::Find {
@@ -1677,6 +1692,9 @@ fn cursor_page(
             max_time_ms,
             ..
         } => (comment.clone(), *max_time_ms, None, Vec::new()),
+        cursor::Kind::MaterializedAggregate { .. } => {
+            unreachable!("materialized cursors are paged before reading the collection")
+        }
     };
     let id_only =
         sort.is_empty() || (sort.len() == 1 && matches!(sort[0].0.as_str(), "_id" | "$natural"));
@@ -1724,6 +1742,9 @@ fn cursor_page(
             let out = aggregate::run(docs, &stages, aggregate::max_docs())?;
             check_cursor_deadline(deadline)?;
             out
+        }
+        cursor::Kind::MaterializedAggregate { .. } => {
+            unreachable!("materialized cursors are paged before running aggregation")
         }
     };
     Ok((out, has_more))

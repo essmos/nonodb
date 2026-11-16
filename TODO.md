@@ -282,6 +282,7 @@ Design: [docs/replication.md](docs/replication.md).
 - [x] MongoDB wire SCRAM-SHA-1 authentication
 - [x] MongoDB wire authSource validation and auth-file principal scopes
 - [x] MongoDB wire strict option validation for unsupported driver options
+- [x] MongoDB wire aggregate cursor batching and getMore paging
 - [x] MongoDB wire listCollections/listDatabases filters and nameOnly
 - [x] Index union for top-level `$or` across indexed fields
 - [x] Use an index for sort-only queries without a filter

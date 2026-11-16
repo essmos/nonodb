@@ -92,19 +92,24 @@ supports arbitrary sort keys; `_id`/natural order uses fast keyset paging,
 while other sort keys use skip-based cursor paging and re-sort each batch.
 Index direction is accepted but NonoDB stores the field order, not
 ascending/descending direction. Custom MongoDB index names are rejected; use
-default names. `aggregate` returns the full result in the first batch; use the
-HTTP aggregation API or cursors for very large result sets. Upserts without an
-`_id` in the filter currently receive the core UUID rather than a
-driver-style ObjectId.
+default names. `aggregate` honors `cursor.batchSize` and `getMore`. Pipelines
+with an optional leading `$match` followed only by `$project`, `$addFields`,
+`$set`, or `$unset` stream pages from the collection; blocking pipelines are
+evaluated once and then paged from a materialized result. Without a `cursor`
+option the full result is returned in the first batch. Upserts without an `_id`
+in the filter currently receive the core UUID rather than a driver-style
+ObjectId.
 
 Driver-facing options are checked instead of silently ignored. The listener
 accepts non-empty `filter` documents for `listCollections` and `listDatabases`,
 and honors `nameOnly` for both. It accepts `readConcern` levels `local` and
 `available`, plus `writeConcern` `w:1`, but rejects unsupported concern values,
 `collation`, `let`, `hint` on commands that cannot use it, `min`/`max`,
-tailable/await-data cursors, `returnKey`, `showRecordId`, and cursor batching
-for `aggregate`/`listIndexes`/`listCollections`. Rejected options return
-MongoDB `BadValue` code `2` instead of changing query behavior silently.
+tailable/await-data cursors, `returnKey`, `showRecordId`, and cursor batching for
+`listIndexes`/`listCollections`. Aggregate cursor batching is supported; an
+unknown `cursor` sub-option or a negative `batchSize` is rejected. Rejected
+options return MongoDB `BadValue` code `2` instead of changing query behavior
+silently.
 
 ## CRUD
 

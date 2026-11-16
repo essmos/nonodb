@@ -3,12 +3,13 @@
 //! Cursors page by `_id`, which keeps memory bounded and avoids holding an LMDB
 //! read transaction across HTTP requests. Find cursors use fast `_id` keyset
 //! paging for `_id`/natural order and skip-based paging for other sort keys.
-//! Aggregation cursors support only document-local stages after an optional
-//! leading `$match` (no `$group`, `$unwind`, or `$sort`).
+//! Aggregation cursors support document-local stages after an optional leading
+//! `$match` without materializing the result. Blocking wire pipelines are
+//! evaluated once and then paged from a shared materialized result.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -38,12 +39,22 @@ pub enum Kind {
         comment: Option<String>,
         max_time_ms: Option<u64>,
     },
+    /// A fully evaluated aggregation result. This is only used when a wire
+    /// pipeline contains a blocking stage and therefore cannot be paged from
+    /// the source collection. The result is shared across cloned cursor states.
+    MaterializedAggregate {
+        coll: String,
+        docs: Arc<Vec<Value>>,
+        offset: usize,
+    },
 }
 
 impl Kind {
     pub fn coll(&self) -> &str {
         match self {
-            Self::Find { coll, .. } | Self::Aggregate { coll, .. } => coll,
+            Self::Find { coll, .. }
+            | Self::Aggregate { coll, .. }
+            | Self::MaterializedAggregate { coll, .. } => coll,
         }
     }
 }
@@ -71,7 +82,7 @@ impl State {
     ) -> Self {
         let skip = match &kind {
             Kind::Find { skip, .. } => *skip,
-            Kind::Aggregate { .. } => 0,
+            Kind::Aggregate { .. } | Kind::MaterializedAggregate { .. } => 0,
         };
         Self {
             owner,
@@ -89,7 +100,7 @@ impl State {
     pub fn ascending(&self) -> bool {
         match &self.kind {
             Kind::Find { ascending, .. } => *ascending,
-            Kind::Aggregate { .. } => true,
+            Kind::Aggregate { .. } | Kind::MaterializedAggregate { .. } => true,
         }
     }
 }
