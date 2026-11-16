@@ -186,6 +186,7 @@ python3 scripts/restore_drill.py             # backup -> verify -> restore -> qu
 python3 scripts/shutdown_test.py             # SIGTERM drain, JSON logs, durable in-flight write
 python3 scripts/mongo_conformance_test.py   # compare wire results with a real MongoDB
 python3 scripts/mongo_export_test.py        # mongoexport/mongodump/mongoimport/mongorestore
+scripts/mongo_drivers_test.sh              # official Node.js and Go MongoDB drivers
 python3 scripts/auth_test.py                 # scopes, token/cert auth, reload, audit, IP lockout
 python3 scripts/auth_api_test.py             # auth API, Prometheus, disk/snapshot metrics, readiness
 python3 scripts/backup_api_test.py           # backups, exclusions, keygen, age, local restore, S3/R2, restic
@@ -312,6 +313,7 @@ scripts are:
 | `scripts/clients_test.sh` | Rust, Node.js, Go client smoke tests, dates, TTL, vault, auth, shutdown, mTLS |
 | `scripts/mongo_conformance_test.py` | PyMongo operations compared with a real MongoDB server |
 | `scripts/mongo_export_test.py` | mongoexport/mongodump output and restore into real MongoDB |
+| `scripts/mongo_drivers_test.sh` | official Node.js and Go MongoDB driver compatibility |
 | `scripts/mtls_test.sh` | mTLS with generated CA/certs, all clients, live revocation |
 | `scripts/concurrency_test.py` | Independent writers/readers and unique indexes |
 

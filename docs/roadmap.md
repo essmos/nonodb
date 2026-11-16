@@ -200,7 +200,8 @@ comparison and practical migration caveats.
   cursors, count, distinct, aggregate, index DDL, collection DDL, optional
   SCRAM-SHA-256/SCRAM-SHA-1 authentication, authSource validation, auth-file
   principal scopes, aggregate cursor batching, strict rejection of unsupported
-  driver options, mongoexport/mongodump-compatible export, and TLS.
+  driver options, mongoexport/mongodump-compatible export, Node.js/Go driver
+  checks, and TLS.
   It does not support client-certificate authentication, sessions, transactions,
   or change streams.
 - The supported API is HTTP/JSON; no gRPC, binary framing, or CBOR API.

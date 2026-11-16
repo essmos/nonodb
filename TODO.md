@@ -285,6 +285,7 @@ Design: [docs/replication.md](docs/replication.md).
 - [x] MongoDB wire aggregate cursor batching and getMore paging
 - [x] MongoDB wire conformance harness against a real MongoDB server
 - [x] Mongo-compatible mongoexport/mongodump export and portability checks
+- [x] Official Node.js and Go MongoDB driver compatibility tests
 - [x] MongoDB wire listCollections/listDatabases filters and nameOnly
 - [x] Index union for top-level `$or` across indexed fields
 - [x] Use an index for sort-only queries without a filter

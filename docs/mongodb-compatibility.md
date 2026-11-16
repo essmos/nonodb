@@ -49,7 +49,7 @@ direct migration target.
 | Feature | Status | Notes |
 |---|---|---|
 | MongoDB wire protocol | 🟡 | Experimental listener with handshake, CRUD, cursors, count, distinct, aggregate, index DDL, collection DDL, SCRAM auth, and TLS; no sessions |
-| Official MongoDB drivers | 🟡 | PyMongo smoke-tested for CRUD, cursors, count, distinct, aggregate, index DDL, collection DDL, and SCRAM auth |
+| Official MongoDB drivers | 🟡 | PyMongo, Node.js, and Go drivers tested for CRUD, cursors, aggregation, indexes, BSON types, and SCRAM auth; Java is not yet in the automated matrix |
 | `mongosh` | ❌ | Use the NonoDB CLI, GUI, or HTTP API |
 | MongoDB URI / `mongodb://` | 🟡 | Single direct connection to `NONODB_MONGO_ADDR`; username/password works with SCRAM-SHA-256 or SCRAM-SHA-1 when configured; no replica-set URIs |
 | Sessions | ❌ | No server sessions or causal consistency |
@@ -110,6 +110,24 @@ tailable/await-data cursors, `returnKey`, `showRecordId`, and cursor batching fo
 unknown `cursor` sub-option or a negative `batchSize` is rejected. Rejected
 options return MongoDB `BadValue` code `2` instead of changing query behavior
 silently.
+
+### Driver tests
+
+`scripts/mongo_drivers_test.sh` runs the official MongoDB Node.js and Go drivers
+against the wire listener. Dependencies are installed into a temporary
+directory, so the repository is not modified. Start the daemon with
+`NONODB_MONGO_ADDR` enabled, then:
+
+```bash
+NONODB_MONGO_URL='mongodb://127.0.0.1:37017/?directConnection=true' \
+scripts/mongo_drivers_test.sh
+```
+
+The checks cover insert/find/update/delete, filters, sort, projection,
+distinct, count, index creation/listing, streamed and blocking aggregation with
+`batchSize`, and BSON ObjectId, Date, Decimal128, Binary, Timestamp, MinKey, and
+MaxKey round-trips. Node.js uses the official `mongodb` 6.x package and Go uses
+`go.mongodb.org/mongo-driver` 1.17.x.
 
 ### Export and portability
 
