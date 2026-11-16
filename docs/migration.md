@@ -34,7 +34,7 @@ normal client.
 |---|---|
 | Document size | 1 MiB |
 | HTTP request body | 4 MiB |
-| `_id` type | string only |
+| `_id` type | string or ObjectId |
 | Atomicity | Per `insert_many` request; not across collections |
 | Vault collections | Not supported by the generic importer |
 | Unsupported BSON | Timestamp, MinKey/MaxKey, regex values, Code, Symbol, DBPointer |
@@ -69,8 +69,9 @@ See [Dates](dates.md), [Numbers](numerics.md), and
 
 ### `_id` handling
 
-`_id` must be a string in nonodb. The importer converts common source forms to a
-stable string:
+`_id` may be a string or an ObjectId. The importer currently converts common
+source ObjectId forms to a stable string for HTTP imports; use the MongoDB wire
+listener or the Extended JSON ObjectId form when the ID type must be preserved.
 
 | Source `_id` | Imported `_id` |
 |---|---|

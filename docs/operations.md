@@ -79,7 +79,7 @@ secrets.
 | `NONODB_ALLOWED_UIDS` | — | Comma-separated Unix uid allow-list for UDS |
 | `NONODB_ALLOWED_GIDS` | — | Comma-separated Unix gid allow-list for UDS |
 | `NONODB_TCP` | — | TCP listen address, e.g. `127.0.0.1:7878` |
-| `NONODB_MONGO_ADDR` | — | Experimental MongoDB wire listener, e.g. `127.0.0.1:27017`. Currently handshake/ping only; no CRUD yet |
+| `NONODB_MONGO_ADDR` | — | Experimental unauthenticated MongoDB wire listener, e.g. `127.0.0.1:27017`. Supports handshake, CRUD, cursors, count, distinct, aggregate, and index DDL; no auth, collection DDL, sessions, or transactions |
 | `NONODB_TLS_CERT` | — | PEM certificate chain for TCP TLS |
 | `NONODB_TLS_KEY` | — | PEM private key for TCP TLS |
 | `NONODB_TLS_CLIENT_CA` | — | PEM CA bundle used to verify client certificates (mTLS) |

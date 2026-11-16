@@ -221,8 +221,9 @@ available. See [Vault collections](vault.md).
 user_id = users.insert({"name": "Ada", "age": 36})
 ```
 
-`insert` returns the `_id` string. If the document has no `_id`, the daemon
-generates a UUID v4.
+`insert` returns the `_id` value. String IDs remain strings; ObjectId IDs are
+returned as Extended JSON objects. If the document has no `_id`, the daemon
+generates a UUID v4 string.
 
 ```python
 ids = users.insert_many([

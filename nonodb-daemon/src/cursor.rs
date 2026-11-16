@@ -51,7 +51,7 @@ pub struct State {
     pub owner: String,
     pub database: String,
     pub kind: Kind,
-    pub last_id: Option<String>,
+    pub last_id: Option<Value>,
     pub remaining: Option<usize>,
     pub batch_size: usize,
     pub skip: usize,

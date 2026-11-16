@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use nonodb_core::replication::{ReplicationChange, ReplicationOp};
 use nonodb_core::{
-    events, vault, Collection, CollectionProfile, FindAndModifyOptions, FindQuery, Store,
+    events, id, vault, Collection, CollectionProfile, FindAndModifyOptions, FindQuery, Store,
 };
 use serde_json::{json, Value};
 use tokio::sync::oneshot;
@@ -620,19 +620,16 @@ fn aggregate_out(
     target.delete_txn(wtxn, &json!({}), true)?;
     if let Some(config) = &config {
         for doc in &before {
-            let id = doc
-                .get("_id")
-                .and_then(Value::as_str)
-                .ok_or_else(|| ApiError {
-                    code: "invalid_id".into(),
-                    message: "document has no string _id".into(),
-                })?;
+            let id = id::key_from_document(doc).ok_or_else(|| ApiError {
+                code: "invalid_id".into(),
+                message: "document has no valid _id".into(),
+            })?;
             emit_event(
                 store,
                 wtxn,
                 &spec.target,
                 "delete",
-                id,
+                &id,
                 Some(doc),
                 None,
                 config,
@@ -721,16 +718,16 @@ fn aggregate_merge(
         let existing = target.find_one_in(&*wtxn, &filter, None)?;
         if let Some(existing) = existing {
             matched += 1;
-            let id = existing
-                .get("_id")
-                .and_then(Value::as_str)
-                .ok_or_else(|| ApiError {
-                    code: "invalid_id".into(),
-                    message: "document has no string _id".into(),
-                })?
-                .to_string();
+            let id = id::key_from_document(&existing).ok_or_else(|| ApiError {
+                code: "invalid_id".into(),
+                message: "document has no valid _id".into(),
+            })?;
+            let existing_id = existing.get("_id").cloned().ok_or_else(|| ApiError {
+                code: "invalid_id".into(),
+                message: "document has no valid _id".into(),
+            })?;
             if let Some(result_id) = obj.get("_id") {
-                if result_id.as_str() != Some(id.as_str()) {
+                if id::key_from_value(result_id).as_deref() != Some(id.as_str()) {
                     return Err(ApiError {
                         code: "invalid_query".into(),
                         message: "$merge cannot change an existing document `_id`".into(),
@@ -753,11 +750,11 @@ fn aggregate_merge(
                     replacement
                         .as_object_mut()
                         .expect("object checked above")
-                        .insert("_id".to_string(), Value::String(id.clone()));
+                        .insert("_id".to_string(), existing_id.clone());
                     let update = json!([{"$replaceWith": replacement}]);
                     let out = target.update_opts_txn_filtered(
                         wtxn,
-                        &json!({"_id": id}),
+                        &json!({"_id": existing_id}),
                         &update,
                         false,
                         false,
@@ -783,7 +780,7 @@ fn aggregate_merge(
                         merge_when_matched_pipeline(&existing, &doc, stages, &spec.let_vars)?;
                     let replacement_id = replacement.get("_id");
                     if let Some(result_id) = replacement_id {
-                        if result_id.as_str() != Some(id.as_str()) {
+                        if id::key_from_value(result_id).as_deref() != Some(id.as_str()) {
                             return Err(ApiError {
                                 code: "invalid_query".into(),
                                 message: "$merge cannot change an existing document `_id`".into(),
@@ -793,12 +790,12 @@ fn aggregate_merge(
                         replacement
                             .as_object_mut()
                             .expect("pipeline output is an object")
-                            .insert("_id".to_string(), Value::String(id.clone()));
+                            .insert("_id".to_string(), existing_id.clone());
                     }
                     let update = json!([{"$replaceWith": replacement}]);
                     let out = target.update_opts_txn_filtered(
                         wtxn,
-                        &json!({"_id": id}),
+                        &json!({"_id": existing_id}),
                         &update,
                         false,
                         false,
@@ -1133,6 +1130,7 @@ fn execute(
                 if vault.is_some() {
                     return Err(vault::key_unexpected().into());
                 }
+                let inserted_id = doc.get("_id").cloned();
                 let id = c.insert_one_txn(wtxn, doc.clone())?;
                 if let Some(config) = &config {
                     emit_by_id(
@@ -1147,7 +1145,8 @@ fn execute(
                         replication,
                     )?;
                 }
-                Ok(json!({ "inserted_id": id }))
+                let inserted_id = inserted_id.unwrap_or(Value::String(id));
+                Ok(json!({ "inserted_id": inserted_id }))
             }
         }
         WriteReq::InsertMany { coll, docs, vault } => {
@@ -1168,8 +1167,12 @@ fn execute(
                     return Err(vault::key_unexpected().into());
                 }
                 let mut ids = Vec::with_capacity(docs.len());
+                let mut inserted_ids = Vec::with_capacity(docs.len());
                 for doc in docs {
-                    ids.push(c.insert_one_txn(wtxn, doc.clone())?);
+                    let inserted_id = doc.get("_id").cloned();
+                    let id = c.insert_one_txn(wtxn, doc.clone())?;
+                    inserted_ids.push(inserted_id.unwrap_or_else(|| Value::String(id.clone())));
+                    ids.push(id);
                 }
                 if let Some(config) = &config {
                     for id in &ids {
@@ -1186,7 +1189,7 @@ fn execute(
                         )?;
                     }
                 }
-                Ok(json!({ "inserted_ids": ids }))
+                Ok(json!({ "inserted_ids": inserted_ids }))
             }
         }
         WriteReq::Update {
@@ -1262,20 +1265,17 @@ fn execute(
                         )?;
                     } else {
                         for before in &before_docs {
-                            let id =
-                                before.get("_id").and_then(Value::as_str).ok_or_else(|| {
-                                    ApiError {
-                                        code: "invalid_id".into(),
-                                        message: "document has no string _id".into(),
-                                    }
-                                })?;
+                            let id = id::key_from_document(before).ok_or_else(|| ApiError {
+                                code: "invalid_id".into(),
+                                message: "document has no valid _id".into(),
+                            })?;
                             emit_by_id(
                                 store,
                                 wtxn,
                                 &c,
                                 coll,
                                 "update",
-                                id,
+                                &id,
                                 Some(before),
                                 config,
                                 replication,
@@ -1501,20 +1501,16 @@ fn execute(
             if let Some(config) = &config {
                 if !c.profile().is_vault() {
                     for before in &before_docs {
-                        let id =
-                            before
-                                .get("_id")
-                                .and_then(Value::as_str)
-                                .ok_or_else(|| ApiError {
-                                    code: "invalid_id".into(),
-                                    message: "document has no string _id".into(),
-                                })?;
+                        let id = id::key_from_document(before).ok_or_else(|| ApiError {
+                            code: "invalid_id".into(),
+                            message: "document has no valid _id".into(),
+                        })?;
                         emit_event(
                             store,
                             wtxn,
                             coll,
                             "delete",
-                            id,
+                            &id,
                             Some(before),
                             None,
                             config,

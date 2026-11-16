@@ -229,7 +229,9 @@ Response:
 
 - The document must be a JSON object.
 - If `_id` is omitted, a UUID v4 string is generated.
-- If `_id` is present it must be a string.
+- If `_id` is present it must be a string or an Extended JSON ObjectId
+  (`{"$oid": "..."}`). String IDs keep their existing format; ObjectId IDs are
+  returned as Extended JSON.
 - A duplicate `_id` or a unique-index conflict fails with `duplicate_key`.
 - `_id` is the primary key. Treat it as immutable.
 - The reserved top-level `_ttl` field sets a per-document expiry in seconds.
@@ -1609,8 +1611,8 @@ Use Extended JSON for binary, UUID, and ObjectId values:
 {"ref": {"$oid": "000000000000000000000001"}}
 ```
 
-`$uuid` is normalized to binary subtype `04`. ObjectId is currently a field
-value only; `_id` remains a string.
+`$uuid` is normalized to binary subtype `04`. ObjectId values are accepted both
+as ordinary fields and as `_id`.
 
 The `$type` operator accepts names, numeric BSON codes, or an array:
 
@@ -3100,7 +3102,7 @@ collection, op, id, and before/after documents. Replicas reject stale epochs. Re
 | `invalid_sql` | 400 | SQL parse/planning error or unsupported SQL clause |
 | `invalid_json` | 400 | Malformed JSON document or value |
 | `invalid_collection` | 400 | Invalid collection name |
-| `invalid_id` | 400 | `_id` is not a string |
+| `invalid_id` | 400 | `_id` is not a string or ObjectId |
 | `duplicate_key` | 400 | Duplicate `_id` or unique-index conflict |
 | `document_too_large` | 413 | Document exceeds 1 MiB |
 | `result_too_large` | 413 | `lookup` result budget exceeds 64 MiB |

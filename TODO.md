@@ -266,10 +266,16 @@ Design: [docs/replication.md](docs/replication.md).
       `$dateFromString` formats, and ISO week fields
 - [ ] IANA time zone identifiers for date expressions
 - [x] Nested projections, positional `$`, and basic `$meta` projections
-- [ ] ObjectId as `_id` (currently field values only)
+- [x] ObjectId as `_id` (string IDs remain supported)
 - [ ] BSON Timestamp and MinKey/MaxKey
 - [ ] Regular-expression values and legacy BSON value compatibility, excluding
       executable code types
+- [x] Experimental MongoDB wire handshake and BSON mapping
+- [x] MongoDB wire `insert`, `find`, `getMore`, and `killCursors`
+- [x] MongoDB wire `update`, `delete`, `findAndModify`, `count`, `distinct`, `aggregate`
+- [x] MongoDB wire createIndexes/listIndexes/dropIndexes
+- [ ] MongoDB wire create/drop/listCollections/listDatabases
+- [ ] MongoDB wire SCRAM authentication
 - [x] Index union for top-level `$or` across indexed fields
 - [x] Use an index for sort-only queries without a filter
 - [x] `$type` index ranges for indexed scalar fields

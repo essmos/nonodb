@@ -101,9 +101,9 @@ The payload must be exactly 24 hexadecimal characters. ObjectIds are stored in
 lowercase canonical form, compare and index by their 12 bytes, and support
 `{ "$type": "objectId" }`.
 
-ObjectId is currently supported as a field **value**. The document `_id` must
-remain a string. Changing `_id` to accept ObjectId would be a separate contract
-change.
+ObjectId is supported as both a field value and a document `_id`. String IDs are
+unchanged. ObjectIds use a reserved internal key prefix so they remain valid
+UTF-8 LMDB keys and sort after strings, matching BSON's type order.
 
 ## Index compatibility
 

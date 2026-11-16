@@ -19,6 +19,7 @@ use crate::error::{Error, Result};
 use crate::events::{self, EventConfig, EVENTS_COLLECTION};
 use crate::geo;
 use crate::history::{self, HistoryEntry};
+use crate::id;
 use crate::index::{self, IndexDef};
 use crate::numeric;
 use crate::query::{
@@ -2524,8 +2525,7 @@ impl<'e> Collection<'e> {
             .ok_or_else(|| Error::Query("document must be an object".into()))?;
 
         let id = match obj.get("_id") {
-            Some(Value::String(s)) => s.clone(),
-            Some(_) => return Err(Error::InvalidId),
+            Some(value) => id::key_from_value(value).ok_or(Error::InvalidId)?,
             None => {
                 let id = uuid::Uuid::new_v4().to_string();
                 obj.insert("_id".to_string(), Value::String(id.clone()));
@@ -2552,6 +2552,21 @@ impl<'e> Collection<'e> {
         Ok(id)
     }
 
+    /// Reads one document by its internal LMDB key.
+    ///
+    /// This is used by the MongoDB wire layer to translate an internal
+    /// upserted key back into the original BSON `_id` value.
+    pub fn find_by_key(&self, key: &str) -> Result<Option<Value>> {
+        let rtxn = self.read_txn()?;
+        let out = self
+            .db
+            .get(&rtxn, key.as_bytes())?
+            .map(parse_json)
+            .transpose()?;
+        rtxn.commit()?;
+        Ok(out)
+    }
+
     /// Applies a replicated document change without generating history or
     /// automatic events. Used only by the replica apply path.
     pub fn apply_replication_change_txn(
@@ -2569,7 +2584,7 @@ impl<'e> Collection<'e> {
             "insert" | "update" => {
                 let after = after
                     .ok_or_else(|| Error::Query("replication change is missing `after`".into()))?;
-                if after.get("_id").and_then(Value::as_str) != Some(id) {
+                if after.get("_id").and_then(id::key_from_value).as_deref() != Some(id) {
                     return Err(Error::Query(
                         "replication document `_id` does not match change id".into(),
                     ));
@@ -2697,9 +2712,8 @@ impl<'e> Collection<'e> {
     ) -> Result<Value> {
         let id = old
             .get("_id")
-            .and_then(Value::as_str)
-            .ok_or(Error::InvalidId)?
-            .to_string();
+            .and_then(id::key_from_value)
+            .ok_or(Error::InvalidId)?;
         let old_ttl = self.ttl_at(&*wtxn, &id)?;
         let mut new = old.clone();
         apply_with_options(&mut new, update, filter, array_filters)?;
@@ -2795,12 +2809,8 @@ impl<'e> Collection<'e> {
             let Some(old) = selected else {
                 return Ok(empty_find_and_modify());
             };
-            let id = old
-                .get("_id")
-                .and_then(Value::as_str)
-                .ok_or(Error::InvalidId)?
-                .to_string();
-            let removed = self.delete_txn(wtxn, &serde_json::json!({"_id": id}), false)?;
+            let id_value = old.get("_id").cloned().ok_or(Error::InvalidId)?;
+            let removed = self.delete_txn(wtxn, &serde_json::json!({"_id": id_value}), false)?;
             return Ok(FindAndModifyOutcome {
                 value: Some(apply_projection(old, opts.projection, Some(opts.filter))),
                 matched: removed,
@@ -6112,7 +6122,7 @@ impl<'e> Collection<'e> {
                     self.name
                 )));
             };
-            if obj.get("_id").and_then(Value::as_str) != Some(id) {
+            if obj.get("_id").and_then(id::key_from_value).as_deref() != Some(id) {
                 return Err(Error::Query(format!(
                     "document `{}`/`{id}` has a missing or mismatched _id",
                     self.name
@@ -6565,16 +6575,17 @@ fn value_at<'a>(doc: &'a Value, path_str: &str) -> Option<&'a Value> {
 }
 
 /// Recognizes a filter equivalent to an `_id` lookup.
-fn direct_id(filter: &Value) -> Option<&str> {
+fn direct_id(filter: &Value) -> Option<String> {
     let obj = filter.as_object()?;
     if obj.len() != 1 {
         return None;
     }
-    match obj.get("_id")? {
-        Value::String(id) => Some(id),
-        Value::Object(op) if op.len() == 1 => op.get("$eq")?.as_str(),
-        _ => None,
+    let value = obj.get("_id")?;
+    if let Some(id) = id::key_from_value(value) {
+        return Some(id);
     }
+    let op = value.as_object()?.get("$eq")?;
+    id::key_from_value(op)
 }
 
 /// Builds a primary-key `_id` range from `$gt/$gte/$lt/$lte` conditions.
@@ -6582,8 +6593,8 @@ fn direct_id(filter: &Value) -> Option<&str> {
 /// combining it with additional conditions without a full scan.
 fn id_bounds(filter: &Value) -> Option<IdBounds> {
     let cond = filter.as_object()?.get("_id")?;
-    if let Some(id) = cond.as_str() {
-        let key = id.as_bytes().to_vec();
+    if let Some(id) = id::key_from_value(cond) {
+        let key = id.into_bytes();
         return Some((Bound::Included(key.clone()), Bound::Included(key)));
     }
     let ops = cond.as_object()?;
@@ -6594,7 +6605,7 @@ fn id_bounds(filter: &Value) -> Option<IdBounds> {
         if ops.len() != 1 {
             return None;
         }
-        let key = eq.as_str()?.as_bytes().to_vec();
+        let key = id::key_from_value(eq)?.into_bytes();
         return Some((Bound::Included(key.clone()), Bound::Included(key)));
     }
 
@@ -6602,7 +6613,7 @@ fn id_bounds(filter: &Value) -> Option<IdBounds> {
     let mut upper = Bound::Unbounded;
     let mut saw = false;
     for (op, value) in ops {
-        let key = value.as_str()?.as_bytes().to_vec();
+        let key = id::key_from_value(value)?.into_bytes();
         match op.as_str() {
             "$gt" => lower = tighter_lower(lower, Bound::Excluded(key)),
             "$gte" => lower = tighter_lower(lower, Bound::Included(key)),
@@ -6888,9 +6899,9 @@ impl<'a> Acc<'a> {
             Acc::All(mut docs) => {
                 // Deterministic order of the returned set.
                 docs.sort_by(|a, b| {
-                    let ka = a.get("_id").and_then(Value::as_str).unwrap_or("");
-                    let kb = b.get("_id").and_then(Value::as_str).unwrap_or("");
-                    ka.cmp(kb)
+                    let ka = id::key_from_document(a).unwrap_or_default();
+                    let kb = id::key_from_document(b).unwrap_or_default();
+                    ka.cmp(&kb)
                 });
                 docs
             }
@@ -7558,6 +7569,38 @@ mod tests {
             assert_eq!(kept[0].doc.as_ref().unwrap()["v"], 2);
             assert_eq!(kept[1].doc.as_ref().unwrap()["v"], 1);
         }
+    }
+
+    #[test]
+    fn object_id_can_be_used_as_primary_key() {
+        let (_dir, store) = store();
+        let c = store.collection("object_ids").unwrap();
+        let oid = json!({"$oid": "000000000000000000000001"});
+        let key = c
+            .insert_one(json!({"_id": oid.clone(), "value": 1}))
+            .unwrap();
+        assert!(crate::id::is_object_id_key(&key));
+
+        let found = c.find_one(&json!({"_id": oid.clone()})).unwrap().unwrap();
+        assert_eq!(found["_id"], oid);
+        assert_eq!(found["value"], 1);
+
+        let updated = c
+            .update(
+                &json!({"_id": {"$eq": oid.clone()}}),
+                &json!({"$set": {"value": 2}}),
+                false,
+            )
+            .unwrap();
+        assert_eq!(updated, 1);
+        assert_eq!(
+            c.find_one(&json!({"_id": oid.clone()})).unwrap().unwrap()["value"],
+            2
+        );
+
+        let removed = c.delete(&json!({"_id": oid.clone()}), false).unwrap();
+        assert_eq!(removed, 1);
+        assert!(c.find_one(&json!({"_id": oid})).unwrap().is_none());
     }
 
     #[test]

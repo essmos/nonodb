@@ -4,12 +4,13 @@ This page compares NonoDB's MongoDB-compatible API with MongoDB itself. It is a
 practical map, not a claim of drop-in replacement.
 
 > **Short answer:** NonoDB is an HTTP/JSON document database with a MongoDB-like
-> query language. It is **not MongoDB wire-protocol compatible**, so MongoDB
-> drivers, `mongosh`, and tools that expect a MongoDB server cannot connect to
-> it. Compatibility applies to request semantics through NonoDB's own HTTP API,
-> Python/Rust/Node.js/Go clients, CLI, and GUI.
+> query language. It also has an **experimental, unauthenticated MongoDB wire
+> listener** for a practical CRUD subset. That listener is not a drop-in MongoDB
+> replacement: it does not yet implement sessions, transactions, change
+> streams, collection DDL, or authentication. The HTTP API and the
+> Python/Rust/Node.js/Go clients remain the supported interfaces.
 
-The assessment below is verified against NonoDB `0.25.x` at commit `c19e374`.
+The assessment below is verified against NonoDB `0.25.x`.
 
 ## Status legend
 
@@ -30,32 +31,56 @@ The assessment below is verified against NonoDB `0.25.x` at commit `c19e374`.
 | Aggregation stages | ~70% | Many common stages work; system, search, geoNear, and change-stream stages are absent |
 | Aggregation expressions | ~70% | Broad but not exhaustive; no IANA time zones or user-defined JavaScript |
 | Indexes | ~65% | No sparse/partial/wildcard indexes, collation, or TTL index options |
-| BSON scalar types | ~70% | ObjectId is a field value, not a valid `_id`; no Timestamp/MinKey/MaxKey |
-| Wire protocol and drivers | 0% | HTTP/JSON only; no MongoDB driver compatibility |
+| BSON scalar types | ~75% | ObjectId `_id`, Date, Decimal128, Binary/UUID and numeric mapping; no Timestamp/MinKey/MaxKey |
+| Wire protocol and drivers | ~40% | Experimental handshake plus CRUD, cursors, count, distinct, aggregate, and index DDL; no auth, collection DDL, sessions, or transactions |
 | Transactions and change streams | ~10% | Atomic write batches and outbox events exist, but not MongoDB APIs |
 
 These percentages are editorial estimates of the language/API surface that a
 typical application uses, not a conformance score.
 
-For an application that uses string `_id`, ordinary CRUD, secondary indexes,
-and common aggregation stages, the practical fit is usually high. An application
-that relies on MongoDB's default ObjectId `_id`, MongoDB drivers, transactions,
-change streams, or collation is not a direct migration target.
+For an application that uses ordinary CRUD, secondary indexes, common
+aggregation stages, and either string or ObjectId `_id`, the practical fit is
+usually high through the NonoDB clients. An application that needs a full
+MongoDB driver surface, transactions, change streams, or collation is not yet a
+direct migration target.
 
 ## Protocol and clients
 
 | Feature | Status | Notes |
 |---|---|---|
-| MongoDB wire protocol | ❌ | NonoDB uses JSON over HTTP/1.1 |
-| Official MongoDB drivers | ❌ | Use the NonoDB Python, Rust, Node.js, or Go clients |
+| MongoDB wire protocol | 🟡 | Experimental listener with handshake, CRUD, cursors, count, distinct, aggregate, and index DDL; no collection DDL, sessions, or auth |
+| Official MongoDB drivers | 🟡 | PyMongo smoke-tested for CRUD, cursors, count, distinct, aggregate, and index DDL; no collection DDL or auth |
 | `mongosh` | ❌ | Use the NonoDB CLI, GUI, or HTTP API |
-| MongoDB URI / `mongodb://` | ❌ | NonoDB uses HTTP URLs and Unix sockets |
+| MongoDB URI / `mongodb://` | 🟡 | Only a single direct connection to `NONODB_MONGO_ADDR`; no replica-set or auth URIs |
 | Sessions | ❌ | No server sessions or causal consistency |
 | Retryable writes | ❌ | Writes are routed to the single writer |
 | Change streams | ❌ | Outbox events, `watch`, and subscriptions are separate APIs |
 | Multi-document transactions | ❌ | `write_batch` is atomic, but it is not a general transaction API |
 | Read/write concern | 🟡 | NonoDB has per-request durability; no MongoDB concern model |
 | Bulk write API | 🟡 | Equivalent batching exists through `write_batch`, not `bulkWrite` |
+
+## MongoDB wire listener
+
+Set `NONODB_MONGO_ADDR=127.0.0.1:27017` and connect with a MongoDB driver using
+`directConnection=true`. The listener is experimental and unauthenticated.
+
+| Wire command | Status |
+|---|---|
+| `hello` / `isMaster` / `ping` / `buildInfo` | ✅ |
+| `insert` / `find` / `getMore` / `killCursors` | ✅ |
+| `update` / `delete` / `findAndModify` | ✅ |
+| `count` / `distinct` / basic `aggregate` | ✅ |
+| `createIndexes` / `listIndexes` / `dropIndexes` | ✅ |
+| `create` / `drop` / `listCollections` / `listDatabases` | ❌ |
+| SCRAM authentication / TLS client auth | ❌ |
+| Sessions / transactions / change streams | ❌ |
+
+`find` currently sorts only by `_id` on the wire. Index direction is accepted
+but NonoDB stores the field order, not ascending/descending direction. Custom
+MongoDB index names are rejected; use default names. `aggregate` returns the
+full result in the first batch; use the HTTP aggregation API or cursors for
+very large result sets. Upserts without an `_id` in the filter currently
+receive the core UUID rather than a driver-style ObjectId.
 
 ## CRUD
 
@@ -75,8 +100,10 @@ change streams, or collation is not a direct migration target.
 | Multi-document transaction | ❌ | Use a single atomic `write_batch` where applicable |
 | Server-side JavaScript | ❌ | No JS execution |
 
-NonoDB `_id` values are strings. ObjectId values are supported in ordinary fields,
-but an ObjectId cannot be the document `_id`.
+NonoDB `_id` values may be strings or ObjectIds. Existing string IDs remain
+unchanged; ObjectIds are stored with an internal UTF-8 key prefix and are
+returned as BSON ObjectIds on the wire. Mixed string/ObjectId collections are
+allowed. Other BSON types are not accepted as `_id`.
 
 ## Query filters
 
@@ -198,14 +225,14 @@ but an ObjectId cannot be the document `_id`.
 
 | Type | Status | Notes |
 |---|---|---|
-| String | ✅ | Required type for `_id` |
+| String | ✅ | Supported `_id` type |
 | Double / int / long | ✅ | Exact numeric comparison |
 | Decimal128 (finite) | ✅ | Extended JSON `$numberDecimal` |
 | Decimal128 NaN / Infinity | ❌ | Not fully supported |
 | Date | ✅ | BSON-compatible instants, indexed ranges, sorting |
 | Binary / UUID | ✅ | `$binary` and `$uuid` |
 | ObjectId field value | ✅ | `$oid`; indexed and `$type`-aware |
-| ObjectId `_id` | ❌ | `_id` must remain a string |
+| ObjectId `_id` | ✅ | Accepted from drivers and stored without converting to a string |
 | Timestamp | ❌ | |
 | MinKey / MaxKey | ❌ | |
 | Regular-expression value | ❌ | `$regex` filters work; BSON regex values do not |
@@ -228,9 +255,10 @@ but an ObjectId cannot be the document `_id`.
 
 A migration from MongoDB to NonoDB should check these items first:
 
-1. **ObjectId `_id`** — convert default ObjectIds to strings, or plan a schema
-   change before importing.
-2. **Drivers** — replace MongoDB drivers with a NonoDB client.
+1. **ObjectId `_id`** — supported, including default driver-generated ObjectIds.
+2. **Drivers** — the experimental wire listener covers CRUD, cursors, count,
+   distinct, aggregate, and index DDL only; use a NonoDB client for collection
+   DDL and authentication.
 3. **Transactions and sessions** — redesign around atomic `write_batch`,
    idempotent operations, or application-level compensation.
 4. **Change streams** — replace with outbox events, `watch`, or subscriptions.
@@ -242,8 +270,9 @@ A migration from MongoDB to NonoDB should check these items first:
    before import.
 9. **Unsupported aggregation expressions/stages** — rewrite with supported
    stages or precompute outside the database.
-10. **Wire-protocol tooling** — replace `mongosh`, BI connectors, and monitoring
-    integrations that connect through the MongoDB protocol.
+10. **Wire-protocol tooling** — `mongosh`, BI connectors, and monitoring
+    integrations that need more than basic insert/find must use another
+    interface until the wire listener grows.
 
 See [Migration and import](migration.md) for the import workflow and
 [Roadmap and limits](roadmap.md) for planned compatibility work.

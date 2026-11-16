@@ -144,7 +144,7 @@ comparison and practical migration caveats.
   Decimal arithmetic rounds results to 34 significant digits; values outside
   the Decimal128 exponent range return `invalid_numeric`.
 - Long text has no dedicated type; the 1 MiB document limit applies to strings.
-- ObjectId is supported as a field value, not as `_id`.
+- ObjectId is supported as both a field value and `_id`.
 - BSON `Timestamp`, `MinKey`, `MaxKey`, regular-expression values, and legacy
   code/symbol types are not implemented.
 
@@ -196,9 +196,10 @@ comparison and practical migration caveats.
 
 ### Protocol and clients
 
-- No MongoDB wire-protocol compatibility and no official MongoDB driver
-  support.
-- HTTP/JSON only; no gRPC, binary framing, or CBOR API.
+- The MongoDB wire listener is experimental and unauthenticated. It currently
+  supports handshake, CRUD, cursors, count, distinct, aggregate, and index DDL;
+  it does not support collection DDL, sessions, transactions, or change streams.
+- The supported API is HTTP/JSON; no gRPC, binary framing, or CBOR API.
 - The Python client is a single module, not a published package.
 - The CLI covers common administration, not every possible operation.
 
@@ -316,7 +317,8 @@ project's target workload.
 
 ## Non-goals
 
-- MongoDB wire-protocol compatibility.
+- Full MongoDB wire-protocol compatibility. The narrow driver-compatible subset
+  is an experiment, not a replacement for the NonoDB API.
 - Distributed consensus, multi-writer clusters, or sharding. Asynchronous
   primary/replica replication is supported; see the
   [replication and cluster guide](replication-cluster-guide.md).

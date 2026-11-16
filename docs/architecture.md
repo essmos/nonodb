@@ -123,9 +123,10 @@ An LMDB environment contains named sub-databases. nonodb uses this layout:
 | `dbslot:<n>` (vector) | `_id` | norm + `f32` components | Exact vector index |
 | legacy `idx:*`, `ft:*`, `ftl:*`, `fz:*` | as above | as above | Resources created by older releases |
 
-Collection names are validated. The `_id` is always a string and is also the
-primary B+ tree key. Documents are serialized with `serde_json`; reads use
-`sonic-rs` for faster parsing.
+Collection names are validated. A string `_id` is used directly as the primary
+B+ tree key. An ObjectId `_id` uses a reserved high-codepoint UTF-8 prefix, which
+sorts after ordinary strings and preserves BSON type ordering. Documents are
+serialized with `serde_json`; reads use `sonic-rs` for faster parsing.
 
 Dates use MongoDB Extended JSON (`{"$date": {"$numberLong": "<ms>"}}`) and are
 canonicalized on write to UTC Unix milliseconds. Index encoding gives dates

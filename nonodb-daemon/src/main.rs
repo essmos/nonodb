@@ -417,7 +417,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             redirect_state,
             write_location,
         ))
-        .with_state(state);
+        .with_state(state.clone());
 
     // Optional TCP listener (with TLS when a certificate and key are provided).
     let mut tcp_task: Option<tokio::task::JoinHandle<()>> = None;
@@ -456,8 +456,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(addr) = mongo_addr.as_deref() {
         let addr = addr.to_string();
         let shutdown = shutdown_rx.clone();
+        let mongo_state = state.clone();
         mongo_task = Some(tokio::spawn(async move {
-            if let Err(e) = mongo_wire::serve(&addr, shutdown, drain_timeout).await {
+            if let Err(e) = mongo_wire::serve(&addr, mongo_state, shutdown, drain_timeout).await {
                 tracing::error!(?e, %addr, "Mongo wire listener stopped");
             }
         }));
@@ -1591,11 +1592,11 @@ fn cursor_api_error(message: String) -> ApiError {
     }
 }
 
-fn cursor_filter(base: &Value, last_id: Option<&str>, ascending: bool) -> Value {
+fn cursor_filter(base: &Value, last_id: Option<&Value>, ascending: bool) -> Value {
     let mut filters = vec![base.clone()];
     if let Some(last_id) = last_id {
         let op = if ascending { "$gt" } else { "$lt" };
-        filters.push(json!({"_id": {op: last_id}}));
+        filters.push(json!({"_id": {op: last_id.clone()}}));
     }
     if filters.len() == 1 {
         filters.pop().expect("one filter")
@@ -1632,10 +1633,10 @@ fn cursor_page(
     let ascending = state.ascending();
     let filter = match &kind {
         cursor::Kind::Find { filter, .. } => {
-            cursor_filter(filter, state.last_id.as_deref(), ascending)
+            cursor_filter(filter, state.last_id.as_ref(), ascending)
         }
         cursor::Kind::Aggregate { filter, .. } => {
-            cursor_filter(filter, state.last_id.as_deref(), ascending)
+            cursor_filter(filter, state.last_id.as_ref(), ascending)
         }
     };
     let (comment, max_time_ms, hint) = match &kind {
@@ -1670,11 +1671,7 @@ fn cursor_page(
     if docs.is_empty() {
         return Ok((Vec::new(), false));
     }
-    state.last_id = docs
-        .last()
-        .and_then(|doc| doc.get("_id"))
-        .and_then(Value::as_str)
-        .map(str::to_owned);
+    state.last_id = docs.last().and_then(|doc| doc.get("_id").cloned());
     if let Some(remaining) = &mut state.remaining {
         *remaining = remaining.saturating_sub(docs.len());
     }

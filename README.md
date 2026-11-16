@@ -134,7 +134,9 @@ provide:
   primary/replica/standby cluster with quorum failover is supported; see the
   [replication and cluster guide](docs/replication-cluster-guide.md);
 - general interactive multi-document transactions;
-- MongoDB wire-protocol compatibility;
+- full MongoDB wire-protocol compatibility; an experimental unauthenticated
+  listener covers CRUD, cursors, aggregation, and index DDL, but not collection
+  DDL, sessions, transactions, or authentication;
 - a role hierarchy or inherited groups; authorization uses principals and
   database-qualified scopes;
 - the full MongoDB query and update language; it implements a practical subset.
@@ -158,7 +160,7 @@ single-database directories are migrated to `default/` on startup. See
 ### Documents and queries
 
 - JSON documents in named collections, stored as JSON on disk.
-- Automatic `_id` generation with UUID v4; custom string `_id` is supported.
+- Automatic `_id` generation with UUID v4; custom string and ObjectId `_id` are supported.
 - MongoDB-style filters: equality, `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`,
   `$in`, `$nin`, `$all`, `$size`, `$elemMatch`, `$exists`, `$regex`/`$options`,
   `$type`, `$mod`, `$bitsAllClear`/`$bitsAllSet`/`$bitsAnyClear`/`$bitsAnySet`,
@@ -370,7 +372,8 @@ See [Dates and time zones](docs/dates.md) for formats, indexes, and limitations.
   `{"$numberDouble": "Infinity"}`.
 - Integer forms `{"$numberInt": "42"}` / `{"$numberLong": "9007199254740993"}`
   preserve their BSON type.
-- Binary/UUID (`$binary`, `$uuid`) and ObjectId (`$oid`) values are indexed.
+- Binary/UUID (`$binary`, `$uuid`) and ObjectId (`$oid`) values are indexed;
+  ObjectId can also be used as `_id`.
 - The `$type` query operator matches BSON scalar types by name or code.
 - Long text remains a normal string, bounded by the 1 MiB document limit.
 
