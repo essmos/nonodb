@@ -924,11 +924,8 @@ impl<'e> Collection<'e> {
             })
             .collect();
         self.create_indexes_txn(wtxn, &secondary_specs)?;
-        for field in &text {
-            self.create_text_index_txn(wtxn, field)?;
-        }
-        for field in &fuzzy {
-            self.create_fuzzy_index_txn(wtxn, field)?;
+        for def in &search_defs {
+            self.create_search_index_txn(wtxn, def)?;
         }
         for def in &vector {
             self.create_vector_index_txn(wtxn, &def.field, def.dims, def.metric)?;
@@ -9482,6 +9479,25 @@ mod tests {
             let rtxn = c.env.read_txn().unwrap();
             let verify = c.verify_in(&rtxn).unwrap();
             assert_eq!(verify.text_indexes, vec!["docs_text".to_string()]);
+        }
+        let report = c.reindex().unwrap();
+        assert_eq!(report.text, vec!["docs_text".to_string()]);
+        assert_eq!(
+            ids(c
+                .search_text_index("docs_text", "alpha gamma", &json!({}), 0, None)
+                .unwrap()),
+            vec!["1", "2", "4"]
+        );
+        {
+            let rtxn = c.env.read_txn().unwrap();
+            let defs = c.search_index_defs_in(&rtxn).unwrap();
+            assert_eq!(defs.len(), 1);
+            assert_eq!(defs[0].name, "docs_text");
+            assert_eq!(defs[0].fields.len(), 2);
+            assert_eq!(defs[0].fields[0].path, "title");
+            assert_eq!(defs[0].fields[0].weight, 2.0);
+            assert_eq!(defs[0].fields[1].path, "body");
+            assert_eq!(defs[0].fields[1].weight, 1.0);
         }
         c.drop_search_index(SearchKind::Text, "docs_text").unwrap();
         assert!(c
