@@ -91,6 +91,11 @@ func main() {
 		panic(err)
 	}
 	check(len(docs) == 2 && docs[0]["_id"] == "c" && docs[1]["_id"] == "b", "filter and sort")
+	regexCount, err := items.CountDocuments(ctx, bson.M{"tag": primitive.Regex{Pattern: "^x"}})
+	if err != nil {
+		panic(err)
+	}
+	check(regexCount == 2, "BSON regex filter")
 
 	result, err := items.UpdateOne(
 		ctx,

@@ -25,7 +25,7 @@ The assessment below is verified against NonoDB `0.25.x`.
 | Area | Approximate practical coverage | Main caveat |
 |---|---:|---|
 | CRUD and find semantics | ~90% | No MongoDB sessions, retryable writes, or multi-document transactions |
-| Query filters | ~80% | No `$where`, `$text`, collation, or full BSON regex values |
+| Query filters | ~80% | No `$where`, `$text`, or collation; BSON regex values work as read filters but cannot be stored |
 | Projection | ~75% | `$meta` is approximate; no arbitrary computed projection expressions |
 | Updates | ~85% | Pipeline updates support a subset of stages |
 | Aggregation stages | ~70% | Many common stages work; system, search, geoNear, and change-stream stages are absent |
@@ -218,7 +218,7 @@ allowed. Other BSON types are not accepted as `_id`.
 | `$comment` as a filter operator | ❌ | `comment` is available as a query option |
 | `$rand` | ❌ | |
 | Collation | ❌ | No per-query or per-index collation |
-| BSON regex document values | ❌ | Rejected with `BadValue` (code 2) on writes and filters; use the `$regex` query operator |
+| BSON regex value filters | ✅ | Direct driver regex literals and `$in` operands; stored regex values are rejected with `BadValue` (code 2) |
 
 ## Projection
 
@@ -329,7 +329,7 @@ allowed. Other BSON types are not accepted as `_id`.
 | ObjectId `_id` | ✅ | Accepted from drivers and stored without converting to a string |
 | Timestamp | ✅ | Extended JSON `$timestamp`; indexed and `$type`-aware |
 | MinKey / MaxKey | ✅ | Sentinel values with BSON ordering and `$type` support |
-| Regular-expression value | ❌ | `$regex` filters work; stored/filter BSON regex values are rejected loudly with `BadValue` (code 2) |
+| Regular-expression value | 🟡 | Read filters accept BSON regex values; storing a regex value is rejected with `BadValue` (code 2) |
 | Code / CodeWithScope / Symbol | ❌ | |
 | DBPointer / Undefined | ❌ | |
 
@@ -360,7 +360,7 @@ A migration from MongoDB to NonoDB should check these items first:
 6. **Collation** — normalize strings or enforce ordering in the application.
 7. **Sparse/partial/TTL indexes** — remodel as collection settings, separate
    indexes, or application logic.
-8. **BSON regex values** — rewrite as `$regex` filters or application logic; the wire listener rejects them with `BadValue` (code 2) instead of accepting them silently.
+8. **Stored BSON regex values** — read filters accept driver regex literals, but regex values cannot be stored; keep them out of documents or rewrite them as strings plus `$regex` filters.
 9. **Unsupported aggregation expressions/stages** — rewrite with supported
    stages or precompute outside the database.
 10. **Wire-protocol tooling** — `mongosh`, BI connectors, and monitoring

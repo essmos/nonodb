@@ -158,9 +158,9 @@ until the index is recreated.
 
 The following BSON types are deliberately unsupported:
 
-- regular-expression values. The MongoDB wire listener rejects BSON regex values
-  on writes and filters with `BadValue` (code 2); a BSON regex is accepted only
-  as the argument of the `$regex` operator,
+- regular-expression values as stored data. The MongoDB wire listener accepts
+  BSON regex values as read filters (including `$in` operands) but rejects them
+  in documents, updates, and projections with `BadValue` (code 2),
 - `Code`, `CodeWithScope`, `Symbol`, `DBPointer`, `Undefined`.
 
 Stored-code types are not planned because nonodb does not execute document

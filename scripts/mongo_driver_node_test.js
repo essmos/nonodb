@@ -69,6 +69,7 @@ async function main() {
       .sort({ n: -1 })
       .toArray();
     assert(filtered.map((doc) => doc._id).join(",") === "c,b", "filter and sort");
+    assert((await items.countDocuments({ tag: /^x/ })) === 2, "BSON regex filter");
 
     const updated = await items.updateOne(
       { _id: "a" },

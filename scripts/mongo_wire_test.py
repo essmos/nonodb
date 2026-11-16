@@ -104,11 +104,26 @@ def main() -> int:
         assert isinstance(replacement.upserted_id, ObjectId), replacement.upserted_id
 
         regex_coll = db[f"regex_smoke_{os.getpid()}"]
-        regex_coll.insert_one({"name": "abc"})
-        assert (
-            regex_coll.find_one({"name": {"$regex": re.compile("^a")}})["name"]
-            == "abc"
-        )
+        regex_coll.insert_many([{"name": "abc"}, {"name": "xyz"}])
+        assert regex_coll.find_one({"name": re.compile("^a")})["name"] == "abc"
+        assert regex_coll.find_one({"name": {"$regex": re.compile("^a")}})[
+            "name"
+        ] == "abc"
+        assert regex_coll.count_documents({"name": re.compile("^a")}) == 1
+        assert [
+            doc["name"]
+            for doc in regex_coll.find({"name": {"$in": [re.compile("^x")]}})
+        ] == ["xyz"]
+        assert [
+            doc["name"]
+            for doc in regex_coll.aggregate(
+                [{"$match": {"name": re.compile("^a")}}]
+            )
+        ] == ["abc"]
+        assert [
+            item["name"]
+            for item in db.list_collections(filter={"name": re.compile("^regex_smoke_")})
+        ] == [regex_coll.name]
 
         for label, operation in [
             (
@@ -116,13 +131,9 @@ def main() -> int:
                 lambda: regex_coll.insert_one({"name": re.compile("^a")}),
             ),
             (
-                "BSON regex filter",
-                lambda: regex_coll.find_one({"name": re.compile("^a")}),
-            ),
-            (
-                "BSON regex aggregate match",
-                lambda: list(
-                    regex_coll.aggregate([{"$match": {"name": re.compile("^a")}}])
+                "BSON regex update",
+                lambda: regex_coll.update_one(
+                    {"name": "abc"}, {"$set": {"name": re.compile("^a")}}
                 ),
             ),
             ("collation", lambda: list(coll.find({}, collation={"locale": "en"}))),

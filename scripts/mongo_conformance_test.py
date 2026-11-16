@@ -13,6 +13,7 @@ Set `MONGODB_CONFORMANCE_KEEP=1` to keep the temporary databases for debugging.
 """
 
 import os
+import re
 import sys
 import uuid
 from datetime import datetime, timezone
@@ -215,6 +216,14 @@ def main() -> int:
         check_both(
             "regex filter",
             lambda db: sorted_docs(db, {"tag": {"$regex": "^x"}}),
+        )
+        check_both(
+            "BSON regex value filter",
+            lambda db: sorted_docs(db, {"tag": re.compile("^x")}),
+        )
+        check_both(
+            "BSON regex value in $in",
+            lambda db: sorted_docs(db, {"tag": {"$in": [re.compile("^y")]}}),
         )
         check_both(
             "projection and array slice",

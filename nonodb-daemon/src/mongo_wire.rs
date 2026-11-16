@@ -2100,8 +2100,9 @@ fn values_to_bson(values: Vec<Value>) -> Result<Vec<Bson>, ApiError> {
 }
 
 /// MongoDB drivers send a regex literal as a BSON regular-expression value.
-/// NonoDB supports `$regex` query arguments but not stored regex values, so
-/// reject them explicitly instead of silently storing or ignoring them.
+/// NonoDB supports those values as read predicates, but does not store them, so
+/// reject them explicitly in documents, updates, projections, and non-filter
+/// aggregation positions.
 fn is_bson_regex(value: &Value) -> bool {
     value.as_object().is_some_and(|object| {
         object.len() == 1
@@ -2111,25 +2112,21 @@ fn is_bson_regex(value: &Value) -> bool {
     })
 }
 
-fn reject_bson_regex(value: &Value, allow_regex_operator: bool) -> Result<(), ApiError> {
+fn reject_stored_bson_regex(value: &Value) -> Result<(), ApiError> {
     if is_bson_regex(value) {
         return Err(bad_value(
-            "BSON regular-expression values are not supported; use the $regex operator",
+            "stored BSON regular-expression values are not supported; use the $regex operator",
         ));
     }
     match value {
         Value::Array(items) => {
             for item in items {
-                reject_bson_regex(item, allow_regex_operator)?;
+                reject_stored_bson_regex(item)?;
             }
         }
         Value::Object(object) => {
-            for (key, item) in object {
-                // A BSON regex is valid as the argument of `$regex`.
-                if allow_regex_operator && key == "$regex" {
-                    continue;
-                }
-                reject_bson_regex(item, allow_regex_operator)?;
+            for item in object.values() {
+                reject_stored_bson_regex(item)?;
             }
         }
         _ => {}
@@ -2137,24 +2134,22 @@ fn reject_bson_regex(value: &Value, allow_regex_operator: bool) -> Result<(), Ap
     Ok(())
 }
 
-fn reject_aggregate_regex(value: &Value) -> Result<(), ApiError> {
+fn reject_aggregate_stored_regex(value: &Value) -> Result<(), ApiError> {
     if is_bson_regex(value) {
         return Err(bad_value(
-            "BSON regular-expression values are not supported; use the $regex operator",
+            "stored BSON regular-expression values are not supported; use the $regex operator",
         ));
     }
     match value {
         Value::Array(items) => {
             for item in items {
-                reject_aggregate_regex(item)?;
+                reject_aggregate_stored_regex(item)?;
             }
         }
         Value::Object(object) => {
             for (key, item) in object {
-                if key == "$match" {
-                    reject_bson_regex(item, true)?;
-                } else {
-                    reject_aggregate_regex(item)?;
+                if key != "$match" {
+                    reject_aggregate_stored_regex(item)?;
                 }
             }
         }
@@ -2174,7 +2169,7 @@ fn validate_mongo_bson_values(command: &str, body: &Document) -> Result<(), ApiE
         "insert" => {
             if let Some(Value::Array(documents)) = command_field(body, "documents")? {
                 for document in &documents {
-                    reject_bson_regex(document, false)?;
+                    reject_stored_bson_regex(document)?;
                 }
             }
         }
@@ -2184,61 +2179,28 @@ fn validate_mongo_bson_values(command: &str, body: &Document) -> Result<(), ApiE
                     let Some(spec) = update.as_object() else {
                         continue;
                     };
-                    if let Some(filter) = spec.get("q") {
-                        reject_bson_regex(filter, true)?;
-                    }
                     if let Some(update) = spec.get("u") {
-                        reject_bson_regex(update, false)?;
-                    }
-                    if let Some(filters) = spec.get("arrayFilters").and_then(Value::as_array) {
-                        for filter in filters {
-                            reject_bson_regex(filter, true)?;
-                        }
-                    }
-                }
-            }
-        }
-        "delete" => {
-            if let Some(Value::Array(deletes)) = command_field(body, "deletes")? {
-                for delete in &deletes {
-                    if let Some(filter) = delete.get("q") {
-                        reject_bson_regex(filter, true)?;
+                        reject_stored_bson_regex(update)?;
                     }
                 }
             }
         }
         "find" => {
-            if let Some(filter) = command_field(body, "filter")? {
-                reject_bson_regex(&filter, true)?;
-            }
             if let Some(projection) = command_field(body, "projection")? {
-                reject_bson_regex(&projection, false)?;
-            }
-        }
-        "count" | "distinct" => {
-            if let Some(filter) = command_field(body, "query")? {
-                reject_bson_regex(&filter, true)?;
+                reject_stored_bson_regex(&projection)?;
             }
         }
         "findAndModify" | "findandmodify" => {
-            if let Some(filter) = command_field(body, "query")? {
-                reject_bson_regex(&filter, true)?;
-            }
             if let Some(update) = command_field(body, "update")? {
-                reject_bson_regex(&update, false)?;
+                reject_stored_bson_regex(&update)?;
             }
             if let Some(fields) = command_field(body, "fields")? {
-                reject_bson_regex(&fields, false)?;
+                reject_stored_bson_regex(&fields)?;
             }
         }
         "aggregate" => {
             if let Some(pipeline) = command_field(body, "pipeline")? {
-                reject_aggregate_regex(&pipeline)?;
-            }
-        }
-        "listCollections" | "listDatabases" => {
-            if let Some(filter) = command_field(body, "filter")? {
-                reject_bson_regex(&filter, true)?;
+                reject_aggregate_stored_regex(&pipeline)?;
             }
         }
         _ => {}

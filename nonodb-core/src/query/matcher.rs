@@ -71,6 +71,10 @@ pub(crate) fn match_field(actual: Option<&Value>, cond: &Value) -> bool {
 }
 
 fn match_field_vars(actual: Option<&Value>, cond: &Value, vars: &BTreeMap<String, Value>) -> bool {
+    // A BSON regex value is a query predicate, not an operator document.
+    if regex::is_value(cond) {
+        return regex::is_match(actual, cond, None);
+    }
     // Extended JSON dates are objects, not operators.
     if date::is_date(cond) || numeric::is_numeric(cond) || bson_types::is_bson_value(cond) {
         return eq_opt(actual, cond);
@@ -146,6 +150,9 @@ fn all_opt(actual: Option<&Value>, arg: &Value) -> bool {
 
 /// Matches an `$in`/`$all` operand, including regex-shaped operands.
 fn operand_opt(actual: Option<&Value>, expected: &Value) -> bool {
+    if regex::is_value(expected) {
+        return regex::is_match(actual, expected, None);
+    }
     if let Some(ops) = expected.as_object() {
         if let Some(pattern) = ops.get("$regex") {
             return regex::is_match(actual, pattern, ops.get("$options"));
@@ -571,6 +578,18 @@ mod tests {
             &json!({"name": {"$regex": {"$regularExpression": {
                 "pattern": "^ala$", "options": "i"
             }}}})
+        ));
+        assert!(matches(
+            &doc,
+            &json!({"name": {"$regularExpression": {
+                "pattern": "^Al", "options": ""
+            }}})
+        ));
+        assert!(matches(
+            &doc,
+            &json!({"tags": {"$in": [
+                {"$regularExpression": {"pattern": "^pi", "options": ""}}
+            ]}})
         ));
     }
 

@@ -27,6 +27,15 @@ fn cache() -> &'static Mutex<Cache> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Returns whether a value is a BSON regular-expression value represented as
+/// Extended JSON.
+pub fn is_value(value: &Value) -> bool {
+    value
+        .as_object()
+        .and_then(|object| object.get("$regularExpression"))
+        .is_some_and(Value::is_object)
+}
+
 /// Parses a regex argument and optional `$options`.
 ///
 /// The argument may be a plain pattern string or an Extended JSON
