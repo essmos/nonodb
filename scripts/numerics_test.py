@@ -129,12 +129,16 @@ def main() -> None:
         "invalid_numeric",
         lambda: c.insert({"_id": "bad", "price": dec("not-a-number")}),
     )
-    expect(
-        "invalid_numeric",
-        lambda: c.insert({"_id": "nan_dec", "price": dec("NaN")}),
-    )
+    # Non-finite Decimal128 values are accepted, canonicalized, and queryable.
+    c.insert({"_id": "nan_dec", "price": dec("NaN")})
+    c.insert({"_id": "pos_inf_dec", "price": dec("Infinity")})
+    c.insert({"_id": "neg_inf_dec", "price": dec("-Infinity")})
     assert c.find_one({"_id": "bad"}) is None
-    assert c.find_one({"_id": "nan_dec"}) is None
+    assert c.find_one({"_id": "nan_dec"})["price"] == dec("NaN")
+    assert [d["_id"] for d in c.find({"price": dec("NaN")})] == ["nan_dec"]
+    assert [d["_id"] for d in c.find({"price": dec("Infinity")})] == [
+        "pos_inf_dec"
+    ]
 
     print("OK: exact integers, Decimal128, arithmetic, special doubles, indexes")
     db.close()
