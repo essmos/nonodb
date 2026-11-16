@@ -639,7 +639,11 @@ struct PushSpec {
 }
 
 fn parse_push(v: &Value) -> Result<PushSpec> {
-    let Some(obj) = v.as_object() else {
+    let scalar = v.as_object().is_none()
+        || numeric::is_numeric(v)
+        || crate::date::is_date(v)
+        || crate::bson_types::is_bson_value(v);
+    let Some(obj) = v.as_object().filter(|_| !scalar) else {
         return Ok(PushSpec {
             values: vec![v.clone()],
             position: None,
@@ -1056,6 +1060,24 @@ pub fn replace(doc: &mut Value, replacement: &Value) -> Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn push_treats_extended_json_scalars_as_values() {
+        let mut doc = json!({"tags": []});
+        apply(&mut doc, &json!({"$push": {"tags": {"$numberInt": "4"}}})).unwrap();
+        apply(
+            &mut doc,
+            &json!({"$push": {"tags": {"$oid": "64b64c000000000000000001"}}}),
+        )
+        .unwrap();
+        assert_eq!(
+            doc,
+            json!({"tags": [
+                {"$numberInt": "4"},
+                {"$oid": "64b64c000000000000000001"}
+            ]})
+        );
+    }
 
     #[test]
     fn set_and_inc() {

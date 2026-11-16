@@ -184,6 +184,7 @@ python3 scripts/db_slots_test.py             # >256 index/search create-drop cyc
 python3 scripts/resize_test.py               # online map growth under concurrent I/O
 python3 scripts/restore_drill.py             # backup -> verify -> restore -> query
 python3 scripts/shutdown_test.py             # SIGTERM drain, JSON logs, durable in-flight write
+python3 scripts/mongo_conformance_test.py   # compare wire results with a real MongoDB
 python3 scripts/auth_test.py                 # scopes, token/cert auth, reload, audit, IP lockout
 python3 scripts/auth_api_test.py             # auth API, Prometheus, disk/snapshot metrics, readiness
 python3 scripts/backup_api_test.py           # backups, exclusions, keygen, age, local restore, S3/R2, restic
@@ -308,6 +309,7 @@ scripts are:
 | `scripts/large_crash_test.sh` | Crash during writes on a large database |
 | `scripts/uvicorn_test.sh` | 12 uvicorn workers against one daemon |
 | `scripts/clients_test.sh` | Rust, Node.js, Go client smoke tests, dates, TTL, vault, auth, shutdown, mTLS |
+| `scripts/mongo_conformance_test.py` | PyMongo operations compared with a real MongoDB server |
 | `scripts/mtls_test.sh` | mTLS with generated CA/certs, all clients, live revocation |
 | `scripts/concurrency_test.py` | Independent writers/readers and unique indexes |
 

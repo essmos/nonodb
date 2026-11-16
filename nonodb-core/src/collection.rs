@@ -7068,12 +7068,16 @@ pub fn project_document(doc: &Value, projection: Option<&Value>) -> Value {
     }
 }
 
+fn projection_integer(value: &Value) -> Option<i64> {
+    numeric::integer_value(value).and_then(|value| i64::try_from(value).ok())
+}
+
 fn slice_projection(value: &Value, arg: &Value) -> Value {
     let Some(items) = value.as_array() else {
         return value.clone();
     };
     let len = items.len();
-    let (skip, limit) = if let Some(n) = arg.as_i64() {
+    let (skip, limit) = if let Some(n) = projection_integer(arg) {
         if n >= 0 {
             (0usize, usize::try_from(n).unwrap_or(usize::MAX).min(len))
         } else {
@@ -7086,10 +7090,10 @@ fn slice_projection(value: &Value, arg: &Value) -> Value {
         if pair.len() != 2 {
             return value.clone();
         }
-        let Some(skip) = pair[0].as_i64() else {
+        let Some(skip) = projection_integer(&pair[0]) else {
             return value.clone();
         };
-        let Some(limit) = pair[1].as_i64() else {
+        let Some(limit) = projection_integer(&pair[1]) else {
             return value.clone();
         };
         if limit <= 0 {
@@ -7985,6 +7989,18 @@ mod tests {
             })
             .unwrap();
         assert_eq!(last, vec![json!({"tags": ["c"]})]);
+
+        let extended = c
+            .find(&FindQuery {
+                filter: serde_json::json!({}),
+                projection: Some(json!({
+                    "tags": {"$slice": {"$numberInt": "2"}},
+                    "_id": 0
+                })),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(extended, vec![json!({"tags": ["a", "b"]})]);
     }
 
     #[test]

@@ -51,14 +51,14 @@ def main() -> int:
         streamed = list(
             coll.aggregate(
                 [{"$match": {"group": "smoke"}}, {"$project": {"i": 1}}],
-                batch_size=3,
+                batchSize=3,
             )
         )
         assert len(streamed) == 10
         grouped = list(
             coll.aggregate(
                 [{"$group": {"_id": "$group", "n": {"$sum": 1}}}],
-                batch_size=1,
+                batchSize=1,
             )
         )
         assert grouped == [{"_id": "smoke", "n": 10}]

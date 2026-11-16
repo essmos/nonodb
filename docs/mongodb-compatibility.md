@@ -111,6 +111,25 @@ unknown `cursor` sub-option or a negative `batchSize` is rejected. Rejected
 options return MongoDB `BadValue` code `2` instead of changing query behavior
 silently.
 
+### Conformance harness
+
+`scripts/mongo_conformance_test.py` runs the same PyMongo workload against the
+NonoDB wire listener and a real MongoDB server, then compares normalized BSON
+results and error codes:
+
+```bash
+NONODB_MONGO_URL='mongodb://127.0.0.1:37017/?directConnection=true' \
+MONGODB_CONFORMANCE_URL='mongodb://127.0.0.1:27017/?directConnection=true' \
+python3 scripts/mongo_conformance_test.py
+```
+
+For a replica set, point `MONGODB_CONFORMANCE_URL` at the writable primary. The
+harness covers BSON scalar round-trips, CRUD, filters, projections, sorting,
+updates, upserts, deletes, indexes, aggregation cursors, collection listing,
+duplicate-key errors, and unknown-command errors. It creates unique temporary
+databases and drops them at the end. Set `MONGODB_CONFORMANCE_KEEP=1` to retain
+them for investigation.
+
 ## CRUD
 
 | Feature | Status | Notes |
