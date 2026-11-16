@@ -914,6 +914,7 @@ error code. `comment` is accepted for correlation but is not stored.
 | `$lookup` | Join documents from another collection |
 | `$unionWith` | Append the result of another collection or sub-pipeline |
 | `$graphLookup` | Recursively traverse references across a collection |
+| `$setWindowFields` | Partition, sort, rank, and compute windowed accumulators |
 | `$sort` | Sort by one or more fields |
 | `$skip` | Skip documents |
 | `$limit` | Limit documents |
@@ -1071,6 +1072,39 @@ Recursively traverses references in another collection:
 - A missing foreign collection produces empty `as` arrays.
 - The aggregate intermediate-document limit applies to each `as` result.
 
+### `$setWindowFields`
+
+Adds partitioned, sorted window calculations without collapsing documents:
+
+```json
+{
+  "$setWindowFields": {
+    "partitionBy": "$region",
+    "sortBy": {"day": 1},
+    "output": {
+      "running": {"$sum": "$amount"},
+      "sum3": {"$sum": "$amount", "window": {"documents": [-1, 1]}},
+      "rank": {"$rank": {}},
+      "dense": {"$denseRank": {}},
+      "row": {"$documentNumber": {}},
+      "previous": {"$shift": {"output": "$amount", "by": -1, "default": 0}}
+    }
+  }
+}
+```
+
+- `partitionBy` is evaluated per document; omitted means one partition.
+- `sortBy` accepts the normal sort object or `[field, direction]` pair array.
+- Accumulators: `$sum`, `$avg`, `$min`, `$max`, `$first`, `$last`, `$push`,
+  `$addToSet`, and `$count`. The default frame is `["unbounded", "unbounded"]`
+  (the whole partition); specify `["unbounded", "current"]` for a running total.
+- `window.documents` accepts `unbounded`, `current`, or integer offsets for both
+  bounds. `range` windows are not supported.
+- Ranking operators: `$rank`, `$denseRank`, and `$documentNumber`, which require
+  `sortBy`.
+- `$shift` supports `output`, integer `by`, and optional `default`.
+- The aggregate intermediate-document limit still applies.
+
 ### Limits
 
 - At most **100,000 documents** may exist in an intermediate result. The call
@@ -1078,8 +1112,8 @@ Recursively traverses references in another collection:
 - The normal request timeout (30 seconds by default) applies.
 - Response size is still limited by the HTTP response path and the client's
   practical memory; use `$limit` and `$project` for large collections.
-- Not supported: `$merge`, `$out`, `$setWindowFields`, `$densify`, `$fill`,
-  `$redact`, window functions, and arbitrary JavaScript.
+- Not supported: `$merge`, `$out`, `$densify`, `$fill`, `$redact`, `$expMovingAvg`,
+  `$derivative`, and arbitrary JavaScript.
 
 ## sql
 

@@ -9591,6 +9591,126 @@ mod tests {
     }
 
     #[test]
+    fn set_window_fields_partitions_ranks_and_accumulates() {
+        let (_dir, store) = store();
+        let c = store.collection("window_sales").unwrap();
+        c.insert_one(json!({"_id": "a1", "region": "a", "day": 1, "amount": 10}))
+            .unwrap();
+        c.insert_one(json!({"_id": "a2", "region": "a", "day": 2, "amount": 20}))
+            .unwrap();
+        c.insert_one(json!({"_id": "a3", "region": "a", "day": 3, "amount": 5}))
+            .unwrap();
+        c.insert_one(json!({"_id": "b1", "region": "z", "day": 1, "amount": 7}))
+            .unwrap();
+
+        let out = c
+            .aggregate(&[
+                json!({"$setWindowFields": {
+                    "partitionBy": "$region",
+                    "sortBy": {"day": 1},
+                    "output": {
+                        "running": {"$sum": "$amount", "window": {"documents": ["unbounded", "current"]}},
+                        "allTotal": {"$sum": "$amount"},
+                        "sum3": {"$sum": "$amount", "window": {"documents": [-1, 1]}},
+                        "rank": {"$rank": {}},
+                        "dense": {"$denseRank": {}},
+                        "row": {"$documentNumber": {}},
+                        "prev": {"$shift": {"output": "$amount", "by": -1, "default": 0}},
+                        "first": {"$first": "$amount"},
+                        "count": {"$count": {}}
+                    }
+                }}),
+                json!({"$sort": [["region", 1], ["day", 1]]}),
+            ])
+            .unwrap();
+        assert_eq!(out.len(), 4);
+        assert_eq!(out[0]["running"], 10);
+        assert_eq!(out[0]["sum3"], 30);
+        assert_eq!(out[0]["rank"], 1);
+        assert_eq!(out[0]["dense"], 1);
+        assert_eq!(out[0]["row"], 1);
+        assert_eq!(out[0]["prev"], 0);
+        assert_eq!(out[0]["first"], 10);
+        assert_eq!(out[0]["allTotal"], 35);
+        assert_eq!(out[0]["count"], 3);
+
+        assert_eq!(out[1]["running"], 30);
+        assert_eq!(out[1]["sum3"], 35);
+        assert_eq!(out[1]["rank"], 2);
+        assert_eq!(out[1]["dense"], 2);
+        assert_eq!(out[1]["row"], 2);
+        assert_eq!(out[1]["prev"], 10);
+        assert_eq!(out[1]["first"], 10);
+        assert_eq!(out[1]["allTotal"], 35);
+        assert_eq!(out[1]["count"], 3);
+
+        assert_eq!(out[2]["running"], 35);
+        assert_eq!(out[2]["sum3"], 25);
+        assert_eq!(out[2]["rank"], 3);
+        assert_eq!(out[2]["dense"], 3);
+        assert_eq!(out[2]["row"], 3);
+        assert_eq!(out[2]["prev"], 20);
+        assert_eq!(out[2]["first"], 10);
+        assert_eq!(out[2]["allTotal"], 35);
+        assert_eq!(out[2]["count"], 3);
+
+        assert_eq!(out[3]["running"], 7);
+        assert_eq!(out[3]["sum3"], 7);
+        assert_eq!(out[3]["rank"], 1);
+        assert_eq!(out[3]["row"], 1);
+        assert_eq!(out[3]["prev"], 0);
+        assert_eq!(out[3]["allTotal"], 7);
+        assert_eq!(out[3]["count"], 1);
+
+        assert!(c
+            .aggregate(&[json!({"$setWindowFields": {
+                "output": {"rank": {"$rank": {}}}
+            }})])
+            .is_err());
+        assert!(c
+            .aggregate(&[json!({"$setWindowFields": {
+                "sortBy": {"day": 1},
+                "output": {
+                    "sum": {"$sum": "$amount", "window": {"range": ["unbounded", "current"]}}
+                }
+            }})])
+            .is_err());
+        assert!(c
+            .aggregate(&[json!({"$setWindowFields": {
+                "sortBy": {"day": 1},
+                "output": {"bad": {"$sum": "$amount", "$avg": "$amount"}}
+            }})])
+            .is_err());
+
+        let ties = store.collection("window_ties").unwrap();
+        ties.insert_one(json!({"_id": "t1", "k": 1})).unwrap();
+        ties.insert_one(json!({"_id": "t2", "k": 1})).unwrap();
+        ties.insert_one(json!({"_id": "t3", "k": 2})).unwrap();
+        let out = ties
+            .aggregate(&[
+                json!({"$setWindowFields": {
+                    "sortBy": {"k": 1},
+                    "output": {
+                        "rank": {"$rank": {}},
+                        "dense": {"$denseRank": {}},
+                        "row": {"$documentNumber": {}}
+                    }
+                }}),
+                json!({"$sort": [["_id", 1]]}),
+            ])
+            .unwrap();
+        assert_eq!(out[0]["rank"], 1);
+        assert_eq!(out[1]["rank"], 1);
+        assert_eq!(out[2]["rank"], 3);
+        assert_eq!(out[0]["dense"], 1);
+        assert_eq!(out[1]["dense"], 1);
+        assert_eq!(out[2]["dense"], 2);
+        assert_eq!(out[0]["row"], 1);
+        assert_eq!(out[1]["row"], 2);
+        assert_eq!(out[2]["row"], 3);
+    }
+
+    #[test]
     fn aggregate_uses_leading_match_and_common_stages() {
         let (_dir, store) = store();
         let c = store.collection("orders").unwrap();

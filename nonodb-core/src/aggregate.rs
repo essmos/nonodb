@@ -502,6 +502,10 @@ pub(crate) fn run_with_host_vars(
                     docs = host.graph_lookup(docs, arg, vars)?;
                     i += 1;
                 }
+                "$setWindowFields" => {
+                    docs = set_window_fields(docs, arg, vars)?;
+                    i += 1;
+                }
                 "$facet" => {
                     let Some(facets) = arg.as_object() else {
                         return Err(Error::Query("$facet requires an object".into()));
@@ -1099,6 +1103,379 @@ fn group(docs: Vec<Value>, spec: &Value, vars: &BTreeMap<String, Value>) -> Resu
     builder.finish()
 }
 
+#[derive(Clone, Debug)]
+enum WindowBound {
+    Unbounded,
+    Current,
+    Offset(i64),
+}
+
+#[derive(Clone, Debug)]
+struct WindowFrame {
+    start: WindowBound,
+    end: WindowBound,
+}
+
+#[derive(Clone, Debug)]
+enum WindowOp {
+    Accumulator(String, Value),
+    Rank,
+    DenseRank,
+    DocumentNumber,
+    Shift {
+        output: Value,
+        by: i64,
+        default: Option<Value>,
+    },
+}
+
+struct WindowOutput {
+    field: String,
+    op: WindowOp,
+    window: Option<WindowFrame>,
+}
+
+fn parse_window_bound(value: &Value) -> Result<WindowBound> {
+    match value {
+        Value::String(value) if value == "unbounded" => Ok(WindowBound::Unbounded),
+        Value::String(value) if value == "current" => Ok(WindowBound::Current),
+        Value::Number(number) => number
+            .as_i64()
+            .map(WindowBound::Offset)
+            .ok_or_else(|| Error::Query("window document bounds must be integers".into())),
+        _ => Err(Error::Query(
+            "window bounds must be `unbounded`, `current`, or an integer".into(),
+        )),
+    }
+}
+
+fn parse_window_frame(value: &Value) -> Result<WindowFrame> {
+    let obj = value
+        .as_object()
+        .ok_or_else(|| Error::Query("window must be an object".into()))?;
+    if obj.contains_key("range") {
+        return Err(Error::Query(
+            "$setWindowFields range windows are not supported".into(),
+        ));
+    }
+    let bounds = obj
+        .get("documents")
+        .and_then(Value::as_array)
+        .filter(|bounds| bounds.len() == 2)
+        .ok_or_else(|| Error::Query("window requires [lower, upper] document bounds".into()))?;
+    Ok(WindowFrame {
+        start: parse_window_bound(&bounds[0])?,
+        end: parse_window_bound(&bounds[1])?,
+    })
+}
+
+fn parse_window_op(name: &str, arg: &Value) -> Result<WindowOp> {
+    match name {
+        "$sum" | "$avg" | "$min" | "$max" | "$first" | "$last" | "$push" | "$addToSet"
+        | "$count" => Ok(WindowOp::Accumulator(name.to_string(), arg.clone())),
+        "$rank" | "$denseRank" | "$documentNumber" => {
+            if !arg.is_object() {
+                return Err(Error::Query(format!("{name} requires an object argument")));
+            }
+            Ok(match name {
+                "$rank" => WindowOp::Rank,
+                "$denseRank" => WindowOp::DenseRank,
+                _ => WindowOp::DocumentNumber,
+            })
+        }
+        "$shift" => {
+            let spec = arg
+                .as_object()
+                .ok_or_else(|| Error::Query("$shift requires an object".into()))?;
+            let output = spec
+                .get("output")
+                .cloned()
+                .ok_or_else(|| Error::Query("$shift requires `output`".into()))?;
+            let by = spec
+                .get("by")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| Error::Query("$shift requires an integer `by`".into()))?;
+            Ok(WindowOp::Shift {
+                output,
+                by,
+                default: spec.get("default").cloned(),
+            })
+        }
+        _ => Err(Error::Query(format!(
+            "unsupported $setWindowFields operator `{name}`"
+        ))),
+    }
+}
+
+fn parse_window_outputs(value: &Value) -> Result<Vec<WindowOutput>> {
+    let outputs = value
+        .as_object()
+        .ok_or_else(|| Error::Query("$setWindowFields requires an `output` object".into()))?;
+    if outputs.is_empty() {
+        return Err(Error::Query(
+            "$setWindowFields `output` must not be empty".into(),
+        ));
+    }
+    let mut parsed = Vec::with_capacity(outputs.len());
+    for (field, spec) in outputs {
+        let spec = spec
+            .as_object()
+            .ok_or_else(|| Error::Query("$setWindowFields output fields must be objects".into()))?;
+        let mut op = None;
+        let mut window = None;
+        for (name, value) in spec {
+            if name == "window" {
+                if window.is_some() {
+                    return Err(Error::Query(
+                        "$setWindowFields output has duplicate `window`".into(),
+                    ));
+                }
+                window = Some(parse_window_frame(value)?);
+                continue;
+            }
+            if op.is_some() {
+                return Err(Error::Query(
+                    "$setWindowFields output must contain one operator".into(),
+                ));
+            }
+            op = Some(parse_window_op(name, value)?);
+        }
+        let op = op.ok_or_else(|| {
+            Error::Query("$setWindowFields output field requires an operator".into())
+        })?;
+        if window.is_some()
+            && matches!(
+                op,
+                WindowOp::Rank
+                    | WindowOp::DenseRank
+                    | WindowOp::DocumentNumber
+                    | WindowOp::Shift { .. }
+            )
+        {
+            return Err(Error::Query(
+                "$setWindowFields `window` is only valid for accumulators".into(),
+            ));
+        }
+        parsed.push(WindowOutput {
+            field: field.clone(),
+            op,
+            window,
+        });
+    }
+    Ok(parsed)
+}
+
+fn resolve_window_bound(bound: &WindowBound, current: usize, len: usize, start: bool) -> i64 {
+    match bound {
+        WindowBound::Unbounded => {
+            if start {
+                0
+            } else {
+                len.saturating_sub(1) as i64
+            }
+        }
+        WindowBound::Current => current as i64,
+        WindowBound::Offset(offset) => current as i64 + offset,
+    }
+}
+
+fn window_slice(
+    frame: &WindowFrame,
+    current: usize,
+    len: usize,
+) -> Option<std::ops::RangeInclusive<usize>> {
+    if len == 0 {
+        return None;
+    }
+    let mut start = resolve_window_bound(&frame.start, current, len, true);
+    let mut end = resolve_window_bound(&frame.end, current, len, false);
+    start = start.max(0);
+    end = end.min(len.saturating_sub(1) as i64);
+    if start > end || start >= len as i64 || end < 0 {
+        return None;
+    }
+    Some(start as usize..=end as usize)
+}
+
+fn window_accumulator_values(
+    docs: &[Value],
+    indices: &[usize],
+    op: &str,
+    expression: &Value,
+    window: Option<&WindowFrame>,
+    vars: &BTreeMap<String, Value>,
+) -> Result<Vec<Value>> {
+    let mut out = Vec::with_capacity(indices.len());
+    if let Some(window) = window {
+        for position in 0..indices.len() {
+            let mut accumulator = Accumulator::new(op);
+            if let Some(range) = window_slice(window, position, indices.len()) {
+                for frame_index in indices[range].iter() {
+                    let value = if op == "$count" {
+                        Value::Null
+                    } else {
+                        eval_expr_vars(&docs[*frame_index], expression, vars)?
+                    };
+                    accumulator.update(op, &value)?;
+                }
+            }
+            out.push(accumulator.finish()?);
+        }
+        return Ok(out);
+    }
+
+    // MongoDB's default window is unbounded to unbounded: the accumulator sees
+    // the whole partition and every row receives the same result.
+    let mut accumulator = Accumulator::new(op);
+    for index in indices {
+        let value = if op == "$count" {
+            Value::Null
+        } else {
+            eval_expr_vars(&docs[*index], expression, vars)?
+        };
+        accumulator.update(op, &value)?;
+    }
+    let value = accumulator.finish()?;
+    out.resize(indices.len(), value);
+    Ok(out)
+}
+
+fn window_rank_values(
+    docs: &[Value],
+    indices: &[usize],
+    sort: &[(String, i32)],
+    dense: bool,
+) -> Vec<Value> {
+    let mut out = Vec::with_capacity(indices.len());
+    let mut rank = 1usize;
+    let mut dense_rank = 1usize;
+    for position in 0..indices.len() {
+        if position > 0 {
+            let previous = &docs[indices[position - 1]];
+            let current = &docs[indices[position]];
+            if compare_docs(previous, current, sort) != Ordering::Equal {
+                rank = position + 1;
+                dense_rank += 1;
+            }
+        }
+        out.push(Value::from(if dense { dense_rank } else { rank }));
+    }
+    out
+}
+
+fn window_shift_values(
+    docs: &[Value],
+    indices: &[usize],
+    output: &Value,
+    by: i64,
+    default: Option<&Value>,
+    vars: &BTreeMap<String, Value>,
+) -> Result<Vec<Value>> {
+    let mut out = Vec::with_capacity(indices.len());
+    for (position, index) in indices.iter().enumerate() {
+        let target = position as i64 + by;
+        if target >= 0 && (target as usize) < indices.len() {
+            out.push(eval_expr_vars(
+                &docs[indices[target as usize]],
+                output,
+                vars,
+            )?);
+        } else {
+            out.push(match default {
+                Some(default) => eval_expr_vars(&docs[*index], default, vars)?,
+                None => Value::Null,
+            });
+        }
+    }
+    Ok(out)
+}
+
+fn window_output_values(
+    docs: &[Value],
+    indices: &[usize],
+    output: &WindowOutput,
+    sort: &[(String, i32)],
+    vars: &BTreeMap<String, Value>,
+) -> Result<Vec<Value>> {
+    match &output.op {
+        WindowOp::Accumulator(op, expression) => {
+            window_accumulator_values(docs, indices, op, expression, output.window.as_ref(), vars)
+        }
+        WindowOp::Rank => Ok(window_rank_values(docs, indices, sort, false)),
+        WindowOp::DenseRank => Ok(window_rank_values(docs, indices, sort, true)),
+        WindowOp::DocumentNumber => Ok((1..=indices.len()).map(Value::from).collect()),
+        WindowOp::Shift {
+            output,
+            by,
+            default,
+        } => window_shift_values(docs, indices, output, *by, default.as_ref(), vars),
+    }
+}
+
+fn set_window_fields(
+    mut docs: Vec<Value>,
+    spec: &Value,
+    vars: &BTreeMap<String, Value>,
+) -> Result<Vec<Value>> {
+    let spec = spec
+        .as_object()
+        .ok_or_else(|| Error::Query("$setWindowFields requires an object".into()))?;
+    let outputs = parse_window_outputs(
+        spec.get("output")
+            .ok_or_else(|| Error::Query("$setWindowFields requires `output`".into()))?,
+    )?;
+    let sort = match spec.get("sortBy") {
+        Some(sort) => parse_sort(sort)?,
+        None => Vec::new(),
+    };
+    let needs_sort = outputs.iter().any(|output| {
+        matches!(
+            output.op,
+            WindowOp::Rank
+                | WindowOp::DenseRank
+                | WindowOp::DocumentNumber
+                | WindowOp::Shift { .. }
+        ) || matches!(
+            &output.op,
+            WindowOp::Accumulator(op, _) if op == "$first" || op == "$last"
+        )
+    });
+    if needs_sort && sort.is_empty() {
+        return Err(Error::Query(
+            "$setWindowFields ranking, $shift, $first, and $last require `sortBy`".into(),
+        ));
+    }
+
+    let mut partitions: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (index, doc) in docs.iter().enumerate() {
+        let key = match spec.get("partitionBy") {
+            Some(expression) => eval_expr_vars(doc, expression, vars)?,
+            None => Value::Null,
+        };
+        partitions
+            .entry(serde_json::to_string(&key)?)
+            .or_default()
+            .push(index);
+    }
+
+    for indices in partitions.values_mut() {
+        if !sort.is_empty() {
+            indices.sort_by(|left, right| compare_docs(&docs[*left], &docs[*right], &sort));
+        }
+        let mut results = Vec::with_capacity(outputs.len());
+        for output in &outputs {
+            results.push(window_output_values(&docs, indices, output, &sort, vars)?);
+        }
+        for (output, values) in outputs.iter().zip(results) {
+            for (index, value) in indices.iter().zip(values) {
+                path::set(&mut docs[*index], &output.field, value)?;
+            }
+        }
+    }
+    Ok(docs)
+}
+
+#[derive(Clone)]
 enum NumericSum {
     Float(f64),
     Decimal(BigDecimal),
@@ -1158,6 +1535,7 @@ impl NumericSum {
     }
 }
 
+#[derive(Clone)]
 enum Accumulator {
     Sum(NumericSum),
     Avg {
