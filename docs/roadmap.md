@@ -11,7 +11,8 @@ and can accept a single-writer model per database.
 
 Implemented:
 
-- JSON documents, collections, automatic UUID `_id`;
+- JSON documents and collections; automatic UUID `_id` on the HTTP/core path
+  and driver-generated ObjectId `_id` on the MongoDB wire path;
 - MongoDB-style filters, projections, sorts, `skip`/`limit`;
 - SQL `SELECT`, `INSERT`, `UPDATE`, and `DELETE` over one collection; `SELECT`
   supports `DISTINCT`, `WHERE`, `GROUP BY`, `HAVING`, aggregates including
@@ -118,7 +119,8 @@ comparison and practical migration caveats.
   and fixed offsets, not IANA identifiers. Expression errors do not match the
   document instead of aborting the query.
 - Projection supports nested paths, positional `$`, `$slice`, `$elemMatch`, and
-  basic `$meta`. Full-text scores are not computed yet.
+  basic `$meta`. Native search supplies `_score`, HTTP `$meta: "textScore"`
+  maps it, and MongoDB wire `$text` computes `textScore` with BM25.
 - `$regex` supports `i`, `m`, `s`, `x`, and `u` options, but not MongoDB's
   PCRE-only constructs; patterns use Rust's non-backtracking regex engine.
 - `$in`, `$nin`, `$all`, and `$elemMatch` accept `{"$regex": ...}` operands, but
@@ -150,8 +152,8 @@ comparison and practical migration caveats.
 
 ### Updates
 
-- No `$rename`, `$min`, `$max`, `$mul`, `$currentDate`, `$bit`, `$pop`.
-- No pipeline updates.
+- Pipeline updates support `$set`, `$addFields`, `$unset`, `$project`,
+  `$replaceRoot`, and `$replaceWith`.
 - `_id` is immutable by contract; changing it with update operators is not
   supported.
 
@@ -198,7 +200,8 @@ comparison and practical migration caveats.
 
 - The optional MongoDB-compatible wire listener implements a documented subset
   for official drivers: handshake, CRUD, cursors, count, distinct, aggregate,
-  index DDL, collection DDL, SCRAM-SHA-256/SCRAM-SHA-1 authentication,
+  index DDL, collection DDL, MongoDB-style text indexes and `$text`,
+  SCRAM-SHA-256/SCRAM-SHA-1 authentication,
   authSource validation, auth-file principal scopes, aggregate cursor batching,
   strict rejection of unsupported driver options, mongoexport/mongodump-compatible
   export, PyMongo/Node.js/Go conformance, and TLS.

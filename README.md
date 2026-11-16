@@ -38,8 +38,9 @@ nonodb is a real document database with:
 
 - JSON documents, MongoDB-style filters, projections, sorting and updates;
 - an optional MongoDB-compatible wire endpoint for PyMongo, Node.js, and Go
-  drivers: CRUD, cursors, basic aggregation, index and collection DDL, BSON
-  types, SCRAM authentication, and TLS;
+  drivers: CRUD, cursors, basic aggregation, index and collection DDL,
+  MongoDB-style text indexes and `$text`, BSON types, SCRAM authentication, and
+  TLS;
 - BSON-compatible dates with RFC 3339 input, timezone normalization and indexed ranges;
 - exact numeric comparison, BSON Decimal128, binary/UUID and ObjectId values with indexed ranges;
 - single-field, compound, unique and covering secondary indexes;
@@ -166,7 +167,7 @@ single-database directories are migrated to `default/` on startup. See
 ### Documents and queries
 
 - JSON documents in named collections, stored as JSON on disk.
-- Automatic `_id` generation with UUID v4; custom string and ObjectId `_id` are supported.
+- Automatic `_id` generation with UUID v4 on the HTTP/core path; MongoDB drivers keep their ObjectId `_id`. Custom string and ObjectId `_id` are supported.
 - MongoDB-style filters: equality, `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`,
   `$in`, `$nin`, `$all`, `$size`, `$elemMatch`, `$exists`, `$regex`/`$options`,
   `$type`, `$mod`, `$bitsAllClear`/`$bitsAllSet`/`$bitsAnyClear`/`$bitsAnySet`,
@@ -423,6 +424,9 @@ TTL is eventual: a document can be visible briefly after its expiry. See
 - AAD binds ciphertext to collection, tenant, `_id`, and key id.
 - Restricted API: CRUD by `_id`, list/count by `tenant_id`, history; no search,
   fuzzy, aggregation, secondary indexes, arbitrary filters, or sorting.
+- The MongoDB wire listener does not carry vault headers; use the native
+  client/HTTP API for vault collections. See
+  [tenant encryption](docs/mongodb-compatibility.md#tenant-ids-and-encryption).
 - History stores ciphertext and decrypts snapshots only for an authenticated
   key.
 - Cache and automatic indexes are disabled for vault collections.

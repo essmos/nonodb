@@ -168,7 +168,7 @@ client timeout with `NONODB_TIMEOUT` or the `timeout=` argument.
 | [`find_and_modify`](#find_and_modify) | Atomically update/remove one document and return it |
 | [`delete`](#delete) | Delete documents |
 | [`count`](#count) | Count matching documents |
-| [`aggregate`](#aggregation) | Read-only aggregation pipeline |
+| [`aggregate`](#aggregate) | Read-only aggregation pipeline |
 | [`sql`](#sql) | SQL `SELECT`, `INSERT`, `UPDATE`, or `DELETE` over one collection |
 | [`explain_sql`](#explain_sql) | Show the plan for a SQL `SELECT` |
 | [`create_index`](#create_index) | Create a secondary index |
@@ -187,7 +187,7 @@ client timeout with `NONODB_TIMEOUT` or the `timeout=` argument.
 | [`reindex`](#reindex) | Rebuild every index on a collection |
 | [`search`](#search) | BM25 full-text query |
 | [`fuzzy`](#fuzzy) | Approximate string query |
-| [`vector_search`](#vector-search) | Exact top-K vector query |
+| [`vector_search`](#vector_search) | Exact top-K vector query |
 | [`batch`](#read-batch) | Multiple read operations, one snapshot |
 | [`write_batch`](#atomic-write-batch) | Atomic group of writes |
 | [`history`](#document-history) | List revisions of one document |
@@ -1701,8 +1701,9 @@ requires a scan. Regex values inside `$all`/`$elemMatch` are not supported.
   `["rust", "lmdb"]`.
 - **Nested paths.** Dots traverse nested objects (`{"a.b.c": 7}`) and arrays
   of objects (`{"items.price": {"$gte": 10}}`).
-- **No `$where` or `$text` operator.** Full-text search is a separate
-  operation.
+- **No `$where` operator, and the HTTP/core query language has no `$text`
+  operator.** Full-text search is a separate operation. The optional MongoDB
+  wire listener accepts `$text` with MongoDB-style text indexes.
 
 ## Projection
 
@@ -1884,7 +1885,10 @@ Response:
 
 `reindex` drops and recreates each existing index definition in a single write
 transaction. It is the one-click migration path after an index-format upgrade or
-when index data is suspected to be incomplete. The operation scans every
+when index data is suspected to be incomplete. The `text` and `fuzzy` arrays
+contain search-index names; native single-field helpers name the index after the
+field, while MongoDB-style text indexes keep their declared name and fields.
+The operation scans every
 document and blocks writers for the duration; it does not change index
 definitions, uniqueness, `include`, `geo`, vector dimensions, or metrics. If the
 rebuild fails, the transaction rolls back and the previous indexes remain
@@ -2300,6 +2304,8 @@ Returns `{"coll":"users","max_versions":50}`. Requires
 
 ## Automatic collection events
 
+### set_collection_events
+
 Configure automatic `insert`/`update`/`delete` events for a standard collection:
 
 ```json
@@ -2322,6 +2328,8 @@ all operations. `filter` suppresses non-matching events before they are stored.
 `include_before`/`include_after` and `projection` control the stored payload. Events are written atomically to `_events` as
 `<collection>.<insert|update|delete>` documents. Vault collections are not
 auto-evented.
+
+### get_collection_events
 
 Read the setting:
 

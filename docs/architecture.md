@@ -516,16 +516,20 @@ its duration. On large collections, raise the client and server timeouts.
 
 ## Full-text search
 
-`create_text_index` builds:
+A text-index definition (`SearchIndexDef`) is stored in metadata under
+`search:<coll>:text:<name>`. A definition may cover multiple fields with
+weights; the native single-field helpers use the field name as the index name.
+Each indexed field has:
 
-- `ft:<coll>:<field>` — postings `term\0_id → term frequency`;
-- `ftl:<coll>:<field>` — document lengths for BM25 normalization;
-- a total-length counter in `meta`.
+- `ft:<coll>:<index>:<field>` — postings `term\0_id → term frequency`;
+- `ftl:<coll>:<index>:<field>` — document lengths for BM25 normalization;
+- `fttotal:<coll>:<index>:<field>` — total token counter.
 
 Queries tokenize the search string, look up postings for every term, compute
 BM25 scores (`k1=1.2`, `b=0.75`), merge scores by document, and sort descending.
-The semantics are **OR** over terms; BM25 decides the ranking. Duplicate query
-terms are removed.
+The semantics are **OR** over positive terms; BM25 decides the ranking.
+Duplicate query terms are removed. Negative terms and phrases are applied as
+exclusions by the MongoDB `$text` path.
 
 Quoted phrases are parsed separately. A document must contain each phrase as a
 contiguous token sequence. Phrase words still participate in scoring, and the
@@ -543,7 +547,9 @@ There is no stemming and no stop-word list.
 
 ## Fuzzy search
 
-`create_fuzzy_index` stores unique trigrams for the field value. A query:
+A fuzzy-index definition is stored under `search:<coll>:fuzzy:<name>` and its
+postings use `fz:<coll>:<index>:<field>`. `create_fuzzy_index` stores unique
+trigrams for the field value. A query:
 
 1. normalizes the query;
 2. collects documents sharing at least one trigram;

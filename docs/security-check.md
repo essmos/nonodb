@@ -59,6 +59,7 @@ on a loopback TCP port. It removes them when the check finishes.
 | `X-Content-Type-Options: nosniff` | warning if missing |
 
 Expected daemon behavior is **19 passing checks and 4 hardening warnings** on
+the current development build. The same counts have been stable since
 `v0.21.0`. CI runs the non-strict form, so the security invariants fail the job
 but known hardening gaps do not block unrelated changes.
 

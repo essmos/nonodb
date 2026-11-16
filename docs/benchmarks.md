@@ -253,10 +253,13 @@ client, end-to-end through the daemon:
 | BM25 search, limit 10 | p50 **971 ms**, p95 1,025 ms |
 | Fuzzy search, max distance 2 | p50 **168 ms**, p95 237 ms |
 
-BM25 at 1M text documents is a full posting-list scan and ranking operation;
-the text index makes candidate lookup possible but does not make large OR
-queries free. Fuzzy search is cheaper here because trigram candidate selection
-limits the number of documents scored.
+These figures are workload-specific and depend heavily on term selectivity.
+In a 10M-document run with 1M text documents and a frequent term, BM25 measured
+p50 **9.21 s** / p95 **10.28 s**, while fuzzy distance=2 measured p50 **240 ms**.
+BM25 at this scale still walks large posting lists and ranks every matching
+document; the text index avoids scanning unrelated documents but does not make
+large OR queries free. Fuzzy search is cheaper because trigram candidate
+selection limits the number of documents scored.
 
 ### 1,000,000 vectors (128 dimensions, exact cosine)
 
@@ -1020,9 +1023,10 @@ also verifies that `full` and explicitly `sync`ed writes survive `SIGKILL`, that
   writes/s with real disk commits on this host.
 - **Full scans are linear.** Sorting 8M documents without an index is seconds,
   not milliseconds. Use an index or a covered query.
-- **Search has its own scaling curve.** BM25 over 1M text documents is hundreds
-  of milliseconds; the inverted index avoids scanning every document's text but
-  does not make large term lists free.
+- **Search has its own scaling curve.** BM25 over 1M text documents ranges from
+  hundreds of milliseconds to several seconds depending on term selectivity;
+  the inverted index avoids scanning every document's text but does not make
+  large term lists free.
 - **RSS is usually small.** Large RSS values after scans are mostly mapped page
   cache, not leaked allocations.
 - **Map size is not memory.** A 1 GiB `map_size` does not mean 1 GiB of RAM.

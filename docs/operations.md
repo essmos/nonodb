@@ -79,7 +79,7 @@ secrets.
 | `NONODB_ALLOWED_UIDS` | — | Comma-separated Unix uid allow-list for UDS |
 | `NONODB_ALLOWED_GIDS` | — | Comma-separated Unix gid allow-list for UDS |
 | `NONODB_TCP` | — | TCP listen address, e.g. `127.0.0.1:7878` |
-| `NONODB_MONGO_ADDR` | — | Optional MongoDB-compatible wire listener, e.g. `127.0.0.1:27017`. Supports handshake, CRUD, cursors, count, distinct, aggregate, index DDL, collection DDL, and `dropDatabase`; no sessions or transactions |
+| `NONODB_MONGO_ADDR` | — | Optional MongoDB-compatible wire listener, e.g. `127.0.0.1:27017`. Supports handshake, CRUD, cursors, count, distinct, aggregate, index DDL, collection DDL, MongoDB-style text indexes and `$text`, and `dropDatabase`; no sessions or transactions |
 | `NONODB_MONGO_USERNAME` | — | MongoDB wire username. Requires `NONODB_MONGO_PASSWORD`; enabling auth requires SCRAM-SHA-256 or SCRAM-SHA-1 for every non-handshake command |
 | `NONODB_MONGO_PASSWORD` | — | MongoDB wire password. Grants the mapped principal's scopes; without `NONODB_AUTH_FILE` it is a full local admin |
 | `NONODB_MONGO_PRINCIPAL` | username | Auth-file principal used for MongoDB wire authorization. Requires the principal to exist in `NONODB_AUTH_FILE`; otherwise authentication fails |

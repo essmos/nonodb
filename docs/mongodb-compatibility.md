@@ -12,7 +12,8 @@ replacement.
 > MongoDB parity remain out of scope. The HTTP API and the
 > Python/Rust/Node.js/Go clients remain the native interfaces.
 
-The assessment below is verified against NonoDB `0.25.x`.
+The assessment below is verified against the current development tree; the
+release notes identify the exact tested tag.
 
 ## Status legend
 
@@ -34,7 +35,7 @@ The assessment below is verified against NonoDB `0.25.x`.
 | Aggregation expressions | ~70% | Broad but not exhaustive; no IANA time zones or user-defined JavaScript |
 | Indexes | ~65% | No sparse/partial/wildcard indexes, collation, or TTL index options |
 | BSON scalar types | ~75% | ObjectId `_id`, Date, Decimal128, Binary/UUID, Timestamp, MinKey/MaxKey, and numeric mapping |
-| Wire protocol and drivers | ~70% | Documented MongoDB-compatible subset: handshake, CRUD, sorted cursors, count, distinct, aggregate, index DDL, collection DDL, dropDatabase, SCRAM auth, and TLS; no sessions or transactions |
+| Wire protocol and drivers | ~70% | Documented MongoDB-compatible subset: handshake, CRUD, sorted cursors, count, distinct, aggregate, index DDL, collection DDL, MongoDB-style text indexes and `$text`, dropDatabase, SCRAM auth, and TLS; no sessions or transactions |
 | Transactions and change streams | ~10% | Atomic write batches and outbox events exist, but not MongoDB APIs |
 
 These percentages are editorial estimates of the language/API surface that a
@@ -50,7 +51,7 @@ direct migration target.
 
 | Feature | Status | Notes |
 |---|---|---|
-| MongoDB wire protocol | ✅ | Documented MongoDB-compatible subset: handshake, CRUD, cursors, count, distinct, aggregate, index DDL, collection DDL, SCRAM auth, and TLS; no sessions or transactions |
+| MongoDB wire protocol | ✅ | Documented MongoDB-compatible subset: handshake, CRUD, cursors, count, distinct, aggregate, index DDL, collection DDL, MongoDB-style text indexes and `$text`, SCRAM auth, and TLS; no sessions or transactions |
 | Official MongoDB drivers | ✅ | PyMongo, Node.js, and Go drivers tested for CRUD, cursors, aggregation, indexes, BSON types, and SCRAM auth; Java is not yet in the automated matrix |
 | `mongosh` | ❌ | Use the NonoDB CLI, GUI, or HTTP API |
 | MongoDB URI / `mongodb://` | 🟡 | Single-host connection to `NONODB_MONGO_ADDR`; plain `mongodb://host:port/` works, `directConnection=true` is optional; username/password uses SCRAM-SHA-256 or SCRAM-SHA-1; no replica-set URIs |

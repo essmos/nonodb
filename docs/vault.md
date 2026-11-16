@@ -99,6 +99,11 @@ python3 -c 'import base64, os; print(base64.b64encode(os.urandom(32)).decode())'
 Store it in your secret manager or environment. Do not commit it to the
 repository.
 
+The MongoDB wire listener does not carry these per-request headers, so do not
+point a MongoDB driver at a vault collection. Use the native NonoDB client or
+the HTTP/JSON API for vault access; standard collections remain available to
+MongoDB drivers.
+
 ## Stored format
 
 A vault document is stored as:

@@ -582,8 +582,8 @@ users.update({"_id": user_id}, {"name": "Ada Lovelace", "age": 37})
 - `$pull` accepts values or query predicates; `$pullAll` removes listed values.
 - Numeric array indexes (`items.0.qty`), positional `$`, `$[]`, and
   `$[identifier]` with `array_filters=` are supported.
-- `$rename`, `$min`, `$max`, `$mul`, `$currentDate`, and pipeline updates are
-  not implemented.
+- Pipeline updates support `$set`, `$addFields`, `$unset`, `$project`,
+  `$replaceRoot`, and `$replaceWith`.
 
 ## Deleting
 

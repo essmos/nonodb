@@ -1,7 +1,10 @@
 # Migrating and importing data
 
-nonodb has no native dump format and no `mongoimport` command. Migration is a
-small, explicit pipeline:
+nonodb has no native dump format and no bundled `mongoimport` command.
+MongoDB's own `mongoexport`, `mongodump`, `mongoimport`, and `mongorestore`
+tools can target the optional MongoDB wire listener; see
+[MongoDB compatibility](mongodb-compatibility.md#export-and-portability).
+Migration through the native importer is a small, explicit pipeline:
 
 ```text
 source database

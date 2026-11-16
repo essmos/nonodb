@@ -49,6 +49,7 @@ quick-start instructions, and a feature overview.
 - **Run several databases in one daemon:** [Multiple databases](multi-database.md)
 - **Open the local GUI:** [GUI console](gui.md)
 - **Pick a client:** [Clients](clients.md) — Python, Rust, Node.js, Go
+- **Connect with a MongoDB driver:** [MongoDB compatibility](mongodb-compatibility.md)
 - **Run a SQL query or simple write:** [SQL queries](sql.md)
 - **Import data from another database:** [Migration and import](migration.md)
 - **Expose nonodb to Python workers:** [Python client](python-client.md)
