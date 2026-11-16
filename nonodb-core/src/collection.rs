@@ -751,6 +751,7 @@ impl<'e> Collection<'e> {
                     ));
                 }
                 def.directions = spec.directions.clone();
+                def.directions_encoded = def.directions.iter().any(|direction| *direction < 0);
             }
             let name = def.name();
             if name == "_id_" {
@@ -1615,9 +1616,10 @@ impl<'e> Collection<'e> {
         let Some(db) = self.index_db(rtxn, &def)? else {
             return Ok(None);
         };
+        let direction = def.storage_directions().first().copied().unwrap_or(1);
         let mut result: Option<HashSet<String>> = None;
         for value in values {
-            let Some((lower, upper)) = index::bounds("$eq", value) else {
+            let Some((lower, upper)) = index::bounds_direction("$eq", value, direction) else {
                 return Ok(None);
             };
             let range = (as_bound(&lower), as_bound(&upper));
@@ -5726,7 +5728,7 @@ impl<'e> Collection<'e> {
                 }
                 parts.as_slice()
             };
-            let Some((lower, upper)) = lookup_bounds(parts) else {
+            let Some((lower, upper)) = lookup_bounds(parts, &def) else {
                 push_lookup_result(
                     &mut unique_out,
                     &mut unique_sizes,
@@ -6561,6 +6563,7 @@ fn bounds_for_index(def: &IndexDef, filter: &Map<String, Value>) -> Option<index
     if fields.is_empty() {
         return None;
     }
+    let directions = def.storage_directions();
     let mut prefix = Vec::new();
     for (i, field) in fields.iter().enumerate() {
         let cond = index_condition(filter, field)?;
@@ -6573,8 +6576,9 @@ fn bounds_for_index(def: &IndexDef, filter: &Map<String, Value>) -> Option<index
         {
             return None;
         }
+        let direction = directions.get(i).copied().unwrap_or(1);
         if i + 1 == fields.len() {
-            let bounds = index::bounds_from_cond(cond)?;
+            let bounds = index::bounds_from_cond_direction(cond, direction)?;
             return Some(if prefix.is_empty() {
                 bounds
             } else {
@@ -6582,7 +6586,7 @@ fn bounds_for_index(def: &IndexDef, filter: &Map<String, Value>) -> Option<index
             });
         }
         let v = eq_value(cond)?;
-        prefix.extend(index::encode_value(v)?);
+        prefix.extend(index::encode_value_direction(v, direction)?);
     }
     Some(index::exact_prefix(&prefix))
 }
@@ -6887,10 +6891,12 @@ fn finish_lookup(
     Ok(out)
 }
 
-fn lookup_bounds(parts: &[Value]) -> Option<crate::index::RangeBytes> {
+fn lookup_bounds(parts: &[Value], def: &IndexDef) -> Option<crate::index::RangeBytes> {
+    let directions = def.storage_directions();
     let mut key = Vec::new();
-    for part in parts {
-        key.extend_from_slice(&index::encode_value(part)?);
+    for (index, part) in parts.iter().enumerate() {
+        let direction = directions.get(index).copied().unwrap_or(1);
+        key.extend_from_slice(&index::encode_value_direction(part, direction)?);
     }
     Some((
         Bound::Included(key.clone()),
@@ -6941,11 +6947,22 @@ fn index_matches_sort(def: &IndexDef, sort: &[(String, i32)]) -> Option<bool> {
     if fields.iter().zip(sort).any(|(f, (s, _))| f != s) {
         return None;
     }
-    let positive = sort[0].1 >= 0;
-    if sort.iter().any(|(_, d)| (*d >= 0) != positive) {
-        return None;
+    let directions = def.storage_directions();
+    if sort
+        .iter()
+        .zip(&directions)
+        .all(|((_, order), direction)| (*order >= 0) == (*direction >= 0))
+    {
+        return Some(false);
     }
-    Some(!positive)
+    if sort
+        .iter()
+        .zip(&directions)
+        .all(|((_, order), direction)| (*order >= 0) != (*direction >= 0))
+    {
+        return Some(true);
+    }
+    None
 }
 
 pub(crate) fn compare_docs(a: &Value, b: &Value, sort: &[(String, i32)]) -> Ordering {
@@ -8487,6 +8504,110 @@ mod tests {
             let rtxn = c.env.read_txn().unwrap();
             c.verify_in(&rtxn).unwrap();
         }
+    }
+
+    #[test]
+    fn mixed_direction_compound_index_serves_sorted_queries() {
+        let (_dir, store) = store();
+        let c = store.collection("mixed_events").unwrap();
+        for g in 0..3 {
+            for age in 0..10 {
+                c.insert_one(json!({
+                    "_id": format!("g{g}a{age}"),
+                    "g": g,
+                    "age": age,
+                }))
+                .unwrap();
+            }
+        }
+        c.create_indexes(&[IndexSpec {
+            fields: vec!["g".into(), "age".into()],
+            name: "g_1_age_-1".into(),
+            directions: vec![1, -1],
+            unique: false,
+            include: vec![],
+            geo: false,
+        }])
+        .unwrap();
+
+        let q = FindQuery {
+            filter: json!({}),
+            sort: vec![("g".into(), 1), ("age".into(), -1)],
+            limit: Some(5),
+            ..Default::default()
+        };
+        let got = c.find(&q).unwrap();
+        let pairs: Vec<_> = got
+            .iter()
+            .map(|doc| (doc["g"].as_i64(), doc["age"].as_i64()))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                (Some(0), Some(9)),
+                (Some(0), Some(8)),
+                (Some(0), Some(7)),
+                (Some(0), Some(6)),
+                (Some(0), Some(5)),
+            ]
+        );
+        let plan = c.explain(&q).unwrap();
+        assert_eq!(plan["access_path"], "index_scan");
+        assert_eq!(plan["sort_covered"], true);
+
+        let q = FindQuery {
+            filter: json!({"g": 1, "age": {"$gte": 4, "$lt": 8}}),
+            sort: vec![("g".into(), 1), ("age".into(), -1)],
+            ..Default::default()
+        };
+        let got = c.find(&q).unwrap();
+        let ages: Vec<_> = got.iter().map(|doc| doc["age"].as_i64()).collect();
+        assert_eq!(ages, vec![Some(7), Some(6), Some(5), Some(4)]);
+        let plan = c.explain(&q).unwrap();
+        assert_eq!(plan["access_path"], "index_scan");
+        assert_eq!(plan["sort_covered"], true);
+
+        let q = FindQuery {
+            filter: json!({}),
+            sort: vec![("g".into(), -1), ("age".into(), 1)],
+            limit: Some(4),
+            ..Default::default()
+        };
+        let got = c.find(&q).unwrap();
+        let pairs: Vec<_> = got
+            .iter()
+            .map(|doc| (doc["g"].as_i64(), doc["age"].as_i64()))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                (Some(2), Some(0)),
+                (Some(2), Some(1)),
+                (Some(2), Some(2)),
+                (Some(2), Some(3)),
+            ]
+        );
+
+        c.update(
+            &json!({"_id": "g1a7"}),
+            &json!({"$set": {"age": 10}}),
+            false,
+        )
+        .unwrap();
+        let q = FindQuery {
+            filter: json!({"g": 1, "age": {"$gte": 8}}),
+            sort: vec![("g".into(), 1), ("age".into(), -1)],
+            ..Default::default()
+        };
+        let got = c.find(&q).unwrap();
+        let ids: Vec<_> = got.iter().map(|doc| doc["_id"].clone()).collect();
+        assert_eq!(ids.len(), 3);
+        assert_eq!(ids[0], "g1a7");
+        assert_eq!(ids[1], "g1a9");
+        assert_eq!(ids[2], "g1a8");
+
+        let rtxn = c.env.read_txn().unwrap();
+        c.verify_in(&rtxn).unwrap();
     }
 
     #[test]

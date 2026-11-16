@@ -1,4 +1,4 @@
-use nonodb_core::{Store, MAX_LOOKUP_VALUES};
+use nonodb_core::{IndexSpec, Store, MAX_LOOKUP_VALUES};
 use serde_json::json;
 use tempfile::TempDir;
 
@@ -184,6 +184,36 @@ fn lookup_compound_unique_index_aligns_values_and_requires_exact_order() {
         err.contains("unique single-field or compound index"),
         "{err}"
     );
+}
+
+#[test]
+fn lookup_uses_mixed_direction_unique_index() {
+    let (_dir, store) = fixture();
+    let c = store.collection("users").unwrap();
+    c.create_indexes(&[IndexSpec {
+        fields: vec!["tenant".into(), "email".into()],
+        name: "tenant_1_email_-1".into(),
+        directions: vec![1, -1],
+        unique: true,
+        include: vec![],
+        geo: false,
+    }])
+    .unwrap();
+
+    let results = c
+        .lookup_fields(
+            &["tenant".to_string(), "email".to_string()],
+            &[
+                json!(["acme", "grace@example.com"]),
+                json!(["acme", "missing@example.com"]),
+                json!(["acme", "ada@example.com"]),
+            ],
+            None,
+        )
+        .unwrap();
+    assert_eq!(results[0].as_ref().unwrap()["_id"], "b");
+    assert!(results[1].is_none());
+    assert_eq!(results[2].as_ref().unwrap()["_id"], "a");
 }
 
 #[test]

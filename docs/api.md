@@ -318,9 +318,10 @@ Behavior:
   Sorting by a single `_id` field can stream that range forwards or backwards.
 - With `sort`, results are ordered by the requested fields. Missing values and
   `null` sort last. Ties are broken deterministically by `_id`.
-- An index can serve the sort when its full field order matches the requested
-  sort and all directions are the same. Otherwise a full scan and top-K sort
-  are used.
+- An index can serve the sort when its full field order and per-field directions
+  match the requested sort, or when every direction is inverted (reverse index
+  traversal). Mixed-direction compound indexes are supported. Otherwise a full
+  scan and top-K sort are used.
 - Nested paths use dots: `{"user.address.city": "London"}`.
 - Projection is either inclusive or exclusive; `_id` is included by default and
   can be disabled with `"_id": 0`. Dotted paths create nested projection trees.
@@ -1746,12 +1747,13 @@ traverse arrays of objects:
 Directions: `1` ascending, `-1` descending. Missing values and `null` sort
 last. Equal keys are ordered deterministically by `_id`.
 
-An index can serve the sort only when the requested sort matches the full index
-field order and all directions are the same. A multikey sort uses the lowest
-array element for ascending order and the highest for descending order, with
-same-document duplicates removed. Otherwise nonodb performs a scan and bounded
-top-K sort. Full-collection sorts and selective unsorted scans are parallelized
-for shallow queries.
+An index can serve the sort when the requested sort matches the full index field
+order and its per-field directions, or when every direction is inverted for a
+reverse index scan. Mixed-direction compound indexes therefore sort without a
+top-K fallback. A multikey sort uses the lowest array element for ascending
+order and the highest for descending order, with same-document duplicates
+removed. Otherwise nonodb performs a scan and bounded top-K sort. Full-collection
+sorts and selective unsorted scans are parallelized for shallow queries.
 
 ---
 
@@ -1824,7 +1826,10 @@ Rules:
 - Without `name`, the index name is the fields joined by `+`. A supplied
   MongoDB-style name is stored and returned by `list_indexes`.
 - `directions` is optional; when present it must contain one `1` or `-1` per
-  field and is preserved in index metadata.
+  field. Newly created and reindexed indexes encode descending fields into key
+  order, so mixed-direction compound indexes can serve matching sorts. Indexes
+  created by older versions keep valid ascending storage and can be rebuilt with
+  the reindex operation to gain direction-aware ordering.
 - Indexable values are string, number, Decimal128, special doubles, boolean,
   Extended JSON dates, binary/UUID, and ObjectId. Ordinary objects remain
   unindexed, but arrays create multikey entries: one key per scalar element.

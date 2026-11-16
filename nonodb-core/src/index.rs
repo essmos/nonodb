@@ -38,6 +38,10 @@ pub struct IndexDef {
     /// Per-field directions (`1` or `-1`). Empty means all ascending.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub directions: Vec<i8>,
+    /// Whether `directions` were applied to stored index keys. Older index
+    /// definitions keep ascending storage until they are reindexed.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub directions_encoded: bool,
     #[serde(default)]
     pub unique: bool,
     /// Fields additionally copied into the index value (covering projections).
@@ -71,6 +75,7 @@ impl IndexDef {
             field: String::new(),
             name: String::new(),
             directions: Vec::new(),
+            directions_encoded: false,
             unique,
             include: Vec::new(),
             geo: false,
@@ -86,6 +91,7 @@ impl IndexDef {
             field: String::new(),
             name: String::new(),
             directions: Vec::new(),
+            directions_encoded: false,
             unique,
             include: include.to_vec(),
             geo: false,
@@ -134,6 +140,19 @@ impl IndexDef {
     pub fn directions(&self) -> Vec<i8> {
         let len = self.effective_fields().len();
         if self.directions.len() == len {
+            self.directions.clone()
+        } else {
+            vec![1; len]
+        }
+    }
+
+    /// Directions actually applied to stored key bytes.
+    ///
+    /// Older definitions stored mixed-direction metadata but kept every key
+    /// ascending. They remain sortable as all-ascending indexes until rebuilt.
+    pub fn storage_directions(&self) -> Vec<i8> {
+        let len = self.effective_fields().len();
+        if self.directions_encoded && self.directions.len() == len {
             self.directions.clone()
         } else {
             vec![1; len]
@@ -209,6 +228,25 @@ pub fn encode_value(v: &Value) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Encodes a value in an index field's storage direction.
+///
+/// Descending fields complement every byte of the ascending encoding. This
+/// reverses lexicographic order while preserving the prefix boundaries used by
+/// ranges and unique-key checks.
+pub fn encode_value_direction(v: &Value, direction: i8) -> Option<Vec<u8>> {
+    let mut out = encode_value(v)?;
+    if direction < 0 {
+        complement_bytes(&mut out);
+    }
+    Some(out)
+}
+
+fn complement_bytes(bytes: &mut [u8]) {
+    for byte in bytes {
+        *byte = !*byte;
+    }
+}
+
 fn push_escaped_string(out: &mut Vec<u8>, s: &str) {
     // Escape NUL: 0x00 -> 0x00 0x01. The string terminator is appended by
     // `encode_value`; prefix bounds intentionally leave it off.
@@ -224,8 +262,15 @@ fn push_escaped_string(out: &mut Vec<u8>, s: &str) {
 
 /// Index range for all strings beginning with `prefix` (`^prefix` regex).
 pub fn string_prefix_bounds(prefix: &str) -> RangeBytes {
+    string_prefix_bounds_direction(prefix, 1)
+}
+
+fn string_prefix_bounds_direction(prefix: &str, direction: i8) -> RangeBytes {
     let mut lower = vec![0x03];
     push_escaped_string(&mut lower, prefix);
+    if direction < 0 {
+        complement_bytes(&mut lower);
+    }
     let upper = after_value(&lower);
     (Bound::Included(lower), Bound::Excluded(upper))
 }
@@ -357,7 +402,9 @@ pub fn encode_index_keys(def: &IndexDef, doc: &Value) -> Result<IndexKeys, crate
     }
     let mut per_field: Vec<Vec<Vec<u8>>> = Vec::with_capacity(fields.len());
     let mut multikey_fields = Vec::new();
-    for field in &fields {
+    let directions = def.storage_directions();
+    for (field_index, field) in fields.iter().enumerate() {
+        let direction = directions.get(field_index).copied().unwrap_or(1);
         let (values, saw_array) = field_values(doc, field);
         let mut encoded = Vec::new();
         let mut field_multikey = saw_array || values.len() > 1;
@@ -368,7 +415,7 @@ pub fn encode_index_keys(def: &IndexDef, doc: &Value) -> Result<IndexKeys, crate
                 field_multikey = true;
             }
             for value in flattened {
-                if let Some(key) = encode_value(value) {
+                if let Some(key) = encode_value_direction(value, direction) {
                     encoded.push(key);
                 }
             }
@@ -470,16 +517,25 @@ pub fn after_value(vb: &[u8]) -> Vec<u8> {
 pub type RangeBytes = (Bound<Vec<u8>>, Bound<Vec<u8>>);
 
 pub fn bounds(op: &str, value: &Value) -> Option<RangeBytes> {
-    let vb = encode_value(value)?;
-    Some(match op {
-        "$eq" => (
+    bounds_direction(op, value, 1)
+}
+
+/// Index key range for a comparison operator in a storage direction.
+pub fn bounds_direction(op: &str, value: &Value, direction: i8) -> Option<RangeBytes> {
+    let vb = encode_value_direction(value, direction)?;
+    Some(match (op, direction < 0) {
+        ("$eq", _) => (
             Bound::Included(vb.clone()),
             Bound::Excluded(after_value(&vb)),
         ),
-        "$gte" => (Bound::Included(vb), Bound::Unbounded),
-        "$gt" => (Bound::Included(after_value(&vb)), Bound::Unbounded),
-        "$lte" => (Bound::Unbounded, Bound::Excluded(after_value(&vb))),
-        "$lt" => (Bound::Unbounded, Bound::Excluded(vb)),
+        ("$gte", false) => (Bound::Included(vb), Bound::Unbounded),
+        ("$gt", false) => (Bound::Included(after_value(&vb)), Bound::Unbounded),
+        ("$lte", false) => (Bound::Unbounded, Bound::Excluded(after_value(&vb))),
+        ("$lt", false) => (Bound::Unbounded, Bound::Excluded(vb)),
+        ("$gte", true) => (Bound::Unbounded, Bound::Excluded(after_value(&vb))),
+        ("$gt", true) => (Bound::Unbounded, Bound::Excluded(vb)),
+        ("$lte", true) => (Bound::Included(vb), Bound::Unbounded),
+        ("$lt", true) => (Bound::Included(after_value(&vb)), Bound::Unbounded),
         _ => return None,
     })
 }
@@ -531,8 +587,9 @@ fn type_index_tag(spec: &Value) -> Option<u8> {
 
 /// Range covering all encoded values of a BSON type. Missing fields are not
 /// indexed, so this is safe for `$type` (which never matches a missing field).
-fn type_bounds(spec: &Value) -> Option<RangeBytes> {
+fn type_bounds_direction(spec: &Value, direction: i8) -> Option<RangeBytes> {
     let tag = type_index_tag(spec)?;
+    let tag = if direction < 0 { !tag } else { tag };
     Some((
         Bound::Included(vec![tag]),
         Bound::Excluded(vec![tag.checked_add(1)?]),
@@ -546,20 +603,25 @@ fn type_bounds(spec: &Value) -> Option<RangeBytes> {
 /// type as the condition value; the matcher does not compare different types, so
 /// otherwise `$gt: 2` would also include strings/bools from the index.
 pub fn bounds_from_cond(cond: &Value) -> Option<RangeBytes> {
+    bounds_from_cond_direction(cond, 1)
+}
+
+/// Range for a compound condition in a storage direction.
+pub fn bounds_from_cond_direction(cond: &Value, direction: i8) -> Option<RangeBytes> {
     if let Some(spec) = cond
         .as_object()
         .and_then(|obj| (obj.len() == 1).then(|| obj.get("$type")).flatten())
     {
-        return type_bounds(spec);
+        return type_bounds_direction(spec, direction);
     }
     if date::is_date(cond) || numeric::is_numeric(cond) || bson_types::is_bson_value(cond) {
-        return bounds("$eq", cond);
+        return bounds_direction("$eq", cond, direction);
     }
     if let Some(prefix) = regex::condition_prefix(cond) {
-        return Some(string_prefix_bounds(&prefix));
+        return Some(string_prefix_bounds_direction(&prefix, direction));
     }
     let Some(obj) = cond.as_object() else {
-        return bounds("$eq", cond);
+        return bounds_direction("$eq", cond, direction);
     };
     if obj.is_empty() {
         return None;
@@ -567,27 +629,33 @@ pub fn bounds_from_cond(cond: &Value) -> Option<RangeBytes> {
     if obj.len() == 1 {
         let (op, value) = obj.iter().next()?;
         if op == "$eq" {
-            return bounds(op, value);
+            return bounds_direction(op, value, direction);
         }
         if op == "$all" {
             let values = value.as_array()?;
             return if values.len() == 1 {
-                bounds("$eq", &values[0])
+                bounds_direction("$eq", &values[0], direction)
             } else {
                 None
             };
         }
-        return range_bounds(std::iter::once((op.as_str(), value)));
+        return range_bounds_direction(std::iter::once((op.as_str(), value)), direction);
     }
-    range_bounds(obj.iter().map(|(op, value)| (op.as_str(), value)))
+    range_bounds_direction(
+        obj.iter().map(|(op, value)| (op.as_str(), value)),
+        direction,
+    )
 }
 
-fn range_bounds<'a>(ops: impl Iterator<Item = (&'a str, &'a Value)>) -> Option<RangeBytes> {
+fn range_bounds_direction<'a>(
+    ops: impl Iterator<Item = (&'a str, &'a Value)>,
+    direction: i8,
+) -> Option<RangeBytes> {
     let mut tag: Option<u8> = None;
     let mut lower = Bound::Unbounded;
     let mut upper = Bound::Unbounded;
     for (op, value) in ops {
-        let vb = encode_value(value)?;
+        let vb = encode_value_direction(value, direction)?;
         let t = *vb.first()?;
         if let Some(prev) = tag {
             if prev != t {
@@ -596,11 +664,15 @@ fn range_bounds<'a>(ops: impl Iterator<Item = (&'a str, &'a Value)>) -> Option<R
         } else {
             tag = Some(t);
         }
-        match op {
-            "$gt" => lower = max_lower(lower, Bound::Included(after_value(&vb))),
-            "$gte" => lower = max_lower(lower, Bound::Included(vb)),
-            "$lt" => upper = min_upper(upper, Bound::Excluded(vb)),
-            "$lte" => upper = min_upper(upper, Bound::Excluded(after_value(&vb))),
+        match (op, direction < 0) {
+            ("$gt", false) => lower = max_lower(lower, Bound::Included(after_value(&vb))),
+            ("$gte", false) => lower = max_lower(lower, Bound::Included(vb)),
+            ("$lt", false) => upper = min_upper(upper, Bound::Excluded(vb)),
+            ("$lte", false) => upper = min_upper(upper, Bound::Excluded(after_value(&vb))),
+            ("$gt", true) => upper = min_upper(upper, Bound::Excluded(vb)),
+            ("$gte", true) => upper = min_upper(upper, Bound::Excluded(after_value(&vb))),
+            ("$lt", true) => lower = max_lower(lower, Bound::Included(after_value(&vb))),
+            ("$lte", true) => lower = max_lower(lower, Bound::Included(vb)),
             _ => return None,
         }
     }
@@ -866,6 +938,33 @@ mod tests {
             enc(json!({"$uuid": "00112233-4455-6677-8899-aabbccddeeff"})),
             enc(json!({"$binary": {"base64": "ABEiM0RVZneImaq7zN3u/w==", "subType": "04"}}))
         );
+    }
+
+    #[test]
+    fn descending_encoding_reverses_order_and_keeps_ranges_exact() {
+        let low = encode_value_direction(&json!(4), -1).unwrap();
+        let mid = encode_value_direction(&json!(6), -1).unwrap();
+        let high = encode_value_direction(&json!(8), -1).unwrap();
+        assert!(low > mid && mid > high);
+
+        let (lo, hi) = bounds_direction("$eq", &json!(6), -1).unwrap();
+        let mut key = encode_value_direction(&json!(6), -1).unwrap();
+        key.extend_from_slice(b"doc-id");
+        assert!(matches!(&lo, Bound::Included(v) if *v <= key));
+        assert!(matches!(&hi, Bound::Excluded(v) if key < *v));
+
+        let (lo, hi) = bounds_from_cond_direction(&json!({"$gte": 5, "$lt": 8}), -1).unwrap();
+        let lower = bound_key(&lo);
+        let upper = bound_key(&hi);
+        for value in [5, 6, 7] {
+            let key = encode_value_direction(&json!(value), -1).unwrap();
+            assert!(lower <= key.as_slice(), "value {value} below lower bound");
+            assert!(key.as_slice() < upper, "value {value} above upper bound");
+        }
+        let below = encode_value_direction(&json!(4), -1).unwrap();
+        let at_upper = encode_value_direction(&json!(8), -1).unwrap();
+        assert!(below.as_slice() > upper);
+        assert!(at_upper.as_slice() < lower);
     }
 
     #[test]
