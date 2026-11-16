@@ -111,6 +111,35 @@ unknown `cursor` sub-option or a negative `batchSize` is rejected. Rejected
 options return MongoDB `BadValue` code `2` instead of changing query behavior
 silently.
 
+### Export and portability
+
+The wire listener is compatible with the standard MongoDB export and restore
+tools. Relaxed JSON, canonical Extended JSON, and BSON dumps preserve ObjectId,
+Date, Decimal128, Binary, Timestamp, MinKey/MaxKey, and numeric BSON types:
+
+```bash
+mongoexport --uri='mongodb://127.0.0.1:37017/?directConnection=true' \
+  --db=app --collection=items --out=items.json
+mongoexport --uri='mongodb://127.0.0.1:37017/?directConnection=true' \
+  --db=app --collection=items --jsonFormat=canonical --out=items-canonical.json
+mongodump --uri='mongodb://127.0.0.1:37017/?directConnection=true' \
+  --db=app --out=dump/
+```
+
+The output can be restored into real MongoDB:
+
+```bash
+mongoimport --uri='mongodb://127.0.0.1:27017/?directConnection=true' \
+  --db=app --collection=items --file=items-canonical.json
+mongorestore --uri='mongodb://127.0.0.1:27017/?directConnection=true' \
+  --nsFrom='app.*' --nsTo='app_restored.*' dump/
+```
+
+`scripts/mongo_export_test.py` checks this path end to end: `mongoexport` in both
+JSON modes, `mongodump`/`bsondump`, `mongoimport`, `mongorestore`, and index-key
+preservation. Set `MONGODB_EXPORT_URL` to include the real-MongoDB restore
+checks; without it the exporter output is still validated locally.
+
 ### Conformance harness
 
 `scripts/mongo_conformance_test.py` runs the same PyMongo workload against the
