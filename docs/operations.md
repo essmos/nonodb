@@ -83,6 +83,8 @@ secrets.
 | `NONODB_MONGO_USERNAME` | — | MongoDB wire username. Requires `NONODB_MONGO_PASSWORD`; enabling auth requires SCRAM-SHA-256 for every non-handshake command |
 | `NONODB_MONGO_PASSWORD` | — | MongoDB wire password. Grants instance-wide administrative access over the experimental listener |
 | `NONODB_MONGO_SCRAM_ITERATIONS` | `15000` | SCRAM-SHA-256 PBKDF2 iteration count, 4096..1000000 |
+| `NONODB_MONGO_TLS_CERT` | — | PEM certificate chain for the MongoDB listener. Requires `NONODB_MONGO_TLS_KEY` |
+| `NONODB_MONGO_TLS_KEY` | — | PEM private key for the MongoDB listener. Requires `NONODB_MONGO_TLS_CERT` |
 | `NONODB_TLS_CERT` | — | PEM certificate chain for TCP TLS |
 | `NONODB_TLS_KEY` | — | PEM private key for TCP TLS |
 | `NONODB_TLS_CLIENT_CA` | — | PEM CA bundle used to verify client certificates (mTLS) |

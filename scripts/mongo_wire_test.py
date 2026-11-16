@@ -25,6 +25,8 @@ def main() -> int:
         credentials = f"{quote(username, safe='')}:{quote(password, safe='')}@"
         url = url.replace("://", f"://{credentials}", 1)
         url += ("&" if "?" in url else "?") + "authSource=admin"
+    if os.environ.get("NONODB_MONGO_TLS", "").lower() in ("1", "true", "yes") and "tls=" not in url:
+        url += "&tls=true&tlsAllowInvalidCertificates=true"
     client = MongoClient(url, serverSelectionTimeoutMS=3000)
     db = client.mongo_wire_smoke
     coll = db[f"items_{os.getpid()}"]

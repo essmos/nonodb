@@ -209,6 +209,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
+    let mongo_tls = if mongo_addr.is_some() {
+        mongo_wire::tls_from_env()?
+    } else {
+        None
+    };
     server_info::set_advertise_url(
         std::env::var("NONODB_REPLICATION_ADVERTISE_URL")
             .ok()
@@ -463,8 +468,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         let shutdown = shutdown_rx.clone();
         let mongo_state = state.clone();
         mongo_task = Some(tokio::spawn(async move {
-            if let Err(e) =
-                mongo_wire::serve(&addr, mongo_state, mongo_auth, shutdown, drain_timeout).await
+            if let Err(e) = mongo_wire::serve(
+                &addr,
+                mongo_state,
+                mongo_auth,
+                mongo_tls,
+                shutdown,
+                drain_timeout,
+            )
+            .await
             {
                 tracing::error!(?e, %addr, "Mongo wire listener stopped");
             }

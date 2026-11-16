@@ -7,7 +7,7 @@ practical map, not a claim of drop-in replacement.
 > query language. It also has an **experimental MongoDB wire listener** for a
 > practical CRUD subset, with optional SCRAM-SHA-256 authentication. That
 > listener is not a drop-in MongoDB replacement: it does not yet implement
-> sessions, transactions, change streams, or TLS. The HTTP API and the
+> sessions, transactions, or change streams. The HTTP API and the
 > Python/Rust/Node.js/Go clients remain the supported interfaces.
 
 The assessment below is verified against NonoDB `0.25.x`.
@@ -66,8 +66,10 @@ Set `NONODB_MONGO_ADDR=127.0.0.1:27017` and connect with a MongoDB driver using
 unauthenticated; set both `NONODB_MONGO_USERNAME` and
 `NONODB_MONGO_PASSWORD` to require SCRAM-SHA-256 authentication. The configured
 account has instance-wide administrative access over the wire listener, so use
-loopback or a trusted private network. The listener itself does not terminate
-TLS.
+loopback or a trusted private network. To terminate TLS, set both
+`NONODB_MONGO_TLS_CERT` and `NONODB_MONGO_TLS_KEY`, then connect with
+`tls=true`. Client-certificate authentication and hot certificate reload are not
+implemented for this listener.
 
 | Wire command | Status |
 |---|---|
@@ -77,7 +79,7 @@ TLS.
 | `count` / `distinct` / basic `aggregate` | ✅ |
 | `createIndexes` / `listIndexes` / `dropIndexes` | ✅ |
 | `create` / `drop` / `listCollections` / `listDatabases` / `dropDatabase` | ✅ |
-| SCRAM-SHA-256 authentication / TLS client auth | 🟡 | Optional username/password auth; no SCRAM-SHA-1 or TLS listener |
+| SCRAM-SHA-256 authentication / TLS | 🟡 | Optional username/password auth and server TLS; no SCRAM-SHA-1 or client-certificate auth |
 | Sessions / transactions / change streams | ❌ |
 
 `dropDatabase` cannot remove the built-in `default` database. Wire `find`

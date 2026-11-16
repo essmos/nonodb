@@ -5,7 +5,7 @@
 //! a small aggregate subset; unsupported commands fail with MongoDB-style
 //! errors instead of silently behaving differently.
 
-use std::io;
+use std::io::{self, BufReader};
 use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -21,6 +21,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
+use tokio_rustls::TlsAcceptor;
 use zeroize::Zeroizing;
 
 use crate::cursor;
@@ -113,6 +114,30 @@ impl MongoAuth {
     }
 }
 
+pub(crate) fn tls_from_env() -> Result<Option<TlsAcceptor>, Box<dyn std::error::Error>> {
+    let cert = std::env::var("NONODB_MONGO_TLS_CERT")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let key = std::env::var("NONODB_MONGO_TLS_KEY")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let (cert, key) = match (cert, key) {
+        (None, None) => return Ok(None),
+        (Some(cert), Some(key)) => (cert, key),
+        _ => return Err("provide both NONODB_MONGO_TLS_CERT and NONODB_MONGO_TLS_KEY".into()),
+    };
+    let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+    let mut cert_reader = BufReader::new(std::fs::File::open(&cert)?);
+    let certs = rustls_pemfile::certs(&mut cert_reader).collect::<Result<Vec<_>, _>>()?;
+    let mut key_reader = BufReader::new(std::fs::File::open(&key)?);
+    let key = rustls_pemfile::private_key(&mut key_reader)?
+        .ok_or("no private key in NONODB_MONGO_TLS_KEY")?;
+    let config = tokio_rustls::rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)?;
+    Ok(Some(TlsAcceptor::from(Arc::new(config))))
+}
+
 #[derive(Default)]
 struct WireSession {
     authenticated: bool,
@@ -132,26 +157,31 @@ pub async fn serve(
     addr: &str,
     state: super::AppState,
     auth: Option<MongoAuth>,
+    tls: Option<TlsAcceptor>,
     mut shutdown: watch::Receiver<bool>,
     drain_timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(addr).await?;
     let bound = listener.local_addr()?.to_string();
+    let tls_enabled = tls.is_some();
     if auth.is_some() {
         tracing::warn!(
             %addr,
             bound = %bound,
             mechanism = SCRAM_MECHANISM,
+            tls = tls_enabled,
             "experimental MongoDB wire listener enabled with SCRAM authentication"
         );
     } else {
         tracing::warn!(
             %addr,
             bound = %bound,
+            tls = tls_enabled,
             "experimental unauthenticated MongoDB wire listener enabled; handshake plus insert/find/getMore/killCursors only"
         );
     }
     let auth = auth.map(Arc::new);
+    let tls = tls.map(Arc::new);
 
     let mut connections = JoinSet::new();
     loop {
@@ -162,8 +192,16 @@ pub async fn serve(
         let shutdown = shutdown.clone();
         let state = state.clone();
         let auth = auth.clone();
+        let tls = tls.clone();
         connections.spawn(async move {
-            if let Err(error) = handle_connection(stream, state, auth, shutdown).await {
+            let result = match tls {
+                Some(acceptor) => match acceptor.accept(stream).await {
+                    Ok(stream) => handle_connection(stream, state, auth, shutdown).await,
+                    Err(error) => Err(error),
+                },
+                None => handle_connection(stream, state, auth, shutdown).await,
+            };
+            if let Err(error) = result {
                 tracing::debug!(?error, %peer, "Mongo wire connection closed");
             }
         });
