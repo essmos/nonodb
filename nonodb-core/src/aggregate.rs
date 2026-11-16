@@ -506,6 +506,14 @@ pub(crate) fn run_with_host_vars(
                     docs = set_window_fields(docs, arg, vars)?;
                     i += 1;
                 }
+                "$densify" => {
+                    docs = densify(docs, arg, vars)?;
+                    i += 1;
+                }
+                "$fill" => {
+                    docs = fill(docs, arg, vars)?;
+                    i += 1;
+                }
                 "$facet" => {
                     let Some(facets) = arg.as_object() else {
                         return Err(Error::Query("$facet requires an object".into()));
@@ -1469,6 +1477,563 @@ fn set_window_fields(
         for (output, values) in outputs.iter().zip(results) {
             for (index, value) in indices.iter().zip(values) {
                 path::set(&mut docs[*index], &output.field, value)?;
+            }
+        }
+    }
+    Ok(docs)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DensifyKind {
+    Number,
+    Date,
+}
+
+#[derive(Clone)]
+enum DensifyBounds {
+    Partition,
+    Full,
+    Explicit(Value, Value),
+}
+
+fn densify_add_date(ms: i64, step: i64, unit: &str) -> Result<i64> {
+    let value = date_from_millis(ms)?;
+    let result = match unit {
+        "year" => add_date_months(
+            value,
+            step.checked_mul(12)
+                .ok_or_else(|| Error::InvalidDate("date arithmetic overflow".into()))?,
+        )?,
+        "quarter" => add_date_months(
+            value,
+            step.checked_mul(3)
+                .ok_or_else(|| Error::InvalidDate("date arithmetic overflow".into()))?,
+        )?,
+        "month" => add_date_months(value, step)?,
+        "week" => value
+            .checked_add(Duration::weeks(step))
+            .ok_or_else(|| Error::InvalidDate("date arithmetic overflow".into()))?,
+        "day" => value
+            .checked_add(Duration::days(step))
+            .ok_or_else(|| Error::InvalidDate("date arithmetic overflow".into()))?,
+        "hour" => value
+            .checked_add(Duration::hours(step))
+            .ok_or_else(|| Error::InvalidDate("date arithmetic overflow".into()))?,
+        "minute" => value
+            .checked_add(Duration::minutes(step))
+            .ok_or_else(|| Error::InvalidDate("date arithmetic overflow".into()))?,
+        "second" => value
+            .checked_add(Duration::seconds(step))
+            .ok_or_else(|| Error::InvalidDate("date arithmetic overflow".into()))?,
+        "millisecond" => value
+            .checked_add(Duration::milliseconds(step))
+            .ok_or_else(|| Error::InvalidDate("date arithmetic overflow".into()))?,
+        _ => return Err(Error::Query(format!("unsupported date unit `{unit}`"))),
+    };
+    date_to_millis(result)
+}
+
+fn densify_value_kind(value: &Value, date_mode: bool) -> Result<()> {
+    if date_mode {
+        if date::is_date(value) {
+            Ok(())
+        } else {
+            Err(Error::Query(
+                "$densify with `unit` requires date field values".into(),
+            ))
+        }
+    } else if numeric::as_bigdecimal(value).is_some() {
+        Ok(())
+    } else {
+        Err(Error::Query(
+            "$densify without `unit` requires numeric field values".into(),
+        ))
+    }
+}
+
+fn densify_key(value: &Value, date_mode: bool) -> Result<String> {
+    if date_mode {
+        serde_json::to_string(&date::canonical(date_millis(value)?)).map_err(Into::into)
+    } else {
+        let value = numeric::as_bigdecimal(value)
+            .ok_or_else(|| Error::Query("$densify requires numeric values".into()))?;
+        serde_json::to_string(&numeric::decimal_value(&value)?).map_err(Into::into)
+    }
+}
+
+fn densify_number_value(value: &BigDecimal) -> Result<Value> {
+    let normalized = value.normalized();
+    let text = normalized.to_string();
+    if !text.contains(['.', 'e', 'E']) {
+        if let Ok(value) = text.parse::<i128>() {
+            return numeric::integer_json(value);
+        }
+    }
+    numeric::decimal_value(value)
+}
+
+fn densify_partition_key(doc: &Value, fields: &[String]) -> Result<String> {
+    let mut values = Vec::with_capacity(fields.len());
+    for field in fields {
+        values.push(path::get(doc, field).cloned().unwrap_or(Value::Null));
+    }
+    Ok(serde_json::to_string(&Value::Array(values))?)
+}
+
+fn densify_partition_doc(doc: &Value, fields: &[String]) -> Result<Value> {
+    let mut out = Value::Object(Map::new());
+    for field in fields {
+        let value = path::get(doc, field).cloned().unwrap_or(Value::Null);
+        path::set(&mut out, field, value)?;
+    }
+    Ok(out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn densify_group(
+    docs: &[Value],
+    indices: &[usize],
+    field: &str,
+    partition_fields: &[String],
+    kind: DensifyKind,
+    bounds: &DensifyBounds,
+    global: Option<(Value, Value)>,
+    step_number: Option<&BigDecimal>,
+    step_date: Option<i64>,
+    unit: Option<&str>,
+) -> Result<Vec<Value>> {
+    let mut existing = HashSet::new();
+    let mut partition_min = None;
+    let mut partition_max = None;
+    for index in indices {
+        let Some(value) = path::get(&docs[*index], field) else {
+            continue;
+        };
+        if value.is_null() {
+            continue;
+        }
+        densify_value_kind(value, kind == DensifyKind::Date)?;
+        existing.insert(densify_key(value, kind == DensifyKind::Date)?);
+        if partition_min
+            .as_ref()
+            .map(|current| compare_value(value, current) == Ordering::Less)
+            .unwrap_or(true)
+        {
+            partition_min = Some(value.clone());
+        }
+        if partition_max
+            .as_ref()
+            .map(|current| compare_value(value, current) == Ordering::Greater)
+            .unwrap_or(true)
+        {
+            partition_max = Some(value.clone());
+        }
+    }
+    let (lower, upper) = match bounds {
+        DensifyBounds::Partition => match (partition_min, partition_max) {
+            (Some(lower), Some(upper)) => (lower, upper),
+            _ => return Ok(Vec::new()),
+        },
+        DensifyBounds::Full => match global {
+            Some((lower, upper)) => (lower, upper),
+            None => return Ok(Vec::new()),
+        },
+        DensifyBounds::Explicit(lower, upper) => {
+            densify_value_kind(lower, kind == DensifyKind::Date)?;
+            densify_value_kind(upper, kind == DensifyKind::Date)?;
+            (lower.clone(), upper.clone())
+        }
+    };
+    let base = densify_partition_doc(
+        indices
+            .first()
+            .map(|index| &docs[*index])
+            .ok_or_else(|| Error::Query("internal densify partition error".into()))?,
+        partition_fields,
+    )?;
+    let mut generated = Vec::new();
+    match kind {
+        DensifyKind::Number => {
+            let Some(step) = step_number else {
+                return Err(Error::Query("$densify requires a numeric `step`".into()));
+            };
+            let mut current = numeric::as_bigdecimal(&lower)
+                .ok_or_else(|| Error::Query("$densify bounds must be numeric".into()))?;
+            let upper = numeric::as_bigdecimal(&upper)
+                .ok_or_else(|| Error::Query("$densify bounds must be numeric".into()))?;
+            while current <= upper {
+                let value = densify_number_value(&current)?;
+                if !existing.contains(&densify_key(&value, false)?) {
+                    let mut doc = base.clone();
+                    path::set(&mut doc, field, value)?;
+                    generated.push(doc);
+                }
+                current += step;
+            }
+        }
+        DensifyKind::Date => {
+            let Some(step) = step_date else {
+                return Err(Error::Query("$densify requires an integer `step`".into()));
+            };
+            let unit = unit.ok_or_else(|| Error::Query("$densify requires `unit`".into()))?;
+            let mut current = date_millis(&lower)?;
+            let upper = date_millis(&upper)?;
+            while current <= upper {
+                let value = date::canonical(current);
+                if !existing.contains(&densify_key(&value, true)?) {
+                    let mut doc = base.clone();
+                    path::set(&mut doc, field, value)?;
+                    generated.push(doc);
+                }
+                let next = densify_add_date(current, step, unit)?;
+                if next <= current {
+                    return Err(Error::InvalidDate(
+                        "$densify date step does not advance".into(),
+                    ));
+                }
+                current = next;
+            }
+        }
+    }
+    Ok(generated)
+}
+
+fn densify(
+    mut docs: Vec<Value>,
+    spec: &Value,
+    _vars: &BTreeMap<String, Value>,
+) -> Result<Vec<Value>> {
+    let spec = spec
+        .as_object()
+        .ok_or_else(|| Error::Query("$densify requires an object".into()))?;
+    let field = spec
+        .get("field")
+        .and_then(Value::as_str)
+        .filter(|field| !field.is_empty() && !field.starts_with('$'))
+        .ok_or_else(|| Error::Query("$densify requires a non-empty `field`".into()))?;
+    let partition_fields = match spec.get("partitionByFields") {
+        Some(value) => value
+            .as_array()
+            .ok_or_else(|| Error::Query("$densify `partitionByFields` must be an array".into()))?
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .filter(|field| !field.is_empty())
+                    .map(str::to_string)
+                    .ok_or_else(|| Error::Query("partition fields must be strings".into()))
+            })
+            .collect::<Result<Vec<_>>>()?,
+        None => Vec::new(),
+    };
+    if partition_fields.iter().any(|partition| partition == field) {
+        return Err(Error::Query(
+            "$densify field cannot also be a partition field".into(),
+        ));
+    }
+    let range = spec
+        .get("range")
+        .and_then(Value::as_object)
+        .ok_or_else(|| Error::Query("$densify requires `range`".into()))?;
+    let unit = range.get("unit").and_then(Value::as_str);
+    let date_mode = unit.is_some();
+    let (step_number, step_date) = if date_mode {
+        let step = range
+            .get("step")
+            .and_then(Value::as_i64)
+            .filter(|step| *step > 0)
+            .ok_or_else(|| {
+                Error::Query("$densify date `step` must be a positive integer".into())
+            })?;
+        (None, Some(step))
+    } else {
+        let step = range
+            .get("step")
+            .and_then(numeric::as_bigdecimal)
+            .filter(|step| *step > 0)
+            .ok_or_else(|| Error::Query("$densify `step` must be positive".into()))?;
+        (Some(step), None)
+    };
+    let bounds = match range.get("bounds") {
+        None => DensifyBounds::Partition,
+        Some(Value::String(value)) if value == "partition" => DensifyBounds::Partition,
+        Some(Value::String(value)) if value == "full" => DensifyBounds::Full,
+        Some(Value::Array(values)) if values.len() == 2 => {
+            DensifyBounds::Explicit(values[0].clone(), values[1].clone())
+        }
+        Some(_) => {
+            return Err(Error::Query(
+                "$densify `bounds` must be `partition`, `full`, or [lower, upper]".into(),
+            ));
+        }
+    };
+    let kind = if date_mode {
+        DensifyKind::Date
+    } else {
+        DensifyKind::Number
+    };
+
+    let mut groups: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (index, doc) in docs.iter().enumerate() {
+        groups
+            .entry(densify_partition_key(doc, &partition_fields)?)
+            .or_default()
+            .push(index);
+    }
+    let mut global_min = None;
+    let mut global_max = None;
+    for doc in &docs {
+        let Some(value) = path::get(doc, field) else {
+            continue;
+        };
+        if value.is_null() {
+            continue;
+        }
+        densify_value_kind(value, date_mode)?;
+        if global_min
+            .as_ref()
+            .map(|current| compare_value(value, current) == Ordering::Less)
+            .unwrap_or(true)
+        {
+            global_min = Some(value.clone());
+        }
+        if global_max
+            .as_ref()
+            .map(|current| compare_value(value, current) == Ordering::Greater)
+            .unwrap_or(true)
+        {
+            global_max = Some(value.clone());
+        }
+    }
+    let global = global_min.zip(global_max);
+    let mut generated = Vec::new();
+    for indices in groups.values() {
+        generated.extend(densify_group(
+            &docs,
+            indices,
+            field,
+            &partition_fields,
+            kind,
+            &bounds,
+            global.clone(),
+            step_number.as_ref(),
+            step_date,
+            unit,
+        )?);
+        if docs.len().saturating_add(generated.len()) > max_docs() {
+            return Err(Error::Query(format!(
+                "$densify result exceeds {} documents",
+                max_docs()
+            )));
+        }
+    }
+    docs.extend(generated);
+    Ok(docs)
+}
+
+#[derive(Clone)]
+enum FillMethod {
+    Value(Value),
+    Locf,
+    Linear,
+}
+
+fn fill_partition_key(doc: &Value, fields: &[String]) -> Result<String> {
+    densify_partition_key(doc, fields)
+}
+
+fn fill_sort_x(doc: &Value, field: &str) -> Result<Option<f64>> {
+    let Some(value) = path::get(doc, field) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    if let Some(value) = numeric::as_f64(value) {
+        return Ok(Some(value));
+    }
+    if date::is_date(value) {
+        return Ok(Some(date_millis(value)? as f64));
+    }
+    Err(Error::Query(
+        "$fill linear requires a numeric or date sort field".into(),
+    ))
+}
+
+fn fill_values(
+    docs: &[Value],
+    indices: &[usize],
+    field: &str,
+    method: &FillMethod,
+    sort: &[(String, i32)],
+    vars: &BTreeMap<String, Value>,
+) -> Result<Vec<Option<Value>>> {
+    let mut out = vec![None; indices.len()];
+    match method {
+        FillMethod::Value(expression) => {
+            for (position, index) in indices.iter().enumerate() {
+                let current = path::get(&docs[*index], field);
+                if current.is_none_or(Value::is_null) {
+                    out[position] = Some(eval_expr_vars(&docs[*index], expression, vars)?);
+                }
+            }
+        }
+        FillMethod::Locf => {
+            let mut last = None;
+            for (position, index) in indices.iter().enumerate() {
+                let current = path::get(&docs[*index], field);
+                match current {
+                    Some(value) if !value.is_null() => last = Some(value.clone()),
+                    _ => {
+                        if let Some(value) = &last {
+                            out[position] = Some(value.clone());
+                        }
+                    }
+                }
+            }
+        }
+        FillMethod::Linear => {
+            let sort_field = sort
+                .first()
+                .map(|(field, _)| field.as_str())
+                .ok_or_else(|| Error::Query("$fill linear requires `sortBy`".into()))?;
+            let mut known = Vec::new();
+            for (position, index) in indices.iter().enumerate() {
+                let Some(value) = path::get(&docs[*index], field) else {
+                    continue;
+                };
+                if value.is_null() {
+                    continue;
+                }
+                let Some(value) = numeric::as_f64(value) else {
+                    return Err(Error::Query(
+                        "$fill linear requires numeric field values".into(),
+                    ));
+                };
+                let Some(x) = fill_sort_x(&docs[*index], sort_field)? else {
+                    return Err(Error::Query(
+                        "$fill linear requires non-null sort values".into(),
+                    ));
+                };
+                known.push((position, x, value));
+            }
+            for (position, index) in indices.iter().enumerate() {
+                let current = path::get(&docs[*index], field);
+                if current.is_some_and(|value| !value.is_null()) {
+                    continue;
+                }
+                let Some(previous) = known.iter().rev().find(|(known, _, _)| *known < position)
+                else {
+                    continue;
+                };
+                let Some(next) = known.iter().find(|(known, _, _)| *known > position) else {
+                    continue;
+                };
+                let Some(x) = fill_sort_x(&docs[*index], sort_field)? else {
+                    continue;
+                };
+                if next.1 == previous.1 {
+                    out[position] = Some(number_value(previous.2));
+                } else {
+                    let ratio = (x - previous.1) / (next.1 - previous.1);
+                    out[position] = Some(number_value(previous.2 + ratio * (next.2 - previous.2)));
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn fill(mut docs: Vec<Value>, spec: &Value, vars: &BTreeMap<String, Value>) -> Result<Vec<Value>> {
+    let spec = spec
+        .as_object()
+        .ok_or_else(|| Error::Query("$fill requires an object".into()))?;
+    let partition_fields = match spec.get("partitionByFields") {
+        Some(value) => value
+            .as_array()
+            .ok_or_else(|| Error::Query("$fill `partitionByFields` must be an array".into()))?
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .filter(|field| !field.is_empty())
+                    .map(str::to_string)
+                    .ok_or_else(|| Error::Query("partition fields must be strings".into()))
+            })
+            .collect::<Result<Vec<_>>>()?,
+        None => Vec::new(),
+    };
+    if spec.contains_key("partitionBy") && spec.contains_key("partitionByFields") {
+        return Err(Error::Query(
+            "$fill cannot combine `partitionBy` and `partitionByFields`".into(),
+        ));
+    }
+    let sort = match spec.get("sortBy") {
+        Some(sort) => parse_sort(sort)?,
+        None => Vec::new(),
+    };
+    let outputs = spec
+        .get("output")
+        .and_then(Value::as_object)
+        .ok_or_else(|| Error::Query("$fill requires an `output` object".into()))?;
+    if outputs.is_empty() {
+        return Err(Error::Query("$fill `output` must not be empty".into()));
+    }
+    let mut methods = Vec::with_capacity(outputs.len());
+    for (field, value) in outputs {
+        let value = value
+            .as_object()
+            .ok_or_else(|| Error::Query("$fill output fields must be objects".into()))?;
+        let method = if let Some(expression) = value.get("value") {
+            if value.contains_key("method") {
+                return Err(Error::Query(
+                    "$fill output field cannot combine `value` and `method`".into(),
+                ));
+            }
+            FillMethod::Value(expression.clone())
+        } else {
+            match value.get("method").and_then(Value::as_str) {
+                Some("locf") => FillMethod::Locf,
+                Some("linear") => FillMethod::Linear,
+                Some(method) => {
+                    return Err(Error::Query(format!("unsupported $fill method `{method}`")));
+                }
+                None => {
+                    return Err(Error::Query(
+                        "$fill output field requires `value` or `method`".into(),
+                    ));
+                }
+            }
+        };
+        if matches!(method, FillMethod::Linear) && sort.is_empty() {
+            return Err(Error::Query("$fill linear requires `sortBy`".into()));
+        }
+        methods.push((field.clone(), method));
+    }
+
+    let mut groups: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (index, doc) in docs.iter().enumerate() {
+        let key = if let Some(expression) = spec.get("partitionBy") {
+            serde_json::to_string(&eval_expr_vars(doc, expression, vars)?)?
+        } else {
+            fill_partition_key(doc, &partition_fields)?
+        };
+        groups.entry(key).or_default().push(index);
+    }
+
+    for indices in groups.values_mut() {
+        if !sort.is_empty() {
+            indices.sort_by(|left, right| compare_docs(&docs[*left], &docs[*right], &sort));
+        }
+        let mut results = Vec::with_capacity(methods.len());
+        for (field, method) in &methods {
+            results.push(fill_values(&docs, indices, field, method, &sort, vars)?);
+        }
+        for ((field, _), values) in methods.iter().zip(results) {
+            for (index, value) in indices.iter().zip(values) {
+                if let Some(value) = value {
+                    path::set(&mut docs[*index], field, value)?;
+                }
             }
         }
     }

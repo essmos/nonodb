@@ -915,6 +915,8 @@ error code. `comment` is accepted for correlation but is not stored.
 | `$unionWith` | Append the result of another collection or sub-pipeline |
 | `$graphLookup` | Recursively traverse references across a collection |
 | `$setWindowFields` | Partition, sort, rank, and compute windowed accumulators |
+| `$densify` | Generate missing values in a numeric or date range |
+| `$fill` | Fill missing or null values with a value, `locf`, or linear interpolation |
 | `$sort` | Sort by one or more fields |
 | `$skip` | Skip documents |
 | `$limit` | Limit documents |
@@ -1105,6 +1107,67 @@ Adds partitioned, sorted window calculations without collapsing documents:
 - `$shift` supports `output`, integer `by`, and optional `default`.
 - The aggregate intermediate-document limit still applies.
 
+### `$densify`
+
+Adds documents for missing values in a numeric or date field:
+
+```json
+{
+  "$densify": {
+    "field": "ts",
+    "partitionByFields": ["sensor"],
+    "range": {"step": 1, "unit": "day", "bounds": "partition"}
+  }
+}
+```
+
+- `field` is a dotted path; `partitionByFields` is an optional array of paths.
+- Without `unit`, `step` is a positive number and the field values must be
+  numeric.
+- With `unit`, `step` is a positive integer and the field values must be dates.
+  Supported units are `year`, `quarter`, `month`, `week`, `day`, `hour`,
+  `minute`, `second`, and `millisecond`.
+- `bounds` is `partition` (default), `full`, or an explicit `[lower, upper]`
+  pair. Bounds are inclusive. `full` uses the global minimum and maximum across
+  all partitions.
+- Generated documents contain the densified field and the partition fields.
+  Existing documents are preserved, and existing values are not duplicated.
+- A partition with no non-null values does not generate documents.
+- The result must stay within the aggregate intermediate-document limit.
+
+### `$fill`
+
+Fills missing and null values within partitions:
+
+```json
+{
+  "$fill": {
+    "partitionBy": "$sensor",
+    "sortBy": {"ts": 1},
+    "output": {
+      "status": {"value": "unknown"},
+      "temperature": {"method": "linear"},
+      "mode": {"method": "locf"}
+    }
+  }
+}
+```
+
+- `partitionBy` is an expression; `partitionByFields` is an optional array of
+  paths. They cannot be combined.
+- `sortBy` uses the normal sort object. It is required for `linear`; `locf`
+  uses the partition order when no sort is supplied.
+- `value` fills missing or null fields with the evaluated expression.
+- `locf` carries the previous non-null value forward. Values before the first
+  non-null value are left unchanged.
+- `linear` interpolates numeric values between known points using the first
+  `sortBy` field as the x-axis. It supports numeric and date sort fields.
+  Values before the first or after the last known point are not extrapolated.
+- Non-null, non-numeric values in a `linear` output field return
+  `invalid_query`.
+- Each output field is computed from the input documents before any `$fill`
+  results are written, so output fields do not depend on each other.
+
 ### Limits
 
 - At most **100,000 documents** may exist in an intermediate result. The call
@@ -1112,8 +1175,8 @@ Adds partitioned, sorted window calculations without collapsing documents:
 - The normal request timeout (30 seconds by default) applies.
 - Response size is still limited by the HTTP response path and the client's
   practical memory; use `$limit` and `$project` for large collections.
-- Not supported: `$merge`, `$out`, `$densify`, `$fill`, `$redact`, `$expMovingAvg`,
-  `$derivative`, and arbitrary JavaScript.
+- Not supported: `$merge`, `$out`, `$redact`, `$expMovingAvg`, `$derivative`,
+  and arbitrary JavaScript.
 
 ## sql
 
@@ -1237,7 +1300,8 @@ documents the cursor may return, not a batch size. `comment`, `max_time_ms`, and
 Cursor aggregation supports an optional leading `$match`, then only
 document-local stages that preserve one output per input: `$project`,
 `$addFields`/`$set`, and `$unset`. Blocking stages (`$group`, `$unwind`,
-`$sort`, `$count`, `$skip`, `$limit`) require a regular `aggregate`.
+`$sort`, `$count`, `$skip`, `$limit`, `$setWindowFields`, `$densify`, `$fill`)
+require a regular `aggregate`.
 
 `comment` and `max_time_ms` are stored with the cursor and applied to every
 page request. The deadline covers the `$match`/page `find` and is checked after

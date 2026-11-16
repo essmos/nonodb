@@ -250,7 +250,8 @@ single-database directories are migrated to `default/` on startup. See
 - Stages: `$match`, `$project`, `$addFields`/`$set`, `$unset`, `$unwind`,
   `$group`, `$bucket`, `$bucketAuto`, `$sortByCount`, `$replaceRoot`/
   `$replaceWith`, `$sample`, `$facet`, `$lookup`, `$unionWith`, `$graphLookup`,
-  `$setWindowFields`, `$sort`, `$skip`, `$limit`, and `$count`.
+  `$setWindowFields`, `$densify`, `$fill`, `$sort`, `$skip`, `$limit`, and
+  `$count`.
 - Accumulators: `$sum`, `$avg`, `$min`, `$max`, `$first`, `$last`, `$push`,
   `$addToSet`, and `$count`.
 - Consecutive leading `$match` stages are fused, and a terminal `$count` skips

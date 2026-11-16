@@ -9711,6 +9711,162 @@ mod tests {
     }
 
     #[test]
+    fn densify_and_fill_time_series_gaps() {
+        let (_dir, store) = store();
+        let c = store.collection("densify").unwrap();
+        c.insert_one(json!({"_id": "a", "p": "x", "t": 1})).unwrap();
+        c.insert_one(json!({"_id": "b", "p": "x", "t": 3})).unwrap();
+        c.insert_one(json!({"_id": "c", "p": "y", "t": 2})).unwrap();
+
+        let out = c
+            .aggregate(&[
+                json!({"$densify": {
+                    "field": "t",
+                    "partitionByFields": ["p"],
+                    "range": {"step": 1, "bounds": "partition"}
+                }}),
+                json!({"$sort": [["p", 1], ["t", 1]]}),
+            ])
+            .unwrap();
+        assert_eq!(out.len(), 4);
+        assert_eq!(out[0]["t"], 1);
+        assert_eq!(out[1]["t"], 2);
+        assert!(out[1].get("_id").is_none());
+        assert_eq!(out[1]["p"], "x");
+        assert_eq!(out[2]["t"], 3);
+        assert_eq!(out[3]["t"], 2);
+
+        let out = c
+            .aggregate(&[
+                json!({"$densify": {
+                    "field": "t",
+                    "partitionByFields": ["p"],
+                    "range": {"step": 1, "bounds": "full"}
+                }}),
+                json!({"$sort": [["p", 1], ["t", 1]]}),
+            ])
+            .unwrap();
+        assert_eq!(out.len(), 6);
+        assert_eq!(out[0]["p"], "x");
+        assert_eq!(out[0]["t"], 1);
+        assert_eq!(out[1]["t"], 2);
+        assert_eq!(out[2]["t"], 3);
+        assert_eq!(out[3]["p"], "y");
+        assert_eq!(out[3]["t"], 1);
+        assert_eq!(out[5]["t"], 3);
+
+        let dates = store.collection("densify_dates").unwrap();
+        dates
+            .insert_one(json!({
+                "_id": "d1",
+                "at": {"$date": "2026-01-01T00:00:00Z"}
+            }))
+            .unwrap();
+        dates
+            .insert_one(json!({
+                "_id": "d2",
+                "at": {"$date": "2026-01-03T00:00:00Z"}
+            }))
+            .unwrap();
+        let out = dates
+            .aggregate(&[
+                json!({"$densify": {
+                    "field": "at",
+                    "range": {"step": 1, "unit": "day", "bounds": "partition"}
+                }}),
+                json!({"$sort": [["at", 1]]}),
+            ])
+            .unwrap();
+        assert_eq!(out.len(), 3);
+        assert_eq!(
+            out[1]["at"],
+            json!({"$date": {"$numberLong": "1767312000000"}})
+        );
+
+        let fill = store.collection("fill").unwrap();
+        fill.insert_one(json!({"_id": "f1", "p": "x", "t": 1, "v": null, "w": null}))
+            .unwrap();
+        fill.insert_one(json!({"_id": "f2", "p": "x", "t": 2, "v": 10, "w": 10}))
+            .unwrap();
+        fill.insert_one(json!({"_id": "f3", "p": "x", "t": 3}))
+            .unwrap();
+        fill.insert_one(json!({"_id": "f4", "p": "x", "t": 4, "v": 20, "w": 20}))
+            .unwrap();
+        fill.insert_one(json!({"_id": "f5", "p": "x", "t": 5}))
+            .unwrap();
+        let out = fill
+            .aggregate(&[
+                json!({"$fill": {
+                    "partitionBy": "$p",
+                    "sortBy": {"t": 1},
+                    "output": {
+                        "v": {"value": 0},
+                        "w": {"method": "locf"}
+                    }
+                }}),
+                json!({"$sort": [["t", 1]]}),
+            ])
+            .unwrap();
+        assert_eq!(out[0]["v"], 0);
+        assert_eq!(out[1]["v"], 10);
+        assert_eq!(out[2]["v"], 0);
+        assert_eq!(out[3]["v"], 20);
+        assert_eq!(out[4]["v"], 0);
+        assert_eq!(out[0]["w"], json!(null));
+        assert_eq!(out[2]["w"], 10);
+        assert_eq!(out[4]["w"], 20);
+
+        let linear = store.collection("fill_linear").unwrap();
+        linear
+            .insert_one(json!({"_id": "l1", "t": 1, "v": null}))
+            .unwrap();
+        linear
+            .insert_one(json!({"_id": "l2", "t": 2, "v": 10}))
+            .unwrap();
+        linear.insert_one(json!({"_id": "l3", "t": 3})).unwrap();
+        linear
+            .insert_one(json!({"_id": "l4", "t": 4, "v": 20}))
+            .unwrap();
+        linear.insert_one(json!({"_id": "l5", "t": 5})).unwrap();
+        let out = linear
+            .aggregate(&[
+                json!({"$fill": {
+                    "sortBy": {"t": 1},
+                    "output": {"v": {"method": "linear"}}
+                }}),
+                json!({"$sort": [["t", 1]]}),
+            ])
+            .unwrap();
+        assert_eq!(out[2]["v"], 15);
+        assert_eq!(out[0]["v"], json!(null));
+        assert!(out[4].get("v").is_none());
+
+        assert!(c
+            .aggregate(&[json!({"$densify": {
+                "field": "t",
+                "range": {"step": 0}
+            }})])
+            .is_err());
+        assert!(fill
+            .aggregate(&[json!({"$fill": {
+                "sortBy": {"t": 1},
+                "output": {"v": {"method": "linear"}}
+            }})])
+            .is_ok());
+        assert!(fill
+            .aggregate(&[json!({"$fill": {
+                "sortBy": {"t": 1},
+                "output": {"v": {"value": 1, "method": "locf"}}
+            }})])
+            .is_err());
+        assert!(linear
+            .aggregate(&[json!({"$fill": {
+                "output": {"v": {"method": "linear"}}
+            }})])
+            .is_err());
+    }
+
+    #[test]
     fn aggregate_uses_leading_match_and_common_stages() {
         let (_dir, store) = store();
         let c = store.collection("orders").unwrap();

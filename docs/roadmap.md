@@ -298,8 +298,8 @@ project's target workload.
    with a migration path.
 13. **Expanded aggregation** beyond the current `$match`/`$group`/`$bucket`/
     `$bucketAuto`/`$project`/`$sort`/`$limit`/`$facet`/`$sample`/`$lookup`/
-    `$unionWith`/`$graphLookup`/`$setWindowFields` subset, including streaming
-    execution, write stages, and advanced window analytics.
+    `$unionWith`/`$graphLookup`/`$setWindowFields`/`$densify`/`$fill` subset,
+    including streaming execution, write stages, and advanced window analytics.
 
 ### Lower priority
 
