@@ -66,9 +66,12 @@ Set `NONODB_MONGO_ADDR=127.0.0.1:27017` and connect with a MongoDB driver using
 unauthenticated; set both `NONODB_MONGO_USERNAME` and
 `NONODB_MONGO_PASSWORD` to require SCRAM authentication. Both
 `SCRAM-SHA-256` and legacy `SCRAM-SHA-1` are supported; drivers normally choose
-SHA-256. The configured account has instance-wide administrative access over the
-wire listener, so use loopback or a trusted private network. To terminate TLS,
-set both
+SHA-256. Set `NONODB_MONGO_PRINCIPAL` to map the SCRAM account to an auth-file
+principal; its read/write/admin scopes are enforced by wire commands, and
+`listCollections`/`listDatabases` are filtered. Without `NONODB_AUTH_FILE` the
+configured account retains instance-wide administrative access, so use loopback
+or a trusted private network. `NONODB_MONGO_AUTH_SOURCE` defaults to `admin` and
+must match the driver's `authSource`. To terminate TLS, set both
 `NONODB_MONGO_TLS_CERT` and `NONODB_MONGO_TLS_KEY`, then connect with
 `tls=true`. Client-certificate authentication and hot certificate reload are not
 implemented for this listener.
@@ -81,7 +84,7 @@ implemented for this listener.
 | `count` / `distinct` / basic `aggregate` | ✅ |
 | `createIndexes` / `listIndexes` / `dropIndexes` | ✅ |
 | `create` / `drop` / `listCollections` / `listDatabases` / `dropDatabase` | ✅ |
-| SCRAM-SHA-256 / SHA-1 authentication / TLS | 🟡 | Optional username/password auth and server TLS; no client-certificate auth |
+| SCRAM-SHA-256 / SHA-1 authentication / TLS | 🟡 | Optional username/password auth, auth-file principal scopes, authSource check, and server TLS; no MongoDB user database or client-certificate auth |
 | Sessions / transactions / change streams | ❌ |
 
 `dropDatabase` cannot remove the built-in `default` database. Wire `find`

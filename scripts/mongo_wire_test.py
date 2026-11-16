@@ -24,7 +24,8 @@ def main() -> int:
     if username and password and "@" not in url.split("://", 1)[-1]:
         credentials = f"{quote(username, safe='')}:{quote(password, safe='')}@"
         url = url.replace("://", f"://{credentials}", 1)
-        url += ("&" if "?" in url else "?") + "authSource=admin"
+        auth_source = os.environ.get("NONODB_MONGO_AUTH_SOURCE", "admin")
+        url += ("&" if "?" in url else "?") + f"authSource={auth_source}"
     if os.environ.get("NONODB_MONGO_TLS", "").lower() in ("1", "true", "yes") and "tls=" not in url:
         url += "&tls=true&tlsAllowInvalidCertificates=true"
     options = {"serverSelectionTimeoutMS": 3000}

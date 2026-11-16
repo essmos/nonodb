@@ -170,6 +170,31 @@ nonodb-cli auth cert disable "$FP"
 There is no CRL or OCSP integration. Revocation is handled by this registry and
 short-lived client certificates.
 
+## MongoDB wire authentication
+
+The experimental MongoDB listener uses the same SCRAM credential for every
+connection:
+
+- `NONODB_MONGO_USERNAME` / `NONODB_MONGO_PASSWORD` configure the SCRAM account.
+- `NONODB_MONGO_PRINCIPAL` selects the auth-file principal used for wire
+  authorization. It defaults to the Mongo username.
+- `NONODB_MONGO_AUTH_SOURCE` defaults to `admin` and must match the driver's
+  `authSource`.
+- If `NONODB_AUTH_FILE` is configured, the principal must exist or SCRAM fails.
+  If it is not configured, the listener keeps the legacy full-admin behavior.
+
+Wire commands enforce the mapped principal's scopes:
+
+- `find`, `count`, `distinct`, `listIndexes`, and `aggregate` require read
+  access; `$out`/`$merge` also require write access to the target collection.
+- `insert`, `update`, `delete`, and `findAndModify` require write access.
+- `create`/`drop` collection and index DDL require collection administration.
+- `dropDatabase` requires `admin:db`.
+- `listCollections` and `listDatabases` are filtered to visible resources.
+
+This is a single-account mapping, not a MongoDB user database. There are no
+per-database SCRAM users, MongoDB roles, or X.509 user names yet.
+
 ## Managing principals
 
 ```bash

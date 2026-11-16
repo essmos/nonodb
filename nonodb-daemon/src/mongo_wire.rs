@@ -24,6 +24,8 @@ use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
 use zeroize::Zeroizing;
 
+use nonodb_auth::{Action, Principal};
+
 use crate::cursor;
 use crate::protocol::{ApiError, Durability, WriteReq};
 
@@ -132,6 +134,8 @@ impl ScramCredential {
 #[derive(Clone)]
 pub(crate) struct MongoAuth {
     username: String,
+    principal: String,
+    auth_source: String,
     sha256: ScramCredential,
     sha1: ScramCredential,
 }
@@ -164,6 +168,14 @@ impl MongoAuth {
             .fill(&mut sha256_salt)
             .and_then(|_| random.fill(&mut sha1_salt))
             .map_err(|_| "cannot generate MongoDB SCRAM salt".to_string())?;
+        let principal = std::env::var("NONODB_MONGO_PRINCIPAL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| username.clone());
+        let auth_source = std::env::var("NONODB_MONGO_AUTH_SOURCE")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "admin".to_string());
         Self::new_with_salts(
             username,
             &password,
@@ -171,6 +183,11 @@ impl MongoAuth {
             sha1_salt.to_vec(),
             iterations,
         )
+        .map(|mut auth| {
+            auth.principal = principal;
+            auth.auth_source = auth_source;
+            auth
+        })
         .map(Some)
     }
 
@@ -195,7 +212,9 @@ impl MongoAuth {
             iterations,
         )?;
         Ok(Self {
-            username,
+            username: username.clone(),
+            principal: username,
+            auth_source: "admin".to_string(),
             sha256,
             sha1,
         })
@@ -237,6 +256,7 @@ pub(crate) fn tls_from_env() -> Result<Option<TlsAcceptor>, Box<dyn std::error::
 struct WireSession {
     authenticated: bool,
     user: Option<String>,
+    principal: Option<Principal>,
     scram: Option<ScramChallenge>,
 }
 
@@ -385,12 +405,18 @@ async fn dispatch_command(
             message: "Authentication required".to_string(),
         });
     }
+    if let Some(principal) = &session.principal {
+        if let Err(error) = authorize_mongo_command(principal, command.unwrap_or(""), body) {
+            return mongo_error(&error);
+        }
+    }
     let result = match command {
         Some("saslStart") => sasl_start_command(auth, session, body),
-        Some("saslContinue") => sasl_continue_command(auth, session, body),
+        Some("saslContinue") => sasl_continue_command(auth, state.auth.as_deref(), session, body),
         Some("logout") => {
             session.authenticated = false;
             session.user = None;
+            session.principal = None;
             session.scram = None;
             Ok(doc_ok())
         }
@@ -409,8 +435,10 @@ async fn dispatch_command(
         Some("dropIndexes") => drop_indexes_command(state, body).await,
         Some("create") => create_collection_command(state, body).await,
         Some("drop") => drop_collection_command(state, body).await,
-        Some("listCollections") => list_collections_command(state, body).await,
-        Some("listDatabases") => list_databases_command(state).await,
+        Some("listCollections") => {
+            list_collections_command(state, body, session.principal.as_ref()).await
+        }
+        Some("listDatabases") => list_databases_command(state, session.principal.as_ref()).await,
         Some("dropDatabase") => drop_database_command(state, body).await,
         Some("endSessions") | Some("refreshSessions") => Ok(doc_ok()),
         Some("ping")
@@ -442,6 +470,13 @@ fn sasl_start_command(
     let Some(mechanism) = ScramMechanism::parse(mechanism) else {
         return Err(authentication_failed());
     };
+    if body
+        .get_str("$db")
+        .ok()
+        .is_some_and(|database| database != auth.auth_source)
+    {
+        return Err(authentication_failed());
+    }
     let credential = auth.credential(mechanism);
     let payload = payload_bytes(body)?;
     let message = std::str::from_utf8(&payload).map_err(|_| authentication_failed())?;
@@ -492,6 +527,7 @@ fn sasl_start_command(
 
 fn sasl_continue_command(
     auth: Option<&MongoAuth>,
+    auth_state: Option<&crate::auth::AuthState>,
     session: &mut WireSession,
     body: &Document,
 ) -> Result<Document, ApiError> {
@@ -543,8 +579,17 @@ fn sasl_continue_command(
         return Err(authentication_failed());
     }
     let server_signature = mechanism.hmac(&credential.server_key, auth_message.as_bytes());
+    let principal = match auth_state {
+        Some(auth_state) => auth_state
+            .registry()
+            .principal(&auth.principal)
+            .cloned()
+            .ok_or_else(authentication_failed)?,
+        None => Principal::local_admin(),
+    };
     session.authenticated = true;
     session.user = Some(auth.username.clone());
+    session.principal = Some(principal);
     let server_final = format!("v={}", STANDARD.encode(server_signature));
     Ok(sasl_reply(
         challenge.conversation_id,
@@ -1255,6 +1300,7 @@ async fn drop_collection_command(
 async fn list_collections_command(
     state: &super::AppState,
     body: &Document,
+    principal: Option<&Principal>,
 ) -> Result<Document, ApiError> {
     let database = database_name(body);
     let namespace = format!("{database}.$cmd.listCollections");
@@ -1274,6 +1320,9 @@ async fn list_collections_command(
     let mut batch = Vec::with_capacity(names.len());
     for name in names {
         if name.starts_with('\u{1}') || name == crate::databases::DEFAULT_DATABASE {
+            continue;
+        }
+        if principal.is_some_and(|principal| !principal.can_see_collection(&database, &name)) {
             continue;
         }
         let mut doc = bson::doc! {
@@ -1311,10 +1360,16 @@ async fn drop_database_command(
     }
 }
 
-async fn list_databases_command(state: &super::AppState) -> Result<Document, ApiError> {
+async fn list_databases_command(
+    state: &super::AppState,
+    principal: Option<&Principal>,
+) -> Result<Document, ApiError> {
     let names = state.databases.names().await;
     let mut databases = Vec::with_capacity(names.len());
     for name in names {
+        if principal.is_some_and(|principal| !principal.can_see_database(&name)) {
+            continue;
+        }
         databases.push(Bson::Document(bson::doc! {
             "name": name,
             "sizeOnDisk": 0i64,
@@ -1863,6 +1918,119 @@ fn values_to_bson(values: Vec<Value>) -> Result<Vec<Bson>, ApiError> {
         .collect()
 }
 
+fn authorize_mongo_command(
+    principal: &Principal,
+    command: &str,
+    body: &Document,
+) -> Result<(), ApiError> {
+    let database = database_name(body);
+    let collection = |name: &str| {
+        body.get_str(name)
+            .map_err(|_| bad_value(format!("{command} must name a collection")))
+    };
+    match command {
+        "insert" => mongo_allow(principal, Action::Write, &database, collection("insert")?),
+        "update" => mongo_allow(principal, Action::Write, &database, collection("update")?),
+        "delete" => mongo_allow(principal, Action::Write, &database, collection("delete")?),
+        "findAndModify" | "findandmodify" => mongo_allow(
+            principal,
+            Action::Write,
+            &database,
+            body.get_str("findAndModify")
+                .or_else(|_| body.get_str("findandmodify"))
+                .map_err(|_| bad_value("findAndModify must name a collection"))?,
+        ),
+        "find" => mongo_allow(principal, Action::Read, &database, collection("find")?),
+        "count" => mongo_allow(principal, Action::Read, &database, collection("count")?),
+        "distinct" => mongo_allow(principal, Action::Read, &database, collection("distinct")?),
+        "listIndexes" => mongo_allow(
+            principal,
+            Action::Read,
+            &database,
+            collection("listIndexes")?,
+        ),
+        "createIndexes" => mongo_allow(
+            principal,
+            Action::AdminCollection,
+            &database,
+            collection("createIndexes")?,
+        ),
+        "dropIndexes" => mongo_allow(
+            principal,
+            Action::AdminCollection,
+            &database,
+            collection("dropIndexes")?,
+        ),
+        "create" => mongo_allow(
+            principal,
+            Action::AdminCollection,
+            &database,
+            collection("create")?,
+        ),
+        "drop" => mongo_allow(
+            principal,
+            Action::AdminCollection,
+            &database,
+            collection("drop")?,
+        ),
+        "aggregate" => {
+            let coll = collection("aggregate")?;
+            if coll == "1" {
+                return Err(bad_value("database-level aggregate is not supported"));
+            }
+            mongo_allow(principal, Action::Read, &database, coll)?;
+            let Ok(stages) = body.get_array("pipeline") else {
+                return Ok(());
+            };
+            let mut pipeline = Vec::with_capacity(stages.len());
+            for stage in stages {
+                let Bson::Document(document) = stage else {
+                    return Ok(());
+                };
+                let Ok(value) = bson_map::document_to_value(document) else {
+                    return Ok(());
+                };
+                pipeline.push(value);
+            }
+            let Ok(Some(spec)) = nonodb_core::aggregate::write_stage_spec(&pipeline) else {
+                return Ok(());
+            };
+            if let Some(target_database) = &spec.database {
+                if target_database != &database {
+                    return Err(ApiError {
+                        code: "invalid_query".into(),
+                        message: "cross-database $out/$merge is not supported".into(),
+                    });
+                }
+            }
+            mongo_allow(principal, Action::Write, &database, &spec.target)
+        }
+        "dropDatabase" => {
+            if principal.allows_admin_database() {
+                Ok(())
+            } else {
+                Err(ApiError::forbidden())
+            }
+        }
+        "getMore" | "killCursors" | "listCollections" | "listDatabases" | "endSessions"
+        | "refreshSessions" => Ok(()),
+        _ => Ok(()),
+    }
+}
+
+fn mongo_allow(
+    principal: &Principal,
+    action: Action,
+    database: &str,
+    collection: &str,
+) -> Result<(), ApiError> {
+    if principal.allows(action, database, collection) {
+        Ok(())
+    } else {
+        Err(ApiError::forbidden())
+    }
+}
+
 fn bad_value(message: impl Into<String>) -> ApiError {
     ApiError {
         code: "invalid_query".into(),
@@ -1886,7 +2054,7 @@ fn mongo_code(error: &ApiError) -> (i32, &'static str) {
         "timeout" => (50, "MaxTimeMSExpired"),
         "document_too_large" => (10334, "BSONObjectTooLarge"),
         "invalid_query" | "invalid_id" | "invalid_json" | "invalid_collection" => (2, "BadValue"),
-        "unauthorized" => (13, "Unauthorized"),
+        "unauthorized" | "forbidden" => (13, "Unauthorized"),
         "authentication_failed" => (18, "AuthenticationFailed"),
         _ => (1, "InternalError"),
     }
@@ -2185,13 +2353,19 @@ fn connection_status(session: &WireSession) -> Document {
                 "db": "admin",
             })]),
         );
-        auth_info.insert(
-            "authenticatedUserRoles",
-            Bson::Array(vec![Bson::Document(bson::doc! {
+        let roles = if session
+            .principal
+            .as_ref()
+            .is_some_and(Principal::allows_admin_database)
+        {
+            vec![Bson::Document(bson::doc! {
                 "role": "root",
                 "db": "admin",
-            })]),
-        );
+            })]
+        } else {
+            Vec::new()
+        };
+        auth_info.insert("authenticatedUserRoles", Bson::Array(roles));
     } else {
         auth_info.insert("authenticatedUsers", Bson::Array(Vec::new()));
         auth_info.insert("authenticatedUserRoles", Bson::Array(Vec::new()));
@@ -2344,7 +2518,7 @@ mod tests {
             }),
             ..WireSession::default()
         };
-        sasl_continue_command(Some(auth), &mut session, &body).unwrap()
+        sasl_continue_command(Some(auth), None, &mut session, &body).unwrap()
     }
 
     fn test_auth() -> MongoAuth {
@@ -2468,9 +2642,82 @@ mod tests {
             }),
             ..WireSession::default()
         };
-        let error = sasl_continue_command(Some(&auth), &mut challenge_session, &body).unwrap_err();
+        let error =
+            sasl_continue_command(Some(&auth), None, &mut challenge_session, &body).unwrap_err();
         assert_eq!(error.code, "authentication_failed");
         assert!(!challenge_session.authenticated);
+    }
+
+    #[test]
+    fn scram_start_checks_the_configured_auth_source() {
+        let mut auth = test_auth();
+        auth.auth_source = "app".into();
+        let mut session = WireSession::default();
+        let start = bson::doc! {
+            "saslStart": 1,
+            "mechanism": SCRAM_SHA256,
+            "$db": "admin",
+            "payload": Bson::Binary(bson::Binary {
+                subtype: bson::spec::BinarySubtype::Generic,
+                bytes: b"n,,n=alice,r=clientnonce".to_vec(),
+            }),
+        };
+        let error = sasl_start_command(Some(&auth), &mut session, &start).unwrap_err();
+        assert_eq!(error.code, "authentication_failed");
+
+        let start = bson::doc! {
+            "saslStart": 1,
+            "mechanism": SCRAM_SHA256,
+            "$db": "app",
+            "payload": Bson::Binary(bson::Binary {
+                subtype: bson::spec::BinarySubtype::Generic,
+                bytes: b"n,,n=alice,r=clientnonce".to_vec(),
+            }),
+        };
+        assert!(sasl_start_command(Some(&auth), &mut session, &start).is_ok());
+    }
+
+    #[test]
+    fn principal_scopes_authorize_wire_commands() {
+        let principal = Principal::new(
+            "app",
+            &["read:app/orders".into(), "write:app/orders".into()],
+        )
+        .unwrap();
+        assert!(authorize_mongo_command(
+            &principal,
+            "find",
+            &bson::doc! { "find": "orders", "$db": "app" }
+        )
+        .is_ok());
+        assert!(authorize_mongo_command(
+            &principal,
+            "insert",
+            &bson::doc! { "insert": "orders", "$db": "app" }
+        )
+        .is_ok());
+        assert_eq!(
+            authorize_mongo_command(
+                &principal,
+                "insert",
+                &bson::doc! { "insert": "customers", "$db": "app" }
+            )
+            .unwrap_err()
+            .code,
+            "forbidden"
+        );
+        assert_eq!(
+            authorize_mongo_command(
+                &principal,
+                "dropDatabase",
+                &bson::doc! { "dropDatabase": 1, "$db": "app" }
+            )
+            .unwrap_err()
+            .code,
+            "forbidden"
+        );
+        assert!(principal.can_see_database("app"));
+        assert!(!principal.can_see_database("other"));
     }
 
     #[test]

@@ -301,6 +301,20 @@ impl Principal {
                 .any(|rule| matches!(rule, ScopeRule::All))
     }
 
+    /// Whether listing databases should reveal `database` to this principal.
+    pub fn can_see_database(&self, database: &str) -> bool {
+        self.scopes.iter().any(|rule| match rule {
+            ScopeRule::All | ScopeRule::AdminDatabase => true,
+            ScopeRule::Read(resource)
+            | ScopeRule::Write(resource)
+            | ScopeRule::AdminCollection(resource) => resource
+                .database
+                .as_deref()
+                .is_none_or(|scope_database| scope_database == "*" || scope_database == database),
+            ScopeRule::MetricsRead => false,
+        })
+    }
+
     pub fn scopes(&self) -> Vec<String> {
         self.scopes
             .iter()
@@ -794,6 +808,21 @@ mod tests {
         assert!(ScopeRule::parse("*:orders").is_err());
         assert!(ScopeRule::parse("read:orders:extra").is_err());
         assert!(ScopeRule::parse("nope:orders").is_err());
+    }
+
+    #[test]
+    fn database_visibility_follows_scopes() {
+        let scoped =
+            Principal::new("app", &["read:app1/orders".into(), "write:app2/*".into()]).unwrap();
+        assert!(scoped.can_see_database("app1"));
+        assert!(scoped.can_see_database("app2"));
+        assert!(!scoped.can_see_database("other"));
+
+        let unqualified = Principal::new("legacy", &["read:orders".into()]).unwrap();
+        assert!(unqualified.can_see_database("anything"));
+
+        let metrics = Principal::new("metrics", &["metrics:read".into()]).unwrap();
+        assert!(!metrics.can_see_database("app1"));
     }
 
     #[test]

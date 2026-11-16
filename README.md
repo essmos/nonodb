@@ -136,7 +136,8 @@ provide:
 - general interactive multi-document transactions;
 - full MongoDB wire-protocol compatibility; an experimental listener covers
   CRUD, cursors, aggregation, index DDL, collection DDL, optional
-  SCRAM-SHA-256/SCRAM-SHA-1 login, and TLS, but not sessions or transactions;
+  SCRAM-SHA-256/SCRAM-SHA-1 login with auth-file scopes, and TLS, but not
+  sessions or transactions;
 - a role hierarchy or inherited groups; authorization uses principals and
   database-qualified scopes;
 - the full MongoDB query and update language; it implements a practical subset.

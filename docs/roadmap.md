@@ -140,9 +140,9 @@ comparison and practical migration caveats.
 - Dates are instants only. IANA timezone names and timezone-aware aggregation
   expressions are not implemented; clients must send RFC 3339 with `Z`/offset.
 - Existing ISO 8601 strings are not migrated to dates automatically.
-- Decimal128 support is finite-only: decimal `NaN`/`Infinity` are rejected.
-  Decimal arithmetic rounds results to 34 significant digits; values outside
-  the Decimal128 exponent range return `invalid_numeric`.
+- Decimal128 support includes finite values and `NaN`/`Infinity`. Arithmetic
+  results round to 34 significant digits; values outside the Decimal128
+  exponent range return `invalid_numeric`.
 - Long text has no dedicated type; the 1 MiB document limit applies to strings.
 - ObjectId is supported as both a field value and `_id`.
 - BSON regular-expression values and legacy
@@ -197,9 +197,10 @@ comparison and practical migration caveats.
 ### Protocol and clients
 
 - The MongoDB wire listener is experimental. It supports handshake, CRUD,
-  cursors, count, distinct, aggregate, index DDL, collection DDL, and optional
-  SCRAM-SHA-256/SCRAM-SHA-1 authentication and TLS. It does not support
-  client-certificate authentication, sessions, transactions, or change streams.
+  cursors, count, distinct, aggregate, index DDL, collection DDL, optional
+  SCRAM-SHA-256/SCRAM-SHA-1 authentication, auth-file principal scopes, and TLS.
+  It does not support client-certificate authentication, sessions, transactions,
+  or change streams.
 - The supported API is HTTP/JSON; no gRPC, binary framing, or CBOR API.
 - The Python client is a single module, not a published package.
 - The CLI covers common administration, not every possible operation.

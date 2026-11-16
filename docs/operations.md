@@ -81,7 +81,9 @@ secrets.
 | `NONODB_TCP` | — | TCP listen address, e.g. `127.0.0.1:7878` |
 | `NONODB_MONGO_ADDR` | — | Experimental MongoDB wire listener, e.g. `127.0.0.1:27017`. Supports handshake, CRUD, cursors, count, distinct, aggregate, index DDL, collection DDL, and `dropDatabase`; no sessions or transactions |
 | `NONODB_MONGO_USERNAME` | — | MongoDB wire username. Requires `NONODB_MONGO_PASSWORD`; enabling auth requires SCRAM-SHA-256 or SCRAM-SHA-1 for every non-handshake command |
-| `NONODB_MONGO_PASSWORD` | — | MongoDB wire password. Grants instance-wide administrative access over the experimental listener |
+| `NONODB_MONGO_PASSWORD` | — | MongoDB wire password. Grants the mapped principal's scopes; without `NONODB_AUTH_FILE` it is a full local admin |
+| `NONODB_MONGO_PRINCIPAL` | username | Auth-file principal used for MongoDB wire authorization. Requires the principal to exist in `NONODB_AUTH_FILE`; otherwise authentication fails |
+| `NONODB_MONGO_AUTH_SOURCE` | `admin` | Expected SCRAM `authSource`/`$db`. The driver must use the same value |
 | `NONODB_MONGO_SCRAM_ITERATIONS` | `15000` | SCRAM PBKDF2 iteration count for both mechanisms, 4096..1000000 |
 | `NONODB_MONGO_TLS_CERT` | — | PEM certificate chain for the MongoDB listener. Requires `NONODB_MONGO_TLS_KEY` |
 | `NONODB_MONGO_TLS_KEY` | — | PEM private key for the MongoDB listener. Requires `NONODB_MONGO_TLS_CERT` |
