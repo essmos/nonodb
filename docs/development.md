@@ -188,6 +188,7 @@ python3 scripts/mongo_conformance_test.py   # compare wire results with a real M
 python3 scripts/mongo_export_test.py        # mongoexport/mongodump/mongoimport/mongorestore
 python3 scripts/mongo_portability_check.py --self-test  # static workload checker
 python3 scripts/mongo_wire_limits_test.py   # Mongo wire connection/read limits (spawns a daemon)
+python3 scripts/mongo_wire_auth_test.py     # Mongo wire SCRAM maps to principal scopes and code 13
 scripts/mongo_drivers_test.sh              # official Node.js and Go MongoDB drivers
 python3 scripts/auth_test.py                 # scopes, token/cert auth, reload, audit, IP lockout
 python3 scripts/auth_api_test.py             # auth API, Prometheus, disk/snapshot metrics, readiness
@@ -317,6 +318,7 @@ scripts are:
 | `scripts/mongo_export_test.py` | mongoexport/mongodump output and restore into real MongoDB |
 | `scripts/mongo_portability_check.py` | static MongoDB workload and source compatibility checker |
 | `scripts/mongo_wire_limits_test.py` | MongoDB wire connection limit, idle read timeout, and config validation |
+| `scripts/mongo_wire_auth_test.py` | MongoDB wire SCRAM authentication, principal scopes, and unauthorized code 13 |
 | `scripts/mongo_drivers_test.sh` | official Node.js and Go MongoDB driver compatibility |
 | `scripts/mtls_test.sh` | mTLS with generated CA/certs, all clients, live revocation |
 | `scripts/concurrency_test.py` | Independent writers/readers and unique indexes |
@@ -387,6 +389,11 @@ cargo test --locked --all-targets --all-features
 cargo build --locked --release --bins --examples
 python3 -m compileall -q client scripts
 ```
+
+A separate `mongodb-compat` job starts a real MongoDB service, builds the
+daemon, and runs the wire smoke test, the PyMongo conformance comparison, the
+official Node.js and Go drivers, and the SCRAM authorization test. This job is
+the regression gate for the Mongo-compatible subset.
 
 A pull request should be green before merging.
 

@@ -116,6 +116,93 @@ jobs:
           NONODB_CLI: target/release/nonodb-cli
         run: python3 scripts/security_check.py
 
+  mongodb-compat:
+    name: MongoDB compatibility
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+      NONODB_MONGO_URL: mongodb://127.0.0.1:37017/?directConnection=true
+      MONGODB_CONFORMANCE_URL: mongodb://127.0.0.1:27017/?directConnection=true
+
+    services:
+      mongodb:
+        image: mongo:8.0
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'db.runCommand({ ping: 1 }).ok'"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: stable
+
+      - name: Install Python MongoDB driver
+        run: python3 -m pip install --disable-pip-version-check pymongo
+
+      - name: Build daemon
+        run: cargo build --locked --bins
+
+      - name: Start NonoDB MongoDB listener
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/nonodb-mongo/data"
+          NONODB_DATA="$RUNNER_TEMP/nonodb-mongo/data" \
+          NONODB_SOCK="$RUNNER_TEMP/nonodb-mongo/nonodb.sock" \
+          NONODB_MONGO_ADDR=127.0.0.1:37017 \
+            target/debug/nonodb-daemon >"$RUNNER_TEMP/nonodb-mongo/daemon.log" 2>&1 &
+          echo $! >"$RUNNER_TEMP/nonodb-mongo/pid"
+          python3 - <<'PY'
+          import socket
+          import time
+
+          deadline = time.monotonic() + 30
+          while time.monotonic() < deadline:
+              try:
+                  with socket.create_connection(("127.0.0.1", 37017), timeout=0.2):
+                      break
+              except OSError:
+                  time.sleep(0.1)
+          else:
+              raise SystemExit("NonoDB MongoDB listener did not start")
+          PY
+
+      - name: Run MongoDB conformance and wire smoke tests
+        run: |
+          python3 scripts/mongo_conformance_test.py
+          python3 scripts/mongo_wire_test.py
+
+      - name: Run official Node.js and Go MongoDB drivers
+        run: bash scripts/mongo_drivers_test.sh
+
+      - name: Run MongoDB auth and authorization tests
+        run: python3 scripts/mongo_wire_auth_test.py
+
+      - name: Stop NonoDB MongoDB listener
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/nonodb-mongo/pid" ]; then
+            kill "$(cat "$RUNNER_TEMP/nonodb-mongo/pid")" 2>/dev/null || true
+          fi
+
   gui:
     name: Build GUI
     runs-on: ubuntu-latest

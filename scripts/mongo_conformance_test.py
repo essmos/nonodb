@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 from bson import (
     Binary,
     Decimal128,
+    Int64,
     MaxKey,
     MinKey,
     ObjectId,
@@ -332,6 +333,35 @@ def main() -> int:
             lambda db: delete_result(db.items.delete_many({"n": {"$gte": 4}})),
         )
         check_both("find after deletes", lambda db: sorted_docs(db))
+        check_both(
+            "namespace not found error",
+            command_error_code(
+                lambda db: db.command({"listIndexes": "missing_collection"})
+            ),
+        )
+        check_both(
+            "cursor not found error",
+            command_error_code(
+                lambda db: db.command(
+                    {
+                        "getMore": Int64(9_223_372_036_854_775_000),
+                        "collection": "items",
+                    }
+                )
+            ),
+        )
+        check_both(
+            "invalid collation error",
+            command_error_code(
+                lambda db: db.command(
+                    {
+                        "find": "items",
+                        "filter": {},
+                        "collation": {"locale": "en", "strength": 99},
+                    }
+                )
+            ),
+        )
         check_both(
             "unknown command error",
             command_error_code(lambda db: db.command({"definitelyUnknownCommand": 1})),

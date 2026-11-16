@@ -290,6 +290,8 @@ Design: [docs/replication.md](docs/replication.md).
 - [x] Mongo-compatible mongoexport/mongodump export and portability checks
 - [x] Static MongoDB workload portability checker with JSON manifests and heuristic source scan
 - [x] MongoDB wire connection limit, handshake/read/write timeouts, and limit test
+- [x] CI MongoDB conformance gate with a real MongoDB service and official drivers
+- [x] MongoDB wire error-code audit: duplicate key, namespace/cursor not found, invalid options, unknown command, unauthorized
 - [x] Direction-aware compound index encoding and mixed-direction sort planning
 - [x] Official Node.js and Go MongoDB driver compatibility tests
 - [x] MongoDB wire listCollections/listDatabases filters and nameOnly

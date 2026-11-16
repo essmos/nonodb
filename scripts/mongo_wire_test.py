@@ -12,7 +12,7 @@ import sys
 import uuid
 from urllib.parse import quote
 
-from bson import ObjectId
+from bson import Int64, ObjectId
 from pymongo import MongoClient, ReturnDocument
 from pymongo.errors import OperationFailure
 from pymongo.read_concern import ReadConcern
@@ -46,6 +46,38 @@ def main() -> int:
         )
         assert len(inserted.inserted_ids) == 10
         assert all(isinstance(value, ObjectId) for value in inserted.inserted_ids)
+        try:
+            coll.insert_one({"_id": inserted.inserted_ids[0]})
+        except OperationFailure as error:
+            assert error.code == 11000, error
+        else:
+            raise AssertionError("duplicate _id was accepted")
+        for label, command, expected_code in [
+            (
+                "namespace not found",
+                {"listIndexes": f"missing_{uuid.uuid4().hex[:8]}"},
+                26,
+            ),
+            (
+                "cursor not found",
+                {
+                    "getMore": Int64(9_223_372_036_854_775_000),
+                    "collection": coll.name,
+                },
+                43,
+            ),
+            (
+                "unknown command",
+                {"definitelyUnknownCommand": 1},
+                59,
+            ),
+        ]:
+            try:
+                db.command(command)
+            except OperationFailure as error:
+                assert error.code == expected_code, (label, error)
+            else:
+                raise AssertionError(f"{label} was accepted")
         assert coll.count_documents({"group": "smoke"}) == 10
         assert coll.estimated_document_count() == 10
         assert db.command(
