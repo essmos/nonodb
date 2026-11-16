@@ -625,6 +625,8 @@ pub enum WriteReq {
         multi: bool,
         upsert: bool,
         array_filters: Vec<Value>,
+        /// `_id` to use when an upsert would otherwise generate a core UUID.
+        default_id: Option<Value>,
         vault: Option<VaultAuth>,
     },
     FindAndModify {
@@ -637,6 +639,8 @@ pub enum WriteReq {
         remove: bool,
         array_filters: Vec<Value>,
         projection: Option<Value>,
+        /// `_id` to use when an upsert would otherwise generate a core UUID.
+        default_id: Option<Value>,
         vault: Option<VaultAuth>,
     },
     Delete {
@@ -1073,6 +1077,7 @@ impl From<WriteOp> for WriteReq {
                 multi,
                 upsert,
                 array_filters,
+                default_id: None,
                 vault: None,
             },
             WriteOp::Delete {

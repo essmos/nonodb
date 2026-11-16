@@ -2658,6 +2658,32 @@ impl<'e> Collection<'e> {
         upsert: bool,
         array_filters: &[Value],
     ) -> Result<UpdateOutcome> {
+        self.update_opts_txn_filtered_with_id(
+            wtxn,
+            filter,
+            update,
+            multi,
+            upsert,
+            array_filters,
+            None,
+        )
+    }
+
+    /// Like [`Self::update_opts_txn_filtered`], but uses `default_id` when an
+    /// upsert would otherwise let the core generate a UUID `_id`. The MongoDB
+    /// wire frontend passes an ObjectId here so driver-visible upsert IDs match
+    /// MongoDB.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_opts_txn_filtered_with_id(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        filter: &Value,
+        update: &Value,
+        multi: bool,
+        upsert: bool,
+        array_filters: &[Value],
+        default_id: Option<&Value>,
+    ) -> Result<UpdateOutcome> {
         self.ensure_standard()?;
         let keys = self.matching_keys(&*wtxn, filter, multi)?;
         if keys.is_empty() {
@@ -2674,6 +2700,11 @@ impl<'e> Collection<'e> {
             // `_id` from the filter is immutable; do not let an update lose it.
             if let Some(id) = filter_id {
                 doc["_id"] = id;
+            }
+            if doc.get("_id").is_none() {
+                if let Some(id) = default_id {
+                    doc["_id"] = id.clone();
+                }
             }
             let id = self.insert_one_txn(wtxn, doc)?;
             return Ok(UpdateOutcome {
@@ -2791,6 +2822,17 @@ impl<'e> Collection<'e> {
         wtxn: &mut RwTxn<'_>,
         opts: &FindAndModifyOptions<'_>,
     ) -> Result<FindAndModifyOutcome> {
+        self.find_and_modify_txn_with_id(wtxn, opts, None)
+    }
+
+    /// Like [`Self::find_and_modify_txn`], but uses `default_id` when an upsert
+    /// would otherwise let the core generate a UUID `_id`.
+    pub fn find_and_modify_txn_with_id(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        opts: &FindAndModifyOptions<'_>,
+        default_id: Option<&Value>,
+    ) -> Result<FindAndModifyOutcome> {
         self.ensure_standard()?;
         validate_find_and_modify(opts)?;
         let query = FindQuery {
@@ -2845,6 +2887,11 @@ impl<'e> Collection<'e> {
         apply_upsert_with_options(&mut doc, update, opts.filter, opts.array_filters)?;
         if let Some(id) = filter_id {
             doc["_id"] = id;
+        }
+        if doc.get("_id").is_none() {
+            if let Some(id) = default_id {
+                doc["_id"] = id.clone();
+            }
         }
         let id = self.insert_one_txn(wtxn, doc)?;
         let value = if opts.new {

@@ -74,6 +74,35 @@ def main() -> int:
             )
         ] == [db.name]
 
+        upsert_coll = db[f"upsert_smoke_{os.getpid()}"]
+        generated = upsert_coll.update_one(
+            {"key": "generated"}, {"$set": {"n": 1}}, upsert=True
+        )
+        assert isinstance(generated.upserted_id, ObjectId), generated.upserted_id
+        generated_doc = upsert_coll.find_one({"key": "generated"})
+        assert generated_doc["_id"] == generated.upserted_id
+        explicit = upsert_coll.update_one(
+            {"key": "explicit"},
+            {"$setOnInsert": {"_id": "kept"}, "$set": {"n": 2}},
+            upsert=True,
+        )
+        assert explicit.upserted_id == "kept"
+        asserted = upsert_coll.find_one_and_update(
+            {"key": "fam"},
+            {"$set": {"n": 3}},
+            upsert=True,
+            return_document=ReturnDocument.AFTER,
+        )
+        assert isinstance(asserted["_id"], ObjectId), asserted["_id"]
+        pipeline = upsert_coll.update_one(
+            {"key": "pipeline"}, [{"$set": {"n": 4}}], upsert=True
+        )
+        assert isinstance(pipeline.upserted_id, ObjectId), pipeline.upserted_id
+        replacement = upsert_coll.replace_one(
+            {"key": "replacement"}, {"n": 5}, upsert=True
+        )
+        assert isinstance(replacement.upserted_id, ObjectId), replacement.upserted_id
+
         regex_coll = db[f"regex_smoke_{os.getpid()}"]
         regex_coll.insert_one({"name": "abc"})
         assert (

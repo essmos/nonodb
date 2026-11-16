@@ -186,5 +186,23 @@ func main() {
 	}
 	check(deleted.DeletedCount == 1, "deleteMany")
 
+	upserts := db.Collection("upserts")
+	upsertResult, err := upserts.UpdateOne(
+		ctx,
+		bson.M{"key": "generated"},
+		bson.M{"$set": bson.M{"n": 1}},
+		options.Update().SetUpsert(true),
+	)
+	if err != nil {
+		panic(err)
+	}
+	upsertedID, ok := upsertResult.UpsertedID.(primitive.ObjectID)
+	check(ok, "upsert ObjectId")
+	var upsertedDoc bson.M
+	if err := upserts.FindOne(ctx, bson.M{"key": "generated"}).Decode(&upsertedDoc); err != nil {
+		panic(err)
+	}
+	check(upsertedDoc["_id"].(primitive.ObjectID) == upsertedID, "upsert document id")
+
 	fmt.Println("go mongodb driver test: ok")
 }

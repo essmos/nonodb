@@ -97,8 +97,7 @@ with an optional leading `$match` followed only by `$project`, `$addFields`,
 `$set`, or `$unset` stream pages from the collection; blocking pipelines are
 evaluated once and then paged from a materialized result. Without a `cursor`
 option the full result is returned in the first batch. Upserts without an `_id`
-in the filter currently receive the core UUID rather than a driver-style
-ObjectId.
+in the filter receive a driver-style ObjectId, matching MongoDB.
 
 Driver-facing options are checked instead of silently ignored. The listener
 accepts non-empty `filter` documents for `listCollections` and `listDatabases`,

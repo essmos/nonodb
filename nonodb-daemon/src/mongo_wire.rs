@@ -863,6 +863,7 @@ async fn update_command(state: &super::AppState, body: &Document) -> Result<Docu
                 array_filters.push(bson_map::document_to_value(document).map_err(bad_value)?);
             }
         }
+        let upsert = spec.get_bool("upsert").unwrap_or(false);
         let (_, response) = super::submit_write(
             &runtime,
             WriteReq::Update {
@@ -870,8 +871,9 @@ async fn update_command(state: &super::AppState, body: &Document) -> Result<Docu
                 filter,
                 update,
                 multi: spec.get_bool("multi").unwrap_or(false),
-                upsert: spec.get_bool("upsert").unwrap_or(false),
+                upsert,
                 array_filters,
+                default_id: upsert.then(new_object_id),
                 vault: None,
             },
             Durability::Full,
@@ -1040,6 +1042,7 @@ async fn find_and_modify_command(
         }
     }
     let runtime = database_for_write(state, &database).await?;
+    let upsert = body.get_bool("upsert").unwrap_or(false);
     let (_, response) = super::submit_write(
         &runtime,
         WriteReq::FindAndModify {
@@ -1048,10 +1051,11 @@ async fn find_and_modify_command(
             update,
             sort,
             new: body.get_bool("new").unwrap_or(false),
-            upsert: body.get_bool("upsert").unwrap_or(false),
+            upsert,
             remove,
             array_filters,
             projection,
+            default_id: (!remove && upsert).then(new_object_id),
             vault: None,
         },
         Durability::Full,
@@ -2531,6 +2535,10 @@ fn mongo_allow(
     } else {
         Err(ApiError::forbidden())
     }
+}
+
+fn new_object_id() -> Value {
+    json!({"$oid": bson::oid::ObjectId::new().to_hex()})
 }
 
 fn bad_value(message: impl Into<String>) -> ApiError {

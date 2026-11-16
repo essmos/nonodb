@@ -1204,6 +1204,7 @@ fn execute(
             multi,
             upsert,
             array_filters,
+            default_id,
             vault,
         } => {
             let c = write_collection(store, wtxn, coll, vault.as_ref())?;
@@ -1252,7 +1253,15 @@ fn execute(
                 if vault.is_some() {
                     return Err(vault::key_unexpected().into());
                 }
-                c.update_opts_txn_filtered(wtxn, filter, update, *multi, *upsert, array_filters)?
+                c.update_opts_txn_filtered_with_id(
+                    wtxn,
+                    filter,
+                    update,
+                    *multi,
+                    *upsert,
+                    array_filters,
+                    default_id.as_ref(),
+                )?
             };
             if let Some(config) = &config {
                 if !c.profile().is_vault() {
@@ -1326,6 +1335,7 @@ fn execute(
             remove,
             array_filters,
             projection,
+            default_id,
             vault,
         } => {
             let c = write_collection(store, wtxn, coll, vault.as_ref())?;
@@ -1376,7 +1386,7 @@ fn execute(
                 if vault.is_some() {
                     return Err(vault::key_unexpected().into());
                 }
-                c.find_and_modify_txn(wtxn, &opts)?
+                c.find_and_modify_txn_with_id(wtxn, &opts, default_id.as_ref())?
             };
             if let Some(config) = &config {
                 if !c.profile().is_vault() {

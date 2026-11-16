@@ -3553,6 +3553,7 @@ async fn exec_inner(
                     multi,
                     upsert,
                     array_filters,
+                    default_id: None,
                     vault: vault_auth.clone(),
                 },
                 Request::FindAndModify {
@@ -3576,6 +3577,7 @@ async fn exec_inner(
                     remove,
                     array_filters,
                     projection,
+                    default_id: None,
                     vault: vault_auth.clone(),
                 },
                 Request::Delete {

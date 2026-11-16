@@ -120,6 +120,16 @@ async function main() {
     const deleted = await items.deleteMany({ n: { $gte: 11 } });
     assert(deleted.deletedCount === 1, "deleteMany");
 
+    const upserts = db.collection("upserts");
+    const upserted = await upserts.updateOne(
+      { key: "generated" },
+      { $set: { n: 1 } },
+      { upsert: true }
+    );
+    assert(upserted.upsertedId instanceof ObjectId, "upsert ObjectId");
+    const upsertedDoc = await upserts.findOne({ key: "generated" });
+    assert(upsertedDoc._id.equals(upserted.upsertedId), "upsert document id");
+
     console.log("node mongodb driver test: ok");
   } finally {
     try {
