@@ -1650,6 +1650,7 @@ name = "nonodb-daemon"
 version = "0.25.0"
 dependencies = [
  "axum",
+ "base64 0.23.1",
  "bson",
  "fs2",
  "futures-util",
@@ -1663,6 +1664,7 @@ dependencies = [
  "rustls-pemfile",
  "serde",
  "serde_json",
+ "subtle",
  "tempfile",
  "time",
  "tokio",

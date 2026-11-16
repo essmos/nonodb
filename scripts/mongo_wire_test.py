@@ -9,13 +9,22 @@ Start the daemon with NONODB_MONGO_ADDR=127.0.0.1:37017, then run:
 import os
 import sys
 import uuid
+from urllib.parse import quote
 
 from bson import ObjectId
 from pymongo import MongoClient, ReturnDocument
 
 
 def main() -> int:
-    url = os.environ.get("NONODB_MONGO_URL", "mongodb://127.0.0.1:37017/?directConnection=true")
+    url = os.environ.get(
+        "NONODB_MONGO_URL", "mongodb://127.0.0.1:37017/?directConnection=true"
+    )
+    username = os.environ.get("NONODB_MONGO_USERNAME")
+    password = os.environ.get("NONODB_MONGO_PASSWORD")
+    if username and password and "@" not in url.split("://", 1)[-1]:
+        credentials = f"{quote(username, safe='')}:{quote(password, safe='')}@"
+        url = url.replace("://", f"://{credentials}", 1)
+        url += ("&" if "?" in url else "?") + "authSource=admin"
     client = MongoClient(url, serverSelectionTimeoutMS=3000)
     db = client.mongo_wire_smoke
     coll = db[f"items_{os.getpid()}"]

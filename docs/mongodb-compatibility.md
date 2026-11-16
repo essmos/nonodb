@@ -4,10 +4,10 @@ This page compares NonoDB's MongoDB-compatible API with MongoDB itself. It is a
 practical map, not a claim of drop-in replacement.
 
 > **Short answer:** NonoDB is an HTTP/JSON document database with a MongoDB-like
-> query language. It also has an **experimental, unauthenticated MongoDB wire
-> listener** for a practical CRUD subset. That listener is not a drop-in MongoDB
-> replacement: it does not yet implement sessions, transactions, change
-> streams, or authentication. The HTTP API and the
+> query language. It also has an **experimental MongoDB wire listener** for a
+> practical CRUD subset, with optional SCRAM-SHA-256 authentication. That
+> listener is not a drop-in MongoDB replacement: it does not yet implement
+> sessions, transactions, change streams, or TLS. The HTTP API and the
 > Python/Rust/Node.js/Go clients remain the supported interfaces.
 
 The assessment below is verified against NonoDB `0.25.x`.
@@ -49,9 +49,9 @@ direct migration target.
 | Feature | Status | Notes |
 |---|---|---|
 | MongoDB wire protocol | 🟡 | Experimental listener with handshake, CRUD, cursors, count, distinct, aggregate, index DDL, and collection DDL; no sessions or auth |
-| Official MongoDB drivers | 🟡 | PyMongo smoke-tested for CRUD, cursors, count, distinct, aggregate, index DDL, and collection DDL; no auth |
+| Official MongoDB drivers | 🟡 | PyMongo smoke-tested for CRUD, cursors, count, distinct, aggregate, index DDL, collection DDL, and SCRAM-SHA-256 auth |
 | `mongosh` | ❌ | Use the NonoDB CLI, GUI, or HTTP API |
-| MongoDB URI / `mongodb://` | 🟡 | Only a single direct connection to `NONODB_MONGO_ADDR`; no replica-set or auth URIs |
+| MongoDB URI / `mongodb://` | 🟡 | Single direct connection to `NONODB_MONGO_ADDR`; username/password works with SCRAM-SHA-256 when configured; no replica-set URIs |
 | Sessions | ❌ | No server sessions or causal consistency |
 | Retryable writes | ❌ | Writes are routed to the single writer |
 | Change streams | ❌ | Outbox events, `watch`, and subscriptions are separate APIs |
@@ -62,7 +62,12 @@ direct migration target.
 ## MongoDB wire listener
 
 Set `NONODB_MONGO_ADDR=127.0.0.1:27017` and connect with a MongoDB driver using
-`directConnection=true`. The listener is experimental and unauthenticated.
+`directConnection=true`. The listener is experimental. By default it is
+unauthenticated; set both `NONODB_MONGO_USERNAME` and
+`NONODB_MONGO_PASSWORD` to require SCRAM-SHA-256 authentication. The configured
+account has instance-wide administrative access over the wire listener, so use
+loopback or a trusted private network. The listener itself does not terminate
+TLS.
 
 | Wire command | Status |
 |---|---|
@@ -72,7 +77,7 @@ Set `NONODB_MONGO_ADDR=127.0.0.1:27017` and connect with a MongoDB driver using
 | `count` / `distinct` / basic `aggregate` | ✅ |
 | `createIndexes` / `listIndexes` / `dropIndexes` | ✅ |
 | `create` / `drop` / `listCollections` / `listDatabases` / `dropDatabase` | ✅ |
-| SCRAM authentication / TLS client auth | ❌ |
+| SCRAM-SHA-256 authentication / TLS client auth | 🟡 | Optional username/password auth; no SCRAM-SHA-1 or TLS listener |
 | Sessions / transactions / change streams | ❌ |
 
 `dropDatabase` cannot remove the built-in `default` database. Wire `find`

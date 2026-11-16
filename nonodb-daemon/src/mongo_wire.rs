@@ -6,15 +6,22 @@
 //! errors instead of silently behaving differently.
 
 use std::io;
+use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+use base64::Engine as _;
 use bson::{Bson, Document};
+use ring::rand::SecureRandom;
 use serde_json::{json, Value};
+use subtle::ConstantTimeEq;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
+use zeroize::Zeroizing;
 
 use crate::cursor;
 use crate::protocol::{ApiError, Durability, WriteReq};
@@ -28,6 +35,8 @@ const MAX_MESSAGE_BYTES: usize = 48_000_000;
 const MAX_BSON_BYTES: i32 = 16 * 1024 * 1024;
 const MAX_WRITE_BATCH_SIZE: i32 = 100_000;
 const MAX_WIRE_VERSION: i32 = 9;
+const SCRAM_MECHANISM: &str = "SCRAM-SHA-256";
+const SCRAM_ITERATIONS_DEFAULT: u32 = 15_000;
 static NEXT_RESPONSE_ID: AtomicI32 = AtomicI32::new(1);
 static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -37,20 +46,112 @@ struct Message {
     body: Document,
 }
 
+#[derive(Clone)]
+pub(crate) struct MongoAuth {
+    username: String,
+    salt: Vec<u8>,
+    iterations: u32,
+    stored_key: [u8; 32],
+    server_key: [u8; 32],
+}
+
+impl MongoAuth {
+    pub(crate) fn from_env() -> Result<Option<Self>, String> {
+        let username = std::env::var("NONODB_MONGO_USERNAME").ok();
+        let password = std::env::var("NONODB_MONGO_PASSWORD").ok();
+        let username = username.filter(|value| !value.is_empty());
+        let password = password.filter(|value| !value.is_empty());
+        let (username, password) = match (username, password) {
+            (None, None) => return Ok(None),
+            (Some(username), Some(password)) => (username, Zeroizing::new(password)),
+            _ => {
+                return Err(
+                    "NONODB_MONGO_USERNAME and NONODB_MONGO_PASSWORD must be set together"
+                        .to_string(),
+                )
+            }
+        };
+        let iterations = std::env::var("NONODB_MONGO_SCRAM_ITERATIONS")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|value| (4_096..=1_000_000).contains(value))
+            .unwrap_or(SCRAM_ITERATIONS_DEFAULT);
+        let mut salt = [0u8; 16];
+        ring::rand::SystemRandom::new()
+            .fill(&mut salt)
+            .map_err(|_| "cannot generate MongoDB SCRAM salt".to_string())?;
+        Self::new_with_salt(username, &password, salt.to_vec(), iterations).map(Some)
+    }
+
+    fn new_with_salt(
+        username: String,
+        password: &str,
+        salt: Vec<u8>,
+        iterations: u32,
+    ) -> Result<Self, String> {
+        let iterations = NonZeroU32::new(iterations)
+            .filter(|value| value.get() >= 4_096)
+            .ok_or_else(|| "SCRAM iteration count is too small".to_string())?;
+        let mut salted = [0u8; 32];
+        ring::pbkdf2::derive(
+            ring::pbkdf2::PBKDF2_HMAC_SHA256,
+            iterations,
+            &salt,
+            password.as_bytes(),
+            &mut salted,
+        );
+        let client_key = hmac_sha256(&salted, b"Client Key");
+        let stored_key = sha256(&client_key);
+        let server_key = hmac_sha256(&salted, b"Server Key");
+        Ok(Self {
+            username,
+            salt,
+            iterations: iterations.get(),
+            stored_key,
+            server_key,
+        })
+    }
+}
+
+#[derive(Default)]
+struct WireSession {
+    authenticated: bool,
+    user: Option<String>,
+    scram: Option<ScramChallenge>,
+}
+
+struct ScramChallenge {
+    conversation_id: i32,
+    client_first_bare: String,
+    server_first: String,
+    nonce: String,
+}
+
 /// Starts the experimental MongoDB wire listener.
 pub async fn serve(
     addr: &str,
     state: super::AppState,
+    auth: Option<MongoAuth>,
     mut shutdown: watch::Receiver<bool>,
     drain_timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(addr).await?;
     let bound = listener.local_addr()?.to_string();
-    tracing::warn!(
-        %addr,
-        bound = %bound,
-        "experimental unauthenticated MongoDB wire listener enabled; handshake plus insert/find/getMore/killCursors only"
-    );
+    if auth.is_some() {
+        tracing::warn!(
+            %addr,
+            bound = %bound,
+            mechanism = SCRAM_MECHANISM,
+            "experimental MongoDB wire listener enabled with SCRAM authentication"
+        );
+    } else {
+        tracing::warn!(
+            %addr,
+            bound = %bound,
+            "experimental unauthenticated MongoDB wire listener enabled; handshake plus insert/find/getMore/killCursors only"
+        );
+    }
+    let auth = auth.map(Arc::new);
 
     let mut connections = JoinSet::new();
     loop {
@@ -60,8 +161,9 @@ pub async fn serve(
         };
         let shutdown = shutdown.clone();
         let state = state.clone();
+        let auth = auth.clone();
         connections.spawn(async move {
-            if let Err(error) = handle_connection(stream, state, shutdown).await {
+            if let Err(error) = handle_connection(stream, state, auth, shutdown).await {
                 tracing::debug!(?error, %peer, "Mongo wire connection closed");
             }
         });
@@ -74,12 +176,14 @@ pub async fn serve(
 async fn handle_connection<S>(
     mut stream: S,
     state: super::AppState,
+    auth: Option<Arc<MongoAuth>>,
     mut shutdown: watch::Receiver<bool>,
 ) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let connection_id = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
+    let mut session = WireSession::default();
     loop {
         let message = tokio::select! {
             _ = super::wait_for_shutdown(&mut shutdown) => return Ok(()),
@@ -88,7 +192,14 @@ where
         let Some(message) = message else {
             return Ok(());
         };
-        let response = dispatch_command(&state, connection_id, &message.body).await;
+        let response = dispatch_command(
+            &state,
+            connection_id,
+            auth.as_deref(),
+            &mut session,
+            &message.body,
+        )
+        .await;
         let bytes = if message.op_code == OP_QUERY {
             encode_op_reply(
                 NEXT_RESPONSE_ID.fetch_add(1, Ordering::Relaxed),
@@ -110,13 +221,45 @@ where
 async fn dispatch_command(
     state: &super::AppState,
     connection_id: u64,
+    auth: Option<&MongoAuth>,
+    session: &mut WireSession,
     body: &Document,
 ) -> Document {
     let command = body
         .keys()
         .find(|key| !key.starts_with('$'))
         .map(String::as_str);
+    let unauthenticated = matches!(
+        command,
+        Some("hello")
+            | Some("isMaster")
+            | Some("ismaster")
+            | Some("ping")
+            | Some("buildInfo")
+            | Some("buildinfo")
+            | Some("getParameter")
+            | Some("connectionStatus")
+            | Some("saslStart")
+            | Some("saslContinue")
+            | Some("logout")
+            | Some("endSessions")
+            | Some("refreshSessions")
+    );
+    if auth.is_some() && !session.authenticated && !unauthenticated {
+        return mongo_error(&ApiError {
+            code: "unauthorized".to_string(),
+            message: "Authentication required".to_string(),
+        });
+    }
     let result = match command {
+        Some("saslStart") => sasl_start_command(auth, session, body),
+        Some("saslContinue") => sasl_continue_command(auth, session, body),
+        Some("logout") => {
+            session.authenticated = false;
+            session.user = None;
+            session.scram = None;
+            Ok(doc_ok())
+        }
         Some("insert") => insert_command(state, body).await,
         Some("find") => find_command(state, connection_id, body).await,
         Some("getMore") => get_more_command(state, connection_id, body).await,
@@ -142,12 +285,211 @@ async fn dispatch_command(
         | Some("ismaster")
         | Some("buildInfo")
         | Some("getParameter")
-        | Some("connectionStatus") => return command_reply(body),
+        | Some("connectionStatus") => return command_reply(body, auth.is_some(), session),
         _ => return command_not_found(command.unwrap_or("<missing>")),
     };
     match result {
         Ok(reply) => reply,
         Err(error) => mongo_error(&error),
+    }
+}
+
+fn sasl_start_command(
+    auth: Option<&MongoAuth>,
+    session: &mut WireSession,
+    body: &Document,
+) -> Result<Document, ApiError> {
+    let Some(auth) = auth else {
+        return Err(authentication_failed());
+    };
+    let mechanism = body
+        .get_str("mechanism")
+        .map_err(|_| bad_value("saslStart requires a mechanism"))?;
+    if mechanism != SCRAM_MECHANISM {
+        return Err(authentication_failed());
+    }
+    let payload = payload_bytes(body)?;
+    let message = std::str::from_utf8(&payload).map_err(|_| authentication_failed())?;
+    let mut parts = message.splitn(3, ',');
+    let channel = parts.next().ok_or_else(authentication_failed)?;
+    let authzid = parts.next().ok_or_else(authentication_failed)?;
+    let bare = parts.next().ok_or_else(authentication_failed)?;
+    if channel == "p" {
+        return Err(authentication_failed());
+    }
+    if !authzid.is_empty() && !authzid.starts_with("a=") {
+        return Err(authentication_failed());
+    }
+    let attrs = scram_attrs(bare)?;
+    let username = scram_get(&attrs, "n")
+        .ok_or_else(authentication_failed)
+        .and_then(scram_unescape)?;
+    let client_nonce = scram_get(&attrs, "r").ok_or_else(authentication_failed)?;
+    if scram_get(&attrs, "m").is_some()
+        || !bool::from(username.as_bytes().ct_eq(auth.username.as_bytes()))
+    {
+        return Err(authentication_failed());
+    }
+    let mut random = [0u8; 18];
+    ring::rand::SystemRandom::new()
+        .fill(&mut random)
+        .map_err(|_| ApiError::internal("cannot generate SCRAM nonce"))?;
+    let nonce = format!("{client_nonce}{}", URL_SAFE_NO_PAD.encode(random));
+    let server_first = format!(
+        "r={nonce},s={},i={}",
+        STANDARD.encode(&auth.salt),
+        auth.iterations
+    );
+    let conversation_id = session
+        .scram
+        .as_ref()
+        .map(|challenge| challenge.conversation_id)
+        .unwrap_or(1);
+    session.scram = Some(ScramChallenge {
+        conversation_id,
+        client_first_bare: bare.to_string(),
+        server_first: server_first.clone(),
+        nonce,
+    });
+    Ok(sasl_reply(conversation_id, false, server_first.as_bytes()))
+}
+
+fn sasl_continue_command(
+    auth: Option<&MongoAuth>,
+    session: &mut WireSession,
+    body: &Document,
+) -> Result<Document, ApiError> {
+    let Some(auth) = auth else {
+        return Err(authentication_failed());
+    };
+    let Some(challenge) = session.scram.take() else {
+        return Err(authentication_failed());
+    };
+    let conversation_id = int_field(body, "conversationId").unwrap_or(0) as i32;
+    if conversation_id != challenge.conversation_id {
+        return Err(authentication_failed());
+    }
+    let payload = payload_bytes(body)?;
+    let message = std::str::from_utf8(&payload).map_err(|_| authentication_failed())?;
+    let proof_at = message.rfind(",p=").ok_or_else(authentication_failed)?;
+    let without_proof = &message[..proof_at];
+    let proof = STANDARD
+        .decode(&message[proof_at + 3..])
+        .map_err(|_| authentication_failed())?;
+    if proof.len() != 32 {
+        return Err(authentication_failed());
+    }
+    let attrs = scram_attrs(without_proof)?;
+    let channel = scram_get(&attrs, "c").ok_or_else(authentication_failed)?;
+    if channel != "biws" && channel != "eSws" {
+        return Err(authentication_failed());
+    }
+    let nonce = scram_get(&attrs, "r").ok_or_else(authentication_failed)?;
+    if nonce != challenge.nonce {
+        return Err(authentication_failed());
+    }
+    let auth_message = format!(
+        "{},{},{}",
+        challenge.client_first_bare, challenge.server_first, without_proof
+    );
+    let client_signature = hmac_sha256(&auth.stored_key, auth_message.as_bytes());
+    let mut client_key = [0u8; 32];
+    for (value, signature) in client_key
+        .iter_mut()
+        .zip(proof.iter().zip(client_signature))
+    {
+        *value = signature.0 ^ signature.1;
+    }
+    let recovered = sha256(&client_key);
+    if !bool::from(recovered.ct_eq(&auth.stored_key)) {
+        return Err(authentication_failed());
+    }
+    let server_signature = hmac_sha256(&auth.server_key, auth_message.as_bytes());
+    session.authenticated = true;
+    session.user = Some(auth.username.clone());
+    let server_final = format!("v={}", STANDARD.encode(server_signature));
+    Ok(sasl_reply(
+        challenge.conversation_id,
+        true,
+        server_final.as_bytes(),
+    ))
+}
+
+fn sasl_reply(conversation_id: i32, done: bool, payload: &[u8]) -> Document {
+    bson::doc! {
+        "conversationId": conversation_id,
+        "done": done,
+        "payload": Bson::Binary(bson::Binary {
+            subtype: bson::spec::BinarySubtype::Generic,
+            bytes: payload.to_vec(),
+        }),
+        "ok": 1.0,
+    }
+}
+
+fn payload_bytes(body: &Document) -> Result<Vec<u8>, ApiError> {
+    match body.get("payload") {
+        Some(Bson::Binary(binary)) => Ok(binary.bytes.clone()),
+        Some(Bson::String(value)) => Ok(value.as_bytes().to_vec()),
+        _ => Err(bad_value("SASL payload must be binary")),
+    }
+}
+
+fn scram_attrs(input: &str) -> Result<Vec<(&str, &str)>, ApiError> {
+    let mut attrs = Vec::new();
+    for part in input.split(',') {
+        let (key, value) = part.split_once('=').ok_or_else(authentication_failed)?;
+        if key.is_empty() {
+            return Err(authentication_failed());
+        }
+        attrs.push((key, value));
+    }
+    Ok(attrs)
+}
+
+fn scram_get<'a>(attrs: &'a [(&'a str, &'a str)], key: &str) -> Option<&'a str> {
+    attrs
+        .iter()
+        .find_map(|(name, value)| (*name == key).then_some(*value))
+}
+
+fn scram_unescape(value: &str) -> Result<String, ApiError> {
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '=' {
+            let escaped = match (chars.next(), chars.next()) {
+                (Some('2'), Some('C')) => ',',
+                (Some('3'), Some('D')) => '=',
+                _ => return Err(authentication_failed()),
+            };
+            out.push(escaped);
+        } else {
+            out.push(ch);
+        }
+    }
+    Ok(out)
+}
+
+fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, key);
+    let tag = ring::hmac::sign(&key, data);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(tag.as_ref());
+    out
+}
+
+fn sha256(data: &[u8]) -> [u8; 32] {
+    let digest = ring::digest::digest(&ring::digest::SHA256, data);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(digest.as_ref());
+    out
+}
+
+fn authentication_failed() -> ApiError {
+    ApiError {
+        code: "authentication_failed".to_string(),
+        message: "Authentication failed".to_string(),
     }
 }
 
@@ -1421,6 +1763,8 @@ fn mongo_code(error: &ApiError) -> (i32, &'static str) {
         "timeout" => (50, "MaxTimeMSExpired"),
         "document_too_large" => (10334, "BSONObjectTooLarge"),
         "invalid_query" | "invalid_id" | "invalid_json" | "invalid_collection" => (2, "BadValue"),
+        "unauthorized" => (13, "Unauthorized"),
+        "authentication_failed" => (18, "AuthenticationFailed"),
         _ => (1, "InternalError"),
     }
 }
@@ -1636,14 +1980,14 @@ fn read_bson_at(payload: &[u8], position: usize, end: usize) -> io::Result<(Docu
     Ok((doc, next))
 }
 
-fn command_reply(body: &Document) -> Document {
+fn command_reply(body: &Document, auth_enabled: bool, session: &WireSession) -> Document {
     let command = body.keys().next().map(String::as_str).unwrap_or("");
     match command {
-        "hello" | "isMaster" | "ismaster" => hello_reply(),
+        "hello" | "isMaster" | "ismaster" => hello_reply(auth_enabled),
         "ping" => doc_ok(),
         "buildInfo" | "buildinfo" => build_info(),
         "getParameter" => get_parameter(),
-        "connectionStatus" => connection_status(),
+        "connectionStatus" => connection_status(session),
         _ => command_not_found(command),
     }
 }
@@ -1654,7 +1998,7 @@ fn doc_ok() -> Document {
     doc
 }
 
-fn hello_reply() -> Document {
+fn hello_reply(auth_enabled: bool) -> Document {
     let mut doc = doc_ok();
     doc.insert("isWritablePrimary", true);
     doc.insert("ismaster", true);
@@ -1667,6 +2011,12 @@ fn hello_reply() -> Document {
     doc.insert("maxWireVersion", MAX_WIRE_VERSION);
     doc.insert("readOnly", false);
     doc.insert("compression", Bson::Array(Vec::new()));
+    if auth_enabled {
+        doc.insert(
+            "saslSupportedMechs",
+            Bson::Array(vec![Bson::String(SCRAM_MECHANISM.to_string())]),
+        );
+    }
     doc
 }
 
@@ -1698,11 +2048,28 @@ fn get_parameter() -> Document {
     doc
 }
 
-fn connection_status() -> Document {
+fn connection_status(session: &WireSession) -> Document {
     let mut doc = doc_ok();
     let mut auth_info = Document::new();
-    auth_info.insert("authenticatedUsers", Bson::Array(Vec::new()));
-    auth_info.insert("authenticatedUserRoles", Bson::Array(Vec::new()));
+    if let Some(user) = &session.user {
+        auth_info.insert(
+            "authenticatedUsers",
+            Bson::Array(vec![Bson::Document(bson::doc! {
+                "user": user.clone(),
+                "db": "admin",
+            })]),
+        );
+        auth_info.insert(
+            "authenticatedUserRoles",
+            Bson::Array(vec![Bson::Document(bson::doc! {
+                "role": "root",
+                "db": "admin",
+            })]),
+        );
+    } else {
+        auth_info.insert("authenticatedUsers", Bson::Array(Vec::new()));
+        auth_info.insert("authenticatedUserRoles", Bson::Array(Vec::new()));
+    }
     doc.insert("authInfo", auth_info);
     doc
 }
@@ -1796,6 +2163,154 @@ mod tests {
         assert_eq!(docs[0].as_document().unwrap().get_str("name").unwrap(), "a");
     }
 
+    fn scram_payload(reply: &Document) -> String {
+        match reply.get("payload").unwrap() {
+            Bson::Binary(binary) => String::from_utf8(binary.bytes.clone()).unwrap(),
+            other => panic!("unexpected payload: {other:?}"),
+        }
+    }
+
+    fn scram_continue(
+        auth: &MongoAuth,
+        password: &str,
+        client_first: &str,
+        server_first: &str,
+        nonce: &str,
+    ) -> Document {
+        let bare = client_first.splitn(3, ',').nth(2).unwrap();
+        let attrs = scram_attrs(server_first).unwrap();
+        let salt = scram_get(&attrs, "s").unwrap();
+        let iterations = scram_get(&attrs, "i").unwrap().parse::<u32>().unwrap();
+        let mut salted = [0u8; 32];
+        ring::pbkdf2::derive(
+            ring::pbkdf2::PBKDF2_HMAC_SHA256,
+            NonZeroU32::new(iterations).unwrap(),
+            &STANDARD.decode(salt).unwrap(),
+            password.as_bytes(),
+            &mut salted,
+        );
+        let client_key = hmac_sha256(&salted, b"Client Key");
+        let stored_key = sha256(&client_key);
+        let without_proof = format!("c=biws,r={nonce}");
+        let auth_message = format!("{bare},{server_first},{without_proof}");
+        let signature = hmac_sha256(&stored_key, auth_message.as_bytes());
+        let mut proof = [0u8; 32];
+        for (value, (client, signature)) in proof
+            .iter_mut()
+            .zip(client_key.iter().zip(signature.iter()))
+        {
+            *value = client ^ signature;
+        }
+        let payload = format!("{without_proof},p={}", STANDARD.encode(proof));
+        let body = bson::doc! {
+            "saslContinue": 1,
+            "conversationId": 1i32,
+            "payload": Bson::Binary(bson::Binary {
+                subtype: bson::spec::BinarySubtype::Generic,
+                bytes: payload.into_bytes(),
+            }),
+        };
+        let mut session = WireSession {
+            scram: Some(ScramChallenge {
+                conversation_id: 1,
+                client_first_bare: bare.to_string(),
+                server_first: server_first.to_string(),
+                nonce: nonce.to_string(),
+            }),
+            ..WireSession::default()
+        };
+        sasl_continue_command(Some(auth), &mut session, &body).unwrap()
+    }
+
+    #[test]
+    fn scram_sha256_round_trip() {
+        let auth =
+            MongoAuth::new_with_salt("alice".into(), "pencil", vec![1, 2, 3, 4], 4_096).unwrap();
+        let mut session = WireSession::default();
+        let client_first = "n,,n=alice,r=clientnonce";
+        let start = bson::doc! {
+            "saslStart": 1,
+            "mechanism": SCRAM_MECHANISM,
+            "payload": Bson::Binary(bson::Binary {
+                subtype: bson::spec::BinarySubtype::Generic,
+                bytes: client_first.as_bytes().to_vec(),
+            }),
+        };
+        let reply = sasl_start_command(Some(&auth), &mut session, &start).unwrap();
+        assert!(!reply.get_bool("done").unwrap());
+        let server_first = scram_payload(&reply);
+        let nonce = scram_get(&scram_attrs(&server_first).unwrap(), "r")
+            .unwrap()
+            .to_string();
+        let final_reply = scram_continue(&auth, "pencil", client_first, &server_first, &nonce);
+        assert!(final_reply.get_bool("done").unwrap());
+        assert!(scram_payload(&final_reply).starts_with("v="));
+    }
+
+    #[test]
+    fn scram_sha256_rejects_wrong_password() {
+        let auth =
+            MongoAuth::new_with_salt("alice".into(), "pencil", vec![1, 2, 3, 4], 4_096).unwrap();
+        let mut session = WireSession::default();
+        let client_first = "n,,n=alice,r=clientnonce";
+        let start = bson::doc! {
+            "saslStart": 1,
+            "mechanism": SCRAM_MECHANISM,
+            "payload": Bson::Binary(bson::Binary {
+                subtype: bson::spec::BinarySubtype::Generic,
+                bytes: client_first.as_bytes().to_vec(),
+            }),
+        };
+        let reply = sasl_start_command(Some(&auth), &mut session, &start).unwrap();
+        let server_first = scram_payload(&reply);
+        let nonce = scram_get(&scram_attrs(&server_first).unwrap(), "r")
+            .unwrap()
+            .to_string();
+        let bare = "n=alice,r=clientnonce";
+        let attrs = scram_attrs(&server_first).unwrap();
+        let salt = scram_get(&attrs, "s").unwrap();
+        let iterations = scram_get(&attrs, "i").unwrap().parse::<u32>().unwrap();
+        let mut salted = [0u8; 32];
+        ring::pbkdf2::derive(
+            ring::pbkdf2::PBKDF2_HMAC_SHA256,
+            NonZeroU32::new(iterations).unwrap(),
+            &STANDARD.decode(salt).unwrap(),
+            b"wrong",
+            &mut salted,
+        );
+        let client_key = hmac_sha256(&salted, b"Client Key");
+        let stored_key = sha256(&client_key);
+        let without_proof = format!("c=biws,r={nonce}");
+        let auth_message = format!("{bare},{server_first},{without_proof}");
+        let signature = hmac_sha256(&stored_key, auth_message.as_bytes());
+        let proof: Vec<u8> = client_key
+            .iter()
+            .zip(signature.iter())
+            .map(|(client, sig)| client ^ sig)
+            .collect();
+        let payload = format!("{without_proof},p={}", STANDARD.encode(proof));
+        let body = bson::doc! {
+            "saslContinue": 1,
+            "conversationId": 1i32,
+            "payload": Bson::Binary(bson::Binary {
+                subtype: bson::spec::BinarySubtype::Generic,
+                bytes: payload.into_bytes(),
+            }),
+        };
+        let mut challenge_session = WireSession {
+            scram: Some(ScramChallenge {
+                conversation_id: 1,
+                client_first_bare: bare.to_string(),
+                server_first: server_first.to_string(),
+                nonce,
+            }),
+            ..WireSession::default()
+        };
+        let error = sasl_continue_command(Some(&auth), &mut challenge_session, &body).unwrap_err();
+        assert_eq!(error.code, "authentication_failed");
+        assert!(!challenge_session.authenticated);
+    }
+
     #[test]
     fn find_sort_support_is_explicit() {
         assert!(id_sort_ascending(&[("_id".into(), 1)]).unwrap());
@@ -1809,7 +2324,7 @@ mod tests {
 
     #[test]
     fn hello_reply_advertises_wire_contract() {
-        let reply = command_reply(&bson::doc! { "hello": 1 });
+        let reply = command_reply(&bson::doc! { "hello": 1 }, false, &WireSession::default());
         assert_eq!(reply.get_f64("ok").unwrap(), 1.0);
         assert_eq!(reply.get_i32("maxWireVersion").unwrap(), MAX_WIRE_VERSION);
         assert_eq!(reply.get_i32("maxBsonObjectSize").unwrap(), MAX_BSON_BYTES);
@@ -1819,12 +2334,16 @@ mod tests {
     #[test]
     fn ping_and_unknown_commands_have_mongodb_errors() {
         assert_eq!(
-            command_reply(&bson::doc! { "ping": 1 })
+            command_reply(&bson::doc! { "ping": 1 }, false, &WireSession::default())
                 .get_f64("ok")
                 .unwrap(),
             1.0
         );
-        let reply = command_reply(&bson::doc! { "notACommand": 1 });
+        let reply = command_reply(
+            &bson::doc! { "notACommand": 1 },
+            false,
+            &WireSession::default(),
+        );
         assert_eq!(reply.get_f64("ok").unwrap(), 0.0);
         assert_eq!(reply.get_i32("code").unwrap(), 59);
         assert_eq!(reply.get_str("codeName").unwrap(), "CommandNotFound");

@@ -196,9 +196,10 @@ comparison and practical migration caveats.
 
 ### Protocol and clients
 
-- The MongoDB wire listener is experimental and unauthenticated. It currently
-  supports handshake, CRUD, cursors, count, distinct, aggregate, index DDL, and
-  collection DDL; it does not support sessions, transactions, or change streams.
+- The MongoDB wire listener is experimental. It supports handshake, CRUD,
+  cursors, count, distinct, aggregate, index DDL, collection DDL, and optional
+  SCRAM-SHA-256 authentication. It does not support TLS, SCRAM-SHA-1, sessions,
+  transactions, or change streams.
 - The supported API is HTTP/JSON; no gRPC, binary framing, or CBOR API.
 - The Python client is a single module, not a published package.
 - The CLI covers common administration, not every possible operation.
