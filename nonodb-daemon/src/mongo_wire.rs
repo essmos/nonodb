@@ -414,6 +414,9 @@ async fn dispatch_command(
         if let Err(error) = validate_mongo_options(command, body) {
             return mongo_error(&error);
         }
+        if let Err(error) = validate_mongo_bson_values(command, body) {
+            return mongo_error(&error);
+        }
     }
     let result = match command {
         Some("saslStart") => sasl_start_command(auth, session, body),
@@ -2090,6 +2093,153 @@ fn values_to_bson(values: Vec<Value>) -> Result<Vec<Bson>, ApiError> {
         .into_iter()
         .map(|value| bson_map::value_to_bson(&value).map_err(ApiError::internal))
         .collect()
+}
+
+/// MongoDB drivers send a regex literal as a BSON regular-expression value.
+/// NonoDB supports `$regex` query arguments but not stored regex values, so
+/// reject them explicitly instead of silently storing or ignoring them.
+fn is_bson_regex(value: &Value) -> bool {
+    value.as_object().is_some_and(|object| {
+        object.len() == 1
+            && object
+                .get("$regularExpression")
+                .is_some_and(Value::is_object)
+    })
+}
+
+fn reject_bson_regex(value: &Value, allow_regex_operator: bool) -> Result<(), ApiError> {
+    if is_bson_regex(value) {
+        return Err(bad_value(
+            "BSON regular-expression values are not supported; use the $regex operator",
+        ));
+    }
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                reject_bson_regex(item, allow_regex_operator)?;
+            }
+        }
+        Value::Object(object) => {
+            for (key, item) in object {
+                // A BSON regex is valid as the argument of `$regex`.
+                if allow_regex_operator && key == "$regex" {
+                    continue;
+                }
+                reject_bson_regex(item, allow_regex_operator)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn reject_aggregate_regex(value: &Value) -> Result<(), ApiError> {
+    if is_bson_regex(value) {
+        return Err(bad_value(
+            "BSON regular-expression values are not supported; use the $regex operator",
+        ));
+    }
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                reject_aggregate_regex(item)?;
+            }
+        }
+        Value::Object(object) => {
+            for (key, item) in object {
+                if key == "$match" {
+                    reject_bson_regex(item, true)?;
+                } else {
+                    reject_aggregate_regex(item)?;
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn command_field(body: &Document, key: &str) -> Result<Option<Value>, ApiError> {
+    body.get(key)
+        .map(|value| bson_map::bson_to_value(value).map_err(bad_value))
+        .transpose()
+}
+
+fn validate_mongo_bson_values(command: &str, body: &Document) -> Result<(), ApiError> {
+    match command {
+        "insert" => {
+            if let Some(Value::Array(documents)) = command_field(body, "documents")? {
+                for document in &documents {
+                    reject_bson_regex(document, false)?;
+                }
+            }
+        }
+        "update" => {
+            if let Some(Value::Array(updates)) = command_field(body, "updates")? {
+                for update in &updates {
+                    let Some(spec) = update.as_object() else {
+                        continue;
+                    };
+                    if let Some(filter) = spec.get("q") {
+                        reject_bson_regex(filter, true)?;
+                    }
+                    if let Some(update) = spec.get("u") {
+                        reject_bson_regex(update, false)?;
+                    }
+                    if let Some(filters) = spec.get("arrayFilters").and_then(Value::as_array) {
+                        for filter in filters {
+                            reject_bson_regex(filter, true)?;
+                        }
+                    }
+                }
+            }
+        }
+        "delete" => {
+            if let Some(Value::Array(deletes)) = command_field(body, "deletes")? {
+                for delete in &deletes {
+                    if let Some(filter) = delete.get("q") {
+                        reject_bson_regex(filter, true)?;
+                    }
+                }
+            }
+        }
+        "find" => {
+            if let Some(filter) = command_field(body, "filter")? {
+                reject_bson_regex(&filter, true)?;
+            }
+            if let Some(projection) = command_field(body, "projection")? {
+                reject_bson_regex(&projection, false)?;
+            }
+        }
+        "count" | "distinct" => {
+            if let Some(filter) = command_field(body, "query")? {
+                reject_bson_regex(&filter, true)?;
+            }
+        }
+        "findAndModify" | "findandmodify" => {
+            if let Some(filter) = command_field(body, "query")? {
+                reject_bson_regex(&filter, true)?;
+            }
+            if let Some(update) = command_field(body, "update")? {
+                reject_bson_regex(&update, false)?;
+            }
+            if let Some(fields) = command_field(body, "fields")? {
+                reject_bson_regex(&fields, false)?;
+            }
+        }
+        "aggregate" => {
+            if let Some(pipeline) = command_field(body, "pipeline")? {
+                reject_aggregate_regex(&pipeline)?;
+            }
+        }
+        "listCollections" | "listDatabases" => {
+            if let Some(filter) = command_field(body, "filter")? {
+                reject_bson_regex(&filter, true)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn validate_mongo_options(command: &str, body: &Document) -> Result<(), ApiError> {

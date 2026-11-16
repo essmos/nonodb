@@ -282,6 +282,7 @@ Design: [docs/replication.md](docs/replication.md).
 - [x] MongoDB wire SCRAM-SHA-1 authentication
 - [x] MongoDB wire authSource validation and auth-file principal scopes
 - [x] MongoDB wire strict option validation for unsupported driver options
+- [x] MongoDB wire rejects BSON regex values with `BadValue` instead of silently ignoring them
 - [x] MongoDB wire aggregate cursor batching and getMore paging
 - [x] MongoDB wire conformance harness against a real MongoDB server
 - [x] Mongo-compatible mongoexport/mongodump export and portability checks

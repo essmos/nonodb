@@ -7,6 +7,7 @@ Start the daemon with NONODB_MONGO_ADDR=127.0.0.1:37017, then run:
 """
 
 import os
+import re
 import sys
 import uuid
 from urllib.parse import quote
@@ -73,7 +74,28 @@ def main() -> int:
             )
         ] == [db.name]
 
+        regex_coll = db[f"regex_smoke_{os.getpid()}"]
+        regex_coll.insert_one({"name": "abc"})
+        assert (
+            regex_coll.find_one({"name": {"$regex": re.compile("^a")}})["name"]
+            == "abc"
+        )
+
         for label, operation in [
+            (
+                "BSON regex insert",
+                lambda: regex_coll.insert_one({"name": re.compile("^a")}),
+            ),
+            (
+                "BSON regex filter",
+                lambda: regex_coll.find_one({"name": re.compile("^a")}),
+            ),
+            (
+                "BSON regex aggregate match",
+                lambda: list(
+                    regex_coll.aggregate([{"$match": {"name": re.compile("^a")}}])
+                ),
+            ),
             ("collation", lambda: list(coll.find({}, collation={"locale": "en"}))),
             (
                 "bypassDocumentValidation",

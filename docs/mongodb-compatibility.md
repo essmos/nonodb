@@ -219,7 +219,7 @@ allowed. Other BSON types are not accepted as `_id`.
 | `$comment` as a filter operator | ❌ | `comment` is available as a query option |
 | `$rand` | ❌ | |
 | Collation | ❌ | No per-query or per-index collation |
-| BSON regex document values | ❌ | Use the `$regex` query operator |
+| BSON regex document values | ❌ | Rejected with `BadValue` (code 2) on writes and filters; use the `$regex` query operator |
 
 ## Projection
 
@@ -330,7 +330,7 @@ allowed. Other BSON types are not accepted as `_id`.
 | ObjectId `_id` | ✅ | Accepted from drivers and stored without converting to a string |
 | Timestamp | ✅ | Extended JSON `$timestamp`; indexed and `$type`-aware |
 | MinKey / MaxKey | ✅ | Sentinel values with BSON ordering and `$type` support |
-| Regular-expression value | ❌ | `$regex` filters work; BSON regex values do not |
+| Regular-expression value | ❌ | `$regex` filters work; stored/filter BSON regex values are rejected loudly with `BadValue` (code 2) |
 | Code / CodeWithScope / Symbol | ❌ | |
 | DBPointer / Undefined | ❌ | |
 
@@ -361,7 +361,7 @@ A migration from MongoDB to NonoDB should check these items first:
 6. **Collation** — normalize strings or enforce ordering in the application.
 7. **Sparse/partial/TTL indexes** — remodel as collection settings, separate
    indexes, or application logic.
-8. **BSON regex values** — rewrite as `$regex` filters or application logic.
+8. **BSON regex values** — rewrite as `$regex` filters or application logic; the wire listener rejects them with `BadValue` (code 2) instead of accepting them silently.
 9. **Unsupported aggregation expressions/stages** — rewrite with supported
    stages or precompute outside the database.
 10. **Wire-protocol tooling** — `mongosh`, BI connectors, and monitoring
