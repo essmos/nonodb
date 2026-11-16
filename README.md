@@ -249,7 +249,8 @@ single-database directories are migrated to `default/` on startup. See
 - Read-only `aggregate` endpoint for reporting, grouping, and summaries.
 - Stages: `$match`, `$project`, `$addFields`/`$set`, `$unset`, `$unwind`,
   `$group`, `$bucket`, `$bucketAuto`, `$sortByCount`, `$replaceRoot`/
-  `$replaceWith`, `$sample`, `$facet`, `$sort`, `$skip`, `$limit`, and `$count`.
+  `$replaceWith`, `$sample`, `$facet`, `$lookup`, `$unionWith`, `$sort`,
+  `$skip`, `$limit`, and `$count`.
 - Accumulators: `$sum`, `$avg`, `$min`, `$max`, `$first`, `$last`, `$push`,
   `$addToSet`, and `$count`.
 - Consecutive leading `$match` stages are fused, and a terminal `$count` skips

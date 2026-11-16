@@ -4118,6 +4118,58 @@ impl<'e> Collection<'e> {
         Ok(out)
     }
 
+    fn union_stage_in(
+        &self,
+        rtxn: &RoTxn<'_>,
+        spec: &Value,
+        _vars: &BTreeMap<String, Value>,
+    ) -> Result<Vec<Value>> {
+        let (from, pipeline) = match spec {
+            Value::String(from) => (from.as_str(), None),
+            Value::Object(obj) => {
+                let from = obj
+                    .get("coll")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| Error::Query("$unionWith requires `coll`".into()))?;
+                let pipeline = match obj.get("pipeline") {
+                    Some(value) => Some(value.as_array().ok_or_else(|| {
+                        Error::Query("$unionWith `pipeline` must be an array".into())
+                    })?),
+                    None => None,
+                };
+                (from, pipeline)
+            }
+            _ => {
+                return Err(Error::Query(
+                    "$unionWith requires a collection name or object".into(),
+                ));
+            }
+        };
+        let store = self
+            .store
+            .ok_or_else(|| Error::Query("$unionWith requires a store-backed collection".into()))?;
+        let Some(foreign) = store.collection_at(rtxn, from)? else {
+            return Ok(Vec::new());
+        };
+        let max_docs = aggregate::max_docs();
+        let docs = match pipeline {
+            Some(pipeline) => foreign.aggregate_in(rtxn, pipeline)?,
+            None => foreign.find_in(
+                rtxn,
+                &FindQuery {
+                    limit: Some(max_docs.saturating_add(1)),
+                    ..Default::default()
+                },
+            )?,
+        };
+        if docs.len() > max_docs {
+            return Err(Error::Query(format!(
+                "$unionWith collection `{from}` exceeds {max_docs} documents"
+            )));
+        }
+        Ok(docs)
+    }
+
     pub fn find(&self, query: &FindQuery) -> Result<Vec<Value>> {
         let normalized = normalized_find_query(query)?;
         let query = normalized.as_ref();
@@ -7156,6 +7208,10 @@ impl aggregate::AggregateHost for LookupHost<'_, '_, '_> {
     ) -> Result<Vec<Value>> {
         self.coll.lookup_stage_in(self.rtxn, docs, spec, vars)
     }
+
+    fn union_with(&self, spec: &Value, vars: &BTreeMap<String, Value>) -> Result<Vec<Value>> {
+        self.coll.union_stage_in(self.rtxn, spec, vars)
+    }
 }
 
 #[cfg(test)]
@@ -9124,6 +9180,74 @@ mod tests {
             .is_err());
         assert!(orders
             .aggregate(&[json!({"$lookup": {"from": "lookup_items", "as": "x"}})])
+            .is_err());
+    }
+
+    #[test]
+    fn union_with_appends_collections_and_runs_subpipelines() {
+        let (_dir, store) = store();
+        let primary = store.collection("union_primary").unwrap();
+        primary
+            .insert_one(json!({"_id": "p1", "active": true, "value": 1}))
+            .unwrap();
+        primary
+            .insert_one(json!({"_id": "p2", "active": false, "value": 2}))
+            .unwrap();
+        let archive = store.collection("union_archive").unwrap();
+        archive
+            .insert_one(json!({"_id": "a1", "active": true, "value": 3}))
+            .unwrap();
+        archive
+            .insert_one(json!({"_id": "a2", "active": false, "value": 4}))
+            .unwrap();
+
+        let out = primary
+            .aggregate(&[
+                json!({"$match": {"active": true}}),
+                json!({"$project": {"_id": 1, "value": 1}}),
+                json!({"$unionWith": {
+                    "coll": "union_archive",
+                    "pipeline": [
+                        {"$match": {"active": true}},
+                        {"$project": {"_id": 1, "value": 1}}
+                    ]
+                }}),
+                json!({"$sort": {"_id": 1}}),
+            ])
+            .unwrap();
+        assert_eq!(
+            out,
+            vec![
+                json!({"_id": "a1", "value": 3}),
+                json!({"_id": "p1", "value": 1})
+            ]
+        );
+
+        let out = primary
+            .aggregate(&[
+                json!({"$match": {"_id": "p1"}}),
+                json!({"$unionWith": "union_archive"}),
+                json!({"$sort": {"_id": 1}}),
+            ])
+            .unwrap();
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0]["_id"], "a1");
+        assert_eq!(out[1]["_id"], "a2");
+        assert_eq!(out[2]["_id"], "p1");
+
+        let out = primary
+            .aggregate(&[
+                json!({"$match": {"_id": "p1"}}),
+                json!({"$unionWith": "union_missing"}),
+            ])
+            .unwrap();
+        assert_eq!(out, vec![json!({"_id": "p1", "active": true, "value": 1})]);
+
+        assert!(primary
+            .aggregate(&[json!({"$unionWith": {"pipeline": []}})])
+            .is_err());
+        assert!(primary
+            .aggregate(&[json!({"$unionWith": {"coll": "union_archive", "pipeline": 1}})])
             .is_err());
     }
 

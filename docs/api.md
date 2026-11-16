@@ -911,6 +911,8 @@ error code. `comment` is accepted for correlation but is not stored.
 | `$replaceRoot` / `$replaceWith` | Replace each document with an evaluated object |
 | `$sample` | Return a random sample of the requested size |
 | `$facet` | Run multiple sub-pipelines over the same input documents |
+| `$lookup` | Join documents from another collection |
+| `$unionWith` | Append the result of another collection or sub-pipeline |
 | `$sort` | Sort by one or more fields |
 | `$skip` | Skip documents |
 | `$limit` | Limit documents |
@@ -1014,6 +1016,28 @@ Joins documents from another collection:
 - The result is written to `as` as an array. The aggregate intermediate-document
   limit still applies.
 
+### `$unionWith`
+
+Appends documents from another collection to the current pipeline result:
+
+```json
+{
+  "$unionWith": {
+    "coll": "archived_orders",
+    "pipeline": [
+      {"$match": {"status": "paid"}},
+      {"$project": {"tenant": 1, "total": 1}}
+    ]
+  }
+}
+```
+
+The shorthand form `{"$unionWith": "archived_orders"}` appends the whole
+collection. Duplicates are preserved, and the union result is appended after
+the current documents. A missing collection contributes no documents.
+Sub-pipelines support the same read-only stages, including nested `$lookup` and
+`$unionWith`; the intermediate-document limit applies to the combined result.
+
 ### Limits
 
 - At most **100,000 documents** may exist in an intermediate result. The call
@@ -1021,8 +1045,8 @@ Joins documents from another collection:
 - The normal request timeout (30 seconds by default) applies.
 - Response size is still limited by the HTTP response path and the client's
   practical memory; use `$limit` and `$project` for large collections.
-- Not supported: `$graphLookup`, `$merge`, `$out`, window functions, and
-  arbitrary JavaScript.
+- Not supported: `$graphLookup`, `$merge`, `$out`, `$setWindowFields`,
+  `$densify`, `$fill`, `$redact`, window functions, and arbitrary JavaScript.
 
 ## sql
 

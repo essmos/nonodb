@@ -282,6 +282,8 @@ pub(crate) trait AggregateHost {
         spec: &Value,
         vars: &BTreeMap<String, Value>,
     ) -> Result<Vec<Value>>;
+
+    fn union_with(&self, spec: &Value, vars: &BTreeMap<String, Value>) -> Result<Vec<Value>>;
 }
 
 /// Runs a pipeline over already selected documents.
@@ -471,6 +473,19 @@ pub(crate) fn run_with_host_vars(
                         Error::Query("$lookup requires a collection-aware host".into())
                     })?;
                     docs = host.lookup(docs, arg, vars)?;
+                    i += 1;
+                }
+                "$unionWith" => {
+                    let host = host.ok_or_else(|| {
+                        Error::Query("$unionWith requires a collection-aware host".into())
+                    })?;
+                    let mut union = host.union_with(arg, vars)?;
+                    docs.append(&mut union);
+                    if docs.len() > max_docs {
+                        return Err(Error::Query(format!(
+                            "$unionWith result exceeds {max_docs} documents"
+                        )));
+                    }
                     i += 1;
                 }
                 "$facet" => {
