@@ -138,6 +138,8 @@ provide:
 - a role hierarchy or inherited groups; authorization uses principals and
   database-qualified scopes;
 - the full MongoDB query and update language; it implements a practical subset.
+  See [MongoDB compatibility](docs/mongodb-compatibility.md) for the feature
+  map and known differences.
 
 For a single host, a small-to-medium data set, and a workload dominated by
 indexed reads and modest writes, those trade-offs buy a very small operational
@@ -807,6 +809,7 @@ documentation.
 |---|---|
 | [Architecture](docs/architecture.md) | Daemon model, LMDB layout, write path, indexes, search, concurrency, crash safety |
 | [HTTP API](docs/api.md) | Every operation, request/response shapes, filters, updates, indexes, search, errors |
+| [MongoDB compatibility](docs/mongodb-compatibility.md) | Feature comparison, practical coverage, and migration caveats |
 | [SQL queries](docs/sql.md) | `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `DISTINCT`, `HAVING`, `CASE`, functions, aggregates, `explain_sql`, parameters, limits, client examples |
 | [Clients](docs/clients.md) | Python, Rust, Node.js and Go clients: install, CRUD, batches, indexes, search, TCP/TLS, read-replica write routing |
 | [Migration and import](docs/migration.md) | MongoDB, PostgreSQL, SQLite and CSV migration, NDJSON format, import manifest, cutover |

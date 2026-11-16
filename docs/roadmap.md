@@ -99,6 +99,9 @@ Implemented:
 
 ### Query language
 
+See [MongoDB compatibility](mongodb-compatibility.md) for a feature-by-feature
+comparison and practical migration caveats.
+
 - The aggregation pipeline is bounded by `NONODB_AGGREGATE_MAX_DOCS` (default
   100,000 intermediate documents). It supports equality `$lookup` joins,
   `$lookup` `let` variables, nested lookups, `$unionWith`, `$graphLookup`,
