@@ -72,11 +72,24 @@ function sqlIsRead(query) {
   }
 }
 
+function aggregateIsWrite(pipeline) {
+  return (
+    Array.isArray(pipeline) &&
+    pipeline.some(
+      (stage) =>
+        stage !== null &&
+        typeof stage === 'object' &&
+        ('$out' in stage || '$merge' in stage),
+    )
+  );
+}
+
 function isWritePayload(payload) {
   if (payload?.op === 'batch') {
     return (payload.ops ?? []).some((item) => isWritePayload(item));
   }
   if (payload?.op === 'sql') return !sqlIsRead(payload.query);
+  if (payload?.op === 'aggregate') return aggregateIsWrite(payload.pipeline);
   return !READ_OPS.has(payload?.op);
 }
 
@@ -809,8 +822,8 @@ class Collection {
     return result.count;
   }
 
-  /** Run a read-only aggregation pipeline. */
-  async aggregate(pipeline, { comment, maxTimeMS } = {}) {
+  /** Run an aggregation pipeline. A terminal `$out`/`$merge` performs a write. */
+  async aggregate(pipeline, { comment, maxTimeMS, durability } = {}) {
     const payload = {
       op: 'aggregate',
       coll: this.name,
@@ -818,6 +831,7 @@ class Collection {
     };
     if (comment !== undefined) payload.comment = comment;
     if (maxTimeMS !== undefined) payload.max_time_ms = maxTimeMS;
+    if (durability !== undefined) payload.durability = durability;
     const result = await this.db.exec(payload);
     return result.results ?? [];
   }

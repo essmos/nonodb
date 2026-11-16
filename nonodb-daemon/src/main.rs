@@ -2936,7 +2936,26 @@ async fn exec_inner(
             pipeline,
             comment: _,
             max_time_ms,
+            durability,
         } => {
+            let spec = match nonodb_core::aggregate::write_stage_spec(&pipeline) {
+                Ok(spec) => spec,
+                Err(err) => return respond(Err(err.into())),
+            };
+            if spec.is_some() {
+                if vault_auth.is_some() {
+                    return respond(Err(
+                        vault::unsupported("$out/$merge on vault collections").into()
+                    ));
+                }
+                let req = WriteReq::Aggregate {
+                    coll,
+                    pipeline,
+                    max_time_ms,
+                    database: database.clone(),
+                };
+                return submit_write(&state, req, durability.unwrap_or_default()).await;
+            }
             let store = state.store.clone();
             let auth = vault_auth.clone();
             let joined = tokio::task::spawn_blocking(move || {
@@ -3976,6 +3995,15 @@ fn cacheable(req: &Request) -> bool {
             return false;
         }
     }
+    if let Request::Aggregate { pipeline, .. } = req {
+        if nonodb_core::aggregate::write_stage_spec(pipeline)
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            return false;
+        }
+    }
     matches!(
         req,
         Request::Find { .. }
@@ -4239,7 +4267,14 @@ fn execute_read(
             pipeline,
             comment: _,
             max_time_ms,
+            ..
         } => {
+            if nonodb_core::aggregate::write_stage_spec(&pipeline)?.is_some() {
+                return Err(ApiError {
+                    code: "invalid_query".into(),
+                    message: "$out/$merge are not allowed in a read batch".into(),
+                });
+            }
             let Some(c) = store.collection_at(rtxn, &coll)? else {
                 return Ok(json!({ "results": [] }));
             };

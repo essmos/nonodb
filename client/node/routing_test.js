@@ -83,6 +83,16 @@ async function main() {
 
   primary.posts = 0;
   replica.posts = 0;
+  await db.exec({
+    op: 'aggregate',
+    coll: 'c',
+    pipeline: [{ $out: 'd' }],
+  });
+  assert.equal(primary.posts, 1);
+  assert.equal(replica.posts, 0);
+
+  primary.posts = 0;
+  replica.posts = 0;
   const plain = new NonoDB({ baseUrl: replica.url, token: 'test' });
   await assert.rejects(
     plain.exec({ op: 'insert', coll: 'c', doc: { x: 4 } }),

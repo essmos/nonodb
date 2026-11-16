@@ -402,11 +402,13 @@ users.insert(doc, durability="relaxed")
 users.insert_many(docs, durability="relaxed")
 users.update(filter, {"$set": {"x": 1}}, durability="full")
 db.write_batch(ops, durability="relaxed")
+users.aggregate([{"$merge": {"into": "totals"}}], durability="relaxed")
 db.sync()
 ```
 
-Rust, Node.js, and Go clients can send the same field through their normal
-`exec`/`Exec` payload. `full` is the default. `unsafe` requires
+Clients classify a terminal `$out` or `$merge` aggregation as a write and route
+it to the primary automatically. Rust, Node.js, and Go clients can send the same
+field through their normal `exec`/`Exec` payload. `full` is the default. `unsafe` requires
 `NONODB_ALLOW_UNSAFE_WRITES=1` on the daemon. See
 [Write durability](api.md#write-durability) for guarantees and risks.
 
@@ -770,7 +772,8 @@ All clients expose the common document operations:
 - `set_collection_ttl`/`get_collection_ttl` for collection TTL defaults and
   optional history purging on expiry;
 - `insert`, `insert_many`, `find`, `find_one`, `update`, `delete`, `count`;
-- `aggregate` for read-only reporting pipelines;
+- `aggregate` for reporting pipelines, plus transactional `$out`/`$merge`
+  write stages;
 - `batch` (read-only) and `write_batch` (atomic writes);
 - `lookup`/`lookup_one` for ordered point lookups by `_id` or a unique index,
   plus `get_many` for fetching documents by `_id`;

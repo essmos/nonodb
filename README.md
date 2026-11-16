@@ -45,7 +45,8 @@ nonodb is a real document database with:
 - fuzzy search using trigrams plus Levenshtein distance;
 - exact vector search with cosine, dot, and L2 metrics, stored and queried
   inside the same LMDB file;
-- a read-only aggregation pipeline for reporting and summaries;
+- an aggregation pipeline for reporting and summaries, with transactional
+  `$out`/`$merge` write stages;
 - asynchronous primary/replica replication with durable ordered operations, snapshot bootstrap, replicated indexes/history/TTL/events/subscriptions and encrypted vault envelopes, a replicated cluster control plane (auth, backup jobs, database catalog), 8-character one-time pairing, lease-gated writes, quorum promotion, automatic election, partition rejoin, write routing and a cluster-wide GUI;
 - snapshots, scheduled native or restic backups with GUI, gzip/age encryption, backup-info files, local/S3/R2 export, staged import as new databases, online LMDB map growth, authentication, TLS/mTLS, metrics and a CLI;
 - graceful shutdown with in-flight request draining and optional JSON logs;
@@ -134,7 +135,6 @@ provide:
   [replication and cluster guide](docs/replication-cluster-guide.md);
 - general interactive multi-document transactions;
 - MongoDB wire-protocol compatibility;
-- aggregation write stages (`$merge`/`$out`);
 - a role hierarchy or inherited groups; authorization uses principals and
   database-qualified scopes;
 - the full MongoDB query and update language; it implements a practical subset.
@@ -246,12 +246,13 @@ single-database directories are migrated to `default/` on startup. See
 
 ### Aggregation
 
-- Read-only `aggregate` endpoint for reporting, grouping, and summaries.
+- `aggregate` endpoint for reporting, grouping, and summaries. A terminal
+  `$out` or `$merge` stage writes the result through the single writer.
 - Stages: `$match`, `$project`, `$addFields`/`$set`, `$unset`, `$unwind`,
   `$group`, `$bucket`, `$bucketAuto`, `$sortByCount`, `$replaceRoot`/
   `$replaceWith`, `$sample`, `$facet`, `$lookup`, `$unionWith`, `$graphLookup`,
-  `$setWindowFields`, `$densify`, `$fill`, `$sort`, `$skip`, `$limit`, and
-  `$count`.
+  `$setWindowFields`, `$densify`, `$fill`, `$sort`, `$skip`, `$limit`,
+  `$count`, `$out`, and `$merge`.
 - Accumulators: `$sum`, `$avg`, `$min`, `$max`, `$first`, `$last`, `$push`,
   `$addToSet`, and `$count`.
 - Consecutive leading `$match` stages are fused, and a terminal `$count` skips

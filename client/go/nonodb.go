@@ -81,10 +81,12 @@ type FindQuery struct {
 	Hint       any
 }
 
-// QueryOptions controls server-side query execution for reads.
+// QueryOptions controls aggregation/query execution. Durability applies to
+// terminal $out/$merge aggregation writes.
 type QueryOptions struct {
-	Comment   *string
-	MaxTimeMS *int64
+	Comment    *string
+	MaxTimeMS  *int64
+	Durability *string
 }
 
 // FindOneOptions controls FindOneWithOptions.
@@ -624,9 +626,38 @@ func sqlIsRead(query any) bool {
 	}
 }
 
+func aggregateIsWrite(pipeline any) bool {
+	switch stages := pipeline.(type) {
+	case []any:
+		for _, stage := range stages {
+			if item, ok := stage.(map[string]any); ok {
+				if _, ok := item["$out"]; ok {
+					return true
+				}
+				if _, ok := item["$merge"]; ok {
+					return true
+				}
+			}
+		}
+	case []map[string]any:
+		for _, item := range stages {
+			if _, ok := item["$out"]; ok {
+				return true
+			}
+			if _, ok := item["$merge"]; ok {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func isWriteOp(payload map[string]any) bool {
 	if payload["op"] == "sql" {
 		return !sqlIsRead(payload["query"])
+	}
+	if payload["op"] == "aggregate" {
+		return aggregateIsWrite(payload["pipeline"])
 	}
 	if payload["op"] == "batch" {
 		switch ops := payload["ops"].(type) {
@@ -1577,12 +1608,13 @@ func (c *Collection) CountWithOptions(
 	return result.Count, nil
 }
 
-// Aggregate runs a read-only aggregation pipeline.
+// Aggregate runs an aggregation pipeline.
 func (c *Collection) Aggregate(ctx context.Context, pipeline []any) ([]map[string]any, error) {
 	return c.AggregateWithOptions(ctx, pipeline, QueryOptions{})
 }
 
 // AggregateWithOptions runs an aggregation pipeline with query options.
+// A terminal `$out`/`$merge` stage performs a write and returns an empty slice.
 func (c *Collection) AggregateWithOptions(
 	ctx context.Context,
 	pipeline []any,
@@ -1596,6 +1628,9 @@ func (c *Collection) AggregateWithOptions(
 	}
 	if options.MaxTimeMS != nil {
 		payload["max_time_ms"] = *options.MaxTimeMS
+	}
+	if options.Durability != nil {
+		payload["durability"] = *options.Durability
 	}
 	raw, err := c.client.execRaw(ctx, payload)
 	if err != nil {

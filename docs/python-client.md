@@ -370,9 +370,12 @@ rows = users.aggregate(
 )
 ```
 
-`aggregate` is read-only and returns the pipeline result rows. The supported
-stages, expressions, accumulators, and the 100,000-document intermediate limit
-are documented in [Aggregation](api.md#aggregation).
+`aggregate` returns the pipeline result rows. A terminal `$out` or `$merge`
+stage performs a write through the primary and returns an empty list; pass
+`durability="relaxed"` or `"unsafe"` to override the default `full` durability.
+Clients detect these terminal stages automatically for primary routing. The
+supported stages, expressions, accumulators, and the 100,000-document
+intermediate limit are documented in [Aggregation](api.md#aggregation).
 
 ## SQL
 

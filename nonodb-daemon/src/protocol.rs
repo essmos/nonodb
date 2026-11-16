@@ -260,7 +260,7 @@ pub enum Request {
         #[serde(default)]
         max_time_ms: Option<u64>,
     },
-    /// Read-only aggregation pipeline.
+    /// Aggregation pipeline. A terminal `$out` or `$merge` makes this a write.
     Aggregate {
         coll: String,
         #[serde(default)]
@@ -269,6 +269,8 @@ pub enum Request {
         comment: Option<String>,
         #[serde(default)]
         max_time_ms: Option<u64>,
+        #[serde(default)]
+        durability: Option<Durability>,
     },
     /// Read-only SQL SELECT over one collection.
     Sql {
@@ -740,6 +742,13 @@ pub enum WriteReq {
         query: String,
         params: Vec<Value>,
     },
+    /// Aggregation with a terminal `$out` or `$merge` write stage.
+    Aggregate {
+        coll: String,
+        pipeline: Vec<Value>,
+        max_time_ms: Option<u64>,
+        database: String,
+    },
     /// Atomic write batch (all or nothing).
     Batch {
         ops: Vec<WriteReq>,
@@ -864,6 +873,7 @@ impl Request {
             | Self::Update { durability, .. }
             | Self::FindAndModify { durability, .. }
             | Self::Delete { durability, .. }
+            | Self::Aggregate { durability, .. }
             | Self::Sql { durability, .. }
             | Self::WriteBatch { durability, .. } => durability.unwrap_or_default(),
             _ => Durability::Full,
@@ -878,7 +888,6 @@ impl Request {
             | Self::Watch { .. }
             | Self::Explain { .. }
             | Self::Count { .. }
-            | Self::Aggregate { .. }
             | Self::ExplainSql { .. }
             | Self::CursorFind { .. }
             | Self::CursorAggregate { .. }
@@ -901,6 +910,10 @@ impl Request {
             | Self::GetCollectionMetrics { .. }
             | Self::ListSubscriptions { .. }
             | Self::ListDatabases => true,
+            Self::Aggregate { pipeline, .. } => nonodb_core::aggregate::write_stage_spec(pipeline)
+                .ok()
+                .flatten()
+                .is_none(),
             Self::Sql { query, .. } => nonodb_core::sql::is_read_only(query).unwrap_or(false),
             Self::Batch { ops } => ops.iter().all(Self::is_read_only),
             _ => false,
@@ -920,7 +933,6 @@ impl Request {
             | Self::FindAndModify { coll, .. }
             | Self::Delete { coll, .. }
             | Self::Count { coll, .. }
-            | Self::Aggregate { coll, .. }
             | Self::CursorFind { coll, .. }
             | Self::CursorAggregate { coll, .. }
             | Self::CreateIndex { coll, .. }
@@ -954,6 +966,15 @@ impl Request {
             | Self::RenewSubscription { coll, .. }
             | Self::DeleteSubscription { coll, .. }
             | Self::ListSubscriptions { coll } => vec![coll.clone()],
+            Self::Aggregate { coll, pipeline, .. } => {
+                let mut out = vec![coll.clone()];
+                if let Ok(Some(spec)) = nonodb_core::aggregate::write_stage_spec(pipeline) {
+                    if spec.target != *coll {
+                        out.push(spec.target);
+                    }
+                }
+                out
+            }
             Self::Sql { query, .. } | Self::ExplainSql { query, .. } => {
                 nonodb_core::sql::collection_name(query)
                     .map(|coll| vec![coll])
@@ -1015,7 +1036,10 @@ impl WriteReq {
     }
 
     pub(crate) fn is_atomic(&self) -> bool {
-        matches!(self, WriteReq::Batch { .. } | WriteReq::Sql { .. })
+        matches!(
+            self,
+            WriteReq::Batch { .. } | WriteReq::Sql { .. } | WriteReq::Aggregate { .. }
+        )
     }
 }
 

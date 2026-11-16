@@ -20,6 +20,10 @@ export interface QueryOptions {
   maxTimeMS?: number;
 }
 
+export interface AggregateOptions extends QueryOptions {
+  durability?: 'full' | 'relaxed' | 'unsafe';
+}
+
 export interface FindOptions extends QueryOptions {
   projection?: Record<string, 0 | 1>;
   sort?: Array<[string, 1 | -1]>;
@@ -147,5 +151,5 @@ export class Collection {
   find(filter?: Record<string, unknown>, options?: FindOptions): Promise<any[]>;
   findOne(filter?: Record<string, unknown>, options?: FindOneOptions): Promise<any | null>;
   count(filter?: Record<string, unknown>, options?: QueryOptions): Promise<number>;
-  aggregate(pipeline: Record<string, unknown>[], options?: QueryOptions): Promise<any[]>;
+  aggregate(pipeline: Record<string, unknown>[], options?: AggregateOptions): Promise<any[]>;
 }

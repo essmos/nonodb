@@ -876,6 +876,10 @@ Optimizations:
 }
 ```
 
+A terminal `$out` or `$merge` stage turns the request into a write. Such a
+request is routed through the single writer, requires `write:<target>`, and may
+include `durability` (`full`, `relaxed`, or `unsafe`).
+
 Response:
 
 ```json
@@ -889,11 +893,16 @@ Response:
 }
 ```
 
-Aggregation is **read-only**. It runs in one LMDB read snapshot and is allowed
-in the read-only `batch` operation. A missing collection produces an empty
-`results` array. `max_time_ms` bounds the pushed-down `find`/`count` phase and is
+Read-only aggregation runs in one LMDB read snapshot and is allowed in the
+read-only `batch` operation. A missing collection produces an empty `results`
+array. `max_time_ms` bounds the pushed-down `find`/`count` phase and is
 rechecked before and after the remaining pipeline; expiry returns the `timeout`
 error code. `comment` is accepted for correlation but is not stored.
+
+Pipelines ending in `$out` or `$merge` run in one writer transaction. The read
+part of the pipeline is evaluated first, then the target writes are applied.
+Any validation, uniqueness, or size error aborts the whole transaction. Write
+stages are not allowed in a read `batch` or in a cursor aggregation.
 
 ### Supported stages
 
@@ -917,6 +926,8 @@ error code. `comment` is accepted for correlation but is not stored.
 | `$setWindowFields` | Partition, sort, rank, and compute windowed accumulators |
 | `$densify` | Generate missing values in a numeric or date range |
 | `$fill` | Fill missing or null values with a value, `locf`, or linear interpolation |
+| `$out` | Replace a collection with the pipeline result (terminal only) |
+| `$merge` | Insert, merge, replace, or skip matching target documents (terminal only) |
 | `$sort` | Sort by one or more fields |
 | `$skip` | Skip documents |
 | `$limit` | Limit documents |
@@ -1168,6 +1179,64 @@ Fills missing and null values within partitions:
 - Each output field is computed from the input documents before any `$fill`
   results are written, so output fields do not depend on each other.
 
+### `$out`
+
+Replaces the target collection contents with the pipeline result:
+
+```json
+{
+  "$out": "daily_totals"
+}
+```
+
+- `$out` must be the last stage.
+- The target may be a string or `{"coll": "...", "db": "..."}`. The database
+  must be the current database; cross-database writes are not supported.
+- The target documents are deleted and the new result documents are inserted in
+  the same writer transaction. Existing indexes and collection settings are
+  preserved.
+- If the target does not exist, it is created as a standard collection.
+- The source and target must be standard collections. Writing to the internal
+  `_events` collection is rejected.
+- The response contains `results: []`, plus `target`, `deleted`, and
+  `inserted` counters.
+
+### `$merge`
+
+Merges the pipeline result into an existing or new collection:
+
+```json
+{
+  "$merge": {
+    "into": "customers",
+    "on": "email",
+    "whenMatched": "merge",
+    "whenNotMatched": "insert"
+  }
+}
+```
+
+- `$merge` must be the last stage.
+- `into` accepts a collection name or `{"coll": "...", "db": "..."}` in the
+  current database.
+- `on` is a field name or array of field names. It defaults to `_id`. Fields
+  other than `_id` require an existing unique index on exactly those fields.
+- `whenMatched` defaults to `merge`:
+  - `merge` — add or overwrite the result's top-level fields, preserving other
+    existing fields;
+  - `replace` — replace the matched document, preserving its `_id`;
+  - `keepExisting` — leave the matched document unchanged;
+  - `fail` — return `invalid_query`.
+- `whenNotMatched` defaults to `insert`:
+  - `insert` — insert the result document;
+  - `discard` — skip it;
+  - `fail` — return `invalid_query`.
+- A result document that contains `_id` must use the same `_id` as a matched
+  target document. Changing `_id` is rejected.
+- `whenMatched` pipelines and `let` variables are not supported.
+- The response contains `results: []`, plus `target`, `matched`, `modified`,
+  `inserted`, and `skipped` counters.
+
 ### Limits
 
 - At most **100,000 documents** may exist in an intermediate result. The call
@@ -1175,8 +1244,8 @@ Fills missing and null values within partitions:
 - The normal request timeout (30 seconds by default) applies.
 - Response size is still limited by the HTTP response path and the client's
   practical memory; use `$limit` and `$project` for large collections.
-- Not supported: `$merge`, `$out`, `$redact`, `$expMovingAvg`, `$derivative`,
-  and arbitrary JavaScript.
+- Not supported: `$redact`, `$expMovingAvg`, `$derivative`, `$merge`
+  `whenMatched` pipelines, and arbitrary JavaScript.
 
 ## sql
 
@@ -1300,8 +1369,8 @@ documents the cursor may return, not a batch size. `comment`, `max_time_ms`, and
 Cursor aggregation supports an optional leading `$match`, then only
 document-local stages that preserve one output per input: `$project`,
 `$addFields`/`$set`, and `$unset`. Blocking stages (`$group`, `$unwind`,
-`$sort`, `$count`, `$skip`, `$limit`, `$setWindowFields`, `$densify`, `$fill`)
-require a regular `aggregate`.
+`$sort`, `$count`, `$skip`, `$limit`, `$setWindowFields`, `$densify`, `$fill`,
+`$out`, `$merge`) require a regular `aggregate`.
 
 `comment` and `max_time_ms` are stored with the cursor and applied to every
 page request. The deadline covers the `$match`/page `find` and is checked after

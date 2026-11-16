@@ -52,7 +52,8 @@ const db = new NonoDB({
 See [Multiple databases](../../docs/multi-database.md).
 
 `find`/`findOne` accept `comment`, `maxTimeMS`, and `hint`; `count` and
-`aggregate` accept `comment` and `maxTimeMS`.
+`aggregate` accept `comment` and `maxTimeMS`. `aggregate` also accepts
+`durability`, and a terminal `$out`/`$merge` stage is routed as a write.
 
 See [docs/clients.md](../../docs/clients.md) for the full client guide. Run
 `NONODB_SOCK=/run/nonodb.sock node smoke_test.js` against a daemon for an
@@ -76,7 +77,8 @@ Documents use the reserved `_ttl` field for a per-document override. See
 
 ## Aggregation
 
-Use `aggregate()` for a read-only reporting pipeline:
+Use `aggregate()` for reporting pipelines. A terminal `$out`/`$merge` stage
+writes through the primary:
 
 ```js
 const rows = await users.aggregate([

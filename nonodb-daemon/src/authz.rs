@@ -25,13 +25,36 @@ pub fn authorize_request(
             allow(principal, Action::Write, database, coll, req.op_name())
         }
 
+        Request::Aggregate { coll, pipeline, .. } => {
+            allow(principal, Action::Read, database, coll, req.op_name())?;
+            let spec =
+                nonodb_core::aggregate::write_stage_spec(pipeline).map_err(ApiError::from)?;
+            if let Some(spec) = spec {
+                if let Some(target_database) = &spec.database {
+                    if target_database != database {
+                        return Err(ApiError {
+                            code: "invalid_query".into(),
+                            message: "cross-database $out/$merge is not supported".into(),
+                        });
+                    }
+                }
+                allow(
+                    principal,
+                    Action::Write,
+                    database,
+                    &spec.target,
+                    req.op_name(),
+                )?;
+            }
+            Ok(())
+        }
+
         Request::Find { coll, .. }
         | Request::FindOne { coll, .. }
         | Request::Lookup { coll, .. }
         | Request::Watch { coll, .. }
         | Request::Explain { coll, .. }
         | Request::Count { coll, .. }
-        | Request::Aggregate { coll, .. }
         | Request::CursorFind { coll, .. }
         | Request::CursorAggregate { coll, .. }
         | Request::ListIndexes { coll }

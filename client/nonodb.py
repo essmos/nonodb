@@ -84,6 +84,15 @@ def _loads(data: bytes) -> Any:
     return json.loads(data)
 
 
+def _aggregate_is_write(pipeline: Any) -> bool:
+    if not isinstance(pipeline, list):
+        return False
+    return any(
+        isinstance(stage, dict) and ("$out" in stage or "$merge" in stage)
+        for stage in pipeline
+    )
+
+
 def _sql_is_read(query: Any) -> bool:
     """Best-effort classification for `/v1/exec` SQL writes."""
     if not isinstance(query, str):
@@ -358,6 +367,8 @@ class NonoDB:
             return any(self._is_write(item) for item in ops if isinstance(item, dict))
         if op == "sql":
             return not _sql_is_read(payload.get("query"))
+        if op == "aggregate":
+            return _aggregate_is_write(payload.get("pipeline"))
         return op not in _READ_OPS
 
     def __enter__(self) -> "NonoDB":
@@ -387,8 +398,9 @@ class NonoDB:
         headers: Optional[dict[str, str]] = None,
     ) -> Any:
         op = payload.get("op")
+        is_write = self._is_write(payload)
         cache_key: Optional[bytes] = None
-        if headers is None and self._cache_ttl > 0 and op in _READ_OPS:
+        if headers is None and self._cache_ttl > 0 and not is_write and op in _READ_OPS:
             cache_key = _cache_key(payload)
             with self._cache_lock:
                 hit = self._cache.get(cache_key)
@@ -417,11 +429,11 @@ class NonoDB:
         extra_headers: Optional[dict[str, str]] = None,
     ) -> Any:
         # Reads are retried after a transport error; writes are not (duplicate risk).
-        retries = 2 if op in _RETRY_OPS else 0
+        is_write = self._is_write(payload)
+        retries = 2 if not is_write and op in _RETRY_OPS else 0
         attempt = 0
         redirected = False
         while True:
-            is_write = self._is_write(payload)
             client, base_url = (
                 self._write_target() if is_write else (self._http, self.base_url)
             )
@@ -1560,8 +1572,13 @@ class Collection:
         *,
         comment: Optional[str] = None,
         max_time_ms: Optional[int] = None,
+        durability: Optional[str] = None,
     ) -> list[dict[str, Any]]:
-        """Runs a read-only aggregation pipeline and returns its result rows."""
+        """Runs an aggregation pipeline and returns its result rows.
+
+        A terminal `$out`/`$merge` stage performs a write and returns an empty
+        result list; use ``exec`` with the same payload to inspect the summary.
+        """
         payload: dict[str, Any] = {
             "op": "aggregate",
             "coll": self.name,
@@ -1571,6 +1588,8 @@ class Collection:
             payload["comment"] = comment
         if max_time_ms is not None:
             payload["max_time_ms"] = max_time_ms
+        if durability is not None:
+            payload["durability"] = durability
         return self._db.exec(payload)["results"]
 
     # -- cursors -----------------------------------------------------

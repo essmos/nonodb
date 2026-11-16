@@ -65,6 +65,27 @@ func TestBatchWithWriteIsWrite(t *testing.T) {
 	}
 }
 
+func TestAggregateWriteClassification(t *testing.T) {
+	if !isWriteOp(map[string]any{
+		"op":       "aggregate",
+		"pipeline": []any{map[string]any{"$out": "target"}},
+	}) {
+		t.Fatal("$out aggregate must be a write")
+	}
+	if !isWriteOp(map[string]any{
+		"op":       "aggregate",
+		"pipeline": []any{map[string]any{"$merge": map[string]any{"into": "target"}}},
+	}) {
+		t.Fatal("$merge aggregate must be a write")
+	}
+	if isWriteOp(map[string]any{
+		"op":       "aggregate",
+		"pipeline": []any{map[string]any{"$match": map[string]any{"x": 1}}},
+	}) {
+		t.Fatal("read aggregate must not be a write")
+	}
+}
+
 func TestWriteRouting(t *testing.T) {
 	var primaryWrites, replicaWrites atomic.Int64
 	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

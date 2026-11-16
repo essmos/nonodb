@@ -44,6 +44,7 @@ See [Multiple databases](../../docs/multi-database.md).
 
 Read options are available on `FindQuery` (`Comment`, `MaxTimeMS`, `Hint`) and
 through `CountWithOptions`, `AggregateWithOptions`, and `FindOneWithOptions`.
+`AggregateWithOptions` also accepts `Durability` for terminal write stages.
 
 See [docs/clients.md](../../docs/clients.md) for the full client guide. Run
 `NONODB_SOCK=/run/nonodb.sock go run ./cmd/smoke` against a daemon for an
@@ -69,15 +70,18 @@ Documents use the reserved `_ttl` field for a per-document override. See
 ## Aggregation
 
 ```go
-rows, err := users.Aggregate(ctx, []any{
+rows, err := users.AggregateWithOptions(ctx, []any{
     map[string]any{"$match": map[string]any{"active": true}},
     map[string]any{"$group": map[string]any{
         "_id": "$tenant", "total": map[string]any{"$sum": "$amount"},
     }},
     map[string]any{"$sort": map[string]any{"total": -1}},
     map[string]any{"$limit": 10},
-})
+}, nonodb.QueryOptions{})
 ```
+
+A terminal `$out` or `$merge` stage performs a write through the primary and
+returns an empty slice. Set `QueryOptions.Durability` to override `full`.
 
 ## SQL
 

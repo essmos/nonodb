@@ -897,6 +897,16 @@ fn is_write_op(payload: &Value) -> bool {
             .and_then(Value::as_array)
             .is_some_and(|ops| ops.iter().any(is_write_op));
     }
+    if payload.get("op").and_then(Value::as_str) == Some("aggregate") {
+        return payload
+            .get("pipeline")
+            .and_then(Value::as_array)
+            .is_some_and(|stages| {
+                stages
+                    .iter()
+                    .any(|stage| stage.get("$out").is_some() || stage.get("$merge").is_some())
+            });
+    }
     !is_read_op(payload)
 }
 
@@ -1574,7 +1584,8 @@ impl Collection<'_> {
             .ok_or_else(|| Error::InvalidResponse("missing count".into()))
     }
 
-    /// Run a read-only aggregation pipeline.
+    /// Run an aggregation pipeline. A terminal `$out`/`$merge` stage performs a
+    /// write and returns an empty result vector.
     pub fn aggregate(&self, pipeline: &[Value]) -> Result<Vec<Value>> {
         let result = self.client.exec(json!({
             "op": "aggregate",
@@ -1731,6 +1742,22 @@ mod tests {
         assert!(!is_write_op(
             &json!({"op": "sql", "query": " -- c\n SELECT * FROM c"})
         ));
+    }
+
+    #[test]
+    fn aggregate_write_stages_are_writes() {
+        assert!(is_write_op(&json!({
+            "op": "aggregate",
+            "pipeline": [{"$out": "target"}]
+        })));
+        assert!(is_write_op(&json!({
+            "op": "aggregate",
+            "pipeline": [{"$merge": {"into": "target"}}]
+        })));
+        assert!(!is_write_op(&json!({
+            "op": "aggregate",
+            "pipeline": [{"$match": {"x": 1}}]
+        })));
     }
 
     #[test]

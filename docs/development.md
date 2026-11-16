@@ -15,7 +15,7 @@ and [HTTP API](api.md).
 │   │   ├── lib.rs
 │   │   ├── store.rs           # LMDB environment and collection registry
 │   │   ├── collection.rs      # CRUD, query planning, aggregate pushdown, scans
-│   │   ├── aggregate.rs       # read-only aggregation stages and expressions
+│   │   ├── aggregate.rs       # aggregation stages, expressions, and write-stage parsing
 │   │   ├── index.rs           # order-preserving index encoding
 │   │   ├── search.rs          # tokenization, BM25, trigrams, Levenshtein
 │   │   ├── vault.rs           # optional encrypted collections

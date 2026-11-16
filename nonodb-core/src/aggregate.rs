@@ -37,6 +37,201 @@ pub fn max_docs() -> usize {
         .unwrap_or(MAX_AGGREGATE_DOCS)
 }
 
+/// Terminal aggregation stages that write their result into a collection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggregateWriteKind {
+    Out,
+    Merge,
+}
+
+/// `$merge` behavior when the target already has a matching document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeWhenMatched {
+    Replace,
+    KeepExisting,
+    Merge,
+    Fail,
+}
+
+/// `$merge` behavior when no target document matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeWhenNotMatched {
+    Insert,
+    Discard,
+    Fail,
+}
+
+/// Parsed terminal `$out` or `$merge` stage. The writer is responsible for
+/// executing the read pipeline and applying the result transactionally.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AggregateWriteSpec {
+    pub kind: AggregateWriteKind,
+    pub target: String,
+    pub database: Option<String>,
+    pub on: Vec<String>,
+    pub when_matched: MergeWhenMatched,
+    pub when_not_matched: MergeWhenNotMatched,
+}
+
+fn write_stage_key(value: &Value) -> Option<&str> {
+    let obj = value.as_object()?;
+    obj.keys()
+        .find(|key| matches!(key.as_str(), "$out" | "$merge"))
+        .map(String::as_str)
+}
+
+fn parse_write_target(value: &Value, stage: &str) -> Result<(String, Option<String>)> {
+    match value {
+        Value::String(target) if !target.is_empty() => Ok((target.clone(), None)),
+        Value::Object(obj) => {
+            let target = obj
+                .get("coll")
+                .and_then(Value::as_str)
+                .filter(|target| !target.is_empty())
+                .ok_or_else(|| Error::Query(format!("{stage} requires `coll`")))?;
+            let database = match obj.get("db") {
+                Some(value) => Some(
+                    value
+                        .as_str()
+                        .filter(|database| !database.is_empty())
+                        .ok_or_else(|| Error::Query(format!("{stage} `db` must be a string")))?
+                        .to_string(),
+                ),
+                None => None,
+            };
+            Ok((target.to_string(), database))
+        }
+        _ => Err(Error::Query(format!(
+            "{stage} requires a collection name or an object with `coll`"
+        ))),
+    }
+}
+
+fn parse_merge_on(value: Option<&Value>) -> Result<Vec<String>> {
+    let Some(value) = value else {
+        return Ok(vec!["_id".to_string()]);
+    };
+    let values = match value {
+        Value::String(field) => vec![field.clone()],
+        Value::Array(values) => values
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .filter(|field| !field.is_empty())
+                    .map(str::to_string)
+                    .ok_or_else(|| Error::Query("$merge `on` fields must be strings".into()))
+            })
+            .collect::<Result<Vec<_>>>()?,
+        _ => {
+            return Err(Error::Query(
+                "$merge `on` must be a string or an array".into(),
+            ))
+        }
+    };
+    if values.is_empty() {
+        return Err(Error::Query("$merge `on` must not be empty".into()));
+    }
+    Ok(values)
+}
+
+/// Parses a terminal `$out` or `$merge` stage. Returns `None` for read-only
+/// pipelines. A write stage anywhere except the last position is rejected.
+pub fn write_stage_spec(pipeline: &[Value]) -> Result<Option<AggregateWriteSpec>> {
+    let mut found = None;
+    for (index, stage) in pipeline.iter().enumerate() {
+        if let Some(key) = write_stage_key(stage) {
+            if found.is_some() {
+                return Err(Error::Query(
+                    "aggregation may contain only one write stage".into(),
+                ));
+            }
+            let obj = stage.as_object().expect("write stage object");
+            if obj.len() != 1 {
+                return Err(Error::Query(
+                    "write stage must contain exactly one operator".into(),
+                ));
+            }
+            found = Some((index, key, obj.get(key).expect("write stage argument")));
+        }
+    }
+    let Some((index, key, arg)) = found else {
+        return Ok(None);
+    };
+    if index + 1 != pipeline.len() {
+        return Err(Error::Query(format!(
+            "{key} must be the last stage in the pipeline"
+        )));
+    }
+    if key == "$out" {
+        let (target, database) = parse_write_target(arg, "$out")?;
+        return Ok(Some(AggregateWriteSpec {
+            kind: AggregateWriteKind::Out,
+            target,
+            database,
+            on: vec!["_id".to_string()],
+            when_matched: MergeWhenMatched::Merge,
+            when_not_matched: MergeWhenNotMatched::Insert,
+        }));
+    }
+    let obj = arg
+        .as_object()
+        .ok_or_else(|| Error::Query("$merge requires an object".into()))?;
+    let into = obj
+        .get("into")
+        .ok_or_else(|| Error::Query("$merge requires `into`".into()))?;
+    let (target, database) = parse_write_target(into, "$merge")?;
+    let on = parse_merge_on(obj.get("on"))?;
+    let when_matched = match obj.get("whenMatched") {
+        None => MergeWhenMatched::Merge,
+        Some(Value::String(value)) => match value.as_str() {
+            "replace" => MergeWhenMatched::Replace,
+            "keepExisting" => MergeWhenMatched::KeepExisting,
+            "merge" => MergeWhenMatched::Merge,
+            "fail" => MergeWhenMatched::Fail,
+            _ => {
+                return Err(Error::Query(format!(
+                    "unsupported $merge whenMatched mode `{value}`"
+                )));
+            }
+        },
+        Some(Value::Array(_)) => {
+            return Err(Error::Query(
+                "$merge whenMatched pipelines are not supported".into(),
+            ));
+        }
+        Some(_) => {
+            return Err(Error::Query("$merge `whenMatched` must be a string".into()));
+        }
+    };
+    let when_not_matched = match obj.get("whenNotMatched") {
+        None => MergeWhenNotMatched::Insert,
+        Some(Value::String(value)) => match value.as_str() {
+            "insert" => MergeWhenNotMatched::Insert,
+            "discard" => MergeWhenNotMatched::Discard,
+            "fail" => MergeWhenNotMatched::Fail,
+            _ => {
+                return Err(Error::Query(format!(
+                    "unsupported $merge whenNotMatched mode `{value}`"
+                )));
+            }
+        },
+        Some(_) => {
+            return Err(Error::Query(
+                "$merge `whenNotMatched` must be a string".into(),
+            ));
+        }
+    };
+    Ok(Some(AggregateWriteSpec {
+        kind: AggregateWriteKind::Merge,
+        target,
+        database,
+        on,
+        when_matched,
+        when_not_matched,
+    }))
+}
+
 /// Parts of a pipeline that can be pushed into the normal `find_in` path.
 #[derive(Debug, Default)]
 pub(crate) struct Pushdown {
@@ -513,6 +708,11 @@ pub(crate) fn run_with_host_vars(
                 "$fill" => {
                     docs = fill(docs, arg, vars)?;
                     i += 1;
+                }
+                "$out" | "$merge" => {
+                    return Err(Error::Query(format!(
+                        "{name} must be executed by the writer"
+                    )));
                 }
                 "$facet" => {
                     let Some(facets) = arg.as_object() else {
@@ -4259,5 +4459,36 @@ mod tests {
     fn rejects_unknown_stage() {
         let err = run(vec![], &[json!({"$geoNear": {}})], 100).unwrap_err();
         assert!(err.to_string().contains("unsupported aggregation stage"));
+    }
+
+    #[test]
+    fn parses_write_stage_contracts() {
+        let spec = write_stage_spec(&[json!({"$out": "target"})])
+            .unwrap()
+            .unwrap();
+        assert_eq!(spec.kind, AggregateWriteKind::Out);
+        assert_eq!(spec.target, "target");
+        assert_eq!(spec.database, None);
+
+        let spec = write_stage_spec(&[json!({"$merge": {
+            "into": {"db": "app", "coll": "target"},
+            "on": ["tenant", "email"],
+            "whenMatched": "keepExisting",
+            "whenNotMatched": "discard"
+        }})])
+        .unwrap()
+        .unwrap();
+        assert_eq!(spec.kind, AggregateWriteKind::Merge);
+        assert_eq!(spec.database.as_deref(), Some("app"));
+        assert_eq!(spec.on, vec!["tenant", "email"]);
+        assert_eq!(spec.when_matched, MergeWhenMatched::KeepExisting);
+        assert_eq!(spec.when_not_matched, MergeWhenNotMatched::Discard);
+
+        assert!(write_stage_spec(&[json!({"$out": "target"}), json!({"$match": {}})]).is_err());
+        assert!(write_stage_spec(&[json!({"$merge": {
+            "into": "target",
+            "whenMatched": [{"$set": {"x": 1}}]
+        }})])
+        .is_err());
     }
 }

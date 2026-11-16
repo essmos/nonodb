@@ -541,6 +541,332 @@ fn emit_by_id(
     )
 }
 
+fn aggregate_target<'a>(
+    store: &'a Store,
+    wtxn: &mut nonodb_core::heed::RwTxn<'_>,
+    target: &str,
+) -> Result<Collection<'a>, ApiError> {
+    if target == events::EVENTS_COLLECTION {
+        return Err(ApiError {
+            code: "invalid_query".into(),
+            message: "$out/$merge cannot write to the internal `_events` collection".into(),
+        });
+    }
+    standard_collection(store, wtxn, target)
+}
+
+fn merge_needs_unique_index(
+    target: &Collection<'_>,
+    wtxn: &nonodb_core::heed::RwTxn<'_>,
+    on: &[String],
+) -> Result<(), ApiError> {
+    if on.len() == 1 && on[0] == "_id" {
+        return Ok(());
+    }
+    let defs = target.index_defs_in(wtxn)?;
+    let found = defs
+        .iter()
+        .any(|def| def.unique && def.current_format() && def.effective_fields() == on);
+    if found {
+        Ok(())
+    } else {
+        Err(ApiError {
+            code: "invalid_query".into(),
+            message: format!(
+                "$merge requires a unique index on the `on` fields: {}",
+                on.join(", ")
+            ),
+        })
+    }
+}
+
+fn merge_filter(doc: &Value, on: &[String]) -> Result<Value, ApiError> {
+    let mut filter = serde_json::Map::new();
+    for field in on {
+        filter.insert(
+            field.clone(),
+            nonodb_core::query::path::get(doc, field)
+                .cloned()
+                .unwrap_or(Value::Null),
+        );
+    }
+    Ok(Value::Object(filter))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn aggregate_out(
+    store: &Store,
+    wtxn: &mut nonodb_core::heed::RwTxn<'_>,
+    spec: &nonodb_core::aggregate::AggregateWriteSpec,
+    docs: Vec<Value>,
+    replication: &mut ReplicationContext,
+) -> Result<Value, ApiError> {
+    let target = aggregate_target(store, wtxn, &spec.target)?;
+    let config = event_config(store, wtxn, &spec.target)?;
+    let before = target.find_in(
+        &*wtxn,
+        &FindQuery {
+            filter: json!({}),
+            projection: None,
+            sort: Vec::new(),
+            skip: 0,
+            limit: None,
+            comment: None,
+            max_time_ms: None,
+            hint: None,
+        },
+    )?;
+    target.delete_txn(wtxn, &json!({}), true)?;
+    if let Some(config) = &config {
+        for doc in &before {
+            let id = doc
+                .get("_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| ApiError {
+                    code: "invalid_id".into(),
+                    message: "document has no string _id".into(),
+                })?;
+            emit_event(
+                store,
+                wtxn,
+                &spec.target,
+                "delete",
+                id,
+                Some(doc),
+                None,
+                config,
+                replication,
+            )?;
+        }
+    }
+    let mut inserted = 0usize;
+    for doc in docs {
+        let id = target.insert_one_txn(wtxn, doc)?;
+        if let Some(config) = &config {
+            emit_by_id(
+                store,
+                wtxn,
+                &target,
+                &spec.target,
+                "insert",
+                &id,
+                None,
+                config,
+                replication,
+            )?;
+        }
+        inserted += 1;
+    }
+    Ok(json!({
+        "results": [],
+        "target": spec.target,
+        "deleted": before.len(),
+        "inserted": inserted,
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn aggregate_merge(
+    store: &Store,
+    wtxn: &mut nonodb_core::heed::RwTxn<'_>,
+    spec: &nonodb_core::aggregate::AggregateWriteSpec,
+    docs: Vec<Value>,
+    replication: &mut ReplicationContext,
+) -> Result<Value, ApiError> {
+    let target = aggregate_target(store, wtxn, &spec.target)?;
+    merge_needs_unique_index(&target, &*wtxn, &spec.on)?;
+    let config = event_config(store, wtxn, &spec.target)?;
+    let mut matched = 0usize;
+    let mut modified = 0usize;
+    let mut inserted = 0usize;
+    let mut skipped = 0usize;
+    for doc in docs {
+        let Some(obj) = doc.as_object() else {
+            return Err(ApiError {
+                code: "invalid_query".into(),
+                message: "$merge inputs must be objects".into(),
+            });
+        };
+        let filter = merge_filter(&doc, &spec.on)?;
+        let existing = target.find_one_in(&*wtxn, &filter, None)?;
+        if let Some(existing) = existing {
+            matched += 1;
+            let id = existing
+                .get("_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| ApiError {
+                    code: "invalid_id".into(),
+                    message: "document has no string _id".into(),
+                })?
+                .to_string();
+            if let Some(result_id) = obj.get("_id") {
+                if result_id.as_str() != Some(id.as_str()) {
+                    return Err(ApiError {
+                        code: "invalid_query".into(),
+                        message: "$merge cannot change an existing document `_id`".into(),
+                    });
+                }
+            }
+            match spec.when_matched {
+                nonodb_core::aggregate::MergeWhenMatched::KeepExisting => {
+                    skipped += 1;
+                }
+                nonodb_core::aggregate::MergeWhenMatched::Fail => {
+                    return Err(ApiError {
+                        code: "invalid_query".into(),
+                        message: "$merge matched an existing document and whenMatched is `fail`"
+                            .into(),
+                    });
+                }
+                nonodb_core::aggregate::MergeWhenMatched::Replace => {
+                    let mut replacement = doc.clone();
+                    replacement
+                        .as_object_mut()
+                        .expect("object checked above")
+                        .insert("_id".to_string(), Value::String(id.clone()));
+                    let update = json!([{"$replaceWith": replacement}]);
+                    let out = target.update_opts_txn_filtered(
+                        wtxn,
+                        &json!({"_id": id}),
+                        &update,
+                        false,
+                        false,
+                        &[],
+                    )?;
+                    modified += out.modified;
+                    if let Some(config) = &config {
+                        emit_by_id(
+                            store,
+                            wtxn,
+                            &target,
+                            &spec.target,
+                            "update",
+                            &id,
+                            Some(&existing),
+                            config,
+                            replication,
+                        )?;
+                    }
+                }
+                nonodb_core::aggregate::MergeWhenMatched::Merge => {
+                    let mut merged = existing.clone();
+                    let merged_obj = merged
+                        .as_object_mut()
+                        .expect("existing document is an object");
+                    for (key, value) in obj {
+                        if key != "_id" {
+                            merged_obj.insert(key.clone(), value.clone());
+                        }
+                    }
+                    let update = json!([{"$replaceWith": merged}]);
+                    let out = target.update_opts_txn_filtered(
+                        wtxn,
+                        &json!({"_id": id}),
+                        &update,
+                        false,
+                        false,
+                        &[],
+                    )?;
+                    modified += out.modified;
+                    if let Some(config) = &config {
+                        emit_by_id(
+                            store,
+                            wtxn,
+                            &target,
+                            &spec.target,
+                            "update",
+                            &id,
+                            Some(&existing),
+                            config,
+                            replication,
+                        )?;
+                    }
+                }
+            }
+        } else {
+            match spec.when_not_matched {
+                nonodb_core::aggregate::MergeWhenNotMatched::Discard => skipped += 1,
+                nonodb_core::aggregate::MergeWhenNotMatched::Fail => {
+                    return Err(ApiError {
+                        code: "invalid_query".into(),
+                        message: "$merge found no matching document and whenNotMatched is `fail`"
+                            .into(),
+                    });
+                }
+                nonodb_core::aggregate::MergeWhenNotMatched::Insert => {
+                    let id = target.insert_one_txn(wtxn, doc)?;
+                    if let Some(config) = &config {
+                        emit_by_id(
+                            store,
+                            wtxn,
+                            &target,
+                            &spec.target,
+                            "insert",
+                            &id,
+                            None,
+                            config,
+                            replication,
+                        )?;
+                    }
+                    inserted += 1;
+                }
+            }
+        }
+    }
+    Ok(json!({
+        "results": [],
+        "target": spec.target,
+        "matched": matched,
+        "modified": modified,
+        "inserted": inserted,
+        "skipped": skipped,
+    }))
+}
+
+fn aggregate_write(
+    store: &Store,
+    wtxn: &mut nonodb_core::heed::RwTxn<'_>,
+    coll: &str,
+    pipeline: &[Value],
+    max_time_ms: Option<u64>,
+    database: &str,
+    replication: &mut ReplicationContext,
+) -> Result<Value, ApiError> {
+    let spec = nonodb_core::aggregate::write_stage_spec(pipeline)?.ok_or_else(|| ApiError {
+        code: "invalid_query".into(),
+        message: "aggregation has no write stage".into(),
+    })?;
+    if let Some(target_database) = &spec.database {
+        if target_database != database {
+            return Err(ApiError {
+                code: "invalid_query".into(),
+                message: "cross-database $out/$merge is not supported".into(),
+            });
+        }
+    }
+    let docs = match store.collection_at(&*wtxn, coll)? {
+        Some(source) => {
+            if source.profile().is_vault() {
+                return Err(vault::unsupported("aggregation on vault collections").into());
+            }
+            source.aggregate_in_with_options(
+                &*wtxn,
+                &pipeline[..pipeline.len() - 1],
+                max_time_ms,
+            )?
+        }
+        None => Vec::new(),
+    };
+    match spec.kind {
+        nonodb_core::aggregate::AggregateWriteKind::Out => {
+            aggregate_out(store, wtxn, &spec, docs, replication)
+        }
+        nonodb_core::aggregate::AggregateWriteKind::Merge => {
+            aggregate_merge(store, wtxn, &spec, docs, replication)
+        }
+    }
+}
+
 fn execute(
     store: &Store,
     wtxn: &mut nonodb_core::heed::RwTxn<'_>,
@@ -1279,6 +1605,20 @@ fn execute(
             let result = prepared.execute_write(&c, wtxn, params)?;
             Ok(json!({ "results": [result] }))
         }
+        WriteReq::Aggregate {
+            coll,
+            pipeline,
+            max_time_ms,
+            database,
+        } => aggregate_write(
+            store,
+            wtxn,
+            coll,
+            pipeline,
+            *max_time_ms,
+            database,
+            replication,
+        ),
         WriteReq::Batch { ops } => {
             let mut results = Vec::with_capacity(ops.len());
             for (idx, op) in ops.iter().enumerate() {
@@ -1294,5 +1634,205 @@ fn execute(
             }
             Ok(json!({ "results": results }))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nonodb_core::{IndexSpec, Store};
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    fn setup() -> (TempDir, Store) {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        (dir, store)
+    }
+
+    fn execute_commit(store: &Store, req: &WriteReq) -> Result<Value, ApiError> {
+        let mut wtxn = store.write_txn().unwrap();
+        let mut replication = ReplicationContext {
+            origin: None,
+            changes: Vec::new(),
+            ops: Vec::new(),
+        };
+        let result = execute(store, &mut wtxn, req, &mut replication);
+        match &result {
+            Ok(_) => wtxn.commit().unwrap(),
+            Err(_) => drop(wtxn),
+        }
+        result
+    }
+
+    fn all(store: &Store, coll: &str) -> Vec<Value> {
+        let c = store.collection(coll).unwrap();
+        c.find(&FindQuery {
+            filter: json!({}),
+            projection: None,
+            sort: vec![("_id".to_string(), 1)],
+            skip: 0,
+            limit: None,
+            comment: None,
+            max_time_ms: None,
+            hint: None,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn out_replaces_target_transactionally() {
+        let (_dir, store) = setup();
+        let source = store.collection("source").unwrap();
+        source
+            .insert_one(json!({"_id": "a", "keep": true, "n": 1}))
+            .unwrap();
+        source
+            .insert_one(json!({"_id": "b", "keep": false, "n": 2}))
+            .unwrap();
+        let target = store.collection("target").unwrap();
+        target.insert_one(json!({"_id": "old", "n": 9})).unwrap();
+
+        let out = execute_commit(
+            &store,
+            &WriteReq::Aggregate {
+                coll: "source".to_string(),
+                pipeline: vec![
+                    json!({"$match": {"keep": true}}),
+                    json!({"$project": {"keep": 1, "n": 1}}),
+                    json!({"$out": "target"}),
+                ],
+                max_time_ms: None,
+                database: "default".to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(out["inserted"], 1);
+        assert_eq!(out["deleted"], 1);
+        let docs = all(&store, "target");
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0]["keep"], true);
+        assert_eq!(docs[0]["n"], 1);
+        assert!(docs[0].get("_id").is_some());
+
+        let source_docs = all(&store, "source");
+        assert_eq!(source_docs.len(), 2);
+    }
+
+    #[test]
+    fn merge_updates_inserts_and_preserves_unique_index() {
+        let (_dir, store) = setup();
+        let source = store.collection("source").unwrap();
+        source
+            .insert_one(json!({"k": 1, "val": 2, "extra": "x"}))
+            .unwrap();
+        source.insert_one(json!({"k": 2, "val": 3})).unwrap();
+        source.insert_one(json!({"k": 3, "val": 4})).unwrap();
+        let target = store.collection("target").unwrap();
+        target
+            .insert_one(json!({"_id": "old", "k": 1, "keep": true, "val": 1}))
+            .unwrap();
+        target
+            .create_indexes(&[IndexSpec {
+                fields: vec!["k".to_string()],
+                unique: true,
+                include: Vec::new(),
+                geo: false,
+            }])
+            .unwrap();
+
+        let out = execute_commit(
+            &store,
+            &WriteReq::Aggregate {
+                coll: "source".to_string(),
+                pipeline: vec![
+                    json!({"$unset": "_id"}),
+                    json!({"$merge": {
+                        "into": "target",
+                        "on": "k",
+                        "whenMatched": "merge",
+                        "whenNotMatched": "insert"
+                    }}),
+                ],
+                max_time_ms: None,
+                database: "default".to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(out["matched"], 1);
+        assert_eq!(out["inserted"], 2);
+        let docs = all(&store, "target");
+        assert_eq!(docs.len(), 3);
+        let first = docs.iter().find(|doc| doc["k"] == 1).unwrap();
+        assert_eq!(first["_id"], "old");
+        assert_eq!(first["keep"], true);
+        assert_eq!(first["val"], 2);
+        assert_eq!(first["extra"], "x");
+
+        let out = execute_commit(
+            &store,
+            &WriteReq::Aggregate {
+                coll: "source".to_string(),
+                pipeline: vec![
+                    json!({"$unset": "_id"}),
+                    json!({"$merge": {
+                        "into": "target",
+                        "on": "k",
+                        "whenMatched": "replace",
+                        "whenNotMatched": "discard"
+                    }}),
+                ],
+                max_time_ms: None,
+                database: "default".to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(out["matched"], 3);
+        assert_eq!(out["inserted"], 0);
+        assert_eq!(out["skipped"], 0);
+        let docs = all(&store, "target");
+        assert_eq!(docs.len(), 3);
+        let first = docs.iter().find(|doc| doc["k"] == 1).unwrap();
+        assert_eq!(first["_id"], "old");
+        assert_eq!(first["val"], 2);
+        assert!(first.get("keep").is_none());
+    }
+
+    #[test]
+    fn merge_failures_abort_the_transaction() {
+        let (_dir, store) = setup();
+        let source = store.collection("source").unwrap();
+        source.insert_one(json!({"_id": "s1", "k": 1})).unwrap();
+        let target = store.collection("target").unwrap();
+        target.insert_one(json!({"_id": "old", "k": 1})).unwrap();
+        target
+            .create_indexes(&[IndexSpec {
+                fields: vec!["k".to_string()],
+                unique: true,
+                include: Vec::new(),
+                geo: false,
+            }])
+            .unwrap();
+
+        let result = execute_commit(
+            &store,
+            &WriteReq::Aggregate {
+                coll: "source".to_string(),
+                pipeline: vec![
+                    json!({"$unset": "_id"}),
+                    json!({"$merge": {
+                        "into": "target",
+                        "on": "k",
+                        "whenMatched": "fail"
+                    }}),
+                ],
+                max_time_ms: None,
+                database: "default".to_string(),
+            },
+        );
+        assert!(result.is_err());
+        let docs = all(&store, "target");
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0]["_id"], "old");
     }
 }
