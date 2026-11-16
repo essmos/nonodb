@@ -129,6 +129,58 @@ exclude matches, and at least one positive clause is required. `$meta:
 lowercase/diacritic-folding tokenization without stemming or stop-word removal,
 so ranking and language behavior are approximate rather than MongoDB-identical.
 
+### Tenant IDs and encryption
+
+`tenant_id` is a normal field in a standard collection. It provides logical
+partitioning and can be indexed, but it does not encrypt documents:
+
+```python
+db.orders.create_index([("tenant_id", 1), ("created_at", -1)])
+db.orders.find({"tenant_id": "acme"})
+```
+
+NonoDB vault collections (`profile: "vault"`) are different. They encrypt the
+whole document and require three per-request headers:
+`X-NonoDB-Tenant`, `X-NonoDB-Key-Id`, and `X-NonoDB-Key`. The MongoDB wire
+protocol and SCRAM handshake have no place to carry a per-request tenant key.
+MongoDB URI options, `authSource`, and SCRAM credentials are not vault keys.
+Use the Mongo wire listener only with standard collections. Do not use it
+against vault collections: writes are rejected, reads do not decrypt vault
+envelopes, and vault collections do not expose secondary, text, or aggregation
+operations.
+
+| Goal | Supported path |
+|---|---|
+| Plain `tenant_id` partitioning through a MongoDB driver | ✅ Standard collection; create a compound index beginning with `tenant_id` |
+| NonoDB-managed whole-document encryption | ✅ Native NonoDB client or HTTP/JSON API with the three vault headers; see [Vault collections](vault.md) |
+| One MongoDB driver and encrypted sensitive fields | ✅ Encrypt payloads in the application before `insert`, update, or replace |
+| MongoDB driver talking directly to a `profile: "vault"` collection | ❌ The wire listener does not carry vault headers |
+
+For application-level encryption, keep the tenant key outside the database and
+store only ciphertext plus plaintext routing metadata:
+
+```python
+record = {
+    "tenant_id": "acme",
+    "key_id": "acme:v1",
+    "created_at": now,
+    "payload_ct": encrypt(tenant_key, {"iban": "PL...", "ssn": "..."}),
+}
+db.secrets.insert_one(record)
+```
+
+This works through the MongoDB driver and remains portable to MongoDB. Filter
+and index on plaintext fields such as `tenant_id`; encrypted fields cannot be
+used in filters, `$text`, aggregation, or indexes. Do not put tenant keys in the
+MongoDB URI, document bodies, logs, or backups.
+
+If an application must use one MongoDB driver and also needs NonoDB vault
+semantics, the options are to use the native client/HTTP API for the vault
+collection, or to put a translating proxy in front of NonoDB that injects the
+vault headers. A proxy is not part of NonoDB. Direct driver support would
+require a new per-tenant authentication and key-transport design; the current
+single SCRAM account and wire protocol do not provide one.
+
 Driver-facing options are checked instead of silently ignored. The listener
 accepts non-empty `filter` documents for `listCollections` and `listDatabases`,
 and honors `nameOnly` for both. It accepts `readConcern` levels `local` and
@@ -453,6 +505,11 @@ A migration from MongoDB to NonoDB should check these items first:
 10. **Wire-protocol tooling** — `mongosh`, BI connectors, and monitoring
     integrations that need more than basic insert/find must use another
     interface until the wire listener grows.
+11. **Tenant encryption** — `tenant_id` is not encryption. MongoDB drivers can
+    use standard collections with plaintext `tenant_id`, or encrypt payloads in
+    the application. NonoDB vault collections require the native client/HTTP
+    API and vault headers; they are not available through the MongoDB wire
+    listener.
 
 See [Migration and import](migration.md) for the import workflow and
 [Roadmap and limits](roadmap.md) for planned compatibility work.
