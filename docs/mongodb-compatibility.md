@@ -32,7 +32,7 @@ The assessment below is verified against NonoDB `0.25.x`.
 | Aggregation expressions | ~70% | Broad but not exhaustive; no IANA time zones or user-defined JavaScript |
 | Indexes | ~65% | No sparse/partial/wildcard indexes, collation, or TTL index options |
 | BSON scalar types | ~75% | ObjectId `_id`, Date, Decimal128, Binary/UUID and numeric mapping; no Timestamp/MinKey/MaxKey |
-| Wire protocol and drivers | ~45% | Experimental handshake plus CRUD, cursors, count, distinct, aggregate, index DDL, and collection DDL; no auth, sessions, or transactions |
+| Wire protocol and drivers | ~50% | Experimental handshake plus CRUD, sorted cursors, count, distinct, aggregate, index DDL, collection DDL, and dropDatabase; no auth, sessions, or transactions |
 | Transactions and change streams | ~10% | Atomic write batches and outbox events exist, but not MongoDB APIs |
 
 These percentages are editorial estimates of the language/API surface that a
@@ -71,16 +71,19 @@ Set `NONODB_MONGO_ADDR=127.0.0.1:27017` and connect with a MongoDB driver using
 | `update` / `delete` / `findAndModify` | ✅ |
 | `count` / `distinct` / basic `aggregate` | ✅ |
 | `createIndexes` / `listIndexes` / `dropIndexes` | ✅ |
-| `create` / `drop` / `listCollections` / `listDatabases` | ✅ |
+| `create` / `drop` / `listCollections` / `listDatabases` / `dropDatabase` | ✅ |
 | SCRAM authentication / TLS client auth | ❌ |
 | Sessions / transactions / change streams | ❌ |
 
-`find` currently sorts only by `_id` on the wire. Index direction is accepted
-but NonoDB stores the field order, not ascending/descending direction. Custom
-MongoDB index names are rejected; use default names. `aggregate` returns the
-full result in the first batch; use the HTTP aggregation API or cursors for
-very large result sets. Upserts without an `_id` in the filter currently
-receive the core UUID rather than a driver-style ObjectId.
+`dropDatabase` cannot remove the built-in `default` database. Wire `find`
+supports arbitrary sort keys; `_id`/natural order uses fast keyset paging,
+while other sort keys use skip-based cursor paging and re-sort each batch.
+Index direction is accepted but NonoDB stores the field order, not
+ascending/descending direction. Custom MongoDB index names are rejected; use
+default names. `aggregate` returns the full result in the first batch; use the
+HTTP aggregation API or cursors for very large result sets. Upserts without an
+`_id` in the filter currently receive the core UUID rather than a
+driver-style ObjectId.
 
 ## CRUD
 

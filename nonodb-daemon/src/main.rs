@@ -1632,25 +1632,39 @@ fn cursor_page(
     }
     let ascending = state.ascending();
     let filter = match &kind {
-        cursor::Kind::Find { filter, .. } => {
-            cursor_filter(filter, state.last_id.as_ref(), ascending)
+        cursor::Kind::Find { filter, sort, .. } => {
+            let id_only = sort.is_empty()
+                || (sort.len() == 1 && matches!(sort[0].0.as_str(), "_id" | "$natural"));
+            if id_only {
+                cursor_filter(filter, state.last_id.as_ref(), ascending)
+            } else {
+                filter.clone()
+            }
         }
         cursor::Kind::Aggregate { filter, .. } => {
             cursor_filter(filter, state.last_id.as_ref(), ascending)
         }
     };
-    let (comment, max_time_ms, hint) = match &kind {
+    let (comment, max_time_ms, hint, sort) = match &kind {
         cursor::Kind::Find {
             comment,
             max_time_ms,
             hint,
+            sort,
             ..
-        } => (comment.clone(), *max_time_ms, hint.clone()),
+        } => (comment.clone(), *max_time_ms, hint.clone(), sort.clone()),
         cursor::Kind::Aggregate {
             comment,
             max_time_ms,
             ..
-        } => (comment.clone(), *max_time_ms, None),
+        } => (comment.clone(), *max_time_ms, None, Vec::new()),
+    };
+    let id_only =
+        sort.is_empty() || (sort.len() == 1 && matches!(sort[0].0.as_str(), "_id" | "$natural"));
+    let sort = if id_only {
+        vec![("_id".to_string(), if ascending { 1 } else { -1 })]
+    } else {
+        sort
     };
     let deadline = max_time_ms
         .filter(|ms| *ms > 0)
@@ -1659,7 +1673,7 @@ fn cursor_page(
     let query = FindQuery {
         filter,
         projection: None,
-        sort: vec![("_id".to_string(), if ascending { 1 } else { -1 })],
+        sort,
         skip: state.skip,
         limit: Some(fetch),
         comment,
@@ -1667,11 +1681,16 @@ fn cursor_page(
         hint,
     };
     let docs = c.find(&query)?;
-    state.skip = 0;
     if docs.is_empty() {
+        state.skip = 0;
         return Ok((Vec::new(), false));
     }
-    state.last_id = docs.last().and_then(|doc| doc.get("_id").cloned());
+    if id_only {
+        state.skip = 0;
+        state.last_id = docs.last().and_then(|doc| doc.get("_id").cloned());
+    } else {
+        state.skip = state.skip.saturating_add(docs.len());
+    }
     if let Some(remaining) = &mut state.remaining {
         *remaining = remaining.saturating_sub(docs.len());
     }
@@ -2812,6 +2831,7 @@ async fn exec_inner(
                 filter: normalize_filter(filter),
                 projection,
                 ascending,
+                sort,
                 skip,
                 comment,
                 max_time_ms,

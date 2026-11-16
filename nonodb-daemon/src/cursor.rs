@@ -1,9 +1,10 @@
 //! Server-side cursors for bounded, resumable reads.
 //!
 //! Cursors page by `_id`, which keeps memory bounded and avoids holding an LMDB
-//! read transaction across HTTP requests. Find cursors support `_id` ordering;
-//! aggregation cursors support only document-local stages after an optional
-//! leading `$match` (no `$group`, `$unwind`, or non-`_id` `$sort`).
+//! read transaction across HTTP requests. Find cursors use fast `_id` keyset
+//! paging for `_id`/natural order and skip-based paging for other sort keys.
+//! Aggregation cursors support only document-local stages after an optional
+//! leading `$match` (no `$group`, `$unwind`, or `$sort`).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -24,6 +25,7 @@ pub enum Kind {
         filter: Value,
         projection: Option<Value>,
         ascending: bool,
+        sort: Vec<(String, i32)>,
         skip: usize,
         comment: Option<String>,
         max_time_ms: Option<u64>,
@@ -188,6 +190,7 @@ mod tests {
                 filter: json!({}),
                 projection: None,
                 ascending: true,
+                sort: Vec::new(),
                 skip: 0,
                 comment: None,
                 max_time_ms: None,

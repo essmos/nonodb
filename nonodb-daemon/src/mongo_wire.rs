@@ -134,6 +134,7 @@ async fn dispatch_command(
         Some("drop") => drop_collection_command(state, body).await,
         Some("listCollections") => list_collections_command(state, body).await,
         Some("listDatabases") => list_databases_command(state).await,
+        Some("dropDatabase") => drop_database_command(state, body).await,
         Some("endSessions") | Some("refreshSessions") => Ok(doc_ok()),
         Some("ping")
         | Some("hello")
@@ -831,6 +832,20 @@ async fn list_collections_command(
     Ok(cursor_reply(0, &namespace, batch, true))
 }
 
+async fn drop_database_command(
+    state: &super::AppState,
+    body: &Document,
+) -> Result<Document, ApiError> {
+    let database = database_name(body);
+    match state.databases.drop_database(&database).await {
+        Ok(_) => Ok(bson::doc! {
+            "dropped": database,
+            "ok": 1.0,
+        }),
+        Err(error) => Err(error),
+    }
+}
+
 async fn list_databases_command(state: &super::AppState) -> Result<Document, ApiError> {
     let names = state.databases.names().await;
     let mut databases = Vec::with_capacity(names.len());
@@ -1176,7 +1191,8 @@ async fn find_command(
     } else {
         None
     };
-    let ascending = sort_direction(body)?;
+    let sort = sort_fields(body)?;
+    let ascending = id_sort_ascending(&sort)?;
     let skip = non_negative(body, "skip")?.unwrap_or(0);
     let raw_limit = int_field(body, "limit").unwrap_or(0);
     let single_batch = body.get_bool("singleBatch").unwrap_or(false) || raw_limit < 0;
@@ -1204,6 +1220,7 @@ async fn find_command(
             filter,
             projection,
             ascending,
+            sort,
             skip,
             comment,
             max_time_ms,
@@ -1366,27 +1383,11 @@ fn non_negative(body: &Document, field: &str) -> Result<Option<usize>, ApiError>
     }
 }
 
-fn sort_direction(body: &Document) -> Result<bool, ApiError> {
-    let Some(value) = body.get("sort") else {
-        return Ok(true);
-    };
-    let Bson::Document(sort) = value else {
-        return Err(bad_value("sort must be a document"));
-    };
-    if sort.is_empty() {
-        return Ok(true);
-    }
-    if sort.len() != 1 {
-        return Err(bad_value(
-            "Mongo wire find currently supports sorting only by _id",
-        ));
-    }
-    match sort.get("_id").and_then(bson_int) {
-        Some(1) => Ok(true),
-        Some(-1) => Ok(false),
-        _ => Err(bad_value(
-            "Mongo wire find currently supports sorting only by _id",
-        )),
+fn id_sort_ascending(sort: &[(String, i32)]) -> Result<bool, ApiError> {
+    match sort {
+        [] => Ok(true),
+        [(field, direction)] if matches!(field.as_str(), "_id" | "$natural") => Ok(*direction > 0),
+        _ => Ok(true),
     }
 }
 
@@ -1797,9 +1798,13 @@ mod tests {
 
     #[test]
     fn find_sort_support_is_explicit() {
-        assert!(sort_direction(&bson::doc! { "sort": { "_id": 1 } }).unwrap());
-        assert!(!sort_direction(&bson::doc! { "sort": { "_id": -1 } }).unwrap());
-        assert!(sort_direction(&bson::doc! { "sort": { "name": 1 } }).is_err());
+        assert!(id_sort_ascending(&[("_id".into(), 1)]).unwrap());
+        assert!(!id_sort_ascending(&[("_id".into(), -1)]).unwrap());
+        assert!(id_sort_ascending(&[("name".into(), 1)]).unwrap());
+        assert_eq!(
+            sort_fields(&bson::doc! { "sort": { "name": 1, "_id": -1 } }).unwrap(),
+            vec![("name".into(), 1), ("_id".into(), -1)]
+        );
     }
 
     #[test]

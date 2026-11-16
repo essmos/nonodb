@@ -45,6 +45,25 @@ def main() -> int:
         assert changed["n"] == 2
         assert coll.find_one_and_delete({"_id": "fm"})["n"] == 2
 
+        sort_coll = db[f"sort_smoke_{os.getpid()}"]
+        sort_coll.insert_many([{"n": i, "m": i % 2} for i in range(7)])
+        assert [doc["n"] for doc in sort_coll.find({}, sort=[("n", -1)], batch_size=2)] == [
+            6,
+            5,
+            4,
+            3,
+            2,
+            1,
+            0,
+        ]
+        assert [
+            doc["n"]
+            for doc in sort_coll.find(
+                {}, sort=[("m", 1), ("n", -1)], skip=1, limit=4, batch_size=2
+            )
+        ] == [4, 2, 0, 5]
+        sort_coll.drop()
+
         ddl_name = f"ddl_smoke_{uuid.uuid4().hex[:8]}"
         ddl = db.create_collection(ddl_name)
         assert ddl_name in db.list_collection_names()
@@ -53,6 +72,13 @@ def main() -> int:
         ddl.drop()
         assert ddl_name not in db.list_collection_names()
         assert db.name in client.list_database_names()
+
+        dropdb_name = f"dropdb_smoke_{uuid.uuid4().hex[:8]}"
+        dropdb = client[dropdb_name]
+        dropdb.items.insert_one({"drop": True})
+        assert dropdb_name in client.list_database_names()
+        client.drop_database(dropdb_name)
+        assert dropdb_name not in client.list_database_names()
 
         assert coll.create_index("group") == "group_1"
         index_names = [index["name"] for index in coll.list_indexes()]
