@@ -80,9 +80,9 @@ secrets.
 | `NONODB_ALLOWED_GIDS` | — | Comma-separated Unix gid allow-list for UDS |
 | `NONODB_TCP` | — | TCP listen address, e.g. `127.0.0.1:7878` |
 | `NONODB_MONGO_ADDR` | — | Experimental MongoDB wire listener, e.g. `127.0.0.1:27017`. Supports handshake, CRUD, cursors, count, distinct, aggregate, index DDL, collection DDL, and `dropDatabase`; no sessions or transactions |
-| `NONODB_MONGO_USERNAME` | — | MongoDB wire username. Requires `NONODB_MONGO_PASSWORD`; enabling auth requires SCRAM-SHA-256 for every non-handshake command |
+| `NONODB_MONGO_USERNAME` | — | MongoDB wire username. Requires `NONODB_MONGO_PASSWORD`; enabling auth requires SCRAM-SHA-256 or SCRAM-SHA-1 for every non-handshake command |
 | `NONODB_MONGO_PASSWORD` | — | MongoDB wire password. Grants instance-wide administrative access over the experimental listener |
-| `NONODB_MONGO_SCRAM_ITERATIONS` | `15000` | SCRAM-SHA-256 PBKDF2 iteration count, 4096..1000000 |
+| `NONODB_MONGO_SCRAM_ITERATIONS` | `15000` | SCRAM PBKDF2 iteration count for both mechanisms, 4096..1000000 |
 | `NONODB_MONGO_TLS_CERT` | — | PEM certificate chain for the MongoDB listener. Requires `NONODB_MONGO_TLS_KEY` |
 | `NONODB_MONGO_TLS_KEY` | — | PEM private key for the MongoDB listener. Requires `NONODB_MONGO_TLS_CERT` |
 | `NONODB_TLS_CERT` | — | PEM certificate chain for TCP TLS |

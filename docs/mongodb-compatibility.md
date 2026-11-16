@@ -5,7 +5,7 @@ practical map, not a claim of drop-in replacement.
 
 > **Short answer:** NonoDB is an HTTP/JSON document database with a MongoDB-like
 > query language. It also has an **experimental MongoDB wire listener** for a
-> practical CRUD subset, with optional SCRAM-SHA-256 authentication. That
+> practical CRUD subset, with optional SCRAM-SHA-256/SHA-1 authentication. That
 > listener is not a drop-in MongoDB replacement: it does not yet implement
 > sessions, transactions, or change streams. The HTTP API and the
 > Python/Rust/Node.js/Go clients remain the supported interfaces.
@@ -49,9 +49,9 @@ direct migration target.
 | Feature | Status | Notes |
 |---|---|---|
 | MongoDB wire protocol | 🟡 | Experimental listener with handshake, CRUD, cursors, count, distinct, aggregate, index DDL, and collection DDL; no sessions or auth |
-| Official MongoDB drivers | 🟡 | PyMongo smoke-tested for CRUD, cursors, count, distinct, aggregate, index DDL, collection DDL, and SCRAM-SHA-256 auth |
+| Official MongoDB drivers | 🟡 | PyMongo smoke-tested for CRUD, cursors, count, distinct, aggregate, index DDL, collection DDL, and SCRAM auth |
 | `mongosh` | ❌ | Use the NonoDB CLI, GUI, or HTTP API |
-| MongoDB URI / `mongodb://` | 🟡 | Single direct connection to `NONODB_MONGO_ADDR`; username/password works with SCRAM-SHA-256 when configured; no replica-set URIs |
+| MongoDB URI / `mongodb://` | 🟡 | Single direct connection to `NONODB_MONGO_ADDR`; username/password works with SCRAM-SHA-256 or SCRAM-SHA-1 when configured; no replica-set URIs |
 | Sessions | ❌ | No server sessions or causal consistency |
 | Retryable writes | ❌ | Writes are routed to the single writer |
 | Change streams | ❌ | Outbox events, `watch`, and subscriptions are separate APIs |
@@ -64,9 +64,11 @@ direct migration target.
 Set `NONODB_MONGO_ADDR=127.0.0.1:27017` and connect with a MongoDB driver using
 `directConnection=true`. The listener is experimental. By default it is
 unauthenticated; set both `NONODB_MONGO_USERNAME` and
-`NONODB_MONGO_PASSWORD` to require SCRAM-SHA-256 authentication. The configured
-account has instance-wide administrative access over the wire listener, so use
-loopback or a trusted private network. To terminate TLS, set both
+`NONODB_MONGO_PASSWORD` to require SCRAM authentication. Both
+`SCRAM-SHA-256` and legacy `SCRAM-SHA-1` are supported; drivers normally choose
+SHA-256. The configured account has instance-wide administrative access over the
+wire listener, so use loopback or a trusted private network. To terminate TLS,
+set both
 `NONODB_MONGO_TLS_CERT` and `NONODB_MONGO_TLS_KEY`, then connect with
 `tls=true`. Client-certificate authentication and hot certificate reload are not
 implemented for this listener.
@@ -79,7 +81,7 @@ implemented for this listener.
 | `count` / `distinct` / basic `aggregate` | ✅ |
 | `createIndexes` / `listIndexes` / `dropIndexes` | ✅ |
 | `create` / `drop` / `listCollections` / `listDatabases` / `dropDatabase` | ✅ |
-| SCRAM-SHA-256 authentication / TLS | 🟡 | Optional username/password auth and server TLS; no SCRAM-SHA-1 or client-certificate auth |
+| SCRAM-SHA-256 / SHA-1 authentication / TLS | 🟡 | Optional username/password auth and server TLS; no client-certificate auth |
 | Sessions / transactions / change streams | ❌ |
 
 `dropDatabase` cannot remove the built-in `default` database. Wire `find`

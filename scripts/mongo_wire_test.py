@@ -27,7 +27,11 @@ def main() -> int:
         url += ("&" if "?" in url else "?") + "authSource=admin"
     if os.environ.get("NONODB_MONGO_TLS", "").lower() in ("1", "true", "yes") and "tls=" not in url:
         url += "&tls=true&tlsAllowInvalidCertificates=true"
-    client = MongoClient(url, serverSelectionTimeoutMS=3000)
+    options = {"serverSelectionTimeoutMS": 3000}
+    mechanism = os.environ.get("NONODB_MONGO_AUTH_MECHANISM")
+    if mechanism:
+        options["authMechanism"] = mechanism
+    client = MongoClient(url, **options)
     db = client.mongo_wire_smoke
     coll = db[f"items_{os.getpid()}"]
     try:

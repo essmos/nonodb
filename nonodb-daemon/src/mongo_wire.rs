@@ -36,7 +36,8 @@ const MAX_MESSAGE_BYTES: usize = 48_000_000;
 const MAX_BSON_BYTES: i32 = 16 * 1024 * 1024;
 const MAX_WRITE_BATCH_SIZE: i32 = 100_000;
 const MAX_WIRE_VERSION: i32 = 9;
-const SCRAM_MECHANISM: &str = "SCRAM-SHA-256";
+const SCRAM_SHA256: &str = "SCRAM-SHA-256";
+const SCRAM_SHA1: &str = "SCRAM-SHA-1";
 const SCRAM_ITERATIONS_DEFAULT: u32 = 15_000;
 static NEXT_RESPONSE_ID: AtomicI32 = AtomicI32::new(1);
 static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
@@ -47,13 +48,92 @@ struct Message {
     body: Document,
 }
 
+#[derive(Clone, Copy)]
+enum ScramMechanism {
+    Sha256,
+    Sha1,
+}
+
+impl ScramMechanism {
+    fn parse(name: &str) -> Option<Self> {
+        match name {
+            SCRAM_SHA256 => Some(Self::Sha256),
+            SCRAM_SHA1 => Some(Self::Sha1),
+            _ => None,
+        }
+    }
+
+    fn hash(self, data: &[u8]) -> Vec<u8> {
+        let algorithm = match self {
+            Self::Sha256 => &ring::digest::SHA256,
+            Self::Sha1 => &ring::digest::SHA1_FOR_LEGACY_USE_ONLY,
+        };
+        ring::digest::digest(algorithm, data).as_ref().to_vec()
+    }
+
+    fn hmac(self, key: &[u8], data: &[u8]) -> Vec<u8> {
+        let algorithm = match self {
+            Self::Sha256 => ring::hmac::HMAC_SHA256,
+            Self::Sha1 => ring::hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY,
+        };
+        let key = ring::hmac::Key::new(algorithm, key);
+        ring::hmac::sign(&key, data).as_ref().to_vec()
+    }
+
+    fn pbkdf2(self, iterations: NonZeroU32, salt: &[u8], password: &[u8]) -> Vec<u8> {
+        let algorithm = match self {
+            Self::Sha256 => ring::pbkdf2::PBKDF2_HMAC_SHA256,
+            Self::Sha1 => ring::pbkdf2::PBKDF2_HMAC_SHA1,
+        };
+        let mut out = vec![0u8; self.hash_len()];
+        ring::pbkdf2::derive(algorithm, iterations, salt, password, &mut out);
+        out
+    }
+
+    fn hash_len(self) -> usize {
+        match self {
+            Self::Sha256 => 32,
+            Self::Sha1 => 20,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ScramCredential {
+    salt: Vec<u8>,
+    iterations: u32,
+    stored_key: Vec<u8>,
+    server_key: Vec<u8>,
+}
+
+impl ScramCredential {
+    fn new(
+        mechanism: ScramMechanism,
+        password: &[u8],
+        salt: Vec<u8>,
+        iterations: u32,
+    ) -> Result<Self, String> {
+        let iterations = NonZeroU32::new(iterations)
+            .filter(|value| value.get() >= 4_096)
+            .ok_or_else(|| "SCRAM iteration count is too small".to_string())?;
+        let salted = mechanism.pbkdf2(iterations, &salt, password);
+        let client_key = mechanism.hmac(&salted, b"Client Key");
+        let stored_key = mechanism.hash(&client_key);
+        let server_key = mechanism.hmac(&salted, b"Server Key");
+        Ok(Self {
+            salt,
+            iterations: iterations.get(),
+            stored_key,
+            server_key,
+        })
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct MongoAuth {
     username: String,
-    salt: Vec<u8>,
-    iterations: u32,
-    stored_key: [u8; 32],
-    server_key: [u8; 32],
+    sha256: ScramCredential,
+    sha1: ScramCredential,
 }
 
 impl MongoAuth {
@@ -77,40 +157,55 @@ impl MongoAuth {
             .and_then(|value| value.parse::<u32>().ok())
             .filter(|value| (4_096..=1_000_000).contains(value))
             .unwrap_or(SCRAM_ITERATIONS_DEFAULT);
-        let mut salt = [0u8; 16];
-        ring::rand::SystemRandom::new()
-            .fill(&mut salt)
+        let mut sha256_salt = [0u8; 16];
+        let mut sha1_salt = [0u8; 16];
+        let random = ring::rand::SystemRandom::new();
+        random
+            .fill(&mut sha256_salt)
+            .and_then(|_| random.fill(&mut sha1_salt))
             .map_err(|_| "cannot generate MongoDB SCRAM salt".to_string())?;
-        Self::new_with_salt(username, &password, salt.to_vec(), iterations).map(Some)
+        Self::new_with_salts(
+            username,
+            &password,
+            sha256_salt.to_vec(),
+            sha1_salt.to_vec(),
+            iterations,
+        )
+        .map(Some)
     }
 
-    fn new_with_salt(
+    fn new_with_salts(
         username: String,
         password: &str,
-        salt: Vec<u8>,
+        sha256_salt: Vec<u8>,
+        sha1_salt: Vec<u8>,
         iterations: u32,
     ) -> Result<Self, String> {
-        let iterations = NonZeroU32::new(iterations)
-            .filter(|value| value.get() >= 4_096)
-            .ok_or_else(|| "SCRAM iteration count is too small".to_string())?;
-        let mut salted = [0u8; 32];
-        ring::pbkdf2::derive(
-            ring::pbkdf2::PBKDF2_HMAC_SHA256,
-            iterations,
-            &salt,
+        let sha256 = ScramCredential::new(
+            ScramMechanism::Sha256,
             password.as_bytes(),
-            &mut salted,
-        );
-        let client_key = hmac_sha256(&salted, b"Client Key");
-        let stored_key = sha256(&client_key);
-        let server_key = hmac_sha256(&salted, b"Server Key");
+            sha256_salt,
+            iterations,
+        )?;
+        let digest = format!("{:x}", md5::compute(format!("{username}:mongo:{password}")));
+        let sha1 = ScramCredential::new(
+            ScramMechanism::Sha1,
+            digest.as_bytes(),
+            sha1_salt,
+            iterations,
+        )?;
         Ok(Self {
             username,
-            salt,
-            iterations: iterations.get(),
-            stored_key,
-            server_key,
+            sha256,
+            sha1,
         })
+    }
+
+    fn credential(&self, mechanism: ScramMechanism) -> &ScramCredential {
+        match mechanism {
+            ScramMechanism::Sha256 => &self.sha256,
+            ScramMechanism::Sha1 => &self.sha1,
+        }
     }
 }
 
@@ -147,6 +242,7 @@ struct WireSession {
 
 struct ScramChallenge {
     conversation_id: i32,
+    mechanism: ScramMechanism,
     client_first_bare: String,
     server_first: String,
     nonce: String,
@@ -168,7 +264,7 @@ pub async fn serve(
         tracing::warn!(
             %addr,
             bound = %bound,
-            mechanism = SCRAM_MECHANISM,
+            mechanism = "SCRAM-SHA-256,SCRAM-SHA-1",
             tls = tls_enabled,
             "experimental MongoDB wire listener enabled with SCRAM authentication"
         );
@@ -343,9 +439,10 @@ fn sasl_start_command(
     let mechanism = body
         .get_str("mechanism")
         .map_err(|_| bad_value("saslStart requires a mechanism"))?;
-    if mechanism != SCRAM_MECHANISM {
+    let Some(mechanism) = ScramMechanism::parse(mechanism) else {
         return Err(authentication_failed());
-    }
+    };
+    let credential = auth.credential(mechanism);
     let payload = payload_bytes(body)?;
     let message = std::str::from_utf8(&payload).map_err(|_| authentication_failed())?;
     let mut parts = message.splitn(3, ',');
@@ -375,8 +472,8 @@ fn sasl_start_command(
     let nonce = format!("{client_nonce}{}", URL_SAFE_NO_PAD.encode(random));
     let server_first = format!(
         "r={nonce},s={},i={}",
-        STANDARD.encode(&auth.salt),
-        auth.iterations
+        STANDARD.encode(&credential.salt),
+        credential.iterations
     );
     let conversation_id = session
         .scram
@@ -385,6 +482,7 @@ fn sasl_start_command(
         .unwrap_or(1);
     session.scram = Some(ScramChallenge {
         conversation_id,
+        mechanism,
         client_first_bare: bare.to_string(),
         server_first: server_first.clone(),
         nonce,
@@ -403,6 +501,8 @@ fn sasl_continue_command(
     let Some(challenge) = session.scram.take() else {
         return Err(authentication_failed());
     };
+    let mechanism = challenge.mechanism;
+    let credential = auth.credential(mechanism);
     let conversation_id = int_field(body, "conversationId").unwrap_or(0) as i32;
     if conversation_id != challenge.conversation_id {
         return Err(authentication_failed());
@@ -414,7 +514,7 @@ fn sasl_continue_command(
     let proof = STANDARD
         .decode(&message[proof_at + 3..])
         .map_err(|_| authentication_failed())?;
-    if proof.len() != 32 {
+    if proof.len() != mechanism.hash_len() {
         return Err(authentication_failed());
     }
     let attrs = scram_attrs(without_proof)?;
@@ -430,19 +530,19 @@ fn sasl_continue_command(
         "{},{},{}",
         challenge.client_first_bare, challenge.server_first, without_proof
     );
-    let client_signature = hmac_sha256(&auth.stored_key, auth_message.as_bytes());
-    let mut client_key = [0u8; 32];
-    for (value, signature) in client_key
+    let client_signature = mechanism.hmac(&credential.stored_key, auth_message.as_bytes());
+    let mut client_key = vec![0u8; mechanism.hash_len()];
+    for (value, (proof, signature)) in client_key
         .iter_mut()
-        .zip(proof.iter().zip(client_signature))
+        .zip(proof.iter().zip(client_signature.iter()))
     {
-        *value = signature.0 ^ signature.1;
+        *value = proof ^ signature;
     }
-    let recovered = sha256(&client_key);
-    if !bool::from(recovered.ct_eq(&auth.stored_key)) {
+    let recovered = mechanism.hash(&client_key);
+    if !bool::from(recovered.ct_eq(&credential.stored_key)) {
         return Err(authentication_failed());
     }
-    let server_signature = hmac_sha256(&auth.server_key, auth_message.as_bytes());
+    let server_signature = mechanism.hmac(&credential.server_key, auth_message.as_bytes());
     session.authenticated = true;
     session.user = Some(auth.username.clone());
     let server_final = format!("v={}", STANDARD.encode(server_signature));
@@ -507,21 +607,6 @@ fn scram_unescape(value: &str) -> Result<String, ApiError> {
         }
     }
     Ok(out)
-}
-
-fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
-    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, key);
-    let tag = ring::hmac::sign(&key, data);
-    let mut out = [0u8; 32];
-    out.copy_from_slice(tag.as_ref());
-    out
-}
-
-fn sha256(data: &[u8]) -> [u8; 32] {
-    let digest = ring::digest::digest(&ring::digest::SHA256, data);
-    let mut out = [0u8; 32];
-    out.copy_from_slice(digest.as_ref());
-    out
 }
 
 fn authentication_failed() -> ApiError {
@@ -2052,7 +2137,10 @@ fn hello_reply(auth_enabled: bool) -> Document {
     if auth_enabled {
         doc.insert(
             "saslSupportedMechs",
-            Bson::Array(vec![Bson::String(SCRAM_MECHANISM.to_string())]),
+            Bson::Array(vec![
+                Bson::String(SCRAM_SHA256.to_string()),
+                Bson::String(SCRAM_SHA1.to_string()),
+            ]),
         );
     }
     doc
@@ -2210,6 +2298,7 @@ mod tests {
 
     fn scram_continue(
         auth: &MongoAuth,
+        mechanism: ScramMechanism,
         password: &str,
         client_first: &str,
         server_first: &str,
@@ -2217,22 +2306,19 @@ mod tests {
     ) -> Document {
         let bare = client_first.splitn(3, ',').nth(2).unwrap();
         let attrs = scram_attrs(server_first).unwrap();
-        let salt = scram_get(&attrs, "s").unwrap();
+        let salt = STANDARD.decode(scram_get(&attrs, "s").unwrap()).unwrap();
         let iterations = scram_get(&attrs, "i").unwrap().parse::<u32>().unwrap();
-        let mut salted = [0u8; 32];
-        ring::pbkdf2::derive(
-            ring::pbkdf2::PBKDF2_HMAC_SHA256,
+        let salted = mechanism.pbkdf2(
             NonZeroU32::new(iterations).unwrap(),
-            &STANDARD.decode(salt).unwrap(),
+            &salt,
             password.as_bytes(),
-            &mut salted,
         );
-        let client_key = hmac_sha256(&salted, b"Client Key");
-        let stored_key = sha256(&client_key);
+        let client_key = mechanism.hmac(&salted, b"Client Key");
+        let stored_key = mechanism.hash(&client_key);
         let without_proof = format!("c=biws,r={nonce}");
         let auth_message = format!("{bare},{server_first},{without_proof}");
-        let signature = hmac_sha256(&stored_key, auth_message.as_bytes());
-        let mut proof = [0u8; 32];
+        let signature = mechanism.hmac(&stored_key, auth_message.as_bytes());
+        let mut proof = vec![0u8; mechanism.hash_len()];
         for (value, (client, signature)) in proof
             .iter_mut()
             .zip(client_key.iter().zip(signature.iter()))
@@ -2251,6 +2337,7 @@ mod tests {
         let mut session = WireSession {
             scram: Some(ScramChallenge {
                 conversation_id: 1,
+                mechanism,
                 client_first_bare: bare.to_string(),
                 server_first: server_first.to_string(),
                 nonce: nonce.to_string(),
@@ -2260,40 +2347,82 @@ mod tests {
         sasl_continue_command(Some(auth), &mut session, &body).unwrap()
     }
 
-    #[test]
-    fn scram_sha256_round_trip() {
-        let auth =
-            MongoAuth::new_with_salt("alice".into(), "pencil", vec![1, 2, 3, 4], 4_096).unwrap();
+    fn test_auth() -> MongoAuth {
+        MongoAuth::new_with_salts(
+            "alice".into(),
+            "pencil",
+            vec![1, 2, 3, 4],
+            vec![5, 6, 7, 8],
+            4_096,
+        )
+        .unwrap()
+    }
+
+    fn scram_start(auth: &MongoAuth, mechanism: &str, client_first: &str) -> Document {
         let mut session = WireSession::default();
-        let client_first = "n,,n=alice,r=clientnonce";
         let start = bson::doc! {
             "saslStart": 1,
-            "mechanism": SCRAM_MECHANISM,
+            "mechanism": mechanism,
             "payload": Bson::Binary(bson::Binary {
                 subtype: bson::spec::BinarySubtype::Generic,
                 bytes: client_first.as_bytes().to_vec(),
             }),
         };
-        let reply = sasl_start_command(Some(&auth), &mut session, &start).unwrap();
+        sasl_start_command(Some(auth), &mut session, &start).unwrap()
+    }
+
+    #[test]
+    fn scram_sha256_round_trip() {
+        let auth = test_auth();
+        let client_first = "n,,n=alice,r=clientnonce";
+        let reply = scram_start(&auth, SCRAM_SHA256, client_first);
         assert!(!reply.get_bool("done").unwrap());
         let server_first = scram_payload(&reply);
         let nonce = scram_get(&scram_attrs(&server_first).unwrap(), "r")
             .unwrap()
             .to_string();
-        let final_reply = scram_continue(&auth, "pencil", client_first, &server_first, &nonce);
+        let final_reply = scram_continue(
+            &auth,
+            ScramMechanism::Sha256,
+            "pencil",
+            client_first,
+            &server_first,
+            &nonce,
+        );
+        assert!(final_reply.get_bool("done").unwrap());
+        assert!(scram_payload(&final_reply).starts_with("v="));
+    }
+
+    #[test]
+    fn scram_sha1_round_trip() {
+        let auth = test_auth();
+        let client_first = "n,,n=alice,r=clientnonce";
+        let reply = scram_start(&auth, SCRAM_SHA1, client_first);
+        let server_first = scram_payload(&reply);
+        let nonce = scram_get(&scram_attrs(&server_first).unwrap(), "r")
+            .unwrap()
+            .to_string();
+        let digest = format!("{:x}", md5::compute("alice:mongo:pencil"));
+        let final_reply = scram_continue(
+            &auth,
+            ScramMechanism::Sha1,
+            &digest,
+            client_first,
+            &server_first,
+            &nonce,
+        );
         assert!(final_reply.get_bool("done").unwrap());
         assert!(scram_payload(&final_reply).starts_with("v="));
     }
 
     #[test]
     fn scram_sha256_rejects_wrong_password() {
-        let auth =
-            MongoAuth::new_with_salt("alice".into(), "pencil", vec![1, 2, 3, 4], 4_096).unwrap();
+        let auth = test_auth();
         let mut session = WireSession::default();
         let client_first = "n,,n=alice,r=clientnonce";
         let start = bson::doc! {
             "saslStart": 1,
-            "mechanism": SCRAM_MECHANISM,
+            "mechanism": SCRAM_SHA256,
             "payload": Bson::Binary(bson::Binary {
                 subtype: bson::spec::BinarySubtype::Generic,
                 bytes: client_first.as_bytes().to_vec(),
@@ -2306,21 +2435,15 @@ mod tests {
             .to_string();
         let bare = "n=alice,r=clientnonce";
         let attrs = scram_attrs(&server_first).unwrap();
-        let salt = scram_get(&attrs, "s").unwrap();
+        let salt = STANDARD.decode(scram_get(&attrs, "s").unwrap()).unwrap();
         let iterations = scram_get(&attrs, "i").unwrap().parse::<u32>().unwrap();
-        let mut salted = [0u8; 32];
-        ring::pbkdf2::derive(
-            ring::pbkdf2::PBKDF2_HMAC_SHA256,
-            NonZeroU32::new(iterations).unwrap(),
-            &STANDARD.decode(salt).unwrap(),
-            b"wrong",
-            &mut salted,
-        );
-        let client_key = hmac_sha256(&salted, b"Client Key");
-        let stored_key = sha256(&client_key);
+        let mechanism = ScramMechanism::Sha256;
+        let salted = mechanism.pbkdf2(NonZeroU32::new(iterations).unwrap(), &salt, b"wrong");
+        let client_key = mechanism.hmac(&salted, b"Client Key");
+        let stored_key = mechanism.hash(&client_key);
         let without_proof = format!("c=biws,r={nonce}");
         let auth_message = format!("{bare},{server_first},{without_proof}");
-        let signature = hmac_sha256(&stored_key, auth_message.as_bytes());
+        let signature = mechanism.hmac(&stored_key, auth_message.as_bytes());
         let proof: Vec<u8> = client_key
             .iter()
             .zip(signature.iter())
@@ -2338,6 +2461,7 @@ mod tests {
         let mut challenge_session = WireSession {
             scram: Some(ScramChallenge {
                 conversation_id: 1,
+                mechanism,
                 client_first_bare: bare.to_string(),
                 server_first: server_first.to_string(),
                 nonce,

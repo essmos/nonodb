@@ -12,6 +12,7 @@ base64 = "0.23"
 bson = { version = "3.1", default-features = false, features = ["serde", "compat-3-0-0"] }
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio", "service"] }
+md5 = "0.7"
 tokio = { version = "1", features = [
     "rt-multi-thread",
     "macros",
