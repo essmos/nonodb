@@ -26,6 +26,7 @@ mod live;
 mod login_guard;
 mod maintenance;
 mod metrics;
+mod mongo_wire;
 mod network;
 mod network_api;
 mod node_state;
@@ -202,6 +203,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let sock =
         PathBuf::from(std::env::var("NONODB_SOCK").unwrap_or_else(|_| "/run/nonodb.sock".into()));
     let tcp_addr = std::env::var("NONODB_TCP").ok();
+    let mongo_addr = std::env::var("NONODB_MONGO_ADDR").ok();
     server_info::set_advertise_url(
         std::env::var("NONODB_REPLICATION_ADVERTISE_URL")
             .ok()
@@ -450,6 +452,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }));
     }
 
+    let mut mongo_task: Option<tokio::task::JoinHandle<()>> = None;
+    if let Some(addr) = mongo_addr.as_deref() {
+        let addr = addr.to_string();
+        let shutdown = shutdown_rx.clone();
+        mongo_task = Some(tokio::spawn(async move {
+            if let Err(e) = mongo_wire::serve(&addr, shutdown, drain_timeout).await {
+                tracing::error!(?e, %addr, "Mongo wire listener stopped");
+            }
+        }));
+    }
+
     #[cfg(not(unix))]
     {
         // Windows and other non-Unix platforms do not have Unix domain sockets
@@ -463,6 +476,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             version = env!("CARGO_PKG_VERSION"),
             data = %data.display(),
             tcp = tcp_addr.as_deref().unwrap_or(""),
+            mongo = mongo_addr.as_deref().unwrap_or(""),
             "nonodb daemon listening"
         );
         let mut shutdown = shutdown_rx.clone();
@@ -470,6 +484,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(task) = tcp_task {
             if let Err(e) = task.await {
                 tracing::warn!(?e, "TCP listener task failed during shutdown");
+            }
+        }
+        if let Some(task) = mongo_task {
+            if let Err(e) = task.await {
+                tracing::warn!(?e, "Mongo wire listener task failed during shutdown");
             }
         }
         wait_for_writer(drain_timeout).await;
@@ -497,6 +516,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             version = env!("CARGO_PKG_VERSION"),
             data = %data.display(),
             sock = %sock.display(),
+            mongo = mongo_addr.as_deref().unwrap_or(""),
             "nonodb daemon listening"
         );
 
@@ -526,6 +546,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(task) = tcp_task {
             if let Err(e) = task.await {
                 tracing::warn!(?e, "TCP listener task failed during shutdown");
+            }
+        }
+        if let Some(task) = mongo_task {
+            if let Err(e) = task.await {
+                tracing::warn!(?e, "Mongo wire listener task failed during shutdown");
             }
         }
         wait_for_writer(drain_timeout).await;
