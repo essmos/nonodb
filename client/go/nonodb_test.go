@@ -1,6 +1,7 @@
 package nonodb
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -114,7 +115,7 @@ func TestWriteRouting(t *testing.T) {
 	replicaURL = replica.URL
 
 	c := New(WithBaseURL(replicaURL), WithAutoPrimary(true), WithToken("test"))
-	if _, err := c.Exec(t.Context(), map[string]any{"op": "insert", "coll": "c", "doc": map[string]any{"x": 1}}); err != nil {
+	if _, err := c.Exec(context.Background(), map[string]any{"op": "insert", "coll": "c", "doc": map[string]any{"x": 1}}); err != nil {
 		t.Fatal(err)
 	}
 	if got := primaryWrites.Load(); got != 1 {
