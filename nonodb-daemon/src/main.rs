@@ -2439,6 +2439,7 @@ async fn exec(
     let database = database_from_uri(&uri);
     let collections = req.collections();
     let read_only = req.is_read_only();
+    let operation = req.op_name();
     let response = exec_inner(
         State(state),
         Extension(connection),
@@ -2457,6 +2458,11 @@ async fn exec(
             response.1.ok,
             started.elapsed(),
         );
+    }
+    // Long-poll and streaming watches are intentionally excluded: their
+    // duration reflects client waiting time, not request execution cost.
+    if operation != "watch" {
+        metrics::record_latency(operation, started.elapsed());
     }
     response
 }

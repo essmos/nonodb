@@ -449,7 +449,7 @@ rotation, and best-fit guidance.
 - Per-user instance registry and `--instance`/`--socket` selection for
   multi-daemon shells.
 - Online backup with SHA-256 manifests, deep verification, restore drills, and inspection.
-- JSON and Prometheus metrics endpoints with daemon-wide/per-collection counters, disk, snapshot, and readiness signals.
+- JSON and Prometheus metrics endpoints with daemon-wide/per-collection counters, per-operation latency histograms, disk, snapshot, and readiness signals.
 - Graceful `SIGTERM`/`SIGINT` drain: stop accepting, finish in-flight requests,
   flush the writer queue, and remove the Unix socket.
 - Text or JSON logs with per-request method, path, status, and duration.

@@ -794,6 +794,7 @@ Useful signals:
 | `index_builds` | Active/recent index backfills and processed/total/elapsed progress |
 | `collection_metrics` | Per-`database/collection` requests, reads, writes, cache, errors, and latency |
 | `collection_metrics_overflow_total` | Requests omitted after the 4096-series metrics cap |
+| `latency` / `nonodb_request_duration_seconds` | End-to-end request latency histogram by operation |
 | `disk` / `nonodb_disk_*` | Filesystem capacity, free, used, and used ratio for data and snapshots |
 | `snapshots` / `nonodb_snapshot_*` | Per-database snapshot success, failures, age, and duration |
 | `auth_failures_total` | Failed authentication attempts |

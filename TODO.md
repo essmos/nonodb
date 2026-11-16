@@ -229,7 +229,7 @@ Design: [docs/replication.md](docs/replication.md).
       checks, and an automated restore drill
 - [x] Graceful drain on shutdown and structured logs
 - [x] Index-build progress in metrics (`processed`/`total`/`elapsed`)
-- [ ] Latency histograms
+- [x] Per-operation request latency histograms in JSON and Prometheus metrics
 - [x] Configurable scan/backfill/aggregate worker counts and blocking threads
 - [x] Batch index creation (`create_indexes`) in one collection scan
 - [x] Automatic indexes in one batch per collection; isolated index-build transactions

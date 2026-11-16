@@ -83,8 +83,20 @@ nonodb_requests_total 1234
 # TYPE nonodb_queue_len gauge
 nonodb_queue_len 0
 nonodb_collection_requests_total{database="default",collection="orders"} 42
+nonodb_request_duration_seconds_bucket{op="find",le="0.01"} 120
+nonodb_request_duration_seconds_bucket{op="find",le="+Inf"} 140
+nonodb_request_duration_seconds_sum{op="find"} 0.82
+nonodb_request_duration_seconds_count{op="find"} 140
 nonodb_disk_used_ratio{mount="data"} 0.41
 nonodb_snapshot_age_seconds{database="default"} 120
+```
+
+Latency histograms cover the end-to-end `/v1/exec` request, including writer
+queue time for writes. Long-poll and streaming watches are excluded because
+their duration is client waiting time. Compute p95 latency with:
+
+```promql
+histogram_quantile(0.95, sum by (le, op) (rate(nonodb_request_duration_seconds_bucket[5m])))
 ```
 
 ## OpenTelemetry

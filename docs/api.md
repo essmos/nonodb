@@ -2575,7 +2575,17 @@ text format and uses the same scopes. See [Monitoring](monitoring.md).
       "avg_request_us": 1533.3
     }
   ],
-  "collection_metrics_overflow_total": 0
+  "collection_metrics_overflow_total": 0,
+  "latency": [
+    {
+      "operation": "find",
+      "buckets_ns": [100000, 500000, 1000000],
+      "buckets": [0, 2, 4],
+      "count": 7,
+      "sum_ns": 8123000
+    }
+  ],
+  "latency_series_overflow_total": 0
 }
 ```
 
@@ -2597,6 +2607,8 @@ text format and uses the same scopes. See [Monitoring](monitoring.md).
 | `index_builds` | Active/recent index, text, fuzzy, and vector backfills with processed/total/elapsed |
 | `collection_metrics` | Per-`database/collection` requests, reads, writes, cache, errors, and latency |
 | `collection_metrics_overflow_total` | Requests omitted after the 4096-series cap |
+| `latency` | Per-operation end-to-end latency buckets, count, and total duration |
+| `latency_series_overflow_total` | Latency series omitted after the operation-series cap |
 | `avg_batch_size` | Write ops per committed write transaction |
 | `avg_commit_us` | Average commit time in microseconds |
 

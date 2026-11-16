@@ -75,6 +75,87 @@ pub static REPLICATION_LAST_SUCCESS_UNIX: AtomicU64 = AtomicU64::new(0);
 pub static REPLICATION_RETENTION_RUNS: AtomicU64 = AtomicU64::new(0);
 pub static REPLICATION_PRUNED_TOTAL: AtomicU64 = AtomicU64::new(0);
 
+/// Upper bounds for request latency histograms in nanoseconds. The matching
+/// Prometheus labels are expressed in seconds.
+const LATENCY_BUCKETS_NS: [u64; 17] = [
+    100_000,
+    500_000,
+    1_000_000,
+    2_500_000,
+    5_000_000,
+    10_000_000,
+    25_000_000,
+    50_000_000,
+    100_000_000,
+    250_000_000,
+    500_000_000,
+    1_000_000_000,
+    2_500_000_000,
+    5_000_000_000,
+    10_000_000_000,
+    30_000_000_000,
+    60_000_000_000,
+];
+const LATENCY_BUCKET_LABELS: [&str; 17] = [
+    "0.0001", "0.0005", "0.001", "0.0025", "0.005", "0.01", "0.025", "0.05", "0.1", "0.25", "0.5",
+    "1", "2.5", "5", "10", "30", "60",
+];
+const MAX_LATENCY_SERIES: usize = 128;
+pub static LATENCY_SERIES_OVERFLOW: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Debug, Default)]
+struct LatencyCounters {
+    buckets: [u64; LATENCY_BUCKETS_NS.len()],
+    count: u64,
+    sum_ns: u64,
+}
+
+fn latency_map() -> &'static Mutex<BTreeMap<String, LatencyCounters>> {
+    static MAP: OnceLock<Mutex<BTreeMap<String, LatencyCounters>>> = OnceLock::new();
+    MAP.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+/// Records one end-to-end request latency for an operation name.
+pub fn record_latency(operation: &str, elapsed: Duration) {
+    if operation.is_empty() {
+        return;
+    }
+    let mut map = latency_map()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !map.contains_key(operation) && map.len() >= MAX_LATENCY_SERIES {
+        inc(&LATENCY_SERIES_OVERFLOW);
+        return;
+    }
+    let entry = map.entry(operation.to_string()).or_default();
+    let ns = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+    entry.count = entry.count.saturating_add(1);
+    entry.sum_ns = entry.sum_ns.saturating_add(ns);
+    for (index, upper) in LATENCY_BUCKETS_NS.iter().enumerate() {
+        if ns <= *upper {
+            entry.buckets[index] = entry.buckets[index].saturating_add(1);
+            break;
+        }
+    }
+}
+
+fn latency_json() -> Vec<Value> {
+    let map = latency_map()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    map.iter()
+        .map(|(operation, counters)| {
+            json!({
+                "operation": operation,
+                "buckets_ns": LATENCY_BUCKETS_NS,
+                "buckets": counters.buckets,
+                "count": counters.count,
+                "sum_ns": counters.sum_ns,
+            })
+        })
+        .collect()
+}
+
 #[derive(Clone, Debug, Default)]
 struct SnapshotCounters {
     success_total: u64,
@@ -425,6 +506,7 @@ pub fn snapshot() -> Value {
         WRITER_WINDOW_NS_TOTAL.load(Relaxed) as f64 / total_windows as f64 / 1000.0
     };
     let (event_emitted, event_suppressed) = nonodb_core::events::stats();
+    let latency = latency_json();
     json!({
         "requests_total": REQUESTS.load(Relaxed),
         "errors_total": ERRORS.load(Relaxed),
@@ -479,6 +561,8 @@ pub fn snapshot() -> Value {
         "replication_pruned_total": REPLICATION_PRUNED_TOTAL.load(Relaxed),
         "collection_metrics": collection_metrics,
         "collection_metrics_overflow_total": COLLECTION_METRICS_OVERFLOW.load(Relaxed),
+        "latency": latency,
+        "latency_series_overflow_total": LATENCY_SERIES_OVERFLOW.load(Relaxed),
         "commit_ns_total": commit_ns,
         "ttl_sweeps_total": TTL_SWEEPS.load(Relaxed),
         "ttl_expired_total": TTL_EXPIRED.load(Relaxed),
@@ -901,6 +985,11 @@ pub fn prometheus() -> String {
             "Collection metric series rejected by the cap.",
         ),
         (
+            "nonodb_latency_series_overflow_total",
+            "latency_series_overflow_total",
+            "Latency operation series rejected by the cap.",
+        ),
+        (
             "nonodb_commit_ns_total",
             "commit_ns_total",
             "Total commit time including fsync.",
@@ -1027,6 +1116,55 @@ pub fn prometheus() -> String {
     for (name, key, help) in GAUGES {
         prom_header(&mut out, name, "gauge", help);
         prom_sample(&mut out, name, &[], &snapshot[key]);
+    }
+
+    if let Some(rows) = snapshot["latency"].as_array() {
+        prom_header(
+            &mut out,
+            "nonodb_request_duration_seconds",
+            "histogram",
+            "End-to-end request latency by operation.",
+        );
+        for row in rows {
+            let operation = row["operation"].as_str().unwrap_or("");
+            let labels = [("op", operation)];
+            let mut cumulative = 0u64;
+            if let Some(buckets) = row["buckets"].as_array() {
+                for (index, label) in LATENCY_BUCKET_LABELS.iter().enumerate() {
+                    cumulative = cumulative.saturating_add(
+                        buckets
+                            .get(index)
+                            .and_then(Value::as_u64)
+                            .unwrap_or_default(),
+                    );
+                    prom_sample(
+                        &mut out,
+                        "nonodb_request_duration_seconds_bucket",
+                        &[("op", operation), ("le", label)],
+                        &json!(cumulative),
+                    );
+                }
+            }
+            prom_sample(
+                &mut out,
+                "nonodb_request_duration_seconds_bucket",
+                &[("op", operation), ("le", "+Inf")],
+                &row["count"],
+            );
+            let sum_seconds = row["sum_ns"].as_u64().unwrap_or_default() as f64 / 1_000_000_000.0;
+            prom_sample(
+                &mut out,
+                "nonodb_request_duration_seconds_sum",
+                &labels,
+                &json!(sum_seconds),
+            );
+            prom_sample(
+                &mut out,
+                "nonodb_request_duration_seconds_count",
+                &labels,
+                &row["count"],
+            );
+        }
     }
 
     if let Some(rows) = snapshot["collection_metrics"].as_array() {
@@ -1348,6 +1486,39 @@ mod tests {
         assert!(text.contains(&format!("collection=\"{collection}\"")));
         assert!(text.contains("nonodb_snapshot_success_total{database=\""));
         assert!(text.contains("nonodb_snapshot_age_seconds{database=\""));
+    }
+
+    #[test]
+    fn request_latency_histograms_are_bounded_and_exported() {
+        let operation = format!("latency-test-{}", std::process::id());
+        record_latency(&operation, Duration::from_millis(1));
+        record_latency(&operation, Duration::from_millis(20));
+        record_latency(&operation, Duration::from_secs(2));
+
+        let snapshot = snapshot();
+        let row = snapshot["latency"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["operation"] == operation)
+            .unwrap();
+        assert_eq!(row["count"], 3);
+        assert_eq!(row["sum_ns"], 2_021_000_000u64);
+        assert_eq!(row["buckets"][2], 1);
+        assert_eq!(row["buckets"][6], 1);
+        assert_eq!(row["buckets"][12], 1);
+
+        let text = prometheus();
+        assert!(text.contains("# TYPE nonodb_request_duration_seconds histogram"));
+        assert!(text.contains(&format!(
+            "nonodb_request_duration_seconds_bucket{{op=\"{operation}\",le=\"1\"}} 2"
+        )));
+        assert!(text.contains(&format!(
+            "nonodb_request_duration_seconds_bucket{{op=\"{operation}\",le=\"+Inf\"}} 3"
+        )));
+        assert!(text.contains(&format!(
+            "nonodb_request_duration_seconds_count{{op=\"{operation}\"}} 3"
+        )));
     }
 
     #[test]
