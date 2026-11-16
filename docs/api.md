@@ -923,7 +923,7 @@ stages are not allowed in a read `batch` or in a cursor aggregation.
 | `$lookup` | Join documents from another collection |
 | `$unionWith` | Append the result of another collection or sub-pipeline |
 | `$graphLookup` | Recursively traverse references across a collection |
-| `$setWindowFields` | Partition, sort, rank, and compute windowed accumulators |
+| `$setWindowFields` | Partition, sort, rank, window, and compute analytics |
 | `$densify` | Generate missing values in a numeric or date range |
 | `$fill` | Fill missing or null values with a value, `locf`, or linear interpolation |
 | `$out` | Replace a collection with the pipeline result (terminal only) |
@@ -1112,7 +1112,15 @@ Adds partitioned, sorted window calculations without collapsing documents:
   `$addToSet`, and `$count`. The default frame is `["unbounded", "unbounded"]`
   (the whole partition); specify `["unbounded", "current"]` for a running total.
 - `window.documents` accepts `unbounded`, `current`, or integer offsets for both
-  bounds. `range` windows are not supported.
+  bounds.
+- `window.range` accepts `unbounded`, `current`, or numeric offsets. It requires
+  exactly one `sortBy` field. Numeric sort fields use numeric offsets. Date sort
+  fields require a `unit` (`year`, `quarter`, `month`, `week`, `day`, `hour`,
+  `minute`, `second`, `millisecond`) and use calendar-aware offsets.
+- Advanced analytics: `$expMovingAvg` (`input` plus `N` or `alpha`),
+  `$derivative` (`input`, optional `unit`), and `$integral` (`input`, optional
+  `unit`). `$expMovingAvg` follows partition order; `$derivative` and `$integral`
+  require exactly one `sortBy` field and accept a `documents` or `range` window.
 - Ranking operators: `$rank`, `$denseRank`, and `$documentNumber`, which require
   `sortBy`.
 - `$shift` supports `output`, integer `by`, and optional `default`.
@@ -1233,7 +1241,12 @@ Merges the pipeline result into an existing or new collection:
   - `fail` — return `invalid_query`.
 - A result document that contains `_id` must use the same `_id` as a matched
   target document. Changing `_id` is rejected.
-- `whenMatched` pipelines and `let` variables are not supported.
+- `whenMatched` may be a pipeline. It runs on the existing target document as
+  the root, with `$$new` bound to the incoming result document. Only `$set`/
+  `$addFields`, `$project`, `$unset`, and `$replaceRoot`/`$replaceWith` are
+  allowed. The pipeline must produce one object and cannot change `_id`.
+- `let` defines variables available as `$$name` in a `whenMatched` pipeline.
+  Values are evaluated against each incoming result document.
 - The response contains `results: []`, plus `target`, `matched`, `modified`,
   `inserted`, and `skipped` counters.
 
@@ -1244,8 +1257,7 @@ Merges the pipeline result into an existing or new collection:
 - The normal request timeout (30 seconds by default) applies.
 - Response size is still limited by the HTTP response path and the client's
   practical memory; use `$limit` and `$project` for large collections.
-- Not supported: `$redact`, `$expMovingAvg`, `$derivative`, `$merge`
-  `whenMatched` pipelines, and arbitrary JavaScript.
+- Not supported: `$redact` and arbitrary JavaScript.
 
 ## sql
 

@@ -60,9 +60,11 @@ limitations are documented in [docs/roadmap.md](docs/roadmap.md).
 - [x] Aggregation: `$lookup` with `let` variables, nested lookups,
       `$unionWith` with collection shorthand or a sub-pipeline,
       `$graphLookup` with depth, depth field, restrictions, and cycle detection,
-      `$setWindowFields` partitions, document windows, ranking, and `$shift`,
+      `$setWindowFields` partitions, document and range windows, ranking,
+      `$shift`, `$expMovingAvg`, `$derivative`, and `$integral`,
       plus `$densify` and `$fill` numeric/date gap filling,
-      and transactional `$out`/`$merge` write stages with unique-key matching
+      and transactional `$out`/`$merge` write stages with unique-key matching,
+      `let` variables, and `whenMatched` pipelines
 - [x] Multikey indexes for arrays and dotted array paths, immutable-index
       metadata, indexed `$all`/`$elemMatch`, and multikey sort order
 - [x] Unique multikey indexes: same-document duplicates allowed, cross-document

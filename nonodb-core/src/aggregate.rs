@@ -45,12 +45,15 @@ pub enum AggregateWriteKind {
 }
 
 /// `$merge` behavior when the target already has a matching document.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MergeWhenMatched {
     Replace,
     KeepExisting,
     Merge,
     Fail,
+    /// A `whenMatched` pipeline, run with the existing document as the root
+    /// and `$$new` bound to the incoming result document.
+    Pipeline(Vec<Value>),
 }
 
 /// `$merge` behavior when no target document matches.
@@ -71,6 +74,8 @@ pub struct AggregateWriteSpec {
     pub on: Vec<String>,
     pub when_matched: MergeWhenMatched,
     pub when_not_matched: MergeWhenNotMatched,
+    /// `$merge` `let` variables, evaluated against each incoming document.
+    pub let_vars: Vec<(String, Value)>,
 }
 
 fn write_stage_key(value: &Value) -> Option<&str> {
@@ -135,6 +140,33 @@ fn parse_merge_on(value: Option<&Value>) -> Result<Vec<String>> {
     Ok(values)
 }
 
+fn validate_merge_pipeline(pipeline: &[Value]) -> Result<()> {
+    if pipeline.is_empty() {
+        return Err(Error::Query(
+            "$merge whenMatched pipeline must not be empty".into(),
+        ));
+    }
+    for stage in pipeline {
+        let Some(obj) = stage.as_object().filter(|obj| obj.len() == 1) else {
+            return Err(Error::Query(
+                "$merge whenMatched stages must contain exactly one operator".into(),
+            ));
+        };
+        let Some(name) = obj.keys().next().map(String::as_str) else {
+            return Err(Error::Query("$merge whenMatched stage is empty".into()));
+        };
+        if !matches!(
+            name,
+            "$set" | "$addFields" | "$project" | "$unset" | "$replaceRoot" | "$replaceWith"
+        ) {
+            return Err(Error::Query(format!(
+                "unsupported $merge whenMatched stage `{name}`"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Parses a terminal `$out` or `$merge` stage. Returns `None` for read-only
 /// pipelines. A write stage anywhere except the last position is rejected.
 pub fn write_stage_spec(pipeline: &[Value]) -> Result<Option<AggregateWriteSpec>> {
@@ -172,6 +204,7 @@ pub fn write_stage_spec(pipeline: &[Value]) -> Result<Option<AggregateWriteSpec>
             on: vec!["_id".to_string()],
             when_matched: MergeWhenMatched::Merge,
             when_not_matched: MergeWhenNotMatched::Insert,
+            let_vars: Vec::new(),
         }));
     }
     let obj = arg
@@ -195,13 +228,14 @@ pub fn write_stage_spec(pipeline: &[Value]) -> Result<Option<AggregateWriteSpec>
                 )));
             }
         },
-        Some(Value::Array(_)) => {
-            return Err(Error::Query(
-                "$merge whenMatched pipelines are not supported".into(),
-            ));
+        Some(Value::Array(stages)) => {
+            validate_merge_pipeline(stages)?;
+            MergeWhenMatched::Pipeline(stages.clone())
         }
         Some(_) => {
-            return Err(Error::Query("$merge `whenMatched` must be a string".into()));
+            return Err(Error::Query(
+                "$merge `whenMatched` must be a string or pipeline".into(),
+            ));
         }
     };
     let when_not_matched = match obj.get("whenNotMatched") {
@@ -222,6 +256,19 @@ pub fn write_stage_spec(pipeline: &[Value]) -> Result<Option<AggregateWriteSpec>
             ));
         }
     };
+    let let_vars = match obj.get("let") {
+        None => Vec::new(),
+        Some(Value::Object(vars)) => vars
+            .iter()
+            .map(|(name, value)| {
+                if name.is_empty() {
+                    return Err(Error::Query("$merge `let` names must not be empty".into()));
+                }
+                Ok((name.clone(), value.clone()))
+            })
+            .collect::<Result<Vec<_>>>()?,
+        Some(_) => return Err(Error::Query("$merge `let` must be an object".into())),
+    };
     Ok(Some(AggregateWriteSpec {
         kind: AggregateWriteKind::Merge,
         target,
@@ -229,6 +276,7 @@ pub fn write_stage_spec(pipeline: &[Value]) -> Result<Option<AggregateWriteSpec>
         on,
         when_matched,
         when_not_matched,
+        let_vars,
     }))
 }
 
@@ -491,6 +539,25 @@ pub(crate) trait AggregateHost {
 /// Runs a pipeline over already selected documents.
 pub fn run(docs: Vec<Value>, pipeline: &[Value], max_docs: usize) -> Result<Vec<Value>> {
     run_with_host_vars(docs, pipeline, max_docs, None, &BTreeMap::new())
+}
+
+/// Runs a pipeline with `$$variables` bound for expressions.
+pub fn run_with_vars(
+    docs: Vec<Value>,
+    pipeline: &[Value],
+    max_docs: usize,
+    vars: &BTreeMap<String, Value>,
+) -> Result<Vec<Value>> {
+    run_with_host_vars(docs, pipeline, max_docs, None, vars)
+}
+
+/// Evaluates an aggregation expression with `$$variables` bound.
+pub fn eval_expression(
+    doc: &Value,
+    expression: &Value,
+    vars: &BTreeMap<String, Value>,
+) -> Result<Value> {
+    eval_expr_vars(doc, expression, vars)
 }
 
 pub(crate) fn run_with_host(
@@ -1319,9 +1386,23 @@ enum WindowBound {
 }
 
 #[derive(Clone, Debug)]
-struct WindowFrame {
-    start: WindowBound,
-    end: WindowBound,
+enum WindowRangeBound {
+    Unbounded,
+    Current,
+    Offset(Value),
+}
+
+#[derive(Clone, Debug)]
+enum WindowFrame {
+    Documents {
+        start: WindowBound,
+        end: WindowBound,
+    },
+    Range {
+        start: WindowRangeBound,
+        end: WindowRangeBound,
+        unit: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -1335,6 +1416,33 @@ enum WindowOp {
         by: i64,
         default: Option<Value>,
     },
+    ExpMovingAvg {
+        input: Value,
+        alpha: f64,
+    },
+    Derivative {
+        input: Value,
+        unit: Option<String>,
+    },
+    Integral {
+        input: Value,
+        unit: Option<String>,
+    },
+}
+
+fn valid_date_unit(unit: &str) -> bool {
+    matches!(
+        unit,
+        "year"
+            | "quarter"
+            | "month"
+            | "week"
+            | "day"
+            | "hour"
+            | "minute"
+            | "second"
+            | "millisecond"
+    )
 }
 
 struct WindowOutput {
@@ -1357,13 +1465,52 @@ fn parse_window_bound(value: &Value) -> Result<WindowBound> {
     }
 }
 
+fn parse_window_range_bound(value: &Value) -> Result<WindowRangeBound> {
+    match value {
+        Value::String(value) if value == "unbounded" => Ok(WindowRangeBound::Unbounded),
+        Value::String(value) if value == "current" => Ok(WindowRangeBound::Current),
+        Value::Number(_) => Ok(WindowRangeBound::Offset(value.clone())),
+        _ => Err(Error::Query(
+            "range window bounds must be `unbounded`, `current`, or a number".into(),
+        )),
+    }
+}
+
 fn parse_window_frame(value: &Value) -> Result<WindowFrame> {
     let obj = value
         .as_object()
         .ok_or_else(|| Error::Query("window must be an object".into()))?;
-    if obj.contains_key("range") {
+    let has_documents = obj.contains_key("documents");
+    let has_range = obj.contains_key("range");
+    if has_documents && has_range {
         return Err(Error::Query(
-            "$setWindowFields range windows are not supported".into(),
+            "window must contain either `documents` or `range`, not both".into(),
+        ));
+    }
+    if has_range {
+        let bounds = obj
+            .get("range")
+            .and_then(Value::as_array)
+            .filter(|bounds| bounds.len() == 2)
+            .ok_or_else(|| Error::Query("window requires [lower, upper] range bounds".into()))?;
+        let unit = match obj.get("unit") {
+            None => None,
+            Some(Value::String(unit)) if valid_date_unit(unit) => Some(unit.clone()),
+            Some(_) => {
+                return Err(Error::Query(
+                    "range window `unit` must be a supported date unit".into(),
+                ));
+            }
+        };
+        return Ok(WindowFrame::Range {
+            start: parse_window_range_bound(&bounds[0])?,
+            end: parse_window_range_bound(&bounds[1])?,
+            unit,
+        });
+    }
+    if obj.contains_key("unit") {
+        return Err(Error::Query(
+            "window `unit` is only valid with a `range` window".into(),
         ));
     }
     let bounds = obj
@@ -1371,7 +1518,7 @@ fn parse_window_frame(value: &Value) -> Result<WindowFrame> {
         .and_then(Value::as_array)
         .filter(|bounds| bounds.len() == 2)
         .ok_or_else(|| Error::Query("window requires [lower, upper] document bounds".into()))?;
-    Ok(WindowFrame {
+    Ok(WindowFrame::Documents {
         start: parse_window_bound(&bounds[0])?,
         end: parse_window_bound(&bounds[1])?,
     })
@@ -1407,6 +1554,68 @@ fn parse_window_op(name: &str, arg: &Value) -> Result<WindowOp> {
                 output,
                 by,
                 default: spec.get("default").cloned(),
+            })
+        }
+        "$expMovingAvg" => {
+            let spec = arg
+                .as_object()
+                .ok_or_else(|| Error::Query("$expMovingAvg requires an object".into()))?;
+            let input = spec
+                .get("input")
+                .cloned()
+                .ok_or_else(|| Error::Query("$expMovingAvg requires `input`".into()))?;
+            let (n, alpha) = (spec.get("N"), spec.get("alpha"));
+            let alpha = match (n, alpha) {
+                (Some(_), Some(_)) => {
+                    return Err(Error::Query(
+                        "$expMovingAvg requires exactly one of `N` or `alpha`".into(),
+                    ));
+                }
+                (Some(n), None) => {
+                    let n = n
+                        .as_i64()
+                        .filter(|n| *n > 0)
+                        .ok_or_else(|| Error::Query("$expMovingAvg `N` must be positive".into()))?;
+                    2.0 / (n as f64 + 1.0)
+                }
+                (None, Some(alpha)) => {
+                    let alpha = alpha.as_f64().ok_or_else(|| {
+                        Error::Query("$expMovingAvg `alpha` must be a number".into())
+                    })?;
+                    if !(alpha > 0.0 && alpha < 1.0) {
+                        return Err(Error::Query(
+                            "$expMovingAvg `alpha` must be between 0 and 1".into(),
+                        ));
+                    }
+                    alpha
+                }
+                (None, None) => {
+                    return Err(Error::Query("$expMovingAvg requires `N` or `alpha`".into()));
+                }
+            };
+            Ok(WindowOp::ExpMovingAvg { input, alpha })
+        }
+        "$derivative" | "$integral" => {
+            let spec = arg
+                .as_object()
+                .ok_or_else(|| Error::Query(format!("{name} requires an object argument")))?;
+            let input = spec
+                .get("input")
+                .cloned()
+                .ok_or_else(|| Error::Query(format!("{name} requires `input`")))?;
+            let unit = match spec.get("unit") {
+                None => None,
+                Some(Value::String(unit)) if valid_date_unit(unit) => Some(unit.clone()),
+                Some(_) => {
+                    return Err(Error::Query(format!(
+                        "{name} `unit` must be a supported date unit"
+                    )));
+                }
+            };
+            Ok(if name == "$derivative" {
+                WindowOp::Derivative { input, unit }
+            } else {
+                WindowOp::Integral { input, unit }
             })
         }
         _ => Err(Error::Query(format!(
@@ -1458,10 +1667,11 @@ fn parse_window_outputs(value: &Value) -> Result<Vec<WindowOutput>> {
                     | WindowOp::DenseRank
                     | WindowOp::DocumentNumber
                     | WindowOp::Shift { .. }
+                    | WindowOp::ExpMovingAvg { .. }
             )
         {
             return Err(Error::Query(
-                "$setWindowFields `window` is only valid for accumulators".into(),
+                "$setWindowFields `window` is not valid for this operator".into(),
             ));
         }
         parsed.push(WindowOutput {
@@ -1492,11 +1702,14 @@ fn window_slice(
     current: usize,
     len: usize,
 ) -> Option<std::ops::RangeInclusive<usize>> {
+    let WindowFrame::Documents { start, end } = frame else {
+        return None;
+    };
     if len == 0 {
         return None;
     }
-    let mut start = resolve_window_bound(&frame.start, current, len, true);
-    let mut end = resolve_window_bound(&frame.end, current, len, false);
+    let mut start = resolve_window_bound(start, current, len, true);
+    let mut end = resolve_window_bound(end, current, len, false);
     start = start.max(0);
     end = end.min(len.saturating_sub(1) as i64);
     if start > end || start >= len as i64 || end < 0 {
@@ -1505,27 +1718,152 @@ fn window_slice(
     Some(start as usize..=end as usize)
 }
 
+#[derive(Clone)]
+enum RangeValue {
+    Number(BigDecimal),
+    Date(i64),
+}
+
+fn range_sort_value(doc: &Value, field: &str) -> Result<Option<RangeValue>> {
+    let Some(value) = path::get(doc, field) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    if date::is_date(value) {
+        return Ok(Some(RangeValue::Date(date_millis(value)?)));
+    }
+    if let Some(number) = numeric::as_bigdecimal(value) {
+        return Ok(Some(RangeValue::Number(number)));
+    }
+    Err(Error::Query(
+        "range windows require a numeric or date sortBy field".into(),
+    ))
+}
+
+fn range_bound_value(
+    bound: &WindowRangeBound,
+    current: &RangeValue,
+    unit: Option<&str>,
+) -> Result<Option<RangeValue>> {
+    match bound {
+        WindowRangeBound::Unbounded => Ok(None),
+        WindowRangeBound::Current => Ok(Some(current.clone())),
+        WindowRangeBound::Offset(offset) => match current {
+            RangeValue::Number(current) => {
+                if unit.is_some() {
+                    return Err(Error::Query(
+                        "range window `unit` is only valid for date sortBy fields".into(),
+                    ));
+                }
+                let offset = numeric::as_bigdecimal(offset)
+                    .ok_or_else(|| Error::Query("range offsets must be numbers".into()))?;
+                Ok(Some(RangeValue::Number(current + offset)))
+            }
+            RangeValue::Date(current) => {
+                let unit =
+                    unit.ok_or_else(|| Error::Query("date range windows require a `unit`".into()))?;
+                let offset = offset.as_i64().ok_or_else(|| {
+                    Error::Query("date range offsets must be integer numbers".into())
+                })?;
+                Ok(Some(RangeValue::Date(densify_add_date(
+                    *current, offset, unit,
+                )?)))
+            }
+        },
+    }
+}
+
+fn range_value_cmp(value: &RangeValue, bound: &RangeValue) -> Result<Ordering> {
+    match (value, bound) {
+        (RangeValue::Number(left), RangeValue::Number(right)) => Ok(left.cmp(right)),
+        (RangeValue::Date(left), RangeValue::Date(right)) => Ok(left.cmp(right)),
+        _ => Err(Error::Query(
+            "range window sortBy values must have one consistent type".into(),
+        )),
+    }
+}
+
+fn range_window_positions(
+    start: &WindowRangeBound,
+    end: &WindowRangeBound,
+    unit: Option<&str>,
+    docs: &[Value],
+    indices: &[usize],
+    position: usize,
+    sort: &[(String, i32)],
+) -> Result<Vec<usize>> {
+    let Some((field, _)) = sort.first().filter(|_| sort.len() == 1) else {
+        return Err(Error::Query(
+            "range windows require exactly one sortBy field".into(),
+        ));
+    };
+    let Some(current) = range_sort_value(&docs[indices[position]], field)? else {
+        return Err(Error::Query(
+            "range window sortBy value is missing or null".into(),
+        ));
+    };
+    let lower = range_bound_value(start, &current, unit)?;
+    let upper = range_bound_value(end, &current, unit)?;
+    let mut out = Vec::new();
+    for (candidate_position, index) in indices.iter().enumerate() {
+        let Some(value) = range_sort_value(&docs[*index], field)? else {
+            continue;
+        };
+        if let Some(lower) = &lower {
+            if range_value_cmp(&value, lower)? == Ordering::Less {
+                continue;
+            }
+        }
+        if let Some(upper) = &upper {
+            if range_value_cmp(&value, upper)? == Ordering::Greater {
+                continue;
+            }
+        }
+        out.push(candidate_position);
+    }
+    Ok(out)
+}
+
+fn window_frame_positions(
+    frame: &WindowFrame,
+    docs: &[Value],
+    indices: &[usize],
+    position: usize,
+    sort: &[(String, i32)],
+) -> Result<Vec<usize>> {
+    match frame {
+        WindowFrame::Documents { .. } => Ok(window_slice(frame, position, indices.len())
+            .map(|range| range.collect())
+            .unwrap_or_default()),
+        WindowFrame::Range { start, end, unit } => {
+            range_window_positions(start, end, unit.as_deref(), docs, indices, position, sort)
+        }
+    }
+}
+
 fn window_accumulator_values(
     docs: &[Value],
     indices: &[usize],
     op: &str,
     expression: &Value,
     window: Option<&WindowFrame>,
+    sort: &[(String, i32)],
     vars: &BTreeMap<String, Value>,
 ) -> Result<Vec<Value>> {
     let mut out = Vec::with_capacity(indices.len());
     if let Some(window) = window {
         for position in 0..indices.len() {
             let mut accumulator = Accumulator::new(op);
-            if let Some(range) = window_slice(window, position, indices.len()) {
-                for frame_index in indices[range].iter() {
-                    let value = if op == "$count" {
-                        Value::Null
-                    } else {
-                        eval_expr_vars(&docs[*frame_index], expression, vars)?
-                    };
-                    accumulator.update(op, &value)?;
-                }
+            for frame_position in window_frame_positions(window, docs, indices, position, sort)? {
+                let frame_index = indices[frame_position];
+                let value = if op == "$count" {
+                    Value::Null
+                } else {
+                    eval_expr_vars(&docs[frame_index], expression, vars)?
+                };
+                accumulator.update(op, &value)?;
             }
             out.push(accumulator.finish()?);
         }
@@ -1598,6 +1936,183 @@ fn window_shift_values(
     Ok(out)
 }
 
+fn window_exp_moving_avg_values(
+    docs: &[Value],
+    indices: &[usize],
+    input: &Value,
+    alpha: f64,
+    vars: &BTreeMap<String, Value>,
+) -> Result<Vec<Value>> {
+    let mut out = Vec::with_capacity(indices.len());
+    let mut previous: Option<f64> = None;
+    for index in indices {
+        let value = eval_expr_vars(&docs[*index], input, vars)?;
+        let Some(value) = numeric::as_f64(&value) else {
+            out.push(Value::Null);
+            continue;
+        };
+        let current = match previous {
+            Some(previous) => alpha * value + (1.0 - alpha) * previous,
+            None => value,
+        };
+        previous = Some(current);
+        out.push(number_value(current));
+    }
+    Ok(out)
+}
+
+fn date_unit_millis(unit: &str) -> f64 {
+    let day = 86_400_000.0;
+    match unit {
+        "year" => day * 365.0,
+        "quarter" => day * 365.0 / 4.0,
+        "month" => day * 365.0 / 12.0,
+        "week" => day * 7.0,
+        "day" => day,
+        "hour" => 3_600_000.0,
+        "minute" => 60_000.0,
+        "second" => 1_000.0,
+        _ => 1.0,
+    }
+}
+
+fn window_x_value(
+    doc: &Value,
+    field: &str,
+    unit: Option<&str>,
+    operation: &str,
+) -> Result<Option<f64>> {
+    let Some(value) = path::get(doc, field) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    if date::is_date(value) {
+        let millis = date_millis(value)? as f64;
+        return Ok(Some(match unit {
+            Some(unit) => millis / date_unit_millis(unit),
+            None => millis,
+        }));
+    }
+    if unit.is_some() {
+        return Err(Error::Query(format!(
+            "{operation} `unit` is only valid for date sortBy fields"
+        )));
+    }
+    Ok(numeric::as_f64(value))
+}
+
+fn window_frame_positions_or_all(
+    docs: &[Value],
+    indices: &[usize],
+    position: usize,
+    sort: &[(String, i32)],
+    window: Option<&WindowFrame>,
+) -> Result<Vec<usize>> {
+    match window {
+        Some(window) => window_frame_positions(window, docs, indices, position, sort),
+        None => Ok((0..indices.len()).collect()),
+    }
+}
+
+fn window_derivative_values(
+    docs: &[Value],
+    indices: &[usize],
+    input: &Value,
+    unit: Option<&str>,
+    window: Option<&WindowFrame>,
+    sort: &[(String, i32)],
+    vars: &BTreeMap<String, Value>,
+) -> Result<Vec<Value>> {
+    let Some((field, _)) = sort.first().filter(|_| sort.len() == 1) else {
+        return Err(Error::Query(
+            "$derivative requires exactly one sortBy field".into(),
+        ));
+    };
+    let mut out = Vec::with_capacity(indices.len());
+    for position in 0..indices.len() {
+        let frame = window_frame_positions_or_all(docs, indices, position, sort, window)?;
+        let (Some(first), Some(last)) = (frame.first(), frame.last()) else {
+            out.push(Value::Null);
+            continue;
+        };
+        let first_doc = &docs[indices[*first]];
+        let last_doc = &docs[indices[*last]];
+        let (Some(x0), Some(x1)) = (
+            window_x_value(first_doc, field, unit, "$derivative")?,
+            window_x_value(last_doc, field, unit, "$derivative")?,
+        ) else {
+            out.push(Value::Null);
+            continue;
+        };
+        let (Some(y0), Some(y1)) = (
+            numeric::as_f64(&eval_expr_vars(first_doc, input, vars)?),
+            numeric::as_f64(&eval_expr_vars(last_doc, input, vars)?),
+        ) else {
+            out.push(Value::Null);
+            continue;
+        };
+        if x1 == x0 {
+            out.push(Value::Null);
+        } else {
+            out.push(number_value((y1 - y0) / (x1 - x0)));
+        }
+    }
+    Ok(out)
+}
+
+fn window_integral_values(
+    docs: &[Value],
+    indices: &[usize],
+    input: &Value,
+    unit: Option<&str>,
+    window: Option<&WindowFrame>,
+    sort: &[(String, i32)],
+    vars: &BTreeMap<String, Value>,
+) -> Result<Vec<Value>> {
+    let Some((field, _)) = sort.first().filter(|_| sort.len() == 1) else {
+        return Err(Error::Query(
+            "$integral requires exactly one sortBy field".into(),
+        ));
+    };
+    let mut out = Vec::with_capacity(indices.len());
+    for position in 0..indices.len() {
+        let frame = window_frame_positions_or_all(docs, indices, position, sort, window)?;
+        if frame.len() < 2 {
+            out.push(Value::from(0));
+            continue;
+        }
+        let mut total = 0.0;
+        let mut valid = true;
+        for pair in frame.windows(2) {
+            let left = &docs[indices[pair[0]]];
+            let right = &docs[indices[pair[1]]];
+            let (Some(x0), Some(x1)) = (
+                window_x_value(left, field, unit, "$integral")?,
+                window_x_value(right, field, unit, "$integral")?,
+            ) else {
+                valid = false;
+                break;
+            };
+            let (Some(y0), Some(y1)) = (
+                numeric::as_f64(&eval_expr_vars(left, input, vars)?),
+                numeric::as_f64(&eval_expr_vars(right, input, vars)?),
+            ) else {
+                valid = false;
+                break;
+            };
+            total += (x1 - x0) * (y0 + y1) / 2.0;
+        }
+        out.push(if valid {
+            number_value(total)
+        } else {
+            Value::Null
+        });
+    }
+    Ok(out)
+}
+
 fn window_output_values(
     docs: &[Value],
     indices: &[usize],
@@ -1606,9 +2121,15 @@ fn window_output_values(
     vars: &BTreeMap<String, Value>,
 ) -> Result<Vec<Value>> {
     match &output.op {
-        WindowOp::Accumulator(op, expression) => {
-            window_accumulator_values(docs, indices, op, expression, output.window.as_ref(), vars)
-        }
+        WindowOp::Accumulator(op, expression) => window_accumulator_values(
+            docs,
+            indices,
+            op,
+            expression,
+            output.window.as_ref(),
+            sort,
+            vars,
+        ),
         WindowOp::Rank => Ok(window_rank_values(docs, indices, sort, false)),
         WindowOp::DenseRank => Ok(window_rank_values(docs, indices, sort, true)),
         WindowOp::DocumentNumber => Ok((1..=indices.len()).map(Value::from).collect()),
@@ -1617,6 +2138,27 @@ fn window_output_values(
             by,
             default,
         } => window_shift_values(docs, indices, output, *by, default.as_ref(), vars),
+        WindowOp::ExpMovingAvg { input, alpha } => {
+            window_exp_moving_avg_values(docs, indices, input, *alpha, vars)
+        }
+        WindowOp::Derivative { input, unit } => window_derivative_values(
+            docs,
+            indices,
+            input,
+            unit.as_deref(),
+            output.window.as_ref(),
+            sort,
+            vars,
+        ),
+        WindowOp::Integral { input, unit } => window_integral_values(
+            docs,
+            indices,
+            input,
+            unit.as_deref(),
+            output.window.as_ref(),
+            sort,
+            vars,
+        ),
     }
 }
 
@@ -1643,14 +2185,30 @@ fn set_window_fields(
                 | WindowOp::DenseRank
                 | WindowOp::DocumentNumber
                 | WindowOp::Shift { .. }
+                | WindowOp::ExpMovingAvg { .. }
+                | WindowOp::Derivative { .. }
+                | WindowOp::Integral { .. }
         ) || matches!(
             &output.op,
             WindowOp::Accumulator(op, _) if op == "$first" || op == "$last"
-        )
+        ) || matches!(&output.window, Some(WindowFrame::Range { .. }))
     });
     if needs_sort && sort.is_empty() {
         return Err(Error::Query(
-            "$setWindowFields ranking, $shift, $first, and $last require `sortBy`".into(),
+            "$setWindowFields ranking, $shift, $first, $last, range, $expMovingAvg, $derivative, and $integral require `sortBy`"
+                .into(),
+        ));
+    }
+    let needs_single_sort = outputs.iter().any(|output| {
+        matches!(
+            output.op,
+            WindowOp::Derivative { .. } | WindowOp::Integral { .. }
+        ) || matches!(&output.window, Some(WindowFrame::Range { .. }))
+    });
+    if needs_single_sort && sort.len() != 1 {
+        return Err(Error::Query(
+            "$setWindowFields range, $derivative, and $integral require exactly one sortBy field"
+                .into(),
         ));
     }
 
@@ -4485,9 +5043,18 @@ mod tests {
         assert_eq!(spec.when_not_matched, MergeWhenNotMatched::Discard);
 
         assert!(write_stage_spec(&[json!({"$out": "target"}), json!({"$match": {}})]).is_err());
+        let spec = write_stage_spec(&[json!({"$merge": {
+            "into": "target",
+            "whenMatched": [{"$set": {"x": 1}}],
+            "let": {"threshold": 10}
+        }})])
+        .unwrap()
+        .unwrap();
+        assert!(matches!(spec.when_matched, MergeWhenMatched::Pipeline(_)));
+        assert_eq!(spec.let_vars.len(), 1);
         assert!(write_stage_spec(&[json!({"$merge": {
             "into": "target",
-            "whenMatched": [{"$set": {"x": 1}}]
+            "whenMatched": [{"$group": {"_id": "$x"}}]
         }})])
         .is_err());
     }

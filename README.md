@@ -253,6 +253,8 @@ single-database directories are migrated to `default/` on startup. See
   `$replaceWith`, `$sample`, `$facet`, `$lookup`, `$unionWith`, `$graphLookup`,
   `$setWindowFields`, `$densify`, `$fill`, `$sort`, `$skip`, `$limit`,
   `$count`, `$out`, and `$merge`.
+- Window analytics include document and range frames, `$expMovingAvg`,
+  `$derivative`, and `$integral`.
 - Accumulators: `$sum`, `$avg`, `$min`, `$max`, `$first`, `$last`, `$push`,
   `$addToSet`, and `$count`.
 - Consecutive leading `$match` stages are fused, and a terminal `$count` skips

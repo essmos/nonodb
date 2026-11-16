@@ -6,6 +6,7 @@
 //! `fsync` per batch. The client response is sent only after the commit.
 
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -665,6 +666,35 @@ fn aggregate_out(
     }))
 }
 
+fn merge_when_matched_pipeline(
+    existing: &Value,
+    incoming: &Value,
+    stages: &[Value],
+    expressions: &[(String, Value)],
+) -> Result<Value, ApiError> {
+    let mut vars = BTreeMap::new();
+    for (name, expression) in expressions {
+        let value = nonodb_core::aggregate::eval_expression(incoming, expression, &vars)?;
+        vars.insert(name.clone(), value);
+    }
+    vars.insert("new".to_string(), incoming.clone());
+    let mut out = nonodb_core::aggregate::run_with_vars(vec![existing.clone()], stages, 1, &vars)?;
+    if out.len() != 1 {
+        return Err(ApiError {
+            code: "invalid_query".into(),
+            message: "$merge whenMatched pipeline must produce exactly one document".into(),
+        });
+    }
+    let replacement = out.pop().expect("checked length");
+    if !replacement.is_object() {
+        return Err(ApiError {
+            code: "invalid_query".into(),
+            message: "$merge whenMatched pipeline must produce an object".into(),
+        });
+    }
+    Ok(replacement)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn aggregate_merge(
     store: &Store,
@@ -707,7 +737,7 @@ fn aggregate_merge(
                     });
                 }
             }
-            match spec.when_matched {
+            match &spec.when_matched {
                 nonodb_core::aggregate::MergeWhenMatched::KeepExisting => {
                     skipped += 1;
                 }
@@ -724,6 +754,47 @@ fn aggregate_merge(
                         .as_object_mut()
                         .expect("object checked above")
                         .insert("_id".to_string(), Value::String(id.clone()));
+                    let update = json!([{"$replaceWith": replacement}]);
+                    let out = target.update_opts_txn_filtered(
+                        wtxn,
+                        &json!({"_id": id}),
+                        &update,
+                        false,
+                        false,
+                        &[],
+                    )?;
+                    modified += out.modified;
+                    if let Some(config) = &config {
+                        emit_by_id(
+                            store,
+                            wtxn,
+                            &target,
+                            &spec.target,
+                            "update",
+                            &id,
+                            Some(&existing),
+                            config,
+                            replication,
+                        )?;
+                    }
+                }
+                nonodb_core::aggregate::MergeWhenMatched::Pipeline(stages) => {
+                    let mut replacement =
+                        merge_when_matched_pipeline(&existing, &doc, stages, &spec.let_vars)?;
+                    let replacement_id = replacement.get("_id");
+                    if let Some(result_id) = replacement_id {
+                        if result_id.as_str() != Some(id.as_str()) {
+                            return Err(ApiError {
+                                code: "invalid_query".into(),
+                                message: "$merge cannot change an existing document `_id`".into(),
+                            });
+                        }
+                    } else {
+                        replacement
+                            .as_object_mut()
+                            .expect("pipeline output is an object")
+                            .insert("_id".to_string(), Value::String(id.clone()));
+                    }
                     let update = json!([{"$replaceWith": replacement}]);
                     let out = target.update_opts_txn_filtered(
                         wtxn,
@@ -1796,6 +1867,60 @@ mod tests {
         assert_eq!(first["_id"], "old");
         assert_eq!(first["val"], 2);
         assert!(first.get("keep").is_none());
+
+        let out = execute_commit(
+            &store,
+            &WriteReq::Aggregate {
+                coll: "source".to_string(),
+                pipeline: vec![
+                    json!({"$unset": "_id"}),
+                    json!({"$merge": {
+                        "into": "target",
+                        "on": "k",
+                        "let": {"threshold": 100},
+                        "whenMatched": [
+                            {"$set": {
+                                "val": {"$add": ["$val", "$$new.val"]},
+                                "threshold": "$$threshold"
+                            }},
+                            {"$project": {"k": 1, "val": 1, "threshold": 1}}
+                        ],
+                        "whenNotMatched": "discard"
+                    }}),
+                ],
+                max_time_ms: None,
+                database: "default".to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(out["matched"], 3);
+        assert_eq!(out["modified"], 3);
+        assert_eq!(out["inserted"], 0);
+        let docs = all(&store, "target");
+        assert_eq!(docs.len(), 3);
+        for (k, expected) in [(1, 4), (2, 6), (3, 8)] {
+            let doc = docs.iter().find(|doc| doc["k"] == k).unwrap();
+            assert_eq!(doc["val"], expected);
+            assert_eq!(doc["threshold"], 100);
+        }
+
+        let result = execute_commit(
+            &store,
+            &WriteReq::Aggregate {
+                coll: "source".to_string(),
+                pipeline: vec![
+                    json!({"$unset": "_id"}),
+                    json!({"$merge": {
+                        "into": "target",
+                        "on": "k",
+                        "whenMatched": [{"$set": {"_id": "changed"}}]
+                    }}),
+                ],
+                max_time_ms: None,
+                database: "default".to_string(),
+            },
+        );
+        assert!(result.is_err());
     }
 
     #[test]

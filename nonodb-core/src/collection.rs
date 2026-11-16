@@ -9612,6 +9612,7 @@ mod tests {
                         "running": {"$sum": "$amount", "window": {"documents": ["unbounded", "current"]}},
                         "allTotal": {"$sum": "$amount"},
                         "sum3": {"$sum": "$amount", "window": {"documents": [-1, 1]}},
+                        "rangeTotal": {"$sum": "$amount", "window": {"range": [-1, 1]}},
                         "rank": {"$rank": {}},
                         "dense": {"$denseRank": {}},
                         "row": {"$documentNumber": {}},
@@ -9626,6 +9627,7 @@ mod tests {
         assert_eq!(out.len(), 4);
         assert_eq!(out[0]["running"], 10);
         assert_eq!(out[0]["sum3"], 30);
+        assert_eq!(out[0]["rangeTotal"], 30);
         assert_eq!(out[0]["rank"], 1);
         assert_eq!(out[0]["dense"], 1);
         assert_eq!(out[0]["row"], 1);
@@ -9636,6 +9638,7 @@ mod tests {
 
         assert_eq!(out[1]["running"], 30);
         assert_eq!(out[1]["sum3"], 35);
+        assert_eq!(out[1]["rangeTotal"], 35);
         assert_eq!(out[1]["rank"], 2);
         assert_eq!(out[1]["dense"], 2);
         assert_eq!(out[1]["row"], 2);
@@ -9646,6 +9649,7 @@ mod tests {
 
         assert_eq!(out[2]["running"], 35);
         assert_eq!(out[2]["sum3"], 25);
+        assert_eq!(out[2]["rangeTotal"], 25);
         assert_eq!(out[2]["rank"], 3);
         assert_eq!(out[2]["dense"], 3);
         assert_eq!(out[2]["row"], 3);
@@ -9656,6 +9660,7 @@ mod tests {
 
         assert_eq!(out[3]["running"], 7);
         assert_eq!(out[3]["sum3"], 7);
+        assert_eq!(out[3]["rangeTotal"], 7);
         assert_eq!(out[3]["rank"], 1);
         assert_eq!(out[3]["row"], 1);
         assert_eq!(out[3]["prev"], 0);
@@ -9671,7 +9676,7 @@ mod tests {
             .aggregate(&[json!({"$setWindowFields": {
                 "sortBy": {"day": 1},
                 "output": {
-                    "sum": {"$sum": "$amount", "window": {"range": ["unbounded", "current"]}}
+                    "sum": {"$sum": "$amount", "window": {"range": [-1, 1], "unit": "day"}}
                 }
             }})])
             .is_err());
@@ -9708,6 +9713,94 @@ mod tests {
         assert_eq!(out[0]["row"], 1);
         assert_eq!(out[1]["row"], 2);
         assert_eq!(out[2]["row"], 3);
+    }
+
+    #[test]
+    fn advanced_window_range_derivative_integral_and_ema() {
+        let (_dir, store) = store();
+        let c = store.collection("window_advanced").unwrap();
+        for (id, x, value) in [("a", 1, 10), ("b", 2, 20), ("c", 4, 40), ("d", 8, 80)] {
+            c.insert_one(json!({"_id": id, "x": x, "value": value}))
+                .unwrap();
+        }
+        let out = c
+            .aggregate(&[
+                json!({"$setWindowFields": {
+                    "sortBy": {"x": 1},
+                    "output": {
+                        "ema": {"$expMovingAvg": {"input": "$value", "N": 3}},
+                        "derivative": {"$derivative": {"input": "$value"}},
+                        "integral": {"$integral": {"input": "$value"}},
+                        "rangeSum": {"$sum": "$value", "window": {"range": [-1, 1]}},
+                        "rangeDerivative": {
+                            "$derivative": {"input": "$value"},
+                            "window": {"range": [-1, 1]}
+                        }
+                    }
+                }}),
+                json!({"$sort": {"_id": 1}}),
+            ])
+            .unwrap();
+        assert_eq!(out.len(), 4);
+        assert_eq!(out[0]["ema"], 10.0);
+        assert_eq!(out[1]["ema"], 15.0);
+        assert_eq!(out[2]["ema"], 27.5);
+        assert_eq!(out[3]["ema"], 53.75);
+        for row in &out {
+            assert_eq!(row["derivative"], 10.0);
+            assert_eq!(row["integral"], 315.0);
+        }
+        assert_eq!(out[0]["rangeSum"], 30);
+        assert_eq!(out[1]["rangeSum"], 30);
+        assert_eq!(out[2]["rangeSum"], 40);
+        assert_eq!(out[3]["rangeSum"], 80);
+        assert_eq!(out[0]["rangeDerivative"], 10.0);
+        assert_eq!(out[1]["rangeDerivative"], 10.0);
+        assert!(out[2]["rangeDerivative"].is_null());
+        assert!(out[3]["rangeDerivative"].is_null());
+
+        let dates = store.collection("window_dates").unwrap();
+        for (id, ts, value) in [
+            ("a", "2024-01-01T00:00:00Z", 1),
+            ("b", "2024-01-01T01:00:00Z", 2),
+            ("c", "2024-01-01T03:00:00Z", 4),
+        ] {
+            let date =
+                crate::date::canonical(crate::date::parse_value(&json!({"$date": ts})).unwrap());
+            dates
+                .insert_one(json!({"_id": id, "ts": date, "value": value}))
+                .unwrap();
+        }
+        let out = dates
+            .aggregate(&[
+                json!({"$setWindowFields": {
+                    "sortBy": {"ts": 1},
+                    "output": {
+                        "rangeSum": {
+                            "$sum": "$value",
+                            "window": {"range": [-1, 1], "unit": "hour"}
+                        }
+                    }
+                }}),
+                json!({"$sort": {"_id": 1}}),
+            ])
+            .unwrap();
+        assert_eq!(out[0]["rangeSum"], 3);
+        assert_eq!(out[1]["rangeSum"], 3);
+        assert_eq!(out[2]["rangeSum"], 4);
+
+        assert!(c
+            .aggregate(&[json!({"$setWindowFields": {
+                "sortBy": {"x": 1},
+                "output": {"bad": {"$expMovingAvg": {"input": "$value"}}}
+            }})])
+            .is_err());
+        assert!(c
+            .aggregate(&[json!({"$setWindowFields": {
+                "sortBy": {"x": 1},
+                "output": {"bad": {"$derivative": {"input": "$value"}, "window": {"documents": [0, 0]}}}
+            }})])
+            .is_ok());
     }
 
     #[test]

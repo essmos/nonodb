@@ -102,9 +102,10 @@ Implemented:
 - The aggregation pipeline is bounded by `NONODB_AGGREGATE_MAX_DOCS` (default
   100,000 intermediate documents). It supports equality `$lookup` joins,
   `$lookup` `let` variables, nested lookups, `$unionWith`, `$graphLookup`,
-  `$setWindowFields`, `$densify`, `$fill`, `$out`, `$merge`, `$facet`,
-  `$bucket`, and `$bucketAuto`, but not advanced window analytics or `$merge`
-  `whenMatched` pipelines. Group state is held in memory; there is no disk spill.
+  `$setWindowFields` with document/range frames and advanced analytics,
+  `$densify`, `$fill`, `$out`, `$merge` with `let` and `whenMatched` pipelines,
+  `$facet`, `$bucket`, and `$bucketAuto`. Group state is held in memory; there
+  is no disk spill.
 - No `$where` or `$text` query operator.
 - `$jsonSchema` supports the common validation keywords but not every JSON
   Schema draft feature.
@@ -299,7 +300,7 @@ project's target workload.
 13. **Expanded aggregation** beyond the current `$match`/`$group`/`$bucket`/
     `$bucketAuto`/`$project`/`$sort`/`$limit`/`$facet`/`$sample`/`$lookup`/
     `$unionWith`/`$graphLookup`/`$setWindowFields`/`$densify`/`$fill`/`$out`/
-    `$merge` subset, including streaming execution and advanced window analytics.
+    `$merge` subset, including streaming execution.
 
 ### Lower priority
 
