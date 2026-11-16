@@ -135,8 +135,8 @@ provide:
   [replication and cluster guide](docs/replication-cluster-guide.md);
 - general interactive multi-document transactions;
 - full MongoDB wire-protocol compatibility; an experimental unauthenticated
-  listener covers CRUD, cursors, aggregation, and index DDL, but not collection
-  DDL, sessions, transactions, or authentication;
+  listener covers CRUD, cursors, aggregation, index DDL, and collection DDL,
+  but not sessions, transactions, or authentication;
 - a role hierarchy or inherited groups; authorization uses principals and
   database-qualified scopes;
 - the full MongoDB query and update language; it implements a practical subset.

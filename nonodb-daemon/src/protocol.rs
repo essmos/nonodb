@@ -651,6 +651,9 @@ pub enum WriteReq {
         ttl_seconds: Option<u64>,
         ttl_purge_history: Option<bool>,
     },
+    DropCollection {
+        coll: String,
+    },
     SetCollectionTtl {
         coll: String,
         ttl_seconds: Option<u64>,

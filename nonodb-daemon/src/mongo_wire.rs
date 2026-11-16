@@ -130,6 +130,10 @@ async fn dispatch_command(
         Some("createIndexes") => create_indexes_command(state, body).await,
         Some("listIndexes") => list_indexes_command(state, body).await,
         Some("dropIndexes") => drop_indexes_command(state, body).await,
+        Some("create") => create_collection_command(state, body).await,
+        Some("drop") => drop_collection_command(state, body).await,
+        Some("listCollections") => list_collections_command(state, body).await,
+        Some("listDatabases") => list_databases_command(state).await,
         Some("endSessions") | Some("refreshSessions") => Ok(doc_ok()),
         Some("ping")
         | Some("hello")
@@ -701,6 +705,147 @@ async fn aggregate_command(state: &super::AppState, body: &Document) -> Result<D
         docs,
         true,
     ))
+}
+
+async fn create_collection_command(
+    state: &super::AppState,
+    body: &Document,
+) -> Result<Document, ApiError> {
+    let collection = body
+        .get_str("create")
+        .map_err(|_| bad_value("create must name a collection"))?
+        .to_string();
+    let database = database_name(body);
+    for unsupported in [
+        "capped",
+        "size",
+        "max",
+        "validator",
+        "validationLevel",
+        "validationAction",
+        "viewOn",
+        "pipeline",
+        "collation",
+        "timeseries",
+        "expireAfterSeconds",
+        "storageEngine",
+        "indexOptionDefaults",
+        "changeStreamPreAndPostImages",
+        "clusteredIndex",
+    ] {
+        if body.contains_key(unsupported) {
+            return Err(bad_value(format!(
+                "collection option `{unsupported}` is not supported by NonoDB"
+            )));
+        }
+    }
+    let runtime = database_for_write(state, &database).await?;
+    let (_, response) = super::submit_write(
+        &runtime,
+        WriteReq::CreateCollection {
+            coll: collection,
+            profile: nonodb_core::CollectionProfile::Standard,
+            ttl_seconds: None,
+            ttl_purge_history: None,
+        },
+        Durability::Full,
+    )
+    .await;
+    let api = response.0;
+    if let Some(error) = api.error {
+        return Err(error);
+    }
+    Ok(doc_ok())
+}
+
+async fn drop_collection_command(
+    state: &super::AppState,
+    body: &Document,
+) -> Result<Document, ApiError> {
+    let collection = body
+        .get_str("drop")
+        .map_err(|_| bad_value("drop must name a collection"))?
+        .to_string();
+    let database = database_name(body);
+    let runtime = database_for_write(state, &database).await?;
+    let (_, response) = super::submit_write(
+        &runtime,
+        WriteReq::DropCollection {
+            coll: collection.clone(),
+        },
+        Durability::Full,
+    )
+    .await;
+    let api = response.0;
+    if let Some(error) = api.error {
+        return Err(error);
+    }
+    Ok(bson::doc! {
+        "ns": format!("{database}.{collection}"),
+        "ok": 1.0,
+    })
+}
+
+async fn list_collections_command(
+    state: &super::AppState,
+    body: &Document,
+) -> Result<Document, ApiError> {
+    let database = database_name(body);
+    let namespace = format!("{database}.$cmd.listCollections");
+    let Some(runtime) = database_for_read(state, &database).await else {
+        return Ok(cursor_reply(0, &namespace, Vec::new(), true));
+    };
+    let store = runtime.store.clone();
+    let names = tokio::task::spawn_blocking(move || {
+        let rtxn = store.read_txn()?;
+        let names = store.collections_in(&rtxn)?;
+        rtxn.commit()?;
+        Ok::<Vec<String>, nonodb_core::Error>(names)
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("listCollections join error: {error}")))??;
+    let name_only = body.get_bool("nameOnly").unwrap_or(false);
+    let mut batch = Vec::with_capacity(names.len());
+    for name in names {
+        if name.starts_with('\u{1}') || name == crate::databases::DEFAULT_DATABASE {
+            continue;
+        }
+        let mut doc = bson::doc! {
+            "name": name.clone(),
+            "type": "collection",
+        };
+        if !name_only {
+            doc.insert("options", Bson::Document(Document::new()));
+            doc.insert("info", Bson::Document(bson::doc! {"readOnly": false}));
+            doc.insert(
+                "idIndex",
+                Bson::Document(bson::doc! {
+                    "v": 2i32,
+                    "key": Bson::Document(bson::doc! {"_id": 1i32}),
+                    "name": "_id_",
+                }),
+            );
+        }
+        batch.push(Bson::Document(doc));
+    }
+    Ok(cursor_reply(0, &namespace, batch, true))
+}
+
+async fn list_databases_command(state: &super::AppState) -> Result<Document, ApiError> {
+    let names = state.databases.names().await;
+    let mut databases = Vec::with_capacity(names.len());
+    for name in names {
+        databases.push(Bson::Document(bson::doc! {
+            "name": name,
+            "sizeOnDisk": 0i64,
+            "empty": false,
+        }));
+    }
+    Ok(bson::doc! {
+        "databases": Bson::Array(databases),
+        "totalSize": 0i64,
+        "ok": 1.0,
+    })
 }
 
 async fn create_indexes_command(

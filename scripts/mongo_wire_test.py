@@ -8,6 +8,7 @@ Start the daemon with NONODB_MONGO_ADDR=127.0.0.1:37017, then run:
 
 import os
 import sys
+import uuid
 
 from bson import ObjectId
 from pymongo import MongoClient, ReturnDocument
@@ -43,6 +44,15 @@ def main() -> int:
         )
         assert changed["n"] == 2
         assert coll.find_one_and_delete({"_id": "fm"})["n"] == 2
+
+        ddl_name = f"ddl_smoke_{uuid.uuid4().hex[:8]}"
+        ddl = db.create_collection(ddl_name)
+        assert ddl_name in db.list_collection_names()
+        ddl.insert_one({"ddl": True})
+        assert ddl.count_documents({}) == 1
+        ddl.drop()
+        assert ddl_name not in db.list_collection_names()
+        assert db.name in client.list_database_names()
 
         assert coll.create_index("group") == "group_1"
         index_names = [index["name"] for index in coll.list_indexes()]

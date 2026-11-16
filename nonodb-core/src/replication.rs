@@ -55,6 +55,9 @@ pub enum ReplicationOp {
         ttl_seconds: Option<u64>,
         ttl_purge_history: Option<bool>,
     },
+    CollectionDrop {
+        name: String,
+    },
     CollectionTtl {
         coll: String,
         ttl_seconds: Option<u64>,
@@ -245,6 +248,31 @@ mod tests {
 
         assert_eq!(store.prune_replication_through(1).unwrap(), 1);
         assert_eq!(store.replication_after(0, 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn collection_drop_replication_is_atomic() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let txn = ReplicationTxn::new_with_ops(
+            1,
+            "node-a",
+            0,
+            Vec::new(),
+            vec![
+                ReplicationOp::CollectionCreate {
+                    name: "orders".into(),
+                    profile: "standard".into(),
+                    ttl_seconds: None,
+                    ttl_purge_history: None,
+                },
+                ReplicationOp::CollectionDrop {
+                    name: "orders".into(),
+                },
+            ],
+        );
+        assert!(store.apply_replication_txn(&txn).unwrap());
+        assert!(!store.collections().unwrap().contains(&"orders".to_string()));
     }
 
     #[test]

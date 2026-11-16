@@ -1375,48 +1375,51 @@ impl Store {
     /// This is an offline/admin operation. The daemon should quiesce direct
     /// access to the collection while it runs.
     pub fn drop_collection(&self, name: &str) -> Result<bool> {
+        let mut wtxn = self.write_txn()?;
+        let dropped = self.drop_collection_in(&mut wtxn, name)?;
+        wtxn.commit()?;
+        Ok(dropped)
+    }
+
+    /// Drops a collection and all of its metadata in a caller-provided write
+    /// transaction. The daemon writer uses this to keep collection DDL in the
+    /// same single-writer transaction as replication capture.
+    pub fn drop_collection_in(&self, wtxn: &mut RwTxn<'_>, name: &str) -> Result<bool> {
         Self::validate_name(name)?;
-        let rtxn = self.read_txn()?;
         let meta: Database<Bytes, Bytes> = self
             .env
-            .open_database(&rtxn, Some(META_DB))?
+            .open_database(&*wtxn, Some(META_DB))?
             .ok_or_else(|| Error::Query("meta database missing".into()))?;
         if meta
-            .get(&rtxn, format!("collection:{name}").as_bytes())?
+            .get(&*wtxn, format!("collection:{name}").as_bytes())?
             .is_none()
         {
-            rtxn.commit()?;
             return Ok(false);
         }
-        let Some(collection) = self.collection_at(&rtxn, name)? else {
-            rtxn.commit()?;
+        let Some(collection) = self.collection_at(&*wtxn, name)? else {
             return Ok(false);
         };
-        let indexes = collection.index_defs_in(&rtxn)?;
-        let vectors = collection.list_vector_indexes_in(&rtxn)?;
-        let texts = collection.list_text_indexes_in(&rtxn)?;
-        let fuzzies = collection.list_fuzzy_indexes_in(&rtxn)?;
-        rtxn.commit()?;
+        let indexes = collection.index_defs_in(&*wtxn)?;
+        let vectors = collection.list_vector_indexes_in(&*wtxn)?;
+        let texts = collection.list_text_indexes_in(&*wtxn)?;
+        let fuzzies = collection.list_fuzzy_indexes_in(&*wtxn)?;
 
-        let collection = self.collection(name)?;
         for def in indexes {
-            collection.drop_index(&def.name())?;
+            collection.drop_index_txn(wtxn, &def.name())?;
         }
         for def in vectors {
-            collection.drop_vector_index(&def.field)?;
+            collection.drop_vector_index_txn(wtxn, &def.field)?;
         }
         for field in texts {
-            collection.drop_text_index(&field)?;
+            collection.drop_text_index_txn(wtxn, &field)?;
         }
         for field in fuzzies {
-            collection.drop_fuzzy_index(&field)?;
+            collection.drop_fuzzy_index_txn(wtxn, &field)?;
         }
 
-        let mut wtxn = self.write_txn()?;
-        if let Some(db) = self.env.open_database::<Bytes, Bytes>(&wtxn, Some(name))? {
-            db.clear(&mut wtxn)?;
+        if let Some(db) = self.env.open_database::<Bytes, Bytes>(&*wtxn, Some(name))? {
+            db.clear(&mut *wtxn)?;
         }
-        let meta: Database<Bytes, Bytes> = self.env.create_database(&mut wtxn, Some(META_DB))?;
         let exact = [
             format!("collection:{name}"),
             format!("profile:{name}"),
@@ -1434,7 +1437,7 @@ impl Store {
             format!("fttotal:{name}:"),
         ];
         let mut meta_keys = Vec::new();
-        for item in meta.iter(&wtxn)? {
+        for item in meta.iter(&*wtxn)? {
             let (key, _) = item?;
             if exact.iter().any(|item| item.as_bytes() == key)
                 || prefixes
@@ -1445,22 +1448,22 @@ impl Store {
             }
         }
         for key in meta_keys {
-            meta.delete(&mut wtxn, key.as_slice())?;
+            meta.delete(&mut *wtxn, key.as_slice())?;
         }
 
         let mut history_keys = Vec::new();
-        for item in self.history.iter(&wtxn)? {
+        for item in self.history.iter(&*wtxn)? {
             let (key, _) = item?;
             if history::parse_key(key).is_some_and(|(coll, _, _)| coll == name) {
                 history_keys.push(key.to_vec());
             }
         }
         for key in history_keys {
-            self.history.delete(&mut wtxn, key.as_slice())?;
+            self.history.delete(&mut *wtxn, key.as_slice())?;
         }
 
         let mut ttl_keys = Vec::new();
-        for item in self.ttl.iter(&wtxn)? {
+        for item in self.ttl.iter(&*wtxn)? {
             let (key, _) = item?;
             let matches = ttl::parse_expiry_key(key).is_some_and(|(_, coll, _)| coll == name)
                 || ttl::parse_id_key(key).is_some_and(|(coll, _)| coll == name);
@@ -1469,10 +1472,9 @@ impl Store {
             }
         }
         for key in ttl_keys {
-            self.ttl.delete(&mut wtxn, key.as_slice())?;
+            self.ttl.delete(&mut *wtxn, key.as_slice())?;
         }
 
-        wtxn.commit()?;
         Ok(true)
     }
 
@@ -1928,6 +1930,9 @@ impl Store {
                     *ttl_purge_history,
                 )?;
                 Ok(())
+            }
+            ReplicationOp::CollectionDrop { name } => {
+                self.drop_collection_in(wtxn, name).map(|_| ())
             }
             ReplicationOp::CollectionTtl {
                 coll,

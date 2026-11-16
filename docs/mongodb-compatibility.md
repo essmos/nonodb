@@ -7,7 +7,7 @@ practical map, not a claim of drop-in replacement.
 > query language. It also has an **experimental, unauthenticated MongoDB wire
 > listener** for a practical CRUD subset. That listener is not a drop-in MongoDB
 > replacement: it does not yet implement sessions, transactions, change
-> streams, collection DDL, or authentication. The HTTP API and the
+> streams, or authentication. The HTTP API and the
 > Python/Rust/Node.js/Go clients remain the supported interfaces.
 
 The assessment below is verified against NonoDB `0.25.x`.
@@ -32,7 +32,7 @@ The assessment below is verified against NonoDB `0.25.x`.
 | Aggregation expressions | ~70% | Broad but not exhaustive; no IANA time zones or user-defined JavaScript |
 | Indexes | ~65% | No sparse/partial/wildcard indexes, collation, or TTL index options |
 | BSON scalar types | ~75% | ObjectId `_id`, Date, Decimal128, Binary/UUID and numeric mapping; no Timestamp/MinKey/MaxKey |
-| Wire protocol and drivers | ~40% | Experimental handshake plus CRUD, cursors, count, distinct, aggregate, and index DDL; no auth, collection DDL, sessions, or transactions |
+| Wire protocol and drivers | ~45% | Experimental handshake plus CRUD, cursors, count, distinct, aggregate, index DDL, and collection DDL; no auth, sessions, or transactions |
 | Transactions and change streams | ~10% | Atomic write batches and outbox events exist, but not MongoDB APIs |
 
 These percentages are editorial estimates of the language/API surface that a
@@ -48,8 +48,8 @@ direct migration target.
 
 | Feature | Status | Notes |
 |---|---|---|
-| MongoDB wire protocol | 🟡 | Experimental listener with handshake, CRUD, cursors, count, distinct, aggregate, and index DDL; no collection DDL, sessions, or auth |
-| Official MongoDB drivers | 🟡 | PyMongo smoke-tested for CRUD, cursors, count, distinct, aggregate, and index DDL; no collection DDL or auth |
+| MongoDB wire protocol | 🟡 | Experimental listener with handshake, CRUD, cursors, count, distinct, aggregate, index DDL, and collection DDL; no sessions or auth |
+| Official MongoDB drivers | 🟡 | PyMongo smoke-tested for CRUD, cursors, count, distinct, aggregate, index DDL, and collection DDL; no auth |
 | `mongosh` | ❌ | Use the NonoDB CLI, GUI, or HTTP API |
 | MongoDB URI / `mongodb://` | 🟡 | Only a single direct connection to `NONODB_MONGO_ADDR`; no replica-set or auth URIs |
 | Sessions | ❌ | No server sessions or causal consistency |
@@ -71,7 +71,7 @@ Set `NONODB_MONGO_ADDR=127.0.0.1:27017` and connect with a MongoDB driver using
 | `update` / `delete` / `findAndModify` | ✅ |
 | `count` / `distinct` / basic `aggregate` | ✅ |
 | `createIndexes` / `listIndexes` / `dropIndexes` | ✅ |
-| `create` / `drop` / `listCollections` / `listDatabases` | ❌ |
+| `create` / `drop` / `listCollections` / `listDatabases` | ✅ |
 | SCRAM authentication / TLS client auth | ❌ |
 | Sessions / transactions / change streams | ❌ |
 
@@ -257,8 +257,8 @@ A migration from MongoDB to NonoDB should check these items first:
 
 1. **ObjectId `_id`** — supported, including default driver-generated ObjectIds.
 2. **Drivers** — the experimental wire listener covers CRUD, cursors, count,
-   distinct, aggregate, and index DDL only; use a NonoDB client for collection
-   DDL and authentication.
+   distinct, aggregate, index DDL, and collection DDL only; use a NonoDB client
+   for authentication and server administration.
 3. **Transactions and sessions** — redesign around atomic `write_batch`,
    idempotent operations, or application-level compensation.
 4. **Change streams** — replace with outbox events, `watch`, or subscriptions.

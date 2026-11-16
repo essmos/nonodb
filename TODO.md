@@ -274,7 +274,8 @@ Design: [docs/replication.md](docs/replication.md).
 - [x] MongoDB wire `insert`, `find`, `getMore`, and `killCursors`
 - [x] MongoDB wire `update`, `delete`, `findAndModify`, `count`, `distinct`, `aggregate`
 - [x] MongoDB wire createIndexes/listIndexes/dropIndexes
-- [ ] MongoDB wire create/drop/listCollections/listDatabases
+- [x] MongoDB wire create/drop/listCollections/listDatabases
+- [ ] MongoDB wire dropDatabase
 - [ ] MongoDB wire SCRAM authentication
 - [x] Index union for top-level `$or` across indexed fields
 - [x] Use an index for sort-only queries without a filter

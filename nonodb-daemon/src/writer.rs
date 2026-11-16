@@ -968,6 +968,11 @@ fn execute(
                 "purge_history": c.ttl_purge_history(),
             }))
         }
+        WriteReq::DropCollection { coll } => {
+            let dropped = store.drop_collection_in(wtxn, coll)?;
+            replication.capture_op(ReplicationOp::CollectionDrop { name: coll.clone() });
+            Ok(json!({"dropped": dropped, "coll": coll}))
+        }
         WriteReq::SetCollectionTtl {
             coll,
             ttl_seconds,
