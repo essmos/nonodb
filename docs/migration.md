@@ -37,7 +37,7 @@ normal client.
 | `_id` type | string or ObjectId |
 | Atomicity | Per `insert_many` request; not across collections |
 | Vault collections | Not supported by the generic importer |
-| Unsupported BSON | Timestamp, MinKey/MaxKey, regex values, Code, Symbol, DBPointer |
+| Unsupported BSON | regex values, Code, Symbol, DBPointer |
 
 The importer defaults to 500 documents or 3,000,000 encoded bytes per request,
 whichever comes first. Lower `--batch-size` if individual documents are large.
@@ -221,7 +221,7 @@ hex string by the importer. ObjectIds in other fields stay as `$oid` values.
 If an application needs to preserve an ObjectId-shaped `_id` in a specific
 format, transform it before import and update the application lookup path.
 
-MongoDB timestamps, regular-expression document values, `MinKey`, `MaxKey`,
+Regular-expression document values,
 `Code`, `Symbol`, and `DBPointer` are not supported and must be dropped or
 converted to supported values first.
 

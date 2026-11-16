@@ -27,12 +27,12 @@ The assessment below is verified against NonoDB `0.25.x`.
 | CRUD and find semantics | ~90% | No MongoDB sessions, retryable writes, or multi-document transactions |
 | Query filters | ~80% | No `$where`, `$text`, collation, or full BSON regex values |
 | Projection | ~75% | `$meta` is approximate; no arbitrary computed projection expressions |
-| Updates | ~85% | Pipeline updates support a subset of stages; timestamp `$currentDate` is unsupported |
+| Updates | ~85% | Pipeline updates support a subset of stages |
 | Aggregation stages | ~70% | Many common stages work; system, search, geoNear, and change-stream stages are absent |
 | Aggregation expressions | ~70% | Broad but not exhaustive; no IANA time zones or user-defined JavaScript |
 | Indexes | ~65% | No sparse/partial/wildcard indexes, collation, or TTL index options |
-| BSON scalar types | ~75% | ObjectId `_id`, Date, Decimal128, Binary/UUID and numeric mapping; no Timestamp/MinKey/MaxKey |
-| Wire protocol and drivers | ~50% | Experimental handshake plus CRUD, sorted cursors, count, distinct, aggregate, index DDL, collection DDL, and dropDatabase; no auth, sessions, or transactions |
+| BSON scalar types | ~75% | ObjectId `_id`, Date, Decimal128, Binary/UUID, Timestamp, MinKey/MaxKey, and numeric mapping |
+| Wire protocol and drivers | ~55% | Experimental handshake plus CRUD, sorted cursors, count, distinct, aggregate, index DDL, collection DDL, dropDatabase, SCRAM auth, and TLS; no sessions or transactions |
 | Transactions and change streams | ~10% | Atomic write batches and outbox events exist, but not MongoDB APIs |
 
 These percentages are editorial estimates of the language/API surface that a
@@ -48,7 +48,7 @@ direct migration target.
 
 | Feature | Status | Notes |
 |---|---|---|
-| MongoDB wire protocol | 🟡 | Experimental listener with handshake, CRUD, cursors, count, distinct, aggregate, index DDL, and collection DDL; no sessions or auth |
+| MongoDB wire protocol | 🟡 | Experimental listener with handshake, CRUD, cursors, count, distinct, aggregate, index DDL, collection DDL, SCRAM auth, and TLS; no sessions |
 | Official MongoDB drivers | 🟡 | PyMongo smoke-tested for CRUD, cursors, count, distinct, aggregate, index DDL, collection DDL, and SCRAM auth |
 | `mongosh` | ❌ | Use the NonoDB CLI, GUI, or HTTP API |
 | MongoDB URI / `mongodb://` | 🟡 | Single direct connection to `NONODB_MONGO_ADDR`; username/password works with SCRAM-SHA-256 or SCRAM-SHA-1 when configured; no replica-set URIs |
@@ -159,7 +159,7 @@ allowed. Other BSON types are not accepted as `_id`.
 | `$set`, `$unset`, `$inc`, `$mul` | ✅ |
 | `$min`, `$max`, `$rename` | ✅ |
 | `$currentDate` (date) | ✅ |
-| `$currentDate` (timestamp) | ❌ |
+| `$currentDate` (timestamp) | ✅ |
 | `$bit` | ✅ |
 | `$pop`, `$push`, `$pull`, `$pullAll`, `$addToSet` | ✅ |
 | `$push` `$each`, `$position`, `$slice`, `$sort` | ✅ |
@@ -245,8 +245,8 @@ allowed. Other BSON types are not accepted as `_id`.
 | Binary / UUID | ✅ | `$binary` and `$uuid` |
 | ObjectId field value | ✅ | `$oid`; indexed and `$type`-aware |
 | ObjectId `_id` | ✅ | Accepted from drivers and stored without converting to a string |
-| Timestamp | ❌ | |
-| MinKey / MaxKey | ❌ | |
+| Timestamp | ✅ | Extended JSON `$timestamp`; indexed and `$type`-aware |
+| MinKey / MaxKey | ✅ | Sentinel values with BSON ordering and `$type` support |
 | Regular-expression value | ❌ | `$regex` filters work; BSON regex values do not |
 | Code / CodeWithScope / Symbol | ❌ | |
 | DBPointer / Undefined | ❌ | |
@@ -278,8 +278,7 @@ A migration from MongoDB to NonoDB should check these items first:
 6. **Collation** — normalize strings or enforce ordering in the application.
 7. **Sparse/partial/TTL indexes** — remodel as collection settings, separate
    indexes, or application logic.
-8. **BSON Timestamp/MinKey/MaxKey/regex values** — convert to supported values
-   before import.
+8. **BSON regex values** — rewrite as `$regex` filters or application logic.
 9. **Unsupported aggregation expressions/stages** — rewrite with supported
    stages or precompute outside the database.
 10. **Wire-protocol tooling** — `mongosh`, BI connectors, and monitoring

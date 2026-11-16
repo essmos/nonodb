@@ -179,6 +179,57 @@ fn object_id_storage_queries_indexes_and_sorting() {
 }
 
 #[test]
+fn timestamp_and_key_sentinels_query_index_and_sort() {
+    let (_dir, store) = store();
+    let c = store.collection("timekeys").unwrap();
+    c.create_index("ts", false).unwrap();
+    c.insert_one(
+        json!({"_id": "a", "ts": {"$timestamp": {"t": 100, "i": 1}}, "low": {"$minKey": 1}}),
+    )
+    .unwrap();
+    c.insert_one(
+        json!({"_id": "b", "ts": {"$timestamp": {"t": 100, "i": 2}}, "high": {"$maxKey": 1}}),
+    )
+    .unwrap();
+    c.insert_one(json!({"_id": "c", "ts": {"$timestamp": {"t": 200, "i": 1}}}))
+        .unwrap();
+
+    assert_eq!(
+        ids(&find(
+            &c,
+            json!({"ts": {"$gte": {"$timestamp": {"t": 100, "i": 2}}}})
+        )),
+        vec!["b", "c"]
+    );
+    assert_eq!(find(&c, json!({"ts": {"$type": "timestamp"}})).len(), 3);
+    assert_eq!(
+        ids(&find(&c, json!({"low": {"$type": "minKey"}}))),
+        vec!["a"]
+    );
+    assert_eq!(
+        ids(&find(&c, json!({"high": {"$type": "maxKey"}}))),
+        vec!["b"]
+    );
+
+    let docs = c
+        .find(&FindQuery {
+            sort: vec![("ts".to_string(), -1)],
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(ids(&docs), vec!["c", "b", "a"]);
+
+    c.update(
+        &json!({"_id": "c"}),
+        &json!({"$currentDate": {"now": {"$type": "timestamp"}}}),
+        false,
+    )
+    .unwrap();
+    let docs = find(&c, json!({"_id": "c"}));
+    assert_eq!(docs[0]["now"]["$timestamp"]["i"], 1);
+}
+
+#[test]
 fn invalid_binary_and_object_id_are_rejected() {
     let (_dir, store) = store();
     let c = store.collection("bad").unwrap();
@@ -194,6 +245,10 @@ fn invalid_binary_and_object_id_are_rejected() {
         .insert_one(json!({"_id": "bad", "v": {"$oid": "xyz"}}))
         .unwrap_err();
     assert!(matches!(err, nonodb_core::Error::InvalidObjectId(_)));
+    let err = c
+        .insert_one(json!({"_id": "bad", "v": {"$timestamp": {"t": -1, "i": 0}}}))
+        .unwrap_err();
+    assert!(matches!(err, nonodb_core::Error::InvalidTimestamp(_)));
     assert!(find(&c, json!({"_id": "bad"})).is_empty());
 }
 

@@ -262,28 +262,34 @@ fn apply_with(
             }
             "$currentDate" => {
                 let now = date::canonical(now_millis());
+                let now_timestamp = bson_types::timestamp_value(bson_types::Timestamp {
+                    time: u32::try_from(now_millis() / 1_000).unwrap_or(u32::MAX),
+                    increment: 1,
+                });
                 for (p, v) in args {
-                    let valid = match v {
-                        Value::Bool(true) => true,
-                        Value::Bool(false) => false,
-                        Value::Object(spec) if spec.len() == 1 => match spec.get("$type") {
-                            Some(Value::String(kind)) if kind == "date" => true,
-                            Some(Value::String(kind)) if kind == "timestamp" => {
+                    let value =
+                        match v {
+                            Value::Bool(true) => now.clone(),
+                            Value::Bool(false) => continue,
+                            Value::Object(spec) if spec.len() == 1 => match spec.get("$type") {
+                                Some(Value::String(kind)) if kind == "date" => now.clone(),
+                                Some(Value::String(kind)) if kind == "timestamp" => {
+                                    now_timestamp.clone()
+                                }
+                                _ => return Err(Error::Query(
+                                    "$currentDate expects true or {$type: \"date\"|\"timestamp\"}"
+                                        .into(),
+                                )),
+                            },
+                            _ => {
                                 return Err(Error::Query(
-                                    "$currentDate timestamp values are not supported".into(),
+                                    "$currentDate expects true or {$type: \"date\"|\"timestamp\"}"
+                                        .into(),
                                 ))
                             }
-                            _ => false,
-                        },
-                        _ => false,
-                    };
-                    if !valid {
-                        return Err(Error::Query(
-                            "$currentDate expects true or {$type: \"date\"}".into(),
-                        ));
-                    }
+                        };
                     for target in resolve_paths(doc, p, &ctx)? {
-                        path::set(doc, &target, now.clone())?;
+                        path::set(doc, &target, value.clone())?;
                     }
                 }
             }
@@ -1078,11 +1084,12 @@ mod tests {
         assert!(date::is_date(&doc["at"]));
 
         assert!(apply(&mut doc, &json!({"$rename": {"old": "_id"}})).is_err());
-        assert!(apply(
+        apply(
             &mut doc,
-            &json!({"$currentDate": {"at": {"$type": "timestamp"}}})
+            &json!({"$currentDate": {"ts": {"$type": "timestamp"}}}),
         )
-        .is_err());
+        .unwrap();
+        assert!(bson_types::is_timestamp(&doc["ts"]));
         assert!(apply(&mut doc, &json!({"$pop": {"n": 1}})).is_err());
         assert!(apply(&mut doc, &json!({"$bit": {"n": {"and": "x"}}})).is_err());
     }

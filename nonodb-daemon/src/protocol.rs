@@ -1106,6 +1106,7 @@ impl From<nonodb_core::Error> for ApiError {
             E::InvalidNumeric(_) => "invalid_numeric",
             E::InvalidBinary(_) => "invalid_binary",
             E::InvalidObjectId(_) => "invalid_object_id",
+            E::InvalidTimestamp(_) => "invalid_timestamp",
             E::Json(_) | E::JsonFast(_) => "invalid_json",
             E::Lmdb(_) => "storage",
             E::Io(_) => "io",

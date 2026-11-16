@@ -145,7 +145,7 @@ comparison and practical migration caveats.
   the Decimal128 exponent range return `invalid_numeric`.
 - Long text has no dedicated type; the 1 MiB document limit applies to strings.
 - ObjectId is supported as both a field value and `_id`.
-- BSON `Timestamp`, `MinKey`, `MaxKey`, regular-expression values, and legacy
+- BSON regular-expression values and legacy
   code/symbol types are not implemented.
 
 ### Updates
@@ -298,7 +298,7 @@ project's target workload.
    timezone identifiers for local calendar operations.
 10. **Non-finite Decimal128 values and decimal comparison across all numeric
     edge cases**, building on the current finite Decimal128 support.
-11. **BSON Timestamp and MinKey/MaxKey**, plus matching `$type` entries and
+11. **BSON regex values**, plus matching `$type` entries and
     global sentinel range behavior.
 12. **Compression and/or CBOR storage** for smaller files and faster parsing,
    with a migration path.

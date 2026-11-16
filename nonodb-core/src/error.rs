@@ -55,6 +55,9 @@ pub enum Error {
     #[error("invalid object id: {0}")]
     InvalidObjectId(String),
 
+    #[error("invalid timestamp: {0}")]
+    InvalidTimestamp(String),
+
     /// Vault/encryption error with a stable API code.
     #[error("{message}")]
     Vault { code: &'static str, message: String },

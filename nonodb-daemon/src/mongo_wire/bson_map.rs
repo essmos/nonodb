@@ -247,6 +247,9 @@ mod tests {
             "large": 9_007_199_254_740_993i64,
             "half": 0.5f64,
             "nan": f64::NAN,
+            "ts": bson::Timestamp { time: 1_700_000_000, increment: 7 },
+            "low": bson::Bson::MinKey,
+            "high": bson::Bson::MaxKey,
         };
         let value = document_to_value(&document).unwrap();
         assert_eq!(value["_id"], json!({"$oid": "000102030405060708090a0b"}));
@@ -263,6 +266,12 @@ mod tests {
         assert_eq!(value["large"], json!({"$numberLong": "9007199254740993"}));
         assert_eq!(value["half"], json!(0.5));
         assert_eq!(value["nan"], json!({"$numberDouble": "NaN"}));
+        assert_eq!(
+            value["ts"],
+            json!({"$timestamp": {"t": 1700000000u32, "i": 7u32}})
+        );
+        assert_eq!(value["low"], json!({"$minKey": 1}));
+        assert_eq!(value["high"], json!({"$maxKey": 1}));
 
         let back = document_to_bson(&value).unwrap();
         assert_eq!(
@@ -276,6 +285,12 @@ mod tests {
         assert_eq!(back.get_i32("small").unwrap(), 42);
         assert_eq!(back.get_i64("large").unwrap(), 9_007_199_254_740_993);
         assert!(back.get_f64("nan").unwrap().is_nan());
+        assert_eq!(
+            back.get_timestamp("ts").unwrap(),
+            document.get_timestamp("ts").unwrap()
+        );
+        assert_eq!(back.get("low"), Some(&Bson::MinKey));
+        assert_eq!(back.get("high"), Some(&Bson::MaxKey));
     }
 
     #[test]

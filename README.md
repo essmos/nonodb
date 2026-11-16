@@ -374,7 +374,8 @@ See [Dates and time zones](docs/dates.md) for formats, indexes, and limitations.
   preserve their BSON type.
 - Binary/UUID (`$binary`, `$uuid`) and ObjectId (`$oid`) values are indexed;
   ObjectId can also be used as `_id`.
-- The `$type` query operator matches BSON scalar types by name or code.
+- The `$type` query operator matches BSON scalar types by name or code,
+  including Timestamp, MinKey, and MaxKey.
 - Long text remains a normal string, bounded by the 1 MiB document limit.
 
 See [Numbers and decimals](docs/numerics.md) for storage forms, arithmetic,
@@ -828,7 +829,7 @@ documentation.
 | [Document TTL](docs/ttl.md) | Collection defaults, per-document expiry, update semantics, maintenance |
 | [Dates and time zones](docs/dates.md) | BSON-compatible dates, RFC 3339 input, filtering, indexes, sorting |
 | [Numbers and decimals](docs/numerics.md) | Exact numeric comparison, Decimal128, arithmetic, NaN/Infinity, index compatibility, long text limits |
-| [BSON scalar types](docs/bson-types.md) | `$numberInt`/`$numberLong`, `$type`, binary/UUID, ObjectId, index compatibility |
+| [BSON scalar types](docs/bson-types.md) | `$numberInt`/`$numberLong`, `$type`, binary/UUID, ObjectId, Timestamp, MinKey/MaxKey, index compatibility |
 | [GUI console](docs/gui.md) | Embedded local React console, data editing, collection settings, SQL, map/metrics, authorization |
 | [Replication and cluster guide](docs/replication-cluster-guide.md) | Primary/replica setup, TLS, CLI, GUI Cluster view, quorum failover, monitoring, troubleshooting |
 | [CLI](docs/cli.md) | `ping`, `gui`, `find`, `count`, `map`, `resize`, auth management, backup/verify/restore, `exec` |

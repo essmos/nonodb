@@ -139,6 +139,14 @@ pub fn field_value<'a>(doc: &'a Value, field: &str) -> Option<&'a Value> {
 /// Layout: `[tag] [data]`.
 pub fn encode_value(v: &Value) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(10);
+    if bson_types::is_min_key(v) {
+        out.push(0x00);
+        return Some(out);
+    }
+    if bson_types::is_max_key(v) {
+        out.push(0x09);
+        return Some(out);
+    }
     match v {
         Value::Null => out.push(0x01),
         Value::Number(_) => {
@@ -165,6 +173,9 @@ pub fn encode_value(v: &Value) -> Option<Vec<u8>> {
             } else if let Some(id) = bson_types::object_id_key(v) {
                 out.push(0x07);
                 out.extend_from_slice(&id);
+            } else if let Some(key) = bson_types::timestamp_key(v) {
+                out.push(0x08);
+                out.extend_from_slice(&key);
             } else {
                 let ms = date::parse_value(v)?;
                 out.push(0x05);
@@ -473,6 +484,9 @@ fn type_index_tag(spec: &Value) -> Option<u8> {
             "date" => Some(0x05),
             "bindata" => Some(0x06),
             "objectid" => Some(0x07),
+            "timestamp" => Some(0x08),
+            "maxkey" => Some(0x09),
+            "minkey" => Some(0x00),
             "null" => Some(0x01),
             _ => None,
         };
@@ -485,6 +499,9 @@ fn type_index_tag(spec: &Value) -> Option<u8> {
         5 => Some(0x06),
         7 => Some(0x07),
         10 => Some(0x01),
+        17 => Some(0x08),
+        127 => Some(0x09),
+        -1 => Some(0x00),
         _ => None,
     }
 }
@@ -723,6 +740,25 @@ mod tests {
         let earlier = date::canonical(1_000);
         let later = date::canonical(2_000);
         assert!(encode_value(&earlier) < encode_value(&later));
+    }
+
+    #[test]
+    fn timestamps_and_key_extremes_encode_in_bson_order() {
+        let min = bson_types::min_key_value();
+        let max = bson_types::max_key_value();
+        let earlier = bson_types::timestamp_value(bson_types::Timestamp {
+            time: 1_000,
+            increment: 1,
+        });
+        let later = bson_types::timestamp_value(bson_types::Timestamp {
+            time: 1_000,
+            increment: 2,
+        });
+        assert_eq!(encode_value(&min).unwrap(), vec![0x00]);
+        assert_eq!(encode_value(&max).unwrap(), vec![0x09]);
+        assert!(encode_value(&earlier) < encode_value(&later));
+        assert!(encode_value(&min) < encode_value(&json!(null)));
+        assert!(encode_value(&max) > encode_value(&json!("z")));
     }
 
     #[test]

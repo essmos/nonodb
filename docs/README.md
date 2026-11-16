@@ -18,7 +18,7 @@ quick-start instructions, and a feature overview.
 | [Document TTL](ttl.md) | Application developers, operators | Collection defaults, per-document overrides, update semantics, background expiry, limits |
 | [Dates and time zones](dates.md) | Application developers | BSON-compatible dates, RFC 3339 input, filtering, indexes, sorting, timezone semantics |
 | [Numbers and decimals](numerics.md) | Application developers | Exact numeric comparison, Decimal128, arithmetic, NaN/Infinity, index compatibility, long text limits |
-| [BSON scalar types](bson-types.md) | Application developers | `$numberInt`/`$numberLong`, `$type`, binary/UUID, ObjectId, index compatibility |
+| [BSON scalar types](bson-types.md) | Application developers | `$numberInt`/`$numberLong`, `$type`, binary/UUID, ObjectId, Timestamp, MinKey/MaxKey, index compatibility |
 | [Clients](clients.md) | Application developers | Python, Rust, Node.js and Go: install, connection, CRUD, batches, indexes, search, aggregation |
 | [Migration and import](migration.md) | Application developers, operators | MongoDB, PostgreSQL, SQLite, CSV conversion; NDJSON format; import manifest; validation and cutover |
 | [Authentication and permissions](auth.md) | Operators, security reviewers | Principals, scopes, hashed tokens, certificate registry, lockout, reloads, audit log |

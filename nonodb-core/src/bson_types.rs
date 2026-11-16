@@ -4,10 +4,12 @@
 //!
 //! - binary data / UUID: `{"$binary": {"base64": "...", "subType": "00"}}`
 //!   and `{"$uuid": "..."}`,
-//! - ObjectId: `{"$oid": "..."}`.
+//! - ObjectId: `{"$oid": "..."}`,
+//! - Timestamp: `{"$timestamp": {"t": 0, "i": 0}}`,
+//! - MinKey / MaxKey: `{"$minKey": 1}` and `{"$maxKey": 1}`.
 //!
-//! Canonical storage uses the `$binary` and `$oid` forms. `$type` query
-//! matching and index ordering are implemented alongside these values.
+//! Canonical storage uses these Extended JSON forms. `$type` query matching,
+//! comparisons, and index ordering are implemented alongside these values.
 
 use std::cmp::Ordering;
 
@@ -21,6 +23,9 @@ use crate::numeric;
 pub const BINARY_KEY: &str = "$binary";
 pub const UUID_KEY: &str = "$uuid";
 pub const OBJECT_ID_KEY: &str = "$oid";
+pub const TIMESTAMP_KEY: &str = "$timestamp";
+pub const MIN_KEY: &str = "$minKey";
+pub const MAX_KEY: &str = "$maxKey";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Binary {
@@ -30,6 +35,12 @@ pub struct Binary {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ObjectId(pub [u8; 12]);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Timestamp {
+    pub time: u32,
+    pub increment: u32,
+}
 
 /// Parses canonical `$binary` or shorthand `$uuid`.
 pub fn parse_binary(value: &Value) -> Option<Binary> {
@@ -70,6 +81,40 @@ pub fn parse_object_id(value: &Value) -> Option<ObjectId> {
     Some(ObjectId(out))
 }
 
+/// Parses `{"$timestamp": {"t": ..., "i": ...}}`.
+pub fn parse_timestamp(value: &Value) -> Option<Timestamp> {
+    let obj = value.as_object()?;
+    if obj.len() != 1 {
+        return None;
+    }
+    let payload = obj.get(TIMESTAMP_KEY)?.as_object()?;
+    let time = payload
+        .get("t")?
+        .as_u64()
+        .and_then(|v| u32::try_from(v).ok())?;
+    let increment = payload
+        .get("i")?
+        .as_u64()
+        .and_then(|v| u32::try_from(v).ok())?;
+    Some(Timestamp { time, increment })
+}
+
+pub fn is_min_key(value: &Value) -> bool {
+    value
+        .as_object()
+        .is_some_and(|obj| obj.len() == 1 && obj.contains_key(MIN_KEY))
+}
+
+pub fn is_max_key(value: &Value) -> bool {
+    value
+        .as_object()
+        .is_some_and(|obj| obj.len() == 1 && obj.contains_key(MAX_KEY))
+}
+
+pub fn is_timestamp(value: &Value) -> bool {
+    parse_timestamp(value).is_some()
+}
+
 pub fn is_binary(value: &Value) -> bool {
     parse_binary(value).is_some()
 }
@@ -79,7 +124,11 @@ pub fn is_object_id(value: &Value) -> bool {
 }
 
 pub fn is_bson_value(value: &Value) -> bool {
-    is_binary(value) || is_object_id(value)
+    is_binary(value)
+        || is_object_id(value)
+        || is_timestamp(value)
+        || is_min_key(value)
+        || is_max_key(value)
 }
 
 /// Whether a filter/document tree contains binary or ObjectId values.
@@ -112,6 +161,18 @@ pub fn object_id_value(id: ObjectId) -> Value {
     json!({ OBJECT_ID_KEY: hex })
 }
 
+pub fn timestamp_value(timestamp: Timestamp) -> Value {
+    json!({ TIMESTAMP_KEY: { "t": timestamp.time, "i": timestamp.increment } })
+}
+
+pub fn min_key_value() -> Value {
+    json!({ MIN_KEY: 1 })
+}
+
+pub fn max_key_value() -> Value {
+    json!({ MAX_KEY: 1 })
+}
+
 /// Equality for binary/ObjectId values. Returns `Some(false)` when either side
 /// is one of these types and the other side is not.
 pub fn eq_values(a: &Value, b: &Value) -> Option<bool> {
@@ -121,6 +182,15 @@ pub fn eq_values(a: &Value, b: &Value) -> Option<bool> {
     if let (Some(x), Some(y)) = (parse_object_id(a), parse_object_id(b)) {
         return Some(x == y);
     }
+    if let (Some(x), Some(y)) = (parse_timestamp(a), parse_timestamp(b)) {
+        return Some(x == y);
+    }
+    if is_min_key(a) || is_min_key(b) {
+        return Some(is_min_key(a) && is_min_key(b));
+    }
+    if is_max_key(a) || is_max_key(b) {
+        return Some(is_max_key(a) && is_max_key(b));
+    }
     if is_bson_value(a) || is_bson_value(b) {
         return Some(false);
     }
@@ -128,11 +198,26 @@ pub fn eq_values(a: &Value, b: &Value) -> Option<bool> {
 }
 
 pub fn cmp_values(a: &Value, b: &Value) -> Option<Ordering> {
+    match (is_min_key(a), is_min_key(b)) {
+        (true, true) => return Some(Ordering::Equal),
+        (true, false) => return Some(Ordering::Less),
+        (false, true) => return Some(Ordering::Greater),
+        (false, false) => {}
+    }
+    match (is_max_key(a), is_max_key(b)) {
+        (true, true) => return Some(Ordering::Equal),
+        (true, false) => return Some(Ordering::Greater),
+        (false, true) => return Some(Ordering::Less),
+        (false, false) => {}
+    }
     if let (Some(x), Some(y)) = (parse_binary(a), parse_binary(b)) {
         return Some(compare_binary(&x, &y));
     }
     if let (Some(x), Some(y)) = (parse_object_id(a), parse_object_id(b)) {
         return Some(x.0.cmp(&y.0));
+    }
+    if let (Some(x), Some(y)) = (parse_timestamp(a), parse_timestamp(b)) {
+        return Some((x.time, x.increment).cmp(&(y.time, y.increment)));
     }
     None
 }
@@ -153,6 +238,14 @@ pub fn object_id_key(value: &Value) -> Option<[u8; 12]> {
     Some(parse_object_id(value)?.0)
 }
 
+pub fn timestamp_key(value: &Value) -> Option<[u8; 8]> {
+    let timestamp = parse_timestamp(value)?;
+    let mut out = [0u8; 8];
+    out[..4].copy_from_slice(&timestamp.time.to_be_bytes());
+    out[4..].copy_from_slice(&timestamp.increment.to_be_bytes());
+    Some(out)
+}
+
 /// Canonicalizes binary/ObjectId Extended JSON values in a document tree.
 pub fn normalize_value(value: &mut Value) -> Result<()> {
     if let Some(obj) = value.as_object() {
@@ -170,6 +263,21 @@ pub fn normalize_value(value: &mut Value) -> Result<()> {
                 Error::InvalidObjectId("`$oid` must be a 24-character hexadecimal string".into())
             })?;
             *value = object_id_value(parsed);
+            return Ok(());
+        }
+        if obj.len() == 1 && obj.contains_key(TIMESTAMP_KEY) {
+            let parsed = parse_timestamp(value).ok_or_else(|| {
+                Error::InvalidTimestamp("`$timestamp` requires u32 `t` and `i` fields".into())
+            })?;
+            *value = timestamp_value(parsed);
+            return Ok(());
+        }
+        if obj.len() == 1 && obj.contains_key(MIN_KEY) {
+            *value = min_key_value();
+            return Ok(());
+        }
+        if obj.len() == 1 && obj.contains_key(MAX_KEY) {
+            *value = max_key_value();
             return Ok(());
         }
     }
@@ -212,6 +320,15 @@ pub fn type_name(value: &Value) -> Option<&'static str> {
     }
     if is_object_id(value) {
         return Some("objectId");
+    }
+    if is_timestamp(value) {
+        return Some("timestamp");
+    }
+    if is_min_key(value) {
+        return Some("minKey");
+    }
+    if is_max_key(value) {
+        return Some("maxKey");
     }
     match value {
         Value::Null => Some("null"),
@@ -262,6 +379,7 @@ fn direct_type_matches(value: &Value, spec: &Value) -> bool {
         9 => "date",
         10 => "null",
         16 => "int",
+        17 => "timestamp",
         18 => "long",
         19 => "decimal",
         -1 => "minKey",
@@ -340,5 +458,36 @@ mod tests {
         assert!(!type_matches(&json!("1"), &json!("number")));
         assert!(type_matches(&json!(["a", 1]), &json!("string")));
         assert!(type_matches(&json!(["a", 1]), &json!("array")));
+    }
+
+    #[test]
+    fn timestamp_and_key_types_roundtrip_and_order() {
+        let timestamp = Timestamp {
+            time: 1_700_000_000,
+            increment: 7,
+        };
+        let value = timestamp_value(timestamp);
+        assert_eq!(parse_timestamp(&value), Some(timestamp));
+        assert_eq!(type_name(&value), Some("timestamp"));
+        assert!(type_matches(&value, &json!("timestamp")));
+        assert!(type_matches(&value, &json!(17)));
+
+        let min = min_key_value();
+        let max = max_key_value();
+        assert_eq!(type_name(&min), Some("minKey"));
+        assert_eq!(type_name(&max), Some("maxKey"));
+        assert_eq!(cmp_values(&min, &json!("anything")), Some(Ordering::Less));
+        assert_eq!(
+            cmp_values(&max, &json!("anything")),
+            Some(Ordering::Greater)
+        );
+        assert_eq!(eq_values(&min, &json!("anything")), Some(false));
+        assert_eq!(eq_values(&max, &max), Some(true));
+
+        let mut doc = json!({"at": {"$timestamp": {"t": 1, "i": 2}}});
+        normalize_document(&mut doc).unwrap();
+        assert_eq!(parse_timestamp(&doc["at"]).unwrap().increment, 2);
+        let mut bad = json!({"$timestamp": {"t": -1, "i": 0}});
+        assert!(normalize_value(&mut bad).is_err());
     }
 }

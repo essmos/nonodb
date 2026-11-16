@@ -267,7 +267,7 @@ Design: [docs/replication.md](docs/replication.md).
 - [ ] IANA time zone identifiers for date expressions
 - [x] Nested projections, positional `$`, and basic `$meta` projections
 - [x] ObjectId as `_id` (string IDs remain supported)
-- [ ] BSON Timestamp and MinKey/MaxKey
+- [x] BSON Timestamp and MinKey/MaxKey
 - [ ] Regular-expression values and legacy BSON value compatibility, excluding
       executable code types
 - [x] Experimental MongoDB wire handshake and BSON mapping

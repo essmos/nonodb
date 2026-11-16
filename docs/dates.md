@@ -115,8 +115,14 @@ Dates can be set or replaced with normal update operators:
  "update": {"$currentDate": {"updated_at": true}}}
 ```
 
-BSON Timestamp values (`{"$type": "timestamp"}`) are not implemented; use a
-date.
+BSON Timestamp values are also supported:
+
+```json
+{"update": {"$currentDate": {"ts": {"$type": "timestamp"}}}}
+```
+
+See [BSON scalar types](bson-types.md) for Timestamp storage and comparison
+semantics.
 
 ## Time zones and civil dates
 
@@ -160,7 +166,7 @@ pipeline updates.
 Time zones are UTC (`Z`, `UTC`, `GMT`) or fixed offsets such as `+02:00` and
 `-05:00`. IANA names such as `Europe/Warsaw` are not implemented.
 
-Not yet supported: IANA time zone identifiers and BSON Timestamp.
+Not yet supported: IANA time zone identifiers.
 
 ## Existing documents and imports
 

@@ -621,7 +621,7 @@ stored key.
 | `$min` | Set the field only if the new value is lower, or the field is missing |
 | `$max` | Set the field only if the new value is higher, or the field is missing |
 | `$rename` | Move a field to a new name |
-| `$currentDate` | Set the current UTC date; `true` or `{"$type": "date"}` |
+| `$currentDate` | Set the current UTC date or BSON Timestamp; `true`, `{"$type": "date"}`, or `{"$type": "timestamp"}` |
 | `$bit` | Bitwise `and`, `or`, or `xor` on an integer field |
 | `$pop` | Remove the first (`-1`) or last (`1`) array element |
 | `$push` | Append one value or `{"$each": [...]}`; supports `$position`, `$slice`, `$sort` |
@@ -716,7 +716,7 @@ Notes:
   beyond the end of an array pads it with `null`; `$unset` on an array index
   sets that element to `null`.
 - `_id` is immutable. Do not use `$set`/`$unset`/array operators on `_id`.
-- `$currentDate` supports dates but not BSON Timestamp (`{"$type": "timestamp"}`).
+- `$currentDate` supports dates and BSON Timestamp (`{"$type": "timestamp"}`).
 - Update pipelines support the stages listed above; other stages return
   `invalid_query`.
 
@@ -1603,12 +1603,14 @@ See [Numbers and decimals](numerics.md).
 
 ### BSON scalar types and `$type`
 
-Use Extended JSON for binary, UUID, and ObjectId values:
+Use Extended JSON for binary, UUID, ObjectId, Timestamp, and key sentinel values:
 
 ```json
 {"payload": {"$binary": {"base64": "YQ==", "subType": "00"}}}
 {"payload": {"$uuid": "00112233-4455-6677-8899-aabbccddeeff"}}
 {"ref": {"$oid": "000000000000000000000001"}}
+{"at": {"$timestamp": {"t": 1700000000, "i": 7}}}
+{"low": {"$minKey": 1}, "high": {"$maxKey": 1}}
 ```
 
 `$uuid` is normalized to binary subtype `04`. ObjectId values are accepted both
@@ -1622,8 +1624,8 @@ The `$type` operator accepts names, numeric BSON codes, or an array:
 ```
 
 Type names include `double`, `string`, `object`, `array`, `binData`,
-`objectId`, `bool`, `date`, `null`, `int`, `long`, and `decimal`; `number`
-matches any numeric type. Arrays match when the array itself or any element has
+`objectId`, `bool`, `date`, `null`, `int`, `timestamp`, `long`, `decimal`,
+`minKey`, and `maxKey`; `number` matches any numeric type. Arrays match when the array itself or any element has
 the requested type. See [BSON scalar types](bson-types.md).
 
 ### Regular expressions
