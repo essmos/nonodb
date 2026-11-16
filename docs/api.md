@@ -1594,9 +1594,10 @@ bracket. Use Extended JSON for decimals:
 }
 ```
 
-`{"$numberDecimal": "199.99"}` is a finite Decimal128 value.
-`{"$numberDouble": "NaN"}`, `"Infinity"`, and `"-Infinity"` represent values
-that JSON numbers cannot express. `{"$numberInt": "42"}` and
+`{"$numberDecimal": "199.99"}` is a Decimal128 value; `NaN`, `Infinity`, and
+`-Infinity` are also accepted. `{"$numberDouble": "NaN"}`, `"Infinity"`, and
+`"-Infinity"` represent non-finite double values that JSON numbers cannot
+express. `{"$numberInt": "42"}` and
 `{"$numberLong": "9007199254740993"}` preserve their BSON integer type.
 Integer comparison and index keys are exact, including values above `2^53`.
 See [Numbers and decimals](numerics.md).

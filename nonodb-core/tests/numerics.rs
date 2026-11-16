@@ -38,7 +38,7 @@ fn invalid_decimal_values_are_rejected() {
     for value in [
         json!({"$numberDecimal": "abc"}),
         json!({"$numberDecimal": 1.5}),
-        json!({"$numberDecimal": "NaN"}),
+        json!({"$numberDecimal": "not-a-number"}),
         json!({"$numberDouble": "not-a-number"}),
     ] {
         let err = c
@@ -47,6 +47,43 @@ fn invalid_decimal_values_are_rejected() {
         assert!(matches!(err, nonodb_core::Error::InvalidNumeric(_)));
         assert!(find(&c, json!({"_id": "bad"})).is_empty());
     }
+}
+
+#[test]
+fn non_finite_decimal_values_roundtrip_query_and_index() {
+    let (_dir, store) = store();
+    let c = store.collection("decimals").unwrap();
+    c.create_index("n", false).unwrap();
+    for (id, text) in [
+        ("nan", "NaN"),
+        ("ninf", "-Infinity"),
+        ("zero", "0"),
+        ("inf", "Infinity"),
+    ] {
+        c.insert_one(json!({"_id": id, "n": {"$numberDecimal": text}}))
+            .unwrap();
+    }
+
+    assert_eq!(find(&c, json!({"n": {"$type": "decimal"}})).len(), 4);
+    assert_eq!(
+        ids(&find(&c, json!({"n": {"$numberDecimal": "NaN"}}))),
+        vec!["nan"]
+    );
+    assert_eq!(
+        ids(&find(
+            &c,
+            json!({"n": {"$gte": {"$numberDecimal": "Infinity"}}})
+        )),
+        vec!["inf"]
+    );
+
+    let docs = c
+        .find(&FindQuery {
+            sort: vec![("n".to_string(), 1)],
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(ids(&docs), vec!["nan", "ninf", "zero", "inf"]);
 }
 
 #[test]

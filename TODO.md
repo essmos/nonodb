@@ -283,7 +283,7 @@ Design: [docs/replication.md](docs/replication.md).
 - [x] Index union for top-level `$or` across indexed fields
 - [x] Use an index for sort-only queries without a filter
 - [x] `$type` index ranges for indexed scalar fields
-- [ ] Non-finite Decimal128 values
+- [x] Non-finite Decimal128 values
 
 ### P1 — event streams
 

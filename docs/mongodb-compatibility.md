@@ -240,7 +240,7 @@ allowed. Other BSON types are not accepted as `_id`.
 | String | ✅ | Supported `_id` type |
 | Double / int / long | ✅ | Exact numeric comparison |
 | Decimal128 (finite) | ✅ | Extended JSON `$numberDecimal` |
-| Decimal128 NaN / Infinity | ❌ | Not fully supported |
+| Decimal128 NaN / Infinity | 🟡 | Stored, queried, indexed, and propagated by `$inc`/`$mul`; `$sum`/`$avg` skip non-finite inputs |
 | Date | ✅ | BSON-compatible instants, indexed ranges, sorting |
 | Binary / UUID | ✅ | `$binary` and `$uuid` |
 | ObjectId field value | ✅ | `$oid`; indexed and `$type`-aware |

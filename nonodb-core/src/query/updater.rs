@@ -435,13 +435,28 @@ fn apply_pipeline(doc: &mut Value, pipeline: &[Value]) -> Result<()> {
 fn inc_path(doc: &mut Value, target: &str, v: &Value) -> Result<()> {
     let current_value = path::get(doc, target).cloned();
     if numeric::is_decimal(v) || current_value.as_ref().is_some_and(numeric::is_decimal) {
+        let has_non_finite = current_value
+            .as_ref()
+            .and_then(numeric::parse_value)
+            .is_some_and(|value| !value.is_finite())
+            || numeric::parse_value(v).is_some_and(|value| !value.is_finite());
+        if has_non_finite {
+            let current = current_value
+                .as_ref()
+                .and_then(numeric::as_f64)
+                .unwrap_or(0.0);
+            let delta =
+                numeric::as_f64(v).ok_or_else(|| Error::Query("$inc expects numbers".into()))?;
+            path::set(doc, target, numeric::decimal_from_f64(current + delta)?)?;
+            return Ok(());
+        }
         let mut current = match current_value.as_ref() {
             Some(value) => numeric::as_bigdecimal(value)
-                .ok_or_else(|| Error::Query("$inc current value is not a finite number".into()))?,
+                .ok_or_else(|| Error::Query("$inc current value is not a number".into()))?,
             None => BigDecimal::from(0),
         };
-        let delta = numeric::as_bigdecimal(v)
-            .ok_or_else(|| Error::Query("$inc expects finite numbers".into()))?;
+        let delta =
+            numeric::as_bigdecimal(v).ok_or_else(|| Error::Query("$inc expects numbers".into()))?;
         current += delta;
         path::set(doc, target, numeric::decimal_value(&current)?)?;
         return Ok(());
@@ -495,13 +510,28 @@ fn inc_path(doc: &mut Value, target: &str, v: &Value) -> Result<()> {
 fn mul_path(doc: &mut Value, target: &str, v: &Value) -> Result<()> {
     let current_value = path::get(doc, target).cloned();
     if numeric::is_decimal(v) || current_value.as_ref().is_some_and(numeric::is_decimal) {
+        let has_non_finite = current_value
+            .as_ref()
+            .and_then(numeric::parse_value)
+            .is_some_and(|value| !value.is_finite())
+            || numeric::parse_value(v).is_some_and(|value| !value.is_finite());
+        if has_non_finite {
+            let current = current_value
+                .as_ref()
+                .and_then(numeric::as_f64)
+                .unwrap_or(0.0);
+            let factor =
+                numeric::as_f64(v).ok_or_else(|| Error::Query("$mul expects numbers".into()))?;
+            path::set(doc, target, numeric::decimal_from_f64(current * factor)?)?;
+            return Ok(());
+        }
         let mut current = match current_value.as_ref() {
             Some(value) => numeric::as_bigdecimal(value)
-                .ok_or_else(|| Error::Query("$mul current value is not a finite number".into()))?,
+                .ok_or_else(|| Error::Query("$mul current value is not a number".into()))?,
             None => BigDecimal::from(0),
         };
-        let factor = numeric::as_bigdecimal(v)
-            .ok_or_else(|| Error::Query("$mul expects finite numbers".into()))?;
+        let factor =
+            numeric::as_bigdecimal(v).ok_or_else(|| Error::Query("$mul expects numbers".into()))?;
         current *= factor;
         path::set(doc, target, numeric::decimal_value(&current)?)?;
         return Ok(());
@@ -1036,6 +1066,32 @@ mod tests {
         )
         .unwrap();
         assert_eq!(doc, json!({"_id": "1", "n": 3, "a": {"b": 5}, "x": true}));
+    }
+
+    #[test]
+    fn non_finite_decimal_arithmetic_stays_decimal() {
+        let mut doc = json!({
+            "n": {"$numberDecimal": "Infinity"},
+            "m": {"$numberDecimal": "2.5"}
+        });
+        apply(
+            &mut doc,
+            &json!({
+                "$inc": {"n": {"$numberDecimal": "1"}},
+                "$mul": {"m": {"$numberDecimal": "Infinity"}}
+            }),
+        )
+        .unwrap();
+        assert_eq!(doc["n"], json!({"$numberDecimal": "Infinity"}));
+        assert_eq!(doc["m"], json!({"$numberDecimal": "Infinity"}));
+
+        apply(
+            &mut doc,
+            &json!({"$inc": {"n": {"$numberDecimal": "-Infinity"}}}),
+        )
+        .unwrap();
+        assert_eq!(doc["n"], json!({"$numberDecimal": "NaN"}));
+        assert_eq!(doc["m"], json!({"$numberDecimal": "Infinity"}));
     }
 
     #[test]

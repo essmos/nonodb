@@ -212,8 +212,7 @@ pub fn parse_value(value: &Value) -> Option<NumericValue> {
     }
     if let Some(Value::String(s)) = obj.get(NUMBER_DECIMAL_KEY) {
         let dec = Decimal128::from_str(s).ok()?;
-        let s = dec.to_string();
-        let value = parse_finite(&s)?;
+        let value = parse_decimal_text(&dec.to_string())?;
         return Some(NumericValue {
             kind: NumericKind::Decimal,
             value,
@@ -286,8 +285,8 @@ pub fn normalize_value(value: &mut Value) -> Result<()> {
                 let dec = Decimal128::from_str(s)
                     .map_err(|e| Error::InvalidNumeric(format!("invalid `$numberDecimal`: {e}")))?;
                 let text = dec.to_string();
-                parse_finite(&text).ok_or_else(|| {
-                    Error::InvalidNumeric("`$numberDecimal` must be a finite number".into())
+                parse_decimal_text(&text).ok_or_else(|| {
+                    Error::InvalidNumeric("invalid `$numberDecimal` value".into())
                 })?;
                 text
             };
@@ -382,6 +381,15 @@ pub fn cmp_values(a: &Value, b: &Value) -> Option<Ordering> {
 
 pub fn eq_values(a: &Value, b: &Value) -> Option<bool> {
     Some(cmp_values(a, b)? == Ordering::Equal)
+}
+
+fn parse_decimal_text(text: &str) -> Option<Numeric> {
+    match text {
+        "NaN" => Some(Numeric::NaN),
+        "Infinity" => Some(Numeric::PositiveInfinity),
+        "-Infinity" => Some(Numeric::NegInfinity),
+        _ => parse_finite(text),
+    }
 }
 
 /// Order-preserving, fixed-size numeric index key payload.
@@ -539,6 +547,22 @@ pub fn integer_json(n: i128) -> Result<Value> {
     Err(Error::InvalidNumeric(
         "integer arithmetic result is out of int64/uint64 range".into(),
     ))
+}
+
+/// Builds a canonical `$numberDecimal` value from an `f64`.
+pub fn decimal_from_f64(value: f64) -> Result<Value> {
+    if value.is_nan() {
+        return Ok(json!({ NUMBER_DECIMAL_KEY: "NaN" }));
+    }
+    if value == f64::INFINITY {
+        return Ok(json!({ NUMBER_DECIMAL_KEY: "Infinity" }));
+    }
+    if value == f64::NEG_INFINITY {
+        return Ok(json!({ NUMBER_DECIMAL_KEY: "-Infinity" }));
+    }
+    let value = BigDecimal::from_str(&format!("{value:?}"))
+        .map_err(|e| Error::InvalidNumeric(format!("invalid decimal result: {e}")))?;
+    decimal_value(&value)
 }
 
 /// Builds a canonical `$numberDecimal` value.
@@ -749,6 +773,41 @@ mod tests {
         normalize_value(&mut doc).unwrap();
         assert_eq!(doc["price"]["$numberDecimal"], "199.9900");
         assert_eq!(as_bigdecimal(&doc["price"]).unwrap().to_string(), "199.99");
+    }
+
+    #[test]
+    fn non_finite_decimal_values_compare_and_index() {
+        let mut doc = json!({
+            "nan": {"$numberDecimal": "nan"},
+            "inf": {"$numberDecimal": "inf"},
+            "ninf": {"$numberDecimal": "-Infinity"}
+        });
+        normalize_value(&mut doc).unwrap();
+        assert_eq!(doc["nan"]["$numberDecimal"], "NaN");
+        assert_eq!(doc["inf"]["$numberDecimal"], "Infinity");
+        assert_eq!(doc["ninf"]["$numberDecimal"], "-Infinity");
+        assert_eq!(
+            parse_value(&doc["nan"]).unwrap().kind(),
+            NumericKind::Decimal
+        );
+        assert_eq!(
+            parse_value(&doc["inf"]).unwrap().value(),
+            Numeric::PositiveInfinity
+        );
+        assert_eq!(
+            parse_value(&doc["ninf"]).unwrap().value(),
+            Numeric::NegInfinity
+        );
+
+        let values = [&doc["nan"], &doc["ninf"], &json!(0), &doc["inf"]];
+        for pair in values.windows(2) {
+            assert_ne!(cmp_values(pair[0], pair[1]), Some(Ordering::Greater));
+            assert!(encode_ordered(pair[0]) <= encode_ordered(pair[1]));
+        }
+        assert_eq!(
+            eq_values(&doc["nan"], &json!({"$numberDouble": "NaN"})),
+            Some(true)
+        );
     }
 
     #[test]

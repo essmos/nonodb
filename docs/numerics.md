@@ -41,8 +41,8 @@ Use MongoDB Extended JSON for decimal values:
 - Stored form: `{"$numberDecimal": "<canonical string>"}`.
 - Precision: up to 34 significant decimal digits, exponent range from
   Decimal128.
-- Only finite decimals are accepted. `NaN`, `Infinity`, and `-Infinity` are
-  rejected with `invalid_numeric`.
+- Non-finite decimals are accepted and canonicalized as `NaN`, `Infinity`, or
+  `-Infinity`.
 - Decimal strings are not parsed from ordinary JSON strings. A value like
   `"199.99"` remains a string.
 
@@ -72,6 +72,11 @@ When a decimal is involved, `$inc`, `$sum`, `$avg`, `$add`, `$subtract`,
 `$numberDecimal` value. Results are rounded to 34 significant digits with
 banker's rounding and must fit Decimal128. A result outside the Decimal128
 range fails with `invalid_numeric`.
+
+`$inc` and `$mul` propagate non-finite decimal results (`NaN`, `Infinity`,
+`-Infinity`) and keep the `decimal` type. `$sum` and `$avg` currently skip
+non-finite decimal inputs, matching their existing behavior for non-finite
+doubles.
 
 ```json
 {
@@ -103,9 +108,8 @@ Sorting and index order follow this numeric order:
 NaN < -Infinity < negative finite < 0 < positive finite < Infinity
 ```
 
-`NaN` equals only `NaN`. These values are stored, filtered, and indexed, but
-`$sum`/`$avg` ignore non-finite values and decimal arithmetic requires finite
-operands.
+`NaN` equals only `NaN`. These values are stored, filtered, indexed, compared,
+and returned by `$inc`/`$mul`; `$sum`/`$avg` ignore non-finite inputs.
 
 ## Index compatibility
 
