@@ -158,6 +158,55 @@ JSON modes, `mongodump`/`bsondump`, `mongoimport`, `mongorestore`, and index-key
 preservation. Set `MONGODB_EXPORT_URL` to include the real-MongoDB restore
 checks; without it the exporter output is still validated locally.
 
+### Portability checker
+
+`scripts/mongo_portability_check.py` statically checks a workload against this
+documented subset before migration. It does not connect to a database or execute
+application code.
+
+The authoritative mode takes a JSON manifest:
+
+```json
+{
+  "operations": [
+    {"method": "find", "filter": {"age": {"$gte": 30}}},
+    {"method": "update_one", "filter": {"_id": 1},
+     "update": {"$set": {"active": true}}},
+    {"method": "aggregate", "pipeline": [
+      {"$match": {"status": "active"}},
+      {"$group": {"_id": "$team", "n": {"$sum": 1}}}
+    ]},
+    {"method": "create_index", "keys": {"email": 1},
+     "options": {"name": "email_1", "unique": true}}
+  ]
+}
+```
+
+```bash
+python3 scripts/mongo_portability_check.py workload.json --strict
+```
+
+A heuristic source scan is also available:
+
+```bash
+python3 scripts/mongo_portability_check.py --source src/ --strict
+```
+
+The source mode looks for common driver calls (`.watch`, `.start_session`,
+`.start_transaction`, etc.) and MongoDB `$` operators in Python, JavaScript,
+TypeScript, Go, Ruby, and Java files. Its findings are advisory because comments
+and dynamic construction can produce false positives.
+
+The checker reports supported operations, explicitly unsupported operations and
+options, and unknown operators separately. Use `--fail-on-unsupported` to fail
+only on explicit incompatibilities, or `--strict` to also fail on unknown
+entries. `--json` emits machine-readable output. The checker has embedded
+regression checks:
+
+```bash
+python3 scripts/mongo_portability_check.py --self-test
+```
+
 ### Conformance harness
 
 `scripts/mongo_conformance_test.py` runs the same PyMongo workload against the
