@@ -4118,6 +4118,149 @@ impl<'e> Collection<'e> {
         Ok(out)
     }
 
+    fn graph_lookup_stage_in(
+        &self,
+        rtxn: &RoTxn<'_>,
+        docs: Vec<Value>,
+        spec: &Value,
+        vars: &BTreeMap<String, Value>,
+    ) -> Result<Vec<Value>> {
+        let spec = spec
+            .as_object()
+            .ok_or_else(|| Error::Query("$graphLookup requires an object".into()))?;
+        let from = spec
+            .get("from")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::Query("$graphLookup requires `from`".into()))?;
+        let start_with = spec
+            .get("startWith")
+            .ok_or_else(|| Error::Query("$graphLookup requires `startWith`".into()))?;
+        let connect_from = spec
+            .get("connectFromField")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::Query("$graphLookup requires `connectFromField`".into()))?;
+        let connect_to = spec
+            .get("connectToField")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::Query("$graphLookup requires `connectToField`".into()))?;
+        let as_field = spec
+            .get("as")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::Query("$graphLookup requires `as`".into()))?;
+        let max_depth = match spec.get("maxDepth") {
+            Some(value) => Some(
+                value
+                    .as_u64()
+                    .and_then(|value| usize::try_from(value).ok())
+                    .ok_or_else(|| {
+                        Error::Query(
+                            "$graphLookup `maxDepth` must be a non-negative integer".into(),
+                        )
+                    })?,
+            ),
+            None => None,
+        };
+        let depth_field = match spec.get("depthField") {
+            Some(value) => Some(
+                value
+                    .as_str()
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        Error::Query("$graphLookup `depthField` must be a non-empty string".into())
+                    })?,
+            ),
+            None => None,
+        };
+        let restrict = match spec.get("restrictSearchWithMatch") {
+            Some(value) => Some(
+                value
+                    .as_object()
+                    .ok_or_else(|| {
+                        Error::Query(
+                            "$graphLookup `restrictSearchWithMatch` must be an object".into(),
+                        )
+                    })?
+                    .clone(),
+            ),
+            None => None,
+        };
+        let store = self.store.ok_or_else(|| {
+            Error::Query("$graphLookup requires a store-backed collection".into())
+        })?;
+        let Some(foreign) = store.collection_at(rtxn, from)? else {
+            let mut out = docs;
+            for doc in &mut out {
+                path::set(doc, as_field, Value::Array(Vec::new()))?;
+            }
+            return Ok(out);
+        };
+        let max_docs = aggregate::max_docs();
+        let mut out = Vec::with_capacity(docs.len());
+        for mut doc in docs {
+            let start = aggregate::eval_expr_vars(&doc, start_with, vars)?;
+            let mut values = Vec::new();
+            let mut value_keys = HashSet::new();
+            graph_push_value(&start, &mut values, &mut value_keys);
+            let mut results = Vec::new();
+            let mut seen = HashSet::new();
+            let mut depth = 0usize;
+            loop {
+                if values.is_empty() {
+                    break;
+                }
+                let base = Value::Object(Map::from_iter([(
+                    connect_to.to_string(),
+                    Value::Object(Map::from_iter([("$in".to_string(), Value::Array(values))])),
+                )]));
+                let filter = if let Some(restrict) = &restrict {
+                    Value::Object(Map::from_iter([(
+                        "$and".to_string(),
+                        Value::Array(vec![base, Value::Object(restrict.clone())]),
+                    )]))
+                } else {
+                    base
+                };
+                let matched = foreign.find_in(
+                    rtxn,
+                    &FindQuery {
+                        filter,
+                        limit: Some(max_docs.saturating_add(1)),
+                        ..Default::default()
+                    },
+                )?;
+                let mut next_values = Vec::new();
+                let mut next_keys = HashSet::new();
+                for mut candidate in matched {
+                    let key = graph_identity(&candidate);
+                    if !seen.insert(key) {
+                        continue;
+                    }
+                    let next = graph_collect_field(&candidate, connect_from);
+                    if let Some(depth_field) = depth_field {
+                        path::set(&mut candidate, depth_field, Value::from(depth as u64))?;
+                    }
+                    results.push(candidate);
+                    if results.len() > max_docs {
+                        return Err(Error::Query(format!(
+                            "$graphLookup result exceeds {max_docs} documents"
+                        )));
+                    }
+                    for value in next {
+                        graph_push_value(&value, &mut next_values, &mut next_keys);
+                    }
+                }
+                if max_depth.is_some_and(|max_depth| depth >= max_depth) {
+                    break;
+                }
+                values = next_values;
+                depth = depth.saturating_add(1);
+            }
+            path::set(&mut doc, as_field, Value::Array(results))?;
+            out.push(doc);
+        }
+        Ok(out)
+    }
+
     fn union_stage_in(
         &self,
         rtxn: &RoTxn<'_>,
@@ -7194,6 +7337,35 @@ fn project(doc: &Value, projection: &Value, filter: Option<&Value>) -> Value {
     }
 }
 
+fn graph_push_value(value: &Value, out: &mut Vec<Value>, seen: &mut HashSet<String>) {
+    if let Value::Array(items) = value {
+        for item in items {
+            graph_push_value(item, out, seen);
+        }
+        return;
+    }
+    let key = serde_json::to_string(value).unwrap_or_default();
+    if seen.insert(key) {
+        out.push(value.clone());
+    }
+}
+
+fn graph_collect_field(doc: &Value, field: &str) -> Vec<Value> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for value in path::get_values(doc, field) {
+        graph_push_value(value, &mut out, &mut seen);
+    }
+    out
+}
+
+fn graph_identity(doc: &Value) -> String {
+    match doc.get("_id") {
+        Some(id) => format!("id:{}", serde_json::to_string(id).unwrap_or_default()),
+        None => format!("doc:{}", serde_json::to_string(doc).unwrap_or_default()),
+    }
+}
+
 struct LookupHost<'a, 'e, 'r> {
     coll: &'a Collection<'e>,
     rtxn: &'a RoTxn<'r>,
@@ -7211,6 +7383,15 @@ impl aggregate::AggregateHost for LookupHost<'_, '_, '_> {
 
     fn union_with(&self, spec: &Value, vars: &BTreeMap<String, Value>) -> Result<Vec<Value>> {
         self.coll.union_stage_in(self.rtxn, spec, vars)
+    }
+
+    fn graph_lookup(
+        &self,
+        docs: Vec<Value>,
+        spec: &Value,
+        vars: &BTreeMap<String, Value>,
+    ) -> Result<Vec<Value>> {
+        self.coll.graph_lookup_stage_in(self.rtxn, docs, spec, vars)
     }
 }
 
@@ -9248,6 +9429,164 @@ mod tests {
             .is_err());
         assert!(primary
             .aggregate(&[json!({"$unionWith": {"coll": "union_archive", "pipeline": 1}})])
+            .is_err());
+    }
+
+    #[test]
+    fn graph_lookup_traverses_depth_restrictions_and_cycles() {
+        let (_dir, store) = store();
+        let employees = store.collection("graph_employees").unwrap();
+        employees
+            .insert_one(json!({"_id": "1", "name": "CEO", "reportsTo": null, "active": true}))
+            .unwrap();
+        employees
+            .insert_one(json!({"_id": "2", "name": "VP", "reportsTo": "1", "active": true}))
+            .unwrap();
+        employees
+            .insert_one(json!({"_id": "3", "name": "Eng", "reportsTo": "2", "active": true}))
+            .unwrap();
+        employees
+            .insert_one(json!({"_id": "4", "name": "Old", "reportsTo": "1", "active": false}))
+            .unwrap();
+        employees
+            .insert_one(json!({"_id": "5", "name": "Cycle", "reportsTo": "5", "active": true}))
+            .unwrap();
+        employees
+            .insert_one(json!({"_id": "r1", "reportsTo": null, "active": true}))
+            .unwrap();
+        employees
+            .insert_one(json!({"_id": "r2", "reportsTo": "r1", "active": false}))
+            .unwrap();
+        employees
+            .insert_one(json!({"_id": "r3", "reportsTo": "r2", "active": true}))
+            .unwrap();
+
+        let inputs = store.collection("graph_inputs").unwrap();
+        inputs
+            .insert_one(json!({"_id": "q1", "reportsTo": "3"}))
+            .unwrap();
+        inputs
+            .insert_one(json!({"_id": "q2", "reportsTo": "1"}))
+            .unwrap();
+        inputs
+            .insert_one(json!({"_id": "q3", "reportsTo": "r3"}))
+            .unwrap();
+
+        let out = inputs
+            .aggregate(&[
+                json!({"$graphLookup": {
+                    "from": "graph_employees",
+                    "startWith": "$reportsTo",
+                    "connectFromField": "reportsTo",
+                    "connectToField": "_id",
+                    "as": "chain",
+                    "depthField": "depth",
+                    "maxDepth": 3
+                }}),
+                json!({"$sort": {"_id": 1}}),
+            ])
+            .unwrap();
+        let chain = out[0]["chain"].as_array().unwrap();
+        assert_eq!(
+            chain
+                .iter()
+                .map(|doc| doc["_id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["3", "2", "1"]
+        );
+        assert_eq!(
+            chain
+                .iter()
+                .map(|doc| doc["depth"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+
+        let out = inputs
+            .aggregate(&[
+                json!({"$match": {"_id": "q1"}}),
+                json!({"$graphLookup": {
+                    "from": "graph_employees",
+                    "startWith": "$reportsTo",
+                    "connectFromField": "reportsTo",
+                    "connectToField": "_id",
+                    "as": "chain",
+                    "maxDepth": 1
+                }}),
+            ])
+            .unwrap();
+        assert_eq!(
+            out[0]["chain"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|doc| doc["_id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["3", "2"]
+        );
+
+        let out = inputs
+            .aggregate(&[
+                json!({"$match": {"_id": "q3"}}),
+                json!({"$graphLookup": {
+                    "from": "graph_employees",
+                    "startWith": "$reportsTo",
+                    "connectFromField": "reportsTo",
+                    "connectToField": "_id",
+                    "as": "chain",
+                    "maxDepth": 3,
+                    "restrictSearchWithMatch": {"active": true}
+                }}),
+            ])
+            .unwrap();
+        assert_eq!(
+            out[0]["chain"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|doc| doc["_id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["r3"]
+        );
+
+        let out = inputs
+            .aggregate(&[
+                json!({"$match": {"_id": "q1"}}),
+                json!({"$graphLookup": {
+                    "from": "graph_employees",
+                    "startWith": "5",
+                    "connectFromField": "reportsTo",
+                    "connectToField": "_id",
+                    "as": "cycle"
+                }}),
+            ])
+            .unwrap();
+        assert_eq!(out[0]["cycle"].as_array().unwrap().len(), 1);
+        assert_eq!(out[0]["cycle"][0]["_id"], "5");
+
+        let out = inputs
+            .aggregate(&[
+                json!({"$match": {"_id": "q1"}}),
+                json!({"$graphLookup": {
+                    "from": "graph_missing",
+                    "startWith": "$reportsTo",
+                    "connectFromField": "reportsTo",
+                    "connectToField": "_id",
+                    "as": "missing"
+                }}),
+            ])
+            .unwrap();
+        assert_eq!(out[0]["missing"], json!([]));
+
+        assert!(inputs
+            .aggregate(&[json!({"$graphLookup": {
+                "from": "graph_employees",
+                "startWith": "$reportsTo",
+                "connectFromField": "reportsTo",
+                "connectToField": "_id",
+                "as": "bad",
+                "maxDepth": -1
+            }})])
             .is_err());
     }
 

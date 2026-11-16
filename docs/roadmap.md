@@ -101,8 +101,9 @@ Implemented:
 
 - The aggregation pipeline is bounded by `NONODB_AGGREGATE_MAX_DOCS` (default
   100,000 intermediate documents). It supports equality `$lookup` joins,
-  `$lookup` `let` variables, nested lookups, `$unionWith`, `$facet`, `$bucket`,
-  and `$bucketAuto`, but not `$graphLookup` or write stages (`$merge`, `$out`).
+  `$lookup` `let` variables, nested lookups, `$unionWith`, `$graphLookup`,
+  `$facet`, `$bucket`, and `$bucketAuto`, but not write stages (`$merge`,
+  `$out`) or window stages.
   Group state is held in memory; there is no disk spill.
 - No `$where` or `$text` query operator.
 - `$jsonSchema` supports the common validation keywords but not every JSON
@@ -297,8 +298,8 @@ project's target workload.
    with a migration path.
 13. **Expanded aggregation** beyond the current `$match`/`$group`/`$bucket`/
     `$bucketAuto`/`$project`/`$sort`/`$limit`/`$facet`/`$sample`/`$lookup`/
-    `$unionWith` subset, including streaming execution, recursive joins, and
-    window stages.
+    `$unionWith`/`$graphLookup` subset, including streaming execution, write
+    stages, and window stages.
 
 ### Lower priority
 

@@ -913,6 +913,7 @@ error code. `comment` is accepted for correlation but is not stored.
 | `$facet` | Run multiple sub-pipelines over the same input documents |
 | `$lookup` | Join documents from another collection |
 | `$unionWith` | Append the result of another collection or sub-pipeline |
+| `$graphLookup` | Recursively traverse references across a collection |
 | `$sort` | Sort by one or more fields |
 | `$skip` | Skip documents |
 | `$limit` | Limit documents |
@@ -1038,6 +1039,38 @@ the current documents. A missing collection contributes no documents.
 Sub-pipelines support the same read-only stages, including nested `$lookup` and
 `$unionWith`; the intermediate-document limit applies to the combined result.
 
+### `$graphLookup`
+
+Recursively traverses references in another collection:
+
+```json
+{
+  "$graphLookup": {
+    "from": "employees",
+    "startWith": "$reportsTo",
+    "connectFromField": "reportsTo",
+    "connectToField": "_id",
+    "as": "managementChain",
+    "maxDepth": 5,
+    "depthField": "depth",
+    "restrictSearchWithMatch": {"active": true}
+  }
+}
+```
+
+- `startWith` is evaluated per input document and may produce a scalar or an
+  array of starting values.
+- At each hop, documents where `connectToField` matches any current value are
+  added to `as`; their `connectFromField` values become the next hop.
+- `maxDepth` limits the number of hop expansions. `0` returns only the initial
+  matches; omit it to traverse until no new documents are found.
+- `depthField` adds the zero-based hop depth to each joined document.
+- `restrictSearchWithMatch` filters candidates at every hop.
+- Cycles are detected by joined document `_id`, so self-references and loops do
+  not run forever.
+- A missing foreign collection produces empty `as` arrays.
+- The aggregate intermediate-document limit applies to each `as` result.
+
 ### Limits
 
 - At most **100,000 documents** may exist in an intermediate result. The call
@@ -1045,8 +1078,8 @@ Sub-pipelines support the same read-only stages, including nested `$lookup` and
 - The normal request timeout (30 seconds by default) applies.
 - Response size is still limited by the HTTP response path and the client's
   practical memory; use `$limit` and `$project` for large collections.
-- Not supported: `$graphLookup`, `$merge`, `$out`, `$setWindowFields`,
-  `$densify`, `$fill`, `$redact`, window functions, and arbitrary JavaScript.
+- Not supported: `$merge`, `$out`, `$setWindowFields`, `$densify`, `$fill`,
+  `$redact`, window functions, and arbitrary JavaScript.
 
 ## sql
 

@@ -57,8 +57,9 @@ limitations are documented in [docs/roadmap.md](docs/roadmap.md).
 - [x] Aggregation: consecutive `$match` fusion, terminal `$count` fast path, in-place stages
 - [x] Aggregation: bounded top-K `$sort`+`$limit`, fused document-local stages,
       streaming leading `$group`, configurable `NONODB_AGGREGATE_MAX_DOCS`
-- [x] Aggregation: `$lookup` with `let` variables, nested lookups, and
-      `$unionWith` with collection shorthand or a sub-pipeline
+- [x] Aggregation: `$lookup` with `let` variables, nested lookups,
+      `$unionWith` with collection shorthand or a sub-pipeline, and
+      `$graphLookup` with depth, depth field, restrictions, and cycle detection
 - [x] Multikey indexes for arrays and dotted array paths, immutable-index
       metadata, indexed `$all`/`$elemMatch`, and multikey sort order
 - [x] Unique multikey indexes: same-document duplicates allowed, cross-document

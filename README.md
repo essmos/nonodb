@@ -134,7 +134,7 @@ provide:
   [replication and cluster guide](docs/replication-cluster-guide.md);
 - general interactive multi-document transactions;
 - MongoDB wire-protocol compatibility;
-- recursive joins (`$graphLookup`) or aggregation write stages (`$merge`/`$out`);
+- aggregation write stages (`$merge`/`$out`) or window stages;
 - a role hierarchy or inherited groups; authorization uses principals and
   database-qualified scopes;
 - the full MongoDB query and update language; it implements a practical subset.
@@ -249,8 +249,8 @@ single-database directories are migrated to `default/` on startup. See
 - Read-only `aggregate` endpoint for reporting, grouping, and summaries.
 - Stages: `$match`, `$project`, `$addFields`/`$set`, `$unset`, `$unwind`,
   `$group`, `$bucket`, `$bucketAuto`, `$sortByCount`, `$replaceRoot`/
-  `$replaceWith`, `$sample`, `$facet`, `$lookup`, `$unionWith`, `$sort`,
-  `$skip`, `$limit`, and `$count`.
+  `$replaceWith`, `$sample`, `$facet`, `$lookup`, `$unionWith`, `$graphLookup`,
+  `$sort`, `$skip`, `$limit`, and `$count`.
 - Accumulators: `$sum`, `$avg`, `$min`, `$max`, `$first`, `$last`, `$push`,
   `$addToSet`, and `$count`.
 - Consecutive leading `$match` stages are fused, and a terminal `$count` skips
