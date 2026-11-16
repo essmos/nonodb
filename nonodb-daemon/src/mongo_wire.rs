@@ -19,7 +19,7 @@ use serde_json::{json, Value};
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::watch;
+use tokio::sync::{watch, Semaphore};
 use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
 use zeroize::Zeroizing;
@@ -38,6 +38,10 @@ const MAX_MESSAGE_BYTES: usize = 48_000_000;
 const MAX_BSON_BYTES: i32 = 16 * 1024 * 1024;
 const MAX_WRITE_BATCH_SIZE: i32 = 100_000;
 const MAX_WIRE_VERSION: i32 = 9;
+const DEFAULT_MAX_CONNECTIONS: usize = 1_024;
+const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(300);
+const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(60);
+const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 const SCRAM_SHA256: &str = "SCRAM-SHA-256";
 const SCRAM_SHA1: &str = "SCRAM-SHA-1";
 const SCRAM_ITERATIONS_DEFAULT: u32 = 15_000;
@@ -252,6 +256,53 @@ pub(crate) fn tls_from_env() -> Result<Option<TlsAcceptor>, Box<dyn std::error::
     Ok(Some(TlsAcceptor::from(Arc::new(config))))
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct WireLimits {
+    max_connections: usize,
+    read_timeout: Option<Duration>,
+    write_timeout: Option<Duration>,
+    handshake_timeout: Option<Duration>,
+}
+
+impl WireLimits {
+    pub(crate) fn from_env() -> Result<Self, String> {
+        Ok(Self {
+            max_connections: parse_limit("NONODB_MONGO_MAX_CONNECTIONS", DEFAULT_MAX_CONNECTIONS)?,
+            read_timeout: parse_timeout("NONODB_MONGO_READ_TIMEOUT_SECS", DEFAULT_READ_TIMEOUT)?,
+            write_timeout: parse_timeout("NONODB_MONGO_WRITE_TIMEOUT_SECS", DEFAULT_WRITE_TIMEOUT)?,
+            handshake_timeout: parse_timeout(
+                "NONODB_MONGO_HANDSHAKE_TIMEOUT_SECS",
+                DEFAULT_HANDSHAKE_TIMEOUT,
+            )?,
+        })
+    }
+}
+
+fn parse_limit(name: &str, default: usize) -> Result<usize, String> {
+    match std::env::var(name) {
+        Ok(value) => match value.trim().parse::<usize>() {
+            Ok(limit) if limit > 0 => Ok(limit),
+            _ => Err(format!("{name} must be a positive integer")),
+        },
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(error) => Err(format!("cannot read {name}: {error}")),
+    }
+}
+
+fn parse_timeout(name: &str, default: Duration) -> Result<Option<Duration>, String> {
+    match std::env::var(name) {
+        Ok(value) if value.trim() == "0" => Ok(None),
+        Ok(value) => match value.trim().parse::<u64>() {
+            Ok(seconds) if seconds > 0 => Ok(Some(Duration::from_secs(seconds))),
+            _ => Err(format!(
+                "{name} must be 0 or a positive integer number of seconds"
+            )),
+        },
+        Err(std::env::VarError::NotPresent) => Ok(Some(default)),
+        Err(error) => Err(format!("cannot read {name}: {error}")),
+    }
+}
+
 #[derive(Default)]
 struct WireSession {
     authenticated: bool,
@@ -276,6 +327,7 @@ pub async fn serve(
     tls: Option<TlsAcceptor>,
     mut shutdown: watch::Receiver<bool>,
     drain_timeout: Duration,
+    limits: WireLimits,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(addr).await?;
     let bound = listener.local_addr()?.to_string();
@@ -286,6 +338,7 @@ pub async fn serve(
             bound = %bound,
             mechanism = "SCRAM-SHA-256,SCRAM-SHA-1",
             tls = tls_enabled,
+            max_connections = limits.max_connections,
             "experimental MongoDB wire listener enabled with SCRAM authentication"
         );
     } else {
@@ -293,11 +346,13 @@ pub async fn serve(
             %addr,
             bound = %bound,
             tls = tls_enabled,
+            max_connections = limits.max_connections,
             "experimental unauthenticated MongoDB wire listener enabled; handshake plus insert/find/getMore/killCursors only"
         );
     }
     let auth = auth.map(Arc::new);
     let tls = tls.map(Arc::new);
+    let connection_limit = Arc::new(Semaphore::new(limits.max_connections));
 
     let mut connections = JoinSet::new();
     loop {
@@ -305,17 +360,56 @@ pub async fn serve(
             _ = super::wait_for_shutdown(&mut shutdown) => break,
             accepted = listener.accept() => accepted?,
         };
+        let permit = match connection_limit.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                tracing::warn!(
+                    %peer,
+                    max_connections = limits.max_connections,
+                    "Mongo wire connection limit reached; rejecting connection"
+                );
+                drop(stream);
+                continue;
+            }
+        };
         let shutdown = shutdown.clone();
         let state = state.clone();
         let auth = auth.clone();
         let tls = tls.clone();
         connections.spawn(async move {
+            let _permit = permit;
             let result = match tls {
-                Some(acceptor) => match acceptor.accept(stream).await {
-                    Ok(stream) => handle_connection(stream, state, auth, shutdown).await,
+                Some(acceptor) => match timeout_opt(
+                    limits.handshake_timeout,
+                    acceptor.accept(stream),
+                    "Mongo TLS handshake timed out",
+                )
+                .await
+                {
+                    Ok(stream) => {
+                        handle_connection(
+                            stream,
+                            state,
+                            auth,
+                            shutdown,
+                            limits.read_timeout,
+                            limits.write_timeout,
+                        )
+                        .await
+                    }
                     Err(error) => Err(error),
                 },
-                None => handle_connection(stream, state, auth, shutdown).await,
+                None => {
+                    handle_connection(
+                        stream,
+                        state,
+                        auth,
+                        shutdown,
+                        limits.read_timeout,
+                        limits.write_timeout,
+                    )
+                    .await
+                }
             };
             if let Err(error) = result {
                 tracing::debug!(?error, %peer, "Mongo wire connection closed");
@@ -332,6 +426,8 @@ async fn handle_connection<S>(
     state: super::AppState,
     auth: Option<Arc<MongoAuth>>,
     mut shutdown: watch::Receiver<bool>,
+    read_timeout: Option<Duration>,
+    write_timeout: Option<Duration>,
 ) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -341,7 +437,11 @@ where
     loop {
         let message = tokio::select! {
             _ = super::wait_for_shutdown(&mut shutdown) => return Ok(()),
-            message = read_message(&mut stream) => message?,
+            message = timeout_opt(
+                read_timeout,
+                read_message(&mut stream),
+                "Mongo wire read timed out",
+            ) => message?,
         };
         let Some(message) = message else {
             return Ok(());
@@ -367,8 +467,25 @@ where
                 &response,
             )?
         };
-        stream.write_all(&bytes).await?;
-        stream.flush().await?;
+        let write = async {
+            stream.write_all(&bytes).await?;
+            stream.flush().await
+        };
+        timeout_opt(write_timeout, write, "Mongo wire write timed out").await?;
+    }
+}
+
+async fn timeout_opt<T>(
+    limit: Option<Duration>,
+    future: impl std::future::Future<Output = io::Result<T>>,
+    message: &'static str,
+) -> io::Result<T> {
+    match limit {
+        Some(limit) => match tokio::time::timeout(limit, future).await {
+            Ok(result) => result,
+            Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, message)),
+        },
+        None => future.await,
     }
 }
 

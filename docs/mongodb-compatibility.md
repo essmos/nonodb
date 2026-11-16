@@ -76,6 +76,15 @@ must match the driver's `authSource`. To terminate TLS, set both
 `tls=true`. Client-certificate authentication and hot certificate reload are not
 implemented for this listener.
 
+The listener bounds resource use with configurable limits:
+`NONODB_MONGO_MAX_CONNECTIONS` (default `1024`),
+`NONODB_MONGO_READ_TIMEOUT_SECS` (default `300`),
+`NONODB_MONGO_WRITE_TIMEOUT_SECS` (default `60`), and
+`NONODB_MONGO_HANDSHAKE_TIMEOUT_SECS` (default `30`). Set a timeout to `0` to
+disable it. Connections over the limit are closed immediately; drivers should
+treat that as a transient connection failure and reconnect within their pool
+limits.
+
 | Wire command | Status |
 |---|---|
 | `hello` / `isMaster` / `ping` / `buildInfo` | ✅ |

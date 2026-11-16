@@ -87,6 +87,10 @@ secrets.
 | `NONODB_MONGO_SCRAM_ITERATIONS` | `15000` | SCRAM PBKDF2 iteration count for both mechanisms, 4096..1000000 |
 | `NONODB_MONGO_TLS_CERT` | — | PEM certificate chain for the MongoDB listener. Requires `NONODB_MONGO_TLS_KEY` |
 | `NONODB_MONGO_TLS_KEY` | — | PEM private key for the MongoDB listener. Requires `NONODB_MONGO_TLS_CERT` |
+| `NONODB_MONGO_MAX_CONNECTIONS` | `1024` | Maximum concurrent MongoDB wire connections; excess connections are rejected immediately |
+| `NONODB_MONGO_READ_TIMEOUT_SECS` | `300` | Maximum seconds to receive one complete wire message, including idle pooled connections; `0` disables |
+| `NONODB_MONGO_WRITE_TIMEOUT_SECS` | `60` | Maximum seconds to send one wire response; `0` disables |
+| `NONODB_MONGO_HANDSHAKE_TIMEOUT_SECS` | `30` | Maximum seconds for the TLS handshake when MongoDB wire TLS is enabled; `0` disables |
 | `NONODB_TLS_CERT` | — | PEM certificate chain for TCP TLS |
 | `NONODB_TLS_KEY` | — | PEM private key for TCP TLS |
 | `NONODB_TLS_CLIENT_CA` | — | PEM CA bundle used to verify client certificates (mTLS) |

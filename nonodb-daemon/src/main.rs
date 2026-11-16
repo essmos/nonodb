@@ -214,6 +214,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
+    let mongo_limits = if mongo_addr.is_some() {
+        Some(mongo_wire::WireLimits::from_env()?)
+    } else {
+        None
+    };
     server_info::set_advertise_url(
         std::env::var("NONODB_REPLICATION_ADVERTISE_URL")
             .ok()
@@ -467,6 +472,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         let addr = addr.to_string();
         let shutdown = shutdown_rx.clone();
         let mongo_state = state.clone();
+        let limits = mongo_limits.ok_or("NONODB_MONGO_ADDR requires MongoDB wire limits")?;
         mongo_task = Some(tokio::spawn(async move {
             if let Err(e) = mongo_wire::serve(
                 &addr,
@@ -475,6 +481,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 mongo_tls,
                 shutdown,
                 drain_timeout,
+                limits,
             )
             .await
             {

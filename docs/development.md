@@ -187,6 +187,7 @@ python3 scripts/shutdown_test.py             # SIGTERM drain, JSON logs, durable
 python3 scripts/mongo_conformance_test.py   # compare wire results with a real MongoDB
 python3 scripts/mongo_export_test.py        # mongoexport/mongodump/mongoimport/mongorestore
 python3 scripts/mongo_portability_check.py --self-test  # static workload checker
+python3 scripts/mongo_wire_limits_test.py   # Mongo wire connection/read limits (spawns a daemon)
 scripts/mongo_drivers_test.sh              # official Node.js and Go MongoDB drivers
 python3 scripts/auth_test.py                 # scopes, token/cert auth, reload, audit, IP lockout
 python3 scripts/auth_api_test.py             # auth API, Prometheus, disk/snapshot metrics, readiness
@@ -315,6 +316,7 @@ scripts are:
 | `scripts/mongo_conformance_test.py` | PyMongo operations compared with a real MongoDB server |
 | `scripts/mongo_export_test.py` | mongoexport/mongodump output and restore into real MongoDB |
 | `scripts/mongo_portability_check.py` | static MongoDB workload and source compatibility checker |
+| `scripts/mongo_wire_limits_test.py` | MongoDB wire connection limit, idle read timeout, and config validation |
 | `scripts/mongo_drivers_test.sh` | official Node.js and Go MongoDB driver compatibility |
 | `scripts/mtls_test.sh` | mTLS with generated CA/certs, all clients, live revocation |
 | `scripts/concurrency_test.py` | Independent writers/readers and unique indexes |
