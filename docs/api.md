@@ -1812,15 +1812,19 @@ Response:
 {"ok": true, "result": {"created": ["tenant", "tenant+created_at", "tags"]}}
 ```
 
-Each entry accepts either `field` or `fields`, plus optional `unique` and
-`include`. Use this for migrations that add multiple indexes at once; it avoids
-re-reading and re-parsing the whole collection for every index.
+Each entry accepts either `field` or `fields`, plus optional `name`,
+`directions`, `unique`, and `include`. Use this for migrations that add
+multiple indexes at once; it avoids re-reading and re-parsing the whole
+collection for every index.
 
 Rules:
 
 - Provide either `field` (single) or `fields` (ordered list). `fields` is
   preferred for new code.
-- The index name is the fields joined by `+`.
+- Without `name`, the index name is the fields joined by `+`. A supplied
+  MongoDB-style name is stored and returned by `list_indexes`.
+- `directions` is optional; when present it must contain one `1` or `-1` per
+  field and is preserved in index metadata.
 - Indexable values are string, number, Decimal128, special doubles, boolean,
   Extended JSON dates, binary/UUID, and ObjectId. Ordinary objects remain
   unindexed, but arrays create multikey entries: one key per scalar element.

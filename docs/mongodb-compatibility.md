@@ -90,9 +90,10 @@ implemented for this listener.
 `dropDatabase` cannot remove the built-in `default` database. Wire `find`
 supports arbitrary sort keys; `_id`/natural order uses fast keyset paging,
 while other sort keys use skip-based cursor paging and re-sort each batch.
-Index direction is accepted but NonoDB stores the field order, not
-ascending/descending direction. Custom MongoDB index names are rejected; use
-default names. `aggregate` honors `cursor.batchSize` and `getMore`. Pipelines
+Index names and ascending/descending directions are preserved and returned by
+`listIndexes`; custom MongoDB names are accepted. Mixed-direction compound
+indexes are stored accurately, but the query planner may fall back to a scan for
+mixed-direction sorts. `aggregate` honors `cursor.batchSize` and `getMore`. Pipelines
 with an optional leading `$match` followed only by `$project`, `$addFields`,
 `$set`, or `$unset` stream pages from the collection; blocking pipelines are
 evaluated once and then paged from a materialized result. Without a `cursor`
@@ -299,6 +300,8 @@ allowed. Other BSON types are not accepted as `_id`.
 |---|---|---|
 | Single-field indexes | ✅ | |
 | Compound indexes | ✅ | |
+| Custom index names | ✅ | MongoDB-style names are stored and listed |
+| Index direction metadata | ✅ | `1`/`-1` preserved and listed; mixed-direction sorts may fall back to a scan |
 | Multikey indexes | ✅ | One entry per array element; compound parallel arrays rejected |
 | Unique indexes | ✅ | Including unique multikey semantics |
 | Covered queries / `include` | ✅ | Top-level inclusive projections only |

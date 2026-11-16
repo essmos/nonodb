@@ -274,7 +274,7 @@ Design: [docs/replication.md](docs/replication.md).
 - [x] Experimental MongoDB wire handshake and BSON mapping
 - [x] MongoDB wire `insert`, `find`, `getMore`, and `killCursors`
 - [x] MongoDB wire `update`, `delete`, `findAndModify`, `count`, `distinct`, `aggregate`
-- [x] MongoDB wire createIndexes/listIndexes/dropIndexes
+- [x] MongoDB wire createIndexes/listIndexes/dropIndexes with custom names and directions
 - [x] MongoDB wire create/drop/listCollections/listDatabases
 - [x] MongoDB wire dropDatabase
 - [x] MongoDB wire arbitrary `find` sort keys with cursor paging

@@ -311,6 +311,8 @@ impl AutoIndexer {
                 .iter()
                 .map(|(_, fields)| IndexSpec {
                     fields: fields.clone(),
+                    name: String::new(),
+                    directions: Vec::new(),
                     unique: false,
                     include: Vec::new(),
                     geo: false,

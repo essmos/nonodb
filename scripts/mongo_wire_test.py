@@ -225,8 +225,26 @@ def main() -> int:
 
         assert coll.create_index("group") == "group_1"
         index_names = [index["name"] for index in coll.list_indexes()]
-        assert "group" in index_names
-        assert db.command({"dropIndexes": coll.name, "index": "group"})["ok"] == 1.0
+        assert "group_1" in index_names
+        custom_name = "custom_group_n"
+        assert (
+            coll.create_index([("group", 1), ("i", -1)], name=custom_name)
+            == custom_name
+        )
+        custom = next(
+            index for index in coll.list_indexes() if index["name"] == custom_name
+        )
+        assert list(custom["key"].items()) == [("group", 1), ("i", -1)]
+        assert (
+            db.command(
+                {"dropIndexes": coll.name, "index": {"group": 1, "i": -1}}
+            )["ok"]
+            == 1.0
+        )
+        assert custom_name not in [
+            index["name"] for index in coll.list_indexes()
+        ]
+        assert db.command({"dropIndexes": coll.name, "index": "group_1"})["ok"] == 1.0
 
         assert coll.delete_one({"group": "smoke"}).deleted_count == 1
         assert coll.delete_many({"group": "smoke"}).deleted_count == 9

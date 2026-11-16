@@ -1817,6 +1817,8 @@ mod tests {
         target
             .create_indexes(&[IndexSpec {
                 fields: vec!["k".to_string()],
+                name: String::new(),
+                directions: Vec::new(),
                 unique: true,
                 include: Vec::new(),
                 geo: false,
@@ -1944,6 +1946,8 @@ mod tests {
         target
             .create_indexes(&[IndexSpec {
                 fields: vec!["k".to_string()],
+                name: String::new(),
+                directions: Vec::new(),
                 unique: true,
                 include: Vec::new(),
                 geo: false,

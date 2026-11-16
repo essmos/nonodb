@@ -110,13 +110,15 @@ async function main() {
     assert((await items.distinct("tag")).sort().join(",") === "x,y", "distinct");
     assert((await items.countDocuments({ tag: "x" })) === 2, "count");
 
-    const indexName = await items.createIndex({ tag: 1, n: -1 });
-    assert(typeof indexName === "string" && indexName.length > 0, "create index");
-    const indexes = await items.listIndexes().toArray();
-    assert(
-      indexes.some((index) => Object.keys(index.key).join(",") === "tag,n"),
-      "list indexes"
+    const indexName = await items.createIndex(
+      { tag: 1, n: -1 },
+      { name: "custom_tag_n" }
     );
+    assert(indexName === "custom_tag_n", "create index");
+    const indexes = await items.listIndexes().toArray();
+    const customIndex = indexes.find((index) => index.name === "custom_tag_n");
+    assert(customIndex !== undefined, "list custom index");
+    assert(customIndex.key.tag === 1 && customIndex.key.n === -1, "index directions");
 
     const deleted = await items.deleteMany({ n: { $gte: 11 } });
     assert(deleted.deletedCount === 1, "deleteMany");

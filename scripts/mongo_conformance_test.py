@@ -128,11 +128,19 @@ def sorted_docs(db, filter=None, **kwargs):
 def index_signature(db):
     return sorted(
         (
-            tuple(index["key"].keys()),
+            tuple(index["key"].items()),
+            index["name"],
             index.get("unique", False),
         )
         for index in db.items.list_indexes()
     )
+
+
+def create_custom_index(db):
+    name = db.items.create_index(
+        [("tag", -1), ("n", 1)], name="custom_tag_n_index"
+    )
+    return {"created": name, "indexes": index_signature(db)}
 
 
 def update_result(result):
@@ -294,6 +302,7 @@ def main() -> int:
         )
         check_both("create index and list", create_index)
         check_both("drop secondary index", drop_secondary_index)
+        check_both("custom index name and direction", create_custom_index)
         check_both("list collection names", lambda db: sorted(db.list_collection_names()))
         check_both(
             "delete one",

@@ -159,12 +159,13 @@ func main() {
 	check(count == 2, "count")
 
 	name, err := items.Indexes().CreateOne(ctx, mongo.IndexModel{
-		Keys: bson.D{{Key: "tag", Value: 1}, {Key: "n", Value: -1}},
+		Keys:    bson.D{{Key: "tag", Value: 1}, {Key: "n", Value: -1}},
+		Options: options.Index().SetName("custom_tag_n"),
 	})
 	if err != nil {
 		panic(err)
 	}
-	check(name != "", "create index")
+	check(name == "custom_tag_n", "create index")
 	indexCursor, err := items.Indexes().List(ctx)
 	if err != nil {
 		panic(err)
@@ -175,15 +176,16 @@ func main() {
 	}
 	found := false
 	for _, index := range indexes {
+		if index["name"] != "custom_tag_n" {
+			continue
+		}
 		if key, ok := index["key"].(bson.M); ok && len(key) == 2 {
-			if _, ok := key["tag"]; ok {
-				if _, ok := key["n"]; ok {
-					found = true
-				}
+			if key["tag"] == int32(1) && key["n"] == int32(-1) {
+				found = true
 			}
 		}
 	}
-	check(found, "list indexes")
+	check(found, "list custom index and directions")
 
 	deleted, err := items.DeleteMany(ctx, bson.M{"n": bson.M{"$gte": 11}})
 	if err != nil {

@@ -369,6 +369,12 @@ pub struct ReindexReport {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexSpec {
     pub fields: Vec<String>,
+    /// Explicit MongoDB index name; empty means the legacy logical name.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    /// Per-field directions (`1` or `-1`); empty means all ascending.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub directions: Vec<i8>,
     #[serde(default)]
     pub unique: bool,
     #[serde(default)]
@@ -705,6 +711,7 @@ impl<'e> Collection<'e> {
         }
         let mut defs: Vec<(String, IndexDef)> = Vec::with_capacity(specs.len());
         let mut names = HashSet::new();
+        let existing_defs = self.index_defs(&*wtxn)?;
         for spec in specs {
             if spec.fields.is_empty() {
                 return Err(Error::Query("index requires at least one field".into()));
@@ -719,14 +726,51 @@ impl<'e> Collection<'e> {
                     "geo indexes require exactly one field and cannot be unique or covering".into(),
                 ));
             }
-            let def = if spec.geo {
+            let mut def = if spec.geo {
                 IndexDef::geo(&spec.fields[0])
             } else {
                 IndexDef::compound(&spec.fields, spec.unique, &spec.include)
             };
+            if !spec.name.is_empty() {
+                if spec.name.contains('\0') {
+                    return Err(Error::Query(
+                        "index name must not contain a NUL byte".into(),
+                    ));
+                }
+                def.name = spec.name.clone();
+            }
+            if !spec.directions.is_empty() {
+                if spec.directions.len() != spec.fields.len()
+                    || spec
+                        .directions
+                        .iter()
+                        .any(|direction| !matches!(direction, 1 | -1))
+                {
+                    return Err(Error::Query(
+                        "index directions must match fields and be 1 or -1".into(),
+                    ));
+                }
+                def.directions = spec.directions.clone();
+            }
             let name = def.name();
+            if name == "_id_" {
+                return Err(Error::Query("index name `_id_` is reserved".into()));
+            }
             if !names.insert(name.clone()) {
                 return Err(Error::Query(format!("duplicate index in batch: {name}")));
+            }
+            if let Some(existing) = existing_defs
+                .iter()
+                .find(|existing| existing.name() == name)
+            {
+                if existing.effective_fields() != def.effective_fields()
+                    || existing.unique != def.unique
+                    || existing.include != def.include
+                    || existing.geo != def.geo
+                    || existing.directions() != def.directions()
+                {
+                    return Err(Error::Query(format!("index name conflict: {name}")));
+                }
             }
             let key = index::def_key(&self.name, &name);
             self.meta.put(
@@ -857,6 +901,8 @@ impl<'e> Collection<'e> {
             .iter()
             .map(|def| IndexSpec {
                 fields: def.effective_fields(),
+                name: def.name(),
+                directions: def.directions(),
                 unique: def.unique,
                 include: def.include.clone(),
                 geo: def.geo,
@@ -8829,18 +8875,24 @@ mod tests {
         c.create_indexes(&[
             IndexSpec {
                 fields: vec!["grp".into()],
+                name: String::new(),
+                directions: Vec::new(),
                 unique: false,
                 include: vec![],
                 geo: false,
             },
             IndexSpec {
                 fields: vec!["score".into()],
+                name: String::new(),
+                directions: Vec::new(),
                 unique: false,
                 include: vec!["grp".into()],
                 geo: false,
             },
             IndexSpec {
                 fields: vec!["tags".into()],
+                name: String::new(),
+                directions: Vec::new(),
                 unique: false,
                 include: vec![],
                 geo: false,
@@ -8865,6 +8917,8 @@ mod tests {
         assert!(dup
             .create_indexes(&[IndexSpec {
                 fields: vec!["email".into()],
+                name: String::new(),
+                directions: Vec::new(),
                 unique: true,
                 include: vec![],
                 geo: false,

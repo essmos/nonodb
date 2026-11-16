@@ -30,6 +30,12 @@ pub struct IndexRequest {
     pub field: Option<String>,
     #[serde(default)]
     pub fields: Option<Vec<String>>,
+    /// Explicit index name; empty means the default name.
+    #[serde(default)]
+    pub name: String,
+    /// Per-field directions (`1` or `-1`); empty means all ascending.
+    #[serde(default)]
+    pub directions: Vec<i8>,
     #[serde(default)]
     pub unique: bool,
     #[serde(default)]

@@ -1588,6 +1588,7 @@ async fn create_indexes_command(
             return Err(bad_value("index key document cannot be empty"));
         }
         let mut fields = Vec::with_capacity(key.len());
+        let mut directions = Vec::with_capacity(key.len());
         let mut default_parts = Vec::with_capacity(key.len());
         let mut geo = false;
         for (field, direction) in key {
@@ -1609,6 +1610,7 @@ async fn create_indexes_command(
                 return Err(bad_value("index direction must be 1 or -1"));
             }
             fields.push(field.clone());
+            directions.push(direction as i8);
             default_parts.push(format!("{field}_{direction_name}"));
         }
         for unsupported in [
@@ -1630,17 +1632,20 @@ async fn create_indexes_command(
         if spec.get_bool("hidden").unwrap_or(false) {
             return Err(bad_value("hidden indexes are not supported by NonoDB"));
         }
-        if let Ok(name) = spec.get_str("name") {
-            let default = default_parts.join("_");
-            let logical = fields.join("+");
-            if name != default && name != logical {
-                return Err(bad_value(
-                    "custom MongoDB index names are not supported; use the default name",
-                ));
-            }
+        let default_name = default_parts.join("_");
+        let name = spec.get_str("name").unwrap_or(&default_name);
+        if name.is_empty() {
+            return Err(bad_value("index name cannot be empty"));
+        }
+        if name.len() > 127 || name.contains('\0') {
+            return Err(bad_value(
+                "index name must be at most 127 bytes and must not contain NUL",
+            ));
         }
         specs.push(nonodb_core::IndexSpec {
             fields,
+            name: name.to_string(),
+            directions,
             unique: spec.get_bool("unique").unwrap_or(false),
             include: Vec::new(),
             geo,
@@ -1715,8 +1720,12 @@ async fn list_indexes_command(
     }));
     for def in defs {
         let mut key = Document::new();
-        for field in def.effective_fields() {
-            key.insert(field, 1i32);
+        for (field, direction) in def.effective_fields().into_iter().zip(def.directions()) {
+            if def.geo {
+                key.insert(field, "2dsphere");
+            } else {
+                key.insert(field, i32::from(direction));
+            }
         }
         let mut doc = bson::doc! {
             "v": 2i32,
@@ -1791,20 +1800,26 @@ async fn drop_indexes_command(
             for (field, direction) in key {
                 if !matches!(
                     direction,
-                    Bson::Int32(1) | Bson::Int32(-1) | Bson::Int64(1) | Bson::Int64(-1)
-                ) {
-                    return Err(bad_value("index key direction must be 1 or -1"));
+                    Bson::Int32(1)
+                        | Bson::Int32(-1)
+                        | Bson::Int64(1)
+                        | Bson::Int64(-1)
+                        | Bson::Double(1.0)
+                        | Bson::Double(-1.0)
+                ) && !matches!(direction, Bson::String(value) if value == "2dsphere")
+                {
+                    return Err(bad_value("index key direction must be 1, -1, or 2dsphere"));
                 }
                 fields.push(field.clone());
             }
-            let name = fields.join("+");
-            if !defs.iter().any(|def| def.name() == name) {
-                return Err(ApiError {
+            let found = defs
+                .iter()
+                .find(|def| def.effective_fields() == fields)
+                .ok_or_else(|| ApiError {
                     code: "index_not_found".into(),
                     message: "index not found".into(),
-                });
-            }
-            vec![name]
+                })?;
+            vec![found.name()]
         }
         _ => return Err(bad_value("dropIndexes index must be a name, key, or `*`")),
     };

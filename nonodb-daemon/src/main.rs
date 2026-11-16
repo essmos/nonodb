@@ -3720,6 +3720,8 @@ async fn exec_inner(
                         };
                         specs.push(nonodb_core::IndexSpec {
                             fields,
+                            name: index.name,
+                            directions: index.directions,
                             unique: index.unique,
                             include: index.include,
                             geo: index.geo,

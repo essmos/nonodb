@@ -32,6 +32,12 @@ pub struct IndexDef {
     pub fields: Vec<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub field: String,
+    /// Explicit MongoDB index name. Empty means the legacy logical name.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    /// Per-field directions (`1` or `-1`). Empty means all ascending.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub directions: Vec<i8>,
     #[serde(default)]
     pub unique: bool,
     /// Fields additionally copied into the index value (covering projections).
@@ -63,6 +69,8 @@ impl IndexDef {
         Self {
             fields: vec![field.to_string()],
             field: String::new(),
+            name: String::new(),
+            directions: Vec::new(),
             unique,
             include: Vec::new(),
             geo: false,
@@ -76,6 +84,8 @@ impl IndexDef {
         Self {
             fields: fields.to_vec(),
             field: String::new(),
+            name: String::new(),
+            directions: Vec::new(),
             unique,
             include: include.to_vec(),
             geo: false,
@@ -112,9 +122,22 @@ impl IndexDef {
         }
     }
 
-    /// Logical name: `age` or `grp+age`.
+    /// Stored MongoDB name, or the legacy logical name (`age` or `grp+age`).
     pub fn name(&self) -> String {
+        if !self.name.is_empty() {
+            return self.name.clone();
+        }
         self.effective_fields().join("+")
+    }
+
+    /// Per-field directions, defaulting to ascending for legacy definitions.
+    pub fn directions(&self) -> Vec<i8> {
+        let len = self.effective_fields().len();
+        if self.directions.len() == len {
+            self.directions.clone()
+        } else {
+            vec![1; len]
+        }
     }
 }
 
