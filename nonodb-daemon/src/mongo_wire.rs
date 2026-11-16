@@ -410,6 +410,11 @@ async fn dispatch_command(
             return mongo_error(&error);
         }
     }
+    if let Some(command) = command {
+        if let Err(error) = validate_mongo_options(command, body) {
+            return mongo_error(&error);
+        }
+    }
     let result = match command {
         Some("saslStart") => sasl_start_command(auth, session, body),
         Some("saslContinue") => sasl_continue_command(auth, state.auth.as_deref(), session, body),
@@ -438,7 +443,9 @@ async fn dispatch_command(
         Some("listCollections") => {
             list_collections_command(state, body, session.principal.as_ref()).await
         }
-        Some("listDatabases") => list_databases_command(state, session.principal.as_ref()).await,
+        Some("listDatabases") => {
+            list_databases_command(state, body, session.principal.as_ref()).await
+        }
         Some("dropDatabase") => drop_database_command(state, body).await,
         Some("endSessions") | Some("refreshSessions") => Ok(doc_ok()),
         Some("ping")
@@ -929,10 +936,10 @@ async fn delete_command(state: &super::AppState, body: &Document) -> Result<Docu
             }
             continue;
         };
-        if spec.contains_key("collation") || spec.contains_key("hint") {
+        if spec.contains_key("collation") || spec.contains_key("hint") || spec.contains_key("let") {
             errors.push(write_error(
                 index,
-                &bad_value("collation and hint are not supported by the wire delete command"),
+                &bad_value("collation, hint, and let are not supported by the wire delete command"),
             ));
             if ordered {
                 break;
@@ -1317,6 +1324,7 @@ async fn list_collections_command(
     .await
     .map_err(|error| ApiError::internal(format!("listCollections join error: {error}")))??;
     let name_only = body.get_bool("nameOnly").unwrap_or(false);
+    let filter = document_field(body, "filter")?;
     let mut batch = Vec::with_capacity(names.len());
     for name in names {
         if name.starts_with('\u{1}') || name == crate::databases::DEFAULT_DATABASE {
@@ -1328,18 +1336,24 @@ async fn list_collections_command(
         let mut doc = bson::doc! {
             "name": name.clone(),
             "type": "collection",
+            "options": Bson::Document(Document::new()),
+            "info": Bson::Document(bson::doc! {"readOnly": false}),
+            "idIndex": Bson::Document(bson::doc! {
+                "v": 2i32,
+                "key": Bson::Document(bson::doc! {"_id": 1i32}),
+                "name": "_id_",
+            }),
         };
-        if !name_only {
-            doc.insert("options", Bson::Document(Document::new()));
-            doc.insert("info", Bson::Document(bson::doc! {"readOnly": false}));
-            doc.insert(
-                "idIndex",
-                Bson::Document(bson::doc! {
-                    "v": 2i32,
-                    "key": Bson::Document(bson::doc! {"_id": 1i32}),
-                    "name": "_id_",
-                }),
-            );
+        if let Some(filter) = &filter {
+            let value = bson_map::document_to_value(&doc).map_err(bad_value)?;
+            if !nonodb_core::query::matches(&value, filter) {
+                continue;
+            }
+        }
+        if name_only {
+            doc.remove("options");
+            doc.remove("info");
+            doc.remove("idIndex");
         }
         batch.push(Bson::Document(doc));
     }
@@ -1362,19 +1376,33 @@ async fn drop_database_command(
 
 async fn list_databases_command(
     state: &super::AppState,
+    body: &Document,
     principal: Option<&Principal>,
 ) -> Result<Document, ApiError> {
     let names = state.databases.names().await;
+    let name_only = body.get_bool("nameOnly").unwrap_or(false);
+    let filter = document_field(body, "filter")?;
     let mut databases = Vec::with_capacity(names.len());
     for name in names {
         if principal.is_some_and(|principal| !principal.can_see_database(&name)) {
             continue;
         }
-        databases.push(Bson::Document(bson::doc! {
+        let mut doc = bson::doc! {
             "name": name,
             "sizeOnDisk": 0i64,
             "empty": false,
-        }));
+        };
+        if let Some(filter) = &filter {
+            let value = bson_map::document_to_value(&doc).map_err(bad_value)?;
+            if !nonodb_core::query::matches(&value, filter) {
+                continue;
+            }
+        }
+        if name_only {
+            doc.remove("sizeOnDisk");
+            doc.remove("empty");
+        }
+        databases.push(Bson::Document(doc));
     }
     Ok(bson::doc! {
         "databases": Bson::Array(databases),
@@ -1916,6 +1944,185 @@ fn values_to_bson(values: Vec<Value>) -> Result<Vec<Bson>, ApiError> {
         .into_iter()
         .map(|value| bson_map::value_to_bson(&value).map_err(ApiError::internal))
         .collect()
+}
+
+fn validate_mongo_options(command: &str, body: &Document) -> Result<(), ApiError> {
+    match command {
+        "find" => {
+            reject_options(
+                body,
+                &["collation", "let", "min", "max"],
+                "not supported by the wire find command",
+            )?;
+            reject_truthy_options(
+                body,
+                &[
+                    "returnKey",
+                    "showRecordId",
+                    "tailable",
+                    "awaitData",
+                    "noCursorTimeout",
+                    "oplogReplay",
+                ],
+                "not supported by the wire find command",
+            )?;
+            validate_concerns(body)
+        }
+        "aggregate" => {
+            reject_options(
+                body,
+                &["collation", "let", "hint"],
+                "not supported by the wire aggregate command",
+            )?;
+            reject_truthy_options(
+                body,
+                &["explain"],
+                "not supported by the wire aggregate command",
+            )?;
+            reject_cursor_batching(body, "aggregate")?;
+            validate_concerns(body)
+        }
+        "count" => {
+            reject_options(
+                body,
+                &["collation", "hint", "let"],
+                "not supported by the wire count command",
+            )?;
+            validate_concerns(body)
+        }
+        "distinct" => {
+            reject_options(
+                body,
+                &["collation", "let"],
+                "not supported by the wire distinct command",
+            )?;
+            if body.contains_key("maxTimeMS") {
+                return Err(bad_value(
+                    "maxTimeMS is not supported by the wire distinct command",
+                ));
+            }
+            validate_concerns(body)
+        }
+        "insert" | "update" | "delete" => {
+            reject_truthy_options(
+                body,
+                &["bypassDocumentValidation"],
+                "not supported by the wire write commands",
+            )?;
+            validate_concerns(body)
+        }
+        "findAndModify" | "findandmodify" => {
+            reject_options(
+                body,
+                &["collation", "hint", "let"],
+                "not supported by the wire findAndModify command",
+            )?;
+            reject_truthy_options(
+                body,
+                &["bypassDocumentValidation"],
+                "not supported by the wire findAndModify command",
+            )?;
+            validate_concerns(body)
+        }
+        "createIndexes" | "dropIndexes" => {
+            reject_options(
+                body,
+                &["commitQuorum", "maxTimeMS"],
+                "not supported by the wire index commands",
+            )?;
+            validate_concerns(body)
+        }
+        "listIndexes" | "listCollections" => {
+            reject_cursor_batching(body, command)?;
+            validate_concerns(body)
+        }
+        "listDatabases" => validate_concerns(body),
+        "create" | "drop" | "dropDatabase" => validate_concerns(body),
+        "getMore" | "killCursors" | "endSessions" | "refreshSessions" => Ok(()),
+        _ => Ok(()),
+    }
+}
+
+fn reject_options(body: &Document, names: &[&str], reason: &str) -> Result<(), ApiError> {
+    for name in names {
+        if body.contains_key(*name) {
+            return Err(bad_value(format!("option `{name}` is {reason}")));
+        }
+    }
+    Ok(())
+}
+
+fn reject_truthy_options(body: &Document, names: &[&str], reason: &str) -> Result<(), ApiError> {
+    for name in names {
+        let Some(value) = body.get(*name) else {
+            continue;
+        };
+        let truthy = match value {
+            Bson::Boolean(value) => *value,
+            Bson::Int32(value) => *value != 0,
+            Bson::Int64(value) => *value != 0,
+            Bson::Double(value) => *value != 0.0,
+            Bson::Null => false,
+            _ => true,
+        };
+        if truthy {
+            return Err(bad_value(format!("option `{name}` is {reason}")));
+        }
+    }
+    Ok(())
+}
+
+fn reject_cursor_batching(body: &Document, command: &str) -> Result<(), ApiError> {
+    let Some(Bson::Document(cursor)) = body.get("cursor") else {
+        if body.contains_key("cursor") {
+            return Err(bad_value("cursor must be a document"));
+        }
+        return Ok(());
+    };
+    if let Some(batch_size) = cursor.get("batchSize").and_then(bson_int) {
+        if batch_size > 0 {
+            return Err(bad_value(format!(
+                "cursor.batchSize is not supported by the wire {command} command"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_concerns(body: &Document) -> Result<(), ApiError> {
+    if let Some(Bson::Document(concern)) = body.get("readConcern") {
+        if let Ok(level) = concern.get_str("level") {
+            if !matches!(level, "local" | "available") {
+                return Err(bad_value(format!(
+                    "readConcern `{level}` is not supported; use `local`"
+                )));
+            }
+        }
+    }
+    if let Some(Bson::Document(concern)) = body.get("writeConcern") {
+        if let Some(w) = concern.get("w") {
+            let supported = match w {
+                Bson::Int32(value) => *value == 1,
+                Bson::Int64(value) => *value == 1,
+                Bson::Double(value) => *value == 1.0,
+                Bson::String(value) => value == "1",
+                _ => false,
+            };
+            if !supported {
+                return Err(bad_value(
+                    "only writeConcern w:1 is supported by the wire listener",
+                ));
+            }
+        }
+        if concern
+            .get("wtimeout")
+            .and_then(bson_int)
+            .is_some_and(|value| value != 0)
+        {
+            return Err(bad_value("writeConcern wtimeout is not supported"));
+        }
+    }
+    Ok(())
 }
 
 fn authorize_mongo_command(
@@ -2718,6 +2925,71 @@ mod tests {
         );
         assert!(principal.can_see_database("app"));
         assert!(!principal.can_see_database("other"));
+    }
+
+    #[test]
+    fn unsupported_wire_options_fail_loudly() {
+        for (command, body, option) in [
+            (
+                "find",
+                bson::doc! { "find": "items", "collation": { "locale": "en" } },
+                "collation",
+            ),
+            (
+                "find",
+                bson::doc! { "find": "items", "returnKey": true },
+                "returnKey",
+            ),
+            (
+                "aggregate",
+                bson::doc! { "aggregate": "items", "pipeline": [], "cursor": { "batchSize": 10 } },
+                "cursor.batchSize",
+            ),
+            (
+                "insert",
+                bson::doc! { "insert": "items", "documents": [], "bypassDocumentValidation": true },
+                "bypassDocumentValidation",
+            ),
+            (
+                "findAndModify",
+                bson::doc! { "findAndModify": "items", "query": {}, "collation": { "locale": "en" } },
+                "collation",
+            ),
+            (
+                "find",
+                bson::doc! { "find": "items", "writeConcern": { "w": "majority" } },
+                "writeConcern",
+            ),
+            (
+                "find",
+                bson::doc! { "find": "items", "readConcern": { "level": "snapshot" } },
+                "readConcern",
+            ),
+        ] {
+            let error = validate_mongo_options(command, &body).unwrap_err();
+            assert_eq!(error.code, "invalid_query", "{option}");
+            assert!(error.message.contains(option), "{}", error.message);
+        }
+
+        assert!(validate_mongo_options(
+            "find",
+            &bson::doc! {
+                "find": "items",
+                "readConcern": { "level": "local" },
+                "writeConcern": { "w": 1 },
+            }
+        )
+        .is_ok());
+        assert!(validate_mongo_options(
+            "aggregate",
+            &bson::doc! { "aggregate": "items", "pipeline": [], "cursor": {} }
+        )
+        .is_ok());
+        assert!(validate_mongo_options(
+            "listCollections",
+            &bson::doc! { "listCollections": 1, "filter": { "name": "items" } }
+        )
+        .is_ok());
     }
 
     #[test]

@@ -56,7 +56,7 @@ direct migration target.
 | Retryable writes | ❌ | Writes are routed to the single writer |
 | Change streams | ❌ | Outbox events, `watch`, and subscriptions are separate APIs |
 | Multi-document transactions | ❌ | `write_batch` is atomic, but it is not a general transaction API |
-| Read/write concern | 🟡 | NonoDB has per-request durability; no MongoDB concern model |
+| Read/write concern | 🟡 | Wire accepts `readConcern: local`/`available` and `writeConcern w:1`; other levels are rejected |
 | Bulk write API | 🟡 | Equivalent batching exists through `write_batch`, not `bulkWrite` |
 
 ## MongoDB wire listener
@@ -96,6 +96,15 @@ default names. `aggregate` returns the full result in the first batch; use the
 HTTP aggregation API or cursors for very large result sets. Upserts without an
 `_id` in the filter currently receive the core UUID rather than a
 driver-style ObjectId.
+
+Driver-facing options are checked instead of silently ignored. The listener
+accepts non-empty `filter` documents for `listCollections` and `listDatabases`,
+and honors `nameOnly` for both. It accepts `readConcern` levels `local` and
+`available`, plus `writeConcern` `w:1`, but rejects unsupported concern values,
+`collation`, `let`, `hint` on commands that cannot use it, `min`/`max`,
+tailable/await-data cursors, `returnKey`, `showRecordId`, and cursor batching
+for `aggregate`/`listIndexes`/`listCollections`. Rejected options return
+MongoDB `BadValue` code `2` instead of changing query behavior silently.
 
 ## CRUD
 

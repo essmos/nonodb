@@ -13,6 +13,9 @@ from urllib.parse import quote
 
 from bson import ObjectId
 from pymongo import MongoClient, ReturnDocument
+from pymongo.errors import OperationFailure
+from pymongo.read_concern import ReadConcern
+from pymongo.write_concern import WriteConcern
 
 
 def main() -> int:
@@ -45,6 +48,48 @@ def main() -> int:
         assert coll.count_documents({"group": "smoke"}) == 10
         assert coll.estimated_document_count() == 10
         assert sorted(coll.distinct("tags")) == ["a", "b"]
+        assert [
+            item["name"]
+            for item in db.list_collections(filter={"name": coll.name})
+        ] == [coll.name]
+        assert [
+            item["name"]
+            for item in client.list_databases(
+                filter={"name": db.name}, nameOnly=True
+            )
+        ] == [db.name]
+
+        for label, operation in [
+            ("collation", lambda: list(coll.find({}, collation={"locale": "en"}))),
+            (
+                "bypassDocumentValidation",
+                lambda: coll.insert_one(
+                    {"unsupported": True}, bypass_document_validation=True
+                ),
+            ),
+            (
+                "aggregate batchSize",
+                lambda: list(coll.aggregate([{"$match": {}}], batchSize=5)),
+            ),
+            (
+                "writeConcern majority",
+                lambda: coll.with_options(
+                    write_concern=WriteConcern("majority")
+                ).insert_one({"unsupported": True}),
+            ),
+            (
+                "readConcern snapshot",
+                lambda: coll.with_options(
+                    read_concern=ReadConcern("snapshot")
+                ).find_one({}),
+            ),
+        ]:
+            try:
+                operation()
+            except OperationFailure as error:
+                assert error.code == 2, (label, error)
+            else:
+                raise AssertionError(f"unsupported option was accepted: {label}")
 
         updated = coll.update_one(
             {"_id": inserted.inserted_ids[0]}, {"$set": {"i": 100}}

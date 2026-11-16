@@ -198,7 +198,8 @@ comparison and practical migration caveats.
 
 - The MongoDB wire listener is experimental. It supports handshake, CRUD,
   cursors, count, distinct, aggregate, index DDL, collection DDL, optional
-  SCRAM-SHA-256/SCRAM-SHA-1 authentication, auth-file principal scopes, and TLS.
+  SCRAM-SHA-256/SCRAM-SHA-1 authentication, authSource validation, auth-file
+  principal scopes, strict rejection of unsupported driver options, and TLS.
   It does not support client-certificate authentication, sessions, transactions,
   or change streams.
 - The supported API is HTTP/JSON; no gRPC, binary framing, or CBOR API.
