@@ -48,7 +48,27 @@ def main() -> int:
         assert all(isinstance(value, ObjectId) for value in inserted.inserted_ids)
         assert coll.count_documents({"group": "smoke"}) == 10
         assert coll.estimated_document_count() == 10
+        assert db.command(
+            {
+                "count": coll.name,
+                "query": {"group": "smoke"},
+                "skip": 3,
+                "limit": 4,
+            }
+        )["n"] == 4
+        assert db.command(
+            {"count": coll.name, "query": {"group": "smoke"}, "skip": 8}
+        )["n"] == 2
         assert sorted(coll.distinct("tags")) == ["a", "b"]
+        assert sorted(
+            db.command(
+                {
+                    "distinct": coll.name,
+                    "key": "tags",
+                    "maxTimeMS": 5000,
+                }
+            )["values"]
+        ) == ["a", "b"]
         streamed = list(
             coll.aggregate(
                 [{"$match": {"group": "smoke"}}, {"$project": {"i": 1}}],

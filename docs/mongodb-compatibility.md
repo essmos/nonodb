@@ -96,8 +96,10 @@ limits.
 | SCRAM-SHA-256 / SHA-1 authentication / TLS | 🟡 | Optional username/password auth, auth-file principal scopes, authSource check, and server TLS; no MongoDB user database or client-certificate auth |
 | Sessions / transactions / change streams | ❌ |
 
-`dropDatabase` cannot remove the built-in `default` database. Wire `find`
-supports arbitrary sort keys; `_id`/natural order uses fast keyset paging,
+`dropDatabase` cannot remove the built-in `default` database. The `count`
+command honors `query`, `skip`, `limit`, and `maxTimeMS`; `distinct` honors
+`maxTimeMS`. Wire `find` supports arbitrary sort keys; `_id`/natural order uses
+fast keyset paging,
 while other sort keys use skip-based cursor paging and re-sort each batch.
 Index names and ascending/descending directions are preserved and returned by
 `listIndexes`; custom MongoDB names are accepted. Newly created and reindexed

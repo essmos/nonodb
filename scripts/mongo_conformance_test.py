@@ -250,7 +250,26 @@ def main() -> int:
             ),
         )
         check_both("count", lambda db: db.items.count_documents({"tag": "x"}))
+        check_both(
+            "count command skip and limit",
+            lambda db: db.command(
+                {
+                    "count": "items",
+                    "query": {"n": {"$gte": 1}},
+                    "skip": 1,
+                    "limit": 2,
+                }
+            )["n"],
+        )
         check_both("distinct", lambda db: sorted(db.items.distinct("tag")))
+        check_both(
+            "distinct command maxTimeMS",
+            lambda db: sorted(
+                db.command(
+                    {"distinct": "items", "key": "tag", "maxTimeMS": 5000}
+                )["values"]
+            ),
+        )
         check_both(
             "update set inc push",
             lambda db: update_result(

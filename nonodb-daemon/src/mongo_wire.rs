@@ -1218,6 +1218,8 @@ async fn count_command(state: &super::AppState, body: &Document) -> Result<Docum
         .to_string();
     let database = database_name(body);
     let filter = document_field(body, "query")?.unwrap_or_else(|| json!({}));
+    let skip = non_negative(body, "skip")?.unwrap_or(0);
+    let limit = non_negative(body, "limit")?.unwrap_or(0);
     let max_time_ms = int_field(body, "maxTimeMS")
         .filter(|value| *value > 0)
         .map(|value| value as u64);
@@ -1232,6 +1234,10 @@ async fn count_command(state: &super::AppState, body: &Document) -> Result<Docum
     })
     .await
     .map_err(|error| ApiError::internal(format!("count join error: {error}")))??;
+    let mut count = count.saturating_sub(skip);
+    if limit != 0 {
+        count = count.min(limit);
+    }
     Ok(bson::doc! {
         "n": Bson::Int64(count as i64),
         "ok": 1.0,
@@ -1249,6 +1255,9 @@ async fn distinct_command(state: &super::AppState, body: &Document) -> Result<Do
         .map_err(|_| bad_value("distinct requires a key"))?
         .to_string();
     let filter = document_field(body, "query")?.unwrap_or_else(|| json!({}));
+    let max_time_ms = int_field(body, "maxTimeMS")
+        .filter(|value| *value > 0)
+        .map(|value| value as u64);
     let Some(runtime) = database_for_read(state, &database).await else {
         return Ok(bson::doc! {"values": Bson::Array(Vec::new()), "ok": 1.0});
     };
@@ -1262,7 +1271,7 @@ async fn distinct_command(state: &super::AppState, body: &Document) -> Result<Do
     let coll = collection.clone();
     let values = tokio::task::spawn_blocking(move || {
         let c = store.collection(&coll)?;
-        let docs = c.aggregate(&pipeline)?;
+        let docs = c.aggregate_with_options(&pipeline, max_time_ms)?;
         Ok::<Vec<Value>, nonodb_core::Error>(
             docs.into_iter()
                 .map(|doc| doc.get("_id").cloned().unwrap_or(Value::Null))
@@ -2389,11 +2398,6 @@ fn validate_mongo_options(command: &str, body: &Document) -> Result<(), ApiError
                 &["collation", "let"],
                 "not supported by the wire distinct command",
             )?;
-            if body.contains_key("maxTimeMS") {
-                return Err(bad_value(
-                    "maxTimeMS is not supported by the wire distinct command",
-                ));
-            }
             validate_concerns(body)
         }
         "insert" | "update" | "delete" => {
