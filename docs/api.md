@@ -289,7 +289,7 @@ Fields:
 | Field | Default | Meaning |
 |---|---|---|
 | `filter` | `{}` | Query predicate; missing/null/empty means match all |
-| `projection` | none | Top-level include or exclude projection |
+| `projection` | none | Include or exclude projection; dotted paths are supported |
 | `sort` | none | Array of `[field, direction]`; `1` ascending, `-1` descending |
 | `skip` | `0` | Number of matching documents to skip |
 | `limit` | none | Maximum number of results; unlimited when omitted |
@@ -319,8 +319,8 @@ Behavior:
   sort and all directions are the same. Otherwise a full scan and top-K sort
   are used.
 - Nested paths use dots: `{"user.address.city": "London"}`.
-- Projection is top-level only. It is either inclusive or exclusive; `_id` is
-  included by default and can be disabled with `"_id": 0`.
+- Projection is either inclusive or exclusive; `_id` is included by default and
+  can be disabled with `"_id": 0`. Dotted paths create nested projection trees.
 
 ## find_one
 
@@ -794,7 +794,7 @@ Fields:
 | `upsert` | Insert a filter-seeded document when nothing matches |
 | `remove` | Remove the selected document instead of updating it |
 | `array_filters` | MongoDB-style filters for `$[identifier]` update paths |
-| `projection` | Flat top-level projection applied to the returned image |
+| `projection` | Projection applied to the returned image; nested paths are supported |
 
 With `upsert=true` and no match, the default (`new=false`) response has
 `"value": null`; with `new=true` it returns the inserted document. For an
@@ -1463,24 +1463,35 @@ requires a scan. Regex values inside `$all`/`$elemMatch` are not supported.
 
 ## Projection
 
-Projection is a top-level include/exclude map:
+Projection is an include/exclude map. Dotted paths build nested output and
+traverse arrays of objects:
 
 ```json
-{"name": 1, "email": 1, "_id": 0}
+{
+  "user.name": 1,
+  "items.sku": 1,
+  "_id": 0
+}
 ```
 
 - If any non-`_id` field has a truthy value, the projection is inclusive.
-- Otherwise it is exclusive; listed fields are removed.
+- Otherwise it is exclusive; listed paths are removed, including fields inside
+  array elements.
 - `_id` is included by default. `"_id": 0` excludes it.
 - `$slice` returns a prefix/suffix of an array or a window:
   `{"tags": {"$slice": 3}}`, `{"tags": {"$slice": -2}}`, and
-  `{"tags": {"$slice": [2, 3]}}`.
+  `{"items.tags": {"$slice": [2, 3]}}`.
 - `$elemMatch` projection returns the first array element matching the
   condition: `{"items": {"$elemMatch": {"qty": {"$gt": 5}}}}`.
-- Nested projections are not supported.
-- `$meta` projection and positional `$` projection are not supported.
-- Covering indexes can satisfy an inclusive projection using indexed and
-  `include`d fields without fetching the document.
+- Positional `$` returns the first array element selected by the query filter:
+  `{"items.$": 1}` with `{"items.qty": {"$gt": 5}}`. The positional path must
+  be the final path segment.
+- `$meta` supports `textScore`/`searchScore` (from `_score`),
+  `indexKey` (from `_indexKey`), and `sortKey` (from `_sortKey`). NonoDB does
+  not compute full-text scores yet, so `textScore` defaults to `0.0`.
+- Covering indexes can satisfy a top-level inclusive projection using indexed
+  and `include`d fields without fetching the document. Nested and positional
+  projections fetch the full document.
 
 ## Sorting
 

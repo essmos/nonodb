@@ -257,7 +257,7 @@ Design: [docs/replication.md](docs/replication.md).
       `$dateToParts`) with UTC and fixed-offset time zones, custom
       `$dateFromString` formats, and ISO week fields
 - [ ] IANA time zone identifiers for date expressions
-- [ ] Nested projections, positional `$`, and `$meta` projections
+- [x] Nested projections, positional `$`, and basic `$meta` projections
 - [ ] ObjectId as `_id` (currently field values only)
 - [ ] BSON Timestamp and MinKey/MaxKey
 - [ ] Regular-expression values and legacy BSON value compatibility, excluding
@@ -409,7 +409,8 @@ indexing, and profiling.
 - LMDB files do not shrink after deletes; use compacting backup and restore.
 - `map_size` can only grow online. Shrinking the map reservation requires a
   restart; the LMDB file itself only shrinks through a compacting backup/restore.
-- Projection and index covering are top-level only.
+- Index covering is limited to top-level inclusive projections; nested and
+  positional projections fetch the full document.
 - Search is scalar-field only and has no custom analyzers.
 - Indexes created before format 5 do not contain array entries; recreate them
   after upgrading if you query or sort array fields.

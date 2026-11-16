@@ -112,8 +112,8 @@ Implemented:
   `$dateDiff` and custom `$dateFromString` formats. Date time zones support UTC
   and fixed offsets, not IANA identifiers. Expression errors do not match the
   document instead of aborting the query.
-- Projection supports top-level fields, `$slice`, and `$elemMatch`; nested
-  projections, positional `$`, and `$meta` are not implemented.
+- Projection supports nested paths, positional `$`, `$slice`, `$elemMatch`, and
+  basic `$meta`. Full-text scores are not computed yet.
 - `$regex` supports `i`, `m`, `s`, `x`, and `u` options, but not MongoDB's
   PCRE-only constructs; patterns use Rust's non-backtracking regex engine.
 - `$in`, `$nin`, `$all`, and `$elemMatch` accept `{"$regex": ...}` operands, but
@@ -129,7 +129,8 @@ Implemented:
   collections; it is not an automatic change stream for arbitrary writes,
   updates, or deletes.
 - TTL is eventual and has no strict read-time filtering.
-- Projection is top-level only, not a nested projection tree.
+- Projection expressions are limited; nested paths, positional `$`, and basic
+  `$meta` are supported, but arbitrary computed projection expressions are not.
 - Sorting and filtering use the documented subset; there is no collation API.
 - Dates are instants only. IANA timezone names and timezone-aware aggregation
   expressions are not implemented; clients must send RFC 3339 with `Z`/offset.
@@ -244,7 +245,7 @@ Implemented:
 | Simple optimizer | Predictable; misses some multi-index opportunities |
 | Global token auth | Simple; insufficient for multi-tenant roles |
 | Snapshot-based backup | Simple; not PITR |
-| Flat projection model | `$slice`/`$elemMatch` work, but nested and positional projections do not |
+| Projection tree model | Nested paths, positional `$`, `$slice`, `$elemMatch`, and basic `$meta` work |
 
 ## Candidate future work
 

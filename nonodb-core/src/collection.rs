@@ -1433,7 +1433,7 @@ impl<'e> Collection<'e> {
             return Ok(Some(
                 out.into_iter()
                     .map(|doc| match &query.projection {
-                        Some(projection) => project(&doc, projection),
+                        Some(projection) => project(&doc, projection, Some(&query.filter)),
                         None => doc,
                     })
                     .collect(),
@@ -1495,7 +1495,7 @@ impl<'e> Collection<'e> {
         Ok(Some(
             out.into_iter()
                 .map(|doc| match &query.projection {
-                    Some(projection) => project(&doc, projection),
+                    Some(projection) => project(&doc, projection, Some(&query.filter)),
                     None => doc,
                 })
                 .collect(),
@@ -2802,7 +2802,7 @@ impl<'e> Collection<'e> {
                 .to_string();
             let removed = self.delete_txn(wtxn, &serde_json::json!({"_id": id}), false)?;
             return Ok(FindAndModifyOutcome {
-                value: Some(apply_projection(old, opts.projection)),
+                value: Some(apply_projection(old, opts.projection, Some(opts.filter))),
                 matched: removed,
                 modified: removed,
                 upserted_id: None,
@@ -2819,6 +2819,7 @@ impl<'e> Collection<'e> {
                 value: Some(apply_projection(
                     if opts.new { new } else { old },
                     opts.projection,
+                    Some(opts.filter),
                 )),
                 matched: 1,
                 modified: 1,
@@ -2841,7 +2842,11 @@ impl<'e> Collection<'e> {
                 .db
                 .get(&*wtxn, id.as_bytes())?
                 .ok_or_else(|| Error::Query("upserted document disappeared".into()))?;
-            Some(apply_projection(parse_json(raw)?, opts.projection))
+            Some(apply_projection(
+                parse_json(raw)?,
+                opts.projection,
+                Some(opts.filter),
+            ))
         } else {
             None
         };
@@ -4152,7 +4157,7 @@ impl<'e> Collection<'e> {
                 .skip(query.skip)
                 .take(limit)
                 .map(|doc| match &query.projection {
-                    Some(projection) => project(&doc, projection),
+                    Some(projection) => project(&doc, projection, Some(&query.filter)),
                     None => doc,
                 })
                 .collect()
@@ -4894,7 +4899,7 @@ impl<'e> Collection<'e> {
             .skip(query.skip)
             .take(limit)
             .map(|(_, doc)| match &query.projection {
-                Some(projection) => project(&doc, projection),
+                Some(projection) => project(&doc, projection, Some(&query.filter)),
                 None => doc,
             })
             .collect())
@@ -4970,7 +4975,7 @@ impl<'e> Collection<'e> {
                 .skip(post_skip)
                 .take(limit)
                 .map(|doc| match &query.projection {
-                    Some(projection) => project(&doc, projection),
+                    Some(projection) => project(&doc, projection, Some(&query.filter)),
                     None => doc,
                 })
                 .collect());
@@ -5084,7 +5089,7 @@ impl<'e> Collection<'e> {
                 return Ok(out
                     .into_iter()
                     .map(|doc| match &query.projection {
-                        Some(projection) => project(&doc, projection),
+                        Some(projection) => project(&doc, projection, Some(&query.filter)),
                         None => doc,
                     })
                     .collect());
@@ -5147,7 +5152,7 @@ impl<'e> Collection<'e> {
                 return Ok(out
                     .into_iter()
                     .map(|doc| match &query.projection {
-                        Some(projection) => project(&doc, projection),
+                        Some(projection) => project(&doc, projection, Some(&query.filter)),
                         None => doc,
                     })
                     .collect());
@@ -5170,7 +5175,7 @@ impl<'e> Collection<'e> {
                 .skip(query.skip)
                 .take(limit)
                 .map(|doc| match &query.projection {
-                    Some(projection) => project(&doc, projection),
+                    Some(projection) => project(&doc, projection, Some(&query.filter)),
                     None => doc,
                 })
                 .collect());
@@ -5227,7 +5232,7 @@ impl<'e> Collection<'e> {
             .skip(post_skip)
             .take(limit)
             .map(|doc| match &query.projection {
-                Some(projection) => project(&doc, projection),
+                Some(projection) => project(&doc, projection, Some(&query.filter)),
                 None => doc,
             })
             .collect())
@@ -5353,7 +5358,7 @@ impl<'e> Collection<'e> {
                             match projection {
                                 Some(projection) => {
                                     let doc: Value = parse_json(bytes)?;
-                                    (Some(project(&doc, projection)), size)
+                                    (Some(project(&doc, projection, None)), size)
                                 }
                                 None => (Some(parse_json(bytes)?), size),
                             }
@@ -5451,7 +5456,7 @@ impl<'e> Collection<'e> {
                 {
                     (
                         match projection {
-                            Some(projection) => project(&doc, projection),
+                            Some(projection) => project(&doc, projection, Some(&filter)),
                             None => doc,
                         },
                         raw_size,
@@ -5464,7 +5469,7 @@ impl<'e> Collection<'e> {
                     match projection {
                         Some(projection) => {
                             let doc: Value = parse_json(bytes)?;
-                            (project(&doc, projection), size)
+                            (project(&doc, projection, None), size)
                         }
                         None => (parse_json(bytes)?, size),
                     }
@@ -6841,9 +6846,9 @@ fn empty_find_and_modify() -> FindAndModifyOutcome {
     }
 }
 
-fn apply_projection(doc: Value, projection: Option<&Value>) -> Value {
+fn apply_projection(doc: Value, projection: Option<&Value>, filter: Option<&Value>) -> Value {
     match projection {
-        Some(p) => project(&doc, p),
+        Some(p) => project(&doc, p, filter),
         None => doc,
     }
 }
@@ -6852,7 +6857,7 @@ fn apply_projection(doc: Value, projection: Option<&Value>) -> Value {
 /// need the raw `_id` for the next page before hiding it from the caller.
 pub fn project_document(doc: &Value, projection: Option<&Value>) -> Value {
     match projection {
-        Some(projection) => project(doc, projection),
+        Some(projection) => project(doc, projection, None),
         None => doc.clone(),
     }
 }
@@ -6906,7 +6911,192 @@ fn slice_projection(value: &Value, arg: &Value) -> Value {
     Value::Array(items[skip..end].to_vec())
 }
 
-fn project(doc: &Value, projection: &Value) -> Value {
+fn merge_projection_value(dst: &mut Value, src: Value) {
+    match (dst, src) {
+        (Value::Object(dst), Value::Object(src)) => merge_projection_object(dst, src),
+        (Value::Array(dst), Value::Array(src)) if dst.len() == src.len() => {
+            for (dst, src) in dst.iter_mut().zip(src) {
+                merge_projection_value(dst, src);
+            }
+        }
+        (dst, src) => *dst = src,
+    }
+}
+
+fn merge_projection_object(dst: &mut Map<String, Value>, src: Map<String, Value>) {
+    for (key, value) in src {
+        match dst.get_mut(&key) {
+            Some(existing) => merge_projection_value(existing, value),
+            None => {
+                dst.insert(key, value);
+            }
+        }
+    }
+}
+
+fn merge_projection_fragment(out: &mut Map<String, Value>, fragment: Value) {
+    if let Value::Object(fragment) = fragment {
+        merge_projection_object(out, fragment);
+    }
+}
+
+/// Applies a projection modifier such as `$slice`, `$elemMatch`, or `$meta`.
+fn projection_modifier(value: &Value, modifier: &Value, root: &Value) -> Option<Value> {
+    let Some(obj) = modifier.as_object() else {
+        return Some(value.clone());
+    };
+    if let Some(slice) = obj.get("$slice") {
+        return Some(slice_projection(value, slice));
+    }
+    if let Some(elem) = obj.get("$elemMatch") {
+        let Value::Array(items) = value else {
+            return None;
+        };
+        return items
+            .iter()
+            .find(|item| crate::query::matcher::elem_item_matches(item, elem))
+            .map(|found| Value::Array(vec![found.clone()]));
+    }
+    if let Some(meta) = obj.get("$meta").and_then(Value::as_str) {
+        return match meta {
+            "textScore" | "searchScore" => Some(
+                root.get("_score")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!(0.0)),
+            ),
+            "indexKey" => Some(
+                root.get("_indexKey")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({})),
+            ),
+            "sortKey" => Some(
+                root.get("_sortKey")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({})),
+            ),
+            _ => None,
+        };
+    }
+    Some(value.clone())
+}
+
+/// Extracts a nested projection fragment. Arrays are traversed element-wise so
+/// `items.name` becomes `{"items": [{"name": ...}, ...]}`.
+fn extract_projection_path(
+    value: &Value,
+    parts: &[&str],
+    modifier: &Value,
+    root: &Value,
+) -> Option<Value> {
+    let Some((part, rest)) = parts.split_first() else {
+        return projection_modifier(value, modifier, root);
+    };
+
+    if let Value::Object(obj) = value {
+        let child = match obj.get(*part) {
+            Some(child) => child,
+            None if rest.is_empty()
+                && modifier
+                    .as_object()
+                    .is_some_and(|obj| obj.contains_key("$meta")) =>
+            {
+                let projected = projection_modifier(&Value::Null, modifier, root)?;
+                let mut out = Map::new();
+                out.insert((*part).to_string(), projected);
+                return Some(Value::Object(out));
+            }
+            None => return None,
+        };
+        let projected = extract_projection_path(child, rest, modifier, root)?;
+        let mut out = Map::new();
+        out.insert((*part).to_string(), projected);
+        return Some(Value::Object(out));
+    }
+
+    if let Value::Array(items) = value {
+        if let Ok(index) = part.parse::<usize>() {
+            let child = items.get(index)?;
+            let projected = extract_projection_path(child, rest, modifier, root)?;
+            return Some(Value::Array(vec![projected]));
+        }
+        let mut out = Vec::with_capacity(items.len());
+        for item in items {
+            out.push(
+                extract_projection_path(item, parts, modifier, root)
+                    .unwrap_or_else(|| Value::Object(Map::new())),
+            );
+        }
+        return Some(Value::Array(out));
+    }
+
+    None
+}
+
+fn positional_element<'a>(
+    doc: &Value,
+    array_path: &str,
+    items: &'a [Value],
+    filter: Option<&Value>,
+) -> Option<&'a Value> {
+    if let Some(filter) = filter {
+        for item in items {
+            let mut probe = doc.clone();
+            if crate::query::path::set(&mut probe, array_path, serde_json::json!([item.clone()]))
+                .is_err()
+            {
+                break;
+            }
+            if crate::query::matcher::matches(&probe, filter) {
+                return Some(item);
+            }
+        }
+    }
+    items.first()
+}
+
+fn positional_projection(
+    doc: &Value,
+    projection_path: &str,
+    modifier: &Value,
+    filter: Option<&Value>,
+) -> Option<Value> {
+    let array_path = projection_path.strip_suffix(".$")?;
+    let items = crate::query::path::get(doc, array_path)?.as_array()?;
+    let item = positional_element(doc, array_path, items, filter)?;
+    let selected = projection_modifier(item, modifier, doc)?;
+    let mut fragment = Value::Object(Map::new());
+    crate::query::path::set(&mut fragment, array_path, Value::Array(vec![selected])).ok()?;
+    Some(fragment)
+}
+
+fn exclude_projection_path(value: &mut Value, parts: &[&str]) {
+    let Some((part, rest)) = parts.split_first() else {
+        return;
+    };
+    match value {
+        Value::Object(obj) => {
+            if rest.is_empty() {
+                obj.remove(*part);
+            } else if let Some(child) = obj.get_mut(*part) {
+                exclude_projection_path(child, rest);
+            }
+        }
+        Value::Array(items) => {
+            if let Ok(index) = part.parse::<usize>() {
+                if let Some(child) = items.get_mut(index) {
+                    exclude_projection_path(child, rest);
+                }
+            } else {
+                for item in items {
+                    exclude_projection_path(item, parts);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn project(doc: &Value, projection: &Value, filter: Option<&Value>) -> Value {
     let Some(p) = projection.as_object() else {
         return doc.clone();
     };
@@ -6929,33 +7119,26 @@ fn project(doc: &Value, projection: &Value) -> Value {
             if k == "_id" || !truthy(v) {
                 continue;
             }
-            let Some(val) = doc.get(k) else {
-                continue;
-            };
-            if let Some(slice) = v.as_object().and_then(|o| o.get("$slice")) {
-                out.insert(k.clone(), slice_projection(val, slice));
-            } else if let Some(elem) = v.as_object().and_then(|o| o.get("$elemMatch")) {
-                if let Value::Array(items) = val {
-                    if let Some(found) = items
-                        .iter()
-                        .find(|item| crate::query::matcher::elem_item_matches(item, elem))
-                    {
-                        out.insert(k.clone(), Value::Array(vec![found.clone()]));
-                    }
-                }
+            let fragment = if k.ends_with(".$") {
+                positional_projection(doc, k, v, filter)
             } else {
-                out.insert(k.clone(), val.clone());
+                let parts: Vec<&str> = k.split('.').collect();
+                extract_projection_path(doc, &parts, v, doc)
+            };
+            if let Some(fragment) = fragment {
+                merge_projection_fragment(&mut out, fragment);
             }
         }
         Value::Object(out)
     } else {
-        let mut out = doc.as_object().cloned().unwrap_or_default();
+        let mut out = doc.clone();
         for (k, v) in p {
             if !truthy(v) {
-                out.remove(k);
+                let parts: Vec<&str> = k.split('.').collect();
+                exclude_projection_path(&mut out, &parts);
             }
         }
-        Value::Object(out)
+        out
     }
 }
 
@@ -7166,7 +7349,7 @@ mod tests {
 
         let d = c.delete(&json!({"age": {"$lt": 18}}), true).unwrap();
         assert_eq!(d, 1);
-        assert_eq!(c.count(&json!({})).unwrap(), 1);
+        assert_eq!(c.count(&serde_json::json!({})).unwrap(), 1);
     }
 
     #[test]
@@ -7459,7 +7642,7 @@ mod tests {
             .delete(&json!({"_id": {"$gte": "id06", "$lte": "id08"}}), true)
             .unwrap();
         assert_eq!(n, 3);
-        assert_eq!(c.count(&json!({})).unwrap(), 17);
+        assert_eq!(c.count(&serde_json::json!({})).unwrap(), 17);
     }
 
     #[test]
@@ -7471,7 +7654,7 @@ mod tests {
                 .unwrap();
         }
         let q = FindQuery {
-            filter: json!({}),
+            filter: serde_json::json!({}),
             projection: Some(json!({"i": 1, "_id": 0})),
             sort: vec![("i".to_string(), -1)],
             skip: 1,
@@ -7497,7 +7680,7 @@ mod tests {
 
         let first = c
             .find(&FindQuery {
-                filter: json!({}),
+                filter: serde_json::json!({}),
                 projection: Some(json!({
                     "tags": {"$slice": 2},
                     "items": {"$elemMatch": {"qty": {"$gt": 3}}},
@@ -7516,12 +7699,106 @@ mod tests {
 
         let last = c
             .find(&FindQuery {
-                filter: json!({}),
+                filter: serde_json::json!({}),
                 projection: Some(json!({"tags": {"$slice": [-2, 1]}, "_id": 0})),
                 ..Default::default()
             })
             .unwrap();
         assert_eq!(last, vec![json!({"tags": ["c"]})]);
+    }
+
+    #[test]
+    fn nested_positional_and_meta_projections() {
+        let (_dir, store) = store();
+        let c = store.collection("projected_nested").unwrap();
+        c.insert_one(json!({
+            "_id": "a",
+            "user": {
+                "name": "Ada",
+                "password": "secret",
+                "address": {"city": "Warsaw", "zip": "00-001"}
+            },
+            "items": [
+                {"sku": "x", "qty": 1, "cost": 10},
+                {"sku": "y", "qty": 5, "cost": 50}
+            ],
+            "tags": ["a", "b", "c"],
+            "_score": 2.5
+        }))
+        .unwrap();
+
+        let nested = c
+            .find(&FindQuery {
+                filter: json!({}),
+                projection: Some(json!({
+                    "user.name": 1,
+                    "user.address.city": 1,
+                    "items.sku": 1,
+                    "items.qty": 1,
+                    "_id": 0
+                })),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            nested,
+            vec![json!({
+                "user": {"name": "Ada", "address": {"city": "Warsaw"}},
+                "items": [
+                    {"sku": "x", "qty": 1},
+                    {"sku": "y", "qty": 5}
+                ]
+            })]
+        );
+
+        let positional = c
+            .find(&FindQuery {
+                filter: json!({"items.qty": {"$gt": 3}}),
+                projection: Some(json!({
+                    "user.name": 1,
+                    "items.$": {"$slice": 1},
+                    "score": {"$meta": "textScore"},
+                    "_id": 0
+                })),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            positional,
+            vec![json!({
+                "user": {"name": "Ada"},
+                "items": [{"sku": "y", "qty": 5, "cost": 50}],
+                "score": 2.5
+            })]
+        );
+
+        let excluded = c
+            .find(&FindQuery {
+                filter: json!({}),
+                projection: Some(json!({
+                    "user.password": 0,
+                    "user.address.zip": 0,
+                    "items.cost": 0,
+                    "_id": 0
+                })),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            excluded,
+            vec![json!({
+                "user": {
+                    "name": "Ada",
+                    "address": {"city": "Warsaw"}
+                },
+                "items": [
+                    {"sku": "x", "qty": 1},
+                    {"sku": "y", "qty": 5}
+                ],
+                "tags": ["a", "b", "c"],
+                "_score": 2.5
+            })]
+        );
     }
 
     #[test]
@@ -7565,7 +7842,7 @@ mod tests {
         c.create_index("name", false).unwrap();
 
         let q = FindQuery {
-            filter: json!({}),
+            filter: serde_json::json!({}),
             sort: vec![("n".into(), -1)],
             limit: Some(3),
             ..Default::default()
@@ -7581,7 +7858,7 @@ mod tests {
         // must fall back to a scan and still place it last.
         c.insert_one(json!({"_id": "missing"})).unwrap();
         let q = FindQuery {
-            filter: json!({}),
+            filter: serde_json::json!({}),
             sort: vec![("n".into(), 1)],
             ..Default::default()
         };
@@ -7655,7 +7932,7 @@ mod tests {
         assert_eq!(plan["access_path"], "index_scan");
 
         let q = FindQuery {
-            filter: json!({}),
+            filter: serde_json::json!({}),
             sort: vec![("tags".into(), 1)],
             ..Default::default()
         };
@@ -7671,7 +7948,7 @@ mod tests {
         assert_eq!(plan["sort_covered"], true);
 
         let q = FindQuery {
-            filter: json!({}),
+            filter: serde_json::json!({}),
             sort: vec![("tags".into(), -1)],
             skip: 1,
             limit: Some(2),
@@ -7688,7 +7965,7 @@ mod tests {
         // A document without the indexed field cannot use index sort order.
         c.insert_one(json!({"_id": "e"})).unwrap();
         let q = FindQuery {
-            filter: json!({}),
+            filter: serde_json::json!({}),
             sort: vec![("tags".into(), 1)],
             ..Default::default()
         };
@@ -7759,7 +8036,7 @@ mod tests {
             .insert_one(json!({"_id": "y", "tags": ["a", "c"]}))
             .unwrap();
         let q = FindQuery {
-            filter: json!({}),
+            filter: serde_json::json!({}),
             sort: vec![("tags".into(), 1)],
             ..Default::default()
         };
@@ -8071,7 +8348,7 @@ mod tests {
                 upserted_id: None
             }
         );
-        assert_eq!(c.count(&json!({})).unwrap(), 0);
+        assert_eq!(c.count(&serde_json::json!({})).unwrap(), 0);
     }
 
     #[test]
@@ -8284,19 +8561,25 @@ mod tests {
 
         assert_eq!(c.count(&json!({"grp": 1})).unwrap(), 1);
         assert_eq!(
-            c.search("body", "rust", &json!({}), 0, Some(10))
+            c.search("body", "rust", &serde_json::json!({}), 0, Some(10))
                 .unwrap()
                 .len(),
             1
         );
         assert_eq!(
-            c.fuzzy_search("name", "helo", 2, &json!({}), Some(10))
+            c.fuzzy_search("name", "helo", 2, &serde_json::json!({}), Some(10))
                 .unwrap()
                 .len(),
             1
         );
         let vector = c
-            .vector_search("embedding", &[1.0, 0.0], &json!({}), 0, Some(10))
+            .vector_search(
+                "embedding",
+                &[1.0, 0.0],
+                &serde_json::json!({}),
+                0,
+                Some(10),
+            )
             .unwrap();
         assert_eq!(vector[0]["_id"], "a");
     }
@@ -8314,7 +8597,9 @@ mod tests {
         c.create_text_index("title").unwrap();
         assert_eq!(c.list_text_indexes().unwrap(), vec!["title".to_string()]);
 
-        let hits = c.search("title", "rust", &json!({}), 0, Some(10)).unwrap();
+        let hits = c
+            .search("title", "rust", &serde_json::json!({}), 0, Some(10))
+            .unwrap();
         assert_eq!(hits.len(), 2);
         // A document with higher `rust` frequency has a higher score.
         assert!(hits[0]["title"].as_str().unwrap().contains("rust rust"));
@@ -8333,18 +8618,22 @@ mod tests {
             false,
         )
         .unwrap();
-        let hits = c.search("title", "rust", &json!({}), 0, Some(10)).unwrap();
+        let hits = c
+            .search("title", "rust", &serde_json::json!({}), 0, Some(10))
+            .unwrap();
         assert_eq!(hits.len(), 3);
 
         c.delete(&json!({"title": "rust database engine"}), false)
             .unwrap();
         let hits = c
-            .search("title", "database", &json!({}), 0, Some(10))
+            .search("title", "database", &serde_json::json!({}), 0, Some(10))
             .unwrap();
         assert!(hits.is_empty());
 
         c.drop_text_index("title").unwrap();
-        assert!(c.search("title", "rust", &json!({}), 0, None).is_err());
+        assert!(c
+            .search("title", "rust", &serde_json::json!({}), 0, None)
+            .is_err());
     }
 
     #[test]
@@ -8357,19 +8646,19 @@ mod tests {
         c.create_fuzzy_index("name").unwrap();
 
         let hits = c
-            .fuzzy_search("name", "aleksander", 2, &json!({}), Some(10))
+            .fuzzy_search("name", "aleksander", 2, &serde_json::json!({}), Some(10))
             .unwrap();
         assert!(hits.len() >= 2);
         assert_eq!(hits[0]["name"], "Aleksander");
         assert_eq!(hits[0]["_distance"], 0);
 
         let hits = c
-            .fuzzy_search("name", "aleksndra", 2, &json!({}), Some(10))
+            .fuzzy_search("name", "aleksndra", 2, &serde_json::json!({}), Some(10))
             .unwrap();
         assert!(hits.iter().any(|d| d["name"] == "Aleksandra"));
 
         let hits = c
-            .fuzzy_search("name", "bartek", 1, &json!({}), Some(10))
+            .fuzzy_search("name", "bartek", 1, &serde_json::json!({}), Some(10))
             .unwrap();
         assert!(hits.is_empty());
 
@@ -8380,13 +8669,13 @@ mod tests {
         )
         .unwrap();
         let hits = c
-            .fuzzy_search("name", "bartlomiej", 2, &json!({}), Some(10))
+            .fuzzy_search("name", "bartlomiej", 2, &serde_json::json!({}), Some(10))
             .unwrap();
         assert_eq!(hits.len(), 1);
 
         c.delete(&json!({"name": "Aleksander"}), false).unwrap();
         let hits = c
-            .fuzzy_search("name", "aleksander", 1, &json!({}), Some(10))
+            .fuzzy_search("name", "aleksander", 1, &serde_json::json!({}), Some(10))
             .unwrap();
         assert!(hits.is_empty());
     }
@@ -8397,11 +8686,11 @@ mod tests {
         let c = store.collection("nums").unwrap();
         c.insert_one(json!({"v": 1})).unwrap();
         c.insert_one(json!({"v": 2})).unwrap();
-        c.insert_one(json!({})).unwrap(); // missing field
+        c.insert_one(serde_json::json!({})).unwrap(); // missing field
         c.insert_one(json!({"v": null})).unwrap();
         c.create_index("v", false).unwrap();
 
-        assert_eq!(c.count(&json!({})).unwrap(), 4);
+        assert_eq!(c.count(&serde_json::json!({})).unwrap(), 4);
         assert_eq!(c.count(&Value::Null).unwrap(), 4);
         assert_eq!(c.count(&json!({"v": 1})).unwrap(), 1);
         assert_eq!(c.count(&json!({"v": {"$gte": 2}})).unwrap(), 1);
@@ -8435,7 +8724,7 @@ mod tests {
         assert_eq!(c.find(&q).unwrap().len(), 3);
 
         let q = FindQuery {
-            filter: json!({}),
+            filter: serde_json::json!({}),
             sort: vec![("n".into(), 1)],
             limit: Some(3),
             ..Default::default()
@@ -8449,7 +8738,7 @@ mod tests {
         assert_eq!(ns, vec![Some(0), Some(1), Some(2)]);
 
         let q = FindQuery {
-            filter: json!({}),
+            filter: serde_json::json!({}),
             sort: vec![("n".into(), -1)],
             skip: 10,
             limit: Some(3),
@@ -8478,7 +8767,7 @@ mod tests {
 
         // `skip` without a filter: natural `_id` order, without collecting skipped documents.
         let q = FindQuery {
-            filter: json!({}),
+            filter: serde_json::json!({}),
             skip: 90,
             limit: Some(5),
             ..Default::default()
@@ -8497,7 +8786,7 @@ mod tests {
         // TopK with sorting, skip, and many equal keys.
         let all = c
             .find(&FindQuery {
-                filter: json!({}),
+                filter: serde_json::json!({}),
                 ..Default::default()
             })
             .unwrap();
@@ -8511,7 +8800,7 @@ mod tests {
             .collect();
 
         let q = FindQuery {
-            filter: json!({}),
+            filter: serde_json::json!({}),
             sort: vec![("grp".into(), 1)],
             skip: 50,
             limit: Some(7),
@@ -8639,7 +8928,7 @@ mod tests {
 
         let deleted = c.delete(&json!({"g": "b"}), false).unwrap();
         assert_eq!(deleted, 1);
-        assert_eq!(c.count(&json!({})).unwrap(), 2);
+        assert_eq!(c.count(&serde_json::json!({})).unwrap(), 2);
 
         // Exact `_id` path in update/delete.
         let one = c.find_one(&json!({"g": "a"})).unwrap().unwrap();
@@ -8650,7 +8939,7 @@ mod tests {
             1
         );
         assert_eq!(c.delete(&json!({"_id": id}), false).unwrap(), 1);
-        assert_eq!(c.count(&json!({})).unwrap(), 1);
+        assert_eq!(c.count(&serde_json::json!({})).unwrap(), 1);
     }
 
     #[test]
@@ -9117,7 +9406,7 @@ mod tests {
         assert_eq!(explained["index"]["fields"], json!(["x"]));
 
         let mut natural = FindQuery {
-            filter: json!({}),
+            filter: serde_json::json!({}),
             projection: None,
             sort: vec![("$natural".to_string(), -1)],
             skip: 0,

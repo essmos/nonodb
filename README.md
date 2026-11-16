@@ -164,8 +164,8 @@ single-database directories are migrated to `default/` on startup. See
 - Nested paths (`{"user.address.city": "..."}`), array membership, and
   consistent, exact numeric comparison (`30 == 30.0`; large integers stay
   distinct).
-- Projection including `$slice` and `$elemMatch`, multi-field sort, `skip`, and
-  `limit`.
+- Nested projections, positional `$`, `$slice`, `$elemMatch`, and basic `$meta`,
+  plus multi-field sort, `skip`, and `limit`.
 - Fast `find_one`/`find` paths that stop after enough matches, a raw JSON
   prefilter for simple string/boolean equalities, and `count({})`
   in O(1).
