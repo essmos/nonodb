@@ -466,6 +466,11 @@ The named volume persists the LMDB data directory. Removing the container does
 not remove the volume; remove it explicitly when you really want to delete the
 database.
 
+Named volumes inherit the filesystem of `/var/lib/docker`, which is commonly
+uncompressed ext4 or XFS. To reduce disk usage, use a dedicated ZFS or Btrfs
+dataset and bind-mount it at `/var/lib/nonodb`. See
+[Volume compression](volume-compression.md).
+
 ### Docker Compose
 
 The repository includes [`deploy/docker-compose.yml`](../deploy/docker-compose.yml):
@@ -845,6 +850,10 @@ The LMDB file is approximately the size of the document data plus indexes plus
 free pages. Indexes, full-text/fuzzy, and vector structures add substantial overhead.
 The file **does not shrink** after deletes. A compacting backup produces a
 smaller copy; restoring it reduces the live file size.
+
+For deployments that control the host filesystem, ZFS or Btrfs compression can
+reduce physical disk usage transparently. See
+[Volume compression](volume-compression.md).
 
 `map_size` must be larger than the database high-water mark. If writes fail when
 the database grows, grow the map online with `nonodb-cli resize`, or stop the

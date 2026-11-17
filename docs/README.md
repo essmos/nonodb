@@ -32,6 +32,7 @@ quick-start instructions, and a feature overview.
 | [Streaming outbox events](streams.md) | Application developers | Long-poll `watch`, NDJSON/SSE streams, resume tokens, filters, truncation, Python/Rust/Node.js/Go examples |
 | [CLI](cli.md) | Operators | Administration, map resize, backup verification, restore drills, inspect, raw requests |
 | [Operations](operations.md) | Operators, SRE | Configuration, deployment, security, snapshots, monitoring, capacity, troubleshooting |
+| [Volume compression](volume-compression.md) | Operators, SRE | ZFS/Btrfs compression, Docker bind mounts and named volumes, verification, benchmarking, migration |
 | [Free-tier and low-cost VM deployment](free-tier-deployment.md) | Operators, small deployments | Oracle Cloud, GCP, AWS, DigitalOcean, small profile, Cloud Run read replicas, Spaces backups, restore |
 | [Backup and restore](backup.md) | Operators, SRE | Online backup, GUI backup/import, snapshots, verification, restore drills, Docker, vault keys, authorization state, recovery |
 | [Replication and cluster guide](replication-cluster-guide.md) | Operators, SRE | Primary/replica setup, TLS, CLI, GUI, quorum failover, monitoring, backup differences, troubleshooting |
@@ -72,4 +73,5 @@ quick-start instructions, and a feature overview.
 - **Import a backup as a new database:** [Import wizard](backup.md#import-wizard)
 - **Tune timeouts for index builds:** [Timeouts](operations.md#timeouts-and-long-operations)
 - **Understand memory usage:** [Capacity and memory](operations.md#capacity-and-memory)
+- **Reduce disk usage with filesystem compression:** [Volume compression](volume-compression.md)
 - **Reproduce performance numbers:** [Benchmarks](benchmarks.md#reproducing)

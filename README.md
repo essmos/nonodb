@@ -779,6 +779,10 @@ instead, use `docker build -t nonodb:local .` and set
 
 More deployment details: [Operations — Docker](docs/operations.md#docker).
 
+To reduce disk usage with transparent filesystem compression, put the data
+directory on ZFS or Btrfs and bind-mount it into the container. See
+[Volume compression](docs/volume-compression.md).
+
 For a free-tier or low-cost VM with a persistent volume, see
 [Free-tier and low-cost VM deployment](docs/free-tier-deployment.md). It includes
 the `NONODB_PROFILE=small` tuning, a DigitalOcean Spaces backup job, and the
@@ -844,6 +848,7 @@ documentation.
 | [Replication and cluster guide](docs/replication-cluster-guide.md) | Primary/replica setup, TLS, CLI, GUI Cluster view, quorum failover, monitoring, troubleshooting |
 | [CLI](docs/cli.md) | `ping`, `gui`, `find`, `count`, `map`, `resize`, auth management, backup/verify/restore, `exec` |
 | [Operations](docs/operations.md) | Configuration, deployment, security, snapshots, monitoring, capacity, troubleshooting |
+| [Volume compression](docs/volume-compression.md) | ZFS/Btrfs setup, Docker bind mounts, verification, benchmarks, migration |
 | [Free-tier and low-cost VM deployment](docs/free-tier-deployment.md) | Oracle Cloud, GCP, AWS, DigitalOcean, small profile, Cloud Run read replicas, Spaces backups |
 | [Backup and restore](docs/backup.md) | Online backup, snapshots, verification, restore drills, retention, Docker, vault keys, authorization state |
 | [Benchmarks](docs/benchmarks.md) | Test environment, throughput, latency, large data sets, RAM, reproducibility |
