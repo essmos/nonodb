@@ -43,6 +43,7 @@ feature gates:
 - **[Automatic indexes](docs/operations.md#automatic-indexes)** — opt-in creation of indexes for frequent query shapes, with cleanup of unused automatic indexes.
 - **[Embedded GUI in the box](docs/gui.md)** — a local browser console for documents, SQL, indexes, backups, credentials, cluster state, and metrics, with no separate frontend service.
 - **Search built in** — [BM25 full-text search](docs/api.md#full-text-indexes), [fuzzy trigram/Levenshtein search](docs/api.md#fuzzy-indexes), and [exact vector search](docs/api.md#vector-indexes) in the same database.
+- **SQL when you need it** — [SQL queries and writes](docs/sql.md) alongside the document API, without a separate SQL database.
 - **[TTL at both levels](docs/ttl.md)** — collection defaults and per-document overrides, with background expiry.
 - **[Simple encrypted backups](docs/backup.md#encryption)** — [native or restic backups](docs/backup.md#restic-engine), gzip/age encryption, local/S3/R2 destinations, verification, and restore drills.
 - **[Simple backup scheduling](docs/backup.md#scheduled-backups-from-the-daemon-and-gui)** — durable backup jobs configured through the CLI, API, or GUI.
@@ -215,7 +216,7 @@ curl -s --unix-socket /tmp/nonodb.sock \
 Aggregation is intentionally bounded: an intermediate result may contain at
 most 100,000 documents. It never writes to the database and is available inside
 the read-only `batch` operation. See
-[Aggregation](docs/api.md#aggregation) for the full stage list and semantics,
+[Aggregation](docs/api.md#aggregate) for the full stage list and semantics,
 and [benchmarks](docs/benchmarks.md#aggregation-pipeline) for stage timings and
 optimization notes.
 
@@ -415,10 +416,85 @@ rotation, and best-fit guidance.
 
 ## Quick start
 
-For a free-tier or low-cost VM with persistent storage, see
-[Free-tier and low-cost VM deployment](docs/free-tier-deployment.md). It covers
-Oracle Cloud Always Free, Google Cloud, AWS, and DigitalOcean, the `small`
-profile, and DigitalOcean Spaces backups.
+### Run with Docker
+
+The Docker workflow publishes images for Linux `amd64` and `arm64`. Stable
+releases publish exact, minor, and `latest` tags; prereleases publish only their
+exact version tag. Pin an exact version in production so an upgrade is
+deliberate, not an accidental `latest` change.
+
+The simplest way to use it from a process on the host is TCP on loopback with
+an auth registry mounted read-only. TCP has no default password; the two
+`nonodb-cli` commands create the registry and print the first token. This is the
+only extra setup step compared with an embedded database.
+
+```bash
+export NONODB_AUTH_FILE="$PWD/nonodb-auth.json"
+nonodb-cli auth init
+export TOKEN=$(nonodb-cli auth token create admin)
+
+docker volume create nonodb-data
+docker run -d --name nonodb \
+  -e NONODB_AUTH_FILE=/etc/nonodb/auth.json \
+  -e NONODB_TCP=0.0.0.0:7878 \
+  -p 127.0.0.1:7878:7878 \
+  --group-add "$(id -g)" \
+  -v "$NONODB_AUTH_FILE:/etc/nonodb/auth.json:ro" \
+  -v nonodb-data:/var/lib/nonodb \
+  ghcr.io/essmos/nonodb:0.26.0
+```
+
+Check health and logs:
+
+```bash
+curl -s http://127.0.0.1:7878/healthz
+docker logs nonodb
+```
+
+Connect from Python:
+
+```python
+from nonodb import NonoDB
+
+db = NonoDB(
+    base_url="http://127.0.0.1:7878",
+    token=os.environ["TOKEN"],
+)
+print(db.collection("users").count())
+db.close()
+```
+
+The named volume `nonodb-data` persists `/var/lib/nonodb`. The container runs as
+the unprivileged `nonodb` user.
+
+For container-to-container access over a Unix socket, mount a shared volume at
+`/run/nonodb`, for example `-v nonodb-run:/run/nonodb`. The client container must
+be able to access the socket with a matching uid/gid. For host processes, TCP on
+`127.0.0.1` is usually simpler; add TLS if the listener is not loopback-only.
+
+Docker Compose example:
+
+```bash
+export NONODB_AUTH_FILE="$PWD/nonodb-auth.json"
+nonodb-cli auth init
+nonodb-cli auth token create admin
+docker compose -f deploy/docker-compose.yml up -d
+```
+
+Set `NONODB_IMAGE` to pin another image tag. To build the image from source
+instead, use `docker build -t nonodb:local .` and set
+`NONODB_IMAGE=nonodb:local`.
+
+More deployment details: [Operations — Docker](docs/operations.md#docker).
+
+To reduce disk usage with transparent filesystem compression, put the data
+directory on ZFS or Btrfs and bind-mount it into the container. See
+[Volume compression](docs/volume-compression.md).
+
+For a free-tier or low-cost VM with a persistent volume, see
+[Free-tier and low-cost VM deployment](docs/free-tier-deployment.md). It includes
+the `NONODB_PROFILE=small` tuning, a DigitalOcean Spaces backup job, and the
+supported Cloud Run read-replica shape.
 
 ### Prebuilt binaries
 
@@ -620,93 +696,6 @@ target/release/nonodb-cli
 Use the same commands as above, replacing `./nonodb-daemon` with
 `./target/release/nonodb-daemon` and `./nonodb-cli` with
 `./target/release/nonodb-cli`.
-
-### Run with Docker
-
-The Docker workflow publishes versioned images to GitHub Container Registry for
-Linux `amd64` and `arm64`. Pull a published tag:
-
-```bash
-docker pull ghcr.io/essmos/nonodb:0.26.0
-```
-
-Pin a version in production. The `latest` tag follows stable releases. If the
-package is private, authenticate first:
-
-```bash
-echo "$GHCR_TOKEN" | docker login ghcr.io -u YOUR_GITHUB_USER --password-stdin
-```
-
-The simplest way to use it from a process on the host is TCP on loopback with
-an auth registry mounted read-only:
-
-```bash
-export NONODB_AUTH_FILE="$PWD/nonodb-auth.json"
-nonodb-cli auth init
-export TOKEN=$(nonodb-cli auth token create admin)
-
-docker volume create nonodb-data
-docker run -d --name nonodb \
-  -e NONODB_AUTH_FILE=/etc/nonodb/auth.json \
-  -e NONODB_TCP=0.0.0.0:7878 \
-  -p 127.0.0.1:7878:7878 \
-  --group-add "$(id -g)" \
-  -v "$NONODB_AUTH_FILE:/etc/nonodb/auth.json:ro" \
-  -v nonodb-data:/var/lib/nonodb \
-  ghcr.io/essmos/nonodb:0.26.0
-```
-
-Check health and logs:
-
-```bash
-curl -s http://127.0.0.1:7878/healthz
-docker logs nonodb
-```
-
-Connect from Python:
-
-```python
-from nonodb import NonoDB
-
-db = NonoDB(
-    base_url="http://127.0.0.1:7878",
-    token=os.environ["TOKEN"],
-)
-print(db.collection("users").count())
-db.close()
-```
-
-The named volume `nonodb-data` persists `/var/lib/nonodb`. The container runs as
-the unprivileged `nonodb` user.
-
-For container-to-container access over a Unix socket, mount a shared volume at
-`/run/nonodb`, for example `-v nonodb-run:/run/nonodb`. The client container must
-be able to access the socket with a matching uid/gid. For host processes, TCP on
-`127.0.0.1` is usually simpler; add TLS if the listener is not loopback-only.
-
-Docker Compose example:
-
-```bash
-export NONODB_AUTH_FILE="$PWD/nonodb-auth.json"
-nonodb-cli auth init
-nonodb-cli auth token create admin
-docker compose -f deploy/docker-compose.yml up -d
-```
-
-Set `NONODB_IMAGE` to pin another image tag. To build the image from source
-instead, use `docker build -t nonodb:local .` and set
-`NONODB_IMAGE=nonodb:local`.
-
-More deployment details: [Operations — Docker](docs/operations.md#docker).
-
-To reduce disk usage with transparent filesystem compression, put the data
-directory on ZFS or Btrfs and bind-mount it into the container. See
-[Volume compression](docs/volume-compression.md).
-
-For a free-tier or low-cost VM with a persistent volume, see
-[Free-tier and low-cost VM deployment](docs/free-tier-deployment.md). It includes
-the `NONODB_PROFILE=small` tuning, a DigitalOcean Spaces backup job, and the
-supported Cloud Run read-replica shape.
 
 ## GUI console
 
