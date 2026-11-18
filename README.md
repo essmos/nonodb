@@ -7,10 +7,10 @@
 [![CI](https://github.com/essmos/nonodb/actions/workflows/ci.yml/badge.svg)](https://github.com/essmos/nonodb/actions/workflows/ci.yml)
 [![Release](https://github.com/essmos/nonodb/actions/workflows/release.yml/badge.svg)](https://github.com/essmos/nonodb/actions/workflows/release.yml)
 
-**A low-resource, crash-safe JSON document database.**
+**The all-in-one JSON document database for small VMs and edge boxes.**
 
-**Idle daemon: ~5 MB RAM** with 1M documents and three indexes; data lives in
-LMDB and hot pages stay in the OS page cache.
+**Idle daemon: ~5 MB RAM** with 1M documents and three indexes; crash-safe
+LMDB storage and production features in one binary.
 
 One Rust daemon for small VMs and edge boxes: owns the LMDB files, speaks
 HTTP/JSON, exposes an optional MongoDB-compatible endpoint for official drivers,
