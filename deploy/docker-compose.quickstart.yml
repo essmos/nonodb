@@ -1,0 +1,75 @@
+# Minimal Docker Compose stack for NonoDB.
+#
+# First run:
+#   docker compose -f deploy/docker-compose.quickstart.yml \
+#     --profile init run --rm auth-init
+#   docker compose -f deploy/docker-compose.quickstart.yml up -d
+#
+# The first command creates admin/auth.json in the nonodb-auth volume and prints
+# the first admin bearer token. Copy that token and keep it secret.
+#
+# Optional GUI:
+#   docker compose -f deploy/docker-compose.quickstart.yml --profile gui up -d
+#
+# Data lives in the nonodb-data volume. The auth registry lives in the separate
+# nonodb-auth volume so it can be backed up or rotated independently.
+
+services:
+  auth-init:
+    image: ${NONODB_IMAGE:-ghcr.io/essmos/nonodb:0.26.0}
+    profiles: ["init"]
+    user: "0"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        nonodb-cli auth init
+        nonodb-cli auth token create admin
+        chown -R nonodb:nonodb /etc/nonodb
+    environment:
+      NONODB_AUTH_FILE: /etc/nonodb/auth.json
+    volumes:
+      - nonodb-auth:/etc/nonodb
+
+  nonodb:
+    image: ${NONODB_IMAGE:-ghcr.io/essmos/nonodb:0.26.0}
+    container_name: nonodb
+    restart: unless-stopped
+    environment:
+      NONODB_AUTH_FILE: /etc/nonodb/auth.json
+      NONODB_TCP: 0.0.0.0:7878
+      RUST_LOG: info
+    ports:
+      - "127.0.0.1:7878:7878"
+    volumes:
+      - nonodb-data:/var/lib/nonodb
+      - nonodb-auth:/etc/nonodb:ro
+
+  nonodb-gui:
+    image: ${NONODB_IMAGE:-ghcr.io/essmos/nonodb:0.26.0}
+    container_name: nonodb-gui
+    profiles: ["gui"]
+    restart: unless-stopped
+    command:
+      - nonodb-cli
+      - gui
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8787"
+      - --allow-remote
+      - --no-open
+    environment:
+      NONODB_SOCK: /run/nonodb/nonodb.sock
+      RUST_LOG: info
+    ports:
+      - "127.0.0.1:8787:8787"
+    depends_on:
+      - nonodb
+    volumes:
+      - nonodb-run:/run/nonodb
+
+volumes:
+  nonodb-data:
+  nonodb-auth:
+  nonodb-run:

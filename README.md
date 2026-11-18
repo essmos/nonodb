@@ -472,14 +472,19 @@ For container-to-container access over a Unix socket, mount a shared volume at
 be able to access the socket with a matching uid/gid. For host processes, TCP on
 `127.0.0.1` is usually simpler; add TLS if the listener is not loopback-only.
 
-Docker Compose example:
+Docker Compose quick start — auth is created in a volume, so no host CLI is
+needed:
 
 ```bash
-export NONODB_AUTH_FILE="$PWD/nonodb-auth.json"
-nonodb-cli auth init
-nonodb-cli auth token create admin
-docker compose -f deploy/docker-compose.yml up -d
+docker compose -f deploy/docker-compose.quickstart.yml \
+  --profile init run --rm auth-init
+docker compose -f deploy/docker-compose.quickstart.yml up -d
 ```
+
+Copy the admin token printed by `auth-init`. Full instructions, GUI, updates,
+backups, and troubleshooting: [Docker Compose](docs/docker-compose.md). The
+legacy [`deploy/docker-compose.yml`](deploy/docker-compose.yml) variant uses a
+host auth file and a Compose secret.
 
 Set `NONODB_IMAGE` to pin another image tag. To build the image from source
 instead, use `docker build -t nonodb:local .` and set
@@ -757,6 +762,7 @@ documentation.
 | [Replication and cluster guide](docs/replication-cluster-guide.md) | Primary/replica setup, TLS, CLI, GUI Cluster view, quorum failover, monitoring, troubleshooting |
 | [CLI](docs/cli.md) | `ping`, `gui`, `find`, `count`, `map`, `resize`, auth management, backup/verify/restore, `exec` |
 | [Operations](docs/operations.md) | Configuration, deployment, security, snapshots, monitoring, capacity, troubleshooting |
+| [Docker Compose quick start](docs/docker-compose.md) | Self-contained Compose stack, auth initialization, GUI, updates, backups, troubleshooting |
 | [Volume compression](docs/volume-compression.md) | ZFS/Btrfs setup, Docker bind mounts, verification, benchmarks, migration |
 | [Free-tier and low-cost VM deployment](docs/free-tier-deployment.md) | Oracle Cloud, GCP, AWS, DigitalOcean, small profile, Cloud Run read replicas, Spaces backups |
 | [Backup and restore](docs/backup.md) | Online backup, snapshots, verification, restore drills, retention, Docker, vault keys, authorization state |

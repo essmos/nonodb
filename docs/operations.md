@@ -482,6 +482,11 @@ nonodb-cli auth token create admin
 docker compose -f deploy/docker-compose.yml up -d
 ```
 
+For a self-contained stack that initializes auth in a Docker volume without a
+host `nonodb-cli`, use
+[`deploy/docker-compose.quickstart.yml`](../deploy/docker-compose.quickstart.yml)
+and the [Docker Compose quick start](docker-compose.md).
+
 Set `NONODB_IMAGE` to pin a different tag. For a locally built image, use
 `NONODB_IMAGE=nonodb:local docker compose -f deploy/docker-compose.yml up -d`.
 
