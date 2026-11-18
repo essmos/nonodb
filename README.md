@@ -37,20 +37,20 @@ document API.
 You get production features in one MIT-licensed binary, with no paid tiers or
 feature gates:
 
-- **Document versioning** — per-collection revision history with global revision IDs and configurable retention.
-- **Tenant encryption** — vault collections with whole-document encryption and per-tenant keys through the native client/HTTP path.
-- **Extremely low RAM usage** — about 5 MB idle with a 1M-document database and three indexes, plus `small` and `tiny` profiles for 512 MB–2 GB VMs.
-- **Automatic indexes** — opt-in creation of indexes for frequent query shapes, with cleanup of unused automatic indexes.
-- **Embedded GUI in the box** — a local browser console for documents, SQL, indexes, backups, credentials, cluster state, and metrics, with no separate frontend service.
-- **Search built in** — BM25 full-text search, fuzzy trigram/Levenshtein search, and exact vector search in the same database.
-- **TTL at both levels** — collection defaults and per-document overrides, with background expiry.
-- **Simple encrypted backups** — native or restic backups, gzip/age encryption, local/S3/R2 destinations, verification, and restore drills.
-- **Simple backup scheduling** — durable backup jobs configured through the CLI, API, or GUI.
-- **Simple credential management** — principals, database-qualified scopes, hashed tokens, client certificates, lockout, and reloads.
-- **Streams beyond the local socket** — watch/SSE/NDJSON streams over the TCP/TLS listener, so remote consumers can use them through a secured endpoint.
-- **Schedulers and background jobs** — durable jobs, workers, leases, retries, and scheduler-friendly CLI commands.
-- **Replication and failover** — asynchronous primary/replica/standby replication with durable ordered operations, snapshot bootstrap, lease-gated writes, quorum promotion, automatic election, partition rejoin, and a cluster-wide GUI.
-- **MongoDB-compatible access** — an optional wire endpoint for official PyMongo, Node.js, and Go drivers, without making MongoDB a deployment dependency.
+- **[Document versioning](docs/api.md#document-history)** — per-collection revision history with global revision IDs and configurable retention.
+- **[Tenant encryption](docs/vault.md)** — vault collections with whole-document encryption and per-tenant keys through the native client/HTTP path.
+- **[Extremely low RAM usage](docs/operations.md#capacity-and-memory)** — about 5 MB idle with a 1M-document database and three indexes, plus [small and tiny profiles](docs/operations.md#small-deployment-profiles) for 512 MB–2 GB VMs.
+- **[Automatic indexes](docs/operations.md#automatic-indexes)** — opt-in creation of indexes for frequent query shapes, with cleanup of unused automatic indexes.
+- **[Embedded GUI in the box](docs/gui.md)** — a local browser console for documents, SQL, indexes, backups, credentials, cluster state, and metrics, with no separate frontend service.
+- **Search built in** — [BM25 full-text search](docs/api.md#full-text-indexes), [fuzzy trigram/Levenshtein search](docs/api.md#fuzzy-indexes), and [exact vector search](docs/api.md#vector-indexes) in the same database.
+- **[TTL at both levels](docs/ttl.md)** — collection defaults and per-document overrides, with background expiry.
+- **[Simple encrypted backups](docs/backup.md#encryption)** — [native or restic backups](docs/backup.md#restic-engine), gzip/age encryption, local/S3/R2 destinations, verification, and restore drills.
+- **[Simple backup scheduling](docs/backup.md#scheduled-backups-from-the-daemon-and-gui)** — durable backup jobs configured through the CLI, API, or GUI.
+- **[Simple credential management](docs/auth.md)** — principals, database-qualified scopes, hashed tokens, client certificates, lockout, and reloads.
+- **[Streams beyond the local socket](docs/streams.md#continuous-stream)** — watch/SSE/NDJSON streams over the TCP/TLS listener, so remote consumers can use them through a secured endpoint.
+- **[Schedulers and background jobs](docs/workers.md#scheduling)** — durable jobs, workers, leases, retries, and scheduler-friendly CLI commands.
+- **[Replication and failover](docs/replication-cluster-guide.md)** — asynchronous primary/replica/standby replication with durable ordered operations, snapshot bootstrap, lease-gated writes, quorum promotion, automatic election, partition rejoin, and a cluster-wide [GUI](docs/gui.md#cluster-view).
+- **[MongoDB-compatible access](docs/mongodb-compatibility.md)** — an optional wire endpoint for official PyMongo, Node.js, and Go drivers, without making MongoDB a deployment dependency.
 
 ## Design principles
 
