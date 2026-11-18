@@ -7,22 +7,14 @@
 [![CI](https://github.com/essmos/nonodb/actions/workflows/ci.yml/badge.svg)](https://github.com/essmos/nonodb/actions/workflows/ci.yml)
 [![Release](https://github.com/essmos/nonodb/actions/workflows/release.yml/badge.svg)](https://github.com/essmos/nonodb/actions/workflows/release.yml)
 
-**A low-resource, crash-safe JSON document database — with a surprisingly
-large feature set under the hood.**
+**A low-resource, crash-safe JSON document database.**
 
-**Idle daemon memory: about 5 MB RAM.** That is measured with a 1M-document
-database and three indexes after a restart. The on-disk LMDB file grows with
-the data and indexes; the ~5 MB figure is process memory, not the database
-files. Hot data stays in the OS page cache instead of the daemon heap.
+**Idle daemon: ~5 MB RAM** with 1M documents and three indexes; data lives in
+LMDB and hot pages stay in the OS page cache.
 
-NoNoDB is a local NoSQL document store written in Rust. It needs no external
-database server and runs comfortably on small VMs, edge boxes, and developer
-machines. It speaks a practical subset of MongoDB's query language over
-HTTP/JSON, exposes a documented MongoDB-compatible wire endpoint for official
-drivers, stores documents in LMDB, and runs as a single daemon that is the only
-process allowed to touch the database files. Application workers connect to it
-through a Unix socket and use a thin client. One daemon can host several
-independent databases.
+One Rust daemon for small VMs and edge boxes: owns the LMDB files, speaks
+HTTP/JSON, exposes an optional MongoDB-compatible endpoint for official drivers,
+and hosts multiple databases.
 
 <p align="center">
   <a href="docs/gui.md">
@@ -33,82 +25,34 @@ independent databases.
 <p align="center"><em>The embedded GUI browsing a 1,000,000-document database.
 <a href="docs/gui.md">See the GUI guide</a>.</em></p>
 
-Low resource use is the starting point, not the whole story. Under the hood,
-nonodb is a real document database with:
-
-- JSON documents, MongoDB-style filters, projections, sorting and updates;
-- an optional MongoDB-compatible wire endpoint for PyMongo, Node.js, and Go
-  drivers: CRUD, cursors, basic aggregation, index and collection DDL,
-  MongoDB-style text indexes and `$text`, BSON types, SCRAM authentication, and
-  TLS;
-- BSON-compatible dates with RFC 3339 input, timezone normalization and indexed ranges;
-- exact numeric comparison, BSON Decimal128, binary/UUID and ObjectId values with indexed ranges;
-- single-field, compound, unique and covering secondary indexes;
-- atomic `write_batch` for all-or-nothing groups of writes;
-- full-text search with **BM25** ranking, Unicode tokenization, diacritic
-  folding and quoted phrases;
-- fuzzy search using trigrams plus Levenshtein distance;
-- exact vector search with cosine, dot, and L2 metrics, stored and queried
-  inside the same LMDB file;
-- an aggregation pipeline for reporting and summaries, with transactional
-  `$out`/`$merge` write stages;
-- asynchronous primary/replica replication with durable ordered operations, snapshot bootstrap, replicated indexes/history/TTL/events/subscriptions and encrypted vault envelopes, a replicated cluster control plane (auth, backup jobs, database catalog), 8-character one-time pairing, lease-gated writes, quorum promotion, automatic election, partition rejoin, write routing and a cluster-wide GUI;
-- snapshots, scheduled native or restic backups with GUI, gzip/age encryption, backup-info files, local/S3/R2 export, staged import as new databases, online LMDB map growth, authentication, TLS/mTLS, metrics and a CLI;
-- graceful shutdown with in-flight request draining and optional JSON logs;
-- `NONODB_PROFILE=small|tiny` presets for 512 MB–2 GB VMs, with every value still overridable;
-- per-collection document revision history with global revision IDs and configurable retention (`0` disables);
-- document TTL with collection defaults, per-document overrides, and background expiry;
-- optional vault collections with whole-document encryption and per-tenant keys;
-- a bounded daemon read cache, invalidated after every committed write;
-- optional automatic indexes for frequent query shapes, with TTL cleanup;
-- single-field GeoJSON point indexes for `$near` and `$geoWithin`.
-
-**Forget about creating indexes — NoNoDB will do it for you if it decides it is
-necessary.** Automatic indexing is opt-in (`NONODB_AUTO_INDEX=1`), conservative,
-and removes unused automatic indexes after a configurable TTL.
-
-These are capabilities often split across several services or reserved for
-larger databases and paid enterprise editions. nonodb puts them in one small,
-MIT-licensed binary: no paid tier, no license keys, no feature gates.
-
-If you need a shared, queryable JSON store without operating PostgreSQL,
-MongoDB, or Redis, nonodb is aimed at you.
-
-```text
-┌──────────────────┐
-│ uvicorn worker 1 │──┐
-│ uvicorn worker 2 │──┤   HTTP/JSON over Unix socket   ┌───────────────┐
-│ ...              │──┼───────────────────────────────▶│ nonodb-daemon │
-│ uvicorn worker N │──┘                                │ 1 writer / DB │
-└──────────────────┘                                   │ N LMDB envs   │
-                                                       └───────┬───────┘
-                                                               │
-                                                   ./data/<database>/ (LMDB)
-```
-
 ## Why nonodb exists
 
-Web applications accumulate small pieces of shared state: feature flags,
-tenant settings, notification templates, routing rules, counters, cached
-metadata, user preferences, and other JSON-shaped records. At first these live
-in YAML files or environment variables. Sooner or later several processes need
-to read and update them concurrently, query them by more than one field, and
-survive a crash.
+Small applications accumulate shared JSON state, but a full database server is
+often too much and files on disk are hard to keep consistent. NonoDB is the
+middle ground: one small daemon that owns the data files and exposes a familiar
+document API.
 
-The usual answers are heavier than the problem:
+### The biggest advantage
 
-- **PostgreSQL / MySQL** require a server, a schema, migrations, connection
-  pooling, and operational work for what is often a handful of collections.
-- **MongoDB** is a full distributed database with its own deployment and
-  security surface.
-- **Redis** is excellent for keys and counters, but it is not a document store
-  with secondary indexes, rich filters, or durable snapshots by default.
-- **Files on disk** are easy to start with and painful to keep consistent:
-  partial writes, no concurrent update semantics, no indexes, no atomic batch.
-- **An embedded database inside every worker** looks attractive, but LMDB and
-  many embedded engines are sensitive to `fork()`, multiple owners, and stale
-  readers. With preforking servers such as Gunicorn or uvicorn, every worker
-  would otherwise open the same environment independently.
+You get production features in one MIT-licensed binary, with no paid tiers or
+feature gates:
+
+- **Document versioning** — per-collection revision history with global revision IDs and configurable retention.
+- **Tenant encryption** — vault collections with whole-document encryption and per-tenant keys through the native client/HTTP path.
+- **Extremely low RAM usage** — about 5 MB idle with a 1M-document database and three indexes, plus `small` and `tiny` profiles for 512 MB–2 GB VMs.
+- **Automatic indexes** — opt-in creation of indexes for frequent query shapes, with cleanup of unused automatic indexes.
+- **Embedded GUI in the box** — a local browser console for documents, SQL, indexes, backups, credentials, cluster state, and metrics, with no separate frontend service.
+- **Search built in** — BM25 full-text search, fuzzy trigram/Levenshtein search, and exact vector search in the same database.
+- **TTL at both levels** — collection defaults and per-document overrides, with background expiry.
+- **Simple encrypted backups** — native or restic backups, gzip/age encryption, local/S3/R2 destinations, verification, and restore drills.
+- **Simple backup scheduling** — durable backup jobs configured through the CLI, API, or GUI.
+- **Simple credential management** — principals, database-qualified scopes, hashed tokens, client certificates, lockout, and reloads.
+- **Streams beyond the local socket** — watch/SSE/NDJSON streams over the TCP/TLS listener, so remote consumers can use them through a secured endpoint.
+- **Schedulers and background jobs** — durable jobs, workers, leases, retries, and scheduler-friendly CLI commands.
+- **Replication and failover** — asynchronous primary/replica/standby replication with durable ordered operations, snapshot bootstrap, lease-gated writes, quorum promotion, automatic election, partition rejoin, and a cluster-wide GUI.
+- **MongoDB-compatible access** — an optional wire endpoint for official PyMongo, Node.js, and Go drivers, without making MongoDB a deployment dependency.
+
+## Design principles
 
 nonodb takes the SQLite philosophy — embedded, zero-administration, one local
 data directory — and applies it to JSON documents. It separates the database
@@ -129,30 +73,6 @@ engine from its clients:
 
 The result is a small service that feels like an embedded database to the
 application, but behaves like a shared database to a preforking web server.
-
-## What nonodb is not
-
-nonodb is deliberately not a general-purpose distributed database. It does not
-provide:
-
-- sharding, or a multi-writer cluster with more than one primary. A
-  primary/replica/standby cluster with quorum failover is supported; see the
-  [replication and cluster guide](docs/replication-cluster-guide.md);
-- general interactive multi-document transactions;
-- full MongoDB feature parity or a drop-in MongoDB server. It provides a
-  documented MongoDB-compatible subset through an optional wire listener:
-  CRUD, cursors, basic aggregation, index and collection DDL, ObjectId and BSON
-  values, SCRAM authentication, and TLS, but not sessions, multi-document
-  transactions, or change streams;
-- a role hierarchy or inherited groups; authorization uses principals and
-  database-qualified scopes;
-- the full MongoDB query and update language; it implements a practical subset.
-  See [MongoDB compatibility](docs/mongodb-compatibility.md) for the feature
-  map and known differences.
-
-For a single host, a small-to-medium data set, and a workload dominated by
-indexed reads and modest writes, those trade-offs buy a very small operational
-footprint.
 
 ## Multiple databases
 
