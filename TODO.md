@@ -397,14 +397,17 @@ Design: [docs/replication.md](docs/replication.md).
 
 ### P2 — indexes, search, and storage
 
-- [ ] **Optimize BM25 and Mongo `$text` ranking for large term postings.**
-      Measured on 10M documents with a 1M-document text index: a frequent-term
-      BM25 query took p50 9.21s / p95 10.28s, while fuzzy distance=2 took
-      p50 240ms. This is a performance issue, not a functional failure.
-      Profile scoring over large postings and document/JSON parsing, then
-      target sub-second p50 for common terms on 1M text documents. Re-run
-      `scripts/large_test.py --docs 10000000 --text-docs 1000000 --text`
-      and the Mongo `$text` conformance/driver tests after the change.
+- [x] **Optimize BM25 and Mongo `$text` ranking for large term postings.**
+      A fresh 1M-text-document run with a frequent term (about 37% document
+      frequency) measures p50 255 ms / p95 376 ms. Text postings store
+      document length, plain queries skip
+      per-candidate JSON parsing and tokenization, and ranking uses a bounded
+      top-K heap instead of sorting every match. `scripts/search_test.py`,
+      `scripts/search_variants_test.py`, core tests, and clippy pass.
+- [ ] Re-run the 10M-document text benchmark and evaluate block-max WAND for
+      posting lists that are much larger than the current 1M-document case.
+      Use `scripts/large_test.py --docs 10000000 --text-docs 1000000 --text`
+      and the Mongo `$text` conformance/driver tests.
 - [ ] Sparse/partial indexes
 - [ ] Wildcard indexes
 - [x] One-click reindex for secondary, text, fuzzy, and vector indexes

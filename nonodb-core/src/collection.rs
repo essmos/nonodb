@@ -38,6 +38,39 @@ const DB_SLOT_META_PREFIX: &str = "\u{1}dbslot:";
 /// Reserve some LMDB sub-database slots for collections and fixed databases.
 const MAX_DB_SLOTS: u32 = crate::store::MAX_DBS - 64;
 
+/// One scored document id for the bounded top-K heap used by text search.
+#[derive(Debug)]
+struct RankedId {
+    id: String,
+    score: f64,
+}
+
+impl PartialEq for RankedId {
+    fn eq(&self, other: &Self) -> bool {
+        self.score == other.score && self.id == other.id
+    }
+}
+
+impl Eq for RankedId {}
+
+impl PartialOrd for RankedId {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RankedId {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // The heap root is the worst retained hit: lower score first, then the
+        // lexicographically larger id (ascending id breaks score ties).
+        other
+            .score
+            .partial_cmp(&self.score)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| self.id.cmp(&other.id))
+    }
+}
+
 /// Maximum number of keys accepted by one `lookup` request.
 pub const MAX_LOOKUP_VALUES: usize = 10_000;
 
@@ -2228,7 +2261,7 @@ impl<'e> Collection<'e> {
                         postings.put(
                             &mut *wtxn,
                             search::postings_key(&term, &id).as_slice(),
-                            &freq.to_le_bytes(),
+                            &search::text_posting_value(freq, dl),
                         )?;
                     }
                 }
@@ -2424,14 +2457,15 @@ impl<'e> Collection<'e> {
                     }
                 }
                 if let Some(tokens) = &new_tokens {
+                    let dl = new_len as u32;
                     for (term, tf) in search::term_freqs(tokens) {
                         postings.put(
                             &mut *wtxn,
                             search::postings_key(&term, id).as_slice(),
-                            &tf.to_le_bytes(),
+                            &search::text_posting_value(tf, dl),
                         )?;
                     }
-                    lens.put(&mut *wtxn, id.as_bytes(), &(new_len as u32).to_le_bytes())?;
+                    lens.put(&mut *wtxn, id.as_bytes(), &dl.to_le_bytes())?;
                 } else {
                     lens.delete(&mut *wtxn, id.as_bytes())?;
                 }
@@ -2566,8 +2600,11 @@ impl<'e> Collection<'e> {
             return Ok(Vec::new());
         }
 
+        let empty_filter = filter.as_object().is_none_or(|object| object.is_empty());
+        let needs_phrases = !parsed.phrases.is_empty() || !parsed.negative_phrases.is_empty();
+        let simple_query = !needs_phrases && empty_filter;
+
         let mut scores: HashMap<String, f64> = HashMap::new();
-        let mut matched_terms: HashSet<String> = HashSet::new();
         let mut phrase_candidates: HashSet<String> = HashSet::new();
         let mut negative_ids: HashSet<String> = HashSet::new();
 
@@ -2593,14 +2630,15 @@ impl<'e> Collection<'e> {
             let avgdl = total / n_docs;
             let weight = field.weight;
 
-            let term_hits = |term: &str| -> Result<Vec<(String, f64)>> {
+            let term_hits = |term: &str| -> Result<Vec<(String, f64, Option<f64>)>> {
                 let prefix = search::posting_prefix(term);
                 let mut hits = Vec::new();
                 for item in postings.prefix_iter(rtxn, prefix.as_slice())? {
-                    let (key, tf) = item?;
+                    let (key, value) = item?;
                     if let Some(id) = search::parse_posting(key) {
-                        let tf = search::read_u32(tf).unwrap_or(1) as f64;
-                        hits.push((id.to_string(), tf));
+                        let tf = search::text_posting_tf(value).unwrap_or(1) as f64;
+                        let dl = search::text_posting_dl(value).map(|dl| dl as f64);
+                        hits.push((id.to_string(), tf, dl));
                     }
                 }
                 Ok(hits)
@@ -2609,18 +2647,20 @@ impl<'e> Collection<'e> {
             for term in &parsed.positive_terms {
                 let hits = term_hits(term)?;
                 let idf = search::idf(n_docs, hits.len() as f64);
-                for (id, tf) in hits {
-                    let dl = lens
-                        .get(rtxn, id.as_bytes())?
-                        .and_then(search::read_u32)
-                        .unwrap_or(0) as f64;
-                    *scores.entry(id.clone()).or_insert(0.0) +=
+                for (id, tf, posting_dl) in hits {
+                    let dl = match posting_dl {
+                        Some(dl) => dl,
+                        None => lens
+                            .get(rtxn, id.as_bytes())?
+                            .and_then(search::read_u32)
+                            .unwrap_or(0) as f64,
+                    };
+                    *scores.entry(id).or_insert(0.0) +=
                         weight * search::bm25_term(tf, dl, avgdl, idf);
-                    matched_terms.insert(id);
                 }
             }
             for term in &parsed.negative_terms {
-                for (id, _) in term_hits(term)? {
+                for (id, _, _) in term_hits(term)? {
                     negative_ids.insert(id);
                 }
             }
@@ -2628,10 +2668,46 @@ impl<'e> Collection<'e> {
                 let Some(first) = phrase.first() else {
                     continue;
                 };
-                for (id, _) in term_hits(first)? {
+                for (id, _, _) in term_hits(first)? {
                     phrase_candidates.insert(id);
                 }
             }
+        }
+
+        // Common case: a plain lexical query with no phrases and no residual
+        // filter. Rank only the posting scores, then load documents for the
+        // requested page. Parsing and tokenizing every candidate here is the
+        // difference between a few seconds and a few milliseconds on a large
+        // posting list.
+        if simple_query && phrase_candidates.is_empty() {
+            let max = match mode {
+                TextQueryMode::Native => limit.unwrap_or(10).min(1000),
+                TextQueryMode::Mongo => limit.unwrap_or(usize::MAX),
+            };
+            let want = skip.saturating_add(max);
+            let mut top = BinaryHeap::with_capacity(want.min(scores.len()).saturating_add(1));
+            for (id, score) in scores {
+                if negative_ids.contains(&id) {
+                    continue;
+                }
+                top.push(RankedId { id, score });
+                if top.len() > want {
+                    top.pop();
+                }
+            }
+
+            let mut out = Vec::new();
+            for hit in top.into_sorted_vec().into_iter().skip(skip).take(max) {
+                let Some(bytes) = self.db.get(rtxn, hit.id.as_bytes())? else {
+                    continue;
+                };
+                let mut doc: Value = parse_json(bytes)?;
+                if let Some(obj) = doc.as_object_mut() {
+                    obj.insert("_score".to_string(), serde_json::json!(hit.score));
+                }
+                out.push(doc);
+            }
+            return Ok(out);
         }
 
         let mut candidates: HashSet<String> = scores.keys().cloned().collect();
@@ -2645,17 +2721,21 @@ impl<'e> Collection<'e> {
                 continue;
             };
             let doc: Value = parse_json(bytes)?;
-            let field_texts: Vec<String> = def
-                .fields
-                .iter()
-                .filter_map(|field| {
-                    index::field_value(&doc, &field.path).and_then(search::field_text)
-                })
-                .collect();
-            let tokenized: Vec<Vec<String>> = field_texts
-                .iter()
-                .map(|text| search::tokenize(text))
-                .collect();
+            let tokenized: Vec<Vec<String>> = if needs_phrases {
+                let field_texts: Vec<String> = def
+                    .fields
+                    .iter()
+                    .filter_map(|field| {
+                        index::field_value(&doc, &field.path).and_then(search::field_text)
+                    })
+                    .collect();
+                field_texts
+                    .iter()
+                    .map(|text| search::tokenize(text))
+                    .collect()
+            } else {
+                Vec::new()
+            };
             if parsed.negative_phrases.iter().any(|phrase| {
                 tokenized
                     .iter()
@@ -2672,7 +2752,7 @@ impl<'e> Collection<'e> {
                         .any(|tokens| search::contains_phrase(tokens, phrase))
                 })
                 .count();
-            let term_match = matched_terms.contains(&id);
+            let term_match = scores.contains_key(&id);
             let positive = match mode {
                 TextQueryMode::Native => {
                     (parsed.positive_terms.is_empty() || term_match)
@@ -6557,11 +6637,19 @@ impl<'e> Collection<'e> {
                             self.name
                         ))
                     })?;
-                    if actual != tf.to_le_bytes().as_slice() {
+                    if search::text_posting_tf(actual) != Some(tf) {
                         return Err(Error::Query(format!(
                             "text index `{field}` on `{}` has a stale term `{term}` for `{id}`",
                             self.name
                         )));
+                    }
+                    if let Some(stored_dl) = search::text_posting_dl(actual) {
+                        if stored_dl != tokens.len() as u32 {
+                            return Err(Error::Query(format!(
+                                "text index `{field}` on `{}` has a stale length in term `{term}` for `{id}`",
+                                self.name
+                            )));
+                        }
                     }
                     expected_postings[i] += 1;
                 }

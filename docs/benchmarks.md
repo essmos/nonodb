@@ -243,23 +243,23 @@ client, end-to-end through the daemon:
 | BM25 search, limit 10 | p50 **62 ms** |
 | Fuzzy search, max distance 2 | p50 **40 ms** |
 
-### 1,000,000 text documents (in an 8M database)
+### 1,000,000 text documents
 
 | Operation | Result |
 |---|---|
-| Load 1M text documents | 14.9 s |
-| `create_text_index` backfill | 12.5 s |
+| Load 1M text documents | 14.6 s |
+| `create_text_index` backfill | 11.5 s |
 | `create_fuzzy_index` backfill | 28.2 s |
-| BM25 search, limit 10 | p50 **971 ms**, p95 1,025 ms |
+| BM25 search, limit 10 | p50 **255 ms**, p95 **376 ms** |
 | Fuzzy search, max distance 2 | p50 **168 ms**, p95 237 ms |
 
-These figures are workload-specific and depend heavily on term selectivity.
-In a 10M-document run with 1M text documents and a frequent term, BM25 measured
-p50 **9.21 s** / p95 **10.28 s**, while fuzzy distance=2 measured p50 **240 ms**.
-BM25 at this scale still walks large posting lists and ranks every matching
-document; the text index avoids scanning unrelated documents but does not make
-large OR queries free. Fuzzy search is cheaper because trigram candidate
-selection limits the number of documents scored.
+The BM25 row uses a 1M-text-document regression database with 12-token bodies
+and a frequent term at about 37% document frequency. Release daemon, ext4,
+`NONODB_CACHE_TTL=0`, `NONODB_MAP_SIZE=8GiB`. Plain lexical queries rank posting
+scores and load only the requested page of documents; text postings also carry
+document length so scoring avoids a second lookup per hit. For much larger
+posting lists, block-max WAND is the next algorithmic step because a
+single-term query still walks every matching posting.
 
 ### 1,000,000 vectors (128 dimensions, exact cosine)
 
@@ -1023,10 +1023,11 @@ also verifies that `full` and explicitly `sync`ed writes survive `SIGKILL`, that
   writes/s with real disk commits on this host.
 - **Full scans are linear.** Sorting 8M documents without an index is seconds,
   not milliseconds. Use an index or a covered query.
-- **Search has its own scaling curve.** BM25 over 1M text documents ranges from
-  hundreds of milliseconds to several seconds depending on term selectivity;
-  the inverted index avoids scanning every document's text but does not make
-  large term lists free.
+- **Search has its own scaling curve.** BM25 over 1M text documents is now
+  around 255 ms p50 for frequent terms in the dedicated regression run. Much
+  larger posting lists still scale with the number of matching postings; the
+  inverted index avoids scanning every document's text but does not make large
+  term lists free.
 - **RSS is usually small.** Large RSS values after scans are mostly mapped page
   cache, not leaked allocations.
 - **Map size is not memory.** A 1 GiB `map_size` does not mean 1 GiB of RAM.

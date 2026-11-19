@@ -2,7 +2,7 @@
 //!
 //! Search indexes are collection-level definitions with one or more fields.
 //! Data layout (LMDB sub-databases):
-//! - `ft:<coll>:<index>:<field>`  - postings: `term \0 _id` -> `tf` (u32 LE),
+//! - `ft:<coll>:<index>:<field>`  - postings: `term \0 _id` -> `tf` (u32 LE) + optional `dl` (u32 LE),
 //! - `ftl:<coll>:<index>:<field>` - document lengths: `_id` -> `dl` (u32 LE),
 //! - `fz:<coll>:<index>:<field>`  - trigrams: `trigram \0 _id` -> empty.
 //!
@@ -401,6 +401,25 @@ pub fn parse_posting(key: &[u8]) -> Option<&str> {
 
 pub fn read_u32(b: &[u8]) -> Option<u32> {
     b.try_into().ok().map(u32::from_le_bytes)
+}
+
+/// Text posting value. New indexes store term frequency and document length
+/// together so scoring does not need a second random lookup for every hit.
+pub fn text_posting_value(tf: u32, dl: u32) -> [u8; 8] {
+    let mut out = [0u8; 8];
+    out[..4].copy_from_slice(&tf.to_le_bytes());
+    out[4..].copy_from_slice(&dl.to_le_bytes());
+    out
+}
+
+/// Term frequency stored in a text posting, old or new format.
+pub fn text_posting_tf(value: &[u8]) -> Option<u32> {
+    value.get(..4).and_then(read_u32)
+}
+
+/// Document length stored in a text posting, if this is a new-format value.
+pub fn text_posting_dl(value: &[u8]) -> Option<u32> {
+    value.get(4..8).and_then(read_u32)
 }
 
 pub fn read_u64(b: &[u8]) -> Option<u64> {
