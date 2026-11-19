@@ -21,3 +21,6 @@ node_modules/
 
 # Local free-tier deployment secrets and backup config
 /config/
+
+# dev.to article drafts (local only)
+/articles/

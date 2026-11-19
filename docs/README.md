@@ -7,6 +7,7 @@ quick-start instructions, and a feature overview.
 
 | Guide | Audience | Contents |
 |---|---|---|
+| [Getting started](getting-started.md) | New users | Docker Compose, prebuilt binary, build from source, first document, configuration basics |
 | [Architecture](architecture.md) | Maintainers, advanced users | Process model, LMDB layout, write path, indexes, search, aggregation, crash safety |
 | [Multiple databases](multi-database.md) | Operators, application developers | Separate LMDB environments, URL routing, create/drop, CLI, GUI, migration, backup |
 | [Adaptive writer](adaptive-writer.md) | Operators, performance reviewers | Adaptive group-commit window, latency/throughput tuning, metrics and limits |
@@ -45,6 +46,7 @@ quick-start instructions, and a feature overview.
 
 ## Common tasks
 
+- **Start here:** [Getting started](getting-started.md)
 - **Download prebuilt binaries:** [README — Prebuilt binaries](../README.md#prebuilt-binaries)
 - **Run on Linux, macOS or Windows:** [README — Quick start](../README.md#quick-start)
 - **Run with Docker:** [README — Run with Docker](../README.md#run-with-docker)
