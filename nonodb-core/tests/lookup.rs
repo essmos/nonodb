@@ -248,13 +248,32 @@ fn lookup_rejects_oversized_result_payload() {
     for index in 0..65 {
         c.insert_one_txn(
             &mut wtxn,
-            json!({"_id": format!("big{index}"), "blob": blob}),
+            json!({
+                "_id": format!("big{index}"),
+                "key": format!("key{index}"),
+                "blob": blob,
+            }),
         )
         .unwrap();
     }
     wtxn.commit().unwrap();
     let c = store.collection("big").unwrap();
+    c.create_index("key", true).unwrap();
     let ids: Vec<_> = (0..65).map(|index| json!(format!("big{index}"))).collect();
     let err = c.lookup("_id", &ids, None).unwrap_err().to_string();
     assert!(err.contains("result too large"), "{err}");
+
+    // An `_id`-only projection returns metadata, not the large documents.
+    let id_only = c.lookup("_id", &ids, Some(&json!({"_id": 1}))).unwrap();
+    assert_eq!(id_only.len(), 65);
+    assert_eq!(id_only[0], Some(json!({"_id": "big0"})));
+    assert_eq!(id_only[0].as_ref().unwrap().as_object().unwrap().len(), 1);
+
+    let keys: Vec<_> = (0..65).map(|index| json!(format!("key{index}"))).collect();
+    let err = c.lookup("key", &keys, None).unwrap_err().to_string();
+    assert!(err.contains("result too large"), "{err}");
+    let key_only = c.lookup("key", &keys, Some(&json!({"_id": 1}))).unwrap();
+    assert_eq!(key_only.len(), 65);
+    assert_eq!(key_only[0], Some(json!({"_id": "big0"})));
+    assert_eq!(key_only[0].as_ref().unwrap().as_object().unwrap().len(), 1);
 }

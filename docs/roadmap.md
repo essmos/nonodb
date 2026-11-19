@@ -39,8 +39,8 @@ Implemented:
 - exact brute-force vector search with cosine, dot, and L2 metrics;
 - read batches and atomic write batches;
 - ordered point lookups by `_id` or a unique single-field or compound index,
-  with covering projections, `_id` exclusion, key deduplication, and a response
-  size cap;
+  with covering projections, index-only `_id` projections, `_id` exclusion, key
+  deduplication, and a response size cap;
 - durable background jobs through an ordinary `_jobs` collection and external
   workers, with leases, retries, and idempotent enqueue;
 - outbox events through an ordinary `_events` collection, with atomic data +

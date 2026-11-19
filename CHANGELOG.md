@@ -15,6 +15,9 @@ Full release notes: https://github.com/essmos/nonodb/releases
 
 ### Changed
 
+- `lookup` now serves `_id`-only projections directly from the unique index;
+  `fields=["_id"]` and `projection={"_id": 1}` no longer read or parse the
+  stored document.
 - Added a raw JSON fast path for plain `find` requests: documents without a
   projection, sort, or index hint are returned from stored bytes without a
   `Value` parse/reserialize round-trip. Filtered full scans reuse the original

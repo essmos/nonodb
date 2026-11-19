@@ -6117,8 +6117,9 @@ impl<'e> Collection<'e> {
     /// Point lookup by `_id` or a unique single-field index.
     ///
     /// Results are returned in input order. A missing key produces `None`.
-    /// `projection` uses the normal include/exclude rules. With a covering
-    /// index, requested fields can be served without reading the document.
+    /// `projection` uses the normal include/exclude rules. An `_id`-only
+    /// projection is served from index metadata, and other covering projections
+    /// can be served without reading the document.
     pub fn lookup(
         &self,
         by: &str,
@@ -6191,19 +6192,24 @@ impl<'e> Collection<'e> {
         let mut unique_out = Vec::with_capacity(unique_values.len());
         let mut unique_sizes = Vec::with_capacity(unique_values.len());
         let mut unique_bytes = 0usize;
+        let id_only = projection_is_id_only(projection);
 
         if by.len() == 1 && by[0] == "_id" {
             for &value in &unique_values {
                 let (doc, size) = match value.as_str() {
                     Some(id) => match self.db.get(rtxn, id.as_bytes())? {
                         Some(bytes) => {
-                            let size = bytes.len();
-                            match projection {
-                                Some(projection) => {
-                                    let doc: Value = parse_json(bytes)?;
-                                    (Some(project(&doc, projection, None)), size)
+                            if id_only {
+                                (Some(serde_json::json!({"_id": id})), id.len())
+                            } else {
+                                let size = bytes.len();
+                                match projection {
+                                    Some(projection) => {
+                                        let doc: Value = parse_json(bytes)?;
+                                        (Some(project(&doc, projection, None)), size)
+                                    }
+                                    None => (Some(parse_json(bytes)?), size),
                                 }
-                                None => (Some(parse_json(bytes)?), size),
                             }
                         }
                         None => (None, 4),
@@ -6294,7 +6300,9 @@ impl<'e> Collection<'e> {
                     filter.insert(field.clone(), part.clone());
                 }
                 let filter = Value::Object(filter);
-                let (doc, size) = if let Some(doc) =
+                let (doc, size) = if id_only {
+                    (serde_json::json!({"_id": id}), raw_size)
+                } else if let Some(doc) =
                     covering_doc(&id, inc.as_ref(), &filter, &covering_projection)
                 {
                     (
@@ -7417,6 +7425,14 @@ fn compare_values(a: Option<&Value>, b: Option<&Value>, descending: bool) -> Ord
         (Some(_), None) => Ordering::Less,
         (Some(a), Some(b)) => compare_scalar_values(a, b),
     }
+}
+
+fn projection_is_id_only(projection: Option<&Value>) -> bool {
+    projection
+        .and_then(Value::as_object)
+        .is_some_and(|projection| {
+            projection.len() == 1 && projection.get("_id").is_some_and(truthy)
+        })
 }
 
 #[derive(Hash, PartialEq, Eq)]

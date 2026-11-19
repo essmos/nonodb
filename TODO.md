@@ -56,9 +56,6 @@ deliberate limitations are documented in [docs/roadmap.md](docs/roadmap.md).
 
 ## P1 — lookup enhancements
 
-- [ ] Serve `_id`-only projections (`fields=["_id"]` or
-      `projection={"_id": 1}`) directly from the unique index without reading
-      the document.
 - [ ] When several unique indexes match `by`, prefer the one whose `include`
       fields cover the requested projection; otherwise choose the smallest
       suitable index.
