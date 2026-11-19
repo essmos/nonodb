@@ -2604,6 +2604,154 @@ impl<'e> Collection<'e> {
         let needs_phrases = !parsed.phrases.is_empty() || !parsed.negative_phrases.is_empty();
         let simple_query = !needs_phrases && empty_filter;
 
+        // Single-field lexical queries do not need the shared score map. For one
+        // term, stream postings straight into a bounded heap. For several terms,
+        // merge the already id-sorted posting lists and score each document once.
+        // This keeps large OR queries from allocating a map entry per hit.
+        if simple_query && parsed.negative_terms.is_empty() && def.fields.len() == 1 {
+            let field = &def.fields[0];
+            let Some(postings) = self.text_postings(rtxn, &def.name, &field.path)? else {
+                return Ok(Vec::new());
+            };
+            let Some(lens) = self.text_len_db(rtxn, &def.name, &field.path)? else {
+                return Ok(Vec::new());
+            };
+            let n_docs = lens.stat(rtxn)?.entries as f64;
+            if n_docs == 0.0 {
+                return Ok(Vec::new());
+            }
+            let total = self
+                .meta
+                .get(
+                    rtxn,
+                    search::text_total_key(&self.name, &def.name, &field.path).as_bytes(),
+                )?
+                .and_then(search::read_u64)
+                .unwrap_or(0) as f64;
+            let avgdl = total / n_docs;
+            let weight = field.weight;
+            let max = match mode {
+                TextQueryMode::Native => limit.unwrap_or(10).min(1000),
+                TextQueryMode::Mongo => limit.unwrap_or(usize::MAX),
+            };
+            if max == 0 {
+                return Ok(Vec::new());
+            }
+            let want = skip.saturating_add(max);
+            let emit_top = |top: BinaryHeap<RankedId>, scale: f64| -> Result<Vec<Value>> {
+                let mut out = Vec::new();
+                for hit in top.into_sorted_vec().into_iter().skip(skip).take(max) {
+                    let Some(bytes) = self.db.get(rtxn, hit.id.as_bytes())? else {
+                        continue;
+                    };
+                    let mut doc: Value = parse_json(bytes)?;
+                    if let Some(obj) = doc.as_object_mut() {
+                        obj.insert("_score".to_string(), serde_json::json!(hit.score * scale));
+                    }
+                    out.push(doc);
+                }
+                Ok(out)
+            };
+
+            if parsed.positive_terms.len() == 1 {
+                let term = &parsed.positive_terms[0];
+                let prefix = search::posting_prefix(term);
+                let mut top = BinaryHeap::with_capacity(want.min(1024).saturating_add(1));
+                let mut df = 0u64;
+                for item in postings.prefix_iter(rtxn, prefix.as_slice())? {
+                    let (key, value) = item?;
+                    let Some(id) = search::parse_posting(key) else {
+                        continue;
+                    };
+                    df += 1;
+                    let tf = search::text_posting_tf(value).unwrap_or(1) as f64;
+                    let dl = match search::text_posting_dl(value) {
+                        Some(dl) => dl as f64,
+                        None => lens
+                            .get(rtxn, id.as_bytes())?
+                            .and_then(search::read_u32)
+                            .unwrap_or(0) as f64,
+                    };
+                    // idf is constant for this term, so rank with idf=1 and
+                    // apply it after the heap has selected the top page.
+                    let score = weight * search::bm25_term(tf, dl, avgdl, 1.0);
+                    top.push(RankedId {
+                        id: id.to_string(),
+                        score,
+                    });
+                    if top.len() > want {
+                        top.pop();
+                    }
+                }
+                let idf = search::idf(n_docs, df as f64);
+                return emit_top(top, idf);
+            }
+
+            let collect_hits = |term: &str| -> Result<Vec<(String, f64, Option<f64>)>> {
+                let prefix = search::posting_prefix(term);
+                let mut hits = Vec::new();
+                for item in postings.prefix_iter(rtxn, prefix.as_slice())? {
+                    let (key, value) = item?;
+                    if let Some(id) = search::parse_posting(key) {
+                        let tf = search::text_posting_tf(value).unwrap_or(1) as f64;
+                        let dl = search::text_posting_dl(value).map(|dl| dl as f64);
+                        hits.push((id.to_string(), tf, dl));
+                    }
+                }
+                Ok(hits)
+            };
+
+            let mut lists: Vec<Vec<(String, f64)>> =
+                Vec::with_capacity(parsed.positive_terms.len());
+            for term in &parsed.positive_terms {
+                let hits = collect_hits(term)?;
+                let idf = search::idf(n_docs, hits.len() as f64);
+                let mut scored = Vec::with_capacity(hits.len());
+                for (id, tf, posting_dl) in hits {
+                    let dl = match posting_dl {
+                        Some(dl) => dl,
+                        None => lens
+                            .get(rtxn, id.as_bytes())?
+                            .and_then(search::read_u32)
+                            .unwrap_or(0) as f64,
+                    };
+                    scored.push((id, weight * search::bm25_term(tf, dl, avgdl, idf)));
+                }
+                lists.push(scored);
+            }
+
+            let mut positions = vec![0usize; lists.len()];
+            let mut top = BinaryHeap::with_capacity(want.min(1024).saturating_add(1));
+            loop {
+                let mut min_id: Option<&str> = None;
+                for (list, position) in lists.iter().zip(&positions) {
+                    if let Some((id, _)) = list.get(*position) {
+                        if min_id.is_none_or(|current| id.as_str() < current) {
+                            min_id = Some(id.as_str());
+                        }
+                    }
+                }
+                let Some(min_id) = min_id else {
+                    break;
+                };
+                let id = min_id.to_string();
+                let mut score = 0.0;
+                for (list, position) in lists.iter().zip(positions.iter_mut()) {
+                    if let Some((candidate, contribution)) = list.get(*position) {
+                        if candidate == &id {
+                            score += *contribution;
+                            *position += 1;
+                        }
+                    }
+                }
+                top.push(RankedId { id, score });
+                if top.len() > want {
+                    top.pop();
+                }
+            }
+            return emit_top(top, 1.0);
+        }
+
         let mut scores: HashMap<String, f64> = HashMap::new();
         let mut phrase_candidates: HashSet<String> = HashSet::new();
         let mut negative_ids: HashSet<String> = HashSet::new();

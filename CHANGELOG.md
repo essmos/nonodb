@@ -2,6 +2,19 @@
 
 Full release notes: https://github.com/essmos/nonodb/releases
 
+## Unreleased
+
+### Changed
+
+- Optimized BM25 lexical search for large posting lists. Single-term queries
+  stream postings into a bounded top-K heap; multi-term queries merge sorted
+  posting lists and score each document once without a shared score map.
+- Benchmarked a 10M-document database with 1M text documents: p50 47–49 ms for
+  one frequent term, 158 ms for two terms, and 270 ms for three terms.
+- Added a 5M-text-document stress benchmark and deferred block-max WAND because
+  the current direct top-K and list-merge paths are faster to ship and keep the
+  release-size workload below 300 ms.
+
 ## v0.26.1 - 2026-11-19
 
 ### Highlights

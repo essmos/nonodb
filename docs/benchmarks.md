@@ -243,23 +243,38 @@ client, end-to-end through the daemon:
 | BM25 search, limit 10 | p50 **62 ms** |
 | Fuzzy search, max distance 2 | p50 **40 ms** |
 
-### 1,000,000 text documents
+### 1,000,000 text documents in a 10M-document database
 
 | Operation | Result |
 |---|---|
-| Load 1M text documents | 14.6 s |
-| `create_text_index` backfill | 11.5 s |
-| `create_fuzzy_index` backfill | 28.2 s |
-| BM25 search, limit 10 | p50 **255 ms**, p95 **376 ms** |
-| Fuzzy search, max distance 2 | p50 **168 ms**, p95 237 ms |
+| Load 10M documents | 97.0 s, **103,105 docs/s** |
+| `create_text_index` backfill, 1M text docs | 13.8 s |
+| BM25 one term, limit 10 | p50 **47–49 ms**, p95 **57 ms** |
+| BM25 two terms, limit 10 | p50 **158 ms**, p95 **171 ms** |
+| BM25 three terms, limit 10 | p50 **270 ms**, p95 **299 ms** |
 
-The BM25 row uses a 1M-text-document regression database with 12-token bodies
-and a frequent term at about 37% document frequency. Release daemon, ext4,
-`NONODB_CACHE_TTL=0`, `NONODB_MAP_SIZE=8GiB`. Plain lexical queries rank posting
-scores and load only the requested page of documents; text postings also carry
-document length so scoring avoids a second lookup per hit. For much larger
-posting lists, block-max WAND is the next algorithmic step because a
-single-term query still walks every matching posting.
+The text corpus uses 12-token bodies and a frequent term at about 37% of text
+documents. Release daemon, ext4, `NONODB_CACHE_TTL=0`,
+`NONODB_MAP_SIZE=16GiB`. A single-term query streams postings directly into a
+bounded top-K heap; multi-term queries merge the already id-sorted posting
+lists and score each document once, without a shared score map.
+
+### 5,000,000 text documents (large-posting stress)
+
+| Operation | Result |
+|---|---|
+| Load 5M text documents | 63.9 s, **78,186 docs/s** |
+| `create_text_index` backfill | 62.9 s |
+| BM25 one term, limit 10 | p50 **223–250 ms**, p95 **316 ms** |
+| BM25 two terms, limit 10 | p50 **928 ms**, p95 **1,024 ms** |
+| BM25 three terms, limit 10 | p50 **1,430 ms**, p95 **1,500 ms** |
+
+This stress case has roughly 1.85M postings per frequent term, five times the
+release-size corpus. We evaluated block-max WAND for this work. The direct
+top-K and sorted-list merge paths avoid the format change and reindex required
+for impact-ordered WAND postings, while keeping the common 10M/1M-text workload
+well below 300 ms. WAND remains deferred until multi-term queries exceed roughly
+2 s p50 or posting lists grow beyond this stress case.
 
 ### 1,000,000 vectors (128 dimensions, exact cosine)
 
@@ -1023,11 +1038,11 @@ also verifies that `full` and explicitly `sync`ed writes survive `SIGKILL`, that
   writes/s with real disk commits on this host.
 - **Full scans are linear.** Sorting 8M documents without an index is seconds,
   not milliseconds. Use an index or a covered query.
-- **Search has its own scaling curve.** BM25 over 1M text documents is now
-  around 255 ms p50 for frequent terms in the dedicated regression run. Much
-  larger posting lists still scale with the number of matching postings; the
-  inverted index avoids scanning every document's text but does not make large
-  term lists free.
+- **Search has its own scaling curve.** BM25 over 1M text documents in a
+  10M-document database measures 47–49 ms p50 for one frequent term, 158 ms for
+  two, and 270 ms for three. A 5M-text-document stress case reaches 250 ms,
+  928 ms, and 1.43 s respectively. Larger posting lists still scale with the
+  number of matching postings.
 - **RSS is usually small.** Large RSS values after scans are mostly mapped page
   cache, not leaked allocations.
 - **Map size is not memory.** A 1 GiB `map_size` does not mean 1 GiB of RAM.

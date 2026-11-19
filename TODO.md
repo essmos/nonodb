@@ -6,10 +6,6 @@ deliberate limitations are documented in [docs/roadmap.md](docs/roadmap.md).
 
 ## P0 — before public launch
 
-- [ ] Re-run the 10M-document text benchmark and evaluate block-max WAND for
-      posting lists much larger than the current 1M-document case. Use
-      `scripts/large_test.py --docs 10000000 --text-docs 1000000 --text` and
-      the Mongo `$text` conformance/driver tests.
 - [ ] Fix long-running `create_text_index` client UX: avoid treating the
       default client timeout as a hard DDL failure, expose build status, and
       provide an async or progress-aware path for large collections.
@@ -165,9 +161,11 @@ indexing, and profiling.
 
 ## Known issues and caveats
 
-- BM25 single-term queries still walk every matching posting. Block-max WAND is
-  not implemented; the current optimization removes per-candidate document
-  parsing and bounds ranking memory, but it does not skip posting blocks.
+- BM25 single-term queries still walk every matching posting. Block-max WAND
+  was evaluated at 5M text documents; it is deferred because direct top-K and
+  sorted-list merging keep one/two-term queries below 1 s and three-term queries
+  around 1.4 s. Revisit WAND if multi-term p50 exceeds roughly 2 s or posting
+  lists grow beyond the current stress case.
 - New index/search resources use a reusable slot pool, so create/drop cycles do
   not consume new LMDB sub-databases. Legacy named sub-databases created by
   older releases cannot be deregistered with the current heed API; a
