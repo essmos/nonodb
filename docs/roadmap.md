@@ -346,5 +346,6 @@ Backups should be taken before upgrades.
 
 ## Contributing
 
-See [Development](development.md) for build/test instructions and contribution
-guidelines.
+See [Contributing](../CONTRIBUTING.md) for setup, required checks, and pull
+request expectations. [Development](development.md) covers the repository
+layout and test scripts in more detail.

@@ -1,0 +1,96 @@
+name: Bug report
+description: Report a reproducible defect in nonodb
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Remove tokens, certificates, private keys, vault
+        material, customer documents, and production logs before submitting.
+        For security vulnerabilities, use SECURITY.md instead of a public issue.
+  - type: input
+    id: version
+    attributes:
+      label: nonodb version
+      description: Release tag, commit SHA, or container image tag.
+      placeholder: v0.26.1
+    validations:
+      required: true
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: Deployment
+      options:
+        - Docker Compose
+        - Docker run
+        - Prebuilt binary
+        - Built from source
+        - Replica / cluster
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: access
+    attributes:
+      label: Access path
+      options:
+        - HTTP/JSON over Unix socket
+        - HTTP/JSON over TCP
+        - TLS / mTLS
+        - MongoDB wire
+        - CLI
+        - GUI
+        - Python client
+        - Rust client
+        - Node.js client
+        - Go client
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      description: Minimal commands or code. Prefer a small, self-contained case.
+      placeholder: |
+        1. Start nonodb with ...
+        2. Insert ...
+        3. Run ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Include the error code and a sanitized response or log excerpt.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, architecture, filesystem, RAM/disk, and relevant NONODB_* settings.
+      placeholder: Ubuntu 24.04, x86_64, ext4, 8 GB RAM, NONODB_MAP_SIZE=8GiB
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional context
+      description: Sanitized logs, screenshots, or related issues.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: I removed secrets, tokens, private keys, and production data.
+          required: true
+        - label: I searched existing issues for the same problem.
+          required: true
+        - label: This is not a security vulnerability; those go through SECURITY.md.
+          required: true

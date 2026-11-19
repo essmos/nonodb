@@ -8,7 +8,6 @@ deliberate limitations are documented in [docs/roadmap.md](docs/roadmap.md).
 
 - [ ] Test clean-machine onboarding: anonymous `docker pull`, Docker Compose
       quickstart, prebuilt binaries, backup/restore, and `kill -9` restart.
-- [ ] Add `CONTRIBUTING.md`, `SECURITY.md`, and issue templates.
 - [ ] Get 3–5 external testers to follow the quickstart without help.
 
 ## P0 — operations

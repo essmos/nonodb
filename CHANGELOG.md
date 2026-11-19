@@ -6,6 +6,8 @@ Full release notes: https://github.com/essmos/nonodb/releases
 
 ### Added
 
+- Added `CONTRIBUTING.md`, `SECURITY.md`, issue templates, and a pull request
+  template.
 - Added the `index_status` operation and Python `IndexBuild`/`Collection.index_status()`
   handles for observing long index backfills.
 - Python `create_text_index`/`create_fuzzy_index` now default to at least a

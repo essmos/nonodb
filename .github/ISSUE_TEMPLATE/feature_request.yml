@@ -1,0 +1,62 @@
+name: Feature request
+description: Propose a capability or compatibility improvement
+title: "[feature] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        nonodb implements a documented MongoDB-compatible subset. Explain the
+        use case and the expected behavior, especially if a driver or migration
+        depends on it.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do, and what blocks you today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: API shape, command, option, or compatibility target.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Existing workarounds, other databases, or simpler options.
+  - type: textarea
+    id: impact
+    attributes:
+      label: Compatibility and migration impact
+      description: Drivers, existing data, indexes, backups, or MongoDB parity concerns.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Query / update compatibility
+        - MongoDB wire
+        - Indexes / search
+        - Storage / durability
+        - Replication / failover
+        - Authentication / security
+        - Backup / restore
+        - Docker / deployment
+        - GUI / CLI / clients
+        - Documentation
+        - Other
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: I checked docs/roadmap.md and existing issues.
+          required: true
+        - label: This request does not contain secrets or production data.
+          required: true
