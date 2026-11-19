@@ -63,7 +63,7 @@ use hyper::server::conn::http1;
 use hyper_util::rt::TokioIo;
 use hyper_util::service::TowerToHyperService;
 use ring::digest::{digest, SHA256};
-use serde_json::{json, Value};
+use serde_json::{json, value::RawValue, Value};
 
 use nonodb_core::heed::RoTxn;
 use nonodb_core::{
@@ -2683,15 +2683,18 @@ async fn exec_inner(
                     let rtxn = store.read_txn()?;
                     let out = c.find_vault_in(&rtxn, &query, &auth.key, &auth.tenant, &auth.kid)?;
                     rtxn.commit().map_err(nonodb_core::Error::from)?;
-                    Ok::<Value, ApiError>(Value::Array(out))
+                    Ok::<FindOutput, ApiError>(FindOutput::Value(Value::Array(out)))
                 } else {
                     if auth.is_some() {
                         return Err(vault::key_unexpected().into());
                     }
-                    Ok::<Value, ApiError>(Value::Array(c.find(&query)?))
+                    match c.find_raw(&query)? {
+                        Some(docs) => Ok(FindOutput::Raw(docs)),
+                        None => Ok(FindOutput::Value(Value::Array(c.find(&query)?))),
+                    }
                 }
             });
-            read_result(joined).await
+            read_find_result(joined).await
         }
 
         Request::Watch {
@@ -3786,8 +3789,19 @@ async fn exec_inner(
     };
 
     if response.0 == StatusCode::OK {
-        if let (Some(key), Some(value)) = (cache_key, response.1 .0.result.clone()) {
-            state.cache.put(key, cache_version, value);
+        if let Some(key) = cache_key {
+            let cached: Option<Value> = response.1 .0.result.clone().or_else(|| {
+                response
+                    .1
+                     .0
+                    .raw_result
+                    .as_ref()
+                    .filter(|raw| state.cache.can_store_bytes(raw.get().len()))
+                    .and_then(|raw| serde_json::from_str(raw.get()).ok())
+            });
+            if let Some(value) = cached {
+                state.cache.put(key, cache_version, value);
+            }
         }
     }
     audit_response(
@@ -4626,6 +4640,11 @@ fn execute_read(
     }
 }
 
+enum FindOutput {
+    Value(Value),
+    Raw(Vec<Vec<u8>>),
+}
+
 async fn read_result(
     joined: tokio::task::JoinHandle<Result<Value, ApiError>>,
 ) -> (StatusCode, Json<ApiResponse>) {
@@ -4633,6 +4652,43 @@ async fn read_result(
     match tokio::time::timeout(request_timeout(), joined).await {
         Ok(joined) => respond(flatten_join(joined)),
         Err(_) => respond(Err(ApiError::timeout())),
+    }
+}
+
+async fn read_find_result(
+    joined: tokio::task::JoinHandle<Result<FindOutput, ApiError>>,
+) -> (StatusCode, Json<ApiResponse>) {
+    metrics::inc(&metrics::READ_OPS);
+    match tokio::time::timeout(request_timeout(), joined).await {
+        Ok(Ok(Ok(FindOutput::Value(value)))) => respond(Ok(value)),
+        Ok(Ok(Ok(FindOutput::Raw(docs)))) => respond_raw_docs(docs),
+        Ok(Ok(Err(err))) => respond(Err(err)),
+        Ok(Err(e)) => respond(Err(ApiError::internal(format!("join error: {e}")))),
+        Err(_) => respond(Err(ApiError::timeout())),
+    }
+}
+
+fn respond_raw_docs(docs: Vec<Vec<u8>>) -> (StatusCode, Json<ApiResponse>) {
+    let capacity = docs.iter().map(Vec::len).sum::<usize>() + docs.len() + 2;
+    let mut out = String::with_capacity(capacity);
+    out.push('[');
+    for (index, doc) in docs.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        match std::str::from_utf8(doc) {
+            Ok(text) => out.push_str(text),
+            Err(e) => {
+                return respond(Err(ApiError::internal(format!(
+                    "stored document is not valid UTF-8: {e}"
+                ))));
+            }
+        }
+    }
+    out.push(']');
+    match RawValue::from_string(out) {
+        Ok(raw) => (StatusCode::OK, Json(ApiResponse::ok_raw(raw))),
+        Err(e) => respond(Err(ApiError::internal(format!("invalid stored JSON: {e}")))),
     }
 }
 

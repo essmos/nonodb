@@ -83,6 +83,11 @@ impl QueryCache {
         self.version.load(Ordering::Acquire)
     }
 
+    /// Whether a result of this encoded size can fit in the cache.
+    pub fn can_store_bytes(&self, len: usize) -> bool {
+        self.enabled() && len <= self.max_value_bytes
+    }
+
     pub fn get(&self, key: &str) -> Option<Value> {
         if !self.enabled() {
             return None;

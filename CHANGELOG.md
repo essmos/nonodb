@@ -15,6 +15,10 @@ Full release notes: https://github.com/essmos/nonodb/releases
 
 ### Changed
 
+- Added a raw JSON fast path for plain `find` requests: documents without a
+  projection, sort, or index hint are returned from stored bytes without a
+  `Value` parse/reserialize round-trip. Filtered full scans reuse the original
+  bytes after matching.
 - Optimized BM25 lexical search for large posting lists. Single-term queries
   stream postings into a bounded top-K heap; multi-term queries merge sorted
   posting lists and score each document once without a shared score map.

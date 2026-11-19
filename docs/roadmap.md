@@ -281,9 +281,11 @@ project's target workload.
 
 ### High value
 
-1. **Raw JSON passthrough for simple reads.** For `find` without projection or
-   sorting, stream stored JSON bytes directly into the response instead of
-   parsing to `Value` and reserializing. Expected read-path win.
+1. **Raw JSON passthrough for simple reads (implemented).** For `find` without
+   projection, sorting, or an index hint, stored JSON bytes are returned directly
+   instead of being parsed to `Value` and reserialized. Filtered full scans still
+   parse for matching but reuse the original bytes for output. Indexed paths keep
+   their existing plans.
 2. **Incremental index backfill writes (implemented).** Backfill streams chunks
    capped by document count and raw bytes, applies entries as each chunk
    completes, and avoids collection-sized unique-key maps.

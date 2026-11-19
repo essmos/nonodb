@@ -10,11 +10,6 @@ deliberate limitations are documented in [docs/roadmap.md](docs/roadmap.md).
       quickstart, prebuilt binaries, backup/restore, and `kill -9` restart.
 - [ ] Get 3–5 external testers to follow the quickstart without help.
 
-## P0 — operations
-
-- [ ] Raw JSON passthrough for `find` without projection/sort: stream stored
-      JSON bytes directly instead of parsing to `Value` and reserializing.
-
 ## P0 — security
 
 - [ ] Optional CRL/OCSP integration for externally managed PKI.

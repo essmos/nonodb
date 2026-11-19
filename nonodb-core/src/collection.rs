@@ -4937,6 +4937,80 @@ impl<'e> Collection<'e> {
         Ok(out)
     }
 
+    /// Returns stored document bytes for a `find` that needs no projection,
+    /// sorting, or index hint. `None` means the caller must use [`Self::find`].
+    ///
+    /// The fast path deliberately avoids `serde_json::Value` on match-all
+    /// scans. Filtered scans still parse for matching, but reuse the original
+    /// bytes for output instead of serializing the parsed value again.
+    pub fn find_raw(&self, query: &FindQuery) -> Result<Option<Vec<Vec<u8>>>> {
+        let normalized = normalized_find_query(query)?;
+        let query = normalized.as_ref();
+        crate::query::validate::validate_filter(&query.filter)?;
+        if self.profile().is_vault()
+            || query.projection.is_some()
+            || !query.sort.is_empty()
+            || query.hint.is_some()
+        {
+            return Ok(None);
+        }
+
+        let limit = query.limit.unwrap_or(usize::MAX);
+        if limit == 0 {
+            return Ok(Some(Vec::new()));
+        }
+        let deadline = find_deadline(query);
+        check_find_deadline(deadline)?;
+        if geo::extract_near(&query.filter).is_some() {
+            return Ok(None);
+        }
+
+        let rtxn = self.read_txn()?;
+        let match_all = is_match_all(&query.filter);
+        if !match_all {
+            // Prefer the existing indexed paths. This fast path is for scans;
+            // replacing an index lookup with a full collection walk would be a
+            // regression for selective filters.
+            let indexed = direct_id(&query.filter).is_some()
+                || id_bounds(&query.filter).is_some()
+                || self.all_index_candidates(&rtxn, &query.filter)?.is_some()
+                || self.geo_index_candidates(&rtxn, &query.filter)?.is_some()
+                || self.index_plan(&rtxn, &query.filter)?.is_some()
+                || self.or_index_plans(&rtxn, &query.filter)?.is_some();
+            if indexed {
+                rtxn.commit()?;
+                return Ok(None);
+            }
+        }
+
+        let raw_prefilter = raw_prefilter(&query.filter);
+        let raw_prefilter = raw_prefilter.as_ref();
+        let mut skipped = 0usize;
+        let mut out = Vec::new();
+        for item in self.db.iter(&rtxn)? {
+            check_find_deadline(deadline)?;
+            let (_key, bytes) = item?;
+            if !match_all {
+                let Some(doc) = parse_prefiltered(bytes, raw_prefilter)? else {
+                    continue;
+                };
+                if !matches(&doc, &query.filter) {
+                    continue;
+                }
+            }
+            if skipped < query.skip {
+                skipped += 1;
+                continue;
+            }
+            out.push(bytes.to_vec());
+            if out.len() >= limit {
+                break;
+            }
+        }
+        rtxn.commit()?;
+        Ok(Some(out))
+    }
+
     /// Reads one bounded backfill chunk after the last processed `_id`.
     ///
     /// Using a fresh range/iterator per chunk releases the LMDB iterator borrow
@@ -11173,6 +11247,60 @@ mod tests {
             Err(Error::Timeout(_))
         ));
         rtxn.commit().unwrap();
+    }
+
+    #[test]
+    fn find_raw_uses_stored_json_for_plain_finds() {
+        let (_dir, store) = store();
+        let c = store.collection("raw_find").unwrap();
+        c.insert_one(json!({"_id": "a", "name": "Ala", "age": 30}))
+            .unwrap();
+        c.insert_one(json!({"_id": "b", "name": "Bob", "age": 20}))
+            .unwrap();
+        c.insert_one(json!({"_id": "c", "name": "Cid", "age": 25}))
+            .unwrap();
+
+        let raw = c
+            .find_raw(&FindQuery {
+                skip: 1,
+                limit: Some(1),
+                ..Default::default()
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(raw.len(), 1);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&raw[0]).unwrap()["_id"],
+            "b"
+        );
+
+        let filtered = c
+            .find_raw(&FindQuery {
+                filter: json!({"name": "Cid"}),
+                ..Default::default()
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&filtered[0]).unwrap()["age"],
+            25
+        );
+
+        assert!(c
+            .find_raw(&FindQuery {
+                projection: Some(json!({"name": 1})),
+                ..Default::default()
+            })
+            .unwrap()
+            .is_none());
+        assert!(c
+            .find_raw(&FindQuery {
+                sort: vec![("age".to_string(), 1)],
+                ..Default::default()
+            })
+            .unwrap()
+            .is_none());
     }
 }
 

@@ -1,7 +1,7 @@
 //! HTTP/JSON protocol: requests, responses, and API errors.
 
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde::{ser::SerializeMap, Deserialize, Serialize, Serializer};
+use serde_json::{value::RawValue, Value};
 
 use nonodb_core::{CollectionProfile, IndexSpec, VaultKey, VectorMetric};
 
@@ -1147,13 +1147,32 @@ impl From<nonodb_core::Error> for ApiError {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct ApiResponse {
     pub ok: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Already-serialized `result` used by the raw `find` fast path.
+    pub raw_result: Option<Box<RawValue>>,
     pub error: Option<ApiError>,
+}
+
+impl Serialize for ApiResponse {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(None)?;
+        map.serialize_entry("ok", &self.ok)?;
+        if let Some(raw) = &self.raw_result {
+            map.serialize_entry("result", raw.as_ref())?;
+        } else if let Some(result) = &self.result {
+            map.serialize_entry("result", result)?;
+        }
+        if let Some(error) = &self.error {
+            map.serialize_entry("error", error)?;
+        }
+        map.end()
+    }
 }
 
 impl ApiResponse {
@@ -1161,6 +1180,16 @@ impl ApiResponse {
         Self {
             ok: true,
             result: Some(result),
+            raw_result: None,
+            error: None,
+        }
+    }
+
+    pub fn ok_raw(raw: Box<RawValue>) -> Self {
+        Self {
+            ok: true,
+            result: None,
+            raw_result: Some(raw),
             error: None,
         }
     }
@@ -1169,7 +1198,23 @@ impl ApiResponse {
         Self {
             ok: false,
             result: None,
+            raw_result: None,
             error: Some(error),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn raw_result_is_serialized_under_result() {
+        let raw = RawValue::from_string(r#"[{"_id":"a","n":1}]"#.to_string()).unwrap();
+        let response = ApiResponse::ok_raw(raw);
+        assert_eq!(
+            serde_json::to_string(&response).unwrap(),
+            r#"{"ok":true,"result":[{"_id":"a","n":1}]}"#
+        );
     }
 }
