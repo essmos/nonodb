@@ -33,6 +33,7 @@ quick-start instructions, and a feature overview.
 | [CLI](cli.md) | Operators | Administration, map resize, backup verification, restore drills, inspect, raw requests |
 | [Operations](operations.md) | Operators, SRE | Configuration, deployment, security, snapshots, monitoring, capacity, troubleshooting |
 | [Docker Compose quick start](docker-compose.md) | Operators, developers | Self-contained Compose stack, auth initialization, GUI, updates, backups, troubleshooting |
+| [Raspberry Pi with Docker](raspberry-pi.md) | Operators, edge deployments | 64-bit Raspberry Pi 4/5 setup, SSD data directory, SSH tunnels, updates, troubleshooting |
 | [Volume compression](volume-compression.md) | Operators, SRE | ZFS/Btrfs compression, Docker bind mounts and named volumes, verification, benchmarking, migration |
 | [Free-tier and low-cost VM deployment](free-tier-deployment.md) | Operators, small deployments | Oracle Cloud, GCP, AWS, DigitalOcean, small profile, Cloud Run read replicas, Spaces backups, restore |
 | [Backup and restore](backup.md) | Operators, SRE | Online backup, GUI backup/import, snapshots, verification, restore drills, Docker, vault keys, authorization state, recovery |
@@ -48,6 +49,7 @@ quick-start instructions, and a feature overview.
 - **Run on Linux, macOS or Windows:** [README — Quick start](../README.md#quick-start)
 - **Run with Docker:** [README — Run with Docker](../README.md#run-with-docker)
 - **Run a self-contained Docker Compose stack:** [Docker Compose quick start](docker-compose.md)
+- **Run on Raspberry Pi 4/5 with Docker:** [Raspberry Pi with Docker](raspberry-pi.md)
 - **Run on a free-tier or low-cost VM:** [Free-tier and low-cost VM deployment](free-tier-deployment.md)
 - **Run several databases in one daemon:** [Multiple databases](multi-database.md)
 - **Open the local GUI:** [GUI console](gui.md)

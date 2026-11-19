@@ -176,6 +176,7 @@ auth registry is managed by the host or another secret manager.
 ## Related documentation
 
 - [Operations — Docker](operations.md#docker)
+- [Raspberry Pi with Docker](raspberry-pi.md)
 - [Authentication and permissions](auth.md)
 - [Backup and restore](backup.md)
 - [Volume compression](volume-compression.md)
