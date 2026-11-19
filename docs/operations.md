@@ -919,20 +919,23 @@ restart drops process RSS to a few MB; the OS may keep pages cached.
 ## Timeouts and long operations
 
 The daemon defaults to a 30-second timeout for normal requests and a separate
-3600-second timeout for index, text-index, fuzzy-index, and vector-index builds. The Python
-client must still allow enough time for the response; set `NONODB_TIMEOUT` or
-`NonoDB(timeout=...)` above the expected build duration.
+3600-second timeout for index, text-index, fuzzy-index, and vector-index builds.
+The Python client uses at least 300 seconds for index DDL; pass `timeout=` to
+override it, or use `wait=False` and `IndexBuild.wait()` for a non-blocking
+start.
 
 ```bash
 export NONODB_INDEX_TIMEOUT=7200   # daemon, index builds
-export NONODB_TIMEOUT=7500         # Python client
+export NONODB_TIMEOUT=7500         # normal Python client requests
 ```
 
-Restart the daemon after changing timeout environment variables. Progress for
-active backfills is exposed as `index_builds` in `/metrics`, including
-`processed`, `total`, `elapsed_ms`, and `finished`. The build remains one LMDB
-write transaction, so it becomes visible and durable only after completion; an
-interrupted build is rolled back and must be restarted.
+Restart the daemon after changing timeout environment variables. Progress is
+available through the `index_status` operation, the Python client's
+`Collection.index_status()`/`IndexBuild.status()`, and the `index_builds` field
+in `/metrics`. Entries include `processed`, `total`, `elapsed_ms`, and
+`finished`. The build remains one LMDB write transaction, so it becomes visible
+and durable only after completion; an interrupted build is rolled back and must
+be restarted. A client-side timeout does not cancel a running build.
 
 Creating a text, fuzzy, or vector index backfills synchronously and blocks writers while
 the final write transaction is active. Schedule large index builds during

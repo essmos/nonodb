@@ -3158,6 +3158,21 @@ async fn exec_inner(
             read_result(joined).await
         }
 
+        Request::IndexStatus { coll } => {
+            let store = state.store.clone();
+            let auth = vault_auth.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                let c = read_collection(&store, &coll, auth.as_ref())?;
+                reject_vault_read(&c, auth.as_ref(), "index status")?;
+                let builds: Vec<_> = nonodb_core::progress::snapshot()
+                    .into_iter()
+                    .filter(|build| build.collection == coll)
+                    .collect();
+                Ok::<Value, ApiError>(json!({ "builds": builds }))
+            });
+            read_result(joined).await
+        }
+
         Request::ListFuzzyIndexes { coll } => {
             let store = state.store.clone();
             let auth = vault_auth.clone();
@@ -4111,6 +4126,7 @@ fn cacheable(req: &Request) -> bool {
             | Request::Fuzzy { .. }
             | Request::ListIndexes { .. }
             | Request::ListTextIndexes { .. }
+            | Request::IndexStatus { .. }
             | Request::ListFuzzyIndexes { .. }
             | Request::ListVectorIndexes { .. }
             | Request::VectorSearch { .. }
@@ -4464,6 +4480,19 @@ fn execute_read(
                 return Err(vault::unsupported("batch reads on vault collections").into());
             }
             Ok(json!({ "text_indexes": c.list_text_indexes_in(rtxn)? }))
+        }
+        Request::IndexStatus { coll } => {
+            let Some(c) = store.collection_at(rtxn, &coll)? else {
+                return Ok(json!({ "builds": [] }));
+            };
+            if c.profile().is_vault() {
+                return Err(vault::unsupported("batch reads on vault collections").into());
+            }
+            let builds: Vec<_> = nonodb_core::progress::snapshot()
+                .into_iter()
+                .filter(|build| build.collection == coll)
+                .collect();
+            Ok(json!({ "builds": builds }))
         }
         Request::ListFuzzyIndexes { coll } => {
             let Some(c) = store.collection_at(rtxn, &coll)? else {

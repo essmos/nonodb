@@ -661,14 +661,26 @@ after an index-format upgrade or when index contents are suspected to be
 incomplete. It runs in one write transaction and rolls back on failure.
 
 Creating an index backfills existing documents synchronously. On large
-collections this can take seconds to minutes and blocks writers; raise
-`timeout` and `NONODB_REQUEST_TIMEOUT` accordingly.
+collections this can take seconds to minutes and blocks writers. The client
+uses at least a 300-second timeout for index DDL instead of the normal 10-second
+request timeout. You can override it with `timeout=`.
+
+For a non-blocking start, use `wait=False`. It returns an `IndexBuild` handle:
+
+```python
+build = articles.create_text_index("body", wait=False)
+print(build.status())       # active/recent progress entries
+build.wait(timeout=3600)    # poll until the index exists
+```
+
+`Collection.index_status()` returns the same progress data directly. A
+completed build remains visible for a short time with `finished: true`.
 
 ## Full-text search
 
 ```python
 articles = db.collection("articles")
-articles.create_text_index("body")
+articles.create_text_index("body")  # waits, up to at least 300 s by default
 
 results = articles.search("body", "rust async", limit=10)
 for doc in results:

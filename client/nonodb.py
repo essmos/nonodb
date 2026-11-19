@@ -33,6 +33,7 @@ __all__ = [
     "VaultDB",
     "Collection",
     "Cursor",
+    "IndexBuild",
     "NonoDBError",
     "StreamTruncatedError",
 ]
@@ -57,6 +58,7 @@ _READ_OPS = {
     "get_collection_events",
     "list_subscriptions",
     "list_text_indexes",
+    "index_status",
     "list_fuzzy_indexes",
     "list_vector_indexes",
     "search",
@@ -70,6 +72,8 @@ _READ_OPS = {
 
 # Reads are safe to retry. `watch` is long-polling and must not be cached.
 _RETRY_OPS = _READ_OPS | {"watch"}
+# Dynamic status reads must always reach the daemon.
+_NO_CACHE_OPS = {"index_status"}
 
 
 def _dumps(obj: Any) -> bytes:
@@ -200,6 +204,47 @@ class NonoDBError(Exception):
         # Set for `read_only`: the primary/write endpoint advertised by the
         # replica. Callers can use it for their own routing or display.
         self.write_url = write_url
+
+
+class IndexBuild:
+    """Handle for an index backfill started without waiting for completion."""
+
+    def __init__(self, db: "NonoDB", collection: str, kind: str, target: str):
+        self._db = db
+        self.collection = collection
+        self.kind = kind
+        self.target = target
+
+    def status(self) -> list[dict[str, Any]]:
+        """Returns active and recently finished backfills for this index."""
+        builds = self._db.collection(self.collection).index_status()
+        return [
+            build
+            for build in builds
+            if build.get("kind") == self.kind and build.get("target") == self.target
+        ]
+
+    def wait(self, timeout: float = 3600.0, poll_interval: float = 0.25) -> bool:
+        """Waits until the index exists and no matching backfill is active."""
+        deadline = time.monotonic() + timeout
+        collection = self._db.collection(self.collection)
+        while True:
+            active = [build for build in self.status() if not build.get("finished")]
+            if not active:
+                if self.kind == "text":
+                    exists = self.target in collection.list_text_indexes()
+                elif self.kind == "fuzzy":
+                    exists = self.target in collection.list_fuzzy_indexes()
+                else:
+                    exists = True
+                if exists:
+                    return True
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"index build {self.kind}:{self.target} did not finish in {timeout}s"
+                )
+            remaining = max(0.0, deadline - time.monotonic())
+            time.sleep(min(poll_interval, remaining))
 
 
 class StreamTruncatedError(NonoDBError):
@@ -396,11 +441,18 @@ class NonoDB:
         payload: dict[str, Any],
         *,
         headers: Optional[dict[str, str]] = None,
+        timeout: Optional[float] = None,
     ) -> Any:
         op = payload.get("op")
         is_write = self._is_write(payload)
         cache_key: Optional[bytes] = None
-        if headers is None and self._cache_ttl > 0 and not is_write and op in _READ_OPS:
+        if (
+            headers is None
+            and self._cache_ttl > 0
+            and not is_write
+            and op in _READ_OPS
+            and op not in _NO_CACHE_OPS
+        ):
             cache_key = _cache_key(payload)
             with self._cache_lock:
                 hit = self._cache.get(cache_key)
@@ -411,7 +463,7 @@ class NonoDB:
                 with self._cache_lock:
                     self._cache.pop(cache_key, None)
 
-        result = self._exec_uncached(payload, op, headers)
+        result = self._exec_uncached(payload, op, headers, timeout)
 
         if self._cache_ttl > 0 and headers is None:
             with self._cache_lock:
@@ -427,6 +479,7 @@ class NonoDB:
         payload: dict[str, Any],
         op: Optional[str],
         extra_headers: Optional[dict[str, str]] = None,
+        timeout: Optional[float] = None,
     ) -> Any:
         # Reads are retried after a transport error; writes are not (duplicate risk).
         is_write = self._is_write(payload)
@@ -447,7 +500,12 @@ class NonoDB:
                     base_url + self._data_path("/v1/exec"),
                     content=_dumps(payload),
                     headers=headers,
+                    timeout=(
+                        httpx.USE_CLIENT_DEFAULT if timeout is None else timeout
+                    ),
                 )
+            except httpx.TimeoutException as exc:
+                raise NonoDBError("timeout", str(exc)) from exc
             except httpx.TransportError as exc:
                 if attempt >= retries:
                     # Daemon unavailable / broken connection - always our own type,
@@ -1082,11 +1140,48 @@ class Collection:
         )
 
     # -- full-text / fuzzy -------------------------------------------
-    def create_text_index(self, field: str) -> bool:
-        self._db.exec(
-            {"op": "create_text_index", "coll": self.name, "field": field}
+    def index_status(self) -> list[dict[str, Any]]:
+        """Returns active and recently finished index backfills."""
+        return self._db.exec({"op": "index_status", "coll": self.name})["builds"]
+
+    def _start_index_build(
+        self,
+        op: str,
+        field: str,
+        kind: str,
+        timeout: Optional[float],
+        wait: bool,
+    ) -> Union[bool, IndexBuild]:
+        payload = {"op": op, "coll": self.name, "field": field}
+        if wait:
+            # Index builds are DDL, not normal queries. Do not let the default
+            # 10s client timeout turn a successful build into a false failure.
+            effective = timeout if timeout is not None else max(self._db._timeout, 300.0)
+            self._db.exec(payload, timeout=effective)
+            return True
+        try:
+            self._db.exec(payload, timeout=timeout if timeout is not None else 1.0)
+        except NonoDBError as exc:
+            if exc.code != "timeout":
+                raise
+        return IndexBuild(self._db, self.name, kind, field)
+
+    def create_text_index(
+        self,
+        field: str,
+        *,
+        timeout: Optional[float] = None,
+        wait: bool = True,
+    ) -> Union[bool, IndexBuild]:
+        """Creates a BM25 text index.
+
+        By default the call waits up to `max(client timeout, 300s)`. Pass
+        `wait=False` to return an :class:`IndexBuild` immediately and poll or
+        wait for progress explicitly.
+        """
+        return self._start_index_build(
+            "create_text_index", field, "text", timeout, wait
         )
-        return True
 
     def drop_text_index(self, field: str) -> bool:
         return self._db.exec(
@@ -1098,11 +1193,20 @@ class Collection:
             {"op": "list_text_indexes", "coll": self.name}
         )["text_indexes"]
 
-    def create_fuzzy_index(self, field: str) -> bool:
-        self._db.exec(
-            {"op": "create_fuzzy_index", "coll": self.name, "field": field}
+    def create_fuzzy_index(
+        self,
+        field: str,
+        *,
+        timeout: Optional[float] = None,
+        wait: bool = True,
+    ) -> Union[bool, IndexBuild]:
+        """Creates a trigram/Levenshtein fuzzy index.
+
+        Pass `wait=False` to return an :class:`IndexBuild` and poll progress.
+        """
+        return self._start_index_build(
+            "create_fuzzy_index", field, "fuzzy", timeout, wait
         )
-        return True
 
     def drop_fuzzy_index(self, field: str) -> bool:
         return self._db.exec(

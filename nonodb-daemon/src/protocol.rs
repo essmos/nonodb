@@ -372,6 +372,10 @@ pub enum Request {
     ListTextIndexes {
         coll: String,
     },
+    /// Active and recently finished index backfills for one collection.
+    IndexStatus {
+        coll: String,
+    },
     CreateFuzzyIndex {
         coll: String,
         field: String,
@@ -850,6 +854,7 @@ impl Request {
             Self::CreateTextIndex { .. } => "create_text_index",
             Self::DropTextIndex { .. } => "drop_text_index",
             Self::ListTextIndexes { .. } => "list_text_indexes",
+            Self::IndexStatus { .. } => "index_status",
             Self::CreateFuzzyIndex { .. } => "create_fuzzy_index",
             Self::DropFuzzyIndex { .. } => "drop_fuzzy_index",
             Self::ListFuzzyIndexes { .. } => "list_fuzzy_indexes",
@@ -917,6 +922,7 @@ impl Request {
             | Self::CloseCursor { .. }
             | Self::ListIndexes { .. }
             | Self::ListTextIndexes { .. }
+            | Self::IndexStatus { .. }
             | Self::ListFuzzyIndexes { .. }
             | Self::ListVectorIndexes { .. }
             | Self::VectorSearch { .. }
@@ -964,6 +970,7 @@ impl Request {
             | Self::CreateTextIndex { coll, .. }
             | Self::DropTextIndex { coll, .. }
             | Self::ListTextIndexes { coll }
+            | Self::IndexStatus { coll }
             | Self::CreateFuzzyIndex { coll, .. }
             | Self::DropFuzzyIndex { coll, .. }
             | Self::ListFuzzyIndexes { coll }

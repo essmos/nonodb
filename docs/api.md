@@ -178,6 +178,7 @@ client timeout with `NONODB_TIMEOUT` or the `timeout=` argument.
 | [`create_text_index`](#full-text-indexes) | Create a BM25 index |
 | [`drop_text_index`](#full-text-indexes) | Drop a BM25 index |
 | [`list_text_indexes`](#full-text-indexes) | List BM25 indexes |
+| [`index_status`](#full-text-indexes) | Show active and recent index backfills |
 | [`create_fuzzy_index`](#fuzzy-indexes) | Create a fuzzy index |
 | [`drop_fuzzy_index`](#fuzzy-indexes) | Drop a fuzzy index |
 | [`list_fuzzy_indexes`](#fuzzy-indexes) | List fuzzy indexes |
@@ -2025,6 +2026,7 @@ Create, drop, and list:
 {"op": "create_text_index", "coll": "articles", "field": "body"}
 {"op": "drop_text_index", "coll": "articles", "field": "body"}
 {"op": "list_text_indexes", "coll": "articles"}
+{"op": "index_status", "coll": "articles"}
 ```
 
 Responses:
@@ -2035,8 +2037,33 @@ Responses:
 {"ok": true, "result": {"text_indexes": ["body"]}}
 ```
 
+`index_status` returns active and recently finished backfills for the
+collection:
+
+```json
+{
+  "ok": true,
+  "result": {
+    "builds": [
+      {
+        "collection": "articles",
+        "target": "body",
+        "kind": "text",
+        "processed": 420000,
+        "total": 1000000,
+        "finished": false,
+        "started_at_ms": 1795125567954,
+        "elapsed_ms": 13628
+      }
+    ]
+  }
+}
+```
+
 The index is maintained in the same transaction as document writes. Creation
-backfills existing documents synchronously.
+backfills existing documents synchronously, so the create request returns only
+after the transaction commits. Use `index_status` to observe a long build from
+another connection. The Python client also exposes an asynchronous helper.
 
 ## Fuzzy indexes
 

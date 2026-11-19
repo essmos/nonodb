@@ -6,9 +6,6 @@ deliberate limitations are documented in [docs/roadmap.md](docs/roadmap.md).
 
 ## P0 — before public launch
 
-- [ ] Fix long-running `create_text_index` client UX: avoid treating the
-      default client timeout as a hard DDL failure, expose build status, and
-      provide an async or progress-aware path for large collections.
 - [ ] Test clean-machine onboarding: anonymous `docker pull`, Docker Compose
       quickstart, prebuilt binaries, backup/restore, and `kill -9` restart.
 - [ ] Add `CONTRIBUTING.md`, `SECURITY.md`, and issue templates.

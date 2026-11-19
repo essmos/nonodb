@@ -11,7 +11,7 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "client"))
 
-from nonodb import NonoDB, NonoDBError  # noqa: E402
+from nonodb import IndexBuild, NonoDB, NonoDBError  # noqa: E402
 
 SOCK = os.environ.get("NONODB_SOCK", "/run/nonodb.sock")
 
@@ -29,7 +29,9 @@ def main() -> int:
     c.insert({"title": "Rust async", "body": "rust language with async runtime and memory safety"})
     c.insert({"title": "Python web", "body": "python framework for web applications"})
 
-    c.create_text_index("body")
+    build = c.create_text_index("body", wait=False)
+    assert isinstance(build, IndexBuild), build
+    assert build.wait(timeout=60), build.status()
     c.create_fuzzy_index("title")
     assert c.list_text_indexes() == ["body"]
     assert c.list_fuzzy_indexes() == ["title"]

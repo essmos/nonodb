@@ -4,6 +4,13 @@ Full release notes: https://github.com/essmos/nonodb/releases
 
 ## Unreleased
 
+### Added
+
+- Added the `index_status` operation and Python `IndexBuild`/`Collection.index_status()`
+  handles for observing long index backfills.
+- Python `create_text_index`/`create_fuzzy_index` now default to at least a
+  300-second DDL timeout and support `wait=False` for a non-blocking start.
+
 ### Changed
 
 - Optimized BM25 lexical search for large posting lists. Single-term queries

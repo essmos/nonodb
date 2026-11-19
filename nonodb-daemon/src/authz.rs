@@ -59,6 +59,7 @@ pub fn authorize_request(
         | Request::CursorAggregate { coll, .. }
         | Request::ListIndexes { coll }
         | Request::ListTextIndexes { coll }
+        | Request::IndexStatus { coll }
         | Request::ListFuzzyIndexes { coll }
         | Request::ListVectorIndexes { coll }
         | Request::VectorSearch { coll, .. }
