@@ -23,9 +23,10 @@ Full release notes: https://github.com/essmos/nonodb/releases
   into a bounded 5,000-candidate heap instead of building a multi-million-entry
   `HashMap<String, u32>` and sorting every candidate. On the 10M-document
   collection, distance-1/2 queries dropped from about 17.4 s to about 2.2 s.
-- Added `scripts/search_scale_bench.py` and a 10M-document search benchmark.
-  On the 10M collection, BM25 takes 454 ms for one term and 3.57 s for three;
-  exact 16D vector search takes 549 ms; fuzzy distance 1/2 takes about 2.2 s.
+- Added `scripts/search_scale_bench.py` and matching 1M/10M search benchmarks.
+  On 1M, BM25 takes 46.5 ms for one term and 354 ms for three, exact 16D vector
+  search takes 52.1 ms, and fuzzy distance 1/2 takes about 238 ms. On 10M the
+  same operations take 454 ms, 3.57 s, 549 ms, and about 2.2 s respectively.
 
 ## v0.27.0 - 2026-11-20
 

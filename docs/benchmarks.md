@@ -13,11 +13,10 @@ filesystem, page cache, and client overhead all affect the result.
 
 | Run | Host | Filesystem | Daemon |
 |---|---|---|---|
-| 1M / 5M text and 1M vectors | 8 vCPU Haswell, 22.9 GiB RAM | ext4 | release build, 2026-11-11 |
-| 10M search and 1B dense | 16 vCPU Xeon D-2141I, 31 GiB RAM | ZFS mirror, 438 GB | `v0.27.0`, 2026-11-20 |
+| 1M / 10M search and 1B dense | 16 vCPU Xeon D-2141I, 31 GiB RAM | ZFS mirror, 438 GB | `v0.27.0`, 2026-11-20 |
 
 Do not compare rows from different hosts as if they came from one controlled
-run. The 1B host has twice the vCPU count, more RAM, and a different filesystem.
+run. The 100M dense comparator in the 1B table comes from an older ext4 host.
 
 ## Methodology and caveats
 
@@ -110,84 +109,61 @@ already contains documents.
 
 ## Search benchmarks
 
-### 10M collection
+### Data sets: 1M and 10M
 
-The primary search benchmark is a 10M-document collection on ZFS. Each document
-has an 8-token `body`, a `title` from 10,000 values, a 16-dimensional `vec`, and
-a low-cardinality `cat`. The daemon used `NONODB_SEARCH_WORKERS=16` and
-`NONODB_CACHE_TTL=0`.
+Both collections use the same schema: an 8-token `body`, a `title` from 10,000
+values, a 16-dimensional `vec`, and a low-cardinality `cat`. Runs used the
+`NONODB_SEARCH_WORKERS=16` daemon with `NONODB_CACHE_TTL=0` on ZFS.
 
-| Phase | Time | `data.mdb` delta |
-|---|---:|---:|
-| Load 10M documents at 5,000 per batch | 161.0 s, **62,123 docs/s** | +2.57 GB |
-| `cat` index | 17.9 s | +1.33 GB |
-| BM25 `body` index | 106.0 s | +5.97 GB |
-| Fuzzy `title` index | 86.0 s | +3.16 GB |
-| 16D vector index | 10.0 s | +1.36 GB |
-| **Total collection** | — | **≈14.4 GB** |
+| Phase | 1M time | 1M `data.mdb` delta | 10M time | 10M `data.mdb` delta |
+|---|---:|---:|---:|---:|
+| Load documents at 5,000 per batch | **15.8 s**, 63,476 docs/s | +0.25 GB | **161.0 s**, 62,123 docs/s | +2.57 GB |
+| `cat` index | 1.6 s | +0.14 GB | 17.9 s | +1.33 GB |
+| BM25 `body` index | 11.0 s | +0.59 GB | 106.0 s | +5.97 GB |
+| Fuzzy `title` index | 11.0 s | +0.31 GB | 86.0 s | +3.16 GB |
+| 16D vector index | 0.8 s | +0.13 GB | 10.0 s | +1.36 GB |
+| **Total collection** | — | **≈1.42 GB** | — | **≈14.4 GB** |
 
-The database file grew from 187.27 GB to 201.66 GB because it also contains the
-1B dense collection and other benchmark data. The delta above is the incremental
-cost of the 10M collection, not the total database size.
+The deltas are incremental costs. The database file already contains the 1B
+dense collection and other benchmark data.
 
-### BM25 scaling
+### BM25
 
 | Data set | Index build | One term | Two terms | Three terms |
 |---|---:|---:|---:|---:|
-| 1M text docs in a 10M database | 13.8 s | **47–49 ms** | **158 ms** | **270 ms** |
-| 5M text docs (large-posting stress) | 62.9 s | **223–250 ms** | **928 ms** | **1.43 s** |
-| 10M docs on ZFS, 16 workers | 106.0 s | **454 ms** | **2.67 s** | **3.57 s** |
+| 1M docs | 11.0 s | **46.5 ms** | **264 ms** | **354 ms** |
+| 10M docs | 106.0 s | **454 ms** | **2.67 s** | **3.57 s** |
 
-The 1M and 5M rows use ext4; the 10M row uses ZFS and worker parallelism, so the
-rows are not directly comparable. On the 10M collection, an indexed `cat` filter
-takes **1.23 s**. Multi-term queries stream sorted posting lists into a bounded
+Timings use `limit=10`. An indexed `cat` filter takes **85.1 ms** on 1M and
+**1.23 s** on 10M. Multi-term queries stream sorted posting lists into a bounded
 top-K heap instead of materializing every hit.
 
 ### Fuzzy search
 
-| Data set | Index build | Query result |
-|---|---:|---|
-| 100,000 documents | 1.9 s | distance 2 p50 **40 ms** |
-| 200,000 documents | — | distance 1 p50 **57.0 ms**, distance 2 p50 **72.1 ms** |
-| 10M documents on ZFS | 86.0 s | distance 1 p50 **2.21 s**, distance 2 p50 **2.20 s** |
+| Data set | Index build | Distance 1 | Distance 2 |
+|---|---:|---:|---:|
+| 1M docs | 11.0 s | **237.83 ms** | **238.55 ms** |
+| 10M docs | 86.0 s | **2.21 s** | **2.20 s** |
 
-At 10M, the distance-1 and distance-2 queries have nearly the same latency
-because the candidate set, not the final edit-distance check, dominates. Before
-the candidate-merge change, the same queries took about **17.4 s**.
+At both sizes, distance 1 and distance 2 have nearly the same latency because
+the candidate set, not the final edit-distance check, dominates. The 10M result
+is down from about **17.4 s** before the candidate merge change.
 
 ### Exact vector search
 
-#### 1M vectors, 128 dimensions
+Both data sets use 16-dimensional vectors and `limit=10`.
 
-Release daemon, ext4, `NONODB_CACHE_TTL=0`, `NONODB_MAP_SIZE=6GiB`. Each
-document carried one deterministic 128-dimensional vector.
-
-| Operation | Result |
-|---|---|
-| Insert 1M documents with vectors | 99.35 s, **10,066 docs/s** |
-| Vector index backfill | 8.08 s, **123,746 docs/s** |
-| `data.mdb` after documents | 3,935 MiB |
-| `data.mdb` after vector + two secondary indexes | 4,767 MiB |
-| No filter, limit 10 | p50 **298.9 ms**, p95 349.7 ms, p99 376.5 ms |
-| No filter, limit 100 | p50 **306.8 ms**, p95 346.0 ms |
-| Indexed `cat` filter (~10k matches) | p50 **118.5 ms**, p95 157.2 ms |
-| Indexed exact `n` filter (1 match) | p50 **0.82 ms**, p95 1.17 ms |
-| Exact `_id` filter | p50 **0.75 ms**, p95 1.44 ms |
-| Unindexed exact `title` filter (worst case) | **8.88 s** for one query |
-| Daemon RSS after searches | ~5.6 GiB, including mapped LMDB pages |
-
-#### 10M vectors, 16 dimensions
-
-| Operation | p50 | p95 |
+| Operation | 1M p50 / p95 | 10M p50 / p95 |
 |---|---:|---:|
-| No filter, limit 10 | **548.65 ms** | 549.09 ms |
-| Indexed `cat` filter, limit 10 | **735.05 ms** | 746.15 ms |
+| Vector index build | 0.8 s | 10.0 s |
+| No filter | **52.10 / 52.13 ms** | **548.65 / 549.09 ms** |
+| Indexed `cat` filter | **80.81 / 82.06 ms** | **735.05 / 746.15 ms** |
 
 The unfiltered cost is the expected exact scan: every indexed vector is
 compared with the query. Selective `_id` and secondary-index filters use the
 index fast path; an unindexed highly selective filter can approach a full
 collection scan. Approximate indexes such as HNSW/IVF/PQ are not implemented;
-exact vector search is intended for offline or low-QPS use at this scale.
+exact vector search is intended for offline or low-QPS use at these sizes.
 
 ---
 
@@ -236,8 +212,9 @@ Then run the relevant script:
 NONODB_SOCK=$S NONODB_TIMEOUT=1800 \
   python3 scripts/dense_bench.py --docs 1000000000 --batch 20000
 
-# 10M BM25/fuzzy/vector benchmark
-NONODB_SOCK=$S python3 scripts/search_scale_bench.py --docs 10000000
+# 1M and 10M BM25/fuzzy/vector benchmarks
+NONODB_SOCK=$S python3 scripts/search_scale_bench.py --docs 1000000 --collection search1m
+NONODB_SOCK=$S python3 scripts/search_scale_bench.py --docs 10000000 --collection search10m
 
 # Smaller functional checks
 NONODB_SOCK=$S python3 scripts/search_test.py
