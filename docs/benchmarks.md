@@ -14,7 +14,7 @@ filesystem, page cache, and client overhead all affect the result.
 | Run | Host | Filesystem | Daemon |
 |---|---|---|---|
 | 1M / 5M text and 1M vectors | 8 vCPU Haswell, 22.9 GiB RAM | ext4 | release build, 2026-11-11 |
-| 100M search and 1B dense | 16 vCPU Xeon D-2141I, 31 GiB RAM | ZFS mirror, 438 GB | `v0.27.0`, 2026-11-20 |
+| 1B dense | 16 vCPU Xeon D-2141I, 31 GiB RAM | ZFS mirror, 438 GB | `v0.27.0`, 2026-11-20 |
 
 Do not compare rows from different hosts as if they came from one controlled
 run. The 1B host has twice the vCPU count, more RAM, and a different filesystem.
@@ -116,36 +116,10 @@ already contains documents.
 |---|---:|---:|---:|---:|
 | 1M text docs in a 10M database | 13.8 s | **47–49 ms** | **158 ms** | **270 ms** |
 | 5M text docs (large-posting stress) | 62.9 s | **223–250 ms** | **928 ms** | **1.43 s** |
-| 100M docs (100M text docs) | 1,276.5 s | **4.24 s** | **29.91 s** | **40.10 s** |
 
-The 1M and 5M rows use ext4 with a frequent term in roughly 37% of documents.
-The 100M row uses ZFS and a much larger posting list; it is not directly
-comparable with the smaller rows.
-
-The 100M text corpus has 8-token bodies. Its index sizes were:
-
-| Phase | `data.mdb` |
-|---|---:|
-| Load 100M documents | 74.73 GB |
-| Add `cat` index | 87.92 GB |
-| Add BM25 `body` index | 146.65 GB |
-| Add fuzzy `title` index | 177.24 GB |
-| Add 16D vector index | 187.27 GB |
-
-#### 100M BM25: streaming and parallel changes
-
-| Query | Before streaming / parallel | Latest |
-|---|---:|---:|
-| BM25 one term | 9.86 s | **4.24 s** with `NONODB_SEARCH_WORKERS=16` |
-| BM25 two terms | 185.24 s | **29.59 s** |
-| BM25 three terms | 285.88 s | **40.10 s** |
-| BM25 one term + indexed `cat` filter | 1,800 s timeout | **18.28 s** |
-
-Multi-term queries stream sorted posting lists into a bounded top-K heap
-instead of materializing every hit. Single-term queries now split postings
-across worker threads and merge local top-K heaps. The single-term and filtered
-paths still read the whole posting list, so the coordinator's LMDB read remains
-the limit. Multi-term BM25 is still a single-thread streaming merge.
+Both rows use ext4 with a frequent term in roughly 37% of documents. Multi-term
+queries stream sorted posting lists into a bounded top-K heap instead of
+materializing every hit.
 
 ### Fuzzy search
 
@@ -154,12 +128,6 @@ the limit. Multi-term BM25 is still a single-thread streaming merge.
 | 5,000 documents | 0.115 s | p50 **4.83 ms**, p95 8.07 ms |
 | 100,000 documents | 1.9 s | distance 2 p50 **40 ms** |
 | 200,000 documents | — | distance 1 p50 **57.0 ms**, distance 2 p50 **72.1 ms** |
-| 100M documents | 1,101.4 s | distance 1 did **not finish in ~9 minutes** |
-
-Fuzzy search remains experimental at 100M scale. The index build completes, but
-the current candidate-map design creates too many candidates for an interactive
-query. Treat fuzzy search at that scale as unsupported until candidate pruning
-or a different index structure is implemented.
 
 ### Exact vector search
 
@@ -182,15 +150,6 @@ document carried one deterministic 128-dimensional vector.
 | Unindexed exact `title` filter (worst case) | **8.88 s** for one query |
 | Daemon RSS after searches | ~5.6 GiB, including mapped LMDB pages |
 
-#### 100M vectors, 16 dimensions
-
-| Operation | Result |
-|---|---|
-| Vector index build | 138.7 s |
-| No filter, serial scan | 6.67 s |
-| No filter, parallel scan | **4.94–5.34 s** with 8–16 workers |
-| Indexed `cat` filter | 7.15 s serial, 7.35–8.50 s parallel |
-
 The unfiltered cost is the expected exact scan: every indexed vector is
 compared with the query. Selective `_id` and secondary-index filters use the
 index fast path; an unindexed highly selective filter can approach a full
@@ -207,13 +166,11 @@ exact vector search is intended for offline or low-QPS use at this scale.
   fit in RAM.
 - **Raw reads matter.** Returning stored JSON bytes avoids a parse/reserialize
   cycle and is about 3× faster than the projection path on the 1B collection.
-- **BM25 scales with postings.** Streaming helped multi-term queries; worker
-  parallelism helped single-term queries. Multi-term and filtered queries still
-  need WAND or ID-range sharding for larger gains.
-- **Fuzzy search does not scale to 100M yet.** The candidate set, not the index
-  build, is the blocker.
-- **Exact vector search is CPU and I/O bound.** Parallelism gives only a modest
-  gain because the coordinator still reads the whole LMDB index.
+- **BM25 scales with postings.** Streaming multi-term merges avoid materializing
+  every hit. Multi-term and filtered queries still need WAND or ID-range
+  sharding for larger gains.
+- **Exact vector search is CPU and I/O bound.** It scans every indexed vector;
+  selective filters are important, and approximate indexes are not implemented.
 - **RSS is not heap.** Large RSS values after scans mostly reflect mapped LMDB
   pages.
 
