@@ -6,8 +6,6 @@ deliberate limitations are documented in [docs/roadmap.md](docs/roadmap.md).
 
 ## P0 — before public launch
 
-- [ ] Test clean-machine onboarding: anonymous `docker pull`, Docker Compose
-      quickstart, prebuilt binaries, backup/restore, and `kill -9` restart.
 - [ ] Get 3–5 external testers to follow the quickstart without help.
 
 ## P0 — security
