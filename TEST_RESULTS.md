@@ -101,7 +101,6 @@ offline nodes, and the new primary.
 Release daemon, 8 vCPU Haswell, 22 GiB RAM, ext4, cache disabled, 8 GiB map.
 The host had heavy swap use and was not exclusively dedicated, so treat these as
 current-host measurements rather than a comparison with the older baseline.
-Full tables: [docs/benchmarks.md](docs/benchmarks.md#multi-database-performance-run-2026-11-13).
 
 | Workload | Result |
 |---|---|
@@ -146,9 +145,7 @@ indexes reported `multikey_fields=['tags']` / `['uq']` and
 ### Ordered lookup benchmark
 
 Release daemon, `NONODB_CACHE_TTL=0`, 1M documents, unique `email` index with
-`include(name,status)`, 20% missing keys, single UDS client. See
-[docs/benchmarks.md](docs/benchmarks.md#ordered-point-lookups) for the full
-methodology.
+`include(name,status)`, 20% missing keys, single UDS client.
 
 | Workload | p50 | p95 | p99 | Key throughput |
 |---|---:|---:|---:|---:|

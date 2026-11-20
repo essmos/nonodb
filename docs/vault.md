@@ -442,8 +442,7 @@ NONODB_CACHE_TTL=0 NONODB_SOCK=/tmp/nonodb.sock \
   python3 scripts/vault_bench.py --docs 5000 --iters 1000 --payload 256
 ```
 
-See [Benchmarks](benchmarks.md#vault-encryption-overhead) for representative
-results and interpretation.
+Run the command above for representative results on the current host.
 
 ## Best-fit summary
 

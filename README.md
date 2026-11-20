@@ -216,9 +216,7 @@ curl -s --unix-socket /tmp/nonodb.sock \
 Aggregation is intentionally bounded: an intermediate result may contain at
 most 100,000 documents. It never writes to the database and is available inside
 the read-only `batch` operation. See
-[Aggregation](docs/api.md#aggregate) for the full stage list and semantics,
-and [benchmarks](docs/benchmarks.md#aggregation-pipeline) for stage timings and
-optimization notes.
+[Aggregation](docs/api.md#aggregate) for the full stage list and semantics.
 
 ### Document history
 
