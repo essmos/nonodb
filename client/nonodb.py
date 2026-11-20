@@ -801,6 +801,7 @@ class VaultDB:
 
     def __init__(self, db: NonoDB, tenant: str, key_id: str, key: str):
         self._db = db
+        self._timeout = db._timeout
         self.tenant = tenant
         self.key_id = key_id
         self._key = key
@@ -818,8 +819,13 @@ class VaultDB:
             "x-nonodb-key": self._key,
         }
 
-    def exec(self, payload: dict[str, Any]) -> Any:
-        return self._db.exec(payload, headers=self._headers())
+    def exec(
+        self,
+        payload: dict[str, Any],
+        *,
+        timeout: Optional[float] = None,
+    ) -> Any:
+        return self._db.exec(payload, headers=self._headers(), timeout=timeout)
 
     def collection(self, name: str) -> "Collection":
         return Collection(self, name)

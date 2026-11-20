@@ -24,6 +24,8 @@ Full release notes: https://github.com/essmos/nonodb/releases
 
 ### Changed
 
+- Fixed the client-side default index-build timeout for `VaultDB`; vault
+  `create_text_index`/`create_fuzzy_index` now use the wrapped client timeout.
 - `lookup` now serves `_id`-only projections directly from the unique index;
   `fields=["_id"]` and `projection={"_id": 1}` no longer read or parse the
   stored document.
