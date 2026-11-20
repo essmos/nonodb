@@ -136,11 +136,11 @@ cost of the 10M collection, not the total database size.
 |---|---:|---:|---:|---:|
 | 1M text docs in a 10M database | 13.8 s | **47–49 ms** | **158 ms** | **270 ms** |
 | 5M text docs (large-posting stress) | 62.9 s | **223–250 ms** | **928 ms** | **1.43 s** |
-| 10M docs on ZFS, 16 workers | 106.0 s | **425 ms** | **2.85 s** | **3.79 s** |
+| 10M docs on ZFS, 16 workers | 106.0 s | **454 ms** | **2.67 s** | **3.57 s** |
 
 The 1M and 5M rows use ext4; the 10M row uses ZFS and worker parallelism, so the
 rows are not directly comparable. On the 10M collection, an indexed `cat` filter
-takes **1.17 s**. Multi-term queries stream sorted posting lists into a bounded
+takes **1.23 s**. Multi-term queries stream sorted posting lists into a bounded
 top-K heap instead of materializing every hit.
 
 ### Fuzzy search
@@ -149,10 +149,11 @@ top-K heap instead of materializing every hit.
 |---|---:|---|
 | 100,000 documents | 1.9 s | distance 2 p50 **40 ms** |
 | 200,000 documents | — | distance 1 p50 **57.0 ms**, distance 2 p50 **72.1 ms** |
-| 10M documents on ZFS | 86.0 s | distance 1 p50 **17.38 s**, distance 2 p50 **17.41 s** |
+| 10M documents on ZFS | 86.0 s | distance 1 p50 **2.21 s**, distance 2 p50 **2.20 s** |
 
 At 10M, the distance-1 and distance-2 queries have nearly the same latency
-because the candidate set, not the final edit-distance check, dominates.
+because the candidate set, not the final edit-distance check, dominates. Before
+the candidate-merge change, the same queries took about **17.4 s**.
 
 ### Exact vector search
 
@@ -179,8 +180,8 @@ document carried one deterministic 128-dimensional vector.
 
 | Operation | p50 | p95 |
 |---|---:|---:|
-| No filter, limit 10 | **543.46 ms** | 544.49 ms |
-| Indexed `cat` filter, limit 10 | **733.13 ms** | 738.63 ms |
+| No filter, limit 10 | **548.65 ms** | 549.09 ms |
+| Indexed `cat` filter, limit 10 | **735.05 ms** | 746.15 ms |
 
 The unfiltered cost is the expected exact scan: every indexed vector is
 compared with the query. Selective `_id` and secondary-index filters use the

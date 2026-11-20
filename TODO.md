@@ -166,11 +166,12 @@ indexing, and profiling.
   terms, 40.1 s for three), and an exact indexed filter still scans all postings
   to compute document frequency (18.3 s). Block-max WAND and ID-range sharding
   for parallel multi-term search remain the next steps.
-- Fuzzy search is not interactive on 100M documents when the field has large
-  posting lists. The index build completed, but a distance-1 query did not
-  finish within roughly 9 minutes in the current candidate-map design. Treat
-  fuzzy search at this scale as experimental until candidate pruning or a
-  different index structure is implemented.
+- Fuzzy search now merges sorted trigram posting lists directly into a bounded
+  5,000-candidate heap. On 10M documents, distance-1/2 queries take about 2.25 s.
+  At 100M documents the candidate set is still too large: a distance-1 query did
+  not finish within roughly 9 minutes in the previous design. Treat fuzzy search
+  at 100M scale as experimental until candidate pruning or a different index
+  structure is implemented.
 - New index/search resources use a reusable slot pool, so create/drop cycles do
   not consume new LMDB sub-databases. Legacy named sub-databases created by
   older releases cannot be deregistered with the current heed API; a

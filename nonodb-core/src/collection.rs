@@ -74,6 +74,67 @@ impl Ord for RankedId {
     }
 }
 
+/// One fuzzy candidate ranked by shared trigrams.
+#[derive(Debug)]
+struct FuzzyCandidate {
+    id: String,
+    count: u32,
+}
+
+impl PartialEq for FuzzyCandidate {
+    fn eq(&self, other: &Self) -> bool {
+        self.count == other.count && self.id == other.id
+    }
+}
+
+impl Eq for FuzzyCandidate {}
+
+impl PartialOrd for FuzzyCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for FuzzyCandidate {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // The heap root is the worst retained candidate: fewer shared trigrams
+        // first, then the lexicographically larger id.
+        other
+            .count
+            .cmp(&self.count)
+            .then_with(|| self.id.cmp(&other.id))
+    }
+}
+
+/// One live trigram posting cursor for the fuzzy candidate merge.
+struct FuzzyPostingCursor<'txn> {
+    iter: RoPrefix<'txn, Bytes, Bytes>,
+    id: Option<Vec<u8>>,
+}
+
+impl<'txn> FuzzyPostingCursor<'txn> {
+    fn open(rtxn: &'txn RoTxn<'_>, db: &Database<Bytes, Bytes>, prefix: &[u8]) -> Result<Self> {
+        let mut cursor = Self {
+            iter: db.prefix_iter(rtxn, prefix)?,
+            id: None,
+        };
+        cursor.advance()?;
+        Ok(cursor)
+    }
+
+    fn advance(&mut self) -> Result<()> {
+        self.id = None;
+        for item in self.iter.by_ref() {
+            let (key, _) = item?;
+            if let Some(id) = search::parse_posting(key) {
+                self.id = Some(id.as_bytes().to_vec());
+                break;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// One live posting cursor for the streaming multi-term BM25 merge.
 struct TextPostingCursor<'txn> {
     iter: RoPrefix<'txn, Bytes, Bytes>,
@@ -3439,23 +3500,70 @@ impl<'e> Collection<'e> {
             return Ok(Vec::new());
         }
 
-        // Candidates: documents sharing at least one trigram.
-        let mut counts: HashMap<String, u32> = HashMap::new();
+        // Candidates: documents sharing at least one trigram. The trigram
+        // posting lists are already sorted by `_id`; merge them directly and
+        // keep a bounded heap instead of building a multi-million-entry
+        // `HashMap<String, u32>` and sorting it.
+        let mut cursors = Vec::new();
         for gram in search::trigrams(&query) {
             let prefix = search::posting_prefix(&gram);
-            for item in db.prefix_iter(rtxn, prefix.as_slice())? {
-                let (key, _) = item?;
-                if let Some(id) = search::parse_posting(key) {
-                    *counts.entry(id.to_string()).or_insert(0) += 1;
+            cursors.push(FuzzyPostingCursor::open(rtxn, &db, prefix.as_slice())?);
+        }
+
+        const FUZZY_CANDIDATE_LIMIT: usize = 5000;
+        let mut candidate_heap: BinaryHeap<FuzzyCandidate> =
+            BinaryHeap::with_capacity(FUZZY_CANDIDATE_LIMIT + 1);
+        let mut min_id = Vec::new();
+        loop {
+            min_id.clear();
+            for cursor in &cursors {
+                let Some(id) = &cursor.id else {
+                    continue;
+                };
+                if min_id.is_empty() || id.as_slice() < min_id.as_slice() {
+                    min_id.clear();
+                    min_id.extend_from_slice(id);
                 }
             }
+            if min_id.is_empty() {
+                break;
+            }
+
+            let mut count = 0u32;
+            for cursor in &mut cursors {
+                if cursor.id.as_deref() == Some(min_id.as_slice()) {
+                    count += 1;
+                    cursor.advance()?;
+                }
+            }
+
+            if candidate_heap.len() >= FUZZY_CANDIDATE_LIMIT {
+                let worst = candidate_heap
+                    .peek()
+                    .expect("non-empty fuzzy candidate heap");
+                if count < worst.count
+                    || (count == worst.count && min_id.as_slice() > worst.id.as_bytes())
+                {
+                    continue;
+                }
+            }
+            let Ok(id) = std::str::from_utf8(&min_id) else {
+                continue;
+            };
+            candidate_heap.push(FuzzyCandidate {
+                id: id.to_string(),
+                count,
+            });
+            if candidate_heap.len() > FUZZY_CANDIDATE_LIMIT {
+                candidate_heap.pop();
+            }
         }
-        let mut candidates: Vec<(String, u32)> = counts.into_iter().collect();
-        candidates.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        candidates.truncate(5000);
+        let mut candidates = candidate_heap.into_vec();
+        candidates.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.id.cmp(&b.id)));
 
         let mut scored: Vec<(usize, String, Value)> = Vec::new();
-        for (id, _) in candidates {
+        for candidate in candidates {
+            let id = candidate.id;
             let Some(bytes) = self.db.get(rtxn, id.as_bytes())? else {
                 continue;
             };
@@ -10427,6 +10535,26 @@ mod tests {
             .fuzzy_search("name", "aleksander", 1, &serde_json::json!({}), Some(10))
             .unwrap();
         assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn fuzzy_candidate_merge_keeps_exact_match_past_the_candidate_limit() {
+        let (_dir, store) = store();
+        let c = store.collection("fuzzy_many").unwrap();
+        for i in 0..5200 {
+            c.insert_one(json!({
+                "_id": format!("f{i:05}"),
+                "title": format!("w{i:05}")
+            }))
+            .unwrap();
+        }
+        c.create_fuzzy_index("title").unwrap();
+
+        let hits = c
+            .fuzzy_search("title", "w05199", 1, &json!({}), Some(5))
+            .unwrap();
+        assert_eq!(hits[0]["_id"], "f05199");
+        assert_eq!(hits[0]["_distance"], 0);
     }
 
     #[test]

@@ -19,9 +19,13 @@ Full release notes: https://github.com/essmos/nonodb/releases
   heaps. On the 100M-document collection, single-term BM25 dropped from 9.9 s
   to 4.2-4.4 s and exact 16D vector search from 6.7 s to 4.9-5.3 s. Multi-term
   BM25 remains on the streaming single-thread merge path.
+- Fuzzy candidate selection now merges sorted trigram posting lists directly
+  into a bounded 5,000-candidate heap instead of building a multi-million-entry
+  `HashMap<String, u32>` and sorting every candidate. On the 10M-document
+  collection, distance-1/2 queries dropped from about 17.4 s to about 2.2 s.
 - Added `scripts/search_scale_bench.py` and a 10M-document search benchmark.
-  On the 10M collection, BM25 takes 425 ms for one term and 3.79 s for three;
-  exact 16D vector search takes 543 ms; fuzzy distance 1/2 takes about 17.4 s.
+  On the 10M collection, BM25 takes 454 ms for one term and 3.57 s for three;
+  exact 16D vector search takes 549 ms; fuzzy distance 1/2 takes about 2.2 s.
 
 ## v0.27.0 - 2026-11-20
 
