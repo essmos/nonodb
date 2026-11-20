@@ -1028,10 +1028,126 @@ also verifies that `full` and explicitly `sync`ed writes survive `SIGKILL`, that
 `unsafe` is rejected without opt-in, and that it works with
 `NONODB_ALLOW_UNSAFE_WRITES=1`.
 
+## Large-scale validation: 10M, 100M, and 1B
+
+These runs come from a second, larger host and are not a controlled comparison
+with the 8-vCPU ext4 baseline above. They are included because they exercise
+collection sizes that do not fit on the original benchmark machine.
+
+| Component | Value |
+|---|---|
+| Date | 2026-11-19 to 2026-11-20 (UTC) |
+| OS / kernel | Debian 13, Linux 7.0.14-29-pve |
+| CPU | 16 vCPU on a shared Proxmox host |
+| RAM | 31 GiB |
+| Data filesystem | 10M/100M: ext4 root disk; 1B: ZFS `data/zd0` |
+| ZFS pool size | 438 GB |
+| Daemon builds | GitHub Release `v0.26.1` (10M/100M) and `v0.27.0` (1B) |
+| Clients | Python on the same host over a Unix socket |
+| 1B map size / timeout | `NONODB_MAP_SIZE=96GiB`, `NONODB_REQUEST_TIMEOUT=1800` |
+
+The 1B data set uses minimal documents (`_id` plus `n`) and no secondary
+indexes. It measures ingest, scan, count, and `_id` lookup behavior, not document
+payload throughput or index build time.
+
+### Full documents: 10M on ext4 (`v0.26.1`)
+
+Documents were roughly 150 bytes with three secondary indexes (`grp`, `age`,
+`score`), on the 20 GB ext4 root disk.
+
+| Metric | Result |
+|---|---|
+| Load 10M | **96.5 s**, 103,655 docs/s |
+| `data.mdb` before indexes | 2,421 MB |
+| `data.mdb` after three indexes | 6,404 MB |
+| `data.mdb` after update/delete workload | 6,555 MB |
+| Backfill three indexes | **53.3 s** |
+
+Query latency, end-to-end through Python and the Unix socket:
+
+| Query | p50 | p95 |
+|---|---:|---:|
+| `find_one` by `_id` | **0.56 ms** | 0.68 ms |
+| `find(grp=x)` via index | **0.71 ms** | — |
+| `count({})` | **0.52 ms** | — |
+| `find(grp=x, sort age, limit 10)` | **29.26 ms** | — |
+| `find(name=..., limit 1)`, unindexed | **235.61 ms** | 879.22 ms |
+
+Mixed workload with 16 client processes from `scripts/bench.py`:
+
+| Operation | Throughput |
+|---|---:|
+| Writes | **4,518 ops/s** |
+| Reads | **12,000 ops/s** |
+
+### Dense documents: 100M and 1B (`v0.26.1` / `v0.27.0`)
+
+Documents contain only `_id` and `n = i % 1000`. There are no secondary
+indexes. The 100M run used ext4 and `v0.26.1`; the 1B run used ZFS and
+`v0.27.0`.
+
+| Metric | 100M (ext4) | 1B (ZFS) |
+|---|---:|---:|
+| Load time | 472 s | **5,553.6 s** (1 h 32 min 34 s) |
+| Load throughput | **211,845 docs/s** | **180,064 docs/s** |
+| `data.mdb` after load | 4.6 GB | **46 GB** |
+| Daemon RSS after load | 4.8 GB | **13.7 GB** |
+| `count({})` | 0.001 s | **0.002 s** |
+| Full scan `count({"n": 0})` | 52.9 s | **625.6 s** |
+| Scan throughput | ~1.89M docs/s | **~1.60M docs/s** |
+| Matches returned by that scan | 100,000 | 1,000,000 |
+| `find_one` by `_id` p50 / p95 / p99 | 0.54 / 0.58 / 0.96 ms | **0.87 / 1.27 / 1.50 ms** |
+| 1,000 `_id` reads in batches of 100 | **56,900 ops/s** | **55,414 ops/s** |
+| 16 processes × 10,000 `_id` reads | 12,097 ops/s | **9,057 ops/s** |
+| Parallel read p50 / p95 / p99 | 1.18 / 2.06 / 2.57 ms | **1.63 / 2.72 / 3.33 ms** |
+
+The 1B daemon used 13.7 GB RSS and about 103 GB virtual size after the run; the
+virtual size mostly reflects the 96 GiB LMDB map. The 1B scan reads 46 GB, more
+than RAM, so it is not fully page-cache resident; the 100M scan is. The 15%
+lower scan throughput reflects both the larger data set and ZFS/disk reads, not
+just the record count.
+
+### `v0.27.0` raw read path on 1B
+
+The 1B collection was also used to compare the new raw JSON `find` path with
+the normal projection path. Each iteration used a unique `comment` value so the
+daemon read cache did not turn repeated calls into cache hits. Values are 30
+iterations, end-to-end through Python and the Unix socket.
+
+| Operation | p50 | p95 |
+|---|---:|---:|
+| `find({}, limit=10000)` — raw JSON path | **7.13 ms** | 9.66 ms |
+| `find({}, projection={_id: 1}, limit=10000)` | 21.85 ms | 31.22 ms |
+| `find({"n": 0}, limit=10)` — filtered, no index | **5.47 ms** | 5.59 ms |
+
+The raw path returns the full minimal document and is still about **3× faster**
+than the projection path, which parses every document and emits only `_id`.
+The filtered query stops after the first ten matches, so it is not a full-scan
+measurement.
+
+Reproduce the dense load and reads with `scripts/dense_bench.py`:
+
+```bash
+NONODB_DATA=/var/lib/nonodb-1b/data \
+  NONODB_SOCK=/var/lib/nonodb-1b/nonodb.sock \
+  NONODB_MAP_SIZE=96GiB NONODB_REQUEST_TIMEOUT=1800 \
+  ./target/release/nonodb-daemon &
+
+NONODB_SOCK=/var/lib/nonodb-1b/nonodb.sock NONODB_TIMEOUT=1800 \
+  python3 scripts/dense_bench.py --docs 1000000000 --batch 20000
+```
+
+Use a fresh data directory. The script clears the target collection if it
+already contains documents.
+
 ## Interpreting the results
 
 - **Indexed point/range reads scale.** 0.5–1.5 ms from 1M to 10M for the tested
-  workload.
+  workload. On the 1B dense collection, `_id` reads stayed at 0.87 ms p50 and
+  1.50 ms p99, while `count({})` remained O(1) at 0.002 s.
+- **Raw reads matter on large scans.** Returning stored JSON bytes avoided a
+  parse/reserialize cycle and made a 10,000-document read about 3× faster than
+  the projection path on the 1B collection.
 - **Batches are the biggest client-side win.** One thousand `find_one` calls
   drop from hundreds of milliseconds to about 20 ms.
 - **Writes are bounded by durability.** One writer plus `fsync` gives ~3.2–3.9k

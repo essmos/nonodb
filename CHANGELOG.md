@@ -4,6 +4,10 @@ Full release notes: https://github.com/essmos/nonodb/releases
 
 ## Unreleased
 
+- Documented 10M, 100M, and 1B benchmark results, including the v0.27.0 raw
+  `find` path on a 1B-document collection, and added `scripts/dense_bench.py`
+  for reproducing the dense-document runs.
+
 ## v0.27.0 - 2026-11-20
 
 ### Highlights
