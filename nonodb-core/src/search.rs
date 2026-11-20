@@ -141,6 +141,12 @@ pub fn text_db_name(coll: &str, index: &str, field: &str) -> String {
 pub fn text_len_db_name(coll: &str, index: &str, field: &str) -> String {
     format!("ftl:{coll}:{index}:{field}")
 }
+pub fn text_df_db_name(coll: &str, index: &str, field: &str) -> String {
+    format!("ftdf:{coll}:{index}:{field}")
+}
+pub fn text_df_ready_key(coll: &str, index: &str, field: &str) -> String {
+    format!("ftdfready:{coll}:{index}:{field}")
+}
 pub fn fuzzy_db_name(coll: &str, index: &str, field: &str) -> String {
     format!("fz:{coll}:{index}:{field}")
 }

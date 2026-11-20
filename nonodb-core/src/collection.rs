@@ -664,6 +664,7 @@ impl<'e> Collection<'e> {
                         for resource in [
                             search::text_db_name(&self.name, &def.name, &field.path),
                             search::text_len_db_name(&self.name, &def.name, &field.path),
+                            search::text_df_db_name(&self.name, &def.name, &field.path),
                         ] {
                             if let Some(bytes) =
                                 self.resource_db_bytes(txn, &resource, &resource)?
@@ -2041,6 +2042,26 @@ impl<'e> Collection<'e> {
         self.resource_db_in(wtxn, &name, &name)
     }
 
+    fn text_df_db(
+        &self,
+        txn: &RoTxn<'_>,
+        index: &str,
+        field: &str,
+    ) -> Result<Option<Database<Bytes, Bytes>>> {
+        let name = search::text_df_db_name(&self.name, index, field);
+        self.resource_db(txn, &name, &name)
+    }
+
+    fn text_df_db_in(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        index: &str,
+        field: &str,
+    ) -> Result<Database<Bytes, Bytes>> {
+        let name = search::text_df_db_name(&self.name, index, field);
+        self.resource_db_in(wtxn, &name, &name)
+    }
+
     fn fuzzy_db(
         &self,
         txn: &RoTxn<'_>,
@@ -2563,8 +2584,10 @@ impl<'e> Collection<'e> {
         for field in &def.fields {
             let postings = self.text_postings_in(wtxn, &def.name, &field.path)?;
             let lens = self.text_len_db_in(wtxn, &def.name, &field.path)?;
+            let df = self.text_df_db_in(wtxn, &def.name, &field.path)?;
             postings.clear(&mut *wtxn)?;
             lens.clear(&mut *wtxn)?;
+            df.clear(&mut *wtxn)?;
             totals.insert(field.path.clone(), 0);
         }
         let index_name = def.name.clone();
@@ -2593,6 +2616,7 @@ impl<'e> Collection<'e> {
                 Ok(out)
             },
             |wtxn, entries| {
+                let mut batch_df: HashMap<(String, String), u64> = HashMap::new();
                 for (id, field, tf, dl) in entries {
                     let postings = self.text_postings_in(wtxn, &index_name, &field)?;
                     let lens = self.text_len_db_in(wtxn, &index_name, &field)?;
@@ -2602,12 +2626,22 @@ impl<'e> Collection<'e> {
                         .and_modify(|total| *total = total.saturating_add(u64::from(dl)))
                         .or_insert(u64::from(dl));
                     for (term, freq) in tf {
+                        *batch_df.entry((field.clone(), term.clone())).or_insert(0) += 1;
                         postings.put(
                             &mut *wtxn,
                             search::postings_key(&term, &id).as_slice(),
                             &search::text_posting_value(freq, dl),
                         )?;
                     }
+                }
+                for ((field, term), delta) in batch_df {
+                    let df = self.text_df_db_in(wtxn, &index_name, &field)?;
+                    let count = df
+                        .get(&*wtxn, term.as_bytes())?
+                        .and_then(search::read_u64)
+                        .unwrap_or(0)
+                        .saturating_add(delta);
+                    df.put(&mut *wtxn, term.as_bytes(), &count.to_le_bytes())?;
                 }
                 Ok(())
             },
@@ -2617,6 +2651,11 @@ impl<'e> Collection<'e> {
                 &mut *wtxn,
                 search::text_total_key(&self.name, &def.name, &field).as_bytes(),
                 &total.to_le_bytes(),
+            )?;
+            self.meta.put(
+                &mut *wtxn,
+                search::text_df_ready_key(&self.name, &def.name, &field).as_bytes(),
+                &[1],
             )?;
         }
         Ok(())
@@ -2745,9 +2784,15 @@ impl<'e> Collection<'e> {
                     self.drop_resource_db(wtxn, &postings, &postings)?;
                     let lens = search::text_len_db_name(&self.name, &def.name, &field.path);
                     self.drop_resource_db(wtxn, &lens, &lens)?;
+                    let df = search::text_df_db_name(&self.name, &def.name, &field.path);
+                    self.drop_resource_db(wtxn, &df, &df)?;
                     self.meta.delete(
                         &mut *wtxn,
                         search::text_total_key(&self.name, &def.name, &field.path).as_bytes(),
+                    )?;
+                    self.meta.delete(
+                        &mut *wtxn,
+                        search::text_df_ready_key(&self.name, &def.name, &field.path).as_bytes(),
                     )?;
                 }
                 SearchKind::Fuzzy => {
@@ -2794,24 +2839,57 @@ impl<'e> Collection<'e> {
                 let new_tokens = new_text.as_ref().map(|t| search::tokenize(t));
                 let old_len = old_tokens.as_ref().map(|t| t.len() as u64).unwrap_or(0);
                 let new_len = new_tokens.as_ref().map(|t| t.len() as u64).unwrap_or(0);
+                let old_freqs = old_tokens
+                    .as_ref()
+                    .map(|tokens| search::term_freqs(tokens))
+                    .unwrap_or_default();
+                let new_freqs = new_tokens
+                    .as_ref()
+                    .map(|tokens| search::term_freqs(tokens))
+                    .unwrap_or_default();
 
-                if let Some(tokens) = &old_tokens {
-                    for term in search::term_freqs(tokens).into_keys() {
-                        postings.delete(&mut *wtxn, search::postings_key(&term, id).as_slice())?;
-                    }
+                for term in old_freqs.keys() {
+                    postings.delete(&mut *wtxn, search::postings_key(term, id).as_slice())?;
                 }
-                if let Some(tokens) = &new_tokens {
+                if new_tokens.is_some() {
                     let dl = new_len as u32;
-                    for (term, tf) in search::term_freqs(tokens) {
+                    for (term, tf) in &new_freqs {
                         postings.put(
                             &mut *wtxn,
-                            search::postings_key(&term, id).as_slice(),
-                            &search::text_posting_value(tf, dl),
+                            search::postings_key(term, id).as_slice(),
+                            &search::text_posting_value(*tf, dl),
                         )?;
                     }
                     lens.put(&mut *wtxn, id.as_bytes(), &dl.to_le_bytes())?;
                 } else {
                     lens.delete(&mut *wtxn, id.as_bytes())?;
+                }
+
+                let df_ready_key = search::text_df_ready_key(&self.name, &def.name, &field.path);
+                if self.meta.get(&*wtxn, df_ready_key.as_bytes())?.is_some() {
+                    let mut df_deltas: HashMap<&str, i64> = HashMap::new();
+                    for term in old_freqs.keys() {
+                        *df_deltas.entry(term.as_str()).or_insert(0) -= 1;
+                    }
+                    for term in new_freqs.keys() {
+                        *df_deltas.entry(term.as_str()).or_insert(0) += 1;
+                    }
+                    let df = self.text_df_db_in(wtxn, &def.name, &field.path)?;
+                    for (term, delta) in df_deltas {
+                        if delta == 0 {
+                            continue;
+                        }
+                        let count = df
+                            .get(&*wtxn, term.as_bytes())?
+                            .and_then(search::read_u64)
+                            .unwrap_or(0);
+                        let count = if delta > 0 {
+                            count.saturating_add(delta as u64)
+                        } else {
+                            count.saturating_sub((-delta) as u64)
+                        };
+                        df.put(&mut *wtxn, term.as_bytes(), &count.to_le_bytes())?;
+                    }
                 }
 
                 total = total.saturating_sub(old_len) + new_len;
@@ -2973,6 +3051,18 @@ impl<'e> Collection<'e> {
             if n_docs == 0.0 {
                 return Ok(Vec::new());
             }
+            let df_ready = self
+                .meta
+                .get(
+                    rtxn,
+                    search::text_df_ready_key(&self.name, &def.name, &field.path).as_bytes(),
+                )?
+                .is_some();
+            let df_db = if df_ready {
+                self.text_df_db(rtxn, &def.name, &field.path)?
+            } else {
+                None
+            };
             let total = self
                 .meta
                 .get(
@@ -3064,13 +3154,21 @@ impl<'e> Collection<'e> {
             let mut cursors = Vec::with_capacity(parsed.positive_terms.len());
             for term in &parsed.positive_terms {
                 let prefix = search::posting_prefix(term);
-                let mut df = 0u64;
-                for item in postings.prefix_iter(rtxn, prefix.as_slice())? {
-                    let (key, _) = item?;
-                    if search::parse_posting(key).is_some() {
-                        df += 1;
+                let df = if let Some(df_db) = df_db.as_ref() {
+                    df_db
+                        .get(rtxn, term.as_bytes())?
+                        .and_then(search::read_u64)
+                        .unwrap_or(0)
+                } else {
+                    let mut df = 0u64;
+                    for item in postings.prefix_iter(rtxn, prefix.as_slice())? {
+                        let (key, _) = item?;
+                        if search::parse_posting(key).is_some() {
+                            df += 1;
+                        }
                     }
-                }
+                    df
+                };
                 let iter = postings.prefix_iter(rtxn, prefix.as_slice())?;
                 let mut cursor = TextPostingCursor {
                     iter,
@@ -10339,6 +10437,45 @@ mod tests {
         assert!(c
             .search("title", "rust", &serde_json::json!({}), 0, None)
             .is_err());
+    }
+
+    #[test]
+    fn text_df_metadata_tracks_inserts_and_updates() {
+        let (_dir, store) = store();
+        let c = store.collection("text_df").unwrap();
+        c.insert_one(json!({"_id": "a", "body": "alpha beta"}))
+            .unwrap();
+        c.insert_one(json!({"_id": "b", "body": "alpha gamma"}))
+            .unwrap();
+        c.create_text_index("body").unwrap();
+
+        let rtxn = c.read_txn().unwrap();
+        let df = c.text_df_db(&rtxn, "body", "body").unwrap().unwrap();
+        assert_eq!(
+            df.get(&rtxn, b"alpha".as_slice())
+                .unwrap()
+                .and_then(search::read_u64),
+            Some(2)
+        );
+        drop(rtxn);
+
+        c.insert_one(json!({"_id": "c", "body": "alpha delta"}))
+            .unwrap();
+        c.update(
+            &json!({"_id": "b"}),
+            &json!({"$set": {"body": "beta"}}),
+            false,
+        )
+        .unwrap();
+
+        let rtxn = c.read_txn().unwrap();
+        let df = c.text_df_db(&rtxn, "body", "body").unwrap().unwrap();
+        assert_eq!(
+            df.get(&rtxn, b"alpha".as_slice())
+                .unwrap()
+                .and_then(search::read_u64),
+            Some(2)
+        );
     }
 
     #[test]

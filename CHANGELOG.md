@@ -24,9 +24,10 @@ Full release notes: https://github.com/essmos/nonodb/releases
   `HashMap<String, u32>` and sorting every candidate. On the 10M-document
   collection, distance-1/2 queries dropped from about 17.4 s to about 2.2 s.
 - Multi-term BM25 merge now reuses ID buffers and allocates a result `String`
-  only when a document can enter the bounded top-K heap. On the 10M collection,
-  two-term queries dropped from 2.67 s to 1.78 s and three-term queries from
-  3.57 s to 2.64 s.
+  only when a document can enter the bounded top-K heap. New text indexes also
+  store per-term document frequency, removing the extra posting-list scan used
+  to compute `df`. On the 10M collection, two-term queries dropped from 2.67 s
+  to 1.19 s and three-term queries from 3.57 s to 1.78 s.
 - Added `scripts/search_scale_bench.py` and matching 1M/10M search benchmarks.
   On 1M, BM25 takes 46.5 ms for one term and 354 ms for three, exact 16D vector
   search takes 52.1 ms, and fuzzy distance 1/2 takes about 238 ms. On 10M the
