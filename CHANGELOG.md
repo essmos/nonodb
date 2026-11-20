@@ -19,6 +19,9 @@ Full release notes: https://github.com/essmos/nonodb/releases
   heaps. On the 100M-document collection, single-term BM25 dropped from 9.9 s
   to 4.2-4.4 s and exact 16D vector search from 6.7 s to 4.9-5.3 s. Multi-term
   BM25 remains on the streaming single-thread merge path.
+- Added `scripts/search_scale_bench.py` and a 10M-document search benchmark.
+  On the 10M collection, BM25 takes 425 ms for one term and 3.79 s for three;
+  exact 16D vector search takes 543 ms; fuzzy distance 1/2 takes about 17.4 s.
 
 ## v0.27.0 - 2026-11-20
 
