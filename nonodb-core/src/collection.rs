@@ -140,40 +140,35 @@ struct TextPostingCursor<'txn> {
     iter: RoPrefix<'txn, Bytes, Bytes>,
     weight: f64,
     idf: f64,
-    current: Option<TextPosting>,
-}
-
-struct TextPosting {
-    id: String,
+    id: Vec<u8>,
     tf: f64,
     dl: f64,
+    active: bool,
 }
 
-fn next_text_posting<'txn>(
-    iter: &mut RoPrefix<'txn, Bytes, Bytes>,
-    lens: &Database<Bytes, Bytes>,
-    rtxn: &RoTxn<'txn>,
-) -> Result<Option<TextPosting>> {
-    for item in iter.by_ref() {
-        let (key, value) = item?;
-        let Some(id) = search::parse_posting(key) else {
-            continue;
-        };
-        let tf = search::text_posting_tf(value).unwrap_or(1) as f64;
-        let dl = match search::text_posting_dl(value) {
-            Some(dl) => dl as f64,
-            None => lens
-                .get(rtxn, id.as_bytes())?
-                .and_then(search::read_u32)
-                .unwrap_or(0) as f64,
-        };
-        return Ok(Some(TextPosting {
-            id: id.to_string(),
-            tf,
-            dl,
-        }));
+impl<'txn> TextPostingCursor<'txn> {
+    fn advance(&mut self, lens: &Database<Bytes, Bytes>, rtxn: &RoTxn<'txn>) -> Result<()> {
+        self.active = false;
+        for item in self.iter.by_ref() {
+            let (key, value) = item?;
+            let Some(id) = search::parse_posting(key) else {
+                continue;
+            };
+            self.id.clear();
+            self.id.extend_from_slice(id.as_bytes());
+            self.tf = search::text_posting_tf(value).unwrap_or(1) as f64;
+            self.dl = match search::text_posting_dl(value) {
+                Some(dl) => dl as f64,
+                None => lens
+                    .get(rtxn, id.as_bytes())?
+                    .and_then(search::read_u32)
+                    .unwrap_or(0) as f64,
+            };
+            self.active = true;
+            break;
+        }
+        Ok(())
     }
-    Ok(None)
 }
 
 /// Maximum number of keys accepted by one `lookup` request.
@@ -3076,44 +3071,67 @@ impl<'e> Collection<'e> {
                         df += 1;
                     }
                 }
-                let mut iter = postings.prefix_iter(rtxn, prefix.as_slice())?;
-                let current = next_text_posting(&mut iter, &lens, rtxn)?;
-                cursors.push(TextPostingCursor {
+                let iter = postings.prefix_iter(rtxn, prefix.as_slice())?;
+                let mut cursor = TextPostingCursor {
                     iter,
                     weight,
                     idf: search::idf(n_docs, df as f64),
-                    current,
-                });
+                    id: Vec::new(),
+                    tf: 0.0,
+                    dl: 0.0,
+                    active: false,
+                };
+                cursor.advance(&lens, rtxn)?;
+                cursors.push(cursor);
             }
 
-            let mut top = BinaryHeap::with_capacity(want.min(1024).saturating_add(1));
+            let mut top: BinaryHeap<RankedId> =
+                BinaryHeap::with_capacity(want.min(1024).saturating_add(1));
+            let mut min_id = Vec::new();
             loop {
-                let next_id = cursors
-                    .iter()
-                    .filter_map(|cursor| cursor.current.as_ref().map(|posting| posting.id.as_str()))
-                    .min()
-                    .map(str::to_string);
-                let Some(id) = next_id else {
-                    break;
-                };
-                let mut score = 0.0;
-                for cursor in &mut cursors {
-                    if cursor
-                        .current
-                        .as_ref()
-                        .is_some_and(|posting| posting.id == id)
+                min_id.clear();
+                for cursor in &cursors {
+                    if cursor.active
+                        && (min_id.is_empty() || cursor.id.as_slice() < min_id.as_slice())
                     {
-                        let posting = cursor.current.take().expect("matched posting");
-                        score += cursor.weight
-                            * search::bm25_term(posting.tf, posting.dl, avgdl, cursor.idf);
-                        cursor.current = next_text_posting(&mut cursor.iter, &lens, rtxn)?;
+                        min_id.clear();
+                        min_id.extend_from_slice(&cursor.id);
                     }
                 }
-                if filter_set.is_none_or(|ids| ids.contains(&id)) {
-                    top.push(RankedId { id, score });
-                    if top.len() > want {
-                        top.pop();
+                if min_id.is_empty() {
+                    break;
+                }
+                let mut score = 0.0;
+                for cursor in &mut cursors {
+                    if cursor.active && cursor.id.as_slice() == min_id.as_slice() {
+                        score += cursor.weight
+                            * search::bm25_term(cursor.tf, cursor.dl, avgdl, cursor.idf);
+                        cursor.advance(&lens, rtxn)?;
                     }
+                }
+                let matches_filter = filter_set.is_none_or(|ids| {
+                    std::str::from_utf8(&min_id).is_ok_and(|id| ids.contains(id))
+                });
+                if !matches_filter {
+                    continue;
+                }
+                if top.len() >= want {
+                    let worst = top.peek().expect("non-empty text heap");
+                    if score < worst.score
+                        || (score == worst.score && min_id.as_slice() > worst.id.as_bytes())
+                    {
+                        continue;
+                    }
+                }
+                let Ok(id) = std::str::from_utf8(&min_id) else {
+                    continue;
+                };
+                top.push(RankedId {
+                    id: id.to_string(),
+                    score,
+                });
+                if top.len() > want {
+                    top.pop();
                 }
             }
             return emit_top(top, 1.0);

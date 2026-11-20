@@ -131,19 +131,19 @@ dense collection and other benchmark data.
 
 | Data set | Index build | One term | Two terms | Three terms |
 |---|---:|---:|---:|---:|
-| 1M docs | 11.0 s | **46.5 ms** | **264 ms** | **354 ms** |
-| 10M docs | 106.0 s | **454 ms** | **2.67 s** | **3.57 s** |
+| 1M docs | 11.0 s | **44.4 ms** | **175 ms** | **260 ms** |
+| 10M docs | 106.0 s | **436 ms** | **1.78 s** | **2.64 s** |
 
-Timings use `limit=10`. An indexed `cat` filter takes **85.1 ms** on 1M and
+Timings use `limit=10`. An indexed `cat` filter takes **82.8 ms** on 1M and
 **1.23 s** on 10M. Multi-term queries stream sorted posting lists into a bounded
-top-K heap instead of materializing every hit.
+top-K heap and reuse ID buffers instead of materializing every hit as a `String`.
 
 ### Fuzzy search
 
 | Data set | Index build | Distance 1 | Distance 2 |
 |---|---:|---:|---:|
-| 1M docs | 11.0 s | **237.83 ms** | **238.55 ms** |
-| 10M docs | 86.0 s | **2.21 s** | **2.20 s** |
+| 1M docs | 11.0 s | **235.88 ms** | **238.41 ms** |
+| 10M docs | 86.0 s | **2.17 s** | **2.17 s** |
 
 At both sizes, distance 1 and distance 2 have nearly the same latency because
 the candidate set, not the final edit-distance check, dominates. The 10M result
@@ -156,8 +156,8 @@ Both data sets use 16-dimensional vectors and `limit=10`.
 | Operation | 1M p50 / p95 | 10M p50 / p95 |
 |---|---:|---:|
 | Vector index build | 0.8 s | 10.0 s |
-| No filter | **52.10 / 52.13 ms** | **548.65 / 549.09 ms** |
-| Indexed `cat` filter | **80.81 / 82.06 ms** | **735.05 / 746.15 ms** |
+| No filter | **51.52 / 51.52 ms** | **526.19 / 526.19 ms** |
+| Indexed `cat` filter | **80.94 / 80.94 ms** | **746.95 / 746.95 ms** |
 
 The unfiltered cost is the expected exact scan: every indexed vector is
 compared with the query. Selective `_id` and secondary-index filters use the
