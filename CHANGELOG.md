@@ -7,6 +7,13 @@ Full release notes: https://github.com/essmos/nonodb/releases
 - Documented 10M, 100M, and 1B benchmark results, including the v0.27.0 raw
   `find` path on a 1B-document collection, and added `scripts/dense_bench.py`
   for reproducing the dense-document runs.
+- BM25 multi-term queries now merge sorted posting-list cursors directly into
+  the bounded top-K heap instead of materializing every hit as a `String`. On
+  the 100M-document benchmark, two-term queries dropped from 185 s to 29.6 s and
+  three-term queries from 286 s to 40.1 s.
+- Text search with an exact equality filter now uses a usable secondary index as
+  a prefilter before scoring. On the same 100M-document collection, a filtered
+  BM25 query that previously timed out at 1800 s completed in 19.4 s.
 
 ## v0.27.0 - 2026-11-20
 

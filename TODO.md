@@ -159,11 +159,16 @@ indexing, and profiling.
 
 ## Known issues and caveats
 
-- BM25 single-term queries still walk every matching posting. Block-max WAND
-  was evaluated at 5M text documents; it is deferred because direct top-K and
-  sorted-list merging keep one/two-term queries below 1 s and three-term queries
-  around 1.4 s. Revisit WAND if multi-term p50 exceeds roughly 2 s or posting
-  lists grow beyond the current stress case.
+- BM25 multi-term and exact-filter queries now stream over posting lists, but
+  single-term queries still walk every matching posting. On a 100M-document
+  corpus, one term takes about 9.9 s, two terms 29.6 s, and three terms 40.1 s;
+  an exact indexed filter takes 19.4 s. Block-max WAND remains the next step for
+  single-term and top-K skipping at this scale.
+- Fuzzy search is not interactive on 100M documents when the field has large
+  posting lists. The index build completed, but a distance-1 query did not
+  finish within roughly 9 minutes in the current candidate-map design. Treat
+  fuzzy search at this scale as experimental until candidate pruning or a
+  different index structure is implemented.
 - New index/search resources use a reusable slot pool, so create/drop cycles do
   not consume new LMDB sub-databases. Legacy named sub-databases created by
   older releases cannot be deregistered with the current heed API; a

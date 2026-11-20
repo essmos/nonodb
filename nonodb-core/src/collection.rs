@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use heed::types::Bytes;
-use heed::{Database, Env, RoTxn, RwTxn};
+use heed::{Database, Env, RoPrefix, RoTxn, RwTxn};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -37,6 +37,9 @@ use crate::verify::{CollectionVerification, IndexVerification};
 const DB_SLOT_META_PREFIX: &str = "\u{1}dbslot:";
 /// Reserve some LMDB sub-database slots for collections and fixed databases.
 const MAX_DB_SLOTS: u32 = crate::store::MAX_DBS - 64;
+
+/// Maximum number of indexed `_id`s used to prefilter a text search.
+const SEARCH_FILTER_CANDIDATE_LIMIT: usize = 10_000_000;
 
 /// One scored document id for the bounded top-K heap used by text search.
 #[derive(Debug)]
@@ -69,6 +72,47 @@ impl Ord for RankedId {
             .unwrap_or(Ordering::Equal)
             .then_with(|| self.id.cmp(&other.id))
     }
+}
+
+/// One live posting cursor for the streaming multi-term BM25 merge.
+struct TextPostingCursor<'txn> {
+    iter: RoPrefix<'txn, Bytes, Bytes>,
+    weight: f64,
+    idf: f64,
+    current: Option<TextPosting>,
+}
+
+struct TextPosting {
+    id: String,
+    tf: f64,
+    dl: f64,
+}
+
+fn next_text_posting<'txn>(
+    iter: &mut RoPrefix<'txn, Bytes, Bytes>,
+    lens: &Database<Bytes, Bytes>,
+    rtxn: &RoTxn<'txn>,
+) -> Result<Option<TextPosting>> {
+    for item in iter.by_ref() {
+        let (key, value) = item?;
+        let Some(id) = search::parse_posting(key) else {
+            continue;
+        };
+        let tf = search::text_posting_tf(value).unwrap_or(1) as f64;
+        let dl = match search::text_posting_dl(value) {
+            Some(dl) => dl as f64,
+            None => lens
+                .get(rtxn, id.as_bytes())?
+                .and_then(search::read_u32)
+                .unwrap_or(0) as f64,
+        };
+        return Ok(Some(TextPosting {
+            id: id.to_string(),
+            tf,
+            dl,
+        }));
+    }
+    Ok(None)
 }
 
 /// Maximum number of keys accepted by one `lookup` request.
@@ -1697,6 +1741,54 @@ impl<'e> Collection<'e> {
         Ok(Some(self.index_plan_candidates(rtxn, &plan, max)?))
     }
 
+    /// Candidate ids for a filter that is exactly covered by one index equality.
+    ///
+    /// This is used as a prefilter for text search. It deliberately returns
+    /// `None` for ranges, compound conditions, and multikey indexes: those
+    /// candidates are only a superset and still need the residual matcher.
+    fn exact_filter_index_candidates(
+        &self,
+        rtxn: &RoTxn<'_>,
+        filter: &Value,
+    ) -> Result<Option<HashSet<String>>> {
+        if filter.as_object().is_none_or(|object| object.is_empty()) {
+            return Ok(None);
+        }
+        if let Some(id) = direct_id(filter) {
+            let mut ids = HashSet::new();
+            ids.insert(id);
+            return Ok(Some(ids));
+        }
+        let Some(object) = filter.as_object() else {
+            return Ok(None);
+        };
+        if object.len() != 1 {
+            return Ok(None);
+        }
+        let Some((_field, condition)) = object.iter().next() else {
+            return Ok(None);
+        };
+        let exact_equality = match condition {
+            Value::Object(operators) => operators.len() == 1 && operators.contains_key("$eq"),
+            _ => true,
+        };
+        if !exact_equality {
+            return Ok(None);
+        }
+        let Some(plan) = self.index_plan(rtxn, filter)? else {
+            return Ok(None);
+        };
+        if plan.def.is_multikey() {
+            return Ok(None);
+        }
+        let ids =
+            self.index_plan_candidates(rtxn, &plan, Some(SEARCH_FILTER_CANDIDATE_LIMIT + 1))?;
+        if ids.len() > SEARCH_FILTER_CANDIDATE_LIMIT {
+            return Ok(None);
+        }
+        Ok(Some(ids.into_iter().collect()))
+    }
+
     fn index_plan_candidates(
         &self,
         rtxn: &RoTxn<'_>,
@@ -1707,13 +1799,18 @@ impl<'e> Collection<'e> {
         let range = (as_bound(lower), as_bound(upper));
 
         let mut ids = Vec::new();
-        let mut seen = HashSet::new();
+        // Non-multikey indexes contain at most one entry per document. Avoid
+        // a second full-size `HashSet<String>` when deduplication is unnecessary.
+        let mut seen = plan.def.is_multikey().then(HashSet::new);
         for item in plan.db.range(rtxn, &range)? {
             let (_key, value) = item?;
             if let Some((id, _)) = index::decode_index_value(value) {
-                if seen.insert(id.clone()) {
-                    ids.push(id);
+                if let Some(seen) = seen.as_mut() {
+                    if !seen.insert(id.clone()) {
+                        continue;
+                    }
                 }
+                ids.push(id);
             }
             if max.is_some_and(|m| ids.len() >= m) {
                 break;
@@ -2602,13 +2699,22 @@ impl<'e> Collection<'e> {
 
         let empty_filter = filter.as_object().is_none_or(|object| object.is_empty());
         let needs_phrases = !parsed.phrases.is_empty() || !parsed.negative_phrases.is_empty();
-        let simple_query = !needs_phrases && empty_filter;
+        let simple_query = !needs_phrases;
+        let filter_candidates = if simple_query && !empty_filter {
+            self.exact_filter_index_candidates(rtxn, filter)?
+        } else {
+            None
+        };
+        let can_use_fast = simple_query
+            && parsed.negative_terms.is_empty()
+            && def.fields.len() == 1
+            && (empty_filter || filter_candidates.is_some());
 
         // Single-field lexical queries do not need the shared score map. For one
         // term, stream postings straight into a bounded heap. For several terms,
         // merge the already id-sorted posting lists and score each document once.
         // This keeps large OR queries from allocating a map entry per hit.
-        if simple_query && parsed.negative_terms.is_empty() && def.fields.len() == 1 {
+        if can_use_fast {
             let field = &def.fields[0];
             let Some(postings) = self.text_postings(rtxn, &def.name, &field.path)? else {
                 return Ok(Vec::new());
@@ -2630,6 +2736,10 @@ impl<'e> Collection<'e> {
                 .unwrap_or(0) as f64;
             let avgdl = total / n_docs;
             let weight = field.weight;
+            let filter_set = filter_candidates.as_ref();
+            if filter_set.is_some_and(HashSet::is_empty) {
+                return Ok(Vec::new());
+            }
             let max = match mode {
                 TextQueryMode::Native => limit.unwrap_or(10).min(1000),
                 TextQueryMode::Mongo => limit.unwrap_or(usize::MAX),
@@ -2664,6 +2774,9 @@ impl<'e> Collection<'e> {
                         continue;
                     };
                     df += 1;
+                    if filter_set.is_some_and(|ids| !ids.contains(id)) {
+                        continue;
+                    }
                     let tf = search::text_posting_tf(value).unwrap_or(1) as f64;
                     let dl = match search::text_posting_dl(value) {
                         Some(dl) => dl as f64,
@@ -2687,66 +2800,57 @@ impl<'e> Collection<'e> {
                 return emit_top(top, idf);
             }
 
-            let collect_hits = |term: &str| -> Result<Vec<(String, f64, Option<f64>)>> {
+            // Materializing every posting as a String was the dominant cost for
+            // multi-term queries on large collections. Keep one live cursor per
+            // term and merge them directly into the bounded heap instead.
+            let mut cursors = Vec::with_capacity(parsed.positive_terms.len());
+            for term in &parsed.positive_terms {
                 let prefix = search::posting_prefix(term);
-                let mut hits = Vec::new();
+                let mut df = 0u64;
                 for item in postings.prefix_iter(rtxn, prefix.as_slice())? {
-                    let (key, value) = item?;
-                    if let Some(id) = search::parse_posting(key) {
-                        let tf = search::text_posting_tf(value).unwrap_or(1) as f64;
-                        let dl = search::text_posting_dl(value).map(|dl| dl as f64);
-                        hits.push((id.to_string(), tf, dl));
+                    let (key, _) = item?;
+                    if search::parse_posting(key).is_some() {
+                        df += 1;
                     }
                 }
-                Ok(hits)
-            };
-
-            let mut lists: Vec<Vec<(String, f64)>> =
-                Vec::with_capacity(parsed.positive_terms.len());
-            for term in &parsed.positive_terms {
-                let hits = collect_hits(term)?;
-                let idf = search::idf(n_docs, hits.len() as f64);
-                let mut scored = Vec::with_capacity(hits.len());
-                for (id, tf, posting_dl) in hits {
-                    let dl = match posting_dl {
-                        Some(dl) => dl,
-                        None => lens
-                            .get(rtxn, id.as_bytes())?
-                            .and_then(search::read_u32)
-                            .unwrap_or(0) as f64,
-                    };
-                    scored.push((id, weight * search::bm25_term(tf, dl, avgdl, idf)));
-                }
-                lists.push(scored);
+                let mut iter = postings.prefix_iter(rtxn, prefix.as_slice())?;
+                let current = next_text_posting(&mut iter, &lens, rtxn)?;
+                cursors.push(TextPostingCursor {
+                    iter,
+                    weight,
+                    idf: search::idf(n_docs, df as f64),
+                    current,
+                });
             }
 
-            let mut positions = vec![0usize; lists.len()];
             let mut top = BinaryHeap::with_capacity(want.min(1024).saturating_add(1));
             loop {
-                let mut min_id: Option<&str> = None;
-                for (list, position) in lists.iter().zip(&positions) {
-                    if let Some((id, _)) = list.get(*position) {
-                        if min_id.is_none_or(|current| id.as_str() < current) {
-                            min_id = Some(id.as_str());
-                        }
-                    }
-                }
-                let Some(min_id) = min_id else {
+                let next_id = cursors
+                    .iter()
+                    .filter_map(|cursor| cursor.current.as_ref().map(|posting| posting.id.as_str()))
+                    .min()
+                    .map(str::to_string);
+                let Some(id) = next_id else {
                     break;
                 };
-                let id = min_id.to_string();
                 let mut score = 0.0;
-                for (list, position) in lists.iter().zip(positions.iter_mut()) {
-                    if let Some((candidate, contribution)) = list.get(*position) {
-                        if candidate == &id {
-                            score += *contribution;
-                            *position += 1;
-                        }
+                for cursor in &mut cursors {
+                    if cursor
+                        .current
+                        .as_ref()
+                        .is_some_and(|posting| posting.id == id)
+                    {
+                        let posting = cursor.current.take().expect("matched posting");
+                        score += cursor.weight
+                            * search::bm25_term(posting.tf, posting.dl, avgdl, cursor.idf);
+                        cursor.current = next_text_posting(&mut cursor.iter, &lens, rtxn)?;
                     }
                 }
-                top.push(RankedId { id, score });
-                if top.len() > want {
-                    top.pop();
+                if filter_set.is_none_or(|ids| ids.contains(&id)) {
+                    top.push(RankedId { id, score });
+                    if top.len() > want {
+                        top.pop();
+                    }
                 }
             }
             return emit_top(top, 1.0);
@@ -2827,7 +2931,7 @@ impl<'e> Collection<'e> {
         // requested page. Parsing and tokenizing every candidate here is the
         // difference between a few seconds and a few milliseconds on a large
         // posting list.
-        if simple_query && phrase_candidates.is_empty() {
+        if simple_query && empty_filter && phrase_candidates.is_empty() {
             let max = match mode {
                 TextQueryMode::Native => limit.unwrap_or(10).min(1000),
                 TextQueryMode::Mongo => limit.unwrap_or(usize::MAX),
@@ -9707,6 +9811,7 @@ mod tests {
         c.insert_one(json!({"title": "python web framework", "tag": "web"}))
             .unwrap();
         c.create_text_index("title").unwrap();
+        c.create_index("tag", false).unwrap();
         assert_eq!(c.list_text_indexes().unwrap(), vec!["title".to_string()]);
 
         let hits = c
@@ -9746,6 +9851,62 @@ mod tests {
         assert!(c
             .search("title", "rust", &serde_json::json!({}), 0, None)
             .is_err());
+    }
+
+    #[test]
+    fn text_search_multi_term_streams_and_prefilters_equality() {
+        let (_dir, store) = store();
+        let c = store.collection("docs").unwrap();
+        for doc in [
+            json!({"_id": "a", "body": "rust database engine", "tag": "db"}),
+            json!({"_id": "b", "body": "rust async runtime", "tag": "db"}),
+            json!({"_id": "c", "body": "database storage engine", "tag": "db"}),
+            json!({"_id": "d", "body": "rust database engine", "tag": "web"}),
+            json!({"_id": "e", "body": "python web framework", "tag": "web"}),
+        ] {
+            c.insert_one(doc).unwrap();
+        }
+        c.create_text_index("body").unwrap();
+        c.create_index("tag", false).unwrap();
+
+        let ids = |docs: Vec<Value>| {
+            let mut ids: Vec<String> = docs
+                .into_iter()
+                .map(|doc| doc["_id"].as_str().unwrap().to_string())
+                .collect();
+            ids.sort();
+            ids
+        };
+
+        assert_eq!(
+            ids(c
+                .search("body", "rust database", &json!({}), 0, Some(10))
+                .unwrap()),
+            vec!["a", "b", "c", "d"]
+        );
+        assert_eq!(
+            ids(c
+                .search("body", "rust database", &json!({"tag": "db"}), 0, Some(10))
+                .unwrap()),
+            vec!["a", "b", "c"]
+        );
+        assert_eq!(
+            ids(c
+                .search("body", "rust database", &json!({"tag": "web"}), 0, Some(10))
+                .unwrap()),
+            vec!["d"]
+        );
+        assert_eq!(
+            ids(c
+                .search("body", "rust", &json!({"_id": "a"}), 0, Some(10))
+                .unwrap()),
+            vec!["a"]
+        );
+
+        let page = c
+            .search("body", "rust database", &json!({}), 1, Some(2))
+            .unwrap();
+        assert_eq!(page.len(), 2);
     }
 
     #[test]
