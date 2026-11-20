@@ -129,6 +129,39 @@ dense collection and other benchmark data. Rebuilding the text indexes to popula
 the new `df` metadata raised the file from 203.08 GB to 208.96 GB through LMDB
 copy-on-write; the old pages are reusable but are not returned to the filesystem.
 
+### Real-text check: MS MARCO
+
+The synthetic 1M/10M rows above use an 8-token body. To test a realistic text
+distribution, the official **MS MARCO passage collection** was loaded into
+`msmarco` (8,841,823 passages) and a 1M-passage prefix into `msmarco1m`. Queries
+are real MS MARCO training queries, sampled deterministically; timings use
+`limit=10` and the same daemon configuration.
+
+| Phase | 1M real passages | Full 8.8M real passages |
+|---|---:|---:|
+| Load throughput | **63,469 docs/s** | **89,010 docs/s** |
+| Text index build | **156.1 s** | not completed |
+| Collection size | 1,000,000 docs | 8,841,823 docs |
+
+Real MS MARCO queries against the 1M passage index (500 samples):
+
+| p50 | p95 | p99 | Mean | QPS |
+|---:|---:|---:|---:|---:|
+| **91.88 ms** | **272.65 ms** | **379.73 ms** | **111.76 ms** | **8.9** |
+
+The full 8.8M text index was stopped after 47 minutes at 3.76M processed
+documents. The build rate kept falling as the LMDB posting tree grew, so the
+remaining work projected to multiple hours. That is a property of the current
+per-posting LMDB layout, not of the data: the same 1M real passages index in
+156 s. Real passages also make queries about 2× slower than the synthetic 1M
+corpus at the same document count because they contain many more terms and
+postings.
+
+These results are the main argument for moving BM25 and fuzzy search to an
+immutable, block-based sidecar index (for example Tantivy). LMDB remains the
+source of truth for documents, but should not be the long-term posting store
+for a 10M real-text collection.
+
 ### BM25
 
 | Data set | Index build | One term | Two terms | Three terms |
@@ -220,6 +253,12 @@ NONODB_SOCK=$S NONODB_TIMEOUT=1800 \
 # 1M and 10M BM25/fuzzy/vector benchmarks
 NONODB_SOCK=$S python3 scripts/search_scale_bench.py --docs 1000000 --collection search1m
 NONODB_SOCK=$S python3 scripts/search_scale_bench.py --docs 10000000 --collection search10m
+
+# Real MS MARCO passages (download collection.tsv and queries.train.tsv first)
+NONODB_SOCK=$S python3 scripts/load_msmarco.py collection.tsv \
+  --collection msmarco1m --limit 1000000 --batch 2000
+NONODB_SOCK=$S python3 scripts/msmarco_bench.py queries.train.tsv \
+  --collection msmarco1m --samples 500 --limit 10
 
 # Smaller functional checks
 NONODB_SOCK=$S python3 scripts/search_test.py

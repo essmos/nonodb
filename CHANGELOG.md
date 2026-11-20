@@ -4,6 +4,13 @@ Full release notes: https://github.com/essmos/nonodb/releases
 
 ## Unreleased
 
+- Added `scripts/load_msmarco.py` and `scripts/msmarco_bench.py` and loaded the
+  real MS MARCO passage collection for search validation. The 8.8M-passage load
+  reached 89,010 docs/s. A 1M-passage BM25 index built in 156 s and real queries
+  ran at p50 91.9 ms / p95 272.7 ms / p99 379.7 ms. The full 8.8M text index
+  was stopped after 47 minutes at 3.76M documents because LMDB posting-tree
+  build time kept growing; this reinforces the need for a block-based search
+  sidecar such as Tantivy.
 - Documented 10M, 100M, and 1B benchmark results, including the v0.27.0 raw
   `find` path on a 1B-document collection, and added `scripts/dense_bench.py`
   for reproducing the dense-document runs.
