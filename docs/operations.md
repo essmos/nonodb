@@ -52,6 +52,7 @@ secrets.
 | `NONODB_SCAN_WORKERS` | min(CPUs, 16) | Workers for parallel full scans/sorts; capped at 256 |
 | `NONODB_BACKFILL_WORKERS` | min(CPUs, 16) | Workers for index/text/fuzzy/vector backfill parsing; capped at 256 |
 | `NONODB_AGGREGATE_WORKERS` | min(CPUs, 16) | Workers for parallel order-independent `$group`; capped at 256 |
+| `NONODB_SEARCH_WORKERS` | min(CPUs, 16) | Workers for exact vector and single-term text search; capped at 256 |
 | `NONODB_SQL_SLOW_MS` | `0` | Log SQL statements slower than this; `0` disables slow-SQL logging |
 | `NONODB_BLOCKING_THREADS` | `64` | Tokio blocking threads used by LMDB reads/writes |
 | `NONODB_CACHE_TTL` | `5` | Read-cache TTL in seconds; `0` disables the cache |
@@ -171,6 +172,7 @@ NONODB_PROFILE=small
 | `NONODB_SCAN_WORKERS` | 2 | 1 |
 | `NONODB_BACKFILL_WORKERS` | 1 | 1 |
 | `NONODB_AGGREGATE_WORKERS` | 1 | 1 |
+| `NONODB_SEARCH_WORKERS` | 1 | 1 |
 | `NONODB_TTL_SWEEP_INTERVAL` | 10 | 15 |
 | `NONODB_TTL_SWEEP_LIMIT` | 128 | 64 |
 

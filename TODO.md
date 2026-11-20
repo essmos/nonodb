@@ -159,11 +159,13 @@ indexing, and profiling.
 
 ## Known issues and caveats
 
-- BM25 multi-term and exact-filter queries now stream over posting lists, but
-  single-term queries still walk every matching posting. On a 100M-document
-  corpus, one term takes about 9.9 s, two terms 29.6 s, and three terms 40.1 s;
-  an exact indexed filter takes 19.4 s. Block-max WAND remains the next step for
-  single-term and top-K skipping at this scale.
+- Single-term BM25 and unfiltered exact vector search now use
+  `NONODB_SEARCH_WORKERS` threads. On a 100M-document corpus, one term dropped
+  from 9.9 s to 4.2-4.4 s and exact 16D vector search from 6.7 s to 4.9-5.3 s.
+  Multi-term BM25 still uses the single-thread streaming merge (29.6 s for two
+  terms, 40.1 s for three), and an exact indexed filter still scans all postings
+  to compute document frequency (18.3 s). Block-max WAND and ID-range sharding
+  for parallel multi-term search remain the next steps.
 - Fuzzy search is not interactive on 100M documents when the field has large
   posting lists. The index build completed, but a distance-1 query did not
   finish within roughly 9 minutes in the current candidate-map design. Treat

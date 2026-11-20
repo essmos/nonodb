@@ -139,6 +139,53 @@ const PARALLEL_UNSORTED_MIN_WANT: usize = 16;
 /// Size of the raw-byte chunk passed to worker threads.
 const PARALLEL_SCAN_CHUNK: usize = 8192;
 
+/// Minimum collection size before single-term text and exact vector searches
+/// use worker threads.
+#[cfg(not(test))]
+const PARALLEL_SEARCH_MIN_ENTRIES: usize = 50_000;
+#[cfg(test)]
+const PARALLEL_SEARCH_MIN_ENTRIES: usize = 200;
+
+/// Maximum result window for a parallel search. Larger pages are better served
+/// by the serial streaming path.
+const PARALLEL_SEARCH_MAX_WANT: usize = 10_000;
+
+/// Posting/vector entries per search worker chunk.
+const PARALLEL_SEARCH_CHUNK: usize = 8192;
+
+/// Compact worker chunk: one byte buffer plus `(offset, key length, value length)`
+/// entries. Keeping raw keys/values in one allocation avoids per-posting and
+/// per-vector `String`/`Vec` allocations in the coordinator.
+struct SearchChunk {
+    buffer: Vec<u8>,
+    entries: Vec<(u32, u32, u32)>,
+}
+
+impl SearchChunk {
+    fn with_capacity(entries: usize) -> Self {
+        Self {
+            buffer: Vec::with_capacity(entries * 32),
+            entries: Vec::with_capacity(entries),
+        }
+    }
+
+    fn push(&mut self, key: &[u8], value: &[u8]) {
+        let offset = self.buffer.len() as u32;
+        self.buffer.extend_from_slice(key);
+        self.buffer.extend_from_slice(value);
+        self.entries
+            .push((offset, key.len() as u32, value.len() as u32));
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
 /// Soft byte cap for one index-backfill chunk. Large documents stop a chunk
 /// early so the bounded worker queue cannot hold gigabytes of raw documents.
 const BACKFILL_CHUNK_BYTES: usize = 4 * 1024 * 1024;
@@ -171,6 +218,10 @@ fn backfill_workers() -> usize {
 
 fn aggregate_workers() -> usize {
     configured_workers("NONODB_AGGREGATE_WORKERS")
+}
+
+fn search_workers() -> usize {
+    configured_workers("NONODB_SEARCH_WORKERS")
 }
 
 /// Scan chunk: one byte buffer plus document offsets (fewer allocations).
@@ -2199,6 +2250,16 @@ impl<'e> Collection<'e> {
             }
         }
         let mut heap: BinaryHeap<Candidate> = BinaryHeap::new();
+        let workers = search_workers();
+        if !filter_active
+            && workers > 1
+            && want <= PARALLEL_SEARCH_MAX_WANT
+            && db.stat(rtxn)?.entries >= PARALLEL_SEARCH_MIN_ENTRIES
+        {
+            let heap =
+                self.parallel_vector_scan(rtxn, db, &def, query, query_norm, want, workers)?;
+            return self.vector_results_from_heap(rtxn, heap, skip, limit);
+        }
         for item in db.iter(rtxn)? {
             let (key, value) = item?;
             let Ok(id) = std::str::from_utf8(key) else {
@@ -2240,6 +2301,136 @@ impl<'e> Collection<'e> {
         }
 
         self.vector_results_from_heap(rtxn, heap, skip, limit)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn parallel_vector_scan(
+        &self,
+        rtxn: &RoTxn<'_>,
+        db: Database<Bytes, Bytes>,
+        def: &VectorDef,
+        query: &[f32],
+        query_norm: f32,
+        want: usize,
+        workers: usize,
+    ) -> Result<BinaryHeap<Candidate>> {
+        let mut job_txs = Vec::with_capacity(workers);
+        let mut job_rxs = Vec::with_capacity(workers);
+        for _ in 0..workers {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, SearchChunk)>(1);
+            job_txs.push(tx);
+            job_rxs.push(rx);
+        }
+        let (res_tx, res_rx) = std::sync::mpsc::channel::<Result<(usize, Vec<Candidate>)>>();
+        let mut iter = db.iter(rtxn)?;
+
+        std::thread::scope(|scope| -> Result<BinaryHeap<Candidate>> {
+            for rx in job_rxs {
+                let tx = res_tx.clone();
+                scope.spawn(move || {
+                    while let Ok((idx, chunk)) = rx.recv() {
+                        let mut local: BinaryHeap<Candidate> =
+                            BinaryHeap::with_capacity(want.saturating_add(1));
+                        for &(offset, key_len, value_len) in &chunk.entries {
+                            let offset = offset as usize;
+                            let key_len = key_len as usize;
+                            let value_len = value_len as usize;
+                            let key = &chunk.buffer[offset..offset + key_len];
+                            let value =
+                                &chunk.buffer[offset + key_len..offset + key_len + value_len];
+                            let Some(distance) = vector::distance_from_bytes(
+                                def.metric, query, query_norm, value, def.dims,
+                            ) else {
+                                continue;
+                            };
+                            let Ok(id) = std::str::from_utf8(key) else {
+                                continue;
+                            };
+                            if local.len() >= want {
+                                let worst = local.peek().expect("non-empty vector heap");
+                                if distance > worst.distance
+                                    || (distance == worst.distance && id >= worst.id.as_str())
+                                {
+                                    continue;
+                                }
+                            }
+                            local.push(Candidate {
+                                distance,
+                                id: id.to_string(),
+                            });
+                            if local.len() > want {
+                                local.pop();
+                            }
+                        }
+                        if tx.send(Ok((idx, local.into_vec()))).is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+            drop(res_tx);
+
+            let mut top = BinaryHeap::with_capacity(want.saturating_add(1));
+            let mut next_idx = 0usize;
+            let mut error: Option<Error> = None;
+            loop {
+                let mut sent = 0usize;
+                for tx in &job_txs {
+                    let mut chunk = SearchChunk::with_capacity(PARALLEL_SEARCH_CHUNK);
+                    while chunk.len() < PARALLEL_SEARCH_CHUNK {
+                        match iter.next() {
+                            Some(Ok((key, value))) => chunk.push(key, value),
+                            Some(Err(err)) => {
+                                error = Some(err.into());
+                                break;
+                            }
+                            None => break,
+                        }
+                    }
+                    if error.is_some() || chunk.is_empty() {
+                        break;
+                    }
+                    let idx = next_idx;
+                    next_idx += 1;
+                    if tx.send((idx, chunk)).is_err() {
+                        error = Some(Error::Query("parallel vector worker stopped".into()));
+                        break;
+                    }
+                    sent += 1;
+                }
+                if error.is_some() || sent == 0 {
+                    break;
+                }
+                for _ in 0..sent {
+                    match res_rx.recv() {
+                        Ok(Ok((_idx, local))) => {
+                            for candidate in local {
+                                top.push(candidate);
+                                if top.len() > want {
+                                    top.pop();
+                                }
+                            }
+                        }
+                        Ok(Err(err)) => {
+                            error = Some(err);
+                            break;
+                        }
+                        Err(_) => {
+                            error = Some(Error::Query(
+                                "parallel vector scan returned no result".into(),
+                            ));
+                            break;
+                        }
+                    }
+                }
+            }
+            drop(job_txs);
+            if let Some(error) = error {
+                Err(error)
+            } else {
+                Ok(top)
+            }
+        })
     }
 
     fn vector_results_from_heap(
@@ -2765,6 +2956,17 @@ impl<'e> Collection<'e> {
 
             if parsed.positive_terms.len() == 1 {
                 let term = &parsed.positive_terms[0];
+                let workers = search_workers();
+                if workers > 1
+                    && want <= PARALLEL_SEARCH_MAX_WANT
+                    && n_docs >= PARALLEL_SEARCH_MIN_ENTRIES as f64
+                {
+                    let (top, df) = self.parallel_text_single_term(
+                        rtxn, &postings, &lens, term, weight, avgdl, filter_set, want, workers,
+                    )?;
+                    let idf = search::idf(n_docs, df as f64);
+                    return emit_top(top, idf);
+                }
                 let prefix = search::posting_prefix(term);
                 let mut top = BinaryHeap::with_capacity(want.min(1024).saturating_add(1));
                 let mut df = 0u64;
@@ -3036,6 +3238,166 @@ impl<'e> Collection<'e> {
             out.push(doc);
         }
         Ok(out)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn parallel_text_single_term(
+        &self,
+        rtxn: &RoTxn<'_>,
+        postings: &Database<Bytes, Bytes>,
+        lens: &Database<Bytes, Bytes>,
+        term: &str,
+        weight: f64,
+        avgdl: f64,
+        filter_set: Option<&HashSet<String>>,
+        want: usize,
+        workers: usize,
+    ) -> Result<(BinaryHeap<RankedId>, u64)> {
+        let mut job_txs = Vec::with_capacity(workers);
+        let mut job_rxs = Vec::with_capacity(workers);
+        for _ in 0..workers {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, SearchChunk)>(1);
+            job_txs.push(tx);
+            job_rxs.push(rx);
+        }
+        let (res_tx, res_rx) = std::sync::mpsc::channel::<Result<(usize, Vec<RankedId>)>>();
+        let prefix = search::posting_prefix(term);
+        let mut iter = postings.prefix_iter(rtxn, prefix.as_slice())?;
+
+        std::thread::scope(|scope| -> Result<(BinaryHeap<RankedId>, u64)> {
+            for rx in job_rxs {
+                let tx = res_tx.clone();
+                scope.spawn(move || {
+                    while let Ok((idx, chunk)) = rx.recv() {
+                        let mut local: BinaryHeap<RankedId> =
+                            BinaryHeap::with_capacity(want.saturating_add(1));
+                        for &(offset, key_len, value_len) in &chunk.entries {
+                            let offset = offset as usize;
+                            let key_len = key_len as usize;
+                            let value_len = value_len as usize;
+                            let key = &chunk.buffer[offset..offset + key_len];
+                            let value =
+                                &chunk.buffer[offset + key_len..offset + key_len + value_len];
+                            let Some(id) = search::parse_posting(key) else {
+                                continue;
+                            };
+                            if value.len() != 16 {
+                                continue;
+                            }
+                            let tf = f64::from_le_bytes(value[..8].try_into().expect("8 bytes"));
+                            let dl = f64::from_le_bytes(value[8..16].try_into().expect("8 bytes"));
+                            let score = weight * search::bm25_term(tf, dl, avgdl, 1.0);
+                            if local.len() >= want {
+                                let worst = local.peek().expect("non-empty text heap");
+                                if score < worst.score
+                                    || (score == worst.score && id > worst.id.as_str())
+                                {
+                                    continue;
+                                }
+                            }
+                            local.push(RankedId {
+                                id: id.to_string(),
+                                score,
+                            });
+                            if local.len() > want {
+                                local.pop();
+                            }
+                        }
+                        if tx.send(Ok((idx, local.into_vec()))).is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+            drop(res_tx);
+
+            let mut top = BinaryHeap::with_capacity(want.saturating_add(1));
+            let mut df = 0u64;
+            let mut next_idx = 0usize;
+            let mut error: Option<Error> = None;
+            loop {
+                let mut sent = 0usize;
+                for tx in &job_txs {
+                    let mut chunk = SearchChunk::with_capacity(PARALLEL_SEARCH_CHUNK);
+                    while chunk.len() < PARALLEL_SEARCH_CHUNK {
+                        match iter.next() {
+                            Some(Ok((key, value))) => {
+                                let Some(id) = search::parse_posting(key) else {
+                                    continue;
+                                };
+                                df += 1;
+                                if filter_set.is_some_and(|ids| !ids.contains(id)) {
+                                    continue;
+                                }
+                                let tf = search::text_posting_tf(value).unwrap_or(1) as f64;
+                                let dl = match search::text_posting_dl(value) {
+                                    Some(dl) => dl as f64,
+                                    None => match lens.get(rtxn, id.as_bytes()) {
+                                        Ok(Some(bytes)) => {
+                                            search::read_u32(bytes).unwrap_or(0) as f64
+                                        }
+                                        Ok(None) => 0.0,
+                                        Err(err) => {
+                                            error = Some(err.into());
+                                            break;
+                                        }
+                                    },
+                                };
+                                let mut payload = [0u8; 16];
+                                payload[..8].copy_from_slice(&tf.to_le_bytes());
+                                payload[8..].copy_from_slice(&dl.to_le_bytes());
+                                chunk.push(key, &payload);
+                            }
+                            Some(Err(err)) => {
+                                error = Some(err.into());
+                                break;
+                            }
+                            None => break,
+                        }
+                    }
+                    if error.is_some() || chunk.is_empty() {
+                        break;
+                    }
+                    let idx = next_idx;
+                    next_idx += 1;
+                    if tx.send((idx, chunk)).is_err() {
+                        error = Some(Error::Query("parallel text worker stopped".into()));
+                        break;
+                    }
+                    sent += 1;
+                }
+                if error.is_some() || sent == 0 {
+                    break;
+                }
+                for _ in 0..sent {
+                    match res_rx.recv() {
+                        Ok(Ok((_idx, local))) => {
+                            for candidate in local {
+                                top.push(candidate);
+                                if top.len() > want {
+                                    top.pop();
+                                }
+                            }
+                        }
+                        Ok(Err(err)) => {
+                            error = Some(err);
+                            break;
+                        }
+                        Err(_) => {
+                            error =
+                                Some(Error::Query("parallel text scan returned no result".into()));
+                            break;
+                        }
+                    }
+                }
+            }
+            drop(job_txs);
+            if let Some(error) = error {
+                Err(error)
+            } else {
+                Ok((top, df))
+            }
+        })
     }
 
     /// Approximate search (trigrams + Levenshtein). Results include `_distance`.
@@ -9907,6 +10269,37 @@ mod tests {
             .search("body", "rust database", &json!({}), 1, Some(2))
             .unwrap();
         assert_eq!(page.len(), 2);
+    }
+
+    #[test]
+    fn parallel_text_and_vector_search_return_exact_results() {
+        let (_dir, store) = store();
+        let c = store.collection("parallel_search").unwrap();
+        for i in 0..300 {
+            let body = if i == 77 {
+                "rust rust rust rust"
+            } else {
+                "rust filler"
+            };
+            c.insert_one(json!({
+                "_id": format!("d{i:03}"),
+                "body": body,
+                "vec": [i as f64, 1.0]
+            }))
+            .unwrap();
+        }
+        c.create_text_index("body").unwrap();
+        c.create_vector_index("vec", 2, VectorMetric::L2).unwrap();
+
+        let hits = c.search("body", "rust", &json!({}), 0, Some(10)).unwrap();
+        assert_eq!(hits.len(), 10);
+        assert_eq!(hits[0]["_id"], "d077");
+
+        let hits = c
+            .vector_search("vec", &[299.0, 1.0], &json!({}), 0, Some(5))
+            .unwrap();
+        assert_eq!(hits.len(), 5);
+        assert_eq!(hits[0]["_id"], "d299");
     }
 
     #[test]

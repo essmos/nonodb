@@ -14,6 +14,11 @@ Full release notes: https://github.com/essmos/nonodb/releases
 - Text search with an exact equality filter now uses a usable secondary index as
   a prefilter before scoring. On the same 100M-document collection, a filtered
   BM25 query that previously timed out at 1800 s completed in 19.4 s.
+- Single-term BM25 and unfiltered exact vector search now spread chunked work
+  across `NONODB_SEARCH_WORKERS` threads and merge bounded per-worker top-K
+  heaps. On the 100M-document collection, single-term BM25 dropped from 9.9 s
+  to 4.2-4.4 s and exact 16D vector search from 6.7 s to 4.9-5.3 s. Multi-term
+  BM25 remains on the streaming single-thread merge path.
 
 ## v0.27.0 - 2026-11-20
 

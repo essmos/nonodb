@@ -1125,6 +1125,40 @@ than the projection path, which parses every document and emits only `_id`.
 The filtered query stops after the first ten matches, so it is not a full-scan
 measurement.
 
+### Search at 100M documents
+
+The `search100m` collection contains 100M short documents with a BM25 index on
+`body`, a fuzzy index on `title`, a 16-dimensional vector index on `vec`, and a
+secondary index on `cat`. It was built with `v0.27.0` on ZFS. Index builds and
+queries used the same 16-vCPU / 31 GiB host.
+
+| Index / phase | Size or time |
+|---|---:|
+| Load 100M documents | 1,667.9 s (27.8 min), 59,954 docs/s |
+| `data.mdb` after load | 74.73 GB |
+| `cat` index | 198.6 s, 87.92 GB |
+| BM25 `body` index | 1,276.5 s (21.3 min), 146.65 GB |
+| Fuzzy `title` index | 1,101.4 s (18.4 min), 177.24 GB |
+| 16D vector index | 138.7 s, 187.27 GB |
+
+Query latency, limit 10, end-to-end through Python and the Unix socket:
+
+| Query | Before streaming / parallel | After streaming | After parallel search |
+|---|---:|---:|---:|
+| BM25 one term | 9.86 s | 9.86 s | **4.24 s** (`NONODB_SEARCH_WORKERS=16`) |
+| BM25 two terms | 185.24 s | **29.59 s** | 29.91 s |
+| BM25 three terms | 285.88 s | **40.10 s** | not re-run |
+| BM25 one term + indexed `cat` filter | 1,800 s timeout | **19.41 s** | 18.28 s |
+| Exact 16D vector, no filter | 6.67 s | 6.67 s | **4.94-5.34 s** (8-16 workers) |
+| Exact 16D vector + indexed `cat` filter | 7.15 s | 7.15 s | 7.35-8.50 s |
+
+The parallel path chunks raw LMDB keys/values into a compact buffer, lets each
+worker score its chunk and keep a local top-K, then merges those heaps. The
+single-term and vector scans still read the whole posting list/index, so the
+coordinator's LMDB read remains the limit; eight and sixteen workers produced
+similar results. Multi-term BM25 still uses the streaming merge because an
+exact parallel merge needs ID-range sharding.
+
 Reproduce the dense load and reads with `scripts/dense_bench.py`:
 
 ```bash
