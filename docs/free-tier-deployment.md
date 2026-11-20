@@ -110,13 +110,13 @@ export NONODB_AUTH_FILE="$PWD/config/auth.json"
 docker run --rm -u "$(id -u):$(id -g)" \
   -e NONODB_AUTH_FILE=/config/auth.json \
   -v "$PWD/config:/config" \
-  ghcr.io/essmos/nonodb:0.26.1 \
+  ghcr.io/essmos/nonodb:0.27.0 \
   nonodb-cli auth init
 
 docker run --rm -u "$(id -u):$(id -g)" \
   -e NONODB_AUTH_FILE=/config/auth.json \
   -v "$PWD/config:/config" \
-  ghcr.io/essmos/nonodb:0.26.1 \
+  ghcr.io/essmos/nonodb:0.27.0 \
   nonodb-cli auth token create admin
 ```
 
@@ -228,7 +228,7 @@ NONODB_DATA_DIR=/mnt/nonodb-data
 ```bash
 docker run --rm --user root \
   -v /mnt/nonodb-data:/var/lib/nonodb \
-  ghcr.io/essmos/nonodb:0.26.1 \
+  ghcr.io/essmos/nonodb:0.27.0 \
   chown -R nonodb:nonodb /var/lib/nonodb
 ```
 
@@ -267,7 +267,7 @@ echo '/dev/disk/by-id/scsi-0DO_Volume_nonodb-data /mnt/nonodb-data ext4 defaults
 ```bash
 docker run --rm --user root \
   -v /mnt/nonodb-data:/var/lib/nonodb \
-  ghcr.io/essmos/nonodb:0.26.1 \
+  ghcr.io/essmos/nonodb:0.27.0 \
   chown -R nonodb:nonodb /var/lib/nonodb
 ```
 
@@ -403,7 +403,7 @@ docker compose -f deploy/docker-compose.free-tier.yml stop nonodb
 docker run --rm \
   -v "${NONODB_DATA_DIR:-nonodb-data}:/var/lib/nonodb" \
   -v "$PWD/restore:/restore" \
-  ghcr.io/essmos/nonodb:0.26.1 \
+  ghcr.io/essmos/nonodb:0.27.0 \
   nonodb-cli restore-all /restore /var/lib/nonodb --force --verify
 
 docker compose -f deploy/docker-compose.free-tier.yml up -d

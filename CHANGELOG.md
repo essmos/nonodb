@@ -4,6 +4,15 @@ Full release notes: https://github.com/essmos/nonodb/releases
 
 ## Unreleased
 
+## v0.27.0 - 2026-11-20
+
+### Highlights
+
+- Plain `find` requests now use a raw JSON fast path when no projection,
+  sorting, or index hint is required.
+- `lookup` serves `_id`-only projections directly from the unique index.
+- Long index builds expose progress through `index_status`.
+
 ### Added
 
 - Added `CONTRIBUTING.md`, `SECURITY.md`, issue templates, and a pull request
