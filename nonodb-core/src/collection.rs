@@ -5,7 +5,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::ops::Bound;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use heed::types::Bytes;
 use heed::{Database, Env, RoPrefix, RoTxn, RwTxn};
@@ -62,6 +62,8 @@ struct FuzzySegmentManifest {
 }
 
 const SEGMENT_DELTA_FLUSH_DOCS: u64 = 4096;
+const SEGMENT_COMPACT_MIN_SEGMENTS: usize = 4;
+const SEGMENT_COMPACT_MAX_DOCS: u32 = 200_000;
 
 fn fuzzy_segment_index_dir(coll: &str, index: &str) -> String {
     let digest = Sha256::digest(format!("fuzzy\0{coll}\0{index}").as_bytes());
@@ -2763,6 +2765,191 @@ impl<'e> Collection<'e> {
         self.create_search_index_txn(wtxn, &def)
     }
 
+    fn cleanup_segment_orphans(&self, dir: &str, live: &[String]) -> Result<()> {
+        let root = self.segment_root()?;
+        let full = root.join(dir);
+        let Ok(entries) = std::fs::read_dir(&full) else {
+            return Ok(());
+        };
+        let live: HashSet<&str> = live
+            .iter()
+            .filter_map(|rel| std::path::Path::new(rel).file_name())
+            .filter_map(|name| name.to_str())
+            .collect();
+        for entry in entries {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if (name.ends_with(".seg") || name.ends_with(".values")) && !live.contains(name) {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+        Ok(())
+    }
+
+    fn maybe_compact_text_segments(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        def: &SearchIndexDef,
+    ) -> Result<()> {
+        let Some(mut manifest) = self.segment_manifest_in(&*wtxn, &def.name)? else {
+            return Ok(());
+        };
+        if manifest.segments.len() < SEGMENT_COMPACT_MIN_SEGMENTS {
+            return Ok(());
+        }
+        let root = self.segment_root()?;
+        let dir = segment_index_dir(&self.name, &def.name);
+        let mut suffix_docs = 0u32;
+        for rel in &manifest.segments[1..] {
+            suffix_docs += SegmentReader::open(root.join(rel))?.documents();
+        }
+        if suffix_docs > SEGMENT_COMPACT_MAX_DOCS {
+            return Ok(());
+        }
+        self.cleanup_segment_orphans(&dir, &manifest.segments)?;
+
+        let prefix = self.segment_delta_prefix(&def.name);
+        let mut ids = Vec::new();
+        for (idx, rel) in manifest.segments.iter().enumerate().skip(1) {
+            let reader = SegmentReader::open(root.join(rel))?;
+            for doc in 0..reader.documents() {
+                let id = reader.doc_id(doc)?;
+                if manifest
+                    .tombstones
+                    .get(&id)
+                    .is_some_and(|deleted_at| idx < *deleted_at)
+                {
+                    continue;
+                }
+                let key = format!("{prefix}{id}");
+                if self.meta.get(&*wtxn, key.as_bytes())?.is_some() {
+                    continue;
+                }
+                ids.push(id);
+            }
+        }
+        ids.sort_unstable();
+        ids.dedup();
+
+        manifest.segments.truncate(1);
+        if !ids.is_empty() {
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let rel = format!("{dir}/compact-{stamp}.seg");
+            let path = root.join(&rel);
+            let mut builder = SegmentBuilder::new(&path)?;
+            let field = &def.fields[0].path;
+            for id in &ids {
+                let Some(bytes) = self.db.get(&*wtxn, id.as_bytes())? else {
+                    continue;
+                };
+                let doc: Value = serde_json::from_slice(bytes)?;
+                if let Some(text) = index::field_value(&doc, field).and_then(search::field_text) {
+                    builder.add_document(id, &text)?;
+                }
+            }
+            builder.finish()?;
+            manifest.segments.push(rel);
+        }
+        let new_idx = manifest.segments.len().saturating_sub(1);
+        for deleted_at in manifest.tombstones.values_mut() {
+            *deleted_at = (*deleted_at).min(new_idx);
+        }
+        manifest.tombstones.retain(|_, deleted_at| *deleted_at > 0);
+        self.put_segment_manifest(wtxn, &def.name, &manifest)?;
+        Ok(())
+    }
+
+    fn maybe_compact_fuzzy_segments(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        def: &SearchIndexDef,
+    ) -> Result<()> {
+        let Some(mut manifest) = self.fuzzy_segment_manifest_in(&*wtxn, &def.name)? else {
+            return Ok(());
+        };
+        if manifest.segments.len() < SEGMENT_COMPACT_MIN_SEGMENTS {
+            return Ok(());
+        }
+        let root = self.segment_root()?;
+        let dir = fuzzy_segment_index_dir(&self.name, &def.name);
+        let mut suffix_docs = 0u32;
+        for rel in &manifest.segments[1..] {
+            suffix_docs += SegmentReader::open(root.join(rel))?.documents();
+        }
+        if suffix_docs > SEGMENT_COMPACT_MAX_DOCS {
+            return Ok(());
+        }
+        let mut live = manifest.segments.clone();
+        live.extend(manifest.values.iter().cloned());
+        self.cleanup_segment_orphans(&dir, &live)?;
+
+        let prefix = self.fuzzy_segment_delta_prefix(&def.name);
+        let mut ids = Vec::new();
+        for (idx, rel) in manifest.segments.iter().enumerate().skip(1) {
+            let reader = SegmentReader::open(root.join(rel))?;
+            for doc in 0..reader.documents() {
+                let id = reader.doc_id(doc)?;
+                if manifest
+                    .tombstones
+                    .get(&id)
+                    .is_some_and(|deleted_at| idx < *deleted_at)
+                {
+                    continue;
+                }
+                let key = format!("{prefix}{id}");
+                if self.meta.get(&*wtxn, key.as_bytes())?.is_some() {
+                    continue;
+                }
+                ids.push(id);
+            }
+        }
+        ids.sort_unstable();
+        ids.dedup();
+
+        manifest.segments.truncate(1);
+        manifest.values.truncate(1);
+        if !ids.is_empty() {
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let rel = format!("{dir}/compact-{stamp}.seg");
+            let values_rel = format!("{dir}/compact-{stamp}.values");
+            let path = root.join(&rel);
+            let values_path = root.join(&values_rel);
+            let mut builder = FuzzySegmentBuilder::new(&path)?;
+            let field = &def.fields[0].path;
+            for id in &ids {
+                let Some(bytes) = self.db.get(&*wtxn, id.as_bytes())? else {
+                    continue;
+                };
+                let doc: Value = serde_json::from_slice(bytes)?;
+                if let Some(text) = index::field_value(&doc, field).and_then(search::field_text) {
+                    builder.add_document(id, &text)?;
+                }
+            }
+            builder.finish(&values_path)?;
+            manifest.segments.push(rel);
+            manifest.values.push(values_rel);
+        }
+        let new_idx = manifest.segments.len().saturating_sub(1);
+        for deleted_at in manifest.tombstones.values_mut() {
+            *deleted_at = (*deleted_at).min(new_idx);
+        }
+        manifest.tombstones.retain(|_, deleted_at| *deleted_at > 0);
+        self.put_fuzzy_segment_manifest(wtxn, &def.name, &manifest)?;
+        Ok(())
+    }
+
     fn fuzzy_segment_manifest_key(&self, index: &str) -> String {
         format!("fsegmanifest:{}:{index}", self.name)
     }
@@ -2902,6 +3089,7 @@ impl<'e> Collection<'e> {
             self.meta.delete(&mut *wtxn, key.as_bytes())?;
         }
         self.set_fuzzy_segment_delta_count(wtxn, &def.name, 0)?;
+        self.maybe_compact_fuzzy_segments(wtxn, def)?;
         Ok(())
     }
 
@@ -3034,6 +3222,7 @@ impl<'e> Collection<'e> {
             self.meta.delete(&mut *wtxn, key.as_bytes())?;
         }
         self.set_segment_delta_count(wtxn, &def.name, 0)?;
+        self.maybe_compact_text_segments(wtxn, def)?;
         Ok(())
     }
 
@@ -10923,6 +11112,135 @@ mod tests {
             ids(c.search("body", "python", &json!({}), 0, Some(10)).unwrap()),
             vec!["a".to_string(), "c".to_string()]
         );
+    }
+
+    #[test]
+    fn segment_text_compacts_after_three_flushes() {
+        let (_dir, store) = store();
+        let c = store.collection("segment_text_auto_compact").unwrap();
+        c.insert_one(json!({"_id": "base", "body": "base rust"}))
+            .unwrap();
+        c.create_text_segment_index("body").unwrap();
+        for i in 0..(SEGMENT_DELTA_FLUSH_DOCS * 3 + 10) {
+            c.insert_one(json!({"_id": format!("d{i}"), "body": format!("doc{i} rust")}))
+                .unwrap();
+        }
+        let rtxn = store.env().read_txn().unwrap();
+        let manifest = c
+            .segment_manifest_in(&rtxn, "body")
+            .unwrap()
+            .expect("segment manifest");
+        assert_eq!(manifest.segments.len(), 2);
+        assert!(manifest.segments[1].contains("compact-"));
+    }
+
+    #[test]
+    fn segment_text_compaction_merges_flushed_suffix() {
+        let (_dir, store) = store();
+        let c = store.collection("segment_text_compact").unwrap();
+        for (id, body) in [
+            ("a", "rust database"),
+            ("b", "rust web"),
+            ("c", "python database"),
+            ("d", "python web"),
+        ] {
+            c.insert_one(json!({"_id": id, "body": body})).unwrap();
+        }
+        c.create_text_segment_index("body").unwrap();
+        let root = c.segment_root().unwrap();
+        let dir = segment_index_dir(&c.name, "body");
+        let manifest = {
+            let rtxn = store.env().read_txn().unwrap();
+            c.segment_manifest_in(&rtxn, "body").unwrap().unwrap()
+        };
+        let mut manifest = manifest;
+        for (n, (id, body)) in [
+            ("b", "rust web"),
+            ("c", "python database"),
+            ("d", "python web"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let rel = format!("{dir}/seg-extra-{n}.seg");
+            let mut builder = SegmentBuilder::new(root.join(&rel)).unwrap();
+            builder.add_document(id, body).unwrap();
+            builder.finish().unwrap();
+            manifest.segments.push(rel);
+        }
+        let mut wtxn = store.env().write_txn().unwrap();
+        c.put_segment_manifest(&mut wtxn, "body", &manifest)
+            .unwrap();
+        let def = c
+            .search_index_def(&wtxn, SearchKind::Text, "body")
+            .unwrap()
+            .unwrap();
+        c.maybe_compact_text_segments(&mut wtxn, &def).unwrap();
+        wtxn.commit().unwrap();
+        let rtxn = store.env().read_txn().unwrap();
+        let compacted = c.segment_manifest_in(&rtxn, "body").unwrap().unwrap();
+        assert_eq!(compacted.segments.len(), 2);
+        drop(rtxn);
+        let mut ids: Vec<String> = c
+            .search("body", "python", &json!({}), 0, Some(10))
+            .unwrap()
+            .into_iter()
+            .map(|doc| doc["_id"].as_str().unwrap().to_string())
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec!["c".to_string(), "d".to_string()]);
+    }
+
+    #[test]
+    fn segment_fuzzy_compaction_merges_flushed_suffix() {
+        let (_dir, store) = store();
+        let c = store.collection("segment_fuzzy_compact").unwrap();
+        for (id, name) in [
+            ("a", "Warszawa"),
+            ("b", "Krakow"),
+            ("c", "Wroclaw"),
+            ("d", "Gdansk"),
+        ] {
+            c.insert_one(json!({"_id": id, "name": name})).unwrap();
+        }
+        c.create_fuzzy_segment_index("name").unwrap();
+        let root = c.segment_root().unwrap();
+        let dir = fuzzy_segment_index_dir(&c.name, "name");
+        let manifest = {
+            let rtxn = store.env().read_txn().unwrap();
+            c.fuzzy_segment_manifest_in(&rtxn, "name").unwrap().unwrap()
+        };
+        let mut manifest = manifest;
+        for (n, (id, name)) in [("b", "Krakow"), ("c", "Wroclaw"), ("d", "Gdansk")]
+            .into_iter()
+            .enumerate()
+        {
+            let rel = format!("{dir}/seg-extra-{n}.seg");
+            let values_rel = format!("{dir}/seg-extra-{n}.values");
+            let mut builder = FuzzySegmentBuilder::new(root.join(&rel)).unwrap();
+            builder.add_document(id, name).unwrap();
+            builder.finish(root.join(&values_rel)).unwrap();
+            manifest.segments.push(rel);
+            manifest.values.push(values_rel);
+        }
+        let mut wtxn = store.env().write_txn().unwrap();
+        c.put_fuzzy_segment_manifest(&mut wtxn, "name", &manifest)
+            .unwrap();
+        let def = c
+            .search_index_def(&wtxn, SearchKind::Fuzzy, "name")
+            .unwrap()
+            .unwrap();
+        c.maybe_compact_fuzzy_segments(&mut wtxn, &def).unwrap();
+        wtxn.commit().unwrap();
+        let rtxn = store.env().read_txn().unwrap();
+        let compacted = c.fuzzy_segment_manifest_in(&rtxn, "name").unwrap().unwrap();
+        assert_eq!(compacted.segments.len(), 2);
+        assert_eq!(compacted.values.len(), 2);
+        drop(rtxn);
+        let hits = c
+            .fuzzy_search("name", "Krakw", 1, &json!({}), Some(10))
+            .unwrap();
+        assert_eq!(hits[0]["_id"], "b");
     }
 
     #[test]

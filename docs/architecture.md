@@ -602,7 +602,12 @@ NONODB_SEGMENT_TEXT=1 NONODB_SEGMENT_FUZZY=1 nonodb-daemon
 the small in-memory delta are tracked in LMDB metadata; documents remain in
 LMDB. Writes update a delta, and every 4096 changed documents the delta is
 flushed to a new immutable segment. Tombstone generations hide older versions,
-so an update does not resurrect a deleted document after a flush.
+so an update does not resurrect a deleted document after a flush. Once four
+segments exist, the writer compacts the flushed suffix into one new segment by
+re-reading the current documents from LMDB. The first (base) segment is kept;
+compaction is skipped when the suffix exceeds 200,000 documents. Tombstones are
+clamped to the compacted generation, and files left by an earlier compaction
+are removed at the start of the next one.
 
 Current limits:
 
@@ -613,7 +618,8 @@ Current limits:
   from a single global index after several flushes;
 - fuzzy search uses a segment-native trigram index and value sidecar when
   `NONODB_SEGMENT_FUZZY=1`; filters are not supported by that path;
-- fuzzy and text segments have no automatic compaction yet.
+- compaction merges the flushed suffix, not the base segment; a very large
+  suffix is left alone until an explicit full rebuild.
 
 Dropping the index removes its manifest, delta keys, and segment directory.
 Backups continue to contain only LMDB; rebuild segment indexes after a restore.

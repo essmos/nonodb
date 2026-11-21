@@ -188,8 +188,9 @@ The segment backend is now selectable in the daemon with
 `NONODB_SEGMENT_TEXT=1`, with a durable delta, tombstone generations, and
 synchronous flushes. It is still experimental: filters and phrases are not
 supported by the segment path, and BM25 scores are merged per segment. Both p50
-and the tail are now in the target range for this data set; the next work is
-compaction, filters/phrases, and a fair concurrent comparison with Elasticsearch.
+and the tail are now in the target range for this data set. Flushed suffix
+segments are compacted automatically; the next work is filters/phrases, global
+BM25 statistics, and a fair concurrent comparison with Elasticsearch.
 
 #### Segment fuzzy
 

@@ -7,6 +7,10 @@ Full release notes: https://github.com/essmos/nonodb/releases
 - Plan segment fuzzy search from the rarest `3*d + 1` trigrams instead of
   merging every trigram posting list. On 808k real MS MARCO queries this moved
   p50 from 144.51 ms to **12.07 ms** and p95 from 279.97 ms to **21.76 ms**.
+- Automatically compact flushed text and fuzzy segment suffixes once four
+  segments exist. Compaction rebuilds the suffix from current LMDB documents,
+  clamps tombstones to the compacted generation, and skips suffixes larger than
+  200,000 documents.
 - Memory-map immutable fuzzy value sidecars as well, and add
   `fuzzy_segment_bench` for reproducible short-string fuzzy measurements.
 - Memory-map immutable segment files instead of issuing `pread` calls for
@@ -23,8 +27,7 @@ Full release notes: https://github.com/essmos/nonodb/releases
   `NONODB_SEGMENT_TEXT=1`. New text indexes get a durable manifest, LMDB-backed
   delta, tombstone generations, synchronous 4096-document flushes, and
   create/update/delete support. The daemon search path serves simple,
-  unfiltered native BM25 queries from segments. Filters, phrases, fuzzy search,
-  and automatic compaction still use or require the existing backends.
+  unfiltered native BM25 queries from segments.
 - Added `SegmentSet`, an in-memory delta layer over immutable segments with
   tombstone generations. Updates replace base documents without hiding later
   flushed versions; deletes survive delta flushes. This is the write-side
