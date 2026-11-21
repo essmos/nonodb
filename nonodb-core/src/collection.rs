@@ -27,7 +27,9 @@ use crate::query::{
     apply_upsert_with_options, apply_with_options, matches, path, seed_from_filter,
 };
 use crate::search::{self, SearchEngine, SearchIndexDef, SearchKind, TextQueryMode};
-use crate::search_segment::{SegmentBuilder, SegmentReader, SegmentSet};
+use crate::search_segment::{
+    FuzzySegmentBuilder, FuzzySegmentReader, SegmentBuilder, SegmentReader, SegmentSet,
+};
 use crate::store::MAX_DOCUMENT_BYTES;
 use crate::subscriptions::{self, Subscription};
 use crate::ttl::{self, TtlUpdate};
@@ -52,7 +54,19 @@ struct SegmentManifest {
     tombstones: HashMap<String, usize>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct FuzzySegmentManifest {
+    segments: Vec<String>,
+    values: Vec<String>,
+    tombstones: HashMap<String, usize>,
+}
+
 const SEGMENT_DELTA_FLUSH_DOCS: u64 = 4096;
+
+fn fuzzy_segment_index_dir(coll: &str, index: &str) -> String {
+    let digest = Sha256::digest(format!("fuzzy\0{coll}\0{index}").as_bytes());
+    format!("search/{digest:x}")
+}
 
 fn segment_index_dir(coll: &str, index: &str) -> String {
     let digest = Sha256::digest(format!("{coll}\0{index}").as_bytes());
@@ -2590,6 +2604,9 @@ impl<'e> Collection<'e> {
                 self.backfill_segment_text_index(wtxn, def)?
             }
             SearchKind::Text => self.backfill_text_search_index(wtxn, def)?,
+            SearchKind::Fuzzy if def.engine == SearchEngine::Segment => {
+                self.backfill_fuzzy_segment_index(wtxn, def)?
+            }
             SearchKind::Fuzzy => self.backfill_fuzzy_search_index(wtxn, def)?,
         }
         self.meta.put(
@@ -2732,6 +2749,160 @@ impl<'e> Collection<'e> {
         let mut def = SearchIndexDef::single(SearchKind::Text, field);
         def.engine = SearchEngine::Segment;
         self.create_search_index_txn(wtxn, &def)
+    }
+
+    pub fn create_fuzzy_segment_index(&self, field: &str) -> Result<()> {
+        let mut def = SearchIndexDef::single(SearchKind::Fuzzy, field);
+        def.engine = SearchEngine::Segment;
+        self.create_search_index(&def)
+    }
+
+    pub fn create_fuzzy_segment_index_txn(&self, wtxn: &mut RwTxn<'_>, field: &str) -> Result<()> {
+        let mut def = SearchIndexDef::single(SearchKind::Fuzzy, field);
+        def.engine = SearchEngine::Segment;
+        self.create_search_index_txn(wtxn, &def)
+    }
+
+    fn fuzzy_segment_manifest_key(&self, index: &str) -> String {
+        format!("fsegmanifest:{}:{index}", self.name)
+    }
+
+    fn fuzzy_segment_delta_prefix(&self, index: &str) -> String {
+        format!("fsegdelta:{}:{index}:", self.name)
+    }
+
+    fn fuzzy_segment_delta_count_key(&self, index: &str) -> String {
+        format!("fsegdeltacount:{}:{index}", self.name)
+    }
+
+    fn fuzzy_segment_manifest_in(
+        &self,
+        txn: &RoTxn<'_>,
+        index: &str,
+    ) -> Result<Option<FuzzySegmentManifest>> {
+        let key = self.fuzzy_segment_manifest_key(index);
+        let Some(bytes) = self.meta.get(txn, key.as_bytes())? else {
+            return Ok(None);
+        };
+        Ok(Some(serde_json::from_slice(bytes)?))
+    }
+
+    fn put_fuzzy_segment_manifest(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        index: &str,
+        manifest: &FuzzySegmentManifest,
+    ) -> Result<()> {
+        let key = self.fuzzy_segment_manifest_key(index);
+        self.meta.put(
+            &mut *wtxn,
+            key.as_bytes(),
+            serde_json::to_vec(manifest)?.as_slice(),
+        )?;
+        Ok(())
+    }
+
+    fn fuzzy_segment_delta_count(&self, txn: &RoTxn<'_>, index: &str) -> u64 {
+        self.meta
+            .get(txn, self.fuzzy_segment_delta_count_key(index).as_bytes())
+            .ok()
+            .flatten()
+            .and_then(search::read_u64)
+            .unwrap_or(0)
+    }
+
+    fn set_fuzzy_segment_delta_count(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        index: &str,
+        count: u64,
+    ) -> Result<()> {
+        self.meta.put(
+            &mut *wtxn,
+            self.fuzzy_segment_delta_count_key(index).as_bytes(),
+            &count.to_le_bytes(),
+        )?;
+        Ok(())
+    }
+
+    fn backfill_fuzzy_segment_index(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        def: &SearchIndexDef,
+    ) -> Result<()> {
+        if def.fields.len() != 1 {
+            return Err(Error::Query(
+                "segment fuzzy indexes support exactly one field".into(),
+            ));
+        }
+        let root = self.segment_root()?;
+        let dir = fuzzy_segment_index_dir(&self.name, &def.name);
+        let rel = format!("{dir}/seg-000000.seg");
+        let values_rel = format!("{dir}/seg-000000.values");
+        let path = root.join(&rel);
+        let values_path = root.join(&values_rel);
+        let mut builder = FuzzySegmentBuilder::new(&path)?;
+        let field = &def.fields[0].path;
+        for item in self.db.iter(&*wtxn)? {
+            let (id_bytes, doc_bytes) = item?;
+            let id = std::str::from_utf8(id_bytes)
+                .map_err(|e| Error::Query(format!("invalid document id: {e}")))?;
+            let doc: Value = serde_json::from_slice(doc_bytes)?;
+            if let Some(text) = index::field_value(&doc, field).and_then(search::field_text) {
+                builder.add_document(id, &text)?;
+            }
+        }
+        builder.finish(&values_path)?;
+        let manifest = FuzzySegmentManifest {
+            segments: vec![rel],
+            values: vec![values_rel],
+            tombstones: HashMap::new(),
+        };
+        self.put_fuzzy_segment_manifest(wtxn, &def.name, &manifest)?;
+        self.set_fuzzy_segment_delta_count(wtxn, &def.name, 0)?;
+        Ok(())
+    }
+
+    fn flush_fuzzy_segment_delta(&self, wtxn: &mut RwTxn<'_>, def: &SearchIndexDef) -> Result<()> {
+        let Some(mut manifest) = self.fuzzy_segment_manifest_in(&*wtxn, &def.name)? else {
+            return Ok(());
+        };
+        let prefix = self.fuzzy_segment_delta_prefix(&def.name);
+        let mut entries: Vec<(String, String)> = Vec::new();
+        for item in self.meta.prefix_iter(&*wtxn, prefix.as_bytes())? {
+            let (key, value) = item?;
+            let id = std::str::from_utf8(&key[prefix.len()..])
+                .map_err(|e| Error::Query(format!("invalid fuzzy delta id: {e}")))?;
+            let text = std::str::from_utf8(value)
+                .map_err(|e| Error::Query(format!("invalid fuzzy delta text: {e}")))?;
+            entries.push((id.to_string(), text.to_string()));
+        }
+        if entries.is_empty() {
+            self.set_fuzzy_segment_delta_count(wtxn, &def.name, 0)?;
+            return Ok(());
+        }
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        let root = self.segment_root()?;
+        let dir = fuzzy_segment_index_dir(&self.name, &def.name);
+        let gen = manifest.segments.len();
+        let rel = format!("{dir}/seg-{gen:06}.seg");
+        let values_rel = format!("{dir}/seg-{gen:06}.values");
+        let path = root.join(&rel);
+        let values_path = root.join(&values_rel);
+        let mut builder = FuzzySegmentBuilder::new(&path)?;
+        for (id, text) in &entries {
+            builder.add_document(id, text)?;
+        }
+        builder.finish(&values_path)?;
+        manifest.segments.push(rel);
+        manifest.values.push(values_rel);
+        self.put_fuzzy_segment_manifest(wtxn, &def.name, &manifest)?;
+        for (id, _) in &entries {
+            let key = format!("{prefix}{id}");
+            self.meta.delete(&mut *wtxn, key.as_bytes())?;
+        }
+        self.set_fuzzy_segment_delta_count(wtxn, &def.name, 0)?;
+        Ok(())
     }
 
     fn segment_root(&self) -> Result<std::path::PathBuf> {
@@ -2944,9 +3115,21 @@ impl<'e> Collection<'e> {
         let def: SearchIndexDef = serde_json::from_slice(bytes)?;
         self.meta.delete(&mut *wtxn, def_key.as_bytes())?;
         if def.engine == SearchEngine::Segment {
-            self.meta
-                .delete(&mut *wtxn, self.segment_manifest_key(&def.name).as_bytes())?;
-            let prefix = self.segment_delta_prefix(&def.name);
+            let (manifest_key, prefix, count_key, dir) = match def.kind {
+                SearchKind::Text => (
+                    self.segment_manifest_key(&def.name),
+                    self.segment_delta_prefix(&def.name),
+                    self.segment_delta_count_key(&def.name),
+                    segment_index_dir(&self.name, &def.name),
+                ),
+                SearchKind::Fuzzy => (
+                    self.fuzzy_segment_manifest_key(&def.name),
+                    self.fuzzy_segment_delta_prefix(&def.name),
+                    self.fuzzy_segment_delta_count_key(&def.name),
+                    fuzzy_segment_index_dir(&self.name, &def.name),
+                ),
+            };
+            self.meta.delete(&mut *wtxn, manifest_key.as_bytes())?;
             let keys: Vec<Vec<u8>> = self
                 .meta
                 .prefix_iter(&*wtxn, prefix.as_bytes())?
@@ -2955,15 +3138,9 @@ impl<'e> Collection<'e> {
             for key in keys {
                 self.meta.delete(&mut *wtxn, &key)?;
             }
-            self.meta.delete(
-                &mut *wtxn,
-                self.segment_delta_count_key(&def.name).as_bytes(),
-            )?;
+            self.meta.delete(&mut *wtxn, count_key.as_bytes())?;
             if let Some(store) = self.store {
-                let dir = store
-                    .env()
-                    .path()
-                    .join(segment_index_dir(&self.name, &def.name));
+                let dir = store.env().path().join(dir);
                 match std::fs::remove_dir_all(&dir) {
                     Ok(()) => {}
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -3148,6 +3325,49 @@ impl<'e> Collection<'e> {
         Ok(())
     }
 
+    fn apply_segment_fuzzy_entry(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        def: &SearchIndexDef,
+        old_text: Option<&str>,
+        new_text: Option<&str>,
+        id: &str,
+    ) -> Result<()> {
+        let prefix = self.fuzzy_segment_delta_prefix(&def.name);
+        let key = format!("{prefix}{id}");
+        let existed = self.meta.get(&*wtxn, key.as_bytes())?.is_some();
+        let mut count = self.fuzzy_segment_delta_count(&*wtxn, &def.name);
+        let mut manifest = self
+            .fuzzy_segment_manifest_in(&*wtxn, &def.name)?
+            .unwrap_or_default();
+        let mut manifest_changed = false;
+        if old_text.is_some() {
+            manifest
+                .tombstones
+                .insert(id.to_string(), manifest.segments.len());
+            manifest_changed = true;
+        }
+        if let Some(text) = new_text {
+            self.meta.put(&mut *wtxn, key.as_bytes(), text.as_bytes())?;
+            if !existed {
+                count = count.saturating_add(1);
+            }
+        } else {
+            self.meta.delete(&mut *wtxn, key.as_bytes())?;
+            if existed {
+                count = count.saturating_sub(1);
+            }
+        }
+        if manifest_changed {
+            self.put_fuzzy_segment_manifest(wtxn, &def.name, &manifest)?;
+        }
+        self.set_fuzzy_segment_delta_count(wtxn, &def.name, count)?;
+        if count >= SEGMENT_DELTA_FLUSH_DOCS {
+            self.flush_fuzzy_segment_delta(wtxn, def)?;
+        }
+        Ok(())
+    }
+
     /// Maintains trigram indexes on an `old -> new` change.
     fn apply_fuzzy_entries(
         &self,
@@ -3170,6 +3390,16 @@ impl<'e> Collection<'e> {
                     .and_then(search::field_text)
                     .map(|t| search::normalize(&t));
                 if old_text == new_text {
+                    continue;
+                }
+                if def.engine == SearchEngine::Segment {
+                    self.apply_segment_fuzzy_entry(
+                        wtxn,
+                        &def,
+                        old_text.as_deref(),
+                        new_text.as_deref(),
+                        id,
+                    )?;
                     continue;
                 }
                 let db = self.fuzzy_db_in(wtxn, &def.name, &field.path)?;
@@ -3885,6 +4115,78 @@ impl<'e> Collection<'e> {
         })
     }
 
+    fn search_segment_fuzzy_in(
+        &self,
+        rtxn: &RoTxn<'_>,
+        def: &SearchIndexDef,
+        query: &str,
+        max_distance: usize,
+        limit: Option<usize>,
+    ) -> Result<Vec<Value>> {
+        let limit = limit.unwrap_or(10).min(1000);
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let Some(manifest) = self.fuzzy_segment_manifest_in(rtxn, &def.name)? else {
+            return Ok(Vec::new());
+        };
+        let root = self.segment_root()?;
+        let prefix = self.fuzzy_segment_delta_prefix(&def.name);
+        let delta_count = self.fuzzy_segment_delta_count(rtxn, &def.name) as usize;
+        let want = limit
+            .saturating_add(manifest.tombstones.len())
+            .saturating_add(delta_count)
+            .max(limit);
+        let mut merged: HashMap<String, usize> = HashMap::new();
+        for (idx, (segment, values)) in manifest.segments.iter().zip(&manifest.values).enumerate() {
+            let reader = FuzzySegmentReader::open(root.join(segment), root.join(values))?;
+            for hit in reader.search(query, max_distance, want)? {
+                let hidden = manifest
+                    .tombstones
+                    .get(&hit.id)
+                    .is_some_and(|deleted_at| idx < *deleted_at);
+                if !hidden {
+                    merged
+                        .entry(hit.id)
+                        .and_modify(|distance| *distance = (*distance).min(hit.distance))
+                        .or_insert(hit.distance);
+                }
+            }
+        }
+        let normalized = search::normalize(query);
+        for item in self.meta.prefix_iter(rtxn, prefix.as_bytes())? {
+            let (key, value) = item?;
+            let id = std::str::from_utf8(&key[prefix.len()..])
+                .map_err(|e| Error::Query(format!("invalid fuzzy delta id: {e}")))?;
+            let text = std::str::from_utf8(value)
+                .map_err(|e| Error::Query(format!("invalid fuzzy delta text: {e}")))?;
+            if let Some(distance) = search::fuzzy_distance(text, &normalized, max_distance) {
+                merged
+                    .entry(id.to_string())
+                    .and_modify(|current| *current = (*current).min(distance))
+                    .or_insert(distance);
+            }
+        }
+        let mut hits: Vec<(usize, String)> = merged
+            .into_iter()
+            .map(|(id, distance)| (distance, id))
+            .collect();
+        hits.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        hits.truncate(limit);
+        let mut out = Vec::with_capacity(hits.len());
+        for (distance, id) in hits {
+            let Some(bytes) = self.db.get(rtxn, id.as_bytes())? else {
+                continue;
+            };
+            let mut doc: Value = serde_json::from_slice(bytes)?;
+            if let Some(obj) = doc.as_object_mut() {
+                obj.insert("_distance".to_string(), serde_json::json!(distance));
+            }
+            out.push(doc);
+        }
+        Ok(out)
+    }
+
     /// Approximate search (trigrams + Levenshtein). Results include `_distance`.
     pub fn fuzzy_search(
         &self,
@@ -3910,11 +4212,16 @@ impl<'e> Collection<'e> {
         limit: Option<usize>,
     ) -> Result<Vec<Value>> {
         crate::query::validate::validate_filter(filter)?;
-        if self
-            .search_index_def(rtxn, SearchKind::Fuzzy, field)?
-            .is_none()
-        {
+        let Some(def) = self.search_index_def(rtxn, SearchKind::Fuzzy, field)? else {
             return Err(Error::Query(format!("no fuzzy index on field `{field}`")));
+        };
+        if def.engine == SearchEngine::Segment {
+            if !filter.as_object().is_none_or(|object| object.is_empty()) {
+                return Err(Error::Query(
+                    "segment fuzzy indexes do not support filters".into(),
+                ));
+            }
+            return self.search_segment_fuzzy_in(rtxn, &def, query, max_distance, limit);
         }
         let Some(db) = self.fuzzy_db(rtxn, field, field)? else {
             return Err(Error::Query(format!("no fuzzy index on field `{field}`")));
@@ -10616,6 +10923,40 @@ mod tests {
             ids(c.search("body", "python", &json!({}), 0, Some(10)).unwrap()),
             vec!["a".to_string(), "c".to_string()]
         );
+    }
+
+    #[test]
+    fn segment_fuzzy_index_supports_crud() {
+        let (_dir, store) = store();
+        let c = store.collection("segment_fuzzy_crud").unwrap();
+        for doc in [
+            json!({"_id": "a", "name": "Warszawa"}),
+            json!({"_id": "b", "name": "Krakow"}),
+            json!({"_id": "c", "name": "Wroclaw"}),
+        ] {
+            c.insert_one(doc).unwrap();
+        }
+        c.create_fuzzy_segment_index("name").unwrap();
+        let hits = c
+            .fuzzy_search("name", "Warszwa", 2, &json!({}), Some(10))
+            .unwrap();
+        assert_eq!(hits[0]["_id"], "a");
+        assert_eq!(hits[0]["_distance"], 1);
+        c.update(
+            &json!({"_id": "a"}),
+            &json!({"$set": {"name": "Berlin"}}),
+            false,
+        )
+        .unwrap();
+        assert!(c
+            .fuzzy_search("name", "Warszwa", 1, &json!({}), Some(10))
+            .unwrap()
+            .is_empty());
+        c.delete(&json!({"_id": "b"}), false).unwrap();
+        assert!(c
+            .fuzzy_search("name", "Krakw", 1, &json!({}), Some(10))
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

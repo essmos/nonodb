@@ -588,11 +588,12 @@ application or a separate embedding service; the daemon does not run a model.
 
 ## Segment text index (experimental)
 
-New text indexes can use the internal immutable segment backend instead of
-LMDB postings. Enable it on the daemon before creating the index:
+New text and fuzzy indexes can use the internal immutable segment backend
+instead of LMDB postings. Enable the desired backend on the daemon before
+creating the index:
 
 ```bash
-NONODB_SEGMENT_TEXT=1 nonodb-daemon
+NONODB_SEGMENT_TEXT=1 NONODB_SEGMENT_FUZZY=1 nonodb-daemon
 ```
 
 `create_text_index` then writes a segment manifest and one or more
@@ -609,9 +610,9 @@ Current limits:
   or filters;
 - segment scores are merged per segment, so absolute BM25 scores can differ
   from a single global index after several flushes;
-- there is no automatic compaction of old segments yet;
-- fuzzy search still uses the LMDB trigram backend. A segment-native
-  `FuzzySegmentReader` exists, but it is not wired into the daemon path yet.
+- fuzzy search uses a segment-native trigram index and value sidecar when
+  `NONODB_SEGMENT_FUZZY=1`; filters are not supported by that path;
+- fuzzy and text segments have no automatic compaction yet.
 
 Dropping the index removes its manifest, delta keys, and segment directory.
 Backups continue to contain only LMDB; rebuild segment indexes after a restore.
