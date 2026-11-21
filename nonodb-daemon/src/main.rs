@@ -41,7 +41,7 @@ mod s3_import;
 mod server_info;
 mod writer;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -275,16 +275,37 @@ async fn run_async() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
     {
-        let store = default.store.clone();
-        for name in store.collections()? {
-            let collection = store.collection(&name)?;
-            let migrated = collection.migrate_search_indexes_to_segment()?;
-            if migrated > 0 {
-                tracing::info!(
-                    collection = %name,
-                    migrated,
-                    "migrated legacy search indexes to segments"
-                );
+        if !replicator::role_is_primary() {
+            tracing::warn!("skipping search segment migration on a non-primary node");
+        } else {
+            let selected: HashSet<String> = std::env::var("NONODB_MIGRATE_SEARCH_COLLECTIONS")
+                .unwrap_or_default()
+                .split(',')
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(ToString::to_string)
+                .collect();
+            for db_name in databases.names().await {
+                let runtime = databases
+                    .get(&db_name)
+                    .await
+                    .map_err(|e| -> Box<dyn std::error::Error> { e.message.into() })?;
+                let store = runtime.store.clone();
+                for name in store.collections()? {
+                    if !selected.is_empty() && !selected.contains(&name) {
+                        continue;
+                    }
+                    let collection = store.collection(&name)?;
+                    let migrated = collection.migrate_search_indexes_to_segment()?;
+                    if migrated > 0 {
+                        tracing::info!(
+                            database = %db_name,
+                            collection = %name,
+                            migrated,
+                            "migrated legacy search indexes to segments"
+                        );
+                    }
+                }
             }
         }
     }

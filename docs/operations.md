@@ -140,6 +140,7 @@ secrets.
 | `NONODB_REBUILD_MISSING_SEARCH` | `0` | Rebuild missing text/fuzzy segment files and vector ANN sidecars for all databases at startup |
 | `NONODB_REBUILD_SEARCH_STATS` | `0` | Fill missing exact BM25 statistics for segment text indexes at startup; use `force` to recompute every index |
 | `NONODB_REBUILD_SEARCH_STATS_COLLECTIONS` | unset | Comma-separated collections for search-statistics rebuild |
+| `NONODB_MIGRATE_SEARCH_COLLECTIONS` | unset | Comma-separated collections to migrate to segment search when `NONODB_MIGRATE_SEARCH_SEGMENTS=1` |
 | `NONODB_MIGRATE_SEARCH_SEGMENTS` | `0` | Migrate legacy LMDB text/fuzzy indexes to segments in the default database at startup |
 | `NONODB_BUILD_VECTOR_ANN` | `0` | Build missing vector ANN sidecars in the default database at startup |
 | `NONODB_VECTOR_ANN_PROBE` | `16` | Clusters probed by an ANN vector query; can be changed at restart without rebuilding the sidecar |

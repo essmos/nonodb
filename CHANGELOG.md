@@ -16,6 +16,8 @@ Full release notes: https://github.com/essmos/nonodb/releases
   instead of reporting their LMDB postings as missing.
 - Transfer search segment and vector ANN sidecars during replication snapshot
   bootstrap, with a rebuild fallback when a source file is unavailable.
+- Run legacy search-index migration across all databases and allow limiting it
+  with `NONODB_MIGRATE_SEARCH_COLLECTIONS`; skip migration on non-primary nodes.
 - Document the 100M vector ANN sidecar result and the 8.84M concurrent search
   benchmark.
 - Add the HTTP/JSON `drop_collection` operation. It removes documents, indexes,
