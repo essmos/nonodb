@@ -723,7 +723,7 @@ impl SegmentReader {
             for (_, entry, idf) in entries {
                 cursors.push(Cursor::new(self, entry, idf)?);
             }
-            self.search_and_rarest(&mut cursors, avgdl, limit, &mut heap)?;
+            self.search_and_rarest(cursors, avgdl, limit, &mut heap)?;
         }
 
         let mut hits = heap
@@ -775,9 +775,69 @@ impl SegmentReader {
         Ok(())
     }
 
+    fn search_wand(
+        &self,
+        mut cursors: Vec<Cursor<'_>>,
+        avgdl: f64,
+        limit: usize,
+        heap: &mut BinaryHeap<Reverse<ScoredDoc>>,
+    ) -> io::Result<()> {
+        let term_count = cursors.len();
+        loop {
+            if cursors.iter().any(|cursor| cursor.current().is_none()) {
+                break;
+            }
+            cursors.sort_unstable_by_key(|cursor| cursor.current().map(|p| p.doc));
+            let threshold = if heap.len() >= limit {
+                heap.peek().map(|r| r.0.score).unwrap_or(0.0)
+            } else {
+                0.0
+            };
+            let mut upper = 0.0f64;
+            let mut pivot = 0u32;
+            let mut pivot_idx = 0usize;
+            let mut found = false;
+            for (idx, cursor) in cursors.iter().enumerate() {
+                upper += cursor.term_max;
+                if upper > threshold {
+                    pivot = cursor.current().unwrap().doc;
+                    pivot_idx = idx;
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                break;
+            }
+            let first_doc = cursors[0].current().unwrap().doc;
+            if first_doc == pivot {
+                let mut matched = 0usize;
+                let mut score = 0.0f64;
+                for cursor in cursors.iter_mut() {
+                    if cursor.current().map(|p| p.doc) == Some(pivot) {
+                        let posting = cursor.current().unwrap();
+                        score += bm25(cursor.idf, posting.tf, posting.dl, avgdl);
+                        matched += 1;
+                        cursor.advance()?;
+                    }
+                }
+                if matched == term_count {
+                    push_hit(heap, ScoredDoc { doc: pivot, score }, limit);
+                }
+            } else {
+                for cursor in cursors.iter_mut().take(pivot_idx) {
+                    if cursor.current().map(|p| p.doc) < Some(pivot) {
+                        cursor.skip_to(pivot)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn search_and_rarest(
         &self,
-        cursors: &mut Vec<Cursor<'_>>,
+        mut cursors: Vec<Cursor<'_>>,
         avgdl: f64,
         limit: usize,
         heap: &mut BinaryHeap<Reverse<ScoredDoc>>,
@@ -785,6 +845,10 @@ impl SegmentReader {
         // Walk the shortest posting list and skip the other cursors to each
         // candidate. This turns an AND query into one scan of its rarest term
         // instead of touching every posting for every term.
+        let doc_count = u64::from(self.header.doc_count);
+        if u64::from(cursors[0].df).saturating_mul(20) > doc_count {
+            return self.search_wand(cursors, avgdl, limit, heap);
+        }
         let mut rare_cursor = cursors.remove(0);
         while let Some(posting) = rare_cursor.current() {
             // Align the next-rarest cursor with this rare block. If the block
@@ -848,6 +912,8 @@ fn bm25(idf: f64, tf: u32, dl: u32, avgdl: f64) -> f64 {
 struct Cursor<'a> {
     reader: &'a SegmentReader,
     idf: f64,
+    df: u32,
+    term_max: f64,
     next_block: u64,
     remaining_blocks: u32,
     block: Vec<Posting>,
@@ -862,6 +928,8 @@ impl<'a> Cursor<'a> {
         let mut cursor = Self {
             reader,
             idf,
+            df: entry.df,
+            term_max: idf * entry.max_tf_norm,
             next_block: entry.postings_off,
             remaining_blocks: entry.block_count,
             block: Vec::new(),

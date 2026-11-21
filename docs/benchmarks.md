@@ -174,10 +174,10 @@ was run on the same full MS MARCO corpus:
 | Terms | **1,576,221** |
 | Postings | **357,334,107** |
 | Segment file | **1.43 GB** |
-| Query p50 | **7.40 ms** |
-| Query p95 | **239.71 ms** |
-| Query p99 | **403.73 ms** |
-| Query throughput | **24.5 qps** (single client) |
+| Query p50 | **7.34 ms** |
+| Query p95 | **235.28 ms** |
+| Query p99 | **404.37 ms** |
+| Query throughput | **24.9 qps** (single client) |
 
 The 1M real subset gives p50 **0.45 ms**, p95 **9.26 ms**, and p99 **29.81 ms**.
 This is still a standalone benchmark, not yet the daemon search path. The p50 is

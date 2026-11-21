@@ -9,7 +9,9 @@ Full release notes: https://github.com/essmos/nonodb/releases
   example. It writes sorted term blocks, delta-encoded postings, and a compact
   term index without an external search engine. On the full 8.84M MS MARCO
   corpus it built in 397.5 s to a 1.43 GB segment and answered real queries at
-  p50 7.40 ms / p95 239.71 ms / p99 403.73 ms with one client. The backend is
+  p50 7.34 ms / p95 235.28 ms / p99 404.37 ms with one client. Multi-term
+  queries use a WAND-style upper-bound path when the rarest term is common;
+  rare-term queries keep the rarest-first block-skipping path. The backend is
   not yet wired into `Collection::search`; block-max WAND is the next step for
   the p95 tail.
 - Added `scripts/load_msmarco.py` and `scripts/msmarco_bench.py` and loaded the
