@@ -8,8 +8,8 @@ Full release notes: https://github.com/essmos/nonodb/releases
   (`nonodb-core/src/search_segment.rs`) and a standalone `segment_bench`
   example. It writes sorted term blocks, delta-encoded postings, and a compact
   term index without an external search engine. On the full 8.84M MS MARCO
-  corpus it built in 393 s to a 1.43 GB segment and answered real queries at
-  p50 7.33 ms / p95 240.53 ms / p99 397.34 ms with one client. The backend is
+  corpus it built in 397.5 s to a 1.43 GB segment and answered real queries at
+  p50 7.40 ms / p95 239.71 ms / p99 403.73 ms with one client. The backend is
   not yet wired into `Collection::search`; block-max WAND is the next step for
   the p95 tail.
 - Added `scripts/load_msmarco.py` and `scripts/msmarco_bench.py` and loaded the

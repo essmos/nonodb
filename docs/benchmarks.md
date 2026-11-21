@@ -170,16 +170,16 @@ was run on the same full MS MARCO corpus:
 
 | Metric | Full 8.84M passages |
 |---|---:|
-| Build | **393.2 s** |
+| Build | **397.5 s** |
 | Terms | **1,576,221** |
 | Postings | **357,334,107** |
 | Segment file | **1.43 GB** |
-| Query p50 | **7.33 ms** |
-| Query p95 | **240.53 ms** |
-| Query p99 | **397.34 ms** |
-| Query throughput | **24.8 qps** (single client) |
+| Query p50 | **7.40 ms** |
+| Query p95 | **239.71 ms** |
+| Query p99 | **403.73 ms** |
+| Query throughput | **24.5 qps** (single client) |
 
-The 1M real subset gives p50 **0.48 ms**, p95 **9.02 ms**, and p99 **29.38 ms**.
+The 1M real subset gives p50 **0.45 ms**, p95 **9.26 ms**, and p99 **29.81 ms**.
 This is still a standalone benchmark, not yet the daemon search path. The p50 is
 already in the target range; the tail needs block-max WAND (or equivalent) before
 the segment backend replaces the LMDB posting path for every query.
