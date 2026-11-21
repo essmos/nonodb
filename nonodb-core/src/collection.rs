@@ -3092,6 +3092,7 @@ impl<'e> Collection<'e> {
                 tombstones: HashMap::new(),
             },
         )?;
+        self.rebuild_segment_stats(wtxn, def)?;
         Ok(())
     }
 
@@ -3460,6 +3461,164 @@ impl<'e> Collection<'e> {
         format!("segmanifest:{}:{index}", self.name)
     }
 
+    fn segment_stats_key(&self, index: &str) -> String {
+        format!("segstats:{}:{index}", self.name)
+    }
+
+    fn segment_stats_df_prefix(&self, index: &str) -> String {
+        format!("segstatsdf:{}:{index}:", self.name)
+    }
+
+    fn segment_stats_df_key(&self, index: &str, term: &str) -> String {
+        format!("segstatsdf:{}:{index}:{term}", self.name)
+    }
+
+    fn segment_stats_in(&self, txn: &RoTxn<'_>, index: &str) -> Result<Option<(u64, u64)>> {
+        let Some(bytes) = self
+            .meta
+            .get(txn, self.segment_stats_key(index).as_bytes())?
+        else {
+            return Ok(None);
+        };
+        if bytes.len() != 16 {
+            return Ok(None);
+        }
+        let documents = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+        let total_doc_len = u64::from_le_bytes(bytes[8..].try_into().unwrap());
+        Ok(Some((documents, total_doc_len)))
+    }
+
+    fn put_segment_stats(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        index: &str,
+        documents: u64,
+        total_doc_len: u64,
+    ) -> Result<()> {
+        let mut value = [0u8; 16];
+        value[..8].copy_from_slice(&documents.to_le_bytes());
+        value[8..].copy_from_slice(&total_doc_len.to_le_bytes());
+        self.meta
+            .put(&mut *wtxn, self.segment_stats_key(index).as_bytes(), &value)?;
+        Ok(())
+    }
+
+    fn segment_df_in(&self, txn: &RoTxn<'_>, index: &str, term: &str) -> Result<u64> {
+        Ok(self
+            .meta
+            .get(txn, self.segment_stats_df_key(index, term).as_bytes())?
+            .and_then(search::read_u64)
+            .unwrap_or(0))
+    }
+
+    fn set_segment_df(&self, wtxn: &mut RwTxn<'_>, index: &str, term: &str, df: u64) -> Result<()> {
+        let key = self.segment_stats_df_key(index, term);
+        if df == 0 {
+            self.meta.delete(&mut *wtxn, key.as_bytes())?;
+        } else {
+            self.meta
+                .put(&mut *wtxn, key.as_bytes(), &df.to_le_bytes())?;
+        }
+        Ok(())
+    }
+
+    fn clear_segment_stats(&self, wtxn: &mut RwTxn<'_>, index: &str) -> Result<()> {
+        self.meta
+            .delete(&mut *wtxn, self.segment_stats_key(index).as_bytes())?;
+        let prefix = self.segment_stats_df_prefix(index);
+        let keys: Vec<Vec<u8>> = self
+            .meta
+            .prefix_iter(&*wtxn, prefix.as_bytes())?
+            .map(|item| item.map(|(key, _)| key.to_vec()))
+            .collect::<std::result::Result<_, _>>()?;
+        for key in keys {
+            self.meta.delete(&mut *wtxn, &key)?;
+        }
+        Ok(())
+    }
+
+    /// Recompute exact live BM25 statistics from the current documents.
+    fn rebuild_segment_stats(&self, wtxn: &mut RwTxn<'_>, def: &SearchIndexDef) -> Result<()> {
+        self.clear_segment_stats(wtxn, &def.name)?;
+        let field = &def.fields[0].path;
+        let mut documents = 0u64;
+        let mut total_doc_len = 0u64;
+        let mut df: HashMap<String, u64> = HashMap::new();
+        for item in self.db.iter(&*wtxn)? {
+            let (_, doc_bytes) = item?;
+            let doc: Value = serde_json::from_slice(doc_bytes)?;
+            let Some(text) = index::field_value(&doc, field).and_then(search::field_text) else {
+                continue;
+            };
+            let tokens = search::tokenize(&text);
+            documents += 1;
+            total_doc_len += tokens.len() as u64;
+            let mut terms: HashMap<&str, ()> = HashMap::new();
+            for token in &tokens {
+                terms.insert(token.as_str(), ());
+            }
+            for term in terms.keys() {
+                *df.entry((*term).to_string()).or_insert(0) += 1;
+            }
+        }
+        self.put_segment_stats(wtxn, &def.name, documents, total_doc_len)?;
+        for (term, count) in df {
+            self.set_segment_df(wtxn, &def.name, &term, count)?;
+        }
+        Ok(())
+    }
+
+    fn adjust_segment_stats(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        def: &SearchIndexDef,
+        old_text: Option<&str>,
+        new_text: Option<&str>,
+    ) -> Result<()> {
+        let Some((mut documents, mut total_doc_len)) = self.segment_stats_in(&*wtxn, &def.name)?
+        else {
+            // Existing segment indexes created before live statistics were
+            // introduced keep the segment-sum fallback until an explicit
+            // `rebuild_segment_text_stats()` run.
+            return Ok(());
+        };
+        let mut changes: HashMap<String, i64> = HashMap::new();
+        if let Some(text) = old_text {
+            documents = documents.saturating_sub(1);
+            let tokens = search::tokenize(text);
+            total_doc_len = total_doc_len.saturating_sub(tokens.len() as u64);
+            let mut terms: HashMap<&str, ()> = HashMap::new();
+            for token in &tokens {
+                terms.insert(token.as_str(), ());
+            }
+            for term in terms.keys() {
+                *changes.entry((*term).to_string()).or_insert(0) -= 1;
+            }
+        }
+        if let Some(text) = new_text {
+            documents += 1;
+            let tokens = search::tokenize(text);
+            total_doc_len += tokens.len() as u64;
+            let mut terms: HashMap<&str, ()> = HashMap::new();
+            for token in &tokens {
+                terms.insert(token.as_str(), ());
+            }
+            for term in terms.keys() {
+                *changes.entry((*term).to_string()).or_insert(0) += 1;
+            }
+        }
+        for (term, change) in changes {
+            if change == 0 {
+                continue;
+            }
+            let current = self.segment_df_in(&*wtxn, &def.name, &term)? as i64;
+            let next = (current + change).max(0) as u64;
+            self.set_segment_df(wtxn, &def.name, &term, next)?;
+        }
+        self.put_segment_stats(wtxn, &def.name, documents, total_doc_len)?;
+        Ok(())
+    }
+
     fn segment_delta_prefix(&self, index: &str) -> String {
         format!("segdelta:{}:{index}:", self.name)
     }
@@ -3541,6 +3700,7 @@ impl<'e> Collection<'e> {
         };
         self.put_segment_manifest(wtxn, &def.name, &manifest)?;
         self.set_segment_delta_count(wtxn, &def.name, 0)?;
+        self.rebuild_segment_stats(wtxn, def)?;
         Ok(())
     }
 
@@ -3744,6 +3904,35 @@ impl<'e> Collection<'e> {
         Ok(rebuilt)
     }
 
+    /// Recomputes exact live BM25 statistics for every segment-backed text index.
+    ///
+    /// Existing indexes created before live statistics were introduced keep
+    /// using the approximate fallback until this runs or until their next write.
+    pub fn rebuild_segment_text_stats(&self) -> Result<usize> {
+        let defs = {
+            let rtxn = self.read_txn()?;
+            let defs = self
+                .search_index_defs_in(&rtxn)?
+                .into_iter()
+                .filter(|def| {
+                    def.engine == SearchEngine::Segment
+                        && def.kind == SearchKind::Text
+                        && def.fields.len() == 1
+                })
+                .collect::<Vec<_>>();
+            rtxn.commit()?;
+            defs
+        };
+        let mut rebuilt = 0usize;
+        for def in defs {
+            let mut wtxn = self.write_txn()?;
+            self.rebuild_segment_stats(&mut wtxn, &def)?;
+            wtxn.commit()?;
+            rebuilt += 1;
+        }
+        Ok(rebuilt)
+    }
+
     /// Rebuilds one existing LMDB search index into an immutable segment index.
     ///
     /// The old index remains intact until the new segment manifest is complete.
@@ -3886,6 +4075,7 @@ impl<'e> Collection<'e> {
                 self.meta.delete(&mut *wtxn, &key)?;
             }
             self.meta.delete(&mut *wtxn, count_key.as_bytes())?;
+            self.clear_segment_stats(wtxn, &def.name)?;
             if let Some(store) = self.store {
                 let dir = store.env().path().join(dir);
                 match std::fs::remove_dir_all(&dir) {
@@ -3959,6 +4149,7 @@ impl<'e> Collection<'e> {
         if manifest_changed {
             self.put_segment_manifest(wtxn, &def.name, &manifest)?;
         }
+        self.adjust_segment_stats(wtxn, def, old_text, new_text)?;
         self.set_segment_delta_count(wtxn, &def.name, count)?;
         if count >= SEGMENT_DELTA_FLUSH_DOCS {
             self.flush_segment_delta(wtxn, def)?;
@@ -4256,6 +4447,16 @@ impl<'e> Collection<'e> {
             let text = std::str::from_utf8(value)
                 .map_err(|e| Error::Query(format!("invalid segment delta text: {e}")))?;
             set.add_document(id, text)?;
+        }
+        if let Some((documents, total_doc_len)) = self.segment_stats_in(rtxn, &def.name)? {
+            let mut terms = search::tokenize(query);
+            terms.sort();
+            terms.dedup();
+            let mut df = HashMap::with_capacity(terms.len());
+            for term in terms {
+                df.insert(term.clone(), self.segment_df_in(rtxn, &def.name, &term)?);
+            }
+            set.set_exact_stats(documents, total_doc_len, df);
         }
         let hits = set.search_verified(query, skip, max, allowed, verify)?;
         let mut out = Vec::with_capacity(hits.len());
@@ -11776,6 +11977,44 @@ mod tests {
             ids(c.search("body", "python", &json!({}), 0, Some(10)).unwrap()),
             vec!["a".to_string(), "c".to_string()]
         );
+    }
+
+    #[test]
+    fn segment_text_tracks_exact_live_stats() {
+        let (_dir, store) = store();
+        let c = store.collection("segment_text_stats").unwrap();
+        c.insert_one(json!({"_id": "a", "body": "alpha beta"}))
+            .unwrap();
+        c.insert_one(json!({"_id": "b", "body": "alpha"})).unwrap();
+        c.create_text_segment_index("body").unwrap();
+
+        c.update(
+            &json!({"_id": "a"}),
+            &json!({"$set": {"body": "gamma"}}),
+            false,
+        )
+        .unwrap();
+        c.delete(&json!({"_id": "b"}), false).unwrap();
+        c.insert_one(json!({"_id": "c", "body": "gamma gamma"}))
+            .unwrap();
+
+        let rtxn = store.read_txn().unwrap();
+        assert_eq!(c.segment_stats_in(&rtxn, "body").unwrap(), Some((2, 3)));
+        assert_eq!(c.segment_df_in(&rtxn, "body", "alpha").unwrap(), 0);
+        assert_eq!(c.segment_df_in(&rtxn, "body", "beta").unwrap(), 0);
+        assert_eq!(c.segment_df_in(&rtxn, "body", "gamma").unwrap(), 2);
+        rtxn.commit().unwrap();
+
+        // Older segment indexes have no stats keys; an explicit rebuild
+        // restores exact live statistics from the current documents.
+        let mut wtxn = store.write_txn().unwrap();
+        c.clear_segment_stats(&mut wtxn, "body").unwrap();
+        wtxn.commit().unwrap();
+        assert_eq!(c.rebuild_segment_text_stats().unwrap(), 1);
+        let rtxn = store.read_txn().unwrap();
+        assert_eq!(c.segment_stats_in(&rtxn, "body").unwrap(), Some((2, 3)));
+        assert_eq!(c.segment_df_in(&rtxn, "body", "gamma").unwrap(), 2);
+        rtxn.commit().unwrap();
     }
 
     #[test]

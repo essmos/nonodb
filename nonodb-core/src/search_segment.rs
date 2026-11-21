@@ -594,6 +594,16 @@ pub struct SegmentSet {
     /// id -> number of base segments that existed when the id was deleted.
     /// Segments created later (a replacement flush) are not hidden.
     tombstones: HashMap<String, usize>,
+    /// Durable live statistics maintained by the collection. When present,
+    /// these replace the approximate sum over all segment versions.
+    exact: Option<ExactSearchStats>,
+}
+
+#[derive(Debug, Clone)]
+struct ExactSearchStats {
+    documents: u64,
+    total_doc_len: u64,
+    df: HashMap<String, u64>,
 }
 
 impl Default for SegmentSet {
@@ -608,6 +618,7 @@ impl SegmentSet {
             segments: Vec::new(),
             delta: HashMap::new(),
             tombstones: HashMap::new(),
+            exact: None,
         }
     }
 
@@ -616,7 +627,21 @@ impl SegmentSet {
             segments,
             delta: HashMap::new(),
             tombstones: HashMap::new(),
+            exact: None,
         }
+    }
+
+    pub fn set_exact_stats(
+        &mut self,
+        documents: u64,
+        total_doc_len: u64,
+        df: HashMap<String, u64>,
+    ) {
+        self.exact = Some(ExactSearchStats {
+            documents,
+            total_doc_len,
+            df,
+        });
     }
 
     pub fn add_document(&mut self, id: &str, text: &str) -> io::Result<()> {
@@ -761,6 +786,21 @@ impl SegmentSet {
     }
 
     fn global_search_stats(&self, terms: &[String]) -> GlobalSearchStats {
+        if let Some(exact) = &self.exact {
+            return GlobalSearchStats {
+                documents: exact.documents,
+                total_doc_len: exact.total_doc_len,
+                df: terms
+                    .iter()
+                    .map(|term| {
+                        (
+                            term.clone(),
+                            exact.df.get(term).copied().unwrap_or(0) as u32,
+                        )
+                    })
+                    .collect(),
+            };
+        }
         let mut stats = GlobalSearchStats::default();
         for segment in &self.segments {
             stats.documents += u64::from(segment.documents());

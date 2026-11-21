@@ -187,7 +187,7 @@ immutable segment once and copying directly from mapped pages instead of
 issuing one `pread` per block header or posting block.
 The segment backend is the default for newly created text indexes in the
 daemon, with a durable delta, tombstone generations, and synchronous flushes.
-Set `NONODB_SEGMENT_TEXT=0` to keep LMDB for new indexes. Filters, phrases, negation, global BM25 statistics, and
+Set `NONODB_SEGMENT_TEXT=0` to keep LMDB for new indexes. Filters, phrases, negation, exact live BM25 statistics, and
 suffix/full compaction are supported; matching phrases add a score bonus, while
 phrase and non-indexed filter verification still loads candidate documents from
 LMDB, so their latency depends on query selectivity. The concurrent daemon and

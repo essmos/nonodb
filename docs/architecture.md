@@ -671,10 +671,12 @@ Current limits:
   after segment candidate generation; each matching phrase adds a score bonus;
 - filters use an indexed candidate set when possible; compound and non-indexed
   filters are verified against current documents and are correspondingly slower;
-- BM25 document frequency, document count, and average length are summed
-  across all base segments and the in-memory delta before scoring, so scores
-  are comparable after flushes instead of using each segment's local corpus
-  statistics;
+- BM25 document count, average length, and per-term document frequency are
+  maintained as exact live statistics in LMDB. Updates and deletes adjust the
+  counts transactionally, so tombstoned versions and old duplicate documents do
+  not inflate scores. Indexes created before live statistics existed use the
+  old segment-sum fallback until `NONODB_REBUILD_SEARCH_STATS=1` runs at
+  startup;
 - fuzzy search uses a segment-native trigram index and value sidecar when
   `NONODB_SEGMENT_FUZZY=1`; indexed filters use the candidate-set fast path, and
   compound or non-indexed filters verify the fetched candidate documents;
