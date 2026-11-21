@@ -36,7 +36,8 @@ Implemented:
 - index-only sorted scans and index-backed counts;
 - BM25 full-text search with diacritic folding and phrases;
 - fuzzy search with trigrams and bounded Levenshtein distance;
-- exact brute-force vector search with cosine, dot, and L2 metrics;
+- exact brute-force vector search with cosine, dot, and L2 metrics, plus an
+  optional internal IVF sidecar for approximate unfiltered queries;
 - read batches and atomic write batches;
 - ordered point lookups by `_id` or a unique single-field or compound index,
   with covering projections, index-only `_id` projections, `_id` exclusion, key
@@ -168,10 +169,10 @@ comparison and practical migration caveats.
 - No sparse/partial indexes, wildcard indexes, or text indexes with custom
   analyzers. Geo indexes currently cover single-field GeoJSON points;
   polygon/line document indexes are not implemented.
-- Vector indexes store one vector per document and scan the whole index for
-  each query. There is no ANN (HNSW/IVF/PQ), multi-vector document index, or
-  built-in embedding model; clients send ready vectors. Auto-index does not
-  create vector indexes automatically.
+- Vector indexes store one vector per document. Exact scan is the default and
+  fallback; an optional IVF sidecar accelerates unfiltered queries. There is no
+  HNSW/PQ, multi-vector document index, or built-in embedding model; clients
+  send ready vectors. Auto-index does not create vector indexes automatically.
 - Filtered vector search uses an exact `_id` or a secondary index when one is
   available. A highly selective filter on an unindexed field may require a full
   document scan.
@@ -320,7 +321,8 @@ project's target workload.
 ### Lower priority
 
 14. Sparse/partial and wildcard indexes.
-15. Approximate vector indexes (HNSW/IVF/PQ) and polygon/line document geo indexes.
+15. Advanced approximate vector indexes (HNSW/PQ) and polygon/line document geo
+    indexes. A basic IVF sidecar is implemented.
 16. Published package-registry releases for the existing Python, Rust, Node.js,
     and Go clients.
 17. Benchmark automation in CI.

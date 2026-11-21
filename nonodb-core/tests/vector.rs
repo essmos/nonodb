@@ -39,6 +39,34 @@ fn vector_index_backfills_and_ranks_by_distance() {
 }
 
 #[test]
+fn vector_ann_sidecar_serves_queries_and_falls_back_after_updates() {
+    let (_dir, store) = store();
+    let c = store.collection("vectors").unwrap();
+    let stats = c.build_vector_ann_index("embedding", 2).unwrap();
+    assert_eq!(stats.entries, 3);
+    let defs = c.list_vector_indexes().unwrap();
+    let ann = defs[0].ann.expect("ANN metadata");
+    assert_eq!(ann.nprobe, 1);
+
+    let results = c
+        .vector_search("embedding", &[1.0, 0.0], &json!({}), 0, Some(3))
+        .unwrap();
+    assert_eq!(results[0]["_id"], "a");
+
+    c.update(
+        &json!({"_id": "c"}),
+        &json!({"$set": {"embedding": [2.0, 0.0]}}),
+        false,
+    )
+    .unwrap();
+    let results = c
+        .vector_search("embedding", &[1.0, 0.0], &json!({}), 0, Some(2))
+        .unwrap();
+    assert_eq!(results[0]["_id"], "a");
+    assert_eq!(results[1]["_id"], "c");
+}
+
+#[test]
 fn vector_search_applies_filter_before_ranking() {
     let (_dir, store) = store();
     let c = store.collection("vectors").unwrap();

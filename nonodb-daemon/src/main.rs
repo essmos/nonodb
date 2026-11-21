@@ -278,6 +278,48 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    if std::env::var("NONODB_BUILD_VECTOR_ANN")
+        .ok()
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
+    {
+        let nprobe = std::env::var("NONODB_VECTOR_ANN_PROBE")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(16);
+        let only: Vec<String> = std::env::var("NONODB_VECTOR_ANN_COLLECTIONS")
+            .ok()
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let store = default.store.clone();
+        for name in store.collections()? {
+            if !only.is_empty() && !only.iter().any(|wanted| wanted == &name) {
+                continue;
+            }
+            let collection = store.collection(&name)?;
+            for def in collection.list_vector_indexes()? {
+                if def.ann.is_none() {
+                    let stats = collection.build_vector_ann_index(&def.field, nprobe)?;
+                    tracing::info!(
+                        collection = %name,
+                        field = %def.field,
+                        entries = stats.entries,
+                        clusters = stats.clusters,
+                        nprobe = stats.nprobe,
+                        bytes = stats.bytes,
+                        "built vector ANN sidecar"
+                    );
+                }
+            }
+        }
+    }
+
     let drain_timeout = drain_timeout();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let replication_shutdown = shutdown_tx.clone();
@@ -3220,6 +3262,7 @@ async fn exec_inner(
                             "dims": d.dims,
                             "metric": d.metric.as_str(),
                             "format": d.format,
+                            "ann": d.ann,
                         })
                     })
                     .collect();
@@ -4551,6 +4594,7 @@ fn execute_read(
                         "dims": d.dims,
                         "metric": d.metric.as_str(),
                         "format": d.format,
+                        "ann": d.ann,
                     })
                 })
                 .collect();

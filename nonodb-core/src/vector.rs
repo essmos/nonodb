@@ -47,6 +47,16 @@ pub struct VectorDef {
     pub metric: VectorMetric,
     #[serde(default = "default_format")]
     pub format: u8,
+    /// Optional immutable IVF sidecar. `None` means exact scan only.
+    #[serde(default)]
+    pub ann: Option<VectorAnnDef>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VectorAnnDef {
+    pub version: u32,
+    pub clusters: u32,
+    pub nprobe: u32,
 }
 
 fn default_format() -> u8 {
@@ -60,6 +70,7 @@ impl VectorDef {
             dims,
             metric,
             format: default_format(),
+            ann: None,
         }
     }
 }
@@ -70,6 +81,23 @@ pub fn db_name(coll: &str, field: &str) -> String {
 
 pub fn def_key(coll: &str, field: &str) -> String {
     format!("vecdef:{coll}:{field}")
+}
+
+pub fn ann_dirty_key(coll: &str, field: &str) -> String {
+    format!("vecanndirty:{coll}:{field}")
+}
+
+/// Decodes a value produced by [`encode_vector`].
+pub fn decode_vector(bytes: &[u8], dims: usize) -> Option<Vec<f32>> {
+    if bytes.len() != 4 + dims * 4 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(dims);
+    for index in 0..dims {
+        let start = 4 + index * 4;
+        out.push(f32::from_le_bytes(bytes[start..start + 4].try_into().ok()?));
+    }
+    Some(out)
 }
 
 /// Parses a JSON array of finite numbers with exactly `dims` elements.

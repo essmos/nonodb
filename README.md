@@ -171,9 +171,10 @@ single-database directories are migrated to `default/` on startup. See
   (`zażółć` → `zazolc`).
 - Quoted phrases requiring contiguous token sequences.
 - Fuzzy search with trigrams plus bounded Levenshtein distance (`_distance`).
-- Exact vector search with `cosine`, `dot`, and `l2` metrics. Vectors are
-  stored in LMDB and queried with a brute-force top-K scan; no external vector
-  service is required. Results include `_distance`, lowest first.
+- Vector search with `cosine`, `dot`, and `l2` metrics. Vectors are stored in
+  LMDB and queried with an exact top-K scan by default; an optional internal IVF
+  sidecar accelerates unfiltered queries. No external vector service is
+  required. Results include `_distance`, lowest first.
 - All search indexes are maintained in the same transaction as the document.
 
 ### Aggregation

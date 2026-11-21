@@ -11,6 +11,11 @@ Full release notes: https://github.com/essmos/nonodb/releases
 - Plan segment fuzzy search from the rarest `3*d + 1` trigrams instead of
   merging every trigram posting list. On 808k real MS MARCO queries this moved
   p50 from 144.51 ms to **12.07 ms** and p95 from 279.97 ms to **21.76 ms**.
+- Add an optional memory-mapped IVF sidecar for vector indexes. On the 10M
+  16D benchmark, p50 fell from 528 ms to 9.84 ms and p95 to 12.10 ms with
+  recall@10 1.0 on a 20-query sample. Build with
+  `NONODB_BUILD_VECTOR_ANN=1` and tune with `NONODB_VECTOR_ANN_PROBE`;
+  vector writes mark the sidecar dirty and fall back to exact search.
 - Add an in-place migration from legacy LMDB text/fuzzy indexes to immutable
   segment indexes. Set `NONODB_MIGRATE_SEARCH_SEGMENTS=1` at daemon startup, or
   call `migrate_search_indexes_to_segment()` from the core API.

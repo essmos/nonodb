@@ -38,6 +38,7 @@ pub mod subscriptions;
 pub mod ttl;
 pub mod vault;
 pub mod vector;
+pub mod vector_ann;
 pub mod verify;
 
 pub use aggregate::MAX_AGGREGATE_DOCS;

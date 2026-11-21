@@ -188,7 +188,7 @@ client timeout with `NONODB_TIMEOUT` or the `timeout=` argument.
 | [`reindex`](#reindex) | Rebuild every index on a collection |
 | [`search`](#search) | BM25 full-text query |
 | [`fuzzy`](#fuzzy) | Approximate string query |
-| [`vector_search`](#vector_search) | Exact top-K vector query |
+| [`vector_search`](#vector_search) | Top-K vector query with exact fallback |
 | [`batch`](#read-batch) | Multiple read operations, one snapshot |
 | [`write_batch`](#atomic-write-batch) | Atomic group of writes |
 | [`history`](#document-history) | List revisions of one document |
@@ -2177,7 +2177,7 @@ Responses:
 ```json
 {"ok": true, "result": {"created": "embedding", "kind": "vector", "dims": 384, "metric": "cosine"}}
 {"ok": true, "result": {"dropped": true, "kind": "vector"}}
-{"ok": true, "result": {"vector_indexes": [{"field": "embedding", "dims": 384, "metric": "cosine", "format": 1}]}}
+{"ok": true, "result": {"vector_indexes": [{"field": "embedding", "dims": 384, "metric": "cosine", "format": 1, "ann": null}]}}
 ```
 
 Semantics:
@@ -2191,6 +2191,12 @@ Semantics:
 - The index is maintained in the same transaction as document inserts,
   updates, deletes, TTL expiry, and restores.
 - Creating the index backfills existing documents synchronously.
+- An optional immutable IVF sidecar can be built for unfiltered acceleration.
+  Start the daemon with `NONODB_BUILD_VECTOR_ANN=1` to build missing sidecars,
+  optionally limited by `NONODB_VECTOR_ANN_COLLECTIONS=collection-a,collection-b`.
+  `NONODB_VECTOR_ANN_PROBE` controls the number of probed clusters (default 16).
+  Vector writes mark the sidecar dirty; queries then use the exact index until
+  the sidecar is rebuilt.
 
 ## vector_search
 
@@ -2223,8 +2229,10 @@ Semantics:
 
 - The vector index must exist; otherwise `invalid_query`.
 - The query vector must have exactly the indexed `dims`.
-- Search is exact and scans the whole index: `O(N × dims)` per query. There is
-  no approximate index or recall loss.
+- Without an IVF sidecar, search is exact and scans the whole index:
+  `O(N × dims)` per query. With a sidecar, unfiltered queries probe the nearest
+  clusters and are approximate. Filtered queries and queries after a vector
+  write use the exact path. Recall depends on the data and `nprobe`.
 - `_distance` is added to each result; lower is better:
   - `cosine`: `1 - cosine_similarity` (0 is identical),
   - `dot`: negative dot product,

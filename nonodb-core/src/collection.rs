@@ -34,7 +34,8 @@ use crate::store::MAX_DOCUMENT_BYTES;
 use crate::subscriptions::{self, Subscription};
 use crate::ttl::{self, TtlUpdate};
 use crate::vault::{self, CollectionProfile, VaultKey};
-use crate::vector::{self, Candidate, VectorDef, VectorMetric};
+use crate::vector::{self, Candidate, VectorAnnDef, VectorDef, VectorMetric};
+use crate::vector_ann;
 use crate::verify::{CollectionVerification, IndexVerification};
 
 /// Meta prefix for reusable physical sub-database slots.
@@ -73,6 +74,11 @@ fn fuzzy_segment_index_dir(coll: &str, index: &str) -> String {
 fn segment_index_dir(coll: &str, index: &str) -> String {
     let digest = Sha256::digest(format!("{coll}\0{index}").as_bytes());
     format!("search/{digest:x}")
+}
+
+fn vector_ann_index_dir(coll: &str, field: &str) -> String {
+    let digest = Sha256::digest(format!("vector\0{coll}\0{field}").as_bytes());
+    format!("vector-ann/{digest:x}")
 }
 
 /// One scored document id for the bounded top-K heap used by text search.
@@ -2241,6 +2247,48 @@ impl<'e> Collection<'e> {
         Ok(())
     }
 
+    /// Builds or rebuilds the optional immutable IVF sidecar for a vector
+    /// index. The exact LMDB index remains the source of truth.
+    pub fn build_vector_ann_index(
+        &self,
+        field: &str,
+        nprobe: usize,
+    ) -> Result<vector_ann::AnnStats> {
+        let mut wtxn = self.write_txn()?;
+        let def_key = vector::def_key(&self.name, field);
+        let Some(bytes) = self.meta.get(&wtxn, def_key.as_bytes())? else {
+            return Err(Error::Query(format!("no vector index on field `{field}`")));
+        };
+        let mut def: VectorDef = serde_json::from_slice(bytes)?;
+        let db = self.vector_db_in(&mut wtxn, field)?;
+        let mut vectors = Vec::with_capacity(db.stat(&wtxn)?.entries);
+        for item in db.iter(&wtxn)? {
+            let (key, value) = item?;
+            let Ok(id) = std::str::from_utf8(key) else {
+                continue;
+            };
+            let Some(values) = vector::decode_vector(value, def.dims) else {
+                continue;
+            };
+            vectors.push((id.to_string(), values));
+        }
+        let path = self.vector_ann_path(field)?;
+        let stats = vector_ann::build(&path, def.dims, def.metric, &vectors, nprobe)?;
+        def.ann = Some(VectorAnnDef {
+            version: 1,
+            clusters: stats.clusters as u32,
+            nprobe: stats.nprobe as u32,
+        });
+        self.meta
+            .put(&mut wtxn, def_key.as_bytes(), &serde_json::to_vec(&def)?)?;
+        self.meta.delete(
+            &mut wtxn,
+            vector::ann_dirty_key(&self.name, field).as_bytes(),
+        )?;
+        wtxn.commit()?;
+        Ok(stats)
+    }
+
     /// Drops a vector index and its stored vectors.
     pub fn drop_vector_index(&self, field: &str) -> Result<bool> {
         let mut wtxn = self.write_txn()?;
@@ -2255,6 +2303,21 @@ impl<'e> Collection<'e> {
         if existed {
             let name = vector::db_name(&self.name, field);
             self.drop_resource_db(wtxn, &name, &name)?;
+            self.meta.delete(
+                &mut *wtxn,
+                vector::ann_dirty_key(&self.name, field).as_bytes(),
+            )?;
+            if let Some(store) = self.store {
+                let dir = store
+                    .env()
+                    .path()
+                    .join(vector_ann_index_dir(&self.name, field));
+                match std::fs::remove_dir_all(&dir) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
         }
         Ok(existed)
     }
@@ -2297,6 +2360,13 @@ impl<'e> Collection<'e> {
                     &mut *wtxn,
                     id.as_bytes(),
                     vector::encode_vector(&vector).as_slice(),
+                )?;
+            }
+            if def.ann.is_some() {
+                self.meta.put(
+                    &mut *wtxn,
+                    vector::ann_dirty_key(&self.name, &def.field).as_bytes(),
+                    b"1",
                 )?;
             }
         }
@@ -2357,6 +2427,26 @@ impl<'e> Collection<'e> {
         let query_norm = vector::norm(query);
         let filter_active =
             !(filter.is_null() || filter.as_object().is_some_and(|object| object.is_empty()));
+        if !filter_active {
+            if let Some(ann) = def.ann.filter(|ann| ann.version == 1) {
+                let dirty = self
+                    .meta
+                    .get(rtxn, vector::ann_dirty_key(&self.name, field).as_bytes())?
+                    .is_some();
+                if !dirty {
+                    if let Ok(path) = self.vector_ann_path(field) {
+                        if let Ok(reader) = vector_ann::AnnReader::open(&path) {
+                            if reader.stats().entries == db.stat(rtxn)?.entries
+                                && reader.stats().nprobe == ann.nprobe as usize
+                            {
+                                let heap = reader.search(query, want)?;
+                                return self.vector_results_from_heap(rtxn, heap, skip, limit);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         if filter_active {
             const FILTER_INDEX_LIMIT: usize = 50_000;
             let ids = if let Some(id) = direct_id(filter) {
@@ -3271,6 +3361,13 @@ impl<'e> Collection<'e> {
         self.store
             .map(|store| store.env().path().to_path_buf())
             .ok_or_else(|| Error::Query("segment search requires a store path".into()))
+    }
+
+    fn vector_ann_path(&self, field: &str) -> Result<std::path::PathBuf> {
+        Ok(self
+            .segment_root()?
+            .join(vector_ann_index_dir(&self.name, field))
+            .join("ann-000000.ivf"))
     }
 
     fn segment_manifest_key(&self, index: &str) -> String {
