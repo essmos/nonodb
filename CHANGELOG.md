@@ -4,6 +4,10 @@ Full release notes: https://github.com/essmos/nonodb/releases
 
 ## Unreleased
 
+- Added `SegmentSet`, an in-memory delta layer over immutable segments with
+  tombstone generations. Updates replace base documents without hiding later
+  flushed versions; deletes survive delta flushes. This is the write-side
+  building block for the internal segment backend.
 - Added the first internal immutable text-search segment backend
   (`nonodb-core/src/search_segment.rs`) and a standalone `segment_bench`
   example. It writes sorted term blocks, delta-encoded postings, and a compact

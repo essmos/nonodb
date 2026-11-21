@@ -531,6 +531,193 @@ fn flush_block(
     Ok(())
 }
 
+#[derive(Debug)]
+struct DeltaDoc {
+    text: String,
+    terms: HashMap<String, u32>,
+    dl: u32,
+}
+
+/// A base set of immutable segments plus one small in-memory delta and
+/// tombstones. This is the piece the writer can update between segment flushes.
+///
+/// The delta is deliberately in-memory only. It is meant to stay small: the
+/// writer flushes it into a new immutable segment when it reaches its configured
+/// size. Tombstones hide documents in older segments until a compaction pass.
+pub struct SegmentSet {
+    segments: Vec<SegmentReader>,
+    delta: HashMap<String, DeltaDoc>,
+    /// id -> number of base segments that existed when the id was deleted.
+    /// Segments created later (a replacement flush) are not hidden.
+    tombstones: HashMap<String, usize>,
+}
+
+impl Default for SegmentSet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SegmentSet {
+    pub fn new() -> Self {
+        Self {
+            segments: Vec::new(),
+            delta: HashMap::new(),
+            tombstones: HashMap::new(),
+        }
+    }
+
+    pub fn with_segments(segments: Vec<SegmentReader>) -> Self {
+        Self {
+            segments,
+            delta: HashMap::new(),
+            tombstones: HashMap::new(),
+        }
+    }
+
+    pub fn add_document(&mut self, id: &str, text: &str) -> io::Result<()> {
+        let tokens = search::tokenize(text);
+        let mut terms = HashMap::new();
+        for token in &tokens {
+            *terms.entry(token.clone()).or_insert(0) += 1;
+        }
+        self.delta.insert(
+            id.to_string(),
+            DeltaDoc {
+                text: text.to_string(),
+                terms,
+                dl: tokens.len() as u32,
+            },
+        );
+        Ok(())
+    }
+
+    /// Mark an id deleted. Delta entries are removed immediately; base entries
+    /// are hidden until the delta is flushed or a compaction removes them.
+    pub fn delete(&mut self, id: &str) {
+        self.delta.remove(id);
+        self.tombstones.insert(id.to_string(), self.segments.len());
+    }
+
+    pub fn delta_len(&self) -> usize {
+        self.delta.len()
+    }
+
+    pub fn tombstone_len(&self) -> usize {
+        self.tombstones.len()
+    }
+
+    pub fn segment_count(&self) -> usize {
+        self.segments.len()
+    }
+
+    /// Flush all delta documents into one immutable segment and attach it to
+    /// the set. Tombstones for flushed ids are cleared: the new segment is the
+    /// current version of those documents.
+    pub fn flush_delta(&mut self, path: impl AsRef<Path>) -> io::Result<Option<SegmentStats>> {
+        if self.delta.is_empty() {
+            return Ok(None);
+        }
+        let mut ids: Vec<String> = self.delta.keys().cloned().collect();
+        ids.sort();
+        let mut builder = SegmentBuilder::new(path.as_ref())?;
+        for id in &ids {
+            if let Some(doc) = self.delta.get(id) {
+                builder.add_document(id, &doc.text)?;
+            }
+        }
+        let stats = builder.finish()?;
+        let reader = SegmentReader::open(path.as_ref())?;
+        self.segments.push(reader);
+        self.delta.clear();
+        Ok(Some(stats))
+    }
+
+    pub fn search(&self, query: &str, skip: usize, limit: usize) -> io::Result<Vec<SearchHit>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let want = skip
+            .saturating_add(limit)
+            .saturating_add(self.tombstones.len())
+            .saturating_add(self.delta.len())
+            .max(limit);
+        let mut merged: HashMap<String, f64> = HashMap::new();
+        for (segment_idx, segment) in self.segments.iter().enumerate() {
+            for hit in segment.search(query, want)? {
+                let hidden = self
+                    .tombstones
+                    .get(&hit.id)
+                    .is_some_and(|deleted_at| segment_idx < *deleted_at);
+                if !hidden {
+                    merged
+                        .entry(hit.id)
+                        .and_modify(|score| *score = score.max(hit.score))
+                        .or_insert(hit.score);
+                }
+            }
+        }
+        for hit in self.search_delta(query, want)? {
+            // Delta wins over any older base version of the same id.
+            merged.insert(hit.id, hit.score);
+        }
+        let mut hits: Vec<SearchHit> = merged
+            .into_iter()
+            .map(|(id, score)| SearchHit { id, score })
+            .collect();
+        hits.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.id.cmp(&b.id)));
+        Ok(hits.into_iter().skip(skip).take(limit).collect())
+    }
+
+    fn search_delta(&self, query: &str, limit: usize) -> io::Result<Vec<SearchHit>> {
+        if limit == 0 || self.delta.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut terms = search::tokenize(query);
+        terms.sort();
+        terms.dedup();
+        if terms.is_empty() {
+            return Ok(Vec::new());
+        }
+        let n = self.delta.len() as f64;
+        let total: u64 = self.delta.values().map(|doc| u64::from(doc.dl)).sum();
+        let avgdl = if total == 0 { 1.0 } else { total as f64 / n };
+        let mut idfs = Vec::with_capacity(terms.len());
+        for term in &terms {
+            let df = self
+                .delta
+                .values()
+                .filter(|doc| doc.terms.contains_key(term))
+                .count() as f64;
+            if df == 0.0 {
+                return Ok(Vec::new());
+            }
+            idfs.push((1.0 + (n - df + 0.5) / (df + 0.5)).ln());
+        }
+        let mut hits = Vec::new();
+        for (id, doc) in &self.delta {
+            let mut score = 0.0;
+            let mut matched = true;
+            for (term, idf) in terms.iter().zip(&idfs) {
+                let Some(tf) = doc.terms.get(term) else {
+                    matched = false;
+                    break;
+                };
+                score += bm25(*idf, *tf, doc.dl, avgdl);
+            }
+            if matched {
+                hits.push(SearchHit {
+                    id: id.clone(),
+                    score,
+                });
+            }
+        }
+        hits.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.id.cmp(&b.id)));
+        hits.truncate(limit);
+        Ok(hits)
+    }
+}
+
 /// A single ranked hit. The caller resolves `id` to a document in LMDB.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SearchHit {
@@ -1286,6 +1473,71 @@ mod tests {
             let n: usize = hit.id[1..].parse().unwrap();
             assert_eq!(n % 2, 0);
         }
+    }
+
+    #[test]
+    fn segment_set_merges_delta_and_tombstones() {
+        let dir = tempfile::tempdir().unwrap();
+        let base_path = dir.path().join("base.nos");
+        let mut builder = SegmentBuilder::new(&base_path).unwrap();
+        builder.add_document("a", "rust database").unwrap();
+        builder.add_document("b", "rust web").unwrap();
+        builder.finish().unwrap();
+        let mut set = SegmentSet::with_segments(vec![SegmentReader::open(&base_path).unwrap()]);
+        set.delete("b");
+        set.add_document("c", "rust database engine").unwrap();
+        let hits = set.search("rust", 0, 10).unwrap();
+        let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+        assert!(ids.contains(&"a"));
+        assert!(ids.contains(&"c"));
+        assert!(!ids.contains(&"b"));
+    }
+
+    #[test]
+    fn flush_delta_replaces_old_base_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let base_path = dir.path().join("base.nos");
+        let delta_path = dir.path().join("delta.nos");
+        let mut builder = SegmentBuilder::new(&base_path).unwrap();
+        builder.add_document("a", "rust database").unwrap();
+        builder.finish().unwrap();
+        let mut set = SegmentSet::with_segments(vec![SegmentReader::open(&base_path).unwrap()]);
+        set.delete("a");
+        set.add_document("a", "rust rust rust newest").unwrap();
+        let before = set.search("rust", 0, 10).unwrap();
+        assert_eq!(before[0].id, "a");
+        assert_eq!(before.len(), 1);
+        set.flush_delta(&delta_path).unwrap();
+        assert_eq!(set.delta_len(), 0);
+        assert_eq!(set.segment_count(), 2);
+        let after = set.search("rust", 0, 10).unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].id, "a");
+        assert!(after[0].score >= before[0].score);
+    }
+
+    #[test]
+    fn deleted_document_stays_deleted_after_delta_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let base_path = dir.path().join("base.nos");
+        let delta_path = dir.path().join("delta.nos");
+        let mut builder = SegmentBuilder::new(&base_path).unwrap();
+        builder.add_document("a", "rust database").unwrap();
+        builder.add_document("b", "rust web").unwrap();
+        builder.finish().unwrap();
+        let mut set = SegmentSet::with_segments(vec![SegmentReader::open(&base_path).unwrap()]);
+        set.delete("b");
+        set.add_document("c", "rust engine").unwrap();
+        set.flush_delta(&delta_path).unwrap();
+        let ids: Vec<String> = set
+            .search("rust", 0, 10)
+            .unwrap()
+            .into_iter()
+            .map(|h| h.id)
+            .collect();
+        assert!(ids.contains(&"a".to_string()));
+        assert!(ids.contains(&"c".to_string()));
+        assert!(!ids.contains(&"b".to_string()));
     }
 
     #[test]
