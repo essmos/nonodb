@@ -481,7 +481,11 @@ Writes are rejected:
 ```
 
 The first start downloads a full snapshot when the local database is fresh.
-Large databases can take a long time and require temporary disk space.
+Large databases can take a long time and require temporary disk space. After a
+snapshot is installed, the replica rebuilds any missing text/fuzzy segment files
+and vector ANN sidecars from the snapshot's LMDB data. If that rebuild fails, the
+replica logs a warning; restart it with `NONODB_REBUILD_MISSING_SEARCH=1` to
+retry before serving search traffic.
 
 ### 5.7 Reversed direction
 

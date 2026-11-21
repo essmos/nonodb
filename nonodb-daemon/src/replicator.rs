@@ -1620,11 +1620,44 @@ async fn bootstrap_database(
             &data_file,
         )
         .await?;
+        match rebuild_bootstrap_search(&data_root.join(database)).await {
+            Ok(rebuilt) if rebuilt > 0 => {
+                tracing::info!(database, rebuilt, "rebuilt replica search sidecars");
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(
+                    database,
+                    error = %error,
+                    "snapshot installed but search sidecars were not rebuilt; restart with NONODB_REBUILD_MISSING_SEARCH=1"
+                );
+            }
+        }
         Ok(snapshot_head)
     }
     .await;
     let _ = tokio::fs::remove_dir_all(&temp).await;
     result
+}
+
+async fn rebuild_bootstrap_search(database_path: &std::path::Path) -> Result<usize, String> {
+    let database_path = database_path.to_path_buf();
+    tokio::task::spawn_blocking(move || -> Result<usize, String> {
+        let store = Store::open(&database_path).map_err(|error| error.to_string())?;
+        let mut rebuilt = 0usize;
+        for name in store.collections().map_err(|error| error.to_string())? {
+            let collection = store.collection(&name).map_err(|error| error.to_string())?;
+            rebuilt += collection
+                .rebuild_missing_search_sidecars()
+                .map_err(|error| error.to_string())?;
+        }
+        let env = store.env().clone();
+        drop(store);
+        env.prepare_for_closing().wait();
+        Ok(rebuilt)
+    })
+    .await
+    .map_err(|error| format!("rebuild search sidecars join error: {error}"))?
 }
 
 async fn install_bootstrap_snapshot(
