@@ -198,6 +198,7 @@ python3 scripts/replication_failover_test.py # quorum promotion fences and demot
 python3 scripts/replication_lease_test.py    # primary self-demotes after losing quorum lease
 python3 scripts/replication_election_test.py # candidate wins auto-election after primary failure
 python3 scripts/replication_cluster_test.py  # 5-host cluster, dynamic joins, failover, reconvergence
+python3 scripts/replication_sidecar_test.py  # snapshot bootstrap with segment text/fuzzy sidecars
 python3 scripts/replication_metadata_test.py # metadata, indexes, history, events, watch on replicas
 python3 scripts/replication_load_test.py --keep  # 1M docs, 7 hosts, two failovers, load/speed report
 python3 scripts/tls_reload_test.py           # TLS server certificate hot reload
@@ -298,6 +299,7 @@ scripts are:
 | `scripts/replication_lease_test.py` | primary renews a quorum lease and self-demotes after losing voter majority |
 | `scripts/replication_election_test.py` | preferred candidate wins a quorum election after the primary disappears, exposes `write_url`/`readyz/write`, while a delayed candidate and followers switch source |
 | `scripts/replication_cluster_test.py` | 5-host cluster under continuous writes, dynamic replica joins, snapshot catch-up, acks, failover, source propagation, and post-failover convergence |
+| `scripts/replication_sidecar_test.py` | snapshot bootstrap of a primary with segment-backed text/fuzzy indexes; replica rebuilds sidecars and serves search |
 | `scripts/replication_metadata_test.py` | collection metadata, secondary/text/fuzzy/vector indexes, history, TTL, events, subscriptions, replicated outbox, and live watch on a replica |
 | `scripts/replication_load_test.py` | seven-host 1M-document load with six dynamic joins, bounded replication batches, memory guard, concurrent writes, two quorum failovers, convergence and latency measurements |
 | `scripts/tls_reload_test.py` | server certificate rotation picked up without restarting the daemon |

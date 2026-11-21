@@ -12,7 +12,9 @@ Full release notes: https://github.com/essmos/nonodb/releases
   merging every trigram posting list. On 808k real MS MARCO queries this moved
   p50 from 144.51 ms to **12.07 ms** and p95 from 279.97 ms to **21.76 ms**.
 - Rebuild missing text/fuzzy segment files and vector ANN sidecars on a replica
-  after a replication snapshot is installed.
+  after a replication snapshot is installed; add
+  `scripts/replication_sidecar_test.py` covering snapshot bootstrap with
+  segment-backed text and fuzzy indexes.
 - Add `rebuild_missing_search_sidecars()` and
   `NONODB_REBUILD_MISSING_SEARCH=1`. After a restore, the daemon can rebuild
   missing text/fuzzy segment files and vector ANN sidecars for every database

@@ -1031,6 +1031,7 @@ python3 scripts/replication_failover_test.py
 python3 scripts/replication_lease_test.py
 python3 scripts/replication_election_test.py
 python3 scripts/replication_cluster_test.py
+python3 scripts/replication_sidecar_test.py
 python3 scripts/replication_metadata_test.py
 python3 scripts/replication_control_plane_test.py
 python3 scripts/replication_discovery_test.py
