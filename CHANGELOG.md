@@ -11,9 +11,11 @@ Full release notes: https://github.com/essmos/nonodb/releases
   document frequency, total documents, and average document length are summed
   before scoring, so scores no longer depend on which flushed segment a hit
   came from.
-- Support exact-equality indexed filters on segment text and fuzzy indexes.
-  Filter IDs are resolved through the existing LMDB index and applied while
-  scoring segment hits, so filtered top-K results remain correct.
+- Support single-field indexed filters on segment text and fuzzy indexes,
+  including equality and range operators. Filter IDs are resolved through the
+  existing LMDB index and applied while scoring segment hits, so filtered top-K
+  results remain correct. Compound and non-indexed filters still return an
+  error.
 - Automatically compact flushed text and fuzzy segment suffixes once four
   segments exist. Compaction rebuilds the suffix from current LMDB documents,
   clamps tombstones to the compacted generation, and skips suffixes larger than

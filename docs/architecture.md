@@ -614,14 +614,14 @@ Current limits:
 - one field per segment index;
 - simple native queries only: no MongoDB-mode text search, phrases, or
   negation;
-- filters are supported only for exact-equality predicates backed by an
-  existing index, or by `_id`; other filters return an error;
+- filters are supported for a single indexed field, including `$eq` and range
+  operators, or for `_id`; compound and non-indexed filters return an error;
 - BM25 document frequency, document count, and average length are summed
   across all base segments and the in-memory delta before scoring, so scores
   are comparable after flushes instead of using each segment's local corpus
   statistics;
 - fuzzy search uses a segment-native trigram index and value sidecar when
-  `NONODB_SEGMENT_FUZZY=1`; exact-equality indexed filters use the same
+  `NONODB_SEGMENT_FUZZY=1`; single-field indexed filters use the same
   candidate-set path as text;
 - compaction merges the flushed suffix, not the base segment; a very large
   suffix is left alone until an explicit full rebuild.

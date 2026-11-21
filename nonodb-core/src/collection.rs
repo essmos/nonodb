@@ -1931,6 +1931,37 @@ impl<'e> Collection<'e> {
         Ok(Some(ids.into_iter().collect()))
     }
 
+    /// Candidate IDs for a segment text/fuzzy filter. Only a single indexed
+    /// field is accepted, so the index range is an exact candidate set rather
+    /// than a superset that would still need a residual filter.
+    fn segment_filter_candidates(
+        &self,
+        rtxn: &RoTxn<'_>,
+        filter: &Value,
+    ) -> Result<Option<HashSet<String>>> {
+        if filter.as_object().is_none_or(|object| object.is_empty()) {
+            return Ok(None);
+        }
+        if let Some(id) = direct_id(filter) {
+            return Ok(Some(HashSet::from([id])));
+        }
+        let Some(object) = filter.as_object() else {
+            return Ok(None);
+        };
+        if object.len() != 1 {
+            return Ok(None);
+        }
+        let Some(plan) = self.index_plan(rtxn, filter)? else {
+            return Ok(None);
+        };
+        let ids =
+            self.index_plan_candidates(rtxn, &plan, Some(SEARCH_FILTER_CANDIDATE_LIMIT + 1))?;
+        if ids.len() > SEARCH_FILTER_CANDIDATE_LIMIT {
+            return Ok(None);
+        }
+        Ok(Some(ids.into_iter().collect()))
+    }
+
     fn index_plan_candidates(
         &self,
         rtxn: &RoTxn<'_>,
@@ -3751,11 +3782,11 @@ impl<'e> Collection<'e> {
             let allowed = if empty_filter {
                 None
             } else {
-                match self.exact_filter_index_candidates(rtxn, filter)? {
+                match self.segment_filter_candidates(rtxn, filter)? {
                     Some(ids) => Some(ids),
                     None => {
                         return Err(Error::Query(
-                            "segment text filters require an indexed exact-equality filter".into(),
+                            "segment text filters require a single indexed field".into(),
                         ))
                     }
                 }
@@ -4432,11 +4463,11 @@ impl<'e> Collection<'e> {
             let allowed = if empty_filter {
                 None
             } else {
-                match self.exact_filter_index_candidates(rtxn, filter)? {
+                match self.segment_filter_candidates(rtxn, filter)? {
                     Some(ids) => Some(ids),
                     None => {
                         return Err(Error::Query(
-                            "segment fuzzy filters require an indexed exact-equality filter".into(),
+                            "segment fuzzy filters require a single indexed field".into(),
                         ))
                     }
                 }
@@ -11173,7 +11204,7 @@ mod tests {
     }
 
     #[test]
-    fn segment_text_index_supports_exact_indexed_filters() {
+    fn segment_text_index_supports_indexed_filters() {
         let (_dir, store) = store();
         let c = store.collection("segment_text_filter").unwrap();
         for doc in [
@@ -11193,9 +11224,13 @@ mod tests {
             .collect();
         ids.sort();
         assert_eq!(ids, vec!["a".to_string()]);
-        assert!(c
+        let ids: Vec<String> = c
             .search("body", "rust", &json!({"cat": {"$gt": 1}}), 0, Some(10))
-            .is_err());
+            .unwrap()
+            .into_iter()
+            .map(|doc| doc["_id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(ids, vec!["b".to_string()]);
     }
 
     #[test]
@@ -11256,7 +11291,7 @@ mod tests {
     }
 
     #[test]
-    fn segment_fuzzy_index_supports_exact_indexed_filters() {
+    fn segment_fuzzy_index_supports_indexed_filters() {
         let (_dir, store) = store();
         let c = store.collection("segment_fuzzy_filter").unwrap();
         for doc in [
@@ -11276,9 +11311,11 @@ mod tests {
         assert_eq!(all.len(), 2, "unfiltered: {all:?}");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0]["_id"], "b");
-        assert!(c
+        let hits = c
             .fuzzy_search("name", "Warszwa", 1, &json!({"cat": {"$gt": 1}}), Some(10))
-            .is_err());
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["_id"], "b");
     }
 
     #[test]
