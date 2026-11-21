@@ -607,7 +607,10 @@ segments exist, the writer compacts the flushed suffix into one new segment by
 re-reading the current documents from LMDB. The first (base) segment is kept;
 compaction is skipped when the suffix exceeds 200,000 documents. Tombstones are
 clamped to the compacted generation, and files left by an earlier compaction
-are removed at the start of the next one.
+are removed at the start of the next one. If tombstones exceed one quarter of the
+base segment's document count, a full compaction rebuilds every live document
+from LMDB into one `full-*.seg` segment, clears the delta and tombstones, and
+replaces the whole manifest.
 
 Current limits:
 
@@ -624,8 +627,8 @@ Current limits:
 - fuzzy search uses a segment-native trigram index and value sidecar when
   `NONODB_SEGMENT_FUZZY=1`; indexed filters use the candidate-set fast path, and
   compound or non-indexed filters verify the fetched candidate documents;
-- compaction merges the flushed suffix, not the base segment; a very large
-  suffix is left alone until an explicit full rebuild.
+- suffix compaction is skipped above 200,000 suffix documents; full compaction
+  is triggered by the tombstone ratio and rewrites the complete index.
 
 Dropping the index removes its manifest, delta keys, and segment directory.
 Backups continue to contain only LMDB; rebuild segment indexes after a restore.

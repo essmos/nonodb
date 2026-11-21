@@ -2899,6 +2899,148 @@ impl<'e> Collection<'e> {
         Ok(())
     }
 
+    fn full_compact_text_segment_index(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        def: &SearchIndexDef,
+    ) -> Result<()> {
+        let root = self.segment_root()?;
+        let dir = segment_index_dir(&self.name, &def.name);
+        let manifest = self
+            .segment_manifest_in(&*wtxn, &def.name)?
+            .unwrap_or_default();
+        self.cleanup_segment_orphans(&dir, &manifest.segments)?;
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let rel = format!("{dir}/full-{stamp}.seg");
+        let mut builder = SegmentBuilder::new(root.join(&rel))?;
+        let field = &def.fields[0].path;
+        for item in self.db.iter(&*wtxn)? {
+            let (id_bytes, doc_bytes) = item?;
+            let id = std::str::from_utf8(id_bytes)
+                .map_err(|e| Error::Query(format!("invalid document id: {e}")))?;
+            let doc: Value = serde_json::from_slice(doc_bytes)?;
+            if let Some(text) = index::field_value(&doc, field).and_then(search::field_text) {
+                builder.add_document(id, &text)?;
+            }
+        }
+        builder.finish()?;
+        let prefix = self.segment_delta_prefix(&def.name);
+        let keys: Vec<Vec<u8>> = self
+            .meta
+            .prefix_iter(&*wtxn, prefix.as_bytes())?
+            .map(|item| item.map(|(key, _)| key.to_vec()))
+            .collect::<std::result::Result<_, _>>()?;
+        for key in keys {
+            self.meta.delete(&mut *wtxn, &key)?;
+        }
+        self.set_segment_delta_count(wtxn, &def.name, 0)?;
+        self.put_segment_manifest(
+            wtxn,
+            &def.name,
+            &SegmentManifest {
+                segments: vec![rel],
+                tombstones: HashMap::new(),
+            },
+        )?;
+        Ok(())
+    }
+
+    fn maybe_full_compact_text_segments(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        def: &SearchIndexDef,
+    ) -> Result<()> {
+        let Some(manifest) = self.segment_manifest_in(&*wtxn, &def.name)? else {
+            return Ok(());
+        };
+        let Some(base) = manifest.segments.first() else {
+            return Ok(());
+        };
+        let base_docs = SegmentReader::open(self.segment_root()?.join(base))?.documents();
+        if base_docs == 0
+            || (manifest.tombstones.len() as u64).saturating_mul(4) <= u64::from(base_docs)
+        {
+            return Ok(());
+        }
+        self.full_compact_text_segment_index(wtxn, def)
+    }
+
+    fn full_compact_fuzzy_segment_index(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        def: &SearchIndexDef,
+    ) -> Result<()> {
+        let root = self.segment_root()?;
+        let dir = fuzzy_segment_index_dir(&self.name, &def.name);
+        let manifest = self
+            .fuzzy_segment_manifest_in(&*wtxn, &def.name)?
+            .unwrap_or_default();
+        let mut live = manifest.segments.clone();
+        live.extend(manifest.values.iter().cloned());
+        self.cleanup_segment_orphans(&dir, &live)?;
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let rel = format!("{dir}/full-{stamp}.seg");
+        let values_rel = format!("{dir}/full-{stamp}.values");
+        let mut builder = FuzzySegmentBuilder::new(root.join(&rel))?;
+        let field = &def.fields[0].path;
+        for item in self.db.iter(&*wtxn)? {
+            let (id_bytes, doc_bytes) = item?;
+            let id = std::str::from_utf8(id_bytes)
+                .map_err(|e| Error::Query(format!("invalid document id: {e}")))?;
+            let doc: Value = serde_json::from_slice(doc_bytes)?;
+            if let Some(text) = index::field_value(&doc, field).and_then(search::field_text) {
+                builder.add_document(id, &text)?;
+            }
+        }
+        builder.finish(root.join(&values_rel))?;
+        let prefix = self.fuzzy_segment_delta_prefix(&def.name);
+        let keys: Vec<Vec<u8>> = self
+            .meta
+            .prefix_iter(&*wtxn, prefix.as_bytes())?
+            .map(|item| item.map(|(key, _)| key.to_vec()))
+            .collect::<std::result::Result<_, _>>()?;
+        for key in keys {
+            self.meta.delete(&mut *wtxn, &key)?;
+        }
+        self.set_fuzzy_segment_delta_count(wtxn, &def.name, 0)?;
+        self.put_fuzzy_segment_manifest(
+            wtxn,
+            &def.name,
+            &FuzzySegmentManifest {
+                segments: vec![rel],
+                values: vec![values_rel],
+                tombstones: HashMap::new(),
+            },
+        )?;
+        Ok(())
+    }
+
+    fn maybe_full_compact_fuzzy_segments(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        def: &SearchIndexDef,
+    ) -> Result<()> {
+        let Some(manifest) = self.fuzzy_segment_manifest_in(&*wtxn, &def.name)? else {
+            return Ok(());
+        };
+        let Some(base) = manifest.segments.first() else {
+            return Ok(());
+        };
+        let base_docs = SegmentReader::open(self.segment_root()?.join(base))?.documents();
+        if base_docs == 0
+            || (manifest.tombstones.len() as u64).saturating_mul(4) <= u64::from(base_docs)
+        {
+            return Ok(());
+        }
+        self.full_compact_fuzzy_segment_index(wtxn, def)
+    }
+
     fn maybe_compact_fuzzy_segments(
         &self,
         wtxn: &mut RwTxn<'_>,
@@ -3121,6 +3263,7 @@ impl<'e> Collection<'e> {
         }
         self.set_fuzzy_segment_delta_count(wtxn, &def.name, 0)?;
         self.maybe_compact_fuzzy_segments(wtxn, def)?;
+        self.maybe_full_compact_fuzzy_segments(wtxn, def)?;
         Ok(())
     }
 
@@ -3254,6 +3397,7 @@ impl<'e> Collection<'e> {
         }
         self.set_segment_delta_count(wtxn, &def.name, 0)?;
         self.maybe_compact_text_segments(wtxn, def)?;
+        self.maybe_full_compact_text_segments(wtxn, def)?;
         Ok(())
     }
 
@@ -11336,6 +11480,86 @@ mod tests {
                 .search("body", "brown", &json!({"tag": "y"}), 0, Some(10))
                 .unwrap()),
             vec!["b".to_string()]
+        );
+    }
+
+    #[test]
+    fn segment_text_full_compaction_removes_tombstones() {
+        let (_dir, store) = store();
+        let c = store.collection("segment_text_full_compact").unwrap();
+        for i in 0..10 {
+            c.insert_one(json!({"_id": format!("d{i}"), "body": "rust database"}))
+                .unwrap();
+        }
+        c.create_text_segment_index("body").unwrap();
+        for i in 0..4 {
+            c.delete(&json!({"_id": format!("d{i}")}), false).unwrap();
+        }
+        let mut wtxn = store.env().write_txn().unwrap();
+        let def = c
+            .search_index_def(&wtxn, SearchKind::Text, "body")
+            .unwrap()
+            .unwrap();
+        c.maybe_full_compact_text_segments(&mut wtxn, &def).unwrap();
+        wtxn.commit().unwrap();
+        let rtxn = store.env().read_txn().unwrap();
+        let manifest = c.segment_manifest_in(&rtxn, "body").unwrap().unwrap();
+        assert_eq!(manifest.segments.len(), 1);
+        assert!(manifest.segments[0].contains("full-"));
+        assert!(manifest.tombstones.is_empty());
+        drop(rtxn);
+        assert_eq!(
+            c.search("body", "rust", &json!({}), 0, Some(20))
+                .unwrap()
+                .len(),
+            6
+        );
+    }
+
+    #[test]
+    fn segment_fuzzy_full_compaction_removes_tombstones() {
+        let (_dir, store) = store();
+        let c = store.collection("segment_fuzzy_full_compact").unwrap();
+        for (id, name) in [
+            ("a", "Warszawa"),
+            ("b", "Krakow"),
+            ("c", "Wroclaw"),
+            ("d", "Gdansk"),
+            ("e", "Poznan"),
+            ("f", "Lodz"),
+            ("g", "Szczecin"),
+            ("h", "Lublin"),
+        ] {
+            c.insert_one(json!({"_id": id, "name": name})).unwrap();
+        }
+        c.create_fuzzy_segment_index("name").unwrap();
+        for id in ["b", "c", "d"] {
+            c.delete(&json!({"_id": id}), false).unwrap();
+        }
+        let mut wtxn = store.env().write_txn().unwrap();
+        let def = c
+            .search_index_def(&wtxn, SearchKind::Fuzzy, "name")
+            .unwrap()
+            .unwrap();
+        c.maybe_full_compact_fuzzy_segments(&mut wtxn, &def)
+            .unwrap();
+        wtxn.commit().unwrap();
+        let rtxn = store.env().read_txn().unwrap();
+        let manifest = c.fuzzy_segment_manifest_in(&rtxn, "name").unwrap().unwrap();
+        assert_eq!(manifest.segments.len(), 1);
+        assert_eq!(manifest.values.len(), 1);
+        assert!(manifest.segments[0].contains("full-"));
+        assert!(manifest.tombstones.is_empty());
+        drop(rtxn);
+        assert!(c
+            .fuzzy_search("name", "Krakw", 1, &json!({}), Some(10))
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            c.fuzzy_search("name", "Warszwa", 1, &json!({}), Some(10))
+                .unwrap()
+                .len(),
+            1
         );
     }
 
