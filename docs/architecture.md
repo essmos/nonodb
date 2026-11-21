@@ -612,8 +612,10 @@ are removed at the start of the next one.
 Current limits:
 
 - one field per segment index;
-- simple native queries only: no MongoDB-mode text search, phrases, negation,
-  or filters;
+- simple native queries only: no MongoDB-mode text search, phrases, or
+  negation;
+- filters are supported only for exact-equality predicates backed by an
+  existing index, or by `_id`; other filters return an error;
 - segment scores are merged per segment, so absolute BM25 scores can differ
   from a single global index after several flushes;
 - fuzzy search uses a segment-native trigram index and value sidecar when

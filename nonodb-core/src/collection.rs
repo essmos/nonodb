@@ -3672,6 +3672,7 @@ impl<'e> Collection<'e> {
         query: &str,
         skip: usize,
         limit: Option<usize>,
+        allowed: Option<&HashSet<String>>,
     ) -> Result<Vec<Value>> {
         let max = limit.unwrap_or(10).min(1000);
         if max == 0 {
@@ -3696,7 +3697,7 @@ impl<'e> Collection<'e> {
                 .map_err(|e| Error::Query(format!("invalid segment delta text: {e}")))?;
             set.add_document(id, text)?;
         }
-        let hits = set.search(query, skip, max)?;
+        let hits = set.search_filtered(query, skip, max, allowed)?;
         let mut out = Vec::with_capacity(hits.len());
         for hit in hits {
             let Some(bytes) = self.db.get(rtxn, hit.id.as_bytes())? else {
@@ -3738,17 +3739,35 @@ impl<'e> Collection<'e> {
         let empty_filter = filter.as_object().is_none_or(|object| object.is_empty());
         if def.engine == SearchEngine::Segment {
             if mode != TextQueryMode::Native
-                || !empty_filter
                 || !parsed.phrases.is_empty()
                 || !parsed.negative_phrases.is_empty()
                 || !parsed.negative_terms.is_empty()
                 || def.fields.len() != 1
             {
                 return Err(Error::Query(
-                    "segment text indexes support only simple unfiltered native queries".into(),
+                    "segment text indexes support only simple native queries".into(),
                 ));
             }
-            return self.search_segment_text_index_in(rtxn, &def, query, skip, limit);
+            let allowed = if empty_filter {
+                None
+            } else {
+                match self.exact_filter_index_candidates(rtxn, filter)? {
+                    Some(ids) => Some(ids),
+                    None => {
+                        return Err(Error::Query(
+                            "segment text filters require an indexed exact-equality filter".into(),
+                        ))
+                    }
+                }
+            };
+            return self.search_segment_text_index_in(
+                rtxn,
+                &def,
+                query,
+                skip,
+                limit,
+                allowed.as_ref(),
+            );
         }
         let needs_phrases = !parsed.phrases.is_empty() || !parsed.negative_phrases.is_empty();
         let simple_query = !needs_phrases;
@@ -11132,6 +11151,32 @@ mod tests {
             .expect("segment manifest");
         assert_eq!(manifest.segments.len(), 2);
         assert!(manifest.segments[1].contains("compact-"));
+    }
+
+    #[test]
+    fn segment_text_index_supports_exact_indexed_filters() {
+        let (_dir, store) = store();
+        let c = store.collection("segment_text_filter").unwrap();
+        for doc in [
+            json!({"_id": "a", "body": "rust database", "cat": 1}),
+            json!({"_id": "b", "body": "rust web", "cat": 2}),
+            json!({"_id": "c", "body": "python database", "cat": 1}),
+        ] {
+            c.insert_one(doc).unwrap();
+        }
+        c.create_index("cat", false).unwrap();
+        c.create_text_segment_index("body").unwrap();
+        let mut ids: Vec<String> = c
+            .search("body", "rust", &json!({"cat": 1}), 0, Some(10))
+            .unwrap()
+            .into_iter()
+            .map(|doc| doc["_id"].as_str().unwrap().to_string())
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec!["a".to_string()]);
+        assert!(c
+            .search("body", "rust", &json!({"cat": {"$gt": 1}}), 0, Some(10))
+            .is_err());
     }
 
     #[test]

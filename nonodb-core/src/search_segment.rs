@@ -22,7 +22,7 @@
 //! index. The format is intentionally append-only and rebuildable from LMDB.
 
 use std::cmp::{Ordering, Reverse};
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -682,7 +682,17 @@ impl SegmentSet {
     }
 
     pub fn search(&self, query: &str, skip: usize, limit: usize) -> io::Result<Vec<SearchHit>> {
-        if limit == 0 {
+        self.search_filtered(query, skip, limit, None)
+    }
+
+    pub fn search_filtered(
+        &self,
+        query: &str,
+        skip: usize,
+        limit: usize,
+        allowed: Option<&HashSet<String>>,
+    ) -> io::Result<Vec<SearchHit>> {
+        if limit == 0 || allowed.is_some_and(HashSet::is_empty) {
             return Ok(Vec::new());
         }
         let want = skip
@@ -692,7 +702,7 @@ impl SegmentSet {
             .max(limit);
         let mut merged: HashMap<String, f64> = HashMap::new();
         for (segment_idx, segment) in self.segments.iter().enumerate() {
-            for hit in segment.search(query, want)? {
+            for hit in segment.search_filtered(query, want, allowed)? {
                 let hidden = self
                     .tombstones
                     .get(&hit.id)
@@ -706,6 +716,9 @@ impl SegmentSet {
             }
         }
         for hit in self.search_delta(query, want)? {
+            if allowed.is_some_and(|set| !set.contains(&hit.id)) {
+                continue;
+            }
             // Delta wins over any older base version of the same id.
             merged.insert(hit.id, hit.score);
         }
@@ -1230,6 +1243,15 @@ impl SegmentReader {
     }
 
     pub fn search(&self, query: &str, limit: usize) -> io::Result<Vec<SearchHit>> {
+        self.search_filtered(query, limit, None)
+    }
+
+    pub fn search_filtered(
+        &self,
+        query: &str,
+        limit: usize,
+        allowed: Option<&HashSet<String>>,
+    ) -> io::Result<Vec<SearchHit>> {
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -1267,13 +1289,13 @@ impl SegmentReader {
         if entries.len() == 1 {
             let (_, entry, idf) = entries.pop().unwrap();
             let mut cursor = Cursor::new(self, entry, idf)?;
-            self.search_single(&mut cursor, avgdl, limit, &mut heap)?;
+            self.search_single(&mut cursor, avgdl, limit, allowed, &mut heap)?;
         } else {
             let mut cursors = Vec::with_capacity(entries.len());
             for (_, entry, idf) in entries {
                 cursors.push(Cursor::new(self, entry, idf)?);
             }
-            self.search_and_rarest(cursors, avgdl, limit, &mut heap)?;
+            self.search_and_rarest(cursors, avgdl, limit, allowed, &mut heap)?;
         }
 
         let mut hits = heap
@@ -1289,11 +1311,19 @@ impl SegmentReader {
         Ok(hits)
     }
 
+    fn doc_allowed(&self, doc: u32, allowed: Option<&HashSet<String>>) -> io::Result<bool> {
+        match allowed {
+            Some(set) => Ok(set.contains(&self.doc_id(doc)?)),
+            None => Ok(true),
+        }
+    }
+
     fn search_single(
         &self,
         cursor: &mut Cursor<'_>,
         avgdl: f64,
         limit: usize,
+        allowed: Option<&HashSet<String>>,
         heap: &mut BinaryHeap<Reverse<ScoredDoc>>,
     ) -> io::Result<()> {
         loop {
@@ -1312,14 +1342,16 @@ impl SegmentReader {
                 break;
             };
             let score = bm25(cursor.idf, posting.tf, posting.dl, avgdl);
-            push_hit(
-                heap,
-                ScoredDoc {
-                    doc: posting.doc,
-                    score,
-                },
-                limit,
-            );
+            if self.doc_allowed(posting.doc, allowed)? {
+                push_hit(
+                    heap,
+                    ScoredDoc {
+                        doc: posting.doc,
+                        score,
+                    },
+                    limit,
+                );
+            }
             cursor.advance()?;
         }
         Ok(())
@@ -1330,6 +1362,7 @@ impl SegmentReader {
         mut cursors: Vec<Cursor<'_>>,
         avgdl: f64,
         limit: usize,
+        allowed: Option<&HashSet<String>>,
         heap: &mut BinaryHeap<Reverse<ScoredDoc>>,
     ) -> io::Result<()> {
         let term_count = cursors.len();
@@ -1371,7 +1404,7 @@ impl SegmentReader {
                         cursor.advance()?;
                     }
                 }
-                if matched == term_count {
+                if matched == term_count && self.doc_allowed(pivot, allowed)? {
                     push_hit(heap, ScoredDoc { doc: pivot, score }, limit);
                 }
             } else {
@@ -1390,6 +1423,7 @@ impl SegmentReader {
         mut cursors: Vec<Cursor<'_>>,
         avgdl: f64,
         limit: usize,
+        allowed: Option<&HashSet<String>>,
         heap: &mut BinaryHeap<Reverse<ScoredDoc>>,
     ) -> io::Result<()> {
         // Walk the shortest posting list and skip the other cursors to each
@@ -1397,7 +1431,7 @@ impl SegmentReader {
         // instead of touching every posting for every term.
         let doc_count = u64::from(self.header.doc_count);
         if u64::from(cursors[0].df).saturating_mul(20) > doc_count {
-            return self.search_wand(cursors, avgdl, limit, heap);
+            return self.search_wand(cursors, avgdl, limit, allowed, heap);
         }
         let mut rare_cursor = cursors.remove(0);
         while let Some(posting) = rare_cursor.current() {
@@ -1432,7 +1466,7 @@ impl SegmentReader {
                     let other = cursor.current().unwrap();
                     score += bm25(cursor.idf, other.tf, other.dl, avgdl);
                 }
-                if matched {
+                if matched && self.doc_allowed(doc, allowed)? {
                     push_hit(heap, ScoredDoc { doc, score }, limit);
                 }
                 rare_cursor.advance()?;

@@ -7,6 +7,9 @@ Full release notes: https://github.com/essmos/nonodb/releases
 - Plan segment fuzzy search from the rarest `3*d + 1` trigrams instead of
   merging every trigram posting list. On 808k real MS MARCO queries this moved
   p50 from 144.51 ms to **12.07 ms** and p95 from 279.97 ms to **21.76 ms**.
+- Support exact-equality indexed filters on segment text indexes. Filter IDs
+  are resolved through the existing LMDB index and applied while scoring
+  segment hits, so filtered top-K results remain correct.
 - Automatically compact flushed text and fuzzy segment suffixes once four
   segments exist. Compaction rebuilds the suffix from current LMDB documents,
   clamps tombstones to the compacted generation, and skips suffixes larger than
