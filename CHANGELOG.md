@@ -4,6 +4,8 @@ Full release notes: https://github.com/essmos/nonodb/releases
 
 ## Unreleased
 
+- Memory-map immutable fuzzy value sidecars as well, and add
+  `fuzzy_segment_bench` for reproducible short-string fuzzy measurements.
 - Memory-map immutable segment files instead of issuing `pread` calls for
   every block header and posting block. On the full 8.84M MS MARCO segment this
   moved p50 from 7.34 ms to **1.83 ms**, p95 from 235.28 ms to **31.99 ms**, and

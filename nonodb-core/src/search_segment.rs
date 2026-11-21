@@ -806,7 +806,7 @@ impl FuzzySegmentBuilder {
 /// Read-only segment-backed fuzzy index.
 pub struct FuzzySegmentReader {
     segment: SegmentReader,
-    values: File,
+    values: Arc<Mmap>,
     value_count: u32,
     offsets_start: u64,
     strings_start: u64,
@@ -815,9 +815,10 @@ pub struct FuzzySegmentReader {
 impl FuzzySegmentReader {
     pub fn open(segment_path: impl AsRef<Path>, values_path: impl AsRef<Path>) -> io::Result<Self> {
         let segment = SegmentReader::open(segment_path)?;
-        let values = File::open(values_path)?;
+        let values_file = File::open(values_path)?;
+        let values = Arc::new(unsafe { Mmap::map(&values_file)? });
         let mut header = [0u8; 16];
-        read_at(&values, 0, &mut header)?;
+        read_map(&values, 0, &mut header)?;
         if &header[..8] != b"NODBVAL1" {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -854,12 +855,12 @@ impl FuzzySegmentReader {
         }
         let mut a = [0u8; 4];
         let mut b = [0u8; 4];
-        read_at(
+        read_map(
             &self.values,
             self.offsets_start + u64::from(doc) * 4,
             &mut a,
         )?;
-        read_at(
+        read_map(
             &self.values,
             self.offsets_start + u64::from(doc + 1) * 4,
             &mut b,
@@ -873,7 +874,7 @@ impl FuzzySegmentReader {
             ));
         }
         let mut buf = vec![0u8; (end - start) as usize];
-        read_at(&self.values, self.strings_start + start, &mut buf)?;
+        read_map(&self.values, self.strings_start + start, &mut buf)?;
         String::from_utf8(buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
@@ -1548,34 +1549,6 @@ fn read_map(map: &Mmap, offset: u64, buf: &mut [u8]) -> io::Result<()> {
     }
     buf.copy_from_slice(&map[start..end]);
     Ok(())
-}
-
-fn read_at(file: &File, offset: u64, buf: &mut [u8]) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::FileExt;
-        file.read_exact_at(buf, offset)
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::FileExt;
-        let mut done = 0usize;
-        while done < buf.len() {
-            let n = file.seek_read(&mut buf[done..], offset + done as u64)?;
-            if n == 0 {
-                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "short read"));
-            }
-            done += n;
-        }
-        Ok(())
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        use std::io::{Read, Seek, SeekFrom};
-        let mut clone = file.try_clone()?;
-        clone.seek(SeekFrom::Start(offset))?;
-        clone.read_exact(buf)
-    }
 }
 
 fn read_str(buf: &[u8], pos: &mut usize) -> io::Result<String> {

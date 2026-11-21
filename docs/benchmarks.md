@@ -191,6 +191,22 @@ supported by the segment path, and BM25 scores are merged per segment. Both p50
 and the tail are now in the target range for this data set; the next work is
 compaction, filters/phrases, and a fair concurrent comparison with Elasticsearch.
 
+#### Segment fuzzy
+
+`FuzzySegmentBuilder` stores normalized values in a mapped sidecar file, so
+candidate verification does not issue one read per candidate. A short-query
+corpus is used here because fuzzy search is intended for names and short labels,
+not long natural-language passages:
+
+| Data set | Build | Segment + values | p50 | p95 | p99 | QPS |
+|---|---:|---:|---:|---:|---:|---:|
+| 85,113 short MS MARCO queries | **1.7 s** | **6.9 MB + 1.8 MB** | **17.21 ms** | **28.09 ms** | **29.89 ms** | **54.8** |
+
+The same benchmark over all 808,731 full queries gives p50 **144.51 ms** because
+long queries produce many trigrams and a much larger candidate union. This is
+not the target workload for fuzzy matching. The next fuzzy optimization is a
+rarer-trigram planning step to reduce the candidate union for long strings.
+
 ### BM25
 
 | Data set | Index build | One term | Two terms | Three terms |
