@@ -104,11 +104,30 @@ fn nearest_centroid(
     vector: &[f32],
     vector_norm: f32,
     centroids: &[Vec<f32>],
+    centroid_norms: &[f32],
 ) -> usize {
     let mut best = 0usize;
     let mut best_distance = f32::INFINITY;
     for (index, centroid) in centroids.iter().enumerate() {
-        let value = distance(metric, vector, vector_norm, centroid, norm_of(centroid));
+        let stored_norm = centroid_norms[index];
+        let mut dot = 0.0f32;
+        let mut squared = 0.0f32;
+        for (left, right) in vector.iter().zip(centroid.iter()) {
+            dot += left * right;
+            let delta = left - right;
+            squared += delta * delta;
+        }
+        let value = match metric {
+            VectorMetric::Cosine => {
+                if vector_norm <= f32::EPSILON || stored_norm <= f32::EPSILON {
+                    1.0
+                } else {
+                    1.0 - (dot / (vector_norm * stored_norm)).clamp(-1.0, 1.0)
+                }
+            }
+            VectorMetric::Dot => -dot,
+            VectorMetric::L2 => squared,
+        };
         if value < best_distance {
             best = index;
             best_distance = value;
@@ -208,11 +227,12 @@ pub fn build(
         if sample.is_empty() {
             break;
         }
+        let centroid_norms: Vec<f32> = centroids.iter().map(|centroid| norm_of(centroid)).collect();
         let mut sums = vec![vec![0.0f32; dims]; clusters];
         let mut counts = vec![0usize; clusters];
         for vector in &sample {
             let norm = norm_of(vector);
-            let cluster = nearest_centroid(metric, vector, norm, &centroids);
+            let cluster = nearest_centroid(metric, vector, norm, &centroids, &centroid_norms);
             counts[cluster] += 1;
             for (sum, value) in sums[cluster].iter_mut().zip(vector) {
                 *sum += *value;
@@ -232,12 +252,57 @@ pub fn build(
         }
     }
 
-    let mut assigned: Vec<Vec<usize>> = vec![Vec::new(); clusters];
-    for (index, (_, values)) in vectors.iter().enumerate() {
-        let norm = norm_of(values);
-        let cluster = nearest_centroid(metric, values, norm, &centroids);
-        assigned[cluster].push(index);
-    }
+    let centroid_norms: Vec<f32> = centroids.iter().map(|centroid| norm_of(centroid)).collect();
+    let workers = std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(1)
+        .clamp(1, 16.min(vectors.len().max(1)));
+    let mut assigned = if workers <= 1 {
+        let mut assigned: Vec<Vec<usize>> = vec![Vec::new(); clusters];
+        for (index, (_, values)) in vectors.iter().enumerate() {
+            let norm = norm_of(values);
+            let cluster = nearest_centroid(metric, values, norm, &centroids, &centroid_norms);
+            assigned[cluster].push(index);
+        }
+        assigned
+    } else {
+        let chunk = vectors.len().div_ceil(workers);
+        let centroids_ref = &centroids;
+        let centroid_norms_ref = &centroid_norms;
+        let vectors_ref = vectors;
+        let parts = std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(workers);
+            for start in (0..vectors.len()).step_by(chunk.max(1)) {
+                let end = (start + chunk).min(vectors.len());
+                handles.push(scope.spawn(move || {
+                    let mut local: Vec<Vec<usize>> = vec![Vec::new(); clusters];
+                    for (index, (_, values)) in vectors_ref[start..end].iter().enumerate() {
+                        let norm = norm_of(values);
+                        let cluster = nearest_centroid(
+                            metric,
+                            values,
+                            norm,
+                            centroids_ref,
+                            centroid_norms_ref,
+                        );
+                        local[cluster].push(start + index);
+                    }
+                    local
+                }));
+            }
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("ANN assignment worker"))
+                .collect::<Vec<_>>()
+        });
+        let mut assigned: Vec<Vec<usize>> = vec![Vec::new(); clusters];
+        for part in parts {
+            for (cluster, mut indexes) in part.into_iter().enumerate() {
+                assigned[cluster].append(&mut indexes);
+            }
+        }
+        assigned
+    };
     for cluster in &mut assigned {
         cluster.sort_unstable_by(|left, right| vectors[*left].0.cmp(&vectors[*right].0));
     }

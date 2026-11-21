@@ -318,16 +318,18 @@ the probed clusters in parallel. Both data sets use 16-dimensional vectors and
 
 | Operation | 1M p50 / p95 / p99 | 10M p50 / p95 / p99 |
 |---|---:|---:|
-| ANN sidecar build | 38.7 s | 236 s |
+| ANN sidecar build | 11.6 s | 30.5 s |
 | Sidecar file | 82 MB | 820 MB |
 | ANN query | **2.32 / 2.53 / 2.85 ms** | **9.84 / 12.10 / 12.24 ms** |
 | Exact query | **49.87 / 50.72 / 52.67 ms** | **528.01 / 528.01 ms** |
 | ANN throughput | **430 qps** | **104 qps** |
 
-The 10M sidecar was about **54× faster at p50** than the exact scan, and the
-1M sidecar about **21× faster**. A 20-query sample on 10M reached recall@10 of
+The 10M sidecar was about **60× faster at p50** than the exact scan, and the
+1M sidecar about **23× faster**. A 20-query sample on 10M reached recall@10 of
 **1.0** against the exact index. Recall is data-dependent, so validate with
-representative queries before relying on approximate results.
+representative queries before relying on approximate results. IVF assignment is
+parallelized, cutting the 10M build from 236 s to 30.5 s and the 1M build from
+38.7 s to 11.6 s.
 
 Vector updates are stored in a small LMDB delta and merged into unfiltered ANN
 queries, so a few updates do not force a 528 ms exact scan. After changing one
