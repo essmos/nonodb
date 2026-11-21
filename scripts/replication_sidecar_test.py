@@ -113,7 +113,7 @@ def main() -> int:
                     **extra,
                 }
             )
-            log = open(temp / f"{name}.log", "w", encoding="utf-8")
+            log = open(temp / f"{name}.log", "a", encoding="utf-8")
             logs.append(log)
             proc = subprocess.Popen(
                 [str(DAEMON)], env=env, stdout=log, stderr=subprocess.STDOUT
@@ -123,6 +123,12 @@ def main() -> int:
             clients[name] = client
             wait_health(client, name, proc)
             return client
+
+        def stop(name: str) -> None:
+            proc = procs.pop(name)
+            proc.terminate()
+            proc.wait(timeout=10)
+            clients.pop(name).close()
 
         primary_port = free_port()
         replica_port = free_port()
@@ -147,6 +153,7 @@ def main() -> int:
                         "_id": f"e{index}",
                         "title": f"Document {index}",
                         "body": "rust async search replication document",
+                        "embedding": [index, index + 1, index + 2, index + 3],
                     },
                 },
             )
@@ -160,11 +167,42 @@ def main() -> int:
             headers,
             {"op": "create_fuzzy_index", "coll": "events", "field": "title"},
         )
+        exec_op(
+            primary,
+            headers,
+            {
+                "op": "create_vector_index",
+                "coll": "events",
+                "field": "embedding",
+                "dims": 4,
+                "metric": "l2",
+            },
+        )
         segment_files = list(
             (temp / "primary-data" / "default" / "search").rglob("*.seg")
         )
         if not segment_files:
             raise RuntimeError("primary did not create segment sidecars")
+
+        # The daemon builds ANN sidecars only during startup.
+        stop("primary")
+        primary = start(
+            "primary",
+            temp / "primary-data",
+            primary_port,
+            {
+                "NONODB_REPLICATION_ROLE": "primary",
+                "NONODB_REPLICATION_ADVERTISE_URL": f"http://127.0.0.1:{primary_port}",
+                "NONODB_BUILD_VECTOR_ANN": "1",
+                "NONODB_VECTOR_ANN_PROBE": "4",
+                "NONODB_VECTOR_ANN_COLLECTIONS": "events",
+            },
+        )
+        ann_files = list(
+            (temp / "primary-data" / "default" / "vector-ann").rglob("*.ivf")
+        )
+        if not ann_files:
+            raise RuntimeError("primary did not create a vector ANN sidecar")
 
         replica = start(
             "replica",
@@ -208,6 +246,24 @@ def main() -> int:
         )["results"]
         if not fuzzy:
             raise RuntimeError("replica fuzzy search returned no hits")
+        vectors = exec_op(
+            replica,
+            headers,
+            {
+                "op": "vector_search",
+                "coll": "events",
+                "field": "embedding",
+                "vector": [0.0, 0.0, 0.0, 0.0],
+                "limit": 5,
+            },
+        )["results"]
+        if len(vectors) != 5:
+            raise RuntimeError(f"replica vector search returned {len(vectors)} hits")
+        replica_ann = list(
+            (temp / "replica-data" / "default" / "vector-ann").rglob("*.ivf")
+        )
+        if not replica_ann:
+            raise RuntimeError("replica did not rebuild the vector ANN sidecar")
 
         replica_log = (temp / "replica.log").read_text(
             encoding="utf-8", errors="replace"
@@ -222,8 +278,11 @@ def main() -> int:
                     "ok": True,
                     "docs": 100,
                     "primary_segment_files": len(segment_files),
+                    "primary_ann_files": len(ann_files),
                     "replica_text_hits": len(hits),
                     "replica_fuzzy_hits": len(fuzzy),
+                    "replica_vector_hits": len(vectors),
+                    "replica_ann_files": len(replica_ann),
                     "replica_log_rebuild": True,
                 }
             )

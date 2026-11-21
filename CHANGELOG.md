@@ -14,7 +14,7 @@ Full release notes: https://github.com/essmos/nonodb/releases
 - Rebuild missing text/fuzzy segment files and vector ANN sidecars on a replica
   after a replication snapshot is installed; add
   `scripts/replication_sidecar_test.py` covering snapshot bootstrap with
-  segment-backed text and fuzzy indexes.
+  segment-backed text/fuzzy indexes and a vector ANN sidecar.
 - Add `rebuild_missing_search_sidecars()` and
   `NONODB_REBUILD_MISSING_SEARCH=1`. After a restore, the daemon can rebuild
   missing text/fuzzy segment files and vector ANN sidecars for every database
