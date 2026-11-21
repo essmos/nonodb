@@ -4,6 +4,9 @@ Full release notes: https://github.com/essmos/nonodb/releases
 
 ## Unreleased
 
+- Plan segment fuzzy search from the rarest `3*d + 1` trigrams instead of
+  merging every trigram posting list. On 808k real MS MARCO queries this moved
+  p50 from 144.51 ms to **12.07 ms** and p95 from 279.97 ms to **21.76 ms**.
 - Memory-map immutable fuzzy value sidecars as well, and add
   `fuzzy_segment_bench` for reproducible short-string fuzzy measurements.
 - Memory-map immutable segment files instead of issuing `pread` calls for

@@ -891,9 +891,11 @@ impl FuzzySegmentReader {
         if query.is_empty() {
             return Ok(Vec::new());
         }
+        let grams = search::trigrams(&query);
+        let total_grams = grams.len();
         let mut cursors = Vec::new();
-        for gram in search::trigrams(&query) {
-            if let Some(entry) = self.segment.term(&gram)? {
+        for gram in &grams {
+            if let Some(entry) = self.segment.term(gram)? {
                 cursors.push(Cursor::new(&self.segment, entry, 1.0)?);
             }
         }
@@ -901,6 +903,83 @@ impl FuzzySegmentReader {
             return Ok(Vec::new());
         }
 
+        // A single edit can destroy at most three trigrams. Therefore a match
+        // within `max_distance` must contain at least `total_grams - 3*d`
+        // query trigrams. Probe the rarest `3*d + 1` trigrams: every candidate
+        // that can satisfy the lower bound must occur in at least one of them.
+        let shared_min = total_grams.saturating_sub(max_distance.saturating_mul(3));
+        if shared_min > cursors.len() {
+            return Ok(Vec::new());
+        }
+        if shared_min == 0 {
+            return self.search_all_grams(cursors, &query, max_distance, limit);
+        }
+        let probe_count = (max_distance.saturating_mul(3) + 1).min(cursors.len());
+        let mut probe: Vec<usize> = (0..cursors.len()).collect();
+        probe.sort_unstable_by_key(|idx| cursors[*idx].df);
+        probe.truncate(probe_count);
+
+        let mut merge: BinaryHeap<Reverse<(u32, usize)>> = BinaryHeap::new();
+        for idx in probe {
+            if let Some(posting) = cursors[idx].current() {
+                merge.push(Reverse((posting.doc, idx)));
+            }
+        }
+        let mut best: BinaryHeap<Reverse<(usize, String)>> =
+            BinaryHeap::with_capacity(limit.saturating_add(1));
+        while let Some(Reverse((doc, idx))) = merge.pop() {
+            let mut advanced = vec![idx];
+            while let Some(Reverse((next_doc, _))) = merge.peek().copied() {
+                if next_doc != doc {
+                    break;
+                }
+                let Reverse((_, next_idx)) = merge.pop().unwrap();
+                advanced.push(next_idx);
+            }
+
+            let mut count = 0usize;
+            for cursor in &mut cursors {
+                if cursor.skip_to(doc)? && cursor.current().map(|p| p.doc) == Some(doc) {
+                    count += 1;
+                }
+            }
+            if count >= shared_min {
+                let value = self.value(doc)?;
+                if let Some(distance) = search::fuzzy_distance(&value, &query, max_distance) {
+                    let id = self.segment.doc_id(doc)?;
+                    if best.len() < limit {
+                        best.push(Reverse((distance, id)));
+                    } else if let Some(Reverse((worst_distance, worst_id))) = best.peek() {
+                        if (distance, &id) < (*worst_distance, worst_id) {
+                            best.pop();
+                            best.push(Reverse((distance, id)));
+                        }
+                    }
+                }
+            }
+
+            for idx in advanced {
+                cursors[idx].advance()?;
+                if let Some(posting) = cursors[idx].current() {
+                    merge.push(Reverse((posting.doc, idx)));
+                }
+            }
+        }
+        let mut scored: Vec<FuzzySegmentHit> = best
+            .into_iter()
+            .map(|Reverse((distance, id))| FuzzySegmentHit { id, distance })
+            .collect();
+        scored.sort_by(|a, b| a.distance.cmp(&b.distance).then_with(|| a.id.cmp(&b.id)));
+        Ok(scored)
+    }
+
+    fn search_all_grams(
+        &self,
+        mut cursors: Vec<Cursor<'_>>,
+        query: &str,
+        max_distance: usize,
+        limit: usize,
+    ) -> io::Result<Vec<FuzzySegmentHit>> {
         let mut merge: BinaryHeap<Reverse<(u32, usize)>> = BinaryHeap::new();
         for (idx, cursor) in cursors.iter().enumerate() {
             if let Some(posting) = cursor.current() {
@@ -941,7 +1020,7 @@ impl FuzzySegmentReader {
         let mut scored = Vec::new();
         for Reverse(candidate) in candidates {
             let value = self.value(candidate.doc)?;
-            if let Some(distance) = search::fuzzy_distance(&value, &query, max_distance) {
+            if let Some(distance) = search::fuzzy_distance(&value, query, max_distance) {
                 scored.push(FuzzySegmentHit {
                     id: self.segment.doc_id(candidate.doc)?,
                     distance,

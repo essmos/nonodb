@@ -200,12 +200,15 @@ not long natural-language passages:
 
 | Data set | Build | Segment + values | p50 | p95 | p99 | QPS |
 |---|---:|---:|---:|---:|---:|---:|
-| 85,113 short MS MARCO queries | **1.7 s** | **6.9 MB + 1.8 MB** | **17.21 ms** | **28.09 ms** | **29.89 ms** | **54.8** |
+| 85,113 short MS MARCO queries | **1.7 s** | **6.9 MB + 1.8 MB** | **0.68 ms** | **1.64 ms** | **1.80 ms** | **1,247** |
+| 808,731 full MS MARCO queries | **24.3 s** | **105.8 MB + 31.9 MB** | **12.07 ms** | **21.76 ms** | **29.60 ms** | **80.4** |
 
-The same benchmark over all 808,731 full queries gives p50 **144.51 ms** because
-long queries produce many trigrams and a much larger candidate union. This is
-not the target workload for fuzzy matching. The next fuzzy optimization is a
-rarer-trigram planning step to reduce the candidate union for long strings.
+Fuzzy planning probes only the rarest `3*d + 1` query trigrams. A match within
+Levenshtein distance `d` can destroy at most `3*d` trigrams, so every candidate
+must occur in at least one of those probes. Candidates are then verified against
+all trigrams and the original string. This avoids merging every posting list
+for long queries and brings the 808k full-query corpus from p50 **144.51 ms** to
+**12.07 ms**.
 
 ### BM25
 
