@@ -136,6 +136,7 @@ struct AppState {
     pub(crate) audit: Option<Arc<audit::AuditLog>>,
     pub(crate) pairings: Arc<pairing::PairingManager>,
     cursors: Arc<cursor::Registry>,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
 }
 
 impl AppState {
@@ -154,6 +155,7 @@ impl AppState {
             audit: self.audit.clone(),
             pairings: self.pairings.clone(),
             cursors: self.cursors.clone(),
+            shutdown_tx: self.shutdown_tx.clone(),
         })
     }
 }
@@ -173,6 +175,15 @@ fn database_from_uri(uri: &Uri) -> String {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let result = run();
+    if replicator::restart_requested() {
+        tracing::warn!("restart requested; exiting with status 75");
+        std::process::exit(75);
+    }
+    result
+}
+
+fn run() -> Result<(), Box<dyn std::error::Error>> {
     profile::apply().map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
     // Explicit runtime: limit the blocking thread pool (lower peak VSZ),
@@ -186,10 +197,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .max_blocking_threads(blocking_threads)
         .enable_all()
         .build()?;
-    rt.block_on(run())
+    rt.block_on(run_async())
 }
 
-async fn run() -> Result<(), Box<dyn std::error::Error>> {
+async fn run_async() -> Result<(), Box<dyn std::error::Error>> {
     init_tracing();
     if let Ok(profile) = std::env::var("NONODB_PROFILE") {
         if !profile.is_empty() {
@@ -347,6 +358,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let drain_timeout = drain_timeout();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let state_shutdown = shutdown_tx.clone();
     let replication_shutdown = shutdown_tx.clone();
     let control =
         control_plane::ControlPlane::new(databases.clone(), auth.clone(), backups.clone());
@@ -391,6 +403,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         audit: audit.clone(),
         pairings: Arc::new(pairing::PairingManager::new()),
         cursors: Arc::new(cursor::Registry::new()),
+        shutdown_tx: state_shutdown,
     };
     let auth_routes = Router::new()
         .route("/v1/auth", get(auth_api::summary))

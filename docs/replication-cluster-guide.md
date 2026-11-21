@@ -442,14 +442,22 @@ the local daemon is listening on its socket:
 export NONODB_SOCK=/run/nonodb.sock
 
 nonodb-cli replication join https://primary.example.com:7878 K7M4P9QX
+
+# join requests a controlled restart so snapshot bootstrap runs first.
+until nonodb-cli ready; do sleep 1; done
 nonodb-cli replication status
 nonodb-cli replication changes 0 5
 nonodb-cli replication acks
-nonodb-cli ready
 ```
 
-The `join` command prints the installed source, node id, databases, and first
-pull result. Expected status:
+The `join` command prints the installed source, node id, databases, and
+`restart_requested`. The daemon exits with status 75 after the response; run it
+under systemd or Docker with a restart policy so it starts again and performs
+snapshot bootstrap before opening the database. If the daemon is running in the
+foreground without a supervisor, restart it manually. Set
+`NONODB_REPLICATION_JOIN_RESTART=0` only when you will restart it yourself;
+otherwise the replica can mark itself ready before the source snapshot exists.
+Expected status after the restart:
 
 ```json
 {
@@ -1035,6 +1043,7 @@ python3 scripts/replication_failover_test.py
 python3 scripts/replication_lease_test.py
 python3 scripts/replication_election_test.py
 python3 scripts/replication_cluster_test.py
+python3 scripts/replication_join_test.py
 python3 scripts/replication_sidecar_test.py
 python3 scripts/replication_metadata_test.py
 python3 scripts/replication_control_plane_test.py

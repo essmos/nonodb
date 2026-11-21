@@ -11,6 +11,10 @@ Full release notes: https://github.com/essmos/nonodb/releases
 - Plan segment fuzzy search from the rarest `3*d + 1` trigrams instead of
   merging every trigram posting list. On 808k real MS MARCO queries this moved
   p50 from 144.51 ms to **12.07 ms** and p95 from 279.97 ms to **21.76 ms**.
+- Make `replication join` request a controlled restart with exit status 75 so
+  snapshot bootstrap runs before the database reopens. Add
+  `scripts/replication_join_test.py` covering join against an already-populated
+  primary and post-bootstrap text/fuzzy/vector search.
 - Add `NONODB_REPLICATION_BOOTSTRAP_TMP` for snapshot downloads and check free
   space before download/install, with an actionable error when the temp or data
   filesystem is too small.

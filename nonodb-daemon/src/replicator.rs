@@ -28,7 +28,20 @@ use crate::{
 
 static PROMOTION_READY: AtomicBool = AtomicBool::new(false);
 static LEASE_VALID: AtomicBool = AtomicBool::new(false);
+static RESTART_REQUESTED: AtomicBool = AtomicBool::new(false);
 static CLUSTER_PEER_TOKEN: OnceLock<std::sync::RwLock<Option<String>>> = OnceLock::new();
+/// Request a controlled process restart after the current request finishes.
+///
+/// A join needs to run snapshot bootstrap before the database is opened, so the
+/// daemon exits with a restart status and lets its supervisor start it again.
+pub fn request_restart() {
+    RESTART_REQUESTED.store(true, Ordering::Relaxed);
+}
+
+pub fn restart_requested() -> bool {
+    RESTART_REQUESTED.load(Ordering::Relaxed)
+}
+
 fn cluster_peer_slot() -> &'static std::sync::RwLock<Option<String>> {
     CLUSTER_PEER_TOKEN.get_or_init(|| std::sync::RwLock::new(None))
 }

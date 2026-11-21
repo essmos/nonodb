@@ -1,6 +1,6 @@
 //! Replica pairing API.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::{
     extract::{Path, State},
@@ -281,7 +281,21 @@ pub async fn join(
     )
     .await
     {
-        Ok(result) => {
+        Ok(mut result) => {
+            let restart = std::env::var("NONODB_REPLICATION_JOIN_RESTART")
+                .ok()
+                .is_none_or(|value| !matches!(value.trim(), "0" | "false" | "no" | "off"));
+            if restart {
+                if let Some(object) = result.as_object_mut() {
+                    object.insert("restart_requested".into(), Value::Bool(true));
+                }
+                let shutdown = state.shutdown_tx.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    crate::replicator::request_restart();
+                    let _ = shutdown.send(true);
+                });
+            }
             audit_control(
                 &state,
                 &connection,
