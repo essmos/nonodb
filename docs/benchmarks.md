@@ -190,7 +190,9 @@ synchronous flushes. It is still experimental: filters and phrases are not
 supported by the segment path, and BM25 scores are merged per segment. Both p50
 and the tail are now in the target range for this data set. Flushed suffix
 segments are compacted automatically; the next work is filters/phrases, global
-phrases/non-indexed filters, and a fair concurrent comparison with Elasticsearch.
+and a fair concurrent comparison with Elasticsearch. Phrase and non-indexed
+filter verification currently loads candidate documents from LMDB, so their
+latency depends on query selectivity.
 
 #### Segment fuzzy
 

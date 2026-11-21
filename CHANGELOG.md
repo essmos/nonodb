@@ -14,8 +14,10 @@ Full release notes: https://github.com/essmos/nonodb/releases
 - Support single-field indexed filters on segment text and fuzzy indexes,
   including equality and range operators. Filter IDs are resolved through the
   existing LMDB index and applied while scoring segment hits, so filtered top-K
-  results remain correct. Compound and non-indexed filters still return an
-  error.
+  results remain correct.
+- Support phrases, negative terms/phrases, and compound or non-indexed filters
+  on segment text indexes. Candidate generation stays in the segment; only
+  candidates are loaded from LMDB for final phrase/filter verification.
 - Automatically compact flushed text and fuzzy segment suffixes once four
   segments exist. Compaction rebuilds the suffix from current LMDB documents,
   clamps tombstones to the compacted generation, and skips suffixes larger than

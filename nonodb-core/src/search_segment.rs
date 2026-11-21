@@ -682,7 +682,7 @@ impl SegmentSet {
     }
 
     pub fn search(&self, query: &str, skip: usize, limit: usize) -> io::Result<Vec<SearchHit>> {
-        self.search_filtered(query, skip, limit, None)
+        self.search_verified(query, skip, limit, None, None)
     }
 
     pub fn search_filtered(
@@ -691,6 +691,17 @@ impl SegmentSet {
         skip: usize,
         limit: usize,
         allowed: Option<&HashSet<String>>,
+    ) -> io::Result<Vec<SearchHit>> {
+        self.search_verified(query, skip, limit, allowed, None)
+    }
+
+    pub fn search_verified(
+        &self,
+        query: &str,
+        skip: usize,
+        limit: usize,
+        allowed: Option<&HashSet<String>>,
+        verify: Option<&DocVerifier<'_>>,
     ) -> io::Result<Vec<SearchHit>> {
         if limit == 0 || allowed.is_some_and(HashSet::is_empty) {
             return Ok(Vec::new());
@@ -712,7 +723,9 @@ impl SegmentSet {
             .max(limit);
         let mut merged: HashMap<String, f64> = HashMap::new();
         for (segment_idx, segment) in self.segments.iter().enumerate() {
-            for hit in segment.search_filtered_with_stats(query, want, allowed, Some(&stats))? {
+            for hit in
+                segment.search_verified_with_stats(query, want, allowed, verify, Some(&stats))?
+            {
                 let hidden = self
                     .tombstones
                     .get(&hit.id)
@@ -728,6 +741,11 @@ impl SegmentSet {
         for hit in self.search_delta(query, want, Some(&stats))? {
             if allowed.is_some_and(|set| !set.contains(&hit.id)) {
                 continue;
+            }
+            if let Some(verify) = verify {
+                if !verify(&hit.id)? {
+                    continue;
+                }
             }
             // Delta wins over any older base version of the same id.
             merged.insert(hit.id, hit.score);
@@ -1158,6 +1176,9 @@ fn write_values(path: &Path, values: &[String]) -> io::Result<()> {
 }
 
 /// A single ranked hit. The caller resolves `id` to a document in LMDB.
+/// Optional predicate used to reject a document after all query terms matched.
+pub type DocVerifier<'a> = dyn Fn(&str) -> io::Result<bool> + 'a;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct SearchHit {
     pub id: String,
@@ -1331,14 +1352,15 @@ impl SegmentReader {
         limit: usize,
         allowed: Option<&HashSet<String>>,
     ) -> io::Result<Vec<SearchHit>> {
-        self.search_filtered_with_stats(query, limit, allowed, None)
+        self.search_verified_with_stats(query, limit, allowed, None, None)
     }
 
-    fn search_filtered_with_stats(
+    fn search_verified_with_stats(
         &self,
         query: &str,
         limit: usize,
         allowed: Option<&HashSet<String>>,
+        verify: Option<&DocVerifier<'_>>,
         global: Option<&GlobalSearchStats>,
     ) -> io::Result<Vec<SearchHit>> {
         if limit == 0 {
@@ -1385,13 +1407,13 @@ impl SegmentReader {
         if entries.len() == 1 {
             let (_, entry, idf) = entries.pop().unwrap();
             let mut cursor = Cursor::new(self, entry, idf)?;
-            self.search_single(&mut cursor, avgdl, limit, allowed, &mut heap)?;
+            self.search_single(&mut cursor, avgdl, limit, allowed, verify, &mut heap)?;
         } else {
             let mut cursors = Vec::with_capacity(entries.len());
             for (_, entry, idf) in entries {
                 cursors.push(Cursor::new(self, entry, idf)?);
             }
-            self.search_and_rarest(cursors, avgdl, limit, allowed, &mut heap)?;
+            self.search_and_rarest(cursors, avgdl, limit, allowed, verify, &mut heap)?;
         }
 
         let mut hits = heap
@@ -1407,9 +1429,21 @@ impl SegmentReader {
         Ok(hits)
     }
 
-    fn doc_allowed(&self, doc: u32, allowed: Option<&HashSet<String>>) -> io::Result<bool> {
-        match allowed {
-            Some(set) => Ok(set.contains(&self.doc_id(doc)?)),
+    fn doc_allowed(
+        &self,
+        doc: u32,
+        allowed: Option<&HashSet<String>>,
+        verify: Option<&DocVerifier<'_>>,
+    ) -> io::Result<bool> {
+        if allowed.is_none() && verify.is_none() {
+            return Ok(true);
+        }
+        let id = self.doc_id(doc)?;
+        if allowed.is_some_and(|set| !set.contains(&id)) {
+            return Ok(false);
+        }
+        match verify {
+            Some(predicate) => predicate(&id),
             None => Ok(true),
         }
     }
@@ -1420,6 +1454,7 @@ impl SegmentReader {
         avgdl: f64,
         limit: usize,
         allowed: Option<&HashSet<String>>,
+        verify: Option<&DocVerifier<'_>>,
         heap: &mut BinaryHeap<Reverse<ScoredDoc>>,
     ) -> io::Result<()> {
         loop {
@@ -1438,7 +1473,7 @@ impl SegmentReader {
                 break;
             };
             let score = bm25(cursor.idf, posting.tf, posting.dl, avgdl);
-            if self.doc_allowed(posting.doc, allowed)? {
+            if self.doc_allowed(posting.doc, allowed, verify)? {
                 push_hit(
                     heap,
                     ScoredDoc {
@@ -1459,6 +1494,7 @@ impl SegmentReader {
         avgdl: f64,
         limit: usize,
         allowed: Option<&HashSet<String>>,
+        verify: Option<&DocVerifier<'_>>,
         heap: &mut BinaryHeap<Reverse<ScoredDoc>>,
     ) -> io::Result<()> {
         let term_count = cursors.len();
@@ -1500,7 +1536,7 @@ impl SegmentReader {
                         cursor.advance()?;
                     }
                 }
-                if matched == term_count && self.doc_allowed(pivot, allowed)? {
+                if matched == term_count && self.doc_allowed(pivot, allowed, verify)? {
                     push_hit(heap, ScoredDoc { doc: pivot, score }, limit);
                 }
             } else {
@@ -1520,6 +1556,7 @@ impl SegmentReader {
         avgdl: f64,
         limit: usize,
         allowed: Option<&HashSet<String>>,
+        verify: Option<&DocVerifier<'_>>,
         heap: &mut BinaryHeap<Reverse<ScoredDoc>>,
     ) -> io::Result<()> {
         // Walk the shortest posting list and skip the other cursors to each
@@ -1527,7 +1564,7 @@ impl SegmentReader {
         // instead of touching every posting for every term.
         let doc_count = u64::from(self.header.doc_count);
         if u64::from(cursors[0].df).saturating_mul(20) > doc_count {
-            return self.search_wand(cursors, avgdl, limit, allowed, heap);
+            return self.search_wand(cursors, avgdl, limit, allowed, verify, heap);
         }
         let mut rare_cursor = cursors.remove(0);
         while let Some(posting) = rare_cursor.current() {
@@ -1562,7 +1599,7 @@ impl SegmentReader {
                     let other = cursor.current().unwrap();
                     score += bm25(cursor.idf, other.tf, other.dl, avgdl);
                 }
-                if matched && self.doc_allowed(doc, allowed)? {
+                if matched && self.doc_allowed(doc, allowed, verify)? {
                     push_hit(heap, ScoredDoc { doc, score }, limit);
                 }
                 rare_cursor.advance()?;

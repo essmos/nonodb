@@ -28,7 +28,7 @@ use crate::query::{
 };
 use crate::search::{self, SearchEngine, SearchIndexDef, SearchKind, TextQueryMode};
 use crate::search_segment::{
-    FuzzySegmentBuilder, FuzzySegmentReader, SegmentBuilder, SegmentReader, SegmentSet,
+    DocVerifier, FuzzySegmentBuilder, FuzzySegmentReader, SegmentBuilder, SegmentReader, SegmentSet,
 };
 use crate::store::MAX_DOCUMENT_BYTES;
 use crate::subscriptions::{self, Subscription};
@@ -3696,6 +3696,7 @@ impl<'e> Collection<'e> {
         Ok(out)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn search_segment_text_index_in(
         &self,
         rtxn: &RoTxn<'_>,
@@ -3704,6 +3705,7 @@ impl<'e> Collection<'e> {
         skip: usize,
         limit: Option<usize>,
         allowed: Option<&HashSet<String>>,
+        verify: Option<&DocVerifier<'_>>,
     ) -> Result<Vec<Value>> {
         let max = limit.unwrap_or(10).min(1000);
         if max == 0 {
@@ -3728,7 +3730,7 @@ impl<'e> Collection<'e> {
                 .map_err(|e| Error::Query(format!("invalid segment delta text: {e}")))?;
             set.add_document(id, text)?;
         }
-        let hits = set.search_filtered(query, skip, max, allowed)?;
+        let hits = set.search_verified(query, skip, max, allowed, verify)?;
         let mut out = Vec::with_capacity(hits.len());
         for hit in hits {
             let Some(bytes) = self.db.get(rtxn, hit.id.as_bytes())? else {
@@ -3769,35 +3771,86 @@ impl<'e> Collection<'e> {
 
         let empty_filter = filter.as_object().is_none_or(|object| object.is_empty());
         if def.engine == SearchEngine::Segment {
-            if mode != TextQueryMode::Native
-                || !parsed.phrases.is_empty()
-                || !parsed.negative_phrases.is_empty()
-                || !parsed.negative_terms.is_empty()
-                || def.fields.len() != 1
-            {
+            if mode != TextQueryMode::Native || def.fields.len() != 1 {
                 return Err(Error::Query(
-                    "segment text indexes support only simple native queries".into(),
+                    "segment text indexes support only native single-field queries".into(),
                 ));
             }
             let allowed = if empty_filter {
                 None
             } else {
-                match self.segment_filter_candidates(rtxn, filter)? {
-                    Some(ids) => Some(ids),
-                    None => {
-                        return Err(Error::Query(
-                            "segment text filters require a single indexed field".into(),
-                        ))
+                self.segment_filter_candidates(rtxn, filter)?
+            };
+            let needs_filter = !empty_filter && allowed.is_none();
+            let needs_negative =
+                !parsed.negative_terms.is_empty() || !parsed.negative_phrases.is_empty();
+            let needs_phrases = !parsed.phrases.is_empty();
+            let mut candidate_terms = parsed.positive_terms.clone();
+            for phrase in &parsed.phrases {
+                candidate_terms.extend(phrase.iter().cloned());
+            }
+            candidate_terms.sort();
+            candidate_terms.dedup();
+            if candidate_terms.is_empty() {
+                return Ok(Vec::new());
+            }
+            let candidate_query = candidate_terms.join(" ");
+            let verify = |id: &str| -> std::io::Result<bool> {
+                let Some(bytes) = self
+                    .db
+                    .get(rtxn, id.as_bytes())
+                    .map_err(std::io::Error::other)?
+                else {
+                    return Ok(false);
+                };
+                let doc: Value = serde_json::from_slice(bytes).map_err(std::io::Error::other)?;
+                if needs_filter && !matches(&doc, filter) {
+                    return Ok(false);
+                }
+                if needs_negative || needs_phrases {
+                    let tokens: Vec<String> = def
+                        .fields
+                        .iter()
+                        .filter_map(|field| {
+                            index::field_value(&doc, &field.path).and_then(search::field_text)
+                        })
+                        .flat_map(|text| search::tokenize(&text))
+                        .collect();
+                    if parsed
+                        .negative_terms
+                        .iter()
+                        .any(|term| tokens.iter().any(|token| token == term))
+                    {
+                        return Ok(false);
+                    }
+                    if parsed
+                        .negative_phrases
+                        .iter()
+                        .any(|phrase| search::contains_phrase(&tokens, phrase))
+                    {
+                        return Ok(false);
+                    }
+                    if needs_phrases
+                        && !parsed
+                            .phrases
+                            .iter()
+                            .all(|phrase| search::contains_phrase(&tokens, phrase))
+                    {
+                        return Ok(false);
                     }
                 }
+                Ok(true)
             };
+            let verify: Option<&DocVerifier<'_>> =
+                (needs_filter || needs_negative || needs_phrases).then_some(&verify);
             return self.search_segment_text_index_in(
                 rtxn,
                 &def,
-                query,
+                &candidate_query,
                 skip,
                 limit,
                 allowed.as_ref(),
+                verify,
             );
         }
         let needs_phrases = !parsed.phrases.is_empty() || !parsed.negative_phrases.is_empty();
@@ -11231,6 +11284,45 @@ mod tests {
             .map(|doc| doc["_id"].as_str().unwrap().to_string())
             .collect();
         assert_eq!(ids, vec!["b".to_string()]);
+    }
+
+    #[test]
+    fn segment_text_supports_phrases_negation_and_post_filters() {
+        let (_dir, store) = store();
+        let c = store.collection("segment_text_verify").unwrap();
+        for doc in [
+            json!({"_id": "a", "body": "quick brown fox", "tag": "x"}),
+            json!({"_id": "b", "body": "quick red brown fox", "tag": "y"}),
+        ] {
+            c.insert_one(doc).unwrap();
+        }
+        c.create_text_segment_index("body").unwrap();
+        let ids = |docs: Vec<Value>| {
+            let mut ids: Vec<String> = docs
+                .into_iter()
+                .map(|doc| doc["_id"].as_str().unwrap().to_string())
+                .collect();
+            ids.sort();
+            ids
+        };
+        assert_eq!(
+            ids(c
+                .search("body", "\"quick brown\"", &json!({}), 0, Some(10))
+                .unwrap()),
+            vec!["a".to_string()]
+        );
+        assert_eq!(
+            ids(c
+                .search("body", "quick brown -red", &json!({}), 0, Some(10))
+                .unwrap()),
+            vec!["a".to_string()]
+        );
+        assert_eq!(
+            ids(c
+                .search("body", "brown", &json!({"tag": "y"}), 0, Some(10))
+                .unwrap()),
+            vec!["b".to_string()]
+        );
     }
 
     #[test]

@@ -612,17 +612,17 @@ are removed at the start of the next one.
 Current limits:
 
 - one field per segment index;
-- simple native queries only: no MongoDB-mode text search, phrases, or
-  negation;
-- filters are supported for a single indexed field, including `$eq` and range
-  operators, or for `_id`; compound and non-indexed filters return an error;
+- native single-field queries only: no MongoDB-mode text search;
+- phrases and negative terms are verified against the current LMDB document
+  after segment candidate generation;
+- filters use an indexed candidate set when possible; compound and non-indexed
+  filters are verified against current documents and are correspondingly slower;
 - BM25 document frequency, document count, and average length are summed
   across all base segments and the in-memory delta before scoring, so scores
   are comparable after flushes instead of using each segment's local corpus
   statistics;
 - fuzzy search uses a segment-native trigram index and value sidecar when
-  `NONODB_SEGMENT_FUZZY=1`; single-field indexed filters use the same
-  candidate-set path as text;
+  `NONODB_SEGMENT_FUZZY=1`; its filters must use a single indexed field;
 - compaction merges the flushed suffix, not the base segment; a very large
   suffix is left alone until an explicit full rebuild.
 
