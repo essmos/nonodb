@@ -329,8 +329,11 @@ The 10M sidecar was about **54× faster at p50** than the exact scan, and the
 **1.0** against the exact index. Recall is data-dependent, so validate with
 representative queries before relying on approximate results.
 
-Vector updates mark the sidecar dirty; searches fall back to exact LMDB until
-the sidecar is rebuilt. Filtered vector searches deliberately use the exact path.
+Vector updates are stored in a small LMDB delta and merged into unfiltered ANN
+queries, so a few updates do not force a 528 ms exact scan. After changing one
+of the 10M vectors, ANN p50 remained **9.77 ms** (p95 **12.01 ms**). After 4,096
+changed ids the query falls back to exact LMDB until the sidecar is rebuilt.
+Filtered vector searches deliberately use the exact path.
 
 ---
 
@@ -347,7 +350,7 @@ the sidecar is rebuilt. Filtered vector searches deliberately use the exact path
   sharding for larger gains.
 - **Vector search scales with the sidecar.** The exact path is CPU and I/O bound
   because it scans every vector. The optional IVF sidecar cuts 10M p50 from
-  about 528 ms to under 10 ms; filtered and dirty queries still use exact scans.
+  about 528 ms to under 10 ms; filtered queries and oversized deltas still use exact scans.
 - **RSS is not heap.** Large RSS values after scans mostly reflect mapped LMDB
   pages.
 

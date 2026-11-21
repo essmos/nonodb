@@ -609,12 +609,15 @@ clusters in parallel and merges their bounded top-K heaps. There are no
 background threads or idle caches, and the exact LMDB index remains the source
 of truth.
 
-Writes that change a vector mark the sidecar dirty. Queries then use the exact
-LMDB path until `build_vector_ann_index` is called again. Filtered queries also
-use the exact path, because applying a filter after approximate candidate
-selection could miss matching documents. Dropping or reindexing the vector
-index removes the sidecar. Backups contain only LMDB, so rebuild the sidecar
-after a restore.
+Writes that change a vector store the current value (or a tombstone) in a small
+LMDB delta under `vecanndelta:<collection>:<field>:<id>`. Unfiltered queries
+merge the ANN candidates with that delta, so updates and deletes do not
+immediately force a full exact scan. Once the delta exceeds 4,096 changed ids,
+queries fall back to the exact path; rebuilding the sidecar clears the delta.
+Filtered queries also use the exact path, because applying a filter after
+approximate candidate selection could miss matching documents. Dropping or
+reindexing the vector index removes the sidecar and delta. Backups contain only
+LMDB, so rebuild the sidecar after a restore.
 
 The sidecar is approximate: recall depends on the number of clusters, `nprobe`,
 and data distribution. The 10M benchmark sample reached recall@10 of 1.0 with

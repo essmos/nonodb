@@ -87,6 +87,14 @@ pub fn ann_dirty_key(coll: &str, field: &str) -> String {
     format!("vecanndirty:{coll}:{field}")
 }
 
+pub fn ann_delta_prefix(coll: &str, field: &str) -> String {
+    format!("vecanndelta:{coll}:{field}:")
+}
+
+pub fn ann_delta_count_key(coll: &str, field: &str) -> String {
+    format!("vecanndeltacount:{coll}:{field}")
+}
+
 /// Decodes a value produced by [`encode_vector`].
 pub fn decode_vector(bytes: &[u8], dims: usize) -> Option<Vec<f32>> {
     if bytes.len() != 4 + dims * 4 {

@@ -304,7 +304,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             let collection = store.collection(&name)?;
             for def in collection.list_vector_indexes()? {
-                if def.ann.is_none() {
+                if def.ann.is_none() || !collection.vector_ann_sidecar_exists(&def.field) {
                     let stats = collection.build_vector_ann_index(&def.field, nprobe)?;
                     tracing::info!(
                         collection = %name,

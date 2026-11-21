@@ -65,6 +65,7 @@ struct FuzzySegmentManifest {
 const SEGMENT_DELTA_FLUSH_DOCS: u64 = 4096;
 const SEGMENT_COMPACT_MIN_SEGMENTS: usize = 4;
 const SEGMENT_COMPACT_MAX_DOCS: u32 = 200_000;
+const VECTOR_ANN_DELTA_MAX: usize = 4096;
 
 fn fuzzy_segment_index_dir(coll: &str, index: &str) -> String {
     let digest = Sha256::digest(format!("fuzzy\0{coll}\0{index}").as_bytes());
@@ -2247,6 +2248,13 @@ impl<'e> Collection<'e> {
         Ok(())
     }
 
+    /// Whether the optional ANN sidecar file exists for a vector index.
+    pub fn vector_ann_sidecar_exists(&self, field: &str) -> bool {
+        self.vector_ann_path(field)
+            .map(|path| path.is_file())
+            .unwrap_or(false)
+    }
+
     /// Builds or rebuilds the optional immutable IVF sidecar for a vector
     /// index. The exact LMDB index remains the source of truth.
     pub fn build_vector_ann_index(
@@ -2285,6 +2293,7 @@ impl<'e> Collection<'e> {
             &mut wtxn,
             vector::ann_dirty_key(&self.name, field).as_bytes(),
         )?;
+        self.clear_vector_ann_delta(&mut wtxn, field)?;
         wtxn.commit()?;
         Ok(stats)
     }
@@ -2307,6 +2316,7 @@ impl<'e> Collection<'e> {
                 &mut *wtxn,
                 vector::ann_dirty_key(&self.name, field).as_bytes(),
             )?;
+            self.clear_vector_ann_delta(wtxn, field)?;
             if let Some(store) = self.store {
                 let dir = store
                     .env()
@@ -2355,19 +2365,39 @@ impl<'e> Collection<'e> {
             if old_vector.is_some() {
                 db.delete(&mut *wtxn, id.as_bytes())?;
             }
-            if let Some(vector) = new_vector {
+            if let Some(vector) = &new_vector {
                 db.put(
                     &mut *wtxn,
                     id.as_bytes(),
-                    vector::encode_vector(&vector).as_slice(),
+                    vector::encode_vector(vector).as_slice(),
                 )?;
             }
             if def.ann.is_some() {
-                self.meta.put(
-                    &mut *wtxn,
-                    vector::ann_dirty_key(&self.name, &def.field).as_bytes(),
-                    b"1",
-                )?;
+                let delta_key =
+                    format!("{}{}", vector::ann_delta_prefix(&self.name, &def.field), id);
+                let existed = self.meta.get(&*wtxn, delta_key.as_bytes())?.is_some();
+                let count_key = vector::ann_delta_count_key(&self.name, &def.field);
+                let count = self
+                    .meta
+                    .get(&*wtxn, count_key.as_bytes())?
+                    .and_then(|value| std::str::from_utf8(value).ok())
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(0);
+                if !existed {
+                    self.meta.put(
+                        &mut *wtxn,
+                        count_key.as_bytes(),
+                        (count + 1).to_string().as_bytes(),
+                    )?;
+                }
+                match &new_vector {
+                    Some(vector) => self.meta.put(
+                        &mut *wtxn,
+                        delta_key.as_bytes(),
+                        vector::encode_vector(vector).as_slice(),
+                    )?,
+                    None => self.meta.put(&mut *wtxn, delta_key.as_bytes(), b"")?,
+                }
             }
         }
         Ok(())
@@ -2433,13 +2463,40 @@ impl<'e> Collection<'e> {
                     .meta
                     .get(rtxn, vector::ann_dirty_key(&self.name, field).as_bytes())?
                     .is_some();
-                if !dirty {
+                let delta = self.vector_ann_delta_in(rtxn, field)?;
+                if !dirty && delta.len() <= VECTOR_ANN_DELTA_MAX {
                     if let Ok(path) = self.vector_ann_path(field) {
                         if let Ok(reader) = vector_ann::AnnReader::open(&path) {
-                            if reader.stats().entries == db.stat(rtxn)?.entries
-                                && reader.stats().nprobe == ann.nprobe as usize
-                            {
-                                let heap = reader.search(query, want)?;
+                            if reader.stats().nprobe == ann.nprobe as usize {
+                                let delta_ids: HashSet<&str> =
+                                    delta.iter().map(|(id, _)| id.as_str()).collect();
+                                let mut heap: BinaryHeap<Candidate> = BinaryHeap::new();
+                                let search_want = want.saturating_add(delta_ids.len());
+                                for candidate in reader.search(query, search_want)? {
+                                    if !delta_ids.contains(candidate.id.as_str()) {
+                                        heap.push(candidate);
+                                        if heap.len() > want {
+                                            heap.pop();
+                                        }
+                                    }
+                                }
+                                for (id, bytes) in &delta {
+                                    if bytes.is_empty() {
+                                        continue;
+                                    }
+                                    let Some(distance) = vector::distance_from_bytes(
+                                        def.metric, query, query_norm, bytes, def.dims,
+                                    ) else {
+                                        continue;
+                                    };
+                                    heap.push(Candidate {
+                                        distance,
+                                        id: id.clone(),
+                                    });
+                                    if heap.len() > want {
+                                        heap.pop();
+                                    }
+                                }
                                 return self.vector_results_from_heap(rtxn, heap, skip, limit);
                             }
                         }
@@ -3368,6 +3425,35 @@ impl<'e> Collection<'e> {
             .segment_root()?
             .join(vector_ann_index_dir(&self.name, field))
             .join("ann-000000.ivf"))
+    }
+
+    fn vector_ann_delta_in(&self, rtxn: &RoTxn<'_>, field: &str) -> Result<Vec<(String, Vec<u8>)>> {
+        let prefix = vector::ann_delta_prefix(&self.name, field);
+        let mut out = Vec::new();
+        for item in self.meta.prefix_iter(rtxn, prefix.as_bytes())? {
+            let (key, value) = item?;
+            let id = std::str::from_utf8(&key[prefix.len()..])
+                .map_err(|error| Error::Query(format!("invalid ANN delta id: {error}")))?;
+            out.push((id.to_string(), value.to_vec()));
+        }
+        Ok(out)
+    }
+
+    fn clear_vector_ann_delta(&self, wtxn: &mut RwTxn<'_>, field: &str) -> Result<()> {
+        let prefix = vector::ann_delta_prefix(&self.name, field);
+        let keys: Vec<Vec<u8>> = self
+            .meta
+            .prefix_iter(&*wtxn, prefix.as_bytes())?
+            .map(|item| item.map(|(key, _)| key.to_vec()))
+            .collect::<std::result::Result<_, _>>()?;
+        for key in keys {
+            self.meta.delete(&mut *wtxn, &key)?;
+        }
+        self.meta.delete(
+            &mut *wtxn,
+            vector::ann_delta_count_key(&self.name, field).as_bytes(),
+        )?;
+        Ok(())
     }
 
     fn segment_manifest_key(&self, index: &str) -> String {

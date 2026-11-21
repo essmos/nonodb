@@ -15,7 +15,8 @@ Full release notes: https://github.com/essmos/nonodb/releases
   16D benchmark, p50 fell from 528 ms to 9.84 ms and p95 to 12.10 ms with
   recall@10 1.0 on a 20-query sample. Build with
   `NONODB_BUILD_VECTOR_ANN=1` and tune with `NONODB_VECTOR_ANN_PROBE`;
-  vector writes mark the sidecar dirty and fall back to exact search.
+  vector writes are tracked in a small LMDB delta and merged into ANN queries,
+  with exact fallback after 4,096 changed ids.
 - Add an in-place migration from legacy LMDB text/fuzzy indexes to immutable
   segment indexes. Set `NONODB_MIGRATE_SEARCH_SEGMENTS=1` at daemon startup, or
   call `migrate_search_indexes_to_segment()` from the core API.

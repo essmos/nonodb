@@ -39,7 +39,7 @@ fn vector_index_backfills_and_ranks_by_distance() {
 }
 
 #[test]
-fn vector_ann_sidecar_serves_queries_and_falls_back_after_updates() {
+fn vector_ann_sidecar_serves_queries_and_tracks_updates_with_delta() {
     let (_dir, store) = store();
     let c = store.collection("vectors").unwrap();
     let stats = c.build_vector_ann_index("embedding", 2).unwrap();
@@ -52,6 +52,13 @@ fn vector_ann_sidecar_serves_queries_and_falls_back_after_updates() {
         .vector_search("embedding", &[1.0, 0.0], &json!({}), 0, Some(3))
         .unwrap();
     assert_eq!(results[0]["_id"], "a");
+
+    c.insert_one(json!({"_id": "d", "embedding": [0.0, 1.0]}))
+        .unwrap();
+    let results = c
+        .vector_search("embedding", &[0.0, 1.0], &json!({}), 0, Some(4))
+        .unwrap();
+    assert!(results.iter().any(|doc| doc["_id"] == "d"));
 
     c.update(
         &json!({"_id": "c"}),

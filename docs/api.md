@@ -2195,8 +2195,9 @@ Semantics:
   Start the daemon with `NONODB_BUILD_VECTOR_ANN=1` to build missing sidecars,
   optionally limited by `NONODB_VECTOR_ANN_COLLECTIONS=collection-a,collection-b`.
   `NONODB_VECTOR_ANN_PROBE` controls the number of probed clusters (default 16).
-  Vector writes mark the sidecar dirty; queries then use the exact index until
-  the sidecar is rebuilt.
+  Vector writes are tracked in a small LMDB delta and merged into unfiltered
+  ANN queries. After 4,096 changed ids, queries use the exact index until the
+  sidecar is rebuilt.
 
 ## vector_search
 
