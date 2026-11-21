@@ -194,6 +194,24 @@ and a fair concurrent comparison with Elasticsearch. Phrase and non-indexed
 filter verification currently loads candidate documents from LMDB, so their
 latency depends on query selectivity.
 
+#### Segment reader concurrency
+
+`segment_bench --clients N` runs the same 500-query sample from `N` threads
+against one mapped segment. The process is standalone, not the daemon, so this
+isolates reader scaling from socket and writer overhead.
+
+| Clients | p50 | p95 | p99 | Aggregate QPS |
+|---:|---:|---:|---:|---:|
+| 1 | **1.26 ms** | **32.88 ms** | **56.22 ms** | **175.6** |
+| 4 | **1.40 ms** | **36.31 ms** | **60.31 ms** | **635.6** |
+| 16 | **2.55 ms** | **74.49 ms** | **125.41 ms** | **1,248.0** |
+| 64 | **11.06 ms** | **299.72 ms** | **535.20 ms** | **1,225.8** |
+
+The server has 8 physical cores and 16 hardware threads. Aggregate throughput
+saturates around 1.25k QPS at 16 clients; 64 clients add queueing latency without
+more throughput. This is not yet an end-to-end daemon or Elasticsearch
+comparison.
+
 #### Segment fuzzy
 
 `FuzzySegmentBuilder` stores normalized values in a mapped sidecar file, so
@@ -315,6 +333,11 @@ NONODB_SOCK=$S python3 scripts/msmarco_bench.py queries.train.tsv \
 cargo run --release -p nonodb-core --example segment_bench -- \
   collection.tsv /var/lib/vz/nonodb-bench-1b/segments/msmarco8m.seg \
   --rebuild --queries queries.train.tsv --samples 500 --limit 10
+
+# Reader concurrency probe (standalone, not the daemon)
+cargo run --release -p nonodb-core --example segment_bench -- \
+  collection.tsv /var/lib/vz/nonodb-bench-1b/segments/msmarco8m.seg \
+  --queries queries.train.tsv --samples 500 --limit 10 --clients 16
 
 # Smaller functional checks
 NONODB_SOCK=$S python3 scripts/search_test.py

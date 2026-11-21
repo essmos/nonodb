@@ -12,6 +12,7 @@
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use nonodb_core::search_segment::{SegmentBuilder, SegmentReader};
@@ -23,6 +24,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut queries: Option<PathBuf> = None;
     let mut samples = 500usize;
     let mut limit = 10usize;
+    let mut clients = 1usize;
     let mut rebuild = false;
     let mut max_docs = 0usize;
     while let Some(arg) = args.next() {
@@ -32,6 +34,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             "--samples" => samples = args.next().ok_or("missing --samples value")?.parse()?,
             "--limit" => limit = args.next().ok_or("missing --limit value")?.parse()?,
+            "--clients" => clients = args.next().ok_or("missing --clients value")?.parse()?,
             "--max-docs" => max_docs = args.next().ok_or("missing --max-docs value")?.parse()?,
             "--rebuild" => rebuild = true,
             other => return Err(format!("unknown argument `{other}`").into()),
@@ -67,30 +70,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .collect();
     }
 
-    for query in queries.iter().take(10) {
+    for query in queries.iter() {
         reader.search(query, limit)?;
     }
-    let mut latencies = Vec::with_capacity(queries.len());
-    let mut slowest = Vec::with_capacity(queries.len());
+    let reader = Arc::new(reader);
+    let queries = Arc::new(queries);
     let started = Instant::now();
-    for query in &queries {
-        let begin = Instant::now();
-        let hits = reader.search(query, limit)?;
-        let elapsed = begin.elapsed();
-        latencies.push(elapsed);
-        slowest.push((elapsed, query.clone(), hits.len()));
+    let mut handles = Vec::with_capacity(clients);
+    for _ in 0..clients.max(1) {
+        let reader = Arc::clone(&reader);
+        let queries = Arc::clone(&queries);
+        handles.push(std::thread::spawn(move || {
+            let mut local = Vec::with_capacity(queries.len());
+            for query in queries.iter() {
+                let begin = Instant::now();
+                let hits = reader.search(query, limit).unwrap();
+                local.push((begin.elapsed(), query.clone(), hits.len()));
+            }
+            local
+        }));
+    }
+    let mut latencies = Vec::with_capacity(queries.len() * clients.max(1));
+    let mut slowest = Vec::with_capacity(queries.len() * clients.max(1));
+    for handle in handles {
+        for item in handle.join().unwrap() {
+            latencies.push(item.0);
+            slowest.push(item);
+        }
     }
     let wall = started.elapsed();
     latencies.sort_unstable();
     slowest.sort_by_key(|a| std::cmp::Reverse(a.0));
     println!(
-        "queries={} p50={:.2}ms p95={:.2}ms p99={:.2}ms mean={:.2}ms qps={:.1}",
-        queries.len(),
+        "clients={} queries={} p50={:.2}ms p95={:.2}ms p99={:.2}ms mean={:.2}ms qps={:.1}",
+        clients.max(1),
+        latencies.len(),
         pct(&latencies, 0.50),
         pct(&latencies, 0.95),
         pct(&latencies, 0.99),
         latencies.iter().map(|d| d.as_secs_f64()).sum::<f64>() * 1000.0 / latencies.len() as f64,
-        queries.len() as f64 / wall.as_secs_f64()
+        latencies.len() as f64 / wall.as_secs_f64()
     );
     for (elapsed, query, hits) in slowest.iter().take(5) {
         println!(

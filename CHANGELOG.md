@@ -7,6 +7,10 @@ Full release notes: https://github.com/essmos/nonodb/releases
 - Plan segment fuzzy search from the rarest `3*d + 1` trigrams instead of
   merging every trigram posting list. On 808k real MS MARCO queries this moved
   p50 from 144.51 ms to **12.07 ms** and p95 from 279.97 ms to **21.76 ms**.
+- Add `segment_bench --clients N` for reader concurrency measurements. On the
+  8.84M segment, aggregate throughput scales from 175.6 QPS at one client to
+  1,248 QPS at 16 clients, then plateaus at 64 clients without a daemon in the
+  path.
 - Use global BM25 statistics across all segment files and the delta: term
   document frequency, total documents, and average document length are summed
   before scoring, so scores no longer depend on which flushed segment a hit
