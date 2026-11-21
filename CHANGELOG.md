@@ -4,6 +4,12 @@ Full release notes: https://github.com/essmos/nonodb/releases
 
 ## Unreleased
 
+- Wired the internal segment backend into the writer and daemon behind
+  `NONODB_SEGMENT_TEXT=1`. New text indexes get a durable manifest, LMDB-backed
+  delta, tombstone generations, synchronous 4096-document flushes, and
+  create/update/delete support. The daemon search path serves simple,
+  unfiltered native BM25 queries from segments. Filters, phrases, fuzzy search,
+  and automatic compaction still use or require the existing backends.
 - Added `SegmentSet`, an in-memory delta layer over immutable segments with
   tombstone generations. Updates replace base documents without hiding later
   flushed versions; deletes survive delta flushes. This is the write-side

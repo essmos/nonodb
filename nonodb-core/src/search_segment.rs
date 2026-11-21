@@ -599,6 +599,10 @@ impl SegmentSet {
         self.tombstones.insert(id.to_string(), self.segments.len());
     }
 
+    pub fn set_tombstones(&mut self, tombstones: HashMap<String, usize>) {
+        self.tombstones = tombstones;
+    }
+
     pub fn delta_len(&self) -> usize {
         self.delta.len()
     }

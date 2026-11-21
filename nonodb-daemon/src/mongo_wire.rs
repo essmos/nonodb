@@ -1982,6 +1982,7 @@ async fn create_indexes_command(
                 name: name.to_string(),
                 kind: nonodb_core::SearchKind::Text,
                 fields,
+                engine: nonodb_core::search::SearchEngine::Lmdb,
             });
             continue;
         }

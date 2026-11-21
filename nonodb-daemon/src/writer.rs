@@ -1619,7 +1619,14 @@ fn execute(
         }
         WriteReq::CreateTextIndex { coll, field } => {
             let c = standard_collection(store, wtxn, coll)?;
-            let index = nonodb_core::SearchIndexDef::single(nonodb_core::SearchKind::Text, field);
+            let mut index =
+                nonodb_core::SearchIndexDef::single(nonodb_core::SearchKind::Text, field);
+            if std::env::var("NONODB_SEGMENT_TEXT")
+                .ok()
+                .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
+            {
+                index.engine = nonodb_core::SearchEngine::Segment;
+            }
             c.create_search_index_txn(wtxn, &index)?;
             replication.capture_op(ReplicationOp::SearchIndexCreate {
                 coll: coll.clone(),

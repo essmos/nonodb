@@ -52,6 +52,15 @@ fn default_weight() -> f64 {
     1.0
 }
 
+/// Storage engine for a search index.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SearchEngine {
+    #[default]
+    Lmdb,
+    Segment,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SearchField {
     pub path: String,
@@ -64,6 +73,8 @@ pub struct SearchIndexDef {
     pub name: String,
     pub kind: SearchKind,
     pub fields: Vec<SearchField>,
+    #[serde(default)]
+    pub engine: SearchEngine,
 }
 
 impl SearchIndexDef {
@@ -75,6 +86,7 @@ impl SearchIndexDef {
                 path: field.to_string(),
                 weight: 1.0,
             }],
+            engine: SearchEngine::Lmdb,
         }
     }
 

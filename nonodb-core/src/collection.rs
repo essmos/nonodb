@@ -11,6 +11,7 @@ use heed::types::Bytes;
 use heed::{Database, Env, RoPrefix, RoTxn, RwTxn};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 
 use crate::aggregate;
 use crate::bson_types;
@@ -25,7 +26,8 @@ use crate::numeric;
 use crate::query::{
     apply_upsert_with_options, apply_with_options, matches, path, seed_from_filter,
 };
-use crate::search::{self, SearchIndexDef, SearchKind, TextQueryMode};
+use crate::search::{self, SearchEngine, SearchIndexDef, SearchKind, TextQueryMode};
+use crate::search_segment::{SegmentBuilder, SegmentReader, SegmentSet};
 use crate::store::MAX_DOCUMENT_BYTES;
 use crate::subscriptions::{self, Subscription};
 use crate::ttl::{self, TtlUpdate};
@@ -40,6 +42,22 @@ const MAX_DB_SLOTS: u32 = crate::store::MAX_DBS - 64;
 
 /// Maximum number of indexed `_id`s used to prefilter a text search.
 const SEARCH_FILTER_CANDIDATE_LIMIT: usize = 10_000_000;
+
+/// Durable manifest for one segment-backed text index.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct SegmentManifest {
+    /// Paths relative to the LMDB data directory.
+    segments: Vec<String>,
+    /// id -> number of segments that existed when the id was deleted.
+    tombstones: HashMap<String, usize>,
+}
+
+const SEGMENT_DELTA_FLUSH_DOCS: u64 = 4096;
+
+fn segment_index_dir(coll: &str, index: &str) -> String {
+    let digest = Sha256::digest(format!("{coll}\0{index}").as_bytes());
+    format!("search/{digest:x}")
+}
 
 /// One scored document id for the bounded top-K heap used by text search.
 #[derive(Debug)]
@@ -2568,6 +2586,9 @@ impl<'e> Collection<'e> {
         }
 
         match def.kind {
+            SearchKind::Text if def.engine == SearchEngine::Segment => {
+                self.backfill_segment_text_index(wtxn, def)?
+            }
             SearchKind::Text => self.backfill_text_search_index(wtxn, def)?,
             SearchKind::Fuzzy => self.backfill_fuzzy_search_index(wtxn, def)?,
         }
@@ -2700,6 +2721,151 @@ impl<'e> Collection<'e> {
         )
     }
 
+    /// Creates a text index backed by immutable search segments.
+    pub fn create_text_segment_index(&self, field: &str) -> Result<()> {
+        let mut def = SearchIndexDef::single(SearchKind::Text, field);
+        def.engine = SearchEngine::Segment;
+        self.create_search_index(&def)
+    }
+
+    pub fn create_text_segment_index_txn(&self, wtxn: &mut RwTxn<'_>, field: &str) -> Result<()> {
+        let mut def = SearchIndexDef::single(SearchKind::Text, field);
+        def.engine = SearchEngine::Segment;
+        self.create_search_index_txn(wtxn, &def)
+    }
+
+    fn segment_root(&self) -> Result<std::path::PathBuf> {
+        self.store
+            .map(|store| store.env().path().to_path_buf())
+            .ok_or_else(|| Error::Query("segment search requires a store path".into()))
+    }
+
+    fn segment_manifest_key(&self, index: &str) -> String {
+        format!("segmanifest:{}:{index}", self.name)
+    }
+
+    fn segment_delta_prefix(&self, index: &str) -> String {
+        format!("segdelta:{}:{index}:", self.name)
+    }
+
+    fn segment_delta_count_key(&self, index: &str) -> String {
+        format!("segdeltacount:{}:{index}", self.name)
+    }
+
+    fn segment_manifest_in(&self, txn: &RoTxn<'_>, index: &str) -> Result<Option<SegmentManifest>> {
+        let key = self.segment_manifest_key(index);
+        let Some(bytes) = self.meta.get(txn, key.as_bytes())? else {
+            return Ok(None);
+        };
+        Ok(Some(serde_json::from_slice(bytes)?))
+    }
+
+    fn put_segment_manifest(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        index: &str,
+        manifest: &SegmentManifest,
+    ) -> Result<()> {
+        let key = self.segment_manifest_key(index);
+        self.meta.put(
+            &mut *wtxn,
+            key.as_bytes(),
+            serde_json::to_vec(manifest)?.as_slice(),
+        )?;
+        Ok(())
+    }
+
+    fn segment_delta_count(&self, txn: &RoTxn<'_>, index: &str) -> u64 {
+        self.meta
+            .get(txn, self.segment_delta_count_key(index).as_bytes())
+            .ok()
+            .flatten()
+            .and_then(search::read_u64)
+            .unwrap_or(0)
+    }
+
+    fn set_segment_delta_count(&self, wtxn: &mut RwTxn<'_>, index: &str, count: u64) -> Result<()> {
+        self.meta.put(
+            &mut *wtxn,
+            self.segment_delta_count_key(index).as_bytes(),
+            &count.to_le_bytes(),
+        )?;
+        Ok(())
+    }
+
+    fn backfill_segment_text_index(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        def: &SearchIndexDef,
+    ) -> Result<()> {
+        if def.fields.len() != 1 {
+            return Err(Error::Query(
+                "segment text indexes support exactly one field".into(),
+            ));
+        }
+        let root = self.segment_root()?;
+        let dir = segment_index_dir(&self.name, &def.name);
+        let rel = format!("{dir}/seg-000000.seg");
+        let path = root.join(&rel);
+        let mut builder = SegmentBuilder::new(&path)?;
+        let field = &def.fields[0].path;
+        for item in self.db.iter(&*wtxn)? {
+            let (id_bytes, doc_bytes) = item?;
+            let id = std::str::from_utf8(id_bytes)
+                .map_err(|e| Error::Query(format!("invalid document id: {e}")))?;
+            let doc: Value = serde_json::from_slice(doc_bytes)?;
+            if let Some(text) = index::field_value(&doc, field).and_then(search::field_text) {
+                builder.add_document(id, &text)?;
+            }
+        }
+        builder.finish()?;
+        let manifest = SegmentManifest {
+            segments: vec![rel],
+            tombstones: HashMap::new(),
+        };
+        self.put_segment_manifest(wtxn, &def.name, &manifest)?;
+        self.set_segment_delta_count(wtxn, &def.name, 0)?;
+        Ok(())
+    }
+
+    fn flush_segment_delta(&self, wtxn: &mut RwTxn<'_>, def: &SearchIndexDef) -> Result<()> {
+        let Some(mut manifest) = self.segment_manifest_in(&*wtxn, &def.name)? else {
+            return Ok(());
+        };
+        let prefix = self.segment_delta_prefix(&def.name);
+        let mut entries: Vec<(String, String)> = Vec::new();
+        for item in self.meta.prefix_iter(&*wtxn, prefix.as_bytes())? {
+            let (key, value) = item?;
+            let id = std::str::from_utf8(&key[prefix.len()..])
+                .map_err(|e| Error::Query(format!("invalid segment delta id: {e}")))?;
+            let text = std::str::from_utf8(value)
+                .map_err(|e| Error::Query(format!("invalid segment delta text: {e}")))?;
+            entries.push((id.to_string(), text.to_string()));
+        }
+        if entries.is_empty() {
+            self.set_segment_delta_count(wtxn, &def.name, 0)?;
+            return Ok(());
+        }
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        let root = self.segment_root()?;
+        let dir = segment_index_dir(&self.name, &def.name);
+        let rel = format!("{dir}/seg-{:06}.seg", manifest.segments.len());
+        let path = root.join(&rel);
+        let mut builder = SegmentBuilder::new(&path)?;
+        for (id, text) in &entries {
+            builder.add_document(id, text)?;
+        }
+        builder.finish()?;
+        manifest.segments.push(rel);
+        self.put_segment_manifest(wtxn, &def.name, &manifest)?;
+        for (id, _) in &entries {
+            let key = format!("{prefix}{id}");
+            self.meta.delete(&mut *wtxn, key.as_bytes())?;
+        }
+        self.set_segment_delta_count(wtxn, &def.name, 0)?;
+        Ok(())
+    }
+
     /// Creates a full-text (BM25) index and backfills it with existing documents.
     pub fn create_text_index(&self, field: &str) -> Result<()> {
         self.create_search_index(&SearchIndexDef::single(SearchKind::Text, field))
@@ -2777,6 +2943,35 @@ impl<'e> Collection<'e> {
         };
         let def: SearchIndexDef = serde_json::from_slice(bytes)?;
         self.meta.delete(&mut *wtxn, def_key.as_bytes())?;
+        if def.engine == SearchEngine::Segment {
+            self.meta
+                .delete(&mut *wtxn, self.segment_manifest_key(&def.name).as_bytes())?;
+            let prefix = self.segment_delta_prefix(&def.name);
+            let keys: Vec<Vec<u8>> = self
+                .meta
+                .prefix_iter(&*wtxn, prefix.as_bytes())?
+                .map(|item| item.map(|(key, _)| key.to_vec()))
+                .collect::<std::result::Result<_, _>>()?;
+            for key in keys {
+                self.meta.delete(&mut *wtxn, &key)?;
+            }
+            self.meta.delete(
+                &mut *wtxn,
+                self.segment_delta_count_key(&def.name).as_bytes(),
+            )?;
+            if let Some(store) = self.store {
+                let dir = store
+                    .env()
+                    .path()
+                    .join(segment_index_dir(&self.name, &def.name));
+                match std::fs::remove_dir_all(&dir) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            return Ok(true);
+        }
         for field in &def.fields {
             match def.kind {
                 SearchKind::Text => {
@@ -2804,6 +2999,49 @@ impl<'e> Collection<'e> {
         Ok(true)
     }
 
+    fn apply_segment_text_entry(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        def: &SearchIndexDef,
+        old_text: Option<&str>,
+        new_text: Option<&str>,
+        id: &str,
+    ) -> Result<()> {
+        let prefix = self.segment_delta_prefix(&def.name);
+        let key = format!("{prefix}{id}");
+        let existed = self.meta.get(&*wtxn, key.as_bytes())?.is_some();
+        let mut count = self.segment_delta_count(&*wtxn, &def.name);
+        let mut manifest = self
+            .segment_manifest_in(&*wtxn, &def.name)?
+            .unwrap_or_default();
+        let mut manifest_changed = false;
+        if old_text.is_some() {
+            manifest
+                .tombstones
+                .insert(id.to_string(), manifest.segments.len());
+            manifest_changed = true;
+        }
+        if let Some(text) = new_text {
+            self.meta.put(&mut *wtxn, key.as_bytes(), text.as_bytes())?;
+            if !existed {
+                count = count.saturating_add(1);
+            }
+        } else {
+            self.meta.delete(&mut *wtxn, key.as_bytes())?;
+            if existed {
+                count = count.saturating_sub(1);
+            }
+        }
+        if manifest_changed {
+            self.put_segment_manifest(wtxn, &def.name, &manifest)?;
+        }
+        self.set_segment_delta_count(wtxn, &def.name, count)?;
+        if count >= SEGMENT_DELTA_FLUSH_DOCS {
+            self.flush_segment_delta(wtxn, def)?;
+        }
+        Ok(())
+    }
+
     /// Maintains full-text indexes on an `old -> new` change.
     fn apply_text_entries(
         &self,
@@ -2824,6 +3062,16 @@ impl<'e> Collection<'e> {
                     .and_then(|d| index::field_value(d, &field.path))
                     .and_then(search::field_text);
                 if old_text == new_text {
+                    continue;
+                }
+                if def.engine == SearchEngine::Segment {
+                    self.apply_segment_text_entry(
+                        wtxn,
+                        &def,
+                        old_text.as_deref(),
+                        new_text.as_deref(),
+                        id,
+                    )?;
                     continue;
                 }
                 let postings = self.text_postings_in(wtxn, &def.name, &field.path)?;
@@ -2998,6 +3246,52 @@ impl<'e> Collection<'e> {
         Ok(out)
     }
 
+    fn search_segment_text_index_in(
+        &self,
+        rtxn: &RoTxn<'_>,
+        def: &SearchIndexDef,
+        query: &str,
+        skip: usize,
+        limit: Option<usize>,
+    ) -> Result<Vec<Value>> {
+        let max = limit.unwrap_or(10).min(1000);
+        if max == 0 {
+            return Ok(Vec::new());
+        }
+        let Some(manifest) = self.segment_manifest_in(rtxn, &def.name)? else {
+            return Ok(Vec::new());
+        };
+        let root = self.segment_root()?;
+        let mut segments = Vec::with_capacity(manifest.segments.len());
+        for rel in &manifest.segments {
+            segments.push(SegmentReader::open(root.join(rel))?);
+        }
+        let mut set = SegmentSet::with_segments(segments);
+        set.set_tombstones(manifest.tombstones);
+        let prefix = self.segment_delta_prefix(&def.name);
+        for item in self.meta.prefix_iter(rtxn, prefix.as_bytes())? {
+            let (key, value) = item?;
+            let id = std::str::from_utf8(&key[prefix.len()..])
+                .map_err(|e| Error::Query(format!("invalid segment delta id: {e}")))?;
+            let text = std::str::from_utf8(value)
+                .map_err(|e| Error::Query(format!("invalid segment delta text: {e}")))?;
+            set.add_document(id, text)?;
+        }
+        let hits = set.search(query, skip, max)?;
+        let mut out = Vec::with_capacity(hits.len());
+        for hit in hits {
+            let Some(bytes) = self.db.get(rtxn, hit.id.as_bytes())? else {
+                continue;
+            };
+            let mut doc: Value = serde_json::from_slice(bytes)?;
+            if let Some(obj) = doc.as_object_mut() {
+                obj.insert("_score".to_string(), serde_json::json!(hit.score));
+            }
+            out.push(doc);
+        }
+        Ok(out)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn search_text_index_in(
         &self,
@@ -3023,6 +3317,20 @@ impl<'e> Collection<'e> {
         }
 
         let empty_filter = filter.as_object().is_none_or(|object| object.is_empty());
+        if def.engine == SearchEngine::Segment {
+            if mode != TextQueryMode::Native
+                || !empty_filter
+                || !parsed.phrases.is_empty()
+                || !parsed.negative_phrases.is_empty()
+                || !parsed.negative_terms.is_empty()
+                || def.fields.len() != 1
+            {
+                return Err(Error::Query(
+                    "segment text indexes support only simple unfiltered native queries".into(),
+                ));
+            }
+            return self.search_segment_text_index_in(rtxn, &def, query, skip, limit);
+        }
         let needs_phrases = !parsed.phrases.is_empty() || !parsed.negative_phrases.is_empty();
         let simple_query = !needs_phrases;
         let filter_candidates = if simple_query && !empty_filter {
@@ -10266,6 +10574,51 @@ mod tests {
     }
 
     #[test]
+    fn segment_text_index_supports_crud() {
+        let (_dir, store) = store();
+        let c = store.collection("segment_text_crud").unwrap();
+        for doc in [
+            json!({"_id": "a", "body": "rust database"}),
+            json!({"_id": "b", "body": "rust web"}),
+            json!({"_id": "c", "body": "python database"}),
+        ] {
+            c.insert_one(doc).unwrap();
+        }
+        c.create_text_segment_index("body").unwrap();
+        let ids = |docs: Vec<Value>| {
+            let mut ids: Vec<String> = docs
+                .into_iter()
+                .map(|doc| doc["_id"].as_str().unwrap().to_string())
+                .collect();
+            ids.sort();
+            ids
+        };
+        assert_eq!(
+            ids(c.search("body", "rust", &json!({}), 0, Some(10)).unwrap()),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        c.update(
+            &json!({"_id": "a"}),
+            &json!({"$set": {"body": "python only"}}),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            ids(c.search("body", "rust", &json!({}), 0, Some(10)).unwrap()),
+            vec!["b".to_string()]
+        );
+        c.delete(&json!({"_id": "b"}), false).unwrap();
+        assert!(c
+            .search("body", "rust", &json!({}), 0, Some(10))
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            ids(c.search("body", "python", &json!({}), 0, Some(10)).unwrap()),
+            vec!["a".to_string(), "c".to_string()]
+        );
+    }
+
+    #[test]
     fn create_indexes_batch_builds_all_indexes_in_one_pass() {
         let (_dir, store) = store();
         let c = store.collection("batch_indexes").unwrap();
@@ -10590,6 +10943,7 @@ mod tests {
                     weight: 1.0,
                 },
             ],
+            engine: search::SearchEngine::Lmdb,
         })
         .unwrap();
         let ids = |docs: Vec<Value>| {

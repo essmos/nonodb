@@ -180,9 +180,12 @@ was run on the same full MS MARCO corpus:
 | Query throughput | **24.9 qps** (single client) |
 
 The 1M real subset gives p50 **0.45 ms**, p95 **9.26 ms**, and p99 **29.81 ms**.
-This is still a standalone benchmark, not yet the daemon search path. The p50 is
-already in the target range; the tail needs block-max WAND (or equivalent) before
-the segment backend replaces the LMDB posting path for every query.
+The segment backend is now selectable in the daemon with
+`NONODB_SEGMENT_TEXT=1`, with a durable delta, tombstone generations, and
+synchronous flushes. It is still experimental: filters and phrases are not
+supported by the segment path, and BM25 scores are merged per segment. The p50
+is already in the target range; the tail needs better upper-bound pruning before
+it replaces the LMDB posting path for every query.
 
 ### BM25
 
