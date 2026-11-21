@@ -2153,6 +2153,7 @@ fn maybe_restart_for_gap(config: &Config, error: &str, shutdown_tx: &watch::Send
         error,
         "replication needs snapshot resync; requesting graceful restart"
     );
+    request_restart();
     let _ = shutdown_tx.send(true);
 }
 

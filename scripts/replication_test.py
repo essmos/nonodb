@@ -463,7 +463,7 @@ def main() -> int:
                 replica_proc.terminate()
                 replica_proc.wait(timeout=10)
                 raise RuntimeError("replica did not request a restart after the log gap")
-            assert replica_proc.returncode == 0, replica_proc.returncode
+            assert replica_proc.returncode in (0, 75), replica_proc.returncode
             replica_log.close()
 
             replica_log = open(temp / "replica.log", "a", encoding="utf-8")

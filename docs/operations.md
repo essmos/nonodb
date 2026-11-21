@@ -130,7 +130,7 @@ secrets.
 | `NONODB_REPLICATION_BOOTSTRAP` | `auto` | Snapshot bootstrap mode: `auto`, `always`, or `never` |
 | `NONODB_REPLICATION_BOOTSTRAP_TMP` | system temp | Directory for downloaded replication snapshots; use a large persistent filesystem for big databases |
 | `NONODB_REPLICATION_JOIN_RESTART` | `1` | Request a controlled restart after `replication join` so snapshot bootstrap runs before reopening the database |
-| `NONODB_REPLICATION_EXIT_ON_GAP` | `0` | Request a graceful exit on a runtime log gap so a supervisor can restart and resync |
+| `NONODB_REPLICATION_EXIT_ON_GAP` | `0` | Request a controlled restart with exit status 75 on a runtime log gap so a supervisor can restart and resync |
 | `NONODB_REPLICATION_PRUNE_INTERVAL` | `0` | Automatic retention interval in seconds; `0` disables |
 | `NONODB_REPLICATION_RETENTION_KEEP` | `0` | Extra sequences retained behind the minimum replica ack |
 | `NONODB_REPLICATION_CA_FILE` | unset | CA bundle for source TLS verification |

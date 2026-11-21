@@ -11,6 +11,9 @@ Full release notes: https://github.com/essmos/nonodb/releases
 - Plan segment fuzzy search from the rarest `3*d + 1` trigrams instead of
   merging every trigram posting list. On 808k real MS MARCO queries this moved
   p50 from 144.51 ms to **12.07 ms** and p95 from 279.97 ms to **21.76 ms**.
+- Use exit status 75 for `NONODB_REPLICATION_EXIT_ON_GAP` restarts as well, so
+  `Restart=on-failure` and Docker restart policies actually resync a replica
+  after a replication log gap.
 - Make `replication join` request a controlled restart with exit status 75 so
   snapshot bootstrap runs before the database reopens. Add
   `scripts/replication_join_test.py` covering join against an already-populated

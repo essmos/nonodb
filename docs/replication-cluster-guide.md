@@ -655,7 +655,7 @@ TLS paths, or retention. Those are startup environment settings.
 | `NONODB_REPLICATION_POLL_INTERVAL` | `1` | Seconds between pulls. |
 | `NONODB_REPLICATION_BATCH` | `500` | Transactions per `/changes` request, clamped to 1–1000. Pairing copies the primary's value to the replica. |
 | `NONODB_REPLICATION_BOOTSTRAP` | `auto` | `auto`, `always`, or `never`. |
-| `NONODB_REPLICATION_EXIT_ON_GAP` | `0` | Ask the supervisor to restart on a runtime gap so startup can resync. |
+| `NONODB_REPLICATION_EXIT_ON_GAP` | `0` | Ask the supervisor to restart on a runtime gap so startup can resync. The daemon exits with status 75. |
 | `NONODB_REPLICATION_ADVERTISE_URL` | unset | Public URL used for write routing and promotion. Replicas auto-detect a LAN URL from the actual TCP listener or `NONODB_TCP` and the route to the primary when unset. |
 | `NONODB_REPLICATION_VOTERS` | unset | Comma-separated voter URLs. Empty disables quorum and leases. |
 | `NONODB_REPLICATION_VOTER_TOKEN` | unset | Shared token used to call voter endpoints. |

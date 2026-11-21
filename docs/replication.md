@@ -301,7 +301,8 @@ changes after that point are pulled normally.
 The gap check runs at startup, before the runtime opens. A pruned source log
 therefore installs a fresh snapshot on the next start. If a gap appears while
 the daemon is running, the pull loop reports an error. With
-`NONODB_REPLICATION_EXIT_ON_GAP=1` it also requests a graceful shutdown; a
+`NONODB_REPLICATION_EXIT_ON_GAP=1` it also requests a controlled restart with
+exit status 75; a
 supervisor such as systemd, Docker, or Kubernetes restarts the replica and the
 startup gap check installs a fresh snapshot. Without a supervisor, restart the
 replica manually.
