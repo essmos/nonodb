@@ -758,15 +758,17 @@ pub async fn sidecar(
         }
     };
     let relative = FsPath::new(&query.path);
+    let relative_text = relative.to_string_lossy();
     if relative.is_absolute()
         || relative
             .components()
             .any(|part| !matches!(part, Component::Normal(_) | Component::CurDir))
+        || !(relative_text.starts_with("search/") || relative_text.starts_with("vector-ann/"))
     {
         return failure(
             StatusCode::BAD_REQUEST,
             "invalid_path",
-            "sidecar path must be relative and contain no parent components",
+            "sidecar path must be a relative file under search/ or vector-ann/",
         )
         .into_response();
     }
