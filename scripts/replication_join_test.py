@@ -4,7 +4,7 @@
 The replica starts without a source, then ``replication join`` configures it.
 Join schedules a controlled restart with exit status 75 so snapshot bootstrap
 runs before the database is opened again. The restarted replica must receive the
-documents and rebuild text/fuzzy/vector ANN search sidecars.
+documents and transfer or rebuild text/fuzzy/vector ANN search sidecars.
 
     cargo build --locked --bins
     python3 scripts/replication_join_test.py
@@ -290,8 +290,11 @@ def main() -> int:
         replica_log = (temp / "replica.log").read_text(
             encoding="utf-8", errors="replace"
         )
-        if "rebuilt replica search sidecars" not in replica_log:
-            raise RuntimeError("replica did not rebuild search sidecars after join")
+        if (
+            "copied replica search sidecars" not in replica_log
+            and "rebuilt replica search sidecars" not in replica_log
+        ):
+            raise RuntimeError("replica did not copy or rebuild search sidecars after join")
 
         success = True
         print(
