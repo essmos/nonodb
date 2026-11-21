@@ -517,6 +517,22 @@ Rules:
 - `restore-all` restores only databases listed in the instance manifest;
   unrelated database directories are left untouched.
 - Ensure the restored files are owned by the daemon user.
+- Backups contain only LMDB. Text/fuzzy segment files and vector ANN sidecars
+  are derived data and are not part of `data.mdb`.
+
+### Search sidecars after restore
+
+Rebuild missing segment files and ANN sidecars before serving traffic:
+
+```bash
+NONODB_REBUILD_MISSING_SEARCH=1 nonodb-daemon
+```
+
+The daemon scans every database under the data root, rebuilds any segment file
+or ANN sidecar referenced by LMDB metadata but missing on disk, clears the stale
+in-memory delta, and logs the rebuilt indexes. Large indexes make this startup
+longer. Once the rebuild finishes, restart the daemon normally. The operation is
+idempotent: a second start finds nothing to rebuild.
 
 After starting the daemon, validate counts, indexes, and a few application
 queries:

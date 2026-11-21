@@ -135,6 +135,11 @@ secrets.
 | `NONODB_REPLICATION_CERT_FILE` | unset | Client certificate for source mTLS |
 | `NONODB_REPLICATION_KEY_FILE` | unset | Client private key for source mTLS |
 | `NONODB_BACKUP_IDENTITY_FILE` | — | age identity file used by encrypted restore |
+| `NONODB_REBUILD_MISSING_SEARCH` | `0` | Rebuild missing text/fuzzy segment files and vector ANN sidecars for all databases at startup |
+| `NONODB_MIGRATE_SEARCH_SEGMENTS` | `0` | Migrate legacy LMDB text/fuzzy indexes to segments in the default database at startup |
+| `NONODB_BUILD_VECTOR_ANN` | `0` | Build missing vector ANN sidecars in the default database at startup |
+| `NONODB_VECTOR_ANN_PROBE` | `16` | Clusters probed by an ANN vector query |
+| `NONODB_VECTOR_ANN_COLLECTIONS` | unset | Comma-separated collections for `NONODB_BUILD_VECTOR_ANN` |
 | `NONODB_SNAPSHOT_INTERVAL` | `300` | Snapshot interval in seconds |
 | `NONODB_SNAPSHOT_KEEP` | `24` | Number of snapshot files to retain |
 | `NONODB_DRAIN_TIMEOUT` | `30` | Maximum seconds to wait for connections and queued writes during shutdown |

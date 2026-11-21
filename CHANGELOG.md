@@ -11,6 +11,10 @@ Full release notes: https://github.com/essmos/nonodb/releases
 - Plan segment fuzzy search from the rarest `3*d + 1` trigrams instead of
   merging every trigram posting list. On 808k real MS MARCO queries this moved
   p50 from 144.51 ms to **12.07 ms** and p95 from 279.97 ms to **21.76 ms**.
+- Add `rebuild_missing_search_sidecars()` and
+  `NONODB_REBUILD_MISSING_SEARCH=1`. After a restore, the daemon can rebuild
+  missing text/fuzzy segment files and vector ANN sidecars for every database
+  from LMDB documents.
 - Parallelize IVF sidecar construction and precompute centroid norms. The 10M
   build time fell from 236 s to 30.5 s; the 1M build fell from 38.7 s to 11.6 s.
 - Add an optional memory-mapped IVF sidecar for vector indexes. On the 10M

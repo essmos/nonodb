@@ -617,7 +617,8 @@ queries fall back to the exact path; rebuilding the sidecar clears the delta.
 Filtered queries also use the exact path, because applying a filter after
 approximate candidate selection could miss matching documents. Dropping or
 reindexing the vector index removes the sidecar and delta. Backups contain only
-LMDB, so rebuild the sidecar after a restore.
+LMDB, so after a restore start once with `NONODB_REBUILD_MISSING_SEARCH=1` to
+rebuild missing segment files and ANN sidecars from the documents.
 
 The sidecar is approximate: recall depends on the number of clusters, `nprobe`,
 and data distribution. The 10M benchmark sample reached recall@10 of 1.0 with

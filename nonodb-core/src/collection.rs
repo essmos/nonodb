@@ -3642,6 +3642,108 @@ impl<'e> Collection<'e> {
         self.fuzzy_defs(rtxn)
     }
 
+    fn clear_meta_prefix(&self, wtxn: &mut RwTxn<'_>, prefix: &str) -> Result<()> {
+        let keys: Vec<Vec<u8>> = self
+            .meta
+            .prefix_iter(&*wtxn, prefix.as_bytes())?
+            .map(|item| item.map(|(key, _)| key.to_vec()))
+            .collect::<std::result::Result<_, _>>()?;
+        for key in keys {
+            self.meta.delete(&mut *wtxn, &key)?;
+        }
+        Ok(())
+    }
+
+    fn search_sidecar_missing(&self, rtxn: &RoTxn<'_>, def: &SearchIndexDef) -> Result<bool> {
+        if def.engine != SearchEngine::Segment {
+            return Ok(false);
+        }
+        let root = self.segment_root()?;
+        match def.kind {
+            SearchKind::Text => {
+                let Some(manifest) = self.segment_manifest_in(rtxn, &def.name)? else {
+                    return Ok(true);
+                };
+                Ok(manifest
+                    .segments
+                    .iter()
+                    .any(|relative| !root.join(relative).is_file()))
+            }
+            SearchKind::Fuzzy => {
+                let Some(manifest) = self.fuzzy_segment_manifest_in(rtxn, &def.name)? else {
+                    return Ok(true);
+                };
+                Ok(manifest
+                    .segments
+                    .iter()
+                    .chain(manifest.values.iter())
+                    .any(|relative| !root.join(relative).is_file()))
+            }
+        }
+    }
+
+    /// Rebuilds segment files and vector ANN sidecars that are missing from
+    /// the data directory after a restore. LMDB manifests and definitions are
+    /// the source of truth; each rebuilt index gets its own transaction.
+    pub fn rebuild_missing_search_sidecars(&self) -> Result<usize> {
+        let (search_defs, vector_defs) = {
+            let rtxn = self.read_txn()?;
+            let mut search_defs = Vec::new();
+            for def in self.search_index_defs_in(&rtxn)? {
+                if self.search_sidecar_missing(&rtxn, &def)? {
+                    search_defs.push(def);
+                }
+            }
+            let vector_defs = self
+                .vector_defs(&rtxn)?
+                .into_iter()
+                .filter(|def| def.ann.is_some())
+                .collect::<Vec<_>>();
+            rtxn.commit()?;
+            (search_defs, vector_defs)
+        };
+        let mut rebuilt = 0usize;
+        for def in search_defs {
+            let mut wtxn = self.write_txn()?;
+            let dir = match def.kind {
+                SearchKind::Text => segment_index_dir(&self.name, &def.name),
+                SearchKind::Fuzzy => fuzzy_segment_index_dir(&self.name, &def.name),
+            };
+            if let Some(store) = self.store {
+                let path = store.env().path().join(dir);
+                match std::fs::remove_dir_all(&path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            match def.kind {
+                SearchKind::Text => {
+                    self.backfill_segment_text_index(&mut wtxn, &def)?;
+                    self.clear_meta_prefix(&mut wtxn, &self.segment_delta_prefix(&def.name))?;
+                    self.set_segment_delta_count(&mut wtxn, &def.name, 0)?;
+                }
+                SearchKind::Fuzzy => {
+                    self.backfill_fuzzy_segment_index(&mut wtxn, &def)?;
+                    self.clear_meta_prefix(&mut wtxn, &self.fuzzy_segment_delta_prefix(&def.name))?;
+                    self.set_fuzzy_segment_delta_count(&mut wtxn, &def.name, 0)?;
+                }
+            }
+            wtxn.commit()?;
+            rebuilt += 1;
+        }
+        for def in vector_defs {
+            if !self.vector_ann_sidecar_exists(&def.field) {
+                self.build_vector_ann_index(
+                    &def.field,
+                    def.ann.map(|ann| ann.nprobe as usize).unwrap_or(16),
+                )?;
+                rebuilt += 1;
+            }
+        }
+        Ok(rebuilt)
+    }
+
     /// Rebuilds one existing LMDB search index into an immutable segment index.
     ///
     /// The old index remains intact until the new segment manifest is complete.

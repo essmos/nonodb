@@ -278,6 +278,31 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    if std::env::var("NONODB_REBUILD_MISSING_SEARCH")
+        .ok()
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
+    {
+        for db_name in databases.names().await {
+            let runtime = databases
+                .get(&db_name)
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error> { e.message.into() })?;
+            let store = runtime.store.clone();
+            for name in store.collections()? {
+                let collection = store.collection(&name)?;
+                let rebuilt = collection.rebuild_missing_search_sidecars()?;
+                if rebuilt > 0 {
+                    tracing::info!(
+                        database = %db_name,
+                        collection = %name,
+                        rebuilt,
+                        "rebuilt missing search sidecars"
+                    );
+                }
+            }
+        }
+    }
+
     if std::env::var("NONODB_BUILD_VECTOR_ANN")
         .ok()
         .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
