@@ -742,10 +742,12 @@ impl SegmentSet {
             if allowed.is_some_and(|set| !set.contains(&hit.id)) {
                 continue;
             }
+            let mut hit = hit;
             if let Some(verify) = verify {
-                if !verify(&hit.id)? {
+                let Some(bonus) = verify(&hit.id)? else {
                     continue;
-                }
+                };
+                hit.score += bonus;
             }
             // Delta wins over any older base version of the same id.
             merged.insert(hit.id, hit.score);
@@ -1049,9 +1051,11 @@ impl FuzzySegmentReader {
                 let value = self.value(doc)?;
                 if let Some(distance) = search::fuzzy_distance(&value, &query, max_distance) {
                     let id = self.segment.doc_id(doc)?;
-                    if !allowed.is_some_and(|set| !set.contains(&id))
-                        && !matches!(verify, Some(predicate) if !predicate(&id)?)
-                    {
+                    let verified = match verify {
+                        Some(predicate) => predicate(&id)?.is_some(),
+                        None => true,
+                    };
+                    if !allowed.is_some_and(|set| !set.contains(&id)) && verified {
                         if best.len() < limit {
                             best.push(Reverse((distance, id)));
                         } else if let Some(Reverse((worst_distance, worst_id))) = best.peek() {
@@ -1134,7 +1138,7 @@ impl FuzzySegmentReader {
                     continue;
                 }
                 if let Some(predicate) = verify {
-                    if !predicate(&id)? {
+                    if predicate(&id)?.is_none() {
                         continue;
                     }
                 }
@@ -1195,8 +1199,9 @@ fn write_values(path: &Path, values: &[String]) -> io::Result<()> {
 }
 
 /// A single ranked hit. The caller resolves `id` to a document in LMDB.
-/// Optional predicate used to reject a document after all query terms matched.
-pub type DocVerifier<'a> = dyn Fn(&str) -> io::Result<bool> + 'a;
+/// Optional verifier for a matched document. `None` rejects it; `Some(bonus)`
+/// accepts it and adds the bonus to its BM25 score.
+pub type DocVerifier<'a> = dyn Fn(&str) -> io::Result<Option<f64>> + 'a;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SearchHit {
@@ -1448,22 +1453,22 @@ impl SegmentReader {
         Ok(hits)
     }
 
-    fn doc_allowed(
+    fn doc_bonus(
         &self,
         doc: u32,
         allowed: Option<&HashSet<String>>,
         verify: Option<&DocVerifier<'_>>,
-    ) -> io::Result<bool> {
+    ) -> io::Result<Option<f64>> {
         if allowed.is_none() && verify.is_none() {
-            return Ok(true);
+            return Ok(Some(0.0));
         }
         let id = self.doc_id(doc)?;
         if allowed.is_some_and(|set| !set.contains(&id)) {
-            return Ok(false);
+            return Ok(None);
         }
         match verify {
             Some(predicate) => predicate(&id),
-            None => Ok(true),
+            None => Ok(Some(0.0)),
         }
     }
 
@@ -1492,12 +1497,12 @@ impl SegmentReader {
                 break;
             };
             let score = bm25(cursor.idf, posting.tf, posting.dl, avgdl);
-            if self.doc_allowed(posting.doc, allowed, verify)? {
+            if let Some(bonus) = self.doc_bonus(posting.doc, allowed, verify)? {
                 push_hit(
                     heap,
                     ScoredDoc {
                         doc: posting.doc,
-                        score,
+                        score: score + bonus,
                     },
                     limit,
                 );
@@ -1555,8 +1560,17 @@ impl SegmentReader {
                         cursor.advance()?;
                     }
                 }
-                if matched == term_count && self.doc_allowed(pivot, allowed, verify)? {
-                    push_hit(heap, ScoredDoc { doc: pivot, score }, limit);
+                if matched == term_count {
+                    if let Some(bonus) = self.doc_bonus(pivot, allowed, verify)? {
+                        push_hit(
+                            heap,
+                            ScoredDoc {
+                                doc: pivot,
+                                score: score + bonus,
+                            },
+                            limit,
+                        );
+                    }
                 }
             } else {
                 for cursor in cursors.iter_mut().take(pivot_idx) {
@@ -1618,8 +1632,17 @@ impl SegmentReader {
                     let other = cursor.current().unwrap();
                     score += bm25(cursor.idf, other.tf, other.dl, avgdl);
                 }
-                if matched && self.doc_allowed(doc, allowed, verify)? {
-                    push_hit(heap, ScoredDoc { doc, score }, limit);
+                if matched {
+                    if let Some(bonus) = self.doc_bonus(doc, allowed, verify)? {
+                        push_hit(
+                            heap,
+                            ScoredDoc {
+                                doc,
+                                score: score + bonus,
+                            },
+                            limit,
+                        );
+                    }
                 }
                 rare_cursor.advance()?;
             }

@@ -27,6 +27,9 @@ Full release notes: https://github.com/essmos/nonodb/releases
   including equality and range operators. Filter IDs are resolved through the
   existing LMDB index and applied while scoring segment hits, so filtered top-K
   results remain correct.
+- Give matching phrases a score bonus on segment text indexes. Phrase
+  verification and residual filtering still load only the segment candidates
+  from LMDB.
 - Support phrases, negative terms/phrases, and compound or non-indexed filters
   on segment text indexes. Candidate generation stays in the segment; only
   candidates are loaded from LMDB for final phrase/filter verification.

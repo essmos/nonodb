@@ -619,7 +619,7 @@ Current limits:
 - one field per segment index;
 - native single-field queries only: no MongoDB-mode text search;
 - phrases and negative terms are verified against the current LMDB document
-  after segment candidate generation;
+  after segment candidate generation; each matching phrase adds a score bonus;
 - filters use an indexed candidate set when possible; compound and non-indexed
   filters are verified against current documents and are correspondingly slower;
 - BM25 document frequency, document count, and average length are summed

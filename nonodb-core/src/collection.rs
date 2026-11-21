@@ -3939,18 +3939,19 @@ impl<'e> Collection<'e> {
                 return Ok(Vec::new());
             }
             let candidate_query = candidate_terms.join(" ");
-            let verify = |id: &str| -> std::io::Result<bool> {
+            let verify = |id: &str| -> std::io::Result<Option<f64>> {
                 let Some(bytes) = self
                     .db
                     .get(rtxn, id.as_bytes())
                     .map_err(std::io::Error::other)?
                 else {
-                    return Ok(false);
+                    return Ok(None);
                 };
                 let doc: Value = serde_json::from_slice(bytes).map_err(std::io::Error::other)?;
                 if needs_filter && !matches(&doc, filter) {
-                    return Ok(false);
+                    return Ok(None);
                 }
+                let mut matched_phrases = 0usize;
                 if needs_negative || needs_phrases {
                     let tokens: Vec<String> = def
                         .fields
@@ -3965,25 +3966,25 @@ impl<'e> Collection<'e> {
                         .iter()
                         .any(|term| tokens.iter().any(|token| token == term))
                     {
-                        return Ok(false);
+                        return Ok(None);
                     }
                     if parsed
                         .negative_phrases
                         .iter()
                         .any(|phrase| search::contains_phrase(&tokens, phrase))
                     {
-                        return Ok(false);
+                        return Ok(None);
                     }
-                    if needs_phrases
-                        && !parsed
-                            .phrases
-                            .iter()
-                            .all(|phrase| search::contains_phrase(&tokens, phrase))
-                    {
-                        return Ok(false);
+                    matched_phrases = parsed
+                        .phrases
+                        .iter()
+                        .filter(|phrase| search::contains_phrase(&tokens, phrase))
+                        .count();
+                    if needs_phrases && matched_phrases != parsed.phrases.len() {
+                        return Ok(None);
                     }
                 }
-                Ok(true)
+                Ok(Some(matched_phrases as f64))
             };
             let verify: Option<&DocVerifier<'_>> =
                 (needs_filter || needs_negative || needs_phrases).then_some(&verify);
@@ -4601,7 +4602,7 @@ impl<'e> Collection<'e> {
                 continue;
             }
             if let Some(predicate) = verify {
-                if !predicate(id)? {
+                if predicate(id)?.is_none() {
                     continue;
                 }
             }
@@ -4670,16 +4671,16 @@ impl<'e> Collection<'e> {
                 self.segment_filter_candidates(rtxn, filter)?
             };
             let needs_filter = !empty_filter && allowed.is_none();
-            let verify = |id: &str| -> std::io::Result<bool> {
+            let verify = |id: &str| -> std::io::Result<Option<f64>> {
                 let Some(bytes) = self
                     .db
                     .get(rtxn, id.as_bytes())
                     .map_err(std::io::Error::other)?
                 else {
-                    return Ok(false);
+                    return Ok(None);
                 };
                 let doc: Value = serde_json::from_slice(bytes).map_err(std::io::Error::other)?;
-                Ok(matches(&doc, filter))
+                Ok(matches(&doc, filter).then_some(0.0))
             };
             let verify: Option<&DocVerifier<'_>> = needs_filter.then_some(&verify);
             return self.search_segment_fuzzy_in(
@@ -11481,6 +11482,17 @@ mod tests {
                 .unwrap()),
             vec!["b".to_string()]
         );
+        let phrase_score = c
+            .search("body", "\"quick brown\"", &json!({}), 0, Some(10))
+            .unwrap()[0]["_score"]
+            .as_f64()
+            .unwrap();
+        let term_score = c
+            .search("body", "quick brown", &json!({}), 0, Some(10))
+            .unwrap()[0]["_score"]
+            .as_f64()
+            .unwrap();
+        assert!(phrase_score > term_score);
     }
 
     #[test]
