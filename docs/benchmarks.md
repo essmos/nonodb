@@ -228,6 +228,27 @@ clients p50 is dominated by queueing rather than segment search. A comparison
 with Elasticsearch still needs to use the same corpus, query mix, concurrency,
 and client harness.
 
+#### Elasticsearch comparison
+
+The same 1M-passage MS MARCO corpus and the same 200-query sample (seed 42,
+`limit=10`, five warmup queries) were loaded into Elasticsearch 8.15.0 and into
+the default segment backend. Elasticsearch used one shard, zero replicas, a
+2 GB heap, the standard analyzer, and `match` with `operator=and`. NonoDB used
+its native single-field AND search over a Unix socket; Elasticsearch was queried
+over loopback HTTP.
+
+| Clients | NonoDB p50 / p95 / QPS | Elasticsearch p50 / p95 / QPS |
+|---:|---:|---:|
+| 1 | **1.54 / 4.10 ms / 464.3** | **1.54 / 2.00 ms / 612.8** |
+| 16 | **9.96 / 19.39 ms / 1,395.8** | **14.01 / 27.49 ms / 1,030.8** |
+| 100 | **66.82 / 130.85 ms / 1,333.3** | **89.49 / 191.36 ms / 944.5** |
+
+At one client Elasticsearch has the better tail and throughput. Under
+concurrency NonoDB is faster: at 16 clients it delivers about 35% more QPS with
+lower p50/p95, and at 100 clients about 41% more QPS with lower queueing
+latency. These are comparison-harness numbers, not a universal ranking: the
+transport, client stacks, analyzer, and single-node tuning differ.
+
 #### Segment fuzzy
 
 `FuzzySegmentBuilder` stores normalized values in a mapped sidecar file, so
@@ -348,6 +369,11 @@ NONODB_SOCK=$S python3 scripts/msmarco_bench.py queries.train.tsv \
 # End-to-end daemon concurrency (each client gets its own socket)
 NONODB_SOCK=$S python3 scripts/msmarco_bench.py queries.train.tsv \
   --collection msmarco1mseg --samples 200 --limit 10 --clients 100
+
+# Elasticsearch comparison harness (ES must already be running)
+python3 scripts/es_bench.py --url http://127.0.0.1:9200 \
+  --collection-tsv collection.tsv --queries queries.train.tsv \
+  --load --samples 200 --clients 100
 
 # Internal immutable segment prototype
 cargo run --release -p nonodb-core --example segment_bench -- \
