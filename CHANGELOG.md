@@ -11,6 +11,9 @@ Full release notes: https://github.com/essmos/nonodb/releases
 - Plan segment fuzzy search from the rarest `3*d + 1` trigrams instead of
   merging every trigram posting list. On 808k real MS MARCO queries this moved
   p50 from 144.51 ms to **12.07 ms** and p95 from 279.97 ms to **21.76 ms**.
+- Add an in-place migration from legacy LMDB text/fuzzy indexes to immutable
+  segment indexes. Set `NONODB_MIGRATE_SEARCH_SEGMENTS=1` at daemon startup, or
+  call `migrate_search_indexes_to_segment()` from the core API.
 - Add `es_bench.py` and compare the 1M-passage segment backend with
   Elasticsearch 8.15. At 16/100 clients NonoDB delivered about 35%/41% more QPS
   with lower p50/p95; Elasticsearch was faster at one client.

@@ -260,6 +260,24 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .await
         .map_err(|e| -> Box<dyn std::error::Error> { e.message.into() })?;
 
+    if std::env::var("NONODB_MIGRATE_SEARCH_SEGMENTS")
+        .ok()
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
+    {
+        let store = default.store.clone();
+        for name in store.collections()? {
+            let collection = store.collection(&name)?;
+            let migrated = collection.migrate_search_indexes_to_segment()?;
+            if migrated > 0 {
+                tracing::info!(
+                    collection = %name,
+                    migrated,
+                    "migrated legacy search indexes to segments"
+                );
+            }
+        }
+    }
+
     let drain_timeout = drain_timeout();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let replication_shutdown = shutdown_tx.clone();

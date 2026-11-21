@@ -597,7 +597,16 @@ backend for newly created indexes, disable either backend explicitly:
 NONODB_SEGMENT_TEXT=0 NONODB_SEGMENT_FUZZY=0 nonodb-daemon
 ```
 
-Existing indexes keep the engine stored in their definition.
+Existing indexes keep the engine stored in their definition. To rebuild legacy
+LMDB text and fuzzy indexes into segments at daemon startup, opt in:
+
+```bash
+NONODB_MIGRATE_SEARCH_SEGMENTS=1 nonodb-daemon
+```
+
+The migration rebuilds each index in its own write transaction and removes the
+old LMDB postings only after the new segment manifest is durable. Large indexes
+make startup longer; run it during a maintenance window.
 
 `create_text_index` then writes a segment manifest and one or more
 `search/<hash>/seg-*.seg` files next to the LMDB environment. The manifest and

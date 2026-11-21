@@ -189,8 +189,9 @@ daemon, with a durable delta, tombstone generations, and synchronous flushes.
 Set `NONODB_SEGMENT_TEXT=0` to keep LMDB for new indexes. Filters, phrases, negation, global BM25 statistics, and
 suffix/full compaction are supported; matching phrases add a score bonus, while
 phrase and non-indexed filter verification still loads candidate documents from
-LMDB, so their latency depends on query selectivity. A fair concurrent daemon and Elasticsearch comparison remains to be
-run.
+LMDB, so their latency depends on query selectivity. The concurrent daemon and
+Elasticsearch comparison is in
+[Elasticsearch comparison](#elasticsearch-comparison).
 
 #### Segment reader concurrency
 

@@ -3459,6 +3459,104 @@ impl<'e> Collection<'e> {
         self.fuzzy_defs(rtxn)
     }
 
+    /// Rebuilds one existing LMDB search index into an immutable segment index.
+    ///
+    /// The old index remains intact until the new segment manifest is complete.
+    /// Returns `false` when the index does not exist or already uses segments.
+    pub fn migrate_search_index(&self, kind: SearchKind, name: &str) -> Result<bool> {
+        let mut wtxn = self.write_txn()?;
+        let migrated = self.migrate_search_index_txn(&mut wtxn, kind, name)?;
+        if migrated {
+            wtxn.commit()?;
+        }
+        Ok(migrated)
+    }
+
+    pub fn migrate_search_index_txn(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        kind: SearchKind,
+        name: &str,
+    ) -> Result<bool> {
+        let def_key = search::def_key(&self.name, kind, name);
+        let Some(bytes) = self.meta.get(&*wtxn, def_key.as_bytes())? else {
+            return Ok(false);
+        };
+        let def: SearchIndexDef = serde_json::from_slice(bytes)?;
+        def.validate().map_err(Error::Query)?;
+        if def.kind != kind {
+            return Err(Error::Query("search index kind mismatch".into()));
+        }
+        if def.engine == SearchEngine::Segment {
+            return Ok(false);
+        }
+        if def.fields.len() != 1 {
+            return Err(Error::Query(
+                "segment migration supports single-field search indexes".into(),
+            ));
+        }
+
+        let mut segment_def = def.clone();
+        segment_def.engine = SearchEngine::Segment;
+        match kind {
+            SearchKind::Text => self.backfill_segment_text_index(wtxn, &segment_def)?,
+            SearchKind::Fuzzy => self.backfill_fuzzy_segment_index(wtxn, &segment_def)?,
+        }
+
+        // Drop the old LMDB index only after the new segment is durable.
+        for field in &def.fields {
+            match kind {
+                SearchKind::Text => {
+                    let postings = search::text_db_name(&self.name, &def.name, &field.path);
+                    self.drop_resource_db(wtxn, &postings, &postings)?;
+                    let lens = search::text_len_db_name(&self.name, &def.name, &field.path);
+                    self.drop_resource_db(wtxn, &lens, &lens)?;
+                    let df = search::text_df_db_name(&self.name, &def.name, &field.path);
+                    self.drop_resource_db(wtxn, &df, &df)?;
+                    self.meta.delete(
+                        &mut *wtxn,
+                        search::text_total_key(&self.name, &def.name, &field.path).as_bytes(),
+                    )?;
+                    self.meta.delete(
+                        &mut *wtxn,
+                        search::text_df_ready_key(&self.name, &def.name, &field.path).as_bytes(),
+                    )?;
+                }
+                SearchKind::Fuzzy => {
+                    let db = search::fuzzy_db_name(&self.name, &def.name, &field.path);
+                    self.drop_resource_db(wtxn, &db, &db)?;
+                }
+            }
+        }
+        self.meta.put(
+            &mut *wtxn,
+            def_key.as_bytes(),
+            &serde_json::to_vec(&segment_def)?,
+        )?;
+        Ok(true)
+    }
+
+    /// Migrates every legacy LMDB text and fuzzy index in this collection.
+    /// Each index gets its own transaction so large collections do not hold one
+    /// write transaction for the entire operation.
+    pub fn migrate_search_indexes_to_segment(&self) -> Result<usize> {
+        let defs = {
+            let rtxn = self.read_txn()?;
+            let defs = self.search_index_defs_in(&rtxn)?;
+            rtxn.commit()?;
+            defs
+        };
+        let mut migrated = 0;
+        for def in defs {
+            if def.engine != SearchEngine::Segment
+                && self.migrate_search_index(def.kind, &def.name)?
+            {
+                migrated += 1;
+            }
+        }
+        Ok(migrated)
+    }
+
     pub fn drop_search_index(&self, kind: SearchKind, name: &str) -> Result<bool> {
         let mut wtxn = self.write_txn()?;
         let existed = self.drop_search_index_txn(&mut wtxn, kind, name)?;
