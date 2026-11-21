@@ -158,9 +158,31 @@ corpus at the same document count because they contain many more terms and
 postings.
 
 These results are the main argument for moving BM25 and fuzzy search to an
-immutable, block-based sidecar index (for example Tantivy). LMDB remains the
-source of truth for documents, but should not be the long-term posting store
-for a 10M real-text collection.
+immutable, block-based index. LMDB remains the source of truth for documents,
+but should not be the long-term posting store for a 10M real-text collection.
+
+#### Internal segment prototype
+
+`nonodb-core/src/search_segment.rs` now contains a dependency-free segment
+format with sorted term blocks, delta-encoded postings, document-frequency-driven
+AND planning, and fast block skipping. The standalone `segment_bench` example
+was run on the same full MS MARCO corpus:
+
+| Metric | Full 8.84M passages |
+|---|---:|
+| Build | **393.2 s** |
+| Terms | **1,576,221** |
+| Postings | **357,334,107** |
+| Segment file | **1.43 GB** |
+| Query p50 | **7.33 ms** |
+| Query p95 | **240.53 ms** |
+| Query p99 | **397.34 ms** |
+| Query throughput | **24.8 qps** (single client) |
+
+The 1M real subset gives p50 **0.48 ms**, p95 **9.02 ms**, and p99 **29.38 ms**.
+This is still a standalone benchmark, not yet the daemon search path. The p50 is
+already in the target range; the tail needs block-max WAND (or equivalent) before
+the segment backend replaces the LMDB posting path for every query.
 
 ### BM25
 
@@ -259,6 +281,11 @@ NONODB_SOCK=$S python3 scripts/load_msmarco.py collection.tsv \
   --collection msmarco1m --limit 1000000 --batch 2000
 NONODB_SOCK=$S python3 scripts/msmarco_bench.py queries.train.tsv \
   --collection msmarco1m --samples 500 --limit 10
+
+# Internal immutable segment prototype
+cargo run --release -p nonodb-core --example segment_bench -- \
+  collection.tsv /var/lib/vz/nonodb-bench-1b/segments/msmarco8m.seg \
+  --rebuild --queries queries.train.tsv --samples 500 --limit 10
 
 # Smaller functional checks
 NONODB_SOCK=$S python3 scripts/search_test.py

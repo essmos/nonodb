@@ -4,6 +4,14 @@ Full release notes: https://github.com/essmos/nonodb/releases
 
 ## Unreleased
 
+- Added the first internal immutable text-search segment backend
+  (`nonodb-core/src/search_segment.rs`) and a standalone `segment_bench`
+  example. It writes sorted term blocks, delta-encoded postings, and a compact
+  term index without an external search engine. On the full 8.84M MS MARCO
+  corpus it built in 393 s to a 1.43 GB segment and answered real queries at
+  p50 7.33 ms / p95 240.53 ms / p99 397.34 ms with one client. The backend is
+  not yet wired into `Collection::search`; block-max WAND is the next step for
+  the p95 tail.
 - Added `scripts/load_msmarco.py` and `scripts/msmarco_bench.py` and loaded the
   real MS MARCO passage collection for search validation. The 8.8M-passage load
   reached 89,010 docs/s. A 1M-passage BM25 index built in 156 s and real queries

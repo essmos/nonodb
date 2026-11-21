@@ -31,6 +31,7 @@ pub mod query;
 mod regex;
 pub mod replication;
 pub mod search;
+pub mod search_segment;
 pub mod sql;
 pub mod store;
 pub mod subscriptions;
