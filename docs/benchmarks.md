@@ -210,6 +210,24 @@ saturates around 1.25k QPS at 16 clients; 64 clients add queueing latency withou
 more throughput. This is not yet an end-to-end daemon or Elasticsearch
 comparison.
 
+#### Daemon end-to-end concurrency
+
+A separate daemon was started with the default segment engine and a fresh
+1,000,000-passage MS MARCO collection. Each Python client opens its own Unix
+socket, runs five warmup queries, then 200 queries with `limit=10`:
+
+| Clients | p50 | p95 | p99 | Aggregate QPS |
+|---:|---:|---:|---:|---:|
+| 1 | **1.65 ms** | **4.31 ms** | **8.33 ms** | **419.4** |
+| 16 | **10.01 ms** | **19.61 ms** | **24.36 ms** | **1,407.0** |
+| 100 | **66.91 ms** | **131.67 ms** | **169.00 ms** | **1,326.2** |
+
+This is end-to-end through the daemon and Python client, including request
+serialization and client overhead. Throughput saturates near 1.3k QPS; at 100
+clients p50 is dominated by queueing rather than segment search. A comparison
+with Elasticsearch still needs to use the same corpus, query mix, concurrency,
+and client harness.
+
 #### Segment fuzzy
 
 `FuzzySegmentBuilder` stores normalized values in a mapped sidecar file, so
@@ -326,6 +344,10 @@ NONODB_SOCK=$S python3 scripts/load_msmarco.py collection.tsv \
   --collection msmarco1m --limit 1000000 --batch 2000
 NONODB_SOCK=$S python3 scripts/msmarco_bench.py queries.train.tsv \
   --collection msmarco1m --samples 500 --limit 10
+
+# End-to-end daemon concurrency (each client gets its own socket)
+NONODB_SOCK=$S python3 scripts/msmarco_bench.py queries.train.tsv \
+  --collection msmarco1mseg --samples 200 --limit 10 --clients 100
 
 # Internal immutable segment prototype
 cargo run --release -p nonodb-core --example segment_bench -- \

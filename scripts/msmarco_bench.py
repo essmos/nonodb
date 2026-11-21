@@ -13,6 +13,7 @@ import argparse
 import os
 import random
 import sys
+import threading
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -46,6 +47,7 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--query-timeout", type=float, default=1800)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--clients", type=int, default=1)
     args = parser.parse_args()
 
     queries = load_queries(args.queries)
@@ -56,25 +58,52 @@ def main() -> None:
         queries = rng.sample(queries, args.samples)
 
     sock = os.environ.get("NONODB_SOCK", "/run/nonodb.sock")
-    db = NonoDB(sock, timeout=args.query_timeout)
-    c = db.collection(args.collection)
+    clients = max(1, args.clients)
+    results: list[tuple[float, str] | None] = [None] * clients
+    errors: list[BaseException] = []
 
-    for query in queries[: args.warmup]:
-        c.search("body", query, limit=args.limit)
+    def worker(index: int) -> None:
+        try:
+            db = NonoDB(sock, timeout=args.query_timeout)
+            c = db.collection(args.collection)
+            for query in queries[: args.warmup]:
+                c.search("body", query, limit=args.limit)
+            local: list[tuple[float, str]] = []
+            for query in queries:
+                begin = time.perf_counter()
+                c.search("body", query, limit=args.limit)
+                local.append((time.perf_counter() - begin, query))
+            db.close()
+            results[index] = local  # type: ignore[assignment]
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
 
-    latencies = []
-    slowest: list[tuple[float, str]] = []
     started = time.perf_counter()
-    for query in queries:
-        begin = time.perf_counter()
-        c.search("body", query, limit=args.limit)
-        elapsed = time.perf_counter() - begin
-        latencies.append(elapsed)
-        slowest.append((elapsed, query))
-
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(clients)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
     wall = time.perf_counter() - started
+    if errors:
+        raise errors[0]
+
+    latencies: list[float] = []
+    slowest: list[tuple[float, str]] = []
+    for result in results:
+        if result is None:
+            continue
+        for elapsed, query in result:
+            latencies.append(elapsed)
+            slowest.append((elapsed, query))
+    if not latencies:
+        raise SystemExit("no results")
     slowest.sort(reverse=True)
-    print(f"collection={args.collection} queries={len(queries)} limit={args.limit}", flush=True)
+    print(
+        f"collection={args.collection} clients={clients} "
+        f"queries_per_client={len(queries)} total={len(latencies)} limit={args.limit}",
+        flush=True,
+    )
     print(
         f"p50={pct(latencies, 0.50):.2f}ms "
         f"p95={pct(latencies, 0.95):.2f}ms "
@@ -86,7 +115,6 @@ def main() -> None:
     print("slowest:", flush=True)
     for elapsed, query in slowest[:5]:
         print(f"  {elapsed * 1000:9.2f}ms  {query}", flush=True)
-    db.close()
 
 
 if __name__ == "__main__":
