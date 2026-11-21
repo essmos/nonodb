@@ -194,6 +194,47 @@ impl SegmentBuilder {
         })
     }
 
+    /// Add a document from an already prepared bag of terms. This is used by
+    /// the fuzzy backend, where terms are trigrams rather than tokenizer output.
+    pub fn add_terms(&mut self, id: &str, terms: &[String]) -> io::Result<u32> {
+        if self.doc_index.contains_key(id) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("duplicate document id `{id}`"),
+            ));
+        }
+        let doc = self.doc_ids.len() as u32;
+        self.doc_index.insert(id.to_string(), doc);
+        self.doc_ids.push(id.to_string());
+        let dl = terms.len() as u32;
+        self.total_doc_len += u64::from(dl);
+        let mut freqs: HashMap<&str, u32> = HashMap::new();
+        for term in terms {
+            *freqs.entry(term.as_str()).or_insert(0) += 1;
+        }
+        for (term, tf) in freqs {
+            let term_id = match self.term_index.get(term) {
+                Some(id) => *id,
+                None => {
+                    let id = self.terms.len() as u32;
+                    self.term_index.insert(term.to_string(), id);
+                    self.terms.push(term.to_string());
+                    id
+                }
+            };
+            self.chunk.push(Record {
+                term: term_id,
+                doc,
+                tf,
+                dl,
+            });
+            if self.chunk.len() >= CHUNK_RECORDS {
+                self.spill_chunk()?;
+            }
+        }
+        Ok(doc)
+    }
+
     pub fn add_document(&mut self, id: &str, text: &str) -> io::Result<()> {
         if self.doc_index.contains_key(id) {
             return Err(io::Error::new(
@@ -720,6 +761,240 @@ impl SegmentSet {
         hits.truncate(limit);
         Ok(hits)
     }
+}
+
+const FUZZY_CANDIDATE_LIMIT: usize = 5000;
+
+/// Builder for a segment-backed trigram fuzzy index.
+pub struct FuzzySegmentBuilder {
+    segment: SegmentBuilder,
+    values: Vec<String>,
+}
+
+impl FuzzySegmentBuilder {
+    pub fn new(segment_path: impl Into<PathBuf>) -> io::Result<Self> {
+        Ok(Self {
+            segment: SegmentBuilder::new(segment_path)?,
+            values: Vec::new(),
+        })
+    }
+
+    pub fn add_document(&mut self, id: &str, text: &str) -> io::Result<()> {
+        let normalized = search::normalize(text);
+        let grams = search::trigrams(&normalized);
+        let doc = self.segment.add_terms(id, &grams)?;
+        if doc as usize != self.values.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "fuzzy value order mismatch",
+            ));
+        }
+        self.values.push(normalized);
+        Ok(())
+    }
+
+    pub fn finish(self, values_path: impl AsRef<Path>) -> io::Result<SegmentStats> {
+        let stats = self.segment.finish()?;
+        write_values(values_path.as_ref(), &self.values)?;
+        Ok(stats)
+    }
+}
+
+/// Read-only segment-backed fuzzy index.
+pub struct FuzzySegmentReader {
+    segment: SegmentReader,
+    values: File,
+    value_count: u32,
+    offsets_start: u64,
+    strings_start: u64,
+}
+
+impl FuzzySegmentReader {
+    pub fn open(segment_path: impl AsRef<Path>, values_path: impl AsRef<Path>) -> io::Result<Self> {
+        let segment = SegmentReader::open(segment_path)?;
+        let values = File::open(values_path)?;
+        let mut header = [0u8; 16];
+        read_at(&values, 0, &mut header)?;
+        if &header[..8] != b"NODBVAL1" {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "not a NonoDB fuzzy values file",
+            ));
+        }
+        let version = u32::from_le_bytes(header[8..12].try_into().unwrap());
+        if version != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unsupported fuzzy values version",
+            ));
+        }
+        let value_count = u32::from_le_bytes(header[12..16].try_into().unwrap());
+        Ok(Self {
+            segment,
+            values,
+            value_count,
+            offsets_start: 16,
+            strings_start: 16 + (u64::from(value_count) + 1) * 4,
+        })
+    }
+
+    pub fn documents(&self) -> u32 {
+        self.segment.documents()
+    }
+
+    pub fn value(&self, doc: u32) -> io::Result<String> {
+        if doc >= self.value_count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "doc id out of range",
+            ));
+        }
+        let mut a = [0u8; 4];
+        let mut b = [0u8; 4];
+        read_at(
+            &self.values,
+            self.offsets_start + u64::from(doc) * 4,
+            &mut a,
+        )?;
+        read_at(
+            &self.values,
+            self.offsets_start + u64::from(doc + 1) * 4,
+            &mut b,
+        )?;
+        let start = u32::from_le_bytes(a) as u64;
+        let end = u32::from_le_bytes(b) as u64;
+        if end < start {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid value offsets",
+            ));
+        }
+        let mut buf = vec![0u8; (end - start) as usize];
+        read_at(&self.values, self.strings_start + start, &mut buf)?;
+        String::from_utf8(buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
+
+    pub fn search(
+        &self,
+        query: &str,
+        max_distance: usize,
+        limit: usize,
+    ) -> io::Result<Vec<FuzzySegmentHit>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let query = search::normalize(query);
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut cursors = Vec::new();
+        for gram in search::trigrams(&query) {
+            if let Some(entry) = self.segment.term(&gram)? {
+                cursors.push(Cursor::new(&self.segment, entry, 1.0)?);
+            }
+        }
+        if cursors.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut merge: BinaryHeap<Reverse<(u32, usize)>> = BinaryHeap::new();
+        for (idx, cursor) in cursors.iter().enumerate() {
+            if let Some(posting) = cursor.current() {
+                merge.push(Reverse((posting.doc, idx)));
+            }
+        }
+        let mut candidates: BinaryHeap<Reverse<FuzzyCandidateDoc>> =
+            BinaryHeap::with_capacity(FUZZY_CANDIDATE_LIMIT + 1);
+        while let Some(Reverse((doc, idx))) = merge.pop() {
+            let mut count = 1u32;
+            cursors[idx].advance()?;
+            if let Some(posting) = cursors[idx].current() {
+                merge.push(Reverse((posting.doc, idx)));
+            }
+            while let Some(Reverse((next_doc, next_idx))) = merge.peek().copied() {
+                if next_doc != doc {
+                    break;
+                }
+                merge.pop();
+                count += 1;
+                cursors[next_idx].advance()?;
+                if let Some(posting) = cursors[next_idx].current() {
+                    merge.push(Reverse((posting.doc, next_idx)));
+                }
+            }
+            if candidates.len() >= FUZZY_CANDIDATE_LIMIT {
+                let worst = candidates.peek().unwrap().0;
+                if count < worst.count || (count == worst.count && doc > worst.doc) {
+                    continue;
+                }
+            }
+            candidates.push(Reverse(FuzzyCandidateDoc { doc, count }));
+            if candidates.len() > FUZZY_CANDIDATE_LIMIT {
+                candidates.pop();
+            }
+        }
+
+        let mut scored = Vec::new();
+        for Reverse(candidate) in candidates {
+            let value = self.value(candidate.doc)?;
+            if let Some(distance) = search::fuzzy_distance(&value, &query, max_distance) {
+                scored.push(FuzzySegmentHit {
+                    id: self.segment.doc_id(candidate.doc)?,
+                    distance,
+                });
+            }
+        }
+        scored.sort_by(|a, b| a.distance.cmp(&b.distance).then_with(|| a.id.cmp(&b.id)));
+        scored.truncate(limit);
+        Ok(scored)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FuzzyCandidateDoc {
+    doc: u32,
+    count: u32,
+}
+
+impl Ord for FuzzyCandidateDoc {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.count
+            .cmp(&other.count)
+            .then_with(|| self.doc.cmp(&other.doc))
+    }
+}
+impl PartialOrd for FuzzyCandidateDoc {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FuzzySegmentHit {
+    pub id: String,
+    pub distance: usize,
+}
+
+fn write_values(path: &Path, values: &[String]) -> io::Result<()> {
+    let mut out = io::BufWriter::new(File::create(path)?);
+    out.write_all(b"NODBVAL1")?;
+    write_u32(&mut out, 1)?;
+    write_u32(&mut out, values.len() as u32)?;
+    let mut offsets = Vec::with_capacity(values.len() + 1);
+    let mut strings = Vec::new();
+    for value in values {
+        offsets.push(strings.len() as u32);
+        strings.extend_from_slice(value.as_bytes());
+    }
+    offsets.push(strings.len() as u32);
+    for offset in offsets {
+        write_u32(&mut out, offset)?;
+    }
+    out.write_all(&strings)?;
+    out.flush()?;
+    let file = out.into_inner().map_err(|e| e.into_error())?;
+    file.sync_all()?;
+    Ok(())
 }
 
 /// A single ranked hit. The caller resolves `id` to a document in LMDB.
@@ -1542,6 +1817,29 @@ mod tests {
         assert!(ids.contains(&"a".to_string()));
         assert!(ids.contains(&"c".to_string()));
         assert!(!ids.contains(&"b".to_string()));
+    }
+
+    #[test]
+    fn fuzzy_segment_finds_typos_and_orders_by_distance() {
+        let dir = tempfile::tempdir().unwrap();
+        let segment_path = dir.path().join("fuzzy.seg");
+        let values_path = dir.path().join("fuzzy.values");
+        let mut builder = FuzzySegmentBuilder::new(&segment_path).unwrap();
+        for (id, name) in [
+            ("warszawa", "Warszawa"),
+            ("krakow", "Krakow"),
+            ("wroclaw", "Wroclaw"),
+            ("gdansk", "Gdansk"),
+        ] {
+            builder.add_document(id, name).unwrap();
+        }
+        builder.finish(&values_path).unwrap();
+        let reader = FuzzySegmentReader::open(&segment_path, &values_path).unwrap();
+        let hits = reader.search("Warszwa", 2, 10).unwrap();
+        assert_eq!(hits[0].id, "warszawa");
+        assert_eq!(hits[0].distance, 1);
+        assert_eq!(reader.search("Krakw", 1, 10).unwrap()[0].id, "krakow");
+        assert!(reader.search("Berlin", 1, 10).unwrap().is_empty());
     }
 
     #[test]

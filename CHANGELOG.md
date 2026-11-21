@@ -4,6 +4,10 @@ Full release notes: https://github.com/essmos/nonodb/releases
 
 ## Unreleased
 
+- Added `FuzzySegmentBuilder`/`FuzzySegmentReader`: trigram postings in the
+  immutable segment format with a sidecar value store, bounded candidate merge,
+  Levenshtein verification, and distance-ordered results. This is the first
+  segment-native fuzzy implementation; daemon integration is still pending.
 - Wired the internal segment backend into the writer and daemon behind
   `NONODB_SEGMENT_TEXT=1`. New text indexes get a durable manifest, LMDB-backed
   delta, tombstone generations, synchronous 4096-document flushes, and

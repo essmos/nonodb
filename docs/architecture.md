@@ -610,7 +610,8 @@ Current limits:
 - segment scores are merged per segment, so absolute BM25 scores can differ
   from a single global index after several flushes;
 - there is no automatic compaction of old segments yet;
-- fuzzy search still uses the LMDB trigram backend.
+- fuzzy search still uses the LMDB trigram backend. A segment-native
+  `FuzzySegmentReader` exists, but it is not wired into the daemon path yet.
 
 Dropping the index removes its manifest, delta keys, and segment directory.
 Backups continue to contain only LMDB; rebuild segment indexes after a restore.
