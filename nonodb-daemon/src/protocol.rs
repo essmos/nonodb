@@ -476,6 +476,9 @@ pub enum Request {
         #[serde(default)]
         ttl_purge_history: Option<bool>,
     },
+    DropCollection {
+        coll: String,
+    },
     /// Sets or clears the default document TTL for a collection.
     SetCollectionTtl {
         coll: String,
@@ -872,6 +875,7 @@ impl Request {
             Self::ListCollections => "list_collections",
             Self::DatabaseStats => "database_stats",
             Self::CreateCollection { .. } => "create_collection",
+            Self::DropCollection { .. } => "drop_collection",
             Self::SetCollectionTtl { .. } => "set_collection_ttl",
             Self::GetCollectionTtl { .. } => "get_collection_ttl",
             Self::SetCollectionHistory { .. } => "set_collection_history",
@@ -984,6 +988,7 @@ impl Request {
             | Self::History { coll, .. }
             | Self::GetVersion { coll, .. }
             | Self::CreateCollection { coll, .. }
+            | Self::DropCollection { coll }
             | Self::SetCollectionTtl { coll, .. }
             | Self::GetCollectionTtl { coll }
             | Self::SetCollectionHistory { coll, .. }

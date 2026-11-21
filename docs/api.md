@@ -196,6 +196,7 @@ client timeout with `NONODB_TIMEOUT` or the `timeout=` argument.
 | [`list_collections`](#list_collections) | List known collections |
 | [`database_stats`](#database_stats) | Record counts and storage estimates per collection |
 | [`create_collection`](#create_collection) | Create a standard or vault collection |
+| [`drop_collection`](#drop_collection) | Drop a collection and its resources |
 | [`set_collection_ttl`](#document-ttl) | Set or clear the default document TTL |
 | [`get_collection_ttl`](#document-ttl) | Read the default document TTL |
 | [`set_collection_history`](#set_collection_history) | Set per-collection history retention (`0` disables) |
@@ -2593,6 +2594,22 @@ An optional `ttl_seconds` sets the default document TTL for new inserts.
 
 History is configured separately per collection with `set_collection_history`;
 new collections start with retention `0` (disabled).
+
+## drop_collection
+
+```json
+{"op": "drop_collection", "coll": "old_events"}
+```
+
+Response:
+
+```json
+{"ok": true, "result": {"dropped": true}}
+```
+
+Dropping a collection removes its documents, indexes, history, TTL state, and
+search/vector sidecars. The request is idempotent: a missing collection returns
+`{"dropped": false}`. It cannot be undone.
 
 ## list_collections
 

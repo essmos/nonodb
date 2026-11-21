@@ -1811,6 +1811,36 @@ mod tests {
     }
 
     #[test]
+    fn drop_collection_is_idempotent() {
+        let (_dir, store) = setup();
+        let c = store.collection("drop_me").unwrap();
+        c.insert_one(json!({"_id": "a", "value": 1})).unwrap();
+
+        let out = execute_commit(
+            &store,
+            &WriteReq::DropCollection {
+                coll: "drop_me".to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(out["dropped"], true);
+        assert!(!store
+            .collections()
+            .unwrap()
+            .iter()
+            .any(|name| name == "drop_me"));
+
+        let out = execute_commit(
+            &store,
+            &WriteReq::DropCollection {
+                coll: "drop_me".to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(out["dropped"], false);
+    }
+
+    #[test]
     fn out_replaces_target_transactionally() {
         let (_dir, store) = setup();
         let source = store.collection("source").unwrap();

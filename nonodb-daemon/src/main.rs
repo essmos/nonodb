@@ -3780,6 +3780,7 @@ async fn exec_inner(
                         ttl_purge_history,
                     }
                 }
+                Request::DropCollection { coll } => WriteReq::DropCollection { coll },
                 Request::SetCollectionTtl {
                     coll,
                     ttl_seconds,

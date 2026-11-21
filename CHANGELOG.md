@@ -4,6 +4,8 @@ Full release notes: https://github.com/essmos/nonodb/releases
 
 ## Unreleased
 
+- Add the HTTP/JSON `drop_collection` operation. It removes documents, indexes,
+  history, TTL state, and search/vector sidecars through the single writer.
 - Maintain exact live BM25 document count, total length, and per-term document
   frequency for segment text indexes. Updates and deletes adjust the statistics
   transactionally, so tombstoned and duplicate document versions no longer

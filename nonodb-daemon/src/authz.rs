@@ -107,6 +107,7 @@ pub fn authorize_request(
         | Request::Reindex { coll }
         | Request::DropVectorIndex { coll, .. }
         | Request::CreateCollection { coll, .. }
+        | Request::DropCollection { coll }
         | Request::SetCollectionTtl { coll, .. }
         | Request::SetCollectionHistory { coll, .. }
         | Request::SetCollectionEvents { coll, .. }
