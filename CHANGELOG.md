@@ -4,6 +4,8 @@ Full release notes: https://github.com/essmos/nonodb/releases
 
 ## Unreleased
 
+- Add `NONODB_VECTOR_ANN_CLUSTERS` (up to 8,192) to tune IVF cluster count for
+  very large vector collections. The default remains 512.
 - Add the HTTP/JSON `drop_collection` operation. It removes documents, indexes,
   history, TTL state, and search/vector sidecars through the single writer.
 - Maintain exact live BM25 document count, total length, and per-term document

@@ -18,7 +18,8 @@ use crate::vector::{self, Candidate, VectorMetric};
 const MAGIC: &[u8; 8] = b"NONOANN1";
 const VERSION: u32 = 1;
 const HEADER_SIZE: usize = 40;
-const MAX_CLUSTERS: usize = 512;
+const DEFAULT_MAX_CLUSTERS: usize = 512;
+const MAX_CLUSTERS_LIMIT: usize = 8_192;
 const MAX_TRAINING: usize = 100_000;
 const TRAINING_ITERATIONS: usize = 8;
 
@@ -205,11 +206,16 @@ pub fn build(
         ));
     }
     let sample = training_vectors(metric, vectors);
+    let max_clusters = std::env::var("NONODB_VECTOR_ANN_CLUSTERS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_MAX_CLUSTERS)
+        .clamp(1, MAX_CLUSTERS_LIMIT);
     let clusters = vectors
         .len()
         .max(1)
         .isqrt()
-        .clamp(1, MAX_CLUSTERS)
+        .clamp(1, max_clusters)
         .min(sample.len().max(1));
     let nprobe = nprobe.clamp(1, clusters);
 
