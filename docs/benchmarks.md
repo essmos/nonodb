@@ -184,9 +184,9 @@ The 1M real subset gives p50 **0.64 ms**, p95 **2.94 ms**, p99 **7.52 ms**, and
 **961.4 qps**. The improvement over the file-read path comes from mapping the
 immutable segment once and copying directly from mapped pages instead of
 issuing one `pread` per block header or posting block.
-The segment backend is now selectable in the daemon with
-`NONODB_SEGMENT_TEXT=1`, with a durable delta, tombstone generations, and
-synchronous flushes. Filters, phrases, negation, global BM25 statistics, and
+The segment backend is the default for newly created text indexes in the
+daemon, with a durable delta, tombstone generations, and synchronous flushes.
+Set `NONODB_SEGMENT_TEXT=0` to keep LMDB for new indexes. Filters, phrases, negation, global BM25 statistics, and
 suffix/full compaction are supported; phrase and non-indexed filter verification
 still loads candidate documents from LMDB, so their latency depends on query
 selectivity. A fair concurrent daemon and Elasticsearch comparison remains to be

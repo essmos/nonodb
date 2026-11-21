@@ -1621,10 +1621,7 @@ fn execute(
             let c = standard_collection(store, wtxn, coll)?;
             let mut index =
                 nonodb_core::SearchIndexDef::single(nonodb_core::SearchKind::Text, field);
-            if std::env::var("NONODB_SEGMENT_TEXT")
-                .ok()
-                .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
-            {
+            if segment_backend_enabled("NONODB_SEGMENT_TEXT") {
                 index.engine = nonodb_core::SearchEngine::Segment;
             }
             c.create_search_index_txn(wtxn, &index)?;
@@ -1650,10 +1647,7 @@ fn execute(
             let c = standard_collection(store, wtxn, coll)?;
             let mut index =
                 nonodb_core::SearchIndexDef::single(nonodb_core::SearchKind::Fuzzy, field);
-            if std::env::var("NONODB_SEGMENT_FUZZY")
-                .ok()
-                .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
-            {
+            if segment_backend_enabled("NONODB_SEGMENT_FUZZY") {
                 index.engine = nonodb_core::SearchEngine::Segment;
             }
             c.create_search_index_txn(wtxn, &index)?;
@@ -1760,6 +1754,17 @@ fn execute(
             Ok(json!({ "results": results }))
         }
     }
+}
+
+/// Segment indexes are the default for newly created text/fuzzy indexes.
+/// Set `NONODB_SEGMENT_TEXT=0` or `NONODB_SEGMENT_FUZZY=0` to keep LMDB.
+fn segment_backend_enabled(var: &str) -> bool {
+    std::env::var(var).ok().is_none_or(|value| {
+        !matches!(
+            value.to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        )
+    })
 }
 
 #[cfg(test)]
