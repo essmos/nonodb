@@ -695,6 +695,16 @@ impl SegmentSet {
         if limit == 0 || allowed.is_some_and(HashSet::is_empty) {
             return Ok(Vec::new());
         }
+        let mut terms = search::tokenize(query);
+        terms.sort();
+        terms.dedup();
+        if terms.is_empty() {
+            return Ok(Vec::new());
+        }
+        let stats = self.global_search_stats(&terms);
+        if stats.documents == 0 {
+            return Ok(Vec::new());
+        }
         let want = skip
             .saturating_add(limit)
             .saturating_add(self.tombstones.len())
@@ -702,7 +712,7 @@ impl SegmentSet {
             .max(limit);
         let mut merged: HashMap<String, f64> = HashMap::new();
         for (segment_idx, segment) in self.segments.iter().enumerate() {
-            for hit in segment.search_filtered(query, want, allowed)? {
+            for hit in segment.search_filtered_with_stats(query, want, allowed, Some(&stats))? {
                 let hidden = self
                     .tombstones
                     .get(&hit.id)
@@ -715,7 +725,7 @@ impl SegmentSet {
                 }
             }
         }
-        for hit in self.search_delta(query, want)? {
+        for hit in self.search_delta(query, want, Some(&stats))? {
             if allowed.is_some_and(|set| !set.contains(&hit.id)) {
                 continue;
             }
@@ -730,7 +740,35 @@ impl SegmentSet {
         Ok(hits.into_iter().skip(skip).take(limit).collect())
     }
 
-    fn search_delta(&self, query: &str, limit: usize) -> io::Result<Vec<SearchHit>> {
+    fn global_search_stats(&self, terms: &[String]) -> GlobalSearchStats {
+        let mut stats = GlobalSearchStats::default();
+        for segment in &self.segments {
+            stats.documents += u64::from(segment.documents());
+            stats.total_doc_len += segment.total_doc_len();
+            for term in terms {
+                if let Ok(Some(df)) = segment.term_df(term) {
+                    *stats.df.entry(term.clone()).or_insert(0) += df;
+                }
+            }
+        }
+        for doc in self.delta.values() {
+            stats.documents += 1;
+            stats.total_doc_len += u64::from(doc.dl);
+            for term in terms {
+                if doc.terms.contains_key(term) {
+                    *stats.df.entry(term.clone()).or_insert(0) += 1;
+                }
+            }
+        }
+        stats
+    }
+
+    fn search_delta(
+        &self,
+        query: &str,
+        limit: usize,
+        global: Option<&GlobalSearchStats>,
+    ) -> io::Result<Vec<SearchHit>> {
         if limit == 0 || self.delta.is_empty() {
             return Ok(Vec::new());
         }
@@ -740,16 +778,28 @@ impl SegmentSet {
         if terms.is_empty() {
             return Ok(Vec::new());
         }
-        let n = self.delta.len() as f64;
+        let n = global
+            .map(|stats| stats.documents as f64)
+            .unwrap_or(self.delta.len() as f64);
         let total: u64 = self.delta.values().map(|doc| u64::from(doc.dl)).sum();
-        let avgdl = if total == 0 { 1.0 } else { total as f64 / n };
+        let avgdl = match global {
+            Some(stats) if stats.documents > 0 => {
+                stats.total_doc_len as f64 / stats.documents as f64
+            }
+            _ if total == 0 => 1.0,
+            _ => total as f64 / n,
+        };
         let mut idfs = Vec::with_capacity(terms.len());
         for term in &terms {
-            let df = self
-                .delta
-                .values()
-                .filter(|doc| doc.terms.contains_key(term))
-                .count() as f64;
+            let df = global
+                .and_then(|stats| stats.df.get(term).copied())
+                .map(f64::from)
+                .unwrap_or_else(|| {
+                    self.delta
+                        .values()
+                        .filter(|doc| doc.terms.contains_key(term))
+                        .count() as f64
+                });
             if df == 0.0 {
                 return Ok(Vec::new());
             }
@@ -1154,6 +1204,13 @@ struct TermIndexEntry {
     len: u32,
 }
 
+#[derive(Debug, Clone, Default)]
+struct GlobalSearchStats {
+    documents: u64,
+    total_doc_len: u64,
+    df: HashMap<String, u32>,
+}
+
 /// Read-only handle to one immutable segment.
 pub struct SegmentReader {
     map: Arc<Mmap>,
@@ -1186,6 +1243,14 @@ impl SegmentReader {
 
     pub fn terms(&self) -> u32 {
         self.header.term_count
+    }
+
+    pub fn total_doc_len(&self) -> u64 {
+        self.header.total_doc_len
+    }
+
+    pub fn term_df(&self, term: &str) -> io::Result<Option<u32>> {
+        Ok(self.term(term)?.map(|entry| entry.df))
     }
 
     fn read(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
@@ -1266,6 +1331,16 @@ impl SegmentReader {
         limit: usize,
         allowed: Option<&HashSet<String>>,
     ) -> io::Result<Vec<SearchHit>> {
+        self.search_filtered_with_stats(query, limit, allowed, None)
+    }
+
+    fn search_filtered_with_stats(
+        &self,
+        query: &str,
+        limit: usize,
+        allowed: Option<&HashSet<String>>,
+        global: Option<&GlobalSearchStats>,
+    ) -> io::Result<Vec<SearchHit>> {
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -1275,17 +1350,24 @@ impl SegmentReader {
         if terms.is_empty() {
             return Ok(Vec::new());
         }
-        let avgdl = if self.header.doc_count == 0 {
-            1.0
-        } else {
-            self.header.total_doc_len as f64 / f64::from(self.header.doc_count)
+        let avgdl = match global {
+            Some(stats) if stats.documents > 0 => {
+                stats.total_doc_len as f64 / stats.documents as f64
+            }
+            _ if self.header.doc_count == 0 => 1.0,
+            _ => self.header.total_doc_len as f64 / f64::from(self.header.doc_count),
         };
-        let n = f64::from(self.header.doc_count);
+        let n = global
+            .map(|stats| stats.documents as f64)
+            .unwrap_or(f64::from(self.header.doc_count));
         let mut entries = Vec::with_capacity(terms.len());
         for term in &terms {
             match self.term(term)? {
                 Some(entry) => {
-                    let df = f64::from(entry.df);
+                    let df = global
+                        .and_then(|stats| stats.df.get(term).copied())
+                        .unwrap_or(entry.df);
+                    let df = f64::from(df);
                     let idf = (1.0 + (n - df + 0.5) / (df + 0.5)).ln();
                     entries.push((term.clone(), entry, idf));
                 }
@@ -1890,6 +1972,30 @@ mod tests {
         assert!(ids.contains(&"a"));
         assert!(ids.contains(&"c"));
         assert!(!ids.contains(&"b"));
+    }
+
+    #[test]
+    fn segment_set_uses_global_bm25_statistics() {
+        let dir = tempfile::tempdir().unwrap();
+        let a_path = dir.path().join("a.nos");
+        let b_path = dir.path().join("b.nos");
+        let mut a = SegmentBuilder::new(&a_path).unwrap();
+        a.add_document("a", "alpha").unwrap();
+        a.add_document("f1", "filler").unwrap();
+        a.finish().unwrap();
+        let mut b = SegmentBuilder::new(&b_path).unwrap();
+        b.add_document("b", "alpha").unwrap();
+        b.add_document("f2", "filler").unwrap();
+        b.add_document("f3", "filler").unwrap();
+        b.add_document("f4", "filler").unwrap();
+        b.finish().unwrap();
+        let set = SegmentSet::with_segments(vec![
+            SegmentReader::open(&a_path).unwrap(),
+            SegmentReader::open(&b_path).unwrap(),
+        ]);
+        let hits = set.search("alpha", 0, 10).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert!((hits[0].score - hits[1].score).abs() < 1e-9);
     }
 
     #[test]

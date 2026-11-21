@@ -616,8 +616,10 @@ Current limits:
   negation;
 - filters are supported only for exact-equality predicates backed by an
   existing index, or by `_id`; other filters return an error;
-- segment scores are merged per segment, so absolute BM25 scores can differ
-  from a single global index after several flushes;
+- BM25 document frequency, document count, and average length are summed
+  across all base segments and the in-memory delta before scoring, so scores
+  are comparable after flushes instead of using each segment's local corpus
+  statistics;
 - fuzzy search uses a segment-native trigram index and value sidecar when
   `NONODB_SEGMENT_FUZZY=1`; exact-equality indexed filters use the same
   candidate-set path as text;
