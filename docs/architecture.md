@@ -675,8 +675,8 @@ Current limits:
   maintained as exact live statistics in LMDB. Updates and deletes adjust the
   counts transactionally, so tombstoned versions and old duplicate documents do
   not inflate scores. Indexes created before live statistics existed use the
-  old segment-sum fallback until `NONODB_REBUILD_SEARCH_STATS=1` runs at
-  startup;
+  old segment-sum fallback until `NONODB_REBUILD_SEARCH_STATS=1` fills the
+  missing statistics at startup; use `force` to recompute every index;
 - fuzzy search uses a segment-native trigram index and value sidecar when
   `NONODB_SEGMENT_FUZZY=1`; indexed filters use the candidate-set fast path, and
   compound or non-indexed filters verify the fetched candidate documents;

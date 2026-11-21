@@ -138,7 +138,7 @@ secrets.
 | `NONODB_REPLICATION_KEY_FILE` | unset | Client private key for source mTLS |
 | `NONODB_BACKUP_IDENTITY_FILE` | — | age identity file used by encrypted restore |
 | `NONODB_REBUILD_MISSING_SEARCH` | `0` | Rebuild missing text/fuzzy segment files and vector ANN sidecars for all databases at startup |
-| `NONODB_REBUILD_SEARCH_STATS` | `0` | Recompute exact BM25 live statistics for segment text indexes in all databases at startup |
+| `NONODB_REBUILD_SEARCH_STATS` | `0` | Fill missing exact BM25 statistics for segment text indexes at startup; use `force` to recompute every index |
 | `NONODB_MIGRATE_SEARCH_SEGMENTS` | `0` | Migrate legacy LMDB text/fuzzy indexes to segments in the default database at startup |
 | `NONODB_BUILD_VECTOR_ANN` | `0` | Build missing vector ANN sidecars in the default database at startup |
 | `NONODB_VECTOR_ANN_PROBE` | `16` | Clusters probed by an ANN vector query |

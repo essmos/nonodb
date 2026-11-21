@@ -3904,6 +3904,43 @@ impl<'e> Collection<'e> {
         Ok(rebuilt)
     }
 
+    /// Fills exact live BM25 statistics for segment text indexes that do not
+    /// have them yet. Existing indexes keep the approximate fallback until this
+    /// runs. Returns the number of indexes initialized.
+    pub fn ensure_segment_text_stats(&self) -> Result<usize> {
+        let defs = {
+            let rtxn = self.read_txn()?;
+            let defs = self
+                .search_index_defs_in(&rtxn)?
+                .into_iter()
+                .filter(|def| {
+                    def.engine == SearchEngine::Segment
+                        && def.kind == SearchKind::Text
+                        && def.fields.len() == 1
+                })
+                .collect::<Vec<_>>();
+            rtxn.commit()?;
+            defs
+        };
+        let mut initialized = 0usize;
+        for def in defs {
+            let missing = {
+                let rtxn = self.read_txn()?;
+                let missing = self.segment_stats_in(&rtxn, &def.name)?.is_none();
+                rtxn.commit()?;
+                missing
+            };
+            if !missing {
+                continue;
+            }
+            let mut wtxn = self.write_txn()?;
+            self.rebuild_segment_stats(&mut wtxn, &def)?;
+            wtxn.commit()?;
+            initialized += 1;
+        }
+        Ok(initialized)
+    }
+
     /// Recomputes exact live BM25 statistics for every segment-backed text index.
     ///
     /// Existing indexes created before live statistics were introduced keep
@@ -12015,6 +12052,13 @@ mod tests {
         assert_eq!(c.segment_stats_in(&rtxn, "body").unwrap(), Some((2, 3)));
         assert_eq!(c.segment_df_in(&rtxn, "body", "gamma").unwrap(), 2);
         rtxn.commit().unwrap();
+
+        // Startup repair only touches indexes without statistics.
+        let mut wtxn = store.write_txn().unwrap();
+        c.clear_segment_stats(&mut wtxn, "body").unwrap();
+        wtxn.commit().unwrap();
+        assert_eq!(c.ensure_segment_text_stats().unwrap(), 1);
+        assert_eq!(c.ensure_segment_text_stats().unwrap(), 0);
     }
 
     #[test]

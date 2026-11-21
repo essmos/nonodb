@@ -314,26 +314,32 @@ async fn run_async() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    if std::env::var("NONODB_REBUILD_SEARCH_STATS")
-        .ok()
-        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
-    {
-        for db_name in databases.names().await {
-            let runtime = databases
-                .get(&db_name)
-                .await
-                .map_err(|e| -> Box<dyn std::error::Error> { e.message.into() })?;
-            let store = runtime.store.clone();
-            for name in store.collections()? {
-                let collection = store.collection(&name)?;
-                let rebuilt = collection.rebuild_segment_text_stats()?;
-                if rebuilt > 0 {
-                    tracing::info!(
-                        database = %db_name,
-                        collection = %name,
-                        rebuilt,
-                        "rebuilt segment text statistics"
-                    );
+    if let Ok(mode) = std::env::var("NONODB_REBUILD_SEARCH_STATS") {
+        let mode = mode.trim().to_ascii_lowercase();
+        if matches!(mode.as_str(), "1" | "true" | "yes" | "on" | "force" | "all") {
+            let force = matches!(mode.as_str(), "force" | "all");
+            for db_name in databases.names().await {
+                let runtime = databases
+                    .get(&db_name)
+                    .await
+                    .map_err(|e| -> Box<dyn std::error::Error> { e.message.into() })?;
+                let store = runtime.store.clone();
+                for name in store.collections()? {
+                    let collection = store.collection(&name)?;
+                    let rebuilt = if force {
+                        collection.rebuild_segment_text_stats()?
+                    } else {
+                        collection.ensure_segment_text_stats()?
+                    };
+                    if rebuilt > 0 {
+                        tracing::info!(
+                            database = %db_name,
+                            collection = %name,
+                            rebuilt,
+                            force,
+                            "rebuilt segment text statistics"
+                        );
+                    }
                 }
             }
         }

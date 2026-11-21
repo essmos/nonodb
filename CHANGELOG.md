@@ -7,8 +7,9 @@ Full release notes: https://github.com/essmos/nonodb/releases
 - Maintain exact live BM25 document count, total length, and per-term document
   frequency for segment text indexes. Updates and deletes adjust the statistics
   transactionally, so tombstoned and duplicate document versions no longer
-  inflate scores. Add `NONODB_REBUILD_SEARCH_STATS=1` to recompute statistics
-  for existing segment indexes at startup.
+  inflate scores. Add `NONODB_REBUILD_SEARCH_STATS=1` to fill missing statistics
+  for existing segment indexes at startup; `NONODB_REBUILD_SEARCH_STATS=force`
+  recomputes every index.
 - Make the immutable segment backend the default for newly created text and
   fuzzy indexes. Existing indexes keep their stored engine. Set
   `NONODB_SEGMENT_TEXT=0` or `NONODB_SEGMENT_FUZZY=0` to keep LMDB for new
