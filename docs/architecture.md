@@ -617,8 +617,10 @@ queries fall back to the exact path; rebuilding the sidecar clears the delta.
 Filtered queries also use the exact path, because applying a filter after
 approximate candidate selection could miss matching documents. Dropping or
 reindexing the vector index removes the sidecar and delta. Backups contain only
-LMDB, so after a restore start once with `NONODB_REBUILD_MISSING_SEARCH=1` to
-rebuild missing segment files and ANN sidecars from the documents.
+LMDB by default; `backup --with-search-sidecars` includes the immutable segment
+and ANN files. Replication snapshot bootstrap fetches the files referenced by
+the snapshot from the source and falls back to rebuilding missing indexes after
+a restore or interrupted transfer.
 
 The sidecar is approximate: recall depends on the number of clusters, `nprobe`,
 and data distribution. The 10M benchmark sample reached recall@10 of 1.0 with
@@ -684,7 +686,8 @@ Current limits:
   is triggered by the tombstone ratio and rewrites the complete index.
 
 Dropping the index removes its manifest, delta keys, and segment directory.
-Backups continue to contain only LMDB; rebuild segment indexes after a restore.
+Backups contain only LMDB by default; optional sidecar backup and replication
+bootstrap can transfer the immutable files without a rebuild.
 
 ## Concurrency and consistency
 

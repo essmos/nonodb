@@ -3766,6 +3766,42 @@ impl<'e> Collection<'e> {
         self.drop_search_index_txn(wtxn, SearchKind::Text, field)
     }
 
+    /// Lists immutable search files referenced by segment text/fuzzy indexes
+    /// and optional vector ANN indexes. Paths are relative to the database
+    /// directory and are suitable for snapshot sidecar transfer.
+    pub fn search_sidecar_files_in(&self, rtxn: &RoTxn<'_>) -> Result<Vec<String>> {
+        let mut files = Vec::new();
+        for def in self.search_index_defs_in(rtxn)? {
+            if def.engine != SearchEngine::Segment {
+                continue;
+            }
+            match def.kind {
+                SearchKind::Text => {
+                    if let Some(manifest) = self.segment_manifest_in(rtxn, &def.name)? {
+                        files.extend(manifest.segments);
+                    }
+                }
+                SearchKind::Fuzzy => {
+                    if let Some(manifest) = self.fuzzy_segment_manifest_in(rtxn, &def.name)? {
+                        files.extend(manifest.segments);
+                        files.extend(manifest.values);
+                    }
+                }
+            }
+        }
+        for def in self.list_vector_indexes_in(rtxn)? {
+            if def.ann.is_some() {
+                files.push(format!(
+                    "{}/ann-000000.ivf",
+                    vector_ann_index_dir(&self.name, &def.field)
+                ));
+            }
+        }
+        files.sort_unstable();
+        files.dedup();
+        Ok(files)
+    }
+
     pub fn list_text_indexes(&self) -> Result<Vec<String>> {
         let rtxn = self.read_txn()?;
         let out = self.list_text_indexes_in(&rtxn)?;

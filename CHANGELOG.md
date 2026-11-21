@@ -14,6 +14,8 @@ Full release notes: https://github.com/essmos/nonodb/releases
   automatically so large segment and ANN indexes do not need a rebuild.
 - Make deep verification open and check segment-backed text and fuzzy indexes
   instead of reporting their LMDB postings as missing.
+- Transfer search segment and vector ANN sidecars during replication snapshot
+  bootstrap, with a rebuild fallback when a source file is unavailable.
 - Document the 100M vector ANN sidecar result and the 8.84M concurrent search
   benchmark.
 - Add the HTTP/JSON `drop_collection` operation. It removes documents, indexes,

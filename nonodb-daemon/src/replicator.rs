@@ -1657,17 +1657,31 @@ async fn bootstrap_database(
             &data_file,
         )
         .await?;
-        match rebuild_bootstrap_search(&data_root.join(database)).await {
-            Ok(rebuilt) if rebuilt > 0 => {
-                tracing::info!(database, rebuilt, "rebuilt replica search sidecars");
+        let database_path = data_root.join(database);
+        match copy_bootstrap_sidecars(client, config, database, &database_path).await {
+            Ok(copied) if copied > 0 => {
+                tracing::info!(database, copied, "copied replica search sidecars");
             }
             Ok(_) => {}
             Err(error) => {
                 tracing::warn!(
                     database,
                     error = %error,
-                    "snapshot installed but search sidecars were not rebuilt; restart with NONODB_REBUILD_MISSING_SEARCH=1"
+                    "sidecar transfer failed; rebuilding from snapshot data"
                 );
+                match rebuild_bootstrap_search(&database_path).await {
+                    Ok(rebuilt) if rebuilt > 0 => {
+                        tracing::info!(database, rebuilt, "rebuilt replica search sidecars");
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::warn!(
+                            database,
+                            error = %error,
+                            "snapshot installed but search sidecars were not rebuilt; restart with NONODB_REBUILD_MISSING_SEARCH=1"
+                        );
+                    }
+                }
             }
         }
         Ok(snapshot_head)
@@ -1675,6 +1689,133 @@ async fn bootstrap_database(
     .await;
     let _ = tokio::fs::remove_dir_all(&temp).await;
     result
+}
+
+async fn bootstrap_sidecar_paths(database_path: &std::path::Path) -> Result<Vec<String>, String> {
+    let database_path = database_path.to_path_buf();
+    tokio::task::spawn_blocking(move || -> Result<Vec<String>, String> {
+        let store = Store::open(&database_path).map_err(|error| error.to_string())?;
+        let files = store
+            .search_sidecar_files()
+            .map_err(|error| error.to_string())?;
+        let env = store.env().clone();
+        drop(store);
+        env.prepare_for_closing().wait();
+        Ok(files)
+    })
+    .await
+    .map_err(|error| format!("list search sidecars join error: {error}"))?
+}
+
+fn safe_sidecar_path(relative: &str) -> bool {
+    let path = std::path::Path::new(relative);
+    if path.is_absolute()
+        || !path.components().all(|part| {
+            matches!(
+                part,
+                std::path::Component::Normal(_) | std::path::Component::CurDir
+            )
+        })
+    {
+        return false;
+    }
+    let text = path.to_string_lossy();
+    text.starts_with("search/") || text.starts_with("vector-ann/")
+}
+
+async fn copy_bootstrap_sidecars(
+    client: &reqwest::Client,
+    config: &Config,
+    database: &str,
+    database_path: &std::path::Path,
+) -> Result<usize, String> {
+    let files = bootstrap_sidecar_paths(database_path).await?;
+    if files.is_empty() {
+        return Ok(0);
+    }
+    let route = if database == DEFAULT_DATABASE {
+        "/v1/replication/snapshot-sidecar".to_string()
+    } else {
+        format!("/{database}/v1/replication/snapshot-sidecar")
+    };
+    let mut copied = 0usize;
+    for relative in files {
+        if !safe_sidecar_path(&relative) {
+            return Err(format!("refusing unsafe sidecar path `{relative}`"));
+        }
+        let mut request = client.get(format!("{}{}?path={}", config.source, route, relative));
+        if let Some(token) = &config.token {
+            request = request.bearer_auth(token);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|error| format!("request sidecar `{relative}`: {error}"))?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(format!(
+                "sidecar `{relative}` -> HTTP {}: {}",
+                status.as_u16(),
+                body.chars().take(300).collect::<String>()
+            ));
+        }
+        let destination = database_path.join(&relative);
+        if let Some(parent) = destination.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|error| format!("create sidecar directory: {error}"))?;
+        }
+        let temp = destination.with_extension(format!(
+            "tmp-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        let mut file = match tokio::fs::File::create(&temp).await {
+            Ok(file) => file,
+            Err(error) => return Err(format!("create sidecar `{relative}`: {error}")),
+        };
+        let mut stream = response.bytes_stream();
+        let mut write_error = None;
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(chunk) => {
+                    if let Err(error) = file.write_all(&chunk).await {
+                        write_error = Some(format!("write sidecar `{relative}`: {error}"));
+                        break;
+                    }
+                }
+                Err(error) => {
+                    write_error = Some(format!("read sidecar `{relative}`: {error}"));
+                    break;
+                }
+            }
+        }
+        if write_error.is_none() {
+            if let Err(error) = file.flush().await {
+                write_error = Some(format!("flush sidecar `{relative}`: {error}"));
+            }
+        }
+        if write_error.is_none() {
+            if let Err(error) = file.sync_all().await {
+                write_error = Some(format!("sync sidecar `{relative}`: {error}"));
+            }
+        }
+        drop(file);
+        if let Some(error) = write_error {
+            let _ = tokio::fs::remove_file(&temp).await;
+            return Err(error);
+        }
+        if let Err(error) = tokio::fs::rename(&temp, &destination).await {
+            let _ = tokio::fs::remove_file(&temp).await;
+            return Err(format!("install sidecar `{relative}`: {error}"));
+        }
+        copied += 1;
+    }
+    Ok(copied)
 }
 
 async fn rebuild_bootstrap_search(database_path: &std::path::Path) -> Result<usize, String> {

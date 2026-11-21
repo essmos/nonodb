@@ -1,5 +1,7 @@
 //! Admin-only replication status and change-log inspection.
 
+use std::path::{Component, Path as FsPath};
+
 use axum::{
     body::Body,
     extract::{Path, Query, State},
@@ -27,6 +29,11 @@ pub struct ChangesQuery {
 
 fn default_limit() -> usize {
     100
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SidecarQuery {
+    pub path: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -727,6 +734,98 @@ pub async fn snapshot(
     response
 }
 
+pub async fn sidecar(
+    State(state): State<AppState>,
+    Extension(connection): Extension<auth::ConnectionAuth>,
+    headers: HeaderMap,
+    Path(database): Path<String>,
+    Query(query): Query<SidecarQuery>,
+) -> Response {
+    let (principal, started) =
+        match start_admin(&state, &connection, &headers, "replication_sidecar") {
+            Ok(value) => value,
+            Err(response) => return response.into_response(),
+        };
+    let database = if database.is_empty() {
+        crate::databases::DEFAULT_DATABASE.to_string()
+    } else {
+        database
+    };
+    let runtime = match state.databases.get(&database).await {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            return failure(StatusCode::BAD_REQUEST, &error.code, error.message).into_response()
+        }
+    };
+    let relative = FsPath::new(&query.path);
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|part| !matches!(part, Component::Normal(_) | Component::CurDir))
+    {
+        return failure(
+            StatusCode::BAD_REQUEST,
+            "invalid_path",
+            "sidecar path must be relative and contain no parent components",
+        )
+        .into_response();
+    }
+    let root = runtime.store.env().path().to_path_buf();
+    let Ok(root) = tokio::fs::canonicalize(&root).await else {
+        return failure(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "replication_error",
+            "cannot resolve database directory",
+        )
+        .into_response();
+    };
+    let full = root.join(relative);
+    let full = match tokio::fs::canonicalize(&full).await {
+        Ok(path) if path.starts_with(&root) => path,
+        _ => {
+            return failure(StatusCode::NOT_FOUND, "not_found", "sidecar file not found")
+                .into_response()
+        }
+    };
+    let metadata = match tokio::fs::metadata(&full).await {
+        Ok(metadata) if metadata.is_file() => metadata,
+        _ => {
+            return failure(StatusCode::NOT_FOUND, "not_found", "sidecar file not found")
+                .into_response()
+        }
+    };
+    let file = match tokio::fs::File::open(&full).await {
+        Ok(file) => file,
+        Err(error) => {
+            return failure(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "replication_error",
+                format!("open sidecar: {error}"),
+            )
+            .into_response()
+        }
+    };
+    audit_control(
+        &state,
+        &connection,
+        principal.name(),
+        "replication_sidecar",
+        true,
+        None,
+        started,
+        None,
+    );
+    let mut response = Response::new(Body::from_stream(ReaderStream::new(file)));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    if let Ok(value) = HeaderValue::from_str(&metadata.len().to_string()) {
+        response.headers_mut().insert(header::CONTENT_LENGTH, value);
+    }
+    response
+}
+
 pub async fn ack(
     State(state): State<AppState>,
     Extension(connection): Extension<auth::ConnectionAuth>,
@@ -1053,6 +1152,22 @@ pub async fn acks_default(
     Query(query): Query<AcksQuery>,
 ) -> AuthResponse {
     acks(
+        State(state),
+        Extension(connection),
+        headers,
+        Path(crate::databases::DEFAULT_DATABASE.to_string()),
+        Query(query),
+    )
+    .await
+}
+
+pub async fn sidecar_default(
+    State(state): State<AppState>,
+    Extension(connection): Extension<auth::ConnectionAuth>,
+    headers: HeaderMap,
+    Query(query): Query<SidecarQuery>,
+) -> Response {
+    sidecar(
         State(state),
         Extension(connection),
         headers,

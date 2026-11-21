@@ -2242,6 +2242,22 @@ impl Store {
     }
 
     /// List of collections in the given read transaction.
+    /// Lists immutable search sidecar files referenced by every collection in
+    /// this environment. Paths are relative to the database directory.
+    pub fn search_sidecar_files(&self) -> Result<Vec<String>> {
+        let rtxn = self.read_txn()?;
+        let mut files = Vec::new();
+        for name in self.collections_in(&rtxn)? {
+            if let Some(collection) = self.collection_at(&rtxn, &name)? {
+                files.extend(collection.search_sidecar_files_in(&rtxn)?);
+            }
+        }
+        rtxn.commit()?;
+        files.sort_unstable();
+        files.dedup();
+        Ok(files)
+    }
+
     pub fn collections_in(&self, rtxn: &RoTxn<'_>) -> Result<Vec<String>> {
         let meta: Database<Bytes, Bytes> = self
             .env

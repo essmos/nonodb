@@ -509,6 +509,10 @@ async fn run_async() -> Result<(), Box<dyn std::error::Error>> {
             get(replication_api::snapshot_default),
         )
         .route(
+            "/v1/replication/snapshot-sidecar",
+            get(replication_api::sidecar_default),
+        )
+        .route(
             "/v1/replication/prune",
             post(replication_api::prune_default),
         )
@@ -554,6 +558,10 @@ async fn run_async() -> Result<(), Box<dyn std::error::Error>> {
         .route(
             "/:database/v1/replication/snapshot",
             get(replication_api::snapshot),
+        )
+        .route(
+            "/:database/v1/replication/snapshot-sidecar",
+            get(replication_api::sidecar),
         )
         .route(
             "/:database/v1/replication/prune",

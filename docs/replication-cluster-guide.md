@@ -494,10 +494,13 @@ Large databases can take a long time and require temporary disk space. Set
 filesystem; the default is the system temp directory, which may be a small
 tmpfs. The daemon checks the advertised snapshot size before downloading and
 fails with a clear error when the temp or data filesystem lacks space. After a
-snapshot is installed, the replica rebuilds any missing text/fuzzy segment files
-and vector ANN sidecars from the snapshot's LMDB data. If that rebuild fails, the
-replica logs a warning; restart it with `NONODB_REBUILD_MISSING_SEARCH=1` to
-retry before serving search traffic.
+snapshot is installed, the replica asks the source for the text/fuzzy segment
+files and vector ANN sidecars referenced by the snapshot. The transfer uses the
+admin-only replication sidecar endpoint and installs each file atomically. If a
+file is unavailable, for example because the source compacted it after taking
+the snapshot, the replica falls back to rebuilding missing indexes from the
+snapshot's LMDB data. If that rebuild also fails, it logs a warning; restart it
+with `NONODB_REBUILD_MISSING_SEARCH=1` before serving search traffic.
 
 ### 5.7 Reversed direction
 

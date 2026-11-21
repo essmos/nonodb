@@ -2,8 +2,9 @@
 """Replica snapshot bootstrap with segment-backed search sidecars.
 
 Starts a primary with text/fuzzy segment indexes, creates a replica, forces a
-snapshot bootstrap, then verifies the replica rebuilt the segment files from the
-snapshot LMDB data and serves text and fuzzy queries.
+snapshot bootstrap, then verifies the replica copied the segment files from the
+snapshot source (or rebuilt them if transfer fails) and serves text and fuzzy
+queries.
 
     cargo build --locked --bins
     python3 scripts/replication_sidecar_test.py
@@ -204,6 +205,26 @@ def main() -> int:
         if not ann_files:
             raise RuntimeError("primary did not create a vector ANN sidecar")
 
+        bad = primary.get(
+            "/v1/replication/snapshot-sidecar",
+            params={"path": "../data.mdb"},
+            headers=headers,
+        )
+        if bad.status_code not in (400, 404):
+            raise RuntimeError("sidecar endpoint accepted a parent path")
+        relative = segment_files[0].relative_to(
+            temp / "primary-data" / "default"
+        ).as_posix()
+        good = primary.get(
+            "/v1/replication/snapshot-sidecar",
+            params={"path": relative},
+            headers=headers,
+        )
+        if good.status_code != 200 or not good.content:
+            raise RuntimeError(
+                f"sidecar endpoint returned {good.status_code} for {relative}"
+            )
+
         replica = start(
             "replica",
             temp / "replica-data",
@@ -269,8 +290,10 @@ def main() -> int:
         replica_log = (temp / "replica.log").read_text(
             encoding="utf-8", errors="replace"
         )
-        if "rebuilt replica search sidecars" not in replica_log:
-            raise RuntimeError("replica did not log sidecar rebuild")
+        if "copied replica search sidecars" not in replica_log:
+            raise RuntimeError(
+                "replica did not copy sidecars (fallback rebuild was used)"
+            )
 
         success = True
         print(
@@ -284,7 +307,7 @@ def main() -> int:
                     "replica_fuzzy_hits": len(fuzzy),
                     "replica_vector_hits": len(vectors),
                     "replica_ann_files": len(replica_ann),
-                    "replica_log_rebuild": True,
+                    "replica_log_copy": True,
                 }
             )
         )
