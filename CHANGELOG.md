@@ -9,7 +9,8 @@ Full release notes: https://github.com/essmos/nonodb/releases
   transactionally, so tombstoned and duplicate document versions no longer
   inflate scores. Add `NONODB_REBUILD_SEARCH_STATS=1` to fill missing statistics
   for existing segment indexes at startup; `NONODB_REBUILD_SEARCH_STATS=force`
-  recomputes every index.
+  recomputes every index. Use `NONODB_REBUILD_SEARCH_STATS_COLLECTIONS` to limit
+  a maintenance run to selected collections.
 - Make the immutable segment backend the default for newly created text and
   fuzzy indexes. Existing indexes keep their stored engine. Set
   `NONODB_SEGMENT_TEXT=0` or `NONODB_SEGMENT_FUZZY=0` to keep LMDB for new

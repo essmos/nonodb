@@ -318,6 +318,17 @@ async fn run_async() -> Result<(), Box<dyn std::error::Error>> {
         let mode = mode.trim().to_ascii_lowercase();
         if matches!(mode.as_str(), "1" | "true" | "yes" | "on" | "force" | "all") {
             let force = matches!(mode.as_str(), "force" | "all");
+            let only: Vec<String> = std::env::var("NONODB_REBUILD_SEARCH_STATS_COLLECTIONS")
+                .ok()
+                .map(|value| {
+                    value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
             for db_name in databases.names().await {
                 let runtime = databases
                     .get(&db_name)
@@ -325,6 +336,9 @@ async fn run_async() -> Result<(), Box<dyn std::error::Error>> {
                     .map_err(|e| -> Box<dyn std::error::Error> { e.message.into() })?;
                 let store = runtime.store.clone();
                 for name in store.collections()? {
+                    if !only.is_empty() && !only.iter().any(|wanted| wanted == &name) {
+                        continue;
+                    }
                     let collection = store.collection(&name)?;
                     let rebuilt = if force {
                         collection.rebuild_segment_text_stats()?
