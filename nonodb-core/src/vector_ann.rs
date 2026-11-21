@@ -465,6 +465,9 @@ impl AnnReader {
         let query_norm = norm_of(query);
         let mut probes = Vec::with_capacity(self.clusters);
         for cluster in 0..self.clusters {
+            if self.offset(cluster)? == self.offset(cluster + 1)? {
+                continue;
+            }
             let centroid = self.centroid(cluster);
             probes.push(ScoredCluster {
                 distance: distance(self.metric, query, query_norm, centroid, norm_of(centroid)),
