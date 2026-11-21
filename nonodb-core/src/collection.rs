@@ -9144,7 +9144,7 @@ impl<'e> Collection<'e> {
         let search_defs = self.search_index_defs_in(rtxn)?;
         let text_indexes: Vec<(String, String, f64)> = search_defs
             .iter()
-            .filter(|def| def.kind == SearchKind::Text)
+            .filter(|def| def.kind == SearchKind::Text && def.engine != SearchEngine::Segment)
             .flat_map(|def| {
                 def.fields
                     .iter()
@@ -9153,7 +9153,7 @@ impl<'e> Collection<'e> {
             .collect();
         let fuzzy_indexes: Vec<(String, String)> = search_defs
             .iter()
-            .filter(|def| def.kind == SearchKind::Fuzzy)
+            .filter(|def| def.kind == SearchKind::Fuzzy && def.engine != SearchEngine::Segment)
             .flat_map(|def| {
                 def.fields
                     .iter()
@@ -9457,6 +9457,78 @@ impl<'e> Collection<'e> {
                     "vector index `{}` on `{}` has {entries} entries, expected {}",
                     def.field, self.name, expected_vectors[i]
                 )));
+            }
+        }
+
+        let root = self.segment_root()?;
+        for def in search_defs
+            .iter()
+            .filter(|def| def.engine == SearchEngine::Segment)
+        {
+            match def.kind {
+                SearchKind::Text => {
+                    let Some(manifest) = self.segment_manifest_in(rtxn, &def.name)? else {
+                        if documents == 0 {
+                            continue;
+                        }
+                        return Err(Error::Query(format!(
+                            "segment text index `{}` on `{}` has no manifest",
+                            def.name, self.name
+                        )));
+                    };
+                    for rel in &manifest.segments {
+                        let path = root.join(rel);
+                        if !path.is_file() {
+                            return Err(Error::Query(format!(
+                                "segment text index `{}` on `{}` is missing `{}`",
+                                def.name,
+                                self.name,
+                                path.display()
+                            )));
+                        }
+                        SegmentReader::open(&path).map_err(|error| {
+                            Error::Query(format!(
+                                "segment text index `{}` on `{}` cannot open `{}`: {error}",
+                                def.name,
+                                self.name,
+                                path.display()
+                            ))
+                        })?;
+                    }
+                }
+                SearchKind::Fuzzy => {
+                    let Some(manifest) = self.fuzzy_segment_manifest_in(rtxn, &def.name)? else {
+                        if documents == 0 {
+                            continue;
+                        }
+                        return Err(Error::Query(format!(
+                            "segment fuzzy index `{}` on `{}` has no manifest",
+                            def.name, self.name
+                        )));
+                    };
+                    for (segment, values) in manifest.segments.iter().zip(&manifest.values) {
+                        let segment_path = root.join(segment);
+                        let values_path = root.join(values);
+                        for path in [&segment_path, &values_path] {
+                            if !path.is_file() {
+                                return Err(Error::Query(format!(
+                                    "segment fuzzy index `{}` on `{}` is missing `{}`",
+                                    def.name,
+                                    self.name,
+                                    path.display()
+                                )));
+                            }
+                        }
+                        FuzzySegmentReader::open(&segment_path, &values_path).map_err(|error| {
+                            Error::Query(format!(
+                                "segment fuzzy index `{}` on `{}` cannot open `{}`: {error}",
+                                def.name,
+                                self.name,
+                                segment_path.display()
+                            ))
+                        })?;
+                    }
+                }
             }
         }
 

@@ -10,6 +10,10 @@ Full release notes: https://github.com/essmos/nonodb/releases
   sets return a full result set instead of occasionally returning no hits.
 - Let `NONODB_VECTOR_ANN_PROBE` override the probe count at query time without
   rebuilding the ANN sidecar.
+- Add `--with-search-sidecars` to `backup`/`backup-all`, and restore those files
+  automatically so large segment and ANN indexes do not need a rebuild.
+- Make deep verification open and check segment-backed text and fuzzy indexes
+  instead of reporting their LMDB postings as missing.
 - Document the 100M vector ANN sidecar result and the 8.84M concurrent search
   benchmark.
 - Add the HTTP/JSON `drop_collection` operation. It removes documents, indexes,

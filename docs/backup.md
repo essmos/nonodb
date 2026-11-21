@@ -95,6 +95,24 @@ than the live `data.mdb`. The copied database file is synced before the command
 exits, then `manifest.json` is written. Creating a backup is I/O-heavy on large
 databases; schedule it like any other storage job.
 
+To include immutable search segment and vector ANN files, add
+`--with-search-sidecars`:
+
+```bash
+nonodb-cli backup /var/lib/nonodb /var/backups/nonodb/app1 --with-search-sidecars
+nonodb-cli backup-all /var/lib/nonodb /var/backups/nonodb/$TS --with-search-sidecars
+```
+
+The option copies `search/` and `vector-ann/` after the compacted `data.mdb`
+snapshot. The files are content-addressed and immutable, so a restore can use
+them directly instead of rebuilding large indexes. The manifest still covers
+`data.mdb`; sidecars are derived data and are not independently checksummed.
+`restore` copies sidecars automatically when they are present in the backup
+directory and replaces any existing sidecar tree. Sidecars can contain indexed
+terms, document ids, and vectors: they are **not encrypted by the LMDB backup
+encryption path**, so omit this option for encrypted backups or protect the
+backup directory accordingly.
+
 Do not run an external `backup` or `inspect` process at the same time as an
 online `resize_map` operation. Finish the resize first.
 
@@ -517,8 +535,9 @@ Rules:
 - `restore-all` restores only databases listed in the instance manifest;
   unrelated database directories are left untouched.
 - Ensure the restored files are owned by the daemon user.
-- Backups contain only LMDB. Text/fuzzy segment files and vector ANN sidecars
-  are derived data and are not part of `data.mdb`.
+- By default, backups contain only LMDB. Text/fuzzy segment files and vector ANN
+  sidecars are derived data and are not part of `data.mdb`; use
+  `--with-search-sidecars` to include them.
 
 ### Search sidecars after restore
 
@@ -532,7 +551,8 @@ The daemon scans every database under the data root, rebuilds any segment file
 or ANN sidecar referenced by LMDB metadata but missing on disk, clears the stale
 in-memory delta, and logs the rebuilt indexes. Large indexes make this startup
 longer. Once the rebuild finishes, restart the daemon normally. The operation is
-idempotent: a second start finds nothing to rebuild.
+idempotent: a second start finds nothing to rebuild. `--verify` also checks the
+manifests and files for segment-backed text and fuzzy indexes.
 
 After starting the daemon, validate counts, indexes, and a few application
 queries:

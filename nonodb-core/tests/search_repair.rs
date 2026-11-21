@@ -34,6 +34,13 @@ fn rebuilds_missing_text_fuzzy_and_vector_sidecars() {
     }
 
     assert_eq!(c.rebuild_missing_search_sidecars().unwrap(), 3);
+    let rtxn = store.read_txn().unwrap();
+    let report = c.verify_in(&rtxn).unwrap();
+    rtxn.commit().unwrap();
+    assert_eq!(report.documents, 3);
+    assert_eq!(report.text_indexes, vec!["body"]);
+    assert_eq!(report.fuzzy_indexes, vec!["body"]);
+    assert_eq!(report.vector_indexes, vec!["embedding"]);
     assert_eq!(
         c.search("body", "quick", &json!({}), 0, Some(10))
             .unwrap()

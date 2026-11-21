@@ -572,8 +572,9 @@ fn run() -> Result<(), String> {
                 args.get(2)
                     .ok_or("użycie: nonodb-cli backup <data-dir> <out-dir>")?,
             );
+            let with_sidecars = args.iter().any(|arg| arg == "--with-search-sidecars");
             let source = database_dir(&data)?;
-            backup(&source, &out)?;
+            backup(&source, &out, with_sidecars)?;
             let manifest = nonodb_core::BackupManifest::from_backup(&out, &source)
                 .map_err(|e| e.to_string())?;
             nonodb_core::verify::write_manifest(&out, &manifest).map_err(|e| e.to_string())?;
@@ -593,7 +594,8 @@ fn run() -> Result<(), String> {
                 args.get(2)
                     .ok_or("użycie: nonodb-cli backup-all <data-root> <out-dir>")?,
             );
-            backup_all(&data, &out)?;
+            let with_sidecars = args.iter().any(|arg| arg == "--with-search-sidecars");
+            backup_all(&data, &out, with_sidecars)?;
         }
         "restore-all" => {
             let backup = PathBuf::from(
@@ -694,9 +696,9 @@ fn usage() -> Result<(), String> {
          map                        rozmiar mapy LMDB i zajęte bajty\n\
          sync                       wymuś fsync wybranej bazy\n\
          resize <rozmiar>           powiększ mapę online, np. 4GiB\n\
-         backup <data> <out>        kopia wybranej bazy (--db) + manifest.json\n\
+         backup <data> <out> [--with-search-sidecars]  kopia wybranej bazy (--db) + manifest.json\n\
          backup-keygen <plik>      generuje parę kluczy age do backupów\n\
-         backup-all <data> <out>    kopia wszystkich baz + manifest instancji\n\
+         backup-all <data> <out> [--with-search-sidecars]  kopia wszystkich baz + manifest instancji\n\
          verify <data> [--json]     głęboka weryfikacja wybranej bazy i indeksów\n\
          verify-backup <backup> [--json]  sprawdź manifest, sumę SHA-256 i zawartość\n\
          inspect <data> [coll]      statystyki bazy/kolekcji (--db wybiera bazę)\n\
@@ -1586,13 +1588,13 @@ fn instance_databases(data: &Path) -> Result<Vec<(String, PathBuf)>, String> {
     Ok(out)
 }
 
-fn backup_all(data: &Path, out_dir: &Path) -> Result<(), String> {
+fn backup_all(data: &Path, out_dir: &Path, with_sidecars: bool) -> Result<(), String> {
     let databases = instance_databases(data)?;
     std::fs::create_dir_all(out_dir).map_err(|e| e.to_string())?;
     let mut entries = Vec::new();
     for (name, source) in databases {
         let db_out = out_dir.join(&name);
-        backup(&source, &db_out)?;
+        backup(&source, &db_out, with_sidecars)?;
         let manifest = nonodb_core::BackupManifest::from_backup(&db_out, &source)
             .map_err(|e| e.to_string())?;
         nonodb_core::verify::write_manifest(&db_out, &manifest).map_err(|e| e.to_string())?;
@@ -1671,7 +1673,7 @@ fn restore_all(backup: &Path, data: &Path, force: bool, verify: bool) -> Result<
     Ok(())
 }
 
-fn backup(data: &Path, out_dir: &Path) -> Result<(), String> {
+fn backup(data: &Path, out_dir: &Path, with_sidecars: bool) -> Result<(), String> {
     std::fs::create_dir_all(out_dir).map_err(|e| e.to_string())?;
     let out = out_dir.join("data.mdb");
     let env = unsafe {
@@ -1685,6 +1687,56 @@ fn backup(data: &Path, out_dir: &Path) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     file.sync_all().map_err(|e| e.to_string())?;
     eprintln!("backup: {} -> {}", data.display(), out.display());
+    if with_sidecars {
+        copy_search_sidecars(data, out_dir)?;
+    }
+    Ok(())
+}
+
+/// Copies derived search files after the LMDB snapshot. They are immutable and
+/// content-addressed, so a file created after the snapshot is an unused extra,
+/// while a file referenced by the snapshot remains valid.
+fn copy_search_sidecars(source: &Path, target: &Path) -> Result<(), String> {
+    for name in ["search", "vector-ann"] {
+        let from = source.join(name);
+        if !from.is_dir() {
+            continue;
+        }
+        let to = target.join(name);
+        let _ = std::fs::remove_dir_all(&to);
+        copy_tree(&from, &to)?;
+        eprintln!("backup sidecars: {} -> {}", from.display(), to.display());
+    }
+    Ok(())
+}
+
+fn copy_tree(source: &Path, target: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(target).map_err(|e| e.to_string())?;
+    for entry in std::fs::read_dir(source).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let from = entry.path();
+        let to = target.join(entry.file_name());
+        let ty = entry.file_type().map_err(|e| e.to_string())?;
+        if ty.is_dir() {
+            copy_tree(&from, &to)?;
+        } else if ty.is_file() {
+            std::fs::copy(&from, &to).map_err(|e| format!("copy {}: {e}", from.display()))?;
+        }
+    }
+    Ok(())
+}
+
+fn restore_search_sidecars(source: &Path, target: &Path) -> Result<(), String> {
+    for name in ["search", "vector-ann"] {
+        let from = source.join(name);
+        if !from.is_dir() {
+            continue;
+        }
+        let to = target.join(name);
+        let _ = std::fs::remove_dir_all(&to);
+        copy_tree(&from, &to)?;
+        eprintln!("restore sidecars: {} -> {}", from.display(), to.display());
+    }
     Ok(())
 }
 
@@ -1830,6 +1882,9 @@ fn restore_into(backup: &Path, data: &Path, force: bool, verify: bool) -> Result
     std::fs::rename(plain, &dst).map_err(|e| e.to_string())?;
     let file = std::fs::File::open(&dst).map_err(|e| e.to_string())?;
     let _ = file.sync_all();
+    if backup.is_dir() {
+        restore_search_sidecars(backup, data)?;
+    }
     eprintln!("restore: {} -> {}", src.display(), dst.display());
     if verify {
         let report = nonodb_core::verify_data_dir(data).map_err(|e| e.to_string())?;
