@@ -185,6 +185,27 @@ The 1M real subset gives p50 **0.64 ms**, p95 **2.94 ms**, p99 **7.52 ms**, and
 **961.4 qps**. The improvement over the file-read path comes from mapping the
 immutable segment once and copying directly from mapped pages instead of
 issuing one `pread` per block header or posting block.
+
+#### Exact live BM25 statistics through the daemon
+
+A release daemon was run against a freshly loaded 1M MS MARCO prefix and the
+full 8.84M collection, with segment indexes and exact live statistics:
+
+| Metric | 1M real passages | Full 8.84M passages |
+|---|---:|---:|
+| Index build | not measured | **625.1 s** |
+| Query p50 | **1.58 ms** | **4.60 ms** |
+| Query p95 | **4.14 ms** | **29.58 ms** |
+| Query p99 | **7.13 ms** | **60.83 ms** |
+| Mean | **1.85 ms** | **7.66 ms** |
+| Throughput | **453.8 qps** | **116.4 qps** |
+
+The 1M run used 200 queries; the full run used 500 queries with 50 warmup
+queries. Daemon latency includes fetching the full top-10 documents from LMDB,
+so it is higher than the standalone segment reader above, which only resolves
+document ids. On the same 8.84M index, the previous daemon without live
+statistics measured p50 **4.48 ms**, p95 **29.40 ms**, and **118.9 qps**;
+exact statistics are within that run-to-run noise.
 The segment backend is the default for newly created text indexes in the
 daemon, with a durable delta, tombstone generations, and synchronous flushes.
 Set `NONODB_SEGMENT_TEXT=0` to keep LMDB for new indexes. Filters, phrases, negation, exact live BM25 statistics, and
