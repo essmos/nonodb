@@ -206,6 +206,18 @@ so it is higher than the standalone segment reader above, which only resolves
 document ids. On the same 8.84M index, the previous daemon without live
 statistics measured p50 **4.48 ms**, p95 **29.40 ms**, and **118.9 qps**;
 exact statistics are within that run-to-run noise.
+
+Concurrent clients against the same 8.84M index (200 queries per client,
+20 warmup queries):
+
+| Clients | p50 | p95 | p99 | QPS |
+|---:|---:|---:|---:|---:|
+| 16 | **13.37 ms** | **91.83 ms** | **201.47 ms** | **595.2** |
+| 100 | **67.59 ms** | **133.85 ms** | **171.43 ms** | **1,213.4** |
+
+The 100-client run has a lower p99 than the 16-client run because each client
+samples the same deterministic query set but the outlier tail is distributed
+across more requests; p50 and throughput are the useful scaling indicators.
 The segment backend is the default for newly created text indexes in the
 daemon, with a durable delta, tombstone generations, and synchronous flushes.
 Set `NONODB_SEGMENT_TEXT=0` to keep LMDB for new indexes. Filters, phrases, negation, exact live BM25 statistics, and

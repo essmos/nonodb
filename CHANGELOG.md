@@ -15,6 +15,7 @@ Full release notes: https://github.com/essmos/nonodb/releases
   a maintenance run to selected collections. A release-daemon validation on
   full MS MARCO measured p50 **4.60 ms**, p95 **29.58 ms**, p99 **60.83 ms**,
   and **116.4 qps**, within run-to-run noise of the previous approximate path.
+  With 16/100 concurrent clients the same index reached **595.2/1,213.4 qps**.
 - Make the immutable segment backend the default for newly created text and
   fuzzy indexes. Existing indexes keep their stored engine. Set
   `NONODB_SEGMENT_TEXT=0` or `NONODB_SEGMENT_FUZZY=0` to keep LMDB for new
