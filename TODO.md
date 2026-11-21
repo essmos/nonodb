@@ -32,10 +32,6 @@ deliberate limitations are documented in [docs/roadmap.md](docs/roadmap.md).
       and automate a restart, and never report promotion-ready until the data
       snapshot is installed. Add a regression test that enables replication on
       an existing database and joins a fresh replica.
-- [ ] Make the replication snapshot/bootstrap temp directory configurable and
-      fail with a clear error when it lacks space. Large snapshots currently
-      use `std::env::temp_dir()`, which may be a small tmpfs even when the data
-      directory has room.
 - [ ] Replicate TLS/import/node-local settings (deliberately local today).
 - [ ] Add GUI controls for cluster peer token rotation and control revision.
 - [ ] Add full automatic rejoin test coverage for multi-database catalogs.

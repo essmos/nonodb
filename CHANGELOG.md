@@ -11,6 +11,9 @@ Full release notes: https://github.com/essmos/nonodb/releases
 - Plan segment fuzzy search from the rarest `3*d + 1` trigrams instead of
   merging every trigram posting list. On 808k real MS MARCO queries this moved
   p50 from 144.51 ms to **12.07 ms** and p95 from 279.97 ms to **21.76 ms**.
+- Add `NONODB_REPLICATION_BOOTSTRAP_TMP` for snapshot downloads and check free
+  space before download/install, with an actionable error when the temp or data
+  filesystem is too small.
 - Rebuild missing text/fuzzy segment files and vector ANN sidecars on a replica
   after a replication snapshot is installed; add
   `scripts/replication_sidecar_test.py` covering snapshot bootstrap with

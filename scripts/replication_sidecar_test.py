@@ -213,6 +213,7 @@ def main() -> int:
                 "NONODB_REPLICATION_SOURCE": f"http://127.0.0.1:{primary_port}",
                 "NONODB_REPLICATION_SOURCE_TOKEN": token,
                 "NONODB_REPLICATION_BOOTSTRAP": "always",
+                "NONODB_REPLICATION_BOOTSTRAP_TMP": str(temp / "bootstrap-tmp"),
                 "NONODB_REPLICATION_POLL_INTERVAL": "1",
                 "NONODB_REPLICATION_ADVERTISE_URL": f"http://127.0.0.1:{replica_port}",
             },

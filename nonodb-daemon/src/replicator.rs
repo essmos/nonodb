@@ -1542,7 +1542,16 @@ async fn bootstrap_database(
     origin: &str,
     source_epoch: u64,
 ) -> Result<u64, String> {
-    let temp = std::env::temp_dir().join(format!(
+    let temp_root = std::env::var_os("NONODB_REPLICATION_BOOTSTRAP_TMP")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    tokio::fs::create_dir_all(&temp_root).await.map_err(|error| {
+        format!(
+            "create replication bootstrap temp root {}: {error}; set NONODB_REPLICATION_BOOTSTRAP_TMP to a writable directory",
+            temp_root.display()
+        )
+    })?;
+    let temp = temp_root.join(format!(
         "nonodb-replication-bootstrap-{}-{}-{}",
         std::process::id(),
         database,
@@ -1553,7 +1562,12 @@ async fn bootstrap_database(
     ));
     tokio::fs::create_dir_all(&temp)
         .await
-        .map_err(|error| format!("create bootstrap temp dir: {error}"))?;
+        .map_err(|error| {
+            format!(
+                "create bootstrap temp dir {}: {error}; set NONODB_REPLICATION_BOOTSTRAP_TMP to a directory with more space",
+                temp.display()
+            )
+        })?;
     let data_file = temp.join("data.mdb");
     let result = async {
         let path = if database == DEFAULT_DATABASE {
@@ -1579,6 +1593,16 @@ async fn bootstrap_database(
                 status.as_u16(),
                 body.chars().take(500).collect::<String>()
             ));
+        }
+        if let Some(required) = response.content_length() {
+            let available = fs2::available_space(&temp)
+                .map_err(|error| format!("check bootstrap temp space: {error}"))?;
+            if required > available {
+                return Err(format!(
+                    "insufficient space for replication snapshot in {}: snapshot is {required} bytes, {available} bytes available; set NONODB_REPLICATION_BOOTSTRAP_TMP to a directory with more space",
+                    temp.display()
+                ));
+            }
         }
         let mut file = tokio::fs::File::create(&data_file)
             .await
@@ -1668,6 +1692,18 @@ async fn install_bootstrap_snapshot(
     epoch: u64,
     source: &std::path::Path,
 ) -> Result<(), String> {
+    let source_size = tokio::fs::metadata(source)
+        .await
+        .map_err(|error| format!("stat bootstrap snapshot: {error}"))?
+        .len();
+    let available = fs2::available_space(data_root)
+        .map_err(|error| format!("check data root space: {error}"))?;
+    if source_size > available {
+        return Err(format!(
+            "insufficient space to install replication snapshot in {}: snapshot is {source_size} bytes, {available} bytes available",
+            data_root.display()
+        ));
+    }
     let target = data_root.join(database);
     let backup = data_root.join(format!(".bootstrap-{database}-{}", std::process::id()));
     let _ = tokio::fs::remove_dir_all(&backup).await;

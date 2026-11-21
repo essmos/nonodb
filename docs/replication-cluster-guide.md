@@ -481,7 +481,11 @@ Writes are rejected:
 ```
 
 The first start downloads a full snapshot when the local database is fresh.
-Large databases can take a long time and require temporary disk space. After a
+Large databases can take a long time and require temporary disk space. Set
+`NONODB_REPLICATION_BOOTSTRAP_TMP` to a directory on a large persistent
+filesystem; the default is the system temp directory, which may be a small
+tmpfs. The daemon checks the advertised snapshot size before downloading and
+fails with a clear error when the temp or data filesystem lacks space. After a
 snapshot is installed, the replica rebuilds any missing text/fuzzy segment files
 and vector ANN sidecars from the snapshot's LMDB data. If that rebuild fails, the
 replica logs a warning; restart it with `NONODB_REBUILD_MISSING_SEARCH=1` to
