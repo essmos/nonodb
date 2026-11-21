@@ -163,10 +163,11 @@ but should not be the long-term posting store for a 10M real-text collection.
 
 #### Internal segment prototype
 
-`nonodb-core/src/search_segment.rs` now contains a dependency-free segment
-format with sorted term blocks, delta-encoded postings, document-frequency-driven
-AND planning, and fast block skipping. The standalone `segment_bench` example
-was run on the same full MS MARCO corpus:
+`nonodb-core/src/search_segment.rs` contains a compact segment format with
+sorted term blocks, delta-encoded postings, document-frequency-driven AND
+planning, fast block skipping, and a lazily populated memory map. The reader has
+no background threads and no owned posting cache. The standalone `segment_bench`
+example was run on the same full MS MARCO corpus:
 
 | Metric | Full 8.84M passages |
 |---|---:|
@@ -174,18 +175,21 @@ was run on the same full MS MARCO corpus:
 | Terms | **1,576,221** |
 | Postings | **357,334,107** |
 | Segment file | **1.43 GB** |
-| Query p50 | **7.34 ms** |
-| Query p95 | **235.28 ms** |
-| Query p99 | **404.37 ms** |
-| Query throughput | **24.9 qps** (single client) |
+| Query p50 | **1.83 ms** |
+| Query p95 | **31.99 ms** |
+| Query p99 | **71.86 ms** |
+| Query throughput | **145.6 qps** (single client) |
 
-The 1M real subset gives p50 **0.45 ms**, p95 **9.26 ms**, and p99 **29.81 ms**.
+The 1M real subset gives p50 **0.64 ms**, p95 **2.94 ms**, p99 **7.52 ms**, and
+**961.4 qps**. The improvement over the file-read path comes from mapping the
+immutable segment once and copying directly from mapped pages instead of
+issuing one `pread` per block header or posting block.
 The segment backend is now selectable in the daemon with
 `NONODB_SEGMENT_TEXT=1`, with a durable delta, tombstone generations, and
 synchronous flushes. It is still experimental: filters and phrases are not
-supported by the segment path, and BM25 scores are merged per segment. The p50
-is already in the target range; the tail needs better upper-bound pruning before
-it replaces the LMDB posting path for every query.
+supported by the segment path, and BM25 scores are merged per segment. Both p50
+and the tail are now in the target range for this data set; the next work is
+compaction, filters/phrases, and a fair concurrent comparison with Elasticsearch.
 
 ### BM25
 

@@ -26,6 +26,9 @@ use std::collections::{BinaryHeap, HashMap};
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use memmap2::Mmap;
 
 use crate::search::{self, BM25_B, BM25_K1};
 
@@ -1046,7 +1049,7 @@ struct TermIndexEntry {
 
 /// Read-only handle to one immutable segment.
 pub struct SegmentReader {
-    file: File,
+    map: Arc<Mmap>,
     header: Header,
     index: Vec<TermIndexEntry>,
 }
@@ -1054,10 +1057,11 @@ pub struct SegmentReader {
 impl SegmentReader {
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
         let file = File::open(path)?;
+        let map = Arc::new(unsafe { Mmap::map(&file)? });
         let mut header_reader = &file;
         let header = Header::read(&mut header_reader)?;
         let mut index_buf = vec![0u8; (header.postings_off - header.term_index_off) as usize];
-        read_at(&file, header.term_index_off, &mut index_buf)?;
+        read_map(&map, header.term_index_off, &mut index_buf)?;
         let mut index = Vec::with_capacity(header.term_block_count as usize);
         let mut pos = 0usize;
         for _ in 0..header.term_block_count {
@@ -1066,11 +1070,7 @@ impl SegmentReader {
             let len = read_u32_buf(&index_buf, &mut pos)?;
             index.push(TermIndexEntry { first, offset, len });
         }
-        Ok(Self {
-            file,
-            header,
-            index,
-        })
+        Ok(Self { map, header, index })
     }
 
     pub fn documents(&self) -> u32 {
@@ -1079,6 +1079,10 @@ impl SegmentReader {
 
     pub fn terms(&self) -> u32 {
         self.header.term_count
+    }
+
+    fn read(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        read_map(&self.map, offset, buf)
     }
 
     pub fn doc_id(&self, doc: u32) -> io::Result<String> {
@@ -1093,8 +1097,8 @@ impl SegmentReader {
         let strings_start = offsets_start + (count + 1) * 4;
         let mut a = [0u8; 4];
         let mut b = [0u8; 4];
-        read_at(&self.file, offsets_start + u64::from(doc) * 4, &mut a)?;
-        read_at(&self.file, offsets_start + u64::from(doc + 1) * 4, &mut b)?;
+        self.read(offsets_start + u64::from(doc) * 4, &mut a)?;
+        self.read(offsets_start + u64::from(doc + 1) * 4, &mut b)?;
         let start = u32::from_le_bytes(a) as u64;
         let end = u32::from_le_bytes(b) as u64;
         if end < start {
@@ -1104,7 +1108,7 @@ impl SegmentReader {
             ));
         }
         let mut buf = vec![0u8; (end - start) as usize];
-        read_at(&self.file, strings_start + start, &mut buf)?;
+        self.read(strings_start + start, &mut buf)?;
         String::from_utf8(buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
@@ -1124,7 +1128,7 @@ impl SegmentReader {
         }
         let block = &self.index[lo];
         let mut buf = vec![0u8; block.len as usize];
-        read_at(&self.file, block.offset, &mut buf)?;
+        self.read(block.offset, &mut buf)?;
         let mut pos = 0usize;
         while pos < buf.len() {
             let name = read_str(&buf, &mut pos)?;
@@ -1469,7 +1473,7 @@ impl<'a> Cursor<'a> {
             return Ok(false);
         }
         let mut header = [0u8; 20];
-        read_at(&self.reader.file, self.next_block, &mut header)?;
+        self.reader.read(self.next_block, &mut header)?;
         let data_len = u32::from_le_bytes(header[14..18].try_into().unwrap()) as u64;
         self.next_block += 20 + data_len;
         self.remaining_blocks -= 1;
@@ -1491,14 +1495,14 @@ impl<'a> Cursor<'a> {
             return Ok(false);
         }
         let mut header = [0u8; 20];
-        read_at(&self.reader.file, self.next_block, &mut header)?;
+        self.reader.read(self.next_block, &mut header)?;
         let first_doc = u32::from_le_bytes(header[0..4].try_into().unwrap());
         let last_doc = u32::from_le_bytes(header[4..8].try_into().unwrap());
         let count = u16::from_le_bytes(header[8..10].try_into().unwrap()) as usize;
         let max_tf_norm = f32::from_le_bytes(header[10..14].try_into().unwrap()) as f64;
         let data_len = u32::from_le_bytes(header[14..18].try_into().unwrap()) as usize;
         let mut data = vec![0u8; data_len];
-        read_at(&self.reader.file, self.next_block + 20, &mut data)?;
+        self.reader.read(self.next_block + 20, &mut data)?;
         let mut postings = Vec::with_capacity(count);
         let mut pos = 0usize;
         let mut doc = first_doc;
@@ -1528,6 +1532,22 @@ impl<'a> Cursor<'a> {
         self.block_last = last_doc;
         Ok(true)
     }
+}
+
+fn read_map(map: &Mmap, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+    let start = usize::try_from(offset)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "offset too large"))?;
+    let end = start
+        .checked_add(buf.len())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "offset overflow"))?;
+    if end > map.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "short mapped read",
+        ));
+    }
+    buf.copy_from_slice(&map[start..end]);
+    Ok(())
 }
 
 fn read_at(file: &File, offset: u64, buf: &mut [u8]) -> io::Result<()> {

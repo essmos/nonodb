@@ -589,8 +589,9 @@ application or a separate embedding service; the daemon does not run a model.
 ## Segment text index (experimental)
 
 New text and fuzzy indexes can use the internal immutable segment backend
-instead of LMDB postings. Enable the desired backend on the daemon before
-creating the index:
+instead of LMDB postings. Segment files are immutable and memory-mapped lazily, so idle
+search has no background threads or owned posting cache. Enable the desired
+backend on the daemon before creating the index:
 
 ```bash
 NONODB_SEGMENT_TEXT=1 NONODB_SEGMENT_FUZZY=1 nonodb-daemon
