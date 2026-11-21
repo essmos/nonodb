@@ -18,6 +18,9 @@ Full release notes: https://github.com/essmos/nonodb/releases
 - Support phrases, negative terms/phrases, and compound or non-indexed filters
   on segment text indexes. Candidate generation stays in the segment; only
   candidates are loaded from LMDB for final phrase/filter verification.
+- Support compound and non-indexed filters on segment fuzzy indexes by
+  verifying fetched fuzzy candidates against the filter when no exact index
+  candidate set is available.
 - Automatically compact flushed text and fuzzy segment suffixes once four
   segments exist. Compaction rebuilds the suffix from current LMDB documents,
   clamps tombstones to the compacted generation, and skips suffixes larger than

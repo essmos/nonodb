@@ -975,6 +975,17 @@ impl FuzzySegmentReader {
         limit: usize,
         allowed: Option<&HashSet<String>>,
     ) -> io::Result<Vec<FuzzySegmentHit>> {
+        self.search_verified(query, max_distance, limit, allowed, None)
+    }
+
+    pub fn search_verified(
+        &self,
+        query: &str,
+        max_distance: usize,
+        limit: usize,
+        allowed: Option<&HashSet<String>>,
+        verify: Option<&DocVerifier<'_>>,
+    ) -> io::Result<Vec<FuzzySegmentHit>> {
         if limit == 0 || allowed.is_some_and(HashSet::is_empty) {
             return Ok(Vec::new());
         }
@@ -1003,7 +1014,7 @@ impl FuzzySegmentReader {
             return Ok(Vec::new());
         }
         if shared_min == 0 {
-            return self.search_all_grams(cursors, &query, max_distance, limit, allowed);
+            return self.search_all_grams(cursors, &query, max_distance, limit, allowed, verify);
         }
         let probe_count = (max_distance.saturating_mul(3) + 1).min(cursors.len());
         let mut probe: Vec<usize> = (0..cursors.len()).collect();
@@ -1038,7 +1049,9 @@ impl FuzzySegmentReader {
                 let value = self.value(doc)?;
                 if let Some(distance) = search::fuzzy_distance(&value, &query, max_distance) {
                     let id = self.segment.doc_id(doc)?;
-                    if !allowed.is_some_and(|set| !set.contains(&id)) {
+                    if !allowed.is_some_and(|set| !set.contains(&id))
+                        && !matches!(verify, Some(predicate) if !predicate(&id)?)
+                    {
                         if best.len() < limit {
                             best.push(Reverse((distance, id)));
                         } else if let Some(Reverse((worst_distance, worst_id))) = best.peek() {
@@ -1073,6 +1086,7 @@ impl FuzzySegmentReader {
         max_distance: usize,
         limit: usize,
         allowed: Option<&HashSet<String>>,
+        verify: Option<&DocVerifier<'_>>,
     ) -> io::Result<Vec<FuzzySegmentHit>> {
         let mut merge: BinaryHeap<Reverse<(u32, usize)>> = BinaryHeap::new();
         for (idx, cursor) in cursors.iter().enumerate() {
@@ -1118,6 +1132,11 @@ impl FuzzySegmentReader {
                 let id = self.segment.doc_id(candidate.doc)?;
                 if allowed.is_some_and(|set| !set.contains(&id)) {
                     continue;
+                }
+                if let Some(predicate) = verify {
+                    if !predicate(&id)? {
+                        continue;
+                    }
                 }
                 scored.push(FuzzySegmentHit { id, distance });
             }

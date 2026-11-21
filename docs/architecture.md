@@ -622,7 +622,8 @@ Current limits:
   are comparable after flushes instead of using each segment's local corpus
   statistics;
 - fuzzy search uses a segment-native trigram index and value sidecar when
-  `NONODB_SEGMENT_FUZZY=1`; its filters must use a single indexed field;
+  `NONODB_SEGMENT_FUZZY=1`; indexed filters use the candidate-set fast path, and
+  compound or non-indexed filters verify the fetched candidate documents;
 - compaction merges the flushed suffix, not the base segment; a very large
   suffix is left alone until an explicit full rebuild.
 

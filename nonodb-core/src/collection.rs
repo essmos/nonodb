@@ -4407,6 +4407,7 @@ impl<'e> Collection<'e> {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn search_segment_fuzzy_in(
         &self,
         rtxn: &RoTxn<'_>,
@@ -4415,6 +4416,7 @@ impl<'e> Collection<'e> {
         max_distance: usize,
         limit: Option<usize>,
         allowed: Option<&HashSet<String>>,
+        verify: Option<&DocVerifier<'_>>,
     ) -> Result<Vec<Value>> {
         let limit = limit.unwrap_or(10).min(1000);
         if limit == 0 {
@@ -4433,7 +4435,7 @@ impl<'e> Collection<'e> {
         let mut merged: HashMap<String, usize> = HashMap::new();
         for (idx, (segment, values)) in manifest.segments.iter().zip(&manifest.values).enumerate() {
             let reader = FuzzySegmentReader::open(root.join(segment), root.join(values))?;
-            for hit in reader.search_filtered(query, max_distance, want, allowed)? {
+            for hit in reader.search_verified(query, max_distance, want, allowed, verify)? {
                 let hidden = manifest
                     .tombstones
                     .get(&hit.id)
@@ -4453,6 +4455,11 @@ impl<'e> Collection<'e> {
                 .map_err(|e| Error::Query(format!("invalid fuzzy delta id: {e}")))?;
             if allowed.is_some_and(|set| !set.contains(id)) {
                 continue;
+            }
+            if let Some(predicate) = verify {
+                if !predicate(id)? {
+                    continue;
+                }
             }
             let text = std::str::from_utf8(value)
                 .map_err(|e| Error::Query(format!("invalid fuzzy delta text: {e}")))?;
@@ -4516,15 +4523,21 @@ impl<'e> Collection<'e> {
             let allowed = if empty_filter {
                 None
             } else {
-                match self.segment_filter_candidates(rtxn, filter)? {
-                    Some(ids) => Some(ids),
-                    None => {
-                        return Err(Error::Query(
-                            "segment fuzzy filters require a single indexed field".into(),
-                        ))
-                    }
-                }
+                self.segment_filter_candidates(rtxn, filter)?
             };
+            let needs_filter = !empty_filter && allowed.is_none();
+            let verify = |id: &str| -> std::io::Result<bool> {
+                let Some(bytes) = self
+                    .db
+                    .get(rtxn, id.as_bytes())
+                    .map_err(std::io::Error::other)?
+                else {
+                    return Ok(false);
+                };
+                let doc: Value = serde_json::from_slice(bytes).map_err(std::io::Error::other)?;
+                Ok(matches(&doc, filter))
+            };
+            let verify: Option<&DocVerifier<'_>> = needs_filter.then_some(&verify);
             return self.search_segment_fuzzy_in(
                 rtxn,
                 &def,
@@ -4532,6 +4545,7 @@ impl<'e> Collection<'e> {
                 max_distance,
                 limit,
                 allowed.as_ref(),
+                verify,
             );
         }
         let Some(db) = self.fuzzy_db(rtxn, field, field)? else {
@@ -11383,12 +11397,12 @@ mod tests {
     }
 
     #[test]
-    fn segment_fuzzy_index_supports_indexed_filters() {
+    fn segment_fuzzy_index_supports_filters() {
         let (_dir, store) = store();
         let c = store.collection("segment_fuzzy_filter").unwrap();
         for doc in [
-            json!({"_id": "a", "name": "Warszawa", "cat": 1}),
-            json!({"_id": "b", "name": "Warszawa", "cat": 2}),
+            json!({"_id": "a", "name": "Warszawa", "cat": 1, "tag": "x"}),
+            json!({"_id": "b", "name": "Warszawa", "cat": 2, "tag": "y"}),
         ] {
             c.insert_one(doc).unwrap();
         }
@@ -11405,6 +11419,22 @@ mod tests {
         assert_eq!(hits[0]["_id"], "b");
         let hits = c
             .fuzzy_search("name", "Warszwa", 1, &json!({"cat": {"$gt": 1}}), Some(10))
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["_id"], "b");
+        let hits = c
+            .fuzzy_search("name", "Warszwa", 1, &json!({"tag": "x"}), Some(10))
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["_id"], "a");
+        let hits = c
+            .fuzzy_search(
+                "name",
+                "Warszwa",
+                1,
+                &json!({"cat": 2, "tag": "y"}),
+                Some(10),
+            )
             .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0]["_id"], "b");
