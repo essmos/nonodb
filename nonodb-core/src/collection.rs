@@ -4330,6 +4330,7 @@ impl<'e> Collection<'e> {
         query: &str,
         max_distance: usize,
         limit: Option<usize>,
+        allowed: Option<&HashSet<String>>,
     ) -> Result<Vec<Value>> {
         let limit = limit.unwrap_or(10).min(1000);
         if limit == 0 {
@@ -4348,7 +4349,7 @@ impl<'e> Collection<'e> {
         let mut merged: HashMap<String, usize> = HashMap::new();
         for (idx, (segment, values)) in manifest.segments.iter().zip(&manifest.values).enumerate() {
             let reader = FuzzySegmentReader::open(root.join(segment), root.join(values))?;
-            for hit in reader.search(query, max_distance, want)? {
+            for hit in reader.search_filtered(query, max_distance, want, allowed)? {
                 let hidden = manifest
                     .tombstones
                     .get(&hit.id)
@@ -4366,6 +4367,9 @@ impl<'e> Collection<'e> {
             let (key, value) = item?;
             let id = std::str::from_utf8(&key[prefix.len()..])
                 .map_err(|e| Error::Query(format!("invalid fuzzy delta id: {e}")))?;
+            if allowed.is_some_and(|set| !set.contains(id)) {
+                continue;
+            }
             let text = std::str::from_utf8(value)
                 .map_err(|e| Error::Query(format!("invalid fuzzy delta text: {e}")))?;
             if let Some(distance) = search::fuzzy_distance(text, &normalized, max_distance) {
@@ -4424,12 +4428,27 @@ impl<'e> Collection<'e> {
             return Err(Error::Query(format!("no fuzzy index on field `{field}`")));
         };
         if def.engine == SearchEngine::Segment {
-            if !filter.as_object().is_none_or(|object| object.is_empty()) {
-                return Err(Error::Query(
-                    "segment fuzzy indexes do not support filters".into(),
-                ));
-            }
-            return self.search_segment_fuzzy_in(rtxn, &def, query, max_distance, limit);
+            let empty_filter = filter.as_object().is_none_or(|object| object.is_empty());
+            let allowed = if empty_filter {
+                None
+            } else {
+                match self.exact_filter_index_candidates(rtxn, filter)? {
+                    Some(ids) => Some(ids),
+                    None => {
+                        return Err(Error::Query(
+                            "segment fuzzy filters require an indexed exact-equality filter".into(),
+                        ))
+                    }
+                }
+            };
+            return self.search_segment_fuzzy_in(
+                rtxn,
+                &def,
+                query,
+                max_distance,
+                limit,
+                allowed.as_ref(),
+            );
         }
         let Some(db) = self.fuzzy_db(rtxn, field, field)? else {
             return Err(Error::Query(format!("no fuzzy index on field `{field}`")));
@@ -11234,6 +11253,32 @@ mod tests {
             .collect();
         ids.sort();
         assert_eq!(ids, vec!["c".to_string(), "d".to_string()]);
+    }
+
+    #[test]
+    fn segment_fuzzy_index_supports_exact_indexed_filters() {
+        let (_dir, store) = store();
+        let c = store.collection("segment_fuzzy_filter").unwrap();
+        for doc in [
+            json!({"_id": "a", "name": "Warszawa", "cat": 1}),
+            json!({"_id": "b", "name": "Warszawa", "cat": 2}),
+        ] {
+            c.insert_one(doc).unwrap();
+        }
+        c.create_index("cat", false).unwrap();
+        c.create_fuzzy_segment_index("name").unwrap();
+        let hits = c
+            .fuzzy_search("name", "Warszwa", 1, &json!({"cat": 2}), Some(10))
+            .unwrap();
+        let all = c
+            .fuzzy_search("name", "Warszwa", 1, &json!({}), Some(10))
+            .unwrap();
+        assert_eq!(all.len(), 2, "unfiltered: {all:?}");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["_id"], "b");
+        assert!(c
+            .fuzzy_search("name", "Warszwa", 1, &json!({"cat": {"$gt": 1}}), Some(10))
+            .is_err());
     }
 
     #[test]

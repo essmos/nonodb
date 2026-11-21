@@ -897,7 +897,17 @@ impl FuzzySegmentReader {
         max_distance: usize,
         limit: usize,
     ) -> io::Result<Vec<FuzzySegmentHit>> {
-        if limit == 0 {
+        self.search_filtered(query, max_distance, limit, None)
+    }
+
+    pub fn search_filtered(
+        &self,
+        query: &str,
+        max_distance: usize,
+        limit: usize,
+        allowed: Option<&HashSet<String>>,
+    ) -> io::Result<Vec<FuzzySegmentHit>> {
+        if limit == 0 || allowed.is_some_and(HashSet::is_empty) {
             return Ok(Vec::new());
         }
         let query = search::normalize(query);
@@ -925,7 +935,7 @@ impl FuzzySegmentReader {
             return Ok(Vec::new());
         }
         if shared_min == 0 {
-            return self.search_all_grams(cursors, &query, max_distance, limit);
+            return self.search_all_grams(cursors, &query, max_distance, limit, allowed);
         }
         let probe_count = (max_distance.saturating_mul(3) + 1).min(cursors.len());
         let mut probe: Vec<usize> = (0..cursors.len()).collect();
@@ -960,12 +970,14 @@ impl FuzzySegmentReader {
                 let value = self.value(doc)?;
                 if let Some(distance) = search::fuzzy_distance(&value, &query, max_distance) {
                     let id = self.segment.doc_id(doc)?;
-                    if best.len() < limit {
-                        best.push(Reverse((distance, id)));
-                    } else if let Some(Reverse((worst_distance, worst_id))) = best.peek() {
-                        if (distance, &id) < (*worst_distance, worst_id) {
-                            best.pop();
+                    if !allowed.is_some_and(|set| !set.contains(&id)) {
+                        if best.len() < limit {
                             best.push(Reverse((distance, id)));
+                        } else if let Some(Reverse((worst_distance, worst_id))) = best.peek() {
+                            if (distance, &id) < (*worst_distance, worst_id) {
+                                best.pop();
+                                best.push(Reverse((distance, id)));
+                            }
                         }
                     }
                 }
@@ -992,6 +1004,7 @@ impl FuzzySegmentReader {
         query: &str,
         max_distance: usize,
         limit: usize,
+        allowed: Option<&HashSet<String>>,
     ) -> io::Result<Vec<FuzzySegmentHit>> {
         let mut merge: BinaryHeap<Reverse<(u32, usize)>> = BinaryHeap::new();
         for (idx, cursor) in cursors.iter().enumerate() {
@@ -1034,10 +1047,11 @@ impl FuzzySegmentReader {
         for Reverse(candidate) in candidates {
             let value = self.value(candidate.doc)?;
             if let Some(distance) = search::fuzzy_distance(&value, query, max_distance) {
-                scored.push(FuzzySegmentHit {
-                    id: self.segment.doc_id(candidate.doc)?,
-                    distance,
-                });
+                let id = self.segment.doc_id(candidate.doc)?;
+                if allowed.is_some_and(|set| !set.contains(&id)) {
+                    continue;
+                }
+                scored.push(FuzzySegmentHit { id, distance });
             }
         }
         scored.sort_by(|a, b| a.distance.cmp(&b.distance).then_with(|| a.id.cmp(&b.id)));

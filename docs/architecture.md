@@ -619,7 +619,8 @@ Current limits:
 - segment scores are merged per segment, so absolute BM25 scores can differ
   from a single global index after several flushes;
 - fuzzy search uses a segment-native trigram index and value sidecar when
-  `NONODB_SEGMENT_FUZZY=1`; filters are not supported by that path;
+  `NONODB_SEGMENT_FUZZY=1`; exact-equality indexed filters use the same
+  candidate-set path as text;
 - compaction merges the flushed suffix, not the base segment; a very large
   suffix is left alone until an explicit full rebuild.
 
