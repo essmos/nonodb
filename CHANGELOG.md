@@ -6,6 +6,10 @@ Full release notes: https://github.com/essmos/nonodb/releases
 
 - Add `NONODB_VECTOR_ANN_CLUSTERS` (up to 8,192) to tune IVF cluster count for
   very large vector collections. The default remains 512.
+- Skip empty IVF clusters when probing, so repetitive or very large vector
+  sets return a full result set instead of occasionally returning no hits.
+- Document the 100M vector ANN sidecar result and the 8.84M concurrent search
+  benchmark.
 - Add the HTTP/JSON `drop_collection` operation. It removes documents, indexes,
   history, TTL state, and search/vector sidecars through the single writer.
 - Maintain exact live BM25 document count, total length, and per-term document

@@ -370,6 +370,28 @@ of the 10M vectors, ANN p50 remained **9.77 ms** (p95 **12.01 ms**). After 4,096
 changed ids the query falls back to exact LMDB until the sidecar is rebuilt.
 Filtered vector searches deliberately use the exact path.
 
+### 100M ANN sidecar
+
+The 100M collection (`search100m`, 16 dimensions) was also indexed with the
+default 512 clusters and `nprobe=16`. The sidecar is **8.2 GB** and took roughly
+**5–6 minutes** to build. Thirty unfiltered queries with `limit=10` measured:
+
+| Metric | 100M result |
+|---|---:|
+| ANN p50 | **92.2 ms** |
+| ANN p95 | **108.1 ms** |
+| ANN mean | **78.7 ms** |
+| ANN throughput | **12.7 qps** |
+| Exact p50 (all-cluster scan) | **6.12 s** |
+| Recall@10 on 20 sample queries | **1.0** |
+
+The latency grows with vectors per probed cluster: 512 clusters leave about
+195k vectors per cluster, so 16 probes scan roughly 3.1M vectors. For very large
+collections, `NONODB_VECTOR_ANN_CLUSTERS` raises the cluster cap (up to 8,192)
+when building the sidecar, trading build time and memory for lower query
+latency. The optimal count depends on the distinct-vector distribution; validate
+recall after changing it.
+
 ---
 
 ## Interpreting the results
@@ -421,6 +443,10 @@ NONODB_SOCK=$S NONODB_TIMEOUT=1800 \
 # Build the optional vector ANN sidecar at daemon startup
 NONODB_BUILD_VECTOR_ANN=1 NONODB_VECTOR_ANN_PROBE=16 \
 NONODB_VECTOR_ANN_COLLECTIONS=search1m,search10m nonodb-daemon
+
+# Optional: raise the IVF cluster cap for a very large collection
+NONODB_BUILD_VECTOR_ANN=1 NONODB_VECTOR_ANN_CLUSTERS=2048 \
+NONODB_VECTOR_ANN_COLLECTIONS=search100m nonodb-daemon
 
 # 1M and 10M BM25/fuzzy/vector benchmarks
 NONODB_SOCK=$S python3 scripts/search_scale_bench.py --docs 1000000 --collection search1m
