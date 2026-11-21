@@ -458,6 +458,17 @@ impl AnnReader {
     }
 
     pub fn search(&self, query: &[f32], want: usize) -> io::Result<BinaryHeap<Candidate>> {
+        self.search_with_nprobe(query, want, self.nprobe)
+    }
+
+    /// Searches with an explicit probe count. This allows tuning recall and
+    /// latency without rebuilding an immutable sidecar.
+    pub fn search_with_nprobe(
+        &self,
+        query: &[f32],
+        want: usize,
+        nprobe: usize,
+    ) -> io::Result<BinaryHeap<Candidate>> {
         let mut heap: BinaryHeap<Candidate> = BinaryHeap::new();
         if want == 0 || self.entries == 0 || query.len() != self.dims {
             return Ok(heap);
@@ -475,7 +486,7 @@ impl AnnReader {
             });
         }
         probes.sort_unstable();
-        probes.truncate(self.nprobe.min(probes.len()));
+        probes.truncate(nprobe.clamp(1, self.clusters).min(probes.len()));
         let clusters: Vec<usize> = probes.into_iter().map(|probe| probe.index).collect();
         let workers = std::thread::available_parallelism()
             .map(|value| value.get())

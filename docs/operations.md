@@ -142,7 +142,7 @@ secrets.
 | `NONODB_REBUILD_SEARCH_STATS_COLLECTIONS` | unset | Comma-separated collections for search-statistics rebuild |
 | `NONODB_MIGRATE_SEARCH_SEGMENTS` | `0` | Migrate legacy LMDB text/fuzzy indexes to segments in the default database at startup |
 | `NONODB_BUILD_VECTOR_ANN` | `0` | Build missing vector ANN sidecars in the default database at startup |
-| `NONODB_VECTOR_ANN_PROBE` | `16` | Clusters probed by an ANN vector query |
+| `NONODB_VECTOR_ANN_PROBE` | `16` | Clusters probed by an ANN vector query; can be changed at restart without rebuilding the sidecar |
 | `NONODB_VECTOR_ANN_CLUSTERS` | `512` | Maximum IVF clusters when building a vector ANN sidecar (1–8,192) |
 | `NONODB_VECTOR_ANN_COLLECTIONS` | unset | Comma-separated collections for `NONODB_BUILD_VECTOR_ANN` |
 | `NONODB_SNAPSHOT_INTERVAL` | `300` | Snapshot interval in seconds |

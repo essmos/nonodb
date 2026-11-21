@@ -2467,38 +2467,42 @@ impl<'e> Collection<'e> {
                 if !dirty && delta.len() <= VECTOR_ANN_DELTA_MAX {
                     if let Ok(path) = self.vector_ann_path(field) {
                         if let Ok(reader) = vector_ann::AnnReader::open(&path) {
-                            if reader.stats().nprobe == ann.nprobe as usize {
-                                let delta_ids: HashSet<&str> =
-                                    delta.iter().map(|(id, _)| id.as_str()).collect();
-                                let mut heap: BinaryHeap<Candidate> = BinaryHeap::new();
-                                let search_want = want.saturating_add(delta_ids.len());
-                                for candidate in reader.search(query, search_want)? {
-                                    if !delta_ids.contains(candidate.id.as_str()) {
-                                        heap.push(candidate);
-                                        if heap.len() > want {
-                                            heap.pop();
-                                        }
-                                    }
-                                }
-                                for (id, bytes) in &delta {
-                                    if bytes.is_empty() {
-                                        continue;
-                                    }
-                                    let Some(distance) = vector::distance_from_bytes(
-                                        def.metric, query, query_norm, bytes, def.dims,
-                                    ) else {
-                                        continue;
-                                    };
-                                    heap.push(Candidate {
-                                        distance,
-                                        id: id.clone(),
-                                    });
+                            let nprobe = std::env::var("NONODB_VECTOR_ANN_PROBE")
+                                .ok()
+                                .and_then(|value| value.parse::<usize>().ok())
+                                .unwrap_or(ann.nprobe as usize);
+                            let delta_ids: HashSet<&str> =
+                                delta.iter().map(|(id, _)| id.as_str()).collect();
+                            let mut heap: BinaryHeap<Candidate> = BinaryHeap::new();
+                            let search_want = want.saturating_add(delta_ids.len());
+                            for candidate in
+                                reader.search_with_nprobe(query, search_want, nprobe)?
+                            {
+                                if !delta_ids.contains(candidate.id.as_str()) {
+                                    heap.push(candidate);
                                     if heap.len() > want {
                                         heap.pop();
                                     }
                                 }
-                                return self.vector_results_from_heap(rtxn, heap, skip, limit);
                             }
+                            for (id, bytes) in &delta {
+                                if bytes.is_empty() {
+                                    continue;
+                                }
+                                let Some(distance) = vector::distance_from_bytes(
+                                    def.metric, query, query_norm, bytes, def.dims,
+                                ) else {
+                                    continue;
+                                };
+                                heap.push(Candidate {
+                                    distance,
+                                    id: id.clone(),
+                                });
+                                if heap.len() > want {
+                                    heap.pop();
+                                }
+                            }
+                            return self.vector_results_from_heap(rtxn, heap, skip, limit);
                         }
                     }
                 }
