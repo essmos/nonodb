@@ -18,6 +18,8 @@ use heed::types::Bytes;
 use heed::{Database, RoTxn, RwTxn};
 use serde_json::Value;
 
+use crate::numeric;
+
 use crate::error::{Error, Result};
 
 /// Name of the TTL sub-database.
@@ -135,6 +137,14 @@ pub enum TtlUpdate {
     Set(u64),
 }
 
+/// Parses a non-negative integer `_ttl` value, including BSON Extended JSON
+/// integers used by the MongoDB wire listener.
+fn ttl_seconds(value: &Value) -> Result<u64> {
+    numeric::integer_value(value)
+        .and_then(|seconds| u64::try_from(seconds).ok())
+        .ok_or_else(|| Error::InvalidTtl("`_ttl` must be a non-negative integer".into()))
+}
+
 /// Removes a reserved `_ttl` field from an inserted document and computes its
 /// absolute expiry. If the field is absent, `default_seconds` applies.
 pub fn take_insert_ttl(doc: &mut Value, default_seconds: Option<u64>) -> Result<Option<u64>> {
@@ -147,19 +157,14 @@ pub fn take_insert_ttl(doc: &mut Value, default_seconds: Option<u64>) -> Result<
             _ => Ok(None),
         },
         Some(Value::Null) => Ok(None),
-        Some(Value::Number(number)) => {
-            let seconds = number
-                .as_u64()
-                .ok_or_else(|| Error::InvalidTtl("`_ttl` must be a non-negative integer".into()))?;
+        Some(value) => {
+            let seconds = ttl_seconds(&value)?;
             if seconds == 0 {
                 Ok(None)
             } else {
                 Ok(Some(ttl_after(seconds)?))
             }
         }
-        Some(_) => Err(Error::InvalidTtl(
-            "`_ttl` must be a non-negative integer or null".into(),
-        )),
     }
 }
 
@@ -172,19 +177,14 @@ pub fn take_update_ttl(doc: &mut Value) -> Result<TtlUpdate> {
     match obj.remove("_ttl") {
         None => Ok(TtlUpdate::Preserve),
         Some(Value::Null) => Ok(TtlUpdate::Clear),
-        Some(Value::Number(number)) => {
-            let seconds = number
-                .as_u64()
-                .ok_or_else(|| Error::InvalidTtl("`_ttl` must be a non-negative integer".into()))?;
+        Some(value) => {
+            let seconds = ttl_seconds(&value)?;
             if seconds == 0 {
                 Ok(TtlUpdate::Clear)
             } else {
                 Ok(TtlUpdate::Set(ttl_after(seconds)?))
             }
         }
-        Some(_) => Err(Error::InvalidTtl(
-            "`_ttl` must be a non-negative integer or null".into(),
-        )),
     }
 }
 
@@ -318,5 +318,30 @@ mod tests {
             take_update_ttl(&mut doc).unwrap(),
             TtlUpdate::Set(at) if at > now_ms()
         ));
+    }
+
+    #[test]
+    fn take_insert_ttl_accepts_bson_integers() {
+        let mut doc = serde_json::json!({"_ttl": {"$numberInt": "30"}});
+        assert!(take_insert_ttl(&mut doc, None).unwrap().is_some());
+        let mut doc = serde_json::json!({"_ttl": {"$numberLong": "0"}});
+        assert!(take_insert_ttl(&mut doc, Some(10)).unwrap().is_none());
+        let mut doc = serde_json::json!({"_ttl": {"$numberLong": "30"}});
+        assert!(take_insert_ttl(&mut doc, None).unwrap().is_some());
+        let mut doc = serde_json::json!({"_ttl": {"$numberInt": "-1"}});
+        assert!(take_insert_ttl(&mut doc, None).is_err());
+    }
+
+    #[test]
+    fn take_update_ttl_accepts_bson_integers() {
+        let mut doc = serde_json::json!({"_ttl": {"$numberInt": "0"}});
+        assert_eq!(take_update_ttl(&mut doc).unwrap(), TtlUpdate::Clear);
+        let mut doc = serde_json::json!({"_ttl": {"$numberLong": "30"}});
+        assert!(matches!(
+            take_update_ttl(&mut doc).unwrap(),
+            TtlUpdate::Set(at) if at > now_ms()
+        ));
+        let mut doc = serde_json::json!({"_ttl": {"$numberInt": "-1"}});
+        assert!(take_update_ttl(&mut doc).is_err());
     }
 }

@@ -4,6 +4,13 @@ Full release notes: https://github.com/essmos/nonodb/releases
 
 ## Unreleased
 
+- Accept BSON int32/int64 `_ttl` values through the MongoDB wire listener by
+  parsing canonical Extended JSON integers in the TTL directive.
+- Validate filters inside `$facet`, `$lookup`, `$unionWith`, `$merge`
+  `whenMatched`, and `$graphLookup` sub-pipelines, so unknown operators fail
+  instead of silently returning empty results.
+- Update the Node.js MongoDB driver test for single-field text indexes.
+
 ## v0.29.0 - 2026-11-22
 
 - Add `AsyncNonoDB` to the Python client for async `watch_once`, `watch`,

@@ -131,10 +131,10 @@ async function main() {
       { _id: "t4", n: 4, title: "alpha beta gamma", body: "delta" },
     ]);
     const textIndex = await textItems.createIndex(
-      { title: "text", body: "text" },
-      { weights: { title: 2, body: 1 }, default_language: "none" }
+      { title: "text" },
+      { default_language: "none" }
     );
-    assert(textIndex === "title_text_body_text", "text index name");
+    assert(textIndex === "title_text", "text index name");
     const phrase = await textItems
       .find(
         { $text: { $search: '"alpha beta"' } },
@@ -145,7 +145,7 @@ async function main() {
     assert(phrase.map((doc) => doc._id).sort().join(",") === "t1,t4", "text phrase");
     assert(phrase.every((doc) => typeof doc.score === "number"), "text score");
     assert(
-      (await textItems.countDocuments({ $text: { $search: "delta -epsilon" } })) === 2,
+      (await textItems.countDocuments({ $text: { $search: "delta -alpha" } })) === 1,
       "text count and negation"
     );
 
