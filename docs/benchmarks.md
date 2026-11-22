@@ -1,7 +1,7 @@
 # Benchmarks
 
 This page keeps the large-scale results that matter for capacity planning:
-the **1B dense-document test** and the **BM25, fuzzy, exact, and IVF vector
+the **1B dense-document test** and the **BM25, fuzzy, and 100M IVF vector
 search** tests. Older microbenchmarks (CRUD, aggregation, vault, backup, connection
 scale) are intentionally not repeated here; they remain available in the git
 history.
@@ -13,7 +13,8 @@ filesystem, page cache, and client overhead all affect the result.
 
 | Run | Host | Filesystem | Daemon |
 |---|---|---|---|
-| 1M / 10M search and 1B dense | 16 vCPU Xeon D-2141I, 31 GiB RAM | ZFS mirror, 438 GB | `v0.27.0`, 2026-11-20 |
+| 1B dense | 16 vCPU Xeon D-2141I, 31 GiB RAM | ZFS mirror, 438 GB | `v0.27.0`, 2026-11-20 |
+| 100M ANN sidecar | 16 vCPU Xeon D-2141I, 31 GiB RAM | ZFS, 438 GB | `v0.27.0`, 2026-11-22 |
 
 Do not compare rows from different hosts as if they came from one controlled
 run. The 100M dense comparator in the 1B table comes from an older ext4 host.
@@ -111,18 +112,6 @@ already contains documents.
 ---
 
 ## Search benchmarks
-
-### Vector data sets: 1M and 10M
-
-The exact and IVF vector tests use 1M/10M collections with a 16-dimensional
-`vec` and a low-cardinality `cat`. Runs used the `NONODB_SEARCH_WORKERS=16`
-daemon with `NONODB_CACHE_TTL=0` on ZFS.
-
-| Phase | 1M time | 1M `data.mdb` delta | 10M time | 10M `data.mdb` delta |
-|---|---:|---:|---:|---:|
-| Load documents at 5,000 per batch | **15.8 s**, 63,476 docs/s | +0.25 GB | **161.0 s**, 62,123 docs/s | +2.57 GB |
-| `cat` index | 1.6 s | +0.14 GB | 17.9 s | +1.33 GB |
-| 16D vector index | 0.8 s | +0.13 GB | 10.0 s | +1.36 GB |
 
 ### Real-text check: MS MARCO
 
@@ -275,50 +264,7 @@ all trigrams and the original string. This avoids merging every posting list
 for long queries and brings the 808k full-query corpus from p50 **144.51 ms** to
 **12.07 ms**.
 
-### Exact vector search
-
-This is the exact vector fallback used for filtered queries and oversized ANN
-deltas. Both data sets use 16-dimensional vectors and `limit=10`.
-
-| Operation | 1M p50 / p95 | 10M p50 / p95 |
-|---|---:|---:|
-| Vector index build | 0.8 s | 10.0 s |
-| No filter | **45.89 / 45.89 ms** | **528.01 / 528.01 ms** |
-| Indexed `cat` filter | **84.70 / 84.70 ms** | **777.27 / 777.27 ms** |
-
-The unfiltered cost is the expected exact scan: every indexed vector is
-compared with the query. Selective `_id` and secondary-index filters use the
-index fast path; an unindexed highly selective filter can approach a full
-collection scan.
-
-### IVF vector sidecar
-
-The 1M and 10M measurements below used 512 clusters and probed 16 of them.
-Queries scan the probed clusters in parallel. Both data sets use 16-dimensional
-vectors and `limit=10`; latency excludes index build time.
-
-| Operation | 1M p50 / p95 / p99 | 10M p50 / p95 / p99 |
-|---|---:|---:|
-| ANN sidecar build | 11.6 s | 30.5 s |
-| Sidecar file | 82 MB | 820 MB |
-| ANN query | **2.32 / 2.53 / 2.85 ms** | **9.84 / 12.10 / 12.24 ms** |
-| Exact query | **49.87 / 50.72 / 52.67 ms** | **528.01 / 528.01 ms** |
-| ANN throughput | **430 qps** | **104 qps** |
-
-The 10M sidecar was about **60× faster at p50** than the exact scan, and the
-1M sidecar about **23× faster**. A 20-query sample on 10M reached recall@10 of
-**1.0** against the exact index. Recall is data-dependent, so validate with
-representative queries before relying on approximate results. IVF assignment is
-parallelized, cutting the 10M build from 236 s to 30.5 s and the 1M build from
-38.7 s to 11.6 s.
-
-Vector updates are stored in a small LMDB delta and merged into unfiltered ANN
-queries, so a few updates do not force a 528 ms exact scan. After changing one
-of the 10M vectors, ANN p50 remained **9.77 ms** (p95 **12.01 ms**). After 4,096
-changed ids the query falls back to exact LMDB until the sidecar is rebuilt.
-Filtered vector searches deliberately use the exact path.
-
-### 100M ANN sidecar
+### IVF vector sidecar (100M)
 
 The 100M collection (`search100m`, 16 dimensions) uses the v2 ANN sidecar with
 **4,096 clusters**, `nprobe=2`, and a checkpoint every 256 records. The sidecar
@@ -382,8 +328,9 @@ mandatory in the v3 format; there is no positions-off mode.
   every hit. Multi-term and filtered queries still need WAND or ID-range
   sharding for larger gains.
 - **Vector search scales with the sidecar.** The exact path is CPU and I/O bound
-  because it scans every vector. The optional IVF sidecar cuts 10M p50 from
-  about 528 ms to under 10 ms; filtered queries and oversized deltas still use exact scans.
+  because it scans every vector. On 100M vectors the sidecar cuts exact p50 from
+  about 468 ms to **5.35 ms** at the reader and **6.30 ms** through the daemon;
+  filtered queries and oversized deltas still use exact scans.
 - **RSS is not heap.** Large RSS values after scans mostly reflect mapped LMDB
   pages.
 
@@ -416,17 +363,10 @@ Then run the relevant script:
 NONODB_SOCK=$S NONODB_TIMEOUT=1800 \
   python3 scripts/dense_bench.py --docs 1000000000 --batch 20000
 
-# Build the optional vector ANN sidecar at daemon startup
-NONODB_BUILD_VECTOR_ANN=1 NONODB_VECTOR_ANN_PROBE=16 \
-NONODB_VECTOR_ANN_COLLECTIONS=search1m,search10m nonodb-daemon
-
-# Optional: override the IVF cluster cap for a very large collection
-NONODB_BUILD_VECTOR_ANN=1 NONODB_VECTOR_ANN_CLUSTERS=4096 \
+# Build the optional 100M vector ANN sidecar at daemon startup
+NONODB_BUILD_VECTOR_ANN=1 NONODB_VECTOR_ANN_PROBE=2 \
+NONODB_VECTOR_ANN_CLUSTERS=4096 \
 NONODB_VECTOR_ANN_COLLECTIONS=search100m nonodb-daemon
-
-# 1M and 10M search benchmarks
-NONODB_SOCK=$S python3 scripts/search_scale_bench.py --docs 1000000 --collection search1m
-NONODB_SOCK=$S python3 scripts/search_scale_bench.py --docs 10000000 --collection search10m
 
 # Real MS MARCO passages (download collection.tsv and queries.train.tsv first)
 NONODB_SOCK=$S python3 scripts/load_msmarco.py collection.tsv \
