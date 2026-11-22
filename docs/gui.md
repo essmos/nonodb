@@ -276,6 +276,7 @@ selected collection's **Metrics** tab, not on the dashboard.
   `<NONODB_DATA>/restic-repo`, so the daemon can write them without root;
 - optional age encryption for native destinations, or restic-managed
   encryption and deduplication;
+- search sidecars are included by default and encrypted when age is enabled;
 - one-time age key or restic password generation; private key material is never
   displayed or editable in the GUI;
 - interval schedule in minutes, retention count, and deep verification;

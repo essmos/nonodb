@@ -260,6 +260,12 @@ pub fn verify_backup(backup_dir: impl AsRef<Path>) -> Result<BackupVerification>
         fs::create_dir_all(&temp)?;
         let result = (|| {
             crate::backup_compress::gunzip_file(&data, &temp.join(DATA_FILE))?;
+            for name in ["search", "vector-ann"] {
+                let from = dir.join(name);
+                if from.is_dir() {
+                    copy_dir(&from, &temp.join(name))?;
+                }
+            }
             verify_data_dir(&temp)
         })();
         let _ = fs::remove_dir_all(&temp);
@@ -274,7 +280,16 @@ pub fn verify_backup(backup_dir: impl AsRef<Path>) -> Result<BackupVerification>
 
 /// Deep verification of a database or backup directory.
 pub fn verify_data_dir(path: impl AsRef<Path>) -> Result<VerificationReport> {
-    let path = path.as_ref();
+    verify_data_dir_inner(path.as_ref(), false)
+}
+
+/// Deep verification that tolerates snapshots whose derived search sidecars
+/// were intentionally omitted, for example filtered backups.
+pub fn verify_data_dir_allow_missing_search(path: impl AsRef<Path>) -> Result<VerificationReport> {
+    verify_data_dir_inner(path.as_ref(), true)
+}
+
+fn verify_data_dir_inner(path: &Path, allow_missing_search: bool) -> Result<VerificationReport> {
     let store = Store::open_read_only(path)?;
     let rtxn = store.read_txn()?;
     let meta = store
@@ -303,7 +318,7 @@ pub fn verify_data_dir(path: impl AsRef<Path>) -> Result<VerificationReport> {
         let collection = store.collection_at(&rtxn, &name)?.ok_or_else(|| {
             Error::Query(format!("collection `{name}` is registered but missing"))
         })?;
-        let report = collection.verify_in(&rtxn)?;
+        let report = collection.verify_in_options(&rtxn, allow_missing_search)?;
         documents += report.documents;
         bytes += report.bytes;
         secondary_index_entries += report.indexes.iter().map(|i| i.entries).sum::<u64>();
@@ -330,6 +345,21 @@ pub fn verify_data_dir(path: impl AsRef<Path>) -> Result<VerificationReport> {
         history_entries,
         ttl_entries,
     })
+}
+
+fn copy_dir(source: &Path, target: &Path) -> Result<()> {
+    fs::create_dir_all(target)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = target.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir(&from, &to)?;
+        } else if entry.file_type()?.is_file() {
+            fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
 }
 
 fn optional_entries(env: &heed::Env, rtxn: &heed::RoTxn<'_>, name: &str) -> Result<u64> {

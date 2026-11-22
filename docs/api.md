@@ -3013,9 +3013,10 @@ Example job:
 
 `compression` may be `none` (default) or `gzip`. It applies to native local/S3
 jobs and runs before optional age encryption. Restic manages its own
-compression. `include_search_sidecars` copies segment text/fuzzy and vector ANN
-sidecars alongside the LMDB snapshot; it cannot be combined with
-`exclude_collections` or age encryption. `databases` selects one or more databases for the job. The legacy `database`
+compression. `include_search_sidecars` defaults to `true` and copies segment
+text/fuzzy and vector ANN sidecars alongside the LMDB snapshot. Age encryption
+encrypts each sidecar file too; `exclude_collections` disables sidecar copies.
+`databases` selects one or more databases for the job. The legacy `database`
 field is still accepted for existing configs; when both are present, `databases`
 wins. `exclude_collections` removes those collections from every selected
 database copy, including their indexes, history, TTL, events, and subscription

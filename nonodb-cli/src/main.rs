@@ -572,7 +572,7 @@ fn run() -> Result<(), String> {
                 args.get(2)
                     .ok_or("użycie: nonodb-cli backup <data-dir> <out-dir>")?,
             );
-            let with_sidecars = args.iter().any(|arg| arg == "--with-search-sidecars");
+            let with_sidecars = !args.iter().any(|arg| arg == "--without-search-sidecars");
             let source = database_dir(&data)?;
             backup(&source, &out, with_sidecars)?;
             let manifest = nonodb_core::BackupManifest::from_backup(&out, &source)
@@ -594,7 +594,7 @@ fn run() -> Result<(), String> {
                 args.get(2)
                     .ok_or("użycie: nonodb-cli backup-all <data-root> <out-dir>")?,
             );
-            let with_sidecars = args.iter().any(|arg| arg == "--with-search-sidecars");
+            let with_sidecars = !args.iter().any(|arg| arg == "--without-search-sidecars");
             backup_all(&data, &out, with_sidecars)?;
         }
         "restore-all" => {
@@ -696,9 +696,9 @@ fn usage() -> Result<(), String> {
          map                        rozmiar mapy LMDB i zajęte bajty\n\
          sync                       wymuś fsync wybranej bazy\n\
          resize <rozmiar>           powiększ mapę online, np. 4GiB\n\
-         backup <data> <out> [--with-search-sidecars]  kopia wybranej bazy (--db) + manifest.json\n\
+         backup <data> <out> [--without-search-sidecars]  kopia wybranej bazy (--db) + manifest.json\n\
          backup-keygen <plik>      generuje parę kluczy age do backupów\n\
-         backup-all <data> <out> [--with-search-sidecars]  kopia wszystkich baz + manifest instancji\n\
+         backup-all <data> <out> [--without-search-sidecars]  kopia wszystkich baz + manifest instancji\n\
          verify <data> [--json]     głęboka weryfikacja wybranej bazy i indeksów\n\
          verify-backup <backup> [--json]  sprawdź manifest, sumę SHA-256 i zawartość\n\
          inspect <data> [coll]      statystyki bazy/kolekcji (--db wybiera bazę)\n\
@@ -1726,7 +1726,11 @@ fn copy_tree(source: &Path, target: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn restore_search_sidecars(source: &Path, target: &Path) -> Result<(), String> {
+fn restore_search_sidecars(
+    source: &Path,
+    target: &Path,
+    identity: Option<&str>,
+) -> Result<(), String> {
     for name in ["search", "vector-ann"] {
         let from = source.join(name);
         if !from.is_dir() {
@@ -1734,8 +1738,39 @@ fn restore_search_sidecars(source: &Path, target: &Path) -> Result<(), String> {
         }
         let to = target.join(name);
         let _ = std::fs::remove_dir_all(&to);
-        copy_tree(&from, &to)?;
+        restore_tree(&from, &to, identity)?;
         eprintln!("restore sidecars: {} -> {}", from.display(), to.display());
+    }
+    Ok(())
+}
+
+fn restore_tree(source: &Path, target: &Path, identity: Option<&str>) -> Result<(), String> {
+    std::fs::create_dir_all(target).map_err(|e| e.to_string())?;
+    for entry in std::fs::read_dir(source).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let from = entry.path();
+        let ty = entry.file_type().map_err(|e| e.to_string())?;
+        if ty.is_dir() {
+            restore_tree(&from, &target.join(entry.file_name()), identity)?;
+        } else if ty.is_file() {
+            if from.extension().is_some_and(|extension| extension == "age") {
+                let identity = identity.ok_or_else(|| {
+                    format!(
+                        "encrypted sidecar {} requires NONODB_BACKUP_IDENTITY_FILE",
+                        from.display()
+                    )
+                })?;
+                let to = target.join(
+                    from.file_stem()
+                        .ok_or_else(|| format!("invalid sidecar name: {}", from.display()))?,
+                );
+                nonodb_core::backup_crypto::decrypt_file(&from, &to, identity)
+                    .map_err(|e| format!("decrypt sidecar {}: {e}", from.display()))?;
+            } else {
+                let to = target.join(entry.file_name());
+                std::fs::copy(&from, &to).map_err(|e| format!("copy {}: {e}", from.display()))?;
+            }
+        }
     }
     Ok(())
 }
@@ -1836,7 +1871,7 @@ fn restore_into(backup: &Path, data: &Path, force: bool, verify: bool) -> Result
     let raw = data.join(format!(".restore-source.tmp.{}", std::process::id()));
     let _ = std::fs::remove_file(&tmp);
     let _ = std::fs::remove_file(&raw);
-    if encrypted {
+    let identity = if encrypted {
         let key_path = std::env::var_os("NONODB_BACKUP_IDENTITY_FILE")
             .map(PathBuf::from)
             .ok_or("encrypted backup requires NONODB_BACKUP_IDENTITY_FILE")?;
@@ -1844,9 +1879,11 @@ fn restore_into(backup: &Path, data: &Path, force: bool, verify: bool) -> Result
             nonodb_core::backup_crypto::read_key_file(&key_path).map_err(|e| e.to_string())?;
         nonodb_core::backup_crypto::decrypt_file(&src, &raw, &identity)
             .map_err(|e| e.to_string())?;
+        Some(identity)
     } else {
         std::fs::copy(&src, &raw).map_err(|e| e.to_string())?;
-    }
+        None
+    };
     let plain = if compressed {
         nonodb_core::backup_compress::gunzip_file(&raw, &tmp)
             .map_err(|e| format!("decompress backup: {e}"))?;
@@ -1883,11 +1920,18 @@ fn restore_into(backup: &Path, data: &Path, force: bool, verify: bool) -> Result
     let file = std::fs::File::open(&dst).map_err(|e| e.to_string())?;
     let _ = file.sync_all();
     if backup.is_dir() {
-        restore_search_sidecars(backup, data)?;
+        restore_search_sidecars(backup, data, identity.as_deref())?;
     }
     eprintln!("restore: {} -> {}", src.display(), dst.display());
     if verify {
-        let report = nonodb_core::verify_data_dir(data).map_err(|e| e.to_string())?;
+        let has_sidecars = ["search", "vector-ann"]
+            .iter()
+            .any(|name| backup.join(name).is_dir());
+        let report = if has_sidecars {
+            nonodb_core::verify_data_dir(data).map_err(|e| e.to_string())?
+        } else {
+            nonodb_core::verify_data_dir_allow_missing_search(data).map_err(|e| e.to_string())?
+        };
         print_report(&report);
     }
     Ok(())

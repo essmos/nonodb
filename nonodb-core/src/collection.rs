@@ -3161,9 +3161,9 @@ impl<'e> Collection<'e> {
     ) -> Result<()> {
         let Some((mut documents, mut total_doc_len)) = self.segment_stats_in(&*wtxn, &def.name)?
         else {
-            // Existing segment indexes created before live statistics were
-            // introduced keep the segment-sum fallback until an explicit
-            // `rebuild_segment_text_stats()` run.
+            // Direct core API callers may open an index before the daemon's
+            // startup statistics pass; keep the segment-sum fallback for that
+            // case.
             return Ok(());
         };
         let mut changes: HashMap<String, i64> = HashMap::new();
@@ -3519,8 +3519,8 @@ impl<'e> Collection<'e> {
     }
 
     /// Fills exact live BM25 statistics for segment text indexes that do not
-    /// have them yet. Existing indexes keep the approximate fallback until this
-    /// runs. Returns the number of indexes initialized.
+    /// have them yet. The daemon calls this at startup. Returns the number of
+    /// indexes initialized.
     pub fn ensure_segment_text_stats(&self) -> Result<usize> {
         let defs = {
             let rtxn = self.read_txn()?;
@@ -3552,9 +3552,6 @@ impl<'e> Collection<'e> {
     }
 
     /// Recomputes exact live BM25 statistics for every segment-backed text index.
-    ///
-    /// Existing indexes created before live statistics were introduced keep
-    /// using the approximate fallback until this runs or until their next write.
     pub fn rebuild_segment_text_stats(&self) -> Result<usize> {
         let defs = {
             let rtxn = self.read_txn()?;
@@ -7901,6 +7898,14 @@ impl<'e> Collection<'e> {
 
     /// Deep-checks documents and all index structures in a read transaction.
     pub fn verify_in(&self, rtxn: &RoTxn<'_>) -> Result<CollectionVerification> {
+        self.verify_in_options(rtxn, false)
+    }
+
+    pub fn verify_in_options(
+        &self,
+        rtxn: &RoTxn<'_>,
+        allow_missing_search: bool,
+    ) -> Result<CollectionVerification> {
         let defs = self.index_defs(rtxn)?;
         let search_defs = self.search_index_defs_in(rtxn)?;
         let text_names: Vec<String> = search_defs
@@ -8061,7 +8066,7 @@ impl<'e> Collection<'e> {
             match def.kind {
                 SearchKind::Text => {
                     let Some(manifest) = self.segment_manifest_in(rtxn, &def.name)? else {
-                        if documents == 0 {
+                        if documents == 0 || allow_missing_search {
                             continue;
                         }
                         return Err(Error::Query(format!(
@@ -8072,6 +8077,9 @@ impl<'e> Collection<'e> {
                     for rel in &manifest.segments {
                         let path = root.join(rel);
                         if !path.is_file() {
+                            if allow_missing_search {
+                                continue;
+                            }
                             return Err(Error::Query(format!(
                                 "segment text index `{}` on `{}` is missing `{}`",
                                 def.name,
@@ -8091,7 +8099,7 @@ impl<'e> Collection<'e> {
                 }
                 SearchKind::Fuzzy => {
                     let Some(manifest) = self.fuzzy_segment_manifest_in(rtxn, &def.name)? else {
-                        if documents == 0 {
+                        if documents == 0 || allow_missing_search {
                             continue;
                         }
                         return Err(Error::Query(format!(
@@ -8102,6 +8110,11 @@ impl<'e> Collection<'e> {
                     for (segment, values) in manifest.segments.iter().zip(&manifest.values) {
                         let segment_path = root.join(segment);
                         let values_path = root.join(values);
+                        if allow_missing_search
+                            && (!segment_path.is_file() || !values_path.is_file())
+                        {
+                            continue;
+                        }
                         for path in [&segment_path, &values_path] {
                             if !path.is_file() {
                                 return Err(Error::Query(format!(

@@ -588,7 +588,7 @@ function defaultBackupForm(
     keep_last: '14',
     verify: true,
     exclude_collections: [],
-    include_search_sidecars: false,
+    include_search_sidecars: true,
   };
 }
 
@@ -611,7 +611,7 @@ function formFromBackup(item: BackupItem, keyDir?: string): BackupForm {
       keep_last: String(job.keep_last),
       verify: job.verify,
       exclude_collections: job.exclude_collections ?? [],
-      include_search_sidecars: job.include_search_sidecars ?? false,
+      include_search_sidecars: job.include_search_sidecars ?? true,
     };
   }
   if (job.destination.kind === 'restic') {
@@ -632,7 +632,7 @@ function formFromBackup(item: BackupItem, keyDir?: string): BackupForm {
       keep_last: String(job.keep_last),
       verify: job.verify,
       exclude_collections: job.exclude_collections ?? [],
-      include_search_sidecars: job.include_search_sidecars ?? false,
+      include_search_sidecars: job.include_search_sidecars ?? true,
     };
   }
   return {
@@ -656,7 +656,7 @@ function formFromBackup(item: BackupItem, keyDir?: string): BackupForm {
     keep_last: String(job.keep_last),
     verify: job.verify,
     exclude_collections: job.exclude_collections ?? [],
-    include_search_sidecars: job.include_search_sidecars ?? false,
+    include_search_sidecars: job.include_search_sidecars ?? true,
   };
 }
 
@@ -1064,7 +1064,7 @@ function BackupsPage({ connection }: { connection: Connection }) {
                     {item.job.encryption ? ' · encrypted (age)' : ' · unencrypted'}
                     {item.job.compression === 'gzip' ? ' · gzip' : ''}
                     {item.job.destination.kind === 'restic' ? ' · restic compression' : ''}
-                    {item.job.include_search_sidecars ? ' · search sidecars' : ''}
+                    {item.job.include_search_sidecars && !(item.job.exclude_collections?.length) ? ' · search sidecars' : ''}
                     {item.job.exclude_collections?.length
                       ? ` · excludes ${item.job.exclude_collections.join(', ')}`
                       : ''}
@@ -1248,12 +1248,12 @@ function BackupsPage({ connection }: { connection: Connection }) {
             <input
               type="checkbox"
               checked={form.include_search_sidecars}
-              disabled={form.encrypt || form.exclude_collections.length > 0}
+              disabled={form.exclude_collections.length > 0}
               onChange={(e) => setField('include_search_sidecars', e.target.checked)}
             />{' '}
             Include search sidecars
             <span className="field-hint">
-              Copies segment and ANN files next to the LMDB snapshot. Requires no excluded collections and no age encryption.
+              Copies segment and ANN files next to the LMDB snapshot. Age-encrypted jobs encrypt the sidecars too. Excluded collections disable sidecar copies.
             </span>
           </label>
           <div className="form-wide">

@@ -28,10 +28,10 @@ app1/manifest.json
 Each database consists of an LMDB environment with documents, secondary
 indexes, vector index entries, history, TTL metadata, collection profiles, and
 database slots. Text/fuzzy postings and vector ANN data live in derived
-`search/` and `vector-ann/` sidecar files; they are not part of `data.mdb` and
-are copied only with `--with-search-sidecars`. Databases are independent: an
-instance backup is consistent per database, but it is not an atomic snapshot
-across databases. A backup does **not** include:
+`search/` and `vector-ann/` sidecar files; they are not part of `data.mdb` but
+are copied by default for native CLI and scheduled backups. Databases are
+independent: an instance backup is consistent per database, but it is not an
+atomic snapshot across databases. A backup does **not** include:
 
 - `lock.mdb` — it is recreated and is not data;
 - `auth.json` — authorization lives outside LMDB and is instance-wide;
@@ -97,23 +97,22 @@ than the live `data.mdb`. The copied database file is synced before the command
 exits, then `manifest.json` is written. Creating a backup is I/O-heavy on large
 databases; schedule it like any other storage job.
 
-To include immutable search segment and vector ANN files, add
-`--with-search-sidecars`:
+Native CLI backups copy immutable search segment and vector ANN files by
+default:
 
 ```bash
-nonodb-cli backup /var/lib/nonodb /var/backups/nonodb/app1 --with-search-sidecars
-nonodb-cli backup-all /var/lib/nonodb /var/backups/nonodb/$TS --with-search-sidecars
+nonodb-cli backup /var/lib/nonodb /var/backups/nonodb/app1
+nonodb-cli backup-all /var/lib/nonodb /var/backups/nonodb/$TS
 ```
 
-The option copies `search/` and `vector-ann/` after the compacted `data.mdb`
-snapshot. The files are content-addressed and immutable, so a restore can use
-them directly instead of rebuilding large indexes. The manifest still covers
-`data.mdb`; sidecars are derived data and are not independently checksummed.
-`restore` copies sidecars automatically when they are present in the backup
-directory and replaces any existing sidecar tree. Sidecars can contain indexed
-terms, document ids, and vectors: they are **not encrypted by the LMDB backup
-encryption path**, so omit this option for encrypted backups or protect the
-backup directory accordingly.
+Use `--without-search-sidecars` to omit them. Sidecar copies are written after
+the compacted `data.mdb` snapshot. The files are content-addressed and
+immutable, so a restore can use them directly instead of rebuilding large
+indexes. The manifest still covers `data.mdb`; sidecars are derived data and
+are not independently checksummed. `restore` copies sidecars automatically
+when they are present in the backup directory and replaces any existing
+sidecar tree. Age-encrypted native jobs encrypt each sidecar file with the same
+recipient as `data.mdb`; restic encrypts the whole repository.
 
 Do not run an external `backup` or `inspect` process at the same time as an
 online `resize_map` operation. Finish the resize first.
@@ -204,17 +203,18 @@ age encryption, so encrypted compressed copies use `data.mdb.gz.age`. Restic
 compresses its own repository data, so the compression field applies only to
 native local/S3 jobs.
 
-Set `include_search_sidecars` to `true` to copy immutable segment text/fuzzy
-and vector ANN sidecars next to `data.mdb`. This avoids rebuilding large search
-indexes after a local restore; `nonodb-cli restore` copies the sidecar
-directories automatically when present. Local destinations get `search/` and
-`vector-ann/` directories, S3 destinations receive the same relative object
-keys, and restic stores them in the repository. The option is intentionally
-incompatible with `exclude_collections` and age encryption: sidecars are
-derived from document data and are not encrypted by the LMDB payload
-encryption. Use restic when encrypted sidecar backups are required. A sidecar
-may be missing if compaction removes it after the LMDB snapshot; the restored
-index then falls back to a rebuild.
+Scheduled jobs copy immutable segment text/fuzzy and vector ANN sidecars by
+default (`include_search_sidecars` defaults to `true`) next to `data.mdb`. This
+avoids rebuilding large search indexes after a local restore; `nonodb-cli
+restore` copies the sidecar directories automatically when present. Local
+destinations get `search/` and `vector-ann/` directories, S3 destinations
+receive the same relative object keys, and restic stores them in the
+repository. Age-encrypted jobs encrypt every sidecar file with the same
+recipient as the LMDB payload. `exclude_collections` disables sidecar copies,
+because a filtered snapshot no longer matches the derived index files; those
+restored indexes are rebuilt. A sidecar may also be missing if compaction
+removes it after the LMDB snapshot; the restored index then falls back to a
+rebuild.
 
 The **Databases** field is a multi-select list of databases known to the daemon.
 One job can back up several databases in one run. **Excluded collections** are
@@ -453,9 +453,10 @@ gzip/age/partial status, and the optional `backup-info.txt`. Import then:
 2. verifies size and SHA-256;
 3. decrypts age with `NONODB_BACKUP_IDENTITY_FILE` when needed;
 4. decompresses gzip when needed;
-5. verifies the LMDB database deeply;
-6. installs it as the requested new database name;
-7. refuses to overwrite an existing database.
+5. verifies the LMDB database deeply while allowing omitted derived sidecars;
+6. rebuilds any missing search sidecars from the documents;
+7. installs it as the requested new database name;
+8. refuses to overwrite an existing database.
 
 For Docker, local import folders must be mounted into the container. S3/R2
 import does not require a mount. The import API is admin-only and accepts local
@@ -548,11 +549,10 @@ Rules:
 - `restore-all` restores only databases listed in the instance manifest;
   unrelated database directories are left untouched.
 - Ensure the restored files are owned by the daemon user.
-- By default, backups contain only LMDB. Text/fuzzy segment files and vector ANN
-  sidecars are derived data and are not part of `data.mdb`; use
-  `--with-search-sidecars` to include them. Deep `verify-backup` needs those
-  sidecars to validate text and fuzzy indexes; include them when verification
-  is part of the backup policy.
+- By default, backups include text/fuzzy segment files and vector ANN sidecars
+  even though they are not part of `data.mdb`. Use `--without-search-sidecars`
+  to omit them. Deep `verify-backup` needs those sidecars to validate text and
+  fuzzy indexes.
 
 ### Search sidecars after restore
 

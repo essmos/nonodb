@@ -388,8 +388,10 @@ manifest: ./backup/manifest.json (sha256 ...)
 - `CompactionOption::Enabled` omits free pages, so the backup is usually smaller
   than the live `data.mdb`.
 - The output directory is created if needed.
-- Only the selected database's `data.mdb` is copied. `lock.mdb` is not part of
-  the backup.
+- The selected database's `data.mdb` is copied. `lock.mdb` is not part of the
+  backup.
+- Search sidecars (`search/`, `vector-ann/`) are copied by default; use
+  `--without-search-sidecars` to omit them.
 - The copy is synced to disk before the command exits.
 - `manifest.json` records the source, timestamp, file size, and SHA-256.
 
@@ -409,10 +411,10 @@ Back up every database under an instance root:
 nonodb-cli backup-all /var/lib/nonodb /var/backups/nonodb/instance
 ```
 
-It writes `instance/manifest.json` plus `<database>/data.mdb` and
-`<database>/manifest.json` for each database. Each database copy is consistent
-on its own, but the set is not atomic across databases. The auth registry is
-not copied.
+It writes `instance/manifest.json` plus `<database>/data.mdb`,
+`<database>/manifest.json`, and search sidecars for each database. Each database
+copy is consistent on its own, but the set is not atomic across databases. The
+auth registry is not copied. Use `--without-search-sidecars` to omit sidecars.
 
 ## restore-all
 

@@ -352,7 +352,8 @@ impl ImportManager {
         }
 
         let data = prepare_payload(&staging, &manifest, &payload)?;
-        verify::verify_data_dir(&staging).map_err(|e| format!("verify imported database: {e}"))?;
+        verify::verify_data_dir_allow_missing_search(&staging)
+            .map_err(|e| format!("verify imported database: {e}"))?;
         self.databases
             .import_database(&request.target_database, &data)
             .await

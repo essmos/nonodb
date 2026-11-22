@@ -11,6 +11,13 @@ Full release notes: https://github.com/essmos/nonodb/releases
   field, and MongoDB-style multi-field text keys and non-default weights are
   rejected. Rebuild or drop old search indexes before upgrading. Scheduled and
   CLI backups that include search sidecars still work.
+- Fill missing exact BM25 statistics automatically at daemon startup instead of
+  waiting for `NONODB_REBUILD_SEARCH_STATS=1`. The variable now supports
+  `force` for a full recompute and `0` to disable the automatic fill.
+- Include search sidecars in native CLI and scheduled backups by default.
+  CLI backups accept `--without-search-sidecars`; scheduled jobs use
+  `include_search_sidecars: false`. Age-encrypted jobs encrypt each sidecar
+  file with the same recipient as the LMDB payload.
 - Add `NONODB_VECTOR_ANN_CLUSTERS` (up to 8,192) to tune IVF cluster count for
   very large vector collections. The default remains 512.
 - Skip empty IVF clusters when probing, so repetitive or very large vector

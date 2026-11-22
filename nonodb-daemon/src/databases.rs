@@ -235,6 +235,13 @@ impl Databases {
             let staging = staging.clone();
             move || -> Result<(), String> {
                 let store = Store::open(&staging).map_err(|e| e.to_string())?;
+                for collection in store.collections().map_err(|e| e.to_string())? {
+                    store
+                        .collection(&collection)
+                        .map_err(|e| e.to_string())?
+                        .rebuild_missing_search_sidecars()
+                        .map_err(|e| format!("rebuild imported search sidecars: {e}"))?;
+                }
                 let env = store.env().clone();
                 drop(store);
                 env.prepare_for_closing().wait();

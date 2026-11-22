@@ -157,8 +157,8 @@ indexing, and profiling.
   keys and non-default weights are rejected.
 - Legacy LMDB text/fuzzy indexes are no longer read. Drop and recreate them as
   segment indexes before upgrading.
-- Sidecar backups are not supported with age encryption; use the restic engine
-  when encrypted sidecar backups are required.
+- Sidecar copies are skipped when collections are excluded; restore those
+  indexes by rebuilding them.
 - `insert_many` is a single request but is not the guaranteed all-or-nothing
   primitive; use `write_batch` for atomic groups.
 - Changing `_id` through update operators is unsupported; treat `_id` as

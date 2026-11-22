@@ -22,6 +22,10 @@ use crate::databases::{validate_name as validate_database_name, Databases};
 
 pub const CONFIG_VERSION: u32 = 1;
 
+fn default_include_search_sidecars() -> bool {
+    true
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BackupConfig {
@@ -65,7 +69,7 @@ pub struct BackupJob {
     pub compression: Compression,
     /// Copy immutable search segment and vector ANN sidecars next to the
     /// LMDB snapshot. This keeps large indexes from being rebuilt on restore.
-    #[serde(default)]
+    #[serde(default = "default_include_search_sidecars")]
     pub include_search_sidecars: bool,
     /// Collections removed from the backup copy. The live database is not
     /// modified.
@@ -347,20 +351,6 @@ fn validate_config(config: &BackupConfig) -> Result<(), String> {
             if name.is_empty() || name.len() > 200 || name.contains('\0') {
                 return Err(format!(
                     "backup job `{}` has an invalid excluded collection name",
-                    job.id
-                ));
-            }
-        }
-        if job.include_search_sidecars {
-            if !job.exclude_collections.is_empty() {
-                return Err(format!(
-                    "backup job `{}` cannot include search sidecars while excluding collections",
-                    job.id
-                ));
-            }
-            if job.encryption.is_some() {
-                return Err(format!(
-                    "backup job `{}` cannot include unencrypted search sidecars with age encryption",
                     job.id
                 ));
             }
@@ -750,7 +740,7 @@ impl BackupManager {
                 .map_err(|e| format!("backup filter task: {e}"))??;
         }
 
-        let sidecar_files = if job.include_search_sidecars {
+        let mut sidecar_files = if job.include_search_sidecars && !filtering {
             let source = self.databases.root().join(database);
             let target = staging.clone();
             tokio::task::spawn_blocking(move || copy_search_sidecars(&source, &target))
@@ -760,6 +750,18 @@ impl BackupManager {
             Vec::new()
         };
 
+        let verify_staging = |staging: &Path| -> Result<(), String> {
+            if filtering {
+                verify::verify_data_dir_allow_missing_search(staging)
+                    .map(|_| ())
+                    .map_err(|e| format!("verify: {e}"))
+            } else {
+                verify::verify_data_dir(staging)
+                    .map(|_| ())
+                    .map_err(|e| format!("verify: {e}"))
+            }
+        };
+
         if let Destination::Restic {
             repository,
             password_file,
@@ -767,7 +769,7 @@ impl BackupManager {
         } = &job.destination
         {
             if job.verify {
-                verify::verify_data_dir(&staging).map_err(|e| format!("verify: {e}"))?;
+                verify_staging(&staging)?;
             }
             let size = std::fs::metadata(&plain).map_err(|e| e.to_string())?.len();
             let repo = repository.clone();
@@ -814,7 +816,7 @@ impl BackupManager {
         manifest.excluded_collections = job.exclude_collections.clone();
         verify::write_manifest(&staging, &manifest).map_err(|e| e.to_string())?;
         if job.verify {
-            verify::verify_backup(&staging).map_err(|e| format!("verify: {e}"))?;
+            verify_staging(&staging)?;
         }
 
         if job.compression == Compression::Gzip {
@@ -847,6 +849,16 @@ impl BackupManager {
                 .len();
             let enc_sha = verify::sha256_file(&encrypted).map_err(|e| e.to_string())?;
             std::fs::remove_file(&source).map_err(|e| e.to_string())?;
+            if !sidecar_files.is_empty() {
+                let staging_path = staging.clone();
+                let files = sidecar_files.clone();
+                let recipient = recipient.clone();
+                sidecar_files = tokio::task::spawn_blocking(move || {
+                    encrypt_search_sidecars(&staging_path, &files, &recipient)
+                })
+                .await
+                .map_err(|e| format!("backup sidecar encryption task: {e}"))??;
+            }
             if manifest.plain_sha256.is_none() {
                 manifest.plain_sha256 = Some(manifest.sha256.clone());
                 manifest.plain_size = Some(manifest.data_size);
@@ -984,6 +996,25 @@ fn copy_search_sidecars(source: &Path, target: &Path) -> Result<Vec<PathBuf>, St
         copy_tree_rel(&from, &to, Path::new(name), &mut files)?;
     }
     Ok(files)
+}
+
+fn encrypt_search_sidecars(
+    source: &Path,
+    files: &[PathBuf],
+    recipient: &str,
+) -> Result<Vec<PathBuf>, String> {
+    let mut encrypted = Vec::with_capacity(files.len());
+    for relative in files {
+        let from = source.join(relative);
+        let encrypted_relative = PathBuf::from(format!("{}.age", relative.to_string_lossy()));
+        let to = source.join(&encrypted_relative);
+        backup_crypto::encrypt_file(&from, &to, recipient)
+            .map_err(|e| format!("encrypt sidecar {}: {e}", from.display()))?;
+        std::fs::remove_file(&from)
+            .map_err(|e| format!("remove plaintext sidecar {}: {e}", from.display()))?;
+        encrypted.push(encrypted_relative);
+    }
+    Ok(encrypted)
 }
 
 fn copy_tree_rel(
@@ -1364,14 +1395,37 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_backups_reject_exclusions_and_age_encryption() {
+    fn sidecars_can_be_encrypted_for_age_backups() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("search/abc")).unwrap();
+        std::fs::write(root.join("search/abc/seg-000000.seg"), b"segment").unwrap();
+        let (identity, recipient) = backup_crypto::generate_keypair();
+        let encrypted = encrypt_search_sidecars(
+            root,
+            &[PathBuf::from("search/abc/seg-000000.seg")],
+            &recipient,
+        )
+        .unwrap();
+        assert_eq!(
+            encrypted,
+            vec![PathBuf::from("search/abc/seg-000000.seg.age")]
+        );
+        assert!(!root.join("search/abc/seg-000000.seg").exists());
+        let decrypted = root.join("search/abc/decrypted.seg");
+        backup_crypto::decrypt_file(&root.join(&encrypted[0]), &decrypted, &identity).unwrap();
+        assert_eq!(std::fs::read(decrypted).unwrap(), b"segment");
+    }
+
+    #[test]
+    fn sidecar_backups_allow_exclusions_and_age_encryption() {
         let mut with_excluded = job(true);
         with_excluded.exclude_collections = vec!["private".into()];
         assert!(validate_config(&BackupConfig {
             version: CONFIG_VERSION,
             jobs: vec![with_excluded],
         })
-        .is_err());
+        .is_ok());
 
         let mut with_age = job(true);
         with_age.encryption = Some(Encryption::Age {
@@ -1381,12 +1435,21 @@ mod tests {
             version: CONFIG_VERSION,
             jobs: vec![with_age],
         })
-        .is_err());
+        .is_ok());
 
         assert!(validate_config(&BackupConfig {
             version: CONFIG_VERSION,
             jobs: vec![job(true)],
         })
         .is_ok());
+    }
+
+    #[test]
+    fn sidecars_are_enabled_by_default_in_backup_jobs() {
+        let raw = serde_json::to_value(job(false)).unwrap();
+        let mut object = raw.as_object().unwrap().clone();
+        object.remove("include_search_sidecars");
+        let parsed: BackupJob = serde_json::from_value(serde_json::Value::Object(object)).unwrap();
+        assert!(parsed.include_search_sidecars);
     }
 }

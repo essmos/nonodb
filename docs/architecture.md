@@ -616,11 +616,11 @@ immediately force a full exact scan. Once the delta exceeds 4,096 changed ids,
 queries fall back to the exact path; rebuilding the sidecar clears the delta.
 Filtered queries also use the exact path, because applying a filter after
 approximate candidate selection could miss matching documents. Dropping or
-reindexing the vector index removes the sidecar and delta. Backups contain only
-LMDB by default; `backup --with-search-sidecars` includes the immutable segment
-and ANN files. Replication snapshot bootstrap fetches the files referenced by
-the snapshot from the source and falls back to rebuilding missing indexes after
-a restore or interrupted transfer.
+reindexing the vector index removes the sidecar and delta. Backups include the
+immutable segment and ANN files by default; `--without-search-sidecars` omits
+them. Replication snapshot bootstrap fetches the files referenced by the
+snapshot from the source and falls back to rebuilding missing indexes after a
+restore or interrupted transfer.
 
 The sidecar is approximate: recall depends on the number of clusters, `nprobe`,
 and data distribution. The 10M benchmark sample reached recall@10 of 1.0 with
@@ -665,9 +665,9 @@ Current limits:
 - BM25 document count, average length, and per-term document frequency are
   maintained as exact live statistics in LMDB. Updates and deletes adjust the
   counts transactionally, so tombstoned versions and old duplicate documents do
-  not inflate scores. Indexes created before live statistics existed use the
-  old segment-sum fallback until `NONODB_REBUILD_SEARCH_STATS=1` fills the
-  missing statistics at startup; use `force` to recompute every index;
+  not inflate scores. Missing statistics in indexes created by older releases
+  are filled automatically at daemon startup; set
+  `NONODB_REBUILD_SEARCH_STATS=force` to recompute every index;
 - fuzzy search uses a segment-native trigram index and value sidecar; indexed
   filters use the candidate-set fast path, and compound or non-indexed filters
   verify the fetched candidate documents;
@@ -675,8 +675,8 @@ Current limits:
   is triggered by the tombstone ratio and rewrites the complete index.
 
 Dropping the index removes its manifest, delta keys, and segment directory.
-Backups contain only LMDB by default; optional sidecar backup and replication
-bootstrap can transfer the immutable files without a rebuild.
+Backups include sidecars by default, and replication bootstrap transfers the
+immutable files without a rebuild.
 
 ## Concurrency and consistency
 

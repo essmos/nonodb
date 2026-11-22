@@ -317,6 +317,14 @@ def main() -> int:
             assert "orders" in report["collections"], report["collections"]
             assert "secret" not in report["collections"], report["collections"]
 
+            assert (
+                client.post(
+                    "/v1/exec",
+                    headers=headers,
+                    json={"op": "create_text_index", "coll": "orders", "field": "x"},
+                ).status_code
+                == 200
+            )
             plain_gzip_root = temp / "plain-gzip"
             plain_gzip_job = {
                 "id": "plain-gzip",
@@ -354,6 +362,56 @@ def main() -> int:
             )
             gzip_report = json.loads(run_cli(auth_file, "verify", str(restored_gzip), "--json"))
             assert "orders" in gzip_report["collections"], gzip_report["collections"]
+
+            encrypted_sidecar_root = temp / "encrypted-sidecars"
+            encrypted_sidecar_job = {
+                "id": "encrypted-sidecars",
+                "database": "default",
+                "enabled": True,
+                "every_minutes": 1440,
+                "destination": {"kind": "local", "path": str(encrypted_sidecar_root)},
+                "encryption": {"kind": "age", "recipient_file": str(recipient_file)},
+                "keep_last": 1,
+                "verify": True,
+            }
+            assert (
+                client.post(
+                    "/v1/backups/jobs", headers=headers, json=encrypted_sidecar_job
+                ).status_code
+                == 200
+            )
+            assert client.post(
+                "/v1/backups/jobs/encrypted-sidecars/run", headers=headers
+            ).status_code == 200
+            wait_backup(client, admin, "encrypted-sidecars")
+            encrypted_sidecar_dir = sorted(
+                (encrypted_sidecar_root / "encrypted-sidecars").iterdir()
+            )[-1]
+            encrypted_sidecar_files = list(
+                (encrypted_sidecar_dir / "search").rglob("*.age")
+            )
+            assert encrypted_sidecar_files, encrypted_sidecar_dir
+            assert not list((encrypted_sidecar_dir / "search").rglob("*.seg"))
+            restored_encrypted_sidecars = temp / "restored-encrypted-sidecars"
+            restore = subprocess.run(
+                [
+                    str(CLI),
+                    "restore",
+                    str(encrypted_sidecar_dir),
+                    str(restored_encrypted_sidecars),
+                    "--force",
+                    "--verify",
+                ],
+                env=cli_env(
+                    auth_file,
+                    {"NONODB_BACKUP_IDENTITY_FILE": str(identity_file)},
+                ),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            assert restore.returncode == 0, restore.stderr
+            assert list(restored_encrypted_sidecars.rglob("*.seg"))
 
             local_source = {"kind": "local", "path": str(plain_gzip_root)}
             local_browse = client.post(
@@ -481,7 +539,7 @@ def main() -> int:
             ).status_code == 200
             wait_backup(client, admin, "s3-plain")
 
-            assert len(FakeS3.received) == 3, len(FakeS3.received)
+            assert len(FakeS3.received) >= 3, len(FakeS3.received)
             paths = [item["path"] for item in FakeS3.received]
             assert any(
                 path.startswith("/backup-bucket/prod/nonodb/s3-plain/")
@@ -493,6 +551,7 @@ def main() -> int:
                 item["authorization"].startswith("AWS4-HMAC-SHA256 ")
                 for item in FakeS3.received
             )
+            assert any("/search/" in path and path.endswith(".seg") for path in paths), paths
             assert any(
                 path.endswith("/backup-info.txt") for path in paths
             ), paths

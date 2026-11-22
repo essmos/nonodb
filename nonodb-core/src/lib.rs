@@ -62,8 +62,9 @@ pub use ttl::DueEntry;
 pub use vault::{CollectionProfile, VaultKey};
 pub use vector::{VectorDef, VectorMetric, MAX_VECTOR_DIMS};
 pub use verify::{
-    verify_backup, verify_data_dir, BackupCompression, BackupManifest, BackupVerification,
-    CollectionVerification, IndexVerification, VerificationReport, MANIFEST_FILE, MANIFEST_VERSION,
+    verify_backup, verify_data_dir, verify_data_dir_allow_missing_search, BackupCompression,
+    BackupManifest, BackupVerification, CollectionVerification, IndexVerification,
+    VerificationReport, MANIFEST_FILE, MANIFEST_VERSION,
 };
 
 // Re-export `heed` so the daemon layer can operate on `RwTxn`
