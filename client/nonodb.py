@@ -14,12 +14,13 @@ in the daemon. Reuse one instance per process (uvicorn worker).
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import ssl
 import threading
 import time
-from typing import Any, Iterable, Iterator, Optional, Union
+from typing import Any, AsyncIterator, Iterable, Iterator, Optional, Union
 
 import httpx
 
@@ -30,8 +31,10 @@ except ImportError:  # pragma: no cover
 
 __all__ = [
     "NonoDB",
+    "AsyncNonoDB",
     "VaultDB",
     "Collection",
+    "AsyncCollection",
     "Cursor",
     "IndexBuild",
     "NonoDBError",
@@ -113,6 +116,58 @@ def _sql_is_read(query: Any) -> bool:
             return text.split(None, 1)[0].lower() in {
                 "select", "explain", "show", "values"
             } if text else False
+
+
+def _resolve_connection(
+    socket_path: Optional[str],
+    base_url: Optional[str],
+    database: Optional[str],
+    token: Optional[str],
+    timeout: Optional[float],
+    verify: Optional[bool],
+    client_cert: Optional[str],
+    client_key: Optional[str],
+    ca_cert: Optional[str],
+) -> tuple[str, Optional[str], str, Optional[str], float, Any]:
+    """Shared connection defaults for the sync and async clients."""
+    if base_url is None:
+        if socket_path is None:
+            socket_path = os.environ.get("NONODB_SOCK", "/run/nonodb.sock")
+        base_url = "http://localhost"
+    else:
+        base_url = base_url.rstrip("/")
+    database = (
+        database
+        if database is not None
+        else os.environ.get("NONODB_DB", "default")
+    ).strip() or "default"
+    token = token if token is not None else os.environ.get("NONODB_TOKEN")
+    if timeout is None:
+        timeout = float(os.environ.get("NONODB_TIMEOUT", "10"))
+    if verify is None:
+        verify = os.environ.get("NONODB_TLS_VERIFY", "1") not in ("0", "false", "no")
+    client_cert = client_cert or os.environ.get("NONODB_TLS_CLIENT_CERT")
+    client_key = client_key or os.environ.get("NONODB_TLS_CLIENT_KEY")
+    ca_cert = ca_cert or os.environ.get("NONODB_TLS_CA")
+    if bool(client_cert) != bool(client_key):
+        raise ValueError("client_cert and client_key must be provided together")
+    tls_verify = ca_cert if ca_cert else verify
+    # httpx 0.28 returns early when `verify` is a CA path and then does not
+    # load `cert`. Build the SSL context explicitly so mTLS works reliably.
+    # This also applies to a TCP write endpoint when the read endpoint uses
+    # a Unix socket.
+    if client_cert or ca_cert:
+        if verify is False:
+            tls_verify = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            tls_verify.check_hostname = False
+            tls_verify.verify_mode = ssl.CERT_NONE
+        elif ca_cert:
+            tls_verify = ssl.create_default_context(cafile=ca_cert)
+        else:
+            tls_verify = ssl.create_default_context()
+        if client_cert:
+            tls_verify.load_cert_chain(client_cert, client_key)
+    return base_url, socket_path, database, token, timeout, tls_verify
 
 
 def _cache_key(payload: dict[str, Any]) -> bytes:
@@ -276,53 +331,32 @@ class NonoDB:
         write_url: Optional[str] = None,
         auto_primary: Optional[bool] = None,
     ):
-        if base_url is None:
-            if socket_path is None:
-                socket_path = os.environ.get("NONODB_SOCK", "/run/nonodb.sock")
-            self.base_url = "http://localhost"
-            transport = httpx.HTTPTransport(uds=socket_path)
-        else:
-            self.base_url = base_url.rstrip("/")
-            transport = None
-        self.socket_path = socket_path
-        self.database = (
-            database
-            if database is not None
-            else os.environ.get("NONODB_DB", "default")
-        ).strip() or "default"
-        self.token = token if token is not None else os.environ.get("NONODB_TOKEN")
-        if timeout is None:
-            timeout = float(os.environ.get("NONODB_TIMEOUT", "10"))
-        if verify is None:
-            verify = os.environ.get("NONODB_TLS_VERIFY", "1") not in ("0", "false", "no")
-        client_cert = client_cert or os.environ.get("NONODB_TLS_CLIENT_CERT")
-        client_key = client_key or os.environ.get("NONODB_TLS_CLIENT_KEY")
-        ca_cert = ca_cert or os.environ.get("NONODB_TLS_CA")
-        if bool(client_cert) != bool(client_key):
-            raise ValueError("client_cert and client_key must be provided together")
-        tls_verify = ca_cert if ca_cert else verify
-        # httpx 0.28 returns early when `verify` is a CA path and then does not
-        # load `cert`. Build the SSL context explicitly so mTLS works reliably.
-        # This also applies to a TCP write endpoint when the read endpoint uses
-        # a Unix socket.
-        if client_cert or ca_cert:
-            if verify is False:
-                tls_verify = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-                tls_verify.check_hostname = False
-                tls_verify.verify_mode = ssl.CERT_NONE
-            elif ca_cert:
-                tls_verify = ssl.create_default_context(cafile=ca_cert)
-            else:
-                tls_verify = ssl.create_default_context()
-            if client_cert:
-                tls_verify.load_cert_chain(client_cert, client_key)
-        self._timeout = timeout
-        # Used by the optional TCP write client even when reads use a socket.
-        self._tls_verify = tls_verify
+        use_socket = base_url is None
+        (
+            self.base_url,
+            self.socket_path,
+            self.database,
+            self.token,
+            self._timeout,
+            self._tls_verify,
+        ) = _resolve_connection(
+            socket_path,
+            base_url,
+            database,
+            token,
+            timeout,
+            verify,
+            client_cert,
+            client_key,
+            ca_cert,
+        )
+        transport = (
+            httpx.HTTPTransport(uds=self.socket_path) if use_socket else None
+        )
         self._http = httpx.Client(
             transport=transport,
             base_url=self.base_url,
-            timeout=timeout,
+            timeout=self._timeout,
             verify=self._tls_verify,
         )
         if write_url is None:
@@ -1764,3 +1798,340 @@ class Collection:
         if max_time_ms is not None:
             payload["max_time_ms"] = max_time_ms
         return Cursor(self._db, payload, batch_size)
+
+
+class AsyncNonoDB:
+    """Async streaming client for long-poll and NDJSON watch APIs.
+
+    The regular :class:`NonoDB` client is synchronous. This class exposes only
+    the watch surface needed by async frameworks such as FastAPI; CRUD remains
+    on the synchronous client. Use it as a context manager or call
+    ``await close()`` when done.
+
+    Example::
+
+        async with AsyncNonoDB("/run/nonodb.sock") as db:
+            events = db.collection("_events")
+            async for event in events.watch(after=cursor):
+                process(event)
+    """
+
+    def __init__(
+        self,
+        socket_path: Optional[str] = None,
+        timeout: Optional[float] = None,
+        token: Optional[str] = None,
+        base_url: Optional[str] = None,
+        verify: Optional[bool] = None,
+        client_cert: Optional[str] = None,
+        client_key: Optional[str] = None,
+        ca_cert: Optional[str] = None,
+        database: Optional[str] = None,
+    ):
+        use_socket = base_url is None
+        (
+            self.base_url,
+            self.socket_path,
+            self.database,
+            self.token,
+            self._timeout,
+            self._tls_verify,
+        ) = _resolve_connection(
+            socket_path,
+            base_url,
+            database,
+            token,
+            timeout,
+            verify,
+            client_cert,
+            client_key,
+            ca_cert,
+        )
+        transport = (
+            httpx.AsyncHTTPTransport(uds=self.socket_path) if use_socket else None
+        )
+        self._http = httpx.AsyncClient(
+            transport=transport,
+            base_url=self.base_url,
+            timeout=self._timeout,
+            verify=self._tls_verify,
+        )
+
+    async def close(self) -> None:
+        await self._http.aclose()
+
+    async def __aenter__(self) -> "AsyncNonoDB":
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        await self.close()
+
+    def _data_path(self, path: str) -> str:
+        if not self.database or self.database == "default":
+            return path
+        return f"/{self.database}{path}"
+
+    def collection(self, name: str) -> "AsyncCollection":
+        return AsyncCollection(self, name)
+
+    async def _exec(self, payload: dict[str, Any]) -> Any:
+        """Runs a read request, retrying transport failures like the sync client."""
+        headers = {"content-type": "application/json"}
+        if self.token:
+            headers["authorization"] = f"Bearer {self.token}"
+        attempt = 0
+        retries = 2
+        while True:
+            try:
+                resp = await self._http.post(
+                    self.base_url + self._data_path("/v1/exec"),
+                    content=_dumps(payload),
+                    headers=headers,
+                )
+            except httpx.TimeoutException as exc:
+                raise NonoDBError("timeout", str(exc)) from exc
+            except httpx.TransportError as exc:
+                if attempt >= retries:
+                    raise NonoDBError("connection", str(exc)) from exc
+                attempt += 1
+                await asyncio.sleep(0.01 * attempt)
+                continue
+
+            try:
+                body = _loads(resp.content)
+            except ValueError:
+                raise NonoDBError(
+                    "invalid_response", f"HTTP {resp.status_code}: {resp.text[:200]}"
+                )
+            if body.get("ok"):
+                return body.get("result")
+
+            err = body.get("error") or {}
+            raise NonoDBError(
+                err.get("code", "error"),
+                err.get("message", ""),
+            )
+
+
+class AsyncCollection:
+    """Collection handle for :class:`AsyncNonoDB` watch/stream methods."""
+
+    def __init__(self, db: AsyncNonoDB, name: str):
+        self._db = db
+        self.name = name
+
+    async def watch_once(
+        self,
+        after: Optional[str] = None,
+        *,
+        limit: int = 100,
+        timeout_ms: int = 1000,
+        types: Optional[Iterable[str]] = None,
+        filter: Optional[dict[str, Any]] = None,
+        projection: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        """Fetches one long-poll batch from an append-only event collection."""
+        payload: dict[str, Any] = {
+            "op": "watch",
+            "coll": self.name,
+            "limit": limit,
+            "timeout_ms": timeout_ms,
+        }
+        if after:
+            payload["after"] = after
+        if types is not None:
+            payload["types"] = list(types)
+        if filter is not None:
+            payload["filter"] = filter
+        if projection is not None:
+            payload["projection"] = projection
+        return await self._db._exec(payload)
+
+    async def watch(
+        self,
+        after: Optional[str] = None,
+        *,
+        limit: int = 100,
+        timeout_ms: int = 1000,
+        types: Optional[Iterable[str]] = None,
+        filter: Optional[dict[str, Any]] = None,
+        projection: Optional[dict[str, Any]] = None,
+        retry: bool = True,
+        retry_delay: float = 1.0,
+        max_retry_delay: float = 30.0,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Yields events from a long-polling watch, reconnecting on transport errors."""
+        cursor = after
+        delay = max(0.001, retry_delay)
+        while True:
+            try:
+                batch = await self.watch_once(
+                    cursor,
+                    limit=limit,
+                    timeout_ms=timeout_ms,
+                    types=types,
+                    filter=filter,
+                    projection=projection,
+                )
+                if batch.get("truncated"):
+                    raise StreamTruncatedError(batch.get("oldest"), cursor)
+                for event in batch.get("events", []):
+                    yield event
+                cursor = batch.get("next") or cursor
+                delay = max(0.001, retry_delay)
+            except NonoDBError as exc:
+                if not retry or exc.code != "connection":
+                    raise
+                await asyncio.sleep(delay)
+                delay = min(max_retry_delay, delay * 2)
+
+    async def watch_stream(
+        self,
+        after: Optional[str] = None,
+        *,
+        limit: int = 100,
+        types: Optional[Iterable[str]] = None,
+        filter: Optional[dict[str, Any]] = None,
+        projection: Optional[dict[str, Any]] = None,
+        heartbeat_ms: Optional[int] = None,
+        timeout_ms: Optional[int] = None,
+        overlap_ms: Optional[int] = None,
+        threshold: Optional[dict[str, Any]] = None,
+        mode: Optional[str] = None,
+        ops: Optional[Iterable[str]] = None,
+        count: Optional[dict[str, Any]] = None,
+        once: bool = False,
+        name: Optional[str] = None,
+        event_type: Optional[str] = None,
+        retry: bool = True,
+        retry_delay: float = 1.0,
+        max_retry_delay: float = 30.0,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Yields events from the NDJSON ``/v1/watch`` stream."""
+        db = self._db
+        cursor = after
+        delay = max(0.001, retry_delay)
+        while True:
+            live = mode == "live"
+            payload: dict[str, Any] = {
+                "op": "watch",
+                "coll": self.name,
+                "limit": limit,
+            }
+            if live:
+                payload["mode"] = "live"
+            elif cursor:
+                payload["after"] = cursor
+            if types is not None and not live:
+                payload["types"] = list(types)
+            if filter is not None:
+                payload["filter"] = filter
+            if projection is not None and not live:
+                payload["projection"] = projection
+            if heartbeat_ms is not None:
+                payload["heartbeat_ms"] = heartbeat_ms
+            if timeout_ms is not None:
+                payload["timeout_ms"] = timeout_ms
+            if overlap_ms is not None and not live:
+                payload["overlap_ms"] = overlap_ms
+            if threshold is not None and not live:
+                payload["threshold"] = threshold
+            if live:
+                if ops is not None:
+                    payload["ops"] = list(ops)
+                if count is not None:
+                    payload["count"] = count
+                if once:
+                    payload["once"] = True
+                if name is not None:
+                    payload["name"] = name
+                if event_type is not None:
+                    payload["event_type"] = event_type
+            headers = {
+                "content-type": "application/json",
+                "accept": "application/x-ndjson",
+            }
+            if db.token:
+                headers["authorization"] = f"Bearer {db.token}"
+            try:
+                async with db._http.stream(
+                    "POST",
+                    db.base_url + db._data_path("/v1/watch"),
+                    content=_dumps(payload),
+                    headers=headers,
+                    timeout=None,
+                ) as resp:
+                    if resp.status_code != 200:
+                        raw = await resp.aread()
+                        try:
+                            body = _loads(raw)
+                            err = body.get("error") or {}
+                        except ValueError:
+                            err = {}
+                        raise NonoDBError(
+                            err.get("code", "http_error"),
+                            err.get("message", f"HTTP {resp.status_code}"),
+                        )
+                    async for raw_line in resp.aiter_lines():
+                        line = raw_line.strip()
+                        if not line:
+                            continue
+                        item = _loads(line)
+                        if "heartbeat" in item:
+                            continue
+                        if "error" in item:
+                            err = item.get("error") or {}
+                            raise NonoDBError(
+                                err.get("code", "error"), err.get("message", "")
+                            )
+                        if "stream" in item:
+                            info = item["stream"]
+                            if info.get("truncated"):
+                                raise StreamTruncatedError(
+                                    info.get("oldest"), cursor
+                                )
+                            continue
+                        event_id = item.get("_id")
+                        if event_id:
+                            cursor = event_id
+                        yield item
+                if not retry:
+                    return
+                delay = max(0.001, retry_delay)
+                await asyncio.sleep(delay)
+            except httpx.TransportError as exc:
+                if not retry:
+                    raise NonoDBError("connection", str(exc)) from exc
+                await asyncio.sleep(delay)
+                delay = min(max_retry_delay, delay * 2)
+
+    def watch_live(
+        self,
+        *,
+        filter: Optional[dict[str, Any]] = None,
+        count: Optional[dict[str, Any]] = None,
+        ops: Optional[Iterable[str]] = None,
+        once: bool = False,
+        heartbeat_ms: int = 10_000,
+        timeout_ms: Optional[int] = None,
+        name: Optional[str] = None,
+        event_type: Optional[str] = None,
+        retry: bool = True,
+        retry_delay: float = 1.0,
+        max_retry_delay: float = 30.0,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Yields matching changes over a connection-scoped live stream."""
+        return self.watch_stream(
+            mode="live",
+            filter=filter,
+            count=count,
+            ops=ops,
+            once=once,
+            heartbeat_ms=heartbeat_ms,
+            timeout_ms=timeout_ms,
+            name=name,
+            event_type=event_type,
+            retry=retry,
+            retry_delay=retry_delay,
+            max_retry_delay=max_retry_delay,
+        )

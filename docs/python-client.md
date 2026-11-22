@@ -1,8 +1,10 @@
 # Python client
 
-`client/nonodb.py` is a thin, synchronous Python client for nonodb. It speaks
-HTTP/JSON to the daemon over a Unix socket or TCP/TLS. Cursors are explicit
-server-side objects created through `find_cursor` and `aggregate_cursor`.
+`client/nonodb.py` is a thin Python client for nonodb. It speaks HTTP/JSON to
+the daemon over a Unix socket or TCP/TLS. The main `NonoDB` client is
+synchronous; `AsyncNonoDB` adds async watch/stream helpers for asyncio
+applications. Cursors are explicit server-side objects created through
+`find_cursor` and `aggregate_cursor`.
 
 The client is intentionally small: query semantics live in the daemon, so
 Python, curl, the CLI, and any future language client all see the same behavior.
@@ -996,6 +998,32 @@ def get_user(user_id: str, request: Request):
 The client is synchronous. In an async endpoint, either call it in a thread
 pool or keep the endpoint synchronous (`def`, not `async def`) so FastAPI runs
 it in its worker thread pool.
+
+For long-lived watch streams, use `AsyncNonoDB` instead of blocking a worker
+thread. It exposes `watch_once`, `watch`, `watch_stream`, and `watch_live` as
+async helpers:
+
+```python
+import json
+
+from fastapi.responses import StreamingResponse
+from nonodb import AsyncNonoDB
+
+@app.get("/orders/stream")
+async def order_events():
+    async def events():
+        async with AsyncNonoDB("/run/nonodb/nonodb.sock") as db:
+            async for event in db.collection("orders").watch_live(
+                filter={"status": "paid"},
+            ):
+                yield json.dumps(event, separators=(",", ":")) + "\n"
+
+    return StreamingResponse(events(), media_type="application/x-ndjson")
+```
+
+The async client intentionally covers only watch/streams; CRUD stays on the
+synchronous `NonoDB` client. Do not iterate the blocking watch generators
+directly inside `async def`.
 
 The daemon is designed for exactly this deployment: many preforked application
 workers, one database owner.

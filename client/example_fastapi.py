@@ -9,12 +9,14 @@ the client between processes.
 
 from __future__ import annotations
 
+import json
 import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
+from fastapi.responses import StreamingResponse
 
-from nonodb import NonoDB
+from nonodb import AsyncNonoDB, NonoDB
 
 SOCK = os.environ.get("NONODB_SOCK", "/run/nonodb/nonodb.sock")
 
@@ -22,8 +24,10 @@ SOCK = os.environ.get("NONODB_SOCK", "/run/nonodb/nonodb.sock")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.db = NonoDB(SOCK)
+    app.state.async_db = AsyncNonoDB(SOCK)
     yield
     app.state.db.close()
+    await app.state.async_db.close()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -47,3 +51,15 @@ def inc_counter(request: Request, name: str):
     counters.update({"name": name}, {"$inc": {"n": 1}}, multi=False)
     doc = counters.find_one({"name": name})
     return {"n": doc["n"] if doc else None}
+
+
+@app.get("/orders/stream")
+async def stream_orders(request: Request):
+    async def events():
+        async for event in request.app.state.async_db.collection("orders").watch_live(
+            filter={"status": "paid"},
+            heartbeat_ms=10_000,
+        ):
+            yield json.dumps(event, separators=(",", ":")) + "\n"
+
+    return StreamingResponse(events(), media_type="application/x-ndjson")

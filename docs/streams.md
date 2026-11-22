@@ -267,6 +267,31 @@ event dictionaries, advance their local cursor, and reconnect after transport
 errors. Persist your own checkpoint after successful processing. Both generators
 raise `StreamTruncatedError` when the server reports a gap.
 
+### Async streaming
+
+`AsyncNonoDB` exposes async versions of the same watch helpers for FastAPI and
+other asyncio applications. It is intentionally limited to the watch/stream
+surface; use the synchronous `NonoDB` for CRUD and index operations.
+
+```python
+from nonodb import AsyncNonoDB
+
+async def tail_events(cursor=None):
+    async with AsyncNonoDB("/run/nonodb/nonodb.sock") as db:
+        events = db.collection("_events")
+        async for event in events.watch(after=cursor):
+            process(event)
+
+# watch_once(...) is awaitable:
+#   batch = await events.watch_once(after=cursor)
+# watch_stream(...) and watch_live(...) are async iterators.
+```
+
+The async client reuses the same request payloads, retry/backoff rules, cursor
+advancement, and `StreamTruncatedError` handling as the synchronous client. Do
+not iterate the blocking `NonoDB` watch generators directly inside `async def`;
+use `AsyncNonoDB` instead.
+
 ## Rust
 
 ```rust

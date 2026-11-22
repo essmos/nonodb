@@ -4,6 +4,10 @@ Full release notes: https://github.com/essmos/nonodb/releases
 
 ## Unreleased
 
+- Add `AsyncNonoDB` to the Python client for async `watch_once`, `watch`,
+  `watch_stream`, and `watch_live` consumption, and document its use with
+  FastAPI and other asyncio applications.
+
 ## v0.28.0 - 2026-11-22
 
 - Add opt-in SQ8/int8 ANN record encoding through

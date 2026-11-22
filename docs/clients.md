@@ -7,7 +7,7 @@ transactions.
 
 | Language | Location | Style | Unix socket | TCP/TLS | mTLS |
 |---|---|---|---|---|---|
-| Python | [`client/nonodb.py`](../client/nonodb.py) | sync | yes | yes | yes |
+| Python | [`client/nonodb.py`](../client/nonodb.py) | sync + async watch | yes | yes | yes |
 | Rust | [`nonodb-client`](../nonodb-client) | sync | yes (Unix) | yes | yes |
 | Node.js | [`client/node`](../client/node) | async / Promise | yes (Unix) | yes | yes |
 | Go | [`client/go`](../client/go) | context-aware | yes (Unix) | yes | yes |
@@ -779,7 +779,8 @@ All clients expose the common document operations:
   plus `get_many` for fetching documents by `_id`;
 - `watch`/`watch_once` for append-only outbox events, with filters, projections,
   resume tokens, and reconnect helpers; Python also exposes `watch_stream` for
-  continuous NDJSON ([details](streams.md));
+  continuous NDJSON and `AsyncNonoDB` for async watch/stream consumption
+  ([details](streams.md));
 - `history` and `get_version` for document revisions (per-collection history enabled);
 - single-field, compound, unique, and covering indexes;
 - full-text (`search`), fuzzy search, and exact vector search;
