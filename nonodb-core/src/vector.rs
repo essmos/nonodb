@@ -158,26 +158,31 @@ pub fn distance_from_bytes(
         return None;
     }
     let stored_norm = f32::from_le_bytes(bytes[..4].try_into().ok()?);
-    let mut dot = 0.0f32;
-    let mut squared = 0.0f32;
-    for (index, query_component) in query.iter().enumerate() {
-        let start = 4 + index * 4;
-        let stored = f32::from_le_bytes(bytes[start..start + 4].try_into().ok()?);
-        dot += query_component * stored;
-        let delta = query_component - stored;
-        squared += delta * delta;
-    }
-
+    let (components, _) = bytes[4..].as_chunks::<4>();
     let distance = match metric {
-        VectorMetric::Cosine => {
-            if query_norm <= f32::EPSILON || stored_norm <= f32::EPSILON {
+        VectorMetric::Cosine | VectorMetric::Dot => {
+            let mut dot = 0.0f32;
+            for (query_component, stored) in query.iter().zip(components) {
+                let stored = f32::from_le_bytes(*stored);
+                dot += query_component * stored;
+            }
+            if metric == VectorMetric::Dot {
+                -dot
+            } else if query_norm <= f32::EPSILON || stored_norm <= f32::EPSILON {
                 1.0
             } else {
                 1.0 - (dot / (query_norm * stored_norm)).clamp(-1.0, 1.0)
             }
         }
-        VectorMetric::Dot => -dot,
-        VectorMetric::L2 => squared,
+        VectorMetric::L2 => {
+            let mut squared = 0.0f32;
+            for (query_component, stored) in query.iter().zip(components) {
+                let stored = f32::from_le_bytes(*stored);
+                let delta = query_component - stored;
+                squared += delta * delta;
+            }
+            squared
+        }
     };
     distance.is_finite().then_some(distance)
 }

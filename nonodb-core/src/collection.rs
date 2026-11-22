@@ -1963,10 +1963,10 @@ impl<'e> Collection<'e> {
         Ok(())
     }
 
-    /// Whether the optional ANN sidecar file exists for a vector index.
+    /// Whether the optional ANN sidecar exists and uses the current format.
     pub fn vector_ann_sidecar_exists(&self, field: &str) -> bool {
         self.vector_ann_path(field)
-            .map(|path| path.is_file())
+            .map(|path| vector_ann::is_compatible(&path))
             .unwrap_or(false)
     }
 
@@ -1997,6 +1997,7 @@ impl<'e> Collection<'e> {
         }
         let path = self.vector_ann_path(field)?;
         let stats = vector_ann::build(&path, def.dims, def.metric, &vectors, nprobe)?;
+        vector_ann::invalidate_cache(&path);
         def.ann = Some(VectorAnnDef {
             version: 1,
             clusters: stats.clusters as u32,
@@ -2033,6 +2034,8 @@ impl<'e> Collection<'e> {
             )?;
             self.clear_vector_ann_delta(wtxn, field)?;
             if let Some(store) = self.store {
+                let path = self.vector_ann_path(field)?;
+                vector_ann::invalidate_cache(&path);
                 let dir = store
                     .env()
                     .path()
@@ -2181,7 +2184,7 @@ impl<'e> Collection<'e> {
                 let delta = self.vector_ann_delta_in(rtxn, field)?;
                 if !dirty && delta.len() <= VECTOR_ANN_DELTA_MAX {
                     if let Ok(path) = self.vector_ann_path(field) {
-                        if let Ok(reader) = vector_ann::AnnReader::open(&path) {
+                        if let Ok(reader) = vector_ann::open_cached(&path) {
                             let nprobe = std::env::var("NONODB_VECTOR_ANN_PROBE")
                                 .ok()
                                 .and_then(|value| value.parse::<usize>().ok())

@@ -8,6 +8,25 @@ deliberate limitations are documented in [docs/roadmap.md](docs/roadmap.md).
 
 - [ ] Get 3–5 external testers to follow the quickstart without help.
 
+## P0 — vector ANN latency
+
+Target on the 100M-document, 16-dimensional benchmark: recall@10 ≥ 0.95,
+p50 ≤ 12 ms, p95 ≤ 16 ms through the daemon. Achieved with 4,096 clusters and
+`nprobe=2`: recall@10 **1.0**, p50 **6.30 ms**, p95 **9.32 ms**.
+
+- [x] Specialize distance loops by metric instead of always computing both
+      dot product and squared L2.
+- [x] Split large IVF clusters into checkpoint ranges and scan them across all
+      cores, not only one thread per probed cluster.
+- [x] Add checkpoint metadata to the ANN sidecar format and reject incompatible
+      sidecars.
+- [x] Raise the default IVF cluster cap for large collections and validate
+      recall against a full sidecar scan.
+- [x] Evaluate scalar or product quantization only if the checkpointed IVF
+      path misses the target on representative real embeddings. The target is
+      met without quantization, so it is not needed now.
+- [x] Keep HNSW/PQ as a later option; do not add a background ANN process.
+
 ## P0 — security
 
 - [ ] Optional CRL/OCSP integration for externally managed PKI.
@@ -150,9 +169,6 @@ indexing, and profiling.
 - BM25 common-term queries on the full 8.84M MS MARCO collection still reach a
   p95 of about 30 ms. Block-max WAND and further pruning remain the next
   performance step.
-- The 100M vector ANN sidecar is about 27 ms p50 at `nprobe=2`, above the
-  8–16 ms target. Tune IVF/PQ or validate HNSW on real vectors before choosing
-  a replacement.
 - Text and fuzzy indexes cover exactly one field. MongoDB-style multi-field text
   keys and non-default weights are rejected.
 - Legacy LMDB text/fuzzy indexes are no longer read. Drop and recreate them as

@@ -23,7 +23,18 @@ Full release notes: https://github.com/essmos/nonodb/releases
   `include_search_sidecars: false`. Age-encrypted jobs encrypt each sidecar
   file with the same recipient as the LMDB payload.
 - Add `NONODB_VECTOR_ANN_CLUSTERS` (up to 8,192) to tune IVF cluster count for
-  very large vector collections. The default remains 512.
+  very large vector collections. The default is now 4,096.
+- Bump the vector ANN sidecar to format v2 with a checkpoint table per cluster.
+  Queries split large clusters into checkpoint ranges and scan them across all
+  cores instead of using one thread per probed cluster. The 100M benchmark drops
+  from about 27 ms p50 to **5.4 ms** at the reader and **6.3 ms** through the
+  daemon, with p95 **8.6 ms** / **9.3 ms** and recall@10 **1.0**. Sidecars in
+  the old v1 format are incompatible and must be rebuilt once.
+- Specialize vector distance loops by metric: cosine and dot no longer compute
+  squared L2, and L2 no longer computes a dot product.
+- Cache the memory-mapped ANN reader per sidecar and invalidate it when the file
+  changes, avoiding a fresh 8 GB mapping and repeated page-table faults on every
+  query.
 - Skip empty IVF clusters when probing, so repetitive or very large vector
   sets return a full result set instead of occasionally returning no hits.
 - Let `NONODB_VECTOR_ANN_PROBE` override the probe count at query time without

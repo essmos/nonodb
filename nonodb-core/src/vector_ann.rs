@@ -3,25 +3,44 @@
 //! The sidecar is built from the exact LMDB vector index. It contains a small
 //! set of centroids, cluster offsets, and the original `_id`/vector pairs.
 //! Queries probe the nearest clusters and keep a bounded top-K heap. The file
-//! is memory-mapped lazily; there are no background threads or warm caches.
+//! is memory-mapped lazily; there are no background threads. The mapping is
+//! cached per sidecar and reused until the file changes.
 
 use std::cmp::Ordering;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashMap};
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufWriter, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::SystemTime;
 
 use memmap2::Mmap;
 
 use crate::vector::{self, Candidate, VectorMetric};
 
 const MAGIC: &[u8; 8] = b"NONOANN1";
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 const HEADER_SIZE: usize = 40;
-const DEFAULT_MAX_CLUSTERS: usize = 512;
+const DEFAULT_MAX_CLUSTERS: usize = 4_096;
 const MAX_CLUSTERS_LIMIT: usize = 8_192;
 const MAX_TRAINING: usize = 100_000;
+const CHECKPOINT_INTERVAL: usize = 256;
 const TRAINING_ITERATIONS: usize = 8;
+const MIN_BYTES_PER_WORKER: usize = 1 << 20;
+const MAX_SEARCH_WORKERS: usize = 64;
+
+fn search_worker_limit() -> usize {
+    std::env::var("NONODB_SEARCH_WORKERS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|value| value.get())
+                .unwrap_or(1)
+        })
+        .clamp(1, MAX_SEARCH_WORKERS)
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct AnnStats {
@@ -29,6 +48,22 @@ pub struct AnnStats {
     pub clusters: usize,
     pub nprobe: usize,
     pub bytes: u64,
+}
+
+struct ClusterBuildMeta {
+    meta_start: u64,
+    entry_count: usize,
+    data_start: u64,
+    data_end: u64,
+    checkpoints: Vec<u64>,
+}
+
+struct ClusterInfo {
+    entry_count: usize,
+    data_start: usize,
+    data_end: usize,
+    checkpoints_offset: usize,
+    checkpoint_count: usize,
 }
 
 struct ScoredCluster {
@@ -75,23 +110,28 @@ fn distance(
     stored: &[f32],
     stored_norm: f32,
 ) -> f32 {
-    let mut dot = 0.0f32;
-    let mut squared = 0.0f32;
-    for (left, right) in query.iter().zip(stored.iter()) {
-        dot += left * right;
-        let delta = left - right;
-        squared += delta * delta;
-    }
     let value = match metric {
-        VectorMetric::Cosine => {
-            if query_norm <= f32::EPSILON || stored_norm <= f32::EPSILON {
+        VectorMetric::Cosine | VectorMetric::Dot => {
+            let mut dot = 0.0f32;
+            for (left, right) in query.iter().zip(stored.iter()) {
+                dot += left * right;
+            }
+            if metric == VectorMetric::Dot {
+                -dot
+            } else if query_norm <= f32::EPSILON || stored_norm <= f32::EPSILON {
                 1.0
             } else {
                 1.0 - (dot / (query_norm * stored_norm)).clamp(-1.0, 1.0)
             }
         }
-        VectorMetric::Dot => -dot,
-        VectorMetric::L2 => squared,
+        VectorMetric::L2 => {
+            let mut squared = 0.0f32;
+            for (left, right) in query.iter().zip(stored.iter()) {
+                let delta = left - right;
+                squared += delta * delta;
+            }
+            squared
+        }
     };
     if value.is_finite() {
         value
@@ -111,23 +151,28 @@ fn nearest_centroid(
     let mut best_distance = f32::INFINITY;
     for (index, centroid) in centroids.iter().enumerate() {
         let stored_norm = centroid_norms[index];
-        let mut dot = 0.0f32;
-        let mut squared = 0.0f32;
-        for (left, right) in vector.iter().zip(centroid.iter()) {
-            dot += left * right;
-            let delta = left - right;
-            squared += delta * delta;
-        }
         let value = match metric {
-            VectorMetric::Cosine => {
-                if vector_norm <= f32::EPSILON || stored_norm <= f32::EPSILON {
+            VectorMetric::Cosine | VectorMetric::Dot => {
+                let mut dot = 0.0f32;
+                for (left, right) in vector.iter().zip(centroid.iter()) {
+                    dot += left * right;
+                }
+                if metric == VectorMetric::Dot {
+                    -dot
+                } else if vector_norm <= f32::EPSILON || stored_norm <= f32::EPSILON {
                     1.0
                 } else {
                     1.0 - (dot / (vector_norm * stored_norm)).clamp(-1.0, 1.0)
                 }
             }
-            VectorMetric::Dot => -dot,
-            VectorMetric::L2 => squared,
+            VectorMetric::L2 => {
+                let mut squared = 0.0f32;
+                for (left, right) in vector.iter().zip(centroid.iter()) {
+                    let delta = left - right;
+                    squared += delta * delta;
+                }
+                squared
+            }
         };
         if value < best_distance {
             best = index;
@@ -183,6 +228,16 @@ fn read_u64(bytes: &[u8], position: &mut usize) -> io::Result<u64> {
     let value = u64::from_le_bytes(bytes[*position..end].try_into().unwrap());
     *position = end;
     Ok(value)
+}
+
+/// Returns whether `path` is an ANN file this build can read.
+pub fn is_compatible(path: &Path) -> bool {
+    let mut header = [0u8; 12];
+    File::open(path)
+        .and_then(|mut file| file.read_exact(&mut header))
+        .is_ok()
+        && &header[..8] == MAGIC
+        && u32::from_le_bytes(header[8..12].try_into().unwrap()) == VERSION
 }
 
 /// Builds an immutable IVF file atomically at `path`.
@@ -347,24 +402,52 @@ pub fn build(
         write_u64(&mut out, 0)?;
     }
 
+    let mut position = data_offset as u64;
+    let mut metas = Vec::with_capacity(clusters);
     let mut offsets = Vec::with_capacity(clusters + 1);
-    let mut data_pos = 0u64;
     for cluster in &assigned {
-        offsets.push(data_offset as u64 + data_pos);
-        for &index in cluster {
+        let checkpoint_count = cluster.len().div_ceil(CHECKPOINT_INTERVAL);
+        let meta_size = 32 + checkpoint_count * 8;
+        let meta_start = position;
+        offsets.push(meta_start);
+        let data_start = meta_start + meta_size as u64;
+        out.write_all(&vec![0u8; meta_size])?;
+        position = data_start;
+        let mut checkpoints = Vec::with_capacity(checkpoint_count);
+        for (entry, &index) in cluster.iter().enumerate() {
+            if entry % CHECKPOINT_INTERVAL == 0 {
+                checkpoints.push(position);
+            }
             let (id, values) = &vectors[index];
             write_u32(&mut out, id.len() as u32)?;
             out.write_all(id.as_bytes())?;
             out.write_all(&vector::encode_vector(values))?;
-            data_pos += 4 + id.len() as u64 + 4 + values.len() as u64 * 4;
+            position += 4 + id.len() as u64 + 4 + values.len() as u64 * 4;
         }
+        metas.push(ClusterBuildMeta {
+            meta_start,
+            entry_count: cluster.len(),
+            data_start,
+            data_end: position,
+            checkpoints,
+        });
     }
-    offsets.push(data_offset as u64 + data_pos);
+    offsets.push(position);
     out.flush()?;
     let mut file = out.into_inner().map_err(|error| error.into_error())?;
     file.seek(SeekFrom::Start(offsets_offset as u64))?;
     for offset in &offsets {
         write_u64(&mut file, *offset)?;
+    }
+    for meta in &metas {
+        file.seek(SeekFrom::Start(meta.meta_start))?;
+        write_u64(&mut file, meta.entry_count as u64)?;
+        write_u64(&mut file, meta.data_start)?;
+        write_u64(&mut file, meta.data_end)?;
+        write_u64(&mut file, meta.checkpoints.len() as u64)?;
+        for checkpoint in &meta.checkpoints {
+            write_u64(&mut file, *checkpoint)?;
+        }
     }
     file.sync_all()?;
     drop(file);
@@ -447,6 +530,10 @@ impl AnnReader {
         }
     }
 
+    pub fn dimensions(&self) -> usize {
+        self.dims
+    }
+
     fn centroid(&self, cluster: usize) -> &[f32] {
         let start = self.centroids_offset + cluster * self.dims * 4;
         unsafe { std::slice::from_raw_parts(self.map[start..].as_ptr().cast::<f32>(), self.dims) }
@@ -476,7 +563,8 @@ impl AnnReader {
         let query_norm = norm_of(query);
         let mut probes = Vec::with_capacity(self.clusters);
         for cluster in 0..self.clusters {
-            if self.offset(cluster)? == self.offset(cluster + 1)? {
+            let info = self.cluster_info(cluster)?;
+            if info.entry_count == 0 {
                 continue;
             }
             let centroid = self.centroid(cluster);
@@ -487,21 +575,49 @@ impl AnnReader {
         }
         probes.sort_unstable();
         probes.truncate(nprobe.clamp(1, self.clusters).min(probes.len()));
-        let clusters: Vec<usize> = probes.into_iter().map(|probe| probe.index).collect();
-        let workers = std::thread::available_parallelism()
-            .map(|value| value.get())
-            .unwrap_or(1)
-            .min(clusters.len())
-            .max(1);
-        if workers <= 1 {
-            return self.scan_clusters(&clusters, query, query_norm, want);
+        let mut clusters = Vec::with_capacity(probes.len());
+        let mut total_bytes = 0usize;
+        for probe in probes {
+            let info = self.cluster_info(probe.index)?;
+            if info.entry_count == 0 {
+                continue;
+            }
+            total_bytes = total_bytes.saturating_add(info.data_end - info.data_start);
+            clusters.push(info);
         }
-        let chunk = clusters.len().div_ceil(workers);
+        if clusters.is_empty() {
+            return Ok(heap);
+        }
+
+        // A query with a small nprobe would otherwise use only nprobe threads.
+        // Split large clusters at their checkpoints so every core can
+        // participate, but avoid spawning workers for tiny ranges where thread
+        // overhead wins.
+        let available = search_worker_limit();
+        let useful = (total_bytes / MIN_BYTES_PER_WORKER).max(1);
+        let workers = available.min(useful).clamp(1, MAX_SEARCH_WORKERS);
+        let parts = workers.div_ceil(clusters.len()).max(1);
+        let mut jobs: Vec<Vec<(usize, usize)>> = vec![Vec::new(); workers];
+        let mut next_job = 0usize;
+        for info in &clusters {
+            for (range_start, range_end) in self.cluster_ranges(info, parts)? {
+                if range_start >= range_end {
+                    continue;
+                }
+                jobs[next_job % workers].push((range_start, range_end));
+                next_job += 1;
+            }
+        }
+        jobs.retain(|job| !job.is_empty());
+        if jobs.len() <= 1 {
+            let ranges = jobs.pop().unwrap_or_default();
+            return self.scan_ranges(&ranges, query, query_norm, want);
+        }
         let parts = std::thread::scope(|scope| {
-            let mut handles = Vec::new();
-            for slice in clusters.chunks(chunk) {
+            let mut handles = Vec::with_capacity(jobs.len());
+            for ranges in jobs {
                 handles
-                    .push(scope.spawn(move || self.scan_clusters(slice, query, query_norm, want)));
+                    .push(scope.spawn(move || self.scan_ranges(&ranges, query, query_norm, want)));
             }
             handles
                 .into_iter()
@@ -527,24 +643,117 @@ impl AnnReader {
         Ok(heap)
     }
 
-    fn scan_clusters(
+    fn cluster_info(&self, cluster: usize) -> io::Result<ClusterInfo> {
+        let meta_start = self.offset(cluster)? as usize;
+        let meta_end = self.offset(cluster + 1)? as usize;
+        if meta_start > meta_end || meta_end > self.map.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bad ANN cluster offset",
+            ));
+        }
+        let mut position = meta_start;
+        let entry_count = read_u64(&self.map, &mut position)? as usize;
+        let data_start = read_u64(&self.map, &mut position)? as usize;
+        let data_end = read_u64(&self.map, &mut position)? as usize;
+        let checkpoint_count = read_u64(&self.map, &mut position)? as usize;
+        let checkpoints_offset = position;
+        let checkpoints_end =
+            checkpoints_offset
+                .checked_add(checkpoint_count.checked_mul(8).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "bad ANN checkpoints")
+                })?)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad ANN checkpoints"))?;
+        if checkpoints_end > meta_end
+            || data_start < checkpoints_end
+            || data_start > data_end
+            || data_end > self.map.len()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bad ANN cluster metadata",
+            ));
+        }
+        if entry_count == 0 && (data_start != data_end || checkpoint_count != 0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bad empty ANN cluster",
+            ));
+        }
+        Ok(ClusterInfo {
+            entry_count,
+            data_start,
+            data_end,
+            checkpoints_offset,
+            checkpoint_count,
+        })
+    }
+
+    fn checkpoint(&self, info: &ClusterInfo, index: usize) -> io::Result<usize> {
+        if index >= info.checkpoint_count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bad ANN checkpoint index",
+            ));
+        }
+        let mut position = info.checkpoints_offset + index * 8;
+        read_u64(&self.map, &mut position).map(|value| value as usize)
+    }
+
+    fn cluster_ranges(&self, info: &ClusterInfo, parts: usize) -> io::Result<Vec<(usize, usize)>> {
+        if info.entry_count == 0 || info.data_start >= info.data_end {
+            return Ok(Vec::new());
+        }
+        let splits = parts.min(info.checkpoint_count.max(1)).max(1);
+        if splits <= 1 {
+            return Ok(vec![(info.data_start, info.data_end)]);
+        }
+        let mut ranges = Vec::with_capacity(splits);
+        for part in 0..splits {
+            let start_index = part * info.checkpoint_count / splits;
+            let end_index = (part + 1) * info.checkpoint_count / splits;
+            let start = self.checkpoint(info, start_index)?;
+            let end = if end_index < info.checkpoint_count {
+                self.checkpoint(info, end_index)?
+            } else {
+                info.data_end
+            };
+            if start < end {
+                ranges.push((start, end));
+            }
+        }
+        Ok(ranges)
+    }
+
+    #[cfg(test)]
+    fn next_record(&self, position: usize, end: usize) -> io::Result<usize> {
+        let mut cursor = position;
+        let id_len = read_u32(&self.map, &mut cursor)? as usize;
+        let id_end = cursor
+            .checked_add(id_len)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "truncated ANN entry"))?;
+        let vector_end = id_end
+            .checked_add(4 + self.dims * 4)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "truncated ANN entry"))?;
+        if vector_end > end {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "truncated ANN entry",
+            ));
+        }
+        Ok(vector_end)
+    }
+
+    fn scan_ranges(
         &self,
-        clusters: &[usize],
+        ranges: &[(usize, usize)],
         query: &[f32],
         query_norm: f32,
         want: usize,
     ) -> io::Result<BinaryHeap<Candidate>> {
         let mut heap: BinaryHeap<Candidate> = BinaryHeap::new();
         let vector_bytes = 4 + self.dims * 4;
-        for &cluster in clusters {
-            let start = self.offset(cluster)? as usize;
-            let end = self.offset(cluster + 1)? as usize;
-            if start > end || end > self.map.len() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "bad ANN cluster offset",
-                ));
-            }
+        for &(start, end) in ranges {
             let mut position = start;
             while position < end {
                 let id_len = read_u32(&self.map, &mut position)? as usize;
@@ -586,38 +795,90 @@ impl AnnReader {
     }
 }
 
+struct CachedReader {
+    len: u64,
+    modified: Option<SystemTime>,
+    reader: Arc<AnnReader>,
+}
+
+static READER_CACHE: OnceLock<Mutex<HashMap<PathBuf, CachedReader>>> = OnceLock::new();
+
+fn reader_cache() -> &'static Mutex<HashMap<PathBuf, CachedReader>> {
+    READER_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Opens a memory-mapped ANN reader, reusing the mapping while the file is
+/// unchanged.
+///
+/// Mapping the multi-gigabyte sidecar per request discards the process page
+/// tables for the probed cluster ranges and makes every query pay minor page
+/// faults again. The cache keeps one mapping per sidecar and invalidates it
+/// when the file length or modification time changes (for example after a
+/// rebuild).
+pub fn open_cached(path: &Path) -> io::Result<Arc<AnnReader>> {
+    let metadata = std::fs::metadata(path)?;
+    let len = metadata.len();
+    let modified = metadata.modified().ok();
+    let mut cache = reader_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(cached) = cache.get(path) {
+        if cached.len == len && cached.modified == modified {
+            return Ok(cached.reader.clone());
+        }
+    }
+    let reader = Arc::new(AnnReader::open(path)?);
+    cache.insert(
+        path.to_path_buf(),
+        CachedReader {
+            len,
+            modified,
+            reader: reader.clone(),
+        },
+    );
+    Ok(reader)
+}
+
+/// Drops a cached reader so the next access maps the file again.
+pub fn invalidate_cache(path: &Path) {
+    reader_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(path);
+}
+
 /// A tiny file-backed vector reader used by tests and tooling.
 pub fn read_all(path: &Path) -> io::Result<Vec<(String, Vec<f32>)>> {
-    let bytes = std::fs::read(path)?;
-    if bytes.len() < HEADER_SIZE || &bytes[..8] != MAGIC {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "not an ANN file",
-        ));
-    }
-    let dims = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
-    let clusters = u32::from_le_bytes(bytes[16..20].try_into().unwrap()) as usize;
-    let entries = u64::from_le_bytes(bytes[24..32].try_into().unwrap()) as usize;
-    let mut out = Vec::with_capacity(entries);
-    let vector_bytes = 4 + dims * 4;
-    let mut position = HEADER_SIZE + clusters * dims * 4 + (clusters + 1) * 8;
-    while position < bytes.len() && out.len() < entries {
-        let len = u32::from_le_bytes(bytes[position..position + 4].try_into().unwrap()) as usize;
-        position += 4;
-        let id = std::str::from_utf8(&bytes[position..position + len])
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
-            .to_string();
-        position += len;
-        let value = &bytes[position..position + vector_bytes];
-        let mut values = Vec::with_capacity(dims);
-        for index in 0..dims {
-            let start = 4 + index * 4;
-            values.push(f32::from_le_bytes(
-                value[start..start + 4].try_into().unwrap(),
-            ));
+    let reader = AnnReader::open(path)?;
+    let mut out = Vec::with_capacity(reader.entries);
+    let vector_bytes = 4 + reader.dims * 4;
+    for cluster in 0..reader.clusters {
+        let info = reader.cluster_info(cluster)?;
+        let mut position = info.data_start;
+        while position < info.data_end {
+            let len = read_u32(&reader.map, &mut position)? as usize;
+            let id_end = position
+                .checked_add(len)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "truncated ANN entry"))?;
+            let vector_end = id_end
+                .checked_add(vector_bytes)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "truncated ANN entry"))?;
+            if vector_end > info.data_end {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "truncated ANN entry",
+                ));
+            }
+            let id = std::str::from_utf8(&reader.map[position..id_end])
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
+                .to_string();
+            let values = vector::decode_vector(&reader.map[id_end..vector_end], reader.dims)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "bad ANN vector payload")
+                })?;
+            out.push((id, values));
+            position = vector_end;
         }
-        out.push((id, values));
-        position += vector_bytes;
     }
     Ok(out)
 }
@@ -626,6 +887,82 @@ pub fn read_all(path: &Path) -> io::Result<Vec<(String, Vec<f32>)>> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn cluster_chunks_cover_records_without_gaps() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("vectors.ann");
+        let vectors = (0..5000)
+            .map(|index| {
+                (
+                    format!("id-{index:05}"),
+                    vec![index as f32 / 5000.0, (index * 7 % 5000) as f32 / 5000.0],
+                )
+            })
+            .collect::<Vec<_>>();
+        let stats = build(&path, 2, VectorMetric::Cosine, &vectors, 1).unwrap();
+        assert_eq!(stats.clusters, 70);
+        let reader = AnnReader::open(&path).unwrap();
+        let mut checked = 0usize;
+        let mut largest = (0usize, 0usize);
+        for cluster in 0..reader.clusters {
+            let info = reader.cluster_info(cluster).unwrap();
+            if info.entry_count == 0 {
+                continue;
+            }
+            if info.entry_count > largest.1 {
+                largest = (cluster, info.entry_count);
+            }
+            let ranges = reader.cluster_ranges(&info, 4).unwrap();
+            assert!(!ranges.is_empty());
+            assert_eq!(ranges.first().unwrap().0, info.data_start);
+            assert_eq!(ranges.last().unwrap().1, info.data_end);
+            for window in ranges.windows(2) {
+                assert_eq!(window[0].1, window[1].0);
+            }
+            assert_eq!(
+                ranges.iter().map(|range| range.1 - range.0).sum::<usize>(),
+                info.data_end - info.data_start
+            );
+            for (start, end) in ranges {
+                let mut position = start;
+                while position < end {
+                    position = reader.next_record(position, end).unwrap();
+                }
+                assert_eq!(position, end);
+            }
+            checked += 1;
+        }
+        assert!(checked > 0);
+        let (largest_cluster, largest_count) = largest;
+        assert!(largest_count >= 8);
+        let info = reader.cluster_info(largest_cluster).unwrap();
+        let query = [0.37, 0.61];
+        let whole = reader
+            .scan_ranges(
+                &[(info.data_start, info.data_end)],
+                &query,
+                norm_of(&query),
+                largest_count,
+            )
+            .unwrap();
+        let ranges = reader.cluster_ranges(&info, 4).unwrap();
+        let chunked = reader
+            .scan_ranges(&ranges, &query, norm_of(&query), largest_count)
+            .unwrap();
+        assert_eq!(chunked.len(), whole.len());
+        let mut whole_ids = whole
+            .into_iter()
+            .map(|candidate| candidate.id)
+            .collect::<Vec<_>>();
+        let mut chunked_ids = chunked
+            .into_iter()
+            .map(|candidate| candidate.id)
+            .collect::<Vec<_>>();
+        whole_ids.sort();
+        chunked_ids.sort();
+        assert_eq!(whole_ids, chunked_ids);
+    }
 
     #[test]
     fn ann_finds_the_exact_nearest_vector_in_a_small_set() {
@@ -639,11 +976,31 @@ mod tests {
         ];
         let stats = build(&path, 2, VectorMetric::Cosine, &vectors, 2).unwrap();
         assert_eq!(stats.entries, 4);
+        assert!(is_compatible(&path));
         let reader = AnnReader::open(&path).unwrap();
         let heap = reader.search(&[1.0, 0.0], 2).unwrap();
         let mut found: Vec<_> = heap.into_iter().map(|candidate| candidate.id).collect();
         found.sort();
         assert_eq!(found, ["a", "b"]);
         assert_eq!(read_all(&path).unwrap().len(), 4);
+    }
+
+    #[test]
+    fn cached_reader_is_reused_and_reloaded_after_rebuild() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("vectors.ann");
+        let first = (0..32)
+            .map(|index| (format!("id-{index:03}"), vec![index as f32, 1.0]))
+            .collect::<Vec<_>>();
+        build(&path, 2, VectorMetric::Cosine, &first, 1).unwrap();
+        let cached = open_cached(&path).unwrap();
+        assert_eq!(cached.stats().entries, 32);
+        assert!(Arc::ptr_eq(&cached, &open_cached(&path).unwrap()));
+
+        let second = (0..64)
+            .map(|index| (format!("id-{index:03}"), vec![index as f32, 1.0]))
+            .collect::<Vec<_>>();
+        build(&path, 2, VectorMetric::Cosine, &second, 1).unwrap();
+        assert_eq!(open_cached(&path).unwrap().stats().entries, 64);
     }
 }

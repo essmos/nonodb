@@ -293,9 +293,9 @@ collection scan.
 
 ### IVF vector sidecar
 
-The optional IVF sidecar uses 512 clusters and probes 16 of them. Queries scan
-the probed clusters in parallel. Both data sets use 16-dimensional vectors and
-`limit=10`; latency excludes index build time.
+The 1M and 10M measurements below used 512 clusters and probed 16 of them.
+Queries scan the probed clusters in parallel. Both data sets use 16-dimensional
+vectors and `limit=10`; latency excludes index build time.
 
 | Operation | 1M p50 / p95 / p99 | 10M p50 / p95 / p99 |
 |---|---:|---:|
@@ -320,36 +320,36 @@ Filtered vector searches deliberately use the exact path.
 
 ### 100M ANN sidecar
 
-The 100M collection (`search100m`, 16 dimensions) was also indexed with the
-default 512 clusters and `nprobe=16`. The sidecar is **8.2 GB** and took roughly
-**5–6 minutes** to build. Thirty unfiltered queries with `limit=10` measured:
+The 100M collection (`search100m`, 16 dimensions) uses the v2 ANN sidecar with
+**4,096 clusters**, `nprobe=2`, and a checkpoint every 256 records. The sidecar
+is **8.2 GB** and took about **21 minutes** to build. Large clusters are split
+at checkpoints and scanned across all available cores, so a small `nprobe` still
+uses the whole machine. A 1,000-query run with `limit=10` measured:
 
-| Metric | 100M result |
-|---|---:|
-| ANN p50 | **92.2 ms** |
-| ANN p95 | **108.1 ms** |
-| ANN mean | **78.7 ms** |
-| ANN throughput | **12.7 qps** |
-| Exact p50 (all-cluster scan) | **6.12 s** |
-| Recall@10 on 20 sample queries | **1.0** |
+| Metric | ANN reader | Through the daemon |
+|---|---:|---:|
+| p50 | **5.35 ms** | **6.30 ms** |
+| p95 | **8.63 ms** | **9.32 ms** |
+| p99 | **10.36 ms** | **11.03 ms** |
+| Mean | 5.69 ms | 6.64 ms |
+| Throughput | 176 qps | 151 qps |
 
-The latency grows with vectors per probed cluster: 512 clusters leave about
-195k vectors per cluster, so 16 probes scan roughly 3.1M vectors. The probe
-count can be changed at restart without rebuilding the sidecar:
+Recall@10 on 10 sample queries was **1.0** against a full sidecar scan, whose
+p50 was **468 ms**. The daemon result includes fetching the ten matching
+documents from LMDB. Both the p50 and p95 targets (**≤ 12 ms** and **≤ 16 ms**)
+are met.
 
-| nprobe | p50 | p95 | QPS | Recall@10 |
-|---:|---:|---:|---:|---:|
-| 16 | 92.2 ms | 108.1 ms | 12.7 | **1.0** |
-| 4 | **34.4 ms** | **50.9 ms** | **40.3** | **1.0** |
-| 2 | **27.4 ms** | **39.8 ms** | **48.1** | **1.0** |
-| 1 | **20.9 ms** | **40.2 ms** | **57.6** | **0.75** |
+The daemon caches the memory-mapped reader per sidecar and invalidates it when
+the file length or modification time changes. Mapping the 8.2 GB file for every
+request discarded the process page tables for the probed ranges and added about
+5 ms per query; reusing the mapping removed that cost.
 
-`nprobe=2` is the best point on this sample: it cuts p50 by **3.4×** with no
-recall loss, while `nprobe=1` loses a quarter of the exact neighbours. For very
-large collections, `NONODB_VECTOR_ANN_CLUSTERS` raises the cluster cap (up to
-8,192) when building the sidecar, trading build time and memory for lower query
-latency. The optimal cluster/probe pair depends on the distinct-vector
-distribution; validate recall after changing either setting.
+The sidecar format is versioned. Version 1 files have no checkpoint metadata and
+are rejected, so a sidecar built by an older release must be rebuilt once.
+`NONODB_VECTOR_ANN_CLUSTERS` caps the cluster count at build time and defaults
+to **4,096** (up to 8,192); `NONODB_VECTOR_ANN_PROBE` can change the probe count
+at restart without a rebuild. The optimal cluster/probe pair depends on the
+distinct-vector distribution, so validate recall after changing either setting.
 
 ### Phrase positions
 
@@ -420,8 +420,8 @@ NONODB_SOCK=$S NONODB_TIMEOUT=1800 \
 NONODB_BUILD_VECTOR_ANN=1 NONODB_VECTOR_ANN_PROBE=16 \
 NONODB_VECTOR_ANN_COLLECTIONS=search1m,search10m nonodb-daemon
 
-# Optional: raise the IVF cluster cap for a very large collection
-NONODB_BUILD_VECTOR_ANN=1 NONODB_VECTOR_ANN_CLUSTERS=2048 \
+# Optional: override the IVF cluster cap for a very large collection
+NONODB_BUILD_VECTOR_ANN=1 NONODB_VECTOR_ANN_CLUSTERS=4096 \
 NONODB_VECTOR_ANN_COLLECTIONS=search100m nonodb-daemon
 
 # 1M and 10M search benchmarks
