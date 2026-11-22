@@ -95,6 +95,25 @@ def main() -> None:
         [{"$match": {"tags": {"$all": ["rust"]}}}, {"$count": "n"}]
     )
     assert out == [{"n": 3}], out
+
+    # $size takes exactly one argument like MongoDB: the single-expression and
+    # one-element array forms are equivalent, and two arguments are rejected.
+    out = c.aggregate(
+        [{"$match": {"_id": "a"}}, {"$project": {"n": {"$size": "$nums"}}}]
+    )
+    assert out == [{"_id": "a", "n": 3}], out
+    out = c.aggregate(
+        [{"$match": {"_id": "a"}}, {"$project": {"n": {"$size": ["$nums"]}}}]
+    )
+    assert out == [{"_id": "a", "n": 3}], out
+    out = c.aggregate(
+        [{"$match": {"_id": "a"}}, {"$project": {"n": {"$size": [[1, 2]]}, "_id": 0}}]
+    )
+    assert out == [{"n": 2}], out
+    expect(
+        "invalid_query",
+        lambda: c.aggregate([{"$project": {"n": {"$size": [1, 2]}}}]),
+    )
     c.create_text_index("kind")
     assert ids(c.search("kind", "x", filter={"nums": {"$size": 3}})) == ["a"]
     c.drop_text_index("kind")

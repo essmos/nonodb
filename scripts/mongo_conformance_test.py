@@ -228,6 +228,32 @@ def main() -> int:
             lambda db: db.items.insert_many(DOCS).inserted_ids,
         )
         check_both("find all", lambda db: sorted_docs(db))
+
+        check_both(
+            "$size single expression",
+            lambda db: [
+                doc["k"]
+                for doc in db.items.aggregate(
+                    [
+                        {"$match": {"_id": "a"}},
+                        {"$project": {"_id": 0, "k": {"$size": "$arr"}}},
+                    ]
+                )
+            ],
+        )
+        check_both(
+            "$size one-element array form",
+            lambda db: [
+                doc["k"]
+                for doc in db.items.aggregate(
+                    [
+                        {"$match": {"_id": "a"}},
+                        {"$project": {"_id": 0, "k": {"$size": ["$arr"]}}},
+                    ]
+                )
+            ],
+        )
+
         check_both(
             "insert text documents",
             lambda db: db.text_items.insert_many(TEXT_DOCS).inserted_ids,

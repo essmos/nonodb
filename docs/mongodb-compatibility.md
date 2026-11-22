@@ -422,7 +422,7 @@ allowed. Other BSON types are not accepted as `_id`.
 | Comparison and boolean | ✅ | Common comparison and `$and`/`$or`/`$not` forms |
 | Conditionals | ✅ | `$cond`, `$switch`, `$ifNull` |
 | Variables | ✅ | `$$ROOT`, `$$CURRENT`, `$let`, `$map`, `$filter`, `$reduce` |
-| Arrays | ✅ | `$in`, `$isArray`, `$arrayElemAt`, `$slice`, `$concatArrays` |
+| Arrays | ✅ | `$in`, `$isArray`, `$arrayElemAt`, `$slice`, `$concatArrays`; `$size` accepts one argument, either `"$size": "$arr"` or `"$size": ["$arr"]` |
 | Objects | ✅ | `$objectToArray`, `$arrayToObject`, `$mergeObjects` |
 | Strings | ✅ | Common operators including `$concat`, `$split`, `$substrCP`, `$regexMatch` |
 | Dates | 🟡 | Broad date support; UTC and fixed offsets only, no IANA zones |

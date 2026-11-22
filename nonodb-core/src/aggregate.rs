@@ -3303,11 +3303,10 @@ fn eval_operator(
             })
         }
         "$length" | "$size" => {
-            let values = args()?;
-            if values.len() != 1 {
-                return Err(Error::Query(format!("{op} requires one argument")));
-            }
-            Ok(match &values[0] {
+            // Like MongoDB, take exactly one argument: `{"$size": "$tags"}` and
+            // the one-element array form `{"$size": ["$tags"]}` both work.
+            let value = one_arg()?;
+            Ok(match &value {
                 Value::String(s) => Value::from(s.chars().count()),
                 Value::Array(items) => Value::from(items.len()),
                 _ => Value::Null,
@@ -4622,6 +4621,14 @@ mod tests {
         assert_eq!(eval(json!({"$isArray": "$nums"})), json!(true));
         assert_eq!(eval(json!({"$arrayElemAt": ["$nums", -1]})), json!(11));
         assert_eq!(eval(json!({"$slice": ["$nums", 1, 2]})), json!([7, 11]));
+        // $size takes one argument like MongoDB: the single-expression form and
+        // the one-element array form are equivalent, more arguments are rejected.
+        assert_eq!(eval(json!({"$size": "$nums"})), json!(3));
+        assert_eq!(eval(json!({"$size": ["$nums"]})), json!(3));
+        assert_eq!(eval(json!({"$size": [[3, 7]]})), json!(2));
+        assert_eq!(eval(json!({"$size": "$missing"})), json!(null));
+        assert!(eval_expr(&doc, &json!({"$size": [1, 2]})).is_err());
+        assert!(eval_expr(&doc, &json!({"$size": []})).is_err());
         assert_eq!(
             eval(json!({"$concatArrays": [[1, 2], [3]]})),
             json!([1, 2, 3])
