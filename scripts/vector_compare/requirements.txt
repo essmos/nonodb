@@ -1,0 +1,6 @@
+numpy>=2.0
+sentence-transformers>=6.3
+torch>=2.0
+qdrant-client==1.12.1
+elasticsearch==8.15.1
+tqdm>=4.66

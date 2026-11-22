@@ -1,8 +1,8 @@
 # Benchmarks
 
 This page keeps the large-scale results that matter for capacity planning:
-the **1B dense-document test** and the **BM25, fuzzy, and 100M IVF vector
-search** tests. Older microbenchmarks (CRUD, aggregation, vault, backup, connection
+the **1B dense-document test**, the **BM25 and fuzzy** tests, the **100M IVF
+vector** test, and the **500k real-embedding engine comparison**. Older microbenchmarks (CRUD, aggregation, vault, backup, connection
 scale) are intentionally not repeated here; they remain available in the git
 history.
 
@@ -15,6 +15,7 @@ filesystem, page cache, and client overhead all affect the result.
 |---|---|---|---|
 | 1B dense | 16 vCPU Xeon D-2141I, 31 GiB RAM | ZFS mirror, 438 GB | `v0.27.0`, 2026-11-20 |
 | 100M ANN sidecar | 16 vCPU Xeon D-2141I, 31 GiB RAM | ZFS, 438 GB | `v0.27.0`, 2026-11-22 |
+| 500k engine comparison | 16 vCPU Xeon D-2141I, 31 GiB RAM | ZFS, 438 GB | `v0.27.0`, 2026-11-22 |
 
 Do not compare rows from different hosts as if they came from one controlled
 run. The 100M dense comparator in the 1B table comes from an older ext4 host.
@@ -292,10 +293,46 @@ request discarded the process page tables for the probed ranges and added about
 
 The sidecar format is versioned. Version 1 files have no checkpoint metadata and
 are rejected, so a sidecar built by an older release must be rebuilt once.
-`NONODB_VECTOR_ANN_CLUSTERS` caps the cluster count at build time and defaults
-to **4,096** (up to 8,192); `NONODB_VECTOR_ANN_PROBE` can change the probe count
-at restart without a rebuild. The optimal cluster/probe pair depends on the
+`NONODB_VECTOR_ANN_CLUSTERS` sets an explicit target cluster count (up to
+8,192); without it the builder uses `sqrt(entries)`, capped at **4,096**.
+`NONODB_VECTOR_ANN_PROBE` can change the probe count at restart without a
+rebuild. The optimal cluster/probe pair depends on the
 distinct-vector distribution, so validate recall after changing either setting.
+
+### Real-embedding engine comparison (500k, 384D)
+
+The 100M sidecar benchmark uses 16-dimensional synthetic vectors. Real
+embeddings are much wider, so a separate comparison used 500,000 real MS MARCO
+passages, 1,000 real MS MARCO queries, and 384-dimensional
+`all-MiniLM-L6-v2` embeddings. Ground truth was exact NumPy cosine top-10 over
+all vectors; every engine used a single sequential client and `limit=10`.
+Qdrant and Elasticsearch ran on the same host.
+
+| Engine | Config | p50 ms | p95 ms | p99 ms | QPS | Recall@10 |
+|---|---|---:|---:|---:|---:|---:|
+| NonoDB exact | no sidecar | 346.86 | 360.25 | 364.86 | 2.9 | 1.0000 |
+| NonoDB ANN | 707 clusters, `nprobe=80` | 8.06 | 9.46 | 10.50 | 121.4 | 0.9579 |
+| Qdrant HNSW | `m=16`, `ef_construct=100`, `hnsw_ef=32` | **2.26** | **2.64** | **2.88** | **431.5** | **0.9637** |
+| Elasticsearch HNSW | `m=16`, `ef_construction=100`, `num_candidates=64` | 4.47 | 5.06 | 5.36 | 221.1 | 0.9529 |
+
+The selected latency rows are medians of three runs; recall was identical
+across repeats. At comparable recall, Qdrant was about **3.6× faster than
+NonoDB ANN** at p50, and Elasticsearch about **1.8× faster**. NonoDB ANN was
+about **43× faster than its own exact scan**. Raising recall increased latency only mildly for the HNSW
+engines: Qdrant reached 0.9947 recall at 3.09 ms p50 (`hnsw_ef=128`), and
+Elasticsearch reached 0.9781 at 5.41 ms (`num_candidates=128`).
+
+Load and build times were: NonoDB 500k docs in 205 s plus a 15.2 s exact vector
+index and 40 s for the ANN sidecar; Qdrant 114 s plus 15 s for HNSW
+readiness; Elasticsearch 852 s including force-merge. On disk, NonoDB used
+8.4 GB (documents, exact index, and the 741 MB ANN sidecar), Qdrant 854 MB
+without payload text, and Elasticsearch 3.7 GB for body plus vector.
+
+Storage and indexing are not perfectly equivalent: Qdrant stored only vectors,
+while NonoDB and Elasticsearch also stored the passage text. Filtered vector
+search is not compared because NonoDB deliberately falls back to an exact scan
+when a filter is active. The harness and per-engine tuning points are in
+[`scripts/vector_compare`](../scripts/vector_compare/README.md).
 
 ### Phrase positions
 

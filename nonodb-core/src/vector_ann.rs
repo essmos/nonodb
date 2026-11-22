@@ -29,6 +29,18 @@ const TRAINING_ITERATIONS: usize = 8;
 const MIN_BYTES_PER_WORKER: usize = 1 << 20;
 const MAX_SEARCH_WORKERS: usize = 64;
 
+fn cluster_target(entries: usize, sample: usize, configured: Option<usize>) -> usize {
+    let ceiling = configured
+        .unwrap_or(DEFAULT_MAX_CLUSTERS)
+        .clamp(1, MAX_CLUSTERS_LIMIT);
+    let base = if configured.is_some() {
+        ceiling
+    } else {
+        entries.max(1).isqrt().clamp(1, DEFAULT_MAX_CLUSTERS)
+    };
+    base.clamp(1, ceiling).min(sample.max(1))
+}
+
 fn search_worker_limit() -> usize {
     std::env::var("NONODB_SEARCH_WORKERS")
         .ok()
@@ -182,6 +194,54 @@ fn nearest_centroid(
     best
 }
 
+#[allow(clippy::too_many_arguments)]
+fn kmeans_iteration(
+    metric: VectorMetric,
+    sample: &[Vec<f32>],
+    centroids: &[Vec<f32>],
+    centroid_norms: &[f32],
+    clusters: usize,
+    dims: usize,
+    workers: usize,
+) -> (Vec<Vec<f32>>, Vec<usize>) {
+    let workers = workers.min(sample.len().max(1));
+    let chunk = sample.len().div_ceil(workers).max(1);
+    let parts = std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for start in (0..sample.len()).step_by(chunk) {
+            let end = (start + chunk).min(sample.len());
+            handles.push(scope.spawn(move || {
+                let mut sums = vec![vec![0.0f32; dims]; clusters];
+                let mut counts = vec![0usize; clusters];
+                for vector in &sample[start..end] {
+                    let norm = norm_of(vector);
+                    let cluster = nearest_centroid(metric, vector, norm, centroids, centroid_norms);
+                    counts[cluster] += 1;
+                    for (sum, value) in sums[cluster].iter_mut().zip(vector) {
+                        *sum += *value;
+                    }
+                }
+                (sums, counts)
+            }));
+        }
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("kmeans worker panicked"))
+            .collect::<Vec<_>>()
+    });
+    let mut sums = vec![vec![0.0f32; dims]; clusters];
+    let mut counts = vec![0usize; clusters];
+    for (part_sums, part_counts) in parts {
+        for cluster in 0..clusters {
+            counts[cluster] += part_counts[cluster];
+            for (sum, add) in sums[cluster].iter_mut().zip(&part_sums[cluster]) {
+                *sum += *add;
+            }
+        }
+    }
+    (sums, counts)
+}
+
 fn training_vectors(metric: VectorMetric, vectors: &[(String, Vec<f32>)]) -> Vec<Vec<f32>> {
     let sample = vectors.len().min(MAX_TRAINING);
     if sample == 0 {
@@ -261,17 +321,10 @@ pub fn build(
         ));
     }
     let sample = training_vectors(metric, vectors);
-    let max_clusters = std::env::var("NONODB_VECTOR_ANN_CLUSTERS")
+    let configured_clusters = std::env::var("NONODB_VECTOR_ANN_CLUSTERS")
         .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(DEFAULT_MAX_CLUSTERS)
-        .clamp(1, MAX_CLUSTERS_LIMIT);
-    let clusters = vectors
-        .len()
-        .max(1)
-        .isqrt()
-        .clamp(1, max_clusters)
-        .min(sample.len().max(1));
+        .and_then(|value| value.parse::<usize>().ok());
+    let clusters = cluster_target(vectors.len(), sample.len(), configured_clusters);
     let nprobe = nprobe.clamp(1, clusters);
 
     let mut centroids: Vec<Vec<f32>> = (0..clusters)
@@ -284,21 +337,24 @@ pub fn build(
         })
         .collect();
 
+    let training_workers = std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(1)
+        .clamp(1, 16);
     for iteration in 0..TRAINING_ITERATIONS {
         if sample.is_empty() {
             break;
         }
         let centroid_norms: Vec<f32> = centroids.iter().map(|centroid| norm_of(centroid)).collect();
-        let mut sums = vec![vec![0.0f32; dims]; clusters];
-        let mut counts = vec![0usize; clusters];
-        for vector in &sample {
-            let norm = norm_of(vector);
-            let cluster = nearest_centroid(metric, vector, norm, &centroids, &centroid_norms);
-            counts[cluster] += 1;
-            for (sum, value) in sums[cluster].iter_mut().zip(vector) {
-                *sum += *value;
-            }
-        }
+        let (sums, counts) = kmeans_iteration(
+            metric,
+            &sample,
+            &centroids,
+            &centroid_norms,
+            clusters,
+            dims,
+            training_workers,
+        );
         for (cluster, centroid) in centroids.iter_mut().enumerate() {
             if counts[cluster] == 0 {
                 *centroid = sample[(iteration * 31 + cluster) % sample.len()].clone();
@@ -983,6 +1039,15 @@ mod tests {
         found.sort();
         assert_eq!(found, ["a", "b"]);
         assert_eq!(read_all(&path).unwrap().len(), 4);
+    }
+
+    #[test]
+    fn configured_cluster_count_is_a_target() {
+        assert_eq!(cluster_target(500_000, 100_000, None), 707);
+        assert_eq!(cluster_target(500_000, 100_000, Some(4_096)), 4_096);
+        assert_eq!(cluster_target(10, 10, Some(4_096)), 10);
+        assert_eq!(cluster_target(100_000_000, 100_000, None), 4_096);
+        assert_eq!(cluster_target(100_000_000, 100_000, Some(8_192)), 8_192);
     }
 
     #[test]

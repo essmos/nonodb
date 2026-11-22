@@ -142,7 +142,7 @@ secrets.
 | `NONODB_REBUILD_SEARCH_STATS_COLLECTIONS` | unset | Comma-separated collections for the statistics scan |
 | `NONODB_BUILD_VECTOR_ANN` | `0` | Build missing vector ANN sidecars in the default database at startup |
 | `NONODB_VECTOR_ANN_PROBE` | `16` | Clusters probed by an ANN vector query; can be changed at restart without rebuilding the sidecar |
-| `NONODB_VECTOR_ANN_CLUSTERS` | `4096` | Maximum IVF clusters when building a vector ANN sidecar (1–8,192) |
+| `NONODB_VECTOR_ANN_CLUSTERS` | unset | Target IVF clusters when building a vector ANN sidecar; otherwise `sqrt(entries)`, capped at 4,096 (1–8,192) |
 | `NONODB_VECTOR_ANN_COLLECTIONS` | unset | Comma-separated collections for `NONODB_BUILD_VECTOR_ANN` |
 | `NONODB_SNAPSHOT_INTERVAL` | `300` | Snapshot interval in seconds |
 | `NONODB_SNAPSHOT_KEEP` | `24` | Number of snapshot files to retain |

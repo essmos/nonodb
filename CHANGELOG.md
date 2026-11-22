@@ -4,6 +4,16 @@ Full release notes: https://github.com/essmos/nonodb/releases
 
 ## Unreleased
 
+- Parallelize IVF k-means training across up to 16 threads and let an explicit
+  `NONODB_VECTOR_ANN_CLUSTERS` value select the target cluster count instead of
+  only acting as a cap. A 500k/384D build with 4,096 clusters dropped from over
+  20 minutes to 210 s; the default 707-cluster build takes 40 s.
+- Add `scripts/vector_compare`, a reproducible harness comparing NonoDB exact
+  and IVF vector search with Qdrant HNSW and Elasticsearch `dense_vector` HNSW
+  on real MS MARCO passages and queries. On 500k passages with 384-dimensional
+  MiniLM embeddings, NonoDB ANN reached recall@10 0.958 at 8.06 ms p50 versus
+  2.26 ms for Qdrant and 4.47 ms for Elasticsearch at comparable recall. The
+  exact NonoDB path took 346.86 ms p50.
 - Read only segment format v3. Older v2 text segments are rejected instead of
   falling back to document-based phrase verification. The
   `NONODB_SEGMENT_POSITIONS` switch is removed; text segments always store
@@ -22,8 +32,6 @@ Full release notes: https://github.com/essmos/nonodb/releases
   CLI backups accept `--without-search-sidecars`; scheduled jobs use
   `include_search_sidecars: false`. Age-encrypted jobs encrypt each sidecar
   file with the same recipient as the LMDB payload.
-- Add `NONODB_VECTOR_ANN_CLUSTERS` (up to 8,192) to tune IVF cluster count for
-  very large vector collections. The default is now 4,096.
 - Bump the vector ANN sidecar to format v2 with a checkpoint table per cluster.
   Queries split large clusters into checkpoint ranges and scan them across all
   cores instead of using one thread per probed cluster. The 100M benchmark drops
