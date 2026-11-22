@@ -71,11 +71,11 @@ The stack is:
 deploy/docker-compose.quickstart.yml
 ```
 
-Pin the image explicitly in production. The file defaults to `0.28.0`; you can
+Pin the image explicitly in production. The file defaults to `0.29.0`; you can
 override it:
 
 ```bash
-export NONODB_IMAGE=ghcr.io/essmos/nonodb:0.28.0
+export NONODB_IMAGE=ghcr.io/essmos/nonodb:0.29.0
 ```
 
 ## Initialize auth once
@@ -153,7 +153,7 @@ numeric IDs with:
 
 ```bash
 docker run --rm --entrypoint sh \
-  ghcr.io/essmos/nonodb:0.28.0 \
+  ghcr.io/essmos/nonodb:0.29.0 \
   -c 'id -u; id -g'
 ```
 

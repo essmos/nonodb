@@ -4,9 +4,18 @@ Full release notes: https://github.com/essmos/nonodb/releases
 
 ## Unreleased
 
+## v0.29.0 - 2026-11-22
+
 - Add `AsyncNonoDB` to the Python client for async `watch_once`, `watch`,
   `watch_stream`, and `watch_live` consumption, and document its use with
   FastAPI and other asyncio applications.
+- Reject unknown filter operators in find/count/update/delete and inside `$expr`
+  with `BadValue` instead of silently matching nothing. This closes the
+  `$nor`/`$not` data-loss path where a typo could match every document.
+- Accept MongoDB's canonical single-expression `$size` form
+  (`{"$size": "$field"}`) in addition to the one-element array form.
+- Document that a plain unique index has the same semantics as MongoDB's
+  `unique + sparse`, including the explicit-`null` caveat.
 
 ## v0.28.0 - 2026-11-22
 

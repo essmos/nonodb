@@ -16,7 +16,7 @@
 
 services:
   auth-init:
-    image: ${NONODB_IMAGE:-ghcr.io/essmos/nonodb:0.28.0}
+    image: ${NONODB_IMAGE:-ghcr.io/essmos/nonodb:0.29.0}
     profiles: ["init"]
     user: "0"
     entrypoint: ["/bin/sh", "-c"]
@@ -32,7 +32,7 @@ services:
       - nonodb-auth:/etc/nonodb
 
   nonodb:
-    image: ${NONODB_IMAGE:-ghcr.io/essmos/nonodb:0.28.0}
+    image: ${NONODB_IMAGE:-ghcr.io/essmos/nonodb:0.29.0}
     container_name: nonodb
     restart: unless-stopped
     environment:
@@ -46,7 +46,7 @@ services:
       - nonodb-auth:/etc/nonodb:ro
 
   nonodb-gui:
-    image: ${NONODB_IMAGE:-ghcr.io/essmos/nonodb:0.28.0}
+    image: ${NONODB_IMAGE:-ghcr.io/essmos/nonodb:0.29.0}
     container_name: nonodb-gui
     profiles: ["gui"]
     restart: unless-stopped
