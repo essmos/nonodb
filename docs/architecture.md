@@ -654,12 +654,11 @@ Current limits:
 
 - one field per segment index; native and MongoDB-style `$text` queries use
   the same segment path;
-- segment text files store token positions in an appended section (format v3).
+- segment text files use format v3 with token positions in an appended section.
   Positive phrases are verified from those positions during candidate ranking,
-  and each matching phrase adds a score bonus. Older v2 segments and indexes
-  built with `NONODB_SEGMENT_POSITIONS=0` fall back to verifying phrases against
-  the current LMDB document. Negative terms and negative phrases still use the
-  document verifier;
+  and each matching phrase adds a score bonus. Older segment versions are
+  rejected at open time; rebuild the index instead of migrating it. Negative
+  terms and negative phrases still use the document verifier;
 - filters use an indexed candidate set when possible; compound and non-indexed
   filters are verified against current documents and are correspondingly slower;
 - BM25 document count, average length, and per-term document frequency are

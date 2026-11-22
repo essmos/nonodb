@@ -3843,22 +3843,6 @@ impl<'e> Collection<'e> {
         Ok(out)
     }
 
-    fn segment_text_has_positions_in(&self, rtxn: &RoTxn<'_>, index: &str) -> Result<bool> {
-        let Some(manifest) = self.segment_manifest_in(rtxn, index)? else {
-            return Ok(false);
-        };
-        if manifest.segments.is_empty() {
-            return Ok(true);
-        }
-        let root = self.segment_root()?;
-        for rel in &manifest.segments {
-            if !SegmentReader::open(root.join(rel))?.has_positions() {
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn search_segment_text_index_in(
         &self,
@@ -3908,9 +3892,6 @@ impl<'e> Collection<'e> {
             set.search_verified(query, skip, max, allowed, verify)?
         } else {
             set.search_verified_phrases(query, skip, max, allowed, verify, phrases)?
-                .ok_or_else(|| {
-                    Error::Query("segment phrase positions disappeared during search".into())
-                })?
         };
         let mut out = Vec::with_capacity(hits.len());
         for hit in hits {
@@ -3964,8 +3945,6 @@ impl<'e> Collection<'e> {
         let needs_filter = !empty_filter && allowed.is_none();
         let needs_negative =
             !parsed.negative_terms.is_empty() || !parsed.negative_phrases.is_empty();
-        let needs_phrases = !parsed.phrases.is_empty();
-        let use_positions = needs_phrases && self.segment_text_has_positions_in(rtxn, &def.name)?;
         let mut candidate_terms = parsed.positive_terms.clone();
         for phrase in &parsed.phrases {
             candidate_terms.extend(phrase.iter().cloned());
@@ -3988,8 +3967,7 @@ impl<'e> Collection<'e> {
             if needs_filter && !matches(&doc, filter) {
                 return Ok(None);
             }
-            let mut matched_phrases = 0usize;
-            if needs_negative || (needs_phrases && !use_positions) {
+            if needs_negative {
                 let tokens: Vec<String> = def
                     .fields
                     .iter()
@@ -4012,22 +3990,10 @@ impl<'e> Collection<'e> {
                 {
                     return Ok(None);
                 }
-                if needs_phrases && !use_positions {
-                    matched_phrases = parsed
-                        .phrases
-                        .iter()
-                        .filter(|phrase| search::contains_phrase(&tokens, phrase))
-                        .count();
-                    if matched_phrases != parsed.phrases.len() {
-                        return Ok(None);
-                    }
-                }
             }
-            Ok(Some(matched_phrases as f64))
+            Ok(Some(0.0))
         };
-        let verify: Option<&DocVerifier<'_>> =
-            (needs_filter || needs_negative || (needs_phrases && !use_positions))
-                .then_some(&verify);
+        let verify: Option<&DocVerifier<'_>> = (needs_filter || needs_negative).then_some(&verify);
         self.search_segment_text_index_in(
             rtxn,
             &def,
@@ -4036,7 +4002,7 @@ impl<'e> Collection<'e> {
             limit,
             allowed.as_ref(),
             verify,
-            if use_positions { &parsed.phrases } else { &[] },
+            &parsed.phrases,
         )
     }
 

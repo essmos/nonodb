@@ -4,6 +4,10 @@ Full release notes: https://github.com/essmos/nonodb/releases
 
 ## Unreleased
 
+- Read only segment format v3. Older v2 text segments are rejected instead of
+  falling back to document-based phrase verification. The
+  `NONODB_SEGMENT_POSITIONS` switch is removed; text segments always store
+  positions. Rebuild old text indexes.
 - Remove the legacy LMDB text/fuzzy search backend. Text and fuzzy definitions
   now always use immutable segments; the `SearchEngine` field, LMDB posting
   paths, `NONODB_SEGMENT_TEXT`, `NONODB_SEGMENT_FUZZY`, and the in-place

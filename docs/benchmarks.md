@@ -365,9 +365,8 @@ against the v3 indexes:
 
 Positions are stored as varint-encoded term ordinals in a per-segment
 dictionary rather than repeating token strings. The 8.84M segment is about
-**3.09 GB** and the 1M rebuilt segment is about **358 MB**. Set
-`NONODB_SEGMENT_POSITIONS=0` before building an index to omit positions and
-save space.
+**3.09 GB** and the 1M rebuilt segment is about **358 MB**. Positions are
+mandatory in the v3 format; there is no positions-off mode.
 
 ---
 

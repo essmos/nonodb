@@ -140,7 +140,6 @@ secrets.
 | `NONODB_REBUILD_MISSING_SEARCH` | `0` | Rebuild missing text/fuzzy segment files and vector ANN sidecars for all databases at startup |
 | `NONODB_REBUILD_SEARCH_STATS` | auto | Missing exact BM25 statistics are filled automatically at startup; `force` recomputes every index, `0` disables the automatic fill |
 | `NONODB_REBUILD_SEARCH_STATS_COLLECTIONS` | unset | Comma-separated collections for the statistics scan |
-| `NONODB_SEGMENT_POSITIONS` | `1` | Store token positions in new text segments for phrase queries; `0` saves disk and uses the LMDB document fallback |
 | `NONODB_BUILD_VECTOR_ANN` | `0` | Build missing vector ANN sidecars in the default database at startup |
 | `NONODB_VECTOR_ANN_PROBE` | `16` | Clusters probed by an ANN vector query; can be changed at restart without rebuilding the sidecar |
 | `NONODB_VECTOR_ANN_CLUSTERS` | `512` | Maximum IVF clusters when building a vector ANN sidecar (1–8,192) |
@@ -1006,6 +1005,8 @@ backups.
 - Text and fuzzy indexes created by releases with the legacy LMDB backend must
   be dropped and recreated as segment indexes. Current releases do not read the
   old LMDB postings/trigrams. New search definitions cover exactly one field.
+- Segment text files must be format v3. Older v2 segments without phrase
+  positions are rejected; drop and rebuild the text index.
 - Schema version is stored in metadata. There is currently no automatic
   migration framework; changes are handled by explicit commands and releases.
 
