@@ -84,9 +84,15 @@ def main() -> int:
     procs: list[subprocess.Popen[bytes]] = []
     clients: list[httpx.Client] = []
 
-    def start(name: str, role: str, auth: Path, extra: dict[str, str]) -> httpx.Client:
-        data = temp / f"{name}-data"
-        data.mkdir()
+    def start(
+        name: str,
+        role: str,
+        auth: Path,
+        extra: dict[str, str],
+        data_dir: Path | None = None,
+    ) -> httpx.Client:
+        data = data_dir or temp / f"{name}-data"
+        data.mkdir(exist_ok=True)
         env = os.environ.copy()
         env.update(
             NONODB_DATA=str(data),
@@ -144,6 +150,23 @@ def main() -> int:
             json={"code": code, "node_id": "replica-one"},
         )
         assert reused.status_code == 401, reused.text
+
+        # Join requests a controlled restart (exit 75) so snapshot bootstrap
+        # copies the primary's auth registry before the replica reopens.
+        replica_proc = procs[-1]
+        for _ in range(300):
+            if replica_proc.poll() is not None:
+                break
+            time.sleep(0.1)
+        assert replica_proc.returncode == 75, replica_proc.returncode
+        replica.close()
+        replica = start(
+            "replica",
+            "replica",
+            replica_auth,
+            {},
+            data_dir=temp / "replica-data",
+        )
 
         def synced_auth() -> bool:
             return json.loads(primary_auth.read_text()) == json.loads(replica_auth.read_text())

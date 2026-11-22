@@ -10,6 +10,9 @@ Full release notes: https://github.com/essmos/nonodb/releases
   `whenMatched`, and `$graphLookup` sub-pipelines, so unknown operators fail
   instead of silently returning empty results.
 - Update the Node.js MongoDB driver test for single-field text indexes.
+- Update the replication control-plane test for the controlled exit-75 restart
+  after `replication join`, so auth-registry replication is checked after the
+  replica bootstraps.
 
 ## v0.29.0 - 2026-11-22
 
