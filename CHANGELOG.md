@@ -18,6 +18,10 @@ Full release notes: https://github.com/essmos/nonodb/releases
   bootstrap, with a rebuild fallback when a source file is unavailable.
 - Run legacy search-index migration across all databases and allow limiting it
   with `NONODB_MIGRATE_SEARCH_COLLECTIONS`; skip migration on non-primary nodes.
+- Fix segment BM25 top-k correctness around block pruning and score ties.
+  Block skipping now decodes the next block instead of ending the posting list,
+  stored `f32` maxima are rounded up before pruning, and equal-score results
+  retain the lowest document ids.
 - Store token positions in segment text files (format v3) and verify positive
   phrases from those positions, falling back to LMDB documents for legacy v2
   segments. Position data uses a per-segment term dictionary and compact term

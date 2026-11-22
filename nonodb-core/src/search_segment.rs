@@ -1455,9 +1455,12 @@ impl PartialEq for ScoredDoc {
 impl Eq for ScoredDoc {}
 impl Ord for ScoredDoc {
     fn cmp(&self, other: &Self) -> Ordering {
+        // Higher score is better; for equal scores a lower doc id is better.
+        // The heap keeps `Reverse<ScoredDoc>`, so its minimum must be the
+        // worst entry: lowest score and, on ties, highest doc id.
         self.score
             .total_cmp(&other.score)
-            .then_with(|| self.doc.cmp(&other.doc))
+            .then_with(|| other.doc.cmp(&self.doc))
     }
 }
 impl PartialOrd for ScoredDoc {
@@ -2094,7 +2097,7 @@ impl SegmentReader {
             } else {
                 0.0
             };
-            if heap.len() >= limit && cursor.block_max() <= threshold {
+            if heap.len() >= limit && cursor.block_max() < threshold {
                 if !cursor.skip_block()? {
                     break;
                 }
@@ -2221,7 +2224,7 @@ impl SegmentReader {
                     break;
                 }
                 if second.current().map(|p| p.doc).unwrap_or(u32::MAX) > block_last {
-                    if !rare_cursor.skip_block_fast()? {
+                    if !rare_cursor.skip_block()? {
                         break;
                     }
                     continue;
@@ -2273,6 +2276,14 @@ fn push_hit(heap: &mut BinaryHeap<Reverse<ScoredDoc>>, hit: ScoredDoc, limit: us
     }
 }
 
+/// Block maxima are stored as `f32`, so round the bound upward before using it
+/// to skip postings. Without this margin a score just above the threshold can
+/// be discarded after the f32 cast.
+fn score_bound(idf: f64, max_tf_norm: f64) -> f64 {
+    let bound = idf * max_tf_norm;
+    bound + bound.abs() * 1e-6 + f64::EPSILON
+}
+
 fn bm25(idf: f64, tf: u32, dl: u32, avgdl: f64) -> f64 {
     let tf = f64::from(tf);
     let dl = f64::from(dl);
@@ -2299,12 +2310,12 @@ impl<'a> Cursor<'a> {
             reader,
             idf,
             df: entry.df,
-            term_max: idf * entry.max_tf_norm,
+            term_max: score_bound(idf, entry.max_tf_norm),
             next_block: entry.postings_off,
             remaining_blocks: entry.block_count,
             block: Vec::new(),
             pos: 0,
-            block_max: idf * entry.max_tf_norm,
+            block_max: score_bound(idf, entry.max_tf_norm),
             block_first: 0,
             block_last: 0,
         };
@@ -2357,7 +2368,10 @@ impl<'a> Cursor<'a> {
     }
 
     fn skip_block(&mut self) -> io::Result<bool> {
-        self.skip_block_fast()
+        if !self.skip_block_fast()? {
+            return Ok(false);
+        }
+        self.load_next_block()
     }
 
     /// Advance to the next block using only its header. This is what makes
@@ -2427,7 +2441,7 @@ impl<'a> Cursor<'a> {
         self.remaining_blocks -= 1;
         self.block = postings;
         self.pos = 0;
-        self.block_max = self.idf * max_tf_norm;
+        self.block_max = score_bound(self.idf, max_tf_norm);
         self.block_first = first_doc;
         self.block_last = last_doc;
         Ok(true)
@@ -2648,6 +2662,111 @@ mod tests {
         let mut ids: Vec<_> = hits.into_iter().map(|hit| hit.id).collect();
         ids.sort();
         assert_eq!(ids, ["a", "d", "delta"]);
+    }
+
+    fn brute_search(docs: &[(String, String)], query: &str, limit: usize) -> Vec<String> {
+        let mut terms = search::tokenize(query);
+        terms.sort();
+        terms.dedup();
+        let tokenized: Vec<(String, Vec<String>)> = docs
+            .iter()
+            .map(|(id, text)| (id.clone(), search::tokenize(text)))
+            .collect();
+        let total_len: usize = tokenized.iter().map(|(_, tokens)| tokens.len()).sum();
+        let n = tokenized.len() as f64;
+        let avgdl = total_len as f64 / n;
+        let idf: Vec<f64> = terms
+            .iter()
+            .map(|term| {
+                let df = tokenized
+                    .iter()
+                    .filter(|(_, tokens)| tokens.contains(term))
+                    .count() as f64;
+                (1.0 + (n - df + 0.5) / (df + 0.5)).ln()
+            })
+            .collect();
+        let mut scored = Vec::new();
+        for (id, tokens) in &tokenized {
+            let mut score = 0.0;
+            let mut matches = true;
+            for (term, idf) in terms.iter().zip(&idf) {
+                let tf = tokens.iter().filter(|token| *token == term).count() as f64;
+                if tf == 0.0 {
+                    matches = false;
+                    break;
+                }
+                let dl = tokens.len() as f64;
+                score += idf * tf * (BM25_K1 + 1.0)
+                    / (tf + BM25_K1 * (1.0 - BM25_B + BM25_B * dl / avgdl));
+            }
+            if matches {
+                scored.push((id.clone(), score));
+            }
+        }
+        scored.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        scored.into_iter().take(limit).map(|(id, _)| id).collect()
+    }
+
+    #[test]
+    fn wand_pruning_matches_brute_force() {
+        let mut docs = Vec::new();
+        for i in 0..500usize {
+            let mut words = Vec::new();
+            if i % 7 != 0 {
+                words.extend(std::iter::repeat_n("alpha", 1 + i % 5));
+            }
+            if i % 5 != 0 {
+                words.extend(std::iter::repeat_n("beta", 1 + (i / 3) % 4));
+            }
+            if i % 11 != 0 {
+                words.extend(std::iter::repeat_n("gamma", 1 + (i / 7) % 3));
+            }
+            words.push("noise");
+            if i % 13 == 0 {
+                words.push("noise");
+            }
+            // Vary document length so BM25 scores are not all identical; WAND
+            // may legitimately choose any subset among exact score ties.
+            words.extend(std::iter::repeat_n("filler", i));
+            docs.push((format!("doc{i:04}"), words.join(" ")));
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wand.seg");
+        let mut builder = SegmentBuilder::new(&path).unwrap();
+        for (id, text) in &docs {
+            builder.add_document(id, text).unwrap();
+        }
+        builder.finish().unwrap();
+        let reader = SegmentReader::open(&path).unwrap();
+        for query in ["alpha", "alpha beta", "alpha beta gamma", "beta gamma"] {
+            for limit in [1, 3, 10] {
+                let actual: Vec<String> = reader
+                    .search(query, limit)
+                    .unwrap()
+                    .into_iter()
+                    .map(|hit| hit.id)
+                    .collect();
+                let expected = brute_search(&docs, query, limit);
+                assert_eq!(actual, expected, "query={query:?} limit={limit}");
+            }
+        }
+    }
+
+    #[test]
+    fn top_k_keeps_lowest_ids_on_score_ties() {
+        let (_dir, reader) = build(&[
+            ("a", "alpha"),
+            ("b", "alpha"),
+            ("c", "alpha"),
+            ("d", "alpha alpha"),
+        ]);
+        let ids: Vec<_> = reader
+            .search("alpha", 3)
+            .unwrap()
+            .into_iter()
+            .map(|hit| hit.id)
+            .collect();
+        assert_eq!(ids, ["d", "a", "b"]);
     }
 
     #[test]
