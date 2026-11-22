@@ -33,7 +33,8 @@ use memmap2::Mmap;
 use crate::search::{self, BM25_B, BM25_K1};
 
 const MAGIC: &[u8; 8] = b"NODBSEG1";
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
+const MIN_VERSION: u32 = 2;
 const HEADER_LEN: u64 = 72;
 const TERM_BLOCK_TERMS: usize = 64;
 const POSTING_BLOCK: usize = 128;
@@ -49,6 +50,7 @@ struct Header {
     terms_off: u64,
     term_index_off: u64,
     postings_off: u64,
+    positions_off: u64,
 }
 
 impl Header {
@@ -62,7 +64,7 @@ impl Header {
             ));
         }
         let version = read_u32(&mut r)?;
-        if version != VERSION {
+        if !(MIN_VERSION..=VERSION).contains(&version) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unsupported segment version {version}"),
@@ -77,6 +79,7 @@ impl Header {
             terms_off: read_u64(&mut r)?,
             term_index_off: read_u64(&mut r)?,
             postings_off: read_u64(&mut r)?,
+            positions_off: read_u64(&mut r)?,
         })
     }
 
@@ -91,7 +94,7 @@ impl Header {
         write_u64(w, self.terms_off)?;
         write_u64(w, self.term_index_off)?;
         write_u64(w, self.postings_off)?;
-        w.write_all(&[0u8; 8])?;
+        write_u64(w, self.positions_off)?;
         Ok(())
     }
 }
@@ -171,6 +174,14 @@ pub struct SegmentBuilder {
     chunk: Vec<Record>,
     chunks: Vec<Chunk>,
     total_doc_len: u64,
+    positions: Option<PositionWriter>,
+    positions_allowed: bool,
+}
+
+struct PositionWriter {
+    file: io::BufWriter<File>,
+    offsets: Vec<u64>,
+    data_len: u64,
 }
 
 impl SegmentBuilder {
@@ -184,6 +195,9 @@ impl SegmentBuilder {
             fs::remove_dir_all(&work_dir)?;
         }
         fs::create_dir_all(&work_dir)?;
+        let positions_allowed = std::env::var("NONODB_SEGMENT_POSITIONS")
+            .ok()
+            .is_none_or(|value| !matches!(value.as_str(), "0" | "false" | "no" | "off"));
         Ok(Self {
             path,
             work_dir,
@@ -194,6 +208,8 @@ impl SegmentBuilder {
             chunk: Vec::new(),
             chunks: Vec::new(),
             total_doc_len: 0,
+            positions: None,
+            positions_allowed,
         })
     }
 
@@ -206,6 +222,13 @@ impl SegmentBuilder {
                 format!("duplicate document id `{id}`"),
             ));
         }
+        if self.positions.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot mix token positions with term-only documents",
+            ));
+        }
+        self.positions_allowed = false;
         let doc = self.doc_ids.len() as u32;
         self.doc_index.insert(id.to_string(), doc);
         self.doc_ids.push(id.to_string());
@@ -252,6 +275,9 @@ impl SegmentBuilder {
         let tokens = search::tokenize(text);
         let dl = tokens.len() as u32;
         self.total_doc_len += u64::from(dl);
+        if self.positions_allowed {
+            self.write_positions(&tokens)?;
+        }
 
         // A local map avoids allocating one String per posting record.
         let mut freqs: HashMap<String, u32> = HashMap::new();
@@ -281,6 +307,27 @@ impl SegmentBuilder {
         Ok(())
     }
 
+    fn write_positions(&mut self, tokens: &[String]) -> io::Result<()> {
+        if self.positions.is_none() {
+            let file = io::BufWriter::new(File::create(self.work_dir.join("positions.tmp"))?);
+            self.positions = Some(PositionWriter {
+                file,
+                offsets: Vec::new(),
+                data_len: 0,
+            });
+        }
+        let writer = self.positions.as_mut().unwrap();
+        writer.offsets.push(writer.data_len);
+        write_u32(&mut writer.file, tokens.len() as u32)?;
+        writer.data_len += 4;
+        for token in tokens {
+            write_u32(&mut writer.file, token.len() as u32)?;
+            writer.file.write_all(token.as_bytes())?;
+            writer.data_len += 4 + token.len() as u64;
+        }
+        Ok(())
+    }
+
     fn spill_chunk(&mut self) -> io::Result<()> {
         if self.chunk.is_empty() {
             return Ok(());
@@ -305,6 +352,7 @@ impl SegmentBuilder {
     /// Finish the segment, write it atomically, and return its statistics.
     pub fn finish(mut self) -> io::Result<SegmentStats> {
         self.spill_chunk()?;
+        let mut positions = self.positions.take();
         let doc_count = self.doc_ids.len() as u32;
         let avgdl = if doc_count == 0 {
             1.0
@@ -420,6 +468,7 @@ impl SegmentBuilder {
             ));
         }
         postings.flush()?;
+        let postings_size = fs::metadata(&postings_path)?.len();
 
         let mut term_entries: Vec<(String, PostingMeta)> =
             self.terms.into_iter().zip(metas).collect();
@@ -448,6 +497,11 @@ impl SegmentBuilder {
         let terms_off = docids_off + docids_size;
         let term_index_off = terms_off + terms_size;
         let postings_off = term_index_off + index_size;
+        let positions_off = if positions.is_some() {
+            postings_off + postings_size
+        } else {
+            0
+        };
         let header = Header {
             doc_count,
             term_count: term_entries.len() as u32,
@@ -457,6 +511,7 @@ impl SegmentBuilder {
             terms_off,
             term_index_off,
             postings_off,
+            positions_off,
         };
 
         let final_tmp = self.path.with_extension("tmp");
@@ -498,6 +553,26 @@ impl SegmentBuilder {
         }
         out.flush()?;
         io::copy(&mut File::open(&postings_path)?, &mut out)?;
+        if let Some(mut positions) = positions.take() {
+            positions.file.flush()?;
+            positions.offsets.push(positions.data_len);
+            if positions.offsets.len() != doc_count as usize + 1 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "position offsets do not match document count",
+                ));
+            }
+            write_u32(&mut out, 1)?;
+            write_u32(&mut out, doc_count)?;
+            for offset in &positions.offsets {
+                write_u64(&mut out, *offset)?;
+            }
+            drop(positions.file);
+            io::copy(
+                &mut File::open(self.work_dir.join("positions.tmp"))?,
+                &mut out,
+            )?;
+        }
         out.flush()?;
         let file = out.into_inner().map_err(|e| e.into_error())?;
         file.sync_all()?;
@@ -728,6 +803,37 @@ impl SegmentSet {
         allowed: Option<&HashSet<String>>,
         verify: Option<&DocVerifier<'_>>,
     ) -> io::Result<Vec<SearchHit>> {
+        self.search_verified_inner(query, skip, limit, allowed, verify, &[])
+    }
+
+    /// Like [`search_verified`], but requires every positive phrase to occur
+    /// using positions stored in the immutable segments. Returns `None` when
+    /// any base segment predates position storage.
+    pub fn search_verified_phrases(
+        &self,
+        query: &str,
+        skip: usize,
+        limit: usize,
+        allowed: Option<&HashSet<String>>,
+        verify: Option<&DocVerifier<'_>>,
+        phrases: &[Vec<String>],
+    ) -> io::Result<Option<Vec<SearchHit>>> {
+        if !phrases.is_empty() && !self.segments.iter().all(SegmentReader::has_positions) {
+            return Ok(None);
+        }
+        self.search_verified_inner(query, skip, limit, allowed, verify, phrases)
+            .map(Some)
+    }
+
+    fn search_verified_inner(
+        &self,
+        query: &str,
+        skip: usize,
+        limit: usize,
+        allowed: Option<&HashSet<String>>,
+        verify: Option<&DocVerifier<'_>>,
+        phrases: &[Vec<String>],
+    ) -> io::Result<Vec<SearchHit>> {
         if limit == 0 || allowed.is_some_and(HashSet::is_empty) {
             return Ok(Vec::new());
         }
@@ -748,9 +854,14 @@ impl SegmentSet {
             .max(limit);
         let mut merged: HashMap<String, f64> = HashMap::new();
         for (segment_idx, segment) in self.segments.iter().enumerate() {
-            for hit in
-                segment.search_verified_with_stats(query, want, allowed, verify, Some(&stats))?
-            {
+            for hit in segment.search_verified_with_stats(
+                query,
+                want,
+                allowed,
+                verify,
+                Some(&stats),
+                phrases,
+            )? {
                 let hidden = self
                     .tombstones
                     .get(&hit.id)
@@ -763,7 +874,12 @@ impl SegmentSet {
                 }
             }
         }
-        for hit in self.search_delta(query, want, Some(&stats))? {
+        let delta_limit = if phrases.is_empty() {
+            want
+        } else {
+            self.delta.len().max(want)
+        };
+        for hit in self.search_delta(query, delta_limit, Some(&stats), phrases)? {
             if allowed.is_some_and(|set| !set.contains(&hit.id)) {
                 continue;
             }
@@ -828,6 +944,7 @@ impl SegmentSet {
         query: &str,
         limit: usize,
         global: Option<&GlobalSearchStats>,
+        phrases: &[Vec<String>],
     ) -> io::Result<Vec<SearchHit>> {
         if limit == 0 || self.delta.is_empty() {
             return Ok(Vec::new());
@@ -875,6 +992,17 @@ impl SegmentSet {
                     break;
                 };
                 score += bm25(*idf, *tf, doc.dl, avgdl);
+            }
+            if matched && !phrases.is_empty() {
+                let tokens = search::tokenize(&doc.text);
+                if !phrases
+                    .iter()
+                    .all(|phrase| search::contains_phrase(&tokens, phrase))
+                {
+                    matched = false;
+                } else {
+                    score += phrases.len() as f64;
+                }
             }
             if matched {
                 hits.push(SearchHit {
@@ -1297,10 +1425,110 @@ struct GlobalSearchStats {
 }
 
 /// Read-only handle to one immutable segment.
+impl Positions {
+    fn read(map: &Mmap, offset: u64, doc_count: u32) -> io::Result<Self> {
+        let mut header = [0u8; 8];
+        read_map(map, offset, &mut header)?;
+        let version = u32::from_le_bytes(header[0..4].try_into().unwrap());
+        let stored_docs = u32::from_le_bytes(header[4..8].try_into().unwrap());
+        if version != 1 || stored_docs != doc_count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid segment position header",
+            ));
+        }
+        let offsets_start = offset + 8;
+        let data_start = offsets_start
+            .checked_add((u64::from(doc_count) + 1) * 8)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "position offset overflow")
+            })?;
+        if data_start > map.len() as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "short segment position data",
+            ));
+        }
+        Ok(Self {
+            offsets_start,
+            data_start,
+            doc_count,
+        })
+    }
+
+    fn tokens(&self, map: &Mmap, doc: u32) -> io::Result<Vec<String>> {
+        if doc >= self.doc_count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "position doc id out of range",
+            ));
+        }
+        let mut start_buf = [0u8; 8];
+        let mut end_buf = [0u8; 8];
+        read_map(map, self.offsets_start + u64::from(doc) * 8, &mut start_buf)?;
+        read_map(
+            map,
+            self.offsets_start + u64::from(doc + 1) * 8,
+            &mut end_buf,
+        )?;
+        let start = self.data_start + u64::from_le_bytes(start_buf);
+        let end = self.data_start + u64::from_le_bytes(end_buf);
+        if end < start || end > map.len() as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid segment position bounds",
+            ));
+        }
+        let mut position = start;
+        let mut count_buf = [0u8; 4];
+        read_map(map, position, &mut count_buf)?;
+        position += 4;
+        let count = u32::from_le_bytes(count_buf) as usize;
+        let mut tokens = Vec::with_capacity(count);
+        for _ in 0..count {
+            read_map(map, position, &mut count_buf)?;
+            position += 4;
+            let len = u32::from_le_bytes(count_buf) as u64;
+            let text_end = position.checked_add(len).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "position length overflow")
+            })?;
+            if text_end > end {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "truncated segment position token",
+                ));
+            }
+            let start = usize::try_from(position)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "position too large"))?;
+            let end = usize::try_from(text_end)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "position too large"))?;
+            let token = std::str::from_utf8(&map[start..end])
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            tokens.push(token.to_string());
+            position = text_end;
+        }
+        if position != end {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "trailing segment position data",
+            ));
+        }
+        Ok(tokens)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Positions {
+    offsets_start: u64,
+    data_start: u64,
+    doc_count: u32,
+}
+
 pub struct SegmentReader {
     map: Arc<Mmap>,
     header: Header,
     index: Vec<TermIndexEntry>,
+    positions: Option<Positions>,
 }
 
 impl SegmentReader {
@@ -1319,7 +1547,39 @@ impl SegmentReader {
             let len = read_u32_buf(&index_buf, &mut pos)?;
             index.push(TermIndexEntry { first, offset, len });
         }
-        Ok(Self { map, header, index })
+        let positions = if header.positions_off == 0 {
+            None
+        } else {
+            Some(Positions::read(
+                &map,
+                header.positions_off,
+                header.doc_count,
+            )?)
+        };
+        Ok(Self {
+            map,
+            header,
+            index,
+            positions,
+        })
+    }
+
+    pub fn has_positions(&self) -> bool {
+        self.positions.is_some()
+    }
+
+    /// Checks a phrase against the stored token positions. `None` means this
+    /// segment predates position storage and the caller must use a document
+    /// fetch fallback.
+    pub fn phrase_matches(&self, doc: u32, phrase: &[String]) -> io::Result<Option<bool>> {
+        let Some(positions) = self.positions else {
+            return Ok(None);
+        };
+        if phrase.is_empty() {
+            return Ok(Some(true));
+        }
+        let tokens = positions.tokens(&self.map, doc)?;
+        Ok(Some(search::contains_phrase(&tokens, phrase)))
     }
 
     pub fn documents(&self) -> u32 {
@@ -1416,7 +1676,7 @@ impl SegmentReader {
         limit: usize,
         allowed: Option<&HashSet<String>>,
     ) -> io::Result<Vec<SearchHit>> {
-        self.search_verified_with_stats(query, limit, allowed, None, None)
+        self.search_verified_with_stats(query, limit, allowed, None, None, &[])
     }
 
     fn search_verified_with_stats(
@@ -1426,6 +1686,7 @@ impl SegmentReader {
         allowed: Option<&HashSet<String>>,
         verify: Option<&DocVerifier<'_>>,
         global: Option<&GlobalSearchStats>,
+        phrases: &[Vec<String>],
     ) -> io::Result<Vec<SearchHit>> {
         if limit == 0 {
             return Ok(Vec::new());
@@ -1471,13 +1732,21 @@ impl SegmentReader {
         if entries.len() == 1 {
             let (_, entry, idf) = entries.pop().unwrap();
             let mut cursor = Cursor::new(self, entry, idf)?;
-            self.search_single(&mut cursor, avgdl, limit, allowed, verify, &mut heap)?;
+            self.search_single(
+                &mut cursor,
+                avgdl,
+                limit,
+                allowed,
+                verify,
+                &mut heap,
+                phrases,
+            )?;
         } else {
             let mut cursors = Vec::with_capacity(entries.len());
             for (_, entry, idf) in entries {
                 cursors.push(Cursor::new(self, entry, idf)?);
             }
-            self.search_and_rarest(cursors, avgdl, limit, allowed, verify, &mut heap)?;
+            self.search_and_rarest(cursors, avgdl, limit, allowed, verify, &mut heap, phrases)?;
         }
 
         let mut hits = heap
@@ -1498,20 +1767,35 @@ impl SegmentReader {
         doc: u32,
         allowed: Option<&HashSet<String>>,
         verify: Option<&DocVerifier<'_>>,
+        phrases: &[Vec<String>],
     ) -> io::Result<Option<f64>> {
-        if allowed.is_none() && verify.is_none() {
-            return Ok(Some(0.0));
-        }
         let id = self.doc_id(doc)?;
         if allowed.is_some_and(|set| !set.contains(&id)) {
             return Ok(None);
         }
-        match verify {
-            Some(predicate) => predicate(&id),
-            None => Ok(Some(0.0)),
+        let mut bonus = match verify {
+            Some(predicate) => match predicate(&id)? {
+                Some(bonus) => bonus,
+                None => return Ok(None),
+            },
+            None => 0.0,
+        };
+        for phrase in phrases {
+            match self.phrase_matches(doc, phrase)? {
+                Some(true) => bonus += 1.0,
+                Some(false) => return Ok(None),
+                None => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "segment does not contain phrase positions",
+                    ))
+                }
+            }
         }
+        Ok(Some(bonus))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn search_single(
         &self,
         cursor: &mut Cursor<'_>,
@@ -1520,6 +1804,7 @@ impl SegmentReader {
         allowed: Option<&HashSet<String>>,
         verify: Option<&DocVerifier<'_>>,
         heap: &mut BinaryHeap<Reverse<ScoredDoc>>,
+        phrases: &[Vec<String>],
     ) -> io::Result<()> {
         loop {
             let threshold = if heap.len() >= limit {
@@ -1537,7 +1822,7 @@ impl SegmentReader {
                 break;
             };
             let score = bm25(cursor.idf, posting.tf, posting.dl, avgdl);
-            if let Some(bonus) = self.doc_bonus(posting.doc, allowed, verify)? {
+            if let Some(bonus) = self.doc_bonus(posting.doc, allowed, verify, phrases)? {
                 push_hit(
                     heap,
                     ScoredDoc {
@@ -1552,6 +1837,7 @@ impl SegmentReader {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn search_wand(
         &self,
         mut cursors: Vec<Cursor<'_>>,
@@ -1560,6 +1846,7 @@ impl SegmentReader {
         allowed: Option<&HashSet<String>>,
         verify: Option<&DocVerifier<'_>>,
         heap: &mut BinaryHeap<Reverse<ScoredDoc>>,
+        phrases: &[Vec<String>],
     ) -> io::Result<()> {
         let term_count = cursors.len();
         loop {
@@ -1601,7 +1888,7 @@ impl SegmentReader {
                     }
                 }
                 if matched == term_count {
-                    if let Some(bonus) = self.doc_bonus(pivot, allowed, verify)? {
+                    if let Some(bonus) = self.doc_bonus(pivot, allowed, verify, phrases)? {
                         push_hit(
                             heap,
                             ScoredDoc {
@@ -1623,6 +1910,7 @@ impl SegmentReader {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn search_and_rarest(
         &self,
         mut cursors: Vec<Cursor<'_>>,
@@ -1631,13 +1919,14 @@ impl SegmentReader {
         allowed: Option<&HashSet<String>>,
         verify: Option<&DocVerifier<'_>>,
         heap: &mut BinaryHeap<Reverse<ScoredDoc>>,
+        phrases: &[Vec<String>],
     ) -> io::Result<()> {
         // Walk the shortest posting list and skip the other cursors to each
         // candidate. This turns an AND query into one scan of its rarest term
         // instead of touching every posting for every term.
         let doc_count = u64::from(self.header.doc_count);
         if u64::from(cursors[0].df).saturating_mul(20) > doc_count {
-            return self.search_wand(cursors, avgdl, limit, allowed, verify, heap);
+            return self.search_wand(cursors, avgdl, limit, allowed, verify, heap, phrases);
         }
         let mut rare_cursor = cursors.remove(0);
         while let Some(posting) = rare_cursor.current() {
@@ -1673,7 +1962,7 @@ impl SegmentReader {
                     score += bm25(cursor.idf, other.tf, other.dl, avgdl);
                 }
                 if matched {
-                    if let Some(bonus) = self.doc_bonus(doc, allowed, verify)? {
+                    if let Some(bonus) = self.doc_bonus(doc, allowed, verify, phrases)? {
                         push_hit(
                             heap,
                             ScoredDoc {
@@ -2024,6 +2313,66 @@ mod tests {
         let hits = reader.search("rust database", 10).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id, "a");
+    }
+
+    #[test]
+    fn phrase_positions_filter_base_and_delta_documents() {
+        let (_dir, reader) = build(&[
+            ("a", "rust database engine"),
+            ("b", "database rust engine"),
+            ("c", "rust engine database"),
+            ("d", "rust database"),
+        ]);
+        assert!(reader.has_positions());
+        let mut set = SegmentSet::with_segments(vec![reader]);
+        set.add_document("delta", "rust database").unwrap();
+        let phrase = vec!["rust".to_string(), "database".to_string()];
+        let without = set
+            .search_verified("rust database", 0, 10, None, None)
+            .unwrap();
+        assert_eq!(without.len(), 5);
+        let hits = set
+            .search_verified_phrases(
+                "rust database",
+                0,
+                10,
+                None,
+                None,
+                std::slice::from_ref(&phrase),
+            )
+            .unwrap()
+            .unwrap();
+        let mut ids: Vec<_> = hits.into_iter().map(|hit| hit.id).collect();
+        ids.sort();
+        assert_eq!(ids, ["a", "d", "delta"]);
+    }
+
+    #[test]
+    fn version_two_segments_remain_readable_without_positions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.seg");
+        let mut builder = SegmentBuilder::new(&path).unwrap();
+        builder.add_document("a", "rust database").unwrap();
+        builder.finish().unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[8..12].copy_from_slice(&2u32.to_le_bytes());
+        bytes[64..72].copy_from_slice(&0u64.to_le_bytes());
+        std::fs::write(&path, bytes).unwrap();
+        let reader = SegmentReader::open(&path).unwrap();
+        assert!(!reader.has_positions());
+        let set = SegmentSet::with_segments(vec![reader]);
+        let phrase = vec!["rust".to_string(), "database".to_string()];
+        assert!(set
+            .search_verified_phrases(
+                "rust database",
+                0,
+                10,
+                None,
+                None,
+                std::slice::from_ref(&phrase),
+            )
+            .unwrap()
+            .is_none());
     }
 
     #[test]

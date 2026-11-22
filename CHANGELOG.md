@@ -18,6 +18,9 @@ Full release notes: https://github.com/essmos/nonodb/releases
   bootstrap, with a rebuild fallback when a source file is unavailable.
 - Run legacy search-index migration across all databases and allow limiting it
   with `NONODB_MIGRATE_SEARCH_COLLECTIONS`; skip migration on non-primary nodes.
+- Store token positions in segment text files (format v3) and verify positive
+  phrases from those positions, falling back to LMDB documents for legacy v2
+  segments. Set `NONODB_SEGMENT_POSITIONS=0` to omit positions and save space.
 - Document the 100M vector ANN sidecar result and the 8.84M concurrent search
   benchmark.
 - Add the HTTP/JSON `drop_collection` operation. It removes documents, indexes,

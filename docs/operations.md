@@ -141,7 +141,10 @@ secrets.
 | `NONODB_REBUILD_SEARCH_STATS` | `0` | Fill missing exact BM25 statistics for segment text indexes at startup; use `force` to recompute every index |
 | `NONODB_REBUILD_SEARCH_STATS_COLLECTIONS` | unset | Comma-separated collections for search-statistics rebuild |
 | `NONODB_MIGRATE_SEARCH_COLLECTIONS` | unset | Comma-separated collections to migrate to segment search when `NONODB_MIGRATE_SEARCH_SEGMENTS=1` |
-| `NONODB_MIGRATE_SEARCH_SEGMENTS` | `0` | Migrate legacy LMDB text/fuzzy indexes to segments in the default database at startup |
+| `NONODB_MIGRATE_SEARCH_SEGMENTS` | `0` | Migrate legacy LMDB text/fuzzy indexes to segments at startup |
+| `NONODB_SEGMENT_TEXT` | `1` | Use the segment backend for new text indexes; `0` keeps LMDB postings |
+| `NONODB_SEGMENT_FUZZY` | `1` | Use the segment backend for new fuzzy indexes; `0` keeps LMDB trigrams |
+| `NONODB_SEGMENT_POSITIONS` | `1` | Store token positions in new text segments for phrase queries; `0` saves disk and uses the LMDB document fallback |
 | `NONODB_BUILD_VECTOR_ANN` | `0` | Build missing vector ANN sidecars in the default database at startup |
 | `NONODB_VECTOR_ANN_PROBE` | `16` | Clusters probed by an ANN vector query; can be changed at restart without rebuilding the sidecar |
 | `NONODB_VECTOR_ANN_CLUSTERS` | `512` | Maximum IVF clusters when building a vector ANN sidecar (1–8,192) |

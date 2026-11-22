@@ -403,6 +403,27 @@ large collections, `NONODB_VECTOR_ANN_CLUSTERS` raises the cluster cap (up to
 latency. The optimal cluster/probe pair depends on the distinct-vector
 distribution; validate recall after changing either setting.
 
+### Phrase positions
+
+Segment text format v3 appends token positions to each `.seg` file. A phrase
+query verifies consecutive tokens from those positions instead of fetching
+every candidate document from LMDB. The same 30 quoted-phrase queries were run
+against the old v2 fallback and a rebuilt v3 index:
+
+| Corpus | Mode | p50 | p95 | Mean |
+|---|---|---:|---:|---:|
+| 1M MS MARCO subset | v2 + LMDB phrase fetch | 0.61 ms | **46.06 ms** | **36.18 ms** |
+| 1M MS MARCO subset | v3 positions | 0.61 ms | **7.71 ms** | **8.75 ms** |
+| 8.84M MS MARCO | v2 + LMDB phrase fetch | 1.05 ms | **310.29 ms** | **336.12 ms** |
+| 8.84M MS MARCO | v3 positions | 0.60 ms | **48.70 ms** | **73.07 ms** |
+
+The 8.84M segment grew from about **1.43 GB** to **5.97 GB**, because positions
+are stored for every token. The 1M rebuilt segment is about **680 MB**. This is
+a deliberate trade-off for phrase verification and scoring; set
+`NONODB_SEGMENT_POSITIONS=0` before building an index to keep the smaller
+position-free format and use the LMDB document fallback. Legacy v2 segments
+remain readable and keep working without a rebuild.
+
 ---
 
 ## Interpreting the results
