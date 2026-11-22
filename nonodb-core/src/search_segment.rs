@@ -183,8 +183,6 @@ pub struct SegmentBuilder {
 
 struct PositionWriter {
     file: io::BufWriter<File>,
-    offsets: Vec<u64>,
-    data_len: u64,
 }
 
 impl SegmentBuilder {
@@ -316,19 +314,12 @@ impl SegmentBuilder {
     fn write_positions(&mut self, term_ids: &[u32]) -> io::Result<()> {
         if self.positions.is_none() {
             let file = io::BufWriter::new(File::create(self.work_dir.join("positions.tmp"))?);
-            self.positions = Some(PositionWriter {
-                file,
-                offsets: Vec::new(),
-                data_len: 0,
-            });
+            self.positions = Some(PositionWriter { file });
         }
         let writer = self.positions.as_mut().unwrap();
-        writer.offsets.push(writer.data_len);
         write_u32(&mut writer.file, term_ids.len() as u32)?;
-        writer.data_len += 4;
         for term_id in term_ids {
             write_u32(&mut writer.file, *term_id)?;
-            writer.data_len += 4;
         }
         Ok(())
     }
@@ -572,13 +563,6 @@ impl SegmentBuilder {
         io::copy(&mut File::open(&postings_path)?, &mut out)?;
         if let Some(mut positions) = positions.take() {
             positions.file.flush()?;
-            positions.offsets.push(positions.data_len);
-            if positions.offsets.len() != doc_count as usize + 1 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "position offsets do not match document count",
-                ));
-            }
             drop(positions.file);
             let term_count = term_entries.len() as u32;
             let mut dict_offsets = Vec::with_capacity(term_entries.len() + 1);
