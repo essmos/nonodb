@@ -3261,6 +3261,10 @@ function CollectionView({
       setError('Index needs at least one field');
       return;
     }
+    if (indexKind !== 'secondary' && fields.length !== 1) {
+      setError('Text, fuzzy, and vector indexes need exactly one field');
+      return;
+    }
     setBusy(true);
     setError('');
     try {
@@ -3832,7 +3836,7 @@ function CollectionView({
             </label>
             <label className="grow">
               Field(s)
-              <input value={indexField} onChange={(e) => setIndexField(e.target.value)} list="nonodb-field-paths" placeholder={indexKind === 'secondary' ? 'field1,field2' : 'field'} />
+              <input value={indexField} onChange={(e) => setIndexField(e.target.value)} list="nonodb-field-paths" placeholder={indexKind === 'secondary' ? 'field1,field2' : 'single field'} />
             </label>
             {indexKind === 'secondary' && (
               <>

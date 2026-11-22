@@ -175,9 +175,9 @@ a shared machine. Use **Disconnect** to clear the active session.
 
 - secondary and compound indexes;
 - unique, include, and geo options;
-- text/BM25 indexes;
-- fuzzy indexes;
-- vector indexes with dimensions and metric;
+- text/BM25 indexes (one field per index);
+- fuzzy indexes (one field per index);
+- vector indexes with dimensions and metric (one field per index);
 - index listing and removal for every supported type;
 - **Reindex all**, which rebuilds every index on the selected collection in one
   write transaction. The GUI asks for confirmation because the rebuild scans
