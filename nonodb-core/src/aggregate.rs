@@ -140,6 +140,50 @@ fn parse_merge_on(value: Option<&Value>) -> Result<Vec<String>> {
     Ok(values)
 }
 
+/// Validates filters in a pipeline, including pipelines embedded in other stages.
+///
+/// Top-level `$match` validation alone is not enough: `$facet` and `$lookup` run
+/// their sub-pipelines outside the collection-level entry point, so an unknown
+/// operator there used to match nothing instead of failing.
+pub(crate) fn validate_pipeline(pipeline: &[Value]) -> Result<()> {
+    for stage in pipeline {
+        let Some(obj) = stage.as_object() else {
+            continue;
+        };
+        for (name, arg) in obj {
+            match name.as_str() {
+                "$match" => crate::query::validate::validate_filter(arg)?,
+                "$facet" => {
+                    if let Some(facets) = arg.as_object() {
+                        for sub in facets.values().filter_map(Value::as_array) {
+                            validate_pipeline(sub)?;
+                        }
+                    }
+                }
+                "$lookup" | "$unionWith" | "$merge" => {
+                    let Some(spec) = arg.as_object() else {
+                        continue;
+                    };
+                    if let Some(sub) = spec
+                        .get("pipeline")
+                        .or_else(|| spec.get("whenMatched"))
+                        .and_then(Value::as_array)
+                    {
+                        validate_pipeline(sub)?;
+                    }
+                }
+                "$graphLookup" => {
+                    if let Some(filter) = arg.as_object().and_then(|spec| spec.get("filter")) {
+                        crate::query::validate::validate_filter(filter)?;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_merge_pipeline(pipeline: &[Value]) -> Result<()> {
     if pipeline.is_empty() {
         return Err(Error::Query(

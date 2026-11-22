@@ -140,3 +140,70 @@ fn supported_operators_keep_working() {
         })
         .is_err());
 }
+
+#[test]
+fn unknown_operator_in_lookup_pipeline_is_rejected() {
+    let (_dir, store) = seeded();
+    let c = store.collection("operators").unwrap();
+    let lookups = store.collection("lookups").unwrap();
+    lookups.insert_one(json!({"_id": "l1", "n": 0})).unwrap();
+
+    let lookup = [json!({"$lookup": {
+        "from": "lookups",
+        "let": {"n": "$n"},
+        "pipeline": [{"$match": {"$expr": {"$eq": ["$n", {"$bogus": "$$n"}]}}}],
+        "as": "joined"
+    }})];
+    match c.aggregate(&lookup) {
+        Err(Error::Query(message)) => {
+            assert!(
+                message.contains("unsupported aggregation expression `$bogus`"),
+                "{message}"
+            )
+        }
+        Ok(docs) => panic!("pipeline was accepted: {docs:?}"),
+        Err(error) => panic!("unexpected error: {error}"),
+    }
+
+    // A supported filter in the same position still runs.
+    let docs = c
+        .aggregate(&[json!({"$lookup": {
+            "from": "lookups",
+            "let": {"n": "$n"},
+            "pipeline": [{"$match": {"$expr": {"$eq": ["$n", "$$n"]}}}],
+            "as": "joined"
+        }})])
+        .unwrap();
+    assert_eq!(docs.len(), 5);
+    assert_eq!(docs[0]["joined"][0]["_id"], "l1");
+}
+
+#[test]
+fn unknown_operator_in_facet_pipeline_is_rejected() {
+    let (_dir, store) = seeded();
+    let c = store.collection("operators").unwrap();
+
+    let facets = [json!({"$facet": {
+        "by_n": [{"$match": {"n": {"$bogusOp": 1}}}],
+        "by_tags": [{"$match": {"tags": {"$size": 1}}}]
+    }})];
+    match c.aggregate(&facets) {
+        Err(Error::Query(message)) => {
+            assert!(message.contains("unknown operator: $bogusOp"), "{message}")
+        }
+        Ok(docs) => panic!("pipeline was accepted: {docs:?}"),
+        Err(error) => panic!("unexpected error: {error}"),
+    }
+
+    // Nested facets are walked too.
+    let nested = [json!({"$facet": {"outer": [
+        {"$facet": {"inner": [{"$match": {"$bogus": []}}]}}
+    ]}})];
+    assert!(c.aggregate(&nested).is_err());
+
+    // Supported filters still work in facets.
+    let docs = c
+        .aggregate(&[json!({"$facet": {"all": [{"$count": "n"}]}})])
+        .unwrap();
+    assert_eq!(docs[0]["all"][0]["n"], 5);
+}
