@@ -441,12 +441,12 @@ allowed. Other BSON types are not accepted as `_id`.
 | Custom index names | ✅ | MongoDB-style names are stored and listed |
 | Index directions | ✅ | `1`/`-1` stored in key order; mixed-direction compound sorts and reverse scans are index-backed |
 | Multikey indexes | ✅ | One entry per array element; compound parallel arrays rejected |
-| Unique indexes | ✅ | Including unique multikey semantics |
+| Unique indexes | ✅ | Including unique multikey semantics; see [Unique indexes without `sparse`](#unique-indexes-without-sparse) for `null` and missing-field behavior |
 | Covered queries / `include` | ✅ | Top-level inclusive projections only |
 | Geospatial indexes | 🟡 | GeoJSON point indexes only; no polygon/line indexes |
 | Text search indexes | 🟡 | One single-field MongoDB-style text index per collection through `createIndexes`/`listIndexes`/`dropIndexes`; leading-`$match` `$text`. Multi-field weights and compound mixed text/non-text keys are not supported |
 | Vector indexes | 🟡 | NonoDB-specific exact/vector search |
-| Sparse indexes | ❌ | |
+| Sparse indexes | ❌ | The `sparse` option is rejected; a plain unique index behaves like `unique + sparse`, see [Unique indexes without `sparse`](#unique-indexes-without-sparse) |
 | Partial indexes | ❌ | |
 | Wildcard indexes | ❌ | |
 | Hidden indexes | ❌ | |
@@ -455,6 +455,32 @@ allowed. Other BSON types are not accepted as `_id`.
 | Index hints | ✅ | Find-shaped queries; unusable hints fail instead of falling back |
 | Background index builds | 🟡 | Parallel bounded backfill; not MongoDB's exact build lifecycle |
 | Index build progress | ✅ | NonoDB metrics |
+
+### Unique indexes without `sparse`
+
+MongoDB applications often declare `IndexModel([("field", 1)], unique=True, sparse=True)`
+so that many documents may omit the field. NonoDB rejects the `sparse` option, but
+a plain unique index already has the same semantics, so dropping the option is the
+supported migration path.
+
+| Document | NonoDB unique index | MongoDB `unique + sparse` |
+|---|---|---|
+| Field absent | Not indexed; any number of documents allowed | Not indexed; any number allowed |
+| Field present and `null` | Indexed as a value; only one such document allowed | Indexed as a value; only one such document allowed |
+| Field present, duplicate value | Rejected with `DuplicateKeyError` | Rejected with `DuplicateKeyError` |
+
+Both implementations were checked side by side on NonoDB 0.27.0 and MongoDB 8.2
+through PyMongo 4.7.0. Inserting two documents without the field succeeds on both,
+the second document with an explicit `null` fails with `DuplicateKeyError` on
+both, and duplicate values are rejected on both.
+
+```python
+# MongoDB
+coll.create_index([("google_sub", 1)], unique=True, sparse=True)
+
+# NonoDB — same behavior, no sparse option
+coll.create_index([("google_sub", 1)], unique=True)
+```
 
 ## BSON values
 
@@ -501,7 +527,9 @@ A migration from MongoDB to NonoDB should check these items first:
 5. **Atlas Search** — use NonoDB's native search API. MongoDB `$text` is supported only for the documented lexical subset.
 6. **Collation** — normalize strings or enforce ordering in the application.
 7. **Sparse/partial/TTL indexes** — remodel as collection settings, separate
-   indexes, or application logic.
+   indexes, or application logic. For `unique + sparse`, drop the `sparse` option:
+   a plain unique index has the same behavior, including explicit `null`
+   (see [Unique indexes without `sparse`](#unique-indexes-without-sparse)).
 8. **Stored BSON regex values** — read filters accept driver regex literals, but regex values cannot be stored; keep them out of documents or rewrite them as strings plus `$regex` filters.
 9. **Unsupported aggregation expressions/stages** — rewrite with supported
    stages or precompute outside the database.
