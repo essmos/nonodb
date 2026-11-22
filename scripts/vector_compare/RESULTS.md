@@ -79,6 +79,21 @@ The 4096-cluster build needed **210 s** after parallelizing k-means training
 build now takes **40 s**. The default `sqrt(entries)` layout therefore stays;
 larger cluster counts need better centroid quality or another index family.
 
+## Quantization experiment
+
+An opt-in SQ8 sidecar (`NONODB_VECTOR_ANN_QUANTIZE=sq8`) reduced the 707-cluster
+sidecar from **741 MB to 193 MB** (3.8×). It did not improve the query path at
+this scale:
+
+| Encoding | Sidecar | Reader p50 | Daemon p50 | Recall@10 |
+|---|---:|---:|---:|---:|
+| f32 | 741 MB | 4.18 ms | 8.06 ms | 0.9579 |
+| SQ8 | 193 MB | 4.10 ms | 8.32 ms | 0.9543 |
+
+The reader is not bandwidth-bound at 500k vectors, so 4× smaller records do not
+translate into lower latency here. SQ8 remains opt-in for storage-constrained
+large sidecars; it is not the default.
+
 ## Interpretation
 
 - Real 384-dimensional embeddings change the picture completely compared with

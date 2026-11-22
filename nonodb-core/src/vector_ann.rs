@@ -300,6 +300,51 @@ pub fn is_compatible(path: &Path) -> bool {
         && u32::from_le_bytes(header[8..12].try_into().unwrap()) == VERSION
 }
 
+fn quantization_scale(values: &[f32]) -> f32 {
+    values
+        .iter()
+        .fold(0.0f32, |max, value| max.max(value.abs()))
+        / 127.0
+}
+
+fn distance_quantized(
+    metric: VectorMetric,
+    query: &[f32],
+    query_norm: f32,
+    stored_norm: f32,
+    scale: f32,
+    bytes: &[u8],
+) -> Option<f32> {
+    if bytes.len() != query.len() {
+        return None;
+    }
+    let value = match metric {
+        VectorMetric::Cosine | VectorMetric::Dot => {
+            let mut dot = 0.0f32;
+            for (query_component, stored) in query.iter().zip(bytes) {
+                dot += query_component * f32::from(*stored as i8);
+            }
+            dot *= scale;
+            if metric == VectorMetric::Dot {
+                -dot
+            } else if query_norm <= f32::EPSILON || stored_norm <= f32::EPSILON {
+                1.0
+            } else {
+                1.0 - (dot / (query_norm * stored_norm)).clamp(-1.0, 1.0)
+            }
+        }
+        VectorMetric::L2 => {
+            let mut squared = 0.0f32;
+            for (query_component, stored) in query.iter().zip(bytes) {
+                let delta = query_component - f32::from(*stored as i8) * scale;
+                squared += delta * delta;
+            }
+            squared
+        }
+    };
+    value.is_finite().then_some(value)
+}
+
 /// Builds an immutable IVF file atomically at `path`.
 pub fn build(
     path: &Path,
@@ -307,6 +352,20 @@ pub fn build(
     metric: VectorMetric,
     vectors: &[(String, Vec<f32>)],
     nprobe: usize,
+) -> io::Result<AnnStats> {
+    let quantized = std::env::var("NONODB_VECTOR_ANN_QUANTIZE")
+        .ok()
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "int8" | "sq8"));
+    build_with_quantization(path, dims, metric, vectors, nprobe, quantized)
+}
+
+fn build_with_quantization(
+    path: &Path,
+    dims: usize,
+    metric: VectorMetric,
+    vectors: &[(String, Vec<f32>)],
+    nprobe: usize,
+    quantized: bool,
 ) -> io::Result<AnnStats> {
     if dims == 0 {
         return Err(io::Error::new(
@@ -448,7 +507,9 @@ pub fn build(
         VectorMetric::Dot => 1,
         VectorMetric::L2 => 2,
     }])?;
-    out.write_all(&[0u8; 7])?;
+    let mut flags = [0u8; 7];
+    flags[0] = u8::from(quantized);
+    out.write_all(&flags)?;
     for centroid in &centroids {
         for value in centroid {
             out.write_all(&value.to_le_bytes())?;
@@ -477,8 +538,23 @@ pub fn build(
             let (id, values) = &vectors[index];
             write_u32(&mut out, id.len() as u32)?;
             out.write_all(id.as_bytes())?;
-            out.write_all(&vector::encode_vector(values))?;
-            position += 4 + id.len() as u64 + 4 + values.len() as u64 * 4;
+            if quantized {
+                let scale = quantization_scale(values);
+                out.write_all(&scale.to_le_bytes())?;
+                out.write_all(&norm_of(values).to_le_bytes())?;
+                for value in values {
+                    let quantized_value = if scale > 0.0 {
+                        (value / scale).round().clamp(-127.0, 127.0) as i8
+                    } else {
+                        0
+                    };
+                    out.write_all(&[quantized_value as u8])?;
+                }
+                position += 4 + id.len() as u64 + 8 + values.len() as u64;
+            } else {
+                out.write_all(&vector::encode_vector(values))?;
+                position += 4 + id.len() as u64 + 4 + values.len() as u64 * 4;
+            }
         }
         metas.push(ClusterBuildMeta {
             meta_start,
@@ -525,6 +601,7 @@ pub struct AnnReader {
     clusters: usize,
     nprobe: usize,
     entries: usize,
+    quantized: bool,
     centroids_offset: usize,
     offsets_offset: usize,
 }
@@ -557,6 +634,7 @@ impl AnnReader {
             2 => VectorMetric::L2,
             _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "bad ANN metric")),
         };
+        let quantized = map[position + 1] == 1;
         let centroids_offset = HEADER_SIZE;
         let offsets_offset = centroids_offset + clusters * dims * 4;
         if offsets_offset + (clusters + 1) * 8 > map.len() {
@@ -572,6 +650,7 @@ impl AnnReader {
             clusters,
             nprobe: nprobe.clamp(1, clusters.max(1)),
             entries,
+            quantized,
             centroids_offset,
             offsets_offset,
         })
@@ -788,8 +867,13 @@ impl AnnReader {
         let id_end = cursor
             .checked_add(id_len)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "truncated ANN entry"))?;
+        let vector_size = if self.quantized {
+            8 + self.dims
+        } else {
+            4 + self.dims * 4
+        };
         let vector_end = id_end
-            .checked_add(4 + self.dims * 4)
+            .checked_add(vector_size)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "truncated ANN entry"))?;
         if vector_end > end {
             return Err(io::Error::new(
@@ -808,7 +892,11 @@ impl AnnReader {
         want: usize,
     ) -> io::Result<BinaryHeap<Candidate>> {
         let mut heap: BinaryHeap<Candidate> = BinaryHeap::new();
-        let vector_bytes = 4 + self.dims * 4;
+        let vector_bytes = if self.quantized {
+            8 + self.dims
+        } else {
+            4 + self.dims * 4
+        };
         for &(start, end) in ranges {
             let mut position = start;
             while position < end {
@@ -824,9 +912,21 @@ impl AnnReader {
                 let id = std::str::from_utf8(&self.map[position..id_end])
                     .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
                 let value = &self.map[id_end..vector_end];
-                if let Some(value_distance) =
+                let value_distance = if self.quantized {
+                    let scale = f32::from_le_bytes(value[..4].try_into().unwrap());
+                    let stored_norm = f32::from_le_bytes(value[4..8].try_into().unwrap());
+                    distance_quantized(
+                        self.metric,
+                        query,
+                        query_norm,
+                        stored_norm,
+                        scale,
+                        &value[8..],
+                    )
+                } else {
                     vector::distance_from_bytes(self.metric, query, query_norm, value, self.dims)
-                {
+                };
+                if let Some(value_distance) = value_distance {
                     let better = match heap.peek() {
                         Some(worst) => {
                             value_distance < worst.distance
@@ -907,7 +1007,11 @@ pub fn invalidate_cache(path: &Path) {
 pub fn read_all(path: &Path) -> io::Result<Vec<(String, Vec<f32>)>> {
     let reader = AnnReader::open(path)?;
     let mut out = Vec::with_capacity(reader.entries);
-    let vector_bytes = 4 + reader.dims * 4;
+    let vector_bytes = if reader.quantized {
+        8 + reader.dims
+    } else {
+        4 + reader.dims * 4
+    };
     for cluster in 0..reader.clusters {
         let info = reader.cluster_info(cluster)?;
         let mut position = info.data_start;
@@ -928,10 +1032,18 @@ pub fn read_all(path: &Path) -> io::Result<Vec<(String, Vec<f32>)>> {
             let id = std::str::from_utf8(&reader.map[position..id_end])
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
                 .to_string();
-            let values = vector::decode_vector(&reader.map[id_end..vector_end], reader.dims)
-                .ok_or_else(|| {
+            let payload = &reader.map[id_end..vector_end];
+            let values = if reader.quantized {
+                let scale = f32::from_le_bytes(payload[..4].try_into().unwrap());
+                payload[8..]
+                    .iter()
+                    .map(|value| f32::from(*value as i8) * scale)
+                    .collect()
+            } else {
+                vector::decode_vector(payload, reader.dims).ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidData, "bad ANN vector payload")
-                })?;
+                })?
+            };
             out.push((id, values));
             position = vector_end;
         }
@@ -1048,6 +1160,30 @@ mod tests {
         assert_eq!(cluster_target(10, 10, Some(4_096)), 10);
         assert_eq!(cluster_target(100_000_000, 100_000, None), 4_096);
         assert_eq!(cluster_target(100_000_000, 100_000, Some(8_192)), 8_192);
+    }
+
+    #[test]
+    fn quantized_sidecar_round_trips_and_searches() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("quantized.ann");
+        let vectors = (0..200)
+            .map(|index| {
+                (
+                    format!("id-{index:03}"),
+                    vec![
+                        (index as f32 / 200.0) - 0.5,
+                        ((index * 7 % 200) as f32 / 200.0) - 0.5,
+                    ],
+                )
+            })
+            .collect::<Vec<_>>();
+        build_with_quantization(&path, 2, VectorMetric::Cosine, &vectors, 1, true).unwrap();
+        let reader = AnnReader::open(&path).unwrap();
+        assert!(reader.quantized);
+        assert_eq!(reader.search(&[0.2, -0.3], 5).unwrap().len(), 5);
+        let decoded = read_all(&path).unwrap();
+        assert_eq!(decoded.len(), vectors.len());
+        assert!(decoded.iter().any(|(id, _)| id == "id-000"));
     }
 
     #[test]

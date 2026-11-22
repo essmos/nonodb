@@ -286,6 +286,11 @@ p50 was **468 ms**. The daemon result includes fetching the ten matching
 documents from LMDB. Both the p50 and p95 targets (**≤ 12 ms** and **≤ 16 ms**)
 are met.
 
+An opt-in SQ8 sidecar (`NONODB_VECTOR_ANN_QUANTIZE=sq8`) shrank the 500k/384D
+sidecar from **741 MB to 193 MB**, but at this size it did not reduce latency
+(about 8.3 ms p50) and recall fell from 0.9579 to 0.9543. It is therefore not
+the default; it is intended for memory- or disk-constrained large collections.
+
 The daemon caches the memory-mapped reader per sidecar and invalidates it when
 the file length or modification time changes. Mapping the 8.2 GB file for every
 request discarded the process page tables for the probed ranges and added about

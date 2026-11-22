@@ -4,6 +4,10 @@ Full release notes: https://github.com/essmos/nonodb/releases
 
 ## Unreleased
 
+- Add opt-in SQ8/int8 ANN record encoding through
+  `NONODB_VECTOR_ANN_QUANTIZE=sq8`. It cuts the 500k/384D sidecar from 741 MB to
+  193 MB, but at that scale it did not reduce query latency and slightly lowered
+  recall, so f32 remains the default.
 - Parallelize IVF k-means training across up to 16 threads and let an explicit
   `NONODB_VECTOR_ANN_CLUSTERS` value select the target cluster count instead of
   only acting as a cap. A 500k/384D build with 4,096 clusters dropped from over
