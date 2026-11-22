@@ -7,8 +7,10 @@ Full release notes: https://github.com/essmos/nonodb/releases
 - Remove the legacy LMDB text/fuzzy search backend. Text and fuzzy definitions
   now always use immutable segments; the `SearchEngine` field, LMDB posting
   paths, `NONODB_SEGMENT_TEXT`, `NONODB_SEGMENT_FUZZY`, and the in-place
-  migration startup options are gone. Rebuild or drop old search indexes before
-  upgrading. Scheduled and CLI backups that include search sidecars still work.
+  migration startup options are gone. Search indexes now cover exactly one
+  field, and MongoDB-style multi-field text keys and non-default weights are
+  rejected. Rebuild or drop old search indexes before upgrading. Scheduled and
+  CLI backups that include search sidecars still work.
 - Add `NONODB_VECTOR_ANN_CLUSTERS` (up to 8,192) to tune IVF cluster count for
   very large vector collections. The default remains 512.
 - Skip empty IVF clusters when probing, so repetitive or very large vector

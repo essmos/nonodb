@@ -2061,10 +2061,11 @@ collection:
 }
 ```
 
-The index is maintained in the same transaction as document writes. Creation
-backfills existing documents synchronously, so the create request returns only
-after the transaction commits. Use `index_status` to observe a long build from
-another connection. The Python client also exposes an asynchronous helper.
+Text indexes cover exactly one field. The index is maintained in the same
+transaction as document writes. Creation backfills existing documents
+synchronously, so the create request returns only after the transaction
+commits. Use `index_status` to observe a long build from another connection.
+The Python client also exposes an asynchronous helper.
 
 ## Fuzzy indexes
 
@@ -2074,7 +2075,7 @@ another connection. The Python client also exposes an asynchronous helper.
 {"op": "list_fuzzy_indexes", "coll": "articles"}
 ```
 
-Responses mirror text indexes:
+Fuzzy indexes cover exactly one field. Responses mirror text indexes:
 
 ```json
 {"ok": true, "result": {"created": "title", "kind": "fuzzy"}}
@@ -2111,7 +2112,7 @@ Response:
 Semantics:
 
 - The text index must exist; otherwise `invalid_query`.
-- Terms are ORed. BM25 ranks documents by relevance.
+- All positive terms must match (AND). BM25 ranks documents by relevance.
 - Duplicate terms in the query are removed.
 - Quoted phrases must occur as contiguous token sequences.
 - `filter` is a residual document filter applied before pagination.

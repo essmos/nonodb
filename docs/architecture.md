@@ -112,16 +112,17 @@ An LMDB environment contains named sub-databases. nonodb uses this layout:
 
 | Sub-database | Key | Value | Purpose |
 |---|---|---|---|
-| `meta` | metadata key | JSON or scalar | Collection registry, collection profile, index definitions, search totals, history sequence |
+| `meta` | metadata key | JSON or scalar | Collection registry, collection profile, index definitions, segment manifests, search deltas, exact BM25 statistics, history sequence |
 | `history` | collection + `_id` + revision | revision JSON | Append-only document history |
 | `ttl` | expiry index / collection + `_id` | expiry timestamp | Document expiry metadata |
 | `coll:<name>` | `_id` bytes | JSON document | Primary collection data |
 | `dbslot:<n>` (index) | encoded values + `_id` | encoded `_id` / covering payload | Secondary index |
-| `dbslot:<n>` (text postings) | `term\0_id` | term frequency (u32 LE) | BM25 postings |
-| `dbslot:<n>` (text lengths) | `_id` | document length (u32 LE) | BM25 normalization |
-| `dbslot:<n>` (fuzzy) | `trigram\0_id` | empty | Fuzzy candidate index |
 | `dbslot:<n>` (vector) | `_id` | norm + `f32` components | Exact vector index (IVF sidecar on disk) |
-| legacy `idx:*`, `ft:*`, `ftl:*`, `fz:*` | as above | as above | Resources created by older releases |
+| legacy `idx:*`, `ft:*`, `ftl:*`, `fz:*` | as above | as above | Resources created by older releases; current code does not open text/fuzzy legacy postings |
+
+Text and fuzzy postings are not stored in LMDB sub-databases. They live in
+immutable segment files under `search/`; manifests, deltas, tombstones, and
+exact statistics are stored in `meta`.
 
 Collection names are validated. A string `_id` is used directly as the primary
 B+ tree key. An ObjectId `_id` uses a reserved high-codepoint UTF-8 prefix, which
@@ -181,13 +182,14 @@ methods reject vault collections, and vault requests require the three
 encryption headers. See [Vault collections](vault.md) for the API contract and
 threat model.
 
-Every collection consumes a named LMDB sub-database. Index, text, fuzzy, and vector
+Every collection consumes a named LMDB sub-database. Secondary index and vector
 resources are assigned physical **slot databases** (`dbslot:*`) from a reusable
 pool. Dropping a resource clears its slot and returns it to the pool, so
-create/drop cycles do not consume additional LMDB sub-databases. `MAX_DBS` is
+create/drop cycles do not consume additional LMDB sub-databases. Text and fuzzy
+indexes use segment sidecars plus `meta`, not a slot database. `MAX_DBS` is
 1024; the pool reserves 64 slots for collections and fixed databases.
 
-Index/search resources created by older releases still use their legacy named
+Resources created by older releases may still use their legacy named
 sub-databases. They remain registered until a compacting backup/restore;
 recreated resources use the slot pool. See
 [Operations](operations.md#capacity-and-memory).
@@ -516,20 +518,18 @@ its duration. On large collections, raise the client and server timeouts.
 
 ## Full-text search
 
-A text-index definition (`SearchIndexDef`) is stored in metadata under
-`search:<coll>:text:<name>`. A definition may cover multiple fields with
-weights; the native single-field helpers use the field name as the index name.
-Each indexed field has:
+A text-index definition (`SearchIndexDef`) is stored in metadata and covers
+exactly one field. The analyzer, postings, document lengths, and term
+dictionary live in an immutable segment under `search/<hash>/`. New or updated
+documents are staged in a small `meta` delta and flushed into a new segment
+after 4096 changes. Exact live BM25 statistics are maintained transactionally
+in `meta`.
 
-- `ft:<coll>:<index>:<field>` — postings `term\0_id → term frequency`;
-- `ftl:<coll>:<index>:<field>` — document lengths for BM25 normalization;
-- `fttotal:<coll>:<index>:<field>` — total token counter.
-
-Queries tokenize the search string, look up postings for every term, compute
-BM25 scores (`k1=1.2`, `b=0.75`), merge scores by document, and sort descending.
-The semantics are **OR** over positive terms; BM25 decides the ranking.
-Duplicate query terms are removed. Negative terms and phrases are applied as
-exclusions by the MongoDB `$text` path.
+Queries tokenize the search string and require every positive term to match.
+Posting lists are merged rarest-first with block skipping and WAND pruning;
+BM25 scores (`k1=1.2`, `b=0.75`) decide the ranking. Duplicate query terms are
+removed. Negative terms and phrases are applied as exclusions by the MongoDB
+`$text` path.
 
 Quoted phrases are parsed separately. A document must contain each phrase as a
 contiguous token sequence. Phrase words still participate in scoring, and the
@@ -547,14 +547,14 @@ There is no stemming and no stop-word list.
 
 ## Fuzzy search
 
-A fuzzy-index definition is stored under `search:<coll>:fuzzy:<name>` and its
-postings use `fz:<coll>:<index>:<field>`. `create_fuzzy_index` stores unique
-trigrams for the field value. A query:
+A fuzzy-index definition is stored in metadata and covers exactly one field.
+Its trigram index and normalized values live in immutable segment files. A
+query:
 
 1. normalizes the query;
-2. collects documents sharing at least one trigram;
-3. ranks candidates by shared-trigram count;
-4. caps candidates at 5,000;
+2. probes the rarest `3*d + 1` query trigrams;
+3. collects documents sharing a sufficient set of trigrams;
+4. caps candidate evaluation at 5,000;
 5. computes bounded Levenshtein distance to the whole normalized value or to
    the closest token;
 6. returns matches with distance ≤ `max_distance` (default 2), sorted by
@@ -652,8 +652,8 @@ replaces the whole manifest.
 
 Current limits:
 
-- one field per segment index;
-- native single-field queries only: no MongoDB-mode text search;
+- one field per segment index; native and MongoDB-style `$text` queries use
+  the same segment path;
 - segment text files store token positions in an appended section (format v3).
   Positive phrases are verified from those positions during candidate ranking,
   and each matching phrase adds a score bonus. Older v2 segments and indexes

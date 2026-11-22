@@ -701,7 +701,7 @@ Collection.search(
 ```
 
 - Results are ranked by BM25, highest `_score` first.
-- Terms are ORed.
+- All positive terms must match (AND).
 - Quoted phrases require contiguous tokens:
 
 ```python

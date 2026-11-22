@@ -307,37 +307,54 @@ def main() -> int:
                 {"n": 4, "title": "alpha beta gamma", "body": "delta"},
             ]
         )
+        try:
+            text_coll.create_index(
+                [("title", "text"), ("body", "text")],
+                default_language="none",
+            )
+        except OperationFailure as error:
+            assert error.code == 2, error
+        else:
+            raise AssertionError("multi-field text index was accepted")
+        try:
+            text_coll.create_index(
+                [("title", "text")],
+                weights={"title": 2},
+                default_language="none",
+            )
+        except OperationFailure as error:
+            assert error.code == 2, error
+        else:
+            raise AssertionError("non-default text weight was accepted")
         text_name = text_coll.create_index(
-            [("title", "text"), ("body", "text")],
-            weights={"title": 2, "body": 1},
+            [("title", "text")],
             default_language="none",
         )
-        assert text_name == "title_text_body_text"
+        assert text_name == "title_text"
         text_index = next(
             index for index in text_coll.list_indexes() if index["name"] == text_name
         )
-        assert list(text_index["key"].items()) == [("title", "text"), ("body", "text")]
+        assert list(text_index["key"].items()) == [("title", "text")]
         assert text_index["default_language"] == "none"
-        assert text_index["weights"] == {"title": 2.0, "body": 1.0}
+        assert "weights" not in text_index
         assert sorted(
             doc["n"]
             for doc in text_coll.find(
                 {"$text": {"$search": '"alpha beta"'}}, {"n": 1, "_id": 0}
             )
         ) == [1, 4]
-        assert len(
-            list(
-                text_coll.find(
-                    {"$text": {"$search": "alpha gamma"}}, {"n": 1, "_id": 0}
-                )
-            )
-        ) == 3
         assert sorted(
             doc["n"]
             for doc in text_coll.find(
-                {"$text": {"$search": "delta -epsilon"}}, {"n": 1, "_id": 0}
+                {"$text": {"$search": "alpha gamma"}}, {"n": 1, "_id": 0}
             )
-        ) == [1, 4]
+        ) == [4]
+        assert sorted(
+            doc["n"]
+            for doc in text_coll.find(
+                {"$text": {"$search": "alpha -beta"}}, {"n": 1, "_id": 0}
+            )
+        ) == [2]
         scored = list(
             text_coll.find(
                 {"$text": {"$search": "alpha beta"}},
@@ -345,7 +362,7 @@ def main() -> int:
                 sort=[("score", {"$meta": "textScore"})],
             )
         )
-        assert sorted(doc["n"] for doc in scored) == [1, 2, 4]
+        assert sorted(doc["n"] for doc in scored) == [1, 4]
         scores = [doc["score"] for doc in scored]
         assert scores == sorted(scores, reverse=True)
         assert all(score >= 0 for score in scores)
@@ -411,7 +428,7 @@ def main() -> int:
             db.command(
                 {
                     "dropIndexes": text_coll.name,
-                    "index": {"title": "text", "body": "text"},
+                    "index": {"title": "text"},
                 }
             )["ok"]
             == 1.0

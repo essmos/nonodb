@@ -118,16 +118,18 @@ option the full result is returned in the first batch. Upserts without an `_id`
 in the filter receive a driver-style ObjectId, matching MongoDB.
 
 MongoDB-style text search is available through `createIndexes` with `key`
-values of `"text"`. A collection can have one text index; multiple fields are
-scored with BM25 and optional `weights`, and `default_language` must be absent or
-`"none"`. `listIndexes` and `dropIndexes` understand text keys and names.
-`$text` is accepted by `find`, `count`, `distinct`, and a leading aggregate
-`$match`. Positive terms and quoted phrases are ORed, `-term` and `"-phrase"`
-exclude matches, and at least one positive clause is required. `$meta:
-"textScore"` is available in projections and `$meta` sorts; other sorts with
-`$text` are rejected. `$text` is not supported in update/delete filters,
-`$or`/`$nor`, or non-leading aggregation stages. The analyzer is
-lowercase/diacritic-folding tokenization without stemming or stop-word removal,
+values of `"text"`. A collection can have one text index, and that index covers
+exactly one field; multi-field text keys and non-default weights are not
+supported. `default_language` must be absent or `"none"`. `listIndexes` and
+`dropIndexes` understand text keys and names. `$text` is accepted by `find`,
+`count`, `distinct`, and a leading aggregate `$match`. Positive terms and
+quoted phrases must all match (AND), `-term` and `"-phrase"` exclude matches,
+and at least one positive clause is required. This differs from MongoDB, which
+ORs positive text clauses. `$meta: "textScore"` is available in projections and
+`$meta` sorts; other sorts with `$text` are rejected. `$text` is not supported
+in update/delete filters, `$or`/`$nor`, or non-leading aggregation stages. The
+analyzer is lowercase/diacritic-folding tokenization without stemming or
+stop-word removal,
 so ranking and language behavior are approximate rather than MongoDB-identical.
 
 ### Tenant IDs and encryption
@@ -351,7 +353,7 @@ allowed. Other BSON types are not accepted as `_id`.
 | `$jsonSchema` | 🟡 | Common keywords and combinators; not every JSON Schema draft feature |
 | `$and`, `$or`, `$nor`, `$not` | ✅ | |
 | `$where` | ❌ | No JavaScript execution |
-| `$text` | 🟡 | Lexical BM25 subset over one MongoDB-style text index; terms and phrases are ORed, negative terms/phrases exclude, and at least one positive clause is required. No stemming, stop words, or non-`none` languages |
+| `$text` | 🟡 | Lexical BM25 subset over one single-field MongoDB-style text index; positive terms and phrases are ANDed, negative terms/phrases exclude, and at least one positive clause is required. No stemming, stop words, or non-`none` languages |
 | `$comment` as a filter operator | ❌ | `comment` is available as a query option |
 | `$rand` | ❌ | |
 | Collation | ❌ | No per-query or per-index collation |
@@ -442,7 +444,7 @@ allowed. Other BSON types are not accepted as `_id`.
 | Unique indexes | ✅ | Including unique multikey semantics |
 | Covered queries / `include` | ✅ | Top-level inclusive projections only |
 | Geospatial indexes | 🟡 | GeoJSON point indexes only; no polygon/line indexes |
-| Text search indexes | 🟡 | One MongoDB-style text index per collection through `createIndexes`/`listIndexes`/`dropIndexes`; multi-field weights and leading-`$match` `$text`. No compound mixed text/non-text keys |
+| Text search indexes | 🟡 | One single-field MongoDB-style text index per collection through `createIndexes`/`listIndexes`/`dropIndexes`; leading-`$match` `$text`. Multi-field weights and compound mixed text/non-text keys are not supported |
 | Vector indexes | 🟡 | NonoDB-specific exact/vector search |
 | Sparse indexes | ❌ | |
 | Partial indexes | ❌ | |

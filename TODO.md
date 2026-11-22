@@ -147,23 +147,18 @@ indexing, and profiling.
 
 ## Known issues and caveats
 
-- Single-term BM25 and unfiltered exact vector search now use
-  `NONODB_SEARCH_WORKERS` threads. On a 100M-document corpus, one term dropped
-  from 9.9 s to 4.2-4.4 s and exact 16D vector search from 6.7 s to 4.9-5.3 s.
-  Multi-term BM25 still uses the single-thread streaming merge (29.6 s for two
-  terms, 40.1 s for three), and an exact indexed filter still scans all postings
-  to compute document frequency (18.3 s). Block-max WAND and ID-range sharding
-  for parallel multi-term search remain the next steps.
-- Fuzzy search now merges sorted trigram posting lists directly into a bounded
-  5,000-candidate heap. On 10M documents, distance-1/2 queries take about 2.25 s.
-  At 100M documents the candidate set is still too large: a distance-1 query did
-  not finish within roughly 9 minutes in the previous design. Treat fuzzy search
-  at 100M scale as experimental until candidate pruning or a different index
-  structure is implemented.
-- New index/search resources use a reusable slot pool, so create/drop cycles do
-  not consume new LMDB sub-databases. Legacy named sub-databases created by
-  older releases cannot be deregistered with the current heed API; a
-  compacting backup/restore reclaims them.
+- BM25 common-term queries on the full 8.84M MS MARCO collection still reach a
+  p95 of about 30 ms. Block-max WAND and further pruning remain the next
+  performance step.
+- The 100M vector ANN sidecar is about 27 ms p50 at `nprobe=2`, above the
+  8–16 ms target. Tune IVF/PQ or validate HNSW on real vectors before choosing
+  a replacement.
+- Text and fuzzy indexes cover exactly one field. MongoDB-style multi-field text
+  keys and non-default weights are rejected.
+- Legacy LMDB text/fuzzy indexes are no longer read. Drop and recreate them as
+  segment indexes before upgrading.
+- Sidecar backups are not supported with age encryption; use the restic engine
+  when encrypted sidecar backups are required.
 - `insert_many` is a single request but is not the guaranteed all-or-nothing
   primitive; use `write_batch` for atomic groups.
 - Changing `_id` through update operators is unsupported; treat `_id` as

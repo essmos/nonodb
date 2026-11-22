@@ -136,7 +136,7 @@ and the same daemon configuration.
 | Load throughput | **63,469 docs/s** | **89,010 docs/s** |
 | Collection size | 1,000,000 docs | 8,841,823 docs |
 
-#### Internal segment prototype
+#### Internal segment implementation
 
 `nonodb-core/src/search_segment.rs` contains a compact segment format with
 sorted term blocks, delta-encoded postings, document-frequency-driven AND
@@ -190,8 +190,8 @@ Concurrent clients against the same 8.84M index (200 queries per client,
 The 100-client run has a lower p99 than the 16-client run because each client
 samples the same deterministic query set but the outlier tail is distributed
 across more requests; p50 and throughput are the useful scaling indicators.
-The segment backend is the default for newly created text indexes in the
-daemon, with a durable delta, tombstone generations, and synchronous flushes.
+All text indexes use the segment backend in the daemon, with a durable delta,
+tombstone generations, and synchronous flushes.
 Filters, phrases, negation, exact live BM25 statistics, and suffix/full
 compaction are supported; matching phrases add a score bonus, while
 phrase and non-indexed filter verification still loads candidate documents from
@@ -219,7 +219,7 @@ comparison.
 
 #### Daemon end-to-end concurrency
 
-A separate daemon was started with the default segment engine and a fresh
+A separate daemon was started with the segment engine and a fresh
 1,000,000-passage MS MARCO collection. Each Python client opens its own Unix
 socket, runs five warmup queries, then 200 queries with `limit=10`:
 
@@ -239,7 +239,7 @@ and client harness.
 
 The same 1M-passage MS MARCO corpus and the same 200-query sample (seed 42,
 `limit=10`, five warmup queries) were loaded into Elasticsearch 8.15.0 and into
-the default segment backend. Elasticsearch used one shard, zero replicas, a
+the segment backend. Elasticsearch used one shard, zero replicas, a
 2 GB heap, the standard analyzer, and `match` with `operator=and`. NonoDB used
 its native single-field AND search over a Unix socket; Elasticsearch was queried
 over loopback HTTP.
@@ -444,7 +444,7 @@ python3 scripts/es_bench.py --url http://127.0.0.1:9200 \
   --collection-tsv collection.tsv --queries queries.train.tsv \
   --load --samples 200 --clients 100
 
-# Internal immutable segment prototype
+# Internal immutable segment implementation
 cargo run --release -p nonodb-core --example segment_bench -- \
   collection.tsv /var/lib/vz/nonodb-bench-1b/segments/msmarco8m.seg \
   --rebuild --queries queries.train.tsv --samples 500 --limit 10

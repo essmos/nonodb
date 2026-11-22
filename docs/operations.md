@@ -883,10 +883,11 @@ retry administrative file commands after it completes.
 ### Named databases
 
 Collections and the fixed metadata/history/TTL databases consume named LMDB
-sub-databases. Index, text, fuzzy, and vector resources share a reusable slot pool:
-dropping an index returns its slot, and later indexes reuse it. The environment
-is opened with `MAX_DBS=1024`, leaving 960 slots for index/search resources.
-Legacy resources from older releases may still hold named databases; a
+sub-databases. Secondary index and vector resources share a reusable slot pool:
+dropping one returns its slot, and later resources reuse it. Text and fuzzy
+indexes use segment sidecars and metadata instead of a slot. The environment is
+opened with `MAX_DBS=1024`, leaving 960 slots for index/vector resources.
+Resources from older releases may still hold legacy named databases; a
 compacting backup/restore reclaims them.
 
 ### Memory
@@ -997,11 +998,14 @@ backups.
 - If tokenization or search analysis changes between versions, drop and recreate
   text and fuzzy indexes. Old index entries use the old analyzer and will not
   match new normalization rules.
-- Search index definitions are now stored as unified `SearchIndexDef` entries
+- Search index definitions are stored as unified `SearchIndexDef` entries
   under `search:<collection>:<kind>:<name>`. Data directories created by an
   older release that used per-field `text:`/`fuzzy:` definition keys must drop
   and recreate their text and fuzzy indexes; the old definitions are not read
   automatically.
+- Text and fuzzy indexes created by releases with the legacy LMDB backend must
+  be dropped and recreated as segment indexes. Current releases do not read the
+  old LMDB postings/trigrams. New search definitions cover exactly one field.
 - Schema version is stored in metadata. There is currently no automatic
   migration framework; changes are handled by explicit commands and releases.
 

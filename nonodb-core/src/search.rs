@@ -83,8 +83,8 @@ impl SearchIndexDef {
                 "search index name must be at most 127 bytes and must not contain NUL".into(),
             );
         }
-        if self.fields.is_empty() {
-            return Err("search index must contain at least one field".into());
+        if self.fields.len() != 1 {
+            return Err("search indexes must contain exactly one field".into());
         }
         let mut seen = HashSet::new();
         for field in &self.fields {
@@ -112,9 +112,8 @@ impl SearchIndexDef {
     }
 }
 
-/// Query parsing mode. Native search requires all quoted phrases and at least
-/// one unquoted term. MongoDB text search treats terms and phrases as ORed
-/// positive clauses.
+/// Query parsing mode. Both native and MongoDB text search require every
+/// positive term and phrase through the segment query path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TextQueryMode {
     Native,

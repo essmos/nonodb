@@ -25,11 +25,13 @@ app1/data.mdb
 app1/manifest.json
 ```
 
-Each LMDB environment includes that database's documents, indexes, full-text,
-fuzzy, and vector data, history, TTL metadata, collection profiles, and database
-slots. Databases are independent: an instance backup is consistent per
-database, but it is not an atomic snapshot across databases. A backup does
-**not** include:
+Each database consists of an LMDB environment with documents, secondary
+indexes, vector index entries, history, TTL metadata, collection profiles, and
+database slots. Text/fuzzy postings and vector ANN data live in derived
+`search/` and `vector-ann/` sidecar files; they are not part of `data.mdb` and
+are copied only with `--with-search-sidecars`. Databases are independent: an
+instance backup is consistent per database, but it is not an atomic snapshot
+across databases. A backup does **not** include:
 
 - `lock.mdb` — it is recreated and is not data;
 - `auth.json` — authorization lives outside LMDB and is instance-wide;
@@ -477,8 +479,7 @@ This checks:
 - the LMDB schema and collection registry;
 - every document's JSON and `_id` consistency;
 - secondary index entries against their documents;
-- full-text postings, document lengths, and token totals;
-- fuzzy trigram posting counts;
+- text and fuzzy segment manifests, files, and openable readers;
 - vector index entries against the stored document vectors;
 - history and TTL entry counts.
 
@@ -549,7 +550,9 @@ Rules:
 - Ensure the restored files are owned by the daemon user.
 - By default, backups contain only LMDB. Text/fuzzy segment files and vector ANN
   sidecars are derived data and are not part of `data.mdb`; use
-  `--with-search-sidecars` to include them.
+  `--with-search-sidecars` to include them. Deep `verify-backup` needs those
+  sidecars to validate text and fuzzy indexes; include them when verification
+  is part of the backup policy.
 
 ### Search sidecars after restore
 

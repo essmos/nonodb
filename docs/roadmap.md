@@ -180,17 +180,18 @@ comparison and practical migration caveats.
   prefix/range rule.
 - A covering projection requires an explicit `include` list and an inclusive
   projection.
-- `drop_*` reuses index/search sub-database slots. Legacy databases created by
-  older releases remain registered until a compacting restore.
-- `MAX_DBS=1024`; collection count plus concurrent index/search resources must
+- `drop_*` reuses secondary index and vector sub-database slots. Text and fuzzy
+  indexes use segment sidecars instead. Legacy databases created by older
+  releases remain registered until a compacting restore.
+- `MAX_DBS=1024`; collection count plus concurrent index/vector resources must
   stay below that limit.
 
 ### Search
 
 - No stemming, stop-word removal, synonyms, thesaurus, or per-language
   analyzers.
-- BM25 terms are ORed; there is no `AND`/`OR` query parser beyond quoted
-  phrases.
+- BM25 requires every positive term to match; there is no user-facing
+  `AND`/`OR` query parser beyond quoted phrases.
 - Phrases require contiguous tokens; no slop parameter.
 - Fuzzy search caps candidate evaluation at 5,000 documents and supports only
   bounded Levenshtein distance.

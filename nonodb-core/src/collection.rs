@@ -3938,7 +3938,7 @@ impl<'e> Collection<'e> {
         filter: &Value,
         skip: usize,
         limit: Option<usize>,
-        mode: TextQueryMode,
+        _mode: TextQueryMode,
     ) -> Result<Vec<Value>> {
         crate::query::validate::validate_filter(filter)?;
         let Some(def) = self.search_index_def(rtxn, SearchKind::Text, name)? else {
@@ -3954,9 +3954,9 @@ impl<'e> Collection<'e> {
         }
 
         let empty_filter = filter.as_object().is_none_or(|object| object.is_empty());
-        if mode != TextQueryMode::Native || def.fields.len() != 1 {
+        if def.fields.len() != 1 {
             return Err(Error::Query(
-                "segment text indexes support only native single-field queries".into(),
+                "segment text indexes support exactly one field".into(),
             ));
         }
         let allowed = if empty_filter {

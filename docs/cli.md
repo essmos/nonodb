@@ -439,11 +439,11 @@ The command opens the database read-only and checks:
 - the schema version and collection registry;
 - every document's JSON and `_id` consistency;
 - every secondary index entry against its document;
-- full-text postings, document lengths, and total token counts;
-- fuzzy trigram posting counts;
+- text and fuzzy segment manifests, files, and openable readers;
+- vector index entries against the stored document vectors;
 - history and TTL entry counts.
 
-Legacy index formats are counted but not reconstructed exactly.
+Legacy secondary index formats are counted but not reconstructed exactly.
 
 ## verify-backup
 

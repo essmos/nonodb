@@ -288,7 +288,7 @@ scripts are:
 | `scripts/array_updates_test.py` | positional `$`, `$[]`, `arrayFilters`, push modifiers, `$pull` |
 | `scripts/find_and_modify_test.py` | atomic old/new return, sort, upsert, remove, concurrent counters |
 | `scripts/explain_test.py` | access paths, index bounds, sort coverage, actual counts |
-| `scripts/db_slots_test.py` | index/text/fuzzy/vector slot reuse above the legacy 256 limit |
+| `scripts/db_slots_test.py` | secondary index and vector slot reuse above the legacy 256 limit |
 | `scripts/resize_test.py` | online map growth, concurrent I/O, rejected shrink |
 | `scripts/restore_drill.py` | live backup, manifest verification, restore, query checks |
 | `scripts/shutdown_test.py` | graceful shutdown with an in-flight atomic write, JSON logs, restart durability |

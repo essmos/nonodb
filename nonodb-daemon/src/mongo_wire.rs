@@ -1893,6 +1893,9 @@ async fn create_indexes_command(
                     "NonoDB text indexes cannot mix text and non-text fields",
                 ));
             }
+            if text_fields.len() != 1 {
+                return Err(bad_value("NonoDB text indexes require exactly one field"));
+            }
             if !text_specs.is_empty() {
                 return Err(bad_value(
                     "createIndexes can create at most one text index at a time",
@@ -1945,6 +1948,11 @@ async fn create_indexes_command(
                             return Err(bad_value(format!(
                                 "text index weight for `{field}` must be positive and finite"
                             )));
+                        }
+                        if (weight - 1.0).abs() > f64::EPSILON {
+                            return Err(bad_value(
+                                "NonoDB text indexes do not support non-default weights",
+                            ));
                         }
                         weight
                     }
