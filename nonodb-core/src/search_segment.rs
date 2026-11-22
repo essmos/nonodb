@@ -14,6 +14,8 @@
 //!          u32 block count, f32 max term impact
 //! index:   u16 len, first term, u64 term block offset, u32 term block len
 //! postings: per term, blocks of at most 128 postings
+//! positions (v3): u32 version, u32 doc_count, (doc_count + 1) x u64 offsets,
+//!                  per-doc u32 token count followed by u32 term ids
 //! ```
 //!
 //! A posting block is `u32 first_doc, u16 count, f32 max_tf_norm, u32 data_len`
