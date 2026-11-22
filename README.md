@@ -742,12 +742,12 @@ documentation.
 | [HTTP API](docs/api.md) | Every operation, request/response shapes, filters, updates, indexes, search, errors |
 | [MongoDB compatibility](docs/mongodb-compatibility.md) | Feature comparison, practical coverage, and migration caveats |
 | [SQL queries](docs/sql.md) | `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `DISTINCT`, `HAVING`, `CASE`, functions, aggregates, `explain_sql`, parameters, limits, client examples |
-| [Clients](docs/clients.md) | Python, Rust, Node.js and Go clients: install, CRUD, batches, indexes, search, TCP/TLS, read-replica write routing |
+| [Clients](docs/clients.md) | Python, Rust, Node.js and Go clients: install, CRUD, batches, indexes, search, TCP/TLS, read-replica write routing, async Python watch/streams |
 | [Migration and import](docs/migration.md) | MongoDB, PostgreSQL, SQLite and CSV migration, NDJSON format, import manifest, cutover |
 | [Authentication and permissions](docs/auth.md) | Principals, scopes, tokens, certificates, CLI/API/GUI management, lockout, reloads, audit log |
 | [Security checks](docs/security-check.md) | Local security regression checks, LiveAPISec audit method, results, hardening gaps, production checklist |
 | [Mutual TLS](docs/mtls.md) | Client certificate setup, private CA, fingerprint mapping, revocation, rotation |
-| [Python client](docs/python-client.md) | `NonoDB`/`Collection` API, caching, retries, TCP/TLS, FastAPI usage |
+| [Python client](docs/python-client.md) | `NonoDB`/`Collection` API, `AsyncNonoDB` watch/streams, caching, retries, TCP/TLS, FastAPI usage |
 | [Background jobs](docs/workers.md) | Durable `_jobs`, workers, leases, retries, cron/systemd, language-independent contract |
 | [Outbox events](docs/events.md) | Atomic data + event writes, automatic collection events, source-side filters, polling consumers, checkpoints, event worker CLI, TTL, systemd |
 | [Conditional subscriptions](docs/subscriptions.md) | Persistent conditions over collection state, count thresholds, edge-triggered delivery |

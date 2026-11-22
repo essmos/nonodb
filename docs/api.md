@@ -2462,8 +2462,9 @@ Rules:
 - `_ttl` overrides the collection default; `_ttl: 0` or `null` disables expiry.
 - A missing `_ttl` inherits the collection default; without either, the
   document does not expire.
-- `ttl_seconds` must be positive. Negative, fractional, or non-numeric `_ttl`
-  values return `invalid_ttl`.
+- `ttl_seconds` must be positive. `_ttl` accepts non-negative integers,
+  including BSON int32/int64 values through the MongoDB wire listener.
+  Negative, fractional, or non-numeric values return `invalid_ttl`.
 - Updates preserve the existing expiry unless the update result contains an
   explicit `_ttl`. Replacement updates and upserts follow the same rule.
 - `$unset` of `_ttl` does not clear an expiry; use `$set` with `0` or `null`.

@@ -149,8 +149,9 @@ const indexes = await articles.listVectorIndexes();
 await articles.dropVectorIndex('embedding');
 ```
 
-`_distance` is lower-is-better. Search is exact and scans the index. Missing or
-wrong-length vectors are skipped. See [Vector search](../../docs/clients.md#vector-search)
+`_distance` is lower-is-better. Search is exact by default; an optional IVF
+sidecar accelerates unfiltered queries. Missing or wrong-length vectors are
+skipped. See [Vector search](../../docs/clients.md#vector-search)
 for common semantics and the other clients.
 
 ## Vault collections

@@ -82,8 +82,10 @@ Use the reserved top-level `_ttl` field in an inserted document:
 
 Rules:
 
-- `_ttl` is a positive integer number of seconds and overrides the collection
-  default.
+- `_ttl` is a non-negative integer number of seconds and overrides the
+  collection default.
+- Through the MongoDB wire listener, BSON int32/int64 values such as
+  `Int64(30)` are accepted in addition to plain JSON integers.
 - `_ttl: 0` or `_ttl: null` disables expiry for that document, even when the
   collection has a default.
 - If `_ttl` is absent, the collection default applies.

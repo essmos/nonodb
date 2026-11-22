@@ -378,7 +378,7 @@ stage performs a write through the primary and returns an empty list; pass
 `durability="relaxed"` or `"unsafe"` to override the default `full` durability.
 Clients detect these terminal stages automatically for primary routing. The
 supported stages, expressions, accumulators, and the 100,000-document
-intermediate limit are documented in [Aggregation](api.md#aggregation).
+intermediate limit are documented in [Aggregation](api.md#aggregate).
 
 ## SQL
 
@@ -744,7 +744,8 @@ Collection.fuzzy(
 ## Vector search
 
 Vectors are computed outside NonoDB, by the application or a local embedding
-service. NonoDB stores the ready vectors and performs exact top-K search.
+service. NonoDB stores the ready vectors and performs exact top-K search by
+default; an optional IVF sidecar accelerates unfiltered queries.
 
 ```python
 articles.create_vector_index("embedding", 384, metric="cosine")
@@ -784,7 +785,8 @@ Collection.vector_search(
 ```
 
 - `_distance` is lower-is-better: `1 - cosine`, `-dot`, or squared L2.
-- Search is exact and scans the whole index; it is not approximate.
+- Search is exact by default; an optional IVF sidecar accelerates unfiltered
+  queries and is approximate. Filtered queries use the exact path.
 - One vector per document per index.
 - Missing or wrong-length vectors are not indexed.
 - The same model and dimensions must be used for stored vectors and queries.

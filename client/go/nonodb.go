@@ -1398,7 +1398,7 @@ func (c *Collection) ListVectorIndexes(ctx context.Context) ([]VectorIndex, erro
 	return result.Indexes, nil
 }
 
-// VectorSearch runs exact top-K vector search.
+// VectorSearch runs top-K vector search, exact or with the optional IVF sidecar.
 func (c *Collection) VectorSearch(
 	ctx context.Context,
 	field string,

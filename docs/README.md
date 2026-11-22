@@ -26,7 +26,7 @@ quick-start instructions, and a feature overview.
 | [Security checks](security-check.md) | Operators, security reviewers, maintainers | Local security regression checks, LiveAPISec audit method, results, hardening gaps, production checklist |
 | [Monitoring and alerting](monitoring.md) | Operators, SRE | Health/readiness, Prometheus endpoint, metrics:read token, OpenTelemetry Collector, disk/snapshot metrics, alerts |
 | [Mutual TLS](mtls.md) | Operators, security reviewers | Private CA setup, client certificates, fingerprint mapping, revocation, rotation, troubleshooting |
-| [Python client](python-client.md) | Python developers | Connection, CRUD, upsert, indexes, search, batches, cache, FastAPI |
+| [Python client](python-client.md) | Python developers | Connection, CRUD, upsert, indexes, search, batches, cache, FastAPI, async watch/streams |
 | [Background jobs](workers.md) | Application developers, operators | Durable jobs, workers, leases, retries, cron/systemd, languages |
 | [Outbox events](events.md) | Application developers, operators | Atomic data + events, automatic collection events, source-side filters, polling consumers, checkpoints, event worker CLI, TTL, systemd |
 | [Conditional subscriptions](subscriptions.md) | Application developers | Conditions over collection state, count thresholds, edge-triggered mode, events, clients |

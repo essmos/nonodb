@@ -710,8 +710,10 @@ Behavior common to all clients:
 - `metric` is `cosine` (default), `dot`, or `l2`.
 - `_distance` is lower-is-better: `1 - cosine_similarity`, negative dot
   product, or squared Euclidean distance.
-- Search is exact and scans the whole vector index, so unfiltered cost is
-  `O(N × dims)`. There is no ANN/recall loss.
+- Search is exact by default and scans the whole vector index.
+- An optional IVF sidecar accelerates unfiltered queries and is approximate;
+  filtered queries and post-write queries use the exact path. Recall depends on
+  the data and probe count.
 - Missing, malformed, or wrong-length vectors are skipped; writes still succeed.
 - Creating an index backfills existing documents synchronously. Auto-index does
   not create vector indexes.
