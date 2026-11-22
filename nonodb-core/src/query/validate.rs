@@ -9,7 +9,53 @@ use crate::numeric;
 use crate::regex;
 use crate::{Error, Result};
 
+/// Top-level filter operators implemented by the matcher. `$text` is resolved by
+/// the search layer, never by the matcher itself.
+const FILTER_OPERATORS: &[&str] = &[
+    "$and",
+    "$or",
+    "$nor",
+    "$not",
+    "$expr",
+    "$jsonSchema",
+    "$text",
+];
+
+/// Field-level operators implemented by the matcher.
+const FIELD_OPERATORS: &[&str] = &[
+    "$eq",
+    "$ne",
+    "$gt",
+    "$gte",
+    "$lt",
+    "$lte",
+    "$in",
+    "$nin",
+    "$all",
+    "$size",
+    "$elemMatch",
+    "$exists",
+    "$regex",
+    "$options",
+    "$type",
+    "$mod",
+    "$bitsAllClear",
+    "$bitsAllSet",
+    "$bitsAnyClear",
+    "$bitsAnySet",
+    "$near",
+    "$nearSphere",
+    "$geoWithin",
+    "$geoIntersects",
+    "$not",
+];
+
 /// Validates regex and array operator arguments before a query runs.
+///
+/// Operators outside the documented subset are rejected here, so a typo such as
+/// `{"email": {"$regx": "..."}}` fails instead of matching nothing. That matters
+/// for negation: `$nor`/`$not` would otherwise turn a silently-false predicate
+/// into "matches every document".
 pub fn validate_filter(filter: &Value) -> Result<()> {
     regex::validate_filter(filter)?;
     validate_array_filter(filter)
@@ -20,6 +66,9 @@ fn validate_array_filter(filter: &Value) -> Result<()> {
         return Ok(());
     };
     for (key, cond) in obj {
+        if key.starts_with('$') && !FILTER_OPERATORS.contains(&key.as_str()) {
+            return Err(Error::Query(format!("unknown top level operator: {key}")));
+        }
         match key.as_str() {
             "$and" | "$or" | "$nor" => {
                 if let Some(arr) = cond.as_array() {
@@ -29,8 +78,10 @@ fn validate_array_filter(filter: &Value) -> Result<()> {
                 }
             }
             "$not" => validate_array_filter(cond)?,
-            "$expr" => {}
+            "$expr" => validate_expression(cond)?,
             "$jsonSchema" => crate::query::schema::validate(cond)?,
+            // `$text` is resolved by the search layer, not by the matcher.
+            "$text" => {}
             _ => validate_condition(cond)?,
         }
     }
@@ -38,7 +89,13 @@ fn validate_array_filter(filter: &Value) -> Result<()> {
 }
 
 fn validate_condition(cond: &Value) -> Result<()> {
-    if date::is_date(cond) || numeric::is_numeric(cond) || bson_types::is_bson_value(cond) {
+    // Extended JSON dates, numbers, BSON values, and BSON regex values are
+    // predicates/values, not operator documents.
+    if date::is_date(cond)
+        || numeric::is_numeric(cond)
+        || bson_types::is_bson_value(cond)
+        || regex::is_value(cond)
+    {
         return Ok(());
     }
     let Some(obj) = cond.as_object() else {
@@ -48,6 +105,9 @@ fn validate_condition(cond: &Value) -> Result<()> {
         return Ok(());
     }
     for (op, arg) in obj {
+        if !FIELD_OPERATORS.contains(&op.as_str()) {
+            return Err(Error::Query(format!("unknown operator: {op}")));
+        }
         match op.as_str() {
             "$size" => {
                 if arg.as_u64().and_then(|n| usize::try_from(n).ok()).is_none() {
@@ -93,6 +153,45 @@ fn validate_condition(cond: &Value) -> Result<()> {
             }
             _ => {}
         }
+    }
+    Ok(())
+}
+
+/// Rejects expression operators that the aggregation evaluator does not implement.
+///
+/// `$expr` used to evaluate unknown operators as `false`, which silently returned
+/// no documents (and, under `$nor`/`$not`, every document).
+fn validate_expression(expr: &Value) -> Result<()> {
+    match expr {
+        Value::Array(items) => {
+            for item in items {
+                validate_expression(item)?;
+            }
+        }
+        Value::Object(obj) => {
+            if obj.len() == 1
+                && !date::is_date(expr)
+                && !numeric::is_numeric(expr)
+                && !bson_types::is_bson_value(expr)
+                && !regex::is_value(expr)
+            {
+                if let Some(op) = obj.keys().next() {
+                    if op.starts_with('$') && !crate::aggregate::expression_operator_supported(op) {
+                        return Err(Error::Query(format!(
+                            "unsupported aggregation expression `{op}`"
+                        )));
+                    }
+                    // `$literal` value is data, not an expression tree.
+                    if op == "$literal" {
+                        return Ok(());
+                    }
+                }
+            }
+            for value in obj.values() {
+                validate_expression(value)?;
+            }
+        }
+        _ => {}
     }
     Ok(())
 }
