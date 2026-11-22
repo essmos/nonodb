@@ -2,7 +2,7 @@
 
 Full release notes: https://github.com/essmos/nonodb/releases
 
-## Unreleased
+## v0.29.1 - 2026-11-22
 
 - Accept BSON int32/int64 `_ttl` values through the MongoDB wire listener by
   parsing canonical Extended JSON integers in the TTL directive.
