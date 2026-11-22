@@ -58,6 +58,26 @@ ANN at p50, and Elasticsearch about **1.8× faster**. NonoDB ANN is about
 | Qdrant | 500k points in 114 s; HNSW ready +15 s | HNSW built during upsert | 854 MB (vectors only, no payload) |
 | Elasticsearch | 500k docs in 852 s including force-merge | HNSW built during indexing | 3.7 GB (body + vector) |
 
+#### RAM and disk
+
+| Engine | RAM (current) | Peak RAM | Disk |
+|---|---:|---:|---:|
+| NonoDB | 1.4 GB | 1.4 GB | 8.4 GB |
+| Qdrant | 1.2 GB | 1.8 GB | 854 MB |
+| Elasticsearch | 3.9 GB | 7.6 GB | 3.7 GB |
+
+Qdrant's figure is the container cgroup value and includes charged page cache;
+its RSS is about 440 MB. NonoDB's 8.4 GB includes the LMDB documents, the exact
+vector index, and a 741 MB ANN sidecar. Qdrant stored vectors without payload
+text, while NonoDB and Elasticsearch also stored the passage text. Elasticsearch
+peak memory covers bulk indexing and force-merge.
+
+NonoDB's practical advantage is not raw ANN latency but that vector, BM25, and
+fuzzy search live in the same collection and the same single-writer database.
+Hybrid ranking can combine vector candidates with BM25 or fuzzy matches without
+running a separate vector service or duplicating the documents. Qdrant is
+vector-only, and this Elasticsearch run measured dense-vector search only.
+
 Storage is not directly comparable: NonoDB also stores document bodies, history
 metadata, the exact LMDB vector index, and the ANN sidecar; Qdrant was loaded
 without payload text; Elasticsearch stores body and vector.
