@@ -14,7 +14,7 @@
 //!          u32 block count, f32 max term impact
 //! index:   u16 len, first term, u64 term block offset, u32 term block len
 //! postings: per term, blocks of at most 128 postings
-//! positions (v3): term dictionary plus per-doc u32 token count and u32 term
+//! positions (v3): term dictionary plus per-doc u32 token count and varint term
 //!                  ordinals; older position files with token strings remain
 //!                  readable
 //! ```
@@ -592,12 +592,38 @@ impl SegmentBuilder {
             dict_offsets.push(u32::try_from(dict_data.len()).map_err(|_| {
                 io::Error::new(io::ErrorKind::InvalidData, "position dictionary too large")
             })?);
+
+            // First pass computes varint-encoded document offsets. The writer
+            // records u32 term ids, so only this pass needs to remap them.
+            let mut doc_offsets = Vec::with_capacity(doc_count as usize + 1);
+            let mut data_len = 0u64;
+            {
+                let mut source =
+                    io::BufReader::new(File::open(self.work_dir.join("positions.tmp"))?);
+                for _ in 0..doc_count {
+                    doc_offsets.push(data_len);
+                    data_len += 4;
+                    let count = read_u32(&mut source)?;
+                    for _ in 0..count {
+                        let old = read_u32(&mut source)?;
+                        let mapped = remap.get(old as usize).copied().ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "position term id out of range",
+                            )
+                        })?;
+                        data_len += varint_len(u64::from(mapped));
+                    }
+                }
+            }
+            doc_offsets.push(data_len);
+
             let header_size = 48u64;
             let dict_offsets_off = positions_off + header_size;
             let dict_data_off = dict_offsets_off + u64::from(term_count + 1) * 4;
             let doc_offsets_off = dict_data_off + dict_data.len() as u64;
             let doc_data_off = doc_offsets_off + u64::from(doc_count + 1) * 8;
-            write_u32(&mut out, 2)?;
+            write_u32(&mut out, 3)?;
             write_u32(&mut out, doc_count)?;
             write_u32(&mut out, term_count)?;
             write_u32(&mut out, 0)?;
@@ -609,9 +635,11 @@ impl SegmentBuilder {
                 write_u32(&mut out, *offset)?;
             }
             out.write_all(&dict_data)?;
-            for offset in &positions.offsets {
+            for offset in &doc_offsets {
                 write_u64(&mut out, *offset)?;
             }
+
+            // Second pass emits the compact varint records.
             let mut source = io::BufReader::new(File::open(self.work_dir.join("positions.tmp"))?);
             for _ in 0..doc_count {
                 let count = read_u32(&mut source)?;
@@ -621,7 +649,7 @@ impl SegmentBuilder {
                     let mapped = remap.get(old as usize).copied().ok_or_else(|| {
                         io::Error::new(io::ErrorKind::InvalidData, "position term id out of range")
                     })?;
-                    write_u32(&mut out, mapped)?;
+                    write_varint_to(&mut out, u64::from(mapped))?;
                 }
             }
         }
@@ -1511,7 +1539,7 @@ impl Positions {
                     doc_count,
                 })
             }
-            2 => {
+            2 | 3 => {
                 let mut header = [0u8; 48];
                 read_map(map, offset, &mut header)?;
                 let stored_docs = u32::from_le_bytes(header[4..8].try_into().unwrap());
@@ -1541,6 +1569,7 @@ impl Positions {
                     doc_offsets,
                     doc_data,
                     doc_count,
+                    varint: version == 3,
                 })
             }
             _ => Err(io::Error::new(
@@ -1567,6 +1596,7 @@ impl Positions {
                 doc_offsets,
                 doc_data,
                 doc_count,
+                varint,
             } => {
                 let mut wanted = Vec::with_capacity(phrase.len());
                 for term in phrase {
@@ -1577,7 +1607,11 @@ impl Positions {
                     };
                     wanted.push(id);
                 }
-                let ids = read_v2_ids(map, *doc_offsets, *doc_data, *doc_count, doc)?;
+                let ids = if *varint {
+                    read_v3_ids(map, *doc_offsets, *doc_data, *doc_count, doc)?
+                } else {
+                    read_v2_ids(map, *doc_offsets, *doc_data, *doc_count, doc)?
+                };
                 Ok(ids.windows(wanted.len()).any(|window| window == wanted))
             }
         }
@@ -1687,6 +1721,58 @@ fn read_v2_ids(
     Ok(ids)
 }
 
+fn read_v3_ids(
+    map: &Mmap,
+    doc_offsets: u64,
+    doc_data: u64,
+    doc_count: u32,
+    doc: u32,
+) -> io::Result<Vec<u32>> {
+    if doc >= doc_count {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "position doc id out of range",
+        ));
+    }
+    let start = doc_data + read_u64_at(map, doc_offsets + u64::from(doc) * 8)?;
+    let end = doc_data + read_u64_at(map, doc_offsets + u64::from(doc + 1) * 8)?;
+    if end < start || end > map.len() as u64 || start + 4 > end {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid segment position bounds",
+        ));
+    }
+    let count = read_u32_at(map, start)? as usize;
+    let data_start = start + 4;
+    if count as u64 > end - data_start {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid segment position count",
+        ));
+    }
+    let start = usize::try_from(data_start)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "position too large"))?;
+    let end = usize::try_from(end)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "position too large"))?;
+    let blob = &map[start..end];
+    let mut position = 0usize;
+    let mut ids = Vec::with_capacity(count);
+    for _ in 0..count {
+        let value = read_varint(blob, &mut position)?;
+        let id = u32::try_from(value).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "position term id too large")
+        })?;
+        ids.push(id);
+    }
+    if position != blob.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "trailing segment position data",
+        ));
+    }
+    Ok(ids)
+}
+
 fn term_ordinal(
     map: &Mmap,
     dict_offsets: u64,
@@ -1733,6 +1819,7 @@ enum Positions {
         doc_offsets: u64,
         doc_data: u64,
         doc_count: u32,
+        varint: bool,
     },
 }
 
@@ -2458,6 +2545,27 @@ fn write_varint(out: &mut Vec<u8>, mut value: u64) {
     out.push(value as u8);
 }
 
+fn varint_len(mut value: u64) -> u64 {
+    let mut len = 1;
+    while value >= 0x80 {
+        value >>= 7;
+        len += 1;
+    }
+    len
+}
+
+fn write_varint_to<W: Write>(out: &mut W, mut value: u64) -> io::Result<()> {
+    let mut buf = [0u8; 10];
+    let mut len = 0;
+    while value >= 0x80 {
+        buf[len] = (value as u8 & 0x7f) | 0x80;
+        value >>= 7;
+        len += 1;
+    }
+    buf[len] = value as u8;
+    out.write_all(&buf[..=len])
+}
+
 fn read_u32<R: Read>(r: &mut R) -> io::Result<u32> {
     let mut buf = [0u8; 4];
     r.read_exact(&mut buf)?;
@@ -2556,6 +2664,46 @@ mod tests {
         let mut ids: Vec<_> = hits.into_iter().map(|hit| hit.id).collect();
         ids.sort();
         assert_eq!(ids, ["a", "d", "delta"]);
+    }
+
+    #[test]
+    fn phrase_positions_use_multibyte_term_ids() {
+        let words: Vec<String> = (0..300).map(|i| format!("term{i:03}")).collect();
+        let text = words.join(" ");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("multi.seg");
+        let mut builder = SegmentBuilder::new(&path).unwrap();
+        builder.add_document("a", &text).unwrap();
+        builder.finish().unwrap();
+        let reader = SegmentReader::open(&path).unwrap();
+        assert!(reader.has_positions());
+        let set = SegmentSet::with_segments(vec![reader]);
+        let phrase = vec!["term150".to_string(), "term151".to_string()];
+        let hits = set
+            .search_verified_phrases(
+                "term150 term151",
+                0,
+                10,
+                None,
+                None,
+                std::slice::from_ref(&phrase),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        let wrong = vec!["term151".to_string(), "term150".to_string()];
+        let misses = set
+            .search_verified_phrases(
+                "term150 term151",
+                0,
+                10,
+                None,
+                None,
+                std::slice::from_ref(&wrong),
+            )
+            .unwrap()
+            .unwrap();
+        assert!(misses.is_empty());
     }
 
     #[test]

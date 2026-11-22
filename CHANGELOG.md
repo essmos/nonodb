@@ -21,7 +21,8 @@ Full release notes: https://github.com/essmos/nonodb/releases
 - Store token positions in segment text files (format v3) and verify positive
   phrases from those positions, falling back to LMDB documents for legacy v2
   segments. Position data uses a per-segment term dictionary and compact term
-  ordinals; set `NONODB_SEGMENT_POSITIONS=0` to omit positions and save space.
+  varint-encoded ordinals; set `NONODB_SEGMENT_POSITIONS=0` to omit positions
+  and save space.
 - Document the 100M vector ANN sidecar result and the 8.84M concurrent search
   benchmark.
 - Add the HTTP/JSON `drop_collection` operation. It removes documents, indexes,

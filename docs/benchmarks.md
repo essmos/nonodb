@@ -413,17 +413,18 @@ against the old v2 fallback and a rebuilt v3 index:
 | Corpus | Mode | p50 | p95 | Mean |
 |---|---|---:|---:|---:|
 | 1M MS MARCO subset | v2 + LMDB phrase fetch | 0.61 ms | **46.06 ms** | **36.18 ms** |
-| 1M MS MARCO subset | v3 positions (term ids) | 0.61 ms | **6.40 ms** | **4.27 ms** |
+| 1M MS MARCO subset | v3 positions (varint term ids) | 0.62 ms | **6.30 ms** | **4.21 ms** |
 | 8.84M MS MARCO | v2 + LMDB phrase fetch | 1.05 ms | **310.29 ms** | **336.12 ms** |
-| 8.84M MS MARCO | v3 positions (term ids) | 0.62 ms | **45.51 ms** | **39.81 ms** |
+| 8.84M MS MARCO | v3 positions (varint term ids) | 0.62 ms | **43.63 ms** | **37.71 ms** |
 
-Positions are stored as term ordinals in a per-segment dictionary rather than
-repeating token strings. The 8.84M segment grew from about **1.43 GB** to
-**3.61 GB**, down from **5.97 GB** when positions stored full token strings. The
-1M rebuilt segment is about **417 MB**. Set `NONODB_SEGMENT_POSITIONS=0` before
+Positions are stored as varint-encoded term ordinals in a per-segment
+dictionary rather than repeating token strings. The 8.84M segment grew from
+about **1.43 GB** to **3.09 GB**, down from **5.97 GB** when positions stored
+full token strings and **3.61 GB** with fixed-width ordinal positions. The 1M
+rebuilt segment is about **358 MB**. Set `NONODB_SEGMENT_POSITIONS=0` before
 building an index to keep the smaller position-free format and use the LMDB
-document fallback. Legacy v2 segments and older token-string position files
-remain readable without a rebuild.
+document fallback. Legacy v2 segments and older position files remain readable
+without a rebuild.
 
 ---
 
