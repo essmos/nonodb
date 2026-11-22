@@ -31,11 +31,7 @@ run. The 100M dense comparator in the 1B table comes from an older ext4 host.
 - Search timings use `limit=10` and `NONODB_CACHE_TTL=0` unless noted.
   The daemon caches identical reads for 5 seconds by default; repeatedly timing
   the same query with the cache enabled measures a cache hit, not search.
-- Results from different data sets and different search backends are not
-  directly comparable. The synthetic `search1m`/`search10m` BM25 and fuzzy
-  indexes below were built before the segment backend became the default, so
-  those rows are legacy LMDB baselines. Current segment results are in the
-  MS MARCO and segment sections.
+- Results from different data sets and query mixes are not directly comparable.
 
 ---
 
@@ -116,57 +112,29 @@ already contains documents.
 
 ## Search benchmarks
 
-### Data sets: 1M and 10M
+### Vector data sets: 1M and 10M
 
-Both collections use the same schema: an 8-token `body`, a `title` from 10,000
-values, a 16-dimensional `vec`, and a low-cardinality `cat`. Runs used the
-`NONODB_SEARCH_WORKERS=16` daemon with `NONODB_CACHE_TTL=0` on ZFS.
+The exact and IVF vector tests use 1M/10M collections with a 16-dimensional
+`vec` and a low-cardinality `cat`. Runs used the `NONODB_SEARCH_WORKERS=16`
+daemon with `NONODB_CACHE_TTL=0` on ZFS.
 
 | Phase | 1M time | 1M `data.mdb` delta | 10M time | 10M `data.mdb` delta |
 |---|---:|---:|---:|---:|
 | Load documents at 5,000 per batch | **15.8 s**, 63,476 docs/s | +0.25 GB | **161.0 s**, 62,123 docs/s | +2.57 GB |
 | `cat` index | 1.6 s | +0.14 GB | 17.9 s | +1.33 GB |
-| BM25 `body` index | 11.0 s | +0.59 GB | 106.0 s | +5.97 GB |
-| Fuzzy `title` index | 11.0 s | +0.31 GB | 86.0 s | +3.16 GB |
 | 16D vector index | 0.8 s | +0.13 GB | 10.0 s | +1.36 GB |
-| **Total collection** | — | **≈1.42 GB** | — | **≈14.4 GB** |
-
-The deltas are incremental costs. The database file already contains the 1B
-dense collection and other benchmark data. Rebuilding the text indexes to populate
-the new `df` metadata raised the file from 203.08 GB to 208.96 GB through LMDB
-copy-on-write; the old pages are reusable but are not returned to the filesystem.
 
 ### Real-text check: MS MARCO
 
-The synthetic 1M/10M rows above use an 8-token body. To test a realistic text
-distribution, the official **MS MARCO passage collection** was loaded into
-`msmarco` (8,841,823 passages) and a 1M-passage prefix into `msmarco1m`. Queries
-are real MS MARCO training queries, sampled deterministically; timings use
-`limit=10` and the same daemon configuration.
+The official **MS MARCO passage collection** was loaded into `msmarco`
+(8,841,823 passages) and a 1M-passage prefix into `msmarco1m`. Queries are real
+MS MARCO training queries, sampled deterministically; timings use `limit=10`
+and the same daemon configuration.
 
 | Phase | 1M real passages | Full 8.8M real passages |
 |---|---:|---:|
 | Load throughput | **63,469 docs/s** | **89,010 docs/s** |
-| Text index build | **156.1 s** | not completed |
 | Collection size | 1,000,000 docs | 8,841,823 docs |
-
-Real MS MARCO queries against the 1M passage index (500 samples):
-
-| p50 | p95 | p99 | Mean | QPS |
-|---:|---:|---:|---:|---:|
-| **91.88 ms** | **272.65 ms** | **379.73 ms** | **111.76 ms** | **8.9** |
-
-The full 8.8M text index was stopped after 47 minutes at 3.76M processed
-documents. The build rate kept falling as the LMDB posting tree grew, so the
-remaining work projected to multiple hours. That is a property of the current
-per-posting LMDB layout, not of the data: the same 1M real passages index in
-156 s. Real passages also make queries about 2× slower than the synthetic 1M
-corpus at the same document count because they contain many more terms and
-postings.
-
-These results are the main argument for moving BM25 and fuzzy search to an
-immutable, block-based index. LMDB remains the source of truth for documents,
-but should not be the long-term posting store for a 10M real-text collection.
 
 #### Internal segment prototype
 
@@ -209,9 +177,7 @@ full 8.84M collection, with segment indexes and exact live statistics:
 The 1M run used 200 queries; the full run used 500 queries with 50 warmup
 queries. Daemon latency includes fetching the full top-10 documents from LMDB,
 so it is higher than the standalone segment reader above, which only resolves
-document ids. On the same 8.84M index, the previous daemon without live
-statistics measured p50 **4.48 ms**, p95 **29.40 ms**, and **118.9 qps**;
-exact statistics are within that run-to-run noise.
+document ids.
 
 Concurrent clients against the same 8.84M index (200 queries per client,
 20 warmup queries):
@@ -226,8 +192,8 @@ samples the same deterministic query set but the outlier tail is distributed
 across more requests; p50 and throughput are the useful scaling indicators.
 The segment backend is the default for newly created text indexes in the
 daemon, with a durable delta, tombstone generations, and synchronous flushes.
-Set `NONODB_SEGMENT_TEXT=0` to keep LMDB for new indexes. Filters, phrases, negation, exact live BM25 statistics, and
-suffix/full compaction are supported; matching phrases add a score bonus, while
+Filters, phrases, negation, exact live BM25 statistics, and suffix/full
+compaction are supported; matching phrases add a score bonus, while
 phrase and non-indexed filter verification still loads candidate documents from
 LMDB, so their latency depends on query selectivity. The concurrent daemon and
 Elasticsearch comparison is in
@@ -309,45 +275,10 @@ all trigrams and the original string. This avoids merging every posting list
 for long queries and brings the 808k full-query corpus from p50 **144.51 ms** to
 **12.07 ms**.
 
-### Legacy LMDB BM25
-
-These `search1m`/`search10m` indexes predate the default segment backend. They
-are kept as a before/after baseline; do not compare them with the segment
-results above. The current segment text backend is benchmarked in
-[Real-text check](#real-text-check-ms-marco) and
-[Exact live BM25 statistics](#exact-live-bm25-statistics-through-the-daemon).
-
-| Data set | Index build | One term | Two terms | Three terms |
-|---|---:|---:|---:|---:|
-| 1M docs | 11.0 s | **43.1 ms** | **118.7 ms** | **176.1 ms** |
-| 10M docs | 106.0 s | **415.2 ms** | **1.19 s** | **1.78 s** |
-
-Timings use `limit=10`. An indexed `cat` filter takes **88.3 ms** on 1M and
-**1.28 s** on 10M. Multi-term queries stream sorted posting lists into a bounded
-top-K heap and reuse ID buffers instead of materializing every hit as a `String`.
-New text indexes also store per-term document frequency (`df`), so multi-term
-queries no longer scan every posting list twice to compute `df`. Existing
-indexes fall back to the old scan until they are rebuilt.
-
-### Legacy LMDB fuzzy search
-
-These rows also use the pre-segment LMDB fuzzy indexes. Segment fuzzy results
-are in [Segment fuzzy](#segment-fuzzy); they use a different index and query
-corpus.
-
-| Data set | Index build | Distance 1 | Distance 2 |
-|---|---:|---:|---:|
-| 1M docs | 11.0 s | **233.52 ms** | **233.30 ms** |
-| 10M docs | 86.0 s | **2.12 s** | **2.10 s** |
-
-At both sizes, distance 1 and distance 2 have nearly the same latency because
-the candidate set, not the final edit-distance check, dominates. The 10M result
-is down from about **17.4 s** before the candidate merge change.
-
 ### Exact vector search
 
-This is the exact LMDB scan path on the synthetic collections, before the ANN
-sidecar. Both data sets use 16-dimensional vectors and `limit=10`.
+This is the exact vector fallback used for filtered queries and oversized ANN
+deltas. Both data sets use 16-dimensional vectors and `limit=10`.
 
 | Operation | 1M p50 / p95 | 10M p50 / p95 |
 |---|---:|---:|
@@ -424,24 +355,19 @@ distribution; validate recall after changing either setting.
 
 Segment text format v3 appends token positions to each `.seg` file. A phrase
 query verifies consecutive tokens from those positions instead of fetching
-every candidate document from LMDB. The same 30 quoted-phrase queries were run
-against the old v2 fallback and a rebuilt v3 index:
+every candidate document from LMDB. Thirty quoted-phrase queries were run
+against the v3 indexes:
 
 | Corpus | Mode | p50 | p95 | Mean |
 |---|---|---:|---:|---:|
-| 1M MS MARCO subset | v2 + LMDB phrase fetch | 0.61 ms | **46.06 ms** | **36.18 ms** |
 | 1M MS MARCO subset | v3 positions (varint term ids) | 0.62 ms | **6.30 ms** | **4.21 ms** |
-| 8.84M MS MARCO | v2 + LMDB phrase fetch | 1.05 ms | **310.29 ms** | **336.12 ms** |
 | 8.84M MS MARCO | v3 positions (varint term ids) | 0.62 ms | **43.63 ms** | **37.71 ms** |
 
 Positions are stored as varint-encoded term ordinals in a per-segment
-dictionary rather than repeating token strings. The 8.84M segment grew from
-about **1.43 GB** to **3.09 GB**, down from **5.97 GB** when positions stored
-full token strings and **3.61 GB** with fixed-width ordinal positions. The 1M
-rebuilt segment is about **358 MB**. Set `NONODB_SEGMENT_POSITIONS=0` before
-building an index to keep the smaller position-free format and use the LMDB
-document fallback. Legacy v2 segments and older position files remain readable
-without a rebuild.
+dictionary rather than repeating token strings. The 8.84M segment is about
+**3.09 GB** and the 1M rebuilt segment is about **358 MB**. Set
+`NONODB_SEGMENT_POSITIONS=0` before building an index to omit positions and
+save space.
 
 ---
 
@@ -499,7 +425,7 @@ NONODB_VECTOR_ANN_COLLECTIONS=search1m,search10m nonodb-daemon
 NONODB_BUILD_VECTOR_ANN=1 NONODB_VECTOR_ANN_CLUSTERS=2048 \
 NONODB_VECTOR_ANN_COLLECTIONS=search100m nonodb-daemon
 
-# 1M and 10M BM25/fuzzy/vector benchmarks
+# 1M and 10M search benchmarks
 NONODB_SOCK=$S python3 scripts/search_scale_bench.py --docs 1000000 --collection search1m
 NONODB_SOCK=$S python3 scripts/search_scale_bench.py --docs 10000000 --collection search10m
 
