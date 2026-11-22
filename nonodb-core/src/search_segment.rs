@@ -14,8 +14,9 @@
 //!          u32 block count, f32 max term impact
 //! index:   u16 len, first term, u64 term block offset, u32 term block len
 //! postings: per term, blocks of at most 128 postings
-//! positions (v3): u32 version, u32 doc_count, (doc_count + 1) x u64 offsets,
-//!                  per-doc u32 token count followed by u32 term ids
+//! positions (v3): term dictionary plus per-doc u32 token count and u32 term
+//!                  ordinals; older position files with token strings remain
+//!                  readable
 //! ```
 //!
 //! A posting block is `u32 first_doc, u16 count, f32 max_tf_norm, u32 data_len`
@@ -277,25 +278,28 @@ impl SegmentBuilder {
         let tokens = search::tokenize(text);
         let dl = tokens.len() as u32;
         self.total_doc_len += u64::from(dl);
-        if self.positions_allowed {
-            self.write_positions(&tokens)?;
-        }
 
-        // A local map avoids allocating one String per posting record.
-        let mut freqs: HashMap<String, u32> = HashMap::new();
+        // Assign term ids in token order, then reuse them for both positions
+        // and the term-frequency postings.
+        let mut freqs: HashMap<u32, u32> = HashMap::new();
+        let mut position_ids = Vec::with_capacity(tokens.len());
         for token in tokens {
-            *freqs.entry(token).or_insert(0) += 1;
-        }
-        for (term, tf) in freqs {
-            let term_id = match self.term_index.get(&term) {
+            let term_id = match self.term_index.get(&token) {
                 Some(id) => *id,
                 None => {
                     let id = self.terms.len() as u32;
-                    self.term_index.insert(term.clone(), id);
-                    self.terms.push(term);
+                    self.term_index.insert(token.clone(), id);
+                    self.terms.push(token);
                     id
                 }
             };
+            position_ids.push(term_id);
+            *freqs.entry(term_id).or_insert(0) += 1;
+        }
+        if self.positions_allowed {
+            self.write_positions(&position_ids)?;
+        }
+        for (term_id, tf) in freqs {
             self.chunk.push(Record {
                 term: term_id,
                 doc,
@@ -309,7 +313,7 @@ impl SegmentBuilder {
         Ok(())
     }
 
-    fn write_positions(&mut self, tokens: &[String]) -> io::Result<()> {
+    fn write_positions(&mut self, term_ids: &[u32]) -> io::Result<()> {
         if self.positions.is_none() {
             let file = io::BufWriter::new(File::create(self.work_dir.join("positions.tmp"))?);
             self.positions = Some(PositionWriter {
@@ -320,12 +324,11 @@ impl SegmentBuilder {
         }
         let writer = self.positions.as_mut().unwrap();
         writer.offsets.push(writer.data_len);
-        write_u32(&mut writer.file, tokens.len() as u32)?;
+        write_u32(&mut writer.file, term_ids.len() as u32)?;
         writer.data_len += 4;
-        for token in tokens {
-            write_u32(&mut writer.file, token.len() as u32)?;
-            writer.file.write_all(token.as_bytes())?;
-            writer.data_len += 4 + token.len() as u64;
+        for term_id in term_ids {
+            write_u32(&mut writer.file, *term_id)?;
+            writer.data_len += 4;
         }
         Ok(())
     }
@@ -472,9 +475,21 @@ impl SegmentBuilder {
         postings.flush()?;
         let postings_size = fs::metadata(&postings_path)?.len();
 
-        let mut term_entries: Vec<(String, PostingMeta)> =
-            self.terms.into_iter().zip(metas).collect();
-        term_entries.sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+        let mut term_entries: Vec<(u32, String, PostingMeta)> = self
+            .terms
+            .into_iter()
+            .enumerate()
+            .map(|(id, term)| (id as u32, term, metas[id].clone()))
+            .collect();
+        term_entries.sort_unstable_by(|a, b| a.1.as_bytes().cmp(b.1.as_bytes()));
+        let mut remap = vec![0u32; term_entries.len()];
+        for (ordinal, (old_id, _, _)) in term_entries.iter().enumerate() {
+            remap[*old_id as usize] = ordinal as u32;
+        }
+        let term_entries: Vec<(String, PostingMeta)> = term_entries
+            .into_iter()
+            .map(|(_, term, meta)| (term, meta))
+            .collect();
 
         let mut doc_offsets = Vec::with_capacity(self.doc_ids.len() + 1);
         let mut doc_strings = Vec::new();
@@ -564,16 +579,51 @@ impl SegmentBuilder {
                     "position offsets do not match document count",
                 ));
             }
-            write_u32(&mut out, 1)?;
+            drop(positions.file);
+            let term_count = term_entries.len() as u32;
+            let mut dict_offsets = Vec::with_capacity(term_entries.len() + 1);
+            let mut dict_data = Vec::new();
+            for (term, _) in &term_entries {
+                dict_offsets.push(u32::try_from(dict_data.len()).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "position dictionary too large")
+                })?);
+                dict_data.extend_from_slice(term.as_bytes());
+            }
+            dict_offsets.push(u32::try_from(dict_data.len()).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "position dictionary too large")
+            })?);
+            let header_size = 48u64;
+            let dict_offsets_off = positions_off + header_size;
+            let dict_data_off = dict_offsets_off + u64::from(term_count + 1) * 4;
+            let doc_offsets_off = dict_data_off + dict_data.len() as u64;
+            let doc_data_off = doc_offsets_off + u64::from(doc_count + 1) * 8;
+            write_u32(&mut out, 2)?;
             write_u32(&mut out, doc_count)?;
+            write_u32(&mut out, term_count)?;
+            write_u32(&mut out, 0)?;
+            write_u64(&mut out, dict_offsets_off)?;
+            write_u64(&mut out, dict_data_off)?;
+            write_u64(&mut out, doc_offsets_off)?;
+            write_u64(&mut out, doc_data_off)?;
+            for offset in &dict_offsets {
+                write_u32(&mut out, *offset)?;
+            }
+            out.write_all(&dict_data)?;
             for offset in &positions.offsets {
                 write_u64(&mut out, *offset)?;
             }
-            drop(positions.file);
-            io::copy(
-                &mut File::open(self.work_dir.join("positions.tmp"))?,
-                &mut out,
-            )?;
+            let mut source = io::BufReader::new(File::open(self.work_dir.join("positions.tmp"))?);
+            for _ in 0..doc_count {
+                let count = read_u32(&mut source)?;
+                write_u32(&mut out, count)?;
+                for _ in 0..count {
+                    let old = read_u32(&mut source)?;
+                    let mapped = remap.get(old as usize).copied().ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "position term id out of range")
+                    })?;
+                    write_u32(&mut out, mapped)?;
+                }
+            }
         }
         out.flush()?;
         let file = out.into_inner().map_err(|e| e.into_error())?;
@@ -1429,101 +1479,261 @@ struct GlobalSearchStats {
 /// Read-only handle to one immutable segment.
 impl Positions {
     fn read(map: &Mmap, offset: u64, doc_count: u32) -> io::Result<Self> {
-        let mut header = [0u8; 8];
-        read_map(map, offset, &mut header)?;
-        let version = u32::from_le_bytes(header[0..4].try_into().unwrap());
-        let stored_docs = u32::from_le_bytes(header[4..8].try_into().unwrap());
-        if version != 1 || stored_docs != doc_count {
-            return Err(io::Error::new(
+        let mut version_buf = [0u8; 4];
+        read_map(map, offset, &mut version_buf)?;
+        let version = u32::from_le_bytes(version_buf);
+        match version {
+            1 => {
+                let mut header = [0u8; 8];
+                read_map(map, offset, &mut header)?;
+                let stored_docs = u32::from_le_bytes(header[4..8].try_into().unwrap());
+                if stored_docs != doc_count {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid segment position header",
+                    ));
+                }
+                let offsets_start = offset + 8;
+                let data_start = offsets_start
+                    .checked_add((u64::from(doc_count) + 1) * 8)
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "position offset overflow")
+                    })?;
+                if data_start > map.len() as u64 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "short segment position data",
+                    ));
+                }
+                Ok(Self::V1 {
+                    offsets_start,
+                    data_start,
+                    doc_count,
+                })
+            }
+            2 => {
+                let mut header = [0u8; 48];
+                read_map(map, offset, &mut header)?;
+                let stored_docs = u32::from_le_bytes(header[4..8].try_into().unwrap());
+                let term_count = u32::from_le_bytes(header[8..12].try_into().unwrap());
+                let dict_offsets = u64::from_le_bytes(header[16..24].try_into().unwrap());
+                let dict_data = u64::from_le_bytes(header[24..32].try_into().unwrap());
+                let doc_offsets = u64::from_le_bytes(header[32..40].try_into().unwrap());
+                let doc_data = u64::from_le_bytes(header[40..48].try_into().unwrap());
+                if stored_docs != doc_count {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid segment position header",
+                    ));
+                }
+                for value in [dict_offsets, dict_data, doc_offsets, doc_data] {
+                    if value > map.len() as u64 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "short segment position data",
+                        ));
+                    }
+                }
+                Ok(Self::V2 {
+                    dict_offsets,
+                    dict_data,
+                    term_count,
+                    doc_offsets,
+                    doc_data,
+                    doc_count,
+                })
+            }
+            _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "invalid segment position header",
-            ));
+                "unsupported segment position version",
+            )),
         }
-        let offsets_start = offset + 8;
-        let data_start = offsets_start
-            .checked_add((u64::from(doc_count) + 1) * 8)
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "position offset overflow")
-            })?;
-        if data_start > map.len() as u64 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "short segment position data",
-            ));
-        }
-        Ok(Self {
-            offsets_start,
-            data_start,
-            doc_count,
-        })
     }
 
-    fn tokens(&self, map: &Mmap, doc: u32) -> io::Result<Vec<String>> {
-        if doc >= self.doc_count {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "position doc id out of range",
-            ));
-        }
-        let mut start_buf = [0u8; 8];
-        let mut end_buf = [0u8; 8];
-        read_map(map, self.offsets_start + u64::from(doc) * 8, &mut start_buf)?;
-        read_map(
-            map,
-            self.offsets_start + u64::from(doc + 1) * 8,
-            &mut end_buf,
-        )?;
-        let start = self.data_start + u64::from_le_bytes(start_buf);
-        let end = self.data_start + u64::from_le_bytes(end_buf);
-        if end < start || end > map.len() as u64 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid segment position bounds",
-            ));
-        }
-        let mut position = start;
-        let mut count_buf = [0u8; 4];
-        read_map(map, position, &mut count_buf)?;
-        position += 4;
-        let count = u32::from_le_bytes(count_buf) as usize;
-        let mut tokens = Vec::with_capacity(count);
-        for _ in 0..count {
-            read_map(map, position, &mut count_buf)?;
-            position += 4;
-            let len = u32::from_le_bytes(count_buf) as u64;
-            let text_end = position.checked_add(len).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "position length overflow")
-            })?;
-            if text_end > end {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "truncated segment position token",
-                ));
+    fn phrase_matches(&self, map: &Mmap, doc: u32, phrase: &[String]) -> io::Result<bool> {
+        match self {
+            Self::V1 {
+                offsets_start,
+                data_start,
+                doc_count,
+            } => {
+                let tokens = read_v1_tokens(map, *offsets_start, *data_start, *doc_count, doc)?;
+                Ok(search::contains_phrase(&tokens, phrase))
             }
-            let start = usize::try_from(position)
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "position too large"))?;
-            let end = usize::try_from(text_end)
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "position too large"))?;
-            let token = std::str::from_utf8(&map[start..end])
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            tokens.push(token.to_string());
-            position = text_end;
+            Self::V2 {
+                dict_offsets,
+                dict_data,
+                term_count,
+                doc_offsets,
+                doc_data,
+                doc_count,
+            } => {
+                let mut wanted = Vec::with_capacity(phrase.len());
+                for term in phrase {
+                    let Some(id) =
+                        term_ordinal(map, *dict_offsets, *dict_data, *term_count, term.as_bytes())?
+                    else {
+                        return Ok(false);
+                    };
+                    wanted.push(id);
+                }
+                let ids = read_v2_ids(map, *doc_offsets, *doc_data, *doc_count, doc)?;
+                Ok(ids.windows(wanted.len()).any(|window| window == wanted))
+            }
         }
-        if position != end {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "trailing segment position data",
-            ));
-        }
-        Ok(tokens)
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-struct Positions {
+fn read_u32_at(map: &Mmap, offset: u64) -> io::Result<u32> {
+    let mut buf = [0u8; 4];
+    read_map(map, offset, &mut buf)?;
+    Ok(u32::from_le_bytes(buf))
+}
+
+fn read_u64_at(map: &Mmap, offset: u64) -> io::Result<u64> {
+    let mut buf = [0u8; 8];
+    read_map(map, offset, &mut buf)?;
+    Ok(u64::from_le_bytes(buf))
+}
+
+fn read_v1_tokens(
+    map: &Mmap,
     offsets_start: u64,
     data_start: u64,
     doc_count: u32,
+    doc: u32,
+) -> io::Result<Vec<String>> {
+    if doc >= doc_count {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "position doc id out of range",
+        ));
+    }
+    let start = data_start + read_u64_at(map, offsets_start + u64::from(doc) * 8)?;
+    let end = data_start + read_u64_at(map, offsets_start + u64::from(doc + 1) * 8)?;
+    if end < start || end > map.len() as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid segment position bounds",
+        ));
+    }
+    let mut position = start;
+    let count = read_u32_at(map, position)? as usize;
+    position += 4;
+    let mut tokens = Vec::with_capacity(count);
+    for _ in 0..count {
+        let len = read_u32_at(map, position)? as u64;
+        position += 4;
+        let text_end = position.checked_add(len).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "position length overflow")
+        })?;
+        if text_end > end {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "truncated segment position token",
+            ));
+        }
+        let start = usize::try_from(position)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "position too large"))?;
+        let end = usize::try_from(text_end)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "position too large"))?;
+        let token = std::str::from_utf8(&map[start..end])
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        tokens.push(token.to_string());
+        position = text_end;
+    }
+    if position != end {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "trailing segment position data",
+        ));
+    }
+    Ok(tokens)
+}
+
+fn read_v2_ids(
+    map: &Mmap,
+    doc_offsets: u64,
+    doc_data: u64,
+    doc_count: u32,
+    doc: u32,
+) -> io::Result<Vec<u32>> {
+    if doc >= doc_count {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "position doc id out of range",
+        ));
+    }
+    let start = doc_data + read_u64_at(map, doc_offsets + u64::from(doc) * 8)?;
+    let end = doc_data + read_u64_at(map, doc_offsets + u64::from(doc + 1) * 8)?;
+    if end < start || end > map.len() as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid segment position bounds",
+        ));
+    }
+    let count = read_u32_at(map, start)? as usize;
+    let expected = start + 4 + count as u64 * 4;
+    if expected != end {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid segment position record length",
+        ));
+    }
+    let mut ids = Vec::with_capacity(count);
+    for index in 0..count {
+        ids.push(read_u32_at(map, start + 4 + index as u64 * 4)?);
+    }
+    Ok(ids)
+}
+
+fn term_ordinal(
+    map: &Mmap,
+    dict_offsets: u64,
+    dict_data: u64,
+    term_count: u32,
+    target: &[u8],
+) -> io::Result<Option<u32>> {
+    let mut lo = 0u32;
+    let mut hi = term_count;
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        let start = dict_data + u64::from(read_u32_at(map, dict_offsets + u64::from(mid) * 4)?);
+        let end = dict_data + u64::from(read_u32_at(map, dict_offsets + u64::from(mid + 1) * 4)?);
+        if end < start || end > map.len() as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid position dictionary bounds",
+            ));
+        }
+        let start = usize::try_from(start)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "dictionary too large"))?;
+        let end = usize::try_from(end)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "dictionary too large"))?;
+        match map[start..end].cmp(target) {
+            std::cmp::Ordering::Less => lo = mid + 1,
+            std::cmp::Ordering::Greater => hi = mid,
+            std::cmp::Ordering::Equal => return Ok(Some(mid)),
+        }
+    }
+    Ok(None)
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Positions {
+    V1 {
+        offsets_start: u64,
+        data_start: u64,
+        doc_count: u32,
+    },
+    V2 {
+        dict_offsets: u64,
+        dict_data: u64,
+        term_count: u32,
+        doc_offsets: u64,
+        doc_data: u64,
+        doc_count: u32,
+    },
 }
 
 pub struct SegmentReader {
@@ -1580,8 +1790,7 @@ impl SegmentReader {
         if phrase.is_empty() {
             return Ok(Some(true));
         }
-        let tokens = positions.tokens(&self.map, doc)?;
-        Ok(Some(search::contains_phrase(&tokens, phrase)))
+        positions.phrase_matches(&self.map, doc, phrase).map(Some)
     }
 
     pub fn documents(&self) -> u32 {
