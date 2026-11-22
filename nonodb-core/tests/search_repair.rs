@@ -1,4 +1,4 @@
-use nonodb_core::{SearchEngine, SearchIndexDef, SearchKind, Store, VectorMetric};
+use nonodb_core::{SearchIndexDef, SearchKind, Store, VectorMetric};
 use serde_json::json;
 use tempfile::TempDir;
 
@@ -14,11 +14,9 @@ fn rebuilds_missing_text_fuzzy_and_vector_sidecars() {
     ] {
         c.insert_one(doc).unwrap();
     }
-    let mut text = SearchIndexDef::single(SearchKind::Text, "body");
-    text.engine = SearchEngine::Segment;
+    let text = SearchIndexDef::single(SearchKind::Text, "body");
     c.create_search_index(&text).unwrap();
-    let mut fuzzy = SearchIndexDef::single(SearchKind::Fuzzy, "body");
-    fuzzy.engine = SearchEngine::Segment;
+    let fuzzy = SearchIndexDef::single(SearchKind::Fuzzy, "body");
     c.create_search_index(&fuzzy).unwrap();
     c.create_vector_index("embedding", 2, VectorMetric::Cosine)
         .unwrap();

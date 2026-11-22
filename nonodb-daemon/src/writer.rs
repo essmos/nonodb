@@ -1619,11 +1619,7 @@ fn execute(
         }
         WriteReq::CreateTextIndex { coll, field } => {
             let c = standard_collection(store, wtxn, coll)?;
-            let mut index =
-                nonodb_core::SearchIndexDef::single(nonodb_core::SearchKind::Text, field);
-            if segment_backend_enabled("NONODB_SEGMENT_TEXT") {
-                index.engine = nonodb_core::SearchEngine::Segment;
-            }
+            let index = nonodb_core::SearchIndexDef::single(nonodb_core::SearchKind::Text, field);
             c.create_search_index_txn(wtxn, &index)?;
             replication.capture_op(ReplicationOp::SearchIndexCreate {
                 coll: coll.clone(),
@@ -1645,11 +1641,7 @@ fn execute(
         }
         WriteReq::CreateFuzzyIndex { coll, field } => {
             let c = standard_collection(store, wtxn, coll)?;
-            let mut index =
-                nonodb_core::SearchIndexDef::single(nonodb_core::SearchKind::Fuzzy, field);
-            if segment_backend_enabled("NONODB_SEGMENT_FUZZY") {
-                index.engine = nonodb_core::SearchEngine::Segment;
-            }
+            let index = nonodb_core::SearchIndexDef::single(nonodb_core::SearchKind::Fuzzy, field);
             c.create_search_index_txn(wtxn, &index)?;
             replication.capture_op(ReplicationOp::SearchIndexCreate {
                 coll: coll.clone(),
@@ -1754,17 +1746,6 @@ fn execute(
             Ok(json!({ "results": results }))
         }
     }
-}
-
-/// Segment indexes are the default for newly created text/fuzzy indexes.
-/// Set `NONODB_SEGMENT_TEXT=0` or `NONODB_SEGMENT_FUZZY=0` to keep LMDB.
-fn segment_backend_enabled(var: &str) -> bool {
-    std::env::var(var).ok().is_none_or(|value| {
-        !matches!(
-            value.to_ascii_lowercase().as_str(),
-            "0" | "false" | "no" | "off"
-        )
-    })
 }
 
 #[cfg(test)]

@@ -43,6 +43,16 @@ fn fixture() -> (tempfile::TempDir, tempfile::TempDir) {
         .update(&json!({"_id": "u1"}), &json!({"$inc": {"age": 1}}), false)
         .unwrap();
 
+    let rtxn = store.read_txn().unwrap();
+    let sidecars = users.search_sidecar_files_in(&rtxn).unwrap();
+    rtxn.commit().unwrap();
+    for relative in sidecars {
+        let from = data.path().join(&relative);
+        let to = backup.path().join(&relative);
+        std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+        std::fs::copy(from, to).unwrap();
+    }
+
     let out = backup.path().join("data.mdb");
     store
         .copy_to_file(&out, CompactionOption::Enabled)
@@ -127,17 +137,33 @@ fn stale_document_index_entry_is_detected() {
 }
 
 #[test]
-fn stale_text_and_fuzzy_entries_are_detected() {
+fn missing_segment_sidecar_is_detected() {
     let (data, _backup) = fixture();
-    rewrite_doc(data.path(), "u1", |doc| {
-        doc["bio"] = json!("Completely different")
-    });
+    let search = data.path().join("search");
+    let segment = walk_files(&search)
+        .into_iter()
+        .find(|path| path.extension().is_some_and(|ext| ext == "seg"))
+        .expect("segment sidecar");
+    std::fs::remove_file(segment).unwrap();
 
     let err = verify_data_dir(data.path()).unwrap_err().to_string();
-    assert!(
-        err.contains("text index") || err.contains("fuzzy index"),
-        "{err}"
-    );
+    assert!(err.contains("segment"), "{err}");
+}
+
+fn walk_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            out.extend(walk_files(&path));
+        } else {
+            out.push(path);
+        }
+    }
+    out
 }
 
 #[test]

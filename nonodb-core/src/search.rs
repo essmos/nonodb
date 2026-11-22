@@ -1,13 +1,9 @@
 //! Full-text (BM25) and approximate search (trigrams + Levenshtein).
 //!
-//! Search indexes are collection-level definitions with one or more fields.
-//! Data layout (LMDB sub-databases):
-//! - `ft:<coll>:<index>:<field>`  - postings: `term \0 _id` -> `tf` (u32 LE) + optional `dl` (u32 LE),
-//! - `ftl:<coll>:<index>:<field>` - document lengths: `_id` -> `dl` (u32 LE),
-//! - `fz:<coll>:<index>:<field>`  - trigrams: `trigram \0 _id` -> empty.
-//!
-//! Document count `N` = `ftl.stat().entries`, total length = meta
-//! `fttotal:<coll>:<index>:<field>` (u64 LE).
+//! Search indexes are collection-level definitions backed by immutable
+//! segment files in the collection's search directory. This module contains
+//! the shared definitions, tokenization, query parsing, trigram generation,
+//! and scoring primitives.
 
 use std::collections::{HashMap, HashSet};
 
@@ -52,15 +48,6 @@ fn default_weight() -> f64 {
     1.0
 }
 
-/// Storage engine for a search index.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum SearchEngine {
-    #[default]
-    Lmdb,
-    Segment,
-}
-
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SearchField {
     pub path: String,
@@ -73,8 +60,6 @@ pub struct SearchIndexDef {
     pub name: String,
     pub kind: SearchKind,
     pub fields: Vec<SearchField>,
-    #[serde(default)]
-    pub engine: SearchEngine,
 }
 
 impl SearchIndexDef {
@@ -86,7 +71,6 @@ impl SearchIndexDef {
                 path: field.to_string(),
                 weight: 1.0,
             }],
-            engine: SearchEngine::Lmdb,
         }
     }
 
@@ -147,31 +131,12 @@ pub struct TextQuery {
 
 // ----------------------------- names ---------------------------------
 
-pub fn text_db_name(coll: &str, index: &str, field: &str) -> String {
-    format!("ft:{coll}:{index}:{field}")
-}
-pub fn text_len_db_name(coll: &str, index: &str, field: &str) -> String {
-    format!("ftl:{coll}:{index}:{field}")
-}
-pub fn text_df_db_name(coll: &str, index: &str, field: &str) -> String {
-    format!("ftdf:{coll}:{index}:{field}")
-}
-pub fn text_df_ready_key(coll: &str, index: &str, field: &str) -> String {
-    format!("ftdfready:{coll}:{index}:{field}")
-}
-pub fn fuzzy_db_name(coll: &str, index: &str, field: &str) -> String {
-    format!("fz:{coll}:{index}:{field}")
-}
 pub fn def_key(coll: &str, kind: SearchKind, name: &str) -> String {
     format!("search:{coll}:{}:{name}", kind.as_str())
 }
 pub fn def_prefix(coll: &str) -> String {
     format!("search:{coll}:")
 }
-pub fn text_total_key(coll: &str, index: &str, field: &str) -> String {
-    format!("fttotal:{coll}:{index}:{field}")
-}
-
 // --------------------------- text / tokens --------------------------
 
 /// Field value as text (scalars only; arrays/objects are skipped).
@@ -393,52 +358,7 @@ pub fn fuzzy_distance(value: &str, query: &str, max: usize) -> Option<usize> {
     best
 }
 
-// ----------------------------- keys ----------------------------------
-
-/// Posting/trigram key: `term \0 id`.
-pub fn postings_key(term: &str, id: &str) -> Vec<u8> {
-    let mut k = Vec::with_capacity(term.len() + 1 + id.len());
-    k.extend_from_slice(term.as_bytes());
-    k.push(0);
-    k.extend_from_slice(id.as_bytes());
-    k
-}
-
-/// Prefix for all postings of a term/trigram.
-pub fn posting_prefix(term: &str) -> Vec<u8> {
-    let mut k = term.as_bytes().to_vec();
-    k.push(0);
-    k
-}
-
-/// Extracts `_id` from a posting key.
-pub fn parse_posting(key: &[u8]) -> Option<&str> {
-    let pos = key.iter().position(|&b| b == 0)?;
-    std::str::from_utf8(&key[pos + 1..]).ok()
-}
-
-pub fn read_u32(b: &[u8]) -> Option<u32> {
-    b.try_into().ok().map(u32::from_le_bytes)
-}
-
-/// Text posting value. New indexes store term frequency and document length
-/// together so scoring does not need a second random lookup for every hit.
-pub fn text_posting_value(tf: u32, dl: u32) -> [u8; 8] {
-    let mut out = [0u8; 8];
-    out[..4].copy_from_slice(&tf.to_le_bytes());
-    out[4..].copy_from_slice(&dl.to_le_bytes());
-    out
-}
-
-/// Term frequency stored in a text posting, old or new format.
-pub fn text_posting_tf(value: &[u8]) -> Option<u32> {
-    value.get(..4).and_then(read_u32)
-}
-
-/// Document length stored in a text posting, if this is a new-format value.
-pub fn text_posting_dl(value: &[u8]) -> Option<u32> {
-    value.get(4..8).and_then(read_u32)
-}
+// ----------------------------- helpers --------------------------------
 
 pub fn read_u64(b: &[u8]) -> Option<u64> {
     b.try_into().ok().map(u64::from_le_bytes)

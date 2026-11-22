@@ -52,8 +52,7 @@ pub use history::{HistoryEntry, DEFAULT_HISTORY_MAX_VERSIONS};
 pub use index::{IndexDef, RangeBytes};
 pub use replication::{ReplicationChange, ReplicationTxn, REPLICATION_DB};
 pub use search::{
-    SearchEngine, SearchField, SearchIndexDef, SearchKind, TextQuery, TextQueryMode,
-    DEFAULT_FUZZY_DISTANCE,
+    SearchField, SearchIndexDef, SearchKind, TextQuery, TextQueryMode, DEFAULT_FUZZY_DISTANCE,
 };
 pub use store::{
     parse_size, ReadTxn, Store, WriteTxn, CONTROL_DB, MAP_SIZE, MAX_DBS, MAX_DOCUMENT_BYTES,

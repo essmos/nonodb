@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use heed::types::Bytes;
-use heed::{Database, Env, RoPrefix, RoTxn, RwTxn};
+use heed::{Database, Env, RoTxn, RwTxn};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -26,7 +26,7 @@ use crate::numeric;
 use crate::query::{
     apply_upsert_with_options, apply_with_options, matches, path, seed_from_filter,
 };
-use crate::search::{self, SearchEngine, SearchIndexDef, SearchKind, TextQueryMode};
+use crate::search::{self, SearchIndexDef, SearchKind, TextQueryMode};
 use crate::search_segment::{
     DocVerifier, FuzzySegmentBuilder, FuzzySegmentReader, SegmentBuilder, SegmentReader, SegmentSet,
 };
@@ -80,136 +80,6 @@ fn segment_index_dir(coll: &str, index: &str) -> String {
 fn vector_ann_index_dir(coll: &str, field: &str) -> String {
     let digest = Sha256::digest(format!("vector\0{coll}\0{field}").as_bytes());
     format!("vector-ann/{digest:x}")
-}
-
-/// One scored document id for the bounded top-K heap used by text search.
-#[derive(Debug)]
-struct RankedId {
-    id: String,
-    score: f64,
-}
-
-impl PartialEq for RankedId {
-    fn eq(&self, other: &Self) -> bool {
-        self.score == other.score && self.id == other.id
-    }
-}
-
-impl Eq for RankedId {}
-
-impl PartialOrd for RankedId {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for RankedId {
-    fn cmp(&self, other: &Self) -> Ordering {
-        // The heap root is the worst retained hit: lower score first, then the
-        // lexicographically larger id (ascending id breaks score ties).
-        other
-            .score
-            .partial_cmp(&self.score)
-            .unwrap_or(Ordering::Equal)
-            .then_with(|| self.id.cmp(&other.id))
-    }
-}
-
-/// One fuzzy candidate ranked by shared trigrams.
-#[derive(Debug)]
-struct FuzzyCandidate {
-    id: String,
-    count: u32,
-}
-
-impl PartialEq for FuzzyCandidate {
-    fn eq(&self, other: &Self) -> bool {
-        self.count == other.count && self.id == other.id
-    }
-}
-
-impl Eq for FuzzyCandidate {}
-
-impl PartialOrd for FuzzyCandidate {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for FuzzyCandidate {
-    fn cmp(&self, other: &Self) -> Ordering {
-        // The heap root is the worst retained candidate: fewer shared trigrams
-        // first, then the lexicographically larger id.
-        other
-            .count
-            .cmp(&self.count)
-            .then_with(|| self.id.cmp(&other.id))
-    }
-}
-
-/// One live trigram posting cursor for the fuzzy candidate merge.
-struct FuzzyPostingCursor<'txn> {
-    iter: RoPrefix<'txn, Bytes, Bytes>,
-    id: Option<Vec<u8>>,
-}
-
-impl<'txn> FuzzyPostingCursor<'txn> {
-    fn open(rtxn: &'txn RoTxn<'_>, db: &Database<Bytes, Bytes>, prefix: &[u8]) -> Result<Self> {
-        let mut cursor = Self {
-            iter: db.prefix_iter(rtxn, prefix)?,
-            id: None,
-        };
-        cursor.advance()?;
-        Ok(cursor)
-    }
-
-    fn advance(&mut self) -> Result<()> {
-        self.id = None;
-        for item in self.iter.by_ref() {
-            let (key, _) = item?;
-            if let Some(id) = search::parse_posting(key) {
-                self.id = Some(id.as_bytes().to_vec());
-                break;
-            }
-        }
-        Ok(())
-    }
-}
-
-/// One live posting cursor for the streaming multi-term BM25 merge.
-struct TextPostingCursor<'txn> {
-    iter: RoPrefix<'txn, Bytes, Bytes>,
-    weight: f64,
-    idf: f64,
-    id: Vec<u8>,
-    tf: f64,
-    dl: f64,
-    active: bool,
-}
-
-impl<'txn> TextPostingCursor<'txn> {
-    fn advance(&mut self, lens: &Database<Bytes, Bytes>, rtxn: &RoTxn<'txn>) -> Result<()> {
-        self.active = false;
-        for item in self.iter.by_ref() {
-            let (key, value) = item?;
-            let Some(id) = search::parse_posting(key) else {
-                continue;
-            };
-            self.id.clear();
-            self.id.extend_from_slice(id.as_bytes());
-            self.tf = search::text_posting_tf(value).unwrap_or(1) as f64;
-            self.dl = match search::text_posting_dl(value) {
-                Some(dl) => dl as f64,
-                None => lens
-                    .get(rtxn, id.as_bytes())?
-                    .and_then(search::read_u32)
-                    .unwrap_or(0) as f64,
-            };
-            self.active = true;
-            break;
-        }
-        Ok(())
-    }
 }
 
 /// Maximum number of keys accepted by one `lookup` request.
@@ -696,33 +566,6 @@ impl<'e> Collection<'e> {
             if let Some(bytes) = self.resource_db_bytes(txn, &resource, &resource)? {
                 index_bytes = index_bytes.saturating_add(bytes);
                 indexes += 1;
-            }
-        }
-        for def in self.search_index_defs_in(txn)? {
-            for field in &def.fields {
-                match def.kind {
-                    SearchKind::Text => {
-                        for resource in [
-                            search::text_db_name(&self.name, &def.name, &field.path),
-                            search::text_len_db_name(&self.name, &def.name, &field.path),
-                            search::text_df_db_name(&self.name, &def.name, &field.path),
-                        ] {
-                            if let Some(bytes) =
-                                self.resource_db_bytes(txn, &resource, &resource)?
-                            {
-                                index_bytes = index_bytes.saturating_add(bytes);
-                                indexes += 1;
-                            }
-                        }
-                    }
-                    SearchKind::Fuzzy => {
-                        let resource = search::fuzzy_db_name(&self.name, &def.name, &field.path);
-                        if let Some(bytes) = self.resource_db_bytes(txn, &resource, &resource)? {
-                            index_bytes = index_bytes.saturating_add(bytes);
-                            indexes += 1;
-                        }
-                    }
-                }
             }
         }
         for def in self.vector_defs(txn)? {
@@ -1890,54 +1733,6 @@ impl<'e> Collection<'e> {
         Ok(Some(self.index_plan_candidates(rtxn, &plan, max)?))
     }
 
-    /// Candidate ids for a filter that is exactly covered by one index equality.
-    ///
-    /// This is used as a prefilter for text search. It deliberately returns
-    /// `None` for ranges, compound conditions, and multikey indexes: those
-    /// candidates are only a superset and still need the residual matcher.
-    fn exact_filter_index_candidates(
-        &self,
-        rtxn: &RoTxn<'_>,
-        filter: &Value,
-    ) -> Result<Option<HashSet<String>>> {
-        if filter.as_object().is_none_or(|object| object.is_empty()) {
-            return Ok(None);
-        }
-        if let Some(id) = direct_id(filter) {
-            let mut ids = HashSet::new();
-            ids.insert(id);
-            return Ok(Some(ids));
-        }
-        let Some(object) = filter.as_object() else {
-            return Ok(None);
-        };
-        if object.len() != 1 {
-            return Ok(None);
-        }
-        let Some((_field, condition)) = object.iter().next() else {
-            return Ok(None);
-        };
-        let exact_equality = match condition {
-            Value::Object(operators) => operators.len() == 1 && operators.contains_key("$eq"),
-            _ => true,
-        };
-        if !exact_equality {
-            return Ok(None);
-        }
-        let Some(plan) = self.index_plan(rtxn, filter)? else {
-            return Ok(None);
-        };
-        if plan.def.is_multikey() {
-            return Ok(None);
-        }
-        let ids =
-            self.index_plan_candidates(rtxn, &plan, Some(SEARCH_FILTER_CANDIDATE_LIMIT + 1))?;
-        if ids.len() > SEARCH_FILTER_CANDIDATE_LIMIT {
-            return Ok(None);
-        }
-        Ok(Some(ids.into_iter().collect()))
-    }
-
     /// Candidate IDs for a segment text/fuzzy filter. Only a single indexed
     /// field is accepted, so the index range is an exact candidate set rather
     /// than a superset that would still need a residual filter.
@@ -2072,86 +1867,6 @@ impl<'e> Collection<'e> {
             .filter(|def| def.kind == SearchKind::Fuzzy)
             .map(|def| def.name)
             .collect())
-    }
-
-    fn text_postings(
-        &self,
-        txn: &RoTxn<'_>,
-        index: &str,
-        field: &str,
-    ) -> Result<Option<Database<Bytes, Bytes>>> {
-        let name = search::text_db_name(&self.name, index, field);
-        self.resource_db(txn, &name, &name)
-    }
-
-    fn text_postings_in(
-        &self,
-        wtxn: &mut RwTxn<'_>,
-        index: &str,
-        field: &str,
-    ) -> Result<Database<Bytes, Bytes>> {
-        let name = search::text_db_name(&self.name, index, field);
-        self.resource_db_in(wtxn, &name, &name)
-    }
-
-    fn text_len_db(
-        &self,
-        txn: &RoTxn<'_>,
-        index: &str,
-        field: &str,
-    ) -> Result<Option<Database<Bytes, Bytes>>> {
-        let name = search::text_len_db_name(&self.name, index, field);
-        self.resource_db(txn, &name, &name)
-    }
-
-    fn text_len_db_in(
-        &self,
-        wtxn: &mut RwTxn<'_>,
-        index: &str,
-        field: &str,
-    ) -> Result<Database<Bytes, Bytes>> {
-        let name = search::text_len_db_name(&self.name, index, field);
-        self.resource_db_in(wtxn, &name, &name)
-    }
-
-    fn text_df_db(
-        &self,
-        txn: &RoTxn<'_>,
-        index: &str,
-        field: &str,
-    ) -> Result<Option<Database<Bytes, Bytes>>> {
-        let name = search::text_df_db_name(&self.name, index, field);
-        self.resource_db(txn, &name, &name)
-    }
-
-    fn text_df_db_in(
-        &self,
-        wtxn: &mut RwTxn<'_>,
-        index: &str,
-        field: &str,
-    ) -> Result<Database<Bytes, Bytes>> {
-        let name = search::text_df_db_name(&self.name, index, field);
-        self.resource_db_in(wtxn, &name, &name)
-    }
-
-    fn fuzzy_db(
-        &self,
-        txn: &RoTxn<'_>,
-        index: &str,
-        field: &str,
-    ) -> Result<Option<Database<Bytes, Bytes>>> {
-        let name = search::fuzzy_db_name(&self.name, index, field);
-        self.resource_db(txn, &name, &name)
-    }
-
-    fn fuzzy_db_in(
-        &self,
-        wtxn: &mut RwTxn<'_>,
-        index: &str,
-        field: &str,
-    ) -> Result<Database<Bytes, Bytes>> {
-        let name = search::fuzzy_db_name(&self.name, index, field);
-        self.resource_db_in(wtxn, &name, &name)
     }
 
     fn vector_db(&self, txn: &RoTxn<'_>, field: &str) -> Result<Option<Database<Bytes, Bytes>>> {
@@ -2784,14 +2499,8 @@ impl<'e> Collection<'e> {
         }
 
         match def.kind {
-            SearchKind::Text if def.engine == SearchEngine::Segment => {
-                self.backfill_segment_text_index(wtxn, def)?
-            }
-            SearchKind::Text => self.backfill_text_search_index(wtxn, def)?,
-            SearchKind::Fuzzy if def.engine == SearchEngine::Segment => {
-                self.backfill_fuzzy_segment_index(wtxn, def)?
-            }
-            SearchKind::Fuzzy => self.backfill_fuzzy_search_index(wtxn, def)?,
+            SearchKind::Text => self.backfill_segment_text_index(wtxn, def)?,
+            SearchKind::Fuzzy => self.backfill_fuzzy_segment_index(wtxn, def)?,
         }
         self.meta.put(
             &mut *wtxn,
@@ -2801,150 +2510,21 @@ impl<'e> Collection<'e> {
         Ok(())
     }
 
-    fn backfill_text_search_index(&self, wtxn: &mut RwTxn<'_>, def: &SearchIndexDef) -> Result<()> {
-        let mut totals: HashMap<String, u64> = HashMap::new();
-        for field in &def.fields {
-            let postings = self.text_postings_in(wtxn, &def.name, &field.path)?;
-            let lens = self.text_len_db_in(wtxn, &def.name, &field.path)?;
-            let df = self.text_df_db_in(wtxn, &def.name, &field.path)?;
-            postings.clear(&mut *wtxn)?;
-            lens.clear(&mut *wtxn)?;
-            df.clear(&mut *wtxn)?;
-            totals.insert(field.path.clone(), 0);
-        }
-        let index_name = def.name.clone();
-        let fields = def.fields.clone();
-        self.parallel_backfill_apply(
-            wtxn,
-            "text",
-            &index_name,
-            move |id, doc| {
-                let mut out = Vec::new();
-                for field in &fields {
-                    let Some(text) =
-                        index::field_value(&doc, &field.path).and_then(search::field_text)
-                    else {
-                        continue;
-                    };
-                    let tokens = search::tokenize(&text);
-                    if tokens.is_empty() {
-                        continue;
-                    }
-                    let dl = tokens.len() as u32;
-                    let tf: HashMap<String, u32> =
-                        search::term_freqs(&tokens).into_iter().collect();
-                    out.push((id.clone(), field.path.clone(), tf, dl));
-                }
-                Ok(out)
-            },
-            |wtxn, entries| {
-                let mut batch_df: HashMap<(String, String), u64> = HashMap::new();
-                for (id, field, tf, dl) in entries {
-                    let postings = self.text_postings_in(wtxn, &index_name, &field)?;
-                    let lens = self.text_len_db_in(wtxn, &index_name, &field)?;
-                    lens.put(&mut *wtxn, id.as_bytes(), &dl.to_le_bytes())?;
-                    totals
-                        .entry(field.clone())
-                        .and_modify(|total| *total = total.saturating_add(u64::from(dl)))
-                        .or_insert(u64::from(dl));
-                    for (term, freq) in tf {
-                        *batch_df.entry((field.clone(), term.clone())).or_insert(0) += 1;
-                        postings.put(
-                            &mut *wtxn,
-                            search::postings_key(&term, &id).as_slice(),
-                            &search::text_posting_value(freq, dl),
-                        )?;
-                    }
-                }
-                for ((field, term), delta) in batch_df {
-                    let df = self.text_df_db_in(wtxn, &index_name, &field)?;
-                    let count = df
-                        .get(&*wtxn, term.as_bytes())?
-                        .and_then(search::read_u64)
-                        .unwrap_or(0)
-                        .saturating_add(delta);
-                    df.put(&mut *wtxn, term.as_bytes(), &count.to_le_bytes())?;
-                }
-                Ok(())
-            },
-        )?;
-        for (field, total) in totals {
-            self.meta.put(
-                &mut *wtxn,
-                search::text_total_key(&self.name, &def.name, &field).as_bytes(),
-                &total.to_le_bytes(),
-            )?;
-            self.meta.put(
-                &mut *wtxn,
-                search::text_df_ready_key(&self.name, &def.name, &field).as_bytes(),
-                &[1],
-            )?;
-        }
-        Ok(())
-    }
-
-    fn backfill_fuzzy_search_index(
-        &self,
-        wtxn: &mut RwTxn<'_>,
-        def: &SearchIndexDef,
-    ) -> Result<()> {
-        for field in &def.fields {
-            let db = self.fuzzy_db_in(wtxn, &def.name, &field.path)?;
-            db.clear(&mut *wtxn)?;
-        }
-        let index_name = def.name.clone();
-        let fields = def.fields.clone();
-        self.parallel_backfill_apply(
-            wtxn,
-            "fuzzy",
-            &index_name,
-            move |id, doc| {
-                let mut out = Vec::new();
-                for field in &fields {
-                    let Some(text) =
-                        index::field_value(&doc, &field.path).and_then(search::field_text)
-                    else {
-                        continue;
-                    };
-                    out.push((id.clone(), field.path.clone(), search::trigrams(&text)));
-                }
-                Ok(out)
-            },
-            |wtxn, entries| {
-                for (id, field, grams) in entries {
-                    let db = self.fuzzy_db_in(wtxn, &index_name, &field)?;
-                    for gram in grams {
-                        db.put(&mut *wtxn, search::postings_key(&gram, &id).as_slice(), &[])?;
-                    }
-                }
-                Ok(())
-            },
-        )
-    }
-
     /// Creates a text index backed by immutable search segments.
     pub fn create_text_segment_index(&self, field: &str) -> Result<()> {
-        let mut def = SearchIndexDef::single(SearchKind::Text, field);
-        def.engine = SearchEngine::Segment;
-        self.create_search_index(&def)
+        self.create_search_index(&SearchIndexDef::single(SearchKind::Text, field))
     }
 
     pub fn create_text_segment_index_txn(&self, wtxn: &mut RwTxn<'_>, field: &str) -> Result<()> {
-        let mut def = SearchIndexDef::single(SearchKind::Text, field);
-        def.engine = SearchEngine::Segment;
-        self.create_search_index_txn(wtxn, &def)
+        self.create_search_index_txn(wtxn, &SearchIndexDef::single(SearchKind::Text, field))
     }
 
     pub fn create_fuzzy_segment_index(&self, field: &str) -> Result<()> {
-        let mut def = SearchIndexDef::single(SearchKind::Fuzzy, field);
-        def.engine = SearchEngine::Segment;
-        self.create_search_index(&def)
+        self.create_search_index(&SearchIndexDef::single(SearchKind::Fuzzy, field))
     }
 
     pub fn create_fuzzy_segment_index_txn(&self, wtxn: &mut RwTxn<'_>, field: &str) -> Result<()> {
-        let mut def = SearchIndexDef::single(SearchKind::Fuzzy, field);
-        def.engine = SearchEngine::Segment;
-        self.create_search_index_txn(wtxn, &def)
+        self.create_search_index_txn(wtxn, &SearchIndexDef::single(SearchKind::Fuzzy, field))
     }
 
     fn cleanup_segment_orphans(&self, dir: &str, live: &[String]) -> Result<()> {
@@ -3772,9 +3352,6 @@ impl<'e> Collection<'e> {
     pub fn search_sidecar_files_in(&self, rtxn: &RoTxn<'_>) -> Result<Vec<String>> {
         let mut files = Vec::new();
         for def in self.search_index_defs_in(rtxn)? {
-            if def.engine != SearchEngine::Segment {
-                continue;
-            }
             match def.kind {
                 SearchKind::Text => {
                     if let Some(manifest) = self.segment_manifest_in(rtxn, &def.name)? {
@@ -3855,9 +3432,6 @@ impl<'e> Collection<'e> {
     }
 
     fn search_sidecar_missing(&self, rtxn: &RoTxn<'_>, def: &SearchIndexDef) -> Result<bool> {
-        if def.engine != SearchEngine::Segment {
-            return Ok(false);
-        }
         let root = self.segment_root()?;
         match def.kind {
             SearchKind::Text => {
@@ -3953,11 +3527,7 @@ impl<'e> Collection<'e> {
             let defs = self
                 .search_index_defs_in(&rtxn)?
                 .into_iter()
-                .filter(|def| {
-                    def.engine == SearchEngine::Segment
-                        && def.kind == SearchKind::Text
-                        && def.fields.len() == 1
-                })
+                .filter(|def| def.kind == SearchKind::Text && def.fields.len() == 1)
                 .collect::<Vec<_>>();
             rtxn.commit()?;
             defs
@@ -3991,11 +3561,7 @@ impl<'e> Collection<'e> {
             let defs = self
                 .search_index_defs_in(&rtxn)?
                 .into_iter()
-                .filter(|def| {
-                    def.engine == SearchEngine::Segment
-                        && def.kind == SearchKind::Text
-                        && def.fields.len() == 1
-                })
+                .filter(|def| def.kind == SearchKind::Text && def.fields.len() == 1)
                 .collect::<Vec<_>>();
             rtxn.commit()?;
             defs
@@ -4008,104 +3574,6 @@ impl<'e> Collection<'e> {
             rebuilt += 1;
         }
         Ok(rebuilt)
-    }
-
-    /// Rebuilds one existing LMDB search index into an immutable segment index.
-    ///
-    /// The old index remains intact until the new segment manifest is complete.
-    /// Returns `false` when the index does not exist or already uses segments.
-    pub fn migrate_search_index(&self, kind: SearchKind, name: &str) -> Result<bool> {
-        let mut wtxn = self.write_txn()?;
-        let migrated = self.migrate_search_index_txn(&mut wtxn, kind, name)?;
-        if migrated {
-            wtxn.commit()?;
-        }
-        Ok(migrated)
-    }
-
-    pub fn migrate_search_index_txn(
-        &self,
-        wtxn: &mut RwTxn<'_>,
-        kind: SearchKind,
-        name: &str,
-    ) -> Result<bool> {
-        let def_key = search::def_key(&self.name, kind, name);
-        let Some(bytes) = self.meta.get(&*wtxn, def_key.as_bytes())? else {
-            return Ok(false);
-        };
-        let def: SearchIndexDef = serde_json::from_slice(bytes)?;
-        def.validate().map_err(Error::Query)?;
-        if def.kind != kind {
-            return Err(Error::Query("search index kind mismatch".into()));
-        }
-        if def.engine == SearchEngine::Segment {
-            return Ok(false);
-        }
-        if def.fields.len() != 1 {
-            return Err(Error::Query(
-                "segment migration supports single-field search indexes".into(),
-            ));
-        }
-
-        let mut segment_def = def.clone();
-        segment_def.engine = SearchEngine::Segment;
-        match kind {
-            SearchKind::Text => self.backfill_segment_text_index(wtxn, &segment_def)?,
-            SearchKind::Fuzzy => self.backfill_fuzzy_segment_index(wtxn, &segment_def)?,
-        }
-
-        // Drop the old LMDB index only after the new segment is durable.
-        for field in &def.fields {
-            match kind {
-                SearchKind::Text => {
-                    let postings = search::text_db_name(&self.name, &def.name, &field.path);
-                    self.drop_resource_db(wtxn, &postings, &postings)?;
-                    let lens = search::text_len_db_name(&self.name, &def.name, &field.path);
-                    self.drop_resource_db(wtxn, &lens, &lens)?;
-                    let df = search::text_df_db_name(&self.name, &def.name, &field.path);
-                    self.drop_resource_db(wtxn, &df, &df)?;
-                    self.meta.delete(
-                        &mut *wtxn,
-                        search::text_total_key(&self.name, &def.name, &field.path).as_bytes(),
-                    )?;
-                    self.meta.delete(
-                        &mut *wtxn,
-                        search::text_df_ready_key(&self.name, &def.name, &field.path).as_bytes(),
-                    )?;
-                }
-                SearchKind::Fuzzy => {
-                    let db = search::fuzzy_db_name(&self.name, &def.name, &field.path);
-                    self.drop_resource_db(wtxn, &db, &db)?;
-                }
-            }
-        }
-        self.meta.put(
-            &mut *wtxn,
-            def_key.as_bytes(),
-            &serde_json::to_vec(&segment_def)?,
-        )?;
-        Ok(true)
-    }
-
-    /// Migrates every legacy LMDB text and fuzzy index in this collection.
-    /// Each index gets its own transaction so large collections do not hold one
-    /// write transaction for the entire operation.
-    pub fn migrate_search_indexes_to_segment(&self) -> Result<usize> {
-        let defs = {
-            let rtxn = self.read_txn()?;
-            let defs = self.search_index_defs_in(&rtxn)?;
-            rtxn.commit()?;
-            defs
-        };
-        let mut migrated = 0;
-        for def in defs {
-            if def.engine != SearchEngine::Segment
-                && self.migrate_search_index(def.kind, &def.name)?
-            {
-                migrated += 1;
-            }
-        }
-        Ok(migrated)
     }
 
     pub fn drop_search_index(&self, kind: SearchKind, name: &str) -> Result<bool> {
@@ -4127,64 +3595,37 @@ impl<'e> Collection<'e> {
         };
         let def: SearchIndexDef = serde_json::from_slice(bytes)?;
         self.meta.delete(&mut *wtxn, def_key.as_bytes())?;
-        if def.engine == SearchEngine::Segment {
-            let (manifest_key, prefix, count_key, dir) = match def.kind {
-                SearchKind::Text => (
-                    self.segment_manifest_key(&def.name),
-                    self.segment_delta_prefix(&def.name),
-                    self.segment_delta_count_key(&def.name),
-                    segment_index_dir(&self.name, &def.name),
-                ),
-                SearchKind::Fuzzy => (
-                    self.fuzzy_segment_manifest_key(&def.name),
-                    self.fuzzy_segment_delta_prefix(&def.name),
-                    self.fuzzy_segment_delta_count_key(&def.name),
-                    fuzzy_segment_index_dir(&self.name, &def.name),
-                ),
-            };
-            self.meta.delete(&mut *wtxn, manifest_key.as_bytes())?;
-            let keys: Vec<Vec<u8>> = self
-                .meta
-                .prefix_iter(&*wtxn, prefix.as_bytes())?
-                .map(|item| item.map(|(key, _)| key.to_vec()))
-                .collect::<std::result::Result<_, _>>()?;
-            for key in keys {
-                self.meta.delete(&mut *wtxn, &key)?;
-            }
-            self.meta.delete(&mut *wtxn, count_key.as_bytes())?;
-            self.clear_segment_stats(wtxn, &def.name)?;
-            if let Some(store) = self.store {
-                let dir = store.env().path().join(dir);
-                match std::fs::remove_dir_all(&dir) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(e.into()),
-                }
-            }
-            return Ok(true);
+        let (manifest_key, prefix, count_key, dir) = match def.kind {
+            SearchKind::Text => (
+                self.segment_manifest_key(&def.name),
+                self.segment_delta_prefix(&def.name),
+                self.segment_delta_count_key(&def.name),
+                segment_index_dir(&self.name, &def.name),
+            ),
+            SearchKind::Fuzzy => (
+                self.fuzzy_segment_manifest_key(&def.name),
+                self.fuzzy_segment_delta_prefix(&def.name),
+                self.fuzzy_segment_delta_count_key(&def.name),
+                fuzzy_segment_index_dir(&self.name, &def.name),
+            ),
+        };
+        self.meta.delete(&mut *wtxn, manifest_key.as_bytes())?;
+        let keys: Vec<Vec<u8>> = self
+            .meta
+            .prefix_iter(&*wtxn, prefix.as_bytes())?
+            .map(|item| item.map(|(key, _)| key.to_vec()))
+            .collect::<std::result::Result<_, _>>()?;
+        for key in keys {
+            self.meta.delete(&mut *wtxn, &key)?;
         }
-        for field in &def.fields {
-            match def.kind {
-                SearchKind::Text => {
-                    let postings = search::text_db_name(&self.name, &def.name, &field.path);
-                    self.drop_resource_db(wtxn, &postings, &postings)?;
-                    let lens = search::text_len_db_name(&self.name, &def.name, &field.path);
-                    self.drop_resource_db(wtxn, &lens, &lens)?;
-                    let df = search::text_df_db_name(&self.name, &def.name, &field.path);
-                    self.drop_resource_db(wtxn, &df, &df)?;
-                    self.meta.delete(
-                        &mut *wtxn,
-                        search::text_total_key(&self.name, &def.name, &field.path).as_bytes(),
-                    )?;
-                    self.meta.delete(
-                        &mut *wtxn,
-                        search::text_df_ready_key(&self.name, &def.name, &field.path).as_bytes(),
-                    )?;
-                }
-                SearchKind::Fuzzy => {
-                    let db = search::fuzzy_db_name(&self.name, &def.name, &field.path);
-                    self.drop_resource_db(wtxn, &db, &db)?;
-                }
+        self.meta.delete(&mut *wtxn, count_key.as_bytes())?;
+        self.clear_segment_stats(wtxn, &def.name)?;
+        if let Some(store) = self.store {
+            let dir = store.env().path().join(dir);
+            match std::fs::remove_dir_all(&dir) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
             }
         }
         Ok(true)
@@ -4256,85 +3697,13 @@ impl<'e> Collection<'e> {
                 if old_text == new_text {
                     continue;
                 }
-                if def.engine == SearchEngine::Segment {
-                    self.apply_segment_text_entry(
-                        wtxn,
-                        &def,
-                        old_text.as_deref(),
-                        new_text.as_deref(),
-                        id,
-                    )?;
-                    continue;
-                }
-                let postings = self.text_postings_in(wtxn, &def.name, &field.path)?;
-                let lens = self.text_len_db_in(wtxn, &def.name, &field.path)?;
-                let total_key = search::text_total_key(&self.name, &def.name, &field.path);
-                let mut total = self
-                    .meta
-                    .get(&*wtxn, total_key.as_bytes())?
-                    .and_then(search::read_u64)
-                    .unwrap_or(0);
-
-                let old_tokens = old_text.as_ref().map(|t| search::tokenize(t));
-                let new_tokens = new_text.as_ref().map(|t| search::tokenize(t));
-                let old_len = old_tokens.as_ref().map(|t| t.len() as u64).unwrap_or(0);
-                let new_len = new_tokens.as_ref().map(|t| t.len() as u64).unwrap_or(0);
-                let old_freqs = old_tokens
-                    .as_ref()
-                    .map(|tokens| search::term_freqs(tokens))
-                    .unwrap_or_default();
-                let new_freqs = new_tokens
-                    .as_ref()
-                    .map(|tokens| search::term_freqs(tokens))
-                    .unwrap_or_default();
-
-                for term in old_freqs.keys() {
-                    postings.delete(&mut *wtxn, search::postings_key(term, id).as_slice())?;
-                }
-                if new_tokens.is_some() {
-                    let dl = new_len as u32;
-                    for (term, tf) in &new_freqs {
-                        postings.put(
-                            &mut *wtxn,
-                            search::postings_key(term, id).as_slice(),
-                            &search::text_posting_value(*tf, dl),
-                        )?;
-                    }
-                    lens.put(&mut *wtxn, id.as_bytes(), &dl.to_le_bytes())?;
-                } else {
-                    lens.delete(&mut *wtxn, id.as_bytes())?;
-                }
-
-                let df_ready_key = search::text_df_ready_key(&self.name, &def.name, &field.path);
-                if self.meta.get(&*wtxn, df_ready_key.as_bytes())?.is_some() {
-                    let mut df_deltas: HashMap<&str, i64> = HashMap::new();
-                    for term in old_freqs.keys() {
-                        *df_deltas.entry(term.as_str()).or_insert(0) -= 1;
-                    }
-                    for term in new_freqs.keys() {
-                        *df_deltas.entry(term.as_str()).or_insert(0) += 1;
-                    }
-                    let df = self.text_df_db_in(wtxn, &def.name, &field.path)?;
-                    for (term, delta) in df_deltas {
-                        if delta == 0 {
-                            continue;
-                        }
-                        let count = df
-                            .get(&*wtxn, term.as_bytes())?
-                            .and_then(search::read_u64)
-                            .unwrap_or(0);
-                        let count = if delta > 0 {
-                            count.saturating_add(delta as u64)
-                        } else {
-                            count.saturating_sub((-delta) as u64)
-                        };
-                        df.put(&mut *wtxn, term.as_bytes(), &count.to_le_bytes())?;
-                    }
-                }
-
-                total = total.saturating_sub(old_len) + new_len;
-                self.meta
-                    .put(&mut *wtxn, total_key.as_bytes(), &total.to_le_bytes())?;
+                self.apply_segment_text_entry(
+                    wtxn,
+                    &def,
+                    old_text.as_deref(),
+                    new_text.as_deref(),
+                    id,
+                )?;
             }
         }
         Ok(())
@@ -4407,27 +3776,13 @@ impl<'e> Collection<'e> {
                 if old_text == new_text {
                     continue;
                 }
-                if def.engine == SearchEngine::Segment {
-                    self.apply_segment_fuzzy_entry(
-                        wtxn,
-                        &def,
-                        old_text.as_deref(),
-                        new_text.as_deref(),
-                        id,
-                    )?;
-                    continue;
-                }
-                let db = self.fuzzy_db_in(wtxn, &def.name, &field.path)?;
-                if let Some(text) = &old_text {
-                    for gram in search::trigrams(text) {
-                        db.delete(&mut *wtxn, search::postings_key(&gram, id).as_slice())?;
-                    }
-                }
-                if let Some(text) = &new_text {
-                    for gram in search::trigrams(text) {
-                        db.put(&mut *wtxn, search::postings_key(&gram, id).as_slice(), &[])?;
-                    }
-                }
+                self.apply_segment_fuzzy_entry(
+                    wtxn,
+                    &def,
+                    old_text.as_deref(),
+                    new_text.as_deref(),
+                    id,
+                )?;
             }
         }
         Ok(())
@@ -4599,648 +3954,93 @@ impl<'e> Collection<'e> {
         }
 
         let empty_filter = filter.as_object().is_none_or(|object| object.is_empty());
-        if def.engine == SearchEngine::Segment {
-            if mode != TextQueryMode::Native || def.fields.len() != 1 {
-                return Err(Error::Query(
-                    "segment text indexes support only native single-field queries".into(),
-                ));
-            }
-            let allowed = if empty_filter {
-                None
-            } else {
-                self.segment_filter_candidates(rtxn, filter)?
-            };
-            let needs_filter = !empty_filter && allowed.is_none();
-            let needs_negative =
-                !parsed.negative_terms.is_empty() || !parsed.negative_phrases.is_empty();
-            let needs_phrases = !parsed.phrases.is_empty();
-            let use_positions =
-                needs_phrases && self.segment_text_has_positions_in(rtxn, &def.name)?;
-            let mut candidate_terms = parsed.positive_terms.clone();
-            for phrase in &parsed.phrases {
-                candidate_terms.extend(phrase.iter().cloned());
-            }
-            candidate_terms.sort();
-            candidate_terms.dedup();
-            if candidate_terms.is_empty() {
-                return Ok(Vec::new());
-            }
-            let candidate_query = candidate_terms.join(" ");
-            let verify = |id: &str| -> std::io::Result<Option<f64>> {
-                let Some(bytes) = self
-                    .db
-                    .get(rtxn, id.as_bytes())
-                    .map_err(std::io::Error::other)?
-                else {
-                    return Ok(None);
-                };
-                let doc: Value = serde_json::from_slice(bytes).map_err(std::io::Error::other)?;
-                if needs_filter && !matches(&doc, filter) {
-                    return Ok(None);
-                }
-                let mut matched_phrases = 0usize;
-                if needs_negative || (needs_phrases && !use_positions) {
-                    let tokens: Vec<String> = def
-                        .fields
-                        .iter()
-                        .filter_map(|field| {
-                            index::field_value(&doc, &field.path).and_then(search::field_text)
-                        })
-                        .flat_map(|text| search::tokenize(&text))
-                        .collect();
-                    if parsed
-                        .negative_terms
-                        .iter()
-                        .any(|term| tokens.iter().any(|token| token == term))
-                    {
-                        return Ok(None);
-                    }
-                    if parsed
-                        .negative_phrases
-                        .iter()
-                        .any(|phrase| search::contains_phrase(&tokens, phrase))
-                    {
-                        return Ok(None);
-                    }
-                    if needs_phrases && !use_positions {
-                        matched_phrases = parsed
-                            .phrases
-                            .iter()
-                            .filter(|phrase| search::contains_phrase(&tokens, phrase))
-                            .count();
-                        if matched_phrases != parsed.phrases.len() {
-                            return Ok(None);
-                        }
-                    }
-                }
-                Ok(Some(matched_phrases as f64))
-            };
-            let verify: Option<&DocVerifier<'_>> =
-                (needs_filter || needs_negative || (needs_phrases && !use_positions))
-                    .then_some(&verify);
-            return self.search_segment_text_index_in(
-                rtxn,
-                &def,
-                &candidate_query,
-                skip,
-                limit,
-                allowed.as_ref(),
-                verify,
-                if use_positions { &parsed.phrases } else { &[] },
-            );
+        if mode != TextQueryMode::Native || def.fields.len() != 1 {
+            return Err(Error::Query(
+                "segment text indexes support only native single-field queries".into(),
+            ));
         }
-        let needs_phrases = !parsed.phrases.is_empty() || !parsed.negative_phrases.is_empty();
-        let simple_query = !needs_phrases;
-        let filter_candidates = if simple_query && !empty_filter {
-            self.exact_filter_index_candidates(rtxn, filter)?
-        } else {
+        let allowed = if empty_filter {
             None
+        } else {
+            self.segment_filter_candidates(rtxn, filter)?
         };
-        let can_use_fast = simple_query
-            && parsed.negative_terms.is_empty()
-            && def.fields.len() == 1
-            && (empty_filter || filter_candidates.is_some());
-
-        // Single-field lexical queries do not need the shared score map. For one
-        // term, stream postings straight into a bounded heap. For several terms,
-        // merge the already id-sorted posting lists and score each document once.
-        // This keeps large OR queries from allocating a map entry per hit.
-        if can_use_fast {
-            let field = &def.fields[0];
-            let Some(postings) = self.text_postings(rtxn, &def.name, &field.path)? else {
-                return Ok(Vec::new());
-            };
-            let Some(lens) = self.text_len_db(rtxn, &def.name, &field.path)? else {
-                return Ok(Vec::new());
-            };
-            let n_docs = lens.stat(rtxn)?.entries as f64;
-            if n_docs == 0.0 {
-                return Ok(Vec::new());
-            }
-            let df_ready = self
-                .meta
-                .get(
-                    rtxn,
-                    search::text_df_ready_key(&self.name, &def.name, &field.path).as_bytes(),
-                )?
-                .is_some();
-            let df_db = if df_ready {
-                self.text_df_db(rtxn, &def.name, &field.path)?
-            } else {
-                None
-            };
-            let total = self
-                .meta
-                .get(
-                    rtxn,
-                    search::text_total_key(&self.name, &def.name, &field.path).as_bytes(),
-                )?
-                .and_then(search::read_u64)
-                .unwrap_or(0) as f64;
-            let avgdl = total / n_docs;
-            let weight = field.weight;
-            let filter_set = filter_candidates.as_ref();
-            if filter_set.is_some_and(HashSet::is_empty) {
-                return Ok(Vec::new());
-            }
-            let max = match mode {
-                TextQueryMode::Native => limit.unwrap_or(10).min(1000),
-                TextQueryMode::Mongo => limit.unwrap_or(usize::MAX),
-            };
-            if max == 0 {
-                return Ok(Vec::new());
-            }
-            let want = skip.saturating_add(max);
-            let emit_top = |top: BinaryHeap<RankedId>, scale: f64| -> Result<Vec<Value>> {
-                let mut out = Vec::new();
-                for hit in top.into_sorted_vec().into_iter().skip(skip).take(max) {
-                    let Some(bytes) = self.db.get(rtxn, hit.id.as_bytes())? else {
-                        continue;
-                    };
-                    let mut doc: Value = parse_json(bytes)?;
-                    if let Some(obj) = doc.as_object_mut() {
-                        obj.insert("_score".to_string(), serde_json::json!(hit.score * scale));
-                    }
-                    out.push(doc);
-                }
-                Ok(out)
-            };
-
-            if parsed.positive_terms.len() == 1 {
-                let term = &parsed.positive_terms[0];
-                let workers = search_workers();
-                if workers > 1
-                    && want <= PARALLEL_SEARCH_MAX_WANT
-                    && n_docs >= PARALLEL_SEARCH_MIN_ENTRIES as f64
-                {
-                    let (top, df) = self.parallel_text_single_term(
-                        rtxn, &postings, &lens, term, weight, avgdl, filter_set, want, workers,
-                    )?;
-                    let idf = search::idf(n_docs, df as f64);
-                    return emit_top(top, idf);
-                }
-                let prefix = search::posting_prefix(term);
-                let mut top = BinaryHeap::with_capacity(want.min(1024).saturating_add(1));
-                let mut df = 0u64;
-                for item in postings.prefix_iter(rtxn, prefix.as_slice())? {
-                    let (key, value) = item?;
-                    let Some(id) = search::parse_posting(key) else {
-                        continue;
-                    };
-                    df += 1;
-                    if filter_set.is_some_and(|ids| !ids.contains(id)) {
-                        continue;
-                    }
-                    let tf = search::text_posting_tf(value).unwrap_or(1) as f64;
-                    let dl = match search::text_posting_dl(value) {
-                        Some(dl) => dl as f64,
-                        None => lens
-                            .get(rtxn, id.as_bytes())?
-                            .and_then(search::read_u32)
-                            .unwrap_or(0) as f64,
-                    };
-                    // idf is constant for this term, so rank with idf=1 and
-                    // apply it after the heap has selected the top page.
-                    let score = weight * search::bm25_term(tf, dl, avgdl, 1.0);
-                    top.push(RankedId {
-                        id: id.to_string(),
-                        score,
-                    });
-                    if top.len() > want {
-                        top.pop();
-                    }
-                }
-                let idf = search::idf(n_docs, df as f64);
-                return emit_top(top, idf);
-            }
-
-            // Materializing every posting as a String was the dominant cost for
-            // multi-term queries on large collections. Keep one live cursor per
-            // term and merge them directly into the bounded heap instead.
-            let mut cursors = Vec::with_capacity(parsed.positive_terms.len());
-            for term in &parsed.positive_terms {
-                let prefix = search::posting_prefix(term);
-                let df = if let Some(df_db) = df_db.as_ref() {
-                    df_db
-                        .get(rtxn, term.as_bytes())?
-                        .and_then(search::read_u64)
-                        .unwrap_or(0)
-                } else {
-                    let mut df = 0u64;
-                    for item in postings.prefix_iter(rtxn, prefix.as_slice())? {
-                        let (key, _) = item?;
-                        if search::parse_posting(key).is_some() {
-                            df += 1;
-                        }
-                    }
-                    df
-                };
-                let iter = postings.prefix_iter(rtxn, prefix.as_slice())?;
-                let mut cursor = TextPostingCursor {
-                    iter,
-                    weight,
-                    idf: search::idf(n_docs, df as f64),
-                    id: Vec::new(),
-                    tf: 0.0,
-                    dl: 0.0,
-                    active: false,
-                };
-                cursor.advance(&lens, rtxn)?;
-                cursors.push(cursor);
-            }
-
-            let mut top: BinaryHeap<RankedId> =
-                BinaryHeap::with_capacity(want.min(1024).saturating_add(1));
-            let mut min_id = Vec::new();
-            loop {
-                min_id.clear();
-                for cursor in &cursors {
-                    if cursor.active
-                        && (min_id.is_empty() || cursor.id.as_slice() < min_id.as_slice())
-                    {
-                        min_id.clear();
-                        min_id.extend_from_slice(&cursor.id);
-                    }
-                }
-                if min_id.is_empty() {
-                    break;
-                }
-                let mut score = 0.0;
-                for cursor in &mut cursors {
-                    if cursor.active && cursor.id.as_slice() == min_id.as_slice() {
-                        score += cursor.weight
-                            * search::bm25_term(cursor.tf, cursor.dl, avgdl, cursor.idf);
-                        cursor.advance(&lens, rtxn)?;
-                    }
-                }
-                let matches_filter = filter_set.is_none_or(|ids| {
-                    std::str::from_utf8(&min_id).is_ok_and(|id| ids.contains(id))
-                });
-                if !matches_filter {
-                    continue;
-                }
-                if top.len() >= want {
-                    let worst = top.peek().expect("non-empty text heap");
-                    if score < worst.score
-                        || (score == worst.score && min_id.as_slice() > worst.id.as_bytes())
-                    {
-                        continue;
-                    }
-                }
-                let Ok(id) = std::str::from_utf8(&min_id) else {
-                    continue;
-                };
-                top.push(RankedId {
-                    id: id.to_string(),
-                    score,
-                });
-                if top.len() > want {
-                    top.pop();
-                }
-            }
-            return emit_top(top, 1.0);
+        let needs_filter = !empty_filter && allowed.is_none();
+        let needs_negative =
+            !parsed.negative_terms.is_empty() || !parsed.negative_phrases.is_empty();
+        let needs_phrases = !parsed.phrases.is_empty();
+        let use_positions = needs_phrases && self.segment_text_has_positions_in(rtxn, &def.name)?;
+        let mut candidate_terms = parsed.positive_terms.clone();
+        for phrase in &parsed.phrases {
+            candidate_terms.extend(phrase.iter().cloned());
         }
-
-        let mut scores: HashMap<String, f64> = HashMap::new();
-        let mut phrase_candidates: HashSet<String> = HashSet::new();
-        let mut negative_ids: HashSet<String> = HashSet::new();
-
-        for field in &def.fields {
-            let Some(postings) = self.text_postings(rtxn, &def.name, &field.path)? else {
-                continue;
-            };
-            let Some(lens) = self.text_len_db(rtxn, &def.name, &field.path)? else {
-                continue;
-            };
-            let n_docs = lens.stat(rtxn)?.entries as f64;
-            if n_docs == 0.0 {
-                continue;
-            }
-            let total = self
-                .meta
-                .get(
-                    rtxn,
-                    search::text_total_key(&self.name, &def.name, &field.path).as_bytes(),
-                )?
-                .and_then(search::read_u64)
-                .unwrap_or(0) as f64;
-            let avgdl = total / n_docs;
-            let weight = field.weight;
-
-            let term_hits = |term: &str| -> Result<Vec<(String, f64, Option<f64>)>> {
-                let prefix = search::posting_prefix(term);
-                let mut hits = Vec::new();
-                for item in postings.prefix_iter(rtxn, prefix.as_slice())? {
-                    let (key, value) = item?;
-                    if let Some(id) = search::parse_posting(key) {
-                        let tf = search::text_posting_tf(value).unwrap_or(1) as f64;
-                        let dl = search::text_posting_dl(value).map(|dl| dl as f64);
-                        hits.push((id.to_string(), tf, dl));
-                    }
-                }
-                Ok(hits)
-            };
-
-            for term in &parsed.positive_terms {
-                let hits = term_hits(term)?;
-                let idf = search::idf(n_docs, hits.len() as f64);
-                for (id, tf, posting_dl) in hits {
-                    let dl = match posting_dl {
-                        Some(dl) => dl,
-                        None => lens
-                            .get(rtxn, id.as_bytes())?
-                            .and_then(search::read_u32)
-                            .unwrap_or(0) as f64,
-                    };
-                    *scores.entry(id).or_insert(0.0) +=
-                        weight * search::bm25_term(tf, dl, avgdl, idf);
-                }
-            }
-            for term in &parsed.negative_terms {
-                for (id, _, _) in term_hits(term)? {
-                    negative_ids.insert(id);
-                }
-            }
-            for phrase in parsed.phrases.iter().chain(parsed.negative_phrases.iter()) {
-                let Some(first) = phrase.first() else {
-                    continue;
-                };
-                for (id, _, _) in term_hits(first)? {
-                    phrase_candidates.insert(id);
-                }
-            }
+        candidate_terms.sort();
+        candidate_terms.dedup();
+        if candidate_terms.is_empty() {
+            return Ok(Vec::new());
         }
-
-        // Common case: a plain lexical query with no phrases and no residual
-        // filter. Rank only the posting scores, then load documents for the
-        // requested page. Parsing and tokenizing every candidate here is the
-        // difference between a few seconds and a few milliseconds on a large
-        // posting list.
-        if simple_query && empty_filter && phrase_candidates.is_empty() {
-            let max = match mode {
-                TextQueryMode::Native => limit.unwrap_or(10).min(1000),
-                TextQueryMode::Mongo => limit.unwrap_or(usize::MAX),
+        let candidate_query = candidate_terms.join(" ");
+        let verify = |id: &str| -> std::io::Result<Option<f64>> {
+            let Some(bytes) = self
+                .db
+                .get(rtxn, id.as_bytes())
+                .map_err(std::io::Error::other)?
+            else {
+                return Ok(None);
             };
-            let want = skip.saturating_add(max);
-            let mut top = BinaryHeap::with_capacity(want.min(scores.len()).saturating_add(1));
-            for (id, score) in scores {
-                if negative_ids.contains(&id) {
-                    continue;
-                }
-                top.push(RankedId { id, score });
-                if top.len() > want {
-                    top.pop();
-                }
+            let doc: Value = serde_json::from_slice(bytes).map_err(std::io::Error::other)?;
+            if needs_filter && !matches(&doc, filter) {
+                return Ok(None);
             }
-
-            let mut out = Vec::new();
-            for hit in top.into_sorted_vec().into_iter().skip(skip).take(max) {
-                let Some(bytes) = self.db.get(rtxn, hit.id.as_bytes())? else {
-                    continue;
-                };
-                let mut doc: Value = parse_json(bytes)?;
-                if let Some(obj) = doc.as_object_mut() {
-                    obj.insert("_score".to_string(), serde_json::json!(hit.score));
-                }
-                out.push(doc);
-            }
-            return Ok(out);
-        }
-
-        let mut candidates: HashSet<String> = scores.keys().cloned().collect();
-        candidates.extend(phrase_candidates);
-        let mut ranked: Vec<(String, f64, Value)> = Vec::new();
-        for id in candidates {
-            if negative_ids.contains(&id) {
-                continue;
-            }
-            let Some(bytes) = self.db.get(rtxn, id.as_bytes())? else {
-                continue;
-            };
-            let doc: Value = parse_json(bytes)?;
-            let tokenized: Vec<Vec<String>> = if needs_phrases {
-                let field_texts: Vec<String> = def
+            let mut matched_phrases = 0usize;
+            if needs_negative || (needs_phrases && !use_positions) {
+                let tokens: Vec<String> = def
                     .fields
                     .iter()
                     .filter_map(|field| {
                         index::field_value(&doc, &field.path).and_then(search::field_text)
                     })
+                    .flat_map(|text| search::tokenize(&text))
                     .collect();
-                field_texts
+                if parsed
+                    .negative_terms
                     .iter()
-                    .map(|text| search::tokenize(text))
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            if parsed.negative_phrases.iter().any(|phrase| {
-                tokenized
+                    .any(|term| tokens.iter().any(|token| token == term))
+                {
+                    return Ok(None);
+                }
+                if parsed
+                    .negative_phrases
                     .iter()
-                    .any(|tokens| search::contains_phrase(tokens, phrase))
-            }) {
-                continue;
-            }
-            let matched_phrases = parsed
-                .phrases
-                .iter()
-                .filter(|phrase| {
-                    tokenized
+                    .any(|phrase| search::contains_phrase(&tokens, phrase))
+                {
+                    return Ok(None);
+                }
+                if needs_phrases && !use_positions {
+                    matched_phrases = parsed
+                        .phrases
                         .iter()
-                        .any(|tokens| search::contains_phrase(tokens, phrase))
-                })
-                .count();
-            let term_match = scores.contains_key(&id);
-            let positive = match mode {
-                TextQueryMode::Native => {
-                    (parsed.positive_terms.is_empty() || term_match)
-                        && (parsed.phrases.is_empty() || matched_phrases == parsed.phrases.len())
+                        .filter(|phrase| search::contains_phrase(&tokens, phrase))
+                        .count();
+                    if matched_phrases != parsed.phrases.len() {
+                        return Ok(None);
+                    }
                 }
-                TextQueryMode::Mongo => term_match || matched_phrases > 0,
-            };
-            if !positive || !matches(&doc, filter) {
-                continue;
             }
-            let score = scores.get(&id).copied().unwrap_or(0.0) + matched_phrases as f64;
-            ranked.push((id, score, doc));
-        }
-        ranked.sort_by(|a, b| {
-            b.1.partial_cmp(&a.1)
-                .unwrap_or(Ordering::Equal)
-                .then_with(|| a.0.cmp(&b.0))
-        });
-
-        let max = match mode {
-            TextQueryMode::Native => limit.unwrap_or(10).min(1000),
-            TextQueryMode::Mongo => limit.unwrap_or(usize::MAX),
+            Ok(Some(matched_phrases as f64))
         };
-        let mut out = Vec::new();
-        for (_id, score, mut doc) in ranked.into_iter().skip(skip).take(max) {
-            if let Some(obj) = doc.as_object_mut() {
-                obj.insert("_score".to_string(), serde_json::json!(score));
-            }
-            out.push(doc);
-        }
-        Ok(out)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn parallel_text_single_term(
-        &self,
-        rtxn: &RoTxn<'_>,
-        postings: &Database<Bytes, Bytes>,
-        lens: &Database<Bytes, Bytes>,
-        term: &str,
-        weight: f64,
-        avgdl: f64,
-        filter_set: Option<&HashSet<String>>,
-        want: usize,
-        workers: usize,
-    ) -> Result<(BinaryHeap<RankedId>, u64)> {
-        let mut job_txs = Vec::with_capacity(workers);
-        let mut job_rxs = Vec::with_capacity(workers);
-        for _ in 0..workers {
-            let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, SearchChunk)>(1);
-            job_txs.push(tx);
-            job_rxs.push(rx);
-        }
-        let (res_tx, res_rx) = std::sync::mpsc::channel::<Result<(usize, Vec<RankedId>)>>();
-        let prefix = search::posting_prefix(term);
-        let mut iter = postings.prefix_iter(rtxn, prefix.as_slice())?;
-
-        std::thread::scope(|scope| -> Result<(BinaryHeap<RankedId>, u64)> {
-            for rx in job_rxs {
-                let tx = res_tx.clone();
-                scope.spawn(move || {
-                    while let Ok((idx, chunk)) = rx.recv() {
-                        let mut local: BinaryHeap<RankedId> =
-                            BinaryHeap::with_capacity(want.saturating_add(1));
-                        for &(offset, key_len, value_len) in &chunk.entries {
-                            let offset = offset as usize;
-                            let key_len = key_len as usize;
-                            let value_len = value_len as usize;
-                            let key = &chunk.buffer[offset..offset + key_len];
-                            let value =
-                                &chunk.buffer[offset + key_len..offset + key_len + value_len];
-                            let Some(id) = search::parse_posting(key) else {
-                                continue;
-                            };
-                            if value.len() != 16 {
-                                continue;
-                            }
-                            let tf = f64::from_le_bytes(value[..8].try_into().expect("8 bytes"));
-                            let dl = f64::from_le_bytes(value[8..16].try_into().expect("8 bytes"));
-                            let score = weight * search::bm25_term(tf, dl, avgdl, 1.0);
-                            if local.len() >= want {
-                                let worst = local.peek().expect("non-empty text heap");
-                                if score < worst.score
-                                    || (score == worst.score && id > worst.id.as_str())
-                                {
-                                    continue;
-                                }
-                            }
-                            local.push(RankedId {
-                                id: id.to_string(),
-                                score,
-                            });
-                            if local.len() > want {
-                                local.pop();
-                            }
-                        }
-                        if tx.send(Ok((idx, local.into_vec()))).is_err() {
-                            break;
-                        }
-                    }
-                });
-            }
-            drop(res_tx);
-
-            let mut top = BinaryHeap::with_capacity(want.saturating_add(1));
-            let mut df = 0u64;
-            let mut next_idx = 0usize;
-            let mut error: Option<Error> = None;
-            loop {
-                let mut sent = 0usize;
-                for tx in &job_txs {
-                    let mut chunk = SearchChunk::with_capacity(PARALLEL_SEARCH_CHUNK);
-                    while chunk.len() < PARALLEL_SEARCH_CHUNK {
-                        match iter.next() {
-                            Some(Ok((key, value))) => {
-                                let Some(id) = search::parse_posting(key) else {
-                                    continue;
-                                };
-                                df += 1;
-                                if filter_set.is_some_and(|ids| !ids.contains(id)) {
-                                    continue;
-                                }
-                                let tf = search::text_posting_tf(value).unwrap_or(1) as f64;
-                                let dl = match search::text_posting_dl(value) {
-                                    Some(dl) => dl as f64,
-                                    None => match lens.get(rtxn, id.as_bytes()) {
-                                        Ok(Some(bytes)) => {
-                                            search::read_u32(bytes).unwrap_or(0) as f64
-                                        }
-                                        Ok(None) => 0.0,
-                                        Err(err) => {
-                                            error = Some(err.into());
-                                            break;
-                                        }
-                                    },
-                                };
-                                let mut payload = [0u8; 16];
-                                payload[..8].copy_from_slice(&tf.to_le_bytes());
-                                payload[8..].copy_from_slice(&dl.to_le_bytes());
-                                chunk.push(key, &payload);
-                            }
-                            Some(Err(err)) => {
-                                error = Some(err.into());
-                                break;
-                            }
-                            None => break,
-                        }
-                    }
-                    if error.is_some() || chunk.is_empty() {
-                        break;
-                    }
-                    let idx = next_idx;
-                    next_idx += 1;
-                    if tx.send((idx, chunk)).is_err() {
-                        error = Some(Error::Query("parallel text worker stopped".into()));
-                        break;
-                    }
-                    sent += 1;
-                }
-                if error.is_some() || sent == 0 {
-                    break;
-                }
-                for _ in 0..sent {
-                    match res_rx.recv() {
-                        Ok(Ok((_idx, local))) => {
-                            for candidate in local {
-                                top.push(candidate);
-                                if top.len() > want {
-                                    top.pop();
-                                }
-                            }
-                        }
-                        Ok(Err(err)) => {
-                            error = Some(err);
-                            break;
-                        }
-                        Err(_) => {
-                            error =
-                                Some(Error::Query("parallel text scan returned no result".into()));
-                            break;
-                        }
-                    }
-                }
-            }
-            drop(job_txs);
-            if let Some(error) = error {
-                Err(error)
-            } else {
-                Ok((top, df))
-            }
-        })
+        let verify: Option<&DocVerifier<'_>> =
+            (needs_filter || needs_negative || (needs_phrases && !use_positions))
+                .then_some(&verify);
+        self.search_segment_text_index_in(
+            rtxn,
+            &def,
+            &candidate_query,
+            skip,
+            limit,
+            allowed.as_ref(),
+            verify,
+            if use_positions { &parsed.phrases } else { &[] },
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5354,141 +4154,36 @@ impl<'e> Collection<'e> {
         let Some(def) = self.search_index_def(rtxn, SearchKind::Fuzzy, field)? else {
             return Err(Error::Query(format!("no fuzzy index on field `{field}`")));
         };
-        if def.engine == SearchEngine::Segment {
-            let empty_filter = filter.as_object().is_none_or(|object| object.is_empty());
-            let allowed = if empty_filter {
-                None
-            } else {
-                self.segment_filter_candidates(rtxn, filter)?
-            };
-            let needs_filter = !empty_filter && allowed.is_none();
-            let verify = |id: &str| -> std::io::Result<Option<f64>> {
-                let Some(bytes) = self
-                    .db
-                    .get(rtxn, id.as_bytes())
-                    .map_err(std::io::Error::other)?
-                else {
-                    return Ok(None);
-                };
-                let doc: Value = serde_json::from_slice(bytes).map_err(std::io::Error::other)?;
-                Ok(matches(&doc, filter).then_some(0.0))
-            };
-            let verify: Option<&DocVerifier<'_>> = needs_filter.then_some(&verify);
-            return self.search_segment_fuzzy_in(
-                rtxn,
-                &def,
-                query,
-                max_distance,
-                limit,
-                allowed.as_ref(),
-                verify,
-            );
-        }
-        let Some(db) = self.fuzzy_db(rtxn, field, field)? else {
-            return Err(Error::Query(format!("no fuzzy index on field `{field}`")));
+        let empty_filter = filter.as_object().is_none_or(|object| object.is_empty());
+        let allowed = if empty_filter {
+            None
+        } else {
+            self.segment_filter_candidates(rtxn, filter)?
         };
-        let query = search::normalize(query);
-        if query.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // Candidates: documents sharing at least one trigram. The trigram
-        // posting lists are already sorted by `_id`; merge them directly and
-        // keep a bounded heap instead of building a multi-million-entry
-        // `HashMap<String, u32>` and sorting it.
-        let mut cursors = Vec::new();
-        for gram in search::trigrams(&query) {
-            let prefix = search::posting_prefix(&gram);
-            cursors.push(FuzzyPostingCursor::open(rtxn, &db, prefix.as_slice())?);
-        }
-
-        const FUZZY_CANDIDATE_LIMIT: usize = 5000;
-        let mut candidate_heap: BinaryHeap<FuzzyCandidate> =
-            BinaryHeap::with_capacity(FUZZY_CANDIDATE_LIMIT + 1);
-        let mut min_id = Vec::new();
-        loop {
-            min_id.clear();
-            for cursor in &cursors {
-                let Some(id) = &cursor.id else {
-                    continue;
-                };
-                if min_id.is_empty() || id.as_slice() < min_id.as_slice() {
-                    min_id.clear();
-                    min_id.extend_from_slice(id);
-                }
-            }
-            if min_id.is_empty() {
-                break;
-            }
-
-            let mut count = 0u32;
-            for cursor in &mut cursors {
-                if cursor.id.as_deref() == Some(min_id.as_slice()) {
-                    count += 1;
-                    cursor.advance()?;
-                }
-            }
-
-            if candidate_heap.len() >= FUZZY_CANDIDATE_LIMIT {
-                let worst = candidate_heap
-                    .peek()
-                    .expect("non-empty fuzzy candidate heap");
-                if count < worst.count
-                    || (count == worst.count && min_id.as_slice() > worst.id.as_bytes())
-                {
-                    continue;
-                }
-            }
-            let Ok(id) = std::str::from_utf8(&min_id) else {
-                continue;
+        let needs_filter = !empty_filter && allowed.is_none();
+        let verify = |id: &str| -> std::io::Result<Option<f64>> {
+            let Some(bytes) = self
+                .db
+                .get(rtxn, id.as_bytes())
+                .map_err(std::io::Error::other)?
+            else {
+                return Ok(None);
             };
-            candidate_heap.push(FuzzyCandidate {
-                id: id.to_string(),
-                count,
-            });
-            if candidate_heap.len() > FUZZY_CANDIDATE_LIMIT {
-                candidate_heap.pop();
-            }
-        }
-        let mut candidates = candidate_heap.into_vec();
-        candidates.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.id.cmp(&b.id)));
-
-        let mut scored: Vec<(usize, String, Value)> = Vec::new();
-        for candidate in candidates {
-            let id = candidate.id;
-            let Some(bytes) = self.db.get(rtxn, id.as_bytes())? else {
-                continue;
-            };
-            let doc: Value = parse_json(bytes)?;
-            let Some(text) = index::field_value(&doc, field).and_then(search::field_text) else {
-                continue;
-            };
-            let Some(distance) = search::fuzzy_distance(&text, &query, max_distance) else {
-                continue;
-            };
-            if !matches(&doc, filter) {
-                continue;
-            }
-            scored.push((distance, id, doc));
-        }
-
-        scored.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-        let limit = limit.unwrap_or(10).min(1000);
-        Ok(scored
-            .into_iter()
-            .take(limit)
-            .map(|(distance, _, mut doc)| {
-                if let Some(obj) = doc.as_object_mut() {
-                    obj.insert("_distance".to_string(), serde_json::json!(distance));
-                }
-                doc
-            })
-            .collect())
+            let doc: Value = serde_json::from_slice(bytes).map_err(std::io::Error::other)?;
+            Ok(matches(&doc, filter).then_some(0.0))
+        };
+        let verify: Option<&DocVerifier<'_>> = needs_filter.then_some(&verify);
+        self.search_segment_fuzzy_in(
+            rtxn,
+            &def,
+            query,
+            max_distance,
+            limit,
+            allowed.as_ref(),
+            verify,
+        )
     }
 
-    // ----------------------------- write -----------------------------
-
-    /// Inserts a document in its own transaction (handy in tests / without the daemon).
     pub fn insert_one(&self, doc: Value) -> Result<String> {
         let mut wtxn = self.write_txn()?;
         let id = self.insert_one_txn(&mut wtxn, doc)?;
@@ -9208,24 +7903,6 @@ impl<'e> Collection<'e> {
     pub fn verify_in(&self, rtxn: &RoTxn<'_>) -> Result<CollectionVerification> {
         let defs = self.index_defs(rtxn)?;
         let search_defs = self.search_index_defs_in(rtxn)?;
-        let text_indexes: Vec<(String, String, f64)> = search_defs
-            .iter()
-            .filter(|def| def.kind == SearchKind::Text && def.engine != SearchEngine::Segment)
-            .flat_map(|def| {
-                def.fields
-                    .iter()
-                    .map(|field| (def.name.clone(), field.path.clone(), field.weight))
-            })
-            .collect();
-        let fuzzy_indexes: Vec<(String, String)> = search_defs
-            .iter()
-            .filter(|def| def.kind == SearchKind::Fuzzy && def.engine != SearchEngine::Segment)
-            .flat_map(|def| {
-                def.fields
-                    .iter()
-                    .map(|field| (def.name.clone(), field.path.clone()))
-            })
-            .collect();
         let text_names: Vec<String> = search_defs
             .iter()
             .filter(|def| def.kind == SearchKind::Text)
@@ -9241,10 +7918,6 @@ impl<'e> Collection<'e> {
         let mut documents = 0u64;
         let mut bytes = 0u64;
         let mut expected_index = vec![0u64; defs.len()];
-        let mut expected_postings = vec![0u64; text_indexes.len()];
-        let mut expected_lengths = vec![0u64; text_indexes.len()];
-        let mut expected_tokens = vec![0u64; text_indexes.len()];
-        let mut expected_trigrams = vec![0u64; fuzzy_indexes.len()];
         let mut expected_vectors = vec![0u64; vector_fields.len()];
 
         for item in self.db.iter(rtxn)? {
@@ -9304,88 +7977,6 @@ impl<'e> Collection<'e> {
                         )));
                     }
                     expected_index[i] += 1;
-                }
-            }
-
-            for (i, (index_name, field, _weight)) in text_indexes.iter().enumerate() {
-                let Some(text) = index::field_value(&doc, field).and_then(search::field_text)
-                else {
-                    continue;
-                };
-                let tokens = search::tokenize(&text);
-                let postings = self.text_postings(rtxn, index_name, field)?.ok_or_else(|| {
-                    Error::Query(format!(
-                        "text index `{index_name}` field `{field}` on `{}` is defined but its postings are missing",
-                        self.name
-                    ))
-                })?;
-                let lengths = self.text_len_db(rtxn, index_name, field)?.ok_or_else(|| {
-                    Error::Query(format!(
-                        "text index `{index_name}` field `{field}` on `{}` is defined but its lengths are missing",
-                        self.name
-                    ))
-                })?;
-                for (term, tf) in search::term_freqs(&tokens) {
-                    let key = search::postings_key(&term, id);
-                    let actual = postings.get(rtxn, &key)?.ok_or_else(|| {
-                        Error::Query(format!(
-                            "text index `{field}` on `{}` is missing term `{term}` for `{id}`",
-                            self.name
-                        ))
-                    })?;
-                    if search::text_posting_tf(actual) != Some(tf) {
-                        return Err(Error::Query(format!(
-                            "text index `{field}` on `{}` has a stale term `{term}` for `{id}`",
-                            self.name
-                        )));
-                    }
-                    if let Some(stored_dl) = search::text_posting_dl(actual) {
-                        if stored_dl != tokens.len() as u32 {
-                            return Err(Error::Query(format!(
-                                "text index `{field}` on `{}` has a stale length in term `{term}` for `{id}`",
-                                self.name
-                            )));
-                        }
-                    }
-                    expected_postings[i] += 1;
-                }
-                let actual = lengths.get(rtxn, key)?.ok_or_else(|| {
-                    Error::Query(format!(
-                        "text index `{field}` on `{}` is missing length for `{id}`",
-                        self.name
-                    ))
-                })?;
-                let expected_len = tokens.len() as u32;
-                if actual != expected_len.to_le_bytes().as_slice() {
-                    return Err(Error::Query(format!(
-                        "text index `{field}` on `{}` has a stale length for `{id}`",
-                        self.name
-                    )));
-                }
-                expected_lengths[i] += 1;
-                expected_tokens[i] += expected_len as u64;
-            }
-
-            for (i, (index_name, field)) in fuzzy_indexes.iter().enumerate() {
-                let Some(text) = index::field_value(&doc, field).and_then(search::field_text)
-                else {
-                    continue;
-                };
-                let db = self.fuzzy_db(rtxn, index_name, field)?.ok_or_else(|| {
-                    Error::Query(format!(
-                        "fuzzy index `{index_name}` field `{field}` on `{}` is defined but its database is missing",
-                        self.name
-                    ))
-                })?;
-                for gram in search::trigrams(&text) {
-                    let key = search::postings_key(&gram, id);
-                    if db.get(rtxn, &key)?.is_none() {
-                        return Err(Error::Query(format!(
-                            "fuzzy index `{field}` on `{}` is missing trigram `{gram}` for `{id}`",
-                            self.name
-                        )));
-                    }
-                    expected_trigrams[i] += 1;
                 }
             }
 
@@ -9449,67 +8040,6 @@ impl<'e> Collection<'e> {
             });
         }
 
-        for (i, (index_name, field, _weight)) in text_indexes.iter().enumerate() {
-            let postings = self.text_postings(rtxn, index_name, field)?.ok_or_else(|| {
-                Error::Query(format!(
-                    "text index `{index_name}` field `{field}` on `{}` is defined but its postings are missing",
-                    self.name
-                ))
-            })?;
-            let lengths = self.text_len_db(rtxn, index_name, field)?.ok_or_else(|| {
-                Error::Query(format!(
-                    "text index `{index_name}` field `{field}` on `{}` is defined but its lengths are missing",
-                    self.name
-                ))
-            })?;
-            let postings_entries = postings.stat(rtxn)?.entries as u64;
-            if postings_entries != expected_postings[i] {
-                return Err(Error::Query(format!(
-                    "text index `{field}` on `{}` has {postings_entries} postings, expected {}",
-                    self.name, expected_postings[i]
-                )));
-            }
-            let length_entries = lengths.stat(rtxn)?.entries as u64;
-            if length_entries != expected_lengths[i] {
-                return Err(Error::Query(format!(
-                    "text index `{field}` on `{}` has {length_entries} lengths, expected {}",
-                    self.name, expected_lengths[i]
-                )));
-            }
-            let total_key = search::text_total_key(&self.name, index_name, field);
-            let total = match self.meta.get(rtxn, total_key.as_bytes())? {
-                Some(raw) => search::read_u64(raw).ok_or_else(|| {
-                    Error::Query(format!(
-                        "text index `{field}` on `{}` has an invalid total length",
-                        self.name
-                    ))
-                })?,
-                None => 0,
-            };
-            if total != expected_tokens[i] {
-                return Err(Error::Query(format!(
-                    "text index `{field}` on `{}` has total length {total}, expected {}",
-                    self.name, expected_tokens[i]
-                )));
-            }
-        }
-
-        for (i, (index_name, field)) in fuzzy_indexes.iter().enumerate() {
-            let db = self.fuzzy_db(rtxn, index_name, field)?.ok_or_else(|| {
-                Error::Query(format!(
-                    "fuzzy index `{index_name}` field `{field}` on `{}` is defined but its database is missing",
-                    self.name
-                ))
-            })?;
-            let entries = db.stat(rtxn)?.entries as u64;
-            if entries != expected_trigrams[i] {
-                return Err(Error::Query(format!(
-                    "fuzzy index `{field}` on `{}` has {entries} trigrams, expected {}",
-                    self.name, expected_trigrams[i]
-                )));
-            }
-        }
-
         for (i, def) in vector_fields.iter().enumerate() {
             let db = self.vector_db(rtxn, &def.field)?.ok_or_else(|| {
                 Error::Query(format!(
@@ -9527,10 +8057,7 @@ impl<'e> Collection<'e> {
         }
 
         let root = self.segment_root()?;
-        for def in search_defs
-            .iter()
-            .filter(|def| def.engine == SearchEngine::Segment)
-        {
+        for def in search_defs.iter() {
             match def.kind {
                 SearchKind::Text => {
                     let Some(manifest) = self.segment_manifest_in(rtxn, &def.name)? else {
@@ -12745,101 +11272,6 @@ mod tests {
     }
 
     #[test]
-    fn text_df_metadata_tracks_inserts_and_updates() {
-        let (_dir, store) = store();
-        let c = store.collection("text_df").unwrap();
-        c.insert_one(json!({"_id": "a", "body": "alpha beta"}))
-            .unwrap();
-        c.insert_one(json!({"_id": "b", "body": "alpha gamma"}))
-            .unwrap();
-        c.create_text_index("body").unwrap();
-
-        let rtxn = c.read_txn().unwrap();
-        let df = c.text_df_db(&rtxn, "body", "body").unwrap().unwrap();
-        assert_eq!(
-            df.get(&rtxn, b"alpha".as_slice())
-                .unwrap()
-                .and_then(search::read_u64),
-            Some(2)
-        );
-        drop(rtxn);
-
-        c.insert_one(json!({"_id": "c", "body": "alpha delta"}))
-            .unwrap();
-        c.update(
-            &json!({"_id": "b"}),
-            &json!({"$set": {"body": "beta"}}),
-            false,
-        )
-        .unwrap();
-
-        let rtxn = c.read_txn().unwrap();
-        let df = c.text_df_db(&rtxn, "body", "body").unwrap().unwrap();
-        assert_eq!(
-            df.get(&rtxn, b"alpha".as_slice())
-                .unwrap()
-                .and_then(search::read_u64),
-            Some(2)
-        );
-    }
-
-    #[test]
-    fn text_search_multi_term_streams_and_prefilters_equality() {
-        let (_dir, store) = store();
-        let c = store.collection("docs").unwrap();
-        for doc in [
-            json!({"_id": "a", "body": "rust database engine", "tag": "db"}),
-            json!({"_id": "b", "body": "rust async runtime", "tag": "db"}),
-            json!({"_id": "c", "body": "database storage engine", "tag": "db"}),
-            json!({"_id": "d", "body": "rust database engine", "tag": "web"}),
-            json!({"_id": "e", "body": "python web framework", "tag": "web"}),
-        ] {
-            c.insert_one(doc).unwrap();
-        }
-        c.create_text_index("body").unwrap();
-        c.create_index("tag", false).unwrap();
-
-        let ids = |docs: Vec<Value>| {
-            let mut ids: Vec<String> = docs
-                .into_iter()
-                .map(|doc| doc["_id"].as_str().unwrap().to_string())
-                .collect();
-            ids.sort();
-            ids
-        };
-
-        assert_eq!(
-            ids(c
-                .search("body", "rust database", &json!({}), 0, Some(10))
-                .unwrap()),
-            vec!["a", "b", "c", "d"]
-        );
-        assert_eq!(
-            ids(c
-                .search("body", "rust database", &json!({"tag": "db"}), 0, Some(10))
-                .unwrap()),
-            vec!["a", "b", "c"]
-        );
-        assert_eq!(
-            ids(c
-                .search("body", "rust database", &json!({"tag": "web"}), 0, Some(10))
-                .unwrap()),
-            vec!["d"]
-        );
-        assert_eq!(
-            ids(c
-                .search("body", "rust", &json!({"_id": "a"}), 0, Some(10))
-                .unwrap()),
-            vec!["a"]
-        );
-
-        let page = c
-            .search("body", "rust database", &json!({}), 1, Some(2))
-            .unwrap();
-        assert_eq!(page.len(), 2);
-    }
-
-    #[test]
     fn parallel_text_and_vector_search_return_exact_results() {
         let (_dir, store) = store();
         let c = store.collection("parallel_search").unwrap();
@@ -12868,90 +11300,6 @@ mod tests {
             .unwrap();
         assert_eq!(hits.len(), 5);
         assert_eq!(hits[0]["_id"], "d299");
-    }
-
-    #[test]
-    fn search_index_defs_support_weighted_fields_and_mongo_or() {
-        let (_dir, store) = store();
-        let c = store.collection("search_defs").unwrap();
-        for doc in [
-            json!({"_id": "1", "n": 1, "title": "Alpha beta", "body": "gamma delta"}),
-            json!({"_id": "2", "n": 2, "title": "Alpha", "body": "beta gamma"}),
-            json!({"_id": "3", "n": 3, "title": "Delta", "body": "epsilon"}),
-            json!({"_id": "4", "n": 4, "title": "alpha beta gamma", "body": "delta"}),
-        ] {
-            c.insert_one(doc).unwrap();
-        }
-        c.create_search_index(&SearchIndexDef {
-            name: "docs_text".into(),
-            kind: SearchKind::Text,
-            fields: vec![
-                search::SearchField {
-                    path: "title".into(),
-                    weight: 2.0,
-                },
-                search::SearchField {
-                    path: "body".into(),
-                    weight: 1.0,
-                },
-            ],
-            engine: search::SearchEngine::Lmdb,
-        })
-        .unwrap();
-        let ids = |docs: Vec<Value>| {
-            let mut ids: Vec<String> = docs
-                .into_iter()
-                .map(|doc| doc["_id"].as_str().unwrap().to_string())
-                .collect();
-            ids.sort();
-            ids
-        };
-        assert_eq!(
-            ids(c
-                .search_text_index("docs_text", "\"alpha beta\"", &json!({}), 0, None)
-                .unwrap()),
-            vec!["1", "4"]
-        );
-        assert_eq!(
-            ids(c
-                .search_text_index("docs_text", "delta -epsilon", &json!({}), 0, None)
-                .unwrap()),
-            vec!["1", "4"]
-        );
-        assert_eq!(
-            ids(c
-                .search_text_index("docs_text", "alpha gamma", &json!({}), 0, None)
-                .unwrap()),
-            vec!["1", "2", "4"]
-        );
-        {
-            let rtxn = c.env.read_txn().unwrap();
-            let verify = c.verify_in(&rtxn).unwrap();
-            assert_eq!(verify.text_indexes, vec!["docs_text".to_string()]);
-        }
-        let report = c.reindex().unwrap();
-        assert_eq!(report.text, vec!["docs_text".to_string()]);
-        assert_eq!(
-            ids(c
-                .search_text_index("docs_text", "alpha gamma", &json!({}), 0, None)
-                .unwrap()),
-            vec!["1", "2", "4"]
-        );
-        {
-            let rtxn = c.env.read_txn().unwrap();
-            let defs = c.search_index_defs_in(&rtxn).unwrap();
-            assert_eq!(defs.len(), 1);
-            assert_eq!(defs[0].name, "docs_text");
-            assert_eq!(defs[0].fields.len(), 2);
-            assert_eq!(defs[0].fields[0].path, "title");
-            assert_eq!(defs[0].fields[0].weight, 2.0);
-            assert_eq!(defs[0].fields[1].path, "body");
-            assert_eq!(defs[0].fields[1].weight, 1.0);
-        }
-        c.drop_search_index(SearchKind::Text, "docs_text").unwrap();
-        assert!(c
-            .search_text_index("docs_text", "alpha", &json!({}), 0, None)
-            .is_err());
     }
 
     #[test]
