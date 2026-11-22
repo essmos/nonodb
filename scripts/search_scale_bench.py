@@ -7,6 +7,9 @@ indexed ``cat`` field.
     NONODB_SOCK=/tmp/nonodb.sock \
       python3 scripts/search_scale_bench.py --docs 10000000
 
+Start the daemon with ``NONODB_CACHE_TTL=0``. This script repeats the same
+query, so the default read cache would otherwise report cache-hit latency.
+
 Use ``--queries-only`` to reuse an existing collection after the indexes have
 already been built.
 """

@@ -29,7 +29,13 @@ run. The 100M dense comparator in the 1B table comes from an older ext4 host.
   exact searches grow with the number of documents or postings. The IVF sidecar
   reduces but does not eliminate that growth.
 - Search timings use `limit=10` and `NONODB_CACHE_TTL=0` unless noted.
-- Results from different data sets are not directly comparable.
+  The daemon caches identical reads for 5 seconds by default; repeatedly timing
+  the same query with the cache enabled measures a cache hit, not search.
+- Results from different data sets and different search backends are not
+  directly comparable. The synthetic `search1m`/`search10m` BM25 and fuzzy
+  indexes below were built before the segment backend became the default, so
+  those rows are legacy LMDB baselines. Current segment results are in the
+  MS MARCO and segment sections.
 
 ---
 
@@ -303,7 +309,13 @@ all trigrams and the original string. This avoids merging every posting list
 for long queries and brings the 808k full-query corpus from p50 **144.51 ms** to
 **12.07 ms**.
 
-### BM25
+### Legacy LMDB BM25
+
+These `search1m`/`search10m` indexes predate the default segment backend. They
+are kept as a before/after baseline; do not compare them with the segment
+results above. The current segment text backend is benchmarked in
+[Real-text check](#real-text-check-ms-marco) and
+[Exact live BM25 statistics](#exact-live-bm25-statistics-through-the-daemon).
 
 | Data set | Index build | One term | Two terms | Three terms |
 |---|---:|---:|---:|---:|
@@ -317,7 +329,11 @@ New text indexes also store per-term document frequency (`df`), so multi-term
 queries no longer scan every posting list twice to compute `df`. Existing
 indexes fall back to the old scan until they are rebuilt.
 
-### Fuzzy search
+### Legacy LMDB fuzzy search
+
+These rows also use the pre-segment LMDB fuzzy indexes. Segment fuzzy results
+are in [Segment fuzzy](#segment-fuzzy); they use a different index and query
+corpus.
 
 | Data set | Index build | Distance 1 | Distance 2 |
 |---|---:|---:|---:|
@@ -330,7 +346,8 @@ is down from about **17.4 s** before the candidate merge change.
 
 ### Exact vector search
 
-Both data sets use 16-dimensional vectors and `limit=10`.
+This is the exact LMDB scan path on the synthetic collections, before the ANN
+sidecar. Both data sets use 16-dimensional vectors and `limit=10`.
 
 | Operation | 1M p50 / p95 | 10M p50 / p95 |
 |---|---:|---:|
@@ -464,7 +481,7 @@ D=$PWD/.bench
 S=$D/nonodb.sock
 rm -rf "$D"
 mkdir -p "$D/data"
-NONODB_DATA=$D/data NONODB_SOCK=$S ./target/release/nonodb-daemon &
+NONODB_DATA=$D/data NONODB_SOCK=$S NONODB_CACHE_TTL=0   ./target/release/nonodb-daemon &
 ```
 
 Then run the relevant script:
