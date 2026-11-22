@@ -483,6 +483,35 @@ def main() -> int:
             ),
         )
         check_both(
+            "unknown operator in $lookup pipeline rejected",
+            command_error_code(
+                lambda db: list(
+                    db.items.aggregate(
+                        [
+                            {
+                                "$lookup": {
+                                    "from": "text_items",
+                                    "let": {"n": "$n"},
+                                    "pipeline": [{"$match": {"n": {"$bogusOp": "$$n"}}}],
+                                    "as": "joined",
+                                }
+                            }
+                        ]
+                    )
+                )
+            ),
+        )
+        check_both(
+            "unknown operator in $facet pipeline rejected",
+            command_error_code(
+                lambda db: list(
+                    db.items.aggregate(
+                        [{"$facet": {"a": [{"$match": {"n": {"$bogusOp": 1}}}]}}]
+                    )
+                )
+            ),
+        )
+        check_both(
             "unknown command error",
             command_error_code(lambda db: db.command({"definitelyUnknownCommand": 1})),
         )

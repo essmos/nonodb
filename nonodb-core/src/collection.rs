@@ -5599,11 +5599,7 @@ impl<'e> Collection<'e> {
         deadline: Option<Instant>,
     ) -> Result<Vec<Value>> {
         check_find_deadline(deadline)?;
-        for stage in pipeline {
-            if let Some(filter) = stage.as_object().and_then(|o| o.get("$match")) {
-                crate::query::validate::validate_filter(filter)?;
-            }
-        }
+        aggregate::validate_pipeline(pipeline)?;
         let plan = aggregate::pushdown(pipeline)?;
         check_find_deadline(deadline)?;
 

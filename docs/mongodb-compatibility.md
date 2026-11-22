@@ -361,7 +361,9 @@ allowed. Other BSON types are not accepted as `_id`.
 
 Operators outside the tables above are rejected with `BadValue` (code 2) instead
 of matching nothing, so a filter typo such as `{"email": {"$regx": "..."}}` fails
-the query. This also covers `$nor`/`$not`: a silently-false predicate would
+the query. Validation follows pipelines embedded in `$facet`, `$lookup`,
+`$unionWith`, `$merge` `whenMatched`, and `$graphLookup` `filter`, so a typo in a
+sub-pipeline is reported the same way. This also covers `$nor`/`$not`: a silently-false predicate would
 otherwise be negated into every document, and `delete`/`update` would then touch
 the whole collection. MongoDB returns the same code for unknown field and
 top-level operators; for an unknown `$expr` operator MongoDB uses
