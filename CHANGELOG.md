@@ -11,7 +11,11 @@ Full release notes: https://github.com/essmos/nonodb/releases
 - Let `NONODB_VECTOR_ANN_PROBE` override the probe count at query time without
   rebuilding the ANN sidecar.
 - Add `--with-search-sidecars` to `backup`/`backup-all`, and restore those files
-  automatically so large segment and ANN indexes do not need a rebuild.
+  automatically so large segment and ANN indexes do not need a rebuild. Scheduled
+  daemon backup jobs can opt in with `include_search_sidecars`; local, S3, and
+  restic destinations include the derived files, while age-encrypted and
+  collection-filtered jobs reject the option because sidecars are not covered
+  by payload encryption.
 - Make deep verification open and check segment-backed text and fuzzy indexes
   instead of reporting their LMDB postings as missing.
 - Transfer search segment and vector ANN sidecars during replication snapshot

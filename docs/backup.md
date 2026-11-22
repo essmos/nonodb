@@ -202,6 +202,18 @@ age encryption, so encrypted compressed copies use `data.mdb.gz.age`. Restic
 compresses its own repository data, so the compression field applies only to
 native local/S3 jobs.
 
+Set `include_search_sidecars` to `true` to copy immutable segment text/fuzzy
+and vector ANN sidecars next to `data.mdb`. This avoids rebuilding large search
+indexes after a local restore; `nonodb-cli restore` copies the sidecar
+directories automatically when present. Local destinations get `search/` and
+`vector-ann/` directories, S3 destinations receive the same relative object
+keys, and restic stores them in the repository. The option is intentionally
+incompatible with `exclude_collections` and age encryption: sidecars are
+derived from document data and are not encrypted by the LMDB payload
+encryption. Use restic when encrypted sidecar backups are required. A sidecar
+may be missing if compaction removes it after the LMDB snapshot; the restored
+index then falls back to a rebuild.
+
 The **Databases** field is a multi-select list of databases known to the daemon.
 One job can back up several databases in one run. **Excluded collections** are
 removed from every selected database's copy only. The live databases are not

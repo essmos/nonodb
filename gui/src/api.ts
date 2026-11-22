@@ -453,6 +453,7 @@ export type BackupJob = {
   verify: boolean;
   compression?: 'none' | 'gzip';
   exclude_collections?: string[];
+  include_search_sidecars?: boolean;
 };
 
 export type BackupJobState = {

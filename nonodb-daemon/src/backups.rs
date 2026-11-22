@@ -63,6 +63,10 @@ pub struct BackupJob {
     /// Compression for native copies. Restic manages its own compression.
     #[serde(default)]
     pub compression: Compression,
+    /// Copy immutable search segment and vector ANN sidecars next to the
+    /// LMDB snapshot. This keeps large indexes from being rebuilt on restore.
+    #[serde(default)]
+    pub include_search_sidecars: bool,
     /// Collections removed from the backup copy. The live database is not
     /// modified.
     #[serde(default)]
@@ -343,6 +347,20 @@ fn validate_config(config: &BackupConfig) -> Result<(), String> {
             if name.is_empty() || name.len() > 200 || name.contains('\0') {
                 return Err(format!(
                     "backup job `{}` has an invalid excluded collection name",
+                    job.id
+                ));
+            }
+        }
+        if job.include_search_sidecars {
+            if !job.exclude_collections.is_empty() {
+                return Err(format!(
+                    "backup job `{}` cannot include search sidecars while excluding collections",
+                    job.id
+                ));
+            }
+            if job.encryption.is_some() {
+                return Err(format!(
+                    "backup job `{}` cannot include unencrypted search sidecars with age encryption",
                     job.id
                 ));
             }
@@ -732,6 +750,16 @@ impl BackupManager {
                 .map_err(|e| format!("backup filter task: {e}"))??;
         }
 
+        let sidecar_files = if job.include_search_sidecars {
+            let source = self.databases.root().join(database);
+            let target = staging.clone();
+            tokio::task::spawn_blocking(move || copy_search_sidecars(&source, &target))
+                .await
+                .map_err(|e| format!("backup sidecar task: {e}"))??
+        } else {
+            Vec::new()
+        };
+
         if let Destination::Restic {
             repository,
             password_file,
@@ -751,6 +779,10 @@ impl BackupManager {
             let keep_last = job.keep_last;
             let verify_repo = job.verify;
             let data_file = plain.clone();
+            let restic_sidecars: Vec<PathBuf> = sidecar_files
+                .iter()
+                .map(|relative| staging.join(relative))
+                .collect();
             let mut info_manifest =
                 BackupManifest::from_backup(&staging, &database).map_err(|e| e.to_string())?;
             info_manifest.job_id = job.id.clone();
@@ -768,6 +800,7 @@ impl BackupManager {
                     verify_repo,
                     &data_file,
                     &info_file,
+                    &restic_sidecars,
                 )
             })
             .await
@@ -838,6 +871,12 @@ impl BackupManager {
                     std::fs::copy(staging.join(name), out.join(name))
                         .map_err(|e| format!("copy backup to {}: {e}", out.display()))?;
                 }
+                for name in ["search", "vector-ann"] {
+                    let from = staging.join(name);
+                    if from.is_dir() {
+                        copy_tree(&from, &out.join(name))?;
+                    }
+                }
                 out.display().to_string()
             }
             Destination::Restic { .. } => unreachable!("restic handled before manifest"),
@@ -891,6 +930,20 @@ impl BackupManager {
                     session_token_env.as_deref(),
                 )
                 .await?;
+                for relative in &sidecar_files {
+                    let relative = relative.to_string_lossy().replace('\\', "/");
+                    s3_put(
+                        endpoint,
+                        bucket,
+                        region,
+                        &path_join(&key_prefix, &relative),
+                        &staging.join(&relative),
+                        access_key_env,
+                        secret_key_env,
+                        session_token_env.as_deref(),
+                    )
+                    .await?;
+                }
                 format!("s3://{bucket}/{key_prefix}")
             }
         };
@@ -916,6 +969,63 @@ impl BackupManager {
         }
         Ok(())
     }
+}
+
+/// Copies immutable derived search files into the backup staging directory.
+/// Returns relative paths for upload destinations.
+fn copy_search_sidecars(source: &Path, target: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut files = Vec::new();
+    for name in ["search", "vector-ann"] {
+        let from = source.join(name);
+        if !from.is_dir() {
+            continue;
+        }
+        let to = target.join(name);
+        copy_tree_rel(&from, &to, Path::new(name), &mut files)?;
+    }
+    Ok(files)
+}
+
+fn copy_tree_rel(
+    source: &Path,
+    target: &Path,
+    relative: &Path,
+    files: &mut Vec<PathBuf>,
+) -> Result<(), String> {
+    std::fs::create_dir_all(target).map_err(|e| e.to_string())?;
+    for entry in std::fs::read_dir(source).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let from = entry.path();
+        let name = entry.file_name();
+        let to = target.join(&name);
+        let child = relative.join(&name);
+        let ty = entry.file_type().map_err(|e| e.to_string())?;
+        if ty.is_dir() {
+            copy_tree_rel(&from, &to, &child, files)?;
+        } else if ty.is_file() {
+            std::fs::copy(&from, &to)
+                .map_err(|e| format!("copy sidecar {}: {e}", from.display()))?;
+            files.push(child);
+        }
+    }
+    Ok(())
+}
+
+fn copy_tree(source: &Path, target: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(target).map_err(|e| e.to_string())?;
+    for entry in std::fs::read_dir(source).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let from = entry.path();
+        let to = target.join(entry.file_name());
+        let ty = entry.file_type().map_err(|e| e.to_string())?;
+        if ty.is_dir() {
+            copy_tree(&from, &to)?;
+        } else if ty.is_file() {
+            std::fs::copy(&from, &to)
+                .map_err(|e| format!("copy sidecar {}: {e}", from.display()))?;
+        }
+    }
+    Ok(())
 }
 
 fn filter_excluded(staging: &Path, excluded: &[String]) -> Result<(), String> {
@@ -962,6 +1072,7 @@ fn restic_backup(
     verify_repo: bool,
     data_file: &Path,
     info_file: &Path,
+    extra_files: &[PathBuf],
 ) -> Result<(), String> {
     if !Path::new(password_file).is_file() {
         return Err(format!("missing restic password file {password_file}"));
@@ -1003,10 +1114,12 @@ fn restic_backup(
         })
         .collect();
     let tag = format!("nonodb-job-{job_id}-{safe_database}");
-    let backup = base()
-        .arg("backup")
-        .arg(data_file)
-        .arg(info_file)
+    let mut backup_command = base();
+    backup_command.arg("backup").arg(data_file).arg(info_file);
+    for path in extra_files {
+        backup_command.arg(path);
+    }
+    let backup = backup_command
         .arg("--tag")
         .arg("nonodb")
         .arg("--tag")
@@ -1205,4 +1318,75 @@ async fn s3_put(
         return Err(format!("S3 upload failed: HTTP {status}: {body}"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn job(include: bool) -> BackupJob {
+        BackupJob {
+            id: "test".into(),
+            database: "default".into(),
+            databases: vec!["default".into()],
+            enabled: true,
+            every_minutes: 60,
+            destination: Destination::Local {
+                path: "/tmp/nonodb-test-backups".into(),
+            },
+            encryption: None,
+            keep_last: 1,
+            verify: false,
+            compression: Compression::None,
+            include_search_sidecars: include,
+            exclude_collections: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn search_sidecars_copy_with_relative_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        let target = dir.path().join("target");
+        std::fs::create_dir_all(source.join("search").join("abc")).unwrap();
+        std::fs::create_dir_all(source.join("vector-ann").join("def")).unwrap();
+        std::fs::write(source.join("search/abc/seg-000000.seg"), b"seg").unwrap();
+        std::fs::write(source.join("vector-ann/def/ann-000000.ivf"), b"ivf").unwrap();
+        let files = copy_search_sidecars(&source, &target).unwrap();
+        assert_eq!(
+            files,
+            vec![
+                PathBuf::from("search/abc/seg-000000.seg"),
+                PathBuf::from("vector-ann/def/ann-000000.ivf"),
+            ]
+        );
+        assert_eq!(std::fs::read(target.join(&files[0])).unwrap(), b"seg");
+    }
+
+    #[test]
+    fn sidecar_backups_reject_exclusions_and_age_encryption() {
+        let mut with_excluded = job(true);
+        with_excluded.exclude_collections = vec!["private".into()];
+        assert!(validate_config(&BackupConfig {
+            version: CONFIG_VERSION,
+            jobs: vec![with_excluded],
+        })
+        .is_err());
+
+        let mut with_age = job(true);
+        with_age.encryption = Some(Encryption::Age {
+            recipient_file: "/tmp/recipient.txt".into(),
+        });
+        assert!(validate_config(&BackupConfig {
+            version: CONFIG_VERSION,
+            jobs: vec![with_age],
+        })
+        .is_err());
+
+        assert!(validate_config(&BackupConfig {
+            version: CONFIG_VERSION,
+            jobs: vec![job(true)],
+        })
+        .is_ok());
+    }
 }
