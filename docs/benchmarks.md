@@ -329,23 +329,24 @@ Elasticsearch reached 0.9781 at 5.41 ms (`num_candidates=128`).
 
 Load and build times were: NonoDB 500k docs in 205 s plus a 15.2 s exact vector
 index and 40 s for the ANN sidecar; Qdrant 114 s plus 15 s for HNSW
-readiness; Elasticsearch 852 s including force-merge. On disk, NonoDB used
-8.4 GB (documents, exact index, and the 741 MB ANN sidecar), Qdrant 854 MB
-without payload text, and Elasticsearch 3.7 GB for body plus vector.
+readiness; Elasticsearch 852 s including force-merge. On disk, the NonoDB ANN
+sidecar is **741 MB**; Qdrant used 854 MB (vectors only, without payload text),
+and Elasticsearch 3.7 GB for body plus vector.
 
 #### RAM and disk
 
 | Engine | RAM (current) | Peak RAM | Disk |
 |---|---:|---:|---:|
-| NonoDB | 1.4 GB | 1.4 GB | 8.4 GB |
+| NonoDB | 1.4 GB | 1.4 GB | 741 MB |
 | Qdrant | 1.2 GB | 1.8 GB | 854 MB |
 | Elasticsearch | 3.9 GB | 7.6 GB | 3.7 GB |
 
 Qdrant's figure is the container cgroup value and includes charged page cache;
-its RSS is about 440 MB. NonoDB's 8.4 GB includes the LMDB documents, the exact
-vector index, and a 741 MB ANN sidecar. Qdrant stored vectors without payload
-text, while NonoDB and Elasticsearch also stored the passage text. Elasticsearch
-peak memory covers bulk indexing and force-merge.
+its RSS is about 440 MB. NonoDB's disk figure is the 741 MB ANN sidecar; the
+LMDB documents and exact vector index are outside this vector-index comparison.
+Qdrant stored vectors without payload text, while NonoDB and Elasticsearch also
+stored the passage text. Elasticsearch peak memory covers bulk indexing and
+force-merge.
 
 NonoDB's practical advantage is not raw ANN latency but that vector, BM25, and
 fuzzy search live in the same collection and the same single-writer database.
