@@ -349,7 +349,7 @@ allowed. Other BSON types are not accepted as `_id`.
 | `$regex` / `$options` | 🟡 | `i`, `m`, `s`, `x`, `u`; not every PCRE feature |
 | `$type` | ✅ | Common BSON scalar type names and numeric codes |
 | `$mod`, bitwise operators | ✅ | `$bitsAllClear`, `$bitsAllSet`, `$bitsAnyClear`, `$bitsAnySet` |
-| `$expr` | 🟡 | Uses the aggregation expression evaluator; errors are treated as no-match |
+| `$expr` | 🟡 | Uses the aggregation expression evaluator; an unknown expression operator is rejected with `BadValue`, while evaluation errors on a document are treated as no-match |
 | `$jsonSchema` | 🟡 | Common keywords and combinators; not every JSON Schema draft feature |
 | `$and`, `$or`, `$nor`, `$not` | ✅ | |
 | `$where` | ❌ | No JavaScript execution |
@@ -358,6 +358,14 @@ allowed. Other BSON types are not accepted as `_id`.
 | `$rand` | ❌ | |
 | Collation | ❌ | No per-query or per-index collation |
 | BSON regex value filters | ✅ | Direct driver regex literals and `$in` operands; stored regex values are rejected with `BadValue` (code 2) |
+
+Operators outside the tables above are rejected with `BadValue` (code 2) instead
+of matching nothing, so a filter typo such as `{"email": {"$regx": "..."}}` fails
+the query. This also covers `$nor`/`$not`: a silently-false predicate would
+otherwise be negated into every document, and `delete`/`update` would then touch
+the whole collection. MongoDB returns the same code for unknown field and
+top-level operators; for an unknown `$expr` operator MongoDB uses
+`InvalidPipelineOperator` (168) where NonoDB reports `BadValue` (2).
 
 ## Projection
 
@@ -531,8 +539,10 @@ A migration from MongoDB to NonoDB should check these items first:
    a plain unique index has the same behavior, including explicit `null`
    (see [Unique indexes without `sparse`](#unique-indexes-without-sparse)).
 8. **Stored BSON regex values** — read filters accept driver regex literals, but regex values cannot be stored; keep them out of documents or rewrite them as strings plus `$regex` filters.
-9. **Unsupported aggregation expressions/stages** — rewrite with supported
-   stages or precompute outside the database.
+9. **Unsupported aggregation expressions/stages and filter operators** — rewrite
+   with supported forms or precompute outside the database. Unknown operators are
+   rejected when the query is validated, so a typo fails instead of returning no
+   documents.
 10. **Wire-protocol tooling** — `mongosh`, BI connectors, and monitoring
     integrations that need more than basic insert/find must use another
     interface until the wire listener grows.

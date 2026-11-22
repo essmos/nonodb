@@ -467,6 +467,22 @@ def main() -> int:
             ),
         )
         check_both(
+            "unknown field operator rejected",
+            command_error_code(
+                lambda db: list(db.items.find({"n": {"$bogusOp": 1}}))
+            ),
+        )
+        check_both(
+            "unknown top level operator rejected",
+            command_error_code(lambda db: list(db.items.find({"$bogus": []}))),
+        )
+        check_both(
+            "unknown operator inside $nor rejected",
+            command_error_code(
+                lambda db: list(db.items.find({"$nor": [{"n": {"$bogusOp": 1}}]}))
+            ),
+        )
+        check_both(
             "unknown command error",
             command_error_code(lambda db: db.command({"definitelyUnknownCommand": 1})),
         )

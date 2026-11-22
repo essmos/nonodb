@@ -3846,6 +3846,21 @@ fn eval_operator(
     }
 }
 
+/// Reports whether `eval_operator` implements `op`.
+///
+/// Filter validation uses this to reject unknown operators inside `$expr` before a
+/// scan instead of letting them evaluate to `false`. The dispatch is probed with an
+/// empty argument list, so unknown operators are reported before their arguments
+/// are read; known operators may fail on arity, which still proves they exist.
+pub(crate) fn expression_operator_supported(op: &str) -> bool {
+    let mut obj = Map::new();
+    obj.insert(op.to_string(), Value::Array(Vec::new()));
+    !matches!(
+        eval_operator(&Value::Object(Map::new()), &obj, &BTreeMap::new()),
+        Err(Error::Query(message)) if message.starts_with("unsupported aggregation expression")
+    )
+}
+
 fn date_millis(value: &Value) -> Result<i64> {
     date::parse_value(value)
         .ok_or_else(|| Error::InvalidDate("expected an Extended JSON date".into()))
