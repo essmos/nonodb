@@ -49,7 +49,9 @@ fn select_star_supports_where_order_limit_offset() {
     )
     .unwrap();
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0]["_id"], "b");
+    // Existing SQL sort semantics follow the core sorting order: missing/null
+    // values sort first ascending, so the descending order is b, a, then e.
+    assert_eq!(rows[0]["_id"], "a");
 }
 
 #[test]

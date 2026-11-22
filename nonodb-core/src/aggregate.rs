@@ -3101,8 +3101,8 @@ pub(crate) fn compare_value(a: &Value, b: &Value) -> Ordering {
         (Value::String(x), Value::String(y)) => x.cmp(y),
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
         (Value::Null, Value::Null) => Ordering::Equal,
-        (Value::Null, _) => Ordering::Greater,
-        (_, Value::Null) => Ordering::Less,
+        (Value::Null, _) => Ordering::Less,
+        (_, Value::Null) => Ordering::Greater,
         _ => date::cmp(a, b).unwrap_or(Ordering::Equal),
     }
 }

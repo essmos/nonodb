@@ -1630,10 +1630,114 @@ impl<'e> Collection<'e> {
         ))
     }
 
-    /// Returns one index plan per top-level `$or` branch, but only when every
-    /// branch is indexable. A union is not semantics-preserving if any branch
-    /// would require a collection scan.
+    /// Finds the single simple `$in` branch in a filter or in a top-level
+    /// `$and` (as produced by cursor pagination). Returns `None` when there are
+    /// several `$in` branches, so a union cannot accidentally weaken the query.
+    fn in_filter_branch(filter: &Value) -> Option<&Value> {
+        fn simple(filter: &Value) -> bool {
+            filter
+                .as_object()
+                .filter(|obj| obj.len() == 1)
+                .and_then(|obj| obj.values().next())
+                .and_then(Value::as_object)
+                .is_some_and(|ops| ops.len() == 1 && ops.contains_key("$in"))
+        }
+        if simple(filter) {
+            return Some(filter);
+        }
+        let branches = filter
+            .as_object()
+            .filter(|obj| obj.len() == 1)
+            .and_then(|obj| obj.get("$and"))
+            .and_then(Value::as_array)?;
+        let mut found = None;
+        for branch in branches {
+            if simple(branch) {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(branch);
+            }
+        }
+        found
+    }
+
+    /// Replaces a filter whose candidates come from one exact `$in` branch
+    /// with the remaining residual conditions. A simple `$in` leaves `{}`.
+    fn residual_without_in(filter: &Value) -> Option<Value> {
+        let branch = Self::in_filter_branch(filter)?;
+        if branch == filter {
+            return Some(Value::Object(Map::new()));
+        }
+        let branches = filter
+            .as_object()
+            .filter(|obj| obj.len() == 1)
+            .and_then(|obj| obj.get("$and"))
+            .and_then(Value::as_array)?;
+        let mut rest = Vec::with_capacity(branches.len().saturating_sub(1));
+        let mut removed = false;
+        for item in branches {
+            if !removed && item == branch {
+                removed = true;
+            } else {
+                rest.push(item.clone());
+            }
+        }
+        if !removed {
+            return None;
+        }
+        Some(match rest.len() {
+            0 => Value::Object(Map::new()),
+            1 => rest.pop().expect("one residual"),
+            _ => Value::Object(Map::from_iter([("$and".to_string(), Value::Array(rest))])),
+        })
+    }
+
+    /// Returns one equality index plan per value of a simple single-field
+    /// `$in` filter. Returns `None` unless every value is indexable.
+    fn in_index_plans(&self, rtxn: &RoTxn<'_>, filter: &Value) -> Result<Option<Vec<IndexPlan>>> {
+        let Some(branch) = Self::in_filter_branch(filter) else {
+            return Ok(None);
+        };
+        let Some(obj) = branch.as_object() else {
+            return Ok(None);
+        };
+        let Some((field, cond)) = obj.iter().next() else {
+            return Ok(None);
+        };
+        if field == "_id" {
+            return Ok(None);
+        }
+        let Some(ops) = cond.as_object().filter(|ops| ops.len() == 1) else {
+            return Ok(None);
+        };
+        let Some(values) = ops.get("$in").and_then(Value::as_array) else {
+            return Ok(None);
+        };
+        if values.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        let mut plans = Vec::with_capacity(values.len());
+        for value in values {
+            let branch = Value::Object(Map::from_iter([(
+                field.clone(),
+                Value::Object(Map::from_iter([("$eq".to_string(), value.clone())])),
+            )]));
+            let Some(plan) = self.index_plan(rtxn, &branch)? else {
+                return Ok(None);
+            };
+            plans.push(plan);
+        }
+        Ok(Some(plans))
+    }
+
+    /// Returns one index plan per top-level `$or` branch or `$in` value, but
+    /// only when every branch is indexable. A union is not semantics-preserving
+    /// if any branch would require a collection scan.
     fn or_index_plans(&self, rtxn: &RoTxn<'_>, filter: &Value) -> Result<Option<Vec<IndexPlan>>> {
+        if let Some(plans) = self.in_index_plans(rtxn, filter)? {
+            return Ok(Some(plans));
+        }
         let Some(obj) = filter.as_object() else {
             return Ok(None);
         };
@@ -5362,6 +5466,56 @@ impl<'e> Collection<'e> {
             return Ok(keys);
         }
 
+        if let Some(ids) = direct_ids_in(filter) {
+            let residual = Self::residual_without_in(filter).unwrap_or_else(|| filter.clone());
+            for id in ids {
+                let Some(bytes) = self.db.get(txn, id.as_bytes())? else {
+                    continue;
+                };
+                let Some(doc) = parse_prefiltered(bytes, raw.as_ref())? else {
+                    continue;
+                };
+                if matches(&doc, &residual) {
+                    keys.push(id.into_bytes());
+                    if !multi {
+                        break;
+                    }
+                }
+            }
+            return Ok(keys);
+        }
+
+        if let Some(plans) = self.or_index_plans(txn, filter)? {
+            let residual = Self::residual_without_in(filter).unwrap_or_else(|| filter.clone());
+            let mut seen = HashSet::new();
+            'plans: for plan in plans {
+                let (lower, upper) = &plan.bounds;
+                let range = (as_bound(lower), as_bound(upper));
+                for item in plan.db.range(txn, &range)? {
+                    let (_key, value) = item?;
+                    let Some((id, _)) = index::decode_index_value(value) else {
+                        continue;
+                    };
+                    if !seen.insert(id.clone()) {
+                        continue;
+                    }
+                    let Some(bytes) = self.db.get(txn, id.as_bytes())? else {
+                        continue;
+                    };
+                    let Some(doc) = parse_prefiltered(bytes, raw.as_ref())? else {
+                        continue;
+                    };
+                    if matches(&doc, &residual) {
+                        keys.push(id.into_bytes());
+                        if !multi {
+                            break 'plans;
+                        }
+                    }
+                }
+            }
+            return Ok(keys);
+        }
+
         if let Some(ids) = self.index_candidates(txn, filter, None)? {
             for id in ids {
                 let Some(bytes) = self.db.get(txn, id.as_bytes())? else {
@@ -5437,6 +5591,23 @@ impl<'e> Collection<'e> {
             return Ok(());
         }
 
+        if let Some(ids) = direct_ids_in(filter) {
+            let residual = Self::residual_without_in(filter).unwrap_or_else(|| filter.clone());
+            for id in ids {
+                check_find_deadline(deadline)?;
+                let Some(bytes) = self.db.get(txn, id.as_bytes())? else {
+                    continue;
+                };
+                let Some(doc) = parse_prefiltered(bytes, raw.as_ref())? else {
+                    continue;
+                };
+                if matches(&doc, &residual) {
+                    f(doc)?;
+                }
+            }
+            return Ok(());
+        }
+
         if let Some(ids) = self.all_index_candidates(txn, filter)? {
             check_find_deadline(deadline)?;
             for id in ids {
@@ -5472,6 +5643,7 @@ impl<'e> Collection<'e> {
         }
 
         if let Some(plans) = self.or_index_plans(txn, filter)? {
+            let residual = Self::residual_without_in(filter).unwrap_or_else(|| filter.clone());
             let mut seen = HashSet::new();
             for plan in plans {
                 let (lower, upper) = &plan.bounds;
@@ -5491,7 +5663,7 @@ impl<'e> Collection<'e> {
                     let Some(doc) = parse_prefiltered(bytes, raw.as_ref())? else {
                         continue;
                     };
-                    if matches(&doc, filter) {
+                    if matches(&doc, &residual) {
                         f(doc)?;
                     }
                 }
@@ -6028,6 +6200,7 @@ impl<'e> Collection<'e> {
             && want <= PARALLEL_SCAN_MAX_WANT
             && self.db.stat(&rtxn)?.entries >= PARALLEL_SCAN_MIN_ENTRIES
             && direct_id(&query.filter).is_none()
+            && direct_ids_in(&query.filter).is_none()
             && id_bounds(&query.filter).is_none()
             && id_sort_direction(&query.sort).is_none()
             && self.index_plan(&rtxn, &query.filter)?.is_none()
@@ -6095,6 +6268,7 @@ impl<'e> Collection<'e> {
             // replacing an index lookup with a full collection walk would be a
             // regression for selective filters.
             let indexed = direct_id(&query.filter).is_some()
+                || direct_ids_in(&query.filter).is_some()
                 || id_bounds(&query.filter).is_some()
                 || self.all_index_candidates(&rtxn, &query.filter)?.is_some()
                 || self.geo_index_candidates(&rtxn, &query.filter)?.is_some()
@@ -6454,7 +6628,10 @@ impl<'e> Collection<'e> {
 
     /// Returns true when a filter has an index-backed access path.
     fn has_index_path(&self, rtxn: &RoTxn<'_>, filter: &Value) -> Result<bool> {
-        if direct_id(filter).is_some() || id_bounds(filter).is_some() {
+        if direct_id(filter).is_some()
+            || direct_ids_in(filter).is_some()
+            || id_bounds(filter).is_some()
+        {
             return Ok(true);
         }
         if self.all_index_candidates(rtxn, filter)?.is_some() {
@@ -6901,13 +7078,16 @@ impl<'e> Collection<'e> {
             }
         }
 
-        // 0b) Top-level `$or`: when every branch has an index, merge the
-        //     candidate ids and apply the full filter as a residual.
+        // 0b) Top-level `$or` or a simple `$in`: when every branch has an
+        //     index, merge the candidate ids and apply the full filter as a
+        //     residual.
         if let Some(plans) = if query.hint.is_none() {
             self.or_index_plans(rtxn, &query.filter)?
         } else {
             None
         } {
+            let residual =
+                Self::residual_without_in(&query.filter).unwrap_or_else(|| query.filter.clone());
             let mut seen = HashSet::new();
             'plans: for plan in &plans {
                 let range = (as_bound(&plan.bounds.0), as_bound(&plan.bounds.1));
@@ -6926,7 +7106,7 @@ impl<'e> Collection<'e> {
                     let Some(doc) = parse_prefiltered(bytes, raw.as_ref())? else {
                         continue;
                     };
-                    if !matches(&doc, &query.filter) {
+                    if !matches(&doc, &residual) {
                         continue;
                     }
                     acc.push(doc);
@@ -6955,6 +7135,31 @@ impl<'e> Collection<'e> {
         } {
             if let Some(bytes) = self.db.get(rtxn, id.as_bytes())? {
                 acc.push(parse_json(bytes)?);
+            }
+        }
+        // 1a) `_id: {$in: [...]}`: fetch the requested primary keys directly
+        //     instead of scanning the collection once per value.
+        else if let Some(ids) = if query.hint.is_none() {
+            direct_ids_in(&query.filter)
+        } else {
+            None
+        } {
+            let residual =
+                Self::residual_without_in(&query.filter).unwrap_or_else(|| query.filter.clone());
+            for id in ids {
+                check_find_deadline(deadline)?;
+                if !sorted && acc.len() >= want {
+                    break;
+                }
+                let Some(bytes) = self.db.get(rtxn, id.as_bytes())? else {
+                    continue;
+                };
+                let Some(doc) = parse_prefiltered(bytes, raw.as_ref())? else {
+                    continue;
+                };
+                if matches(&doc, &residual) {
+                    acc.push(doc);
+                }
             }
         }
         // 1b) Multikey `$all`: intersect the index ranges for every required
@@ -7594,6 +7799,27 @@ impl<'e> Collection<'e> {
             );
             out.insert("bounds".into(), Value::Null);
             out.insert("candidates".into(), Value::from(u64::from(exists)));
+            out.insert("sort_covered".into(), Value::Bool(sort_covered(None)));
+            return Ok(Value::Object(out));
+        }
+
+        if let Some(ids) = if query.hint.is_none() {
+            direct_ids_in(&query.filter)
+        } else {
+            None
+        } {
+            let mut candidates = 0u64;
+            for id in ids {
+                candidates += u64::from(self.db.get(rtxn, id.as_bytes())?.is_some());
+            }
+            out.insert("access_path".into(), Value::String("id_lookup".into()));
+            out.insert("index_used".into(), Value::Bool(true));
+            out.insert(
+                "index".into(),
+                serde_json::json!({"fields": ["_id"], "primary": true}),
+            );
+            out.insert("bounds".into(), Value::Null);
+            out.insert("candidates".into(), Value::from(candidates));
             out.insert("sort_covered".into(), Value::Bool(sort_covered(None)));
             return Ok(Value::Object(out));
         }
@@ -8314,6 +8540,30 @@ fn direct_id(filter: &Value) -> Option<String> {
     id::key_from_value(op)
 }
 
+/// Recognizes a simple `{"_id": {"$in": [...]}}` filter and resolves each
+/// value to its primary key. Duplicate values produce one result.
+fn direct_ids_in(filter: &Value) -> Option<Vec<String>> {
+    let branch = Collection::in_filter_branch(filter)?;
+    let obj = branch.as_object()?;
+    if obj.len() != 1 {
+        return None;
+    }
+    let ops = obj.get("_id")?.as_object()?;
+    if ops.len() != 1 {
+        return None;
+    }
+    let values = ops.get("$in")?.as_array()?;
+    let mut seen = HashSet::new();
+    let mut ids = Vec::with_capacity(values.len());
+    for value in values {
+        let id = id::key_from_value(value)?;
+        if seen.insert(id.clone()) {
+            ids.push(id);
+        }
+    }
+    Some(ids)
+}
+
 /// Builds a primary-key `_id` range from `$gt/$gte/$lt/$lte` conditions.
 /// An exact `_id` (string or `{"$eq": ...}`) is also a range, which allows
 /// combining it with additional conditions without a full scan.
@@ -8451,8 +8701,8 @@ fn compare_scalar_values(a: &Value, b: &Value) -> Ordering {
     }
     match (a, b) {
         (Value::Null, Value::Null) => Ordering::Equal,
-        (Value::Null, _) => Ordering::Greater,
-        (_, Value::Null) => Ordering::Less,
+        (Value::Null, _) => Ordering::Less,
+        (_, Value::Null) => Ordering::Greater,
         (Value::String(x), Value::String(y)) => x.cmp(y),
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
         _ => date::cmp(a, b).unwrap_or(Ordering::Equal),
@@ -8464,8 +8714,10 @@ fn compare_values(a: Option<&Value>, b: Option<&Value>, descending: bool) -> Ord
     let b = sort_value(b, descending);
     match (a, b) {
         (None, None) => Ordering::Equal,
-        (None, Some(_)) => Ordering::Greater, // missing field sorts last
-        (Some(_), None) => Ordering::Less,
+        // MongoDB treats a missing field like an explicit null for sorting.
+        (None, Some(Value::Null)) | (Some(Value::Null), None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Less, // missing fields sort first, like MongoDB
+        (Some(_), None) => Ordering::Greater,
         (Some(a), Some(b)) => compare_scalar_values(a, b),
     }
 }
@@ -9898,7 +10150,7 @@ mod tests {
         assert_eq!(plan["sort_covered"], true);
 
         // A document missing the sort field is not in the index, so the planner
-        // must fall back to a scan and still place it last.
+        // must fall back to a scan and place it first, like MongoDB.
         c.insert_one(json!({"_id": "missing"})).unwrap();
         let q = FindQuery {
             filter: serde_json::json!({}),
@@ -9907,7 +10159,7 @@ mod tests {
         };
         let got = c.find(&q).unwrap();
         assert_eq!(got.len(), 11);
-        assert_eq!(got[10]["_id"], "missing");
+        assert_eq!(got[0]["_id"], "missing");
         let plan = c.explain(&q).unwrap();
         assert_eq!(plan["access_path"], "collection_scan");
 
@@ -9929,6 +10181,83 @@ mod tests {
         assert_eq!(c.find(&q).unwrap().len(), 3);
         let plan = c.explain(&q).unwrap();
         assert_eq!(plan["access_path"], "index_scan");
+    }
+
+    #[test]
+    fn mongodb_null_sort_and_in_lookup_plans() {
+        let (_dir, store) = store();
+        let c = store.collection("items").unwrap();
+        for (id, value) in [("1", Some(2)), ("2", None), ("3", Some(1)), ("4", Some(0))] {
+            let mut doc = json!({"_id": id});
+            if let Some(value) = value {
+                doc["v"] = json!(value);
+            }
+            if id == "4" {
+                doc["v"] = Value::Null;
+            }
+            c.insert_one(doc).unwrap();
+        }
+        let asc = FindQuery {
+            filter: json!({}),
+            sort: vec![("v".into(), 1)],
+            ..Default::default()
+        };
+        let ids: Vec<_> = c
+            .find(&asc)
+            .unwrap()
+            .into_iter()
+            .map(|doc| doc["_id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(ids, ["2", "4", "3", "1"]);
+        let desc = FindQuery {
+            sort: vec![("v".into(), -1)],
+            ..asc.clone()
+        };
+        let ids: Vec<_> = c
+            .find(&desc)
+            .unwrap()
+            .into_iter()
+            .map(|doc| doc["_id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(ids, ["1", "3", "2", "4"]);
+
+        c.create_index("n", false).unwrap();
+        for i in 0..6 {
+            c.insert_one(json!({"_id": format!("n{i}"), "n": i}))
+                .unwrap();
+        }
+        let primary = FindQuery {
+            filter: json!({"_id": {"$in": ["n1", "n3", "n1"]}}),
+            ..Default::default()
+        };
+        let ids: Vec<_> = c
+            .find(&primary)
+            .unwrap()
+            .into_iter()
+            .map(|doc| doc["_id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(ids, ["n1", "n3"]);
+        assert_eq!(c.explain(&primary).unwrap()["access_path"], "id_lookup");
+
+        let secondary = FindQuery {
+            filter: json!({"n": {"$in": [1, 3, 5]}}),
+            ..Default::default()
+        };
+        assert_eq!(c.find(&secondary).unwrap().len(), 3);
+        assert_eq!(c.explain(&secondary).unwrap()["access_path"], "index_union");
+
+        let paged = FindQuery {
+            filter: json!({"$and": [{"n": {"$in": [1, 3, 5]}}, {"_id": {"$gt": "n1"}}]}),
+            ..Default::default()
+        };
+        let ids: Vec<_> = c
+            .find(&paged)
+            .unwrap()
+            .into_iter()
+            .map(|doc| doc["_id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(ids, ["n3", "n5"]);
+        assert_eq!(c.explain(&paged).unwrap()["access_path"], "index_union");
     }
 
     #[test]
@@ -10005,7 +10334,8 @@ mod tests {
             .collect();
         assert_eq!(ids, vec!["d", "a"]);
 
-        // A document without the indexed field cannot use index sort order.
+        // A document without the indexed field cannot use index sort order;
+        // the scan must place it first, like MongoDB.
         c.insert_one(json!({"_id": "e"})).unwrap();
         let q = FindQuery {
             filter: serde_json::json!({}),
@@ -10018,7 +10348,7 @@ mod tests {
             .into_iter()
             .map(|d| d["_id"].as_str().unwrap().to_string())
             .collect();
-        assert_eq!(ids, vec!["b", "a", "c", "d", "e"]);
+        assert_eq!(ids, vec!["e", "b", "a", "c", "d"]);
         {
             let rtxn = c.env.read_txn().unwrap();
             c.verify_in(&rtxn).unwrap();

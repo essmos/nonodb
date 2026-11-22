@@ -2,6 +2,18 @@
 
 Full release notes: https://github.com/essmos/nonodb/releases
 
+## Unreleased
+
+- Sort missing and `null` values first, matching MongoDB's BSON ordering for
+  both ascending and descending sorts. This fixes different `skip`/`limit`
+  pages after a MongoDB migration.
+- Resolve `$in` on `_id` and indexed fields through direct primary-key gets or
+  an index range union instead of a full collection scan. Cursor pagination
+  preserves the indexed path for `$in` filters.
+- Commit MongoDB wire `insert_many` batches in one transaction. Ordered and
+  unordered partial-success behavior is preserved when a duplicate forces the
+  fallback path.
+
 ## v0.29.1 - 2026-11-22
 
 - Accept BSON int32/int64 `_ttl` values through the MongoDB wire listener by

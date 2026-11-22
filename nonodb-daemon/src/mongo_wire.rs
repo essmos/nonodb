@@ -27,7 +27,7 @@ use zeroize::Zeroizing;
 use nonodb_auth::{Action, Principal};
 
 use crate::cursor;
-use crate::protocol::{ApiError, Durability, WriteReq};
+use crate::protocol::{ApiError, Durability, WriteOp, WriteReq};
 
 mod bson_map;
 
@@ -822,6 +822,21 @@ async fn database_for_read(root: &super::AppState, database: &str) -> Option<sup
     }
 }
 
+fn wire_insert_document(item: &Bson) -> Result<serde_json::Value, ApiError> {
+    let Bson::Document(document) = item else {
+        return Err(bad_value("insert document must be a BSON document"));
+    };
+    let mut value = bson_map::document_to_value(document).map_err(bad_value)?;
+    if value.get("_id").is_none() {
+        let oid = bson::oid::ObjectId::new();
+        value
+            .as_object_mut()
+            .expect("document")
+            .insert("_id".to_string(), json!({"$oid": oid.to_hex()}));
+    }
+    Ok(value)
+}
+
 async fn insert_command(state: &super::AppState, body: &Document) -> Result<Document, ApiError> {
     let collection = body
         .get_str("insert")
@@ -839,36 +854,57 @@ async fn insert_command(state: &super::AppState, body: &Document) -> Result<Docu
     }
     let ordered = body.get_bool("ordered").unwrap_or(true);
     let runtime = database_for_write(state, &database).await?;
+
+    // Fast path: a batch that needs no per-document error handling becomes one
+    // core write transaction. If the transaction fails, fall back to the
+    // ordered/unordered per-document loop below so partial-success semantics
+    // are unchanged.
+    let mut prepared = Vec::with_capacity(documents.len());
+    let mut can_batch = true;
+    for item in documents {
+        match wire_insert_document(item) {
+            Ok(value) => prepared.push(value),
+            Err(_) => {
+                can_batch = false;
+                break;
+            }
+        }
+    }
+    if can_batch {
+        let count = prepared.len();
+        let (_, response) = super::submit_write(
+            &runtime,
+            WriteReq::Batch {
+                ops: vec![WriteOp::InsertMany {
+                    coll: collection.clone(),
+                    docs: prepared,
+                }
+                .into()],
+            },
+            Durability::Full,
+        )
+        .await;
+        if response.0.error.is_none() {
+            let mut reply = Document::new();
+            reply.insert("n", Bson::Int32(count as i32));
+            reply.insert("ok", Bson::Double(1.0));
+            return Ok(reply);
+        }
+    }
+
     let mut inserted = 0i32;
     let mut errors = Vec::new();
     for (index, item) in documents.iter().enumerate() {
-        let Bson::Document(document) = item else {
-            errors.push(write_error(
-                index,
-                &bad_value("insert document must be a BSON document"),
-            ));
-            if ordered {
-                break;
-            }
-            continue;
-        };
-        let mut value = match bson_map::document_to_value(document) {
+        let value = match wire_insert_document(item) {
             Ok(value) => value,
-            Err(message) => {
-                errors.push(write_error(index, &bad_value(message)));
+            Err(error) => {
+                errors.push(write_error(index, &error));
                 if ordered {
                     break;
                 }
                 continue;
             }
         };
-        if value.get("_id").is_none() {
-            let oid = bson::oid::ObjectId::new();
-            value
-                .as_object_mut()
-                .expect("document")
-                .insert("_id".to_string(), json!({"$oid": oid.to_hex()}));
-        }
         let (_, response) = super::submit_write(
             &runtime,
             WriteReq::Insert {

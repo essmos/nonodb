@@ -781,8 +781,8 @@ fn compare_sort_values(a: Option<&Value>, b: Option<&Value>) -> std::cmp::Orderi
     use std::cmp::Ordering;
     match (a, b) {
         (None, None) => Ordering::Equal,
-        (None, Some(_)) => Ordering::Greater,
-        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Less,
+        (Some(_), None) => Ordering::Greater,
         (Some(a), Some(b)) => {
             if let Some(ord) = numeric::cmp_values(a, b) {
                 return ord;
@@ -792,8 +792,8 @@ fn compare_sort_values(a: Option<&Value>, b: Option<&Value>) -> std::cmp::Orderi
             }
             match (a, b) {
                 (Value::Null, Value::Null) => Ordering::Equal,
-                (Value::Null, _) => Ordering::Greater,
-                (_, Value::Null) => Ordering::Less,
+                (Value::Null, _) => Ordering::Less,
+                (_, Value::Null) => Ordering::Greater,
                 (Value::String(x), Value::String(y)) => x.cmp(y),
                 (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
                 _ => date::cmp(a, b).unwrap_or(Ordering::Equal),

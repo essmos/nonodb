@@ -352,6 +352,7 @@ allowed. Other BSON types are not accepted as `_id`.
 | `$expr` | 🟡 | Uses the aggregation expression evaluator; an unknown expression operator is rejected with `BadValue`, while evaluation errors on a document are treated as no-match |
 | `$jsonSchema` | 🟡 | Common keywords and combinators; not every JSON Schema draft feature |
 | `$and`, `$or`, `$nor`, `$not` | ✅ | |
+| Sort order for missing/`null` | ✅ | Missing and `null` sort first (lowest), like MongoDB, including `skip`/`limit` pagination |
 | `$where` | ❌ | No JavaScript execution |
 | `$text` | 🟡 | Lexical BM25 subset over one single-field MongoDB-style text index; positive terms and phrases are ANDed, negative terms/phrases exclude, and at least one positive clause is required. No stemming, stop words, or non-`none` languages |
 | `$comment` as a filter operator | ❌ | `comment` is available as a query option |

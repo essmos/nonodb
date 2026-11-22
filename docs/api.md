@@ -319,7 +319,8 @@ Behavior:
 - Equality or range conditions on `_id` use the primary-key B+ tree directly.
   Sorting by a single `_id` field can stream that range forwards or backwards.
 - With `sort`, results are ordered by the requested fields. Missing values and
-  `null` sort last. Ties are broken deterministically by `_id`.
+  `null` sort first, matching MongoDB. Ties are broken deterministically by
+  `_id`.
 - An index can serve the sort when its full field order and per-field directions
   match the requested sort, or when every direction is inverted (reverse index
   traversal). Mixed-direction compound indexes are supported. Otherwise a full
@@ -1749,7 +1750,7 @@ traverse arrays of objects:
 ```
 
 Directions: `1` ascending, `-1` descending. Missing values and `null` sort
-last. Equal keys are ordered deterministically by `_id`.
+first, matching MongoDB. Equal keys are ordered deterministically by `_id`.
 
 An index can serve the sort when the requested sort matches the full index field
 order and its per-field directions, or when every direction is inverted for a

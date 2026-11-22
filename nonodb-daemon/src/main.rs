@@ -1841,7 +1841,14 @@ fn cursor_page(
     let id_only =
         sort.is_empty() || (sort.len() == 1 && matches!(sort[0].0.as_str(), "_id" | "$natural"));
     let sort = if id_only {
-        vec![("_id".to_string(), if ascending { 1 } else { -1 })]
+        if ascending {
+            // The collection's natural order is ascending `_id`; leaving the
+            // sort empty lets indexed filters stop after `skip + limit` instead
+            // of materializing the whole candidate set for TopK.
+            Vec::new()
+        } else {
+            vec![("_id".to_string(), -1)]
+        }
     } else {
         sort
     };

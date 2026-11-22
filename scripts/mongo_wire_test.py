@@ -14,7 +14,7 @@ from urllib.parse import quote
 
 from bson import Int64, ObjectId
 from pymongo import MongoClient, ReturnDocument
-from pymongo.errors import OperationFailure
+from pymongo.errors import BulkWriteError, OperationFailure
 from pymongo.read_concern import ReadConcern
 from pymongo.write_concern import WriteConcern
 
@@ -52,6 +52,24 @@ def main() -> int:
             assert error.code == 11000, error
         else:
             raise AssertionError("duplicate _id was accepted")
+
+        for ordered, expected_inserted, expected_ids in (
+            (True, 1, ["batch-a", "batch-b"]),
+            (False, 2, ["batch-a", "batch-b", "batch-c"]),
+        ):
+            batch = db[f"batch_{ordered}_{os.getpid()}"]
+            batch.insert_one({"_id": "batch-a"})
+            try:
+                batch.insert_many(
+                    [{"_id": "batch-b"}, {"_id": "batch-a"}, {"_id": "batch-c"}],
+                    ordered=ordered,
+                )
+            except BulkWriteError as error:
+                assert error.details["nInserted"] == expected_inserted, error.details
+                assert error.details["writeErrors"][0]["index"] == 1, error.details
+            else:
+                raise AssertionError("duplicate batch _id was accepted")
+            assert sorted(doc["_id"] for doc in batch.find({})) == expected_ids
         for label, command, expected_code in [
             (
                 "namespace not found",

@@ -228,6 +228,24 @@ def main() -> int:
             lambda db: db.items.insert_many(DOCS).inserted_ids,
         )
         check_both("find all", lambda db: sorted_docs(db))
+        check_both(
+            "sort missing/null ascending",
+            lambda db: [doc["_id"] for doc in db.items.find({}).sort("nil", 1)],
+        )
+        check_both(
+            "sort missing/null descending",
+            lambda db: [doc["_id"] for doc in db.items.find({}).sort("nil", -1)],
+        )
+        check_both(
+            "$in on _id deduplicates and keeps matches",
+            lambda db: sorted(
+                doc["_id"] for doc in db.items.find({"_id": {"$in": ["a", "c", "a"]}})
+            ),
+        )
+        check_both(
+            "$in on an indexed field",
+            lambda db: sorted(doc["_id"] for doc in db.items.find({"n": {"$in": [1, 3]}})),
+        )
 
         check_both(
             "$size single expression",
