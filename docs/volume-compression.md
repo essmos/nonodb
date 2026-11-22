@@ -55,7 +55,7 @@ Set ownership to the user that runs the daemon or container. For the published
 container image, the `nonodb` account is a system user; get its numeric IDs with:
 
 ```bash
-docker run --rm --entrypoint sh ghcr.io/essmos/nonodb:0.27.0 \
+docker run --rm --entrypoint sh ghcr.io/essmos/nonodb:0.28.0 \
   -c 'id -u; id -g'
 ```
 
@@ -110,7 +110,7 @@ normal directory; the host filesystem performs compression.
 ```yaml
 services:
   nonodb:
-    image: ghcr.io/essmos/nonodb:0.27.0
+    image: ghcr.io/essmos/nonodb:0.28.0
     volumes:
       - /tank/nonodb:/var/lib/nonodb
 ```

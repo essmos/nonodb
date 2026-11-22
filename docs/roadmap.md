@@ -5,7 +5,7 @@ is deliberately out of scope, and which gaps are candidates for future work.
 
 ## Current status
 
-The project is at `0.27.0`. It is suitable for local, single-host, and
+The project is at `0.28.0`. It is suitable for local, single-host, and
 primary/replica deployments that need a small, durable, queryable JSON store
 and can accept a single-writer model per database.
 

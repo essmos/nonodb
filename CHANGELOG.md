@@ -4,6 +4,8 @@ Full release notes: https://github.com/essmos/nonodb/releases
 
 ## Unreleased
 
+## v0.28.0 - 2026-11-22
+
 - Add opt-in SQ8/int8 ANN record encoding through
   `NONODB_VECTOR_ANN_QUANTIZE=sq8`. It cuts the 500k/384D sidecar from 741 MB to
   193 MB, but at that scale it did not reduce query latency and slightly lowered

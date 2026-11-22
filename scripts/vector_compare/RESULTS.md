@@ -9,7 +9,7 @@ Reproduce with the scripts in this directory; raw JSON results were produced by
 | Item | Value |
 |---|---|
 | Host | 16 vCPU Xeon D-2141I, 31 GiB RAM, ZFS, same host for all engines |
-| NonoDB | `v0.27.0`, ANN format v2, 707 clusters |
+| NonoDB | `v0.28.0`, ANN format v2, 707 clusters |
 | Qdrant | `1.12.4`, HNSW `m=16`, `ef_construct=100` |
 | Elasticsearch | `8.15.0`, `dense_vector` HNSW `m=16`, `ef_construction=100` |
 | Corpus | 500,000 MS MARCO passages (real text, first 500k rows) |
