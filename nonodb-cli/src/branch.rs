@@ -465,6 +465,9 @@ fn run_branch(
         } else {
             None
         };
+        // Verification opens LMDB and may create a lock. The published clone
+        // must not inherit a lock; the daemon creates one on first start.
+        let _ = fs::remove_file(temp.join("lock.mdb"));
 
         replace_target(&temp, &target_dir, &options.data_root, &options.target)?;
         if let Some(report) = verification.as_mut() {

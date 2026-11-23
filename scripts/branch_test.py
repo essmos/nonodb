@@ -156,7 +156,7 @@ def main() -> int:
         assert output["verification"]["documents"] == 5, output
         assert output["verification"]["path"] == str(data / "branch"), output
         assert (data / "branch" / "search").is_dir(), output
-        assert not (data / "branch" / "lock.mdb").samefile(data / "source" / "lock.mdb")
+        assert not (data / "branch" / "lock.mdb").exists(), output
 
         expect_failure(
             cli, "branch", "branch", "--db", SOURCE, "--data", str(data)
