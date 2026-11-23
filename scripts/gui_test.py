@@ -140,9 +140,14 @@ def main() -> int:
                 b"Any single /v1/exec request",
                 b"playground-result.json",
                 b"search_all",
+                b"New database name",
+                b"Create database",
+                b"Drop database",
+                b"default cannot be dropped",
+                b"Type ",
+                b"instance administrator scope",
             ):
                 assert marker in asset, marker
-            assert b"New database name" not in asset
 
             result = json.loads(fetch(base + "/v1/exec", data={"op": "list_collections"}))
             assert result["ok"] is True, result
@@ -224,6 +229,19 @@ def main() -> int:
                 fetch(base + "/app1/v1/replication/status")
             )
             assert replication["result"]["database"] == "app1", replication
+
+            # The GUI proxy exposes the same database management operations used
+            # by the Database tab: create, select, write, drop, then refresh.
+            fetch(base + "/v1/exec", data={"op": "create_database", "name": "gui_temp"})
+            listed = json.loads(fetch(base + "/v1/exec", data={"op": "list_databases"}))
+            assert "gui_temp" in listed["result"]["databases"], listed
+            fetch(
+                base + "/gui_temp/v1/exec",
+                data={"op": "insert", "coll": "temp", "doc": {"_id": "t1"}},
+            )
+            fetch(base + "/v1/exec", data={"op": "drop_database", "name": "gui_temp"})
+            listed = json.loads(fetch(base + "/v1/exec", data={"op": "list_databases"}))
+            assert "gui_temp" not in listed["result"]["databases"], listed
             print("gui e2e: ok")
             return 0
         finally:

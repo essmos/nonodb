@@ -4879,14 +4879,28 @@ function AuthView({ connection }: { connection: Connection }) {
   );
 }
 
-function DatabaseView({ connection }: { connection: Connection }) {
+function DatabaseView({
+  connection,
+  databases,
+  onRefreshDatabases,
+  onSwitchDatabase,
+}: {
+  connection: Connection;
+  databases: string[];
+  onRefreshDatabases: (database?: string) => Promise<string[]>;
+  onSwitchDatabase: (database: string) => void;
+}) {
   const [info, setInfo] = useState<MapInfo | null>(null);
   const [size, setSize] = useState('');
   const [importUpsert, setImportUpsert] = useState(false);
+  const [newDatabase, setNewDatabase] = useState('');
+  const [dropTarget, setDropTarget] = useState<string | null>(null);
+  const [dropConfirm, setDropConfirm] = useState('');
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
   const [busy, setBusy] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
+  const currentDatabase = connection.database || 'default';
 
   const load = useCallback(async () => {
     setError('');
@@ -4906,6 +4920,49 @@ function DatabaseView({ connection }: { connection: Connection }) {
     const timer = window.setTimeout(() => setNotice(''), 3000);
     return () => window.clearTimeout(timer);
   }, [notice]);
+
+  const createDatabase = async () => {
+    const name = newDatabase.trim();
+    if (!name) return;
+    setBusy(true);
+    setError('');
+    setNotice('');
+    try {
+      await exec(connection, { op: 'create_database', name });
+      await onRefreshDatabases();
+      setNewDatabase('');
+      setNotice(`Database ${name} created`);
+      onSwitchDatabase(name);
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const dropDatabase = async () => {
+    if (!dropTarget || dropConfirm !== dropTarget) return;
+    const name = dropTarget;
+    setBusy(true);
+    setError('');
+    setNotice('');
+    try {
+      await exec(connection, { op: 'drop_database', name });
+      setDropTarget(null);
+      setDropConfirm('');
+      if (currentDatabase === name) {
+        await onRefreshDatabases('default').catch(() => {});
+        onSwitchDatabase('default');
+      } else {
+        await onRefreshDatabases();
+      }
+      setNotice(`Database ${name} dropped`);
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setBusy(false);
+    }
+  };
 
   const resize = async () => {
     setBusy(true);
@@ -5051,8 +5108,71 @@ function DatabaseView({ connection }: { connection: Connection }) {
       </section>
 
       <section className="panel">
-        <div className="panel-title"><h3>Databases</h3></div>
-        <p className="muted small">This daemon serves one LMDB database at a time. To run another database, start a second daemon with a different <code>NONODB_DATA</code> directory and socket.</p>
+        <div className="panel-title">
+          <h3>Databases</h3>
+          <button className="small" onClick={() => void onRefreshDatabases().catch((err) => setError(errorText(err)))} disabled={busy}>
+            Refresh
+          </button>
+        </div>
+        <p className="muted small">
+          Create or drop databases served by this daemon. Creating and dropping requires an
+          instance administrator scope; forbidden requests are reported below. Dropping a
+          database permanently deletes its collections, indexes, history, and metadata.
+        </p>
+        <div className="toolbar">
+          <label className="grow">
+            New database name
+            <input
+              value={newDatabase}
+              onChange={(e) => setNewDatabase(e.target.value)}
+              placeholder="app1"
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') void createDatabase();
+              }}
+            />
+          </label>
+          <button className="primary" onClick={() => void createDatabase()} disabled={busy || !newDatabase.trim()}>
+            Create database
+          </button>
+        </div>
+        <div className="metric-table-wrap">
+          <table className="metric-table">
+            <thead>
+              <tr>
+                <th>Database</th>
+                <th>Status</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {databases.length === 0 ? (
+                <tr><td colSpan={3} className="muted">No databases returned.</td></tr>
+              ) : databases.map((name) => (
+                <tr key={name}>
+                  <td className="mono">{name}</td>
+                  <td>{name === currentDatabase ? <span className="badge">current</span> : <span className="muted">available</span>}</td>
+                  <td>
+                    {name === 'default' ? (
+                      <span className="muted small">default cannot be dropped</span>
+                    ) : (
+                      <button
+                        className="small danger"
+                        onClick={() => {
+                          setDropTarget(name);
+                          setDropConfirm('');
+                          setError('');
+                        }}
+                        disabled={busy}
+                      >
+                        Drop database
+                      </button>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
       </section>
 
       <section className="panel">
@@ -5069,6 +5189,47 @@ function DatabaseView({ connection }: { connection: Connection }) {
           ))}
         </div>
       </section>
+
+      {dropTarget && (
+        <Modal
+          title={`Drop database ${dropTarget}`}
+          subtitle="This permanently deletes the database and cannot be undone."
+          onClose={() => {
+            if (!busy) {
+              setDropTarget(null);
+              setDropConfirm('');
+            }
+          }}
+        >
+          {error && <div className="error-box">{error}</div>}
+          <p className="muted small">
+            All collections, indexes, history, TTL metadata, and event configuration in
+            <code> {dropTarget}</code> will be removed. Export or back up the database first if
+            you need a copy.
+          </p>
+          <label>
+            Type <code>{dropTarget}</code> to confirm
+            <input
+              value={dropConfirm}
+              onChange={(e) => setDropConfirm(e.target.value)}
+              autoFocus
+              autoComplete="off"
+            />
+          </label>
+          <div className="modal-actions">
+            <button onClick={() => { setDropTarget(null); setDropConfirm(''); }} disabled={busy}>
+              Cancel
+            </button>
+            <button
+              className="danger"
+              onClick={() => void dropDatabase()}
+              disabled={busy || dropConfirm !== dropTarget}
+            >
+              {busy ? 'Dropping…' : 'Drop database'}
+            </button>
+          </div>
+        </Modal>
+      )}
     </div>
   );
 }
@@ -5097,17 +5258,19 @@ function Shell({
   const [databases, setDatabases] = useState<string[]>([]);
   const [collectionTab, setCollectionTab] = useState<CollectionTab>('documents');
 
-  useEffect(() => {
-    let cancelled = false;
-    exec<{ databases: string[] }>(connection, { op: 'list_databases' })
-      .then((result) => {
-        if (!cancelled) setDatabases(result.databases ?? []);
-      })
-      .catch(() => {});
-    return () => {
-      cancelled = true;
-    };
+  const refreshDatabases = useCallback(async (database = connection.database): Promise<string[]> => {
+    const result = await exec<{ databases: string[] }>(
+      { ...connection, database: database || 'default' },
+      { op: 'list_databases' },
+    );
+    const names = result.databases ?? [];
+    setDatabases(names);
+    return names;
   }, [connection]);
+
+  useEffect(() => {
+    void refreshDatabases().catch(() => {});
+  }, [refreshDatabases]);
 
   const switchDatabase = (database: string) => {
     if (!database || database === connection.database) return;
@@ -5299,7 +5462,12 @@ function Shell({
         ) : tab === 'playground' ? (
           <PlaygroundView connection={connection} collections={collections} selected={selected} />
         ) : tab === 'database' ? (
-          <DatabaseView connection={connection} />
+          <DatabaseView
+            connection={connection}
+            databases={databases}
+            onRefreshDatabases={refreshDatabases}
+            onSwitchDatabase={switchDatabase}
+          />
         ) : tab === 'backups' ? (
           <BackupsPage connection={connection} />
         ) : tab === 'import' ? (

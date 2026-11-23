@@ -142,6 +142,11 @@ token. There is no separate GUI account.
   **Advanced**.
 - The sidebar database selector switches between databases in the same daemon.
   Requests are routed as `/<database>/v1/exec` and `/<database>/v1/watch`.
+- The **Database** tab lists databases, creates new ones, and drops non-default
+  databases after typing the exact name to confirm. The selector refreshes after
+  each change. Dropping the current database switches the GUI back to `default`.
+  These operations require an instance administrator scope; a `forbidden`
+  response is shown in the page and does not change the selector.
 - The collection list stays visible in the sidebar on every tab. **Dashboard**
   shows the selected database overview and metrics; choosing a collection opens
   its document view.
@@ -155,6 +160,25 @@ connection profiles use browser `localStorage`; do not save production tokens on
 a shared machine. Use **Disconnect** to clear the active session.
 
 ## Features
+
+### Databases
+
+The **Database** tab manages the databases served by the connected daemon:
+
+- list every visible database and mark the current one;
+- create a database by name; the selector refreshes and opens the new database;
+- drop a non-default database with a confirmation dialog. The drop button stays
+  disabled until the exact database name is typed;
+- `default` cannot be dropped, and dropping the current database switches the
+  GUI back to `default`.
+
+Create and drop use the daemon's `create_database` and `drop_database`
+operations. They require an instance administrator scope (`admin:db` or `*:*`),
+not a per-database administrator scope. Forbidden requests are reported in the
+GUI and leave the database list unchanged. Dropping permanently removes
+collections, indexes, history, TTL metadata, and event configuration; export or
+back up the database first if a copy is needed. See
+[Multiple databases](multi-database.md#management-api).
 
 ### Documents
 
