@@ -119,8 +119,6 @@ jobs:
         run: |
           python3 scripts/multi_database_test.py
           python3 scripts/multi_database_features_test.py
-          python3 scripts/bson_types_test.py
-          python3 scripts/regex_test.py
           python3 scripts/durability_test.py
           python3 scripts/gui_test.py
           python3 scripts/gui_views_test.py

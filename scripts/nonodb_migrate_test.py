@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import subprocess
 import sys
 import tempfile
@@ -20,6 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from bson import Binary, Decimal128, ObjectId
+from bson.regex import Regex
 from pymongo import MongoClient
 from pymongo.errors import DuplicateKeyError
 
@@ -56,7 +56,7 @@ def main() -> int:
                     "created_at": datetime(2024, 1, 1, tzinfo=timezone.utc),
                     "dec": Decimal128("1.50"),
                     "bin": Binary(b"\x00\x01"),
-                    "pattern": re.compile("^a", re.I),
+                    "pattern": Regex("^a", "i"),
                     "tags": ["a", "b"],
                 },
                 {
