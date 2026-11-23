@@ -147,7 +147,13 @@ secrets.
 | `NONODB_VECTOR_ANN_CLUSTERS` | unset | Target IVF clusters when building a vector ANN sidecar; otherwise `sqrt(entries)`, capped at 4,096 (1–8,192) |
 | `NONODB_VECTOR_ANN_COLLECTIONS` | unset | Comma-separated collections for `NONODB_BUILD_VECTOR_ANN` |
 | `NONODB_SNAPSHOT_INTERVAL` | `300` | Snapshot interval in seconds |
-| `NONODB_SNAPSHOT_KEEP` | `24` | Number of snapshot files to retain |
+| `NONODB_SNAPSHOT_KEEP` | `24` | Number of snapshot files to retain when PITR is disabled |
+| `NONODB_PITR_ENABLED` | `0` | Enable snapshot + segmented WAL point-in-time recovery |
+| `NONODB_PITR_WINDOW_SECS` | `604800` | PITR recovery window retained, in seconds |
+| `NONODB_WAL_MAX_AGE_SECS` | PITR window | Hard maximum WAL age; a shorter value also shortens the effective recovery window |
+| `NONODB_WAL_SEGMENT_BYTES` | `64MiB` | Target WAL segment size |
+| `NONODB_WAL_MAX_BYTES` | `20GiB` | Hard per-database WAL size limit; writes fail with `wal_full` at the limit |
+| `NONODB_PITR_REPLAY_TO` | — | Optional RFC 3339/Unix timestamp replayed from the retained WAL when a database opens, before accepting writes |
 | `NONODB_DRAIN_TIMEOUT` | `30` | Maximum seconds to wait for connections and queued writes during shutdown |
 | `NONODB_LOG_FORMAT` | `text` | `text` for human-readable logs or `json` for structured logs |
 | `RUST_LOG` | `info,nonodb=debug` | `tracing` log filter |
@@ -707,11 +713,16 @@ For certificate generation, mTLS setup, rotation, and troubleshooting, see
 Periodic snapshots are enabled with `NONODB_SNAPSHOT_DIR`,
 `NONODB_SNAPSHOT_INTERVAL`, and `NONODB_SNAPSHOT_KEEP`. Each database writes
 compacted, consistent copies below its own directory:
-`<snapshot-dir>/<database>/data-<unix-ms>.mdb`. Snapshots are not point-in-time
-recovery, are not atomic across databases, and are not verified automatically.
+`<snapshot-dir>/<database>/data-<unix-ms>.mdb`, plus a `.json` metadata marker.
 
-See [Periodic snapshots](backup.md#periodic-snapshots) for configuration,
-retention, and restore details.
+Enable `NONODB_PITR_ENABLED=1` to retain a segmented WAL and replay it forward
+to a chosen timestamp during restore. PITR is per database, not atomic across
+databases. At the WAL size or age limit, writes are rejected with `wal_full`
+until snapshot retention frees covered history.
+
+See [Periodic snapshots](backup.md#periodic-snapshots) and
+[Point-in-time recovery](pitr.md) for configuration, retention, restore, and
+alerts.
 
 ## Backup and restore
 
@@ -836,6 +847,8 @@ Useful signals:
 | `certificates` / `nonodb_tls_certificate_expiry_timestamp_seconds` | Configured server and replication certificate expiry timestamps |
 | `disk` / `nonodb_disk_*` | Filesystem capacity, free, used, and used ratio for data and snapshots |
 | `snapshots` / `nonodb_snapshot_*` | Per-database snapshot success, failures, age, and duration |
+| `wal` / `nonodb_wal_*` | Per-database WAL bytes, age, sequence, hard-limit state, and pruned bytes |
+| `nonodb_pitr_available` | Whether a snapshot plus WAL can serve a PITR restore |
 | `auth_failures_total` | Failed authentication attempts |
 | `auth_blocks_total` | IP lockouts started |
 | `auth_blocked_requests_total` | Requests rejected while the IP was blocked |
@@ -1026,6 +1039,7 @@ backups.
 | `rate_limited` (429) | Too many failed logins from this IP | Wait for `NONODB_AUTH_BLOCK_SECS`; tune lockout thresholds |
 | `timeout` | Long scan exceeds 30 s, or index build exceeds 1 h | Raise `NONODB_REQUEST_TIMEOUT`, `NONODB_INDEX_TIMEOUT`, and client timeout |
 | `document_too_large` (413) | Document > 1 MiB or request > 4 MiB | Split document/import; batch inserts |
+| `wal_full` (507) | PITR WAL reached `NONODB_WAL_MAX_BYTES`/age | Check `nonodb_wal_*`, snapshot disk space, and PITR window; writes resume after retention |
 | `duplicate_key` | Duplicate `_id` or unique-index conflict | Use a new id or update the existing document |
 | `invalid_query` on search | Text/fuzzy/vector index missing | Create the index first |
 | `MDB_DBS_FULL` | Named database limit reached | Reduce collections/indexes; recreate database with fewer names |

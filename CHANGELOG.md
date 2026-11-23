@@ -2,6 +2,15 @@
 
 Full release notes: https://github.com/essmos/nonodb/releases
 
+## Unreleased
+
+- Add opt-in point-in-time recovery through `NONODB_PITR_ENABLED=1`: periodic
+  snapshots plus segmented WAL with replay to an RFC 3339/Unix timestamp during
+  `nonodb-cli restore --to`. Retention prunes only WAL covered by a verified
+  snapshot, hard size/age limits reject writes with `wal_full`, and per-database
+  WAL metrics plus alerts report bytes, age, sequence, availability, and pruned
+  bytes. See `docs/pitr.md`.
+
 ## v0.31.0 - 2026-11-23
 
 - Remove orphaned `.dropped-*` database directories at startup. A failed

@@ -573,7 +573,8 @@ a recovery time and restore it:
 
 ```bash
 nonodb-cli --db app1 restore --to 2026-01-01T12:00:00Z \
-  /var/backups/nonodb/snapshots /var/lib/nonodb --force --verify
+  /var/backups/nonodb/snapshots /var/lib/nonodb \
+  --wal /var/lib/nonodb/app1/wal --force --verify
 ```
 
 The first positional path is a snapshot root containing either
@@ -582,10 +583,17 @@ selected database comes from `--db`/`NONODB_DB`; the default is `default`.
 `--to` also accepts Unix milliseconds or seconds (values below
 `100000000000` are treated as seconds).
 
-This is snapshot selection, not WAL point-in-time recovery: data written after
-the selected snapshot is not replayed. A timestamp with no snapshot at or
-before it fails, as does a timestamp in the future. Without `--to`, `restore`
-keeps its existing backup-directory behavior.
+The command selects the newest snapshot at or before `--to`, then replays the
+retained WAL up to that timestamp when a WAL is available. `--wal` defaults to
+`<target-database>/wal` when restoring in place; pass it explicitly when
+restoring into a new data root. If no WAL exists, the snapshot is restored and a
+warning is printed. A timestamp with no snapshot at or before it fails, as does
+a timestamp in the future or a target older than the retained WAL base. Without
+`--to`, `restore` keeps its existing backup-directory behavior and does not
+replay WAL.
+
+PITR is opt-in with `NONODB_PITR_ENABLED=1`. See
+[Point-in-time recovery](pitr.md) for configuration, limits, and alerts.
 
 ## auth
 

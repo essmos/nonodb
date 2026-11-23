@@ -39,6 +39,7 @@ mod replicator;
 mod retention;
 mod s3_import;
 mod server_info;
+mod wal;
 mod webhooks;
 mod writer;
 
@@ -1146,9 +1147,16 @@ where
     }
 }
 
-/// Periodic LMDB snapshots (consistent copies without stopping writes).
-/// This is not full PITR with a WAL - it provides restore points every N seconds.
-pub(crate) fn spawn_snapshots(store: Arc<Store>, dir: PathBuf, database: String) {
+/// Periodic LMDB snapshots. With PITR enabled, snapshots are the verified
+/// base for WAL retention: only a snapshot whose metadata was fsynced may
+/// allow pruning older WAL segments.
+pub(crate) fn spawn_snapshots(
+    store: Arc<Store>,
+    dir: PathBuf,
+    wal_dir: PathBuf,
+    database: String,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+) -> Option<std::thread::JoinHandle<()>> {
     let interval = std::env::var("NONODB_SNAPSHOT_INTERVAL")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
@@ -1161,47 +1169,88 @@ pub(crate) fn spawn_snapshots(store: Arc<Store>, dir: PathBuf, database: String)
         .filter(|&n| n > 0)
         .unwrap_or(24);
     std::thread::Builder::new()
-        .name("nonodb-snapshots".into())
+        .name(format!("nonodb-snapshots-{database}"))
         .spawn(move || {
             if let Err(e) = std::fs::create_dir_all(&dir) {
                 metrics::record_snapshot_failure(&database);
                 tracing::error!(?e, dir = %dir.display(), "cannot create snapshot directory");
                 return;
             }
+            let mut last_run = std::time::Instant::now()
+                .checked_sub(interval)
+                .unwrap_or_else(std::time::Instant::now);
             loop {
-                let stamp = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis())
-                    .unwrap_or(0);
-                let path = dir.join(format!("data-{stamp}.mdb"));
-                let started = std::time::Instant::now();
-                match store.copy_to_file(&path, nonodb_core::heed::CompactionOption::Enabled) {
-                    Ok(file) => {
-                        if let Err(e) = file.sync_all() {
-                            metrics::record_snapshot_failure(&database);
-                            tracing::warn!(?e, "snapshot fsync failed");
-                        } else {
-                            metrics::record_snapshot_success(&database, started.elapsed());
-                            tracing::info!(path = %path.display(), "snapshot zapisany");
-                            prune_snapshots(&dir, keep);
-                        }
-                    }
-                    Err(e) => {
-                        metrics::record_snapshot_failure(&database);
-                        tracing::error!(?e, "snapshot failed");
-                    }
+                if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
                 }
-                std::thread::sleep(interval);
+                let requested = crate::wal::take_snapshot_request(&store);
+                if requested || last_run.elapsed() >= interval {
+                    snapshot_once(&store, &dir, &wal_dir, &database, keep);
+                    last_run = std::time::Instant::now();
+                }
+                // Wake quickly for WAL pressure and shutdown; the actual
+                // snapshot cadence is still governed by `interval`.
+                std::thread::sleep(Duration::from_millis(500));
             }
         })
-        .ok();
+        .ok()
 }
 
-fn prune_snapshots(dir: &std::path::Path, keep: usize) {
+fn snapshot_once(
+    store: &Store,
+    dir: &std::path::Path,
+    wal_dir: &std::path::Path,
+    database: &str,
+    keep: usize,
+) {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let path = dir.join(format!("data-{stamp}.mdb"));
+    let head = store.replication_head().unwrap_or(0);
+    let started = std::time::Instant::now();
+    match store.copy_to_file(&path, nonodb_core::heed::CompactionOption::Enabled) {
+        Ok(file) => {
+            if let Err(e) = file.sync_all() {
+                metrics::record_snapshot_failure(database);
+                tracing::warn!(?e, "snapshot fsync failed");
+                let _ = std::fs::remove_file(&path);
+                return;
+            }
+            drop(file);
+            if let Err(error) = nonodb_core::pitr::write_snapshot_meta(&path, database, head) {
+                metrics::record_snapshot_failure(database);
+                tracing::warn!(path = %path.display(), error = %error, "snapshot metadata write failed");
+                let _ = std::fs::remove_file(&path);
+                nonodb_core::pitr::remove_snapshot_meta(&path);
+                return;
+            }
+            metrics::record_snapshot_success(database, started.elapsed());
+            tracing::info!(path = %path.display(), head, "snapshot zapisany");
+            let floor = prune_snapshots(dir, keep);
+            if let Some(through) = floor {
+                // The WAL thread owns the active file handle and performs the
+                // actual prune safely after rotating if necessary.
+                let _ = wal_dir;
+                crate::wal::request_prune(store, through);
+            }
+        }
+        Err(e) => {
+            metrics::record_snapshot_failure(database);
+            tracing::error!(?e, "snapshot failed");
+        }
+    }
+}
+
+/// Prunes old snapshots. Returns the replication head of the snapshot that
+/// still covers the oldest retained restore point. `None` means no WAL may be
+/// pruned (legacy/missing metadata or PITR disabled).
+fn prune_snapshots(dir: &std::path::Path, keep: usize) -> Option<u64> {
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
+        return None;
     };
-    let mut files: Vec<PathBuf> = entries
+    let mut files: Vec<(u64, PathBuf)> = entries
         .flatten()
         .map(|e| e.path())
         .filter(|p| {
@@ -1209,14 +1258,56 @@ fn prune_snapshots(dir: &std::path::Path, keep: usize) {
                 .and_then(|n| n.to_str())
                 .is_some_and(|n| n.starts_with("data-") && n.ends_with(".mdb"))
         })
+        .filter_map(|path| snapshot_timestamp(&path).map(|stamp| (stamp, path)))
         .collect();
-    files.sort();
-    let excess = files.len().saturating_sub(keep);
-    for old in files.into_iter().take(excess) {
-        if let Err(e) = std::fs::remove_file(&old) {
-            tracing::warn!(?e, path = %old.display(), "cannot remove old snapshot");
-        }
+    files.sort_by_key(|(stamp, _)| *stamp);
+    if files.is_empty() {
+        return None;
     }
+    if !crate::wal::enabled() {
+        let excess = files.len().saturating_sub(keep);
+        for (_, old) in files.into_iter().take(excess) {
+            if let Err(e) = std::fs::remove_file(&old) {
+                tracing::warn!(?e, path = %old.display(), "cannot remove old snapshot");
+            }
+            nonodb_core::pitr::remove_snapshot_meta(&old);
+        }
+        return None;
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let window_ms = crate::wal::retention_secs().saturating_mul(1000);
+    let newest = files.len() - 1;
+    // Keep the oldest retained base and the newest recovery point. The base is
+    // the newest snapshot at or before the retention window; before a full
+    // window has elapsed it is the oldest snapshot available.
+    let floor = files
+        .iter()
+        .rposition(|(stamp, _)| stamp.saturating_add(window_ms) <= now)
+        .unwrap_or(0);
+    for (index, (_, path)) in files.iter().enumerate() {
+        if index == floor || index == newest {
+            continue;
+        }
+        if let Err(e) = std::fs::remove_file(path) {
+            tracing::warn!(?e, path = %path.display(), "cannot remove old snapshot");
+            continue;
+        }
+        nonodb_core::pitr::remove_snapshot_meta(path);
+    }
+    let meta = nonodb_core::pitr::read_snapshot_meta(&files[floor].1)
+        .ok()
+        .flatten()?;
+    Some(meta.replication_head)
+}
+
+fn snapshot_timestamp(path: &std::path::Path) -> Option<u64> {
+    let name = path.file_name()?.to_str()?;
+    let value = name.strip_prefix("data-")?.strip_suffix(".mdb")?;
+    value.parse::<u64>().ok()
 }
 
 async fn no_store(request: axum::extract::Request, next: axum::middleware::Next) -> Response {
@@ -5162,6 +5253,7 @@ pub(crate) fn error_status(err: &ApiError) -> StatusCode {
         | "invalid_collection_profile" => StatusCode::BAD_REQUEST,
         "not_found" => StatusCode::NOT_FOUND,
         "database_limit" => StatusCode::SERVICE_UNAVAILABLE,
+        "wal_full" => StatusCode::INSUFFICIENT_STORAGE,
         "unsafe_durability_disabled" => StatusCode::BAD_REQUEST,
         "unauthorized" => StatusCode::UNAUTHORIZED,
         "forbidden" | "read_only" => StatusCode::FORBIDDEN,

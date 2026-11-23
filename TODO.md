@@ -6,8 +6,6 @@ deliberate limitations are documented in [docs/roadmap.md](docs/roadmap.md).
 
 ## P0 — konieczne przed produkcją
 
-- [ ] Point-in-time recovery / WAL: continuous recovery to a chosen timestamp,
-      with startup replay and documented RPO/RTO.
 - [ ] CRL/OCSP support for mutual TLS, or an equivalent automated revocation
       path for externally managed PKI.
 - [ ] Real sparse/partial index semantics, including unique-index behavior for

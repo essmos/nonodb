@@ -109,7 +109,7 @@ pub(crate) fn replication_origin() -> Option<String> {
             let enabled = std::env::var("NONODB_REPLICATION_ENABLED")
                 .ok()
                 .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"));
-            if !enabled {
+            if !enabled && !crate::wal::enabled() {
                 return None;
             }
             Some(
@@ -274,6 +274,16 @@ fn capture_replicated_ttls(
 
 fn run_batch(store: &Store, cache: &QueryCache, jobs: Vec<WriteJob>) {
     metrics::sub(&metrics::QUEUE_LEN, jobs.len() as u64);
+    if crate::wal::is_full(store) {
+        let err = ApiError {
+            code: "wal_full".to_string(),
+            message: "PITR WAL has reached its hard limit; wait for snapshot retention to prune covered segments".to_string(),
+        };
+        for job in jobs {
+            let _ = job.resp.send(Err(err.clone()));
+        }
+        return;
+    }
     if !crate::replicator::writable() {
         let err = ApiError {
             code: "read_only".to_string(),
@@ -379,6 +389,13 @@ fn run_batch(store: &Store, cache: &QueryCache, jobs: Vec<WriteJob>) {
 
 fn run_single(store: &Store, cache: &QueryCache, job: WriteJob) {
     metrics::inc(&metrics::WRITE_BATCHES);
+    if crate::wal::is_full(store) {
+        let _ = job.resp.send(Err(ApiError {
+            code: "wal_full".to_string(),
+            message: "PITR WAL has reached its hard limit; wait for snapshot retention to prune covered segments".to_string(),
+        }));
+        return;
+    }
     let sync = job.durability == Durability::Full;
     let mut wtxn = match store.write_txn_unsynced() {
         Ok(wtxn) => wtxn,

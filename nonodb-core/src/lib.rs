@@ -26,6 +26,7 @@ pub mod index;
 pub mod instance;
 pub mod numeric;
 pub mod observer;
+pub mod pitr;
 pub mod progress;
 pub mod query;
 mod regex;

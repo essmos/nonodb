@@ -46,6 +46,8 @@ pub struct DatabaseRuntime {
     writer: Mutex<Option<std::thread::JoinHandle<()>>>,
     maintenance: Mutex<Option<std::thread::JoinHandle<()>>>,
     webhooks: Mutex<Option<std::thread::JoinHandle<()>>>,
+    snapshots: Mutex<Option<std::thread::JoinHandle<()>>>,
+    wal: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl DatabaseRuntime {
@@ -66,6 +68,12 @@ impl Drop for DatabaseRuntime {
             let _ = handle.join();
         }
         if let Some(handle) = self.webhooks.lock().expect("webhooks lock").take() {
+            let _ = handle.join();
+        }
+        if let Some(handle) = self.snapshots.lock().expect("snapshots lock").take() {
+            let _ = handle.join();
+        }
+        if let Some(handle) = self.wal.lock().expect("wal lock").take() {
             let _ = handle.join();
         }
         if let Some(handle) = self.writer.lock().expect("writer lock").take() {
@@ -321,10 +329,38 @@ impl Databases {
     }
 }
 
+fn parse_pitr_target(raw: &str) -> Result<u64, String> {
+    let raw = raw.trim();
+    if let Ok(value) = raw.parse::<u64>() {
+        return Ok(if value < 100_000_000_000 {
+            value.saturating_mul(1000)
+        } else {
+            value
+        });
+    }
+    let ms = nonodb_core::date::parse_rfc3339_ms(raw)
+        .ok_or_else(|| format!("invalid NONODB_PITR_REPLAY_TO: {raw}"))?;
+    u64::try_from(ms).map_err(|_| format!("NONODB_PITR_REPLAY_TO is before the Unix epoch: {raw}"))
+}
+
 fn start_runtime(root: &Path, name: &str) -> Result<DatabaseRuntime, String> {
     let path = root.join(name);
     fs::create_dir_all(&path).map_err(|e| format!("create database `{name}`: {e}"))?;
     let store = Arc::new(Store::open(&path).map_err(|e| format!("open database `{name}`: {e}"))?);
+    if let Some(raw) = std::env::var_os("NONODB_PITR_REPLAY_TO") {
+        let raw = raw.to_string_lossy();
+        let target = parse_pitr_target(&raw)?;
+        let wal_dir = crate::wal::dir(&path);
+        let report = nonodb_core::pitr::replay_to(&store, &wal_dir, target)
+            .map_err(|e| format!("PITR startup replay for `{name}`: {e}"))?;
+        tracing::info!(
+            database = name,
+            target,
+            applied = report.applied,
+            last_seq = report.last_replayed_seq,
+            "PITR startup replay completed"
+        );
+    }
     let (write_tx, write_rx) = mpsc::channel::<WriteJob>();
     let cache = Arc::new(QueryCache::from_env());
     let writer_store = store.clone();
@@ -344,13 +380,19 @@ fn start_runtime(root: &Path, name: &str) -> Result<DatabaseRuntime, String> {
     );
     let webhooks =
         crate::webhooks::start(store.clone(), write_tx.clone(), path.clone(), stop.clone());
-    if let Some(dir) = std::env::var_os("NONODB_SNAPSHOT_DIR") {
+    let wal = crate::wal::start(store.clone(), path.clone(), name.to_string(), stop.clone());
+    let snapshot_dir = std::env::var_os("NONODB_SNAPSHOT_DIR")
+        .map(|dir| PathBuf::from(dir).join(name))
+        .or_else(|| crate::wal::enabled().then(|| path.join("snapshots")));
+    let snapshots = snapshot_dir.and_then(|dir| {
         crate::spawn_snapshots(
             store.clone(),
-            PathBuf::from(dir).join(name),
+            dir,
+            crate::wal::dir(&path),
             name.to_string(),
-        );
-    }
+            stop.clone(),
+        )
+    });
     Ok(DatabaseRuntime {
         store,
         write_tx,
@@ -360,6 +402,8 @@ fn start_runtime(root: &Path, name: &str) -> Result<DatabaseRuntime, String> {
         writer: Mutex::new(Some(writer)),
         maintenance: Mutex::new(Some(maintenance)),
         webhooks: Mutex::new(Some(webhooks)),
+        snapshots: Mutex::new(snapshots),
+        wal: Mutex::new(wal),
     })
 }
 

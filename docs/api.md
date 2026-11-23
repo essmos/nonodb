@@ -3378,6 +3378,7 @@ collection, op, id, and before/after documents. Replicas reject stale epochs. Re
 | `invalid_query` | 400 | Invalid filter/update/index/query shape, write in a read batch, unsupported operator |
 | `unsafe_durability_disabled` | 400 | `durability:"unsafe"` without `NONODB_ALLOW_UNSAFE_WRITES=1` |
 | `database_limit` | 503 | Too many open databases and no idle environment can be evicted |
+| `wal_full` | 507 | PITR WAL reached its size or age limit; reads continue until snapshot retention frees covered history |
 | `invalid_sql` | 400 | SQL parse/planning error or unsupported SQL clause |
 | `invalid_json` | 400 | Malformed JSON document or value |
 | `invalid_collection` | 400 | Invalid collection name |

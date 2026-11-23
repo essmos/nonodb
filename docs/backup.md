@@ -38,9 +38,10 @@ atomic snapshot across databases. A backup does **not** include:
 - the audit log;
 - vault tenant keys.
 
-Backups are consistent copies, not a write-ahead log. There is no point-in-time
-recovery to an arbitrary operation. The recovery point is the moment each
-database copy was taken.
+Backups are consistent copies. A single backup restores to the moment its copy
+was taken. For recovery to an arbitrary timestamp between snapshots, enable the
+opt-in [point-in-time recovery](pitr.md), which retains a WAL beside regular
+snapshots.
 
 ## Quick reference
 
@@ -54,7 +55,7 @@ database copy was taken.
 | Restore one database | `nonodb-cli --db app1 restore BACKUP ROOT --force` |
 | Restore and verify one database | `nonodb-cli --db app1 restore BACKUP ROOT --force --verify` |
 | Restore all databases | `nonodb-cli restore-all BACKUP ROOT --force --verify` |
-| Restore newest snapshot at/before a time | `nonodb-cli --db app1 restore --to TIME SNAPSHOTS ROOT --force --verify` |
+| Restore newest snapshot at/before a time | `nonodb-cli --db app1 restore --to TIME SNAPSHOTS ROOT --wal WAL --force --verify` |
 | Automated drill | `python3 scripts/restore_drill.py` |
 | Branch a snapshot for CI | `nonodb-cli branch NAME --from-snapshot SNAPSHOT --data ROOT --verify` |
 
@@ -134,6 +135,15 @@ browser.
 
 ## Periodic snapshots
 
+Periodic snapshots are enabled with `NONODB_SNAPSHOT_DIR`; for PITR they are
+also enabled with `NONODB_PITR_ENABLED=1` and default below each database
+directory. Each database writes compacted copies as
+`<snapshot-dir>/<database>/data-<unix-ms>.mdb` with a `.json` metadata marker.
+
+With PITR enabled, the marker records the snapshot's verified recovery base and
+WAL retention only deletes history covered by such a snapshot. See
+[Point-in-time recovery](pitr.md) for retention, hard limits, and replay.
+
 The daemon can write compacted snapshots on a fixed interval:
 
 ```bash
@@ -144,9 +154,11 @@ export NONODB_SNAPSHOT_KEEP=24
 
 Each database writes snapshots below its own directory:
 `$NONODB_SNAPSHOT_DIR/<database>/data-<unix-ms>.mdb`. Retention is independent
-per database and removes the oldest files after each successful snapshot.
-Snapshots do not have a `manifest.json`, are not atomic across databases, and
-are not automatically verified.
+per database. Without PITR it removes the oldest files after each successful
+snapshot; with PITR it keeps the recovery-window base and newest snapshot.
+Snapshots do not have a `manifest.json` and are not atomic across databases.
+PITR snapshots get a fsynced metadata marker before they may cover WAL pruning,
+but this is not a deep `verify`.
 
 For a one-off restore from a snapshot, select the database and pass the file
 directly:

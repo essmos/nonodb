@@ -64,7 +64,9 @@ Implemented:
 - Unix-socket daemon, optional TCP/TLS and mutual TLS, file-based principals and scopes, uid/gid allow-lists;
 - group commit, request limits/timeouts, JSON and Prometheus metrics, health/readiness, disk and snapshot monitoring;
 - snapshots, online backup, SHA-256 manifests, deep verification, restore drills,
-  snapshot-based `restore --to <timestamp>`, CLI;
+  snapshot-based `restore --to <timestamp>`, and opt-in snapshot + segmented
+  WAL point-in-time recovery with hard size/age limits and `wal_full` write
+  rejection;
 - `scripts/nonodb-migrate.py` for quiesced MongoDB migration with checksums and
   an opt-in MongoDB wire shadow mode with JSONL diff reports;
 - offline `nonodb-cli branch` clones with reflink/clonefile, snapshot sources,
@@ -100,6 +102,9 @@ Implemented:
   Use `find_and_modify`, atomic update operators (`$inc`), or `write_batch`.
 - **One writer.** All writes are serialized. This is a design choice, not a
   temporary limitation.
+- **PITR is per database.** There is no atomic multi-database point-in-time
+  recovery. PITR is opt-in, bounded by WAL size/age limits, and excludes
+  `auth.json`, audit logs, and vault tenant keys.
 - **Replication is asynchronous and primary/replica, not multi-writer.** Sharding
   and cross-database transactions are not implemented. The control plane
   replicates auth, backup jobs/state, the database catalog, and the cluster peer
@@ -264,7 +269,7 @@ comparison and practical migration caveats.
   restore to reclaim space.
 - `map_size` can grow online; shrinking the reservation requires a restart and
   the file itself only shrinks through a compacting backup/restore.
-- No write-ahead log or point-in-time recovery. Snapshots and native backups
+- PITR is opt-in and per database. Without it, snapshots and native backups
   are periodic full consistent copies; deduplicated incremental repositories
   use the restic engine.
 - No online schema migration framework.
@@ -285,7 +290,7 @@ comparison and practical migration caveats.
 | JSON on disk | Human-readable and flexible; larger/slower than CBOR for large data |
 | Simple optimizer | Predictable; misses some multi-index opportunities |
 | Global token auth | Simple; insufficient for multi-tenant roles |
-| Snapshot-based backup | Simple; not PITR |
+| Snapshot + WAL recovery | Fast snapshot restore and timestamp replay; opt-in disk cost and bounded retention |
 | Projection tree model | Nested paths, positional `$`, `$slice`, `$elemMatch`, and basic `$meta` work |
 
 ## Future work
@@ -294,25 +299,23 @@ The current implementation plan is limited to this list.
 
 ### P0 — necessary before production
 
-1. **Point-in-time recovery / WAL.** Continuous recovery to a chosen timestamp,
-   with startup replay and documented RPO/RTO.
-2. **CRL/OCSP support for mutual TLS.** Or an equivalent automated revocation
+1. **CRL/OCSP support for mutual TLS.** Or an equivalent automated revocation
    path for externally managed PKI.
-3. **Real sparse/partial index semantics.** Unique-index behavior for missing
+2. **Real sparse/partial index semantics.** Unique-index behavior for missing
    fields, query planning, migration notes, and MongoDB compatibility tests.
-4. **Per-database quotas and usage accounting.** Limits for data, indexes,
+3. **Per-database quotas and usage accounting.** Limits for data, indexes,
    history, and sidecars, with operator-visible warnings and a write-rejection
    policy.
-5. **Safe restore-in-place API and GUI flow.** Typed confirmation, preflight
+4. **Safe restore-in-place API and GUI flow.** Typed confirmation, preflight
    verification, audit logging, and rollback guidance.
 
 ### P1 — low effort, worthwhile
 
-1. **Publish `nonodb-client` to PyPI.** Use the prepared manual workflow.
-2. **Client-side `lookup_join` helpers.** Python, Node.js, Rust, and Go, with
-   order and missing-key alignment.
-3. **Stored BSON regex values.** Matching `$type` entries and documented index
-   behavior.
+- Publish `nonodb-client` to PyPI using the prepared manual workflow.
+- Add client-side `lookup_join` helpers in Python, Node.js, Rust, and Go,
+  preserving order and missing-key alignment.
+- Store BSON regex values with matching `$type` entries and documented index
+  behavior.
 
 ## Non-goals
 

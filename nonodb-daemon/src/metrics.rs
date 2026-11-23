@@ -325,6 +325,75 @@ pub fn record_snapshot_failure(database: &str) {
     entry.last_failure_unix = unix_now();
 }
 
+#[derive(Clone, Debug, Default)]
+struct WalCounters {
+    bytes: u64,
+    oldest_unix: u64,
+    last_seq: u64,
+    full: bool,
+    available: bool,
+    pruned_bytes_total: u64,
+}
+
+fn wal_map() -> &'static Mutex<BTreeMap<String, WalCounters>> {
+    static MAP: OnceLock<Mutex<BTreeMap<String, WalCounters>>> = OnceLock::new();
+    MAP.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+/// Publishes the current PITR WAL state for one database.
+pub fn record_wal(
+    database: &str,
+    bytes: u64,
+    oldest_unix: u64,
+    last_seq: u64,
+    full: bool,
+    available: bool,
+) {
+    let mut map = wal_map()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let entry = map.entry(database.to_string()).or_default();
+    entry.bytes = bytes;
+    entry.oldest_unix = oldest_unix;
+    entry.last_seq = last_seq;
+    entry.full = full;
+    entry.available = available;
+}
+
+/// Adds bytes removed by WAL retention to the per-database counter.
+pub fn record_wal_pruned(database: &str, bytes: u64) {
+    let mut map = wal_map()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let entry = map.entry(database.to_string()).or_default();
+    entry.pruned_bytes_total = entry.pruned_bytes_total.saturating_add(bytes);
+}
+
+fn wal_json() -> Vec<Value> {
+    let now = unix_now();
+    let map = wal_map()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    map.iter()
+        .map(|(database, counters)| {
+            json!({
+                "database": database,
+                "bytes": counters.bytes,
+                "oldest_unix": counters.oldest_unix,
+                "oldest_age_seconds": if counters.oldest_unix == 0 {
+                    Value::Null
+                } else {
+                    json!(now.saturating_sub(counters.oldest_unix))
+                },
+                "last_seq": counters.last_seq,
+                "full": u64::from(counters.full),
+                "pitr_available": u64::from(counters.available),
+                "pruned_bytes_total": counters.pruned_bytes_total,
+            })
+        })
+        .collect()
+}
+
 fn snapshots_json() -> Vec<Value> {
     let now = unix_now();
     let map = snapshot_map()
@@ -709,6 +778,7 @@ pub fn snapshot() -> Value {
         "ttl_sweep_errors_total": TTL_SWEEP_ERRORS.load(Relaxed),
         "ttl_backlog": TTL_BACKLOG.load(Relaxed),
         "snapshots": snapshots_json(),
+        "wal": wal_json(),
         "certificates": certificates_json(),
         "disk": disk_json(),
         "index_builds": nonodb_core::progress::snapshot(),
@@ -1629,6 +1699,61 @@ pub fn prometheus() -> String {
         }
     }
 
+    if let Some(wal) = snapshot["wal"].as_array() {
+        const WAL_METRICS: &[(&str, &str, &str, &str)] = &[
+            (
+                "nonodb_wal_bytes",
+                "bytes",
+                "gauge",
+                "Bytes used by retained PITR WAL segments.",
+            ),
+            (
+                "nonodb_wal_oldest_age_seconds",
+                "oldest_age_seconds",
+                "gauge",
+                "Age of the oldest retained WAL segment.",
+            ),
+            (
+                "nonodb_wal_last_sequence",
+                "last_seq",
+                "gauge",
+                "Highest sequence archived in the WAL.",
+            ),
+            (
+                "nonodb_wal_full",
+                "full",
+                "gauge",
+                "1 when the WAL hard limit blocks writes.",
+            ),
+            (
+                "nonodb_pitr_available",
+                "pitr_available",
+                "gauge",
+                "1 when a snapshot plus WAL can serve a PITR restore.",
+            ),
+            (
+                "nonodb_wal_pruned_bytes_total",
+                "pruned_bytes_total",
+                "counter",
+                "WAL bytes removed by snapshot-covered retention.",
+            ),
+        ];
+        for (name, key, kind, help) in WAL_METRICS {
+            prom_header(&mut out, name, kind, help);
+            for row in wal {
+                if row[*key].is_null() {
+                    continue;
+                }
+                prom_sample(
+                    &mut out,
+                    name,
+                    &[("database", row["database"].as_str().unwrap_or(""))],
+                    &row[*key],
+                );
+            }
+        }
+    }
+
     if let Some(snapshots) = snapshot["snapshots"].as_array() {
         const SNAPSHOT_METRICS: &[(&str, &str, &str, &str)] = &[
             (
@@ -1690,6 +1815,36 @@ pub fn prometheus() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wal_metrics_are_exposed_in_snapshot_and_prometheus() {
+        let database = format!("wal-metrics-{}", std::process::id());
+        record_wal(
+            &database,
+            2048,
+            unix_now().saturating_sub(30),
+            7,
+            true,
+            false,
+        );
+        record_wal_pruned(&database, 512);
+        let snapshot = snapshot();
+        let row = snapshot["wal"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["database"] == database.as_str())
+            .expect("wal row");
+        assert_eq!(row["bytes"], 2048);
+        assert_eq!(row["full"], 1);
+        assert_eq!(row["pitr_available"], 0);
+        assert_eq!(row["pruned_bytes_total"], 512);
+        let text = prometheus();
+        assert!(text.contains("nonodb_wal_bytes{database=\""));
+        assert!(text.contains("nonodb_wal_full{database=\""));
+        assert!(text.contains("nonodb_pitr_available{database=\""));
+        assert!(text.contains("nonodb_wal_pruned_bytes_total{database=\""));
+    }
 
     #[test]
     fn collection_metrics_are_isolated_and_include_cache_and_errors() {

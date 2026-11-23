@@ -210,6 +210,17 @@ Periodic snapshots expose per-database series:
 | `nonodb_snapshot_last_failure_timestamp_seconds` | Unix time of the last failure |
 | `nonodb_snapshot_last_duration_ms` | Duration of the last successful snapshot |
 
+With PITR enabled, WAL retention exposes per-database series:
+
+| Metric | Meaning |
+|---|---|
+| `nonodb_wal_bytes` | Bytes used by retained WAL |
+| `nonodb_wal_oldest_age_seconds` | Age of the oldest retained WAL segment |
+| `nonodb_wal_last_sequence` | Highest sequence archived in the WAL |
+| `nonodb_wal_full` | `1` while the hard limit rejects writes |
+| `nonodb_pitr_available` | `1` when a snapshot plus WAL can serve a restore |
+| `nonodb_wal_pruned_bytes_total` | WAL bytes removed by covered-snapshot retention |
+
 `nonodb-cli backup` runs outside the daemon, so its age is not reported here.
 For external backups, write a timestamp marker in your backup script and alert
 on the marker's age, or use the target's native backup monitoring.
@@ -256,6 +267,9 @@ At minimum, alert on:
 5. a sustained `nonodb_errors_total` rate
 6. `nonodb_auth_failures_total` and `nonodb_auth_blocks_total`
 7. `nonodb_tls_certificate_expiry_timestamp_seconds - time() < 14 * 24 * 3600`
+8. `nonodb_wal_full == 1`
+9. `nonodb_pitr_available == 0` when PITR is enabled and the WAL has data
+10. `nonodb_wal_oldest_age_seconds` above the configured PITR window
 
 `GET /metrics` remains available for existing JSON consumers and includes the
-same extra `disk`, `snapshots`, and `collection_metrics` fields.
+same extra `disk`, `snapshots`, `wal`, and `collection_metrics` fields.

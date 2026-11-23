@@ -606,11 +606,15 @@ fn run() -> Result<(), String> {
             backup_all(&data, &out, with_sidecars)?;
         }
         "restore-all" => {
-            if args
-                .iter()
-                .any(|arg| arg == "--to" || arg.starts_with("--to="))
-            {
-                return Err("--to is only supported by the single-database restore command".into());
+            if args.iter().any(|arg| {
+                arg == "--to"
+                    || arg.starts_with("--to=")
+                    || arg == "--wal"
+                    || arg.starts_with("--wal=")
+            }) {
+                return Err(
+                    "--to/--wal are only supported by the single-database restore command".into(),
+                );
             }
             let backup = PathBuf::from(
                 args.get(1)
@@ -710,7 +714,7 @@ fn usage() -> Result<(), String> {
          verify <data> [--json]     głęboka weryfikacja wybranej bazy i indeksów\n\
          verify-backup <backup> [--json]  sprawdź manifest, sumę SHA-256 i zawartość\n\
          inspect <data> [coll]      statystyki bazy/kolekcji (--db wybiera bazę)\n\
-         restore <backup> <data> [--force] [--verify] [--to <czas>]  przywróć bazę (najpierw zatrzymaj daemona)\n\
+         restore <backup> <data> [--force] [--verify] [--to <czas>] [--wal <katalog>]  przywróć bazę (najpierw zatrzymaj daemona)\n\
          restore-all <backup> <data> [--force] [--verify]  przywróć wszystkie bazy\n\
          \n\
          Opcje: --db <nazwa> wybiera bazę (albo NONODB_DB).\n\
@@ -1875,7 +1879,7 @@ fn restore_all(backup: &Path, data: &Path, force: bool, verify: bool) -> Result<
             ));
         }
         let target = data.join(name);
-        restore_into(&source, &target, force, verify)?;
+        restore_into(&source, &target, force, verify, None)?;
     }
     eprintln!(
         "restore-all: {} databases -> {}",
@@ -2034,6 +2038,7 @@ struct RestoreOptions {
     force: bool,
     verify: bool,
     to_ms: Option<u64>,
+    wal: Option<PathBuf>,
 }
 
 fn parse_restore_options(args: &[String]) -> Result<RestoreOptions, String> {
@@ -2042,6 +2047,7 @@ fn parse_restore_options(args: &[String]) -> Result<RestoreOptions, String> {
     let mut force = false;
     let mut verify = false;
     let mut to_ms = None;
+    let mut wal = None;
     let mut index = 0;
     while index < args.len() {
         let arg = &args[index];
@@ -2057,6 +2063,15 @@ fn parse_restore_options(args: &[String]) -> Result<RestoreOptions, String> {
             }
             _ if arg.starts_with("--to=") => {
                 to_ms = Some(parse_restore_timestamp(&arg["--to=".len()..])?);
+            }
+            "--wal" => {
+                index += 1;
+                wal = Some(PathBuf::from(
+                    args.get(index).ok_or("--wal requires a WAL directory")?,
+                ));
+            }
+            _ if arg.starts_with("--wal=") => {
+                wal = Some(PathBuf::from(&arg["--wal=".len()..]));
             }
             _ if arg.starts_with('-') => {
                 return Err(format!("unknown restore option: {arg}"));
@@ -2075,14 +2090,15 @@ fn parse_restore_options(args: &[String]) -> Result<RestoreOptions, String> {
     }
     Ok(RestoreOptions {
         backup: backup.ok_or(
-            "użycie: nonodb-cli restore <backup-dir> <data-dir> [--force] [--verify] [--to <czas>]",
+            "użycie: nonodb-cli restore <backup-dir> <data-dir> [--force] [--verify] [--to <czas>] [--wal <katalog>]",
         )?,
         data: data.ok_or(
-            "użycie: nonodb-cli restore <backup-dir> <data-dir> [--force] [--verify] [--to <czas>]",
+            "użycie: nonodb-cli restore <backup-dir> <data-dir> [--force] [--verify] [--to <czas>] [--wal <katalog>]",
         )?,
         force,
         verify,
         to_ms,
+        wal,
     })
 }
 
@@ -2168,6 +2184,7 @@ fn select_snapshot(root: &Path, database: &str, to_ms: u64) -> Result<(u64, Path
 
 fn restore_cmd(args: &[String]) -> Result<(), String> {
     let options = parse_restore_options(args)?;
+    let target = database_target(&options.data)?;
     let backup = if let Some(to_ms) = options.to_ms {
         let (timestamp, path) = select_snapshot(&options.backup, &selected_database(), to_ms)?;
         eprintln!(
@@ -2180,16 +2197,37 @@ fn restore_cmd(args: &[String]) -> Result<(), String> {
     } else {
         options.backup
     };
-    let target = database_target(&options.data)?;
-    restore(&backup, &target, options.force, options.verify)
+    let wal = options.to_ms.and_then(|_| {
+        if let Some(wal) = options.wal.clone() {
+            return Some(wal);
+        }
+        let default = target.join(nonodb_core::pitr::WAL_DIR);
+        if default.is_dir() {
+            Some(default)
+        } else {
+            eprintln!(
+                "pitr: no WAL found at {}; restoring the snapshot only (pass --wal to replay history)",
+                default.display()
+            );
+            None
+        }
+    });
+    restore_into(
+        &backup,
+        &target,
+        options.force,
+        options.verify,
+        wal.as_deref().zip(options.to_ms),
+    )
 }
 
-fn restore(backup: &Path, data: &Path, force: bool, verify: bool) -> Result<(), String> {
-    let target = database_target(data)?;
-    restore_into(backup, &target, force, verify)
-}
-
-fn restore_into(backup: &Path, data: &Path, force: bool, verify: bool) -> Result<(), String> {
+fn restore_into(
+    backup: &Path,
+    data: &Path,
+    force: bool,
+    verify: bool,
+    pitr: Option<(&Path, u64)>,
+) -> Result<(), String> {
     let manifest = if backup.is_dir() {
         nonodb_core::verify::read_manifest(backup).map_err(|e| e.to_string())?
     } else {
@@ -2292,6 +2330,22 @@ fn restore_into(backup: &Path, data: &Path, force: bool, verify: bool) -> Result
         restore_search_sidecars(backup, data, identity.as_deref())?;
     }
     eprintln!("restore: {} -> {}", src.display(), dst.display());
+    if let Some((wal_dir, target_ms)) = pitr {
+        if !wal_dir.is_dir() {
+            return Err(format!(
+                "PITR WAL directory not found: {} (pass --wal <dir>)",
+                wal_dir.display()
+            ));
+        }
+        let store = nonodb_core::Store::open(data).map_err(|e| e.to_string())?;
+        let report = nonodb_core::pitr::replay_to(&store, wal_dir, target_ms)
+            .map_err(|e| format!("PITR replay failed: {e}"))?;
+        eprintln!(
+            "pitr: replayed {} transactions through sequence {} (snapshot head {}, target {})",
+            report.applied, report.last_replayed_seq, report.snapshot_head, report.target_ms
+        );
+        drop(store);
+    }
     if verify {
         let has_sidecars = ["search", "vector-ann"]
             .iter()
@@ -2369,5 +2423,6 @@ mod tests {
         assert!(options.force);
         assert!(options.verify);
         assert_eq!(options.to_ms, Some(2_000_000));
+        assert!(options.wal.is_none());
     }
 }
