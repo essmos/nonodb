@@ -182,6 +182,7 @@ def main() -> int:
         snap_root.mkdir(parents=True)
         snapshot = snap_root / "data-1700000000000.mdb"
         shutil.copy2(backup / "data.mdb", snapshot)
+        snapshot.chmod(0o444)
         snapshot_output = branch_json(
             cli, "snapshot", "--from-snapshot", str(snapshot), "--data", str(data), "--verify"
         )

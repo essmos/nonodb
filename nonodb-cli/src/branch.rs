@@ -362,6 +362,23 @@ fn replace_target(temp: &Path, target: &Path, root: &Path, name: &str) -> Result
     }
 }
 
+fn make_writable(path: &Path) -> Result<(), String> {
+    let metadata =
+        fs::metadata(path).map_err(|error| format!("metadata {}: {error}", path.display()))?;
+    let mut permissions = metadata.permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        permissions.set_mode(permissions.mode() | 0o600);
+    }
+    #[cfg(not(unix))]
+    {
+        permissions.set_readonly(false);
+    }
+    fs::set_permissions(path, permissions)
+        .map_err(|error| format!("make {} writable: {error}", path.display()))
+}
+
 fn tree_size(path: &Path) -> u64 {
     let Ok(entries) = fs::read_dir(path) else {
         return 0;
@@ -431,6 +448,7 @@ fn run_branch(
     let result = (|| {
         let started = Instant::now();
         let (bytes, method) = copy_file(&source_data, &temp.join("data.mdb"))?;
+        make_writable(&temp.join("data.mdb"))?;
         let mut stats = CopyStats { bytes, method };
         if !options.no_sidecars {
             for name in ["search", "vector-ann"] {
