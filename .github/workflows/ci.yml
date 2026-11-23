@@ -157,8 +157,8 @@ jobs:
         with:
           go-version: stable
 
-      - name: Install Python MongoDB driver
-        run: python3 -m pip install --disable-pip-version-check pymongo
+      - name: Install Python MongoDB driver and client dependencies
+        run: python3 -m pip install --disable-pip-version-check pymongo httpx
 
       - name: Build daemon
         run: cargo build --locked --bins
