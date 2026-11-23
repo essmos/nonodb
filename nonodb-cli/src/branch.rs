@@ -604,6 +604,29 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_reflink_is_used_on_a_cow_filesystem() {
+        let Some(base) = std::env::var_os("NONODB_TEST_REFLINK_DIR") else {
+            return;
+        };
+        let root = PathBuf::from(base).join(format!(
+            "nonodb-reflink-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("source");
+        let target = root.join("target");
+        fs::write(&source, vec![9u8; 1024 * 1024]).unwrap();
+        let (_, method) = copy_file(&source, &target).unwrap();
+        assert_eq!(method, Method::Reflink);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn failed_copy_leaves_no_partial_target() {
         let root = temp_root("partial");
