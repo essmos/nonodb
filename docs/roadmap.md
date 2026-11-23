@@ -1,7 +1,7 @@
 # Roadmap and limits
 
 nonodb is intentionally narrow. This page lists what is supported today, what
-is deliberately out of scope, and which gaps are candidates for future work.
+is deliberately out of scope, and where active implementation work is tracked.
 
 ## Current status
 
@@ -288,74 +288,16 @@ comparison and practical migration caveats.
 | Snapshot-based backup | Simple; not PITR |
 | Projection tree model | Nested paths, positional `$`, `$slice`, `$elemMatch`, and basic `$meta` work |
 
-## Candidate future work
+## Future work
 
-These are not commitments. They are ordered roughly by expected value for the
-project's target workload.
+Active implementation tasks live only in [TODO.md](../TODO.md). This roadmap
+does not keep a second wishlist or a duplicate backlog: if an item is not in
+`TODO.md`, it is not part of the current plan. Removing an item from `TODO.md`
+does not mean it was implemented; unsupported behavior remains documented in
+the limitations above and in the relevant guides.
 
-### Backlog scope
-
-`TODO.md` intentionally tracks a filtered implementation backlog: low/medium
-difficulty tasks worth doing now. Before the current backlog was executed, the
-user removed larger product ideas, high-cost integrations, and work that needs
-measured evidence or a separate design decision. Removing an item from
-`TODO.md` does not mean it was implemented; the unsupported behavior remains
-documented in this roadmap and the relevant guides.
-
-### GUI and operator experience
-
-1. **Backup verification and restore APIs.** Let the GUI verify manifests and
-   show restore instructions without direct filesystem access.
-2. **Import progress and large result sets.** Cancellable/resumable imports and
-   virtualized large result sets.
-3. **Deeper accessibility testing and density.** Screen-reader passes on real
-   assistive technology and an optional compact layout.
-
-### High value
-
-1. **Raw JSON passthrough for simple reads (implemented).** For `find` without
-   projection, sorting, or an index hint, stored JSON bytes are returned directly
-   instead of being parsed to `Value` and reserialized. Filtered full scans still
-   parse for matching but reuse the original bytes for output. Indexed paths keep
-   their existing plans.
-2. **Incremental index backfill writes (implemented).** Backfill streams chunks
-   capped by document count and raw bytes, applies entries as each chunk
-   completes, and avoids collection-sized unique-key maps.
-3. **Reindex tooling (implemented).** The `reindex` operation and CLI/GUI/Python
-   entry points rebuild secondary, text, fuzzy, and vector indexes in one write
-   transaction.
-4. **Operational hardening.** More metrics such as latency histograms and
-   per-stage query timings. Health/readiness, index-build status, structured logs,
-   and graceful drain are implemented.
-
-### Medium value
-
-6. **Role hierarchy and inherited groups.** Principal tokens, database-qualified
-   scopes, and mTLS-to-principal mapping already exist.
-7. **Point-in-time recovery / WAL** for stricter durability and recovery
-   objectives.
-8. **Stop words, stemming, and per-index analyzers**; possibly an integration
-   with Tantivy for advanced text search.
-9. **Non-finite Decimal128 values and decimal comparison across all numeric
-    edge cases**, building on the current finite Decimal128 support.
-10. **BSON regex values**, plus matching `$type` entries and
-    global sentinel range behavior.
-11. **Compression and/or CBOR storage** for smaller files and faster parsing,
-   with a migration path.
-12. **Expanded aggregation** beyond the current `$match`/`$group`/`$bucket`/
-    `$bucketAuto`/`$project`/`$sort`/`$limit`/`$facet`/`$sample`/`$lookup`/
-    `$unionWith`/`$graphLookup`/`$setWindowFields`/`$densify`/`$fill`/`$out`/
-    `$merge` subset, including streaming execution.
-
-### Lower priority
-
-13. Sparse/partial and wildcard indexes.
-14. Advanced approximate vector indexes (HNSW/PQ) and polygon/line document geo
-    indexes. A basic IVF sidecar is implemented.
-15. Published package-registry releases for the existing Python, Rust, Node.js,
-    and Go clients.
-16. Benchmark automation in CI.
-17. Shared or hosted web administration beyond the embedded local GUI.
+The absence of a feature from `TODO.md` does not guarantee it will never be
+added. It means there is no committed implementation plan for it today.
 
 ## Non-goals
 
@@ -366,7 +308,6 @@ documented in this roadmap and the relevant guides.
   primary/replica replication is supported; see the
   [replication and cluster guide](replication-cluster-guide.md).
 - A general-purpose OLAP engine.
-- Full MongoDB feature parity.
 - Running multiple writers against one LMDB environment.
 - Cross-database queries or transactions.
 - Network filesystems for the instance root.

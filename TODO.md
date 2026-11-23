@@ -12,4 +12,4 @@ keep only low/medium-difficulty tasks worth doing now, and remove the rest. The
 This file has no open checkboxes because no retained task remains. Removed
 product ideas are not claimed as implemented; unsupported capabilities remain
 documented in [docs/roadmap.md](docs/roadmap.md) and the module guides as
-deferred work.
+deliberate limitations.
