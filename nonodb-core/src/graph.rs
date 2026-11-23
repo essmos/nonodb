@@ -20,6 +20,7 @@ use crate::date;
 use crate::error::{Error, Result};
 use crate::id;
 use crate::query::{matches, path, validate::validate_filter};
+use crate::vector::VectorMetric;
 
 /// Prefix for the node-collection graph definition.
 pub const NODE_DEF_PREFIX: &str = "graph:";
@@ -1325,7 +1326,7 @@ pub fn neighbors(view: &dyn GraphView, options: &NeighborsOptions) -> Result<Val
     }))
 }
 
-fn cosine_score(query: &[f32], node: &Value, field: &str) -> Option<f64> {
+fn vector_score(query: &[f32], node: &Value, field: &str, metric: VectorMetric) -> Option<f64> {
     let raw = path::get(node, field)?;
     let values = raw.as_array()?;
     if values.len() != query.len() {
@@ -1334,28 +1335,52 @@ fn cosine_score(query: &[f32], node: &Value, field: &str) -> Option<f64> {
     let mut dot = 0.0f64;
     let mut query_norm = 0.0f64;
     let mut node_norm = 0.0f64;
+    let mut squared_distance = 0.0f64;
     for (q, value) in query.iter().zip(values) {
         let value = value.as_f64()?;
         if !value.is_finite() {
             return None;
         }
-        dot += f64::from(*q) * value;
-        query_norm += f64::from(*q) * f64::from(*q);
+        let q = f64::from(*q);
+        dot += q * value;
+        query_norm += q * q;
         node_norm += value * value;
+        squared_distance += (q - value) * (q - value);
     }
-    if query_norm <= f64::EPSILON || node_norm <= f64::EPSILON {
-        return Some(0.5);
-    }
-    Some(((dot / (query_norm.sqrt() * node_norm.sqrt())).clamp(-1.0, 1.0) + 1.0) / 2.0)
+    Some(match metric {
+        VectorMetric::Cosine => {
+            if query_norm <= f64::EPSILON || node_norm <= f64::EPSILON {
+                0.5
+            } else {
+                ((dot / (query_norm.sqrt() * node_norm.sqrt())).clamp(-1.0, 1.0) + 1.0) / 2.0
+            }
+        }
+        VectorMetric::Dot => {
+            // Numerically stable logistic transform of an unbounded dot product.
+            if dot >= 0.0 {
+                1.0 / (1.0 + (-dot).exp())
+            } else {
+                let exp = dot.exp();
+                exp / (1.0 + exp)
+            }
+        }
+        VectorMetric::L2 => 1.0 / (1.0 + squared_distance),
+    })
 }
 
 /// Hybrid vector seed + graph expansion rerank.
 ///
 /// `seed_ids` are the vector-search hits in rank order; the graph expands from
-/// them up to `max_depth`. Every candidate receives a cosine vector relevance
-/// in `[0, 1]` and a graph proximity score `1 / (1 + depth)`. The final score is
-/// a normalized weighted sum, with deterministic `_id` tie-breaking.
-pub fn hybrid(view: &dyn GraphView, options: &HybridOptions, seed_ids: &[String]) -> Result<Value> {
+/// them up to `max_depth`. Every candidate receives a vector relevance in
+/// `[0, 1]` using the index metric and a graph proximity score
+/// `1 / (1 + depth)`. The final score is a normalized weighted sum, with
+/// deterministic `_id` tie-breaking.
+pub fn hybrid(
+    view: &dyn GraphView,
+    options: &HybridOptions,
+    seed_ids: &[String],
+    metric: VectorMetric,
+) -> Result<Value> {
     options.validate()?;
     let as_of = as_of_ms(options.as_of.as_ref())?;
     let total_weight = options.vector_weight + options.graph_weight;
@@ -1414,7 +1439,8 @@ pub fn hybrid(view: &dyn GraphView, options: &HybridOptions, seed_ids: &[String]
             continue;
         };
         let vector_score =
-            cosine_score(&options.vector.vector, &node, &options.vector.field).unwrap_or(0.0);
+            vector_score(&options.vector.vector, &node, &options.vector.field, metric)
+                .unwrap_or(0.0);
         let graph_score = 1.0 / (1.0 + at_depth as f64);
         let score = vector_weight * vector_score + graph_weight * graph_score;
         scored.push((
@@ -1696,6 +1722,39 @@ mod tests {
         assert_eq!(out["_id"], "a");
         assert_eq!(out["name"], "A");
         assert!(out.get("secret").is_none());
+    }
+
+    #[test]
+    fn hybrid_vector_score_honors_index_metric() {
+        let node = json!({"_id":"a","embedding":[1.0,0.0]});
+        let query = [1.0f32, 0.0];
+        assert_eq!(
+            vector_score(&query, &node, "embedding", VectorMetric::Cosine).unwrap(),
+            1.0
+        );
+        assert!(
+            (vector_score(&query, &node, "embedding", VectorMetric::Dot).unwrap()
+                - 1.0 / (1.0 + (-1.0f64).exp()))
+            .abs()
+                < 1e-12
+        );
+        assert_eq!(
+            vector_score(&query, &node, "embedding", VectorMetric::L2).unwrap(),
+            1.0
+        );
+        let orthogonal = json!({"_id":"b","embedding":[0.0,1.0]});
+        assert_eq!(
+            vector_score(&query, &orthogonal, "embedding", VectorMetric::L2).unwrap(),
+            1.0 / 3.0
+        );
+        assert!(vector_score(&query, &orthogonal, "embedding", VectorMetric::Cosine).is_some());
+        assert!(vector_score(
+            &query,
+            &json!({"_id":"c","embedding":[1.0]}),
+            "embedding",
+            VectorMetric::L2
+        )
+        .is_none());
     }
 
     #[test]

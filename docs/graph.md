@@ -224,8 +224,10 @@ Returns one-hop `edges` as `{node, via}`, plus `nodes`, `missing`, and
  "projection":{"name":1}}
 ```
 
-Each candidate receives `vector_score` (cosine relevance in `[0,1]`),
-`graph_score` (`1/(1+depth)`), and their normalized weighted `score`. Results
+Each candidate receives `vector_score` in `[0,1]` using the vector index metric
+(cosine similarity mapped to `[0,1]`, a logistic transform of the dot product,
+or `1/(1+squared_l2_distance)`), `graph_score` (`1/(1+depth)`), and their
+normalized weighted `score`. Results
 are sorted by score descending with `_id` tie-breaking, so repeated requests
 are deterministic. `edge_filter`, `node_filter`, `labels`, and `as_of` apply
 during expansion.

@@ -33,6 +33,13 @@ function parseJson(value: string): unknown | undefined {
   }
 }
 
+function asOfValue(value: string): number | string | undefined {
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  const number = Number(trimmed);
+  return Number.isFinite(number) ? number : trimmed;
+}
+
 function idOf(node: Doc): string {
   const id = node._id;
   return typeof id === 'string' ? id : JSON.stringify(id);
@@ -53,6 +60,7 @@ function GraphNodeView({
   direction,
   labels,
   includeEdges,
+  asOf,
   onError,
 }: {
   connection: Connection;
@@ -61,6 +69,7 @@ function GraphNodeView({
   direction: string;
   labels: string;
   includeEdges: boolean;
+  asOf?: number | string;
   onError: (message: string) => void;
 }) {
   const [children, setChildren] = useState<GraphNode[]>(entry.children ?? []);
@@ -92,6 +101,7 @@ function GraphNodeView({
         max_depth: 1,
         tree: true,
         include_edges: includeEdges,
+        ...(asOf !== undefined ? { as_of: asOf } : {}),
       });
       setChildren(result.roots?.[0]?.children ?? []);
       setTruncated(Boolean(result.truncated));
@@ -137,6 +147,7 @@ function GraphNodeView({
               direction={direction}
               labels={labels}
               includeEdges={includeEdges}
+              asOf={asOf}
               onError={onError}
             />
           ))}
@@ -174,6 +185,7 @@ export default function GraphPage({
   const [maxDepth, setMaxDepth] = useState('1');
   const [algorithm, setAlgorithm] = useState('bfs');
   const [includeEdges, setIncludeEdges] = useState(false);
+  const [asOf, setAsOf] = useState('');
   const [roots, setRoots] = useState<GraphNode[]>([]);
   const [summary, setSummary] = useState<string>('');
   const [error, setError] = useState('');
@@ -300,6 +312,7 @@ export default function GraphPage({
         algorithm,
         tree: true,
         include_edges: includeEdges,
+        ...(asOf.trim() ? { as_of: asOfValue(asOf) } : {}),
         ...(edgeFilter.trim() ? { edge_filter: parseJson(edgeFilter) } : {}),
         ...(nodeFilter.trim() ? { node_filter: parseJson(nodeFilter) } : {}),
         ...(projection.trim() ? { projection: parseJson(projection) } : {}),
@@ -424,6 +437,10 @@ export default function GraphPage({
             <input value={labels} onChange={(e) => setLabels(e.target.value)} placeholder="KNOWS, WORKS_AT" />
           </label>
           <label>
+            As of (Unix ms or RFC3339)
+            <input value={asOf} onChange={(e) => setAsOf(e.target.value)} placeholder="2026-01-01T00:00:00Z" />
+          </label>
+          <label>
             Initial depth
             <input type="number" min={0} max={64} value={maxDepth} onChange={(e) => setMaxDepth(e.target.value)} />
           </label>
@@ -474,6 +491,7 @@ export default function GraphPage({
                 direction={direction}
                 labels={labels}
                 includeEdges={includeEdges}
+                asOf={asOfValue(asOf)}
                 onError={setError}
               />
             ))}

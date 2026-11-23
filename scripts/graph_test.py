@@ -255,6 +255,26 @@ def main() -> int:
         )
         assert [i["id"] for i in hybrid["items"]] == [i["id"] for i in again["items"]]
 
+        db.create_collection("l2nodes")
+        db.create_collection("l2edges")
+        l2n = db.collection("l2nodes")
+        l2e = db.collection("l2edges")
+        l2n.insert_many(
+            [
+                {"_id": "a", "v": [1.0, 0.0]},
+                {"_id": "b", "v": [0.0, 1.0]},
+                {"_id": "c", "v": [0.9, 0.1]},
+            ]
+        )
+        l2n.set_graph("l2edges")
+        l2e.insert({"_id": "l2e1", "from": "a", "to": "b"})
+        l2n.create_vector_index("v", 2, metric="l2")
+        l2 = l2n.hybrid_search(
+            "v", [1.0, 0.0], k=2, max_depth=1, vector_weight=1.0, graph_weight=0.0
+        )
+        assert l2["items"][0]["id"] == "a", l2
+        assert all(0.0 <= item["vector_score"] <= 1.0 for item in l2["items"]), l2
+
         # TTL expiry removes edge adjacency through the same hook.
         db.create_collection("tnodes")
         db.create_collection("tedges")
@@ -283,6 +303,8 @@ def main() -> int:
         gnodes.set_graph("gedges")
         gedges.insert({"_id": "g1", "from": "n1", "to": "n2"})
         gedges.insert({"_id": "g2", "from": "n2", "to": "n3"})
+        gedges.insert({"_id": "gz", "from": "n4", "to": "n3", "label": "A"})
+        gedges.insert({"_id": "ga", "from": "n5", "to": "n3", "label": "Z"})
         lookup = gnodes.aggregate(
             [
                 {
@@ -298,8 +320,27 @@ def main() -> int:
                 }
             ]
         )[0]["chain"]
-        assert {item["_id"] for item in lookup} == {"g1", "g2"}, lookup
+        assert {item["_id"] for item in lookup} == {"g1", "g2", "ga", "gz"}, lookup
         assert {item["level"] for item in lookup} == {0, 1}, lookup
+        fallback = gnodes.aggregate(
+            [
+                {
+                    "$graphLookup": {
+                        "from": "gedges",
+                        "startWith": "n3",
+                        "connectFromField": "from",
+                        "connectToField": "to",
+                        "as": "chain",
+                        "depthField": "level",
+                        "maxDepth": 2,
+                        "restrictSearchWithMatch": {},
+                    }
+                }
+            ]
+        )[0]["chain"]
+        assert [item["_id"] for item in lookup] == [
+            item["_id"] for item in fallback
+        ], (lookup, fallback)
         restricted = gnodes.aggregate(
             [
                 {

@@ -5761,11 +5761,19 @@ impl<'e> Collection<'e> {
                 "truncated": false,
             }));
         }
+        let def_key = vector::def_key(&self.name, &options.vector.field);
+        let Some(raw_def) = self.meta.get(&rtxn, def_key.as_bytes())? else {
+            return Err(Error::Query(format!(
+                "no vector index on field `{}`",
+                options.vector.field
+            )));
+        };
+        let vector_def: VectorDef = serde_json::from_slice(raw_def)?;
         let store = self.store.ok_or_else(|| {
             Error::Query("graph traversal requires a store-backed collection".into())
         })?;
         let view = GraphViewImpl::new(store, &rtxn, def)?;
-        let out = graph::hybrid(&view, &options, &seed_ids)?;
+        let out = graph::hybrid(&view, &options, &seed_ids, vector_def.metric)?;
         rtxn.commit()?;
         Ok(out)
     }
@@ -7303,6 +7311,8 @@ impl<'e> Collection<'e> {
                 }
                 let mut next_values = Vec::new();
                 let mut next_keys = HashSet::new();
+                let mut level = Vec::new();
+                let mut level_keys = HashSet::new();
                 for value in &values {
                     let id = match graph::node_key(value) {
                         Ok(id) => id,
@@ -7321,23 +7331,35 @@ impl<'e> Collection<'e> {
                             Err(_) => return Ok(None),
                         };
                         let key = graph_identity(&candidate);
-                        if !seen.insert(key) {
+                        if seen.contains(&key) || !level_keys.insert(key.clone()) {
                             continue;
                         }
-                        let next = graph_collect_field(&candidate, connect_from);
-                        let mut candidate = candidate;
-                        if let Some(depth_field) = depth_field {
-                            path::set(&mut candidate, depth_field, Value::from(depth as u64))?;
-                        }
-                        results.push(candidate);
-                        if results.len() > max_docs {
-                            return Err(Error::Query(format!(
-                                "$graphLookup result exceeds {max_docs} documents"
-                            )));
-                        }
-                        for value in next {
-                            graph_push_value(&value, &mut next_values, &mut next_keys);
-                        }
+                        let sort_key = candidate
+                            .get("_id")
+                            .and_then(crate::id::key_from_value)
+                            .unwrap_or_default();
+                        level.push((sort_key, key, candidate));
+                    }
+                }
+                // The fallback `find` path returns matches in `_id` order.
+                // Keep that observable ordering even though adjacency keys are
+                // sorted by label/target/edge id.
+                level.sort_by(|a, b| a.0.cmp(&b.0));
+                for (_, key, candidate) in level {
+                    seen.insert(key);
+                    let next = graph_collect_field(&candidate, connect_from);
+                    let mut candidate = candidate;
+                    if let Some(depth_field) = depth_field {
+                        path::set(&mut candidate, depth_field, Value::from(depth as u64))?;
+                    }
+                    results.push(candidate);
+                    if results.len() > max_docs {
+                        return Err(Error::Query(format!(
+                            "$graphLookup result exceeds {max_docs} documents"
+                        )));
+                    }
+                    for value in next {
+                        graph_push_value(&value, &mut next_values, &mut next_keys);
                     }
                 }
                 if max_depth.is_some_and(|max_depth| depth >= max_depth) {
