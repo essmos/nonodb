@@ -312,9 +312,7 @@ The current implementation plan is limited to this list.
 2. **Client-side `lookup_join` helpers.** Python, Node.js, Rust, and Go, with
    order and missing-key alignment.
 3. **Certificate pinning.** Outgoing replication and client TLS connections.
-4. **Small-dataset benchmark smoke in CI.** Lookup and vector coverage to catch
-   planner, sidecar, and query regressions.
-5. **Stored BSON regex values.** Matching `$type` entries and documented index
+4. **Stored BSON regex values.** Matching `$type` entries and documented index
    behavior.
 
 ## Non-goals
