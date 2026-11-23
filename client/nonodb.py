@@ -1128,12 +1128,16 @@ class Collection:
         fields: Optional[list[str]] = None,
         include: Optional[list[str]] = None,
         geo: bool = False,
+        sparse: bool = False,
+        partial_filter_expression: Optional[dict[str, Any]] = None,
     ) -> bool:
         """Creates a single-field (`field`) or compound (`fields`) index.
 
         `include` copies extra fields into the index, allowing a projection to be covered
         without reading the document (covering index). Set `geo=True` to create a
         single-field GeoJSON point index for `$near` and `$geoWithin`.
+        Set `sparse=True` to omit documents without the key, and pass
+        `partial_filter_expression` to index only matching documents.
         """
         if fields is None:
             if field is None:
@@ -1145,6 +1149,8 @@ class Collection:
                 "coll": self.name,
                 "fields": fields,
                 "unique": unique,
+                "sparse": sparse,
+                "partial_filter_expression": partial_filter_expression,
                 "include": include or [],
                 "geo": geo,
             }
@@ -1155,8 +1161,9 @@ class Collection:
         """Creates several indexes in one collection scan.
 
         Each entry accepts the same keys as :meth:`create_index`:
-        `field` or `fields`, optional `unique`, optional `include`, and optional
-        `geo` for a single-field GeoJSON point index.
+        `field` or `fields`, optional `unique`, `sparse`, `include`,
+        `partial_filter_expression`, and `geo` for a single-field GeoJSON point
+        index.
         """
         result = self._db.exec(
             {

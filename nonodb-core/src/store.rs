@@ -2191,11 +2191,21 @@ impl Store {
                 coll,
                 fields,
                 unique,
+                sparse,
+                partial_filter_expression,
                 include,
                 geo,
             } => {
                 let collection = self.collection_in(wtxn, coll)?;
-                collection.create_index_fields_txn(wtxn, fields, *unique, include, *geo)
+                collection.create_index_fields_txn(
+                    wtxn,
+                    fields,
+                    *unique,
+                    include,
+                    *geo,
+                    *sparse,
+                    partial_filter_expression.clone(),
+                )
             }
             ReplicationOp::IndexDrop { coll, field } => {
                 let collection = self.collection_in(wtxn, coll)?;

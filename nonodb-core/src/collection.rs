@@ -504,6 +504,14 @@ pub struct IndexSpec {
     #[serde(default)]
     pub unique: bool,
     #[serde(default)]
+    pub sparse: bool,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "partialFilterExpression"
+    )]
+    pub partial_filter_expression: Option<Value>,
+    #[serde(default)]
     pub include: Vec<String>,
     /// Single-field GeoJSON point index.
     #[serde(default)]
@@ -1000,6 +1008,9 @@ impl<'e> Collection<'e> {
                 }
                 def.name = spec.name.clone();
             }
+            def.sparse = spec.sparse;
+            def.partial_filter_expression = spec.partial_filter_expression.clone();
+            validate_partial_filter(def.partial_filter_expression.as_ref())?;
             if !spec.directions.is_empty() {
                 if spec.directions.len() != spec.fields.len()
                     || spec
@@ -1027,6 +1038,8 @@ impl<'e> Collection<'e> {
             {
                 if existing.effective_fields() != def.effective_fields()
                     || existing.unique != def.unique
+                    || existing.sparse != def.sparse
+                    || existing.partial_filter_expression != def.partial_filter_expression
                     || existing.include != def.include
                     || existing.geo != def.geo
                     || existing.directions() != def.directions()
@@ -1172,6 +1185,8 @@ impl<'e> Collection<'e> {
                 name: def.name(),
                 directions: def.directions(),
                 unique: def.unique,
+                sparse: def.sparse,
+                partial_filter_expression: def.partial_filter_expression.clone(),
                 include: def.include.clone(),
                 geo: def.geo,
             })
@@ -1193,7 +1208,7 @@ impl<'e> Collection<'e> {
     }
 
     pub fn create_index_txn(&self, wtxn: &mut RwTxn<'_>, field: &str, unique: bool) -> Result<()> {
-        self.create_index_fields_txn(wtxn, &[field.to_string()], unique, &[], false)
+        self.create_index_fields_txn(wtxn, &[field.to_string()], unique, &[], false, false, None)
     }
 
     /// Creates a single-field GeoJSON point index.
@@ -1205,7 +1220,7 @@ impl<'e> Collection<'e> {
     }
 
     pub fn create_geo_index_txn(&self, wtxn: &mut RwTxn<'_>, field: &str) -> Result<()> {
-        self.create_index_fields_txn(wtxn, &[field.to_string()], false, &[], true)
+        self.create_index_fields_txn(wtxn, &[field.to_string()], false, &[], true, false, None)
     }
 
     /// Creates a compound index. Field order matters: a field prefix can
@@ -1217,11 +1232,12 @@ impl<'e> Collection<'e> {
         include: &[String],
     ) -> Result<()> {
         let mut wtxn = self.write_txn()?;
-        self.create_index_fields_txn(&mut wtxn, fields, unique, include, false)?;
+        self.create_index_fields_txn(&mut wtxn, fields, unique, include, false, false, None)?;
         wtxn.commit()?;
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn create_index_fields_txn(
         &self,
         wtxn: &mut RwTxn<'_>,
@@ -1229,6 +1245,8 @@ impl<'e> Collection<'e> {
         unique: bool,
         include: &[String],
         geo: bool,
+        sparse: bool,
+        partial_filter_expression: Option<Value>,
     ) -> Result<()> {
         self.ensure_standard()?;
         if fields.is_empty() {
@@ -1249,6 +1267,9 @@ impl<'e> Collection<'e> {
         } else {
             IndexDef::compound(fields, unique, include)
         };
+        def.sparse = sparse;
+        def.partial_filter_expression = partial_filter_expression;
+        validate_partial_filter(def.partial_filter_expression.as_ref())?;
         let key = index::def_key(&self.name, &def.name());
         self.meta.put(
             &mut *wtxn,
@@ -1514,6 +1535,12 @@ impl<'e> Collection<'e> {
                 def.name()
             )));
         }
+        if !partial_filter_allows(&def, filter) {
+            return Err(Error::Query(format!(
+                "hint index `{}` requires the query to include its partialFilterExpression",
+                def.name()
+            )));
+        }
         let Some(db) = self.index_db(rtxn, &def)? else {
             return Err(Error::Query(format!(
                 "hint index `{}` is missing its storage",
@@ -1533,11 +1560,13 @@ impl<'e> Collection<'e> {
         // those documents would never be visited. A full index scan is safe
         // only when every document has at least one entry.
         let document_count = self.db.stat(rtxn)?.entries;
-        let covers_all = if def.is_multikey() {
-            def.multikey_all_docs
-        } else {
-            db.stat(rtxn)?.entries == document_count
-        };
+        let covers_all = !def.sparse
+            && def.partial_filter_expression.is_none()
+            && if def.is_multikey() {
+                def.multikey_all_docs
+            } else {
+                db.stat(rtxn)?.entries == document_count
+            };
         if !covers_all {
             return Err(Error::Query(format!(
                 "hint index `{}` cannot be used for this filter because it does not contain every document",
@@ -1570,7 +1599,7 @@ impl<'e> Collection<'e> {
             }
             // Older indexes skipped arrays and some Extended JSON values during
             // backfill. Only current-format indexes are safe for planning.
-            if !def.current_format() {
+            if !def.current_format() || !partial_filter_allows(&def, filter) {
                 continue;
             }
             let Some(bounds) = bounds_for_index(&def, obj) else {
@@ -1593,7 +1622,10 @@ impl<'e> Collection<'e> {
             return Ok(None);
         };
         let Some(def) = self.index_defs(rtxn)?.into_iter().find(|def| {
-            def.geo && def.current_format() && def.effective_fields().as_slice() == [field.as_str()]
+            def.geo
+                && def.current_format()
+                && def.effective_fields().as_slice() == [field.as_str()]
+                && partial_filter_allows(def, filter)
         }) else {
             return Ok(None);
         };
@@ -1978,6 +2010,7 @@ impl<'e> Collection<'e> {
             !def.geo
                 && def.current_format()
                 && def.effective_fields().as_slice() == [field.as_str()]
+                && partial_filter_allows(def, filter)
         }) else {
             return Ok(None);
         };
@@ -8931,6 +8964,100 @@ fn index_condition<'a>(filter: &'a Map<String, Value>, field: &str) -> Option<&'
     nested_map_value(elem, rest)
 }
 
+fn validate_partial_filter(filter: Option<&Value>) -> Result<()> {
+    let Some(filter) = filter else {
+        return Ok(());
+    };
+    let Some(object) = filter.as_object() else {
+        return Err(Error::Query(
+            "partialFilterExpression must be a document".into(),
+        ));
+    };
+    for key in object.keys() {
+        if matches!(key.as_str(), "$where" | "$text" | "$expr" | "$jsonSchema") {
+            return Err(Error::Query(format!(
+                "partialFilterExpression does not support `{key}`"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn flatten_filter_conditions(filter: &Value) -> Option<Vec<(String, Value)>> {
+    let obj = filter.as_object()?;
+    if let Some(and) = obj.get("$and") {
+        if obj.len() != 1 {
+            return None;
+        }
+        let mut out = Vec::new();
+        for branch in and.as_array()? {
+            out.extend(flatten_filter_conditions(branch)?);
+        }
+        return Some(out);
+    }
+    if obj.keys().any(|key| key.starts_with('$')) {
+        return None;
+    }
+    Some(
+        obj.iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    )
+}
+
+fn condition_implies(query: &Value, partial: &Value) -> bool {
+    if query == partial {
+        return true;
+    }
+    let query = query
+        .as_object()
+        .and_then(|object| object.get("$eq"))
+        .unwrap_or(query);
+    let partial = partial
+        .as_object()
+        .and_then(|object| object.get("$eq"))
+        .unwrap_or(partial);
+    if query == partial {
+        return true;
+    }
+    query
+        .as_object()
+        .and_then(|object| object.get("$in"))
+        .and_then(Value::as_array)
+        .is_some_and(|values| values.iter().any(|value| value == partial))
+}
+
+/// A partial index may only serve a query when the query's top-level filter
+/// explicitly includes the partial predicate. This is deliberately
+/// conservative: it never assumes that an unrelated range implies a partial
+/// filter, and it falls back to a collection scan when the implication is not
+/// obvious.
+fn partial_filter_allows(def: &IndexDef, query: &Value) -> bool {
+    let Some(partial) = &def.partial_filter_expression else {
+        return true;
+    };
+    let Some(partial_conditions) = flatten_filter_conditions(partial) else {
+        return false;
+    };
+    if partial_conditions.is_empty() {
+        return true;
+    }
+    let Some(query_conditions) = flatten_filter_conditions(query) else {
+        return false;
+    };
+    for (field, partial_condition) in &partial_conditions {
+        if !query_conditions
+            .iter()
+            .any(|(query_field, query_condition)| {
+                query_field == field && condition_implies(query_condition, partial_condition)
+            })
+        {
+            return false;
+        }
+    }
+    true
+}
+
 fn bounds_for_index(def: &IndexDef, filter: &Map<String, Value>) -> Option<index::RangeBytes> {
     let fields = def.effective_fields();
     if fields.is_empty() {
@@ -11032,6 +11159,8 @@ mod tests {
             name: "g_1_age_-1".into(),
             directions: vec![1, -1],
             unique: false,
+            sparse: false,
+            partial_filter_expression: None,
             include: vec![],
             geo: false,
         }])
@@ -11366,6 +11495,93 @@ mod tests {
             }
         );
         assert_eq!(c.count(&serde_json::json!({})).unwrap(), 0);
+    }
+
+    #[test]
+    fn sparse_and_partial_indexes_enforce_unique_only_for_indexed_documents() {
+        let (_dir, store) = store();
+        let c = store.collection("sparse_partial").unwrap();
+        c.insert_one(json!({"_id": "missing-a"})).unwrap();
+        c.insert_one(json!({"_id": "missing-b"})).unwrap();
+        c.insert_one(json!({"_id": "null", "email": null})).unwrap();
+        c.create_indexes(&[IndexSpec {
+            fields: vec!["email".into()],
+            name: "email_sparse".into(),
+            directions: Vec::new(),
+            unique: true,
+            sparse: true,
+            partial_filter_expression: None,
+            include: Vec::new(),
+            geo: false,
+        }])
+        .unwrap();
+        c.insert_one(json!({"_id": "missing-c"})).unwrap();
+        assert!(matches!(
+            c.insert_one(json!({"_id": "null-2", "email": null})),
+            Err(Error::DuplicateKey(_))
+        ));
+        c.insert_one(json!({"_id": "one", "email": "a@example.test"}))
+            .unwrap();
+        assert!(matches!(
+            c.insert_one(json!({"_id": "two", "email": "a@example.test"})),
+            Err(Error::DuplicateKey(_))
+        ));
+
+        let p = store.collection("partial_unique").unwrap();
+        p.insert_one(json!({"_id": "old-inactive", "status": "inactive", "email": "same"}))
+            .unwrap();
+        p.insert_one(json!({"_id": "old-active", "status": "active", "email": "old"}))
+            .unwrap();
+        p.create_indexes(&[IndexSpec {
+            fields: vec!["email".into()],
+            name: "active_email".into(),
+            directions: Vec::new(),
+            unique: true,
+            sparse: false,
+            partial_filter_expression: Some(json!({"status": "active"})),
+            include: Vec::new(),
+            geo: false,
+        }])
+        .unwrap();
+        // Inactive documents are not in the partial index, even with duplicate
+        // keys. Active documents must be unique.
+        p.insert_one(json!({"_id": "inactive-2", "status": "inactive", "email": "same"}))
+            .unwrap();
+        p.insert_one(json!({"_id": "active-new", "status": "active", "email": "new"}))
+            .unwrap();
+        assert!(matches!(
+            p.insert_one(json!({"_id": "active-dup", "status": "active", "email": "old"})),
+            Err(Error::DuplicateKey(_))
+        ));
+
+        // The partial index is used only when the query repeats its predicate.
+        let filtered = FindQuery {
+            filter: json!({"status": "active", "email": "old"}),
+            ..Default::default()
+        };
+        let explain = p.explain(&filtered).unwrap();
+        assert_eq!(explain["access_path"], "index_scan");
+        assert_eq!(explain["index"]["fields"], json!(["email"]));
+        let unfiltered = FindQuery {
+            filter: json!({"email": "same"}),
+            ..Default::default()
+        };
+        assert_eq!(
+            p.explain(&unfiltered).unwrap()["access_path"],
+            "collection_scan"
+        );
+        let hint = FindQuery {
+            filter: json!({"email": "same"}),
+            hint: Some(json!("active_email")),
+            ..Default::default()
+        };
+        assert!(p.find(&hint).is_err());
+
+        // Reindex keeps the sparse and partial definitions.
+        p.reindex().unwrap();
+        let defs = p.list_index_defs().unwrap();
+        assert!(defs.iter().any(|def| def.name() == "active_email"
+            && def.partial_filter_expression == Some(json!({"status": "active"}))));
     }
 
     #[test]
@@ -11963,6 +12179,8 @@ mod tests {
                 name: String::new(),
                 directions: Vec::new(),
                 unique: false,
+                sparse: false,
+                partial_filter_expression: None,
                 include: vec![],
                 geo: false,
             },
@@ -11971,6 +12189,8 @@ mod tests {
                 name: String::new(),
                 directions: Vec::new(),
                 unique: false,
+                sparse: false,
+                partial_filter_expression: None,
                 include: vec!["grp".into()],
                 geo: false,
             },
@@ -11979,6 +12199,8 @@ mod tests {
                 name: String::new(),
                 directions: Vec::new(),
                 unique: false,
+                sparse: false,
+                partial_filter_expression: None,
                 include: vec![],
                 geo: false,
             },
@@ -12005,6 +12227,8 @@ mod tests {
                 name: String::new(),
                 directions: Vec::new(),
                 unique: true,
+                sparse: false,
+                partial_filter_expression: None,
                 include: vec![],
                 geo: false,
             }])

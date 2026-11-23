@@ -1692,15 +1692,27 @@ fn execute(
             coll,
             fields,
             unique,
+            sparse,
+            partial_filter_expression,
             include,
             geo,
         } => {
             let c = standard_collection(store, wtxn, coll)?;
-            c.create_index_fields_txn(wtxn, fields, *unique, include, *geo)?;
+            c.create_index_fields_txn(
+                wtxn,
+                fields,
+                *unique,
+                include,
+                *geo,
+                *sparse,
+                partial_filter_expression.clone(),
+            )?;
             replication.capture_op(ReplicationOp::IndexCreate {
                 coll: coll.clone(),
                 fields: fields.clone(),
                 unique: *unique,
+                sparse: *sparse,
+                partial_filter_expression: partial_filter_expression.clone(),
                 include: include.clone(),
                 geo: *geo,
             });
@@ -1709,6 +1721,8 @@ fn execute(
                 "created": name,
                 "fields": fields,
                 "unique": unique,
+                "sparse": sparse,
+                "partial_filter_expression": partial_filter_expression,
                 "include": include,
                 "geo": geo
             }))
@@ -1721,6 +1735,8 @@ fn execute(
                     coll: coll.clone(),
                     fields: index.fields.clone(),
                     unique: index.unique,
+                    sparse: index.sparse,
+                    partial_filter_expression: index.partial_filter_expression.clone(),
                     include: index.include.clone(),
                     geo: index.geo,
                 });
@@ -2026,6 +2042,8 @@ mod tests {
                 name: String::new(),
                 directions: Vec::new(),
                 unique: true,
+                sparse: false,
+                partial_filter_expression: None,
                 include: Vec::new(),
                 geo: false,
             }])
@@ -2155,6 +2173,8 @@ mod tests {
                 name: String::new(),
                 directions: Vec::new(),
                 unique: true,
+                sparse: false,
+                partial_filter_expression: None,
                 include: Vec::new(),
                 geo: false,
             }])

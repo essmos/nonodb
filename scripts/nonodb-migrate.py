@@ -50,6 +50,8 @@ class MigrationFailure(Exception):
 class IndexPlan:
     fields: list[str]
     unique: bool = False
+    sparse: bool = False
+    partial_filter_expression: dict | None = None
     geo: bool = False
     text: bool = False
 
@@ -164,9 +166,15 @@ def discover(db: Any, include: set[str], exclude: set[str]) -> list[CollectionPl
                 else:
                     plan.indexes.append(IndexPlan(fields=fields, geo=True))
                 continue
-            if index.get("partialFilterExpression") or index.get("wildcardProjection"):
+            if index.get("wildcardProjection"):
                 plan.warnings.append(
-                    f"index {index_name!r} uses partial/wildcard options; skipped"
+                    f"index {index_name!r} uses wildcardProjection; skipped"
+                )
+                continue
+            partial_filter = index.get("partialFilterExpression")
+            if partial_filter is not None and not isinstance(partial_filter, dict):
+                plan.warnings.append(
+                    f"index {index_name!r} has a non-document partialFilterExpression; skipped"
                 )
                 continue
             if any(not isinstance(direction, int) for direction in directions):
@@ -178,13 +186,10 @@ def discover(db: Any, include: set[str], exclude: set[str]) -> list[CollectionPl
                 IndexPlan(
                     fields=fields,
                     unique=bool(index.get("unique", False)),
+                    sparse=bool(index.get("sparse", False)),
+                    partial_filter_expression=partial_filter,
                 )
             )
-            if index.get("sparse") and not index.get("unique"):
-                plan.warnings.append(
-                    f"index {index_name!r} is non-unique sparse; "
-                    "sparse is ignored because NonoDB indexes are already sparse-like"
-                )
             if "expireAfterSeconds" in index:
                 seconds = index["expireAfterSeconds"]
                 if (
@@ -325,6 +330,8 @@ def copy_collection(
                     {
                         "fields": index.fields,
                         "unique": index.unique,
+                        "sparse": index.sparse,
+                        "partial_filter_expression": index.partial_filter_expression,
                     }
                 ]
             )
@@ -468,6 +475,8 @@ def main(argv: list[str] | None = None) -> int:
                         {
                             "fields": index.fields,
                             "unique": index.unique,
+                            "sparse": index.sparse,
+                            "partial_filter_expression": index.partial_filter_expression,
                             "geo": index.geo,
                             "text": index.text,
                         }

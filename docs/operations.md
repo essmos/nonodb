@@ -1037,6 +1037,16 @@ backups.
   old LMDB postings/trigrams. New search definitions cover exactly one field.
 - Segment text files must be format v3. Older v2 segments without phrase
   positions are rejected; drop and rebuild the text index.
+- Sparse and partial indexes are stored as part of each index definition.
+  Existing definitions without those options keep their previous behavior.
+  To adopt `sparse` or `partialFilterExpression` for an existing index, drop it
+  and create it again with the new options; `reindex` rebuilds the stored
+  definition but cannot add or change options.
+- Plain indexes continue to omit documents that are missing an indexed field.
+  Existing plain unique indexes therefore need no reindex for missing-field
+  semantics: missing values are not indexed as `null`, and uniqueness applies
+  only to documents that have every indexed field. Present `null` values are
+  indexed and can collide under a unique index.
 - Schema version is stored in metadata. There is currently no automatic
   migration framework; changes are handled by explicit commands and releases.
 

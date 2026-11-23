@@ -33,7 +33,7 @@ release notes identify the exact tested tag.
 | Updates | ~85% | Pipeline updates support a subset of stages |
 | Aggregation stages | ~70% | Many common stages work; system, search, geoNear, and change-stream stages are absent |
 | Aggregation expressions | ~70% | Broad but not exhaustive; no IANA time zones or user-defined JavaScript |
-| Indexes | ~68% | Sparse is accepted as a no-op for unique indexes; TTL indexes map to date-field TTL; no partial/wildcard indexes or collation |
+| Indexes | ~82% | Sparse and partial indexes are real; TTL indexes map to date-field TTL; no wildcard indexes or collation |
 | BSON scalar types | ~75% | ObjectId `_id`, Date, Decimal128, Binary/UUID, Timestamp, MinKey/MaxKey, and numeric mapping |
 | Wire protocol and drivers | ~70% | Documented MongoDB-compatible subset: handshake, CRUD, sorted cursors, count, distinct, aggregate, index DDL, collection DDL, MongoDB-style text indexes and `$text`, dropDatabase, SCRAM auth, and TLS; no sessions or transactions |
 | Transactions and change streams | ~10% | Atomic write batches and outbox events exist, but not MongoDB APIs |
@@ -452,13 +452,13 @@ top-level operators; for an unknown `$expr` operator MongoDB uses
 | Custom index names | ✅ | MongoDB-style names are stored and listed |
 | Index directions | ✅ | `1`/`-1` stored in key order; mixed-direction compound sorts and reverse scans are index-backed |
 | Multikey indexes | ✅ | One entry per array element; compound parallel arrays rejected |
-| Unique indexes | ✅ | Including unique multikey semantics; see [Unique indexes without `sparse`](#unique-indexes-without-sparse) for `null` and missing-field behavior |
+| Unique indexes | ✅ | Including unique multikey semantics; missing fields are indexed as `null` unless the index is sparse. See [Sparse and partial indexes](#sparse-and-partial-indexes) |
 | Covered queries / `include` | ✅ | Top-level inclusive projections only |
 | Geospatial indexes | 🟡 | GeoJSON point indexes only; no polygon/line indexes |
 | Text search indexes | 🟡 | One single-field MongoDB-style text index per collection through `createIndexes`/`listIndexes`/`dropIndexes`; leading-`$match` `$text`. Multi-field weights and compound mixed text/non-text keys are not supported |
 | Vector indexes | 🟡 | NonoDB-specific exact/vector search |
-| Sparse indexes | 🟡 | Accepted on `createIndexes`; a plain unique index behaves like `unique + sparse`, so the option is a no-op, see [Unique indexes without `sparse`](#unique-indexes-without-sparse) |
-| Partial indexes | ❌ | |
+| Sparse indexes | ✅ | Single-field sparse indexes omit documents without the field; compound sparse indexes omit only documents with every key absent. See [Sparse and partial indexes](#sparse-and-partial-indexes) |
+| Partial indexes | ✅ | `partialFilterExpression` limits membership. The planner uses the index only when the query repeats the predicate; see [Sparse and partial indexes](#sparse-and-partial-indexes) |
 | Wildcard indexes | ❌ | |
 | Hidden indexes | ❌ | |
 | TTL indexes | 🟡 | `createIndexes` with `expireAfterSeconds` selects date-field TTL and backfills existing documents. One TTL index per collection; missing/non-date fields never expire. Expired documents are hidden from reads immediately by default |
@@ -467,31 +467,46 @@ top-level operators; for an unknown `$expr` operator MongoDB uses
 | Background index builds | 🟡 | Parallel bounded backfill; not MongoDB's exact build lifecycle |
 | Index build progress | ✅ | NonoDB metrics |
 
-### Unique indexes without `sparse`
+### Sparse and partial indexes
 
-MongoDB applications often declare `IndexModel([("field", 1)], unique=True, sparse=True)`
-so that many documents may omit the field. NonoDB accepts `sparse` for
-compatibility, but a plain unique index already has the same semantics, so the
-option is a no-op. Dropping it from the application is still recommended.
+MongoDB applications often declare
+`IndexModel([("field", 1)], unique=True, sparse=True)` so that many documents
+may omit the field. NonoDB now implements the same distinction as MongoDB: a
+plain unique index indexes a missing field as `null`, while a sparse unique
+index omits the document entirely.
 
-| Document | NonoDB unique index | MongoDB `unique + sparse` |
+| Document | Plain unique | `unique + sparse` |
 |---|---|---|
-| Field absent | Not indexed; any number of documents allowed | Not indexed; any number allowed |
+| Field absent | Indexed as `null`; only one such document allowed | Not indexed; any number of documents allowed |
 | Field present and `null` | Indexed as a value; only one such document allowed | Indexed as a value; only one such document allowed |
 | Field present, duplicate value | Rejected with `DuplicateKeyError` | Rejected with `DuplicateKeyError` |
 
-Both implementations were checked side by side on NonoDB 0.27.0 and MongoDB 8.2
-through PyMongo 4.7.0. Inserting two documents without the field succeeds on both,
-the second document with an explicit `null` fails with `DuplicateKeyError` on
-both, and duplicate values are rejected on both.
+A non-unique sparse index also omits documents without any key. A compound
+sparse index stores `null` for absent fields and omits a document only when
+every key is absent, matching MongoDB's compound sparse behavior.
+
+`partialFilterExpression` is a normal query document. Only documents matching
+the expression are indexed, so unique partial indexes allow duplicates outside
+the predicate. For example:
 
 ```python
-# MongoDB
-coll.create_index([("google_sub", 1)], unique=True, sparse=True)
-
-# NonoDB — sparse is accepted and has the same behavior
-coll.create_index([("google_sub", 1)], unique=True, sparse=True)
+coll.create_index(
+    [("email", 1)],
+    unique=True,
+    partialFilterExpression={"status": "active"},
+)
 ```
+
+The planner uses a partial index only when the query explicitly includes the
+same predicate, using equality, `$eq`, or `$in`. An unrelated range or filter
+falls back to a collection scan rather than assuming the predicate is implied.
+A hint that selects a partial index without the predicate fails with an error
+instead of returning incomplete results. The partial expression cannot use
+`$where`, `$text`, `$expr`, or `$jsonSchema`.
+
+`scripts/nonodb-migrate.py`, MongoDB-wire `createIndexes`, and `listIndexes`
+preserve `sparse` and `partialFilterExpression`. Wildcard indexes and
+per-index/per-query collation remain unsupported.
 
 ## BSON values
 
@@ -537,12 +552,12 @@ A migration from MongoDB to NonoDB should check these items first:
 4. **Change streams** — replace with outbox events, `watch`, or subscriptions.
 5. **Atlas Search** — use the native `search_all` API, or the documented `$search`/`$searchMeta`/`$vectorSearch` compatibility subset. See [Search and Atlas compatibility](search.md). MongoDB `$text` is supported only for the documented lexical subset.
 6. **Collation** — normalize strings or enforce ordering in the application.
-7. **Sparse/partial/TTL indexes** — `sparse` is accepted as a no-op; a plain
-   unique index already has the same behavior, including explicit `null`
-   (see [Unique indexes without `sparse`](#unique-indexes-without-sparse)).
+7. **Sparse/partial/TTL indexes** — sparse indexes omit documents without the
+   key, and `partialFilterExpression` limits membership (see
+   [Sparse and partial indexes](#sparse-and-partial-indexes)). Keep the query
+   filter explicit so the planner can use a partial index.
    `expireAfterSeconds` maps to date-field TTL: documents expire at the indexed
    date plus the configured seconds, and existing documents are backfilled.
-   Partial indexes still need application-level filtering.
 8. **Stored BSON regex values** — read filters accept driver regex literals, but regex values cannot be stored; keep them out of documents or rewrite them as strings plus `$regex` filters.
 9. **Unsupported aggregation expressions/stages and filter operators** — rewrite
    with supported forms or precompute outside the database. Unknown operators are

@@ -41,6 +41,14 @@ pub struct IndexRequest {
     #[serde(default)]
     pub unique: bool,
     #[serde(default)]
+    pub sparse: bool,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "partialFilterExpression"
+    )]
+    pub partial_filter_expression: Option<Value>,
+    #[serde(default)]
     pub include: Vec<String>,
     /// Create a GeoJSON point index.
     #[serde(default)]
@@ -358,6 +366,14 @@ pub enum Request {
         fields: Option<Vec<String>>,
         #[serde(default)]
         unique: bool,
+        #[serde(default)]
+        sparse: bool,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            alias = "partialFilterExpression"
+        )]
+        partial_filter_expression: Option<Value>,
         #[serde(default)]
         include: Vec<String>,
         #[serde(default)]
@@ -797,6 +813,8 @@ pub enum WriteReq {
         coll: String,
         fields: Vec<String>,
         unique: bool,
+        sparse: bool,
+        partial_filter_expression: Option<Value>,
         include: Vec<String>,
         geo: bool,
     },

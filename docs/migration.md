@@ -58,8 +58,8 @@ What the helper does:
 - preserves `_id` strings and ObjectIds and converts BSON dates, Decimal128,
   binary values, and other supported values to Extended JSON;
 - maps `expireAfterSeconds` to date-field TTL on the indexed field, backfills
-  existing documents, and accepts `sparse` as a compatibility no-op for unique
-  indexes;
+  existing documents, and preserves `sparse` and `partialFilterExpression` on
+  translated indexes;
 - copies documents in bounded batches, checks source and target counts, and
   compares a SHA-256 content checksum for every collection;
 - writes a JSON report with counts, checksums, translated indexes, TTL values,

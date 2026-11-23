@@ -91,6 +91,10 @@ pub enum ReplicationOp {
         #[serde(default)]
         unique: bool,
         #[serde(default)]
+        sparse: bool,
+        #[serde(default)]
+        partial_filter_expression: Option<Value>,
+        #[serde(default)]
         include: Vec<String>,
         #[serde(default)]
         geo: bool,

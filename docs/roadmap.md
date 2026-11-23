@@ -30,7 +30,8 @@ Implemented:
 - `explain` with access path, index/bounds, sort coverage, and actual counts;
 - `comment`, `maxTimeMS`, index hints, and `$natural` sort for find queries and
   cursors; `maxTimeMS` also bounds `count` and aggregation scans;
-- single-field, compound, unique, and covering indexes;
+- single-field, compound, unique, and covering indexes, plus sparse and
+  `partialFilterExpression` membership with documented planner behavior;
 - single-field GeoJSON point geo indexes with `$near`, `$geoWithin`, and
   `$geoIntersects`;
 - index-only sorted scans and index-backed counts;
@@ -183,12 +184,16 @@ comparison and practical migration caveats.
   contain at most one array field; parallel arrays are rejected. Ordinary
   objects are skipped. Indexes created before format 5 must be recreated to
   include array entries.
-- `sparse` is accepted as a no-op for compatibility; a plain unique index has
-  the same behavior. No partial/wildcard indexes, or text indexes with custom
-  analyzers. `expireAfterSeconds` on a single-field TTL index maps to
-  date-field TTL and backfills existing documents. Geo indexes
-  currently cover single-field GeoJSON points;
-  polygon/line document indexes are not implemented.
+- `sparse` indexes omit documents without the key. A plain index, including a
+  plain unique index, also omits documents missing any indexed field, so missing
+  values are not treated as `null` for uniqueness. A compound sparse index
+  stores `null` for absent fields and omits a document only when every key is
+  absent. `partialFilterExpression` limits index membership and is used by the
+  planner only when the query repeats the predicate. No wildcard indexes or text
+  indexes with custom analyzers. `expireAfterSeconds` on a single-field TTL
+  index maps to date-field TTL and backfills existing documents. Geo indexes
+  currently cover single-field GeoJSON points; polygon/line document indexes are
+  not implemented.
 - Vector indexes store one vector per document. Exact scan is the default and
   fallback; an optional IVF sidecar accelerates unfiltered queries. There is no
   HNSW/PQ, multi-vector document index, or built-in embedding model; clients
@@ -302,12 +307,10 @@ The current implementation plan is limited to this list.
 
 ### P0 — necessary before production
 
-1. **Real sparse/partial index semantics.** Unique-index behavior for missing
-   fields, query planning, migration notes, and MongoDB compatibility tests.
-2. **Per-database quotas and usage accounting.** Limits for data, indexes,
+1. **Per-database quotas and usage accounting.** Limits for data, indexes,
    history, and sidecars, with operator-visible warnings and a write-rejection
    policy.
-3. **Safe restore-in-place API and GUI flow.** Typed confirmation, preflight
+2. **Safe restore-in-place API and GUI flow.** Typed confirmation, preflight
    verification, audit logging, and rollback guidance.
 
 ### P1 — low effort, worthwhile

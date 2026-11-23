@@ -2278,12 +2278,7 @@ async fn create_indexes_command(
             directions.push(direction as i8);
             default_parts.push(format!("{field}_{direction_name}"));
         }
-        for unsupported in [
-            "partialFilterExpression",
-            "collation",
-            "wildcardProjection",
-            "weights",
-        ] {
+        for unsupported in ["collation", "wildcardProjection", "weights"] {
             if spec.contains_key(unsupported) {
                 return Err(bad_value(format!(
                     "index option `{unsupported}` is not supported by NonoDB"
@@ -2326,11 +2321,18 @@ async fn create_indexes_command(
                 "index name must be at most 127 bytes and must not contain NUL",
             ));
         }
+        let partial_filter_expression = match spec.get("partialFilterExpression") {
+            Some(Bson::Document(document)) => Some(bson_doc_json(document)),
+            Some(_) => return Err(bad_value("partialFilterExpression must be a document")),
+            None => None,
+        };
         specs.push(nonodb_core::IndexSpec {
             fields,
             name: name.to_string(),
             directions,
             unique: spec.get_bool("unique").unwrap_or(false),
+            sparse: spec.get_bool("sparse").unwrap_or(false),
+            partial_filter_expression,
             include: Vec::new(),
             geo,
         });
@@ -2534,6 +2536,14 @@ async fn list_indexes_command(
         };
         if def.unique {
             doc.insert("unique", true);
+        }
+        if def.sparse {
+            doc.insert("sparse", true);
+        }
+        if let Some(filter) = &def.partial_filter_expression {
+            if let Ok(document) = bson_map::document_to_bson(filter) {
+                doc.insert("partialFilterExpression", Bson::Document(document));
+            }
         }
         if def.geo {
             doc.insert("2dsphere", true);

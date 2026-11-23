@@ -4,6 +4,13 @@ Full release notes: https://github.com/essmos/nonodb/releases
 
 ## Unreleased
 
+- Add real sparse and partial index semantics. `sparse` now omits documents
+  without the key instead of behaving like a plain index, compound sparse
+  indexes skip only documents with every key absent, and
+  `partialFilterExpression` limits index membership. Partial indexes are used
+  by the planner only when the query repeats the predicate; hints that omit it
+  fail instead of returning incomplete results. MongoDB-wire index DDL,
+  `listIndexes`, and `scripts/nonodb-migrate.py` preserve both options.
 - Add CRL and OCSP revocation checks for mutual TLS. CRL files/URLs refresh on a
   timer, OCSP answers are cached per certificate, and
   `NONODB_TLS_REVOCATION_FAIL_MODE` selects fail-closed (default) or fail-open

@@ -1894,7 +1894,7 @@ Response:
 ```
 
 Each entry accepts either `field` or `fields`, plus optional `name`,
-`directions`, `unique`, and `include`. Use this for migrations that add
+`directions`, `unique`, `sparse`, `partial_filter_expression`, and `include`. Use this for migrations that add
 multiple indexes at once; it avoids re-reading and re-parsing the whole
 collection for every index.
 
@@ -1902,6 +1902,17 @@ Rules:
 
 - Provide either `field` (single) or `fields` (ordered list). `fields` is
   preferred for new code.
+- `sparse: true` omits documents where a single-field key is absent. A compound
+  sparse index stores `null` for absent fields and omits a document only when
+  every key is absent. Missing fields are not treated as `null` for sparse
+  unique checks.
+- `partial_filter_expression` is a document using the normal query language. A
+  document is indexed only when it matches the expression. A partial index is
+  used only when the query explicitly includes the same predicate (equality,
+  `$eq`, or `$in`); otherwise NonoDB falls back to a collection scan. A hint
+  that selects a partial index without its predicate fails instead of silently
+  returning incomplete results. `$where`, `$text`, `$expr`, and `$jsonSchema`
+  are rejected in partial filters.
 - Without `name`, the index name is the fields joined by `+`. A supplied
   MongoDB-style name is stored and returned by `list_indexes`.
 - `directions` is optional; when present it must contain one `1` or `-1` per
@@ -1920,6 +1931,16 @@ Rules:
   that means the combination, not each field individually. A unique multikey
   index accepts repeated elements within the same document (`tags: ["x","x"]`)
   but rejects the same key in another document.
+- A sparse index omits documents where the key is absent. For a single-field
+  index this means many documents may omit the field, and a unique sparse index
+  only checks documents where it is present. A compound sparse index stores
+  `null` for absent fields and omits a document only when every key is absent.
+- `partial_filter_expression` indexes only documents matching the expression.
+  Unique partial indexes allow duplicates outside the predicate. The planner
+  uses a partial index only when the query explicitly repeats the predicate
+  with equality, `$eq`, or `$in`; otherwise it falls back to a collection scan.
+  Hints that omit the predicate fail instead of returning incomplete results.
+  `$where`, `$text`, `$expr`, and `$jsonSchema` are rejected.
 - Creating an index on an existing collection performs a synchronous backfill.
   Writers are blocked while the backfill write transaction is active.
 - `include` copies extra fields into index values for covering projections.
@@ -2079,6 +2100,8 @@ Response:
         "field": "email",
         "fields": ["email"],
         "unique": true,
+        "sparse": true,
+        "partial_filter_expression": null,
         "include": [],
         "format": 5,
         "geo": false,
@@ -2090,6 +2113,7 @@ Response:
 }
 ```
 
+`partial_filter_expression` is `null` when the index is not partial.
 `multikey_fields` lists indexed fields that produced array entries.
 `multikey_all_docs` is `true` only while every document has at least one entry,
 which is required for an index to provide multikey sort order.

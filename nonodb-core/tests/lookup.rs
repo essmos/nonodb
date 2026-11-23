@@ -195,6 +195,8 @@ fn lookup_uses_mixed_direction_unique_index() {
         name: "tenant_1_email_-1".into(),
         directions: vec![1, -1],
         unique: true,
+        sparse: false,
+        partial_filter_expression: None,
         include: vec![],
         geo: false,
     }])

@@ -193,7 +193,7 @@ python3 scripts/mongo_export_test.py        # mongoexport/mongodump/mongoimport/
 python3 scripts/mongo_portability_check.py --self-test  # static workload checker
 python3 scripts/mongo_wire_limits_test.py   # Mongo wire connection/read limits (spawns a daemon)
 python3 scripts/mongo_wire_auth_test.py     # Mongo wire SCRAM maps to principal scopes and code 13
-python3 scripts/mongo_ddl_test.py           # TTL/sparse DDL translation
+python3 scripts/mongo_ddl_test.py           # TTL/sparse/partial DDL translation
 python3 scripts/mongo_ttl_restart_test.py   # TTL index and steps survive daemon restart
 python3 scripts/nonodb_migrate_test.py      # MongoDB -> NonoDB migration and checksums
 python3 scripts/mongo_shadow_test.py        # shadow dual-write and JSONL diff report

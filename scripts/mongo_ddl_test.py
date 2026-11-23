@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Test MongoDB DDL options translated by the NonoDB wire listener.
 
-The listener must accept the two common migration options:
+The listener must accept the common migration options:
 
 - ``expireAfterSeconds`` on a createIndexes entry selects date-field TTL on the
   indexed field and backfills existing documents;
-- ``sparse`` is accepted for a unique index (NonoDB unique indexes already
-  behave like ``unique + sparse``).
+- ``sparse`` omits documents without the key, so a sparse unique index allows
+  many missing values;
+- ``partialFilterExpression`` limits membership, so duplicates are rejected
+  only inside the predicate.
 
 Run the daemon with a MongoDB listener and a Unix socket, then:
 
@@ -43,6 +45,7 @@ def main() -> int:
 
     ttl_name = f"ttl_index_{suffix}"
     sparse_name = f"sparse_index_{suffix}"
+    partial_name = f"partial_index_{suffix}"
     try:
         client.admin.command("ping")
 
@@ -85,6 +88,7 @@ def main() -> int:
                 {"_id": "null", "email": None},
             ]
         )
+        sparse.insert_one({"_id": "missing-c"})
         try:
             sparse.insert_one({"_id": "duplicate", "email": "same@example.test"})
             sparse.insert_one({"_id": "duplicate-2", "email": "same@example.test"})
@@ -92,6 +96,52 @@ def main() -> int:
             assert error.code == 11000, error
         else:
             raise AssertionError("unique + sparse index accepted a duplicate")
+        try:
+            sparse.insert_one({"_id": "null-2", "email": None})
+        except DuplicateKeyError as error:
+            assert error.code == 11000, error
+        else:
+            raise AssertionError("unique + sparse index accepted duplicate null")
+        listed = sparse.index_information()
+        assert listed["email_unique"].get("sparse") is True, listed
+
+        partial = db[partial_name]
+        assert (
+            partial.create_index(
+                [("email", 1)],
+                unique=True,
+                partialFilterExpression={"status": "active"},
+                name="active_email",
+            )
+            == "active_email"
+        )
+        partial.insert_many(
+            [
+                {"_id": "inactive-1", "status": "inactive", "email": "same"},
+                {"_id": "inactive-2", "status": "inactive", "email": "same"},
+                {
+                    "_id": "active-1",
+                    "status": "active",
+                    "email": "same@example.test",
+                },
+            ]
+        )
+        try:
+            partial.insert_one(
+                {
+                    "_id": "active-2",
+                    "status": "active",
+                    "email": "same@example.test",
+                }
+            )
+        except DuplicateKeyError as error:
+            assert error.code == 11000, error
+        else:
+            raise AssertionError("partial unique index accepted a duplicate")
+        listed = partial.index_information()
+        assert listed["active_email"]["partialFilterExpression"] == {
+            "status": "active"
+        }, listed
 
         multi = {
             "createIndexes": f"multi_ttl_{suffix}",
@@ -129,7 +179,7 @@ def main() -> int:
         else:
             raise AssertionError("expireAfterSeconds: 0 was accepted")
     finally:
-        for name in (ttl_name, sparse_name):
+        for name in (ttl_name, sparse_name, partial_name):
             db.drop_collection(name)
         client.close()
 

@@ -44,6 +44,18 @@ pub struct IndexDef {
     pub directions_encoded: bool,
     #[serde(default)]
     pub unique: bool,
+    /// MongoDB sparse index: documents whose indexed field is absent are not
+    /// indexed. For a compound sparse index, documents with at least one
+    /// indexed field are indexed; missing fields become null keys.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub sparse: bool,
+    /// MongoDB partial index predicate. Only matching documents are indexed.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "partialFilterExpression"
+    )]
+    pub partial_filter_expression: Option<Value>,
     /// Fields additionally copied into the index value (covering projections).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub include: Vec<String>,
@@ -77,6 +89,8 @@ impl IndexDef {
             directions: Vec::new(),
             directions_encoded: false,
             unique,
+            sparse: false,
+            partial_filter_expression: None,
             include: Vec::new(),
             geo: false,
             format: FORMAT_VERSION,
@@ -93,6 +107,8 @@ impl IndexDef {
             directions: Vec::new(),
             directions_encoded: false,
             unique,
+            sparse: false,
+            partial_filter_expression: None,
             include: include.to_vec(),
             geo: false,
             format: FORMAT_VERSION,
@@ -366,6 +382,14 @@ fn flatten_array<'a>(value: &'a Value, out: &mut Vec<&'a Value>) {
 /// contain at most one array field, matching MongoDB's parallel-array rule.
 pub fn encode_index_keys(def: &IndexDef, doc: &Value) -> Result<IndexKeys, crate::Error> {
     let fields = def.effective_fields();
+    if let Some(filter) = &def.partial_filter_expression {
+        if !crate::query::matches(doc, filter) {
+            return Ok(IndexKeys {
+                keys: Vec::new(),
+                multikey_fields: Vec::new(),
+            });
+        }
+    }
     if def.geo {
         if fields.len() != 1 {
             return Err(crate::Error::Query(
@@ -374,6 +398,12 @@ pub fn encode_index_keys(def: &IndexDef, doc: &Value) -> Result<IndexKeys, crate
         }
         let field = &fields[0];
         let (values, saw_array) = field_values(doc, field);
+        if values.is_empty() && def.sparse {
+            return Ok(IndexKeys {
+                keys: Vec::new(),
+                multikey_fields: Vec::new(),
+            });
+        }
         let mut keys = Vec::new();
         for value in values {
             if let Some(point) = crate::geo::parse_point(value) {
@@ -403,9 +433,21 @@ pub fn encode_index_keys(def: &IndexDef, doc: &Value) -> Result<IndexKeys, crate
     let mut per_field: Vec<Vec<Vec<u8>>> = Vec::with_capacity(fields.len());
     let mut multikey_fields = Vec::new();
     let directions = def.storage_directions();
+    let mut present_fields = 0usize;
     for (field_index, field) in fields.iter().enumerate() {
         let direction = directions.get(field_index).copied().unwrap_or(1);
         let (values, saw_array) = field_values(doc, field);
+        if values.is_empty() && def.sparse && fields.len() > 1 {
+            // MongoDB compound sparse entries store null for absent fields.
+            let direction = directions.get(field_index).copied().unwrap_or(1);
+            if let Some(key) = encode_value_direction(&Value::Null, direction) {
+                per_field.push(vec![key]);
+            }
+            continue;
+        }
+        if !values.is_empty() {
+            present_fields = present_fields.saturating_add(1);
+        }
         let mut encoded = Vec::new();
         let mut field_multikey = saw_array || values.len() > 1;
         for value in &values {
@@ -432,6 +474,12 @@ pub fn encode_index_keys(def: &IndexDef, doc: &Value) -> Result<IndexKeys, crate
             });
         }
         per_field.push(encoded);
+    }
+    if def.sparse && present_fields == 0 {
+        return Ok(IndexKeys {
+            keys: Vec::new(),
+            multikey_fields,
+        });
     }
     if multikey_fields.len() > 1 {
         return Err(crate::Error::Query(

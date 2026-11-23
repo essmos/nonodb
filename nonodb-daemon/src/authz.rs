@@ -315,6 +315,8 @@ mod tests {
             field: Some("x".into()),
             fields: None,
             unique: false,
+            sparse: false,
+            partial_filter_expression: None,
             include: vec![],
             geo: false,
         };
@@ -420,6 +422,8 @@ mod tests {
             field: Some("x".into()),
             fields: None,
             unique: false,
+            sparse: false,
+            partial_filter_expression: None,
             include: vec![],
             geo: false,
         };
