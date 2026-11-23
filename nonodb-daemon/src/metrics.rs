@@ -1,7 +1,8 @@
 //! Simple daemon metrics (atomic counters, no external dependencies).
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::io::BufReader;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -175,6 +176,52 @@ fn unix_now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0)
+}
+
+fn certificate_map() -> &'static Mutex<BTreeMap<String, i64>> {
+    static MAP: OnceLock<Mutex<BTreeMap<String, i64>>> = OnceLock::new();
+    MAP.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+/// Records the leaf certificate expiry for one TLS role. The value is a Unix
+/// timestamp in seconds so Prometheus can compare it directly with `time()`.
+pub fn set_certificate_expiry(kind: &str, expires_at_unix: i64) {
+    let mut map = certificate_map()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    map.insert(kind.to_string(), expires_at_unix);
+}
+
+/// Reads the first certificate from a PEM file and records its `notAfter`.
+pub fn record_certificate_expiry(kind: &str, path: &Path) -> Result<(), String> {
+    let file = std::fs::File::open(path)
+        .map_err(|error| format!("open certificate {}: {error}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    let certificates = rustls_pemfile::certs(&mut reader)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("parse certificate {}: {error}", path.display()))?;
+    let leaf = certificates
+        .first()
+        .ok_or_else(|| format!("no certificate in {}", path.display()))?;
+    use x509_parser::prelude::FromDer;
+    let (_, certificate) = x509_parser::certificate::X509Certificate::from_der(leaf.as_ref())
+        .map_err(|error| format!("decode certificate {}: {error}", path.display()))?;
+    set_certificate_expiry(kind, certificate.validity().not_after.timestamp());
+    Ok(())
+}
+
+fn certificates_json() -> Vec<Value> {
+    let map = certificate_map()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    map.iter()
+        .map(|(kind, expires_at_unix)| {
+            json!({
+                "kind": kind,
+                "expires_at_unix": expires_at_unix,
+            })
+        })
+        .collect()
 }
 
 /// Records a successful consistent snapshot for one database.
@@ -569,6 +616,7 @@ pub fn snapshot() -> Value {
         "ttl_sweep_errors_total": TTL_SWEEP_ERRORS.load(Relaxed),
         "ttl_backlog": TTL_BACKLOG.load(Relaxed),
         "snapshots": snapshots_json(),
+        "certificates": certificates_json(),
         "disk": disk_json(),
         "index_builds": nonodb_core::progress::snapshot(),
         "avg_batch_size": write_ops as f64 / batches as f64,
@@ -1118,6 +1166,26 @@ pub fn prometheus() -> String {
         prom_sample(&mut out, name, &[], &snapshot[key]);
     }
 
+    if let Some(rows) = snapshot["certificates"].as_array() {
+        if !rows.is_empty() {
+            prom_header(
+                &mut out,
+                "nonodb_tls_certificate_expiry_timestamp_seconds",
+                "gauge",
+                "Leaf TLS certificate expiry as a Unix timestamp.",
+            );
+            for row in rows {
+                let kind = row["kind"].as_str().unwrap_or("unknown");
+                prom_sample(
+                    &mut out,
+                    "nonodb_tls_certificate_expiry_timestamp_seconds",
+                    &[("kind", kind)],
+                    &row["expires_at_unix"],
+                );
+            }
+        }
+    }
+
     if let Some(rows) = snapshot["latency"].as_array() {
         prom_header(
             &mut out,
@@ -1486,6 +1554,23 @@ mod tests {
         assert!(text.contains(&format!("collection=\"{collection}\"")));
         assert!(text.contains("nonodb_snapshot_success_total{database=\""));
         assert!(text.contains("nonodb_snapshot_age_seconds{database=\""));
+    }
+
+    #[test]
+    fn certificate_expiry_is_exported_as_a_timestamp() {
+        let kind = format!("test-{}", std::process::id());
+        set_certificate_expiry(&kind, 1_900_000_000);
+        let snapshot = snapshot();
+        assert!(snapshot["certificates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["kind"] == kind.as_str() && row["expires_at_unix"] == 1_900_000_000));
+        let text = prometheus();
+        assert!(text.contains("# TYPE nonodb_tls_certificate_expiry_timestamp_seconds gauge"));
+        assert!(text.contains(&format!(
+            "nonodb_tls_certificate_expiry_timestamp_seconds{{kind=\"{kind}\"}} 1900000000"
+        )));
     }
 
     #[test]

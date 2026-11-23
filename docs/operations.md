@@ -833,6 +833,7 @@ Useful signals:
 | `collection_metrics` | Per-`database/collection` requests, reads, writes, cache, errors, and latency |
 | `collection_metrics_overflow_total` | Requests omitted after the 4096-series metrics cap |
 | `latency` / `nonodb_request_duration_seconds` | End-to-end request latency histogram by operation |
+| `certificates` / `nonodb_tls_certificate_expiry_timestamp_seconds` | Configured server and replication certificate expiry timestamps |
 | `disk` / `nonodb_disk_*` | Filesystem capacity, free, used, and used ratio for data and snapshots |
 | `snapshots` / `nonodb_snapshot_*` | Per-database snapshot success, failures, age, and duration |
 | `auth_failures_total` | Failed authentication attempts |

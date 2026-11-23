@@ -927,6 +927,9 @@ fn build_tls_acceptor(
         }
         builder.with_no_client_auth().with_single_cert(certs, key)?
     };
+    if let Err(error) = metrics::record_certificate_expiry("server", Path::new(cert)) {
+        tracing::warn!(%error, "TLS certificate expiry metric unavailable");
+    }
     Ok((TlsAcceptor::from(Arc::new(config)), client_ca.is_some()))
 }
 

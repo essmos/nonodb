@@ -135,3 +135,12 @@ groups:
         annotations:
           summary: NonoDB replica acknowledgement is stale
           description: Replica {{ $labels.node }} has not acknowledged {{ $labels.database }}/{{ $labels.origin }} for more than five minutes.
+
+      - alert: NonoDBCertificateExpiring
+        expr: nonodb_tls_certificate_expiry_timestamp_seconds - time() < 14 * 24 * 3600
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: NonoDB TLS certificate expires soon
+          description: The {{ $labels.kind }} certificate expires within 14 days or has already expired. Rotate it and reload the daemon.

@@ -419,6 +419,11 @@ impl Config {
             let identity = reqwest::Identity::from_pem(&pem)
                 .map_err(|error| format!("parse client identity: {error}"))?;
             builder = builder.identity(identity);
+            if let Err(error) =
+                metrics::record_certificate_expiry("replication", std::path::Path::new(cert))
+            {
+                tracing::warn!(%error, "replication certificate expiry metric unavailable");
+            }
         }
         builder
             .build()

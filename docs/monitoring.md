@@ -129,11 +129,37 @@ Tempo/Mimir, Honeycomb, Datadog, and self-hosted OpenTelemetry Collectors.
 - stale snapshots and snapshot failures;
 - elevated authentication failures and IP lockouts;
 - per-collection error rate;
-- replica lag, replication transport errors, apply failures, and stale replica acks.
+- replica lag, replication transport errors, apply failures, and stale replica acks;
+- TLS certificates that expire within 14 days or have already expired.
 
 Tune thresholds and `for:` durations for the deployment. The disk alerts use
 `mount="data"`; snapshot alerts only fire when periodic snapshots are enabled
 with `NONODB_SNAPSHOT_DIR`.
+
+## Certificate metrics
+
+When TLS is configured, the daemon exports the leaf certificate expiry as a
+Unix timestamp:
+
+| Metric | Meaning |
+|---|---|
+| `nonodb_tls_certificate_expiry_timestamp_seconds{kind}` | Expiry time of the configured certificate |
+
+The `kind` label is `server` for `NONODB_TLS_CERT` and `replication` for
+`NONODB_REPLICATION_CERT_FILE`. The series is absent when the corresponding
+certificate is not configured. The same values are available in the `/metrics`
+JSON response under `certificates`.
+
+The included `NonoDBCertificateExpiring` alert fires when a certificate has
+less than 14 days remaining:
+
+```promql
+nonodb_tls_certificate_expiry_timestamp_seconds - time() < 14 * 24 * 3600
+```
+
+Rotate the certificate and trigger the normal TLS reload by replacing the file.
+For a replication client certificate, restart the daemon so the outbound HTTP
+client picks up the new identity.
 
 ## Disk and snapshot metrics
 
@@ -203,6 +229,7 @@ At minimum, alert on:
 4. sustained `nonodb_queue_len` growth
 5. a sustained `nonodb_errors_total` rate
 6. `nonodb_auth_failures_total` and `nonodb_auth_blocks_total`
+7. `nonodb_tls_certificate_expiry_timestamp_seconds - time() < 14 * 24 * 3600`
 
 `GET /metrics` remains available for existing JSON consumers and includes the
 same extra `disk`, `snapshots`, and `collection_metrics` fields.
