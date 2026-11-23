@@ -6,6 +6,13 @@ import { oneDark } from '@codemirror/theme-one-dark';
 import { autocompletion, type CompletionContext } from '@codemirror/autocomplete';
 import QueryBuilder from './QueryBuilder';
 import { handleTabKey } from './accessibility';
+import {
+  normalizeViewList,
+  parseSavedViewsFile,
+  savedViewsFileName,
+  serializeSavedViews,
+  type SavedView,
+} from './savedViews';
 import EventingPage from './EventingPage';
 import {
   applyFirewall,
@@ -2924,9 +2931,11 @@ function CollectionView({
   const [docs, setDocs] = useState<Doc[]>([]);
   const [sampleDocs, setSampleDocs] = useState<Doc[]>([]);
   const [fieldPaths, setFieldPaths] = useState<string[]>([]);
-  const [savedViews, setSavedViews] = useState<Array<Record<string, string | number>>>(() => {
+  const [savedViews, setSavedViews] = useState<SavedView[]>(() => {
     try {
-      return JSON.parse(localStorage.getItem(collectionViewStorageKey(connection, name)) ?? '[]') as Array<Record<string, string | number>>;
+      return normalizeViewList(
+        JSON.parse(localStorage.getItem(collectionViewStorageKey(connection, name)) ?? '[]'),
+      );
     } catch {
       return [];
     }
@@ -2992,6 +3001,7 @@ function CollectionView({
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
   const fileInput = useRef<HTMLInputElement>(null);
+  const viewsFileInput = useRef<HTMLInputElement>(null);
 
   const sort = useMemo(() => {
     const field = cleanField(sortField);
@@ -3145,12 +3155,36 @@ function CollectionView({
   const applyView = (label: string) => {
     const view = savedViews.find((item) => item.name === label);
     if (!view) return;
-    setFilterText(String(view.filter ?? '{}'));
-    setSortField(String(view.sortField ?? '_id'));
-    setSortDir(view.sortDir === 'desc' ? 'desc' : 'asc');
-    setLimit(Number(view.limit ?? 50));
-    setProjectionText(String(view.projection ?? ''));
+    setFilterText(view.filter);
+    setSortField(view.sortField);
+    setSortDir(view.sortDir);
+    setLimit(view.limit);
+    setProjectionText(view.projection);
     setSkip(0);
+  };
+
+  const exportViews = () => {
+    if (savedViews.length === 0) return;
+    downloadText(savedViewsFileName(name), serializeSavedViews(name, savedViews));
+    setNotice(`Exported ${savedViews.length} saved view${savedViews.length === 1 ? '' : 's'}`);
+  };
+
+  const importViews = async (file: File | null) => {
+    if (!file) return;
+    setError('');
+    try {
+      const imported = parseSavedViewsFile(await file.text());
+      const names = new Set(imported.map((view) => view.name));
+      const next = [...savedViews.filter((view) => !names.has(view.name)), ...imported].sort(
+        (a, b) => a.name.localeCompare(b.name),
+      );
+      setSavedViews(next);
+      localStorage.setItem(collectionViewStorageKey(connection, name), JSON.stringify(next));
+      setViewName('');
+      setNotice(`Imported ${imported.length} saved view${imported.length === 1 ? '' : 's'}`);
+    } catch (err) {
+      setError(`Could not import saved views: ${err instanceof Error ? err.message : String(err)}`);
+    }
   };
 
   const openHistory = async () => {
@@ -3852,6 +3886,21 @@ function CollectionView({
                       </select>
                       <input value={viewName} onChange={(e) => setViewName(e.target.value)} placeholder="view name" className="view-name" />
                       <button onClick={saveView}>Save</button>
+                    </div>
+                    <div className="tools-row">
+                      <button onClick={exportViews} disabled={savedViews.length === 0}>Export views</button>
+                      <button onClick={() => viewsFileInput.current?.click()}>Import views</button>
+                      <input
+                        ref={viewsFileInput}
+                        type="file"
+                        accept=".json,application/json"
+                        hidden
+                        onChange={(event) => {
+                          const file = event.target.files?.[0] ?? null;
+                          event.target.value = '';
+                          void importViews(file);
+                        }}
+                      />
                     </div>
                   </div>
                   <div className="tools-section">

@@ -222,6 +222,7 @@ python3 scripts/async_watch_test.py          # AsyncNonoDB long-poll, NDJSON, li
 python3 scripts/subscriptions_test.py        # persistent conditional subscriptions, count, once, SQL, restart
 python3 scripts/live_watch_test.py           # connection-scoped live mode, direct SSE delivery, no _events
 python3 scripts/gui_test.py                     # GUI asset markers, accessibility landmarks, proxy, database flow
+python3 scripts/gui_views_test.py               # saved-view JSON export/import validation and credential stripping
 python3 scripts/gui_cluster_test.py                  # embedded GUI assets and local API proxy
 python3 scripts/multi_database_test.py       # routing, isolation, cursors, restart, drop
 python3 scripts/multi_database_features_test.py  # full feature matrix inside app1

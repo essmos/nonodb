@@ -163,6 +163,11 @@ def main() -> int:
                 b"aria-current",
                 b"aria-modal",
                 b"tablist",
+                b"Export views",
+                b"Import views",
+                b"nonodb.saved-views",
+                b"nonodb-views-",
+                b"Could not import saved views",
             ):
                 assert marker in asset, marker
             for marker in (

@@ -262,7 +262,47 @@ back up the database first if a copy is needed. See
 - multi-document selection with bulk delete and bulk field update;
 - document history viewer with previous-revision comparison and restore;
 - import/export as JSON, NDJSON, or CSV, with optional upsert on import;
-- saved per-collection views for filter, sort, projection, and limit.
+- saved per-collection views for filter, sort, projection, and limit;
+- credential-free JSON export and import of saved views.
+
+### Saved views
+
+A saved view stores the filter, sort field and direction, limit, and projection
+for one collection. Views are scoped to the endpoint and database, so the same
+collection name on two daemons does not share local view definitions.
+
+**Export views** downloads a `nonodb-views-<collection>.json` file with this
+shape:
+
+```json
+{
+  "format": "nonodb.saved-views",
+  "version": 1,
+  "collection": "orders",
+  "views": [
+    {
+      "name": "Active",
+      "filter": "{\"status\":\"active\"}",
+      "sortField": "created_at",
+      "sortDir": "desc",
+      "limit": 25,
+      "projection": "{\"name\":1}"
+    }
+  ]
+}
+```
+
+The file contains only view definitions and the collection name. It never
+includes the endpoint, database token, TLS material, vault keys, saved
+connection profiles, or document bodies. Treat it as shareable but review
+filters before posting publicly.
+
+**Import views** accepts the same format. Each imported view replaces an
+existing view with the same name; other views are preserved. Unknown fields and
+credential-like fields are ignored, never stored, and omitted from later
+exports. Invalid JSON, unknown formats or versions, empty names, invalid sort
+directions, and limits outside `0..10000` are rejected as a whole, with an error
+shown above the collection. Nothing is written until the entire file validates.
 
 ### Indexes
 
@@ -734,29 +774,20 @@ runs.
 - Import currently supports full-database import from native local/S3 backups;
   selective collection import, restic repository import, and replace-in-place
   restore are not exposed in the GUI.
-- Multi-connection profiles exist, but simultaneous multi-daemon tabs do not.
 - A light theme is not included.
 
 ## Future GUI work
 
 These are planned improvements, not current features.
 
-- **Database management in the GUI.** Create and drop databases directly from
-  the console; today the GUI can select databases but creation/drop is CLI-only.
 - **Backup and restore UI.** Trigger online backups, list manifests, verify
   checksums, and show restore instructions. Restore itself remains CLI-only
   until a safe daemon-side restore flow exists.
-- **Multiple daemon tabs.** Keep several connection profiles open at once
-  instead of switching one active connection.
 - **Progress and resume for large imports.** Stream import progress, allow
   cancellation, and resume large JSON/NDJSON/CSV imports.
 - **Better large-result handling.** Virtualized document lists and resumable
   cursors for very large collections.
 - **Light theme.** The current console is intentionally dark-only.
-- **Accessibility and keyboard navigation.** Improve focus management, ARIA
-  labels, and shortcuts beyond the command palette.
-- **Shareable saved views and filters.** Export/import saved views without
-  sharing credentials.
 
 ## Security notes
 
