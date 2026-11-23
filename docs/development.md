@@ -217,6 +217,7 @@ python3 scripts/ttl_strict_disabled_test.py  # NONODB_TTL_STRICT_READS=0 legacy 
 python3 scripts/ttl_replica_strict_test.py   # replicated TTL metadata hides documents on a replica
 python3 scripts/history_test.py              # per-collection history enable/disable, restart, CLI
 python3 scripts/events_auto_test.py          # automatic collection events, field filters, thresholds, CLI
+python3 scripts/events_ttl_test.py           # consumed outbox events expire; checkpoint resume and watch truncation
 python3 scripts/async_watch_test.py          # AsyncNonoDB long-poll, NDJSON, live, and truncation
 python3 scripts/subscriptions_test.py        # persistent conditional subscriptions, count, once, SQL, restart
 python3 scripts/live_watch_test.py           # connection-scoped live mode, direct SSE delivery, no _events
@@ -330,6 +331,7 @@ scripts are:
 | `scripts/vault_regression_test.py` | Vault profiles, headers, filters, CRUD, errors, history |
 | `scripts/history_test.py` | Per-collection history retention, isolation, restart durability, CLI |
 | `scripts/events_auto_test.py` | Automatic collection events, source-side filters/projections, find_and_modify/TTL/SQL writes, watch filters, thresholds, metrics, CLI tail |
+| `scripts/events_ttl_test.py` | TTL retention of consumed outbox events, checkpoint survival, delivery after an expired event, and truncated watch cursors |
 | `scripts/async_watch_test.py` | AsyncNonoDB long-poll, NDJSON stream, live subscription, and truncation behavior |
 | `scripts/webhook_test.py` | Asynchronous webhook rules, filters, count/sum/avg thresholds, once/cooldown, HMAC, idempotency, timeout, retry/dead-letter, CLI CRUD, and restart |
 | `scripts/search_all_test.py` | Unified search modes, filters, pagination, RRF metadata, `$search`/`$searchMeta`/`$vectorSearch`, CLI, and MongoDB wire aggregation |

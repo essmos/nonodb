@@ -131,6 +131,7 @@ jobs:
           python3 scripts/ttl_strict_test.py
           python3 scripts/ttl_strict_disabled_test.py
           python3 scripts/ttl_replica_strict_test.py
+          python3 scripts/events_ttl_test.py
 
       - name: Run security regression checks
         env:

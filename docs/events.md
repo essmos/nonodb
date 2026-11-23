@@ -396,7 +396,10 @@ db.set_collection_ttl("_events", 7 * 24 * 3600)
 ```
 
 Choose retention longer than the maximum consumer outage you want to survive.
-Events already consumed can expire safely after that window.
+Events already consumed can expire safely after that window. TTL removes only
+event documents, not consumer checkpoints: a consumer whose checkpoint is still
+valid resumes with the next retained event, while `watch` reports `truncated`
+when the requested cursor has already expired.
 
 The event collection needs no extra index for the default consumer: the `_id`
 primary key provides the ordered range scan. If you filter by `type`, the query
