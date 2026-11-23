@@ -293,6 +293,15 @@ comparison and practical migration caveats.
 These are not commitments. They are ordered roughly by expected value for the
 project's target workload.
 
+### Backlog scope
+
+`TODO.md` intentionally tracks a filtered implementation backlog: low/medium
+difficulty tasks worth doing now. Before the current backlog was executed, the
+user removed larger product ideas, high-cost integrations, and work that needs
+measured evidence or a separate design decision. Removing an item from
+`TODO.md` does not mean it was implemented; the unsupported behavior remains
+documented in this roadmap and the relevant guides.
+
 ### GUI and operator experience
 
 1. **Backup verification and restore APIs.** Let the GUI verify manifests and
