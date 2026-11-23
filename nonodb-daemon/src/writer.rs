@@ -1881,6 +1881,12 @@ fn execute(
             Ok(json!({ "dropped": existed, "kind": "vector" }))
         }
         WriteReq::SetGraph { coll, def } => {
+            if def.node_collection != *coll {
+                return Err(ApiError {
+                    code: "invalid_query".into(),
+                    message: "graph `node_collection` must equal `coll`".into(),
+                });
+            }
             let c = standard_collection(store, wtxn, coll)?;
             let out = def.clone();
             c.set_graph_txn(wtxn, def)?;

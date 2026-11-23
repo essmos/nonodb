@@ -516,6 +516,17 @@ pub fn traverse(view: &dyn GraphView, options: &TraverseOptions) -> Result<Value
             }
             let via = via_value(&edge, options.include_edges);
             if let Some(&existing) = visited.get(&edge.target) {
+                if records.len() >= options.limit_nodes {
+                    truncated = true;
+                    stop = true;
+                    break;
+                }
+                bytes = bytes.saturating_add(serde_json::to_vec(&records[existing].node)?.len());
+                if bytes > options.max_bytes {
+                    truncated = true;
+                    stop = true;
+                    break;
+                }
                 records.push(Record {
                     id: edge.target.clone(),
                     depth: records[current].depth + 1,
@@ -887,6 +898,33 @@ mod tests {
         assert_eq!(roots.len(), 1);
         assert_eq!(roots[0]["node"]["_id"], "a");
         assert!(out.to_string().contains("\"cycle\":true"));
+        let limited = TraverseOptions {
+            limit_nodes: 3,
+            ..TraverseOptions {
+                start: vec![json!("a")],
+                seed: None,
+                direction: GraphDirection::Out,
+                labels: Vec::new(),
+                max_depth: 4,
+                limit_nodes: 100,
+                limit_edges: 100,
+                max_bytes: 1_000_000,
+                tree: true,
+                include_edges: false,
+                algorithm: TraverseAlgorithm::Bfs,
+            }
+        };
+        let out = traverse(&view(), &limited).unwrap();
+        assert_eq!(out["nodes"], 3);
+        assert_eq!(out["truncated"], true);
+
+        let tiny = TraverseOptions {
+            max_bytes: 1,
+            ..limited
+        };
+        let out = traverse(&view(), &tiny).unwrap();
+        assert_eq!(out["nodes"], 0);
+        assert_eq!(out["truncated"], true);
     }
 
     #[test]

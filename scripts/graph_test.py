@@ -87,6 +87,34 @@ def main() -> int:
         assert nodes.get_graph()["from_field"] == "from"
         assert nodes.get_graph()["directed"] is True
 
+        # HTTP set_graph must not let `def.node_collection` diverge from `coll`.
+        try:
+            db.exec(
+                {
+                    "op": "set_graph",
+                    "coll": "nodes",
+                    "def": {
+                        "node_collection": "other",
+                        "edge_collection": "edges",
+                        "from_field": "from",
+                        "to_field": "to",
+                        "label_field": "label",
+                        "weight_field": "weight",
+                        "directed": True,
+                    },
+                }
+            )
+        except NonoDBError:
+            pass
+        else:
+            raise AssertionError("set_graph accepted a mismatched node_collection")
+
+        # A successful edge insert after configuration updates adjacency.
+        edges.insert({"_id": "e6", "from": "a", "to": "d", "label": "KNOWS", "weight": 1})
+        assert "d" in child_ids(nodes.traverse("a", max_depth=1)["roots"][0])
+        edges.delete({"_id": "e6"}, multi=False)
+        assert "d" not in child_ids(nodes.traverse("a", max_depth=1)["roots"][0])
+
         tree = nodes.traverse("a", max_depth=2)
         assert tree["nodes"] == 5, tree
         assert tree["edges"] == 4, tree
@@ -99,6 +127,17 @@ def main() -> int:
         flat = nodes.traverse("a", max_depth=2, tree=False)
         assert len(flat["items"]) == 5, flat
         assert flat["items"][0]["node"]["_id"] == "a"
+
+        dfs = nodes.traverse("a", max_depth=2, algorithm="dfs")
+        assert dfs["nodes"] == 5 and dfs["edges"] == 4, dfs
+
+        node_limited = nodes.traverse("a", max_depth=2, limit_nodes=3)
+        assert node_limited["nodes"] == 3, node_limited
+        assert node_limited["truncated"] is True, node_limited
+
+        byte_limited = nodes.traverse("a", max_depth=2, max_bytes=1)
+        assert byte_limited["nodes"] == 0, byte_limited
+        assert byte_limited["truncated"] is True, byte_limited
 
         depth_one = nodes.traverse("a", max_depth=1)
         assert depth_one["nodes"] == 3 and depth_one["edges"] == 2, depth_one
