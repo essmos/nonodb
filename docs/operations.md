@@ -1047,11 +1047,13 @@ backups.
   To adopt `sparse` or `partialFilterExpression` for an existing index, drop it
   and create it again with the new options; `reindex` rebuilds the stored
   definition but cannot add or change options.
-- Plain indexes continue to omit documents that are missing an indexed field.
-  Existing plain unique indexes therefore need no reindex for missing-field
-  semantics: missing values are not indexed as `null`, and uniqueness applies
-  only to documents that have every indexed field. Present `null` values are
-  indexed and can collide under a unique index.
+- Plain indexes now index a missing field as `null`, matching MongoDB. Indexes
+  built by earlier releases omitted those entries, so run
+  `nonodb-cli reindex <collection>` for every collection with plain indexes
+  after upgrading. Until reindexing, index-backed reads and unique enforcement
+  can differ for documents with missing fields. If several documents already
+  share a missing/`null` value under a plain unique index, reindexing fails
+  with a duplicate-key error; resolve the duplicates first.
 - Schema version is stored in metadata. There is currently no automatic
   migration framework; changes are handled by explicit commands and releases.
 

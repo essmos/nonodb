@@ -272,7 +272,10 @@ def wal_full(tmp: Path) -> None:
         docs = db.collection("docs")
         payload = "x" * 1500
         error = None
-        for index in range(40):
+        # The archiver applies the hard limit asynchronously. Keep writing long
+        # enough for the limit to take effect instead of relying on a fixed
+        # number of fast writes.
+        for index in range(500):
             try:
                 docs.insert({"_id": f"d{index}", "payload": payload})
             except NonoDBError as exc:
@@ -280,6 +283,8 @@ def wal_full(tmp: Path) -> None:
                     error = exc
                     break
                 raise
+            if index % 10 == 0:
+                time.sleep(0.01)
         assert error is not None, "WAL reached its hard limit without returning wal_full"
         print(f"pitr wal_full: {error.code}")
     finally:

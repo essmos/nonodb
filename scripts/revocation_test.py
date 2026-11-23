@@ -345,11 +345,13 @@ def ocsp_response(serial: bytes, revoked: bool) -> bytes:
 
 class OcspHandler(http.server.BaseHTTPRequestHandler):
     revoked_serial = b""
+    requests: list[bytes] = []
 
     def do_POST(self) -> None:  # noqa: N802
         length = int(self.headers.get("content-length", "0"))
         body = self.rfile.read(length)
         serial = request_serial(body)
+        self.requests.append(serial)
         payload = ocsp_response(serial, serial == self.revoked_serial)
         self.send_response(200)
         self.send_header("content-type", "application/ocsp-response")
@@ -468,6 +470,7 @@ def main() -> int:
         # Local OCSP responder: revoked serial is rejected, good serial passes.
         handler = OcspHandler
         handler.revoked_serial = bytes.fromhex(bad_serial)
+        handler.requests = []
         server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -483,8 +486,12 @@ def main() -> int:
         )
         try:
             accepted(ocsp_daemon, "good", export_token)
+            accepted(ocsp_daemon, "good", export_token)
+            # The second good connection must be served from the OCSP cache.
+            assert len(handler.requests) == 1, handler.requests
             rejected(ocsp_daemon, "revoked", export_token, "revoked by OCSP")
-            print("ocsp: good accepted, revoked rejected")
+            assert len(handler.requests) == 2, handler.requests
+            print("ocsp: good accepted (cached), revoked rejected")
         finally:
             ocsp_daemon.stop()
             server.shutdown()

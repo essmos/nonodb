@@ -44,6 +44,7 @@ def main() -> int:
     suffix = uuid.uuid4().hex[:8]
 
     ttl_name = f"ttl_index_{suffix}"
+    plain_name = f"plain_index_{suffix}"
     sparse_name = f"sparse_index_{suffix}"
     partial_name = f"partial_index_{suffix}"
     try:
@@ -73,6 +74,25 @@ def main() -> int:
         assert ttl.find_one({"_id": "live"}) is not None
         assert ttl.find_one({"_id": "missing-date"}) is not None
         assert ttl.find_one({"_id": "not-a-date"}) is not None
+
+        plain = db[plain_name]
+        assert (
+            plain.create_index([("email", 1)], unique=True, name="email_plain")
+            == "email_plain"
+        )
+        plain.insert_one({"_id": "plain-missing-a"})
+        for document in (
+            {"_id": "plain-missing-b"},
+            {"_id": "plain-null", "email": None},
+        ):
+            try:
+                plain.insert_one(document)
+            except DuplicateKeyError as error:
+                assert error.code == 11000, error
+            else:
+                raise AssertionError(
+                    "plain unique index accepted a duplicate missing/null key"
+                )
 
         sparse = db[sparse_name]
         assert (

@@ -193,12 +193,12 @@ comparison and practical migration caveats.
   contain at most one array field; parallel arrays are rejected. Ordinary
   objects are skipped. Indexes created before format 5 must be recreated to
   include array entries.
-- `sparse` indexes omit documents without the key. A plain index, including a
-  plain unique index, also omits documents missing any indexed field, so missing
-  values are not treated as `null` for uniqueness. A compound sparse index
-  stores `null` for absent fields and omits a document only when every key is
-  absent. `partialFilterExpression` limits index membership and is used by the
-  planner only when the query repeats the predicate. No wildcard indexes or text
+- A plain index, including a plain unique index, indexes a missing field as
+  `null`, matching MongoDB, so only one missing/`null` value can be unique.
+  `sparse` indexes omit documents whose key is absent; a compound sparse index
+  omits a document only when every key is absent. `partialFilterExpression`
+  limits index membership and is used by the planner only when the query repeats
+  the predicate. No wildcard indexes or text
   indexes with custom analyzers. `expireAfterSeconds` on a single-field TTL
   index maps to date-field TTL and backfills existing documents. Geo indexes
   currently cover single-field GeoJSON points; polygon/line document indexes are

@@ -202,8 +202,10 @@ configuration.
 
 Indexes are created **after** documents are loaded. This is faster for large
 imports, but a unique index fails if the source contains duplicates or `null`
-values that collide. Deduplicate before import, or create the unique index
-first in a small validation pass.
+values that collide. A plain unique index treats a missing field as `null`, so
+at most one imported document may omit the indexed field; use `sparse` when
+many documents may omit it. Deduplicate before import, or create the unique
+index first in a small validation pass.
 
 ## Run the importer
 

@@ -9067,7 +9067,8 @@ fn bounds_for_index(def: &IndexDef, filter: &Map<String, Value>) -> Option<index
     let mut prefix = Vec::new();
     for (i, field) in fields.iter().enumerate() {
         let cond = index_condition(filter, field)?;
-        // `null` also matches a missing field, and missing fields are not in the index.
+        // `null` also matches a missing field. Plain indexes encode it as
+        // null, but the planner remains conservative here.
         if cond.is_null()
             || cond
                 .as_object()
@@ -10816,8 +10817,8 @@ mod tests {
         assert_eq!(plan["access_path"], "index_scan");
         assert_eq!(plan["sort_covered"], true);
 
-        // A document missing the sort field is not in the index, so the planner
-        // must fall back to a scan and place it first, like MongoDB.
+        // A plain index stores a missing sort field as null, so it still covers
+        // the sort and places that document first, like MongoDB.
         c.insert_one(json!({"_id": "missing"})).unwrap();
         let q = FindQuery {
             filter: serde_json::json!({}),
@@ -10828,7 +10829,8 @@ mod tests {
         assert_eq!(got.len(), 11);
         assert_eq!(got[0]["_id"], "missing");
         let plan = c.explain(&q).unwrap();
-        assert_eq!(plan["access_path"], "collection_scan");
+        assert_eq!(plan["access_path"], "index_scan");
+        assert_eq!(plan["sort_covered"], true);
 
         let q = FindQuery {
             filter: json!({"$or": [{"n": 3}, {"name": "u7"}]}),
@@ -11524,6 +11526,18 @@ mod tests {
             .unwrap();
         assert!(matches!(
             c.insert_one(json!({"_id": "two", "email": "a@example.test"})),
+            Err(Error::DuplicateKey(_))
+        ));
+
+        let plain = store.collection("plain_unique_missing").unwrap();
+        plain.create_index("email", true).unwrap();
+        plain.insert_one(json!({"_id": "plain-missing-a"})).unwrap();
+        assert!(matches!(
+            plain.insert_one(json!({"_id": "plain-missing-b"})),
+            Err(Error::DuplicateKey(_))
+        ));
+        assert!(matches!(
+            plain.insert_one(json!({"_id": "plain-null", "email": null})),
             Err(Error::DuplicateKey(_))
         ));
 
@@ -12452,7 +12466,8 @@ mod tests {
         assert_eq!(c.count(&Value::Null).unwrap(), 4);
         assert_eq!(c.count(&json!({"v": 1})).unwrap(), 1);
         assert_eq!(c.count(&json!({"v": {"$gte": 2}})).unwrap(), 1);
-        // `null` also matches a missing field -> the index must not be used.
+        // `null` also matches a missing field. The planner stays conservative
+        // and scans, even though plain indexes now encode missing as null.
         assert_eq!(c.count(&json!({"v": null})).unwrap(), 2);
         assert_eq!(c.count(&json!({"v": {"$eq": null}})).unwrap(), 2);
 
@@ -12581,7 +12596,7 @@ mod tests {
         c.insert_one(json!({"b": 1, "tag": "missing"})).unwrap();
         c.create_index("a", false).unwrap();
 
-        // A missing field also matches `null`; the index does not contain missing fields.
+        // A missing field also matches `null`; the planner deliberately scans.
         assert_eq!(c.count(&json!({"a": null})).unwrap(), 2);
         let q = FindQuery {
             filter: json!({"a": null}),
@@ -13807,12 +13822,12 @@ mod tests {
         natural.hint = None;
         assert_eq!(ids(c.find(&natural).unwrap()), vec!["c", "b", "a"]);
 
-        // A hinted index that omits a document cannot be used for a full
-        // residual scan, because that document would never be visited.
+        // A plain index includes a missing field as null, so a hinted residual
+        // scan still visits documents without that field.
         c.insert_one(json!({"_id": "d", "y": "d"})).unwrap();
         q.filter = json!({"y": "d"});
         q.hint = Some(json!({"x": 1}));
-        assert!(c.find(&q).is_err());
+        assert_eq!(ids(c.find(&q).unwrap()), vec!["d"]);
     }
 
     #[test]

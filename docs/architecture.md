@@ -99,8 +99,10 @@ Properties that matter here:
   makes that explicit with one writer thread.
 - **Crash safety.** Committed transactions survive process death. An
   interrupted write leaves the last committed state intact.
-- **No WAL, no background compaction.** The file grows to a high-water mark and
-  does not shrink. `backup` with compaction produces a smaller copy.
+- **Optional WAL.** PITR is opt-in and per database; it retains a segmented
+  logical WAL alongside periodic snapshots. The LMDB file grows to a high-water
+  mark and does not shrink, with or without PITR. `backup` with compaction
+  produces a smaller copy.
 
 The default `map_size` is 1 GiB. This is a maximum address-space reservation
 for the database, not an allocation of 1 GiB of RAM or disk. It can be raised
@@ -222,8 +224,9 @@ The optimizer is intentionally simple and conservative. It uses an index when:
   the last field; or
 - a single-field index has an equality or range condition, a single-value
   `$all`, or a case-sensitive anchored regex (`^literal`); and
-- the indexed field value is not `null` (because `null` also matches a missing
-  field, which is absent from the index).
+- the indexed field value is not `null`. The planner keeps `null` conditions on
+  a scan even though plain indexes encode a missing field as `null`, so results
+  remain correct without relying on index membership.
 
 Even when an index supplies candidates, the full filter is evaluated against
 each document. Indexes are an access path, not a substitute for query
@@ -455,9 +458,10 @@ become contiguous LMDB ranges. An index range scan does not deserialize
 documents until candidates are verified.
 
 Secondary indexes accept strings, numbers, Decimal128, special doubles,
-booleans, dates, binary/UUID, ObjectId, and `null` values that are actually
-present. Arrays and ordinary objects are skipped. Dates are canonicalized
-before indexing, so all offsets for one instant share a key. Text and fuzzy
+booleans, dates, binary/UUID, ObjectId, and `null`. A plain index encodes a
+missing indexed field as `null`; a sparse index omits it instead. Arrays and
+ordinary objects are skipped. Dates are canonicalized before indexing, so all
+offsets for one instant share a key. Text and fuzzy
 indexes search string, boolean, and numeric scalar values, including Extended
 JSON integer/double/decimal forms. Dates, binary/UUID, and ObjectId values are
 not searchable text.

@@ -442,13 +442,27 @@ pub fn encode_index_keys(def: &IndexDef, doc: &Value) -> Result<IndexKeys, crate
     for (field_index, field) in fields.iter().enumerate() {
         let direction = directions.get(field_index).copied().unwrap_or(1);
         let (values, saw_array) = field_values(doc, field);
-        if values.is_empty() && def.sparse && fields.len() > 1 {
-            // MongoDB compound sparse entries store null for absent fields.
-            let direction = directions.get(field_index).copied().unwrap_or(1);
-            if let Some(key) = encode_value_direction(&Value::Null, direction) {
-                per_field.push(vec![key]);
+        if values.is_empty() {
+            if def.sparse && fields.len() > 1 {
+                // MongoDB compound sparse entries store null for absent
+                // fields and omit only documents where every key is absent.
+                let direction = directions.get(field_index).copied().unwrap_or(1);
+                if let Some(key) = encode_value_direction(&Value::Null, direction) {
+                    per_field.push(vec![key]);
+                }
+                continue;
             }
-            continue;
+            if !def.sparse {
+                // Plain indexes treat an absent field as null, matching
+                // MongoDB uniqueness and index ordering. Geo indexes are
+                // sparse by construction and handled above.
+                let direction = directions.get(field_index).copied().unwrap_or(1);
+                let key = encode_value_direction(&Value::Null, direction).ok_or_else(|| {
+                    crate::Error::Query("cannot encode a missing index field".into())
+                })?;
+                per_field.push(vec![key]);
+                continue;
+            }
         }
         if !values.is_empty() {
             present_fields = present_fields.saturating_add(1);
@@ -1018,6 +1032,24 @@ mod tests {
         let at_upper = encode_value_direction(&json!(8), -1).unwrap();
         assert!(below.as_slice() > upper);
         assert!(at_upper.as_slice() < lower);
+    }
+
+    #[test]
+    fn plain_indexes_encode_missing_as_null_and_sparse_omit() {
+        let plain = IndexDef::single("a", false);
+        let keys = encode_index_keys(&plain, &json!({"_id": "missing"})).unwrap();
+        assert_eq!(keys.keys, vec![encode_value(&Value::Null).unwrap()]);
+
+        let mut sparse = IndexDef::single("a", false);
+        sparse.sparse = true;
+        let keys = encode_index_keys(&sparse, &json!({"_id": "missing"})).unwrap();
+        assert!(keys.keys.is_empty());
+
+        let compound = IndexDef::compound(&["a".into(), "b".into()], false, &[]);
+        let keys = encode_index_keys(&compound, &json!({"_id": "missing"})).unwrap();
+        let mut expected = encode_value(&Value::Null).unwrap();
+        expected.extend_from_slice(&encode_value(&Value::Null).unwrap());
+        assert_eq!(keys.keys, vec![expected]);
     }
 
     #[test]

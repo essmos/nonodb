@@ -1904,6 +1904,8 @@ Rules:
 
 - Provide either `field` (single) or `fields` (ordered list). `fields` is
   preferred for new code.
+- Without `sparse`, a missing field is indexed as `null`; a plain unique index
+  therefore allows only one document with that key absent or `null`.
 - `sparse: true` omits documents where a single-field key is absent. A compound
   sparse index stores `null` for absent fields and omits a document only when
   every key is absent. Missing fields are not treated as `null` for sparse
