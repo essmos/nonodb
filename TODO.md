@@ -6,8 +6,6 @@ deliberate limitations are documented in [docs/roadmap.md](docs/roadmap.md).
 
 ## P1 — query and update compatibility
 
-- [ ] SQL benchmark coverage, `SUM`/`AVG`/`MIN`/`MAX(DISTINCT ...)`, and
-      `RETURNING`.
 - [ ] IANA time zone identifiers for date expressions.
 
 ## P1 — event streams

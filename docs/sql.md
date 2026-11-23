@@ -115,8 +115,8 @@ Response:
 
 `UPDATE` affects every matching document. Expressions are evaluated per
 document; statements that do not reference document fields use the normal
-single-statement update path. There is no `LIMIT` on `UPDATE`, no `RETURNING`,
-and no upsert. Use the JSON API for those cases.
+single-statement update path. There is no `LIMIT` on `UPDATE` and no upsert.
+Use the JSON API for those cases.
 
 All assignments are applied in one writer transaction and `$set` semantics are
 used. `matched` is the number of matching documents; `modified` is the number
@@ -149,7 +149,40 @@ Response:
 
 `DELETE` supports the same `WHERE` conditions and optional table aliases as
 `SELECT`/`UPDATE`. It deletes every matching document in one writer transaction.
-There is no `LIMIT`, `RETURNING`, or truncate shortcut.
+There is no `LIMIT` or truncate shortcut.
+
+### RETURNING
+
+`INSERT`, `UPDATE`, and `DELETE` accept a `RETURNING` clause:
+
+```sql
+INSERT INTO users (name, age) VALUES ('Ada', 36), ('Grace', 31)
+RETURNING _id, name, age;
+
+UPDATE users SET age = age + 1 WHERE team = 'core'
+RETURNING name, age AS next_age;
+
+DELETE FROM users WHERE active = FALSE
+RETURNING _id, name;
+```
+
+The list may contain `*`, field paths, scalar expressions, and aliases. `*` must
+be the only item. Aggregate functions are not allowed in `RETURNING`.
+
+`INSERT ... RETURNING` returns the inserted documents, `UPDATE ... RETURNING`
+returns the updated documents, and `DELETE ... RETURNING` returns the documents
+as they were before deletion. The write result gains a `returned` array next to
+`inserted`/`inserted_ids`, `matched`/`modified`, or `deleted`:
+
+```json
+{
+  "inserted": 1,
+  "inserted_ids": ["..."],
+  "returned": [{"_id": "...", "name": "Ada", "age": 36}]
+}
+```
+
+Without `RETURNING`, write results keep their existing shape.
 
 ## Supported SELECT syntax
 
@@ -168,7 +201,8 @@ The `select_list` is either `*` or a comma-separated list of:
 
 - a field path such as `name`, `address.city`, or `u.name`;
 - an aggregate function: `COUNT(*)`, `COUNT(field)`, `SUM(field)`,
-  `AVG(field)`, `MIN(field)`, `MAX(field)`;
+  `AVG(field)`, `MIN(field)`, `MAX(field)`, and the `DISTINCT` forms of
+  `COUNT`, `SUM`, `AVG`, `MIN`, and `MAX`;
 - a scalar expression (see below);
 - an optional alias: `name AS person`, `COUNT(*) AS n`, `age + 1 AS next_age`.
 
@@ -284,9 +318,10 @@ SELECT DISTINCT team, COUNT(*) AS n FROM users GROUP BY team HAVING COUNT(*) > 1
 `SELECT DISTINCT *` is allowed but is effectively a no-op because `SELECT *`
 always includes the unique `_id`.
 
-`COUNT(DISTINCT field)` is supported and ignores missing/`NULL` values.
-`SUM(DISTINCT ...)`, `AVG(DISTINCT ...)`, `MIN(DISTINCT ...)`, and
-`MAX(DISTINCT ...)` are not supported yet.
+`COUNT(DISTINCT field)`, `SUM(DISTINCT field)`, `AVG(DISTINCT field)`,
+`MIN(DISTINCT field)`, and `MAX(DISTINCT field)` are supported. They remove
+duplicate values and ignore missing/`NULL` values. `AVG(DISTINCT ...)` returns
+`NULL` when there are no non-null values.
 
 ### Projection semantics
 
@@ -348,8 +383,8 @@ same `access_path`, `index`, `bounds`, `candidates`, and actual counts as
   multi-row `INSERT`, `UPDATE`, or `DELETE` rolls back entirely.
 - SQL writes accept only standard collections, not vault collections.
 - SQL writes are not allowed inside a read `batch`; use a normal `sql` request.
-- `CREATE`, `DROP`, transactions, joins, subqueries, `RETURNING`,
-  `INSERT ... SELECT`, and `UPDATE ... FROM` are not supported.
+- `CREATE`, `DROP`, transactions, joins, subqueries, `INSERT ... SELECT`, and
+  `UPDATE ... FROM` are not supported.
 - One statement reads or writes one collection.
 - Scalar expressions in a grouped `SELECT` are not supported yet. Use a
   selected `GROUP BY` field or an aggregate alias.
@@ -371,6 +406,31 @@ The collection name is parsed from the statement before execution.
 
 A matching wildcard scope also works. Parse errors return `invalid_sql` with
 HTTP 400.
+
+## Benchmark
+
+`scripts/sql_bench.py` measures SQL end to end through the Python client over a
+Unix socket. It loads a disposable collection, creates indexes, then reports
+p50/p95 latency for counts, grouping, distinct aggregates, an indexed equality
+lookup, and a filtered aggregate:
+
+```bash
+NONODB_SOCK=/tmp/nonodb.sock python3 scripts/sql_bench.py --docs 100000 --iters 10
+```
+
+Reference run against a release daemon on the 16 vCPU / 31 GiB ZFS development
+host, with `NONODB_CACHE_TTL=0`:
+
+| Query | Rows | p50 | p95 |
+|---|---:|---:|---:|
+| `COUNT(*)` | 1 | 54.7 ms | 65.0 ms |
+| `GROUP BY team` with `COUNT`/`SUM` | 100 | 70.0 ms | 91.2 ms |
+| five `DISTINCT` aggregates | 1 | 258.5 ms | 292.9 ms |
+| indexed equality on `seq` | 1 | 0.7 ms | 0.8 ms |
+| filtered `COUNT`/`AVG` | 1 | 73.4 ms | 88.0 ms |
+
+Load throughput for that run was 45,451 docs/s. Use the script to compare your
+own hardware and map size; the numbers are reference points, not guarantees.
 
 ## Client examples
 

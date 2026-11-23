@@ -175,8 +175,9 @@ python3 scripts/arrays_test.py               # $all, $size, $elemMatch, validati
 python3 scripts/array_updates_test.py        # positional/array-filter updates
 python3 scripts/find_and_modify_test.py      # atomic select-update-return
 python3 scripts/explain_test.py              # plans, bounds, actual counts
-python3 scripts/sql_test.py                  # SQL SELECT/INSERT/UPDATE/distinct/having/explain/params/batch (spawns a daemon)
+python3 scripts/sql_test.py                  # SQL SELECT/INSERT/UPDATE/distinct/aggregates/RETURNING/having/explain/params/batch (spawns a daemon)
 python3 scripts/sql_matrix_test.py           # exhaustive SQL matrix, concurrency, restart, metrics, CLI (spawns a daemon)
+python3 scripts/sql_bench.py --docs 100000   # SQL counts, grouping, DISTINCT aggregates, indexed reads (running daemon)
 PYTHONPATH=client:workers/python python3 workers/python/examples/jobs_smoke.py  # jobs
 PYTHONPATH=client:workers/python python3 workers/python/examples/events_smoke.py  # events
 python3 workers/python/tests/events_integration.py  # events against a spawned daemon
@@ -290,7 +291,9 @@ scripts are:
 | `scripts/bench.py` | Mixed CRUD throughput/latency with multiple processes |
 | `scripts/opt_bench.py` | Count, early exit, index update, batch comparison |
 | `scripts/aggregate_bench.py` | Per-stage aggregation timings and report pipelines |
-| `scripts/sql_test.py` | End-to-end SQL against a disposable daemon |
+| `scripts/sql_test.py` | End-to-end SQL against a disposable daemon, including DISTINCT aggregates and RETURNING |
+| `scripts/sql_matrix_test.py` | Exhaustive SQL SELECT/write matrix, errors, concurrency, restart, metrics, and CLI |
+| `scripts/sql_bench.py` | End-to-end SQL latency for counts, grouping, DISTINCT aggregates, indexed equality, and filtered aggregates |
 | `scripts/dates_test.py` | Date offsets, ranges, indexes, sorting, unique constraints |
 | `scripts/numerics_test.py` | Large integers, Decimal128, special doubles, arithmetic, indexes |
 | `scripts/bson_types_test.py` | `$numberInt`/`$numberLong`, `$type`, binary/UUID, ObjectId |

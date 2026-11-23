@@ -506,6 +506,115 @@ fn count_distinct_aggregate_works() {
         ]
     );
 
-    let err = sql::execute(&c, "SELECT SUM(DISTINCT score) FROM users", &[]).unwrap_err();
-    assert!(err.to_string().contains("only COUNT(DISTINCT"), "{err}");
+    let rows = sql::execute(
+        &c,
+        "SELECT COUNT(DISTINCT score) AS n, SUM(DISTINCT score) AS total,          AVG(DISTINCT score) AS average, MIN(DISTINCT score) AS smallest,          MAX(DISTINCT score) AS largest FROM users",
+        &[],
+    )
+    .unwrap();
+    assert_eq!(
+        rows,
+        vec![json!({
+            "n": 4,
+            "total": 100.0,
+            "average": 25.0,
+            "smallest": 10,
+            "largest": 40,
+        })]
+    );
+}
+
+#[test]
+fn distinct_aggregates_remove_duplicate_values() {
+    let (_dir, store) = fixture();
+    let c = store.collection("ratings").unwrap();
+    for (id, score) in [
+        ("a", 10),
+        ("b", 10),
+        ("c", 20),
+        ("d", 20),
+        ("e", 30),
+        ("f", 30),
+    ] {
+        c.insert_one(json!({"_id": id, "score": score, "team": "core"}))
+            .unwrap();
+    }
+    let rows = sql::execute(
+        &c,
+        "SELECT COUNT(DISTINCT score) AS n, SUM(DISTINCT score) AS total,          AVG(DISTINCT score) AS average, MIN(DISTINCT score) AS smallest,          MAX(DISTINCT score) AS largest FROM ratings",
+        &[],
+    )
+    .unwrap();
+    assert_eq!(
+        rows,
+        vec![json!({
+            "n": 3,
+            "total": 60.0,
+            "average": 20.0,
+            "smallest": 10,
+            "largest": 30,
+        })]
+    );
+}
+
+#[test]
+fn returning_projects_inserted_updated_and_deleted_rows() {
+    let (_dir, store) = fixture();
+    let c = store.collection("users").unwrap();
+
+    let insert = sql::PreparedSql::parse(
+        "INSERT INTO users (name, age, team) VALUES ('Ret', 20, 'ops'), ('Ret2', 21, 'ops')          RETURNING name, age, team",
+    )
+    .unwrap();
+    let mut wtxn = store.write_txn().unwrap();
+    let out = insert.execute_write(&c, &mut wtxn, &[]).unwrap();
+    wtxn.commit().unwrap();
+    assert_eq!(
+        out["returned"],
+        json!([
+            {"name": "Ret", "age": 20, "team": "ops"},
+            {"name": "Ret2", "age": 21, "team": "ops"},
+        ])
+    );
+
+    let update = sql::PreparedSql::parse(
+        "UPDATE users SET age = 30 WHERE team = 'ops' RETURNING name, age AS years",
+    )
+    .unwrap();
+    let mut wtxn = store.write_txn().unwrap();
+    let out = update.execute_write(&c, &mut wtxn, &[]).unwrap();
+    wtxn.commit().unwrap();
+    let mut returned = out["returned"].as_array().unwrap().clone();
+    returned.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+    assert_eq!(
+        returned,
+        vec![
+            json!({"name": "Ret", "years": 30}),
+            json!({"name": "Ret2", "years": 30}),
+        ]
+    );
+
+    let update = sql::PreparedSql::parse(
+        "UPDATE users SET age = age + 1 WHERE name = 'Ret' RETURNING name, age",
+    )
+    .unwrap();
+    let mut wtxn = store.write_txn().unwrap();
+    let out = update.execute_write(&c, &mut wtxn, &[]).unwrap();
+    wtxn.commit().unwrap();
+    assert_eq!(out["returned"], json!([{"name": "Ret", "age": 31}]));
+
+    let delete =
+        sql::PreparedSql::parse("DELETE FROM users WHERE name = 'Ret2' RETURNING name, age")
+            .unwrap();
+    let mut wtxn = store.write_txn().unwrap();
+    let out = delete.execute_write(&c, &mut wtxn, &[]).unwrap();
+    wtxn.commit().unwrap();
+    assert_eq!(out["deleted"], 1);
+    assert_eq!(out["returned"], json!([{"name": "Ret2", "age": 30}]));
+
+    let err = sql::PreparedSql::parse("INSERT INTO users (name) VALUES ('x') RETURNING COUNT(*)")
+        .unwrap_err();
+    assert!(err.to_string().contains("aggregate"), "{err}");
+    let err = sql::PreparedSql::parse("UPDATE users SET age = 1 RETURNING *, name").unwrap_err();
+    assert!(err.to_string().contains("only item"), "{err}");
 }

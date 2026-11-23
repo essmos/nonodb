@@ -113,11 +113,11 @@ single-database directories are migrated to `default/` on startup. See
   deduplication, a 64 MiB response cap, and `null` for missing keys.
 - SQL `SELECT`, `INSERT`, `UPDATE`, and `DELETE` over one collection. `SELECT`
   supports `DISTINCT`, `WHERE`, `GROUP BY`, `HAVING`, aggregates including
-  `COUNT(DISTINCT field)`, `CASE`, scalar functions, `ORDER BY`,
-  `LIMIT`/`OFFSET`, positional parameters, and `explain_sql`; simple field-only
-  queries use the normal indexed `find` path. Writes use the single writer and
-  are atomic per statement, including document expressions in `UPDATE SET`;
-  there are no joins.
+  `COUNT`/`SUM`/`AVG`/`MIN`/`MAX(DISTINCT ...)`, `CASE`, scalar functions,
+  `ORDER BY`, `LIMIT`/`OFFSET`, positional parameters, and `explain_sql`; simple
+  field-only queries use the normal indexed `find` path. Writes use the single
+  writer and are atomic per statement, including document expressions in
+  `UPDATE SET` and `RETURNING` on writes; there are no joins.
 
 ### Writes and updates
 

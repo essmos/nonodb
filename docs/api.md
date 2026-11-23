@@ -1303,19 +1303,23 @@ Supported clauses and limitations are documented in [SQL queries](sql.md):
 - `WHERE` with comparisons, `AND`/`OR`/`NOT`, parentheses, `IN`, `BETWEEN`,
   `IS NULL`, and `LIKE`;
 - `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, and `OFFSET`;
-- aggregate functions `COUNT`, `COUNT(DISTINCT field)`, `SUM`, `AVG`, `MIN`, and
-  `MAX`;
+- aggregate functions `COUNT`, `SUM`, `AVG`, `MIN`, and `MAX`, including their
+  `DISTINCT` forms;
 - positional parameters with `?` or `$1`;
 - one collection, no joins or subqueries;
-- `INSERT INTO collection (columns...) VALUES (...)` with one or more rows;
-- `UPDATE collection SET column = value... [WHERE ...]`, including expressions;
-- `DELETE FROM collection [WHERE ...]`.
+- `INSERT INTO collection (columns...) VALUES (...) [RETURNING ...]` with one or
+  more rows;
+- `UPDATE collection SET column = value... [WHERE ...] [RETURNING ...]`,
+  including expressions;
+- `DELETE FROM collection [WHERE ...] [RETURNING ...]`.
 
 Simple field-only selects use the normal `find` path. Grouping, `DISTINCT`,
 computed expressions, and `HAVING` use the aggregation pipeline. `INSERT`, `UPDATE`, and
 `DELETE` run through the single writer in one isolated LMDB transaction and
 return `inserted`/`inserted_ids`, `matched`/`modified`, or `deleted` inside
-`results`.
+`results`. `RETURNING *` or a field/expression list adds a `returned` array with
+the inserted or updated documents, or the documents as they were before a
+delete. Aggregate functions are not allowed in `RETURNING`.
 
 `SELECT` is read-only and can be used in a read `batch`; write statements are
 rejected there. `SELECT` requires `read:<collection>`, while `INSERT`, `UPDATE`, and `DELETE`
@@ -2845,7 +2849,7 @@ additive.
 ```json
 {
   "schema_version": 1,
-  "server_version": "0.30.0",
+  "server_version": "0.31.0",
   "api": {"http_json": true, "mongodb_wire": true, "sql": true},
   "features": {
     "search": {"search_all": true, "modes": ["lexical", "fuzzy", "vector", "hybrid"]},
@@ -2867,7 +2871,7 @@ Authenticated admin endpoint. Returns the daemon's real listener state:
 {
   "ok": true,
   "result": {
-    "version": "0.30.0",
+    "version": "0.31.0",
     "tcp": {"configured": "0.0.0.0:7902", "bound": "0.0.0.0:7902", "tls": false},
     "unix": "/run/nonodb.sock",
     "advertise_url": "http://10.0.0.10:7902"

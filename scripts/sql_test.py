@@ -97,6 +97,15 @@ def main() -> int:
         rows = db.sql("SELECT COUNT(*) AS n, AVG(score) AS avg FROM users")
         assert rows == [{"n": 4, "avg": 20}], rows
 
+        rows = db.sql(
+            "SELECT COUNT(DISTINCT score) AS n, SUM(DISTINCT score) AS total, "
+            "AVG(DISTINCT score) AS average, MIN(DISTINCT score) AS smallest, "
+            "MAX(DISTINCT score) AS largest FROM users"
+        )
+        assert rows == [
+            {"n": 3, "total": 60, "average": 20, "smallest": 10, "largest": 30}
+        ], rows
+
         rows = db.sql("SELECT DISTINCT team FROM users ORDER BY team")
         assert rows == [{"team": "core"}, {"team": "kernel"}], rows
 
@@ -191,6 +200,15 @@ def main() -> int:
         )
         assert rows == [{"age": age, "n": n} for age, n in sorted(ages.items())], rows
 
+        rows = db.sql(
+            "SELECT COUNT(DISTINCT score) AS n, SUM(DISTINCT score) AS total, "
+            "AVG(DISTINCT score) AS average, MIN(DISTINCT score) AS smallest, "
+            "MAX(DISTINCT score) AS largest FROM sql_bulk"
+        )
+        assert rows == [
+            {"n": 100, "total": 4950, "average": 49.5, "smallest": 0, "largest": 99}
+        ], rows
+
         bulk.create_index("age")
         plan = db.explain_sql(
             "SELECT name, age FROM sql_bulk WHERE age >= 70 ORDER BY age LIMIT 5"
@@ -223,12 +241,23 @@ def main() -> int:
         assert written[0]["inserted"] == 2, written
         assert len(written[0]["inserted_ids"]) == 2, written
 
+        inserted_returning = db.sql(
+            "INSERT INTO sql_returning (name, age) VALUES ('Returned', 22) "
+            "RETURNING name, age"
+        )
+        assert inserted_returning[0]["returned"] == [
+            {"name": "Returned", "age": 22}
+        ], inserted_returning
+
         updated = db.sql(
             "UPDATE sql_write AS w SET w.age = $1, w.profile.level = $2 "
-            "WHERE w.name = $3",
+            "WHERE w.name = $3 RETURNING w.name, w.age, w.profile.level AS level",
             [37, 9, "Ada"],
         )
-        assert updated[0] == {"matched": 1, "modified": 1}, updated
+        assert updated[0]["matched"] == 1 and updated[0]["modified"] == 1, updated
+        assert updated[0]["returned"] == [
+            {"name": "Ada", "age": 37, "level": 9}
+        ], updated
 
         rows = db.sql(
             "SELECT name, age, profile.level AS level FROM sql_write ORDER BY name"
@@ -237,6 +266,12 @@ def main() -> int:
             {"name": "Ada", "age": 37, "level": 9},
             {"name": "Grace", "age": 41, "level": 4},
         ], rows
+
+        deleted_returning = db.sql(
+            "DELETE FROM sql_returning WHERE name = 'Returned' RETURNING *"
+        )
+        assert deleted_returning[0]["deleted"] == 1, deleted_returning
+        assert deleted_returning[0]["returned"][0]["name"] == "Returned", deleted_returning
 
         rejected = db.batch(
             [
@@ -258,7 +293,7 @@ def main() -> int:
             raise AssertionError("explain_sql must reject writes")
 
         db.close()
-        print("OK: SQL real-daemon 10k-row distinct/having/CASE/functions/index/insert/update/explain/params/batch/errors")
+        print("OK: SQL real-daemon 10k-row distinct/aggregates/returning/having/CASE/functions/index/insert/update/explain/params/batch/errors")
         return 0
     finally:
         proc.terminate()

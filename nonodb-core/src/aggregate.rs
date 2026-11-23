@@ -3947,6 +3947,57 @@ fn eval_operator(
                 .ok_or_else(|| Error::Query("$pow requires numbers".into()))?;
             Ok(number_value(a.powf(b)))
         }
+        "$sum" | "$avg" => {
+            let values = if arg.is_array() {
+                args()?
+            } else {
+                vec![eval_expr_vars(doc, arg, vars)?]
+            };
+            let mut numbers = Vec::new();
+            for value in values {
+                match value {
+                    Value::Array(items) => {
+                        for item in items {
+                            if numeric::is_numeric(&item) {
+                                numbers.push(item);
+                            }
+                        }
+                    }
+                    value if numeric::is_numeric(&value) => numbers.push(value),
+                    _ => {}
+                }
+            }
+            if op == "$avg" && numbers.is_empty() {
+                return Ok(Value::Null);
+            }
+            if numbers.iter().any(numeric::is_decimal) {
+                let mut sum = BigDecimal::from(0);
+                let mut count = 0i64;
+                for value in &numbers {
+                    if let Some(number) = numeric::as_bigdecimal(value) {
+                        sum += number;
+                        count += 1;
+                    }
+                }
+                if op == "$avg" {
+                    if count == 0 {
+                        return Ok(Value::Null);
+                    }
+                    return numeric::decimal_value(&(sum / BigDecimal::from(count)));
+                }
+                return numeric::decimal_value(&sum);
+            }
+            let values: Vec<f64> = numbers.iter().filter_map(numeric::as_f64).collect();
+            if op == "$avg" {
+                if values.is_empty() {
+                    return Ok(Value::Null);
+                }
+                return Ok(Value::from(
+                    values.iter().sum::<f64>() / values.len() as f64,
+                ));
+            }
+            Ok(Value::from(values.iter().sum::<f64>()))
+        }
         "$min" | "$max" => {
             let mut values = if arg.is_array() {
                 args()?
