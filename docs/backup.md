@@ -54,6 +54,7 @@ database copy was taken.
 | Restore one database | `nonodb-cli --db app1 restore BACKUP ROOT --force` |
 | Restore and verify one database | `nonodb-cli --db app1 restore BACKUP ROOT --force --verify` |
 | Restore all databases | `nonodb-cli restore-all BACKUP ROOT --force --verify` |
+| Restore newest snapshot at/before a time | `nonodb-cli --db app1 restore --to TIME SNAPSHOTS ROOT --force --verify` |
 | Automated drill | `python3 scripts/restore_drill.py` |
 
 `ROOT` is the instance root (`NONODB_DATA`). Without `--db`, single-database
@@ -159,6 +160,23 @@ systemctl start nonodb
 
 Snapshot retention is not a replacement for independent backups. Keep at least
 one copy off the host and verify it with a restore drill.
+
+To select the newest snapshot at or before a recovery time, pass the snapshot
+root and `--to`:
+
+```bash
+systemctl stop nonodb
+nonodb-cli --db app1 restore --to 2026-01-01T12:00:00Z \
+  /var/backups/nonodb/snapshots /var/lib/nonodb --force --verify
+systemctl start nonodb
+```
+
+`--to` accepts RFC 3339, Unix milliseconds, or Unix seconds. The command fails
+when no snapshot exists at or before the requested time, or when the time is in
+the future. This is still **snapshot selection**, not point-in-time recovery:
+operations committed after the selected snapshot are not replayed. Use a short
+write freeze or a backup taken at the desired recovery point when operation-level
+recovery is required.
 
 ## Scheduled backups from the daemon and GUI
 

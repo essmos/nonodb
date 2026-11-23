@@ -63,7 +63,10 @@ Implemented:
 - BSON-compatible dates with RFC 3339 input, UTC normalization, indexed ranges, and sorting;
 - Unix-socket daemon, optional TCP/TLS and mutual TLS, file-based principals and scopes, uid/gid allow-lists;
 - group commit, request limits/timeouts, JSON and Prometheus metrics, health/readiness, disk and snapshot monitoring;
-- snapshots, online backup, SHA-256 manifests, deep verification, restore drills, CLI;
+- snapshots, online backup, SHA-256 manifests, deep verification, restore drills,
+  snapshot-based `restore --to <timestamp>`, CLI;
+- `scripts/nonodb-migrate.py` for quiesced MongoDB migration with checksums and
+  an opt-in MongoDB wire shadow mode with JSONL diff reports;
 - GUI backup jobs with full/restic engines, multi-database selection, exclusions,
   gzip compression, age/restic encryption, local/S3/R2 destinations, and
   `backup-info.txt`;
@@ -166,8 +169,11 @@ comparison and practical migration caveats.
   contain at most one array field; parallel arrays are rejected. Ordinary
   objects are skipped. Indexes created before format 5 must be recreated to
   include array entries.
-- No sparse/partial indexes, wildcard indexes, or text indexes with custom
-  analyzers. Geo indexes currently cover single-field GeoJSON points;
+- `sparse` is accepted as a no-op for compatibility; a plain unique index has
+  the same behavior. No partial/wildcard indexes, or text indexes with custom
+  analyzers. `expireAfterSeconds` on a single-field TTL index maps to collection
+  TTL, which is insertion-based rather than date-field-based. Geo indexes
+  currently cover single-field GeoJSON points;
   polygon/line document indexes are not implemented.
 - Vector indexes store one vector per document. Exact scan is the default and
   fallback; an optional IVF sidecar accelerates unfiltered queries. There is no

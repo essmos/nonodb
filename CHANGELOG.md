@@ -13,6 +13,16 @@ Full release notes: https://github.com/essmos/nonodb/releases
 - Commit MongoDB wire `insert_many` batches in one transaction. Ordered and
   unordered partial-success behavior is preserved when a duplicate forces the
   fallback path.
+- Translate MongoDB `createIndexes` `expireAfterSeconds` into collection TTL and
+  accept `sparse` as a compatibility no-op for unique indexes.
+- Add `scripts/nonodb-migrate.py` for quiesced MongoDB-to-NonoDB migration with
+  index/TTL discovery, Extended JSON conversion, batched inserts, checksums, and
+  a JSON report.
+- Add an opt-in MongoDB wire shadow mode (`NONODB_MONGO_SHADOW_URL`) that mirrors
+  successful writes to MongoDB and logs reply differences as JSONL. This is a
+  prototype, not a production proxy.
+- Add `nonodb-cli restore --to <timestamp>` for selecting the newest periodic
+  snapshot at or before a recovery time, with explicit no-WAL-PITR semantics.
 
 ## v0.29.1 - 2026-11-22
 

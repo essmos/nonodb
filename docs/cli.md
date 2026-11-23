@@ -532,6 +532,27 @@ Rules and warnings:
 - `--verify` deep-checks the restored directory after the copy.
 - Start the daemon after the restore and verify counts and indexes.
 
+### Restore from a timestamped snapshot
+
+If the daemon writes periodic snapshots, select the newest snapshot at or before
+a recovery time and restore it:
+
+```bash
+nonodb-cli --db app1 restore --to 2026-01-01T12:00:00Z \
+  /var/backups/nonodb/snapshots /var/lib/nonodb --force --verify
+```
+
+The first positional path is a snapshot root containing either
+`<root>/<database>/data-<unix-ms>.mdb` or `data-<unix-ms>.mdb` directly. The
+selected database comes from `--db`/`NONODB_DB`; the default is `default`.
+`--to` also accepts Unix milliseconds or seconds (values below
+`100000000000` are treated as seconds).
+
+This is snapshot selection, not WAL point-in-time recovery: data written after
+the selected snapshot is not replayed. A timestamp with no snapshot at or
+before it fails, as does a timestamp in the future. Without `--to`, `restore`
+keeps its existing backup-directory behavior.
+
 ## auth
 
 Manage the file-based principal registry. The default path is

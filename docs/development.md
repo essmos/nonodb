@@ -64,7 +64,7 @@ and [HTTP API](api.md).
 │   ├── node/                  # zero-dependency Node.js client
 │   └── go/                    # context-aware Go client
 ├── workers/python/            # external background-job helper and examples
-├── scripts/                   # benchmarks, concurrency/crash/search tests
+├── scripts/                   # benchmarks, migration, concurrency/crash/search tests
 ├── deploy/                    # systemd units
 ├── docs/                      # documentation
 ├── Dockerfile
@@ -183,12 +183,16 @@ python3 workers/python/tests/events_integration.py  # events against a spawned d
 python3 scripts/db_slots_test.py             # >256 index/search create-drop cycles
 python3 scripts/resize_test.py               # online map growth under concurrent I/O
 python3 scripts/restore_drill.py             # backup -> verify -> restore -> query
+python3 scripts/restore_to_test.py           # restore --to snapshot selection and verification
 python3 scripts/shutdown_test.py             # SIGTERM drain, JSON logs, durable in-flight write
 python3 scripts/mongo_conformance_test.py   # compare wire results with a real MongoDB
 python3 scripts/mongo_export_test.py        # mongoexport/mongodump/mongoimport/mongorestore
 python3 scripts/mongo_portability_check.py --self-test  # static workload checker
 python3 scripts/mongo_wire_limits_test.py   # Mongo wire connection/read limits (spawns a daemon)
 python3 scripts/mongo_wire_auth_test.py     # Mongo wire SCRAM maps to principal scopes and code 13
+python3 scripts/mongo_ddl_test.py           # TTL/sparse DDL translation
+python3 scripts/nonodb_migrate_test.py      # MongoDB -> NonoDB migration and checksums
+python3 scripts/mongo_shadow_test.py        # shadow dual-write and JSONL diff report
 scripts/mongo_drivers_test.sh              # official Node.js and Go MongoDB drivers
 python3 scripts/auth_test.py                 # scopes, token/cert auth, reload, audit, IP lockout
 python3 scripts/auth_api_test.py             # auth API, Prometheus, disk/snapshot metrics, readiness

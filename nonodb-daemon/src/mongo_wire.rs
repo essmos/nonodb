@@ -5,11 +5,12 @@
 //! a small aggregate subset; unsupported commands fail with MongoDB-style
 //! errors instead of silently behaving differently.
 
-use std::io::{self, BufReader};
+use std::io::{self, BufReader, Write};
 use std::num::NonZeroU32;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine as _;
@@ -489,6 +490,222 @@ async fn timeout_opt<T>(
     }
 }
 
+#[derive(Debug)]
+struct ShadowConfig {
+    host: String,
+    port: u16,
+    log: Option<PathBuf>,
+}
+
+fn shadow_config() -> Option<&'static ShadowConfig> {
+    static CONFIG: OnceLock<Option<ShadowConfig>> = OnceLock::new();
+    CONFIG
+        .get_or_init(|| {
+            let raw = std::env::var("NONODB_MONGO_SHADOW_URL").ok()?;
+            let raw = raw.trim();
+            let Some(rest) = raw.strip_prefix("mongodb://") else {
+                tracing::warn!("NONODB_MONGO_SHADOW_URL must start with mongodb://");
+                return None;
+            };
+            if rest.contains('@') {
+                tracing::warn!(
+                    "MongoDB shadow mode does not support credentials; shadow mode disabled"
+                );
+                return None;
+            }
+            let authority = rest.split('/').next().unwrap_or(rest);
+            let authority = authority.split('?').next().unwrap_or(authority);
+            let (host, port) = match authority.rsplit_once(':') {
+                Some((host, port)) => match port.parse::<u16>() {
+                    Ok(port) => (host.trim_matches(['[', ']']).to_string(), port),
+                    Err(_) => {
+                        tracing::warn!("invalid port in NONODB_MONGO_SHADOW_URL");
+                        return None;
+                    }
+                },
+                None => (authority.to_string(), 27017),
+            };
+            if host.is_empty() {
+                tracing::warn!("missing host in NONODB_MONGO_SHADOW_URL");
+                return None;
+            }
+            let log = std::env::var_os("NONODB_MONGO_SHADOW_LOG").map(PathBuf::from);
+            tracing::warn!(
+                %host,
+                port,
+                log = ?log,
+                "MongoDB shadow mode enabled (prototype: unauthenticated upstream)"
+            );
+            Some(ShadowConfig { host, port, log })
+        })
+        .as_ref()
+}
+
+fn shadow_write_command(command: &str) -> bool {
+    matches!(
+        command,
+        "insert"
+            | "update"
+            | "delete"
+            | "findAndModify"
+            | "findandmodify"
+            | "createIndexes"
+            | "dropIndexes"
+            | "create"
+            | "drop"
+    )
+}
+
+fn bson_doc_json(doc: &Document) -> serde_json::Value {
+    bson_map::document_to_value(doc)
+        .unwrap_or_else(|_| serde_json::json!({"unrepresentable": true}))
+}
+
+fn shadow_diff(nonodb: &Document, mongodb: &Document) -> Vec<String> {
+    let mut differences = Vec::new();
+    for field in [
+        "ok",
+        "n",
+        "nModified",
+        "deleted",
+        "upserted",
+        "writeErrors",
+        "writeConcernError",
+    ] {
+        let left = bson_doc_json(nonodb).get(field).cloned();
+        let right = bson_doc_json(mongodb).get(field).cloned();
+        if left != right {
+            differences.push(field.to_string());
+        }
+    }
+    differences
+}
+
+fn write_shadow_log(config: &ShadowConfig, entry: &serde_json::Value) {
+    let line = format!("{}\n", entry);
+    if let Some(path) = &config.log {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Err(error) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .and_then(|mut file| file.write_all(line.as_bytes()))
+        {
+            tracing::warn!(?error, path = %path.display(), "cannot append MongoDB shadow log");
+        }
+    } else {
+        tracing::info!(%line, "MongoDB shadow result");
+    }
+}
+
+async fn shadow_forward(
+    command: &str,
+    body: &Document,
+    nonodb_reply: &Document,
+) -> Result<(), String> {
+    let Some(config) = shadow_config() else {
+        return Ok(());
+    };
+    if !shadow_write_command(command) {
+        return Ok(());
+    }
+    let database = body.get_str("$db").unwrap_or("default").to_string();
+    let collection = body
+        .get_str(command)
+        .or_else(|_| body.get_str("createIndexes"))
+        .unwrap_or("")
+        .to_string();
+    let partial = nonodb_reply
+        .get_array("writeErrors")
+        .map(|errors| !errors.is_empty())
+        .unwrap_or(false);
+    if partial {
+        let entry = serde_json::json!({
+            "ts": SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0),
+            "command": command,
+            "database": database,
+            "collection": collection,
+            "skipped": "NonoDB returned partial write errors; not forwarding to MongoDB",
+            "nonodb": bson_doc_json(nonodb_reply),
+        });
+        write_shadow_log(config, &entry);
+        return Ok(());
+    }
+    if nonodb_reply.get_f64("ok").unwrap_or(0.0) != 1.0 {
+        return Ok(());
+    }
+
+    let result = tokio::time::timeout(Duration::from_secs(3), async {
+        let mut stream = tokio::net::TcpStream::connect((config.host.as_str(), config.port))
+            .await
+            .map_err(|error| format!("connect shadow MongoDB: {error}"))?;
+        let hello = bson::doc! {"hello": 1i32, "$db": "admin"};
+        let request_id = NEXT_RESPONSE_ID.fetch_add(1, Ordering::Relaxed);
+        let message = encode_op_msg(request_id, 0, &hello).map_err(|e| e.to_string())?;
+        stream
+            .write_all(&message)
+            .await
+            .map_err(|e| e.to_string())?;
+        stream.flush().await.map_err(|e| e.to_string())?;
+        let handshake = read_message(&mut stream)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "shadow MongoDB closed during handshake".to_string())?;
+        if handshake.body.get_f64("ok").unwrap_or(0.0) != 1.0 {
+            return Err(format!(
+                "shadow MongoDB handshake failed: {}",
+                handshake
+                    .body
+                    .get_str("errmsg")
+                    .unwrap_or("unknown handshake error")
+            ));
+        }
+        let request_id = NEXT_RESPONSE_ID.fetch_add(1, Ordering::Relaxed);
+        let message = encode_op_msg(request_id, 0, body).map_err(|e| e.to_string())?;
+        stream
+            .write_all(&message)
+            .await
+            .map_err(|e| e.to_string())?;
+        stream.flush().await.map_err(|e| e.to_string())?;
+        let reply = read_message(&mut stream)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "shadow MongoDB closed before reply".to_string())?;
+        Ok::<Document, String>(reply.body)
+    })
+    .await;
+
+    let (mongodb_reply, error) = match result {
+        Ok(Ok(reply)) => (Some(reply), None),
+        Ok(Err(error)) => (None, Some(error)),
+        Err(_) => (None, Some("shadow MongoDB timed out".to_string())),
+    };
+    let entry = if let Some(mongodb_reply) = mongodb_reply {
+        let differences = shadow_diff(nonodb_reply, &mongodb_reply);
+        serde_json::json!({
+            "ts": SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0),
+            "command": command,
+            "database": database,
+            "collection": collection,
+            "diff": differences,
+            "nonodb": bson_doc_json(nonodb_reply),
+            "mongodb": bson_doc_json(&mongodb_reply),
+        })
+    } else {
+        serde_json::json!({
+            "ts": SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0),
+            "command": command,
+            "database": database,
+            "collection": collection,
+            "error": error,
+        })
+    };
+    write_shadow_log(config, &entry);
+    Ok(())
+}
+
 async fn dispatch_command(
     state: &super::AppState,
     connection_id: u64,
@@ -577,6 +794,9 @@ async fn dispatch_command(
         | Some("connectionStatus") => return command_reply(body, auth.is_some(), session),
         _ => return command_not_found(command.unwrap_or("<missing>")),
     };
+    if let (Some(command), Ok(reply)) = (command, &result) {
+        let _ = shadow_forward(command, body, reply).await;
+    }
     match result {
         Ok(reply) => reply,
         Err(error) => mongo_error(&error),
@@ -1908,6 +2128,7 @@ async fn create_indexes_command(
         .map_err(|_| bad_value("createIndexes requires an indexes array"))?;
     let mut specs = Vec::with_capacity(indexes.len());
     let mut text_specs: Vec<nonodb_core::SearchIndexDef> = Vec::new();
+    let mut ttl_seconds: Option<u64> = None;
     for item in indexes {
         let Bson::Document(spec) = item else {
             return Err(bad_value("index specification must be a document"));
@@ -1959,9 +2180,6 @@ async fn create_indexes_command(
             }
             if spec.get_bool("unique").unwrap_or(false) {
                 return Err(bad_value("text indexes cannot be unique"));
-            }
-            if spec.get_bool("sparse").unwrap_or(false) {
-                return Err(bad_value("sparse indexes are not supported by NonoDB"));
             }
             if spec.get_bool("hidden").unwrap_or(false) {
                 return Err(bad_value("hidden indexes are not supported by NonoDB"));
@@ -2062,7 +2280,6 @@ async fn create_indexes_command(
         for unsupported in [
             "partialFilterExpression",
             "collation",
-            "expireAfterSeconds",
             "wildcardProjection",
             "weights",
         ] {
@@ -2072,11 +2289,30 @@ async fn create_indexes_command(
                 )));
             }
         }
-        if spec.get_bool("sparse").unwrap_or(false) {
-            return Err(bad_value("sparse indexes are not supported by NonoDB"));
-        }
         if spec.get_bool("hidden").unwrap_or(false) {
             return Err(bad_value("hidden indexes are not supported by NonoDB"));
+        }
+        if let Some(value) = spec.get("expireAfterSeconds") {
+            if fields.len() != 1 {
+                return Err(bad_value(
+                    "TTL indexes must be single-field; NonoDB has one collection TTL",
+                ));
+            }
+            if geo {
+                return Err(bad_value("geo indexes cannot use expireAfterSeconds"));
+            }
+            let seconds = bson_nonnegative_u64(value)
+                .ok_or_else(|| bad_value("expireAfterSeconds must be a non-negative integer"))?;
+            if seconds == 0 {
+                return Err(bad_value(
+                    "expireAfterSeconds: 0 is not supported; NonoDB collection TTL must be greater than zero",
+                ));
+            }
+            if ttl_seconds.replace(seconds).is_some() {
+                return Err(bad_value(
+                    "only one TTL index is supported per collection by NonoDB",
+                ));
+            }
         }
         let default_name = default_parts.join("_");
         let name = spec.get_str("name").unwrap_or(&default_name);
@@ -2130,7 +2366,7 @@ async fn create_indexes_command(
         let (_, response) = super::submit_write(
             &runtime,
             WriteReq::CreateSearchIndex {
-                coll: collection,
+                coll: collection.clone(),
                 index: def,
             },
             Durability::Full,
@@ -2144,8 +2380,24 @@ async fn create_indexes_command(
         let (_, response) = super::submit_write(
             &runtime,
             WriteReq::CreateIndexes {
-                coll: collection,
+                coll: collection.clone(),
                 indexes: specs,
+            },
+            Durability::Full,
+        )
+        .await;
+        let api = response.0;
+        if let Some(error) = api.error {
+            return Err(error);
+        }
+    }
+    if let Some(ttl_seconds) = ttl_seconds {
+        let (_, response) = super::submit_write(
+            &runtime,
+            WriteReq::SetCollectionTtl {
+                coll: collection,
+                ttl_seconds: Some(ttl_seconds),
+                purge_history: None,
             },
             Durability::Full,
         )
@@ -2168,6 +2420,17 @@ fn bson_number(value: &Bson) -> Option<f64> {
         Bson::Int32(value) => Some(f64::from(*value)),
         Bson::Int64(value) => Some(*value as f64),
         Bson::Double(value) => Some(*value),
+        _ => None,
+    }
+}
+
+fn bson_nonnegative_u64(value: &Bson) -> Option<u64> {
+    match value {
+        Bson::Int32(value) => u64::try_from(*value).ok(),
+        Bson::Int64(value) => u64::try_from(*value).ok(),
+        Bson::Double(value) if value.is_finite() && value.fract() == 0.0 && *value >= 0.0 => {
+            (*value <= u64::MAX as f64).then_some(*value as u64)
+        }
         _ => None,
     }
 }

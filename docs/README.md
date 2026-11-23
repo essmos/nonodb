@@ -14,6 +14,7 @@ quick-start instructions, and a feature overview.
 | [GUI console](gui.md) | Operators, application developers | Embedded local React console, data editing, collection settings, SQL, map/metrics |
 | [HTTP API](api.md) | All client authors | Operations, request/response formats, filters, updates, aggregation, errors |
 | [MongoDB compatibility](mongodb-compatibility.md) | Evaluators, migrating teams | Documented MongoDB-compatible subset, supported drivers, known differences, and migration assessment |
+| [MongoDB wire shadow mode](mongodb-shadow.md) | Evaluators, migration engineers | Opt-in prototype dual-write to MongoDB, JSONL diff report, and limitations |
 | [SQL queries](sql.md) | Analysts, reporting jobs, application developers | `SELECT`, `INSERT`, `UPDATE`, `DELETE`, filters, aggregates, parameters, limits, client examples |
 | [Vault collections](vault.md) | Application developers, security reviewers | Optional whole-document encryption, tenant keys, restrictions, operations, key rotation |
 | [Document TTL](ttl.md) | Application developers, operators | Collection defaults, per-document overrides, update semantics, background expiry, limits |
@@ -57,6 +58,7 @@ quick-start instructions, and a feature overview.
 - **Open the local GUI:** [GUI console](gui.md)
 - **Pick a client:** [Clients](clients.md) — Python, Rust, Node.js, Go
 - **Connect with a MongoDB driver:** [MongoDB compatibility](mongodb-compatibility.md)
+- **Rehearse with MongoDB shadow mode:** [MongoDB wire shadow mode](mongodb-shadow.md)
 - **Run a SQL query or simple write:** [SQL queries](sql.md)
 - **Import data from another database:** [Migration and import](migration.md)
 - **Expose nonodb to Python workers:** [Python client](python-client.md)

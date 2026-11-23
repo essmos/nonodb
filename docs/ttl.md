@@ -9,6 +9,27 @@ TTL is supported for both standard and vault collections. For vault
 collections the expiry metadata is plaintext; the document body is never
 decrypted by the sweeper.
 
+## MongoDB `expireAfterSeconds`
+
+The MongoDB wire listener accepts a common migration form:
+
+```javascript
+db.sessions.createIndex({ createdAt: 1 }, { expireAfterSeconds: 86400 })
+```
+
+This creates the requested secondary index and sets the collection TTL to
+`86400` seconds. MongoDB applies `expireAfterSeconds` to the indexed date field;
+NonoDB's existing TTL is **insertion-based** and applies to new documents without
+an `_ttl` override. Existing documents keep their current expiry metadata.
+
+Limits:
+
+- NonoDB supports one TTL index per collection.
+- The TTL index must be single-field and cannot be a geo index.
+- `expireAfterSeconds: 0` is rejected because collection TTL must be positive.
+- Dropping the translated index does not clear the collection TTL; use
+  `set_collection_ttl` with `null` if expiry should stop.
+
 ## Collection default
 
 Set a default TTL in seconds when creating a collection:

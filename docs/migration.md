@@ -31,6 +31,63 @@ normal HTTP/JSON write path, so authentication, collection profiles, indexes,
 dates, decimals, and BSON scalar validation behave exactly as they do for a
 normal client.
 
+## Automated MongoDB migration
+
+For a quiesced MongoDB source, use the reference migration helper. It reads
+through PyMongo, writes through the native NonoDB HTTP/JSON client, and verifies
+each collection before creating its indexes:
+
+```bash
+python3 scripts/nonodb-migrate.py \
+  --mongo-uri 'mongodb://127.0.0.1:27017/app' \
+  --source-db app \
+  --socket /run/nonodb/nonodb.sock \
+  --database app \
+  --report /tmp/app-migration.json
+```
+
+Use `--url https://db.internal:7878 --token "$NONODB_TOKEN"` for TCP/TLS instead
+of `--socket`. The target database is created automatically unless
+`--no-create-database` is passed. `--dry-run` discovers collections, counts
+documents, and validates `_id` values without writing.
+
+What the helper does:
+
+- discovers collections and common scalar, compound, unique, geo, and
+  single-field text indexes;
+- preserves `_id` strings and ObjectIds and converts BSON dates, Decimal128,
+  binary values, and other supported values to Extended JSON;
+- infers `expireAfterSeconds` as the collection TTL and accepts `sparse` as a
+  compatibility no-op for unique indexes;
+- copies documents in bounded batches, checks source and target counts, and
+  compares a SHA-256 content checksum for every collection;
+- writes a JSON report with counts, checksums, translated indexes, TTL values,
+  warnings, and the redacted source URI.
+
+Useful options:
+
+| Option | Meaning |
+|---|---|
+| `--include NAME` | Migrate only this collection; repeatable |
+| `--exclude NAME` | Skip this collection; repeatable |
+| `--batch-size N` | Maximum documents per `insert_many` (default 500) |
+| `--max-bytes N` | Maximum encoded batch size (default 3,000,000) |
+| `--drop` | Drop a non-empty target collection before copying |
+| `--dry-run` | Discover and validate without writing |
+| `--report PATH` | Write the JSON migration report |
+
+The source must be stopped or at a consistent snapshot. This is not a live CDC
+tool: writes made during the copy are not replayed. Unsupported `_id` types and
+multiple TTL indexes fail with an error before the affected collection is
+copied. Partial/wildcard indexes and unsupported text/geo forms are skipped with
+a warning in the report. Source authentication is taken from the MongoDB URI;
+never put credentials in the report or commit them.
+
+TTL translation is intentionally approximate: MongoDB expires documents at the
+indexed date plus `expireAfterSeconds`, while NonoDB expires them
+`expireAfterSeconds` after insertion. For date-driven expiry, migrate the date
+into `_ttl` or keep the TTL policy in the application.
+
 ## Important limits
 
 | Limit | Value |

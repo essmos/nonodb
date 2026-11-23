@@ -33,7 +33,7 @@ release notes identify the exact tested tag.
 | Updates | ~85% | Pipeline updates support a subset of stages |
 | Aggregation stages | ~70% | Many common stages work; system, search, geoNear, and change-stream stages are absent |
 | Aggregation expressions | ~70% | Broad but not exhaustive; no IANA time zones or user-defined JavaScript |
-| Indexes | ~65% | No sparse/partial/wildcard indexes, collation, or TTL index options |
+| Indexes | ~68% | Sparse is accepted as a no-op for unique indexes; TTL indexes map to collection TTL; no partial/wildcard indexes or collation |
 | BSON scalar types | ~75% | ObjectId `_id`, Date, Decimal128, Binary/UUID, Timestamp, MinKey/MaxKey, and numeric mapping |
 | Wire protocol and drivers | ~70% | Documented MongoDB-compatible subset: handshake, CRUD, sorted cursors, count, distinct, aggregate, index DDL, collection DDL, MongoDB-style text indexes and `$text`, dropDatabase, SCRAM auth, and TLS; no sessions or transactions |
 | Transactions and change streams | ~10% | Atomic write batches and outbox events exist, but not MongoDB APIs |
@@ -457,11 +457,11 @@ top-level operators; for an unknown `$expr` operator MongoDB uses
 | Geospatial indexes | 🟡 | GeoJSON point indexes only; no polygon/line indexes |
 | Text search indexes | 🟡 | One single-field MongoDB-style text index per collection through `createIndexes`/`listIndexes`/`dropIndexes`; leading-`$match` `$text`. Multi-field weights and compound mixed text/non-text keys are not supported |
 | Vector indexes | 🟡 | NonoDB-specific exact/vector search |
-| Sparse indexes | ❌ | The `sparse` option is rejected; a plain unique index behaves like `unique + sparse`, see [Unique indexes without `sparse`](#unique-indexes-without-sparse) |
+| Sparse indexes | 🟡 | Accepted on `createIndexes`; a plain unique index behaves like `unique + sparse`, so the option is a no-op, see [Unique indexes without `sparse`](#unique-indexes-without-sparse) |
 | Partial indexes | ❌ | |
 | Wildcard indexes | ❌ | |
 | Hidden indexes | ❌ | |
-| TTL indexes | ❌ | TTL is a collection/document setting |
+| TTL indexes | 🟡 | `createIndexes` with `expireAfterSeconds` sets the collection TTL. One TTL index per collection; TTL is insertion-based, not based on the indexed date field |
 | Per-index/per-query collation | ❌ | |
 | Index hints | ✅ | Find-shaped queries; unusable hints fail instead of falling back |
 | Background index builds | 🟡 | Parallel bounded backfill; not MongoDB's exact build lifecycle |
@@ -470,9 +470,9 @@ top-level operators; for an unknown `$expr` operator MongoDB uses
 ### Unique indexes without `sparse`
 
 MongoDB applications often declare `IndexModel([("field", 1)], unique=True, sparse=True)`
-so that many documents may omit the field. NonoDB rejects the `sparse` option, but
-a plain unique index already has the same semantics, so dropping the option is the
-supported migration path.
+so that many documents may omit the field. NonoDB accepts `sparse` for
+compatibility, but a plain unique index already has the same semantics, so the
+option is a no-op. Dropping it from the application is still recommended.
 
 | Document | NonoDB unique index | MongoDB `unique + sparse` |
 |---|---|---|
@@ -489,8 +489,8 @@ both, and duplicate values are rejected on both.
 # MongoDB
 coll.create_index([("google_sub", 1)], unique=True, sparse=True)
 
-# NonoDB — same behavior, no sparse option
-coll.create_index([("google_sub", 1)], unique=True)
+# NonoDB — sparse is accepted and has the same behavior
+coll.create_index([("google_sub", 1)], unique=True, sparse=True)
 ```
 
 ## BSON values
@@ -537,10 +537,12 @@ A migration from MongoDB to NonoDB should check these items first:
 4. **Change streams** — replace with outbox events, `watch`, or subscriptions.
 5. **Atlas Search** — use NonoDB's native search API. MongoDB `$text` is supported only for the documented lexical subset.
 6. **Collation** — normalize strings or enforce ordering in the application.
-7. **Sparse/partial/TTL indexes** — remodel as collection settings, separate
-   indexes, or application logic. For `unique + sparse`, drop the `sparse` option:
-   a plain unique index has the same behavior, including explicit `null`
+7. **Sparse/partial/TTL indexes** — `sparse` is accepted as a no-op; a plain
+   unique index already has the same behavior, including explicit `null`
    (see [Unique indexes without `sparse`](#unique-indexes-without-sparse)).
+   `expireAfterSeconds` sets the collection TTL, but NonoDB TTL counts from
+   insertion rather than from the indexed date field. Partial indexes still
+   need application-level filtering.
 8. **Stored BSON regex values** — read filters accept driver regex literals, but regex values cannot be stored; keep them out of documents or rewrite them as strings plus `$regex` filters.
 9. **Unsupported aggregation expressions/stages and filter operators** — rewrite
    with supported forms or precompute outside the database. Unknown operators are
@@ -548,7 +550,8 @@ A migration from MongoDB to NonoDB should check these items first:
    documents.
 10. **Wire-protocol tooling** — `mongosh`, BI connectors, and monitoring
     integrations that need more than basic insert/find must use another
-    interface until the wire listener grows.
+    interface until the wire listener grows. For a migration rehearsal, see
+    [MongoDB wire shadow mode](mongodb-shadow.md).
 11. **Tenant encryption** — `tenant_id` is not encryption. MongoDB drivers can
     use standard collections with plaintext `tenant_id`, or encrypt payloads in
     the application. NonoDB vault collections require the native client/HTTP

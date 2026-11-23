@@ -598,6 +598,12 @@ fn run() -> Result<(), String> {
             backup_all(&data, &out, with_sidecars)?;
         }
         "restore-all" => {
+            if args
+                .iter()
+                .any(|arg| arg == "--to" || arg.starts_with("--to="))
+            {
+                return Err("--to is only supported by the single-database restore command".into());
+            }
             let backup = PathBuf::from(
                 args.get(1)
                     .ok_or("użycie: nonodb-cli restore-all <backup-dir> <data-root> [--force]")?,
@@ -656,20 +662,7 @@ fn run() -> Result<(), String> {
             let source = database_dir(&data)?;
             inspect(&source, args.get(2).map(String::as_str))?;
         }
-        "restore" => {
-            let backup = PathBuf::from(
-                args.get(1)
-                    .ok_or("użycie: nonodb-cli restore <backup-dir> <data-dir> [--force]")?,
-            );
-            let data = PathBuf::from(
-                args.get(2)
-                    .ok_or("użycie: nonodb-cli restore <backup-dir> <data-dir> [--force]")?,
-            );
-            let force = args.iter().any(|a| a == "--force");
-            let verify = args.iter().any(|a| a == "--verify");
-            let target = database_target(&data)?;
-            restore(&backup, &target, force, verify)?;
-        }
+        "restore" => restore_cmd(&args[1..])?,
         "-h" | "--help" | "help" => return usage(),
         other => return Err(format!("nieznana komenda: {other} (spróbuj `help`)")),
     }
@@ -702,7 +695,7 @@ fn usage() -> Result<(), String> {
          verify <data> [--json]     głęboka weryfikacja wybranej bazy i indeksów\n\
          verify-backup <backup> [--json]  sprawdź manifest, sumę SHA-256 i zawartość\n\
          inspect <data> [coll]      statystyki bazy/kolekcji (--db wybiera bazę)\n\
-         restore <backup> <data> [--force] [--verify]  przywróć bazę (najpierw zatrzymaj daemona)\n\
+         restore <backup> <data> [--force] [--verify] [--to <czas>]  przywróć bazę (najpierw zatrzymaj daemona)\n\
          restore-all <backup> <data> [--force] [--verify]  przywróć wszystkie bazy\n\
          \n\
          Opcje: --db <nazwa> wybiera bazę (albo NONODB_DB).\n\
@@ -1540,13 +1533,6 @@ fn database_target(data: &Path) -> Result<PathBuf, String> {
     Ok(data.join("default"))
 }
 
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or(0)
-}
-
 fn validate_database_name(name: &str) -> Result<(), String> {
     if name.is_empty() || name.len() > 64 {
         return Err(format!("invalid database name `{name}`"));
@@ -1815,6 +1801,163 @@ fn inspect(data: &Path, only: Option<&str>) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Debug)]
+struct RestoreOptions {
+    backup: PathBuf,
+    data: PathBuf,
+    force: bool,
+    verify: bool,
+    to_ms: Option<u64>,
+}
+
+fn parse_restore_options(args: &[String]) -> Result<RestoreOptions, String> {
+    let mut backup = None;
+    let mut data = None;
+    let mut force = false;
+    let mut verify = false;
+    let mut to_ms = None;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        match arg.as_str() {
+            "--force" => force = true,
+            "--verify" => verify = true,
+            "--to" => {
+                index += 1;
+                let raw = args
+                    .get(index)
+                    .ok_or("--to requires an RFC3339 timestamp or Unix milliseconds")?;
+                to_ms = Some(parse_restore_timestamp(raw)?);
+            }
+            _ if arg.starts_with("--to=") => {
+                to_ms = Some(parse_restore_timestamp(&arg["--to=".len()..])?);
+            }
+            _ if arg.starts_with('-') => {
+                return Err(format!("unknown restore option: {arg}"));
+            }
+            _ => {
+                if backup.is_none() {
+                    backup = Some(PathBuf::from(arg));
+                } else if data.is_none() {
+                    data = Some(PathBuf::from(arg));
+                } else {
+                    return Err(format!("unexpected restore argument: {arg}"));
+                }
+            }
+        }
+        index += 1;
+    }
+    Ok(RestoreOptions {
+        backup: backup.ok_or(
+            "użycie: nonodb-cli restore <backup-dir> <data-dir> [--force] [--verify] [--to <czas>]",
+        )?,
+        data: data.ok_or(
+            "użycie: nonodb-cli restore <backup-dir> <data-dir> [--force] [--verify] [--to <czas>]",
+        )?,
+        force,
+        verify,
+        to_ms,
+    })
+}
+
+fn parse_restore_timestamp(raw: &str) -> Result<u64, String> {
+    if let Ok(value) = raw.parse::<u64>() {
+        // Snapshot names use milliseconds. Accept Unix seconds too, as a
+        // convenience for timestamps below the millisecond range.
+        return Ok(if value < 100_000_000_000 {
+            value.saturating_mul(1000)
+        } else {
+            value
+        });
+    }
+    let ms = nonodb_core::date::parse_rfc3339_ms(raw)
+        .ok_or_else(|| format!("invalid timestamp: {raw} (use RFC3339 or Unix milliseconds)"))?;
+    u64::try_from(ms).map_err(|_| format!("timestamp before the Unix epoch: {raw}"))
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn snapshot_timestamp(path: &Path) -> Option<u64> {
+    let name = path.file_name()?.to_str()?;
+    let value = name.strip_prefix("data-")?.strip_suffix(".mdb")?;
+    value.parse::<u64>().ok()
+}
+
+fn snapshot_candidates(root: &Path, database: &str) -> Vec<(u64, PathBuf)> {
+    let database_dir = root.join(database);
+    let selected = if database_dir.is_dir() {
+        database_dir
+    } else {
+        root.to_path_buf()
+    };
+    let mut candidates = Vec::new();
+    let Ok(entries) = std::fs::read_dir(&selected) else {
+        return candidates;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        if let Some(timestamp) = snapshot_timestamp(&path) {
+            candidates.push((timestamp, path));
+        }
+    }
+    candidates.sort_by_key(|(timestamp, _)| *timestamp);
+    candidates
+}
+
+fn select_snapshot(root: &Path, database: &str, to_ms: u64) -> Result<(u64, PathBuf), String> {
+    if to_ms > now_ms() {
+        return Err(format!("--to timestamp is in the future ({} > now)", to_ms));
+    }
+    let candidates = snapshot_candidates(root, database);
+    if candidates.is_empty() {
+        return Err(format!(
+            "no snapshot files data-<unix-ms>.mdb found in {} or {}/{}",
+            root.display(),
+            root.display(),
+            database
+        ));
+    }
+    match candidates
+        .iter()
+        .rev()
+        .find(|(timestamp, _)| *timestamp <= to_ms)
+    {
+        Some((timestamp, path)) => Ok((*timestamp, path.clone())),
+        None => Err(format!(
+            "no snapshot at or before {} in {} (oldest available: {})",
+            to_ms,
+            root.display(),
+            candidates[0].0
+        )),
+    }
+}
+
+fn restore_cmd(args: &[String]) -> Result<(), String> {
+    let options = parse_restore_options(args)?;
+    let backup = if let Some(to_ms) = options.to_ms {
+        let (timestamp, path) = select_snapshot(&options.backup, &selected_database(), to_ms)?;
+        eprintln!(
+            "snapshot: {} (timestamp {}) for --to {}",
+            path.display(),
+            timestamp,
+            to_ms
+        );
+        path
+    } else {
+        options.backup
+    };
+    let target = database_target(&options.data)?;
+    restore(&backup, &target, options.force, options.verify)
+}
+
 fn restore(backup: &Path, data: &Path, force: bool, verify: bool) -> Result<(), String> {
     let target = database_target(data)?;
     restore_into(backup, &target, force, verify)
@@ -1935,4 +2078,70 @@ fn restore_into(backup: &Path, data: &Path, force: bool, verify: bool) -> Result
         print_report(&report);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_root(label: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("nonodb-cli-{label}-{}-{stamp}", std::process::id()))
+    }
+
+    #[test]
+    fn parses_restore_timestamps_in_seconds_ms_and_rfc3339() {
+        assert_eq!(
+            parse_restore_timestamp("1700000000").unwrap(),
+            1_700_000_000_000
+        );
+        assert_eq!(
+            parse_restore_timestamp("1700000000000").unwrap(),
+            1_700_000_000_000
+        );
+        assert_eq!(
+            parse_restore_timestamp("2024-01-01T00:00:00Z").unwrap(),
+            1_704_067_200_000
+        );
+        assert!(parse_restore_timestamp("not-a-time").is_err());
+    }
+
+    #[test]
+    fn selects_latest_snapshot_at_or_before_timestamp() {
+        let root = temp_root("select");
+        let db = root.join("app1");
+        std::fs::create_dir_all(&db).unwrap();
+        for timestamp in [1000u64, 2000, 3000] {
+            std::fs::write(db.join(format!("data-{timestamp}.mdb")), b"x").unwrap();
+        }
+        let now = now_ms();
+        let (timestamp, path) = select_snapshot(&root, "app1", 2500).unwrap();
+        assert_eq!(timestamp, 2000);
+        assert_eq!(path.file_name().unwrap(), "data-2000.mdb");
+        assert!(select_snapshot(&root, "app1", 999).is_err());
+        assert!(select_snapshot(&root, "app1", now + 60_000).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn parses_restore_options_in_any_order() {
+        let options = parse_restore_options(&[
+            "--to".into(),
+            "2000".into(),
+            "backup".into(),
+            "--verify".into(),
+            "data".into(),
+            "--force".into(),
+        ])
+        .unwrap();
+        assert_eq!(options.backup, PathBuf::from("backup"));
+        assert_eq!(options.data, PathBuf::from("data"));
+        assert!(options.force);
+        assert!(options.verify);
+        assert_eq!(options.to_ms, Some(2_000_000));
+    }
 }
