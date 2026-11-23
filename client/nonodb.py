@@ -14,7 +14,7 @@ in the daemon. Reuse one instance per process (uvicorn worker).
 
 from __future__ import annotations
 
-__version__ = "0.30.0"
+__version__ = "0.31.0"
 
 import asyncio
 import json

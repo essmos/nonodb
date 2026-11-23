@@ -2,7 +2,7 @@
 
 Full release notes: https://github.com/essmos/nonodb/releases
 
-## Unreleased
+## v0.31.0 - 2026-11-23
 
 - Remove orphaned `.dropped-*` database directories at startup. A failed
   `remove_dir_all` no longer turns an already-committed database drop into an
