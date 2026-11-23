@@ -853,7 +853,9 @@ See [Authentication and permissions](auth.md#backups).
 
 ## Limitations
 
-- No write-ahead log or point-in-time recovery.
+- Point-in-time recovery is opt-in and per database. It needs a retained
+  snapshot plus WAL chain; without one, backups are periodic full consistent
+  copies.
 - Native backups have no incremental mode and copy the full compacted
   environment, optionally gzip-compressed. Incremental/deduplicated backups
   require the restic engine.
