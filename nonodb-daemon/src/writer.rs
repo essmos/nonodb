@@ -463,9 +463,7 @@ fn write_collection<'a>(
     if vault.is_some() {
         match store.collection_profile_in_rw(wtxn, coll)? {
             Some(nonodb_core::CollectionProfile::Vault) => {}
-            Some(nonodb_core::CollectionProfile::Standard) => {
-                return Err(vault::key_unexpected().into())
-            }
+            Some(_) => return Err(vault::key_unexpected().into()),
             None => return Err(vault::not_a_vault_collection().into()),
         }
     }
@@ -969,6 +967,7 @@ fn execute(
             profile,
             ttl_seconds,
             ttl_purge_history,
+            timeseries,
         } => {
             let c = store.create_collection_with_ttl_and_purge_in(
                 wtxn,
@@ -977,12 +976,20 @@ fn execute(
                 *ttl_seconds,
                 *ttl_purge_history,
             )?;
+            if let Some(settings) = timeseries {
+                c.set_timeseries_settings_in(wtxn, settings)?;
+            }
             replication.capture_op(ReplicationOp::CollectionCreate {
                 name: coll.clone(),
                 profile: profile.as_str().to_string(),
                 ttl_seconds: *ttl_seconds,
                 ttl_field: None,
                 ttl_purge_history: *ttl_purge_history,
+                timeseries: timeseries
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()
+                    .map_err(nonodb_core::Error::from)?,
             });
             Ok(json!({
                 "created": coll,

@@ -566,15 +566,96 @@ impl<'e> Collection<'e> {
         &self.name
     }
 
-    /// Collection profile (`standard` or `vault`).
+    /// Collection profile (`standard`, `vault`, or `timeseries`).
     pub fn profile(&self) -> CollectionProfile {
         self.profile
+    }
+
+    /// Time-series settings, or `None` for non-time-series collections.
+    pub fn timeseries_settings_in(
+        &self,
+        txn: &RoTxn<'_>,
+    ) -> Result<Option<crate::timeseries::Settings>> {
+        if !self.profile.is_timeseries() {
+            return Ok(None);
+        }
+        let key = format!("{}{}", crate::timeseries::SETTINGS_META_PREFIX, self.name);
+        match self.meta.get(txn, key.as_bytes())? {
+            Some(raw) => Ok(Some(crate::timeseries::parse_settings(raw)?)),
+            None => Ok(Some(crate::timeseries::Settings::default())),
+        }
+    }
+
+    /// Stores time-series settings for this collection.
+    pub fn set_timeseries_settings_in(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        settings: &crate::timeseries::Settings,
+    ) -> Result<()> {
+        settings.validate()?;
+        let key = format!("{}{}", crate::timeseries::SETTINGS_META_PREFIX, self.name);
+        let bytes = serde_json::to_vec(settings)?;
+        self.meta.put(&mut *wtxn, key.as_bytes(), &bytes)?;
+        Ok(())
+    }
+
+    /// Stores time-series settings for this collection using its own write
+    /// transaction.
+    pub fn set_timeseries_settings(&self, settings: &crate::timeseries::Settings) -> Result<()> {
+        let mut wtxn = self.write_txn()?;
+        self.set_timeseries_settings_in(&mut wtxn, settings)?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    /// Compression and size statistics for a time-series collection.
+    pub fn timeseries_stats(&self) -> Result<Option<crate::timeseries::Stats>> {
+        if !self.profile.is_timeseries() {
+            return Ok(None);
+        }
+        let rtxn = self.read_txn()?;
+        let settings = self.timeseries_settings_in(&rtxn)?.unwrap_or_default();
+        let stats = crate::timeseries::stats(&rtxn, self.env, &self.name, &settings)?;
+        rtxn.commit()?;
+        Ok(Some(stats))
+    }
+
+    fn ensure_not_timeseries(&self, operation: &str) -> Result<()> {
+        if self.profile.is_timeseries() {
+            return Err(Error::Query(format!(
+                "`{operation}` is not supported on time-series collection `{}`; time-series collections accept inserts and reads",
+                self.name
+            )));
+        }
+        Ok(())
+    }
+
+    fn find_timeseries_in(&self, rtxn: &RoTxn<'_>, query: &FindQuery) -> Result<Vec<Value>> {
+        let settings = self.timeseries_settings_in(rtxn)?.unwrap_or_default();
+        crate::timeseries::find(rtxn, self.env, &self.name, &settings, query)
     }
 
     /// Storage summary for this collection. Data and index bytes come from
     /// LMDB B-tree page allocation; shared history/TTL bytes are added by the
     /// store-level aggregation.
     pub fn storage_stats(&self, txn: &RoTxn<'_>) -> Result<CollectionStorageStats> {
+        if self.profile.is_timeseries() {
+            let settings = self.timeseries_settings_in(txn)?.unwrap_or_default();
+            let stats = crate::timeseries::stats(txn, self.env, &self.name, &settings)?;
+            let db_name = format!("{}{}", crate::timeseries::BUCKET_DB_PREFIX, self.name);
+            let data_bytes = self
+                .env
+                .open_database::<Bytes, Bytes>(txn, Some(&db_name))?
+                .map(|db| db.stat(txn).map(|stat| stat_bytes(&stat)))
+                .transpose()?
+                .unwrap_or(0);
+            return Ok(CollectionStorageStats {
+                records: stats.rows,
+                data_bytes,
+                index_bytes: 0,
+                indexes: 0,
+            });
+        }
         let data = self.db.stat(txn)?;
         let mut index_bytes = 0u64;
         let mut indexes = 0u64;
@@ -1199,6 +1280,7 @@ impl<'e> Collection<'e> {
         include: &[String],
         geo: bool,
     ) -> Result<()> {
+        self.ensure_not_timeseries("create_index")?;
         self.ensure_standard()?;
         if fields.is_empty() {
             return Err(Error::Query("index requires at least one field".into()));
@@ -2166,6 +2248,7 @@ impl<'e> Collection<'e> {
         dims: usize,
         metric: VectorMetric,
     ) -> Result<()> {
+        self.ensure_not_timeseries("create_vector_index")?;
         self.ensure_standard()?;
         if field.is_empty() || field.contains('+') {
             return Err(Error::Query(
@@ -2776,6 +2859,7 @@ impl<'e> Collection<'e> {
         wtxn: &mut RwTxn<'_>,
         def: &SearchIndexDef,
     ) -> Result<()> {
+        self.ensure_not_timeseries("create_search_index")?;
         self.ensure_standard()?;
         def.validate().map_err(Error::Query)?;
         let def_key = search::def_key(&self.name, def.kind, &def.name);
@@ -4540,6 +4624,10 @@ impl<'e> Collection<'e> {
 
     /// Inserts a document in the given transaction. Assigns `_id` (UUID v4) if missing.
     pub fn insert_one_txn(&self, wtxn: &mut RwTxn<'_>, mut doc: Value) -> Result<String> {
+        if self.profile.is_timeseries() {
+            let settings = self.timeseries_settings_in(&*wtxn)?.unwrap_or_default();
+            return crate::timeseries::insert(wtxn, self.env, &self.name, &settings, doc);
+        }
         self.ensure_standard()?;
         let ttl_at = ttl::take_insert_ttl_with_field(
             &mut doc,
@@ -4587,6 +4675,24 @@ impl<'e> Collection<'e> {
     /// upserted key back into the original BSON `_id` value.
     pub fn find_by_key(&self, key: &str) -> Result<Option<Value>> {
         let rtxn = self.read_txn()?;
+        if self.profile.is_timeseries() {
+            let settings = self.timeseries_settings_in(&rtxn)?.unwrap_or_default();
+            let query = FindQuery {
+                filter: Value::Object(Map::new()),
+                projection: None,
+                sort: Vec::new(),
+                skip: 0,
+                limit: None,
+                comment: None,
+                max_time_ms: None,
+                hint: None,
+            };
+            let docs = crate::timeseries::find(&rtxn, self.env, &self.name, &settings, &query)?;
+            rtxn.commit()?;
+            return Ok(docs
+                .into_iter()
+                .find(|doc| doc.get("_id").and_then(Value::as_str) == Some(key)));
+        }
         let out = self
             .db
             .get(&rtxn, key.as_bytes())?
@@ -4714,6 +4820,7 @@ impl<'e> Collection<'e> {
         array_filters: &[Value],
         default_id: Option<&Value>,
     ) -> Result<UpdateOutcome> {
+        self.ensure_not_timeseries("update")?;
         self.ensure_standard()?;
         let keys = self.matching_keys(&*wtxn, filter, multi)?;
         if keys.is_empty() {
@@ -4863,6 +4970,7 @@ impl<'e> Collection<'e> {
         opts: &FindAndModifyOptions<'_>,
         default_id: Option<&Value>,
     ) -> Result<FindAndModifyOutcome> {
+        self.ensure_not_timeseries("find_and_modify")?;
         self.ensure_standard()?;
         validate_find_and_modify(opts)?;
         let query = FindQuery {
@@ -5055,6 +5163,7 @@ impl<'e> Collection<'e> {
     }
 
     pub fn delete_txn(&self, wtxn: &mut RwTxn<'_>, filter: &Value, multi: bool) -> Result<usize> {
+        self.ensure_not_timeseries("delete")?;
         self.ensure_standard()?;
         let keys = self.matching_keys(&*wtxn, filter, multi)?;
         for key in &keys {
@@ -6082,6 +6191,7 @@ impl<'e> Collection<'e> {
         pipeline: &[Value],
         deadline: Option<Instant>,
     ) -> Result<Vec<Value>> {
+        self.ensure_not_timeseries("aggregate")?;
         check_find_deadline(deadline)?;
         aggregate::validate_pipeline(pipeline)?;
         if let Some(stage) = pipeline.first().and_then(Value::as_object) {
@@ -6538,6 +6648,12 @@ impl<'e> Collection<'e> {
     }
 
     pub fn find(&self, query: &FindQuery) -> Result<Vec<Value>> {
+        if self.profile.is_timeseries() {
+            let rtxn = self.read_txn()?;
+            let out = self.find_timeseries_in(&rtxn, query)?;
+            rtxn.commit()?;
+            return Ok(out);
+        }
         let normalized = normalized_find_query(query)?;
         let query = normalized.as_ref();
         crate::query::validate::validate_filter(&query.filter)?;
@@ -6601,6 +6717,7 @@ impl<'e> Collection<'e> {
         let query = normalized.as_ref();
         crate::query::validate::validate_filter(&query.filter)?;
         if self.profile().is_vault()
+            || self.profile().is_timeseries()
             || query.projection.is_some()
             || !query.sort.is_empty()
             || query.hint.is_some()
@@ -7410,6 +7527,9 @@ impl<'e> Collection<'e> {
     }
 
     pub fn find_in(&self, rtxn: &RoTxn<'_>, query: &FindQuery) -> Result<Vec<Value>> {
+        if self.profile.is_timeseries() {
+            return self.find_timeseries_in(rtxn, query);
+        }
         let normalized = normalized_find_query(query)?;
         let query = normalized.as_ref();
         crate::query::validate::validate_filter(&query.filter)?;
@@ -8082,6 +8202,17 @@ impl<'e> Collection<'e> {
     /// This executes the query so `actual_matched` and `actual_returned` are
     /// exact. Use small limits when explaining broad queries.
     pub fn explain_in(&self, rtxn: &RoTxn<'_>, query: &FindQuery) -> Result<Value> {
+        if self.profile.is_timeseries() {
+            let matched = self.count_in(rtxn, &query.filter)?;
+            return Ok(serde_json::json!({
+                "collection": self.name,
+                "profile": "timeseries",
+                "access": "bucket_scan",
+                "index_used": Value::Null,
+                "filter": query.filter,
+                "matched": matched,
+            }));
+        }
         let normalized = normalized_find_query(query)?;
         let query = normalized.as_ref();
         crate::query::validate::validate_filter(&query.filter)?;
@@ -8406,6 +8537,10 @@ impl<'e> Collection<'e> {
         filter: &Value,
         deadline: Option<Instant>,
     ) -> Result<usize> {
+        if self.profile.is_timeseries() {
+            let settings = self.timeseries_settings_in(rtxn)?.unwrap_or_default();
+            return crate::timeseries::count(rtxn, self.env, &self.name, &settings, filter);
+        }
         crate::query::validate::validate_filter(filter)?;
         check_find_deadline(deadline)?;
         if self.ttl_filter_active(rtxn)? {

@@ -675,14 +675,51 @@ impl Store {
 
     /// Creates a collection with an explicit profile.
     ///
-    /// Existing collections cannot be converted between `standard` and `vault`;
-    /// create a new collection and reinsert the data instead.
+    /// Existing collections cannot be converted between `standard`, `vault`,
+    /// and `timeseries`; create a new collection and reinsert the data instead.
     pub fn create_collection(
         &self,
         name: &str,
         profile: CollectionProfile,
     ) -> Result<Collection<'_>> {
         self.create_collection_with_ttl(name, profile, None)
+    }
+
+    /// Seals all pending time-series rows into columnar buckets.
+    ///
+    /// Open buckets keep rows as raw JSON so inserts stay O(1). Sealing is
+    /// automatic when a bucket fills or the window advances; this method lets
+    /// operators force it (for example before a compression report or a cold
+    /// backup).
+    pub fn seal_timeseries(&self, name: &str) -> Result<usize> {
+        let mut wtxn = self.write_txn()?;
+        let collection = self.collection_in(&mut wtxn, name)?;
+        let Some(settings) = collection.timeseries_settings_in(&wtxn)? else {
+            return Ok(0);
+        };
+        let sealed = crate::timeseries::seal_all(&mut wtxn, &self.env, name, &settings)?;
+        wtxn.commit()?;
+        Ok(sealed)
+    }
+
+    /// Creates a time-series collection backed by columnar buckets.
+    pub fn create_timeseries_collection(
+        &self,
+        name: &str,
+        settings: &crate::timeseries::Settings,
+    ) -> Result<Collection<'_>> {
+        settings.validate()?;
+        let mut wtxn = self.write_txn()?;
+        let collection = self.create_collection_with_ttl_and_purge_in(
+            &mut wtxn,
+            name,
+            CollectionProfile::TimeSeries,
+            None,
+            None,
+        )?;
+        collection.set_timeseries_settings_in(&mut wtxn, settings)?;
+        wtxn.commit()?;
+        Ok(collection)
     }
 
     /// Creates a collection with an optional default document TTL.
@@ -1573,6 +1610,10 @@ impl Store {
             collection.drop_search_index_txn(wtxn, def.kind, &def.name)?;
         }
 
+        if collection.profile().is_timeseries() {
+            crate::timeseries::clear(wtxn, &self.env, name)?;
+        }
+
         if let Some(db) = self.env.open_database::<Bytes, Bytes>(&*wtxn, Some(name))? {
             db.clear(&mut *wtxn)?;
         }
@@ -1583,6 +1624,7 @@ impl Store {
             format!("events:{name}"),
             format!("ttl:{name}"),
             format!("ttl_purge:{name}"),
+            format!("{}{name}", crate::timeseries::SETTINGS_META_PREFIX),
             subscriptions::meta_key(name),
         ];
         let prefixes = [
@@ -2081,15 +2123,20 @@ impl Store {
                 ttl_seconds,
                 ttl_field,
                 ttl_purge_history,
+                timeseries,
             } => {
                 let profile = CollectionProfile::parse(profile)?;
-                self.create_collection_with_ttl_and_purge_in(
+                let collection = self.create_collection_with_ttl_and_purge_in(
                     wtxn,
                     name,
                     profile,
                     *ttl_seconds,
                     *ttl_purge_history,
                 )?;
+                if let Some(raw) = timeseries {
+                    let settings: crate::timeseries::Settings = serde_json::from_str(raw)?;
+                    collection.set_timeseries_settings_in(wtxn, &settings)?;
+                }
                 if let (Some(field), Some(seconds)) = (ttl_field.as_deref(), ttl_seconds) {
                     self.set_collection_ttl_after_in(
                         wtxn,

@@ -37,6 +37,7 @@ pub mod search_segment;
 pub mod sql;
 pub mod store;
 pub mod subscriptions;
+pub mod timeseries;
 pub mod ttl;
 pub mod vault;
 pub mod vector;
@@ -60,6 +61,10 @@ pub use search_all::{SearchAllRequest, SearchAllResponse, SearchMode};
 pub use store::{
     parse_size, ReadTxn, Store, WriteTxn, CONTROL_DB, MAP_SIZE, MAX_DBS, MAX_DOCUMENT_BYTES,
     META_DB, PAGE_SIZE,
+};
+pub use timeseries::{
+    Compression as TimeSeriesCompression, Granularity as TimeSeriesGranularity,
+    Settings as TimeSeriesSettings, Stats as TimeSeriesStats,
 };
 pub use ttl::DueEntry;
 pub use vault::{CollectionProfile, VaultKey};

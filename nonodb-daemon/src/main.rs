@@ -3820,6 +3820,7 @@ async fn exec_inner(
                     profile,
                     ttl_seconds,
                     ttl_purge_history,
+                    timeseries,
                 } => {
                     let profile = match profile {
                         Some(raw) => match CollectionProfile::parse(&raw) {
@@ -3828,11 +3829,34 @@ async fn exec_inner(
                         },
                         None => CollectionProfile::Standard,
                     };
+                    let timeseries = match timeseries {
+                        Some(settings) => {
+                            if !profile.is_timeseries() {
+                                return respond(Err(nonodb_core::Error::Query(
+                                    "`timeseries` settings require profile `timeseries`".into(),
+                                )
+                                .into()));
+                            }
+                            if let Err(err) = settings.validate() {
+                                return respond(Err(err.into()));
+                            }
+                            Some(settings)
+                        }
+                        None if profile.is_timeseries() => {
+                            return respond(Err(nonodb_core::Error::Query(
+                                "profile `timeseries` requires a `timeseries` settings object with `timeField`"
+                                    .into(),
+                            )
+                            .into()));
+                        }
+                        None => None,
+                    };
                     WriteReq::CreateCollection {
                         coll,
                         profile,
                         ttl_seconds,
                         ttl_purge_history,
+                        timeseries,
                     }
                 }
                 Request::DropCollection { coll } => WriteReq::DropCollection { coll },
@@ -4415,7 +4439,7 @@ fn read_collection<'a>(
     if auth.is_some() {
         match store.collection_profile(coll)? {
             Some(CollectionProfile::Vault) => {}
-            Some(CollectionProfile::Standard) => return Err(vault::key_unexpected().into()),
+            Some(_) => return Err(vault::key_unexpected().into()),
             None => return Err(vault::not_a_vault_collection().into()),
         }
     }

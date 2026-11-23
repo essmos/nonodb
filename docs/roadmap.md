@@ -61,6 +61,10 @@ Implemented:
 - per-collection append-only document revision history with retention (`0` disables);
 - document TTL with collection defaults, per-document overrides, and background expiry;
 - BSON-compatible dates with RFC 3339 input, UTC normalization, indexed ranges, and sorting;
+- time-series collections (`profile: "timeseries"`) with per-series/window
+  buckets, columnar codecs (delta, delta-of-delta, Gorilla XOR, dictionary,
+  bit packing, byte shuffle, zlib), O(1) appends, automatic sealing, read-time
+  expiry, time-range pruning, and compression statistics;
 - Unix-socket daemon, optional TCP/TLS and mutual TLS, file-based principals and scopes, uid/gid allow-lists;
 - group commit, request limits/timeouts, JSON and Prometheus metrics, health/readiness, disk and snapshot monitoring;
 - snapshots, online backup, SHA-256 manifests, deep verification, restore drills,

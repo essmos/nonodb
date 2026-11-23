@@ -1968,6 +1968,7 @@ async fn create_collection_command(
             profile: nonodb_core::CollectionProfile::Standard,
             ttl_seconds: None,
             ttl_purge_history: None,
+            timeseries: None,
         },
         Durability::Full,
     )

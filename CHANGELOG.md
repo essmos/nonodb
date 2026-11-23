@@ -4,6 +4,19 @@ Full release notes: https://github.com/essmos/nonodb/releases
 
 ## Unreleased
 
+- Add `profile: "timeseries"` collections with bucketed columnar storage for
+  IoT and event data. A bucket covers one series (`metaField`) and one time
+  window; the meta value is stored once and every other field becomes a typed
+  column encoded with the cheapest of delta, delta-of-delta, Gorilla XOR,
+  dictionary, frame-of-reference bit packing, boolean bit packing, byte
+  shuffle, and optional zlib per column. Open buckets append rows in O(1) and
+  seal when full or when the window advances. `find`, `count`, `explain`,
+  ordered lookups, replication, backup, and drop work; updates, deletes,
+  indexes, aggregation, and SQL are rejected with a clear error. The bundled
+  benchmark stores 50k mixed IoT samples in 4.21 bytes/row, 43.6x smaller than
+  raw JSON and 2.64x smaller than row-oriented zlib with the same data. See
+  `docs/timeseries.md`.
+
 - Remove orphaned `.dropped-*` database directories at startup. A failed
   `remove_dir_all` no longer turns an already-committed database drop into an
   error.

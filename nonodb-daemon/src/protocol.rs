@@ -472,7 +472,9 @@ pub enum Request {
     ListCollections,
     /// Per-collection record counts and storage estimates for this database.
     DatabaseStats,
-    /// Creates a collection explicitly. `profile` is `standard` (default) or `vault`.
+    /// Creates a collection explicitly. `profile` is `standard` (default),
+    /// `vault`, or `timeseries`; `timeseries` configures the time-series bucket
+    /// layout when the profile is `timeseries`.
     CreateCollection {
         coll: String,
         #[serde(default)]
@@ -482,6 +484,9 @@ pub enum Request {
         /// Purge stored history on TTL expiry instead of adding a tombstone.
         #[serde(default)]
         ttl_purge_history: Option<bool>,
+        /// Time-series settings (`timeField`, `metaField`, granularity, ...).
+        #[serde(default)]
+        timeseries: Option<nonodb_core::timeseries::Settings>,
     },
     DropCollection {
         coll: String,
@@ -712,6 +717,7 @@ pub enum WriteReq {
         profile: CollectionProfile,
         ttl_seconds: Option<u64>,
         ttl_purge_history: Option<bool>,
+        timeseries: Option<nonodb_core::timeseries::Settings>,
     },
     DropCollection {
         coll: String,

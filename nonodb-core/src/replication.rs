@@ -61,6 +61,9 @@ pub enum ReplicationOp {
         #[serde(default)]
         ttl_field: Option<String>,
         ttl_purge_history: Option<bool>,
+        /// Serialized time-series settings for `profile = "timeseries"`.
+        #[serde(default)]
+        timeseries: Option<String>,
     },
     CollectionDrop {
         name: String,
@@ -292,6 +295,7 @@ mod tests {
                     ttl_seconds: None,
                     ttl_field: None,
                     ttl_purge_history: None,
+                    timeseries: None,
                 },
                 ReplicationOp::CollectionDrop {
                     name: "orders".into(),

@@ -2683,9 +2683,27 @@ Response:
 {"ok": true, "result": {"created": "vault", "profile": "vault", "ttl_seconds": null, "purge_history": false}}
 ```
 
-`profile` is `standard` (default) or `vault`. An existing collection cannot be
-converted between profiles; the request fails with
+`profile` is `standard` (default), `vault`, or `timeseries`. An existing
+collection cannot be converted between profiles; the request fails with
 `vault_profile_immutable`.
+
+A `timeseries` profile requires a `timeseries` settings object with `timeField`;
+see [Time-series collections](timeseries.md) for the bucketed columnar format,
+codecs, and measured compression:
+
+```json
+{
+  "op": "create_collection",
+  "coll": "readings",
+  "profile": "timeseries",
+  "timeseries": {
+    "timeField": "ts",
+    "metaField": "device",
+    "granularity": "seconds",
+    "compression": "balanced"
+  }
+}
+```
 
 An optional `ttl_seconds` sets the default document TTL for new inserts.
 `ttl_purge_history` controls whether TTL expiry deletes stored history:
