@@ -290,14 +290,32 @@ comparison and practical migration caveats.
 
 ## Future work
 
-Active implementation tasks live only in [TODO.md](../TODO.md). This roadmap
-does not keep a second wishlist or a duplicate backlog: if an item is not in
-`TODO.md`, it is not part of the current plan. Removing an item from `TODO.md`
-does not mean it was implemented; unsupported behavior remains documented in
-the limitations above and in the relevant guides.
+The current implementation plan is limited to this list.
 
-The absence of a feature from `TODO.md` does not guarantee it will never be
-added. It means there is no committed implementation plan for it today.
+### P0 — necessary before production
+
+1. **Point-in-time recovery / WAL.** Continuous recovery to a chosen timestamp,
+   with startup replay and documented RPO/RTO.
+2. **CRL/OCSP support for mutual TLS.** Or an equivalent automated revocation
+   path for externally managed PKI.
+3. **Real sparse/partial index semantics.** Unique-index behavior for missing
+   fields, query planning, migration notes, and MongoDB compatibility tests.
+4. **Per-database quotas and usage accounting.** Limits for data, indexes,
+   history, and sidecars, with operator-visible warnings and a write-rejection
+   policy.
+5. **Safe restore-in-place API and GUI flow.** Typed confirmation, preflight
+   verification, audit logging, and rollback guidance.
+
+### P1 — low effort, worthwhile
+
+1. **Publish `nonodb-client` to PyPI.** Use the prepared manual workflow.
+2. **Client-side `lookup_join` helpers.** Python, Node.js, Rust, and Go, with
+   order and missing-key alignment.
+3. **Certificate pinning.** Outgoing replication and client TLS connections.
+4. **Small-dataset benchmark smoke in CI.** Lookup and vector coverage to catch
+   planner, sidecar, and query regressions.
+5. **Stored BSON regex values.** Matching `$type` entries and documented index
+   behavior.
 
 ## Non-goals
 

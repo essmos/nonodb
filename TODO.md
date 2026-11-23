@@ -24,8 +24,6 @@ deliberate limitations are documented in [docs/roadmap.md](docs/roadmap.md).
 - [ ] Client-side `lookup_join` helpers in Python, Node.js, Rust, and Go,
       preserving order and missing-key alignment.
 - [ ] Certificate pinning for outgoing replication and client TLS connections.
-- [ ] Firewalld and ufw backends for managed firewall rules, keeping nftables as
-      the default.
 - [ ] Small-dataset lookup/vector benchmark smoke in CI to catch planner,
       sidecar, and query regressions.
 - [ ] Stored BSON regex values with matching `$type` entries and documented
