@@ -175,6 +175,9 @@ def main() -> int:
                 b"nonodb.saved-views",
                 b"nonodb-views-",
                 b"Could not import saved views",
+                b"Graph definition",
+                b"Traverse",
+                b"Initial depth",
             ):
                 assert marker in asset, marker
             assert b"Backup, restore, and verification remain CLI-only" not in asset

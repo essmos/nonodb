@@ -114,12 +114,13 @@ An LMDB environment contains named sub-databases. nonodb uses this layout:
 
 | Sub-database | Key | Value | Purpose |
 |---|---|---|---|
-| `meta` | metadata key | JSON or scalar | Collection registry, collection profile, index definitions, segment manifests, search deltas, exact BM25 statistics, history sequence |
+| `meta` | metadata key | JSON or scalar | Collection registry, collection profile, index definitions, graph definitions, segment manifests, search deltas, exact BM25 statistics, history sequence |
 | `history` | collection + `_id` + revision | revision JSON | Append-only document history |
 | `ttl` | expiry index / collection + `_id` | expiry timestamp | Document expiry metadata |
 | `coll:<name>` | `_id` bytes | JSON document | Primary collection data |
 | `dbslot:<n>` (index) | encoded values + `_id` | encoded `_id` / covering payload | Secondary index |
 | `dbslot:<n>` (vector) | `_id` | norm + `f32` components | Exact vector index (IVF sidecar on disk) |
+| `dbslot:<n>` (graph) | node + label + target + edge id | edge JSON | Derived graph adjacency (`out`/`in`) |
 | legacy `idx:*`, `ft:*`, `ftl:*`, `fz:*` | as above | as above | Resources created by older releases; current code does not open text/fuzzy legacy postings |
 
 Text and fuzzy postings are not stored in LMDB sub-databases. They live in
@@ -161,8 +162,9 @@ two key families in one named database: an expiry-ordered index
 collection/`_id` lookup (`i + collection + _id`) for updates and deletes.
 Collection defaults live in `meta` as `ttl:<name>`; date-field TTL also stores
 `ttl_field:<name>`. TTL entries are written in
-the same transaction as the document, indexes, and history. See
-[Document TTL](ttl.md).
+the same transaction as the document, indexes, and history. Graph adjacency
+entries are also written in that transaction. See [Document TTL](ttl.md) and
+[Graph traversal](graph.md).
 
 ### Vault collection layout
 
@@ -184,6 +186,18 @@ Vault collections have no secondary, text, fuzzy, or vector indexes. Standard wr
 methods reject vault collections, and vault requests require the three
 encryption headers. See [Vault collections](vault.md) for the API contract and
 threat model.
+
+### Graph layout
+
+Graph definitions live in `meta` as `graph:<node_collection>` with a reverse
+mapping `graph_edge:<edge_collection>`. The native adjacency index uses two
+reusable slot databases per graph: `graph:<edge_collection>:out` and
+`graph:<edge_collection>:in`. Each entry is keyed by the local node id, edge
+label, remote node id, and edge id, and stores the edge document. Entries are
+updated in the same write transaction as the edge document, including TTL
+expiry and replication apply. The index is derived and can be rebuilt with
+`reindex_graph`; it is not part of document history. See
+[Graph traversal](graph.md).
 
 Every collection consumes a named LMDB sub-database. Secondary index and vector
 resources are assigned physical **slot databases** (`dbslot:*`) from a reusable

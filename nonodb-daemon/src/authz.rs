@@ -64,6 +64,9 @@ pub fn authorize_request(
         | Request::ListFuzzyIndexes { coll }
         | Request::ListVectorIndexes { coll }
         | Request::VectorSearch { coll, .. }
+        | Request::GetGraph { coll }
+        | Request::Traverse { coll, .. }
+        | Request::ShortestPath { coll, .. }
         | Request::Search { coll, .. }
         | Request::Fuzzy { coll, .. }
         | Request::History { coll, .. }
@@ -120,6 +123,8 @@ pub fn authorize_request(
         | Request::DropFuzzyIndex { coll, .. }
         | Request::CreateVectorIndex { coll, .. }
         | Request::Reindex { coll }
+        | Request::DropGraph { coll }
+        | Request::ReindexGraph { coll }
         | Request::DropVectorIndex { coll, .. }
         | Request::CreateCollection { coll, .. }
         | Request::DropCollection { coll }
@@ -137,6 +142,25 @@ pub fn authorize_request(
             coll,
             req.op_name(),
         ),
+        Request::SetGraph { coll, def } => {
+            allow(
+                principal,
+                Action::AdminCollection,
+                database,
+                coll,
+                req.op_name(),
+            )?;
+            if def.edge_collection != *coll {
+                allow(
+                    principal,
+                    Action::AdminCollection,
+                    database,
+                    &def.edge_collection,
+                    req.op_name(),
+                )?;
+            }
+            Ok(())
+        }
         Request::CreateWebhook { rule } => allow(
             principal,
             Action::AdminCollection,

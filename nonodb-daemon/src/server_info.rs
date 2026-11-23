@@ -95,6 +95,14 @@ pub fn capabilities() -> Value {
                 "webhooks": true,
                 "webhook_thresholds": ["count", "sum", "avg"],
             },
+            "graph": {
+                "traverse": true,
+                "shortest_path": true,
+                "adjacency": true,
+                "vector_seed": true,
+                "algorithms": ["bfs", "dfs", "dijkstra"],
+                "directions": ["out", "in", "both"],
+            },
             "storage": {
                 "history": true,
                 "vault": true,
@@ -114,6 +122,11 @@ pub fn capabilities() -> Value {
             "aggregate_docs": nonodb_core::MAX_AGGREGATE_DOCS,
             "search_results": 1000,
             "lookup_values": nonodb_core::MAX_LOOKUP_VALUES,
+            "graph_start_ids": 10_000,
+            "graph_depth": nonodb_core::graph::MAX_GRAPH_DEPTH,
+            "graph_nodes": nonodb_core::graph::DEFAULT_GRAPH_NODES,
+            "graph_edges": nonodb_core::graph::DEFAULT_GRAPH_EDGES,
+            "graph_bytes": nonodb_core::graph::DEFAULT_GRAPH_BYTES,
         },
     })
 }
@@ -128,6 +141,7 @@ mod tests {
         assert_eq!(value["schema_version"], 1);
         assert_eq!(value["features"]["ttl"]["date_field"], true);
         assert_eq!(value["features"]["aggregation"]["convert"], true);
+        assert_eq!(value["features"]["graph"]["vector_seed"], true);
         assert!(value.get("token").is_none());
         let text = value.to_string();
         assert!(!text.contains("token"));

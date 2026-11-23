@@ -2187,6 +2187,14 @@ impl Store {
             ReplicationOp::CollectionEvents { coll, config } => {
                 self.set_collection_events_in(wtxn, coll, config)
             }
+            ReplicationOp::GraphSet { coll, def } => {
+                let collection = self.collection_in(wtxn, coll)?;
+                collection.set_graph_txn(wtxn, def)
+            }
+            ReplicationOp::GraphDrop { coll } => {
+                let collection = self.collection_in(wtxn, coll)?;
+                collection.drop_graph_txn(wtxn).map(|_| ())
+            }
             ReplicationOp::IndexCreate {
                 coll,
                 fields,

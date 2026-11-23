@@ -144,6 +144,10 @@ support only a restricted subset of operations. See
 | `lookup` result budget | 64 MiB (`result_too_large`) |
 | Fuzzy candidates | 5,000 per query |
 | Vector dimensions | 1–65,536 |
+| Graph `start` ids | 10,000 |
+| Graph `max_depth` | 64 |
+| Graph `limit_nodes` / `limit_edges` | defaults 1,000 / 10,000 |
+| Graph result budget | 64 MiB (`truncated` instead of an error) |
 | `write_batch` operations | bounded by request size |
 | LMDB named databases | 1024 (`MDB_DBS_FULL` when exhausted) |
 
@@ -164,6 +168,12 @@ client timeout with `NONODB_TIMEOUT` or the `timeout=` argument.
 | [`find_one`](#find_one) | Return one document |
 | [`lookup`](#lookup) | Ordered point lookups by `_id` or a unique index |
 | [`explain_lookup`](#explain_lookup) | Index, coverage, and counters for a lookup |
+| [`set_graph`](#graph) | Configure a graph and rebuild adjacency |
+| [`get_graph`](#graph) | Read the graph definition |
+| [`drop_graph`](#graph) | Remove a graph definition and adjacency |
+| [`reindex_graph`](#graph) | Rebuild graph adjacency |
+| [`traverse`](#graph) | BFS/DFS traversal with a tree or flat result |
+| [`shortest_path`](#graph) | BFS or weighted shortest path |
 | [`watch`](#watch) | Long-poll append-only events by sortable `_id` |
 | [`explain`](#explain) | Show the selected plan, bounds, and actual counts |
 | [`update`](#update) | Update or upsert documents |
@@ -2303,6 +2313,40 @@ Semantics:
   Vector writes are tracked in a small LMDB delta and merged into unfiltered
   ANN queries. After 4,096 changed ids, queries use the exact index until the
   sidecar is rebuilt.
+
+## Graph
+
+Graphs are ordinary node and edge documents plus a native adjacency index. Full
+semantics, limits, and examples are in [Graph traversal](graph.md). The
+operations are:
+
+| `op` | Purpose |
+|---|---|
+| `set_graph` | Create/replace a definition and rebuild adjacency |
+| `get_graph` | Read the definition (`null` when absent) |
+| `drop_graph` | Remove the definition and clear adjacency |
+| `reindex_graph` | Rebuild adjacency from the edge collection |
+| `traverse` | BFS/DFS traversal, tree or flat items, optional vector seed |
+| `shortest_path` | BFS hops or Dijkstra over edge weights |
+
+```json
+{"op":"traverse","coll":"nodes","start":["alice"],
+ "direction":"out","labels":["KNOWS"],"max_depth":2,
+ "algorithm":"bfs","tree":true}
+```
+
+Every traversal runs in one read snapshot. A node is expanded once; repeated
+arrivals are marked with `"cycle":true`. Results include `nodes`, `edges`,
+`truncated`, and `missing`. `start` and `seed` are mutually exclusive.
+
+```json
+{"op":"shortest_path","coll":"nodes","start":"alice","target":"carol",
+ "weighted":true,"max_depth":8}
+```
+
+Graph configuration requires admin scope on both collections; reads require a
+read scope on the node collection. Vault collections are rejected. The MongoDB
+wire listener does not expose graph operations.
 
 ## vector_search
 

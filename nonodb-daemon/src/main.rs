@@ -3540,6 +3540,39 @@ async fn exec_inner(
             read_result(joined).await
         }
 
+        Request::GetGraph { coll } => {
+            let store = state.store.clone();
+            let auth = vault_auth.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                let c = read_collection(&store, &coll, auth.as_ref())?;
+                reject_vault_read(&c, auth.as_ref(), "graph")?;
+                Ok::<Value, ApiError>(json!({ "graph": c.get_graph()? }))
+            });
+            read_result(joined).await
+        }
+
+        Request::Traverse { coll, options } => {
+            let store = state.store.clone();
+            let auth = vault_auth.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                let c = read_collection(&store, &coll, auth.as_ref())?;
+                reject_vault_read(&c, auth.as_ref(), "graph traversal")?;
+                c.graph_traverse(options).map_err(ApiError::from)
+            });
+            read_result(joined).await
+        }
+
+        Request::ShortestPath { coll, options } => {
+            let store = state.store.clone();
+            let auth = vault_auth.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                let c = read_collection(&store, &coll, auth.as_ref())?;
+                reject_vault_read(&c, auth.as_ref(), "graph traversal")?;
+                c.graph_shortest_path(options).map_err(ApiError::from)
+            });
+            read_result(joined).await
+        }
+
         Request::Search {
             coll,
             field,
@@ -4195,6 +4228,9 @@ async fn exec_inner(
                     metric: metric.unwrap_or_default(),
                 },
                 Request::Reindex { coll } => WriteReq::Reindex { coll },
+                Request::SetGraph { coll, def } => WriteReq::SetGraph { coll, def },
+                Request::DropGraph { coll } => WriteReq::DropGraph { coll },
+                Request::ReindexGraph { coll } => WriteReq::ReindexGraph { coll },
                 Request::DropVectorIndex { coll, field } => {
                     WriteReq::DropVectorIndex { coll, field }
                 }

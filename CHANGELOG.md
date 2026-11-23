@@ -59,6 +59,13 @@ Full release notes: https://github.com/essmos/nonodb/releases
 
 ## v0.31.0 - 2026-11-23
 
+- Add graph traversal over ordinary node and edge documents. A graph definition
+  in `meta` drives native `out`/`in` adjacency slots maintained in the same
+  transaction as every edge insert, update, delete, TTL expiry, and replication
+  apply. Add `set_graph`, `get_graph`, `drop_graph`, `reindex_graph`, `traverse`
+  (BFS/DFS, directions, labels, cycle markers, tree/flat output, node/edge/byte
+  budgets, vector-search seeds), `shortest_path` (BFS or Dijkstra), Python client
+  methods, and a lazy Graph tree in the GUI. See `docs/graph.md`.
 - Remove orphaned `.dropped-*` database directories at startup. A failed
   `remove_dir_all` no longer turns an already-committed database drop into an
   error.

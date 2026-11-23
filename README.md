@@ -184,6 +184,18 @@ single-database directories are migrated to `default/` on startup. See
   required. Results include `_distance`, lowest first.
 - All search indexes are maintained in the same transaction as the document.
 
+### Graph
+
+- Nodes and edges are ordinary documents; a graph definition names the edge
+  collection and endpoint/label/weight fields.
+- Native `out`/`in` adjacency slots are maintained in the same transaction as
+  every edge insert, update, delete, TTL expiry, and replication apply.
+- `traverse` supports BFS/DFS, directions, label filters, cycle markers, tree or
+  flat output, hard node/edge/byte budgets, and vector-search seeds.
+- `shortest_path` uses BFS by hops or Dijkstra over edge weights.
+- Graph configuration and traversal are available through the HTTP API, Python
+  client, and the GUI Graph tab. See [Graph traversal](docs/graph.md).
+
 ### Aggregation
 
 - `aggregate` endpoint for reporting, grouping, and summaries. A terminal

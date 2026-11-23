@@ -1570,6 +1570,122 @@ class Collection:
             }
         )["results"]
 
+    # -- graph -------------------------------------------------------
+    def set_graph(
+        self,
+        edge_collection: str,
+        *,
+        from_field: str = "from",
+        to_field: str = "to",
+        label_field: str = "label",
+        weight_field: str = "weight",
+        directed: bool = True,
+    ) -> dict[str, Any]:
+        """Configures a graph rooted at this node collection.
+
+        Edges are ordinary documents in `edge_collection`. The native adjacency
+        index is rebuilt from existing edges in the same transaction.
+        """
+        return self._db.exec(
+            {
+                "op": "set_graph",
+                "coll": self.name,
+                "def": {
+                    "node_collection": self.name,
+                    "edge_collection": edge_collection,
+                    "from_field": from_field,
+                    "to_field": to_field,
+                    "label_field": label_field,
+                    "weight_field": weight_field,
+                    "directed": directed,
+                },
+            }
+        )["graph"]
+
+    def get_graph(self) -> Optional[dict[str, Any]]:
+        """Returns the graph definition for this collection, if configured."""
+        return self._db.exec({"op": "get_graph", "coll": self.name})["graph"]
+
+    def drop_graph(self) -> bool:
+        """Removes the graph definition and its adjacency index."""
+        return self._db.exec({"op": "drop_graph", "coll": self.name})["dropped"]
+
+    def reindex_graph(self) -> dict[str, Any]:
+        """Rebuilds the adjacency index from the edge collection."""
+        return self._db.exec({"op": "reindex_graph", "coll": self.name})
+
+    def traverse(
+        self,
+        start: Any | Iterable[Any] | None = None,
+        *,
+        seed: Optional[dict[str, Any]] = None,
+        direction: str = "out",
+        labels: Optional[Iterable[str]] = None,
+        max_depth: int = 3,
+        limit_nodes: int = 1000,
+        limit_edges: int = 10_000,
+        max_bytes: int = 64 * 1024 * 1024,
+        tree: bool = True,
+        include_edges: bool = False,
+        algorithm: str = "bfs",
+    ) -> dict[str, Any]:
+        """Traverses the graph from `start` ids or a vector seed.
+
+        `seed` accepts `{"vector": {"field": ..., "vector": [...], "k": 5}}`.
+        `direction` is `out`, `in`, or `both`. The result is a nested tree when
+        `tree` is true, otherwise a flat `items` list. `truncated` and `missing`
+        report budget and unresolved ids.
+        """
+        if start is None:
+            starts: list[Any] = []
+        elif isinstance(start, (str, int, float, dict)) or hasattr(start, "binary"):
+            starts = [start]
+        else:
+            starts = list(start)
+        payload: dict[str, Any] = {
+            "op": "traverse",
+            "coll": self.name,
+            "start": starts,
+            "direction": direction,
+            "labels": list(labels or []),
+            "max_depth": max_depth,
+            "limit_nodes": limit_nodes,
+            "limit_edges": limit_edges,
+            "max_bytes": max_bytes,
+            "tree": tree,
+            "include_edges": include_edges,
+            "algorithm": algorithm,
+        }
+        if seed is not None:
+            payload["seed"] = seed
+        return self._db.exec(payload)
+
+    def shortest_path(
+        self,
+        start: Any,
+        target: Any,
+        *,
+        direction: str = "out",
+        labels: Optional[Iterable[str]] = None,
+        max_depth: int = 8,
+        limit_nodes: int = 1000,
+        weighted: bool = False,
+    ) -> dict[str, Any]:
+        """Returns a shortest path by hops or by edge `weight` (Dijkstra)."""
+        return self._db.exec(
+            {
+                "op": "shortest_path",
+                "coll": self.name,
+                "start": start,
+                "target": target,
+                "direction": direction,
+                "labels": list(labels or []),
+                "max_depth": max_depth,
+                "limit_nodes": limit_nodes,
+                "weighted": weighted,
+            }
+        )
+
     # -- read --------------------------------------------------------
     def watch_once(
         self,

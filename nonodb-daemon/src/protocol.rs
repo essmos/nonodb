@@ -3,6 +3,7 @@
 use serde::{ser::SerializeMap, Deserialize, Serialize, Serializer};
 use serde_json::{value::RawValue, Value};
 
+use nonodb_core::graph::{GraphDef, ShortestPathOptions, TraverseOptions};
 use nonodb_core::{CollectionProfile, IndexSpec, SearchAllRequest, VaultKey, VectorMetric};
 
 use crate::webhooks::WebhookRule;
@@ -431,6 +432,16 @@ pub enum Request {
         coll: String,
         field: String,
     },
+    SetGraph {
+        coll: String,
+        def: GraphDef,
+    },
+    DropGraph {
+        coll: String,
+    },
+    ReindexGraph {
+        coll: String,
+    },
     ListVectorIndexes {
         coll: String,
     },
@@ -444,6 +455,22 @@ pub enum Request {
         skip: usize,
         #[serde(default)]
         limit: Option<usize>,
+    },
+    /// Reads the graph definition for a node collection.
+    GetGraph {
+        coll: String,
+    },
+    /// Breadth-first or depth-first traversal over the graph rooted at `coll`.
+    Traverse {
+        coll: String,
+        #[serde(flatten)]
+        options: TraverseOptions,
+    },
+    /// Shortest path over the graph rooted at `coll`.
+    ShortestPath {
+        coll: String,
+        #[serde(flatten)]
+        options: ShortestPathOptions,
     },
     Search {
         coll: String,
@@ -871,6 +898,16 @@ pub enum WriteReq {
         coll: String,
         field: String,
     },
+    SetGraph {
+        coll: String,
+        def: GraphDef,
+    },
+    DropGraph {
+        coll: String,
+    },
+    ReindexGraph {
+        coll: String,
+    },
     /// SQL `INSERT` or `UPDATE` executed in one writer transaction.
     Sql {
         query: String,
@@ -972,6 +1009,12 @@ impl Request {
             Self::Fuzzy { .. } => "fuzzy",
             Self::CreateVectorIndex { .. } => "create_vector_index",
             Self::Reindex { .. } => "reindex",
+            Self::GetGraph { .. } => "get_graph",
+            Self::Traverse { .. } => "traverse",
+            Self::ShortestPath { .. } => "shortest_path",
+            Self::SetGraph { .. } => "set_graph",
+            Self::DropGraph { .. } => "drop_graph",
+            Self::ReindexGraph { .. } => "reindex_graph",
             Self::DropVectorIndex { .. } => "drop_vector_index",
             Self::ListVectorIndexes { .. } => "list_vector_indexes",
             Self::VectorSearch { .. } => "vector_search",
@@ -1047,6 +1090,9 @@ impl Request {
             | Self::ListFuzzyIndexes { .. }
             | Self::ListVectorIndexes { .. }
             | Self::VectorSearch { .. }
+            | Self::GetGraph { .. }
+            | Self::Traverse { .. }
+            | Self::ShortestPath { .. }
             | Self::Search { .. }
             | Self::SearchAll { .. }
             | Self::Fuzzy { .. }
@@ -1105,6 +1151,11 @@ impl Request {
             | Self::DropVectorIndex { coll, .. }
             | Self::ListVectorIndexes { coll }
             | Self::VectorSearch { coll, .. }
+            | Self::GetGraph { coll }
+            | Self::Traverse { coll, .. }
+            | Self::ShortestPath { coll, .. }
+            | Self::DropGraph { coll }
+            | Self::ReindexGraph { coll }
             | Self::Search { coll, .. }
             | Self::Fuzzy { coll, .. }
             | Self::History { coll, .. }
@@ -1124,6 +1175,13 @@ impl Request {
             | Self::RenewSubscription { coll, .. }
             | Self::DeleteSubscription { coll, .. }
             | Self::ListSubscriptions { coll } => vec![coll.clone()],
+            Self::SetGraph { coll, def } => {
+                if def.edge_collection == *coll {
+                    vec![coll.clone()]
+                } else {
+                    vec![coll.clone(), def.edge_collection.clone()]
+                }
+            }
             Self::SearchAll { request } => vec![request.coll.clone()],
             Self::CreateWebhook { rule } => vec![rule.coll.clone()],
             Self::DeleteWebhook { .. }
@@ -1196,7 +1254,8 @@ impl WriteReq {
             | Self::CreateTextIndex { .. }
             | Self::CreateFuzzyIndex { .. }
             | Self::CreateVectorIndex { .. }
-            | Self::Reindex { .. } => true,
+            | Self::Reindex { .. }
+            | Self::ReindexGraph { .. } => true,
             Self::Batch { ops } => ops.iter().any(Self::is_index_build),
             _ => false,
         }

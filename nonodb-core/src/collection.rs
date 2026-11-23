@@ -10,7 +10,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use heed::types::Bytes;
 use heed::{Database, Env, RoTxn, RwTxn};
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
 use crate::aggregate;
@@ -19,6 +19,9 @@ use crate::date;
 use crate::error::{Error, Result};
 use crate::events::{self, EventConfig, EVENTS_COLLECTION};
 use crate::geo;
+use crate::graph::{
+    self, AdjEdge, GraphDef, GraphDirection, GraphView, ShortestPathOptions, TraverseOptions,
+};
 use crate::history::{self, HistoryEntry};
 use crate::id;
 use crate::index::{self, IndexDef};
@@ -4631,12 +4634,14 @@ impl<'e> Collection<'e> {
         }
         self.validate_unique(&*wtxn, &doc, &id)?;
 
+        self.validate_graph_edge_txn(&*wtxn, &doc)?;
         let bytes = serde_json::to_vec(&doc)?;
         if bytes.len() > MAX_DOCUMENT_BYTES {
             return Err(Error::DocumentTooLarge(bytes.len(), MAX_DOCUMENT_BYTES));
         }
         self.db.put(&mut *wtxn, id.as_bytes(), &bytes)?;
         self.apply_index_entries(wtxn, None, Some(&doc), &id)?;
+        self.apply_graph_entries(wtxn, None, Some(&doc))?;
         self.apply_text_entries(wtxn, None, Some(&doc), &id)?;
         self.apply_fuzzy_entries(wtxn, None, Some(&doc), &id)?;
         self.apply_vector_entries(wtxn, None, Some(&doc), &id)?;
@@ -4693,6 +4698,7 @@ impl<'e> Collection<'e> {
                 }
                 if let Some(old) = &old {
                     self.apply_index_entries(wtxn, Some(old), None, id)?;
+                    self.apply_graph_entries(wtxn, Some(old), None)?;
                     self.apply_text_entries(wtxn, Some(old), None, id)?;
                     self.apply_fuzzy_entries(wtxn, Some(old), None, id)?;
                     self.apply_vector_entries(wtxn, Some(old), None, id)?;
@@ -4705,6 +4711,7 @@ impl<'e> Collection<'e> {
                 }
                 self.db.put(&mut *wtxn, id.as_bytes(), &bytes)?;
                 self.apply_index_entries(wtxn, None, Some(after), id)?;
+                self.apply_graph_entries(wtxn, None, Some(after))?;
                 self.apply_text_entries(wtxn, None, Some(after), id)?;
                 self.apply_fuzzy_entries(wtxn, None, Some(after), id)?;
                 self.apply_vector_entries(wtxn, None, Some(after), id)?;
@@ -4715,6 +4722,7 @@ impl<'e> Collection<'e> {
                 if let Some(old) = &old {
                     self.db.delete(&mut *wtxn, id.as_bytes())?;
                     self.apply_index_entries(wtxn, Some(old), None, id)?;
+                    self.apply_graph_entries(wtxn, Some(old), None)?;
                     self.apply_text_entries(wtxn, Some(old), None, id)?;
                     self.apply_fuzzy_entries(wtxn, Some(old), None, id)?;
                     self.apply_vector_entries(wtxn, Some(old), None, id)?;
@@ -4851,6 +4859,7 @@ impl<'e> Collection<'e> {
         numeric::normalize_document(&mut new)?;
         bson_types::normalize_document(&mut new)?;
 
+        self.validate_graph_edge_txn(&*wtxn, &new)?;
         self.validate_unique(&*wtxn, &new, &id)?;
         let bytes = serde_json::to_vec(&new)?;
         if bytes.len() > MAX_DOCUMENT_BYTES {
@@ -4858,6 +4867,7 @@ impl<'e> Collection<'e> {
         }
         self.db.put(&mut *wtxn, id.as_bytes(), &bytes)?;
         self.apply_index_entries(wtxn, Some(&old), Some(&new), &id)?;
+        self.apply_graph_entries(wtxn, Some(&old), Some(&new))?;
         self.apply_text_entries(wtxn, Some(&old), Some(&new), &id)?;
         self.apply_fuzzy_entries(wtxn, Some(&old), Some(&new), &id)?;
         self.apply_vector_entries(wtxn, Some(&old), Some(&new), &id)?;
@@ -5133,6 +5143,7 @@ impl<'e> Collection<'e> {
             let old: Value = parse_json(&raw)?;
             self.db.delete(&mut *wtxn, key.as_slice())?;
             self.apply_index_entries(wtxn, Some(&old), None, &id)?;
+            self.apply_graph_entries(wtxn, Some(&old), None)?;
             self.apply_text_entries(wtxn, Some(&old), None, &id)?;
             self.apply_fuzzy_entries(wtxn, Some(&old), None, &id)?;
             self.apply_vector_entries(wtxn, Some(&old), None, &id)?;
@@ -5147,6 +5158,313 @@ impl<'e> Collection<'e> {
         let n = self.delete_txn(&mut wtxn, filter, multi)?;
         wtxn.commit()?;
         Ok(n)
+    }
+
+    // ----------------------------- graph -----------------------------
+
+    fn graph_adjacency_db(
+        &self,
+        txn: &RoTxn<'_>,
+        direction: GraphDirection,
+    ) -> Result<Option<Database<Bytes, Bytes>>> {
+        let resource = graph::adjacency_resource(&self.name, direction);
+        self.resource_db(txn, &resource, &resource)
+    }
+
+    fn graph_adjacency_db_in(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        direction: GraphDirection,
+    ) -> Result<Database<Bytes, Bytes>> {
+        let resource = graph::adjacency_resource(&self.name, direction);
+        self.resource_db_in(wtxn, &resource, &resource)
+    }
+
+    fn graph_def_in(&self, txn: &RoTxn<'_>) -> Result<Option<GraphDef>> {
+        let key = graph::node_def_key(&self.name);
+        let Some(raw) = self.meta.get(txn, key.as_bytes())? else {
+            return Ok(None);
+        };
+        Ok(Some(graph::parse_def(raw)?))
+    }
+
+    fn edge_graph_def_in(&self, txn: &RoTxn<'_>) -> Result<Option<GraphDef>> {
+        let key = graph::edge_def_key(&self.name);
+        let Some(raw) = self.meta.get(txn, key.as_bytes())? else {
+            return Ok(None);
+        };
+        Ok(Some(graph::parse_def(raw)?))
+    }
+
+    /// Adds or replaces the graph definition rooted at this node collection.
+    ///
+    /// The adjacency index is rebuilt from the edge collection in the same
+    /// transaction. Existing edges are validated; a malformed edge aborts the
+    /// whole change.
+    pub fn set_graph(&self, mut def: GraphDef) -> Result<GraphDef> {
+        def.node_collection = self.name.clone();
+        def.validate()?;
+        if def.node_collection == def.edge_collection {
+            return Err(Error::Query(
+                "graph node and edge collections must differ".into(),
+            ));
+        }
+        let mut wtxn = self.write_txn()?;
+        self.set_graph_txn(&mut wtxn, &def)?;
+        wtxn.commit()?;
+        Ok(def)
+    }
+
+    pub fn set_graph_txn(&self, wtxn: &mut RwTxn<'_>, def: &GraphDef) -> Result<()> {
+        let store = self.store.ok_or_else(|| {
+            Error::Query("graph configuration requires a store-backed collection".into())
+        })?;
+        let edge = store
+            .collection_at(&*wtxn, &def.edge_collection)?
+            .ok_or_else(|| {
+                Error::Query(format!(
+                    "graph edge collection `{}` does not exist",
+                    def.edge_collection
+                ))
+            })?;
+        if let Some(existing) = edge.edge_graph_def_in(&*wtxn)? {
+            if existing.node_collection != def.node_collection {
+                return Err(Error::Query(format!(
+                    "edge collection `{}` already belongs to graph `{}`",
+                    def.edge_collection, existing.node_collection
+                )));
+            }
+        }
+        if let Some(existing) = self.graph_def_in(&*wtxn)? {
+            edge.clear_graph_adjacency_txn(wtxn, &existing)?;
+            if existing.edge_collection != def.edge_collection {
+                self.meta.delete(
+                    &mut *wtxn,
+                    graph::edge_def_key(&existing.edge_collection).as_bytes(),
+                )?;
+            }
+        }
+        self.meta.put(
+            &mut *wtxn,
+            graph::node_def_key(&self.name).as_bytes(),
+            serde_json::to_vec(def)?.as_slice(),
+        )?;
+        self.meta.put(
+            &mut *wtxn,
+            graph::edge_def_key(&edge.name).as_bytes(),
+            serde_json::to_vec(def)?.as_slice(),
+        )?;
+        edge.rebuild_graph_adjacency_txn(wtxn, def)?;
+        Ok(())
+    }
+
+    pub fn get_graph(&self) -> Result<Option<GraphDef>> {
+        let rtxn = self.read_txn()?;
+        let out = self.graph_def_in(&rtxn)?;
+        rtxn.commit()?;
+        Ok(out)
+    }
+
+    /// Removes the graph definition and clears its adjacency index.
+    pub fn drop_graph(&self) -> Result<bool> {
+        let mut wtxn = self.write_txn()?;
+        let dropped = self.drop_graph_txn(&mut wtxn)?;
+        wtxn.commit()?;
+        Ok(dropped)
+    }
+
+    pub fn drop_graph_txn(&self, wtxn: &mut RwTxn<'_>) -> Result<bool> {
+        let Some(def) = self.graph_def_in(&*wtxn)? else {
+            return Ok(false);
+        };
+        let store = self.store.ok_or_else(|| {
+            Error::Query("graph configuration requires a store-backed collection".into())
+        })?;
+        if let Some(edge) = store.collection_at(&*wtxn, &def.edge_collection)? {
+            edge.clear_graph_adjacency_txn(wtxn, &def)?;
+        }
+        self.meta
+            .delete(&mut *wtxn, graph::node_def_key(&self.name).as_bytes())?;
+        self.meta.delete(
+            &mut *wtxn,
+            graph::edge_def_key(&def.edge_collection).as_bytes(),
+        )?;
+        Ok(true)
+    }
+
+    fn clear_graph_adjacency_txn(&self, wtxn: &mut RwTxn<'_>, def: &GraphDef) -> Result<()> {
+        for direction in [GraphDirection::Out, GraphDirection::In] {
+            let resource = graph::adjacency_resource(&def.edge_collection, direction);
+            self.drop_resource_db(wtxn, &resource, &resource)?;
+        }
+        Ok(())
+    }
+
+    fn rebuild_graph_adjacency_txn(&self, wtxn: &mut RwTxn<'_>, def: &GraphDef) -> Result<()> {
+        let docs = self.find_in(
+            &*wtxn,
+            &FindQuery {
+                filter: Value::Object(Map::new()),
+                projection: None,
+                sort: Vec::new(),
+                skip: 0,
+                limit: None,
+                comment: None,
+                max_time_ms: None,
+                hint: None,
+            },
+        )?;
+        let out = self.graph_adjacency_db_in(wtxn, GraphDirection::Out)?;
+        let incoming = self.graph_adjacency_db_in(wtxn, GraphDirection::In)?;
+        for doc in &docs {
+            for (direction, key, value) in graph::adjacency_entries(def, doc)? {
+                match direction {
+                    GraphDirection::Out => out.put(&mut *wtxn, key.as_slice(), value.as_slice())?,
+                    GraphDirection::In => {
+                        incoming.put(&mut *wtxn, key.as_slice(), value.as_slice())?
+                    }
+                    GraphDirection::Both => unreachable!(),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn reindex_graph(&self) -> Result<usize> {
+        let mut wtxn = self.write_txn()?;
+        let count = self.reindex_graph_txn(&mut wtxn)?;
+        wtxn.commit()?;
+        Ok(count)
+    }
+
+    pub fn reindex_graph_txn(&self, wtxn: &mut RwTxn<'_>) -> Result<usize> {
+        let def = self
+            .graph_def_in(&*wtxn)?
+            .ok_or_else(|| Error::Query("graph is not configured for this collection".into()))?;
+        let store = self.store.ok_or_else(|| {
+            Error::Query("graph configuration requires a store-backed collection".into())
+        })?;
+        let edge = store
+            .collection_at(&*wtxn, &def.edge_collection)?
+            .ok_or_else(|| {
+                Error::Query(format!(
+                    "graph edge collection `{}` does not exist",
+                    def.edge_collection
+                ))
+            })?;
+        edge.clear_graph_adjacency_txn(wtxn, &def)?;
+        edge.rebuild_graph_adjacency_txn(wtxn, &def)?;
+        Ok(edge.db.iter(&*wtxn)?.filter_map(|item| item.ok()).count())
+    }
+
+    pub fn graph_traverse(&self, mut options: TraverseOptions) -> Result<Value> {
+        options.validate()?;
+        let rtxn = self.read_txn()?;
+        let def = self
+            .graph_def_in(&rtxn)?
+            .ok_or_else(|| Error::Query("graph is not configured for this collection".into()))?;
+        if let Some(seed) = options.seed.as_ref() {
+            if !options.start.is_empty() {
+                return Err(Error::Query(
+                    "traverse accepts either `start` or `seed.vector`, not both".into(),
+                ));
+            }
+            let docs = self.vector_search_in(
+                &rtxn,
+                &seed.vector.field,
+                &seed.vector.vector,
+                &seed.vector.filter,
+                0,
+                Some(seed.vector.k),
+            )?;
+            options.start = docs
+                .into_iter()
+                .filter_map(|doc| doc.get("_id").cloned())
+                .collect();
+            if options.start.is_empty() {
+                return Ok(json!({
+                    "roots": [],
+                    "nodes": 0,
+                    "edges": 0,
+                    "truncated": false,
+                    "missing": [],
+                }));
+            }
+        }
+        let store = self.store.ok_or_else(|| {
+            Error::Query("graph traversal requires a store-backed collection".into())
+        })?;
+        let view = GraphViewImpl::new(store, &rtxn, def)?;
+        let out = graph::traverse(&view, &options)?;
+        rtxn.commit()?;
+        Ok(out)
+    }
+
+    pub fn graph_shortest_path(&self, options: ShortestPathOptions) -> Result<Value> {
+        options.validate()?;
+        let rtxn = self.read_txn()?;
+        let def = self
+            .graph_def_in(&rtxn)?
+            .ok_or_else(|| Error::Query("graph is not configured for this collection".into()))?;
+        let store = self.store.ok_or_else(|| {
+            Error::Query("graph traversal requires a store-backed collection".into())
+        })?;
+        let view = GraphViewImpl::new(store, &rtxn, def)?;
+        let out = graph::shortest_path(&view, &options)?;
+        rtxn.commit()?;
+        Ok(out)
+    }
+
+    fn validate_graph_edge_txn(&self, txn: &RoTxn<'_>, doc: &Value) -> Result<()> {
+        if self.profile.is_vault() {
+            return Ok(());
+        }
+        if let Some(def) = self.edge_graph_def_in(txn)? {
+            graph::adjacency_entries(&def, doc)?;
+        }
+        Ok(())
+    }
+
+    /// Maintains the native adjacency index for an edge collection.
+    fn apply_graph_entries(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        old: Option<&Value>,
+        new: Option<&Value>,
+    ) -> Result<()> {
+        if self.profile.is_vault() {
+            return Ok(());
+        }
+        let Some(def) = self.edge_graph_def_in(&*wtxn)? else {
+            return Ok(());
+        };
+        let out = self.graph_adjacency_db_in(wtxn, GraphDirection::Out)?;
+        let incoming = self.graph_adjacency_db_in(wtxn, GraphDirection::In)?;
+        for doc in [old, new].into_iter().flatten() {
+            for (direction, key, _) in graph::adjacency_entries(&def, doc)? {
+                match direction {
+                    GraphDirection::Out => {
+                        out.delete(&mut *wtxn, key.as_slice())?;
+                    }
+                    GraphDirection::In => {
+                        incoming.delete(&mut *wtxn, key.as_slice())?;
+                    }
+                    GraphDirection::Both => unreachable!(),
+                }
+            }
+        }
+        if let Some(doc) = new {
+            for (direction, key, value) in graph::adjacency_entries(&def, doc)? {
+                match direction {
+                    GraphDirection::Out => out.put(&mut *wtxn, key.as_slice(), value.as_slice())?,
+                    GraphDirection::In => {
+                        incoming.put(&mut *wtxn, key.as_slice(), value.as_slice())?
+                    }
+                    GraphDirection::Both => unreachable!(),
+                }
+            }
+        }
+        Ok(())
     }
 
     // ----------------------------- vault -----------------------------
@@ -5510,6 +5828,7 @@ impl<'e> Collection<'e> {
         self.db.delete(&mut *wtxn, id.as_bytes())?;
         if !self.profile.is_vault() {
             self.apply_index_entries(wtxn, Some(&old), None, id)?;
+            self.apply_graph_entries(wtxn, Some(&old), None)?;
             self.apply_text_entries(wtxn, Some(&old), None, id)?;
             self.apply_fuzzy_entries(wtxn, Some(&old), None, id)?;
             self.apply_vector_entries(wtxn, Some(&old), None, id)?;
@@ -8903,6 +9222,125 @@ impl<'e> Collection<'e> {
             self.env,
             true,
         ))
+    }
+}
+
+struct GraphViewImpl<'a, 't> {
+    txn: &'a RoTxn<'t>,
+    node: Collection<'a>,
+    def: GraphDef,
+    out: Option<Database<Bytes, Bytes>>,
+    incoming: Option<Database<Bytes, Bytes>>,
+}
+
+impl<'a, 't> GraphViewImpl<'a, 't> {
+    fn new(store: &'a crate::store::Store, txn: &'a RoTxn<'t>, def: GraphDef) -> Result<Self> {
+        let node = store
+            .collection_at(txn, &def.node_collection)?
+            .ok_or_else(|| {
+                Error::Query(format!(
+                    "graph node collection `{}` does not exist",
+                    def.node_collection
+                ))
+            })?;
+        let edge = store
+            .collection_at(txn, &def.edge_collection)?
+            .ok_or_else(|| {
+                Error::Query(format!(
+                    "graph edge collection `{}` does not exist",
+                    def.edge_collection
+                ))
+            })?;
+        let out = edge.graph_adjacency_db(txn, GraphDirection::Out)?;
+        let incoming = edge.graph_adjacency_db(txn, GraphDirection::In)?;
+        Ok(Self {
+            txn,
+            node,
+            def,
+            out,
+            incoming,
+        })
+    }
+
+    fn scan(
+        &self,
+        db: Option<Database<Bytes, Bytes>>,
+        node: &str,
+        label: Option<&str>,
+        seen: &mut HashSet<String>,
+        out: &mut Vec<AdjEdge>,
+    ) -> Result<()> {
+        let Some(db) = db else {
+            return Ok(());
+        };
+        let prefix = match label {
+            Some(label) => graph::label_prefix(node, label),
+            None => graph::node_prefix(node),
+        };
+        for item in db.prefix_iter(self.txn, prefix.as_slice())? {
+            let (key, raw) = item?;
+            let Some((_node, edge_label, target, edge_id)) = graph::decode_adjacency_key(key)
+            else {
+                continue;
+            };
+            if !seen.insert(edge_id.to_string()) {
+                continue;
+            }
+            let edge: Value = serde_json::from_slice(raw)?;
+            let weight = graph::edge_parts(&self.def, &edge)?.weight;
+            out.push(AdjEdge {
+                edge_id: edge_id.to_string(),
+                label: edge_label.to_string(),
+                weight,
+                target: target.to_string(),
+                edge,
+            });
+        }
+        Ok(())
+    }
+}
+
+impl GraphView for GraphViewImpl<'_, '_> {
+    fn node(&self, id: &str) -> Result<Option<Value>> {
+        self.node
+            .db
+            .get(self.txn, id.as_bytes())?
+            .map(parse_json)
+            .transpose()
+    }
+
+    fn neighbors(
+        &self,
+        id: &str,
+        direction: GraphDirection,
+        labels: &[String],
+    ) -> Result<Vec<AdjEdge>> {
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        let directions: &[GraphDirection] = if !self.def.directed {
+            &[GraphDirection::Out, GraphDirection::In]
+        } else {
+            match direction {
+                GraphDirection::Out => &[GraphDirection::Out],
+                GraphDirection::In => &[GraphDirection::In],
+                GraphDirection::Both => &[GraphDirection::Out, GraphDirection::In],
+            }
+        };
+        for current in directions {
+            let db = match current {
+                GraphDirection::Out => self.out,
+                GraphDirection::In => self.incoming,
+                GraphDirection::Both => unreachable!(),
+            };
+            if labels.is_empty() {
+                self.scan(db, id, None, &mut seen, &mut out)?;
+            } else {
+                for label in labels {
+                    self.scan(db, id, Some(label), &mut seen, &mut out)?;
+                }
+            }
+        }
+        Ok(out)
     }
 }
 

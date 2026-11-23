@@ -64,6 +64,25 @@ Use the client-specific `create_vector_index` / `vector_search` helpers; see
 [Vector search](../docs/clients.md#vector-search) for examples in Python, Rust,
 Node.js, and Go.
 
+## Graph
+
+```python
+nodes = db.collection("nodes")
+nodes.set_graph("edges")
+tree = nodes.traverse("alice", direction="out", max_depth=2)
+flat = nodes.traverse("alice", max_depth=1, tree=False)["items"]
+seed = nodes.traverse(
+    seed={"vector": {"field": "embedding", "vector": [0.1, 0.9, 0.0], "k": 5}},
+    max_depth=2,
+)
+path = nodes.shortest_path("alice", "carol", weighted=True)
+nodes.reindex_graph()
+nodes.drop_graph()
+```
+
+The result contains `nodes`, `edges`, `truncated`, and `missing`; repeated
+arrivals are marked with `cycle`. See [Graph traversal](../docs/graph.md).
+
 ## Document history
 
 Enable history per collection with `set_collection_history(coll, max_versions)`. All clients expose

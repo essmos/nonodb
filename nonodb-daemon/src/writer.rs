@@ -1880,6 +1880,29 @@ fn execute(
             }
             Ok(json!({ "dropped": existed, "kind": "vector" }))
         }
+        WriteReq::SetGraph { coll, def } => {
+            let c = standard_collection(store, wtxn, coll)?;
+            let out = def.clone();
+            c.set_graph_txn(wtxn, def)?;
+            replication.capture_op(ReplicationOp::GraphSet {
+                coll: coll.clone(),
+                def: out.clone(),
+            });
+            Ok(json!({ "graph": out }))
+        }
+        WriteReq::DropGraph { coll } => {
+            let c = standard_collection(store, wtxn, coll)?;
+            let dropped = c.drop_graph_txn(wtxn)?;
+            if dropped {
+                replication.capture_op(ReplicationOp::GraphDrop { coll: coll.clone() });
+            }
+            Ok(json!({ "dropped": dropped, "collection": coll }))
+        }
+        WriteReq::ReindexGraph { coll } => {
+            let c = standard_collection(store, wtxn, coll)?;
+            let edges = c.reindex_graph_txn(wtxn)?;
+            Ok(json!({ "reindexed": coll, "edges": edges }))
+        }
         WriteReq::Sql { query, params } => {
             let prepared = nonodb_core::sql::PreparedSql::parse(query)?;
             if prepared.is_read_only() {
