@@ -58,6 +58,9 @@ pub enum Error {
     #[error("invalid timestamp: {0}")]
     InvalidTimestamp(String),
 
+    #[error("invalid regex: {0}")]
+    InvalidRegex(String),
+
     /// Vault/encryption error with a stable API code.
     #[error("{message}")]
     Vault { code: &'static str, message: String },

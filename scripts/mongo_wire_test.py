@@ -13,6 +13,7 @@ import uuid
 from urllib.parse import quote
 
 from bson import Int64, ObjectId
+from bson.regex import Regex
 from pymongo import MongoClient, ReturnDocument
 from pymongo.errors import BulkWriteError, OperationFailure
 from pymongo.read_concern import ReadConcern
@@ -195,17 +196,26 @@ def main() -> int:
             for item in db.list_collections(filter={"name": re.compile("^regex_smoke_")})
         ] == [regex_coll.name]
 
+        # BSON regex values are storable data. A direct regex literal remains a
+        # string predicate; $eq compares the stored pattern.
+        regex_coll.insert_one({"_id": "stored", "name": re.compile("^a", re.I)})
+        stored = regex_coll.find_one({"_id": "stored"})["name"]
+        assert isinstance(stored, Regex), stored
+        assert stored.pattern == "^a" and stored.flags & re.I, stored
+        assert regex_coll.find_one(
+            {"name": {"$eq": re.compile("^a", re.I)}}
+        )["_id"] == "stored"
+        assert [doc["_id"] for doc in regex_coll.find({"name": {"$type": "regex"}})] == [
+            "stored"
+        ]
+        regex_coll.update_one(
+            {"_id": "stored"}, {"$set": {"name": re.compile("^b", re.M)}}
+        )
+        updated_regex = regex_coll.find_one({"_id": "stored"})["name"]
+        assert updated_regex.pattern == "^b" and updated_regex.flags & re.M, updated_regex
+        assert regex_coll.find_one({"name": {"$regex": "^b"}}) is None
+
         for label, operation in [
-            (
-                "BSON regex insert",
-                lambda: regex_coll.insert_one({"name": re.compile("^a")}),
-            ),
-            (
-                "BSON regex update",
-                lambda: regex_coll.update_one(
-                    {"name": "abc"}, {"$set": {"name": re.compile("^a")}}
-                ),
-            ),
             ("collation", lambda: list(coll.find({}, collation={"locale": "en"}))),
             (
                 "bypassDocumentValidation",

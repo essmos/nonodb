@@ -1272,6 +1272,7 @@ impl From<nonodb_core::Error> for ApiError {
             E::InvalidBinary(_) => "invalid_binary",
             E::InvalidObjectId(_) => "invalid_object_id",
             E::InvalidTimestamp(_) => "invalid_timestamp",
+            E::InvalidRegex(_) => "invalid_regex",
             E::Json(_) | E::JsonFast(_) => "invalid_json",
             E::Lmdb(_) => "storage",
             E::Io(_) => "io",

@@ -3480,6 +3480,8 @@ collection, op, id, and before/after documents. Replicas reject stale epochs. Re
 | `invalid_numeric` | 400 | Invalid Extended JSON number or decimal arithmetic overflow |
 | `invalid_binary` | 400 | Invalid `$binary`/`$uuid` payload or base64 |
 | `invalid_object_id` | 400 | `$oid` is not 24 hexadecimal characters |
+| `invalid_timestamp` | 400 | `$timestamp` does not contain valid u32 `t` and `i` fields |
+| `invalid_regex` | 400 | `$regularExpression` is malformed or has unsupported options |
 | `invalid_auth_request` | 400/409 | Invalid auth mutation, referenced principal, or last-admin protection |
 | `auth_disabled` | 400 | Authorization registry is not configured |
 | `unauthorized` | 401 | Missing/invalid/disabled credential |

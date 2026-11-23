@@ -169,7 +169,7 @@ python3 scripts/write_batch_test.py          # atomic commit/rollback
 python3 scripts/upsert_test.py               # upsert and array operators
 python3 scripts/dates_test.py                # Extended JSON dates, ranges, indexes
 python3 scripts/numerics_test.py             # exact numbers, decimal arithmetic/indexes
-python3 scripts/bson_types_test.py           # numberInt/Long, $type, binary/UUID, ObjectId
+python3 scripts/bson_types_test.py           # numberInt/Long, $type, binary/UUID, ObjectId, regex
 python3 scripts/regex_test.py                # $regex/$options, arrays, errors
 python3 scripts/arrays_test.py               # $all, $size, $elemMatch, validation
 python3 scripts/array_updates_test.py        # positional/array-filter updates
@@ -302,7 +302,7 @@ scripts are:
 | `scripts/sql_bench.py` | End-to-end SQL latency for counts, grouping, DISTINCT aggregates, indexed equality, and filtered aggregates |
 | `scripts/dates_test.py` | Date offsets, ranges, indexes, sorting, unique constraints |
 | `scripts/numerics_test.py` | Large integers, Decimal128, special doubles, arithmetic, indexes |
-| `scripts/bson_types_test.py` | `$numberInt`/`$numberLong`, `$type`, binary/UUID, ObjectId |
+| `scripts/bson_types_test.py` | `$numberInt`/`$numberLong`, `$type`, binary/UUID, ObjectId, stored regex |
 | `scripts/regex_test.py` | `$regex`/`$options`, arrays, invalid patterns, index prefixes |
 | `scripts/arrays_test.py` | `$all`, `$size`, `$elemMatch`, validation, index/aggregation/search |
 | `scripts/array_updates_test.py` | positional `$`, `$[]`, `arrayFilters`, push modifiers, `$pull` |

@@ -3236,9 +3236,8 @@ fn values_to_bson(values: Vec<Value>) -> Result<Vec<Bson>, ApiError> {
 }
 
 /// MongoDB drivers send a regex literal as a BSON regular-expression value.
-/// NonoDB supports those values as read predicates, but does not store them, so
-/// reject them explicitly in documents, updates, projections, and non-filter
-/// aggregation positions.
+/// These values are stored as data; projections and non-filter aggregation
+/// positions cannot interpret them, so reject them explicitly there.
 fn is_bson_regex(value: &Value) -> bool {
     value.as_object().is_some_and(|object| {
         object.len() == 1
@@ -3248,21 +3247,21 @@ fn is_bson_regex(value: &Value) -> bool {
     })
 }
 
-fn reject_stored_bson_regex(value: &Value) -> Result<(), ApiError> {
+fn reject_projection_bson_regex(value: &Value) -> Result<(), ApiError> {
     if is_bson_regex(value) {
         return Err(bad_value(
-            "stored BSON regular-expression values are not supported; use the $regex operator",
+            "regular-expression values are not valid in a projection; use $regex in a filter",
         ));
     }
     match value {
         Value::Array(items) => {
             for item in items {
-                reject_stored_bson_regex(item)?;
+                reject_projection_bson_regex(item)?;
             }
         }
         Value::Object(object) => {
             for item in object.values() {
-                reject_stored_bson_regex(item)?;
+                reject_projection_bson_regex(item)?;
             }
         }
         _ => {}
@@ -3273,7 +3272,7 @@ fn reject_stored_bson_regex(value: &Value) -> Result<(), ApiError> {
 fn reject_aggregate_stored_regex(value: &Value) -> Result<(), ApiError> {
     if is_bson_regex(value) {
         return Err(bad_value(
-            "stored BSON regular-expression values are not supported; use the $regex operator",
+            "regular-expression values are not supported in this aggregation position; use $regex inside $match",
         ));
     }
     match value {
@@ -3302,36 +3301,14 @@ fn command_field(body: &Document, key: &str) -> Result<Option<Value>, ApiError> 
 
 fn validate_mongo_bson_values(command: &str, body: &Document) -> Result<(), ApiError> {
     match command {
-        "insert" => {
-            if let Some(Value::Array(documents)) = command_field(body, "documents")? {
-                for document in &documents {
-                    reject_stored_bson_regex(document)?;
-                }
-            }
-        }
-        "update" => {
-            if let Some(Value::Array(updates)) = command_field(body, "updates")? {
-                for update in &updates {
-                    let Some(spec) = update.as_object() else {
-                        continue;
-                    };
-                    if let Some(update) = spec.get("u") {
-                        reject_stored_bson_regex(update)?;
-                    }
-                }
-            }
-        }
         "find" => {
             if let Some(projection) = command_field(body, "projection")? {
-                reject_stored_bson_regex(&projection)?;
+                reject_projection_bson_regex(&projection)?;
             }
         }
         "findAndModify" | "findandmodify" => {
-            if let Some(update) = command_field(body, "update")? {
-                reject_stored_bson_regex(&update)?;
-            }
             if let Some(fields) = command_field(body, "fields")? {
-                reject_stored_bson_regex(&fields)?;
+                reject_projection_bson_regex(&fields)?;
             }
         }
         "aggregate" => {

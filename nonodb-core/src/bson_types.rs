@@ -6,7 +6,8 @@
 //!   and `{"$uuid": "..."}`,
 //! - ObjectId: `{"$oid": "..."}`,
 //! - Timestamp: `{"$timestamp": {"t": 0, "i": 0}}`,
-//! - MinKey / MaxKey: `{"$minKey": 1}` and `{"$maxKey": 1}`.
+//! - MinKey / MaxKey: `{"$minKey": 1}` and `{"$maxKey": 1}`,
+//! - regular expressions: `{"$regularExpression": {"pattern": "...", "options": "..."}}`.
 //!
 //! Canonical storage uses these Extended JSON forms. `$type` query matching,
 //! comparisons, and index ordering are implemented alongside these values.
@@ -26,6 +27,7 @@ pub const OBJECT_ID_KEY: &str = "$oid";
 pub const TIMESTAMP_KEY: &str = "$timestamp";
 pub const MIN_KEY: &str = "$minKey";
 pub const MAX_KEY: &str = "$maxKey";
+pub const REGEX_KEY: &str = "$regularExpression";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Binary {
@@ -40,6 +42,58 @@ pub struct ObjectId(pub [u8; 12]);
 pub struct Timestamp {
     pub time: u32,
     pub increment: u32,
+}
+
+/// A stored BSON regular-expression value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BsonRegex {
+    pub pattern: String,
+    pub options: String,
+}
+
+/// Parses a canonical BSON regular-expression value.
+pub fn parse_regex(value: &Value) -> Option<BsonRegex> {
+    let obj = value.as_object()?;
+    if obj.len() != 1 {
+        return None;
+    }
+    let payload = obj.get(REGEX_KEY)?.as_object()?;
+    let pattern = payload.get("pattern")?.as_str()?;
+    if payload
+        .keys()
+        .any(|key| key != "pattern" && key != "options")
+    {
+        return None;
+    }
+    let options = match payload.get("options") {
+        Some(Value::String(options)) => options.as_str(),
+        Some(_) => return None,
+        None => "",
+    };
+    Some(BsonRegex {
+        pattern: pattern.to_string(),
+        options: options.to_string(),
+    })
+}
+
+pub fn is_regex(value: &Value) -> bool {
+    parse_regex(value).is_some()
+}
+
+pub fn regex_value(pattern: &str, options: &str) -> Value {
+    json!({ REGEX_KEY: { "pattern": pattern, "options": options } })
+}
+
+fn validate_regex_options(options: &str) -> Result<()> {
+    if let Some(ch) = options
+        .chars()
+        .find(|ch| !matches!(ch, 'i' | 'm' | 's' | 'x' | 'u'))
+    {
+        return Err(Error::InvalidRegex(format!(
+            "unsupported regular-expression option `{ch}` (allowed: i, m, s, x, u)"
+        )));
+    }
+    Ok(())
 }
 
 /// Parses canonical `$binary` or shorthand `$uuid`.
@@ -191,6 +245,12 @@ pub fn eq_values(a: &Value, b: &Value) -> Option<bool> {
     if is_max_key(a) || is_max_key(b) {
         return Some(is_max_key(a) && is_max_key(b));
     }
+    if let (Some(x), Some(y)) = (parse_regex(a), parse_regex(b)) {
+        return Some(x == y);
+    }
+    if is_regex(a) || is_regex(b) {
+        return Some(false);
+    }
     if is_bson_value(a) || is_bson_value(b) {
         return Some(false);
     }
@@ -218,6 +278,13 @@ pub fn cmp_values(a: &Value, b: &Value) -> Option<Ordering> {
     }
     if let (Some(x), Some(y)) = (parse_timestamp(a), parse_timestamp(b)) {
         return Some((x.time, x.increment).cmp(&(y.time, y.increment)));
+    }
+    if let (Some(x), Some(y)) = (parse_regex(a), parse_regex(b)) {
+        return Some(
+            x.pattern
+                .cmp(&y.pattern)
+                .then_with(|| x.options.cmp(&y.options)),
+        );
     }
     None
 }
@@ -249,6 +316,21 @@ pub fn timestamp_key(value: &Value) -> Option<[u8; 8]> {
 /// Canonicalizes binary/ObjectId Extended JSON values in a document tree.
 pub fn normalize_value(value: &mut Value) -> Result<()> {
     if let Some(obj) = value.as_object() {
+        if obj.len() == 1 && obj.contains_key(REGEX_KEY) {
+            let parsed = parse_regex(value).ok_or_else(|| {
+                Error::InvalidRegex(
+                    "`$regularExpression` requires string `pattern` and `options` fields".into(),
+                )
+            })?;
+            if parsed.pattern.contains('\0') || parsed.options.contains('\0') {
+                return Err(Error::InvalidRegex(
+                    "regular-expression pattern and options cannot contain NUL bytes".into(),
+                ));
+            }
+            validate_regex_options(&parsed.options)?;
+            *value = regex_value(&parsed.pattern, &parsed.options);
+            return Ok(());
+        }
         if obj.len() == 1 && (obj.contains_key(BINARY_KEY) || obj.contains_key(UUID_KEY)) {
             let parsed = parse_binary(value).ok_or_else(|| {
                 Error::InvalidBinary(
@@ -330,6 +412,9 @@ pub fn type_name(value: &Value) -> Option<&'static str> {
     if is_max_key(value) {
         return Some("maxKey");
     }
+    if is_regex(value) {
+        return Some("regex");
+    }
     match value {
         Value::Null => Some("null"),
         Value::Bool(_) => Some("bool"),
@@ -381,6 +466,7 @@ fn direct_type_matches(value: &Value, spec: &Value) -> bool {
         16 => "int",
         17 => "timestamp",
         18 => "long",
+        11 => "regex",
         19 => "decimal",
         -1 => "minKey",
         127 => "maxKey",

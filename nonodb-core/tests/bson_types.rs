@@ -350,3 +350,91 @@ fn search_indexes_extended_numbers_and_skips_non_text_types() {
     assert_eq!(ids(&hits), vec!["long"]);
     assert_eq!(hits[0]["_distance"], 1);
 }
+
+#[test]
+fn stored_regex_values_roundtrip_type_and_equality() {
+    let (_dir, store) = store();
+    let c = store.collection("patterns").unwrap();
+    c.insert_one(json!({
+        "_id": "ci",
+        "pattern": {"$regularExpression": {"pattern": "^ada$", "options": "i"}}
+    }))
+    .unwrap();
+    c.insert_one(json!({
+        "_id": "cs",
+        "pattern": {"$regularExpression": {"pattern": "^ada$", "options": ""}}
+    }))
+    .unwrap();
+    c.insert_one(json!({"_id": "text", "pattern": "ada"}))
+        .unwrap();
+
+    let docs = find(&c, json!({"_id": "ci"}));
+    assert_eq!(
+        docs[0]["pattern"],
+        json!({"$regularExpression": {"pattern": "^ada$", "options": "i"}})
+    );
+    assert_eq!(
+        ids(&find(&c, json!({"pattern": {"$type": "regex"}}))),
+        vec!["ci", "cs"]
+    );
+    assert_eq!(
+        ids(&find(&c, json!({"pattern": {"$type": 11}}))),
+        vec!["ci", "cs"]
+    );
+    assert_eq!(
+        ids(&find(
+            &c,
+            json!({"pattern": {"$eq": {"$regularExpression": {"pattern": "^ada$", "options": "i"}}}})
+        )),
+        vec!["ci"]
+    );
+    // A direct regex literal remains a string predicate, not stored-value
+    // equality.
+    assert_eq!(
+        ids(&find(&c, json!({"pattern": {"$regex": "^ada$"}}))),
+        vec!["text"]
+    );
+
+    c.update(
+        &json!({"_id": "text"}),
+        &json!({"$set": {"pattern": {"$regularExpression": {"pattern": "^x", "options": "m"}}}}),
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        find(&c, json!({"_id": "text"}))[0]["pattern"],
+        json!({"$regularExpression": {"pattern": "^x", "options": "m"}})
+    );
+
+    // Regex values are not entered into secondary indexes. Indexed and
+    // unindexed access paths must return the same documents.
+    c.create_index("pattern", false).unwrap();
+    assert_eq!(
+        ids(&find(&c, json!({"pattern": {"$type": "regex"}}))),
+        vec!["ci", "cs", "text"]
+    );
+    assert!(find(&c, json!({"pattern": {"$regex": "^ada$"}})).is_empty());
+    let explained = c
+        .explain(&FindQuery {
+            filter: json!({"pattern": {"$type": "regex"}}),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(explained["access_path"], "collection_scan");
+    assert_eq!(explained["index_used"], false);
+
+    let err = c
+        .insert_one(json!({
+            "_id": "bad",
+            "pattern": {"$regularExpression": {"pattern": "x", "options": "q"}}
+        }))
+        .unwrap_err();
+    assert!(matches!(err, nonodb_core::Error::InvalidRegex(_)));
+    let err = c
+        .insert_one(json!({
+            "_id": "bad2",
+            "pattern": {"$regularExpression": {"pattern": 1, "options": ""}}
+        }))
+        .unwrap_err();
+    assert!(matches!(err, nonodb_core::Error::InvalidRegex(_)));
+}

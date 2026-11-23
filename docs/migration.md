@@ -98,7 +98,7 @@ documents. Documents with a missing or non-date TTL field never expire.
 | `_id` type | string or ObjectId |
 | Atomicity | Per `insert_many` request; not across collections |
 | Vault collections | Not supported by the generic importer |
-| Unsupported BSON | regex values, Code, Symbol, DBPointer |
+| Unsupported BSON | Code, Symbol, DBPointer |
 
 The importer defaults to 500 documents or 3,000,000 encoded bytes per request,
 whichever comes first. Lower `--batch-size` if individual documents are large.

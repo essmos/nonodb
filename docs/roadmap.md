@@ -140,9 +140,10 @@ comparison and practical migration caveats.
   maps it, and MongoDB wire `$text` computes `textScore` with BM25.
 - `$regex` supports `i`, `m`, `s`, `x`, and `u` options, but not MongoDB's
   PCRE-only constructs; patterns use Rust's non-backtracking regex engine.
-- `$in`, `$nin`, `$all`, and `$elemMatch` accept `{"$regex": ...}` operands, but
-  stored BSON regex values are not implemented. Multikey indexes serve array
-  equality, `$all`, ranges, and simple `$elemMatch`; `$size` is not index-backed.
+- `$in`, `$nin`, `$all`, and `$elemMatch` accept `{"$regex": ...}` operands.
+  Stored BSON regex values support exact `$eq` and `$type`, but are not indexed.
+  Multikey indexes serve array equality, `$all`, ranges, and simple `$elemMatch`;
+  `$size` is not index-backed.
 - No joins. `lookup` is a point/batch lookup, not a general join, and requires a
   matching unique index for non-`_id` keys. Non-unique lookups are not supported.
 - SQL covers one collection. Joins, subqueries, scalar expressions in grouped
@@ -166,8 +167,7 @@ comparison and practical migration caveats.
   exponent range return `invalid_numeric`.
 - Long text has no dedicated type; the 1 MiB document limit applies to strings.
 - ObjectId is supported as both a field value and `_id`.
-- BSON regular-expression values and legacy
-  code/symbol types are not implemented.
+- Legacy code/symbol BSON types are not implemented.
 
 ### Updates
 
@@ -308,8 +308,6 @@ The current implementation plan is limited to this list.
 ### P1 — low effort, worthwhile
 
 - Publish `nonodb-client` to PyPI using the prepared manual workflow.
-- Store BSON regex values with matching `$type` entries and documented index
-  behavior.
 
 ## Non-goals
 

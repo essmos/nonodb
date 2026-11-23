@@ -30,10 +30,7 @@ fn cache() -> &'static Mutex<Cache> {
 /// Returns whether a value is a BSON regular-expression value represented as
 /// Extended JSON.
 pub fn is_value(value: &Value) -> bool {
-    value
-        .as_object()
-        .and_then(|object| object.get("$regularExpression"))
-        .is_some_and(Value::is_object)
+    bson_types::is_regex(value)
 }
 
 /// Parses a regex argument and optional `$options`.
@@ -43,21 +40,11 @@ pub fn is_value(value: &Value) -> bool {
 pub fn parse_argument(arg: &Value, options: Option<&Value>) -> Result<(String, String)> {
     let (pattern, inline_options) = match arg {
         Value::String(s) => (s.clone(), String::new()),
-        Value::Object(obj) => {
-            let re = obj
-                .get("$regularExpression")
-                .and_then(Value::as_object)
-                .ok_or_else(|| {
-                    Error::Query("$regex must be a string or $regularExpression object".into())
-                })?;
-            let pattern = re.get("pattern").and_then(Value::as_str).ok_or_else(|| {
-                Error::Query("$regularExpression.pattern must be a string".into())
+        Value::Object(_) => {
+            let re = bson_types::parse_regex(arg).ok_or_else(|| {
+                Error::Query("$regex must be a string or $regularExpression object".into())
             })?;
-            let options = re
-                .get("options")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            (pattern.to_string(), options.to_string())
+            (re.pattern, re.options)
         }
         _ => return Err(Error::Query("$regex must be a string".into())),
     };

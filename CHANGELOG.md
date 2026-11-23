@@ -4,6 +4,11 @@ Full release notes: https://github.com/essmos/nonodb/releases
 
 ## Unreleased
 
+- Store BSON regular-expression values (`$regularExpression`) as document data.
+  They round-trip through the MongoDB wire listener, support `$type: "regex"`
+  and exact `$eq` matching, and are deliberately excluded from secondary
+  indexes. Malformed values return `invalid_regex`.
+
 - Add client-side `lookup_join` helpers to the Python, Node.js, Rust, and Go
   clients. They attach matching foreign documents through chunked `lookup`,
   preserve local order and length, and align missing keys with null. See

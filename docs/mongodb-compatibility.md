@@ -28,7 +28,7 @@ release notes identify the exact tested tag.
 | Area | Approximate practical coverage | Main caveat |
 |---|---:|---|
 | CRUD and find semantics | ~90% | No MongoDB sessions, retryable writes, or multi-document transactions |
-| Query filters | ~82% | No `$where` or collation; `$text` is a documented lexical subset; BSON regex values work as read filters but cannot be stored |
+| Query filters | ~82% | No `$where` or collation; `$text` is a documented lexical subset; BSON regex values work as read filters and stored data |
 | Projection | ~75% | `$meta` is approximate; no arbitrary computed projection expressions |
 | Updates | ~85% | Pipeline updates support a subset of stages |
 | Aggregation stages | ~70% | Many common stages work; system, search, geoNear, and change-stream stages are absent |
@@ -358,7 +358,7 @@ allowed. Other BSON types are not accepted as `_id`.
 | `$comment` as a filter operator | ❌ | `comment` is available as a query option |
 | `$rand` | ❌ | |
 | Collation | ❌ | No per-query or per-index collation |
-| BSON regex value filters | ✅ | Direct driver regex literals and `$in` operands; stored regex values are rejected with `BadValue` (code 2) |
+| BSON regex values | ✅ | Direct literals and `$in` operands match strings; stored values round-trip, support `$type: "regex"` and exact `$eq`; not indexed |
 
 Operators outside the tables above are rejected with `BadValue` (code 2) instead
 of matching nothing, so a filter typo such as `{"email": {"$regx": "..."}}` fails
@@ -522,7 +522,7 @@ per-index/per-query collation remain unsupported.
 | ObjectId `_id` | ✅ | Accepted from drivers and stored without converting to a string |
 | Timestamp | ✅ | Extended JSON `$timestamp`; indexed and `$type`-aware |
 | MinKey / MaxKey | ✅ | Sentinel values with BSON ordering and `$type` support |
-| Regular-expression value | 🟡 | Read filters accept BSON regex values; storing a regex value is rejected with `BadValue` (code 2) |
+| Regular-expression value | ✅ | Stored, returned, `$type`/`$eq`, migration; direct literals remain string predicates; not indexed |
 | Code / CodeWithScope / Symbol | ❌ | |
 | DBPointer / Undefined | ❌ | |
 
@@ -558,7 +558,7 @@ A migration from MongoDB to NonoDB should check these items first:
    filter explicit so the planner can use a partial index.
    `expireAfterSeconds` maps to date-field TTL: documents expire at the indexed
    date plus the configured seconds, and existing documents are backfilled.
-8. **Stored BSON regex values** — read filters accept driver regex literals, but regex values cannot be stored; keep them out of documents or rewrite them as strings plus `$regex` filters.
+8. **Stored BSON regex values** — stored and returned with `$type: "regex"`; use `$eq` to compare stored patterns, while direct literals remain string predicates. They are not indexed, so queries that target them scan.
 9. **Unsupported aggregation expressions/stages and filter operators** — rewrite
    with supported forms or precompute outside the database. Unknown operators are
    rejected when the query is validated, so a typo fails instead of returning no

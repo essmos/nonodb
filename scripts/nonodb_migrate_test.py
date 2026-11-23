@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -55,6 +56,7 @@ def main() -> int:
                     "created_at": datetime(2024, 1, 1, tzinfo=timezone.utc),
                     "dec": Decimal128("1.50"),
                     "bin": Binary(b"\x00\x01"),
+                    "pattern": re.compile("^a", re.I),
                     "tags": ["a", "b"],
                 },
                 {
@@ -142,6 +144,9 @@ def main() -> int:
             )
             assert restored["dec"] == {"$numberDecimal": "1.50"}, restored
             assert restored["created_at"]["$date"]["$numberLong"] == "1704067200000", restored
+            assert restored["pattern"] == {
+                "$regularExpression": {"pattern": "^a", "options": "i"}
+            }, restored
             try:
                 target.collection("users").insert(
                     {"_id": "duplicate", "email": "a@example.test"}

@@ -205,6 +205,11 @@ pub fn encode_value(v: &Value) -> Option<Vec<u8>> {
         out.push(0x09);
         return Some(out);
     }
+    if bson_types::is_regex(v) {
+        // Stored regex values are intentionally not indexed; queries that
+        // target them fall back to a collection scan.
+        return None;
+    }
     match v {
         Value::Null => out.push(0x01),
         Value::Number(_) => {
