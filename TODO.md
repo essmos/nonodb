@@ -6,7 +6,6 @@ deliberate limitations are documented in [docs/roadmap.md](docs/roadmap.md).
 
 ## P2 — GUI and operator experience
 
-- [ ] Accessibility audit and expanded keyboard navigation.
 - [ ] Export/import of saved views and filters without credentials.
 
 ## P2 — clients

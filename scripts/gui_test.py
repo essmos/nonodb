@@ -102,6 +102,9 @@ def main() -> int:
             assert match, index[:500]
             asset = fetch(base + match.group(1))
             assert len(asset) > 1000
+            style_match = re.search(r'href="([^"]+\.css)"', index)
+            assert style_match, index[:500]
+            styles = fetch(base + style_match.group(1)).decode()
             for marker in (
                 b"Save & run now",
                 b"Select one or more databases",
@@ -151,8 +154,23 @@ def main() -> int:
                 b"New connection",
                 b"nonodb.gui.sessions",
                 b"session-bar",
+                b"Skip to main content",
+                b"Console navigation",
+                b"Collection views",
+                b"Eventing views",
+                b"Close dialog",
+                b"Search commands or collections",
+                b"aria-current",
+                b"aria-modal",
+                b"tablist",
             ):
                 assert marker in asset, marker
+            for marker in (
+                ":focus-visible",
+                ".skip-link",
+                "prefers-reduced-motion",
+            ):
+                assert marker in styles, marker
 
             result = json.loads(fetch(base + "/v1/exec", data={"op": "list_collections"}))
             assert result["ok"] is True, result

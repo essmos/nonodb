@@ -298,8 +298,8 @@ project's target workload.
    show restore instructions without direct filesystem access.
 2. **Import progress and large result sets.** Cancellable/resumable imports and
    virtualized large result sets.
-3. **Accessibility and theming.** Keyboard navigation, screen-reader labels, and
-   an optional light theme.
+3. **Deeper accessibility testing and density.** Screen-reader passes on real
+   assistive technology and an optional compact layout.
 
 ### High value
 

@@ -1,10 +1,11 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode } from 'react';
 import CodeMirror from '@uiw/react-codemirror';
 import { json as jsonLanguage } from '@codemirror/lang-json';
 import { sql as sqlLanguage } from '@codemirror/lang-sql';
 import { oneDark } from '@codemirror/theme-one-dark';
 import { autocompletion, type CompletionContext } from '@codemirror/autocomplete';
 import QueryBuilder from './QueryBuilder';
+import { handleTabKey } from './accessibility';
 import EventingPage from './EventingPage';
 import {
   applyFirewall,
@@ -232,15 +233,72 @@ function Modal({
   children: ReactNode;
   wide?: boolean;
 }) {
+  const titleId = useId();
+  const subtitleId = useId();
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    if (!dialog) return;
+    const previous = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const focusable = () =>
+      Array.from(
+        dialog.querySelectorAll<HTMLElement>(
+          'a[href], button:not([disabled]), textarea:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])',
+        ),
+      ).filter((element) => element.getClientRects().length > 0);
+    if (!dialog.contains(document.activeElement)) {
+      (focusable()[0] ?? dialog).focus();
+    }
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        onCloseRef.current();
+        return;
+      }
+      if (event.key !== 'Tab') return;
+      const items = focusable();
+      if (items.length === 0) {
+        event.preventDefault();
+        dialog.focus();
+        return;
+      }
+      const first = items[0];
+      const last = items[items.length - 1];
+      if (event.shiftKey && (document.activeElement === first || !dialog.contains(document.activeElement))) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('keydown', onKey);
+      if (previous?.isConnected) previous.focus();
+    };
+  }, []);
+
   return (
     <div className="modal-backdrop" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
-      <div className={`modal${wide ? ' wide-modal' : ''}`} role="dialog" aria-modal="true">
+      <div
+        ref={dialogRef}
+        className={`modal${wide ? ' wide-modal' : ''}`}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        aria-describedby={subtitle ? subtitleId : undefined}
+        tabIndex={-1}
+      >
         <div className="modal-header">
           <div>
-            <h3>{title}</h3>
-            {subtitle && <p className="muted small">{subtitle}</p>}
+            <h3 id={titleId}>{title}</h3>
+            {subtitle && <p id={subtitleId} className="muted small">{subtitle}</p>}
           </div>
-          <button className="icon-button" onClick={onClose} aria-label="Close">
+          <button className="icon-button" onClick={onClose} aria-label="Close dialog">
             ✕
           </button>
         </div>
@@ -363,7 +421,7 @@ function ConnectView({
         <button className="primary wide" onClick={connect} disabled={busy}>
           {busy ? 'Connecting…' : 'Connect'}
         </button>
-        {error && <div className="error-box">{error}</div>}
+        {error && <div className="error-box" role="alert">{error}</div>}
         {onCancel && (
           <button className="link-button" onClick={onCancel} disabled={busy}>
             Back to the active connection
@@ -519,7 +577,7 @@ function DatabaseMetrics({ connection }: { connection: Connection }) {
 
   return (
     <>
-      {error && <div className="error-box">{error}</div>}
+      {error && <div className="error-box" role="alert">{error}</div>}
       <section className="panel">
         <div className="panel-title">
           <h3>Database metrics</h3>
@@ -1035,8 +1093,8 @@ function BackupsPage({ connection }: { connection: Connection }) {
           <button onClick={() => void load()} disabled={loading}>{loading ? 'Loading…' : 'Refresh'}</button>
         </div>
       </header>
-      {error && <div className="error-box">{error}</div>}
-      {notice && <div className="notice-box">{notice}</div>}
+      {error && <div className="error-box" role="alert">{error}</div>}
+      {notice && <div className="notice-box" role="status">{notice}</div>}
       <section className={`panel disclaimer-box${disclaimerAccepted ? ' accepted' : ''}`}>
         <div className="panel-title">
           <h3>Backup disclaimer</h3>
@@ -1440,8 +1498,8 @@ function ImportsPage({ connection }: { connection: Connection }) {
           <button onClick={() => void loadOverview()}>Refresh</button>
         </div>
       </header>
-      {error && <div className="error-box">{error}</div>}
-      {notice && <div className="notice-box">{notice}</div>}
+      {error && <div className="error-box" role="alert">{error}</div>}
+      {notice && <div className="notice-box" role="status">{notice}</div>}
 
       <section className="panel">
         <div className="panel-title"><h3>Source</h3></div>
@@ -1679,7 +1737,7 @@ function ClusterPage({ connection }: { connection: Connection }) {
           <button onClick={() => void load()} disabled={loading}>{loading ? 'Refreshing…' : 'Refresh'}</button>
         </div>
       </header>
-      {error && <div className="error-box">{error}</div>}
+      {error && <div className="error-box" role="alert">{error}</div>}
       {cluster?.message && <div className="panel"><p className="muted">{cluster.message}</p></div>}
       {progress && (
         <section className={`panel test-progress ${progress.active ? 'test-progress-live' : ''}`}>
@@ -1760,7 +1818,7 @@ function ClusterPage({ connection }: { connection: Connection }) {
                 </span>
               </div>
               {!node.ok ? (
-                <div className="error-box">{node.error ?? 'node unreachable'}</div>
+                <div className="error-box" role="alert">{node.error ?? 'node unreachable'}</div>
               ) : (
                 <>
                   <div className="stat-grid cluster-stats">
@@ -1788,8 +1846,8 @@ function ClusterPage({ connection }: { connection: Connection }) {
                   <div className="cluster-detail"><span>Reads</span><strong>{metric(node, 'read_ops_total').toLocaleString()}</strong></div>
                   <div className="cluster-detail"><span>Errors</span><strong>{metric(node, 'errors_total').toLocaleString()}</strong></div>
                   <div className="cluster-detail"><span>Disk used</span><strong>{(Number(node.metrics?.disk?.data?.used_ratio ?? 0) * 100).toFixed(1)}%</strong></div>
-                  {nodeError.transport && <div className="error-box">transport: {nodeError.transport}</div>}
-                  {nodeError.apply && <div className="error-box">apply: {nodeError.apply}</div>}
+                  {nodeError.transport && <div className="error-box" role="alert">transport: {nodeError.transport}</div>}
+                  {nodeError.apply && <div className="error-box" role="alert">apply: {nodeError.apply}</div>}
                 </>
               )}
             </section>
@@ -2057,7 +2115,7 @@ function ReplicationPage({ connection }: { connection: Connection }) {
           <button onClick={() => void load()} disabled={loading}>{loading ? 'Loading…' : 'Refresh'}</button>
         </div>
       </header>
-      {error && <div className="error-box">{error}</div>}
+      {error && <div className="error-box" role="alert">{error}</div>}
       <section className="panel">
         <div className="panel-title"><h3>How to read this page</h3><span>glossary</span></div>
         <div className="replication-glossary">
@@ -2201,7 +2259,7 @@ docker exec nonodb-replica nonodb-cli replication status`}</pre>
           )}
         </section>
       )}
-      {replicationNotice && <div className="notice-box">{replicationNotice}</div>}
+      {replicationNotice && <div className="notice-box" role="status">{replicationNotice}</div>}
       {status && status.role !== 'primary' && (
         <section className="panel">
           <div className="panel-title">
@@ -2248,10 +2306,10 @@ docker exec nonodb-replica nonodb-cli replication status`}</pre>
             <RepStat label="Databases" value={<span className="mono">{(status.replication.databases ?? []).join(', ') || '—'}</span>} help="Databases included in this replication source configuration." />
           </div>
           {replicationError.transport && (
-            <div className="error-box">transport: {replicationError.transport}</div>
+            <div className="error-box" role="alert">transport: {replicationError.transport}</div>
           )}
           {replicationError.apply && (
-            <div className="error-box">apply: {replicationError.apply}</div>
+            <div className="error-box" role="alert">apply: {replicationError.apply}</div>
           )}
             </>
           )}
@@ -2452,7 +2510,7 @@ function StorageView({
           </button>
         </div>
       </header>
-      {error && <div className="error-box">{error}</div>}
+      {error && <div className="error-box" role="alert">{error}</div>}
       {loading && !stats && <p className="muted">Reading LMDB storage statistics…</p>}
       {stats && (
         <>
@@ -2629,8 +2687,8 @@ function NetworkView({ connection }: { connection: Connection }) {
           <button onClick={() => void load()} disabled={busy}>Refresh</button>
         </div>
       </header>
-      {error && <div className="error-box">{error}</div>}
-      {notice && <div className="notice-box">{notice}</div>}
+      {error && <div className="error-box" role="alert">{error}</div>}
+      {notice && <div className="notice-box" role="status">{notice}</div>}
 
       <section className="panel">
         <div className="panel-title"><h3>Listeners</h3><span>actual bind</span></div>
@@ -2641,7 +2699,7 @@ function NetworkView({ connection }: { connection: Connection }) {
             <div className="cluster-detail"><span>Unix socket</span><strong className="mono">{data.listeners.unix ?? "disabled"}</strong></div>
             <div className="cluster-detail"><span>Advertise URL</span><strong className="mono">{data.listeners.advertise_url ?? "—"}</strong></div>
             {data.listeners.tcp?.bound?.startsWith("127.") && (
-              <div className="error-box">TCP is loopback-only. Remote replicas cannot connect until the daemon listens on 0.0.0.0 or a LAN address.</div>
+              <div className="error-box" role="alert">TCP is loopback-only. Remote replicas cannot connect until the daemon listens on 0.0.0.0 or a LAN address.</div>
             )}
           </>
         ) : <p className="muted">Loading listener details…</p>}
@@ -2660,12 +2718,12 @@ function NetworkView({ connection }: { connection: Connection }) {
             <div className="cluster-detail"><span>Apply</span><strong>{data.firewall.apply_enabled ? "enabled" : "disabled (preview only)"}</strong></div>
             <div className="cluster-detail"><span>Managed table</span><strong>{data.firewall.managed ? "active" : "not active"}</strong></div>
             {!data.firewall.apply_enabled && (
-              <div className="error-box">
+              <div className="error-box" role="alert">
                 Apply is disabled. Set <code>NONODB_FIREWALL_MANAGE=1</code> on the daemon and restart it.
                 The rules below are still generated for review.
               </div>
             )}
-            {data.firewall.error && <div className="error-box">{data.firewall.error}</div>}
+            {data.firewall.error && <div className="error-box" role="alert">{data.firewall.error}</div>}
           </>
         )}
         <div className="form-grid">
@@ -2737,7 +2795,7 @@ function Dashboard({
           <button onClick={onRefresh}>Refresh</button>
         </div>
       </header>
-      {error && <div className="error-box">{error}</div>}
+      {error && <div className="error-box" role="alert">{error}</div>}
       <div className="stat-grid">
         <div className="stat">
           <span>Collections</span>
@@ -3716,12 +3774,20 @@ function CollectionView({
           </button>
         </div>
       </header>
-      {error && <div className="error-box">{error}</div>}
-      {notice && <div className="notice-box">{notice}</div>}
+      {error && <div className="error-box" role="alert">{error}</div>}
+      {notice && <div className="notice-box" role="status">{notice}</div>}
 
-      <div className="tab-bar">
+      <div className="tab-bar" role="tablist" aria-label="Collection views">
         {(['documents', 'indexes', 'events', 'search', 'aggregate', 'schema', 'metrics'] as const).map((item) => (
-          <button key={item} className={tab === item ? 'active' : ''} onClick={() => setTab(item)}>
+          <button
+            key={item}
+            role="tab"
+            aria-selected={tab === item}
+            tabIndex={tab === item ? 0 : -1}
+            className={tab === item ? 'active' : ''}
+            onClick={() => setTab(item)}
+            onKeyDown={handleTabKey}
+          >
             {item === 'events' ? 'Changes' : item[0].toUpperCase() + item.slice(1)}
             {item === 'indexes' && <span className="tab-count">{indexes.length + textIndexes.length + fuzzyIndexes.length + vectorIndexes.length}</span>}
             {item === 'events' && <span className="tab-count">{subscriptions.length}</span>}
@@ -3976,7 +4042,7 @@ function CollectionView({
             Uses the current collection filter in <code>mode:"live"</code>. Events are pushed
             directly over the stream and are not written to <code>_events</code>.
           </p>
-          {liveError && <div className="error-box">{liveError}</div>}
+          {liveError && <div className="error-box" role="alert">{liveError}</div>}
           <div className="live-events">
             {liveEvents.length === 0 ? (
               <p className="muted">{liveRunning ? 'Waiting for matching writes…' : 'Not running.'}</p>
@@ -4078,7 +4144,7 @@ function CollectionView({
 
       {showHistory && selected && (
         <Modal title={`History: ${idOf(selected)}`} subtitle="Newest revisions first. History requires versioning enabled for this collection." onClose={() => setShowHistory(false)} wide>
-          {historyError && <div className="error-box">{historyError}</div>}
+          {historyError && <div className="error-box" role="alert">{historyError}</div>}
           {historyBusy ? <p className="muted">Loading revisions…</p> : revisions.length === 0 ? <p className="muted">No revisions found. Enable versioning in collection Settings, then update the document.</p> : (
             <div className="history-layout">
               <div className="revision-list">
@@ -4346,16 +4412,20 @@ function PlaygroundView({
         <button
           role="tab"
           aria-selected={mode === 'sql'}
+          tabIndex={mode === 'sql' ? 0 : -1}
           className={mode === 'sql' ? 'active' : ''}
           onClick={() => { setMode('sql'); setError(''); }}
+          onKeyDown={handleTabKey}
         >
           SQL
         </button>
         <button
           role="tab"
           aria-selected={mode === 'json'}
+          tabIndex={mode === 'json' ? 0 : -1}
           className={mode === 'json' ? 'active' : ''}
           onClick={() => { setMode('json'); setError(''); }}
+          onKeyDown={handleTabKey}
         >
           JSON
         </button>
@@ -4365,7 +4435,7 @@ function PlaygroundView({
             : 'Any single /v1/exec request: find, aggregate, search_all, insert, SQL, and more.'}
         </span>
       </div>
-      {error && <div className="error-box">{error}</div>}
+      {error && <div className="error-box" role="alert">{error}</div>}
       {mode === 'sql' ? (
         <section className="panel">
           <SqlEditor value={query} onChange={setQuery} />
@@ -4726,8 +4796,8 @@ function AuthView({ connection }: { connection: Connection }) {
           </button>
         </div>
       </header>
-      {error && <div className="error-box">{error}</div>}
-      {notice && <div className="notice-box">{notice}</div>}
+      {error && <div className="error-box" role="alert">{error}</div>}
+      {notice && <div className="notice-box" role="status">{notice}</div>}
 
       {!summary ? (
         <p className="muted">Loading authorization state…</p>
@@ -5108,8 +5178,8 @@ function DatabaseView({
           <button onClick={() => void load()}>Refresh</button>
         </div>
       </header>
-      {error && <div className="error-box">{error}</div>}
-      {notice && <div className="notice-box">{notice}</div>}
+      {error && <div className="error-box" role="alert">{error}</div>}
+      {notice && <div className="notice-box" role="status">{notice}</div>}
       <section className="panel">
         <div className="stat-grid">
           <div className="stat"><span>Map size</span><strong>{info ? formatBytes(info.map_size) : '-'}</strong></div>
@@ -5228,7 +5298,7 @@ function DatabaseView({
             }
           }}
         >
-          {error && <div className="error-box">{error}</div>}
+          {error && <div className="error-box" role="alert">{error}</div>}
           <p className="muted small">
             All collections, indexes, history, TTL metadata, and event configuration in
             <code> {dropTarget}</code> will be removed. Export or back up the database first if
@@ -5381,7 +5451,7 @@ function Shell({
 
   return (
     <div className="app-shell">
-      <aside className="sidebar">
+      <aside className="sidebar" aria-label="Console navigation">
         <div className="brand">
           <span className="brand-mark"><img src="/nonodb-mark.svg" alt="" /></span>
           <div>
@@ -5389,35 +5459,35 @@ function Shell({
             <small>Console</small>
           </div>
         </div>
-        <nav className="nav">
-          <button className={tab === 'dashboard' && !selected ? 'active' : ''} onClick={() => { setTab('dashboard'); setSelected(null); }}>
+        <nav className="nav" aria-label="Views">
+          <button className={tab === 'dashboard' && !selected ? 'active' : ''} aria-current={tab === 'dashboard' && !selected ? 'page' : undefined} onClick={() => { setTab('dashboard'); setSelected(null); }}>
             Dashboard
           </button>
-          <button className={tab === 'playground' ? 'active' : ''} onClick={() => setTab('playground')}>
+          <button className={tab === 'playground' ? 'active' : ''} aria-current={tab === 'playground' ? 'page' : undefined} onClick={() => setTab('playground')}>
             Playground
           </button>
-          <button className={tab === 'database' ? 'active' : ''} onClick={() => setTab('database')}>
+          <button className={tab === 'database' ? 'active' : ''} aria-current={tab === 'database' ? 'page' : undefined} onClick={() => setTab('database')}>
             Database
           </button>
-          <button className={tab === 'backups' ? 'active' : ''} onClick={() => setTab('backups')}>
+          <button className={tab === 'backups' ? 'active' : ''} aria-current={tab === 'backups' ? 'page' : undefined} onClick={() => setTab('backups')}>
             Backups
           </button>
-          <button className={tab === 'import' ? 'active' : ''} onClick={() => setTab('import')}>
+          <button className={tab === 'import' ? 'active' : ''} aria-current={tab === 'import' ? 'page' : undefined} onClick={() => setTab('import')}>
             Import
           </button>
-          <button className={tab === 'eventing' ? 'active' : ''} onClick={() => setTab('eventing')}>
+          <button className={tab === 'eventing' ? 'active' : ''} aria-current={tab === 'eventing' ? 'page' : undefined} onClick={() => setTab('eventing')}>
             Eventing
           </button>
-          <button className={tab === 'replication' ? 'active' : ''} onClick={() => setTab('replication')}>
+          <button className={tab === 'replication' ? 'active' : ''} aria-current={tab === 'replication' ? 'page' : undefined} onClick={() => setTab('replication')}>
             Replication
           </button>
-          <button className={tab === 'cluster' ? 'active' : ''} onClick={() => setTab('cluster')}>
+          <button className={tab === 'cluster' ? 'active' : ''} aria-current={tab === 'cluster' ? 'page' : undefined} onClick={() => setTab('cluster')}>
             Cluster
           </button>
-          <button className={tab === 'network' ? 'active' : ''} onClick={() => setTab('network')}>
+          <button className={tab === 'network' ? 'active' : ''} aria-current={tab === 'network' ? 'page' : undefined} onClick={() => setTab('network')}>
             Network
           </button>
-          <button className={tab === 'auth' ? 'active' : ''} onClick={() => setTab('auth')}>
+          <button className={tab === 'auth' ? 'active' : ''} aria-current={tab === 'auth' ? 'page' : undefined} onClick={() => setTab('auth')}>
             Authorization
           </button>
           {collections.includes('_jobs') && (
@@ -5426,7 +5496,7 @@ function Shell({
         </nav>
         <div className="sidebar-section">
           <span>Database</span>
-          <button className="icon-button" onClick={() => void refreshCollections()} title="Refresh">
+          <button className="icon-button" onClick={() => void refreshCollections()} title="Refresh" aria-label="Refresh collections">
             ↻
           </button>
         </div>
@@ -5436,6 +5506,7 @@ function Shell({
             value={connection.database || 'default'}
             onChange={(e) => switchDatabase(e.target.value)}
             title="Switch database"
+            aria-label="Current database"
           >
             {[...new Set(['default', connection.database || 'default', ...databases])].map((name) => (
               <option key={name} value={name}>{name}</option>
@@ -5462,6 +5533,7 @@ function Shell({
             <button
               key={name}
               className={selected === name && tab === 'dashboard' ? 'active' : ''}
+              aria-current={selected === name && tab === 'dashboard' ? 'page' : undefined}
               onClick={() => openCollection(name)}
             >
               {name}
@@ -5482,7 +5554,7 @@ function Shell({
           </button>
         </div>
       </aside>
-      <main className="main">
+      <main className="main" id="main-content" tabIndex={-1}>
         {error && <div className="error-box sticky">{error}</div>}
         {tab === 'storage' ? (
           <StorageView connection={connection} onOpenCollection={(name) => openCollection(name, 'metrics')} />
@@ -5536,6 +5608,15 @@ function Shell({
             value={paletteQuery}
             onChange={(e) => setPaletteQuery(e.target.value)}
             placeholder="Search commands or collections…"
+            aria-label="Search commands or collections"
+            onKeyDown={(event) => {
+              if (event.key !== 'ArrowDown') return;
+              event.preventDefault();
+              event.currentTarget
+                .closest('.modal')
+                ?.querySelector<HTMLButtonElement>('.palette-row')
+                ?.focus();
+            }}
           />
           <div className="palette-list">
             {[
@@ -5749,8 +5830,10 @@ function SessionBar({
               className="session-select"
               role="tab"
               aria-selected={session.id === activeId}
+              tabIndex={session.id === activeId ? 0 : -1}
               title={`${session.connection.endpoint} · ${session.connection.database || 'default'}`}
               onClick={() => onSelect(session.id)}
+              onKeyDown={handleTabKey}
             >
               <span className={`session-dot ${session.status}`} aria-hidden="true" />
               <span className="session-label">{label}</span>
@@ -5932,8 +6015,16 @@ export default function App() {
     );
   }
 
+  const showSkipLink =
+    !checking && !adding && Boolean(active && active.status === 'online');
+
   return (
     <>
+      {showSkipLink && (
+        <a className="skip-link" href="#main-content">
+          Skip to main content
+        </a>
+      )}
       {sessions.length > 0 ? (
         <div className="session-layout">
           <SessionBar

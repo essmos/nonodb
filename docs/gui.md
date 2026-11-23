@@ -190,6 +190,44 @@ reverse proxy with distinct path prefixes, or configure CORS at the proxy; the
 GUI does not bypass browser cross-origin rules. Use TLS for non-loopback
 endpoints.
 
+### Accessibility and keyboard navigation
+
+The console uses native buttons, links, labels, and form controls. Dialogs have
+an accessible name, trap focus while open, restore focus on close, and close with
+`Esc`. The sidebar is a labelled landmark, the active view uses
+`aria-current="page"`, and errors and notices are live regions.
+
+Keyboard shortcuts:
+
+| Key | Action |
+|---|---|
+| `Tab` / `Shift+Tab` | Move through interactive controls |
+| `Ctrl+K` / `Cmd+K` | Open or close the command palette |
+| `ArrowDown` in the palette | Move from the search field to the first result |
+| `ArrowLeft` / `ArrowRight` | Move between tabs in a tab list |
+| `Home` / `End` | Jump to the first or last tab in a tab list |
+| `Enter` / `Space` | Activate a focused button or clickable table row |
+| `Esc` | Close the active dialog or palette |
+
+The first `Tab` from the page start reveals **Skip to main content**, which moves
+focus directly to the console. Focus-visible outlines are shown on buttons,
+links, inputs, tabs, and clickable rows. `prefers-reduced-motion` disables
+non-essential transitions.
+
+Accessibility checklist for GUI changes:
+
+- Every icon-only control has an `aria-label` or visible text.
+- Every input has an associated `<label>` or `aria-label`.
+- Tabs use `role="tablist"`, `role="tab"`, `aria-selected`, roving `tabIndex`,
+  and arrow-key navigation.
+- Dialogs use `role="dialog"`, `aria-modal`, `aria-labelledby`, and the shared
+  `Modal` component's focus handling.
+- Errors use `role="alert"`; transient notices use `role="status"`.
+- New interactive table rows respond to `Enter` and `Space`.
+- The layout remains usable at 200% zoom and with keyboard only.
+- The embedded GUI test checks the shipped assets for these landmarks,
+  focus-visible styles, and reduced-motion rules.
+
 ## Features
 
 ### Databases

@@ -43,6 +43,33 @@ textarea {
   color: inherit;
 }
 
+:where(a, button, input, textarea, select, [tabindex]):focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.skip-link {
+  position: fixed;
+  top: 0.5rem;
+  left: 0.5rem;
+  z-index: 100;
+  padding: 0.55rem 0.85rem;
+  border-radius: 6px;
+  background: var(--accent-2);
+  color: #ffffff;
+  font-weight: 600;
+  text-decoration: none;
+  transform: translateY(-160%);
+}
+
+.skip-link:focus {
+  transform: translateY(0);
+}
+
+.main:focus {
+  outline: none;
+}
+
 button {
   border: 1px solid var(--border);
   background: var(--panel-2);
@@ -955,7 +982,11 @@ h3 {
 .clickable-row:hover,
 .clickable-row:focus-visible {
   background: #1f6feb1f;
-  outline: none;
+}
+
+.clickable-row:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
 }
 
 
@@ -2069,4 +2100,15 @@ select {
   cursor: pointer;
   color: var(--muted);
   font-size: 0.8rem;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+  }
 }
