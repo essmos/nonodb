@@ -5334,16 +5334,30 @@ impl<'e> Collection<'e> {
     ///
     /// The expected expiry must still match the TTL entry; this protects a
     /// concurrent update that refreshed the TTL after the sweeper read it.
+    /// Returns the stored document so the caller can emit the delete event
+    /// after strict TTL reads have already hidden it.
     pub fn expire_txn(&self, wtxn: &mut RwTxn<'_>, id: &str, expected_ttl_at: u64) -> Result<bool> {
+        Ok(self
+            .expire_txn_with_doc(wtxn, id, expected_ttl_at)?
+            .is_some())
+    }
+
+    /// Like [`Self::expire_txn`], but returns the expired stored document.
+    pub fn expire_txn_with_doc(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        id: &str,
+        expected_ttl_at: u64,
+    ) -> Result<Option<Value>> {
         let Some(current) = self.ttl_at(&*wtxn, id)? else {
-            return Ok(false);
+            return Ok(None);
         };
         if current != expected_ttl_at {
-            return Ok(false);
+            return Ok(None);
         }
         let Some(raw) = self.db.get(&*wtxn, id.as_bytes())? else {
             self.set_ttl(wtxn, id, None)?;
-            return Ok(false);
+            return Ok(None);
         };
         let old: Value = parse_json(raw)?;
         self.db.delete(&mut *wtxn, id.as_bytes())?;
@@ -5359,7 +5373,7 @@ impl<'e> Collection<'e> {
         } else {
             self.record_history(wtxn, id, "delete", None)?;
         }
-        Ok(true)
+        Ok(Some(old))
     }
 
     /// Reads vault documents. Only `_id`/`tenant_id` filters and `_id` sorting are allowed.

@@ -87,7 +87,11 @@ fn expiry_deletes_document_and_records_tombstone() {
 
     let mut wtxn = store.write_txn().unwrap();
     let c = store.collection_in(&mut wtxn, "events").unwrap();
-    assert!(c.expire_txn(&mut wtxn, "gone", entry.expire_at).unwrap());
+    let old = c
+        .expire_txn_with_doc(&mut wtxn, "gone", entry.expire_at)
+        .unwrap()
+        .expect("expired document is returned for delete events");
+    assert_eq!(old["n"], 1);
     assert!(!c.expire_txn(&mut wtxn, "gone", entry.expire_at).unwrap());
     wtxn.commit().unwrap();
 

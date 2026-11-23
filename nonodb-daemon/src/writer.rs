@@ -1161,12 +1161,9 @@ fn execute(
                 } else {
                     None
                 };
-                let before = if config.is_some() && !c.profile().is_vault() {
-                    c.find_one_in(&*wtxn, &json!({ "_id": entry.id }), None)?
-                } else {
-                    None
-                };
-                if c.expire_txn(wtxn, &entry.id, entry.expected_ttl_at)? {
+                if let Some(before) =
+                    c.expire_txn_with_doc(wtxn, &entry.id, entry.expected_ttl_at)?
+                {
                     if let Some(before) = vault_before.as_ref() {
                         replication.capture_vault(
                             &entry.coll,
@@ -1176,18 +1173,20 @@ fn execute(
                             None,
                         );
                     }
-                    if let (Some(config), Some(before)) = (&config, before.as_ref()) {
-                        emit_event(
-                            store,
-                            wtxn,
-                            &entry.coll,
-                            "delete",
-                            &entry.id,
-                            Some(before),
-                            None,
-                            config,
-                            replication,
-                        )?;
+                    if let Some(config) = config.as_ref() {
+                        if !c.profile().is_vault() {
+                            emit_event(
+                                store,
+                                wtxn,
+                                &entry.coll,
+                                "delete",
+                                &entry.id,
+                                Some(&before),
+                                None,
+                                config,
+                                replication,
+                            )?;
+                        }
                     }
                     expired += 1;
                 }

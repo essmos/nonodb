@@ -9,6 +9,8 @@ Full release notes: https://github.com/essmos/nonodb/releases
   immediately at `_ttl_at`. Search paths over-fetch to fill limits, the read
   cache is capped at the next TTL deadline, and replicated documents carry
   their TTL metadata. `NONODB_TTL_STRICT_READS=0` restores legacy visibility.
+- Preserve automatic collection delete events for TTL expiry when strict TTL
+  reads hide the document before the sweeper runs.
 - Turn the GUI SQL console into a **Playground** with SQL and JSON modes. JSON
   mode runs any `/v1/exec` request, offers find/aggregate/search/SQL/insert
   templates, formats requests, renders array results as tables, and keeps
