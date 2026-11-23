@@ -243,6 +243,32 @@ def main() -> int:
                 item["collection"] for item in admin_stats.json()["result"]["collections"]
             } == {"orders", "secret"}
 
+            assert (
+                client.post(
+                    "/v1/exec",
+                    headers=headers(reader_token),
+                    json={
+                        "op": "lookup",
+                        "coll": "orders",
+                        "by": "_id",
+                        "values": ["o1", "missing"],
+                    },
+                ).status_code
+                == 200
+            )
+            explain_lookup = client.post(
+                "/v1/exec",
+                headers=headers(reader_token),
+                json={
+                    "op": "explain_lookup",
+                    "coll": "orders",
+                    "by": "_id",
+                    "values": ["o1", "missing"],
+                },
+            )
+            assert explain_lookup.status_code == 200, explain_lookup.text
+            assert explain_lookup.json()["result"]["found"] == 1
+
             collection_metrics = client.post(
                 "/v1/exec",
                 headers=headers(reader_token),
@@ -262,6 +288,13 @@ def main() -> int:
                 for row in rows
             )
             assert all_metrics.json()["disk"]["data"]["total_bytes"] > 0
+            assert all_metrics.json()["lookup_requests_total"] >= 1
+            assert all_metrics.json()["lookup_explains_total"] >= 1
+            assert all_metrics.json()["lookup_found_total"] >= 1
+            assert any(
+                row["operation"] == "lookup"
+                for row in all_metrics.json()["lookup_latency"]
+            )
 
             # A metrics:read principal can scrape metrics but cannot manage auth.
             assert client.get("/metrics", headers=headers(prometheus_token)).status_code == 200
@@ -274,6 +307,9 @@ def main() -> int:
             assert "nonodb_requests_total" in body
             assert 'nonodb_collection_requests_total{database="default",collection="orders"}' in body
             assert 'nonodb_disk_used_ratio{mount="data"}' in body
+            assert "nonodb_lookup_requests_total" in body
+            assert "# TYPE nonodb_lookup_duration_seconds histogram" in body
+            assert 'nonodb_lookup_duration_seconds_bucket{op="lookup"' in body
             assert client.get("/v1/auth", headers=headers(prometheus_token)).status_code == 403
 
             # Snapshots run in the background; wait for the first success metric.

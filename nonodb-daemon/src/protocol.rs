@@ -154,6 +154,18 @@ pub enum Request {
         #[serde(default)]
         projection: Option<Value>,
     },
+    /// Plan and counters for an ordered point lookup.
+    ExplainLookup {
+        coll: String,
+        #[serde(default)]
+        by: Option<LookupBy>,
+        #[serde(default)]
+        values: Vec<Value>,
+        #[serde(default)]
+        fields: Option<Vec<String>>,
+        #[serde(default)]
+        projection: Option<Value>,
+    },
     /// Long-polls an append-only event collection after a sortable `_id`.
     Watch {
         coll: String,
@@ -905,6 +917,7 @@ impl Request {
             Self::Find { .. } => "find",
             Self::FindOne { .. } => "find_one",
             Self::Lookup { .. } => "lookup",
+            Self::ExplainLookup { .. } => "explain_lookup",
             Self::Watch { .. } => "watch",
             Self::Explain { .. } => "explain",
             Self::Update { .. } => "update",
@@ -992,6 +1005,7 @@ impl Request {
             Self::Find { .. }
             | Self::FindOne { .. }
             | Self::Lookup { .. }
+            | Self::ExplainLookup { .. }
             | Self::Watch { .. }
             | Self::Explain { .. }
             | Self::Count { .. }
@@ -1038,6 +1052,7 @@ impl Request {
             | Self::Find { coll, .. }
             | Self::FindOne { coll, .. }
             | Self::Lookup { coll, .. }
+            | Self::ExplainLookup { coll, .. }
             | Self::Watch { coll, .. }
             | Self::Explain { coll, .. }
             | Self::Update { coll, .. }

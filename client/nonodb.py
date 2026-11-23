@@ -46,6 +46,7 @@ _READ_OPS = {
     "find",
     "find_one",
     "lookup",
+    "explain_lookup",
     "count",
     "aggregate",
     "cursor_aggregate",

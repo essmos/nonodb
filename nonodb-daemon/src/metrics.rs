@@ -37,6 +37,19 @@ pub static SQL_UPDATE: AtomicU64 = AtomicU64::new(0);
 pub static SQL_DELETE: AtomicU64 = AtomicU64::new(0);
 pub static SQL_ERRORS: AtomicU64 = AtomicU64::new(0);
 pub static SQL_DURATION_NS: AtomicU64 = AtomicU64::new(0);
+/// Aggregate ordered point lookup counters.
+pub static LOOKUP_REQUESTS: AtomicU64 = AtomicU64::new(0);
+pub static LOOKUP_EXPLAINS: AtomicU64 = AtomicU64::new(0);
+pub static LOOKUP_KEYS: AtomicU64 = AtomicU64::new(0);
+pub static LOOKUP_UNIQUE_KEYS: AtomicU64 = AtomicU64::new(0);
+pub static LOOKUP_FOUND: AtomicU64 = AtomicU64::new(0);
+pub static LOOKUP_MISSING: AtomicU64 = AtomicU64::new(0);
+pub static LOOKUP_DOCUMENTS_READ: AtomicU64 = AtomicU64::new(0);
+pub static LOOKUP_INDEX_ENTRIES: AtomicU64 = AtomicU64::new(0);
+pub static LOOKUP_BYTES_READ: AtomicU64 = AtomicU64::new(0);
+pub static LOOKUP_BYTES_RETURNED: AtomicU64 = AtomicU64::new(0);
+pub static LOOKUP_ERRORS: AtomicU64 = AtomicU64::new(0);
+pub static LOOKUP_DURATION_NS: AtomicU64 = AtomicU64::new(0);
 /// Number of operations executed in `/v1/batch` requests.
 pub static BATCH_OPS: AtomicU64 = AtomicU64::new(0);
 pub static WRITE_OPS: AtomicU64 = AtomicU64::new(0);
@@ -155,6 +168,72 @@ fn latency_json() -> Vec<Value> {
             })
         })
         .collect()
+}
+
+fn lookup_latency_map() -> &'static Mutex<BTreeMap<String, LatencyCounters>> {
+    static MAP: OnceLock<Mutex<BTreeMap<String, LatencyCounters>>> = OnceLock::new();
+    MAP.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn lookup_latency_json() -> Vec<Value> {
+    let map = lookup_latency_map()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    map.iter()
+        .map(|(operation, counters)| {
+            json!({
+                "operation": operation,
+                "buckets_ns": LATENCY_BUCKETS_NS,
+                "buckets": counters.buckets,
+                "count": counters.count,
+                "sum_ns": counters.sum_ns,
+            })
+        })
+        .collect()
+}
+
+/// Records one lookup and its aggregate counters.
+pub fn record_lookup(
+    elapsed: Duration,
+    stats: &nonodb_core::LookupStats,
+    bytes_returned: u64,
+    ok: bool,
+    explain: bool,
+) {
+    if explain {
+        inc(&LOOKUP_EXPLAINS);
+    } else {
+        inc(&LOOKUP_REQUESTS);
+    }
+    add(&LOOKUP_KEYS, stats.requested_keys as u64);
+    add(&LOOKUP_UNIQUE_KEYS, stats.unique_keys as u64);
+    add(&LOOKUP_FOUND, stats.found as u64);
+    add(&LOOKUP_MISSING, stats.missing as u64);
+    add(&LOOKUP_DOCUMENTS_READ, stats.documents_read);
+    add(&LOOKUP_INDEX_ENTRIES, stats.index_entries_read);
+    add(&LOOKUP_BYTES_READ, stats.bytes_read);
+    add(&LOOKUP_BYTES_RETURNED, bytes_returned);
+    add(
+        &LOOKUP_DURATION_NS,
+        u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX),
+    );
+    if !ok {
+        inc(&LOOKUP_ERRORS);
+    }
+    let operation = if explain { "explain_lookup" } else { "lookup" };
+    let mut map = lookup_latency_map()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let entry = map.entry(operation.to_string()).or_default();
+    let ns = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+    entry.count = entry.count.saturating_add(1);
+    entry.sum_ns = entry.sum_ns.saturating_add(ns);
+    for (index, upper) in LATENCY_BUCKETS_NS.iter().enumerate() {
+        if ns <= *upper {
+            entry.buckets[index] = entry.buckets[index].saturating_add(1);
+            break;
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -554,6 +633,7 @@ pub fn snapshot() -> Value {
     };
     let (event_emitted, event_suppressed) = nonodb_core::events::stats();
     let latency = latency_json();
+    let lookup_latency = lookup_latency_json();
     json!({
         "requests_total": REQUESTS.load(Relaxed),
         "errors_total": ERRORS.load(Relaxed),
@@ -582,6 +662,18 @@ pub fn snapshot() -> Value {
         "sql_delete_total": SQL_DELETE.load(Relaxed),
         "sql_errors_total": SQL_ERRORS.load(Relaxed),
         "sql_duration_ns_total": SQL_DURATION_NS.load(Relaxed),
+        "lookup_requests_total": LOOKUP_REQUESTS.load(Relaxed),
+        "lookup_explains_total": LOOKUP_EXPLAINS.load(Relaxed),
+        "lookup_keys_total": LOOKUP_KEYS.load(Relaxed),
+        "lookup_unique_keys_total": LOOKUP_UNIQUE_KEYS.load(Relaxed),
+        "lookup_found_total": LOOKUP_FOUND.load(Relaxed),
+        "lookup_missing_total": LOOKUP_MISSING.load(Relaxed),
+        "lookup_documents_read_total": LOOKUP_DOCUMENTS_READ.load(Relaxed),
+        "lookup_index_entries_read_total": LOOKUP_INDEX_ENTRIES.load(Relaxed),
+        "lookup_bytes_read_total": LOOKUP_BYTES_READ.load(Relaxed),
+        "lookup_bytes_returned_total": LOOKUP_BYTES_RETURNED.load(Relaxed),
+        "lookup_errors_total": LOOKUP_ERRORS.load(Relaxed),
+        "lookup_duration_ns_total": LOOKUP_DURATION_NS.load(Relaxed),
         "batch_ops_total": BATCH_OPS.load(Relaxed),
         "write_ops_total": write_ops,
         "write_batches_total": WRITE_BATCHES.load(Relaxed),
@@ -609,6 +701,7 @@ pub fn snapshot() -> Value {
         "collection_metrics": collection_metrics,
         "collection_metrics_overflow_total": COLLECTION_METRICS_OVERFLOW.load(Relaxed),
         "latency": latency,
+        "lookup_latency": lookup_latency,
         "latency_series_overflow_total": LATENCY_SERIES_OVERFLOW.load(Relaxed),
         "commit_ns_total": commit_ns,
         "ttl_sweeps_total": TTL_SWEEPS.load(Relaxed),
@@ -978,6 +1071,66 @@ pub fn prometheus() -> String {
             "Total SQL execution time.",
         ),
         (
+            "nonodb_lookup_requests_total",
+            "lookup_requests_total",
+            "Ordered point lookup requests.",
+        ),
+        (
+            "nonodb_lookup_explains_total",
+            "lookup_explains_total",
+            "Lookup plan explanations.",
+        ),
+        (
+            "nonodb_lookup_keys_total",
+            "lookup_keys_total",
+            "Requested lookup keys including duplicates.",
+        ),
+        (
+            "nonodb_lookup_unique_keys_total",
+            "lookup_unique_keys_total",
+            "Distinct lookup keys after deduplication.",
+        ),
+        (
+            "nonodb_lookup_found_total",
+            "lookup_found_total",
+            "Lookup results that found a document.",
+        ),
+        (
+            "nonodb_lookup_missing_total",
+            "lookup_missing_total",
+            "Lookup results with no document.",
+        ),
+        (
+            "nonodb_lookup_documents_read_total",
+            "lookup_documents_read_total",
+            "Documents read from the main collection during lookups.",
+        ),
+        (
+            "nonodb_lookup_index_entries_read_total",
+            "lookup_index_entries_read_total",
+            "Index entries examined during lookups.",
+        ),
+        (
+            "nonodb_lookup_bytes_read_total",
+            "lookup_bytes_read_total",
+            "Stored document and index bytes read during lookups.",
+        ),
+        (
+            "nonodb_lookup_bytes_returned_total",
+            "lookup_bytes_returned_total",
+            "Stored result bytes returned by lookups.",
+        ),
+        (
+            "nonodb_lookup_errors_total",
+            "lookup_errors_total",
+            "Failed lookup requests.",
+        ),
+        (
+            "nonodb_lookup_duration_ns_total",
+            "lookup_duration_ns_total",
+            "Total lookup execution time.",
+        ),
+        (
             "nonodb_batch_ops_total",
             "batch_ops_total",
             "Operations inside read batches.",
@@ -1229,6 +1382,55 @@ pub fn prometheus() -> String {
             prom_sample(
                 &mut out,
                 "nonodb_request_duration_seconds_count",
+                &labels,
+                &row["count"],
+            );
+        }
+    }
+
+    if let Some(rows) = snapshot["lookup_latency"].as_array() {
+        prom_header(
+            &mut out,
+            "nonodb_lookup_duration_seconds",
+            "histogram",
+            "Lookup latency by operation.",
+        );
+        for row in rows {
+            let operation = row["operation"].as_str().unwrap_or("");
+            let labels = [("op", operation)];
+            let mut cumulative = 0u64;
+            if let Some(buckets) = row["buckets"].as_array() {
+                for (index, label) in LATENCY_BUCKET_LABELS.iter().enumerate() {
+                    cumulative = cumulative.saturating_add(
+                        buckets
+                            .get(index)
+                            .and_then(Value::as_u64)
+                            .unwrap_or_default(),
+                    );
+                    prom_sample(
+                        &mut out,
+                        "nonodb_lookup_duration_seconds_bucket",
+                        &[("op", operation), ("le", label)],
+                        &json!(cumulative),
+                    );
+                }
+            }
+            prom_sample(
+                &mut out,
+                "nonodb_lookup_duration_seconds_bucket",
+                &[("op", operation), ("le", "+Inf")],
+                &row["count"],
+            );
+            let sum_seconds = row["sum_ns"].as_u64().unwrap_or_default() as f64 / 1_000_000_000.0;
+            prom_sample(
+                &mut out,
+                "nonodb_lookup_duration_seconds_sum",
+                &labels,
+                &json!(sum_seconds),
+            );
+            prom_sample(
+                &mut out,
+                "nonodb_lookup_duration_seconds_count",
                 &labels,
                 &row["count"],
             );
@@ -1604,6 +1806,46 @@ mod tests {
         assert!(text.contains(&format!(
             "nonodb_request_duration_seconds_count{{op=\"{operation}\"}} 3"
         )));
+    }
+
+    #[test]
+    fn lookup_metrics_and_histograms_are_exported() {
+        let stats = nonodb_core::LookupStats {
+            selected_index: "email".into(),
+            index_fields: vec!["email".into()],
+            index_include: vec!["name".into()],
+            requested_keys: 3,
+            unique_keys: 2,
+            found: 2,
+            missing: 1,
+            index_entries_read: 2,
+            documents_read: 0,
+            bytes_read: 64,
+            result_bytes: 32,
+            covering: true,
+            primary: false,
+        };
+        record_lookup(Duration::from_millis(2), &stats, 32, true, false);
+        record_lookup(Duration::from_millis(3), &stats, 32, true, true);
+
+        let snapshot = snapshot();
+        assert!(snapshot["lookup_requests_total"].as_u64().unwrap() >= 1);
+        assert!(snapshot["lookup_explains_total"].as_u64().unwrap() >= 1);
+        assert!(snapshot["lookup_found_total"].as_u64().unwrap() >= 2);
+        assert!(snapshot["lookup_latency"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["operation"] == "lookup"));
+        assert!(snapshot["lookup_latency"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["operation"] == "explain_lookup"));
+        let text = prometheus();
+        assert!(text.contains("nonodb_lookup_requests_total"));
+        assert!(text.contains("# TYPE nonodb_lookup_duration_seconds histogram"));
+        assert!(text.contains("nonodb_lookup_duration_seconds_bucket{op=\"lookup\",le=\"+Inf\"}"));
     }
 
     #[test]

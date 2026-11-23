@@ -88,6 +88,37 @@ pub const MAX_LOOKUP_VALUES: usize = 10_000;
 /// Maximum serialized size of the `lookup` result payload.
 pub const MAX_LOOKUP_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 
+/// Execution counters for one ordered point lookup.
+#[derive(Debug, Clone, Default)]
+pub struct LookupStats {
+    /// Selected primary or secondary index name.
+    pub selected_index: String,
+    /// Fields in the selected index order.
+    pub index_fields: Vec<String>,
+    /// Covering fields copied into the index value.
+    pub index_include: Vec<String>,
+    /// Whether the selected index is the primary `_id` index.
+    pub primary: bool,
+    /// Whether the projection was served without reading documents.
+    pub covering: bool,
+    /// Number of keys in the request, including duplicates.
+    pub requested_keys: usize,
+    /// Number of distinct keys after deduplication.
+    pub unique_keys: usize,
+    /// Non-null results returned, including duplicate inputs.
+    pub found: usize,
+    /// Null results returned.
+    pub missing: usize,
+    /// Index entries examined while resolving keys.
+    pub index_entries_read: u64,
+    /// Full documents fetched from the main collection.
+    pub documents_read: u64,
+    /// Stored document or index-value bytes read.
+    pub bytes_read: u64,
+    /// Stored bytes represented by the returned results.
+    pub result_bytes: u64,
+}
+
 /// Minimum document count for a sorted full scan to use multiple threads.
 #[cfg(not(test))]
 const PARALLEL_SCAN_MIN_ENTRIES: usize = 50_000;
@@ -7882,6 +7913,19 @@ impl<'e> Collection<'e> {
         Ok(out)
     }
 
+    /// Ordered point lookup with execution counters.
+    pub fn lookup_fields_report(
+        &self,
+        by: &[String],
+        values: &[Value],
+        projection: Option<&Value>,
+    ) -> Result<(Vec<Option<Value>>, LookupStats)> {
+        let rtxn = self.read_txn()?;
+        let out = self.lookup_fields_report_in(&rtxn, by, values, projection)?;
+        rtxn.commit()?;
+        Ok(out)
+    }
+
     pub fn lookup_fields_in(
         &self,
         rtxn: &RoTxn<'_>,
@@ -7889,6 +7933,19 @@ impl<'e> Collection<'e> {
         values: &[Value],
         projection: Option<&Value>,
     ) -> Result<Vec<Option<Value>>> {
+        Ok(self
+            .lookup_fields_report_in(rtxn, by, values, projection)?
+            .0)
+    }
+
+    /// Ordered point lookup with execution counters for `explain_lookup`.
+    pub fn lookup_fields_report_in(
+        &self,
+        rtxn: &RoTxn<'_>,
+        by: &[String],
+        values: &[Value],
+        projection: Option<&Value>,
+    ) -> Result<(Vec<Option<Value>>, LookupStats)> {
         if by.is_empty() || by.iter().any(String::is_empty) {
             return Err(Error::Query("lookup field must not be empty".into()));
         }
@@ -7899,8 +7956,12 @@ impl<'e> Collection<'e> {
         }
         let strict_ttl = self.ttl_filter_active(rtxn)?;
         let now = ttl::now_ms();
+        let mut stats = LookupStats {
+            requested_keys: values.len(),
+            ..LookupStats::default()
+        };
         if values.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), stats));
         }
 
         // Deduplicate key work while preserving the original result order.
@@ -7923,16 +7984,25 @@ impl<'e> Collection<'e> {
         let mut unique_sizes = Vec::with_capacity(unique_values.len());
         let mut unique_bytes = 0usize;
         let id_only = projection_is_id_only(projection);
+        stats.unique_keys = unique_values.len();
 
         if by.len() == 1 && by[0] == "_id" {
+            stats.selected_index = "_id_".to_string();
+            stats.index_fields = by.to_vec();
+            stats.primary = true;
             for &value in &unique_values {
+                stats.index_entries_read = stats.index_entries_read.saturating_add(1);
                 let (doc, size) = match value.as_str() {
                     Some(id) if strict_ttl && self.ttl_expired_at(rtxn, id, now)? => (None, 4),
                     Some(id) => match self.db.get(rtxn, id.as_bytes())? {
                         Some(bytes) => {
                             if id_only {
+                                stats.bytes_read = stats.bytes_read.saturating_add(id.len() as u64);
                                 (Some(serde_json::json!({"_id": id})), id.len())
                             } else {
+                                stats.documents_read = stats.documents_read.saturating_add(1);
+                                stats.bytes_read =
+                                    stats.bytes_read.saturating_add(bytes.len() as u64);
                                 let size = bytes.len();
                                 match projection {
                                     Some(projection) => {
@@ -7955,7 +8025,16 @@ impl<'e> Collection<'e> {
                     size,
                 )?;
             }
-            return finish_lookup(values.len(), unique_out, unique_sizes, &positions);
+            stats.covering = id_only;
+            finish_lookup_stats(
+                values.len(),
+                &unique_out,
+                &unique_sizes,
+                &positions,
+                &mut stats,
+            );
+            let out = finish_lookup(values.len(), unique_out, unique_sizes, &positions)?;
+            return Ok((out, stats));
         }
 
         let def = self
@@ -7980,6 +8059,9 @@ impl<'e> Collection<'e> {
                 by.join("+")
             )));
         };
+        stats.selected_index = def.name();
+        stats.index_fields = def.effective_fields();
+        stats.index_include = def.include.clone();
 
         let covering_projection = projection.cloned();
         for &value in &unique_values {
@@ -8021,6 +8103,7 @@ impl<'e> Collection<'e> {
             let range = (as_bound(&lower), as_bound(&upper));
             let mut found = None;
             for item in db.range(rtxn, &range)? {
+                stats.index_entries_read = stats.index_entries_read.saturating_add(1);
                 let (_key, raw) = item?;
                 let raw_size = raw.len();
                 let Some((id, inc)) = index::decode_index_value(raw) else {
@@ -8035,10 +8118,12 @@ impl<'e> Collection<'e> {
                 }
                 let filter = Value::Object(filter);
                 let (doc, size) = if id_only {
+                    stats.bytes_read = stats.bytes_read.saturating_add(raw_size as u64);
                     (serde_json::json!({"_id": id}), raw_size)
                 } else if let Some(doc) =
                     covering_doc(&id, inc.as_ref(), &filter, &covering_projection)
                 {
+                    stats.bytes_read = stats.bytes_read.saturating_add(raw_size as u64);
                     (
                         match projection {
                             Some(projection) => project(&doc, projection, Some(&filter)),
@@ -8050,6 +8135,8 @@ impl<'e> Collection<'e> {
                     let Some(bytes) = self.db.get(rtxn, id.as_bytes())? else {
                         continue;
                     };
+                    stats.documents_read = stats.documents_read.saturating_add(1);
+                    stats.bytes_read = stats.bytes_read.saturating_add(bytes.len() as u64);
                     let size = bytes.len();
                     match projection {
                         Some(projection) => {
@@ -8074,7 +8161,16 @@ impl<'e> Collection<'e> {
                 size,
             )?;
         }
-        finish_lookup(values.len(), unique_out, unique_sizes, &positions)
+        stats.covering = projection.is_some() && stats.documents_read == 0;
+        finish_lookup_stats(
+            values.len(),
+            &unique_out,
+            &unique_sizes,
+            &positions,
+            &mut stats,
+        );
+        let out = finish_lookup(values.len(), unique_out, unique_sizes, &positions)?;
+        Ok((out, stats))
     }
 
     /// Explains the access path and actual counts for a `find` query.
@@ -9179,6 +9275,28 @@ fn push_lookup_result(
     out.push(doc);
     sizes.push(size);
     Ok(())
+}
+
+fn finish_lookup_stats(
+    total: usize,
+    unique_out: &[Option<Value>],
+    sizes: &[usize],
+    positions: &[usize],
+    stats: &mut LookupStats,
+) {
+    let mut found = 0usize;
+    let mut bytes = 0u64;
+    for &index in positions {
+        if unique_out.get(index).is_some_and(Option::is_some) {
+            found = found.saturating_add(1);
+        }
+        if let Some(size) = sizes.get(index) {
+            bytes = bytes.saturating_add(*size as u64);
+        }
+    }
+    stats.found = found;
+    stats.missing = total.saturating_sub(found);
+    stats.result_bytes = bytes;
 }
 
 fn finish_lookup(

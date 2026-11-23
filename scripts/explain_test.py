@@ -75,6 +75,76 @@ def main() -> None:
     expect_invalid(lambda: c.explain({"score": {"$all": 1}}))
     expect_invalid(lambda: c.explain({"score": {"$regex": "["}}))
 
+    plan = db.exec(
+        {
+            "op": "explain_lookup",
+            "coll": COLL,
+            "by": "_id",
+            "values": ["a", "missing", "a"],
+        }
+    )
+    assert plan["collection"] == COLL, plan
+    assert plan["selected_index"] == "_id_", plan
+    assert plan["index"]["primary"] is True, plan
+    assert plan["covering"] is False, plan
+    assert plan["key_counts"] == {"requested": 3, "unique": 2, "duplicates": 1}, plan
+    assert plan["found"] == 2, plan
+    assert plan["missing"] == 1, plan
+    assert plan["documents_read"] == 1, plan
+    assert plan["bytes_read"] > 0 and plan["bytes_returned"] > 0, plan
+    assert plan["elapsed_ms"] >= 0, plan
+
+    plan = db.exec(
+        {
+            "op": "explain_lookup",
+            "coll": COLL,
+            "by": "_id",
+            "values": ["a", "missing"],
+            "projection": {"_id": 1},
+        }
+    )
+    assert plan["covering"] is True, plan
+    assert plan["documents_read"] == 0, plan
+    assert plan["found"] == 1 and plan["missing"] == 1, plan
+
+    unique = db.collection("explain_lookup_unique")
+    unique.delete({}, multi=True)
+    unique.insert_many(
+        [
+            {"_id": "u1", "email": "a@example.com", "name": "A"},
+            {"_id": "u2", "email": "b@example.com", "name": "B"},
+        ]
+    )
+    unique.create_index("email", unique=True, include=["name"])
+    plan = db.exec(
+        {
+            "op": "explain_lookup",
+            "coll": unique.name,
+            "by": "email",
+            "values": ["a@example.com", "missing@example.com", "a@example.com"],
+            "fields": ["name"],
+        }
+    )
+    assert plan["selected_index"] == "email", plan
+    assert plan["index"]["fields"] == ["email"], plan
+    assert plan["index"]["include"] == ["name"], plan
+    assert plan["index"]["unique"] is True, plan
+    assert plan["covering"] is True, plan
+    assert plan["documents_read"] == 0, plan
+    assert plan["key_counts"] == {"requested": 3, "unique": 2, "duplicates": 1}, plan
+    assert plan["found"] == 2 and plan["missing"] == 1, plan
+
+    expect_invalid(
+        lambda: db.exec(
+            {
+                "op": "explain_lookup",
+                "coll": COLL,
+                "by": "kind",
+                "values": ["x"],
+            }
+        )
+    )
+
     print("explain OK")
 
 

@@ -6,9 +6,6 @@ deliberate limitations are documented in [docs/roadmap.md](docs/roadmap.md).
 
 ## P1 — lookup enhancements
 
-- [ ] Add `explain_lookup` with selected index, covering status, key counts,
-      found/missing counts, documents read, bytes returned, and elapsed time.
-      Add aggregate lookup metrics and latency histograms.
 - [ ] Add client-side `lookup_chunked` helpers that split large key lists into
       bounded requests while preserving input order and missing-key alignment.
 - [ ] Validate lookup limits consistently on missing-collection and batch-read

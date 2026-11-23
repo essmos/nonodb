@@ -52,6 +52,7 @@ pub fn authorize_request(
         Request::Find { coll, .. }
         | Request::FindOne { coll, .. }
         | Request::Lookup { coll, .. }
+        | Request::ExplainLookup { coll, .. }
         | Request::Watch { coll, .. }
         | Request::Explain { coll, .. }
         | Request::Count { coll, .. }

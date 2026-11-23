@@ -3006,15 +3006,38 @@ async fn exec_inner(
             let store = state.store.clone();
             let auth = vault_auth.clone();
             let joined = tokio::task::spawn_blocking(move || {
+                let started = std::time::Instant::now();
                 let c = read_collection(&store, &coll, auth.as_ref())?;
                 reject_vault_read(&c, auth.as_ref(), "lookup on vault collections")?;
                 let by = by
                     .unwrap_or(LookupBy::Field("_id".to_string()))
                     .into_fields();
                 let projection = lookup_projection(fields.as_deref(), projection.as_ref())?;
-                let results = c.lookup_fields(&by, &values, projection.as_ref())?;
-                let found = results.iter().filter(|doc| doc.is_some()).count();
-                Ok::<Value, ApiError>(json!({ "results": results, "found": found }))
+                let report = c.lookup_fields_report(&by, &values, projection.as_ref());
+                lookup_response(&coll, &by, report, started.elapsed(), false)
+            });
+            read_result(joined).await
+        }
+
+        Request::ExplainLookup {
+            coll,
+            by,
+            values,
+            fields,
+            projection,
+        } => {
+            let store = state.store.clone();
+            let auth = vault_auth.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                let started = std::time::Instant::now();
+                let c = read_collection(&store, &coll, auth.as_ref())?;
+                reject_vault_read(&c, auth.as_ref(), "explain_lookup on vault collections")?;
+                let by = by
+                    .unwrap_or(LookupBy::Field("_id".to_string()))
+                    .into_fields();
+                let projection = lookup_projection(fields.as_deref(), projection.as_ref())?;
+                let report = c.lookup_fields_report(&by, &values, projection.as_ref());
+                lookup_response(&coll, &by, report, started.elapsed(), true)
             });
             read_result(joined).await
         }
@@ -4142,6 +4165,71 @@ fn audit_response(
     }
 }
 
+fn lookup_response(
+    coll: &str,
+    by: &[String],
+    report: nonodb_core::Result<(Vec<Option<Value>>, nonodb_core::LookupStats)>,
+    elapsed: std::time::Duration,
+    explain: bool,
+) -> Result<Value, ApiError> {
+    match report {
+        Ok((results, stats)) => {
+            let bytes_returned = if explain {
+                u64::try_from(
+                    serde_json::to_vec(&results)
+                        .map(|bytes| bytes.len())
+                        .unwrap_or_default(),
+                )
+                .unwrap_or_default()
+            } else {
+                stats.result_bytes
+            };
+            metrics::record_lookup(elapsed, &stats, bytes_returned, true, explain);
+            if explain {
+                let by = Value::Array(by.iter().cloned().map(Value::String).collect());
+                Ok(json!({
+                    "collection": coll,
+                    "by": by,
+                    "selected_index": stats.selected_index,
+                    "index": {
+                        "name": stats.selected_index,
+                        "fields": stats.index_fields,
+                        "include": stats.index_include,
+                        "primary": stats.primary,
+                        "unique": true,
+                    },
+                    "covering": stats.covering,
+                    "key_counts": {
+                        "requested": stats.requested_keys,
+                        "unique": stats.unique_keys,
+                        "duplicates": stats.requested_keys.saturating_sub(stats.unique_keys),
+                    },
+                    "found": stats.found,
+                    "missing": stats.missing,
+                    "documents_read": stats.documents_read,
+                    "index_entries_read": stats.index_entries_read,
+                    "bytes_read": stats.bytes_read,
+                    "bytes_returned": bytes_returned,
+                    "elapsed_ms": elapsed.as_secs_f64() * 1000.0,
+                }))
+            } else {
+                let found = results.iter().filter(|doc| doc.is_some()).count();
+                Ok(json!({ "results": results, "found": found }))
+            }
+        }
+        Err(err) => {
+            metrics::record_lookup(
+                elapsed,
+                &nonodb_core::LookupStats::default(),
+                0,
+                false,
+                explain,
+            );
+            Err(err.into())
+        }
+    }
+}
+
 fn lookup_projection(
     fields: Option<&[String]>,
     projection: Option<&Value>,
@@ -4375,6 +4463,7 @@ fn cacheable(req: &Request) -> bool {
         Request::Find { .. }
             | Request::FindOne { .. }
             | Request::Lookup { .. }
+            | Request::ExplainLookup { .. }
             | Request::Explain { .. }
             | Request::Count { .. }
             | Request::Aggregate { .. }
@@ -4579,7 +4668,15 @@ fn execute_read(
             fields,
             projection,
         } => {
+            let started = std::time::Instant::now();
             let Some(c) = store.collection_at(rtxn, &coll)? else {
+                metrics::record_lookup(
+                    started.elapsed(),
+                    &nonodb_core::LookupStats::default(),
+                    0,
+                    true,
+                    false,
+                );
                 return Ok(json!({
                     "results": vec![Value::Null; values.len()],
                     "found": 0,
@@ -4590,9 +4687,60 @@ fn execute_read(
                 .unwrap_or(LookupBy::Field("_id".to_string()))
                 .into_fields();
             let projection = lookup_projection(fields.as_deref(), projection.as_ref())?;
-            let results = c.lookup_fields_in(rtxn, &by, &values, projection.as_ref())?;
-            let found = results.iter().filter(|doc| doc.is_some()).count();
-            Ok(json!({ "results": results, "found": found }))
+            let report = c.lookup_fields_report_in(rtxn, &by, &values, projection.as_ref());
+            lookup_response(&coll, &by, report, started.elapsed(), false)
+        }
+        Request::ExplainLookup {
+            coll,
+            by,
+            values,
+            fields,
+            projection,
+        } => {
+            let started = std::time::Instant::now();
+            let by = by
+                .unwrap_or(LookupBy::Field("_id".to_string()))
+                .into_fields();
+            let projection = lookup_projection(fields.as_deref(), projection.as_ref())?;
+            let Some(c) = store.collection_at(rtxn, &coll)? else {
+                let stats = nonodb_core::LookupStats {
+                    requested_keys: values.len(),
+                    missing: values.len(),
+                    selected_index: "_id_".to_string(),
+                    index_fields: by.clone(),
+                    primary: true,
+                    ..nonodb_core::LookupStats::default()
+                };
+                metrics::record_lookup(started.elapsed(), &stats, 0, true, true);
+                return Ok(json!({
+                    "collection": coll,
+                    "by": by,
+                    "selected_index": stats.selected_index,
+                    "index": {
+                        "name": stats.selected_index,
+                        "fields": stats.index_fields,
+                        "include": stats.index_include,
+                        "primary": stats.primary,
+                        "unique": true,
+                    },
+                    "covering": false,
+                    "key_counts": {
+                        "requested": stats.requested_keys,
+                        "unique": 0,
+                        "duplicates": 0,
+                    },
+                    "found": 0,
+                    "missing": stats.missing,
+                    "documents_read": 0,
+                    "index_entries_read": 0,
+                    "bytes_read": 0,
+                    "bytes_returned": 0,
+                    "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0,
+                }));
+            };
+            reject_vault_read(&c, None, "explain_lookup on vault collections")?;
+            let report = c.lookup_fields_report_in(rtxn, &by, &values, projection.as_ref());
+            lookup_response(&coll, &by, report, started.elapsed(), true)
         }
         Request::Explain {
             coll,

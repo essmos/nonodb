@@ -47,7 +47,7 @@ pub use aggregate::MAX_AGGREGATE_DOCS;
 pub use backup_info::INFO_FILE as BACKUP_INFO_FILE;
 pub use collection::{
     project_document, Collection, FindAndModifyOptions, FindAndModifyOutcome, FindQuery, IndexSpec,
-    ReindexReport, UpdateOutcome, MAX_LOOKUP_RESPONSE_BYTES, MAX_LOOKUP_VALUES,
+    LookupStats, ReindexReport, UpdateOutcome, MAX_LOOKUP_RESPONSE_BYTES, MAX_LOOKUP_VALUES,
 };
 pub use error::{Error, Result};
 pub use history::{HistoryEntry, DEFAULT_HISTORY_MAX_VERSIONS};

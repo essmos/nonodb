@@ -100,6 +100,32 @@ their duration is client waiting time. Compute p95 latency with:
 histogram_quantile(0.95, sum by (le, op) (rate(nonodb_request_duration_seconds_bucket[5m])))
 ```
 
+Ordered point lookups also have dedicated counters and a histogram:
+
+```text
+nonodb_lookup_requests_total
+nonodb_lookup_explains_total
+nonodb_lookup_keys_total
+nonodb_lookup_unique_keys_total
+nonodb_lookup_found_total
+nonodb_lookup_missing_total
+nonodb_lookup_documents_read_total
+nonodb_lookup_index_entries_read_total
+nonodb_lookup_bytes_read_total
+nonodb_lookup_bytes_returned_total
+nonodb_lookup_errors_total
+nonodb_lookup_duration_ns_total
+nonodb_lookup_duration_seconds_bucket{op="lookup",le="0.001"}
+nonodb_lookup_duration_seconds_bucket{op="explain_lookup",le="0.001"}
+```
+
+`nonodb_lookup_duration_seconds` measures the lookup execution itself, not the
+HTTP round trip. Use it to watch index coverage and document-fetch rates:
+
+```promql
+histogram_quantile(0.95, sum by (le, op) (rate(nonodb_lookup_duration_seconds_bucket[5m])))
+```
+
 ## OpenTelemetry
 
 The daemon does not embed the OpenTelemetry SDK or push OTLP itself. This keeps

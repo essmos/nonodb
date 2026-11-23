@@ -163,6 +163,7 @@ client timeout with `NONODB_TIMEOUT` or the `timeout=` argument.
 | [`find`](#find) | Query documents |
 | [`find_one`](#find_one) | Return one document |
 | [`lookup`](#lookup) | Ordered point lookups by `_id` or a unique index |
+| [`explain_lookup`](#explain_lookup) | Index, coverage, and counters for a lookup |
 | [`watch`](#watch) | Long-poll append-only events by sortable `_id` |
 | [`explain`](#explain) | Show the selected plan, bounds, and actual counts |
 | [`update`](#update) | Update or upsert documents |
@@ -433,6 +434,69 @@ Semantics:
   arbitrary predicates.
 - Non-unique lookups and lookups without a matching index are not supported yet.
 - Vault collections reject `lookup`.
+
+## explain_lookup
+
+Returns the plan and exact execution counters for a lookup without returning
+the looked-up documents. It accepts the same `by`, `values`, `fields`, and
+`projection` fields as [`lookup`](#lookup), and the same validation applies.
+
+```json
+{
+  "op": "explain_lookup",
+  "coll": "users",
+  "by": "email",
+  "values": ["ada@example.com", "missing@example.com", "ada@example.com"],
+  "fields": ["name", "status"]
+}
+```
+
+Response:
+
+```json
+{
+  "ok": true,
+  "result": {
+    "collection": "users",
+    "by": ["email"],
+    "selected_index": "email",
+    "index": {
+      "name": "email",
+      "fields": ["email"],
+      "include": ["name", "status"],
+      "primary": false,
+      "unique": true
+    },
+    "covering": true,
+    "key_counts": {"requested": 3, "unique": 2, "duplicates": 1},
+    "found": 2,
+    "missing": 1,
+    "documents_read": 0,
+    "index_entries_read": 2,
+    "bytes_read": 96,
+    "bytes_returned": 74,
+    "elapsed_ms": 0.184
+  }
+}
+```
+
+Fields:
+
+| Field | Meaning |
+|---|---|
+| `selected_index` | `_id_` for the primary key, otherwise the secondary index name |
+| `index` | Index name, fields, covering `include` fields, primary flag, and uniqueness |
+| `covering` | Whether the projection was served from index data without document reads. `_id`-only projections are always covering |
+| `key_counts` | Requested keys, distinct keys after deduplication, and duplicate inputs |
+| `found` / `missing` | Non-null and null results, counted in input order including duplicates |
+| `documents_read` | Documents fetched from the main collection |
+| `index_entries_read` | Index entries examined while resolving keys |
+| `bytes_read` | Stored document or index-value bytes read |
+| `bytes_returned` | Serialized size of the lookup results that would be returned |
+| `elapsed_ms` | Lookup execution time, excluding HTTP transport and response encoding |
+
+`explain_lookup` is a read operation and requires the same `read:<db>/<coll>`
+scope as `lookup`. It is also accepted inside a read batch.
 
 ## watch
 
@@ -2616,7 +2680,7 @@ Response:
 
 Rules:
 
-- Allowed operations: `find`, `find_one`, `lookup`, `count`, `list_indexes`,
+- Allowed operations: `find`, `find_one`, `lookup`, `explain_lookup`, `count`, `list_indexes`,
   `list_text_indexes`, `list_fuzzy_indexes`, `list_vector_indexes`,
   `list_collections`, `history`, `get_version`, `search`, `fuzzy`,
   `vector_search`.
