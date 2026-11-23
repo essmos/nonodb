@@ -172,7 +172,9 @@ nonodb-cli branch app1-ci \
 ```
 
 See [Branching a database](branching.md). On a CoW filesystem this is a reflink
-clone; elsewhere it is a full copy.
+clone; elsewhere it is a full copy. Snapshot files normally contain only
+`data.mdb`; the branch rebuilds missing search/fuzzy/ANN sidecars during the
+clone.
 
 To select the newest snapshot at or before a recovery time, pass the snapshot
 root and `--to`:

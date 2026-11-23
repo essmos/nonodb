@@ -129,12 +129,14 @@ def main() -> int:
             collection = db.collection(COLL)
             collection.insert_many(
                 [
-                    {"_id": str(i), "n": i, "bio": "rust developer"}
+                    {"_id": str(i), "n": i, "bio": "rust developer", "vec": [i, 1]}
                     for i in range(5)
                 ]
             )
             collection.create_index("n")
             collection.create_text_index("bio")
+            collection.create_fuzzy_index("bio")
+            collection.create_vector_index("vec", 2, "cosine")
             db.close()
             admin.close()
         finally:
@@ -161,23 +163,31 @@ def main() -> int:
         )
         branch_json(cli, "branch", "--db", SOURCE, "--data", str(data), "--force", "--verify")
         no_sidecars = branch_json(
-            cli, "nosidecars", "--db", SOURCE, "--data", str(data), "--no-sidecars"
+            cli,
+            "nosidecars",
+            "--db",
+            SOURCE,
+            "--data",
+            str(data),
+            "--no-sidecars",
+            "--verify",
         )
         assert no_sidecars["sidecars"] == [], no_sidecars
+        assert no_sidecars["verification"]["documents"] == 5, no_sidecars
 
-        # Build a real snapshot file plus its sidecar directory.
+        # Build the real daemon snapshot shape: only data-<ms>.mdb, no sidecars.
         backup = tmp / "backup"
         run_cli(cli, "--db", SOURCE, "backup", data, backup)
         snap_root = tmp / "snapshots" / SOURCE
         snap_root.mkdir(parents=True)
         snapshot = snap_root / "data-1700000000000.mdb"
         shutil.copy2(backup / "data.mdb", snapshot)
-        if (backup / "search").is_dir():
-            shutil.copytree(backup / "search", snap_root / "search")
         snapshot_output = branch_json(
             cli, "snapshot", "--from-snapshot", str(snapshot), "--data", str(data), "--verify"
         )
         assert snapshot_output["verification"]["documents"] == 5, snapshot_output
+        assert snapshot_output["sidecars"] == ["search"], snapshot_output
+        assert snapshot_output["sidecar_rebuilds"] >= 2, snapshot_output
         assert (data / "snapshot" / "search").is_dir(), snapshot_output
         assert hashlib.sha256(source_data.read_bytes()).hexdigest() == source_hash
 
@@ -189,13 +199,16 @@ def main() -> int:
             assert source_db.collection(COLL).count() == 5
             assert branch_db.collection(COLL).count() == 5
             assert snapshot_db.collection(COLL).count() == 5
-            assert [d["_id"] for d in branch_db.collection(COLL).search("bio", "rust")] == [
-                "0",
-                "1",
-                "2",
-                "3",
-                "4",
-            ]
+            expected_ids = ["0", "1", "2", "3", "4"]
+            assert [
+                d["_id"] for d in branch_db.collection(COLL).search("bio", "rust")
+            ] == expected_ids
+            assert [
+                d["_id"] for d in snapshot_db.collection(COLL).search("bio", "rust")
+            ] == expected_ids
+            assert len(snapshot_db.collection(COLL).fuzzy("bio", "rust")) == 5
+            hits = snapshot_db.collection(COLL).vector_search("vec", [0, 1], limit=3)
+            assert hits and hits[0]["_id"] == "0", hits
             branch_db.collection(COLL).insert({"_id": "branch-only", "n": 99})
             assert branch_db.collection(COLL).count() == 6
             assert source_db.collection(COLL).count() == 5

@@ -383,8 +383,11 @@ nonodb-cli branch app1-ci --from-snapshot /snapshots/app1/data-1767225600000.mdb
 The target is `<data>/<target>/`. Reflink/clonefile is used when the filesystem
 supports it; otherwise the command falls back to a full copy and reports
 `method: "copy"`. `--force` replaces an existing target only after the new clone
-is complete, `--no-sidecars` omits `search/` and `vector-ann/`, and `--verify`
-runs a deep check. Auth and instance-wide files are not copied. See
+is complete, and `--verify` runs a deep check. Missing text/fuzzy/ANN sidecars are
+rebuilt automatically, including for data-only snapshots. `--no-sidecars` skips
+copying and rebuilding them; text/fuzzy/vector queries then fail until a daemon
+restart with `NONODB_REBUILD_MISSING_SEARCH=1`. Auth and instance-wide files are
+not copied. See
 [Branching a database](branching.md).
 
 ## backup

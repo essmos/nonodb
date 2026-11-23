@@ -3,7 +3,7 @@
 NonoDB can create an offline branch of a database for CI, integration tests,
 migration rehearsals, or experiments. A branch is a complete, independent
 database with its own `data.mdb`, writer, lock file, indexes, TTL/history
-metadata, and (optionally) copied search/vector sidecars.
+metadata, and search/vector sidecars copied or rebuilt from the data.
 
 ```bash
 # Stop the daemon first when cloning a live database directory.
@@ -42,9 +42,16 @@ nonodb-cli branch app1-ci \
 ```
 
 `--from-snapshot` accepts a `data-<unix-ms>.mdb` file, a `data.mdb` file, or a
-directory containing `data.mdb`. Sidecars are looked up next to that file or
-inside that directory, so a snapshot root that contains `search/` and
-`vector-ann/` preserves them.
+directory containing `data.mdb` or `data-<unix-ms>.mdb` snapshots (the newest
+snapshot is selected). Sidecars are looked up next to that file or inside that
+directory, so a snapshot root that contains `search/` and `vector-ann/`
+preserves them.
+
+Daemon snapshots normally contain only `data-<unix-ms>.mdb`; the search and
+vector-ann sidecar directories stay with the live database. The branch command
+therefore rebuilds missing text, fuzzy, and enabled ANN sidecars inside the
+staging clone before publishing it. The default snapshot CI flow below produces
+a clone that can answer text, fuzzy, and vector queries immediately.
 
 ## Copy-on-write
 
@@ -63,12 +70,16 @@ nonodb-cli --db app1 branch app1-ci --data /var/lib/nonodb --json
   "bytes": 734003200,
   "elapsed_ms": 12,
   "sidecars": ["search"],
+  "sidecar_rebuilds": 0,
   "verification": null
 }
 ```
 
 If the filesystem or kernel does not support reflinking, the command falls back
 to a normal byte copy and reports `"method": "copy"`, plus a `"warning"` field.
+`bytes` is the final size of the clone (data plus sidecars), and
+`sidecar_rebuilds` reports how many missing search/fuzzy/ANN sidecars were built
+during the clone.
 The human-readable output prints the warning on stderr. The result is correct,
 but not instant. `--verify` adds a deep LMDB/index check; it does not change the
 copy method.
@@ -81,14 +92,19 @@ copy method.
 | `--from-snapshot PATH` | Branch from a snapshot instead of the selected live database |
 | `--force` | Replace an existing target only after the new branch is complete |
 | `--verify` | Deep-verify the branch before publishing it |
-| `--no-sidecars` | Skip `search/` and `vector-ann/`; indexes rebuild on first use |
+| `--no-sidecars` | Skip copying and rebuilding `search/` and `vector-ann/` |
 | `--json` | Machine-readable method, size, elapsed time, sidecars, verification |
 
 The source is never modified. `lock.mdb` is not copied; the daemon creates a
-new lock file for the branch. `--force` removes the old target only after the
-temporary branch has been created and verified, so a failed clone does not
-leave a half-written target. Auth, TLS, backup configuration, audit logs, and
-other instance-wide files are not copied.
+new lock file for the branch. `--force` swaps the old target out only after the
+temporary branch has been created and verified, so a failed clone leaves the
+existing target intact. Auth, TLS, backup configuration, audit logs, and other
+instance-wide files are not copied.
+
+`--no-sidecars` is an explicit opt-out. A clone made with it has no search,
+fuzzy, or ANN sidecars, so those queries fail until you restart the daemon with
+`NONODB_REBUILD_MISSING_SEARCH=1` (or rebuild the branch without the flag). Do
+not use `--no-sidecars` for a CI branch that runs text, fuzzy, or vector tests.
 
 ## CI example
 
@@ -114,8 +130,10 @@ merge/rebase between branches; use a new branch for each isolated test run.
   writer is active; use a snapshot for a live database.
 - Branching a stopped database directory is a filesystem copy, not a logical
   dump. Do not branch a directory while another process is writing it.
-- Sidecars are derived data. `--no-sidecars` is valid, but the first text,
-  fuzzy, or vector query may rebuild them.
+- Sidecars are derived data. A normal branch copies them and rebuilds any that
+  are missing; `--no-sidecars` deliberately leaves them absent. The daemon does
+  not rebuild them on first query, only at startup when
+  `NONODB_REBUILD_MISSING_SEARCH=1` is set.
 - Reflink performance depends on the filesystem. XFS, Btrfs, and ZFS are common
   choices; ext4 and some overlay filesystems usually fall back to a full copy.
 - A branch has no merge/diff/rebase support and is not registered in a cluster

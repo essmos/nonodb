@@ -132,7 +132,31 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
 fn resolve_source(options: &Options) -> Result<(PathBuf, PathBuf), String> {
     if let Some(snapshot) = &options.snapshot {
         let (data, sidecar_root) = if snapshot.is_dir() {
-            (snapshot.join("data.mdb"), snapshot.clone())
+            let direct = snapshot.join("data.mdb");
+            if direct.is_file() {
+                (direct, snapshot.clone())
+            } else {
+                let latest = fs::read_dir(snapshot)
+                    .map_err(|error| format!("read snapshot dir {}: {error}", snapshot.display()))?
+                    .filter_map(|entry| entry.ok())
+                    .filter_map(|entry| {
+                        let name = entry.file_name();
+                        let name = name.to_str()?;
+                        if name.starts_with("data-") && name.ends_with(".mdb") {
+                            Some(entry.path())
+                        } else {
+                            None
+                        }
+                    })
+                    .max_by(|left, right| left.file_name().cmp(&right.file_name()))
+                    .ok_or_else(|| {
+                        format!(
+                            "snapshot dir {} has no data.mdb or data-<unix-ms>.mdb",
+                            snapshot.display()
+                        )
+                    })?;
+                (latest, snapshot.clone())
+            }
         } else {
             let root = snapshot
                 .parent()
@@ -338,6 +362,51 @@ fn replace_target(temp: &Path, target: &Path, root: &Path, name: &str) -> Result
     }
 }
 
+fn tree_size(path: &Path) -> u64 {
+    let Ok(entries) = fs::read_dir(path) else {
+        return 0;
+    };
+    entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| match entry.file_type() {
+            Ok(ty) if ty.is_dir() => tree_size(&entry.path()),
+            Ok(ty) if ty.is_file() => entry.metadata().map(|meta| meta.len()).unwrap_or(0),
+            _ => 0,
+        })
+        .sum()
+}
+
+fn rebuild_sidecars(path: &Path) -> Result<usize, String> {
+    let data_size = fs::metadata(path.join("data.mdb"))
+        .map_err(|error| format!("metadata {}: {error}", path.display()))?
+        .len();
+    // The clone is opened offline with a map large enough for the copied data.
+    // Virtual address space is not allocated up front, so a generous map is safe.
+    let map_size = usize::try_from(data_size.saturating_mul(2).max(1024 * 1024 * 1024))
+        .map_err(|_| "database is too large for this platform".to_string())?;
+    let store = nonodb_core::Store::open_with_map_size(path, map_size)
+        .map_err(|error| format!("open branch for sidecar rebuild: {error}"))?;
+    let names = store
+        .collections()
+        .map_err(|error| format!("list branch collections: {error}"))?;
+    let mut rebuilt = 0usize;
+    for name in names {
+        let collection = store
+            .collection(&name)
+            .map_err(|error| format!("open branch collection `{name}`: {error}"))?;
+        rebuilt += collection
+            .rebuild_missing_search_sidecars()
+            .map_err(|error| format!("rebuild branch sidecars for `{name}`: {error}"))?;
+    }
+    let env = store.env().clone();
+    drop(store);
+    env.prepare_for_closing().wait();
+    // The daemon creates its own lock file on first start. Do not publish the
+    // temporary lock created while rebuilding.
+    let _ = fs::remove_file(path.join("lock.mdb"));
+    Ok(rebuilt)
+}
+
 fn run_branch(
     options: &Options,
 ) -> Result<(Value, Option<nonodb_core::VerificationReport>), String> {
@@ -363,16 +432,27 @@ fn run_branch(
         let started = Instant::now();
         let (bytes, method) = copy_file(&source_data, &temp.join("data.mdb"))?;
         let mut stats = CopyStats { bytes, method };
-        let mut sidecars = Vec::new();
         if !options.no_sidecars {
             for name in ["search", "vector-ann"] {
                 let from = source_root.join(name);
                 if from.is_dir() {
                     copy_tree(&from, &temp.join(name), &mut stats)?;
-                    sidecars.push(name.to_string());
                 }
             }
         }
+        // Snapshots contain only `data.mdb`, so rebuild missing text, fuzzy and
+        // vector sidecars inside the staging clone before it is published.
+        let sidecar_rebuilds = if options.no_sidecars {
+            0
+        } else {
+            rebuild_sidecars(&temp)?
+        };
+        let sidecars: Vec<String> = ["search", "vector-ann"]
+            .into_iter()
+            .filter(|name| temp.join(name).is_dir())
+            .map(str::to_string)
+            .collect();
+        let final_bytes = tree_size(&temp);
 
         let mut verification = if options.verify {
             let report = if sidecars.is_empty() {
@@ -396,9 +476,10 @@ fn run_branch(
             "target_path": target_dir.display().to_string(),
             "source_path": source_data.display().to_string(),
             "method": stats.method.as_str(),
-            "bytes": stats.bytes,
+            "bytes": final_bytes,
             "elapsed_ms": started.elapsed().as_millis() as u64,
             "sidecars": sidecars,
+            "sidecar_rebuilds": sidecar_rebuilds,
             "verification": verification
                 .as_ref()
                 .map(|report| serde_json::to_value(report).unwrap_or(Value::Null)),
@@ -535,23 +616,48 @@ mod tests {
     }
 
     #[test]
+    fn copy_tree_preserves_sidecar_layout() {
+        let root = temp_root("tree");
+        let source = root.join("source");
+        let target = root.join("target");
+        fs::create_dir_all(source.join("search/digest")).unwrap();
+        fs::write(source.join("search/digest/seg-000001.seg"), b"search").unwrap();
+        fs::create_dir_all(source.join("vector-ann/digest")).unwrap();
+        fs::write(source.join("vector-ann/digest/ann.bin"), b"vectors").unwrap();
+        let (_, method) = copy_file_mode(
+            &source.join("search/digest/seg-000001.seg"),
+            &root.join("probe"),
+            false,
+        )
+        .unwrap();
+        let mut stats = CopyStats { bytes: 0, method };
+        copy_tree(&source, &target, &mut stats).unwrap();
+        assert_eq!(
+            fs::read(target.join("search/digest/seg-000001.seg")).unwrap(),
+            b"search"
+        );
+        assert_eq!(
+            fs::read(target.join("vector-ann/digest/ann.bin")).unwrap(),
+            b"vectors"
+        );
+        assert_eq!(stats.bytes, 13);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn branch_does_not_copy_lock_file() {
         let root = temp_root("lock");
         let source_root = root.join("source");
         fs::create_dir_all(&source_root).unwrap();
         fs::write(source_root.join("data.mdb"), b"source bytes").unwrap();
         fs::write(source_root.join("lock.mdb"), b"must not be copied").unwrap();
-        fs::create_dir_all(source_root.join("search/digest")).unwrap();
-        fs::write(source_root.join("search/digest/seg-000001.seg"), b"search").unwrap();
-        fs::create_dir_all(source_root.join("vector-ann/digest")).unwrap();
-        fs::write(source_root.join("vector-ann/digest/ann.bin"), b"vectors").unwrap();
         let options = Options {
             data_root: root.clone(),
             target: "clone".into(),
             snapshot: Some(source_root.join("data.mdb")),
             force: false,
             verify: false,
-            no_sidecars: false,
+            no_sidecars: true,
             json: true,
         };
         let (output, _) = run_branch(&options).unwrap();
@@ -561,15 +667,28 @@ mod tests {
             b"source bytes"
         );
         assert!(!root.join("clone/lock.mdb").exists());
-        assert_eq!(
-            fs::read(root.join("clone/search/digest/seg-000001.seg")).unwrap(),
-            b"search"
-        );
-        assert_eq!(
-            fs::read(root.join("clone/vector-ann/digest/ann.bin")).unwrap(),
-            b"vectors"
-        );
         assert!(source_root.join("lock.mdb").is_file());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn snapshot_directory_uses_the_newest_snapshot_file() {
+        let root = temp_root("snapdir");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("data-1000.mdb"), b"old").unwrap();
+        fs::write(root.join("data-2000.mdb"), b"new").unwrap();
+        let options = Options {
+            data_root: root.join("data"),
+            target: "clone".into(),
+            snapshot: Some(root.clone()),
+            force: false,
+            verify: false,
+            no_sidecars: true,
+            json: true,
+        };
+        let (data, sidecars) = resolve_source(&options).unwrap();
+        assert_eq!(data, root.join("data-2000.mdb"));
+        assert_eq!(sidecars, root);
         fs::remove_dir_all(root).unwrap();
     }
 
