@@ -43,6 +43,8 @@ Implemented:
 - ordered point lookups by `_id` or a unique single-field or compound index,
   with covering projections, index-only `_id` projections, `_id` exclusion, key
   deduplication, and a response size cap;
+- client-side `lookup_join` helpers in Python, Node.js, Rust, and Go, preserving
+  order and missing-key alignment over chunked lookups;
 - durable background jobs through an ordinary `_jobs` collection and external
   workers, with leases, retries, and idempotent enqueue;
 - outbox events through an ordinary `_events` collection, with atomic data +
@@ -62,6 +64,8 @@ Implemented:
 - per-collection append-only document revision history with retention (`0` disables);
 - document TTL with collection defaults, per-document overrides, and background expiry;
 - BSON-compatible dates with RFC 3339 input, UTC normalization, indexed ranges, and sorting;
+- stored BSON regular-expression values with `$type: "regex"`, exact `$eq`, and
+  documented unindexed scan behavior;
 - Unix-socket daemon, optional TCP/TLS and mutual TLS, file-based principals and scopes, uid/gid allow-lists;
 - mutual TLS client revocation through the auth registry plus configurable CRL
   files/URLs and OCSP, with refresh, caching, and fail-closed defaults;
@@ -70,6 +74,11 @@ Implemented:
   snapshot-based `restore --to <timestamp>`, and opt-in snapshot + segmented
   WAL point-in-time recovery with hard size/age limits and `wal_full` write
   rejection;
+- verified restore-in-place through the admin API and GUI, with preflight
+  verification, typed confirmation, audit entries, and a rollback safety
+  snapshot;
+- per-database data/index/history/sidecar quotas with API/CLI usage reporting,
+  soft warnings, and hard `quota_exceeded` write rejection;
 - `scripts/nonodb-migrate.py` for quiesced MongoDB migration with checksums and
   an opt-in MongoDB wire shadow mode with JSONL diff reports;
 - offline `nonodb-cli branch` clones with reflink/clonefile, snapshot sources,
