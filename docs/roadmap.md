@@ -255,7 +255,7 @@ comparison and practical migration caveats.
   use the restic engine.
 - No online schema migration framework.
 - No native compression at rest; restic repositories compress their own data.
-- No storage encryption; use filesystem/volume encryption if needed.
+- No native storage encryption; use [filesystem or volume encryption](encryption-at-rest.md) for the data directory.
 - No multi-tenant isolation inside one database.
 - No built-in TLS certificate rotation or secret management.
 

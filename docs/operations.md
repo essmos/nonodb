@@ -1075,5 +1075,7 @@ vault key material are outside LMDB and are never affected by this setting.
   secret manager, not next to the LMDB backup.
 - Remember that vault encryption is applied inside the daemon; it protects data
   at rest, not plaintext in daemon memory. See [Vault collections](vault.md).
+- Put the data directory on encrypted storage and keep volume, vault, and backup
+  keys outside that volume. See [Encryption at rest](encryption-at-rest.md).
 - Monitor `errors_total`, `queue_len`, and disk space.
 - Keep the OS, Rust toolchain, and dependencies patched.
