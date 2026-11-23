@@ -23,6 +23,5 @@ deliberate limitations are documented in [docs/roadmap.md](docs/roadmap.md).
 - [ ] Publish `nonodb-client` to PyPI using the prepared manual workflow.
 - [ ] Client-side `lookup_join` helpers in Python, Node.js, Rust, and Go,
       preserving order and missing-key alignment.
-- [ ] Certificate pinning for outgoing replication and client TLS connections.
 - [ ] Stored BSON regex values with matching `$type` entries and documented
       index behavior.
