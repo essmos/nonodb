@@ -6,7 +6,6 @@ deliberate limitations are documented in [docs/roadmap.md](docs/roadmap.md).
 
 ## Replication
 
-- [ ] Add full automatic rejoin test coverage for multi-database catalogs.
 - [ ] Alert rule for replication certificate expiry. Lag alerts already exist.
 
 ## P1 — query and update compatibility

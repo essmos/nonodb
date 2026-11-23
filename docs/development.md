@@ -203,6 +203,7 @@ python3 scripts/replication_test.py         # replication log, snapshot bootstra
 python3 scripts/replication_failover_test.py # quorum promotion fences and demotes the old source
 python3 scripts/replication_lease_test.py    # primary self-demotes after losing quorum lease
 python3 scripts/replication_election_test.py # candidate wins auto-election after primary failure
+python3 scripts/replication_partition_test.py # partition, failover, and multi-database catalog rejoin
 python3 scripts/replication_cluster_test.py  # 5-host cluster, dynamic joins, failover, reconvergence
 python3 scripts/replication_join_test.py     # join existing primary, restart, snapshot, search sidecars
 python3 scripts/replication_sidecar_test.py  # snapshot bootstrap with segment text/fuzzy/ANN sidecars
@@ -309,6 +310,7 @@ scripts are:
 | `scripts/replication_failover_test.py` | quorum promotion demotes and fences the old source, exposes the new `write_url`, validates `/readyz/write` and `Location` routing, persists votes, and rejects writes on the demoted node |
 | `scripts/replication_lease_test.py` | primary renews a quorum lease and self-demotes after losing voter majority |
 | `scripts/replication_election_test.py` | preferred candidate wins a quorum election after the primary disappears, exposes `write_url`/`readyz/write`, while a delayed candidate and followers switch source |
+| `scripts/replication_partition_test.py` | network partition fences the old primary, a quorum candidate is promoted, and the old primary automatically rejoins and catches up the default plus non-default database catalog and data |
 | `scripts/replication_cluster_test.py` | 5-host cluster under continuous writes, dynamic replica joins, snapshot catch-up, acks, failover, source propagation, and post-failover convergence |
 | `scripts/replication_join_test.py` | join an already-populated primary from a running replica, controlled restart, snapshot bootstrap, and text/fuzzy/vector search after sidecar rebuild |
 | `scripts/replication_sidecar_test.py` | snapshot bootstrap of a primary with segment-backed text/fuzzy indexes and vector ANN; replica rebuilds sidecars and serves text, fuzzy, and vector search |
