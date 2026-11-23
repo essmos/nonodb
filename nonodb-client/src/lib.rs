@@ -1227,6 +1227,42 @@ impl Collection<'_> {
         value_array(result.get("results").cloned().unwrap_or(Value::Null))
     }
 
+    /// Ordered lookups split into bounded requests.
+    ///
+    /// The concatenated result has the same length and order as `values`, with
+    /// `Value::Null` for missing keys. `chunk_size` must be between 1 and
+    /// 10,000.
+    pub fn lookup_chunked<V: Serialize>(
+        &self,
+        by: &str,
+        values: &[V],
+        fields: Option<&[String]>,
+        chunk_size: usize,
+    ) -> Result<Vec<Value>> {
+        self.lookup_with_chunked(&[by], values, fields, None, chunk_size)
+    }
+
+    /// General ordered lookup split into bounded requests.
+    pub fn lookup_with_chunked<V: Serialize>(
+        &self,
+        by: &[&str],
+        values: &[V],
+        fields: Option<&[String]>,
+        projection: Option<&Value>,
+        chunk_size: usize,
+    ) -> Result<Vec<Value>> {
+        if !(1..=10_000).contains(&chunk_size) {
+            return Err(Error::Config(
+                "lookup chunk_size must be between 1 and 10000".to_string(),
+            ));
+        }
+        let mut out = Vec::with_capacity(values.len());
+        for chunk in values.chunks(chunk_size) {
+            out.extend(self.lookup_with(by, chunk, fields, projection)?);
+        }
+        Ok(out)
+    }
+
     /// Returns one document by `_id` or a unique index.
     pub fn lookup_one<V: Serialize>(
         &self,

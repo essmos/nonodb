@@ -132,6 +132,15 @@ export class Collection {
       projection?: Record<string, unknown>;
     },
   ): Promise<Array<any | null>>;
+  lookupChunked(
+    by: string | string[],
+    values: Iterable<unknown>,
+    options?: {
+      chunkSize?: number;
+      fields?: string[];
+      projection?: Record<string, unknown>;
+    },
+  ): Promise<Array<any | null>>;
   lookupOne(
     by: string | string[],
     value: unknown,

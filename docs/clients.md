@@ -434,6 +434,12 @@ docs = articles.lookup(
 
 article = articles.lookup_one("slug", "async-rust", projection={"title": 1})
 ids = articles.get_many(["a", "b", "missing"])
+chunked = articles.lookup_chunked(
+    "slug",
+    large_slug_list,
+    chunk_size=1000,
+    fields=["title", "status"],
+)
 
 # Compound unique index: tenant_id + slug.
 articles.create_index(fields=["tenant_id", "slug"], unique=True)
@@ -469,6 +475,12 @@ let rows = articles.lookup_with(
     Some(&json!({"title": 1, "_id": 0})),
 )?;
 let ids = articles.get_many(["a", "b", "missing"])?;
+let chunked = articles.lookup_chunked(
+    "slug",
+    &large_slug_list,
+    Some(&["title".to_string(), "status".to_string()]),
+    1000,
+)?;
 ```
 
 Node.js:
@@ -483,6 +495,10 @@ const article = await articles.lookupOne('slug', 'async-rust', {
   projection: { title: 1, _id: 0 },
 });
 const ids = await articles.getMany(['a', 'b', 'missing']);
+const chunked = await articles.lookupChunked('slug', largeSlugList, {
+  chunkSize: 1000,
+  fields: ['title', 'status'],
+});
 
 await articles.createIndex(['tenant_id', 'slug'], { unique: true });
 const rows = await articles.lookup(
@@ -507,6 +523,8 @@ article, err := articles.LookupOne(ctx, "slug", "async-rust", nonodb.LookupOptio
     Projection: map[string]any{"title": 1, "_id": 0},
 })
 ids, err := articles.GetMany(ctx, []string{"a", "b", "missing"})
+chunked, err := articles.LookupChunked(ctx, "slug", largeSlugList,
+    nonodb.LookupOptions{Fields: []string{"title", "status"}}, 1000)
 
 _, err = articles.CreateIndex(ctx, []string{"tenant_id", "slug"}, nonodb.IndexOptions{
     Unique: true,
@@ -523,6 +541,10 @@ Shared rules:
 - `by` defaults to `_id`.
 - `values` is capped at 10,000 per request; the result budget is 64 MiB
   (`result_too_large`).
+- `lookup_chunked`/`lookupChunked`/`LookupChunked` split larger key lists into
+  sequential requests. `chunk_size` defaults to 1,000 where optional and must
+  be between 1 and 10,000. The concatenated output preserves input order and
+  keeps one `null`/`Value::Null`/`nil` per missing key across chunk boundaries.
 - Missing or malformed compound values become `null`; `get_many` keeps its old
   behavior and filters them out.
 - `fields` is a top-level inclusive projection. `projection` accepts a normal
@@ -781,7 +803,8 @@ All clients expose the common document operations:
   write stages;
 - `batch` (read-only) and `write_batch` (atomic writes);
 - `lookup`/`lookup_one` for ordered point lookups by `_id` or a unique index,
-  plus `get_many` for fetching documents by `_id`;
+  `lookup_chunked`/`lookupChunked`/`LookupChunked` for bounded batches, plus
+  `get_many` for fetching documents by `_id`;
 - `watch`/`watch_once` for append-only outbox events, with filters, projections,
   resume tokens, and reconnect helpers; Python also exposes `watch_stream` for
   continuous NDJSON and `AsyncNonoDB` for async watch/stream consumption

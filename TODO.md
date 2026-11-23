@@ -6,8 +6,6 @@ deliberate limitations are documented in [docs/roadmap.md](docs/roadmap.md).
 
 ## P1 — lookup enhancements
 
-- [ ] Add client-side `lookup_chunked` helpers that split large key lists into
-      bounded requests while preserving input order and missing-key alignment.
 - [ ] Validate lookup limits consistently on missing-collection and batch-read
       paths, matching the normal `lookup` validation.
 

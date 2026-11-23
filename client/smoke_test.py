@@ -33,6 +33,18 @@ def main() -> int:
     coll.delete({}, multi=True)
 
     doc_id = coll.insert({"name": "counter", "n": 0})
+    chunked = coll.lookup_chunked(
+        "_id", [doc_id, "missing", doc_id], chunk_size=1
+    )
+    assert len(chunked) == 3, chunked
+    assert chunked[0]["_id"] == doc_id and chunked[1] is None, chunked
+    assert chunked[2]["_id"] == doc_id, chunked
+    try:
+        coll.lookup_chunked("_id", [doc_id], chunk_size=0)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("chunk_size=0 must fail")
     rows = db.sql(
         "SELECT COUNT(*) AS n FROM concurrency WHERE name = $1",
         ["counter"],

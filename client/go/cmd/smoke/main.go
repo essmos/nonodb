@@ -135,6 +135,15 @@ func main() {
 	if _, err := users.GetMany(ctx, []string{id}); err != nil {
 		log.Fatal(err)
 	}
+	chunked, err := users.LookupChunked(ctx, "_id", []any{id, "missing", id},
+		nonodb.LookupOptions{}, 1)
+	if err != nil || len(chunked) != 3 || chunked[0] == nil || chunked[1] != nil || chunked[2] == nil {
+		log.Fatalf("lookup_chunked: %v %v", chunked, err)
+	}
+	if _, err := users.LookupChunked(ctx, "_id", []any{id},
+		nonodb.LookupOptions{}, 0); err == nil {
+		log.Fatal("lookup_chunked accepted chunk size 0")
+	}
 
 	revisions, err := users.History(ctx, id, 10, true)
 	if err != nil || len(revisions) == 0 {

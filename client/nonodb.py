@@ -1214,6 +1214,38 @@ class Collection:
             payload["projection"] = projection
         return self._db.exec(payload)["results"]
 
+    def lookup_chunked(
+        self,
+        by: Union[str, Iterable[str]],
+        values: Iterable[Any],
+        *,
+        chunk_size: int = 1000,
+        fields: Optional[Iterable[str]] = None,
+        projection: Optional[dict[str, Any]] = None,
+    ) -> list[Optional[dict[str, Any]]]:
+        """Ordered lookups split into bounded requests.
+
+        The concatenated result has the same length and order as ``values``,
+        with ``None`` for missing keys. ``chunk_size`` must be between 1 and
+        10,000.
+        """
+        if isinstance(chunk_size, bool) or not isinstance(chunk_size, int):
+            raise ValueError("chunk_size must be an integer")
+        if not 1 <= chunk_size <= 10_000:
+            raise ValueError("chunk_size must be between 1 and 10000")
+        pending = list(values)
+        results: list[Optional[dict[str, Any]]] = []
+        for start in range(0, len(pending), chunk_size):
+            results.extend(
+                self.lookup(
+                    by,
+                    pending[start : start + chunk_size],
+                    fields=fields,
+                    projection=projection,
+                )
+            )
+        return results
+
     def lookup_one(
         self,
         by: Union[str, Iterable[str]],

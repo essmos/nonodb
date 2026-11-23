@@ -70,6 +70,17 @@ async function main() {
   assert.equal(typeof upsert.upserted_id, 'string');
 
   assert.equal((await users.getMany([id])).length, 1);
+  const chunked = await users.lookupChunked('_id', [id, 'missing', id], {
+    chunkSize: 1,
+  });
+  assert.equal(chunked.length, 3);
+  assert.equal(chunked[0].name, 'Ada');
+  assert.equal(chunked[1], null);
+  assert.equal(chunked[2].name, 'Ada');
+  await assert.rejects(
+    users.lookupChunked('_id', [id], { chunkSize: 0 }),
+    /chunkSize/,
+  );
 
   const revisions = await users.history(id, { limit: 10, includeDocs: true });
   assert.ok(revisions.length >= 1);

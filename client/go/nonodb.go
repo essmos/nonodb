@@ -1253,6 +1253,34 @@ func (c *Collection) Lookup(
 	return result.Results, nil
 }
 
+// LookupChunked runs ordered lookups in bounded requests. The concatenated
+// result has the same length and order as values, with nil entries for missing
+// keys. chunkSize must be between 1 and 10,000.
+func (c *Collection) LookupChunked(
+	ctx context.Context,
+	by any,
+	values []any,
+	options LookupOptions,
+	chunkSize int,
+) ([]map[string]any, error) {
+	if chunkSize < 1 || chunkSize > 10000 {
+		return nil, fmt.Errorf("nonodb: lookup chunkSize must be between 1 and 10000")
+	}
+	documents := make([]map[string]any, 0, len(values))
+	for start := 0; start < len(values); start += chunkSize {
+		end := start + chunkSize
+		if end > len(values) {
+			end = len(values)
+		}
+		chunk, err := c.Lookup(ctx, by, values[start:end], options)
+		if err != nil {
+			return nil, err
+		}
+		documents = append(documents, chunk...)
+	}
+	return documents, nil
+}
+
 // LookupOne returns one document by _id or a unique index.
 func (c *Collection) LookupOne(
 	ctx context.Context,

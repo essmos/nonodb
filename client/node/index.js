@@ -559,6 +559,27 @@ class Collection {
     return result.results ?? [];
   }
 
+  /**
+   * Ordered lookups split into bounded requests. The concatenated result has
+   * the same length and order as `values`, with `null` for missing keys.
+   */
+  async lookupChunked(by, values, { chunkSize = 1000, fields, projection } = {}) {
+    if (!Number.isInteger(chunkSize) || chunkSize < 1 || chunkSize > 10000) {
+      throw new Error('chunkSize must be an integer between 1 and 10000');
+    }
+    const pending = Array.from(values);
+    const results = [];
+    for (let start = 0; start < pending.length; start += chunkSize) {
+      results.push(
+        ...(await this.lookup(by, pending.slice(start, start + chunkSize), {
+          fields,
+          projection,
+        })),
+      );
+    }
+    return results;
+  }
+
   /** Return one document by `_id` or a unique index. */
   async lookupOne(by, value, options = {}) {
     const [document] = await this.lookup(by, [value], options);

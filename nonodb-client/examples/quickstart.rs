@@ -14,6 +14,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let id = users.insert(&json!({"name": "Ada", "age": 36, "tags": ["db", "rust"]}))?;
     println!("inserted {id}");
 
+    let keys = vec![id.clone(), "missing".to_string(), id.clone()];
+    let chunked = users.lookup_chunked("_id", &keys, None, 1)?;
+    assert_eq!(chunked.len(), 3);
+    assert_eq!(chunked[0]["_id"], json!(id));
+    assert!(chunked[1].is_null());
+    assert_eq!(chunked[2]["_id"], json!(id));
+    assert!(users.lookup_chunked("_id", &keys, None, 0).is_err());
+
     let adults = users.find(&FindQuery::new(json!({"age": {"$gte": 18}})).sort("age", -1))?;
     println!(
         "{} adult(s): {}",
