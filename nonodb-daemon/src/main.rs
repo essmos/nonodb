@@ -3659,6 +3659,7 @@ async fn exec_inner(
                 names.push(databases::DEFAULT_DATABASE.to_string());
                 names.sort();
             }
+            names.retain(|name| principal.can_see_database(name));
             respond(Ok(json!({
                 "default": databases::DEFAULT_DATABASE,
                 "databases": names,

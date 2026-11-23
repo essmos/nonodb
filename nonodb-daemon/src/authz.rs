@@ -82,7 +82,7 @@ pub fn authorize_request(
             req.op_name(),
         ),
         Request::ListWebhooks | Request::ListWebhookDeliveries { .. } => {
-            if principal.allows_admin_database() {
+            if principal.allows_database_admin(database) {
                 Ok(())
             } else {
                 Err(ApiError::forbidden())
@@ -144,7 +144,7 @@ pub fn authorize_request(
             req.op_name(),
         ),
         Request::DeleteWebhook { .. } | Request::RetryWebhookDelivery { .. } => {
-            if principal.allows_admin_database() {
+            if principal.allows_database_admin(database) {
                 Ok(())
             } else {
                 Err(ApiError::forbidden())
@@ -152,12 +152,15 @@ pub fn authorize_request(
         }
 
         Request::ListDatabases => Ok(()),
-        Request::CreateDatabase { .. }
-        | Request::DropDatabase { .. }
-        | Request::Sync
-        | Request::MapInfo
-        | Request::ResizeMap { .. } => {
+        Request::CreateDatabase { .. } | Request::DropDatabase { .. } => {
             if principal.allows_admin_database() {
+                Ok(())
+            } else {
+                Err(ApiError::forbidden())
+            }
+        }
+        Request::Sync | Request::MapInfo | Request::ResizeMap { .. } => {
+            if principal.allows_database_admin(database) {
                 Ok(())
             } else {
                 Err(ApiError::forbidden())
@@ -421,6 +424,28 @@ mod tests {
         };
         assert!(authorize_request(&app, &index, "app2").is_ok());
         assert!(authorize_request(&app, &index, "app1").is_err());
+        assert!(authorize_request(&app, &Request::MapInfo, "app2").is_ok());
+        assert!(authorize_request(&app, &Request::MapInfo, "app1").is_err());
+        assert!(authorize_request(&app, &Request::ResizeMap { size: 4096 }, "app2").is_ok());
+        assert!(authorize_request(&app, &Request::Sync, "app2").is_ok());
+        assert!(authorize_request(&app, &Request::ListWebhooks, "app2").is_ok());
+        assert!(authorize_request(&app, &Request::ListWebhooks, "app1").is_err());
+        assert!(authorize_request(
+            &app,
+            &Request::CreateDatabase {
+                name: "newdb".into(),
+            },
+            "app2"
+        )
+        .is_err());
+        assert!(authorize_request(
+            &app,
+            &Request::DropDatabase {
+                name: "app2".into(),
+            },
+            "app2"
+        )
+        .is_err());
         let legacy = principal(&["read:orders"]);
         assert!(authorize_request(&legacy, &insert("orders"), "app1").is_err());
         assert!(authorize_request(
