@@ -77,6 +77,8 @@ def main() -> int:
             NONODB_DATA=str(tmp / "data"),
             NONODB_SOCK=str(sock),
             NONODB_LOG="warn",
+            NONODB_BACKUP_CONFIG=str(tmp / "backups.json"),
+            NONODB_IMPORT_ROOTS=str(tmp / "backups"),
         )
         daemon_log = (tmp / "daemon.log").open("wb")
         daemon_proc = subprocess.Popen(
@@ -263,6 +265,75 @@ def main() -> int:
                 fetch(base + "/app1/v1/replication/status")
             )
             assert replication["result"]["database"] == "app1", replication
+
+            # Exercise the GUI proxy restore-in-place path end to end: create a
+            # native backup job, discover it through the Import API, preflight
+            # it, then restore app1 and confirm the newer document is gone.
+            backup_root = tmp / "backups"
+            job = {
+                "id": "gui-restore",
+                "database": "app1",
+                "databases": ["app1"],
+                "enabled": True,
+                "every_minutes": 1440,
+                "destination": {"kind": "local", "path": str(backup_root)},
+                "keep_last": 2,
+                "verify": True,
+                "compression": "gzip",
+            }
+            fetch(base + "/v1/backups/jobs", data=job)
+            fetch(base + "/v1/backups/jobs/gui-restore/run", data={})
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                view = json.loads(fetch(base + "/v1/backups"))["result"]
+                state = next(
+                    item["state"]
+                    for item in view["jobs"]
+                    if item["job"]["id"] == "gui-restore"
+                )
+                if state["last_status"] in {"ok", "error"} and not state["running"]:
+                    assert state["last_status"] == "ok", state
+                    break
+                time.sleep(0.1)
+            else:
+                raise AssertionError("GUI backup job timed out")
+            source = {"kind": "local", "path": str(backup_root)}
+            discovered = json.loads(
+                fetch(base + "/v1/import/browse", data={"source": source})
+            )["result"]["backups"]
+            assert discovered, discovered
+            location = discovered[0]["location"]
+            fetch(
+                base + "/app1/v1/exec",
+                data={"op": "insert", "coll": "gui_orders", "doc": {"_id": "a2", "n": 3}},
+            )
+            preflight = json.loads(
+                fetch(
+                    base + "/v1/restore/preflight",
+                    data={"source": source, "location": location, "database": "app1"},
+                )
+            )["result"]
+            assert preflight["database"] == "app1", preflight
+            restored = json.loads(
+                fetch(
+                    base + "/v1/restore",
+                    data={
+                        "source": source,
+                        "location": location,
+                        "database": "app1",
+                        "confirmation": preflight["confirmation"],
+                    },
+                )
+            )["result"]
+            assert restored["database"] == "app1", restored
+            assert restored["safety_snapshot"], restored
+            result = json.loads(
+                fetch(
+                    base + "/app1/v1/exec",
+                    data={"op": "find", "coll": "gui_orders", "filter": {}},
+                )
+            )
+            assert result["result"] == [{"_id": "a1", "n": 2}], result
 
             # The GUI proxy exposes the same database management operations used
             # by the Database tab: create, select, write, drop, then refresh.
