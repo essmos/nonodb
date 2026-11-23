@@ -2,7 +2,13 @@
 
 Full release notes: https://github.com/essmos/nonodb/releases
 
-## Unreleased
+## v0.32.0 - 2026-11-23
+
+- **Upgrade: plain indexes now index a missing field as `null`.** Run
+  `nonodb-cli reindex <collection>` for every collection with plain indexes
+  after upgrading. Existing plain unique indexes can fail to rebuild if several
+  documents already share a missing/`null` key; resolve those duplicates first.
+  Sparse and partial indexes keep their stored definitions.
 
 - Store BSON regular-expression values (`$regularExpression`) as document data.
   They round-trip through the MongoDB wire listener, support `$type: "regex"`

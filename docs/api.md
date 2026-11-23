@@ -3004,7 +3004,7 @@ additive.
 ```json
 {
   "schema_version": 1,
-  "server_version": "0.31.0",
+  "server_version": "0.32.0",
   "api": {"http_json": true, "mongodb_wire": true, "sql": true},
   "features": {
     "search": {"search_all": true, "modes": ["lexical", "fuzzy", "vector", "hybrid"]},
@@ -3026,7 +3026,7 @@ Authenticated admin endpoint. Returns the daemon's real listener state:
 {
   "ok": true,
   "result": {
-    "version": "0.31.0",
+    "version": "0.32.0",
     "tcp": {"configured": "0.0.0.0:7902", "bound": "0.0.0.0:7902", "tls": false},
     "unix": "/run/nonodb.sock",
     "advertise_url": "http://10.0.0.10:7902"
