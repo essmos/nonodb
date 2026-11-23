@@ -136,6 +136,22 @@ GUI origin and one daemon port; the selected database is added as
 `/<database>/v1/exec` and `/<database>/v1/watch`. The `default` database may also
 use the unprefixed aliases.
 
+## Branching
+
+Create an offline, independent database for CI or experiments:
+
+```bash
+systemctl stop nonodb
+nonodb-cli --db app1 branch app1-ci --data /var/lib/nonodb --verify
+systemctl start nonodb
+```
+
+The branch has its own `data.mdb`, writer, lock file, indexes, history/TTL
+metadata, and copied sidecars. Use `--from-snapshot <file>` to branch from an
+immutable snapshot without stopping the daemon. Reflink is used on supported
+filesystems; otherwise the command falls back to a full copy. See
+[Branching a database](branching.md).
+
 ## Backup and restore
 
 Each database is a normal LMDB directory. Select one explicitly:

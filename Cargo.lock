@@ -1617,6 +1617,7 @@ dependencies = [
 name = "nonodb-cli"
 version = "0.29.1"
 dependencies = [
+ "libc",
  "mime_guess",
  "nonodb-auth",
  "nonodb-core",

@@ -23,6 +23,9 @@ Full release notes: https://github.com/essmos/nonodb/releases
   prototype, not a production proxy.
 - Add `nonodb-cli restore --to <timestamp>` for selecting the newest periodic
   snapshot at or before a recovery time, with explicit no-WAL-PITR semantics.
+- Add offline `nonodb-cli branch` for independent CI/test database clones. It
+  uses Linux FICLONE or macOS clonefile when available, falls back to a full
+  copy, preserves search/vector sidecars, and supports snapshots and `--verify`.
 
 ## v0.29.1 - 2026-11-22
 

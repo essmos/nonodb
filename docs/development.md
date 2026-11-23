@@ -184,6 +184,7 @@ python3 scripts/db_slots_test.py             # >256 index/search create-drop cyc
 python3 scripts/resize_test.py               # online map growth under concurrent I/O
 python3 scripts/restore_drill.py             # backup -> verify -> restore -> query
 python3 scripts/restore_to_test.py           # restore --to snapshot selection and verification
+python3 scripts/branch_test.py               # offline branch from stopped DB and snapshot, CoW fallback
 python3 scripts/shutdown_test.py             # SIGTERM drain, JSON logs, durable in-flight write
 python3 scripts/mongo_conformance_test.py   # compare wire results with a real MongoDB
 python3 scripts/mongo_export_test.py        # mongoexport/mongodump/mongoimport/mongorestore

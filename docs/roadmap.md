@@ -67,6 +67,8 @@ Implemented:
   snapshot-based `restore --to <timestamp>`, CLI;
 - `scripts/nonodb-migrate.py` for quiesced MongoDB migration with checksums and
   an opt-in MongoDB wire shadow mode with JSONL diff reports;
+- offline `nonodb-cli branch` clones with reflink/clonefile, snapshot sources,
+  copied sidecars, and a full-copy fallback;
 - GUI backup jobs with full/restic engines, multi-database selection, exclusions,
   gzip compression, age/restic encryption, local/S3/R2 destinations, and
   `backup-info.txt`;

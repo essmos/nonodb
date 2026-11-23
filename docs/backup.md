@@ -56,6 +56,7 @@ database copy was taken.
 | Restore all databases | `nonodb-cli restore-all BACKUP ROOT --force --verify` |
 | Restore newest snapshot at/before a time | `nonodb-cli --db app1 restore --to TIME SNAPSHOTS ROOT --force --verify` |
 | Automated drill | `python3 scripts/restore_drill.py` |
+| Branch a snapshot for CI | `nonodb-cli branch NAME --from-snapshot SNAPSHOT --data ROOT --verify` |
 
 `ROOT` is the instance root (`NONODB_DATA`). Without `--db`, single-database
 file commands resolve a legacy `data.mdb` root first, then `default/data.mdb`,
@@ -160,6 +161,18 @@ systemctl start nonodb
 
 Snapshot retention is not a replacement for independent backups. Keep at least
 one copy off the host and verify it with a restore drill.
+
+For CI or experiments, a snapshot can be turned into a full, writable database
+without restoring over the live data:
+
+```bash
+nonodb-cli branch app1-ci \
+  --from-snapshot /var/backups/nonodb/snapshots/app1/data-1767225600000.mdb \
+  --data /var/lib/nonodb --verify
+```
+
+See [Branching a database](branching.md). On a CoW filesystem this is a reflink
+clone; elsewhere it is a full copy.
 
 To select the newest snapshot at or before a recovery time, pass the snapshot
 root and `--to`:

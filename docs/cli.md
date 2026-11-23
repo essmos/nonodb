@@ -369,6 +369,24 @@ The identity is written to the file with mode `0600`; the public
 `age1...` recipient is printed to stdout. Store the identity outside the daemon
 and set `NONODB_BACKUP_IDENTITY_FILE` when restoring an encrypted backup.
 
+## branch
+
+Create an offline, independent clone of a database. Stop the daemon first, or
+branch from a snapshot:
+
+```bash
+nonodb-cli --db app1 branch app1-ci --data /var/lib/nonodb --verify
+nonodb-cli branch app1-ci --from-snapshot /snapshots/app1/data-1767225600000.mdb \
+  --data /var/lib/nonodb --json
+```
+
+The target is `<data>/<target>/`. Reflink/clonefile is used when the filesystem
+supports it; otherwise the command falls back to a full copy and reports
+`method: "copy"`. `--force` replaces an existing target only after the new clone
+is complete, `--no-sidecars` omits `search/` and `vector-ann/`, and `--verify`
+runs a deep check. Auth and instance-wide files are not copied. See
+[Branching a database](branching.md).
+
 ## backup
 
 Create a consistent, compacted copy of one database. In the multi-database

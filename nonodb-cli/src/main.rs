@@ -17,6 +17,7 @@ use nonodb_core::heed::types::Bytes;
 use nonodb_core::heed::{CompactionOption, EnvFlags, EnvOpenOptions};
 use serde_json::{json, Value};
 
+mod branch;
 mod gui;
 
 fn main() {
@@ -563,6 +564,7 @@ fn run() -> Result<(), String> {
             let res = http_post("/v1/exec", &json!({"op": "resize_map", "size": size}))?;
             print_result(&res);
         }
+        "branch" => branch::run(&args[1..])?,
         "backup" => {
             let data = PathBuf::from(
                 args.get(1)
@@ -689,6 +691,8 @@ fn usage() -> Result<(), String> {
          map                        rozmiar mapy LMDB i zajęte bajty\n\
          sync                       wymuś fsync wybranej bazy\n\
          resize <rozmiar>           powiększ mapę online, np. 4GiB\n\
+         branch <target-db> --data <root> [--from-snapshot <plik>] [--force] [--verify] [--no-sidecars] [--json]\n\
+              utwórz niezależny klon bazy (reflink/copy; daemon zatrzymany lub snapshot)\n\
          backup <data> <out> [--without-search-sidecars]  kopia wybranej bazy (--db) + manifest.json\n\
          backup-keygen <plik>      generuje parę kluczy age do backupów\n\
          backup-all <data> <out> [--without-search-sidecars]  kopia wszystkich baz + manifest instancji\n\
@@ -709,7 +713,7 @@ fn usage() -> Result<(), String> {
     Ok(())
 }
 
-fn print_report(report: &nonodb_core::VerificationReport) {
+pub(crate) fn print_report(report: &nonodb_core::VerificationReport) {
     println!("verified: {}", report.path);
     println!("schema: {}", report.schema_version);
     println!("collections: {}", report.collections.len());
@@ -1476,7 +1480,7 @@ fn parse_scopes(raw: &str) -> Result<Vec<String>, String> {
     Ok(scopes)
 }
 
-fn selected_database() -> String {
+pub(crate) fn selected_database() -> String {
     std::env::var("NONODB_DB")
         .ok()
         .filter(|name| !name.is_empty())
@@ -1533,7 +1537,7 @@ fn database_target(data: &Path) -> Result<PathBuf, String> {
     Ok(data.join("default"))
 }
 
-fn validate_database_name(name: &str) -> Result<(), String> {
+pub(crate) fn validate_database_name(name: &str) -> Result<(), String> {
     if name.is_empty() || name.len() > 64 {
         return Err(format!("invalid database name `{name}`"));
     }

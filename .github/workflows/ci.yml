@@ -111,6 +111,7 @@ jobs:
           python3 scripts/replication_partition_test.py
           python3 scripts/replication_vault_test.py
           python3 scripts/restore_to_test.py
+          python3 scripts/branch_test.py
 
       - name: Run security regression checks
         env:

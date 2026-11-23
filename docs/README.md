@@ -39,6 +39,7 @@ quick-start instructions, and a feature overview.
 | [Volume compression](volume-compression.md) | Operators, SRE | ZFS/Btrfs compression, Docker bind mounts and named volumes, verification, benchmarking, migration |
 | [Free-tier and low-cost VM deployment](free-tier-deployment.md) | Operators, small deployments | Oracle Cloud, GCP, AWS, DigitalOcean, small profile, Cloud Run read replicas, Spaces backups, restore |
 | [Backup and restore](backup.md) | Operators, SRE | Online backup, GUI backup/import, snapshots, verification, restore drills, Docker, vault keys, authorization state, recovery |
+| [Branching a database](branching.md) | Operators, CI engineers | Offline clone/branch, reflink/CoW, snapshot sources, CI isolation, limits |
 | [Replication and cluster guide](replication-cluster-guide.md) | Operators, SRE | Primary/replica setup, TLS, CLI, GUI, quorum failover, monitoring, backup differences, troubleshooting |
 | [Replication design](replication.md) | Maintainers, advanced users | Ordered operation log, apply rules, epochs, snapshots, quorum design, metrics |
 | [Benchmarks](benchmarks.md) | Evaluators, maintainers | Environment, methodology, throughput, latency, memory, large-data results |
@@ -77,6 +78,7 @@ quick-start instructions, and a feature overview.
 - **Store money and exact decimals:** [Numbers and decimals](numerics.md)
 - **Use binary, UUID, ObjectId, or `$type`:** [BSON scalar types](bson-types.md)
 - **Back up and restore:** [Backup and restore](backup.md)
+- **Clone a database for CI:** [Branching a database](branching.md)
 - **Set up replication and a cluster:** [Replication and cluster guide](replication-cluster-guide.md)
 - **Import a backup as a new database:** [Import wizard](backup.md#import-wizard)
 - **Tune timeouts for index builds:** [Timeouts](operations.md#timeouts-and-long-operations)
