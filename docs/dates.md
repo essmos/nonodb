@@ -127,8 +127,9 @@ semantics.
 ## Time zones and civil dates
 
 Timezone identifiers such as `Europe/Warsaw` are not part of the stored value.
-Convert local times to an RFC 3339 instant in the client. This is also how the
-MongoDB BSON Date type works.
+Date expression operators can take an IANA zone to interpret local civil dates,
+but the result is always stored as a UTC instant. This is also how the MongoDB
+BSON Date type works.
 
 ## Date expressions
 
@@ -163,10 +164,39 @@ pipeline updates.
 }
 ```
 
-Time zones are UTC (`Z`, `UTC`, `GMT`) or fixed offsets such as `+02:00` and
-`-05:00`. IANA names such as `Europe/Warsaw` are not implemented.
+Time zones are UTC (`Z`, `UTC`, `GMT`), fixed offsets such as `+02:00` and
+`-05:00`, or IANA names such as `Europe/Warsaw`, `America/New_York`, and
+`Asia/Kolkata`. IANA zones apply the daylight-saving rules for each instant:
 
-Not yet supported: IANA time zone identifiers.
+```json
+{
+  "$project": {
+    "winter": {
+      "$dateToString": {
+        "date": {"$date": "2024-01-15T12:00:00Z"},
+        "format": "%Y-%m-%d %H:%M %z",
+        "timezone": "Europe/Warsaw"
+      }
+    },
+    "summer": {
+      "$dateToString": {
+        "date": {"$date": "2024-07-15T12:00:00Z"},
+        "format": "%Y-%m-%d %H:%M %z",
+        "timezone": "Europe/Warsaw"
+      }
+    }
+  }
+}
+```
+
+The result is `2024-01-15 13:00 +0100` in winter and
+`2024-07-15 14:00 +0200` in summer.
+
+Calendar arithmetic (`year`, `quarter`, `month`, `week`, `day`) is performed in
+the selected zone and resolves the resulting civil time back to an instant, so
+crossing a DST boundary changes the UTC offset. For a repeated local time during
+the autumn fall-back, the earlier occurrence is used. A local time skipped by
+spring-forward returns `invalid_date`.
 
 ## Existing documents and imports
 

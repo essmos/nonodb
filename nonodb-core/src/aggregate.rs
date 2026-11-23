@@ -4221,26 +4221,110 @@ fn date_to_millis(value: OffsetDateTime) -> Result<i64> {
     i64::try_from(ms).map_err(|_| Error::InvalidDate("date is out of range".into()))
 }
 
+#[derive(Clone, Debug)]
+enum DateZone {
+    Fixed(UtcOffset),
+    Iana(chrono_tz::Tz),
+}
+
+impl DateZone {
+    fn offset_at(&self, value: OffsetDateTime) -> UtcOffset {
+        match self {
+            Self::Fixed(offset) => *offset,
+            Self::Iana(zone) => {
+                use chrono::{Offset, TimeZone};
+                let utc = value.to_offset(UtcOffset::UTC);
+                let Some(naive) = chrono::NaiveDate::from_ymd_opt(
+                    utc.year(),
+                    u32::from(u8::from(utc.month())),
+                    u32::from(utc.day()),
+                )
+                .and_then(|date| {
+                    date.and_hms_nano_opt(
+                        u32::from(utc.hour()),
+                        u32::from(utc.minute()),
+                        u32::from(utc.second()),
+                        utc.nanosecond(),
+                    )
+                }) else {
+                    return UtcOffset::UTC;
+                };
+                let seconds = zone
+                    .offset_from_utc_datetime(&naive)
+                    .fix()
+                    .local_minus_utc();
+                UtcOffset::from_whole_seconds(seconds).unwrap_or(UtcOffset::UTC)
+            }
+        }
+    }
+
+    fn to_local(&self, value: OffsetDateTime) -> OffsetDateTime {
+        value.to_offset(self.offset_at(value))
+    }
+
+    fn resolve_local(&self, date: Date, time: Time) -> Result<OffsetDateTime> {
+        match self {
+            Self::Fixed(offset) => Ok(OffsetDateTime::new_in_offset(date, time, *offset)),
+            Self::Iana(zone) => {
+                use chrono::{LocalResult, Offset, TimeZone};
+                let naive_date = chrono::NaiveDate::from_ymd_opt(
+                    date.year(),
+                    u32::from(u8::from(date.month())),
+                    u32::from(date.day()),
+                )
+                .ok_or_else(|| Error::InvalidDate("date is out of range".into()))?;
+                let naive_time = chrono::NaiveTime::from_hms_nano_opt(
+                    u32::from(time.hour()),
+                    u32::from(time.minute()),
+                    u32::from(time.second()),
+                    time.nanosecond(),
+                )
+                .ok_or_else(|| Error::InvalidDate("time is out of range".into()))?;
+                let naive = naive_date.and_time(naive_time);
+                let offset = match zone.from_local_datetime(&naive) {
+                    LocalResult::Single(value) => value.offset().fix().local_minus_utc(),
+                    LocalResult::Ambiguous(first, second) => {
+                        let chosen = if first.timestamp_millis() <= second.timestamp_millis() {
+                            first
+                        } else {
+                            second
+                        };
+                        chosen.offset().fix().local_minus_utc()
+                    }
+                    LocalResult::None => {
+                        return Err(Error::InvalidDate(format!(
+                            "local time does not exist in timezone `{zone}`"
+                        )))
+                    }
+                };
+                let offset = UtcOffset::from_whole_seconds(offset)
+                    .map_err(|_| Error::InvalidDate("timezone offset is out of range".into()))?;
+                Ok(OffsetDateTime::new_in_offset(date, time, offset))
+            }
+        }
+    }
+}
+
 fn date_timezone(
     obj: &Map<String, Value>,
     doc: &Value,
     vars: &BTreeMap<String, Value>,
-) -> Result<UtcOffset> {
+) -> Result<DateZone> {
     let Some(value) = obj.get("timezone") else {
-        return Ok(UtcOffset::UTC);
+        return Ok(DateZone::Fixed(UtcOffset::UTC));
     };
     let value = eval_expr_vars(doc, value, vars)?;
     parse_timezone_value(&value)
 }
 
-fn parse_timezone_value(value: &Value) -> Result<UtcOffset> {
+fn parse_timezone_value(value: &Value) -> Result<DateZone> {
     let Some(raw) = value.as_str() else {
         return Err(Error::Query("timezone must be a string".into()));
     };
     let raw = raw.trim();
     let upper = raw.to_ascii_uppercase();
     if matches!(upper.as_str(), "Z" | "UTC" | "GMT") {
-        return Ok(UtcOffset::UTC);
+        return Ok(DateZone::Fixed(UtcOffset::UTC));
     }
     let offset = upper
         .strip_prefix("UTC")
@@ -4251,9 +4335,12 @@ fn parse_timezone_value(value: &Value) -> Result<UtcOffset> {
         Some(b'+') => (1, &offset[1..]),
         Some(b'-') => (-1, &offset[1..]),
         _ => {
+            if let Ok(zone) = chrono_tz::Tz::from_str(raw) {
+                return Ok(DateZone::Iana(zone));
+            }
             return Err(Error::Query(format!(
-                "unsupported timezone `{raw}`; use UTC or a fixed +HH:MM offset"
-            )))
+                "unsupported timezone `{raw}`; use UTC, a fixed +HH:MM offset, or an IANA name such as Europe/Warsaw"
+            )));
         }
     };
     let (hours, minutes) = match rest.len() {
@@ -4269,6 +4356,7 @@ fn parse_timezone_value(value: &Value) -> Result<UtcOffset> {
         .parse::<i8>()
         .map_err(|_| Error::Query(format!("invalid timezone offset `{raw}`")))?;
     UtcOffset::from_hms(sign * hours, sign * minutes, 0)
+        .map(DateZone::Fixed)
         .map_err(|_| Error::Query(format!("invalid timezone offset `{raw}`")))
 }
 
@@ -4320,7 +4408,7 @@ fn date_add_op(
         amount
     };
     let timezone = date_timezone(obj, doc, vars)?;
-    let value = date_from_millis(start)?.to_offset(timezone);
+    let value = timezone.to_local(date_from_millis(start)?);
     let result = match unit {
         "year" => add_date_months(
             value,
@@ -4355,6 +4443,7 @@ fn date_add_op(
             .ok_or_else(|| Error::InvalidDate("date arithmetic overflow".into()))?,
         _ => return Err(Error::Query(format!("unsupported date unit `{unit}`"))),
     };
+    let result = timezone.resolve_local(result.date(), result.time())?;
     Ok(date::canonical(date_to_millis(result)?))
 }
 
@@ -4385,8 +4474,8 @@ fn date_diff_op(doc: &Value, arg: &Value, vars: &BTreeMap<String, Value>) -> Res
         .and_then(Value::as_str)
         .ok_or_else(|| Error::Query("$dateDiff requires `unit`".into()))?;
     let timezone = date_timezone(obj, doc, vars)?;
-    let start = date_from_millis(start)?.to_offset(timezone);
-    let end = date_from_millis(end)?.to_offset(timezone);
+    let start = timezone.to_local(date_from_millis(start)?);
+    let end = timezone.to_local(date_from_millis(end)?);
     let start_date = start.date();
     let end_date = end.date();
     let diff = match unit {
@@ -4412,16 +4501,13 @@ fn date_diff_op(doc: &Value, arg: &Value, vars: &BTreeMap<String, Value>) -> Res
         }
         "day" => i64::from(end_date.to_julian_day()) - i64::from(start_date.to_julian_day()),
         "hour" | "minute" | "second" | "millisecond" => {
-            let offset_ms = i64::from(timezone.whole_seconds()) * 1000;
-            let start_ms = date_to_millis(start)? + offset_ms;
-            let end_ms = date_to_millis(end)? + offset_ms;
             let width = match unit {
                 "hour" => 3_600_000,
                 "minute" => 60_000,
                 "second" => 1_000,
                 _ => 1,
             };
-            end_ms.div_euclid(width) - start_ms.div_euclid(width)
+            date_to_millis(end)?.div_euclid(width) - date_to_millis(start)?.div_euclid(width)
         }
         _ => return Err(Error::Query(format!("unsupported date unit `{unit}`"))),
     };
@@ -4447,7 +4533,7 @@ fn parse_start_of_week(value: Option<&Value>) -> Result<Weekday> {
     }
 }
 
-fn week_reference_millis(start: Weekday, _timezone: UtcOffset) -> Result<i64> {
+fn week_reference_millis(start: Weekday) -> Result<i64> {
     let reference = week_reference_date(start)?;
     let local = OffsetDateTime::new_in_offset(reference, Time::MIDNIGHT, UtcOffset::UTC);
     date_to_millis(local)
@@ -4455,11 +4541,11 @@ fn week_reference_millis(start: Weekday, _timezone: UtcOffset) -> Result<i64> {
 
 fn truncate_date(
     value: OffsetDateTime,
+    timezone: &DateZone,
     unit: &str,
     bin_size: i64,
     start_of_week: Weekday,
 ) -> Result<i64> {
-    let timezone = value.offset();
     if matches!(unit, "year" | "quarter" | "month") {
         let months_per_bin = match unit {
             "year" => 12,
@@ -4475,11 +4561,11 @@ fn truncate_date(
             .map_err(|_| Error::InvalidDate("date is out of range".into()))?;
         let date = Date::from_calendar_date(year, month, 1)
             .map_err(|_| Error::InvalidDate("date is out of range".into()))?;
-        let local = OffsetDateTime::new_in_offset(date, Time::MIDNIGHT, timezone);
+        let local = timezone.resolve_local(date, Time::MIDNIGHT)?;
         return date_to_millis(local);
     }
 
-    let offset_ms = i64::from(timezone.whole_seconds()) * 1000;
+    let offset_ms = i64::from(value.offset().whole_seconds()) * 1000;
     let local_ms = date_to_millis(value)? + offset_ms;
     let unit_ms: i64 = match unit {
         "week" => 7 * 86_400_000,
@@ -4494,12 +4580,14 @@ fn truncate_date(
         .checked_mul(bin_size)
         .ok_or_else(|| Error::InvalidDate("date arithmetic overflow".into()))?;
     let reference = if unit == "week" {
-        week_reference_millis(start_of_week, timezone)?
+        week_reference_millis(start_of_week)?
     } else {
         946_684_800_000
     };
     let truncated = reference + (local_ms - reference).div_euclid(width) * width;
-    Ok(truncated - offset_ms)
+    let local = date_from_millis(truncated)?;
+    let resolved = timezone.resolve_local(local.date(), local.time())?;
+    date_to_millis(resolved)
 }
 
 fn date_trunc_op(doc: &Value, arg: &Value, vars: &BTreeMap<String, Value>) -> Result<Value> {
@@ -4526,8 +4614,8 @@ fn date_trunc_op(doc: &Value, arg: &Value, vars: &BTreeMap<String, Value>) -> Re
     };
     let timezone = date_timezone(obj, doc, vars)?;
     let start_of_week = parse_start_of_week(obj.get("startOfWeek"))?;
-    let value = date_from_millis(date)?.to_offset(timezone);
-    let truncated = truncate_date(value, unit, bin_size, start_of_week)?;
+    let value = timezone.to_local(date_from_millis(date)?);
+    let truncated = truncate_date(value, &timezone, unit, bin_size, start_of_week)?;
     Ok(date::canonical(truncated))
 }
 
@@ -4606,7 +4694,7 @@ fn date_to_string_op(doc: &Value, arg: &Value, vars: &BTreeMap<String, Value>) -
         .and_then(Value::as_str)
         .unwrap_or("%Y-%m-%dT%H:%M:%S.%LZ");
     let timezone = date_timezone(obj, doc, vars)?;
-    let value = date_from_millis(date)?.to_offset(timezone);
+    let value = timezone.to_local(date_from_millis(date)?);
     Ok(Value::String(format_date(value, format)?))
 }
 
@@ -4644,7 +4732,7 @@ fn take_date_offset(input: &str, position: &mut usize) -> Option<UtcOffset> {
     .ok()
 }
 
-fn parse_date_with_format(input: &str, format: &str, default_timezone: UtcOffset) -> Option<i64> {
+fn parse_date_with_format(input: &str, format: &str, default_timezone: &DateZone) -> Option<i64> {
     let format_bytes = format.as_bytes();
     let input_bytes = input.as_bytes();
     let mut fi = 0usize;
@@ -4657,7 +4745,7 @@ fn parse_date_with_format(input: &str, format: &str, default_timezone: UtcOffset
     let mut minute = 0u8;
     let mut second = 0u8;
     let mut millisecond = 0u16;
-    let mut timezone = default_timezone;
+    let mut timezone = default_timezone.clone();
     while fi < format_bytes.len() {
         if format_bytes[fi] != b'%' {
             if input_bytes.get(pi) != Some(&format_bytes[fi]) {
@@ -4696,7 +4784,7 @@ fn parse_date_with_format(input: &str, format: &str, default_timezone: UtcOffset
                 };
                 millisecond = u16::try_from(scaled).ok()?;
             }
-            b'z' => timezone = take_date_offset(input, &mut pi)?,
+            b'z' => timezone = DateZone::Fixed(take_date_offset(input, &mut pi)?),
             _ => return None,
         }
     }
@@ -4710,11 +4798,11 @@ fn parse_date_with_format(input: &str, format: &str, default_timezone: UtcOffset
         Date::from_calendar_date(year, month, day).ok()?
     };
     let time = Time::from_hms_milli(hour, minute, second, millisecond).ok()?;
-    let value = OffsetDateTime::new_in_offset(date, time, timezone);
+    let value = timezone.resolve_local(date, time).ok()?;
     date_to_millis(value).ok()
 }
 
-fn parse_date_string(input: &str, format: Option<&str>, timezone: UtcOffset) -> Option<i64> {
+fn parse_date_string(input: &str, format: Option<&str>, timezone: &DateZone) -> Option<i64> {
     if let Some(format) = format {
         return parse_date_with_format(input, format, timezone);
     }
@@ -4747,7 +4835,7 @@ fn date_from_string_op(doc: &Value, arg: &Value, vars: &BTreeMap<String, Value>)
     let format = obj.get("format").and_then(Value::as_str);
     let parsed = raw
         .as_str()
-        .and_then(|raw| parse_date_string(raw, format, timezone))
+        .and_then(|raw| parse_date_string(raw, format, &timezone))
         .map(date::canonical);
     match parsed {
         Some(value) => Ok(value),
@@ -4823,7 +4911,7 @@ fn date_from_parts_op(doc: &Value, arg: &Value, vars: &BTreeMap<String, Value>) 
         .map_err(|_| Error::InvalidDate("invalid millisecond".into()))?;
     let time = Time::from_hms_milli(hour, minute, second, millisecond)
         .map_err(|_| Error::InvalidDate("invalid time".into()))?;
-    let value = OffsetDateTime::new_in_offset(date, time, timezone);
+    let value = timezone.resolve_local(date, time)?;
     Ok(date::canonical(date_to_millis(value)?))
 }
 
@@ -4837,7 +4925,7 @@ fn date_to_parts_op(doc: &Value, arg: &Value, vars: &BTreeMap<String, Value>) ->
     let date = eval_expr_vars(doc, date, vars)?;
     let date = date_millis(&date)?;
     let timezone = date_timezone(obj, doc, vars)?;
-    let value = date_from_millis(date)?.to_offset(timezone);
+    let value = timezone.to_local(date_from_millis(date)?);
     let date = value.date();
     let time = value.time();
     let mut out = Map::new();
@@ -5240,6 +5328,62 @@ mod tests {
                 "timezone": "+02:00"
             }})),
             json!("08:07 +0200 120")
+        );
+        assert_eq!(
+            eval(json!({"$dateToString": {
+                "date": {"$date": "2024-01-15T12:00:00Z"},
+                "format": "%Y-%m-%d %H:%M %z",
+                "timezone": "Europe/Warsaw"
+            }})),
+            json!("2024-01-15 13:00 +0100")
+        );
+        assert_eq!(
+            eval(json!({"$dateToString": {
+                "date": {"$date": "2024-07-15T12:00:00Z"},
+                "format": "%Y-%m-%d %H:%M %z",
+                "timezone": "Europe/Warsaw"
+            }})),
+            json!("2024-07-15 14:00 +0200")
+        );
+        assert_eq!(
+            eval(json!({"$dateAdd": {
+                "startDate": {"$date": "2024-03-30T12:00:00Z"},
+                "unit": "day",
+                "amount": 1,
+                "timezone": "Europe/Warsaw"
+            }})),
+            canonical("2024-03-31T11:00:00Z")
+        );
+        assert_eq!(
+            eval(json!({"$dateTrunc": {
+                "date": {"$date": "2024-03-30T23:30:00Z"},
+                "unit": "day",
+                "timezone": "Europe/Warsaw"
+            }})),
+            canonical("2024-03-30T23:00:00Z")
+        );
+        assert_eq!(
+            eval(json!({"$dateFromString": {
+                "dateString": "2024-07-15 12:00:00",
+                "format": "%Y-%m-%d %H:%M:%S",
+                "timezone": "Europe/Warsaw"
+            }})),
+            canonical("2024-07-15T10:00:00Z")
+        );
+        assert_eq!(
+            eval(json!({"$dateToParts": {
+                "date": {"$date": "2024-07-15T10:00:00Z"},
+                "timezone": "Europe/Warsaw"
+            }})),
+            json!({
+                "year": 2024,
+                "month": 7,
+                "day": 15,
+                "hour": 12,
+                "minute": 0,
+                "second": 0,
+                "millisecond": 0
+            })
         );
         assert_eq!(
             eval(json!({"$dateFromString": {
