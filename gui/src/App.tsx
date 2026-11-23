@@ -21,7 +21,6 @@ import {
   createReplicaPairing,
   databaseStats,
   disableFirewall,
-  defaultConnection,
   deleteBackupJob,
   deletePrincipal,
   disconnectReplication,
@@ -269,8 +268,31 @@ function cleanField(value: string): string {
   return value.trim().replace(/^["'`]+|["'`]+$/g, '');
 }
 
-function ConnectView({ onConnected }: { onConnected: (connection: Connection) => void }) {
-  const [connection, setConnection] = useState<Connection>(() => loadConnection());
+function connectionScope(connection: Connection): string {
+  const endpoint = connection.endpoint.trim().replace(/^https?:\/\//i, '').replace(/\/+$/, '');
+  return encodeURIComponent(`${endpoint || 'local'}|${connection.database || 'default'}`);
+}
+
+function collectionViewStorageKey(connection: Connection, collection: string): string {
+  return `nonodb.gui.views.${connectionScope(connection)}.${collection}`;
+}
+
+function playgroundHistoryStorageKey(connection: Connection, mode: string): string {
+  return `nonodb.gui.history.${connectionScope(connection)}.${mode}`;
+}
+
+function ConnectView({
+  onConnected,
+  initialConnection,
+  onCancel,
+}: {
+  onConnected: (connection: Connection) => void;
+  initialConnection?: Connection;
+  onCancel?: () => void;
+}) {
+  const [connection, setConnection] = useState<Connection>(
+    () => initialConnection ?? loadConnection(),
+  );
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [advanced, setAdvanced] = useState(false);
@@ -342,6 +364,11 @@ function ConnectView({ onConnected }: { onConnected: (connection: Connection) =>
           {busy ? 'Connecting…' : 'Connect'}
         </button>
         {error && <div className="error-box">{error}</div>}
+        {onCancel && (
+          <button className="link-button" onClick={onCancel} disabled={busy}>
+            Back to the active connection
+          </button>
+        )}
         <button className="link-button" onClick={() => setAdvanced(!advanced)}>
           {advanced ? 'Hide advanced options' : 'Advanced: endpoint, profiles, vault'}
         </button>
@@ -2841,7 +2868,7 @@ function CollectionView({
   const [fieldPaths, setFieldPaths] = useState<string[]>([]);
   const [savedViews, setSavedViews] = useState<Array<Record<string, string | number>>>(() => {
     try {
-      return JSON.parse(localStorage.getItem(`nonodb.gui.views.${name}`) ?? '[]') as Array<Record<string, string | number>>;
+      return JSON.parse(localStorage.getItem(collectionViewStorageKey(connection, name)) ?? '[]') as Array<Record<string, string | number>>;
     } catch {
       return [];
     }
@@ -3052,7 +3079,7 @@ function CollectionView({
       { name: label, filter: filterText, sortField, sortDir, limit, projection: projectionText },
     ].sort((a, b) => String(a.name).localeCompare(String(b.name)));
     setSavedViews(next);
-    localStorage.setItem(`nonodb.gui.views.${name}`, JSON.stringify(next));
+    localStorage.setItem(collectionViewStorageKey(connection, name), JSON.stringify(next));
     setViewName('');
     setNotice(`Saved view "${label}"`);
   };
@@ -4181,14 +4208,14 @@ function PlaygroundView({
   const [explainResult, setExplainResult] = useState<unknown>(null);
   const [sqlHistory, setSqlHistory] = useState<string[]>(() => {
     try {
-      return JSON.parse(localStorage.getItem('nonodb.gui.sqlHistory') ?? '[]') as string[];
+      return JSON.parse(localStorage.getItem(playgroundHistoryStorageKey(connection, 'sql')) ?? '[]') as string[];
     } catch {
       return [];
     }
   });
   const [jsonHistory, setJsonHistory] = useState<string[]>(() => {
     try {
-      return JSON.parse(localStorage.getItem('nonodb.gui.jsonHistory') ?? '[]') as string[];
+      return JSON.parse(localStorage.getItem(playgroundHistoryStorageKey(connection, 'json')) ?? '[]') as string[];
     } catch {
       return [];
     }
@@ -4197,7 +4224,7 @@ function PlaygroundView({
   const [busy, setBusy] = useState(false);
 
   const history = mode === 'sql' ? sqlHistory : jsonHistory;
-  const historyKey = mode === 'sql' ? 'nonodb.gui.sqlHistory' : 'nonodb.gui.jsonHistory';
+  const historyKey = playgroundHistoryStorageKey(connection, mode);
 
   const remember = (statement: string) => {
     const current = mode === 'sql' ? sqlHistory : jsonHistory;
@@ -5615,10 +5642,157 @@ function Shell({
   );
 }
 
+type SessionStatus = 'checking' | 'online' | 'offline';
+
+type SessionTab = {
+  id: string;
+  connection: Connection;
+  status: SessionStatus;
+};
+
+type StoredSessionState = {
+  activeId: string | null;
+  sessions: Array<{ id: string; connection: Connection }>;
+};
+
+const SESSIONS_KEY = 'nonodb.gui.sessions';
+
+function newSessionId(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  return `session-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+function sessionLabel(connection: Connection): string {
+  const endpoint = connection.endpoint.replace(/^https?:\/\//i, '').replace(/\/$/, '');
+  return `${endpoint || 'local'} · ${connection.database || 'default'}`;
+}
+
+function loadSessionState(): StoredSessionState {
+  try {
+    const raw = sessionStorage.getItem(SESSIONS_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw) as Partial<StoredSessionState>;
+      if (Array.isArray(parsed.sessions) && parsed.sessions.length > 0) {
+        const seen = new Set<string>();
+        const sessions = parsed.sessions
+          .filter((item): item is { id: string; connection: Connection } =>
+            Boolean(item && typeof item.id === 'string' && item.connection && typeof item.connection === 'object'))
+          .filter((item) => {
+            if (seen.has(item.id)) return false;
+            seen.add(item.id);
+            return true;
+          });
+        if (sessions.length > 0) {
+          const activeId =
+            typeof parsed.activeId === 'string' && sessions.some((item) => item.id === parsed.activeId)
+              ? parsed.activeId
+              : sessions[0].id;
+          return { sessions, activeId };
+        }
+      }
+    }
+  } catch {
+    // Fall through to the legacy single-connection value.
+  }
+  const id = newSessionId();
+  return {
+    sessions: [{ id, connection: loadConnection() }],
+    activeId: id,
+  };
+}
+
+function persistSessionState(sessions: SessionTab[], activeId: string | null): void {
+  if (sessions.length === 0) {
+    sessionStorage.removeItem(SESSIONS_KEY);
+    return;
+  }
+  sessionStorage.setItem(
+    SESSIONS_KEY,
+    JSON.stringify({
+      activeId,
+      sessions: sessions.map(({ id, connection }) => ({ id, connection })),
+    }),
+  );
+}
+
+function SessionBar({
+  sessions,
+  activeId,
+  adding,
+  addDisabled,
+  onSelect,
+  onClose,
+  onAdd,
+}: {
+  sessions: SessionTab[];
+  activeId: string | null;
+  adding: boolean;
+  addDisabled: boolean;
+  onSelect: (id: string) => void;
+  onClose: (id: string) => void;
+  onAdd: () => void;
+}) {
+  return (
+    <div className="session-bar" role="tablist" aria-label="Daemon connections">
+      <span className="session-bar-label">Connections</span>
+      {sessions.map((session) => {
+        const label = sessionLabel(session.connection);
+        return (
+          <div
+            key={session.id}
+            className={`session-tab${session.id === activeId ? ' active' : ''}`}
+          >
+            <button
+              type="button"
+              className="session-select"
+              role="tab"
+              aria-selected={session.id === activeId}
+              title={`${session.connection.endpoint} · ${session.connection.database || 'default'}`}
+              onClick={() => onSelect(session.id)}
+            >
+              <span className={`session-dot ${session.status}`} aria-hidden="true" />
+              <span className="session-label">{label}</span>
+            </button>
+            <button
+              type="button"
+              className="session-close"
+              title={`Close ${label}`}
+              aria-label={`Close connection ${label}`}
+              onClick={() => onClose(session.id)}
+            >
+              ×
+            </button>
+          </div>
+        );
+      })}
+      {adding && <span className="session-tab session-new">New connection</span>}
+      <button
+        type="button"
+        className="session-add"
+        title="Add daemon connection"
+        aria-label="Add daemon connection"
+        onClick={onAdd}
+        disabled={adding || addDisabled}
+      >
+        +
+      </button>
+    </div>
+  );
+}
+
 export default function App() {
-  const [connection, setConnection] = useState<Connection>(() => loadConnection());
-  const [connected, setConnected] = useState(false);
+  const initialSessionState = useRef<StoredSessionState | null>(null);
+  if (initialSessionState.current === null) {
+    initialSessionState.current = loadSessionState();
+  }
+  const [sessions, setSessions] = useState<SessionTab[]>(
+    initialSessionState.current.sessions.map((session) => ({ ...session, status: 'checking' })),
+  );
+  const [activeId, setActiveId] = useState<string | null>(initialSessionState.current.activeId);
   const [checking, setChecking] = useState(true);
+  const [adding, setAdding] = useState(false);
   const [lastTiming, setLastTiming] = useState<ApiTiming | null>(null);
   const [timings, setTimings] = useState<ApiTiming[]>([]);
   const [showActivity, setShowActivity] = useState(false);
@@ -5633,33 +5807,55 @@ export default function App() {
   );
 
   useEffect(() => {
+    persistSessionState(sessions, activeId);
+  }, [sessions, activeId]);
+
+  useEffect(() => {
+    if (sessions.length > 0 && !sessions.some((session) => session.id === activeId)) {
+      setActiveId(sessions[0].id);
+    }
+  }, [sessions, activeId]);
+
+  useEffect(() => {
     let cancelled = false;
-    const boot = async () => {
-      let current = loadConnection();
-      const defaults = await sessionDefaults();
-      const sameOrigin =
-        current.endpoint.replace(/\/$/, '') === window.location.origin.replace(/\/$/, '');
-      // The CLI injects the active daemon token into /gui/session. When the GUI
-      // is served from the same origin, this token is authoritative and must
-      // replace a stale token cached by an earlier cluster on the same port.
-      if (defaults.token && (sameOrigin || !current.token)) {
-        current = { ...current, token: defaults.token };
-        saveConnection(current);
-      }
+    const setStatus = (id: string, status: SessionStatus) => {
       if (cancelled) return;
-      setConnection(current);
-      if (!current.endpoint) {
-        setChecking(false);
-        return;
-      }
-      try {
-        await exec(current, { op: 'list_collections' });
-        if (!cancelled) setConnected(true);
-      } catch {
-        if (!cancelled) setConnected(false);
-      } finally {
-        if (!cancelled) setChecking(false);
-      }
+      setSessions((current) =>
+        current.map((session) => (session.id === id ? { ...session, status } : session)),
+      );
+    };
+    const boot = async () => {
+      const base = initialSessionState.current?.sessions ?? [];
+      const defaults = await sessionDefaults();
+      const prepared = base.map(({ id, connection }) => {
+        const sameOrigin =
+          connection.endpoint.replace(/\/$/, '') === window.location.origin.replace(/\/$/, '');
+        const next =
+          defaults.token && (sameOrigin || !connection.token)
+            ? { ...connection, token: defaults.token }
+            : connection;
+        if (next !== connection && id === initialSessionState.current?.activeId) {
+          saveConnection(next);
+        }
+        return { id, connection: next, status: 'checking' as SessionStatus };
+      });
+      if (cancelled) return;
+      setSessions(prepared);
+      await Promise.all(
+        prepared.map(async (session) => {
+          if (!session.connection.endpoint) {
+            setStatus(session.id, 'offline');
+            return;
+          }
+          try {
+            await exec(session.connection, { op: 'list_collections' });
+            setStatus(session.id, 'online');
+          } catch {
+            setStatus(session.id, 'offline');
+          }
+        }),
+      );
+      if (!cancelled) setChecking(false);
     };
     void boot();
     return () => {
@@ -5667,35 +5863,96 @@ export default function App() {
     };
   }, []);
 
+  const active =
+    sessions.find((session) => session.id === activeId) ?? sessions[0] ?? null;
+
+  const addSession = (connection: Connection) => {
+    const id = newSessionId();
+    setSessions((current) => [...current, { id, connection, status: 'online' }]);
+    setActiveId(id);
+    setAdding(false);
+    saveConnection(connection);
+  };
+
+  const updateActiveConnection = (connection: Connection) => {
+    if (!activeId) return;
+    saveConnection(connection);
+    setSessions((current) =>
+      current.map((session) =>
+        session.id === activeId ? { ...session, connection, status: 'online' } : session,
+      ),
+    );
+  };
+
+  const closeSession = (id: string) => {
+    const remaining = sessions.filter((session) => session.id !== id);
+    setSessions(remaining);
+    if (remaining.length === 0) {
+      clearConnection();
+      setActiveId(null);
+      setAdding(false);
+      return;
+    }
+    if (activeId === id) setActiveId(remaining[0].id);
+  };
+
   let content: ReactNode;
   if (checking) {
     content = <div className="splash">Connecting to NonoDB…</div>;
-  } else if (!connected) {
+  } else if (adding) {
     content = (
       <ConnectView
-        onConnected={(next) => {
-          setConnection(next);
-          setConnected(true);
-        }}
+        key={`new-${sessions.length}`}
+        onConnected={addSession}
+        onCancel={sessions.length > 0 ? () => setAdding(false) : undefined}
+      />
+    );
+  } else if (!active) {
+    content = <ConnectView onConnected={addSession} />;
+  } else if (active.status === 'checking') {
+    content = <div className="splash">Connecting to NonoDB…</div>;
+  } else if (active.status === 'online') {
+    content = (
+      <Shell
+        key={active.id}
+        connection={active.connection}
+        onConnectionChange={updateActiveConnection}
+        onDisconnect={() => closeSession(active.id)}
       />
     );
   } else {
+    const nextSession = sessions.find((session) => session.id !== active.id);
     content = (
-      <Shell
-        connection={connection}
-        onConnectionChange={(next) => setConnection(next)}
-        onDisconnect={() => {
-          clearConnection();
-          setConnection(defaultConnection());
-          setConnected(false);
-        }}
+      <ConnectView
+        key={`reconnect-${active.id}`}
+        initialConnection={active.connection}
+        onConnected={updateActiveConnection}
+        onCancel={nextSession ? () => setActiveId(nextSession.id) : undefined}
       />
     );
   }
 
   return (
     <>
-      {content}
+      {sessions.length > 0 ? (
+        <div className="session-layout">
+          <SessionBar
+            sessions={sessions}
+            activeId={activeId}
+            adding={adding}
+            addDisabled={checking}
+            onSelect={(id) => {
+              setActiveId(id);
+              setAdding(false);
+            }}
+            onClose={closeSession}
+            onAdd={() => setAdding(true)}
+          />
+          <div className="session-body">{content}</div>
+        </div>
+      ) : (
+        content
+      )}
       {lastTiming && (
         <button
           type="button"

@@ -146,6 +146,11 @@ def main() -> int:
                 b"default cannot be dropped",
                 b"Type ",
                 b"instance administrator scope",
+                b"Connections",
+                b"Add daemon connection",
+                b"New connection",
+                b"nonodb.gui.sessions",
+                b"session-bar",
             ):
                 assert marker in asset, marker
 

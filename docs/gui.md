@@ -157,7 +157,38 @@ token. There is no separate GUI account.
 
 Credentials are kept in browser `sessionStorage` for the active session. Saved
 connection profiles use browser `localStorage`; do not save production tokens on
-a shared machine. Use **Disconnect** to clear the active session.
+a shared machine. Use **Disconnect** to close the active connection tab.
+
+### Connection tabs
+
+The bar above the console keeps one tab per daemon connection:
+
+- **+** opens the connect screen for another endpoint without closing the
+  current session.
+- Each tab stores its own endpoint, database, token, vault fields, and saved
+  database selection in `sessionStorage`.
+- Clicking a tab switches the console to that connection. The console is
+  remounted for the selected tab, so collections, filters, search results, and
+  in-flight editor state never leak between daemons.
+- The status dot shows `online`, `offline`, or `checking`. An offline tab offers
+  the reconnect screen instead of sending requests with another tab's
+  credentials.
+- Saved collection views and Playground history are namespaced by endpoint and
+  database, so two tenants or daemons with the same collection name do not share
+  local UI state.
+- Closing a tab removes its stored session. Closing the last tab returns to the
+  connect screen.
+
+Session tabs are restored after a page reload; the GUI validates each endpoint
+again at startup. Tokens are still scoped to the tab and are never copied from
+one daemon to another unless the endpoint is the same origin and the CLI injected
+a session token.
+
+Tabs can point at different endpoints. The browser must be able to reach those
+endpoints directly. If they use different origins, expose them through one
+reverse proxy with distinct path prefixes, or configure CORS at the proxy; the
+GUI does not bypass browser cross-origin rules. Use TLS for non-loopback
+endpoints.
 
 ## Features
 

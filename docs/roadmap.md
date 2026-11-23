@@ -93,6 +93,9 @@ Implemented:
   spanning multiple requests.
 - **`write_batch` is the atomic primitive.** It is all-or-nothing, but it is a
   single request and cannot read intermediate results from outside.
+- **`insert_many` is not all-or-nothing.** It is a single request, but a failure
+  can leave earlier documents from the same request committed. Use
+  `write_batch` for atomic groups.
 - **No cross-request read-modify-write isolation.** Two requests can interleave.
   Use `find_and_modify`, atomic update operators (`$inc`), or `write_batch`.
 - **One writer.** All writes are serialized. This is a design choice, not a
@@ -121,9 +124,9 @@ comparison and practical migration caveats.
   Schema draft feature.
 - `$expr` uses the aggregation expression evaluator, including variables,
   common comparison, array, string, conditional, and date operators, including
-  `$dateDiff` and custom `$dateFromString` formats. Date time zones support UTC
-  and fixed offsets, not IANA identifiers. Expression errors do not match the
-  document instead of aborting the query.
+  `$dateDiff` and custom `$dateFromString` formats. Date time zones support UTC,
+  fixed offsets, and IANA identifiers with daylight-saving rules. Expression
+  errors do not match the document instead of aborting the query.
 - Projection supports nested paths, positional `$`, `$slice`, `$elemMatch`, and
   basic `$meta`. Native search supplies `_score`, HTTP `$meta: "textScore"`
   maps it, and MongoDB wire `$text` computes `textScore` with BM25.
@@ -135,8 +138,9 @@ comparison and practical migration caveats.
 - No joins. `lookup` is a point/batch lookup, not a general join, and requires a
   matching unique index for non-`_id` keys. Non-unique lookups are not supported.
 - SQL covers one collection. Joins, subqueries, scalar expressions in grouped
-  `SELECT`, `RETURNING`, `INSERT ... SELECT`, and `UPDATE ... FROM` are not
-  supported yet. Aggregate `DISTINCT` is limited to `COUNT(DISTINCT field)`.
+  `SELECT`, `INSERT ... SELECT`, and `UPDATE ... FROM` are not supported yet.
+  Writes support `RETURNING`, and all five aggregate functions support
+  `DISTINCT`.
 - No stored procedures or daemon plugins. Background jobs and outbox events are
   ordinary client processes. `watch` long-polls or streams append-only outbox
   collections; it is not an automatic change stream for arbitrary writes,
@@ -145,8 +149,9 @@ comparison and practical migration caveats.
 - Projection expressions are limited; nested paths, positional `$`, and basic
   `$meta` are supported, but arbitrary computed projection expressions are not.
 - Sorting and filtering use the documented subset; there is no collation API.
-- Dates are instants only. IANA timezone names and timezone-aware aggregation
-  expressions are not implemented; clients must send RFC 3339 with `Z`/offset.
+- Dates are stored as instants. Aggregation date expressions accept IANA
+  timezone names for local calendar operations; stored values and client input
+  still use RFC 3339 with `Z` or a numeric offset.
 - Existing ISO 8601 strings are not migrated to dates automatically.
 - Decimal128 support includes finite values and `NaN`/`Infinity`. Arithmetic
   results round to 34 significant digits; values outside the Decimal128
@@ -187,7 +192,8 @@ comparison and practical migration caveats.
 - No index intersection or cost-based optimizer. The planner uses a simple
   prefix/range rule.
 - A covering projection requires an explicit `include` list and an inclusive
-  projection.
+  top-level projection. Nested and positional projections fetch the full
+  document.
 - `drop_*` reuses secondary index and vector sub-database slots. Text and fuzzy
   indexes use segment sidecars instead. Legacy databases created by older
   releases remain registered until a compacting restore.
@@ -203,6 +209,13 @@ comparison and practical migration caveats.
 - Phrases require contiguous tokens; no slop parameter.
 - Fuzzy search caps candidate evaluation at 5,000 documents and supports only
   bounded Levenshtein distance.
+- BM25 common-term queries on the full 8.84M MS MARCO collection still reach a
+  p95 of about 30 ms. Block-max WAND is implemented; further pruning and query
+  optimization remain the next performance step.
+- Text and fuzzy indexes cover exactly one field. MongoDB-style multi-field text
+  keys and non-default weights are rejected.
+- Legacy LMDB text/fuzzy indexes are no longer read. Drop and recreate them as
+  segment indexes before upgrading.
 - Search indexes cover scalar values only.
 - Reindexing is required after analyzer changes.
 
@@ -256,6 +269,8 @@ comparison and practical migration caveats.
 - No online schema migration framework.
 - No native compression at rest; restic repositories compress their own data.
 - No native storage encryption; use [filesystem or volume encryption](encryption-at-rest.md) for the data directory.
+- Sidecar copies are skipped when collections are excluded from a backup.
+  Rebuild the affected text, fuzzy, or vector indexes after restore.
 - No multi-tenant isolation inside one database.
 - No built-in TLS certificate rotation or secret management.
 
@@ -279,14 +294,11 @@ project's target workload.
 
 ### GUI and operator experience
 
-1. **Database management from the GUI.** Create/drop databases, not just select
-   them.
-2. **Backup verification and restore APIs.** Let the GUI verify manifests and
+1. **Backup verification and restore APIs.** Let the GUI verify manifests and
    show restore instructions without direct filesystem access.
-3. **Multiple daemon tabs.** Keep several profiles connected simultaneously.
-4. **Import progress and large result sets.** Cancellable/resumable imports and
+2. **Import progress and large result sets.** Cancellable/resumable imports and
    virtualized large result sets.
-5. **Accessibility and theming.** Keyboard navigation, screen-reader labels, and
+3. **Accessibility and theming.** Keyboard navigation, screen-reader labels, and
    an optional light theme.
 
 ### High value
@@ -314,28 +326,26 @@ project's target workload.
    objectives.
 8. **Stop words, stemming, and per-index analyzers**; possibly an integration
    with Tantivy for advanced text search.
-9. **Timezone-aware date expressions** for aggregation, including IANA
-   timezone identifiers for local calendar operations.
-10. **Non-finite Decimal128 values and decimal comparison across all numeric
+9. **Non-finite Decimal128 values and decimal comparison across all numeric
     edge cases**, building on the current finite Decimal128 support.
-11. **BSON regex values**, plus matching `$type` entries and
+10. **BSON regex values**, plus matching `$type` entries and
     global sentinel range behavior.
-12. **Compression and/or CBOR storage** for smaller files and faster parsing,
+11. **Compression and/or CBOR storage** for smaller files and faster parsing,
    with a migration path.
-13. **Expanded aggregation** beyond the current `$match`/`$group`/`$bucket`/
+12. **Expanded aggregation** beyond the current `$match`/`$group`/`$bucket`/
     `$bucketAuto`/`$project`/`$sort`/`$limit`/`$facet`/`$sample`/`$lookup`/
     `$unionWith`/`$graphLookup`/`$setWindowFields`/`$densify`/`$fill`/`$out`/
     `$merge` subset, including streaming execution.
 
 ### Lower priority
 
-14. Sparse/partial and wildcard indexes.
-15. Advanced approximate vector indexes (HNSW/PQ) and polygon/line document geo
+13. Sparse/partial and wildcard indexes.
+14. Advanced approximate vector indexes (HNSW/PQ) and polygon/line document geo
     indexes. A basic IVF sidecar is implemented.
-16. Published package-registry releases for the existing Python, Rust, Node.js,
+15. Published package-registry releases for the existing Python, Rust, Node.js,
     and Go clients.
-17. Benchmark automation in CI.
-18. Shared or hosted web administration beyond the embedded local GUI.
+16. Benchmark automation in CI.
+17. Shared or hosted web administration beyond the embedded local GUI.
 
 ## Non-goals
 

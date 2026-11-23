@@ -279,8 +279,8 @@ retention semantics.
 - Aggregation expressions include `$dateAdd`, `$dateSubtract`, `$dateDiff`,
   `$dateTrunc`, `$dateToString`, `$dateFromString`, `$dateFromParts`, and
   `$dateToParts`.
-  Time zones use UTC or fixed `+HH:MM` offsets; IANA zone names are not
-  implemented.
+  Time zones use UTC, fixed `+HH:MM` offsets, or IANA zone names with
+  daylight-saving rules.
 - Naive local datetimes are rejected as ambiguous.
 
 ```bash

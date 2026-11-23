@@ -296,6 +296,135 @@ h3 {
   font-size: 0.8rem;
 }
 
+.session-layout {
+  --session-bar-height: 42px;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.session-bar {
+  min-height: var(--session-bar-height);
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.3rem 0.55rem;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+  position: sticky;
+  top: 0;
+  z-index: 40;
+  overflow-x: auto;
+}
+
+.session-bar-label {
+  color: var(--muted);
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 0 0.25rem;
+  white-space: nowrap;
+}
+
+.session-tab {
+  display: flex;
+  align-items: stretch;
+  flex: 0 0 auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--panel-2);
+}
+
+.session-tab.active {
+  border-color: var(--accent-2);
+  background: #12233c;
+}
+
+.session-tab > button {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  padding: 0.28rem 0.5rem;
+  font-size: 0.78rem;
+}
+
+.session-select {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  max-width: 18rem;
+}
+
+.session-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-close {
+  border-left: 1px solid var(--border) !important;
+  color: var(--muted);
+  line-height: 1;
+}
+
+.session-close:hover:not(:disabled) {
+  color: var(--danger);
+}
+
+.session-new {
+  padding: 0.28rem 0.55rem;
+  color: var(--muted);
+  font-size: 0.78rem;
+  border-style: dashed;
+}
+
+.session-add {
+  flex: 0 0 auto;
+  padding: 0.2rem 0.55rem;
+  font-size: 1rem;
+  line-height: 1.2;
+}
+
+.session-dot {
+  width: 0.45rem;
+  height: 0.45rem;
+  border-radius: 999px;
+  background: var(--muted);
+  flex: 0 0 auto;
+}
+
+.session-dot.online {
+  background: var(--ok);
+}
+
+.session-dot.offline {
+  background: var(--danger);
+}
+
+.session-dot.checking {
+  background: #d29922;
+}
+
+.session-body {
+  flex: 1;
+  min-height: 0;
+}
+
+.session-body .app-shell {
+  min-height: calc(100vh - var(--session-bar-height));
+}
+
+.session-body .sidebar {
+  top: var(--session-bar-height);
+  min-height: calc(100vh - var(--session-bar-height));
+}
+
+.session-body .connect-page,
+.session-body .splash {
+  min-height: calc(100vh - var(--session-bar-height));
+}
+
 .app-shell {
   min-height: 100vh;
   display: grid;
