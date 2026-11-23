@@ -509,6 +509,20 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn apfs_clonefile_is_used() {
+        let root = temp_root("apfs");
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("source");
+        let target = root.join("target");
+        fs::write(&source, vec![3u8; 1024 * 1024]).unwrap();
+        let (bytes, method) = copy_file(&source, &target).unwrap();
+        assert_eq!(bytes, 1024 * 1024);
+        assert_eq!(method, Method::Clonefile);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn failed_copy_leaves_no_partial_target() {
         let root = temp_root("partial");

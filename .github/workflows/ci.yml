@@ -267,3 +267,7 @@ jobs:
 
       - name: Check macOS/Windows build
         run: cargo check --locked --all-targets --all-features
+
+      - name: Test APFS clonefile branch method
+        if: runner.os == 'macOS'
+        run: cargo test --locked -p nonodb-cli branch::tests::apfs_clonefile_is_used -- --nocapture
