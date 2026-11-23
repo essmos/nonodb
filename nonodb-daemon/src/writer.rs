@@ -53,6 +53,7 @@ impl ReplicationContext {
             before: before.cloned(),
             after: after.cloned(),
             vault: false,
+            ttl_at: None,
         });
         self.ops.push(ReplicationOp::Document { change });
     }
@@ -76,6 +77,7 @@ impl ReplicationContext {
             before: before.cloned(),
             after: after.cloned(),
             vault: true,
+            ttl_at: None,
         });
         self.ops.push(ReplicationOp::Document { change });
     }
@@ -150,6 +152,7 @@ pub(crate) fn capture_sql_replication(
             before: before.cloned(),
             after: after.cloned(),
             vault: false,
+            ttl_at: None,
         });
     });
 }
@@ -252,6 +255,23 @@ pub fn run(
     }
 }
 
+fn capture_replicated_ttls(
+    store: &Store,
+    wtxn: &mut nonodb_core::heed::RwTxn<'_>,
+    changes: &mut [ReplicationChange],
+) {
+    for change in changes {
+        change.ttl_at = None;
+        if change.op == "delete" {
+            continue;
+        }
+        let Ok(collection) = store.collection_in(wtxn, &change.collection) else {
+            continue;
+        };
+        change.ttl_at = collection.ttl_expiry_in(&*wtxn, &change.id).ok().flatten();
+    }
+}
+
 fn run_batch(store: &Store, cache: &QueryCache, jobs: Vec<WriteJob>) {
     metrics::sub(&metrics::QUEUE_LEN, jobs.len() as u64);
     if !crate::replicator::writable() {
@@ -304,6 +324,7 @@ fn run_batch(store: &Store, cache: &QueryCache, jobs: Vec<WriteJob>) {
     }
     if let Some(origin) = &replication.origin {
         if !replication.changes.is_empty() || !replication.ops.is_empty() {
+            capture_replicated_ttls(store, &mut wtxn, &mut replication.changes);
             if let Err(error) = store.append_replication_txn_ops_with_epoch_in(
                 &mut wtxn,
                 origin,
@@ -383,6 +404,7 @@ fn run_single(store: &Store, cache: &QueryCache, job: WriteJob) {
             }
             if let Some(origin) = &replication.origin {
                 if !replication.changes.is_empty() || !replication.ops.is_empty() {
+                    capture_replicated_ttls(store, &mut wtxn, &mut replication.changes);
                     if let Err(error) = store.append_replication_txn_ops_with_epoch_in(
                         &mut wtxn,
                         origin,
@@ -1068,6 +1090,62 @@ fn execute(
                 });
             }
             Ok(json!({ "deleted": deleted }))
+        }
+        WriteReq::CreateWebhook { rule } => {
+            rule.validate().map_err(|message| ApiError {
+                code: "invalid_query".into(),
+                message,
+            })?;
+            let _ = store.collection_in(wtxn, &rule.coll)?;
+            crate::webhooks::ensure_events(store, wtxn, &rule.coll).map_err(ApiError::internal)?;
+            let mut rule = rule.clone();
+            if rule.start_cursor.is_empty() {
+                let events = store.collection_in(wtxn, events::EVENTS_COLLECTION)?;
+                let latest = events.find_in(
+                    &*wtxn,
+                    &FindQuery {
+                        filter: json!({}),
+                        projection: Some(json!({"_id": 1})),
+                        sort: vec![("_id".to_string(), -1)],
+                        skip: 0,
+                        limit: Some(1),
+                        comment: None,
+                        max_time_ms: None,
+                        hint: None,
+                    },
+                )?;
+                rule.start_cursor = latest
+                    .first()
+                    .and_then(|doc| doc.get("_id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+            }
+            let collection = store.collection_in(wtxn, crate::webhooks::WEBHOOKS_COLLECTION)?;
+            let _ = collection.delete_txn(wtxn, &json!({"_id": rule.name}), false)?;
+            let mut doc = serde_json::to_value(&rule).map_err(nonodb_core::Error::from)?;
+            doc["_id"] = json!(rule.name);
+            collection.insert_one_txn(wtxn, doc)?;
+            Ok(serde_json::to_value(&rule).map_err(nonodb_core::Error::from)?)
+        }
+        WriteReq::DeleteWebhook { name } => {
+            let collection = store.collection_in(wtxn, crate::webhooks::WEBHOOKS_COLLECTION)?;
+            let deleted = collection.delete_txn(wtxn, &json!({"_id": name}), false)? > 0;
+            Ok(json!({ "deleted": deleted }))
+        }
+        WriteReq::RetryWebhookDelivery { id } => {
+            let collection = store.collection_in(wtxn, crate::webhooks::DELIVERIES_COLLECTION)?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let retried = collection.update_txn(
+                wtxn,
+                &json!({"_id": id}),
+                &json!({"$set": {"status": "pending", "next_attempt_ms": 0, "updated_at": now}}),
+                false,
+            )?;
+            Ok(json!({ "retried": retried > 0 }))
         }
         WriteReq::Expire { entries } => {
             let mut expired = 0usize;

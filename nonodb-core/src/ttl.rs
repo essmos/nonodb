@@ -244,6 +244,20 @@ pub struct DueEntry {
     pub expire_at: u64,
 }
 
+/// Returns the earliest expiry timestamp, including entries already due.
+pub(crate) fn earliest_expiry(
+    db: &Database<Bytes, Bytes>,
+    rtxn: &RoTxn<'_>,
+) -> Result<Option<u64>> {
+    for item in db.prefix_iter(rtxn, &[EXPIRY_PREFIX])? {
+        let (key, _) = item?;
+        if let Some((at, _, _)) = parse_expiry_key(key) {
+            return Ok(Some(at));
+        }
+    }
+    Ok(None)
+}
+
 /// Reads up to `limit` TTL entries with `expire_at <= now`.
 ///
 /// Entries are ordered by expiry, collection, and id. The caller must re-check

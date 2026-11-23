@@ -19,6 +19,9 @@ func TestReadOps(t *testing.T) {
 	if !isReadOp(map[string]any{"op": "sql"}) {
 		t.Fatal("sql should be retryable")
 	}
+	if !isReadOp(map[string]any{"op": "search_all"}) {
+		t.Fatal("search_all should be retryable")
+	}
 	if !isReadOp(map[string]any{"op": "explain_sql"}) {
 		t.Fatal("explain_sql should be retryable")
 	}
@@ -123,5 +126,38 @@ func TestWriteRouting(t *testing.T) {
 	}
 	if got := replicaWrites.Load(); got != 0 {
 		t.Fatalf("replica writes = %d", got)
+	}
+}
+
+func TestSearchAllUsesReadEndpoint(t *testing.T) {
+	var reads atomic.Int64
+	replica := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/readyz" {
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+			return
+		}
+		reads.Add(1)
+		w.Header().Set("content-type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true,"result":{"results":[{"_id":"doc-1"}]}}`))
+	}))
+	defer replica.Close()
+
+	c := New(
+		WithBaseURL(replica.URL),
+		WithWriteURL("http://127.0.0.1:9"),
+		WithToken("test"),
+	)
+	results, err := c.Collection("c").SearchAll(context.Background(), SearchAllOptions{
+		Mode:  "lexical",
+		Query: "coffee",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || results[0]["_id"] != "doc-1" {
+		t.Fatalf("results = %#v", results)
+	}
+	if got := reads.Load(); got != 1 {
+		t.Fatalf("read endpoint requests = %d", got)
 	}
 }

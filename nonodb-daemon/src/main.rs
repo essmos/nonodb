@@ -39,6 +39,7 @@ mod replicator;
 mod retention;
 mod s3_import;
 mod server_info;
+mod webhooks;
 mod writer;
 
 use std::collections::HashMap;
@@ -1781,15 +1782,21 @@ fn cursor_page(
     if fetch == 0 {
         return Ok((Vec::new(), false));
     }
-    if let cursor::Kind::MaterializedAggregate { docs, offset, .. } = &mut state.kind {
-        let start = (*offset).min(docs.len());
-        let take = fetch.min(docs.len() - start);
-        let out = docs[start..start + take].to_vec();
-        *offset = start + take;
+    if let cursor::Kind::MaterializedAggregate { coll, docs, offset } = &mut state.kind {
+        let c = read_collection(store, coll, auth)?;
+        let mut out = Vec::with_capacity(fetch);
+        while out.len() < fetch && *offset < docs.len() {
+            let start = *offset;
+            let take = fetch.min(docs.len() - start);
+            let page = c.retain_visible(docs[start..start + take].to_vec())?;
+            *offset = start + take;
+            out.extend(page);
+        }
+        let visible = out.len();
         let has_more =
-            *offset < docs.len() && state.remaining.is_none_or(|remaining| remaining > take);
+            *offset < docs.len() && state.remaining.is_none_or(|remaining| remaining > visible);
         if let Some(remaining) = &mut state.remaining {
-            *remaining = remaining.saturating_sub(take);
+            *remaining = remaining.saturating_sub(visible);
         }
         return Ok((out, has_more));
     }
@@ -3414,6 +3421,19 @@ async fn exec_inner(
             read_result(joined).await
         }
 
+        Request::SearchAll { request } => {
+            let store = state.store.clone();
+            let auth = vault_auth.clone();
+            let coll = request.coll.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                let c = read_collection(&store, &coll, auth.as_ref())?;
+                reject_vault_read(&c, auth.as_ref(), "unified search")?;
+                let out = c.search_all(&request)?;
+                Ok::<Value, ApiError>(search_all_response(out))
+            });
+            read_result(joined).await
+        }
+
         Request::History {
             coll,
             id,
@@ -3582,6 +3602,33 @@ async fn exec_inner(
             let joined = tokio::task::spawn_blocking(move || {
                 let list = store.list_subscriptions(&coll)?;
                 Ok::<Value, ApiError>(json!({ "subscriptions": list }))
+            });
+            read_result(joined).await
+        }
+
+        Request::ListWebhooks => {
+            let store = state.store.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                Ok::<Value, ApiError>(json!({
+                    "webhooks": crate::webhooks::list_rules(&store).map_err(ApiError::internal)?
+                }))
+            });
+            read_result(joined).await
+        }
+
+        Request::ListWebhookDeliveries { status, limit } => {
+            let store = state.store.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                let mut deliveries =
+                    crate::webhooks::list_deliveries(&store).map_err(ApiError::internal)?;
+                if let Some(status) = status.as_deref().filter(|value| !value.is_empty()) {
+                    deliveries.retain(|delivery| {
+                        delivery.get("status").and_then(Value::as_str) == Some(status)
+                    });
+                }
+                let limit = limit.unwrap_or(100).min(1000);
+                deliveries.truncate(limit);
+                Ok::<Value, ApiError>(json!({ "deliveries": deliveries }))
             });
             read_result(joined).await
         }
@@ -3846,6 +3893,9 @@ async fn exec_inner(
                 Request::DeleteSubscription { coll, name } => {
                     WriteReq::DeleteSubscription { coll, name }
                 }
+                Request::CreateWebhook { rule } => WriteReq::CreateWebhook { rule },
+                Request::DeleteWebhook { name } => WriteReq::DeleteWebhook { name },
+                Request::RetryWebhookDelivery { id } => WriteReq::RetryWebhookDelivery { id },
                 Request::CreateIndex {
                     coll,
                     field,
@@ -3944,7 +3994,12 @@ async fn exec_inner(
                     .and_then(|raw| serde_json::from_str(raw.get()).ok())
             });
             if let Some(value) = cached {
-                state.cache.put(key, cache_version, value);
+                state.cache.put_until(
+                    key,
+                    cache_version,
+                    value,
+                    ttl_cache_deadline(state.store.as_ref()),
+                );
             }
         }
     }
@@ -4255,6 +4310,12 @@ fn watch_status(
     Ok((oldest.as_deref().is_some_and(|id| id > after), oldest))
 }
 
+fn ttl_cache_deadline(store: &Store) -> Option<Instant> {
+    let expiry = store.next_ttl_expiry().ok().flatten()?;
+    let now = nonodb_core::ttl::now_ms();
+    Some(Instant::now() + Duration::from_millis(expiry.saturating_sub(now)))
+}
+
 fn cacheable(req: &Request) -> bool {
     if let Request::Sql { query, .. } = req {
         if !nonodb_core::sql::is_read_only(query).unwrap_or(false) {
@@ -4281,6 +4342,7 @@ fn cacheable(req: &Request) -> bool {
             | Request::Sql { .. }
             | Request::ExplainSql { .. }
             | Request::Search { .. }
+            | Request::SearchAll { .. }
             | Request::Fuzzy { .. }
             | Request::ListIndexes { .. }
             | Request::ListTextIndexes { .. }
@@ -4296,6 +4358,18 @@ fn cacheable(req: &Request) -> bool {
             | Request::History { .. }
             | Request::GetVersion { .. }
     )
+}
+
+fn search_all_response(out: nonodb_core::SearchAllResponse) -> Value {
+    json!({
+        "results": out.results,
+        "meta": {
+            "mode": out.mode,
+            "rrf_k": out.rrf_k,
+            "candidate_count": out.candidate_count,
+            "sources": out.sources,
+        }
+    })
 }
 
 fn read_collection<'a>(
@@ -4746,6 +4820,19 @@ fn execute_read(
             Ok(json!({
                 "results": c.fuzzy_search_in(rtxn, &field, &query, distance, &filter, limit)?
             }))
+        }
+        Request::SearchAll { request } => {
+            let Some(c) = store.collection_at(rtxn, &request.coll)? else {
+                return Err(nonodb_core::Error::Query(format!(
+                    "collection `{}` does not exist",
+                    request.coll
+                ))
+                .into());
+            };
+            if c.profile().is_vault() {
+                return Err(vault::unsupported("batch reads on vault collections").into());
+            }
+            Ok(search_all_response(c.search_all_in(rtxn, &request)?))
         }
         Request::History {
             coll,

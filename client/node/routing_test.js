@@ -29,7 +29,7 @@ function start(role, primaryUrl) {
         send(404, { ok: false, error: { code: 'not_found', message: '' } });
         return;
       }
-      if (role === 'replica' && payload.op !== 'find') {
+      if (role === 'replica' && !['find', 'search_all'].includes(payload.op)) {
         state.posts += 1;
         send(403, {
           ok: false,
@@ -39,7 +39,12 @@ function start(role, primaryUrl) {
       }
       state.posts += 1;
       state.seen.push(payload);
-      send(200, { ok: true, result: payload.op === 'find' ? [] : { inserted_id: 'doc-1' } });
+      const result = payload.op === 'find'
+        ? []
+        : payload.op === 'search_all'
+          ? { results: [{ _id: 'doc-1' }] }
+          : { inserted_id: 'doc-1' };
+      send(200, { ok: true, result });
     });
   });
   return new Promise((resolve) => {
@@ -66,6 +71,10 @@ async function main() {
   assert.equal(replica.posts, 0);
   await db.exec({ op: 'find', coll: 'c' });
   assert.equal(replica.posts, 1);
+  const found = await db.collection('c').searchAll({ query: 'coffee' });
+  assert.equal(found.length, 1);
+  assert.equal(replica.posts, 2);
+  assert.equal(primary.posts, 1);
 
   primary.posts = 0;
   replica.posts = 0;

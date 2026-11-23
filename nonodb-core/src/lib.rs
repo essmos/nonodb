@@ -31,6 +31,8 @@ pub mod query;
 mod regex;
 pub mod replication;
 pub mod search;
+pub mod search_all;
+pub mod search_compat;
 pub mod search_segment;
 pub mod sql;
 pub mod store;
@@ -54,6 +56,7 @@ pub use replication::{ReplicationChange, ReplicationTxn, REPLICATION_DB};
 pub use search::{
     SearchField, SearchIndexDef, SearchKind, TextQuery, TextQueryMode, DEFAULT_FUZZY_DISTANCE,
 };
+pub use search_all::{SearchAllRequest, SearchAllResponse, SearchMode};
 pub use store::{
     parse_size, ReadTxn, Store, WriteTxn, CONTROL_DB, MAP_SIZE, MAX_DBS, MAX_DOCUMENT_BYTES,
     META_DB, PAGE_SIZE,

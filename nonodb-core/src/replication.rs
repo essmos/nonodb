@@ -36,6 +36,9 @@ pub struct ReplicationChange {
     /// instead of routing it through the standard document write path.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub vault: bool,
+    /// Absolute TTL expiry (Unix ms) captured from the primary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_at: Option<u64>,
 }
 
 /// One ordered logical operation in a replication transaction.
@@ -215,6 +218,7 @@ mod tests {
                     before: None,
                     after: Some(serde_json::json!({"_id": "o1", "total": 10})),
                     vault: false,
+                    ttl_at: None,
                 }],
             )
             .unwrap();
@@ -233,6 +237,7 @@ mod tests {
                         before: Some(serde_json::json!({"_id": "o1", "total": 10})),
                         after: Some(serde_json::json!({"_id": "o1", "total": 20})),
                         vault: false,
+                        ttl_at: None,
                     },
                     ReplicationChange {
                         collection: "payments".into(),
@@ -241,6 +246,7 @@ mod tests {
                         before: None,
                         after: Some(serde_json::json!({"_id": "p1", "total": 20})),
                         vault: false,
+                        ttl_at: None,
                     },
                 ],
             )
@@ -296,6 +302,7 @@ mod tests {
             before: None,
             after: Some(serde_json::json!({"_id": id})),
             vault: false,
+            ttl_at: None,
         };
         let first = ReplicationTxn::new_with_epoch(1, "node-a", 2, vec![change("o1")]);
         assert!(store.apply_replication_txn(&first).unwrap());
@@ -322,6 +329,7 @@ mod tests {
                 before: None,
                 after: Some(serde_json::json!({"_id": "o1", "total": 10})),
                 vault: false,
+                ttl_at: None,
             }],
         );
         assert!(store.apply_replication_txn(&insert).unwrap());
@@ -349,6 +357,7 @@ mod tests {
                 before: Some(serde_json::json!({"_id": "o1", "total": 10})),
                 after: Some(serde_json::json!({"_id": "o1", "total": 20})),
                 vault: false,
+                ttl_at: None,
             }],
         );
         assert!(store.apply_replication_txn(&update).unwrap());
@@ -378,6 +387,7 @@ mod tests {
                 before: Some(serde_json::json!({"_id": "o1", "total": 20})),
                 after: None,
                 vault: false,
+                ttl_at: None,
             }],
         );
         assert!(store.apply_replication_txn(&delete).unwrap());

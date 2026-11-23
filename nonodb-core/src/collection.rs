@@ -490,6 +490,7 @@ pub struct Collection<'e> {
     profile: CollectionProfile,
     ttl_default_seconds: Option<u64>,
     ttl_purge_history: bool,
+    strict_reads: bool,
     env: &'e Env,
     txn_gate: &'e crate::store::TxnGate,
 }
@@ -505,6 +506,19 @@ pub struct CollectionStorageStats {
 fn stat_bytes(stat: &heed::DatabaseStat) -> u64 {
     let pages = stat.branch_pages + stat.leaf_pages + stat.overflow_pages;
     pages as u64 * stat.page_size as u64
+}
+
+/// Strict read-time TTL filtering is on by default; `NONODB_TTL_STRICT_READS=0`
+/// restores the legacy eventual-visibility behavior.
+fn strict_reads_enabled() -> bool {
+    std::env::var("NONODB_TTL_STRICT_READS")
+        .map(|value| {
+            !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            )
+        })
+        .unwrap_or(true)
 }
 
 impl<'e> Collection<'e> {
@@ -534,6 +548,7 @@ impl<'e> Collection<'e> {
             profile,
             ttl_default_seconds,
             ttl_purge_history,
+            strict_reads: strict_reads_enabled(),
             env,
             txn_gate,
         }
@@ -621,6 +636,69 @@ impl<'e> Collection<'e> {
 
     fn ttl_at(&self, txn: &RoTxn<'_>, id: &str) -> Result<Option<u64>> {
         ttl::get_entry(&self.ttl_db, txn, &self.name, id)
+    }
+
+    /// Whether strict read-time TTL filtering is enabled for this collection.
+    pub fn strict_ttl_reads(&self) -> bool {
+        self.strict_reads
+    }
+
+    /// Whether any TTL metadata exists. Used to skip the per-document expiry
+    /// check for collections/databases that never use TTL.
+    fn ttl_filter_active(&self, txn: &RoTxn<'_>) -> Result<bool> {
+        Ok(self.strict_reads && self.ttl_db.stat(txn)?.entries > 0)
+    }
+
+    pub fn ttl_expiry_in(&self, txn: &RoTxn<'_>, id: &str) -> Result<Option<u64>> {
+        self.ttl_at(txn, id)
+    }
+
+    /// Returns true when `id` has an expiry at or before `now`.
+    fn ttl_expired_in(&self, txn: &RoTxn<'_>, id: &str, now: u64) -> Result<bool> {
+        if !self.strict_reads {
+            return Ok(false);
+        }
+        Ok(self.ttl_at(txn, id)?.is_some_and(|at| at <= now))
+    }
+
+    fn ttl_expired_at(&self, txn: &RoTxn<'_>, id: &str, now: u64) -> Result<bool> {
+        self.ttl_expired_in(txn, id, now)
+    }
+
+    fn ttl_doc_visible(&self, txn: &RoTxn<'_>, doc: &Value, now: u64) -> Result<bool> {
+        match doc.get("_id").and_then(Value::as_str) {
+            Some(id) => Ok(!self.ttl_expired_at(txn, id, now)?),
+            None => Ok(true),
+        }
+    }
+
+    /// Filters expired documents from a materialized result using a fresh read
+    /// transaction. Used by cursor pages that outlive the transaction which
+    /// produced them.
+    pub fn retain_visible(&self, docs: Vec<Value>) -> Result<Vec<Value>> {
+        let rtxn = self.read_txn()?;
+        let out = self.retain_visible_docs(&rtxn, docs)?;
+        rtxn.commit()?;
+        Ok(out)
+    }
+
+    /// Filters expired documents out of a materialized result without writing.
+    fn retain_visible_docs(&self, txn: &RoTxn<'_>, docs: Vec<Value>) -> Result<Vec<Value>> {
+        if !self.ttl_filter_active(txn)? {
+            return Ok(docs);
+        }
+        let now = ttl::now_ms();
+        let mut out = Vec::with_capacity(docs.len());
+        for doc in docs {
+            let visible = match doc.get("_id").and_then(Value::as_str) {
+                Some(id) => !self.ttl_expired_at(txn, id, now)?,
+                None => true,
+            };
+            if visible {
+                out.push(doc);
+            }
+        }
+        Ok(out)
     }
 
     /// Collection default TTL in seconds, if configured.
@@ -2241,6 +2319,38 @@ impl<'e> Collection<'e> {
     }
 
     pub fn vector_search_in(
+        &self,
+        rtxn: &RoTxn<'_>,
+        field: &str,
+        query: &[f32],
+        filter: &Value,
+        skip: usize,
+        limit: Option<usize>,
+    ) -> Result<Vec<Value>> {
+        if !self.ttl_filter_active(rtxn)? {
+            return self.vector_search_in_unfiltered(rtxn, field, query, filter, skip, limit);
+        }
+        let target = skip.saturating_add(limit.unwrap_or(10).min(1000));
+        if target == 0 {
+            return Ok(Vec::new());
+        }
+        let mut fetch = target.saturating_mul(2).clamp(target, 1000);
+        loop {
+            let docs =
+                self.vector_search_in_unfiltered(rtxn, field, query, filter, 0, Some(fetch))?;
+            let filtered = self.retain_visible_docs(rtxn, docs)?;
+            if filtered.len() >= target || fetch >= 1000 {
+                return Ok(filtered
+                    .into_iter()
+                    .skip(skip)
+                    .take(limit.unwrap_or(10))
+                    .collect());
+            }
+            fetch = (fetch * 2).min(1000);
+        }
+    }
+
+    fn vector_search_in_unfiltered(
         &self,
         rtxn: &RoTxn<'_>,
         field: &str,
@@ -4023,6 +4133,57 @@ impl<'e> Collection<'e> {
         filter: &Value,
         skip: usize,
         limit: Option<usize>,
+        mode: TextQueryMode,
+    ) -> Result<Vec<Value>> {
+        if !self.ttl_filter_active(rtxn)? {
+            return self
+                .search_text_index_in_unfiltered(rtxn, name, query, filter, skip, limit, mode);
+        }
+        let target = skip.saturating_add(limit.unwrap_or(10).min(1000));
+        if target == 0 {
+            return Ok(Vec::new());
+        }
+        let mut fetch = target.saturating_mul(2).clamp(target, 1000);
+        loop {
+            let docs = self.search_text_index_in_unfiltered(
+                rtxn,
+                name,
+                query,
+                filter,
+                0,
+                Some(fetch),
+                mode,
+            )?;
+            let filtered = self.retain_visible_docs(rtxn, docs)?;
+            let exhausted =
+                fetch >= 1000 || (fetch > target && filtered.len() < target && fetch == 1000);
+            if filtered.len() >= target || fetch >= 1000 {
+                return Ok(filtered
+                    .into_iter()
+                    .skip(skip)
+                    .take(limit.unwrap_or(10))
+                    .collect());
+            }
+            if exhausted {
+                return Ok(filtered
+                    .into_iter()
+                    .skip(skip)
+                    .take(limit.unwrap_or(10))
+                    .collect());
+            }
+            fetch = (fetch * 2).min(1000);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn search_text_index_in_unfiltered(
+        &self,
+        rtxn: &RoTxn<'_>,
+        name: &str,
+        query: &str,
+        filter: &Value,
+        skip: usize,
+        limit: Option<usize>,
         _mode: TextQueryMode,
     ) -> Result<Vec<Value>> {
         crate::query::validate::validate_filter(filter)?;
@@ -4220,6 +4381,47 @@ impl<'e> Collection<'e> {
         filter: &Value,
         limit: Option<usize>,
     ) -> Result<Vec<Value>> {
+        if !self.ttl_filter_active(rtxn)? {
+            return self.fuzzy_search_in_unfiltered(
+                rtxn,
+                field,
+                query,
+                max_distance,
+                filter,
+                limit,
+            );
+        }
+        let max = limit.unwrap_or(10).min(1000);
+        if max == 0 {
+            return Ok(Vec::new());
+        }
+        let mut fetch = max.saturating_mul(2).clamp(max, 1000);
+        loop {
+            let docs = self.fuzzy_search_in_unfiltered(
+                rtxn,
+                field,
+                query,
+                max_distance,
+                filter,
+                Some(fetch),
+            )?;
+            let filtered = self.retain_visible_docs(rtxn, docs)?;
+            if filtered.len() >= max || fetch >= 1000 {
+                return Ok(filtered.into_iter().take(max).collect());
+            }
+            fetch = (fetch * 2).min(1000);
+        }
+    }
+
+    fn fuzzy_search_in_unfiltered(
+        &self,
+        rtxn: &RoTxn<'_>,
+        field: &str,
+        query: &str,
+        max_distance: usize,
+        filter: &Value,
+        limit: Option<usize>,
+    ) -> Result<Vec<Value>> {
         crate::query::validate::validate_filter(filter)?;
         let Some(def) = self.search_index_def(rtxn, SearchKind::Fuzzy, field)? else {
             return Err(Error::Query(format!("no fuzzy index on field `{field}`")));
@@ -4323,6 +4525,7 @@ impl<'e> Collection<'e> {
         op: &str,
         id: &str,
         after: Option<&Value>,
+        ttl_at: Option<u64>,
     ) -> Result<()> {
         self.ensure_standard()?;
         let existing = self.db.get(&*wtxn, id.as_bytes())?.map(|raw| raw.to_vec());
@@ -4350,7 +4553,7 @@ impl<'e> Collection<'e> {
                     self.apply_text_entries(wtxn, Some(old), None, id)?;
                     self.apply_fuzzy_entries(wtxn, Some(old), None, id)?;
                     self.apply_vector_entries(wtxn, Some(old), None, id)?;
-                    self.set_ttl(wtxn, id, None)?;
+                    self.set_ttl(wtxn, id, ttl_at)?;
                 }
                 self.validate_unique(&*wtxn, after, id)?;
                 let bytes = serde_json::to_vec(after)?;
@@ -4362,7 +4565,7 @@ impl<'e> Collection<'e> {
                 self.apply_text_entries(wtxn, None, Some(after), id)?;
                 self.apply_fuzzy_entries(wtxn, None, Some(after), id)?;
                 self.apply_vector_entries(wtxn, None, Some(after), id)?;
-                self.set_ttl(wtxn, id, None)?;
+                self.set_ttl(wtxn, id, ttl_at)?;
                 self.record_history(wtxn, id, op, Some(after.clone()))?;
             }
             "delete" => {
@@ -4867,6 +5070,7 @@ impl<'e> Collection<'e> {
         op: &str,
         id: &str,
         after: Option<&Value>,
+        ttl_at: Option<u64>,
     ) -> Result<()> {
         self.ensure_vault()?;
         match op {
@@ -4886,6 +5090,7 @@ impl<'e> Collection<'e> {
                 }
                 let bytes = Self::check_vault_size(stored)?;
                 self.db.put(&mut *wtxn, id.as_bytes(), &bytes)?;
+                self.set_ttl(wtxn, id, ttl_at)?;
                 self.record_history(
                     wtxn,
                     id,
@@ -5575,7 +5780,7 @@ impl<'e> Collection<'e> {
         txn: &RoTxn<'_>,
         filter: &Value,
         deadline: Option<Instant>,
-        mut f: F,
+        f: F,
     ) -> Result<()>
     where
         F: FnMut(Value) -> Result<()>,
@@ -5583,10 +5788,19 @@ impl<'e> Collection<'e> {
         crate::query::validate::validate_filter(filter)?;
         check_find_deadline(deadline)?;
         let raw = raw_prefilter(filter);
+        let strict_ttl = self.ttl_filter_active(txn)?;
+        let now = ttl::now_ms();
+        let mut f = f;
+        let mut emit = |doc: Value| -> Result<()> {
+            if strict_ttl && !self.ttl_doc_visible(txn, &doc, now)? {
+                return Ok(());
+            }
+            f(doc)
+        };
 
         if let Some(id) = direct_id(filter) {
             if let Some(bytes) = self.db.get(txn, id.as_bytes())? {
-                f(parse_json(bytes)?)?;
+                emit(parse_json(bytes)?)?;
             }
             return Ok(());
         }
@@ -5602,7 +5816,7 @@ impl<'e> Collection<'e> {
                     continue;
                 };
                 if matches(&doc, &residual) {
-                    f(doc)?;
+                    emit(doc)?;
                 }
             }
             return Ok(());
@@ -5619,7 +5833,7 @@ impl<'e> Collection<'e> {
                     continue;
                 };
                 if matches(&doc, filter) {
-                    f(doc)?;
+                    emit(doc)?;
                 }
             }
             return Ok(());
@@ -5636,7 +5850,7 @@ impl<'e> Collection<'e> {
                     continue;
                 };
                 if matches(&doc, filter) {
-                    f(doc)?;
+                    emit(doc)?;
                 }
             }
             return Ok(());
@@ -5664,7 +5878,7 @@ impl<'e> Collection<'e> {
                         continue;
                     };
                     if matches(&doc, &residual) {
-                        f(doc)?;
+                        emit(doc)?;
                     }
                 }
             }
@@ -5692,7 +5906,7 @@ impl<'e> Collection<'e> {
                     continue;
                 };
                 if matches(&doc, filter) {
-                    f(doc)?;
+                    emit(doc)?;
                 }
             }
             return Ok(());
@@ -5707,7 +5921,7 @@ impl<'e> Collection<'e> {
                     continue;
                 };
                 if matches(&doc, filter) {
-                    f(doc)?;
+                    emit(doc)?;
                 }
             }
             return Ok(());
@@ -5720,7 +5934,7 @@ impl<'e> Collection<'e> {
                 continue;
             };
             if matches(&doc, filter) {
-                f(doc)?;
+                emit(doc)?;
             }
         }
         Ok(())
@@ -5772,6 +5986,44 @@ impl<'e> Collection<'e> {
     ) -> Result<Vec<Value>> {
         check_find_deadline(deadline)?;
         aggregate::validate_pipeline(pipeline)?;
+        if let Some(stage) = pipeline.first().and_then(Value::as_object) {
+            if let Some(spec) = stage.get("$search") {
+                let docs = crate::search_compat::search_stage_in(self, rtxn, spec, 1000)?;
+                let host = LookupHost { coll: self, rtxn };
+                let out = aggregate::run_with_host(
+                    docs,
+                    &pipeline[1..],
+                    aggregate::max_docs(),
+                    Some(&host),
+                )?;
+                check_find_deadline(deadline)?;
+                return Ok(out);
+            }
+            if let Some(spec) = stage.get("$searchMeta") {
+                let meta = crate::search_compat::search_meta_stage_in(self, rtxn, spec)?;
+                let host = LookupHost { coll: self, rtxn };
+                let out = aggregate::run_with_host(
+                    vec![meta],
+                    &pipeline[1..],
+                    aggregate::max_docs(),
+                    Some(&host),
+                )?;
+                check_find_deadline(deadline)?;
+                return Ok(out);
+            }
+            if let Some(spec) = stage.get("$vectorSearch") {
+                let docs = crate::search_compat::vector_search_stage_in(self, rtxn, spec)?;
+                let host = LookupHost { coll: self, rtxn };
+                let out = aggregate::run_with_host(
+                    docs,
+                    &pipeline[1..],
+                    aggregate::max_docs(),
+                    Some(&host),
+                )?;
+                check_find_deadline(deadline)?;
+                return Ok(out);
+            }
+        }
         let plan = aggregate::pushdown(pipeline)?;
         check_find_deadline(deadline)?;
 
@@ -5820,7 +6072,8 @@ impl<'e> Collection<'e> {
                 let mut builder = aggregate::GroupBuilder::new(group_arg)?;
                 let grouped = if builder.order_independent() {
                     let total = self.db.stat(rtxn)?.entries;
-                    let parallel = total >= PARALLEL_SCAN_MIN_ENTRIES
+                    let parallel = !self.ttl_filter_active(rtxn)?
+                        && total >= PARALLEL_SCAN_MIN_ENTRIES
                         && aggregate_workers() > 1
                         && !self.has_index_path(rtxn, &plan.filter)?;
                     if parallel {
@@ -5833,11 +6086,15 @@ impl<'e> Collection<'e> {
                     }
                 } else {
                     // `$first`/`$last`/`$push` depend on the natural `_id` order.
+                    let strict_ttl = self.ttl_filter_active(rtxn)?;
+                    let now = ttl::now_ms();
                     for item in self.db.iter(rtxn)? {
                         check_find_deadline(deadline)?;
                         let (_key, raw) = item?;
                         let doc = parse_json(raw)?;
-                        if matches(&doc, &plan.filter) {
+                        if matches(&doc, &plan.filter)
+                            && (!strict_ttl || self.ttl_doc_visible(rtxn, &doc, now)?)
+                        {
                             builder.update(doc)?;
                         }
                     }
@@ -6189,13 +6446,15 @@ impl<'e> Collection<'e> {
         let rtxn = self.read_txn()?;
         let limit = query.limit.unwrap_or(usize::MAX);
         let want = query.skip.saturating_add(limit);
+        let strict_ttl = self.ttl_filter_active(&rtxn)?;
 
         // Sorting the whole set is CPU-bound. When the filter has no
         // index, JSON parsing and TopK can be spread across all cores.
         // The snapshot stays consistent: the main thread reads one `RoTxn` and sends
         // only raw bytes to workers (the LMDB cursor is not shared).
         let sorted = !query.sort.is_empty();
-        let parallel_base = query.hint.is_none()
+        let parallel_base = !strict_ttl
+            && query.hint.is_none()
             && limit > 0
             && want <= PARALLEL_SCAN_MAX_WANT
             && self.db.stat(&rtxn)?.entries >= PARALLEL_SCAN_MIN_ENTRIES
@@ -6262,6 +6521,10 @@ impl<'e> Collection<'e> {
         }
 
         let rtxn = self.read_txn()?;
+        if self.ttl_filter_active(&rtxn)? {
+            rtxn.commit()?;
+            return Ok(None);
+        }
         let match_all = is_match_all(&query.filter);
         if !match_all {
             // Prefer the existing indexed paths. This fast path is for scans;
@@ -7059,8 +7322,15 @@ impl<'e> Collection<'e> {
         }
         let deadline = find_deadline(query);
         check_find_deadline(deadline)?;
+        let strict_ttl = self.ttl_filter_active(rtxn)?;
+        let now = ttl::now_ms();
         if let Some((field, near)) = geo::extract_near(&query.filter) {
-            return self.find_near(rtxn, query, &field, &near);
+            let docs = self.find_near(rtxn, query, &field, &near)?;
+            return if strict_ttl {
+                self.retain_visible_docs(rtxn, docs)
+            } else {
+                Ok(docs)
+            };
         }
         let sorted = !query.sort.is_empty();
         // Without sorting, `skip + limit` matches are enough (early exit).
@@ -7072,7 +7342,7 @@ impl<'e> Collection<'e> {
 
         // 0) Ordered match-all queries can walk primary-key or index order
         //    directly, stopping after `skip + limit` entries.
-        if query.hint.is_none() && is_match_all(&query.filter) && sorted {
+        if query.hint.is_none() && is_match_all(&query.filter) && sorted && !strict_ttl {
             if let Some(out) = self.find_sorted_match_all(rtxn, query)? {
                 return Ok(out);
             }
@@ -7109,6 +7379,9 @@ impl<'e> Collection<'e> {
                     if !matches(&doc, &residual) {
                         continue;
                     }
+                    if strict_ttl && !self.ttl_doc_visible(rtxn, &doc, now)? {
+                        continue;
+                    }
                     acc.push(doc);
                     if !sorted && acc.len() >= want {
                         break 'plans;
@@ -7134,7 +7407,10 @@ impl<'e> Collection<'e> {
             None
         } {
             if let Some(bytes) = self.db.get(rtxn, id.as_bytes())? {
-                acc.push(parse_json(bytes)?);
+                let doc = parse_json(bytes)?;
+                if !strict_ttl || self.ttl_doc_visible(rtxn, &doc, now)? {
+                    acc.push(doc);
+                }
             }
         }
         // 1a) `_id: {$in: [...]}`: fetch the requested primary keys directly
@@ -7157,7 +7433,9 @@ impl<'e> Collection<'e> {
                 let Some(doc) = parse_prefiltered(bytes, raw.as_ref())? else {
                     continue;
                 };
-                if matches(&doc, &residual) {
+                if matches(&doc, &residual)
+                    && (!strict_ttl || self.ttl_doc_visible(rtxn, &doc, now)?)
+                {
                     acc.push(doc);
                 }
             }
@@ -7180,7 +7458,9 @@ impl<'e> Collection<'e> {
                 let Some(doc) = parse_prefiltered(bytes, raw.as_ref())? else {
                     continue;
                 };
-                if matches(&doc, &query.filter) {
+                if matches(&doc, &query.filter)
+                    && (!strict_ttl || self.ttl_doc_visible(rtxn, &doc, now)?)
+                {
                     acc.push(doc);
                 }
             }
@@ -7202,7 +7482,9 @@ impl<'e> Collection<'e> {
                 let Some(doc) = parse_prefiltered(bytes, raw.as_ref())? else {
                     continue;
                 };
-                if matches(&doc, &query.filter) {
+                if matches(&doc, &query.filter)
+                    && (!strict_ttl || self.ttl_doc_visible(rtxn, &doc, now)?)
+                {
                     acc.push(doc);
                 }
             }
@@ -7248,6 +7530,9 @@ impl<'e> Collection<'e> {
                     if !matches(&doc, &query.filter) {
                         continue;
                     }
+                    if strict_ttl && !self.ttl_doc_visible(rtxn, &doc, now)? {
+                        continue;
+                    }
                     if skipped < query.skip {
                         skipped += 1;
                         continue;
@@ -7278,7 +7563,9 @@ impl<'e> Collection<'e> {
                         continue;
                     };
                     // Residual filter: the index may return extra entries.
-                    if matches(&doc, &query.filter) {
+                    if matches(&doc, &query.filter)
+                        && (!strict_ttl || self.ttl_doc_visible(rtxn, &doc, now)?)
+                    {
                         acc.push(doc);
                     }
                 }
@@ -7311,6 +7598,9 @@ impl<'e> Collection<'e> {
                     if !matches(&doc, &query.filter) {
                         continue;
                     }
+                    if strict_ttl && !self.ttl_doc_visible(rtxn, &doc, now)? {
+                        continue;
+                    }
                     if skipped < query.skip {
                         skipped += 1;
                         continue;
@@ -7336,7 +7626,9 @@ impl<'e> Collection<'e> {
                 let Some(doc) = parse_prefiltered(bytes, raw.as_ref())? else {
                     continue;
                 };
-                if matches(&doc, &query.filter) {
+                if matches(&doc, &query.filter)
+                    && (!strict_ttl || self.ttl_doc_visible(rtxn, &doc, now)?)
+                {
                     top.push(doc);
                 }
             }
@@ -7355,7 +7647,7 @@ impl<'e> Collection<'e> {
         //     skipped documents or sorting the whole batch at the end.
         else if !sorted {
             post_skip = 0;
-            if is_match_all(&query.filter) {
+            if is_match_all(&query.filter) && !strict_ttl {
                 // Natural order is `_id`; skipped documents do not need parsing.
                 for item in self.db.iter(rtxn)?.skip(query.skip).take(limit) {
                     check_find_deadline(deadline)?;
@@ -7371,6 +7663,9 @@ impl<'e> Collection<'e> {
                         continue;
                     };
                     if matches(&doc, &query.filter) {
+                        if strict_ttl && !self.ttl_doc_visible(rtxn, &doc, now)? {
+                            continue;
+                        }
                         if skipped < query.skip {
                             skipped += 1;
                             continue;
@@ -7391,13 +7686,20 @@ impl<'e> Collection<'e> {
                 let Some(doc) = parse_prefiltered(bytes, raw.as_ref())? else {
                     continue;
                 };
-                if matches(&doc, &query.filter) {
+                if matches(&doc, &query.filter)
+                    && (!strict_ttl || self.ttl_doc_visible(rtxn, &doc, now)?)
+                {
                     acc.push(doc);
                 }
             }
         }
 
         let docs = acc.finish();
+        let docs = if strict_ttl {
+            self.retain_visible_docs(rtxn, docs)?
+        } else {
+            docs
+        };
         Ok(docs
             .into_iter()
             .skip(post_skip)
@@ -7497,6 +7799,8 @@ impl<'e> Collection<'e> {
                 "lookup accepts at most {MAX_LOOKUP_VALUES} values"
             )));
         }
+        let strict_ttl = self.ttl_filter_active(rtxn)?;
+        let now = ttl::now_ms();
         if values.is_empty() {
             return Ok(Vec::new());
         }
@@ -7525,6 +7829,7 @@ impl<'e> Collection<'e> {
         if by.len() == 1 && by[0] == "_id" {
             for &value in &unique_values {
                 let (doc, size) = match value.as_str() {
+                    Some(id) if strict_ttl && self.ttl_expired_at(rtxn, id, now)? => (None, 4),
                     Some(id) => match self.db.get(rtxn, id.as_bytes())? {
                         Some(bytes) => {
                             if id_only {
@@ -7623,6 +7928,9 @@ impl<'e> Collection<'e> {
                 let Some((id, inc)) = index::decode_index_value(raw) else {
                     continue;
                 };
+                if strict_ttl && self.ttl_expired_at(rtxn, &id, now)? {
+                    break;
+                }
                 let mut filter = Map::new();
                 for (field, part) in by.iter().zip(parts) {
                     filter.insert(field.clone(), part.clone());
@@ -8002,6 +8310,22 @@ impl<'e> Collection<'e> {
     ) -> Result<usize> {
         crate::query::validate::validate_filter(filter)?;
         check_find_deadline(deadline)?;
+        if self.ttl_filter_active(rtxn)? {
+            let query = FindQuery {
+                filter: filter.clone(),
+                max_time_ms: deadline.map(|deadline| {
+                    u64::try_from(
+                        deadline
+                            .saturating_duration_since(Instant::now())
+                            .as_millis(),
+                    )
+                    .unwrap_or(u64::MAX)
+                    .max(1)
+                }),
+                ..Default::default()
+            };
+            return Ok(self.find_in(rtxn, &query)?.len());
+        }
         // `count({})` / `count(null)` -> O(1) from B+tree metadata.
         if is_match_all(filter) {
             return Ok(self.db.stat(rtxn)?.entries);
@@ -8339,7 +8663,7 @@ impl<'e> Collection<'e> {
         })
     }
 
-    fn read_txn(&self) -> Result<crate::store::ReadTxn<'_>> {
+    pub(crate) fn read_txn(&self) -> Result<crate::store::ReadTxn<'_>> {
         let guard = self.txn_gate.enter();
         Ok(crate::store::ReadTxn::new(self.env.read_txn()?, guard))
     }
@@ -13116,6 +13440,95 @@ mod tests {
             })
             .unwrap()
             .is_none());
+    }
+    fn expire_document(c: &Collection<'_>, store: &Store, id: &str) {
+        let mut wtxn = store.write_txn().unwrap();
+        c.set_ttl(&mut wtxn, id, Some(ttl::now_ms().saturating_sub(1)))
+            .unwrap();
+        wtxn.commit().unwrap();
+    }
+
+    #[test]
+    fn strict_ttl_reads_hide_expired_documents() {
+        let (_dir, store) = store();
+        let c = store.collection("items").unwrap();
+        c.insert_one(json!({"_id": "live", "name": "live", "embedding": [0.9, 0.1]}))
+            .unwrap();
+        c.insert_one(json!({"_id": "expired", "name": "expired", "embedding": [1.0, 0.0]}))
+            .unwrap();
+        c.create_text_index("name").unwrap();
+        c.create_fuzzy_index("name").unwrap();
+        c.create_vector_index("embedding", 2, VectorMetric::Cosine)
+            .unwrap();
+        expire_document(&c, &store, "expired");
+
+        assert_eq!(c.count(&json!({})).unwrap(), 1);
+        assert!(c.find_one(&json!({"_id": "expired"})).unwrap().is_none());
+        assert_eq!(
+            c.find(&FindQuery {
+                filter: json!({}),
+                ..Default::default()
+            })
+            .unwrap()
+            .len(),
+            1
+        );
+        assert_eq!(
+            c.lookup("_id", &[json!("expired"), json!("live")], None)
+                .unwrap(),
+            vec![
+                None,
+                Some(json!({"_id": "live", "name": "live", "embedding": [0.9, 0.1]}))
+            ]
+        );
+        assert_eq!(
+            c.search("name", "live", &json!({}), 0, Some(10))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(c
+            .fuzzy_search("name", "expired", 0, &json!({}), Some(10))
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            c.vector_search("embedding", &[1.0, 0.0], &json!({}), 0, Some(1))
+                .unwrap()[0]["_id"],
+            "live"
+        );
+        assert_eq!(
+            c.aggregate(&[json!({"$group": {"_id": null, "n": {"$sum": 1}}})])
+                .unwrap()[0]["n"],
+            1
+        );
+    }
+
+    #[test]
+    fn strict_ttl_boundary_update_and_clear() {
+        let (_dir, store) = store();
+        let c = store.collection("items").unwrap();
+        let id = c
+            .insert_one(json!({"_id": "doc", "n": 1, "_ttl": 60}))
+            .unwrap();
+        let rtxn = store.read_txn().unwrap();
+        let at = c.ttl_at(&rtxn, &id).unwrap().unwrap();
+        assert!(at > ttl::now_ms());
+        assert!(!c.ttl_expired_in(&rtxn, &id, at - 1).unwrap());
+        assert!(c.ttl_expired_in(&rtxn, &id, at).unwrap());
+        rtxn.commit().unwrap();
+
+        c.update(&json!({"_id": id}), &json!({"$set": {"n": 2}}), false)
+            .unwrap();
+        let rtxn = store.read_txn().unwrap();
+        assert_eq!(c.ttl_at(&rtxn, &id).unwrap(), Some(at));
+        rtxn.commit().unwrap();
+
+        c.update(&json!({"_id": id}), &json!({"$set": {"_ttl": 0}}), false)
+            .unwrap();
+        assert!(c.ttl_at(&store.read_txn().unwrap(), &id).unwrap().is_none());
+        assert!(!c
+            .ttl_expired_in(&store.read_txn().unwrap(), &id, u64::MAX)
+            .unwrap());
     }
 }
 

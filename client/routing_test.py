@@ -40,7 +40,10 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.endswith("/v1/exec") is False:
             self._json(404, {"ok": False, "error": {"code": "not_found", "message": ""}})
             return
-        if self.server.role == "replica" and payload.get("op") != "find":
+        if self.server.role == "replica" and payload.get("op") not in {
+            "find",
+            "search_all",
+        }:
             self.server.posts += 1
             self._json(
                 403,
@@ -56,6 +59,8 @@ class Handler(BaseHTTPRequestHandler):
         self.server.seen.append(payload)
         if payload.get("op") == "find":
             self._json(200, {"ok": True, "result": [{"x": 1}]})
+        elif payload.get("op") == "search_all":
+            self._json(200, {"ok": True, "result": {"results": [{"_id": "doc-1"}]}})
         else:
             self._json(200, {"ok": True, "result": {"inserted_id": "doc-1"}})
 
@@ -80,6 +85,8 @@ def main() -> None:
     assert primary.posts == 1 and replica.posts == 0
     db.exec({"op": "find", "coll": "c"})
     assert replica.posts == 1
+    assert db.collection("c").search_all(query="coffee") == [{"_id": "doc-1"}]
+    assert replica.posts == 2 and primary.posts == 1
     db.close()
 
     # Discovery: /readyz selects the primary before the first write.

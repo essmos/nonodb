@@ -1,9 +1,13 @@
 # Document TTL
 
 nonodb supports optional document expiry with a collection default and
-per-document overrides. TTL is **eventual**: a document remains readable until
-the maintenance worker sweeps it, normally within a few seconds of its expiry.
-There is no strict read-time filtering.
+per-document overrides. Read visibility is **strict by default**: once
+`_ttl_at <= now`, the document is hidden from find, count, aggregation, SQL,
+search, lookups, cursors, and MongoDB-wire reads.
+
+The old eventual-visibility behavior can be restored with
+`NONODB_TTL_STRICT_READS=0`. This is an emergency compatibility switch; the
+default is strict.
 
 TTL is supported for both standard and vault collections. For vault
 collections the expiry metadata is plaintext; the document body is never
@@ -182,10 +186,18 @@ The worker:
   update that refreshed the TTL is not deleted by a stale sweep;
 - removes orphaned TTL entries when a collection no longer exists.
 
-Because expiry is eventual, a document may be returned by reads for a short
-time after its `_ttl_at` timestamp. This is deliberate: strict expiry would
-require every `find`, `count`, `search`, `aggregate`, and index path to filter
-expired documents.
+Reads apply the expiry check against the same LMDB snapshot they query. The
+search paths over-fetch candidates when needed so expired top hits do not
+consume the requested limit, and the read cache is capped at the next TTL
+deadline so a cached result cannot outlive an expiry.
+
+With strict reads enabled, a document is not returned after `_ttl_at`.
+History behavior is unchanged.
+
+History and revision APIs are audit surfaces and are not filtered by strict
+TTL reads; they continue to expose retained revisions until normal history
+retention or `purge_history` removes them. Use `purge_history` when revisions
+must not outlive the document.
 
 ## Vault collections
 
@@ -197,6 +209,7 @@ TTL metadata contains only the collection name, `_id`, and expiry timestamp.
 
 | Variable | Default | Description |
 |---|---|---|
+| `NONODB_TTL_STRICT_READS` | `1` | Hide expired documents at read time; `0` restores eventual visibility |
 | `NONODB_TTL_SWEEP_INTERVAL` | `5` | Seconds between TTL sweeps |
 | `NONODB_TTL_SWEEP_LIMIT` | `256` | Maximum due documents processed per sweep |
 | `NONODB_MAINTENANCE_INTERVAL_MS` | `1000` | Maintenance loop heartbeat in milliseconds |
@@ -215,8 +228,10 @@ next maintenance sweep after the daemon starts. See
 
 ## Limits
 
-- TTL is eventual, not strict.
-- The sweeper deletes bounded batches; a very large expiry burst is drained
-  over multiple passes.
+- Strict visibility is immediate.
+- The background sweeper processes bounded batches; this does not affect read
+  visibility.
+- `NONODB_TTL_STRICT_READS=0` restores the legacy behavior where reads may
+  return a document briefly after expiry.
 - TTL is not a substitute for access control or retention compliance. Use normal
-  deletes when immediate removal is required.
+  deletes when immediate physical removal is required.

@@ -52,6 +52,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("old: {}", serde_json::to_string(&old)?);
     }
 
+    users.create_text_index("name")?;
+    let unified = users.search_all(json!({
+        "mode": "lexical",
+        "query": "Grace",
+        "fields": ["name"]
+    }))?;
+    println!("search_all: {}", serde_json::to_string(&unified)?);
+
     println!("collections: {:?}", db.collections()?);
     Ok(())
 }

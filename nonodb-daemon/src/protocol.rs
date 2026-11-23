@@ -3,7 +3,9 @@
 use serde::{ser::SerializeMap, Deserialize, Serialize, Serializer};
 use serde_json::{value::RawValue, Value};
 
-use nonodb_core::{CollectionProfile, IndexSpec, VaultKey, VectorMetric};
+use nonodb_core::{CollectionProfile, IndexSpec, SearchAllRequest, VaultKey, VectorMetric};
+
+use crate::webhooks::WebhookRule;
 
 /// Per-request vault credentials. Never format the key.
 #[derive(Clone)]
@@ -426,6 +428,11 @@ pub enum Request {
         #[serde(default)]
         limit: Option<usize>,
     },
+    /// Unified lexical/fuzzy/vector/hybrid search.
+    SearchAll {
+        #[serde(flatten)]
+        request: SearchAllRequest,
+    },
     Fuzzy {
         coll: String,
         field: String,
@@ -555,6 +562,24 @@ pub enum Request {
     },
     ListSubscriptions {
         coll: String,
+    },
+    /// Creates or replaces an asynchronous webhook rule.
+    CreateWebhook {
+        #[serde(flatten)]
+        rule: WebhookRule,
+    },
+    DeleteWebhook {
+        name: String,
+    },
+    ListWebhooks,
+    ListWebhookDeliveries {
+        #[serde(default)]
+        status: Option<String>,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    RetryWebhookDelivery {
+        id: String,
     },
     /// Lists databases in this daemon.
     ListDatabases,
@@ -705,6 +730,15 @@ pub enum WriteReq {
     },
     /// Internal maintenance: delete expired subscriptions.
     PruneSubscriptions,
+    CreateWebhook {
+        rule: WebhookRule,
+    },
+    DeleteWebhook {
+        name: String,
+    },
+    RetryWebhookDelivery {
+        id: String,
+    },
     /// Internal maintenance: delete expired documents if their TTL still matches.
     Expire {
         entries: Vec<ExpireEntry>,
@@ -862,6 +896,7 @@ impl Request {
             Self::DropFuzzyIndex { .. } => "drop_fuzzy_index",
             Self::ListFuzzyIndexes { .. } => "list_fuzzy_indexes",
             Self::Search { .. } => "search",
+            Self::SearchAll { .. } => "search_all",
             Self::Fuzzy { .. } => "fuzzy",
             Self::CreateVectorIndex { .. } => "create_vector_index",
             Self::Reindex { .. } => "reindex",
@@ -887,6 +922,11 @@ impl Request {
             Self::RenewSubscription { .. } => "renew_subscription",
             Self::DeleteSubscription { .. } => "delete_subscription",
             Self::ListSubscriptions { .. } => "list_subscriptions",
+            Self::CreateWebhook { .. } => "create_webhook",
+            Self::DeleteWebhook { .. } => "delete_webhook",
+            Self::ListWebhooks => "list_webhooks",
+            Self::ListWebhookDeliveries { .. } => "list_webhook_deliveries",
+            Self::RetryWebhookDelivery { .. } => "retry_webhook_delivery",
             Self::ListDatabases => "list_databases",
             Self::CreateDatabase { .. } => "create_database",
             Self::DropDatabase { .. } => "drop_database",
@@ -931,6 +971,7 @@ impl Request {
             | Self::ListVectorIndexes { .. }
             | Self::VectorSearch { .. }
             | Self::Search { .. }
+            | Self::SearchAll { .. }
             | Self::Fuzzy { .. }
             | Self::History { .. }
             | Self::GetVersion { .. }
@@ -941,6 +982,8 @@ impl Request {
             | Self::GetCollectionEvents { .. }
             | Self::GetCollectionMetrics { .. }
             | Self::ListSubscriptions { .. }
+            | Self::ListWebhooks
+            | Self::ListWebhookDeliveries { .. }
             | Self::ListDatabases => true,
             Self::Aggregate { pipeline, .. } => nonodb_core::aggregate::write_stage_spec(pipeline)
                 .ok()
@@ -1000,6 +1043,12 @@ impl Request {
             | Self::RenewSubscription { coll, .. }
             | Self::DeleteSubscription { coll, .. }
             | Self::ListSubscriptions { coll } => vec![coll.clone()],
+            Self::SearchAll { request } => vec![request.coll.clone()],
+            Self::CreateWebhook { rule } => vec![rule.coll.clone()],
+            Self::DeleteWebhook { .. }
+            | Self::ListWebhooks
+            | Self::ListWebhookDeliveries { .. }
+            | Self::RetryWebhookDelivery { .. } => Vec::new(),
             Self::Aggregate { coll, pipeline, .. } => {
                 let mut out = vec![coll.clone()];
                 if let Ok(Some(spec)) = nonodb_core::aggregate::write_stage_spec(pipeline) {

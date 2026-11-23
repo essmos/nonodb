@@ -188,8 +188,8 @@ sessions.update({"_id": "s1"}, {"$set": {"_ttl": 0}})   # disable expiry
 
 An update without `_ttl` preserves the current expiry. `purge_history=True`
 removes stored revisions when TTL deletes a document instead of appending a
-tombstone. Expiry is eventual and handled by the daemon maintenance worker.
-See [Document TTL](ttl.md).
+tombstone. Reads hide an expired document immediately. See
+[Document TTL](ttl.md).
 
 ## Vault collections
 

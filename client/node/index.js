@@ -22,6 +22,7 @@ const READ_OPS = new Set([
   'list_fuzzy_indexes',
   'list_vector_indexes',
   'search',
+  'search_all',
   'fuzzy',
   'vector_search',
   'history',
@@ -687,6 +688,37 @@ class Collection {
       skip,
       limit,
     });
+    return result.results ?? [];
+  }
+
+  /** Unified lexical/fuzzy/vector/hybrid search with RRF scores. */
+  async searchAll({
+    mode = 'lexical',
+    query = undefined,
+    fields = undefined,
+    vector = undefined,
+    vectorField = undefined,
+    filter = {},
+    skip = 0,
+    limit = 10,
+    maxDistance = undefined,
+    rrfK = undefined,
+  } = {}) {
+    const payload = {
+      op: 'search_all',
+      coll: this.name,
+      mode,
+      filter,
+      skip,
+      limit,
+    };
+    if (query !== undefined) payload.query = query;
+    if (fields !== undefined) payload.fields = fields;
+    if (vector !== undefined) payload.vector = vector;
+    if (vectorField !== undefined) payload.vector_field = vectorField;
+    if (maxDistance !== undefined) payload.max_distance = maxDistance;
+    if (rrfK !== undefined) payload.rrf_k = rrfK;
+    const result = await this.db.exec(payload);
     return result.results ?? [];
   }
 

@@ -110,6 +110,20 @@ type SearchOptions struct {
 	Limit  int64
 }
 
+// SearchAllOptions controls SearchAll.
+type SearchAllOptions struct {
+	Mode        string
+	Query       string
+	Fields      []string
+	Vector      []float32
+	VectorField string
+	Filter      map[string]any
+	Skip        int64
+	Limit       int64
+	MaxDistance int
+	RRFK        int
+}
+
 // FuzzyOptions controls Fuzzy.
 type FuzzyOptions struct {
 	MaxDistance int
@@ -685,7 +699,7 @@ func isReadOp(payload map[string]any) bool {
 	case "find", "find_one", "lookup", "watch", "count", "aggregate", "cursor_aggregate", "cursor_find",
 		"get_more", "close_cursor", "explain", "list_indexes", "list_collections",
 		"list_text_indexes", "list_fuzzy_indexes", "list_vector_indexes",
-		"search", "fuzzy", "vector_search", "history", "get_version",
+		"search", "search_all", "fuzzy", "vector_search", "history", "get_version",
 		"get_collection_ttl", "get_collection_history", "get_collection_events",
 		"list_subscriptions", "sql", "explain_sql", "map_info", "batch":
 		return true
@@ -1412,6 +1426,47 @@ func (c *Collection) VectorSearch(
 		"op": "vector_search", "coll": c.Name, "field": field, "vector": vector,
 		"filter": nonNilMap(options.Filter), "skip": options.Skip, "limit": options.Limit,
 	})
+	if err != nil {
+		return nil, err
+	}
+	return decodeResults(raw)
+}
+
+// SearchAll runs unified lexical/fuzzy/vector/hybrid search.
+// Hybrid results use reciprocal-rank fusion and include _score and _sources.
+func (c *Collection) SearchAll(
+	ctx context.Context,
+	options SearchAllOptions,
+) ([]map[string]any, error) {
+	if options.Mode == "" {
+		options.Mode = "lexical"
+	}
+	if options.Limit == 0 {
+		options.Limit = 10
+	}
+	payload := map[string]any{
+		"op": "search_all", "coll": c.Name, "mode": options.Mode,
+		"filter": nonNilMap(options.Filter), "skip": options.Skip, "limit": options.Limit,
+	}
+	if options.Query != "" {
+		payload["query"] = options.Query
+	}
+	if len(options.Fields) > 0 {
+		payload["fields"] = options.Fields
+	}
+	if options.Vector != nil {
+		payload["vector"] = options.Vector
+	}
+	if options.VectorField != "" {
+		payload["vector_field"] = options.VectorField
+	}
+	if options.MaxDistance > 0 {
+		payload["max_distance"] = options.MaxDistance
+	}
+	if options.RRFK > 0 {
+		payload["rrf_k"] = options.RRFK
+	}
+	raw, err := c.client.execRaw(ctx, payload)
 	if err != nil {
 		return nil, err
 	}

@@ -4,6 +4,25 @@ Full release notes: https://github.com/essmos/nonodb/releases
 
 ## Unreleased
 
+- Enforce TTL at read time by default. Expired documents are hidden from find,
+  count, aggregation, SQL, lookups, cursors, search, and MongoDB-wire reads
+  immediately at `_ttl_at`. Search paths over-fetch to fill limits, the read
+  cache is capped at the next TTL deadline, and replicated documents carry
+  their TTL metadata. `NONODB_TTL_STRICT_READS=0` restores legacy visibility.
+- Turn the GUI SQL console into a **Playground** with SQL and JSON modes. JSON
+  mode runs any `/v1/exec` request, offers find/aggregate/search/SQL/insert
+  templates, formats requests, renders array results as tables, and keeps
+  separate SQL/JSON history.
+- Add unified `search_all` with lexical, fuzzy, vector, and hybrid modes,
+  reciprocal-rank fusion, filters, pagination, and `_score`/`_sources`
+  metadata. Add a `$search`/`$searchMeta`/`$vectorSearch` compatibility subset
+  to aggregation pipelines plus Python/Node.js/Rust/Go/CLI helpers and Atlas
+  migration documentation.
+- Add native asynchronous webhooks: filtered HTTP delivery with `count`, `sum`,
+  and `avg` thresholds, edge-triggered `once`, cooldown, HMAC-SHA256 signing,
+  idempotency keys, durable retries/dead-letter, API/CLI management, and a GUI
+  for rules and deliveries. Filters and aggregates are evaluated outside the
+  writer; the writer only appends the normal change event.
 - Sort missing and `null` values first, matching MongoDB's BSON ordering for
   both ascending and descending sorts. This fixes different `skip`/`limit`
   pages after a MongoDB migration.

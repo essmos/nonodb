@@ -65,6 +65,7 @@ _READ_OPS = {
     "list_fuzzy_indexes",
     "list_vector_indexes",
     "search",
+    "search_all",
     "fuzzy",
     "vector_search",
     "sql",
@@ -1279,6 +1280,47 @@ class Collection:
                 "limit": limit,
             }
         )["results"]
+
+    def search_all(
+        self,
+        *,
+        mode: str = "lexical",
+        query: Optional[str] = None,
+        fields: Optional[list[str]] = None,
+        vector: Optional[list[float]] = None,
+        vector_field: Optional[str] = None,
+        filter: Optional[dict[str, Any]] = None,
+        skip: int = 0,
+        limit: int = 10,
+        max_distance: Optional[int] = None,
+        rrf_k: Optional[int] = None,
+    ) -> list[dict[str, Any]]:
+        """Unified lexical/fuzzy/vector/hybrid search.
+
+        Hybrid results use reciprocal-rank fusion and include `_score` and
+        `_sources`; source scores/distances are retained in `_sources`.
+        """
+        payload: dict[str, Any] = {
+            "op": "search_all",
+            "coll": self.name,
+            "mode": mode,
+            "filter": filter or {},
+            "skip": skip,
+            "limit": limit,
+        }
+        if query is not None:
+            payload["query"] = query
+        if fields:
+            payload["fields"] = fields
+        if vector is not None:
+            payload["vector"] = vector
+        if vector_field is not None:
+            payload["vector_field"] = vector_field
+        if max_distance is not None:
+            payload["max_distance"] = max_distance
+        if rrf_k is not None:
+            payload["rrf_k"] = rrf_k
+        return self._db.exec(payload)["results"]
 
     def fuzzy(
         self,

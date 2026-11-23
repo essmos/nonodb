@@ -135,6 +135,11 @@ def main() -> int:
                 b"actual bind",
                 b"Host firewall",
                 b"Generated nftables rules",
+                b"Run SQL reports or raw JSON operations",
+                b"JSON request",
+                b"Any single /v1/exec request",
+                b"playground-result.json",
+                b"search_all",
             ):
                 assert marker in asset, marker
             assert b"New database name" not in asset
@@ -153,6 +158,17 @@ def main() -> int:
                 )
             )
             assert result["result"] == [{"_id": "o1", "n": 1}], result
+            sql = json.loads(
+                fetch(
+                    base + "/v1/exec",
+                    data={
+                        "op": "sql",
+                        "query": "SELECT n FROM gui_orders LIMIT 10",
+                        "params": [],
+                    },
+                )
+            )
+            assert sql["result"]["results"] == [{"n": 1}], sql
 
             health = json.loads(fetch(base + "/healthz"))
             assert health, health

@@ -420,7 +420,7 @@ top-level operators; for an unknown `$expr` operator MongoDB uses
 | `$out`, `$merge` | 🟡 | Same-database targets; `$merge` supports `let` and `whenMatched` pipelines |
 | `$redact` | ❌ | |
 | `$geoNear` | ❌ | Geo queries exist outside the aggregation stage |
-| `$search` / Atlas Search | ❌ | Search is a separate NonoDB API |
+| `$search` / Atlas Search | 🟡 | Compatibility subset for `$search`, `$searchMeta`, and `$vectorSearch`; see [Search and Atlas compatibility](search.md) |
 | `$changeStream` | ❌ | Use outbox events / `watch` |
 | `$collStats`, `$indexStats`, `$planCacheStats`, `$currentOp` | ❌ | |
 | `$documents`, `$listSessions`, `$listLocalSessions` | ❌ | |
@@ -461,7 +461,7 @@ top-level operators; for an unknown `$expr` operator MongoDB uses
 | Partial indexes | ❌ | |
 | Wildcard indexes | ❌ | |
 | Hidden indexes | ❌ | |
-| TTL indexes | 🟡 | `createIndexes` with `expireAfterSeconds` sets the collection TTL. One TTL index per collection; TTL is insertion-based, not based on the indexed date field |
+| TTL indexes | 🟡 | `createIndexes` with `expireAfterSeconds` sets the collection TTL. One TTL index per collection; TTL is insertion-based, not based on the indexed date field. Expired documents are hidden from reads immediately by default |
 | Per-index/per-query collation | ❌ | |
 | Index hints | ✅ | Find-shaped queries; unusable hints fail instead of falling back |
 | Background index builds | 🟡 | Parallel bounded backfill; not MongoDB's exact build lifecycle |
@@ -535,7 +535,7 @@ A migration from MongoDB to NonoDB should check these items first:
 3. **Transactions and sessions** — redesign around atomic `write_batch`,
    idempotent operations, or application-level compensation.
 4. **Change streams** — replace with outbox events, `watch`, or subscriptions.
-5. **Atlas Search** — use NonoDB's native search API. MongoDB `$text` is supported only for the documented lexical subset.
+5. **Atlas Search** — use the native `search_all` API, or the documented `$search`/`$searchMeta`/`$vectorSearch` compatibility subset. See [Search and Atlas compatibility](search.md). MongoDB `$text` is supported only for the documented lexical subset.
 6. **Collation** — normalize strings or enforce ordering in the application.
 7. **Sparse/partial/TTL indexes** — `sparse` is accepted as a no-op; a plain
    unique index already has the same behavior, including explicit `null`

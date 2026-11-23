@@ -41,10 +41,11 @@ feature gates:
 - **[Tenant encryption](docs/vault.md)** — vault collections with whole-document encryption and per-tenant keys through the native client/HTTP path.
 - **[Extremely low RAM usage](docs/operations.md#capacity-and-memory)** — about 5 MB idle with a 1M-document database and three indexes, plus [small and tiny profiles](docs/operations.md#small-deployment-profiles) for 512 MB–2 GB VMs.
 - **[Automatic indexes](docs/operations.md#automatic-indexes)** — opt-in creation of indexes for frequent query shapes, with cleanup of unused automatic indexes.
-- **[Embedded GUI in the box](docs/gui.md)** — a local browser console for documents, SQL, indexes, backups, credentials, cluster state, and metrics, with no separate frontend service.
+- **[Embedded GUI in the box](docs/gui.md)** — a local browser console for documents, a SQL + JSON playground, indexes, backups, credentials, cluster state, and metrics, with no separate frontend service.
 - **Search built in** — [BM25 full-text search](docs/api.md#full-text-indexes), [fuzzy trigram/Levenshtein search](docs/api.md#fuzzy-indexes), and [exact vector search](docs/api.md#vector-indexes) in the same database.
-- **SQL when you need it** — [SQL queries and writes](docs/sql.md) alongside the document API, without a separate SQL database.
-- **[TTL at both levels](docs/ttl.md)** — collection defaults and per-document overrides, with background expiry.
+- **[Asynchronous webhooks](docs/webhooks.md)** — filtered HTTP delivery with count/sum/avg thresholds, retries, HMAC signing, dead-letter queuing, CLI/API management, and a GUI for deliveries.
+- **SQL when you need it** — [SQL queries and writes](docs/sql.md) alongside the document API, plus a [SQL + JSON playground](docs/gui.md#playground-sql--json) in the GUI, without a separate SQL database.
+- **[TTL at both levels](docs/ttl.md)** — collection defaults and per-document overrides, with immediate read-time hiding.
 - **[Simple encrypted backups](docs/backup.md#encryption)** — [native or restic backups](docs/backup.md#restic-engine), gzip/age encryption, local/S3/R2 destinations, verification, and restore drills.
 - **[Instant CI database branches](docs/branching.md)** — clone a stopped database or data-only snapshot into an independent, writable database with `nonodb-cli branch`; CoW reflink/clonefile keeps it cheap, sidecars are copied or rebuilt, and the source is never modified.
 - **[Simple backup scheduling](docs/backup.md#scheduled-backups-from-the-daemon-and-gui)** — durable backup jobs configured through the CLI, API, or GUI.
@@ -332,7 +333,7 @@ curl -s --unix-socket /tmp/nonodb.sock \
   -d '{"op":"insert","coll":"sessions","doc":{"_id":"s1","user":7,"_ttl":300}}'
 ```
 
-TTL is eventual: a document can be visible briefly after its expiry. See
+Expired documents are hidden from reads immediately. See
 [Document TTL](docs/ttl.md) for update semantics, maintenance, and limits.
 
 ### Vault collections (optional encryption)
@@ -751,11 +752,12 @@ documentation.
 | [Mutual TLS](docs/mtls.md) | Client certificate setup, private CA, fingerprint mapping, revocation, rotation |
 | [Python client](docs/python-client.md) | `NonoDB`/`Collection` API, `AsyncNonoDB` watch/streams, caching, retries, TCP/TLS, FastAPI usage |
 | [Background jobs](docs/workers.md) | Durable `_jobs`, workers, leases, retries, cron/systemd, language-independent contract |
+| [Search and Atlas compatibility](docs/search.md) | Unified lexical/fuzzy/vector/hybrid search, RRF, and the `$search`/`$searchMeta`/`$vectorSearch` subset |
 | [Outbox events](docs/events.md) | Atomic data + event writes, automatic collection events, source-side filters, polling consumers, checkpoints, event worker CLI, TTL, systemd |
 | [Conditional subscriptions](docs/subscriptions.md) | Persistent conditions over collection state, count thresholds, edge-triggered delivery |
 | [Streaming outbox events](docs/streams.md) | Long-poll `watch`, NDJSON/SSE streams, server-side filters, count thresholds, resume tokens, truncation, client examples |
 | [Vault collections](docs/vault.md) | Optional encrypted tenant data, headers, restrictions, key rotation |
-| [Document TTL](docs/ttl.md) | Collection defaults, per-document expiry, update semantics, maintenance |
+| [Document TTL](docs/ttl.md) | Collection defaults, per-document expiry, strict read visibility, update semantics, limits |
 | [Dates and time zones](docs/dates.md) | BSON-compatible dates, RFC 3339 input, filtering, indexes, sorting |
 | [Numbers and decimals](docs/numerics.md) | Exact numeric comparison, Decimal128, arithmetic, NaN/Infinity, index compatibility, long text limits |
 | [BSON scalar types](docs/bson-types.md) | `$numberInt`/`$numberLong`, `$type`, binary/UUID, ObjectId, Timestamp, MinKey/MaxKey, index compatibility |

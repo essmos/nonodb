@@ -17,7 +17,7 @@ quick-start instructions, and a feature overview.
 | [MongoDB wire shadow mode](mongodb-shadow.md) | Evaluators, migration engineers | Opt-in prototype dual-write to MongoDB, JSONL diff report, and limitations |
 | [SQL queries](sql.md) | Analysts, reporting jobs, application developers | `SELECT`, `INSERT`, `UPDATE`, `DELETE`, filters, aggregates, parameters, limits, client examples |
 | [Vault collections](vault.md) | Application developers, security reviewers | Optional whole-document encryption, tenant keys, restrictions, operations, key rotation |
-| [Document TTL](ttl.md) | Application developers, operators | Collection defaults, per-document overrides, update semantics, background expiry, limits |
+| [Document TTL](ttl.md) | Application developers, operators | Collection defaults, per-document overrides, strict read visibility, update semantics, limits |
 | [Dates and time zones](dates.md) | Application developers | BSON-compatible dates, RFC 3339 input, filtering, indexes, sorting, timezone semantics |
 | [Numbers and decimals](numerics.md) | Application developers | Exact numeric comparison, Decimal128, arithmetic, NaN/Infinity, index compatibility, long text limits |
 | [BSON scalar types](bson-types.md) | Application developers | `$numberInt`/`$numberLong`, `$type`, binary/UUID, ObjectId, Timestamp, MinKey/MaxKey, index compatibility |
@@ -31,7 +31,9 @@ quick-start instructions, and a feature overview.
 | [Background jobs](workers.md) | Application developers, operators | Durable jobs, workers, leases, retries, cron/systemd, languages |
 | [Outbox events](events.md) | Application developers, operators | Atomic data + events, automatic collection events, source-side filters, polling consumers, checkpoints, event worker CLI, TTL, systemd |
 | [Conditional subscriptions](subscriptions.md) | Application developers | Conditions over collection state, count thresholds, edge-triggered mode, events, clients |
+| [Search and Atlas compatibility](search.md) | Application developers | Unified `search_all`, BM25, fuzzy, vector, hybrid RRF, and Atlas migration |
 | [Streaming outbox events](streams.md) | Application developers | Long-poll `watch`, NDJSON/SSE streams, resume tokens, filters, truncation, Python/Rust/Node.js/Go examples |
+| [Asynchronous webhooks](webhooks.md) | Application developers, operators | Webhook rules, async filters and count/sum/avg thresholds, retries, HMAC, dead-letter, GUI |
 | [CLI](cli.md) | Operators | Administration, map resize, backup verification, restore drills, inspect, raw requests |
 | [Operations](operations.md) | Operators, SRE | Configuration, deployment, security, snapshots, monitoring, capacity, troubleshooting |
 | [Docker Compose quick start](docker-compose.md) | Operators, developers | Self-contained Compose stack, auth initialization, GUI, updates, backups, troubleshooting |
@@ -67,6 +69,7 @@ quick-start instructions, and a feature overview.
 - **Consume change events:** [Outbox events](events.md)
 - **React to collection conditions:** [Conditional subscriptions](subscriptions.md)
 - **Stream events with a resume token:** [Streaming outbox events](streams.md)
+- **Deliver changes to an HTTP endpoint:** [Asynchronous webhooks](webhooks.md)
 - **Secure a deployment:** [Authentication and authorization](auth.md) and
   [TCP/TLS](operations.md#tcp-and-tls)
 - **Run security checks:** [Security checks](security-check.md)

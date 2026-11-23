@@ -183,8 +183,29 @@ a shared machine. Use **Disconnect** to clear the active session.
   write transaction. The GUI asks for confirmation because the rebuild scans
   the whole collection and blocks writers while it runs.
 
-### Events
+### Eventing
 
+The sidebar has one **Eventing** area for all change-data features:
+
+- **Overview** — webhook rules, subscriptions, enabled event sources, delivery
+  health, and per-collection links to **Changes**;
+- **Rules** — webhook rule management and a global subscription list/editor;
+- **Deliveries** — filter by `pending`, `retry`, `delivered`, or `dead`, inspect
+  HTTP errors, and retry a delivery manually;
+- **Live watch** — connection-scoped live events for a selected collection;
+- **Outbox** — open the raw `_events` collection for inspection and replay.
+
+Webhook rules support event filters, `count`/`sum`/`avg` thresholds, `once`,
+cooldown, HMAC secret environment variable, request timeout, custom headers, and
+max attempts. Filters and aggregates are evaluated by the daemon worker, never
+in the writer. See [Asynchronous webhooks](webhooks.md).
+
+### Changes
+
+Each collection has a **Changes** tab:
+
+- enable or disable automatic insert/update/delete events in the transactional
+  outbox;
 - persistent conditional subscription management;
 - create with filter, count condition, operation selection, `once`, and lease;
 - renew and delete subscriptions;
@@ -214,12 +235,24 @@ Text, fuzzy, and vector search require the corresponding index on the field.
 - detected value types and coverage percentage;
 - click a field path to add an `$exists` filter.
 
-### SQL
+### Playground (SQL + JSON)
 
-- SQL console with JSON parameters;
-- `EXPLAIN` for SQL;
-- query history stored in browser localStorage;
-- JSON and CSV result export.
+The **Playground** tab combines two ways to explore the current database:
+
+- **SQL** mode runs one `SELECT`, `INSERT`, `UPDATE`, or `DELETE` statement
+  against one collection, with a JSON parameter array and `EXPLAIN`;
+- **JSON** mode sends any single `/v1/exec` request: `find`, `aggregate`,
+  `search_all`, `insert`, `sql`, index operations, and so on;
+- one-click templates for find, aggregation, unified search, SQL, and insert,
+  using the selected collection;
+- a JSON formatter and a validated `op` field before sending;
+- result tables for array-shaped replies, with collapsible raw JSON;
+- JSON and CSV export, plus separate SQL/JSON query history in browser
+  localStorage.
+
+The JSON mode is the quickest way to prototype a query before moving it into an
+application. It uses the same filters, indexes, TTL, auth, and search paths as
+the native clients; there is no separate playground backend.
 
 ### Network
 
@@ -485,6 +518,7 @@ is disabled, the tab shows the required `NONODB_REPLICATION_ENABLED` and
 
 - saved connection profiles;
 - command palette (`Ctrl+K`) for navigation and collection switching;
+- **Playground** for SQL reports and raw JSON operations;
 - toast notifications;
 - recent operation log with backend-side timings.
 
@@ -500,9 +534,12 @@ client-side timing.
 
 Settings are edited in a focused dialog:
 
-- default document TTL in seconds, with an explanation;
-- versioning / history retention (`0` disables history);
-- automatic collection events.
+- default document TTL in seconds, with an explanation; expired documents are
+  hidden from reads immediately;
+- versioning / history retention (`0` disables history).
+
+Automatic collection events are configured in the collection's **Changes** tab,
+not in this dialog.
 
 ## Multiple databases
 

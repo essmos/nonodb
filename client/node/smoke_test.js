@@ -83,6 +83,9 @@ async function main() {
   assert.equal(found.length, 1);
   const fuzzy = await users.fuzzy('name', 'grce');
   assert.ok(fuzzy.length >= 1);
+  const unified = await users.searchAll({ mode: 'lexical', query: 'grace', fields: ['name'] });
+  assert.ok(unified.length >= 1);
+  assert.ok(unified[0]._score > 0);
 
   const atomic = await users.writeBatch([
     { op: 'insert', doc: { name: 'Atomic', age: 1 } },

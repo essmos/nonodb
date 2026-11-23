@@ -457,6 +457,8 @@ fn run() -> Result<(), String> {
             let res = http_post("/v1/exec", &json!({"op": "sync"}))?;
             print_result(&res);
         }
+        "search-all" => search_all_cmd(&args[1..])?,
+        "webhooks" => webhooks_cmd(&args[1..])?,
         "events" => {
             if args.get(1).map(String::as_str) == Some("tail") {
                 return events_tail(&args[2..]);
@@ -691,6 +693,10 @@ fn usage() -> Result<(), String> {
          map                        rozmiar mapy LMDB i zajęte bajty\n\
          sync                       wymuś fsync wybranej bazy\n\
          resize <rozmiar>           powiększ mapę online, np. 4GiB\n\
+         search-all <coll> [--mode lexical|fuzzy|vector|hybrid] [--query tekst]\n\
+              [--fields a,b] [--vector JSON] [--vector-field pole] [--filter JSON]\n\
+              [--skip N] [--limit N] [--max-distance N] [--rrf-k N]  ujednolicone wyszukiwanie\n\
+         webhooks <list|create|update|delete|deliveries|retry> ...  zarządzaj asynchronicznymi webhookami\n\
          branch <target-db> --data <root> [--from-snapshot <plik>] [--force] [--verify] [--no-sidecars] [--json]\n\
               utwórz niezależny klon bazy (reflink/copy; daemon zatrzymany lub snapshot)\n\
          backup <data> <out> [--without-search-sidecars]  kopia wybranej bazy (--db) + manifest.json\n\
@@ -812,6 +818,217 @@ fn subscribe_cmd(args: &[String]) -> Result<(), String> {
     }
     let res = http_post("/v1/exec", &payload)?;
     print_result(&res);
+    Ok(())
+}
+
+fn search_all_cmd(args: &[String]) -> Result<(), String> {
+    let coll = args
+        .first()
+        .ok_or("użycie: nonodb-cli search-all <kolekcja> [opcje]")?;
+    let mut payload = json!({"op": "search_all", "coll": coll, "mode": "lexical"});
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--mode" => {
+                payload["mode"] = json!(args.get(i + 1).ok_or("--mode wymaga wartości")?);
+                i += 2;
+            }
+            "--query" => {
+                payload["query"] = json!(args.get(i + 1).ok_or("--query wymaga tekstu")?);
+                i += 2;
+            }
+            "--fields" => {
+                payload["fields"] = json!(args
+                    .get(i + 1)
+                    .ok_or("--fields wymaga listy pól")?
+                    .split(',')
+                    .filter(|field| !field.is_empty())
+                    .collect::<Vec<_>>());
+                i += 2;
+            }
+            "--vector" => {
+                payload["vector"] =
+                    serde_json::from_str(args.get(i + 1).ok_or("--vector wymaga JSON")?)
+                        .map_err(|e| e.to_string())?;
+                i += 2;
+            }
+            "--vector-field" => {
+                payload["vector_field"] =
+                    json!(args.get(i + 1).ok_or("--vector-field wymaga pola")?);
+                i += 2;
+            }
+            "--filter" => {
+                payload["filter"] =
+                    serde_json::from_str(args.get(i + 1).ok_or("--filter wymaga JSON")?)
+                        .map_err(|e| e.to_string())?;
+                i += 2;
+            }
+            "--skip" => {
+                payload["skip"] = json!(args
+                    .get(i + 1)
+                    .ok_or("--skip wymaga liczby")?
+                    .parse::<usize>()
+                    .map_err(|e| e.to_string())?);
+                i += 2;
+            }
+            "--limit" => {
+                payload["limit"] = json!(args
+                    .get(i + 1)
+                    .ok_or("--limit wymaga liczby")?
+                    .parse::<usize>()
+                    .map_err(|e| e.to_string())?);
+                i += 2;
+            }
+            "--max-distance" => {
+                payload["max_distance"] = json!(args
+                    .get(i + 1)
+                    .ok_or("--max-distance wymaga liczby")?
+                    .parse::<usize>()
+                    .map_err(|e| e.to_string())?);
+                i += 2;
+            }
+            "--rrf-k" => {
+                payload["rrf_k"] = json!(args
+                    .get(i + 1)
+                    .ok_or("--rrf-k wymaga liczby")?
+                    .parse::<usize>()
+                    .map_err(|e| e.to_string())?);
+                i += 2;
+            }
+            other => return Err(format!("nieznana opcja: {other}")),
+        }
+    }
+    let res = http_post("/v1/exec", &payload)?;
+    print_result(&res);
+    Ok(())
+}
+
+fn webhooks_cmd(args: &[String]) -> Result<(), String> {
+    match args.first().map(String::as_str) {
+        Some("list") | None => {
+            let res = http_post("/v1/exec", &json!({"op": "list_webhooks"}))?;
+            print_result(&res);
+        }
+        Some("deliveries") => {
+            let mut payload = json!({"op": "list_webhook_deliveries"});
+            if let Some(status) = args.get(1) {
+                payload["status"] = json!(status);
+            }
+            let res = http_post("/v1/exec", &payload)?;
+            print_result(&res);
+        }
+        Some("retry") => {
+            let id = args
+                .get(1)
+                .ok_or("użycie: nonodb-cli webhooks retry <delivery-id>")?;
+            let res = http_post(
+                "/v1/exec",
+                &json!({"op": "retry_webhook_delivery", "id": id}),
+            )?;
+            print_result(&res);
+        }
+        Some("delete") => {
+            let name = args
+                .get(1)
+                .ok_or("użycie: nonodb-cli webhooks delete <nazwa>")?;
+            let res = http_post("/v1/exec", &json!({"op": "delete_webhook", "name": name}))?;
+            print_result(&res);
+        }
+        Some("create") | Some("update") => {
+            let name = args
+                .get(1)
+                .ok_or("użycie: nonodb-cli webhooks create <nazwa> <kolekcja> <url> [opcje]")?;
+            let coll = args
+                .get(2)
+                .ok_or("użycie: nonodb-cli webhooks create <nazwa> <kolekcja> <url> [opcje]")?;
+            let url = args
+                .get(3)
+                .ok_or("użycie: nonodb-cli webhooks create <nazwa> <kolekcja> <url> [opcje]")?;
+            let mut payload = json!({
+                "op": "create_webhook",
+                "name": name,
+                "coll": coll,
+                "url": url,
+                "enabled": true,
+                "headers": {},
+            });
+            let mut i = 4;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--filter" => {
+                        payload["filter"] =
+                            serde_json::from_str(args.get(i + 1).ok_or("--filter wymaga JSON")?)
+                                .map_err(|e| e.to_string())?;
+                        i += 2;
+                    }
+                    "--threshold" => {
+                        payload["threshold"] =
+                            serde_json::from_str(args.get(i + 1).ok_or("--threshold wymaga JSON")?)
+                                .map_err(|e| e.to_string())?;
+                        i += 2;
+                    }
+                    "--ops" => {
+                        payload["ops"] = json!(args
+                            .get(i + 1)
+                            .ok_or("--ops wymaga listy insert,update,delete")?
+                            .split(',')
+                            .filter(|part| !part.is_empty())
+                            .collect::<Vec<_>>());
+                        i += 2;
+                    }
+                    "--once" => {
+                        payload["once"] = json!(true);
+                        i += 1;
+                    }
+                    "--cooldown" => {
+                        payload["cooldown_seconds"] = json!(args
+                            .get(i + 1)
+                            .ok_or("--cooldown wymaga sekund")?
+                            .parse::<u64>()
+                            .map_err(|e| e.to_string())?);
+                        i += 2;
+                    }
+                    "--secret-env" => {
+                        payload["secret_env"] = json!(args
+                            .get(i + 1)
+                            .ok_or("--secret-env wymaga nazwy zmiennej")?);
+                        i += 2;
+                    }
+                    "--header" => {
+                        let raw = args.get(i + 1).ok_or("--header wymaga name:value")?;
+                        let (key, value) =
+                            raw.split_once(':').ok_or("--header wymaga name:value")?;
+                        payload["headers"][key.trim()] = json!(value.trim());
+                        i += 2;
+                    }
+                    "--max-attempts" => {
+                        payload["max_attempts"] = json!(args
+                            .get(i + 1)
+                            .ok_or("--max-attempts wymaga liczby")?
+                            .parse::<u64>()
+                            .map_err(|e| e.to_string())?);
+                        i += 2;
+                    }
+                    "--timeout-ms" => {
+                        payload["timeout_ms"] = json!(args
+                            .get(i + 1)
+                            .ok_or("--timeout-ms wymaga liczby")?
+                            .parse::<u64>()
+                            .map_err(|e| e.to_string())?);
+                        i += 2;
+                    }
+                    "--disabled" => {
+                        payload["enabled"] = json!(false);
+                        i += 1;
+                    }
+                    other => return Err(format!("nieznana opcja: {other}")),
+                }
+            }
+            let res = http_post("/v1/exec", &payload)?;
+            print_result(&res);
+        }
+        Some(other) => return Err(format!("nieznana komenda webhooks: {other}")),
+    }
     Ok(())
 }
 

@@ -931,6 +931,7 @@ fn is_read_op(payload: &Value) -> bool {
                 | "list_fuzzy_indexes"
                 | "list_vector_indexes"
                 | "search"
+                | "search_all"
                 | "fuzzy"
                 | "vector_search"
                 | "history"
@@ -1375,6 +1376,28 @@ impl Collection<'_> {
             "limit": limit,
         }))?;
         value_array(result.get("results").cloned().unwrap_or(Value::Null))
+    }
+
+    /// Unified lexical/fuzzy/vector/hybrid search.
+    ///
+    /// The request object uses the daemon's `search_all` fields (`mode`,
+    /// `query`, `fields`, `vector`, `vector_field`, `filter`, `skip`, `limit`,
+    /// `max_distance`, `rrf_k`). The collection name and op are filled in.
+    pub fn search_all(&self, request: Value) -> Result<Vec<Value>> {
+        let response = self.search_all_with_meta(request)?;
+        value_array(response.get("results").cloned().unwrap_or(Value::Null))
+    }
+
+    /// Unified search returning the full `{results, meta}` response.
+    pub fn search_all_with_meta(&self, request: Value) -> Result<Value> {
+        let Value::Object(mut payload) = request else {
+            return Err(Error::Config(
+                "search_all request must be a JSON object".into(),
+            ));
+        };
+        payload.insert("op".into(), Value::String("search_all".into()));
+        payload.insert("coll".into(), Value::String(self.name.to_string()));
+        self.client.exec(Value::Object(payload))
     }
 
     /// Fuzzy search. Results contain `_distance`, lowest first.

@@ -106,8 +106,19 @@ impl QueryCache {
         None
     }
 
+    #[cfg(test)]
     pub fn put(&self, key: String, version: u64, value: Value) {
+        self.put_until(key, version, value, None);
+    }
+
+    /// Stores a result that must expire no later than `deadline`.
+    pub fn put_until(&self, key: String, version: u64, value: Value, deadline: Option<Instant>) {
         if !self.enabled() || self.version() != version {
+            return;
+        }
+        let now = Instant::now();
+        let expires = deadline.map_or(now + self.ttl, |deadline| deadline.min(now + self.ttl));
+        if expires <= now {
             return;
         }
         let Ok(encoded) = serde_json::to_vec(&value) else {
@@ -127,7 +138,7 @@ impl QueryCache {
             key,
             Entry {
                 version,
-                expires: Instant::now() + self.ttl,
+                expires,
                 value,
             },
         );
@@ -157,6 +168,21 @@ mod tests {
         assert!(cache.get(&key).is_none());
         // An old read cannot insert a result after invalidation.
         cache.put(key.clone(), version, json!({"count": 3}));
+        assert!(cache.get(&key).is_none());
+    }
+
+    #[test]
+    fn cache_does_not_outlive_ttl_deadline() {
+        let cache = QueryCache::new(Duration::from_secs(60), 8, 4096);
+        let key = cache.key(&json!({"op": "find", "coll": "x"})).unwrap();
+        cache.put_until(
+            key.clone(),
+            cache.version(),
+            json!({"documents": []}),
+            Some(Instant::now() + Duration::from_millis(10)),
+        );
+        assert!(cache.get(&key).is_some());
+        std::thread::sleep(Duration::from_millis(20));
         assert!(cache.get(&key).is_none());
     }
 

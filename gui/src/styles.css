@@ -1903,3 +1903,41 @@ select {
   color: var(--accent);
   margin-bottom: 8px;
 }
+
+/* Playground */
+.mode-tabs {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+
+.mode-tabs > button {
+  min-width: 4.5rem;
+}
+
+.mode-tabs > .muted {
+  margin-left: 0.5rem;
+}
+
+.playground-table-wrap {
+  overflow-x: auto;
+  max-height: 34rem;
+  overflow-y: auto;
+}
+
+.playground-table td {
+  max-width: 28rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.raw-result {
+  margin-top: 0.75rem;
+}
+
+.raw-result summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 0.8rem;
+}

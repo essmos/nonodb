@@ -145,6 +145,18 @@ export class Collection {
   listVectorIndexes(): Promise<Array<{ field: string; dims: number; metric: string; format: number }>>;
   vectorSearch(field: string, vector: number[], options?: { filter?: Record<string, unknown>; skip?: number; limit?: number }): Promise<any[]>;
   search(field: string, query: string, options?: { filter?: Record<string, unknown>; skip?: number; limit?: number }): Promise<any[]>;
+  searchAll(options?: {
+    mode?: 'lexical' | 'fuzzy' | 'vector' | 'hybrid';
+    query?: string;
+    fields?: string[];
+    vector?: number[];
+    vectorField?: string;
+    filter?: Record<string, unknown>;
+    skip?: number;
+    limit?: number;
+    maxDistance?: number;
+    rrfK?: number;
+  }): Promise<any[]>;
   fuzzy(field: string, query: string, options?: { maxDistance?: number; filter?: Record<string, unknown>; limit?: number }): Promise<any[]>;
   watchOnce(after?: string | null, options?: WatchOptions): Promise<WatchBatch>;
   watch(after?: string | null, options?: WatchOptions): AsyncGenerator<any, void, unknown>;

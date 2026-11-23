@@ -189,6 +189,7 @@ client timeout with `NONODB_TIMEOUT` or the `timeout=` argument.
 | [`search`](#search) | BM25 full-text query |
 | [`fuzzy`](#fuzzy) | Approximate string query |
 | [`vector_search`](#vector_search) | Top-K vector query with exact fallback |
+| [`search_all`](#search_all) | Unified lexical/fuzzy/vector/hybrid search with RRF |
 | [`batch`](#read-batch) | Multiple read operations, one snapshot |
 | [`write_batch`](#atomic-write-batch) | Atomic group of writes |
 | [`history`](#document-history) | List revisions of one document |
@@ -2253,6 +2254,71 @@ Semantics:
   at 1,000.
 - Vectors are stored in LMDB; no external vector service is used.
 
+## search_all
+
+Unified lexical, fuzzy, vector, and hybrid search:
+
+```json
+{
+  "op": "search_all",
+  "coll": "products",
+  "mode": "hybrid",
+  "query": "coffee grinder",
+  "fields": ["title", "description"],
+  "vector": [0.12, -0.03, 0.44],
+  "vector_field": "embedding",
+  "filter": {"status": "active"},
+  "skip": 0,
+  "limit": 20,
+  "rrf_k": 60
+}
+```
+
+Response:
+
+```json
+{
+  "ok": true,
+  "result": {
+    "results": [
+      {
+        "_id": "p1",
+        "_score": 0.016393,
+        "_sources": {
+          "lexical:title": {"rank": 1, "score": 2.41},
+          "vector:embedding": {"rank": 2, "distance": 0.08}
+        }
+      }
+    ],
+    "meta": {
+      "mode": "hybrid",
+      "rrf_k": 60,
+      "candidate_count": 1,
+      "sources": ["lexical:title", "vector:embedding"]
+    }
+  }
+}
+```
+
+Semantics:
+
+- `mode` is `lexical`, `fuzzy`, `vector`, or `hybrid`.
+- `lexical`/`hybrid` need `query`; `vector` needs `vector`; `hybrid` needs
+  both.
+- `fields` selects text or fuzzy indexes. Empty means all indexes of that
+  kind.
+- `vector_field` is required when multiple vector indexes exist. With one
+  vector index it is optional.
+- `filter` is applied by each source before ranking and pagination.
+- `skip` and `limit` apply after fusion. `limit` defaults to 10, cap 1,000.
+- `_score` is reciprocal-rank fusion (`rrf_k`, default 60), not raw BM25 or
+  distance. Source scores/distances are in `_sources`.
+- `max_distance` applies to fuzzy mode; default 2.
+- Existing `search`, `fuzzy`, and `vector_search` are unchanged.
+
+See [Search and Atlas compatibility](search.md) for client examples and the
+`$search` aggregation bridge.
+
 ## Document history
 
 History is configured per collection and is stored separately from the current
@@ -2424,8 +2490,9 @@ Expiry removes the subscription only, not existing `_events` documents.
 
 ## Document TTL
 
-TTL is optional and eventual. A document may remain readable briefly after its
-expiry until the maintenance sweeper commits the delete.
+TTL is optional. Read visibility is strict by default: a document is hidden
+from reads as soon as its expiry passes. `NONODB_TTL_STRICT_READS=0` restores
+legacy visibility for compatibility.
 
 Collection default:
 
@@ -2472,6 +2539,9 @@ Rules:
 - Expiry deletes the document through the normal write path and appends a
   history tombstone when history is enabled. With `purge_history: true`, stored
   revisions are deleted instead of adding a tombstone.
+- Strict read filtering applies to the HTTP API, SQL, search paths, cursors,
+  and the MongoDB wire listener. Open cursors and the read cache also respect
+  the expiry boundary.
 - TTL works for vault collections; the sweeper deletes the ciphertext without
   decrypting it.
 

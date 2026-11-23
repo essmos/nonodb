@@ -5,6 +5,7 @@ import { sql as sqlLanguage } from '@codemirror/lang-sql';
 import { oneDark } from '@codemirror/theme-one-dark';
 import { autocompletion, type CompletionContext } from '@codemirror/autocomplete';
 import QueryBuilder from './QueryBuilder';
+import EventingPage from './EventingPage';
 import {
   applyFirewall,
   authSummary,
@@ -2827,10 +2828,12 @@ function CollectionView({
   connection,
   name,
   initialTab = 'documents',
+  onOpenEventing,
 }: {
   connection: Connection;
   name: string;
   initialTab?: CollectionTab;
+  onOpenEventing?: () => void;
 }) {
   const [tab, setTab] = useState<CollectionTab>(initialTab);
   const [docs, setDocs] = useState<Doc[]>([]);
@@ -3231,6 +3234,19 @@ function CollectionView({
         coll: name,
         max_versions: Number(history || 0),
       });
+      setNotice('Collection settings saved');
+      await load();
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const saveEvents = async () => {
+    setBusy(true);
+    setError('');
+    try {
       const current = await exec<{ enabled: boolean; fields: string[] }>(connection, {
         op: 'get_collection_events',
         coll: name,
@@ -3246,7 +3262,7 @@ function CollectionView({
         include_after: true,
         projection: null,
       });
-      setNotice('Collection settings saved');
+      setNotice(eventsEnabled ? 'Automatic change events enabled' : 'Automatic change events disabled');
       await load();
     } catch (err) {
       setError(errorText(err));
@@ -3679,7 +3695,7 @@ function CollectionView({
       <div className="tab-bar">
         {(['documents', 'indexes', 'events', 'search', 'aggregate', 'schema', 'metrics'] as const).map((item) => (
           <button key={item} className={tab === item ? 'active' : ''} onClick={() => setTab(item)}>
-            {item[0].toUpperCase() + item.slice(1)}
+            {item === 'events' ? 'Changes' : item[0].toUpperCase() + item.slice(1)}
             {item === 'indexes' && <span className="tab-count">{indexes.length + textIndexes.length + fuzzyIndexes.length + vectorIndexes.length}</span>}
             {item === 'events' && <span className="tab-count">{subscriptions.length}</span>}
           </button>
@@ -3879,6 +3895,25 @@ function CollectionView({
       )}
 
       {tab === 'events' && (
+        <>
+        <section className="panel">
+          <div className="panel-title">
+            <h3>Automatic change events</h3>
+            <span className={`badge ${eventsEnabled ? '' : 'danger-badge'}`}>{eventsEnabled ? 'enabled' : 'disabled'}</span>
+          </div>
+          <p className="muted small">
+            Append insert/update/delete events for this collection to the transactional outbox. Subscriptions, live
+            watch, and webhooks all consume these changes; webhook filters and aggregates still run outside the writer.
+          </p>
+          <label className="checkbox">
+            <input type="checkbox" checked={eventsEnabled} onChange={(e) => setEventsEnabled(e.target.checked)} />
+            Write change events to <code>_events</code>
+          </label>
+          <div className="actions">
+            <button className="primary" onClick={() => void saveEvents()} disabled={busy}>Save event source</button>
+            {onOpenEventing && <button onClick={onOpenEventing}>Open Eventing</button>}
+          </div>
+        </section>
         <section className="panel">
           <div className="panel-title"><h3>Subscriptions</h3><button onClick={() => void loadSubscriptions()}>Refresh</button></div>
           <p className="muted small">Persistent subscriptions write matching events to <code>_events</code>. Renew the lease before it expires.</p>
@@ -3927,6 +3962,7 @@ function CollectionView({
             )}
           </div>
         </section>
+        </>
       )}
 
       {tab === 'search' && (
@@ -4044,7 +4080,6 @@ function CollectionView({
           <div className="form-grid">
             <label>Default document TTL (seconds)<input value={ttl} onChange={(e) => setTtl(e.target.value)} placeholder="empty = disabled" /><span className="field-hint">Documents expire after this many seconds unless they have their own TTL. Leave empty to disable automatic expiry.</span></label>
             <label>Versioning / history versions<input type="number" min={0} value={history} onChange={(e) => setHistory(e.target.value)} /><span className="field-hint">Number of previous document revisions to keep. 0 disables history for this collection.</span></label>
-            <label className="checkbox span-2"><input type="checkbox" checked={eventsEnabled} onChange={(e) => setEventsEnabled(e.target.checked)} /> Automatic change events (insert / update / delete)</label>
           </div>
           <div className="modal-actions"><button onClick={() => setShowSettings(false)}>Cancel</button><button className="primary" onClick={() => void saveSettings().then(() => setShowSettings(false))} disabled={busy}>Save settings</button></div>
         </Modal>
@@ -4065,14 +4100,95 @@ function toCsv(rows: unknown): string {
   return [columns.map(escape).join(','), ...objects.map((row) => columns.map((column) => escape(row[column])).join(','))].join('\n');
 }
 
-function SqlView({ connection }: { connection: Connection }) {
+type PlaygroundMode = 'sql' | 'json';
+
+function resultRows(value: unknown): Record<string, unknown>[] | null {
+  const candidate = Array.isArray(value)
+    ? value
+    : value && typeof value === 'object'
+      ? ((value as Record<string, unknown>).results ??
+        (value as Record<string, unknown>).rows ??
+        (value as Record<string, unknown>).documents)
+      : null;
+  if (!Array.isArray(candidate) || candidate.length === 0) return null;
+  const rows = candidate.filter(
+    (row): row is Record<string, unknown> =>
+      Boolean(row) && typeof row === 'object' && !Array.isArray(row),
+  );
+  return rows.length === candidate.length ? rows : null;
+}
+
+function cellText(value: unknown): string {
+  if (value === undefined) return '';
+  if (value === null) return 'null';
+  if (typeof value === 'object') return JSON.stringify(value);
+  return String(value);
+}
+
+function PlaygroundTable({ rows }: { rows: Record<string, unknown>[] }) {
+  const columns = [...new Set(rows.flatMap((row) => Object.keys(row)))];
+  const visible = rows.slice(0, 200);
+  return (
+    <div className="playground-table-wrap">
+      <table className="metric-table playground-table">
+        <thead>
+          <tr>
+            {columns.map((column) => (
+              <th key={column}>{column}</th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {visible.map((row, index) => (
+            <tr key={String(row._id ?? index)}>
+              {columns.map((column) => (
+                <td key={column} title={cellText(row[column])}>
+                  {cellText(row[column])}
+                </td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      {rows.length > visible.length && (
+        <p className="muted small">
+          Showing the first {visible.length} of {rows.length} rows. Export CSV or JSON for the full result.
+        </p>
+      )}
+    </div>
+  );
+}
+
+function PlaygroundView({
+  connection,
+  collections,
+  selected,
+}: {
+  connection: Connection;
+  collections: string[];
+  selected: string | null;
+}) {
+  const [mode, setMode] = useState<PlaygroundMode>('sql');
   const [query, setQuery] = useState('SELECT * FROM orders LIMIT 20');
   const [params, setParams] = useState('[]');
+  const [jsonRequest, setJsonRequest] = useState(`{
+  "op": "find",
+  "coll": "orders",
+  "filter": {},
+  "limit": 20
+}`);
   const [result, setResult] = useState<unknown>(null);
   const [explainResult, setExplainResult] = useState<unknown>(null);
-  const [history, setHistory] = useState<string[]>(() => {
+  const [sqlHistory, setSqlHistory] = useState<string[]>(() => {
     try {
       return JSON.parse(localStorage.getItem('nonodb.gui.sqlHistory') ?? '[]') as string[];
+    } catch {
+      return [];
+    }
+  });
+  const [jsonHistory, setJsonHistory] = useState<string[]>(() => {
+    try {
+      return JSON.parse(localStorage.getItem('nonodb.gui.jsonHistory') ?? '[]') as string[];
     } catch {
       return [];
     }
@@ -4080,13 +4196,36 @@ function SqlView({ connection }: { connection: Connection }) {
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
 
+  const history = mode === 'sql' ? sqlHistory : jsonHistory;
+  const historyKey = mode === 'sql' ? 'nonodb.gui.sqlHistory' : 'nonodb.gui.jsonHistory';
+
   const remember = (statement: string) => {
-    const next = [statement, ...history.filter((item) => item !== statement)].slice(0, 30);
-    setHistory(next);
-    localStorage.setItem('nonodb.gui.sqlHistory', JSON.stringify(next));
+    const current = mode === 'sql' ? sqlHistory : jsonHistory;
+    const next = [statement, ...current.filter((item) => item !== statement)].slice(0, 30);
+    if (mode === 'sql') setSqlHistory(next);
+    else setJsonHistory(next);
+    localStorage.setItem(historyKey, JSON.stringify(next));
+  };
+
+  const clearHistory = () => {
+    if (mode === 'sql') setSqlHistory([]);
+    else setJsonHistory([]);
+    localStorage.removeItem(historyKey);
   };
 
   const parsedParams = () => parseJson(params, 'Params') as unknown[];
+
+  const parsedRequest = () => {
+    const value = parseJson(jsonRequest, 'JSON request');
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      throw new Error('JSON request: expected one object, for example {"op":"find","coll":"orders"}');
+    }
+    const request = value as Record<string, unknown>;
+    if (typeof request.op !== 'string' || request.op.trim() === '') {
+      throw new Error('JSON request: the `op` field is required');
+    }
+    return request;
+  };
 
   const run = async () => {
     setBusy(true);
@@ -4094,9 +4233,16 @@ function SqlView({ connection }: { connection: Connection }) {
     setResult(null);
     setExplainResult(null);
     try {
-      const out = await exec(connection, { op: 'sql', query, params: parsedParams() });
-      setResult(out);
-      remember(query);
+      if (mode === 'sql') {
+        const out = await exec(connection, { op: 'sql', query, params: parsedParams() });
+        setResult(out);
+        remember(query);
+      } else {
+        const request = parsedRequest();
+        const out = await exec(connection, request);
+        setResult(out);
+        remember(jsonRequest);
+      }
     } catch (err) {
       setError(errorText(err));
     } finally {
@@ -4118,30 +4264,120 @@ function SqlView({ connection }: { connection: Connection }) {
     }
   };
 
+  const formatJson = () => {
+    try {
+      setJsonRequest(pretty(parseJson(jsonRequest, 'JSON request')));
+      setError('');
+    } catch (err) {
+      setError(errorText(err));
+    }
+  };
+
+  const loadTemplate = (kind: 'find' | 'aggregate' | 'search' | 'sql' | 'insert') => {
+    const coll = selected ?? collections.find((name) => !name.startsWith('_')) ?? collections[0] ?? 'orders';
+    const templates: Record<typeof kind, Record<string, unknown>> = {
+      find: { op: 'find', coll, filter: {}, limit: 20 },
+      aggregate: {
+        op: 'aggregate',
+        coll,
+        pipeline: [{ $match: {} }, { $sort: { _id: 1 } }, { $limit: 20 }],
+      },
+      search: {
+        op: 'search_all',
+        coll,
+        mode: 'lexical',
+        query: 'coffee',
+        fields: ['title'],
+        limit: 10,
+      },
+      sql: { op: 'sql', query: `SELECT * FROM ${coll} LIMIT 20`, params: [] },
+      insert: { op: 'insert', coll, doc: { example: true } },
+    };
+    setJsonRequest(pretty(templates[kind]));
+    setError('');
+  };
+
+  const rows = resultRows(result);
+
   return (
     <div className="page">
       <header className="page-header">
         <div>
-          <h2>SQL console</h2>
-          <p>Read and write one collection per statement</p>
+          <h2>Playground</h2>
+          <p>Run SQL reports or raw JSON operations against the current database</p>
         </div>
         <div className="actions">
-          <button onClick={() => void explain()} disabled={busy}>Explain</button>
-          <button onClick={() => void run()} disabled={busy} className="primary">{busy ? 'Running…' : 'Run'}</button>
+          {mode === 'sql' && (
+            <button onClick={() => void explain()} disabled={busy}>Explain</button>
+          )}
+          <button onClick={() => void run()} disabled={busy} className="primary">
+            {busy ? 'Running…' : `Run ${mode === 'sql' ? 'SQL' : 'JSON'}`}
+          </button>
         </div>
       </header>
+      <div className="mode-tabs" role="tablist" aria-label="Playground mode">
+        <button
+          role="tab"
+          aria-selected={mode === 'sql'}
+          className={mode === 'sql' ? 'active' : ''}
+          onClick={() => { setMode('sql'); setError(''); }}
+        >
+          SQL
+        </button>
+        <button
+          role="tab"
+          aria-selected={mode === 'json'}
+          className={mode === 'json' ? 'active' : ''}
+          onClick={() => { setMode('json'); setError(''); }}
+        >
+          JSON
+        </button>
+        <span className="muted small">
+          {mode === 'sql'
+            ? 'One collection per SELECT/INSERT/UPDATE/DELETE statement.'
+            : 'Any single /v1/exec request: find, aggregate, search_all, insert, SQL, and more.'}
+        </span>
+      </div>
       {error && <div className="error-box">{error}</div>}
-      <section className="panel">
-        <SqlEditor value={query} onChange={setQuery} />
-        <label>Params JSON<input value={params} onChange={(e) => setParams(e.target.value)} spellCheck={false} /></label>
-      </section>
+      {mode === 'sql' ? (
+        <section className="panel">
+          <SqlEditor value={query} onChange={setQuery} />
+          <label>Params JSON<input value={params} onChange={(e) => setParams(e.target.value)} spellCheck={false} /></label>
+        </section>
+      ) : (
+        <section className="panel">
+          <div className="panel-title">
+            <h3>JSON request</h3>
+            <div className="actions">
+              <button className="small" onClick={() => loadTemplate('find')}>Find</button>
+              <button className="small" onClick={() => loadTemplate('aggregate')}>Aggregate</button>
+              <button className="small" onClick={() => loadTemplate('search')}>Search</button>
+              <button className="small" onClick={() => loadTemplate('sql')}>SQL</button>
+              <button className="small" onClick={() => loadTemplate('insert')}>Insert</button>
+              <button className="small" onClick={formatJson}>Format</button>
+            </div>
+          </div>
+          <JsonEditor value={jsonRequest} onChange={setJsonRequest} height="300px" />
+          <p className="muted small">
+            Templates use {selected ? <code>{selected}</code> : 'the first visible collection'}. Change <code>coll</code> freely; results use the same indexes, filters, and search modes as the clients.
+          </p>
+        </section>
+      )}
       {history.length > 0 && (
         <section className="panel">
-          <div className="panel-title"><h3>Query history</h3><button onClick={() => { setHistory([]); localStorage.removeItem('nonodb.gui.sqlHistory'); }}>Clear</button></div>
+          <div className="panel-title">
+            <h3>{mode === 'sql' ? 'SQL' : 'JSON'} history</h3>
+            <button onClick={clearHistory}>Clear</button>
+          </div>
           <div className="query-history">
             {history.map((statement, index) => (
-              <button key={`${index}-${statement}`} className="query-history-row" onClick={() => setQuery(statement)} title={statement}>
-                {statement}
+              <button
+                key={`${index}-${statement}`}
+                className="query-history-row"
+                onClick={() => (mode === 'sql' ? setQuery(statement) : setJsonRequest(statement))}
+                title={statement}
+              >
+                {statement.replace(/\s+/g, ' ')}
               </button>
             ))}
           </div>
@@ -4149,8 +4385,29 @@ function SqlView({ connection }: { connection: Connection }) {
       )}
       {result !== null && (
         <section className="panel">
-          <div className="panel-title"><h3>Result</h3><div className="actions"><button onClick={() => downloadText('query-result.json', pretty(result))}>Export JSON</button><button onClick={() => downloadText('query-result.csv', toCsv(result), 'text/csv')}>Export CSV</button></div></div>
-          <pre className="result">{pretty(result)}</pre>
+          <div className="panel-title">
+            <h3>Result{rows ? ` · ${rows.length} row${rows.length === 1 ? '' : 's'}` : ''}</h3>
+            <div className="actions">
+              <button onClick={() => downloadText('playground-result.json', pretty(result))}>Export JSON</button>
+              <button
+                onClick={() => downloadText('playground-result.csv', toCsv(rows ?? result), 'text/csv')}
+                disabled={!rows}
+              >
+                Export CSV
+              </button>
+            </div>
+          </div>
+          {rows ? (
+            <>
+              <PlaygroundTable rows={rows} />
+              <details className="raw-result">
+                <summary>Raw JSON</summary>
+                <pre className="result">{pretty(result)}</pre>
+              </details>
+            </>
+          ) : (
+            <pre className="result">{pretty(result)}</pre>
+          )}
         </section>
       )}
       {explainResult !== null && (
@@ -4827,7 +5084,7 @@ function Shell({
 }) {
   const [collections, setCollections] = useState<string[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
-  const [tab, setTab] = useState<'dashboard' | 'storage' | 'sql' | 'database' | 'backups' | 'import' | 'replication' | 'cluster' | 'network' | 'auth'>('dashboard');
+  const [tab, setTab] = useState<'dashboard' | 'storage' | 'playground' | 'database' | 'backups' | 'import' | 'replication' | 'cluster' | 'network' | 'auth' | 'eventing'>('dashboard');
   const [showNewCollection, setShowNewCollection] = useState(false);
   const [showPalette, setShowPalette] = useState(false);
   const [paletteQuery, setPaletteQuery] = useState('');
@@ -4946,8 +5203,8 @@ function Shell({
           <button className={tab === 'dashboard' && !selected ? 'active' : ''} onClick={() => { setTab('dashboard'); setSelected(null); }}>
             Dashboard
           </button>
-          <button className={tab === 'sql' ? 'active' : ''} onClick={() => setTab('sql')}>
-            SQL
+          <button className={tab === 'playground' ? 'active' : ''} onClick={() => setTab('playground')}>
+            Playground
           </button>
           <button className={tab === 'database' ? 'active' : ''} onClick={() => setTab('database')}>
             Database
@@ -4957,6 +5214,9 @@ function Shell({
           </button>
           <button className={tab === 'import' ? 'active' : ''} onClick={() => setTab('import')}>
             Import
+          </button>
+          <button className={tab === 'eventing' ? 'active' : ''} onClick={() => setTab('eventing')}>
+            Eventing
           </button>
           <button className={tab === 'replication' ? 'active' : ''} onClick={() => setTab('replication')}>
             Replication
@@ -4972,9 +5232,6 @@ function Shell({
           </button>
           {collections.includes('_jobs') && (
             <button onClick={() => openCollection('_jobs')}>Jobs _jobs</button>
-          )}
-          {collections.includes('_events') && (
-            <button onClick={() => openCollection('_events')}>Outbox _events</button>
           )}
         </nav>
         <div className="sidebar-section">
@@ -5039,14 +5296,20 @@ function Shell({
         {error && <div className="error-box sticky">{error}</div>}
         {tab === 'storage' ? (
           <StorageView connection={connection} onOpenCollection={(name) => openCollection(name, 'metrics')} />
-        ) : tab === 'sql' ? (
-          <SqlView connection={connection} />
+        ) : tab === 'playground' ? (
+          <PlaygroundView connection={connection} collections={collections} selected={selected} />
         ) : tab === 'database' ? (
           <DatabaseView connection={connection} />
         ) : tab === 'backups' ? (
           <BackupsPage connection={connection} />
         ) : tab === 'import' ? (
           <ImportsPage connection={connection} />
+        ) : tab === 'eventing' ? (
+          <EventingPage
+            connection={connection}
+            collections={collections}
+            onOpenCollection={(name, eventingTab) => openCollection(name, eventingTab ?? 'events')}
+          />
         ) : tab === 'replication' ? (
           <ReplicationPage connection={connection} />
         ) : tab === 'cluster' ? (
@@ -5061,6 +5324,7 @@ function Shell({
             connection={connection}
             name={selected}
             initialTab={collectionTab}
+            onOpenEventing={() => setTab('eventing')}
           />
         ) : (
           <Dashboard
@@ -5082,10 +5346,11 @@ function Shell({
             {[
               { label: 'Open Dashboard', run: () => { setTab('dashboard'); setSelected(null); } },
               { label: 'Open Storage', run: () => setTab('storage') },
-              { label: 'Open SQL console', run: () => setTab('sql') },
+              { label: 'Open Playground (SQL + JSON)', run: () => setTab('playground') },
               { label: 'Open Database settings', run: () => setTab('database') },
               { label: 'Open Backups', run: () => setTab('backups') },
               { label: 'Open Import', run: () => setTab('import') },
+              { label: 'Open Eventing', run: () => setTab('eventing') },
               { label: 'Open Replication', run: () => setTab('replication') },
               { label: 'Open Cluster', run: () => setTab('cluster') },
               { label: 'Open Network', run: () => setTab('network') },

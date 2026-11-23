@@ -58,6 +58,7 @@ secrets.
 | `NONODB_CACHE_TTL` | `5` | Read-cache TTL in seconds; `0` disables the cache |
 | `NONODB_CACHE_ENTRIES` | `512` | Maximum number of cached read results |
 | `NONODB_CACHE_MAX_BYTES` | `262144` | Maximum serialized size of one cached result |
+| `NONODB_TTL_STRICT_READS` | `1` | Hide expired documents at read time; `0` restores eventual visibility |
 | `NONODB_TTL_SWEEP_INTERVAL` | `5` | Seconds between document TTL sweeps |
 | `NONODB_TTL_SWEEP_LIMIT` | `256` | Maximum due documents processed per TTL sweep |
 | `NONODB_MAINTENANCE_INTERVAL_MS` | `1000` | Maintenance worker heartbeat in milliseconds |
@@ -255,10 +256,11 @@ sub-database and written atomically with the document and its indexes.
 
 The maintenance worker submits expiry deletes to the single writer. It processes
 at most `NONODB_TTL_SWEEP_LIMIT` due documents every
-`NONODB_TTL_SWEEP_INTERVAL` seconds. TTL is eventual: a document may remain
-visible briefly after its timestamp. Expiry uses the normal delete path,
-including a history tombstone when history is enabled. Collections can set
-`purge_history` to delete stored revisions instead.
+`NONODB_TTL_SWEEP_INTERVAL` seconds. Read visibility is strict by default:
+the document is hidden immediately at its timestamp. Set
+`NONODB_TTL_STRICT_READS=0` for legacy visibility. Expiry uses the normal
+delete path, including a history tombstone when history is enabled. Collections
+can set `purge_history` to delete stored revisions instead.
 
 See [Document TTL](ttl.md) for semantics, update behavior, vault support, and
 metrics.

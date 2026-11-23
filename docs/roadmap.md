@@ -141,7 +141,7 @@ comparison and practical migration caveats.
   ordinary client processes. `watch` long-polls or streams append-only outbox
   collections; it is not an automatic change stream for arbitrary writes,
   updates, or deletes.
-- TTL is eventual and has no strict read-time filtering.
+- TTL read visibility is strict by default.
 - Projection expressions are limited; nested paths, positional `$`, and basic
   `$meta` are supported, but arbitrary computed projection expressions are not.
 - Sorting and filtering use the documented subset; there is no collation API.

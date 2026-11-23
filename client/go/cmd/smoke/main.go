@@ -113,6 +113,12 @@ func main() {
 	if err != nil || len(fuzzy) < 1 {
 		log.Fatalf("fuzzy: %v %v", fuzzy, err)
 	}
+	unified, err := users.SearchAll(ctx, nonodb.SearchAllOptions{
+		Mode: "lexical", Query: "grace", Fields: []string{"name"}, Limit: 5,
+	})
+	if err != nil || len(unified) < 1 || unified[0]["_score"] == nil {
+		log.Fatalf("search_all: %v %v", unified, err)
+	}
 
 	entries, err := users.WriteBatch(ctx, []map[string]any{
 		{"op": "insert", "doc": map[string]any{"name": "Atomic"}},

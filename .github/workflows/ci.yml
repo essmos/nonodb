@@ -77,10 +77,12 @@ jobs:
       - name: Install Python test dependencies
         run: python3 -m pip install --disable-pip-version-check httpx
 
-      - name: Check Node.js client
+      - name: Check client routing
         run: |
+          python3 client/routing_test.py
           node --check client/node/index.js
           node --check client/node/smoke_test.js
+          node client/node/routing_test.js
 
       - name: Install Go
         uses: actions/setup-go@v7
@@ -123,6 +125,12 @@ jobs:
           python3 scripts/replication_vault_test.py
           python3 scripts/restore_to_test.py
           python3 scripts/branch_test.py
+          python3 scripts/webhook_test.py
+          python3 scripts/search_all_test.py
+          python3 scripts/search_bench.py
+          python3 scripts/ttl_strict_test.py
+          python3 scripts/ttl_strict_disabled_test.py
+          python3 scripts/ttl_replica_strict_test.py
 
       - name: Run security regression checks
         env:
@@ -203,6 +211,7 @@ jobs:
         run: |
           python3 scripts/mongo_conformance_test.py
           python3 scripts/mongo_wire_test.py
+          python3 scripts/search_all_test.py
 
       - name: Run MongoDB DDL translation tests
         env:

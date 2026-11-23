@@ -209,6 +209,9 @@ python3 scripts/replication_metadata_test.py # metadata, indexes, history, event
 python3 scripts/replication_load_test.py --keep  # 1M docs, 7 hosts, two failovers, load/speed report
 python3 scripts/tls_reload_test.py           # TLS server certificate hot reload
 python3 scripts/ttl_test.py                  # TTL sweeps, overrides, history, vault
+python3 scripts/ttl_strict_test.py           # strict reads before sweep: find/count/aggregate/SQL/search/cursor/wire
+python3 scripts/ttl_strict_disabled_test.py  # NONODB_TTL_STRICT_READS=0 legacy behavior
+python3 scripts/ttl_replica_strict_test.py   # replicated TTL metadata hides documents on a replica
 python3 scripts/history_test.py              # per-collection history enable/disable, restart, CLI
 python3 scripts/events_auto_test.py          # automatic collection events, field filters, thresholds, CLI
 python3 scripts/async_watch_test.py          # AsyncNonoDB long-poll, NDJSON, live, and truncation
@@ -314,11 +317,17 @@ scripts are:
 | `scripts/security_check.py` | isolated auth gates, database-qualified scopes, CORS, malformed input, security headers, lockout |
 | `scripts/writer_window_bench.py` | adaptive/fixed group-commit window latency and throughput comparison |
 | `scripts/ttl_test.py` | TTL defaults, overrides, update semantics, sweeper, vault |
+| `scripts/ttl_strict_test.py` | Strict read-time visibility before sweep across find/count/aggregate/SQL/search/cursor/wire |
+| `scripts/ttl_strict_disabled_test.py` | Emergency `NONODB_TTL_STRICT_READS=0` compatibility path |
+| `scripts/ttl_replica_strict_test.py` | Replicated per-document TTL metadata and strict replica reads |
 | `scripts/vault_test.py` | Vault encryption, tenant isolation, and restricted API |
 | `scripts/vault_regression_test.py` | Vault profiles, headers, filters, CRUD, errors, history |
 | `scripts/history_test.py` | Per-collection history retention, isolation, restart durability, CLI |
 | `scripts/events_auto_test.py` | Automatic collection events, source-side filters/projections, find_and_modify/TTL/SQL writes, watch filters, thresholds, metrics, CLI tail |
 | `scripts/async_watch_test.py` | AsyncNonoDB long-poll, NDJSON stream, live subscription, and truncation behavior |
+| `scripts/webhook_test.py` | Asynchronous webhook rules, filters, count/sum/avg thresholds, once/cooldown, HMAC, idempotency, timeout, retry/dead-letter, CLI CRUD, and restart |
+| `scripts/search_all_test.py` | Unified search modes, filters, pagination, RRF metadata, `$search`/`$searchMeta`/`$vectorSearch`, CLI, and MongoDB wire aggregation |
+| `scripts/search_bench.py` | Latency smoke for lexical, vector, and hybrid search over 1,000 documents |
 | `scripts/vault_bench.py` | Standard vs vault insert/read/update/count performance |
 | `scripts/cpu_bench.py` | Samples daemon CPU from `/proc` |
 | `scripts/large_test.py` | 1M+ document load, indexes, query latency, RAM |

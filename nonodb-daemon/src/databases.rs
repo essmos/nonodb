@@ -45,6 +45,7 @@ pub struct DatabaseRuntime {
     stop: Arc<AtomicBool>,
     writer: Mutex<Option<std::thread::JoinHandle<()>>>,
     maintenance: Mutex<Option<std::thread::JoinHandle<()>>>,
+    webhooks: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl DatabaseRuntime {
@@ -62,6 +63,9 @@ impl Drop for DatabaseRuntime {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(handle) = self.maintenance.lock().expect("maintenance lock").take() {
+            let _ = handle.join();
+        }
+        if let Some(handle) = self.webhooks.lock().expect("webhooks lock").take() {
             let _ = handle.join();
         }
         if let Some(handle) = self.writer.lock().expect("writer lock").take() {
@@ -330,6 +334,8 @@ fn start_runtime(root: &Path, name: &str) -> Result<DatabaseRuntime, String> {
         auto_index.clone(),
         stop.clone(),
     );
+    let webhooks =
+        crate::webhooks::start(store.clone(), write_tx.clone(), path.clone(), stop.clone());
     if let Some(dir) = std::env::var_os("NONODB_SNAPSHOT_DIR") {
         crate::spawn_snapshots(
             store.clone(),
@@ -345,6 +351,7 @@ fn start_runtime(root: &Path, name: &str) -> Result<DatabaseRuntime, String> {
         stop,
         writer: Mutex::new(Some(writer)),
         maintenance: Mutex::new(Some(maintenance)),
+        webhooks: Mutex::new(Some(webhooks)),
     })
 }
 

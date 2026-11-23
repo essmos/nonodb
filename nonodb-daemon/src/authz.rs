@@ -74,6 +74,20 @@ pub fn authorize_request(
         | Request::ListSubscriptions { coll } => {
             allow(principal, Action::Read, database, coll, req.op_name())
         }
+        Request::SearchAll { request } => allow(
+            principal,
+            Action::Read,
+            database,
+            &request.coll,
+            req.op_name(),
+        ),
+        Request::ListWebhooks | Request::ListWebhookDeliveries { .. } => {
+            if principal.allows_admin_database() {
+                Ok(())
+            } else {
+                Err(ApiError::forbidden())
+            }
+        }
 
         Request::Sql { query, .. } => {
             let (coll, read_only) =
@@ -120,6 +134,20 @@ pub fn authorize_request(
             coll,
             req.op_name(),
         ),
+        Request::CreateWebhook { rule } => allow(
+            principal,
+            Action::AdminCollection,
+            database,
+            &rule.coll,
+            req.op_name(),
+        ),
+        Request::DeleteWebhook { .. } | Request::RetryWebhookDelivery { .. } => {
+            if principal.allows_admin_database() {
+                Ok(())
+            } else {
+                Err(ApiError::forbidden())
+            }
+        }
 
         Request::ListDatabases => Ok(()),
         Request::CreateDatabase { .. }

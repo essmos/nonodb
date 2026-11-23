@@ -66,8 +66,9 @@ def main() -> None:
     wait_for(lambda: c.find_one({"_id": later}) is None)
 
     # TTL deletion records a history tombstone when history is enabled.
-    hist = c.history(later)
-    assert hist and hist[0]["op"] == "delete", hist
+    # Reads hide the document immediately; wait for the sweeper that appends
+    # the physical delete tombstone.
+    wait_for(lambda: (c.history(later) or [{}])[0].get("op") == "delete")
 
     # Opt-in history purge on TTL deletion.
     purge_name = "ttl_purge_e2e"
@@ -78,7 +79,7 @@ def main() -> None:
     pc = db.collection(purge_name)
     purge_id = pc.insert({"_id": "purged", "v": 1})
     wait_for(lambda: pc.find_one({"_id": purge_id}) is None)
-    assert pc.history(purge_id) == []
+    wait_for(lambda: pc.history(purge_id) == [])
 
     # Vault collections use the same TTL metadata without decrypting for expiry.
     vault_name = "ttl_vault_e2e"

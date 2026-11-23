@@ -1350,6 +1350,14 @@ impl Store {
         )
     }
 
+    /// Earliest TTL expiry in the database, if any.
+    pub fn next_ttl_expiry(&self) -> Result<Option<u64>> {
+        let rtxn = self.read_txn()?;
+        let out = ttl::earliest_expiry(&self.ttl, &rtxn)?;
+        rtxn.commit()?;
+        Ok(out)
+    }
+
     /// Reads due TTL entries with a short-lived read transaction.
     pub fn ttl_due(&self, now: u64, limit: usize) -> Result<Vec<crate::ttl::DueEntry>> {
         let rtxn = self.read_txn()?;
@@ -1855,6 +1863,7 @@ impl Store {
                     &change.op,
                     &change.id,
                     change.after.as_ref(),
+                    change.ttl_at,
                 )?;
             }
         } else {
@@ -1902,6 +1911,7 @@ impl Store {
                         &change.op,
                         &change.id,
                         change.after.as_ref(),
+                        change.ttl_at,
                     )
                 } else {
                     collection.apply_replication_change_txn(
@@ -1909,6 +1919,7 @@ impl Store {
                         &change.op,
                         &change.id,
                         change.after.as_ref(),
+                        change.ttl_at,
                     )
                 }
             }
@@ -2013,11 +2024,11 @@ impl Store {
                     .and_then(Value::as_str)
                     .ok_or_else(|| Error::Query("replication event has no string _id".into()))?;
                 let collection = self.collection_in(wtxn, crate::events::EVENTS_COLLECTION)?;
-                collection.apply_replication_change_txn(wtxn, "insert", id, Some(doc))
+                collection.apply_replication_change_txn(wtxn, "insert", id, Some(doc), None)
             }
             ReplicationOp::EventDelete { id } => {
                 let collection = self.collection_in(wtxn, crate::events::EVENTS_COLLECTION)?;
-                collection.apply_replication_change_txn(wtxn, "delete", id, None)
+                collection.apply_replication_change_txn(wtxn, "delete", id, None, None)
             }
         }
     }
