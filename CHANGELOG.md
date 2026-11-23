@@ -2,7 +2,7 @@
 
 Full release notes: https://github.com/essmos/nonodb/releases
 
-## Unreleased
+## v0.30.0 - 2026-11-23
 
 - Enforce TTL at read time by default. Expired documents are hidden from find,
   count, aggregation, SQL, lookups, cursors, search, and MongoDB-wire reads

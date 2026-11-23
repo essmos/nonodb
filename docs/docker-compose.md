@@ -108,11 +108,11 @@ docker compose -f deploy/docker-compose.quickstart.yml pull
 docker compose -f deploy/docker-compose.quickstart.yml up -d
 ```
 
-Pin a version in production. The default example uses `0.29.1`; override the
+Pin a version in production. The default example uses `0.30.0`; override the
 image explicitly if needed:
 
 ```bash
-NONODB_IMAGE=ghcr.io/essmos/nonodb:0.29.1 \
+NONODB_IMAGE=ghcr.io/essmos/nonodb:0.30.0 \
   docker compose -f deploy/docker-compose.quickstart.yml up -d
 ```
 

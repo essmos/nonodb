@@ -2808,7 +2808,7 @@ Authenticated admin endpoint. Returns the daemon's real listener state:
 {
   "ok": true,
   "result": {
-    "version": "0.29.1",
+    "version": "0.30.0",
     "tcp": {"configured": "0.0.0.0:7902", "bound": "0.0.0.0:7902", "tls": false},
     "unix": "/run/nonodb.sock",
     "advertise_url": "http://10.0.0.10:7902"

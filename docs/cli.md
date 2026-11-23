@@ -102,7 +102,7 @@ NONODB_SOCK=/tmp/nonodb.sock nonodb-cli server
 {
   "ok": true,
   "result": {
-    "version": "0.29.1",
+    "version": "0.30.0",
     "tcp": {
       "configured": "127.0.0.1:7902",
       "bound": "127.0.0.1:7902",
