@@ -24,3 +24,5 @@ node_modules/
 
 # dev.to article drafts (local only)
 /articles/
+/dist/
+/client/build/

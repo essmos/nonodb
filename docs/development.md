@@ -514,6 +514,41 @@ nonodb-<tag>-linux-x86_64.tar.gz.sha256
 The tarball contains `nonodb-daemon`, `nonodb-cli`, `README.md`, `LICENSE`, and
 the `docs/` directory.
 
+### Python package
+
+The Python client is packaged separately as `nonodb-client`; it is not part of
+the binary archives. Keep its version aligned in both places:
+
+- `client/pyproject.toml` → `[project].version`
+- `client/nonodb.py` → `__version__`
+
+Build and verify the wheel and sdist locally:
+
+```bash
+python3 -m pip install build
+python3 -m build client --outdir dist
+python3 scripts/python_package_test.py --dist dist
+```
+
+`scripts/python_package_test.py` installs the wheel and sdist in clean
+virtualenvs and checks imports, metadata, and sdist contents. CI runs the same
+build test.
+
+Publication is manual and never triggered by a `v*` tag. Use **Actions →
+Python package → Run workflow**:
+
+1. Configure a PyPI trusted publisher for the `nonodb-client` project:
+   owner `essmos`, repository `nonodb`, workflow `pypi.yml`, environment `pypi`.
+2. Run the workflow once with `publish=false` to build and test both artifacts.
+3. Run it again with `publish=true` only after the result is approved.
+
+The publish job uses OpenID Connect (`id-token: write`) and
+`pypa/gh-action-pypi-publish`; no PyPI API token secret is stored in the
+repository. The build job uses `twine check --strict` before upload. If an
+attempt fails before PyPI accepts any file, rerun the workflow. Once a version
+exists on PyPI, files cannot be replaced: bump the version, rebuild, and publish
+the new version instead.
+
 ### Re-running a release
 
 If the GitHub Release already exists, the workflow uploads the newly built

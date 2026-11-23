@@ -16,18 +16,23 @@ Python, curl, the CLI, and any future language client all see the same behavior.
 - Optional: [`orjson`](https://github.com/ijson/ijson) for faster JSON encoding
   and decoding
 
-The client is a single module, not yet published on PyPI. Add the `client`
-directory to your import path or vendor `nonodb.py` into your project:
+The client is packaged as `nonodb-client`. From a repository checkout:
+
+```bash
+python3 -m pip install ./client          # runtime dependency: httpx
+python3 -m pip install "./client[speed]" # adds orjson
+```
+
+For editable development or vendoring, add the `client` directory to your
+import path instead:
 
 ```bash
 export PYTHONPATH="/path/to/nonodb/client:$PYTHONPATH"
+python3 -m pip install httpx
 ```
 
-Install dependencies with your package manager, for example:
-
-```bash
-pip install httpx orjson
-```
+After the package is published to PyPI, the equivalent commands are
+`pip install nonodb-client` and `pip install "nonodb-client[speed]"`.
 
 ## Connecting
 
@@ -1043,6 +1048,21 @@ workers, one database owner.
 concurrent requests and the cache has its own lock. For simplicity and
 predictable connection behavior, many applications create one client per
 worker process or per thread.
+
+## Building the distribution
+
+The package metadata is in `client/pyproject.toml`. Build and verify a wheel and
+sdist from the repository root:
+
+```bash
+python3 -m pip install build
+python3 -m build client --outdir dist
+python3 scripts/python_package_test.py --dist dist
+```
+
+The test installs both the wheel and the sdist in clean virtualenvs, checks the
+imported version and metadata, and validates the sdist contents. Maintainer publication steps are separate and
+manual; see [Development](development.md#python-package).
 
 ## Complete example
 

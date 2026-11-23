@@ -1,6 +1,6 @@
 # nonodb clients
 
-- [Python](nonodb.py) — sync client with optional cache, retries, and FastAPI example; `AsyncNonoDB` covers async watch/streams.
+- [Python](nonodb.py) — packaged as `nonodb-client`; sync client with optional cache, retries, and FastAPI example; `AsyncNonoDB` covers async watch/streams.
 - [Rust](../nonodb-client) — sync crate using `reqwest`; Unix socket or TCP/TLS.
 - [Node.js](node) — zero-dependency async client; Unix socket or TCP/TLS.
 - [Go](go) — context-aware client; Unix socket or TCP/TLS.

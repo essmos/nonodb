@@ -232,7 +232,8 @@ comparison and practical migration caveats.
   multi-document transactions, change streams, collation, or full MongoDB
   feature parity.
 - The supported API is HTTP/JSON; no gRPC, binary framing, or CBOR API.
-- The Python client is a single module, not a published package.
+- The Python client is a single module. Its `nonodb-client` wheel and sdist are
+  prepared, but PyPI publication is a separate manually approved step.
 - The CLI covers common administration, not every possible operation.
 
 ### Security

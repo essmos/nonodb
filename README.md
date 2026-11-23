@@ -575,12 +575,12 @@ curl -s --unix-socket "$NONODB_SOCK" -H 'content-type: application/json' \
   -d '{"op":"find","coll":"users","filter":{"age":{"$gte":18}},"sort":[["age",-1]]}'
 ```
 
-Use the optional Python client. It is not included in the binary archive, so
-clone the repository once and point `PYTHONPATH` at its `client` directory:
+Use the optional Python client. It is not included in the binary archive. The
+repository packages it as `nonodb-client`; install it from a checkout:
 
 ```bash
 git clone --depth 1 https://github.com/essmos/nonodb.git
-export PYTHONPATH="$PWD/nonodb/client"
+python3 -m pip install ./nonodb/client
 python3 - <<'PY'
 from nonodb import NonoDB
 

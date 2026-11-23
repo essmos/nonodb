@@ -84,6 +84,13 @@ jobs:
           node --check client/node/smoke_test.js
           node client/node/routing_test.js
 
+      - name: Build and test Python package
+        run: |
+          python3 -m pip install --disable-pip-version-check build
+          rm -rf dist
+          python3 -m build client --outdir dist
+          python3 scripts/python_package_test.py --dist dist
+
       - name: Install Go
         uses: actions/setup-go@v7
         with:
