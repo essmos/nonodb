@@ -479,6 +479,38 @@ func (c *Client) Health(ctx context.Context) bool {
 	return response.StatusCode == http.StatusOK
 }
 
+// Capabilities returns the daemon's public versioned capability document.
+func (c *Client) Capabilities(ctx context.Context) (map[string]any, error) {
+	if c.initErr != nil {
+		return nil, c.initErr
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/v1/capabilities", nil)
+	if err != nil {
+		return nil, err
+	}
+	response, err := c.http.Do(request)
+	if err != nil {
+		return nil, err
+	}
+	defer response.Body.Close()
+	raw, err := io.ReadAll(response.Body)
+	if err != nil {
+		return nil, err
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return nil, &APIError{Code: "http_error", Message: response.Status}
+	}
+	value, err := decodeAny(raw)
+	if err != nil {
+		return nil, err
+	}
+	out, ok := value.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("capabilities: unexpected response type")
+	}
+	return out, nil
+}
+
 func (c *Client) dataPath(path string) string {
 	if c.database == "" || c.database == "default" {
 		return path

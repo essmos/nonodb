@@ -192,6 +192,7 @@ python3 scripts/mongo_portability_check.py --self-test  # static workload checke
 python3 scripts/mongo_wire_limits_test.py   # Mongo wire connection/read limits (spawns a daemon)
 python3 scripts/mongo_wire_auth_test.py     # Mongo wire SCRAM maps to principal scopes and code 13
 python3 scripts/mongo_ddl_test.py           # TTL/sparse DDL translation
+python3 scripts/mongo_ttl_restart_test.py   # TTL index and steps survive daemon restart
 python3 scripts/nonodb_migrate_test.py      # MongoDB -> NonoDB migration and checksums
 python3 scripts/mongo_shadow_test.py        # shadow dual-write and JSONL diff report
 scripts/mongo_drivers_test.sh              # official Node.js and Go MongoDB drivers
@@ -319,7 +320,7 @@ scripts are:
 | `scripts/ttl_test.py` | TTL defaults, overrides, update semantics, sweeper, vault |
 | `scripts/ttl_strict_test.py` | Strict read-time visibility before sweep across find/count/aggregate/SQL/search/cursor/wire |
 | `scripts/ttl_strict_disabled_test.py` | Emergency `NONODB_TTL_STRICT_READS=0` compatibility path |
-| `scripts/ttl_replica_strict_test.py` | Replicated per-document TTL metadata and strict replica reads |
+| `scripts/ttl_replica_strict_test.py` | Replicated per-document TTL metadata, date-field backfill, and strict replica reads |
 | `scripts/vault_test.py` | Vault encryption, tenant isolation, and restricted API |
 | `scripts/vault_regression_test.py` | Vault profiles, headers, filters, CRUD, errors, history |
 | `scripts/history_test.py` | Per-collection history retention, isolation, restart durability, CLI |
@@ -339,6 +340,7 @@ scripts are:
 | `scripts/mongo_portability_check.py` | static MongoDB workload and source compatibility checker |
 | `scripts/mongo_wire_limits_test.py` | MongoDB wire connection limit, idle read timeout, and config validation |
 | `scripts/mongo_wire_auth_test.py` | MongoDB wire SCRAM authentication, principal scopes, and unauthorized code 13 |
+| `scripts/mongo_ttl_restart_test.py` | MongoDB TTL index translation, date-field backfill, and expiry after daemon restart |
 | `scripts/mongo_drivers_test.sh` | official Node.js and Go MongoDB driver compatibility |
 | `scripts/mtls_test.sh` | mTLS with generated CA/certs, all clients, live revocation |
 | `scripts/concurrency_test.py` | Independent writers/readers and unique indexes |

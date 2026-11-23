@@ -2129,6 +2129,7 @@ async fn create_indexes_command(
     let mut specs = Vec::with_capacity(indexes.len());
     let mut text_specs: Vec<nonodb_core::SearchIndexDef> = Vec::new();
     let mut ttl_seconds: Option<u64> = None;
+    let mut ttl_field: Option<String> = None;
     for item in indexes {
         let Bson::Document(spec) = item else {
             return Err(bad_value("index specification must be a document"));
@@ -2313,6 +2314,7 @@ async fn create_indexes_command(
                     "only one TTL index is supported per collection by NonoDB",
                 ));
             }
+            ttl_field = fields.first().cloned();
         }
         let default_name = default_parts.join("_");
         let name = spec.get_str("name").unwrap_or(&default_name);
@@ -2391,12 +2393,13 @@ async fn create_indexes_command(
             return Err(error);
         }
     }
-    if let Some(ttl_seconds) = ttl_seconds {
+    if let (Some(ttl_seconds), Some(field)) = (ttl_seconds, ttl_field) {
         let (_, response) = super::submit_write(
             &runtime,
-            WriteReq::SetCollectionTtl {
-                coll: collection,
-                ttl_seconds: Some(ttl_seconds),
+            WriteReq::SetCollectionTtlAfter {
+                coll: collection.clone(),
+                field: field.clone(),
+                ttl_seconds,
                 purge_history: None,
             },
             Durability::Full,
@@ -2405,6 +2408,36 @@ async fn create_indexes_command(
         let api = response.0;
         if let Some(error) = api.error {
             return Err(error);
+        }
+
+        let mut after = None;
+        loop {
+            let (_, response) = super::submit_write(
+                &runtime,
+                WriteReq::BackfillCollectionTtl {
+                    coll: collection.clone(),
+                    field: field.clone(),
+                    ttl_seconds,
+                    after,
+                    limit: 1000,
+                    dry_run: false,
+                },
+                Durability::Full,
+            )
+            .await;
+            let api = response.0;
+            if let Some(error) = api.error {
+                return Err(error);
+            }
+            let result = api.result.unwrap_or(Value::Null);
+            let page = result.get("result").cloned().unwrap_or(Value::Null);
+            if page.get("done").and_then(Value::as_bool).unwrap_or(true) {
+                break;
+            }
+            after = page.get("next_after").cloned().filter(|v| !v.is_null());
+            if after.is_none() {
+                break;
+            }
         }
     }
     Ok(bson::doc! {

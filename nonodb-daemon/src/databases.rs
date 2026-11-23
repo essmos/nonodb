@@ -86,6 +86,7 @@ impl Databases {
     pub fn open(root: impl AsRef<Path>) -> Result<Arc<Self>, String> {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(&root).map_err(|e| format!("create data root: {e}"))?;
+        cleanup_dropped(&root);
         migrate_legacy(&root)?;
         let me = Arc::new(Self {
             root,
@@ -307,8 +308,15 @@ impl Databases {
             .join(format!(".dropped-{name}-{}", std::process::id()));
         fs::rename(&path, &trash)
             .map_err(|e| ApiError::internal(format!("drop database rename: {e}")))?;
-        fs::remove_dir_all(&trash)
-            .map_err(|e| ApiError::internal(format!("drop database remove: {e}")))?;
+        // The live directory is already gone. A failed cleanup must not make the
+        // drop look unsuccessful; the next startup will remove the trash.
+        if let Err(error) = fs::remove_dir_all(&trash) {
+            tracing::warn!(
+                path = %trash.display(),
+                error = %error,
+                "deferred removed database cleanup"
+            );
+        }
         Ok(true)
     }
 }
@@ -353,6 +361,30 @@ fn start_runtime(root: &Path, name: &str) -> Result<DatabaseRuntime, String> {
         maintenance: Mutex::new(Some(maintenance)),
         webhooks: Mutex::new(Some(webhooks)),
     })
+}
+
+fn cleanup_dropped(root: &Path) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with(".dropped-") {
+            continue;
+        }
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        if let Err(error) = fs::remove_dir_all(&path) {
+            tracing::warn!(
+                path = %path.display(),
+                error = %error,
+                "failed to clean up removed database directory"
+            );
+        }
+    }
 }
 
 fn migrate_legacy(root: &Path) -> Result<(), String> {
@@ -402,4 +434,46 @@ pub fn validate_name(name: &str) -> Result<(), String> {
         return Err("database name may contain only letters, digits, _ and -".into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_root() -> tempfile::TempDir {
+        tempfile::tempdir().expect("temp dir")
+    }
+
+    #[tokio::test]
+    async fn open_removes_orphaned_dropped_directories() {
+        let dir = temp_root();
+        let trash = dir.path().join(".dropped-old-1234");
+        fs::create_dir_all(&trash).unwrap();
+        fs::write(trash.join("data.mdb"), b"stale").unwrap();
+        fs::write(trash.join("lock.mdb"), b"stale").unwrap();
+
+        let databases = Databases::open(dir.path()).unwrap();
+        assert!(!trash.exists(), "startup cleanup left {}", trash.display());
+        drop(databases);
+    }
+
+    #[tokio::test]
+    async fn drop_removes_database_without_leaving_trash() {
+        let dir = temp_root();
+        let databases = Databases::open(dir.path()).unwrap();
+        databases.create("scratch").await.unwrap();
+        databases.get("scratch").await.unwrap();
+        assert!(databases.drop_database("scratch").await.unwrap());
+
+        assert!(!dir.path().join("scratch").exists());
+        for entry in fs::read_dir(dir.path()).unwrap() {
+            let name = entry.unwrap().file_name();
+            assert!(
+                !name.to_string_lossy().starts_with(".dropped-"),
+                "left trash {}",
+                name.to_string_lossy()
+            );
+        }
+        drop(databases);
+    }
 }

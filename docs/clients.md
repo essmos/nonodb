@@ -771,8 +771,11 @@ All clients expose the common document operations:
 - `create_collection` for explicit standard/vault collection creation, with an
   optional default TTL (`create_collection_with_ttl` in Rust, an optional
   argument in Python/Node.js, `CreateCollectionWithTTL` in Go);
-- `set_collection_ttl`/`get_collection_ttl` for collection TTL defaults and
-  optional history purging on expiry;
+- `set_collection_ttl`/`get_collection_ttl` for insertion-based collection TTL
+  defaults and optional history purging on expiry; the Python client also
+  exposes `set_collection_ttl_after`, `backfill_collection_ttl`, and
+  `get_collection_ttl_field` for date-field TTL;
+- `capabilities` for the public, versioned `/v1/capabilities` document;
 - `insert`, `insert_many`, `find`, `find_one`, `update`, `delete`, `count`;
 - `aggregate` for reporting pipelines, plus transactional `$out`/`$merge`
   write stages;

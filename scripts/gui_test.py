@@ -172,6 +172,10 @@ def main() -> int:
 
             health = json.loads(fetch(base + "/healthz"))
             assert health, health
+            capabilities = json.loads(fetch(base + "/v1/capabilities"))
+            assert capabilities["schema_version"] == 1, capabilities
+            assert capabilities["features"]["ttl"]["date_field"] is True, capabilities
+            assert "server_version" in capabilities, capabilities
             ready = json.loads(fetch(base + "/readyz"))
             assert ready["ok"] is True, ready
             backups = json.loads(fetch(base + "/v1/backups"))

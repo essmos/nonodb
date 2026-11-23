@@ -581,6 +581,32 @@ impl Store {
         format!("ttl_purge:{name}")
     }
 
+    fn ttl_field_key(name: &str) -> String {
+        format!("ttl_field:{name}")
+    }
+
+    fn ttl_field_from_ro(
+        meta: Database<Bytes, Bytes>,
+        rtxn: &RoTxn<'_>,
+        name: &str,
+    ) -> Result<Option<String>> {
+        Ok(meta
+            .get(rtxn, Self::ttl_field_key(name).as_bytes())?
+            .and_then(|b| std::str::from_utf8(b).ok())
+            .map(ToString::to_string))
+    }
+
+    fn ttl_field_from_rw(
+        meta: Database<Bytes, Bytes>,
+        wtxn: &RwTxn<'_>,
+        name: &str,
+    ) -> Result<Option<String>> {
+        Ok(meta
+            .get(wtxn, Self::ttl_field_key(name).as_bytes())?
+            .and_then(|b| std::str::from_utf8(b).ok())
+            .map(ToString::to_string))
+    }
+
     fn ttl_from_ro(
         meta: Database<Bytes, Bytes>,
         rtxn: &RoTxn<'_>,
@@ -759,9 +785,19 @@ impl Store {
             }
         }
         let ttl_default = Self::ttl_from_rw(meta, wtxn, name)?;
+        let ttl_field = Self::ttl_field_from_rw(meta, wtxn, name)?;
         let purge = Self::ttl_purge_from_rw(meta, wtxn, name)?;
         let history = Self::history_from_rw(meta, wtxn, name)?;
-        Ok(self.wrap(name, db, meta, profile, ttl_default, purge, history))
+        Ok(self.wrap(
+            name,
+            db,
+            meta,
+            profile,
+            ttl_default,
+            ttl_field,
+            purge,
+            history,
+        ))
     }
 
     fn validate_ttl(seconds: u64) -> Result<()> {
@@ -822,8 +858,10 @@ impl Store {
                 Self::ttl_key(name).as_bytes(),
                 seconds.to_string().as_bytes(),
             )?;
+            meta.delete(&mut *wtxn, Self::ttl_field_key(name).as_bytes())?;
         } else {
             meta.delete(&mut *wtxn, Self::ttl_key(name).as_bytes())?;
+            meta.delete(&mut *wtxn, Self::ttl_field_key(name).as_bytes())?;
         }
         if let Some(purge) = purge_history {
             if purge {
@@ -833,6 +871,96 @@ impl Store {
             }
         }
         Ok(())
+    }
+
+    /// Sets a date-field TTL, replacing any insertion-based collection TTL.
+    pub fn set_collection_ttl_after(
+        &self,
+        name: &str,
+        field: &str,
+        ttl_seconds: u64,
+        purge_history: Option<bool>,
+    ) -> Result<()> {
+        let mut wtxn = self.write_txn()?;
+        self.set_collection_ttl_after_in(&mut wtxn, name, field, ttl_seconds, purge_history)?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    /// Date-field TTL setter for an existing writer transaction.
+    pub fn set_collection_ttl_after_in(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        name: &str,
+        field: &str,
+        ttl_seconds: u64,
+        purge_history: Option<bool>,
+    ) -> Result<()> {
+        Self::validate_name(name)?;
+        if field.trim().is_empty() {
+            return Err(Error::InvalidTtl("TTL field must not be empty".into()));
+        }
+        let Some(profile) = self.collection_profile_in_rw(wtxn, name)? else {
+            return Err(Error::Query(format!("collection `{name}` does not exist")));
+        };
+        if profile.is_vault() {
+            return Err(Error::Vault {
+                code: "vault_ttl_field_unsupported",
+                message: "date-field TTL is not supported for vault collections".into(),
+            });
+        }
+        Self::validate_ttl(ttl_seconds)?;
+        let meta = self
+            .env
+            .create_database::<Bytes, Bytes>(&mut *wtxn, Some(META_DB))?;
+        meta.put(
+            &mut *wtxn,
+            Self::ttl_key(name).as_bytes(),
+            ttl_seconds.to_string().as_bytes(),
+        )?;
+        meta.put(
+            &mut *wtxn,
+            Self::ttl_field_key(name).as_bytes(),
+            field.as_bytes(),
+        )?;
+        if let Some(purge) = purge_history {
+            if purge {
+                meta.put(&mut *wtxn, Self::ttl_purge_key(name).as_bytes(), b"1")?;
+            } else {
+                meta.delete(&mut *wtxn, Self::ttl_purge_key(name).as_bytes())?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns `(field, seconds)` for a date-field TTL collection.
+    pub fn collection_ttl_after(&self, name: &str) -> Result<Option<(String, u64)>> {
+        let rtxn = self.read_txn()?;
+        let meta = self
+            .env
+            .open_database::<Bytes, Bytes>(&rtxn, Some(META_DB))?
+            .ok_or_else(|| Error::Query("meta database missing".into()))?;
+        let field = Self::ttl_field_from_ro(meta, &rtxn, name)?;
+        let seconds = Self::ttl_from_ro(meta, &rtxn, name)?;
+        rtxn.commit()?;
+        Ok(field.zip(seconds))
+    }
+
+    /// Backfills one page of date-field TTL metadata.
+    #[allow(clippy::too_many_arguments)]
+    pub fn backfill_collection_ttl_in(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        name: &str,
+        field: &str,
+        ttl_seconds: u64,
+        after: Option<&Value>,
+        limit: usize,
+        dry_run: bool,
+    ) -> Result<crate::ttl::BackfillPage> {
+        Self::validate_ttl(ttl_seconds)?;
+        let collection = self.collection_in(wtxn, name)?;
+        collection.backfill_ttl_in(wtxn, field, ttl_seconds, after, limit, dry_run)
     }
 
     /// Returns a collection's default TTL, if any.
@@ -1256,10 +1384,20 @@ impl Store {
                 // the database was opened; otherwise later `db` use fails with EINVAL.
                 let profile = Self::profile_from_ro(meta, &rtxn, name)?;
                 let ttl_default = Self::ttl_from_ro(meta, &rtxn, name)?;
+                let ttl_field = Self::ttl_field_from_ro(meta, &rtxn, name)?;
                 let purge = Self::ttl_purge_from_ro(meta, &rtxn, name)?;
                 let history = Self::history_from_ro(meta, &rtxn, name)?;
                 rtxn.commit()?;
-                return Ok(self.wrap(name, db, meta, profile, ttl_default, purge, history));
+                return Ok(self.wrap(
+                    name,
+                    db,
+                    meta,
+                    profile,
+                    ttl_default,
+                    ttl_field,
+                    purge,
+                    history,
+                ));
             }
             rtxn.commit()?;
         }
@@ -1288,9 +1426,19 @@ impl Store {
         }
         let profile = Self::profile_from_rw(meta, wtxn, name)?;
         let ttl_default = Self::ttl_from_rw(meta, wtxn, name)?;
+        let ttl_field = Self::ttl_field_from_rw(meta, wtxn, name)?;
         let purge = Self::ttl_purge_from_rw(meta, wtxn, name)?;
         let history = Self::history_from_rw(meta, wtxn, name)?;
-        Ok(self.wrap(name, db, meta, profile, ttl_default, purge, history))
+        Ok(self.wrap(
+            name,
+            db,
+            meta,
+            profile,
+            ttl_default,
+            ttl_field,
+            purge,
+            history,
+        ))
     }
 
     /// Opens an **existing** collection in the given read transaction.
@@ -1310,6 +1458,7 @@ impl Store {
             .ok_or_else(|| Error::Query("meta database missing".into()))?;
         let profile = Self::profile_from_ro(meta, rtxn, name)?;
         let ttl_default = Self::ttl_from_ro(meta, rtxn, name)?;
+        let ttl_field = Self::ttl_field_from_ro(meta, rtxn, name)?;
         let purge = Self::ttl_purge_from_ro(meta, rtxn, name)?;
         let history = Self::history_from_ro(meta, rtxn, name)?;
         Ok(Some(self.wrap(
@@ -1318,6 +1467,7 @@ impl Store {
             meta,
             profile,
             ttl_default,
+            ttl_field,
             purge,
             history,
         )))
@@ -1331,6 +1481,7 @@ impl Store {
         meta: Database<Bytes, Bytes>,
         profile: CollectionProfile,
         ttl_default: Option<u64>,
+        ttl_field: Option<String>,
         purge_history: bool,
         history_max_versions: usize,
     ) -> Collection<'e> {
@@ -1345,6 +1496,7 @@ impl Store {
             name.to_string(),
             profile,
             ttl_default,
+            ttl_field,
             purge_history,
             &self.txn_gate,
         )
@@ -1927,6 +2079,7 @@ impl Store {
                 name,
                 profile,
                 ttl_seconds,
+                ttl_field,
                 ttl_purge_history,
             } => {
                 let profile = CollectionProfile::parse(profile)?;
@@ -1937,6 +2090,15 @@ impl Store {
                     *ttl_seconds,
                     *ttl_purge_history,
                 )?;
+                if let (Some(field), Some(seconds)) = (ttl_field.as_deref(), ttl_seconds) {
+                    self.set_collection_ttl_after_in(
+                        wtxn,
+                        name,
+                        field,
+                        *seconds,
+                        *ttl_purge_history,
+                    )?;
+                }
                 Ok(())
             }
             ReplicationOp::CollectionDrop { name } => {
@@ -1945,8 +2107,23 @@ impl Store {
             ReplicationOp::CollectionTtl {
                 coll,
                 ttl_seconds,
+                ttl_field,
                 purge_history,
-            } => self.set_collection_ttl_with_purge_in(wtxn, coll, *ttl_seconds, *purge_history),
+            } => match (ttl_field.as_deref(), ttl_seconds) {
+                (Some(field), Some(seconds)) => {
+                    self.set_collection_ttl_after_in(wtxn, coll, field, *seconds, *purge_history)
+                }
+                _ => {
+                    self.set_collection_ttl_with_purge_in(wtxn, coll, *ttl_seconds, *purge_history)
+                }
+            },
+            ReplicationOp::TtlSet { coll, entries } => {
+                let collection = self.collection_in(wtxn, coll)?;
+                for entry in entries {
+                    collection.set_ttl(wtxn, &entry.id, entry.ttl_at)?;
+                }
+                Ok(())
+            }
             ReplicationOp::CollectionHistory { coll, max_versions } => {
                 self.set_collection_history_in(wtxn, coll, *max_versions)
             }

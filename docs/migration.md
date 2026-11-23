@@ -57,8 +57,9 @@ What the helper does:
   single-field text indexes;
 - preserves `_id` strings and ObjectIds and converts BSON dates, Decimal128,
   binary values, and other supported values to Extended JSON;
-- infers `expireAfterSeconds` as the collection TTL and accepts `sparse` as a
-  compatibility no-op for unique indexes;
+- maps `expireAfterSeconds` to date-field TTL on the indexed field, backfills
+  existing documents, and accepts `sparse` as a compatibility no-op for unique
+  indexes;
 - copies documents in bounded batches, checks source and target counts, and
   compares a SHA-256 content checksum for every collection;
 - writes a JSON report with counts, checksums, translated indexes, TTL values,
@@ -83,10 +84,10 @@ copied. Partial/wildcard indexes and unsupported text/geo forms are skipped with
 a warning in the report. Source authentication is taken from the MongoDB URI;
 never put credentials in the report or commit them.
 
-TTL translation is intentionally approximate: MongoDB expires documents at the
-indexed date plus `expireAfterSeconds`, while NonoDB expires them
-`expireAfterSeconds` after insertion. For date-driven expiry, migrate the date
-into `_ttl` or keep the TTL policy in the application.
+TTL translation matches MongoDB's date-field semantics: a document expires at
+the indexed date plus `expireAfterSeconds`. The helper reports both
+`ttl_seconds` and `ttl_field`, and backfills TTL metadata after copying the
+documents. Documents with a missing or non-date TTL field never expire.
 
 ## Important limits
 

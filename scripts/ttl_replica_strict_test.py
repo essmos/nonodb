@@ -140,7 +140,71 @@ def main() -> int:
         assert call(replica, {"op": "find_one", "coll": coll, "filter": {"_id": "d1"}}) is None
         assert call(replica, {"op": "count", "coll": coll, "filter": {}})["count"] == 0
         assert call(primary, {"op": "find_one", "coll": coll, "filter": {"_id": "d1"}}) is None
-        print("OK: replica strict TTL reads before sweep")
+
+        # Date-field backfill must replicate exact per-document TTL metadata,
+        # not only the collection mode. Insert before selecting the mode so the
+        # documents start without TTL entries, exactly like a migration.
+        date_coll = "repl_ttl_date"
+        call(primary, {"op": "create_collection", "coll": date_coll})
+        now_ms = int(time.time() * 1000)
+        call(
+            primary,
+            {
+                "op": "insert_many",
+                "coll": date_coll,
+                "docs": [
+                    {"_id": "past", "createdAt": {"$date": now_ms - 3_600_000}},
+                    {"_id": "future", "createdAt": {"$date": now_ms + 3_600_000}},
+                    {"_id": "missing"},
+                ],
+            },
+        )
+        wait_for(
+            lambda: call(
+                replica, {"op": "find", "coll": date_coll, "filter": {}}
+            )
+            and len(call(replica, {"op": "find", "coll": date_coll, "filter": {}})) == 3,
+            label="date TTL seed document replication",
+        )
+        assert call(primary, {"op": "find_one", "coll": date_coll, "filter": {"_id": "past"}})
+        call(
+            primary,
+            {
+                "op": "set_collection_ttl_after",
+                "coll": date_coll,
+                "field": "createdAt",
+                "ttl_seconds": 60,
+            },
+        )
+        after = None
+        while True:
+            body = {
+                "op": "backfill_collection_ttl",
+                "coll": date_coll,
+                "field": "createdAt",
+                "ttl_seconds": 60,
+                "limit": 2,
+                "dry_run": False,
+            }
+            if after is not None:
+                body["after"] = after
+            page = call(primary, body)["result"]
+            if page["done"]:
+                break
+            after = page["next_after"]
+        wait_for(
+            lambda: call(
+                replica, {"op": "find_one", "coll": date_coll, "filter": {"_id": "past"}}
+            )
+            is None,
+            label="replica date-field backfill TTL metadata",
+        )
+        assert call(replica, {"op": "find_one", "coll": date_coll, "filter": {"_id": "future"}})
+        assert call(replica, {"op": "find_one", "coll": date_coll, "filter": {"_id": "missing"}})
+        assert call(primary, {"op": "find_one", "coll": date_coll, "filter": {"_id": "past"}}) is None
+        ttl = call(replica, {"op": "get_collection_ttl", "coll": date_coll})
+        assert ttl["ttl_field"] == "createdAt", ttl
+        print("OK: replica strict TTL reads and date-field backfill before sweep")
         return 0
     finally:
         for proc in procs:

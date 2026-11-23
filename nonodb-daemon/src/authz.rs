@@ -123,6 +123,8 @@ pub fn authorize_request(
         | Request::CreateCollection { coll, .. }
         | Request::DropCollection { coll }
         | Request::SetCollectionTtl { coll, .. }
+        | Request::SetCollectionTtlAfter { coll, .. }
+        | Request::BackfillCollectionTtl { coll, .. }
         | Request::SetCollectionHistory { coll, .. }
         | Request::SetCollectionEvents { coll, .. }
         | Request::CreateSubscription { coll, .. }

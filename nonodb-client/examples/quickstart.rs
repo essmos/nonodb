@@ -5,6 +5,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db = Client::from_env()?;
     db.create_collection("users", "standard")?;
     db.set_collection_history("users", 5)?;
+    let capabilities = db.capabilities()?;
+    assert_eq!(capabilities["schema_version"], 1);
+    assert_eq!(capabilities["features"]["ttl"]["date_field"], true);
+
     let users = db.collection("users");
 
     let id = users.insert(&json!({"name": "Ada", "age": 36, "tags": ["db", "rust"]}))?;

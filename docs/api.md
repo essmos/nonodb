@@ -10,6 +10,7 @@ and authorization-management endpoints.
 - Stream endpoint: `POST /v1/watch` (alias for `/default/v1/watch`)
 - Database-scoped stream: `POST /{database}/v1/watch`
 - Health: `GET /healthz`
+- Capabilities: `GET /v1/capabilities` (public, versioned JSON)
 - Metrics: `GET /metrics` (JSON) and `GET /metrics/prometheus` (Prometheus text)
 - Readiness: `GET /readyz`
 - Authorization management: `/v1/auth`, `/v1/auth/principals`, `/v1/auth/tokens`, `/v1/auth/certificates`
@@ -106,8 +107,8 @@ Authorization: Bearer nodb_<kid>_<secret>
 or a registered client certificate (mTLS). If both are supplied, they must
 resolve to the same principal.
 
-`GET /healthz` and `GET /readyz` are public. `/metrics` and
-`/metrics/prometheus` require `metrics:read`, `admin:db`, or `*:*`. Authorization is
+`GET /healthz`, `GET /readyz`, and `GET /v1/capabilities` are public.
+`/metrics` and `/metrics/prometheus` require `metrics:read`, `admin:db`, or `*:*`. Authorization is
 deny-by-default and checked per database/collection; `write_batch` is checked
 per operation. Scopes may be database-qualified, for example
 `read:app1/orders`. Missing credentials return `401`; insufficient scope returns `403` with error
@@ -198,8 +199,10 @@ client timeout with `NONODB_TIMEOUT` or the `timeout=` argument.
 | [`database_stats`](#database_stats) | Record counts and storage estimates per collection |
 | [`create_collection`](#create_collection) | Create a standard or vault collection |
 | [`drop_collection`](#drop_collection) | Drop a collection and its resources |
-| [`set_collection_ttl`](#document-ttl) | Set or clear the default document TTL |
-| [`get_collection_ttl`](#document-ttl) | Read the default document TTL |
+| [`set_collection_ttl`](#document-ttl) | Set or clear insertion-based collection TTL |
+| [`set_collection_ttl_after`](#document-ttl) | Select date-field collection TTL |
+| [`backfill_collection_ttl`](#document-ttl) | Backfill date-field TTL metadata in pages |
+| [`get_collection_ttl`](#document-ttl) | Read collection TTL and mode |
 | [`set_collection_history`](#set_collection_history) | Set per-collection history retention (`0` disables) |
 | [`get_collection_history`](#get_collection_history) | Read per-collection history retention |
 | [`set_collection_events`](#set_collection_events) | Enable/disable automatic collection change events |
@@ -2494,7 +2497,10 @@ TTL is optional. Read visibility is strict by default: a document is hidden
 from reads as soon as its expiry passes. `NONODB_TTL_STRICT_READS=0` restores
 legacy visibility for compatibility.
 
-Collection default:
+NonoDB supports insertion-based TTL (the default) and date-field TTL. An
+explicit `_ttl` document field overrides both.
+
+Collection default (insertion-based):
 
 ```json
 {"op":"create_collection","coll":"sessions","ttl_seconds":86400}
@@ -2507,16 +2513,39 @@ Collection default:
 {"op":"get_collection_ttl","coll":"sessions"}
 ```
 
+Date-field TTL:
+
+```json
+{"op":"set_collection_ttl_after","coll":"sessions","field":"createdAt","ttl_seconds":86400}
+{"op":"backfill_collection_ttl","coll":"sessions","field":"createdAt","ttl_seconds":86400,"after":null,"limit":1000,"dry_run":false}
+```
+
 `set_collection_ttl` response:
 
 ```json
 {"ok":true,"result":{"coll":"sessions","ttl_seconds":3600,"purge_history":false}}
 ```
 
+`set_collection_ttl_after` response:
+
+```json
+{"ok":true,"result":{"coll":"sessions","ttl_seconds":86400,"ttl_field":"createdAt","purge_history":false}}
+```
+
+`backfill_collection_ttl` response:
+
+```json
+{"ok":true,"result":{"coll":"sessions","field":"createdAt","dry_run":false,"result":{"scanned":1000,"updated":998,"cleared":2,"next_after":"s-1000","done":false}}}
+```
+
+Pass `next_after` as `after` until `done` is true. `dry_run: true` does not write
+metadata. Backfill is idempotent, and the written per-document expiry is
+replicated to replicas.
+
 `get_collection_ttl` response:
 
 ```json
-{"ok":true,"result":{"coll":"sessions","ttl_seconds":3600,"purge_history":false}}
+{"ok":true,"result":{"coll":"sessions","ttl_seconds":86400,"ttl_field":"createdAt","purge_history":false}}
 ```
 
 Per-document override:
@@ -2527,14 +2556,19 @@ Per-document override:
 
 Rules:
 
-- `_ttl` overrides the collection default; `_ttl: 0` or `null` disables expiry.
-- A missing `_ttl` inherits the collection default; without either, the
+- `_ttl` overrides the collection default or date-field TTL; `_ttl: 0` or
+  `null` disables expiry.
+- A missing `_ttl` inherits the active collection mode; without either, the
   document does not expire.
+- In date-field mode, only BSON/Extended JSON dates count. Missing, `null`, and
+  non-date values never expire.
 - `ttl_seconds` must be positive. `_ttl` accepts non-negative integers,
   including BSON int32/int64 values through the MongoDB wire listener.
   Negative, fractional, or non-numeric values return `invalid_ttl`.
-- Updates preserve the existing expiry unless the update result contains an
-  explicit `_ttl`. Replacement updates and upserts follow the same rule.
+- With insertion-based TTL, updates preserve the existing expiry unless the
+  update result contains an explicit `_ttl`. In date-field mode, updates
+  recompute expiry from the current date field. Replacement updates and upserts
+  follow the same rule.
 - `$unset` of `_ttl` does not clear an expiry; use `$set` with `0` or `null`.
 - Expiry deletes the document through the normal write path and appends a
   history tombstone when history is enabled. With `purge_history: true`, stored
@@ -2542,8 +2576,9 @@ Rules:
 - Strict read filtering applies to the HTTP API, SQL, search paths, cursors,
   and the MongoDB wire listener. Open cursors and the read cache also respect
   the expiry boundary.
-- TTL works for vault collections; the sweeper deletes the ciphertext without
-  decrypting it.
+- Insertion-based TTL works for vault collections; the sweeper deletes the
+  ciphertext without decrypting it. Date-field TTL is not supported for vault
+  collections.
 
 See [Document TTL](ttl.md) for maintenance, metrics, and operational details.
 
@@ -2799,6 +2834,30 @@ blocks new ones. It only grows the map; shrinking requires an offline restart.
 See [Operations](operations.md#capacity-and-memory).
 
 ## Health and metrics
+
+### GET /v1/capabilities
+
+Public, no authentication. Returns a stable, versioned description of the
+server and its supported features. Clients and migration tools should use
+`schema_version` to select a compatible parser and treat unknown fields as
+additive.
+
+```json
+{
+  "schema_version": 1,
+  "server_version": "0.30.0",
+  "api": {"http_json": true, "mongodb_wire": true, "sql": true},
+  "features": {
+    "search": {"search_all": true, "modes": ["lexical", "fuzzy", "vector", "hybrid"]},
+    "aggregation": {"convert": true, "conversion_aliases": ["$toString", "$toInt"]},
+    "ttl": {"insertion_based": true, "date_field": true, "backfill": true, "strict_reads_default": true},
+    "events": {"watch": true, "webhooks": true}
+  },
+  "limits": {"document_bytes": 1048576, "aggregate_docs": 100000, "search_results": 1000}
+}
+```
+
+The document contains no credentials, keys, tenant data, or document contents.
 
 ### GET /v1/server
 

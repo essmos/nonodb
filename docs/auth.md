@@ -109,7 +109,8 @@ Rules:
   scope. A principal with `read:orders` does not learn that `customers` exists.
 - Database management (`create_database`, `drop_database`, `map_info`,
   `resize_map`, `/metrics`) still requires global `admin:db` or `*:*`.
-- `/healthz` and `/readyz` are public. `/metrics` and `/metrics/prometheus`
+- `/healthz`, `/readyz`, and `/v1/capabilities` are public. `/metrics` and
+  `/metrics/prometheus`
   require `metrics:read`, `admin:db`, or `*:*`.
 - If both a client certificate and a bearer token are used, they must resolve to
   the same principal.

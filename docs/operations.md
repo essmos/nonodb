@@ -250,9 +250,10 @@ value or disable history for write-heavy collections.
 
 ### Document TTL
 
-TTL is configured per collection (`ttl_seconds`) and optionally per document
-with the reserved `_ttl` field. Expiry metadata is stored in the `ttl`
-sub-database and written atomically with the document and its indexes.
+TTL is configured per collection (`ttl_seconds`) or from a date field with
+`set_collection_ttl_after`, and optionally per document with the reserved
+`_ttl` field. Expiry metadata is stored in the `ttl` sub-database and written
+atomically with the document and its indexes.
 
 The maintenance worker submits expiry deletes to the single writer. It processes
 at most `NONODB_TTL_SWEEP_LIMIT` due documents every
@@ -646,7 +647,8 @@ nonodb-cli auth token create app
 - There is no global static token fallback.
 - Deny-by-default; `write` does not imply `read`.
 - `write_batch` is authorized per operation.
-- `/healthz` is public; `/metrics` requires `admin:db`.
+- `/healthz`, `/readyz`, and `/v1/capabilities` are public; `/metrics` requires
+  `admin:db`.
 - Per-collection runtime counters are available through
   `{"op":"get_collection_metrics","coll":"..."}` to principals with
   `read:<collection>`. The full `/metrics` snapshot requires `admin:db`.

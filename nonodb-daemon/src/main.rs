@@ -453,6 +453,7 @@ async fn run_async() -> Result<(), Box<dyn std::error::Error>> {
     let redirect_state = state.clone();
     let app = Router::new()
         .route("/healthz", get(health))
+        .route("/v1/capabilities", get(capabilities))
         .route("/v1/server", get(server))
         .route("/v1/network", get(network_api::view))
         .route(
@@ -562,6 +563,7 @@ async fn run_async() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/watch", post(watch_stream))
         .route("/:database/v1/exec", post(exec))
         .route("/:database/v1/watch", post(watch_stream))
+        .route("/:database/v1/capabilities", get(capabilities))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .layer(axum::middleware::from_fn(http_access_log))
         .layer(axum::middleware::from_fn_with_state(
@@ -1244,6 +1246,11 @@ async fn http_access_log(
 
 async fn health() -> Json<Value> {
     Json(json!({ "ok": true }))
+}
+
+/// Public capability contract used by clients and migration tooling.
+async fn capabilities() -> Json<Value> {
+    Json(server_info::capabilities())
 }
 
 /// Returns the actual listener addresses of this daemon (admin only).
@@ -3528,10 +3535,12 @@ async fn exec_inner(
             let store = state.store.clone();
             let joined = tokio::task::spawn_blocking(move || {
                 let ttl = store.collection_ttl(&coll)?;
+                let ttl_field = store.collection_ttl_after(&coll)?.map(|(field, _)| field);
                 let purge = store.collection_ttl_purge(&coll)?;
                 Ok::<Value, ApiError>(json!({
                     "coll": coll,
                     "ttl_seconds": ttl,
+                    "ttl_field": ttl_field,
                     "purge_history": purge,
                 }))
             });
@@ -3835,6 +3844,32 @@ async fn exec_inner(
                     coll,
                     ttl_seconds,
                     purge_history,
+                },
+                Request::SetCollectionTtlAfter {
+                    coll,
+                    field,
+                    ttl_seconds,
+                    purge_history,
+                } => WriteReq::SetCollectionTtlAfter {
+                    coll,
+                    field,
+                    ttl_seconds,
+                    purge_history,
+                },
+                Request::BackfillCollectionTtl {
+                    coll,
+                    field,
+                    ttl_seconds,
+                    after,
+                    limit,
+                    dry_run,
+                } => WriteReq::BackfillCollectionTtl {
+                    coll,
+                    field,
+                    ttl_seconds,
+                    after,
+                    limit: limit.unwrap_or(1000).clamp(1, 10_000),
+                    dry_run: dry_run.unwrap_or(false),
                 },
                 Request::SetCollectionHistory { coll, max_versions } => {
                     WriteReq::SetCollectionHistory { coll, max_versions }

@@ -157,7 +157,8 @@ The `ttl` sub-database stores expiry metadata separately from documents. It has
 two key families in one named database: an expiry-ordered index
 (`e + expire_ms + collection + _id`) for the sweeper and a direct
 collection/`_id` lookup (`i + collection + _id`) for updates and deletes.
-Collection defaults live in `meta` as `ttl:<name>`. TTL entries are written in
+Collection defaults live in `meta` as `ttl:<name>`; date-field TTL also stores
+`ttl_field:<name>`. TTL entries are written in
 the same transaction as the document, indexes, and history. See
 [Document TTL](ttl.md).
 

@@ -489,6 +489,7 @@ pub struct Collection<'e> {
     name: String,
     profile: CollectionProfile,
     ttl_default_seconds: Option<u64>,
+    ttl_field: Option<String>,
     ttl_purge_history: bool,
     strict_reads: bool,
     env: &'e Env,
@@ -534,6 +535,7 @@ impl<'e> Collection<'e> {
         name: String,
         profile: CollectionProfile,
         ttl_default_seconds: Option<u64>,
+        ttl_field: Option<String>,
         ttl_purge_history: bool,
         txn_gate: &'e crate::store::TxnGate,
     ) -> Self {
@@ -547,6 +549,7 @@ impl<'e> Collection<'e> {
             name,
             profile,
             ttl_default_seconds,
+            ttl_field,
             ttl_purge_history,
             strict_reads: strict_reads_enabled(),
             env,
@@ -630,7 +633,7 @@ impl<'e> Collection<'e> {
         }
     }
 
-    fn set_ttl(&self, wtxn: &mut RwTxn<'_>, id: &str, at: Option<u64>) -> Result<()> {
+    pub(crate) fn set_ttl(&self, wtxn: &mut RwTxn<'_>, id: &str, at: Option<u64>) -> Result<()> {
         ttl::set_entry(&self.ttl_db, wtxn, &self.name, id, at)
     }
 
@@ -706,9 +709,81 @@ impl<'e> Collection<'e> {
         self.ttl_default_seconds
     }
 
+    /// Date field used for TTL, if the collection uses date-based TTL.
+    pub fn ttl_field(&self) -> Option<&str> {
+        self.ttl_field.as_deref()
+    }
+
     /// Whether TTL expiry purges stored history instead of appending a tombstone.
     pub fn ttl_purge_history(&self) -> bool {
         self.ttl_purge_history
+    }
+
+    fn ttl_field_pair(&self) -> Option<(&str, u64)> {
+        self.ttl_field.as_deref().zip(self.ttl_default_seconds)
+    }
+
+    /// Backfills `_ttl` metadata from a date field in one bounded page.
+    pub fn backfill_ttl_in(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        field: &str,
+        seconds: u64,
+        after: Option<&Value>,
+        limit: usize,
+        dry_run: bool,
+    ) -> Result<ttl::BackfillPage> {
+        let limit = limit.clamp(1, 10_000);
+        let filter = match after {
+            Some(after) => serde_json::json!({"_id": {"$gt": after}}),
+            None => serde_json::json!({}),
+        };
+        // Scan stored documents directly: a document hidden by an older TTL
+        // must still be backfilled when the collection switches to date-field
+        // semantics.
+        let mut docs: Vec<Value> = Vec::with_capacity(limit);
+        for item in self.db.iter(wtxn)? {
+            let (_key, bytes) = item?;
+            let doc = parse_json(bytes)?;
+            if !matches(&doc, &filter) {
+                continue;
+            }
+            docs.push(doc);
+            if docs.len() >= limit {
+                break;
+            }
+        }
+        let mut updated = 0u64;
+        let mut cleared = 0u64;
+        let mut next_after = None;
+        let mut entries = Vec::with_capacity(docs.len());
+        for doc in &docs {
+            let Some(id) = doc.get("_id").and_then(id::key_from_value) else {
+                continue;
+            };
+            let at = ttl::expiry_from_field(doc, field, seconds)?;
+            if at.is_some() {
+                updated += 1;
+            } else {
+                cleared += 1;
+            }
+            if !dry_run {
+                self.set_ttl(wtxn, &id, at)?;
+                entries.push(ttl::BackfillEntry {
+                    id: id.clone(),
+                    ttl_at: at,
+                });
+            }
+            next_after = doc.get("_id").cloned();
+        }
+        Ok(ttl::BackfillPage {
+            scanned: docs.len() as u64,
+            updated,
+            cleared,
+            next_after,
+            done: docs.len() < limit,
+            entries,
+        })
     }
 
     // ----------------------------- indexes -----------------------------
@@ -4466,7 +4541,11 @@ impl<'e> Collection<'e> {
     /// Inserts a document in the given transaction. Assigns `_id` (UUID v4) if missing.
     pub fn insert_one_txn(&self, wtxn: &mut RwTxn<'_>, mut doc: Value) -> Result<String> {
         self.ensure_standard()?;
-        let ttl_at = ttl::take_insert_ttl(&mut doc, self.ttl_default_seconds)?;
+        let ttl_at = ttl::take_insert_ttl_with_field(
+            &mut doc,
+            self.ttl_default_seconds,
+            self.ttl_field_pair(),
+        )?;
         date::normalize_document(&mut doc)?;
         numeric::normalize_document(&mut doc)?;
         bson_types::normalize_document(&mut doc)?;
@@ -4699,7 +4778,7 @@ impl<'e> Collection<'e> {
         let old_ttl = self.ttl_at(&*wtxn, &id)?;
         let mut new = old.clone();
         apply_with_options(&mut new, update, filter, array_filters)?;
-        let ttl_at = match ttl::take_update_ttl(&mut new)? {
+        let ttl_at = match ttl::take_update_ttl_with_field(&mut new, self.ttl_field_pair())? {
             TtlUpdate::Preserve => old_ttl,
             TtlUpdate::Clear => None,
             TtlUpdate::Set(at) => Some(at),
@@ -5160,7 +5239,11 @@ impl<'e> Collection<'e> {
         if self.db.get(&*wtxn, id.as_bytes())?.is_some() {
             return Err(Error::DuplicateKey(id));
         }
-        let ttl_at = ttl::take_insert_ttl(&mut doc, self.ttl_default_seconds)?;
+        let ttl_at = ttl::take_insert_ttl_with_field(
+            &mut doc,
+            self.ttl_default_seconds,
+            self.ttl_field_pair(),
+        )?;
         date::normalize_document(&mut doc)?;
         numeric::normalize_document(&mut doc)?;
         bson_types::normalize_document(&mut doc)?;
@@ -5275,7 +5358,7 @@ impl<'e> Collection<'e> {
         let old_ttl = self.ttl_at(&*wtxn, &id)?;
         let mut new = old.clone();
         apply_with_options(&mut new, update, filter, array_filters)?;
-        let ttl_at = match ttl::take_update_ttl(&mut new)? {
+        let ttl_at = match ttl::take_update_ttl_with_field(&mut new, self.ttl_field_pair())? {
             TtlUpdate::Preserve => old_ttl,
             TtlUpdate::Clear => None,
             TtlUpdate::Set(at) => Some(at),
@@ -5531,6 +5614,7 @@ impl<'e> Collection<'e> {
             0,
             EVENTS_COLLECTION.to_string(),
             crate::vault::CollectionProfile::Standard,
+            None,
             None,
             false,
             self.txn_gate,
@@ -12420,6 +12504,30 @@ mod tests {
             .unwrap();
         assert_eq!(out[0]["let_group"], json!([{"_id": "a", "n": 1}]));
         assert_eq!(out[1]["let_group"], json!([{"_id": "c", "n": 1}]));
+
+        let out = orders
+            .aggregate(&[
+                json!({"$match": {"_id": "o1"}}),
+                json!({"$lookup": {
+                    "from": "lookup_items",
+                    "let": {"wanted": "$sku"},
+                    "pipeline": [
+                        {"$match": {"$expr": {"$eq": ["$sku", "$$wanted"]}}},
+                        {"$project": {
+                            "_id": 0,
+                            "name": 1,
+                            "label": {"$convert": {"input": "$name", "to": "string"}},
+                            "code": {"$toString": "$sku"}
+                        }}
+                    ],
+                    "as": "converted"
+                }}),
+            ])
+            .unwrap();
+        assert_eq!(
+            out[0]["converted"],
+            json!([{"name": "A", "label": "A", "code": "a"}])
+        );
 
         let out = orders
             .aggregate(&[

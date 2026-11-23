@@ -589,6 +589,12 @@ class NonoDB:
             return False
         return resp.status_code == 200 and resp.json().get("ok") is True
 
+    def capabilities(self) -> dict[str, Any]:
+        """Returns the daemon's public, versioned capability document."""
+        resp = self._http.get(self.base_url + "/v1/capabilities")
+        resp.raise_for_status()
+        return resp.json()
+
     def map_info(self) -> dict[str, Any]:
         """Current LMDB map size, high-water mark, and page size."""
         return self.exec({"op": "map_info"})
@@ -692,9 +698,85 @@ class NonoDB:
             req["purge_history"] = purge_history
         return self.exec(req)
 
+    def set_collection_ttl_after(
+        self,
+        name: str,
+        field: str,
+        ttl_seconds: int,
+        purge_history: bool | None = None,
+    ) -> dict[str, Any]:
+        """Expires documents at `field + ttl_seconds` using a date field.
+
+        Missing or non-date fields never expire. An explicit `_ttl` document
+        field still overrides the collection field.
+        """
+        req: dict[str, Any] = {
+            "op": "set_collection_ttl_after",
+            "coll": name,
+            "field": field,
+            "ttl_seconds": ttl_seconds,
+        }
+        if purge_history is not None:
+            req["purge_history"] = purge_history
+        return self.exec(req)
+
+    def backfill_collection_ttl(
+        self,
+        name: str,
+        field: str,
+        ttl_seconds: int,
+        after: Any | None = None,
+        limit: int = 1000,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Backfills one page of date-field TTL metadata.
+
+        Repeat with `after=result["result"]["next_after"]` until
+        `result["result"]["done"]` is true, or use `backfill_collection_ttl_all`.
+        """
+        req: dict[str, Any] = {
+            "op": "backfill_collection_ttl",
+            "coll": name,
+            "field": field,
+            "ttl_seconds": ttl_seconds,
+            "limit": limit,
+            "dry_run": dry_run,
+        }
+        if after is not None:
+            req["after"] = after
+        return self.exec(req)
+
+    def backfill_collection_ttl_all(
+        self,
+        name: str,
+        field: str,
+        ttl_seconds: int,
+        limit: int = 1000,
+        dry_run: bool = False,
+    ) -> dict[str, int]:
+        """Runs all date-field TTL backfill pages and returns aggregate counts."""
+        after = None
+        totals = {"scanned": 0, "updated": 0, "cleared": 0}
+        while True:
+            response = self.backfill_collection_ttl(
+                name, field, ttl_seconds, after=after, limit=limit, dry_run=dry_run
+            )
+            page = response["result"]
+            for key in totals:
+                totals[key] += int(page[key])
+            if page["done"]:
+                return totals
+            after = page["next_after"]
+            if after is None:
+                return totals
+
     def get_collection_ttl(self, name: str) -> int | None:
         """Returns the collection default TTL in seconds, or `None`."""
         return self.exec({"op": "get_collection_ttl", "coll": name})["ttl_seconds"]
+
+    def get_collection_ttl_field(self, name: str) -> str | None:
+        """Returns the date field for date-based TTL, or `None`."""
+        return self.exec({"op": "get_collection_ttl", "coll": name})["ttl_field"]
 
     def set_collection_history(self, name: str, max_versions: int) -> dict[str, Any]:
         """Sets per-collection revision history retention. `0` disables it."""

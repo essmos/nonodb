@@ -73,7 +73,9 @@ history, exact-revision helpers, and aggregation.
 
 Collection defaults and per-document `_ttl` overrides are available through
 the normal API and the Python `db.create_collection(..., ttl_seconds=...)`,
-`set_collection_ttl`, and `get_collection_ttl` helpers. See
+`set_collection_ttl`, and `get_collection_ttl` helpers. The Python client also
+exposes `set_collection_ttl_after`, `backfill_collection_ttl`, and
+`get_collection_ttl_field` for date-field TTL. See
 [Document TTL](../docs/ttl.md).
 
 ## Vault collections

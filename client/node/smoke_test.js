@@ -6,6 +6,9 @@ const { NonoDB } = require('./index');
 async function main() {
   const db = new NonoDB();
   assert.equal(await db.health(), true, 'daemon is not healthy');
+  const capabilities = await db.capabilities();
+  assert.equal(capabilities.schema_version, 1);
+  assert.equal(capabilities.features.ttl.date_field, true);
 
   const name = `node_client_test_${Date.now()}`;
   await db.createCollection(name);

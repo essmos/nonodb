@@ -7,9 +7,10 @@
 use std::cmp::Ordering;
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BinaryHeap, HashSet};
+use std::str::FromStr;
 use std::sync::Arc;
 
-use bigdecimal::num_traits::Zero;
+use bigdecimal::num_traits::{ToPrimitive, Zero};
 use bigdecimal::{BigDecimal, FromPrimitive};
 use rand::seq::SliceRandom;
 use serde_json::{Map, Value};
@@ -3192,6 +3193,247 @@ pub(crate) fn eval_expr_vars(
     }
 }
 
+fn object_id_hex(value: &Value) -> Option<String> {
+    let id = bson_types::parse_object_id(value)?;
+    let encoded = bson_types::object_id_value(id);
+    encoded
+        .get(bson_types::OBJECT_ID_KEY)
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+}
+
+fn value_to_string(value: &Value) -> Result<String> {
+    if let Value::String(text) = value {
+        return Ok(text.clone());
+    }
+    if let Value::Bool(flag) = value {
+        return Ok(flag.to_string());
+    }
+    if let Value::Number(number) = value {
+        return Ok(number.to_string());
+    }
+    if let Some(ms) = date::parse_value(value) {
+        return format_date(date_from_millis(ms)?, "%Y-%m-%dT%H:%M:%S.%LZ");
+    }
+    if let Some(hex) = object_id_hex(value) {
+        return Ok(hex);
+    }
+    if numeric::is_numeric(value) {
+        if let Some(obj) = value.as_object() {
+            for key in [
+                numeric::NUMBER_INT_KEY,
+                numeric::NUMBER_LONG_KEY,
+                numeric::NUMBER_DOUBLE_KEY,
+                numeric::NUMBER_DECIMAL_KEY,
+            ] {
+                if let Some(Value::String(text)) = obj.get(key) {
+                    return Ok(text.clone());
+                }
+            }
+        }
+        if let Some(decimal) = numeric::as_bigdecimal(value) {
+            return Ok(decimal.to_string());
+        }
+    }
+    Err(Error::Query(format!(
+        "$convert cannot convert {} to string",
+        bson_types::type_name(value).unwrap_or("value")
+    )))
+}
+
+fn value_to_integer(value: &Value, target: &str) -> Result<i128> {
+    let result = if let Some(flag) = value.as_bool() {
+        i128::from(flag)
+    } else if let Some(text) = value.as_str() {
+        text.parse::<i128>()
+            .map_err(|_| Error::Query(format!("$convert cannot parse `{text}` as {target}")))?
+    } else if let Some(decimal) = numeric::as_bigdecimal(value) {
+        decimal
+            .to_i128()
+            .ok_or_else(|| Error::Query(format!("$convert value is out of {target} range")))?
+    } else {
+        return Err(Error::Query(format!(
+            "$convert cannot convert {} to {target}",
+            bson_types::type_name(value).unwrap_or("value")
+        )));
+    };
+    Ok(result)
+}
+
+fn value_to_bool(value: &Value) -> Result<bool> {
+    if let Some(flag) = value.as_bool() {
+        return Ok(flag);
+    }
+    if let Some(text) = value.as_str() {
+        return match text.to_ascii_lowercase().as_str() {
+            "true" => Ok(true),
+            "false" => Ok(false),
+            _ => Err(Error::Query(format!(
+                "$convert cannot parse `{text}` as bool"
+            ))),
+        };
+    }
+    if let Some(number) = numeric::as_f64(value) {
+        return Ok(number != 0.0);
+    }
+    Err(Error::Query(format!(
+        "$convert cannot convert {} to bool",
+        bson_types::type_name(value).unwrap_or("value")
+    )))
+}
+
+fn value_to_decimal(value: &Value) -> Result<Value> {
+    let decimal = if let Some(flag) = value.as_bool() {
+        BigDecimal::from(u8::from(flag))
+    } else if let Some(text) = value.as_str() {
+        BigDecimal::from_str(text)
+            .map_err(|_| Error::Query(format!("$convert cannot parse `{text}` as decimal")))?
+    } else {
+        numeric::as_bigdecimal(value).ok_or_else(|| {
+            Error::Query(format!(
+                "$convert cannot convert {} to decimal",
+                bson_types::type_name(value).unwrap_or("value")
+            ))
+        })?
+    };
+    numeric::decimal_value(&decimal)
+}
+
+fn convert_value(value: &Value, target: &str) -> Result<Value> {
+    match target.to_ascii_lowercase().as_str() {
+        "string" => value_to_string(value).map(Value::String),
+        "int" => {
+            let n = value_to_integer(value, "int")?;
+            let n = i32::try_from(n)
+                .map_err(|_| Error::Query("$convert value is out of int range".into()))?;
+            Ok(Value::from(n))
+        }
+        "long" => {
+            let n = value_to_integer(value, "long")?;
+            let n = i64::try_from(n)
+                .map_err(|_| Error::Query("$convert value is out of long range".into()))?;
+            Ok(Value::from(n))
+        }
+        "double" => {
+            let n = if let Some(flag) = value.as_bool() {
+                f64::from(u8::from(flag))
+            } else if let Some(text) = value.as_str() {
+                text.parse::<f64>().map_err(|_| {
+                    Error::Query(format!("$convert cannot parse `{text}` as double"))
+                })?
+            } else {
+                numeric::as_f64(value).ok_or_else(|| {
+                    Error::Query(format!(
+                        "$convert cannot convert {} to double",
+                        bson_types::type_name(value).unwrap_or("value")
+                    ))
+                })?
+            };
+            Ok(Value::from(n))
+        }
+        "decimal" => value_to_decimal(value),
+        "bool" => value_to_bool(value).map(Value::Bool),
+        "date" => {
+            if date::is_date(value) {
+                return Ok(value.clone());
+            }
+            if let Some(text) = value.as_str() {
+                let ms = date::parse_rfc3339_ms(text).ok_or_else(|| {
+                    Error::Query(format!("$convert cannot parse `{text}` as date"))
+                })?;
+                return Ok(date::canonical(ms));
+            }
+            if let Some(ms) = numeric::as_f64(value).filter(|v| v.is_finite()) {
+                return Ok(date::canonical(ms.trunc() as i64));
+            }
+            Err(Error::Query(format!(
+                "$convert cannot convert {} to date",
+                bson_types::type_name(value).unwrap_or("value")
+            )))
+        }
+        "objectid" => {
+            if bson_types::is_object_id(value) {
+                return Ok(value.clone());
+            }
+            if let Some(text) = value.as_str() {
+                if text.len() == 24 && text.chars().all(|c| c.is_ascii_hexdigit()) {
+                    return Ok(serde_json::json!({ bson_types::OBJECT_ID_KEY: text }));
+                }
+            }
+            Err(Error::Query(format!(
+                "$convert cannot convert {} to objectId",
+                bson_types::type_name(value).unwrap_or("value")
+            )))
+        }
+        other => Err(Error::Query(format!(
+            "unsupported $convert target `{other}`"
+        ))),
+    }
+}
+
+fn convert_target(value: &Value) -> Result<String> {
+    if let Some(text) = value.as_str() {
+        return Ok(text.to_string());
+    }
+    if let Some(obj) = value.as_object() {
+        if let Some(text) = obj.get("type").and_then(Value::as_str) {
+            return Ok(text.to_string());
+        }
+    }
+    Err(Error::Query(
+        "$convert requires a string `to` target".into(),
+    ))
+}
+
+fn convert_op(doc: &Value, arg: &Value, vars: &BTreeMap<String, Value>) -> Result<Value> {
+    let Some(obj) = arg.as_object() else {
+        return Err(Error::Query("$convert requires an object".into()));
+    };
+    let Some(input) = obj.get("input") else {
+        return Err(Error::Query("$convert requires `input`".into()));
+    };
+    let Some(to) = obj.get("to") else {
+        return Err(Error::Query("$convert requires `to`".into()));
+    };
+    let target = convert_target(&eval_expr_vars(doc, to, vars)?)?;
+    let input = eval_expr_vars(doc, input, vars)?;
+    if input.is_null() {
+        return match obj.get("onNull") {
+            Some(on_null) => eval_expr_vars(doc, on_null, vars),
+            None => Ok(Value::Null),
+        };
+    }
+    match convert_value(&input, &target) {
+        Ok(value) => Ok(value),
+        Err(_) if obj.contains_key("onError") => {
+            eval_expr_vars(doc, obj.get("onError").expect("checked"), vars)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn convert_alias(
+    doc: &Value,
+    arg: &Value,
+    vars: &BTreeMap<String, Value>,
+    target: &str,
+) -> Result<Value> {
+    let value = if let Value::Array(items) = arg {
+        if items.len() != 1 {
+            return Err(Error::Query(
+                "conversion operator requires one argument".into(),
+            ));
+        }
+        eval_expr_vars(doc, &items[0], vars)?
+    } else {
+        eval_expr_vars(doc, arg, vars)?
+    };
+    if value.is_null() {
+        return Ok(Value::Null);
+    }
+    convert_value(&value, target)
+}
+
 fn eval_operator(
     doc: &Value,
     obj: &Map<String, Value>,
@@ -3219,6 +3461,14 @@ fn eval_operator(
     };
 
     match op.as_str() {
+        "$convert" => convert_op(doc, arg, vars),
+        "$toString" => convert_alias(doc, arg, vars, "string"),
+        "$toInt" => convert_alias(doc, arg, vars, "int"),
+        "$toLong" => convert_alias(doc, arg, vars, "long"),
+        "$toDouble" => convert_alias(doc, arg, vars, "double"),
+        "$toDecimal" => convert_alias(doc, arg, vars, "decimal"),
+        "$toBool" => convert_alias(doc, arg, vars, "bool"),
+        "$toDate" => convert_alias(doc, arg, vars, "date"),
         "$dateAdd" | "$dateSubtract" => date_add_op(doc, arg, vars, op == "$dateSubtract"),
         "$dateDiff" => date_diff_op(doc, arg, vars),
         "$dateTrunc" => date_trunc_op(doc, arg, vars),
@@ -4663,6 +4913,116 @@ mod tests {
         ];
         let out = run(docs, &pipeline, 100).unwrap();
         assert_eq!(out, vec![json!({"x": 4}), json!({"x": 6})]);
+    }
+
+    #[test]
+    fn conversion_expression_operators() {
+        let date = date::canonical(1767225600000);
+        let doc = json!({
+            "n": 4,
+            "f": 3.9,
+            "s": "42",
+            "flag": true,
+            "date": date,
+        });
+        let eval = |expr: Value| eval_expr(&doc, &expr).unwrap();
+
+        assert_eq!(eval(json!({"$toString": "$n"})), json!("4"));
+        assert_eq!(eval(json!({"$toString": "$flag"})), json!("true"));
+        assert_eq!(
+            eval(json!({"$toString": "$date"})),
+            json!("2026-01-01T00:00:00.000Z")
+        );
+        assert_eq!(eval(json!({"$toInt": "$s"})), json!(42));
+        assert_eq!(eval(json!({"$toInt": "$f"})), json!(3));
+        assert_eq!(eval(json!({"$toLong": "$n"})), json!(4));
+        assert_eq!(eval(json!({"$toDouble": "$s"})), json!(42.0));
+        assert_eq!(
+            eval(json!({"$toDecimal": "$s"})),
+            json!({"$numberDecimal": "42"})
+        );
+        assert_eq!(eval(json!({"$toBool": "false"})), json!(false));
+        assert_eq!(eval(json!({"$toDate": "2026-01-01T00:00:00Z"})), date);
+        assert_eq!(
+            eval(json!({"$convert": {
+                "input": "not-a-number",
+                "to": "int",
+                "onError": 7
+            }})),
+            json!(7)
+        );
+        assert_eq!(
+            eval(json!({"$convert": {
+                "input": "$missing",
+                "to": "int",
+                "onNull": 8
+            }})),
+            json!(8)
+        );
+        assert_eq!(
+            eval(json!({"$convert": {
+                "input": "$s",
+                "to": "string"
+            }})),
+            json!("42")
+        );
+        assert!(eval_expr(&doc, &json!({"$convert": {"input": "$n", "to": "nope"}})).is_err());
+    }
+
+    #[test]
+    fn conversion_operators_in_add_fields() {
+        let date = date::canonical(1767225600000);
+        let docs = vec![json!({
+            "_id": "a",
+            "n": 4,
+            "f": 3.9,
+            "s": "42",
+            "flag": true,
+            "date": date,
+        })];
+        let pipeline = vec![json!({
+            "$addFields": {
+                "str": {"$toString": "$n"},
+                "int": {"$toInt": "$f"},
+                "long": {"$toLong": "$n"},
+                "double": {"$toDouble": "$s"},
+                "decimal": {"$toDecimal": "$s"},
+                "bool": {"$toBool": "false"},
+                "date": {"$toDate": "2026-01-01T00:00:00Z"},
+                "converted": {"$convert": {"input": "$s", "to": "int"}},
+                "fallback": {"$convert": {
+                    "input": "not-a-number",
+                    "to": "int",
+                    "onError": 7
+                }},
+                "empty": {"$convert": {
+                    "input": "$missing",
+                    "to": "int",
+                    "onNull": 8
+                }}
+            }
+        })];
+        let out = run(docs, &pipeline, 100).unwrap();
+        assert_eq!(
+            out[0],
+            json!({
+                "_id": "a",
+                "n": 4,
+                "f": 3.9,
+                "s": "42",
+                "flag": true,
+                "date": date,
+                "str": "4",
+                "int": 3,
+                "long": 4,
+                "double": 42.0,
+                "decimal": {"$numberDecimal": "42"},
+                "bool": false,
+                "converted": 42,
+                "fallback": 7,
+                "empty": 8
+            })
+        );
     }
 
     #[test]

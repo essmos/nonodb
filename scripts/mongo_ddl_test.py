@@ -3,7 +3,8 @@
 
 The listener must accept the two common migration options:
 
-- ``expireAfterSeconds`` on a createIndexes entry becomes the collection TTL;
+- ``expireAfterSeconds`` on a createIndexes entry selects date-field TTL on the
+  indexed field and backfills existing documents;
 - ``sparse`` is accepted for a unique index (NonoDB unique indexes already
   behave like ``unique + sparse``).
 
@@ -14,6 +15,7 @@ Run the daemon with a MongoDB listener and a Unix socket, then:
 
 from __future__ import annotations
 
+import datetime as dt
 import os
 import sys
 import uuid
@@ -45,13 +47,29 @@ def main() -> int:
         client.admin.command("ping")
 
         ttl = db[ttl_name]
+        now = dt.datetime.now(dt.timezone.utc)
+        ttl.insert_many(
+            [
+                {"_id": "expired", "createdAt": now - dt.timedelta(hours=1)},
+                {"_id": "live", "createdAt": now + dt.timedelta(hours=1)},
+                {"_id": "missing-date"},
+                {"_id": "not-a-date", "createdAt": "tomorrow"},
+            ]
+        )
         assert (
             ttl.create_index(
-                [("createdAt", 1)], expireAfterSeconds=42, name="created_ttl"
+                [("createdAt", 1)], expireAfterSeconds=1, name="created_ttl"
             )
             == "created_ttl"
         )
-        assert nd.get_collection_ttl(ttl_name) == 42
+        assert nd.get_collection_ttl(ttl_name) == 1
+        assert nd.exec({"op": "get_collection_ttl", "coll": ttl_name})[
+            "ttl_field"
+        ] == "createdAt"
+        assert ttl.find_one({"_id": "expired"}) is None
+        assert ttl.find_one({"_id": "live"}) is not None
+        assert ttl.find_one({"_id": "missing-date"}) is not None
+        assert ttl.find_one({"_id": "not-a-date"}) is not None
 
         sparse = db[sparse_name]
         assert (

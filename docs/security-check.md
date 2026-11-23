@@ -39,6 +39,7 @@ on a loopback TCP port. It removes them when the check finishes.
 | Check | Expected result |
 |---|---|
 | `GET /healthz` without credentials | `200`, public by design |
+| `GET /v1/capabilities` without credentials | `200`, public by design; contains no secrets |
 | `GET /metrics` without credentials | `401` |
 | `POST /v1/exec` without credentials | `401` |
 | `POST /v1/watch` without credentials | `401` |

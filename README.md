@@ -45,7 +45,8 @@ feature gates:
 - **Search built in** — [BM25 full-text search](docs/api.md#full-text-indexes), [fuzzy trigram/Levenshtein search](docs/api.md#fuzzy-indexes), and [exact vector search](docs/api.md#vector-indexes) in the same database.
 - **[Asynchronous webhooks](docs/webhooks.md)** — filtered HTTP delivery with count/sum/avg thresholds, retries, HMAC signing, dead-letter queuing, CLI/API management, and a GUI for deliveries.
 - **SQL when you need it** — [SQL queries and writes](docs/sql.md) alongside the document API, plus a [SQL + JSON playground](docs/gui.md#playground-sql--json) in the GUI, without a separate SQL database.
-- **[TTL at both levels](docs/ttl.md)** — collection defaults and per-document overrides, with immediate read-time hiding.
+- **[TTL at both levels](docs/ttl.md)** — collection defaults, date-field MongoDB TTL, and per-document overrides, with immediate read-time hiding.
+- **Versioned capabilities endpoint** — `GET /v1/capabilities` for clients and migration tools.
 - **[Simple encrypted backups](docs/backup.md#encryption)** — [native or restic backups](docs/backup.md#restic-engine), gzip/age encryption, local/S3/R2 destinations, verification, and restore drills.
 - **[Instant CI database branches](docs/branching.md)** — clone a stopped database or data-only snapshot into an independent, writable database with `nonodb-cli branch`; CoW reflink/clonefile keeps it cheap, sidecars are copied or rebuilt, and the source is never modified.
 - **[Simple backup scheduling](docs/backup.md#scheduled-backups-from-the-daemon-and-gui)** — durable backup jobs configured through the CLI, API, or GUI.
@@ -312,14 +313,19 @@ index compatibility, and limits.
 
 ### Document TTL
 
-- Optional collection default (`ttl_seconds`) and per-document `_ttl` override.
+- Optional insertion-based collection default (`ttl_seconds`) and per-document
+  `_ttl` override.
+- Date-field TTL for MongoDB-compatible `expireAfterSeconds`, with bounded
+  backfill and a MongoDB migration mapping.
 - Expiry metadata is stored outside the document; `_ttl` is not returned by
   reads.
-- Updates preserve the current TTL unless `_ttl` is explicitly set.
+- With insertion-based TTL, updates preserve the current expiry unless `_ttl`
+  is explicitly set. Date-field TTL recalculates from the current date value.
 - Background maintenance sweeps due documents through the single writer.
 - TTL deletes remove index entries and append a history tombstone when history
   is enabled; collections can opt into purging stored revisions instead.
-- Works for standard and vault collections.
+- Insertion-based TTL works for standard and vault collections. Date-field TTL
+  works for standard collections.
 
 ```bash
 curl -s --unix-socket /tmp/nonodb.sock \
@@ -334,7 +340,8 @@ curl -s --unix-socket /tmp/nonodb.sock \
 ```
 
 Expired documents are hidden from reads immediately. See
-[Document TTL](docs/ttl.md) for update semantics, maintenance, and limits.
+[Document TTL](docs/ttl.md) for date-field TTL, update semantics, maintenance,
+and limits.
 
 ### Vault collections (optional encryption)
 
@@ -757,7 +764,7 @@ documentation.
 | [Conditional subscriptions](docs/subscriptions.md) | Persistent conditions over collection state, count thresholds, edge-triggered delivery |
 | [Streaming outbox events](docs/streams.md) | Long-poll `watch`, NDJSON/SSE streams, server-side filters, count thresholds, resume tokens, truncation, client examples |
 | [Vault collections](docs/vault.md) | Optional encrypted tenant data, headers, restrictions, key rotation |
-| [Document TTL](docs/ttl.md) | Collection defaults, per-document expiry, strict read visibility, update semantics, limits |
+| [Document TTL](docs/ttl.md) | Collection defaults, date-field MongoDB TTL, per-document expiry, strict read visibility, update semantics, limits |
 | [Dates and time zones](docs/dates.md) | BSON-compatible dates, RFC 3339 input, filtering, indexes, sorting |
 | [Numbers and decimals](docs/numerics.md) | Exact numeric comparison, Decimal128, arithmetic, NaN/Infinity, index compatibility, long text limits |
 | [BSON scalar types](docs/bson-types.md) | `$numberInt`/`$numberLong`, `$type`, binary/UUID, ObjectId, Timestamp, MinKey/MaxKey, index compatibility |

@@ -181,12 +181,18 @@ assert db.get_collection_ttl("sessions") == 3600
 db.set_collection_ttl("sessions", None)   # clear the default
 db.set_collection_ttl("sessions", 3600, purge_history=True)
 
+# Date-field TTL, matching MongoDB expireAfterSeconds:
+db.set_collection_ttl_after("sessions", "createdAt", 86400)
+assert db.get_collection_ttl_field("sessions") == "createdAt"
+db.backfill_collection_ttl_all("sessions", "createdAt", 86400)
+
 sessions = db.collection("sessions")
 sessions.insert({"_id": "s1", "user": 7, "_ttl": 300})  # per-document override
 sessions.update({"_id": "s1"}, {"$set": {"_ttl": 0}})   # disable expiry
 ```
 
-An update without `_ttl` preserves the current expiry. `purge_history=True`
+With insertion-based TTL, an update without `_ttl` preserves the current expiry.
+Date-field TTL recomputes from the current date value. `purge_history=True`
 removes stored revisions when TTL deletes a document instead of appending a
 tombstone. Reads hide an expired document immediately. See
 [Document TTL](ttl.md).
@@ -951,6 +957,7 @@ Common error codes are listed in the [HTTP API](api.md#error-codes).
 
 ```python
 db.health()        # bool
+db.capabilities()  # versioned feature and limit document
 db.collections()   # list[str]
 db.map_info()      # {"map_size": ..., "used_bytes": ..., "page_size": ...}
 db.resize_map(4 * 1024**3)  # grow the map online, returns old/new sizes

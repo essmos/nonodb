@@ -140,6 +140,9 @@ def main() -> None:
 
             # Missing/bad credentials.
             expect_code(lambda: anon.collections(), "unauthorized")
+            capabilities = anon.capabilities()
+            assert capabilities["schema_version"] == 1, capabilities
+            assert capabilities["features"]["ttl"]["date_field"] is True, capabilities
             bad = NonoDB(base_url=url, token="nodb_reader_nope", timeout=10)
             expect_code(lambda: bad.collections(), "unauthorized")
 

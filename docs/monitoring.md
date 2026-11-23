@@ -6,6 +6,7 @@ NonoDB exposes two machine-readable views of the same process-local counters:
 |---|---|---|---|
 | `GET /healthz` | JSON | public | Cheap liveness probe |
 | `GET /readyz` | JSON | public | Writer + LMDB readiness probe |
+| `GET /v1/capabilities` | JSON | public | Versioned feature and limit contract |
 | `GET /metrics` | JSON | `metrics:read`, `admin:db`, or `*:*` | Human/debugging view and existing integrations |
 | `GET /metrics/prometheus` | Prometheus text | `metrics:read`, `admin:db`, or `*:*` | Prometheus, Grafana Agent, VictoriaMetrics, OTel Collector |
 

@@ -17,6 +17,10 @@ func main() {
 	if !db.Health(ctx) {
 		log.Fatal("daemon is not healthy")
 	}
+	capabilities, err := db.Capabilities(ctx)
+	if err != nil || fmt.Sprint(capabilities["schema_version"]) != "1" {
+		log.Fatalf("capabilities: %v %v", capabilities, err)
+	}
 
 	name := fmt.Sprintf("go_client_test_%d", time.Now().UnixNano())
 	if err := db.CreateCollection(ctx, name, "standard"); err != nil {

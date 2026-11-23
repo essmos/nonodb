@@ -72,7 +72,7 @@ local reverse proxy if the nodes require HTTPS.
 
 The server listens on `127.0.0.1` by default. Non-loopback binds require
 `--allow-remote` and should sit behind TLS/auth. It proxies `/v1/exec`, database-scoped
-`/<database>/v1/exec`, `/v1/watch`, `/healthz`, `/metrics`, and replication API
+`/<database>/v1/exec`, `/v1/watch`, `/healthz`, `/v1/capabilities`, `/metrics`, and replication API
 paths to the daemon. The React assets are embedded in the CLI binary. See
 [GUI console](gui.md).
 
@@ -87,6 +87,19 @@ NONODB_SOCK=/tmp/nonodb.sock nonodb-cli ping
 ```json
 {"ok": true}
 ```
+
+## capabilities
+
+Print the daemon's public, versioned capability document. This is useful before
+upgrading clients or migration tooling:
+
+```bash
+NONODB_SOCK=/tmp/nonodb.sock nonodb-cli capabilities
+```
+
+The output includes `schema_version`, `server_version`, feature flags for
+search, aggregation, TTL, events, storage, and migration, plus documented
+limits. No credentials, keys, or tenant data are included.
 
 ## server
 

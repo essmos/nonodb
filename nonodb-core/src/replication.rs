@@ -13,6 +13,7 @@ use serde_json::Value;
 use crate::events::EventConfig;
 use crate::search::{SearchIndexDef, SearchKind};
 use crate::subscriptions::Subscription;
+use crate::ttl::BackfillEntry;
 use crate::vector::VectorMetric;
 
 /// Internal LMDB sub-database for replication records.
@@ -57,6 +58,8 @@ pub enum ReplicationOp {
         name: String,
         profile: String,
         ttl_seconds: Option<u64>,
+        #[serde(default)]
+        ttl_field: Option<String>,
         ttl_purge_history: Option<bool>,
     },
     CollectionDrop {
@@ -65,7 +68,14 @@ pub enum ReplicationOp {
     CollectionTtl {
         coll: String,
         ttl_seconds: Option<u64>,
+        #[serde(default)]
+        ttl_field: Option<String>,
         purge_history: Option<bool>,
+    },
+    /// Exact per-document TTL metadata written by date-field backfill.
+    TtlSet {
+        coll: String,
+        entries: Vec<BackfillEntry>,
     },
     CollectionHistory {
         coll: String,
@@ -280,6 +290,7 @@ mod tests {
                     name: "orders".into(),
                     profile: "standard".into(),
                     ttl_seconds: None,
+                    ttl_field: None,
                     ttl_purge_history: None,
                 },
                 ReplicationOp::CollectionDrop {

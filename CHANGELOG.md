@@ -2,6 +2,25 @@
 
 Full release notes: https://github.com/essmos/nonodb/releases
 
+## Unreleased
+
+- Remove orphaned `.dropped-*` database directories at startup. A failed
+  `remove_dir_all` no longer turns an already-committed database drop into an
+  error.
+- Add aggregation `$convert` with `input`, `to`, `onNull`, and `onError`, plus
+  `$toString`, `$toInt`, `$toLong`, `$toDouble`, `$toDecimal`, `$toBool`, and
+  `$toDate`. `$lookup` pipelines using `let` and these expressions are covered.
+- Add date-field TTL through `set_collection_ttl_after` and idempotent
+  `backfill_collection_ttl` pages. MongoDB `createIndexes` with
+  `expireAfterSeconds` and `scripts/nonodb-migrate.py` now map the indexed date
+  field, backfill existing documents, and preserve the mode across restarts.
+  Backfilled per-document expiry is replicated so replicas hide expired
+  documents before any local sweep. Missing or non-date fields never expire;
+  explicit `_ttl` still overrides.
+- Add public `GET /v1/capabilities` with a versioned schema, feature flags, and
+  limits. Expose it through `nonodb-cli capabilities` and the Python, Node.js,
+  Rust, and Go clients.
+
 ## v0.30.0 - 2026-11-23
 
 - Enforce TTL at read time by default. Expired documents are hidden from find,
@@ -34,8 +53,9 @@ Full release notes: https://github.com/essmos/nonodb/releases
 - Commit MongoDB wire `insert_many` batches in one transaction. Ordered and
   unordered partial-success behavior is preserved when a duplicate forces the
   fallback path.
-- Translate MongoDB `createIndexes` `expireAfterSeconds` into collection TTL and
-  accept `sparse` as a compatibility no-op for unique indexes.
+- Translate MongoDB `createIndexes` `expireAfterSeconds` into insertion-based
+  collection TTL and accept `sparse` as a compatibility no-op for unique
+  indexes.
 - Add `scripts/nonodb-migrate.py` for quiesced MongoDB-to-NonoDB migration with
   index/TTL discovery, Extended JSON conversion, batched inserts, checksums, and
   a JSON report.

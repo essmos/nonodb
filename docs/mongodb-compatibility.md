@@ -33,7 +33,7 @@ release notes identify the exact tested tag.
 | Updates | ~85% | Pipeline updates support a subset of stages |
 | Aggregation stages | ~70% | Many common stages work; system, search, geoNear, and change-stream stages are absent |
 | Aggregation expressions | ~70% | Broad but not exhaustive; no IANA time zones or user-defined JavaScript |
-| Indexes | ~68% | Sparse is accepted as a no-op for unique indexes; TTL indexes map to collection TTL; no partial/wildcard indexes or collation |
+| Indexes | ~68% | Sparse is accepted as a no-op for unique indexes; TTL indexes map to date-field TTL; no partial/wildcard indexes or collation |
 | BSON scalar types | ~75% | ObjectId `_id`, Date, Decimal128, Binary/UUID, Timestamp, MinKey/MaxKey, and numeric mapping |
 | Wire protocol and drivers | ~70% | Documented MongoDB-compatible subset: handshake, CRUD, sorted cursors, count, distinct, aggregate, index DDL, collection DDL, MongoDB-style text indexes and `$text`, dropDatabase, SCRAM auth, and TLS; no sessions or transactions |
 | Transactions and change streams | ~10% | Atomic write batches and outbox events exist, but not MongoDB APIs |
@@ -461,7 +461,7 @@ top-level operators; for an unknown `$expr` operator MongoDB uses
 | Partial indexes | ❌ | |
 | Wildcard indexes | ❌ | |
 | Hidden indexes | ❌ | |
-| TTL indexes | 🟡 | `createIndexes` with `expireAfterSeconds` sets the collection TTL. One TTL index per collection; TTL is insertion-based, not based on the indexed date field. Expired documents are hidden from reads immediately by default |
+| TTL indexes | 🟡 | `createIndexes` with `expireAfterSeconds` selects date-field TTL and backfills existing documents. One TTL index per collection; missing/non-date fields never expire. Expired documents are hidden from reads immediately by default |
 | Per-index/per-query collation | ❌ | |
 | Index hints | ✅ | Find-shaped queries; unusable hints fail instead of falling back |
 | Background index builds | 🟡 | Parallel bounded backfill; not MongoDB's exact build lifecycle |
@@ -540,9 +540,9 @@ A migration from MongoDB to NonoDB should check these items first:
 7. **Sparse/partial/TTL indexes** — `sparse` is accepted as a no-op; a plain
    unique index already has the same behavior, including explicit `null`
    (see [Unique indexes without `sparse`](#unique-indexes-without-sparse)).
-   `expireAfterSeconds` sets the collection TTL, but NonoDB TTL counts from
-   insertion rather than from the indexed date field. Partial indexes still
-   need application-level filtering.
+   `expireAfterSeconds` maps to date-field TTL: documents expire at the indexed
+   date plus the configured seconds, and existing documents are backfilled.
+   Partial indexes still need application-level filtering.
 8. **Stored BSON regex values** — read filters accept driver regex literals, but regex values cannot be stored; keep them out of documents or rewrite them as strings plus `$regex` filters.
 9. **Unsupported aggregation expressions/stages and filter operators** — rewrite
    with supported forms or precompute outside the database. Unknown operators are

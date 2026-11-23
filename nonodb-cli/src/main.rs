@@ -49,6 +49,10 @@ fn run() -> Result<(), String> {
             let res = http_get("/v1/server")?;
             println!("{}", serde_json::to_string_pretty(&res).unwrap());
         }
+        "capabilities" => {
+            let res = http_get("/v1/capabilities")?;
+            println!("{}", serde_json::to_string_pretty(&res).unwrap());
+        }
         "backup-keygen" => {
             let path = PathBuf::from(
                 args.get(1)
@@ -681,6 +685,7 @@ fn usage() -> Result<(), String> {
          gui [--port N] [--no-open]  lokalne GUI w przeglądarce\n\
          ping                       sprawdź daemona\n\
          server                     rzeczywiste adresy nasłuchu (TCP/UDS)\n\
+         capabilities               publiczny opis możliwości serwera (JSON)\n\
          exec '<json>'              dowolne żądanie /v1/exec\n\
          databases [list|create <nazwa>|drop <nazwa>]  bazy w jednym daemonie\n\
          replication [status|changes [after] [limit]|source <url> [dbs] [interval]|pause|resume|disconnect|forget <node>|acks|prune <seq> [--require-acks]|promote <epoch> [--force]|demote <epoch> [role] [successor]|add-replica <name> [dbs]|pairings|revoke <code>|join <primary-url> [code]]\n\

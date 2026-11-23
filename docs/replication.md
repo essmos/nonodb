@@ -102,7 +102,8 @@ Implemented core primitives:
 
 The daemon writer appends ordered logical operations in the same LMDB
 transaction as the data. `changes` carries document payloads; `ops` carries the
-exact order of document, metadata, index, subscription, and outbox operations.
+exact order of document, metadata, TTL, index, subscription, and outbox
+operations.
 Older logs without `ops` still apply document changes sequentially. Vault
 writes remain outside replication. Set `NONODB_REPLICATION_ENABLED=1` and
 `NONODB_REPLICATION_ORIGIN` to enable logging.
@@ -571,8 +572,8 @@ whole topology, including offline members.
 There are three different mechanisms:
 
 1. **Replication log** — every committed write is appended as an ordered set of
-   logical operations: document changes, collection metadata, indexes,
-   subscriptions, and outbox events.
+   logical operations: document changes, collection metadata, per-document TTL
+   metadata, indexes, subscriptions, and outbox events.
 2. **Application events** — when enabled, the primary writes event documents to
    `_events`. Those documents are replicated as `event_append` operations in the
    same transaction. Subscription definitions are replicated as metadata.
@@ -603,7 +604,7 @@ inspection work; client writes are rejected with `read_only`.
 | Collection creation, TTL, history, event settings | Yes | Replicated as ordered metadata operations. |
 | Secondary, text, fuzzy, vector, geo indexes | Yes | Created and backfilled on the replica; subsequent applies maintain them. |
 | Unique index enforcement | Yes | The definition is replicated, so a promoted replica keeps enforcing it. |
-| TTL | Config replicated | Expiry runs on the primary and is replicated as a delete. The replica does not run a local TTL sweeper; after promotion the TTL setting is already present. |
+| TTL | Config and metadata replicated | Insertion and date-field settings replicate. Expiry runs on the primary and is replicated as a delete; date-field backfill replicates exact per-document expiry so strict reads match before any sweep. The replica does not run a local TTL sweeper. |
 | Document history | Yes | Generated locally from replicated before/after values and the replicated history setting. History pruning is paused while read-only and resumes after promotion. |
 | Automatic collection events | Yes | `_events` documents are replicated atomically with the source transaction. |
 | Conditional subscriptions | Yes | Definitions and renewals are replicated; evaluation happens only on the primary. |

@@ -150,7 +150,8 @@ Details:
 | `delete` | ✅ exactly one document, by `_id` |
 | `history` | ✅ with headers; snapshots are decrypted |
 | `get_version` | ✅ with headers; snapshot is decrypted |
-| `set_collection_ttl` / `get_collection_ttl` | ✅ expiry metadata is plaintext |
+| `set_collection_ttl` / `get_collection_ttl` | ✅ insertion-based expiry metadata is plaintext |
+| `set_collection_ttl_after` / `backfill_collection_ttl` | ❌ date-field TTL is not supported for vault collections |
 | `search` | ❌ `unsupported_encrypted_operation` |
 | `fuzzy` | ❌ `unsupported_encrypted_operation` |
 | `aggregate` | ❌ `unsupported_encrypted_operation` |
@@ -276,7 +277,8 @@ read. The history entry is a tombstone and contains no document snapshot.
 
 ## TTL
 
-Vault collections support collection default TTL and the reserved `_ttl` field.
+Vault collections support insertion-based collection default TTL and the
+reserved `_ttl` field. Date-field TTL is not supported for vault collections.
 The document body is encrypted as usual, while the expiry timestamp and
 collection/`_id` remain in the plaintext TTL sub-database. The maintenance
 sweeper deletes an expired vault document without decrypting its envelope. See

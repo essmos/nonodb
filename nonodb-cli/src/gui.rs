@@ -242,6 +242,7 @@ fn handle(
     }
     if plain_path == "/v1/exec"
         || plain_path == "/healthz"
+        || plain_path == "/v1/capabilities"
         || plain_path == "/v1/server"
         || plain_path == "/v1/network"
         || plain_path.starts_with("/v1/network/")
@@ -258,6 +259,7 @@ fn handle(
         || plain_path.starts_with("/v1/replication/")
         || (database_scoped && segments[2] == "replication")
         || (database_scoped && segments[2] == "exec")
+        || (database_scoped && segments[2] == "capabilities")
     {
         return proxy(client, target, &request);
     }

@@ -13,18 +13,27 @@ TTL is supported for both standard and vault collections. For vault
 collections the expiry metadata is plaintext; the document body is never
 decrypted by the sweeper.
 
+NonoDB supports two collection TTL modes:
+
+- **Insertion-based** (the default): each document expires `ttl_seconds` after
+  it is inserted.
+- **Date-field**: each document expires when a date field plus `ttl_seconds`
+  passes. This matches MongoDB TTL indexes.
+
+An explicit `_ttl` document field overrides both modes.
+
 ## MongoDB `expireAfterSeconds`
 
-The MongoDB wire listener accepts a common migration form:
+The MongoDB wire listener accepts the standard MongoDB form:
 
 ```javascript
 db.sessions.createIndex({ createdAt: 1 }, { expireAfterSeconds: 86400 })
 ```
 
-This creates the requested secondary index and sets the collection TTL to
-`86400` seconds. MongoDB applies `expireAfterSeconds` to the indexed date field;
-NonoDB's existing TTL is **insertion-based** and applies to new documents without
-an `_ttl` override. Existing documents keep their current expiry metadata.
+This creates the requested secondary index, switches the collection to
+date-field TTL on `createdAt`, and backfills existing documents in bounded
+batches. A document expires at `createdAt + 86400` seconds. Documents with a
+missing or non-date `createdAt` never expire.
 
 Limits:
 
@@ -32,7 +41,82 @@ Limits:
 - The TTL index must be single-field and cannot be a geo index.
 - `expireAfterSeconds: 0` is rejected because collection TTL must be positive.
 - Dropping the translated index does not clear the collection TTL; use
-  `set_collection_ttl` with `null` if expiry should stop.
+  `set_collection_ttl_after` with another field or `set_collection_ttl` with
+  `null` if expiry should stop.
+
+## Date-field TTL
+
+Use date-field TTL when documents already contain a creation, session, or
+retention timestamp:
+
+```json
+{
+  "op": "set_collection_ttl_after",
+  "coll": "sessions",
+  "field": "createdAt",
+  "ttl_seconds": 86400
+}
+```
+
+The response confirms the selected mode:
+
+```json
+{"ok": true, "result": {"coll": "sessions", "ttl_seconds": 86400, "ttl_field": "createdAt", "purge_history": false}}
+```
+
+`set_collection_ttl_after` does not rewrite existing documents. Backfill TTL
+metadata in bounded pages:
+
+```json
+{
+  "op": "backfill_collection_ttl",
+  "coll": "sessions",
+  "field": "createdAt",
+  "ttl_seconds": 86400,
+  "after": null,
+  "limit": 1000,
+  "dry_run": false
+}
+```
+
+The response contains one page:
+
+```json
+{
+  "ok": true,
+  "result": {
+    "coll": "sessions",
+    "field": "createdAt",
+    "dry_run": false,
+    "result": {"scanned": 1000, "updated": 998, "cleared": 2, "next_after": "s-1000", "done": false}
+  }
+}
+```
+
+Pass `next_after` as `after` until `done` is true. `dry_run: true` reports what
+would change without writing metadata. Backfill is idempotent: rerunning it
+recomputes the same expiry from the date field. The MongoDB wire listener and
+`scripts/nonodb-migrate.py` perform this backfill automatically. Backfilled
+expiry metadata is replicated to replicas, so strict read visibility matches
+the primary before any background cleanup.
+
+`get_collection_ttl` reports the active mode:
+
+```json
+{"ok": true, "result": {"coll": "sessions", "ttl_seconds": 86400, "ttl_field": "createdAt", "purge_history": false}}
+```
+
+Rules:
+
+- The field must contain a BSON/Extended JSON date, for example
+  `{"$date": "2026-01-01T00:00:00Z"}`. Missing, `null`, and non-date values
+  never expire.
+- An explicit `_ttl` on insert or update still overrides date-field TTL.
+- Date-field TTL is not supported for vault collections; use the insertion-based
+  collection default for vault data.
+- Calling `set_collection_ttl` replaces date-field mode with insertion-based
+  TTL. Calling `set_collection_ttl_after` replaces insertion-based mode.
+- Existing date-field metadata is preserved across restart.
 
 ## Collection default
 
@@ -91,7 +175,8 @@ preserves the current setting.
 
 A collection default applies only to documents inserted **after** the default
 is configured. Changing or clearing the default does not rewrite existing
-documents. `ttl_seconds` must be a positive integer.
+documents. `ttl_seconds` must be a positive integer. `set_collection_ttl`
+selects insertion-based TTL and clears any date-field mode.
 
 ## Per-document TTL
 
@@ -108,13 +193,14 @@ Use the reserved top-level `_ttl` field in an inserted document:
 Rules:
 
 - `_ttl` is a non-negative integer number of seconds and overrides the
-  collection default.
+  collection default or date-field TTL.
 - Through the MongoDB wire listener, BSON int32/int64 values such as
   `Int64(30)` are accepted in addition to plain JSON integers.
 - `_ttl: 0` or `_ttl: null` disables expiry for that document, even when the
   collection has a default.
-- If `_ttl` is absent, the collection default applies.
-- If neither is set, the document never expires.
+- If `_ttl` is absent, the active collection mode applies: insertion-based
+  default or date-field TTL.
+- If no mode is active, the document never expires.
 - Negative, fractional, or non-numeric values are rejected with
   `invalid_ttl`.
 - `_ttl` is removed before the document is stored and is not returned by reads.
@@ -122,7 +208,7 @@ Rules:
 
 ## Updates
 
-A normal update preserves the existing expiry:
+With insertion-based TTL, a normal update preserves the existing expiry:
 
 ```json
 {
@@ -145,11 +231,14 @@ Disable expiry:
 {"op": "update", "coll": "sessions", "filter": {"_id": "s1"}, "update": {"$set": {"_ttl": 0}}}
 ```
 
+In date-field mode, an update without `_ttl` recomputes expiry from the current
+value of the date field. Changing the date field moves the expiry; changing it
+to a missing or non-date value clears expiry.
+
 Replacement updates and upserts follow the same rule: an explicit `_ttl` in the
-replacement sets the expiry; otherwise an existing expiry is preserved. A
-document created by an upsert uses the normal insert semantics and therefore
-inherits the collection default. `$unset: {"_ttl": ...}` does not clear an
-expiry; use `$set` with `0` or `null`.
+replacement sets the expiry; otherwise the active collection mode applies. A
+document created by an upsert uses the normal insert semantics. `$unset:
+{"_ttl": ...}` does not clear an expiry; use `$set` with `0` or `null`.
 
 ## Deletion and history
 
@@ -233,5 +322,7 @@ next maintenance sweep after the daemon starts. See
   visibility.
 - `NONODB_TTL_STRICT_READS=0` restores the legacy behavior where reads may
   return a document briefly after expiry.
+- Date-field TTL depends on a valid date in the configured field; other values
+  never expire.
 - TTL is not a substitute for access control or retention compliance. Use normal
   deletes when immediate physical removal is required.

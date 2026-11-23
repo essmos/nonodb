@@ -24,6 +24,9 @@ ITERS = int(os.environ.get("ITERS", "100"))
 
 def main() -> int:
     db = NonoDB(SOCK)
+    capabilities = db.capabilities()
+    assert capabilities["schema_version"] == 1, capabilities
+    assert capabilities["features"]["ttl"]["date_field"] is True, capabilities
     db.create_collection("concurrency")
     db.set_collection_history("concurrency", 5)
     coll = db.collection("concurrency")

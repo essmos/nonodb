@@ -1,5 +1,13 @@
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 
+export interface Capabilities {
+  schema_version: number;
+  server_version: string;
+  api: Record<string, Json>;
+  features: Record<string, Json>;
+  limits: Record<string, Json>;
+}
+
 export interface ClientOptions {
   socketPath?: string;
   baseUrl?: string;
@@ -85,6 +93,7 @@ export class NonoDB {
   constructor(options?: ClientOptions | string);
   close(): void;
   health(): Promise<boolean>;
+  capabilities(): Promise<Capabilities>;
   exec(payload: Record<string, unknown>): Promise<any>;
   collections(): Promise<string[]>;
   createCollection(name: string, profile?: string, ttlSeconds?: number | null, purgeHistory?: boolean | null): Promise<any>;

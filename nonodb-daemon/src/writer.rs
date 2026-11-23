@@ -981,6 +981,7 @@ fn execute(
                 name: coll.clone(),
                 profile: profile.as_str().to_string(),
                 ttl_seconds: *ttl_seconds,
+                ttl_field: None,
                 ttl_purge_history: *ttl_purge_history,
             });
             Ok(json!({
@@ -1004,12 +1005,64 @@ fn execute(
             replication.capture_op(ReplicationOp::CollectionTtl {
                 coll: coll.clone(),
                 ttl_seconds: *ttl_seconds,
+                ttl_field: None,
                 purge_history: *purge_history,
             });
             Ok(json!({
                 "coll": coll,
                 "ttl_seconds": ttl_seconds,
                 "purge_history": purge_history,
+            }))
+        }
+        WriteReq::SetCollectionTtlAfter {
+            coll,
+            field,
+            ttl_seconds,
+            purge_history,
+        } => {
+            store.set_collection_ttl_after_in(wtxn, coll, field, *ttl_seconds, *purge_history)?;
+            replication.capture_op(ReplicationOp::CollectionTtl {
+                coll: coll.clone(),
+                ttl_seconds: Some(*ttl_seconds),
+                ttl_field: Some(field.clone()),
+                purge_history: *purge_history,
+            });
+            Ok(json!({
+                "coll": coll,
+                "ttl_seconds": ttl_seconds,
+                "ttl_field": field,
+                "purge_history": purge_history,
+            }))
+        }
+        WriteReq::BackfillCollectionTtl {
+            coll,
+            field,
+            ttl_seconds,
+            after,
+            limit,
+            dry_run,
+        } => {
+            let mut page = store.backfill_collection_ttl_in(
+                wtxn,
+                coll,
+                field,
+                *ttl_seconds,
+                after.as_ref(),
+                *limit,
+                *dry_run,
+            )?;
+            let entries = std::mem::take(&mut page.entries);
+            if !dry_run && !entries.is_empty() {
+                replication.capture_op(ReplicationOp::TtlSet {
+                    coll: coll.clone(),
+                    entries,
+                });
+            }
+            Ok(json!({
+                "coll": coll,
+                "field": field,
+                "dry_run": dry_run,
+                "result": page,
             }))
         }
         WriteReq::SetCollectionHistory { coll, max_versions } => {

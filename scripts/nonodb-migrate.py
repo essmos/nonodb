@@ -58,6 +58,7 @@ class IndexPlan:
 class CollectionPlan:
     name: str
     ttl_seconds: int | None = None
+    ttl_field: str | None = None
     indexes: list[IndexPlan] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     count: int = 0
@@ -198,10 +199,18 @@ def discover(db: Any, include: set[str], exclude: set[str]) -> list[CollectionPl
             fail(f"collection {name!r}: multiple TTL indexes are not supported")
         if ttl_values:
             plan.ttl_seconds = ttl_values[0]
-            plan.warnings.append(
-                "MongoDB TTL is based on the indexed date field; "
-                "NonoDB TTL is insertion-based"
+            plan.ttl_field = next(
+                (
+                    fields[0]
+                    for index_name, index in collection.index_information().items()
+                    if index_name != "_id_"
+                    and "expireAfterSeconds" in index
+                    and len(index.get("key", [])) == 1
+                ),
+                None,
             )
+            if plan.ttl_field is None:
+                fail(f"collection {name!r}: cannot determine the TTL date field")
         plans.append(plan)
     return plans
 
@@ -235,7 +244,7 @@ def copy_collection(
                     "use --drop or an empty target"
                 )
 
-    if plan.ttl_seconds is not None:
+    if plan.ttl_seconds is not None and plan.ttl_field is None:
         if plan.name in target_db.collections():
             target_db.set_collection_ttl(plan.name, plan.ttl_seconds)
         else:
@@ -319,6 +328,14 @@ def copy_collection(
                     }
                 ]
             )
+
+    if plan.ttl_seconds is not None and plan.ttl_field is not None:
+        target_db.set_collection_ttl_after(
+            plan.name, plan.ttl_field, plan.ttl_seconds
+        )
+        target_db.backfill_collection_ttl_all(
+            plan.name, plan.ttl_field, plan.ttl_seconds
+        )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -413,7 +430,10 @@ def main(argv: list[str] | None = None) -> int:
         for plan in plans:
             print(f"Collection {plan.name!r}", flush=True)
             if plan.ttl_seconds is not None:
-                print(f"  TTL: {plan.ttl_seconds}s", flush=True)
+                suffix = (
+                    f" from {plan.ttl_field}" if plan.ttl_field is not None else ""
+                )
+                print(f"  TTL: {plan.ttl_seconds}s{suffix}", flush=True)
             for warning in plan.warnings:
                 print(f"  warning: {warning}", flush=True)
             if args.dry_run:
@@ -443,6 +463,7 @@ def main(argv: list[str] | None = None) -> int:
                     "bytes": plan.bytes,
                     "sha256": plan.checksum,
                     "ttl_seconds": plan.ttl_seconds,
+                    "ttl_field": plan.ttl_field,
                     "indexes": [
                         {
                             "fields": index.fields,

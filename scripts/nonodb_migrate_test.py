@@ -108,6 +108,7 @@ def main() -> int:
         assert collections["users"]["count"] == 2
         assert collections["orders"]["count"] == 10
         assert collections["sessions"]["ttl_seconds"] == 120
+        assert collections["sessions"]["ttl_field"] == "createdAt"
         assert all(entry["sha256"] for entry in collections.values())
 
         target = NonoDB(socket_path=socket, database=target_db)
@@ -116,6 +117,7 @@ def main() -> int:
             assert target.collection("users").count() == 2
             assert target.collection("orders").count() == 10
             assert target.get_collection_ttl("sessions") == 120
+            assert target.get_collection_ttl_field("sessions") == "createdAt"
             indexes = target.collection("users").list_indexes()
             assert any(index["unique"] and index["fields"] == ["email"] for index in indexes), indexes
             assert target.collection("orders").find_one({"_id": "0"})["total"] == 0.0

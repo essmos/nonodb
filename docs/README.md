@@ -17,7 +17,7 @@ quick-start instructions, and a feature overview.
 | [MongoDB wire shadow mode](mongodb-shadow.md) | Evaluators, migration engineers | Opt-in prototype dual-write to MongoDB, JSONL diff report, and limitations |
 | [SQL queries](sql.md) | Analysts, reporting jobs, application developers | `SELECT`, `INSERT`, `UPDATE`, `DELETE`, filters, aggregates, parameters, limits, client examples |
 | [Vault collections](vault.md) | Application developers, security reviewers | Optional whole-document encryption, tenant keys, restrictions, operations, key rotation |
-| [Document TTL](ttl.md) | Application developers, operators | Collection defaults, per-document overrides, strict read visibility, update semantics, limits |
+| [Document TTL](ttl.md) | Application developers, operators | Collection defaults, date-field MongoDB TTL, per-document overrides, strict read visibility, update semantics, limits |
 | [Dates and time zones](dates.md) | Application developers | BSON-compatible dates, RFC 3339 input, filtering, indexes, sorting, timezone semantics |
 | [Numbers and decimals](numerics.md) | Application developers | Exact numeric comparison, Decimal128, arithmetic, NaN/Infinity, index compatibility, long text limits |
 | [BSON scalar types](bson-types.md) | Application developers | `$numberInt`/`$numberLong`, `$type`, binary/UUID, ObjectId, Timestamp, MinKey/MaxKey, index compatibility |

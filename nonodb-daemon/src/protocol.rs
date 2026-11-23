@@ -494,6 +494,26 @@ pub enum Request {
         #[serde(default)]
         purge_history: Option<bool>,
     },
+    /// Sets a date-field TTL for a collection.
+    SetCollectionTtlAfter {
+        coll: String,
+        field: String,
+        ttl_seconds: u64,
+        #[serde(default)]
+        purge_history: Option<bool>,
+    },
+    /// Backfills date-field TTL metadata for one page of documents.
+    BackfillCollectionTtl {
+        coll: String,
+        field: String,
+        ttl_seconds: u64,
+        #[serde(default)]
+        after: Option<Value>,
+        #[serde(default)]
+        limit: Option<usize>,
+        #[serde(default)]
+        dry_run: Option<bool>,
+    },
     /// Returns the collection default TTL.
     GetCollectionTtl {
         coll: String,
@@ -700,6 +720,20 @@ pub enum WriteReq {
         coll: String,
         ttl_seconds: Option<u64>,
         purge_history: Option<bool>,
+    },
+    SetCollectionTtlAfter {
+        coll: String,
+        field: String,
+        ttl_seconds: u64,
+        purge_history: Option<bool>,
+    },
+    BackfillCollectionTtl {
+        coll: String,
+        field: String,
+        ttl_seconds: u64,
+        after: Option<Value>,
+        limit: usize,
+        dry_run: bool,
     },
     SetCollectionHistory {
         coll: String,
@@ -912,6 +946,8 @@ impl Request {
             Self::CreateCollection { .. } => "create_collection",
             Self::DropCollection { .. } => "drop_collection",
             Self::SetCollectionTtl { .. } => "set_collection_ttl",
+            Self::SetCollectionTtlAfter { .. } => "set_collection_ttl_after",
+            Self::BackfillCollectionTtl { .. } => "backfill_collection_ttl",
             Self::GetCollectionTtl { .. } => "get_collection_ttl",
             Self::SetCollectionHistory { .. } => "set_collection_history",
             Self::GetCollectionHistory { .. } => "get_collection_history",
@@ -1033,6 +1069,8 @@ impl Request {
             | Self::CreateCollection { coll, .. }
             | Self::DropCollection { coll }
             | Self::SetCollectionTtl { coll, .. }
+            | Self::SetCollectionTtlAfter { coll, .. }
+            | Self::BackfillCollectionTtl { coll, .. }
             | Self::GetCollectionTtl { coll }
             | Self::SetCollectionHistory { coll, .. }
             | Self::GetCollectionHistory { coll }

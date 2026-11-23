@@ -407,6 +407,16 @@ impl Client {
             .is_ok_and(|response| response.status().is_success())
     }
 
+    /// Read the daemon's public versioned capability document.
+    pub fn capabilities(&self) -> Result<Value> {
+        let response = self
+            .http
+            .get(format!("{}/v1/capabilities", self.base_url))
+            .send()?
+            .error_for_status()?;
+        Ok(response.json()?)
+    }
+
     /// Execute an arbitrary `/v1/exec` payload and return its `result`.
     pub fn exec(&self, payload: Value) -> Result<Value> {
         let is_write = is_write_op(&payload);

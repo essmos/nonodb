@@ -173,8 +173,8 @@ comparison and practical migration caveats.
   include array entries.
 - `sparse` is accepted as a no-op for compatibility; a plain unique index has
   the same behavior. No partial/wildcard indexes, or text indexes with custom
-  analyzers. `expireAfterSeconds` on a single-field TTL index maps to collection
-  TTL, which is insertion-based rather than date-field-based. Geo indexes
+  analyzers. `expireAfterSeconds` on a single-field TTL index maps to
+  date-field TTL and backfills existing documents. Geo indexes
   currently cover single-field GeoJSON points;
   polygon/line document indexes are not implemented.
 - Vector indexes store one vector per document. Exact scan is the default and

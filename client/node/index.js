@@ -161,6 +161,11 @@ class NonoDB {
     }
   }
 
+  /** Read the daemon's public versioned capabilities. */
+  async capabilities() {
+    return this._request('GET', '/v1/capabilities');
+  }
+
   /** Execute an arbitrary /v1/exec payload and return its `result`. */
   async exec(payload) {
     if (this.closed) throw new NonoDBError('closed', 'client is closed');

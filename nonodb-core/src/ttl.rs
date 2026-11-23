@@ -18,7 +18,9 @@ use heed::types::Bytes;
 use heed::{Database, RoTxn, RwTxn};
 use serde_json::Value;
 
+use crate::date;
 use crate::numeric;
+use crate::query::path;
 
 use crate::error::{Error, Result};
 
@@ -145,16 +147,71 @@ fn ttl_seconds(value: &Value) -> Result<u64> {
         .ok_or_else(|| Error::InvalidTtl("`_ttl` must be a non-negative integer".into()))
 }
 
+/// One TTL metadata assignment produced by backfill.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BackfillEntry {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_at: Option<u64>,
+}
+
+/// Result of one batched date-field TTL backfill page.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BackfillPage {
+    pub scanned: u64,
+    pub updated: u64,
+    pub cleared: u64,
+    pub next_after: Option<Value>,
+    pub done: bool,
+    /// Exact assignments written by this page; serialized only for replication.
+    #[serde(skip)]
+    pub entries: Vec<BackfillEntry>,
+}
+
+/// Computes an expiry from a date field plus a collection TTL. A missing or
+/// non-date field never expires, matching MongoDB TTL indexes.
+pub fn expiry_from_field(doc: &Value, field: &str, seconds: u64) -> Result<Option<u64>> {
+    let Some(value) = path::get(doc, field) else {
+        return Ok(None);
+    };
+    let Some(ms) = date::parse_value(value) else {
+        return Ok(None);
+    };
+    let millis = seconds
+        .checked_mul(1000)
+        .ok_or_else(|| Error::InvalidTtl("TTL is too large".into()))?;
+    let at = i128::from(ms) + i128::from(millis);
+    if at <= 0 {
+        return Ok(Some(0));
+    }
+    u64::try_from(at)
+        .map(Some)
+        .map_err(|_| Error::InvalidTtl("TTL overflows the timestamp".into()))
+}
+
 /// Removes a reserved `_ttl` field from an inserted document and computes its
-/// absolute expiry. If the field is absent, `default_seconds` applies.
+/// absolute expiry. If the field is absent, a date-field TTL or the insertion
+/// default applies.
 pub fn take_insert_ttl(doc: &mut Value, default_seconds: Option<u64>) -> Result<Option<u64>> {
+    take_insert_ttl_with_field(doc, default_seconds, None)
+}
+
+/// Like [`take_insert_ttl`], with an optional date-field TTL.
+pub fn take_insert_ttl_with_field(
+    doc: &mut Value,
+    default_seconds: Option<u64>,
+    ttl_field: Option<(&str, u64)>,
+) -> Result<Option<u64>> {
     let Some(obj) = doc.as_object_mut() else {
         return Err(Error::Query("document must be an object".into()));
     };
     match obj.remove("_ttl") {
-        None => match default_seconds {
-            Some(seconds) if seconds > 0 => Ok(Some(ttl_after(seconds)?)),
-            _ => Ok(None),
+        None => match ttl_field {
+            Some((field, seconds)) if seconds > 0 => expiry_from_field(doc, field, seconds),
+            _ => match default_seconds {
+                Some(seconds) if seconds > 0 => Ok(Some(ttl_after(seconds)?)),
+                _ => Ok(None),
+            },
         },
         Some(Value::Null) => Ok(None),
         Some(value) => {
@@ -171,11 +228,27 @@ pub fn take_insert_ttl(doc: &mut Value, default_seconds: Option<u64>) -> Result<
 /// Removes a reserved `_ttl` field from an updated document and returns the
 /// requested TTL change.
 pub fn take_update_ttl(doc: &mut Value) -> Result<TtlUpdate> {
+    take_update_ttl_with_field(doc, None)
+}
+
+/// Like [`take_update_ttl`], recalculating from a date field when one is set.
+pub fn take_update_ttl_with_field(
+    doc: &mut Value,
+    ttl_field: Option<(&str, u64)>,
+) -> Result<TtlUpdate> {
     let Some(obj) = doc.as_object_mut() else {
         return Err(Error::Query("document must be an object".into()));
     };
     match obj.remove("_ttl") {
-        None => Ok(TtlUpdate::Preserve),
+        None => match ttl_field {
+            Some((field, seconds)) if seconds > 0 => {
+                Ok(match expiry_from_field(doc, field, seconds)? {
+                    Some(at) => TtlUpdate::Set(at),
+                    None => TtlUpdate::Clear,
+                })
+            }
+            _ => Ok(TtlUpdate::Preserve),
+        },
         Some(Value::Null) => Ok(TtlUpdate::Clear),
         Some(value) => {
             let seconds = ttl_seconds(&value)?;
