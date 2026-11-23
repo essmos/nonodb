@@ -1021,6 +1021,18 @@ fn execute(
                 "purge_history": purge_history,
             }))
         }
+        WriteReq::RetainTimeSeries { coll, before_ms } => {
+            let report = store.retain_timeseries_in(wtxn, coll, *before_ms)?;
+            replication.capture_op(ReplicationOp::TimeSeriesRetain {
+                coll: coll.clone(),
+                before_ms: *before_ms,
+            });
+            Ok(json!({
+                "coll": coll,
+                "before_ms": before_ms,
+                "report": report,
+            }))
+        }
         WriteReq::SetCollectionTtlAfter {
             coll,
             field,

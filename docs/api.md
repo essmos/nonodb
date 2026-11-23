@@ -2705,6 +2705,23 @@ codecs, and measured compression:
 }
 ```
 
+`retain_timeseries` drops time-series rows older than a date. Whole buckets are
+removed by key without decoding; only the boundary bucket is rewritten:
+
+```json
+{"op": "retain_timeseries", "coll": "readings",
+ "before": {"$date": "2026-01-01T00:00:00Z"}}
+```
+
+```json
+{"ok": true, "result": {"coll": "readings", "before_ms": 1767225600000,
+ "report": {"dropped_buckets": 20, "rewritten_buckets": 20,
+            "dropped_rows": 0, "remaining_rows": 64000}}}
+```
+
+`aggregate` works on time-series collections by decoding the pruned time range
+and running the in-memory pipeline (see [Time-series collections](timeseries.md)).
+
 An optional `ttl_seconds` sets the default document TTL for new inserts.
 `ttl_purge_history` controls whether TTL expiry deletes stored history:
 

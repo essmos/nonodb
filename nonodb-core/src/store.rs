@@ -702,6 +702,34 @@ impl Store {
         Ok(sealed)
     }
 
+    /// Removes time-series rows older than `before_ms`.
+    pub fn retain_timeseries(
+        &self,
+        name: &str,
+        before_ms: i64,
+    ) -> Result<crate::timeseries::RetainReport> {
+        let mut wtxn = self.write_txn()?;
+        let report = self.retain_timeseries_in(&mut wtxn, name, before_ms)?;
+        wtxn.commit()?;
+        Ok(report)
+    }
+
+    /// Retention variant for an existing writer transaction.
+    pub fn retain_timeseries_in(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        name: &str,
+        before_ms: i64,
+    ) -> Result<crate::timeseries::RetainReport> {
+        let collection = self.collection_in(wtxn, name)?;
+        let Some(settings) = collection.timeseries_settings_in(&*wtxn)? else {
+            return Err(Error::Query(format!(
+                "collection `{name}` is not a time-series collection"
+            )));
+        };
+        crate::timeseries::retain(wtxn, &self.env, name, &settings, before_ms)
+    }
+
     /// Creates a time-series collection backed by columnar buckets.
     pub fn create_timeseries_collection(
         &self,
@@ -2151,6 +2179,9 @@ impl Store {
             ReplicationOp::CollectionDrop { name } => {
                 self.drop_collection_in(wtxn, name).map(|_| ())
             }
+            ReplicationOp::TimeSeriesRetain { coll, before_ms } => self
+                .retain_timeseries_in(wtxn, coll, *before_ms)
+                .map(|_| ()),
             ReplicationOp::CollectionTtl {
                 coll,
                 ttl_seconds,

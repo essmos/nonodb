@@ -3869,6 +3869,21 @@ async fn exec_inner(
                     ttl_seconds,
                     purge_history,
                 },
+                Request::RetainTimeSeries { coll, before } => {
+                    let before_ms = match nonodb_core::date::parse_value(&before) {
+                        Some(ms) => ms,
+                        None => match before.as_i64() {
+                            Some(ms) => ms,
+                            None => {
+                                return respond(Err(nonodb_core::Error::Query(
+                                    "`before` must be a date or epoch milliseconds".into(),
+                                )
+                                .into()))
+                            }
+                        },
+                    };
+                    WriteReq::RetainTimeSeries { coll, before_ms }
+                }
                 Request::SetCollectionTtlAfter {
                     coll,
                     field,

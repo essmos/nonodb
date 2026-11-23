@@ -109,6 +109,9 @@ pub fn capabilities() -> Value {
                     ],
                     "granularities": ["seconds", "minutes", "hours"],
                     "compression_levels": ["fast", "balanced", "max"],
+                    "aggregation": true,
+                    "retention": true,
+                    "point_lookup": "synthetic_id",
                 },
             },
             "migration": {

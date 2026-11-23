@@ -1041,6 +1041,20 @@ fn get_path<'a>(doc: &'a Value, path: &str) -> Option<&'a Value> {
     Some(current)
 }
 
+fn set_path_parts(doc: &mut Map<String, Value>, parts: &[&str], value: Value) {
+    let mut current = doc;
+    for part in &parts[..parts.len() - 1] {
+        let entry = current
+            .entry((*part).to_string())
+            .or_insert_with(|| Value::Object(Map::new()));
+        if !entry.is_object() {
+            *entry = Value::Object(Map::new());
+        }
+        current = entry.as_object_mut().expect("object just inserted");
+    }
+    current.insert(parts[parts.len() - 1].to_string(), value);
+}
+
 fn set_path(doc: &mut Map<String, Value>, path: &str, value: Value) {
     let parts: Vec<&str> = path.split('.').collect();
     let mut current = doc;
@@ -1195,7 +1209,43 @@ fn bucket_bounds(data: &[u8]) -> Result<(bool, i64, i64)> {
     Ok((flags & FLAG_SEALED != 0, start, end))
 }
 
+/// Reads the header only: sealed flag, window bounds, and the series meta value.
+fn bucket_header(data: &[u8], _settings: &Settings) -> Result<(bool, i64, i64, Option<Value>)> {
+    if data.len() < 6 || &data[..4] != MAGIC {
+        return Err(corrupt("bad magic"));
+    }
+    let flags = data[5];
+    let mut pos = 6;
+    let _rows = get_uvarint(data, &mut pos)?;
+    let start = get_ivarint(data, &mut pos)?;
+    let end = get_ivarint(data, &mut pos)?;
+    let meta_raw = get_bytes(data, &mut pos)?;
+    let meta = if meta_raw.is_empty() {
+        None
+    } else {
+        Some(serde_json::from_slice(meta_raw)?)
+    };
+    Ok((flags & FLAG_SEALED != 0, start, end, meta))
+}
+
 fn decode_bucket(data: &[u8], settings: &Settings) -> Result<Bucket> {
+    let (bucket, _selected) = decode_bucket_inner(data, settings, None, None)?;
+    Ok(bucket)
+}
+
+/// Decodes a sealed bucket, optionally materializing only rows whose time
+/// column falls in `[low, high]`.
+///
+/// Column payloads still decode sequentially (several codecs are stateful), but
+/// path splitting and row map construction happen only for selected rows. A
+/// one-minute query inside an hour bucket therefore pays for one column decode
+/// instead of thousands of row builds.
+fn decode_bucket_inner(
+    data: &[u8],
+    settings: &Settings,
+    low: Option<i64>,
+    high: Option<i64>,
+) -> Result<(Bucket, Vec<usize>)> {
     if data.len() < 6 || &data[..4] != MAGIC {
         return Err(corrupt("bad magic"));
     }
@@ -1225,14 +1275,58 @@ fn decode_bucket(data: &[u8], settings: &Settings) -> Result<Bucket> {
     for _ in 0..columns {
         decoded.push(decode_column(data, &mut pos)?);
     }
-    let mut rows = vec![Map::new(); n];
+
+    let mut keep = vec![true; n];
+    let mut selected = Vec::new();
+    if low.is_some() || high.is_some() {
+        if let Some(time_column) = decoded
+            .iter()
+            .find(|column| column.field == settings.time_field)
+        {
+            for (idx, value) in time_column.values.iter().enumerate() {
+                let ts = value.as_ref().and_then(time_value_ms);
+                let inside = ts.is_some_and(|ts| {
+                    low.is_none_or(|low| ts >= low) && high.is_none_or(|high| ts <= high)
+                });
+                keep[idx] = inside;
+            }
+        }
+        for (idx, keep) in keep.iter().enumerate() {
+            if *keep {
+                selected.push(idx);
+            }
+        }
+    } else {
+        selected.extend(0..n);
+    }
+
+    let mut rows: Vec<Map<String, Value>> = vec![Map::new(); n];
     for column in decoded {
+        let paths: Vec<&str> = column.field.split('.').collect();
+        let simple = paths.len() == 1;
         for (idx, value) in column.values.into_iter().enumerate() {
-            if let Some(value) = value {
-                set_path(&mut rows[idx], &column.field, value);
+            if !keep[idx] {
+                continue;
+            }
+            let Some(value) = value else { continue };
+            if simple {
+                rows[idx].insert(paths[0].to_string(), value);
+            } else {
+                set_path_parts(&mut rows[idx], &paths, value);
             }
         }
     }
+    // Drop rows filtered out by the time range so callers never materialize
+    // documents outside the requested window.
+    let mut rows: Vec<Map<String, Value>> = if selected.len() == n {
+        rows
+    } else {
+        rows.into_iter()
+            .zip(keep.iter())
+            .filter(|(_, keep)| **keep)
+            .map(|(row, _)| row)
+            .collect()
+    };
     if let Some(meta) = &meta {
         if let Some(field) = &settings.meta_field {
             for row in rows.iter_mut() {
@@ -1240,13 +1334,55 @@ fn decode_bucket(data: &[u8], settings: &Settings) -> Result<Bucket> {
             }
         }
     }
-    Ok(Bucket {
-        sealed,
-        window_start,
-        end,
-        meta,
-        rows,
-    })
+    Ok((
+        Bucket {
+            sealed,
+            window_start,
+            end,
+            meta,
+            rows,
+        },
+        selected,
+    ))
+}
+
+/// Decodes only one row of a sealed bucket. Used by point lookups so a single
+/// `_id` does not build thousands of maps.
+fn decode_bucket_row(
+    data: &[u8],
+    settings: &Settings,
+    index: usize,
+) -> Result<Option<Map<String, Value>>> {
+    if data.len() < 6 || &data[..4] != MAGIC {
+        return Err(corrupt("bad magic"));
+    }
+    let mut pos = 6;
+    let n = get_uvarint(data, &mut pos)? as usize;
+    let _window_start = get_ivarint(data, &mut pos)?;
+    let _end = get_ivarint(data, &mut pos)?;
+    let meta_raw = get_bytes(data, &mut pos)?;
+    let meta: Option<Value> = if meta_raw.is_empty() {
+        None
+    } else {
+        Some(serde_json::from_slice(meta_raw)?)
+    };
+    let columns = get_uvarint(data, &mut pos)? as usize;
+    if index >= n {
+        return Ok(None);
+    }
+    let mut row = Map::new();
+    for _ in 0..columns {
+        let column = decode_column(data, &mut pos)?;
+        if let Some(Some(value)) = column.values.into_iter().nth(index) {
+            set_path(&mut row, &column.field, value);
+        }
+    }
+    if let Some(meta) = &meta {
+        if let Some(field) = &settings.meta_field {
+            set_path(&mut row, field, meta.clone());
+        }
+    }
+    Ok(Some(row))
 }
 
 fn time_value_ms(value: &Value) -> Option<i64> {
@@ -1271,8 +1407,28 @@ fn row_json_bytes(doc: &Value) -> u64 {
     serde_json::to_vec(doc).map(|v| v.len() as u64).unwrap_or(0)
 }
 
-fn row_id(hash: u64, window_start: i64, idx: usize) -> String {
-    format!("{hash:016x}{:016x}{:08x}", window_start as u64, idx as u32)
+/// Synthetic `_id` for a row without a user-provided `_id`.
+///
+/// Encodes the full physical location (series hash, salt, window, bucket
+/// serial, row sequence) so `find_by_key` can jump straight to the row instead
+/// of scanning the collection.
+fn row_id(hash: u64, salt: u32, window_start: i64, serial: u16, seq: u32) -> String {
+    format!(
+        "{hash:016x}{salt:08x}{:016x}{serial:04x}{seq:08x}",
+        window_start as u64
+    )
+}
+
+fn parse_row_id(id: &str) -> Option<(u64, u32, i64, u16, u32)> {
+    if id.len() != 52 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let hash = u64::from_str_radix(&id[0..16], 16).ok()?;
+    let salt = u32::from_str_radix(&id[16..24], 16).ok()?;
+    let window = u64::from_str_radix(&id[24..40], 16).ok()? as i64;
+    let serial = u16::from_str_radix(&id[40..44], 16).ok()?;
+    let seq = u32::from_str_radix(&id[44..52], 16).ok()?;
+    Some((hash, salt, window, serial, seq))
 }
 
 fn series_hash(settings: &Settings, meta: Option<&Value>) -> u64 {
@@ -1561,7 +1717,7 @@ pub fn insert(
     let id = match object.get("_id") {
         Some(Value::String(id)) => id.clone(),
         Some(other) => crate::id::key_from_value(other).ok_or(Error::InvalidId)?,
-        None => row_id(hash, window, count as usize),
+        None => row_id(hash, salt, window, serial, count),
     };
     Ok(id)
 }
@@ -1666,6 +1822,47 @@ fn expired(settings: &Settings, doc: &Value, now_ms: i64) -> bool {
     ts.saturating_add((ttl as i64).saturating_mul(1000)) < now_ms
 }
 
+/// Extracts only the constraints that apply to the series meta value.
+///
+/// Buckets store the meta value once, so a filter such as
+/// `{"device.id": "sensor-7"}` can prune every other series by checking the
+/// bucket header without decoding a single column.
+fn meta_only_filter(filter: &Value, settings: &Settings) -> Option<Value> {
+    let field = settings.meta_field.as_deref()?;
+    let prefix = format!("{field}.");
+    let object = filter.as_object()?;
+    let mut out = Map::new();
+    for (key, value) in object {
+        if key == field || key.starts_with(&prefix) {
+            out.insert(key.clone(), value.clone());
+        } else if key == "$and" {
+            if let Some(items) = value.as_array() {
+                let nested: Vec<Value> = items
+                    .iter()
+                    .filter_map(|item| meta_only_filter(item, settings))
+                    .collect();
+                if !nested.is_empty() {
+                    out.insert("$and".into(), Value::Array(nested));
+                }
+            }
+        }
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(Value::Object(out))
+    }
+}
+
+fn meta_bucket_matches(filter: &Value, settings: &Settings, meta: Option<&Value>) -> bool {
+    let Some(field) = settings.meta_field.as_deref() else {
+        return true;
+    };
+    let mut probe = Map::new();
+    set_path(&mut probe, field, meta.cloned().unwrap_or(Value::Null));
+    matcher::matches(&Value::Object(probe), filter)
+}
+
 /// Executes a `find` query against the bucket store.
 pub fn find(
     rtxn: &RoTxn<'_>,
@@ -1685,6 +1882,7 @@ pub fn find(
     };
     let (low, high) = time_bounds(&query.filter, &settings.time_field);
     let meta_hash = meta_equality_hash(&query.filter, settings);
+    let meta_filter = meta_only_filter(&query.filter, settings);
     let deadline = query
         .max_time_ms
         .filter(|ms| *ms > 0)
@@ -1705,19 +1903,26 @@ pub fn find(
                         continue;
                     }
                 }
-                let (_, start, end) = bucket_bounds(payload)?;
+                let (_, start, end, meta) = bucket_header(payload, settings)?;
                 if low.is_some_and(|low| end < low) || high.is_some_and(|high| start > high) {
                     continue;
                 }
-                let bucket = decode_bucket(payload, settings)?;
-                let (hash, _, window, _) = key_parts(key).unwrap_or((0, 0, start, 0));
-                for (idx, row) in bucket.rows.iter().enumerate() {
+                // Prune whole series without decoding columns: check the header
+                // meta value against the meta-field part of the filter.
+                if let Some(filter) = &meta_filter {
+                    if !meta_bucket_matches(filter, settings, meta.as_ref()) {
+                        continue;
+                    }
+                }
+                let (bucket, selected) = decode_bucket_inner(payload, settings, low, high)?;
+                let (hash, salt, window, serial) = key_parts(key).unwrap_or((0, 0, start, 0));
+                for (row, idx) in bucket.rows.iter().zip(selected.iter()) {
                     let mut doc = Value::Object(row.clone());
                     if !row.contains_key("_id") {
                         set_path(
                             doc.as_object_mut().expect("object"),
                             "_id",
-                            Value::String(row_id(hash, window, idx)),
+                            Value::String(row_id(hash, salt, window, serial, *idx as u32)),
                         );
                     }
                     if expired(settings, &doc, now) || !matcher::matches(&doc, &query.filter) {
@@ -1727,7 +1932,7 @@ pub fn find(
                 }
             }
             Some(&KEY_ROW) => {
-                let Some((hash, _, window, _, seq)) = row_key_parts(key) else {
+                let Some((hash, salt, window, serial, seq)) = row_key_parts(key) else {
                     continue;
                 };
                 if let Some(expected) = meta_hash {
@@ -1749,7 +1954,7 @@ pub fn find(
                     set_path(
                         doc.as_object_mut().expect("object"),
                         "_id",
-                        Value::String(row_id(hash, window, seq as usize)),
+                        Value::String(row_id(hash, salt, window, serial, seq)),
                     );
                 }
                 if expired(settings, &doc, now) || !matcher::matches(&doc, &query.filter) {
@@ -1794,6 +1999,210 @@ pub fn count(
         hint: None,
     };
     Ok(find(rtxn, env, name, settings, &query)?.len())
+}
+
+/// Result of a time-based retention pass.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RetainReport {
+    /// Whole sealed buckets removed without decoding their columns.
+    pub dropped_buckets: u64,
+    /// Boundary buckets that were decoded, filtered, and re-encoded.
+    pub rewritten_buckets: u64,
+    /// Pending (unsealed) rows removed.
+    pub dropped_rows: u64,
+    pub remaining_rows: u64,
+}
+
+/// Removes every row older than `before_ms` (exclusive).
+///
+/// Buckets whose whole time range is older are dropped by key, with no column
+/// decode. Only buckets that straddle the cutoff are decoded and re-encoded.
+/// Pending rows are inspected individually because they are stored as JSON.
+pub fn retain(
+    wtxn: &mut RwTxn<'_>,
+    env: &heed::Env,
+    name: &str,
+    settings: &Settings,
+    before_ms: i64,
+) -> Result<RetainReport> {
+    let db =
+        env.create_database::<Bytes, Bytes>(wtxn, Some(&format!("{BUCKET_DB_PREFIX}{name}")))?;
+    let mut report = RetainReport::default();
+    let mut pointers: Vec<(Vec<u8>, Vec<u8>, u32)> = Vec::new();
+    let mut buckets: Vec<(Vec<u8>, bool, i64, i64)> = Vec::new();
+    let mut open_rows: Vec<(Vec<u8>, i64)> = Vec::new();
+
+    for item in db.iter(&*wtxn)? {
+        let (key, value) = item?;
+        match key.first() {
+            Some(&KEY_OPEN) => {
+                if let Some((bucket_key, count)) = parse_open(value) {
+                    pointers.push((key.to_vec(), bucket_key, count));
+                }
+            }
+            Some(&KEY_BUCKET) => {
+                let (_, start, end, _) = bucket_header(value, settings)?;
+                buckets.push((key.to_vec(), start >= before_ms, start, end));
+            }
+            Some(&KEY_ROW) => {
+                let row: Map<String, Value> = serde_json::from_slice(value)?;
+                let doc = Value::Object(row);
+                if let Some(ts) = extract_time(&doc, &settings.time_field) {
+                    if ts < before_ms {
+                        open_rows.push((key.to_vec(), ts));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for (key, keep, start, end) in buckets {
+        if keep {
+            continue;
+        }
+        if end < before_ms {
+            db.delete(&mut *wtxn, &key)?;
+            report.dropped_buckets += 1;
+            continue;
+        }
+        let payload = db
+            .get(&*wtxn, &key)?
+            .ok_or_else(|| corrupt("bucket disappeared during retention"))?
+            .to_vec();
+        let (bucket, _) = decode_bucket_inner(&payload, settings, None, None)?;
+        let kept: Vec<Map<String, Value>> = bucket
+            .rows
+            .into_iter()
+            .filter(|row| {
+                extract_time(&Value::Object(row.clone()), &settings.time_field)
+                    .is_some_and(|ts| ts >= before_ms)
+            })
+            .collect();
+        if kept.is_empty() {
+            db.delete(&mut *wtxn, &key)?;
+            report.dropped_buckets += 1;
+            continue;
+        }
+        let end = kept
+            .iter()
+            .filter_map(|row| extract_time(&Value::Object(row.clone()), &settings.time_field))
+            .max()
+            .unwrap_or(start);
+        let shrunk = Bucket {
+            sealed: true,
+            window_start: start,
+            end,
+            meta: bucket.meta,
+            rows: kept,
+        };
+        let payload = encode_bucket(&shrunk, settings)?;
+        db.put(&mut *wtxn, &key, &payload)?;
+        report.rewritten_buckets += 1;
+    }
+
+    for (key, _) in &open_rows {
+        db.delete(&mut *wtxn, key)?;
+        report.dropped_rows += 1;
+    }
+
+    // Recompute pending row counts and roll pointers whose bucket was removed.
+    for (pointer_key, pointer_bucket, count) in pointers {
+        let Some((hash, salt, window, serial)) = key_parts(&pointer_bucket) else {
+            continue;
+        };
+        let prefix = row_base(hash, salt, window, serial);
+        let remaining = db.prefix_iter(&*wtxn, &prefix)?.count();
+        if remaining == 0 && count > 0 {
+            let next = bucket_key(hash, salt, window, serial.saturating_add(1));
+            db.put(&mut *wtxn, &pointer_key, &encode_open(&next, 0))?;
+        } else if remaining as u32 != count {
+            db.put(
+                &mut *wtxn,
+                &pointer_key,
+                &encode_open(&pointer_bucket, remaining as u32),
+            )?;
+        }
+    }
+
+    // Count what is left so callers can report a retention result.
+    let stats = stats(wtxn, env, name, settings)?;
+    report.remaining_rows = stats.rows;
+    Ok(report)
+}
+
+/// Fetches one row by `_id` without scanning the collection.
+///
+/// Synthetic ids encode the physical location, so this is a single LMDB get
+/// (pending row) or one get plus one bucket decode (sealed row). User-supplied
+/// `_id` values fall back to a filtered scan.
+pub fn find_by_id(
+    rtxn: &RoTxn<'_>,
+    env: &heed::Env,
+    name: &str,
+    settings: &Settings,
+    id: &str,
+) -> Result<Option<Value>> {
+    let Some(db) =
+        env.open_database::<Bytes, Bytes>(rtxn, Some(&format!("{BUCKET_DB_PREFIX}{name}")))?
+    else {
+        return Ok(None);
+    };
+    let now = crate::ttl::now_ms() as i64;
+    if let Some((hash, salt, window, serial, seq)) = parse_row_id(id) {
+        if let Some(payload) = db.get(rtxn, &row_key(hash, salt, window, serial, seq))? {
+            let row: Map<String, Value> = serde_json::from_slice(payload)?;
+            let mut doc = Value::Object(row);
+            if !doc
+                .as_object()
+                .is_some_and(|object| object.contains_key("_id"))
+            {
+                set_path(
+                    doc.as_object_mut().expect("object"),
+                    "_id",
+                    Value::String(row_id(hash, salt, window, serial, seq)),
+                );
+            }
+            if expired(settings, &doc, now) {
+                return Ok(None);
+            }
+            return Ok(Some(doc));
+        }
+        if let Some(payload) = db.get(rtxn, &bucket_key(hash, salt, window, serial))? {
+            if let Some(row) = decode_bucket_row(payload, settings, seq as usize)? {
+                let mut doc = Value::Object(row);
+                if !doc
+                    .as_object()
+                    .is_some_and(|object| object.contains_key("_id"))
+                {
+                    set_path(
+                        doc.as_object_mut().expect("object"),
+                        "_id",
+                        Value::String(id.to_string()),
+                    );
+                }
+                if expired(settings, &doc, now) {
+                    return Ok(None);
+                }
+                return Ok(Some(doc));
+            }
+        }
+    }
+    // User-supplied `_id` (or a stale synthetic id): filtered scan.
+    let query = FindQuery {
+        filter: Value::Object(Map::new()),
+        projection: None,
+        sort: Vec::new(),
+        skip: 0,
+        limit: None,
+        comment: None,
+        max_time_ms: None,
+        hint: None,
+    };
+    let docs = find(rtxn, env, name, settings, &query)?;
+    Ok(docs
+        .into_iter()
+        .find(|doc| doc.get("_id").and_then(Value::as_str) == Some(id)))
 }
 
 /// Removes every bucket and series pointer for a collection.
@@ -2029,6 +2438,92 @@ mod tests {
 
         store.drop_collection("metrics").unwrap();
         assert!(store.collection_profile("metrics").unwrap().is_none());
+    }
+
+    #[test]
+    fn retention_drops_old_buckets_and_filters_the_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open(dir.path()).unwrap();
+        let settings = Settings {
+            time_field: "ts".into(),
+            meta_field: Some("device".into()),
+            granularity: Granularity::Seconds,
+            ..Settings::default()
+        };
+        let collection = store
+            .create_timeseries_collection("metrics", &settings)
+            .unwrap();
+        let hour = 3_600_000i64;
+        let base = 1_700_000_000_000i64;
+        // Three hourly windows: one sample every two minutes.
+        for idx in 0..90i64 {
+            let ts = base + idx * 120_000;
+            collection
+                .insert_one(json!({
+                    "ts": {"$date": {"$numberLong": ts.to_string()}},
+                    "device": {"id": "a"},
+                    "value": idx,
+                }))
+                .unwrap();
+        }
+        store.seal_timeseries("metrics").unwrap();
+        assert_eq!(collection.count(&json!({})).unwrap(), 90);
+
+        // Drop the first window entirely, keep the second half of the middle
+        // window, and leave the third window untouched.
+        let cutoff = base + hour + 30 * 60_000;
+        let report = store.retain_timeseries("metrics", cutoff).unwrap();
+        assert_eq!(report.dropped_buckets, 1);
+        assert_eq!(report.rewritten_buckets, 1);
+        let remaining = collection.count(&json!({})).unwrap();
+        assert_eq!(remaining, 15 + 30);
+        assert_eq!(report.remaining_rows, remaining as u64);
+
+        let docs = collection
+            .find(&FindQuery {
+                filter: json!({"ts": {"$lt": {"$date": {"$numberLong": cutoff.to_string()}}}}),
+                projection: None,
+                sort: Vec::new(),
+                skip: 0,
+                limit: None,
+                comment: None,
+                max_time_ms: None,
+                hint: None,
+            })
+            .unwrap();
+        assert!(docs.is_empty());
+    }
+
+    #[test]
+    fn aggregation_groups_time_series_documents() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open(dir.path()).unwrap();
+        let settings = Settings {
+            time_field: "ts".into(),
+            meta_field: Some("device".into()),
+            ..Settings::default()
+        };
+        let collection = store
+            .create_timeseries_collection("metrics", &settings)
+            .unwrap();
+        for idx in 0..100i64 {
+            collection
+                .insert_one(json!({
+                    "ts": {"$date": {"$numberLong": (1_700_000_000_000i64 + idx * 1000).to_string()}},
+                    "device": {"id": "a"},
+                    "value": idx,
+                }))
+                .unwrap();
+        }
+        let grouped = collection
+            .aggregate(&[
+                json!({"$match": {"device.id": "a"}}),
+                json!({"$group": {"_id": "$device.id", "count": {"$sum": 1}, "total": {"$sum": "$value"}}}),
+            ])
+            .unwrap();
+        assert_eq!(grouped.len(), 1);
+        assert_eq!(grouped[0]["count"], 100);
+        assert_eq!(grouped[0]["total"], 4950);
     }
 
     #[test]

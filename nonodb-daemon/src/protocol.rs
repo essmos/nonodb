@@ -491,6 +491,11 @@ pub enum Request {
     DropCollection {
         coll: String,
     },
+    /// Removes time-series rows older than `before` (date or epoch ms).
+    RetainTimeSeries {
+        coll: String,
+        before: Value,
+    },
     /// Sets or clears the default document TTL for a collection.
     SetCollectionTtl {
         coll: String,
@@ -733,6 +738,10 @@ pub enum WriteReq {
         ttl_seconds: u64,
         purge_history: Option<bool>,
     },
+    RetainTimeSeries {
+        coll: String,
+        before_ms: i64,
+    },
     BackfillCollectionTtl {
         coll: String,
         field: String,
@@ -953,6 +962,7 @@ impl Request {
             Self::DropCollection { .. } => "drop_collection",
             Self::SetCollectionTtl { .. } => "set_collection_ttl",
             Self::SetCollectionTtlAfter { .. } => "set_collection_ttl_after",
+            Self::RetainTimeSeries { .. } => "retain_timeseries",
             Self::BackfillCollectionTtl { .. } => "backfill_collection_ttl",
             Self::GetCollectionTtl { .. } => "get_collection_ttl",
             Self::SetCollectionHistory { .. } => "set_collection_history",
@@ -1076,6 +1086,7 @@ impl Request {
             | Self::DropCollection { coll }
             | Self::SetCollectionTtl { coll, .. }
             | Self::SetCollectionTtlAfter { coll, .. }
+            | Self::RetainTimeSeries { coll, .. }
             | Self::BackfillCollectionTtl { coll, .. }
             | Self::GetCollectionTtl { coll }
             | Self::SetCollectionHistory { coll, .. }

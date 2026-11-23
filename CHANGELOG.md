@@ -16,6 +16,13 @@ Full release notes: https://github.com/essmos/nonodb/releases
   benchmark stores 50k mixed IoT samples in 4.21 bytes/row, 43.6x smaller than
   raw JSON and 2.64x smaller than row-oriented zlib with the same data. See
   `docs/timeseries.md`.
+- Add aggregation and retention for time-series collections. `aggregate` now
+  decodes buckets through the time-range-pruned find path and runs the normal
+  in-memory pipeline, so `$group`/`$bucket` downsampling works. The new
+  `retain_timeseries` write op (replicated as `time_series_retain`) drops whole
+  old buckets by key without decoding columns and only rewrites the boundary
+  bucket. Add `examples/timeseries_bench.rs` with write/read/aggregate/retention
+  latency percentiles and a standard-collection baseline.
 
 - Remove orphaned `.dropped-*` database directories at startup. A failed
   `remove_dir_all` no longer turns an already-committed database drop into an

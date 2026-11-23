@@ -68,6 +68,11 @@ pub enum ReplicationOp {
     CollectionDrop {
         name: String,
     },
+    /// Drops time-series rows older than `before_ms`.
+    TimeSeriesRetain {
+        coll: String,
+        before_ms: i64,
+    },
     CollectionTtl {
         coll: String,
         ttl_seconds: Option<u64>,

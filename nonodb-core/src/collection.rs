@@ -4677,21 +4677,9 @@ impl<'e> Collection<'e> {
         let rtxn = self.read_txn()?;
         if self.profile.is_timeseries() {
             let settings = self.timeseries_settings_in(&rtxn)?.unwrap_or_default();
-            let query = FindQuery {
-                filter: Value::Object(Map::new()),
-                projection: None,
-                sort: Vec::new(),
-                skip: 0,
-                limit: None,
-                comment: None,
-                max_time_ms: None,
-                hint: None,
-            };
-            let docs = crate::timeseries::find(&rtxn, self.env, &self.name, &settings, &query)?;
+            let out = crate::timeseries::find_by_id(&rtxn, self.env, &self.name, &settings, key)?;
             rtxn.commit()?;
-            return Ok(docs
-                .into_iter()
-                .find(|doc| doc.get("_id").and_then(Value::as_str) == Some(key)));
+            return Ok(out);
         }
         let out = self
             .db
@@ -6191,7 +6179,32 @@ impl<'e> Collection<'e> {
         pipeline: &[Value],
         deadline: Option<Instant>,
     ) -> Result<Vec<Value>> {
-        self.ensure_not_timeseries("aggregate")?;
+        if self.profile.is_timeseries() {
+            // Time-series buckets are decoded through the normal find path so
+            // bucket pruning and residual filters still apply, then the regular
+            // in-memory pipeline runs on the decoded documents. This enables
+            // `$group`/`$bucket` downsampling without a second query engine.
+            check_find_deadline(deadline)?;
+            aggregate::validate_pipeline(pipeline)?;
+            let settings = self.timeseries_settings_in(rtxn)?.unwrap_or_default();
+            let filter = pipeline
+                .first()
+                .and_then(|stage| stage.get("$match"))
+                .cloned()
+                .unwrap_or_else(|| Value::Object(Map::new()));
+            let query = FindQuery {
+                filter,
+                projection: None,
+                sort: Vec::new(),
+                skip: 0,
+                limit: None,
+                comment: None,
+                max_time_ms: None,
+                hint: None,
+            };
+            let docs = crate::timeseries::find(rtxn, self.env, &self.name, &settings, &query)?;
+            return aggregate::run(docs, pipeline, aggregate::max_docs());
+        }
         check_find_deadline(deadline)?;
         aggregate::validate_pipeline(pipeline)?;
         if let Some(stage) = pipeline.first().and_then(Value::as_object) {

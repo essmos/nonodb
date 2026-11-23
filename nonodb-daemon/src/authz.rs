@@ -124,6 +124,7 @@ pub fn authorize_request(
         | Request::DropCollection { coll }
         | Request::SetCollectionTtl { coll, .. }
         | Request::SetCollectionTtlAfter { coll, .. }
+        | Request::RetainTimeSeries { coll, .. }
         | Request::BackfillCollectionTtl { coll, .. }
         | Request::SetCollectionHistory { coll, .. }
         | Request::SetCollectionEvents { coll, .. }

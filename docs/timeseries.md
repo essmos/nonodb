@@ -33,7 +33,7 @@ payload. It also tries zlib on top of that payload and only accepts it when it
 is at least two bytes smaller. `compression` controls the zlib level: `fast` (1),
 `balanced` (3, default), `max` (6).
 
-### Measured on the bundled benchmark
+### Measured compression on the bundled benchmark
 
 `nonodb-core/examples/timeseries_compression.rs` generates 10 series, one sample
 per second, with three floats, one enum string, one counter, one boolean, and a
@@ -159,9 +159,34 @@ pins `metaField` by equality restricts the scan to that series.
 ```
 
 Residual filters, sorting, `skip`/`limit`, and projections are applied after
-decoding. Aggregation pipelines (`aggregate`, `$group`, `$bucket`, `$densify`,
-...) are **not** supported on time-series collections yet; use `find` and
-aggregate in the client, or a standard collection if you need `$group`.
+decoding.
+
+### Aggregation and downsampling
+
+Aggregation pipelines run over the decoded documents, so `$group`, `$bucket`,
+`$sort`, `$project`, `$count`, and the rest of the in-memory stage set work on
+time-series collections. A leading `$match` is reused for bucket and series
+pruning, and the whole bucket time range is decoded before the pipeline runs:
+
+```json
+{
+  "op": "aggregate",
+  "coll": "readings",
+  "pipeline": [
+    {"$match": {"device.id": "sensor-7",
+                "ts": {"$gte": {"$date": "2026-01-01T00:00:00Z"}}}},
+    {"$group": {"_id": "$status", "samples": {"$sum": 1},
+                "avg_temp": {"$avg": "$temperature"}}},
+    {"$sort": {"_id": 1}}
+  ]
+}
+```
+
+Downsampling to per-minute buckets works the same way (group by a truncated
+time expression computed with `$dateToString`/`$subtract` in `$project`).
+
+Stages that need a second collection or an index host (`$lookup`, `$search`,
+`$unionWith`) are outside the in-memory runner.
 
 ## Supported operations
 
@@ -175,13 +200,42 @@ aggregate in the client, or a standard collection if you need `$group`.
 | document history | not recorded (keeps the format columnar) |
 | secondary, text, fuzzy, geo, vector indexes | rejected with a clear error |
 | `update`, `find_and_modify`, `delete` | rejected |
-| aggregation, SQL, `$search`, watches/events | not supported |
+| aggregation pipelines (`$match`, `$group`, `$bucket`, `$sort`, ...) | yes, decoded then run in memory |
+| retention: delete rows older than a cutoff | `retain_timeseries` |
+| SQL, `$search`, `$lookup`, watches/events | not supported |
 | drop collection | removes all buckets and series pointers |
 | replication, backup, restore, verify | yes (buckets travel with the database) |
 
 Rejections return `invalid query: `<op>` is not supported on time-series
 collection `<name>``, so API clients fail loudly instead of silently returning
 empty results.
+
+## Retention
+
+`retain_timeseries` deletes every row older than a cutoff. Buckets whose whole
+window is older are dropped by key with **no column decode**; only the boundary
+bucket is decoded, filtered, and re-encoded. Pending rows are inspected
+individually.
+
+```json
+{
+  "op": "retain_timeseries",
+  "coll": "readings",
+  "before": {"$date": "2026-01-01T00:00:00Z"}
+}
+```
+
+Response:
+
+```json
+{"ok": true, "result": {"coll": "readings", "before_ms": 1767225600000,
+ "report": {"dropped_buckets": 20, "rewritten_buckets": 20,
+            "dropped_rows": 0, "remaining_rows": 64000}}}
+```
+
+Retention is replicated as `time_series_retain`, so replicas drop the same
+ranges. Run it from a scheduler (workers/cron) for a rolling window, or call it
+once before an archive.
 
 ## Maintenance
 
@@ -218,11 +272,56 @@ value) followed by one block per column: field name, kind (`i64`, `f64`, `bool`,
 Every payload may additionally be zlib-deflated (codec flag `0x80`). Unknown
 versions or codecs are reported as corruption instead of being guessed.
 
+## Write and read speed
+
+Measured with `nonodb-core/examples/timeseries_bench.rs` on 100k rows, 10
+series, 8 columns (release build, single core, local SSD), compared with a
+standard collection holding the same documents:
+
+```text
+write
+insert (time-series)                 100000 ops   21700 ops/s  p50 32.7us  p95 53.2us  p99 61.6us
+insert (standard, baseline)          100000 ops   46700 ops/s  p50 20.6us  p95 25.7us  p99 30.1us
+seal open buckets                        10 perm  156 ms total, 15.6 ms/bucket
+stored: 3.95 bytes/row, 46.4x smaller than raw JSON
+
+read (time-series collection)
+find_by_key (point)                      500 ops     371 ops/s  p50 2.54 ms  p99 4.44 ms
+find 1 min, 1 series (60 rows)           500 ops     185 ops/s  p50 5.24 ms  p99 8.03 ms
+find 1 h, 1 series (3600 rows)           125 ops      38 ops/s  p50 25.6 ms  p99 36.2 ms
+count 1 h, 1 series                      125 ops      32 ops/s  p50 31.1 ms  p99 40.4 ms
+aggregate $group 1 h, 1 series            50 ops      23 ops/s  p50 43.7 ms  p99 49.4 ms
+find match-all (100000 rows)              10 ops     2.0 ops/s  p50 499 ms   p99 525 ms
+retention before +1 h (40 buckets)        1 pass   498 ms, 20 dropped + 20 rewritten
+
+baseline (standard collection, one document per row)
+find 1 h, 1 series (no index)             10 ops     3.8 ops/s  p50 262 ms   p99 284 ms
+find match-all (100000 rows)              10 ops     2.5 ops/s  p50 400 ms   p99 407 ms
+```
+
+Reading a one-hour slice is ~10x faster than the document baseline because
+whole buckets outside the time range are skipped instead of parsing 100k JSON
+documents. Inserts are ~2x slower than the raw document path: each insert is two
+LMDB puts (row + open-bucket pointer) instead of one, and series resolution
+reads the pointer.
+
+The weak spot is point lookup by `_id`: sealed buckets decode their columns
+sequentially, so a synthetic id costs ~2.5 ms instead of the microsecond a
+document store needs. Range scans, counts, and downsampling are the intended
+access pattern; if you need millions of single-row lookups, keep a small
+document or index mapping outside the collection, or query by time range.
+
+Reproduce: `ROWS=100000 READS=500 cargo run --release -p nonodb-core --example timeseries_bench`
+
 ## Limitations
 
-- No updates or deletes: delete individual samples by dropping expired windows
-  through `expireAfterSeconds`, or drop the collection.
-- No aggregation, SQL, indexes, or search inside the collection.
+- No updates or deletes of individual rows: use `retain_timeseries` for
+  time-based retention, `expireAfterSeconds` for read-time expiry, or drop the
+  collection.
+- No SQL, secondary/text/fuzzy/geo/vector indexes, `$search`, `$lookup`, or
+  watches inside the collection.
+- Aggregation decodes the full time range into memory before running stages.
+- Point lookup by `_id` decodes the containing bucket (see above).
 - Open buckets are uncompressed until they seal.
 - `bucketMaxDocs` bounds row count, not wall-clock rate; a very high ingest rate
   simply produces more buckets per window (serial counter in the key).
