@@ -6,8 +6,6 @@ deliberate limitations are documented in [docs/roadmap.md](docs/roadmap.md).
 
 ## P1 — lookup enhancements
 
-- [ ] Validate lookup limits consistently on missing-collection and batch-read
-      paths, matching the normal `lookup` validation.
 
 ## P1 — durability and operations
 

@@ -432,6 +432,8 @@ Semantics:
   or use a smaller projection.
 - `lookup` does not accept `filter`, `sort`, `skip`, or `limit`. Use `find` for
   arbitrary predicates.
+- Field, value-count, and projection validation happens before collection
+  resolution, so it is identical in read batches and for missing collections.
 - Non-unique lookups and lookups without a matching index are not supported yet.
 - Vault collections reject `lookup`.
 

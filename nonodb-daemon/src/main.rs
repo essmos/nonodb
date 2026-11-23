@@ -4165,6 +4165,25 @@ fn audit_response(
     }
 }
 
+fn validate_lookup_input(by: &[String], values: &[Value]) -> Result<(), ApiError> {
+    if by.is_empty() || by.iter().any(String::is_empty) {
+        return Err(ApiError {
+            code: "invalid_query".to_string(),
+            message: "lookup field must not be empty".to_string(),
+        });
+    }
+    if values.len() > nonodb_core::MAX_LOOKUP_VALUES {
+        return Err(ApiError {
+            code: "invalid_query".to_string(),
+            message: format!(
+                "lookup accepts at most {} values",
+                nonodb_core::MAX_LOOKUP_VALUES
+            ),
+        });
+    }
+    Ok(())
+}
+
 fn lookup_response(
     coll: &str,
     by: &[String],
@@ -4669,6 +4688,11 @@ fn execute_read(
             projection,
         } => {
             let started = std::time::Instant::now();
+            let by = by
+                .unwrap_or(LookupBy::Field("_id".to_string()))
+                .into_fields();
+            let projection = lookup_projection(fields.as_deref(), projection.as_ref())?;
+            validate_lookup_input(&by, &values)?;
             let Some(c) = store.collection_at(rtxn, &coll)? else {
                 metrics::record_lookup(
                     started.elapsed(),
@@ -4683,10 +4707,6 @@ fn execute_read(
                 }));
             };
             reject_vault_read(&c, None, "lookup on vault collections")?;
-            let by = by
-                .unwrap_or(LookupBy::Field("_id".to_string()))
-                .into_fields();
-            let projection = lookup_projection(fields.as_deref(), projection.as_ref())?;
             let report = c.lookup_fields_report_in(rtxn, &by, &values, projection.as_ref());
             lookup_response(&coll, &by, report, started.elapsed(), false)
         }
@@ -4702,6 +4722,7 @@ fn execute_read(
                 .unwrap_or(LookupBy::Field("_id".to_string()))
                 .into_fields();
             let projection = lookup_projection(fields.as_deref(), projection.as_ref())?;
+            validate_lookup_input(&by, &values)?;
             let Some(c) = store.collection_at(rtxn, &coll)? else {
                 let stats = nonodb_core::LookupStats {
                     requested_keys: values.len(),
