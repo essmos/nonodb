@@ -792,18 +792,17 @@ runs.
 ## Limitations
 
 - Whole-collection deletion is not exposed yet.
-- Import currently supports full-database import from native local/S3 backups;
-  selective collection import, restic repository import, and replace-in-place
-  restore are not exposed in the GUI.
+- Import currently supports full-database import from native local/S3 backups
+  and verified restore-in-place for non-default databases; selective collection
+  import and restic repository import are not exposed in the GUI.
 - A light theme is not included.
 
 ## Future GUI work
 
 These are planned improvements, not current features.
 
-- **Backup and restore UI.** Trigger online backups, list manifests, verify
-  checksums, and show restore instructions. Restore itself remains CLI-only
-  until a safe daemon-side restore flow exists.
+- **Restore history and rollback shortcuts.** Show previous restore operations
+  and offer guided recovery from retained safety snapshots.
 - **Progress and resume for large imports.** Stream import progress, allow
   cancellation, and resume large JSON/NDJSON/CSV imports.
 - **Better large-result handling.** Virtualized document lists and resumable

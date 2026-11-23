@@ -168,11 +168,14 @@ def main() -> int:
                 b"Restore in place",
                 b"Verify for restore",
                 b"a safety snapshot for rollback",
+                b"Manual backups, offline restore, and verification",
+                b"Non-default databases can also be restored in place",
                 b"nonodb.saved-views",
                 b"nonodb-views-",
                 b"Could not import saved views",
             ):
                 assert marker in asset, marker
+            assert b"Backup, restore, and verification remain CLI-only" not in asset
             for marker in (
                 ":focus-visible",
                 ".skip-link",

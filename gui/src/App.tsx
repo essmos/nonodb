@@ -5454,7 +5454,7 @@ function DatabaseView({
 
       <section className="panel">
         <div className="panel-title"><h3>Maintenance (CLI)</h3></div>
-        <p className="muted small">Backup, restore, and verification remain CLI-only because the HTTP API intentionally does not expose filesystem paths. Authorization is managed from the <strong>Authorization</strong> tab.</p>
+        <p className="muted small">Manual backups, offline restore, and verification commands are available for the default database and disaster recovery. Non-default databases can also be restored in place from the <strong>Import</strong> tab. Authorization is managed from the <strong>Authorization</strong> tab.</p>
         <div className="command-list">
           {[
             'nonodb-cli backup /var/lib/nonodb ./backup',
