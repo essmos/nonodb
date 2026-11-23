@@ -67,6 +67,9 @@ pub fn authorize_request(
         | Request::GetGraph { coll }
         | Request::Traverse { coll, .. }
         | Request::ShortestPath { coll, .. }
+        | Request::Neighbors { coll, .. }
+        | Request::HybridSearch { coll, .. }
+        | Request::GraphRebuildStatus { coll }
         | Request::Search { coll, .. }
         | Request::Fuzzy { coll, .. }
         | Request::History { coll, .. }
@@ -124,7 +127,8 @@ pub fn authorize_request(
         | Request::CreateVectorIndex { coll, .. }
         | Request::Reindex { coll }
         | Request::DropGraph { coll }
-        | Request::ReindexGraph { coll }
+        | Request::ReindexGraph { coll, .. }
+        | Request::CancelGraphRebuild { coll }
         | Request::DropVectorIndex { coll, .. }
         | Request::CreateCollection { coll, .. }
         | Request::DropCollection { coll }
@@ -217,6 +221,16 @@ pub fn authorize_request(
             Ok(())
         }
     }
+}
+
+pub fn allow_collection(
+    principal: &Principal,
+    action: Action,
+    database: &str,
+    coll: &str,
+    op: &'static str,
+) -> Result<(), ApiError> {
+    allow(principal, action, database, coll, op)
 }
 
 pub fn authorize_write_op(

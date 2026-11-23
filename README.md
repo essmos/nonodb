@@ -190,9 +190,18 @@ single-database directories are migrated to `default/` on startup. See
   collection and endpoint/label/weight fields.
 - Native `out`/`in` adjacency slots are maintained in the same transaction as
   every edge insert, update, delete, TTL expiry, and replication apply.
-- `traverse` supports BFS/DFS, directions, label filters, cycle markers, tree or
-  flat output, hard node/edge/byte budgets, and vector-search seeds.
+- `traverse` supports BFS/DFS, directions, label/edge/node filters, temporal
+  `as_of` windows, projection, cycle markers, tree or flat output, hard
+  node/edge/byte budgets, and vector-search seeds.
+- `neighbors` returns one-hop filtered neighbors without building a tree.
 - `shortest_path` uses BFS by hops or Dijkstra over edge weights.
+- `hybrid_search` reranks vector hits and their graph neighborhood with
+  deterministic `vector_weight`/`graph_weight` scoring.
+- `$graphLookup` uses the adjacency fast path when the lookup fields match the
+  configured graph, with a safe fallback.
+- Online `reindex_graph` builds a new adjacency generation into temporary slots
+  and atomically swaps it after a complete scan; reads keep using the old
+  generation and edge writes are mirrored meanwhile.
 - Graph configuration and traversal are available through the HTTP API, Python
   client, and the GUI Graph tab. See [Graph traversal](docs/graph.md).
 

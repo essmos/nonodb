@@ -126,6 +126,10 @@ jobs:
           python3 scripts/multi_database_features_test.py
           python3 scripts/durability_test.py
           python3 scripts/graph_test.py
+          python3 scripts/graph_auth_test.py
+          python3 scripts/graph_property_test.py
+          python3 scripts/graph_crash_test.py
+          python3 scripts/graph_replication_test.py
           python3 scripts/gui_test.py
           python3 scripts/gui_views_test.py
           python3 scripts/gui_graph_test.py

@@ -1579,6 +1579,8 @@ class Collection:
         to_field: str = "to",
         label_field: str = "label",
         weight_field: str = "weight",
+        valid_from_field: str = "",
+        valid_to_field: str = "",
         directed: bool = True,
     ) -> dict[str, Any]:
         """Configures a graph rooted at this node collection.
@@ -1597,6 +1599,8 @@ class Collection:
                     "to_field": to_field,
                     "label_field": label_field,
                     "weight_field": weight_field,
+                    "valid_from_field": valid_from_field,
+                    "valid_to_field": valid_to_field,
                     "directed": directed,
                 },
             }
@@ -1610,9 +1614,26 @@ class Collection:
         """Removes the graph definition and its adjacency index."""
         return self._db.exec({"op": "drop_graph", "coll": self.name})["dropped"]
 
-    def reindex_graph(self) -> dict[str, Any]:
-        """Rebuilds the adjacency index from the edge collection."""
-        return self._db.exec({"op": "reindex_graph", "coll": self.name})
+    def reindex_graph(self, *, online: bool = False) -> dict[str, Any]:
+        """Rebuilds the adjacency index from the edge collection.
+
+        With ``online=True`` the rebuild is started in the background and the
+        old generation stays readable until an atomic swap completes. Poll
+        :meth:`graph_rebuild_status` for progress.
+        """
+        return self._db.exec(
+            {"op": "reindex_graph", "coll": self.name, "online": online}
+        )
+
+    def graph_rebuild_status(self) -> dict[str, Any]:
+        """Returns online adjacency rebuild progress."""
+        return self._db.exec({"op": "graph_rebuild_status", "coll": self.name})
+
+    def cancel_graph_rebuild(self) -> bool:
+        """Discards the in-progress online adjacency rebuild."""
+        return self._db.exec(
+            {"op": "cancel_graph_rebuild", "coll": self.name}
+        )["canceled"]
 
     def traverse(
         self,
@@ -1621,6 +1642,9 @@ class Collection:
         seed: Optional[dict[str, Any]] = None,
         direction: str = "out",
         labels: Optional[Iterable[str]] = None,
+        edge_filter: Optional[dict[str, Any]] = None,
+        node_filter: Optional[dict[str, Any]] = None,
+        as_of: Any = None,
         max_depth: int = 3,
         limit_nodes: int = 1000,
         limit_edges: int = 10_000,
@@ -1628,6 +1652,7 @@ class Collection:
         tree: bool = True,
         include_edges: bool = False,
         algorithm: str = "bfs",
+        projection: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
         """Traverses the graph from `start` ids or a vector seed.
 
@@ -1658,6 +1683,14 @@ class Collection:
         }
         if seed is not None:
             payload["seed"] = seed
+        if edge_filter is not None:
+            payload["edge_filter"] = edge_filter
+        if node_filter is not None:
+            payload["node_filter"] = node_filter
+        if as_of is not None:
+            payload["as_of"] = as_of
+        if projection is not None:
+            payload["projection"] = projection
         return self._db.exec(payload)
 
     def shortest_path(
@@ -1667,24 +1700,120 @@ class Collection:
         *,
         direction: str = "out",
         labels: Optional[Iterable[str]] = None,
+        edge_filter: Optional[dict[str, Any]] = None,
+        node_filter: Optional[dict[str, Any]] = None,
+        as_of: Any = None,
         max_depth: int = 8,
         limit_nodes: int = 1000,
         weighted: bool = False,
+        projection: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
         """Returns a shortest path by hops or by edge `weight` (Dijkstra)."""
-        return self._db.exec(
-            {
-                "op": "shortest_path",
-                "coll": self.name,
-                "start": start,
-                "target": target,
-                "direction": direction,
-                "labels": list(labels or []),
-                "max_depth": max_depth,
-                "limit_nodes": limit_nodes,
-                "weighted": weighted,
-            }
-        )
+        payload: dict[str, Any] = {
+            "op": "shortest_path",
+            "coll": self.name,
+            "start": start,
+            "target": target,
+            "direction": direction,
+            "labels": list(labels or []),
+            "max_depth": max_depth,
+            "limit_nodes": limit_nodes,
+            "weighted": weighted,
+        }
+        if edge_filter is not None:
+            payload["edge_filter"] = edge_filter
+        if node_filter is not None:
+            payload["node_filter"] = node_filter
+        if as_of is not None:
+            payload["as_of"] = as_of
+        if projection is not None:
+            payload["projection"] = projection
+        return self._db.exec(payload)
+
+    def neighbors(
+        self,
+        start: Any,
+        *,
+        direction: str = "out",
+        labels: Optional[Iterable[str]] = None,
+        edge_filter: Optional[dict[str, Any]] = None,
+        node_filter: Optional[dict[str, Any]] = None,
+        as_of: Any = None,
+        projection: Optional[dict[str, Any]] = None,
+        include_edges: bool = False,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        """Returns one-hop neighbors with the same filters as traverse."""
+        payload: dict[str, Any] = {
+            "op": "neighbors",
+            "coll": self.name,
+            "start": start,
+            "direction": direction,
+            "labels": list(labels or []),
+            "include_edges": include_edges,
+            "limit": limit,
+        }
+        if edge_filter is not None:
+            payload["edge_filter"] = edge_filter
+        if node_filter is not None:
+            payload["node_filter"] = node_filter
+        if as_of is not None:
+            payload["as_of"] = as_of
+        if projection is not None:
+            payload["projection"] = projection
+        return self._db.exec(payload)
+
+    def hybrid_search(
+        self,
+        field: str,
+        vector: Iterable[float],
+        *,
+        k: int = 10,
+        vector_filter: Optional[dict[str, Any]] = None,
+        direction: str = "out",
+        labels: Optional[Iterable[str]] = None,
+        edge_filter: Optional[dict[str, Any]] = None,
+        node_filter: Optional[dict[str, Any]] = None,
+        as_of: Any = None,
+        max_depth: int = 2,
+        limit: int = 20,
+        max_nodes: int = 1000,
+        max_edges: int = 10_000,
+        vector_weight: float = 0.7,
+        graph_weight: float = 0.3,
+        projection: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        """Reranks vector hits and their graph neighborhood.
+
+        Returns deterministic `score`, `vector_score` and `graph_score` values;
+        ties are broken by `_id`.
+        """
+        payload: dict[str, Any] = {
+            "op": "hybrid_search",
+            "coll": self.name,
+            "field": field,
+            "vector": list(vector),
+            "k": k,
+            "direction": direction,
+            "labels": list(labels or []),
+            "max_depth": max_depth,
+            "limit": limit,
+            "max_nodes": max_nodes,
+            "max_edges": max_edges,
+            "vector_weight": vector_weight,
+            "graph_weight": graph_weight,
+        }
+        if vector_filter is not None:
+            payload["filter"] = vector_filter
+        if edge_filter is not None:
+            payload["edge_filter"] = edge_filter
+        if node_filter is not None:
+            payload["node_filter"] = node_filter
+        if as_of is not None:
+            payload["as_of"] = as_of
+        if projection is not None:
+            payload["projection"] = projection
+        return self._db.exec(payload)
 
     # -- read --------------------------------------------------------
     def watch_once(

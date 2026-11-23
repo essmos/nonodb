@@ -18,8 +18,20 @@ type GraphDef = {
   to_field: string;
   label_field: string;
   weight_field: string;
+  valid_from_field?: string;
+  valid_to_field?: string;
   directed: boolean;
+  generation?: number;
 };
+
+function parseJson(value: string): unknown | undefined {
+  if (!value.trim()) return undefined;
+  try {
+    return JSON.parse(value);
+  } catch {
+    throw new Error(`invalid JSON: ${value}`);
+  }
+}
 
 function idOf(node: Doc): string {
   const id = node._id;
@@ -150,7 +162,12 @@ export default function GraphPage({
   const [toField, setToField] = useState('to');
   const [labelField, setLabelField] = useState('label');
   const [weightField, setWeightField] = useState('weight');
+  const [validFromField, setValidFromField] = useState('');
+  const [validToField, setValidToField] = useState('');
   const [directed, setDirected] = useState(true);
+  const [edgeFilter, setEdgeFilter] = useState('');
+  const [nodeFilter, setNodeFilter] = useState('');
+  const [projection, setProjection] = useState('');
   const [start, setStart] = useState('');
   const [direction, setDirection] = useState('out');
   const [labels, setLabels] = useState('');
@@ -180,6 +197,8 @@ export default function GraphPage({
           setToField(result.graph.to_field);
           setLabelField(result.graph.label_field);
           setWeightField(result.graph.weight_field);
+          setValidFromField(result.graph.valid_from_field ?? '');
+          setValidToField(result.graph.valid_to_field ?? '');
           setDirected(result.graph.directed);
         }
       })
@@ -206,6 +225,8 @@ export default function GraphPage({
           to_field: toField,
           label_field: labelField,
           weight_field: weightField,
+          valid_from_field: validFromField,
+          valid_to_field: validToField,
           directed,
         },
       });
@@ -279,6 +300,9 @@ export default function GraphPage({
         algorithm,
         tree: true,
         include_edges: includeEdges,
+        ...(edgeFilter.trim() ? { edge_filter: parseJson(edgeFilter) } : {}),
+        ...(nodeFilter.trim() ? { node_filter: parseJson(nodeFilter) } : {}),
+        ...(projection.trim() ? { projection: parseJson(projection) } : {}),
       });
       setRoots(result.roots ?? []);
       setSummary(
@@ -348,6 +372,14 @@ export default function GraphPage({
             <input value={weightField} onChange={(e) => setWeightField(e.target.value)} />
           </label>
           <label>
+            Valid from field (optional)
+            <input value={validFromField} onChange={(e) => setValidFromField(e.target.value)} />
+          </label>
+          <label>
+            Valid to field (optional)
+            <input value={validToField} onChange={(e) => setValidToField(e.target.value)} />
+          </label>
+          <label>
             Directed
             <select value={directed ? 'yes' : 'no'} onChange={(e) => setDirected(e.target.value === 'yes')}>
               <option value="yes">yes</option>
@@ -401,6 +433,18 @@ export default function GraphPage({
               <option value="bfs">bfs</option>
               <option value="dfs">dfs</option>
             </select>
+          </label>
+          <label>
+            Edge filter (JSON)
+            <input value={edgeFilter} onChange={(e) => setEdgeFilter(e.target.value)} placeholder='{"weight":{"$gte":1}}' />
+          </label>
+          <label>
+            Node filter (JSON)
+            <input value={nodeFilter} onChange={(e) => setNodeFilter(e.target.value)} placeholder='{"status":"active"}' />
+          </label>
+          <label>
+            Projection (JSON)
+            <input value={projection} onChange={(e) => setProjection(e.target.value)} placeholder='{"name":1}' />
           </label>
           <label>
             Include full edge

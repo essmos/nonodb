@@ -26,6 +26,7 @@ struct Config {
     interval: Duration,
     ttl_interval: Duration,
     ttl_limit: usize,
+    graph_rebuild_limit: usize,
 }
 
 impl Config {
@@ -34,6 +35,7 @@ impl Config {
             interval: Duration::from_millis(env_u64("NONODB_MAINTENANCE_INTERVAL_MS", 1000).max(1)),
             ttl_interval: Duration::from_secs(env_u64("NONODB_TTL_SWEEP_INTERVAL", 5).max(1)),
             ttl_limit: env_usize("NONODB_TTL_SWEEP_LIMIT", 256).clamp(1, 10_000),
+            graph_rebuild_limit: env_usize("NONODB_GRAPH_REBUILD_CHUNK", 1000).clamp(1, 10_000),
         }
     }
 }
@@ -76,6 +78,7 @@ fn run(
     let mut last_ttl: Option<Instant> = None;
     let mut last_prune: Option<Instant> = None;
     let mut last_subscription_prune: Option<Instant> = None;
+    let mut last_graph_rebuild: Option<Instant> = None;
 
     loop {
         let deadline = Instant::now() + config.interval;
@@ -124,8 +127,38 @@ fn run(
             }
         }
 
+        if last_graph_rebuild.is_none_or(|at| at.elapsed() >= config.interval) {
+            last_graph_rebuild = Some(Instant::now());
+            if let Err(e) = step_graph_rebuilds(&store, &write_tx, config.graph_rebuild_limit) {
+                tracing::warn!(?e, "graph rebuild step failed");
+            }
+        }
+
         auto_index.tick_due();
     }
+}
+
+fn step_graph_rebuilds(
+    store: &Store,
+    write_tx: &mpsc::Sender<WriteJob>,
+    limit: usize,
+) -> Result<(), String> {
+    for coll in store.collections().map_err(|e| e.to_string())? {
+        let collection = store.collection(&coll).map_err(|e| e.to_string())?;
+        if collection
+            .graph_rebuild_state()
+            .map_err(|e| e.to_string())?
+            .is_none()
+        {
+            continue;
+        }
+        submit(
+            write_tx,
+            WriteReq::GraphRebuildStep { edge: coll, limit },
+            true,
+        )?;
+    }
+    Ok(())
 }
 
 fn sweep_ttl(store: &Store, write_tx: &mpsc::Sender<WriteJob>, limit: usize) -> Result<(), String> {

@@ -20,7 +20,8 @@ use crate::error::{Error, Result};
 use crate::events::{self, EventConfig, EVENTS_COLLECTION};
 use crate::geo;
 use crate::graph::{
-    self, AdjEdge, GraphDef, GraphDirection, GraphView, ShortestPathOptions, TraverseOptions,
+    self, AdjEdge, GraphDef, GraphDirection, GraphRebuildState, GraphView, HybridOptions,
+    NeighborsOptions, ShortestPathOptions, TraverseOptions,
 };
 use crate::history::{self, HistoryEntry};
 use crate::id;
@@ -5166,8 +5167,9 @@ impl<'e> Collection<'e> {
         &self,
         txn: &RoTxn<'_>,
         direction: GraphDirection,
+        generation: u64,
     ) -> Result<Option<Database<Bytes, Bytes>>> {
-        let resource = graph::adjacency_resource(&self.name, direction);
+        let resource = graph::adjacency_resource_gen(&self.name, direction, generation);
         self.resource_db(txn, &resource, &resource)
     }
 
@@ -5175,8 +5177,9 @@ impl<'e> Collection<'e> {
         &self,
         wtxn: &mut RwTxn<'_>,
         direction: GraphDirection,
+        generation: u64,
     ) -> Result<Database<Bytes, Bytes>> {
-        let resource = graph::adjacency_resource(&self.name, direction);
+        let resource = graph::adjacency_resource_gen(&self.name, direction, generation);
         self.resource_db_in(wtxn, &resource, &resource)
     }
 
@@ -5186,6 +5189,42 @@ impl<'e> Collection<'e> {
             return Ok(None);
         };
         Ok(Some(graph::parse_def(raw)?))
+    }
+
+    pub fn graph_rebuild_state_in(&self, txn: &RoTxn<'_>) -> Result<Option<GraphRebuildState>> {
+        let key = graph::rebuild_key(&self.name);
+        let Some(raw) = self.meta.get(txn, key.as_bytes())? else {
+            return Ok(None);
+        };
+        Ok(Some(serde_json::from_slice(raw)?))
+    }
+
+    pub fn graph_rebuild_state(&self) -> Result<Option<GraphRebuildState>> {
+        let rtxn = self.read_txn()?;
+        let state = self.graph_rebuild_state_in(&rtxn)?;
+        rtxn.commit()?;
+        Ok(state)
+    }
+
+    fn set_graph_rebuild_state_in(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        state: Option<&GraphRebuildState>,
+    ) -> Result<()> {
+        let key = graph::rebuild_key(&self.name);
+        match state {
+            Some(state) => {
+                self.meta.put(
+                    &mut *wtxn,
+                    key.as_bytes(),
+                    serde_json::to_vec(state)?.as_slice(),
+                )?;
+            }
+            None => {
+                self.meta.delete(&mut *wtxn, key.as_bytes())?;
+            }
+        }
+        Ok(())
     }
 
     fn edge_graph_def_in(&self, txn: &RoTxn<'_>) -> Result<Option<GraphDef>> {
@@ -5216,6 +5255,11 @@ impl<'e> Collection<'e> {
     }
 
     pub fn set_graph_txn(&self, wtxn: &mut RwTxn<'_>, def: &GraphDef) -> Result<()> {
+        if self.profile.is_vault() {
+            return Err(Error::Query(
+                "graph operations are not supported on vault collections".into(),
+            ));
+        }
         let store = self.store.ok_or_else(|| {
             Error::Query("graph configuration requires a store-backed collection".into())
         })?;
@@ -5227,6 +5271,11 @@ impl<'e> Collection<'e> {
                     def.edge_collection
                 ))
             })?;
+        if edge.profile.is_vault() {
+            return Err(Error::Query(
+                "graph edge collection cannot be a vault collection".into(),
+            ));
+        }
         if let Some(existing) = edge.edge_graph_def_in(&*wtxn)? {
             if existing.node_collection != def.node_collection {
                 return Err(Error::Query(format!(
@@ -5237,6 +5286,7 @@ impl<'e> Collection<'e> {
         }
         if let Some(existing) = self.graph_def_in(&*wtxn)? {
             edge.clear_graph_adjacency_txn(wtxn, &existing)?;
+            edge.set_graph_rebuild_state_in(wtxn, None)?;
             if existing.edge_collection != def.edge_collection {
                 self.meta.delete(
                     &mut *wtxn,
@@ -5259,10 +5309,19 @@ impl<'e> Collection<'e> {
     }
 
     pub fn get_graph(&self) -> Result<Option<GraphDef>> {
+        if self.profile.is_vault() {
+            return Err(Error::Query(
+                "graph operations are not supported on vault collections".into(),
+            ));
+        }
         let rtxn = self.read_txn()?;
         let out = self.graph_def_in(&rtxn)?;
         rtxn.commit()?;
         Ok(out)
+    }
+
+    pub fn get_graph_in(&self, rtxn: &RoTxn<'_>) -> Result<Option<GraphDef>> {
+        self.graph_def_in(rtxn)
     }
 
     /// Removes the graph definition and clears its adjacency index.
@@ -5282,6 +5341,7 @@ impl<'e> Collection<'e> {
         })?;
         if let Some(edge) = store.collection_at(&*wtxn, &def.edge_collection)? {
             edge.clear_graph_adjacency_txn(wtxn, &def)?;
+            edge.set_graph_rebuild_state_in(wtxn, None)?;
         }
         self.meta
             .delete(&mut *wtxn, graph::node_def_key(&self.name).as_bytes())?;
@@ -5293,9 +5353,12 @@ impl<'e> Collection<'e> {
     }
 
     fn clear_graph_adjacency_txn(&self, wtxn: &mut RwTxn<'_>, def: &GraphDef) -> Result<()> {
-        for direction in [GraphDirection::Out, GraphDirection::In] {
-            let resource = graph::adjacency_resource(&def.edge_collection, direction);
-            self.drop_resource_db(wtxn, &resource, &resource)?;
+        for generation in 0..=def.generation.saturating_add(1) {
+            for direction in [GraphDirection::Out, GraphDirection::In] {
+                let resource =
+                    graph::adjacency_resource_gen(&def.edge_collection, direction, generation);
+                self.drop_resource_db(wtxn, &resource, &resource)?;
+            }
         }
         Ok(())
     }
@@ -5314,8 +5377,8 @@ impl<'e> Collection<'e> {
                 hint: None,
             },
         )?;
-        let out = self.graph_adjacency_db_in(wtxn, GraphDirection::Out)?;
-        let incoming = self.graph_adjacency_db_in(wtxn, GraphDirection::In)?;
+        let out = self.graph_adjacency_db_in(wtxn, GraphDirection::Out, def.generation)?;
+        let incoming = self.graph_adjacency_db_in(wtxn, GraphDirection::In, def.generation)?;
         for doc in &docs {
             for (direction, key, value) in graph::adjacency_entries(def, doc)? {
                 match direction {
@@ -5352,12 +5415,238 @@ impl<'e> Collection<'e> {
                     def.edge_collection
                 ))
             })?;
+        if edge.graph_rebuild_state_in(&*wtxn)?.is_some() {
+            return Err(Error::Query(
+                "an online graph rebuild is running; cancel it first".into(),
+            ));
+        }
         edge.clear_graph_adjacency_txn(wtxn, &def)?;
         edge.rebuild_graph_adjacency_txn(wtxn, &def)?;
         Ok(edge.db.iter(&*wtxn)?.filter_map(|item| item.ok()).count())
     }
 
+    /// Starts an online adjacency rebuild. Readers keep using the active
+    /// generation; edge writes are mirrored into the target generation until
+    /// the maintenance worker atomically swaps it in.
+    pub fn start_graph_rebuild(&self) -> Result<Value> {
+        let mut wtxn = self.write_txn()?;
+        let out = self.start_graph_rebuild_txn(&mut wtxn)?;
+        wtxn.commit()?;
+        Ok(out)
+    }
+
+    pub fn start_graph_rebuild_txn(&self, wtxn: &mut RwTxn<'_>) -> Result<Value> {
+        if self.profile.is_vault() {
+            return Err(Error::Query(
+                "graph operations are not supported on vault collections".into(),
+            ));
+        }
+        let def = self
+            .graph_def_in(&*wtxn)?
+            .ok_or_else(|| Error::Query("graph is not configured for this collection".into()))?;
+        let store = self.store.ok_or_else(|| {
+            Error::Query("graph configuration requires a store-backed collection".into())
+        })?;
+        let edge = store
+            .collection_at(&*wtxn, &def.edge_collection)?
+            .ok_or_else(|| {
+                Error::Query(format!(
+                    "graph edge collection `{}` does not exist",
+                    def.edge_collection
+                ))
+            })?;
+        if edge.graph_rebuild_state_in(&*wtxn)?.is_some() {
+            return Err(Error::Query("graph rebuild is already running".into()));
+        }
+        let target = def.generation.saturating_add(1);
+        for direction in [GraphDirection::Out, GraphDirection::In] {
+            let resource = graph::adjacency_resource_gen(&edge.name, direction, target);
+            edge.drop_resource_db(&mut *wtxn, &resource, &resource)?;
+        }
+        let state = GraphRebuildState {
+            node_collection: self.name.clone(),
+            edge_collection: edge.name.clone(),
+            target_generation: target,
+            after: None,
+            scanned: 0,
+        };
+        edge.set_graph_rebuild_state_in(wtxn, Some(&state))?;
+        Ok(json!({
+            "active_generation": def.generation,
+            "target_generation": target,
+            "scanned": 0,
+            "done": false,
+        }))
+    }
+
+    pub fn graph_rebuild_status(&self) -> Result<Value> {
+        let rtxn = self.read_txn()?;
+        let def = self
+            .graph_def_in(&rtxn)?
+            .ok_or_else(|| Error::Query("graph is not configured for this collection".into()))?;
+        let store = self.store.ok_or_else(|| {
+            Error::Query("graph configuration requires a store-backed collection".into())
+        })?;
+        let Some(edge) = store.collection_at(&rtxn, &def.edge_collection)? else {
+            return Ok(json!({
+                "active_generation": def.generation,
+                "target_generation": Value::Null,
+                "scanned": 0,
+                "done": true,
+            }));
+        };
+        let state = edge.graph_rebuild_state_in(&rtxn)?;
+        rtxn.commit()?;
+        Ok(match state {
+            Some(state) => json!({
+                "active_generation": def.generation,
+                "target_generation": state.target_generation,
+                "scanned": state.scanned,
+                "after": state.after,
+                "done": false,
+            }),
+            None => json!({
+                "active_generation": def.generation,
+                "target_generation": Value::Null,
+                "scanned": 0,
+                "done": true,
+            }),
+        })
+    }
+
+    pub fn cancel_graph_rebuild(&self) -> Result<bool> {
+        let mut wtxn = self.write_txn()?;
+        let out = self.cancel_graph_rebuild_txn(&mut wtxn)?;
+        wtxn.commit()?;
+        Ok(out)
+    }
+
+    pub fn cancel_graph_rebuild_txn(&self, wtxn: &mut RwTxn<'_>) -> Result<bool> {
+        let Some(def) = self.graph_def_in(&*wtxn)? else {
+            return Ok(false);
+        };
+        let store = self.store.ok_or_else(|| {
+            Error::Query("graph configuration requires a store-backed collection".into())
+        })?;
+        let Some(edge) = store.collection_at(&*wtxn, &def.edge_collection)? else {
+            return Ok(false);
+        };
+        let Some(state) = edge.graph_rebuild_state_in(&*wtxn)? else {
+            return Ok(false);
+        };
+        for direction in [GraphDirection::Out, GraphDirection::In] {
+            let resource =
+                graph::adjacency_resource_gen(&edge.name, direction, state.target_generation);
+            edge.drop_resource_db(&mut *wtxn, &resource, &resource)?;
+        }
+        edge.set_graph_rebuild_state_in(wtxn, None)?;
+        Ok(true)
+    }
+
+    /// Builds one bounded chunk of the online rebuild. Called by the daemon
+    /// maintenance worker through the single writer thread.
+    pub fn step_graph_rebuild(&self, limit: usize) -> Result<Value> {
+        let mut wtxn = self.write_txn()?;
+        let out = self.step_graph_rebuild_txn(&mut wtxn, limit)?;
+        wtxn.commit()?;
+        Ok(out)
+    }
+
+    pub fn step_graph_rebuild_txn(&self, wtxn: &mut RwTxn<'_>, limit: usize) -> Result<Value> {
+        let limit = limit.clamp(1, 10_000);
+        let Some(mut state) = self.graph_rebuild_state_in(&*wtxn)? else {
+            return Ok(json!({"done": true, "scanned": 0}));
+        };
+        let store = self.store.ok_or_else(|| {
+            Error::Query("graph configuration requires a store-backed collection".into())
+        })?;
+        let Some(node) = store.collection_at(&*wtxn, &state.node_collection)? else {
+            return Err(Error::Query(
+                "graph rebuild node collection is missing".into(),
+            ));
+        };
+        let Some(def) = node.graph_def_in(&*wtxn)? else {
+            return Err(Error::Query("graph rebuild definition is missing".into()));
+        };
+        if def.generation.saturating_add(1) != state.target_generation {
+            return Err(Error::Query(
+                "graph rebuild target generation is stale".into(),
+            ));
+        }
+        let out =
+            self.graph_adjacency_db_in(&mut *wtxn, GraphDirection::Out, state.target_generation)?;
+        let incoming =
+            self.graph_adjacency_db_in(&mut *wtxn, GraphDirection::In, state.target_generation)?;
+        let mut docs = Vec::with_capacity(limit);
+        let range = match state.after.as_deref() {
+            Some(after) => (Bound::Excluded(after.as_bytes()), Bound::Unbounded),
+            None => (Bound::Unbounded, Bound::Unbounded),
+        };
+        for item in self.db.range(&*wtxn, &range)? {
+            let (id, raw) = item?;
+            docs.push((String::from_utf8_lossy(id).into_owned(), raw.to_vec()));
+            if docs.len() >= limit {
+                break;
+            }
+        }
+        let done_scan = docs.len() < limit;
+        for (id, raw) in &docs {
+            let doc: Value = parse_json(raw)?;
+            for (direction, key, value) in graph::adjacency_entries(&def, &doc)? {
+                match direction {
+                    GraphDirection::Out => out.put(&mut *wtxn, key.as_slice(), value.as_slice())?,
+                    GraphDirection::In => {
+                        incoming.put(&mut *wtxn, key.as_slice(), value.as_slice())?
+                    }
+                    GraphDirection::Both => unreachable!(),
+                }
+            }
+            state.after = Some(id.clone());
+        }
+        state.scanned = state.scanned.saturating_add(docs.len() as u64);
+        if !done_scan {
+            self.set_graph_rebuild_state_in(wtxn, Some(&state))?;
+            return Ok(json!({
+                "done": false,
+                "scanned": state.scanned,
+                "after": state.after,
+            }));
+        }
+        // Atomic swap: bump both metadata copies, remove the state, and delete
+        // the old generations in the same transaction.
+        let mut new_def = def.clone();
+        new_def.generation = state.target_generation;
+        let raw_def = serde_json::to_vec(&new_def)?;
+        node.meta.put(
+            &mut *wtxn,
+            graph::node_def_key(&node.name).as_bytes(),
+            raw_def.as_slice(),
+        )?;
+        self.meta.put(
+            &mut *wtxn,
+            graph::edge_def_key(&self.name).as_bytes(),
+            raw_def.as_slice(),
+        )?;
+        for generation in 0..state.target_generation {
+            for direction in [GraphDirection::Out, GraphDirection::In] {
+                let resource = graph::adjacency_resource_gen(&self.name, direction, generation);
+                self.drop_resource_db(&mut *wtxn, &resource, &resource)?;
+            }
+        }
+        self.set_graph_rebuild_state_in(wtxn, None)?;
+        Ok(json!({
+            "done": true,
+            "scanned": state.scanned,
+            "active_generation": state.target_generation,
+        }))
+    }
+
     pub fn graph_traverse(&self, mut options: TraverseOptions) -> Result<Value> {
+        if self.profile.is_vault() {
+            return Err(Error::Query(
+                "graph operations are not supported on vault collections".into(),
+            ));
+        }
         options.validate()?;
         let rtxn = self.read_txn()?;
         let def = self
@@ -5401,6 +5690,11 @@ impl<'e> Collection<'e> {
     }
 
     pub fn graph_shortest_path(&self, options: ShortestPathOptions) -> Result<Value> {
+        if self.profile.is_vault() {
+            return Err(Error::Query(
+                "graph operations are not supported on vault collections".into(),
+            ));
+        }
         options.validate()?;
         let rtxn = self.read_txn()?;
         let def = self
@@ -5411,6 +5705,67 @@ impl<'e> Collection<'e> {
         })?;
         let view = GraphViewImpl::new(store, &rtxn, def)?;
         let out = graph::shortest_path(&view, &options)?;
+        rtxn.commit()?;
+        Ok(out)
+    }
+
+    pub fn graph_neighbors(&self, options: NeighborsOptions) -> Result<Value> {
+        if self.profile.is_vault() {
+            return Err(Error::Query(
+                "graph operations are not supported on vault collections".into(),
+            ));
+        }
+        options.validate()?;
+        let rtxn = self.read_txn()?;
+        let def = self
+            .graph_def_in(&rtxn)?
+            .ok_or_else(|| Error::Query("graph is not configured for this collection".into()))?;
+        let store = self.store.ok_or_else(|| {
+            Error::Query("graph traversal requires a store-backed collection".into())
+        })?;
+        let view = GraphViewImpl::new(store, &rtxn, def)?;
+        let out = graph::neighbors(&view, &options)?;
+        rtxn.commit()?;
+        Ok(out)
+    }
+
+    pub fn hybrid_search(&self, options: HybridOptions) -> Result<Value> {
+        if self.profile.is_vault() {
+            return Err(Error::Query(
+                "graph operations are not supported on vault collections".into(),
+            ));
+        }
+        options.validate()?;
+        let rtxn = self.read_txn()?;
+        let def = self
+            .graph_def_in(&rtxn)?
+            .ok_or_else(|| Error::Query("graph is not configured for this collection".into()))?;
+        let seeds = self.vector_search_in(
+            &rtxn,
+            &options.vector.field,
+            &options.vector.vector,
+            &options.vector.filter,
+            0,
+            Some(options.vector.k),
+        )?;
+        let seed_ids: Vec<String> = seeds
+            .iter()
+            .filter_map(|doc| doc.get("_id").and_then(crate::id::key_from_value))
+            .collect();
+        if seed_ids.is_empty() {
+            rtxn.commit()?;
+            return Ok(json!({
+                "items": [],
+                "nodes": 0,
+                "edges": 0,
+                "truncated": false,
+            }));
+        }
+        let store = self.store.ok_or_else(|| {
+            Error::Query("graph traversal requires a store-backed collection".into())
+        })?;
+        let view = GraphViewImpl::new(store, &rtxn, def)?;
+        let out = graph::hybrid(&view, &options, &seed_ids)?;
         rtxn.commit()?;
         Ok(out)
     }
@@ -5438,29 +5793,39 @@ impl<'e> Collection<'e> {
         let Some(def) = self.edge_graph_def_in(&*wtxn)? else {
             return Ok(());
         };
-        let out = self.graph_adjacency_db_in(wtxn, GraphDirection::Out)?;
-        let incoming = self.graph_adjacency_db_in(wtxn, GraphDirection::In)?;
-        for doc in [old, new].into_iter().flatten() {
-            for (direction, key, _) in graph::adjacency_entries(&def, doc)? {
-                match direction {
-                    GraphDirection::Out => {
-                        out.delete(&mut *wtxn, key.as_slice())?;
-                    }
-                    GraphDirection::In => {
-                        incoming.delete(&mut *wtxn, key.as_slice())?;
-                    }
-                    GraphDirection::Both => unreachable!(),
-                }
+        let mut generations = vec![def.generation];
+        if let Some(state) = self.graph_rebuild_state_in(&*wtxn)? {
+            if state.target_generation != def.generation {
+                generations.push(state.target_generation);
             }
         }
-        if let Some(doc) = new {
-            for (direction, key, value) in graph::adjacency_entries(&def, doc)? {
-                match direction {
-                    GraphDirection::Out => out.put(&mut *wtxn, key.as_slice(), value.as_slice())?,
-                    GraphDirection::In => {
-                        incoming.put(&mut *wtxn, key.as_slice(), value.as_slice())?
+        for generation in generations {
+            let out = self.graph_adjacency_db_in(wtxn, GraphDirection::Out, generation)?;
+            let incoming = self.graph_adjacency_db_in(wtxn, GraphDirection::In, generation)?;
+            for doc in [old, new].into_iter().flatten() {
+                for (direction, key, _) in graph::adjacency_entries(&def, doc)? {
+                    match direction {
+                        GraphDirection::Out => {
+                            out.delete(&mut *wtxn, key.as_slice())?;
+                        }
+                        GraphDirection::In => {
+                            incoming.delete(&mut *wtxn, key.as_slice())?;
+                        }
+                        GraphDirection::Both => unreachable!(),
                     }
-                    GraphDirection::Both => unreachable!(),
+                }
+            }
+            if let Some(doc) = new {
+                for (direction, key, value) in graph::adjacency_entries(&def, doc)? {
+                    match direction {
+                        GraphDirection::Out => {
+                            out.put(&mut *wtxn, key.as_slice(), value.as_slice())?
+                        }
+                        GraphDirection::In => {
+                            incoming.put(&mut *wtxn, key.as_slice(), value.as_slice())?
+                        }
+                        GraphDirection::Both => unreachable!(),
+                    }
                 }
             }
         }
@@ -6802,6 +7167,36 @@ impl<'e> Collection<'e> {
             return Ok(out);
         };
         let max_docs = aggregate::max_docs();
+        if restrict.is_none() {
+            let fast_def = match foreign.get_graph_in(rtxn)? {
+                Some(def)
+                    if def.node_collection == self.name
+                        && def.edge_collection == foreign.name
+                        && def.directed
+                        && def.from_field == connect_from
+                        && def.to_field == connect_to =>
+                {
+                    Some(def)
+                }
+                _ => None,
+            };
+            if let Some(def) = fast_def {
+                if let Some(out) = self.graph_lookup_adjacency(
+                    rtxn,
+                    &foreign,
+                    &def,
+                    docs.clone(),
+                    start_with,
+                    connect_from,
+                    as_field,
+                    max_depth,
+                    depth_field,
+                    vars,
+                )? {
+                    return Ok(out);
+                }
+            }
+        }
         let mut out = Vec::with_capacity(docs.len());
         for mut doc in docs {
             let start = aggregate::eval_expr_vars(&doc, start_with, vars)?;
@@ -6866,6 +7261,95 @@ impl<'e> Collection<'e> {
             out.push(doc);
         }
         Ok(out)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn graph_lookup_adjacency(
+        &self,
+        rtxn: &RoTxn<'_>,
+        foreign: &Collection<'_>,
+        def: &GraphDef,
+        docs: Vec<Value>,
+        start_with: &Value,
+        connect_from: &str,
+        as_field: &str,
+        max_depth: Option<usize>,
+        depth_field: Option<&str>,
+        vars: &BTreeMap<String, Value>,
+    ) -> Result<Option<Vec<Value>>> {
+        let Some(store) = self.store else {
+            return Ok(None);
+        };
+        let view = match GraphViewImpl::new(store, rtxn, def.clone()) {
+            Ok(view) => view,
+            Err(_) => return Ok(None),
+        };
+        let max_docs = aggregate::max_docs();
+        let mut out = Vec::with_capacity(docs.len());
+        for mut doc in docs {
+            let start = aggregate::eval_expr_vars(&doc, start_with, vars)?;
+            let mut values = Vec::new();
+            let mut value_keys = HashSet::new();
+            graph_push_value(&start, &mut values, &mut value_keys);
+            if values.iter().any(|value| graph::node_key(value).is_err()) {
+                return Ok(None);
+            }
+            let mut results = Vec::new();
+            let mut seen = HashSet::new();
+            let mut depth = 0usize;
+            loop {
+                if values.is_empty() {
+                    break;
+                }
+                let mut next_values = Vec::new();
+                let mut next_keys = HashSet::new();
+                for value in &values {
+                    let id = match graph::node_key(value) {
+                        Ok(id) => id,
+                        Err(_) => return Ok(None),
+                    };
+                    let neighbors = match view.neighbors(&id, GraphDirection::In, &[]) {
+                        Ok(neighbors) => neighbors,
+                        Err(_) => return Ok(None),
+                    };
+                    for edge in neighbors {
+                        let Some(bytes) = foreign.db.get(rtxn, edge.edge_id.as_bytes())? else {
+                            return Ok(None);
+                        };
+                        let candidate = match parse_json(bytes) {
+                            Ok(candidate) => candidate,
+                            Err(_) => return Ok(None),
+                        };
+                        let key = graph_identity(&candidate);
+                        if !seen.insert(key) {
+                            continue;
+                        }
+                        let next = graph_collect_field(&candidate, connect_from);
+                        let mut candidate = candidate;
+                        if let Some(depth_field) = depth_field {
+                            path::set(&mut candidate, depth_field, Value::from(depth as u64))?;
+                        }
+                        results.push(candidate);
+                        if results.len() > max_docs {
+                            return Err(Error::Query(format!(
+                                "$graphLookup result exceeds {max_docs} documents"
+                            )));
+                        }
+                        for value in next {
+                            graph_push_value(&value, &mut next_values, &mut next_keys);
+                        }
+                    }
+                }
+                if max_depth.is_some_and(|max_depth| depth >= max_depth) {
+                    break;
+                }
+                values = next_values;
+                depth = depth.saturating_add(1);
+            }
+            path::set(&mut doc, as_field, Value::Array(results))?;
+            out.push(doc);
+        }
+        Ok(Some(out))
     }
 
     fn union_stage_in(
@@ -9228,6 +9712,7 @@ impl<'e> Collection<'e> {
 struct GraphViewImpl<'a, 't> {
     txn: &'a RoTxn<'t>,
     node: Collection<'a>,
+    edge: Collection<'a>,
     def: GraphDef,
     out: Option<Database<Bytes, Bytes>>,
     incoming: Option<Database<Bytes, Bytes>>,
@@ -9251,11 +9736,12 @@ impl<'a, 't> GraphViewImpl<'a, 't> {
                     def.edge_collection
                 ))
             })?;
-        let out = edge.graph_adjacency_db(txn, GraphDirection::Out)?;
-        let incoming = edge.graph_adjacency_db(txn, GraphDirection::In)?;
+        let out = edge.graph_adjacency_db(txn, GraphDirection::Out, def.generation)?;
+        let incoming = edge.graph_adjacency_db(txn, GraphDirection::In, def.generation)?;
         Ok(Self {
             txn,
             node,
+            edge,
             def,
             out,
             incoming,
@@ -9286,14 +9772,33 @@ impl<'a, 't> GraphViewImpl<'a, 't> {
             if !seen.insert(edge_id.to_string()) {
                 continue;
             }
-            let edge: Value = serde_json::from_slice(raw)?;
-            let weight = graph::edge_parts(&self.def, &edge)?.weight;
+            let summary = match graph::decode_adjacency_value(raw) {
+                Ok(summary) => summary,
+                Err(_) => {
+                    // Releases before compact adjacency stored the full edge
+                    // document. Read it transparently; the next reindex writes
+                    // the compact form.
+                    let doc: Value = parse_json(raw)?;
+                    let parts = graph::edge_parts(&self.def, &doc)?;
+                    graph::AdjacencyValue {
+                        edge_id: graph::edge_id(&doc)?,
+                        label: parts.label,
+                        weight: parts.weight,
+                        valid_from: parts.valid_from,
+                        valid_to: parts.valid_to,
+                    }
+                }
+            };
+            if summary.edge_id != edge_id || summary.label != edge_label {
+                return Err(Error::Query("corrupt graph adjacency value".into()));
+            }
             out.push(AdjEdge {
-                edge_id: edge_id.to_string(),
-                label: edge_label.to_string(),
-                weight,
+                edge_id: summary.edge_id,
+                label: summary.label,
+                weight: summary.weight,
                 target: target.to_string(),
-                edge,
+                valid_from: summary.valid_from,
+                valid_to: summary.valid_to,
             });
         }
         Ok(())
@@ -9303,6 +9808,14 @@ impl<'a, 't> GraphViewImpl<'a, 't> {
 impl GraphView for GraphViewImpl<'_, '_> {
     fn node(&self, id: &str) -> Result<Option<Value>> {
         self.node
+            .db
+            .get(self.txn, id.as_bytes())?
+            .map(parse_json)
+            .transpose()
+    }
+
+    fn edge(&self, id: &str) -> Result<Option<Value>> {
+        self.edge
             .db
             .get(self.txn, id.as_bytes())?
             .map(parse_json)

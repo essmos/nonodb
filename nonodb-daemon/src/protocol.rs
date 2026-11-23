@@ -3,7 +3,9 @@
 use serde::{ser::SerializeMap, Deserialize, Serialize, Serializer};
 use serde_json::{value::RawValue, Value};
 
-use nonodb_core::graph::{GraphDef, ShortestPathOptions, TraverseOptions};
+use nonodb_core::graph::{
+    GraphDef, HybridOptions, NeighborsOptions, ShortestPathOptions, TraverseOptions,
+};
 use nonodb_core::{CollectionProfile, IndexSpec, SearchAllRequest, VaultKey, VectorMetric};
 
 use crate::webhooks::WebhookRule;
@@ -441,6 +443,14 @@ pub enum Request {
     },
     ReindexGraph {
         coll: String,
+        #[serde(default)]
+        online: bool,
+    },
+    GraphRebuildStatus {
+        coll: String,
+    },
+    CancelGraphRebuild {
+        coll: String,
     },
     ListVectorIndexes {
         coll: String,
@@ -471,6 +481,18 @@ pub enum Request {
         coll: String,
         #[serde(flatten)]
         options: ShortestPathOptions,
+    },
+    /// One-hop neighbors of a node with graph filters.
+    Neighbors {
+        coll: String,
+        #[serde(flatten)]
+        options: NeighborsOptions,
+    },
+    /// Vector seed + graph expansion rerank.
+    HybridSearch {
+        coll: String,
+        #[serde(flatten)]
+        options: HybridOptions,
     },
     Search {
         coll: String,
@@ -908,6 +930,16 @@ pub enum WriteReq {
     ReindexGraph {
         coll: String,
     },
+    StartGraphRebuild {
+        coll: String,
+    },
+    CancelGraphRebuild {
+        coll: String,
+    },
+    GraphRebuildStep {
+        edge: String,
+        limit: usize,
+    },
     /// SQL `INSERT` or `UPDATE` executed in one writer transaction.
     Sql {
         query: String,
@@ -1012,9 +1044,13 @@ impl Request {
             Self::GetGraph { .. } => "get_graph",
             Self::Traverse { .. } => "traverse",
             Self::ShortestPath { .. } => "shortest_path",
+            Self::Neighbors { .. } => "neighbors",
+            Self::HybridSearch { .. } => "hybrid_search",
             Self::SetGraph { .. } => "set_graph",
             Self::DropGraph { .. } => "drop_graph",
             Self::ReindexGraph { .. } => "reindex_graph",
+            Self::GraphRebuildStatus { .. } => "graph_rebuild_status",
+            Self::CancelGraphRebuild { .. } => "cancel_graph_rebuild",
             Self::DropVectorIndex { .. } => "drop_vector_index",
             Self::ListVectorIndexes { .. } => "list_vector_indexes",
             Self::VectorSearch { .. } => "vector_search",
@@ -1093,6 +1129,9 @@ impl Request {
             | Self::GetGraph { .. }
             | Self::Traverse { .. }
             | Self::ShortestPath { .. }
+            | Self::Neighbors { .. }
+            | Self::HybridSearch { .. }
+            | Self::GraphRebuildStatus { .. }
             | Self::Search { .. }
             | Self::SearchAll { .. }
             | Self::Fuzzy { .. }
@@ -1154,8 +1193,12 @@ impl Request {
             | Self::GetGraph { coll }
             | Self::Traverse { coll, .. }
             | Self::ShortestPath { coll, .. }
+            | Self::Neighbors { coll, .. }
+            | Self::HybridSearch { coll, .. }
             | Self::DropGraph { coll }
-            | Self::ReindexGraph { coll }
+            | Self::ReindexGraph { coll, .. }
+            | Self::GraphRebuildStatus { coll }
+            | Self::CancelGraphRebuild { coll }
             | Self::Search { coll, .. }
             | Self::Fuzzy { coll, .. }
             | Self::History { coll, .. }
@@ -1255,7 +1298,9 @@ impl WriteReq {
             | Self::CreateFuzzyIndex { .. }
             | Self::CreateVectorIndex { .. }
             | Self::Reindex { .. }
-            | Self::ReindexGraph { .. } => true,
+            | Self::ReindexGraph { .. }
+            | Self::StartGraphRebuild { .. }
+            | Self::GraphRebuildStep { .. } => true,
             Self::Batch { ops } => ops.iter().any(Self::is_index_build),
             _ => false,
         }

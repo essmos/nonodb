@@ -2879,6 +2879,18 @@ async fn exec_inner(
         Ok(state) => state,
         Err(err) => return respond(Err(err)),
     };
+    if let Err(err) = authorize_graph_edges(&state.store, &principal, &req, &database) {
+        audit_denied(
+            &state,
+            &connection,
+            principal.name(),
+            &req,
+            &err,
+            started,
+            None,
+        );
+        return respond(Err(err));
+    }
     let audit_needed = state
         .audit
         .as_ref()
@@ -3551,6 +3563,16 @@ async fn exec_inner(
             read_result(joined).await
         }
 
+        Request::GraphRebuildStatus { coll } => {
+            let store = state.store.clone();
+            let auth = vault_auth.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                let c = read_collection(&store, &coll, auth.as_ref())?;
+                c.graph_rebuild_status().map_err(ApiError::from)
+            });
+            read_result(joined).await
+        }
+
         Request::Traverse { coll, options } => {
             let store = state.store.clone();
             let auth = vault_auth.clone();
@@ -3569,6 +3591,28 @@ async fn exec_inner(
                 let c = read_collection(&store, &coll, auth.as_ref())?;
                 reject_vault_read(&c, auth.as_ref(), "graph traversal")?;
                 c.graph_shortest_path(options).map_err(ApiError::from)
+            });
+            read_result(joined).await
+        }
+
+        Request::HybridSearch { coll, options } => {
+            let store = state.store.clone();
+            let auth = vault_auth.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                let c = read_collection(&store, &coll, auth.as_ref())?;
+                reject_vault_read(&c, auth.as_ref(), "graph traversal")?;
+                c.hybrid_search(options).map_err(ApiError::from)
+            });
+            read_result(joined).await
+        }
+
+        Request::Neighbors { coll, options } => {
+            let store = state.store.clone();
+            let auth = vault_auth.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                let c = read_collection(&store, &coll, auth.as_ref())?;
+                reject_vault_read(&c, auth.as_ref(), "graph traversal")?;
+                c.graph_neighbors(options).map_err(ApiError::from)
             });
             read_result(joined).await
         }
@@ -4230,7 +4274,14 @@ async fn exec_inner(
                 Request::Reindex { coll } => WriteReq::Reindex { coll },
                 Request::SetGraph { coll, def } => WriteReq::SetGraph { coll, def },
                 Request::DropGraph { coll } => WriteReq::DropGraph { coll },
-                Request::ReindexGraph { coll } => WriteReq::ReindexGraph { coll },
+                Request::ReindexGraph { coll, online } => {
+                    if online {
+                        WriteReq::StartGraphRebuild { coll }
+                    } else {
+                        WriteReq::ReindexGraph { coll }
+                    }
+                }
+                Request::CancelGraphRebuild { coll } => WriteReq::CancelGraphRebuild { coll },
                 Request::DropVectorIndex { coll, field } => {
                     WriteReq::DropVectorIndex { coll, field }
                 }
@@ -4714,6 +4765,38 @@ fn search_all_response(out: nonodb_core::SearchAllResponse) -> Value {
             "sources": out.sources,
         }
     })
+}
+
+fn authorize_graph_edges(
+    store: &nonodb_core::Store,
+    principal: &nonodb_auth::Principal,
+    req: &Request,
+    database: &str,
+) -> Result<(), ApiError> {
+    let coll = match req {
+        Request::GetGraph { coll }
+        | Request::Traverse { coll, .. }
+        | Request::ShortestPath { coll, .. }
+        | Request::Neighbors { coll, .. }
+        | Request::HybridSearch { coll, .. } => coll,
+        _ => return Ok(()),
+    };
+    let rtxn = store.read_txn()?;
+    let Some(collection) = store.collection_at(&rtxn, coll)? else {
+        return Ok(());
+    };
+    let Some(def) = collection.get_graph_in(&rtxn)? else {
+        return Ok(());
+    };
+    rtxn.commit()
+        .map_err(|err| ApiError::from(nonodb_core::Error::from(err)))?;
+    authz::allow_collection(
+        principal,
+        nonodb_auth::Action::Read,
+        database,
+        &def.edge_collection,
+        req.op_name(),
+    )
 }
 
 fn read_collection<'a>(

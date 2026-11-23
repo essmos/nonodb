@@ -1909,6 +1909,36 @@ fn execute(
             let edges = c.reindex_graph_txn(wtxn)?;
             Ok(json!({ "reindexed": coll, "edges": edges }))
         }
+        WriteReq::StartGraphRebuild { coll } => {
+            let c = standard_collection(store, wtxn, coll)?;
+            Ok(c.start_graph_rebuild_txn(wtxn)?)
+        }
+        WriteReq::CancelGraphRebuild { coll } => {
+            let c = standard_collection(store, wtxn, coll)?;
+            let canceled = c.cancel_graph_rebuild_txn(wtxn)?;
+            Ok(json!({ "canceled": canceled }))
+        }
+        WriteReq::GraphRebuildStep { edge, limit } => {
+            let c = store.collection_at(wtxn, edge)?.ok_or_else(|| ApiError {
+                code: "not_found".into(),
+                message: format!("collection `{edge}` does not exist"),
+            })?;
+            let state = c.graph_rebuild_state_in(wtxn)?;
+            let out = c.step_graph_rebuild_txn(wtxn, *limit)?;
+            if out.get("done").and_then(Value::as_bool) == Some(true) {
+                if let Some(state) = state {
+                    if let Some(node) = store.collection_at(wtxn, &state.node_collection)? {
+                        if let Some(def) = node.get_graph_in(wtxn)? {
+                            replication.capture_op(ReplicationOp::GraphSet {
+                                coll: state.node_collection,
+                                def,
+                            });
+                        }
+                    }
+                }
+            }
+            Ok(out)
+        }
         WriteReq::Sql { query, params } => {
             let prepared = nonodb_core::sql::PreparedSql::parse(query)?;
             if prepared.is_read_only() {

@@ -120,7 +120,7 @@ An LMDB environment contains named sub-databases. nonodb uses this layout:
 | `coll:<name>` | `_id` bytes | JSON document | Primary collection data |
 | `dbslot:<n>` (index) | encoded values + `_id` | encoded `_id` / covering payload | Secondary index |
 | `dbslot:<n>` (vector) | `_id` | norm + `f32` components | Exact vector index (IVF sidecar on disk) |
-| `dbslot:<n>` (graph) | node + label + target + edge id | edge JSON | Derived graph adjacency (`out`/`in`) |
+| `dbslot:<n>` (graph) | node + label + target + edge id | compact adjacency summary | Derived graph adjacency (`out`/`in`) |
 | legacy `idx:*`, `ft:*`, `ftl:*`, `fz:*` | as above | as above | Resources created by older releases; current code does not open text/fuzzy legacy postings |
 
 Text and fuzzy postings are not stored in LMDB sub-databases. They live in
@@ -193,9 +193,13 @@ Graph definitions live in `meta` as `graph:<node_collection>` with a reverse
 mapping `graph_edge:<edge_collection>`. The native adjacency index uses two
 reusable slot databases per graph: `graph:<edge_collection>:out` and
 `graph:<edge_collection>:in`. Each entry is keyed by the local node id, edge
-label, remote node id, and edge id, and stores the edge document. Entries are
+label, remote node id, and edge id, and stores only a compact versioned summary
+(edge id, label, weight, validity timestamps). Full edge documents stay in the
+edge collection and are loaded for `include_edges` or `edge_filter`. Entries are
 updated in the same write transaction as the edge document, including TTL
-expiry and replication apply. The index is derived and can be rebuilt with
+expiry and replication apply. Online rebuilds write `:gN` generation slots,
+mirror concurrent edge writes, then atomically bump the definition and drop the
+old generations. The index is derived and can be rebuilt with
 `reindex_graph`; it is not part of document history. See
 [Graph traversal](graph.md).
 

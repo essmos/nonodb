@@ -54,6 +54,8 @@ def main() -> int:
             "NONODB_SOCK": str(sock),
             "NONODB_LOG": "warn",
             "NONODB_TTL_SWEEP_INTERVAL": "1",
+            "NONODB_MAINTENANCE_INTERVAL_MS": "100",
+            "NONODB_GRAPH_REBUILD_CHUNK": "1",
         }
     )
     fh = log.open("wb")
@@ -86,6 +88,15 @@ def main() -> int:
         assert graph["edge_collection"] == "edges", graph
         assert nodes.get_graph()["from_field"] == "from"
         assert nodes.get_graph()["directed"] is True
+
+        db.create_collection("vaulted_edges", profile="vault")
+        try:
+            nodes.set_graph("vaulted_edges")
+        except NonoDBError as err:
+            assert "vault" in str(err).lower(), err
+        else:
+            raise AssertionError("vault edge collection must be rejected")
+        assert nodes.get_graph()["edge_collection"] == "edges"
 
         # HTTP set_graph must not let `def.node_collection` diverge from `coll`.
         try:
@@ -142,6 +153,35 @@ def main() -> int:
         depth_one = nodes.traverse("a", max_depth=1)
         assert depth_one["nodes"] == 3 and depth_one["edges"] == 2, depth_one
 
+        projected = nodes.traverse("a", max_depth=1, projection={"name": 1})
+        node = projected["roots"][0]["node"]
+        assert node["_id"] == "a" and node["name"] == "A", projected
+        assert "embedding" not in node, projected
+        assert len(json.dumps(projected)) < len(
+            json.dumps(nodes.traverse("a", max_depth=1))
+        ), "projection must shrink the response"
+
+        full_edges = nodes.traverse("a", max_depth=1, include_edges=True)
+        via = full_edges["roots"][0]["children"][0]["via"]
+        assert "from" in via and "to" in via, full_edges
+
+        filtered_edges = nodes.traverse(
+            "a", max_depth=1, edge_filter={"weight": {"$gte": 5}}
+        )
+        assert child_ids(filtered_edges["roots"][0]) == ["c"], filtered_edges
+
+        filtered_nodes = nodes.traverse("a", max_depth=2, node_filter={"name": {"$in": ["A", "B"]}})
+        assert child_ids(filtered_nodes["roots"][0]) == ["b"], filtered_nodes
+
+        near = nodes.neighbors("a")
+        assert near["nodes"] == 2, near
+        assert {item["via"]["_id"] for item in near["edges"]} == {"e1", "e3"}, near
+        near_filtered = nodes.neighbors(
+            "a", edge_filter={"weight": {"$gte": 5}}, projection={"name": 1}
+        )
+        assert near_filtered["edges"][0]["node"]["_id"] == "c", near_filtered
+        assert "embedding" not in near_filtered["edges"][0]["node"], near_filtered
+
         limited = nodes.traverse("a", max_depth=2, limit_edges=1)
         assert limited["truncated"] is True and limited["edges"] == 1, limited
 
@@ -163,6 +203,10 @@ def main() -> int:
         assert weighted["found"] is True and weighted["weight"] == 3, weighted
         assert weighted["hops"] == 2, weighted
         assert nodes.shortest_path("a", "z")["found"] is False
+        projected_path = nodes.shortest_path("a", "c", projection={"name": 1})
+        assert "embedding" not in projected_path["path"][0]["node"], projected_path
+        no_path = nodes.shortest_path("a", "c", node_filter={"name": "A"})
+        assert no_path["found"] is False, no_path
 
         # Adjacency follows updates and deletes in the same transaction.
         edges.update({"_id": "e2"}, {"$set": {"to": "d"}})
@@ -196,6 +240,21 @@ def main() -> int:
         )
         assert seeded["roots"][0]["node"]["_id"] == "b", seeded
 
+        hybrid = nodes.hybrid_search(
+            "embedding", [1.0, 0.0, 0.0], k=2, max_depth=1, limit=10,
+            vector_weight=0.6, graph_weight=0.4, projection={"name": 1},
+        )
+        assert hybrid["nodes"] >= 3, hybrid
+        scores = [item["score"] for item in hybrid["items"]]
+        assert scores == sorted(scores, reverse=True), hybrid
+        assert hybrid["items"][0]["node"]["_id"] == "a", hybrid
+        assert "embedding" not in hybrid["items"][0]["node"], hybrid
+        again = nodes.hybrid_search(
+            "embedding", [1.0, 0.0, 0.0], k=2, max_depth=1, limit=10,
+            vector_weight=0.6, graph_weight=0.4, projection={"name": 1},
+        )
+        assert [i["id"] for i in hybrid["items"]] == [i["id"] for i in again["items"]]
+
         # TTL expiry removes edge adjacency through the same hook.
         db.create_collection("tnodes")
         db.create_collection("tedges")
@@ -213,6 +272,100 @@ def main() -> int:
         else:
             raise AssertionError("TTL-expired edge still appears in adjacency")
         assert tedges.count({}) == 0
+
+        # $graphLookup uses the adjacency fast path when fields match the graph.
+        db.create_collection("gnodes")
+        db.create_collection("gedges")
+        gnodes = db.collection("gnodes")
+        gedges = db.collection("gedges")
+        for node in ({"_id": "n1"}, {"_id": "n2"}, {"_id": "n3"}):
+            gnodes.insert(node)
+        gnodes.set_graph("gedges")
+        gedges.insert({"_id": "g1", "from": "n1", "to": "n2"})
+        gedges.insert({"_id": "g2", "from": "n2", "to": "n3"})
+        lookup = gnodes.aggregate(
+            [
+                {
+                    "$graphLookup": {
+                        "from": "gedges",
+                        "startWith": "n3",
+                        "connectFromField": "from",
+                        "connectToField": "to",
+                        "as": "chain",
+                        "depthField": "level",
+                        "maxDepth": 2,
+                    }
+                }
+            ]
+        )[0]["chain"]
+        assert {item["_id"] for item in lookup} == {"g1", "g2"}, lookup
+        assert {item["level"] for item in lookup} == {0, 1}, lookup
+        restricted = gnodes.aggregate(
+            [
+                {
+                    "$graphLookup": {
+                        "from": "gedges",
+                        "startWith": "n3",
+                        "connectFromField": "from",
+                        "connectToField": "to",
+                        "as": "chain",
+                        "restrictSearchWithMatch": {"missing": True},
+                    }
+                }
+            ]
+        )[0]["chain"]
+        assert restricted == [], restricted
+
+        # Online rebuild mirrors writes into the target generation and swaps
+        # only after a complete scan; reads use the old generation meanwhile.
+        db.create_collection("onodes")
+        db.create_collection("oedges")
+        onodes = db.collection("onodes")
+        oedges = db.collection("oedges")
+        for i in range(5):
+            onodes.insert({"_id": f"n{i}"})
+        for i in range(4):
+            oedges.insert({"_id": f"o{i}", "from": f"n{i}", "to": f"n{i + 1}"})
+        onodes.set_graph("oedges")
+        generation = onodes.get_graph()["generation"]
+        status = onodes.reindex_graph(online=True)
+        assert status["done"] is False, status
+        assert status["target_generation"] == generation + 1, status
+        # Writes during the rebuild are visible immediately and mirrored.
+        oedges.insert({"_id": "online", "from": "n0", "to": "n4"})
+        assert "n4" in child_ids(onodes.traverse("n0", max_depth=1)["roots"][0])
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            current = onodes.graph_rebuild_status()
+            if current["done"]:
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("online graph rebuild did not finish")
+        assert onodes.get_graph()["generation"] == generation + 1
+        assert "n4" in child_ids(onodes.traverse("n0", max_depth=1)["roots"][0])
+        assert onodes.reindex_graph(online=True)["done"] is False
+        assert onodes.cancel_graph_rebuild() is True
+        assert onodes.graph_rebuild_status()["done"] is True
+        assert onodes.get_graph()["generation"] == generation + 1
+        assert "n4" in child_ids(onodes.traverse("n0", max_depth=1)["roots"][0])
+
+        # Temporal validity windows use adjacency summaries (no edge JSON read).
+        db.create_collection("tn")
+        db.create_collection("te")
+        tn = db.collection("tn")
+        te = db.collection("te")
+        for node in ({"_id": "n1"}, {"_id": "n2"}, {"_id": "n3"}):
+            tn.insert(node)
+        tn.set_graph("te", valid_from_field="vf", valid_to_field="vt")
+        te.insert({"_id": "t1", "from": "n1", "to": "n2", "vf": 1000, "vt": 2000})
+        te.insert({"_id": "t2", "from": "n1", "to": "n3", "vf": 2000, "vt": 3000})
+        at_1500 = tn.traverse("n1", max_depth=1, as_of=1500)
+        assert child_ids(at_1500["roots"][0]) == ["n2"], at_1500
+        at_2500 = tn.traverse("n1", max_depth=1, as_of=2500)
+        assert child_ids(at_2500["roots"][0]) == ["n3"], at_2500
+        assert tn.shortest_path("n1", "n2", as_of=2500)["found"] is False
+        assert tn.shortest_path("n1", "n2", as_of=1500)["found"] is True
 
         assert nodes.drop_graph() is True
         assert nodes.get_graph() is None

@@ -853,6 +853,10 @@ weighted = nodes.shortest_path("alice", "carol", weighted=True)
 
 # Adjacency is derived data and can always be rebuilt.
 nodes.reindex_graph()
+nodes.reindex_graph(online=True)
+nodes.graph_rebuild_status()
+nodes.neighbors("alice", edge_filter={"weight": {"$gte": 0.5}})
+nodes.hybrid_search("embedding", [0.1, 0.9, 0.0], k=10, max_depth=2)
 print(nodes.get_graph())
 nodes.drop_graph()
 ```

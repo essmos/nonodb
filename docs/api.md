@@ -171,8 +171,12 @@ client timeout with `NONODB_TIMEOUT` or the `timeout=` argument.
 | [`set_graph`](#graph) | Configure a graph and rebuild adjacency |
 | [`get_graph`](#graph) | Read the graph definition |
 | [`drop_graph`](#graph) | Remove a graph definition and adjacency |
-| [`reindex_graph`](#graph) | Rebuild graph adjacency |
+| [`reindex_graph`](#graph) | Rebuild graph adjacency (sync or online) |
+| [`graph_rebuild_status`](#graph) | Read online rebuild progress |
+| [`cancel_graph_rebuild`](#graph) | Discard an online rebuild |
 | [`traverse`](#graph) | BFS/DFS traversal with a tree or flat result |
+| [`neighbors`](#graph) | One-hop filtered neighbors |
+| [`hybrid_search`](#graph) | Vector + graph rerank |
 | [`shortest_path`](#graph) | BFS or weighted shortest path |
 | [`watch`](#watch) | Long-poll append-only events by sortable `_id` |
 | [`explain`](#explain) | Show the selected plan, bounds, and actual counts |
@@ -2325,8 +2329,12 @@ operations are:
 | `set_graph` | Create/replace a definition and rebuild adjacency |
 | `get_graph` | Read the definition (`null` when absent) |
 | `drop_graph` | Remove the definition and clear adjacency |
-| `reindex_graph` | Rebuild adjacency from the edge collection |
-| `traverse` | BFS/DFS traversal, tree or flat items, optional vector seed |
+| `reindex_graph` | Rebuild adjacency synchronously or start an online rebuild |
+| `graph_rebuild_status` | Read online rebuild progress |
+| `cancel_graph_rebuild` | Discard an in-progress online rebuild |
+| `traverse` | BFS/DFS traversal with filters, projection, and vector seed |
+| `neighbors` | One-hop filtered neighbors |
+| `hybrid_search` | Vector seed + graph rerank |
 | `shortest_path` | BFS hops or Dijkstra over edge weights |
 
 ```json
@@ -2338,14 +2346,24 @@ operations are:
 Every traversal runs in one read snapshot. A node is expanded once; repeated
 arrivals are marked with `"cycle":true`. Results include `nodes`, `edges`,
 `truncated`, and `missing`. `start` and `seed` are mutually exclusive.
+`edge_filter`, `node_filter`, `as_of`, and `projection` are supported.
+Adjacency values store only a compact summary; full edge documents are fetched
+for `include_edges` or `edge_filter`.
+
+`neighbors` returns one-hop `{node, via}` entries. `hybrid_search` combines
+vector scores with graph proximity and returns deterministic
+`score`/`vector_score`/`graph_score` values. Online rebuilds keep the active
+generation readable and mirror edge writes into the target generation until an
+atomic swap.
 
 ```json
 {"op":"shortest_path","coll":"nodes","start":"alice","target":"carol",
  "weighted":true,"max_depth":8}
 ```
 
-Graph configuration requires admin scope on both collections; reads require a
-read scope on the node collection. Vault collections are rejected. The MongoDB
+Graph configuration requires admin scope on both collections; graph reads
+require a read scope on the node **and** edge collections. Vault collections are
+rejected as node or edge collections. The MongoDB
 wire listener does not expose graph operations.
 
 ## vector_search
