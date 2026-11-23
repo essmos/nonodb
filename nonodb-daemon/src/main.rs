@@ -489,6 +489,11 @@ async fn run_async() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/import/run", post(imports_api::run))
         .route("/v1/import/status/:id", get(imports_api::status))
         .route(
+            "/v1/restore/preflight",
+            post(imports_api::restore_preflight),
+        )
+        .route("/v1/restore", post(imports_api::restore))
+        .route(
             "/v1/replication/status",
             get(replication_api::status_default),
         )
@@ -5324,6 +5329,7 @@ pub(crate) fn error_status(err: &ApiError) -> StatusCode {
         | "invalid_collection_profile" => StatusCode::BAD_REQUEST,
         "not_found" => StatusCode::NOT_FOUND,
         "database_limit" => StatusCode::SERVICE_UNAVAILABLE,
+        "database_busy" => StatusCode::CONFLICT,
         "wal_full" | "quota_exceeded" => StatusCode::INSUFFICIENT_STORAGE,
         "unsafe_durability_disabled" => StatusCode::BAD_REQUEST,
         "unauthorized" => StatusCode::UNAUTHORIZED,

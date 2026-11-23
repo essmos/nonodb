@@ -482,8 +482,10 @@ decryption.
 
 ## Import wizard
 
-The GUI **Import** tab imports a native backup as a **new database** while the
-daemon stays online. It never replaces a live database.
+The GUI **Import** tab imports a native backup as a **new database** and also
+offers verified restore-in-place for an existing non-default database. Import
+never overwrites a live database; restore-in-place is a separate destructive
+action with typed confirmation.
 
 Sources:
 
@@ -509,6 +511,103 @@ paths only inside the configured roots.
 
 The GUI workflow and screenshots are documented in
 [GUI console](gui.md#backup-workflow) and [Import](gui.md#import-workflow).
+
+## Restore in place (online API and GUI)
+
+Restore-in-place replaces one existing non-default database from a native
+local/S3 backup while the daemon stays online. The default database is not
+supported by this API; stop the daemon and use `nonodb-cli restore` for it.
+
+The operation has two steps. It is also available in the GUI **Import** tab
+under **Restore in place**.
+
+### 1. Preflight verification
+
+```http
+POST /v1/restore/preflight
+Content-Type: application/json
+Authorization: Bearer <admin-token>
+
+{
+  "source": {"kind": "local", "path": "/var/backups/nonodb"},
+  "location": "/var/backups/nonodb/nightly-app1/20261123T030000Z",
+  "database": "app1"
+}
+```
+
+The daemon:
+
+1. checks that the backup/target database is valid and the source is allowed by
+   `NONODB_IMPORT_ROOTS`;
+2. reads `manifest.json` and checks the payload size and SHA-256;
+3. decrypts age with `NONODB_BACKUP_IDENTITY_FILE` and decompresses gzip when
+   the manifest requires it;
+4. deeply verifies the LMDB database, allowing derived search sidecars to be
+   missing;
+5. returns the manifest, verified byte count, and the exact confirmation phrase
+   `RESTORE <database>`.
+
+No live database is modified by preflight. An unverified or tampered backup
+fails here.
+
+### 2. Typed restore
+
+```http
+POST /v1/restore
+Content-Type: application/json
+Authorization: Bearer <admin-token>
+
+{
+  "source": {"kind": "local", "path": "/var/backups/nonodb"},
+  "location": "/var/backups/nonodb/nightly-app1/20261123T030000Z",
+  "database": "app1",
+  "confirmation": "RESTORE app1"
+}
+```
+
+The confirmation must match exactly. The API then verifies the backup again,
+waits briefly for active requests to that database to finish, and moves the
+live database directory to a safety snapshot:
+
+```text
+<NONODB_DATA>/restore-safety/app1-<unix-ms>-<pid>/
+├── data.mdb
+├── lock.mdb            # absent after clean shutdown
+├── quota.json          # preserved by the restore
+├── search/             # old derived sidecars, when present
+├── vector-ann/
+└── restore-info.json   # source, location, timestamp, safety path
+```
+
+It installs the verified `data.mdb`, preserves the database's quota
+configuration, rebuilds missing search/vector sidecars, and starts a fresh
+writer. If installation or startup fails, the daemon automatically restores the
+safety snapshot and reopens the old database. A `database_busy` (HTTP 409)
+response means a request still holds the database; close clients and retry.
+
+The response includes the safety snapshot path and a rollback instruction.
+Keep the safety snapshot until the restored database has passed application
+checks.
+
+### Rollback
+
+If the restored data is wrong, stop the daemon, remove or rename the current
+database directory, move the reported safety snapshot back to
+`<NONODB_DATA>/<database>`, and start the daemon. Do not copy only `data.mdb`
+from the safety snapshot while the target database is open.
+
+The audit log records `restore_preflight` and `restore_in_place` with the target
+database, backup location, result, and error. Successful restores are also
+logged by the daemon.
+
+### Online restore boundaries
+
+- Only non-default databases are supported.
+- The backup must be a native NonoDB backup accepted by preflight.
+- Restore replaces the target database; it does not merge documents.
+- The safety snapshot is not pruned automatically.
+- Active requests may delay the swap for up to 30 seconds before
+  `database_busy` is returned.
 
 ## Verify before relying on a backup
 
@@ -743,7 +842,7 @@ See [Authentication and permissions](auth.md#backups).
 
 | Scenario | Recovery |
 |---|---|
-| Accidental document deletion | Restore the latest verified backup for that database to a scratch directory, extract affected data, or restore the database after stopping the daemon |
+| Accidental document deletion | Restore the latest verified backup for that database to a scratch directory, extract affected data, or use verified restore-in-place after preflight |
 | Corrupt `data.mdb` in one database | Restore that database's latest backup that passes `verify-backup` |
 | Corrupt files in several databases | Restore the instance backup with `restore-all`, or restore each database separately |
 | Lost host or disk | Restore the off-host instance copy and reinstall the daemon from the matching release |

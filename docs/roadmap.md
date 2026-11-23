@@ -305,11 +305,6 @@ comparison and practical migration caveats.
 
 The current implementation plan is limited to this list.
 
-### P0 — necessary before production
-
-1. **Safe restore-in-place API and GUI flow.** Typed confirmation, preflight
-   verification, audit logging, and rollback guidance.
-
 ### P1 — low effort, worthwhile
 
 - Publish `nonodb-client` to PyPI using the prepared manual workflow.

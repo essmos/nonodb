@@ -584,6 +584,27 @@ export type DiscoveredImport = {
   info?: string | null;
 };
 
+export type RestorePreflight = {
+  database: string;
+  source: string;
+  location: string;
+  backup_bytes: number;
+  manifest: DiscoveredImport['manifest'];
+  info?: string | null;
+  confirmation: string;
+  safety_root: string;
+};
+
+export type RestoreResult = {
+  database: string;
+  backup: string;
+  source: string;
+  backup_bytes: number;
+  manifest: DiscoveredImport['manifest'];
+  safety_snapshot: string;
+  rollback: string;
+};
+
 export type ImportStatus = {
   id: string;
   status: string;
@@ -625,6 +646,34 @@ export function runImport(
     source,
     location,
     target_database,
+  });
+}
+
+export function restorePreflight(
+  connection: Connection,
+  source: ImportSource,
+  location: string,
+  database: string,
+): Promise<RestorePreflight> {
+  return backupRequest<RestorePreflight>(connection, '/v1/restore/preflight', 'POST', {
+    source,
+    location,
+    database,
+  });
+}
+
+export function restoreInPlace(
+  connection: Connection,
+  source: ImportSource,
+  location: string,
+  database: string,
+  confirmation: string,
+): Promise<RestoreResult> {
+  return backupRequest<RestoreResult>(connection, '/v1/restore', 'POST', {
+    source,
+    location,
+    database,
+    confirmation,
   });
 }
 

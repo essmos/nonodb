@@ -3465,6 +3465,7 @@ collection, op, id, and before/after documents. Replicas reject stale epochs. Re
 | `invalid_query` | 400 | Invalid filter/update/index/query shape, write in a read batch, unsupported operator |
 | `unsafe_durability_disabled` | 400 | `durability:"unsafe"` without `NONODB_ALLOW_UNSAFE_WRITES=1` |
 | `database_limit` | 503 | Too many open databases and no idle environment can be evicted |
+| `database_busy` | 409 | Restore-in-place could not obtain exclusive access; close clients and retry |
 | `wal_full` | 507 | PITR WAL reached its size or age limit; reads continue until snapshot retention frees covered history |
 | `quota_exceeded` | 507 | A growing write would cross a database data/index/history/sidecar quota; deletes, drops, and pruning remain allowed |
 | `invalid_sql` | 400 | SQL parse/planning error or unsupported SQL clause |

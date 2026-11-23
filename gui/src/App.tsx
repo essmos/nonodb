@@ -49,6 +49,8 @@ import {
   replicationStatus,
   resumeReplication,
   revokeReplicaPairing,
+  restoreInPlace,
+  restorePreflight,
   runImport,
   updateReplicationSource,
   loadConnection,
@@ -75,6 +77,8 @@ import {
   type ReplicationChangeTxn,
   type NetworkInfo,
   type ReplicationStatus,
+  type RestorePreflight,
+  type RestoreResult,
   type DatabaseStorageStats,
   subscribeTiming,
   updateAuthToken,
@@ -1397,6 +1401,11 @@ function ImportsPage({ connection }: { connection: Connection }) {
   const [selected, setSelected] = useState<string | null>(null);
   const [target, setTarget] = useState('');
   const [status, setStatus] = useState<ImportStatus | null>(null);
+  const [restoreTarget, setRestoreTarget] = useState(connection.database);
+  const [restoreCheck, setRestoreCheck] = useState<RestorePreflight | null>(null);
+  const [restoreConfirmation, setRestoreConfirmation] = useState('');
+  const [restoreResult, setRestoreResult] = useState<RestoreResult | null>(null);
+  const [restoring, setRestoring] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
@@ -1470,6 +1479,9 @@ function ImportsPage({ connection }: { connection: Connection }) {
     setSelected(item.location);
     setTarget(`restored-${item.manifest.source}`);
     setStatus(null);
+    setRestoreCheck(null);
+    setRestoreConfirmation('');
+    setRestoreResult(null);
     setError('');
   };
 
@@ -1490,6 +1502,54 @@ function ImportsPage({ connection }: { connection: Connection }) {
     }
   };
 
+  const verifyRestore = async () => {
+    if (!selected) throw new Error('Select a backup first.');
+    if (!restoreTarget.trim()) throw new Error('Restore target database is required.');
+    setRestoring(true);
+    setError('');
+    setNotice('');
+    setRestoreResult(null);
+    try {
+      const result = await restorePreflight(
+        connection,
+        source(),
+        selected,
+        restoreTarget.trim(),
+      );
+      setRestoreCheck(result);
+      setRestoreConfirmation('');
+      setNotice(`Verified backup for ${result.database}. Type ${result.confirmation} to enable restore.`);
+    } catch (err) {
+      setRestoreCheck(null);
+      setError(errorText(err));
+    } finally {
+      setRestoring(false);
+    }
+  };
+
+  const restore = async () => {
+    if (!restoreCheck) throw new Error('Verify the backup first.');
+    if (restoreConfirmation !== restoreCheck.confirmation) return;
+    setRestoring(true);
+    setError('');
+    setNotice('');
+    try {
+      const result = await restoreInPlace(
+        connection,
+        source(),
+        restoreCheck.location,
+        restoreCheck.database,
+        restoreConfirmation,
+      );
+      setRestoreResult(result);
+      setNotice(`Restored ${result.database}. Safety snapshot: ${result.safety_snapshot}`);
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setRestoring(false);
+    }
+  };
+
   const selectedBackup = backups.find((item) => item.location === selected);
   const formatTime = (ms: number) => (ms > 0 ? new Date(ms).toLocaleString() : '—');
   const formatSize = (bytes: number) => formatBytes(bytes);
@@ -1499,7 +1559,7 @@ function ImportsPage({ connection }: { connection: Connection }) {
       <header className="page-header">
         <div>
           <h2>Import</h2>
-          <p>Import a verified backup as a new database. The live database is never replaced.</p>
+          <p>Import a verified backup as a new database, or verify and restore one in place.</p>
         </div>
         <div className="actions">
           <button onClick={() => void loadOverview()}>Refresh</button>
@@ -1617,6 +1677,77 @@ function ImportsPage({ connection }: { connection: Connection }) {
           )}
         </section>
       )}
+
+      <section className="panel">
+        <div className="panel-title"><h3>Restore in place</h3><span className="badge danger-badge">destructive</span></div>
+        <p className="muted">
+          Replaces the selected database with the chosen backup. Preflight verifies the manifest,
+          checksum and database contents, then requires the exact typed phrase. The current
+          database directory is kept as a safety snapshot for rollback.
+        </p>
+        <div className="form-grid">
+          <label>
+            Target database
+            <input
+              value={restoreTarget}
+              onChange={(event) => {
+                setRestoreTarget(event.target.value);
+                setRestoreCheck(null);
+                setRestoreConfirmation('');
+                setRestoreResult(null);
+              }}
+              placeholder="app1"
+            />
+            <span className="field-hint">
+              The default database requires the offline CLI restore. Restore is available for
+              non-default databases while the daemon runs.
+            </span>
+          </label>
+          <label>
+            Verified backup
+            <input readOnly value={restoreCheck?.location ?? 'No backup verified yet'} />
+            <span className="field-hint">
+              {restoreCheck
+                ? `SHA-256 ${restoreCheck.manifest.sha256} · ${formatSize(restoreCheck.backup_bytes)}`
+                : 'Select a backup above and run preflight verification.'}
+            </span>
+          </label>
+        </div>
+        <div className="toolbar">
+          <button onClick={() => void verifyRestore()} disabled={busy || restoring || !selected || restoreTarget.trim() === 'default'}>
+            {restoring ? 'Working…' : 'Verify for restore'}
+          </button>
+        </div>
+        {restoreCheck && (
+          <>
+            <label>
+              Type <code>{restoreCheck.confirmation}</code> to confirm
+              <input
+                value={restoreConfirmation}
+                onChange={(event) => setRestoreConfirmation(event.target.value)}
+                autoComplete="off"
+                spellCheck={false}
+              />
+            </label>
+            <div className="toolbar">
+              <button
+                className="danger"
+                onClick={() => void restore()}
+                disabled={restoring || restoreConfirmation !== restoreCheck.confirmation}
+              >
+                {restoring ? 'Restoring…' : `Restore ${restoreCheck.database} in place`}
+              </button>
+            </div>
+          </>
+        )}
+        {restoreResult && (
+          <div className="notice-box">
+            Restored <strong>{restoreResult.database}</strong>. Safety snapshot:
+            <div className="mono">{restoreResult.safety_snapshot}</div>
+            <div className="muted small">{restoreResult.rollback}</div>
+          </div>
+        )}
+      </section>
 
       <section className="panel">
         <div className="panel-title"><h3>Recent imports</h3><span>{overview?.jobs.length ?? 0}</span></div>

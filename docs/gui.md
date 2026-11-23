@@ -475,7 +475,9 @@ daemon can write them without root. In Docker, mount every local destination and
 - read the generated `backup-info.txt` when available;
 - import as a new database with checksum, decryption, decompression, and deep
   LMDB verification;
-- existing databases are never overwritten.
+- verify and restore one non-default database in place with typed confirmation
+  and an automatic safety snapshot;
+- existing databases are never overwritten by import.
 
 #### Import workflow
 
@@ -493,6 +495,25 @@ daemon can write them without root. In Docker, mount every local destination and
 The importer verifies the checksum, decrypts age with
 `NONODB_BACKUP_IDENTITY_FILE` when needed, decompresses gzip, verifies the LMDB
 database, and refuses to overwrite an existing database.
+
+#### Restore in place
+
+Use **Restore in place** below the import plan to replace an existing
+non-default database from the selected backup:
+
+1. Enter the target database name.
+2. Click **Verify for restore**. Preflight verifies the manifest, checksum,
+   decryption/decompression, and LMDB contents without changing live data.
+3. Read the verified backup details, then type the exact
+   `RESTORE <database>` phrase.
+4. Click **Restore &lt;database&gt; in place**. The button stays disabled until the
+   phrase matches.
+5. Keep the shown safety snapshot path until the application checks pass. The
+   same panel shows the rollback instruction.
+
+The default database is restored with the offline CLI. An active request may
+return `database_busy`; close clients and retry.
+
 
 ### Replication
 

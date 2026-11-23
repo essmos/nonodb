@@ -187,6 +187,7 @@ python3 scripts/restore_drill.py             # backup -> verify -> restore -> qu
 python3 scripts/restore_to_test.py           # restore --to snapshot selection and verification
 python3 scripts/pitr_test.py                 # PITR snapshot+WAL replay, retention, wal_full
 python3 scripts/quota_test.py                # per-database quotas, warnings, rejection, restart
+python3 scripts/restore_in_place_test.py     # verified API restore, typed confirmation, safety snapshot
 python3 scripts/branch_test.py               # offline branch from stopped DB and snapshot, CoW fallback
 python3 scripts/shutdown_test.py             # SIGTERM drain, JSON logs, durable in-flight write
 python3 scripts/mongo_conformance_test.py   # compare wire results with a real MongoDB
@@ -314,6 +315,7 @@ scripts are:
 | `scripts/auth_test.py` | principals, scopes, filtered collections, token revocation, audit, IP lockout |
 | `scripts/auth_api_test.py` | admin-only auth API, one-time tokens, last-admin protection, certificates, Prometheus endpoint, disk/snapshot metrics, readiness |
 | `scripts/backup_api_test.py` | multi-database backups, backup-info, excluded collections, age keygen, local/S3 import, restore, SigV4, and restic command flow |
+| `scripts/restore_in_place_test.py` | verified API restore, typed confirmation, safety snapshot, and post-restore contents |
 | `scripts/replication_test.py` | writer log capture, snapshot bootstrap, manual and automatic prune with replica acks, ack age, pull apply, local applied log, global sequence, read-only replica, promote/demote epoch, stale-epoch rejection, source reload, successor source switch, graceful restart on runtime gap, startup auto-resync, apply metrics, and lag |
 | `scripts/replication_failover_test.py` | quorum promotion demotes and fences the old source, exposes the new `write_url`, validates `/readyz/write` and `Location` routing, persists votes, and rejects writes on the demoted node |
 | `scripts/replication_lease_test.py` | primary renews a quorum lease and self-demotes after losing voter majority |

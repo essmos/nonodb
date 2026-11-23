@@ -4,11 +4,6 @@ This file tracks remaining engineering work only. Completed implementation
 history lives in [CHANGELOG.md](CHANGELOG.md); user-facing capabilities and
 deliberate limitations are documented in [docs/roadmap.md](docs/roadmap.md).
 
-## P0 — konieczne przed produkcją
-
-- [ ] Safe restore-in-place API and GUI flow with typed confirmation, preflight
-      verification, audit logging, and rollback guidance.
-
 ## P1 — niski nakład, warto
 
 - [ ] Publish `nonodb-client` to PyPI using the prepared manual workflow.

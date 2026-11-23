@@ -4,6 +4,15 @@ Full release notes: https://github.com/essmos/nonodb/releases
 
 ## Unreleased
 
+- Add verified restore-in-place through the admin HTTP API and GUI. Preflight
+  validates the backup manifest, checksum, decryption/decompression, and LMDB
+  contents without changing live data; restore requires the exact
+  `RESTORE <database>` phrase and records the operation in the audit log. The
+  previous database is kept in `restore-safety/<database>-<timestamp>-<pid>`
+  with `restore-info.json`, failures roll back automatically, and the response
+  includes rollback instructions. Only non-default databases can be restored
+  online; the default database still uses the offline CLI. See
+  `docs/backup.md`.
 - Add per-database storage quotas for data, indexes, history, and search/vector
   sidecars. `get_quota`/`set_quota`, `database_stats`, and
   `nonodb-cli quota` expose usage and limits; limits persist across restarts and
