@@ -81,6 +81,18 @@ async function main() {
     users.lookupChunked('_id', [id], { chunkSize: 0 }),
     /chunkSize/,
   );
+  const joined = await users.lookupJoin(
+    users,
+    [{ _id: id }, { _id: 'missing' }],
+    { localField: '_id', chunkSize: 1 },
+  );
+  assert.equal(joined.length, 2);
+  assert.equal(joined[0].joined.name, 'Ada');
+  assert.equal(joined[1].joined, null);
+  await assert.rejects(
+    users.lookupJoin(users, [{}], { localField: '' }),
+    /localField/,
+  );
 
   const revisions = await users.history(id, { limit: 10, includeDocs: true });
   assert.ok(revisions.length >= 1);

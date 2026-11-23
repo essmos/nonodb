@@ -22,6 +22,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(chunked[2]["_id"], json!(id));
     assert!(users.lookup_chunked("_id", &keys, None, 0).is_err());
 
+    let local = vec![json!({"_id": id}), json!({"_id": "missing"})];
+    let joined = users.lookup_join(&users, &local, "_id", Default::default())?;
+    assert_eq!(joined[0]["joined"]["name"], json!("Ada"));
+    assert!(joined[1]["joined"].is_null());
+    assert_eq!(joined.len(), local.len());
+
     let adults = users.find(&FindQuery::new(json!({"age": {"$gte": 18}})).sort("age", -1))?;
     println!(
         "{} adult(s): {}",

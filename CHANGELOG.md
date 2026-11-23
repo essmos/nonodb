@@ -4,6 +4,10 @@ Full release notes: https://github.com/essmos/nonodb/releases
 
 ## Unreleased
 
+- Add client-side `lookup_join` helpers to the Python, Node.js, Rust, and Go
+  clients. They attach matching foreign documents through chunked `lookup`,
+  preserve local order and length, and align missing keys with null. See
+  `docs/clients.md`.
 - Add verified restore-in-place through the admin HTTP API and GUI. Preflight
   validates the backup manifest, checksum, decryption/decompression, and LMDB
   contents without changing live data; restore requires the exact

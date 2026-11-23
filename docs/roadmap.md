@@ -308,8 +308,6 @@ The current implementation plan is limited to this list.
 ### P1 — low effort, worthwhile
 
 - Publish `nonodb-client` to PyPI using the prepared manual workflow.
-- Add client-side `lookup_join` helpers in Python, Node.js, Rust, and Go,
-  preserving order and missing-key alignment.
 - Store BSON regex values with matching `$type` entries and documented index
   behavior.
 

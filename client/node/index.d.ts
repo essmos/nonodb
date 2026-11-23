@@ -141,6 +141,18 @@ export class Collection {
       projection?: Record<string, unknown>;
     },
   ): Promise<Array<any | null>>;
+  lookupJoin(
+    foreign: Collection,
+    docs: Iterable<Record<string, unknown>>,
+    options?: {
+      localField: string;
+      foreignBy?: string | string[];
+      asField?: string;
+      fields?: string[];
+      projection?: Record<string, unknown>;
+      chunkSize?: number;
+    },
+  ): Promise<Array<Record<string, unknown>>>;
   lookupOne(
     by: string | string[],
     value: unknown,

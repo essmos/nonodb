@@ -580,6 +580,59 @@ class Collection {
     return results;
   }
 
+  /**
+   * Attach matching foreign documents to local documents.
+   *
+   * Keys are read from `localField` and looked up with `lookupChunked`. The
+   * returned array preserves input order and length. Missing keys and keys
+   * without a match receive `null` in `asField`. Input documents are copied,
+   * not modified.
+   */
+  async lookupJoin(
+    foreign,
+    docs,
+    {
+      localField,
+      foreignBy = '_id',
+      asField = 'joined',
+      fields,
+      projection,
+      chunkSize = 1000,
+    } = {},
+  ) {
+    if (typeof localField !== 'string' || localField.length === 0) {
+      throw new Error('localField must be a non-empty string');
+    }
+    if (typeof asField !== 'string' || asField.length === 0) {
+      throw new Error('asField must be a non-empty string');
+    }
+    if (
+      docs === null ||
+      typeof docs !== 'object' ||
+      typeof docs[Symbol.iterator] !== 'function'
+    ) {
+      throw new Error('lookupJoin docs must be an iterable of objects');
+    }
+    const rows = [];
+    const keys = [];
+    for (const doc of docs) {
+      if (doc === null || typeof doc !== 'object' || Array.isArray(doc)) {
+        throw new Error('lookupJoin documents must be objects');
+      }
+      rows.push({ ...doc });
+      keys.push(Object.prototype.hasOwnProperty.call(doc, localField) ? doc[localField] : null);
+    }
+    const matches = await foreign.lookupChunked(foreignBy, keys, {
+      chunkSize,
+      fields,
+      projection,
+    });
+    rows.forEach((row, index) => {
+      row[asField] = matches[index] ?? null;
+    });
+    return rows;
+  }
+
   /** Return one document by `_id` or a unique index. */
   async lookupOne(by, value, options = {}) {
     const [document] = await this.lookup(by, [value], options);

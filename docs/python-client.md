@@ -332,6 +332,22 @@ A non-`_id` lookup requires a unique index with the same field order as `by`.
 For a compound lookup each value must be an array of the same length. Values are
 limited to 10,000 per request and the result budget to 64 MiB.
 
+`lookup_join` attaches a foreign document to copies of local documents while
+preserving order and missing-key alignment:
+
+```python
+posts = db.collection("posts")
+joined = posts.lookup_join(
+    users,
+    posts.find({}),
+    local_field="author_id",
+    foreign_by="_id",
+    as_field="author",
+    fields=["name", "email"],
+)
+# Missing authors produce {"author": None, ...}.
+```
+
 `fields` is a top-level inclusive projection; a covering index can satisfy it
 without reading the document. `projection` accepts a normal flat projection,
 allows `"_id": 0`, and cannot be combined with `fields`. Duplicate keys are

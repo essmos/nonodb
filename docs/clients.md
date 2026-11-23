@@ -536,6 +536,66 @@ rows, err := articles.Lookup(ctx, []string{"tenant_id", "slug"}, []any{
 }, nonodb.LookupOptions{})
 ```
 
+### Client-side joins
+
+`lookup_join` attaches a matching document from another collection. It is a
+thin client-side helper over `lookup_chunked`, not a server-side `$lookup`: it
+fetches local documents once, looks up their keys in bounded batches, and adds
+one field to each copy. Input order and length are preserved. A missing local
+key or a missing foreign document becomes `null`/`Value::Null`/`nil`.
+
+Python:
+
+```python
+posts = db.collection("posts")
+local = posts.find({})
+joined = posts.lookup_join(
+    users,
+    local,
+    local_field="author_id",
+    foreign_by="_id",
+    as_field="author",
+    fields=["name", "email"],
+    chunk_size=1000,
+)
+```
+
+Rust:
+
+```rust
+let local = posts.find(&FindQuery::new(json!({})))?;
+let joined = posts.lookup_join(&users, &local, "author_id", Default::default())?;
+```
+
+Node.js:
+
+```js
+const local = await posts.find({});
+const joined = await posts.lookupJoin(users, local, {
+  localField: 'author_id',
+  foreignBy: '_id',
+  asField: 'author',
+  fields: ['name', 'email'],
+  chunkSize: 1000,
+});
+```
+
+Go:
+
+```go
+local, err := posts.Find(ctx, map[string]any{})
+joined, err := posts.LookupJoin(ctx, users, local, nonodb.LookupJoinOptions{
+    LocalField: "author_id",
+    AsField:    "author",
+    Fields:     []string{"name", "email"},
+    ChunkSize:  1000,
+})
+```
+
+The helper does not modify the input documents and does not deduplicate local
+rows. If several local documents use the same key, they all receive the same
+foreign document. The foreign lookup still requires `_id` or a unique index.
+
 Shared rules:
 
 - `by` defaults to `_id`.
@@ -552,7 +612,8 @@ Shared rules:
   With a covering index, an inclusive projection avoids reading the document.
 - Duplicate input keys produce duplicate results. Repeated keys are looked up
   only once internally.
-- `lookup` is not a join and does not accept a filter or sort; use `find` for
+- `lookup` itself is not a join and does not accept a filter or sort; use
+  `lookup_join` for the client-side attachment described above, or `find` for
   arbitrary predicates. Non-unique lookups are not supported yet.
 
 See [HTTP API: lookup](api.md#lookup) for the wire format.

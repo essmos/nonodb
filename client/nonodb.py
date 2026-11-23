@@ -1255,6 +1255,52 @@ class Collection:
             )
         return results
 
+    def lookup_join(
+        self,
+        foreign: "Collection",
+        docs: Iterable[dict[str, Any]],
+        *,
+        local_field: str,
+        foreign_by: Union[str, Iterable[str]] = "_id",
+        as_field: str = "joined",
+        fields: Optional[Iterable[str]] = None,
+        projection: Optional[dict[str, Any]] = None,
+        chunk_size: int = 1000,
+    ) -> list[dict[str, Any]]:
+        """Attaches matching foreign documents to local documents.
+
+        Keys are read from ``local_field`` in each input document and looked up
+        in ``foreign`` with :meth:`lookup_chunked`. The result preserves input
+        order and length. A document with a missing key, or a key without a
+        foreign match, receives ``None`` in ``as_field``. The returned
+        dictionaries are copies; input documents are not modified.
+
+        ``foreign_by`` defaults to ``_id`` and may be a unique index. ``fields``
+        and ``projection`` work exactly as in :meth:`lookup`; ``chunk_size``
+        must be between 1 and 10,000.
+        """
+        if not local_field:
+            raise ValueError("local_field must not be empty")
+        if not as_field:
+            raise ValueError("as_field must not be empty")
+        rows: list[dict[str, Any]] = []
+        keys: list[Any] = []
+        for doc in docs:
+            if not isinstance(doc, dict):
+                raise ValueError("lookup_join documents must be objects")
+            rows.append(dict(doc))
+            keys.append(doc.get(local_field))
+        matches = foreign.lookup_chunked(
+            foreign_by,
+            keys,
+            chunk_size=chunk_size,
+            fields=fields,
+            projection=projection,
+        )
+        for row, match in zip(rows, matches):
+            row[as_field] = match
+        return rows
+
     def lookup_one(
         self,
         by: Union[str, Iterable[str]],

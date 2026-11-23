@@ -144,6 +144,15 @@ func main() {
 		nonodb.LookupOptions{}, 0); err == nil {
 		log.Fatal("lookup_chunked accepted chunk size 0")
 	}
+	joined, err := users.LookupJoin(ctx, users, []map[string]any{
+		{"_id": id}, {"_id": "missing"},
+	}, nonodb.LookupJoinOptions{LocalField: "_id", ChunkSize: 1})
+	if err != nil || len(joined) != 2 || joined[0]["joined"] == nil || joined[1]["joined"] != nil {
+		log.Fatalf("lookup_join: %v %v", joined, err)
+	}
+	if profile, ok := joined[0]["joined"].(map[string]any); !ok || profile["name"] != "Ada" {
+		log.Fatalf("lookup_join wrong document: %v", joined[0]["joined"])
+	}
 
 	revisions, err := users.History(ctx, id, 10, true)
 	if err != nil || len(revisions) == 0 {

@@ -45,6 +45,16 @@ def main() -> int:
         pass
     else:
         raise AssertionError("chunk_size=0 must fail")
+    joined = coll.lookup_join(
+        coll,
+        [{"_id": doc_id}, {"_id": "missing"}],
+        local_field="_id",
+        chunk_size=1,
+    )
+    assert len(joined) == 2, joined
+    assert joined[0]["joined"]["name"] == "counter", joined
+    assert joined[1]["joined"] is None, joined
+    assert "_id" not in joined[0] or joined[0]["_id"] == doc_id, joined
     rows = db.sql(
         "SELECT COUNT(*) AS n FROM concurrency WHERE name = $1",
         ["counter"],
