@@ -174,8 +174,10 @@ Revoke:
 nonodb-cli auth cert disable "$FP"
 ```
 
-There is no CRL or OCSP integration. Revocation is handled by this registry and
-short-lived client certificates.
+Revocation also honors configured CRL files/URLs and OCSP responders. The
+registry remains authoritative for fingerprint allow-listing; CRL/OCSP checks
+run before the registry lookup and default to fail-closed when no source can
+decide. See [Mutual TLS](mtls.md).
 
 ## MongoDB wire authentication
 

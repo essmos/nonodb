@@ -232,6 +232,7 @@ python3 scripts/vault_test.py                # optional vault encryption end-to-
 python3 scripts/vault_regression_test.py     # vault API regressions
 python3 scripts/vault_bench.py --docs 5000   # standard vs vault performance
 bash scripts/mtls_test.sh                    # mTLS, cert registry, live revocation
+python3 scripts/revocation_test.py           # CRL file/refresh, OCSP responder, fail-open/closed
 python3 scripts/search_test.py               # BM25 + fuzzy end-to-end
 python3 scripts/search_variants_test.py      # search/query edge cases
 python3 scripts/compound_test.py             # compound/covering indexes, phrases

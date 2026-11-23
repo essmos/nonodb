@@ -37,6 +37,7 @@ mod protocol;
 mod replication_api;
 mod replicator;
 mod retention;
+mod revocation;
 mod s3_import;
 mod server_info;
 mod wal;
@@ -833,6 +834,7 @@ struct TlsSetup {
     auth: Arc<auth::AuthState>,
     client_auth: bool,
     audit: Option<Arc<audit::AuditLog>>,
+    revocation: Option<Arc<revocation::RevocationState>>,
 }
 
 fn fingerprint(cert: &CertificateDer<'_>) -> [u8; 32] {
@@ -866,6 +868,7 @@ fn tls_acceptor(
         .filter(|value| !value.is_empty());
     let (acceptor, client_auth) =
         build_tls_acceptor(cert, key, client_ca.as_deref(), auth.clone(), audit.clone())?;
+    let revocation = revocation::RevocationState::from_env(client_ca.as_deref())?;
     Ok(TlsSetup {
         acceptor: Arc::new(RwLock::new(acceptor)),
         cert: cert.to_string(),
@@ -874,6 +877,7 @@ fn tls_acceptor(
         auth,
         client_auth,
         audit,
+        revocation,
     })
 }
 
@@ -955,6 +959,20 @@ fn tls_signature(setup: &TlsSetup) -> u64 {
 }
 
 fn spawn_tls_reload(setup: TlsSetup, mut shutdown: watch::Receiver<bool>) {
+    if let Some(revocation) = setup.revocation.clone() {
+        let mut revocation_shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            let interval = revocation.refresh_interval();
+            loop {
+                tokio::select! {
+                    _ = wait_for_shutdown(&mut revocation_shutdown) => break,
+                    _ = tokio::time::sleep(interval) => {}
+                }
+                revocation.refresh().await;
+            }
+            tracing::info!("revocation refresh watcher stopped");
+        });
+    }
     let interval = std::env::var("NONODB_TLS_RELOAD_INTERVAL")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
@@ -1075,6 +1093,13 @@ async fn serve_tcp(
                 .and_then(|certs| certs.first())
             {
                 Some(cert) => {
+                    if let Some(revocation) = &tls.revocation {
+                        if let Err(reason) = revocation.check_peer(cert.as_ref()).await {
+                            audit_tls(tls.audit.as_deref(), peer, "unauthorized", None);
+                            tracing::warn!(%peer, %reason, "mTLS client rejected by revocation policy");
+                            return;
+                        }
+                    }
                     let fingerprint = fingerprint(cert);
                     match tls.auth.registry().authenticate_certificate(&fingerprint) {
                         Ok(principal) => {

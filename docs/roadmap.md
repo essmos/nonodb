@@ -62,6 +62,8 @@ Implemented:
 - document TTL with collection defaults, per-document overrides, and background expiry;
 - BSON-compatible dates with RFC 3339 input, UTC normalization, indexed ranges, and sorting;
 - Unix-socket daemon, optional TCP/TLS and mutual TLS, file-based principals and scopes, uid/gid allow-lists;
+- mutual TLS client revocation through the auth registry plus configurable CRL
+  files/URLs and OCSP, with refresh, caching, and fail-closed defaults;
 - group commit, request limits/timeouts, JSON and Prometheus metrics, health/readiness, disk and snapshot monitoring;
 - snapshots, online backup, SHA-256 manifests, deep verification, restore drills,
   snapshot-based `restore --to <timestamp>`, and opt-in snapshot + segmented
@@ -256,8 +258,9 @@ comparison and practical migration caveats.
   queries, or sorting beyond `_id`.
 - Vault key rotation is an operational re-encryption procedure; the daemon does
   not keep a keyring of old keys.
-- Mutual TLS is supported, but revocation uses the auth registry; there is no
-  CRL or OCSP integration.
+- Mutual TLS revocation combines the auth registry with configured CRL/OCSP
+  sources. A source that cannot decide is rejected by default; fail-open mode is
+  explicit. See [Mutual TLS](mtls.md).
 - Client certificates map to a principal with collection scopes, not to a
   separate user or tenant hierarchy.
 - Unix peer checks use uid and primary gid only, not supplementary groups.
@@ -299,14 +302,12 @@ The current implementation plan is limited to this list.
 
 ### P0 — necessary before production
 
-1. **CRL/OCSP support for mutual TLS.** Or an equivalent automated revocation
-   path for externally managed PKI.
-2. **Real sparse/partial index semantics.** Unique-index behavior for missing
+1. **Real sparse/partial index semantics.** Unique-index behavior for missing
    fields, query planning, migration notes, and MongoDB compatibility tests.
-3. **Per-database quotas and usage accounting.** Limits for data, indexes,
+2. **Per-database quotas and usage accounting.** Limits for data, indexes,
    history, and sidecars, with operator-visible warnings and a write-rejection
    policy.
-4. **Safe restore-in-place API and GUI flow.** Typed confirmation, preflight
+3. **Safe restore-in-place API and GUI flow.** Typed confirmation, preflight
    verification, audit logging, and rollback guidance.
 
 ### P1 — low effort, worthwhile

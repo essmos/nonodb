@@ -270,6 +270,8 @@ At minimum, alert on:
 8. `nonodb_wal_full == 1`
 9. `nonodb_pitr_available == 0` when PITR is enabled and the WAL has data
 10. `nonodb_wal_oldest_age_seconds` above the configured PITR window
+11. `nonodb_tls_revocation_refresh_errors_total` increasing when CRL/OCSP is configured
+12. `nonodb_tls_revocation_unavailable_total` increasing with fail-closed mTLS
 
 `GET /metrics` remains available for existing JSON consumers and includes the
 same extra `disk`, `snapshots`, `wal`, and `collection_metrics` fields.

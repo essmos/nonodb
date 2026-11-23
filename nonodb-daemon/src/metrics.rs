@@ -89,6 +89,12 @@ pub static REPLICATION_LAST_SUCCESS_UNIX: AtomicU64 = AtomicU64::new(0);
 pub static REPLICATION_RETENTION_RUNS: AtomicU64 = AtomicU64::new(0);
 pub static REPLICATION_PRUNED_TOTAL: AtomicU64 = AtomicU64::new(0);
 
+/// Client-certificate revocation refresh and decisions.
+pub static TLS_REVOCATION_REFRESH_TOTAL: AtomicU64 = AtomicU64::new(0);
+pub static TLS_REVOCATION_REFRESH_ERRORS: AtomicU64 = AtomicU64::new(0);
+pub static TLS_REVOCATION_REVOKED_TOTAL: AtomicU64 = AtomicU64::new(0);
+pub static TLS_REVOCATION_UNAVAILABLE_TOTAL: AtomicU64 = AtomicU64::new(0);
+
 /// Upper bounds for request latency histograms in nanoseconds. The matching
 /// Prometheus labels are expressed in seconds.
 const LATENCY_BUCKETS_NS: [u64; 17] = [
@@ -767,6 +773,10 @@ pub fn snapshot() -> Value {
         "replication_last_success_unix": REPLICATION_LAST_SUCCESS_UNIX.load(Relaxed),
         "replication_retention_runs_total": REPLICATION_RETENTION_RUNS.load(Relaxed),
         "replication_pruned_total": REPLICATION_PRUNED_TOTAL.load(Relaxed),
+        "tls_revocation_refresh_total": TLS_REVOCATION_REFRESH_TOTAL.load(Relaxed),
+        "tls_revocation_refresh_errors_total": TLS_REVOCATION_REFRESH_ERRORS.load(Relaxed),
+        "tls_revocation_revoked_total": TLS_REVOCATION_REVOKED_TOTAL.load(Relaxed),
+        "tls_revocation_unavailable_total": TLS_REVOCATION_UNAVAILABLE_TOTAL.load(Relaxed),
         "collection_metrics": collection_metrics,
         "collection_metrics_overflow_total": COLLECTION_METRICS_OVERFLOW.load(Relaxed),
         "latency": latency,
@@ -1367,6 +1377,26 @@ pub fn prometheus() -> String {
             "nonodb_replication_pruned_total",
             "replication_pruned_total",
             "Replication log entries removed by automatic retention.",
+        ),
+        (
+            "nonodb_tls_revocation_refresh_total",
+            "tls_revocation_refresh_total",
+            "CRL refresh passes.",
+        ),
+        (
+            "nonodb_tls_revocation_refresh_errors_total",
+            "tls_revocation_refresh_errors_total",
+            "CRL refresh passes with at least one failed source.",
+        ),
+        (
+            "nonodb_tls_revocation_revoked_total",
+            "tls_revocation_revoked_total",
+            "Client certificates rejected as revoked.",
+        ),
+        (
+            "nonodb_tls_revocation_unavailable_total",
+            "tls_revocation_unavailable_total",
+            "Client connections whose revocation status could not be determined.",
         ),
         (
             "nonodb_ttl_backlog",

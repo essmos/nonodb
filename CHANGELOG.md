@@ -4,6 +4,12 @@ Full release notes: https://github.com/essmos/nonodb/releases
 
 ## Unreleased
 
+- Add CRL and OCSP revocation checks for mutual TLS. CRL files/URLs refresh on a
+  timer, OCSP answers are cached per certificate, and
+  `NONODB_TLS_REVOCATION_FAIL_MODE` selects fail-closed (default) or fail-open
+  when no source can decide. Revoked client certificates are rejected before
+  registry authorization; metrics and docs cover refresh failures, revoked
+  clients, and unavailable checks.
 - Add opt-in point-in-time recovery through `NONODB_PITR_ENABLED=1`: periodic
   snapshots plus segmented WAL with replay to an RFC 3339/Unix timestamp during
   `nonodb-cli restore --to`. Retention prunes only WAL covered by a verified

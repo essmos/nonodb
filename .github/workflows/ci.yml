@@ -125,6 +125,7 @@ jobs:
           python3 scripts/live_watch_test.py
           python3 scripts/async_watch_test.py
           python3 scripts/auth_api_test.py
+          python3 scripts/revocation_test.py
           python3 scripts/backup_api_test.py
           python3 scripts/replication_control_plane_test.py
           python3 scripts/replication_discovery_test.py

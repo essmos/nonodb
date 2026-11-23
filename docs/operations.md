@@ -98,6 +98,13 @@ secrets.
 | `NONODB_TLS_CLIENT_CA` | — | PEM CA bundle used to verify client certificates (mTLS) |
 | `NONODB_TLS_CLIENT_AUTH` | `required` when client CA is set | `required`, `optional`, or `off` |
 | `NONODB_TLS_RELOAD_INTERVAL` | `30` | Seconds between server cert/key/CA reload checks; `0` disables |
+| `NONODB_TLS_CRL_FILE` | — | Comma-separated CRL files for mTLS client certificates |
+| `NONODB_TLS_CRL_URL` | — | Comma-separated CRL URLs refreshed on the revocation interval |
+| `NONODB_TLS_OCSP_URL` | — | OCSP responder URL for mTLS client certificates |
+| `NONODB_TLS_REVOCATION_FAIL_MODE` | `closed` | `closed` rejects when no CRL/OCSP source can decide; `open` allows with a warning |
+| `NONODB_TLS_REVOCATION_REFRESH_SECS` | `300` | CRL refresh interval |
+| `NONODB_TLS_OCSP_CACHE_SECS` | `300` | OCSP result cache lifetime |
+| `NONODB_TLS_REVOCATION_TIMEOUT_SECS` | `5` | CRL/OCSP HTTP timeout |
 | `NONODB_SNAPSHOT_DIR` | — | Enables periodic LMDB snapshots in this directory |
 | `NONODB_BACKUP_CONFIG` | `<NONODB_DATA>/backups.json` | Scheduled backup job configuration |
 | `NONODB_BACKUP_STAGING` | `<NONODB_DATA>/.backup-staging` | Temporary backup staging directory |
@@ -690,8 +697,10 @@ export NONODB_TLS_KEY=/etc/nonodb/server.key
   anonymous clients; anonymous clients still need a bearer token.
 - Client certificates and bearer tokens live in the same `NONODB_AUTH_FILE`;
   there is no legacy allow-list or global token.
-- There is no CRL/OCSP. Revocation is handled by disabling the registry entry
-  and using short-lived certificates.
+- Revocation can use the registry entry, a CRL file/URL, or an OCSP responder.
+  CRLs refresh on `NONODB_TLS_REVOCATION_REFRESH_SECS`; OCSP answers are cached
+  for `NONODB_TLS_OCSP_CACHE_SECS`. When no source can decide, the default
+  `NONODB_TLS_REVOCATION_FAIL_MODE=closed` rejects the connection.
 
 Client example:
 
@@ -849,6 +858,8 @@ Useful signals:
 | `snapshots` / `nonodb_snapshot_*` | Per-database snapshot success, failures, age, and duration |
 | `wal` / `nonodb_wal_*` | Per-database WAL bytes, age, sequence, hard-limit state, and pruned bytes |
 | `nonodb_pitr_available` | Whether a snapshot plus WAL can serve a PITR restore |
+| `nonodb_tls_revocation_refresh_total` / `..._errors_total` | CRL refresh passes and failures |
+| `nonodb_tls_revocation_revoked_total` / `..._unavailable_total` | Rejected revoked certificates and unavailable status checks |
 | `auth_failures_total` | Failed authentication attempts |
 | `auth_blocks_total` | IP lockouts started |
 | `auth_blocked_requests_total` | Requests rejected while the IP was blocked |
