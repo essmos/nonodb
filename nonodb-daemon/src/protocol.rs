@@ -500,6 +500,13 @@ pub enum Request {
     ListCollections,
     /// Per-collection record counts and storage estimates for this database.
     DatabaseStats,
+    /// Current storage usage and quota limits for this database.
+    GetQuota,
+    /// Replace the storage quota limits for this database. Zero or null clears
+    /// a limit.
+    SetQuota {
+        limits: crate::quota::QuotaLimits,
+    },
     /// Creates a collection explicitly. `profile` is `standard` (default) or `vault`.
     CreateCollection {
         coll: String,
@@ -974,6 +981,8 @@ impl Request {
             Self::WriteBatch { .. } => "write_batch",
             Self::ListCollections => "list_collections",
             Self::DatabaseStats => "database_stats",
+            Self::GetQuota => "get_quota",
+            Self::SetQuota { .. } => "set_quota",
             Self::CreateCollection { .. } => "create_collection",
             Self::DropCollection { .. } => "drop_collection",
             Self::SetCollectionTtl { .. } => "set_collection_ttl",
@@ -1045,6 +1054,7 @@ impl Request {
             | Self::GetVersion { .. }
             | Self::ListCollections
             | Self::DatabaseStats
+            | Self::GetQuota
             | Self::GetCollectionTtl { .. }
             | Self::GetCollectionHistory { .. }
             | Self::GetCollectionEvents { .. }
@@ -1145,6 +1155,8 @@ impl Request {
             Self::GetMore { .. } | Self::CloseCursor { .. } => Vec::new(),
             Self::ListCollections
             | Self::DatabaseStats
+            | Self::GetQuota
+            | Self::SetQuota { .. }
             | Self::ListDatabases
             | Self::CreateDatabase { .. }
             | Self::DropDatabase { .. }

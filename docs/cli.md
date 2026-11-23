@@ -230,6 +230,27 @@ nonodb> .quit
 
 Each line is one statement. Use `.quit`, `.exit`, `quit`, or `exit` to leave.
 
+## quota
+
+Show the selected database's storage usage and limits:
+
+```bash
+nonodb-cli --db app1 quota
+```
+
+Set one or more limits. Unnamed limits are preserved, and `unlimited` or `0`
+clears a limit:
+
+```bash
+nonodb-cli --db app1 quota set --data 20GiB --index 5GiB --history 2GiB --sidecar 5GiB
+nonodb-cli --db app1 quota set --data unlimited
+nonodb-cli --db app1 quota reset
+```
+
+Sizes accept bytes or suffixes such as `512MiB` and `20GiB`. Once a hard limit
+is reached, growing writes fail with `quota_exceeded`; deletes and drops remain
+allowed. See [Per-database quotas](quotas.md).
+
 ## indexes
 
 List secondary indexes for a collection:

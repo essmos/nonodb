@@ -197,7 +197,9 @@ client timeout with `NONODB_TIMEOUT` or the `timeout=` argument.
 | [`history`](#document-history) | List revisions of one document |
 | [`get_version`](#document-history) | Read one exact document revision |
 | [`list_collections`](#list_collections) | List known collections |
-| [`database_stats`](#database_stats) | Record counts and storage estimates per collection |
+| [`database_stats`](#database_stats) | Record counts, storage estimates, and quota status per collection |
+| [`get_quota`](#get_quota) | Read storage usage and limits for this database |
+| [`set_quota`](#set_quota) | Replace storage limits for this database |
 | [`create_collection`](#create_collection) | Create a standard or vault collection |
 | [`drop_collection`](#drop_collection) | Drop a collection and its resources |
 | [`set_collection_ttl`](#document-ttl) | Set or clear insertion-based collection TTL |
@@ -2828,6 +2830,66 @@ Response:
 Standard collections are created on first write. Vault collections should be
 created explicitly with `create_collection`.
 
+## get_quota
+
+```json
+{"op": "get_quota"}
+```
+
+Returns usage and limits for the selected database. The read requires no
+database-admin scope.
+
+```json
+{
+  "ok": true,
+  "result": {
+    "database": "app1",
+    "limits": {"data_bytes": 21474836480},
+    "usage": {
+      "data_bytes": 19327352832,
+      "index_bytes": 2097152,
+      "history_bytes": 0,
+      "sidecar_bytes": 1048576
+    },
+    "status": "warning",
+    "soft_limit_percent": 80,
+    "warnings": [
+      {
+        "resource": "data",
+        "used_bytes": 19327352832,
+        "limit_bytes": 21474836480,
+        "used_percent": 90,
+        "severity": "warning",
+        "message": "data usage is 19327352832 of 21474836480 bytes (90%)"
+      }
+    ]
+  }
+}
+```
+
+`status` is `ok`, `warning`, or `exceeded`. See
+[Per-database quotas](quotas.md) for measurement and limits.
+
+## set_quota
+
+```json
+{
+  "op": "set_quota",
+  "limits": {
+    "data_bytes": 21474836480,
+    "index_bytes": 5368709120,
+    "history_bytes": 2147483648,
+    "sidecar_bytes": 5368709120
+  }
+}
+```
+
+Replaces the saved limits for this database and returns the same report as
+`get_quota`. Omitted fields, `null`, and `0` mean unlimited. Requires a
+database administrator scope. When a growing write would cross a hard limit it
+fails with `quota_exceeded` and HTTP `507`; deletes, drops, and pruning remain
+allowed.
+
 ## database_stats
 
 ```json
@@ -2873,7 +2935,8 @@ estimated from shared history/TTL keys and values. `requests_last_minute` is a
 rolling 60-second request count and `avg_requests_per_second` is that count
 divided by 60. `used_bytes` is the LMDB file high-water mark and can exceed the
 sum of collection totals because LMDB keeps freed pages and does not shrink the
-file.
+file. The response also contains a `quota` object with the same fields as
+`get_quota`.
 
 ### Vault operation summary
 
@@ -3403,6 +3466,7 @@ collection, op, id, and before/after documents. Replicas reject stale epochs. Re
 | `unsafe_durability_disabled` | 400 | `durability:"unsafe"` without `NONODB_ALLOW_UNSAFE_WRITES=1` |
 | `database_limit` | 503 | Too many open databases and no idle environment can be evicted |
 | `wal_full` | 507 | PITR WAL reached its size or age limit; reads continue until snapshot retention frees covered history |
+| `quota_exceeded` | 507 | A growing write would cross a database data/index/history/sidecar quota; deletes, drops, and pruning remain allowed |
 | `invalid_sql` | 400 | SQL parse/planning error or unsupported SQL clause |
 | `invalid_json` | 400 | Malformed JSON document or value |
 | `invalid_collection` | 400 | Invalid collection name |

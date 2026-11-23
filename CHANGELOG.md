@@ -4,6 +4,13 @@ Full release notes: https://github.com/essmos/nonodb/releases
 
 ## Unreleased
 
+- Add per-database storage quotas for data, indexes, history, and search/vector
+  sidecars. `get_quota`/`set_quota`, `database_stats`, and
+  `nonodb-cli quota` expose usage and limits; limits persist across restarts and
+  can default from `NONODB_QUOTA_*`. Usage at 80% produces a soft warning, and
+  growing writes that would cross a hard limit fail with `quota_exceeded`
+  (HTTP 507) while deletes, drops, and pruning remain available. See
+  `docs/quotas.md`.
 - Add real sparse and partial index semantics. `sparse` now omits documents
   without the key instead of behaving like a plain index, compound sparse
   indexes skip only documents with every key absent, and

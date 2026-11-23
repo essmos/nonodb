@@ -17,6 +17,7 @@ use tokio::sync::{Mutex as AsyncMutex, RwLock};
 use crate::auto_index::AutoIndexer;
 use crate::cache::QueryCache;
 use crate::protocol::ApiError;
+use crate::quota::Quota;
 use crate::writer::{self, WriteJob};
 
 pub const DEFAULT_DATABASE: &str = "default";
@@ -42,6 +43,7 @@ pub struct DatabaseRuntime {
     pub write_tx: mpsc::Sender<WriteJob>,
     pub cache: Arc<QueryCache>,
     pub auto_index: Arc<AutoIndexer>,
+    pub quota: Arc<Quota>,
     stop: Arc<AtomicBool>,
     writer: Mutex<Option<std::thread::JoinHandle<()>>>,
     maintenance: Mutex<Option<std::thread::JoinHandle<()>>>,
@@ -361,15 +363,26 @@ fn start_runtime(root: &Path, name: &str) -> Result<DatabaseRuntime, String> {
             "PITR startup replay completed"
         );
     }
+    let quota =
+        Arc::new(Quota::load(name, &path).map_err(|e| format!("load quota for `{name}`: {e}"))?);
     let (write_tx, write_rx) = mpsc::channel::<WriteJob>();
     let cache = Arc::new(QueryCache::from_env());
     let writer_store = store.clone();
     let writer_cache = cache.clone();
+    let writer_quota = quota.clone();
     let stop = Arc::new(AtomicBool::new(false));
     let writer_stop = stop.clone();
     let writer = std::thread::Builder::new()
         .name(format!("nonodb-writer-{name}"))
-        .spawn(move || writer::run(writer_store, write_rx, writer_cache, writer_stop))
+        .spawn(move || {
+            writer::run(
+                writer_store,
+                write_rx,
+                writer_cache,
+                writer_quota,
+                writer_stop,
+            )
+        })
         .map_err(|e| format!("start writer for `{name}`: {e}"))?;
     let auto_index = AutoIndexer::start(store.clone(), write_tx.clone(), &path);
     let maintenance = crate::maintenance::start(
@@ -398,6 +411,7 @@ fn start_runtime(root: &Path, name: &str) -> Result<DatabaseRuntime, String> {
         write_tx,
         cache,
         auto_index,
+        quota,
         stop,
         writer: Mutex::new(Some(writer)),
         maintenance: Mutex::new(Some(maintenance)),

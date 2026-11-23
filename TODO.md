@@ -6,8 +6,6 @@ deliberate limitations are documented in [docs/roadmap.md](docs/roadmap.md).
 
 ## P0 — konieczne przed produkcją
 
-- [ ] Per-database quotas and usage accounting for data, indexes, history, and
-      sidecars, with operator-visible warnings and write rejection policy.
 - [ ] Safe restore-in-place API and GUI flow with typed confirmation, preflight
       verification, audit logging, and rollback guidance.
 

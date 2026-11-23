@@ -160,6 +160,14 @@ pub fn authorize_request(
                 Err(ApiError::forbidden())
             }
         }
+        Request::GetQuota => Ok(()),
+        Request::SetQuota { .. } => {
+            if principal.allows_database_admin(database) {
+                Ok(())
+            } else {
+                Err(ApiError::forbidden())
+            }
+        }
         Request::Sync | Request::MapInfo | Request::ResizeMap { .. } => {
             if principal.allows_database_admin(database) {
                 Ok(())

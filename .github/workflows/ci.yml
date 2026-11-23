@@ -134,6 +134,7 @@ jobs:
           python3 scripts/replication_vault_test.py
           python3 scripts/restore_to_test.py
           python3 scripts/pitr_test.py
+          python3 scripts/quota_test.py
           python3 scripts/branch_test.py
           python3 scripts/webhook_test.py
           python3 scripts/search_all_test.py

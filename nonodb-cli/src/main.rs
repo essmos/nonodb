@@ -371,6 +371,7 @@ fn run() -> Result<(), String> {
             let res = http_post("/v1/exec", &payload)?;
             println!("{}", serde_json::to_string_pretty(&res).unwrap());
         }
+        "quota" => quota_cmd(&args[1..])?,
         "collections" => {
             let res = http_post("/v1/exec", &json!({"op": "list_collections"}))?;
             print_result(&res);
@@ -695,6 +696,10 @@ fn usage() -> Result<(), String> {
          replication [status|changes [after] [limit]|source <url> [dbs] [interval]|pause|resume|disconnect|forget <node>|acks|prune <seq> [--require-acks]|promote <epoch> [--force]|demote <epoch> [role] [successor]|add-replica <name> [dbs]|pairings|revoke <code>|join <primary-url> [code]]\n\
          instances [--json] [prune] lista lokalnych daemonów\n\
          collections                lista kolekcji\n\
+         quota [show]               użycie i limity wybranej bazy\n\
+         quota set [--data R] [--index R] [--history R] [--sidecar R]\n\
+              ustaw limity (np. 10GiB, 500MiB, unlimited); --db wybiera bazę\n\
+         quota reset                usuń wszystkie limity wybranej bazy\n\
          count <coll> [filtr]       liczba dokumentów\n\
          find <coll> [filtr] [--sort pole:asc|desc] [--limit N] [--skip N]\n\
          indexes <coll>             indeksy kolekcji\n\
@@ -725,6 +730,69 @@ fn usage() -> Result<(), String> {
          NONODB_DB (domyślnie default),\n\
          NONODB_AUTH_FILE (domyślnie /etc/nonodb/auth.json)"
     );
+    Ok(())
+}
+
+fn quota_cmd(args: &[String]) -> Result<(), String> {
+    let action = args.first().map(String::as_str).unwrap_or("show");
+    match action {
+        "show" | "get" => {
+            let res = http_post("/v1/exec", &json!({"op": "get_quota"}))?;
+            print_result(&res);
+        }
+        "reset" => {
+            let res = http_post(
+                "/v1/exec",
+                &json!({
+                    "op": "set_quota",
+                    "limits": {
+                        "data_bytes": null,
+                        "index_bytes": null,
+                        "history_bytes": null,
+                        "sidecar_bytes": null,
+                    },
+                }),
+            )?;
+            print_result(&res);
+        }
+        "set" => {
+            let current = http_post("/v1/exec", &json!({"op": "get_quota"}))?;
+            let mut limits = current
+                .pointer("/result/limits")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            let mut i = 1;
+            while i < args.len() {
+                let (key, raw) = match args[i].as_str() {
+                    "--data" => ("data_bytes", args.get(i + 1)),
+                    "--index" => ("index_bytes", args.get(i + 1)),
+                    "--history" => ("history_bytes", args.get(i + 1)),
+                    "--sidecar" => ("sidecar_bytes", args.get(i + 1)),
+                    other => return Err(format!("nieznana opcja quota: {other}")),
+                };
+                let raw = raw.ok_or_else(|| format!("{} wymaga rozmiaru", args[i]))?;
+                if raw.eq_ignore_ascii_case("unlimited") {
+                    limits.remove(key);
+                } else {
+                    let value = nonodb_core::parse_size(raw)
+                        .ok_or_else(|| format!("niepoprawny rozmiar: {raw}"))?;
+                    if value == 0 {
+                        limits.remove(key);
+                    } else {
+                        limits.insert(key.to_string(), json!(value));
+                    }
+                }
+                i += 2;
+            }
+            let res = http_post(
+                "/v1/exec",
+                &json!({"op": "set_quota", "limits": Value::Object(limits)}),
+            )?;
+            print_result(&res);
+        }
+        other => return Err(format!("nieznana akcja quota: {other}")),
+    }
     Ok(())
 }
 

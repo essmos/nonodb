@@ -22,6 +22,7 @@ use crate::cache::QueryCache;
 use crate::live;
 use crate::metrics;
 use crate::protocol::{ApiError, Durability, WriteReq};
+use crate::quota::Quota;
 
 /// Maximum number of operations in one transaction.
 const MAX_BATCH: usize = 512;
@@ -201,6 +202,7 @@ pub fn run(
     store: Arc<Store>,
     rx: Receiver<WriteJob>,
     cache: Arc<QueryCache>,
+    quota: Arc<Quota>,
     stop: Arc<std::sync::atomic::AtomicBool>,
 ) {
     let (idle_window, base_window, pressure_window, max_window) = window_config();
@@ -250,7 +252,7 @@ pub fn run(
 
         metrics::set(&metrics::WRITER_LAST_BATCH_SIZE, jobs.len() as u64);
         metrics::inc(&metrics::WRITER_BUSY);
-        run_batch(&store, &cache, jobs);
+        run_batch(&store, &cache, &quota, jobs);
         metrics::sub(&metrics::WRITER_BUSY, 1);
     }
 }
@@ -272,7 +274,7 @@ fn capture_replicated_ttls(
     }
 }
 
-fn run_batch(store: &Store, cache: &QueryCache, jobs: Vec<WriteJob>) {
+fn run_batch(store: &Store, cache: &QueryCache, quota: &Quota, jobs: Vec<WriteJob>) {
     metrics::sub(&metrics::QUEUE_LEN, jobs.len() as u64);
     if crate::wal::is_full(store) {
         let err = ApiError {
@@ -294,12 +296,19 @@ fn run_batch(store: &Store, cache: &QueryCache, jobs: Vec<WriteJob>) {
         }
         return;
     }
+    let requests: Vec<&WriteReq> = jobs.iter().map(|job| &job.req).collect();
+    if let Err(err) = quota.check_write(store, &requests) {
+        for job in jobs {
+            let _ = job.resp.send(Err(err.clone()));
+        }
+        return;
+    }
     // An atomic `write_batch` cannot share a transaction with other
     // requests: one failed operation must roll back the whole batch, not
     // the other writes in the group. That is why such a group is run job by job.
     if jobs.iter().any(|j| j.req.is_atomic() || j.isolated) {
         for job in jobs {
-            run_single(store, cache, job);
+            run_single(store, cache, quota, job);
         }
         return;
     }
@@ -387,13 +396,17 @@ fn run_batch(store: &Store, cache: &QueryCache, jobs: Vec<WriteJob>) {
     }
 }
 
-fn run_single(store: &Store, cache: &QueryCache, job: WriteJob) {
+fn run_single(store: &Store, cache: &QueryCache, quota: &Quota, job: WriteJob) {
     metrics::inc(&metrics::WRITE_BATCHES);
     if crate::wal::is_full(store) {
         let _ = job.resp.send(Err(ApiError {
             code: "wal_full".to_string(),
             message: "PITR WAL has reached its hard limit; wait for snapshot retention to prune covered segments".to_string(),
         }));
+        return;
+    }
+    if let Err(err) = quota.check_write(store, &[&job.req]) {
+        let _ = job.resp.send(Err(err));
         return;
     }
     let sync = job.durability == Durability::Full;

@@ -212,8 +212,8 @@ all slots are busy, the daemon returns HTTP `503` with error code
   `read:app1/orders`, `write:app1/*`, `admin:app1/orders`. Unqualified scopes
   such as `read:orders` apply to every database.
 - `admin:<database>/*` is a per-database administrator. It can manage collections,
-  indexes, TTL/history/events/subscriptions, map operations, `sync`, and webhooks
-  in that database. It cannot create or drop databases, manage the instance-wide
+  indexes, TTL/history/events/subscriptions, storage quotas, map operations,
+  `sync`, and webhooks in that database. It cannot create or drop databases, manage the instance-wide
   authorization registry, or read instance-wide metrics. Those still require
   `admin:db` or `*:*`.
 - `list_databases` is filtered to the databases visible through the caller's
@@ -223,3 +223,6 @@ all slots are busy, the daemon returns HTTP `503` with error code
 - There are no cross-database queries, transactions, or joins.
 - Snapshot directories are created per database when `NONODB_SNAPSHOT_DIR` is
   set: `<snapshot-dir>/<database>/data-<timestamp>.mdb`.
+- Storage quotas are configured independently per database. See
+  [Per-database quotas](quotas.md); `get_quota` and `set_quota` require the
+  selected database, and `nonodb-cli --db <name> quota` manages them.

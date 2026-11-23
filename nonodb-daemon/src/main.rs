@@ -34,6 +34,7 @@ mod pairing;
 mod pairing_api;
 mod profile;
 mod protocol;
+mod quota;
 mod replication_api;
 mod replicator;
 mod retention;
@@ -131,6 +132,7 @@ struct AppState {
     write_tx: mpsc::Sender<WriteJob>,
     cache: Arc<cache::QueryCache>,
     auto_index: Arc<auto_index::AutoIndexer>,
+    quota: Arc<quota::Quota>,
     _runtime: Arc<databases::DatabaseRuntime>,
     databases: Arc<databases::Databases>,
     pub(crate) backups: Arc<backups::BackupManager>,
@@ -150,6 +152,7 @@ impl AppState {
             write_tx: runtime.write_tx.clone(),
             cache: runtime.cache.clone(),
             auto_index: runtime.auto_index.clone(),
+            quota: runtime.quota.clone(),
             _runtime: runtime,
             databases: self.databases.clone(),
             backups: self.backups.clone(),
@@ -427,6 +430,7 @@ async fn run_async() -> Result<(), Box<dyn std::error::Error>> {
         write_tx: default.write_tx.clone(),
         cache: default.cache.clone(),
         auto_index: default.auto_index.clone(),
+        quota: default.quota.clone(),
         _runtime: default.clone(),
         databases: databases.clone(),
         backups,
@@ -3727,9 +3731,11 @@ async fn exec_inner(
 
         Request::DatabaseStats => {
             let store = state.store.clone();
+            let quota = state.quota.clone();
             let principal = principal.clone();
             let database = database.clone();
             let joined = tokio::task::spawn_blocking(move || {
+                let quota = quota.report(&store)?;
                 let mut stats = store.storage_stats()?;
                 stats
                     .collections
@@ -3745,7 +3751,33 @@ async fn exec_inner(
                     stats.collections.iter().map(|item| item.total_bytes).sum();
                 let mut value = serde_json::to_value(stats).map_err(nonodb_core::Error::from)?;
                 value["database"] = json!(database);
+                value["quota"] = serde_json::to_value(quota).map_err(nonodb_core::Error::from)?;
                 Ok::<Value, ApiError>(value)
+            });
+            read_result(joined).await
+        }
+
+        Request::GetQuota => {
+            let store = state.store.clone();
+            let quota = state.quota.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                let report = quota.report(&store)?;
+                Ok::<Value, ApiError>(
+                    serde_json::to_value(report).map_err(nonodb_core::Error::from)?,
+                )
+            });
+            read_result(joined).await
+        }
+
+        Request::SetQuota { limits } => {
+            let store = state.store.clone();
+            let quota = state.quota.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                quota.set_limits(limits)?;
+                let report = quota.report(&store)?;
+                Ok::<Value, ApiError>(
+                    serde_json::to_value(report).map_err(nonodb_core::Error::from)?,
+                )
             });
             read_result(joined).await
         }
@@ -5007,6 +5039,10 @@ fn execute_read(
             code: "invalid_query".into(),
             message: "database_stats is not supported inside a read batch".into(),
         }),
+        Request::GetQuota | Request::SetQuota { .. } => Err(ApiError {
+            code: "invalid_query".into(),
+            message: "quota operations are not supported inside a read batch".into(),
+        }),
         Request::ListSubscriptions { coll } => {
             let list = store.list_subscriptions(&coll)?;
             Ok(json!({ "subscriptions": list }))
@@ -5288,7 +5324,7 @@ pub(crate) fn error_status(err: &ApiError) -> StatusCode {
         | "invalid_collection_profile" => StatusCode::BAD_REQUEST,
         "not_found" => StatusCode::NOT_FOUND,
         "database_limit" => StatusCode::SERVICE_UNAVAILABLE,
-        "wal_full" => StatusCode::INSUFFICIENT_STORAGE,
+        "wal_full" | "quota_exceeded" => StatusCode::INSUFFICIENT_STORAGE,
         "unsafe_durability_disabled" => StatusCode::BAD_REQUEST,
         "unauthorized" => StatusCode::UNAUTHORIZED,
         "forbidden" | "read_only" => StatusCode::FORBIDDEN,

@@ -307,10 +307,7 @@ The current implementation plan is limited to this list.
 
 ### P0 — necessary before production
 
-1. **Per-database quotas and usage accounting.** Limits for data, indexes,
-   history, and sidecars, with operator-visible warnings and a write-rejection
-   policy.
-2. **Safe restore-in-place API and GUI flow.** Typed confirmation, preflight
+1. **Safe restore-in-place API and GUI flow.** Typed confirmation, preflight
    verification, audit logging, and rollback guidance.
 
 ### P1 — low effort, worthwhile

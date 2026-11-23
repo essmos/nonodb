@@ -10,6 +10,7 @@ quick-start instructions, and a feature overview.
 | [Getting started](getting-started.md) | New users | Docker Compose, prebuilt binary, build from source, first document, configuration basics |
 | [Architecture](architecture.md) | Maintainers, advanced users | Process model, LMDB layout, write path, indexes, search, aggregation, crash safety |
 | [Multiple databases](multi-database.md) | Operators, application developers | Separate LMDB environments, URL routing, create/drop, CLI, GUI, migration, backup |
+| [Per-database quotas](quotas.md) | Operators, SRE | Data/index/history/sidecar accounting, soft warnings, hard write rejection, CLI |
 | [Adaptive writer](adaptive-writer.md) | Operators, performance reviewers | Adaptive group-commit window, latency/throughput tuning, metrics and limits |
 | [GUI console](gui.md) | Operators, application developers | Embedded local React console, data editing, collection settings, SQL, map/metrics |
 | [HTTP API](api.md) | All client authors | Operations, request/response formats, filters, updates, aggregation, errors |

@@ -39,6 +39,11 @@ secrets.
 | `NONODB_DATA` | `./data` | Instance root containing `<database>/data.mdb` and `<database>/lock.mdb` |
 | `NONODB_PROFILE` | unset | `small` or `tiny` fills unset small-host defaults; explicit variables win |
 | `NONODB_MAX_OPEN_DATABASES` | `64` | Maximum open LMDB environments/writers; idle databases are evicted |
+| `NONODB_QUOTA_DATA_BYTES` | unlimited | Default per-database data quota when no saved limits exist |
+| `NONODB_QUOTA_INDEX_BYTES` | unlimited | Default per-database index quota when no saved limits exist |
+| `NONODB_QUOTA_HISTORY_BYTES` | unlimited | Default per-database history quota when no saved limits exist |
+| `NONODB_QUOTA_SIDECAR_BYTES` | unlimited | Default per-database search/vector sidecar quota |
+| `NONODB_QUOTA_SOFT_PERCENT` | `80` | Percentage of a quota that produces a soft warning |
 | `NONODB_ALLOW_UNSAFE_WRITES` | unset | Enables opt-in `durability:"unsafe"` writes using LMDB `MDB_NOSYNC` |
 | `NONODB_WRITER_WINDOW_US` | `1000` | Group-commit window when the writer has a backlog |
 | `NONODB_WRITER_WINDOW_PRESSURE_US` | `3000` | Window when 64+ writes are queued |
@@ -1061,6 +1066,7 @@ backups.
 | `timeout` | Long scan exceeds 30 s, or index build exceeds 1 h | Raise `NONODB_REQUEST_TIMEOUT`, `NONODB_INDEX_TIMEOUT`, and client timeout |
 | `document_too_large` (413) | Document > 1 MiB or request > 4 MiB | Split document/import; batch inserts |
 | `wal_full` (507) | PITR WAL reached `NONODB_WAL_MAX_BYTES`/age | Check `nonodb_wal_*`, snapshot disk space, and PITR window; writes resume after retention |
+| `quota_exceeded` (507) | A database quota is exhausted | `nonodb-cli --db <name> quota`; delete data or raise/clear the named limit |
 | `duplicate_key` | Duplicate `_id` or unique-index conflict | Use a new id or update the existing document |
 | `invalid_query` on search | Text/fuzzy/vector index missing | Create the index first |
 | `MDB_DBS_FULL` | Named database limit reached | Reduce collections/indexes; recreate database with fewer names |

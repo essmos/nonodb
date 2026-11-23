@@ -186,6 +186,7 @@ python3 scripts/resize_test.py               # online map growth under concurren
 python3 scripts/restore_drill.py             # backup -> verify -> restore -> query
 python3 scripts/restore_to_test.py           # restore --to snapshot selection and verification
 python3 scripts/pitr_test.py                 # PITR snapshot+WAL replay, retention, wal_full
+python3 scripts/quota_test.py                # per-database quotas, warnings, rejection, restart
 python3 scripts/branch_test.py               # offline branch from stopped DB and snapshot, CoW fallback
 python3 scripts/shutdown_test.py             # SIGTERM drain, JSON logs, durable in-flight write
 python3 scripts/mongo_conformance_test.py   # compare wire results with a real MongoDB
