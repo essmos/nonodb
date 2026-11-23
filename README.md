@@ -1,5 +1,9 @@
 <p align="center">
-  <img src="docs/assets/nonodb-logo.svg" alt="NonoDB" width="360">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/nonodb-logo.svg">
+    <source media="(prefers-color-scheme: light)" srcset="docs/assets/nonodb-logo-light.svg">
+    <img src="docs/assets/nonodb-logo.svg" alt="NonoDB" width="360">
+  </picture>
 </p>
 
 # NoNoDB
