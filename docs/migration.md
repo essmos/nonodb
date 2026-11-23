@@ -80,8 +80,9 @@ Useful options:
 The source must be stopped or at a consistent snapshot. This is not a live CDC
 tool: writes made during the copy are not replayed. Unsupported `_id` types and
 multiple TTL indexes fail with an error before the affected collection is
-copied. Partial/wildcard indexes and unsupported text/geo forms are skipped with
-a warning in the report. Source authentication is taken from the MongoDB URI;
+copied. Wildcard indexes and unsupported text/geo forms are skipped with a
+warning in the report; sparse and `partialFilterExpression` definitions are
+preserved. Source authentication is taken from the MongoDB URI;
 never put credentials in the report or commit them.
 
 TTL translation matches MongoDB's date-field semantics: a document expires at
