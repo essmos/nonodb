@@ -49,6 +49,11 @@ Full release notes: https://github.com/essmos/nonodb/releases
   fields (`timeField`, `metaField`, `granularity`) can only change on an empty
   collection. The MongoDB wire `create` command now accepts the standard
   `timeseries` object.
+- GUI: the New collection dialog supports the `timeseries` profile (required
+  time field plus meta field, granularity, compression, and expiry), and the
+  collection settings panel shows bucket statistics, deleted rows, and
+  compression sizes. Compression/bucket/expiry settings are editable; the
+  structural fields are read-only once rows exist.
 - Add aggregation and retention for time-series collections. `aggregate` now
   decodes buckets through the time-range-pruned find path and runs the normal
   in-memory pipeline, so `$group`/`$bucket` downsampling works. The new

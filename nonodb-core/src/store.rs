@@ -1052,6 +1052,20 @@ impl Store {
         Ok(out)
     }
 
+    /// Storage statistics for a time-series collection.
+    pub fn timeseries_stats(
+        &self,
+        name: &str,
+    ) -> Result<Option<crate::timeseries::Stats>> {
+        let Some(settings) = self.timeseries_settings(name)? else {
+            return Ok(None);
+        };
+        let rtxn = self.read_txn()?;
+        let out = crate::timeseries::stats(&rtxn, self.env(), name, &settings)?;
+        rtxn.commit()?;
+        Ok(Some(out))
+    }
+
     pub fn collection_ttl(&self, name: &str) -> Result<Option<u64>> {
         let rtxn = self.read_txn()?;
         let meta = self

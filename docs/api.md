@@ -2709,7 +2709,7 @@ codecs, and measured compression:
 
 ### Time-series settings
 
-`get_collection_timeseries` returns the stored settings; `set_collection_timeseries`
+`get_collection_timeseries` returns the stored settings and storage statistics; `set_collection_timeseries`
 validates and replicates a replacement. `timeField`, `metaField`, and
 `granularity` may only change while the collection is empty; bucket sizing,
 compression, and `expireAfterSeconds` can change at any time.
@@ -2720,9 +2720,11 @@ compression, and `expireAfterSeconds` can change at any time.
 
 ```json
 {"ok": true, "result": {"coll": "readings", "profile": "timeseries",
- "timeseries": {"timeField": "ts", "metaField": "device",
+ "timeseries": {"time_field": "ts", "meta_field": "device",
                 "granularity": "seconds", "compression": "balanced",
-                "expireAfterSeconds": 86400}}}
+                "expire_after_seconds": 86400},
+ "stats": {"rows": 1200, "deleted_rows": 3, "buckets": 8, "series": 1,
+           "encoded_bytes": 8123, "open_bytes": 0, "raw_bytes": 204800}}}
 ```
 
 ```json

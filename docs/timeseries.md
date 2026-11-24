@@ -246,6 +246,16 @@ that move buckets), deletes, upserts, and replicated writes maintain the
 entries; `reindex` rebuilds all of them. Secondary indexes remain non-unique,
 but text/fuzzy/geo/vector indexes have no uniqueness semantics of their own.
 
+### GUI and CLI
+
+The GUI's **New collection** dialog offers `timeseries` next to `standard` and
+`vault`; it requires a time field and collects meta field, granularity,
+compression, and `expireAfterSeconds`, sending the same `timeseries` object as
+the wire API. Opening a time-series collection and clicking **Settings** shows
+the stored settings plus row/bucket/series counts, deleted rows, encoded size,
+and raw JSON size; compression, bucket size, and expiry are editable (the
+structural time/meta/granularity fields are read-only once rows exist).
+
 ### Reading and changing settings
 
 `Store::timeseries_settings("name")` and the `get_collection_timeseries` wire op

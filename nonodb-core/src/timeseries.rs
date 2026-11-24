@@ -175,20 +175,25 @@ impl Compression {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Settings {
     /// Field holding the event time.
+    #[serde(alias = "timeField")]
     pub time_field: String,
     /// Optional field that groups rows into series. Stored once per bucket.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, alias = "metaField", skip_serializing_if = "Option::is_none")]
     pub meta_field: Option<String>,
     #[serde(default)]
     pub granularity: Granularity,
-    #[serde(default = "default_bucket_max_docs")]
+    #[serde(default = "default_bucket_max_docs", alias = "bucketMaxDocs")]
     pub bucket_max_docs: usize,
-    #[serde(default = "default_bucket_max_bytes")]
+    #[serde(default = "default_bucket_max_bytes", alias = "bucketMaxBytes")]
     pub bucket_max_bytes: usize,
     #[serde(default)]
     pub compression: Compression,
     /// Optional read-time expiry in seconds, relative to the event time.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "expireAfterSeconds",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub expire_after_seconds: Option<u64>,
 }
 

@@ -3556,10 +3556,12 @@ async fn exec_inner(
                         "collection `{coll}` is not a time-series collection"
                     ))));
                 };
+                let stats = store.timeseries_stats(&coll)?;
                 Ok::<Value, ApiError>(json!({
                     "coll": coll,
                     "profile": "timeseries",
                     "timeseries": settings,
+                    "stats": stats,
                 }))
             });
             read_result(joined).await
