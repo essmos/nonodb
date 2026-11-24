@@ -25,6 +25,9 @@ const DEFAULT_CYPHER_ROWS: usize = 1_000;
 const DEFAULT_CYPHER_OPERATIONS: usize = 1_000_000;
 const MAX_CYPHER_ROWS: usize = 100_000;
 const MAX_CYPHER_HOPS: usize = 64;
+const MAX_CYPHER_OPERATIONS: usize = 100_000_000;
+const DEFAULT_CYPHER_TIMEOUT_MS: u64 = 30_000;
+const MAX_CYPHER_TIMEOUT_MS: u64 = 300_000;
 const DEFAULT_CYPHER_MEMORY: usize = 64 * 1024 * 1024;
 const MAX_CYPHER_MEMORY: usize = 1024 * 1024 * 1024;
 const HIDDEN_PATH_NODES: &str = "__path_nodes";
@@ -69,10 +72,16 @@ impl CypherOptions {
                 "cypher `max_rows` must be between 1 and {MAX_CYPHER_ROWS}"
             )));
         }
-        if self.max_operations == 0 {
-            return Err(Error::Query(
-                "cypher `max_operations` must be positive".into(),
-            ));
+        if self.max_operations == 0 || self.max_operations > MAX_CYPHER_OPERATIONS {
+            return Err(Error::Query(format!(
+                "cypher `max_operations` must be between 1 and {MAX_CYPHER_OPERATIONS}"
+            )));
+        }
+        let timeout = self.timeout_ms.unwrap_or(DEFAULT_CYPHER_TIMEOUT_MS);
+        if timeout == 0 || timeout > MAX_CYPHER_TIMEOUT_MS {
+            return Err(Error::Query(format!(
+                "cypher `timeout_ms` must be between 1 and {MAX_CYPHER_TIMEOUT_MS}"
+            )));
         }
         if !self.params.is_null() && !self.params.is_object() {
             return Err(Error::Query("cypher `params` must be a JSON object".into()));
@@ -231,9 +240,12 @@ impl<'a> Executor<'a> {
             graph: Graph { view },
             params: options.params.clone(),
             options,
-            deadline: options
-                .timeout_ms
-                .map(|ms| Instant::now() + Duration::from_millis(ms)),
+            deadline: Some(
+                Instant::now()
+                    + Duration::from_millis(
+                        options.timeout_ms.unwrap_or(DEFAULT_CYPHER_TIMEOUT_MS),
+                    ),
+            ),
             operations: 0,
             memory_used: 0,
             truncated: false,
@@ -253,6 +265,13 @@ impl<'a> Executor<'a> {
             return Err(Error::Query("cypher query timed out".into()));
         }
         Ok(())
+    }
+
+    fn charge_row(&mut self, row: &Row) -> Result<()> {
+        let bytes = serde_json::to_vec(&row.values)
+            .map_or(0, |raw| raw.len())
+            .saturating_add(row.order.iter().map(|name| name.len() + 24).sum::<usize>());
+        self.charge_memory(bytes)
     }
 
     fn charge_memory(&mut self, bytes: usize) -> Result<()> {
@@ -393,8 +412,11 @@ impl<'a> Executor<'a> {
                 let mut seen = HashSet::new();
                 let mut out = Vec::new();
                 for row in rows {
+                    self.tick()?;
                     let key = serde_json::to_string(&row.visible_values())?;
+                    self.charge_memory(key.len().saturating_add(24))?;
                     if seen.insert(key) {
+                        self.charge_row(&row)?;
                         out.push(row);
                     }
                 }
@@ -487,33 +509,41 @@ impl<'a> Executor<'a> {
                 let mut out = Vec::new();
                 for row in rows {
                     let value = self.eval(expression, &row, None)?;
-                    match value {
-                        Value::Array(items) => {
-                            for item in items {
-                                let mut next = row.clone();
-                                next.set(alias.clone(), item);
-                                out.push(next);
-                            }
-                        }
-                        Value::Null => {}
-                        value => {
-                            let mut next = row.clone();
-                            next.set(alias.clone(), value);
-                            out.push(next);
-                        }
+                    let items = match value {
+                        Value::Array(items) => items,
+                        Value::Null => continue,
+                        value => vec![value],
+                    };
+                    for item in items {
+                        self.tick()?;
+                        let mut next = row.clone();
+                        next.set(alias.clone(), item);
+                        self.charge_row(&next)?;
+                        out.push(next);
                     }
                 }
                 Ok(out)
             }
             Plan::Union { left, right, all } => {
                 let mut out = self.execute_input(left)?;
-                out.extend(self.execute_input(right)?);
+                let right_rows = self.execute_input(right)?;
+                for row in &right_rows {
+                    self.tick()?;
+                    self.charge_row(row)?;
+                }
+                out.extend(right_rows);
                 if !*all {
                     let mut seen = HashSet::new();
-                    out.retain(|row| {
-                        let key = serde_json::to_string(&row.visible_values()).unwrap_or_default();
-                        seen.insert(key)
-                    });
+                    let mut deduped = Vec::new();
+                    for row in out {
+                        self.tick()?;
+                        let key = serde_json::to_string(&row.visible_values())?;
+                        self.charge_memory(key.len().saturating_add(24))?;
+                        if seen.insert(key) {
+                            deduped.push(row);
+                        }
+                    }
+                    out = deduped;
                 }
                 Ok(out)
             }
@@ -862,7 +892,7 @@ impl<'a> Executor<'a> {
             edge_filter: None,
             node_filter: None,
             as_of: None,
-            limit: self.options.max_rows.min(10_000),
+            limit: self.options.max_rows.min(1_000),
             max_nodes: self.options.max_rows.clamp(1, 1_000),
             damping: 0.85,
             iterations: 100,
@@ -902,6 +932,9 @@ impl<'a> Executor<'a> {
             }
         };
         let mut rows = Vec::new();
+        if value["truncated"].as_bool().unwrap_or(false) {
+            self.truncated = true;
+        }
         if short == "wcc" {
             for component in value["components"].as_array().into_iter().flatten() {
                 let component_id = component["id"].clone();
@@ -1308,6 +1341,8 @@ impl<'a> Executor<'a> {
                     .collect();
                 let mut keyed = Vec::with_capacity(projected.len());
                 for row in projected {
+                    self.tick()?;
+                    self.charge_row(&row)?;
                     let mut values = Vec::with_capacity(keys.len());
                     for key in keys {
                         values.push(self.eval_sort_key_with_aliases(&key.expr, &row, &aliases)?);
@@ -1330,6 +1365,8 @@ impl<'a> Executor<'a> {
             collect_projection_aliases(input, &mut aliases);
             let mut keyed = Vec::new();
             for (projected, scope) in pairs {
+                self.tick()?;
+                self.charge_row(&projected)?;
                 let mut values = Vec::with_capacity(keys.len());
                 for key in keys {
                     values.push(self.eval_sort_key_with_aliases(&key.expr, &scope, &aliases)?);
@@ -1350,6 +1387,8 @@ impl<'a> Executor<'a> {
         let mut rows = self.execute_input(input)?;
         let mut keyed = Vec::with_capacity(rows.len());
         for row in rows.drain(..) {
+            self.tick()?;
+            self.charge_row(&row)?;
             let mut values = Vec::with_capacity(keys.len());
             for key in keys {
                 values.push(self.eval(&key.expr, &row, None)?);
@@ -1425,6 +1464,7 @@ impl<'a> Executor<'a> {
                 "cypher supports exactly one read-only statement".into(),
             ));
         }
+        reject_unsupported_shapes(&query)?;
         if query.clauses.iter().any(is_write_clause) {
             return Err(Error::Query(
                 "cypher write clauses are not supported in read-only mode".into(),
@@ -3994,7 +4034,12 @@ fn normalize_literals(query: &str) -> String {
                             }
                             if let Ok(code) = u32::from_str_radix(&digits, 16) {
                                 if let Some(ch) = char::from_u32(code) {
-                                    out.push(ch);
+                                    match ch {
+                                        '\'' if active == '\'' => out.push_str("\\'"),
+                                        '"' if active == '"' => out.push_str("\\\""),
+                                        '\\' => out.push_str("\\\\"),
+                                        other => out.push(other),
+                                    }
                                 }
                             }
                         }
@@ -4055,13 +4100,12 @@ fn normalize_literals(query: &str) -> String {
         }
         out.push(ch);
     }
-    out.replace("-9223372036854775808", "(-9223372036854775807 - 1)")
+    out
 }
 
 pub fn execute(view: &dyn GraphView, options: &CypherOptions) -> Result<Value> {
     options.validate()?;
     check_nesting_depth(&options.query)?;
-    reject_unsupported_shapes(&options.query)?;
     let expanded = expand_exists_subqueries(&prepend_optional_anchor(&options.query))?;
     let normalized = normalize_query_text(&expanded);
     let query: Query =
@@ -4071,6 +4115,7 @@ pub fn execute(view: &dyn GraphView, options: &CypherOptions) -> Result<Value> {
             "cypher supports exactly one read-only statement".into(),
         ));
     }
+    reject_unsupported_shapes(&query)?;
     if query.clauses.iter().any(is_write_clause) {
         return Err(Error::Query(
             "cypher write clauses are not supported in read-only mode".into(),
@@ -4090,13 +4135,13 @@ pub fn execute(view: &dyn GraphView, options: &CypherOptions) -> Result<Value> {
         .first()
         .map(|row| row.order.clone())
         .unwrap_or_default();
-    let mut out = Vec::with_capacity(rows.len());
-    for row in rows {
+    let row_count = rows.len();
+    let mut out = Vec::with_capacity(row_count.min(options.max_rows));
+    for row in rows.into_iter().take(options.max_rows) {
         out.push(Value::Object(row.visible_values()));
-        if out.len() >= options.max_rows {
-            executor.truncated = true;
-            break;
-        }
+    }
+    if row_count > options.max_rows {
+        executor.truncated = true;
     }
     let result = json!({
         "columns": columns,
@@ -4113,24 +4158,96 @@ pub fn execute(view: &dyn GraphView, options: &CypherOptions) -> Result<Value> {
     Ok(result)
 }
 
-fn reject_unsupported_shapes(query: &str) -> Result<()> {
-    let upper = query.to_ascii_uppercase();
-    if let Some(skip) = upper.find(" SKIP ") {
-        if upper[..skip].rfind(" WITH ").is_some() && upper[skip + 6..].contains(" MATCH ") {
-            return Err(Error::Query(
-                "cypher WITH ... SKIP followed by MATCH is not supported".into(),
-            ));
+fn reject_unsupported_shapes(query: &Query) -> Result<()> {
+    let mut after_with = false;
+    let mut after_with_skip = false;
+    for clause in &query.clauses {
+        match clause {
+            Clause::With(_) => {
+                after_with = true;
+                after_with_skip = false;
+            }
+            Clause::Skip(_) if after_with => after_with_skip = true,
+            Clause::Match(_) if after_with_skip => {
+                return Err(Error::Query(
+                    "cypher WITH ... SKIP followed by MATCH is not supported".into(),
+                ));
+            }
+            _ => {}
         }
     }
     Ok(())
 }
 
+fn replace_outside_literals(input: &str, needle: &str, replacement: &str) -> String {
+    let chars: Vec<char> = input.chars().collect();
+    let needle: Vec<char> = needle.chars().collect();
+    let mut out = String::with_capacity(input.len());
+    let mut index = 0usize;
+    let mut quote: Option<char> = None;
+    while index < chars.len() {
+        let ch = chars[index];
+        if let Some(active) = quote {
+            out.push(ch);
+            if ch == '\\' && index + 1 < chars.len() {
+                index += 1;
+                out.push(chars[index]);
+            } else if ch == active {
+                quote = None;
+            }
+            index += 1;
+            continue;
+        }
+        if ch == '\'' || ch == '"' || ch == '`' {
+            quote = Some(ch);
+            out.push(ch);
+            index += 1;
+            continue;
+        }
+        if ch == '/' && chars.get(index + 1) == Some(&'/') {
+            while index < chars.len() && chars[index] != '\n' {
+                out.push(chars[index]);
+                index += 1;
+            }
+            continue;
+        }
+        if ch == '/' && chars.get(index + 1) == Some(&'*') {
+            out.push(ch);
+            out.push(chars[index + 1]);
+            index += 2;
+            while index < chars.len() {
+                if chars[index] == '*' && chars.get(index + 1) == Some(&'/') {
+                    out.push('*');
+                    out.push('/');
+                    index += 2;
+                    break;
+                }
+                out.push(chars[index]);
+                index += 1;
+            }
+            continue;
+        }
+        if chars.get(index..index + needle.len()) == Some(needle.as_slice()) {
+            out.push_str(replacement);
+            index += needle.len();
+            continue;
+        }
+        out.push(ch);
+        index += 1;
+    }
+    out
+}
+
 fn normalize_query_text(query: &str) -> String {
-    normalize_reserved_labels(&normalize_is_null_comparisons(
-        &normalize_literals(query)
-            .replace("<-->", "--")
-            .replace(":T|:T", ":T"),
-    ))
+    let normalized = normalize_literals(query);
+    let normalized = replace_outside_literals(&normalized, "<-->", "--");
+    let normalized = replace_outside_literals(&normalized, ":T|:T", ":T");
+    let normalized = replace_outside_literals(
+        &normalized,
+        "-9223372036854775808",
+        "(-9223372036854775807 - 1)",
+    );
+    normalize_reserved_labels(&normalize_is_null_comparisons(&normalized))
 }
 
 fn prepend_optional_anchor(query: &str) -> String {

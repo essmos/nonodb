@@ -5470,6 +5470,12 @@ impl<'e> Collection<'e> {
             return Err(Error::Query("graph rebuild is already running".into()));
         }
         let target = def.generation.saturating_add(1);
+        if target > graph::MAX_GRAPH_GENERATION {
+            return Err(Error::Query(format!(
+                "graph rebuild would exceed the maximum generation {}",
+                graph::MAX_GRAPH_GENERATION
+            )));
+        }
         for direction in [GraphDirection::Out, GraphDirection::In] {
             let resource = graph::adjacency_resource_gen(&edge.name, direction, target);
             edge.drop_resource_db(&mut *wtxn, &resource, &resource)?;
@@ -5584,6 +5590,12 @@ impl<'e> Collection<'e> {
                 "graph rebuild target generation is stale".into(),
             ));
         }
+        if state.target_generation > graph::MAX_GRAPH_GENERATION {
+            return Err(Error::Query(format!(
+                "graph rebuild target exceeds the maximum generation {}",
+                graph::MAX_GRAPH_GENERATION
+            )));
+        }
         let out =
             self.graph_adjacency_db_in(&mut *wtxn, GraphDirection::Out, state.target_generation)?;
         let incoming =
@@ -5627,6 +5639,7 @@ impl<'e> Collection<'e> {
         // the old generations in the same transaction.
         let mut new_def = def.clone();
         new_def.generation = state.target_generation;
+        new_def.validate()?;
         let raw_def = serde_json::to_vec(&new_def)?;
         node.meta.put(
             &mut *wtxn,
@@ -14067,6 +14080,27 @@ mod tests {
         assert!(primary
             .aggregate(&[json!({"$unionWith": {"coll": "union_archive", "pipeline": 1}})])
             .is_err());
+    }
+
+    #[test]
+    fn online_rebuild_rejects_generation_overflow() {
+        let (_dir, store) = store();
+        store
+            .create_collection("nodes", crate::vault::CollectionProfile::Standard)
+            .unwrap();
+        store
+            .create_collection("edges", crate::vault::CollectionProfile::Standard)
+            .unwrap();
+        let nodes = store.collection("nodes").unwrap();
+        let def: crate::graph::GraphDef = serde_json::from_value(json!({
+            "node_collection": "nodes",
+            "edge_collection": "edges",
+            "generation": crate::graph::MAX_GRAPH_GENERATION
+        }))
+        .unwrap();
+        nodes.set_graph(def).unwrap();
+        let error = nodes.start_graph_rebuild().unwrap_err().to_string();
+        assert!(error.contains("maximum generation"), "{error}");
     }
 
     #[test]

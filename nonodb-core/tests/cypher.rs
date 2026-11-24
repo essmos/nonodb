@@ -248,6 +248,99 @@ fn cypher_distinct_and_explain_are_deterministic() {
 }
 
 #[test]
+fn cypher_normalization_preserves_string_literals_and_planned_shapes() {
+    let (_dir, store) = graph_store();
+    let collection = store.collection("nodes").unwrap();
+    for (query, expected) in [
+        (r"RETURN '<-->' AS s", "<-->"),
+        (
+            r"RETURN '-9223372036854775808' AS s",
+            "-9223372036854775808",
+        ),
+        (r"RETURN ':T|:T' AS s", ":T|:T"),
+        (
+            r"RETURN ' WITH x SKIP 1 MATCH ' AS s",
+            " WITH x SKIP 1 MATCH ",
+        ),
+        (r"RETURN '\u0027' AS s", "'"),
+    ] {
+        let options: CypherOptions = serde_json::from_value(json!({"query": query})).unwrap();
+        let out = collection.graph_cypher(options).unwrap();
+        assert_eq!(out["rows"], json!([{"s": expected}]), "{query}");
+    }
+
+    let options: CypherOptions = serde_json::from_value(json!({
+        "query": "MATCH (n) WITH n SKIP 1 MATCH (m) RETURN m"
+    }))
+    .unwrap();
+    let error = collection.graph_cypher(options).unwrap_err().to_string();
+    assert!(error.contains("WITH ... SKIP followed by MATCH"), "{error}");
+}
+
+#[test]
+fn cypher_enforces_unwind_budget_operations_and_timeout_bounds() {
+    let (_dir, store) = graph_store();
+    let collection = store.collection("nodes").unwrap();
+    let xs: Vec<u64> = (1..100_000).collect();
+    let options: CypherOptions = serde_json::from_value(json!({
+        "query": "UNWIND $xs AS x WITH x ORDER BY x RETURN count(x) AS n",
+        "params": {"xs": xs},
+        "max_memory_bytes": 2_000
+    }))
+    .unwrap();
+    let error = collection.graph_cypher(options).unwrap_err().to_string();
+    assert!(error.contains("memory budget"), "{error}");
+
+    let options: CypherOptions = serde_json::from_value(json!({
+        "query": "RETURN 1 AS x",
+        "max_operations": 100_000_001
+    }))
+    .unwrap();
+    let error = collection.graph_cypher(options).unwrap_err().to_string();
+    assert!(error.contains("max_operations"), "{error}");
+
+    let options: CypherOptions = serde_json::from_value(json!({
+        "query": "RETURN 1 AS x",
+        "timeout_ms": 300_001
+    }))
+    .unwrap();
+    let error = collection.graph_cypher(options).unwrap_err().to_string();
+    assert!(error.contains("timeout_ms"), "{error}");
+}
+
+#[test]
+fn cypher_gds_clamps_large_row_limits_and_reports_truncation() {
+    let dir = TempDir::new().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let nodes = store
+        .create_collection("nodes", nonodb_core::CollectionProfile::Standard)
+        .unwrap();
+    store
+        .create_collection("edges", nonodb_core::CollectionProfile::Standard)
+        .unwrap();
+    for i in 0..1_500 {
+        nodes
+            .insert_one(json!({"_id": format!("n{i:05}")}))
+            .unwrap();
+    }
+    let def: GraphDef = serde_json::from_value(json!({
+        "node_collection": "nodes",
+        "edge_collection": "edges"
+    }))
+    .unwrap();
+    nodes.set_graph(def).unwrap();
+    let options: CypherOptions = serde_json::from_value(json!({
+        "query": "CALL gds.pagerank.stream() YIELD nodeId, score RETURN nodeId, score",
+        "max_rows": 2_000,
+        "max_operations": 10_000_000
+    }))
+    .unwrap();
+    let out = nodes.graph_cypher(options).unwrap();
+    assert_eq!(out["row_count"], 1_000);
+    assert_eq!(out["truncated"], true);
+}
+
+#[test]
 fn cypher_limits_and_nesting_fail_explicitly() {
     let (_dir, store) = graph_store();
     let collection = store.collection("nodes").unwrap();
@@ -274,6 +367,15 @@ fn cypher_limits_and_nesting_fail_explicitly() {
     .unwrap();
     let error = collection.graph_cypher(options).unwrap_err().to_string();
     assert!(error.contains("memory budget"), "{error}");
+
+    let options: CypherOptions = serde_json::from_value(json!({
+        "query": "UNWIND range(1, 5000) AS x RETURN sum(x) AS n",
+        "max_rows": 10,
+        "max_operations": 1_000_000
+    }))
+    .unwrap();
+    let out = collection.graph_cypher(options).unwrap();
+    assert_eq!(out["rows"], json!([{"n": 12_502_500.0}]));
 
     let options: CypherOptions = serde_json::from_value(json!({
         "query": "RETURN size(range(1, 200000)) AS n",
@@ -336,7 +438,7 @@ fn cypher_timeout_cancels_long_queries() {
     let options: CypherOptions = serde_json::from_value(json!({
         "query": "UNWIND range(1, 1000000) AS x RETURN sum(x)",
         "timeout_ms": 1,
-        "max_operations": 1_000_000_000
+        "max_operations": 100_000_000
     }))
     .unwrap();
     let error = collection.graph_cypher(options).unwrap_err().to_string();

@@ -50,7 +50,7 @@ rows = nodes.cypher(
 | Temporal values | Partial | constructors and accessors; some functions and extreme ranges fail explicitly |
 | `CREATE`, `MERGE`, `SET`, `REMOVE`, `DELETE` | Rejected | read-only mode |
 | `LOAD CSV`, schema commands, APOC, Bloom | Rejected | out of scope |
-| Arbitrary procedures | Rejected | only the four `gds.*` procedures below |
+| Arbitrary procedures | Rejected | only the seven `gds.*` procedures below |
 
 Unsupported syntax returns `invalid_query`; it is never silently ignored.
 
@@ -92,15 +92,16 @@ RETURN nodeId, score ORDER BY score DESC
 
 - exactly one read-only statement per request;
 - write clauses are rejected before planning;
-- `max_rows` (default 1000, max 100000), `max_operations` (default 1,000,000),
-  `max_memory_bytes` (default 64 MiB), and `timeout_ms` bound execution; the
-  operation/result budget is checked during execution, so cancellation returns a
-  structured error;
+- `max_rows` (default 1000, max 100000), `max_operations` (default 1,000,000,
+  max 100,000,000), `max_memory_bytes` (default 64 MiB), and `timeout_ms`
+  (default 30 s, max 5 min) bound execution; operation, row, and memory budgets
+  are charged during execution, including `UNWIND`/`DISTINCT`/`SORT`/`UNION`, so
+  cancellation returns a structured error;
 - `max_depth` bounds variable-length expansion (hard maximum 64);
 - literal/pattern nesting is capped at 16 levels to prevent parser stack
   exhaustion;
-- the GDS procedures process at most 1,000 nodes, emit at most `max_rows`, and
-  receive the same timeout budget as the query;
+- the GDS procedures process at most 1,000 nodes, emit at most `max_rows` (and
+  set `truncated:true` when clipped), and receive the same timeout budget;
 - unsupported syntax fails explicitly with `invalid_query`, never a silent
   wrong result;
 - vault collections are rejected, and graph reads require scope on the node
