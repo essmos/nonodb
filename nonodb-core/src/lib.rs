@@ -16,6 +16,7 @@ pub mod backup_crypto;
 pub mod backup_info;
 pub mod bson_types;
 pub mod collection;
+pub mod cypher;
 pub mod date;
 pub mod error;
 pub mod events;

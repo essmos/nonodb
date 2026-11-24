@@ -1730,6 +1730,35 @@ class Collection:
             payload["projection"] = projection
         return self._db.exec(payload)
 
+    def cypher(
+        self,
+        query: str,
+        *,
+        params: Optional[dict[str, Any]] = None,
+        max_rows: int = 1_000,
+        max_operations: int = 1_000_000,
+        timeout_ms: Optional[int] = None,
+        max_depth: int = 64,
+    ) -> dict[str, Any]:
+        """Executes a read-only Cypher query against the configured graph.
+
+        Write clauses, APOC, Bloom, and non-agreed procedures are rejected.
+        Returns ``columns``, ``rows``, ``row_count``, and ``truncated``.
+        """
+        payload: dict[str, Any] = {
+            "op": "cypher",
+            "coll": self.name,
+            "query": query,
+            "max_rows": max_rows,
+            "max_operations": max_operations,
+            "max_depth": max_depth,
+        }
+        if params is not None:
+            payload["params"] = params
+        if timeout_ms is not None:
+            payload["timeout_ms"] = timeout_ms
+        return self._db.exec(payload)
+
     def all_shortest_paths(
         self,
         start: Any,

@@ -15,6 +15,7 @@ use sha2::{Digest, Sha256};
 
 use crate::aggregate;
 use crate::bson_types;
+use crate::cypher::CypherOptions;
 use crate::date;
 use crate::error::{Error, Result};
 use crate::events::{self, EventConfig, EVENTS_COLLECTION};
@@ -5706,6 +5707,26 @@ impl<'e> Collection<'e> {
         })?;
         let view = GraphViewImpl::new(store, &rtxn, def)?;
         let out = graph::shortest_path(&view, &options)?;
+        rtxn.commit()?;
+        Ok(out)
+    }
+
+    pub fn graph_cypher(&self, options: CypherOptions) -> Result<Value> {
+        if self.profile.is_vault() {
+            return Err(Error::Query(
+                "graph operations are not supported on vault collections".into(),
+            ));
+        }
+        options.validate()?;
+        let rtxn = self.read_txn()?;
+        let def = self
+            .graph_def_in(&rtxn)?
+            .ok_or_else(|| Error::Query("graph is not configured for this collection".into()))?;
+        let store = self.store.ok_or_else(|| {
+            Error::Query("graph traversal requires a store-backed collection".into())
+        })?;
+        let view = GraphViewImpl::new(store, &rtxn, def)?;
+        let out = crate::cypher::execute(&view, &options)?;
         rtxn.commit()?;
         Ok(out)
     }

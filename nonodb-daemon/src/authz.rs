@@ -67,6 +67,7 @@ pub fn authorize_request(
         | Request::GetGraph { coll }
         | Request::Traverse { coll, .. }
         | Request::ShortestPath { coll, .. }
+        | Request::Cypher { coll, .. }
         | Request::AllShortestPaths { coll, .. }
         | Request::GraphMatch { coll, .. }
         | Request::GraphAlgorithm { coll, .. }
