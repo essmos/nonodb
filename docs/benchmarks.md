@@ -407,6 +407,9 @@ edges), and 20 reachable shortest-path pairs. Ingest used 1,000-edge batches.
 The table is the median of three runs; timings are end-to-end request latency
 after warmup, with p50/p95 over 100 samples.
 
+Full dataset, methodology, caveats, and reproduction steps:
+[Graph benchmark](graph-benchmark.md).
+
 | Metric | NonoDB | Neo4j 5 Community | NonoDB advantage |
 |---|---:|---:|---:|
 | Ingest nodes + edges | **166 ms** (~48k edges/s) | 2,323 ms (~3.4k edges/s) | ~14.0× |
@@ -414,26 +417,10 @@ after warmup, with p50/p95 over 100 samples.
 | Traverse depth 3, p50 / p95 | **1.32 / 2.34 ms** | 8.21 / 11.96 ms | ~6.2× p50 |
 | Shortest path by hops, p50 / p95 | **0.80 / 1.52 ms** | 6.15 / 12.72 ms | ~7.6× p50 |
 
-Caveats:
-
-- NonoDB was queried over a Unix socket with JSON request/response; Neo4j was
-  queried through HTTP transactional Cypher. Part of Neo4j's fixed latency is
-  the HTTP transaction and JVM client path, not graph traversal itself.
-- Neo4j queries returned only a count/ID result, while NonoDB materialized
-  projected node documents. The NonoDB side therefore did more response work.
-- Neo4j Community is a single instance and has no built-in multi-node
-  replication. This table is **not** a replication or failover benchmark.
-- Results are sensitive to batching, page cache, JVM warmup, and graph shape.
-  Use the script on the target hardware before making capacity decisions.
-
-Run it with:
-
-```bash
-cargo build --release --bins
-docker pull neo4j:5-community
-NONODB_DAEMON=target/release/nonodb-daemon \
-  python3 scripts/graph_neo4j_bench.py
-```
+Key caveats: NonoDB used a Unix socket while Neo4j used HTTP/Cypher; Neo4j
+returned only counts/IDs while NonoDB materialized projected documents; the graph
+is small; Neo4j Community is single-node, so this is not a replication benchmark.
+See [Graph benchmark](graph-benchmark.md) for the full discussion.
 
 ---
 

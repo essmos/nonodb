@@ -319,8 +319,15 @@ the same.
 
 The **Graph** tab configures a graph (including validity fields), rebuilds
 adjacency, traverses from one or more start ids with optional edge/node filters,
-temporal `as_of`, and projection, and renders results as a tree. Expanding a node issues a
-one-level `traverse` request, so large result sets stay bounded and interactive.
+temporal `as_of`, and projection, and renders results as a tree. Expanding a
+node issues a one-level `traverse` request, so large result sets stay bounded and
+interactive.
+
+## Benchmarks
+
+See [Graph benchmark](graph-benchmark.md) for the NonoDB vs Neo4j Community
+methodology and results. It covers ingest, BFS depth 1/3, and shortest paths on a
+small deterministic graph; it is not a replication benchmark.
 
 ## Limitations
 
