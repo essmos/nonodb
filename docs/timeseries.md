@@ -587,7 +587,7 @@ Storage for TimescaleDB is `hypertable_size` after native compression
 | Operation | NonoDB standard | NonoDB time-series | TimescaleDB |
 |---|---:|---:|---:|
 | Insert, one row | 20 µs p50 | 39 µs p50 | 0.89 ms p50 |
-| Bulk load, 1000-row txns | 120,700 rows/s | 40,500 rows/s | 98,900 rows/s |
+| Bulk load, 1000-row txns | 94,800 rows/s | 49,000 rows/s | 98,900 rows/s |
 | Find by `_id` / primary key | 5.9 µs | 2.06 ms | 0.62 ms |
 | Find 1 h, 1 series | 358 ms | **20.2 ms** | 14.9 ms |
 | Count 1 h, 1 series | 269 ms | 24.8 ms | 1.81 ms |

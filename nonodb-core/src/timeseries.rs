@@ -1909,6 +1909,116 @@ pub(crate) fn exact_id_filter(filter: &Value) -> Option<&str> {
     object.get("_id")?.as_str()
 }
 
+/// Inserts many documents, keeping one open pointer per series in memory.
+///
+/// The ordinary `insert` reads and writes the open pointer for every row. In a
+/// bulk load that is one extra LMDB get and put per document. This variant
+/// resolves each series once and writes its pointer at the end of the batch.
+pub fn insert_many(
+    wtxn: &mut RwTxn<'_>,
+    env: &heed::Env,
+    name: &str,
+    settings: &Settings,
+    docs: &[Value],
+) -> Result<Vec<String>> {
+    settings.validate()?;
+    let db = ensure_bucket_db(wtxn, env, name)?;
+    struct OpenState {
+        salt: u32,
+        key: Vec<u8>,
+        count: u32,
+    }
+    let mut series: std::collections::HashMap<(u64, String), OpenState> =
+        std::collections::HashMap::new();
+    let mut ids = Vec::with_capacity(docs.len());
+    for doc in docs {
+        let mut doc = doc.clone();
+        crate::date::normalize_document(&mut doc)?;
+        let object = doc
+            .as_object()
+            .cloned()
+            .ok_or_else(|| Error::Query("document must be an object".into()))?;
+        if !object.contains_key(&settings.time_field) {
+            return Err(Error::Query(format!(
+                "time-series document is missing the time field `{}`",
+                settings.time_field
+            )));
+        }
+        let end = extract_time(&doc, &settings.time_field).ok_or_else(|| {
+            Error::Query(format!(
+                "time-series field `{}` must be a date or epoch milliseconds",
+                settings.time_field
+            ))
+        })?;
+        let meta = series_meta(&doc, settings);
+        let hash = series_hash(settings, meta.as_ref());
+        let span = settings.span_ms();
+        let window_start = end.div_euclid(span) * span;
+        let row_bytes = serde_json::to_vec(&doc)?;
+        if row_bytes.len() > crate::store::MAX_DOCUMENT_BYTES {
+            return Err(Error::DocumentTooLarge(
+                row_bytes.len(),
+                crate::store::MAX_DOCUMENT_BYTES,
+            ));
+        }
+        let series_key = (hash, canonical_json(meta.as_ref().unwrap_or(&Value::Null)));
+        if !series.contains_key(&series_key) {
+            let salt = resolve_salt(wtxn, &db, settings, hash, meta.as_ref())?;
+            let pointer_key = open_key(hash, salt);
+            let (key, count) = match db.get(&*wtxn, &pointer_key)? {
+                Some(value) => {
+                    parse_open(value).unwrap_or((bucket_key(hash, salt, window_start, 0), 0))
+                }
+                None => (bucket_key(hash, salt, window_start, 0), 0),
+            };
+            series.insert(series_key.clone(), OpenState { salt, key, count });
+        }
+        let state = series.get_mut(&series_key).expect("series inserted");
+        let (_, _, key_window, key_serial) =
+            key_parts(&state.key).unwrap_or((hash, state.salt, window_start, 0));
+        let stale = key_window != window_start;
+        let full = state.count as usize >= settings.bucket_max_docs;
+        if stale || full {
+            seal_bucket(wtxn, &db, settings, &state.key)?;
+            let mut serial = key_serial.saturating_add(1);
+            loop {
+                let candidate = bucket_key(hash, state.salt, window_start, serial);
+                if db.get(&*wtxn, &candidate)?.is_none() {
+                    state.key = candidate;
+                    break;
+                }
+                serial = serial.saturating_add(1);
+                if serial == u16::MAX {
+                    return Err(Error::Query("time-series bucket serial exhausted".into()));
+                }
+            }
+            state.count = 0;
+        }
+        let (_, _, window, serial) =
+            key_parts(&state.key).unwrap_or((hash, state.salt, window_start, 0));
+        db.put(
+            &mut *wtxn,
+            &row_key(hash, state.salt, window, serial, state.count),
+            &row_bytes,
+        )?;
+        let id = match object.get("_id") {
+            Some(Value::String(id)) => id.clone(),
+            Some(other) => crate::id::key_from_value(other).ok_or(Error::InvalidId)?,
+            None => row_id(hash, state.salt, window, serial, state.count),
+        };
+        state.count = state.count.saturating_add(1);
+        ids.push(id);
+    }
+    for ((hash, _), state) in series {
+        db.put(
+            &mut *wtxn,
+            &open_key(hash, state.salt),
+            &encode_open(&state.key, state.count),
+        )?;
+    }
+    Ok(ids)
+}
+
 fn time_bounds(filter: &Value, field: &str) -> (Option<i64>, Option<i64>) {
     let mut low = None;
     let mut high = None;
@@ -4509,6 +4619,38 @@ mod tests {
         assert!(c.drop_index("level").unwrap());
         assert!(!c.drop_index("level").unwrap());
         assert_eq!(c.explain(&query(None)).unwrap()["index_used"], json!(false));
+    }
+
+    #[test]
+    fn insert_many_txn_batches_series_and_windows() {
+        let (_dir, store) = ts_store();
+        let settings = Settings {
+            time_field: "ts".into(),
+            meta_field: Some("device".into()),
+            ..Settings::default()
+        };
+        let c = store
+            .create_timeseries_collection("metrics", &settings)
+            .unwrap();
+        let base = 1_700_000_000_000i64;
+        let docs: Vec<Value> = (0..200i64)
+            .map(|idx| {
+                json!({
+                    "ts": {"$date": {"$numberLong": (base + idx * 3_600_000).to_string()}},
+                    "device": {"id": format!("d{}", idx % 3)},
+                    "value": idx,
+                })
+            })
+            .collect();
+        let mut wtxn = store.write_txn().unwrap();
+        let ids = c.insert_many_txn(&mut wtxn, &docs).unwrap();
+        wtxn.commit().unwrap();
+        assert_eq!(ids.len(), docs.len());
+        assert_eq!(c.count(&json!({})).unwrap(), docs.len());
+        for (idx, id) in ids.iter().enumerate() {
+            let doc = c.find_by_key(id).unwrap().expect("inserted id");
+            assert_eq!(doc["value"], json!(idx));
+        }
     }
 
     #[test]

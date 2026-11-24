@@ -4,6 +4,10 @@ Full release notes: https://github.com/essmos/nonodb/releases
 
 ## Unreleased
 
+- Add `Collection::insert_many_txn` with a time-series batch writer that
+  resolves each open bucket once and flushes its pointer at the end of the
+  transaction. A 100k-row load in 1000-row transactions improved from ~40.5k to
+  ~49k rows/s; the daemon `insert_many` path and the benchmark use it.
 - Speed up time-series single-row maintenance: `update`/`findAndModify` by a
   synthetic `_id` now restrict scanning to the bucket encoded in the id, and
   unsorted indexed reads stop after `skip + limit` rows instead of decoding all

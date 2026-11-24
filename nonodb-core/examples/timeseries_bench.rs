@@ -515,9 +515,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let started = Instant::now();
         for chunk in (0..rows).collect::<Vec<_>>().chunks(1000) {
             let mut wtxn = store.write_txn()?;
-            for idx in chunk {
-                bulk.insert_one_txn(&mut wtxn, doc(*idx % series, *idx))?;
-            }
+            let batch: Vec<Value> = chunk.iter().map(|idx| doc(*idx % series, *idx)).collect();
+            bulk.insert_many_txn(&mut wtxn, &batch)?;
             wtxn.commit()?;
         }
         let elapsed = started.elapsed();

@@ -4785,6 +4785,33 @@ impl<'e> Collection<'e> {
         Ok(id)
     }
 
+    /// Inserts many documents in one writer transaction. Time-series
+    /// collections resolve each open bucket once and flush pointers at the end.
+    pub fn insert_many_txn(&self, wtxn: &mut RwTxn<'_>, docs: &[Value]) -> Result<Vec<String>> {
+        if self.profile.is_timeseries() {
+            let settings = self.timeseries_settings_in(&*wtxn)?.unwrap_or_default();
+            let ids = crate::timeseries::insert_many(wtxn, self.env, &self.name, &settings, docs)?;
+            for (doc, id) in docs.iter().zip(ids.iter()) {
+                let mut doc = doc.clone();
+                if !doc
+                    .as_object()
+                    .is_some_and(|object| object.contains_key("_id"))
+                {
+                    if let Some(object) = doc.as_object_mut() {
+                        object.insert("_id".into(), Value::String(id.clone()));
+                    }
+                }
+                self.apply_all_index_entries(wtxn, None, Some(&doc), id)?;
+            }
+            return Ok(ids);
+        }
+        let mut ids = Vec::with_capacity(docs.len());
+        for doc in docs {
+            ids.push(self.insert_one_txn(wtxn, doc.clone())?);
+        }
+        Ok(ids)
+    }
+
     /// Inserts a document in the given transaction. Assigns `_id` (UUID v4) if missing.
     pub fn insert_one_txn(&self, wtxn: &mut RwTxn<'_>, mut doc: Value) -> Result<String> {
         if self.profile.is_timeseries() {

@@ -1366,14 +1366,11 @@ fn execute(
                 if vault.is_some() {
                     return Err(vault::key_unexpected().into());
                 }
-                let mut ids = Vec::with_capacity(docs.len());
-                let mut inserted_ids = Vec::with_capacity(docs.len());
-                for doc in docs {
-                    let inserted_id = doc.get("_id").cloned();
-                    let id = c.insert_one_txn(wtxn, doc.clone())?;
-                    inserted_ids.push(inserted_id.unwrap_or_else(|| Value::String(id.clone())));
-                    ids.push(id);
-                }
+                let ids = c.insert_many_txn(wtxn, docs)?;
+                let inserted_ids = ids
+                    .iter()
+                    .map(|id| Value::String(id.clone()))
+                    .collect::<Vec<_>>();
                 if let Some(config) = &config {
                     for id in &ids {
                         emit_by_id(
