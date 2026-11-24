@@ -397,15 +397,26 @@ direction; edge documents are still stored once.
 | `start` ids | 10,000 |
 | `max_depth` | 64 |
 | default `limit_nodes` | 1,000 |
+| max `limit_nodes` | 100,000 |
 | default `limit_edges` | 10,000 |
+| max `limit_edges` | 100,000 |
 | default `max_bytes` | 64 MiB |
+| max `max_bytes` | 256 MiB |
+| labels / relationship types | 64 entries, each ≤ 256 bytes |
 | vector seed `k` | 1–1,000 |
 | `all_shortest_paths` `limit_paths` | 1–1,000 |
 | graph algorithm `iterations` | 1–100 |
 | graph algorithm `max_nodes` | 1–100,000 |
+| graph adjacency `generation` | 0–1,024 (internal; HTTP `set_graph` resets it to 0) |
 
-Reaching a node, edge, or byte limit returns the partial result with
+Budgets above the hard maximum are rejected with `invalid_query`. Reaching a
+valid node, edge, or byte limit returns the partial result with
 `"truncated":true`; it is not an error.
+
+`drop_graph` and `reindex_graph` require collection-admin on the node
+collection. That permission deliberately covers the graph metadata and derived
+adjacency stored on the edge collection; the edge collection is not separately
+granted.
 
 ## `$graphLookup`
 

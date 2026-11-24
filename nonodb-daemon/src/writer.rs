@@ -1881,6 +1881,10 @@ fn execute(
             Ok(json!({ "dropped": existed, "kind": "vector" }))
         }
         WriteReq::SetGraph { coll, def } => {
+            // `generation` is internal rebuild state; clients cannot seed it.
+            let mut def = def.clone();
+            def.generation = 0;
+            def.validate()?;
             if def.node_collection != *coll {
                 return Err(ApiError {
                     code: "invalid_query".into(),
@@ -1889,7 +1893,7 @@ fn execute(
             }
             let c = standard_collection(store, wtxn, coll)?;
             let out = def.clone();
-            c.set_graph_txn(wtxn, def)?;
+            c.set_graph_txn(wtxn, &def)?;
             replication.capture_op(ReplicationOp::GraphSet {
                 coll: coll.clone(),
                 def: out.clone(),

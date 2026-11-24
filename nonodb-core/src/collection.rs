@@ -15,6 +15,7 @@ use sha2::{Digest, Sha256};
 
 use crate::aggregate;
 use crate::bson_types;
+use crate::cypher::CypherOptions;
 use crate::date;
 use crate::error::{Error, Result};
 use crate::events::{self, EventConfig, EVENTS_COLLECTION};
@@ -522,6 +523,10 @@ pub struct IndexSpec {
     #[serde(default)]
     pub geo: bool,
 }
+
+#[cfg(test)]
+static GRAPH_LOOKUP_FAST_PATH_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 pub struct Collection<'e> {
     store: Option<&'e crate::store::Store>,
@@ -5207,7 +5212,7 @@ impl<'e> Collection<'e> {
         Ok(state)
     }
 
-    fn set_graph_rebuild_state_in(
+    pub(crate) fn set_graph_rebuild_state_in(
         &self,
         wtxn: &mut RwTxn<'_>,
         state: Option<&GraphRebuildState>,
@@ -5228,7 +5233,7 @@ impl<'e> Collection<'e> {
         Ok(())
     }
 
-    fn edge_graph_def_in(&self, txn: &RoTxn<'_>) -> Result<Option<GraphDef>> {
+    pub(crate) fn edge_graph_def_in(&self, txn: &RoTxn<'_>) -> Result<Option<GraphDef>> {
         let key = graph::edge_def_key(&self.name);
         let Some(raw) = self.meta.get(txn, key.as_bytes())? else {
             return Ok(None);
@@ -5256,6 +5261,7 @@ impl<'e> Collection<'e> {
     }
 
     pub fn set_graph_txn(&self, wtxn: &mut RwTxn<'_>, def: &GraphDef) -> Result<()> {
+        def.validate()?;
         if self.profile.is_vault() {
             return Err(Error::Query(
                 "graph operations are not supported on vault collections".into(),
@@ -5353,7 +5359,11 @@ impl<'e> Collection<'e> {
         Ok(true)
     }
 
-    fn clear_graph_adjacency_txn(&self, wtxn: &mut RwTxn<'_>, def: &GraphDef) -> Result<()> {
+    pub(crate) fn clear_graph_adjacency_txn(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        def: &GraphDef,
+    ) -> Result<()> {
         for generation in 0..=def.generation.saturating_add(1) {
             for direction in [GraphDirection::Out, GraphDirection::In] {
                 let resource =
@@ -5460,6 +5470,12 @@ impl<'e> Collection<'e> {
             return Err(Error::Query("graph rebuild is already running".into()));
         }
         let target = def.generation.saturating_add(1);
+        if target > graph::MAX_GRAPH_GENERATION {
+            return Err(Error::Query(format!(
+                "graph rebuild would exceed the maximum generation {}",
+                graph::MAX_GRAPH_GENERATION
+            )));
+        }
         for direction in [GraphDirection::Out, GraphDirection::In] {
             let resource = graph::adjacency_resource_gen(&edge.name, direction, target);
             edge.drop_resource_db(&mut *wtxn, &resource, &resource)?;
@@ -5574,6 +5590,12 @@ impl<'e> Collection<'e> {
                 "graph rebuild target generation is stale".into(),
             ));
         }
+        if state.target_generation > graph::MAX_GRAPH_GENERATION {
+            return Err(Error::Query(format!(
+                "graph rebuild target exceeds the maximum generation {}",
+                graph::MAX_GRAPH_GENERATION
+            )));
+        }
         let out =
             self.graph_adjacency_db_in(&mut *wtxn, GraphDirection::Out, state.target_generation)?;
         let incoming =
@@ -5617,6 +5639,7 @@ impl<'e> Collection<'e> {
         // the old generations in the same transaction.
         let mut new_def = def.clone();
         new_def.generation = state.target_generation;
+        new_def.validate()?;
         let raw_def = serde_json::to_vec(&new_def)?;
         node.meta.put(
             &mut *wtxn,
@@ -5706,6 +5729,26 @@ impl<'e> Collection<'e> {
         })?;
         let view = GraphViewImpl::new(store, &rtxn, def)?;
         let out = graph::shortest_path(&view, &options)?;
+        rtxn.commit()?;
+        Ok(out)
+    }
+
+    pub fn graph_cypher(&self, options: CypherOptions) -> Result<Value> {
+        if self.profile.is_vault() {
+            return Err(Error::Query(
+                "graph operations are not supported on vault collections".into(),
+            ));
+        }
+        options.validate()?;
+        let rtxn = self.read_txn()?;
+        let def = self
+            .graph_def_in(&rtxn)?
+            .ok_or_else(|| Error::Query("graph is not configured for this collection".into()))?;
+        let store = self.store.ok_or_else(|| {
+            Error::Query("graph traversal requires a store-backed collection".into())
+        })?;
+        let view = GraphViewImpl::new(store, &rtxn, def)?;
+        let out = crate::cypher::execute(&view, &options)?;
         rtxn.commit()?;
         Ok(out)
     }
@@ -7237,7 +7280,7 @@ impl<'e> Collection<'e> {
         };
         let max_docs = aggregate::max_docs();
         if restrict.is_none() {
-            let fast_def = match foreign.get_graph_in(rtxn)? {
+            let fast_def = match foreign.edge_graph_def_in(rtxn)? {
                 Some(def)
                     if def.node_collection == self.name
                         && def.edge_collection == foreign.name
@@ -7346,6 +7389,8 @@ impl<'e> Collection<'e> {
         depth_field: Option<&str>,
         vars: &BTreeMap<String, Value>,
     ) -> Result<Option<Vec<Value>>> {
+        #[cfg(test)]
+        GRAPH_LOOKUP_FAST_PATH_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let Some(store) = self.store else {
             return Ok(None);
         };
@@ -14035,6 +14080,62 @@ mod tests {
         assert!(primary
             .aggregate(&[json!({"$unionWith": {"coll": "union_archive", "pipeline": 1}})])
             .is_err());
+    }
+
+    #[test]
+    fn online_rebuild_rejects_generation_overflow() {
+        let (_dir, store) = store();
+        store
+            .create_collection("nodes", crate::vault::CollectionProfile::Standard)
+            .unwrap();
+        store
+            .create_collection("edges", crate::vault::CollectionProfile::Standard)
+            .unwrap();
+        let nodes = store.collection("nodes").unwrap();
+        let def: crate::graph::GraphDef = serde_json::from_value(json!({
+            "node_collection": "nodes",
+            "edge_collection": "edges",
+            "generation": crate::graph::MAX_GRAPH_GENERATION
+        }))
+        .unwrap();
+        nodes.set_graph(def).unwrap();
+        let error = nodes.start_graph_rebuild().unwrap_err().to_string();
+        assert!(error.contains("maximum generation"), "{error}");
+    }
+
+    #[test]
+    fn graph_lookup_uses_adjacency_fast_path() {
+        let (_dir, store) = store();
+        let nodes = store.collection("nodes").unwrap();
+        let edges = store.collection("edges").unwrap();
+        for id in ["n1", "n2", "n3"] {
+            nodes.insert_one(json!({"_id": id})).unwrap();
+        }
+        let def: GraphDef = serde_json::from_value(json!({
+            "node_collection": "nodes",
+            "edge_collection": "edges"
+        }))
+        .unwrap();
+        nodes.set_graph(def).unwrap();
+        edges
+            .insert_one(json!({"_id": "e1", "from": "n1", "to": "n2"}))
+            .unwrap();
+        edges
+            .insert_one(json!({"_id": "e2", "from": "n2", "to": "n3"}))
+            .unwrap();
+        super::GRAPH_LOOKUP_FAST_PATH_HITS.store(0, std::sync::atomic::Ordering::Relaxed);
+        let out = nodes
+            .aggregate(&[json!({"$graphLookup": {
+                "from": "edges",
+                "startWith": "n3",
+                "connectFromField": "from",
+                "connectToField": "to",
+                "as": "chain",
+                "maxDepth": 2
+            }})])
+            .unwrap();
+        assert!(super::GRAPH_LOOKUP_FAST_PATH_HITS.load(std::sync::atomic::Ordering::Relaxed) > 0);
+        assert_eq!(out[0]["chain"].as_array().unwrap().len(), 2);
     }
 
     #[test]

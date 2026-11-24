@@ -209,6 +209,10 @@ single-database directories are migrated to `default/` on startup. See
   generation and edge writes are mirrored meanwhile.
 - Graph configuration and traversal are available through the HTTP API, Python
   client, and the GUI Graph tab. See [Graph traversal](docs/graph.md).
+- Read-only Cypher compatibility (`cypher` / `Collection.cypher()`), including
+  `MATCH`/`WHERE`/`WITH`/`UNWIND`, variable-length paths, shortest paths, and
+  GDS-style PageRank/degree/components/similarity procedures. See
+  [Read-only Cypher](docs/cypher.md).
 
 ### Aggregation
 

@@ -3595,6 +3595,17 @@ async fn exec_inner(
             read_result(joined).await
         }
 
+        Request::Cypher { coll, options } => {
+            let store = state.store.clone();
+            let auth = vault_auth.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                let c = read_collection(&store, &coll, auth.as_ref())?;
+                reject_vault_read(&c, auth.as_ref(), "graph traversal")?;
+                c.graph_cypher(options).map_err(ApiError::from)
+            });
+            read_result(joined).await
+        }
+
         Request::AllShortestPaths { coll, options } => {
             let store = state.store.clone();
             let auth = vault_auth.clone();
@@ -4810,6 +4821,7 @@ fn authorize_graph_edges(
         Request::GetGraph { coll }
         | Request::Traverse { coll, .. }
         | Request::ShortestPath { coll, .. }
+        | Request::Cypher { coll, .. }
         | Request::AllShortestPaths { coll, .. }
         | Request::GraphMatch { coll, .. }
         | Request::GraphAlgorithm { coll, .. }

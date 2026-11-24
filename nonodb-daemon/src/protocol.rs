@@ -3,6 +3,7 @@
 use serde::{ser::SerializeMap, Deserialize, Serialize, Serializer};
 use serde_json::{value::RawValue, Value};
 
+use nonodb_core::cypher::CypherOptions;
 use nonodb_core::graph::{
     AllShortestPathsOptions, GraphAlgorithmOptions, GraphDef, GraphMatchOptions, HybridOptions,
     NeighborsOptions, ShortestPathOptions, TraverseOptions,
@@ -482,6 +483,12 @@ pub enum Request {
         coll: String,
         #[serde(flatten)]
         options: ShortestPathOptions,
+    },
+    /// Execute a read-only Cypher query.
+    Cypher {
+        coll: String,
+        #[serde(flatten)]
+        options: CypherOptions,
     },
     /// Every shortest path between two nodes.
     AllShortestPaths {
@@ -1063,6 +1070,7 @@ impl Request {
             Self::GetGraph { .. } => "get_graph",
             Self::Traverse { .. } => "traverse",
             Self::ShortestPath { .. } => "shortest_path",
+            Self::Cypher { .. } => "cypher",
             Self::AllShortestPaths { .. } => "all_shortest_paths",
             Self::GraphMatch { .. } => "graph_match",
             Self::GraphAlgorithm { .. } => "graph_algorithm",
@@ -1151,6 +1159,7 @@ impl Request {
             | Self::GetGraph { .. }
             | Self::Traverse { .. }
             | Self::ShortestPath { .. }
+            | Self::Cypher { .. }
             | Self::AllShortestPaths { .. }
             | Self::GraphMatch { .. }
             | Self::GraphAlgorithm { .. }
@@ -1218,6 +1227,7 @@ impl Request {
             | Self::GetGraph { coll }
             | Self::Traverse { coll, .. }
             | Self::ShortestPath { coll, .. }
+            | Self::Cypher { coll, .. }
             | Self::AllShortestPaths { coll, .. }
             | Self::GraphMatch { coll, .. }
             | Self::GraphAlgorithm { coll, .. }

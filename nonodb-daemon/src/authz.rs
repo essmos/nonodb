@@ -67,6 +67,7 @@ pub fn authorize_request(
         | Request::GetGraph { coll }
         | Request::Traverse { coll, .. }
         | Request::ShortestPath { coll, .. }
+        | Request::Cypher { coll, .. }
         | Request::AllShortestPaths { coll, .. }
         | Request::GraphMatch { coll, .. }
         | Request::GraphAlgorithm { coll, .. }
@@ -274,6 +275,7 @@ fn allow(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nonodb_core::cypher::CypherOptions;
     use serde_json::json;
 
     fn principal(scopes: &[&str]) -> Principal {
@@ -327,6 +329,37 @@ mod tests {
         )
         .is_err());
         assert!(authorize_request(&app, &Request::MapInfo, "default").is_ok());
+    }
+
+    #[test]
+    fn cypher_uses_read_scope() {
+        let reader = principal(&["read:orders"]);
+        let ok = Request::Cypher {
+            coll: "orders".into(),
+            options: CypherOptions {
+                query: "MATCH (n) RETURN n".into(),
+                params: json!({}),
+                max_rows: 10,
+                max_operations: 100,
+                timeout_ms: None,
+                max_depth: 4,
+                max_memory_bytes: 64 * 1024 * 1024,
+            },
+        };
+        assert!(authorize_request(&reader, &ok, "default").is_ok());
+        let denied = Request::Cypher {
+            coll: "customers".into(),
+            options: CypherOptions {
+                query: "MATCH (n) RETURN n".into(),
+                params: json!({}),
+                max_rows: 10,
+                max_operations: 100,
+                timeout_ms: None,
+                max_depth: 4,
+                max_memory_bytes: 64 * 1024 * 1024,
+            },
+        };
+        assert!(authorize_request(&reader, &denied, "default").is_err());
     }
 
     #[test]
