@@ -169,14 +169,15 @@ python3 scripts/write_batch_test.py          # atomic commit/rollback
 python3 scripts/upsert_test.py               # upsert and array operators
 python3 scripts/dates_test.py                # Extended JSON dates, ranges, indexes
 python3 scripts/numerics_test.py             # exact numbers, decimal arithmetic/indexes
-python3 scripts/bson_types_test.py           # numberInt/Long, $type, binary/UUID, ObjectId
+python3 scripts/bson_types_test.py           # numberInt/Long, $type, binary/UUID, ObjectId, regex
 python3 scripts/regex_test.py                # $regex/$options, arrays, errors
 python3 scripts/arrays_test.py               # $all, $size, $elemMatch, validation
 python3 scripts/array_updates_test.py        # positional/array-filter updates
 python3 scripts/find_and_modify_test.py      # atomic select-update-return
 python3 scripts/explain_test.py              # plans, bounds, actual counts
-python3 scripts/sql_test.py                  # SQL SELECT/INSERT/UPDATE/distinct/having/explain/params/batch (spawns a daemon)
+python3 scripts/sql_test.py                  # SQL SELECT/INSERT/UPDATE/distinct/aggregates/RETURNING/having/explain/params/batch (spawns a daemon)
 python3 scripts/sql_matrix_test.py           # exhaustive SQL matrix, concurrency, restart, metrics, CLI (spawns a daemon)
+python3 scripts/sql_bench.py --docs 100000   # SQL counts, grouping, DISTINCT aggregates, indexed reads (running daemon)
 PYTHONPATH=client:workers/python python3 workers/python/examples/jobs_smoke.py  # jobs
 PYTHONPATH=client:workers/python python3 workers/python/examples/events_smoke.py  # events
 python3 workers/python/tests/events_integration.py  # events against a spawned daemon
@@ -184,6 +185,9 @@ python3 scripts/db_slots_test.py             # >256 index/search create-drop cyc
 python3 scripts/resize_test.py               # online map growth under concurrent I/O
 python3 scripts/restore_drill.py             # backup -> verify -> restore -> query
 python3 scripts/restore_to_test.py           # restore --to snapshot selection and verification
+python3 scripts/pitr_test.py                 # PITR snapshot+WAL replay, retention, wal_full
+python3 scripts/quota_test.py                # per-database quotas, warnings, rejection, restart
+python3 scripts/restore_in_place_test.py     # verified API restore, typed confirmation, safety snapshot
 python3 scripts/branch_test.py               # offline branch from stopped DB and snapshot, CoW fallback
 python3 scripts/shutdown_test.py             # SIGTERM drain, JSON logs, durable in-flight write
 python3 scripts/mongo_conformance_test.py   # compare wire results with a real MongoDB
@@ -191,7 +195,7 @@ python3 scripts/mongo_export_test.py        # mongoexport/mongodump/mongoimport/
 python3 scripts/mongo_portability_check.py --self-test  # static workload checker
 python3 scripts/mongo_wire_limits_test.py   # Mongo wire connection/read limits (spawns a daemon)
 python3 scripts/mongo_wire_auth_test.py     # Mongo wire SCRAM maps to principal scopes and code 13
-python3 scripts/mongo_ddl_test.py           # TTL/sparse DDL translation
+python3 scripts/mongo_ddl_test.py           # TTL/sparse/partial DDL translation
 python3 scripts/mongo_ttl_restart_test.py   # TTL index and steps survive daemon restart
 python3 scripts/nonodb_migrate_test.py      # MongoDB -> NonoDB migration and checksums
 python3 scripts/mongo_shadow_test.py        # shadow dual-write and JSONL diff report
@@ -203,6 +207,7 @@ python3 scripts/replication_test.py         # replication log, snapshot bootstra
 python3 scripts/replication_failover_test.py # quorum promotion fences and demotes the old source
 python3 scripts/replication_lease_test.py    # primary self-demotes after losing quorum lease
 python3 scripts/replication_election_test.py # candidate wins auto-election after primary failure
+python3 scripts/replication_partition_test.py # partition, failover, and multi-database catalog rejoin
 python3 scripts/replication_cluster_test.py  # 5-host cluster, dynamic joins, failover, reconvergence
 python3 scripts/replication_join_test.py     # join existing primary, restart, snapshot, search sidecars
 python3 scripts/replication_sidecar_test.py  # snapshot bootstrap with segment text/fuzzy/ANN sidecars
@@ -215,10 +220,12 @@ python3 scripts/ttl_strict_disabled_test.py  # NONODB_TTL_STRICT_READS=0 legacy 
 python3 scripts/ttl_replica_strict_test.py   # replicated TTL metadata hides documents on a replica
 python3 scripts/history_test.py              # per-collection history enable/disable, restart, CLI
 python3 scripts/events_auto_test.py          # automatic collection events, field filters, thresholds, CLI
+python3 scripts/events_ttl_test.py           # consumed outbox events expire; checkpoint resume and watch truncation
 python3 scripts/async_watch_test.py          # AsyncNonoDB long-poll, NDJSON, live, and truncation
 python3 scripts/subscriptions_test.py        # persistent conditional subscriptions, count, once, SQL, restart
 python3 scripts/live_watch_test.py           # connection-scoped live mode, direct SSE delivery, no _events
-python3 scripts/gui_test.py
+python3 scripts/gui_test.py                     # GUI asset markers, accessibility landmarks, proxy, database flow
+python3 scripts/gui_views_test.py               # saved-view JSON export/import validation and credential stripping
 python3 scripts/gui_cluster_test.py                  # embedded GUI assets and local API proxy
 python3 scripts/multi_database_test.py       # routing, isolation, cursors, restart, drop
 python3 scripts/multi_database_features_test.py  # full feature matrix inside app1
@@ -227,6 +234,7 @@ python3 scripts/vault_test.py                # optional vault encryption end-to-
 python3 scripts/vault_regression_test.py     # vault API regressions
 python3 scripts/vault_bench.py --docs 5000   # standard vs vault performance
 bash scripts/mtls_test.sh                    # mTLS, cert registry, live revocation
+python3 scripts/revocation_test.py           # CRL file/refresh, OCSP responder, fail-open/closed
 python3 scripts/search_test.py               # BM25 + fuzzy end-to-end
 python3 scripts/search_variants_test.py      # search/query edge cases
 python3 scripts/compound_test.py             # compound/covering indexes, phrases
@@ -289,10 +297,12 @@ scripts are:
 | `scripts/bench.py` | Mixed CRUD throughput/latency with multiple processes |
 | `scripts/opt_bench.py` | Count, early exit, index update, batch comparison |
 | `scripts/aggregate_bench.py` | Per-stage aggregation timings and report pipelines |
-| `scripts/sql_test.py` | End-to-end SQL against a disposable daemon |
+| `scripts/sql_test.py` | End-to-end SQL against a disposable daemon, including DISTINCT aggregates and RETURNING |
+| `scripts/sql_matrix_test.py` | Exhaustive SQL SELECT/write matrix, errors, concurrency, restart, metrics, and CLI |
+| `scripts/sql_bench.py` | End-to-end SQL latency for counts, grouping, DISTINCT aggregates, indexed equality, and filtered aggregates |
 | `scripts/dates_test.py` | Date offsets, ranges, indexes, sorting, unique constraints |
 | `scripts/numerics_test.py` | Large integers, Decimal128, special doubles, arithmetic, indexes |
-| `scripts/bson_types_test.py` | `$numberInt`/`$numberLong`, `$type`, binary/UUID, ObjectId |
+| `scripts/bson_types_test.py` | `$numberInt`/`$numberLong`, `$type`, binary/UUID, ObjectId, stored regex |
 | `scripts/regex_test.py` | `$regex`/`$options`, arrays, invalid patterns, index prefixes |
 | `scripts/arrays_test.py` | `$all`, `$size`, `$elemMatch`, validation, index/aggregation/search |
 | `scripts/array_updates_test.py` | positional `$`, `$[]`, `arrayFilters`, push modifiers, `$pull` |
@@ -305,10 +315,12 @@ scripts are:
 | `scripts/auth_test.py` | principals, scopes, filtered collections, token revocation, audit, IP lockout |
 | `scripts/auth_api_test.py` | admin-only auth API, one-time tokens, last-admin protection, certificates, Prometheus endpoint, disk/snapshot metrics, readiness |
 | `scripts/backup_api_test.py` | multi-database backups, backup-info, excluded collections, age keygen, local/S3 import, restore, SigV4, and restic command flow |
+| `scripts/restore_in_place_test.py` | verified API restore, typed confirmation, safety snapshot, and post-restore contents |
 | `scripts/replication_test.py` | writer log capture, snapshot bootstrap, manual and automatic prune with replica acks, ack age, pull apply, local applied log, global sequence, read-only replica, promote/demote epoch, stale-epoch rejection, source reload, successor source switch, graceful restart on runtime gap, startup auto-resync, apply metrics, and lag |
 | `scripts/replication_failover_test.py` | quorum promotion demotes and fences the old source, exposes the new `write_url`, validates `/readyz/write` and `Location` routing, persists votes, and rejects writes on the demoted node |
 | `scripts/replication_lease_test.py` | primary renews a quorum lease and self-demotes after losing voter majority |
 | `scripts/replication_election_test.py` | preferred candidate wins a quorum election after the primary disappears, exposes `write_url`/`readyz/write`, while a delayed candidate and followers switch source |
+| `scripts/replication_partition_test.py` | network partition fences the old primary, a quorum candidate is promoted, and the old primary automatically rejoins and catches up the default plus non-default database catalog and data |
 | `scripts/replication_cluster_test.py` | 5-host cluster under continuous writes, dynamic replica joins, snapshot catch-up, acks, failover, source propagation, and post-failover convergence |
 | `scripts/replication_join_test.py` | join an already-populated primary from a running replica, controlled restart, snapshot bootstrap, and text/fuzzy/vector search after sidecar rebuild |
 | `scripts/replication_sidecar_test.py` | snapshot bootstrap of a primary with segment-backed text/fuzzy indexes and vector ANN; replica rebuilds sidecars and serves text, fuzzy, and vector search |
@@ -325,6 +337,7 @@ scripts are:
 | `scripts/vault_regression_test.py` | Vault profiles, headers, filters, CRUD, errors, history |
 | `scripts/history_test.py` | Per-collection history retention, isolation, restart durability, CLI |
 | `scripts/events_auto_test.py` | Automatic collection events, source-side filters/projections, find_and_modify/TTL/SQL writes, watch filters, thresholds, metrics, CLI tail |
+| `scripts/events_ttl_test.py` | TTL retention of consumed outbox events, checkpoint survival, delivery after an expired event, and truncated watch cursors |
 | `scripts/async_watch_test.py` | AsyncNonoDB long-poll, NDJSON stream, live subscription, and truncation behavior |
 | `scripts/webhook_test.py` | Asynchronous webhook rules, filters, count/sum/avg thresholds, once/cooldown, HMAC, idempotency, timeout, retry/dead-letter, CLI CRUD, and restart |
 | `scripts/search_all_test.py` | Unified search modes, filters, pagination, RRF metadata, `$search`/`$searchMeta`/`$vectorSearch`, CLI, and MongoDB wire aggregation |
@@ -505,6 +518,41 @@ nonodb-<tag>-linux-x86_64.tar.gz.sha256
 
 The tarball contains `nonodb-daemon`, `nonodb-cli`, `README.md`, `LICENSE`, and
 the `docs/` directory.
+
+### Python package
+
+The Python client is packaged separately as `nonodb-client`; it is not part of
+the binary archives. Keep its version aligned in both places:
+
+- `client/pyproject.toml` → `[project].version`
+- `client/nonodb.py` → `__version__`
+
+Build and verify the wheel and sdist locally:
+
+```bash
+python3 -m pip install build
+python3 -m build client --outdir dist
+python3 scripts/python_package_test.py --dist dist
+```
+
+`scripts/python_package_test.py` installs the wheel and sdist in clean
+virtualenvs and checks imports, metadata, and sdist contents. CI runs the same
+build test.
+
+Publication is manual and never triggered by a `v*` tag. Use **Actions →
+Python package → Run workflow**:
+
+1. Configure a PyPI trusted publisher for the `nonodb-client` project:
+   owner `essmos`, repository `nonodb`, workflow `pypi.yml`, environment `pypi`.
+2. Run the workflow once with `publish=false` to build and test both artifacts.
+3. Run it again with `publish=true` only after the result is approved.
+
+The publish job uses OpenID Connect (`id-token: write`) and
+`pypa/gh-action-pypi-publish`; no PyPI API token secret is stored in the
+repository. The build job uses `twine check --strict` before upload. If an
+attempt fails before PyPI accepts any file, rerun the workflow. Once a version
+exists on PyPI, files cannot be replaced: bump the version, rebuild, and publish
+the new version instead.
 
 ### Re-running a release
 

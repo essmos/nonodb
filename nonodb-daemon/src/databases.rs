@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::{mpsc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use nonodb_core::Store;
 use tokio::sync::{Mutex as AsyncMutex, RwLock};
@@ -17,6 +18,7 @@ use tokio::sync::{Mutex as AsyncMutex, RwLock};
 use crate::auto_index::AutoIndexer;
 use crate::cache::QueryCache;
 use crate::protocol::ApiError;
+use crate::quota::Quota;
 use crate::writer::{self, WriteJob};
 
 pub const DEFAULT_DATABASE: &str = "default";
@@ -42,10 +44,13 @@ pub struct DatabaseRuntime {
     pub write_tx: mpsc::Sender<WriteJob>,
     pub cache: Arc<QueryCache>,
     pub auto_index: Arc<AutoIndexer>,
+    pub quota: Arc<Quota>,
     stop: Arc<AtomicBool>,
     writer: Mutex<Option<std::thread::JoinHandle<()>>>,
     maintenance: Mutex<Option<std::thread::JoinHandle<()>>>,
     webhooks: Mutex<Option<std::thread::JoinHandle<()>>>,
+    snapshots: Mutex<Option<std::thread::JoinHandle<()>>>,
+    wal: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl DatabaseRuntime {
@@ -66,6 +71,12 @@ impl Drop for DatabaseRuntime {
             let _ = handle.join();
         }
         if let Some(handle) = self.webhooks.lock().expect("webhooks lock").take() {
+            let _ = handle.join();
+        }
+        if let Some(handle) = self.snapshots.lock().expect("snapshots lock").take() {
+            let _ = handle.join();
+        }
+        if let Some(handle) = self.wal.lock().expect("wal lock").take() {
             let _ = handle.join();
         }
         if let Some(handle) = self.writer.lock().expect("writer lock").take() {
@@ -355,6 +366,171 @@ impl Databases {
         Ok(())
     }
 
+    /// Replace a database with a verified native backup while the daemon is
+    /// running. The previous directory is kept as a restore safety snapshot.
+    /// Only non-default databases are supported because the default runtime is
+    /// permanently owned by the instance state.
+    pub async fn restore_database(
+        &self,
+        name: &str,
+        source: &Path,
+        source_label: &str,
+        location: &str,
+    ) -> Result<RestoreOutcome, ApiError> {
+        validate_name(name).map_err(invalid)?;
+        if name == DEFAULT_DATABASE {
+            return Err(invalid(
+                "restore-in-place does not support the default database; stop the daemon and use nonodb-cli restore",
+            ));
+        }
+        let _open_guard = self.open_lock.lock().await;
+        if !self.known.read().await.contains(name) {
+            return Err(ApiError {
+                code: "not_found".into(),
+                message: format!("database `{name}` does not exist"),
+            });
+        }
+
+        let runtime = self.runtimes.write().await.remove(name);
+        if let Some(runtime) = runtime {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while Arc::strong_count(&runtime) > 1 {
+                if Instant::now() >= deadline {
+                    self.runtimes
+                        .write()
+                        .await
+                        .insert(name.to_string(), runtime);
+                    return Err(ApiError {
+                        code: "database_busy".into(),
+                        message: format!(
+                            "database `{name}` still has active requests; close clients and retry"
+                        ),
+                    });
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            drop(runtime);
+        }
+
+        let path = self.root.join(name);
+        let safety_root = self.root.join("restore-safety");
+        fs::create_dir_all(&safety_root)
+            .map_err(|error| ApiError::internal(format!("create restore safety root: {error}")))?;
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis())
+            .unwrap_or(0);
+        let safety = safety_root.join(format!("{name}-{stamp}-{}", std::process::id()));
+        let had_live = path.exists();
+        if had_live {
+            fs::rename(&path, &safety).map_err(|error| {
+                ApiError::internal(format!(
+                    "move live database to safety snapshot {}: {error}",
+                    safety.display()
+                ))
+            })?;
+        }
+
+        let source_owned = source.to_path_buf();
+        let root = self.root.clone();
+        let name_owned = name.to_string();
+        let safety_for_install = safety.clone();
+        let installed = tokio::task::spawn_blocking(move || {
+            install_restored(
+                &root,
+                &name_owned,
+                &source_owned,
+                safety_for_install.as_path(),
+            )
+        })
+        .await
+        .map_err(|error| ApiError::internal(format!("restore install task: {error}")))?;
+
+        match installed {
+            Ok(runtime) => {
+                self.runtimes
+                    .write()
+                    .await
+                    .insert(name.to_string(), Arc::new(runtime));
+                let info = serde_json::json!({
+                    "version": 1,
+                    "database": name,
+                    "source": source_label,
+                    "location": location,
+                    "restored_at_ms": stamp,
+                    "safety_snapshot": safety,
+                });
+                if let Err(error) = fs::write(
+                    safety.join("restore-info.json"),
+                    serde_json::to_vec_pretty(&info).unwrap_or_default(),
+                ) {
+                    tracing::warn!(
+                        path = %safety.display(),
+                        error = %error,
+                        "failed to write restore safety metadata"
+                    );
+                }
+                tracing::info!(
+                    database = name,
+                    source = source_label,
+                    location,
+                    safety = %safety.display(),
+                    "database restored in place"
+                );
+                Ok(RestoreOutcome {
+                    database: name.to_string(),
+                    safety_snapshot: safety,
+                    source: source_label.to_string(),
+                })
+            }
+            Err(install_error) => {
+                let path_for_rollback = path.clone();
+                let safety_for_rollback = safety.clone();
+                let rollback = tokio::task::spawn_blocking(move || -> Result<(), String> {
+                    let _ = fs::remove_dir_all(&path_for_rollback);
+                    if had_live {
+                        fs::rename(&safety_for_rollback, &path_for_rollback)
+                            .map_err(|error| format!("restore previous database: {error}"))?;
+                    }
+                    Ok(())
+                })
+                .await
+                .map_err(|error| ApiError::internal(format!("restore rollback task: {error}")))?;
+                if let Err(rollback_error) = rollback {
+                    return Err(ApiError::internal(format!(
+                        "restore failed ({install_error}) and rollback failed ({rollback_error}); recovery data is at {}",
+                        safety.display()
+                    )));
+                }
+                // Reopen the previous database so the instance remains usable.
+                let root = self.root.clone();
+                let name_owned = name.to_string();
+                let reopened =
+                    tokio::task::spawn_blocking(move || start_runtime(&root, &name_owned))
+                        .await
+                        .map_err(|error| {
+                            ApiError::internal(format!("restore reopen task: {error}"))
+                        })?;
+                match reopened {
+                    Ok(runtime) => {
+                        self.runtimes
+                            .write()
+                            .await
+                            .insert(name.to_string(), Arc::new(runtime));
+                    }
+                    Err(error) => {
+                        return Err(ApiError::internal(format!(
+                            "restore failed ({install_error}); rollback data was restored but reopening failed: {error}"
+                        )));
+                    }
+                }
+                Err(ApiError::internal(format!(
+                    "restore failed: {install_error}; previous database was restored"
+                )))
+            }
+        }
+    }
+
     pub async fn drop_database(&self, name: &str) -> Result<bool, ApiError> {
         validate_name(name).map_err(invalid)?;
         if name == DEFAULT_DATABASE {
@@ -404,6 +580,20 @@ impl Databases {
     }
 }
 
+fn parse_pitr_target(raw: &str) -> Result<u64, String> {
+    let raw = raw.trim();
+    if let Ok(value) = raw.parse::<u64>() {
+        return Ok(if value < 100_000_000_000 {
+            value.saturating_mul(1000)
+        } else {
+            value
+        });
+    }
+    let ms = nonodb_core::date::parse_rfc3339_ms(raw)
+        .ok_or_else(|| format!("invalid NONODB_PITR_REPLAY_TO: {raw}"))?;
+    u64::try_from(ms).map_err(|_| format!("NONODB_PITR_REPLAY_TO is before the Unix epoch: {raw}"))
+}
+
 fn start_runtime(root: &Path, name: &str) -> Result<DatabaseRuntime, String> {
     let path = root.join(name);
     fs::create_dir_all(&path).map_err(|e| format!("create database `{name}`: {e}"))?;
@@ -416,15 +606,40 @@ fn start_runtime(root: &Path, name: &str) -> Result<DatabaseRuntime, String> {
         );
     }
     let store = Arc::new(Store::open(&path).map_err(|e| format!("open database `{name}`: {e}"))?);
+    if let Some(raw) = std::env::var_os("NONODB_PITR_REPLAY_TO") {
+        let raw = raw.to_string_lossy();
+        let target = parse_pitr_target(&raw)?;
+        let wal_dir = crate::wal::dir(&path);
+        let report = nonodb_core::pitr::replay_to(&store, &wal_dir, target)
+            .map_err(|e| format!("PITR startup replay for `{name}`: {e}"))?;
+        tracing::info!(
+            database = name,
+            target,
+            applied = report.applied,
+            last_seq = report.last_replayed_seq,
+            "PITR startup replay completed"
+        );
+    }
+    let quota =
+        Arc::new(Quota::load(name, &path).map_err(|e| format!("load quota for `{name}`: {e}"))?);
     let (write_tx, write_rx) = mpsc::channel::<WriteJob>();
     let cache = Arc::new(QueryCache::from_env());
     let writer_store = store.clone();
     let writer_cache = cache.clone();
+    let writer_quota = quota.clone();
     let stop = Arc::new(AtomicBool::new(false));
     let writer_stop = stop.clone();
     let writer = std::thread::Builder::new()
         .name(format!("nonodb-writer-{name}"))
-        .spawn(move || writer::run(writer_store, write_rx, writer_cache, writer_stop))
+        .spawn(move || {
+            writer::run(
+                writer_store,
+                write_rx,
+                writer_cache,
+                writer_quota,
+                writer_stop,
+            )
+        })
         .map_err(|e| format!("start writer for `{name}`: {e}"))?;
     let auto_index = AutoIndexer::start(store.clone(), write_tx.clone(), &path);
     let maintenance = crate::maintenance::start(
@@ -436,23 +651,77 @@ fn start_runtime(root: &Path, name: &str) -> Result<DatabaseRuntime, String> {
     );
     let webhooks =
         crate::webhooks::start(store.clone(), write_tx.clone(), path.clone(), stop.clone());
-    if let Some(dir) = std::env::var_os("NONODB_SNAPSHOT_DIR") {
+    let wal = crate::wal::start(store.clone(), path.clone(), name.to_string(), stop.clone());
+    let snapshot_dir = std::env::var_os("NONODB_SNAPSHOT_DIR")
+        .map(|dir| PathBuf::from(dir).join(name))
+        .or_else(|| crate::wal::enabled().then(|| path.join("snapshots")));
+    let snapshots = snapshot_dir.and_then(|dir| {
         crate::spawn_snapshots(
             store.clone(),
-            PathBuf::from(dir).join(name),
+            dir,
+            crate::wal::dir(&path),
             name.to_string(),
-        );
-    }
+            stop.clone(),
+        )
+    });
     Ok(DatabaseRuntime {
         store,
         write_tx,
         cache,
         auto_index,
+        quota,
         stop,
         writer: Mutex::new(Some(writer)),
         maintenance: Mutex::new(Some(maintenance)),
         webhooks: Mutex::new(Some(webhooks)),
+        snapshots: Mutex::new(snapshots),
+        wal: Mutex::new(wal),
     })
+}
+
+#[derive(Debug, Clone)]
+pub struct RestoreOutcome {
+    pub database: String,
+    pub safety_snapshot: PathBuf,
+    pub source: String,
+}
+
+fn install_restored(
+    root: &Path,
+    name: &str,
+    source: &Path,
+    safety: &Path,
+) -> Result<DatabaseRuntime, String> {
+    let path = root.join(name);
+    fs::create_dir_all(&path).map_err(|error| format!("create restored database: {error}"))?;
+    fs::copy(source, path.join("data.mdb"))
+        .map_err(|error| format!("install restored data.mdb: {error}"))?;
+    // Operational settings that live beside data.mdb should survive a restore.
+    let quota = safety.join("quota.json");
+    if quota.is_file() {
+        fs::copy(&quota, path.join("quota.json"))
+            .map_err(|error| format!("preserve restore quota config: {error}"))?;
+    }
+
+    let rebuild_path = path.clone();
+    let store =
+        Store::open(&rebuild_path).map_err(|error| format!("open restored data: {error}"))?;
+    for collection in store
+        .collections()
+        .map_err(|error| format!("list restored collections: {error}"))?
+    {
+        store
+            .collection(&collection)
+            .map_err(|error| format!("open restored collection `{collection}`: {error}"))?
+            .rebuild_missing_search_sidecars()
+            .map_err(|error| format!("rebuild restored search sidecars: {error}"))?;
+    }
+    let env = store.env().clone();
+    drop(store);
+    env.prepare_for_closing().wait();
+    let _ = fs::remove_file(path.join("lock.mdb"));
+
+    start_runtime(root, name)
 }
 
 fn cleanup_dropped(root: &Path) {

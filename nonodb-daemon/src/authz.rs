@@ -52,6 +52,7 @@ pub fn authorize_request(
         Request::Find { coll, .. }
         | Request::FindOne { coll, .. }
         | Request::Lookup { coll, .. }
+        | Request::ExplainLookup { coll, .. }
         | Request::Watch { coll, .. }
         | Request::Explain { coll, .. }
         | Request::Count { coll, .. }
@@ -63,6 +64,15 @@ pub fn authorize_request(
         | Request::ListFuzzyIndexes { coll }
         | Request::ListVectorIndexes { coll }
         | Request::VectorSearch { coll, .. }
+        | Request::GetGraph { coll }
+        | Request::Traverse { coll, .. }
+        | Request::ShortestPath { coll, .. }
+        | Request::AllShortestPaths { coll, .. }
+        | Request::GraphMatch { coll, .. }
+        | Request::GraphAlgorithm { coll, .. }
+        | Request::Neighbors { coll, .. }
+        | Request::HybridSearch { coll, .. }
+        | Request::GraphRebuildStatus { coll }
         | Request::Search { coll, .. }
         | Request::Fuzzy { coll, .. }
         | Request::History { coll, .. }
@@ -83,7 +93,7 @@ pub fn authorize_request(
             req.op_name(),
         ),
         Request::ListWebhooks | Request::ListWebhookDeliveries { .. } => {
-            if principal.allows_admin_database() {
+            if principal.allows_database_admin(database) {
                 Ok(())
             } else {
                 Err(ApiError::forbidden())
@@ -120,6 +130,9 @@ pub fn authorize_request(
         | Request::DropFuzzyIndex { coll, .. }
         | Request::CreateVectorIndex { coll, .. }
         | Request::Reindex { coll }
+        | Request::DropGraph { coll }
+        | Request::ReindexGraph { coll, .. }
+        | Request::CancelGraphRebuild { coll }
         | Request::DropVectorIndex { coll, .. }
         | Request::CreateCollection { coll, .. }
         | Request::DropCollection { coll }
@@ -139,6 +152,25 @@ pub fn authorize_request(
             coll,
             req.op_name(),
         ),
+        Request::SetGraph { coll, def } => {
+            allow(
+                principal,
+                Action::AdminCollection,
+                database,
+                coll,
+                req.op_name(),
+            )?;
+            if def.edge_collection != *coll {
+                allow(
+                    principal,
+                    Action::AdminCollection,
+                    database,
+                    &def.edge_collection,
+                    req.op_name(),
+                )?;
+            }
+            Ok(())
+        }
         Request::CreateWebhook { rule } => allow(
             principal,
             Action::AdminCollection,
@@ -147,7 +179,7 @@ pub fn authorize_request(
             req.op_name(),
         ),
         Request::DeleteWebhook { .. } | Request::RetryWebhookDelivery { .. } => {
-            if principal.allows_admin_database() {
+            if principal.allows_database_admin(database) {
                 Ok(())
             } else {
                 Err(ApiError::forbidden())
@@ -155,12 +187,23 @@ pub fn authorize_request(
         }
 
         Request::ListDatabases => Ok(()),
-        Request::CreateDatabase { .. }
-        | Request::DropDatabase { .. }
-        | Request::Sync
-        | Request::MapInfo
-        | Request::ResizeMap { .. } => {
+        Request::CreateDatabase { .. } | Request::DropDatabase { .. } => {
             if principal.allows_admin_database() {
+                Ok(())
+            } else {
+                Err(ApiError::forbidden())
+            }
+        }
+        Request::GetQuota => Ok(()),
+        Request::SetQuota { .. } => {
+            if principal.allows_database_admin(database) {
+                Ok(())
+            } else {
+                Err(ApiError::forbidden())
+            }
+        }
+        Request::Sync | Request::MapInfo | Request::ResizeMap { .. } => {
+            if principal.allows_database_admin(database) {
                 Ok(())
             } else {
                 Err(ApiError::forbidden())
@@ -184,6 +227,16 @@ pub fn authorize_request(
             Ok(())
         }
     }
+}
+
+pub fn allow_collection(
+    principal: &Principal,
+    action: Action,
+    database: &str,
+    coll: &str,
+    op: &'static str,
+) -> Result<(), ApiError> {
+    allow(principal, action, database, coll, op)
 }
 
 pub fn authorize_write_op(
@@ -314,6 +367,8 @@ mod tests {
             field: Some("x".into()),
             fields: None,
             unique: false,
+            sparse: false,
+            partial_filter_expression: None,
             include: vec![],
             geo: false,
         };
@@ -419,11 +474,35 @@ mod tests {
             field: Some("x".into()),
             fields: None,
             unique: false,
+            sparse: false,
+            partial_filter_expression: None,
             include: vec![],
             geo: false,
         };
         assert!(authorize_request(&app, &index, "app2").is_ok());
         assert!(authorize_request(&app, &index, "app1").is_err());
+        assert!(authorize_request(&app, &Request::MapInfo, "app2").is_ok());
+        assert!(authorize_request(&app, &Request::MapInfo, "app1").is_err());
+        assert!(authorize_request(&app, &Request::ResizeMap { size: 4096 }, "app2").is_ok());
+        assert!(authorize_request(&app, &Request::Sync, "app2").is_ok());
+        assert!(authorize_request(&app, &Request::ListWebhooks, "app2").is_ok());
+        assert!(authorize_request(&app, &Request::ListWebhooks, "app1").is_err());
+        assert!(authorize_request(
+            &app,
+            &Request::CreateDatabase {
+                name: "newdb".into(),
+            },
+            "app2"
+        )
+        .is_err());
+        assert!(authorize_request(
+            &app,
+            &Request::DropDatabase {
+                name: "app2".into(),
+            },
+            "app2"
+        )
+        .is_err());
         let legacy = principal(&["read:orders"]);
         assert!(authorize_request(&legacy, &insert("orders"), "app1").is_err());
         assert!(authorize_request(

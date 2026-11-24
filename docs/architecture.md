@@ -99,8 +99,10 @@ Properties that matter here:
   makes that explicit with one writer thread.
 - **Crash safety.** Committed transactions survive process death. An
   interrupted write leaves the last committed state intact.
-- **No WAL, no background compaction.** The file grows to a high-water mark and
-  does not shrink. `backup` with compaction produces a smaller copy.
+- **Optional WAL.** PITR is opt-in and per database; it retains a segmented
+  logical WAL alongside periodic snapshots. The LMDB file grows to a high-water
+  mark and does not shrink, with or without PITR. `backup` with compaction
+  produces a smaller copy.
 
 The default `map_size` is 1 GiB. This is a maximum address-space reservation
 for the database, not an allocation of 1 GiB of RAM or disk. It can be raised
@@ -112,12 +114,13 @@ An LMDB environment contains named sub-databases. nonodb uses this layout:
 
 | Sub-database | Key | Value | Purpose |
 |---|---|---|---|
-| `meta` | metadata key | JSON or scalar | Collection registry, collection profile, index definitions, segment manifests, search deltas, exact BM25 statistics, history sequence |
+| `meta` | metadata key | JSON or scalar | Collection registry, collection profile, index definitions, graph definitions, segment manifests, search deltas, exact BM25 statistics, history sequence |
 | `history` | collection + `_id` + revision | revision JSON | Append-only document history |
 | `ttl` | expiry index / collection + `_id` | expiry timestamp | Document expiry metadata |
 | `coll:<name>` | `_id` bytes | JSON document | Primary collection data |
 | `dbslot:<n>` (index) | encoded values + `_id` | encoded `_id` / covering payload | Secondary index |
 | `dbslot:<n>` (vector) | `_id` | norm + `f32` components | Exact vector index (IVF sidecar on disk) |
+| `dbslot:<n>` (graph) | node + label + target + edge id | compact adjacency summary | Derived graph adjacency (`out`/`in`) |
 | legacy `idx:*`, `ft:*`, `ftl:*`, `fz:*` | as above | as above | Resources created by older releases; current code does not open text/fuzzy legacy postings |
 
 Text and fuzzy postings are not stored in LMDB sub-databases. They live in
@@ -159,8 +162,9 @@ two key families in one named database: an expiry-ordered index
 collection/`_id` lookup (`i + collection + _id`) for updates and deletes.
 Collection defaults live in `meta` as `ttl:<name>`; date-field TTL also stores
 `ttl_field:<name>`. TTL entries are written in
-the same transaction as the document, indexes, and history. See
-[Document TTL](ttl.md).
+the same transaction as the document, indexes, and history. Graph adjacency
+entries are also written in that transaction. See [Document TTL](ttl.md) and
+[Graph traversal](graph.md).
 
 ### Vault collection layout
 
@@ -182,6 +186,22 @@ Vault collections have no secondary, text, fuzzy, or vector indexes. Standard wr
 methods reject vault collections, and vault requests require the three
 encryption headers. See [Vault collections](vault.md) for the API contract and
 threat model.
+
+### Graph layout
+
+Graph definitions live in `meta` as `graph:<node_collection>` with a reverse
+mapping `graph_edge:<edge_collection>`. The native adjacency index uses two
+reusable slot databases per graph: `graph:<edge_collection>:out` and
+`graph:<edge_collection>:in`. Each entry is keyed by the local node id, edge
+label, remote node id, and edge id, and stores only a compact versioned summary
+(edge id, label, weight, validity timestamps). Full edge documents stay in the
+edge collection and are loaded for `include_edges` or `edge_filter`. Entries are
+updated in the same write transaction as the edge document, including TTL
+expiry and replication apply. Online rebuilds write `:gN` generation slots,
+mirror concurrent edge writes, then atomically bump the definition and drop the
+old generations. The index is derived and can be rebuilt with
+`reindex_graph`; it is not part of document history. See
+[Graph traversal](graph.md).
 
 Every collection consumes a named LMDB sub-database. Secondary index and vector
 resources are assigned physical **slot databases** (`dbslot:*`) from a reusable
@@ -222,8 +242,9 @@ The optimizer is intentionally simple and conservative. It uses an index when:
   the last field; or
 - a single-field index has an equality or range condition, a single-value
   `$all`, or a case-sensitive anchored regex (`^literal`); and
-- the indexed field value is not `null` (because `null` also matches a missing
-  field, which is absent from the index).
+- the indexed field value is not `null`. The planner keeps `null` conditions on
+  a scan even though plain indexes encode a missing field as `null`, so results
+  remain correct without relying on index membership.
 
 Even when an index supplies candidates, the full filter is evaluated against
 each document. Indexes are an access path, not a substitute for query
@@ -455,9 +476,10 @@ become contiguous LMDB ranges. An index range scan does not deserialize
 documents until candidates are verified.
 
 Secondary indexes accept strings, numbers, Decimal128, special doubles,
-booleans, dates, binary/UUID, ObjectId, and `null` values that are actually
-present. Arrays and ordinary objects are skipped. Dates are canonicalized
-before indexing, so all offsets for one instant share a key. Text and fuzzy
+booleans, dates, binary/UUID, ObjectId, and `null`. A plain index encodes a
+missing indexed field as `null`; a sparse index omits it instead. Arrays and
+ordinary objects are skipped. Dates are canonicalized before indexing, so all
+offsets for one instant share a key. Text and fuzzy
 indexes search string, boolean, and numeric scalar values, including Extended
 JSON integer/double/decimal forms. Dates, binary/UUID, and ObjectId values are
 not searchable text.

@@ -2188,22 +2188,7 @@ impl Store {
                 local_head, txn.seq
             )));
         }
-        if txn.ops.is_empty() {
-            for change in &txn.changes {
-                let collection = self.collection_in(&mut wtxn, &change.collection)?;
-                collection.apply_replication_change_txn(
-                    &mut wtxn,
-                    &change.op,
-                    &change.id,
-                    change.after.as_ref(),
-                    change.ttl_at,
-                )?;
-            }
-        } else {
-            for op in &txn.ops {
-                self.apply_replication_op_in(&mut wtxn, &txn.changes, op)?;
-            }
-        }
+        self.apply_replication_ops_in(&mut wtxn, &txn.changes, &txn.ops)?;
         self.append_replication_txn_ops_with_epoch_in(
             &mut wtxn,
             &txn.origin,
@@ -2221,6 +2206,78 @@ impl Store {
             &mut wtxn,
             epoch_key.as_bytes(),
             txn.epoch.to_string().as_bytes(),
+        )?;
+        wtxn.commit()?;
+        Ok(true)
+    }
+
+    fn apply_replication_ops_in(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        changes: &[ReplicationChange],
+        ops: &[ReplicationOp],
+    ) -> Result<()> {
+        if ops.is_empty() {
+            for change in changes {
+                let collection = self.collection_in(wtxn, &change.collection)?;
+                collection.apply_replication_change_txn(
+                    wtxn,
+                    &change.op,
+                    &change.id,
+                    change.after.as_ref(),
+                    change.ttl_at,
+                )?;
+            }
+        } else {
+            for op in ops {
+                self.apply_replication_op_in(wtxn, changes, op)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Applies a transaction from this database's own PITR WAL. Unlike
+    /// [`Self::apply_replication_txn`], this checks the local log head instead
+    /// of the per-origin replica apply cursor, and preserves the original
+    /// transaction timestamp in the restored log.
+    pub fn apply_pitr_txn(&self, txn: &ReplicationTxn) -> Result<bool> {
+        if txn.origin.trim().is_empty() {
+            return Err(Error::Query("replication origin is empty".into()));
+        }
+        if txn.seq == 0 {
+            return Err(Error::Query("replication sequence must be positive".into()));
+        }
+        if txn.changes.is_empty() && txn.ops.is_empty() {
+            return Err(Error::Query(
+                "replication transaction must contain at least one change".into(),
+            ));
+        }
+        let mut wtxn = self.write_txn()?;
+        let meta: Database<Bytes, Bytes> = self.env.create_database(&mut wtxn, Some(META_DB))?;
+        let local_head = meta
+            .get(&wtxn, REPLICATION_SEQ_KEY)?
+            .and_then(|raw| std::str::from_utf8(raw).ok())
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .unwrap_or(0);
+        if txn.seq <= local_head {
+            wtxn.commit()?;
+            return Ok(false);
+        }
+        if txn.seq != local_head.saturating_add(1) {
+            return Err(Error::Query(format!(
+                "PITR replay gap: local head {local_head}, got sequence {}",
+                txn.seq
+            )));
+        }
+        self.apply_replication_ops_in(&mut wtxn, &txn.changes, &txn.ops)?;
+        let encoded = serde_json::to_vec(txn)?;
+        let db: Database<Bytes, Bytes> =
+            self.env.create_database(&mut wtxn, Some(REPLICATION_DB))?;
+        db.put(&mut wtxn, &txn.seq.to_be_bytes(), &encoded)?;
+        meta.put(
+            &mut wtxn,
+            REPLICATION_SEQ_KEY,
+            txn.seq.to_string().as_bytes(),
         )?;
         wtxn.commit()?;
         Ok(true)
@@ -2324,15 +2381,33 @@ impl Store {
             ReplicationOp::CollectionEvents { coll, config } => {
                 self.set_collection_events_in(wtxn, coll, config)
             }
+            ReplicationOp::GraphSet { coll, def } => {
+                let collection = self.collection_in(wtxn, coll)?;
+                collection.set_graph_txn(wtxn, def)
+            }
+            ReplicationOp::GraphDrop { coll } => {
+                let collection = self.collection_in(wtxn, coll)?;
+                collection.drop_graph_txn(wtxn).map(|_| ())
+            }
             ReplicationOp::IndexCreate {
                 coll,
                 fields,
                 unique,
+                sparse,
+                partial_filter_expression,
                 include,
                 geo,
             } => {
                 let collection = self.collection_in(wtxn, coll)?;
-                collection.create_index_fields_txn(wtxn, fields, *unique, include, *geo)
+                collection.create_index_fields_txn(
+                    wtxn,
+                    fields,
+                    *unique,
+                    include,
+                    *geo,
+                    *sparse,
+                    partial_filter_expression.clone(),
+                )
             }
             ReplicationOp::IndexDrop { coll, field } => {
                 let collection = self.collection_in(wtxn, coll)?;

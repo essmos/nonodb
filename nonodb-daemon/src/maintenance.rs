@@ -33,6 +33,7 @@ struct Config {
     ttl_limit: usize,
     ts_retention_interval: Duration,
     ts_compact_threshold: u64,
+    graph_rebuild_limit: usize,
 }
 
 impl Config {
@@ -47,6 +48,7 @@ impl Config {
             )),
             ts_compact_threshold: env_u64("NONODB_TS_COMPACT_THRESHOLD_MB", 256)
                 .saturating_mul(1024 * 1024),
+            graph_rebuild_limit: env_usize("NONODB_GRAPH_REBUILD_CHUNK", 1000).clamp(1, 10_000),
         }
     }
 }
@@ -93,6 +95,7 @@ fn run(
     let mut last_subscription_prune: Option<Instant> = None;
     let mut last_ts_retention: Option<Instant> = None;
     let mut ts_deletions_seen = false;
+    let mut last_graph_rebuild: Option<Instant> = None;
 
     loop {
         let deadline = Instant::now() + config.interval;
@@ -160,6 +163,12 @@ fn run(
                         }
                     }
                 }
+            }
+        }
+        if last_graph_rebuild.is_none_or(|at| at.elapsed() >= config.interval) {
+            last_graph_rebuild = Some(Instant::now());
+            if let Err(e) = step_graph_rebuilds(&store, &write_tx, config.graph_rebuild_limit) {
+                tracing::warn!(?e, "graph rebuild step failed");
             }
         }
 
@@ -296,6 +305,29 @@ pub fn compact_if_requested(
     Ok(Some(report))
 }
 
+fn step_graph_rebuilds(
+    store: &Store,
+    write_tx: &mpsc::Sender<WriteJob>,
+    limit: usize,
+) -> Result<(), String> {
+    for coll in store.collections().map_err(|e| e.to_string())? {
+        let collection = store.collection(&coll).map_err(|e| e.to_string())?;
+        if collection
+            .graph_rebuild_state()
+            .map_err(|e| e.to_string())?
+            .is_none()
+        {
+            continue;
+        }
+        submit(
+            write_tx,
+            WriteReq::GraphRebuildStep { edge: coll, limit },
+            true,
+        )?;
+    }
+    Ok(())
+}
+
 fn sweep_ttl(store: &Store, write_tx: &mpsc::Sender<WriteJob>, limit: usize) -> Result<(), String> {
     metrics::inc(&metrics::TTL_SWEEPS);
     let due = store
@@ -392,8 +424,9 @@ mod tests {
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let writer_stop = stop.clone();
         let writer_store = store.clone();
+        let quota = Arc::new(crate::quota::Quota::load("test", dir.path()).expect("test quota"));
         let writer = std::thread::spawn(move || {
-            crate::writer::run(writer_store, rx, cache, writer_stop);
+            crate::writer::run(writer_store, rx, cache, quota, writer_stop);
         });
 
         let changed = sweep_timeseries_retention(&store, &tx).unwrap();

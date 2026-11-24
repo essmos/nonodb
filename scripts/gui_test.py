@@ -77,6 +77,8 @@ def main() -> int:
             NONODB_DATA=str(tmp / "data"),
             NONODB_SOCK=str(sock),
             NONODB_LOG="warn",
+            NONODB_BACKUP_CONFIG=str(tmp / "backups.json"),
+            NONODB_IMPORT_ROOTS=str(tmp / "backups"),
         )
         daemon_log = (tmp / "daemon.log").open("wb")
         daemon_proc = subprocess.Popen(
@@ -102,6 +104,9 @@ def main() -> int:
             assert match, index[:500]
             asset = fetch(base + match.group(1))
             assert len(asset) > 1000
+            style_match = re.search(r'href="([^"]+\.css)"', index)
+            assert style_match, index[:500]
+            styles = fetch(base + style_match.group(1)).decode()
             for marker in (
                 b"Save & run now",
                 b"Select one or more databases",
@@ -140,9 +145,48 @@ def main() -> int:
                 b"Any single /v1/exec request",
                 b"playground-result.json",
                 b"search_all",
+                b"New database name",
+                b"Create database",
+                b"Drop database",
+                b"default cannot be dropped",
+                b"Type ",
+                b"instance administrator scope",
+                b"Connections",
+                b"Add daemon connection",
+                b"New connection",
+                b"nonodb.gui.sessions",
+                b"session-bar",
+                b"Skip to main content",
+                b"Console navigation",
+                b"Collection views",
+                b"Eventing views",
+                b"Close dialog",
+                b"Search commands or collections",
+                b"aria-current",
+                b"aria-modal",
+                b"tablist",
+                b"Export views",
+                b"Import views",
+                b"Restore in place",
+                b"Verify for restore",
+                b"a safety snapshot for rollback",
+                b"Manual backups, offline restore, and verification",
+                b"Non-default databases can also be restored in place",
+                b"nonodb.saved-views",
+                b"nonodb-views-",
+                b"Could not import saved views",
+                b"Graph definition",
+                b"Traverse",
+                b"Initial depth",
             ):
                 assert marker in asset, marker
-            assert b"New database name" not in asset
+            assert b"Backup, restore, and verification remain CLI-only" not in asset
+            for marker in (
+                ":focus-visible",
+                ".skip-link",
+                "prefers-reduced-motion",
+            ):
+                assert marker in styles, marker
 
             result = json.loads(fetch(base + "/v1/exec", data={"op": "list_collections"}))
             assert result["ok"] is True, result
@@ -224,6 +268,88 @@ def main() -> int:
                 fetch(base + "/app1/v1/replication/status")
             )
             assert replication["result"]["database"] == "app1", replication
+
+            # Exercise the GUI proxy restore-in-place path end to end: create a
+            # native backup job, discover it through the Import API, preflight
+            # it, then restore app1 and confirm the newer document is gone.
+            backup_root = tmp / "backups"
+            job = {
+                "id": "gui-restore",
+                "database": "app1",
+                "databases": ["app1"],
+                "enabled": True,
+                "every_minutes": 1440,
+                "destination": {"kind": "local", "path": str(backup_root)},
+                "keep_last": 2,
+                "verify": True,
+                "compression": "gzip",
+            }
+            fetch(base + "/v1/backups/jobs", data=job)
+            fetch(base + "/v1/backups/jobs/gui-restore/run", data={})
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                view = json.loads(fetch(base + "/v1/backups"))["result"]
+                state = next(
+                    item["state"]
+                    for item in view["jobs"]
+                    if item["job"]["id"] == "gui-restore"
+                )
+                if state["last_status"] in {"ok", "error"} and not state["running"]:
+                    assert state["last_status"] == "ok", state
+                    break
+                time.sleep(0.1)
+            else:
+                raise AssertionError("GUI backup job timed out")
+            source = {"kind": "local", "path": str(backup_root)}
+            discovered = json.loads(
+                fetch(base + "/v1/import/browse", data={"source": source})
+            )["result"]["backups"]
+            assert discovered, discovered
+            location = discovered[0]["location"]
+            fetch(
+                base + "/app1/v1/exec",
+                data={"op": "insert", "coll": "gui_orders", "doc": {"_id": "a2", "n": 3}},
+            )
+            preflight = json.loads(
+                fetch(
+                    base + "/v1/restore/preflight",
+                    data={"source": source, "location": location, "database": "app1"},
+                )
+            )["result"]
+            assert preflight["database"] == "app1", preflight
+            restored = json.loads(
+                fetch(
+                    base + "/v1/restore",
+                    data={
+                        "source": source,
+                        "location": location,
+                        "database": "app1",
+                        "confirmation": preflight["confirmation"],
+                    },
+                )
+            )["result"]
+            assert restored["database"] == "app1", restored
+            assert restored["safety_snapshot"], restored
+            result = json.loads(
+                fetch(
+                    base + "/app1/v1/exec",
+                    data={"op": "find", "coll": "gui_orders", "filter": {}},
+                )
+            )
+            assert result["result"] == [{"_id": "a1", "n": 2}], result
+
+            # The GUI proxy exposes the same database management operations used
+            # by the Database tab: create, select, write, drop, then refresh.
+            fetch(base + "/v1/exec", data={"op": "create_database", "name": "gui_temp"})
+            listed = json.loads(fetch(base + "/v1/exec", data={"op": "list_databases"}))
+            assert "gui_temp" in listed["result"]["databases"], listed
+            fetch(
+                base + "/gui_temp/v1/exec",
+                data={"op": "insert", "coll": "temp", "doc": {"_id": "t1"}},
+            )
+            fetch(base + "/v1/exec", data={"op": "drop_database", "name": "gui_temp"})
+            listed = json.loads(fetch(base + "/v1/exec", data={"op": "list_databases"}))
+            assert "gui_temp" not in listed["result"]["databases"], listed
             print("gui e2e: ok")
             return 0
         finally:

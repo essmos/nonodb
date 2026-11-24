@@ -97,6 +97,10 @@ List databases:
 {"op":"list_databases"}
 ```
 
+The response is filtered to databases visible through the caller's scopes. A
+per-database administrator sees only its own database; `admin:db` and `*:*` see
+the whole instance.
+
 Create a database:
 
 ```json
@@ -206,11 +210,19 @@ all slots are busy, the daemon returns HTTP `503` with error code
 
 - Collection scopes may be database-qualified:
   `read:app1/orders`, `write:app1/*`, `admin:app1/orders`. Unqualified scopes
-  such as `read:orders` apply to every database. Database management still
-  requires global `admin:db`.
-- A per-database administrator role is planned; `admin:db` is instance-wide.
+  such as `read:orders` apply to every database.
+- `admin:<database>/*` is a per-database administrator. It can manage collections,
+  indexes, TTL/history/events/subscriptions, storage quotas, map operations,
+  `sync`, and webhooks in that database. It cannot create or drop databases, manage the instance-wide
+  authorization registry, or read instance-wide metrics. Those still require
+  `admin:db` or `*:*`.
+- `list_databases` is filtered to the databases visible through the caller's
+  scopes, matching the MongoDB wire listener.
 - Each open database has one writer thread. A shared sharded writer pool is a
   later scaling step. The open-database limit bounds total writer threads.
 - There are no cross-database queries, transactions, or joins.
 - Snapshot directories are created per database when `NONODB_SNAPSHOT_DIR` is
   set: `<snapshot-dir>/<database>/data-<timestamp>.mdb`.
+- Storage quotas are configured independently per database. See
+  [Per-database quotas](quotas.md); `get_quota` and `set_quota` require the
+  selected database, and `nonodb-cli --db <name> quota` manages them.

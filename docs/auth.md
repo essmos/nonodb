@@ -86,14 +86,15 @@ version make the file invalid.
 | `read:<collection>` | find, find_one, lookup, count, aggregate, SQL `SELECT`, explain_sql, explain, search, fuzzy, vector search, history, get_version, get_collection_ttl, get_collection_history, get_collection_events, get_collection_metrics, list_subscriptions, list indexes |
 | `write:<collection>` | insert, insert_many, update, find_and_modify, delete, SQL `INSERT`/`UPDATE` |
 | `admin:<collection>` | create/drop collection, create/drop secondary/text/fuzzy/vector index, set collection TTL, set collection history, set collection events, create/renew/delete subscription |
-| `admin:db` | Instance-wide administration: `list_databases`, `create_database`, `drop_database`, map operations, `sync`, metrics, and auth management; collection actions still use collection scopes |
+| `admin:db` | Instance-wide administration: `create_database`, `drop_database`, authorization management, and `/metrics`; collection actions still use collection scopes |
 | `metrics:read` | Read `/metrics` and `/metrics/prometheus` without granting database administration |
 | `read:*` / `write:*` / `admin:*` | The action on every collection in every database |
 | `read:<database>/<collection>` | Same read actions, limited to one database |
 | `write:<database>/<collection>` | Same write actions, limited to one database |
 | `admin:<database>/<collection>` | Collection administration, limited to one database |
+| `admin:<database>/*` | Per-database administrator: collection administration plus map operations, `sync`, and webhooks in that database. Does not create/drop databases, manage authorization, or read instance-wide metrics |
 | `read:<database>/*` | Read every collection in one database |
-| `write:<database>/*` / `admin:<database>/*` | Write or administer every collection in one database |
+| `write:<database>/*` | Write every collection in one database |
 | `*:*` | Everything |
 
 Rules:
@@ -107,8 +108,13 @@ Rules:
   name in every database. Use `read:app1/orders` to restrict one database.
 - `list_collections` returns only collections visible through any collection
   scope. A principal with `read:orders` does not learn that `customers` exists.
-- Database management (`create_database`, `drop_database`, `map_info`,
-  `resize_map`, `/metrics`) still requires global `admin:db` or `*:*`.
+- `list_databases` returns only databases visible through the principal's
+  scopes. A per-database administrator sees its own database, not the rest of
+  the instance.
+- `create_database`, `drop_database`, authorization management, and `/metrics`
+  still require instance-wide `admin:db` or `*:*`. Map operations, `sync`, and
+  webhook management are allowed to an `admin:<database>/*` principal for its
+  own database.
 - `/healthz`, `/readyz`, and `/v1/capabilities` are public. `/metrics` and
   `/metrics/prometheus`
   require `metrics:read`, `admin:db`, or `*:*`.
@@ -168,8 +174,10 @@ Revoke:
 nonodb-cli auth cert disable "$FP"
 ```
 
-There is no CRL or OCSP integration. Revocation is handled by this registry and
-short-lived client certificates.
+Revocation also honors configured CRL files/URLs and OCSP responders. The
+registry remains authoritative for fingerprint allow-listing; CRL/OCSP checks
+run before the registry lookup and default to fail-closed when no source can
+decide. See [Mutual TLS](mtls.md).
 
 ## MongoDB wire authentication
 

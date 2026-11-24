@@ -2,7 +2,7 @@
 
 Full release notes: https://github.com/essmos/nonodb/releases
 
-## Unreleased
+## v0.32.0 - 2026-11-23
 
 - Time-series secondary indexes now drive `update`/`delete` filters as well as
   reads, unique indexes are enforced (including insert/update/upsert/reindex and
@@ -124,6 +124,79 @@ Full release notes: https://github.com/essmos/nonodb/releases
   `Store::close()` so offline maintenance can reopen the environment in the same
   process.
 
+
+- Add graph search parity features: `all_shortest_paths` (BFS and weighted
+  Dijkstra), `graph_match` for linear variable-length patterns with per-step
+  filters, and `graph_algorithm` for bounded PageRank, degree centrality, and
+  weakly connected components. Python client methods and the graph benchmark
+  cover the new operations. See `docs/graph.md`.
+- **Upgrade: plain indexes now index a missing field as `null`.** Run
+  `nonodb-cli reindex <collection>` for every collection with plain indexes
+  after upgrading. Existing plain unique indexes can fail to rebuild if several
+  documents already share a missing/`null` key; resolve those duplicates first.
+  Sparse and partial indexes keep their stored definitions.
+
+- Store BSON regular-expression values (`$regularExpression`) as document data.
+  They round-trip through the MongoDB wire listener, support `$type: "regex"`
+  and exact `$eq` matching, and are deliberately excluded from secondary
+  indexes. Malformed values return `invalid_regex`.
+
+- Add client-side `lookup_join` helpers to the Python, Node.js, Rust, and Go
+  clients. They attach matching foreign documents through chunked `lookup`,
+  preserve local order and length, and align missing keys with null. See
+  `docs/clients.md`.
+- Add verified restore-in-place through the admin HTTP API and GUI. Preflight
+  validates the backup manifest, checksum, decryption/decompression, and LMDB
+  contents without changing live data; restore requires the exact
+  `RESTORE <database>` phrase and records the operation in the audit log. The
+  previous database is kept in `restore-safety/<database>-<timestamp>-<pid>`
+  with `restore-info.json`, failures roll back automatically, and the response
+  includes rollback instructions. Only non-default databases can be restored
+  online; the default database still uses the offline CLI. See
+  `docs/backup.md`.
+- Add per-database storage quotas for data, indexes, history, and search/vector
+  sidecars. `get_quota`/`set_quota`, `database_stats`, and
+  `nonodb-cli quota` expose usage and limits; limits persist across restarts and
+  can default from `NONODB_QUOTA_*`. Usage at 80% produces a soft warning, and
+  growing writes that would cross a hard limit fail with `quota_exceeded`
+  (HTTP 507) while deletes, drops, and pruning remain available. See
+  `docs/quotas.md`.
+- Add real sparse and partial index semantics. `sparse` now omits documents
+  without the key instead of behaving like a plain index, compound sparse
+  indexes skip only documents with every key absent, and
+  `partialFilterExpression` limits index membership. Plain indexes now index a
+  missing field as `null`, matching MongoDB, so a plain unique index allows only
+  one missing/`null` key. Partial indexes are used by the planner only when the
+  query repeats the predicate; hints that omit it fail instead of returning
+  incomplete results. MongoDB-wire index DDL, `listIndexes`, and
+  `scripts/nonodb-migrate.py` preserve both options.
+- Add CRL and OCSP revocation checks for mutual TLS. CRL files/URLs refresh on a
+  timer, OCSP answers are cached per certificate, and
+  `NONODB_TLS_REVOCATION_FAIL_MODE` selects fail-closed (default) or fail-open
+  when no source can decide. Revoked client certificates are rejected before
+  registry authorization; metrics and docs cover refresh failures, revoked
+  clients, and unavailable checks.
+- Add opt-in point-in-time recovery through `NONODB_PITR_ENABLED=1`: periodic
+  snapshots plus segmented WAL with replay to an RFC 3339/Unix timestamp during
+  `nonodb-cli restore --to`. Retention prunes only WAL covered by a verified
+  snapshot, hard size/age limits reject writes with `wal_full`, and per-database
+  WAL metrics plus alerts report bytes, age, sequence, availability, and pruned
+  bytes. See `docs/pitr.md`.
+
+## v0.31.0 - 2026-11-23
+
+- Add graph traversal over ordinary node and edge documents. A graph definition
+  in `meta` drives native `out`/`in` adjacency slots maintained in the same
+  transaction as every edge insert, update, delete, TTL expiry, and replication
+  apply. Add `set_graph`, `get_graph`, `drop_graph`, `reindex_graph`
+  (synchronous or online with generation swap and progress/cancel), `traverse`
+  (BFS/DFS, directions, label/edge/node filters, `as_of`, projection, cycle
+  markers, tree/flat output, node/edge/byte budgets, vector-search seeds),
+  `neighbors`, `hybrid_search` vector+graph rerank, `shortest_path` (BFS or
+  Dijkstra), adjacency-backed `$graphLookup`, Python client methods, and a lazy
+  Graph tree in the GUI. Adjacency values store a compact summary instead of
+  duplicating edge JSON; graph reads require edge-collection read scope and
+  vault edge collections are rejected. See `docs/graph.md`.
 - Remove orphaned `.dropped-*` database directories at startup. A failed
   `remove_dir_all` no longer turns an already-committed database drop into an
   error.

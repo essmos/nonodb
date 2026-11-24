@@ -1,4 +1,4 @@
-#![recursion_limit = "256"]
+#![recursion_limit = "512"]
 
 //! nonodb daemon: HTTP/JSON over a Unix socket.
 //!
@@ -34,11 +34,14 @@ mod pairing;
 mod pairing_api;
 mod profile;
 mod protocol;
+mod quota;
 mod replication_api;
 mod replicator;
 mod retention;
+mod revocation;
 mod s3_import;
 mod server_info;
+mod wal;
 mod webhooks;
 mod writer;
 
@@ -129,6 +132,7 @@ struct AppState {
     write_tx: mpsc::Sender<WriteJob>,
     cache: Arc<cache::QueryCache>,
     auto_index: Arc<auto_index::AutoIndexer>,
+    quota: Arc<quota::Quota>,
     _runtime: Arc<databases::DatabaseRuntime>,
     databases: Arc<databases::Databases>,
     pub(crate) backups: Arc<backups::BackupManager>,
@@ -148,6 +152,7 @@ impl AppState {
             write_tx: runtime.write_tx.clone(),
             cache: runtime.cache.clone(),
             auto_index: runtime.auto_index.clone(),
+            quota: runtime.quota.clone(),
             _runtime: runtime,
             databases: self.databases.clone(),
             backups: self.backups.clone(),
@@ -426,6 +431,7 @@ async fn run_async() -> Result<(), Box<dyn std::error::Error>> {
         write_tx: default.write_tx.clone(),
         cache: default.cache.clone(),
         auto_index: default.auto_index.clone(),
+        quota: default.quota.clone(),
         _runtime: default.clone(),
         databases: databases.clone(),
         backups,
@@ -483,6 +489,11 @@ async fn run_async() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/import/browse", post(imports_api::browse))
         .route("/v1/import/run", post(imports_api::run))
         .route("/v1/import/status/:id", get(imports_api::status))
+        .route(
+            "/v1/restore/preflight",
+            post(imports_api::restore_preflight),
+        )
+        .route("/v1/restore", post(imports_api::restore))
         .route(
             "/v1/replication/status",
             get(replication_api::status_default),
@@ -833,6 +844,7 @@ struct TlsSetup {
     auth: Arc<auth::AuthState>,
     client_auth: bool,
     audit: Option<Arc<audit::AuditLog>>,
+    revocation: Option<Arc<revocation::RevocationState>>,
 }
 
 fn fingerprint(cert: &CertificateDer<'_>) -> [u8; 32] {
@@ -866,6 +878,7 @@ fn tls_acceptor(
         .filter(|value| !value.is_empty());
     let (acceptor, client_auth) =
         build_tls_acceptor(cert, key, client_ca.as_deref(), auth.clone(), audit.clone())?;
+    let revocation = revocation::RevocationState::from_env(client_ca.as_deref())?;
     Ok(TlsSetup {
         acceptor: Arc::new(RwLock::new(acceptor)),
         cert: cert.to_string(),
@@ -874,6 +887,7 @@ fn tls_acceptor(
         auth,
         client_auth,
         audit,
+        revocation,
     })
 }
 
@@ -928,6 +942,9 @@ fn build_tls_acceptor(
         }
         builder.with_no_client_auth().with_single_cert(certs, key)?
     };
+    if let Err(error) = metrics::record_certificate_expiry("server", Path::new(cert)) {
+        tracing::warn!(%error, "TLS certificate expiry metric unavailable");
+    }
     Ok((TlsAcceptor::from(Arc::new(config)), client_ca.is_some()))
 }
 
@@ -952,6 +969,20 @@ fn tls_signature(setup: &TlsSetup) -> u64 {
 }
 
 fn spawn_tls_reload(setup: TlsSetup, mut shutdown: watch::Receiver<bool>) {
+    if let Some(revocation) = setup.revocation.clone() {
+        let mut revocation_shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            let interval = revocation.refresh_interval();
+            loop {
+                tokio::select! {
+                    _ = wait_for_shutdown(&mut revocation_shutdown) => break,
+                    _ = tokio::time::sleep(interval) => {}
+                }
+                revocation.refresh().await;
+            }
+            tracing::info!("revocation refresh watcher stopped");
+        });
+    }
     let interval = std::env::var("NONODB_TLS_RELOAD_INTERVAL")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
@@ -1072,6 +1103,13 @@ async fn serve_tcp(
                 .and_then(|certs| certs.first())
             {
                 Some(cert) => {
+                    if let Some(revocation) = &tls.revocation {
+                        if let Err(reason) = revocation.check_peer(cert.as_ref()).await {
+                            audit_tls(tls.audit.as_deref(), peer, "unauthorized", None);
+                            tracing::warn!(%peer, %reason, "mTLS client rejected by revocation policy");
+                            return;
+                        }
+                    }
                     let fingerprint = fingerprint(cert);
                     match tls.auth.registry().authenticate_certificate(&fingerprint) {
                         Ok(principal) => {
@@ -1144,9 +1182,16 @@ where
     }
 }
 
-/// Periodic LMDB snapshots (consistent copies without stopping writes).
-/// This is not full PITR with a WAL - it provides restore points every N seconds.
-pub(crate) fn spawn_snapshots(store: Arc<Store>, dir: PathBuf, database: String) {
+/// Periodic LMDB snapshots. With PITR enabled, snapshots are the verified
+/// base for WAL retention: only a snapshot whose metadata was fsynced may
+/// allow pruning older WAL segments.
+pub(crate) fn spawn_snapshots(
+    store: Arc<Store>,
+    dir: PathBuf,
+    wal_dir: PathBuf,
+    database: String,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+) -> Option<std::thread::JoinHandle<()>> {
     let interval = std::env::var("NONODB_SNAPSHOT_INTERVAL")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
@@ -1159,47 +1204,88 @@ pub(crate) fn spawn_snapshots(store: Arc<Store>, dir: PathBuf, database: String)
         .filter(|&n| n > 0)
         .unwrap_or(24);
     std::thread::Builder::new()
-        .name("nonodb-snapshots".into())
+        .name(format!("nonodb-snapshots-{database}"))
         .spawn(move || {
             if let Err(e) = std::fs::create_dir_all(&dir) {
                 metrics::record_snapshot_failure(&database);
                 tracing::error!(?e, dir = %dir.display(), "cannot create snapshot directory");
                 return;
             }
+            let mut last_run = std::time::Instant::now()
+                .checked_sub(interval)
+                .unwrap_or_else(std::time::Instant::now);
             loop {
-                let stamp = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis())
-                    .unwrap_or(0);
-                let path = dir.join(format!("data-{stamp}.mdb"));
-                let started = std::time::Instant::now();
-                match store.copy_to_file(&path, nonodb_core::heed::CompactionOption::Enabled) {
-                    Ok(file) => {
-                        if let Err(e) = file.sync_all() {
-                            metrics::record_snapshot_failure(&database);
-                            tracing::warn!(?e, "snapshot fsync failed");
-                        } else {
-                            metrics::record_snapshot_success(&database, started.elapsed());
-                            tracing::info!(path = %path.display(), "snapshot zapisany");
-                            prune_snapshots(&dir, keep);
-                        }
-                    }
-                    Err(e) => {
-                        metrics::record_snapshot_failure(&database);
-                        tracing::error!(?e, "snapshot failed");
-                    }
+                if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
                 }
-                std::thread::sleep(interval);
+                let requested = crate::wal::take_snapshot_request(&store);
+                if requested || last_run.elapsed() >= interval {
+                    snapshot_once(&store, &dir, &wal_dir, &database, keep);
+                    last_run = std::time::Instant::now();
+                }
+                // Wake quickly for WAL pressure and shutdown; the actual
+                // snapshot cadence is still governed by `interval`.
+                std::thread::sleep(Duration::from_millis(500));
             }
         })
-        .ok();
+        .ok()
 }
 
-fn prune_snapshots(dir: &std::path::Path, keep: usize) {
+fn snapshot_once(
+    store: &Store,
+    dir: &std::path::Path,
+    wal_dir: &std::path::Path,
+    database: &str,
+    keep: usize,
+) {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let path = dir.join(format!("data-{stamp}.mdb"));
+    let head = store.replication_head().unwrap_or(0);
+    let started = std::time::Instant::now();
+    match store.copy_to_file(&path, nonodb_core::heed::CompactionOption::Enabled) {
+        Ok(file) => {
+            if let Err(e) = file.sync_all() {
+                metrics::record_snapshot_failure(database);
+                tracing::warn!(?e, "snapshot fsync failed");
+                let _ = std::fs::remove_file(&path);
+                return;
+            }
+            drop(file);
+            if let Err(error) = nonodb_core::pitr::write_snapshot_meta(&path, database, head) {
+                metrics::record_snapshot_failure(database);
+                tracing::warn!(path = %path.display(), error = %error, "snapshot metadata write failed");
+                let _ = std::fs::remove_file(&path);
+                nonodb_core::pitr::remove_snapshot_meta(&path);
+                return;
+            }
+            metrics::record_snapshot_success(database, started.elapsed());
+            tracing::info!(path = %path.display(), head, "snapshot zapisany");
+            let floor = prune_snapshots(dir, keep);
+            if let Some(through) = floor {
+                // The WAL thread owns the active file handle and performs the
+                // actual prune safely after rotating if necessary.
+                let _ = wal_dir;
+                crate::wal::request_prune(store, through);
+            }
+        }
+        Err(e) => {
+            metrics::record_snapshot_failure(database);
+            tracing::error!(?e, "snapshot failed");
+        }
+    }
+}
+
+/// Prunes old snapshots. Returns the replication head of the snapshot that
+/// still covers the oldest retained restore point. `None` means no WAL may be
+/// pruned (legacy/missing metadata or PITR disabled).
+fn prune_snapshots(dir: &std::path::Path, keep: usize) -> Option<u64> {
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
+        return None;
     };
-    let mut files: Vec<PathBuf> = entries
+    let mut files: Vec<(u64, PathBuf)> = entries
         .flatten()
         .map(|e| e.path())
         .filter(|p| {
@@ -1207,14 +1293,56 @@ fn prune_snapshots(dir: &std::path::Path, keep: usize) {
                 .and_then(|n| n.to_str())
                 .is_some_and(|n| n.starts_with("data-") && n.ends_with(".mdb"))
         })
+        .filter_map(|path| snapshot_timestamp(&path).map(|stamp| (stamp, path)))
         .collect();
-    files.sort();
-    let excess = files.len().saturating_sub(keep);
-    for old in files.into_iter().take(excess) {
-        if let Err(e) = std::fs::remove_file(&old) {
-            tracing::warn!(?e, path = %old.display(), "cannot remove old snapshot");
-        }
+    files.sort_by_key(|(stamp, _)| *stamp);
+    if files.is_empty() {
+        return None;
     }
+    if !crate::wal::enabled() {
+        let excess = files.len().saturating_sub(keep);
+        for (_, old) in files.into_iter().take(excess) {
+            if let Err(e) = std::fs::remove_file(&old) {
+                tracing::warn!(?e, path = %old.display(), "cannot remove old snapshot");
+            }
+            nonodb_core::pitr::remove_snapshot_meta(&old);
+        }
+        return None;
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let window_ms = crate::wal::retention_secs().saturating_mul(1000);
+    let newest = files.len() - 1;
+    // Keep the oldest retained base and the newest recovery point. The base is
+    // the newest snapshot at or before the retention window; before a full
+    // window has elapsed it is the oldest snapshot available.
+    let floor = files
+        .iter()
+        .rposition(|(stamp, _)| stamp.saturating_add(window_ms) <= now)
+        .unwrap_or(0);
+    for (index, (_, path)) in files.iter().enumerate() {
+        if index == floor || index == newest {
+            continue;
+        }
+        if let Err(e) = std::fs::remove_file(path) {
+            tracing::warn!(?e, path = %path.display(), "cannot remove old snapshot");
+            continue;
+        }
+        nonodb_core::pitr::remove_snapshot_meta(path);
+    }
+    let meta = nonodb_core::pitr::read_snapshot_meta(&files[floor].1)
+        .ok()
+        .flatten()?;
+    Some(meta.replication_head)
+}
+
+fn snapshot_timestamp(path: &std::path::Path) -> Option<u64> {
+    let name = path.file_name()?.to_str()?;
+    let value = name.strip_prefix("data-")?.strip_suffix(".mdb")?;
+    value.parse::<u64>().ok()
 }
 
 async fn no_store(request: axum::extract::Request, next: axum::middleware::Next) -> Response {
@@ -2752,6 +2880,18 @@ async fn exec_inner(
         Ok(state) => state,
         Err(err) => return respond(Err(err)),
     };
+    if let Err(err) = authorize_graph_edges(&state.store, &principal, &req, &database) {
+        audit_denied(
+            &state,
+            &connection,
+            principal.name(),
+            &req,
+            &err,
+            started,
+            None,
+        );
+        return respond(Err(err));
+    }
     let audit_needed = state
         .audit
         .as_ref()
@@ -3004,15 +3144,38 @@ async fn exec_inner(
             let store = state.store.clone();
             let auth = vault_auth.clone();
             let joined = tokio::task::spawn_blocking(move || {
+                let started = std::time::Instant::now();
                 let c = read_collection(&store, &coll, auth.as_ref())?;
                 reject_vault_read(&c, auth.as_ref(), "lookup on vault collections")?;
                 let by = by
                     .unwrap_or(LookupBy::Field("_id".to_string()))
                     .into_fields();
                 let projection = lookup_projection(fields.as_deref(), projection.as_ref())?;
-                let results = c.lookup_fields(&by, &values, projection.as_ref())?;
-                let found = results.iter().filter(|doc| doc.is_some()).count();
-                Ok::<Value, ApiError>(json!({ "results": results, "found": found }))
+                let report = c.lookup_fields_report(&by, &values, projection.as_ref());
+                lookup_response(&coll, &by, report, started.elapsed(), false)
+            });
+            read_result(joined).await
+        }
+
+        Request::ExplainLookup {
+            coll,
+            by,
+            values,
+            fields,
+            projection,
+        } => {
+            let store = state.store.clone();
+            let auth = vault_auth.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                let started = std::time::Instant::now();
+                let c = read_collection(&store, &coll, auth.as_ref())?;
+                reject_vault_read(&c, auth.as_ref(), "explain_lookup on vault collections")?;
+                let by = by
+                    .unwrap_or(LookupBy::Field("_id".to_string()))
+                    .into_fields();
+                let projection = lookup_projection(fields.as_deref(), projection.as_ref())?;
+                let report = c.lookup_fields_report(&by, &values, projection.as_ref());
+                lookup_response(&coll, &by, report, started.elapsed(), true)
             });
             read_result(joined).await
         }
@@ -3294,6 +3457,8 @@ async fn exec_inner(
                             "field": d.name(),
                             "fields": d.effective_fields(),
                             "unique": d.unique,
+                            "sparse": d.sparse,
+                            "partial_filter_expression": d.partial_filter_expression,
                             "include": d.include,
                             "format": d.format,
                             "geo": d.geo,
@@ -3384,6 +3549,104 @@ async fn exec_inner(
                 Ok::<Value, ApiError>(json!({
                     "results": c.vector_search(&field, &vector, &filter, skip, limit)?
                 }))
+            });
+            read_result(joined).await
+        }
+
+        Request::GetGraph { coll } => {
+            let store = state.store.clone();
+            let auth = vault_auth.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                let c = read_collection(&store, &coll, auth.as_ref())?;
+                reject_vault_read(&c, auth.as_ref(), "graph")?;
+                Ok::<Value, ApiError>(json!({ "graph": c.get_graph()? }))
+            });
+            read_result(joined).await
+        }
+
+        Request::GraphRebuildStatus { coll } => {
+            let store = state.store.clone();
+            let auth = vault_auth.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                let c = read_collection(&store, &coll, auth.as_ref())?;
+                c.graph_rebuild_status().map_err(ApiError::from)
+            });
+            read_result(joined).await
+        }
+
+        Request::Traverse { coll, options } => {
+            let store = state.store.clone();
+            let auth = vault_auth.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                let c = read_collection(&store, &coll, auth.as_ref())?;
+                reject_vault_read(&c, auth.as_ref(), "graph traversal")?;
+                c.graph_traverse(options).map_err(ApiError::from)
+            });
+            read_result(joined).await
+        }
+
+        Request::ShortestPath { coll, options } => {
+            let store = state.store.clone();
+            let auth = vault_auth.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                let c = read_collection(&store, &coll, auth.as_ref())?;
+                reject_vault_read(&c, auth.as_ref(), "graph traversal")?;
+                c.graph_shortest_path(options).map_err(ApiError::from)
+            });
+            read_result(joined).await
+        }
+
+        Request::AllShortestPaths { coll, options } => {
+            let store = state.store.clone();
+            let auth = vault_auth.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                let c = read_collection(&store, &coll, auth.as_ref())?;
+                reject_vault_read(&c, auth.as_ref(), "graph traversal")?;
+                c.graph_all_shortest_paths(options).map_err(ApiError::from)
+            });
+            read_result(joined).await
+        }
+
+        Request::GraphMatch { coll, options } => {
+            let store = state.store.clone();
+            let auth = vault_auth.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                let c = read_collection(&store, &coll, auth.as_ref())?;
+                reject_vault_read(&c, auth.as_ref(), "graph traversal")?;
+                c.graph_match(options).map_err(ApiError::from)
+            });
+            read_result(joined).await
+        }
+
+        Request::GraphAlgorithm { coll, options } => {
+            let store = state.store.clone();
+            let auth = vault_auth.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                let c = read_collection(&store, &coll, auth.as_ref())?;
+                reject_vault_read(&c, auth.as_ref(), "graph traversal")?;
+                c.graph_algorithm(options).map_err(ApiError::from)
+            });
+            read_result(joined).await
+        }
+
+        Request::HybridSearch { coll, options } => {
+            let store = state.store.clone();
+            let auth = vault_auth.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                let c = read_collection(&store, &coll, auth.as_ref())?;
+                reject_vault_read(&c, auth.as_ref(), "graph traversal")?;
+                c.hybrid_search(options).map_err(ApiError::from)
+            });
+            read_result(joined).await
+        }
+
+        Request::Neighbors { coll, options } => {
+            let store = state.store.clone();
+            let auth = vault_auth.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                let c = read_collection(&store, &coll, auth.as_ref())?;
+                reject_vault_read(&c, auth.as_ref(), "graph traversal")?;
+                c.graph_neighbors(options).map_err(ApiError::from)
             });
             read_result(joined).await
         }
@@ -3604,9 +3867,11 @@ async fn exec_inner(
 
         Request::DatabaseStats => {
             let store = state.store.clone();
+            let quota = state.quota.clone();
             let principal = principal.clone();
             let database = database.clone();
             let joined = tokio::task::spawn_blocking(move || {
+                let quota = quota.report(&store)?;
                 let mut stats = store.storage_stats()?;
                 stats
                     .collections
@@ -3622,7 +3887,33 @@ async fn exec_inner(
                     stats.collections.iter().map(|item| item.total_bytes).sum();
                 let mut value = serde_json::to_value(stats).map_err(nonodb_core::Error::from)?;
                 value["database"] = json!(database);
+                value["quota"] = serde_json::to_value(quota).map_err(nonodb_core::Error::from)?;
                 Ok::<Value, ApiError>(value)
+            });
+            read_result(joined).await
+        }
+
+        Request::GetQuota => {
+            let store = state.store.clone();
+            let quota = state.quota.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                let report = quota.report(&store)?;
+                Ok::<Value, ApiError>(
+                    serde_json::to_value(report).map_err(nonodb_core::Error::from)?,
+                )
+            });
+            read_result(joined).await
+        }
+
+        Request::SetQuota { limits } => {
+            let store = state.store.clone();
+            let quota = state.quota.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                quota.set_limits(limits)?;
+                let report = quota.report(&store)?;
+                Ok::<Value, ApiError>(
+                    serde_json::to_value(report).map_err(nonodb_core::Error::from)?,
+                )
             });
             read_result(joined).await
         }
@@ -3680,6 +3971,7 @@ async fn exec_inner(
                 names.push(databases::DEFAULT_DATABASE.to_string());
                 names.sort();
             }
+            names.retain(|name| principal.can_see_database(name));
             respond(Ok(json!({
                 "default": databases::DEFAULT_DATABASE,
                 "databases": names,
@@ -3999,6 +4291,8 @@ async fn exec_inner(
                     field,
                     fields,
                     unique,
+                    sparse,
+                    partial_filter_expression,
                     include,
                     geo,
                 } => {
@@ -4016,6 +4310,8 @@ async fn exec_inner(
                         coll,
                         fields,
                         unique,
+                        sparse,
+                        partial_filter_expression,
                         include,
                         geo,
                     }
@@ -4040,6 +4336,8 @@ async fn exec_inner(
                             name: index.name,
                             directions: index.directions,
                             unique: index.unique,
+                            sparse: index.sparse,
+                            partial_filter_expression: index.partial_filter_expression,
                             include: index.include,
                             geo: index.geo,
                         });
@@ -4070,6 +4368,16 @@ async fn exec_inner(
                     metric: metric.unwrap_or_default(),
                 },
                 Request::Reindex { coll } => WriteReq::Reindex { coll },
+                Request::SetGraph { coll, def } => WriteReq::SetGraph { coll, def },
+                Request::DropGraph { coll } => WriteReq::DropGraph { coll },
+                Request::ReindexGraph { coll, online } => {
+                    if online {
+                        WriteReq::StartGraphRebuild { coll }
+                    } else {
+                        WriteReq::ReindexGraph { coll }
+                    }
+                }
+                Request::CancelGraphRebuild { coll } => WriteReq::CancelGraphRebuild { coll },
                 Request::DropVectorIndex { coll, field } => {
                     WriteReq::DropVectorIndex { coll, field }
                 }
@@ -4198,6 +4506,90 @@ fn audit_response(
             started.elapsed().as_secs_f64() * 1000.0,
             None,
         );
+    }
+}
+
+fn validate_lookup_input(by: &[String], values: &[Value]) -> Result<(), ApiError> {
+    if by.is_empty() || by.iter().any(String::is_empty) {
+        return Err(ApiError {
+            code: "invalid_query".to_string(),
+            message: "lookup field must not be empty".to_string(),
+        });
+    }
+    if values.len() > nonodb_core::MAX_LOOKUP_VALUES {
+        return Err(ApiError {
+            code: "invalid_query".to_string(),
+            message: format!(
+                "lookup accepts at most {} values",
+                nonodb_core::MAX_LOOKUP_VALUES
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn lookup_response(
+    coll: &str,
+    by: &[String],
+    report: nonodb_core::Result<(Vec<Option<Value>>, nonodb_core::LookupStats)>,
+    elapsed: std::time::Duration,
+    explain: bool,
+) -> Result<Value, ApiError> {
+    match report {
+        Ok((results, stats)) => {
+            let bytes_returned = if explain {
+                u64::try_from(
+                    serde_json::to_vec(&results)
+                        .map(|bytes| bytes.len())
+                        .unwrap_or_default(),
+                )
+                .unwrap_or_default()
+            } else {
+                stats.result_bytes
+            };
+            metrics::record_lookup(elapsed, &stats, bytes_returned, true, explain);
+            if explain {
+                let by = Value::Array(by.iter().cloned().map(Value::String).collect());
+                Ok(json!({
+                    "collection": coll,
+                    "by": by,
+                    "selected_index": stats.selected_index,
+                    "index": {
+                        "name": stats.selected_index,
+                        "fields": stats.index_fields,
+                        "include": stats.index_include,
+                        "primary": stats.primary,
+                        "unique": true,
+                    },
+                    "covering": stats.covering,
+                    "key_counts": {
+                        "requested": stats.requested_keys,
+                        "unique": stats.unique_keys,
+                        "duplicates": stats.requested_keys.saturating_sub(stats.unique_keys),
+                    },
+                    "found": stats.found,
+                    "missing": stats.missing,
+                    "documents_read": stats.documents_read,
+                    "index_entries_read": stats.index_entries_read,
+                    "bytes_read": stats.bytes_read,
+                    "bytes_returned": bytes_returned,
+                    "elapsed_ms": elapsed.as_secs_f64() * 1000.0,
+                }))
+            } else {
+                let found = results.iter().filter(|doc| doc.is_some()).count();
+                Ok(json!({ "results": results, "found": found }))
+            }
+        }
+        Err(err) => {
+            metrics::record_lookup(
+                elapsed,
+                &nonodb_core::LookupStats::default(),
+                0,
+                false,
+                explain,
+            );
+            Err(err.into())
+        }
     }
 }
 
@@ -4434,6 +4826,7 @@ fn cacheable(req: &Request) -> bool {
         Request::Find { .. }
             | Request::FindOne { .. }
             | Request::Lookup { .. }
+            | Request::ExplainLookup { .. }
             | Request::Explain { .. }
             | Request::Count { .. }
             | Request::Aggregate { .. }
@@ -4469,6 +4862,41 @@ fn search_all_response(out: nonodb_core::SearchAllResponse) -> Value {
             "sources": out.sources,
         }
     })
+}
+
+fn authorize_graph_edges(
+    store: &nonodb_core::Store,
+    principal: &nonodb_auth::Principal,
+    req: &Request,
+    database: &str,
+) -> Result<(), ApiError> {
+    let coll = match req {
+        Request::GetGraph { coll }
+        | Request::Traverse { coll, .. }
+        | Request::ShortestPath { coll, .. }
+        | Request::AllShortestPaths { coll, .. }
+        | Request::GraphMatch { coll, .. }
+        | Request::GraphAlgorithm { coll, .. }
+        | Request::Neighbors { coll, .. }
+        | Request::HybridSearch { coll, .. } => coll,
+        _ => return Ok(()),
+    };
+    let rtxn = store.read_txn()?;
+    let Some(collection) = store.collection_at(&rtxn, coll)? else {
+        return Ok(());
+    };
+    let Some(def) = collection.get_graph_in(&rtxn)? else {
+        return Ok(());
+    };
+    rtxn.commit()
+        .map_err(|err| ApiError::from(nonodb_core::Error::from(err)))?;
+    authz::allow_collection(
+        principal,
+        nonodb_auth::Action::Read,
+        database,
+        &def.edge_collection,
+        req.op_name(),
+    )
 }
 
 fn read_collection<'a>(
@@ -4639,20 +5067,81 @@ fn execute_read(
             fields,
             projection,
         } => {
+            let started = std::time::Instant::now();
+            let by = by
+                .unwrap_or(LookupBy::Field("_id".to_string()))
+                .into_fields();
+            let projection = lookup_projection(fields.as_deref(), projection.as_ref())?;
+            validate_lookup_input(&by, &values)?;
             let Some(c) = store.collection_at(rtxn, &coll)? else {
+                metrics::record_lookup(
+                    started.elapsed(),
+                    &nonodb_core::LookupStats::default(),
+                    0,
+                    true,
+                    false,
+                );
                 return Ok(json!({
                     "results": vec![Value::Null; values.len()],
                     "found": 0,
                 }));
             };
             reject_vault_read(&c, None, "lookup on vault collections")?;
+            let report = c.lookup_fields_report_in(rtxn, &by, &values, projection.as_ref());
+            lookup_response(&coll, &by, report, started.elapsed(), false)
+        }
+        Request::ExplainLookup {
+            coll,
+            by,
+            values,
+            fields,
+            projection,
+        } => {
+            let started = std::time::Instant::now();
             let by = by
                 .unwrap_or(LookupBy::Field("_id".to_string()))
                 .into_fields();
             let projection = lookup_projection(fields.as_deref(), projection.as_ref())?;
-            let results = c.lookup_fields_in(rtxn, &by, &values, projection.as_ref())?;
-            let found = results.iter().filter(|doc| doc.is_some()).count();
-            Ok(json!({ "results": results, "found": found }))
+            validate_lookup_input(&by, &values)?;
+            let Some(c) = store.collection_at(rtxn, &coll)? else {
+                let stats = nonodb_core::LookupStats {
+                    requested_keys: values.len(),
+                    missing: values.len(),
+                    selected_index: "_id_".to_string(),
+                    index_fields: by.clone(),
+                    primary: true,
+                    ..nonodb_core::LookupStats::default()
+                };
+                metrics::record_lookup(started.elapsed(), &stats, 0, true, true);
+                return Ok(json!({
+                    "collection": coll,
+                    "by": by,
+                    "selected_index": stats.selected_index,
+                    "index": {
+                        "name": stats.selected_index,
+                        "fields": stats.index_fields,
+                        "include": stats.index_include,
+                        "primary": stats.primary,
+                        "unique": true,
+                    },
+                    "covering": false,
+                    "key_counts": {
+                        "requested": stats.requested_keys,
+                        "unique": 0,
+                        "duplicates": 0,
+                    },
+                    "found": 0,
+                    "missing": stats.missing,
+                    "documents_read": 0,
+                    "index_entries_read": 0,
+                    "bytes_read": 0,
+                    "bytes_returned": 0,
+                    "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0,
+                }));
+            };
+            reject_vault_read(&c, None, "explain_lookup on vault collections")?;
+            let report = c.lookup_fields_report_in(rtxn, &by, &values, projection.as_ref());
+            lookup_response(&coll, &by, report, started.elapsed(), true)
         }
         Request::Explain {
             coll,
@@ -4774,6 +5263,10 @@ fn execute_read(
             code: "invalid_query".into(),
             message: "database_stats is not supported inside a read batch".into(),
         }),
+        Request::GetQuota | Request::SetQuota { .. } => Err(ApiError {
+            code: "invalid_query".into(),
+            message: "quota operations are not supported inside a read batch".into(),
+        }),
         Request::ListSubscriptions { coll } => {
             let list = store.list_subscriptions(&coll)?;
             Ok(json!({ "subscriptions": list }))
@@ -4793,6 +5286,8 @@ fn execute_read(
                         "field": d.name(),
                         "fields": d.effective_fields(),
                         "unique": d.unique,
+                        "sparse": d.sparse,
+                        "partial_filter_expression": d.partial_filter_expression,
                         "include": d.include,
                         "format": d.format,
                         "geo": d.geo,
@@ -5053,6 +5548,8 @@ pub(crate) fn error_status(err: &ApiError) -> StatusCode {
         | "invalid_collection_profile" => StatusCode::BAD_REQUEST,
         "not_found" => StatusCode::NOT_FOUND,
         "database_limit" => StatusCode::SERVICE_UNAVAILABLE,
+        "database_busy" => StatusCode::CONFLICT,
+        "wal_full" | "quota_exceeded" => StatusCode::INSUFFICIENT_STORAGE,
         "unsafe_durability_disabled" => StatusCode::BAD_REQUEST,
         "unauthorized" => StatusCode::UNAUTHORIZED,
         "forbidden" | "read_only" => StatusCode::FORBIDDEN,

@@ -10,6 +10,7 @@ quick-start instructions, and a feature overview.
 | [Getting started](getting-started.md) | New users | Docker Compose, prebuilt binary, build from source, first document, configuration basics |
 | [Architecture](architecture.md) | Maintainers, advanced users | Process model, LMDB layout, write path, indexes, search, aggregation, crash safety |
 | [Multiple databases](multi-database.md) | Operators, application developers | Separate LMDB environments, URL routing, create/drop, CLI, GUI, migration, backup |
+| [Per-database quotas](quotas.md) | Operators, SRE | Data/index/history/sidecar accounting, soft warnings, hard write rejection, CLI |
 | [Adaptive writer](adaptive-writer.md) | Operators, performance reviewers | Adaptive group-commit window, latency/throughput tuning, metrics and limits |
 | [GUI console](gui.md) | Operators, application developers | Embedded local React console, data editing, collection settings, SQL, map/metrics |
 | [HTTP API](api.md) | All client authors | Operations, request/response formats, filters, updates, aggregation, errors |
@@ -32,6 +33,8 @@ quick-start instructions, and a feature overview.
 | [Outbox events](events.md) | Application developers, operators | Atomic data + events, automatic collection events, source-side filters, polling consumers, checkpoints, event worker CLI, TTL, systemd |
 | [Conditional subscriptions](subscriptions.md) | Application developers | Conditions over collection state, count thresholds, edge-triggered mode, events, clients |
 | [Search and Atlas compatibility](search.md) | Application developers | Unified `search_all`, BM25, fuzzy, vector, hybrid RRF, and Atlas migration |
+| [Graph traversal](graph.md) | Application developers | Nodes and edges as documents, adjacency index, BFS/DFS, shortest/all-shortest paths, pattern matching, PageRank/degree/components, filters, hybrid search, online rebuild, GUI tree, limits |
+| [Graph benchmark](graph-benchmark.md) | Evaluators, maintainers | NonoDB vs Neo4j Community: dataset, methodology, results, caveats, reproduction |
 | [Streaming outbox events](streams.md) | Application developers | Long-poll `watch`, NDJSON/SSE streams, resume tokens, filters, truncation, Python/Rust/Node.js/Go examples |
 | [Asynchronous webhooks](webhooks.md) | Application developers, operators | Webhook rules, async filters and count/sum/avg thresholds, retries, HMAC, dead-letter, GUI |
 | [CLI](cli.md) | Operators | Administration, map resize, backup verification, restore drills, inspect, raw requests |
@@ -60,6 +63,7 @@ quick-start instructions, and a feature overview.
 - **Run several databases in one daemon:** [Multiple databases](multi-database.md)
 - **Open the local GUI:** [GUI console](gui.md)
 - **Pick a client:** [Clients](clients.md) — Python, Rust, Node.js, Go
+- **Traverse relationships:** [Graph traversal](graph.md)
 - **Connect with a MongoDB driver:** [MongoDB compatibility](mongodb-compatibility.md)
 - **Rehearse with MongoDB shadow mode:** [MongoDB wire shadow mode](mongodb-shadow.md)
 - **Run a SQL query or simple write:** [SQL queries](sql.md)

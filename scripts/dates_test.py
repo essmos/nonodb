@@ -121,13 +121,85 @@ def main() -> None:
         ),
     )
 
+    # IANA time zones follow daylight-saving transitions.
+    rows = c.aggregate(
+        [
+            {"$match": {"_id": "warsaw"}},
+            {
+                "$project": {
+                    "_id": 0,
+                    "winter": {
+                        "$dateToString": {
+                            "date": "$at",
+                            "format": "%Y-%m-%d %H:%M %z",
+                            "timezone": "Europe/Warsaw",
+                        }
+                    },
+                    "summer": {
+                        "$dateToString": {
+                            "date": {"$date": "2024-07-15T12:00:00Z"},
+                            "format": "%Y-%m-%d %H:%M %z",
+                            "timezone": "Europe/Warsaw",
+                        }
+                    },
+                    "next_day": {
+                        "$dateAdd": {
+                            "startDate": {"$date": "2024-03-30T12:00:00Z"},
+                            "unit": "day",
+                            "amount": 1,
+                            "timezone": "Europe/Warsaw",
+                        }
+                    },
+                    "truncated": {
+                        "$dateTrunc": {
+                            "date": {"$date": "2024-03-30T23:30:00Z"},
+                            "unit": "day",
+                            "timezone": "Europe/Warsaw",
+                        }
+                    },
+                    "parsed": {
+                        "$dateFromString": {
+                            "dateString": "2024-07-15 12:00:00",
+                            "format": "%Y-%m-%d %H:%M:%S",
+                            "timezone": "Europe/Warsaw",
+                        }
+                    },
+                    "parts": {
+                        "$dateToParts": {
+                            "date": {"$date": "2024-07-15T10:00:00Z"},
+                            "timezone": "Europe/Warsaw",
+                        }
+                    },
+                }
+            },
+        ]
+    )
+    assert rows == [
+        {
+            "winter": "2026-01-01 01:00 +0100",
+            "summer": "2024-07-15 14:00 +0200",
+            "next_day": {"$date": {"$numberLong": "1711882800000"}},
+            "truncated": {"$date": {"$numberLong": "1711839600000"}},
+            "parsed": {"$date": {"$numberLong": "1721037600000"}},
+            "parts": {
+                "year": 2024,
+                "month": 7,
+                "day": 15,
+                "hour": 12,
+                "minute": 0,
+                "second": 0,
+                "millisecond": 0,
+            },
+        }
+    ], rows
+
     expect(
         "invalid_date",
         lambda: c.insert({"_id": "naive", "at": {"$date": "2026-01-01T00:00:00"}}),
     )
     assert c.find_one({"_id": "naive"}) is None
 
-    print("OK: dates, offsets, ranges, indexes, sorting, unique, invalid_date")
+    print("OK: dates, offsets, ranges, indexes, sorting, unique, IANA/DST, invalid_date")
     db.close()
 
 

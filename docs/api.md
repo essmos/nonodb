@@ -144,6 +144,10 @@ support only a restricted subset of operations. See
 | `lookup` result budget | 64 MiB (`result_too_large`) |
 | Fuzzy candidates | 5,000 per query |
 | Vector dimensions | 1–65,536 |
+| Graph `start` ids | 10,000 |
+| Graph `max_depth` | 64 |
+| Graph `limit_nodes` / `limit_edges` | defaults 1,000 / 10,000 |
+| Graph result budget | 64 MiB (`truncated` instead of an error) |
 | `write_batch` operations | bounded by request size |
 | LMDB named databases | 1024 (`MDB_DBS_FULL` when exhausted) |
 
@@ -163,6 +167,20 @@ client timeout with `NONODB_TIMEOUT` or the `timeout=` argument.
 | [`find`](#find) | Query documents |
 | [`find_one`](#find_one) | Return one document |
 | [`lookup`](#lookup) | Ordered point lookups by `_id` or a unique index |
+| [`explain_lookup`](#explain_lookup) | Index, coverage, and counters for a lookup |
+| [`set_graph`](#graph) | Configure a graph and rebuild adjacency |
+| [`get_graph`](#graph) | Read the graph definition |
+| [`drop_graph`](#graph) | Remove a graph definition and adjacency |
+| [`reindex_graph`](#graph) | Rebuild graph adjacency (sync or online) |
+| [`graph_rebuild_status`](#graph) | Read online rebuild progress |
+| [`cancel_graph_rebuild`](#graph) | Discard an online rebuild |
+| [`traverse`](#graph) | BFS/DFS traversal with a tree or flat result |
+| [`neighbors`](#graph) | One-hop filtered neighbors |
+| [`hybrid_search`](#graph) | Vector + graph rerank |
+| [`shortest_path`](#graph) | BFS or weighted shortest path |
+| [`all_shortest_paths`](#graph) | Every shortest path with bounded output |
+| [`graph_match`](#graph) | Linear variable-length pattern matching |
+| [`graph_algorithm`](#graph) | PageRank, degree centrality, connected components |
 | [`watch`](#watch) | Long-poll append-only events by sortable `_id` |
 | [`explain`](#explain) | Show the selected plan, bounds, and actual counts |
 | [`update`](#update) | Update or upsert documents |
@@ -196,7 +214,9 @@ client timeout with `NONODB_TIMEOUT` or the `timeout=` argument.
 | [`history`](#document-history) | List revisions of one document |
 | [`get_version`](#document-history) | Read one exact document revision |
 | [`list_collections`](#list_collections) | List known collections |
-| [`database_stats`](#database_stats) | Record counts and storage estimates per collection |
+| [`database_stats`](#database_stats) | Record counts, storage estimates, and quota status per collection |
+| [`get_quota`](#get_quota) | Read storage usage and limits for this database |
+| [`set_quota`](#set_quota) | Replace storage limits for this database |
 | [`create_collection`](#create_collection) | Create a standard or vault collection |
 | [`drop_collection`](#drop_collection) | Drop a collection and its resources |
 | [`set_collection_ttl`](#document-ttl) | Set or clear insertion-based collection TTL |
@@ -433,8 +453,73 @@ Semantics:
   or use a smaller projection.
 - `lookup` does not accept `filter`, `sort`, `skip`, or `limit`. Use `find` for
   arbitrary predicates.
+- Field, value-count, and projection validation happens before collection
+  resolution, so it is identical in read batches and for missing collections.
 - Non-unique lookups and lookups without a matching index are not supported yet.
 - Vault collections reject `lookup`.
+
+## explain_lookup
+
+Returns the plan and exact execution counters for a lookup without returning
+the looked-up documents. It accepts the same `by`, `values`, `fields`, and
+`projection` fields as [`lookup`](#lookup), and the same validation applies.
+
+```json
+{
+  "op": "explain_lookup",
+  "coll": "users",
+  "by": "email",
+  "values": ["ada@example.com", "missing@example.com", "ada@example.com"],
+  "fields": ["name", "status"]
+}
+```
+
+Response:
+
+```json
+{
+  "ok": true,
+  "result": {
+    "collection": "users",
+    "by": ["email"],
+    "selected_index": "email",
+    "index": {
+      "name": "email",
+      "fields": ["email"],
+      "include": ["name", "status"],
+      "primary": false,
+      "unique": true
+    },
+    "covering": true,
+    "key_counts": {"requested": 3, "unique": 2, "duplicates": 1},
+    "found": 2,
+    "missing": 1,
+    "documents_read": 0,
+    "index_entries_read": 2,
+    "bytes_read": 96,
+    "bytes_returned": 74,
+    "elapsed_ms": 0.184
+  }
+}
+```
+
+Fields:
+
+| Field | Meaning |
+|---|---|
+| `selected_index` | `_id_` for the primary key, otherwise the secondary index name |
+| `index` | Index name, fields, covering `include` fields, primary flag, and uniqueness |
+| `covering` | Whether the projection was served from index data without document reads. `_id`-only projections are always covering |
+| `key_counts` | Requested keys, distinct keys after deduplication, and duplicate inputs |
+| `found` / `missing` | Non-null and null results, counted in input order including duplicates |
+| `documents_read` | Documents fetched from the main collection |
+| `index_entries_read` | Index entries examined while resolving keys |
+| `bytes_read` | Stored document or index-value bytes read |
+| `bytes_returned` | Serialized size of the lookup results that would be returned |
+| `elapsed_ms` | Lookup execution time, excluding HTTP transport and response encoding |
+
+`explain_lookup` is a read operation and requires the same `read:<db>/<coll>`
+scope as `lookup`. It is also accepted inside a read batch.
 
 ## watch
 
@@ -1305,19 +1390,23 @@ Supported clauses and limitations are documented in [SQL queries](sql.md):
 - `WHERE` with comparisons, `AND`/`OR`/`NOT`, parentheses, `IN`, `BETWEEN`,
   `IS NULL`, and `LIKE`;
 - `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, and `OFFSET`;
-- aggregate functions `COUNT`, `COUNT(DISTINCT field)`, `SUM`, `AVG`, `MIN`, and
-  `MAX`;
+- aggregate functions `COUNT`, `SUM`, `AVG`, `MIN`, and `MAX`, including their
+  `DISTINCT` forms;
 - positional parameters with `?` or `$1`;
 - one collection, no joins or subqueries;
-- `INSERT INTO collection (columns...) VALUES (...)` with one or more rows;
-- `UPDATE collection SET column = value... [WHERE ...]`, including expressions;
-- `DELETE FROM collection [WHERE ...]`.
+- `INSERT INTO collection (columns...) VALUES (...) [RETURNING ...]` with one or
+  more rows;
+- `UPDATE collection SET column = value... [WHERE ...] [RETURNING ...]`,
+  including expressions;
+- `DELETE FROM collection [WHERE ...] [RETURNING ...]`.
 
 Simple field-only selects use the normal `find` path. Grouping, `DISTINCT`,
 computed expressions, and `HAVING` use the aggregation pipeline. `INSERT`, `UPDATE`, and
 `DELETE` run through the single writer in one isolated LMDB transaction and
 return `inserted`/`inserted_ids`, `matched`/`modified`, or `deleted` inside
-`results`.
+`results`. `RETURNING *` or a field/expression list adds a `returned` array with
+the inserted or updated documents, or the documents as they were before a
+delete. Aggregate functions are not allowed in `RETURNING`.
 
 `SELECT` is read-only and can be used in a read `batch`; write statements are
 rejected there. `SELECT` requires `read:<collection>`, while `INSERT`, `UPDATE`, and `DELETE`
@@ -1524,13 +1613,13 @@ The expression evaluator supports comparison and boolean operators, arithmetic
 `$split`, `$indexOfCP`, `$trim`/`$ltrim`/`$rtrim`), `$regexMatch`, `$min`,
 `$max`, `$type`, and `$literal`. Date operators are `$dateAdd`,
 `$dateSubtract`, `$dateDiff`, `$dateTrunc`, `$dateToString`, `$dateFromString`,
-`$dateFromParts`, and `$dateToParts`; time zones use UTC or fixed offsets such
-as `+02:00`. Variables use `$$name` or `$$name.path` syntax inside `$let`,
-`$map`, `$filter`, and `$reduce`.
+`$dateFromParts`, and `$dateToParts`; time zones use UTC, fixed offsets such as
+`+02:00`, or IANA identifiers such as `Europe/Warsaw`. Variables use `$$name`
+or `$$name.path` syntax inside `$let`, `$map`, `$filter`, and `$reduce`.
 
 `$dateFromString` accepts RFC 3339, custom formats such as `%d/%m/%Y %H:%M:%S`,
-and naive input when `timezone` is provided. IANA time zone identifiers are not
-supported.
+and naive input when `timezone` is provided. IANA zones apply daylight-saving
+transitions for date arithmetic and formatting.
 
 Regex operands are accepted inside `$in`, `$nin`, and `$all`:
 
@@ -1826,7 +1915,7 @@ Response:
 ```
 
 Each entry accepts either `field` or `fields`, plus optional `name`,
-`directions`, `unique`, and `include`. Use this for migrations that add
+`directions`, `unique`, `sparse`, `partial_filter_expression`, and `include`. Use this for migrations that add
 multiple indexes at once; it avoids re-reading and re-parsing the whole
 collection for every index.
 
@@ -1834,6 +1923,19 @@ Rules:
 
 - Provide either `field` (single) or `fields` (ordered list). `fields` is
   preferred for new code.
+- Without `sparse`, a missing field is indexed as `null`; a plain unique index
+  therefore allows only one document with that key absent or `null`.
+- `sparse: true` omits documents where a single-field key is absent. A compound
+  sparse index stores `null` for absent fields and omits a document only when
+  every key is absent. Missing fields are not treated as `null` for sparse
+  unique checks.
+- `partial_filter_expression` is a document using the normal query language. A
+  document is indexed only when it matches the expression. A partial index is
+  used only when the query explicitly includes the same predicate (equality,
+  `$eq`, or `$in`); otherwise NonoDB falls back to a collection scan. A hint
+  that selects a partial index without its predicate fails instead of silently
+  returning incomplete results. `$where`, `$text`, `$expr`, and `$jsonSchema`
+  are rejected in partial filters.
 - Without `name`, the index name is the fields joined by `+`. A supplied
   MongoDB-style name is stored and returned by `list_indexes`.
 - `directions` is optional; when present it must contain one `1` or `-1` per
@@ -1852,6 +1954,16 @@ Rules:
   that means the combination, not each field individually. A unique multikey
   index accepts repeated elements within the same document (`tags: ["x","x"]`)
   but rejects the same key in another document.
+- A sparse index omits documents where the key is absent. For a single-field
+  index this means many documents may omit the field, and a unique sparse index
+  only checks documents where it is present. A compound sparse index stores
+  `null` for absent fields and omits a document only when every key is absent.
+- `partial_filter_expression` indexes only documents matching the expression.
+  Unique partial indexes allow duplicates outside the predicate. The planner
+  uses a partial index only when the query explicitly repeats the predicate
+  with equality, `$eq`, or `$in`; otherwise it falls back to a collection scan.
+  Hints that omit the predicate fail instead of returning incomplete results.
+  `$where`, `$text`, `$expr`, and `$jsonSchema` are rejected.
 - Creating an index on an existing collection performs a synchronous backfill.
   Writers are blocked while the backfill write transaction is active.
 - `include` copies extra fields into index values for covering projections.
@@ -2011,6 +2123,8 @@ Response:
         "field": "email",
         "fields": ["email"],
         "unique": true,
+        "sparse": true,
+        "partial_filter_expression": null,
         "include": [],
         "format": 5,
         "geo": false,
@@ -2022,6 +2136,7 @@ Response:
 }
 ```
 
+`partial_filter_expression` is `null` when the index is not partial.
 `multikey_fields` lists indexed fields that produced array entries.
 `multikey_all_docs` is `true` only while every document has at least one entry,
 which is required for an index to provide multikey sort order.
@@ -2207,6 +2322,63 @@ Semantics:
   Vector writes are tracked in a small LMDB delta and merged into unfiltered
   ANN queries. After 4,096 changed ids, queries use the exact index until the
   sidecar is rebuilt.
+
+## Graph
+
+Graphs are ordinary node and edge documents plus a native adjacency index. Full
+semantics, limits, and examples are in [Graph traversal](graph.md). The
+operations are:
+
+| `op` | Purpose |
+|---|---|
+| `set_graph` | Create/replace a definition and rebuild adjacency |
+| `get_graph` | Read the definition (`null` when absent) |
+| `drop_graph` | Remove the definition and clear adjacency |
+| `reindex_graph` | Rebuild adjacency synchronously or start an online rebuild |
+| `graph_rebuild_status` | Read online rebuild progress |
+| `cancel_graph_rebuild` | Discard an in-progress online rebuild |
+| `traverse` | BFS/DFS traversal with filters, projection, and vector seed |
+| `neighbors` | One-hop filtered neighbors |
+| `hybrid_search` | Vector seed + graph rerank |
+| `shortest_path` | BFS hops or Dijkstra over edge weights |
+| `all_shortest_paths` | Every shortest path, capped by `limit_paths`/`limit_nodes` |
+| `graph_match` | Linear variable-length pattern with per-step filters |
+| `graph_algorithm` | PageRank, degree centrality, or weakly connected components |
+
+```json
+{"op":"traverse","coll":"nodes","start":["alice"],
+ "direction":"out","labels":["KNOWS"],"max_depth":2,
+ "algorithm":"bfs","tree":true}
+```
+
+Every traversal runs in one read snapshot. A node is expanded once; repeated
+arrivals are marked with `"cycle":true`. Results include `nodes`, `edges`,
+`truncated`, and `missing`. `start` and `seed` are mutually exclusive.
+`edge_filter`, `node_filter`, `as_of`, and `projection` are supported.
+Adjacency values store only a compact summary; full edge documents are fetched
+for `include_edges` or `edge_filter`.
+
+`neighbors` returns one-hop `{node, via}` entries. `hybrid_search` combines
+vector scores with graph proximity and returns deterministic
+`score`/`vector_score`/`graph_score` values. Online rebuilds keep the active
+generation readable and mirror edge writes into the target generation until an
+atomic swap.
+
+```json
+{"op":"shortest_path","coll":"nodes","start":"alice","target":"carol",
+ "weighted":true,"max_depth":8}
+```
+
+`all_shortest_paths` returns all shortest paths with `limit_paths` and
+`limit_nodes`; `weighted:true` uses Dijkstra. `graph_match` takes a `pattern`
+array of `{direction, labels, min_hops, max_hops, edge_filter, node_filter}`
+segments. `graph_algorithm` takes `kind` = `pagerank`, `degree_centrality`, or
+`connected_components`, bounded by `limit` and `max_nodes`.
+
+Graph configuration requires admin scope on both collections; graph reads
+require a read scope on the node **and** edge collections. Vault collections are
+rejected as node or edge collections. The MongoDB
+wire listener does not expose graph operations.
 
 ## vector_search
 
@@ -2614,7 +2786,7 @@ Response:
 
 Rules:
 
-- Allowed operations: `find`, `find_one`, `lookup`, `count`, `list_indexes`,
+- Allowed operations: `find`, `find_one`, `lookup`, `explain_lookup`, `count`, `list_indexes`,
   `list_text_indexes`, `list_fuzzy_indexes`, `list_vector_indexes`,
   `list_collections`, `history`, `get_version`, `search`, `fuzzy`,
   `vector_search`.
@@ -2813,6 +2985,66 @@ Response:
 Standard collections are created on first write. Vault collections should be
 created explicitly with `create_collection`.
 
+## get_quota
+
+```json
+{"op": "get_quota"}
+```
+
+Returns usage and limits for the selected database. The read requires no
+database-admin scope.
+
+```json
+{
+  "ok": true,
+  "result": {
+    "database": "app1",
+    "limits": {"data_bytes": 21474836480},
+    "usage": {
+      "data_bytes": 19327352832,
+      "index_bytes": 2097152,
+      "history_bytes": 0,
+      "sidecar_bytes": 1048576
+    },
+    "status": "warning",
+    "soft_limit_percent": 80,
+    "warnings": [
+      {
+        "resource": "data",
+        "used_bytes": 19327352832,
+        "limit_bytes": 21474836480,
+        "used_percent": 90,
+        "severity": "warning",
+        "message": "data usage is 19327352832 of 21474836480 bytes (90%)"
+      }
+    ]
+  }
+}
+```
+
+`status` is `ok`, `warning`, or `exceeded`. See
+[Per-database quotas](quotas.md) for measurement and limits.
+
+## set_quota
+
+```json
+{
+  "op": "set_quota",
+  "limits": {
+    "data_bytes": 21474836480,
+    "index_bytes": 5368709120,
+    "history_bytes": 2147483648,
+    "sidecar_bytes": 5368709120
+  }
+}
+```
+
+Replaces the saved limits for this database and returns the same report as
+`get_quota`. Omitted fields, `null`, and `0` mean unlimited. Requires a
+database administrator scope. When a growing write would cross a hard limit it
+fails with `quota_exceeded` and HTTP `507`; deletes, drops, and pruning remain
+allowed.
+
 ## database_stats
 
 ```json
@@ -2858,7 +3090,8 @@ estimated from shared history/TTL keys and values. `requests_last_minute` is a
 rolling 60-second request count and `avg_requests_per_second` is that count
 divided by 60. `used_bytes` is the LMDB file high-water mark and can exceed the
 sum of collection totals because LMDB keeps freed pages and does not shrink the
-file.
+file. The response also contains a `quota` object with the same fields as
+`get_quota`.
 
 ### Vault operation summary
 
@@ -2924,7 +3157,7 @@ additive.
 ```json
 {
   "schema_version": 1,
-  "server_version": "0.30.0",
+  "server_version": "0.32.0",
   "api": {"http_json": true, "mongodb_wire": true, "sql": true},
   "features": {
     "search": {"search_all": true, "modes": ["lexical", "fuzzy", "vector", "hybrid"]},
@@ -2959,7 +3192,7 @@ Authenticated admin endpoint. Returns the daemon's real listener state:
 {
   "ok": true,
   "result": {
-    "version": "0.30.0",
+    "version": "0.32.0",
     "tcp": {"configured": "0.0.0.0:7902", "bound": "0.0.0.0:7902", "tls": false},
     "unix": "/run/nonodb.sock",
     "advertise_url": "http://10.0.0.10:7902"
@@ -3400,6 +3633,9 @@ collection, op, id, and before/after documents. Replicas reject stale epochs. Re
 | `invalid_query` | 400 | Invalid filter/update/index/query shape, write in a read batch, unsupported operator |
 | `unsafe_durability_disabled` | 400 | `durability:"unsafe"` without `NONODB_ALLOW_UNSAFE_WRITES=1` |
 | `database_limit` | 503 | Too many open databases and no idle environment can be evicted |
+| `database_busy` | 409 | Restore-in-place could not obtain exclusive access; close clients and retry |
+| `wal_full` | 507 | PITR WAL reached its size or age limit; reads continue until snapshot retention frees covered history |
+| `quota_exceeded` | 507 | A growing write would cross a database data/index/history/sidecar quota; deletes, drops, and pruning remain allowed |
 | `invalid_sql` | 400 | SQL parse/planning error or unsupported SQL clause |
 | `invalid_json` | 400 | Malformed JSON document or value |
 | `invalid_collection` | 400 | Invalid collection name |
@@ -3412,6 +3648,8 @@ collection, op, id, and before/after documents. Replicas reject stale epochs. Re
 | `invalid_numeric` | 400 | Invalid Extended JSON number or decimal arithmetic overflow |
 | `invalid_binary` | 400 | Invalid `$binary`/`$uuid` payload or base64 |
 | `invalid_object_id` | 400 | `$oid` is not 24 hexadecimal characters |
+| `invalid_timestamp` | 400 | `$timestamp` does not contain valid u32 `t` and `i` fields |
+| `invalid_regex` | 400 | `$regularExpression` is malformed or has unsupported options |
 | `invalid_auth_request` | 400/409 | Invalid auth mutation, referenced principal, or last-admin protection |
 | `auth_disabled` | 400 | Authorization registry is not configured |
 | `unauthorized` | 401 | Missing/invalid/disabled credential |

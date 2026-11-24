@@ -279,6 +279,26 @@ impl Principal {
             .any(|rule| matches!(rule, ScopeRule::All | ScopeRule::AdminDatabase))
     }
 
+    /// Database-level administration for one database.
+    ///
+    /// Instance-wide `admin:db`/`*:*` grants apply to every database. A
+    /// database-qualified collection wildcard such as `admin:app1/*` grants
+    /// administration only for `app1`; it does not grant instance-wide
+    /// database creation, authorization management, or metrics.
+    pub fn allows_database_admin(&self, database: &str) -> bool {
+        self.scopes.iter().any(|rule| match rule {
+            ScopeRule::All | ScopeRule::AdminDatabase => true,
+            ScopeRule::AdminCollection(resource) => {
+                resource.collection == "*"
+                    && resource
+                        .database
+                        .as_deref()
+                        .is_some_and(|scope| scope == "*" || scope == database)
+            }
+            _ => false,
+        })
+    }
+
     /// Metrics are instance-wide and reveal cross-collection load. They require
     /// an explicit `metrics:read`, `admin:db`, or `*:*` grant.
     pub fn allows_metrics(&self) -> bool {
@@ -823,6 +843,18 @@ mod tests {
 
         let metrics = Principal::new("metrics", &["metrics:read".into()]).unwrap();
         assert!(!metrics.can_see_database("app1"));
+
+        let database_admin = Principal::new("dbadmin", &["admin:app1/*".into()]).unwrap();
+        assert!(database_admin.allows_database_admin("app1"));
+        assert!(!database_admin.allows_database_admin("app2"));
+        assert!(!database_admin.allows_admin_database());
+        assert!(database_admin.can_see_database("app1"));
+        assert!(!database_admin.can_see_database("app2"));
+
+        let instance_admin = Principal::new("root", &["admin:db".into()]).unwrap();
+        assert!(instance_admin.allows_database_admin("anything"));
+        let wildcard = Principal::new("wild", &["admin:*/*".into()]).unwrap();
+        assert!(wildcard.allows_database_admin("anything"));
     }
 
     #[test]

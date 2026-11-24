@@ -974,6 +974,34 @@ pub struct WatchBatch {
 }
 
 /// A handle for one collection.
+/// Options for [`Collection::lookup_join`].
+#[derive(Debug, Clone)]
+pub struct LookupJoinOptions<'a> {
+    /// Foreign field or unique-index field list passed to `lookup`.
+    pub foreign_by: &'a str,
+    /// Field added to each returned local document.
+    pub as_field: &'a str,
+    /// Inclusive projection for the foreign documents.
+    pub fields: Option<&'a [String]>,
+    /// Flat projection for the foreign documents. Mutually exclusive with
+    /// `fields`.
+    pub projection: Option<&'a Value>,
+    /// Maximum keys per lookup request; 1 to 10,000.
+    pub chunk_size: usize,
+}
+
+impl<'a> Default for LookupJoinOptions<'a> {
+    fn default() -> Self {
+        Self {
+            foreign_by: "_id",
+            as_field: "joined",
+            fields: None,
+            projection: None,
+            chunk_size: 1000,
+        }
+    }
+}
+
 pub struct Collection<'a> {
     client: &'a Client,
     name: String,
@@ -1225,6 +1253,91 @@ impl Collection<'_> {
             "projection": projection,
         }))?;
         value_array(result.get("results").cloned().unwrap_or(Value::Null))
+    }
+
+    /// Ordered lookups split into bounded requests.
+    ///
+    /// The concatenated result has the same length and order as `values`, with
+    /// `Value::Null` for missing keys. `chunk_size` must be between 1 and
+    /// 10,000.
+    pub fn lookup_chunked<V: Serialize>(
+        &self,
+        by: &str,
+        values: &[V],
+        fields: Option<&[String]>,
+        chunk_size: usize,
+    ) -> Result<Vec<Value>> {
+        self.lookup_with_chunked(&[by], values, fields, None, chunk_size)
+    }
+
+    /// General ordered lookup split into bounded requests.
+    pub fn lookup_with_chunked<V: Serialize>(
+        &self,
+        by: &[&str],
+        values: &[V],
+        fields: Option<&[String]>,
+        projection: Option<&Value>,
+        chunk_size: usize,
+    ) -> Result<Vec<Value>> {
+        if !(1..=10_000).contains(&chunk_size) {
+            return Err(Error::Config(
+                "lookup chunk_size must be between 1 and 10000".to_string(),
+            ));
+        }
+        let mut out = Vec::with_capacity(values.len());
+        for chunk in values.chunks(chunk_size) {
+            out.extend(self.lookup_with(by, chunk, fields, projection)?);
+        }
+        Ok(out)
+    }
+
+    /// Attach matching foreign documents to local documents.
+    ///
+    /// Keys are read from `local_field` in each input object and looked up in
+    /// `foreign` with [`lookup_with_chunked`](Self::lookup_with_chunked). The
+    /// result preserves input order and length. Missing keys, or keys without a
+    /// foreign match, receive `Value::Null` in `options.as_field`. Input
+    /// documents are copied, not modified.
+    pub fn lookup_join(
+        &self,
+        foreign: &Collection<'_>,
+        docs: &[Value],
+        local_field: &str,
+        options: LookupJoinOptions<'_>,
+    ) -> Result<Vec<Value>> {
+        if local_field.is_empty() {
+            return Err(Error::Config(
+                "lookup_join local_field must not be empty".to_string(),
+            ));
+        }
+        if options.as_field.is_empty() {
+            return Err(Error::Config(
+                "lookup_join as_field must not be empty".to_string(),
+            ));
+        }
+        let mut keys = Vec::with_capacity(docs.len());
+        for doc in docs {
+            let object = doc.as_object().ok_or_else(|| {
+                Error::Config("lookup_join documents must be objects".to_string())
+            })?;
+            keys.push(object.get(local_field).cloned().unwrap_or(Value::Null));
+        }
+        let matches = foreign.lookup_with_chunked(
+            &[options.foreign_by],
+            &keys,
+            options.fields,
+            options.projection,
+            options.chunk_size,
+        )?;
+        let mut out = Vec::with_capacity(docs.len());
+        for (doc, matched) in docs.iter().zip(matches) {
+            let mut object = doc.as_object().cloned().ok_or_else(|| {
+                Error::Config("lookup_join documents must be objects".to_string())
+            })?;
+            object.insert(options.as_field.to_string(), matched);
+            out.push(Value::Object(object));
+        }
+        Ok(out)
     }
 
     /// Returns one document by `_id` or a unique index.

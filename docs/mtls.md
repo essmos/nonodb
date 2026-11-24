@@ -114,6 +114,13 @@ export NONODB_TLS_CLIENT_AUTH=required
 | `NONODB_TLS_KEY` | PEM server private key |
 | `NONODB_TLS_CLIENT_CA` | PEM CA bundle used to verify client certificates |
 | `NONODB_TLS_CLIENT_AUTH` | `required`, `optional`, or `off` |
+| `NONODB_TLS_CRL_FILE` | Comma-separated CRL files for client certificates |
+| `NONODB_TLS_CRL_URL` | Comma-separated CRL URLs refreshed on the revocation interval |
+| `NONODB_TLS_OCSP_URL` | OCSP responder URL for client certificates |
+| `NONODB_TLS_REVOCATION_FAIL_MODE` | `closed` (default) or `open` when no source can decide |
+| `NONODB_TLS_REVOCATION_REFRESH_SECS` | CRL refresh interval, default `300` |
+| `NONODB_TLS_OCSP_CACHE_SECS` | OCSP result cache, default `300` |
+| `NONODB_TLS_REVOCATION_TIMEOUT_SECS` | CRL/OCSP HTTP timeout, default `5` |
 | `NONODB_AUTH_FILE` | Token and certificate registry; mandatory for TCP |
 
 `NONODB_TLS_CLIENT_AUTH` defaults to `required` when a client CA is configured
@@ -153,10 +160,71 @@ NONODB_TLS_CLIENT_KEY=/etc/nonodb/tls/acme-app.key
 
 ## Revocation and rotation
 
+A certificate must pass all configured checks:
+
+1. the CA chain and `clientAuth` usage;
+2. the CRL and/or OCSP revocation check, when configured;
+3. the fingerprint registry entry in `NONODB_AUTH_FILE` and its principal's
+   scopes.
+
+The registry remains the fastest path: disabling a certificate blocks both new
+handshakes and further requests on existing keep-alive connections within about
+one second.
+
+### CRL
+
+Configure one or more CRL files or URLs:
+
+```bash
+export NONODB_TLS_CRL_FILE=/etc/nonodb/tls/client-ca.crl.pem
+# or:
+export NONODB_TLS_CRL_URL=https://pki.internal/nonodb/client-ca.crl.pem
+```
+
+Comma-separated lists are accepted. CRLs are refreshed every
+`NONODB_TLS_REVOCATION_REFRESH_SECS` seconds. Each CRL must be signed by a CA in
+`NONODB_TLS_CLIENT_CA`; an unsigned, unparsable, expired, or wrong-issuer CRL
+does not provide a definitive answer.
+
+Generate and refresh a CRL with your CA tooling, for example:
+
+```bash
+openssl ca -config /etc/nonodb/openssl-ca.cnf -gencrl   -out /etc/nonodb/tls/client-ca.crl.pem
+```
+
+### OCSP
+
+Set the responder URL for client certificates:
+
+```bash
+export NONODB_TLS_OCSP_URL=https://ocsp.pki.internal
+```
+
+The responder is queried on the first connection for each certificate, with
+results cached for `NONODB_TLS_OCSP_CACHE_SECS` seconds. Use an HTTPS responder
+operated by the same PKI as the client CA. The configured responder is trusted;
+do not point it at an untrusted service.
+
+### Failure policy
+
+```bash
+export NONODB_TLS_REVOCATION_FAIL_MODE=closed   # default
+```
+
+| Mode | Behaviour when no CRL/OCSP source can decide |
+|---|---|
+| `closed` | Reject the connection and log the reason. This is the default. |
+| `open` | Allow the connection, log a warning, and increment the unavailable counter. Intended for a documented migration window only. |
+
+If both CRL and OCSP are configured, any definitive `revoked` result rejects the
+certificate. At least one configured source must return a definitive `good`
+result. A certificate with no covering CRL and no OCSP answer follows the failure
+policy.
+
+### Rotation
+
 - Disable a certificate: `nonodb-cli auth cert disable "$FP"`.
 - Disable a token: `nonodb-cli auth token disable "$KID"`.
-- Changes are picked up within about one second without restarting the daemon.
-- There is no CRL/OCSP; the registry is the revocation mechanism.
 - Rotate client certificates by registering the new fingerprint, deploying the
   new certificate, and disabling the old fingerprint.
 - Server certificates, keys, and `NONODB_TLS_CLIENT_CA` are checked every
@@ -177,3 +245,7 @@ NONODB_TLS_CLIENT_KEY=/etc/nonodb/tls/acme-app.key
 | `403 forbidden` | Principal exists but lacks the required scope |
 | Daemon refuses to start | Missing/invalid `NONODB_AUTH_FILE`, or missing server cert/key pair |
 | Existing connection suddenly gets `401` | Token or certificate was disabled and the reload completed |
+| Client is rejected with `revoked by CRL` | The client serial is in a configured CRL |
+| Client is rejected with `revoked by OCSP` | The responder returned `revoked` |
+| Client is rejected with `revocation status unavailable` | No valid CRL/OCSP answer and fail-closed is active |
+| Daemon refuses to start | A configured CRL source is unusable while revocation is fail-closed |

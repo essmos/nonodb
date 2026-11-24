@@ -58,8 +58,8 @@ What the helper does:
 - preserves `_id` strings and ObjectIds and converts BSON dates, Decimal128,
   binary values, and other supported values to Extended JSON;
 - maps `expireAfterSeconds` to date-field TTL on the indexed field, backfills
-  existing documents, and accepts `sparse` as a compatibility no-op for unique
-  indexes;
+  existing documents, and preserves `sparse` and `partialFilterExpression` on
+  translated indexes;
 - copies documents in bounded batches, checks source and target counts, and
   compares a SHA-256 content checksum for every collection;
 - writes a JSON report with counts, checksums, translated indexes, TTL values,
@@ -80,8 +80,9 @@ Useful options:
 The source must be stopped or at a consistent snapshot. This is not a live CDC
 tool: writes made during the copy are not replayed. Unsupported `_id` types and
 multiple TTL indexes fail with an error before the affected collection is
-copied. Partial/wildcard indexes and unsupported text/geo forms are skipped with
-a warning in the report. Source authentication is taken from the MongoDB URI;
+copied. Wildcard indexes and unsupported text/geo forms are skipped with a
+warning in the report; sparse and `partialFilterExpression` definitions are
+preserved. Source authentication is taken from the MongoDB URI;
 never put credentials in the report or commit them.
 
 TTL translation matches MongoDB's date-field semantics: a document expires at
@@ -98,7 +99,7 @@ documents. Documents with a missing or non-date TTL field never expire.
 | `_id` type | string or ObjectId |
 | Atomicity | Per `insert_many` request; not across collections |
 | Vault collections | Not supported by the generic importer |
-| Unsupported BSON | regex values, Code, Symbol, DBPointer |
+| Unsupported BSON | Code, Symbol, DBPointer |
 
 The importer defaults to 500 documents or 3,000,000 encoded bytes per request,
 whichever comes first. Lower `--batch-size` if individual documents are large.
@@ -201,8 +202,10 @@ configuration.
 
 Indexes are created **after** documents are loaded. This is faster for large
 imports, but a unique index fails if the source contains duplicates or `null`
-values that collide. Deduplicate before import, or create the unique index
-first in a small validation pass.
+values that collide. A plain unique index treats a missing field as `null`, so
+at most one imported document may omit the indexed field; use `sparse` when
+many documents may omit it. Deduplicate before import, or create the unique
+index first in a small validation pass.
 
 ## Run the importer
 

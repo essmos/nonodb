@@ -60,12 +60,14 @@ def auth_doc() -> dict:
             "app": {"scopes": ["read:orders", "write:orders"]},
             "reader": {"scopes": ["read:orders"]},
             "wide": {"scopes": ["read:orders", "read:customers"]},
+            "dbadmin": {"scopes": ["admin:app1/*"]},
         },
         "tokens": [
             entry("admin", "admin-secret", "admin"),
             entry("app", "app-secret", "app"),
             entry("reader", "reader-secret", "reader"),
             entry("wide", "wide-secret", "wide"),
+            entry("dbadmin", "dbadmin-secret", "dbadmin"),
         ],
         "certificates": [],
     }
@@ -136,6 +138,17 @@ def main() -> None:
             app = NonoDB(base_url=url, token=token("app", "app-secret"), timeout=10)
             reader = NonoDB(base_url=url, token=token("reader", "reader-secret"), timeout=10)
             wide = NonoDB(base_url=url, token=token("wide", "wide-secret"), timeout=10)
+            dbadmin = NonoDB(
+                base_url=url,
+                token=token("dbadmin", "dbadmin-secret"),
+                database="app1",
+                timeout=10,
+            )
+            dbadmin_default = NonoDB(
+                base_url=url,
+                token=token("dbadmin", "dbadmin-secret"),
+                timeout=10,
+            )
             anon = NonoDB(base_url=url, timeout=10)
 
             # Missing/bad credentials.
@@ -151,6 +164,33 @@ def main() -> None:
             admin.create_collection("customers")
             admin.collection("orders").insert({"_id": "o1", "total": 10})
             admin.collection("customers").insert({"_id": "c1", "name": "Ada"})
+            admin.exec({"op": "create_database", "name": "app1"})
+
+            # Per-database administrator: full control of app1, none of the
+            # instance-wide operations.
+            dbadmin.create_collection("widgets")
+            assert dbadmin.collections() == ["widgets"]
+            assert dbadmin.map_info()["map_size"] > 0
+            assert dbadmin.exec({"op": "sync"})["synced"] is True
+            assert dbadmin.exec({"op": "list_webhooks"})["webhooks"] == []
+            assert dbadmin.exec({"op": "list_databases"})["databases"] == ["app1"]
+            expect_code(lambda: dbadmin_default.map_info(), "forbidden")
+            expect_code(
+                lambda: dbadmin.exec({"op": "create_database", "name": "app2"}),
+                "forbidden",
+            )
+            expect_code(
+                lambda: dbadmin.exec({"op": "drop_database", "name": "app1"}),
+                "forbidden",
+            )
+            assert (
+                httpx.get(
+                    url + "/v1/auth",
+                    headers={"authorization": f"Bearer {token('dbadmin', 'dbadmin-secret')}"},
+                    timeout=10,
+                ).status_code
+                == 403
+            )
 
             # Reader: read one collection only.
             assert reader.collection("orders").count({}) == 1
@@ -234,6 +274,14 @@ def main() -> None:
                 ).status_code
                 == 403
             )
+            assert (
+                httpx.get(
+                    url + "/metrics",
+                    headers={"authorization": f"Bearer {token('dbadmin', 'dbadmin-secret')}"},
+                    timeout=10,
+                ).status_code
+                == 403
+            )
             metrics_response = httpx.get(
                 url + "/metrics",
                 headers={"authorization": f"Bearer {token('admin', 'admin-secret')}"},
@@ -276,6 +324,7 @@ def main() -> None:
             assert "app-secret" not in audit_text
             assert "admin-secret" not in audit_text
             assert "reader-secret" not in audit_text
+            assert "dbadmin-secret" not in audit_text
             records = [json.loads(line) for line in audit_text.splitlines() if line.strip()]
             assert any(
                 r["principal"] == "app" and r["op"] == "insert" and r["result"] == "ok"

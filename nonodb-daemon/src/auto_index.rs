@@ -314,6 +314,8 @@ impl AutoIndexer {
                     name: String::new(),
                     directions: Vec::new(),
                     unique: false,
+                    sparse: false,
+                    partial_filter_expression: None,
                     include: Vec::new(),
                     geo: false,
                 })

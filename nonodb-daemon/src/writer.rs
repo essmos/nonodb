@@ -22,6 +22,7 @@ use crate::cache::QueryCache;
 use crate::live;
 use crate::metrics;
 use crate::protocol::{ApiError, Durability, WriteReq};
+use crate::quota::Quota;
 
 /// Maximum number of operations in one transaction.
 const MAX_BATCH: usize = 512;
@@ -109,7 +110,7 @@ pub(crate) fn replication_origin() -> Option<String> {
             let enabled = std::env::var("NONODB_REPLICATION_ENABLED")
                 .ok()
                 .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"));
-            if !enabled {
+            if !enabled && !crate::wal::enabled() {
                 return None;
             }
             Some(
@@ -201,6 +202,7 @@ pub fn run(
     store: Arc<Store>,
     rx: Receiver<WriteJob>,
     cache: Arc<QueryCache>,
+    quota: Arc<Quota>,
     stop: Arc<std::sync::atomic::AtomicBool>,
 ) {
     let (idle_window, base_window, pressure_window, max_window) = window_config();
@@ -250,7 +252,7 @@ pub fn run(
 
         metrics::set(&metrics::WRITER_LAST_BATCH_SIZE, jobs.len() as u64);
         metrics::inc(&metrics::WRITER_BUSY);
-        run_batch(&store, &cache, jobs);
+        run_batch(&store, &cache, &quota, jobs);
         metrics::sub(&metrics::WRITER_BUSY, 1);
     }
 }
@@ -272,8 +274,18 @@ fn capture_replicated_ttls(
     }
 }
 
-fn run_batch(store: &Store, cache: &QueryCache, jobs: Vec<WriteJob>) {
+fn run_batch(store: &Store, cache: &QueryCache, quota: &Quota, jobs: Vec<WriteJob>) {
     metrics::sub(&metrics::QUEUE_LEN, jobs.len() as u64);
+    if crate::wal::is_full(store) {
+        let err = ApiError {
+            code: "wal_full".to_string(),
+            message: "PITR WAL has reached its hard limit; wait for snapshot retention to prune covered segments".to_string(),
+        };
+        for job in jobs {
+            let _ = job.resp.send(Err(err.clone()));
+        }
+        return;
+    }
     if !crate::replicator::writable() {
         let err = ApiError {
             code: "read_only".to_string(),
@@ -284,12 +296,19 @@ fn run_batch(store: &Store, cache: &QueryCache, jobs: Vec<WriteJob>) {
         }
         return;
     }
+    let requests: Vec<&WriteReq> = jobs.iter().map(|job| &job.req).collect();
+    if let Err(err) = quota.check_write(store, &requests) {
+        for job in jobs {
+            let _ = job.resp.send(Err(err.clone()));
+        }
+        return;
+    }
     // An atomic `write_batch` cannot share a transaction with other
     // requests: one failed operation must roll back the whole batch, not
     // the other writes in the group. That is why such a group is run job by job.
     if jobs.iter().any(|j| j.req.is_atomic() || j.isolated) {
         for job in jobs {
-            run_single(store, cache, job);
+            run_single(store, cache, quota, job);
         }
         return;
     }
@@ -377,8 +396,19 @@ fn run_batch(store: &Store, cache: &QueryCache, jobs: Vec<WriteJob>) {
     }
 }
 
-fn run_single(store: &Store, cache: &QueryCache, job: WriteJob) {
+fn run_single(store: &Store, cache: &QueryCache, quota: &Quota, job: WriteJob) {
     metrics::inc(&metrics::WRITE_BATCHES);
+    if crate::wal::is_full(store) {
+        let _ = job.resp.send(Err(ApiError {
+            code: "wal_full".to_string(),
+            message: "PITR WAL has reached its hard limit; wait for snapshot retention to prune covered segments".to_string(),
+        }));
+        return;
+    }
+    if let Err(err) = quota.check_write(store, &[&job.req]) {
+        let _ = job.resp.send(Err(err));
+        return;
+    }
     let sync = job.durability == Durability::Full;
     let mut wtxn = match store.write_txn_unsynced() {
         Ok(wtxn) => wtxn,
@@ -1793,15 +1823,27 @@ fn execute(
             coll,
             fields,
             unique,
+            sparse,
+            partial_filter_expression,
             include,
             geo,
         } => {
             let c = standard_collection(store, wtxn, coll)?;
-            c.create_index_fields_txn(wtxn, fields, *unique, include, *geo)?;
+            c.create_index_fields_txn(
+                wtxn,
+                fields,
+                *unique,
+                include,
+                *geo,
+                *sparse,
+                partial_filter_expression.clone(),
+            )?;
             replication.capture_op(ReplicationOp::IndexCreate {
                 coll: coll.clone(),
                 fields: fields.clone(),
                 unique: *unique,
+                sparse: *sparse,
+                partial_filter_expression: partial_filter_expression.clone(),
                 include: include.clone(),
                 geo: *geo,
             });
@@ -1810,6 +1852,8 @@ fn execute(
                 "created": name,
                 "fields": fields,
                 "unique": unique,
+                "sparse": sparse,
+                "partial_filter_expression": partial_filter_expression,
                 "include": include,
                 "geo": geo
             }))
@@ -1822,6 +1866,8 @@ fn execute(
                     coll: coll.clone(),
                     fields: index.fields.clone(),
                     unique: index.unique,
+                    sparse: index.sparse,
+                    partial_filter_expression: index.partial_filter_expression.clone(),
                     include: index.include.clone(),
                     geo: index.geo,
                 });
@@ -1951,6 +1997,65 @@ fn execute(
                 });
             }
             Ok(json!({ "dropped": existed, "kind": "vector" }))
+        }
+        WriteReq::SetGraph { coll, def } => {
+            if def.node_collection != *coll {
+                return Err(ApiError {
+                    code: "invalid_query".into(),
+                    message: "graph `node_collection` must equal `coll`".into(),
+                });
+            }
+            let c = standard_collection(store, wtxn, coll)?;
+            let out = def.clone();
+            c.set_graph_txn(wtxn, def)?;
+            replication.capture_op(ReplicationOp::GraphSet {
+                coll: coll.clone(),
+                def: out.clone(),
+            });
+            Ok(json!({ "graph": out }))
+        }
+        WriteReq::DropGraph { coll } => {
+            let c = standard_collection(store, wtxn, coll)?;
+            let dropped = c.drop_graph_txn(wtxn)?;
+            if dropped {
+                replication.capture_op(ReplicationOp::GraphDrop { coll: coll.clone() });
+            }
+            Ok(json!({ "dropped": dropped, "collection": coll }))
+        }
+        WriteReq::ReindexGraph { coll } => {
+            let c = standard_collection(store, wtxn, coll)?;
+            let edges = c.reindex_graph_txn(wtxn)?;
+            Ok(json!({ "reindexed": coll, "edges": edges }))
+        }
+        WriteReq::StartGraphRebuild { coll } => {
+            let c = standard_collection(store, wtxn, coll)?;
+            Ok(c.start_graph_rebuild_txn(wtxn)?)
+        }
+        WriteReq::CancelGraphRebuild { coll } => {
+            let c = standard_collection(store, wtxn, coll)?;
+            let canceled = c.cancel_graph_rebuild_txn(wtxn)?;
+            Ok(json!({ "canceled": canceled }))
+        }
+        WriteReq::GraphRebuildStep { edge, limit } => {
+            let c = store.collection_at(wtxn, edge)?.ok_or_else(|| ApiError {
+                code: "not_found".into(),
+                message: format!("collection `{edge}` does not exist"),
+            })?;
+            let state = c.graph_rebuild_state_in(wtxn)?;
+            let out = c.step_graph_rebuild_txn(wtxn, *limit)?;
+            if out.get("done").and_then(Value::as_bool) == Some(true) {
+                if let Some(state) = state {
+                    if let Some(node) = store.collection_at(wtxn, &state.node_collection)? {
+                        if let Some(def) = node.get_graph_in(wtxn)? {
+                            replication.capture_op(ReplicationOp::GraphSet {
+                                coll: state.node_collection,
+                                def,
+                            });
+                        }
+                    }
+                }
+            }
+            Ok(out)
         }
         WriteReq::Sql { query, params } => {
             let prepared = nonodb_core::sql::PreparedSql::parse(query)?;
@@ -2547,6 +2652,8 @@ mod tests {
                 name: String::new(),
                 directions: Vec::new(),
                 unique: true,
+                sparse: false,
+                partial_filter_expression: None,
                 include: Vec::new(),
                 geo: false,
             }])
@@ -2676,6 +2783,8 @@ mod tests {
                 name: String::new(),
                 directions: Vec::new(),
                 unique: true,
+                sparse: false,
+                partial_filter_expression: None,
                 include: Vec::new(),
                 geo: false,
             }])

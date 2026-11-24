@@ -39,6 +39,11 @@ secrets.
 | `NONODB_DATA` | `./data` | Instance root containing `<database>/data.mdb` and `<database>/lock.mdb` |
 | `NONODB_PROFILE` | unset | `small` or `tiny` fills unset small-host defaults; explicit variables win |
 | `NONODB_MAX_OPEN_DATABASES` | `64` | Maximum open LMDB environments/writers; idle databases are evicted |
+| `NONODB_QUOTA_DATA_BYTES` | unlimited | Default per-database data quota when no saved limits exist |
+| `NONODB_QUOTA_INDEX_BYTES` | unlimited | Default per-database index quota when no saved limits exist |
+| `NONODB_QUOTA_HISTORY_BYTES` | unlimited | Default per-database history quota when no saved limits exist |
+| `NONODB_QUOTA_SIDECAR_BYTES` | unlimited | Default per-database search/vector sidecar quota |
+| `NONODB_QUOTA_SOFT_PERCENT` | `80` | Percentage of a quota that produces a soft warning |
 | `NONODB_ALLOW_UNSAFE_WRITES` | unset | Enables opt-in `durability:"unsafe"` writes using LMDB `MDB_NOSYNC` |
 | `NONODB_WRITER_WINDOW_US` | `1000` | Group-commit window when the writer has a backlog |
 | `NONODB_WRITER_WINDOW_PRESSURE_US` | `3000` | Window when 64+ writes are queued |
@@ -98,6 +103,13 @@ secrets.
 | `NONODB_TLS_CLIENT_CA` | — | PEM CA bundle used to verify client certificates (mTLS) |
 | `NONODB_TLS_CLIENT_AUTH` | `required` when client CA is set | `required`, `optional`, or `off` |
 | `NONODB_TLS_RELOAD_INTERVAL` | `30` | Seconds between server cert/key/CA reload checks; `0` disables |
+| `NONODB_TLS_CRL_FILE` | — | Comma-separated CRL files for mTLS client certificates |
+| `NONODB_TLS_CRL_URL` | — | Comma-separated CRL URLs refreshed on the revocation interval |
+| `NONODB_TLS_OCSP_URL` | — | OCSP responder URL for mTLS client certificates |
+| `NONODB_TLS_REVOCATION_FAIL_MODE` | `closed` | `closed` rejects when no CRL/OCSP source can decide; `open` allows with a warning |
+| `NONODB_TLS_REVOCATION_REFRESH_SECS` | `300` | CRL refresh interval |
+| `NONODB_TLS_OCSP_CACHE_SECS` | `300` | OCSP result cache lifetime |
+| `NONODB_TLS_REVOCATION_TIMEOUT_SECS` | `5` | CRL/OCSP HTTP timeout |
 | `NONODB_SNAPSHOT_DIR` | — | Enables periodic LMDB snapshots in this directory |
 | `NONODB_BACKUP_CONFIG` | `<NONODB_DATA>/backups.json` | Scheduled backup job configuration |
 | `NONODB_BACKUP_STAGING` | `<NONODB_DATA>/.backup-staging` | Temporary backup staging directory |
@@ -147,7 +159,13 @@ secrets.
 | `NONODB_VECTOR_ANN_CLUSTERS` | unset | Target IVF clusters when building a vector ANN sidecar; otherwise `sqrt(entries)`, capped at 4,096 (1–8,192) |
 | `NONODB_VECTOR_ANN_COLLECTIONS` | unset | Comma-separated collections for `NONODB_BUILD_VECTOR_ANN` |
 | `NONODB_SNAPSHOT_INTERVAL` | `300` | Snapshot interval in seconds |
-| `NONODB_SNAPSHOT_KEEP` | `24` | Number of snapshot files to retain |
+| `NONODB_SNAPSHOT_KEEP` | `24` | Number of snapshot files to retain when PITR is disabled |
+| `NONODB_PITR_ENABLED` | `0` | Enable snapshot + segmented WAL point-in-time recovery |
+| `NONODB_PITR_WINDOW_SECS` | `604800` | PITR recovery window retained, in seconds |
+| `NONODB_WAL_MAX_AGE_SECS` | PITR window | Hard maximum WAL age; a shorter value also shortens the effective recovery window |
+| `NONODB_WAL_SEGMENT_BYTES` | `64MiB` | Target WAL segment size |
+| `NONODB_WAL_MAX_BYTES` | `20GiB` | Hard per-database WAL size limit; writes fail with `wal_full` at the limit |
+| `NONODB_PITR_REPLAY_TO` | — | Optional RFC 3339/Unix timestamp replayed from the retained WAL when a database opens, before accepting writes |
 | `NONODB_DRAIN_TIMEOUT` | `30` | Maximum seconds to wait for connections and queued writes during shutdown |
 | `NONODB_LOG_FORMAT` | `text` | `text` for human-readable logs or `json` for structured logs |
 | `RUST_LOG` | `info,nonodb=debug` | `tracing` log filter |
@@ -342,7 +360,7 @@ Download the archive from the matching GitHub Release, verify its checksum, and
 install the two binaries:
 
 ```bash
-TAG=v0.30.0
+TAG=v0.32.0
 ARCHIVE="nonodb-$TAG-linux-x86_64.tar.gz"
 curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/$ARCHIVE"
 curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/$ARCHIVE.sha256"
@@ -404,7 +422,7 @@ Linux `amd64` and `arm64`. Pull a published tag:
 
 ```bash
 # Pin a version in production; latest tracks stable releases.
-docker pull ghcr.io/essmos/nonodb:0.30.0
+docker pull ghcr.io/essmos/nonodb:0.32.0
 ```
 
 If the GHCR package is private, log in before pulling:
@@ -450,7 +468,7 @@ docker run -d --name nonodb \
   --group-add "$(id -g)" \
   -v "$NONODB_AUTH_FILE:/etc/nonodb/auth.json:ro" \
   -v nonodb-data:/var/lib/nonodb \
-  ghcr.io/essmos/nonodb:0.30.0
+  ghcr.io/essmos/nonodb:0.32.0
 ```
 
 Verify it:
@@ -532,7 +550,7 @@ docker volume create nonodb-run
 docker run -d --name nonodb \
   -v nonodb-data:/var/lib/nonodb \
   -v nonodb-run:/run/nonodb \
-  ghcr.io/essmos/nonodb:0.30.0
+  ghcr.io/essmos/nonodb:0.32.0
 ```
 
 The client container mounts the same `nonodb-run` volume and sets:
@@ -561,7 +579,7 @@ docker run -d --name nonodb \
   -v "$NONODB_AUTH_FILE:/etc/nonodb/auth.json:ro" \
   -v /host/certs:/certs:ro \
   -v nonodb-data:/var/lib/nonodb \
-  ghcr.io/essmos/nonodb:0.30.0
+  ghcr.io/essmos/nonodb:0.32.0
 ```
 
 Without a certificate and key pair, TCP runs in plaintext and logs a warning.
@@ -575,7 +593,7 @@ Back up into a separate mounted directory:
 docker run --rm \
   -v nonodb-data:/var/lib/nonodb:ro \
   -v /host/backups:/backups \
-  ghcr.io/essmos/nonodb:0.30.0 \
+  ghcr.io/essmos/nonodb:0.32.0 \
   nonodb-cli backup-all /var/lib/nonodb /backups/$(date -u +%Y%m%dT%H%M%SZ)
 ```
 
@@ -595,7 +613,7 @@ docker run -d --name nonodb \
   -v "$NONODB_AUTH_FILE:/etc/nonodb/auth.json:ro" \
   -v nonodb-data:/var/lib/nonodb \
   -v /host/backups:/var/backups/nonodb \
-  ghcr.io/essmos/nonodb:0.30.0
+  ghcr.io/essmos/nonodb:0.32.0
 ```
 
 Then use `/var/backups/nonodb` in the GUI. By default keys live in
@@ -684,8 +702,10 @@ export NONODB_TLS_KEY=/etc/nonodb/server.key
   anonymous clients; anonymous clients still need a bearer token.
 - Client certificates and bearer tokens live in the same `NONODB_AUTH_FILE`;
   there is no legacy allow-list or global token.
-- There is no CRL/OCSP. Revocation is handled by disabling the registry entry
-  and using short-lived certificates.
+- Revocation can use the registry entry, a CRL file/URL, or an OCSP responder.
+  CRLs refresh on `NONODB_TLS_REVOCATION_REFRESH_SECS`; OCSP answers are cached
+  for `NONODB_TLS_OCSP_CACHE_SECS`. When no source can decide, the default
+  `NONODB_TLS_REVOCATION_FAIL_MODE=closed` rejects the connection.
 
 Client example:
 
@@ -707,11 +727,16 @@ For certificate generation, mTLS setup, rotation, and troubleshooting, see
 Periodic snapshots are enabled with `NONODB_SNAPSHOT_DIR`,
 `NONODB_SNAPSHOT_INTERVAL`, and `NONODB_SNAPSHOT_KEEP`. Each database writes
 compacted, consistent copies below its own directory:
-`<snapshot-dir>/<database>/data-<unix-ms>.mdb`. Snapshots are not point-in-time
-recovery, are not atomic across databases, and are not verified automatically.
+`<snapshot-dir>/<database>/data-<unix-ms>.mdb`, plus a `.json` metadata marker.
 
-See [Periodic snapshots](backup.md#periodic-snapshots) for configuration,
-retention, and restore details.
+Enable `NONODB_PITR_ENABLED=1` to retain a segmented WAL and replay it forward
+to a chosen timestamp during restore. PITR is per database, not atomic across
+databases. At the WAL size or age limit, writes are rejected with `wal_full`
+until snapshot retention frees covered history.
+
+See [Periodic snapshots](backup.md#periodic-snapshots) and
+[Point-in-time recovery](pitr.md) for configuration, retention, restore, and
+alerts.
 
 ## Backup and restore
 
@@ -833,8 +858,13 @@ Useful signals:
 | `collection_metrics` | Per-`database/collection` requests, reads, writes, cache, errors, and latency |
 | `collection_metrics_overflow_total` | Requests omitted after the 4096-series metrics cap |
 | `latency` / `nonodb_request_duration_seconds` | End-to-end request latency histogram by operation |
+| `certificates` / `nonodb_tls_certificate_expiry_timestamp_seconds` | Configured server and replication certificate expiry timestamps |
 | `disk` / `nonodb_disk_*` | Filesystem capacity, free, used, and used ratio for data and snapshots |
 | `snapshots` / `nonodb_snapshot_*` | Per-database snapshot success, failures, age, and duration |
+| `wal` / `nonodb_wal_*` | Per-database WAL bytes, age, sequence, hard-limit state, and pruned bytes |
+| `nonodb_pitr_available` | Whether a snapshot plus WAL can serve a PITR restore |
+| `nonodb_tls_revocation_refresh_total` / `..._errors_total` | CRL refresh passes and failures |
+| `nonodb_tls_revocation_revoked_total` / `..._unavailable_total` | Rejected revoked certificates and unavailable status checks |
 | `auth_failures_total` | Failed authentication attempts |
 | `auth_blocks_total` | IP lockouts started |
 | `auth_blocked_requests_total` | Requests rejected while the IP was blocked |
@@ -1012,6 +1042,18 @@ backups.
   old LMDB postings/trigrams. New search definitions cover exactly one field.
 - Segment text files must be format v3. Older v2 segments without phrase
   positions are rejected; drop and rebuild the text index.
+- Sparse and partial indexes are stored as part of each index definition.
+  Existing definitions without those options keep their previous behavior.
+  To adopt `sparse` or `partialFilterExpression` for an existing index, drop it
+  and create it again with the new options; `reindex` rebuilds the stored
+  definition but cannot add or change options.
+- Plain indexes now index a missing field as `null`, matching MongoDB. Indexes
+  built by earlier releases omitted those entries, so run
+  `nonodb-cli reindex <collection>` for every collection with plain indexes
+  after upgrading. Until reindexing, index-backed reads and unique enforcement
+  can differ for documents with missing fields. If several documents already
+  share a missing/`null` value under a plain unique index, reindexing fails
+  with a duplicate-key error; resolve the duplicates first.
 - Schema version is stored in metadata. There is currently no automatic
   migration framework; changes are handled by explicit commands and releases.
 
@@ -1025,6 +1067,8 @@ backups.
 | `rate_limited` (429) | Too many failed logins from this IP | Wait for `NONODB_AUTH_BLOCK_SECS`; tune lockout thresholds |
 | `timeout` | Long scan exceeds 30 s, or index build exceeds 1 h | Raise `NONODB_REQUEST_TIMEOUT`, `NONODB_INDEX_TIMEOUT`, and client timeout |
 | `document_too_large` (413) | Document > 1 MiB or request > 4 MiB | Split document/import; batch inserts |
+| `wal_full` (507) | PITR WAL reached `NONODB_WAL_MAX_BYTES`/age | Check `nonodb_wal_*`, snapshot disk space, and PITR window; writes resume after retention |
+| `quota_exceeded` (507) | A database quota is exhausted | `nonodb-cli --db <name> quota`; delete data or raise/clear the named limit |
 | `duplicate_key` | Duplicate `_id` or unique-index conflict | Use a new id or update the existing document |
 | `invalid_query` on search | Text/fuzzy/vector index missing | Create the index first |
 | `MDB_DBS_FULL` | Named database limit reached | Reduce collections/indexes; recreate database with fewer names |
@@ -1074,5 +1118,7 @@ vault key material are outside LMDB and are never affected by this setting.
   secret manager, not next to the LMDB backup.
 - Remember that vault encryption is applied inside the daemon; it protects data
   at rest, not plaintext in daemon memory. See [Vault collections](vault.md).
+- Put the data directory on encrypted storage and keep volume, vault, and backup
+  keys outside that volume. See [Encryption at rest](encryption-at-rest.md).
 - Monitor `errors_total`, `queue_len`, and disk space.
 - Keep the OS, Rust toolchain, and dependencies patched.

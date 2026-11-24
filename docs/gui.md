@@ -142,6 +142,11 @@ token. There is no separate GUI account.
   **Advanced**.
 - The sidebar database selector switches between databases in the same daemon.
   Requests are routed as `/<database>/v1/exec` and `/<database>/v1/watch`.
+- The **Database** tab lists databases, creates new ones, and drops non-default
+  databases after typing the exact name to confirm. The selector refreshes after
+  each change. Dropping the current database switches the GUI back to `default`.
+  These operations require an instance administrator scope; a `forbidden`
+  response is shown in the page and does not change the selector.
 - The collection list stays visible in the sidebar on every tab. **Dashboard**
   shows the selected database overview and metrics; choosing a collection opens
   its document view.
@@ -152,9 +157,97 @@ token. There is no separate GUI account.
 
 Credentials are kept in browser `sessionStorage` for the active session. Saved
 connection profiles use browser `localStorage`; do not save production tokens on
-a shared machine. Use **Disconnect** to clear the active session.
+a shared machine. Use **Disconnect** to close the active connection tab.
+
+### Connection tabs
+
+The bar above the console keeps one tab per daemon connection:
+
+- **+** opens the connect screen for another endpoint without closing the
+  current session.
+- Each tab stores its own endpoint, database, token, vault fields, and saved
+  database selection in `sessionStorage`.
+- Clicking a tab switches the console to that connection. The console is
+  remounted for the selected tab, so collections, filters, search results, and
+  in-flight editor state never leak between daemons.
+- The status dot shows `online`, `offline`, or `checking`. An offline tab offers
+  the reconnect screen instead of sending requests with another tab's
+  credentials.
+- Saved collection views and Playground history are namespaced by endpoint and
+  database, so two tenants or daemons with the same collection name do not share
+  local UI state.
+- Closing a tab removes its stored session. Closing the last tab returns to the
+  connect screen.
+
+Session tabs are restored after a page reload; the GUI validates each endpoint
+again at startup. Tokens are still scoped to the tab and are never copied from
+one daemon to another unless the endpoint is the same origin and the CLI injected
+a session token.
+
+Tabs can point at different endpoints. The browser must be able to reach those
+endpoints directly. If they use different origins, expose them through one
+reverse proxy with distinct path prefixes, or configure CORS at the proxy; the
+GUI does not bypass browser cross-origin rules. Use TLS for non-loopback
+endpoints.
+
+### Accessibility and keyboard navigation
+
+The console uses native buttons, links, labels, and form controls. Dialogs have
+an accessible name, trap focus while open, restore focus on close, and close with
+`Esc`. The sidebar is a labelled landmark, the active view uses
+`aria-current="page"`, and errors and notices are live regions.
+
+Keyboard shortcuts:
+
+| Key | Action |
+|---|---|
+| `Tab` / `Shift+Tab` | Move through interactive controls |
+| `Ctrl+K` / `Cmd+K` | Open or close the command palette |
+| `ArrowDown` in the palette | Move from the search field to the first result |
+| `ArrowLeft` / `ArrowRight` | Move between tabs in a tab list |
+| `Home` / `End` | Jump to the first or last tab in a tab list |
+| `Enter` / `Space` | Activate a focused button or clickable table row |
+| `Esc` | Close the active dialog or palette |
+
+The first `Tab` from the page start reveals **Skip to main content**, which moves
+focus directly to the console. Focus-visible outlines are shown on buttons,
+links, inputs, tabs, and clickable rows. `prefers-reduced-motion` disables
+non-essential transitions.
+
+Accessibility checklist for GUI changes:
+
+- Every icon-only control has an `aria-label` or visible text.
+- Every input has an associated `<label>` or `aria-label`.
+- Tabs use `role="tablist"`, `role="tab"`, `aria-selected`, roving `tabIndex`,
+  and arrow-key navigation.
+- Dialogs use `role="dialog"`, `aria-modal`, `aria-labelledby`, and the shared
+  `Modal` component's focus handling.
+- Errors use `role="alert"`; transient notices use `role="status"`.
+- New interactive table rows respond to `Enter` and `Space`.
+- The layout remains usable at 200% zoom and with keyboard only.
+- The embedded GUI test checks the shipped assets for these landmarks,
+  focus-visible styles, and reduced-motion rules.
 
 ## Features
+
+### Databases
+
+The **Database** tab manages the databases served by the connected daemon:
+
+- list every visible database and mark the current one;
+- create a database by name; the selector refreshes and opens the new database;
+- drop a non-default database with a confirmation dialog. The drop button stays
+  disabled until the exact database name is typed;
+- `default` cannot be dropped, and dropping the current database switches the
+  GUI back to `default`.
+
+Create and drop use the daemon's `create_database` and `drop_database`
+operations. They require an instance administrator scope (`admin:db` or `*:*`),
+not a per-database administrator scope. Forbidden requests are reported in the
+GUI and leave the database list unchanged. Dropping permanently removes
+collections, indexes, history, TTL metadata, and event configuration; export or
+back up the database first if a copy is needed. See
+[Multiple databases](multi-database.md#management-api).
 
 ### Documents
 
@@ -173,6 +266,46 @@ a shared machine. Use **Disconnect** to clear the active session.
 - **New collection** supports the `timeseries` profile: `timeField` is required,
   and `metaField`, granularity, compression, and `expireAfterSeconds` are
   optional.
+- credential-free JSON export and import of saved views.
+
+### Saved views
+
+A saved view stores the filter, sort field and direction, limit, and projection
+for one collection. Views are scoped to the endpoint and database, so the same
+collection name on two daemons does not share local view definitions.
+
+**Export views** downloads a `nonodb-views-<collection>.json` file with this
+shape:
+
+```json
+{
+  "format": "nonodb.saved-views",
+  "version": 1,
+  "collection": "orders",
+  "views": [
+    {
+      "name": "Active",
+      "filter": "{\"status\":\"active\"}",
+      "sortField": "created_at",
+      "sortDir": "desc",
+      "limit": 25,
+      "projection": "{\"name\":1}"
+    }
+  ]
+}
+```
+
+The file contains only view definitions and the collection name. It never
+includes the endpoint, database token, TLS material, vault keys, saved
+connection profiles, or document bodies. Treat it as shareable but review
+filters before posting publicly.
+
+**Import views** accepts the same format. Each imported view replaces an
+existing view with the same name; other views are preserved. Unknown fields and
+credential-like fields are ignored, never stored, and omitted from later
+exports. Invalid JSON, unknown formats or versions, empty names, invalid sort
+directions, and limits outside `0..10000` are rejected as a whole, with an error
+shown above the collection. Nothing is written until the entire file validates.
 
 ### Indexes
 
@@ -202,6 +335,19 @@ Webhook rules support event filters, `count`/`sum`/`avg` thresholds, `once`,
 cooldown, HMAC secret environment variable, request timeout, custom headers, and
 max attempts. Filters and aggregates are evaluated by the daemon worker, never
 in the writer. See [Asynchronous webhooks](webhooks.md).
+
+### Graph
+
+The **Graph** tab configures a graph on a node collection and explores it:
+
+- choose the edge collection and the from/to/label/weight fields;
+- configure, update, drop, or reindex adjacency;
+- start from one or more node ids, choose direction, labels, depth, BFS/DFS,
+  and whether to include full edge documents;
+- expand tree nodes lazily one level at a time, with cycle and missing-node
+  markers.
+
+See [Graph traversal](graph.md).
 
 ### Changes
 
@@ -345,7 +491,9 @@ daemon can write them without root. In Docker, mount every local destination and
 - read the generated `backup-info.txt` when available;
 - import as a new database with checksum, decryption, decompression, and deep
   LMDB verification;
-- existing databases are never overwritten.
+- verify and restore one non-default database in place with typed confirmation
+  and an automatic safety snapshot;
+- existing databases are never overwritten by import.
 
 #### Import workflow
 
@@ -363,6 +511,25 @@ daemon can write them without root. In Docker, mount every local destination and
 The importer verifies the checksum, decrypts age with
 `NONODB_BACKUP_IDENTITY_FILE` when needed, decompresses gzip, verifies the LMDB
 database, and refuses to overwrite an existing database.
+
+#### Restore in place
+
+Use **Restore in place** below the import plan to replace an existing
+non-default database from the selected backup:
+
+1. Enter the target database name.
+2. Click **Verify for restore**. Preflight verifies the manifest, checksum,
+   decryption/decompression, and LMDB contents without changing live data.
+3. Read the verified backup details, then type the exact
+   `RESTORE <database>` phrase.
+4. Click **Restore &lt;database&gt; in place**. The button stays disabled until the
+   phrase matches.
+5. Keep the shown safety snapshot path until the application checks pass. The
+   same panel shows the rollback instruction.
+
+The default database is restored with the offline CLI. An active request may
+return `database_busy`; close clients and retry.
+
 
 ### Replication
 
@@ -479,7 +646,7 @@ docker volume create nonodb-replica-run
 docker run --rm \
   -v nonodb-replica-data:/var/lib/nonodb \
   -e NONODB_AUTH_FILE=/var/lib/nonodb/auth.json \
-  ghcr.io/essmos/nonodb:0.30.0 \
+  ghcr.io/essmos/nonodb:0.32.0 \
   nonodb-cli auth init
 
 docker run -d --name nonodb-replica \
@@ -491,7 +658,7 @@ docker run -d --name nonodb-replica \
   -e NONODB_REPLICATION_ROLE=replica \
   -e NONODB_REPLICATION_NODE_ID=replica-docker \
   -e NONODB_REPLICATION_ADVERTISE_URL=http://DOCKER_HOST_IP:7912 \
-  ghcr.io/essmos/nonodb:0.30.0
+  ghcr.io/essmos/nonodb:0.32.0
 
 docker exec nonodb-replica nonodb-cli replication join \
   http://PRIMARY_HOST:7878 PAIRING-CODE
@@ -601,7 +768,7 @@ docker run -d --name nonodb-gui \
   -p 127.0.0.1:8787:8787 \
   -v nonodb-run:/run/nonodb \
   -e NONODB_SOCK=/run/nonodb/nonodb.sock \
-  ghcr.io/essmos/nonodb:0.30.0 \
+  ghcr.io/essmos/nonodb:0.32.0 \
   nonodb-cli gui --host 0.0.0.0 --port 8787 --allow-remote --no-open
 ```
 
@@ -651,32 +818,22 @@ runs.
 ## Limitations
 
 - Whole-collection deletion is not exposed yet.
-- Import currently supports full-database import from native local/S3 backups;
-  selective collection import, restic repository import, and replace-in-place
-  restore are not exposed in the GUI.
-- Multi-connection profiles exist, but simultaneous multi-daemon tabs do not.
+- Import currently supports full-database import from native local/S3 backups
+  and verified restore-in-place for non-default databases; selective collection
+  import and restic repository import are not exposed in the GUI.
 - A light theme is not included.
 
 ## Future GUI work
 
 These are planned improvements, not current features.
 
-- **Database management in the GUI.** Create and drop databases directly from
-  the console; today the GUI can select databases but creation/drop is CLI-only.
-- **Backup and restore UI.** Trigger online backups, list manifests, verify
-  checksums, and show restore instructions. Restore itself remains CLI-only
-  until a safe daemon-side restore flow exists.
-- **Multiple daemon tabs.** Keep several connection profiles open at once
-  instead of switching one active connection.
+- **Restore history and rollback shortcuts.** Show previous restore operations
+  and offer guided recovery from retained safety snapshots.
 - **Progress and resume for large imports.** Stream import progress, allow
   cancellation, and resume large JSON/NDJSON/CSV imports.
 - **Better large-result handling.** Virtualized document lists and resumable
   cursors for very large collections.
 - **Light theme.** The current console is intentionally dark-only.
-- **Accessibility and keyboard navigation.** Improve focus management, ARIA
-  labels, and shortcuts beyond the command palette.
-- **Shareable saved views and filters.** Export/import saved views without
-  sharing credentials.
 
 ## Security notes
 

@@ -2,8 +2,9 @@
 
 nonodb stores documents as JSON but accepts MongoDB Extended JSON for scalar
 types that JSON cannot represent. This page covers integer forms, `$type`,
-binary/UUID, ObjectId, Timestamp, and MinKey/MaxKey. Dates and numeric/Decimal128 semantics are documented
-in [Dates and time zones](dates.md) and [Numbers and decimals](numerics.md).
+binary/UUID, ObjectId, Timestamp, MinKey/MaxKey, and regular expressions. Dates
+and numeric/Decimal128 semantics are documented in [Dates and time zones](dates.md)
+and [Numbers and decimals](numerics.md).
 
 ## Extended JSON integer forms
 
@@ -46,6 +47,7 @@ Supported names and numeric codes:
 | `bool` | 8 | boolean |
 | `date` | 9 | Extended JSON date |
 | `null` | 10 | null |
+| `regex` | 11 | BSON regular expression |
 | `int` | 16 | JSON integer in int32 range or `$numberInt` |
 | `timestamp` | 17 | Extended JSON Timestamp |
 | `long` | 18 | `$numberLong` or larger JSON integer |
@@ -127,6 +129,33 @@ Queries can use `{ "$type": "timestamp" }` or code `17`.
 The daemon currently writes the current second with increment `1`; it does not
 provide MongoDB's per-process increment guarantees.
 
+## Regular expressions
+
+Stored BSON regular-expression values use the canonical Extended JSON form:
+
+```json
+{"$regularExpression": {"pattern": "^ada$", "options": "i"}}
+```
+
+The pattern and options must be strings. Supported options are `i`, `m`, `s`,
+`x`, and `u`. Values are stored as data, returned unchanged by reads, and can be
+updated like any other field. `{ "$type": "regex" }` and code `11` match stored
+values. Equality via `{ "$eq": <regex value> }` compares the exact pattern and
+options.
+
+A direct regex literal remains a string predicate, following MongoDB semantics:
+
+```json
+{"name": {"$regex": "^ada$", "$options": "i"}}
+{"name": {"$in": [{"$regularExpression": {"pattern": "^ada$", "options": "i"}}]}}
+```
+
+Use `$eq` when you want to find documents whose field stores that regex value.
+Regular-expression values are not entered into secondary, text, or fuzzy
+indexes. A query that targets them uses a collection scan; an index on the same
+field simply omits documents whose value is a regex. This is visible in
+`explain` as a collection-scan plan.
+
 ## MinKey and MaxKey
 
 ```json
@@ -143,7 +172,8 @@ stored, queried, compared, and indexed, and are matched by
 Binary and ObjectId keys were added in index format version 4. Indexes created
 with an older format are skipped for filters containing binary, ObjectId,
 numbers, dates, Timestamps, MinKey, or MaxKey; the query falls back to a scan
-until the index is recreated.
+until the index is recreated. Regular-expression values are not indexed at all;
+queries that target them always scan.
 
 ## Errors
 
@@ -153,14 +183,12 @@ until the index is recreated.
 | `invalid_binary` | Invalid `$binary`/`$uuid` payload or base64 |
 | `invalid_object_id` | `$oid` is not 24 hexadecimal characters |
 | `invalid_timestamp` | `$timestamp` does not contain valid u32 `t` and `i` fields |
+| `invalid_regex` | `$regularExpression` is malformed or has unsupported options |
 
 ## Not implemented
 
 The following BSON types are deliberately unsupported:
 
-- regular-expression values as stored data. The MongoDB wire listener accepts
-  BSON regex values as read filters (including `$in` operands) but rejects them
-  in documents, updates, and projections with `BadValue` (code 2),
 - `Code`, `CodeWithScope`, `Symbol`, `DBPointer`, `Undefined`.
 
 Stored-code types are not planned because nonodb does not execute document

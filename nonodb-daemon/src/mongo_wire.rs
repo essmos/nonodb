@@ -2355,12 +2355,7 @@ async fn create_indexes_command(
             directions.push(direction as i8);
             default_parts.push(format!("{field}_{direction_name}"));
         }
-        for unsupported in [
-            "partialFilterExpression",
-            "collation",
-            "wildcardProjection",
-            "weights",
-        ] {
+        for unsupported in ["collation", "wildcardProjection", "weights"] {
             if spec.contains_key(unsupported) {
                 return Err(bad_value(format!(
                     "index option `{unsupported}` is not supported by NonoDB"
@@ -2403,11 +2398,18 @@ async fn create_indexes_command(
                 "index name must be at most 127 bytes and must not contain NUL",
             ));
         }
+        let partial_filter_expression = match spec.get("partialFilterExpression") {
+            Some(Bson::Document(document)) => Some(bson_doc_json(document)),
+            Some(_) => return Err(bad_value("partialFilterExpression must be a document")),
+            None => None,
+        };
         specs.push(nonodb_core::IndexSpec {
             fields,
             name: name.to_string(),
             directions,
             unique: spec.get_bool("unique").unwrap_or(false),
+            sparse: spec.get_bool("sparse").unwrap_or(false),
+            partial_filter_expression,
             include: Vec::new(),
             geo,
         });
@@ -2611,6 +2613,14 @@ async fn list_indexes_command(
         };
         if def.unique {
             doc.insert("unique", true);
+        }
+        if def.sparse {
+            doc.insert("sparse", true);
+        }
+        if let Some(filter) = &def.partial_filter_expression {
+            if let Ok(document) = bson_map::document_to_bson(filter) {
+                doc.insert("partialFilterExpression", Bson::Document(document));
+            }
         }
         if def.geo {
             doc.insert("2dsphere", true);
@@ -3303,9 +3313,8 @@ fn values_to_bson(values: Vec<Value>) -> Result<Vec<Bson>, ApiError> {
 }
 
 /// MongoDB drivers send a regex literal as a BSON regular-expression value.
-/// NonoDB supports those values as read predicates, but does not store them, so
-/// reject them explicitly in documents, updates, projections, and non-filter
-/// aggregation positions.
+/// These values are stored as data; projections and non-filter aggregation
+/// positions cannot interpret them, so reject them explicitly there.
 fn is_bson_regex(value: &Value) -> bool {
     value.as_object().is_some_and(|object| {
         object.len() == 1
@@ -3315,21 +3324,21 @@ fn is_bson_regex(value: &Value) -> bool {
     })
 }
 
-fn reject_stored_bson_regex(value: &Value) -> Result<(), ApiError> {
+fn reject_projection_bson_regex(value: &Value) -> Result<(), ApiError> {
     if is_bson_regex(value) {
         return Err(bad_value(
-            "stored BSON regular-expression values are not supported; use the $regex operator",
+            "regular-expression values are not valid in a projection; use $regex in a filter",
         ));
     }
     match value {
         Value::Array(items) => {
             for item in items {
-                reject_stored_bson_regex(item)?;
+                reject_projection_bson_regex(item)?;
             }
         }
         Value::Object(object) => {
             for item in object.values() {
-                reject_stored_bson_regex(item)?;
+                reject_projection_bson_regex(item)?;
             }
         }
         _ => {}
@@ -3340,7 +3349,7 @@ fn reject_stored_bson_regex(value: &Value) -> Result<(), ApiError> {
 fn reject_aggregate_stored_regex(value: &Value) -> Result<(), ApiError> {
     if is_bson_regex(value) {
         return Err(bad_value(
-            "stored BSON regular-expression values are not supported; use the $regex operator",
+            "regular-expression values are not supported in this aggregation position; use $regex inside $match",
         ));
     }
     match value {
@@ -3369,36 +3378,14 @@ fn command_field(body: &Document, key: &str) -> Result<Option<Value>, ApiError> 
 
 fn validate_mongo_bson_values(command: &str, body: &Document) -> Result<(), ApiError> {
     match command {
-        "insert" => {
-            if let Some(Value::Array(documents)) = command_field(body, "documents")? {
-                for document in &documents {
-                    reject_stored_bson_regex(document)?;
-                }
-            }
-        }
-        "update" => {
-            if let Some(Value::Array(updates)) = command_field(body, "updates")? {
-                for update in &updates {
-                    let Some(spec) = update.as_object() else {
-                        continue;
-                    };
-                    if let Some(update) = spec.get("u") {
-                        reject_stored_bson_regex(update)?;
-                    }
-                }
-            }
-        }
         "find" => {
             if let Some(projection) = command_field(body, "projection")? {
-                reject_stored_bson_regex(&projection)?;
+                reject_projection_bson_regex(&projection)?;
             }
         }
         "findAndModify" | "findandmodify" => {
-            if let Some(update) = command_field(body, "update")? {
-                reject_stored_bson_regex(&update)?;
-            }
             if let Some(fields) = command_field(body, "fields")? {
-                reject_stored_bson_regex(&fields)?;
+                reject_projection_bson_regex(&fields)?;
             }
         }
         "aggregate" => {

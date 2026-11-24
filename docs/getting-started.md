@@ -92,7 +92,7 @@ archive for your platform from the
 Linux example:
 
 ```bash
-TAG=v0.30.0
+TAG=v0.32.0
 curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/nonodb-$TAG-linux-x86_64.tar.gz"
 curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/nonodb-$TAG-linux-x86_64.tar.gz.sha256"
 sha256sum -c "nonodb-$TAG-linux-x86_64.tar.gz.sha256"

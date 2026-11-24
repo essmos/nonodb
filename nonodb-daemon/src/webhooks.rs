@@ -1231,8 +1231,11 @@ mod tests {
             4096,
         ));
         let writer_stop = stop.clone();
-        let writer_thread =
-            std::thread::spawn(move || writer::run(writer_store, write_rx, cache, writer_stop));
+        let quota =
+            std::sync::Arc::new(crate::quota::Quota::load("test", dir.path()).expect("test quota"));
+        let writer_thread = std::thread::spawn(move || {
+            writer::run(writer_store, write_rx, cache, quota, writer_stop)
+        });
         let submit = |req| {
             let (resp, out) = tokio::sync::oneshot::channel();
             write_tx

@@ -559,6 +559,80 @@ class Collection {
     return result.results ?? [];
   }
 
+  /**
+   * Ordered lookups split into bounded requests. The concatenated result has
+   * the same length and order as `values`, with `null` for missing keys.
+   */
+  async lookupChunked(by, values, { chunkSize = 1000, fields, projection } = {}) {
+    if (!Number.isInteger(chunkSize) || chunkSize < 1 || chunkSize > 10000) {
+      throw new Error('chunkSize must be an integer between 1 and 10000');
+    }
+    const pending = Array.from(values);
+    const results = [];
+    for (let start = 0; start < pending.length; start += chunkSize) {
+      results.push(
+        ...(await this.lookup(by, pending.slice(start, start + chunkSize), {
+          fields,
+          projection,
+        })),
+      );
+    }
+    return results;
+  }
+
+  /**
+   * Attach matching foreign documents to local documents.
+   *
+   * Keys are read from `localField` and looked up with `lookupChunked`. The
+   * returned array preserves input order and length. Missing keys and keys
+   * without a match receive `null` in `asField`. Input documents are copied,
+   * not modified.
+   */
+  async lookupJoin(
+    foreign,
+    docs,
+    {
+      localField,
+      foreignBy = '_id',
+      asField = 'joined',
+      fields,
+      projection,
+      chunkSize = 1000,
+    } = {},
+  ) {
+    if (typeof localField !== 'string' || localField.length === 0) {
+      throw new Error('localField must be a non-empty string');
+    }
+    if (typeof asField !== 'string' || asField.length === 0) {
+      throw new Error('asField must be a non-empty string');
+    }
+    if (
+      docs === null ||
+      typeof docs !== 'object' ||
+      typeof docs[Symbol.iterator] !== 'function'
+    ) {
+      throw new Error('lookupJoin docs must be an iterable of objects');
+    }
+    const rows = [];
+    const keys = [];
+    for (const doc of docs) {
+      if (doc === null || typeof doc !== 'object' || Array.isArray(doc)) {
+        throw new Error('lookupJoin documents must be objects');
+      }
+      rows.push({ ...doc });
+      keys.push(Object.prototype.hasOwnProperty.call(doc, localField) ? doc[localField] : null);
+    }
+    const matches = await foreign.lookupChunked(foreignBy, keys, {
+      chunkSize,
+      fields,
+      projection,
+    });
+    rows.forEach((row, index) => {
+      row[asField] = matches[index] ?? null;
+    });
+    return rows;
+  }
+
   /** Return one document by `_id` or a unique index. */
   async lookupOne(by, value, options = {}) {
     const [document] = await this.lookup(by, [value], options);

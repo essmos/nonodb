@@ -183,6 +183,11 @@ def select_matrix(db: NonoDB) -> None:
     check(db, "SELECT COUNT(DISTINCT team) AS teams, COUNT(DISTINCT city) AS cities FROM users", [
         {"teams": 3, "cities": 4}
     ])
+    check(db, "SELECT COUNT(DISTINCT score) AS n, SUM(DISTINCT score) AS total, "
+              "AVG(DISTINCT score) AS average, MIN(DISTINCT score) AS smallest, "
+              "MAX(DISTINCT score) AS largest FROM users", [
+        {"n": 5, "total": 150, "average": 30, "smallest": 10, "largest": 50}
+    ])
     check(db, "SELECT team, COUNT(*) AS n, SUM(score) AS total FROM users GROUP BY team ORDER BY team", [
         {"team": "core", "n": 3, "total": 30},
         {"team": "kernel", "n": 2, "total": 70},
@@ -226,8 +231,19 @@ def write_matrix(db: NonoDB) -> None:
     )
     assert out[0]["inserted_ids"] == ["c"], out
 
+    out = db.sql(
+        "INSERT INTO write_users (name, age) VALUES ('R', 22) RETURNING name, age"
+    )
+    assert out[0]["inserted"] == 1 and out[0]["returned"] == [{"name": "R", "age": 22}], out
+    out = db.sql("DELETE FROM write_users WHERE name = 'R' RETURNING *")
+    assert out[0]["deleted"] == 1 and out[0]["returned"][0]["name"] == "R", out
+
     out = db.sql("UPDATE write_users SET age = age + $1 WHERE name = $2", [5, "A"])
     assert out[0] == {"matched": 1, "modified": 1}, out
+    out = db.sql(
+        "UPDATE write_users SET age = age WHERE name = 'B' RETURNING name, age AS years"
+    )
+    assert out[0]["matched"] == 1 and out[0]["returned"] == [{"name": "B", "years": 30}], out
     out = db.sql("UPDATE write_users SET active = TRUE")
     assert out[0] == {"matched": 3, "modified": 3}, out
     out = db.sql("UPDATE write_users AS w SET w.profile.level = $1 WHERE w.name = $2", [9, "B"])
@@ -253,7 +269,6 @@ def error_matrix(db: NonoDB) -> None:
         "SELEC name FROM users",
         "SELECT name FROM",
         "SELECT * FROM users WHERE age =",
-        "SELECT SUM(DISTINCT score) FROM users",
         "SELECT * FROM users GROUP BY team",
         "SELECT name, COUNT(*) FROM users GROUP BY team",
         "SELECT team, COUNT(*) AS n FROM users GROUP BY team ORDER BY score",
@@ -262,16 +277,16 @@ def error_matrix(db: NonoDB) -> None:
         "SELECT * FROM users WHERE age IN (SELECT age FROM write_users)",
         "INSERT INTO users (name, age) VALUES ('x')",
         "INSERT INTO users (name, name) VALUES ('x', 'y')",
-        "INSERT INTO users (name) VALUES ('x') RETURNING *",
-        "UPDATE users SET age = age + 1 RETURNING *",
-        "DELETE FROM users RETURNING *",
+        "INSERT INTO users (name) VALUES ('x') RETURNING COUNT(*)",
+        "UPDATE users SET age = age + 1 RETURNING *, name",
+        "DELETE FROM users RETURNING age +",
         "SELECT * FROM users % 2",
         "CREATE TABLE nope (id INT)",
         "BEGIN",
     ]:
         expect_sql_error(db, query)
     expect_sql_error(db, "SELECT name FROM users WHERE age = $2", [1])
-    expect_sql_error(db, "SELECT SUM(DISTINCT score) FROM users")
+    expect_sql_error(db, "SELECT MEDIAN(score) FROM users")
 
 
 def concurrent_matrix(sock: str) -> None:

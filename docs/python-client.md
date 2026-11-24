@@ -16,18 +16,23 @@ Python, curl, the CLI, and any future language client all see the same behavior.
 - Optional: [`orjson`](https://github.com/ijson/ijson) for faster JSON encoding
   and decoding
 
-The client is a single module, not yet published on PyPI. Add the `client`
-directory to your import path or vendor `nonodb.py` into your project:
+The client is packaged as `nonodb-client`. From a repository checkout:
+
+```bash
+python3 -m pip install ./client          # runtime dependency: httpx
+python3 -m pip install "./client[speed]" # adds orjson
+```
+
+For editable development or vendoring, add the `client` directory to your
+import path instead:
 
 ```bash
 export PYTHONPATH="/path/to/nonodb/client:$PYTHONPATH"
+python3 -m pip install httpx
 ```
 
-Install dependencies with your package manager, for example:
-
-```bash
-pip install httpx orjson
-```
+After the package is published to PyPI, the equivalent commands are
+`pip install nonodb-client` and `pip install "nonodb-client[speed]"`.
 
 ## Connecting
 
@@ -326,6 +331,22 @@ rows = users.lookup(
 A non-`_id` lookup requires a unique index with the same field order as `by`.
 For a compound lookup each value must be an array of the same length. Values are
 limited to 10,000 per request and the result budget to 64 MiB.
+
+`lookup_join` attaches a foreign document to copies of local documents while
+preserving order and missing-key alignment:
+
+```python
+posts = db.collection("posts")
+joined = posts.lookup_join(
+    users,
+    posts.find({}),
+    local_field="author_id",
+    foreign_by="_id",
+    as_field="author",
+    fields=["name", "email"],
+)
+# Missing authors produce {"author": None, ...}.
+```
 
 `fields` is a top-level inclusive projection; a covering index can satisfy it
 without reading the document. `projection` accepts a normal flat projection,
@@ -797,6 +818,65 @@ Collection.vector_search(
 - Missing or wrong-length vectors are not indexed.
 - The same model and dimensions must be used for stored vectors and queries.
 
+## Graph
+
+Graphs use ordinary node and edge collections. Configure one graph per node
+collection, then traverse it or ask for a shortest path.
+
+```python
+nodes = db.collection("nodes")
+nodes.set_graph(
+    "edges",
+    from_field="from",
+    to_field="to",
+    label_field="label",
+    weight_field="weight",
+    directed=True,
+)
+
+# Nested tree, one level per node; expand nodes lazily in a UI.
+tree = nodes.traverse("alice", direction="out", labels=["KNOWS"], max_depth=2)
+print(tree["nodes"], tree["edges"], tree["truncated"], tree["missing"])
+
+# Flat list instead of a tree.
+items = nodes.traverse(["alice", "bob"], max_depth=1, tree=False)["items"]
+
+# Seed traversal from the top-K results of a vector index.
+seeded = nodes.traverse(
+    seed={"vector": {"field": "embedding", "vector": [0.1, 0.9, 0.0], "k": 5}},
+    max_depth=2,
+)
+
+# BFS by hops, or Dijkstra with the configured weight field.
+path = nodes.shortest_path("alice", "carol")
+weighted = nodes.shortest_path("alice", "carol", weighted=True)
+paths = nodes.all_shortest_paths("alice", "carol", limit_paths=10)
+matches = nodes.graph_match(
+    "alice",
+    [{"direction": "out", "labels": ["KNOWS"], "min_hops": 1, "max_hops": 3}],
+)
+ranked = nodes.pagerank(limit=20)
+degrees = nodes.degree_centrality(limit=20)
+components = nodes.connected_components()
+
+# Adjacency is derived data and can always be rebuilt.
+nodes.reindex_graph()
+nodes.reindex_graph(online=True)
+nodes.graph_rebuild_status()
+nodes.neighbors("alice", edge_filter={"weight": {"$gte": 0.5}})
+nodes.hybrid_search("embedding", [0.1, 0.9, 0.0], k=10, max_depth=2)
+print(nodes.get_graph())
+nodes.drop_graph()
+```
+
+`traverse` accepts `direction="out"|"in"|"both"`, `algorithm="bfs"|"dfs"`,
+`limit_nodes`, `limit_edges`, `max_bytes`, and `include_edges`. A repeated
+arrival is marked with `"cycle": True` and is not expanded. `truncated` reports
+a reached budget; `missing` lists unresolved ids. `start` and `seed` are
+mutually exclusive.
+
+See [Graph traversal](graph.md) and [HTTP API: graph](api.md#graph).
+
 ## Listing indexes
 
 ```python
@@ -1043,6 +1123,21 @@ workers, one database owner.
 concurrent requests and the cache has its own lock. For simplicity and
 predictable connection behavior, many applications create one client per
 worker process or per thread.
+
+## Building the distribution
+
+The package metadata is in `client/pyproject.toml`. Build and verify a wheel and
+sdist from the repository root:
+
+```bash
+python3 -m pip install build
+python3 -m build client --outdir dist
+python3 scripts/python_package_test.py --dist dist
+```
+
+The test installs both the wheel and the sdist in clean virtualenvs, checks the
+imported version and metadata, and validates the sdist contents. Maintainer publication steps are separate and
+manual; see [Development](development.md#python-package).
 
 ## Complete example
 

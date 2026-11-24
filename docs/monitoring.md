@@ -100,6 +100,32 @@ their duration is client waiting time. Compute p95 latency with:
 histogram_quantile(0.95, sum by (le, op) (rate(nonodb_request_duration_seconds_bucket[5m])))
 ```
 
+Ordered point lookups also have dedicated counters and a histogram:
+
+```text
+nonodb_lookup_requests_total
+nonodb_lookup_explains_total
+nonodb_lookup_keys_total
+nonodb_lookup_unique_keys_total
+nonodb_lookup_found_total
+nonodb_lookup_missing_total
+nonodb_lookup_documents_read_total
+nonodb_lookup_index_entries_read_total
+nonodb_lookup_bytes_read_total
+nonodb_lookup_bytes_returned_total
+nonodb_lookup_errors_total
+nonodb_lookup_duration_ns_total
+nonodb_lookup_duration_seconds_bucket{op="lookup",le="0.001"}
+nonodb_lookup_duration_seconds_bucket{op="explain_lookup",le="0.001"}
+```
+
+`nonodb_lookup_duration_seconds` measures the lookup execution itself, not the
+HTTP round trip. Use it to watch index coverage and document-fetch rates:
+
+```promql
+histogram_quantile(0.95, sum by (le, op) (rate(nonodb_lookup_duration_seconds_bucket[5m])))
+```
+
 ## OpenTelemetry
 
 The daemon does not embed the OpenTelemetry SDK or push OTLP itself. This keeps
@@ -129,11 +155,37 @@ Tempo/Mimir, Honeycomb, Datadog, and self-hosted OpenTelemetry Collectors.
 - stale snapshots and snapshot failures;
 - elevated authentication failures and IP lockouts;
 - per-collection error rate;
-- replica lag, replication transport errors, apply failures, and stale replica acks.
+- replica lag, replication transport errors, apply failures, and stale replica acks;
+- TLS certificates that expire within 14 days or have already expired.
 
 Tune thresholds and `for:` durations for the deployment. The disk alerts use
 `mount="data"`; snapshot alerts only fire when periodic snapshots are enabled
 with `NONODB_SNAPSHOT_DIR`.
+
+## Certificate metrics
+
+When TLS is configured, the daemon exports the leaf certificate expiry as a
+Unix timestamp:
+
+| Metric | Meaning |
+|---|---|
+| `nonodb_tls_certificate_expiry_timestamp_seconds{kind}` | Expiry time of the configured certificate |
+
+The `kind` label is `server` for `NONODB_TLS_CERT` and `replication` for
+`NONODB_REPLICATION_CERT_FILE`. The series is absent when the corresponding
+certificate is not configured. The same values are available in the `/metrics`
+JSON response under `certificates`.
+
+The included `NonoDBCertificateExpiring` alert fires when a certificate has
+less than 14 days remaining:
+
+```promql
+nonodb_tls_certificate_expiry_timestamp_seconds - time() < 14 * 24 * 3600
+```
+
+Rotate the certificate and trigger the normal TLS reload by replacing the file.
+For a replication client certificate, restart the daemon so the outbound HTTP
+client picks up the new identity.
 
 ## Disk and snapshot metrics
 
@@ -157,6 +209,17 @@ Periodic snapshots expose per-database series:
 | `nonodb_snapshot_age_seconds` | Age of the last success |
 | `nonodb_snapshot_last_failure_timestamp_seconds` | Unix time of the last failure |
 | `nonodb_snapshot_last_duration_ms` | Duration of the last successful snapshot |
+
+With PITR enabled, WAL retention exposes per-database series:
+
+| Metric | Meaning |
+|---|---|
+| `nonodb_wal_bytes` | Bytes used by retained WAL |
+| `nonodb_wal_oldest_age_seconds` | Age of the oldest retained WAL segment |
+| `nonodb_wal_last_sequence` | Highest sequence archived in the WAL |
+| `nonodb_wal_full` | `1` while the hard limit rejects writes |
+| `nonodb_pitr_available` | `1` when a snapshot plus WAL can serve a restore |
+| `nonodb_wal_pruned_bytes_total` | WAL bytes removed by covered-snapshot retention |
 
 `nonodb-cli backup` runs outside the daemon, so its age is not reported here.
 For external backups, write a timestamp marker in your backup script and alert
@@ -230,6 +293,12 @@ At minimum, alert on:
 4. sustained `nonodb_queue_len` growth
 5. a sustained `nonodb_errors_total` rate
 6. `nonodb_auth_failures_total` and `nonodb_auth_blocks_total`
+7. `nonodb_tls_certificate_expiry_timestamp_seconds - time() < 14 * 24 * 3600`
+8. `nonodb_wal_full == 1`
+9. `nonodb_pitr_available == 0` when PITR is enabled and the WAL has data
+10. `nonodb_wal_oldest_age_seconds` above the configured PITR window
+11. `nonodb_tls_revocation_refresh_errors_total` increasing when CRL/OCSP is configured
+12. `nonodb_tls_revocation_unavailable_total` increasing with fail-closed mTLS
 
 `GET /metrics` remains available for existing JSON consumers and includes the
-same extra `disk`, `snapshots`, and `collection_metrics` fields.
+same extra `disk`, `snapshots`, `wal`, and `collection_metrics` fields.

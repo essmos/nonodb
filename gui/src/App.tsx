@@ -1,11 +1,20 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode } from 'react';
 import CodeMirror from '@uiw/react-codemirror';
 import { json as jsonLanguage } from '@codemirror/lang-json';
 import { sql as sqlLanguage } from '@codemirror/lang-sql';
 import { oneDark } from '@codemirror/theme-one-dark';
 import { autocompletion, type CompletionContext } from '@codemirror/autocomplete';
 import QueryBuilder from './QueryBuilder';
+import { handleTabKey } from './accessibility';
+import {
+  normalizeViewList,
+  parseSavedViewsFile,
+  savedViewsFileName,
+  serializeSavedViews,
+  type SavedView,
+} from './savedViews';
 import EventingPage from './EventingPage';
+import GraphPage from './GraphPage';
 import {
   applyFirewall,
   authSummary,
@@ -21,7 +30,6 @@ import {
   createReplicaPairing,
   databaseStats,
   disableFirewall,
-  defaultConnection,
   deleteBackupJob,
   deletePrincipal,
   disconnectReplication,
@@ -42,6 +50,8 @@ import {
   replicationStatus,
   resumeReplication,
   revokeReplicaPairing,
+  restoreInPlace,
+  restorePreflight,
   runImport,
   updateReplicationSource,
   loadConnection,
@@ -68,6 +78,8 @@ import {
   type ReplicationChangeTxn,
   type NetworkInfo,
   type ReplicationStatus,
+  type RestorePreflight,
+  type RestoreResult,
   type DatabaseStorageStats,
   subscribeTiming,
   updateAuthToken,
@@ -255,15 +267,72 @@ function Modal({
   children: ReactNode;
   wide?: boolean;
 }) {
+  const titleId = useId();
+  const subtitleId = useId();
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    if (!dialog) return;
+    const previous = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const focusable = () =>
+      Array.from(
+        dialog.querySelectorAll<HTMLElement>(
+          'a[href], button:not([disabled]), textarea:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])',
+        ),
+      ).filter((element) => element.getClientRects().length > 0);
+    if (!dialog.contains(document.activeElement)) {
+      (focusable()[0] ?? dialog).focus();
+    }
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        onCloseRef.current();
+        return;
+      }
+      if (event.key !== 'Tab') return;
+      const items = focusable();
+      if (items.length === 0) {
+        event.preventDefault();
+        dialog.focus();
+        return;
+      }
+      const first = items[0];
+      const last = items[items.length - 1];
+      if (event.shiftKey && (document.activeElement === first || !dialog.contains(document.activeElement))) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('keydown', onKey);
+      if (previous?.isConnected) previous.focus();
+    };
+  }, []);
+
   return (
     <div className="modal-backdrop" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
-      <div className={`modal${wide ? ' wide-modal' : ''}`} role="dialog" aria-modal="true">
+      <div
+        ref={dialogRef}
+        className={`modal${wide ? ' wide-modal' : ''}`}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        aria-describedby={subtitle ? subtitleId : undefined}
+        tabIndex={-1}
+      >
         <div className="modal-header">
           <div>
-            <h3>{title}</h3>
-            {subtitle && <p className="muted small">{subtitle}</p>}
+            <h3 id={titleId}>{title}</h3>
+            {subtitle && <p id={subtitleId} className="muted small">{subtitle}</p>}
           </div>
-          <button className="icon-button" onClick={onClose} aria-label="Close">
+          <button className="icon-button" onClick={onClose} aria-label="Close dialog">
             ✕
           </button>
         </div>
@@ -291,8 +360,31 @@ function cleanField(value: string): string {
   return value.trim().replace(/^["'`]+|["'`]+$/g, '');
 }
 
-function ConnectView({ onConnected }: { onConnected: (connection: Connection) => void }) {
-  const [connection, setConnection] = useState<Connection>(() => loadConnection());
+function connectionScope(connection: Connection): string {
+  const endpoint = connection.endpoint.trim().replace(/^https?:\/\//i, '').replace(/\/+$/, '');
+  return encodeURIComponent(`${endpoint || 'local'}|${connection.database || 'default'}`);
+}
+
+function collectionViewStorageKey(connection: Connection, collection: string): string {
+  return `nonodb.gui.views.${connectionScope(connection)}.${collection}`;
+}
+
+function playgroundHistoryStorageKey(connection: Connection, mode: string): string {
+  return `nonodb.gui.history.${connectionScope(connection)}.${mode}`;
+}
+
+function ConnectView({
+  onConnected,
+  initialConnection,
+  onCancel,
+}: {
+  onConnected: (connection: Connection) => void;
+  initialConnection?: Connection;
+  onCancel?: () => void;
+}) {
+  const [connection, setConnection] = useState<Connection>(
+    () => initialConnection ?? loadConnection(),
+  );
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [advanced, setAdvanced] = useState(false);
@@ -363,7 +455,12 @@ function ConnectView({ onConnected }: { onConnected: (connection: Connection) =>
         <button className="primary wide" onClick={connect} disabled={busy}>
           {busy ? 'Connecting…' : 'Connect'}
         </button>
-        {error && <div className="error-box">{error}</div>}
+        {error && <div className="error-box" role="alert">{error}</div>}
+        {onCancel && (
+          <button className="link-button" onClick={onCancel} disabled={busy}>
+            Back to the active connection
+          </button>
+        )}
         <button className="link-button" onClick={() => setAdvanced(!advanced)}>
           {advanced ? 'Hide advanced options' : 'Advanced: endpoint, profiles, vault'}
         </button>
@@ -514,7 +611,7 @@ function DatabaseMetrics({ connection }: { connection: Connection }) {
 
   return (
     <>
-      {error && <div className="error-box">{error}</div>}
+      {error && <div className="error-box" role="alert">{error}</div>}
       <section className="panel">
         <div className="panel-title">
           <h3>Database metrics</h3>
@@ -1030,8 +1127,8 @@ function BackupsPage({ connection }: { connection: Connection }) {
           <button onClick={() => void load()} disabled={loading}>{loading ? 'Loading…' : 'Refresh'}</button>
         </div>
       </header>
-      {error && <div className="error-box">{error}</div>}
-      {notice && <div className="notice-box">{notice}</div>}
+      {error && <div className="error-box" role="alert">{error}</div>}
+      {notice && <div className="notice-box" role="status">{notice}</div>}
       <section className={`panel disclaimer-box${disclaimerAccepted ? ' accepted' : ''}`}>
         <div className="panel-title">
           <h3>Backup disclaimer</h3>
@@ -1327,6 +1424,11 @@ function ImportsPage({ connection }: { connection: Connection }) {
   const [selected, setSelected] = useState<string | null>(null);
   const [target, setTarget] = useState('');
   const [status, setStatus] = useState<ImportStatus | null>(null);
+  const [restoreTarget, setRestoreTarget] = useState(connection.database);
+  const [restoreCheck, setRestoreCheck] = useState<RestorePreflight | null>(null);
+  const [restoreConfirmation, setRestoreConfirmation] = useState('');
+  const [restoreResult, setRestoreResult] = useState<RestoreResult | null>(null);
+  const [restoring, setRestoring] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
@@ -1400,6 +1502,9 @@ function ImportsPage({ connection }: { connection: Connection }) {
     setSelected(item.location);
     setTarget(`restored-${item.manifest.source}`);
     setStatus(null);
+    setRestoreCheck(null);
+    setRestoreConfirmation('');
+    setRestoreResult(null);
     setError('');
   };
 
@@ -1420,6 +1525,54 @@ function ImportsPage({ connection }: { connection: Connection }) {
     }
   };
 
+  const verifyRestore = async () => {
+    if (!selected) throw new Error('Select a backup first.');
+    if (!restoreTarget.trim()) throw new Error('Restore target database is required.');
+    setRestoring(true);
+    setError('');
+    setNotice('');
+    setRestoreResult(null);
+    try {
+      const result = await restorePreflight(
+        connection,
+        source(),
+        selected,
+        restoreTarget.trim(),
+      );
+      setRestoreCheck(result);
+      setRestoreConfirmation('');
+      setNotice(`Verified backup for ${result.database}. Type ${result.confirmation} to enable restore.`);
+    } catch (err) {
+      setRestoreCheck(null);
+      setError(errorText(err));
+    } finally {
+      setRestoring(false);
+    }
+  };
+
+  const restore = async () => {
+    if (!restoreCheck) throw new Error('Verify the backup first.');
+    if (restoreConfirmation !== restoreCheck.confirmation) return;
+    setRestoring(true);
+    setError('');
+    setNotice('');
+    try {
+      const result = await restoreInPlace(
+        connection,
+        source(),
+        restoreCheck.location,
+        restoreCheck.database,
+        restoreConfirmation,
+      );
+      setRestoreResult(result);
+      setNotice(`Restored ${result.database}. Safety snapshot: ${result.safety_snapshot}`);
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setRestoring(false);
+    }
+  };
+
   const selectedBackup = backups.find((item) => item.location === selected);
   const formatTime = (ms: number) => (ms > 0 ? new Date(ms).toLocaleString() : '—');
   const formatSize = (bytes: number) => formatBytes(bytes);
@@ -1429,14 +1582,14 @@ function ImportsPage({ connection }: { connection: Connection }) {
       <header className="page-header">
         <div>
           <h2>Import</h2>
-          <p>Import a verified backup as a new database. The live database is never replaced.</p>
+          <p>Import a verified backup as a new database, or verify and restore one in place.</p>
         </div>
         <div className="actions">
           <button onClick={() => void loadOverview()}>Refresh</button>
         </div>
       </header>
-      {error && <div className="error-box">{error}</div>}
-      {notice && <div className="notice-box">{notice}</div>}
+      {error && <div className="error-box" role="alert">{error}</div>}
+      {notice && <div className="notice-box" role="status">{notice}</div>}
 
       <section className="panel">
         <div className="panel-title"><h3>Source</h3></div>
@@ -1547,6 +1700,77 @@ function ImportsPage({ connection }: { connection: Connection }) {
           )}
         </section>
       )}
+
+      <section className="panel">
+        <div className="panel-title"><h3>Restore in place</h3><span className="badge danger-badge">destructive</span></div>
+        <p className="muted">
+          Replaces the selected database with the chosen backup. Preflight verifies the manifest,
+          checksum and database contents, then requires the exact typed phrase. The current
+          database directory is kept as a safety snapshot for rollback.
+        </p>
+        <div className="form-grid">
+          <label>
+            Target database
+            <input
+              value={restoreTarget}
+              onChange={(event) => {
+                setRestoreTarget(event.target.value);
+                setRestoreCheck(null);
+                setRestoreConfirmation('');
+                setRestoreResult(null);
+              }}
+              placeholder="app1"
+            />
+            <span className="field-hint">
+              The default database requires the offline CLI restore. Restore is available for
+              non-default databases while the daemon runs.
+            </span>
+          </label>
+          <label>
+            Verified backup
+            <input readOnly value={restoreCheck?.location ?? 'No backup verified yet'} />
+            <span className="field-hint">
+              {restoreCheck
+                ? `SHA-256 ${restoreCheck.manifest.sha256} · ${formatSize(restoreCheck.backup_bytes)}`
+                : 'Select a backup above and run preflight verification.'}
+            </span>
+          </label>
+        </div>
+        <div className="toolbar">
+          <button onClick={() => void verifyRestore()} disabled={busy || restoring || !selected || restoreTarget.trim() === 'default'}>
+            {restoring ? 'Working…' : 'Verify for restore'}
+          </button>
+        </div>
+        {restoreCheck && (
+          <>
+            <label>
+              Type <code>{restoreCheck.confirmation}</code> to confirm
+              <input
+                value={restoreConfirmation}
+                onChange={(event) => setRestoreConfirmation(event.target.value)}
+                autoComplete="off"
+                spellCheck={false}
+              />
+            </label>
+            <div className="toolbar">
+              <button
+                className="danger"
+                onClick={() => void restore()}
+                disabled={restoring || restoreConfirmation !== restoreCheck.confirmation}
+              >
+                {restoring ? 'Restoring…' : `Restore ${restoreCheck.database} in place`}
+              </button>
+            </div>
+          </>
+        )}
+        {restoreResult && (
+          <div className="notice-box">
+            Restored <strong>{restoreResult.database}</strong>. Safety snapshot:
+            <div className="mono">{restoreResult.safety_snapshot}</div>
+            <div className="muted small">{restoreResult.rollback}</div>
+          </div>
+        )}
+      </section>
 
       <section className="panel">
         <div className="panel-title"><h3>Recent imports</h3><span>{overview?.jobs.length ?? 0}</span></div>
@@ -1674,7 +1898,7 @@ function ClusterPage({ connection }: { connection: Connection }) {
           <button onClick={() => void load()} disabled={loading}>{loading ? 'Refreshing…' : 'Refresh'}</button>
         </div>
       </header>
-      {error && <div className="error-box">{error}</div>}
+      {error && <div className="error-box" role="alert">{error}</div>}
       {cluster?.message && <div className="panel"><p className="muted">{cluster.message}</p></div>}
       {progress && (
         <section className={`panel test-progress ${progress.active ? 'test-progress-live' : ''}`}>
@@ -1755,7 +1979,7 @@ function ClusterPage({ connection }: { connection: Connection }) {
                 </span>
               </div>
               {!node.ok ? (
-                <div className="error-box">{node.error ?? 'node unreachable'}</div>
+                <div className="error-box" role="alert">{node.error ?? 'node unreachable'}</div>
               ) : (
                 <>
                   <div className="stat-grid cluster-stats">
@@ -1783,8 +2007,8 @@ function ClusterPage({ connection }: { connection: Connection }) {
                   <div className="cluster-detail"><span>Reads</span><strong>{metric(node, 'read_ops_total').toLocaleString()}</strong></div>
                   <div className="cluster-detail"><span>Errors</span><strong>{metric(node, 'errors_total').toLocaleString()}</strong></div>
                   <div className="cluster-detail"><span>Disk used</span><strong>{(Number(node.metrics?.disk?.data?.used_ratio ?? 0) * 100).toFixed(1)}%</strong></div>
-                  {nodeError.transport && <div className="error-box">transport: {nodeError.transport}</div>}
-                  {nodeError.apply && <div className="error-box">apply: {nodeError.apply}</div>}
+                  {nodeError.transport && <div className="error-box" role="alert">transport: {nodeError.transport}</div>}
+                  {nodeError.apply && <div className="error-box" role="alert">apply: {nodeError.apply}</div>}
                 </>
               )}
             </section>
@@ -2052,7 +2276,7 @@ function ReplicationPage({ connection }: { connection: Connection }) {
           <button onClick={() => void load()} disabled={loading}>{loading ? 'Loading…' : 'Refresh'}</button>
         </div>
       </header>
-      {error && <div className="error-box">{error}</div>}
+      {error && <div className="error-box" role="alert">{error}</div>}
       <section className="panel">
         <div className="panel-title"><h3>How to read this page</h3><span>glossary</span></div>
         <div className="replication-glossary">
@@ -2132,7 +2356,7 @@ docker volume create nonodb-replica-run
 docker run --rm \
   -v nonodb-replica-data:/var/lib/nonodb \
   -e NONODB_AUTH_FILE=/var/lib/nonodb/auth.json \
-  ghcr.io/essmos/nonodb:0.30.0 \
+  ghcr.io/essmos/nonodb:0.32.0 \
   nonodb-cli auth init
 
 docker run -d --name nonodb-replica \
@@ -2144,7 +2368,7 @@ docker run -d --name nonodb-replica \
   -e NONODB_REPLICATION_ROLE=replica \
   -e NONODB_REPLICATION_NODE_ID=replica-docker \
   -e NONODB_REPLICATION_ADVERTISE_URL=http://DOCKER_HOST_IP:7912 \
-  ghcr.io/essmos/nonodb:0.30.0
+  ghcr.io/essmos/nonodb:0.32.0
 
 docker exec nonodb-replica nonodb-cli replication join \
   http://PRIMARY_HOST:7878 PAIRING-CODE
@@ -2196,7 +2420,7 @@ docker exec nonodb-replica nonodb-cli replication status`}</pre>
           )}
         </section>
       )}
-      {replicationNotice && <div className="notice-box">{replicationNotice}</div>}
+      {replicationNotice && <div className="notice-box" role="status">{replicationNotice}</div>}
       {status && status.role !== 'primary' && (
         <section className="panel">
           <div className="panel-title">
@@ -2243,10 +2467,10 @@ docker exec nonodb-replica nonodb-cli replication status`}</pre>
             <RepStat label="Databases" value={<span className="mono">{(status.replication.databases ?? []).join(', ') || '—'}</span>} help="Databases included in this replication source configuration." />
           </div>
           {replicationError.transport && (
-            <div className="error-box">transport: {replicationError.transport}</div>
+            <div className="error-box" role="alert">transport: {replicationError.transport}</div>
           )}
           {replicationError.apply && (
-            <div className="error-box">apply: {replicationError.apply}</div>
+            <div className="error-box" role="alert">apply: {replicationError.apply}</div>
           )}
             </>
           )}
@@ -2447,7 +2671,7 @@ function StorageView({
           </button>
         </div>
       </header>
-      {error && <div className="error-box">{error}</div>}
+      {error && <div className="error-box" role="alert">{error}</div>}
       {loading && !stats && <p className="muted">Reading LMDB storage statistics…</p>}
       {stats && (
         <>
@@ -2624,8 +2848,8 @@ function NetworkView({ connection }: { connection: Connection }) {
           <button onClick={() => void load()} disabled={busy}>Refresh</button>
         </div>
       </header>
-      {error && <div className="error-box">{error}</div>}
-      {notice && <div className="notice-box">{notice}</div>}
+      {error && <div className="error-box" role="alert">{error}</div>}
+      {notice && <div className="notice-box" role="status">{notice}</div>}
 
       <section className="panel">
         <div className="panel-title"><h3>Listeners</h3><span>actual bind</span></div>
@@ -2636,7 +2860,7 @@ function NetworkView({ connection }: { connection: Connection }) {
             <div className="cluster-detail"><span>Unix socket</span><strong className="mono">{data.listeners.unix ?? "disabled"}</strong></div>
             <div className="cluster-detail"><span>Advertise URL</span><strong className="mono">{data.listeners.advertise_url ?? "—"}</strong></div>
             {data.listeners.tcp?.bound?.startsWith("127.") && (
-              <div className="error-box">TCP is loopback-only. Remote replicas cannot connect until the daemon listens on 0.0.0.0 or a LAN address.</div>
+              <div className="error-box" role="alert">TCP is loopback-only. Remote replicas cannot connect until the daemon listens on 0.0.0.0 or a LAN address.</div>
             )}
           </>
         ) : <p className="muted">Loading listener details…</p>}
@@ -2655,12 +2879,12 @@ function NetworkView({ connection }: { connection: Connection }) {
             <div className="cluster-detail"><span>Apply</span><strong>{data.firewall.apply_enabled ? "enabled" : "disabled (preview only)"}</strong></div>
             <div className="cluster-detail"><span>Managed table</span><strong>{data.firewall.managed ? "active" : "not active"}</strong></div>
             {!data.firewall.apply_enabled && (
-              <div className="error-box">
+              <div className="error-box" role="alert">
                 Apply is disabled. Set <code>NONODB_FIREWALL_MANAGE=1</code> on the daemon and restart it.
                 The rules below are still generated for review.
               </div>
             )}
-            {data.firewall.error && <div className="error-box">{data.firewall.error}</div>}
+            {data.firewall.error && <div className="error-box" role="alert">{data.firewall.error}</div>}
           </>
         )}
         <div className="form-grid">
@@ -2732,7 +2956,7 @@ function Dashboard({
           <button onClick={onRefresh}>Refresh</button>
         </div>
       </header>
-      {error && <div className="error-box">{error}</div>}
+      {error && <div className="error-box" role="alert">{error}</div>}
       <div className="stat-grid">
         <div className="stat">
           <span>Collections</span>
@@ -2861,9 +3085,11 @@ function CollectionView({
   const [docs, setDocs] = useState<Doc[]>([]);
   const [sampleDocs, setSampleDocs] = useState<Doc[]>([]);
   const [fieldPaths, setFieldPaths] = useState<string[]>([]);
-  const [savedViews, setSavedViews] = useState<Array<Record<string, string | number>>>(() => {
+  const [savedViews, setSavedViews] = useState<SavedView[]>(() => {
     try {
-      return JSON.parse(localStorage.getItem(`nonodb.gui.views.${name}`) ?? '[]') as Array<Record<string, string | number>>;
+      return normalizeViewList(
+        JSON.parse(localStorage.getItem(collectionViewStorageKey(connection, name)) ?? '[]'),
+      );
     } catch {
       return [];
     }
@@ -2934,6 +3160,7 @@ function CollectionView({
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
   const fileInput = useRef<HTMLInputElement>(null);
+  const viewsFileInput = useRef<HTMLInputElement>(null);
 
   const sort = useMemo(() => {
     const field = cleanField(sortField);
@@ -3094,7 +3321,7 @@ function CollectionView({
       { name: label, filter: filterText, sortField, sortDir, limit, projection: projectionText },
     ].sort((a, b) => String(a.name).localeCompare(String(b.name)));
     setSavedViews(next);
-    localStorage.setItem(`nonodb.gui.views.${name}`, JSON.stringify(next));
+    localStorage.setItem(collectionViewStorageKey(connection, name), JSON.stringify(next));
     setViewName('');
     setNotice(`Saved view "${label}"`);
   };
@@ -3102,12 +3329,36 @@ function CollectionView({
   const applyView = (label: string) => {
     const view = savedViews.find((item) => item.name === label);
     if (!view) return;
-    setFilterText(String(view.filter ?? '{}'));
-    setSortField(String(view.sortField ?? '_id'));
-    setSortDir(view.sortDir === 'desc' ? 'desc' : 'asc');
-    setLimit(Number(view.limit ?? 50));
-    setProjectionText(String(view.projection ?? ''));
+    setFilterText(view.filter);
+    setSortField(view.sortField);
+    setSortDir(view.sortDir);
+    setLimit(view.limit);
+    setProjectionText(view.projection);
     setSkip(0);
+  };
+
+  const exportViews = () => {
+    if (savedViews.length === 0) return;
+    downloadText(savedViewsFileName(name), serializeSavedViews(name, savedViews));
+    setNotice(`Exported ${savedViews.length} saved view${savedViews.length === 1 ? '' : 's'}`);
+  };
+
+  const importViews = async (file: File | null) => {
+    if (!file) return;
+    setError('');
+    try {
+      const imported = parseSavedViewsFile(await file.text());
+      const names = new Set(imported.map((view) => view.name));
+      const next = [...savedViews.filter((view) => !names.has(view.name)), ...imported].sort(
+        (a, b) => a.name.localeCompare(b.name),
+      );
+      setSavedViews(next);
+      localStorage.setItem(collectionViewStorageKey(connection, name), JSON.stringify(next));
+      setViewName('');
+      setNotice(`Imported ${imported.length} saved view${imported.length === 1 ? '' : 's'}`);
+    } catch (err) {
+      setError(`Could not import saved views: ${err instanceof Error ? err.message : String(err)}`);
+    }
   };
 
   const openHistory = async () => {
@@ -3747,12 +3998,20 @@ function CollectionView({
           </button>
         </div>
       </header>
-      {error && <div className="error-box">{error}</div>}
-      {notice && <div className="notice-box">{notice}</div>}
+      {error && <div className="error-box" role="alert">{error}</div>}
+      {notice && <div className="notice-box" role="status">{notice}</div>}
 
-      <div className="tab-bar">
+      <div className="tab-bar" role="tablist" aria-label="Collection views">
         {(['documents', 'indexes', 'events', 'search', 'aggregate', 'schema', 'metrics'] as const).map((item) => (
-          <button key={item} className={tab === item ? 'active' : ''} onClick={() => setTab(item)}>
+          <button
+            key={item}
+            role="tab"
+            aria-selected={tab === item}
+            tabIndex={tab === item ? 0 : -1}
+            className={tab === item ? 'active' : ''}
+            onClick={() => setTab(item)}
+            onKeyDown={handleTabKey}
+          >
             {item === 'events' ? 'Changes' : item[0].toUpperCase() + item.slice(1)}
             {item === 'indexes' && <span className="tab-count">{indexes.length + textIndexes.length + fuzzyIndexes.length + vectorIndexes.length}</span>}
             {item === 'events' && <span className="tab-count">{subscriptions.length}</span>}
@@ -3817,6 +4076,21 @@ function CollectionView({
                       </select>
                       <input value={viewName} onChange={(e) => setViewName(e.target.value)} placeholder="view name" className="view-name" />
                       <button onClick={saveView}>Save</button>
+                    </div>
+                    <div className="tools-row">
+                      <button onClick={exportViews} disabled={savedViews.length === 0}>Export views</button>
+                      <button onClick={() => viewsFileInput.current?.click()}>Import views</button>
+                      <input
+                        ref={viewsFileInput}
+                        type="file"
+                        accept=".json,application/json"
+                        hidden
+                        onChange={(event) => {
+                          const file = event.target.files?.[0] ?? null;
+                          event.target.value = '';
+                          void importViews(file);
+                        }}
+                      />
                     </div>
                   </div>
                   <div className="tools-section">
@@ -4007,7 +4281,7 @@ function CollectionView({
             Uses the current collection filter in <code>mode:"live"</code>. Events are pushed
             directly over the stream and are not written to <code>_events</code>.
           </p>
-          {liveError && <div className="error-box">{liveError}</div>}
+          {liveError && <div className="error-box" role="alert">{liveError}</div>}
           <div className="live-events">
             {liveEvents.length === 0 ? (
               <p className="muted">{liveRunning ? 'Waiting for matching writes…' : 'Not running.'}</p>
@@ -4109,7 +4383,7 @@ function CollectionView({
 
       {showHistory && selected && (
         <Modal title={`History: ${idOf(selected)}`} subtitle="Newest revisions first. History requires versioning enabled for this collection." onClose={() => setShowHistory(false)} wide>
-          {historyError && <div className="error-box">{historyError}</div>}
+          {historyError && <div className="error-box" role="alert">{historyError}</div>}
           {historyBusy ? <p className="muted">Loading revisions…</p> : revisions.length === 0 ? <p className="muted">No revisions found. Enable versioning in collection Settings, then update the document.</p> : (
             <div className="history-layout">
               <div className="revision-list">
@@ -4300,14 +4574,14 @@ function PlaygroundView({
   const [explainResult, setExplainResult] = useState<unknown>(null);
   const [sqlHistory, setSqlHistory] = useState<string[]>(() => {
     try {
-      return JSON.parse(localStorage.getItem('nonodb.gui.sqlHistory') ?? '[]') as string[];
+      return JSON.parse(localStorage.getItem(playgroundHistoryStorageKey(connection, 'sql')) ?? '[]') as string[];
     } catch {
       return [];
     }
   });
   const [jsonHistory, setJsonHistory] = useState<string[]>(() => {
     try {
-      return JSON.parse(localStorage.getItem('nonodb.gui.jsonHistory') ?? '[]') as string[];
+      return JSON.parse(localStorage.getItem(playgroundHistoryStorageKey(connection, 'json')) ?? '[]') as string[];
     } catch {
       return [];
     }
@@ -4316,7 +4590,7 @@ function PlaygroundView({
   const [busy, setBusy] = useState(false);
 
   const history = mode === 'sql' ? sqlHistory : jsonHistory;
-  const historyKey = mode === 'sql' ? 'nonodb.gui.sqlHistory' : 'nonodb.gui.jsonHistory';
+  const historyKey = playgroundHistoryStorageKey(connection, mode);
 
   const remember = (statement: string) => {
     const current = mode === 'sql' ? sqlHistory : jsonHistory;
@@ -4438,16 +4712,20 @@ function PlaygroundView({
         <button
           role="tab"
           aria-selected={mode === 'sql'}
+          tabIndex={mode === 'sql' ? 0 : -1}
           className={mode === 'sql' ? 'active' : ''}
           onClick={() => { setMode('sql'); setError(''); }}
+          onKeyDown={handleTabKey}
         >
           SQL
         </button>
         <button
           role="tab"
           aria-selected={mode === 'json'}
+          tabIndex={mode === 'json' ? 0 : -1}
           className={mode === 'json' ? 'active' : ''}
           onClick={() => { setMode('json'); setError(''); }}
+          onKeyDown={handleTabKey}
         >
           JSON
         </button>
@@ -4457,7 +4735,7 @@ function PlaygroundView({
             : 'Any single /v1/exec request: find, aggregate, search_all, insert, SQL, and more.'}
         </span>
       </div>
-      {error && <div className="error-box">{error}</div>}
+      {error && <div className="error-box" role="alert">{error}</div>}
       {mode === 'sql' ? (
         <section className="panel">
           <SqlEditor value={query} onChange={setQuery} />
@@ -4818,8 +5096,8 @@ function AuthView({ connection }: { connection: Connection }) {
           </button>
         </div>
       </header>
-      {error && <div className="error-box">{error}</div>}
-      {notice && <div className="notice-box">{notice}</div>}
+      {error && <div className="error-box" role="alert">{error}</div>}
+      {notice && <div className="notice-box" role="status">{notice}</div>}
 
       {!summary ? (
         <p className="muted">Loading authorization state…</p>
@@ -4998,14 +5276,28 @@ function AuthView({ connection }: { connection: Connection }) {
   );
 }
 
-function DatabaseView({ connection }: { connection: Connection }) {
+function DatabaseView({
+  connection,
+  databases,
+  onRefreshDatabases,
+  onSwitchDatabase,
+}: {
+  connection: Connection;
+  databases: string[];
+  onRefreshDatabases: (database?: string) => Promise<string[]>;
+  onSwitchDatabase: (database: string) => void;
+}) {
   const [info, setInfo] = useState<MapInfo | null>(null);
   const [size, setSize] = useState('');
   const [importUpsert, setImportUpsert] = useState(false);
+  const [newDatabase, setNewDatabase] = useState('');
+  const [dropTarget, setDropTarget] = useState<string | null>(null);
+  const [dropConfirm, setDropConfirm] = useState('');
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
   const [busy, setBusy] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
+  const currentDatabase = connection.database || 'default';
 
   const load = useCallback(async () => {
     setError('');
@@ -5025,6 +5317,49 @@ function DatabaseView({ connection }: { connection: Connection }) {
     const timer = window.setTimeout(() => setNotice(''), 3000);
     return () => window.clearTimeout(timer);
   }, [notice]);
+
+  const createDatabase = async () => {
+    const name = newDatabase.trim();
+    if (!name) return;
+    setBusy(true);
+    setError('');
+    setNotice('');
+    try {
+      await exec(connection, { op: 'create_database', name });
+      await onRefreshDatabases();
+      setNewDatabase('');
+      setNotice(`Database ${name} created`);
+      onSwitchDatabase(name);
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const dropDatabase = async () => {
+    if (!dropTarget || dropConfirm !== dropTarget) return;
+    const name = dropTarget;
+    setBusy(true);
+    setError('');
+    setNotice('');
+    try {
+      await exec(connection, { op: 'drop_database', name });
+      setDropTarget(null);
+      setDropConfirm('');
+      if (currentDatabase === name) {
+        await onRefreshDatabases('default').catch(() => {});
+        onSwitchDatabase('default');
+      } else {
+        await onRefreshDatabases();
+      }
+      setNotice(`Database ${name} dropped`);
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setBusy(false);
+    }
+  };
 
   const resize = async () => {
     setBusy(true);
@@ -5143,8 +5478,8 @@ function DatabaseView({ connection }: { connection: Connection }) {
           <button onClick={() => void load()}>Refresh</button>
         </div>
       </header>
-      {error && <div className="error-box">{error}</div>}
-      {notice && <div className="notice-box">{notice}</div>}
+      {error && <div className="error-box" role="alert">{error}</div>}
+      {notice && <div className="notice-box" role="status">{notice}</div>}
       <section className="panel">
         <div className="stat-grid">
           <div className="stat"><span>Map size</span><strong>{info ? formatBytes(info.map_size) : '-'}</strong></div>
@@ -5170,13 +5505,76 @@ function DatabaseView({ connection }: { connection: Connection }) {
       </section>
 
       <section className="panel">
-        <div className="panel-title"><h3>Databases</h3></div>
-        <p className="muted small">This daemon serves one LMDB database at a time. To run another database, start a second daemon with a different <code>NONODB_DATA</code> directory and socket.</p>
+        <div className="panel-title">
+          <h3>Databases</h3>
+          <button className="small" onClick={() => void onRefreshDatabases().catch((err) => setError(errorText(err)))} disabled={busy}>
+            Refresh
+          </button>
+        </div>
+        <p className="muted small">
+          Create or drop databases served by this daemon. Creating and dropping requires an
+          instance administrator scope; forbidden requests are reported below. Dropping a
+          database permanently deletes its collections, indexes, history, and metadata.
+        </p>
+        <div className="toolbar">
+          <label className="grow">
+            New database name
+            <input
+              value={newDatabase}
+              onChange={(e) => setNewDatabase(e.target.value)}
+              placeholder="app1"
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') void createDatabase();
+              }}
+            />
+          </label>
+          <button className="primary" onClick={() => void createDatabase()} disabled={busy || !newDatabase.trim()}>
+            Create database
+          </button>
+        </div>
+        <div className="metric-table-wrap">
+          <table className="metric-table">
+            <thead>
+              <tr>
+                <th>Database</th>
+                <th>Status</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {databases.length === 0 ? (
+                <tr><td colSpan={3} className="muted">No databases returned.</td></tr>
+              ) : databases.map((name) => (
+                <tr key={name}>
+                  <td className="mono">{name}</td>
+                  <td>{name === currentDatabase ? <span className="badge">current</span> : <span className="muted">available</span>}</td>
+                  <td>
+                    {name === 'default' ? (
+                      <span className="muted small">default cannot be dropped</span>
+                    ) : (
+                      <button
+                        className="small danger"
+                        onClick={() => {
+                          setDropTarget(name);
+                          setDropConfirm('');
+                          setError('');
+                        }}
+                        disabled={busy}
+                      >
+                        Drop database
+                      </button>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
       </section>
 
       <section className="panel">
         <div className="panel-title"><h3>Maintenance (CLI)</h3></div>
-        <p className="muted small">Backup, restore, and verification remain CLI-only because the HTTP API intentionally does not expose filesystem paths. Authorization is managed from the <strong>Authorization</strong> tab.</p>
+        <p className="muted small">Manual backups, offline restore, and verification commands are available for the default database and disaster recovery. Non-default databases can also be restored in place from the <strong>Import</strong> tab. Authorization is managed from the <strong>Authorization</strong> tab.</p>
         <div className="command-list">
           {[
             'nonodb-cli backup /var/lib/nonodb ./backup',
@@ -5188,6 +5586,47 @@ function DatabaseView({ connection }: { connection: Connection }) {
           ))}
         </div>
       </section>
+
+      {dropTarget && (
+        <Modal
+          title={`Drop database ${dropTarget}`}
+          subtitle="This permanently deletes the database and cannot be undone."
+          onClose={() => {
+            if (!busy) {
+              setDropTarget(null);
+              setDropConfirm('');
+            }
+          }}
+        >
+          {error && <div className="error-box" role="alert">{error}</div>}
+          <p className="muted small">
+            All collections, indexes, history, TTL metadata, and event configuration in
+            <code> {dropTarget}</code> will be removed. Export or back up the database first if
+            you need a copy.
+          </p>
+          <label>
+            Type <code>{dropTarget}</code> to confirm
+            <input
+              value={dropConfirm}
+              onChange={(e) => setDropConfirm(e.target.value)}
+              autoFocus
+              autoComplete="off"
+            />
+          </label>
+          <div className="modal-actions">
+            <button onClick={() => { setDropTarget(null); setDropConfirm(''); }} disabled={busy}>
+              Cancel
+            </button>
+            <button
+              className="danger"
+              onClick={() => void dropDatabase()}
+              disabled={busy || dropConfirm !== dropTarget}
+            >
+              {busy ? 'Dropping…' : 'Drop database'}
+            </button>
+          </div>
+        </Modal>
+      )}
     </div>
   );
 }
@@ -5203,7 +5642,7 @@ function Shell({
 }) {
   const [collections, setCollections] = useState<string[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
-  const [tab, setTab] = useState<'dashboard' | 'storage' | 'playground' | 'database' | 'backups' | 'import' | 'replication' | 'cluster' | 'network' | 'auth' | 'eventing'>('dashboard');
+  const [tab, setTab] = useState<'dashboard' | 'storage' | 'playground' | 'database' | 'backups' | 'import' | 'replication' | 'cluster' | 'network' | 'auth' | 'eventing' | 'graph'>('dashboard');
   const [showNewCollection, setShowNewCollection] = useState(false);
   const [showPalette, setShowPalette] = useState(false);
   const [paletteQuery, setPaletteQuery] = useState('');
@@ -5221,17 +5660,19 @@ function Shell({
   const [databases, setDatabases] = useState<string[]>([]);
   const [collectionTab, setCollectionTab] = useState<CollectionTab>('documents');
 
-  useEffect(() => {
-    let cancelled = false;
-    exec<{ databases: string[] }>(connection, { op: 'list_databases' })
-      .then((result) => {
-        if (!cancelled) setDatabases(result.databases ?? []);
-      })
-      .catch(() => {});
-    return () => {
-      cancelled = true;
-    };
+  const refreshDatabases = useCallback(async (database = connection.database): Promise<string[]> => {
+    const result = await exec<{ databases: string[] }>(
+      { ...connection, database: database || 'default' },
+      { op: 'list_databases' },
+    );
+    const names = result.databases ?? [];
+    setDatabases(names);
+    return names;
   }, [connection]);
+
+  useEffect(() => {
+    void refreshDatabases().catch(() => {});
+  }, [refreshDatabases]);
 
   const switchDatabase = (database: string) => {
     if (!database || database === connection.database) return;
@@ -5330,7 +5771,7 @@ function Shell({
 
   return (
     <div className="app-shell">
-      <aside className="sidebar">
+      <aside className="sidebar" aria-label="Console navigation">
         <div className="brand">
           <span className="brand-mark"><img src="/nonodb-mark.svg" alt="" /></span>
           <div>
@@ -5338,35 +5779,38 @@ function Shell({
             <small>Console</small>
           </div>
         </div>
-        <nav className="nav">
-          <button className={tab === 'dashboard' && !selected ? 'active' : ''} onClick={() => { setTab('dashboard'); setSelected(null); }}>
+        <nav className="nav" aria-label="Views">
+          <button className={tab === 'dashboard' && !selected ? 'active' : ''} aria-current={tab === 'dashboard' && !selected ? 'page' : undefined} onClick={() => { setTab('dashboard'); setSelected(null); }}>
             Dashboard
           </button>
-          <button className={tab === 'playground' ? 'active' : ''} onClick={() => setTab('playground')}>
+          <button className={tab === 'playground' ? 'active' : ''} aria-current={tab === 'playground' ? 'page' : undefined} onClick={() => setTab('playground')}>
             Playground
           </button>
-          <button className={tab === 'database' ? 'active' : ''} onClick={() => setTab('database')}>
+          <button className={tab === 'database' ? 'active' : ''} aria-current={tab === 'database' ? 'page' : undefined} onClick={() => setTab('database')}>
             Database
           </button>
-          <button className={tab === 'backups' ? 'active' : ''} onClick={() => setTab('backups')}>
+          <button className={tab === 'backups' ? 'active' : ''} aria-current={tab === 'backups' ? 'page' : undefined} onClick={() => setTab('backups')}>
             Backups
           </button>
-          <button className={tab === 'import' ? 'active' : ''} onClick={() => setTab('import')}>
+          <button className={tab === 'import' ? 'active' : ''} aria-current={tab === 'import' ? 'page' : undefined} onClick={() => setTab('import')}>
             Import
           </button>
-          <button className={tab === 'eventing' ? 'active' : ''} onClick={() => setTab('eventing')}>
+          <button className={tab === 'eventing' ? 'active' : ''} aria-current={tab === 'eventing' ? 'page' : undefined} onClick={() => setTab('eventing')}>
             Eventing
           </button>
-          <button className={tab === 'replication' ? 'active' : ''} onClick={() => setTab('replication')}>
+          <button className={tab === 'graph' ? 'active' : ''} aria-current={tab === 'graph' ? 'page' : undefined} onClick={() => setTab('graph')}>
+            Graph
+          </button>
+          <button className={tab === 'replication' ? 'active' : ''} aria-current={tab === 'replication' ? 'page' : undefined} onClick={() => setTab('replication')}>
             Replication
           </button>
-          <button className={tab === 'cluster' ? 'active' : ''} onClick={() => setTab('cluster')}>
+          <button className={tab === 'cluster' ? 'active' : ''} aria-current={tab === 'cluster' ? 'page' : undefined} onClick={() => setTab('cluster')}>
             Cluster
           </button>
-          <button className={tab === 'network' ? 'active' : ''} onClick={() => setTab('network')}>
+          <button className={tab === 'network' ? 'active' : ''} aria-current={tab === 'network' ? 'page' : undefined} onClick={() => setTab('network')}>
             Network
           </button>
-          <button className={tab === 'auth' ? 'active' : ''} onClick={() => setTab('auth')}>
+          <button className={tab === 'auth' ? 'active' : ''} aria-current={tab === 'auth' ? 'page' : undefined} onClick={() => setTab('auth')}>
             Authorization
           </button>
           {collections.includes('_jobs') && (
@@ -5375,7 +5819,7 @@ function Shell({
         </nav>
         <div className="sidebar-section">
           <span>Database</span>
-          <button className="icon-button" onClick={() => void refreshCollections()} title="Refresh">
+          <button className="icon-button" onClick={() => void refreshCollections()} title="Refresh" aria-label="Refresh collections">
             ↻
           </button>
         </div>
@@ -5385,6 +5829,7 @@ function Shell({
             value={connection.database || 'default'}
             onChange={(e) => switchDatabase(e.target.value)}
             title="Switch database"
+            aria-label="Current database"
           >
             {[...new Set(['default', connection.database || 'default', ...databases])].map((name) => (
               <option key={name} value={name}>{name}</option>
@@ -5411,6 +5856,7 @@ function Shell({
             <button
               key={name}
               className={selected === name && tab === 'dashboard' ? 'active' : ''}
+              aria-current={selected === name && tab === 'dashboard' ? 'page' : undefined}
               onClick={() => openCollection(name)}
             >
               {name}
@@ -5431,14 +5877,19 @@ function Shell({
           </button>
         </div>
       </aside>
-      <main className="main">
+      <main className="main" id="main-content" tabIndex={-1}>
         {error && <div className="error-box sticky">{error}</div>}
         {tab === 'storage' ? (
           <StorageView connection={connection} onOpenCollection={(name) => openCollection(name, 'metrics')} />
         ) : tab === 'playground' ? (
           <PlaygroundView connection={connection} collections={collections} selected={selected} />
         ) : tab === 'database' ? (
-          <DatabaseView connection={connection} />
+          <DatabaseView
+            connection={connection}
+            databases={databases}
+            onRefreshDatabases={refreshDatabases}
+            onSwitchDatabase={switchDatabase}
+          />
         ) : tab === 'backups' ? (
           <BackupsPage connection={connection} />
         ) : tab === 'import' ? (
@@ -5449,6 +5900,8 @@ function Shell({
             collections={collections}
             onOpenCollection={(name, eventingTab) => openCollection(name, eventingTab ?? 'events')}
           />
+        ) : tab === 'graph' ? (
+          <GraphPage connection={connection} collections={collections} />
         ) : tab === 'replication' ? (
           <ReplicationPage connection={connection} />
         ) : tab === 'cluster' ? (
@@ -5480,6 +5933,15 @@ function Shell({
             value={paletteQuery}
             onChange={(e) => setPaletteQuery(e.target.value)}
             placeholder="Search commands or collections…"
+            aria-label="Search commands or collections"
+            onKeyDown={(event) => {
+              if (event.key !== 'ArrowDown') return;
+              event.preventDefault();
+              event.currentTarget
+                .closest('.modal')
+                ?.querySelector<HTMLButtonElement>('.palette-row')
+                ?.focus();
+            }}
           />
           <div className="palette-list">
             {[
@@ -5490,6 +5952,7 @@ function Shell({
               { label: 'Open Backups', run: () => setTab('backups') },
               { label: 'Open Import', run: () => setTab('import') },
               { label: 'Open Eventing', run: () => setTab('eventing') },
+              { label: 'Open Graph', run: () => setTab('graph') },
               { label: 'Open Replication', run: () => setTab('replication') },
               { label: 'Open Cluster', run: () => setTab('cluster') },
               { label: 'Open Network', run: () => setTab('network') },
@@ -5646,10 +6109,159 @@ function Shell({
   );
 }
 
+type SessionStatus = 'checking' | 'online' | 'offline';
+
+type SessionTab = {
+  id: string;
+  connection: Connection;
+  status: SessionStatus;
+};
+
+type StoredSessionState = {
+  activeId: string | null;
+  sessions: Array<{ id: string; connection: Connection }>;
+};
+
+const SESSIONS_KEY = 'nonodb.gui.sessions';
+
+function newSessionId(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  return `session-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+function sessionLabel(connection: Connection): string {
+  const endpoint = connection.endpoint.replace(/^https?:\/\//i, '').replace(/\/$/, '');
+  return `${endpoint || 'local'} · ${connection.database || 'default'}`;
+}
+
+function loadSessionState(): StoredSessionState {
+  try {
+    const raw = sessionStorage.getItem(SESSIONS_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw) as Partial<StoredSessionState>;
+      if (Array.isArray(parsed.sessions) && parsed.sessions.length > 0) {
+        const seen = new Set<string>();
+        const sessions = parsed.sessions
+          .filter((item): item is { id: string; connection: Connection } =>
+            Boolean(item && typeof item.id === 'string' && item.connection && typeof item.connection === 'object'))
+          .filter((item) => {
+            if (seen.has(item.id)) return false;
+            seen.add(item.id);
+            return true;
+          });
+        if (sessions.length > 0) {
+          const activeId =
+            typeof parsed.activeId === 'string' && sessions.some((item) => item.id === parsed.activeId)
+              ? parsed.activeId
+              : sessions[0].id;
+          return { sessions, activeId };
+        }
+      }
+    }
+  } catch {
+    // Fall through to the legacy single-connection value.
+  }
+  const id = newSessionId();
+  return {
+    sessions: [{ id, connection: loadConnection() }],
+    activeId: id,
+  };
+}
+
+function persistSessionState(sessions: SessionTab[], activeId: string | null): void {
+  if (sessions.length === 0) {
+    sessionStorage.removeItem(SESSIONS_KEY);
+    return;
+  }
+  sessionStorage.setItem(
+    SESSIONS_KEY,
+    JSON.stringify({
+      activeId,
+      sessions: sessions.map(({ id, connection }) => ({ id, connection })),
+    }),
+  );
+}
+
+function SessionBar({
+  sessions,
+  activeId,
+  adding,
+  addDisabled,
+  onSelect,
+  onClose,
+  onAdd,
+}: {
+  sessions: SessionTab[];
+  activeId: string | null;
+  adding: boolean;
+  addDisabled: boolean;
+  onSelect: (id: string) => void;
+  onClose: (id: string) => void;
+  onAdd: () => void;
+}) {
+  return (
+    <div className="session-bar" role="tablist" aria-label="Daemon connections">
+      <span className="session-bar-label">Connections</span>
+      {sessions.map((session) => {
+        const label = sessionLabel(session.connection);
+        return (
+          <div
+            key={session.id}
+            className={`session-tab${session.id === activeId ? ' active' : ''}`}
+          >
+            <button
+              type="button"
+              className="session-select"
+              role="tab"
+              aria-selected={session.id === activeId}
+              tabIndex={session.id === activeId ? 0 : -1}
+              title={`${session.connection.endpoint} · ${session.connection.database || 'default'}`}
+              onClick={() => onSelect(session.id)}
+              onKeyDown={handleTabKey}
+            >
+              <span className={`session-dot ${session.status}`} aria-hidden="true" />
+              <span className="session-label">{label}</span>
+            </button>
+            <button
+              type="button"
+              className="session-close"
+              title={`Close ${label}`}
+              aria-label={`Close connection ${label}`}
+              onClick={() => onClose(session.id)}
+            >
+              ×
+            </button>
+          </div>
+        );
+      })}
+      {adding && <span className="session-tab session-new">New connection</span>}
+      <button
+        type="button"
+        className="session-add"
+        title="Add daemon connection"
+        aria-label="Add daemon connection"
+        onClick={onAdd}
+        disabled={adding || addDisabled}
+      >
+        +
+      </button>
+    </div>
+  );
+}
+
 export default function App() {
-  const [connection, setConnection] = useState<Connection>(() => loadConnection());
-  const [connected, setConnected] = useState(false);
+  const initialSessionState = useRef<StoredSessionState | null>(null);
+  if (initialSessionState.current === null) {
+    initialSessionState.current = loadSessionState();
+  }
+  const [sessions, setSessions] = useState<SessionTab[]>(
+    initialSessionState.current.sessions.map((session) => ({ ...session, status: 'checking' })),
+  );
+  const [activeId, setActiveId] = useState<string | null>(initialSessionState.current.activeId);
   const [checking, setChecking] = useState(true);
+  const [adding, setAdding] = useState(false);
   const [lastTiming, setLastTiming] = useState<ApiTiming | null>(null);
   const [timings, setTimings] = useState<ApiTiming[]>([]);
   const [showActivity, setShowActivity] = useState(false);
@@ -5664,33 +6276,55 @@ export default function App() {
   );
 
   useEffect(() => {
+    persistSessionState(sessions, activeId);
+  }, [sessions, activeId]);
+
+  useEffect(() => {
+    if (sessions.length > 0 && !sessions.some((session) => session.id === activeId)) {
+      setActiveId(sessions[0].id);
+    }
+  }, [sessions, activeId]);
+
+  useEffect(() => {
     let cancelled = false;
-    const boot = async () => {
-      let current = loadConnection();
-      const defaults = await sessionDefaults();
-      const sameOrigin =
-        current.endpoint.replace(/\/$/, '') === window.location.origin.replace(/\/$/, '');
-      // The CLI injects the active daemon token into /gui/session. When the GUI
-      // is served from the same origin, this token is authoritative and must
-      // replace a stale token cached by an earlier cluster on the same port.
-      if (defaults.token && (sameOrigin || !current.token)) {
-        current = { ...current, token: defaults.token };
-        saveConnection(current);
-      }
+    const setStatus = (id: string, status: SessionStatus) => {
       if (cancelled) return;
-      setConnection(current);
-      if (!current.endpoint) {
-        setChecking(false);
-        return;
-      }
-      try {
-        await exec(current, { op: 'list_collections' });
-        if (!cancelled) setConnected(true);
-      } catch {
-        if (!cancelled) setConnected(false);
-      } finally {
-        if (!cancelled) setChecking(false);
-      }
+      setSessions((current) =>
+        current.map((session) => (session.id === id ? { ...session, status } : session)),
+      );
+    };
+    const boot = async () => {
+      const base = initialSessionState.current?.sessions ?? [];
+      const defaults = await sessionDefaults();
+      const prepared = base.map(({ id, connection }) => {
+        const sameOrigin =
+          connection.endpoint.replace(/\/$/, '') === window.location.origin.replace(/\/$/, '');
+        const next =
+          defaults.token && (sameOrigin || !connection.token)
+            ? { ...connection, token: defaults.token }
+            : connection;
+        if (next !== connection && id === initialSessionState.current?.activeId) {
+          saveConnection(next);
+        }
+        return { id, connection: next, status: 'checking' as SessionStatus };
+      });
+      if (cancelled) return;
+      setSessions(prepared);
+      await Promise.all(
+        prepared.map(async (session) => {
+          if (!session.connection.endpoint) {
+            setStatus(session.id, 'offline');
+            return;
+          }
+          try {
+            await exec(session.connection, { op: 'list_collections' });
+            setStatus(session.id, 'online');
+          } catch {
+            setStatus(session.id, 'offline');
+          }
+        }),
+      );
+      if (!cancelled) setChecking(false);
     };
     void boot();
     return () => {
@@ -5698,35 +6332,104 @@ export default function App() {
     };
   }, []);
 
+  const active =
+    sessions.find((session) => session.id === activeId) ?? sessions[0] ?? null;
+
+  const addSession = (connection: Connection) => {
+    const id = newSessionId();
+    setSessions((current) => [...current, { id, connection, status: 'online' }]);
+    setActiveId(id);
+    setAdding(false);
+    saveConnection(connection);
+  };
+
+  const updateActiveConnection = (connection: Connection) => {
+    if (!activeId) return;
+    saveConnection(connection);
+    setSessions((current) =>
+      current.map((session) =>
+        session.id === activeId ? { ...session, connection, status: 'online' } : session,
+      ),
+    );
+  };
+
+  const closeSession = (id: string) => {
+    const remaining = sessions.filter((session) => session.id !== id);
+    setSessions(remaining);
+    if (remaining.length === 0) {
+      clearConnection();
+      setActiveId(null);
+      setAdding(false);
+      return;
+    }
+    if (activeId === id) setActiveId(remaining[0].id);
+  };
+
   let content: ReactNode;
   if (checking) {
     content = <div className="splash">Connecting to NonoDB…</div>;
-  } else if (!connected) {
+  } else if (adding) {
     content = (
       <ConnectView
-        onConnected={(next) => {
-          setConnection(next);
-          setConnected(true);
-        }}
+        key={`new-${sessions.length}`}
+        onConnected={addSession}
+        onCancel={sessions.length > 0 ? () => setAdding(false) : undefined}
+      />
+    );
+  } else if (!active) {
+    content = <ConnectView onConnected={addSession} />;
+  } else if (active.status === 'checking') {
+    content = <div className="splash">Connecting to NonoDB…</div>;
+  } else if (active.status === 'online') {
+    content = (
+      <Shell
+        key={active.id}
+        connection={active.connection}
+        onConnectionChange={updateActiveConnection}
+        onDisconnect={() => closeSession(active.id)}
       />
     );
   } else {
+    const nextSession = sessions.find((session) => session.id !== active.id);
     content = (
-      <Shell
-        connection={connection}
-        onConnectionChange={(next) => setConnection(next)}
-        onDisconnect={() => {
-          clearConnection();
-          setConnection(defaultConnection());
-          setConnected(false);
-        }}
+      <ConnectView
+        key={`reconnect-${active.id}`}
+        initialConnection={active.connection}
+        onConnected={updateActiveConnection}
+        onCancel={nextSession ? () => setActiveId(nextSession.id) : undefined}
       />
     );
   }
 
+  const showSkipLink =
+    !checking && !adding && Boolean(active && active.status === 'online');
+
   return (
     <>
-      {content}
+      {showSkipLink && (
+        <a className="skip-link" href="#main-content">
+          Skip to main content
+        </a>
+      )}
+      {sessions.length > 0 ? (
+        <div className="session-layout">
+          <SessionBar
+            sessions={sessions}
+            activeId={activeId}
+            adding={adding}
+            addDisabled={checking}
+            onSelect={(id) => {
+              setActiveId(id);
+              setAdding(false);
+            }}
+            onClose={closeSession}
+            onAdd={() => setAdding(true)}
+          />
+          <div className="session-body">{content}</div>
+        </div>
+      ) : (
+        content
+      )}
       {lastTiming && (
         <button
           type="button"

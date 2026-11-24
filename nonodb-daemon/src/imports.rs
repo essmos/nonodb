@@ -109,6 +109,14 @@ pub struct RunImportRequest {
     pub target_database: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct RestoreRequest {
+    pub source: ImportSource,
+    pub location: String,
+    pub database: String,
+    pub confirmation: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ImportStatus {
     pub id: String,
@@ -235,6 +243,169 @@ impl ImportManager {
         }
     }
 
+    /// Verify a backup and return the typed confirmation needed to restore it
+    /// into an existing database. No live database is modified.
+    pub async fn preflight_restore(
+        &self,
+        source: ImportSource,
+        location: String,
+        database: String,
+    ) -> Result<Value, String> {
+        validate_database_name(&database)
+            .map_err(|error| format!("invalid target database: {error}"))?;
+        if database == crate::databases::DEFAULT_DATABASE {
+            return Err(
+                "restore-in-place does not support the default database; use nonodb-cli restore"
+                    .into(),
+            );
+        }
+        if !self
+            .databases
+            .names()
+            .await
+            .iter()
+            .any(|name| name == &database)
+        {
+            return Err(format!("database `{database}` does not exist"));
+        }
+        if location.trim().is_empty() {
+            return Err("backup location is required".into());
+        }
+        let staging = self.staging_root.join(format!(
+            "restore-preflight-{}-{}",
+            now_ms(),
+            self.counter.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&staging);
+        std::fs::create_dir_all(&staging)
+            .map_err(|error| format!("create restore staging: {error}"))?;
+        let _guard = StagingGuard(staging.clone());
+        let (manifest, _data, info, bytes) =
+            self.prepare_backup(&staging, &source, &location).await?;
+        Ok(json!({
+            "database": database,
+            "source": source.label(),
+            "location": location,
+            "backup_bytes": bytes,
+            "manifest": manifest,
+            "info": info,
+            "confirmation": format!("RESTORE {database}"),
+            "safety_root": self.databases.root().join("restore-safety").display().to_string(),
+        }))
+    }
+
+    /// Restore a verified backup over an existing database. The caller must
+    /// already have seen the preflight result and supplied the typed phrase.
+    pub async fn restore_in_place(&self, request: RestoreRequest) -> Result<Value, String> {
+        validate_database_name(&request.database)
+            .map_err(|error| format!("invalid target database: {error}"))?;
+        if request.database == crate::databases::DEFAULT_DATABASE {
+            return Err(
+                "restore-in-place does not support the default database; use nonodb-cli restore"
+                    .into(),
+            );
+        }
+        let expected = format!("RESTORE {}", request.database);
+        if request.confirmation.trim() != expected {
+            return Err(format!(
+                "typed confirmation does not match; enter exactly `{expected}`"
+            ));
+        }
+        if request.location.trim().is_empty() {
+            return Err("backup location is required".into());
+        }
+        let staging = self.staging_root.join(format!(
+            "restore-{}-{}",
+            now_ms(),
+            self.counter.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&staging);
+        std::fs::create_dir_all(&staging)
+            .map_err(|error| format!("create restore staging: {error}"))?;
+        let _guard = StagingGuard(staging.clone());
+        let (manifest, data, _info, bytes) = self
+            .prepare_backup(&staging, &request.source, &request.location)
+            .await?;
+        let outcome = self
+            .databases
+            .restore_database(
+                &request.database,
+                &data,
+                &request.source.label(),
+                &request.location,
+            )
+            .await
+            .map_err(|error| error.message)?;
+        Ok(json!({
+            "database": outcome.database,
+            "backup": request.location,
+            "source": outcome.source,
+            "backup_bytes": bytes,
+            "manifest": manifest,
+            "safety_snapshot": outcome.safety_snapshot.display().to_string(),
+            "rollback": "Stop the daemon, move the safety snapshot back to the database directory, and start the daemon.",
+        }))
+    }
+
+    async fn prepare_backup(
+        &self,
+        staging: &Path,
+        source: &ImportSource,
+        location: &str,
+    ) -> Result<(BackupManifest, PathBuf, Option<String>, u64), String> {
+        let (manifest, payload, info) = match source {
+            ImportSource::Local { .. } => {
+                let backup_dir = self.allowed_local(Path::new(location))?;
+                let manifest = verify::read_manifest(&backup_dir)
+                    .map_err(|error| error.to_string())?
+                    .ok_or_else(|| format!("missing manifest.json in {}", backup_dir.display()))?;
+                let source = verify::manifest_data_path(&backup_dir, &manifest)
+                    .map_err(|error| error.to_string())?;
+                let payload = staging.join("payload.bin");
+                std::fs::copy(&source, &payload)
+                    .map_err(|error| format!("copy backup payload: {error}"))?;
+                let info =
+                    std::fs::read_to_string(backup_dir.join(nonodb_core::BACKUP_INFO_FILE)).ok();
+                (manifest, payload, info)
+            }
+            ImportSource::S3 { .. } => {
+                let s3 = source.s3().ok_or("missing S3 source")?;
+                let reader = S3Reader::new(s3)?;
+                let manifest_key = path_join(location, "manifest.json");
+                let text = reader.get_text(&manifest_key).await?;
+                let manifest = serde_json::from_str::<BackupManifest>(&text)
+                    .map_err(|error| format!("parse remote manifest: {error}"))?;
+                let payload = staging.join("payload.bin");
+                let data_key = path_join(location, &manifest.data_file);
+                reader.get_to_file(&data_key, &payload).await?;
+                let info_key = path_join(location, nonodb_core::BACKUP_INFO_FILE);
+                let info = reader.get_text(&info_key).await.ok();
+                (manifest, payload, info)
+            }
+        };
+
+        let size = std::fs::metadata(&payload)
+            .map_err(|error| error.to_string())?
+            .len();
+        if size != manifest.data_size {
+            return Err(format!(
+                "backup size mismatch: manifest {}, actual {size}",
+                manifest.data_size
+            ));
+        }
+        let digest = verify::sha256_file(&payload).map_err(|error| error.to_string())?;
+        if digest != manifest.sha256 {
+            return Err(format!(
+                "backup SHA-256 mismatch: manifest {}, actual {digest}",
+                manifest.sha256
+            ));
+        }
+        let data = prepare_payload(staging, &manifest, &payload)?;
+        verify::verify_data_dir_allow_missing_search(staging)
+            .map_err(|error| format!("verify backup: {error}"))?;
+        Ok((manifest, data, info, size))
+    }
+
     pub fn start(self: &Arc<Self>, request: RunImportRequest) -> Result<ImportStatus, String> {
         validate_database_name(&request.target_database)
             .map_err(|error| format!("invalid target database: {error}"))?;
@@ -300,70 +471,22 @@ impl ImportManager {
         let staging = self.staging_root.join(id);
         let _ = std::fs::remove_dir_all(&staging);
         std::fs::create_dir_all(&staging)
-            .map_err(|e| format!("create import staging {}: {e}", staging.display()))?;
+            .map_err(|error| format!("create import staging {}: {error}", staging.display()))?;
         let _guard = StagingGuard(staging.clone());
-
-        let (manifest, payload, info) = match &request.source {
-            ImportSource::Local { .. } => {
-                let backup_dir = self.allowed_local(Path::new(&request.location))?;
-                let manifest = verify::read_manifest(&backup_dir)
-                    .map_err(|e| e.to_string())?
-                    .ok_or_else(|| format!("missing manifest.json in {}", backup_dir.display()))?;
-                let source = verify::manifest_data_path(&backup_dir, &manifest)
-                    .map_err(|e| e.to_string())?;
-                let payload = staging.join("payload.bin");
-                std::fs::copy(&source, &payload)
-                    .map_err(|e| format!("copy backup payload: {e}"))?;
-                let info =
-                    std::fs::read_to_string(backup_dir.join(nonodb_core::BACKUP_INFO_FILE)).ok();
-                (manifest, payload, info)
-            }
-            ImportSource::S3 { .. } => {
-                let s3 = request.source.s3().ok_or("missing S3 source")?;
-                let reader = S3Reader::new(s3)?;
-                let manifest_key = path_join(&request.location, "manifest.json");
-                let text = reader.get_text(&manifest_key).await?;
-                let manifest = serde_json::from_str::<BackupManifest>(&text)
-                    .map_err(|e| format!("parse remote manifest: {e}"))?;
-                let payload = staging.join("payload.bin");
-                let data_key = path_join(&request.location, &manifest.data_file);
-                reader.get_to_file(&data_key, &payload).await?;
-                let info_key = path_join(&request.location, nonodb_core::BACKUP_INFO_FILE);
-                let info = reader.get_text(&info_key).await.ok();
-                (manifest, payload, info)
-            }
-        };
-
-        let size = std::fs::metadata(&payload)
-            .map_err(|e| e.to_string())?
-            .len();
-        if size != manifest.data_size {
-            return Err(format!(
-                "backup size mismatch: manifest {}, actual {size}",
-                manifest.data_size
-            ));
-        }
-        let digest = verify::sha256_file(&payload).map_err(|e| e.to_string())?;
-        if digest != manifest.sha256 {
-            return Err(format!(
-                "backup SHA-256 mismatch: manifest {}, actual {digest}",
-                manifest.sha256
-            ));
-        }
-
-        let data = prepare_payload(&staging, &manifest, &payload)?;
-        verify::verify_data_dir_allow_missing_search(&staging)
-            .map_err(|e| format!("verify imported database: {e}"))?;
+        let (manifest, data, info, size) = self
+            .prepare_backup(&staging, &request.source, &request.location)
+            .await?;
         self.databases
             .import_database(&request.target_database, &data)
             .await
-            .map_err(|e| e.message)?;
+            .map_err(|error| error.message)?;
         tracing::info!(
             import = %id,
             source = %request.source.label(),
             target = %request.target_database,
             bytes = size,
             info_present = info.is_some(),
+            manifest = %manifest.data_file,
             "backup imported"
         );
         Ok(size)

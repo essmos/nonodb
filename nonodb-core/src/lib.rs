@@ -20,12 +20,14 @@ pub mod date;
 pub mod error;
 pub mod events;
 pub mod geo;
+pub mod graph;
 pub mod history;
 pub mod id;
 pub mod index;
 pub mod instance;
 pub mod numeric;
 pub mod observer;
+pub mod pitr;
 pub mod progress;
 pub mod query;
 mod regex;
@@ -48,7 +50,7 @@ pub use aggregate::MAX_AGGREGATE_DOCS;
 pub use backup_info::INFO_FILE as BACKUP_INFO_FILE;
 pub use collection::{
     project_document, Collection, FindAndModifyOptions, FindAndModifyOutcome, FindQuery, IndexSpec,
-    ReindexReport, UpdateOutcome, MAX_LOOKUP_RESPONSE_BYTES, MAX_LOOKUP_VALUES,
+    LookupStats, ReindexReport, UpdateOutcome, MAX_LOOKUP_RESPONSE_BYTES, MAX_LOOKUP_VALUES,
 };
 pub use error::{Error, Result};
 pub use history::{HistoryEntry, DEFAULT_HISTORY_MAX_VERSIONS};

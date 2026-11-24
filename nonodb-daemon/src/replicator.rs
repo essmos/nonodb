@@ -419,6 +419,11 @@ impl Config {
             let identity = reqwest::Identity::from_pem(&pem)
                 .map_err(|error| format!("parse client identity: {error}"))?;
             builder = builder.identity(identity);
+            if let Err(error) =
+                metrics::record_certificate_expiry("replication", std::path::Path::new(cert))
+            {
+                tracing::warn!(%error, "replication certificate expiry metric unavailable");
+            }
         }
         builder
             .build()
@@ -1243,9 +1248,10 @@ pub fn ensure_source_databases(
     data_root: &std::path::Path,
     names: &[String],
 ) -> Result<(), String> {
-    let Some(mut persisted) =
-        read_state::<PersistedSource>("replication:source", "replication-source.json", data_root)?
-    else {
+    // The initial source may come from environment variables and never have
+    // been persisted. Load the effective configuration so catalog databases
+    // are added to that source too, then persist the merged list.
+    let Some(config) = Config::load(data_root)? else {
         return Ok(());
     };
     let mut desired = vec![DEFAULT_DATABASE.to_string()];
@@ -1256,21 +1262,20 @@ pub fn ensure_source_databases(
     }
     desired.sort();
     desired.dedup();
-    let mut current = persisted.databases.clone();
+    let mut current = config.databases.clone();
     current.sort();
     current.dedup();
     if current == desired {
         return Ok(());
     }
-    persisted.databases = desired;
     set_source_with_token(
         data_root,
-        &persisted.source,
-        persisted.token,
-        &persisted.databases,
-        persisted.interval_secs,
-        persisted.batch,
-        &persisted.bootstrap,
+        &config.source,
+        config.token.clone(),
+        &desired,
+        config.interval.as_secs(),
+        config.limit,
+        &config.bootstrap,
     )?;
     Ok(())
 }

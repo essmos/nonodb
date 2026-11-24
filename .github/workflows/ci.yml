@@ -77,12 +77,24 @@ jobs:
       - name: Install Python test dependencies
         run: python3 -m pip install --disable-pip-version-check httpx
 
+      - name: Install Playwright browser
+        run: |
+          python3 -m pip install --disable-pip-version-check playwright
+          python3 -m playwright install --with-deps chromium
+
       - name: Check client routing
         run: |
           python3 client/routing_test.py
           node --check client/node/index.js
           node --check client/node/smoke_test.js
           node client/node/routing_test.js
+
+      - name: Build and test Python package
+        run: |
+          python3 -m pip install --disable-pip-version-check build
+          rm -rf dist
+          python3 -m build client --outdir dist
+          python3 scripts/python_package_test.py --dist dist
 
       - name: Install Go
         uses: actions/setup-go@v7
@@ -113,10 +125,19 @@ jobs:
           python3 scripts/multi_database_test.py
           python3 scripts/multi_database_features_test.py
           python3 scripts/durability_test.py
+          python3 scripts/graph_test.py
+          python3 scripts/graph_auth_test.py
+          python3 scripts/graph_property_test.py
+          python3 scripts/graph_crash_test.py
+          python3 scripts/graph_rebuild_crash_test.py
+          python3 scripts/graph_replication_test.py
           python3 scripts/gui_test.py
+          python3 scripts/gui_views_test.py
+          python3 scripts/gui_graph_test.py
           python3 scripts/live_watch_test.py
           python3 scripts/async_watch_test.py
           python3 scripts/auth_api_test.py
+          python3 scripts/revocation_test.py
           python3 scripts/backup_api_test.py
           python3 scripts/replication_control_plane_test.py
           python3 scripts/replication_discovery_test.py
@@ -124,6 +145,9 @@ jobs:
           python3 scripts/replication_partition_test.py
           python3 scripts/replication_vault_test.py
           python3 scripts/restore_to_test.py
+          python3 scripts/pitr_test.py
+          python3 scripts/quota_test.py
+          python3 scripts/restore_in_place_test.py
           python3 scripts/branch_test.py
           python3 scripts/webhook_test.py
           python3 scripts/search_all_test.py
@@ -131,6 +155,7 @@ jobs:
           python3 scripts/ttl_strict_test.py
           python3 scripts/ttl_strict_disabled_test.py
           python3 scripts/ttl_replica_strict_test.py
+          python3 scripts/events_ttl_test.py
 
       - name: Run security regression checks
         env:

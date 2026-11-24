@@ -33,6 +33,10 @@ def binary(base64: str, subtype: str = "00") -> dict:
     return {"$binary": {"base64": base64, "subType": subtype}}
 
 
+def regex(pattern: str, options: str = "") -> dict:
+    return {"$regularExpression": {"pattern": pattern, "options": options}}
+
+
 def main() -> None:
     db = NonoDB(os.environ.get("NONODB_SOCK", "/run/nonodb.sock"), timeout=60)
     c = db.collection(COLL)
@@ -107,6 +111,43 @@ def main() -> None:
     assert len(oc.find({"v": {"$type": "objectId"}})) == 3
     assert [d["_id"] for d in oc.find({}, sort=[("v", -1)])] == ["c", "b", "a"]
 
+    # Stored BSON regex values: canonical round-trip, $type, and $eq.
+    rc = db.collection("bson_types_regex_e2e")
+    rc.drop_index("v")
+    rc.delete({}, multi=True)
+    rc.insert({"_id": "ci", "v": regex("^ada$", "i")})
+    rc.insert({"_id": "cs", "v": regex("^ada$")})
+    rc.insert({"_id": "text", "v": "ada"})
+    assert rc.find_one({"_id": "ci"})["v"] == regex("^ada$", "i")
+    assert [d["_id"] for d in rc.find({"v": {"$type": "regex"}})] == ["ci", "cs"]
+    assert [d["_id"] for d in rc.find({"v": {"$type": 11}})] == ["ci", "cs"]
+    assert [d["_id"] for d in rc.find({"v": {"$eq": regex("^ada$", "i")}})] == [
+        "ci"
+    ]
+    # A direct regex literal remains a string predicate.
+    assert [d["_id"] for d in rc.find({"v": {"$regex": "^ada$"}})] == ["text"]
+    rc.update({"_id": "text"}, {"$set": {"v": regex("^x", "m")}})
+    assert rc.find_one({"_id": "text"})["v"] == regex("^x", "m")
+    # Regular-expression values are not indexed; both access paths see them.
+    rc.create_index("v")
+    assert [d["_id"] for d in rc.find({"v": {"$type": "regex"}})] == [
+        "ci",
+        "cs",
+        "text",
+    ]
+    assert rc.find({"v": {"$regex": "^ada$"}}) == []
+    rc.drop_index("v")
+
+    expect(
+        "invalid_regex",
+        lambda: c.insert({"_id": "bad_re", "v": regex("x", "q")}),
+    )
+    expect(
+        "invalid_regex",
+        lambda: c.insert({"_id": "bad_re2", "v": {"$regularExpression": {"pattern": 1}}}),
+    )
+    assert c.find_one({"_id": "bad_re"}) is None
+
     # $type handles arrays, codes, and aliases.
     tc = db.collection("bson_types_type_e2e")
     tc.delete({}, multi=True)
@@ -154,7 +195,7 @@ def main() -> None:
     )
     assert c.find_one({"_id": "bad_bin"}) is None
 
-    print("OK: numberInt/numberLong, $type, binary/UUID, ObjectId")
+    print("OK: numberInt/numberLong, $type, binary/UUID, ObjectId, regex")
     db.close()
 
 

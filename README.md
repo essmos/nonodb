@@ -114,11 +114,11 @@ single-database directories are migrated to `default/` on startup. See
   deduplication, a 64 MiB response cap, and `null` for missing keys.
 - SQL `SELECT`, `INSERT`, `UPDATE`, and `DELETE` over one collection. `SELECT`
   supports `DISTINCT`, `WHERE`, `GROUP BY`, `HAVING`, aggregates including
-  `COUNT(DISTINCT field)`, `CASE`, scalar functions, `ORDER BY`,
-  `LIMIT`/`OFFSET`, positional parameters, and `explain_sql`; simple field-only
-  queries use the normal indexed `find` path. Writes use the single writer and
-  are atomic per statement, including document expressions in `UPDATE SET`;
-  there are no joins.
+  `COUNT`/`SUM`/`AVG`/`MIN`/`MAX(DISTINCT ...)`, `CASE`, scalar functions,
+  `ORDER BY`, `LIMIT`/`OFFSET`, positional parameters, and `explain_sql`; simple
+  field-only queries use the normal indexed `find` path. Writes use the single
+  writer and are atomic per statement, including document expressions in
+  `UPDATE SET` and `RETURNING` on writes; there are no joins.
 
 ### Writes and updates
 
@@ -184,6 +184,32 @@ single-database directories are migrated to `default/` on startup. See
   sidecar accelerates unfiltered queries. No external vector service is
   required. Results include `_distance`, lowest first.
 - All search indexes are maintained in the same transaction as the document.
+
+### Graph
+
+- Nodes and edges are ordinary documents; a graph definition names the edge
+  collection and endpoint/label/weight fields.
+- Native `out`/`in` adjacency slots are maintained in the same transaction as
+  every edge insert, update, delete, TTL expiry, and replication apply.
+- `traverse` supports BFS/DFS, directions, label/edge/node filters, temporal
+  `as_of` windows, projection, cycle markers, tree or flat output, hard
+  node/edge/byte budgets, and vector-search seeds.
+- `neighbors` returns one-hop filtered neighbors without building a tree.
+- `shortest_path` uses BFS by hops or Dijkstra over edge weights;
+  `all_shortest_paths` returns every shortest path with bounded path/node budgets.
+- `graph_match` matches linear variable-length patterns with per-step direction,
+  labels, node/edge filters, and relationship uniqueness.
+- `graph_algorithm` computes bounded PageRank, degree centrality, and weakly
+  connected components.
+- `hybrid_search` reranks vector hits and their graph neighborhood with
+  deterministic `vector_weight`/`graph_weight` scoring.
+- `$graphLookup` uses the adjacency fast path when the lookup fields match the
+  configured graph, with a safe fallback.
+- Online `reindex_graph` builds a new adjacency generation into temporary slots
+  and atomically swaps it after a complete scan; reads keep using the old
+  generation and edge writes are mirrored meanwhile.
+- Graph configuration and traversal are available through the HTTP API, Python
+  client, and the GUI Graph tab. See [Graph traversal](docs/graph.md).
 
 ### Aggregation
 
@@ -280,8 +306,8 @@ retention semantics.
 - Aggregation expressions include `$dateAdd`, `$dateSubtract`, `$dateDiff`,
   `$dateTrunc`, `$dateToString`, `$dateFromString`, `$dateFromParts`, and
   `$dateToParts`.
-  Time zones use UTC or fixed `+HH:MM` offsets; IANA zone names are not
-  implemented.
+  Time zones use UTC, fixed `+HH:MM` offsets, or IANA zone names with
+  daylight-saving rules.
 - Naive local datetimes are rejected as ambiguous.
 
 ```bash
@@ -454,7 +480,7 @@ docker run -d --name nonodb \
   --group-add "$(id -g)" \
   -v "$NONODB_AUTH_FILE:/etc/nonodb/auth.json:ro" \
   -v nonodb-data:/var/lib/nonodb \
-  ghcr.io/essmos/nonodb:0.30.0
+  ghcr.io/essmos/nonodb:0.32.0
 ```
 
 Check health and logs:
@@ -538,7 +564,7 @@ listener, so the Windows daemon requires TCP plus `NONODB_AUTH_FILE`.
 Download, verify, and extract the x86_64 archive:
 
 ```bash
-TAG=v0.30.0
+TAG=v0.32.0
 curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/nonodb-$TAG-linux-x86_64.tar.gz"
 curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/nonodb-$TAG-linux-x86_64.tar.gz.sha256"
 sha256sum -c "nonodb-$TAG-linux-x86_64.tar.gz.sha256"
@@ -576,12 +602,12 @@ curl -s --unix-socket "$NONODB_SOCK" -H 'content-type: application/json' \
   -d '{"op":"find","coll":"users","filter":{"age":{"$gte":18}},"sort":[["age",-1]]}'
 ```
 
-Use the optional Python client. It is not included in the binary archive, so
-clone the repository once and point `PYTHONPATH` at its `client` directory:
+Use the optional Python client. It is not included in the binary archive. The
+repository packages it as `nonodb-client`; install it from a checkout:
 
 ```bash
 git clone --depth 1 https://github.com/essmos/nonodb.git
-export PYTHONPATH="$PWD/nonodb/client"
+python3 -m pip install ./nonodb/client
 python3 - <<'PY'
 from nonodb import NonoDB
 
@@ -626,7 +652,7 @@ connection failures, or `5xx`. You can also set `write_url` explicitly. See
 Download the archive matching your CPU (`uname -m` prints `arm64` or `x86_64`):
 
 ```bash
-TAG=v0.30.0
+TAG=v0.32.0
 ARCHIVE="nonodb-$TAG-macos-arm64.tar.gz"   # use macos-x86_64 on Intel
 curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/$ARCHIVE"
 curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/$ARCHIVE.sha256"
@@ -779,10 +805,12 @@ documentation.
 | [Operations](docs/operations.md) | Configuration, deployment, security, snapshots, monitoring, capacity, troubleshooting |
 | [Docker Compose quick start](docs/docker-compose.md) | Self-contained Compose stack, auth initialization, GUI, updates, backups, troubleshooting |
 | [Volume compression](docs/volume-compression.md) | ZFS/Btrfs setup, Docker bind mounts, verification, benchmarks, migration |
+| [Encryption at rest](docs/encryption-at-rest.md) | LUKS, ZFS and cloud volume encryption, key separation, backup keys, vault boundaries |
 | [Free-tier and low-cost VM deployment](docs/free-tier-deployment.md) | Oracle Cloud, GCP, AWS, DigitalOcean, small profile, Cloud Run read replicas, Spaces backups |
 | [Backup and restore](docs/backup.md) | Online backup, snapshots, verification, restore drills, retention, Docker, vault keys, authorization state |
 | [Branching a database](docs/branching.md) | Offline CoW clone for CI, snapshot sources, verification, limits |
 | [Benchmarks](docs/benchmarks.md) | Test environment, throughput, latency, large data sets, RAM, reproducibility |
+| [Graph benchmark](docs/graph-benchmark.md) | NonoDB vs Neo4j Community graph ingest/traversal methodology and results |
 | [Development](docs/development.md) | Repository layout, tests, linting, benchmark scripts, contribution notes |
 | [Contributing](CONTRIBUTING.md) | Setup, required checks, code guidelines, pull requests |
 | [Security policy](SECURITY.md) | Supported versions, private vulnerability reporting, scope |
@@ -821,7 +849,7 @@ results. Visit [liveapisec.com](https://liveapisec.com) to learn more.
 
 ## Status
 
-nonodb is an early-stage project (`0.30.0`). Its core storage, query, index,
+nonodb is an early-stage project (`0.32.0`). Its core storage, query, index,
 search, batching, security, snapshot, and operational paths are covered by unit,
 property-based, end-to-end, concurrency, crash, and large-data tests. The API
 may still change before a stable release.

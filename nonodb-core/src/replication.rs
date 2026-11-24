@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::events::EventConfig;
+use crate::graph::GraphDef;
 use crate::search::{SearchIndexDef, SearchKind};
 use crate::subscriptions::Subscription;
 use crate::ttl::BackfillEntry;
@@ -98,11 +99,22 @@ pub enum ReplicationOp {
         coll: String,
         config: EventConfig,
     },
+    GraphSet {
+        coll: String,
+        def: GraphDef,
+    },
+    GraphDrop {
+        coll: String,
+    },
     IndexCreate {
         coll: String,
         fields: Vec<String>,
         #[serde(default)]
         unique: bool,
+        #[serde(default)]
+        sparse: bool,
+        #[serde(default)]
+        partial_filter_expression: Option<Value>,
         #[serde(default)]
         include: Vec<String>,
         #[serde(default)]

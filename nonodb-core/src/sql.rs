@@ -226,11 +226,13 @@ struct InsertSql {
     collection: String,
     columns: Vec<String>,
     rows: Vec<Vec<ValueExpr>>,
+    returning: Option<Vec<SelectItem>>,
 }
 
 impl InsertSql {
     fn execute(&self, c: &Collection<'_>, wtxn: &mut RwTxn<'_>, params: &[Value]) -> Result<Value> {
         let mut inserted_ids = Vec::with_capacity(self.rows.len());
+        let mut returned = Vec::new();
         for row in &self.rows {
             let mut doc = json!({});
             for (column, value) in self.columns.iter().zip(row) {
@@ -239,13 +241,20 @@ impl InsertSql {
             let id = c.insert_one_txn(wtxn, doc)?;
             if let Some(after) = c.find_one_in(&*wtxn, &json!({ "_id": id }), None)? {
                 c.append_change_event(wtxn, "insert", &id, None, Some(&after))?;
+                if let Some(items) = &self.returning {
+                    returned.push(returning_row(items, &after, params)?);
+                }
             }
             inserted_ids.push(id);
         }
-        Ok(json!({
+        let mut result = json!({
             "inserted": inserted_ids.len(),
             "inserted_ids": inserted_ids,
-        }))
+        });
+        if self.returning.is_some() {
+            result["returned"] = Value::Array(returned);
+        }
+        Ok(result)
     }
 }
 
@@ -254,6 +263,7 @@ struct UpdateSql {
     collection: String,
     assignments: Vec<(String, ScalarExpr)>,
     filter: Option<WhereExpr>,
+    returning: Option<Vec<SelectItem>>,
 }
 
 impl UpdateSql {
@@ -271,7 +281,7 @@ impl UpdateSql {
             let events_enabled = c.events_enabled_in(wtxn)?.is_some()
                 || c.has_subscriptions_in(wtxn)?
                 || crate::observer::is_active();
-            let before_docs = if events_enabled {
+            let before_docs = if events_enabled || self.returning.is_some() {
                 c.find_in(
                     &*wtxn,
                     &FindQuery {
@@ -300,20 +310,30 @@ impl UpdateSql {
                 false,
                 &[],
             )?;
-            if events_enabled {
+            let mut returned = Vec::new();
+            if events_enabled || self.returning.is_some() {
                 for before in &before_docs {
                     let id = before
                         .get("_id")
                         .and_then(Value::as_str)
                         .ok_or(Error::InvalidId)?;
                     let after = c.find_one_in(&*wtxn, &json!({ "_id": id }), None)?;
-                    c.append_change_event(wtxn, "update", id, Some(before), after.as_ref())?;
+                    if events_enabled {
+                        c.append_change_event(wtxn, "update", id, Some(before), after.as_ref())?;
+                    }
+                    if let (Some(items), Some(after)) = (&self.returning, after.as_ref()) {
+                        returned.push(returning_row(items, after, params)?);
+                    }
                 }
             }
-            return Ok(json!({
+            let mut result = json!({
                 "matched": out.matched,
                 "modified": out.modified,
-            }));
+            });
+            if self.returning.is_some() {
+                result["returned"] = Value::Array(returned);
+            }
+            return Ok(result);
         }
 
         let docs = c.find_in(
@@ -330,6 +350,7 @@ impl UpdateSql {
             },
         )?;
         let mut modified = 0usize;
+        let mut returned = Vec::new();
         for doc in &docs {
             let mut set = Map::new();
             for (field, expr) in &self.assignments {
@@ -348,16 +369,27 @@ impl UpdateSql {
                 false,
                 &[],
             )?;
+            let after = if out.modified > 0 || self.returning.is_some() {
+                c.find_one_in(&*wtxn, &json!({ "_id": id }), None)?
+            } else {
+                None
+            };
             if out.modified > 0 {
-                let after = c.find_one_in(&*wtxn, &json!({ "_id": id }), None)?;
                 c.append_change_event(wtxn, "update", &id, Some(doc), after.as_ref())?;
+            }
+            if let (Some(items), Some(after)) = (&self.returning, after.as_ref()) {
+                returned.push(returning_row(items, after, params)?);
             }
             modified += out.modified;
         }
-        Ok(json!({
+        let mut result = json!({
             "matched": docs.len(),
             "modified": modified,
-        }))
+        });
+        if self.returning.is_some() {
+            result["returned"] = Value::Array(returned);
+        }
+        Ok(result)
     }
 }
 
@@ -365,6 +397,7 @@ impl UpdateSql {
 struct DeleteSql {
     collection: String,
     filter: Option<WhereExpr>,
+    returning: Option<Vec<SelectItem>>,
 }
 
 impl DeleteSql {
@@ -376,7 +409,7 @@ impl DeleteSql {
         let events_enabled = c.events_enabled_in(wtxn)?.is_some()
             || c.has_subscriptions_in(wtxn)?
             || crate::observer::is_active();
-        let before_docs = if events_enabled {
+        let before_docs = if events_enabled || self.returning.is_some() {
             c.find_in(
                 &*wtxn,
                 &FindQuery {
@@ -394,16 +427,76 @@ impl DeleteSql {
             Vec::new()
         };
         let deleted = c.delete_txn(wtxn, &filter, true)?;
-        if events_enabled {
+        let mut returned = Vec::new();
+        if events_enabled || self.returning.is_some() {
             for before in &before_docs {
                 let id = before
                     .get("_id")
                     .and_then(Value::as_str)
                     .ok_or(Error::InvalidId)?;
-                c.append_change_event(wtxn, "delete", id, Some(before), None)?;
+                if events_enabled {
+                    c.append_change_event(wtxn, "delete", id, Some(before), None)?;
+                }
+                if let Some(items) = &self.returning {
+                    returned.push(returning_row(items, before, params)?);
+                }
             }
         }
-        Ok(json!({ "deleted": deleted }))
+        let mut result = json!({ "deleted": deleted });
+        if self.returning.is_some() {
+            result["returned"] = Value::Array(returned);
+        }
+        Ok(result)
+    }
+}
+
+fn returning_row(items: &[SelectItem], doc: &Value, params: &[Value]) -> Result<Value> {
+    if items.len() == 1 && matches!(items[0], SelectItem::Star) {
+        return Ok(doc.clone());
+    }
+    let mut row = Map::new();
+    let mut used = HashSet::new();
+    for (idx, item) in items.iter().enumerate() {
+        let (base, value) = match item {
+            SelectItem::Star => unreachable!(),
+            SelectItem::Field { field, alias } => (
+                alias.clone().unwrap_or_else(|| field.clone()),
+                path::get(doc, field).cloned().unwrap_or(Value::Null),
+            ),
+            SelectItem::Expr { expr, alias } => (
+                alias.clone().unwrap_or_else(|| format!("expr{}", idx + 1)),
+                expr.eval(doc, params)?,
+            ),
+            SelectItem::Aggregate { .. } => {
+                return Err(Error::Sql(
+                    "RETURNING does not support aggregate functions".into(),
+                ))
+            }
+        };
+        row.insert(unique_hidden_name(&base, &mut used), value);
+    }
+    Ok(Value::Object(row))
+}
+
+fn strip_returning(items: &mut [SelectItem], alias: &str) {
+    let prefix = format!("{alias}.");
+    for item in items {
+        match item {
+            SelectItem::Field { field, .. } => {
+                if let Some(rest) = field.strip_prefix(&prefix) {
+                    *field = rest.to_string();
+                }
+            }
+            SelectItem::Expr { expr, .. } => strip_scalar(expr, alias),
+            SelectItem::Aggregate {
+                field: Some(field), ..
+            } => {
+                if let Some(rest) = field.strip_prefix(&prefix) {
+                    *field = rest.to_string();
+                }
+            }
+            SelectItem::Star | SelectItem::Aggregate { field: None, .. } => {}
+        }
     }
 }
 
@@ -443,9 +536,13 @@ enum AggregateKind {
     Count,
     CountDistinct,
     Sum,
+    SumDistinct,
     Avg,
+    AvgDistinct,
     Min,
+    MinDistinct,
     Max,
+    MaxDistinct,
 }
 
 #[derive(Debug, Clone)]
@@ -1199,10 +1296,18 @@ fn aggregate_base_name(
         Some(a) => a.to_string(),
         None => match (kind, field) {
             (AggregateKind::Count | AggregateKind::CountDistinct, _) => "count".to_string(),
-            (AggregateKind::Sum, Some(f)) => format!("sum_{}", sanitize_name(f)),
-            (AggregateKind::Avg, Some(f)) => format!("avg_{}", sanitize_name(f)),
-            (AggregateKind::Min, Some(f)) => format!("min_{}", sanitize_name(f)),
-            (AggregateKind::Max, Some(f)) => format!("max_{}", sanitize_name(f)),
+            (AggregateKind::Sum | AggregateKind::SumDistinct, Some(f)) => {
+                format!("sum_{}", sanitize_name(f))
+            }
+            (AggregateKind::Avg | AggregateKind::AvgDistinct, Some(f)) => {
+                format!("avg_{}", sanitize_name(f))
+            }
+            (AggregateKind::Min | AggregateKind::MinDistinct, Some(f)) => {
+                format!("min_{}", sanitize_name(f))
+            }
+            (AggregateKind::Max | AggregateKind::MaxDistinct, Some(f)) => {
+                format!("max_{}", sanitize_name(f))
+            }
             _ => format!("expr{}", idx + 1),
         },
     }
@@ -1215,9 +1320,13 @@ fn aggregate_key(kind: AggregateKind, field: Option<&str>) -> String {
             AggregateKind::Count => "count",
             AggregateKind::CountDistinct => "count_distinct",
             AggregateKind::Sum => "sum",
+            AggregateKind::SumDistinct => "sum_distinct",
             AggregateKind::Avg => "avg",
+            AggregateKind::AvgDistinct => "avg_distinct",
             AggregateKind::Min => "min",
+            AggregateKind::MinDistinct => "min_distinct",
             AggregateKind::Max => "max",
+            AggregateKind::MaxDistinct => "max_distinct",
         },
         field.unwrap_or("*")
     )
@@ -1624,10 +1733,14 @@ fn strip_scalar(expr: &mut ScalarExpr, alias: &str) {
 }
 
 fn aggregate_projection(kind: AggregateKind, key: &str) -> Value {
-    if kind == AggregateKind::CountDistinct {
-        json!({ "$size": [ { "$setDifference": [ format!("${key}"), [null] ] } ] })
-    } else {
-        json!(format!("${key}"))
+    let values = json!({ "$setDifference": [ format!("${key}"), [null] ] });
+    match kind {
+        AggregateKind::CountDistinct => json!({ "$size": values }),
+        AggregateKind::SumDistinct => json!({ "$sum": values }),
+        AggregateKind::AvgDistinct => json!({ "$avg": values }),
+        AggregateKind::MinDistinct => json!({ "$min": values }),
+        AggregateKind::MaxDistinct => json!({ "$max": values }),
+        _ => json!(format!("${key}")),
     }
 }
 
@@ -1639,9 +1752,13 @@ fn aggregate_spec(kind: AggregateKind, field: Option<&str>) -> Result<Value> {
                 "$sum": { "$cond": [ { "$ne": [ format!("${f}"), null ] }, 1, 0 ] }
             })),
         },
-        AggregateKind::CountDistinct => {
-            let f =
-                field.ok_or_else(|| Error::Sql("COUNT(DISTINCT ...) requires a field".into()))?;
+        AggregateKind::CountDistinct
+        | AggregateKind::SumDistinct
+        | AggregateKind::AvgDistinct
+        | AggregateKind::MinDistinct
+        | AggregateKind::MaxDistinct => {
+            let f = field
+                .ok_or_else(|| Error::Sql("DISTINCT aggregate functions require a field".into()))?;
             Ok(json!({ "$addToSet": format!("${f}") }))
         }
         AggregateKind::Sum | AggregateKind::Avg | AggregateKind::Min | AggregateKind::Max => {
@@ -1652,7 +1769,7 @@ fn aggregate_spec(kind: AggregateKind, field: Option<&str>) -> Result<Value> {
                 AggregateKind::Avg => "$avg",
                 AggregateKind::Min => "$min",
                 AggregateKind::Max => "$max",
-                AggregateKind::Count | AggregateKind::CountDistinct => unreachable!(),
+                _ => unreachable!(),
             };
             Ok(json!({ op: format!("${f}") }))
         }
@@ -2206,11 +2323,13 @@ impl Parser {
                 break;
             }
         }
+        let returning = self.parse_returning()?;
         self.finish_statement()?;
         Ok(InsertSql {
             collection,
             columns,
             rows,
+            returning,
         })
     }
 
@@ -2257,11 +2376,16 @@ impl Parser {
             strip_all(&mut wrapped, alias);
             *filter = wrapped.expect("filter exists");
         }
+        let mut returning = self.parse_returning()?;
+        if let (Some(alias), Some(items)) = (table_alias.as_deref(), returning.as_mut()) {
+            strip_returning(items, alias);
+        }
         self.finish_statement()?;
         Ok(UpdateSql {
             collection,
             assignments,
             filter,
+            returning,
         })
     }
 
@@ -2285,8 +2409,45 @@ impl Parser {
             strip_all(&mut wrapped, alias);
             *filter = wrapped.expect("filter exists");
         }
+        let mut returning = self.parse_returning()?;
+        if let (Some(alias), Some(items)) = (table_alias.as_deref(), returning.as_mut()) {
+            strip_returning(items, alias);
+        }
         self.finish_statement()?;
-        Ok(DeleteSql { collection, filter })
+        Ok(DeleteSql {
+            collection,
+            filter,
+            returning,
+        })
+    }
+
+    fn parse_returning(&mut self) -> Result<Option<Vec<SelectItem>>> {
+        if !self.eat_kw("RETURNING") {
+            return Ok(None);
+        }
+        let mut items = Vec::new();
+        loop {
+            if self.eat_tok(&Tok::Star) {
+                items.push(SelectItem::Star);
+            } else {
+                let item = self.parse_select_item()?;
+                if matches!(item, SelectItem::Aggregate { .. }) {
+                    return Err(Error::Sql(
+                        "RETURNING does not support aggregate functions".into(),
+                    ));
+                }
+                items.push(item);
+            }
+            if !self.eat_tok(&Tok::Comma) {
+                break;
+            }
+        }
+        if items.len() > 1 && items.iter().any(|item| matches!(item, SelectItem::Star)) {
+            return Err(Error::Sql(
+                "RETURNING * must be the only item in the list".into(),
+            ));
+        }
+        Ok(Some(items))
     }
 
     fn finish_statement(&mut self) -> Result<()> {
@@ -2537,12 +2698,14 @@ impl Parser {
                     } else {
                         let distinct = self.eat_kw("DISTINCT");
                         if distinct {
-                            if kind != AggregateKind::Count {
-                                return Err(Error::Sql(
-                                    "only COUNT(DISTINCT field) is supported".into(),
-                                ));
-                            }
-                            kind = AggregateKind::CountDistinct;
+                            kind = match kind {
+                                AggregateKind::Count => AggregateKind::CountDistinct,
+                                AggregateKind::Sum => AggregateKind::SumDistinct,
+                                AggregateKind::Avg => AggregateKind::AvgDistinct,
+                                AggregateKind::Min => AggregateKind::MinDistinct,
+                                AggregateKind::Max => AggregateKind::MaxDistinct,
+                                _ => unreachable!(),
+                            };
                         }
                         Some(self.parse_field()?)
                     };

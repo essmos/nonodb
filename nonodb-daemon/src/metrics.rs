@@ -1,7 +1,8 @@
 //! Simple daemon metrics (atomic counters, no external dependencies).
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::io::BufReader;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -36,6 +37,19 @@ pub static SQL_UPDATE: AtomicU64 = AtomicU64::new(0);
 pub static SQL_DELETE: AtomicU64 = AtomicU64::new(0);
 pub static SQL_ERRORS: AtomicU64 = AtomicU64::new(0);
 pub static SQL_DURATION_NS: AtomicU64 = AtomicU64::new(0);
+/// Aggregate ordered point lookup counters.
+pub static LOOKUP_REQUESTS: AtomicU64 = AtomicU64::new(0);
+pub static LOOKUP_EXPLAINS: AtomicU64 = AtomicU64::new(0);
+pub static LOOKUP_KEYS: AtomicU64 = AtomicU64::new(0);
+pub static LOOKUP_UNIQUE_KEYS: AtomicU64 = AtomicU64::new(0);
+pub static LOOKUP_FOUND: AtomicU64 = AtomicU64::new(0);
+pub static LOOKUP_MISSING: AtomicU64 = AtomicU64::new(0);
+pub static LOOKUP_DOCUMENTS_READ: AtomicU64 = AtomicU64::new(0);
+pub static LOOKUP_INDEX_ENTRIES: AtomicU64 = AtomicU64::new(0);
+pub static LOOKUP_BYTES_READ: AtomicU64 = AtomicU64::new(0);
+pub static LOOKUP_BYTES_RETURNED: AtomicU64 = AtomicU64::new(0);
+pub static LOOKUP_ERRORS: AtomicU64 = AtomicU64::new(0);
+pub static LOOKUP_DURATION_NS: AtomicU64 = AtomicU64::new(0);
 /// Number of operations executed in `/v1/batch` requests.
 pub static BATCH_OPS: AtomicU64 = AtomicU64::new(0);
 pub static WRITE_OPS: AtomicU64 = AtomicU64::new(0);
@@ -89,6 +103,11 @@ pub static TS_RETENTION_ERRORS: AtomicU64 = AtomicU64::new(0);
 pub static TS_COMPACTION_REQUESTS: AtomicU64 = AtomicU64::new(0);
 pub static TS_COMPACTIONS: AtomicU64 = AtomicU64::new(0);
 pub static TS_COMPACTED_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Client-certificate revocation refresh and decisions.
+pub static TLS_REVOCATION_REFRESH_TOTAL: AtomicU64 = AtomicU64::new(0);
+pub static TLS_REVOCATION_REFRESH_ERRORS: AtomicU64 = AtomicU64::new(0);
+pub static TLS_REVOCATION_REVOKED_TOTAL: AtomicU64 = AtomicU64::new(0);
+pub static TLS_REVOCATION_UNAVAILABLE_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 /// Upper bounds for request latency histograms in nanoseconds. The matching
 /// Prometheus labels are expressed in seconds.
@@ -171,6 +190,72 @@ fn latency_json() -> Vec<Value> {
         .collect()
 }
 
+fn lookup_latency_map() -> &'static Mutex<BTreeMap<String, LatencyCounters>> {
+    static MAP: OnceLock<Mutex<BTreeMap<String, LatencyCounters>>> = OnceLock::new();
+    MAP.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn lookup_latency_json() -> Vec<Value> {
+    let map = lookup_latency_map()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    map.iter()
+        .map(|(operation, counters)| {
+            json!({
+                "operation": operation,
+                "buckets_ns": LATENCY_BUCKETS_NS,
+                "buckets": counters.buckets,
+                "count": counters.count,
+                "sum_ns": counters.sum_ns,
+            })
+        })
+        .collect()
+}
+
+/// Records one lookup and its aggregate counters.
+pub fn record_lookup(
+    elapsed: Duration,
+    stats: &nonodb_core::LookupStats,
+    bytes_returned: u64,
+    ok: bool,
+    explain: bool,
+) {
+    if explain {
+        inc(&LOOKUP_EXPLAINS);
+    } else {
+        inc(&LOOKUP_REQUESTS);
+    }
+    add(&LOOKUP_KEYS, stats.requested_keys as u64);
+    add(&LOOKUP_UNIQUE_KEYS, stats.unique_keys as u64);
+    add(&LOOKUP_FOUND, stats.found as u64);
+    add(&LOOKUP_MISSING, stats.missing as u64);
+    add(&LOOKUP_DOCUMENTS_READ, stats.documents_read);
+    add(&LOOKUP_INDEX_ENTRIES, stats.index_entries_read);
+    add(&LOOKUP_BYTES_READ, stats.bytes_read);
+    add(&LOOKUP_BYTES_RETURNED, bytes_returned);
+    add(
+        &LOOKUP_DURATION_NS,
+        u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX),
+    );
+    if !ok {
+        inc(&LOOKUP_ERRORS);
+    }
+    let operation = if explain { "explain_lookup" } else { "lookup" };
+    let mut map = lookup_latency_map()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let entry = map.entry(operation.to_string()).or_default();
+    let ns = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+    entry.count = entry.count.saturating_add(1);
+    entry.sum_ns = entry.sum_ns.saturating_add(ns);
+    for (index, upper) in LATENCY_BUCKETS_NS.iter().enumerate() {
+        if ns <= *upper {
+            entry.buckets[index] = entry.buckets[index].saturating_add(1);
+            break;
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 struct SnapshotCounters {
     success_total: u64,
@@ -190,6 +275,52 @@ fn unix_now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0)
+}
+
+fn certificate_map() -> &'static Mutex<BTreeMap<String, i64>> {
+    static MAP: OnceLock<Mutex<BTreeMap<String, i64>>> = OnceLock::new();
+    MAP.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+/// Records the leaf certificate expiry for one TLS role. The value is a Unix
+/// timestamp in seconds so Prometheus can compare it directly with `time()`.
+pub fn set_certificate_expiry(kind: &str, expires_at_unix: i64) {
+    let mut map = certificate_map()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    map.insert(kind.to_string(), expires_at_unix);
+}
+
+/// Reads the first certificate from a PEM file and records its `notAfter`.
+pub fn record_certificate_expiry(kind: &str, path: &Path) -> Result<(), String> {
+    let file = std::fs::File::open(path)
+        .map_err(|error| format!("open certificate {}: {error}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    let certificates = rustls_pemfile::certs(&mut reader)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("parse certificate {}: {error}", path.display()))?;
+    let leaf = certificates
+        .first()
+        .ok_or_else(|| format!("no certificate in {}", path.display()))?;
+    use x509_parser::prelude::FromDer;
+    let (_, certificate) = x509_parser::certificate::X509Certificate::from_der(leaf.as_ref())
+        .map_err(|error| format!("decode certificate {}: {error}", path.display()))?;
+    set_certificate_expiry(kind, certificate.validity().not_after.timestamp());
+    Ok(())
+}
+
+fn certificates_json() -> Vec<Value> {
+    let map = certificate_map()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    map.iter()
+        .map(|(kind, expires_at_unix)| {
+            json!({
+                "kind": kind,
+                "expires_at_unix": expires_at_unix,
+            })
+        })
+        .collect()
 }
 
 /// Records a successful consistent snapshot for one database.
@@ -212,6 +343,75 @@ pub fn record_snapshot_failure(database: &str) {
     let entry = map.entry(database.to_string()).or_default();
     entry.failures_total = entry.failures_total.saturating_add(1);
     entry.last_failure_unix = unix_now();
+}
+
+#[derive(Clone, Debug, Default)]
+struct WalCounters {
+    bytes: u64,
+    oldest_unix: u64,
+    last_seq: u64,
+    full: bool,
+    available: bool,
+    pruned_bytes_total: u64,
+}
+
+fn wal_map() -> &'static Mutex<BTreeMap<String, WalCounters>> {
+    static MAP: OnceLock<Mutex<BTreeMap<String, WalCounters>>> = OnceLock::new();
+    MAP.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+/// Publishes the current PITR WAL state for one database.
+pub fn record_wal(
+    database: &str,
+    bytes: u64,
+    oldest_unix: u64,
+    last_seq: u64,
+    full: bool,
+    available: bool,
+) {
+    let mut map = wal_map()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let entry = map.entry(database.to_string()).or_default();
+    entry.bytes = bytes;
+    entry.oldest_unix = oldest_unix;
+    entry.last_seq = last_seq;
+    entry.full = full;
+    entry.available = available;
+}
+
+/// Adds bytes removed by WAL retention to the per-database counter.
+pub fn record_wal_pruned(database: &str, bytes: u64) {
+    let mut map = wal_map()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let entry = map.entry(database.to_string()).or_default();
+    entry.pruned_bytes_total = entry.pruned_bytes_total.saturating_add(bytes);
+}
+
+fn wal_json() -> Vec<Value> {
+    let now = unix_now();
+    let map = wal_map()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    map.iter()
+        .map(|(database, counters)| {
+            json!({
+                "database": database,
+                "bytes": counters.bytes,
+                "oldest_unix": counters.oldest_unix,
+                "oldest_age_seconds": if counters.oldest_unix == 0 {
+                    Value::Null
+                } else {
+                    json!(now.saturating_sub(counters.oldest_unix))
+                },
+                "last_seq": counters.last_seq,
+                "full": u64::from(counters.full),
+                "pitr_available": u64::from(counters.available),
+                "pruned_bytes_total": counters.pruned_bytes_total,
+            })
+        })
+        .collect()
 }
 
 fn snapshots_json() -> Vec<Value> {
@@ -522,6 +722,7 @@ pub fn snapshot() -> Value {
     };
     let (event_emitted, event_suppressed) = nonodb_core::events::stats();
     let latency = latency_json();
+    let lookup_latency = lookup_latency_json();
     json!({
         "requests_total": REQUESTS.load(Relaxed),
         "errors_total": ERRORS.load(Relaxed),
@@ -550,6 +751,18 @@ pub fn snapshot() -> Value {
         "sql_delete_total": SQL_DELETE.load(Relaxed),
         "sql_errors_total": SQL_ERRORS.load(Relaxed),
         "sql_duration_ns_total": SQL_DURATION_NS.load(Relaxed),
+        "lookup_requests_total": LOOKUP_REQUESTS.load(Relaxed),
+        "lookup_explains_total": LOOKUP_EXPLAINS.load(Relaxed),
+        "lookup_keys_total": LOOKUP_KEYS.load(Relaxed),
+        "lookup_unique_keys_total": LOOKUP_UNIQUE_KEYS.load(Relaxed),
+        "lookup_found_total": LOOKUP_FOUND.load(Relaxed),
+        "lookup_missing_total": LOOKUP_MISSING.load(Relaxed),
+        "lookup_documents_read_total": LOOKUP_DOCUMENTS_READ.load(Relaxed),
+        "lookup_index_entries_read_total": LOOKUP_INDEX_ENTRIES.load(Relaxed),
+        "lookup_bytes_read_total": LOOKUP_BYTES_READ.load(Relaxed),
+        "lookup_bytes_returned_total": LOOKUP_BYTES_RETURNED.load(Relaxed),
+        "lookup_errors_total": LOOKUP_ERRORS.load(Relaxed),
+        "lookup_duration_ns_total": LOOKUP_DURATION_NS.load(Relaxed),
         "batch_ops_total": BATCH_OPS.load(Relaxed),
         "write_ops_total": write_ops,
         "write_batches_total": WRITE_BATCHES.load(Relaxed),
@@ -587,9 +800,14 @@ pub fn snapshot() -> Value {
         "ts_compaction_requests_total": TS_COMPACTION_REQUESTS.load(Relaxed),
         "ts_compactions_total": TS_COMPACTIONS.load(Relaxed),
         "ts_compacted_bytes_total": TS_COMPACTED_BYTES.load(Relaxed),
+        "tls_revocation_refresh_total": TLS_REVOCATION_REFRESH_TOTAL.load(Relaxed),
+        "tls_revocation_refresh_errors_total": TLS_REVOCATION_REFRESH_ERRORS.load(Relaxed),
+        "tls_revocation_revoked_total": TLS_REVOCATION_REVOKED_TOTAL.load(Relaxed),
+        "tls_revocation_unavailable_total": TLS_REVOCATION_UNAVAILABLE_TOTAL.load(Relaxed),
         "collection_metrics": collection_metrics,
         "collection_metrics_overflow_total": COLLECTION_METRICS_OVERFLOW.load(Relaxed),
         "latency": latency,
+        "lookup_latency": lookup_latency,
         "latency_series_overflow_total": LATENCY_SERIES_OVERFLOW.load(Relaxed),
         "commit_ns_total": commit_ns,
         "ttl_sweeps_total": TTL_SWEEPS.load(Relaxed),
@@ -597,6 +815,8 @@ pub fn snapshot() -> Value {
         "ttl_sweep_errors_total": TTL_SWEEP_ERRORS.load(Relaxed),
         "ttl_backlog": TTL_BACKLOG.load(Relaxed),
         "snapshots": snapshots_json(),
+        "wal": wal_json(),
+        "certificates": certificates_json(),
         "disk": disk_json(),
         "index_builds": nonodb_core::progress::snapshot(),
         "avg_batch_size": write_ops as f64 / batches as f64,
@@ -958,6 +1178,66 @@ pub fn prometheus() -> String {
             "Total SQL execution time.",
         ),
         (
+            "nonodb_lookup_requests_total",
+            "lookup_requests_total",
+            "Ordered point lookup requests.",
+        ),
+        (
+            "nonodb_lookup_explains_total",
+            "lookup_explains_total",
+            "Lookup plan explanations.",
+        ),
+        (
+            "nonodb_lookup_keys_total",
+            "lookup_keys_total",
+            "Requested lookup keys including duplicates.",
+        ),
+        (
+            "nonodb_lookup_unique_keys_total",
+            "lookup_unique_keys_total",
+            "Distinct lookup keys after deduplication.",
+        ),
+        (
+            "nonodb_lookup_found_total",
+            "lookup_found_total",
+            "Lookup results that found a document.",
+        ),
+        (
+            "nonodb_lookup_missing_total",
+            "lookup_missing_total",
+            "Lookup results with no document.",
+        ),
+        (
+            "nonodb_lookup_documents_read_total",
+            "lookup_documents_read_total",
+            "Documents read from the main collection during lookups.",
+        ),
+        (
+            "nonodb_lookup_index_entries_read_total",
+            "lookup_index_entries_read_total",
+            "Index entries examined during lookups.",
+        ),
+        (
+            "nonodb_lookup_bytes_read_total",
+            "lookup_bytes_read_total",
+            "Stored document and index bytes read during lookups.",
+        ),
+        (
+            "nonodb_lookup_bytes_returned_total",
+            "lookup_bytes_returned_total",
+            "Stored result bytes returned by lookups.",
+        ),
+        (
+            "nonodb_lookup_errors_total",
+            "lookup_errors_total",
+            "Failed lookup requests.",
+        ),
+        (
+            "nonodb_lookup_duration_ns_total",
+            "lookup_duration_ns_total",
+            "Total lookup execution time.",
+        ),
+        (
             "nonodb_batch_ops_total",
             "batch_ops_total",
             "Operations inside read batches.",
@@ -1161,6 +1441,26 @@ pub fn prometheus() -> String {
             "Replication log entries removed by automatic retention.",
         ),
         (
+            "nonodb_tls_revocation_refresh_total",
+            "tls_revocation_refresh_total",
+            "CRL refresh passes.",
+        ),
+        (
+            "nonodb_tls_revocation_refresh_errors_total",
+            "tls_revocation_refresh_errors_total",
+            "CRL refresh passes with at least one failed source.",
+        ),
+        (
+            "nonodb_tls_revocation_revoked_total",
+            "tls_revocation_revoked_total",
+            "Client certificates rejected as revoked.",
+        ),
+        (
+            "nonodb_tls_revocation_unavailable_total",
+            "tls_revocation_unavailable_total",
+            "Client connections whose revocation status could not be determined.",
+        ),
+        (
             "nonodb_ttl_backlog",
             "ttl_backlog",
             "Due TTL entries observed by the last sweep.",
@@ -1211,6 +1511,26 @@ pub fn prometheus() -> String {
         prom_sample(&mut out, name, &[], &snapshot[key]);
     }
 
+    if let Some(rows) = snapshot["certificates"].as_array() {
+        if !rows.is_empty() {
+            prom_header(
+                &mut out,
+                "nonodb_tls_certificate_expiry_timestamp_seconds",
+                "gauge",
+                "Leaf TLS certificate expiry as a Unix timestamp.",
+            );
+            for row in rows {
+                let kind = row["kind"].as_str().unwrap_or("unknown");
+                prom_sample(
+                    &mut out,
+                    "nonodb_tls_certificate_expiry_timestamp_seconds",
+                    &[("kind", kind)],
+                    &row["expires_at_unix"],
+                );
+            }
+        }
+    }
+
     if let Some(rows) = snapshot["latency"].as_array() {
         prom_header(
             &mut out,
@@ -1254,6 +1574,55 @@ pub fn prometheus() -> String {
             prom_sample(
                 &mut out,
                 "nonodb_request_duration_seconds_count",
+                &labels,
+                &row["count"],
+            );
+        }
+    }
+
+    if let Some(rows) = snapshot["lookup_latency"].as_array() {
+        prom_header(
+            &mut out,
+            "nonodb_lookup_duration_seconds",
+            "histogram",
+            "Lookup latency by operation.",
+        );
+        for row in rows {
+            let operation = row["operation"].as_str().unwrap_or("");
+            let labels = [("op", operation)];
+            let mut cumulative = 0u64;
+            if let Some(buckets) = row["buckets"].as_array() {
+                for (index, label) in LATENCY_BUCKET_LABELS.iter().enumerate() {
+                    cumulative = cumulative.saturating_add(
+                        buckets
+                            .get(index)
+                            .and_then(Value::as_u64)
+                            .unwrap_or_default(),
+                    );
+                    prom_sample(
+                        &mut out,
+                        "nonodb_lookup_duration_seconds_bucket",
+                        &[("op", operation), ("le", label)],
+                        &json!(cumulative),
+                    );
+                }
+            }
+            prom_sample(
+                &mut out,
+                "nonodb_lookup_duration_seconds_bucket",
+                &[("op", operation), ("le", "+Inf")],
+                &row["count"],
+            );
+            let sum_seconds = row["sum_ns"].as_u64().unwrap_or_default() as f64 / 1_000_000_000.0;
+            prom_sample(
+                &mut out,
+                "nonodb_lookup_duration_seconds_sum",
+                &labels,
+                &json!(sum_seconds),
+            );
+            prom_sample(
+                &mut out,
+                "nonodb_lookup_duration_seconds_count",
                 &labels,
                 &row["count"],
             );
@@ -1452,6 +1821,61 @@ pub fn prometheus() -> String {
         }
     }
 
+    if let Some(wal) = snapshot["wal"].as_array() {
+        const WAL_METRICS: &[(&str, &str, &str, &str)] = &[
+            (
+                "nonodb_wal_bytes",
+                "bytes",
+                "gauge",
+                "Bytes used by retained PITR WAL segments.",
+            ),
+            (
+                "nonodb_wal_oldest_age_seconds",
+                "oldest_age_seconds",
+                "gauge",
+                "Age of the oldest retained WAL segment.",
+            ),
+            (
+                "nonodb_wal_last_sequence",
+                "last_seq",
+                "gauge",
+                "Highest sequence archived in the WAL.",
+            ),
+            (
+                "nonodb_wal_full",
+                "full",
+                "gauge",
+                "1 when the WAL hard limit blocks writes.",
+            ),
+            (
+                "nonodb_pitr_available",
+                "pitr_available",
+                "gauge",
+                "1 when a snapshot plus WAL can serve a PITR restore.",
+            ),
+            (
+                "nonodb_wal_pruned_bytes_total",
+                "pruned_bytes_total",
+                "counter",
+                "WAL bytes removed by snapshot-covered retention.",
+            ),
+        ];
+        for (name, key, kind, help) in WAL_METRICS {
+            prom_header(&mut out, name, kind, help);
+            for row in wal {
+                if row[*key].is_null() {
+                    continue;
+                }
+                prom_sample(
+                    &mut out,
+                    name,
+                    &[("database", row["database"].as_str().unwrap_or(""))],
+                    &row[*key],
+                );
+            }
+        }
+    }
+
     if let Some(snapshots) = snapshot["snapshots"].as_array() {
         const SNAPSHOT_METRICS: &[(&str, &str, &str, &str)] = &[
             (
@@ -1513,6 +1937,36 @@ pub fn prometheus() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wal_metrics_are_exposed_in_snapshot_and_prometheus() {
+        let database = format!("wal-metrics-{}", std::process::id());
+        record_wal(
+            &database,
+            2048,
+            unix_now().saturating_sub(30),
+            7,
+            true,
+            false,
+        );
+        record_wal_pruned(&database, 512);
+        let snapshot = snapshot();
+        let row = snapshot["wal"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["database"] == database.as_str())
+            .expect("wal row");
+        assert_eq!(row["bytes"], 2048);
+        assert_eq!(row["full"], 1);
+        assert_eq!(row["pitr_available"], 0);
+        assert_eq!(row["pruned_bytes_total"], 512);
+        let text = prometheus();
+        assert!(text.contains("nonodb_wal_bytes{database=\""));
+        assert!(text.contains("nonodb_wal_full{database=\""));
+        assert!(text.contains("nonodb_pitr_available{database=\""));
+        assert!(text.contains("nonodb_wal_pruned_bytes_total{database=\""));
+    }
 
     #[test]
     fn collection_metrics_are_isolated_and_include_cache_and_errors() {
@@ -1582,6 +2036,23 @@ mod tests {
     }
 
     #[test]
+    fn certificate_expiry_is_exported_as_a_timestamp() {
+        let kind = format!("test-{}", std::process::id());
+        set_certificate_expiry(&kind, 1_900_000_000);
+        let snapshot = snapshot();
+        assert!(snapshot["certificates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["kind"] == kind.as_str() && row["expires_at_unix"] == 1_900_000_000));
+        let text = prometheus();
+        assert!(text.contains("# TYPE nonodb_tls_certificate_expiry_timestamp_seconds gauge"));
+        assert!(text.contains(&format!(
+            "nonodb_tls_certificate_expiry_timestamp_seconds{{kind=\"{kind}\"}} 1900000000"
+        )));
+    }
+
+    #[test]
     fn request_latency_histograms_are_bounded_and_exported() {
         let operation = format!("latency-test-{}", std::process::id());
         record_latency(&operation, Duration::from_millis(1));
@@ -1612,6 +2083,46 @@ mod tests {
         assert!(text.contains(&format!(
             "nonodb_request_duration_seconds_count{{op=\"{operation}\"}} 3"
         )));
+    }
+
+    #[test]
+    fn lookup_metrics_and_histograms_are_exported() {
+        let stats = nonodb_core::LookupStats {
+            selected_index: "email".into(),
+            index_fields: vec!["email".into()],
+            index_include: vec!["name".into()],
+            requested_keys: 3,
+            unique_keys: 2,
+            found: 2,
+            missing: 1,
+            index_entries_read: 2,
+            documents_read: 0,
+            bytes_read: 64,
+            result_bytes: 32,
+            covering: true,
+            primary: false,
+        };
+        record_lookup(Duration::from_millis(2), &stats, 32, true, false);
+        record_lookup(Duration::from_millis(3), &stats, 32, true, true);
+
+        let snapshot = snapshot();
+        assert!(snapshot["lookup_requests_total"].as_u64().unwrap() >= 1);
+        assert!(snapshot["lookup_explains_total"].as_u64().unwrap() >= 1);
+        assert!(snapshot["lookup_found_total"].as_u64().unwrap() >= 2);
+        assert!(snapshot["lookup_latency"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["operation"] == "lookup"));
+        assert!(snapshot["lookup_latency"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["operation"] == "explain_lookup"));
+        let text = prometheus();
+        assert!(text.contains("nonodb_lookup_requests_total"));
+        assert!(text.contains("# TYPE nonodb_lookup_duration_seconds histogram"));
+        assert!(text.contains("nonodb_lookup_duration_seconds_bucket{op=\"lookup\",le=\"+Inf\"}"));
     }
 
     #[test]

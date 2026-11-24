@@ -3,6 +3,10 @@
 use serde::{ser::SerializeMap, Deserialize, Serialize, Serializer};
 use serde_json::{value::RawValue, Value};
 
+use nonodb_core::graph::{
+    AllShortestPathsOptions, GraphAlgorithmOptions, GraphDef, GraphMatchOptions, HybridOptions,
+    NeighborsOptions, ShortestPathOptions, TraverseOptions,
+};
 use nonodb_core::{CollectionProfile, IndexSpec, SearchAllRequest, VaultKey, VectorMetric};
 
 use crate::webhooks::WebhookRule;
@@ -40,6 +44,14 @@ pub struct IndexRequest {
     pub directions: Vec<i8>,
     #[serde(default)]
     pub unique: bool,
+    #[serde(default)]
+    pub sparse: bool,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "partialFilterExpression"
+    )]
+    pub partial_filter_expression: Option<Value>,
     #[serde(default)]
     pub include: Vec<String>,
     /// Create a GeoJSON point index.
@@ -144,6 +156,18 @@ pub enum Request {
     },
     /// Ordered point lookups by `_id` or a unique single-field index.
     Lookup {
+        coll: String,
+        #[serde(default)]
+        by: Option<LookupBy>,
+        #[serde(default)]
+        values: Vec<Value>,
+        #[serde(default)]
+        fields: Option<Vec<String>>,
+        #[serde(default)]
+        projection: Option<Value>,
+    },
+    /// Plan and counters for an ordered point lookup.
+    ExplainLookup {
         coll: String,
         #[serde(default)]
         by: Option<LookupBy>,
@@ -347,6 +371,14 @@ pub enum Request {
         #[serde(default)]
         unique: bool,
         #[serde(default)]
+        sparse: bool,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            alias = "partialFilterExpression"
+        )]
+        partial_filter_expression: Option<Value>,
+        #[serde(default)]
         include: Vec<String>,
         #[serde(default)]
         geo: bool,
@@ -403,6 +435,24 @@ pub enum Request {
         coll: String,
         field: String,
     },
+    SetGraph {
+        coll: String,
+        def: GraphDef,
+    },
+    DropGraph {
+        coll: String,
+    },
+    ReindexGraph {
+        coll: String,
+        #[serde(default)]
+        online: bool,
+    },
+    GraphRebuildStatus {
+        coll: String,
+    },
+    CancelGraphRebuild {
+        coll: String,
+    },
     ListVectorIndexes {
         coll: String,
     },
@@ -416,6 +466,52 @@ pub enum Request {
         skip: usize,
         #[serde(default)]
         limit: Option<usize>,
+    },
+    /// Reads the graph definition for a node collection.
+    GetGraph {
+        coll: String,
+    },
+    /// Breadth-first or depth-first traversal over the graph rooted at `coll`.
+    Traverse {
+        coll: String,
+        #[serde(flatten)]
+        options: TraverseOptions,
+    },
+    /// Shortest path over the graph rooted at `coll`.
+    ShortestPath {
+        coll: String,
+        #[serde(flatten)]
+        options: ShortestPathOptions,
+    },
+    /// Every shortest path between two nodes.
+    AllShortestPaths {
+        coll: String,
+        #[serde(flatten)]
+        options: AllShortestPathsOptions,
+    },
+    /// Linear variable-length graph pattern matching.
+    GraphMatch {
+        coll: String,
+        #[serde(flatten)]
+        options: GraphMatchOptions,
+    },
+    /// Read-only graph algorithm (PageRank, degree, components).
+    GraphAlgorithm {
+        coll: String,
+        #[serde(flatten)]
+        options: GraphAlgorithmOptions,
+    },
+    /// One-hop neighbors of a node with graph filters.
+    Neighbors {
+        coll: String,
+        #[serde(flatten)]
+        options: NeighborsOptions,
+    },
+    /// Vector seed + graph expansion rerank.
+    HybridSearch {
+        coll: String,
+        #[serde(flatten)]
+        options: HybridOptions,
     },
     Search {
         coll: String,
@@ -472,6 +568,13 @@ pub enum Request {
     ListCollections,
     /// Per-collection record counts and storage estimates for this database.
     DatabaseStats,
+    /// Current storage usage and quota limits for this database.
+    GetQuota,
+    /// Replace the storage quota limits for this database. Zero or null clears
+    /// a limit.
+    SetQuota {
+        limits: crate::quota::QuotaLimits,
+    },
     /// Creates a collection explicitly. `profile` is `standard` (default),
     /// `vault`, or `timeseries`; `timeseries` configures the time-series bucket
     /// layout when the profile is `timeseries`.
@@ -813,6 +916,8 @@ pub enum WriteReq {
         coll: String,
         fields: Vec<String>,
         unique: bool,
+        sparse: bool,
+        partial_filter_expression: Option<Value>,
         include: Vec<String>,
         geo: bool,
     },
@@ -861,6 +966,26 @@ pub enum WriteReq {
     DropVectorIndex {
         coll: String,
         field: String,
+    },
+    SetGraph {
+        coll: String,
+        def: GraphDef,
+    },
+    DropGraph {
+        coll: String,
+    },
+    ReindexGraph {
+        coll: String,
+    },
+    StartGraphRebuild {
+        coll: String,
+    },
+    CancelGraphRebuild {
+        coll: String,
+    },
+    GraphRebuildStep {
+        edge: String,
+        limit: usize,
     },
     /// SQL `INSERT` or `UPDATE` executed in one writer transaction.
     Sql {
@@ -933,6 +1058,7 @@ impl Request {
             Self::Find { .. } => "find",
             Self::FindOne { .. } => "find_one",
             Self::Lookup { .. } => "lookup",
+            Self::ExplainLookup { .. } => "explain_lookup",
             Self::Watch { .. } => "watch",
             Self::Explain { .. } => "explain",
             Self::Update { .. } => "update",
@@ -962,6 +1088,19 @@ impl Request {
             Self::Fuzzy { .. } => "fuzzy",
             Self::CreateVectorIndex { .. } => "create_vector_index",
             Self::Reindex { .. } => "reindex",
+            Self::GetGraph { .. } => "get_graph",
+            Self::Traverse { .. } => "traverse",
+            Self::ShortestPath { .. } => "shortest_path",
+            Self::AllShortestPaths { .. } => "all_shortest_paths",
+            Self::GraphMatch { .. } => "graph_match",
+            Self::GraphAlgorithm { .. } => "graph_algorithm",
+            Self::Neighbors { .. } => "neighbors",
+            Self::HybridSearch { .. } => "hybrid_search",
+            Self::SetGraph { .. } => "set_graph",
+            Self::DropGraph { .. } => "drop_graph",
+            Self::ReindexGraph { .. } => "reindex_graph",
+            Self::GraphRebuildStatus { .. } => "graph_rebuild_status",
+            Self::CancelGraphRebuild { .. } => "cancel_graph_rebuild",
             Self::DropVectorIndex { .. } => "drop_vector_index",
             Self::ListVectorIndexes { .. } => "list_vector_indexes",
             Self::VectorSearch { .. } => "vector_search",
@@ -971,6 +1110,8 @@ impl Request {
             Self::WriteBatch { .. } => "write_batch",
             Self::ListCollections => "list_collections",
             Self::DatabaseStats => "database_stats",
+            Self::GetQuota => "get_quota",
+            Self::SetQuota { .. } => "set_quota",
             Self::CreateCollection { .. } => "create_collection",
             Self::DropCollection { .. } => "drop_collection",
             Self::GetCollectionTimeSeries { .. } => "get_collection_timeseries",
@@ -1023,6 +1164,7 @@ impl Request {
             Self::Find { .. }
             | Self::FindOne { .. }
             | Self::Lookup { .. }
+            | Self::ExplainLookup { .. }
             | Self::Watch { .. }
             | Self::Explain { .. }
             | Self::Count { .. }
@@ -1037,6 +1179,15 @@ impl Request {
             | Self::ListFuzzyIndexes { .. }
             | Self::ListVectorIndexes { .. }
             | Self::VectorSearch { .. }
+            | Self::GetGraph { .. }
+            | Self::Traverse { .. }
+            | Self::ShortestPath { .. }
+            | Self::AllShortestPaths { .. }
+            | Self::GraphMatch { .. }
+            | Self::GraphAlgorithm { .. }
+            | Self::Neighbors { .. }
+            | Self::HybridSearch { .. }
+            | Self::GraphRebuildStatus { .. }
             | Self::Search { .. }
             | Self::SearchAll { .. }
             | Self::Fuzzy { .. }
@@ -1044,6 +1195,7 @@ impl Request {
             | Self::GetVersion { .. }
             | Self::ListCollections
             | Self::DatabaseStats
+            | Self::GetQuota
             | Self::GetCollectionTtl { .. }
             | Self::GetCollectionHistory { .. }
             | Self::GetCollectionEvents { .. }
@@ -1069,6 +1221,7 @@ impl Request {
             | Self::Find { coll, .. }
             | Self::FindOne { coll, .. }
             | Self::Lookup { coll, .. }
+            | Self::ExplainLookup { coll, .. }
             | Self::Watch { coll, .. }
             | Self::Explain { coll, .. }
             | Self::Update { coll, .. }
@@ -1093,6 +1246,18 @@ impl Request {
             | Self::DropVectorIndex { coll, .. }
             | Self::ListVectorIndexes { coll }
             | Self::VectorSearch { coll, .. }
+            | Self::GetGraph { coll }
+            | Self::Traverse { coll, .. }
+            | Self::ShortestPath { coll, .. }
+            | Self::AllShortestPaths { coll, .. }
+            | Self::GraphMatch { coll, .. }
+            | Self::GraphAlgorithm { coll, .. }
+            | Self::Neighbors { coll, .. }
+            | Self::HybridSearch { coll, .. }
+            | Self::DropGraph { coll }
+            | Self::ReindexGraph { coll, .. }
+            | Self::GraphRebuildStatus { coll }
+            | Self::CancelGraphRebuild { coll }
             | Self::Search { coll, .. }
             | Self::Fuzzy { coll, .. }
             | Self::History { coll, .. }
@@ -1115,6 +1280,13 @@ impl Request {
             | Self::RenewSubscription { coll, .. }
             | Self::DeleteSubscription { coll, .. }
             | Self::ListSubscriptions { coll } => vec![coll.clone()],
+            Self::SetGraph { coll, def } => {
+                if def.edge_collection == *coll {
+                    vec![coll.clone()]
+                } else {
+                    vec![coll.clone(), def.edge_collection.clone()]
+                }
+            }
             Self::SearchAll { request } => vec![request.coll.clone()],
             Self::CreateWebhook { rule } => vec![rule.coll.clone()],
             Self::DeleteWebhook { .. }
@@ -1146,6 +1318,8 @@ impl Request {
             Self::GetMore { .. } | Self::CloseCursor { .. } => Vec::new(),
             Self::ListCollections
             | Self::DatabaseStats
+            | Self::GetQuota
+            | Self::SetQuota { .. }
             | Self::ListDatabases
             | Self::CreateDatabase { .. }
             | Self::DropDatabase { .. }
@@ -1185,7 +1359,10 @@ impl WriteReq {
             | Self::CreateTextIndex { .. }
             | Self::CreateFuzzyIndex { .. }
             | Self::CreateVectorIndex { .. }
-            | Self::Reindex { .. } => true,
+            | Self::Reindex { .. }
+            | Self::ReindexGraph { .. }
+            | Self::StartGraphRebuild { .. }
+            | Self::GraphRebuildStep { .. } => true,
             Self::Batch { ops } => ops.iter().any(Self::is_index_build),
             _ => false,
         }
@@ -1261,6 +1438,7 @@ impl From<nonodb_core::Error> for ApiError {
             E::InvalidBinary(_) => "invalid_binary",
             E::InvalidObjectId(_) => "invalid_object_id",
             E::InvalidTimestamp(_) => "invalid_timestamp",
+            E::InvalidRegex(_) => "invalid_regex",
             E::Json(_) | E::JsonFast(_) => "invalid_json",
             E::Lmdb(_) => "storage",
             E::Io(_) => "io",

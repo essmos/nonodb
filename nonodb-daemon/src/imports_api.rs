@@ -10,7 +10,7 @@ use crate::{
     audit_control,
     auth::{self},
     auth_api::{failure, ok, start_admin, AuthResponse},
-    imports::{BrowseRequest, RunImportRequest},
+    imports::{BrowseRequest, ImportSource, RestoreRequest, RunImportRequest},
     AppState,
 };
 
@@ -112,6 +112,134 @@ pub async fn run(
                 None,
             );
             failure(StatusCode::BAD_REQUEST, "import_error", error)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn audit_restore(
+    state: &AppState,
+    connection: &auth::ConnectionAuth,
+    principal: &str,
+    op: &str,
+    ok: bool,
+    error: Option<&str>,
+    started: std::time::Instant,
+    details: serde_json::Value,
+) {
+    if let Some(audit) = &state.audit {
+        audit.record_detail(
+            principal,
+            connection.source.as_str(),
+            connection.peer.as_deref(),
+            op,
+            &[],
+            ok,
+            error,
+            started.elapsed().as_secs_f64() * 1000.0,
+            None,
+            Some(&details),
+        );
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct RestorePreflightRequest {
+    pub source: ImportSource,
+    pub location: String,
+    pub database: String,
+}
+
+pub async fn restore_preflight(
+    State(state): State<AppState>,
+    Extension(connection): Extension<auth::ConnectionAuth>,
+    headers: HeaderMap,
+    Json(request): Json<RestorePreflightRequest>,
+) -> AuthResponse {
+    let (principal, started) = match start_admin(&state, &connection, &headers, "restore_preflight")
+    {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let details = serde_json::json!({
+        "database": request.database,
+        "location": request.location,
+    });
+    match state
+        .imports
+        .preflight_restore(request.source, request.location, request.database)
+        .await
+    {
+        Ok(value) => {
+            audit_restore(
+                &state,
+                &connection,
+                principal.name(),
+                "restore_preflight",
+                true,
+                None,
+                started,
+                details,
+            );
+            ok(value)
+        }
+        Err(error) => {
+            audit_restore(
+                &state,
+                &connection,
+                principal.name(),
+                "restore_preflight",
+                false,
+                Some(&error),
+                started,
+                details,
+            );
+            failure(StatusCode::BAD_REQUEST, "restore_error", error)
+        }
+    }
+}
+
+pub async fn restore(
+    State(state): State<AppState>,
+    Extension(connection): Extension<auth::ConnectionAuth>,
+    headers: HeaderMap,
+    Json(request): Json<RestoreRequest>,
+) -> AuthResponse {
+    let (principal, started) = match start_admin(&state, &connection, &headers, "restore_in_place")
+    {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let details = serde_json::json!({
+        "database": request.database,
+        "location": request.location,
+    });
+    match state.imports.restore_in_place(request).await {
+        Ok(value) => {
+            audit_restore(
+                &state,
+                &connection,
+                principal.name(),
+                "restore_in_place",
+                true,
+                None,
+                started,
+                details,
+            );
+            ok(value)
+        }
+        Err(error) => {
+            audit_restore(
+                &state,
+                &connection,
+                principal.name(),
+                "restore_in_place",
+                false,
+                Some(&error),
+                started,
+                details,
+            );
+            failure(StatusCode::BAD_REQUEST, "restore_error", error)
         }
     }
 }

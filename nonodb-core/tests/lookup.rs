@@ -195,6 +195,8 @@ fn lookup_uses_mixed_direction_unique_index() {
         name: "tenant_1_email_-1".into(),
         directions: vec![1, -1],
         unique: true,
+        sparse: false,
+        partial_filter_expression: None,
         include: vec![],
         geo: false,
     }])
@@ -236,6 +238,63 @@ fn lookup_supports_projection_without_id_and_deduplicates_results() {
     assert_eq!(results[0], Some(json!({"name": "Ada"})));
     assert_eq!(results[1], Some(json!({"name": "Ada"})));
     assert_eq!(results[2], Some(json!({"name": "Grace"})));
+}
+
+#[test]
+fn lookup_report_exposes_index_covering_and_counters() {
+    let (_dir, store) = fixture();
+    let c = store.collection("users").unwrap();
+
+    let (results, stats) = c
+        .lookup_fields_report(
+            &["email".to_string()],
+            &[
+                json!("ada@example.com"),
+                json!("absent@example.com"),
+                json!("ada@example.com"),
+            ],
+            Some(&json!({"name": 1})),
+        )
+        .unwrap();
+    assert_eq!(results.len(), 3);
+    assert!(results[1].is_none());
+    assert_eq!(stats.selected_index, "email");
+    assert_eq!(stats.index_fields, ["email"]);
+    assert_eq!(stats.index_include, ["name", "status"]);
+    assert!(!stats.primary);
+    assert!(stats.covering);
+    assert_eq!(stats.requested_keys, 3);
+    assert_eq!(stats.unique_keys, 2);
+    assert_eq!(stats.found, 2);
+    assert_eq!(stats.missing, 1);
+    assert_eq!(stats.documents_read, 0);
+    assert!(stats.index_entries_read >= 1);
+    assert!(stats.result_bytes > 0);
+
+    let (_, stats) = c
+        .lookup_fields_report(
+            &["_id".to_string()],
+            &[json!("a"), json!("absent")],
+            Some(&json!({"_id": 1})),
+        )
+        .unwrap();
+    assert_eq!(stats.selected_index, "_id_");
+    assert!(stats.primary);
+    assert!(stats.covering);
+    assert_eq!(stats.documents_read, 0);
+    assert_eq!(stats.found, 1);
+    assert_eq!(stats.missing, 1);
+
+    let (_, stats) = c
+        .lookup_fields_report(
+            &["email".to_string()],
+            &[json!("ada@example.com")],
+            Some(&json!({"name": 1, "extra": 1})),
+        )
+        .unwrap();
+    assert!(!stats.covering);
+    assert_eq!(stats.documents_read, 1);
+    assert!(stats.bytes_read > 0);
 }
 
 #[test]

@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nonodb-client"
+version = "0.32.0"
+description = "Thin Python client for NonoDB over Unix sockets or TCP/TLS"
+readme = "python-readme.md"
+requires-python = ">=3.9"
+license = "MIT"
+authors = [{ name = "NonoDB contributors" }]
+keywords = ["nonodb", "database", "json", "httpx", "asyncio"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Database :: Database Engines/Servers",
+  "Typing :: Typed",
+]
+dependencies = ["httpx>=0.24"]
+
+[project.optional-dependencies]
+speed = ["orjson>=3.9"]
+
+[project.urls]
+Homepage = "https://nonodb.com"
+Documentation = "https://nonodb.com/python-client/"
+Repository = "https://github.com/essmos/nonodb"
+Changelog = "https://github.com/essmos/nonodb/releases"
+
+[tool.setuptools]
+py-modules = ["nonodb"]
+include-package-data = false

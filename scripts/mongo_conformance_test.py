@@ -152,6 +152,24 @@ def sorted_docs(db, filter=None, **kwargs):
     return list(db.items.find(filter or {}).sort([("_id", 1)], **kwargs))
 
 
+def unique_missing_outcomes(db):
+    """Plain unique indexes treat a missing field as null."""
+    coll = db.unique_missing
+    coll.create_index([("email", 1)], unique=True)
+    outcomes = []
+    for document in (
+        {"_id": "missing-a"},
+        {"_id": "missing-b"},
+        {"_id": "explicit-null", "email": None},
+    ):
+        try:
+            coll.insert_one(document)
+            outcomes.append("ok")
+        except OperationFailure as error:
+            outcomes.append(error.code)
+    return outcomes
+
+
 def index_signature(db):
     return sorted(
         (
@@ -445,6 +463,7 @@ def main() -> int:
         check_both("create index and list", create_index)
         check_both("drop secondary index", drop_secondary_index)
         check_both("custom index name and direction", create_custom_index)
+        check_both("plain unique missing field", unique_missing_outcomes)
         check_both("list collection names", lambda db: sorted(db.list_collection_names()))
         check_both(
             "delete one",

@@ -268,6 +268,40 @@ def main() -> int:
             "initial replication",
         )
 
+        # Multi-database catalog: create two non-default databases and write
+        # data before the partition. Both candidates must receive the catalog
+        # and the data, not just the default database.
+        for database in ("app1", "app2"):
+            created = primary.post(
+                "/v1/exec",
+                headers=headers,
+                json={"op": "create_database", "name": database},
+            )
+            assert created.status_code == 200, created.text
+            inserted = primary.post(
+                f"/{database}/v1/exec",
+                headers=headers,
+                json={"op": "insert", "coll": "orders", "doc": {"_id": "before", "n": 1}},
+            )
+            assert inserted.status_code == 200, inserted.text
+        wait_for(
+            lambda: all(
+                clients[name]
+                .post(
+                    f"/{database}/v1/exec",
+                    headers=headers,
+                    json={"op": "count", "coll": "orders", "filter": {}},
+                )
+                .json()
+                .get("result", {})
+                .get("count")
+                == 1
+                for name in ("candidate1", "candidate2")
+                for database in ("app1", "app2")
+            ),
+            "multi-database catalog replication",
+        )
+
         # Cut the primary from voters and cut candidates from their source.
         for proxy in [*primary_voter_proxies.values(), primary_link]:
             proxy.stop()
@@ -317,6 +351,20 @@ def main() -> int:
             == 200,
             "new primary write",
         )
+        wait_for(
+            lambda: new_primary.post(
+                "/app1/v1/exec",
+                headers=headers,
+                json={"op": "insert", "coll": "orders", "doc": {"_id": "after-app1"}},
+            ).status_code
+            == 200,
+            "new primary multi-database write",
+        )
+        assert new_primary.post(
+            "/app2/v1/exec",
+            headers=headers,
+            json={"op": "insert", "coll": "orders", "doc": {"_id": "after-app2"}},
+        ).status_code == 200
 
         # Restore the network. The old primary should discover the new primary
         # and rejoin as a replica without a manual source command.
@@ -343,6 +391,35 @@ def main() -> int:
             "old primary catch-up",
             timeout=30,
         )
+        wait_for(
+            lambda: (
+                primary.post(
+                    "/app1/v1/exec",
+                    headers=headers,
+                    json={"op": "count", "coll": "orders", "filter": {}},
+                )
+                .json()
+                .get("result", {})
+                .get("count", 0)
+                >= 2
+                and primary.post(
+                    "/app2/v1/exec",
+                    headers=headers,
+                    json={"op": "count", "coll": "orders", "filter": {}},
+                )
+                .json()
+                .get("result", {})
+                .get("count", 0)
+                >= 2
+            ),
+            "old primary multi-database catch-up",
+            timeout=30,
+        )
+        databases = (
+            primary.post("/v1/exec", headers=headers, json={"op": "list_databases"})
+            .json()["result"]["databases"]
+        )
+        assert {"default", "app1", "app2"}.issubset(set(databases)), databases
         status = primary.get("/v1/replication/status", headers=headers).json()["result"]
         assert status["read_only"] is True, status
         print(
@@ -352,6 +429,8 @@ def main() -> int:
                     "old_role": status["role"],
                     "old_source": status["replication"]["source"],
                     "new_primary": new_primary_name,
+                    "catalog_databases": databases,
+                    "multi_database_converged": True,
                     "converged": True,
                 },
                 sort_keys=True,

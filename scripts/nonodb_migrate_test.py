@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from bson import Binary, Decimal128, ObjectId
+from bson.regex import Regex
 from pymongo import MongoClient
 from pymongo.errors import DuplicateKeyError
 
@@ -55,6 +56,7 @@ def main() -> int:
                     "created_at": datetime(2024, 1, 1, tzinfo=timezone.utc),
                     "dec": Decimal128("1.50"),
                     "bin": Binary(b"\x00\x01"),
+                    "pattern": Regex("^a", "i"),
                     "tags": ["a", "b"],
                 },
                 {
@@ -71,6 +73,11 @@ def main() -> int:
             [{"_id": str(i), "user": f"u{i % 3}", "total": i * 1.5} for i in range(10)]
         )
         db["orders"].create_index([("user", 1), ("total", -1)], name="user_total")
+        db["orders"].create_index(
+            [("total", 1)],
+            name="positive_total",
+            partialFilterExpression={"total": {"$gte": 0}},
+        )
         db["sessions"].insert_one(
             {"_id": "s1", "createdAt": datetime.now(timezone.utc)}
         )
@@ -119,13 +126,27 @@ def main() -> int:
             assert target.get_collection_ttl("sessions") == 120
             assert target.get_collection_ttl_field("sessions") == "createdAt"
             indexes = target.collection("users").list_indexes()
-            assert any(index["unique"] and index["fields"] == ["email"] for index in indexes), indexes
+            assert any(
+                index["unique"]
+                and index["sparse"]
+                and index["fields"] == ["email"]
+                for index in indexes
+            ), indexes
+            order_indexes = target.collection("orders").list_indexes()
+            assert any(
+                index["fields"] == ["total"]
+                and index.get("partial_filter_expression") == {"total": {"$gte": 0}}
+                for index in order_indexes
+            ), order_indexes
             assert target.collection("orders").find_one({"_id": "0"})["total"] == 0.0
             restored = target.collection("users").find_one(
                 {"_id": {"$oid": "64b64c000000000000000001"}}
             )
             assert restored["dec"] == {"$numberDecimal": "1.50"}, restored
             assert restored["created_at"]["$date"]["$numberLong"] == "1704067200000", restored
+            assert restored["pattern"] == {
+                "$regularExpression": {"pattern": "^a", "options": "i"}
+            }, restored
             try:
                 target.collection("users").insert(
                     {"_id": "duplicate", "email": "a@example.test"}

@@ -5,7 +5,9 @@ plaintext in LMDB, backups, or snapshots. They are not the default and they do
 not change the behaviour of standard collections.
 
 The trade-off is deliberate: a vault collection gives up most query features in
-exchange for whole-document encryption and per-tenant keys.
+exchange for whole-document encryption and per-tenant keys. Volume encryption
+and backup encryption are separate layers; see
+[Encryption at rest](encryption-at-rest.md).
 
 Use vault collections when:
 

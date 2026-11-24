@@ -71,6 +71,37 @@ impl AuditLog {
         duration_ms: f64,
         auth: Option<AuthAudit>,
     ) {
+        self.record_detail(
+            principal,
+            source,
+            peer,
+            op,
+            collections,
+            ok,
+            error,
+            duration_ms,
+            auth,
+            None,
+        );
+    }
+
+    /// Record an event with an additional structured `details` object. Used by
+    /// restore operations, where the backup source and safety snapshot are part
+    /// of the audit trail.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_detail(
+        &self,
+        principal: &str,
+        source: &str,
+        peer: Option<&str>,
+        op: &str,
+        collections: &[&str],
+        ok: bool,
+        error: Option<&str>,
+        duration_ms: f64,
+        auth: Option<AuthAudit>,
+        details: Option<&Value>,
+    ) {
         let ts_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis())
@@ -95,6 +126,11 @@ impl AuditLog {
                 if let Some(secs) = auth.blocked_for_secs {
                     object.insert("blocked_for_secs".into(), Value::from(secs));
                 }
+            }
+        }
+        if let Some(details) = details {
+            if let Some(object) = line.as_object_mut() {
+                object.insert("details".into(), details.clone());
             }
         }
         let mut encoded = serde_json::to_vec(&line).unwrap_or_default();

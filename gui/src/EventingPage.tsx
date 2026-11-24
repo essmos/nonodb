@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { handleTabKey } from './accessibility';
 import { exec, errorText, watchStream, type Connection } from './api';
 import WebhooksPage from './WebhooksPage';
 
@@ -244,12 +245,20 @@ export default function EventingPage({
         </div>
       </header>
 
-      {error && <div className="error-box">{error}</div>}
-      {notice && <div className="notice-box">{notice}</div>}
+      {error && <div className="error-box" role="alert">{error}</div>}
+      {notice && <div className="notice-box" role="status">{notice}</div>}
 
-      <div className="tab-bar">
+      <div className="tab-bar" role="tablist" aria-label="Eventing views">
         {tabs.map((item) => (
-          <button key={item.id} className={tab === item.id ? 'active' : ''} onClick={() => setTab(item.id)}>
+          <button
+            key={item.id}
+            role="tab"
+            aria-selected={tab === item.id}
+            tabIndex={tab === item.id ? 0 : -1}
+            className={tab === item.id ? 'active' : ''}
+            onClick={() => setTab(item.id)}
+            onKeyDown={handleTabKey}
+          >
             {item.label}
             {item.id === 'deliveries' && (deliveryCounts.dead > 0 || deliveryCounts.retry > 0) && (
               <span className="tab-count">{deliveryCounts.dead + deliveryCounts.retry}</span>
@@ -390,7 +399,7 @@ export default function EventingPage({
             </label>
             <label>Filter<input value={liveFilter} onChange={(e) => setLiveFilter(e.target.value)} spellCheck={false} /></label>
           </div>
-          {liveError && <div className="error-box">{liveError}</div>}
+          {liveError && <div className="error-box" role="alert">{liveError}</div>}
           <div className="live-events">
             {liveEvents.length === 0 ? (
               <p className="muted">{liveRunning ? 'Waiting for matching writes…' : 'Not running.'}</p>
