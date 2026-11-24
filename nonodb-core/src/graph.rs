@@ -30,6 +30,19 @@ pub const EDGE_DEF_PREFIX: &str = "graph_edge:";
 
 /// Maximum accepted traversal depth.
 pub const MAX_GRAPH_DEPTH: usize = 64;
+/// Maximum accepted node budget for graph operations.
+pub const MAX_GRAPH_NODES: usize = 100_000;
+/// Maximum accepted edge/adjacency budget for graph operations.
+pub const MAX_GRAPH_EDGES: usize = 100_000;
+/// Maximum accepted serialized result budget (256 MiB).
+pub const MAX_GRAPH_BYTES: usize = 256 * 1024 * 1024;
+/// Maximum number of labels/types accepted by one graph request.
+pub const MAX_GRAPH_LABELS: usize = 64;
+/// Maximum byte length of one label/type.
+pub const MAX_GRAPH_LABEL_LEN: usize = 256;
+/// Maximum accepted adjacency generation; rebuilds stop with an explicit error
+/// once this is exceeded.
+pub const MAX_GRAPH_GENERATION: u64 = 1_024;
 /// Default traversal depth.
 pub const DEFAULT_GRAPH_DEPTH: usize = 3;
 /// Default node budget.
@@ -109,6 +122,11 @@ impl GraphDef {
             return Err(Error::Query(
                 "graph `from_field` and `to_field` must differ".into(),
             ));
+        }
+        if self.generation > MAX_GRAPH_GENERATION {
+            return Err(Error::Query(format!(
+                "graph generation must be at most {MAX_GRAPH_GENERATION}"
+            )));
         }
         Ok(())
     }
@@ -200,6 +218,22 @@ fn default_bytes() -> usize {
     DEFAULT_GRAPH_BYTES
 }
 
+fn validate_graph_labels(labels: &[String]) -> Result<()> {
+    if labels.len() > MAX_GRAPH_LABELS {
+        return Err(Error::Query(format!(
+            "graph labels must contain at most {MAX_GRAPH_LABELS} entries"
+        )));
+    }
+    for label in labels {
+        if label.is_empty() || label.len() > MAX_GRAPH_LABEL_LEN || label.contains('\0') {
+            return Err(Error::Query(format!(
+                "graph label must be 1..={MAX_GRAPH_LABEL_LEN} bytes"
+            )));
+        }
+    }
+    Ok(())
+}
+
 impl TraverseOptions {
     pub fn validate(&self) -> Result<()> {
         if self.start.is_empty() && self.seed.is_none() {
@@ -215,11 +249,18 @@ impl TraverseOptions {
                 "traverse `max_depth` must be at most {MAX_GRAPH_DEPTH}"
             )));
         }
-        if self.limit_nodes == 0 || self.limit_edges == 0 || self.max_bytes == 0 {
-            return Err(Error::Query(
-                "traverse limits must be greater than zero".into(),
-            ));
+        if self.limit_nodes == 0
+            || self.limit_nodes > MAX_GRAPH_NODES
+            || self.limit_edges == 0
+            || self.limit_edges > MAX_GRAPH_EDGES
+            || self.max_bytes == 0
+            || self.max_bytes > MAX_GRAPH_BYTES
+        {
+            return Err(Error::Query(format!(
+                "traverse limits must be between 1 and ({MAX_GRAPH_NODES} nodes, {MAX_GRAPH_EDGES} edges, {MAX_GRAPH_BYTES} bytes)"
+            )));
         }
+        validate_graph_labels(&self.labels)?;
         if let Some(filter) = &self.edge_filter {
             validate_filter(filter)?;
         }
@@ -274,11 +315,12 @@ impl ShortestPathOptions {
                 "shortest_path `max_depth` must be at most {MAX_GRAPH_DEPTH}"
             )));
         }
-        if self.limit_nodes == 0 {
-            return Err(Error::Query(
-                "shortest_path `limit_nodes` must be greater than zero".into(),
-            ));
+        if self.limit_nodes == 0 || self.limit_nodes > MAX_GRAPH_NODES {
+            return Err(Error::Query(format!(
+                "shortest_path `limit_nodes` must be between 1 and {MAX_GRAPH_NODES}"
+            )));
         }
+        validate_graph_labels(&self.labels)?;
         if let Some(filter) = &self.edge_filter {
             validate_filter(filter)?;
         }
@@ -316,6 +358,7 @@ fn default_neighbors_limit() -> usize {
 
 impl NeighborsOptions {
     pub fn validate(&self) -> Result<()> {
+        validate_graph_labels(&self.labels)?;
         if self.limit == 0 || self.limit > DEFAULT_GRAPH_EDGES {
             return Err(Error::Query(format!(
                 "neighbors `limit` must be between 1 and {DEFAULT_GRAPH_EDGES}"
@@ -376,6 +419,7 @@ fn default_graph_weight() -> f64 {
 
 impl HybridOptions {
     pub fn validate(&self) -> Result<()> {
+        validate_graph_labels(&self.labels)?;
         if self.vector.k == 0 || self.vector.k > 1000 {
             return Err(Error::Query("hybrid `k` must be between 1 and 1000".into()));
         }
@@ -466,6 +510,7 @@ fn default_algo_nodes() -> usize {
 
 impl AllShortestPathsOptions {
     pub fn validate(&self) -> Result<()> {
+        validate_graph_labels(&self.labels)?;
         if self.max_depth > MAX_GRAPH_DEPTH {
             return Err(Error::Query(format!(
                 "all_shortest_paths `max_depth` must be at most {MAX_GRAPH_DEPTH}"
@@ -565,6 +610,7 @@ impl GraphMatchOptions {
             ));
         }
         for step in &self.pattern {
+            validate_graph_labels(&step.labels)?;
             if step.min_hops > step.max_hops {
                 return Err(Error::Query(
                     "graph_match step `min_hops` must not exceed `max_hops`".into(),
@@ -638,6 +684,7 @@ fn default_tolerance() -> f64 {
 
 impl GraphAlgorithmOptions {
     pub fn validate(&self) -> Result<()> {
+        validate_graph_labels(&self.labels)?;
         if self.limit == 0 || self.limit > DEFAULT_GRAPH_NODES {
             return Err(Error::Query(format!(
                 "graph algorithm `limit` must be between 1 and {DEFAULT_GRAPH_NODES}"
@@ -2612,6 +2659,46 @@ mod tests {
         };
         assert!(def.validate().is_ok());
         def.to_field = "from".into();
+        assert!(def.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_oversized_graph_budgets_generation_and_labels() {
+        let mut options: TraverseOptions = serde_json::from_value(json!({
+            "start": ["a"],
+            "limit_nodes": MAX_GRAPH_NODES + 1
+        }))
+        .unwrap();
+        assert!(options.validate().is_err());
+        options.limit_nodes = 1;
+        options.limit_edges = MAX_GRAPH_EDGES + 1;
+        assert!(options.validate().is_err());
+        options.limit_edges = 1;
+        options.max_bytes = MAX_GRAPH_BYTES + 1;
+        assert!(options.validate().is_err());
+
+        let labels = vec!["L".to_string(); MAX_GRAPH_LABELS + 1];
+        let options: TraverseOptions = serde_json::from_value(json!({
+            "start": ["a"],
+            "labels": labels
+        }))
+        .unwrap();
+        assert!(options.validate().is_err());
+
+        let shortest: ShortestPathOptions = serde_json::from_value(json!({
+            "start": "a",
+            "target": "b",
+            "limit_nodes": MAX_GRAPH_NODES + 1
+        }))
+        .unwrap();
+        assert!(shortest.validate().is_err());
+
+        let def: GraphDef = serde_json::from_value(json!({
+            "node_collection": "nodes",
+            "edge_collection": "edges",
+            "generation": MAX_GRAPH_GENERATION + 1
+        }))
+        .unwrap();
         assert!(def.validate().is_err());
     }
 

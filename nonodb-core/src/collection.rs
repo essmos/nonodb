@@ -524,6 +524,10 @@ pub struct IndexSpec {
     pub geo: bool,
 }
 
+#[cfg(test)]
+static GRAPH_LOOKUP_FAST_PATH_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 pub struct Collection<'e> {
     store: Option<&'e crate::store::Store>,
     db: Database<Bytes, Bytes>,
@@ -5208,7 +5212,7 @@ impl<'e> Collection<'e> {
         Ok(state)
     }
 
-    fn set_graph_rebuild_state_in(
+    pub(crate) fn set_graph_rebuild_state_in(
         &self,
         wtxn: &mut RwTxn<'_>,
         state: Option<&GraphRebuildState>,
@@ -5229,7 +5233,7 @@ impl<'e> Collection<'e> {
         Ok(())
     }
 
-    fn edge_graph_def_in(&self, txn: &RoTxn<'_>) -> Result<Option<GraphDef>> {
+    pub(crate) fn edge_graph_def_in(&self, txn: &RoTxn<'_>) -> Result<Option<GraphDef>> {
         let key = graph::edge_def_key(&self.name);
         let Some(raw) = self.meta.get(txn, key.as_bytes())? else {
             return Ok(None);
@@ -5257,6 +5261,7 @@ impl<'e> Collection<'e> {
     }
 
     pub fn set_graph_txn(&self, wtxn: &mut RwTxn<'_>, def: &GraphDef) -> Result<()> {
+        def.validate()?;
         if self.profile.is_vault() {
             return Err(Error::Query(
                 "graph operations are not supported on vault collections".into(),
@@ -5354,7 +5359,11 @@ impl<'e> Collection<'e> {
         Ok(true)
     }
 
-    fn clear_graph_adjacency_txn(&self, wtxn: &mut RwTxn<'_>, def: &GraphDef) -> Result<()> {
+    pub(crate) fn clear_graph_adjacency_txn(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        def: &GraphDef,
+    ) -> Result<()> {
         for generation in 0..=def.generation.saturating_add(1) {
             for direction in [GraphDirection::Out, GraphDirection::In] {
                 let resource =
@@ -7258,7 +7267,7 @@ impl<'e> Collection<'e> {
         };
         let max_docs = aggregate::max_docs();
         if restrict.is_none() {
-            let fast_def = match foreign.get_graph_in(rtxn)? {
+            let fast_def = match foreign.edge_graph_def_in(rtxn)? {
                 Some(def)
                     if def.node_collection == self.name
                         && def.edge_collection == foreign.name
@@ -7367,6 +7376,8 @@ impl<'e> Collection<'e> {
         depth_field: Option<&str>,
         vars: &BTreeMap<String, Value>,
     ) -> Result<Option<Vec<Value>>> {
+        #[cfg(test)]
+        GRAPH_LOOKUP_FAST_PATH_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let Some(store) = self.store else {
             return Ok(None);
         };
@@ -14056,6 +14067,41 @@ mod tests {
         assert!(primary
             .aggregate(&[json!({"$unionWith": {"coll": "union_archive", "pipeline": 1}})])
             .is_err());
+    }
+
+    #[test]
+    fn graph_lookup_uses_adjacency_fast_path() {
+        let (_dir, store) = store();
+        let nodes = store.collection("nodes").unwrap();
+        let edges = store.collection("edges").unwrap();
+        for id in ["n1", "n2", "n3"] {
+            nodes.insert_one(json!({"_id": id})).unwrap();
+        }
+        let def: GraphDef = serde_json::from_value(json!({
+            "node_collection": "nodes",
+            "edge_collection": "edges"
+        }))
+        .unwrap();
+        nodes.set_graph(def).unwrap();
+        edges
+            .insert_one(json!({"_id": "e1", "from": "n1", "to": "n2"}))
+            .unwrap();
+        edges
+            .insert_one(json!({"_id": "e2", "from": "n2", "to": "n3"}))
+            .unwrap();
+        super::GRAPH_LOOKUP_FAST_PATH_HITS.store(0, std::sync::atomic::Ordering::Relaxed);
+        let out = nodes
+            .aggregate(&[json!({"$graphLookup": {
+                "from": "edges",
+                "startWith": "n3",
+                "connectFromField": "from",
+                "connectToField": "to",
+                "as": "chain",
+                "maxDepth": 2
+            }})])
+            .unwrap();
+        assert!(super::GRAPH_LOOKUP_FAST_PATH_HITS.load(std::sync::atomic::Ordering::Relaxed) > 0);
+        assert_eq!(out[0]["chain"].as_array().unwrap().len(), 2);
     }
 
     #[test]
