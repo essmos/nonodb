@@ -214,7 +214,7 @@ events, and replication stay consistent.
 | `findAndModify` with `remove: true` | yes |
 | `findAndModify` with an update | yes (returns the new `_id` when the row moves) |
 | `update` (`$set`, `$inc`, `$mul`, `$unset`, `$rename`, pipelines, upsert) | yes |
-| aggregation pipelines (`$match`, `$group`, `$bucket`, `$sort`, ...) | yes; row-local stages stream in batches, blocking stages fall back to memory |
+| aggregation pipelines (`$match`, `$group`, `$bucket`, `$sort`, ...) | yes; row-local stages and `$group` stream in batches, other blocking stages fall back to memory |
 | retention: delete rows older than a cutoff | `retain_timeseries` |
 | SQL `SELECT`/`INSERT`/`UPDATE`/`DELETE`, `explain` | yes (same find/aggregate path) |
 | `$search`, `$searchMeta`, `$vectorSearch` | yes |
@@ -580,8 +580,9 @@ lookups are now practical.
 An unsorted indexed query stops after `skip + limit` rows, so a broad status
 query with `limit: 100` costs ~31 ms instead of decoding every candidate.
 Updates and `findAndModify` by synthetic `_id` restrict the scan to the bucket
-encoded in the id (~18 ms for a 1,667-row bucket), and a pure `_id` delete also
-goes straight to the locator instead of scanning every bucket.
+encoded in the id (~18 ms for a 1,667-row bucket), and a pure `_id` delete uses
+the locator. User-supplied ids use the `0x05` id-to-locator map instead of a
+collection scan.
 
 Reproduce: `ROWS=100000 READS=500 cargo run --release -p nonodb-core --example timeseries_bench`
 
@@ -619,10 +620,10 @@ prepared statements were used. Reproduce the Timescale side with
 
 ## Limitations
 
-- Deletes and rows moved by an update set bits in the bucket deletion bitmap;
-  deleted rows occupy their bucket (and its encoded payload) until retention or
-  compaction. Reclaiming file space requires an offline compacting copy, not
-  only a retention pass (`data.mdb` keeps its high-water mark).
+- Deletes and rows moved by an update set bits in the bucket deletion bitmap.
+  Their values are cleared on the next bucket rewrite, but LMDB still keeps the
+  high-water mark, so reclaiming file space requires an online/offline compacting
+  copy rather than a retention pass alone.
 - Unique secondary indexes are enforced on insert, update, upsert, and reindex
   (deleted rows immediately free their value). Non-unique secondary, text,
   fuzzy, geo, and vector indexes are also supported. The planner is used by
@@ -631,8 +632,9 @@ prepared statements were used. Reproduce the Timescale side with
   indexes, events, and replication stay consistent.
 - Aggregation streams row-local pipelines (`$match`, `$project`, `$addFields`,
   `$set`, `$unset`, `$replaceRoot`, `$lookup`, `$unwind`) in batches
-  (`NONODB_TS_AGG_BATCH`, default 4096). Pipelines with `$group`, `$sort`,
-  `$skip`, `$limit`, or `$facet` fall back to the materialized path.
+  (`NONODB_TS_AGG_BATCH`, default 4096). A single `$group` stage streams into one
+  builder; `$sort`/`$limit` then work on the group result. Pipelines with a
+  blocking stage before `$group`, or `$facet`, use the materialized path.
 - Point lookup by `_id` decodes one 256-row column block, not the containing
   bucket; deletes by `_id` use the locator directly.
 - Open buckets are uncompressed until they seal.

@@ -36,11 +36,10 @@ Full release notes: https://github.com/essmos/nonodb/releases
   deleted bitmap rows instead of renumbering the surviving rows. Added a pending
   move test alongside the `findAndModify` index test.
 - Run time-series retention automatically in the daemon for collections with
-  `expireAfterSeconds`, via the single writer thread, and request an offline
-  compaction when deleted pages pass `NONODB_TS_COMPACT_THRESHOLD_MB`. The
-  compacting copy runs before the environment is opened on the next startup,
-  so restart/compaction never races live readers or the writer. Added
-  `compact_data_dir` in the core crate and startup/retention tests.
+  `expireAfterSeconds`, via the single writer thread, and request compaction
+  when deleted pages pass `NONODB_TS_COMPACT_THRESHOLD_MB`. The daemon compacts
+  an idle runtime online; startup compaction remains the crash/disabled-fallback
+  path. Added `compact_data_dir` in the core crate and retention/startup tests.
 - Store time-series deletions as a per-bucket bitmap appended to the columnar
   payload instead of one 27-byte tombstone key per deleted row. `NTB1`
   payloads and legacy `0x03` keys remain readable and migrate into the bitmap on
