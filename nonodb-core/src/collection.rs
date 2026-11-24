@@ -624,18 +624,41 @@ impl<'e> Collection<'e> {
         Ok(Some(stats))
     }
 
-    fn ensure_not_timeseries(&self, operation: &str) -> Result<()> {
-        if self.profile.is_timeseries() {
-            return Err(Error::Query(format!(
-                "`{operation}` is not supported on time-series collection `{}`; time-series collections accept inserts and reads",
-                self.name
-            )));
-        }
-        Ok(())
-    }
-
     fn find_timeseries_in(&self, rtxn: &RoTxn<'_>, query: &FindQuery) -> Result<Vec<Value>> {
         let settings = self.timeseries_settings_in(rtxn)?.unwrap_or_default();
+        if let Some((field, near)) = geo::extract_near(&query.filter) {
+            let docs = match self.geo_index_candidates(rtxn, &query.filter)? {
+                Some(ids) => {
+                    let ids: HashSet<String> = ids.into_iter().collect();
+                    crate::timeseries::find_with_ids(
+                        rtxn,
+                        self.env,
+                        &self.name,
+                        &settings,
+                        query,
+                        Some(&ids),
+                    )?
+                }
+                None => crate::timeseries::find(rtxn, self.env, &self.name, &settings, query)?,
+            };
+            let limit = query.limit.unwrap_or(usize::MAX);
+            let mut hits: Vec<(f64, Value)> = docs
+                .into_iter()
+                .filter_map(|doc| {
+                    geo::field_distance(&doc, &field, near.center).map(|distance| (distance, doc))
+                })
+                .collect();
+            hits.sort_by(|a, b| a.0.total_cmp(&b.0));
+            return Ok(hits
+                .into_iter()
+                .skip(query.skip)
+                .take(limit)
+                .map(|(_, doc)| match &query.projection {
+                    Some(projection) => project(&doc, projection, Some(&query.filter)),
+                    None => doc,
+                })
+                .collect());
+        }
         let hint = query.hint.as_ref().map(parse_index_hint).transpose()?;
         if let Some(plan) = self.query_index_plan(rtxn, &query.filter, hint.as_ref())? {
             let range = (as_bound(&plan.bounds.0), as_bound(&plan.bounds.1));
@@ -1035,6 +1058,33 @@ impl<'e> Collection<'e> {
         self.resource_db_in(wtxn, &name, &name)
     }
 
+    /// Fetches a document by `_id`, branching to the bucket store for
+    /// time-series collections.
+    fn document_in(&self, txn: &RoTxn<'_>, id: &str) -> Result<Option<Value>> {
+        if self.profile.is_timeseries() {
+            let settings = self.timeseries_settings_in(txn)?.unwrap_or_default();
+            return crate::timeseries::find_by_id(txn, self.env, &self.name, &settings, id);
+        }
+        self.db.get(txn, id.as_bytes())?.map(parse_json).transpose()
+    }
+
+    /// Every document, used to backfill text/fuzzy/vector indexes.
+    fn documents_for_backfill(&self, txn: &RoTxn<'_>) -> Result<Vec<(String, Value)>> {
+        if self.profile.is_timeseries() {
+            let settings = self.timeseries_settings_in(txn)?.unwrap_or_default();
+            return crate::timeseries::all_docs(txn, self.env, &self.name, &settings);
+        }
+        let mut out = Vec::new();
+        for item in self.db.iter(txn)? {
+            let (id, bytes) = item?;
+            let id = std::str::from_utf8(id)
+                .map_err(|e| Error::Query(format!("invalid document id: {e}")))?
+                .to_string();
+            out.push((id, parse_json(bytes)?));
+        }
+        Ok(out)
+    }
+
     /// Creates multiple secondary indexes in one collection scan.
     ///
     /// Parsing and key encoding run in parallel; all index writes happen in the
@@ -1064,17 +1114,10 @@ impl<'e> Collection<'e> {
                     "index fields must be non-empty and must not contain `+`".into(),
                 ));
             }
-            if self.profile.is_timeseries() {
-                if spec.unique {
-                    return Err(Error::Query(
-                        "unique indexes are not supported on time-series collections".into(),
-                    ));
-                }
-                if spec.geo {
-                    return Err(Error::Query(
-                        "geo indexes are not supported on time-series collections".into(),
-                    ));
-                }
+            if self.profile.is_timeseries() && spec.unique {
+                return Err(Error::Query(
+                    "unique indexes are not supported on time-series collections".into(),
+                ));
             }
             if spec.geo && (spec.fields.len() != 1 || spec.unique || !spec.include.is_empty()) {
                 return Err(Error::Query(
@@ -1385,17 +1428,10 @@ impl<'e> Collection<'e> {
         geo: bool,
     ) -> Result<()> {
         self.ensure_standard()?;
-        if self.profile.is_timeseries() {
-            if unique {
-                return Err(Error::Query(
-                    "unique indexes are not supported on time-series collections".into(),
-                ));
-            }
-            if geo {
-                return Err(Error::Query(
-                    "geo indexes are not supported on time-series collections".into(),
-                ));
-            }
+        if self.profile.is_timeseries() && unique {
+            return Err(Error::Query(
+                "unique indexes are not supported on time-series collections".into(),
+            ));
         }
         if fields.is_empty() {
             return Err(Error::Query("index requires at least one field".into()));
@@ -2367,7 +2403,6 @@ impl<'e> Collection<'e> {
         dims: usize,
         metric: VectorMetric,
     ) -> Result<()> {
-        self.ensure_not_timeseries("create_vector_index")?;
         self.ensure_standard()?;
         if field.is_empty() || field.contains('+') {
             return Err(Error::Query(
@@ -2393,6 +2428,27 @@ impl<'e> Collection<'e> {
 
         let db = self.vector_db_in(wtxn, field)?;
         db.clear(&mut *wtxn)?;
+        if self.profile.is_timeseries() {
+            for (id, doc) in self.documents_for_backfill(&*wtxn)? {
+                let Some(vector) =
+                    index::field_value(&doc, field).and_then(|v| vector::parse_vector(v, dims))
+                else {
+                    continue;
+                };
+                db.put(
+                    &mut *wtxn,
+                    id.as_bytes(),
+                    vector::encode_vector(&vector).as_slice(),
+                )?;
+            }
+            let def = VectorDef::new(field, dims, metric);
+            self.meta.put(
+                &mut *wtxn,
+                def_key.as_bytes(),
+                serde_json::to_vec(&def)?.as_slice(),
+            )?;
+            return Ok(());
+        }
         self.parallel_backfill_apply(
             wtxn,
             "vector",
@@ -2728,10 +2784,9 @@ impl<'e> Collection<'e> {
             if let Some(ids) = ids {
                 let mut heap: BinaryHeap<Candidate> = BinaryHeap::new();
                 for id in ids {
-                    let Some(raw_doc) = self.db.get(rtxn, id.as_bytes())? else {
+                    let Some(doc) = self.document_in(rtxn, &id)? else {
                         continue;
                     };
-                    let doc: Value = parse_json(raw_doc)?;
                     if !matches(&doc, filter) {
                         continue;
                     }
@@ -2785,10 +2840,12 @@ impl<'e> Collection<'e> {
                 }
             }
             if filter_active {
-                let Some(raw_doc) = self.db.get(rtxn, key)? else {
+                let Some(id) = std::str::from_utf8(key).ok() else {
                     continue;
                 };
-                let doc: Value = parse_json(raw_doc)?;
+                let Some(doc) = self.document_in(rtxn, id)? else {
+                    continue;
+                };
                 if !matches(&doc, filter) {
                     continue;
                 }
@@ -2950,10 +3007,9 @@ impl<'e> Collection<'e> {
         });
         let mut out = Vec::new();
         for candidate in ranked.into_iter().skip(skip).take(limit) {
-            let Some(bytes) = self.db.get(rtxn, candidate.id.as_bytes())? else {
+            let Some(mut doc) = self.document_in(rtxn, &candidate.id)? else {
                 continue;
             };
-            let mut doc: Value = parse_json(bytes)?;
             if let Some(object) = doc.as_object_mut() {
                 object.insert(
                     "_distance".to_string(),
@@ -2978,7 +3034,6 @@ impl<'e> Collection<'e> {
         wtxn: &mut RwTxn<'_>,
         def: &SearchIndexDef,
     ) -> Result<()> {
-        self.ensure_not_timeseries("create_search_index")?;
         self.ensure_standard()?;
         def.validate().map_err(Error::Query)?;
         let def_key = search::def_key(&self.name, def.kind, &def.name);
@@ -3143,13 +3198,12 @@ impl<'e> Collection<'e> {
         let rel = format!("{dir}/full-{stamp}.seg");
         let mut builder = SegmentBuilder::new(root.join(&rel))?;
         let field = &def.fields[0].path;
-        for item in self.db.iter(&*wtxn)? {
-            let (id_bytes, doc_bytes) = item?;
-            let id = std::str::from_utf8(id_bytes)
-                .map_err(|e| Error::Query(format!("invalid document id: {e}")))?;
-            let doc: Value = serde_json::from_slice(doc_bytes)?;
+        let docs = self.documents_for_backfill(&*wtxn)?;
+        eprintln!("text backfill docs: {}", docs.len());
+        for (id, doc) in docs {
             if let Some(text) = index::field_value(&doc, field).and_then(search::field_text) {
-                builder.add_document(id, &text)?;
+                eprintln!("text add {id}: {text}");
+                builder.add_document(&id, &text)?;
             }
         }
         builder.finish()?;
@@ -3216,13 +3270,9 @@ impl<'e> Collection<'e> {
         let values_rel = format!("{dir}/full-{stamp}.values");
         let mut builder = FuzzySegmentBuilder::new(root.join(&rel))?;
         let field = &def.fields[0].path;
-        for item in self.db.iter(&*wtxn)? {
-            let (id_bytes, doc_bytes) = item?;
-            let id = std::str::from_utf8(id_bytes)
-                .map_err(|e| Error::Query(format!("invalid document id: {e}")))?;
-            let doc: Value = serde_json::from_slice(doc_bytes)?;
+        for (id, doc) in self.documents_for_backfill(&*wtxn)? {
             if let Some(text) = index::field_value(&doc, field).and_then(search::field_text) {
-                builder.add_document(id, &text)?;
+                builder.add_document(&id, &text)?;
             }
         }
         builder.finish(root.join(&values_rel))?;
@@ -3430,13 +3480,9 @@ impl<'e> Collection<'e> {
         let values_path = root.join(&values_rel);
         let mut builder = FuzzySegmentBuilder::new(&path)?;
         let field = &def.fields[0].path;
-        for item in self.db.iter(&*wtxn)? {
-            let (id_bytes, doc_bytes) = item?;
-            let id = std::str::from_utf8(id_bytes)
-                .map_err(|e| Error::Query(format!("invalid document id: {e}")))?;
-            let doc: Value = serde_json::from_slice(doc_bytes)?;
+        for (id, doc) in self.documents_for_backfill(&*wtxn)? {
             if let Some(text) = index::field_value(&doc, field).and_then(search::field_text) {
-                builder.add_document(id, &text)?;
+                builder.add_document(&id, &text)?;
             }
         }
         builder.finish(&values_path)?;
@@ -3623,9 +3669,7 @@ impl<'e> Collection<'e> {
         let mut documents = 0u64;
         let mut total_doc_len = 0u64;
         let mut df: HashMap<String, u64> = HashMap::new();
-        for item in self.db.iter(&*wtxn)? {
-            let (_, doc_bytes) = item?;
-            let doc: Value = serde_json::from_slice(doc_bytes)?;
+        for (_, doc) in self.documents_for_backfill(&*wtxn)? {
             let Some(text) = index::field_value(&doc, field).and_then(search::field_text) else {
                 continue;
             };
@@ -3763,13 +3807,9 @@ impl<'e> Collection<'e> {
         let path = root.join(&rel);
         let mut builder = SegmentBuilder::new(&path)?;
         let field = &def.fields[0].path;
-        for item in self.db.iter(&*wtxn)? {
-            let (id_bytes, doc_bytes) = item?;
-            let id = std::str::from_utf8(id_bytes)
-                .map_err(|e| Error::Query(format!("invalid document id: {e}")))?;
-            let doc: Value = serde_json::from_slice(doc_bytes)?;
+        for (id, doc) in self.documents_for_backfill(&*wtxn)? {
             if let Some(text) = index::field_value(&doc, field).and_then(search::field_text) {
-                builder.add_document(id, &text)?;
+                builder.add_document(&id, &text)?;
             }
         }
         builder.finish()?;
@@ -4390,10 +4430,9 @@ impl<'e> Collection<'e> {
         };
         let mut out = Vec::with_capacity(hits.len());
         for hit in hits {
-            let Some(bytes) = self.db.get(rtxn, hit.id.as_bytes())? else {
+            let Some(mut doc) = self.document_in(rtxn, &hit.id)? else {
                 continue;
             };
-            let mut doc: Value = serde_json::from_slice(bytes)?;
             if let Some(obj) = doc.as_object_mut() {
                 obj.insert("_score".to_string(), serde_json::json!(hit.score));
             }
@@ -4502,14 +4541,9 @@ impl<'e> Collection<'e> {
         }
         let candidate_query = candidate_terms.join(" ");
         let verify = |id: &str| -> std::io::Result<Option<f64>> {
-            let Some(bytes) = self
-                .db
-                .get(rtxn, id.as_bytes())
-                .map_err(std::io::Error::other)?
-            else {
+            let Some(doc) = self.document_in(rtxn, id).map_err(std::io::Error::other)? else {
                 return Ok(None);
             };
-            let doc: Value = serde_json::from_slice(bytes).map_err(std::io::Error::other)?;
             if needs_filter && !matches(&doc, filter) {
                 return Ok(None);
             }
@@ -4623,10 +4657,9 @@ impl<'e> Collection<'e> {
         hits.truncate(limit);
         let mut out = Vec::with_capacity(hits.len());
         for (distance, id) in hits {
-            let Some(bytes) = self.db.get(rtxn, id.as_bytes())? else {
+            let Some(mut doc) = self.document_in(rtxn, &id)? else {
                 continue;
             };
-            let mut doc: Value = serde_json::from_slice(bytes)?;
             if let Some(obj) = doc.as_object_mut() {
                 obj.insert("_distance".to_string(), serde_json::json!(distance));
             }
@@ -4712,14 +4745,10 @@ impl<'e> Collection<'e> {
         };
         let needs_filter = !empty_filter && allowed.is_none();
         let verify = |id: &str| -> std::io::Result<Option<f64>> {
-            let Some(bytes) = self
-                .db
-                .get(rtxn, id.as_bytes())
-                .map_err(std::io::Error::other)?
-            else {
+            let doc = self.document_in(rtxn, id).map_err(std::io::Error::other)?;
+            let Some(doc) = doc else {
                 return Ok(None);
             };
-            let doc: Value = serde_json::from_slice(bytes).map_err(std::io::Error::other)?;
             Ok(matches(&doc, filter).then_some(0.0))
         };
         let verify: Option<&DocVerifier<'_>> = needs_filter.then_some(&verify);
@@ -4750,6 +4779,9 @@ impl<'e> Collection<'e> {
                 crate::timeseries::find_by_id(&*wtxn, self.env, &self.name, &settings, &id)?
             {
                 self.apply_index_entries(wtxn, None, Some(&doc), &id)?;
+                self.apply_text_entries(wtxn, None, Some(&doc), &id)?;
+                self.apply_fuzzy_entries(wtxn, None, Some(&doc), &id)?;
+                self.apply_vector_entries(wtxn, None, Some(&doc), &id)?;
             }
             return Ok(id);
         }
@@ -4842,6 +4874,9 @@ impl<'e> Collection<'e> {
                         crate::timeseries::find_by_id(&*wtxn, self.env, &self.name, &settings, id)?
                     {
                         self.apply_index_entries(wtxn, None, Some(&doc), id)?;
+                        self.apply_text_entries(wtxn, None, Some(&doc), id)?;
+                        self.apply_fuzzy_entries(wtxn, None, Some(&doc), id)?;
+                        self.apply_vector_entries(wtxn, None, Some(&doc), id)?;
                     }
                     return Ok(());
                 }
@@ -4857,6 +4892,9 @@ impl<'e> Collection<'e> {
                     let after =
                         crate::timeseries::find_by_id(&*wtxn, self.env, &self.name, &settings, id)?;
                     self.apply_index_entries(wtxn, before.as_ref(), after.as_ref(), id)?;
+                    self.apply_text_entries(wtxn, before.as_ref(), after.as_ref(), id)?;
+                    self.apply_fuzzy_entries(wtxn, before.as_ref(), after.as_ref(), id)?;
+                    self.apply_vector_entries(wtxn, before.as_ref(), after.as_ref(), id)?;
                     return Ok(());
                 }
                 "delete" => {
@@ -4865,6 +4903,9 @@ impl<'e> Collection<'e> {
                     crate::timeseries::delete_by_id(wtxn, self.env, &self.name, &settings, id)?;
                     if let Some(doc) = &before {
                         self.apply_index_entries(wtxn, Some(doc), None, id)?;
+                        self.apply_text_entries(wtxn, Some(doc), None, id)?;
+                        self.apply_fuzzy_entries(wtxn, Some(doc), None, id)?;
+                        self.apply_vector_entries(wtxn, Some(doc), None, id)?;
                     }
                     return Ok(());
                 }
@@ -5013,6 +5054,9 @@ impl<'e> Collection<'e> {
                 };
                 if let Some((_, new_id)) = report.moved.iter().find(|(old, _)| old == old_id) {
                     self.apply_index_entries(wtxn, Some(old), None, old_id)?;
+                    self.apply_text_entries(wtxn, Some(old), None, old_id)?;
+                    self.apply_fuzzy_entries(wtxn, Some(old), None, old_id)?;
+                    self.apply_vector_entries(wtxn, Some(old), None, old_id)?;
                     if let Some(new_doc) = crate::timeseries::find_by_id(
                         &*wtxn, self.env, &self.name, &settings, new_id,
                     )? {
@@ -5022,6 +5066,9 @@ impl<'e> Collection<'e> {
                     crate::timeseries::find_by_id(&*wtxn, self.env, &self.name, &settings, old_id)?
                 {
                     self.apply_index_entries(wtxn, Some(old), Some(&new_doc), old_id)?;
+                    self.apply_text_entries(wtxn, Some(old), Some(&new_doc), old_id)?;
+                    self.apply_fuzzy_entries(wtxn, Some(old), Some(&new_doc), old_id)?;
+                    self.apply_vector_entries(wtxn, Some(old), Some(&new_doc), old_id)?;
                 }
             }
             if let Some(id) = &report.upserted_id {
@@ -5029,6 +5076,9 @@ impl<'e> Collection<'e> {
                     crate::timeseries::find_by_id(&*wtxn, self.env, &self.name, &settings, id)?
                 {
                     self.apply_index_entries(wtxn, None, Some(&new_doc), id)?;
+                    self.apply_text_entries(wtxn, None, Some(&new_doc), id)?;
+                    self.apply_fuzzy_entries(wtxn, None, Some(&new_doc), id)?;
+                    self.apply_vector_entries(wtxn, None, Some(&new_doc), id)?;
                 }
             }
             return Ok(UpdateOutcome {
@@ -5515,6 +5565,9 @@ impl<'e> Collection<'e> {
             for doc in before {
                 if let Some(id) = doc.get("_id").and_then(Value::as_str) {
                     self.apply_index_entries(wtxn, Some(&doc), None, id)?;
+                    self.apply_text_entries(wtxn, Some(&doc), None, id)?;
+                    self.apply_fuzzy_entries(wtxn, Some(&doc), None, id)?;
+                    self.apply_vector_entries(wtxn, Some(&doc), None, id)?;
                 }
             }
             return Ok(removed);
@@ -6572,8 +6625,42 @@ impl<'e> Collection<'e> {
                 max_time_ms: None,
                 hint: None,
             };
+            if let Some(stage) = pipeline.first().and_then(Value::as_object) {
+                let host = LookupHost { coll: self, rtxn };
+                if let Some(spec) = stage.get("$search") {
+                    let docs = crate::search_compat::search_stage_in(self, rtxn, spec, 1000)?;
+                    let out = aggregate::run_with_host(
+                        docs,
+                        &pipeline[1..],
+                        aggregate::max_docs(),
+                        Some(&host),
+                    )?;
+                    return Ok(out);
+                }
+                if let Some(spec) = stage.get("$searchMeta") {
+                    let meta = crate::search_compat::search_meta_stage_in(self, rtxn, spec)?;
+                    let out = aggregate::run_with_host(
+                        vec![meta],
+                        &pipeline[1..],
+                        aggregate::max_docs(),
+                        Some(&host),
+                    )?;
+                    return Ok(out);
+                }
+                if let Some(spec) = stage.get("$vectorSearch") {
+                    let docs = crate::search_compat::vector_search_stage_in(self, rtxn, spec)?;
+                    let out = aggregate::run_with_host(
+                        docs,
+                        &pipeline[1..],
+                        aggregate::max_docs(),
+                        Some(&host),
+                    )?;
+                    return Ok(out);
+                }
+            }
             let docs = crate::timeseries::find(rtxn, self.env, &self.name, &settings, &query)?;
-            return aggregate::run(docs, pipeline, aggregate::max_docs());
+            let host = LookupHost { coll: self, rtxn };
+            return aggregate::run_with_host(docs, pipeline, aggregate::max_docs(), Some(&host));
         }
         check_find_deadline(deadline)?;
         aggregate::validate_pipeline(pipeline)?;

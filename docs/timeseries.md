@@ -201,7 +201,8 @@ Stages that need a second collection or an index host (`$lookup`, `$search`,
 | document history | not recorded (keeps the format columnar) |
 | secondary indexes (`createIndex`/`dropIndex`/`reindex`) | yes, non-unique only |
 | unique indexes | rejected with a clear error |
-| text, fuzzy, geo, vector indexes | rejected with a clear error |
+| text, fuzzy, geo, vector indexes | yes (`createTextIndex`, `createFuzzyIndex`, `createGeoIndex`, `createVectorIndex`) |
+| `$search`, `$searchMeta`, `$vectorSearch` aggregation stages | yes |
 | `delete` by filter or by `_id` | yes (tombstones) |
 | `findAndModify` with `remove: true` | yes |
 | `findAndModify` with an update | yes (returns the new `_id` when the row moves) |
@@ -229,6 +230,17 @@ without visiting index entries, so stale entries can remain until `reindex` or
 `dropIndex`; they are harmless because candidate rows that no longer exist are
 skipped. Unique indexes are rejected because tombstones and bucket rewrites
 make uniqueness checks incompatible with the columnar layout.
+
+### Search indexes
+
+Time-series collections accept the same text, fuzzy, geo, and vector indexes as
+document collections. Creation backfills them from decoded bucket rows and the
+regular search APIs (`search`, `fuzzy_search`, `vector_search`, `$near`,
+`$geoWithin`) plus the `$search`/`$searchMeta`/`$vectorSearch` aggregation
+stages return the same documents as a scan. Inserts, updates (including rows
+that move buckets), deletes, upserts, and replicated writes maintain the
+entries; `reindex` rebuilds all of them. Secondary indexes remain non-unique,
+but text/fuzzy/geo/vector indexes have no uniqueness semantics of their own.
 
 ### Updates and ids
 
@@ -453,8 +465,7 @@ Reproduce: `ROWS=100000 READS=500 cargo run --release -p nonodb-core --example t
 - Unique indexes are rejected. Non-unique secondary indexes are supported and
   used by `find`/`count`/`explain` (`index_used`), but deletes and updates by
   filter still decode candidate buckets when no index applies.
-- No SQL, secondary/text/fuzzy/geo/vector indexes, `$search`, `$lookup`, or
-  watches inside the collection.
+- No SQL, `$lookup`, `$unionWith`, or watches inside the collection yet.
 - Aggregation decodes the full time range into memory before running stages.
 - Point lookup by `_id` decodes the containing bucket (see above).
 - Open buckets are uncompressed until they seal.

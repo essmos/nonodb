@@ -2697,10 +2697,6 @@ fn normalize_doc(doc: &mut Value) -> Result<()> {
 }
 
 /// Removes a synthetic `_id` that was derived from the row location.
-pub fn strip_derived_id_pub(doc: &mut Value) {
-    strip_derived_id(doc)
-}
-
 fn strip_derived_id(doc: &mut Value) {
     let derived = doc
         .get("_id")
@@ -4227,6 +4223,161 @@ mod tests {
         assert!(c.drop_index("level").unwrap());
         assert!(!c.drop_index("level").unwrap());
         assert_eq!(c.explain(&query(None)).unwrap()["index_used"], json!(false));
+    }
+
+    #[test]
+    fn text_fuzzy_geo_and_vector_indexes_work_on_timeseries() {
+        use crate::vector::VectorMetric;
+
+        let (_dir, store) = ts_store();
+        let settings = Settings {
+            time_field: "ts".into(),
+            meta_field: Some("device".into()),
+            ..Settings::default()
+        };
+        let c = store
+            .create_timeseries_collection("metrics", &settings)
+            .unwrap();
+        let base = 1_700_000_000_000i64;
+        let rows = [
+            (
+                "rust database engine",
+                "color",
+                [1.0f32, 0.0, 0.0],
+                [19.94, 50.06],
+            ),
+            (
+                "python web framework",
+                "colour",
+                [0.0, 1.0, 0.0],
+                [21.01, 52.23],
+            ),
+            (
+                "rust web framework",
+                "colourful",
+                [0.9, 0.1, 0.0],
+                [19.941, 50.06],
+            ),
+        ];
+        for (idx, (title, code, emb, loc)) in rows.iter().enumerate() {
+            c.insert_one(json!({
+                "ts": {"$date": {"$numberLong": (base + idx as i64 * 1000).to_string()}},
+                "device": {"id": "a"},
+                "title": title,
+                "code": code,
+                "emb": emb,
+                "loc": {"type": "Point", "coordinates": loc},
+            }))
+            .unwrap();
+        }
+
+        c.create_text_index("title").unwrap();
+        c.create_fuzzy_index("code").unwrap();
+        c.create_geo_index("loc").unwrap();
+        c.create_vector_index("emb", 3, VectorMetric::Cosine)
+            .unwrap();
+
+        // Text search and the `$search` aggregation stage.
+        let hits = c.search("title", "rust", &json!({}), 0, Some(10)).unwrap();
+        assert_eq!(hits.len(), 2);
+        let staged = c
+            .aggregate(&[
+                json!({"$search": {"text": {"query": "rust", "path": "title"}}}),
+                json!({"$project": {"_id": 1, "title": 1}}),
+            ])
+            .unwrap();
+        assert_eq!(staged.len(), 2);
+
+        // Fuzzy search by distance.
+        let fuzzy = c
+            .fuzzy_search("code", "color", 1, &json!({}), Some(10))
+            .unwrap();
+        assert!(fuzzy.iter().any(|doc| doc["code"] == json!("color")));
+        assert!(fuzzy.iter().any(|doc| doc["code"] == json!("colour")));
+
+        // Vector search returns the closest rows with `_distance`.
+        let vector = c
+            .vector_search("emb", &[1.0, 0.0, 0.0], &json!({}), 0, Some(2))
+            .unwrap();
+        assert_eq!(vector.len(), 2);
+        assert!(
+            vector[0]["_distance"].as_f64().unwrap() <= vector[1]["_distance"].as_f64().unwrap()
+        );
+
+        // Geo `$near` sorts by distance and `$geoWithin` filters by box.
+        let near = crate::collection::FindQuery {
+            filter: json!({"loc": {"$near": {
+                "$geometry": {"type": "Point", "coordinates": [19.94, 50.06]},
+                "$maxDistance": 500
+            }}}),
+            ..Default::default()
+        };
+        let found = c.find(&near).unwrap();
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0]["title"], json!("rust database engine"));
+        assert_eq!(
+            c.count(&json!({"loc": {"$geoWithin": {"$box": [[19.0, 50.0], [20.0, 51.0]]}}}))
+                .unwrap(),
+            2
+        );
+
+        // Insert/update/delete keep every index in sync.
+        let id = c
+            .insert_one(json!({
+                "ts": {"$date": {"$numberLong": (base + 500_000).to_string()}},
+                "device": {"id": "a"},
+                "title": "rust stream processor",
+                "code": "colorr",
+                "emb": [1.0, 0.0, 0.0],
+                "loc": {"type": "Point", "coordinates": [19.941, 50.06]},
+            }))
+            .unwrap();
+        assert!(c
+            .search("title", "stream", &json!({}), 0, Some(10))
+            .unwrap()
+            .iter()
+            .any(|doc| doc["_id"] == json!(id)));
+
+        c.update_opts(
+            &json!({"_id": id}),
+            &json!({"$set": {"title": "velvet stream", "code": "velvet", "loc": {"type": "Point", "coordinates": [10.0, 40.0]}}}),
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(c
+            .search("title", "rust", &json!({}), 0, Some(10))
+            .unwrap()
+            .iter()
+            .all(|doc| doc["_id"] != json!(id)));
+        assert!(c
+            .search("title", "velvet", &json!({}), 0, Some(10))
+            .unwrap()
+            .iter()
+            .any(|doc| doc["_id"] == json!(id)));
+        assert_eq!(
+            c.count(&json!({"loc": {"$geoWithin": {"$box": [[19.0, 50.0], [20.0, 51.0]]}}}))
+                .unwrap(),
+            2
+        );
+
+        assert_eq!(c.delete(&json!({"_id": id}), false).unwrap(), 1);
+        assert!(c
+            .search("title", "velvet", &json!({}), 0, Some(10))
+            .unwrap()
+            .is_empty());
+
+        // Reindex rebuilds all four index types.
+        let report = c.reindex().unwrap();
+        assert!(report.text.iter().any(|name| name == "title"));
+        assert!(report.fuzzy.iter().any(|name| name == "code"));
+        assert!(report.vector.iter().any(|name| name == "emb"));
+        assert_eq!(
+            c.search("title", "rust", &json!({}), 0, Some(10))
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[test]

@@ -28,6 +28,10 @@ Full release notes: https://github.com/essmos/nonodb/releases
   entries current, and `find`/`count`/`explain` use the planner
   (`index_used`, `access: index_scan`). Unique indexes are rejected with a
   clear error.
+- Enable text, fuzzy, geo, and vector indexes on time-series collections,
+  including `$search`, `$searchMeta`, `$vectorSearch`, fuzzy/vector search, and
+  `$near`/`$geoWithin`. Backfills decode bucket rows, and inserts, updates,
+  deletes, upserts, and replicated writes keep the search structures current.
 - Add aggregation and retention for time-series collections. `aggregate` now
   decodes buckets through the time-range-pruned find path and runs the normal
   in-memory pipeline, so `$group`/`$bucket` downsampling works. The new
