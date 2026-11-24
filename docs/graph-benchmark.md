@@ -9,24 +9,6 @@ API?
 It is **not** a general graph-database ranking, a durability benchmark, or a
 replication benchmark.
 
-## Why NonoDB has no special graph collection
-
-In NonoDB, graph data is still ordinary document data:
-
-- a node is a document in a normal collection;
-- an edge is a document in another normal collection;
-- `set_graph` stores a definition in metadata and maintains a derived
-  `out`/`in` adjacency index in the same LMDB transaction as edge writes.
-
-The internal `graph:<edge_collection>:out` and `graph:<edge_collection>:in`
-slots are derived resources, not user-visible collections. A graph is therefore
-a mapping and an adjacency index over ordinary collections, not a new collection
-type.
-
-Neo4j uses a different model: native nodes and relationships. The benchmark maps
-each NonoDB edge document to a Neo4j `:EDGE` relationship with `id` and `label`
-properties.
-
 ## Environment
 
 | Component | Value |
@@ -43,7 +25,8 @@ tuning, or Neo4j Enterprise features were enabled.
 
 ## Dataset
 
-The dataset is deterministic (`random.Random(42)`):
+NonoDB edge documents were mapped to Neo4j `:EDGE` relationships with `id` and
+`label` properties. The dataset is deterministic (`random.Random(42)`):
 
 - **2,000 nodes**, `n0` through `n1999`;
 - **8,000 directed edges**;
