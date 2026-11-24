@@ -211,13 +211,14 @@ retention is enabled (`NONODB_TS_RETENTION_INTERVAL_SECS` > 0).
 | `nonodb_ts_retention_dropped_buckets_total` | Whole buckets removed by retention |
 | `nonodb_ts_retention_boundary_buckets_total` | Boundary buckets marked by retention |
 | `nonodb_ts_retention_errors_total` | Failed retention passes |
-| `nonodb_ts_compaction_requests_total` | Offline compaction requests written |
-| `nonodb_ts_compactions_total` | Compactions completed at startup |
+| `nonodb_ts_compaction_requests_total` | Compaction requests written |
+| `nonodb_ts_compactions_total` | Compactions completed (startup or online) |
 | `nonodb_ts_compacted_bytes_total` | Bytes reclaimed by compaction |
 
 A rising `nonodb_ts_deleted_rows` with a flat `nonodb_ts_encoded_bytes` means
-bitmap deletes are accumulating; check `NONODB_TS_COMPACT_THRESHOLD_MB` and
-plan the next restart/offline compaction.
+bitmap deletes are accumulating; check `NONODB_TS_COMPACT_THRESHOLD_MB`. The
+daemon's online compactor picks up the marker and swaps the file once the
+database has no active runtime (`NONODB_TS_ONLINE_COMPACT_INTERVAL_SECS`).
 
 ## Recommended alerts
 

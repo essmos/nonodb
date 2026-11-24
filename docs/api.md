@@ -2762,8 +2762,9 @@ deletion bitmap so synthetic `_id`s stay valid:
             "dropped_rows": 0, "remaining_rows": 64000}}}
 ```
 
-`aggregate` works on time-series collections by decoding the pruned time range
-and running the in-memory pipeline (see [Time-series collections](timeseries.md)).
+`aggregate` works on time-series collections. Row-local stages are streamed in
+batches after bucket pruning; blocking stages still materialize the selected
+range (see [Time-series collections](timeseries.md)).
 
 An optional `ttl_seconds` sets the default document TTL for new inserts.
 `ttl_purge_history` controls whether TTL expiry deletes stored history:

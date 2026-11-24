@@ -239,6 +239,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         agg_runs,
     );
 
+    let stream_pipeline = vec![
+        json!({"$match": wide.clone()}),
+        json!({"$project": {"status": 1, "temperature": 1, "_id": 0}}),
+    ];
+    let mut samples = Vec::with_capacity(agg_runs);
+    let mut streamed = 0usize;
+    for _ in 0..agg_runs {
+        let op = Instant::now();
+        streamed = ts.aggregate(&stream_pipeline)?.len();
+        samples.push(op.elapsed());
+    }
+    report_latency(
+        &format!("aggregate streamed $match/$project ({streamed} rows)"),
+        samples,
+        agg_runs,
+    );
+
     // Point deletes by synthetic id: sealed buckets take a tombstone, so the
     // cost is one LMDB put plus the bucket header read.
     let delete_sample = (rows / 2000).clamp(1, 100);

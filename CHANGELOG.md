@@ -4,6 +4,19 @@ Full release notes: https://github.com/essmos/nonodb/releases
 
 ## Unreleased
 
+- Time-series secondary indexes now drive `update`/`delete` filters as well as
+  reads, unique indexes are enforced (including insert/update/upsert/reindex and
+  reuse after delete), and retention removes index entries for reaped rows.
+- Time-series `$out`/`$merge` targets write through the bucket writer, so
+  indexes, events, replication, and synthetic ids stay consistent.
+- Row-local time-series aggregation stages stream in batches
+  (`NONODB_TS_AGG_BATCH`); `$group`/`$sort`/`$limit` keep the materialized path.
+- Buckets use block-column encoding (256 rows per block), so `find_by_key`
+  decodes one block instead of the whole bucket. Old `NTB1`/`NTB2` payloads
+  remain readable.
+- Idle databases can be compacted online without restarting the daemon; active
+  runtimes are left untouched until they finish, and deleted row values are
+  cleared per bucket during rewrites.
 - Add `Collection::insert_many_txn` with a time-series batch writer that
   resolves each open bucket once and flushes its pointer at the end of the
   transaction. A 100k-row load in 1000-row transactions improved from ~40.5k to
@@ -49,8 +62,8 @@ Full release notes: https://github.com/essmos/nonodb/releases
   `createIndexes`, `dropIndex`, `listIndexes`, and `reindex` backfill from
   bucket rows; inserts, deletes, updates, upserts, and replicated writes keep
   entries current, and `find`/`count`/`explain` use the planner
-  (`index_used`, `access: index_scan`). Unique indexes are rejected with a
-  clear error.
+  (`index_used`, `access: index_scan`). Unique indexes are enforced on the
+  same paths.
 - Enable text, fuzzy, geo, and vector indexes on time-series collections,
   including `$search`, `$searchMeta`, `$vectorSearch`, fuzzy/vector search, and
   `$near`/`$geoWithin`. Backfills decode bucket rows, and inserts, updates,

@@ -22,7 +22,7 @@ buckets by time and decodes only the needed range, `INSERT`/`UPDATE`/`DELETE`
 go through the bucket writer (keeping the synthetic `_id` stable unless the time
 or meta field changes), and `EXPLAIN` reports `index_scan` when a secondary
 index is used. See [Time-series collections](timeseries.md). `$out` and
-`$merge` are still rejected on time-series collections.
+`$merge` write to time-series targets through the bucket writer.
 
 ## SELECT
 

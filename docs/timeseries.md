@@ -164,9 +164,10 @@ decoding.
 ### Aggregation and downsampling
 
 Aggregation pipelines run over the decoded documents, so `$group`, `$bucket`,
-`$sort`, `$project`, `$count`, and the rest of the in-memory stage set work on
-time-series collections. A leading `$match` is reused for bucket and series
-pruning, and the whole bucket time range is decoded before the pipeline runs:
+`$sort`, `$project`, `$count`, and the rest of the stage set work on time-series
+collections. A leading `$match` is reused for bucket and series pruning.
+Row-local stages are fed in batches by `scan_batches`; stages that need the
+whole input (`$group`, `$sort`, `$limit`) use the materialized path:
 
 ```json
 {
@@ -202,15 +203,15 @@ bucket writer.
 | TTL: collection/document TTL | not applied to buckets |
 | `verify_data_dir` | decodes every bucket and validates keys, headers, rows, and deletion bitmaps |
 | document history | not recorded (keeps the format columnar) |
-| secondary indexes (`createIndex`/`dropIndex`/`reindex`) | yes, non-unique only |
-| unique indexes | rejected with a clear error |
+| secondary indexes (`createIndex`/`dropIndex`/`reindex`) | yes, including unique |
+| unique indexes | enforced on insert/update/upsert/reindex |
 | text, fuzzy, geo, vector indexes | yes (`createTextIndex`, `createFuzzyIndex`, `createGeoIndex`, `createVectorIndex`) |
 | `$search`, `$searchMeta`, `$vectorSearch` aggregation stages | yes |
 | `delete` by filter or by `_id` | yes (bitmap; `_id` uses the locator directly) |
 | `findAndModify` with `remove: true` | yes |
 | `findAndModify` with an update | yes (returns the new `_id` when the row moves) |
 | `update` (`$set`, `$inc`, `$mul`, `$unset`, `$rename`, pipelines, upsert) | yes |
-| aggregation pipelines (`$match`, `$group`, `$bucket`, `$sort`, ...) | yes, decoded then run in memory |
+| aggregation pipelines (`$match`, `$group`, `$bucket`, `$sort`, ...) | yes; row-local stages stream in batches, blocking stages fall back to memory |
 | retention: delete rows older than a cutoff | `retain_timeseries` |
 | SQL `SELECT`/`INSERT`/`UPDATE`/`DELETE`, `explain` | yes (same find/aggregate path) |
 | `$search`, `$searchMeta`, `$vectorSearch` | yes |
@@ -244,8 +245,8 @@ regular search APIs (`search`, `fuzzy_search`, `vector_search`, `$near`,
 `$geoWithin`) plus the `$search`/`$searchMeta`/`$vectorSearch` aggregation
 stages return the same documents as a scan. Inserts, updates (including rows
 that move buckets), deletes, upserts, and replicated writes maintain the
-entries; `reindex` rebuilds all of them. Secondary indexes remain non-unique,
-but text/fuzzy/geo/vector indexes have no uniqueness semantics of their own.
+entries; `reindex` rebuilds all of them. Text/fuzzy/geo/vector indexes have no
+uniqueness semantics of their own.
 
 ### GUI and CLI
 
@@ -533,17 +534,18 @@ standard collection holding the same documents:
 
 ```text
 write
-insert (time-series)                 100000 ops   17123 ops/s  p50 38.4us  p95 65.0us  p99 73.8us
-insert (standard, baseline)          100000 ops   50526 ops/s  p50 19.6us  p95 23.6us  p99 28.2us
+insert (time-series)                 100000 ops   17552 ops/s  p50 37.9us  p95 64.7us  p99 74.4us
+insert (standard, baseline)          100000 ops   39789 ops/s  p50 21.7us  p95 38.2us  p99 44.8us
 seal open buckets                        10 perm  231 ms total, 23.1 ms/bucket
 stored: 9.24 bytes/row, 19.8x smaller than raw JSON
 
 read (time-series collection)
-find_by_key (point)                     2000 ops    2486 ops/s  p50 355 us  p99 634 us
+find_by_key (point)                     2000 ops    2505 ops/s  p50 352 us  p99 613 us
 find 1 min, 1 series (60 rows)          2000 ops     197 ops/s  p50 4.81 ms  p99 8.20 ms
 find 1 h, 1 series (3600 rows)           500 ops      48 ops/s  p50 20.2 ms  p99 30.5 ms
 count 1 h, 1 series                      500 ops      36 ops/s  p50 27.2 ms  p99 43.7 ms
-aggregate $group 1 h, 1 series           200 ops      24 ops/s  p50 41.0 ms  p99 57.3 ms
+aggregate $group 1 h, 1 series           200 ops      20 ops/s  p50 48.9 ms  p99 61.5 ms
+aggregate streamed $match/$project       200 ops      23 ops/s  p50 43.6 ms  p99 64.5 ms
 delete by _id (bitmap)                    50 ops      66 ops/s  p50 15.1 ms  p99 17.2 ms
 find match-all (99950 rows)               40 ops     2.4 ops/s  p50 411 ms   p99 565 ms
 retention before +1 h                      1 pass   541 ms, 20 dropped + 10 tombstoned

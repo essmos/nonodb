@@ -470,7 +470,8 @@ nonodb-cli verify-backup ./backup
 
 ## compact
 
-LMDB never shrinks `data.mdb`; TTL expiry, time-series retention, bitmap-deleted
+The daemon compacts time-series databases online once they are idle; `compact`
+is the offline/manual path. LMDB never shrinks `data.mdb`; TTL expiry, time-series retention, bitmap-deleted
 deletes, and dropped collections only free pages for reuse. Compact a stopped
 database in place:
 
