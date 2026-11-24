@@ -16,7 +16,7 @@ filesystem, page cache, and client overhead all affect the result.
 | 1B dense | 16 vCPU Xeon D-2141I, 31 GiB RAM | ZFS mirror, 438 GB | `v0.27.0`, 2026-11-20 |
 | 100M ANN sidecar | 16 vCPU Xeon D-2141I, 31 GiB RAM | ZFS, 438 GB | `v0.28.0`, 2026-11-22 |
 | 500k engine comparison | 16 vCPU Xeon D-2141I, 31 GiB RAM | ZFS, 438 GB | `v0.28.0`, 2026-11-22 |
-| Graph vs Neo4j Community | 8 vCPU Haswell, 22 GiB RAM | ext4 (`/var/tmp`) | `v0.31.0`, 2026-11-23 |
+| Graph vs Neo4j Community | 8 vCPU Haswell, 22 GiB RAM | ext4 (`/var/tmp`) | `v0.32.0`, 2026-11-24 |
 
 Do not compare rows from different hosts as if they came from one controlled
 run. The 100M dense comparator in the 1B table comes from an older ext4 host.
@@ -409,10 +409,10 @@ after warmup, with p50/p95 over 100 samples.
 
 | Metric | NonoDB | Neo4j 5 Community | NonoDB advantage |
 |---|---:|---:|---:|
-| Ingest nodes + edges | **145 ms** (~55k edges/s) | 2,256 ms (~3.5k edges/s) | ~15.6× |
-| Traverse depth 1, p50 / p95 | **0.74 / 1.45 ms** | 8.41 / 13.36 ms | ~11.3× p50 |
-| Traverse depth 3, p50 / p95 | **1.31 / 2.47 ms** | 7.34 / 11.18 ms | ~5.6× p50 |
-| Shortest path by hops, p50 / p95 | **0.72 / 1.24 ms** | 6.40 / 11.60 ms | ~8.9× p50 |
+| Ingest nodes + edges | **166 ms** (~48k edges/s) | 2,323 ms (~3.4k edges/s) | ~14.0× |
+| Traverse depth 1, p50 / p95 | **0.75 / 1.36 ms** | 8.64 / 13.21 ms | ~11.6× p50 |
+| Traverse depth 3, p50 / p95 | **1.32 / 2.34 ms** | 8.21 / 11.96 ms | ~6.2× p50 |
+| Shortest path by hops, p50 / p95 | **0.80 / 1.52 ms** | 6.15 / 12.72 ms | ~7.6× p50 |
 
 Caveats:
 
