@@ -60,6 +60,7 @@ const KEY_OPEN: u8 = 0x00;
 const KEY_BUCKET: u8 = 0x01;
 const KEY_ROW: u8 = 0x02;
 const KEY_TOMB: u8 = 0x03;
+const KEY_USER: u8 = 0x05;
 const FLAG_SEALED: u8 = 0x01;
 
 /// Default bucket width per granularity, in milliseconds.
@@ -1687,6 +1688,40 @@ fn row_base(hash: u64, salt: u32, window_start: i64, serial: u16) -> Vec<u8> {
     key
 }
 
+fn user_key(id: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(1 + id.len());
+    key.push(KEY_USER);
+    key.extend_from_slice(id.as_bytes());
+    key
+}
+
+fn user_locator(hash: u64, salt: u32, window: i64, serial: u16, seq: u32) -> Vec<u8> {
+    let mut value = bucket_key(hash, salt, window, serial);
+    value.extend_from_slice(&seq.to_be_bytes());
+    value
+}
+
+#[allow(clippy::too_many_arguments)]
+fn remember_user_id(
+    db: &Database<Bytes, Bytes>,
+    wtxn: &mut RwTxn<'_>,
+    id: &str,
+    hash: u64,
+    salt: u32,
+    window: i64,
+    serial: u16,
+    seq: u32,
+) -> Result<()> {
+    if parse_row_id(id).is_none() {
+        db.put(
+            &mut *wtxn,
+            &user_key(id),
+            &user_locator(hash, salt, window, serial, seq),
+        )?;
+    }
+    Ok(())
+}
+
 fn row_key(hash: u64, salt: u32, window_start: i64, serial: u16, seq: u32) -> Vec<u8> {
     let mut key = row_base(hash, salt, window_start, serial);
     key.extend_from_slice(&seq.to_be_bytes());
@@ -2050,6 +2085,7 @@ pub fn insert(
         Some(other) => crate::id::key_from_value(other).ok_or(Error::InvalidId)?,
         None => row_id(hash, salt, window, serial, count),
     };
+    remember_user_id(&db, wtxn, &id, hash, salt, window, serial, count)?;
     Ok(id)
 }
 
@@ -2159,6 +2195,16 @@ pub fn insert_many(
             Some(other) => crate::id::key_from_value(other).ok_or(Error::InvalidId)?,
             None => row_id(hash, state.salt, window, serial, state.count),
         };
+        remember_user_id(
+            &db,
+            wtxn,
+            &id,
+            hash,
+            state.salt,
+            window,
+            serial,
+            state.count,
+        )?;
         state.count = state.count.saturating_add(1);
         ids.push(id);
     }
@@ -2927,10 +2973,19 @@ fn delete_inner(
     let mut deleted = 0usize;
 
     let mut buckets: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-    for item in db.iter(&*wtxn)? {
-        let (key, payload) = item?;
-        if key.first() == Some(&KEY_BUCKET) {
-            buckets.push((key.to_vec(), payload.to_vec()));
+    if let Some(filter) = &write_filter {
+        for (hash, salt, window, serial) in filter.by_bucket.keys() {
+            let key = bucket_key(*hash, *salt, *window, *serial);
+            if let Some(payload) = db.get(&*wtxn, &key)? {
+                buckets.push((key, payload.to_vec()));
+            }
+        }
+    } else {
+        for item in db.iter(&*wtxn)? {
+            let (key, payload) = item?;
+            if key.first() == Some(&KEY_BUCKET) {
+                buckets.push((key.to_vec(), payload.to_vec()));
+            }
         }
     }
     for (key, payload) in buckets {
@@ -3011,10 +3066,21 @@ fn delete_inner(
 
     if multi || deleted == 0 {
         let mut rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-        for item in db.iter(&*wtxn)? {
-            let (key, payload) = item?;
-            if key.first() == Some(&KEY_ROW) {
-                rows.push((key.to_vec(), payload.to_vec()));
+        if let Some(filter) = &write_filter {
+            for ((hash, salt, window, serial), seqs) in &filter.by_bucket {
+                for seq in seqs {
+                    let key = row_key(*hash, *salt, *window, *serial, *seq);
+                    if let Some(payload) = db.get(&*wtxn, &key)? {
+                        rows.push((key, payload.to_vec()));
+                    }
+                }
+            }
+        } else {
+            for item in db.iter(&*wtxn)? {
+                let (key, payload) = item?;
+                if key.first() == Some(&KEY_ROW) {
+                    rows.push((key.to_vec(), payload.to_vec()));
+                }
             }
         }
         for (key, payload) in rows {
@@ -3187,6 +3253,11 @@ pub fn verify_in(
                     rows += 1;
                 }
                 bytes += payload.len() as u64;
+            }
+            Some(&KEY_USER) => {
+                if key.len() <= 1 {
+                    return Err(corrupt("malformed user-id key"));
+                }
             }
             Some(&KEY_TOMB) => {
                 if key.len() != 27 {
@@ -3498,17 +3569,24 @@ fn update_inner(
         .and_then(parse_row_id);
 
     let mut buckets: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-    for item in db.iter(&*wtxn)? {
-        let (key, payload) = item?;
-        if key.first() == Some(&KEY_BUCKET) {
-            if let Some((hash, salt, window, serial, _)) = direct {
-                if key_parts(key).map(|parts| (parts.0, parts.1, parts.2, parts.3))
-                    != Some((hash, salt, window, serial))
-                {
-                    continue;
-                }
+    if let Some((hash, salt, window, serial, _)) = direct {
+        let key = bucket_key(hash, salt, window, serial);
+        if let Some(payload) = db.get(&*wtxn, &key)? {
+            buckets.push((key, payload.to_vec()));
+        }
+    } else if let Some(filter) = &write_filter {
+        for (hash, salt, window, serial) in filter.by_bucket.keys() {
+            let key = bucket_key(*hash, *salt, *window, *serial);
+            if let Some(payload) = db.get(&*wtxn, &key)? {
+                buckets.push((key, payload.to_vec()));
             }
-            buckets.push((key.to_vec(), payload.to_vec()));
+        }
+    } else {
+        for item in db.iter(&*wtxn)? {
+            let (key, payload) = item?;
+            if key.first() == Some(&KEY_BUCKET) {
+                buckets.push((key.to_vec(), payload.to_vec()));
+            }
         }
     }
     for (key, payload) in buckets {
@@ -3614,10 +3692,26 @@ fn update_inner(
 
     if multi || report.matched == 0 {
         let mut rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-        for item in db.iter(&*wtxn)? {
-            let (key, payload) = item?;
-            if key.first() == Some(&KEY_ROW) {
-                rows.push((key.to_vec(), payload.to_vec()));
+        if let Some(filter) = &write_filter {
+            for ((hash, salt, window, serial), seqs) in &filter.by_bucket {
+                for seq in seqs {
+                    let key = row_key(*hash, *salt, *window, *serial, *seq);
+                    if let Some(payload) = db.get(&*wtxn, &key)? {
+                        rows.push((key, payload.to_vec()));
+                    }
+                }
+            }
+        } else if let Some((hash, salt, window, serial, seq)) = direct {
+            let key = row_key(hash, salt, window, serial, seq);
+            if let Some(payload) = db.get(&*wtxn, &key)? {
+                rows.push((key, payload.to_vec()));
+            }
+        } else {
+            for item in db.iter(&*wtxn)? {
+                let (key, payload) = item?;
+                if key.first() == Some(&KEY_ROW) {
+                    rows.push((key.to_vec(), payload.to_vec()));
+                }
             }
         }
         for (key, payload) in rows {
@@ -4028,7 +4122,30 @@ pub fn find_by_id(
             }
         }
     }
-    // User-supplied `_id` (or a stale synthetic id): filtered scan.
+    if let Some(value) = db.get(rtxn, &user_key(id))? {
+        if value.len() == 27 {
+            let seq = u32::from_be_bytes(value[23..27].try_into().expect("4 bytes"));
+            let bucket = &value[..23];
+            if let Some((hash, salt, window, serial)) = key_parts(bucket) {
+                if let Some(row) = db.get(rtxn, &row_key(hash, salt, window, serial, seq))? {
+                    let row: Map<String, Value> = serde_json::from_slice(row)?;
+                    let doc = Value::Object(row);
+                    if !expired(settings, &doc, now) {
+                        return Ok(Some(doc));
+                    }
+                } else if let Some(payload) = db.get(rtxn, bucket)? {
+                    if let Some(row) = decode_bucket_row(payload, settings, seq as usize)? {
+                        let doc = Value::Object(row);
+                        if !expired(settings, &doc, now) {
+                            return Ok(Some(doc));
+                        }
+                    }
+                }
+                return Ok(None);
+            }
+        }
+    }
+    // User-supplied `_id` written before the id map existed: filtered scan.
     let query = FindQuery {
         filter: Value::Object(Map::new()),
         projection: None,
@@ -5248,6 +5365,54 @@ mod tests {
     }
 
     #[test]
+    fn user_supplied_ids_use_the_point_id_map() {
+        let (_dir, store) = ts_store();
+        let settings = Settings {
+            time_field: "ts".into(),
+            bucket_max_docs: 64,
+            ..Settings::default()
+        };
+        let c = store
+            .create_timeseries_collection("metrics", &settings)
+            .unwrap();
+        c.insert_one(json!({"_id": "user-1", "ts": 1_000, "v": 1}))
+            .unwrap();
+        for idx in 0..2_000i64 {
+            c.insert_one(json!({"ts": 2_000 + idx * 1000, "v": idx}))
+                .unwrap();
+        }
+        let mut wtxn = store.write_txn().unwrap();
+        seal_all(&mut wtxn, store.env(), "metrics", &settings).unwrap();
+        let db = store
+            .env()
+            .create_database::<heed::types::Bytes, heed::types::Bytes>(
+                &mut wtxn,
+                Some("tsb:metrics"),
+            )
+            .unwrap();
+        let locator = db
+            .get(&wtxn, &user_key("user-1"))
+            .unwrap()
+            .unwrap()
+            .to_vec();
+        let wanted = &locator[..23];
+        let keys: Vec<Vec<u8>> = db
+            .iter(&wtxn)
+            .unwrap()
+            .map(|item| item.unwrap().0.to_vec())
+            .filter(|key| key.first() == Some(&KEY_BUCKET) && key.as_slice() != wanted)
+            .collect();
+        assert!(!keys.is_empty());
+        for key in keys {
+            db.put(&mut wtxn, &key, b"corrupt").unwrap();
+        }
+        wtxn.commit().unwrap();
+        // Only the mapped bucket is decoded; corrupt siblings are never read.
+        let doc = c.find_by_key("user-1").unwrap().unwrap();
+        assert_eq!(doc["v"], json!(1));
+    }
+
+    #[test]
     fn retention_removes_index_entries_for_reaped_rows() {
         let (_dir, store) = ts_store();
         let settings = Settings {
@@ -5365,6 +5530,15 @@ mod tests {
         assert_eq!(grouped.len(), 2);
         assert_eq!(grouped[0]["n"], json!(2_500));
         assert_eq!(grouped[1]["n"], json!(2_500));
+        let averaged = c
+            .aggregate(&[
+                json!({"$match": {"grp": "a"}}),
+                json!({"$group": {"_id": null, "avg": {"$avg": "$v"}}}),
+                json!({"$limit": 1}),
+            ])
+            .unwrap();
+        assert_eq!(averaged.len(), 1);
+        assert_eq!(averaged[0]["avg"], json!(2_499));
         let limited = c
             .aggregate(&[
                 json!({"$match": {"grp": "b"}}),

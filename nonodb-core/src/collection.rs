@@ -6857,6 +6857,61 @@ impl<'e> Collection<'e> {
                     return Ok(out);
                 }
             }
+            if let Some(group_at) = pipeline
+                .iter()
+                .position(|stage| stage.get("$group").is_some())
+            {
+                let prefix = &pipeline[..group_at];
+                let tail = &pipeline[group_at + 1..];
+                let streamable_prefix = prefix.iter().all(|stage| {
+                    Self::timeseries_aggregate_streamable(std::slice::from_ref(stage))
+                });
+                if streamable_prefix {
+                    if let Some(spec) = pipeline[group_at].get("$group") {
+                        if let Ok(builder) = aggregate::GroupBuilder::new(spec) {
+                            if builder.order_independent() {
+                                let mut builder = builder;
+                                let batch_size = std::env::var("NONODB_TS_AGG_BATCH")
+                                    .ok()
+                                    .and_then(|value| value.parse::<usize>().ok())
+                                    .unwrap_or(4096);
+                                let host = LookupHost { coll: self, rtxn };
+                                crate::timeseries::scan_batches(
+                                    rtxn,
+                                    self.env,
+                                    &self.name,
+                                    &settings,
+                                    &query.filter,
+                                    batch_size,
+                                    |batch| {
+                                        let docs = if prefix.is_empty() {
+                                            batch
+                                        } else {
+                                            aggregate::run_with_host(
+                                                batch,
+                                                prefix,
+                                                aggregate::max_docs(),
+                                                Some(&host),
+                                            )?
+                                        };
+                                        for doc in docs {
+                                            builder.update(doc)?;
+                                        }
+                                        Ok(true)
+                                    },
+                                )?;
+                                let groups = builder.finish()?;
+                                return aggregate::run_with_host(
+                                    groups,
+                                    tail,
+                                    aggregate::max_docs(),
+                                    Some(&host),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
             if Self::timeseries_aggregate_streamable(pipeline) {
                 let batch_size = std::env::var("NONODB_TS_AGG_BATCH")
                     .ok()

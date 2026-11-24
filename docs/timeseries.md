@@ -166,8 +166,11 @@ decoding.
 Aggregation pipelines run over the decoded documents, so `$group`, `$bucket`,
 `$sort`, `$project`, `$count`, and the rest of the stage set work on time-series
 collections. A leading `$match` is reused for bucket and series pruning.
-Row-local stages are fed in batches by `scan_batches`; stages that need the
-whole input (`$group`, `$sort`, `$limit`) use the materialized path:
+Row-local stages are fed in batches by `scan_batches`. Order-independent
+`$group` accumulators (`$sum`, `$avg`, `$min`, `$max`, `$count`) stream into one
+group builder, so downsampling does not materialize the range; `$sort`/`$limit`
+then operate on the much smaller group result. Other blocking stages use the
+materialized path:
 
 ```json
 {
@@ -189,8 +192,8 @@ time expression computed with `$dateToString`/`$subtract` in `$project`).
 Stages that need a second collection or an index host run through the normal
 aggregation host: `$lookup` (local and pipeline/`let`), `$graphLookup`,
 `$unionWith`, `$search`, `$searchMeta`, and `$vectorSearch` work on time-series
-inputs. `$out` and `$merge` remain unsupported because they would bypass the
-bucket writer.
+inputs. `$out` and `$merge` write through the bucket writer, so indexes,
+events, and replication stay consistent.
 
 ## Supported operations
 
@@ -291,8 +294,8 @@ Aggregation on a time-series collection runs with the same host as document
 collections, so `$lookup` (both `localField`/`foreignField` and
 `pipeline`/`let` forms), `$graphLookup`, and `$unionWith` work. The foreign
 collection can be a document collection or another time-series collection;
-`find` on it uses its own bucket pruning and indexes. `$out`/`$merge` remain
-unsupported because they would need to re-encode rows into buckets.
+`find` on it uses its own bucket pruning and indexes. `$out`/`$merge` targets
+write through the bucket writer, including indexes and events.
 
 ### SQL
 
@@ -568,11 +571,11 @@ documents. Inserts are ~2x slower than the raw document path: each insert is two
 LMDB puts (row + open-bucket pointer) instead of one, and series resolution
 reads the pointer.
 
-The weak spot is point lookup by `_id`: sealed buckets decode their columns
-sequentially, so a synthetic id costs ~2.2 ms instead of the microsecond a
-document store needs. Range scans, counts, and downsampling are the intended
-access pattern; if you need millions of single-row lookups, keep a small
-document or index mapping outside the collection, or query by time range.
+Point lookup by `_id` decodes one 256-row column block (about 0.35 ms in the
+100k-row benchmark), not the whole bucket. User-supplied ids use a small
+`0x05` id-to-locator map, so they also skip the collection scan. Range scans,
+counts, and downsampling remain the intended access pattern, but single-row
+lookups are now practical.
 
 An unsorted indexed query stops after `skip + limit` rows, so a broad status
 query with `limit: 100` costs ~31 ms instead of decoding every candidate.
