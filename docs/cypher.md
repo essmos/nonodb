@@ -93,12 +93,14 @@ RETURN nodeId, score ORDER BY score DESC
 - exactly one read-only statement per request;
 - write clauses are rejected before planning;
 - `max_rows` (default 1000, max 100000), `max_operations` (default 1,000,000),
-  and `timeout_ms` bound execution; the operation budget is checked per row and
-  per expansion, so cancellation returns a structured error;
+  `max_memory_bytes` (default 64 MiB), and `timeout_ms` bound execution; the
+  operation/result budget is checked during execution, so cancellation returns a
+  structured error;
 - `max_depth` bounds variable-length expansion (hard maximum 64);
 - literal/pattern nesting is capped at 16 levels to prevent parser stack
   exhaustion;
-- the GDS procedures process at most 1,000 nodes and emit at most `max_rows`;
+- the GDS procedures process at most 1,000 nodes, emit at most `max_rows`, and
+  receive the same timeout budget as the query;
 - unsupported syntax fails explicitly with `invalid_query`, never a silent
   wrong result;
 - vault collections are rejected, and graph reads require scope on the node
@@ -109,19 +111,19 @@ RETURN nodeId, score ORDER BY score DESC
 The harness pins the openCypher TCK at commit
 `677cbafabb8c3c5eed458fd3b1ec0daec8d67d23`.
 
-Baseline selection is intentionally narrow and documented in
-`scripts/cypher_tck.py`:
+Selection is deliberately broad and reproducible: every result-table scenario
+with a read-only query, including graph fixtures (`having executed`), named
+graphs (`the binary-tree-1 graph`), parameters, `MATCH`/`OPTIONAL MATCH`, and
+pattern/path queries. Expected-error scenarios, `Scenario Outline` expansion,
+write queries, custom `test.*` procedures, and unsupported fixture syntax are
+excluded; each excluded scenario and its reason are listed in the committed
+[`tck-report.json`](tck-report.json), not silently skipped.
 
-- scenarios starting with `Given any graph`;
-- no setup writes (`having executed`);
-- no parameters;
-- no query that writes or calls an arbitrary procedure;
-- result-table scenarios only (no expected-error/outline scenarios).
-
-Current baseline: **270 / 293 pass (92.15%)**, **0 wrong-result failures**, and
-23 explicit unsupported cases (parser edge cases, mixed-type min/max, extreme
-temporal ranges, and deeply nested literals). See `docs/tck-baseline.json` and
-run the harness for the full per-scenario report.
+Current baseline: **789 / 874 pass (90.27%)**, with **28 known-gap mismatches**
+and **57 explicit unsupported cases**. The known gaps are real semantic
+differences (for example optional-match joins and rare variable-length pattern
+shapes); they are reported per scenario in `tck-report.json`. Unsupported syntax
+returns `invalid_query`, never a silent success.
 
 ```bash
 scripts/fetch-opencypher-tck.sh /tmp/opencypher-tck
@@ -132,5 +134,4 @@ python3 scripts/cypher_tck.py \
   --output tck-report.json
 ```
 
-The full 90% gate for the broader read-only corpus is an ongoing goal; the
-baseline above is not a claim of full TCK conformance.
+The harness runs in CI and fails below 90%.

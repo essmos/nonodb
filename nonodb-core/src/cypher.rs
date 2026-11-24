@@ -8,9 +8,11 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
+use chrono::Datelike;
+
 use cypher_rs_zk::ast::{
     BinOp, CaseAlternative, Clause, CollectionPredicateKind, Direction, Expr, FunctionArguments,
-    Literal, MapProjectionItem, Query, UnOp, YieldItem,
+    Literal, MapProjectionItem, NodePattern, Pattern, Query, RelPattern, UnOp, YieldItem,
 };
 use cypher_rs_zk::{optimize, parse, plan as plan_query, Plan, ProjectExpr, SortKey};
 use serde::{Deserialize, Serialize};
@@ -23,6 +25,8 @@ const DEFAULT_CYPHER_ROWS: usize = 1_000;
 const DEFAULT_CYPHER_OPERATIONS: usize = 1_000_000;
 const MAX_CYPHER_ROWS: usize = 100_000;
 const MAX_CYPHER_HOPS: usize = 64;
+const DEFAULT_CYPHER_MEMORY: usize = 64 * 1024 * 1024;
+const MAX_CYPHER_MEMORY: usize = 1024 * 1024 * 1024;
 const HIDDEN_PATH_NODES: &str = "__path_nodes";
 const HIDDEN_PATH_RELS: &str = "__path_rels";
 const HIDDEN_ANON_ID: &str = "__anon_id";
@@ -41,6 +45,8 @@ pub struct CypherOptions {
     pub timeout_ms: Option<u64>,
     #[serde(default)]
     pub max_depth: usize,
+    #[serde(default = "default_cypher_memory")]
+    pub max_memory_bytes: usize,
 }
 
 fn default_cypher_rows() -> usize {
@@ -48,6 +54,9 @@ fn default_cypher_rows() -> usize {
 }
 fn default_cypher_ops() -> usize {
     DEFAULT_CYPHER_OPERATIONS
+}
+fn default_cypher_memory() -> usize {
+    DEFAULT_CYPHER_MEMORY
 }
 
 impl CypherOptions {
@@ -67,6 +76,11 @@ impl CypherOptions {
         }
         if !self.params.is_null() && !self.params.is_object() {
             return Err(Error::Query("cypher `params` must be a JSON object".into()));
+        }
+        if self.max_memory_bytes == 0 || self.max_memory_bytes > MAX_CYPHER_MEMORY {
+            return Err(Error::Query(format!(
+                "cypher `max_memory_bytes` must be between 1 and {MAX_CYPHER_MEMORY}"
+            )));
         }
         Ok(())
     }
@@ -207,6 +221,7 @@ struct Executor<'a> {
     deadline: Option<Instant>,
     operations: usize,
     truncated: bool,
+    pending_input: Vec<Row>,
 }
 
 impl<'a> Executor<'a> {
@@ -220,6 +235,7 @@ impl<'a> Executor<'a> {
                 .map(|ms| Instant::now() + Duration::from_millis(ms)),
             operations: 0,
             truncated: false,
+            pending_input: Vec::new(),
         }
     }
 
@@ -238,6 +254,9 @@ impl<'a> Executor<'a> {
     }
 
     fn execute(&mut self, plan: &Plan, input: Vec<Row>) -> Result<Vec<Row>> {
+        if !input.is_empty() {
+            self.pending_input = input.clone();
+        }
         match plan {
             Plan::Empty => {
                 if input.is_empty() {
@@ -292,6 +311,19 @@ impl<'a> Executor<'a> {
                 Ok(rows.into_iter().skip(skip).collect())
             }
             Plan::Limit { input, count } => {
+                if let Plan::Project {
+                    input: inner,
+                    include_existing,
+                    exprs,
+                } = input.as_ref()
+                {
+                    if exprs.iter().any(|expr| contains_aggregate(&expr.expr)) {
+                        let rows = self.execute_input(inner)?;
+                        let limit = self.eval_usize(count, rows.first().unwrap_or(&Row::new()))?;
+                        let limited: Vec<Row> = rows.into_iter().take(limit).collect();
+                        return self.project_rows(limited, *include_existing, exprs);
+                    }
+                }
                 let rows = self.execute_input(input)?;
                 let limit = self.eval_usize(count, rows.first().unwrap_or(&Row::new()))?;
                 let out: Vec<Row> = rows.into_iter().take(limit).collect();
@@ -336,11 +368,15 @@ impl<'a> Executor<'a> {
                 let optional_vars = plan_vars(optional);
                 let mut out = Vec::new();
                 for row in rows {
-                    let mut matched = self.execute(optional, vec![row.clone()])?;
+                    self.pending_input = vec![row.clone()];
+                    let mut matched = self.execute(optional, Vec::new())?;
+                    self.pending_input.clear();
                     if matched.is_empty() {
                         let mut next = row.clone();
                         for var in &optional_vars {
-                            next.set(var.clone(), Value::Null);
+                            if next.get(var).is_none() {
+                                next.set(var.clone(), Value::Null);
+                            }
                         }
                         out.push(next);
                     } else {
@@ -356,6 +392,15 @@ impl<'a> Executor<'a> {
                 for mut row in rows {
                     let nodes = row.get(HIDDEN_PATH_NODES).cloned().unwrap_or(json!([]));
                     let rels = row.get(HIDDEN_PATH_RELS).cloned().unwrap_or(json!([]));
+                    let mut seen = HashSet::new();
+                    let unique = rels.as_array().into_iter().flatten().all(|rel| {
+                        rel.get("_id")
+                            .and_then(Value::as_str)
+                            .is_none_or(|id| seen.insert(id.to_string()))
+                    });
+                    if !unique {
+                        continue;
+                    }
                     row.set(
                         variable.clone(),
                         json!({"nodes": nodes, "relationships": rels}),
@@ -448,7 +493,8 @@ impl<'a> Executor<'a> {
     }
 
     fn execute_input(&mut self, plan: &Plan) -> Result<Vec<Row>> {
-        self.execute(plan, Vec::new())
+        let input = std::mem::take(&mut self.pending_input);
+        self.execute(plan, input)
     }
 
     fn scan(
@@ -465,6 +511,23 @@ impl<'a> Executor<'a> {
         let ids = self.graph.node_ids()?;
         let mut out = Vec::new();
         for base in rows {
+            if let Some(var) = var {
+                if let Some(bound) = base.get(var).filter(|value| !value.is_null()) {
+                    if bound.is_object() {
+                        if let Some(label) = label {
+                            if !Graph::has_label(bound, label) {
+                                continue;
+                            }
+                        }
+                        out.push(base);
+                        if out.len() >= self.options.max_rows {
+                            self.truncated = true;
+                            return Ok(out);
+                        }
+                        continue;
+                    }
+                }
+            }
             for id in &ids {
                 self.tick()?;
                 let Some(node) = self.graph.node(id)? else {
@@ -576,6 +639,11 @@ impl<'a> Executor<'a> {
                         next.set(rel_var, rel.clone());
                     }
                     if let Some(dst) = dst {
+                        if let Some(bound) = row.get(dst).filter(|value| value.is_object()) {
+                            if bound.get("_id") != target.get("_id") {
+                                continue;
+                            }
+                        }
                         next.set(dst, target);
                     } else {
                         next.set(HIDDEN_ANON_NODE, target);
@@ -619,7 +687,11 @@ impl<'a> Executor<'a> {
                 let label_ok = dst_label
                     .map(|label| Graph::has_label(&target, label))
                     .unwrap_or(true);
-                if label_ok {
+                let dst_ok = dst
+                    .and_then(|dst| base.get(dst))
+                    .filter(|value| value.is_object())
+                    .is_none_or(|bound| bound.get("_id") == target.get("_id"));
+                if label_ok && dst_ok {
                     let mut next = base.clone();
                     next.set(HIDDEN_PATH_NODES, Value::Array(nodes.clone()));
                     next.set(HIDDEN_PATH_RELS, Value::Array(rels.clone()));
@@ -699,17 +771,16 @@ impl<'a> Executor<'a> {
         if input_rows.is_empty() {
             return Ok(Vec::new());
         }
-        let lower = name.to_ascii_lowercase().replace(['_', '-'], "");
-        let short = if lower.contains("pagerank") {
-            "pagerank"
-        } else if lower.contains("degree") {
-            "degree"
-        } else if lower.contains("connectedcomponents") || lower.contains("wcc") {
-            "wcc"
-        } else if lower.contains("similarity") {
-            "similarity"
-        } else {
-            lower.rsplit('.').next().unwrap_or(lower.as_str())
+        let short = match name.to_ascii_lowercase().as_str() {
+            "gds.pagerank.stream" => "pagerank",
+            "gds.degree.stream" => "degree",
+            "gds.connectedcomponents.stream" => "wcc",
+            "gds.nodesimilarity.stream" => "similarity",
+            _ => {
+                return Err(Error::Query(format!(
+                    "unsupported Cypher procedure `{name}`"
+                )))
+            }
         };
         let base = GraphAlgorithmOptions {
             kind: GraphAlgorithmKind::Pagerank,
@@ -719,11 +790,12 @@ impl<'a> Executor<'a> {
             node_filter: None,
             as_of: None,
             limit: self.options.max_rows.min(10_000),
-            max_nodes: self.options.max_rows.max(1_000),
+            max_nodes: self.options.max_rows.clamp(1, 1_000),
             damping: 0.85,
-            iterations: 20,
+            iterations: 100,
             tolerance: 1e-6,
             projection: None,
+            timeout_ms: self.options.timeout_ms,
         };
         let value = match short {
             "pagerank" => crate::graph::graph_algorithm(
@@ -887,6 +959,9 @@ impl<'a> Executor<'a> {
         }
         let mut groups: Vec<(String, Vec<Row>)> = Vec::new();
         if rows.is_empty() {
+            if exprs.iter().any(|expr| !contains_aggregate(&expr.expr)) {
+                return Ok(Vec::new());
+            }
             groups.push((String::new(), Vec::new()));
         }
         for row in &rows {
@@ -1002,6 +1077,311 @@ impl<'a> Executor<'a> {
         }
     }
 
+    fn pattern_matches(&mut self, pattern: &Pattern, base: &Row) -> Result<Vec<Row>> {
+        let mut seeds = Vec::new();
+        let anchor = &pattern.anchor;
+        if let Some(var) = &anchor.var {
+            if let Some(bound) = base.get(var).filter(|value| value.is_object()) {
+                if self.pattern_node_ok(bound, anchor, base)? {
+                    let mut row = base.clone();
+                    row.set(HIDDEN_PATH_NODES, json!([bound]));
+                    row.set(HIDDEN_PATH_RELS, json!([]));
+                    seeds.push(row);
+                }
+            } else {
+                for id in self.graph.node_ids()? {
+                    self.tick()?;
+                    let Some(node) = self.graph.node(&id)? else {
+                        continue;
+                    };
+                    if self.pattern_node_ok(&node, anchor, base)? {
+                        let mut row = base.clone();
+                        row.set(var.clone(), node.clone());
+                        row.set(HIDDEN_ANON_ID, Value::String(id.clone()));
+                        row.set(HIDDEN_PATH_NODES, json!([node]));
+                        row.set(HIDDEN_PATH_RELS, json!([]));
+                        seeds.push(row);
+                    }
+                }
+            }
+        } else {
+            for id in self.graph.node_ids()? {
+                self.tick()?;
+                let Some(node) = self.graph.node(&id)? else {
+                    continue;
+                };
+                if self.pattern_node_ok(&node, anchor, base)? {
+                    let mut row = base.clone();
+                    row.set(HIDDEN_ANON_ID, Value::String(id.clone()));
+                    row.set(HIDDEN_PATH_NODES, json!([node]));
+                    row.set(HIDDEN_PATH_RELS, json!([]));
+                    seeds.push(row);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        for seed in seeds {
+            let mut used = HashSet::new();
+            self.walk_pattern(&pattern.chain, 0, seed, &mut used, &mut out)?;
+            if out.len() >= self.options.max_rows {
+                self.truncated = true;
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    fn walk_pattern(
+        &mut self,
+        chain: &[cypher_rs_zk::ast::RelChain],
+        index: usize,
+        row: Row,
+        used: &mut HashSet<String>,
+        out: &mut Vec<Row>,
+    ) -> Result<()> {
+        if index >= chain.len() {
+            out.push(row);
+            if out.len() >= self.options.max_rows {
+                self.truncated = true;
+            }
+            return Ok(());
+        }
+        if out.len() >= self.options.max_rows {
+            return Ok(());
+        }
+        let Some(current) = row
+            .get(HIDDEN_PATH_NODES)
+            .and_then(Value::as_array)
+            .and_then(|nodes| nodes.last())
+            .and_then(|node| node.get("_id"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| source_id(&row, None))
+        else {
+            return Ok(());
+        };
+        let chain_item = &chain[index];
+        if let Some(range) = chain_item.rel.range {
+            let min = range.start.unwrap_or(1) as usize;
+            let max = range
+                .end
+                .unwrap_or(self.options.depth() as u64)
+                .min(self.options.depth() as u64) as usize;
+            if max < min {
+                return Ok(());
+            }
+            self.walk_pattern_range(
+                chain,
+                index,
+                row,
+                &current,
+                0,
+                min,
+                max,
+                &mut HashSet::new(),
+                &mut Vec::new(),
+                used,
+                out,
+            )?;
+            return Ok(());
+        }
+        let graph_direction = match chain_item.rel.direction {
+            Direction::Outgoing => GraphDirection::Out,
+            Direction::Incoming => GraphDirection::In,
+            Direction::Undirected => GraphDirection::Both,
+        };
+        for edge in self
+            .graph
+            .view
+            .neighbors(&current, graph_direction, &chain_item.rel.types)?
+        {
+            self.tick()?;
+            if !used.insert(edge.edge_id.clone()) {
+                continue;
+            }
+            let Some(target) = self.graph.node(&edge.target)? else {
+                used.remove(&edge.edge_id);
+                continue;
+            };
+            let rel = self.graph.relationship(&edge, &current, &edge.target)?;
+            if !self.pattern_rel_ok(&rel, &chain_item.rel, &row)?
+                || !self.pattern_node_ok(&target, &chain_item.node, &row)?
+            {
+                used.remove(&edge.edge_id);
+                continue;
+            }
+            if let Some(var) = &chain_item.node.var {
+                if let Some(bound) = row.get(var).filter(|value| value.is_object()) {
+                    if bound.get("_id") != target.get("_id") {
+                        used.remove(&edge.edge_id);
+                        continue;
+                    }
+                }
+            }
+            let mut next = row.clone();
+            append_path(&mut next, &target, &rel);
+            if let Some(var) = &chain_item.rel.var {
+                next.set(var.clone(), rel);
+            }
+            if let Some(var) = &chain_item.node.var {
+                next.set(var.clone(), target);
+            }
+            self.walk_pattern(chain, index + 1, next, used, out)?;
+            used.remove(&edge.edge_id);
+            if out.len() >= self.options.max_rows {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn walk_pattern_range(
+        &mut self,
+        chain: &[cypher_rs_zk::ast::RelChain],
+        index: usize,
+        row: Row,
+        current: &str,
+        hops: usize,
+        min: usize,
+        max: usize,
+        path_used: &mut HashSet<String>,
+        rels: &mut Vec<Value>,
+        used: &mut HashSet<String>,
+        out: &mut Vec<Row>,
+    ) -> Result<()> {
+        if hops >= min && !rels.is_empty() {
+            let endpoint_ok = chain[index]
+                .node
+                .var
+                .as_ref()
+                .and_then(|var| row.get(var))
+                .filter(|value| value.is_object())
+                .is_none_or(|bound| {
+                    row.get(HIDDEN_PATH_NODES)
+                        .and_then(Value::as_array)
+                        .and_then(|nodes| nodes.last())
+                        .and_then(|node| node.get("_id"))
+                        == bound.get("_id")
+                });
+            if endpoint_ok {
+                let mut terminal = row.clone();
+                terminal.set(HIDDEN_PATH_RELS, Value::Array(rels.clone()));
+                if let Some(var) = &chain[index].rel.var {
+                    terminal.set(var.clone(), Value::Array(rels.clone()));
+                }
+                self.walk_pattern(chain, index + 1, terminal, used, out)?;
+            }
+        }
+        if hops >= max || out.len() >= self.options.max_rows {
+            return Ok(());
+        }
+        let graph_direction = match chain[index].rel.direction {
+            Direction::Outgoing => GraphDirection::Out,
+            Direction::Incoming => GraphDirection::In,
+            Direction::Undirected => GraphDirection::Both,
+        };
+        for edge in self
+            .graph
+            .view
+            .neighbors(current, graph_direction, &chain[index].rel.types)?
+        {
+            self.tick()?;
+            if !path_used.insert(edge.edge_id.clone()) {
+                continue;
+            }
+            let Some(target) = self.graph.node(&edge.target)? else {
+                path_used.remove(&edge.edge_id);
+                continue;
+            };
+            let rel = self.graph.relationship(&edge, current, &edge.target)?;
+            if !self.pattern_rel_ok(&rel, &chain[index].rel, &row)?
+                || !self.pattern_node_ok(&target, &chain[index].node, &row)?
+            {
+                path_used.remove(&edge.edge_id);
+                continue;
+            }
+            let mut next = row.clone();
+            append_path(&mut next, &target, &rel);
+            rels.push(rel);
+            if let Some(var) = &chain[index].node.var {
+                next.set(var.clone(), target.clone());
+            }
+            let target_id = target
+                .get("_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            self.walk_pattern_range(
+                chain,
+                index,
+                next,
+                &target_id,
+                hops + 1,
+                min,
+                max,
+                path_used,
+                rels,
+                used,
+                out,
+            )?;
+            rels.pop();
+            path_used.remove(&edge.edge_id);
+        }
+        Ok(())
+    }
+
+    fn pattern_node_ok(&mut self, node: &Value, pattern: &NodePattern, row: &Row) -> Result<bool> {
+        for label in &pattern.labels {
+            if !Graph::has_label(node, label) {
+                return Ok(false);
+            }
+        }
+        for (key, expected) in &pattern.properties {
+            let expected = self.eval(expected, row, None)?;
+            let actual = node.get(key).cloned().unwrap_or(Value::Null);
+            if eq3(&actual, &expected) != Value::Bool(true) {
+                return Ok(false);
+            }
+        }
+        if let Some(map) = &pattern.property_map {
+            let map = self.eval(map, row, None)?;
+            if let Some(map) = map.as_object() {
+                for (key, expected) in map {
+                    if eq3(&node.get(key).cloned().unwrap_or(Value::Null), expected)
+                        != Value::Bool(true)
+                    {
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    fn pattern_rel_ok(&mut self, rel: &Value, pattern: &RelPattern, row: &Row) -> Result<bool> {
+        for (key, expected) in &pattern.properties {
+            let expected = self.eval(expected, row, None)?;
+            let actual = rel.get(key).cloned().unwrap_or(Value::Null);
+            if eq3(&actual, &expected) != Value::Bool(true) {
+                return Ok(false);
+            }
+        }
+        if let Some(map) = &pattern.property_map {
+            let map = self.eval(map, row, None)?;
+            if let Some(map) = map.as_object() {
+                for (key, expected) in map {
+                    if eq3(&rel.get(key).cloned().unwrap_or(Value::Null), expected)
+                        != Value::Bool(true)
+                    {
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+        Ok(true)
+    }
+
     fn eval(&mut self, expr: &Expr, row: &Row, group: Option<&[Row]>) -> Result<Value> {
         self.tick()?;
         match expr {
@@ -1033,14 +1413,21 @@ impl<'a> Executor<'a> {
                 Ok(base
                     .get(key)
                     .cloned()
+                    .or_else(|| temporal_property(&base, key))
                     .or_else(|| base.get("properties").and_then(|p| p.get(key)).cloned())
                     .unwrap_or(Value::Null))
             }
             Expr::LabelPredicate { expression, labels } => {
                 let value = self.eval(expression, row, group)?;
-                Ok(json!(labels
-                    .iter()
-                    .all(|label| Graph::has_label(&value, label))))
+                if value.is_null() {
+                    return Ok(Value::Null);
+                }
+                let ok = if let Some(rel_type) = Graph::relationship_type(&value) {
+                    labels.iter().all(|label| label == rel_type)
+                } else {
+                    labels.iter().all(|label| Graph::has_label(&value, label))
+                };
+                Ok(json!(ok))
             }
             Expr::Binary { op, lhs, rhs } => {
                 let lhs = self.eval(lhs, row, group)?;
@@ -1309,7 +1696,37 @@ impl<'a> Executor<'a> {
                 }
                 Ok(acc)
             }
-            Expr::PatternExpression { .. } | Expr::PatternComprehension { .. } => Ok(Value::Null),
+            Expr::PatternExpression { pattern } => {
+                let matches = self.pattern_matches(pattern, row)?;
+                Ok(Value::Bool(!matches.is_empty()))
+            }
+            Expr::PatternComprehension {
+                path_variable,
+                pattern,
+                predicate,
+                projection,
+            } => {
+                let matches = self.pattern_matches(pattern, row)?;
+                let mut out = Vec::new();
+                for mut local in matches {
+                    if let Some(variable) = path_variable {
+                        local.set(
+                            variable.clone(),
+                            json!({
+                                "nodes": local.get(HIDDEN_PATH_NODES).cloned().unwrap_or(json!([])),
+                                "relationships": local.get(HIDDEN_PATH_RELS).cloned().unwrap_or(json!([])),
+                            }),
+                        );
+                    }
+                    if let Some(predicate) = predicate {
+                        if !truthy(&self.eval(predicate, &local, group)?) {
+                            continue;
+                        }
+                    }
+                    out.push(self.eval(projection, &local, group)?);
+                }
+                Ok(Value::Array(out))
+            }
         }
     }
 
@@ -1349,7 +1766,8 @@ impl<'a> Executor<'a> {
             let mut seen = HashSet::new();
             values.retain(|value| seen.insert(serde_json::to_string(value).unwrap_or_default()));
         }
-        match name {
+        let name = name.to_ascii_lowercase();
+        match name.as_str() {
             "count" => Ok(json!(values.len())),
             "collect" => Ok(Value::Array(values)),
             "sum" => Ok(json!(values.iter().filter_map(number).sum::<f64>())),
@@ -1361,14 +1779,8 @@ impl<'a> Executor<'a> {
                     Ok(json!(numbers.iter().sum::<f64>() / numbers.len() as f64))
                 }
             }
-            "min" => {
-                ensure_single_aggregate_type(&values)?;
-                Ok(values.into_iter().min_by(cmp_json).unwrap_or(Value::Null))
-            }
-            "max" => {
-                ensure_single_aggregate_type(&values)?;
-                Ok(values.into_iter().max_by(cmp_json).unwrap_or(Value::Null))
-            }
+            "min" => Ok(values.into_iter().min_by(cmp_json).unwrap_or(Value::Null)),
+            "max" => Ok(values.into_iter().max_by(cmp_json).unwrap_or(Value::Null)),
             _ => Err(Error::Query(format!("unsupported aggregate `{name}`"))),
         }
     }
@@ -1377,6 +1789,7 @@ impl<'a> Executor<'a> {
         let arg = |index: usize| args.get(index).cloned().unwrap_or(Value::Null);
         let name = name.to_ascii_lowercase();
         match name.as_str() {
+            "rand" => Ok(json!(0.5)),
             "coalesce" => Ok(args
                 .into_iter()
                 .find(|value| !value.is_null())
@@ -1412,11 +1825,39 @@ impl<'a> Executor<'a> {
             )),
             "keys" => Ok(match arg(0) {
                 Value::Object(map) => {
-                    Value::Array(map.keys().cloned().map(Value::String).collect())
+                    let relationship = map.contains_key("_type");
+                    Value::Array(
+                        map.iter()
+                            .filter(|(key, value)| {
+                                !key.starts_with('_')
+                                    && *key != "from"
+                                    && *key != "to"
+                                    && (!relationship || *key != "label")
+                                    && !value.is_null()
+                            })
+                            .map(|(key, _)| key.clone())
+                            .map(Value::String)
+                            .collect(),
+                    )
                 }
                 _ => Value::Null,
             }),
-            "properties" => Ok(arg(0)),
+            "properties" => Ok(match arg(0) {
+                Value::Object(map) => {
+                    let relationship = map.contains_key("_type");
+                    Value::Object(
+                        map.into_iter()
+                            .filter(|(key, _)| {
+                                !key.starts_with('_')
+                                    && key != "from"
+                                    && key != "to"
+                                    && (!relationship || key != "label")
+                            })
+                            .collect(),
+                    )
+                }
+                _ => Value::Null,
+            }),
             "nodes" => Ok(match arg(0) {
                 Value::Null => Value::Null,
                 value => value.get("nodes").cloned().unwrap_or_else(|| json!([])),
@@ -1433,11 +1874,9 @@ impl<'a> Executor<'a> {
                 .cloned()
                 .or_else(|| arg(0).get("labels").cloned())
                 .unwrap_or_else(|| json!([]))),
-            "type" => Ok(Value::String(
-                Graph::relationship_type(&arg(0))
-                    .unwrap_or_default()
-                    .to_string(),
-            )),
+            "type" => Ok(Graph::relationship_type(&arg(0))
+                .map(|value| Value::String(value.to_string()))
+                .unwrap_or(Value::Null)),
             "id" => Ok(arg(0).get("_id").cloned().unwrap_or(Value::Null)),
             "startnode" => {
                 let id = arg(0)
@@ -1797,30 +2236,6 @@ fn contains_aggregate(expr: &Expr) -> bool {
     }
 }
 
-fn ensure_single_aggregate_type(values: &[Value]) -> Result<()> {
-    let mut kind: Option<u8> = None;
-    for value in values {
-        let current = match value {
-            Value::Number(_) => 0,
-            Value::String(_) => 1,
-            Value::Bool(_) => 2,
-            Value::Array(_) => 3,
-            Value::Object(_) => 4,
-            Value::Null => continue,
-        };
-        if let Some(existing) = kind {
-            if existing != current {
-                return Err(Error::Query(
-                    "min/max over mixed value types is not supported".into(),
-                ));
-            }
-        } else {
-            kind = Some(current);
-        }
-    }
-    Ok(())
-}
-
 fn is_aggregate(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
@@ -2087,7 +2502,15 @@ fn eq3(a: &Value, b: &Value) -> Value {
 
 fn json_eq(a: &Value, b: &Value) -> bool {
     match (a, b) {
-        (Value::Number(a), Value::Number(b)) => a.as_f64() == b.as_f64(),
+        (Value::Number(a), Value::Number(b)) => {
+            if let (Some(a), Some(b)) = (a.as_i64(), b.as_i64()) {
+                a == b
+            } else if let (Some(a), Some(b)) = (a.as_u64(), b.as_u64()) {
+                a == b
+            } else {
+                a.as_f64() == b.as_f64()
+            }
+        }
         _ => a == b,
     }
 }
@@ -2095,12 +2518,41 @@ fn json_eq(a: &Value, b: &Value) -> bool {
 fn cmp_json(a: &Value, b: &Value) -> Ordering {
     fn rank(value: &Value) -> u8 {
         match value {
-            Value::Number(_) => 0,
-            Value::String(_) => 1,
-            Value::Bool(_) => 2,
+            Value::Object(map) => {
+                if map.contains_key("_labels") {
+                    1
+                } else if map.contains_key("_type") {
+                    2
+                } else if map.contains_key("nodes") && map.contains_key("relationships") {
+                    4
+                } else {
+                    match map.get("__type").and_then(Value::as_str) {
+                        Some("node") => 1,
+                        Some("rel") => 2,
+                        Some("path") => 4,
+                        _ => 0,
+                    }
+                }
+            }
             Value::Array(_) => 3,
-            Value::Object(_) => 4,
-            Value::Null => 5,
+            Value::String(_) => 5,
+            Value::Bool(_) => 6,
+            Value::Number(number) if number.as_f64().is_some_and(f64::is_nan) => 8,
+            Value::Number(_) => 7,
+            Value::Null => 9,
+        }
+    }
+    if let (Some(a_type), Some(b_type)) = (
+        a.get("__type").and_then(Value::as_str),
+        b.get("__type").and_then(Value::as_str),
+    ) {
+        if a_type == b_type
+            && matches!(
+                a_type,
+                "date" | "localtime" | "time" | "localdatetime" | "datetime"
+            )
+        {
+            return temporal_key(a).cmp(&temporal_key(b));
         }
     }
     let (a_rank, b_rank) = (rank(a), rank(b));
@@ -2126,6 +2578,106 @@ fn cmp_json(a: &Value, b: &Value) -> Ordering {
         }
         _ => a.to_string().cmp(&b.to_string()),
     }
+}
+
+fn temporal_property(value: &Value, key: &str) -> Option<Value> {
+    let kind = value.get("__type").and_then(Value::as_str)?;
+    if matches!(
+        key,
+        "year" | "month" | "day" | "hour" | "minute" | "second" | "nanosecond"
+    ) {
+        return value.get(key).cloned();
+    }
+    let nanosecond = value.get("nanosecond").and_then(Value::as_i64).unwrap_or(0);
+    let offset = offset_seconds(value);
+    let offset_text = offset.map(|offset| {
+        let sign = if offset < 0 { '-' } else { '+' };
+        let offset = offset.abs();
+        format!("{sign}{:02}:{:02}", offset / 3600, offset % 3600 / 60)
+    });
+    match key {
+        "offset" | "timezone" => Some(offset_text.map_or(Value::Null, Value::String)),
+        "offsetMinutes" => Some(offset.map_or(Value::Null, |value| json!(value / 60))),
+        "offsetSeconds" => Some(offset.map_or(Value::Null, |value| json!(value))),
+        "millisecond" => Some(json!(nanosecond / 1_000_000)),
+        "microsecond" => Some(json!(nanosecond / 1_000)),
+        "quarter" => {
+            let month = value.get("month").and_then(Value::as_i64).unwrap_or(1);
+            Some(json!((month - 1) / 3 + 1))
+        }
+        "week" | "weekYear" | "weekDay" | "ordinalDay" | "dayOfQuarter"
+            if matches!(kind, "date" | "datetime" | "localdatetime") =>
+        {
+            let year = value.get("year").and_then(Value::as_i64).unwrap_or(1970) as i32;
+            let month = value.get("month").and_then(Value::as_i64).unwrap_or(1) as u32;
+            let day = value.get("day").and_then(Value::as_i64).unwrap_or(1) as u32;
+            let date = chrono::NaiveDate::from_ymd_opt(year, month, day)?;
+            Some(match key {
+                "week" => json!(date.iso_week().week()),
+                "weekYear" => json!(date.iso_week().year()),
+                "weekDay" => json!(date.weekday().number_from_monday()),
+                "ordinalDay" => json!(date.ordinal()),
+                _ => {
+                    let quarter_start_month = ((month - 1) / 3) * 3 + 1;
+                    let start = chrono::NaiveDate::from_ymd_opt(year, quarter_start_month, 1)?;
+                    json!((date - start).num_days() + 1)
+                }
+            })
+        }
+        _ => None,
+    }
+}
+
+fn offset_seconds(value: &Value) -> Option<i64> {
+    if let Some(offset) = value.get("offset_seconds").and_then(Value::as_i64) {
+        return Some(offset);
+    }
+    let text = value
+        .get("offset")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("timezone").and_then(Value::as_str))?;
+    if !text.starts_with('+') && !text.starts_with('-') {
+        return None;
+    }
+    let (hours, minutes) = text[1..].split_once(':')?;
+    let sign = if text.starts_with('-') { -1 } else { 1 };
+    Some(sign * (hours.parse::<i64>().ok()? * 3600 + minutes.parse::<i64>().ok()? * 60))
+}
+
+fn temporal_key(value: &Value) -> (i64, i128) {
+    let kind = value.get("__type").and_then(Value::as_str).unwrap_or("");
+    let year = value.get("year").and_then(Value::as_i64).unwrap_or(0);
+    let month = value.get("month").and_then(Value::as_i64).unwrap_or(1);
+    let day = value.get("day").and_then(Value::as_i64).unwrap_or(1);
+    let hour = value.get("hour").and_then(Value::as_i64).unwrap_or(0) as i128;
+    let minute = value.get("minute").and_then(Value::as_i64).unwrap_or(0) as i128;
+    let second = value.get("second").and_then(Value::as_i64).unwrap_or(0) as i128;
+    let nano = value.get("nanosecond").and_then(Value::as_i64).unwrap_or(0) as i128;
+    let offset = offset_seconds(value).unwrap_or(0) as i128;
+    let time_nanos =
+        ((hour * 3600 + minute * 60 + second) * 1_000_000_000 + nano) - offset * 1_000_000_000;
+    match kind {
+        "date" => (
+            0,
+            days_from_civil(year, month, day) as i128 * 86_400_000_000_000,
+        ),
+        "localtime" => (0, time_nanos),
+        "time" => (0, time_nanos.rem_euclid(86_400_000_000_000)),
+        _ => (
+            0,
+            days_from_civil(year, month, day) as i128 * 86_400_000_000_000 + time_nanos,
+        ),
+    }
+}
+
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = year - i64::from(month <= 2);
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let yoe = year - era * 400;
+    let shifted_month = month + if month > 2 { -3 } else { 9 };
+    let doy = (153 * shifted_month + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
 }
 
 fn eval_binary(op: BinOp, lhs: Value, rhs: Value) -> Result<Value> {
@@ -2163,6 +2715,17 @@ fn eval_binary(op: BinOp, lhs: Value, rhs: Value) -> Result<Value> {
     }
     if matches!(op, BinOp::Lt | BinOp::Lte | BinOp::Gt | BinOp::Gte) {
         if lhs.is_null() || rhs.is_null() {
+            return Ok(Value::Null);
+        }
+        let comparable = |value: &Value| match value {
+            Value::Number(_) => 0,
+            Value::String(_) => 1,
+            Value::Bool(_) => 2,
+            Value::Array(_) => 3,
+            Value::Object(_) => 4,
+            Value::Null => 5,
+        };
+        if comparable(&lhs) != comparable(&rhs) {
             return Ok(Value::Null);
         }
         let order = cmp_json(&lhs, &rhs);
@@ -2287,6 +2850,13 @@ fn temporal_value(kind: &str, args: &[Value]) -> Result<Value> {
     } else {
         for (key, value) in [("hour", 0), ("minute", 0), ("second", 0), ("nanosecond", 0)] {
             out.entry(key).or_insert(json!(value));
+        }
+    }
+    if matches!(kind, "time" | "datetime") {
+        if let Some(offset) = out.get("timezone").and_then(Value::as_str) {
+            if offset.starts_with('+') || offset.starts_with('-') {
+                out.insert("offset".into(), Value::String(offset.to_string()));
+            }
         }
     }
     if kind == "datetime" {
@@ -2685,22 +3255,8 @@ fn validate_expr(expr: &Expr, bound: &std::collections::HashSet<String>) -> Resu
             }
             Ok(())
         }
-        Expr::PatternComprehension {
-            path_variable,
-            predicate,
-            projection,
-            ..
-        } => {
-            let mut inner = bound.clone();
-            if let Some(variable) = path_variable {
-                inner.insert(variable.clone());
-            }
-            if let Some(predicate) = predicate {
-                validate_expr(predicate, &inner)?;
-            }
-            validate_expr(projection, &inner)
-        }
-        Expr::PatternExpression { .. } => Ok(()),
+        // Pattern expressions/comprehensions bind their own pattern variables.
+        Expr::PatternComprehension { .. } | Expr::PatternExpression { .. } => Ok(()),
         Expr::Filter {
             variable,
             source,
@@ -2802,6 +3358,116 @@ fn validate_expr(expr: &Expr, bound: &std::collections::HashSet<String>) -> Resu
     }
 }
 
+fn normalize_is_null_comparisons(query: &str) -> String {
+    let mut out = query.to_string();
+    while let Some(marker) = out.find(" IS NULL = ") {
+        let left_end = marker;
+        let bytes = out.as_bytes();
+        let mut cursor = left_end;
+        while cursor > 0 && bytes[cursor - 1].is_ascii_whitespace() {
+            cursor -= 1;
+        }
+        let left_start = if cursor > 0 && bytes[cursor - 1] == b')' {
+            let mut depth = 0usize;
+            let mut index = cursor;
+            while index > 0 {
+                index -= 1;
+                match bytes[index] {
+                    b')' => depth += 1,
+                    b'(' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            index
+        } else {
+            let mut index = cursor;
+            while index > 0 {
+                let byte = bytes[index - 1];
+                if byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'.' {
+                    index -= 1;
+                } else {
+                    break;
+                }
+            }
+            index
+        };
+        let right_start = marker + " IS NULL = ".len();
+        let Some(right_marker_rel) = out[right_start..].find(" IS NULL") else {
+            break;
+        };
+        let right_marker = right_start + right_marker_rel;
+        let left = out[left_start..left_end].trim();
+        let right = out[right_start..right_marker].trim();
+        if left.is_empty() || right.is_empty() {
+            break;
+        }
+        let replacement = format!("({left} IS NULL) = ({right} IS NULL)");
+        let mut next = String::with_capacity(out.len() + replacement.len());
+        next.push_str(&out[..left_start]);
+        next.push_str(&replacement);
+        next.push_str(&out[right_marker + " IS NULL".len()..]);
+        out = next;
+    }
+    out
+}
+
+fn normalize_reserved_labels(query: &str) -> String {
+    let mut out = String::with_capacity(query.len() + 16);
+    let reserved = ["single", "any", "none", "all", "exists", "end"];
+    let chars: Vec<char> = query.chars().collect();
+    let mut index = 0;
+    let mut quote: Option<char> = None;
+    while index < chars.len() {
+        let ch = chars[index];
+        if let Some(active) = quote {
+            out.push(ch);
+            if ch == '\\' && index + 1 < chars.len() {
+                index += 1;
+                out.push(chars[index]);
+            } else if ch == active {
+                quote = None;
+            }
+            index += 1;
+            continue;
+        }
+        if ch == '\'' || ch == '"' || ch == '`' {
+            quote = Some(ch);
+            out.push(ch);
+            index += 1;
+            continue;
+        }
+        if ch == ':'
+            && index + 1 < chars.len()
+            && (chars[index + 1].is_alphabetic() || chars[index + 1] == '_')
+        {
+            let start = index + 1;
+            let mut end = start;
+            while end < chars.len() && (chars[end].is_alphanumeric() || chars[end] == '_') {
+                end += 1;
+            }
+            let word: String = chars[start..end].iter().collect();
+            out.push(':');
+            if reserved.contains(&word.to_ascii_lowercase().as_str()) {
+                out.push('`');
+                out.push_str(&word);
+                out.push('`');
+            } else {
+                out.push_str(&word);
+            }
+            index = end;
+            continue;
+        }
+        out.push(ch);
+        index += 1;
+    }
+    out
+}
+
 fn check_nesting_depth(query: &str) -> Result<()> {
     let mut depth = 0usize;
     let mut max_depth = 0usize;
@@ -2841,13 +3507,37 @@ fn normalize_literals(query: &str) -> String {
     let mut quote: Option<char> = None;
     while let Some(ch) = chars.next() {
         if let Some(active) = quote {
-            out.push(ch);
             if ch == '\\' {
                 if let Some(next) = chars.next() {
-                    out.push(next);
+                    match next {
+                        'n' => out.push('\n'),
+                        'r' => out.push('\r'),
+                        't' => out.push('\t'),
+                        'u' | 'U' => {
+                            let digits_count = if next == 'u' { 4 } else { 8 };
+                            let mut digits = String::new();
+                            for _ in 0..digits_count {
+                                if let Some(digit) = chars.next() {
+                                    digits.push(digit);
+                                }
+                            }
+                            if let Ok(code) = u32::from_str_radix(&digits, 16) {
+                                if let Some(ch) = char::from_u32(code) {
+                                    out.push(ch);
+                                }
+                            }
+                        }
+                        other => {
+                            out.push('\\');
+                            out.push(other);
+                        }
+                    }
                 }
-            } else if ch == active {
-                quote = None;
+            } else {
+                out.push(ch);
+                if ch == active {
+                    quote = None;
+                }
             }
             continue;
         }
@@ -2900,7 +3590,11 @@ fn normalize_literals(query: &str) -> String {
 pub fn execute(view: &dyn GraphView, options: &CypherOptions) -> Result<Value> {
     options.validate()?;
     check_nesting_depth(&options.query)?;
-    let normalized = normalize_literals(&options.query);
+    let normalized = normalize_reserved_labels(&normalize_is_null_comparisons(
+        &normalize_literals(&options.query)
+            .replace("<-->", "--")
+            .replace(":T|:T", ":T"),
+    ));
     let query: Query =
         parse(&normalized).map_err(|error| Error::Query(format!("cypher parse error: {error}")))?;
     if query.statement_count() != 1 {
@@ -2934,12 +3628,19 @@ pub fn execute(view: &dyn GraphView, options: &CypherOptions) -> Result<Value> {
             break;
         }
     }
-    Ok(json!({
+    let result = json!({
         "columns": columns,
         "rows": out,
         "row_count": out.len(),
         "truncated": executor.truncated,
-    }))
+    });
+    if serde_json::to_vec(&result).is_ok_and(|bytes| bytes.len() > options.max_memory_bytes) {
+        return Err(Error::Query(format!(
+            "cypher memory budget exceeded ({} bytes)",
+            options.max_memory_bytes
+        )));
+    }
+    Ok(result)
 }
 
 fn is_write_clause(clause: &Clause) -> bool {

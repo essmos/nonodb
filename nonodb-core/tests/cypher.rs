@@ -246,6 +246,14 @@ fn cypher_limits_and_nesting_fail_explicitly() {
     .unwrap();
     let error = collection.graph_cypher(options).unwrap_err().to_string();
     assert!(error.contains("nesting"));
+
+    let options: CypherOptions = serde_json::from_value(json!({
+        "query": "UNWIND range(1, 1000) AS x RETURN x",
+        "max_memory_bytes": 100
+    }))
+    .unwrap();
+    let error = collection.graph_cypher(options).unwrap_err().to_string();
+    assert!(error.contains("memory budget"), "{error}");
 }
 
 #[test]
@@ -332,4 +340,88 @@ fn cypher_gds_handles_empty_graphs_and_row_bounds() {
     let out = collection.graph_cypher(options).unwrap();
     assert_eq!(out["row_count"], 1);
     assert_eq!(out["truncated"], true);
+}
+
+#[test]
+fn cypher_optional_match_preserves_bound_variables() {
+    let (_dir, store) = graph_store();
+    let out = run(
+        &store,
+        "MATCH (n:Person) OPTIONAL MATCH (n)-[:KNOWS]->(m) \
+         RETURN n.name AS name, m.name AS friend ORDER BY name, friend",
+    );
+    assert_eq!(
+        out["rows"],
+        json!([
+            {"name": "Alice", "friend": "Bob"},
+            {"name": "Alice", "friend": "Carol"},
+            {"name": "Bob", "friend": "Carol"},
+            {"name": "Carol", "friend": null}
+        ])
+    );
+
+    let out = run(
+        &store,
+        "MATCH (n:Person) OPTIONAL MATCH (n)-[:MISSING]->(m) \
+         RETURN n.name AS name, m.name AS friend ORDER BY name",
+    );
+    assert_eq!(
+        out["rows"],
+        json!([
+            {"name": "Alice", "friend": null},
+            {"name": "Bob", "friend": null},
+            {"name": "Carol", "friend": null}
+        ])
+    );
+}
+
+#[test]
+fn cypher_pattern_expressions_and_comprehensions() {
+    let (_dir, store) = graph_store();
+    let out = run(
+        &store,
+        "MATCH (n:Person) WHERE (n)-[:KNOWS]->() RETURN n.name AS name ORDER BY name",
+    );
+    assert_eq!(out["rows"], json!([{"name": "Alice"}, {"name": "Bob"}]));
+
+    let out = run(
+        &store,
+        "MATCH (n:Person) WHERE NOT (n)-[:KNOWS]->() RETURN n.name AS name ORDER BY name",
+    );
+    assert_eq!(out["rows"], json!([{"name": "Carol"}]));
+
+    let out = run(
+        &store,
+        "MATCH (n:Person) RETURN n.name AS name, \
+         [(n)-[:KNOWS]->(m) | m.name] AS friends ORDER BY name",
+    );
+    assert_eq!(
+        out["rows"],
+        json!([
+            {"name": "Alice", "friends": ["Bob", "Carol"]},
+            {"name": "Bob", "friends": ["Carol"]},
+            {"name": "Carol", "friends": []}
+        ])
+    );
+}
+
+#[test]
+fn cypher_rejects_non_gds_procedures() {
+    let (_dir, store) = graph_store();
+    for name in [
+        "apoc.pagerank.stream",
+        "my.pagerank.stream",
+        "evil.similarity",
+    ] {
+        let collection = store.collection("nodes").unwrap();
+        let options: CypherOptions = serde_json::from_value(json!({
+            "query": format!("CALL {name}() YIELD nodeId RETURN nodeId")
+        }))
+        .unwrap();
+        let error = collection.graph_cypher(options).unwrap_err().to_string();
+        assert!(
+            error.contains("unsupported Cypher procedure"),
+            "{name}: {error}"
+        );
+    }
 }

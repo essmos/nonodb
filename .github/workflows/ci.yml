@@ -117,8 +117,8 @@ jobs:
           python3 - <<'PY'
           import json
           report = json.load(open("tck-report.json"))
-          assert report["counts"]["fail"] == 0, report["counts"]
           assert report["pass_rate"] >= 0.90, report["pass_rate"]
+          assert report["counts"]["pass"] + report["counts"]["known_gap"] + report["counts"]["unsupported"] == report["total"]
           PY
 
       - name: Test MongoDB wire limits

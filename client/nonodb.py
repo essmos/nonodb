@@ -1739,6 +1739,7 @@ class Collection:
         max_operations: int = 1_000_000,
         timeout_ms: Optional[int] = None,
         max_depth: int = 64,
+        max_memory_bytes: int = 64 * 1024 * 1024,
     ) -> dict[str, Any]:
         """Executes a read-only Cypher query against the configured graph.
 
@@ -1752,6 +1753,7 @@ class Collection:
             "max_rows": max_rows,
             "max_operations": max_operations,
             "max_depth": max_depth,
+            "max_memory_bytes": max_memory_bytes,
         }
         if params is not None:
             payload["params"] = params

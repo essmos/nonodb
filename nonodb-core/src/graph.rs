@@ -12,6 +12,7 @@
 
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -621,6 +622,8 @@ pub struct GraphAlgorithmOptions {
     pub tolerance: f64,
     #[serde(default)]
     pub projection: Option<Value>,
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
 }
 
 fn default_damping() -> f64 {
@@ -2276,6 +2279,7 @@ fn algorithm_adjacency(
 }
 
 fn pagerank(view: &dyn GraphView, options: &GraphAlgorithmOptions) -> Result<Value> {
+    let started = Instant::now();
     let as_of = as_of_ms(options.as_of.as_ref())?;
     let (ids, ids_truncated) = algorithm_nodes(view, options)?;
     if ids.is_empty() {
@@ -2304,6 +2308,7 @@ fn pagerank(view: &dyn GraphView, options: &GraphAlgorithmOptions) -> Result<Val
     let mut converged = false;
     let mut iterations = 0usize;
     for _ in 0..options.iterations {
+        check_algorithm_timeout(options, started)?;
         let dangling: f64 = ids
             .iter()
             .filter(|id| adjacency.get(*id).is_none_or(|edges| edges.is_empty()))
@@ -2361,6 +2366,7 @@ fn pagerank(view: &dyn GraphView, options: &GraphAlgorithmOptions) -> Result<Val
 }
 
 fn degree_centrality(view: &dyn GraphView, options: &GraphAlgorithmOptions) -> Result<Value> {
+    let started = Instant::now();
     let as_of = as_of_ms(options.as_of.as_ref())?;
     let (ids, ids_truncated) = algorithm_nodes(view, options)?;
     let empty = HashMap::new();
@@ -2374,6 +2380,7 @@ fn degree_centrality(view: &dyn GraphView, options: &GraphAlgorithmOptions) -> R
     } else {
         algorithm_adjacency(view, &ids, options, as_of, GraphDirection::In)?
     };
+    check_algorithm_timeout(options, started)?;
     let mut ranked: Vec<(String, usize, usize)> = ids
         .iter()
         .map(|id| {
@@ -2410,11 +2417,13 @@ fn degree_centrality(view: &dyn GraphView, options: &GraphAlgorithmOptions) -> R
 }
 
 fn connected_components(view: &dyn GraphView, options: &GraphAlgorithmOptions) -> Result<Value> {
+    let started = Instant::now();
     let as_of = as_of_ms(options.as_of.as_ref())?;
     let (ids, ids_truncated) = algorithm_nodes(view, options)?;
     let allowed: HashSet<&str> = ids.iter().map(String::as_str).collect();
     let (adjacency, edges_truncated) =
         algorithm_adjacency(view, &ids, options, as_of, GraphDirection::Both)?;
+    check_algorithm_timeout(options, started)?;
     let mut seen: HashSet<String> = HashSet::new();
     let mut components: Vec<(String, Vec<String>)> = Vec::new();
     let mut truncated = ids_truncated || edges_truncated;
@@ -2468,6 +2477,15 @@ fn connected_components(view: &dyn GraphView, options: &GraphAlgorithmOptions) -
 
 /// Runs a read-only graph algorithm over all nodes in the graph's node
 /// collection. The result is bounded by `limit` and `max_nodes`.
+fn check_algorithm_timeout(options: &GraphAlgorithmOptions, started: Instant) -> Result<()> {
+    if let Some(timeout_ms) = options.timeout_ms {
+        if started.elapsed().as_millis() as u64 >= timeout_ms {
+            return Err(Error::Query("graph algorithm timed out".into()));
+        }
+    }
+    Ok(())
+}
+
 pub fn graph_algorithm(view: &dyn GraphView, options: &GraphAlgorithmOptions) -> Result<Value> {
     options.validate()?;
     match options.kind {

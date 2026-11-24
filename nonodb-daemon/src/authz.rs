@@ -343,6 +343,7 @@ mod tests {
                 max_operations: 100,
                 timeout_ms: None,
                 max_depth: 4,
+                max_memory_bytes: 64 * 1024 * 1024,
             },
         };
         assert!(authorize_request(&reader, &ok, "default").is_ok());
@@ -355,6 +356,7 @@ mod tests {
                 max_operations: 100,
                 timeout_ms: None,
                 max_depth: 4,
+                max_memory_bytes: 64 * 1024 * 1024,
             },
         };
         assert!(authorize_request(&reader, &denied, "default").is_err());

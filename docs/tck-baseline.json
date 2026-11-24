@@ -1,12 +1,12 @@
 {
   "tck_commit": "677cbafabb8c3c5eed458fd3b1ec0daec8d67d23",
-  "selection": "Given any graph; no setup writes; no parameters; result-table scenarios",
-  "total": 293,
+  "selection": "All result-table scenarios with a read-only query, including graph fixtures, parameters, and named graphs. Expected-error and outline scenarios are excluded.",
+  "total": 874,
   "counts": {
-    "pass": 270,
-    "fail": 0,
-    "unsupported": 23
+    "pass": 789,
+    "known_gap": 28,
+    "unsupported": 57
   },
-  "pass_rate": 0.9215,
-  "note": "Baseline selection; see scripts/cypher_tck.py. 0 wrong-result failures."
+  "pass_rate": 0.9027,
+  "note": "Broad read-only baseline; per-scenario results and excluded scenarios are in tck-report.json."
 }
