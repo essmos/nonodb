@@ -460,6 +460,14 @@ fn cypher_cheap_gds_procedures_are_allowlisted_and_deterministic() {
         "CALL gds.labelPropagation.stream() YIELD nodeId, label          RETURN nodeId, label ORDER BY nodeId",
     );
     assert_eq!(labels, again);
+    let community_labels: std::collections::HashSet<&str> = labels["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["nodeId"] != "acme")
+        .map(|row| row["label"].as_str().unwrap())
+        .collect();
+    assert_eq!(community_labels.len(), 1, "{labels}");
 
     let cores = run(
         &store,
@@ -511,7 +519,7 @@ fn cypher_gds_processes_more_than_1000_nodes_and_honors_budgets() {
     store
         .create_collection("edges", nonodb_core::CollectionProfile::Standard)
         .unwrap();
-    for i in 0..1_500 {
+    for i in 0..12_000 {
         nodes
             .insert_one(json!({"_id": format!("n{i:05}")}))
             .unwrap();
@@ -525,14 +533,25 @@ fn cypher_gds_processes_more_than_1000_nodes_and_honors_budgets() {
 
     let options: CypherOptions = serde_json::from_value(json!({
         "query": "CALL gds.pagerank.stream() YIELD nodeId, score RETURN nodeId, score",
-        "max_rows": 2_000,
+        "max_rows": 20_000,
         "max_operations": 10_000_000,
-        "gds_max_nodes": 2_000
+        "gds_max_nodes": 20_000
     }))
     .unwrap();
     let out = nodes.graph_cypher(options).unwrap();
-    assert_eq!(out["row_count"], 1_500);
+    assert_eq!(out["row_count"], 12_000);
     assert_eq!(out["truncated"], false);
+
+    let options: CypherOptions = serde_json::from_value(json!({
+        "query": "CALL gds.degree.stream() YIELD nodeId, degree RETURN nodeId, degree",
+        "max_rows": 1_000,
+        "max_operations": 10_000_000,
+        "gds_max_nodes": 20_000
+    }))
+    .unwrap();
+    let out = nodes.graph_cypher(options).unwrap();
+    assert_eq!(out["row_count"], 1_000);
+    assert_eq!(out["truncated"], true);
 
     let options: CypherOptions = serde_json::from_value(json!({
         "query": "CALL gds.pagerank.stream() YIELD nodeId, score RETURN nodeId, score",

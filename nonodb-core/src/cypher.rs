@@ -982,6 +982,7 @@ impl<'a> Executor<'a> {
                 self.graph.view,
                 &GraphAlgorithmOptions {
                     kind: GraphAlgorithmKind::LabelPropagation,
+                    direction: GraphDirection::Both,
                     ..base
                 },
             )?,

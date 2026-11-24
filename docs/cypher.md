@@ -80,8 +80,9 @@ Definitions:
 - **Node similarity**: Jaccard similarity between neighbor sets, using both edge
   directions; pairs with similarity `<= 0` are omitted; results sorted by
   descending similarity.
-- **Label propagation**: deterministic synchronous propagation with label ids
-  initialized to node ids; ties choose the lexicographically smallest label.
+- **Label propagation**: deterministic synchronous propagation over both edge
+  directions, with label ids initialized to node ids; ties choose the
+  lexicographically smallest label.
 - **k-core**: deterministic peeling core number using both edge directions.
 - **Degree distribution**: histogram of `in + out` total degree.
 
@@ -111,7 +112,8 @@ RETURN nodeId, score ORDER BY score DESC
   1,000,000), `gds_max_edges` (default 1,000,000, max 10,000,000),
   `gds_max_memory_bytes` (default 256 MiB, max 1 GiB), and `gds_timeout_ms`
   (falling back to `timeout_ms` when unset); they emit at most `max_rows` and
-  set `truncated:true` when clipped;
+  set `truncated:true` when the algorithm output is larger, with no hidden
+  10,000-row cap;
 - GDS node, edge, memory, and timeout overruns fail explicitly with
   `invalid_query` instead of returning an incomplete graph;
 - unsupported syntax fails explicitly with `invalid_query`, never a silent
