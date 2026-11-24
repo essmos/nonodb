@@ -4700,6 +4700,38 @@ impl<'e> Collection<'e> {
         after: Option<&Value>,
         ttl_at: Option<u64>,
     ) -> Result<()> {
+        if self.profile.is_timeseries() {
+            // Time-series rows do not live in `coll:<name>`; appending them to
+            // the bucket store keeps replicas byte-compatible with the primary
+            // (same settings, same insert order, same synthetic ids).
+            let settings = self.timeseries_settings_in(&*wtxn)?.unwrap_or_default();
+            match op {
+                "insert" | "update" => {
+                    let after = after.ok_or_else(|| {
+                        Error::Query("replication change is missing `after`".into())
+                    })?;
+                    crate::timeseries::insert(
+                        wtxn,
+                        self.env,
+                        &self.name,
+                        &settings,
+                        after.clone(),
+                    )?;
+                    return Ok(());
+                }
+                "delete" => {
+                    return Err(Error::Query(
+                        "replication delete is not supported on time-series collections; use retain_timeseries"
+                            .into(),
+                    ));
+                }
+                other => {
+                    return Err(Error::Query(format!(
+                        "unknown replication operation `{other}`"
+                    )))
+                }
+            }
+        }
         self.ensure_standard()?;
         let existing = self.db.get(&*wtxn, id.as_bytes())?.map(|raw| raw.to_vec());
         let old = existing.as_deref().map(parse_json).transpose()?;

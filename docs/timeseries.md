@@ -210,6 +210,38 @@ Rejections return `invalid query: `<op>` is not supported on time-series
 collection `<name>``, so API clients fail loudly instead of silently returning
 empty results.
 
+## Disk usage
+
+Same 100k-row workload (10 series, 8 columns, 183 bytes of JSON per row),
+`ROWS=100000 cargo run --release -p nonodb-core --example timeseries_space`:
+
+| Form | Size | Bytes/row |
+|---|---|---|
+| raw JSON documents | 17.47 MB | 183.2 |
+| standard collection (`data.mdb`, no indexes) | 41.66 MB | 436.8 |
+| TS, pending rows before seal (`data.mdb`) | 7.52 MB | 78.9 |
+| TS, sealed, before compaction (`data.mdb`) | 7.52 MB | 78.9 |
+| TS, sealed, compacted copy | **0.46 MB** | **4.79** |
+| TS after retention to half + compacted | 0.25 MB | 5.32 |
+
+Read that carefully, because it matters operationally:
+
+- **Sealed payloads are tiny, but LMDB never shrinks `data.mdb`.** Sealing and
+  retention free pages for reuse; the file keeps the high-water mark. The
+  numbers above only drop after a compacting copy.
+- **Compaction is the existing backup path.** `nonodb-cli backup` and daemon
+  backup jobs call `copy_to_file(..., CompactionOption::Enabled)`, so a
+  backup/restore cycle reclaims the space. `Store::copy_to_file` exposes the
+  same operation for scripts.
+- **Pending rows are raw JSON on purpose** (O(1) inserts). With
+  `bucket_max_docs = 2048`, at most 2048 rows per series are uncompressed at
+  any moment; seal or `seal_timeseries` shrinks them into the columnar payload.
+- Compaction is a whole-database operation: plan a maintenance window or run it
+  against a replica, exactly like any other LMDB high-water issue.
+
+Compacted on-disk size is **~91x smaller than a document-per-row collection**
+and **~38x smaller than the raw JSON** for this workload.
+
 ## Retention
 
 `retain_timeseries` deletes every row older than a cutoff. Buckets whose whole
@@ -235,7 +267,29 @@ Response:
 
 Retention is replicated as `time_series_retain`, so replicas drop the same
 ranges. Run it from a scheduler (workers/cron) for a rolling window, or call it
-once before an archive.
+once before an archive. Compact afterwards (backup path) if you need the file to
+shrink on disk.
+
+## Replication and backups
+
+Time-series collections participate in the normal replication stream:
+
+- `CollectionCreate` carries the serialized settings, so a replica creates the
+  same bucket layout instead of falling back to a standard collection;
+- document inserts are applied through the bucket writer, not into the (empty)
+  `coll:<name>` database, so replicas are readable immediately;
+- inserts are deterministic: same settings, same insert order, same timestamps
+  produce the same synthetic `_id` on primary and replica (covered by a test
+  that compares full document sets);
+- `time_series_retain` replicas the retention cutoff;
+- snapshot bootstrap, full backups, restores, and branch clones copy the whole
+  environment, so `tsb:<collection>` buckets travel with the database;
+- filtered backups drop collections through the normal drop path, which also
+  clears the bucket database.
+
+`verify_data_dir` counts time-series collections as registered collections but
+does not decode bucket payloads yet; the bucket database is covered by the LMDB
+copy/manifest checks like any other named database.
 
 ## Maintenance
 

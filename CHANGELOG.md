@@ -23,6 +23,13 @@ Full release notes: https://github.com/essmos/nonodb/releases
   old buckets by key without decoding columns and only rewrites the boundary
   bucket. Add `examples/timeseries_bench.rs` with write/read/aggregate/retention
   latency percentiles and a standard-collection baseline.
+- Route replicated time-series inserts through the bucket writer instead of the
+  unused `coll:<name>` database, and replicate `retain_timeseries` as
+  `time_series_retain`. Replicas now produce byte-identical documents, including
+  synthetic `_id`s, which is covered by a two-store replication test. Add
+  `examples/timeseries_space.rs`: 100k rows occupy 0.46 MB compacted (4.79
+  B/row) versus 41.66 MB (436.8 B/row) for a document-per-row collection, with
+  the LMDB high-water caveat documented.
 
 - Remove orphaned `.dropped-*` database directories at startup. A failed
   `remove_dir_all` no longer turns an already-committed database drop into an

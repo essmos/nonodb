@@ -2527,6 +2527,112 @@ mod tests {
     }
 
     #[test]
+    fn replication_applies_buckets_settings_and_retention() {
+        use crate::replication::{ReplicationChange, ReplicationOp, ReplicationTxn};
+        use crate::vault::CollectionProfile;
+
+        let primary_dir = tempfile::tempdir().unwrap();
+        let primary = crate::store::Store::open(primary_dir.path()).unwrap();
+        let settings = Settings {
+            time_field: "ts".into(),
+            meta_field: Some("device".into()),
+            ..Settings::default()
+        };
+        let source = primary
+            .create_timeseries_collection("metrics", &settings)
+            .unwrap();
+        let mut inserted = Vec::new();
+        for idx in 0..40i64 {
+            let doc = json!({
+                "ts": {"$date": {"$numberLong": (1_700_000_000_000i64 + idx * 1000).to_string()}},
+                "device": {"id": "a"},
+                "value": idx,
+            });
+            let id = source.insert_one(doc.clone()).unwrap();
+            inserted.push((id, doc));
+        }
+        primary.seal_timeseries("metrics").unwrap();
+
+        let mut changes = Vec::new();
+        let mut ops = vec![ReplicationOp::CollectionCreate {
+            name: "metrics".into(),
+            profile: "timeseries".into(),
+            ttl_seconds: None,
+            ttl_field: None,
+            ttl_purge_history: None,
+            timeseries: Some(serde_json::to_string(&settings).unwrap()),
+        }];
+        for (id, doc) in &inserted {
+            let change = changes.len();
+            changes.push(ReplicationChange {
+                collection: "metrics".into(),
+                op: "insert".into(),
+                id: id.clone(),
+                before: None,
+                after: Some(doc.clone()),
+                vault: false,
+                ttl_at: None,
+            });
+            ops.push(ReplicationOp::Document { change });
+        }
+
+        let replica_dir = tempfile::tempdir().unwrap();
+        let replica = crate::store::Store::open(replica_dir.path()).unwrap();
+        let txn = ReplicationTxn::new_with_ops(1, "primary", 0, changes, ops);
+        assert!(replica.apply_replication_txn(&txn).unwrap());
+
+        let target = replica.collection("metrics").unwrap();
+        assert_eq!(target.profile(), CollectionProfile::TimeSeries);
+        assert_eq!(
+            target
+                .timeseries_settings_in(&replica.read_txn().unwrap())
+                .unwrap(),
+            Some(settings.clone())
+        );
+        assert_eq!(target.count(&json!({})).unwrap(), 40);
+        let all = |collection: &crate::collection::Collection<'_>| {
+            collection
+                .find(&FindQuery {
+                    filter: json!({}),
+                    projection: None,
+                    sort: vec![("ts".into(), 1)],
+                    skip: 0,
+                    limit: None,
+                    comment: None,
+                    max_time_ms: None,
+                    hint: None,
+                })
+                .unwrap()
+        };
+        let primary_docs = all(&source);
+        let replica_docs = all(&target);
+        assert_eq!(
+            primary_docs, replica_docs,
+            "replica rows must match primary"
+        );
+
+        // Retention replicates too: same cutoff, same remaining rows.
+        let cutoff = 1_700_000_000_000i64 + 20_000;
+        let report = primary.retain_timeseries("metrics", cutoff).unwrap();
+        let retain = ReplicationTxn::new_with_ops(
+            2,
+            "primary",
+            0,
+            Vec::new(),
+            vec![ReplicationOp::TimeSeriesRetain {
+                coll: "metrics".into(),
+                before_ms: cutoff,
+            }],
+        );
+        assert!(replica.apply_replication_txn(&retain).unwrap());
+        assert_eq!(
+            target.count(&json!({})).unwrap(),
+            report.remaining_rows as usize
+        );
+        assert_eq!(target.count(&json!({})).unwrap(), 20);
+    }
+
+    #[test]
     fn numeric_columns_compress_well() {
         let settings = Settings::default();
         let mut bucket = Bucket {
