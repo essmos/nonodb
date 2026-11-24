@@ -3617,6 +3617,7 @@ fn update_inner(
             }
         }
     }
+    let mut moved_docs: Vec<(String, Value)> = Vec::new();
     for (key, payload) in buckets {
         if !multi && report.matched > 0 {
             break;
@@ -3696,8 +3697,7 @@ fn update_inner(
                     }
                 }
                 let old_id = row_id(hash, salt, window, serial, seq);
-                let new_id = insert(wtxn, env, name, settings, next)?;
-                report.moved.push((old_id, new_id));
+                moved_docs.push((old_id, next));
             }
         }
         bucket.deleted.extend(moved_out.iter().copied());
@@ -3800,11 +3800,15 @@ fn update_inner(
                     }
                 }
                 let old_id = row_id(hash, salt, window, serial, seq);
-                let new_id = insert(wtxn, env, name, settings, next)?;
-                report.moved.push((old_id, new_id));
+                moved_docs.push((old_id, next));
             }
         }
-        refresh_pointers(wtxn, &db)?;
+    }
+
+    refresh_pointers(wtxn, &db)?;
+    for (old_id, next) in moved_docs {
+        let new_id = insert(wtxn, env, name, settings, next)?;
+        report.moved.push((old_id, new_id));
     }
 
     if report.matched == 0 && upsert {
@@ -5446,6 +5450,44 @@ mod tests {
         assert_eq!(doc["v"], json!(1));
         // A stale synthetic id is authoritative and returns None without a scan.
         assert!(c.find_by_key(&stale).unwrap().is_none());
+    }
+
+    #[test]
+    fn multi_update_moves_sealed_and_pending_rows_once() {
+        let (_dir, store) = ts_store();
+        let settings = Settings {
+            time_field: "ts".into(),
+            bucket_max_docs: 16,
+            ..Settings::default()
+        };
+        let c = store
+            .create_timeseries_collection("metrics", &settings)
+            .unwrap();
+        c.create_index("k", true).unwrap();
+        for idx in 0..20i64 {
+            c.insert_one(json!({"ts": idx * 1000, "k": idx, "v": 0}))
+                .unwrap();
+        }
+        let report = c
+            .update_opts(
+                &json!({}),
+                &json!([{"$set": {
+                    "ts": {"$add": ["$ts", 7_200_000]},
+                    "v": {"$add": ["$v", 1]}
+                }}]),
+                true,
+                false,
+            )
+            .unwrap();
+        assert_eq!(report.matched, 20);
+        assert_eq!(report.modified, 20);
+        assert_eq!(c.count(&json!({})).unwrap(), 20);
+        assert_eq!(c.count(&json!({"v": 0})).unwrap(), 0);
+        assert_eq!(c.count(&json!({"v": 1})).unwrap(), 20);
+        assert_eq!(c.count(&json!({"ts": {"$lt": 7_200_000}})).unwrap(), 0);
+        for idx in 0..20i64 {
+            assert_eq!(c.count(&json!({"k": idx})).unwrap(), 1);
+        }
     }
 
     #[test]
