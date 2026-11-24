@@ -2390,7 +2390,7 @@ bounded by `limit`, `max_nodes`, `max_edges`, `max_memory_bytes`, and
 
 `start_graph_job` runs the same options in the background and returns a
 `job_id`; `graph_job_status`, `graph_job_result`, and `cancel_graph_job` manage
-that job. States are `queued`, `running`, `cancelling`, `completed`, `failed`,
+that job. States are `queued`, `running`, `cancelling`, `exporting`, `completed`, `failed`,
 and `cancelled`. Status includes a `progress` object with `phase`, `done`, and
 `total`. Jobs are database-scoped, owner-isolated, and bounded to two concurrent
 runs per database. `export_graph_job` atomically copies a completed result into

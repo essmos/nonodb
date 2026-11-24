@@ -27,6 +27,7 @@ enum JobState {
     Queued,
     Running,
     Cancelling,
+    Exporting,
     Completed,
     Failed,
     Cancelled,
@@ -38,6 +39,7 @@ impl JobState {
             Self::Queued => "queued",
             Self::Running => "running",
             Self::Cancelling => "cancelling",
+            Self::Exporting => "exporting",
             Self::Completed => "completed",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
@@ -307,6 +309,7 @@ impl AnalyticsManager {
                 message: "analytics result was already exported".into(),
             })?;
             job.result_bytes = 0;
+            job.state = JobState::Exporting;
             (job.kind.clone(), result)
         };
         let retained = result.clone();
@@ -340,6 +343,7 @@ impl AnalyticsManager {
             if let Some(job) = inner.jobs.get_mut(id) {
                 job.result = None;
                 job.result_bytes = 0;
+                job.state = JobState::Completed;
             }
         }
         Ok(json!({
@@ -385,6 +389,7 @@ impl AnalyticsManager {
             if let Some(job) = inner.jobs.get_mut(id) {
                 job.result_bytes = serde_json::to_vec(result.as_ref()).map_or(0, |raw| raw.len());
                 job.result = Some(result);
+                job.state = JobState::Completed;
             }
         }
     }

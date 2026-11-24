@@ -463,9 +463,9 @@ database-scoped and accept the same options as `graph_algorithm`.
 | `graph_job_status` | Return `state`, `progress.phase/done/total`, timestamps, and error |
 | `graph_job_result` | Return the completed result until export consumes it; fails until terminal |
 | `cancel_graph_job` | Request cooperative cancellation |
-| `export_graph_job` | Atomically write a completed result into a collection |
+| `export_graph_job` | Atomically write a completed result into a collection; the job is `exporting` and cannot be reaped until the write finishes |
 
-States are `queued`, `running`, `cancelling`, `completed`, `failed`, and
+States are `queued`, `running`, `cancelling`, `exporting`, `completed`, `failed`, and
 `cancelled`. Progress phases are `scan_nodes`, `scan_edges`, the algorithm name,
 and `components`. Workers check cancellation between every 1,024 items and each
 PageRank iteration. The pool is bounded to two concurrent jobs per database;
