@@ -4956,6 +4956,7 @@ impl<'e> Collection<'e> {
                     if let Some(doc) =
                         crate::timeseries::find_by_id(&*wtxn, self.env, &self.name, &settings, id)?
                     {
+                        self.validate_unique(&*wtxn, &doc, id)?;
                         self.apply_index_entries(wtxn, None, Some(&doc), id)?;
                         self.apply_text_entries(wtxn, None, Some(&doc), id)?;
                         self.apply_fuzzy_entries(wtxn, None, Some(&doc), id)?;
@@ -4974,6 +4975,9 @@ impl<'e> Collection<'e> {
                     )?;
                     let after =
                         crate::timeseries::find_by_id(&*wtxn, self.env, &self.name, &settings, id)?;
+                    if let Some(doc) = &after {
+                        self.validate_unique(&*wtxn, doc, id)?;
+                    }
                     self.apply_index_entries(wtxn, before.as_ref(), after.as_ref(), id)?;
                     self.apply_text_entries(wtxn, before.as_ref(), after.as_ref(), id)?;
                     self.apply_fuzzy_entries(wtxn, before.as_ref(), after.as_ref(), id)?;

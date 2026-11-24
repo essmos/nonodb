@@ -5341,7 +5341,7 @@ mod tests {
         let c = store
             .create_timeseries_collection("metrics", &settings)
             .unwrap();
-        for idx in 0..250i64 {
+        for idx in 0..5_000i64 {
             c.insert_one(json!({
                 "ts": 1_700_000_000_000i64 + idx * 1000,
                 "grp": if idx % 2 == 0 { "a" } else { "b" },
@@ -5355,7 +5355,7 @@ mod tests {
                 json!({"$project": {"v": 1, "_id": 0}}),
             ])
             .unwrap();
-        assert_eq!(streamed.len(), 125);
+        assert_eq!(streamed.len(), 2_500);
         let grouped = c
             .aggregate(&[
                 json!({"$group": {"_id": "$grp", "n": {"$sum": 1}}}),
@@ -5363,8 +5363,8 @@ mod tests {
             ])
             .unwrap();
         assert_eq!(grouped.len(), 2);
-        assert_eq!(grouped[0]["n"], json!(125));
-        assert_eq!(grouped[1]["n"], json!(125));
+        assert_eq!(grouped[0]["n"], json!(2_500));
+        assert_eq!(grouped[1]["n"], json!(2_500));
         let limited = c
             .aggregate(&[
                 json!({"$match": {"grp": "b"}}),
@@ -5391,8 +5391,8 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(seen, 250);
-        assert_eq!(batches, 15);
+        assert_eq!(seen, 5_000);
+        assert_eq!(batches, 295);
     }
 
     #[test]
