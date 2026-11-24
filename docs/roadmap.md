@@ -5,7 +5,7 @@ is deliberately out of scope, and where active implementation work is tracked.
 
 ## Current status
 
-The project is at `0.32.0`. It is suitable for local, single-host, and
+The project is at `0.33.0`. It is suitable for local, single-host, and
 primary/replica deployments that need a small, durable, queryable JSON store
 and can accept a single-writer model per database.
 
@@ -42,8 +42,13 @@ Implemented:
 - graph traversal over ordinary node/edge documents with a native transactional
   adjacency index, BFS/DFS, label and direction filters, vector seeds, BFS and
   Dijkstra `shortest_path`, all-shortest paths, linear pattern matching,
-  PageRank/degree/component algorithms, hard result budgets, a Python client, and
-  a GUI tree;
+  PageRank/degree/component/label-propagation/k-core/degree-distribution
+  algorithms, bounded background analytics jobs with atomic export, hard result
+  budgets, a Python client, and a GUI tree;
+- read-only Cypher queries through `cypher` and `Collection.cypher()`, with
+  `MATCH`/`WHERE`/`WITH`/`UNWIND`, variable-length and shortest paths, optional
+  matches, existential subqueries, a pinned openCypher TCK baseline, and a
+  bounded GDS-style procedure subset;
 - read batches and atomic write batches;
 - ordered point lookups by `_id` or a unique single-field or compound index,
   with covering projections, index-only `_id` projections, `_id` exclusion, key
