@@ -274,6 +274,28 @@ def main() -> int:
                     "MATCH p=shortestPath((a)-[:EDGE*..6]->(b)) RETURN length(p)",
                     {"a": pairs[0][0], "b": pairs[0][1]},
                 )
+                coll.all_shortest_paths(
+                    pairs[0][0],
+                    pairs[0][1],
+                    max_depth=6,
+                    limit_paths=10,
+                    projection={"_id": 1},
+                )
+                neo.scalar(
+                    "MATCH (a:Node {id: $a}), (b:Node {id: $b}) "
+                    "MATCH p=allShortestPaths((a)-[:EDGE*..6]->(b)) RETURN count(p)",
+                    {"a": pairs[0][0], "b": pairs[0][1]},
+                )
+                coll.graph_match(
+                    start,
+                    [{"direction": "out", "min_hops": 1, "max_hops": 2}],
+                    limit=100,
+                    projection={"_id": 1},
+                )
+                neo.scalar(
+                    "MATCH p=(n:Node {id: $id})-[:EDGE*1..2]->(m) RETURN count(p)",
+                    {"id": start},
+                )
 
         def time_nonodb_traverse(depth: int) -> list[float]:
             values = []
@@ -320,6 +342,60 @@ def main() -> int:
                     values.append((time.perf_counter() - t0) * 1000)
             return values
 
+        def time_nonodb_all_shortest() -> list[float]:
+            values = []
+            for _ in range(5):
+                for start, target in pairs:
+                    t0 = time.perf_counter()
+                    coll.all_shortest_paths(
+                        start,
+                        target,
+                        max_depth=6,
+                        limit_paths=10,
+                        projection={"_id": 1},
+                    )
+                    values.append((time.perf_counter() - t0) * 1000)
+            return values
+
+        def time_neo4j_all_shortest() -> list[float]:
+            values = []
+            for _ in range(5):
+                for start, target in pairs:
+                    t0 = time.perf_counter()
+                    neo.scalar(
+                        "MATCH (a:Node {id: $a}), (b:Node {id: $b}) "
+                        "MATCH p=allShortestPaths((a)-[:EDGE*..6]->(b)) RETURN count(p)",
+                        {"a": start, "b": target},
+                    )
+                    values.append((time.perf_counter() - t0) * 1000)
+            return values
+
+        def time_nonodb_match() -> list[float]:
+            values = []
+            for _ in range(5):
+                for start in starts:
+                    t0 = time.perf_counter()
+                    coll.graph_match(
+                        start,
+                        [{"direction": "out", "min_hops": 1, "max_hops": 2}],
+                        limit=100,
+                        projection={"_id": 1},
+                    )
+                    values.append((time.perf_counter() - t0) * 1000)
+            return values
+
+        def time_neo4j_match() -> list[float]:
+            values = []
+            for _ in range(5):
+                for start in starts:
+                    t0 = time.perf_counter()
+                    neo.scalar(
+                        "MATCH p=(n:Node {id: $id})-[:EDGE*1..2]->(m) RETURN count(p)",
+                        {"id": start},
+                    )
+                    values.append((time.perf_counter() - t0) * 1000)
+            return values
+
         # Validate reachability counts for one start on both engines.
         sample = starts[0]
         nonodb_sample = coll.traverse(
@@ -334,12 +410,48 @@ def main() -> int:
         )
         assert len(nonodb_ids) - 1 == neo4j_count, (len(nonodb_ids) - 1, neo4j_count)
 
+        all_sample = coll.all_shortest_paths(
+            pairs[0][0],
+            pairs[0][1],
+            max_depth=6,
+            limit_paths=100,
+            projection={"_id": 1},
+        )
+        neo4j_all_count = neo.scalar(
+            "MATCH (a:Node {id: $a}), (b:Node {id: $b}) "
+            "MATCH p=allShortestPaths((a)-[:EDGE*..6]->(b)) RETURN count(p)",
+            {"a": pairs[0][0], "b": pairs[0][1]},
+        )
+        assert all_sample["path_count"] == neo4j_all_count, (
+            all_sample["path_count"],
+            neo4j_all_count,
+        )
+
+        match_sample = coll.graph_match(
+            sample,
+            [{"direction": "out", "min_hops": 1, "max_hops": 2}],
+            limit=1000,
+            projection={"_id": 1},
+        )
+        neo4j_match_count = neo.scalar(
+            "MATCH p=(n:Node {id: $id})-[:EDGE*1..2]->(m) RETURN count(p)",
+            {"id": sample},
+        )
+        assert match_sample["matches"] == neo4j_match_count, (
+            match_sample["matches"],
+            neo4j_match_count,
+        )
+
         depth1_nonodb = stats(time_nonodb_traverse(1))
         depth1_neo4j = stats(time_neo4j_traverse(1))
         depth3_nonodb = stats(time_nonodb_traverse(3))
         depth3_neo4j = stats(time_neo4j_traverse(3))
         shortest_nonodb = stats(time_nonodb_shortest())
         shortest_neo4j = stats(time_neo4j_shortest())
+        all_shortest_nonodb = stats(time_nonodb_all_shortest())
+        all_shortest_neo4j = stats(time_neo4j_all_shortest())
+        match_nonodb = stats(time_nonodb_match())
+        match_neo4j = stats(time_neo4j_match())
         print(
             json.dumps(
                 {
@@ -355,6 +467,14 @@ def main() -> int:
                     "shortest_path_hops": {
                         "nonodb": shortest_nonodb,
                         "neo4j": shortest_neo4j,
+                    },
+                    "all_shortest_paths_hops": {
+                        "nonodb": all_shortest_nonodb,
+                        "neo4j": all_shortest_neo4j,
+                    },
+                    "graph_match_depth2": {
+                        "nonodb": match_nonodb,
+                        "neo4j": match_neo4j,
                     },
                     "notes": [
                         "End-to-end request latency after warmup, one machine.",

@@ -3595,6 +3595,39 @@ async fn exec_inner(
             read_result(joined).await
         }
 
+        Request::AllShortestPaths { coll, options } => {
+            let store = state.store.clone();
+            let auth = vault_auth.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                let c = read_collection(&store, &coll, auth.as_ref())?;
+                reject_vault_read(&c, auth.as_ref(), "graph traversal")?;
+                c.graph_all_shortest_paths(options).map_err(ApiError::from)
+            });
+            read_result(joined).await
+        }
+
+        Request::GraphMatch { coll, options } => {
+            let store = state.store.clone();
+            let auth = vault_auth.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                let c = read_collection(&store, &coll, auth.as_ref())?;
+                reject_vault_read(&c, auth.as_ref(), "graph traversal")?;
+                c.graph_match(options).map_err(ApiError::from)
+            });
+            read_result(joined).await
+        }
+
+        Request::GraphAlgorithm { coll, options } => {
+            let store = state.store.clone();
+            let auth = vault_auth.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                let c = read_collection(&store, &coll, auth.as_ref())?;
+                reject_vault_read(&c, auth.as_ref(), "graph traversal")?;
+                c.graph_algorithm(options).map_err(ApiError::from)
+            });
+            read_result(joined).await
+        }
+
         Request::HybridSearch { coll, options } => {
             let store = state.store.clone();
             let auth = vault_auth.clone();
@@ -4777,6 +4810,9 @@ fn authorize_graph_edges(
         Request::GetGraph { coll }
         | Request::Traverse { coll, .. }
         | Request::ShortestPath { coll, .. }
+        | Request::AllShortestPaths { coll, .. }
+        | Request::GraphMatch { coll, .. }
+        | Request::GraphAlgorithm { coll, .. }
         | Request::Neighbors { coll, .. }
         | Request::HybridSearch { coll, .. } => coll,
         _ => return Ok(()),

@@ -4,7 +4,8 @@ use serde::{ser::SerializeMap, Deserialize, Serialize, Serializer};
 use serde_json::{value::RawValue, Value};
 
 use nonodb_core::graph::{
-    GraphDef, HybridOptions, NeighborsOptions, ShortestPathOptions, TraverseOptions,
+    AllShortestPathsOptions, GraphAlgorithmOptions, GraphDef, GraphMatchOptions, HybridOptions,
+    NeighborsOptions, ShortestPathOptions, TraverseOptions,
 };
 use nonodb_core::{CollectionProfile, IndexSpec, SearchAllRequest, VaultKey, VectorMetric};
 
@@ -481,6 +482,24 @@ pub enum Request {
         coll: String,
         #[serde(flatten)]
         options: ShortestPathOptions,
+    },
+    /// Every shortest path between two nodes.
+    AllShortestPaths {
+        coll: String,
+        #[serde(flatten)]
+        options: AllShortestPathsOptions,
+    },
+    /// Linear variable-length graph pattern matching.
+    GraphMatch {
+        coll: String,
+        #[serde(flatten)]
+        options: GraphMatchOptions,
+    },
+    /// Read-only graph algorithm (PageRank, degree, components).
+    GraphAlgorithm {
+        coll: String,
+        #[serde(flatten)]
+        options: GraphAlgorithmOptions,
     },
     /// One-hop neighbors of a node with graph filters.
     Neighbors {
@@ -1044,6 +1063,9 @@ impl Request {
             Self::GetGraph { .. } => "get_graph",
             Self::Traverse { .. } => "traverse",
             Self::ShortestPath { .. } => "shortest_path",
+            Self::AllShortestPaths { .. } => "all_shortest_paths",
+            Self::GraphMatch { .. } => "graph_match",
+            Self::GraphAlgorithm { .. } => "graph_algorithm",
             Self::Neighbors { .. } => "neighbors",
             Self::HybridSearch { .. } => "hybrid_search",
             Self::SetGraph { .. } => "set_graph",
@@ -1129,6 +1151,9 @@ impl Request {
             | Self::GetGraph { .. }
             | Self::Traverse { .. }
             | Self::ShortestPath { .. }
+            | Self::AllShortestPaths { .. }
+            | Self::GraphMatch { .. }
+            | Self::GraphAlgorithm { .. }
             | Self::Neighbors { .. }
             | Self::HybridSearch { .. }
             | Self::GraphRebuildStatus { .. }
@@ -1193,6 +1218,9 @@ impl Request {
             | Self::GetGraph { coll }
             | Self::Traverse { coll, .. }
             | Self::ShortestPath { coll, .. }
+            | Self::AllShortestPaths { coll, .. }
+            | Self::GraphMatch { coll, .. }
+            | Self::GraphAlgorithm { coll, .. }
             | Self::Neighbors { coll, .. }
             | Self::HybridSearch { coll, .. }
             | Self::DropGraph { coll }

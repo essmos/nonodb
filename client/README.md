@@ -76,6 +76,14 @@ seed = nodes.traverse(
     max_depth=2,
 )
 path = nodes.shortest_path("alice", "carol", weighted=True)
+paths = nodes.all_shortest_paths("alice", "carol", limit_paths=10)
+matches = nodes.graph_match(
+    "alice",
+    [{"direction": "out", "labels": ["KNOWS"], "min_hops": 1, "max_hops": 3}],
+)
+ranked = nodes.pagerank(limit=20)
+degrees = nodes.degree_centrality(limit=20)
+components = nodes.connected_components()
 nodes.reindex_graph()
 nodes.drop_graph()
 ```

@@ -186,6 +186,103 @@ missing, non-numeric, negative, or non-finite weights fail with
 `{"found":false}` means no path exists within the limits. `path` includes the
 full edge document in `via`.
 
+## All shortest paths
+
+```json
+{"op":"all_shortest_paths",
+ "coll":"nodes",
+ "start":"alice",
+ "target":"carol",
+ "direction":"out",
+ "labels":[],
+ "max_depth":8,
+ "limit_paths":100,
+ "limit_nodes":10000,
+ "weighted":false,
+ "include_edges":false}
+```
+
+This returns every shortest path, not just one. Unweighted mode uses BFS and
+reports the hop count in `weight`; `"weighted":true` uses Dijkstra over the
+configured weight field. `limit_paths` caps the number of returned paths and
+`limit_nodes` caps the explored node set. The response contains `found`,
+`paths`, `path_count`, `weight`, and `truncated`:
+
+```json
+{"found":true,
+ "paths":[
+   {"path":[{"node":{"_id":"alice"},"via":{"_id":"e1",...}},
+            {"node":{"_id":"bob"}},
+            {"node":{"_id":"carol"},"via":{"_id":"e2",...}}],
+    "weight":2.0,
+    "hops":2}
+ ],
+ "path_count":1,
+ "weight":2.0,
+ "truncated":false}
+```
+
+## Graph match
+
+```json
+{"op":"graph_match",
+ "coll":"nodes",
+ "start":"alice",
+ "pattern":[
+   {"direction":"out","labels":["KNOWS"],"min_hops":1,"max_hops":3}
+ ],
+ "node_filter":{"status":"active"},
+ "limit":100,
+ "limit_nodes":10000,
+ "limit_edges":10000,
+ "max_depth":8,
+ "include_edges":false}
+```
+
+`graph_match` matches a linear sequence of variable-length relationship
+segments. Each step accepts `direction`, `labels`, `min_hops`, `max_hops`,
+`edge_filter`, and `node_filter`. A path may revisit a node only through a
+different edge; relationship uniqueness is enforced within each path. It returns
+`paths` (`nodes`, `edges`, `hops`), `matches`, and `truncated`. This is a JSON
+DSL, not Cypher: it does not support arbitrary subgraphs, `WHERE` expressions,
+or `RETURN` projections beyond node `projection`.
+
+## Graph algorithms
+
+```json
+{"op":"graph_algorithm",
+ "coll":"nodes",
+ "kind":"pagerank",
+ "direction":"out",
+ "labels":[],
+ "limit":100,
+ "max_nodes":10000,
+ "damping":0.85,
+ "iterations":20,
+ "tolerance":1e-6}
+```
+
+`kind` is `pagerank`, `degree_centrality`, or `connected_components`. All three
+are read-only, use the same `edge_filter`, `node_filter`, `as_of`, and `labels`
+options as traversal, and are bounded by `limit` and `max_nodes`.
+
+- `pagerank` returns `items` sorted by `score` descending, plus `iterations` and
+  `converged`.
+- `degree_centrality` returns `items` with `in`, `out`, and `total` degree.
+- `connected_components` returns weakly connected `components` with `id`, `size`,
+  and `nodes`.
+
+```json
+{"ok":true,"result":{
+  "kind":"pagerank",
+  "items":[{"id":"alice","score":0.31},{"id":"bob","score":0.22}],
+  "nodes":2,
+  "iterations":7,
+  "converged":true,
+  "truncated":false
+}}
+```
+
 ## Neighbors
 
 ```json
@@ -285,8 +382,9 @@ direction; edge documents are still stored once.
 
 ## Security and limits
 
-- `get_graph`, `traverse`, `shortest_path`, `neighbors`, and `hybrid_search`
-  require a read scope on the node collection **and** the edge collection.
+- `get_graph`, `traverse`, `shortest_path`, `all_shortest_paths`, `graph_match`,
+  `graph_algorithm`, `neighbors`, and `hybrid_search` require a read scope on the
+  node collection **and** the edge collection.
 - `set_graph` requires collection-admin scope on both the node and edge
   collections. `drop_graph` and `reindex_graph` require admin scope on the node
   collection.
@@ -302,6 +400,9 @@ direction; edge documents are still stored once.
 | default `limit_edges` | 10,000 |
 | default `max_bytes` | 64 MiB |
 | vector seed `k` | 1–1,000 |
+| `all_shortest_paths` `limit_paths` | 1–1,000 |
+| graph algorithm `iterations` | 1–100 |
+| graph algorithm `max_nodes` | 1–100,000 |
 
 Reaching a node, edge, or byte limit returns the partial result with
 `"truncated":true`; it is not an error.
@@ -326,13 +427,18 @@ interactive.
 ## Benchmarks
 
 See [Graph benchmark](graph-benchmark.md) for the NonoDB vs Neo4j Community
-methodology and results. It covers ingest, BFS depth 1/3, and shortest paths on a
-small deterministic graph; it is not a replication benchmark.
+methodology and results. It covers ingest, BFS depth 1/3, shortest paths,
+`allShortestPaths`, and variable-length pattern matching on a small deterministic
+graph. It is not a replication benchmark, and Neo4j Community without GDS does
+not provide a directly comparable PageRank/component implementation.
 
 ## Limitations
 
 - HTTP/JSON only; no MongoDB wire graph operations.
-- BFS, DFS, and Dijkstra only. No A*, PageRank, all-paths, or subgraph matching.
+- BFS/DFS, Dijkstra, all-shortest paths, linear variable-length pattern matching,
+  PageRank, degree centrality, and weakly connected components are supported.
+  There is no full Cypher, A*, arbitrary subgraph matching, GDS, or graph
+  projections.
 - No cross-database traversal and no edges that reference another database.
 - One graph definition per node collection.
 - Graph operations are read-only except for configuration and adjacency

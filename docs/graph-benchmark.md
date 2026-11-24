@@ -48,10 +48,13 @@ request-path overhead.
 | Traverse depth 1 | `traverse(start, max_depth=1, projection={"_id":1})` | single-hop pattern, `count(DISTINCT m.id)` |
 | Traverse depth 3 | `traverse(start, max_depth=3, projection={"_id":1})` | variable-length pattern `*1..3`, `count(DISTINCT m.id)` |
 | Shortest path | BFS by hops, `max_depth=6`, projected nodes | `shortestPath()` with `*..6`, returns path length |
+| All shortest paths | `all_shortest_paths(..., limit_paths=10)` | `allShortestPaths()` with `*..6`, returns path count |
+| Pattern match depth 2 | `graph_match` with `min_hops=1`, `max_hops=2` | `MATCH p=...*1..2` returns path count |
 
-The benchmark validates reachability for one sample root against both engines
-before reporting timings. It does not compare weighted shortest paths, filtered
-traversals, hybrid vector search, or concurrent clients.
+The benchmark validates reachability, all-shortest-path counts, and pattern-match
+counts for one sample against both engines before reporting timings. It does not
+compare weighted shortest paths, filtered traversals, hybrid vector search, graph
+algorithms (Neo4j Community has no built-in GDS), or concurrent clients.
 
 ## Results
 
@@ -60,19 +63,23 @@ request time in milliseconds; smaller is better.
 
 | Metric | NonoDB | Neo4j Community | NonoDB advantage |
 |---|---:|---:|---:|
-| Ingest nodes + edges | **166 ms** (~48k edges/s) | 2,323 ms (~3.4k edges/s) | **~14.0×** |
-| Traverse depth 1 p50 / p95 | **0.75 / 1.36 ms** | 8.64 / 13.21 ms | **~11.6×** p50 |
-| Traverse depth 3 p50 / p95 | **1.32 / 2.34 ms** | 8.21 / 11.96 ms | **~6.2×** p50 |
-| Shortest path by hops p50 / p95 | **0.80 / 1.52 ms** | 6.15 / 12.72 ms | **~7.6×** p50 |
+| Ingest nodes + edges | **149 ms** (~54k edges/s) | 2,214 ms (~3.6k edges/s) | **~14.8×** |
+| Traverse depth 1 p50 / p95 | **0.62 / 0.86 ms** | 7.29 / 12.35 ms | **~11.8×** p50 |
+| Traverse depth 3 p50 / p95 | **1.32 / 2.22 ms** | 6.62 / 10.02 ms | **~5.0×** p50 |
+| Shortest path by hops p50 / p95 | **0.70 / 1.60 ms** | 6.94 / 12.62 ms | **~9.9×** p50 |
+| All shortest paths p50 / p95 | **0.72 / 1.23 ms** | 5.59 / 9.27 ms | **~7.8×** p50 |
+| Pattern match depth 2 p50 / p95 | **0.92 / 1.60 ms** | 4.55 / 7.60 ms | **~5.0×** p50 |
 
 Observed run-to-run range:
 
 | Metric | NonoDB p50 | Neo4j p50 |
 |---|---:|---:|
-| Traverse depth 1 | 0.73–0.76 ms | 7.76–9.03 ms |
-| Traverse depth 3 | 1.24–1.54 ms | 7.31–11.00 ms |
-| Shortest path | 0.78–0.81 ms | 5.93–8.62 ms |
-| Ingest | 154–168 ms | 2,207–2,426 ms |
+| Traverse depth 1 | 0.60–0.63 ms | 6.60–7.95 ms |
+| Traverse depth 3 | 1.30–1.41 ms | 6.61–7.48 ms |
+| Shortest path | 0.68–0.83 ms | 5.73–7.62 ms |
+| All shortest paths | 0.65–0.72 ms | 5.26–5.89 ms |
+| Pattern match depth 2 | 0.91–1.01 ms | 4.19–4.67 ms |
+| Ingest | 143–163 ms | 2,125–2,241 ms |
 
 ## How to read the numbers
 
@@ -82,6 +89,14 @@ Observed run-to-run range:
 - **Response work differs.** NonoDB materialized projected node documents;
   Neo4j returned only a count or path length. The NonoDB side did more response
   work, so the gap is not explained by NonoDB returning less data.
+- **Pattern semantics are close, not identical.** NonoDB `graph_match` uses a
+  linear JSON pattern with relationship uniqueness. Neo4j `MATCH p=...*1..2`
+  uses Cypher path semantics. Validation checks the sample counts, but this is
+  not a test of full Cypher pattern expressiveness.
+- **Graph algorithms are not benchmarked against Neo4j.** PageRank, degree
+  centrality, and connected components are implemented in NonoDB, but Neo4j
+  Community has no built-in GDS equivalent without installing a plugin. There is
+  no apples-to-apples latency row for those operations.
 - **The graph is small.** On a larger-than-RAM graph, storage and page-cache
   behavior would matter more. The relative gap may narrow or widen depending on
   graph shape and indexes.

@@ -412,10 +412,12 @@ Full dataset, methodology, caveats, and reproduction steps:
 
 | Metric | NonoDB | Neo4j 5 Community | NonoDB advantage |
 |---|---:|---:|---:|
-| Ingest nodes + edges | **166 ms** (~48k edges/s) | 2,323 ms (~3.4k edges/s) | ~14.0× |
-| Traverse depth 1, p50 / p95 | **0.75 / 1.36 ms** | 8.64 / 13.21 ms | ~11.6× p50 |
-| Traverse depth 3, p50 / p95 | **1.32 / 2.34 ms** | 8.21 / 11.96 ms | ~6.2× p50 |
-| Shortest path by hops, p50 / p95 | **0.80 / 1.52 ms** | 6.15 / 12.72 ms | ~7.6× p50 |
+| Ingest nodes + edges | **149 ms** (~54k edges/s) | 2,214 ms (~3.6k edges/s) | ~14.8× |
+| Traverse depth 1, p50 / p95 | **0.62 / 0.86 ms** | 7.29 / 12.35 ms | ~11.8× p50 |
+| Traverse depth 3, p50 / p95 | **1.32 / 2.22 ms** | 6.62 / 10.02 ms | ~5.0× p50 |
+| Shortest path by hops, p50 / p95 | **0.70 / 1.60 ms** | 6.94 / 12.62 ms | ~9.9× p50 |
+| All shortest paths, p50 / p95 | **0.72 / 1.23 ms** | 5.59 / 9.27 ms | ~7.8× p50 |
+| Pattern match depth 2, p50 / p95 | **0.92 / 1.60 ms** | 4.55 / 7.60 ms | ~5.0× p50 |
 
 Key caveats: NonoDB used a Unix socket while Neo4j used HTTP/Cypher; Neo4j
 returned only counts/IDs while NonoDB materialized projected documents; the graph

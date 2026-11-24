@@ -425,6 +425,251 @@ impl HybridOptions {
     }
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AllShortestPathsOptions {
+    pub start: Value,
+    pub target: Value,
+    #[serde(default)]
+    pub direction: GraphDirection,
+    #[serde(default)]
+    pub labels: Vec<String>,
+    #[serde(default)]
+    pub edge_filter: Option<Value>,
+    #[serde(default)]
+    pub node_filter: Option<Value>,
+    #[serde(default)]
+    pub as_of: Option<Value>,
+    #[serde(default = "default_shortest_depth")]
+    pub max_depth: usize,
+    #[serde(default = "default_all_paths")]
+    pub limit_paths: usize,
+    #[serde(default = "default_algo_nodes")]
+    pub limit_nodes: usize,
+    #[serde(default)]
+    pub weighted: bool,
+    #[serde(default)]
+    pub include_edges: bool,
+    #[serde(default)]
+    pub projection: Option<Value>,
+}
+
+fn default_shortest_depth() -> usize {
+    8
+}
+fn default_all_paths() -> usize {
+    100
+}
+fn default_algo_nodes() -> usize {
+    10_000
+}
+
+impl AllShortestPathsOptions {
+    pub fn validate(&self) -> Result<()> {
+        if self.max_depth > MAX_GRAPH_DEPTH {
+            return Err(Error::Query(format!(
+                "all_shortest_paths `max_depth` must be at most {MAX_GRAPH_DEPTH}"
+            )));
+        }
+        if self.limit_paths == 0 || self.limit_paths > 1000 {
+            return Err(Error::Query(
+                "all_shortest_paths `limit_paths` must be between 1 and 1000".into(),
+            ));
+        }
+        if self.limit_nodes == 0 || self.limit_nodes > 100_000 {
+            return Err(Error::Query(
+                "all_shortest_paths `limit_nodes` must be between 1 and 100000".into(),
+            ));
+        }
+        if let Some(filter) = &self.edge_filter {
+            validate_filter(filter)?;
+        }
+        if let Some(filter) = &self.node_filter {
+            validate_filter(filter)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MatchStep {
+    #[serde(default)]
+    pub direction: GraphDirection,
+    #[serde(default)]
+    pub labels: Vec<String>,
+    #[serde(default = "default_one")]
+    pub min_hops: usize,
+    #[serde(default = "default_one")]
+    pub max_hops: usize,
+    #[serde(default)]
+    pub edge_filter: Option<Value>,
+    #[serde(default)]
+    pub node_filter: Option<Value>,
+}
+
+fn default_one() -> usize {
+    1
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct GraphMatchOptions {
+    pub start: Value,
+    pub pattern: Vec<MatchStep>,
+    #[serde(default)]
+    pub node_filter: Option<Value>,
+    #[serde(default)]
+    pub as_of: Option<Value>,
+    #[serde(default)]
+    pub projection: Option<Value>,
+    #[serde(default)]
+    pub include_edges: bool,
+    #[serde(default = "default_match_limit")]
+    pub limit: usize,
+    #[serde(default = "default_algo_nodes")]
+    pub limit_nodes: usize,
+    #[serde(default = "default_edges")]
+    pub limit_edges: usize,
+    #[serde(default = "default_shortest_depth")]
+    pub max_depth: usize,
+}
+
+fn default_match_limit() -> usize {
+    100
+}
+
+impl GraphMatchOptions {
+    pub fn validate(&self) -> Result<()> {
+        if self.pattern.len() > 16 {
+            return Err(Error::Query(
+                "graph_match supports at most 16 pattern steps".into(),
+            ));
+        }
+        if self.max_depth > MAX_GRAPH_DEPTH {
+            return Err(Error::Query(format!(
+                "graph_match `max_depth` must be at most {MAX_GRAPH_DEPTH}"
+            )));
+        }
+        if self.limit == 0 || self.limit > 1000 {
+            return Err(Error::Query(
+                "graph_match `limit` must be between 1 and 1000".into(),
+            ));
+        }
+        if self.limit_nodes == 0 || self.limit_nodes > 100_000 {
+            return Err(Error::Query(
+                "graph_match `limit_nodes` must be between 1 and 100000".into(),
+            ));
+        }
+        if self.limit_edges == 0 || self.limit_edges > 100_000 {
+            return Err(Error::Query(
+                "graph_match `limit_edges` must be between 1 and 100000".into(),
+            ));
+        }
+        for step in &self.pattern {
+            if step.min_hops > step.max_hops {
+                return Err(Error::Query(
+                    "graph_match step `min_hops` must not exceed `max_hops`".into(),
+                ));
+            }
+            if step.max_hops > MAX_GRAPH_DEPTH {
+                return Err(Error::Query(format!(
+                    "graph_match step `max_hops` must be at most {MAX_GRAPH_DEPTH}"
+                )));
+            }
+            if let Some(filter) = &step.edge_filter {
+                validate_filter(filter)?;
+            }
+            if let Some(filter) = &step.node_filter {
+                validate_filter(filter)?;
+            }
+        }
+        if let Some(filter) = &self.node_filter {
+            validate_filter(filter)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphAlgorithmKind {
+    Pagerank,
+    DegreeCentrality,
+    ConnectedComponents,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct GraphAlgorithmOptions {
+    pub kind: GraphAlgorithmKind,
+    #[serde(default)]
+    pub direction: GraphDirection,
+    #[serde(default)]
+    pub labels: Vec<String>,
+    #[serde(default)]
+    pub edge_filter: Option<Value>,
+    #[serde(default)]
+    pub node_filter: Option<Value>,
+    #[serde(default)]
+    pub as_of: Option<Value>,
+    #[serde(default = "default_match_limit")]
+    pub limit: usize,
+    #[serde(default = "default_algo_nodes")]
+    pub max_nodes: usize,
+    #[serde(default = "default_damping")]
+    pub damping: f64,
+    #[serde(default = "default_iterations")]
+    pub iterations: usize,
+    #[serde(default = "default_tolerance")]
+    pub tolerance: f64,
+    #[serde(default)]
+    pub projection: Option<Value>,
+}
+
+fn default_damping() -> f64 {
+    0.85
+}
+fn default_iterations() -> usize {
+    20
+}
+fn default_tolerance() -> f64 {
+    1e-6
+}
+
+impl GraphAlgorithmOptions {
+    pub fn validate(&self) -> Result<()> {
+        if self.limit == 0 || self.limit > DEFAULT_GRAPH_NODES {
+            return Err(Error::Query(format!(
+                "graph algorithm `limit` must be between 1 and {DEFAULT_GRAPH_NODES}"
+            )));
+        }
+        if self.max_nodes == 0 || self.max_nodes > 100_000 {
+            return Err(Error::Query(
+                "graph algorithm `max_nodes` must be between 1 and 100000".into(),
+            ));
+        }
+        if !self.damping.is_finite() || !(0.0..1.0).contains(&self.damping) {
+            return Err(Error::Query(
+                "graph algorithm `damping` must be in [0, 1)".into(),
+            ));
+        }
+        if self.iterations == 0 || self.iterations > 100 {
+            return Err(Error::Query(
+                "graph algorithm `iterations` must be between 1 and 100".into(),
+            ));
+        }
+        if !self.tolerance.is_finite() || self.tolerance <= 0.0 {
+            return Err(Error::Query(
+                "graph algorithm `tolerance` must be positive".into(),
+            ));
+        }
+        if let Some(filter) = &self.edge_filter {
+            validate_filter(filter)?;
+        }
+        if let Some(filter) = &self.node_filter {
+            validate_filter(filter)?;
+        }
+        Ok(())
+    }
+}
+
 /// One adjacency entry returned by a [`GraphView`].
 #[derive(Debug, Clone)]
 pub struct AdjEdge {
@@ -445,6 +690,11 @@ pub trait GraphView {
         direction: GraphDirection,
         labels: &[String],
     ) -> Result<Vec<AdjEdge>>;
+
+    /// All node ids in the node collection. Used by graph algorithms.
+    fn node_ids(&self) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
 }
 
 pub const REBUILD_PREFIX: &str = "graph_rebuild:";
@@ -1263,6 +1513,341 @@ pub fn shortest_path(view: &dyn GraphView, options: &ShortestPathOptions) -> Res
     Ok(json!({"found": false}))
 }
 
+fn all_paths_result(
+    view: &dyn GraphView,
+    start: &str,
+    steps: &[AdjEdge],
+    weight: f64,
+    projection: Option<&Value>,
+    include_edges: bool,
+) -> Result<Value> {
+    let mut ids = Vec::with_capacity(steps.len() + 1);
+    ids.push(start.to_string());
+    ids.extend(steps.iter().map(|edge| edge.target.clone()));
+    let mut path = Vec::with_capacity(ids.len());
+    for (index, id) in ids.iter().enumerate() {
+        let node = view
+            .node(id)?
+            .unwrap_or_else(|| json!({"_id": id, "missing": true}));
+        let node = project_node(node, projection)?;
+        let mut item = json!({"node": node});
+        if let Some(edge) = steps.get(index) {
+            item["via"] = via_value(view, edge, include_edges)?;
+        }
+        path.push(item);
+    }
+    Ok(json!({
+        "path": path,
+        "weight": weight,
+        "hops": steps.len(),
+    }))
+}
+
+fn collect_shortest_steps(
+    target: &str,
+    start: &str,
+    preds: &HashMap<String, Vec<(String, AdjEdge)>>,
+    limit: usize,
+) -> (Vec<Vec<AdjEdge>>, bool) {
+    #[allow(clippy::too_many_arguments)]
+    fn walk(
+        current: &str,
+        start: &str,
+        preds: &HashMap<String, Vec<(String, AdjEdge)>>,
+        steps: &mut Vec<AdjEdge>,
+        visited: &mut HashSet<String>,
+        out: &mut Vec<Vec<AdjEdge>>,
+        limit: usize,
+        truncated: &mut bool,
+    ) {
+        if out.len() >= limit {
+            *truncated = true;
+            return;
+        }
+        if current == start {
+            let mut ordered = steps.clone();
+            ordered.reverse();
+            out.push(ordered);
+            return;
+        }
+        if !visited.insert(current.to_string()) {
+            return;
+        }
+        if let Some(parents) = preds.get(current) {
+            for (parent, edge) in parents {
+                if out.len() >= limit {
+                    *truncated = true;
+                    break;
+                }
+                steps.push(edge.clone());
+                walk(parent, start, preds, steps, visited, out, limit, truncated);
+                steps.pop();
+            }
+        }
+        visited.remove(current);
+    }
+
+    let mut out = Vec::new();
+    let mut steps = Vec::new();
+    let mut visited = HashSet::new();
+    let mut truncated = false;
+    walk(
+        target,
+        start,
+        preds,
+        &mut steps,
+        &mut visited,
+        &mut out,
+        limit,
+        &mut truncated,
+    );
+    (out, truncated)
+}
+
+/// Returns every shortest path between two nodes. Unweighted mode uses BFS and
+/// reports hop distance; weighted mode uses Dijkstra and requires numeric edge
+/// weights. The result is capped by `limit_paths` and `limit_nodes`.
+pub fn all_shortest_paths(
+    view: &dyn GraphView,
+    options: &AllShortestPathsOptions,
+) -> Result<Value> {
+    options.validate()?;
+    let as_of = as_of_ms(options.as_of.as_ref())?;
+    let start = node_key(&options.start)?;
+    let target = node_key(&options.target)?;
+    if active_filter(&options.node_filter) {
+        match view.node(&start)? {
+            Some(node) if node_matches(&node, &options.node_filter) => {}
+            _ => {
+                return Ok(json!({
+                    "found": false,
+                    "paths": [],
+                    "path_count": 0,
+                    "truncated": false,
+                }))
+            }
+        }
+    }
+    if start == target {
+        let one = all_paths_result(
+            view,
+            &start,
+            &[],
+            0.0,
+            options.projection.as_ref(),
+            options.include_edges,
+        )?;
+        return Ok(json!({
+            "found": true,
+            "paths": [one],
+            "path_count": 1,
+            "truncated": false,
+        }));
+    }
+
+    let mut preds: HashMap<String, Vec<(String, AdjEdge)>> = HashMap::new();
+    let mut truncated = false;
+    let path_weight = if !options.weighted {
+        let mut dist: HashMap<String, usize> = HashMap::new();
+        let mut queue: VecDeque<(String, usize)> = VecDeque::new();
+        dist.insert(start.clone(), 0);
+        queue.push_back((start.clone(), 0));
+        let mut target_depth: Option<usize> = None;
+        while let Some((current, depth)) = queue.pop_front() {
+            if depth >= options.max_depth {
+                continue;
+            }
+            if target_depth.is_some_and(|target_depth| depth >= target_depth) {
+                continue;
+            }
+            for edge in view.neighbors(&current, options.direction, &options.labels)? {
+                if !edge_in_window(&edge, as_of)
+                    || !edge_matches(view, &edge, &options.edge_filter)?
+                {
+                    continue;
+                }
+                let next_depth = depth + 1;
+                if next_depth > options.max_depth
+                    || target_depth.is_some_and(|target_depth| next_depth > target_depth)
+                {
+                    continue;
+                }
+                match view.node(&edge.target)? {
+                    Some(node) if node_matches(&node, &options.node_filter) => {}
+                    _ => continue,
+                }
+                let known = dist.get(&edge.target).copied();
+                match known {
+                    None => {
+                        if dist.len() >= options.limit_nodes {
+                            truncated = true;
+                            continue;
+                        }
+                        dist.insert(edge.target.clone(), next_depth);
+                        preds
+                            .entry(edge.target.clone())
+                            .or_default()
+                            .push((current.clone(), edge.clone()));
+                        queue.push_back((edge.target.clone(), next_depth));
+                    }
+                    Some(known) if known == next_depth => {
+                        preds
+                            .entry(edge.target.clone())
+                            .or_default()
+                            .push((current.clone(), edge.clone()));
+                    }
+                    Some(_) => continue,
+                }
+                if edge.target == target {
+                    target_depth = Some(next_depth);
+                }
+            }
+        }
+        if !dist.contains_key(&target) {
+            return Ok(json!({
+                "found": false,
+                "paths": [],
+                "path_count": 0,
+                "truncated": truncated,
+            }));
+        }
+        dist[&target] as f64
+    } else {
+        let mut best: HashMap<String, f64> = HashMap::new();
+        let mut heap = BinaryHeap::new();
+        let mut settled: HashSet<String> = HashSet::new();
+        best.insert(start.clone(), 0.0);
+        heap.push(QueueEntry {
+            distance: 0.0,
+            hops: 0,
+            id: start.clone(),
+        });
+        let mut popped = 0usize;
+        while let Some(entry) = heap.pop() {
+            if settled.contains(&entry.id) {
+                continue;
+            }
+            if entry
+                .distance
+                .partial_cmp(best.get(&entry.id).unwrap_or(&f64::INFINITY))
+                != Some(Ordering::Equal)
+            {
+                continue;
+            }
+            if let Some(target_best) = best.get(&target).copied() {
+                if entry.distance > target_best {
+                    break;
+                }
+            }
+            settled.insert(entry.id.clone());
+            popped += 1;
+            if popped > options.limit_nodes {
+                truncated = true;
+                break;
+            }
+            if entry.id == target {
+                continue;
+            }
+            if entry.hops >= options.max_depth {
+                continue;
+            }
+            for edge in view.neighbors(&entry.id, options.direction, &options.labels)? {
+                if !edge_in_window(&edge, as_of)
+                    || !edge_matches(view, &edge, &options.edge_filter)?
+                {
+                    continue;
+                }
+                match view.node(&edge.target)? {
+                    Some(node) if node_matches(&node, &options.node_filter) => {}
+                    _ => continue,
+                }
+                let weight = edge.weight.ok_or_else(|| {
+                    Error::Query(format!("edge `{}` has no numeric weight", edge.edge_id))
+                })?;
+                if !weight.is_finite() || weight < 0.0 {
+                    return Err(Error::Query(format!(
+                        "edge `{}` has invalid weight",
+                        edge.edge_id
+                    )));
+                }
+                let distance = entry.distance + weight;
+                if let Some(target_best) = best.get(&target).copied() {
+                    if distance > target_best {
+                        continue;
+                    }
+                }
+                match best.get(&edge.target).copied() {
+                    None => {
+                        best.insert(edge.target.clone(), distance);
+                        preds
+                            .entry(edge.target.clone())
+                            .or_default()
+                            .push((entry.id.clone(), edge.clone()));
+                        heap.push(QueueEntry {
+                            distance,
+                            hops: entry.hops + 1,
+                            id: edge.target.clone(),
+                        });
+                    }
+                    Some(known) if distance < known => {
+                        best.insert(edge.target.clone(), distance);
+                        preds
+                            .entry(edge.target.clone())
+                            .or_default()
+                            .retain(|_| false);
+                        preds
+                            .entry(edge.target.clone())
+                            .or_default()
+                            .push((entry.id.clone(), edge.clone()));
+                        heap.push(QueueEntry {
+                            distance,
+                            hops: entry.hops + 1,
+                            id: edge.target.clone(),
+                        });
+                    }
+                    Some(known) if distance == known => {
+                        preds
+                            .entry(edge.target.clone())
+                            .or_default()
+                            .push((entry.id.clone(), edge.clone()));
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+        let Some(weight) = best.get(&target).copied() else {
+            return Ok(json!({
+                "found": false,
+                "paths": [],
+                "path_count": 0,
+                "truncated": truncated,
+            }));
+        };
+        weight
+    };
+
+    let (all_steps, paths_truncated) =
+        collect_shortest_steps(&target, &start, &preds, options.limit_paths);
+    let mut paths = Vec::with_capacity(all_steps.len());
+    for steps in all_steps {
+        paths.push(all_paths_result(
+            view,
+            &start,
+            &steps,
+            path_weight,
+            options.projection.as_ref(),
+            options.include_edges,
+        )?);
+    }
+    Ok(json!({
+        "found": true,
+        "paths": paths,
+        "path_count": paths.len(),
+        "weight": path_weight,
+        "truncated": truncated || paths_truncated,
+    }))
+}
+
 /// Returns the immediate neighbors of a node with the same filtering rules as
 /// `traverse`, without materializing a traversal tree.
 pub fn neighbors(view: &dyn GraphView, options: &NeighborsOptions) -> Result<Value> {
@@ -1375,6 +1960,152 @@ fn vector_score(query: &[f32], node: &Value, field: &str, metric: VectorMetric) 
 /// `[0, 1]` using the index metric and a graph proximity score
 /// `1 / (1 + depth)`. The final score is a normalized weighted sum, with
 /// deterministic `_id` tie-breaking.
+struct MatchState<'a> {
+    view: &'a dyn GraphView,
+    options: &'a GraphMatchOptions,
+    as_of: Option<i64>,
+    chain: Vec<(String, Option<AdjEdge>)>,
+    used_edges: HashSet<String>,
+    paths: Vec<Value>,
+    truncated: bool,
+    edges: usize,
+    expansions: usize,
+}
+
+impl MatchState<'_> {
+    fn walk_step(&mut self, step_index: usize) -> Result<()> {
+        if self.expansions >= self.options.limit_nodes {
+            self.truncated = true;
+            return Ok(());
+        }
+        self.expansions += 1;
+        if step_index == self.options.pattern.len() {
+            return self.emit();
+        }
+        self.expand(step_index, 0)
+    }
+
+    fn expand(&mut self, step_index: usize, hops: usize) -> Result<()> {
+        if self.paths.len() >= self.options.limit {
+            self.truncated = true;
+            return Ok(());
+        }
+        let step = self.options.pattern[step_index].clone();
+        if hops >= step.min_hops {
+            self.walk_step(step_index + 1)?;
+            if self.paths.len() >= self.options.limit {
+                self.truncated = true;
+                return Ok(());
+            }
+        }
+        if hops >= step.max_hops || self.chain.len().saturating_sub(1) >= self.options.max_depth {
+            return Ok(());
+        }
+        let current = self
+            .chain
+            .last()
+            .map(|(id, _)| id.clone())
+            .unwrap_or_default();
+        for edge in self
+            .view
+            .neighbors(&current, step.direction, &step.labels)?
+        {
+            if self.edges >= self.options.limit_edges {
+                self.truncated = true;
+                return Ok(());
+            }
+            self.edges += 1;
+            if !edge_in_window(&edge, self.as_of)
+                || !edge_matches(self.view, &edge, &step.edge_filter)?
+            {
+                continue;
+            }
+            if self.used_edges.contains(&edge.edge_id) {
+                continue;
+            }
+            let Some(node) = self.view.node(&edge.target)? else {
+                continue;
+            };
+            if !node_matches(&node, &step.node_filter) {
+                continue;
+            }
+            self.used_edges.insert(edge.edge_id.clone());
+            self.chain.push((edge.target.clone(), Some(edge.clone())));
+            self.expand(step_index, hops + 1)?;
+            self.chain.pop();
+            self.used_edges.remove(&edge.edge_id);
+            if self.paths.len() >= self.options.limit {
+                self.truncated = true;
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
+    fn emit(&mut self) -> Result<()> {
+        if self.paths.len() >= self.options.limit {
+            self.truncated = true;
+            return Ok(());
+        }
+        let mut nodes = Vec::with_capacity(self.chain.len());
+        let mut edges = Vec::with_capacity(self.chain.len().saturating_sub(1));
+        for (id, edge) in &self.chain {
+            let node = self
+                .view
+                .node(id)?
+                .unwrap_or_else(|| json!({"_id": id, "missing": true}));
+            nodes.push(project_node(node, self.options.projection.as_ref())?);
+            if let Some(edge) = edge {
+                edges.push(via_value(self.view, edge, self.options.include_edges)?);
+            }
+        }
+        self.paths.push(json!({
+            "nodes": nodes,
+            "edges": edges,
+            "hops": self.chain.len().saturating_sub(1),
+        }));
+        Ok(())
+    }
+}
+
+/// Matches a linear graph pattern starting at one node. Each pattern step is a
+/// variable-length relationship segment with its own direction, labels, and
+/// optional node/edge filters. Relationship uniqueness is enforced per path.
+pub fn graph_match(view: &dyn GraphView, options: &GraphMatchOptions) -> Result<Value> {
+    options.validate()?;
+    let as_of = as_of_ms(options.as_of.as_ref())?;
+    let start = node_key(&options.start)?;
+    if active_filter(&options.node_filter) {
+        match view.node(&start)? {
+            Some(node) if node_matches(&node, &options.node_filter) => {}
+            _ => {
+                return Ok(json!({
+                    "paths": [],
+                    "matches": 0,
+                    "truncated": false,
+                }))
+            }
+        }
+    }
+    let mut state = MatchState {
+        view,
+        options,
+        as_of,
+        chain: vec![(start, None)],
+        used_edges: HashSet::new(),
+        paths: Vec::new(),
+        truncated: false,
+        edges: 0,
+        expansions: 0,
+    };
+    state.walk_step(0)?;
+    Ok(json!({
+        "paths": state.paths,
+        "matches": state.paths.len(),
+        "truncated": state.truncated,
+    }))
+}
+
 pub fn hybrid(
     view: &dyn GraphView,
     options: &HybridOptions,
@@ -1487,6 +2218,265 @@ pub fn hybrid(
     }))
 }
 
+fn algorithm_nodes(
+    view: &dyn GraphView,
+    options: &GraphAlgorithmOptions,
+) -> Result<(Vec<String>, bool)> {
+    let mut ids = view.node_ids()?;
+    ids.sort();
+    ids.dedup();
+    let mut kept = Vec::new();
+    let mut truncated = false;
+    for id in ids {
+        if kept.len() >= options.max_nodes {
+            truncated = true;
+            break;
+        }
+        let Some(node) = view.node(&id)? else {
+            continue;
+        };
+        if node_matches(&node, &options.node_filter) {
+            kept.push(id);
+        }
+    }
+    Ok((kept, truncated))
+}
+
+fn algorithm_adjacency(
+    view: &dyn GraphView,
+    ids: &[String],
+    options: &GraphAlgorithmOptions,
+    as_of: Option<i64>,
+    direction: GraphDirection,
+) -> Result<(HashMap<String, Vec<AdjEdge>>, bool)> {
+    let allowed: HashSet<&str> = ids.iter().map(String::as_str).collect();
+    let mut adjacency: HashMap<String, Vec<AdjEdge>> = HashMap::new();
+    let mut truncated = false;
+    let mut scanned = 0usize;
+    for id in ids {
+        for edge in view.neighbors(id, direction, &options.labels)? {
+            scanned += 1;
+            if scanned > 1_000_000 {
+                truncated = true;
+                break;
+            }
+            if !edge_in_window(&edge, as_of) || !edge_matches(view, &edge, &options.edge_filter)? {
+                continue;
+            }
+            if !allowed.contains(edge.target.as_str()) {
+                continue;
+            }
+            adjacency.entry(id.clone()).or_default().push(edge);
+        }
+        if truncated {
+            break;
+        }
+    }
+    Ok((adjacency, truncated))
+}
+
+fn pagerank(view: &dyn GraphView, options: &GraphAlgorithmOptions) -> Result<Value> {
+    let as_of = as_of_ms(options.as_of.as_ref())?;
+    let (ids, ids_truncated) = algorithm_nodes(view, options)?;
+    if ids.is_empty() {
+        return Ok(json!({
+            "kind": "pagerank",
+            "items": [],
+            "nodes": 0,
+            "iterations": 0,
+            "converged": true,
+            "truncated": ids_truncated,
+        }));
+    }
+    let (adjacency, edges_truncated) =
+        algorithm_adjacency(view, &ids, options, as_of, options.direction)?;
+    let n = ids.len() as f64;
+    let mut incoming: HashMap<String, Vec<String>> = HashMap::new();
+    for (source, edges) in &adjacency {
+        for edge in edges {
+            incoming
+                .entry(edge.target.clone())
+                .or_default()
+                .push(source.clone());
+        }
+    }
+    let mut scores: HashMap<String, f64> = ids.iter().map(|id| (id.clone(), 1.0 / n)).collect();
+    let mut converged = false;
+    let mut iterations = 0usize;
+    for _ in 0..options.iterations {
+        let dangling: f64 = ids
+            .iter()
+            .filter(|id| adjacency.get(*id).is_none_or(|edges| edges.is_empty()))
+            .map(|id| scores.get(id).copied().unwrap_or(0.0))
+            .sum();
+        let base = (1.0 - options.damping) / n + options.damping * dangling / n;
+        let mut next: HashMap<String, f64> = HashMap::with_capacity(ids.len());
+        for id in &ids {
+            let mut score = base;
+            if let Some(parents) = incoming.get(id) {
+                for parent in parents {
+                    let degree = adjacency.get(parent).map_or(0, Vec::len) as f64;
+                    if degree > 0.0 {
+                        score +=
+                            options.damping * scores.get(parent).copied().unwrap_or(0.0) / degree;
+                    }
+                }
+            }
+            next.insert(id.clone(), score);
+        }
+        let delta: f64 = ids
+            .iter()
+            .map(|id| {
+                (next.get(id).copied().unwrap_or(0.0) - scores.get(id).copied().unwrap_or(0.0))
+                    .abs()
+            })
+            .sum();
+        scores = next;
+        iterations += 1;
+        if delta < options.tolerance {
+            converged = true;
+            break;
+        }
+    }
+    let mut ranked: Vec<(String, f64)> = scores.into_iter().collect();
+    ranked.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    let limited = ranked.len() > options.limit;
+    ranked.truncate(options.limit);
+    let items: Vec<Value> = ranked
+        .into_iter()
+        .map(|(id, score)| json!({"id": id, "score": score}))
+        .collect();
+    Ok(json!({
+        "kind": "pagerank",
+        "items": items,
+        "nodes": ids.len(),
+        "iterations": iterations,
+        "converged": converged,
+        "truncated": ids_truncated || edges_truncated || limited,
+    }))
+}
+
+fn degree_centrality(view: &dyn GraphView, options: &GraphAlgorithmOptions) -> Result<Value> {
+    let as_of = as_of_ms(options.as_of.as_ref())?;
+    let (ids, ids_truncated) = algorithm_nodes(view, options)?;
+    let empty = HashMap::new();
+    let (outgoing, out_truncated) = if options.direction == GraphDirection::In {
+        (empty, false)
+    } else {
+        algorithm_adjacency(view, &ids, options, as_of, GraphDirection::Out)?
+    };
+    let (incoming, in_truncated) = if options.direction == GraphDirection::Out {
+        (HashMap::new(), false)
+    } else {
+        algorithm_adjacency(view, &ids, options, as_of, GraphDirection::In)?
+    };
+    let mut ranked: Vec<(String, usize, usize)> = ids
+        .iter()
+        .map(|id| {
+            let out = outgoing.get(id).map_or(0, Vec::len);
+            let incoming = incoming.get(id).map_or(0, Vec::len);
+            (id.clone(), out, incoming)
+        })
+        .collect();
+    ranked.sort_by(|a, b| {
+        (b.1 + b.2)
+            .cmp(&(a.1 + a.2))
+            .then_with(|| b.1.cmp(&a.1))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    let limited = ranked.len() > options.limit;
+    ranked.truncate(options.limit);
+    let items: Vec<Value> = ranked
+        .into_iter()
+        .map(|(id, out, incoming)| {
+            json!({
+                "id": id,
+                "out": out,
+                "in": incoming,
+                "total": out + incoming,
+            })
+        })
+        .collect();
+    Ok(json!({
+        "kind": "degree_centrality",
+        "items": items,
+        "nodes": ids.len(),
+        "truncated": ids_truncated || out_truncated || in_truncated || limited,
+    }))
+}
+
+fn connected_components(view: &dyn GraphView, options: &GraphAlgorithmOptions) -> Result<Value> {
+    let as_of = as_of_ms(options.as_of.as_ref())?;
+    let (ids, ids_truncated) = algorithm_nodes(view, options)?;
+    let allowed: HashSet<&str> = ids.iter().map(String::as_str).collect();
+    let (adjacency, edges_truncated) =
+        algorithm_adjacency(view, &ids, options, as_of, GraphDirection::Both)?;
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut components: Vec<(String, Vec<String>)> = Vec::new();
+    let mut truncated = ids_truncated || edges_truncated;
+    for id in &ids {
+        if seen.contains(id) {
+            continue;
+        }
+        if components.len() >= options.limit {
+            truncated = true;
+            break;
+        }
+        let mut queue = VecDeque::new();
+        let mut members = Vec::new();
+        seen.insert(id.clone());
+        queue.push_back(id.clone());
+        while let Some(current) = queue.pop_front() {
+            members.push(current.clone());
+            if let Some(edges) = adjacency.get(&current) {
+                for edge in edges {
+                    if allowed.contains(edge.target.as_str()) && seen.insert(edge.target.clone()) {
+                        queue.push_back(edge.target.clone());
+                    }
+                }
+            }
+        }
+        if let Some(first) = members.first() {
+            components.push((first.clone(), members));
+        }
+    }
+    components.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
+    let count = components.len();
+    let items: Vec<Value> = components
+        .into_iter()
+        .enumerate()
+        .map(|(index, (_first, members))| {
+            json!({
+                "id": index,
+                "size": members.len(),
+                "nodes": members,
+            })
+        })
+        .collect();
+    Ok(json!({
+        "kind": "connected_components",
+        "components": items,
+        "count": count,
+        "nodes": ids.len(),
+        "truncated": truncated,
+    }))
+}
+
+/// Runs a read-only graph algorithm over all nodes in the graph's node
+/// collection. The result is bounded by `limit` and `max_nodes`.
+pub fn graph_algorithm(view: &dyn GraphView, options: &GraphAlgorithmOptions) -> Result<Value> {
+    options.validate()?;
+    match options.kind {
+        GraphAlgorithmKind::Pagerank => pagerank(view, options),
+        GraphAlgorithmKind::DegreeCentrality => degree_centrality(view, options),
+        GraphAlgorithmKind::ConnectedComponents => connected_components(view, options),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1521,20 +2511,43 @@ mod tests {
             Ok(Some(json!({"_id": id})))
         }
 
+        fn node_ids(&self) -> Result<Vec<String>> {
+            let mut ids: HashSet<String> = self.edges.keys().cloned().collect();
+            for edges in self.edges.values() {
+                for edge in edges {
+                    ids.insert(edge.target.clone());
+                }
+            }
+            Ok(ids.into_iter().collect())
+        }
+
         fn neighbors(
             &self,
             id: &str,
-            _direction: GraphDirection,
+            direction: GraphDirection,
             labels: &[String],
         ) -> Result<Vec<AdjEdge>> {
-            Ok(self
-                .edges
-                .get(id)
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|edge| labels.is_empty() || labels.contains(&edge.label))
-                .collect())
+            let mut out = Vec::new();
+            if direction != GraphDirection::In {
+                out.extend(self.edges.get(id).cloned().unwrap_or_default());
+            }
+            if direction != GraphDirection::Out {
+                for (source, edges) in &self.edges {
+                    for edge in edges {
+                        if edge.target == id {
+                            let mut incoming = edge.clone();
+                            incoming.target = source.clone();
+                            out.push(incoming);
+                        }
+                    }
+                }
+            }
+            let mut seen = HashSet::new();
+            out.retain(|edge| {
+                (labels.is_empty() || labels.contains(&edge.label))
+                    && seen.insert(edge.edge_id.clone())
+            });
+            Ok(out)
         }
     }
 
@@ -1784,5 +2797,92 @@ mod tests {
         let out = shortest_path(&view(), &weighted).unwrap();
         assert_eq!(out["weight"], 2.0);
         assert_eq!(out["path"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn all_shortest_paths_bfs_and_dijkstra() {
+        let options: AllShortestPathsOptions = serde_json::from_value(json!({
+            "start": "a",
+            "target": "c",
+            "direction": "out",
+            "max_depth": 4,
+            "limit_paths": 10,
+            "limit_nodes": 100
+        }))
+        .unwrap();
+        let out = all_shortest_paths(&view(), &options).unwrap();
+        assert_eq!(out["found"], true);
+        assert_eq!(out["path_count"], 1);
+        assert_eq!(out["paths"][0]["hops"], 1);
+
+        let weighted: AllShortestPathsOptions = serde_json::from_value(json!({
+            "start": "a",
+            "target": "c",
+            "direction": "out",
+            "max_depth": 4,
+            "limit_paths": 10,
+            "limit_nodes": 100,
+            "weighted": true
+        }))
+        .unwrap();
+        let out = all_shortest_paths(&view(), &weighted).unwrap();
+        assert_eq!(out["found"], true);
+        assert_eq!(out["weight"], 2.0);
+        assert_eq!(out["paths"][0]["hops"], 2);
+    }
+
+    #[test]
+    fn graph_match_variable_length_and_algorithms() {
+        let match_options: GraphMatchOptions = serde_json::from_value(json!({
+            "start": "a",
+            "pattern": [{
+                "direction": "out",
+                "labels": ["KNOWS"],
+                "min_hops": 1,
+                "max_hops": 2
+            }],
+            "limit": 10,
+            "max_depth": 4
+        }))
+        .unwrap();
+        let out = graph_match(&view(), &match_options).unwrap();
+        assert_eq!(out["matches"], 3);
+
+        let pagerank_options: GraphAlgorithmOptions = serde_json::from_value(json!({
+            "kind": "pagerank",
+            "direction": "out",
+            "limit": 10,
+            "max_nodes": 100
+        }))
+        .unwrap();
+        let out = graph_algorithm(&view(), &pagerank_options).unwrap();
+        assert_eq!(out["kind"], "pagerank");
+        assert_eq!(out["items"].as_array().unwrap().len(), 3);
+
+        let degree_options: GraphAlgorithmOptions = serde_json::from_value(json!({
+            "kind": "degree_centrality",
+            "direction": "both",
+            "limit": 10,
+            "max_nodes": 100
+        }))
+        .unwrap();
+        let out = graph_algorithm(&view(), &degree_options).unwrap();
+        assert_eq!(out["items"][0]["total"], 3);
+        assert!(out["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["id"] == "c" && item["total"] == 3));
+
+        let components_options: GraphAlgorithmOptions = serde_json::from_value(json!({
+            "kind": "connected_components",
+            "direction": "both",
+            "limit": 10,
+            "max_nodes": 100
+        }))
+        .unwrap();
+        let out = graph_algorithm(&view(), &components_options).unwrap();
+        assert_eq!(out["count"], 1);
+        assert_eq!(out["components"][0]["size"], 3);
     }
 }

@@ -194,7 +194,12 @@ single-database directories are migrated to `default/` on startup. See
   `as_of` windows, projection, cycle markers, tree or flat output, hard
   node/edge/byte budgets, and vector-search seeds.
 - `neighbors` returns one-hop filtered neighbors without building a tree.
-- `shortest_path` uses BFS by hops or Dijkstra over edge weights.
+- `shortest_path` uses BFS by hops or Dijkstra over edge weights;
+  `all_shortest_paths` returns every shortest path with bounded path/node budgets.
+- `graph_match` matches linear variable-length patterns with per-step direction,
+  labels, node/edge filters, and relationship uniqueness.
+- `graph_algorithm` computes bounded PageRank, degree centrality, and weakly
+  connected components.
 - `hybrid_search` reranks vector hits and their graph neighborhood with
   deterministic `vector_weight`/`graph_weight` scoring.
 - `$graphLookup` uses the adjacency fast path when the lookup fields match the

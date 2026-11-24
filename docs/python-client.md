@@ -850,6 +850,14 @@ seeded = nodes.traverse(
 # BFS by hops, or Dijkstra with the configured weight field.
 path = nodes.shortest_path("alice", "carol")
 weighted = nodes.shortest_path("alice", "carol", weighted=True)
+paths = nodes.all_shortest_paths("alice", "carol", limit_paths=10)
+matches = nodes.graph_match(
+    "alice",
+    [{"direction": "out", "labels": ["KNOWS"], "min_hops": 1, "max_hops": 3}],
+)
+ranked = nodes.pagerank(limit=20)
+degrees = nodes.degree_centrality(limit=20)
+components = nodes.connected_components()
 
 # Adjacency is derived data and can always be rebuilt.
 nodes.reindex_graph()

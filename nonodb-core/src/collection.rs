@@ -20,8 +20,9 @@ use crate::error::{Error, Result};
 use crate::events::{self, EventConfig, EVENTS_COLLECTION};
 use crate::geo;
 use crate::graph::{
-    self, AdjEdge, GraphDef, GraphDirection, GraphRebuildState, GraphView, HybridOptions,
-    NeighborsOptions, ShortestPathOptions, TraverseOptions,
+    self, AdjEdge, AllShortestPathsOptions, GraphAlgorithmOptions, GraphDef, GraphDirection,
+    GraphMatchOptions, GraphRebuildState, GraphView, HybridOptions, NeighborsOptions,
+    ShortestPathOptions, TraverseOptions,
 };
 use crate::history::{self, HistoryEntry};
 use crate::id;
@@ -5709,6 +5710,66 @@ impl<'e> Collection<'e> {
         Ok(out)
     }
 
+    pub fn graph_all_shortest_paths(&self, options: AllShortestPathsOptions) -> Result<Value> {
+        if self.profile.is_vault() {
+            return Err(Error::Query(
+                "graph operations are not supported on vault collections".into(),
+            ));
+        }
+        options.validate()?;
+        let rtxn = self.read_txn()?;
+        let def = self
+            .graph_def_in(&rtxn)?
+            .ok_or_else(|| Error::Query("graph is not configured for this collection".into()))?;
+        let store = self.store.ok_or_else(|| {
+            Error::Query("graph traversal requires a store-backed collection".into())
+        })?;
+        let view = GraphViewImpl::new(store, &rtxn, def)?;
+        let out = graph::all_shortest_paths(&view, &options)?;
+        rtxn.commit()?;
+        Ok(out)
+    }
+
+    pub fn graph_match(&self, options: GraphMatchOptions) -> Result<Value> {
+        if self.profile.is_vault() {
+            return Err(Error::Query(
+                "graph operations are not supported on vault collections".into(),
+            ));
+        }
+        options.validate()?;
+        let rtxn = self.read_txn()?;
+        let def = self
+            .graph_def_in(&rtxn)?
+            .ok_or_else(|| Error::Query("graph is not configured for this collection".into()))?;
+        let store = self.store.ok_or_else(|| {
+            Error::Query("graph traversal requires a store-backed collection".into())
+        })?;
+        let view = GraphViewImpl::new(store, &rtxn, def)?;
+        let out = graph::graph_match(&view, &options)?;
+        rtxn.commit()?;
+        Ok(out)
+    }
+
+    pub fn graph_algorithm(&self, options: GraphAlgorithmOptions) -> Result<Value> {
+        if self.profile.is_vault() {
+            return Err(Error::Query(
+                "graph operations are not supported on vault collections".into(),
+            ));
+        }
+        options.validate()?;
+        let rtxn = self.read_txn()?;
+        let def = self
+            .graph_def_in(&rtxn)?
+            .ok_or_else(|| Error::Query("graph is not configured for this collection".into()))?;
+        let store = self.store.ok_or_else(|| {
+            Error::Query("graph traversal requires a store-backed collection".into())
+        })?;
+        let view = GraphViewImpl::new(store, &rtxn, def)?;
+        let out = graph::graph_algorithm(&view, &options)?;
+        rtxn.commit()?;
+        Ok(out)
+    }
+
     pub fn graph_neighbors(&self, options: NeighborsOptions) -> Result<Value> {
         if self.profile.is_vault() {
             return Err(Error::Query(
@@ -9842,6 +9903,17 @@ impl GraphView for GraphViewImpl<'_, '_> {
             .get(self.txn, id.as_bytes())?
             .map(parse_json)
             .transpose()
+    }
+
+    fn node_ids(&self) -> Result<Vec<String>> {
+        let mut ids = Vec::new();
+        for item in self.node.db.iter(self.txn)? {
+            let (key, _) = item?;
+            if let Ok(id) = std::str::from_utf8(key) {
+                ids.push(id.to_string());
+            }
+        }
+        Ok(ids)
     }
 
     fn neighbors(

@@ -1730,6 +1730,200 @@ class Collection:
             payload["projection"] = projection
         return self._db.exec(payload)
 
+    def all_shortest_paths(
+        self,
+        start: Any,
+        target: Any,
+        *,
+        direction: str = "out",
+        labels: Optional[Iterable[str]] = None,
+        edge_filter: Optional[dict[str, Any]] = None,
+        node_filter: Optional[dict[str, Any]] = None,
+        as_of: Any = None,
+        max_depth: int = 8,
+        limit_paths: int = 100,
+        limit_nodes: int = 10_000,
+        weighted: bool = False,
+        include_edges: bool = False,
+        projection: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        """Returns every shortest path between `start` and `target`.
+
+        Unweighted mode uses BFS. Weighted mode uses Dijkstra and requires
+        numeric edge weights. `truncated` reports path/node budget exhaustion.
+        """
+        payload: dict[str, Any] = {
+            "op": "all_shortest_paths",
+            "coll": self.name,
+            "start": start,
+            "target": target,
+            "direction": direction,
+            "labels": list(labels or []),
+            "max_depth": max_depth,
+            "limit_paths": limit_paths,
+            "limit_nodes": limit_nodes,
+            "weighted": weighted,
+            "include_edges": include_edges,
+        }
+        if edge_filter is not None:
+            payload["edge_filter"] = edge_filter
+        if node_filter is not None:
+            payload["node_filter"] = node_filter
+        if as_of is not None:
+            payload["as_of"] = as_of
+        if projection is not None:
+            payload["projection"] = projection
+        return self._db.exec(payload)
+
+    def graph_match(
+        self,
+        start: Any,
+        pattern: Iterable[dict[str, Any]],
+        *,
+        node_filter: Optional[dict[str, Any]] = None,
+        as_of: Any = None,
+        projection: Optional[dict[str, Any]] = None,
+        include_edges: bool = False,
+        limit: int = 100,
+        limit_nodes: int = 10_000,
+        limit_edges: int = 10_000,
+        max_depth: int = 8,
+    ) -> dict[str, Any]:
+        """Matches a linear pattern such as
+        `[{"direction": "out", "labels": ["KNOWS"], "min_hops": 1, "max_hops": 3}]`.
+
+        Each path is returned as `nodes`, `edges`, and `hops`. Relationship
+        uniqueness is enforced within a path.
+        """
+        payload: dict[str, Any] = {
+            "op": "graph_match",
+            "coll": self.name,
+            "start": start,
+            "pattern": list(pattern),
+            "include_edges": include_edges,
+            "limit": limit,
+            "limit_nodes": limit_nodes,
+            "limit_edges": limit_edges,
+            "max_depth": max_depth,
+        }
+        if node_filter is not None:
+            payload["node_filter"] = node_filter
+        if as_of is not None:
+            payload["as_of"] = as_of
+        if projection is not None:
+            payload["projection"] = projection
+        return self._db.exec(payload)
+
+    def pagerank(
+        self,
+        *,
+        direction: str = "out",
+        labels: Optional[Iterable[str]] = None,
+        edge_filter: Optional[dict[str, Any]] = None,
+        node_filter: Optional[dict[str, Any]] = None,
+        as_of: Any = None,
+        limit: int = 100,
+        max_nodes: int = 10_000,
+        damping: float = 0.85,
+        iterations: int = 20,
+        tolerance: float = 1e-6,
+    ) -> dict[str, Any]:
+        """Runs bounded PageRank and returns nodes ordered by score."""
+        return self._graph_algorithm(
+            "pagerank",
+            direction=direction,
+            labels=labels,
+            edge_filter=edge_filter,
+            node_filter=node_filter,
+            as_of=as_of,
+            limit=limit,
+            max_nodes=max_nodes,
+            damping=damping,
+            iterations=iterations,
+            tolerance=tolerance,
+        )
+
+    def degree_centrality(
+        self,
+        *,
+        direction: str = "both",
+        labels: Optional[Iterable[str]] = None,
+        edge_filter: Optional[dict[str, Any]] = None,
+        node_filter: Optional[dict[str, Any]] = None,
+        as_of: Any = None,
+        limit: int = 100,
+        max_nodes: int = 10_000,
+    ) -> dict[str, Any]:
+        """Returns filtered in/out/total degree for nodes."""
+        return self._graph_algorithm(
+            "degree_centrality",
+            direction=direction,
+            labels=labels,
+            edge_filter=edge_filter,
+            node_filter=node_filter,
+            as_of=as_of,
+            limit=limit,
+            max_nodes=max_nodes,
+        )
+
+    def connected_components(
+        self,
+        *,
+        direction: str = "both",
+        labels: Optional[Iterable[str]] = None,
+        edge_filter: Optional[dict[str, Any]] = None,
+        node_filter: Optional[dict[str, Any]] = None,
+        as_of: Any = None,
+        limit: int = 100,
+        max_nodes: int = 10_000,
+    ) -> dict[str, Any]:
+        """Returns weakly connected components."""
+        return self._graph_algorithm(
+            "connected_components",
+            direction=direction,
+            labels=labels,
+            edge_filter=edge_filter,
+            node_filter=node_filter,
+            as_of=as_of,
+            limit=limit,
+            max_nodes=max_nodes,
+        )
+
+    def _graph_algorithm(
+        self,
+        kind: str,
+        *,
+        direction: str,
+        labels: Optional[Iterable[str]],
+        edge_filter: Optional[dict[str, Any]],
+        node_filter: Optional[dict[str, Any]],
+        as_of: Any,
+        limit: int,
+        max_nodes: int,
+        damping: float = 0.85,
+        iterations: int = 20,
+        tolerance: float = 1e-6,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "op": "graph_algorithm",
+            "coll": self.name,
+            "kind": kind,
+            "direction": direction,
+            "labels": list(labels or []),
+            "limit": limit,
+            "max_nodes": max_nodes,
+            "damping": damping,
+            "iterations": iterations,
+            "tolerance": tolerance,
+        }
+        if edge_filter is not None:
+            payload["edge_filter"] = edge_filter
+        if node_filter is not None:
+            payload["node_filter"] = node_filter
+        if as_of is not None:
+            payload["as_of"] = as_of
+        return self._db.exec(payload)
+
     def neighbors(
         self,
         start: Any,

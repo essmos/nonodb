@@ -4,6 +4,11 @@ Full release notes: https://github.com/essmos/nonodb/releases
 
 ## v0.32.0 - 2026-11-23
 
+- Add graph search parity features: `all_shortest_paths` (BFS and weighted
+  Dijkstra), `graph_match` for linear variable-length patterns with per-step
+  filters, and `graph_algorithm` for bounded PageRank, degree centrality, and
+  weakly connected components. Python client methods and the graph benchmark
+  cover the new operations. See `docs/graph.md`.
 - **Upgrade: plain indexes now index a missing field as `null`.** Run
   `nonodb-cli reindex <collection>` for every collection with plain indexes
   after upgrading. Existing plain unique indexes can fail to rebuild if several

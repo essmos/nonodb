@@ -178,6 +178,9 @@ client timeout with `NONODB_TIMEOUT` or the `timeout=` argument.
 | [`neighbors`](#graph) | One-hop filtered neighbors |
 | [`hybrid_search`](#graph) | Vector + graph rerank |
 | [`shortest_path`](#graph) | BFS or weighted shortest path |
+| [`all_shortest_paths`](#graph) | Every shortest path with bounded output |
+| [`graph_match`](#graph) | Linear variable-length pattern matching |
+| [`graph_algorithm`](#graph) | PageRank, degree centrality, connected components |
 | [`watch`](#watch) | Long-poll append-only events by sortable `_id` |
 | [`explain`](#explain) | Show the selected plan, bounds, and actual counts |
 | [`update`](#update) | Update or upsert documents |
@@ -2336,6 +2339,9 @@ operations are:
 | `neighbors` | One-hop filtered neighbors |
 | `hybrid_search` | Vector seed + graph rerank |
 | `shortest_path` | BFS hops or Dijkstra over edge weights |
+| `all_shortest_paths` | Every shortest path, capped by `limit_paths`/`limit_nodes` |
+| `graph_match` | Linear variable-length pattern with per-step filters |
+| `graph_algorithm` | PageRank, degree centrality, or weakly connected components |
 
 ```json
 {"op":"traverse","coll":"nodes","start":["alice"],
@@ -2360,6 +2366,12 @@ atomic swap.
 {"op":"shortest_path","coll":"nodes","start":"alice","target":"carol",
  "weighted":true,"max_depth":8}
 ```
+
+`all_shortest_paths` returns all shortest paths with `limit_paths` and
+`limit_nodes`; `weighted:true` uses Dijkstra. `graph_match` takes a `pattern`
+array of `{direction, labels, min_hops, max_hops, edge_filter, node_filter}`
+segments. `graph_algorithm` takes `kind` = `pagerank`, `degree_centrality`, or
+`connected_components`, bounded by `limit` and `max_nodes`.
 
 Graph configuration requires admin scope on both collections; graph reads
 require a read scope on the node **and** edge collections. Vault collections are
