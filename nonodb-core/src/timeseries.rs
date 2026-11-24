@@ -1933,6 +1933,20 @@ pub fn find(
     settings: &Settings,
     query: &FindQuery,
 ) -> Result<Vec<Value>> {
+    find_with_ids(rtxn, env, name, settings, query, None)
+}
+
+/// Finds documents, optionally restricted to a set of `_id` values (index
+/// candidates). Rows are loaded bucket-by-bucket, so a secondary index lookup
+/// decodes each bucket once instead of once per id.
+pub fn find_with_ids(
+    rtxn: &RoTxn<'_>,
+    env: &heed::Env,
+    name: &str,
+    settings: &Settings,
+    query: &FindQuery,
+    candidates: Option<&std::collections::HashSet<String>>,
+) -> Result<Vec<Value>> {
     validate_filter(&query.filter)?;
     let limit = query.limit.unwrap_or(usize::MAX);
     if limit == 0 {
@@ -1953,31 +1967,218 @@ pub fn find(
     let span = settings.span_ms();
 
     let mut out: Vec<Value> = Vec::new();
-    for item in db.iter(rtxn)? {
-        let (key, payload) = item?;
-        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
-            return Err(Error::Timeout("operation exceeded maxTimeMS".into()));
+    if let Some(candidates) = candidates {
+        let mut by_bucket: std::collections::HashMap<(u64, u32, i64, u16), Vec<u32>> =
+            std::collections::HashMap::new();
+        let mut user_ids: Vec<&String> = Vec::new();
+        for id in candidates {
+            match parse_row_id(id) {
+                Some((hash, salt, window, serial, seq)) => by_bucket
+                    .entry((hash, salt, window, serial))
+                    .or_default()
+                    .push(seq),
+                None => user_ids.push(id),
+            }
         }
-        match key.first() {
-            Some(&KEY_BUCKET) => {
-                if let Some(expected) = meta_hash {
-                    if key_parts(key).map(|parts| parts.0) != Some(expected) {
-                        continue;
-                    }
-                }
-                let (_, start, end, meta) = bucket_header(payload, settings)?;
-                if low.is_some_and(|low| end < low) || high.is_some_and(|high| start > high) {
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for ((hash, salt, window, serial), seqs) in by_bucket {
+            // Series and time pruning still applies to the candidate bucket.
+            if let Some(expected) = meta_hash {
+                if hash != expected {
                     continue;
                 }
-                // Prune whole series without decoding columns: check the header
-                // meta value against the meta-field part of the filter.
-                if let Some(filter) = &meta_filter {
-                    if !meta_bucket_matches(filter, settings, meta.as_ref()) {
+            }
+            let window_end = window.saturating_add(span).saturating_sub(1);
+            if low.is_some_and(|low| window_end < low) || high.is_some_and(|high| window > high) {
+                continue;
+            }
+            let wanted: std::collections::HashSet<u32> = seqs.into_iter().collect();
+            let key = bucket_key(hash, salt, window, serial);
+            if let Some(payload) = db.get(rtxn, &key)? {
+                let (bucket, selected) = decode_bucket_inner(payload, settings, low, high)?;
+                let tombs = tombstones(rtxn, &db, hash, salt, window, serial)?;
+                for (row, idx) in bucket.rows.iter().zip(selected.iter()) {
+                    let seq = *idx as u32;
+                    if tombs.contains(&seq) || !wanted.contains(&seq) {
                         continue;
                     }
+                    let mut doc = Value::Object(row.clone());
+                    if !row.contains_key("_id") {
+                        set_path(
+                            doc.as_object_mut().expect("object"),
+                            "_id",
+                            Value::String(row_id(hash, salt, window, serial, seq)),
+                        );
+                    }
+                    if expired(settings, &doc, now) || !matcher::matches(&doc, &query.filter) {
+                        continue;
+                    }
+                    let id = doc
+                        .get("_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    if seen.insert(id) {
+                        out.push(doc);
+                    }
                 }
-                let (bucket, selected) = decode_bucket_inner(payload, settings, low, high)?;
-                let (hash, salt, window, serial) = key_parts(key).unwrap_or((0, 0, start, 0));
+            } else {
+                for seq in wanted {
+                    let Some(payload) = db.get(rtxn, &row_key(hash, salt, window, serial, seq))?
+                    else {
+                        continue;
+                    };
+                    let row: Map<String, Value> = serde_json::from_slice(payload)?;
+                    let mut doc = Value::Object(row);
+                    if !doc
+                        .as_object()
+                        .is_some_and(|object| object.contains_key("_id"))
+                    {
+                        set_path(
+                            doc.as_object_mut().expect("object"),
+                            "_id",
+                            Value::String(row_id(hash, salt, window, serial, seq)),
+                        );
+                    }
+                    if expired(settings, &doc, now) || !matcher::matches(&doc, &query.filter) {
+                        continue;
+                    }
+                    let id = doc
+                        .get("_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    if seen.insert(id) {
+                        out.push(doc);
+                    }
+                }
+            }
+        }
+        for id in user_ids {
+            if let Some(doc) = find_by_id(rtxn, env, name, settings, id)? {
+                if matcher::matches(&doc, &query.filter) && seen.insert(id.clone()) {
+                    out.push(doc);
+                }
+            }
+        }
+    }
+    if candidates.is_none() {
+        for item in db.iter(rtxn)? {
+            let (key, payload) = item?;
+            if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                return Err(Error::Timeout("operation exceeded maxTimeMS".into()));
+            }
+            match key.first() {
+                Some(&KEY_BUCKET) => {
+                    if let Some(expected) = meta_hash {
+                        if key_parts(key).map(|parts| parts.0) != Some(expected) {
+                            continue;
+                        }
+                    }
+                    let (_, start, end, meta) = bucket_header(payload, settings)?;
+                    if low.is_some_and(|low| end < low) || high.is_some_and(|high| start > high) {
+                        continue;
+                    }
+                    // Prune whole series without decoding columns: check the header
+                    // meta value against the meta-field part of the filter.
+                    if let Some(filter) = &meta_filter {
+                        if !meta_bucket_matches(filter, settings, meta.as_ref()) {
+                            continue;
+                        }
+                    }
+                    let (bucket, selected) = decode_bucket_inner(payload, settings, low, high)?;
+                    let (hash, salt, window, serial) = key_parts(key).unwrap_or((0, 0, start, 0));
+                    let tombs = tombstones(rtxn, &db, hash, salt, window, serial)?;
+                    for (row, idx) in bucket.rows.iter().zip(selected.iter()) {
+                        if tombs.contains(&(*idx as u32)) {
+                            continue;
+                        }
+                        let mut doc = Value::Object(row.clone());
+                        if !row.contains_key("_id") {
+                            set_path(
+                                doc.as_object_mut().expect("object"),
+                                "_id",
+                                Value::String(row_id(hash, salt, window, serial, *idx as u32)),
+                            );
+                        }
+                        if expired(settings, &doc, now) || !matcher::matches(&doc, &query.filter) {
+                            continue;
+                        }
+                        out.push(doc);
+                    }
+                }
+                Some(&KEY_ROW) => {
+                    let Some((hash, salt, window, serial, seq)) = row_key_parts(key) else {
+                        continue;
+                    };
+                    if let Some(expected) = meta_hash {
+                        if hash != expected {
+                            continue;
+                        }
+                    }
+                    let window_end = window.saturating_add(span).saturating_sub(1);
+                    if low.is_some_and(|low| window_end < low)
+                        || high.is_some_and(|high| window > high)
+                    {
+                        continue;
+                    }
+                    let row: Map<String, Value> = serde_json::from_slice(payload)?;
+                    let mut doc = Value::Object(row);
+                    if !doc
+                        .as_object()
+                        .is_some_and(|object| object.contains_key("_id"))
+                    {
+                        set_path(
+                            doc.as_object_mut().expect("object"),
+                            "_id",
+                            Value::String(row_id(hash, salt, window, serial, seq)),
+                        );
+                    }
+                    if expired(settings, &doc, now) || !matcher::matches(&doc, &query.filter) {
+                        continue;
+                    }
+                    out.push(doc);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if !query.sort.is_empty() {
+        out.sort_by(|a, b| compare_docs(a, b, &query.sort));
+    }
+    let start = query.skip.min(out.len());
+    let mut out: Vec<Value> = out.into_iter().skip(start).take(limit).collect();
+    if let Some(projection) = &query.projection {
+        for doc in out.iter_mut() {
+            *doc = project_document(doc, Some(projection));
+        }
+    }
+    Ok(out)
+}
+
+/// Returns every live row with its `_id`, decoded from buckets. Used to build
+/// and rebuild secondary indexes.
+pub fn all_docs(
+    rtxn: &RoTxn<'_>,
+    env: &heed::Env,
+    name: &str,
+    settings: &Settings,
+) -> Result<Vec<(String, Value)>> {
+    let Some(db) =
+        env.open_database::<Bytes, Bytes>(rtxn, Some(&format!("{BUCKET_DB_PREFIX}{name}")))?
+    else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for item in db.iter(rtxn)? {
+        let (key, payload) = item?;
+        match key.first() {
+            Some(&KEY_BUCKET) => {
+                let Some((hash, salt, window, serial)) = key_parts(key) else {
+                    continue;
+                };
+                let (bucket, selected) = decode_bucket_inner(payload, settings, None, None)?;
                 let tombs = tombstones(rtxn, &db, hash, salt, window, serial)?;
                 for (row, idx) in bucket.rows.iter().zip(selected.iter()) {
                     if tombs.contains(&(*idx as u32)) {
@@ -1991,26 +2192,18 @@ pub fn find(
                             Value::String(row_id(hash, salt, window, serial, *idx as u32)),
                         );
                     }
-                    if expired(settings, &doc, now) || !matcher::matches(&doc, &query.filter) {
-                        continue;
-                    }
-                    out.push(doc);
+                    let id = doc
+                        .get("_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    out.push((id, doc));
                 }
             }
             Some(&KEY_ROW) => {
                 let Some((hash, salt, window, serial, seq)) = row_key_parts(key) else {
                     continue;
                 };
-                if let Some(expected) = meta_hash {
-                    if hash != expected {
-                        continue;
-                    }
-                }
-                let window_end = window.saturating_add(span).saturating_sub(1);
-                if low.is_some_and(|low| window_end < low) || high.is_some_and(|high| window > high)
-                {
-                    continue;
-                }
                 let row: Map<String, Value> = serde_json::from_slice(payload)?;
                 let mut doc = Value::Object(row);
                 if !doc
@@ -2023,23 +2216,14 @@ pub fn find(
                         Value::String(row_id(hash, salt, window, serial, seq)),
                     );
                 }
-                if expired(settings, &doc, now) || !matcher::matches(&doc, &query.filter) {
-                    continue;
-                }
-                out.push(doc);
+                let id = doc
+                    .get("_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                out.push((id, doc));
             }
             _ => {}
-        }
-    }
-
-    if !query.sort.is_empty() {
-        out.sort_by(|a, b| compare_docs(a, b, &query.sort));
-    }
-    let start = query.skip.min(out.len());
-    let mut out: Vec<Value> = out.into_iter().skip(start).take(limit).collect();
-    if let Some(projection) = &query.projection {
-        for doc in out.iter_mut() {
-            *doc = project_document(doc, Some(projection));
         }
     }
     Ok(out)
@@ -3266,7 +3450,8 @@ mod tests {
             .update(&json!({}), &json!({"$set": {"x": 1}}), false)
             .unwrap();
         assert_eq!(updated, 1);
-        assert!(collection.create_index("level", false).is_err());
+        assert!(collection.create_index("level", false).is_ok());
+        assert!(collection.drop_index("level").unwrap());
         assert_eq!(collection.delete(&json!({}), false).unwrap(), 1);
         assert_eq!(collection.count(&json!({})).unwrap(), 249);
 
@@ -3947,6 +4132,101 @@ mod tests {
         assert!(created.upserted_id.is_some());
         assert_eq!(created.value.as_ref().unwrap()["value"], json!(9));
         assert_eq!(c.count(&json!({})).unwrap(), 3);
+    }
+
+    #[test]
+    fn secondary_index_lifecycle_and_planner() {
+        let (_dir, store) = ts_store();
+        let settings = Settings {
+            time_field: "ts".into(),
+            meta_field: Some("device".into()),
+            ..Settings::default()
+        };
+        let c = store
+            .create_timeseries_collection("metrics", &settings)
+            .unwrap();
+        let base = 1_700_000_000_000i64;
+        for idx in 0..1_200i64 {
+            c.insert_one(json!({
+                "ts": {"$date": {"$numberLong": (base + idx * 1000).to_string()}},
+                "device": {"id": format!("d{}", idx % 4)},
+                "level": idx % 10,
+                "value": idx,
+            }))
+            .unwrap();
+        }
+        c.create_index("level", false).unwrap();
+        assert!(c
+            .list_indexes()
+            .unwrap()
+            .iter()
+            .any(|(name, unique)| name == "level" && !unique));
+
+        let query = |hint: Option<Value>| crate::collection::FindQuery {
+            filter: json!({"level": 7}),
+            projection: None,
+            sort: vec![("ts".into(), 1)],
+            skip: 0,
+            limit: None,
+            comment: None,
+            max_time_ms: None,
+            hint,
+        };
+        let find_level = |level: i64| {
+            c.find(&crate::collection::FindQuery {
+                filter: json!({"level": level}),
+                projection: None,
+                sort: vec![("ts".into(), 1)],
+                skip: 0,
+                limit: None,
+                comment: None,
+                max_time_ms: None,
+                hint: None,
+            })
+            .unwrap()
+        };
+        let indexed = c.find(&query(None)).unwrap();
+        let scanned = c.find(&query(Some(json!({"$natural": 1})))).unwrap();
+        assert_eq!(indexed, scanned);
+        assert_eq!(indexed.len(), 120);
+
+        let plan = c.explain(&query(None)).unwrap();
+        assert_eq!(plan["index_used"], json!(true), "{plan}");
+        assert_eq!(plan["access"], json!("index_scan"));
+        let natural = c.explain(&query(Some(json!({"$natural": 1})))).unwrap();
+        assert_eq!(natural["index_used"], json!(false));
+
+        // Updates move index entries.
+        let target = indexed[0]["_id"].as_str().unwrap().to_string();
+        c.update_opts(
+            &json!({"_id": target}),
+            &json!({"$set": {"level": 3}}),
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(find_level(7).len(), 119);
+        assert!(find_level(3).iter().any(|doc| doc["_id"] == json!(target)));
+
+        // Deletes remove index entries.
+        assert_eq!(c.delete(&json!({"_id": target}), false).unwrap(), 1);
+        assert!(!find_level(3).iter().any(|doc| doc["_id"] == json!(target)));
+
+        // Unique indexes are rejected with a clear message.
+        let err = c.create_index("value", true).unwrap_err();
+        assert!(err.to_string().contains("unique"), "{err}");
+
+        // Reindex rebuilds the same index and keeps the planner happy.
+        let report = c.reindex().unwrap();
+        assert!(report.secondary.iter().any(|name| name == "level"));
+        assert_eq!(
+            c.find(&query(None)).unwrap(),
+            c.find(&query(Some(json!({"$natural": 1})))).unwrap()
+        );
+
+        assert!(c.drop_index("level").unwrap());
+        assert!(!c.drop_index("level").unwrap());
+        assert_eq!(c.explain(&query(None)).unwrap()["index_used"], json!(false));
     }
 
     #[test]

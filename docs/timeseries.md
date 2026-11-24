@@ -199,7 +199,9 @@ Stages that need a second collection or an index host (`$lookup`, `$search`,
 | TTL: collection/document TTL | not applied to buckets |
 | `verify_data_dir` | decodes every bucket and validates keys, headers, rows, tombstones |
 | document history | not recorded (keeps the format columnar) |
-| secondary, text, fuzzy, geo, vector indexes | rejected with a clear error |
+| secondary indexes (`createIndex`/`dropIndex`/`reindex`) | yes, non-unique only |
+| unique indexes | rejected with a clear error |
+| text, fuzzy, geo, vector indexes | rejected with a clear error |
 | `delete` by filter or by `_id` | yes (tombstones) |
 | `findAndModify` with `remove: true` | yes |
 | `findAndModify` with an update | yes (returns the new `_id` when the row moves) |
@@ -213,6 +215,20 @@ Stages that need a second collection or an index host (`$lookup`, `$search`,
 Rejections return `invalid query: `<op>` is not supported on time-series
 collection `<name>``, so API clients fail loudly instead of silently returning
 empty results.
+
+### Secondary indexes
+
+`createIndex`/`createIndexes` build ordinary (non-unique) indexes over
+time-series rows; `dropIndex`, `listIndexes`, and `reindex` work as on document
+collections. The planner uses an index when the filter has an equality/range
+condition on the leading field and reports `"index_used": true` with
+`"access": "index_scan"` in `explain`. Index entries are maintained by
+`insert`, `delete`, `update`, upserts, and replicated writes; a row moved by an
+update removes its old entry and adds a new one. Retention drops whole buckets
+without visiting index entries, so stale entries can remain until `reindex` or
+`dropIndex`; they are harmless because candidate rows that no longer exist are
+skipped. Unique indexes are rejected because tombstones and bucket rewrites
+make uniqueness checks incompatible with the columnar layout.
 
 ### Updates and ids
 
@@ -434,8 +450,9 @@ Reproduce: `ROWS=100000 READS=500 cargo run --release -p nonodb-core --example t
 
 - Deletes and rows moved by an update use tombstones; deleted rows keep
   occupying their bucket until retention or compaction.
-- No unique/secondary indexes, so deletes by filter decode the candidate
-  buckets like a scan.
+- Unique indexes are rejected. Non-unique secondary indexes are supported and
+  used by `find`/`count`/`explain` (`index_used`), but deletes and updates by
+  filter still decode candidate buckets when no index applies.
 - No SQL, secondary/text/fuzzy/geo/vector indexes, `$search`, `$lookup`, or
   watches inside the collection.
 - Aggregation decodes the full time range into memory before running stages.

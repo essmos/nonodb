@@ -636,6 +636,25 @@ impl<'e> Collection<'e> {
 
     fn find_timeseries_in(&self, rtxn: &RoTxn<'_>, query: &FindQuery) -> Result<Vec<Value>> {
         let settings = self.timeseries_settings_in(rtxn)?.unwrap_or_default();
+        let hint = query.hint.as_ref().map(parse_index_hint).transpose()?;
+        if let Some(plan) = self.query_index_plan(rtxn, &query.filter, hint.as_ref())? {
+            let range = (as_bound(&plan.bounds.0), as_bound(&plan.bounds.1));
+            let mut ids = HashSet::new();
+            for item in plan.db.range(rtxn, &range)? {
+                let (_key, value) = item?;
+                if let Some((id, _)) = index::decode_index_value(value) {
+                    ids.insert(id);
+                }
+            }
+            return crate::timeseries::find_with_ids(
+                rtxn,
+                self.env,
+                &self.name,
+                &settings,
+                query,
+                Some(&ids),
+            );
+        }
         crate::timeseries::find(rtxn, self.env, &self.name, &settings, query)
     }
 
@@ -653,11 +672,20 @@ impl<'e> Collection<'e> {
                 .map(|db| db.stat(txn).map(|stat| stat_bytes(&stat)))
                 .transpose()?
                 .unwrap_or(0);
+            let mut index_bytes = 0u64;
+            let mut indexes = 0u64;
+            for def in self.index_defs(txn)? {
+                let resource = index::db_name(&self.name, &def.name());
+                if let Some(bytes) = self.resource_db_bytes(txn, &resource, &resource)? {
+                    index_bytes = index_bytes.saturating_add(bytes);
+                    indexes += 1;
+                }
+            }
             return Ok(CollectionStorageStats {
                 records: stats.rows,
                 data_bytes,
-                index_bytes: 0,
-                indexes: 0,
+                index_bytes,
+                indexes,
             });
         }
         let data = self.db.stat(txn)?;
@@ -1036,6 +1064,18 @@ impl<'e> Collection<'e> {
                     "index fields must be non-empty and must not contain `+`".into(),
                 ));
             }
+            if self.profile.is_timeseries() {
+                if spec.unique {
+                    return Err(Error::Query(
+                        "unique indexes are not supported on time-series collections".into(),
+                    ));
+                }
+                if spec.geo {
+                    return Err(Error::Query(
+                        "geo indexes are not supported on time-series collections".into(),
+                    ));
+                }
+            }
             if spec.geo && (spec.fields.len() != 1 || spec.unique || !spec.include.is_empty()) {
                 return Err(Error::Query(
                     "geo indexes require exactly one field and cannot be unique or covering".into(),
@@ -1097,6 +1137,10 @@ impl<'e> Collection<'e> {
             defs.push((key, def));
         }
 
+        if self.profile.is_timeseries() {
+            self.backfill_timeseries_indexes_txn(wtxn, &mut defs)?;
+            return Ok(());
+        }
         let total_docs = self.db.stat(wtxn)?.entries as u64;
         let index_dbs: Vec<_> = defs
             .iter()
@@ -1166,6 +1210,62 @@ impl<'e> Collection<'e> {
             }
             def.multikey_all_docs = docs_per_index[slot] == total_docs;
             let key = index::def_key(&self.name, &def.name());
+            self.meta.put(
+                &mut *wtxn,
+                key.as_bytes(),
+                serde_json::to_vec(def)?.as_slice(),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Backfills secondary indexes from time-series rows. Rows live in bucket
+    /// databases instead of `coll:<name>`, so they cannot use the document
+    /// backfill path.
+    fn backfill_timeseries_indexes_txn(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        defs: &mut [(String, IndexDef)],
+    ) -> Result<()> {
+        let settings = self.timeseries_settings_in(&*wtxn)?.unwrap_or_default();
+        let docs = crate::timeseries::all_docs(&*wtxn, self.env, &self.name, &settings)?;
+        let total = docs.len() as u64;
+        let index_dbs: Vec<_> = defs
+            .iter()
+            .map(|(_key, def)| self.index_db_in(wtxn, def))
+            .collect::<Result<_>>()?;
+        for db in &index_dbs {
+            db.clear(&mut *wtxn)?;
+        }
+        let mut docs_per_index = vec![0u64; defs.len()];
+        let mut multikey_fields: Vec<Vec<String>> = vec![Vec::new(); defs.len()];
+        for (id, doc) in &docs {
+            for (slot, (_key, def)) in defs.iter_mut().enumerate() {
+                let keys = index::encode_index_keys(def, doc)?;
+                if keys.keys.is_empty() {
+                    continue;
+                }
+                docs_per_index[slot] = docs_per_index[slot].saturating_add(1);
+                for field in &keys.multikey_fields {
+                    if !multikey_fields[slot].contains(field) {
+                        multikey_fields[slot].push(field.clone());
+                    }
+                }
+                let value = index::encode_index_value(def, doc, id);
+                for vb in keys.keys {
+                    let mut key = vb;
+                    key.extend_from_slice(id.as_bytes());
+                    index_dbs[slot].put(&mut *wtxn, key.as_slice(), value.as_slice())?;
+                }
+            }
+        }
+        for (slot, (key, def)) in defs.iter_mut().enumerate() {
+            for field in &multikey_fields[slot] {
+                if !def.multikey_fields.contains(field) {
+                    def.multikey_fields.push(field.clone());
+                }
+            }
+            def.multikey_all_docs = docs_per_index[slot] == total;
             self.meta.put(
                 &mut *wtxn,
                 key.as_bytes(),
@@ -1284,8 +1384,19 @@ impl<'e> Collection<'e> {
         include: &[String],
         geo: bool,
     ) -> Result<()> {
-        self.ensure_not_timeseries("create_index")?;
         self.ensure_standard()?;
+        if self.profile.is_timeseries() {
+            if unique {
+                return Err(Error::Query(
+                    "unique indexes are not supported on time-series collections".into(),
+                ));
+            }
+            if geo {
+                return Err(Error::Query(
+                    "geo indexes are not supported on time-series collections".into(),
+                ));
+            }
+        }
         if fields.is_empty() {
             return Err(Error::Query("index requires at least one field".into()));
         }
@@ -1312,6 +1423,10 @@ impl<'e> Collection<'e> {
         )?;
         let idx_db = self.index_db_in(wtxn, &def)?;
         idx_db.clear(&mut *wtxn)?;
+        if self.profile.is_timeseries() {
+            self.backfill_timeseries_indexes_txn(wtxn, &mut [(key, def)])?;
+            return Ok(());
+        }
 
         // Backfill incrementally: workers parse/encode, the main thread writes
         // each completed chunk into the index immediately.
@@ -4630,7 +4745,13 @@ impl<'e> Collection<'e> {
     pub fn insert_one_txn(&self, wtxn: &mut RwTxn<'_>, mut doc: Value) -> Result<String> {
         if self.profile.is_timeseries() {
             let settings = self.timeseries_settings_in(&*wtxn)?.unwrap_or_default();
-            return crate::timeseries::insert(wtxn, self.env, &self.name, &settings, doc);
+            let id = crate::timeseries::insert(wtxn, self.env, &self.name, &settings, doc)?;
+            if let Some(doc) =
+                crate::timeseries::find_by_id(&*wtxn, self.env, &self.name, &settings, &id)?
+            {
+                self.apply_index_entries(wtxn, None, Some(&doc), &id)?;
+            }
+            return Ok(id);
         }
         self.ensure_standard()?;
         let ttl_at = ttl::take_insert_ttl_with_field(
@@ -4717,19 +4838,34 @@ impl<'e> Collection<'e> {
                     crate::timeseries::insert_replicated(
                         wtxn, self.env, &self.name, &settings, id, after,
                     )?;
+                    if let Some(doc) =
+                        crate::timeseries::find_by_id(&*wtxn, self.env, &self.name, &settings, id)?
+                    {
+                        self.apply_index_entries(wtxn, None, Some(&doc), id)?;
+                    }
                     return Ok(());
                 }
                 "update" => {
                     let after = after.ok_or_else(|| {
                         Error::Query("replication change is missing `after`".into())
                     })?;
+                    let before =
+                        crate::timeseries::find_by_id(&*wtxn, self.env, &self.name, &settings, id)?;
                     crate::timeseries::replace_by_id(
                         wtxn, self.env, &self.name, &settings, id, after,
                     )?;
+                    let after =
+                        crate::timeseries::find_by_id(&*wtxn, self.env, &self.name, &settings, id)?;
+                    self.apply_index_entries(wtxn, before.as_ref(), after.as_ref(), id)?;
                     return Ok(());
                 }
                 "delete" => {
+                    let before =
+                        crate::timeseries::find_by_id(&*wtxn, self.env, &self.name, &settings, id)?;
                     crate::timeseries::delete_by_id(wtxn, self.env, &self.name, &settings, id)?;
+                    if let Some(doc) = &before {
+                        self.apply_index_entries(wtxn, Some(doc), None, id)?;
+                    }
                     return Ok(());
                 }
                 other => {
@@ -4849,6 +4985,17 @@ impl<'e> Collection<'e> {
     ) -> Result<UpdateOutcome> {
         if self.profile.is_timeseries() {
             let settings = self.timeseries_settings_in(&*wtxn)?.unwrap_or_default();
+            let query = FindQuery {
+                filter: filter.clone(),
+                projection: None,
+                sort: Vec::new(),
+                skip: 0,
+                limit: if multi { None } else { Some(1) },
+                comment: None,
+                max_time_ms: None,
+                hint: None,
+            };
+            let before = crate::timeseries::find(&*wtxn, self.env, &self.name, &settings, &query)?;
             let report = crate::timeseries::update(
                 wtxn,
                 self.env,
@@ -4860,6 +5007,30 @@ impl<'e> Collection<'e> {
                 array_filters,
                 upsert,
             )?;
+            for old in &before {
+                let Some(old_id) = old.get("_id").and_then(Value::as_str) else {
+                    continue;
+                };
+                if let Some((_, new_id)) = report.moved.iter().find(|(old, _)| old == old_id) {
+                    self.apply_index_entries(wtxn, Some(old), None, old_id)?;
+                    if let Some(new_doc) = crate::timeseries::find_by_id(
+                        &*wtxn, self.env, &self.name, &settings, new_id,
+                    )? {
+                        self.apply_index_entries(wtxn, None, Some(&new_doc), new_id)?;
+                    }
+                } else if let Some(new_doc) =
+                    crate::timeseries::find_by_id(&*wtxn, self.env, &self.name, &settings, old_id)?
+                {
+                    self.apply_index_entries(wtxn, Some(old), Some(&new_doc), old_id)?;
+                }
+            }
+            if let Some(id) = &report.upserted_id {
+                if let Some(new_doc) =
+                    crate::timeseries::find_by_id(&*wtxn, self.env, &self.name, &settings, id)?
+                {
+                    self.apply_index_entries(wtxn, None, Some(&new_doc), id)?;
+                }
+            }
             return Ok(UpdateOutcome {
                 matched: report.matched,
                 modified: report.modified,
@@ -5328,7 +5499,25 @@ impl<'e> Collection<'e> {
     pub fn delete_txn(&self, wtxn: &mut RwTxn<'_>, filter: &Value, multi: bool) -> Result<usize> {
         if self.profile.is_timeseries() {
             let settings = self.timeseries_settings_in(&*wtxn)?.unwrap_or_default();
-            return crate::timeseries::delete(wtxn, self.env, &self.name, &settings, filter, multi);
+            let query = FindQuery {
+                filter: filter.clone(),
+                projection: None,
+                sort: Vec::new(),
+                skip: 0,
+                limit: if multi { None } else { Some(1) },
+                comment: None,
+                max_time_ms: None,
+                hint: None,
+            };
+            let before = crate::timeseries::find(&*wtxn, self.env, &self.name, &settings, &query)?;
+            let removed =
+                crate::timeseries::delete(wtxn, self.env, &self.name, &settings, filter, multi)?;
+            for doc in before {
+                if let Some(id) = doc.get("_id").and_then(Value::as_str) {
+                    self.apply_index_entries(wtxn, Some(&doc), None, id)?;
+                }
+            }
+            return Ok(removed);
         }
         self.ensure_standard()?;
         let keys = self.matching_keys(&*wtxn, filter, multi)?;
@@ -8398,11 +8587,14 @@ impl<'e> Collection<'e> {
     pub fn explain_in(&self, rtxn: &RoTxn<'_>, query: &FindQuery) -> Result<Value> {
         if self.profile.is_timeseries() {
             let matched = self.count_in(rtxn, &query.filter)?;
+            let hint = query.hint.as_ref().map(parse_index_hint).transpose()?;
+            let plan = self.query_index_plan(rtxn, &query.filter, hint.as_ref())?;
             return Ok(serde_json::json!({
                 "collection": self.name,
                 "profile": "timeseries",
-                "access": "bucket_scan",
-                "index_used": Value::Null,
+                "access": if plan.is_some() { "index_scan" } else { "bucket_scan" },
+                "index_used": plan.is_some(),
+                "index": plan.as_ref().map(|plan| plan.def.name()),
                 "filter": query.filter,
                 "matched": matched,
             }));

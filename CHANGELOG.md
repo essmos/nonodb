@@ -22,6 +22,12 @@ Full release notes: https://github.com/essmos/nonodb/releases
   synthetic `_id`; changing the time or meta field is a delete + insert and
   reports the new `_id` (`new_id` from `findAndModify`). Replication replays a
   move as delete + insert and pinned locators keep ids identical on replicas.
+- Add non-unique secondary indexes to time-series collections. `createIndex`,
+  `createIndexes`, `dropIndex`, `listIndexes`, and `reindex` backfill from
+  bucket rows; inserts, deletes, updates, upserts, and replicated writes keep
+  entries current, and `find`/`count`/`explain` use the planner
+  (`index_used`, `access: index_scan`). Unique indexes are rejected with a
+  clear error.
 - Add aggregation and retention for time-series collections. `aggregate` now
   decodes buckets through the time-range-pruned find path and runs the normal
   in-memory pipeline, so `$group`/`$bucket` downsampling works. The new
