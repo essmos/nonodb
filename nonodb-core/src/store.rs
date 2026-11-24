@@ -814,12 +814,7 @@ impl Store {
         before_ms: i64,
     ) -> Result<crate::timeseries::RetainReport> {
         let collection = self.collection_in(wtxn, name)?;
-        let Some(settings) = collection.timeseries_settings_in(&*wtxn)? else {
-            return Err(Error::Query(format!(
-                "collection `{name}` is not a time-series collection"
-            )));
-        };
-        crate::timeseries::retain(wtxn, &self.env, name, &settings, before_ms)
+        collection.retain_timeseries_txn(wtxn, before_ms)
     }
 
     /// Creates a time-series collection backed by columnar buckets.

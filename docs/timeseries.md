@@ -231,10 +231,9 @@ empty results.
 condition on the leading field and reports `"index_used": true` with
 `"access": "index_scan"` in `explain`. Index entries are maintained by
 `insert`, `delete`, `update`, upserts, and replicated writes; a row moved by an
-update removes its old entry and adds a new one. Retention drops whole buckets
-without visiting index entries, so stale entries can remain until `reindex` or
-`dropIndex`; they are harmless because candidate rows that no longer exist are
-skipped. Unique indexes are enforced on insert, update, upsert, and reindex; deleted
+update removes its old entry and adds a new one. Retention removes index
+entries for every reaped row (whole dropped buckets and the tombstoned boundary
+bucket) before returning, so `reindex` is not required to avoid stale keys. Unique indexes are enforced on insert, update, upsert, and reindex; deleted
 rows free their value immediately.
 
 ### Search indexes

@@ -613,6 +613,33 @@ impl<'e> Collection<'e> {
     }
 
     /// Compression and size statistics for a time-series collection.
+    /// Time-based retention that also removes index entries for reaped rows.
+    pub fn retain_timeseries_txn(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        before_ms: i64,
+    ) -> Result<crate::timeseries::RetainReport> {
+        let settings = self.timeseries_settings_in(&*wtxn)?.ok_or_else(|| {
+            Error::Query(format!(
+                "collection `{}` is not a time-series collection",
+                self.name
+            ))
+        })?;
+        let has_indexes = !self.index_defs(&*wtxn)?.is_empty()
+            || !self.search_index_defs_in(&*wtxn)?.is_empty()
+            || !self.vector_defs(&*wtxn)?.is_empty();
+        if !has_indexes {
+            return crate::timeseries::retain(wtxn, self.env, &self.name, &settings, before_ms);
+        }
+        let report = crate::timeseries::retain_with_reaped(
+            wtxn, self.env, &self.name, &settings, before_ms,
+        )?;
+        for (id, doc) in &report.reaped {
+            self.apply_all_index_entries(wtxn, Some(doc), None, id)?;
+        }
+        Ok(report)
+    }
+
     pub fn timeseries_stats(&self) -> Result<Option<crate::timeseries::Stats>> {
         if !self.profile.is_timeseries() {
             return Ok(None);

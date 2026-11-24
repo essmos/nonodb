@@ -2797,6 +2797,9 @@ pub struct RetainReport {
     /// Pending (unsealed) rows removed.
     pub dropped_rows: u64,
     pub remaining_rows: u64,
+    /// Documents removed by this pass. Skipped in JSON; used to clean indexes.
+    #[serde(skip)]
+    pub reaped: Vec<(String, Value)>,
 }
 
 /// Recomputes open-bucket row counts and rolls pointers whose bucket is gone.
@@ -3213,11 +3216,34 @@ pub fn retain(
     settings: &Settings,
     before_ms: i64,
 ) -> Result<RetainReport> {
+    retain_inner(wtxn, env, name, settings, before_ms, false)
+}
+
+/// Retention variant that also returns the removed documents so the caller can
+/// drop secondary/search/vector index entries.
+pub fn retain_with_reaped(
+    wtxn: &mut RwTxn<'_>,
+    env: &heed::Env,
+    name: &str,
+    settings: &Settings,
+    before_ms: i64,
+) -> Result<RetainReport> {
+    retain_inner(wtxn, env, name, settings, before_ms, true)
+}
+
+fn retain_inner(
+    wtxn: &mut RwTxn<'_>,
+    env: &heed::Env,
+    name: &str,
+    settings: &Settings,
+    before_ms: i64,
+    collect_reaped: bool,
+) -> Result<RetainReport> {
     let db =
         env.create_database::<Bytes, Bytes>(wtxn, Some(&format!("{BUCKET_DB_PREFIX}{name}")))?;
     let mut report = RetainReport::default();
     let mut buckets: Vec<(Vec<u8>, i64, i64)> = Vec::new();
-    let mut open_rows: Vec<Vec<u8>> = Vec::new();
+    let mut open_rows: Vec<(Vec<u8>, Value)> = Vec::new();
 
     for item in db.iter(&*wtxn)? {
         let (key, value) = item?;
@@ -3231,7 +3257,7 @@ pub fn retain(
                 let doc = Value::Object(row);
                 if let Some(ts) = extract_time(&doc, &settings.time_field) {
                     if ts < before_ms {
-                        open_rows.push(key.to_vec());
+                        open_rows.push((key.to_vec(), doc));
                     }
                 }
             }
@@ -3244,6 +3270,23 @@ pub fn retain(
             continue;
         };
         if end < before_ms {
+            if collect_reaped {
+                let payload = db
+                    .get(&*wtxn, &key)?
+                    .ok_or_else(|| corrupt("bucket disappeared during retention"))?
+                    .to_vec();
+                let (bucket, selected) = decode_bucket_inner(&payload, settings, None, None)?;
+                for (row, idx) in bucket.rows.iter().zip(selected.iter()) {
+                    let seq = *idx as u32;
+                    if bucket.deleted.contains(&seq) {
+                        continue;
+                    }
+                    let doc = row_doc(row, hash, salt, window, serial, seq);
+                    if let Some(id) = doc.get("_id").and_then(Value::as_str) {
+                        report.reaped.push((id.to_string(), doc));
+                    }
+                }
+            }
             db.delete(&mut *wtxn, &key)?;
             drop_tombstones(wtxn, &db, hash, salt, window, serial)?;
             report.dropped_buckets += 1;
@@ -3269,6 +3312,12 @@ pub fn retain(
             let expired = extract_time(&Value::Object(row.clone()), &settings.time_field)
                 .is_some_and(|ts| ts < before_ms);
             if expired {
+                if collect_reaped {
+                    let doc = row_doc(row, hash, salt, window, serial, seq);
+                    if let Some(id) = doc.get("_id").and_then(Value::as_str) {
+                        report.reaped.push((id.to_string(), doc));
+                    }
+                }
                 bucket.deleted.insert(seq);
                 added += 1;
             }
@@ -3293,7 +3342,12 @@ pub fn retain(
         }
     }
 
-    for key in &open_rows {
+    for (key, doc) in &open_rows {
+        if collect_reaped {
+            if let Some(id) = doc.get("_id").and_then(Value::as_str) {
+                report.reaped.push((id.to_string(), doc.clone()));
+            }
+        }
         db.delete(&mut *wtxn, key)?;
         report.dropped_rows += 1;
     }
@@ -5191,6 +5245,41 @@ mod tests {
         d.insert_one(json!({"ts": 2, "seq": 1})).unwrap();
         assert!(d.create_index("seq", true).is_err());
         assert!(d.create_index("seq", false).is_ok());
+    }
+
+    #[test]
+    fn retention_removes_index_entries_for_reaped_rows() {
+        let (_dir, store) = ts_store();
+        let settings = Settings {
+            time_field: "ts".into(),
+            ..Settings::default()
+        };
+        let c = store
+            .create_timeseries_collection("metrics", &settings)
+            .unwrap();
+        c.create_index("seq", true).unwrap();
+        c.insert_one(json!({"ts": 1_000, "seq": 1, "msg": "old"}))
+            .unwrap();
+        c.insert_one(json!({"ts": 2_000, "seq": 2, "msg": "new"}))
+            .unwrap();
+        c.insert_one(json!({"ts": 3_000, "seq": 3, "msg": "new"}))
+            .unwrap();
+        c.create_text_index("msg").unwrap();
+        let mut wtxn = store.write_txn().unwrap();
+        seal_all(&mut wtxn, store.env(), "metrics", &settings).unwrap();
+        wtxn.commit().unwrap();
+
+        let report = store.retain_timeseries("metrics", 1_500).unwrap();
+        assert_eq!(report.tombstoned_buckets, 1);
+        assert!(report.reaped.iter().any(|(_, doc)| doc["seq"] == json!(1)));
+        // The unique entry for the reaped row is gone, so the value is reusable.
+        c.insert_one(json!({"ts": 4_000, "seq": 1, "msg": "reused"}))
+            .unwrap();
+        assert_eq!(c.count(&json!({"seq": 1})).unwrap(), 1);
+        assert_eq!(
+            c.search("msg", "old", &json!({}), 0, None).unwrap().len(),
+            0
+        );
     }
 
     #[test]
