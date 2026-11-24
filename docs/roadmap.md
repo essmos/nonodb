@@ -312,11 +312,9 @@ comparison and practical migration caveats.
 
 ## Future work
 
-The current implementation plan is limited to this list.
-
-### P1 — low effort, worthwhile
-
-- Publish `nonodb-client` to PyPI using the prepared manual workflow.
+No active implementation backlog. Completed work is tracked in
+[CHANGELOG.md](../CHANGELOG.md); the remaining entries below are deliberate
+non-goals and documented limitations, not planned work.
 
 ## Non-goals
 

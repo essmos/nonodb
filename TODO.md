@@ -6,4 +6,4 @@ deliberate limitations are documented in [docs/roadmap.md](docs/roadmap.md).
 
 ## P1 — niski nakład, warto
 
-- [ ] Publish `nonodb-client` to PyPI using the prepared manual workflow.
+Brak otwartych zadań.
