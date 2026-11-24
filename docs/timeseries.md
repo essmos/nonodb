@@ -347,11 +347,14 @@ Read that carefully, because it matters operationally:
   any moment; seal or `seal_timeseries` shrinks them into the columnar payload.
 - Compaction is a whole-database operation: plan a maintenance window or run it
   against a replica, exactly like any other LMDB high-water issue.
-- Deleted rows are 27-byte tombstone keys until retention drops the bucket or a
-  compaction rewrites the file. Retention keeps the boundary bucket's columnar
-  payload and tombstones expired rows (so synthetic ids stay valid), which is
-  why the post-retention file is slightly larger than a renumbered rewrite would
-  be; the whole window is dropped once it ages out.
+- Deleted rows are bits in a per-bucket deletion bitmap appended to the columnar
+  payload (one bit per row, so 1000 deleted rows cost 125 bytes instead of
+  27-byte tombstone keys). Retention keeps the boundary bucket's columnar
+  payload and sets expired bits (so synthetic ids stay valid), which is why the
+  post-retention file is slightly larger than a renumbered rewrite would be;
+  the whole window is dropped once it ages out. Buckets written by older
+  versions keep separate `0x03` tombstone keys; reads accept both formats and
+  any write/seal folds the old keys into the bitmap.
 
 ### Reclaiming space
 
@@ -373,23 +376,27 @@ and **~38x smaller than the raw JSON** for this workload.
 ## Deleting rows
 
 `delete` works on time-series collections. Pending rows are removed from their
-key; rows inside sealed buckets get a **tombstone** (a 27-byte key) instead of a
-rewrite:
+key; rows inside sealed buckets get a **deletion bitmap bit** in the bucket
+payload instead of a rewrite:
 
 ```json
 {"op": "delete", "coll": "readings", "filter": {"device.id": "sensor-7", "status": "error"}, "multi": true}
 ```
 
-Why tombstones: synthetic `_id`s encode the row position inside a bucket, and a
-rewrite would renumber every following row. Tombstones keep sealed buckets
-immutable, so previously returned `_id`s stay valid and a delete costs one LMDB
-put instead of decoding and re-encoding a 2048-row bucket. `find`, `count`,
-`find_by_key`, aggregation, and `verify_data_dir` all skip tombstoned rows.
-`timeseries_stats()` reports them as `deleted_rows`.
+Why a bitmap: synthetic `_id`s encode the row position inside a bucket, and a
+rewrite would renumber every following row. Setting a bit keeps sealed buckets
+logically immutable (the column data is never renumbered), so previously
+returned `_id`s stay valid, and a delete costs one bucket re-encode instead of
+one LMDB key per deleted row. A full bucket that becomes empty is dropped
+outright. `find`, `count`, `find_by_key`, aggregation, and `verify_data_dir` all
+skip deleted rows. `timeseries_stats()` reports them as `deleted_rows`.
 
-Space from tombstones and sealed payloads is reclaimed when the bucket's whole
-window ages out (retention drops the bucket and its tombstones) or by
-compaction — see below. `delete` with `multi: false` removes at most one row.
+The bucket format is `NTB2` (bitmap appended after the columns). `NTB1` payloads
+and legacy `0x03` tombstone keys are still read; the next bucket write, delete,
+retention pass, or seal migrates them into the bitmap. Space from deleted rows
+and sealed payloads is reclaimed when the bucket's whole window ages out
+(retention drops the bucket) or by compaction — see below. `delete` with
+`multi: false` removes at most one row.
 
 ## Retention
 

@@ -4,6 +4,11 @@ Full release notes: https://github.com/essmos/nonodb/releases
 
 ## Unreleased
 
+- Store time-series deletions as a per-bucket bitmap appended to the columnar
+  payload instead of one 27-byte tombstone key per deleted row. `NTB1`
+  payloads and legacy `0x03` keys remain readable and migrate into the bitmap on
+  the next write, delete, retention, or seal. 10,000 deleted rows now cost about
+  1.25 KB of bitmap instead of 270 KB of keys.
 - Add `profile: "timeseries"` collections with bucketed columnar storage for
   IoT and event data. A bucket covers one series (`metaField`) and one time
   window; the meta value is stored once and every other field becomes a typed
