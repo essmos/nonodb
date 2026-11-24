@@ -405,6 +405,103 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     report_latency("find 1 h, 1 series (standard)", samples, scans);
 
+    let standard_sample = standard
+        .find(&query(json!({}), Some(1)))?
+        .into_iter()
+        .next()
+        .ok_or("no standard sample")?;
+    let standard_id = standard_sample["_id"]
+        .as_str()
+        .ok_or("no standard id")?
+        .to_string();
+    let mut samples = Vec::with_capacity(reads);
+    for _ in 0..reads {
+        let op = Instant::now();
+        assert!(standard.find_by_key(&standard_id)?.is_some());
+        samples.push(op.elapsed());
+    }
+    report_latency("find_by_key (standard)", samples, reads);
+
+    let mut samples = Vec::with_capacity(reads / 4);
+    for _ in 0..(reads / 4).max(1) {
+        let op = Instant::now();
+        standard.count(&wide)?;
+        samples.push(op.elapsed());
+    }
+    report_latency(
+        "count 1 h, 1 series (standard)",
+        samples,
+        (reads / 4).max(1),
+    );
+
+    let mut samples = Vec::with_capacity(agg_runs);
+    for _ in 0..agg_runs {
+        let op = Instant::now();
+        let _ = standard.aggregate(&pipeline)?;
+        samples.push(op.elapsed());
+    }
+    report_latency(
+        &format!("aggregate $group 1 h, 1 series (standard)"),
+        samples,
+        agg_runs,
+    );
+
+    let std_update_ids: Vec<String> = standard
+        .find(&query(json!({"status": "ok"}), Some(update_sample)))?
+        .iter()
+        .filter_map(|doc| doc["_id"].as_str().map(str::to_string))
+        .collect();
+    let mut samples = Vec::with_capacity(std_update_ids.len());
+    for id in &std_update_ids {
+        let op = Instant::now();
+        standard.update(&json!({"_id": id}), &json!({"$set": {"level": 9}}), false)?;
+        samples.push(op.elapsed());
+    }
+    report_latency(
+        &format!(
+            "update $set by _id, {} rows (standard)",
+            std_update_ids.len()
+        ),
+        samples,
+        std_update_ids.len(),
+    );
+
+    let std_delete_ids: Vec<String> = standard
+        .find(&query(json!({}), Some(delete_sample)))?
+        .iter()
+        .filter_map(|doc| doc["_id"].as_str().map(str::to_string))
+        .collect();
+    let mut samples = Vec::with_capacity(std_delete_ids.len());
+    for id in &std_delete_ids {
+        let op = Instant::now();
+        standard.delete(&json!({"_id": id}), false)?;
+        samples.push(op.elapsed());
+    }
+    report_latency(
+        &format!("delete by _id, {} rows (standard)", std_delete_ids.len()),
+        samples,
+        std_delete_ids.len(),
+    );
+
+    let std_index_started = Instant::now();
+    standard.create_index("status", false)?;
+    println!(
+        "{:<34} {:>9.2?}",
+        "createIndex status (standard)",
+        std_index_started.elapsed()
+    );
+    let mut samples = Vec::with_capacity((reads / 10).max(1));
+    for _ in 0..(reads / 10).max(1) {
+        let op = Instant::now();
+        let _ = standard.find(&indexed)?;
+        samples.push(op.elapsed());
+    }
+    report_latency(
+        "find indexed status+series (standard)",
+        samples,
+        (reads / 10).max(1),
+    );
+
     // Retention: drop the oldest hourly window of every series.
     let cutoff = base + 3_600_000;
     let retain_started = Instant::now();
