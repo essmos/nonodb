@@ -1672,6 +1672,39 @@ impl<'e> Collection<'e> {
         Ok(())
     }
 
+    /// Validates a multi-row update as one set: old entries of every updated id
+    /// are ignored (they are about to be replaced), while collisions within the
+    /// new batch are rejected before any row is written.
+    fn validate_unique_updates(&self, txn: &RoTxn<'_>, updates: &[(String, Value)]) -> Result<()> {
+        let updated: HashSet<String> = updates.iter().map(|(id, _)| id.clone()).collect();
+        for def in self.index_defs(txn)? {
+            if !def.unique {
+                continue;
+            }
+            let Some(db) = self.index_db(txn, &def)? else {
+                continue;
+            };
+            let mut seen: HashSet<Vec<u8>> = HashSet::new();
+            for (id, doc) in updates {
+                let keys = index::encode_index_keys(&def, doc)?;
+                for vb in keys.keys {
+                    if !seen.insert(vb.clone()) {
+                        return Err(Error::DuplicateKey(id.clone()));
+                    }
+                    for item in db.prefix_iter(txn, vb.as_slice())? {
+                        let (_key, existing) = item?;
+                        if let Some((existing_id, _)) = index::decode_index_value(existing) {
+                            if existing_id != *id && !updated.contains(&existing_id) {
+                                return Err(Error::DuplicateKey(id.clone()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn normalize_for_index(doc: &mut Value) -> Result<()> {
         date::normalize_document(doc)?;
         numeric::normalize_document(doc)?;
@@ -5205,14 +5238,16 @@ impl<'e> Collection<'e> {
                     crate::timeseries::find(&*wtxn, self.env, &self.name, &settings, &query)?
                 }
             };
+            let mut checks = Vec::with_capacity(before.len());
             for old in &before {
                 let mut check = old.clone();
                 apply_with_options(&mut check, update, filter, array_filters)?;
                 Self::normalize_for_index(&mut check)?;
                 if let Some(id) = old.get("_id").and_then(id::key_from_value) {
-                    self.validate_unique(&*wtxn, &check, &id)?;
+                    checks.push((id, check));
                 }
             }
+            self.validate_unique_updates(&*wtxn, &checks)?;
             if before.is_empty() && upsert {
                 let mut check = seed_from_filter(filter);
                 apply_upsert_with_options(&mut check, update, filter, array_filters)?;
@@ -5259,13 +5294,11 @@ impl<'e> Collection<'e> {
                     if let Some(new_doc) = crate::timeseries::find_by_id(
                         &*wtxn, self.env, &self.name, &settings, new_id,
                     )? {
-                        self.validate_unique(&*wtxn, &new_doc, new_id)?;
                         self.apply_all_index_entries(wtxn, None, Some(&new_doc), new_id)?;
                     }
                 } else if let Some(new_doc) =
                     crate::timeseries::find_by_id(&*wtxn, self.env, &self.name, &settings, old_id)?
                 {
-                    self.validate_unique(&*wtxn, &new_doc, old_id)?;
                     self.apply_all_index_entries(wtxn, Some(old), Some(&new_doc), old_id)?;
                 }
             }
@@ -5273,7 +5306,6 @@ impl<'e> Collection<'e> {
                 if let Some(new_doc) =
                     crate::timeseries::find_by_id(&*wtxn, self.env, &self.name, &settings, id)?
                 {
-                    self.validate_unique(&*wtxn, &new_doc, id)?;
                     self.apply_all_index_entries(wtxn, None, Some(&new_doc), id)?;
                 }
             }

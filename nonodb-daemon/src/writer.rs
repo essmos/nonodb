@@ -2424,6 +2424,35 @@ mod tests {
         assert_eq!(c.count(&json!({})).unwrap(), 2);
         assert_eq!(c.count(&json!({"k": 1})).unwrap(), 1);
         assert_eq!(c.count(&json!({"k": 2})).unwrap(), 1);
+
+        // A multi-update that makes two rows collide is rejected as a set
+        // before any row is rewritten; committing the shared txn is safe.
+        let mut wtxn = store.write_txn().unwrap();
+        let mut replication = ReplicationContext {
+            origin: None,
+            changes: Vec::new(),
+            ops: Vec::new(),
+        };
+        assert!(execute(
+            &store,
+            &mut wtxn,
+            &WriteReq::Update {
+                coll: "metrics".into(),
+                filter: json!({}),
+                update: json!({"$set": {"k": 5}}),
+                multi: true,
+                upsert: false,
+                array_filters: Vec::new(),
+                default_id: None,
+                vault: None,
+            },
+            &mut replication,
+        )
+        .is_err());
+        wtxn.commit().unwrap();
+        assert_eq!(c.count(&json!({"k": 1})).unwrap(), 1);
+        assert_eq!(c.count(&json!({"k": 2})).unwrap(), 1);
+        assert_eq!(c.count(&json!({"k": 5})).unwrap(), 0);
     }
 
     #[test]

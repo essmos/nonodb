@@ -5449,6 +5449,42 @@ mod tests {
     }
 
     #[test]
+    fn multi_update_collisions_are_rejected_before_writing() {
+        let (_dir, store) = ts_store();
+        let settings = Settings {
+            time_field: "ts".into(),
+            ..Settings::default()
+        };
+        let c = store
+            .create_timeseries_collection("metrics", &settings)
+            .unwrap();
+        c.create_index("k", true).unwrap();
+        c.insert_one(json!({"ts": 1, "k": 1})).unwrap();
+        c.insert_one(json!({"ts": 2, "k": 2})).unwrap();
+        assert!(c
+            .update(&json!({}), &json!({"$set": {"k": 5}}), true)
+            .is_err());
+        assert_eq!(c.count(&json!({"k": 1})).unwrap(), 1);
+        assert_eq!(c.count(&json!({"k": 2})).unwrap(), 1);
+        assert_eq!(c.count(&json!({"k": 5})).unwrap(), 0);
+        assert_eq!(
+            c.find(&crate::collection::FindQuery {
+                filter: json!({"k": 5}),
+                projection: None,
+                sort: Vec::new(),
+                skip: 0,
+                limit: None,
+                comment: None,
+                max_time_ms: None,
+                hint: Some(json!({"$natural": 1})),
+            })
+            .unwrap()
+            .len(),
+            0
+        );
+    }
+
+    #[test]
     fn time_range_delete_keeps_out_of_range_rows_in_the_bucket() {
         let (_dir, store) = ts_store();
         let settings = Settings {
