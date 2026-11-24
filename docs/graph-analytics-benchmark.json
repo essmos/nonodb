@@ -1,7 +1,7 @@
 {
   "daemon": "/home/ubuntu/nonodb-target/release/nonodb-daemon",
-  "daemon_bytes": 34726112,
-  "generated_at": "2026-11-24T14:35:21Z",
+  "daemon_bytes": 34744848,
+  "generated_at": "2026-11-24T17:14:56Z",
   "machine": {
     "cpu": "Intel Core Processor (Haswell, no TSX)",
     "cpu_count": 8,
@@ -28,56 +28,56 @@
     {
       "algorithms": {
         "degree_centrality": {
-          "max_ms": 428.5,
-          "min_ms": 428.5,
-          "p50_ms": 428.5,
+          "max_ms": 361.4,
+          "min_ms": 361.4,
+          "p50_ms": 361.4,
           "peak_rss_mb": 142.8,
           "result_nodes": 100000
         },
         "degree_distribution": {
-          "max_ms": 612.1,
-          "min_ms": 612.1,
-          "p50_ms": 612.1,
+          "max_ms": 593.6,
+          "min_ms": 593.6,
+          "p50_ms": 593.6,
           "peak_rss_mb": 180.1,
           "result_nodes": 100000
         },
         "k_core": {
-          "max_ms": 1271.1,
-          "min_ms": 1271.1,
-          "p50_ms": 1271.1,
-          "peak_rss_mb": 276.7,
+          "max_ms": 1304.2,
+          "min_ms": 1304.2,
+          "p50_ms": 1304.2,
+          "peak_rss_mb": 276.9,
           "result_nodes": 100000
         },
         "label_propagation": {
-          "max_ms": 1120.0,
-          "min_ms": 1120.0,
-          "p50_ms": 1120.0,
-          "peak_rss_mb": 221.4,
+          "max_ms": 1957.4,
+          "min_ms": 1957.4,
+          "p50_ms": 1957.4,
+          "peak_rss_mb": 242.4,
           "result_nodes": 100000
         },
         "pagerank": {
-          "max_ms": 1274.2,
-          "min_ms": 1274.2,
-          "p50_ms": 1274.2,
-          "peak_rss_mb": 180.1,
+          "max_ms": 1425.2,
+          "min_ms": 1425.2,
+          "p50_ms": 1425.2,
+          "peak_rss_mb": 180.2,
           "result_nodes": 100000
         }
       },
       "edges": 100000,
       "edges_per_node": 1.0,
       "ingest": {
-        "edges_ms": 2076.9,
-        "edges_per_s": 48150,
-        "nodes_ms": 504.3,
-        "nodes_per_s": 198278,
-        "total_ms": 2581.2
+        "edges_ms": 2072.5,
+        "edges_per_s": 48252,
+        "nodes_ms": 452.0,
+        "nodes_per_s": 221221,
+        "total_ms": 2524.5
       },
       "nodes": 100000,
       "pagerank_job": {
-        "ms": 1363.2,
-        "peak_rss_mb": 358.7,
-        "rss_after_mb": 358.7,
-        "rss_before_mb": 276.7,
+        "ms": 1519.3,
+        "peak_rss_mb": 358.9,
+        "rss_after_mb": 358.9,
+        "rss_before_mb": 276.9,
         "state": "completed"
       },
       "peak_rss_after_ingest_mb": 80.3,
@@ -87,119 +87,119 @@
     {
       "algorithms": {
         "degree_centrality": {
-          "max_ms": 2112.4,
-          "min_ms": 2112.4,
-          "p50_ms": 2112.4,
-          "peak_rss_mb": 503.9,
+          "max_ms": 2367.6,
+          "min_ms": 2367.6,
+          "p50_ms": 2367.6,
+          "peak_rss_mb": 503.2,
           "result_nodes": 500000
         },
         "degree_distribution": {
-          "max_ms": 3114.1,
-          "min_ms": 3114.1,
-          "p50_ms": 3114.1,
-          "peak_rss_mb": 693.4,
+          "max_ms": 3435.6,
+          "min_ms": 3435.6,
+          "p50_ms": 3435.6,
+          "peak_rss_mb": 692.8,
           "result_nodes": 500000
         },
         "k_core": {
-          "max_ms": 8621.9,
-          "min_ms": 8621.9,
-          "p50_ms": 8621.9,
-          "peak_rss_mb": 1234.5,
+          "max_ms": 8901.9,
+          "min_ms": 8901.9,
+          "p50_ms": 8901.9,
+          "peak_rss_mb": 1234.0,
           "result_nodes": 500000
         },
         "label_propagation": {
-          "max_ms": 7532.0,
-          "min_ms": 7532.0,
-          "p50_ms": 7532.0,
-          "peak_rss_mb": 921.7,
+          "max_ms": 12972.6,
+          "min_ms": 12972.6,
+          "p50_ms": 12972.6,
+          "peak_rss_mb": 1021.7,
           "result_nodes": 500000
         },
         "pagerank": {
-          "max_ms": 8743.7,
-          "min_ms": 8743.7,
-          "p50_ms": 8743.7,
-          "peak_rss_mb": 693.4,
+          "max_ms": 10635.1,
+          "min_ms": 10635.1,
+          "p50_ms": 10635.1,
+          "peak_rss_mb": 692.9,
           "result_nodes": 500000
         }
       },
       "edges": 500000,
       "edges_per_node": 1.0,
       "ingest": {
-        "edges_ms": 12476.0,
-        "edges_per_s": 40077,
-        "nodes_ms": 2450.3,
-        "nodes_per_s": 204055,
-        "total_ms": 14926.3
+        "edges_ms": 12547.5,
+        "edges_per_s": 39848,
+        "nodes_ms": 2733.7,
+        "nodes_per_s": 182900,
+        "total_ms": 15281.3
       },
       "nodes": 500000,
       "pagerank_job": {
-        "ms": 10688.0,
-        "peak_rss_mb": 1536.2,
-        "rss_after_mb": 830.9,
-        "rss_before_mb": 1115.4,
+        "ms": 12259.3,
+        "peak_rss_mb": 1535.8,
+        "rss_after_mb": 830.4,
+        "rss_before_mb": 1114.8,
         "state": "completed"
       },
-      "peak_rss_after_ingest_mb": 210.1,
-      "rss_after_ingest_mb": 209.8,
+      "peak_rss_after_ingest_mb": 209.3,
+      "rss_after_ingest_mb": 209.0,
       "seed": 42
     },
     {
       "algorithms": {
         "degree_centrality": {
-          "max_ms": 4370.4,
-          "min_ms": 4370.4,
-          "p50_ms": 4370.4,
-          "peak_rss_mb": 941.6,
+          "max_ms": 4339.6,
+          "min_ms": 4339.6,
+          "p50_ms": 4339.6,
+          "peak_rss_mb": 942.3,
           "result_nodes": 1000000
         },
         "degree_distribution": {
-          "max_ms": 8021.5,
-          "min_ms": 8021.5,
-          "p50_ms": 8021.5,
-          "peak_rss_mb": 1319.2,
+          "max_ms": 7774.0,
+          "min_ms": 7774.0,
+          "p50_ms": 7774.0,
+          "peak_rss_mb": 1319.8,
           "result_nodes": 1000000
         },
         "k_core": {
-          "max_ms": 20030.5,
-          "min_ms": 20030.5,
-          "p50_ms": 20030.5,
-          "peak_rss_mb": 2402.5,
+          "max_ms": 21094.6,
+          "min_ms": 21094.6,
+          "p50_ms": 21094.6,
+          "peak_rss_mb": 2403.1,
           "result_nodes": 1000000
         },
         "label_propagation": {
-          "max_ms": 16766.6,
-          "min_ms": 16766.6,
-          "p50_ms": 16766.6,
-          "peak_rss_mb": 1777.2,
+          "max_ms": 26494.3,
+          "min_ms": 26494.3,
+          "p50_ms": 26494.3,
+          "peak_rss_mb": 1978.7,
           "result_nodes": 1000000
         },
         "pagerank": {
-          "max_ms": 21807.3,
-          "min_ms": 21807.3,
-          "p50_ms": 21807.3,
-          "peak_rss_mb": 1402.3,
+          "max_ms": 23094.9,
+          "min_ms": 23094.9,
+          "p50_ms": 23094.9,
+          "peak_rss_mb": 1402.9,
           "result_nodes": 1000000
         }
       },
       "edges": 1000000,
       "edges_per_node": 1.0,
       "ingest": {
-        "edges_ms": 25594.9,
-        "edges_per_s": 39070,
-        "nodes_ms": 4855.9,
-        "nodes_per_s": 205935,
-        "total_ms": 30450.8
+        "edges_ms": 26976.8,
+        "edges_per_s": 37069,
+        "nodes_ms": 5482.0,
+        "nodes_per_s": 182415,
+        "total_ms": 32458.8
       },
       "nodes": 1000000,
       "pagerank_job": {
-        "ms": 25449.4,
-        "peak_rss_mb": 2967.6,
-        "rss_after_mb": 1064.2,
-        "rss_before_mb": 2125.4,
+        "ms": 26307.3,
+        "peak_rss_mb": 2968.4,
+        "rss_after_mb": 1080.0,
+        "rss_before_mb": 2125.9,
         "state": "completed"
       },
-      "peak_rss_after_ingest_mb": 354.8,
-      "rss_after_ingest_mb": 354.8,
+      "peak_rss_after_ingest_mb": 354.9,
+      "rss_after_ingest_mb": 354.9,
       "seed": 42
     }
   ]

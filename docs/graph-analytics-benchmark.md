@@ -12,9 +12,10 @@ environment metadata are in
 - Batches of 2,000 documents; adjacency is built by `set_graph` before edge
   ingestion, so edge writes include adjacency maintenance.
 - Times are wall-clock milliseconds from the client, one run per operation.
-- `pagerank` uses 5 iterations; `label_propagation` uses 5 synchronous
-  iterations; `k_core` uses both directions. All algorithms use both directions
-  where applicable and a 1 GiB per-run memory budget.
+- `pagerank` uses 5 iterations and outgoing edges; `label_propagation` uses 5
+  synchronous iterations over both directions; `k_core` and
+  `degree_distribution` use both directions. All algorithms use a 1 GiB per-run
+  memory budget.
 - Peak RSS is `VmHWM` sampled from `/proc`; it is a process high-water mark, so
   later operations inherit earlier peaks and the value is an upper bound, not an
   incremental measurement.
@@ -33,17 +34,17 @@ NONODB_DAEMON=target/release/nonodb-daemon \
 
 | Nodes | Edges | Ingest total | Degree | Degree distribution | PageRank (5 iter) | Label propagation (5 iter) | k-core | PageRank job |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 100,000 | 100,000 | 2.58 s | 429 ms | 612 ms | 1.27 s | 1.12 s | 1.27 s | 1.36 s |
-| 500,000 | 500,000 | 14.93 s | 2.11 s | 3.11 s | 8.74 s | 7.53 s | 8.62 s | 10.69 s |
-| 1,000,000 | 1,000,000 | 30.45 s | 4.37 s | 8.02 s | 21.81 s | 16.77 s | 20.03 s | 25.45 s |
+| 100,000 | 100,000 | 2.52 s | 361 ms | 594 ms | 1.43 s | 1.96 s | 1.30 s | 1.52 s |
+| 500,000 | 500,000 | 15.28 s | 2.37 s | 3.44 s | 10.64 s | 12.97 s | 8.90 s | 12.26 s |
+| 1,000,000 | 1,000,000 | 32.46 s | 4.34 s | 7.77 s | 23.09 s | 26.49 s | 21.09 s | 26.31 s |
 
 Ingest throughput:
 
 | Nodes | Node ingest | Edge ingest + adjacency |
 |---:|---:|---:|
-| 100,000 | 198,278/s | 48,150/s |
-| 500,000 | 204,055/s | 40,077/s |
-| 1,000,000 | 205,935/s | 39,070/s |
+| 100,000 | 221,221/s | 48,252/s |
+| 500,000 | 182,900/s | 39,848/s |
+| 1,000,000 | 182,415/s | 37,069/s |
 
 Peak process RSS (`VmHWM`) after the algorithm sequence:
 
