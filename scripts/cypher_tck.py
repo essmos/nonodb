@@ -657,7 +657,7 @@ def lex_fixture(text: str) -> list[str]:
             tokens.append(text[index : index + 2])
             index += 2
             continue
-        if char in "()[]{}:,|;-":
+        if char in "()[]{}:,|;-.":
             tokens.append(char)
             index += 1
             continue
@@ -877,6 +877,17 @@ class FixtureBuilder:
 
     def value(self) -> Any:
         token = self.peek()
+        if self.word() and self.peek(1) == ".":
+            variable = self.take()
+            self.take(".")
+            prop = self.take()
+            node_id = self.vars.get(variable)
+            if node_id is None:
+                raise FixtureError(f"unknown fixture variable {variable!r}")
+            for node in self.nodes:
+                if node["_id"] == node_id:
+                    return node.get(prop)
+            return None
         if token in {"date", "localtime", "time", "localdatetime", "datetime"} and self.peek(1) == "(":
             kind = self.take()
             self.take("(")

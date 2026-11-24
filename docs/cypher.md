@@ -39,15 +39,15 @@ rows = nodes.cypher(
 
 | Surface | Status | Notes |
 |---|---|---|
-| `MATCH`, `OPTIONAL MATCH`, `WHERE`, `RETURN` | Supported | labels, properties, direction, multiple patterns |
-| `WITH`, `UNWIND`, `ORDER BY`, `SKIP`, `LIMIT`, `DISTINCT` | Supported | deterministic ordering for equal keys |
+| `MATCH`, `OPTIONAL MATCH`, `WHERE`, `RETURN` | Supported | labels, properties, direction, multiple patterns; a leading `OPTIONAL MATCH` is supported |
+| `WITH`, `UNWIND`, `ORDER BY`, `SKIP`, `LIMIT`, `DISTINCT` | Partial | deterministic ordering for equal keys; `WITH ... SKIP` followed by another `MATCH` is explicitly unsupported |
 | Aggregations | Supported | `count`, `sum`, `avg`, `min`, `max`, `collect`; `DISTINCT`; null handling |
-| Expressions | Supported | list/map/string/math functions, `CASE`, comprehensions, map projections |
+| Expressions | Partial | list/map/string/math functions, `CASE`, comprehensions, map projections; some parser edge cases (long comparison chains, parameterised list slices) fail explicitly |
 | Variable-length paths | Supported | bounded by `max_depth`; relationship uniqueness |
 | `shortestPath`, `allShortestPaths` | Supported | unweighted; depth bounded |
 | Pattern comprehensions / pattern expressions | Partial | selected TCK scope; unsupported forms fail explicitly |
-| Subqueries | Partial | `CALL {}` is not part of the selected TCK baseline and fails explicitly |
-| Temporal values | Partial | constructors and `toString`; extreme ranges rejected |
+| Existential subqueries (`EXISTS { ... }`) | Supported | correlated and nested forms; `CALL {}` is not supported and fails explicitly |
+| Temporal values | Partial | constructors and accessors; some functions and extreme ranges fail explicitly |
 | `CREATE`, `MERGE`, `SET`, `REMOVE`, `DELETE` | Rejected | read-only mode |
 | `LOAD CSV`, schema commands, APOC, Bloom | Rejected | out of scope |
 | Arbitrary procedures | Rejected | only the four `gds.*` procedures below |
@@ -119,10 +119,16 @@ write queries, custom `test.*` procedures, and unsupported fixture syntax are
 excluded; each excluded scenario and its reason are listed in the committed
 [`tck-report.json`](tck-report.json), not silently skipped.
 
-Current baseline: **817 / 874 pass (93.48%)**, with **0 known wrong-result
-mismatches** and **57 explicit unsupported cases**. Unsupported syntax returns
+Current baseline: **859 / 874 pass (98.28%)**, with **0 known wrong-result
+mismatches** and **15 explicit unsupported cases**. Unsupported syntax returns
 `invalid_query`, never a silent success. Each unsupported scenario and reason is
 listed in `tck-report.json`.
+
+The remaining unsupported cases are deliberate safety/scope limits and parser
+edge cases: nesting above 16 levels, long chained comparisons, parameterised
+list slices, two temporal functions, two temporal fixture forms, and one
+`WITH ... SKIP`/`MATCH` pipeline shape. They are reported per scenario rather
+than silently skipped.
 
 ```bash
 scripts/fetch-opencypher-tck.sh /tmp/opencypher-tck

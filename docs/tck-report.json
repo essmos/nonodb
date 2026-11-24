@@ -3,11 +3,11 @@
   "selection": "All result-table scenarios with a read-only query, including graph fixtures, parameters, and named graphs. Expected-error and outline scenarios are excluded.",
   "total": 874,
   "counts": {
-    "pass": 817,
+    "pass": 859,
     "known_gap": 0,
-    "unsupported": 57
+    "unsupported": 15
   },
-  "pass_rate": 0.9348,
+  "pass_rate": 0.9828,
   "excluded": [
     {
       "feature": "Call1 - Basic procedure calling",
@@ -4766,16 +4766,16 @@
       "scenario": "[27] Matching from null nodes should return no results owing to finding no matches",
       "line": "526",
       "query": "OPTIONAL MATCH (a)\n      WITH a\n      MATCH (a)-->(b)\n      RETURN b",
-      "status": "unsupported",
-      "detail": "invalid_query: invalid query: cypher plan error: plan: OPTIONAL MATCH must follow at least one regular MATCH clause"
+      "status": "pass",
+      "detail": ""
     },
     {
       "feature": "Match3 - Match fixed length patterns",
       "scenario": "[28] Matching from null nodes should return no results owing to matches being filtered out",
       "line": "539",
       "query": "OPTIONAL MATCH (a:TheLabel)\n      WITH a\n      MATCH (a)-->(b)\n      RETURN b",
-      "status": "unsupported",
-      "detail": "invalid_query: invalid query: cypher plan error: plan: OPTIONAL MATCH must follow at least one regular MATCH clause"
+      "status": "pass",
+      "detail": ""
     },
     {
       "feature": "Match4 - Match variable length patterns scenarios",
@@ -4798,8 +4798,8 @@
       "scenario": "[3] Zero-length variable length pattern in the middle of the pattern",
       "line": "71",
       "query": "MATCH (a {name: 'A'})-[:CONTAINS*0..1]->(b)-[:FRIEND*0..1]->(c)\n      RETURN a, b, c",
-      "status": "unsupported",
-      "detail": "invalid_query: invalid query: cypher parse error: parse error:  --> 1:25\n  |\n1 | MATCH (a {name: 'A'})-[:CONTAINS*0..1]->(b)-[:FRIEND*0..1]->(c)\n  |                         ^---\n  |\n  = expected ident"
+      "status": "pass",
+      "detail": ""
     },
     {
       "feature": "Match4 - Match variable length patterns scenarios",
@@ -5174,8 +5174,8 @@
       "scenario": "[1] Simple OPTIONAL MATCH on empty graph",
       "line": "34",
       "query": "OPTIONAL MATCH (n)\n      RETURN n",
-      "status": "unsupported",
-      "detail": "invalid_query: invalid query: cypher plan error: plan: OPTIONAL MATCH must follow at least one regular MATCH clause"
+      "status": "pass",
+      "detail": ""
     },
     {
       "feature": "Match7 - Optional match",
@@ -5246,8 +5246,8 @@
       "scenario": "[10] Optionally matching from null nodes should return null",
       "line": "205",
       "query": "OPTIONAL MATCH (a)\n      WITH a\n      OPTIONAL MATCH (a)-->(b)\n      RETURN b",
-      "status": "unsupported",
-      "detail": "invalid_query: invalid query: cypher plan error: plan: OPTIONAL MATCH must follow at least one regular MATCH clause"
+      "status": "pass",
+      "detail": ""
     },
     {
       "feature": "Match7 - Optional match",
@@ -5334,8 +5334,8 @@
       "scenario": "[21] Handling optional matches between nulls",
       "line": "429",
       "query": "OPTIONAL MATCH (a:NotThere)\n      OPTIONAL MATCH (b:NotThere)\n      WITH a, b\n      OPTIONAL MATCH (b)-[r:NOR_THIS]->(a)\n      RETURN a, b, r",
-      "status": "unsupported",
-      "detail": "invalid_query: invalid query: cypher plan error: plan: OPTIONAL MATCH must follow at least one regular MATCH clause"
+      "status": "pass",
+      "detail": ""
     },
     {
       "feature": "Match7 - Optional match",
@@ -5382,8 +5382,8 @@
       "scenario": "[27] Handling optional matches between optionally matched entities",
       "line": "568",
       "query": "OPTIONAL MATCH (a:NotThere)\n      WITH a\n      MATCH (b:B)\n      WITH a, b\n      OPTIONAL MATCH (b)-[r:NOR_THIS]->(a)\n      RETURN a, b, r",
-      "status": "unsupported",
-      "detail": "invalid_query: invalid query: cypher plan error: plan: OPTIONAL MATCH must follow at least one regular MATCH clause"
+      "status": "pass",
+      "detail": ""
     },
     {
       "feature": "Match7 - Optional match",
@@ -6230,8 +6230,8 @@
       "scenario": "[3] Sort on aggregated function",
       "line": "75",
       "query": "MATCH (n)\n      RETURN n.division, max(n.age)\n        ORDER BY max(n.age)",
-      "status": "unsupported",
-      "detail": "invalid_query: invalid query: aggregate `max` used outside an aggregation context"
+      "status": "pass",
+      "detail": ""
     },
     {
       "feature": "ReturnOrderBy2 - Order by a single expression (order of projection)",
@@ -6254,8 +6254,8 @@
       "scenario": "[6] Count star should count everything in scope",
       "line": "136",
       "query": "MATCH (a)\n      RETURN a, count(*)\n      ORDER BY count(*)",
-      "status": "unsupported",
-      "detail": "invalid_query: invalid query: aggregate `count` used outside an aggregation context"
+      "status": "pass",
+      "detail": ""
     },
     {
       "feature": "ReturnOrderBy2 - Order by a single expression (order of projection)",
@@ -6310,24 +6310,24 @@
       "scenario": "[1] Sort on aggregate function and normal property",
       "line": "33",
       "query": "MATCH (n)\n      RETURN n.division, count(*)\n      ORDER BY count(*) DESC, n.division ASC",
-      "status": "unsupported",
-      "detail": "invalid_query: invalid query: aggregate `count` used outside an aggregation context"
+      "status": "pass",
+      "detail": ""
     },
     {
       "feature": "ReturnOrderBy4 - Order by in combination with projection",
       "scenario": "[1] ORDER BY of a column introduced in RETURN should return salient results in ascending order",
       "line": "33",
       "query": "WITH [0, 1] AS prows, [[2], [3, 4]] AS qrows\n      UNWIND prows AS p\n      UNWIND qrows[p] AS q\n      WITH p, count(q) AS rng\n      RETURN p\n      ORDER BY rng",
-      "status": "unsupported",
-      "detail": "invalid_query: invalid query: unbound variable `rng`"
+      "status": "pass",
+      "detail": ""
     },
     {
       "feature": "ReturnOrderBy4 - Order by in combination with projection",
       "scenario": "[2] Handle projections with ORDER BY",
       "line": "50",
       "query": "MATCH (c:Crew {name: 'Neo'})\n      WITH c, 0 AS relevance\n      RETURN c.rank AS rank\n      ORDER BY relevance, c.rank",
-      "status": "unsupported",
-      "detail": "invalid_query: invalid query: unbound variable `relevance`"
+      "status": "pass",
+      "detail": ""
     },
     {
       "feature": "ReturnOrderBy5 - Order by in combination with column renaming",
@@ -6654,16 +6654,16 @@
       "scenario": "[6] Forwarding a node variable possibly null",
       "line": "122",
       "query": "OPTIONAL MATCH (a:A)\n      WITH a AS a\n      MATCH (b:B)\n      RETURN a, b",
-      "status": "unsupported",
-      "detail": "invalid_query: invalid query: cypher plan error: plan: OPTIONAL MATCH must follow at least one regular MATCH clause"
+      "status": "pass",
+      "detail": ""
     },
     {
       "feature": "With2 - Forward single expression",
       "scenario": "[1] Forwarding a property to express a join",
       "line": "34",
       "query": "MATCH (a:Begin)\n      WITH a.num AS property\n      MATCH (b)\n      WHERE b.id = property\n      RETURN b",
-      "status": "unsupported",
-      "detail": "fixture: unexpected fixture character '.'"
+      "status": "pass",
+      "detail": ""
     },
     {
       "feature": "With2 - Forward single expression",
@@ -7038,8 +7038,8 @@
       "scenario": "[8] Sort by non-projected existing variable",
       "line": "211",
       "query": "MATCH (a:A)\n      WITH a, a.num + a.num2 AS sum\n      WITH a, a.num2 % 3 AS mod\n        ORDER BY sum\n        LIMIT 3\n      RETURN a, mod",
-      "status": "unsupported",
-      "detail": "invalid_query: invalid query: unbound variable `sum`"
+      "status": "pass",
+      "detail": ""
     },
     {
       "feature": "WithOrderBy4 - Order by in combination with projection and aliasing",
@@ -7062,8 +7062,8 @@
       "scenario": "[11] Sort by an aggregate projection",
       "line": "289",
       "query": "MATCH (a:A)\n      WITH a.num2 % 3 AS mod, sum(a.num + a.num2) AS sum\n        ORDER BY sum(a.num + a.num2)\n        LIMIT 2\n      RETURN mod, sum",
-      "status": "unsupported",
-      "detail": "invalid_query: invalid query: aggregate `sum` used outside an aggregation context"
+      "status": "pass",
+      "detail": ""
     },
     {
       "feature": "WithOrderBy4 - Order by in combination with projection and aliasing",
@@ -7086,8 +7086,8 @@
       "scenario": "[16] Handle constants and parameters inside an order by item which contains an aggregation expression",
       "line": "401",
       "query": "MATCH (person)\n      WITH avg(person.age) AS avgAge\n      ORDER BY $age + avg(person.age) - 1000\n      RETURN avgAge",
-      "status": "unsupported",
-      "detail": "invalid_query: invalid query: aggregate `avg` used outside an aggregation context"
+      "status": "pass",
+      "detail": ""
     },
     {
       "feature": "WithOrderBy4 - Order by in combination with projection and aliasing",
@@ -7111,7 +7111,7 @@
       "line": "62",
       "query": "MATCH (a)\n      WITH a.name AS property, a.num AS idToUse\n        ORDER BY property\n        SKIP 1\n      MATCH (b)\n      WHERE b.id = idToUse\n      RETURN DISTINCT b",
       "status": "unsupported",
-      "detail": "fixture: unexpected fixture character '.'"
+      "detail": "invalid_query: invalid query: cypher WITH ... SKIP followed by MATCH is not supported"
     },
     {
       "feature": "WithSkipLimit1 - Skip",
@@ -7134,8 +7134,8 @@
       "scenario": "[2] Handle dependencies across WITH with LIMIT",
       "line": "84",
       "query": "MATCH (a:Begin)\n      WITH a.num AS property\n        LIMIT 1\n      MATCH (b)\n      WHERE b.id = property\n      RETURN b",
-      "status": "unsupported",
-      "detail": "fixture: unexpected fixture character '.'"
+      "status": "pass",
+      "detail": ""
     },
     {
       "feature": "WithSkipLimit2 - Limit",
@@ -7182,8 +7182,8 @@
       "scenario": "[2] Filter node with property predicate on a single variable with multiple distinct bindings",
       "line": "53",
       "query": "MATCH (a)\n      WITH DISTINCT a.name2 AS name\n      WHERE a.name2 = 'B'\n      RETURN *",
-      "status": "unsupported",
-      "detail": "invalid_query: invalid query: unbound variable `a`"
+      "status": "pass",
+      "detail": ""
     },
     {
       "feature": "WithWhere1 - Filter single variable",
@@ -7318,8 +7318,8 @@
       "scenario": "[3] WHERE sees both, variable bound before but not after WITH and variable bound after but not before WITH",
       "line": "73",
       "query": "MATCH (a)\n      WITH a.name2 AS name\n      WHERE name = 'B' OR a.name2 = 'C'\n      RETURN *",
-      "status": "unsupported",
-      "detail": "invalid_query: invalid query: unbound variable `a`"
+      "status": "pass",
+      "detail": ""
     },
     {
       "feature": "Aggregation1 - Count",
@@ -7462,8 +7462,8 @@
       "scenario": "[1] Distinct on unbound node",
       "line": "33",
       "query": "OPTIONAL MATCH (a)\n      RETURN count(DISTINCT a)",
-      "status": "unsupported",
-      "detail": "invalid_query: invalid query: cypher plan error: plan: OPTIONAL MATCH must follow at least one regular MATCH clause"
+      "status": "pass",
+      "detail": ""
     },
     {
       "feature": "Aggregation8 - DISTINCT",
@@ -7886,72 +7886,72 @@
       "scenario": "[1] Simple subquery without WHERE clause",
       "line": "33",
       "query": "MATCH (n) WHERE exists {\n        (n)-->()\n      }\n      RETURN n",
-      "status": "unsupported",
-      "detail": "invalid_query: invalid query: cypher parse error: parse error:  --> 2:9\n  |\n2 |         (n)-->()\n  |         ^---\n  |\n  = expected ident, map_projection_property, or map_projection_all"
+      "status": "pass",
+      "detail": ""
     },
     {
       "feature": "ExistentialSubquery1 - Simple existential subquery",
       "scenario": "[2] Simple subquery with WHERE clause",
       "line": "53",
       "query": "MATCH (n) WHERE exists {\n        (n)-->(m) WHERE n.prop = m.prop\n      }\n      RETURN n",
-      "status": "unsupported",
-      "detail": "invalid_query: invalid query: cypher parse error: parse error:  --> 2:9\n  |\n2 |         (n)-->(m) WHERE n.prop = m.prop\n  |         ^---\n  |\n  = expected ident, map_projection_property, or map_projection_all"
+      "status": "pass",
+      "detail": ""
     },
     {
       "feature": "ExistentialSubquery1 - Simple existential subquery",
       "scenario": "[3] Simple subquery without WHERE clause, not existing pattern",
       "line": "74",
       "query": "MATCH (n) WHERE exists {\n        (n)-[:NA]->()\n      }\n      RETURN n",
-      "status": "unsupported",
-      "detail": "invalid_query: invalid query: cypher parse error: parse error:  --> 2:9\n  |\n2 |         (n)-[:NA]->()\n  |         ^---\n  |\n  = expected ident, map_projection_property, or map_projection_all"
+      "status": "pass",
+      "detail": ""
     },
     {
       "feature": "ExistentialSubquery1 - Simple existential subquery",
       "scenario": "[4] Simple subquery with WHERE clause, not existing pattern",
       "line": "93",
       "query": "MATCH (n) WHERE exists {\n        (n)-[r]->() WHERE type(r) = 'NA'\n      }\n      RETURN n",
-      "status": "unsupported",
-      "detail": "invalid_query: invalid query: cypher parse error: parse error:  --> 2:9\n  |\n2 |         (n)-[r]->() WHERE type(r) = 'NA'\n  |         ^---\n  |\n  = expected ident, map_projection_property, or map_projection_all"
+      "status": "pass",
+      "detail": ""
     },
     {
       "feature": "ExistentialSubquery2 - Full existential subquery",
       "scenario": "[1] Full existential subquery",
       "line": "33",
       "query": "MATCH (n) WHERE exists {\n        MATCH (n)-->()\n        RETURN true\n      }\n      RETURN n",
-      "status": "unsupported",
-      "detail": "invalid_query: invalid query: cypher parse error: parse error:  --> 2:9\n  |\n2 |         MATCH (n)-->()\n  |         ^---\n  |\n  = expected ident, map_projection_property, or map_projection_all"
+      "status": "pass",
+      "detail": ""
     },
     {
       "feature": "ExistentialSubquery2 - Full existential subquery",
       "scenario": "[2] Full existential subquery with aggregation",
       "line": "54",
       "query": "MATCH (n) WHERE exists {\n        MATCH (n)-->(m)\n        WITH n, count(*) AS numConnections\n        WHERE numConnections = 3\n        RETURN true\n      }\n      RETURN n",
-      "status": "unsupported",
-      "detail": "invalid_query: invalid query: cypher parse error: parse error:  --> 2:9\n  |\n2 |         MATCH (n)-->(m)\n  |         ^---\n  |\n  = expected ident, map_projection_property, or map_projection_all"
+      "status": "pass",
+      "detail": ""
     },
     {
       "feature": "ExistentialSubquery3 - Nested existential subquery",
       "scenario": "[1] Nested simple existential subquery",
       "line": "33",
       "query": "MATCH (n) WHERE exists {\n        MATCH (m) WHERE exists {\n          (n)-[]->(m) WHERE n.prop = m.prop\n        }\n        RETURN true\n      }\n      RETURN n",
-      "status": "unsupported",
-      "detail": "invalid_query: invalid query: cypher parse error: parse error:  --> 2:9\n  |\n2 |         MATCH (m) WHERE exists {\n  |         ^---\n  |\n  = expected ident, map_projection_property, or map_projection_all"
+      "status": "pass",
+      "detail": ""
     },
     {
       "feature": "ExistentialSubquery3 - Nested existential subquery",
       "scenario": "[2] Nested full existential subquery",
       "line": "56",
       "query": "MATCH (n) WHERE exists {\n        MATCH (m) WHERE exists {\n          MATCH (l)<-[:R]-(n)-[:R]->(m) RETURN true\n        }\n        RETURN true\n      }\n      RETURN n",
-      "status": "unsupported",
-      "detail": "invalid_query: invalid query: cypher parse error: parse error:  --> 2:9\n  |\n2 |         MATCH (m) WHERE exists {\n  |         ^---\n  |\n  = expected ident, map_projection_property, or map_projection_all"
+      "status": "pass",
+      "detail": ""
     },
     {
       "feature": "ExistentialSubquery3 - Nested existential subquery",
       "scenario": "[3] Nested full existential subquery with pattern predicate",
       "line": "79",
       "query": "MATCH (n) WHERE exists {\n        MATCH (m) WHERE exists {\n          MATCH (l) WHERE (l)<-[:R]-(n)-[:R]->(m) RETURN true\n        }\n        RETURN true\n      }\n      RETURN n",
-      "status": "unsupported",
-      "detail": "invalid_query: invalid query: cypher parse error: parse error:  --> 2:9\n  |\n2 |         MATCH (m) WHERE exists {\n  |         ^---\n  |\n  = expected ident, map_projection_property, or map_projection_all"
+      "status": "pass",
+      "detail": ""
     },
     {
       "feature": "Graph3 - Node labels",
@@ -7966,8 +7966,8 @@
       "scenario": "[7] `labels()` on null node",
       "line": "128",
       "query": "OPTIONAL MATCH (n:DoesNotExist)\n      RETURN labels(n), labels(null)",
-      "status": "unsupported",
-      "detail": "invalid_query: invalid query: cypher plan error: plan: OPTIONAL MATCH must follow at least one regular MATCH clause"
+      "status": "pass",
+      "detail": ""
     },
     {
       "feature": "Graph4 - Edge relationship type",
@@ -8054,16 +8054,16 @@
       "scenario": "[2] Statically access a property of a optional non-null node",
       "line": "50",
       "query": "OPTIONAL MATCH (n)\n      RETURN n.missing, n.missingToo, n.existing",
-      "status": "unsupported",
-      "detail": "invalid_query: invalid query: cypher plan error: plan: OPTIONAL MATCH must follow at least one regular MATCH clause"
+      "status": "pass",
+      "detail": ""
     },
     {
       "feature": "Graph6 - Static property access",
       "scenario": "[3] Statically access a property of a null node",
       "line": "66",
       "query": "OPTIONAL MATCH (n)\n      RETURN n.missing",
-      "status": "unsupported",
-      "detail": "invalid_query: invalid query: cypher plan error: plan: OPTIONAL MATCH must follow at least one regular MATCH clause"
+      "status": "pass",
+      "detail": ""
     },
     {
       "feature": "Graph6 - Static property access",
@@ -8086,16 +8086,16 @@
       "scenario": "[6] Statically access a property of a optional non-null relationship",
       "line": "111",
       "query": "OPTIONAL MATCH ()-[r]->()\n      RETURN r.missing, r.missingToo, r.existing",
-      "status": "unsupported",
-      "detail": "invalid_query: invalid query: cypher plan error: plan: OPTIONAL MATCH must follow at least one regular MATCH clause"
+      "status": "pass",
+      "detail": ""
     },
     {
       "feature": "Graph6 - Static property access",
       "scenario": "[7] Statically access a property of a null relationship",
       "line": "127",
       "query": "OPTIONAL MATCH ()-[r]->()\n      RETURN r.missing",
-      "status": "unsupported",
-      "detail": "invalid_query: invalid query: cypher plan error: plan: OPTIONAL MATCH must follow at least one regular MATCH clause"
+      "status": "pass",
+      "detail": ""
     },
     {
       "feature": "Graph6 - Static property access",
@@ -8142,8 +8142,8 @@
       "scenario": "[4] Using `keys()` on an optionally matched node",
       "line": "88",
       "query": "OPTIONAL MATCH (n)\n      UNWIND keys(n) AS x\n      RETURN DISTINCT x AS theProps",
-      "status": "unsupported",
-      "detail": "invalid_query: invalid query: cypher plan error: plan: OPTIONAL MATCH must follow at least one regular MATCH clause"
+      "status": "pass",
+      "detail": ""
     },
     {
       "feature": "Graph8 - Property keys function",
@@ -8166,8 +8166,8 @@
       "scenario": "[7] Using `keys()` on an optionally matched relationship",
       "line": "138",
       "query": "OPTIONAL MATCH ()-[r:KNOWS]-()\n      UNWIND keys(r) AS x\n      RETURN DISTINCT x AS theProps",
-      "status": "unsupported",
-      "detail": "invalid_query: invalid query: cypher plan error: plan: OPTIONAL MATCH must follow at least one regular MATCH clause"
+      "status": "pass",
+      "detail": ""
     },
     {
       "feature": "Graph8 - Property keys function",
@@ -8198,8 +8198,8 @@
       "scenario": "[3] `properties()` on null",
       "line": "65",
       "query": "OPTIONAL MATCH (n:DoesNotExist)\n      OPTIONAL MATCH (n)-[r:NOT_THERE]->()\n      RETURN properties(n), properties(r), properties(null)",
-      "status": "unsupported",
-      "detail": "invalid_query: invalid query: cypher plan error: plan: OPTIONAL MATCH must follow at least one regular MATCH clause"
+      "status": "pass",
+      "detail": ""
     },
     {
       "feature": "Graph9 - Retrieve all properties as a property map",
@@ -9790,16 +9790,16 @@
       "scenario": "[2] Property null check on optional non-null node",
       "line": "50",
       "query": "OPTIONAL MATCH (n)\n      RETURN n.missing IS NULL,\n             n.exists IS NULL",
-      "status": "unsupported",
-      "detail": "invalid_query: invalid query: cypher plan error: plan: OPTIONAL MATCH must follow at least one regular MATCH clause"
+      "status": "pass",
+      "detail": ""
     },
     {
       "feature": "Null1 - IS NULL validation",
       "scenario": "[3] Property null check on null node",
       "line": "67",
       "query": "OPTIONAL MATCH (n)\n      RETURN n.missing IS NULL",
-      "status": "unsupported",
-      "detail": "invalid_query: invalid query: cypher plan error: plan: OPTIONAL MATCH must follow at least one regular MATCH clause"
+      "status": "pass",
+      "detail": ""
     },
     {
       "feature": "Null1 - IS NULL validation",
@@ -9830,16 +9830,16 @@
       "scenario": "[2] Property not null check on optional non-null node",
       "line": "50",
       "query": "OPTIONAL MATCH (n)\n      RETURN n.missing IS NOT NULL,\n             n.exists IS NOT NULL",
-      "status": "unsupported",
-      "detail": "invalid_query: invalid query: cypher plan error: plan: OPTIONAL MATCH must follow at least one regular MATCH clause"
+      "status": "pass",
+      "detail": ""
     },
     {
       "feature": "Null2 - IS NOT NULL validation",
       "scenario": "[3] Property not null check on null node",
       "line": "67",
       "query": "OPTIONAL MATCH (n)\n      RETURN n.missing IS NOT NULL",
-      "status": "unsupported",
-      "detail": "invalid_query: invalid query: cypher plan error: plan: OPTIONAL MATCH must follow at least one regular MATCH clause"
+      "status": "pass",
+      "detail": ""
     },
     {
       "feature": "Null2 - IS NOT NULL validation",

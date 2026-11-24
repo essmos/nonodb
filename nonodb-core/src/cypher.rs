@@ -309,6 +309,37 @@ impl<'a> Executor<'a> {
                 {
                     return self.optional(base, optional, Some(pred));
                 }
+                if let Plan::Project {
+                    input: inner,
+                    include_existing,
+                    exprs,
+                } = input.as_ref()
+                {
+                    if !exprs.iter().any(|expr| contains_aggregate(&expr.expr)) {
+                        return self.filter_project(inner, *include_existing, exprs, false, pred);
+                    }
+                }
+                if let Plan::Distinct {
+                    input: distinct_input,
+                } = input.as_ref()
+                {
+                    if let Plan::Project {
+                        input: inner,
+                        include_existing,
+                        exprs,
+                    } = distinct_input.as_ref()
+                    {
+                        if !exprs.iter().any(|expr| contains_aggregate(&expr.expr)) {
+                            return self.filter_project(
+                                inner,
+                                *include_existing,
+                                exprs,
+                                true,
+                                pred,
+                            );
+                        }
+                    }
+                }
                 let rows = self.execute_input(input)?;
                 let mut out = Vec::new();
                 for row in rows {
@@ -1156,6 +1187,94 @@ impl<'a> Executor<'a> {
         Ok(Some(ok))
     }
 
+    fn filter_project(
+        &mut self,
+        inner: &Plan,
+        include_existing: bool,
+        exprs: &[ProjectExpr],
+        distinct: bool,
+        pred: &Expr,
+    ) -> Result<Vec<Row>> {
+        let rows = self.execute_input(inner)?;
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        for row in rows {
+            self.tick()?;
+            let projected = self.project_rows(vec![row.clone()], include_existing, exprs)?;
+            let Some(projected) = projected.into_iter().next() else {
+                continue;
+            };
+            let mut scope = row;
+            scope.merge(&projected);
+            if !truthy(&self.eval(pred, &scope, None)?) {
+                continue;
+            }
+            if distinct {
+                let key = serde_json::to_string(&projected.visible_values())?;
+                if !seen.insert(key) {
+                    continue;
+                }
+            }
+            out.push(projected);
+        }
+        Ok(out)
+    }
+
+    fn projected_rows_with_scope(&mut self, plan: &Plan) -> Result<Vec<(Row, Row)>> {
+        if let Plan::Project {
+            input,
+            include_existing,
+            exprs,
+        } = plan
+        {
+            if !exprs.iter().any(|expr| contains_aggregate(&expr.expr)) {
+                let bases = self.projected_rows_with_scope(input)?;
+                let mut out = Vec::with_capacity(bases.len());
+                for (row, scope) in bases {
+                    let projected = self.project_rows(vec![row], *include_existing, exprs)?;
+                    let Some(projected) = projected.into_iter().next() else {
+                        continue;
+                    };
+                    let mut merged = scope;
+                    merged.merge(&projected);
+                    out.push((projected, merged));
+                }
+                return Ok(out);
+            }
+        }
+        let rows = self.execute_input(plan)?;
+        Ok(rows.into_iter().map(|row| (row.clone(), row)).collect())
+    }
+
+    fn eval_sort_key_with_aliases(
+        &mut self,
+        expr: &Expr,
+        row: &Row,
+        aliases: &HashMap<String, String>,
+    ) -> Result<Value> {
+        let name = expr_name(expr);
+        if let Some(alias) = aliases.get(&name) {
+            if let Some(value) = row.get(alias) {
+                return Ok(value.clone());
+            }
+        }
+        if let Some(value) = row.get(&name) {
+            return Ok(value.clone());
+        }
+        match expr {
+            Expr::Binary { op, lhs, rhs } => {
+                let left = self.eval_sort_key_with_aliases(lhs, row, aliases)?;
+                let right = self.eval_sort_key_with_aliases(rhs, row, aliases)?;
+                eval_binary(*op, left, right)
+            }
+            Expr::Unary { op, operand } => {
+                let value = self.eval_sort_key_with_aliases(operand, row, aliases)?;
+                eval_unary(*op, value)
+            }
+            _ => self.eval(expr, row, None),
+        }
+    }
+
     fn sort(&mut self, input: &Plan, keys: &[SortKey]) -> Result<Vec<Row>> {
         if let Plan::Project {
             input: inner,
@@ -1164,21 +1283,56 @@ impl<'a> Executor<'a> {
         } = input
         {
             if exprs.iter().any(|expr| contains_aggregate(&expr.expr)) {
-                let rows = self.sort(inner, keys)?;
-                return self.project_rows(rows, *include_existing, exprs);
+                let aggregate_order = keys.iter().any(|key| {
+                    contains_aggregate(&key.expr)
+                        || exprs.iter().any(|expr| {
+                            contains_aggregate(&expr.expr)
+                                && (expr.alias.as_deref() == Some(expr_name(&key.expr).as_str())
+                                    || expr_name(&expr.expr) == expr_name(&key.expr))
+                        })
+                });
+                if !aggregate_order {
+                    let rows = self.sort(inner, keys)?;
+                    return self.project_rows(rows, *include_existing, exprs);
+                }
+                let rows = self.execute_input(inner)?;
+                let projected = self.project_rows(rows, *include_existing, exprs)?;
+                let aliases: HashMap<String, String> = exprs
+                    .iter()
+                    .filter(|expr| contains_aggregate(&expr.expr))
+                    .filter_map(|expr| {
+                        expr.alias
+                            .as_ref()
+                            .map(|alias| (expr_name(&expr.expr), alias.clone()))
+                    })
+                    .collect();
+                let mut keyed = Vec::with_capacity(projected.len());
+                for row in projected {
+                    let mut values = Vec::with_capacity(keys.len());
+                    for key in keys {
+                        values.push(self.eval_sort_key_with_aliases(&key.expr, &row, &aliases)?);
+                    }
+                    keyed.push((values, row));
+                }
+                keyed.sort_by(|(a, _), (b, _)| {
+                    for (index, key) in keys.iter().enumerate() {
+                        let order = cmp_json(&a[index], &b[index]);
+                        if order != Ordering::Equal {
+                            return if key.desc { order.reverse() } else { order };
+                        }
+                    }
+                    Ordering::Equal
+                });
+                return Ok(keyed.into_iter().map(|(_, row)| row).collect());
             }
-            let rows = self.execute_input(inner)?;
+            let pairs = self.projected_rows_with_scope(input)?;
+            let mut aliases = HashMap::new();
+            collect_projection_aliases(input, &mut aliases);
             let mut keyed = Vec::new();
-            for row in rows {
-                let projected = self.project_rows(vec![row.clone()], *include_existing, exprs)?;
-                let Some(projected) = projected.into_iter().next() else {
-                    continue;
-                };
-                let mut scope = row;
-                scope.merge(&projected);
+            for (projected, scope) in pairs {
                 let mut values = Vec::with_capacity(keys.len());
                 for key in keys {
-                    values.push(self.eval(&key.expr, &scope, None)?);
+                    values.push(self.eval_sort_key_with_aliases(&key.expr, &scope, &aliases)?);
                 }
                 keyed.push((values, projected));
             }
@@ -1246,6 +1400,47 @@ impl<'a> Executor<'a> {
             }
         }
         Ok(groups.into_values().flatten().collect())
+    }
+
+    fn exists_subquery(&mut self, body: &str, row: &Row) -> Result<bool> {
+        let trimmed = body.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        let has_clause = ["match", "with", "unwind", "return", "optional", "call"]
+            .iter()
+            .any(|keyword| lower.starts_with(keyword));
+        let mut subquery = if has_clause {
+            trimmed.to_string()
+        } else {
+            format!("MATCH {trimmed} RETURN true")
+        };
+        if !subquery.to_ascii_lowercase().contains("return") {
+            subquery.push_str(" RETURN true");
+        }
+        let expanded = expand_exists_subqueries(&prepend_optional_anchor(&subquery))?;
+        let normalized = normalize_query_text(&expanded);
+        let query: Query = parse(&normalized)
+            .map_err(|error| Error::Query(format!("cypher subquery parse error: {error}")))?;
+        if query.statement_count() != 1 {
+            return Err(Error::Query(
+                "cypher supports exactly one read-only statement".into(),
+            ));
+        }
+        if query.clauses.iter().any(is_write_clause) {
+            return Err(Error::Query(
+                "cypher write clauses are not supported in read-only mode".into(),
+            ));
+        }
+        let extra_labels = collect_extra_labels(&query);
+        let plan = plan_query(&query)
+            .map_err(|error| Error::Query(format!("cypher subquery plan error: {error}")))?;
+        let plan = inject_extra_labels(optimize(plan), &extra_labels);
+        let mut bound: HashSet<String> = row.visible_values().keys().cloned().collect();
+        validate_plan(&plan, &mut bound)?;
+        let saved = std::mem::take(&mut self.pending_input);
+        self.pending_input = vec![row.clone()];
+        let result = self.execute(&plan, Vec::new());
+        self.pending_input = saved;
+        Ok(!result?.is_empty())
     }
 
     fn eval_usize(&mut self, expr: &Expr, row: &Row) -> Result<usize> {
@@ -1661,6 +1856,12 @@ impl<'a> Executor<'a> {
                         .collect::<Result<Vec<_>>>()?,
                     FunctionArguments::Wildcard => Vec::new(),
                 };
+                if name.eq_ignore_ascii_case("nonodb_exists") {
+                    let Some(body) = args.first().and_then(Value::as_str) else {
+                        return Ok(Value::Bool(false));
+                    };
+                    return Ok(Value::Bool(self.exists_subquery(body, row)?));
+                }
                 self.call_function(name, args)
             }
             Expr::ListComprehension {
@@ -2068,11 +2269,14 @@ impl<'a> Executor<'a> {
                     .cloned()
                     .unwrap_or_else(|| json!([])),
             }),
-            "labels" => Ok(arg(0)
-                .get("_labels")
-                .cloned()
-                .or_else(|| arg(0).get("labels").cloned())
-                .unwrap_or_else(|| json!([]))),
+            "labels" => Ok(match arg(0) {
+                Value::Null => Value::Null,
+                value => value
+                    .get("_labels")
+                    .cloned()
+                    .or_else(|| value.get("labels").cloned())
+                    .unwrap_or_else(|| json!([])),
+            }),
             "type" => Ok(Graph::relationship_type(&arg(0))
                 .map(|value| Value::String(value.to_string()))
                 .unwrap_or(Value::Null)),
@@ -2462,6 +2666,19 @@ fn is_aggregate(name: &str) -> bool {
     )
 }
 
+fn collect_projection_aliases(plan: &Plan, out: &mut HashMap<String, String>) {
+    if let Plan::Project { input, exprs, .. } = plan {
+        for expr in exprs {
+            if contains_aggregate(&expr.expr) {
+                if let Some(alias) = &expr.alias {
+                    out.insert(expr_name(&expr.expr), alias.clone());
+                }
+            }
+        }
+        collect_projection_aliases(input, out);
+    }
+}
+
 fn expr_name(expr: &Expr) -> String {
     expr_name_prec(expr, 0)
 }
@@ -2635,16 +2852,44 @@ fn collect_plan_vars(plan: &Plan, out: &mut Vec<String>) {
         }
         Plan::Filter { input, .. }
         | Plan::PropertyMapFilter { input, .. }
-        | Plan::Project { input, .. }
         | Plan::Sort { input, .. }
         | Plan::Skip { input, .. }
         | Plan::Limit { input, .. }
         | Plan::ShortestPath { input, .. }
-        | Plan::NamedPath { input, .. }
         | Plan::PlannerHint { input, .. }
-        | Plan::Unwind { input, .. }
-        | Plan::Distinct { input }
-        | Plan::Optional { input, .. } => collect_plan_vars(input, out),
+        | Plan::Distinct { input } => collect_plan_vars(input, out),
+        Plan::Project { input, exprs, .. } => {
+            collect_plan_vars(input, out);
+            for expr in exprs {
+                if let Some(alias) = &expr.alias {
+                    out.push(alias.clone());
+                } else if let Expr::Variable(name) = &expr.expr {
+                    out.push(name.clone());
+                }
+            }
+        }
+        Plan::NamedPath { input, variable } => {
+            collect_plan_vars(input, out);
+            out.push(variable.clone());
+        }
+        Plan::Unwind {
+            input,
+            expression: _,
+            alias,
+        } => {
+            collect_plan_vars(input, out);
+            out.push(alias.clone());
+        }
+        Plan::Optional { input, optional } => {
+            collect_plan_vars(input, out);
+            collect_plan_vars(optional, out);
+        }
+        Plan::ProcedureCall { input, yields, .. } => {
+            collect_plan_vars(input, out);
+            for item in yields {
+                out.push(item.binding().to_string());
+            }
+        }
         Plan::Cartesian { left, right } | Plan::Union { left, right, .. } => {
             collect_plan_vars(left, out);
             collect_plan_vars(right, out);
@@ -3304,7 +3549,11 @@ fn validate_plan(plan: &Plan, bound: &mut std::collections::HashSet<String>) -> 
         }
         Plan::Filter { input, pred } => {
             validate_plan(input, bound)?;
-            validate_expr(pred, bound)?;
+            let mut available = bound.clone();
+            let mut plan_vars = Vec::new();
+            collect_plan_vars(input, &mut plan_vars);
+            available.extend(plan_vars);
+            validate_expr(pred, &available)?;
         }
         Plan::PropertyMapFilter {
             input,
@@ -3640,7 +3889,7 @@ fn normalize_is_null_comparisons(query: &str) -> String {
 
 fn normalize_reserved_labels(query: &str) -> String {
     let mut out = String::with_capacity(query.len() + 16);
-    let reserved = ["single", "any", "none", "all", "exists", "end"];
+    let reserved = ["single", "any", "none", "all", "exists", "end", "contains"];
     let chars: Vec<char> = query.chars().collect();
     let mut index = 0;
     let mut quote: Option<char> = None;
@@ -3812,11 +4061,9 @@ fn normalize_literals(query: &str) -> String {
 pub fn execute(view: &dyn GraphView, options: &CypherOptions) -> Result<Value> {
     options.validate()?;
     check_nesting_depth(&options.query)?;
-    let normalized = normalize_reserved_labels(&normalize_is_null_comparisons(
-        &normalize_literals(&options.query)
-            .replace("<-->", "--")
-            .replace(":T|:T", ":T"),
-    ));
+    reject_unsupported_shapes(&options.query)?;
+    let expanded = expand_exists_subqueries(&prepend_optional_anchor(&options.query))?;
+    let normalized = normalize_query_text(&expanded);
     let query: Query =
         parse(&normalized).map_err(|error| Error::Query(format!("cypher parse error: {error}")))?;
     if query.statement_count() != 1 {
@@ -3864,6 +4111,150 @@ pub fn execute(view: &dyn GraphView, options: &CypherOptions) -> Result<Value> {
         )));
     }
     Ok(result)
+}
+
+fn reject_unsupported_shapes(query: &str) -> Result<()> {
+    let upper = query.to_ascii_uppercase();
+    if let Some(skip) = upper.find(" SKIP ") {
+        if upper[..skip].rfind(" WITH ").is_some() && upper[skip + 6..].contains(" MATCH ") {
+            return Err(Error::Query(
+                "cypher WITH ... SKIP followed by MATCH is not supported".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn normalize_query_text(query: &str) -> String {
+    normalize_reserved_labels(&normalize_is_null_comparisons(
+        &normalize_literals(query)
+            .replace("<-->", "--")
+            .replace(":T|:T", ":T"),
+    ))
+}
+
+fn prepend_optional_anchor(query: &str) -> String {
+    let trimmed = query.trim_start();
+    if trimmed
+        .get(..14)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("OPTIONAL MATCH"))
+    {
+        format!("WITH 1 AS __nonodb_anchor {query}")
+    } else {
+        query.to_string()
+    }
+}
+
+fn cypher_string_literal(value: &str) -> String {
+    let mut out = String::from("'");
+    for character in value.chars() {
+        match character {
+            '\\' => out.push_str("\\\\"),
+            '\'' => out.push_str("\\'"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            other => out.push(other),
+        }
+    }
+    out.push('\'');
+    out
+}
+
+fn expand_exists_subqueries(query: &str) -> Result<String> {
+    let chars: Vec<char> = query.chars().collect();
+    let mut out = String::new();
+    let mut index = 0;
+    while index < chars.len() {
+        let character = chars[index];
+        if character == '\'' || character == '"' {
+            let quote = character;
+            out.push(character);
+            index += 1;
+            while index < chars.len() {
+                let current = chars[index];
+                out.push(current);
+                index += 1;
+                if current == '\\' && index < chars.len() {
+                    out.push(chars[index]);
+                    index += 1;
+                } else if current == quote {
+                    break;
+                }
+            }
+            continue;
+        }
+        if character == '/' && chars.get(index + 1) == Some(&'/') {
+            while index < chars.len() && chars[index] != '\n' {
+                out.push(chars[index]);
+                index += 1;
+            }
+            continue;
+        }
+        let word = chars
+            .get(index..index + 6)
+            .map(|slice| slice.iter().collect::<String>())
+            .unwrap_or_default();
+        let before_ok =
+            index == 0 || !(chars[index - 1].is_ascii_alphanumeric() || chars[index - 1] == '_');
+        let after_ok = chars
+            .get(index + 6)
+            .is_none_or(|next| !(next.is_ascii_alphanumeric() || *next == '_'));
+        if before_ok && after_ok && word.eq_ignore_ascii_case("exists") {
+            let mut cursor = index + 6;
+            while chars.get(cursor).is_some_and(|c| c.is_whitespace()) {
+                cursor += 1;
+            }
+            if chars.get(cursor) == Some(&'{') {
+                let body_start = cursor + 1;
+                let mut depth = 1usize;
+                let mut end = body_start;
+                while end < chars.len() {
+                    let current = chars[end];
+                    if current == '\'' || current == '"' {
+                        let quote = current;
+                        end += 1;
+                        while end < chars.len() {
+                            if chars[end] == '\\' {
+                                end += 2;
+                                continue;
+                            }
+                            if chars[end] == quote {
+                                end += 1;
+                                break;
+                            }
+                            end += 1;
+                        }
+                        continue;
+                    }
+                    if current == '{' {
+                        depth += 1;
+                    } else if current == '}' {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    end += 1;
+                }
+                if depth != 0 {
+                    return Err(Error::Query(
+                        "cypher exists subquery is missing a closing brace".into(),
+                    ));
+                }
+                let body: String = chars[body_start..end].iter().collect();
+                let body = expand_exists_subqueries(&body)?;
+                out.push_str("nonodb_exists(");
+                out.push_str(&cypher_string_literal(&body));
+                out.push(')');
+                index = end + 1;
+                continue;
+            }
+        }
+        out.push(character);
+        index += 1;
+    }
+    Ok(out)
 }
 
 fn collect_extra_labels(query: &Query) -> HashMap<String, Vec<String>> {
