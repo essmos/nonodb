@@ -10,9 +10,10 @@ Full release notes: https://github.com/essmos/nonodb/releases
 - Time-series `$out`/`$merge` targets write through the bucket writer, so
   indexes, events, replication, and synthetic ids stay consistent.
 - Row-local time-series aggregation stages stream in batches
-  (`NONODB_TS_AGG_BATCH`); order-independent `$group` accumulators stream into
-  one builder so downsampling does not materialize the range. `$sort`/`$limit`
-  run on the group result; other blocking stages keep the materialized path.
+  (`NONODB_TS_AGG_BATCH`); a single `$group` stage streams all supported
+  accumulators into one builder so downsampling does not materialize the range.
+  `$sort`/`$limit` run on the group result; other blocking stages keep the
+  materialized path.
 - Buckets use block-column encoding (256 rows per block), so `find_by_key`
   decodes one block instead of the whole bucket. User-supplied ids use a small
   id-to-locator map instead of a collection scan. Old `NTB1`/`NTB2` payloads

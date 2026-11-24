@@ -6869,7 +6869,7 @@ impl<'e> Collection<'e> {
                 if streamable_prefix {
                     if let Some(spec) = pipeline[group_at].get("$group") {
                         if let Ok(builder) = aggregate::GroupBuilder::new(spec) {
-                            if builder.order_independent() {
+                            {
                                 let mut builder = builder;
                                 let batch_size = std::env::var("NONODB_TS_AGG_BATCH")
                                     .ok()

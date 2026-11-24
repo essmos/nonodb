@@ -166,11 +166,11 @@ decoding.
 Aggregation pipelines run over the decoded documents, so `$group`, `$bucket`,
 `$sort`, `$project`, `$count`, and the rest of the stage set work on time-series
 collections. A leading `$match` is reused for bucket and series pruning.
-Row-local stages are fed in batches by `scan_batches`. Order-independent
-`$group` accumulators (`$sum`, `$avg`, `$min`, `$max`, `$count`) stream into one
-group builder, so downsampling does not materialize the range; `$sort`/`$limit`
-then operate on the much smaller group result. Other blocking stages use the
-materialized path:
+Row-local stages are fed in batches by `scan_batches`, and a `$group` stage
+streams every supported accumulator (including `$first`, `$last`, `$push`, and
+`$addToSet`) into one group builder, so downsampling does not materialize the
+range; `$sort`/`$limit` then operate on the much smaller group result. Other
+blocking stages use the materialized path:
 
 ```json
 {
