@@ -3036,7 +3036,7 @@ fn delete_inner(
                 continue;
             }
         }
-        let (mut bucket, selected) = decode_bucket_inner(&payload, settings, low, high)?;
+        let (mut bucket, selected) = decode_bucket_inner(&payload, settings, None, None)?;
         let (hash, salt, window, serial) = key_parts(&key).unwrap_or((0, 0, start, 0));
         merge_tombstones(wtxn, &db, &mut bucket, hash, salt, window, serial)?;
         let mut live = 0usize;
@@ -5357,6 +5357,7 @@ mod tests {
         c.create_index("seq", true).unwrap();
         let first = c.insert_one(json!({"ts": 1, "seq": 1})).unwrap();
         assert!(c.insert_one(json!({"ts": 2, "seq": 1})).is_err());
+        assert_eq!(c.count(&json!({"seq": 1})).unwrap(), 1);
         let second = c.insert_one(json!({"ts": 3, "seq": 2})).unwrap();
         assert!(c
             .update_opts(
@@ -5366,6 +5367,7 @@ mod tests {
                 false,
             )
             .is_err());
+        assert_eq!(c.count(&json!({"seq": 2})).unwrap(), 1);
         assert_eq!(c.delete(&json!({"_id": first}), false).unwrap(), 1);
         c.update_opts(
             &json!({"_id": second}),
@@ -5444,6 +5446,32 @@ mod tests {
         assert_eq!(doc["v"], json!(1));
         // A stale synthetic id is authoritative and returns None without a scan.
         assert!(c.find_by_key(&stale).unwrap().is_none());
+    }
+
+    #[test]
+    fn time_range_delete_keeps_out_of_range_rows_in_the_bucket() {
+        let (_dir, store) = ts_store();
+        let settings = Settings {
+            time_field: "ts".into(),
+            ..Settings::default()
+        };
+        let c = store
+            .create_timeseries_collection("metrics", &settings)
+            .unwrap();
+        for idx in 0..30i64 {
+            c.insert_one(json!({"ts": idx * 1000, "v": idx})).unwrap();
+        }
+        let mut wtxn = store.write_txn().unwrap();
+        seal_all(&mut wtxn, store.env(), "metrics", &settings).unwrap();
+        wtxn.commit().unwrap();
+        assert_eq!(
+            c.delete(&json!({"ts": {"$gte": 5_000, "$lte": 14_000}}), true)
+                .unwrap(),
+            10
+        );
+        assert_eq!(c.count(&json!({})).unwrap(), 20);
+        assert_eq!(c.count(&json!({"ts": {"$lt": 5_000}})).unwrap(), 5);
+        assert_eq!(c.count(&json!({"ts": {"$gt": 14_000}})).unwrap(), 15);
     }
 
     #[test]

@@ -2357,6 +2357,76 @@ mod tests {
     }
 
     #[test]
+    fn failed_timeseries_unique_write_leaves_no_partial_rows() {
+        let (_dir, store) = setup();
+        let settings = nonodb_core::timeseries::Settings {
+            time_field: "ts".into(),
+            ..Default::default()
+        };
+        execute_commit(
+            &store,
+            &WriteReq::CreateCollection {
+                coll: "metrics".into(),
+                profile: CollectionProfile::TimeSeries,
+                ttl_seconds: None,
+                ttl_purge_history: None,
+                timeseries: Some(settings),
+            },
+        )
+        .unwrap();
+        let c = store.collection("metrics").unwrap();
+        c.create_index("k", true).unwrap();
+        for (ts, k) in [(1, 1), (2, 2)] {
+            execute_commit(
+                &store,
+                &WriteReq::Insert {
+                    coll: "metrics".into(),
+                    doc: json!({"ts": ts, "k": k}),
+                    vault: None,
+                },
+            )
+            .unwrap();
+        }
+        let mut wtxn = store.write_txn().unwrap();
+        let mut replication = ReplicationContext {
+            origin: None,
+            changes: Vec::new(),
+            ops: Vec::new(),
+        };
+        assert!(execute(
+            &store,
+            &mut wtxn,
+            &WriteReq::Insert {
+                coll: "metrics".into(),
+                doc: json!({"ts": 3, "k": 1}),
+                vault: None,
+            },
+            &mut replication,
+        )
+        .is_err());
+        assert!(execute(
+            &store,
+            &mut wtxn,
+            &WriteReq::Update {
+                coll: "metrics".into(),
+                filter: json!({"k": 2}),
+                update: json!({"$set": {"k": 1}}),
+                multi: false,
+                upsert: false,
+                array_filters: Vec::new(),
+                default_id: None,
+                vault: None,
+            },
+            &mut replication,
+        )
+        .is_err());
+        wtxn.commit().unwrap();
+        assert_eq!(c.count(&json!({})).unwrap(), 2);
+        assert_eq!(c.count(&json!({"k": 1})).unwrap(), 1);
+        assert_eq!(c.count(&json!({"k": 2})).unwrap(), 1);
+    }
+
+    #[test]
     fn out_and_merge_write_timeseries_targets() {
         let (_dir, store) = setup();
         let settings = nonodb_core::timeseries::Settings {
