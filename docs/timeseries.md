@@ -358,8 +358,9 @@ Read that carefully, because it matters operationally:
 - **Updates and `_id` deletes decode one bucket**, not the whole collection.
   An update by `_id` rewrites the affected sealed bucket (about 0.7 s for a
   1,667-row bucket in the 100k-row benchmark); changing time/meta is a move.
-- Compaction is a whole-database operation: plan a maintenance window or run it
-  against a replica, exactly like any other LMDB high-water issue.
+- Compaction is a whole-database operation. The daemon runs it online once the
+  database is idle; for a manual window use `nonodb-cli compact`, or compact a
+  replica, exactly like any other LMDB high-water issue.
 - Deleted rows are bits in a per-bucket deletion bitmap appended to the columnar
   payload (one bit per row, so 1000 deleted rows cost 125 bytes instead of
   27-byte tombstone keys). Deleted row values are cleared on the next bucket

@@ -2897,16 +2897,38 @@ struct WriteFilter {
 }
 
 impl WriteFilter {
-    fn from_ids(ids: &std::collections::HashSet<String>) -> Option<Self> {
+    fn from_ids(
+        db: &Database<Bytes, Bytes>,
+        wtxn: &RwTxn<'_>,
+        ids: &std::collections::HashSet<String>,
+    ) -> Result<Option<Self>> {
         let mut out = Self::default();
         for id in ids {
-            let (hash, salt, window, serial, seq) = parse_row_id(id)?;
-            out.by_bucket
-                .entry((hash, salt, window, serial))
-                .or_default()
-                .insert(seq);
+            if let Some((hash, salt, window, serial, seq)) = parse_row_id(id) {
+                out.by_bucket
+                    .entry((hash, salt, window, serial))
+                    .or_default()
+                    .insert(seq);
+            } else {
+                let Some(value) = db.get(wtxn, &user_key(id))? else {
+                    return Ok(None);
+                };
+                if value.len() != 27 {
+                    return Ok(None);
+                }
+                let Some((hash, salt, window, serial)) = key_parts(&value[..23]) else {
+                    return Ok(None);
+                };
+                let Ok(seq) = value[23..27].try_into().map(u32::from_be_bytes) else {
+                    return Ok(None);
+                };
+                out.by_bucket
+                    .entry((hash, salt, window, serial))
+                    .or_default()
+                    .insert(seq);
+            }
         }
-        Some(out)
+        Ok(Some(out))
     }
 
     fn bucket_ok(&self, key: &[u8]) -> bool {
@@ -2969,7 +2991,10 @@ fn delete_inner(
     let meta_hash = meta_equality_hash(filter, settings);
     let meta_filter = meta_only_filter(filter, settings);
     let now = crate::ttl::now_ms() as i64;
-    let write_filter = candidate_ids.and_then(WriteFilter::from_ids);
+    let write_filter = match candidate_ids {
+        Some(ids) => WriteFilter::from_ids(&db, &*wtxn, ids)?,
+        None => None,
+    };
     let mut deleted = 0usize;
 
     let mut buckets: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
@@ -3560,7 +3585,10 @@ fn update_inner(
     let meta_hash = meta_equality_hash(filter, settings);
     let meta_filter = meta_only_filter(filter, settings);
     let now = crate::ttl::now_ms() as i64;
-    let write_filter = candidate_ids.and_then(WriteFilter::from_ids);
+    let write_filter = match candidate_ids {
+        Some(ids) => WriteFilter::from_ids(&db, &*wtxn, ids)?,
+        None => None,
+    };
     let mut report = UpdateReport::default();
     // A pure `_id` equality only needs the bucket encoded in that id.
     let direct = (!multi)
@@ -4062,8 +4090,9 @@ fn delete_locator(
 /// Fetches one row by `_id` without scanning the collection.
 ///
 /// Synthetic ids encode the physical location, so this is a single LMDB get
-/// (pending row) or one get plus one bucket decode (sealed row). User-supplied
-/// `_id` values fall back to a filtered scan.
+/// (pending row) or one get plus one block decode (sealed row); a miss is
+/// authoritative. User-supplied ids use the `0x05` locator map. Only ids written
+/// before that map existed fall back to a filtered scan.
 pub fn find_by_id(
     rtxn: &RoTxn<'_>,
     env: &heed::Env,
@@ -4121,6 +4150,8 @@ pub fn find_by_id(
                 return Ok(Some(doc));
             }
         }
+        // A synthetic id is authoritative: a miss is a stale/deleted id.
+        return Ok(None);
     }
     if let Some(value) = db.get(rtxn, &user_key(id))? {
         if value.len() == 27 {
@@ -5403,6 +5434,7 @@ mod tests {
             .filter(|key| key.first() == Some(&KEY_BUCKET) && key.as_slice() != wanted)
             .collect();
         assert!(!keys.is_empty());
+        let stale = row_id(0, 0, 0, 0, u32::MAX);
         for key in keys {
             db.put(&mut wtxn, &key, b"corrupt").unwrap();
         }
@@ -5410,6 +5442,65 @@ mod tests {
         // Only the mapped bucket is decoded; corrupt siblings are never read.
         let doc = c.find_by_key("user-1").unwrap().unwrap();
         assert_eq!(doc["v"], json!(1));
+        // A stale synthetic id is authoritative and returns None without a scan.
+        assert!(c.find_by_key(&stale).unwrap().is_none());
+    }
+
+    #[test]
+    fn indexed_writes_resolve_user_supplied_ids() {
+        let (_dir, store) = ts_store();
+        let settings = Settings {
+            time_field: "ts".into(),
+            bucket_max_docs: 32,
+            ..Settings::default()
+        };
+        let c = store
+            .create_timeseries_collection("metrics", &settings)
+            .unwrap();
+        c.create_index("grp", false).unwrap();
+        for idx in 0..200i64 {
+            c.insert_one(json!({
+                "_id": format!("u{idx}"),
+                "ts": idx * 1000,
+                "grp": if idx < 10 { "target" } else { "other" },
+            }))
+            .unwrap();
+        }
+        let mut wtxn = store.write_txn().unwrap();
+        seal_all(&mut wtxn, store.env(), "metrics", &settings).unwrap();
+        let db = store
+            .env()
+            .create_database::<heed::types::Bytes, heed::types::Bytes>(
+                &mut wtxn,
+                Some("tsb:metrics"),
+            )
+            .unwrap();
+        let locator = db.get(&wtxn, &user_key("u0")).unwrap().unwrap().to_vec();
+        let wanted = &locator[..23];
+        let keys: Vec<Vec<u8>> = db
+            .iter(&wtxn)
+            .unwrap()
+            .map(|item| item.unwrap().0.to_vec())
+            .filter(|key| key.first() == Some(&KEY_BUCKET) && key.as_slice() != wanted)
+            .collect();
+        assert!(!keys.is_empty());
+        for key in keys {
+            db.put(&mut wtxn, &key, b"corrupt").unwrap();
+        }
+        wtxn.commit().unwrap();
+
+        assert_eq!(
+            c.update(
+                &json!({"grp": "target"}),
+                &json!({"$set": {"hit": true}}),
+                true
+            )
+            .unwrap(),
+            10
+        );
+        assert_eq!(c.find_by_key("u0").unwrap().unwrap()["hit"], json!(true));
+        assert_eq!(c.delete(&json!({"grp": "target"}), true).unwrap(), 10);
+        assert!(c.find_by_key("u0").unwrap().is_none());
     }
 
     #[test]
