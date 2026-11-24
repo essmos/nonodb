@@ -284,3 +284,52 @@ fn cypher_is_deterministic_and_rejects_vault_collections() {
     let error = vault.graph_cypher(options).unwrap_err().to_string();
     assert!(error.contains("vault"));
 }
+
+#[test]
+fn cypher_timeout_cancels_long_queries() {
+    let (_dir, store) = graph_store();
+    let collection = store.collection("nodes").unwrap();
+    let options: CypherOptions = serde_json::from_value(json!({
+        "query": "UNWIND range(1, 100000000) AS x RETURN sum(x)",
+        "timeout_ms": 1,
+        "max_operations": 1_000_000_000
+    }))
+    .unwrap();
+    let error = collection.graph_cypher(options).unwrap_err().to_string();
+    assert!(error.contains("timed out"), "{error}");
+}
+
+#[test]
+fn cypher_gds_handles_empty_graphs_and_row_bounds() {
+    let dir = TempDir::new().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    store
+        .create_collection("nodes", nonodb_core::CollectionProfile::Standard)
+        .unwrap();
+    store
+        .create_collection("edges", nonodb_core::CollectionProfile::Standard)
+        .unwrap();
+    let nodes = store.collection("nodes").unwrap();
+    let def: GraphDef = serde_json::from_value(json!({
+        "node_collection": "nodes",
+        "edge_collection": "edges"
+    }))
+    .unwrap();
+    nodes.set_graph(def).unwrap();
+    let out = run(
+        &store,
+        "CALL gds.pagerank.stream() YIELD nodeId, score RETURN nodeId, score",
+    );
+    assert_eq!(out["row_count"], 0);
+
+    let (_dir, store) = graph_store();
+    let collection = store.collection("nodes").unwrap();
+    let options: CypherOptions = serde_json::from_value(json!({
+        "query": "CALL gds.pagerank.stream() YIELD nodeId, score RETURN nodeId, score",
+        "max_rows": 1
+    }))
+    .unwrap();
+    let out = collection.graph_cypher(options).unwrap();
+    assert_eq!(out["row_count"], 1);
+    assert_eq!(out["truncated"], true);
+}
