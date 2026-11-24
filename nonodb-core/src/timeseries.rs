@@ -53,7 +53,9 @@ pub const BUCKET_DB_PREFIX: &str = "tsb:";
 
 const MAGIC: &[u8; 4] = b"NTB2";
 const MAGIC_V1: &[u8; 4] = b"NTB1";
-const FORMAT_VERSION: u8 = 1;
+const FORMAT_VERSION: u8 = 2;
+const FORMAT_VERSION_LEGACY: u8 = 1;
+const BLOCK_ROWS: usize = 256;
 const KEY_OPEN: u8 = 0x00;
 const KEY_BUCKET: u8 = 0x01;
 const KEY_ROW: u8 = 0x02;
@@ -1225,10 +1227,27 @@ fn encode_bucket(bucket: &Bucket, settings: &Settings) -> Result<Vec<u8>> {
         Some(meta) => put_bytes(&mut out, &serde_json::to_vec(meta)?),
         None => put_uvarint(&mut out, 0),
     }
+    put_uvarint(&mut out, BLOCK_ROWS as u64);
     put_uvarint(&mut out, encoded_columns.len() as u64);
     for (field, values) in encoded_columns {
-        let column = Column { field, values };
-        out.extend_from_slice(&encode_column(&column, settings.compression)?);
+        put_bytes(&mut out, field.as_bytes());
+        let blocks = values.chunks(BLOCK_ROWS).count().max(1);
+        put_uvarint(&mut out, blocks as u64);
+        if values.is_empty() {
+            let column = Column {
+                field: field.clone(),
+                values: Vec::new(),
+            };
+            put_bytes(&mut out, &encode_column(&column, settings.compression)?);
+        } else {
+            for chunk in values.chunks(BLOCK_ROWS) {
+                let column = Column {
+                    field: field.clone(),
+                    values: chunk.to_vec(),
+                };
+                put_bytes(&mut out, &encode_column(&column, settings.compression)?);
+            }
+        }
     }
     let deleted = encode_deleted(bucket);
     put_uvarint(&mut out, deleted.len() as u64);
@@ -1291,7 +1310,7 @@ fn decode_bucket_inner(
         return Err(corrupt("bad magic"));
     }
     let version = data[4];
-    if version != FORMAT_VERSION {
+    if version != FORMAT_VERSION && version != FORMAT_VERSION_LEGACY {
         return Err(corrupt("unsupported format version"));
     }
     let sealed = data[5] & FLAG_SEALED != 0;
@@ -1308,13 +1327,47 @@ fn decode_bucket_inner(
     } else {
         Some(serde_json::from_slice(meta_raw)?)
     };
-    let columns = get_uvarint(data, &mut pos)? as usize;
-    if columns > 4096 {
-        return Err(corrupt("column count out of range"));
-    }
-    let mut decoded = Vec::with_capacity(columns);
-    for _ in 0..columns {
-        decoded.push(decode_column(data, &mut pos)?);
+    let mut decoded = Vec::new();
+    if version >= 2 {
+        let block_rows = get_uvarint(data, &mut pos)? as usize;
+        if block_rows == 0 || block_rows > HARD_BUCKET_MAX_DOCS {
+            return Err(corrupt("column block size out of range"));
+        }
+        let columns = get_uvarint(data, &mut pos)? as usize;
+        if columns > 4096 {
+            return Err(corrupt("column count out of range"));
+        }
+        for _ in 0..columns {
+            let field = std::str::from_utf8(get_bytes(data, &mut pos)?)
+                .map_err(|_| corrupt("field name is not UTF-8"))?
+                .to_string();
+            let blocks = get_uvarint(data, &mut pos)? as usize;
+            if blocks > HARD_BUCKET_MAX_DOCS {
+                return Err(corrupt("column block count out of range"));
+            }
+            let mut values = Vec::with_capacity(n.min(block_rows.saturating_mul(blocks)));
+            for _ in 0..blocks {
+                let blob = get_bytes(data, &mut pos)?;
+                let mut block_pos = 0;
+                let block = decode_column(blob, &mut block_pos)?;
+                if block.field != field {
+                    return Err(corrupt("column block field mismatch"));
+                }
+                values.extend(block.values);
+            }
+            decoded.push(Column { field, values });
+        }
+        if decoded.iter().any(|column| column.values.len() != n) {
+            return Err(corrupt("column length mismatch"));
+        }
+    } else {
+        let columns = get_uvarint(data, &mut pos)? as usize;
+        if columns > 4096 {
+            return Err(corrupt("column count out of range"));
+        }
+        for _ in 0..columns {
+            decoded.push(decode_column(data, &mut pos)?);
+        }
     }
     let mut deleted = BTreeSet::new();
     if has_bitmap(data) {
@@ -1421,15 +1474,46 @@ fn decode_bucket_row(
     } else {
         Some(serde_json::from_slice(meta_raw)?)
     };
-    let columns = get_uvarint(data, &mut pos)? as usize;
     if index >= n {
         return Ok(None);
     }
+    let version = data[4];
     let mut row = Map::new();
-    for _ in 0..columns {
-        let column = decode_column(data, &mut pos)?;
-        if let Some(Some(value)) = column.values.into_iter().nth(index) {
-            set_path(&mut row, &column.field, value);
+    if version >= 2 {
+        let block_rows = get_uvarint(data, &mut pos)? as usize;
+        if block_rows == 0 {
+            return Err(corrupt("column block size out of range"));
+        }
+        let columns = get_uvarint(data, &mut pos)? as usize;
+        let target = index / block_rows;
+        let local = index % block_rows;
+        for _ in 0..columns {
+            let field = std::str::from_utf8(get_bytes(data, &mut pos)?)
+                .map_err(|_| corrupt("field name is not UTF-8"))?
+                .to_string();
+            let blocks = get_uvarint(data, &mut pos)? as usize;
+            for block in 0..blocks {
+                let blob = get_bytes(data, &mut pos)?;
+                if block != target {
+                    continue;
+                }
+                let mut block_pos = 0;
+                let column = decode_column(blob, &mut block_pos)?;
+                if column.field != field {
+                    return Err(corrupt("column block field mismatch"));
+                }
+                if let Some(Some(value)) = column.values.into_iter().nth(local) {
+                    set_path(&mut row, &field, value);
+                }
+            }
+        }
+    } else {
+        let columns = get_uvarint(data, &mut pos)? as usize;
+        for _ in 0..columns {
+            let column = decode_column(data, &mut pos)?;
+            if let Some(Some(value)) = column.values.into_iter().nth(index) {
+                set_path(&mut row, &column.field, value);
+            }
         }
     }
     if has_bitmap(data) {
@@ -3303,9 +3387,6 @@ fn update_inner(
             }
             buckets.push((key.to_vec(), payload.to_vec()));
         }
-    }
-    if std::env::var("TS_DEBUG").is_ok() {
-        eprintln!("UPDATE direct={:?} collected={}", direct, buckets.len());
     }
     for (key, payload) in buckets {
         if !multi && report.matched > 0 {

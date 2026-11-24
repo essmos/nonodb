@@ -226,17 +226,16 @@ empty results.
 
 ### Secondary indexes
 
-`createIndex`/`createIndexes` build ordinary (non-unique) indexes over
-time-series rows; `dropIndex`, `listIndexes`, and `reindex` work as on document
-collections. The planner uses an index when the filter has an equality/range
+`createIndex`/`createIndexes` build secondary indexes over time-series rows;
+`dropIndex`, `listIndexes`, and `reindex` work as on document collections. The planner uses an index when the filter has an equality/range
 condition on the leading field and reports `"index_used": true` with
 `"access": "index_scan"` in `explain`. Index entries are maintained by
 `insert`, `delete`, `update`, upserts, and replicated writes; a row moved by an
 update removes its old entry and adds a new one. Retention drops whole buckets
 without visiting index entries, so stale entries can remain until `reindex` or
 `dropIndex`; they are harmless because candidate rows that no longer exist are
-skipped. Unique indexes are rejected because the deletion bitmap and bucket
-rewrites make uniqueness checks incompatible with the columnar layout.
+skipped. Unique indexes are enforced on insert, update, upsert, and reindex; deleted
+rows free their value immediately.
 
 ### Search indexes
 
@@ -527,13 +526,13 @@ standard collection holding the same documents:
 
 ```text
 write
-insert (time-series)                 100000 ops   22750 ops/s  p50 36.3us  p95 41.9us  p99 51.5us
-insert (standard, baseline)          100000 ops   48840 ops/s  p50 20.4us  p95 24.2us  p99 27.6us
-seal open buckets                        10 perm  126 ms total, 12.6 ms/bucket
-stored: 4.07 bytes/row, 45.0x smaller than raw JSON
+insert (time-series)                 100000 ops   17123 ops/s  p50 38.4us  p95 65.0us  p99 73.8us
+insert (standard, baseline)          100000 ops   50526 ops/s  p50 19.6us  p95 23.6us  p99 28.2us
+seal open buckets                        10 perm  231 ms total, 23.1 ms/bucket
+stored: 9.24 bytes/row, 19.8x smaller than raw JSON
 
 read (time-series collection)
-find_by_key (point)                     2000 ops     405 ops/s  p50 2.31 ms  p99 4.02 ms
+find_by_key (point)                     2000 ops    2486 ops/s  p50 355 us  p99 634 us
 find 1 min, 1 series (60 rows)          2000 ops     197 ops/s  p50 4.81 ms  p99 8.20 ms
 find 1 h, 1 series (3600 rows)           500 ops      48 ops/s  p50 20.2 ms  p99 30.5 ms
 count 1 h, 1 series                      500 ops      36 ops/s  p50 27.2 ms  p99 43.7 ms
@@ -587,8 +586,8 @@ Storage for TimescaleDB is `hypertable_size` after native compression
 | Operation | NonoDB standard | NonoDB time-series | TimescaleDB |
 |---|---:|---:|---:|
 | Insert, one row | 20 µs p50 | 39 µs p50 | 0.89 ms p50 |
-| Bulk load, 1000-row txns | 94,800 rows/s | 49,000 rows/s | 98,900 rows/s |
-| Find by `_id` / primary key | 5.9 µs | 2.06 ms | 0.62 ms |
+| Bulk load, 1000-row txns | 94,800 rows/s | 46,000 rows/s | 98,900 rows/s |
+| Find by `_id` / primary key | 5.9 µs | 355 µs | 0.62 ms |
 | Find 1 h, 1 series | 358 ms | **20.2 ms** | 14.9 ms |
 | Count 1 h, 1 series | 269 ms | 24.8 ms | 1.81 ms |
 | Aggregate `$group` 1 h | 118 ms | 35.7 ms | 2.54 ms |
@@ -596,7 +595,7 @@ Storage for TimescaleDB is `hypertable_size` after native compression
 | Delete by id | 20 µs | 14.8 ms | 1.33 ms |
 | Indexed status+series, limit 100 | 0.36 ms | 33.1 ms | 1.11 ms |
 | Create index on status | 209 ms | 919 ms | 222 ms |
-| Storage, 100k rows | 41.35 MB | **0.46 MB** (compacted) | 1.98 MB (compressed) |
+| Storage, 100k rows | 41.35 MB | **0.53 MB** (compacted) | 1.98 MB (compressed) |
 
 TimescaleDB wins the point/update/delete and highly selective indexed queries
 because it is a general OLTP engine with native B-tree indexes. NonoDB
@@ -622,8 +621,8 @@ prepared statements were used. Reproduce the Timescale side with
   `$set`, `$unset`, `$replaceRoot`, `$lookup`, `$unwind`) in batches
   (`NONODB_TS_AGG_BATCH`, default 4096). Pipelines with `$group`, `$sort`,
   `$skip`, `$limit`, or `$facet` fall back to the materialized path.
-- Point lookup by `_id` decodes the containing bucket (see above); deletes by
-  `_id` use the locator directly.
+- Point lookup by `_id` decodes one 256-row column block, not the containing
+  bucket; deletes by `_id` use the locator directly.
 - Open buckets are uncompressed until they seal.
 - `bucketMaxDocs` bounds row count, not wall-clock rate; a very high ingest rate
   simply produces more buckets per window (serial counter in the key).
