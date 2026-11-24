@@ -392,6 +392,22 @@ fn cypher_limits_and_nesting_fail_explicitly() {
     .unwrap();
     let error = collection.graph_cypher(options).unwrap_err().to_string();
     assert!(error.contains("memory budget"), "{error}");
+
+    for i in 0..10 {
+        collection
+            .insert_one(json!({
+                "_id": format!("big-{i}"),
+                "blob": "x".repeat(10_000),
+            }))
+            .unwrap();
+    }
+    let options: CypherOptions = serde_json::from_value(json!({
+        "query": "MATCH (n) RETURN count(n) AS c",
+        "max_memory_bytes": 1000
+    }))
+    .unwrap();
+    let error = collection.graph_cypher(options).unwrap_err().to_string();
+    assert!(error.contains("memory budget"), "{error}");
 }
 
 #[test]

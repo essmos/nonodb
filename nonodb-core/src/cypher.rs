@@ -434,6 +434,7 @@ impl<'a> Executor<'a> {
                         self.tick()?;
                         if let Some(mut joined) = join_rows(&left_row, &right_row) {
                             joined.merge(&right_row);
+                            self.charge_row(&joined)?;
                             out.push(joined);
                         }
                     }
@@ -596,6 +597,8 @@ impl<'a> Executor<'a> {
                             row.set(HIDDEN_PATH_NODES, json!([bound]));
                             row.set(HIDDEN_PATH_RELS, json!([]));
                         }
+                        self.tick()?;
+                        self.charge_row(&row)?;
                         out.push(row);
                         if out.len() >= self.options.max_rows {
                             self.truncated = true;
@@ -624,6 +627,7 @@ impl<'a> Executor<'a> {
                 row.set(HIDDEN_ANON_ID, Value::String(id.clone()));
                 row.set(HIDDEN_PATH_NODES, json!([node]));
                 row.set(HIDDEN_PATH_RELS, json!([]));
+                self.charge_row(&row)?;
                 out.push(row);
                 if out.len() >= self.options.max_rows {
                     self.truncated = true;
@@ -752,6 +756,7 @@ impl<'a> Executor<'a> {
                         next.set(HIDDEN_ANON_NODE, target);
                     }
                     next.set(HIDDEN_ANON_ID, Value::String(edge.target.clone()));
+                    self.charge_row(&next)?;
                     out.push(next);
                     if out.len() >= self.options.max_rows {
                         self.truncated = true;
@@ -813,6 +818,8 @@ impl<'a> Executor<'a> {
                     {
                         next.set(HIDDEN_ANON_ID, Value::String(id.to_string()));
                     }
+                    self.tick()?;
+                    self.charge_row(&next)?;
                     out.push(next);
                     if out.len() >= self.options.max_rows {
                         self.truncated = true;
@@ -1155,6 +1162,8 @@ impl<'a> Executor<'a> {
                         continue;
                     }
                 }
+                self.tick()?;
+                self.charge_row(&next)?;
                 out.push(next);
                 continue;
             }
@@ -1175,6 +1184,8 @@ impl<'a> Executor<'a> {
                         next.set(var.clone(), Value::Null);
                     }
                 }
+                self.tick()?;
+                self.charge_row(&next)?;
                 out.push(next);
                 continue;
             }
