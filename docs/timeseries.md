@@ -574,6 +574,38 @@ goes straight to the locator instead of scanning every bucket.
 
 Reproduce: `ROWS=100000 READS=500 cargo run --release -p nonodb-core --example timeseries_bench`
 
+### Comparison with TimescaleDB
+
+The same 100k-row workload was loaded into TimescaleDB 2.x (PostgreSQL 16,
+`timescale/timescaledb:latest-pg16`) through the local TCP listener. Timescale
+rows were inserted one statement at a time for the insert sample and in
+1000-row batches for the rest; range/count/aggregate timings include fetching
+the result. NonoDB runs in-process, so its timings exclude a network round trip.
+Storage for TimescaleDB is `hypertable_size` after native compression
+(`segmentby=device`, `orderby=ts DESC`).
+
+| Operation | NonoDB standard | NonoDB time-series | TimescaleDB |
+|---|---:|---:|---:|
+| Insert, one row | 20 µs p50 | 35 µs p50 | 0.89 ms p50 |
+| Bulk load | — | — | 98,900 rows/s |
+| Find by `_id` / primary key | 5.9 µs | 2.06 ms | 0.62 ms |
+| Find 1 h, 1 series | 358 ms | **20.2 ms** | 14.9 ms |
+| Count 1 h, 1 series | 269 ms | 24.8 ms | 1.81 ms |
+| Aggregate `$group` 1 h | 118 ms | 35.7 ms | 2.54 ms |
+| Update by id | 25 µs | 13.6 ms | 1.46 ms |
+| Delete by id | 20 µs | 14.8 ms | 1.33 ms |
+| Indexed status+series, limit 100 | 0.36 ms | 33.1 ms | 1.11 ms |
+| Create index on status | 209 ms | 919 ms | 222 ms |
+| Storage, 100k rows | 41.35 MB | **0.46 MB** (compacted) | 1.98 MB (compressed) |
+
+TimescaleDB wins the point/update/delete and highly selective indexed queries
+because it is a general OLTP engine with native B-tree indexes. NonoDB
+time-series wins on footprint and is close on range scans; its count/aggregate
+path decodes buckets instead of using a columnar executor. The comparison is a
+shape check, not a tuned benchmark: no PostgreSQL tuning, connection pooling, or
+prepared statements were used. Reproduce the Timescale side with
+`scripts/timescale_bench.py`.
+
 ## Limitations
 
 - Deletes and rows moved by an update set bits in the bucket deletion bitmap;
