@@ -44,6 +44,11 @@ Full release notes: https://github.com/essmos/nonodb/releases
   subscriptions, and webhooks. `_events` entries carry the decoded row and the
   new id when an update moves it; count thresholds use the normal `count` path;
   tests cover a live receiver and a webhook delivery with a `sum` threshold.
+- Add `get_collection_timeseries`/`set_collection_timeseries` (native API and
+  core `Store::timeseries_settings`) with validation and replication. Structural
+  fields (`timeField`, `metaField`, `granularity`) can only change on an empty
+  collection. The MongoDB wire `create` command now accepts the standard
+  `timeseries` object.
 - Add aggregation and retention for time-series collections. `aggregate` now
   decodes buckets through the time-range-pruned find path and runs the normal
   in-memory pipeline, so `$group`/`$bucket` downsampling works. The new

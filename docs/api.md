@@ -203,6 +203,8 @@ client timeout with `NONODB_TIMEOUT` or the `timeout=` argument.
 | [`set_collection_ttl_after`](#document-ttl) | Select date-field collection TTL |
 | [`backfill_collection_ttl`](#document-ttl) | Backfill date-field TTL metadata in pages |
 | [`get_collection_ttl`](#document-ttl) | Read collection TTL and mode |
+| [`get_collection_timeseries`](#time-series-settings) | Read time-series settings |
+| [`set_collection_timeseries`](#time-series-settings) | Replace time-series settings |
 | [`set_collection_history`](#set_collection_history) | Set per-collection history retention (`0` disables) |
 | [`get_collection_history`](#get_collection_history) | Read per-collection history retention |
 | [`set_collection_events`](#set_collection_events) | Enable/disable automatic collection change events |
@@ -2703,6 +2705,38 @@ codecs, and measured compression:
     "compression": "balanced"
   }
 }
+```
+
+### Time-series settings
+
+`get_collection_timeseries` returns the stored settings; `set_collection_timeseries`
+validates and replicates a replacement. `timeField`, `metaField`, and
+`granularity` may only change while the collection is empty; bucket sizing,
+compression, and `expireAfterSeconds` can change at any time.
+
+```json
+{"op": "get_collection_timeseries", "coll": "readings"}
+```
+
+```json
+{"ok": true, "result": {"coll": "readings", "profile": "timeseries",
+ "timeseries": {"timeField": "ts", "metaField": "device",
+                "granularity": "seconds", "compression": "balanced",
+                "expireAfterSeconds": 86400}}}
+```
+
+```json
+{"op": "set_collection_timeseries", "coll": "readings",
+ "timeseries": {"timeField": "ts", "metaField": "device",
+                "granularity": "minutes", "compression": "max"}}
+```
+
+The MongoDB wire `create` command accepts the same options:
+
+```json
+{"create": "readings",
+ "timeseries": {"timeField": "ts", "metaField": "device",
+                "granularity": "seconds", "expireAfterSeconds": 86400}}
 ```
 
 `retain_timeseries` drops time-series rows older than a date. Whole buckets are

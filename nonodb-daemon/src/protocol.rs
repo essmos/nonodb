@@ -496,6 +496,15 @@ pub enum Request {
         coll: String,
         before: Value,
     },
+    /// Reads the time-series settings of a collection.
+    GetCollectionTimeSeries {
+        coll: String,
+    },
+    /// Replaces the time-series settings of a collection.
+    SetCollectionTimeSeries {
+        coll: String,
+        settings: nonodb_core::timeseries::Settings,
+    },
     /// Sets or clears the default document TTL for a collection.
     SetCollectionTtl {
         coll: String,
@@ -732,6 +741,10 @@ pub enum WriteReq {
         ttl_seconds: Option<u64>,
         purge_history: Option<bool>,
     },
+    SetCollectionTimeSeries {
+        coll: String,
+        settings: nonodb_core::timeseries::Settings,
+    },
     SetCollectionTtlAfter {
         coll: String,
         field: String,
@@ -960,6 +973,8 @@ impl Request {
             Self::DatabaseStats => "database_stats",
             Self::CreateCollection { .. } => "create_collection",
             Self::DropCollection { .. } => "drop_collection",
+            Self::GetCollectionTimeSeries { .. } => "get_collection_timeseries",
+            Self::SetCollectionTimeSeries { .. } => "set_collection_timeseries",
             Self::SetCollectionTtl { .. } => "set_collection_ttl",
             Self::SetCollectionTtlAfter { .. } => "set_collection_ttl_after",
             Self::RetainTimeSeries { .. } => "retain_timeseries",
@@ -1084,6 +1099,8 @@ impl Request {
             | Self::GetVersion { coll, .. }
             | Self::CreateCollection { coll, .. }
             | Self::DropCollection { coll }
+            | Self::GetCollectionTimeSeries { coll }
+            | Self::SetCollectionTimeSeries { coll, .. }
             | Self::SetCollectionTtl { coll, .. }
             | Self::SetCollectionTtlAfter { coll, .. }
             | Self::RetainTimeSeries { coll, .. }

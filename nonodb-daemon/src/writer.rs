@@ -482,6 +482,15 @@ fn standard_collection<'a>(
     write_collection(store, wtxn, coll, None)
 }
 
+fn timeseries_rows(
+    store: &Store,
+    wtxn: &mut nonodb_core::heed::RwTxn<'_>,
+    coll: &str,
+    settings: &nonodb_core::timeseries::Settings,
+) -> Result<u64, ApiError> {
+    Ok(nonodb_core::timeseries::stats(&*wtxn, store.env(), coll, settings)?.rows)
+}
+
 fn event_config(
     store: &Store,
     wtxn: &nonodb_core::heed::RwTxn<'_>,
@@ -1019,6 +1028,38 @@ fn execute(
                 "coll": coll,
                 "ttl_seconds": ttl_seconds,
                 "purge_history": purge_history,
+            }))
+        }
+        WriteReq::SetCollectionTimeSeries { coll, settings } => {
+            let c = write_collection(store, wtxn, coll, None)?;
+            if !c.profile().is_timeseries() {
+                return Err(nonodb_core::Error::Query(format!(
+                    "collection `{coll}` is not a time-series collection"
+                ))
+                .into());
+            }
+            settings.validate()?;
+            let current = c.timeseries_settings_in(&*wtxn)?.unwrap_or_default();
+            let rows = timeseries_rows(store, wtxn, coll, &current)?;
+            if rows > 0
+                && (current.time_field != settings.time_field
+                    || current.meta_field != settings.meta_field
+                    || current.granularity != settings.granularity)
+            {
+                return Err(nonodb_core::Error::Query(
+                    "time field, meta field, and granularity can only change on an empty time-series collection"
+                        .into(),
+                )
+                .into());
+            }
+            c.set_timeseries_settings_in(wtxn, settings)?;
+            replication.capture_op(ReplicationOp::TimeSeriesSettings {
+                coll: coll.clone(),
+                settings: settings.clone(),
+            });
+            Ok(json!({
+                "coll": coll,
+                "timeseries": settings,
             }))
         }
         WriteReq::RetainTimeSeries { coll, before_ms } => {
@@ -2147,6 +2188,101 @@ mod tests {
             json!(2),
             "watch event carries the threshold count"
         );
+    }
+
+    #[test]
+    fn set_collection_timeseries_validates_and_replicates() {
+        use nonodb_core::timeseries::{Compression, Settings};
+        let (_dir, store) = setup();
+        let initial = Settings {
+            time_field: "ts".into(),
+            ..Settings::default()
+        };
+        execute_commit(
+            &store,
+            &WriteReq::CreateCollection {
+                coll: "metrics".into(),
+                profile: CollectionProfile::TimeSeries,
+                ttl_seconds: None,
+                ttl_purge_history: None,
+                timeseries: Some(initial),
+            },
+        )
+        .unwrap();
+        let changed = Settings {
+            time_field: "ts".into(),
+            compression: Compression::Max,
+            expire_after_seconds: Some(600),
+            ..Settings::default()
+        };
+        let mut wtxn = store.write_txn().unwrap();
+        let mut replication = ReplicationContext {
+            origin: Some("test".into()),
+            changes: Vec::new(),
+            ops: Vec::new(),
+        };
+        let out = execute(
+            &store,
+            &mut wtxn,
+            &WriteReq::SetCollectionTimeSeries {
+                coll: "metrics".into(),
+                settings: changed.clone(),
+            },
+            &mut replication,
+        )
+        .unwrap();
+        wtxn.commit().unwrap();
+        assert_eq!(out["timeseries"]["compression"], json!("max"));
+        assert!(replication.ops.iter().any(|op| matches!(
+            op,
+            nonodb_core::replication::ReplicationOp::TimeSeriesSettings { .. }
+        )));
+        assert_eq!(store.timeseries_settings("metrics").unwrap(), Some(changed));
+
+        execute_commit(
+            &store,
+            &WriteReq::Insert {
+                coll: "metrics".into(),
+                doc: json!({"ts": 1_700_000_000_000i64, "value": 1}),
+                vault: None,
+            },
+        )
+        .unwrap();
+        let mut wtxn = store.write_txn().unwrap();
+        let mut replication = ReplicationContext {
+            origin: None,
+            changes: Vec::new(),
+            ops: Vec::new(),
+        };
+        let error = execute(
+            &store,
+            &mut wtxn,
+            &WriteReq::SetCollectionTimeSeries {
+                coll: "metrics".into(),
+                settings: Settings {
+                    time_field: "other".into(),
+                    ..Settings::default()
+                },
+            },
+            &mut replication,
+        )
+        .unwrap_err();
+        assert!(error.message.contains("empty time-series collection"));
+        drop(wtxn);
+
+        // Non-time-series collections are rejected.
+        let error = execute_commit(
+            &store,
+            &WriteReq::SetCollectionTimeSeries {
+                coll: "metrics".into(),
+                settings: Settings {
+                    time_field: "_id".into(),
+                    ..Settings::default()
+                },
+            },
+        )
+        .unwrap_err();
+        assert!(error.message.contains("timeField"));
     }
 
     #[test]

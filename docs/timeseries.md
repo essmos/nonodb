@@ -246,6 +246,18 @@ that move buckets), deletes, upserts, and replicated writes maintain the
 entries; `reindex` rebuilds all of them. Secondary indexes remain non-unique,
 but text/fuzzy/geo/vector indexes have no uniqueness semantics of their own.
 
+### Reading and changing settings
+
+`Store::timeseries_settings("name")` and the `get_collection_timeseries` wire op
+return the saved settings. `set_collection_timeseries` (or
+`Collection::set_timeseries_settings`) validates and persists a replacement and
+replicates it as a settings operation. `timeField`, `metaField`, and
+`granularity` are structural: they can only change while the collection is
+empty because existing buckets were encoded with the old layout. Bucket size
+limits, compression level, and `expireAfterSeconds` can change at any time.
+MongoDB clients can pass the standard `timeseries` object to `create`:
+`timeField`, optional `metaField`, `granularity`, and `expireAfterSeconds`.
+
 ### Change events, watches, and webhooks
 
 Time-series writes use the same event pipeline as document collections.

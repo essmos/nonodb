@@ -3547,6 +3547,24 @@ async fn exec_inner(
             read_result(joined).await
         }
 
+        Request::GetCollectionTimeSeries { coll } => {
+            let store = state.store.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                let settings = store.timeseries_settings(&coll)?;
+                let Some(settings) = settings else {
+                    return Err(ApiError::from(nonodb_core::Error::Query(format!(
+                        "collection `{coll}` is not a time-series collection"
+                    ))));
+                };
+                Ok::<Value, ApiError>(json!({
+                    "coll": coll,
+                    "profile": "timeseries",
+                    "timeseries": settings,
+                }))
+            });
+            read_result(joined).await
+        }
+
         Request::GetCollectionHistory { coll } => {
             let store = state.store.clone();
             let joined = tokio::task::spawn_blocking(move || {
@@ -3860,6 +3878,9 @@ async fn exec_inner(
                     }
                 }
                 Request::DropCollection { coll } => WriteReq::DropCollection { coll },
+                Request::SetCollectionTimeSeries { coll, settings } => {
+                    WriteReq::SetCollectionTimeSeries { coll, settings }
+                }
                 Request::SetCollectionTtl {
                     coll,
                     ttl_seconds,
@@ -4426,6 +4447,7 @@ fn cacheable(req: &Request) -> bool {
             | Request::VectorSearch { .. }
             | Request::ListCollections
             | Request::GetCollectionTtl { .. }
+            | Request::GetCollectionTimeSeries { .. }
             | Request::GetCollectionHistory { .. }
             | Request::GetCollectionEvents { .. }
             | Request::ListSubscriptions { .. }

@@ -4570,6 +4570,93 @@ mod tests {
     }
 
     #[test]
+    fn settings_roundtrip_validation_and_replication() {
+        use crate::replication::{ReplicationOp, ReplicationTxn};
+        use crate::vault::CollectionProfile;
+
+        let (_primary_dir, primary) = ts_store();
+        let initial = Settings {
+            time_field: "ts".into(),
+            meta_field: Some("device".into()),
+            compression: Compression::Fast,
+            ..Settings::default()
+        };
+        let source = primary
+            .create_timeseries_collection("metrics", &initial)
+            .unwrap();
+        assert_eq!(
+            primary.timeseries_settings("metrics").unwrap(),
+            Some(initial.clone())
+        );
+        let changed = Settings {
+            time_field: "ts".into(),
+            meta_field: Some("device".into()),
+            compression: Compression::Max,
+            expire_after_seconds: Some(3_600),
+            ..Settings::default()
+        };
+        source.set_timeseries_settings(&changed).unwrap();
+        assert_eq!(
+            primary.timeseries_settings("metrics").unwrap(),
+            Some(changed.clone())
+        );
+
+        // Invalid settings are rejected by validation.
+        let invalid = Settings {
+            time_field: String::new(),
+            ..Settings::default()
+        };
+        assert!(source.set_timeseries_settings(&invalid).is_err());
+        assert_eq!(
+            primary.timeseries_settings("metrics").unwrap(),
+            Some(changed.clone())
+        );
+
+        // Replicating the settings update leaves both nodes identical.
+        let (_replica_dir, replica) = ts_store();
+        let txn = ReplicationTxn::new_with_ops(
+            1,
+            "primary",
+            0,
+            Vec::new(),
+            vec![ReplicationOp::CollectionCreate {
+                name: "metrics".into(),
+                profile: "timeseries".into(),
+                ttl_seconds: None,
+                ttl_field: None,
+                ttl_purge_history: None,
+                timeseries: Some(serde_json::to_string(&initial).unwrap()),
+            }],
+        );
+        assert!(replica.apply_replication_txn(&txn).unwrap());
+        let txn = ReplicationTxn::new_with_ops(
+            2,
+            "primary",
+            0,
+            Vec::new(),
+            vec![ReplicationOp::TimeSeriesSettings {
+                coll: "metrics".into(),
+                settings: changed.clone(),
+            }],
+        );
+        assert!(replica.apply_replication_txn(&txn).unwrap());
+        assert_eq!(
+            replica.timeseries_settings("metrics").unwrap(),
+            primary.timeseries_settings("metrics").unwrap()
+        );
+        assert_eq!(
+            replica.collection("metrics").unwrap().profile(),
+            CollectionProfile::TimeSeries
+        );
+
+        // Document collections report no time-series settings.
+        primary
+            .create_collection("docs", CollectionProfile::Standard)
+            .unwrap();
+        assert_eq!(primary.timeseries_settings("docs").unwrap(), None);
+    }
+
+    #[test]
     fn replication_applies_timeseries_update_and_move() {
         use crate::replication::{ReplicationChange, ReplicationOp, ReplicationTxn};
 

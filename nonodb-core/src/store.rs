@@ -1039,6 +1039,19 @@ impl Store {
     }
 
     /// Returns a collection's default TTL, if any.
+    /// Time-series settings for `name`, or `None` when it is not a
+    /// time-series collection.
+    pub fn timeseries_settings(&self, name: &str) -> Result<Option<crate::timeseries::Settings>> {
+        let rtxn = self.read_txn()?;
+        let collection = self.collection_at(&rtxn, name)?;
+        let out = match collection {
+            Some(collection) => collection.timeseries_settings_in(&rtxn)?,
+            None => None,
+        };
+        rtxn.commit()?;
+        Ok(out)
+    }
+
     pub fn collection_ttl(&self, name: &str) -> Result<Option<u64>> {
         let rtxn = self.read_txn()?;
         let meta = self
@@ -2192,6 +2205,11 @@ impl Store {
             ReplicationOp::TimeSeriesRetain { coll, before_ms } => self
                 .retain_timeseries_in(wtxn, coll, *before_ms)
                 .map(|_| ()),
+            ReplicationOp::TimeSeriesSettings { coll, settings } => {
+                let collection = self.collection_in(&mut *wtxn, coll)?;
+                collection.set_timeseries_settings_in(wtxn, settings)?;
+                Ok(())
+            }
             ReplicationOp::CollectionTtl {
                 coll,
                 ttl_seconds,

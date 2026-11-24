@@ -73,6 +73,11 @@ pub enum ReplicationOp {
         coll: String,
         before_ms: i64,
     },
+    /// Replaces the time-series settings of an existing collection.
+    TimeSeriesSettings {
+        coll: String,
+        settings: crate::timeseries::Settings,
+    },
     CollectionTtl {
         coll: String,
         ttl_seconds: Option<u64>,

@@ -1928,6 +1928,48 @@ fn streamable_aggregate_pipeline(pipeline: &[Value]) -> Option<(Value, Vec<Value
     Some((filter, stages.to_vec()))
 }
 
+fn parse_timeseries_spec(
+    body: &Document,
+) -> Result<Option<nonodb_core::timeseries::Settings>, ApiError> {
+    use nonodb_core::timeseries::{Granularity, Settings};
+    let Some(value) = body.get("timeseries") else {
+        return Ok(None);
+    };
+    let spec = value
+        .as_document()
+        .ok_or_else(|| bad_value("timeseries must be a document"))?;
+    let time_field = spec
+        .get_str("timeField")
+        .map_err(|_| bad_value("timeseries.timeField must be a non-empty string"))?;
+    let mut settings = Settings::new(time_field);
+    if let Ok(meta) = spec.get_str("metaField") {
+        if meta.is_empty() {
+            return Err(bad_value("timeseries.metaField must be a non-empty string"));
+        }
+        settings.meta_field = Some(meta.to_string());
+    }
+    if let Ok(raw) = spec.get_str("granularity") {
+        settings.granularity =
+            Granularity::parse(raw).map_err(|error| bad_value(error.to_string()))?;
+    }
+    if let Some(raw) = spec
+        .get_i64("expireAfterSeconds")
+        .ok()
+        .or_else(|| spec.get_i32("expireAfterSeconds").ok().map(i64::from))
+    {
+        if raw < 0 {
+            return Err(bad_value(
+                "timeseries.expireAfterSeconds must not be negative",
+            ));
+        }
+        settings.expire_after_seconds = Some(raw as u64);
+    }
+    settings
+        .validate()
+        .map_err(|error| bad_value(error.to_string()))?;
+    Ok(Some(settings))
+}
+
 async fn create_collection_command(
     state: &super::AppState,
     body: &Document,
@@ -1947,7 +1989,6 @@ async fn create_collection_command(
         "viewOn",
         "pipeline",
         "collation",
-        "timeseries",
         "expireAfterSeconds",
         "storageEngine",
         "indexOptionDefaults",
@@ -1960,15 +2001,21 @@ async fn create_collection_command(
             )));
         }
     }
+    let timeseries = parse_timeseries_spec(body)?;
+    let profile = if timeseries.is_some() {
+        nonodb_core::CollectionProfile::TimeSeries
+    } else {
+        nonodb_core::CollectionProfile::Standard
+    };
     let runtime = database_for_write(state, &database).await?;
     let (_, response) = super::submit_write(
         &runtime,
         WriteReq::CreateCollection {
             coll: collection,
-            profile: nonodb_core::CollectionProfile::Standard,
+            profile,
             ttl_seconds: None,
             ttl_purge_history: None,
-            timeseries: None,
+            timeseries,
         },
         Durability::Full,
     )
@@ -4424,6 +4471,32 @@ mod tests {
         assert_eq!(reply.get_i32("maxWireVersion").unwrap(), MAX_WIRE_VERSION);
         assert_eq!(reply.get_i32("maxBsonObjectSize").unwrap(), MAX_BSON_BYTES);
         assert!(reply.get_bool("isWritablePrimary").unwrap());
+    }
+
+    #[test]
+    fn create_parses_timeseries_options() {
+        let spec = bson::doc! {
+            "timeField": "ts",
+            "metaField": "device",
+            "granularity": "minutes",
+            "expireAfterSeconds": 3600i64,
+        };
+        let body = bson::doc! {"create": "metrics", "timeseries": spec};
+        let settings = parse_timeseries_spec(&body).unwrap().unwrap();
+        assert_eq!(settings.time_field, "ts");
+        assert_eq!(settings.meta_field.as_deref(), Some("device"));
+        assert_eq!(settings.granularity.as_str(), "minutes");
+        assert_eq!(settings.expire_after_seconds, Some(3600));
+        assert!(parse_timeseries_spec(&bson::doc! {"create": "plain"})
+            .unwrap()
+            .is_none());
+        let bad = bson::doc! {"create": "metrics", "timeseries": bson::doc! {"metaField": "d"}};
+        assert!(parse_timeseries_spec(&bad).is_err());
+        let bad = bson::doc! {
+            "create": "metrics",
+            "timeseries": bson::doc! {"timeField": "ts", "granularity": "weeks"},
+        };
+        assert!(parse_timeseries_spec(&bad).is_err());
     }
 
     #[test]
