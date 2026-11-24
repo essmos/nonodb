@@ -1997,6 +1997,159 @@ mod tests {
     }
 
     #[test]
+    fn timeseries_changes_feed_events_and_live() {
+        use nonodb_core::subscriptions::{CountCondition, Subscription};
+
+        let _dir = TempDir::new().unwrap();
+        let store = Arc::new(Store::open(_dir.path()).unwrap());
+        let settings = nonodb_core::timeseries::Settings {
+            time_field: "ts".into(),
+            ..Default::default()
+        };
+        execute_commit(
+            &store,
+            &WriteReq::CreateCollection {
+                coll: "metrics".into(),
+                profile: CollectionProfile::TimeSeries,
+                ttl_seconds: None,
+                ttl_purge_history: None,
+                timeseries: Some(settings),
+            },
+        )
+        .unwrap();
+        execute_commit(
+            &store,
+            &WriteReq::SetCollectionEvents {
+                coll: "metrics".into(),
+                enabled: true,
+                fields: Vec::new(),
+                ops: Vec::new(),
+                filter: Value::Null,
+                include_before: true,
+                include_after: true,
+                projection: None,
+            },
+        )
+        .unwrap();
+
+        // A persisted subscription also writes watch events into `_events`.
+        execute_commit(
+            &store,
+            &WriteReq::CreateSubscription {
+                coll: "metrics".into(),
+                subscription: Subscription {
+                    name: "watch-metrics".into(),
+                    ops: vec!["insert".into()],
+                    count: Some(CountCondition {
+                        gte: Some(2),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            },
+        )
+        .unwrap();
+
+        // A live subscription with a count threshold (>= 2 rows) as the receiver.
+        let (live_tx, mut live_rx) = tokio::sync::mpsc::channel(8);
+        let (_live_id, _live_guard) = crate::live::registry().register(
+            store.id(),
+            "metrics".into(),
+            Subscription {
+                name: "live-metrics".into(),
+                ops: vec!["insert".into()],
+                count: Some(CountCondition {
+                    gte: Some(2),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            live_tx,
+        );
+
+        execute_commit(
+            &store,
+            &WriteReq::Insert {
+                coll: "metrics".into(),
+                doc: json!({"ts": 1_700_000_000_000i64, "value": 1, "device": "a"}),
+                vault: None,
+            },
+        )
+        .unwrap();
+        crate::live::dispatch_pending();
+        assert!(
+            live_rx.try_recv().is_err(),
+            "count threshold not reached yet"
+        );
+        execute_commit(
+            &store,
+            &WriteReq::Insert {
+                coll: "metrics".into(),
+                doc: json!({"ts": 1_700_000_001_000i64, "value": 2, "device": "a"}),
+                vault: None,
+            },
+        )
+        .unwrap();
+        crate::live::dispatch_pending();
+        let live = live_rx
+            .try_recv()
+            .expect("live subscription should fire at count >= 2");
+        assert_eq!(live["payload"]["coll"], json!("metrics"));
+        assert_eq!(live["payload"]["after"]["value"], json!(2));
+
+        // Update and delete also produce `_events` entries.
+        let inserted = all(&store, "metrics");
+        let id = inserted[0]["_id"].as_str().unwrap().to_string();
+        execute_commit(
+            &store,
+            &WriteReq::Update {
+                coll: "metrics".into(),
+                filter: json!({"_id": id}),
+                update: json!({"$set": {"value": 7}}),
+                multi: false,
+                upsert: false,
+                array_filters: Vec::new(),
+                default_id: None,
+                vault: None,
+            },
+        )
+        .unwrap();
+        execute_commit(
+            &store,
+            &WriteReq::Delete {
+                coll: "metrics".into(),
+                filter: json!({"_id": id}),
+                multi: false,
+                vault: None,
+            },
+        )
+        .unwrap();
+        let events = all(&store, nonodb_core::events::EVENTS_COLLECTION);
+        let ops: Vec<String> = events
+            .iter()
+            .filter(|event| event["payload"]["coll"] == json!("metrics"))
+            .filter(|event| event["payload"].get("subscription").is_none())
+            .filter_map(|event| event["payload"]["op"].as_str().map(str::to_string))
+            .collect();
+        assert_eq!(ops, vec!["insert", "insert", "update", "delete"]);
+        let update_event = events
+            .iter()
+            .find(|event| event["payload"]["op"] == json!("update"))
+            .unwrap();
+        assert_eq!(update_event["payload"]["after"]["value"], json!(7));
+        let subscription_events: Vec<&Value> = events
+            .iter()
+            .filter(|event| event["type"] == json!("subscription.watch-metrics"))
+            .collect();
+        assert_eq!(subscription_events.len(), 1);
+        assert_eq!(
+            subscription_events[0]["payload"]["count"],
+            json!(2),
+            "watch event carries the threshold count"
+        );
+    }
+
+    #[test]
     fn drop_collection_is_idempotent() {
         let (_dir, store) = setup();
         let c = store.collection("drop_me").unwrap();

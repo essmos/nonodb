@@ -212,7 +212,8 @@ Stages that need a second collection or an index host (`$lookup`, `$search`,
 | SQL `SELECT`/`INSERT`/`UPDATE`/`DELETE`, `explain` | yes (same find/aggregate path) |
 | `$search`, `$searchMeta`, `$vectorSearch` | yes |
 | `$lookup` (local/foreign and pipeline/`let`), `$graphLookup`, `$unionWith` | yes |
-| watches/events | not supported |
+| `_events`, change streams/watch, persistent and live subscriptions | yes |
+| webhook rules with count/sum/avg thresholds | yes |
 | drop collection | removes all buckets and series pointers |
 | replication, backup, restore, verify | yes (buckets travel with the database) |
 
@@ -244,6 +245,21 @@ stages return the same documents as a scan. Inserts, updates (including rows
 that move buckets), deletes, upserts, and replicated writes maintain the
 entries; `reindex` rebuilds all of them. Secondary indexes remain non-unique,
 but text/fuzzy/geo/vector indexes have no uniqueness semantics of their own.
+
+### Change events, watches, and webhooks
+
+Time-series writes use the same event pipeline as document collections.
+Enabling events for a time-series collection writes `insert`/`update`/`delete`
+entries to `_events` with the decoded document as `payload.before`/`after`;
+when an update moves a row to another bucket, the emitted `_id` is the new
+synthetic id. Persistent subscriptions (`CreateSubscription`) and live
+subscriptions (including `count` thresholds evaluated through the normal
+`count` path) fire for those events, so `watch` long-poll, NDJSON, and SSE
+streams deliver them unchanged. Webhook rules can match the collection and use
+`count`, `sum`, or `avg` thresholds over row fields; the daemon worker posts
+deliveries with the threshold value in `webhook.threshold_value`. Event
+projections, filters, and `fields` filters apply exactly as for document
+collections.
 
 ### Joins and set stages
 
@@ -486,7 +502,8 @@ Reproduce: `ROWS=100000 READS=500 cargo run --release -p nonodb-core --example t
 - Unique indexes are rejected. Non-unique secondary indexes are supported and
   used by `find`/`count`/`explain` (`index_used`), but deletes and updates by
   filter still decode candidate buckets when no index applies.
-- Watches/events and `$out`/`$merge` are not supported for time-series rows.
+- `$out`/`$merge` are not supported for time-series rows (writes must go
+  through the bucket writer).
 - Aggregation decodes the full time range into memory before running stages.
 - Point lookup by `_id` decodes the containing bucket (see above).
 - Open buckets are uncompressed until they seal.

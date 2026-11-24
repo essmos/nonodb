@@ -40,6 +40,10 @@ Full release notes: https://github.com/essmos/nonodb/releases
   `$lookup` (local/foreign and pipeline/`let`), `$graphLookup`, and
   `$unionWith` against document or time-series collections. Tests compare the
   results with the equivalent pipeline on a document collection.
+- Time-series writes now feed change events, watches, persistent/live
+  subscriptions, and webhooks. `_events` entries carry the decoded row and the
+  new id when an update moves it; count thresholds use the normal `count` path;
+  tests cover a live receiver and a webhook delivery with a `sum` threshold.
 - Add aggregation and retention for time-series collections. `aggregate` now
   decodes buckets through the time-range-pruned find path and runs the normal
   in-memory pipeline, so `$group`/`$bucket` downsampling works. The new
