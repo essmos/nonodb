@@ -502,6 +502,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (reads / 10).max(1),
     );
 
+    // Bulk ingestion: same 1000-row transaction shape as the TimescaleDB
+    // comparison script (which uses 1000-row execute_values batches).
+    for (label, bulk) in [
+        ("ts", {
+            store.create_timeseries_collection("tsbulk", &settings)?
+        }),
+        ("standard", {
+            store.create_collection("stdbulk", nonodb_core::CollectionProfile::Standard)?
+        }),
+    ] {
+        let started = Instant::now();
+        for chunk in (0..rows).collect::<Vec<_>>().chunks(1000) {
+            let mut wtxn = store.write_txn()?;
+            for idx in chunk {
+                bulk.insert_one_txn(&mut wtxn, doc(*idx % series, *idx))?;
+            }
+            wtxn.commit()?;
+        }
+        let elapsed = started.elapsed();
+        println!(
+            "{:<34} {:>7} rows  {:>9.0} rows/s (1000-row txns)",
+            format!("bulk load ({label})"),
+            rows,
+            rows as f64 / elapsed.as_secs_f64()
+        );
+    }
+
     // Retention: drop the oldest hourly window of every series.
     let cutoff = base + 3_600_000;
     let retain_started = Instant::now();
