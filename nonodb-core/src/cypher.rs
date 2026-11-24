@@ -858,14 +858,23 @@ impl<'a> Executor<'a> {
         exprs: &[ProjectExpr],
     ) -> Result<Vec<Row>> {
         let rows = self.execute_input(input)?;
+        self.project_rows(rows, include_existing, exprs)
+    }
+
+    fn project_rows(
+        &mut self,
+        rows: Vec<Row>,
+        include_existing: bool,
+        exprs: &[ProjectExpr],
+    ) -> Result<Vec<Row>> {
         let aggregate = exprs.iter().any(|expr| contains_aggregate(&expr.expr));
         if !aggregate {
             let mut out = Vec::with_capacity(rows.len());
             for row in rows {
                 self.tick()?;
-                let mut next = Row::new();
-                if include_existing {
-                    next = row.clone();
+                let mut next = row.clone();
+                if !include_existing {
+                    next.order.clear();
                 }
                 for expr in exprs {
                     let value = self.eval(&expr.expr, &row, None)?;
@@ -896,9 +905,9 @@ impl<'a> Executor<'a> {
         let mut out = Vec::new();
         for (_, group) in groups {
             let base = group.first().cloned().unwrap_or_else(Row::new);
-            let mut next = Row::new();
-            if include_existing {
-                next = base.clone();
+            let mut next = base.clone();
+            if !include_existing {
+                next.order.clear();
             }
             for expr in exprs {
                 let value = self.eval(&expr.expr, &base, Some(&group))?;
@@ -915,6 +924,17 @@ impl<'a> Executor<'a> {
     }
 
     fn sort(&mut self, input: &Plan, keys: &[SortKey]) -> Result<Vec<Row>> {
+        if let Plan::Project {
+            input: inner,
+            include_existing,
+            exprs,
+        } = input
+        {
+            if exprs.iter().any(|expr| contains_aggregate(&expr.expr)) {
+                let rows = self.sort(inner, keys)?;
+                return self.project_rows(rows, *include_existing, exprs);
+            }
+        }
         let mut rows = self.execute_input(input)?;
         let mut keyed = Vec::with_capacity(rows.len());
         for row in rows.drain(..) {
@@ -2460,6 +2480,361 @@ fn duration_seconds(args: &[Value]) -> Result<Value> {
     Ok(Value::String(text))
 }
 
+fn validate_bindings(plan: &Plan) -> Result<()> {
+    let mut bound = std::collections::HashSet::new();
+    validate_plan(plan, &mut bound)
+}
+
+fn validate_plan(plan: &Plan, bound: &mut std::collections::HashSet<String>) -> Result<()> {
+    match plan {
+        Plan::Empty => {}
+        Plan::Scan { var: Some(var), .. } => {
+            bound.insert(var.clone());
+        }
+        Plan::Scan { var: None, .. } => {}
+        Plan::Expand {
+            input,
+            src,
+            rel_var,
+            dst,
+            ..
+        } => {
+            validate_plan(input, bound)?;
+            if let Some(src) = src {
+                require_bound(bound, src)?;
+            }
+            if let Some(rel_var) = rel_var {
+                bound.insert(rel_var.clone());
+            }
+            if let Some(dst) = dst {
+                bound.insert(dst.clone());
+            }
+        }
+        Plan::Filter { input, pred } => {
+            validate_plan(input, bound)?;
+            validate_expr(pred, bound)?;
+        }
+        Plan::PropertyMapFilter {
+            input,
+            variable,
+            map,
+        } => {
+            validate_plan(input, bound)?;
+            require_bound(bound, variable)?;
+            validate_expr(map, bound)?;
+        }
+        Plan::Project {
+            input,
+            include_existing,
+            exprs,
+        } => {
+            validate_plan(input, bound)?;
+            let input_bound = bound.clone();
+            for expr in exprs {
+                validate_expr(&expr.expr, bound)?;
+            }
+            let mut next = if *include_existing {
+                bound.clone()
+            } else {
+                std::collections::HashSet::new()
+            };
+            for expr in exprs {
+                if let Some(alias) = &expr.alias {
+                    next.insert(alias.clone());
+                } else if let Expr::Variable(name) = &expr.expr {
+                    next.insert(name.clone());
+                }
+            }
+            if exprs.iter().any(|expr| contains_aggregate(&expr.expr)) {
+                // ORDER BY after an aggregate may refer to rows before aggregation.
+                next.extend(input_bound);
+            }
+            *bound = next;
+        }
+        Plan::Sort { input, keys } => {
+            let before = bound.clone();
+            validate_plan(input, bound)?;
+            let mut available = bound.clone();
+            available.extend(before);
+            let mut plan_vars = Vec::new();
+            collect_plan_vars(input, &mut plan_vars);
+            available.extend(plan_vars);
+            // Sorting an aggregate/projection may refer to pre-projection keys.
+            for key in keys {
+                validate_expr(&key.expr, &available)?;
+            }
+        }
+        Plan::Skip { input, count } | Plan::Limit { input, count } => {
+            validate_plan(input, bound)?;
+            validate_expr(count, bound)?;
+        }
+        Plan::Cartesian { left, right } => {
+            validate_plan(left, bound)?;
+            validate_plan(right, bound)?;
+        }
+        Plan::Optional { input, optional } => {
+            validate_plan(input, bound)?;
+            let mut optional_bound = bound.clone();
+            validate_plan(optional, &mut optional_bound)?;
+            bound.extend(optional_bound);
+        }
+        Plan::ShortestPath { input, .. } | Plan::NamedPath { input, .. } => {
+            validate_plan(input, bound)?;
+            if let Plan::NamedPath { variable, .. } = plan {
+                bound.insert(variable.clone());
+            }
+        }
+        Plan::PlannerHint { input, .. } => validate_plan(input, bound)?,
+        Plan::ProcedureCall {
+            input,
+            arguments,
+            yields,
+            ..
+        } => {
+            validate_plan(input, bound)?;
+            for argument in arguments {
+                validate_expr(argument, bound)?;
+            }
+            for item in yields {
+                bound.insert(item.binding().to_string());
+            }
+        }
+        Plan::Unwind {
+            input,
+            expression,
+            alias,
+        } => {
+            validate_plan(input, bound)?;
+            validate_expr(expression, bound)?;
+            bound.insert(alias.clone());
+        }
+        Plan::Explain { input } | Plan::Profile { input } | Plan::Distinct { input } => {
+            validate_plan(input, bound)?;
+        }
+        Plan::Union { left, right, .. } => {
+            validate_plan(left, bound)?;
+            validate_plan(right, bound)?;
+        }
+        Plan::PeriodicCommit { input, .. } => validate_plan(input, bound)?,
+        _ => {}
+    }
+    Ok(())
+}
+
+fn require_bound(bound: &std::collections::HashSet<String>, name: &str) -> Result<()> {
+    if bound.contains(name) {
+        Ok(())
+    } else {
+        Err(Error::Query(format!("unbound variable `{name}`")))
+    }
+}
+
+fn validate_expr(expr: &Expr, bound: &std::collections::HashSet<String>) -> Result<()> {
+    match expr {
+        Expr::Variable(name) => require_bound(bound, name),
+        Expr::Literal(_) | Expr::Param(_) => Ok(()),
+        Expr::List(items) => {
+            for item in items {
+                validate_expr(item, bound)?;
+            }
+            Ok(())
+        }
+        Expr::Map(items) => {
+            for (_, item) in items {
+                validate_expr(item, bound)?;
+            }
+            Ok(())
+        }
+        Expr::FunctionCall { arguments, .. } => match arguments {
+            cypher_rs_zk::FunctionArguments::Expressions(items) => {
+                for item in items {
+                    validate_expr(item, bound)?;
+                }
+                Ok(())
+            }
+            cypher_rs_zk::FunctionArguments::Wildcard => Ok(()),
+        },
+        Expr::ListComprehension {
+            variable,
+            source,
+            predicate,
+            projection,
+        } => {
+            validate_expr(source, bound)?;
+            let mut inner = bound.clone();
+            inner.insert(variable.clone());
+            if let Some(predicate) = predicate {
+                validate_expr(predicate, &inner)?;
+            }
+            if let Some(projection) = projection {
+                validate_expr(projection, &inner)?;
+            }
+            Ok(())
+        }
+        Expr::CollectionPredicate {
+            variable,
+            source,
+            predicate,
+            ..
+        } => {
+            validate_expr(source, bound)?;
+            let mut inner = bound.clone();
+            inner.insert(variable.clone());
+            if let Some(predicate) = predicate {
+                validate_expr(predicate, &inner)?;
+            }
+            Ok(())
+        }
+        Expr::PatternComprehension {
+            path_variable,
+            predicate,
+            projection,
+            ..
+        } => {
+            let mut inner = bound.clone();
+            if let Some(variable) = path_variable {
+                inner.insert(variable.clone());
+            }
+            if let Some(predicate) = predicate {
+                validate_expr(predicate, &inner)?;
+            }
+            validate_expr(projection, &inner)
+        }
+        Expr::PatternExpression { .. } => Ok(()),
+        Expr::Filter {
+            variable,
+            source,
+            predicate,
+        } => {
+            validate_expr(source, bound)?;
+            let mut inner = bound.clone();
+            inner.insert(variable.clone());
+            if let Some(predicate) = predicate {
+                validate_expr(predicate, &inner)?;
+            }
+            Ok(())
+        }
+        Expr::Extract {
+            variable,
+            source,
+            projection,
+        } => {
+            validate_expr(source, bound)?;
+            let mut inner = bound.clone();
+            inner.insert(variable.clone());
+            if let Some(projection) = projection {
+                validate_expr(projection, &inner)?;
+            }
+            Ok(())
+        }
+        Expr::Reduce {
+            accumulator,
+            initial,
+            variable,
+            source,
+            expression,
+        } => {
+            validate_expr(initial, bound)?;
+            validate_expr(source, bound)?;
+            let mut inner = bound.clone();
+            inner.insert(variable.clone());
+            inner.insert(accumulator.clone());
+            if let Some(expression) = expression {
+                validate_expr(expression, &inner)?;
+            }
+            Ok(())
+        }
+        Expr::Case {
+            operand,
+            alternatives,
+            else_expr,
+        } => {
+            if let Some(operand) = operand {
+                validate_expr(operand, bound)?;
+            }
+            for alternative in alternatives {
+                validate_expr(&alternative.when, bound)?;
+                validate_expr(&alternative.then, bound)?;
+            }
+            if let Some(else_expr) = else_expr {
+                validate_expr(else_expr, bound)?;
+            }
+            Ok(())
+        }
+        Expr::Property { base, .. }
+        | Expr::LabelPredicate {
+            expression: base, ..
+        } => validate_expr(base, bound),
+        Expr::Subscript { base, index } => {
+            validate_expr(base, bound)?;
+            validate_expr(index, bound)
+        }
+        Expr::Slice { base, start, end } => {
+            validate_expr(base, bound)?;
+            if let Some(start) = start {
+                validate_expr(start, bound)?;
+            }
+            if let Some(end) = end {
+                validate_expr(end, bound)?;
+            }
+            Ok(())
+        }
+        Expr::MapProjection { base, items } => {
+            validate_expr(base, bound)?;
+            for item in items {
+                if let cypher_rs_zk::MapProjectionItem::Literal { value, .. } = item {
+                    validate_expr(value, bound)?;
+                }
+            }
+            Ok(())
+        }
+        Expr::ComparisonChain { arguments, .. } => {
+            for argument in arguments {
+                validate_expr(argument, bound)?;
+            }
+            Ok(())
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            validate_expr(lhs, bound)?;
+            validate_expr(rhs, bound)
+        }
+        Expr::Unary { operand, .. } => validate_expr(operand, bound),
+    }
+}
+
+fn check_nesting_depth(query: &str) -> Result<()> {
+    let mut depth = 0usize;
+    let mut max_depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for ch in query.chars() {
+        if let Some(active) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == active {
+                quote = None;
+            }
+            continue;
+        }
+        if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+        } else if matches!(ch, '(' | '[' | '{') {
+            depth += 1;
+            max_depth = max_depth.max(depth);
+            if max_depth > 16 {
+                return Err(Error::Query(
+                    "cypher literal/pattern nesting exceeds 16 levels".into(),
+                ));
+            }
+        } else if matches!(ch, ')' | ']' | '}') {
+            depth = depth.saturating_sub(1);
+        }
+    }
+    Ok(())
+}
+
 fn normalize_literals(query: &str) -> String {
     let mut out = String::with_capacity(query.len());
     let mut chars = query.chars().peekable();
@@ -2524,6 +2899,7 @@ fn normalize_literals(query: &str) -> String {
 
 pub fn execute(view: &dyn GraphView, options: &CypherOptions) -> Result<Value> {
     options.validate()?;
+    check_nesting_depth(&options.query)?;
     let normalized = normalize_literals(&options.query);
     let query: Query =
         parse(&normalized).map_err(|error| Error::Query(format!("cypher parse error: {error}")))?;
@@ -2540,6 +2916,10 @@ pub fn execute(view: &dyn GraphView, options: &CypherOptions) -> Result<Value> {
     let plan =
         plan_query(&query).map_err(|error| Error::Query(format!("cypher plan error: {error}")))?;
     let plan = optimize(plan);
+    if std::env::var_os("NONODB_CYPHER_DEBUG_PLAN").is_some() {
+        eprintln!("{plan:#?}");
+    }
+    validate_bindings(&plan)?;
     let mut executor = Executor::new(view, options);
     let rows = executor.execute(&plan, Vec::new())?;
     let columns = rows

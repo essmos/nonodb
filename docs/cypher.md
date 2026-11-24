@@ -35,19 +35,25 @@ rows = nodes.cypher(
 )
 ```
 
-## Supported read-only surface
+## Compatibility matrix
 
-- `MATCH`, `OPTIONAL MATCH`, `WHERE`, `RETURN`
-- `WITH`, `UNWIND`, `ORDER BY`, `SKIP`, `LIMIT`, `DISTINCT`
-- multiple patterns and shared-variable joins
-- variable-length relationships, relationship uniqueness
-- `shortestPath` and `allShortestPaths`
-- aggregations: `count`, `sum`, `avg`, `min`, `max`, `collect`
-- list/map/string/math functions, `CASE`, comprehensions, map projections
-- basic temporal constructors and `toString` round-trips
+| Surface | Status | Notes |
+|---|---|---|
+| `MATCH`, `OPTIONAL MATCH`, `WHERE`, `RETURN` | Supported | labels, properties, direction, multiple patterns |
+| `WITH`, `UNWIND`, `ORDER BY`, `SKIP`, `LIMIT`, `DISTINCT` | Supported | deterministic ordering for equal keys |
+| Aggregations | Supported | `count`, `sum`, `avg`, `min`, `max`, `collect`; `DISTINCT`; null handling |
+| Expressions | Supported | list/map/string/math functions, `CASE`, comprehensions, map projections |
+| Variable-length paths | Supported | bounded by `max_depth`; relationship uniqueness |
+| `shortestPath`, `allShortestPaths` | Supported | unweighted; depth bounded |
+| Pattern comprehensions / pattern expressions | Partial | selected TCK scope; unsupported forms fail explicitly |
+| Subqueries | Partial | `CALL {}` is not part of the selected TCK baseline and fails explicitly |
+| Temporal values | Partial | constructors and `toString`; extreme ranges rejected |
+| `CREATE`, `MERGE`, `SET`, `REMOVE`, `DELETE` | Rejected | read-only mode |
+| `LOAD CSV`, schema commands, APOC, Bloom | Rejected | out of scope |
+| Arbitrary procedures | Rejected | only the four `gds.*` procedures below |
 
-Write clauses (`CREATE`, `MERGE`, `SET`, `REMOVE`, `DELETE`), APOC, Bloom,
-`LOAD CSV`, schema commands, and arbitrary procedures are out of scope.
+Unsupported syntax returns `invalid_query`; it is never silently ignored.
+
 
 ## GDS-style procedures
 
@@ -59,6 +65,18 @@ The following procedures are available through `CALL ... YIELD`:
 | `gds.degree.stream()` | `nodeId`, `degree`, `in`, `out` |
 | `gds.connectedComponents.stream()` | `nodeId`, `componentId`, `size` |
 | `gds.nodeSimilarity.stream()` | `node1`, `node2`, `similarity` |
+
+Definitions:
+
+- **PageRank**: iterative PageRank with damping `0.85`, at most 100 iterations,
+  convergence at `1e-6`; scores normalized to sum to 1 across processed nodes.
+- **Degree centrality**: total degree (`in + out`) for the configured graph
+  direction; yields `degree`, `in`, and `out`.
+- **Connected components**: weakly connected components over both edge
+  directions; component IDs are deterministic and `size` is the component size.
+- **Node similarity**: Jaccard similarity between neighbor sets, using both edge
+  directions; pairs with similarity `<= 0` are omitted; results sorted by
+  descending similarity.
 
 They run over the configured graph, are bounded by `max_rows`/`max_operations`,
 and use the same read-only transaction and authorization path as other graph
@@ -74,8 +92,13 @@ RETURN nodeId, score ORDER BY score DESC
 
 - exactly one read-only statement per request;
 - write clauses are rejected before planning;
-- `max_rows`, `max_operations`, and `timeout_ms` bound execution;
+- `max_rows` (default 1000, max 100000), `max_operations` (default 1,000,000),
+  and `timeout_ms` bound execution; the operation budget is checked per row and
+  per expansion, so cancellation returns a structured error;
 - `max_depth` bounds variable-length expansion (hard maximum 64);
+- literal/pattern nesting is capped at 16 levels to prevent parser stack
+  exhaustion;
+- the GDS procedures process at most 1,000 nodes and emit at most `max_rows`;
 - unsupported syntax fails explicitly with `invalid_query`, never a silent
   wrong result;
 - vault collections are rejected, and graph reads require scope on the node

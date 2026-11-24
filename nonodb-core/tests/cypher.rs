@@ -48,7 +48,9 @@ fn run(store: &Store, query: &str) -> Value {
         "max_operations": 100_000
     }))
     .unwrap();
-    collection.graph_cypher(options).unwrap()
+    collection
+        .graph_cypher(options)
+        .unwrap_or_else(|error| panic!("{query}: {error}"))
 }
 
 #[test]
@@ -153,4 +155,132 @@ fn cypher_gds_procedures_are_bounded_and_callable() {
          RETURN nodeId, componentId ORDER BY nodeId",
     );
     assert_eq!(out["row_count"], 4);
+
+    let out = run(
+        &store,
+        "CALL gds.nodeSimilarity.stream() YIELD node1, node2, similarity \
+         RETURN node1, node2, similarity ORDER BY node1, node2",
+    );
+    assert!(out["row_count"].as_u64().unwrap() > 0);
+}
+
+#[test]
+fn cypher_clauses_join_optional_match_and_branching() {
+    let (_dir, store) = graph_store();
+    let out = run(
+        &store,
+        "UNWIND [3, 1, 2] AS x WITH x ORDER BY x SKIP 1 LIMIT 1 RETURN x",
+    );
+    assert_eq!(out["rows"], json!([{"x": 2}]));
+
+    let out = run(
+        &store,
+        "MATCH (n:Person) WITH n.age AS age ORDER BY age RETURN collect(age) AS ages",
+    );
+    assert_eq!(out["rows"], json!([{"ages": [20, 30, 40]}]));
+
+    let out = run(
+        &store,
+        "MATCH (n:Person) OPTIONAL MATCH (n)-[:MISSING]->(m) \
+         RETURN n.name AS name, m.name AS missing ORDER BY name",
+    );
+    assert_eq!(out["row_count"], 3);
+    assert!(out["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|row| row["missing"].is_null()));
+
+    let out = run(
+        &store,
+        "MATCH (a:Person {name: 'Alice'})-[:KNOWS]->(b), \
+         (a)-[:WORKS_AT]->(c) RETURN b.name AS friend, c.name AS company",
+    );
+    assert_eq!(
+        out["rows"],
+        json!([{"friend": "Bob", "company": "Acme"}, {"friend": "Carol", "company": "Acme"}])
+    );
+
+    let out = run(
+        &store,
+        "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Carol'}) \
+         MATCH p=allShortestPaths((a)-[:KNOWS*1..3]->(b)) RETURN length(p) AS len",
+    );
+    assert_eq!(out["row_count"], 1);
+    assert_eq!(out["rows"][0]["len"], 1);
+}
+
+#[test]
+fn cypher_distinct_and_explain_are_deterministic() {
+    let (_dir, store) = graph_store();
+    let out = run(
+        &store,
+        "MATCH (n) RETURN DISTINCT labels(n) AS labels ORDER BY labels",
+    );
+    assert_eq!(out["row_count"], 2);
+
+    let out = run(
+        &store,
+        "EXPLAIN MATCH (n:Person) WHERE n.age > 20 RETURN n.name",
+    );
+    assert_eq!(out["row_count"], 1);
+    assert!(out["rows"][0]["plan"].as_str().unwrap().contains("Scan"));
+}
+
+#[test]
+fn cypher_limits_and_nesting_fail_explicitly() {
+    let (_dir, store) = graph_store();
+    let collection = store.collection("nodes").unwrap();
+    let options: CypherOptions = serde_json::from_value(json!({
+        "query": "UNWIND range(1, 1000000) AS x RETURN sum(x)",
+        "max_rows": 10,
+        "max_operations": 50
+    }))
+    .unwrap();
+    let error = collection.graph_cypher(options).unwrap_err().to_string();
+    assert!(error.contains("operation budget"));
+
+    let options: CypherOptions = serde_json::from_value(json!({
+        "query": "RETURN [[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]] AS x"
+    }))
+    .unwrap();
+    let error = collection.graph_cypher(options).unwrap_err().to_string();
+    assert!(error.contains("nesting"));
+}
+
+#[test]
+fn cypher_unbound_variables_fail_explicitly() {
+    let (_dir, store) = graph_store();
+    let collection = store.collection("nodes").unwrap();
+    let options: CypherOptions = serde_json::from_value(json!({
+        "query": "RETURN missing"
+    }))
+    .unwrap();
+    let error = collection.graph_cypher(options).unwrap_err().to_string();
+    assert!(error.contains("unbound variable"));
+}
+
+#[test]
+fn cypher_is_deterministic_and_rejects_vault_collections() {
+    let (_dir, store) = graph_store();
+    let collection = store.collection("nodes").unwrap();
+    let options: CypherOptions = serde_json::from_value(json!({
+        "query": "MATCH (n:Person) RETURN n.name AS name ORDER BY name"
+    }))
+    .unwrap();
+    let first = collection.graph_cypher(options.clone()).unwrap();
+    let second = collection.graph_cypher(options).unwrap();
+    assert_eq!(first, second);
+    assert_eq!(
+        first["rows"],
+        json!([{"name": "Alice"}, {"name": "Bob"}, {"name": "Carol"}])
+    );
+
+    store
+        .create_collection("vault", nonodb_core::CollectionProfile::Vault)
+        .unwrap();
+    let vault = store.collection("vault").unwrap();
+    let options: CypherOptions = serde_json::from_value(json!({"query": "RETURN 1 AS x"})).unwrap();
+    let error = vault.graph_cypher(options).unwrap_err().to_string();
+    assert!(error.contains("vault"));
 }
