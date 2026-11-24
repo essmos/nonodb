@@ -134,6 +134,7 @@ def main() -> int:
                     {"op": "get_graph", "coll": "nodes"},
                     {"op": "traverse", "coll": "nodes", "start": ["a"]},
                     {"op": "shortest_path", "coll": "nodes", "start": "a", "target": "b"},
+                    {"op": "cypher", "coll": "nodes", "query": "MATCH (n) RETURN n"},
                 ):
                     denied = call(node_only, payload)
                     assert denied.status_code == 403, (payload, denied.status_code, denied.text)
