@@ -4399,6 +4399,84 @@ mod tests {
     }
 
     #[test]
+    fn find_and_modify_keeps_timeseries_indexes_current() {
+        use crate::collection::FindAndModifyOptions;
+
+        fn opts<'a>(
+            filter: &'a Value,
+            update: &'a Value,
+            upsert: bool,
+        ) -> FindAndModifyOptions<'a> {
+            FindAndModifyOptions {
+                filter,
+                update: Some(update),
+                sort: &[],
+                new: true,
+                upsert,
+                remove: false,
+                array_filters: &[],
+                projection: None,
+            }
+        }
+
+        let (_dir, store) = ts_store();
+        let settings = Settings {
+            time_field: "ts".into(),
+            meta_field: Some("device".into()),
+            ..Settings::default()
+        };
+        let c = store
+            .create_timeseries_collection("metrics", &settings)
+            .unwrap();
+        let base = 1_700_000_000_000i64;
+        for idx in 0..50i64 {
+            c.insert_one(json!({
+                "ts": {"$date": {"$numberLong": (base + idx * 1000).to_string()}},
+                "device": {"id": "a"},
+                "level": idx % 5,
+                "value": idx,
+            }))
+            .unwrap();
+        }
+        c.create_index("level", false).unwrap();
+        assert_eq!(c.count(&json!({"level": 1})).unwrap(), 10);
+
+        let filter = json!({"level": 1});
+        let update = json!({"$set": {"level": 3}});
+        let changed = c.find_and_modify(&opts(&filter, &update, false)).unwrap();
+        let changed_id = changed.value.as_ref().unwrap()["_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(c.count(&json!({"level": 1})).unwrap(), 9);
+        assert_eq!(c.count(&json!({"level": 3})).unwrap(), 11);
+        assert_eq!(c.count(&json!({"level": 3, "_id": changed_id})).unwrap(), 1);
+
+        // A time/meta move removes the old index entry and inserts the new one.
+        let filter = json!({"_id": changed_id});
+        let update = json!({"$set": {
+            "ts": {"$date": {"$numberLong": (base + 86_400_000).to_string()}},
+            "level": 4
+        }});
+        let moved = c.find_and_modify(&opts(&filter, &update, false)).unwrap();
+        let moved_id = moved.new_id.as_ref().unwrap();
+        assert_ne!(moved_id, &changed_id);
+        assert_eq!(c.count(&json!({"level": 3})).unwrap(), 10);
+        assert_eq!(c.count(&json!({"level": 4})).unwrap(), 11);
+        assert_eq!(c.count(&json!({"_id": moved_id, "level": 4})).unwrap(), 1);
+
+        // Upserts add index entries too.
+        let filter = json!({"_id": "custom-ts-id", "level": 9});
+        let update = json!({"$set": {
+            "ts": {"$date": {"$numberLong": (base + 1_000).to_string()}},
+            "device": {"id": "a"}
+        }});
+        let upserted = c.find_and_modify(&opts(&filter, &update, true)).unwrap();
+        assert_eq!(upserted.upserted_id.as_deref(), Some("custom-ts-id"));
+        assert_eq!(c.count(&json!({"level": 9})).unwrap(), 1);
+    }
+
+    #[test]
     fn text_fuzzy_geo_and_vector_indexes_work_on_timeseries() {
         use crate::vector::VectorMetric;
 

@@ -1598,6 +1598,21 @@ impl<'e> Collection<'e> {
         Ok(())
     }
 
+    /// Updates secondary, text, fuzzy, and vector entries for one row.
+    fn apply_all_index_entries(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        old: Option<&Value>,
+        new: Option<&Value>,
+        id: &str,
+    ) -> Result<()> {
+        self.apply_index_entries(wtxn, old, new, id)?;
+        self.apply_text_entries(wtxn, old, new, id)?;
+        self.apply_fuzzy_entries(wtxn, old, new, id)?;
+        self.apply_vector_entries(wtxn, old, new, id)?;
+        Ok(())
+    }
+
     /// Updates index entries for an `old -> new` change (insert: `old=None`,
     /// delete: `new=None`).
     fn apply_index_entries(
@@ -5053,32 +5068,23 @@ impl<'e> Collection<'e> {
                     continue;
                 };
                 if let Some((_, new_id)) = report.moved.iter().find(|(old, _)| old == old_id) {
-                    self.apply_index_entries(wtxn, Some(old), None, old_id)?;
-                    self.apply_text_entries(wtxn, Some(old), None, old_id)?;
-                    self.apply_fuzzy_entries(wtxn, Some(old), None, old_id)?;
-                    self.apply_vector_entries(wtxn, Some(old), None, old_id)?;
+                    self.apply_all_index_entries(wtxn, Some(old), None, old_id)?;
                     if let Some(new_doc) = crate::timeseries::find_by_id(
                         &*wtxn, self.env, &self.name, &settings, new_id,
                     )? {
-                        self.apply_index_entries(wtxn, None, Some(&new_doc), new_id)?;
+                        self.apply_all_index_entries(wtxn, None, Some(&new_doc), new_id)?;
                     }
                 } else if let Some(new_doc) =
                     crate::timeseries::find_by_id(&*wtxn, self.env, &self.name, &settings, old_id)?
                 {
-                    self.apply_index_entries(wtxn, Some(old), Some(&new_doc), old_id)?;
-                    self.apply_text_entries(wtxn, Some(old), Some(&new_doc), old_id)?;
-                    self.apply_fuzzy_entries(wtxn, Some(old), Some(&new_doc), old_id)?;
-                    self.apply_vector_entries(wtxn, Some(old), Some(&new_doc), old_id)?;
+                    self.apply_all_index_entries(wtxn, Some(old), Some(&new_doc), old_id)?;
                 }
             }
             if let Some(id) = &report.upserted_id {
                 if let Some(new_doc) =
                     crate::timeseries::find_by_id(&*wtxn, self.env, &self.name, &settings, id)?
                 {
-                    self.apply_index_entries(wtxn, None, Some(&new_doc), id)?;
-                    self.apply_text_entries(wtxn, None, Some(&new_doc), id)?;
-                    self.apply_fuzzy_entries(wtxn, None, Some(&new_doc), id)?;
-                    self.apply_vector_entries(wtxn, None, Some(&new_doc), id)?;
+                    self.apply_all_index_entries(wtxn, None, Some(&new_doc), id)?;
                 }
             }
             return Ok(UpdateOutcome {
@@ -5384,12 +5390,18 @@ impl<'e> Collection<'e> {
                 .moved
                 .last()
                 .map(|(_, new_id)| new_id.clone())
-                .unwrap_or(id);
+                .unwrap_or_else(|| id.clone());
             let new =
                 crate::timeseries::find_by_id(&*wtxn, self.env, &self.name, &settings, &new_id)?
                     .ok_or_else(|| {
                         Error::Query("updated time-series document disappeared".into())
                     })?;
+            if new_id == id {
+                self.apply_all_index_entries(wtxn, Some(&old), Some(&new), &id)?;
+            } else {
+                self.apply_all_index_entries(wtxn, Some(&old), None, &id)?;
+                self.apply_all_index_entries(wtxn, None, Some(&new), &new_id)?;
+            }
             return Ok(FindAndModifyOutcome {
                 value: Some(apply_projection(
                     if opts.new { new } else { old },
@@ -5419,9 +5431,12 @@ impl<'e> Collection<'e> {
         let id = report
             .upserted_id
             .ok_or_else(|| Error::Query("upserted time-series document disappeared".into()))?;
+        let inserted = crate::timeseries::find_by_id(&*wtxn, self.env, &self.name, &settings, &id)?;
+        if let Some(doc) = &inserted {
+            self.apply_all_index_entries(wtxn, None, Some(doc), &id)?;
+        }
         let value = if opts.new {
-            crate::timeseries::find_by_id(&*wtxn, self.env, &self.name, &settings, &id)?
-                .map(|doc| apply_projection(doc, opts.projection, Some(opts.filter)))
+            inserted.map(|doc| apply_projection(doc, opts.projection, Some(opts.filter)))
         } else {
             None
         };

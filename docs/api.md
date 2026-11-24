@@ -2741,6 +2741,12 @@ The MongoDB wire `create` command accepts the same options:
                 "granularity": "seconds", "expireAfterSeconds": 86400}}
 ```
 
+`listCollections` reads them back: the collection entry includes
+`options.timeseries` with `timeField`, `metaField`, `granularity`, and
+`expireAfterSeconds` (plus the NonoDB `bucketMaxDocs`, `bucketMaxBytes`, and
+`compression` extensions). This is the Mongo-wire equivalent of
+`get_collection_timeseries`.
+
 `retain_timeseries` drops time-series rows older than a date. Whole buckets are
 removed by key without decoding; the boundary bucket marks expired rows in its
 deletion bitmap so synthetic `_id`s stay valid:

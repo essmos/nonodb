@@ -185,8 +185,11 @@ pruning, and the whole bucket time range is decoded before the pipeline runs:
 Downsampling to per-minute buckets works the same way (group by a truncated
 time expression computed with `$dateToString`/`$subtract` in `$project`).
 
-Stages that need a second collection or an index host (`$lookup`, `$search`,
-`$unionWith`) are outside the in-memory runner.
+Stages that need a second collection or an index host run through the normal
+aggregation host: `$lookup` (local and pipeline/`let`), `$graphLookup`,
+`$unionWith`, `$search`, `$searchMeta`, and `$vectorSearch` work on time-series
+inputs. `$out` and `$merge` remain unsupported because they would bypass the
+bucket writer.
 
 ## Supported operations
 
@@ -317,7 +320,11 @@ behaves differently depending on what it touches:
 - Removing the time field (`$unset`) or setting it to a non-date value is
   rejected.
 - Upserts accept `$setOnInsert` and must end up with a valid time field.
-- TTL, history, and secondary indexes are not maintained for time-series rows.
+- Secondary, text, fuzzy, geo, and vector indexes are maintained by inserts,
+  updates, upserts, deletes, `findAndModify`, and replicated writes, including
+  moves and index rebuilds. History is not recorded for time-series rows; TTL
+  is read-time expiry (`expireAfterSeconds`) plus automatic daemon retention,
+  not document history.
 
 ## Disk usage
 

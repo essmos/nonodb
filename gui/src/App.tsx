@@ -5550,7 +5550,7 @@ function Shell({
               {profile === 'timeseries' && (
                 <span className="field-hint">
                   Rows are grouped into buckets by time window and optional series field.
-                  Field names become columns; updates and deletes use tombstones.
+                  Field names become columns; deletes use a bucket deletion bitmap.
                 </span>
               )}
             </label>

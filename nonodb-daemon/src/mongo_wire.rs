@@ -2055,6 +2055,25 @@ async fn drop_collection_command(
     })
 }
 
+/// Renders stored time-series settings with the MongoDB `listCollections`
+/// option names (plus NonoDB bucket/compression extensions).
+fn timeseries_options_doc(settings: &nonodb_core::timeseries::Settings) -> Document {
+    let mut spec = bson::doc! {
+        "timeField": settings.time_field.clone(),
+        "granularity": settings.granularity.as_str(),
+    };
+    if let Some(meta) = &settings.meta_field {
+        spec.insert("metaField", meta.clone());
+    }
+    if let Some(expire) = settings.expire_after_seconds {
+        spec.insert("expireAfterSeconds", expire as i64);
+    }
+    spec.insert("bucketMaxDocs", settings.bucket_max_docs as i64);
+    spec.insert("bucketMaxBytes", settings.bucket_max_bytes as i64);
+    spec.insert("compression", settings.compression.as_str());
+    spec
+}
+
 async fn list_collections_command(
     state: &super::AppState,
     body: &Document,
@@ -2066,28 +2085,38 @@ async fn list_collections_command(
         return Ok(cursor_reply(0, &namespace, Vec::new(), true));
     };
     let store = runtime.store.clone();
-    let names = tokio::task::spawn_blocking(move || {
-        let rtxn = store.read_txn()?;
-        let names = store.collections_in(&rtxn)?;
-        rtxn.commit()?;
-        Ok::<Vec<String>, nonodb_core::Error>(names)
+    let entries = tokio::task::spawn_blocking(move || {
+        let names = store.collections()?;
+        let mut entries = Vec::with_capacity(names.len());
+        for name in names {
+            let settings = store.timeseries_settings(&name)?;
+            entries.push((name, settings));
+        }
+        Ok::<_, nonodb_core::Error>(entries)
     })
     .await
     .map_err(|error| ApiError::internal(format!("listCollections join error: {error}")))??;
     let name_only = body.get_bool("nameOnly").unwrap_or(false);
     let filter = document_field(body, "filter")?;
-    let mut batch = Vec::with_capacity(names.len());
-    for name in names {
+    let mut batch = Vec::with_capacity(entries.len());
+    for (name, timeseries) in entries {
         if name.starts_with('\u{1}') || name == crate::databases::DEFAULT_DATABASE {
             continue;
         }
         if principal.is_some_and(|principal| !principal.can_see_collection(&database, &name)) {
             continue;
         }
+        let mut options = Document::new();
+        if let Some(settings) = timeseries {
+            options.insert(
+                "timeseries",
+                Bson::Document(timeseries_options_doc(&settings)),
+            );
+        }
         let mut doc = bson::doc! {
             "name": name.clone(),
             "type": "collection",
-            "options": Bson::Document(Document::new()),
+            "options": Bson::Document(options),
             "info": Bson::Document(bson::doc! {"readOnly": false}),
             "idIndex": Bson::Document(bson::doc! {
                 "v": 2i32,
@@ -4497,6 +4526,24 @@ mod tests {
             "timeseries": bson::doc! {"timeField": "ts", "granularity": "weeks"},
         };
         assert!(parse_timeseries_spec(&bad).is_err());
+    }
+
+    #[test]
+    fn list_collections_renders_timeseries_options() {
+        let settings = nonodb_core::timeseries::Settings {
+            time_field: "ts".into(),
+            meta_field: Some("device".into()),
+            granularity: nonodb_core::timeseries::Granularity::Minutes,
+            expire_after_seconds: Some(3600),
+            ..Default::default()
+        };
+        let options = timeseries_options_doc(&settings);
+        assert_eq!(options.get_str("timeField").unwrap(), "ts");
+        assert_eq!(options.get_str("metaField").unwrap(), "device");
+        assert_eq!(options.get_str("granularity").unwrap(), "minutes");
+        assert_eq!(options.get_i64("expireAfterSeconds").unwrap(), 3600);
+        assert_eq!(options.get_i64("bucketMaxDocs").unwrap(), 2048);
+        assert_eq!(options.get_str("compression").unwrap(), "balanced");
     }
 
     #[test]
