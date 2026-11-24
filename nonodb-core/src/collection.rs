@@ -280,6 +280,8 @@ pub struct UpdateOutcome {
     pub matched: usize,
     pub modified: usize,
     pub upserted_id: Option<String>,
+    /// `(old_id, new_id)` rows whose time or series changed (time-series only).
+    pub moved: Vec<(String, String)>,
 }
 
 /// Options for an atomic find-and-modify operation.
@@ -305,6 +307,8 @@ pub struct FindAndModifyOutcome {
     pub matched: usize,
     pub modified: usize,
     pub upserted_id: Option<String>,
+    /// New synthetic `_id` when a time-series update moved the row.
+    pub new_id: Option<String>,
 }
 type IndexIter<'a> = Box<dyn Iterator<Item = heed::Result<(&'a [u8], &'a [u8])>> + 'a>;
 type IdBounds = (Bound<Vec<u8>>, Bound<Vec<u8>>);
@@ -4706,16 +4710,21 @@ impl<'e> Collection<'e> {
             // (same settings, same insert order, same synthetic ids).
             let settings = self.timeseries_settings_in(&*wtxn)?.unwrap_or_default();
             match op {
-                "insert" | "update" => {
+                "insert" => {
                     let after = after.ok_or_else(|| {
                         Error::Query("replication change is missing `after`".into())
                     })?;
-                    crate::timeseries::insert(
-                        wtxn,
-                        self.env,
-                        &self.name,
-                        &settings,
-                        after.clone(),
+                    crate::timeseries::insert_replicated(
+                        wtxn, self.env, &self.name, &settings, id, after,
+                    )?;
+                    return Ok(());
+                }
+                "update" => {
+                    let after = after.ok_or_else(|| {
+                        Error::Query("replication change is missing `after`".into())
+                    })?;
+                    crate::timeseries::replace_by_id(
+                        wtxn, self.env, &self.name, &settings, id, after,
                     )?;
                     return Ok(());
                 }
@@ -4838,7 +4847,26 @@ impl<'e> Collection<'e> {
         array_filters: &[Value],
         default_id: Option<&Value>,
     ) -> Result<UpdateOutcome> {
-        self.ensure_not_timeseries("update")?;
+        if self.profile.is_timeseries() {
+            let settings = self.timeseries_settings_in(&*wtxn)?.unwrap_or_default();
+            let report = crate::timeseries::update(
+                wtxn,
+                self.env,
+                &self.name,
+                &settings,
+                filter,
+                update,
+                multi,
+                array_filters,
+                upsert,
+            )?;
+            return Ok(UpdateOutcome {
+                matched: report.matched,
+                modified: report.modified,
+                upserted_id: report.upserted_id,
+                moved: report.moved,
+            });
+        }
         self.ensure_standard()?;
         let keys = self.matching_keys(&*wtxn, filter, multi)?;
         if keys.is_empty() {
@@ -4847,6 +4875,7 @@ impl<'e> Collection<'e> {
                     matched: 0,
                     modified: 0,
                     upserted_id: None,
+                    moved: Vec::new(),
                 });
             }
             let mut doc = seed_from_filter(filter);
@@ -4866,6 +4895,7 @@ impl<'e> Collection<'e> {
                 matched: 0,
                 modified: 0,
                 upserted_id: Some(id),
+                moved: Vec::new(),
             });
         }
 
@@ -4885,6 +4915,7 @@ impl<'e> Collection<'e> {
             matched,
             modified,
             upserted_id: None,
+            moved: Vec::new(),
         })
     }
 
@@ -4988,8 +5019,8 @@ impl<'e> Collection<'e> {
         opts: &FindAndModifyOptions<'_>,
         default_id: Option<&Value>,
     ) -> Result<FindAndModifyOutcome> {
-        if !opts.remove {
-            self.ensure_not_timeseries("find_and_modify")?;
+        if self.profile.is_timeseries() {
+            return self.find_and_modify_timeseries(wtxn, opts);
         }
         self.ensure_standard()?;
         validate_find_and_modify(opts)?;
@@ -5016,6 +5047,7 @@ impl<'e> Collection<'e> {
                 matched: removed,
                 modified: removed,
                 upserted_id: None,
+                new_id: None,
             });
         }
 
@@ -5034,6 +5066,7 @@ impl<'e> Collection<'e> {
                 matched: 1,
                 modified: 1,
                 upserted_id: None,
+                new_id: None,
             });
         }
 
@@ -5070,6 +5103,113 @@ impl<'e> Collection<'e> {
             matched: 0,
             modified: 0,
             upserted_id: Some(id),
+            new_id: None,
+        })
+    }
+
+    fn find_and_modify_timeseries(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        opts: &FindAndModifyOptions<'_>,
+    ) -> Result<FindAndModifyOutcome> {
+        validate_find_and_modify(opts)?;
+        let query = FindQuery {
+            filter: opts.filter.clone(),
+            projection: None,
+            sort: opts.sort.to_vec(),
+            skip: 0,
+            limit: Some(1),
+            comment: None,
+            max_time_ms: None,
+            hint: None,
+        };
+        let selected = self.find_in(&*wtxn, &query)?.into_iter().next();
+        if opts.remove {
+            let Some(old) = selected else {
+                return Ok(empty_find_and_modify());
+            };
+            let id = old.get("_id").cloned().ok_or(Error::InvalidId)?;
+            let removed = self.delete_txn(wtxn, &serde_json::json!({"_id": id}), false)?;
+            return Ok(FindAndModifyOutcome {
+                value: Some(apply_projection(old, opts.projection, Some(opts.filter))),
+                matched: removed,
+                modified: removed,
+                upserted_id: None,
+                new_id: None,
+            });
+        }
+        let update = opts
+            .update
+            .ok_or_else(|| Error::Query("find_and_modify requires `update` or `remove`".into()))?;
+        let settings = self.timeseries_settings_in(&*wtxn)?.unwrap_or_default();
+        if let Some(old) = selected {
+            let id = old
+                .get("_id")
+                .and_then(Value::as_str)
+                .ok_or(Error::InvalidId)?
+                .to_string();
+            let report = crate::timeseries::update(
+                wtxn,
+                self.env,
+                &self.name,
+                &settings,
+                &serde_json::json!({"_id": id}),
+                update,
+                false,
+                opts.array_filters,
+                false,
+            )?;
+            let new_id = report
+                .moved
+                .last()
+                .map(|(_, new_id)| new_id.clone())
+                .unwrap_or(id);
+            let new =
+                crate::timeseries::find_by_id(&*wtxn, self.env, &self.name, &settings, &new_id)?
+                    .ok_or_else(|| {
+                        Error::Query("updated time-series document disappeared".into())
+                    })?;
+            return Ok(FindAndModifyOutcome {
+                value: Some(apply_projection(
+                    if opts.new { new } else { old },
+                    opts.projection,
+                    Some(opts.filter),
+                )),
+                matched: 1,
+                modified: 1,
+                upserted_id: None,
+                new_id: Some(new_id),
+            });
+        }
+        if !opts.upsert {
+            return Ok(empty_find_and_modify());
+        }
+        let report = crate::timeseries::update(
+            wtxn,
+            self.env,
+            &self.name,
+            &settings,
+            opts.filter,
+            update,
+            false,
+            opts.array_filters,
+            true,
+        )?;
+        let id = report
+            .upserted_id
+            .ok_or_else(|| Error::Query("upserted time-series document disappeared".into()))?;
+        let value = if opts.new {
+            crate::timeseries::find_by_id(&*wtxn, self.env, &self.name, &settings, &id)?
+                .map(|doc| apply_projection(doc, opts.projection, Some(opts.filter)))
+        } else {
+            None
+        };
+        Ok(FindAndModifyOutcome {
+            value,
+            matched: 0,
+            modified: 0,
+            upserted_id: Some(id.clone()),
+            new_id: Some(id),
         })
     }
 
@@ -5124,6 +5264,7 @@ impl<'e> Collection<'e> {
                 matched: removed,
                 modified: removed,
                 upserted_id: None,
+                new_id: None,
             });
         }
         let update = opts
@@ -5145,6 +5286,7 @@ impl<'e> Collection<'e> {
                 matched: 1,
                 modified: 1,
                 upserted_id: None,
+                new_id: None,
             });
         }
         if !opts.upsert {
@@ -5165,6 +5307,7 @@ impl<'e> Collection<'e> {
             matched: 0,
             modified: 0,
             upserted_id: Some(id),
+            new_id: None,
         })
     }
 
@@ -5447,6 +5590,7 @@ impl<'e> Collection<'e> {
                     matched: 0,
                     modified: 0,
                     upserted_id: None,
+                    moved: Vec::new(),
                 });
             }
             let mut doc = seed_from_filter(filter);
@@ -5457,6 +5601,7 @@ impl<'e> Collection<'e> {
                 matched: 0,
                 modified: 0,
                 upserted_id: Some(id),
+                moved: Vec::new(),
             });
         };
         let old_stored: Value = parse_json(raw)?;
@@ -5466,6 +5611,7 @@ impl<'e> Collection<'e> {
             matched: 1,
             modified: 1,
             upserted_id: None,
+            moved: Vec::new(),
         })
     }
 
@@ -9666,6 +9812,7 @@ fn empty_find_and_modify() -> FindAndModifyOutcome {
         matched: 0,
         modified: 0,
         upserted_id: None,
+        new_id: None,
     }
 }
 
@@ -11440,7 +11587,8 @@ mod tests {
             UpdateOutcome {
                 matched: 0,
                 modified: 0,
-                upserted_id: None
+                upserted_id: None,
+                moved: Vec::new()
             }
         );
         assert_eq!(c.count(&serde_json::json!({})).unwrap(), 0);

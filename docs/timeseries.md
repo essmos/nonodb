@@ -202,8 +202,8 @@ Stages that need a second collection or an index host (`$lookup`, `$search`,
 | secondary, text, fuzzy, geo, vector indexes | rejected with a clear error |
 | `delete` by filter or by `_id` | yes (tombstones) |
 | `findAndModify` with `remove: true` | yes |
-| `findAndModify` with an update | rejected |
-| `update` / `$set` | rejected |
+| `findAndModify` with an update | yes (returns the new `_id` when the row moves) |
+| `update` (`$set`, `$inc`, `$mul`, `$unset`, `$rename`, pipelines, upsert) | yes |
 | aggregation pipelines (`$match`, `$group`, `$bucket`, `$sort`, ...) | yes, decoded then run in memory |
 | retention: delete rows older than a cutoff | `retain_timeseries` |
 | SQL, `$search`, `$lookup`, watches/events | not supported |
@@ -213,6 +213,24 @@ Stages that need a second collection or an index host (`$lookup`, `$search`,
 Rejections return `invalid query: `<op>` is not supported on time-series
 collection `<name>``, so API clients fail loudly instead of silently returning
 empty results.
+
+### Updates and ids
+
+A time-series `_id` encodes the row location (bucket + position), so an update
+behaves differently depending on what it touches:
+
+- Changing ordinary fields rewrites the affected sealed bucket in place; the
+  row keeps its position and its `_id` stays valid. Pending rows are rewritten
+  under their existing key.
+- Changing `timeField` or `metaField` moves the row to another bucket: the old
+  row is tombstoned, the document is re-inserted, and its synthetic `_id`
+  changes. `update` still reports `matched`/`modified`; `findAndModify` returns
+  the new `_id` in `new_id` and the updated document when `new: true`. The
+  change is replicated as `delete(old)` + `insert(new)`.
+- Removing the time field (`$unset`) or setting it to a non-date value is
+  rejected.
+- Upserts accept `$setOnInsert` and must end up with a valid time field.
+- TTL, history, and secondary indexes are not maintained for time-series rows.
 
 ## Disk usage
 
@@ -414,9 +432,8 @@ Reproduce: `ROWS=100000 READS=500 cargo run --release -p nonodb-core --example t
 
 ## Limitations
 
-- No in-place updates (`$set`, `$inc`, pipelines). Delete is supported and uses
-  tombstones; deleted rows keep occupying their bucket until retention or
-  compaction.
+- Deletes and rows moved by an update use tombstones; deleted rows keep
+  occupying their bucket until retention or compaction.
 - No unique/secondary indexes, so deletes by filter decode the candidate
   buckets like a scan.
 - No SQL, secondary/text/fuzzy/geo/vector indexes, `$search`, `$lookup`, or

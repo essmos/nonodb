@@ -11,11 +11,17 @@ Full release notes: https://github.com/essmos/nonodb/releases
   dictionary, frame-of-reference bit packing, boolean bit packing, byte
   shuffle, and optional zlib per column. Open buckets append rows in O(1) and
   seal when full or when the window advances. `find`, `count`, `explain`,
-  ordered lookups, replication, backup, and drop work; updates, deletes,
-  indexes, aggregation, and SQL are rejected with a clear error. The bundled
+  ordered lookups, replication, backup, and drop work; indexes, search, and SQL
+  are rejected with a clear error. The bundled
   benchmark stores 50k mixed IoT samples in 4.21 bytes/row, 43.6x smaller than
   raw JSON and 2.64x smaller than row-oriented zlib with the same data. See
   `docs/timeseries.md`.
+- Add `update` and `findAndModify` update support for time-series collections:
+  `$set`, `$inc`, `$mul`, `$unset`, `$rename`, update pipelines and upserts.
+  Ordinary field changes rewrite the affected bucket in place and keep the
+  synthetic `_id`; changing the time or meta field is a delete + insert and
+  reports the new `_id` (`new_id` from `findAndModify`). Replication replays a
+  move as delete + insert and pinned locators keep ids identical on replicas.
 - Add aggregation and retention for time-series collections. `aggregate` now
   decodes buckets through the time-range-pruned find path and runs the normal
   in-memory pipeline, so `$group`/`$bucket` downsampling works. The new

@@ -1432,6 +1432,9 @@ fn execute(
                                 code: "invalid_id".into(),
                                 message: "document has no valid _id".into(),
                             })?;
+                            if out.moved.iter().any(|(old, _)| old == &id) {
+                                continue;
+                            }
                             emit_by_id(
                                 store,
                                 wtxn,
@@ -1440,6 +1443,31 @@ fn execute(
                                 "update",
                                 &id,
                                 Some(before),
+                                config,
+                                replication,
+                            )?;
+                        }
+                        // Time-series rows that moved buckets: replay as delete+insert.
+                        for (old, new_id) in &out.moved {
+                            emit_event(
+                                store,
+                                wtxn,
+                                coll,
+                                "delete",
+                                old,
+                                None,
+                                None,
+                                config,
+                                replication,
+                            )?;
+                            emit_by_id(
+                                store,
+                                wtxn,
+                                &c,
+                                coll,
+                                "insert",
+                                new_id,
+                                None,
                                 config,
                                 replication,
                             )?;
@@ -1573,17 +1601,45 @@ fn execute(
                                 replication,
                             )?;
                         } else if out.modified > 0 {
-                            emit_by_id(
-                                store,
-                                wtxn,
-                                &c,
-                                coll,
-                                "update",
-                                id,
-                                Some(before),
-                                config,
-                                replication,
-                            )?;
+                            let moved = out.new_id.as_deref().is_some_and(|new_id| new_id != id);
+                            if moved {
+                                emit_event(
+                                    store,
+                                    wtxn,
+                                    coll,
+                                    "delete",
+                                    id,
+                                    Some(before),
+                                    None,
+                                    config,
+                                    replication,
+                                )?;
+                                if let Some(new_id) = &out.new_id {
+                                    emit_by_id(
+                                        store,
+                                        wtxn,
+                                        &c,
+                                        coll,
+                                        "insert",
+                                        new_id,
+                                        None,
+                                        config,
+                                        replication,
+                                    )?;
+                                }
+                            } else {
+                                emit_by_id(
+                                    store,
+                                    wtxn,
+                                    &c,
+                                    coll,
+                                    "update",
+                                    id,
+                                    Some(before),
+                                    config,
+                                    replication,
+                                )?;
+                            }
                         }
                     }
                 }

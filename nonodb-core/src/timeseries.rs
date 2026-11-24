@@ -2475,6 +2475,481 @@ pub fn retain(
     Ok(report)
 }
 
+/// Result of a time-series update.
+#[derive(Debug, Clone, Default)]
+pub struct UpdateReport {
+    pub matched: usize,
+    pub modified: usize,
+    pub upserted_id: Option<String>,
+    /// `(old_id, new_id)` for rows whose time or series changed. Those rows are
+    /// removed and re-inserted, so their synthetic `_id` changes.
+    pub moved: Vec<(String, String)>,
+}
+
+fn row_doc(
+    row: &Map<String, Value>,
+    hash: u64,
+    salt: u32,
+    window: i64,
+    serial: u16,
+    seq: u32,
+) -> Value {
+    let mut doc = Value::Object(row.clone());
+    if !row.contains_key("_id") {
+        set_path(
+            doc.as_object_mut().expect("object"),
+            "_id",
+            Value::String(row_id(hash, salt, window, serial, seq)),
+        );
+    }
+    doc
+}
+
+fn normalize_doc(doc: &mut Value) -> Result<()> {
+    crate::date::normalize_document(doc)?;
+    crate::numeric::normalize_document(doc)?;
+    crate::bson_types::normalize_document(doc)?;
+    Ok(())
+}
+
+/// Removes a synthetic `_id` that was derived from the row location.
+pub fn strip_derived_id_pub(doc: &mut Value) {
+    strip_derived_id(doc)
+}
+
+fn strip_derived_id(doc: &mut Value) {
+    let derived = doc
+        .get("_id")
+        .and_then(Value::as_str)
+        .is_some_and(|id| parse_row_id(id).is_some());
+    if derived {
+        if let Some(object) = doc.as_object_mut() {
+            object.remove("_id");
+        }
+    }
+}
+
+/// Applies `update` to matching time-series rows.
+///
+/// Rows whose time and series stay the same are replaced in place (their
+/// synthetic `_id` remains valid). Rows whose `timeField` or `metaField`
+/// changes are deleted and re-inserted, which changes their `_id`; the returned
+/// [`UpdateReport::moved`] carries the id mapping.
+#[allow(clippy::too_many_arguments)]
+pub fn update(
+    wtxn: &mut RwTxn<'_>,
+    env: &heed::Env,
+    name: &str,
+    settings: &Settings,
+    filter: &Value,
+    update: &Value,
+    multi: bool,
+    array_filters: &[Value],
+    upsert: bool,
+) -> Result<UpdateReport> {
+    use crate::query::updater::{apply_upsert_with_options, apply_with_options, seed_from_filter};
+
+    validate_filter(filter)?;
+    let db =
+        env.create_database::<Bytes, Bytes>(wtxn, Some(&format!("{BUCKET_DB_PREFIX}{name}")))?;
+    let (low, high) = time_bounds(filter, &settings.time_field);
+    let meta_hash = meta_equality_hash(filter, settings);
+    let meta_filter = meta_only_filter(filter, settings);
+    let now = crate::ttl::now_ms() as i64;
+    let mut report = UpdateReport::default();
+
+    let mut buckets: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    for item in db.iter(&*wtxn)? {
+        let (key, payload) = item?;
+        if key.first() == Some(&KEY_BUCKET) {
+            buckets.push((key.to_vec(), payload.to_vec()));
+        }
+    }
+    for (key, payload) in buckets {
+        if !multi && report.matched > 0 {
+            break;
+        }
+        if let Some(expected) = meta_hash {
+            if key_parts(&key).map(|parts| parts.0) != Some(expected) {
+                continue;
+            }
+        }
+        let (_, start, end, meta) = bucket_header(&payload, settings)?;
+        if low.is_some_and(|low| end < low) || high.is_some_and(|high| start > high) {
+            continue;
+        }
+        if let Some(filter) = &meta_filter {
+            if !meta_bucket_matches(filter, settings, meta.as_ref()) {
+                continue;
+            }
+        }
+        let (mut bucket, selected) = decode_bucket_inner(&payload, settings, None, None)?;
+        let (hash, salt, window, serial) = key_parts(&key).unwrap_or((0, 0, start, 0));
+        let tombs = tombstones(&*wtxn, &db, hash, salt, window, serial)?;
+        let mut changed = false;
+        let mut moved_out = Vec::new();
+        for (pos, idx) in selected.iter().enumerate() {
+            if !multi && report.matched > 0 {
+                break;
+            }
+            let seq = *idx as u32;
+            if tombs.contains(&seq) {
+                continue;
+            }
+            let row = &bucket.rows[pos];
+            let had_id = row.contains_key("_id");
+            let doc = row_doc(row, hash, salt, window, serial, seq);
+            if expired(settings, &doc, now) || !matcher::matches(&doc, filter) {
+                continue;
+            }
+            report.matched += 1;
+            report.modified += 1;
+            let old_time = extract_time(&doc, &settings.time_field);
+            let old_meta = series_meta(&doc, settings);
+            let mut next = doc.clone();
+            apply_with_options(&mut next, update, filter, array_filters)?;
+            normalize_doc(&mut next)?;
+            let new_time = extract_time(&next, &settings.time_field).ok_or_else(|| {
+                Error::Query(format!(
+                    "time-series update cannot remove or invalidate `{}`",
+                    settings.time_field
+                ))
+            })?;
+            let new_meta = series_meta(&next, settings);
+            let same = old_time == Some(new_time) && old_meta == new_meta;
+            if same {
+                if !had_id {
+                    if let Some(object) = next.as_object_mut() {
+                        object.remove("_id");
+                    }
+                }
+                bucket.rows[pos] = next.as_object().cloned().unwrap_or_default();
+                changed = true;
+            } else {
+                moved_out.push(seq);
+                if !had_id {
+                    if let Some(object) = next.as_object_mut() {
+                        object.remove("_id");
+                    }
+                }
+                let old_id = row_id(hash, salt, window, serial, seq);
+                let new_id = insert(wtxn, env, name, settings, next)?;
+                report.moved.push((old_id, new_id));
+            }
+        }
+        for seq in &moved_out {
+            db.put(&mut *wtxn, &tomb_key(hash, salt, window, serial, *seq), &[])?;
+        }
+        if changed {
+            let payload = encode_bucket(&bucket, settings)?;
+            db.put(&mut *wtxn, &key, &payload)?;
+        }
+        if !moved_out.is_empty() {
+            let live =
+                bucket.rows.len() - tombstones(&*wtxn, &db, hash, salt, window, serial)?.len();
+            if live == 0 {
+                db.delete(&mut *wtxn, &key)?;
+                drop_tombstones(wtxn, &db, hash, salt, window, serial)?;
+            }
+        }
+    }
+
+    if multi || report.matched == 0 {
+        let mut rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for item in db.iter(&*wtxn)? {
+            let (key, payload) = item?;
+            if key.first() == Some(&KEY_ROW) {
+                rows.push((key.to_vec(), payload.to_vec()));
+            }
+        }
+        for (key, payload) in rows {
+            if !multi && report.matched > 0 {
+                break;
+            }
+            let Some((hash, salt, window, serial, seq)) = row_key_parts(&key) else {
+                continue;
+            };
+            if let Some(expected) = meta_hash {
+                if hash != expected {
+                    continue;
+                }
+            }
+            let row: Map<String, Value> = serde_json::from_slice(&payload)?;
+            let had_id = row.contains_key("_id");
+            let doc = row_doc(&row, hash, salt, window, serial, seq);
+            if expired(settings, &doc, now) || !matcher::matches(&doc, filter) {
+                continue;
+            }
+            report.matched += 1;
+            report.modified += 1;
+            let old_time = extract_time(&doc, &settings.time_field);
+            let old_meta = series_meta(&doc, settings);
+            let mut next = doc.clone();
+            apply_with_options(&mut next, update, filter, array_filters)?;
+            normalize_doc(&mut next)?;
+            let new_time = extract_time(&next, &settings.time_field).ok_or_else(|| {
+                Error::Query(format!(
+                    "time-series update cannot remove or invalidate `{}`",
+                    settings.time_field
+                ))
+            })?;
+            if old_time == Some(new_time) && old_meta == series_meta(&next, settings) {
+                if !had_id {
+                    if let Some(object) = next.as_object_mut() {
+                        object.remove("_id");
+                    }
+                }
+                let bytes = serde_json::to_vec(&next)?;
+                db.put(&mut *wtxn, &key, &bytes)?;
+            } else {
+                db.delete(&mut *wtxn, &key)?;
+                if !had_id {
+                    if let Some(object) = next.as_object_mut() {
+                        object.remove("_id");
+                    }
+                }
+                let old_id = row_id(hash, salt, window, serial, seq);
+                let new_id = insert(wtxn, env, name, settings, next)?;
+                report.moved.push((old_id, new_id));
+            }
+        }
+        refresh_pointers(wtxn, &db)?;
+    }
+
+    if report.matched == 0 && upsert {
+        let mut doc = seed_from_filter(filter);
+        apply_upsert_with_options(&mut doc, update, filter, array_filters)?;
+        normalize_doc(&mut doc)?;
+        if extract_time(&doc, &settings.time_field).is_none() {
+            return Err(Error::Query(format!(
+                "time-series upsert must provide the time field `{}`",
+                settings.time_field
+            )));
+        }
+        let id = insert(wtxn, env, name, settings, doc)?;
+        report.upserted_id = Some(id);
+    }
+
+    Ok(report)
+}
+
+/// Replica-side update: replaces one row by `_id`, or inserts `after` when the
+/// primary moved the row to another bucket.
+pub fn replace_by_id(
+    wtxn: &mut RwTxn<'_>,
+    env: &heed::Env,
+    name: &str,
+    settings: &Settings,
+    id: &str,
+    after: &Value,
+) -> Result<()> {
+    let db =
+        env.create_database::<Bytes, Bytes>(wtxn, Some(&format!("{BUCKET_DB_PREFIX}{name}")))?;
+    let mut next = after.clone();
+    strip_derived_id(&mut next);
+    normalize_doc(&mut next)?;
+    let Some((hash, salt, window, serial, seq)) = parse_row_id(id) else {
+        // User-supplied `_id`: fall back to delete+insert semantics.
+        if let Some((hash, salt, window, serial, seq)) =
+            locator_by_user_id(wtxn, env, name, settings, id)?
+        {
+            delete_locator(wtxn, &db, hash, salt, window, serial, seq)?;
+        }
+        insert(wtxn, env, name, settings, next)?;
+        return Ok(());
+    };
+    let new_time = extract_time(&next, &settings.time_field).ok_or_else(|| {
+        Error::Query(format!(
+            "replicated time-series row is missing `{}`",
+            settings.time_field
+        ))
+    })?;
+    let new_meta = series_meta(&next, settings);
+
+    if let Some(payload) = db.get(&*wtxn, &row_key(hash, salt, window, serial, seq))? {
+        let row: Map<String, Value> = serde_json::from_slice(payload)?;
+        let old = row_doc(&row, hash, salt, window, serial, seq);
+        let same = extract_time(&old, &settings.time_field) == Some(new_time)
+            && series_meta(&old, settings) == new_meta;
+        if same {
+            let bytes = serde_json::to_vec(&next)?;
+            db.put(
+                &mut *wtxn,
+                &row_key(hash, salt, window, serial, seq),
+                &bytes,
+            )?;
+            return Ok(());
+        }
+        db.delete(&mut *wtxn, &row_key(hash, salt, window, serial, seq))?;
+        insert(wtxn, env, name, settings, next)?;
+        refresh_pointers(wtxn, &db)?;
+        return Ok(());
+    }
+
+    let bucket = bucket_key(hash, salt, window, serial);
+    if db
+        .get(&*wtxn, &tomb_key(hash, salt, window, serial, seq))?
+        .is_some()
+    {
+        return Ok(());
+    }
+    if let Some(payload) = db.get(&*wtxn, &bucket)?.map(|raw| raw.to_vec()) {
+        let (mut decoded, selected) = decode_bucket_inner(&payload, settings, None, None)?;
+        let Some(pos) = selected.iter().position(|idx| *idx == seq as usize) else {
+            insert(wtxn, env, name, settings, next)?;
+            return Ok(());
+        };
+        let row = &decoded.rows[pos];
+        let old = row_doc(row, hash, salt, window, serial, seq);
+        let same = extract_time(&old, &settings.time_field) == Some(new_time)
+            && series_meta(&old, settings) == new_meta;
+        if !same {
+            db.put(&mut *wtxn, &tomb_key(hash, salt, window, serial, seq), &[])?;
+            insert(wtxn, env, name, settings, next)?;
+            return Ok(());
+        }
+        let mut row_map = next.as_object().cloned().unwrap_or_default();
+        if let Some(field) = &settings.meta_field {
+            if let Some(object) = next.as_object() {
+                if let Some(meta) = get_path(&Value::Object(object.clone()), field) {
+                    row_map.insert(field.clone(), meta.clone());
+                }
+            }
+        }
+        decoded.rows[pos] = row_map;
+        let payload = encode_bucket(&decoded, settings)?;
+        db.put(&mut *wtxn, &bucket, &payload)?;
+        return Ok(());
+    }
+
+    // The primary moved the row: the old location is gone, insert the payload
+    // at the primary's locator so ids stay stable across nodes.
+    insert_replicated(wtxn, env, name, settings, id, &next)?;
+    Ok(())
+}
+
+/// Replica-side insert that honours the primary's synthetic `_id`. Physical
+/// bucket layout (serial numbers) may differ between nodes, so the row is
+/// written at the exact locator encoded in `id` whenever it is synthetic.
+pub fn insert_replicated(
+    wtxn: &mut RwTxn<'_>,
+    env: &heed::Env,
+    name: &str,
+    settings: &Settings,
+    id: &str,
+    doc: &Value,
+) -> Result<String> {
+    let mut doc = doc.clone();
+    strip_derived_id(&mut doc);
+    normalize_doc(&mut doc)?;
+    let Some((hash, salt, window, serial, seq)) = parse_row_id(id) else {
+        return insert(wtxn, env, name, settings, doc);
+    };
+    if extract_time(&doc, &settings.time_field).is_none() {
+        return Err(Error::Query(format!(
+            "replicated time-series row is missing `{}`",
+            settings.time_field
+        )));
+    }
+    let db = ensure_bucket_db(wtxn, env, name)?;
+    let key = bucket_key(hash, salt, window, serial);
+    let mut bucket = match db.get(&*wtxn, &key)? {
+        Some(payload) => decode_bucket_inner(payload, settings, None, None)?.0,
+        None => Bucket {
+            sealed: false,
+            window_start: window,
+            end: window,
+            meta: series_meta(&doc, settings),
+            rows: Vec::new(),
+        },
+    };
+    let row = doc.as_object().cloned().unwrap_or_default();
+    let idx = seq as usize;
+    if idx < bucket.rows.len() {
+        bucket.rows[idx] = row;
+    } else if idx == bucket.rows.len() {
+        bucket.rows.push(row);
+    } else {
+        return Err(Error::Query(format!(
+            "replicated time-series row `{id}` leaves a gap in its bucket"
+        )));
+    }
+    if let Some(time) = extract_time(&doc, &settings.time_field) {
+        bucket.end = bucket.end.max(time);
+    }
+    let payload = encode_bucket(&bucket, settings)?;
+    db.put(&mut *wtxn, &key, &payload)?;
+    db.delete(&mut *wtxn, &tomb_key(hash, salt, window, serial, seq))?;
+    refresh_pointers(wtxn, &db)?;
+    Ok(id.to_string())
+}
+
+type Locator = (u64, u32, i64, u16, u32);
+
+fn locator_by_user_id(
+    wtxn: &RwTxn<'_>,
+    env: &heed::Env,
+    name: &str,
+    settings: &Settings,
+    id: &str,
+) -> Result<Option<Locator>> {
+    let Some(db) =
+        env.open_database::<Bytes, Bytes>(wtxn, Some(&format!("{BUCKET_DB_PREFIX}{name}")))?
+    else {
+        return Ok(None);
+    };
+    for item in db.iter(wtxn)? {
+        let (key, payload) = item?;
+        if key.first() != Some(&KEY_ROW) {
+            continue;
+        }
+        let row: Map<String, Value> = serde_json::from_slice(payload)?;
+        if row.get("_id").and_then(Value::as_str) == Some(id) {
+            return Ok(row_key_parts(key));
+        }
+    }
+    for item in db.iter(wtxn)? {
+        let (key, payload) = item?;
+        if key.first() != Some(&KEY_BUCKET) {
+            continue;
+        }
+        let Some((hash, salt, window, serial)) = key_parts(key) else {
+            continue;
+        };
+        let (bucket, selected) = decode_bucket_inner(payload, settings, None, None)?;
+        let tombs = tombstones(wtxn, &db, hash, salt, window, serial)?;
+        for (row, idx) in bucket.rows.iter().zip(selected.iter()) {
+            if tombs.contains(&(*idx as u32)) {
+                continue;
+            }
+            if row.get("_id").and_then(Value::as_str) == Some(id) {
+                return Ok(Some((hash, salt, window, serial, *idx as u32)));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn delete_locator(
+    wtxn: &mut RwTxn<'_>,
+    db: &Database<Bytes, Bytes>,
+    hash: u64,
+    salt: u32,
+    window: i64,
+    serial: u16,
+    seq: u32,
+) -> Result<()> {
+    if db
+        .get(&*wtxn, &row_key(hash, salt, window, serial, seq))?
+        .is_some()
+    {
+        db.delete(&mut *wtxn, &row_key(hash, salt, window, serial, seq))?;
+    } else {
+        db.put(&mut *wtxn, &tomb_key(hash, salt, window, serial, seq), &[])?;
+    }
+    refresh_pointers(wtxn, db)
+}
+
 /// Fetches one row by `_id` without scanning the collection.
 ///
 /// Synthetic ids encode the physical location, so this is a single LMDB get
@@ -2787,9 +3262,10 @@ mod tests {
             stats.compression_ratio()
         );
 
-        assert!(collection
+        let updated = collection
             .update(&json!({}), &json!({"$set": {"x": 1}}), false)
-            .is_err());
+            .unwrap();
+        assert_eq!(updated, 1);
         assert!(collection.create_index("level", false).is_err());
         assert_eq!(collection.delete(&json!({}), false).unwrap(), 1);
         assert_eq!(collection.count(&json!({})).unwrap(), 249);
@@ -3109,7 +3585,7 @@ mod tests {
                 array_filters: &[],
                 projection: None,
             })
-            .is_err());
+            .is_ok());
 
         let expected = collection.count(&json!({})).unwrap() as u64;
         let rtxn = store.read_txn().unwrap();
@@ -3155,5 +3631,451 @@ mod tests {
             raw,
             encoded.len()
         );
+    }
+
+    fn ts_store() -> (tempfile::TempDir, crate::store::Store) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open(dir.path()).unwrap();
+        (dir, store)
+    }
+
+    fn ts_insert_range(c: &crate::collection::Collection<'_>, base: i64, rows: i64) -> Vec<String> {
+        (0..rows)
+            .map(|idx| {
+                c.insert_one(json!({
+                    "ts": {"$date": {"$numberLong": (base + idx * 1000).to_string()}},
+                    "device": {"id": "a"},
+                    "value": idx,
+                    "counter": 2,
+                    "legacy": true,
+                }))
+                .unwrap()
+            })
+            .collect()
+    }
+
+    fn ts_find_all(c: &crate::collection::Collection<'_>) -> Vec<Value> {
+        c.find(&crate::collection::FindQuery {
+            filter: json!({}),
+            projection: None,
+            sort: vec![("ts".into(), 1)],
+            skip: 0,
+            limit: None,
+            comment: None,
+            max_time_ms: None,
+            hint: None,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn update_keeps_synthetic_ids_and_moves_on_time_or_meta_change() {
+        let (_dir, store) = ts_store();
+        let settings = Settings {
+            time_field: "ts".into(),
+            meta_field: Some("device".into()),
+            ..Settings::default()
+        };
+        let c = store
+            .create_timeseries_collection("metrics", &settings)
+            .unwrap();
+        let base = 1_700_000_000_000i64;
+        let ids = ts_insert_range(&c, base, 6);
+        store.seal_timeseries("metrics").unwrap();
+        let target = ids[0].clone();
+
+        let out = c
+            .update_opts(
+                &json!({"_id": target}),
+                &json!({
+                    "$set": {"value": 100},
+                    "$inc": {"counter": 3},
+                    "$rename": {"legacy": "renamed"},
+                }),
+                false,
+                false,
+            )
+            .unwrap();
+        assert_eq!((out.matched, out.modified), (1, 1));
+        assert!(out.moved.is_empty());
+        let doc = c.find_by_key(&target).unwrap().unwrap();
+        assert_eq!(doc["_id"], json!(target));
+        assert_eq!(doc["value"], json!(100));
+        assert_eq!(doc["counter"], json!(5));
+        assert_eq!(doc["renamed"], json!(true));
+        assert!(doc.get("legacy").is_none());
+
+        c.update_opts(
+            &json!({"_id": target}),
+            &json!({"$unset": {"renamed": ""}}),
+            false,
+            false,
+        )
+        .unwrap();
+        c.update_opts(
+            &json!({"_id": target}),
+            &json!({"$mul": {"value": 2}}),
+            false,
+            false,
+        )
+        .unwrap();
+        c.update_opts(
+            &json!({"_id": target}),
+            &json!([{"$set": {"piped": true}}]),
+            false,
+            false,
+        )
+        .unwrap();
+        let doc = c.find_by_key(&target).unwrap().unwrap();
+        assert_eq!(doc["value"], json!(200));
+        assert_eq!(doc["piped"], json!(true));
+        assert!(doc.get("renamed").is_none());
+
+        // A multi pipeline update keeps every synthetic id stable.
+        let out = c
+            .update_opts(&json!({}), &json!([{"$set": {"tag": "x"}}]), true, false)
+            .unwrap();
+        assert_eq!(out.matched, 6);
+        for id in &ids {
+            let doc = c.find_by_key(id).unwrap().expect("id must survive");
+            assert_eq!(doc["tag"], json!("x"));
+        }
+        assert_eq!(c.count(&json!({})).unwrap(), 6);
+
+        // Changing the time field deletes + re-inserts the row.
+        let moved_ts = base + 3_600_000;
+        let out = c
+            .update_opts(
+                &json!({"_id": target}),
+                &json!({"$set": {"ts": {"$date": {"$numberLong": moved_ts.to_string()}}}}),
+                false,
+                false,
+            )
+            .unwrap();
+        assert_eq!(out.moved.len(), 1);
+        let new_id = out.moved[0].1.clone();
+        assert_ne!(new_id, target);
+        assert!(c.find_by_key(&target).unwrap().is_none());
+        let moved = c.find_by_key(&new_id).unwrap().unwrap();
+        assert_eq!(moved["value"], json!(200));
+        assert_eq!(c.count(&json!({})).unwrap(), 6);
+
+        // Changing the meta field also moves the row.
+        let out = c
+            .update_opts(
+                &json!({"_id": new_id}),
+                &json!({"$set": {"device": {"id": "b"}}}),
+                false,
+                false,
+            )
+            .unwrap();
+        assert_eq!(out.moved.len(), 1);
+        assert!(c
+            .find(&crate::collection::FindQuery {
+                filter: json!({"device.id": "b"}),
+                projection: None,
+                sort: vec![],
+                skip: 0,
+                limit: None,
+                comment: None,
+                max_time_ms: None,
+                hint: None,
+            })
+            .unwrap()
+            .iter()
+            .any(|doc| doc["_id"] == json!(out.moved[0].1)));
+        assert_eq!(c.count(&json!({})).unwrap(), 6);
+    }
+
+    #[test]
+    fn update_pending_rows_and_upsert() {
+        let (_dir, store) = ts_store();
+        let settings = Settings {
+            time_field: "ts".into(),
+            meta_field: Some("device".into()),
+            ..Settings::default()
+        };
+        let c = store
+            .create_timeseries_collection("metrics", &settings)
+            .unwrap();
+        let base = 1_700_000_000_000i64;
+        let ids = ts_insert_range(&c, base, 3);
+        let out = c
+            .update_opts(
+                &json!({"_id": ids[1]}),
+                &json!({"$set": {"value": 77}}),
+                false,
+                false,
+            )
+            .unwrap();
+        assert!(out.moved.is_empty());
+        assert_eq!(c.find_by_key(&ids[1]).unwrap().unwrap()["value"], json!(77));
+
+        let out = c
+            .update_opts(
+                &json!({"device.id": "zzz"}),
+                &json!({
+                    "$set": {"value": 1},
+                    "$setOnInsert": {"ts": {"$date": {"$numberLong": (base + 60_000).to_string()}}},
+                }),
+                false,
+                true,
+            )
+            .unwrap();
+        let upserted = out.upserted_id.expect("upserted id");
+        assert_eq!(c.count(&json!({})).unwrap(), 4);
+        let doc = c.find_by_key(&upserted).unwrap().unwrap();
+        assert_eq!(doc["value"], json!(1));
+        assert_eq!(doc["device"]["id"], json!("zzz"));
+
+        // Removing the time field from a row is rejected.
+        let err = c
+            .update_opts(
+                &json!({"_id": ids[0]}),
+                &json!({"$unset": {"ts": ""}}),
+                false,
+                false,
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("cannot remove or invalidate"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn find_and_modify_timeseries_new_remove_and_upsert() {
+        use crate::collection::FindAndModifyOptions;
+        let (_dir, store) = ts_store();
+        let settings = Settings {
+            time_field: "ts".into(),
+            meta_field: Some("device".into()),
+            ..Settings::default()
+        };
+        let c = store
+            .create_timeseries_collection("metrics", &settings)
+            .unwrap();
+        let base = 1_700_000_000_000i64;
+        let ids = ts_insert_range(&c, base, 3);
+        store.seal_timeseries("metrics").unwrap();
+
+        let update = json!({"$set": {"value": 42}});
+        let old = c
+            .find_and_modify(&FindAndModifyOptions {
+                filter: &json!({"_id": ids[1]}),
+                update: Some(&update),
+                sort: &[],
+                new: false,
+                upsert: false,
+                remove: false,
+                array_filters: &[],
+                projection: None,
+            })
+            .unwrap();
+        assert_eq!(old.value.as_ref().unwrap()["_id"], json!(ids[1]));
+        assert_eq!(old.value.as_ref().unwrap()["value"], json!(1));
+        assert_eq!(old.new_id.as_deref(), Some(ids[1].as_str()));
+
+        let new = c
+            .find_and_modify(&FindAndModifyOptions {
+                filter: &json!({"_id": ids[1]}),
+                update: Some(&json!({"$set": {"value": 43}})),
+                sort: &[],
+                new: true,
+                upsert: false,
+                remove: false,
+                array_filters: &[],
+                projection: None,
+            })
+            .unwrap();
+        assert_eq!(new.value.as_ref().unwrap()["value"], json!(43));
+        assert_eq!(new.value.as_ref().unwrap()["_id"], json!(ids[1]));
+
+        // A time change moves the row and returns the new id.
+        let moved_ts = base + 7_200_000;
+        let move_ts_doc = json!({"$set": {"ts": {"$date": {"$numberLong": moved_ts.to_string()}}}});
+        let moved = c
+            .find_and_modify(&FindAndModifyOptions {
+                filter: &json!({"_id": ids[1]}),
+                update: Some(&move_ts_doc),
+                sort: &[],
+                new: true,
+                upsert: false,
+                remove: false,
+                array_filters: &[],
+                projection: None,
+            })
+            .unwrap();
+        let moved_id = moved.new_id.clone().unwrap();
+        assert_ne!(moved_id, ids[1]);
+        assert_eq!(moved.value.as_ref().unwrap()["value"], json!(43));
+        assert!(c.find_by_key(&ids[1]).unwrap().is_none());
+
+        let removed = c
+            .find_and_modify(&FindAndModifyOptions {
+                filter: &json!({"_id": moved_id}),
+                update: None,
+                sort: &[],
+                new: false,
+                upsert: false,
+                remove: true,
+                array_filters: &[],
+                projection: None,
+            })
+            .unwrap();
+        assert_eq!(removed.matched, 1);
+        assert_eq!(removed.value.as_ref().unwrap()["value"], json!(43));
+        assert!(c.find_by_key(&moved_id).unwrap().is_none());
+        assert_eq!(c.count(&json!({})).unwrap(), 2);
+
+        let upsert = json!({
+            "$set": {"value": 9},
+            "$setOnInsert": {"ts": {"$date": {"$numberLong": (base + 120_000).to_string()}}},
+        });
+        let created = c
+            .find_and_modify(&FindAndModifyOptions {
+                filter: &json!({"device.id": "u"}),
+                update: Some(&upsert),
+                sort: &[],
+                new: true,
+                upsert: true,
+                remove: false,
+                array_filters: &[],
+                projection: None,
+            })
+            .unwrap();
+        assert!(created.upserted_id.is_some());
+        assert_eq!(created.value.as_ref().unwrap()["value"], json!(9));
+        assert_eq!(c.count(&json!({})).unwrap(), 3);
+    }
+
+    #[test]
+    fn replication_applies_timeseries_update_and_move() {
+        use crate::replication::{ReplicationChange, ReplicationOp, ReplicationTxn};
+
+        let (primary_dir, primary) = ts_store();
+        let settings = Settings {
+            time_field: "ts".into(),
+            meta_field: Some("device".into()),
+            ..Settings::default()
+        };
+        let source = primary
+            .create_timeseries_collection("metrics", &settings)
+            .unwrap();
+        let base = 1_700_000_000_000i64;
+        let ids = ts_insert_range(&source, base, 12);
+        primary.seal_timeseries("metrics").unwrap();
+
+        let mut changes = Vec::new();
+        let mut ops = vec![ReplicationOp::CollectionCreate {
+            name: "metrics".into(),
+            profile: "timeseries".into(),
+            ttl_seconds: None,
+            ttl_field: None,
+            ttl_purge_history: None,
+            timeseries: Some(serde_json::to_string(&settings).unwrap()),
+        }];
+        for id in &ids {
+            let doc = source.find_by_key(id).unwrap().unwrap();
+            changes.push(ReplicationChange {
+                collection: "metrics".into(),
+                op: "insert".into(),
+                id: id.clone(),
+                before: None,
+                after: Some(doc),
+                vault: false,
+                ttl_at: None,
+            });
+            ops.push(ReplicationOp::Document {
+                change: changes.len() - 1,
+            });
+        }
+        let (_replica_dir, replica) = ts_store();
+        let txn = ReplicationTxn::new_with_ops(1, "primary", 0, changes, ops);
+        assert!(replica.apply_replication_txn(&txn).unwrap());
+        assert_eq!(
+            ts_find_all(&source),
+            ts_find_all(&replica.collection("metrics").unwrap())
+        );
+
+        // In-place update on a sealed bucket replicates without changing ids.
+        let target = ids[2].clone();
+        let before = source.find_by_key(&target).unwrap().unwrap();
+        let update = json!({"$set": {"value": 500}, "$inc": {"counter": 1}});
+        source
+            .update_opts(&json!({"_id": target}), &update, false, false)
+            .unwrap();
+        let after = source.find_by_key(&target).unwrap().unwrap();
+        let txn = ReplicationTxn::new_with_ops(
+            2,
+            "primary",
+            0,
+            vec![ReplicationChange {
+                collection: "metrics".into(),
+                op: "update".into(),
+                id: target.clone(),
+                before: Some(before),
+                after: Some(after),
+                vault: false,
+                ttl_at: None,
+            }],
+            vec![ReplicationOp::Document { change: 0 }],
+        );
+        assert!(replica.apply_replication_txn(&txn).unwrap());
+        let replica_coll = replica.collection("metrics").unwrap();
+        assert_eq!(
+            replica_coll.find_by_key(&target).unwrap().unwrap()["value"],
+            json!(500)
+        );
+        assert_eq!(ts_find_all(&source), ts_find_all(&replica_coll));
+
+        // Move: primary captures delete(old) + insert(new).
+        let moved_ts = base + 10 * 3_600_000;
+        let out = source
+            .update_opts(
+                &json!({"_id": target}),
+                &json!({"$set": {"ts": {"$date": {"$numberLong": moved_ts.to_string()}}}}),
+                false,
+                false,
+            )
+            .unwrap();
+        let new_id = out.moved[0].1.clone();
+        let after = source.find_by_key(&new_id).unwrap().unwrap();
+        let txn = ReplicationTxn::new_with_ops(
+            3,
+            "primary",
+            0,
+            vec![
+                ReplicationChange {
+                    collection: "metrics".into(),
+                    op: "delete".into(),
+                    id: target.clone(),
+                    before: None,
+                    after: None,
+                    vault: false,
+                    ttl_at: None,
+                },
+                ReplicationChange {
+                    collection: "metrics".into(),
+                    op: "insert".into(),
+                    id: new_id.clone(),
+                    before: None,
+                    after: Some(after),
+                    vault: false,
+                    ttl_at: None,
+                },
+            ],
+            vec![
+                ReplicationOp::Document { change: 0 },
+                ReplicationOp::Document { change: 1 },
+            ],
+        );
+        assert!(replica.apply_replication_txn(&txn).unwrap());
+        assert_eq!(
+            source.count(&json!({})).unwrap(),
+            replica_coll.count(&json!({})).unwrap()
+        );
+        assert_eq!(ts_find_all(&source), ts_find_all(&replica_coll));
+        let _ = primary_dir;
     }
 }
