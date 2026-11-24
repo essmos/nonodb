@@ -71,6 +71,7 @@ pub fn authorize_request(
         | Request::AllShortestPaths { coll, .. }
         | Request::GraphMatch { coll, .. }
         | Request::GraphAlgorithm { coll, .. }
+        | Request::StartGraphJob { coll, .. }
         | Request::Neighbors { coll, .. }
         | Request::HybridSearch { coll, .. }
         | Request::GraphRebuildStatus { coll }
@@ -92,6 +93,14 @@ pub fn authorize_request(
             &request.coll,
             req.op_name(),
         ),
+        Request::GraphJobStatus { .. }
+        | Request::GraphJobResult { .. }
+        | Request::CancelGraphJob { .. } => Ok(()),
+
+        Request::ExportGraphJob { coll, .. } => {
+            allow(principal, Action::Write, database, coll, req.op_name())
+        }
+
         Request::ListWebhooks | Request::ListWebhookDeliveries { .. } => {
             if principal.allows_database_admin(database) {
                 Ok(())
@@ -344,6 +353,10 @@ mod tests {
                 timeout_ms: None,
                 max_depth: 4,
                 max_memory_bytes: 64 * 1024 * 1024,
+                gds_max_nodes: 100_000,
+                gds_max_edges: 1_000_000,
+                gds_max_memory_bytes: 256 * 1024 * 1024,
+                gds_timeout_ms: None,
             },
         };
         assert!(authorize_request(&reader, &ok, "default").is_ok());
@@ -357,6 +370,10 @@ mod tests {
                 timeout_ms: None,
                 max_depth: 4,
                 max_memory_bytes: 64 * 1024 * 1024,
+                gds_max_nodes: 100_000,
+                gds_max_edges: 1_000_000,
+                gds_max_memory_bytes: 256 * 1024 * 1024,
+                gds_timeout_ms: None,
             },
         };
         assert!(authorize_request(&reader, &denied, "default").is_err());

@@ -594,6 +594,33 @@ fn emit_by_id(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+fn insert_export_doc(
+    store: &Store,
+    wtxn: &mut nonodb_core::heed::RwTxn<'_>,
+    c: &Collection<'_>,
+    coll: &str,
+    config: Option<&events::EventConfig>,
+    replication: &mut ReplicationContext,
+    doc: Value,
+) -> Result<(), ApiError> {
+    let id = c.insert_one_txn(wtxn, doc)?;
+    if let Some(config) = config {
+        emit_by_id(
+            store,
+            wtxn,
+            c,
+            coll,
+            "insert",
+            &id,
+            None,
+            config,
+            replication,
+        )?;
+    }
+    Ok(())
+}
+
 fn aggregate_target<'a>(
     store: &'a Store,
     wtxn: &mut nonodb_core::heed::RwTxn<'_>,
@@ -1356,6 +1383,88 @@ fn execute(
                 }
                 Ok(json!({ "inserted_ids": inserted_ids }))
             }
+        }
+        WriteReq::ExportGraphResult { coll, kind, result } => {
+            let c = standard_collection(store, wtxn, coll)?;
+            let config = event_config(store, wtxn, coll)?;
+            let mut count = 0usize;
+            match kind.as_str() {
+                "connected_components" => {
+                    for component in result["components"].as_array().into_iter().flatten() {
+                        for node in component["nodes"].as_array().into_iter().flatten() {
+                            let Some(node_id) = node.as_str() else {
+                                return Err(ApiError {
+                                    code: "invalid_query".into(),
+                                    message: "analytic result node id is not a string".into(),
+                                });
+                            };
+                            let doc = json!({
+                                "_id": format!("connected_components:{node_id}"),
+                                "kind": kind,
+                                "node_id": node_id,
+                                "component_id": component["id"].clone(),
+                                "size": component["size"].clone(),
+                            });
+                            insert_export_doc(
+                                store,
+                                wtxn,
+                                &c,
+                                coll,
+                                config.as_ref(),
+                                replication,
+                                doc,
+                            )?;
+                            count += 1;
+                        }
+                    }
+                }
+                "degree_distribution" => {
+                    for item in result["items"].as_array().into_iter().flatten() {
+                        let degree = item["degree"].as_u64().unwrap_or(0);
+                        let doc = json!({
+                            "_id": format!("degree_distribution:{degree}"),
+                            "kind": kind,
+                            "degree": item["degree"].clone(),
+                            "count": item["count"].clone(),
+                        });
+                        insert_export_doc(
+                            store,
+                            wtxn,
+                            &c,
+                            coll,
+                            config.as_ref(),
+                            replication,
+                            doc,
+                        )?;
+                        count += 1;
+                    }
+                }
+                _ => {
+                    for item in result["items"].as_array().into_iter().flatten() {
+                        let Some(id) = item["id"].as_str() else {
+                            return Err(ApiError {
+                                code: "invalid_query".into(),
+                                message: "analytic result item id is not a string".into(),
+                            });
+                        };
+                        let mut doc = item.as_object().cloned().unwrap_or_default();
+                        doc.insert("_id".into(), json!(format!("{kind}:{id}")));
+                        doc.insert("kind".into(), json!(kind));
+                        doc.insert("node_id".into(), json!(id));
+                        insert_export_doc(
+                            store,
+                            wtxn,
+                            &c,
+                            coll,
+                            config.as_ref(),
+                            replication,
+                            Value::Object(doc),
+                        )?;
+                        count += 1;
+                    }
+                }
+            }
+            Ok(json!({ "exported": count }))
         }
         WriteReq::Update {
             coll,

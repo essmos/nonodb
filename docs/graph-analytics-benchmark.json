@@ -1,0 +1,206 @@
+{
+  "daemon": "/home/ubuntu/nonodb-target/release/nonodb-daemon",
+  "daemon_bytes": 34724752,
+  "generated_at": "2026-11-24T13:10:00Z",
+  "machine": {
+    "cpu": "Intel Core Processor (Haswell, no TSX)",
+    "cpu_count": 8,
+    "memory_total_mb": 23463,
+    "platform": "Linux-6.14.0-37-generic-x86_64-with-glibc2.41",
+    "python": "3.13.3"
+  },
+  "method": {
+    "algorithms": {
+      "degree_centrality": "one pass, both directions",
+      "degree_distribution": "one pass, both directions",
+      "k_core": "peeling, both directions",
+      "label_propagation": "5 synchronous iterations, both directions",
+      "pagerank": "5 iterations, damping 0.85",
+      "pagerank_job": "background job start-to-terminal, 5 iterations"
+    },
+    "batch": 2000,
+    "edges_per_node": 1.0,
+    "repeats": 1,
+    "rss": "VmRSS/VmHWM sampled from /proc before and after each operation",
+    "seed": 42
+  },
+  "sizes": [
+    {
+      "algorithms": {
+        "degree_centrality": {
+          "max_ms": 360.8,
+          "min_ms": 360.8,
+          "p50_ms": 360.8,
+          "peak_rss_mb": 144.1,
+          "result_nodes": 100000
+        },
+        "degree_distribution": {
+          "max_ms": 594.6,
+          "min_ms": 594.6,
+          "p50_ms": 594.6,
+          "peak_rss_mb": 181.4,
+          "result_nodes": 100000
+        },
+        "k_core": {
+          "max_ms": 1338.6,
+          "min_ms": 1338.6,
+          "p50_ms": 1338.6,
+          "peak_rss_mb": 277.4,
+          "result_nodes": 100000
+        },
+        "label_propagation": {
+          "max_ms": 1057.3,
+          "min_ms": 1057.3,
+          "p50_ms": 1057.3,
+          "peak_rss_mb": 222.8,
+          "result_nodes": 100000
+        },
+        "pagerank": {
+          "max_ms": 1321.9,
+          "min_ms": 1321.9,
+          "p50_ms": 1321.9,
+          "peak_rss_mb": 181.4,
+          "result_nodes": 100000
+        }
+      },
+      "edges": 100000,
+      "edges_per_node": 1.0,
+      "ingest": {
+        "edges_ms": 1928.9,
+        "edges_per_s": 51843,
+        "nodes_ms": 515.8,
+        "nodes_per_s": 193857,
+        "total_ms": 2444.7
+      },
+      "nodes": 100000,
+      "pagerank_job": {
+        "ms": 1361.1,
+        "peak_rss_mb": 294.8,
+        "rss_after_mb": 294.8,
+        "rss_before_mb": 212.8,
+        "state": "completed"
+      },
+      "peak_rss_after_ingest_mb": 81.6,
+      "rss_after_ingest_mb": 81.4,
+      "seed": 42
+    },
+    {
+      "algorithms": {
+        "degree_centrality": {
+          "max_ms": 2125.6,
+          "min_ms": 2125.6,
+          "p50_ms": 2125.6,
+          "peak_rss_mb": 502.7,
+          "result_nodes": 500000
+        },
+        "degree_distribution": {
+          "max_ms": 3182.7,
+          "min_ms": 3182.7,
+          "p50_ms": 3182.7,
+          "peak_rss_mb": 692.1,
+          "result_nodes": 500000
+        },
+        "k_core": {
+          "max_ms": 7864.7,
+          "min_ms": 7864.7,
+          "p50_ms": 7864.7,
+          "peak_rss_mb": 1233.2,
+          "result_nodes": 500000
+        },
+        "label_propagation": {
+          "max_ms": 6752.2,
+          "min_ms": 6752.2,
+          "p50_ms": 6752.2,
+          "peak_rss_mb": 921.1,
+          "result_nodes": 500000
+        },
+        "pagerank": {
+          "max_ms": 9028.2,
+          "min_ms": 9028.2,
+          "p50_ms": 9028.2,
+          "peak_rss_mb": 692.1,
+          "result_nodes": 500000
+        }
+      },
+      "edges": 500000,
+      "edges_per_node": 1.0,
+      "ingest": {
+        "edges_ms": 11821.2,
+        "edges_per_s": 42297,
+        "nodes_ms": 2733.8,
+        "nodes_per_s": 182897,
+        "total_ms": 14555.0
+      },
+      "nodes": 500000,
+      "pagerank_job": {
+        "ms": 9730.9,
+        "peak_rss_mb": 1535.1,
+        "rss_after_mb": 1469.7,
+        "rss_before_mb": 1114.0,
+        "state": "completed"
+      },
+      "peak_rss_after_ingest_mb": 208.6,
+      "rss_after_ingest_mb": 208.3,
+      "seed": 42
+    },
+    {
+      "algorithms": {
+        "degree_centrality": {
+          "max_ms": 4135.7,
+          "min_ms": 4135.7,
+          "p50_ms": 4135.7,
+          "peak_rss_mb": 941.7,
+          "result_nodes": 1000000
+        },
+        "degree_distribution": {
+          "max_ms": 7055.0,
+          "min_ms": 7055.0,
+          "p50_ms": 7055.0,
+          "peak_rss_mb": 1319.4,
+          "result_nodes": 1000000
+        },
+        "k_core": {
+          "max_ms": 18850.9,
+          "min_ms": 18850.9,
+          "p50_ms": 18850.9,
+          "peak_rss_mb": 2402.7,
+          "result_nodes": 1000000
+        },
+        "label_propagation": {
+          "max_ms": 15706.1,
+          "min_ms": 15706.1,
+          "p50_ms": 15706.1,
+          "peak_rss_mb": 1777.5,
+          "result_nodes": 1000000
+        },
+        "pagerank": {
+          "max_ms": 21053.7,
+          "min_ms": 21053.7,
+          "p50_ms": 21053.7,
+          "peak_rss_mb": 1402.4,
+          "result_nodes": 1000000
+        }
+      },
+      "edges": 1000000,
+      "edges_per_node": 1.0,
+      "ingest": {
+        "edges_ms": 25645.4,
+        "edges_per_s": 38993,
+        "nodes_ms": 4824.6,
+        "nodes_per_s": 207270,
+        "total_ms": 30470.0
+      },
+      "nodes": 1000000,
+      "pagerank_job": {
+        "ms": 24794.5,
+        "peak_rss_mb": 2967.9,
+        "rss_after_mb": 1128.2,
+        "rss_before_mb": 2125.3,
+        "state": "completed"
+      },
+      "peak_rss_after_ingest_mb": 354.7,
+      "rss_after_ingest_mb": 354.4,
+      "seed": 42
+    }
+  ]
+}

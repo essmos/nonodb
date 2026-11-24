@@ -6,6 +6,7 @@
 //! processes) connect through `/run/nonodb.sock` (paths configurable via
 //! `NONODB_SOCK` i `NONODB_DATA`).
 
+mod analytics;
 mod audit;
 mod auth;
 mod auth_api;
@@ -133,6 +134,7 @@ struct AppState {
     cache: Arc<cache::QueryCache>,
     auto_index: Arc<auto_index::AutoIndexer>,
     quota: Arc<quota::Quota>,
+    analytics: Arc<analytics::AnalyticsManager>,
     _runtime: Arc<databases::DatabaseRuntime>,
     databases: Arc<databases::Databases>,
     pub(crate) backups: Arc<backups::BackupManager>,
@@ -153,6 +155,7 @@ impl AppState {
             cache: runtime.cache.clone(),
             auto_index: runtime.auto_index.clone(),
             quota: runtime.quota.clone(),
+            analytics: runtime.analytics.clone(),
             _runtime: runtime,
             databases: self.databases.clone(),
             backups: self.backups.clone(),
@@ -431,6 +434,7 @@ async fn run_async() -> Result<(), Box<dyn std::error::Error>> {
         cache: default.cache.clone(),
         auto_index: default.auto_index.clone(),
         quota: default.quota.clone(),
+        analytics: default.analytics.clone(),
         _runtime: default.clone(),
         databases: databases.clone(),
         backups,
@@ -3639,6 +3643,53 @@ async fn exec_inner(
             read_result(joined).await
         }
 
+        Request::StartGraphJob { coll, options } => {
+            let collection = match read_collection(&state.store, &coll, vault_auth.as_ref()) {
+                Ok(collection) => collection,
+                Err(err) => return respond(Err(err)),
+            };
+            if let Err(err) = reject_vault_read(&collection, vault_auth.as_ref(), "graph traversal")
+            {
+                return respond(Err(err));
+            }
+            match state
+                .analytics
+                .start(principal.name(), &coll, options, state.store.clone())
+            {
+                Ok(value) => respond(Ok(value)),
+                Err(err) => respond(Err(err)),
+            }
+        }
+
+        Request::GraphJobStatus { job_id } => {
+            match state.analytics.status(principal.name(), &job_id) {
+                Ok(value) => respond(Ok(value)),
+                Err(err) => respond(Err(err)),
+            }
+        }
+
+        Request::GraphJobResult { job_id } => {
+            match state.analytics.result(principal.name(), &job_id) {
+                Ok(value) => respond(Ok(value)),
+                Err(err) => respond(Err(err)),
+            }
+        }
+
+        Request::CancelGraphJob { job_id } => {
+            match state.analytics.cancel(principal.name(), &job_id) {
+                Ok(value) => respond(Ok(value)),
+                Err(err) => respond(Err(err)),
+            }
+        }
+
+        Request::ExportGraphJob { job_id, coll } => {
+            let manager = state.analytics.clone();
+            let owner = principal.name().to_string();
+            let joined =
+                tokio::task::spawn_blocking(move || manager.export(&owner, &job_id, &coll));
+            read_result(joined).await
+        }
+
         Request::HybridSearch { coll, options } => {
             let store = state.store.clone();
             let auth = vault_auth.clone();
@@ -4825,6 +4876,7 @@ fn authorize_graph_edges(
         | Request::AllShortestPaths { coll, .. }
         | Request::GraphMatch { coll, .. }
         | Request::GraphAlgorithm { coll, .. }
+        | Request::StartGraphJob { coll, .. }
         | Request::Neighbors { coll, .. }
         | Request::HybridSearch { coll, .. } => coll,
         _ => return Ok(()),

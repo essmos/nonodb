@@ -198,8 +198,10 @@ single-database directories are migrated to `default/` on startup. See
   `all_shortest_paths` returns every shortest path with bounded path/node budgets.
 - `graph_match` matches linear variable-length patterns with per-step direction,
   labels, node/edge filters, and relationship uniqueness.
-- `graph_algorithm` computes bounded PageRank, degree centrality, and weakly
-  connected components.
+- `graph_algorithm` computes bounded PageRank, degree centrality, weakly
+  connected components, label propagation, k-core, and degree distribution.
+- `start_graph_job` runs the same algorithms as bounded background jobs with
+  progress, cancellation, result retrieval, and atomic collection export.
 - `hybrid_search` reranks vector hits and their graph neighborhood with
   deterministic `vector_weight`/`graph_weight` scoring.
 - `$graphLookup` uses the adjacency fast path when the lookup fields match the
@@ -211,8 +213,8 @@ single-database directories are migrated to `default/` on startup. See
   client, and the GUI Graph tab. See [Graph traversal](docs/graph.md).
 - Read-only Cypher compatibility (`cypher` / `Collection.cypher()`), including
   `MATCH`/`WHERE`/`WITH`/`UNWIND`, variable-length paths, shortest paths, and
-  GDS-style PageRank/degree/components/similarity procedures. See
-  [Read-only Cypher](docs/cypher.md).
+  GDS-style PageRank/degree/components/similarity/label-propagation/k-core/
+  degree-distribution procedures. See [Read-only Cypher](docs/cypher.md).
 
 ### Aggregation
 
@@ -814,6 +816,7 @@ documentation.
 | [Branching a database](docs/branching.md) | Offline CoW clone for CI, snapshot sources, verification, limits |
 | [Benchmarks](docs/benchmarks.md) | Test environment, throughput, latency, large data sets, RAM, reproducibility |
 | [Graph benchmark](docs/graph-benchmark.md) | NonoDB vs Neo4j Community graph ingest/traversal methodology and results |
+| [Graph analytics benchmark](docs/graph-analytics-benchmark.md) | Reproducible 100k/500k/1M-node analytics timings, memory, and method |
 | [Development](docs/development.md) | Repository layout, tests, linting, benchmark scripts, contribution notes |
 | [Contributing](CONTRIBUTING.md) | Setup, required checks, code guidelines, pull requests |
 | [Security policy](SECURITY.md) | Supported versions, private vulnerability reporting, scope |

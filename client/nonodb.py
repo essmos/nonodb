@@ -1920,6 +1920,68 @@ class Collection:
             max_nodes=max_nodes,
         )
 
+    def label_propagation(
+        self,
+        *,
+        direction: str = "both",
+        labels: Optional[Iterable[str]] = None,
+        limit: int = 100,
+        max_nodes: int = 100_000,
+        iterations: int = 20,
+        tolerance: float = 1e-6,
+    ) -> dict[str, Any]:
+        """Returns deterministic label-propagation communities."""
+        return self._graph_algorithm(
+            "label_propagation",
+            direction=direction,
+            labels=labels,
+            edge_filter=None,
+            node_filter=None,
+            as_of=None,
+            limit=limit,
+            max_nodes=max_nodes,
+            iterations=iterations,
+            tolerance=tolerance,
+        )
+
+    def k_core(
+        self,
+        *,
+        labels: Optional[Iterable[str]] = None,
+        limit: int = 100,
+        max_nodes: int = 100_000,
+    ) -> dict[str, Any]:
+        """Returns deterministic k-core numbers."""
+        return self._graph_algorithm(
+            "k_core",
+            direction="both",
+            labels=labels,
+            edge_filter=None,
+            node_filter=None,
+            as_of=None,
+            limit=limit,
+            max_nodes=max_nodes,
+        )
+
+    def degree_distribution(
+        self,
+        *,
+        direction: str = "both",
+        labels: Optional[Iterable[str]] = None,
+        max_nodes: int = 100_000,
+    ) -> dict[str, Any]:
+        """Returns a total-degree histogram."""
+        return self._graph_algorithm(
+            "degree_distribution",
+            direction=direction,
+            labels=labels,
+            edge_filter=None,
+            node_filter=None,
+            as_of=None,
+            limit=100,
+            max_nodes=max_nodes,
+        )
+
     def _graph_algorithm(
         self,
         kind: str,
@@ -1954,6 +2016,77 @@ class Collection:
         if as_of is not None:
             payload["as_of"] = as_of
         return self._db.exec(payload)
+
+    def start_graph_job(
+        self,
+        kind: str,
+        *,
+        direction: str = "out",
+        labels: Optional[Iterable[str]] = None,
+        edge_filter: Optional[dict[str, Any]] = None,
+        node_filter: Optional[dict[str, Any]] = None,
+        as_of: Any = None,
+        limit: int = 100,
+        max_nodes: int = 100_000,
+        max_edges: int = 1_000_000,
+        max_memory_bytes: int = 256 * 1024 * 1024,
+        timeout_ms: Optional[int] = None,
+        damping: float = 0.85,
+        iterations: int = 20,
+        tolerance: float = 1e-6,
+    ) -> dict[str, Any]:
+        """Starts a bounded graph algorithm as a background job.
+
+        Returns ``job_id`` and ``state``. Poll with :meth:`graph_job_status`,
+        read the result with :meth:`graph_job_result`, and stop it with
+        :meth:`cancel_graph_job`.
+        """
+        payload: dict[str, Any] = {
+            "op": "start_graph_job",
+            "coll": self.name,
+            "kind": kind,
+            "direction": direction,
+            "labels": list(labels or []),
+            "limit": limit,
+            "max_nodes": max_nodes,
+            "max_edges": max_edges,
+            "max_memory_bytes": max_memory_bytes,
+            "damping": damping,
+            "iterations": iterations,
+            "tolerance": tolerance,
+        }
+        if edge_filter is not None:
+            payload["edge_filter"] = edge_filter
+        if node_filter is not None:
+            payload["node_filter"] = node_filter
+        if as_of is not None:
+            payload["as_of"] = as_of
+        if timeout_ms is not None:
+            payload["timeout_ms"] = timeout_ms
+        return self._db.exec(payload)
+
+    def graph_job_status(self, job_id: str) -> dict[str, Any]:
+        """Returns state, progress, and error for an analytics job."""
+        return self._db.exec({"op": "graph_job_status", "job_id": job_id})
+
+    def graph_job_result(self, job_id: str) -> dict[str, Any]:
+        """Returns the completed algorithm result."""
+        return self._db.exec({"op": "graph_job_result", "job_id": job_id})
+
+    def cancel_graph_job(self, job_id: str) -> dict[str, Any]:
+        """Requests cancellation and returns the current job state."""
+        return self._db.exec({"op": "cancel_graph_job", "job_id": job_id})
+
+    def export_graph_job(self, job_id: str, collection: str) -> dict[str, Any]:
+        """Atomically writes a completed analytics result into `collection`.
+
+        Document ids are deterministic (`<kind>:<node_id>`), so re-exporting the
+        same result is idempotently visible as a duplicate-key conflict. Any
+        failure aborts the whole write transaction.
+        """
+        return self._db.exec(
+            {"op": "export_graph_job", "job_id": job_id, "coll": collection}
+        )
 
     def neighbors(
         self,

@@ -256,21 +256,34 @@ or `RETURN` projections beyond node `projection`.
  "direction":"out",
  "labels":[],
  "limit":100,
- "max_nodes":10000,
+ "max_nodes":100000,
+ "max_edges":1000000,
+ "max_memory_bytes":268435456,
+ "timeout_ms":10000,
  "damping":0.85,
  "iterations":20,
  "tolerance":1e-6}
 ```
 
-`kind` is `pagerank`, `degree_centrality`, or `connected_components`. All three
+`kind` is `pagerank`, `degree_centrality`, `connected_components`,
+`label_propagation`, `k_core`, or `degree_distribution`. All six
 are read-only, use the same `edge_filter`, `node_filter`, `as_of`, and `labels`
-options as traversal, and are bounded by `limit` and `max_nodes`.
+options as traversal, and are bounded by `limit` (returned rows), `max_nodes`,
+`max_edges`, `max_memory_bytes`, and `timeout_ms`. Exceeding any execution budget
+fails explicitly with `invalid_query`; algorithms never return a silently
+truncated graph.
 
 - `pagerank` returns `items` sorted by `score` descending, plus `iterations` and
   `converged`.
 - `degree_centrality` returns `items` with `in`, `out`, and `total` degree.
 - `connected_components` returns weakly connected `components` with `id`, `size`,
   and `nodes`.
+- `label_propagation` returns `items` with deterministic community `label`;
+  ties choose the lexicographically smallest label.
+- `k_core` returns `items` with the peeling `core` number, using both edge
+  directions.
+- `degree_distribution` returns `items` as `{degree, count}` in ascending degree
+  order.
 
 ```json
 {"ok":true,"result":{
@@ -406,19 +419,65 @@ direction; edge documents are still stored once.
 | vector seed `k` | 1–1,000 |
 | `all_shortest_paths` `limit_paths` | 1–1,000 |
 | graph algorithm `iterations` | 1–100 |
-| graph algorithm `max_nodes` | 1–100,000 |
+| graph algorithm `limit` | 1–1,000,000 |
+| graph algorithm `max_nodes` | default 100,000; max 1,000,000 |
+| graph algorithm `max_edges` | default 1,000,000; max 10,000,000 |
+| graph algorithm `max_memory_bytes` | default 256 MiB; max 1 GiB |
 | graph adjacency `generation` | 0–1,024 (internal; HTTP `set_graph` resets it to 0) |
 
-Budgets above the hard maximum are rejected with `invalid_query`. Reaching a
-valid node, edge, or byte limit returns the partial result with
-`"truncated":true`; it is not an error.
+Budgets above the hard maximum are rejected with `invalid_query`. Traversal
+node/edge/byte limits return a partial result with `"truncated":true`; graph
+algorithms instead reject node, edge, memory, and timeout overruns explicitly.
 
 `drop_graph` and `reindex_graph` require collection-admin on the node
 collection. That permission deliberately covers the graph metadata and derived
 adjacency stored on the edge collection; the edge collection is not separately
 granted.
 
-## `$graphLookup`
+## Analytics benchmark
+
+The reproducible 100k/500k/1M-node benchmark, raw JSON, and methodology live in
+[`graph-analytics-benchmark.md`](graph-analytics-benchmark.md) and
+[`graph-analytics-benchmark.json`](graph-analytics-benchmark.json).
+
+## Background analytics jobs
+
+Long algorithms should run as background jobs instead of holding an HTTP
+request open:
+
+```json
+{"op":"start_graph_job","coll":"nodes","kind":"pagerank",
+ "direction":"out","max_nodes":100000,"max_edges":1000000,
+ "max_memory_bytes":268435456,"timeout_ms":10000,"iterations":20}
+```
+
+The response is `{"job_id":"job-default-1","state":"queued"}`. Jobs are
+database-scoped and accept the same options as `graph_algorithm`.
+
+| Operation | Meaning |
+|---|---|
+| `start_graph_job` | Validate and queue an algorithm |
+| `graph_job_status` | Return `state`, `progress.phase/done/total`, timestamps, and error |
+| `graph_job_result` | Return the completed result exactly once per read; fails until terminal |
+| `cancel_graph_job` | Request cooperative cancellation |
+| `export_graph_job` | Atomically write a completed result into a collection |
+
+States are `queued`, `running`, `cancelling`, `completed`, `failed`, and
+`cancelled`. Progress phases are `scan_nodes`, `scan_edges`, the algorithm name,
+and `components`. Workers check cancellation between every 1,024 items and each
+PageRank iteration. The pool is bounded to two concurrent jobs per database;
+additional starts return `too_many_jobs`. Only the principal that started a job
+may read or cancel it.
+
+Jobs are in-memory metadata: they are cancelled and joined when the database
+runtime shuts down, and completed results are not persisted across restarts.
+Use `export_graph_job` for durable output. It writes all result rows in one
+writer transaction, streaming documents from the result into the transaction,
+and uses deterministic `_id` values (`<kind>:<node_id>` or
+`connected_components:<node_id>`). Any duplicate key or writer error aborts the
+whole transaction without partial documents. Export consumes the in-memory job
+result; `graph_job_result` reports `not_found` afterwards.
+
 
 When a `$graphLookup` stage uses the collection's configured edge collection,
 `connectFromField`/`connectToField` match the graph definition, the graph is

@@ -508,6 +508,26 @@ pub enum Request {
         #[serde(flatten)]
         options: GraphAlgorithmOptions,
     },
+    /// Start a graph algorithm as a background job.
+    StartGraphJob {
+        coll: String,
+        #[serde(flatten)]
+        options: GraphAlgorithmOptions,
+    },
+    GraphJobStatus {
+        job_id: String,
+    },
+    GraphJobResult {
+        job_id: String,
+    },
+    CancelGraphJob {
+        job_id: String,
+    },
+    /// Atomically export a completed analytics result into a collection.
+    ExportGraphJob {
+        job_id: String,
+        coll: String,
+    },
     /// One-hop neighbors of a node with graph filters.
     Neighbors {
         coll: String,
@@ -785,6 +805,12 @@ pub enum WriteReq {
         coll: String,
         docs: Vec<Value>,
         vault: Option<VaultAuth>,
+    },
+    /// Atomically materialize a completed analytics result as documents.
+    ExportGraphResult {
+        coll: String,
+        kind: String,
+        result: Value,
     },
     Update {
         coll: String,
@@ -1074,6 +1100,11 @@ impl Request {
             Self::AllShortestPaths { .. } => "all_shortest_paths",
             Self::GraphMatch { .. } => "graph_match",
             Self::GraphAlgorithm { .. } => "graph_algorithm",
+            Self::StartGraphJob { .. } => "start_graph_job",
+            Self::GraphJobStatus { .. } => "graph_job_status",
+            Self::GraphJobResult { .. } => "graph_job_result",
+            Self::CancelGraphJob { .. } => "cancel_graph_job",
+            Self::ExportGraphJob { .. } => "export_graph_job",
             Self::Neighbors { .. } => "neighbors",
             Self::HybridSearch { .. } => "hybrid_search",
             Self::SetGraph { .. } => "set_graph",
@@ -1163,6 +1194,10 @@ impl Request {
             | Self::AllShortestPaths { .. }
             | Self::GraphMatch { .. }
             | Self::GraphAlgorithm { .. }
+            | Self::StartGraphJob { .. }
+            | Self::GraphJobStatus { .. }
+            | Self::GraphJobResult { .. }
+            | Self::CancelGraphJob { .. }
             | Self::Neighbors { .. }
             | Self::HybridSearch { .. }
             | Self::GraphRebuildStatus { .. }
@@ -1231,6 +1266,7 @@ impl Request {
             | Self::AllShortestPaths { coll, .. }
             | Self::GraphMatch { coll, .. }
             | Self::GraphAlgorithm { coll, .. }
+            | Self::StartGraphJob { coll, .. }
             | Self::Neighbors { coll, .. }
             | Self::HybridSearch { coll, .. }
             | Self::DropGraph { coll }
@@ -1291,7 +1327,12 @@ impl Request {
                 out
             }
             Self::WriteBatch { ops, .. } => ops.iter().flat_map(|op| op.collections()).collect(),
-            Self::GetMore { .. } | Self::CloseCursor { .. } => Vec::new(),
+            Self::GetMore { .. }
+            | Self::CloseCursor { .. }
+            | Self::GraphJobStatus { .. }
+            | Self::GraphJobResult { .. }
+            | Self::CancelGraphJob { .. } => Vec::new(),
+            Self::ExportGraphJob { coll, .. } => vec![coll.clone()],
             Self::ListCollections
             | Self::DatabaseStats
             | Self::GetQuota

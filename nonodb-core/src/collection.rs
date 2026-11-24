@@ -21,9 +21,9 @@ use crate::error::{Error, Result};
 use crate::events::{self, EventConfig, EVENTS_COLLECTION};
 use crate::geo;
 use crate::graph::{
-    self, AdjEdge, AllShortestPathsOptions, GraphAlgorithmOptions, GraphDef, GraphDirection,
-    GraphMatchOptions, GraphRebuildState, GraphView, HybridOptions, NeighborsOptions,
-    ShortestPathOptions, TraverseOptions,
+    self, AdjEdge, AllShortestPathsOptions, GraphAlgorithmObserver, GraphAlgorithmOptions,
+    GraphDef, GraphDirection, GraphMatchOptions, GraphRebuildState, GraphView, HybridOptions,
+    NeighborsOptions, ShortestPathOptions, TraverseOptions,
 };
 use crate::history::{self, HistoryEntry};
 use crate::id;
@@ -5794,6 +5794,14 @@ impl<'e> Collection<'e> {
     }
 
     pub fn graph_algorithm(&self, options: GraphAlgorithmOptions) -> Result<Value> {
+        self.graph_algorithm_with_observer(options, None)
+    }
+
+    pub fn graph_algorithm_with_observer(
+        &self,
+        options: GraphAlgorithmOptions,
+        observer: Option<&dyn GraphAlgorithmObserver>,
+    ) -> Result<Value> {
         if self.profile.is_vault() {
             return Err(Error::Query(
                 "graph operations are not supported on vault collections".into(),
@@ -5808,7 +5816,7 @@ impl<'e> Collection<'e> {
             Error::Query("graph traversal requires a store-backed collection".into())
         })?;
         let view = GraphViewImpl::new(store, &rtxn, def)?;
-        let out = graph::graph_algorithm(&view, &options)?;
+        let out = graph::graph_algorithm_with_observer(&view, &options, observer)?;
         rtxn.commit()?;
         Ok(out)
     }

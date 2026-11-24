@@ -19,7 +19,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
 use crate::error::{Error, Result};
-use crate::graph::{AdjEdge, GraphAlgorithmKind, GraphAlgorithmOptions, GraphDirection, GraphView};
+use crate::graph::{
+    AdjEdge, GraphAlgorithmKind, GraphAlgorithmOptions, GraphDirection, GraphView,
+    DEFAULT_ALGORITHM_EDGES, DEFAULT_ALGORITHM_MEMORY, DEFAULT_ALGORITHM_NODES,
+    MAX_ALGORITHM_EDGES, MAX_ALGORITHM_MEMORY, MAX_ALGORITHM_NODES,
+};
 
 const DEFAULT_CYPHER_ROWS: usize = 1_000;
 const DEFAULT_CYPHER_OPERATIONS: usize = 1_000_000;
@@ -50,6 +54,14 @@ pub struct CypherOptions {
     pub max_depth: usize,
     #[serde(default = "default_cypher_memory")]
     pub max_memory_bytes: usize,
+    #[serde(default = "default_gds_nodes")]
+    pub gds_max_nodes: usize,
+    #[serde(default = "default_gds_edges")]
+    pub gds_max_edges: usize,
+    #[serde(default = "default_gds_memory")]
+    pub gds_max_memory_bytes: usize,
+    #[serde(default)]
+    pub gds_timeout_ms: Option<u64>,
 }
 
 fn default_cypher_rows() -> usize {
@@ -60,6 +72,15 @@ fn default_cypher_ops() -> usize {
 }
 fn default_cypher_memory() -> usize {
     DEFAULT_CYPHER_MEMORY
+}
+fn default_gds_nodes() -> usize {
+    DEFAULT_ALGORITHM_NODES
+}
+fn default_gds_edges() -> usize {
+    DEFAULT_ALGORITHM_EDGES
+}
+fn default_gds_memory() -> usize {
+    DEFAULT_ALGORITHM_MEMORY
 }
 
 impl CypherOptions {
@@ -90,6 +111,26 @@ impl CypherOptions {
             return Err(Error::Query(format!(
                 "cypher `max_memory_bytes` must be between 1 and {MAX_CYPHER_MEMORY}"
             )));
+        }
+        if self.gds_max_nodes == 0 || self.gds_max_nodes > MAX_ALGORITHM_NODES {
+            return Err(Error::Query(format!(
+                "cypher `gds_max_nodes` must be between 1 and {MAX_ALGORITHM_NODES}"
+            )));
+        }
+        if self.gds_max_edges == 0 || self.gds_max_edges > MAX_ALGORITHM_EDGES {
+            return Err(Error::Query(format!(
+                "cypher `gds_max_edges` must be between 1 and {MAX_ALGORITHM_EDGES}"
+            )));
+        }
+        if self.gds_max_memory_bytes == 0 || self.gds_max_memory_bytes > MAX_ALGORITHM_MEMORY {
+            return Err(Error::Query(format!(
+                "cypher `gds_max_memory_bytes` must be between 1 and {MAX_ALGORITHM_MEMORY}"
+            )));
+        }
+        if self.gds_timeout_ms == Some(0) {
+            return Err(Error::Query(
+                "cypher `gds_timeout_ms` must be positive".into(),
+            ));
         }
         Ok(())
     }
@@ -886,6 +927,9 @@ impl<'a> Executor<'a> {
             "gds.degree.stream" => "degree",
             "gds.connectedcomponents.stream" => "wcc",
             "gds.nodesimilarity.stream" => "similarity",
+            "gds.labelpropagation.stream" => "labelpropagation",
+            "gds.kcore.stream" => "kcore",
+            "gds.degreedistribution.stream" => "degreedistribution",
             _ => {
                 return Err(Error::Query(format!(
                     "unsupported Cypher procedure `{name}`"
@@ -899,13 +943,15 @@ impl<'a> Executor<'a> {
             edge_filter: None,
             node_filter: None,
             as_of: None,
-            limit: self.options.max_rows.min(1_000),
-            max_nodes: self.options.max_rows.clamp(1, 1_000),
+            limit: self.options.max_rows,
+            max_nodes: self.options.gds_max_nodes,
+            max_edges: self.options.gds_max_edges,
+            max_memory_bytes: self.options.gds_max_memory_bytes,
             damping: 0.85,
             iterations: 100,
             tolerance: 1e-6,
             projection: None,
-            timeout_ms: self.options.timeout_ms,
+            timeout_ms: self.options.gds_timeout_ms.or(self.options.timeout_ms),
         };
         let value = match short {
             "pagerank" => crate::graph::graph_algorithm(
@@ -932,6 +978,29 @@ impl<'a> Executor<'a> {
                 },
             )?,
             "similarity" => self.similarity_procedure()?,
+            "labelpropagation" => crate::graph::graph_algorithm(
+                self.graph.view,
+                &GraphAlgorithmOptions {
+                    kind: GraphAlgorithmKind::LabelPropagation,
+                    ..base
+                },
+            )?,
+            "kcore" => crate::graph::graph_algorithm(
+                self.graph.view,
+                &GraphAlgorithmOptions {
+                    kind: GraphAlgorithmKind::KCore,
+                    direction: GraphDirection::Both,
+                    ..base
+                },
+            )?,
+            "degreedistribution" => crate::graph::graph_algorithm(
+                self.graph.view,
+                &GraphAlgorithmOptions {
+                    kind: GraphAlgorithmKind::DegreeDistribution,
+                    direction: GraphDirection::Both,
+                    ..base
+                },
+            )?,
             _ => {
                 return Err(Error::Query(format!(
                     "unsupported Cypher procedure `{name}`"
@@ -962,6 +1031,27 @@ impl<'a> Executor<'a> {
                 set_yield(&mut row, yields, "similarity", item["similarity"].clone());
                 rows.push(row);
             }
+        } else if short == "labelpropagation" {
+            for item in value["items"].as_array().into_iter().flatten() {
+                let mut row = Row::new();
+                set_yield(&mut row, yields, "nodeId", item["id"].clone());
+                set_yield(&mut row, yields, "label", item["label"].clone());
+                rows.push(row);
+            }
+        } else if short == "kcore" {
+            for item in value["items"].as_array().into_iter().flatten() {
+                let mut row = Row::new();
+                set_yield(&mut row, yields, "nodeId", item["id"].clone());
+                set_yield(&mut row, yields, "core", item["core"].clone());
+                rows.push(row);
+            }
+        } else if short == "degreedistribution" {
+            for item in value["items"].as_array().into_iter().flatten() {
+                let mut row = Row::new();
+                set_yield(&mut row, yields, "degree", item["degree"].clone());
+                set_yield(&mut row, yields, "count", item["count"].clone());
+                rows.push(row);
+            }
         } else {
             for item in value["items"].as_array().into_iter().flatten() {
                 let mut row = Row::new();
@@ -985,13 +1075,27 @@ impl<'a> Executor<'a> {
 
     fn similarity_procedure(&mut self) -> Result<Value> {
         let ids = self.graph.node_ids()?;
-        let max = ids.len().min(1_000);
+        if ids.len() > self.options.gds_max_nodes {
+            return Err(Error::Query(format!(
+                "graph algorithm node budget exceeded (limit {})",
+                self.options.gds_max_nodes
+            )));
+        }
         let mut neighbors: HashMap<String, HashSet<String>> = HashMap::new();
-        for id in ids.iter().take(max) {
+        for id in &ids {
+            self.tick()?;
             let mut set = HashSet::new();
             for edge in self.graph.view.neighbors(id, GraphDirection::Both, &[])? {
+                self.tick()?;
                 set.insert(edge.target);
             }
+            let bytes = id.len()
+                + std::mem::size_of::<String>()
+                + set
+                    .iter()
+                    .map(|target| target.len() + std::mem::size_of::<String>() + 32)
+                    .sum::<usize>();
+            self.charge_memory(bytes)?;
             neighbors.insert(id.clone(), set);
         }
         let mut ids: Vec<String> = neighbors.keys().cloned().collect();
