@@ -30,6 +30,16 @@ Full release notes: https://github.com/essmos/nonodb/releases
   `examples/timeseries_space.rs`: 100k rows occupy 0.46 MB compacted (4.79
   B/row) versus 41.66 MB (436.8 B/row) for a document-per-row collection, with
   the LMDB high-water caveat documented.
+- Add `delete` and `findAndModify(remove: true)` for time-series collections.
+  Sealed buckets stay immutable: deleting a row writes a 27-byte tombstone key,
+  so synthetic `_id`s stay valid and a delete is one LMDB put instead of a
+  2048-row bucket rewrite. `find`, `count`, `find_by_key`, aggregation, and
+  `verify_data_dir` skip tombstones; `timeseries_stats` reports `deleted_rows`.
+  Retention now tombstones the boundary bucket instead of renumbering it. Add
+  `nonodb-cli compact <data-dir>` for offline in-place compaction (compacting
+  copy + fsync + swap, with a `.before-compact` fallback), plus
+  `Store::close()` so offline maintenance can reopen the environment in the same
+  process.
 
 - Remove orphaned `.dropped-*` database directories at startup. A failed
   `remove_dir_all` no longer turns an already-committed database drop into an

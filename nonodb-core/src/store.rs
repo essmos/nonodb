@@ -475,6 +475,16 @@ impl Store {
     }
 
     /// Makes a consistent LMDB copy while holding the resize gate.
+    /// Consumes the store and waits until LMDB releases the environment path.
+    ///
+    /// Useful for offline maintenance (compaction, file replacement) performed
+    /// in the same process. The daemon normally relies on process exit.
+    pub fn close(self) {
+        let env = self.env.clone();
+        drop(self);
+        env.prepare_for_closing().wait();
+    }
+
     pub fn copy_to_file(
         &self,
         path: impl AsRef<Path>,

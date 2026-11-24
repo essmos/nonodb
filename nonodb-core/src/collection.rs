@@ -4720,10 +4720,8 @@ impl<'e> Collection<'e> {
                     return Ok(());
                 }
                 "delete" => {
-                    return Err(Error::Query(
-                        "replication delete is not supported on time-series collections; use retain_timeseries"
-                            .into(),
-                    ));
+                    crate::timeseries::delete_by_id(wtxn, self.env, &self.name, &settings, id)?;
+                    return Ok(());
                 }
                 other => {
                     return Err(Error::Query(format!(
@@ -4990,7 +4988,9 @@ impl<'e> Collection<'e> {
         opts: &FindAndModifyOptions<'_>,
         default_id: Option<&Value>,
     ) -> Result<FindAndModifyOutcome> {
-        self.ensure_not_timeseries("find_and_modify")?;
+        if !opts.remove {
+            self.ensure_not_timeseries("find_and_modify")?;
+        }
         self.ensure_standard()?;
         validate_find_and_modify(opts)?;
         let query = FindQuery {
@@ -5183,7 +5183,10 @@ impl<'e> Collection<'e> {
     }
 
     pub fn delete_txn(&self, wtxn: &mut RwTxn<'_>, filter: &Value, multi: bool) -> Result<usize> {
-        self.ensure_not_timeseries("delete")?;
+        if self.profile.is_timeseries() {
+            let settings = self.timeseries_settings_in(&*wtxn)?.unwrap_or_default();
+            return crate::timeseries::delete(wtxn, self.env, &self.name, &settings, filter, multi);
+        }
         self.ensure_standard()?;
         let keys = self.matching_keys(&*wtxn, filter, multi)?;
         for key in &keys {
@@ -8699,6 +8702,19 @@ impl<'e> Collection<'e> {
         rtxn: &RoTxn<'_>,
         allow_missing_search: bool,
     ) -> Result<CollectionVerification> {
+        if self.profile.is_timeseries() {
+            let settings = self.timeseries_settings_in(rtxn)?.unwrap_or_default();
+            let (documents, bytes) =
+                crate::timeseries::verify_in(rtxn, self.env, &self.name, &settings)?;
+            return Ok(CollectionVerification {
+                documents,
+                bytes,
+                indexes: Vec::new(),
+                text_indexes: Vec::new(),
+                fuzzy_indexes: Vec::new(),
+                vector_indexes: Vec::new(),
+            });
+        }
         let defs = self.index_defs(rtxn)?;
         let search_defs = self.search_index_defs_in(rtxn)?;
         let text_names: Vec<String> = search_defs

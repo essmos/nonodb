@@ -237,6 +237,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         agg_runs,
     );
 
+    // Point deletes by synthetic id: sealed buckets take a tombstone, so the
+    // cost is one LMDB put plus the bucket header read.
+    let doomed: Vec<String> = ts
+        .find(&query(json!({}), Some(500)))?
+        .iter()
+        .filter_map(|doc| doc["_id"].as_str().map(str::to_string))
+        .collect();
+    let mut samples = Vec::with_capacity(doomed.len());
+    for id in &doomed {
+        let op = Instant::now();
+        ts.delete(&json!({"_id": id}), false)?;
+        samples.push(op.elapsed());
+    }
+    report_latency("delete by _id (tombstone)", samples, doomed.len());
+
     let scans = (reads / 50).max(1);
     let mut samples = Vec::with_capacity(scans);
     let mut matched = 0usize;
@@ -309,10 +324,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let report = store.retain_timeseries("tsbench", cutoff)?;
     let retain_total = retain_started.elapsed();
     println!(
-        "\nretention before +1 h: {:?}, dropped_buckets={}, rewritten={}, dropped_rows={}, remaining_rows={}",
+        "\nretention before +1 h: {:?}, dropped_buckets={}, tombstoned={}, dropped_rows={}, remaining_rows={}",
         retain_total,
         report.dropped_buckets,
-        report.rewritten_buckets,
+        report.tombstoned_buckets,
         report.dropped_rows,
         report.remaining_rows
     );

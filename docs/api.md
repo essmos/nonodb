@@ -2706,7 +2706,8 @@ codecs, and measured compression:
 ```
 
 `retain_timeseries` drops time-series rows older than a date. Whole buckets are
-removed by key without decoding; only the boundary bucket is rewritten:
+removed by key without decoding; the boundary bucket tombstones expired rows so
+synthetic `_id`s stay valid:
 
 ```json
 {"op": "retain_timeseries", "coll": "readings",
@@ -2715,7 +2716,7 @@ removed by key without decoding; only the boundary bucket is rewritten:
 
 ```json
 {"ok": true, "result": {"coll": "readings", "before_ms": 1767225600000,
- "report": {"dropped_buckets": 20, "rewritten_buckets": 20,
+ "report": {"dropped_buckets": 20, "tombstoned_buckets": 10,
             "dropped_rows": 0, "remaining_rows": 64000}}}
 ```
 

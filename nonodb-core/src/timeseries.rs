@@ -54,6 +54,7 @@ const FORMAT_VERSION: u8 = 1;
 const KEY_OPEN: u8 = 0x00;
 const KEY_BUCKET: u8 = 0x01;
 const KEY_ROW: u8 = 0x02;
+const KEY_TOMB: u8 = 0x03;
 const FLAG_SEALED: u8 = 0x01;
 
 /// Default bucket width per granularity, in milliseconds.
@@ -279,6 +280,8 @@ pub struct Stats {
     /// Bytes of unsealed rows, which are stored as raw JSON until the bucket
     /// is sealed (bounded by `bucket_max_docs` per series).
     pub open_bytes: u64,
+    /// Rows marked deleted by tombstones in sealed buckets.
+    pub deleted_rows: u64,
 }
 
 impl Stats {
@@ -1197,6 +1200,7 @@ fn encode_bucket(bucket: &Bucket, settings: &Settings) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+#[cfg(test)]
 fn bucket_bounds(data: &[u8]) -> Result<(bool, i64, i64)> {
     if data.len() < 6 || &data[..4] != MAGIC {
         return Err(corrupt("bad magic"));
@@ -1228,6 +1232,7 @@ fn bucket_header(data: &[u8], _settings: &Settings) -> Result<(bool, i64, i64, O
     Ok((flags & FLAG_SEALED != 0, start, end, meta))
 }
 
+#[cfg(test)]
 fn decode_bucket(data: &[u8], settings: &Settings) -> Result<Bucket> {
     let (bucket, _selected) = decode_bucket_inner(data, settings, None, None)?;
     Ok(bucket)
@@ -1545,6 +1550,18 @@ fn row_key(hash: u64, salt: u32, window_start: i64, serial: u16, seq: u32) -> Ve
     key
 }
 
+fn tomb_base(hash: u64, salt: u32, window_start: i64, serial: u16) -> Vec<u8> {
+    let mut key = row_base(hash, salt, window_start, serial);
+    key[0] = KEY_TOMB;
+    key
+}
+
+fn tomb_key(hash: u64, salt: u32, window_start: i64, serial: u16, seq: u32) -> Vec<u8> {
+    let mut key = tomb_base(hash, salt, window_start, serial);
+    key.extend_from_slice(&seq.to_be_bytes());
+    key
+}
+
 fn row_key_parts(key: &[u8]) -> Option<(u64, u32, i64, u16, u32)> {
     if key.len() != 27 || key[0] != KEY_ROW {
         return None;
@@ -1556,6 +1573,51 @@ fn row_key_parts(key: &[u8]) -> Option<(u64, u32, i64, u16, u32)> {
     })?;
     let seq = u32::from_be_bytes(key[23..27].try_into().ok()?);
     Some((hash, salt, window, serial, seq))
+}
+
+/// Row indexes marked as deleted inside one sealed bucket.
+///
+/// Sealed buckets are immutable and synthetic `_id`s encode the row position,
+/// so deleting a row writes a tombstone instead of rewriting (and renumbering)
+/// the bucket. Tombstones are cheap `put`s and are dropped when the bucket is
+/// rewritten by retention or compaction.
+fn tombstones(
+    txn: &RoTxn<'_>,
+    db: &Database<Bytes, Bytes>,
+    hash: u64,
+    salt: u32,
+    window: i64,
+    serial: u16,
+) -> Result<std::collections::HashSet<u32>> {
+    let prefix = tomb_base(hash, salt, window, serial);
+    let mut out = std::collections::HashSet::new();
+    for item in db.prefix_iter(txn, &prefix)? {
+        let (key, _) = item?;
+        if key.len() == 27 {
+            out.insert(u32::from_be_bytes(key[23..27].try_into().expect("4 bytes")));
+        }
+    }
+    Ok(out)
+}
+
+fn drop_tombstones(
+    wtxn: &mut RwTxn<'_>,
+    db: &Database<Bytes, Bytes>,
+    hash: u64,
+    salt: u32,
+    window: i64,
+    serial: u16,
+) -> Result<()> {
+    let prefix = tomb_base(hash, salt, window, serial);
+    let mut keys = Vec::new();
+    for item in db.prefix_iter(&*wtxn, &prefix)? {
+        let (key, _) = item?;
+        keys.push(key.to_vec());
+    }
+    for key in keys {
+        db.delete(&mut *wtxn, &key)?;
+    }
+    Ok(())
 }
 
 /// Converts every pending row of one bucket into a sealed columnar payload.
@@ -1916,7 +1978,11 @@ pub fn find(
                 }
                 let (bucket, selected) = decode_bucket_inner(payload, settings, low, high)?;
                 let (hash, salt, window, serial) = key_parts(key).unwrap_or((0, 0, start, 0));
+                let tombs = tombstones(rtxn, &db, hash, salt, window, serial)?;
                 for (row, idx) in bucket.rows.iter().zip(selected.iter()) {
+                    if tombs.contains(&(*idx as u32)) {
+                        continue;
+                    }
                     let mut doc = Value::Object(row.clone());
                     if !row.contains_key("_id") {
                         set_path(
@@ -2006,11 +2072,313 @@ pub fn count(
 pub struct RetainReport {
     /// Whole sealed buckets removed without decoding their columns.
     pub dropped_buckets: u64,
-    /// Boundary buckets that were decoded, filtered, and re-encoded.
-    pub rewritten_buckets: u64,
+    /// Boundary buckets that received tombstones for expired rows.
+    pub tombstoned_buckets: u64,
     /// Pending (unsealed) rows removed.
     pub dropped_rows: u64,
     pub remaining_rows: u64,
+}
+
+/// Recomputes open-bucket row counts and rolls pointers whose bucket is gone.
+fn refresh_pointers(wtxn: &mut RwTxn<'_>, db: &Database<Bytes, Bytes>) -> Result<()> {
+    let mut pointers: Vec<(Vec<u8>, Vec<u8>, u32)> = Vec::new();
+    for item in db.prefix_iter(&*wtxn, &[KEY_OPEN])? {
+        let (key, value) = item?;
+        if let Some((bucket_key, count)) = parse_open(value) {
+            pointers.push((key.to_vec(), bucket_key, count));
+        }
+    }
+    for (pointer_key, pointer_bucket, count) in pointers {
+        let Some((hash, salt, window, serial)) = key_parts(&pointer_bucket) else {
+            continue;
+        };
+        let prefix = row_base(hash, salt, window, serial);
+        let mut next_seq = 0u32;
+        let mut remaining = 0u32;
+        for item in db.prefix_iter(&*wtxn, &prefix)? {
+            let (key, _) = item?;
+            remaining += 1;
+            if key.len() == 27 {
+                let seq = u32::from_be_bytes(key[23..27].try_into().expect("4 bytes"));
+                next_seq = next_seq.max(seq.saturating_add(1));
+            }
+        }
+        if remaining == 0 && count > 0 {
+            db.put(&mut *wtxn, &pointer_key, &encode_open(&pointer_bucket, 0))?;
+        } else if next_seq != count {
+            db.put(
+                &mut *wtxn,
+                &pointer_key,
+                &encode_open(&pointer_bucket, next_seq),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Deletes rows matching `filter`. Returns the number of removed rows.
+///
+/// Sealed buckets that still contain matches are decoded once and re-encoded;
+/// buckets whose every row matches are dropped by key. Pending rows are deleted
+/// individually and the open-bucket counters are recomputed. With
+/// `multi = false` at most one row is removed.
+pub fn delete(
+    wtxn: &mut RwTxn<'_>,
+    env: &heed::Env,
+    name: &str,
+    settings: &Settings,
+    filter: &Value,
+    multi: bool,
+) -> Result<usize> {
+    validate_filter(filter)?;
+    let db =
+        env.create_database::<Bytes, Bytes>(wtxn, Some(&format!("{BUCKET_DB_PREFIX}{name}")))?;
+    let (low, high) = time_bounds(filter, &settings.time_field);
+    let meta_hash = meta_equality_hash(filter, settings);
+    let meta_filter = meta_only_filter(filter, settings);
+    let now = crate::ttl::now_ms() as i64;
+    let mut deleted = 0usize;
+
+    let mut buckets: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    for item in db.iter(&*wtxn)? {
+        let (key, payload) = item?;
+        if key.first() == Some(&KEY_BUCKET) {
+            buckets.push((key.to_vec(), payload.to_vec()));
+        }
+    }
+    for (key, payload) in buckets {
+        if !multi && deleted > 0 {
+            break;
+        }
+        if let Some(expected) = meta_hash {
+            if key_parts(&key).map(|parts| parts.0) != Some(expected) {
+                continue;
+            }
+        }
+        let (_, start, end, meta) = bucket_header(&payload, settings)?;
+        if low.is_some_and(|low| end < low) || high.is_some_and(|high| start > high) {
+            continue;
+        }
+        if let Some(filter) = &meta_filter {
+            if !meta_bucket_matches(filter, settings, meta.as_ref()) {
+                continue;
+            }
+        }
+        let (bucket, selected) = decode_bucket_inner(&payload, settings, low, high)?;
+        let (hash, salt, window, serial) = key_parts(&key).unwrap_or((0, 0, start, 0));
+        let tombs = tombstones(&*wtxn, &db, hash, salt, window, serial)?;
+        let mut live = 0usize;
+        let mut removed_tombstones = Vec::new();
+        for (row, idx) in bucket.rows.iter().zip(selected.iter()) {
+            let seq = *idx as u32;
+            if tombs.contains(&seq) {
+                continue;
+            }
+            live += 1;
+            let mut doc = Value::Object(row.clone());
+            if !row.contains_key("_id") {
+                set_path(
+                    doc.as_object_mut().expect("object"),
+                    "_id",
+                    Value::String(row_id(hash, salt, window, serial, seq)),
+                );
+            }
+            let hit = !expired(settings, &doc, now) && matcher::matches(&doc, filter);
+            if hit && (multi || deleted + removed_tombstones.len() == 0) {
+                removed_tombstones.push(seq);
+            }
+        }
+        if removed_tombstones.is_empty() {
+            continue;
+        }
+        let removed = removed_tombstones.len();
+        deleted += removed;
+        for seq in removed_tombstones {
+            db.put(&mut *wtxn, &tomb_key(hash, salt, window, serial, seq), &[])?;
+        }
+        // If every live row of the bucket is now deleted, drop the payload and
+        // its tombstones instead of keeping an empty sealed bucket.
+        if removed == live {
+            db.delete(&mut *wtxn, &key)?;
+            drop_tombstones(wtxn, &db, hash, salt, window, serial)?;
+        }
+    }
+
+    if multi || deleted == 0 {
+        let mut rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for item in db.iter(&*wtxn)? {
+            let (key, payload) = item?;
+            if key.first() == Some(&KEY_ROW) {
+                rows.push((key.to_vec(), payload.to_vec()));
+            }
+        }
+        for (key, payload) in rows {
+            if !multi && deleted > 0 {
+                break;
+            }
+            let Some((hash, salt, window, serial, seq)) = row_key_parts(&key) else {
+                continue;
+            };
+            if let Some(expected) = meta_hash {
+                if hash != expected {
+                    continue;
+                }
+            }
+            let window_end = window.saturating_add(settings.span_ms()).saturating_sub(1);
+            if low.is_some_and(|low| window_end < low) || high.is_some_and(|high| window > high) {
+                continue;
+            }
+            let row: Map<String, Value> = serde_json::from_slice(&payload)?;
+            let mut doc = Value::Object(row);
+            if !doc
+                .as_object()
+                .is_some_and(|object| object.contains_key("_id"))
+            {
+                set_path(
+                    doc.as_object_mut().expect("object"),
+                    "_id",
+                    Value::String(row_id(hash, salt, window, serial, seq)),
+                );
+            }
+            if expired(settings, &doc, now) || !matcher::matches(&doc, filter) {
+                continue;
+            }
+            db.delete(&mut *wtxn, &key)?;
+            deleted += 1;
+        }
+    }
+
+    refresh_pointers(wtxn, &db)?;
+    Ok(deleted)
+}
+
+/// Deletes one row by `_id`. Synthetic ids are resolved without a scan.
+pub fn delete_by_id(
+    wtxn: &mut RwTxn<'_>,
+    env: &heed::Env,
+    name: &str,
+    settings: &Settings,
+    id: &str,
+) -> Result<bool> {
+    let db =
+        env.create_database::<Bytes, Bytes>(wtxn, Some(&format!("{BUCKET_DB_PREFIX}{name}")))?;
+    if let Some((hash, salt, window, serial, seq)) = parse_row_id(id) {
+        if db
+            .get(&*wtxn, &row_key(hash, salt, window, serial, seq))?
+            .is_some()
+        {
+            db.delete(&mut *wtxn, &row_key(hash, salt, window, serial, seq))?;
+            refresh_pointers(wtxn, &db)?;
+            return Ok(true);
+        }
+        let sealed = bucket_key(hash, salt, window, serial);
+        if db.get(&*wtxn, &sealed)?.is_some() {
+            let tomb = tomb_key(hash, salt, window, serial, seq);
+            if db.get(&*wtxn, &tomb)?.is_some() {
+                return Ok(false);
+            }
+            // The row exists only if its position is inside the bucket.
+            let payload = db
+                .get(&*wtxn, &sealed)?
+                .ok_or_else(|| corrupt("bucket disappeared during delete"))?
+                .to_vec();
+            let (bucket, selected) = decode_bucket_inner(&payload, settings, None, None)?;
+            if !selected.contains(&(seq as usize)) {
+                return Ok(false);
+            }
+            let tombs = tombstones(&*wtxn, &db, hash, salt, window, serial)?;
+            if tombs.len() + 1 >= bucket.rows.len() {
+                db.delete(&mut *wtxn, &sealed)?;
+                drop_tombstones(wtxn, &db, hash, salt, window, serial)?;
+            } else {
+                db.put(&mut *wtxn, &tomb, &[])?;
+            }
+            refresh_pointers(wtxn, &db)?;
+            return Ok(true);
+        }
+    }
+    let filter = Value::Object(Map::from_iter([(
+        "_id".to_string(),
+        Value::String(id.to_string()),
+    )]));
+    Ok(delete(wtxn, env, name, settings, &filter, false)? > 0)
+}
+
+/// Verifies every bucket: header, column decode, row count, and key layout.
+pub fn verify_in(
+    rtxn: &RoTxn<'_>,
+    env: &heed::Env,
+    name: &str,
+    settings: &Settings,
+) -> Result<(u64, u64)> {
+    let Some(db) =
+        env.open_database::<Bytes, Bytes>(rtxn, Some(&format!("{BUCKET_DB_PREFIX}{name}")))?
+    else {
+        return Ok((0, 0));
+    };
+    let mut rows = 0u64;
+    let mut bytes = 0u64;
+    for item in db.iter(rtxn)? {
+        let (key, payload) = item?;
+        match key.first() {
+            Some(&KEY_OPEN) => {
+                if parse_open(payload).is_none() {
+                    return Err(corrupt("malformed open-bucket pointer"));
+                }
+            }
+            Some(&KEY_ROW) => {
+                let Some((hash, salt, window, serial, seq)) = row_key_parts(key) else {
+                    return Err(corrupt("malformed pending row key"));
+                };
+                let _ = (hash, salt, window, serial, seq);
+                let row: Map<String, Value> = serde_json::from_slice(payload)?;
+                if extract_time(&Value::Object(row), &settings.time_field).is_none() {
+                    return Err(corrupt("pending row has no time field"));
+                }
+                rows += 1;
+                bytes += payload.len() as u64;
+            }
+            Some(&KEY_BUCKET) => {
+                let (_, start, end, _) = bucket_header(payload, settings)?;
+                if end < start {
+                    return Err(corrupt("bucket end precedes window start"));
+                }
+                let (hash, salt, window, serial) = key_parts(key).unwrap_or((0, 0, 0, 0));
+                let tombs = tombstones(rtxn, &db, hash, salt, window, serial)?;
+                let (bucket, selected) = decode_bucket_inner(payload, settings, None, None)?;
+                if bucket.rows.len() != selected.len() {
+                    return Err(corrupt("bucket row count mismatch"));
+                }
+                for seq in &tombs {
+                    if !selected.iter().any(|idx| *idx as u32 == *seq) {
+                        return Err(corrupt("tombstone points outside its bucket"));
+                    }
+                }
+                for (row, idx) in bucket.rows.iter().zip(selected.iter()) {
+                    if tombs.contains(&(*idx as u32)) {
+                        continue;
+                    }
+                    if extract_time(&Value::Object(row.clone()), &settings.time_field).is_none() {
+                        return Err(corrupt("sealed row has no time field"));
+                    }
+                    rows += 1;
+                }
+                bytes += payload.len() as u64;
+            }
+            Some(&KEY_TOMB) => {
+                if key.len() != 27 {
+                    return Err(corrupt("malformed tombstone key"));
+                }
+                let mut copy = key[..23].to_vec();
+                copy[0] = KEY_BUCKET;
+                if key_parts(&copy).is_none() {
+                    return Err(corrupt("malformed tombstone bucket key"));
+                }
+            }
+            _ => return Err(corrupt("unknown time-series key prefix")),
+        }
+    }
+    Ok((rows, bytes))
 }
 
 /// Removes every row older than `before_ms` (exclusive).
@@ -2028,28 +2396,22 @@ pub fn retain(
     let db =
         env.create_database::<Bytes, Bytes>(wtxn, Some(&format!("{BUCKET_DB_PREFIX}{name}")))?;
     let mut report = RetainReport::default();
-    let mut pointers: Vec<(Vec<u8>, Vec<u8>, u32)> = Vec::new();
-    let mut buckets: Vec<(Vec<u8>, bool, i64, i64)> = Vec::new();
-    let mut open_rows: Vec<(Vec<u8>, i64)> = Vec::new();
+    let mut buckets: Vec<(Vec<u8>, i64, i64)> = Vec::new();
+    let mut open_rows: Vec<Vec<u8>> = Vec::new();
 
     for item in db.iter(&*wtxn)? {
         let (key, value) = item?;
         match key.first() {
-            Some(&KEY_OPEN) => {
-                if let Some((bucket_key, count)) = parse_open(value) {
-                    pointers.push((key.to_vec(), bucket_key, count));
-                }
-            }
             Some(&KEY_BUCKET) => {
                 let (_, start, end, _) = bucket_header(value, settings)?;
-                buckets.push((key.to_vec(), start >= before_ms, start, end));
+                buckets.push((key.to_vec(), start, end));
             }
             Some(&KEY_ROW) => {
                 let row: Map<String, Value> = serde_json::from_slice(value)?;
                 let doc = Value::Object(row);
                 if let Some(ts) = extract_time(&doc, &settings.time_field) {
                     if ts < before_ms {
-                        open_rows.push((key.to_vec(), ts));
+                        open_rows.push(key.to_vec());
                     }
                 }
             }
@@ -2057,77 +2419,59 @@ pub fn retain(
         }
     }
 
-    for (key, keep, start, end) in buckets {
-        if keep {
+    for (key, start, end) in buckets {
+        let Some((hash, salt, window, serial)) = key_parts(&key) else {
             continue;
-        }
+        };
         if end < before_ms {
             db.delete(&mut *wtxn, &key)?;
+            drop_tombstones(wtxn, &db, hash, salt, window, serial)?;
             report.dropped_buckets += 1;
             continue;
         }
+        if start >= before_ms {
+            continue;
+        }
+        // Boundary bucket: keep the columnar payload immutable (synthetic `_id`s
+        // encode row positions) and tombstone expired rows instead.
         let payload = db
             .get(&*wtxn, &key)?
             .ok_or_else(|| corrupt("bucket disappeared during retention"))?
             .to_vec();
-        let (bucket, _) = decode_bucket_inner(&payload, settings, None, None)?;
-        let kept: Vec<Map<String, Value>> = bucket
-            .rows
-            .into_iter()
-            .filter(|row| {
-                extract_time(&Value::Object(row.clone()), &settings.time_field)
-                    .is_some_and(|ts| ts >= before_ms)
-            })
-            .collect();
-        if kept.is_empty() {
-            db.delete(&mut *wtxn, &key)?;
-            report.dropped_buckets += 1;
-            continue;
+        let (bucket, selected) = decode_bucket_inner(&payload, settings, None, None)?;
+        let tombs = tombstones(&*wtxn, &db, hash, salt, window, serial)?;
+        let mut added = 0u64;
+        for (row, idx) in bucket.rows.iter().zip(selected.iter()) {
+            let seq = *idx as u32;
+            if tombs.contains(&seq) {
+                continue;
+            }
+            let expired = extract_time(&Value::Object(row.clone()), &settings.time_field)
+                .is_some_and(|ts| ts < before_ms);
+            if expired {
+                db.put(&mut *wtxn, &tomb_key(hash, salt, window, serial, seq), &[])?;
+                added += 1;
+            }
         }
-        let end = kept
-            .iter()
-            .filter_map(|row| extract_time(&Value::Object(row.clone()), &settings.time_field))
-            .max()
-            .unwrap_or(start);
-        let shrunk = Bucket {
-            sealed: true,
-            window_start: start,
-            end,
-            meta: bucket.meta,
-            rows: kept,
-        };
-        let payload = encode_bucket(&shrunk, settings)?;
-        db.put(&mut *wtxn, &key, &payload)?;
-        report.rewritten_buckets += 1;
+        if added > 0 {
+            report.tombstoned_buckets += 1;
+        }
+        let live_after =
+            bucket.rows.len() - tombstones(&*wtxn, &db, hash, salt, window, serial)?.len();
+        if live_after == 0 {
+            db.delete(&mut *wtxn, &key)?;
+            drop_tombstones(wtxn, &db, hash, salt, window, serial)?;
+            report.dropped_buckets += 1;
+        }
     }
 
-    for (key, _) in &open_rows {
+    for key in &open_rows {
         db.delete(&mut *wtxn, key)?;
         report.dropped_rows += 1;
     }
 
-    // Recompute pending row counts and roll pointers whose bucket was removed.
-    for (pointer_key, pointer_bucket, count) in pointers {
-        let Some((hash, salt, window, serial)) = key_parts(&pointer_bucket) else {
-            continue;
-        };
-        let prefix = row_base(hash, salt, window, serial);
-        let remaining = db.prefix_iter(&*wtxn, &prefix)?.count();
-        if remaining == 0 && count > 0 {
-            let next = bucket_key(hash, salt, window, serial.saturating_add(1));
-            db.put(&mut *wtxn, &pointer_key, &encode_open(&next, 0))?;
-        } else if remaining as u32 != count {
-            db.put(
-                &mut *wtxn,
-                &pointer_key,
-                &encode_open(&pointer_bucket, remaining as u32),
-            )?;
-        }
-    }
-
-    // Count what is left so callers can report a retention result.
-    let stats = stats(wtxn, env, name, settings)?;
-    report.remaining_rows = stats.rows;
+    refresh_pointers(wtxn, &db)?;
+    report.remaining_rows = stats(wtxn, env, name, settings)?.rows;
     Ok(report)
 }
 
@@ -2167,6 +2511,12 @@ pub fn find_by_id(
                 return Ok(None);
             }
             return Ok(Some(doc));
+        }
+        if db
+            .get(rtxn, &tomb_key(hash, salt, window, serial, seq))?
+            .is_some()
+        {
+            return Ok(None);
         }
         if let Some(payload) = db.get(rtxn, &bucket_key(hash, salt, window, serial))? {
             if let Some(row) = decode_bucket_row(payload, settings, seq as usize)? {
@@ -2229,26 +2579,33 @@ pub fn stats(rtxn: &RoTxn<'_>, env: &heed::Env, name: &str, settings: &Settings)
         match key.first() {
             Some(&KEY_OPEN) => {
                 stats.series += 1;
-                let count = parse_open(payload).map(|(_, count)| count).unwrap_or(0);
-                if count > 0 {
+                if parse_open(payload).is_some_and(|(_, count)| count > 0) {
                     stats.open_buckets += 1;
-                    stats.rows += u64::from(count);
                 }
             }
             Some(&KEY_ROW) => {
+                stats.rows += 1;
                 stats.open_bytes += payload.len() as u64;
                 stats.raw_bytes += payload.len() as u64;
             }
             Some(&KEY_BUCKET) => {
-                let (sealed, _, _) = bucket_bounds(payload)?;
-                let bucket = decode_bucket(payload, settings)?;
+                let (sealed, _, _, _) = bucket_header(payload, settings)?;
+                let (hash, salt, window, serial) = key_parts(key).unwrap_or((0, 0, 0, 0));
+                let tombs = tombstones(rtxn, &db, hash, salt, window, serial)?;
+                let (bucket, selected) = decode_bucket_inner(payload, settings, None, None)?;
                 stats.buckets += 1;
                 if sealed {
                     stats.sealed_buckets += 1;
+                } else {
+                    stats.open_buckets += 1;
                 }
-                stats.rows += bucket.rows.len() as u64;
                 stats.encoded_bytes += payload.len() as u64;
-                for row in &bucket.rows {
+                for (row, idx) in bucket.rows.iter().zip(selected.iter()) {
+                    if tombs.contains(&(*idx as u32)) {
+                        stats.deleted_rows += 1;
+                        continue;
+                    }
+                    stats.rows += 1;
                     stats.raw_bytes += row_json_bytes(&Value::Object(row.clone()));
                 }
             }
@@ -2433,8 +2790,9 @@ mod tests {
         assert!(collection
             .update(&json!({}), &json!({"$set": {"x": 1}}), false)
             .is_err());
-        assert!(collection.delete(&json!({}), false).is_err());
         assert!(collection.create_index("level", false).is_err());
+        assert_eq!(collection.delete(&json!({}), false).unwrap(), 1);
+        assert_eq!(collection.count(&json!({})).unwrap(), 249);
 
         store.drop_collection("metrics").unwrap();
         assert!(store.collection_profile("metrics").unwrap().is_none());
@@ -2474,7 +2832,7 @@ mod tests {
         let cutoff = base + hour + 30 * 60_000;
         let report = store.retain_timeseries("metrics", cutoff).unwrap();
         assert_eq!(report.dropped_buckets, 1);
-        assert_eq!(report.rewritten_buckets, 1);
+        assert_eq!(report.tombstoned_buckets, 1);
         let remaining = collection.count(&json!({})).unwrap();
         assert_eq!(remaining, 15 + 30);
         assert_eq!(report.remaining_rows, remaining as u64);
@@ -2611,11 +2969,51 @@ mod tests {
             "replica rows must match primary"
         );
 
+        // Delete replicates: remove one row by id on the primary and replay it.
+        let doomed = source
+            .find(&FindQuery {
+                filter: json!({}),
+                projection: None,
+                sort: vec![("ts".into(), 1)],
+                skip: 0,
+                limit: Some(1),
+                comment: None,
+                max_time_ms: None,
+                hint: None,
+            })
+            .unwrap()
+            .remove(0);
+        let doomed_id = doomed["_id"].as_str().unwrap().to_string();
+        assert_eq!(source.delete(&json!({"_id": doomed_id}), false).unwrap(), 1);
+        let delete_txn = ReplicationTxn::new_with_ops(
+            2,
+            "primary",
+            0,
+            vec![ReplicationChange {
+                collection: "metrics".into(),
+                op: "delete".into(),
+                id: doomed_id.clone(),
+                before: Some(doomed),
+                after: None,
+                vault: false,
+                ttl_at: None,
+            }],
+            vec![ReplicationOp::Document { change: 0 }],
+        );
+        assert!(replica.apply_replication_txn(&delete_txn).unwrap());
+        assert!(replica
+            .collection("metrics")
+            .unwrap()
+            .find_by_key(&doomed_id)
+            .unwrap()
+            .is_none());
+        assert_eq!(target.count(&json!({})).unwrap(), 39);
+
         // Retention replicates too: same cutoff, same remaining rows.
         let cutoff = 1_700_000_000_000i64 + 20_000;
         let report = primary.retain_timeseries("metrics", cutoff).unwrap();
         let retain = ReplicationTxn::new_with_ops(
-            2,
+            3,
             "primary",
             0,
             Vec::new(),
@@ -2630,6 +3028,95 @@ mod tests {
             report.remaining_rows as usize
         );
         assert_eq!(target.count(&json!({})).unwrap(), 20);
+    }
+
+    #[test]
+    fn delete_by_id_by_filter_and_verification() {
+        use crate::collection::FindAndModifyOptions;
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open(dir.path()).unwrap();
+        let settings = Settings {
+            time_field: "ts".into(),
+            meta_field: Some("device".into()),
+            ..Settings::default()
+        };
+        let collection = store
+            .create_timeseries_collection("metrics", &settings)
+            .unwrap();
+        for idx in 0..100i64 {
+            collection
+                .insert_one(json!({
+                    "ts": {"$date": {"$numberLong": (1_700_000_000_000i64 + idx * 1000).to_string()}},
+                    "device": {"id": "a"},
+                    "level": idx % 4,
+                    "value": idx,
+                }))
+                .unwrap();
+        }
+        store.seal_timeseries("metrics").unwrap();
+        let first = collection
+            .find(&FindQuery {
+                filter: json!({}),
+                projection: None,
+                sort: Vec::new(),
+                skip: 0,
+                limit: Some(1),
+                comment: None,
+                max_time_ms: None,
+                hint: None,
+            })
+            .unwrap()
+            .remove(0);
+        let first_id = first["_id"].as_str().unwrap().to_string();
+        assert!(collection.find_by_key(&first_id).unwrap().is_some());
+        assert_eq!(
+            collection.delete(&json!({"_id": first_id}), false).unwrap(),
+            1
+        );
+        assert!(collection.find_by_key(&first_id).unwrap().is_none());
+        assert_eq!(collection.count(&json!({})).unwrap(), 99);
+
+        // Single delete by filter removes exactly one row.
+        assert_eq!(collection.delete(&json!({"level": 1}), false).unwrap(), 1);
+        assert_eq!(collection.count(&json!({"level": 1})).unwrap(), 24);
+        // Multi delete removes the rest of that level.
+        assert_eq!(collection.delete(&json!({"level": 1}), true).unwrap(), 24);
+        assert_eq!(collection.count(&json!({"level": 1})).unwrap(), 0);
+        assert_eq!(collection.count(&json!({})).unwrap(), 74);
+
+        // findAndModify remove works, update does not.
+        let removed = collection
+            .find_and_modify(&FindAndModifyOptions {
+                filter: &json!({"level": 2}),
+                update: None,
+                sort: &[],
+                new: false,
+                remove: true,
+                upsert: false,
+                array_filters: &[],
+                projection: None,
+            })
+            .unwrap();
+        assert!(removed.value.is_some());
+        assert!(collection
+            .find_and_modify(&FindAndModifyOptions {
+                filter: &json!({"level": 2}),
+                update: Some(&json!({"$set": {"x": 1}})),
+                sort: &[],
+                new: false,
+                remove: false,
+                upsert: false,
+                array_filters: &[],
+                projection: None,
+            })
+            .is_err());
+
+        let expected = collection.count(&json!({})).unwrap() as u64;
+        let rtxn = store.read_txn().unwrap();
+        let report = collection.verify_in_options(&rtxn, false).unwrap();
+        rtxn.commit().unwrap();
+        assert_eq!(report.documents, expected);
+        assert!(report.indexes.is_empty());
     }
 
     #[test]

@@ -437,6 +437,22 @@ nonodb-cli inspect ./backup
 nonodb-cli verify-backup ./backup
 ```
 
+## compact
+
+LMDB never shrinks `data.mdb`; TTL expiry, time-series retention, tombstoned
+deletes, and dropped collections only free pages for reuse. Compact a stopped
+database in place:
+
+```bash
+nonodb-cli compact /var/lib/nonodb/default
+```
+
+The command opens the database read-only, copies it through LMDB's compacting
+copy, fsyncs the result, and swaps it in. `data.mdb.before-compact` keeps the
+previous file until the swap succeeds. Stop the daemon first — the command
+refuses to run against a live environment. `nonodb-cli backup` produces a
+compacted copy without replacing the source, which is safer on a primary.
+
 ## backup-all
 
 Back up every database under an instance root:

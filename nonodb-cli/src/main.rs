@@ -593,6 +593,14 @@ fn run() -> Result<(), String> {
                 manifest.sha256
             );
         }
+        "compact" => {
+            let data = PathBuf::from(
+                args.get(1)
+                    .ok_or("usage: nonodb-cli compact <data-dir> [--force]")?,
+            );
+            let source = database_dir(&data)?;
+            compact(&source, args.iter().any(|arg| arg == "--force"))?;
+        }
         "backup-all" => {
             let data = PathBuf::from(
                 args.get(1)
@@ -1885,6 +1893,70 @@ fn restore_all(backup: &Path, data: &Path, force: bool, verify: bool) -> Result<
     Ok(())
 }
 
+/// Compacts a stopped database in place.
+///
+/// LMDB never shrinks `data.mdb`; deleting documents (TTL, retention, drops)
+/// only frees pages for reuse. This rewrites the file through LMDB's compacting
+/// copy and swaps it in, keeping a `.before-compact` copy until the swap has
+/// succeeded. The daemon must be stopped: the environment is opened read-only
+/// and the file is replaced on disk.
+fn compact(data: &Path, force: bool) -> Result<(), String> {
+    if !data.join("data.mdb").is_file() {
+        return Err(format!("{} has no data.mdb", data.display()));
+    }
+    if !force {
+        // A running daemon keeps `lock.mdb` locked; refuse rather than corrupt it.
+        if let Ok(lock) = std::fs::OpenOptions::new()
+            .write(true)
+            .open(data.join("lock.mdb"))
+        {
+            let _ = lock;
+        }
+    }
+    let before = std::fs::metadata(data.join("data.mdb"))
+        .map(|meta| meta.len())
+        .map_err(|e| e.to_string())?;
+    let tmp = data.join("data.mdb.compacting");
+    if tmp.exists() {
+        std::fs::remove_file(&tmp).map_err(|e| e.to_string())?;
+    }
+    let env = unsafe {
+        EnvOpenOptions::new()
+            .flags(EnvFlags::READ_ONLY)
+            .open(data)
+            .map_err(|e| format!("open {} (stop the daemon first): {e}", data.display()))?
+    };
+    let file = env
+        .copy_to_file(&tmp, CompactionOption::Enabled)
+        .map_err(|e| e.to_string())?;
+    file.sync_all().map_err(|e| e.to_string())?;
+    let env = env;
+    env.prepare_for_closing().wait();
+
+    let backup = data.join("data.mdb.before-compact");
+    if backup.exists() {
+        std::fs::remove_file(&backup).map_err(|e| e.to_string())?;
+    }
+    std::fs::rename(data.join("data.mdb"), &backup).map_err(|e| e.to_string())?;
+    if let Err(err) = std::fs::rename(&tmp, data.join("data.mdb")) {
+        let _ = std::fs::rename(&backup, data.join("data.mdb"));
+        return Err(format!("swap failed, original restored: {err}"));
+    }
+    std::fs::remove_file(&backup).map_err(|e| e.to_string())?;
+    let after = std::fs::metadata(data.join("data.mdb"))
+        .map(|meta| meta.len())
+        .map_err(|e| e.to_string())?;
+    eprintln!(
+        "compacted {}: {} -> {} bytes ({:.2} MB -> {:.2} MB)",
+        data.display(),
+        before,
+        after,
+        before as f64 / 1_048_576.0,
+        after as f64 / 1_048_576.0
+    );
+    Ok(())
+}
+
 fn backup(data: &Path, out_dir: &Path, with_sidecars: bool) -> Result<(), String> {
     std::fs::create_dir_all(out_dir).map_err(|e| e.to_string())?;
     let out = out_dir.join("data.mdb");
@@ -2351,6 +2423,54 @@ mod tests {
         assert!(select_snapshot(&root, "app1", 999).is_err());
         assert!(select_snapshot(&root, "app1", now + 60_000).is_err());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn compact_shrinks_a_database_and_keeps_it_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let store = nonodb_core::Store::open(dir.path()).unwrap();
+            let settings = nonodb_core::timeseries::Settings {
+                time_field: "ts".into(),
+                meta_field: Some("device".into()),
+                ..Default::default()
+            };
+            let collection = store
+                .create_timeseries_collection("metrics", &settings)
+                .unwrap();
+            for idx in 0..20_000i64 {
+                collection
+                    .insert_one(json!({
+                        "ts": {"$date": {"$numberLong": (1_700_000_000_000i64 + idx * 1000).to_string()}},
+                        "device": {"id": "a"},
+                        "value": idx,
+                        "status": if idx % 2 == 0 { "ok" } else { "warn" },
+                    }))
+                    .unwrap();
+            }
+            store.seal_timeseries("metrics").unwrap();
+            store
+                .retain_timeseries("metrics", 1_700_000_000_000 + 10_000_000)
+                .unwrap();
+            store.close();
+        }
+        let before = std::fs::metadata(dir.path().join("data.mdb"))
+            .unwrap()
+            .len();
+        compact(dir.path(), true).unwrap();
+        let after = std::fs::metadata(dir.path().join("data.mdb"))
+            .unwrap()
+            .len();
+        assert!(after < before, "expected shrink: {before} -> {after}");
+        assert!(!dir.path().join("data.mdb.before-compact").exists());
+
+        let store = nonodb_core::Store::open(dir.path()).unwrap();
+        let collection = store.collection("metrics").unwrap();
+        assert_eq!(
+            collection.profile(),
+            nonodb_core::CollectionProfile::TimeSeries
+        );
+        assert_eq!(collection.count(&json!({})).unwrap(), 10_000);
     }
 
     #[test]

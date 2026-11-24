@@ -129,8 +129,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let retain_time = retain_started.elapsed();
     let after_retention = data_mdb(ts_dir.path());
     println!(
-        "  retention:         {:?}, dropped {} buckets + {} rewritten, {} rows left",
-        retain_time, report.dropped_buckets, report.rewritten_buckets, report.remaining_rows
+        "  retention:         {:?}, dropped {} buckets + {} tombstoned, {} rows left",
+        retain_time, report.dropped_buckets, report.tombstoned_buckets, report.remaining_rows
     );
     println!(
         "  data.mdb after retention: {:.2} MB (LMDB keeps the high-water mark)",

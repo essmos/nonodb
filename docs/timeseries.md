@@ -197,9 +197,13 @@ Stages that need a second collection or an index host (`$lookup`, `$search`,
 | projections, sorts, `skip`/`limit`, `maxTimeMS`, hints | yes (residual, after decode) |
 | TTL: `expireAfterSeconds` on the TS settings | yes (read-time) |
 | TTL: collection/document TTL | not applied to buckets |
+| `verify_data_dir` | decodes every bucket and validates keys, headers, rows, tombstones |
 | document history | not recorded (keeps the format columnar) |
 | secondary, text, fuzzy, geo, vector indexes | rejected with a clear error |
-| `update`, `find_and_modify`, `delete` | rejected |
+| `delete` by filter or by `_id` | yes (tombstones) |
+| `findAndModify` with `remove: true` | yes |
+| `findAndModify` with an update | rejected |
+| `update` / `$set` | rejected |
 | aggregation pipelines (`$match`, `$group`, `$bucket`, `$sort`, ...) | yes, decoded then run in memory |
 | retention: delete rows older than a cutoff | `retain_timeseries` |
 | SQL, `$search`, `$lookup`, watches/events | not supported |
@@ -222,7 +226,7 @@ Same 100k-row workload (10 series, 8 columns, 183 bytes of JSON per row),
 | TS, pending rows before seal (`data.mdb`) | 7.52 MB | 78.9 |
 | TS, sealed, before compaction (`data.mdb`) | 7.52 MB | 78.9 |
 | TS, sealed, compacted copy | **0.46 MB** | **4.79** |
-| TS after retention to half + compacted | 0.25 MB | 5.32 |
+| TS after retention to half, compacted | 0.32 MB | 6.64 |
 
 Read that carefully, because it matters operationally:
 
@@ -238,16 +242,56 @@ Read that carefully, because it matters operationally:
   any moment; seal or `seal_timeseries` shrinks them into the columnar payload.
 - Compaction is a whole-database operation: plan a maintenance window or run it
   against a replica, exactly like any other LMDB high-water issue.
+- Deleted rows are 27-byte tombstone keys until retention drops the bucket or a
+  compaction rewrites the file. Retention keeps the boundary bucket's columnar
+  payload and tombstones expired rows (so synthetic ids stay valid), which is
+  why the post-retention file is slightly larger than a renumbered rewrite would
+  be; the whole window is dropped once it ages out.
+
+### Reclaiming space
+
+Stop the daemon and compact in place:
+
+```bash
+nonodb-cli compact /var/lib/nonodb/default
+```
+
+The command copies `data.mdb` through LMDB's compacting copy, fsyncs it, swaps it
+in, and keeps `data.mdb.before-compact` until the swap succeeds. It refuses to
+run against a live environment. `nonodb-cli backup <data-dir> <out-dir>` produces
+a compacted copy without touching the source, which is the safer option on a
+primary.
 
 Compacted on-disk size is **~91x smaller than a document-per-row collection**
 and **~38x smaller than the raw JSON** for this workload.
 
+## Deleting rows
+
+`delete` works on time-series collections. Pending rows are removed from their
+key; rows inside sealed buckets get a **tombstone** (a 27-byte key) instead of a
+rewrite:
+
+```json
+{"op": "delete", "coll": "readings", "filter": {"device.id": "sensor-7", "status": "error"}, "multi": true}
+```
+
+Why tombstones: synthetic `_id`s encode the row position inside a bucket, and a
+rewrite would renumber every following row. Tombstones keep sealed buckets
+immutable, so previously returned `_id`s stay valid and a delete costs one LMDB
+put instead of decoding and re-encoding a 2048-row bucket. `find`, `count`,
+`find_by_key`, aggregation, and `verify_data_dir` all skip tombstoned rows.
+`timeseries_stats()` reports them as `deleted_rows`.
+
+Space from tombstones and sealed payloads is reclaimed when the bucket's whole
+window ages out (retention drops the bucket and its tombstones) or by
+compaction — see below. `delete` with `multi: false` removes at most one row.
+
 ## Retention
 
 `retain_timeseries` deletes every row older than a cutoff. Buckets whose whole
-window is older are dropped by key with **no column decode**; only the boundary
-bucket is decoded, filtered, and re-encoded. Pending rows are inspected
-individually.
+window is older are dropped by key with **no column decode**; the boundary
+bucket keeps its immutable payload and tombstones only the expired rows, so
+synthetic ids remain valid. Pending rows are inspected individually.
 
 ```json
 {
@@ -261,7 +305,7 @@ Response:
 
 ```json
 {"ok": true, "result": {"coll": "readings", "before_ms": 1767225600000,
- "report": {"dropped_buckets": 20, "rewritten_buckets": 20,
+ "report": {"dropped_buckets": 20, "tombstoned_buckets": 10,
             "dropped_rows": 0, "remaining_rows": 64000}}}
 ```
 
@@ -287,9 +331,9 @@ Time-series collections participate in the normal replication stream:
 - filtered backups drop collections through the normal drop path, which also
   clears the bucket database.
 
-`verify_data_dir` counts time-series collections as registered collections but
-does not decode bucket payloads yet; the bucket database is covered by the LMDB
-copy/manifest checks like any other named database.
+`verify_data_dir` decodes every sealed bucket, checks the header (window bounds,
+meta), validates every row still has its time field, validates pending-row keys
+and tombstones, and reports live row counts for time-series collections.
 
 ## Maintenance
 
@@ -345,8 +389,9 @@ find 1 min, 1 series (60 rows)           500 ops     185 ops/s  p50 5.24 ms  p99
 find 1 h, 1 series (3600 rows)           125 ops      38 ops/s  p50 25.6 ms  p99 36.2 ms
 count 1 h, 1 series                      125 ops      32 ops/s  p50 31.1 ms  p99 40.4 ms
 aggregate $group 1 h, 1 series            50 ops      23 ops/s  p50 43.7 ms  p99 49.4 ms
+delete by _id (tombstone)                500 ops     128 ops/s  p50 7.8 ms  p99 8.9 ms
 find match-all (100000 rows)              10 ops     2.0 ops/s  p50 499 ms   p99 525 ms
-retention before +1 h (40 buckets)        1 pass   498 ms, 20 dropped + 20 rewritten
+retention before +1 h                      1 pass   410 ms, 20 dropped + 10 tombstoned
 
 baseline (standard collection, one document per row)
 find 1 h, 1 series (no index)             10 ops     3.8 ops/s  p50 262 ms   p99 284 ms
@@ -369,9 +414,11 @@ Reproduce: `ROWS=100000 READS=500 cargo run --release -p nonodb-core --example t
 
 ## Limitations
 
-- No updates or deletes of individual rows: use `retain_timeseries` for
-  time-based retention, `expireAfterSeconds` for read-time expiry, or drop the
-  collection.
+- No in-place updates (`$set`, `$inc`, pipelines). Delete is supported and uses
+  tombstones; deleted rows keep occupying their bucket until retention or
+  compaction.
+- No unique/secondary indexes, so deletes by filter decode the candidate
+  buckets like a scan.
 - No SQL, secondary/text/fuzzy/geo/vector indexes, `$search`, `$lookup`, or
   watches inside the collection.
 - Aggregation decodes the full time range into memory before running stages.
