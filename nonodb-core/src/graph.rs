@@ -2504,14 +2504,17 @@ fn pagerank(
         }
     }
     let mut scores: HashMap<String, f64> = ids.iter().map(|id| (id.clone(), 1.0 / n)).collect();
-    let mut working = estimate_adjacency_memory(&ids, &adjacency)
-        .saturating_add(
-            incoming
-                .values()
-                .map(|parents| parents.iter().map(|p| p.len() + 48).sum::<usize>())
-                .sum::<usize>(),
-        )
-        .saturating_add(ids.len().saturating_mul(std::mem::size_of::<String>() + 32));
+    let base_memory = estimate_adjacency_memory(&ids, &adjacency).saturating_add(
+        incoming
+            .values()
+            .map(|parents| parents.iter().map(|p| p.len() + 48).sum::<usize>())
+            .sum::<usize>(),
+    );
+    let score_memory = ids
+        .iter()
+        .map(|id| id.len() + std::mem::size_of::<String>() + 48)
+        .sum::<usize>();
+    let working = base_memory.saturating_add(score_memory);
     check_algorithm_memory(options, working)?;
     let mut converged = false;
     let mut iterations = 0usize;
@@ -2547,9 +2550,10 @@ fn pagerank(
             })
             .sum();
         scores = next;
-        working =
-            working.saturating_add(ids.len().saturating_mul(std::mem::size_of::<String>() + 48));
-        check_algorithm_memory(options, working)?;
+        check_algorithm_memory(
+            options,
+            base_memory.saturating_add(score_memory.saturating_mul(2)),
+        )?;
         iterations += 1;
         if delta < options.tolerance {
             converged = true;
@@ -2668,10 +2672,12 @@ fn label_propagation(
     )?;
     let mut labels: HashMap<String, String> =
         ids.iter().map(|id| (id.clone(), id.clone())).collect();
-    let mut working = estimate_adjacency_memory(&ids, &adjacency).saturating_add(
-        ids.len()
-            .saturating_mul(2 * (std::mem::size_of::<String>() + 32)),
-    );
+    let base_memory = estimate_adjacency_memory(&ids, &adjacency);
+    let label_memory = ids
+        .iter()
+        .map(|id| 2 * (id.len() + std::mem::size_of::<String>()) + 64)
+        .sum::<usize>();
+    let working = base_memory.saturating_add(label_memory);
     check_algorithm_memory(options, working)?;
     let mut converged = false;
     let mut iterations = 0usize;
@@ -2707,9 +2713,10 @@ fn label_propagation(
             }
         }
         labels = next;
-        working =
-            working.saturating_add(ids.len().saturating_mul(std::mem::size_of::<String>() + 32));
-        check_algorithm_memory(options, working)?;
+        check_algorithm_memory(
+            options,
+            base_memory.saturating_add(label_memory.saturating_mul(2)),
+        )?;
         iterations += 1;
         if !changed {
             converged = true;
@@ -3458,6 +3465,19 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("edge budget exceeded"), "{err}");
+
+        let many_iterations: GraphAlgorithmOptions = serde_json::from_value(json!({
+            "kind": "pagerank",
+            "limit": 10,
+            "max_nodes": 100_000,
+            "max_edges": 1_000_000,
+            "max_memory_bytes": 256 * 1024 * 1024,
+            "iterations": 100,
+            "tolerance": 1e-300
+        }))
+        .unwrap();
+        let out = graph_algorithm(&large, &many_iterations).unwrap();
+        assert_eq!(out["nodes"], 100_000);
 
         let timed: GraphAlgorithmOptions = serde_json::from_value(json!({
             "kind": "pagerank",

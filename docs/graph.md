@@ -461,7 +461,7 @@ database-scoped and accept the same options as `graph_algorithm`.
 |---|---|
 | `start_graph_job` | Validate and queue an algorithm |
 | `graph_job_status` | Return `state`, `progress.phase/done/total`, timestamps, and error |
-| `graph_job_result` | Return the completed result exactly once per read; fails until terminal |
+| `graph_job_result` | Return the completed result until export consumes it; fails until terminal |
 | `cancel_graph_job` | Request cooperative cancellation |
 | `export_graph_job` | Atomically write a completed result into a collection |
 
@@ -475,6 +475,10 @@ may read or cancel it.
 Jobs are in-memory metadata: they are cancelled and joined when the database
 runtime shuts down, and completed results are not persisted across restarts.
 Use `export_graph_job` for durable output. It writes all result rows in one
+transaction; if the write fails (for example on a duplicate `_id`), the result is
+restored so the export can be retried. Completed results are capped at 64 MiB
+each and 128 MiB total; older terminal jobs are evicted first. A result over the
+per-job cap fails with `result_too_large` instead of being retained.
 writer transaction, streaming documents from the result into the transaction,
 and uses deterministic `_id` values (`<kind>:<node_id>` or
 `connected_components:<node_id>`). Any duplicate key or writer error aborts the

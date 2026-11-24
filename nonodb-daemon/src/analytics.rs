@@ -19,6 +19,8 @@ use crate::writer::WriteJob;
 
 const MAX_CONCURRENT_JOBS: usize = 2;
 const MAX_TERMINAL_JOBS: usize = 100;
+const MAX_JOB_RESULT_BYTES: usize = 64 * 1024 * 1024;
+const MAX_RETAINED_RESULT_BYTES: usize = 128 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum JobState {
@@ -72,7 +74,8 @@ struct Job {
     state: JobState,
     progress: Arc<Mutex<Progress>>,
     cancel: Arc<AtomicBool>,
-    result: Option<Value>,
+    result: Option<Arc<Value>>,
+    result_bytes: usize,
     error: Option<ApiError>,
     created_ms: u128,
     started_ms: Option<u128>,
@@ -165,6 +168,7 @@ impl AnalyticsManager {
                     progress: progress.clone(),
                     cancel: cancel.clone(),
                     result: None,
+                    result_bytes: 0,
                     error: None,
                     created_ms: now_ms(),
                     started_ms: None,
@@ -302,24 +306,42 @@ impl AnalyticsManager {
                 code: "not_found".into(),
                 message: "analytics result was already exported".into(),
             })?;
+            job.result_bytes = 0;
             (job.kind.clone(), result)
         };
+        let retained = result.clone();
         let (resp, rx) = tokio::sync::oneshot::channel();
-        self.write_tx
-            .send(WriteJob {
-                req: WriteReq::ExportGraphResult {
-                    coll: target.to_string(),
-                    kind,
-                    result,
-                },
-                resp,
-                isolated: true,
-                durability: Durability::Full,
-            })
-            .map_err(|_| ApiError::internal("writer unavailable"))?;
-        let value = rx
-            .blocking_recv()
-            .map_err(|_| ApiError::internal("writer dropped export"))??;
+        let sent = self.write_tx.send(WriteJob {
+            req: WriteReq::ExportGraphResult {
+                coll: target.to_string(),
+                kind,
+                result: (*result).clone(),
+            },
+            resp,
+            isolated: true,
+            durability: Durability::Full,
+        });
+        if sent.is_err() {
+            self.restore_result(id, retained);
+            return Err(ApiError::internal("writer unavailable"));
+        }
+        let value = match rx.blocking_recv() {
+            Ok(Ok(value)) => value,
+            Ok(Err(err)) => {
+                self.restore_result(id, retained);
+                return Err(err);
+            }
+            Err(_) => {
+                self.restore_result(id, retained);
+                return Err(ApiError::internal("writer dropped export"));
+            }
+        };
+        if let Ok(mut inner) = self.inner.lock() {
+            if let Some(job) = inner.jobs.get_mut(id) {
+                job.result = None;
+                job.result_bytes = 0;
+            }
+        }
         Ok(json!({
             "job_id": id,
             "collection": target,
@@ -337,10 +359,14 @@ impl AnalyticsManager {
             return Err(ApiError::forbidden());
         }
         match job.state {
-            JobState::Completed => job.result.clone().ok_or_else(|| ApiError {
-                code: "not_found".into(),
-                message: "analytics result was already exported".into(),
-            }),
+            JobState::Completed => job
+                .result
+                .as_ref()
+                .map(|result| (**result).clone())
+                .ok_or_else(|| ApiError {
+                    code: "not_found".into(),
+                    message: "analytics result was already exported".into(),
+                }),
             JobState::Failed | JobState::Cancelled => {
                 Err(job.error.clone().unwrap_or_else(|| ApiError {
                     code: "cancelled".into(),
@@ -351,6 +377,15 @@ impl AnalyticsManager {
                 code: "job_not_ready".into(),
                 message: "analytics job has not completed".into(),
             }),
+        }
+    }
+
+    fn restore_result(&self, id: &str, result: Arc<Value>) {
+        if let Ok(mut inner) = self.inner.lock() {
+            if let Some(job) = inner.jobs.get_mut(id) {
+                job.result_bytes = serde_json::to_vec(result.as_ref()).map_or(0, |raw| raw.len());
+                job.result = Some(result);
+            }
         }
     }
 
@@ -387,8 +422,20 @@ impl AnalyticsManager {
                 let cancelled = job.cancel.load(Ordering::SeqCst);
                 match outcome {
                     Ok(value) if !cancelled => {
-                        job.state = JobState::Completed;
-                        job.result = Some(value);
+                        let bytes = serde_json::to_vec(&value).map_or(usize::MAX, |raw| raw.len());
+                        if bytes > MAX_JOB_RESULT_BYTES {
+                            job.state = JobState::Failed;
+                            job.error = Some(ApiError {
+                                code: "result_too_large".into(),
+                                message: format!(
+                                    "analytics result is {bytes} bytes (limit {MAX_JOB_RESULT_BYTES}); lower the limit or export from Cypher"
+                                ),
+                            });
+                        } else {
+                            job.state = JobState::Completed;
+                            job.result = Some(Arc::new(value));
+                            job.result_bytes = bytes;
+                        }
                     }
                     Ok(_) => {
                         job.state = JobState::Cancelled;
@@ -425,6 +472,7 @@ impl AnalyticsManager {
                 }));
                 inner.running = inner.running.saturating_sub(1);
             }
+            inner.reap();
         }
     }
 
@@ -480,15 +528,26 @@ impl GraphAlgorithmObserver for JobObserver {
 
 impl Inner {
     fn reap(&mut self) {
-        let mut terminal = self
-            .jobs
-            .values()
-            .filter(|job| job.state.terminal())
-            .map(|job| (job.created_ms, job.id.clone()))
-            .collect::<Vec<_>>();
-        terminal.sort();
-        let excess = terminal.len().saturating_sub(MAX_TERMINAL_JOBS);
-        for (_, id) in terminal.into_iter().take(excess) {
+        loop {
+            let mut terminal = self
+                .jobs
+                .values()
+                .filter(|job| job.state.terminal())
+                .map(|job| (job.created_ms, job.id.clone()))
+                .collect::<Vec<_>>();
+            terminal.sort();
+            let retained_bytes = self
+                .jobs
+                .values()
+                .map(|job| job.result_bytes)
+                .sum::<usize>();
+            if terminal.len() <= MAX_TERMINAL_JOBS && retained_bytes <= MAX_RETAINED_RESULT_BYTES {
+                break;
+            }
+            let Some((_, id)) = terminal.first() else {
+                break;
+            };
+            let id = id.clone();
             self.jobs.remove(&id);
             self.order.retain(|candidate| candidate != &id);
         }

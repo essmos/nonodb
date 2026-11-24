@@ -2394,7 +2394,8 @@ that job. States are `queued`, `running`, `cancelling`, `completed`, `failed`,
 and `cancelled`. Status includes a `progress` object with `phase`, `done`, and
 `total`. Jobs are database-scoped, owner-isolated, and bounded to two concurrent
 runs per database. `export_graph_job` atomically copies a completed result into
-a target collection with deterministic ids; the export consumes the in-memory
+a target collection with deterministic ids; a failed export restores the result,
+and a successful export consumes the in-memory
 result.
 
 Graph configuration requires admin scope on both collections; graph reads

@@ -83,7 +83,7 @@ def chunks(items, size: int):
 def graph_options(kind: str, nodes: int, edges: int, iterations: int = 5) -> dict:
     return {
         "kind": kind,
-        "direction": "both" if kind in {"k_core", "degree_distribution"} else "out",
+        "direction": "both" if kind in {"k_core", "degree_distribution", "label_propagation"} else "out",
         "limit": min(nodes, 1000),
         "max_nodes": nodes,
         "max_edges": max(edges * MAX_EDGE_BUDGET_FACTOR, 1000),
