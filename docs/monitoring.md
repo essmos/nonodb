@@ -193,6 +193,32 @@ They are cheap gauges read from LMDB; they do not scan documents.
 source. Apply also invalidates the replica query cache so reads do not serve
 stale documents.
 
+## Time-series metrics
+
+Time-series maintenance publishes gauges after each retention sweep and
+counters for retention/compaction work. Gauges are updated when automatic
+retention is enabled (`NONODB_TS_RETENTION_INTERVAL_SECS` > 0).
+
+| Metric | Meaning |
+|---|---|
+| `nonodb_ts_collections` | Time-series collections seen by the sweep |
+| `nonodb_ts_rows` | Live rows across those collections |
+| `nonodb_ts_deleted_rows` | Deleted rows still encoded in bucket bitmaps |
+| `nonodb_ts_buckets` | Buckets across all time-series collections |
+| `nonodb_ts_encoded_bytes` | Encoded bucket bytes |
+| `nonodb_ts_raw_bytes` | Raw JSON bytes represented by those buckets |
+| `nonodb_ts_retention_runs_total` | Automatic retention passes |
+| `nonodb_ts_retention_dropped_buckets_total` | Whole buckets removed by retention |
+| `nonodb_ts_retention_boundary_buckets_total` | Boundary buckets marked by retention |
+| `nonodb_ts_retention_errors_total` | Failed retention passes |
+| `nonodb_ts_compaction_requests_total` | Offline compaction requests written |
+| `nonodb_ts_compactions_total` | Compactions completed at startup |
+| `nonodb_ts_compacted_bytes_total` | Bytes reclaimed by compaction |
+
+A rising `nonodb_ts_deleted_rows` with a flat `nonodb_ts_encoded_bytes` means
+bitmap deletes are accumulating; check `NONODB_TS_COMPACT_THRESHOLD_MB` and
+plan the next restart/offline compaction.
+
 ## Recommended alerts
 
 At minimum, alert on:

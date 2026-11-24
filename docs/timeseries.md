@@ -533,21 +533,21 @@ seal open buckets                        10 perm  126 ms total, 12.6 ms/bucket
 stored: 4.07 bytes/row, 45.0x smaller than raw JSON
 
 read (time-series collection)
-find_by_key (point)                     2000 ops     463 ops/s  p50 2.16 ms  p99 2.25 ms
-find 1 min, 1 series (60 rows)          2000 ops     219 ops/s  p50 4.56 ms  p99 4.75 ms
-find 1 h, 1 series (3600 rows)           500 ops      47 ops/s  p50 21.0 ms  p99 22.8 ms
-count 1 h, 1 series                      500 ops      39 ops/s  p50 25.5 ms  p99 27.5 ms
-aggregate $group 1 h, 1 series           200 ops      26 ops/s  p50 37.8 ms  p99 40.6 ms
-delete by _id (bitmap)                    50 ops      62 ops/s  p50 16.1 ms  p99 17.1 ms
-find match-all (99950 rows)               40 ops     2.4 ops/s  p50 424 ms   p99 428 ms
+find_by_key (point)                     2000 ops     405 ops/s  p50 2.31 ms  p99 4.02 ms
+find 1 min, 1 series (60 rows)          2000 ops     197 ops/s  p50 4.81 ms  p99 8.20 ms
+find 1 h, 1 series (3600 rows)           500 ops      48 ops/s  p50 20.2 ms  p99 30.5 ms
+count 1 h, 1 series                      500 ops      36 ops/s  p50 27.2 ms  p99 43.7 ms
+aggregate $group 1 h, 1 series           200 ops      24 ops/s  p50 41.0 ms  p99 57.3 ms
+delete by _id (bitmap)                    50 ops      66 ops/s  p50 15.1 ms  p99 17.2 ms
+find match-all (99950 rows)               40 ops     2.4 ops/s  p50 411 ms   p99 565 ms
 retention before +1 h                      1 pass   541 ms, 20 dropped + 10 tombstoned
 
 index, update, and SQL
 createIndex status                         1 call   757 ms
-find indexed status+series (100 rows)    200 ops     5.2 ops/s  p50 193 ms   p99 197 ms
+find indexed status+series (100 rows)    200 ops    25.7 ops/s  p50 30.8 ms  p99 107 ms
 explain indexed query                               index_used=true, access=index_scan
-update $set by _id (100 rows)            100 ops     1.5 ops/s  p50 688 ms   p99 703 ms
-SQL GROUP BY status (4 groups)            20 ops     1.7 ops/s  p50 604 ms   p99 606 ms
+update $set by _id (100 rows)            100 ops    56.2 ops/s  p50 17.6 ms  p99 19.4 ms
+SQL GROUP BY status (4 groups)            20 ops     1.7 ops/s  p50 585 ms   p99 646 ms
 
 baseline (standard collection, one document per row)
 find 1 h, 1 series (no index)             40 ops     3.6 ops/s  p50 282 ms   p99 286 ms
@@ -566,12 +566,11 @@ document store needs. Range scans, counts, and downsampling are the intended
 access pattern; if you need millions of single-row lookups, keep a small
 document or index mapping outside the collection, or query by time range.
 
-The first indexed query over a broad, low-selectivity field can still cost
-~190 ms because candidate buckets are decoded and the residual filter runs
-afterwards. Updates rewrite the containing bucket (~690 ms for a 1,667-row
-bucket in this run), so prefer collecting ids and batching by time window for
-large maintenance jobs. A pure `_id` delete now goes straight to the locator
-(~16 ms) instead of scanning every bucket.
+An unsorted indexed query stops after `skip + limit` rows, so a broad status
+query with `limit: 100` costs ~31 ms instead of decoding every candidate.
+Updates and `findAndModify` by synthetic `_id` restrict the scan to the bucket
+encoded in the id (~18 ms for a 1,667-row bucket), and a pure `_id` delete also
+goes straight to the locator instead of scanning every bucket.
 
 Reproduce: `ROWS=100000 READS=500 cargo run --release -p nonodb-core --example timeseries_bench`
 

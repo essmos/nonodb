@@ -4,6 +4,12 @@ Full release notes: https://github.com/essmos/nonodb/releases
 
 ## Unreleased
 
+- Speed up time-series single-row maintenance: `update`/`findAndModify` by a
+  synthetic `_id` now restrict scanning to the bucket encoded in the id, and
+  unsorted indexed reads stop after `skip + limit` rows instead of decoding all
+  candidates. Add `/metrics` gauges for time-series rows, deleted rows, buckets,
+  encoded/raw bytes, plus retention and compaction counters, documented in
+  `docs/monitoring.md`.
 - Keep synthetic time-series ids stable when a pending row is deleted or moved
   and the open bucket is later sealed: sealing now preserves sequence gaps as
   deleted bitmap rows instead of renumbering the surviving rows. Added a pending

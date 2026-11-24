@@ -1900,6 +1900,15 @@ pub fn insert(
     Ok(id)
 }
 
+/// Returns the string when the filter is exactly `{"_id": "<string>"}`.
+pub(crate) fn exact_id_filter(filter: &Value) -> Option<&str> {
+    let object = filter.as_object()?;
+    if object.len() != 1 {
+        return None;
+    }
+    object.get("_id")?.as_str()
+}
+
 fn time_bounds(filter: &Value, field: &str) -> (Option<i64>, Option<i64>) {
     let mut low = None;
     let mut high = None;
@@ -2081,6 +2090,13 @@ pub fn find_with_ids(
         .and_then(|ms| std::time::Instant::now().checked_add(std::time::Duration::from_millis(ms)));
     let now = crate::ttl::now_ms() as i64;
     let span = settings.span_ms();
+    // Without a sort the query only needs `skip + limit` documents, so stop
+    // decoding candidate buckets as soon as that many rows were produced.
+    let need = if query.sort.is_empty() {
+        query.skip.saturating_add(limit)
+    } else {
+        usize::MAX
+    };
 
     let mut out: Vec<Value> = Vec::new();
     if let Some(candidates) = candidates {
@@ -2097,7 +2113,10 @@ pub fn find_with_ids(
             }
         }
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for ((hash, salt, window, serial), seqs) in by_bucket {
+        'candidates: for ((hash, salt, window, serial), seqs) in by_bucket {
+            if out.len() >= need {
+                break;
+            }
             // Series and time pruning still applies to the candidate bucket.
             if let Some(expected) = meta_hash {
                 if hash != expected {
@@ -2136,6 +2155,9 @@ pub fn find_with_ids(
                         .to_string();
                     if seen.insert(id) {
                         out.push(doc);
+                        if out.len() >= need {
+                            break 'candidates;
+                        }
                     }
                 }
             } else {
@@ -2166,11 +2188,17 @@ pub fn find_with_ids(
                         .to_string();
                     if seen.insert(id) {
                         out.push(doc);
+                        if out.len() >= need {
+                            break 'candidates;
+                        }
                     }
                 }
             }
         }
         for id in user_ids {
+            if out.len() >= need {
+                break;
+            }
             if let Some(doc) = find_by_id(rtxn, env, name, settings, id)? {
                 if matcher::matches(&doc, &query.filter) && seen.insert(id.clone()) {
                     out.push(doc);
@@ -2221,6 +2249,12 @@ pub fn find_with_ids(
                             continue;
                         }
                         out.push(doc);
+                        if out.len() >= need {
+                            break;
+                        }
+                    }
+                    if out.len() >= need {
+                        break;
                     }
                 }
                 Some(&KEY_ROW) => {
@@ -2254,6 +2288,9 @@ pub fn find_with_ids(
                         continue;
                     }
                     out.push(doc);
+                    if out.len() >= need {
+                        break;
+                    }
                 }
                 _ => {}
             }
@@ -2880,11 +2917,23 @@ pub fn update(
     let meta_filter = meta_only_filter(filter, settings);
     let now = crate::ttl::now_ms() as i64;
     let mut report = UpdateReport::default();
+    // A pure `_id` equality only needs the bucket encoded in that id.
+    let direct = (!multi)
+        .then(|| exact_id_filter(filter))
+        .flatten()
+        .and_then(parse_row_id);
 
     let mut buckets: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     for item in db.iter(&*wtxn)? {
         let (key, payload) = item?;
         if key.first() == Some(&KEY_BUCKET) {
+            if let Some((hash, salt, window, serial, _)) = direct {
+                if key_parts(key).map(|parts| (parts.0, parts.1, parts.2, parts.3))
+                    != Some((hash, salt, window, serial))
+                {
+                    continue;
+                }
+            }
             buckets.push((key.to_vec(), payload.to_vec()));
         }
     }
@@ -2993,6 +3042,11 @@ pub fn update(
             let Some((hash, salt, window, serial, seq)) = row_key_parts(&key) else {
                 continue;
             };
+            if let Some((dhash, dsalt, dwindow, dserial, dseq)) = direct {
+                if (hash, salt, window, serial, seq) != (dhash, dsalt, dwindow, dserial, dseq) {
+                    continue;
+                }
+            }
             if let Some(expected) = meta_hash {
                 if hash != expected {
                     continue;
@@ -4398,6 +4452,25 @@ mod tests {
         let scanned = c.find(&query(Some(json!({"$natural": 1})))).unwrap();
         assert_eq!(indexed, scanned);
         assert_eq!(indexed.len(), 120);
+
+        // An unsorted indexed query stops after skip + limit rows.
+        let limited = c
+            .find(&crate::collection::FindQuery {
+                filter: json!({"level": 7}),
+                projection: None,
+                sort: Vec::new(),
+                skip: 5,
+                limit: Some(7),
+                comment: None,
+                max_time_ms: None,
+                hint: None,
+            })
+            .unwrap();
+        assert_eq!(limited.len(), 7);
+        assert!(limited.iter().all(|doc| doc["level"] == json!(7)));
+        assert!(limited.iter().all(|doc| indexed
+            .iter()
+            .any(|candidate| candidate["_id"] == doc["_id"])));
 
         let plan = c.explain(&query(None)).unwrap();
         assert_eq!(plan["index_used"], json!(true), "{plan}");

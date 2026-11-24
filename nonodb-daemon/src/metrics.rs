@@ -75,6 +75,21 @@ pub static REPLICATION_LAST_SUCCESS_UNIX: AtomicU64 = AtomicU64::new(0);
 pub static REPLICATION_RETENTION_RUNS: AtomicU64 = AtomicU64::new(0);
 pub static REPLICATION_PRUNED_TOTAL: AtomicU64 = AtomicU64::new(0);
 
+/// Time-series storage gauges and maintenance counters.
+pub static TS_COLLECTIONS: AtomicU64 = AtomicU64::new(0);
+pub static TS_ROWS: AtomicU64 = AtomicU64::new(0);
+pub static TS_DELETED_ROWS: AtomicU64 = AtomicU64::new(0);
+pub static TS_BUCKETS: AtomicU64 = AtomicU64::new(0);
+pub static TS_ENCODED_BYTES: AtomicU64 = AtomicU64::new(0);
+pub static TS_RAW_BYTES: AtomicU64 = AtomicU64::new(0);
+pub static TS_RETENTION_RUNS: AtomicU64 = AtomicU64::new(0);
+pub static TS_RETENTION_DROPPED_BUCKETS: AtomicU64 = AtomicU64::new(0);
+pub static TS_RETENTION_BOUNDARY_BUCKETS: AtomicU64 = AtomicU64::new(0);
+pub static TS_RETENTION_ERRORS: AtomicU64 = AtomicU64::new(0);
+pub static TS_COMPACTION_REQUESTS: AtomicU64 = AtomicU64::new(0);
+pub static TS_COMPACTIONS: AtomicU64 = AtomicU64::new(0);
+pub static TS_COMPACTED_BYTES: AtomicU64 = AtomicU64::new(0);
+
 /// Upper bounds for request latency histograms in nanoseconds. The matching
 /// Prometheus labels are expressed in seconds.
 const LATENCY_BUCKETS_NS: [u64; 17] = [
@@ -559,6 +574,19 @@ pub fn snapshot() -> Value {
         "replication_last_success_unix": REPLICATION_LAST_SUCCESS_UNIX.load(Relaxed),
         "replication_retention_runs_total": REPLICATION_RETENTION_RUNS.load(Relaxed),
         "replication_pruned_total": REPLICATION_PRUNED_TOTAL.load(Relaxed),
+        "ts_collections": TS_COLLECTIONS.load(Relaxed),
+        "ts_rows": TS_ROWS.load(Relaxed),
+        "ts_deleted_rows": TS_DELETED_ROWS.load(Relaxed),
+        "ts_buckets": TS_BUCKETS.load(Relaxed),
+        "ts_encoded_bytes": TS_ENCODED_BYTES.load(Relaxed),
+        "ts_raw_bytes": TS_RAW_BYTES.load(Relaxed),
+        "ts_retention_runs_total": TS_RETENTION_RUNS.load(Relaxed),
+        "ts_retention_dropped_buckets_total": TS_RETENTION_DROPPED_BUCKETS.load(Relaxed),
+        "ts_retention_boundary_buckets_total": TS_RETENTION_BOUNDARY_BUCKETS.load(Relaxed),
+        "ts_retention_errors_total": TS_RETENTION_ERRORS.load(Relaxed),
+        "ts_compaction_requests_total": TS_COMPACTION_REQUESTS.load(Relaxed),
+        "ts_compactions_total": TS_COMPACTIONS.load(Relaxed),
+        "ts_compacted_bytes_total": TS_COMPACTED_BYTES.load(Relaxed),
         "collection_metrics": collection_metrics,
         "collection_metrics_overflow_total": COLLECTION_METRICS_OVERFLOW.load(Relaxed),
         "latency": latency,
@@ -1000,6 +1028,41 @@ pub fn prometheus() -> String {
             "TTL sweeps performed.",
         ),
         (
+            "nonodb_ts_retention_runs_total",
+            "ts_retention_runs_total",
+            "Automatic time-series retention passes.",
+        ),
+        (
+            "nonodb_ts_retention_dropped_buckets_total",
+            "ts_retention_dropped_buckets_total",
+            "Whole time-series buckets dropped by retention.",
+        ),
+        (
+            "nonodb_ts_retention_boundary_buckets_total",
+            "ts_retention_boundary_buckets_total",
+            "Time-series boundary buckets marked by retention.",
+        ),
+        (
+            "nonodb_ts_retention_errors_total",
+            "ts_retention_errors_total",
+            "Failed time-series retention passes.",
+        ),
+        (
+            "nonodb_ts_compaction_requests_total",
+            "ts_compaction_requests_total",
+            "Offline time-series compaction requests written.",
+        ),
+        (
+            "nonodb_ts_compactions_total",
+            "ts_compactions_total",
+            "Time-series compactions completed at startup.",
+        ),
+        (
+            "nonodb_ts_compacted_bytes_total",
+            "ts_compacted_bytes_total",
+            "Bytes reclaimed by time-series compaction.",
+        ),
+        (
             "nonodb_ttl_expired_total",
             "ttl_expired_total",
             "Documents deleted by TTL.",
@@ -1101,6 +1164,36 @@ pub fn prometheus() -> String {
             "nonodb_ttl_backlog",
             "ttl_backlog",
             "Due TTL entries observed by the last sweep.",
+        ),
+        (
+            "nonodb_ts_collections",
+            "ts_collections",
+            "Time-series collections observed by the last sweep.",
+        ),
+        (
+            "nonodb_ts_rows",
+            "ts_rows",
+            "Live rows across time-series collections.",
+        ),
+        (
+            "nonodb_ts_deleted_rows",
+            "ts_deleted_rows",
+            "Deleted time-series rows still occupying bucket payloads.",
+        ),
+        (
+            "nonodb_ts_buckets",
+            "ts_buckets",
+            "Time-series buckets across all collections.",
+        ),
+        (
+            "nonodb_ts_encoded_bytes",
+            "ts_encoded_bytes",
+            "Encoded time-series bucket bytes.",
+        ),
+        (
+            "nonodb_ts_raw_bytes",
+            "ts_raw_bytes",
+            "Raw JSON bytes represented by time-series buckets.",
         ),
         (
             "nonodb_avg_batch_size",

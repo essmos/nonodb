@@ -5041,17 +5041,26 @@ impl<'e> Collection<'e> {
     ) -> Result<UpdateOutcome> {
         if self.profile.is_timeseries() {
             let settings = self.timeseries_settings_in(&*wtxn)?.unwrap_or_default();
-            let query = FindQuery {
-                filter: filter.clone(),
-                projection: None,
-                sort: Vec::new(),
-                skip: 0,
-                limit: if multi { None } else { Some(1) },
-                comment: None,
-                max_time_ms: None,
-                hint: None,
+            let direct_id = (!multi)
+                .then(|| crate::timeseries::exact_id_filter(filter))
+                .flatten();
+            let before = if let Some(id) = direct_id {
+                crate::timeseries::find_by_id(&*wtxn, self.env, &self.name, &settings, id)?
+                    .into_iter()
+                    .collect()
+            } else {
+                let query = FindQuery {
+                    filter: filter.clone(),
+                    projection: None,
+                    sort: Vec::new(),
+                    skip: 0,
+                    limit: if multi { None } else { Some(1) },
+                    comment: None,
+                    max_time_ms: None,
+                    hint: None,
+                };
+                crate::timeseries::find(&*wtxn, self.env, &self.name, &settings, &query)?
             };
-            let before = crate::timeseries::find(&*wtxn, self.env, &self.name, &settings, &query)?;
             let report = crate::timeseries::update(
                 wtxn,
                 self.env,
@@ -5340,6 +5349,7 @@ impl<'e> Collection<'e> {
         opts: &FindAndModifyOptions<'_>,
     ) -> Result<FindAndModifyOutcome> {
         validate_find_and_modify(opts)?;
+        let settings = self.timeseries_settings_in(&*wtxn)?.unwrap_or_default();
         let query = FindQuery {
             filter: opts.filter.clone(),
             projection: None,
@@ -5350,7 +5360,11 @@ impl<'e> Collection<'e> {
             max_time_ms: None,
             hint: None,
         };
-        let selected = self.find_in(&*wtxn, &query)?.into_iter().next();
+        let selected = if let Some(id) = crate::timeseries::exact_id_filter(opts.filter) {
+            crate::timeseries::find_by_id(&*wtxn, self.env, &self.name, &settings, id)?
+        } else {
+            self.find_in(&*wtxn, &query)?.into_iter().next()
+        };
         if opts.remove {
             let Some(old) = selected else {
                 return Ok(empty_find_and_modify());
@@ -5368,7 +5382,6 @@ impl<'e> Collection<'e> {
         let update = opts
             .update
             .ok_or_else(|| Error::Query("find_and_modify requires `update` or `remove`".into()))?;
-        let settings = self.timeseries_settings_in(&*wtxn)?.unwrap_or_default();
         if let Some(old) = selected {
             let id = old
                 .get("_id")

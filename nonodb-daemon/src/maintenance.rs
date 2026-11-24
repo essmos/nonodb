@@ -147,7 +147,10 @@ fn run(
             last_ts_retention = Some(Instant::now());
             match sweep_timeseries_retention(&store, &write_tx) {
                 Ok(changed) => ts_deletions_seen |= changed,
-                Err(e) => tracing::warn!(?e, "time-series retention failed"),
+                Err(e) => {
+                    metrics::inc(&metrics::TS_RETENTION_ERRORS);
+                    tracing::warn!(?e, "time-series retention failed");
+                }
             }
             if config.ts_compact_threshold > 0 && ts_deletions_seen {
                 if let Some(bytes) = data_file_bytes(&path) {
@@ -173,6 +176,12 @@ fn sweep_timeseries_retention(
 ) -> Result<bool, String> {
     let now = ttl::now_ms() as i64;
     let mut changed = false;
+    let mut collections = 0u64;
+    let mut rows = 0u64;
+    let mut deleted_rows = 0u64;
+    let mut buckets = 0u64;
+    let mut encoded_bytes = 0u64;
+    let mut raw_bytes = 0u64;
     for name in store.collections().map_err(|e| e.to_string())? {
         let Some(settings) = store
             .timeseries_settings(&name)
@@ -180,32 +189,54 @@ fn sweep_timeseries_retention(
         else {
             continue;
         };
-        let Some(expire) = settings.expire_after_seconds.filter(|value| *value > 0) else {
-            continue;
-        };
-        if store
-            .timeseries_stats(&name)
-            .map_err(|e| e.to_string())?
-            .is_some_and(|stats| stats.deleted_rows > 0)
-        {
-            changed = true;
+        collections += 1;
+        if let Some(expire) = settings.expire_after_seconds.filter(|value| *value > 0) {
+            let before_ms = now.saturating_sub((expire as i64).saturating_mul(1000));
+            metrics::inc(&metrics::TS_RETENTION_RUNS);
+            let value = submit(
+                write_tx,
+                WriteReq::RetainTimeSeries {
+                    coll: name.clone(),
+                    before_ms,
+                },
+                false,
+            )?;
+            if let Some(report) = value.get("report") {
+                let dropped = report
+                    .get("dropped_buckets")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let boundary = report
+                    .get("tombstoned_buckets")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let dropped_rows = report
+                    .get("dropped_rows")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                metrics::add(&metrics::TS_RETENTION_DROPPED_BUCKETS, dropped);
+                metrics::add(&metrics::TS_RETENTION_BOUNDARY_BUCKETS, boundary);
+                changed |= dropped > 0 || boundary > 0 || dropped_rows > 0;
+            }
         }
-        let before_ms = now.saturating_sub((expire as i64).saturating_mul(1000));
-        let value = submit(
-            write_tx,
-            WriteReq::RetainTimeSeries {
-                coll: name.clone(),
-                before_ms,
-            },
-            false,
-        )?;
-        if let Some(report) = value.get("report") {
-            let removed = ["dropped_buckets", "tombstoned_buckets", "dropped_rows"]
-                .iter()
-                .any(|field| report.get(*field).and_then(Value::as_u64).unwrap_or(0) > 0);
-            changed |= removed;
+        // Read stats after retention so the gauges reflect the post-pass state.
+        if let Some(stats) = store.timeseries_stats(&name).map_err(|e| e.to_string())? {
+            rows += stats.rows;
+            deleted_rows += stats.deleted_rows;
+            buckets += stats.buckets;
+            encoded_bytes += stats.encoded_bytes;
+            raw_bytes += stats.raw_bytes;
+            if stats.deleted_rows > 0 {
+                changed = true;
+            }
         }
     }
+    metrics::set(&metrics::TS_COLLECTIONS, collections);
+    metrics::set(&metrics::TS_ROWS, rows);
+    metrics::set(&metrics::TS_DELETED_ROWS, deleted_rows);
+    metrics::set(&metrics::TS_BUCKETS, buckets);
+    metrics::set(&metrics::TS_ENCODED_BYTES, encoded_bytes);
+    metrics::set(&metrics::TS_RAW_BYTES, raw_bytes);
     Ok(changed)
 }
 
@@ -231,6 +262,7 @@ fn request_compaction(path: &Path) -> Result<(), String> {
         data_file_bytes(path).unwrap_or(0)
     );
     std::fs::write(&marker, payload).map_err(|e| e.to_string())?;
+    metrics::inc(&metrics::TS_COMPACTION_REQUESTS);
     tracing::warn!(
         path = %path.display(),
         "time-series deletions exceeded the compaction threshold; data.mdb will be compacted on next startup"
@@ -250,6 +282,11 @@ pub fn compact_if_requested(
     }
     let report = nonodb_core::store::compact_data_dir(path).map_err(|e| e.to_string())?;
     std::fs::remove_file(&marker).map_err(|e| e.to_string())?;
+    metrics::inc(&metrics::TS_COMPACTIONS);
+    metrics::add(
+        &metrics::TS_COMPACTED_BYTES,
+        report.before_bytes.saturating_sub(report.after_bytes),
+    );
     tracing::info!(
         path = %path.display(),
         before = report.before_bytes,
@@ -362,6 +399,15 @@ mod tests {
         let changed = sweep_timeseries_retention(&store, &tx).unwrap();
         assert!(changed);
         assert_eq!(c.count(&json!({})).unwrap(), 10);
+        assert_eq!(
+            metrics::TS_COLLECTIONS.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            metrics::TS_ROWS.load(std::sync::atomic::Ordering::Relaxed),
+            10
+        );
+        assert!(metrics::TS_RETENTION_RUNS.load(std::sync::atomic::Ordering::Relaxed) > 0);
         assert_eq!(c.count(&json!({"missing": true})).unwrap(), 0);
 
         drop(tx);
