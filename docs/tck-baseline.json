@@ -1,0 +1,12 @@
+{
+  "tck_commit": "677cbafabb8c3c5eed458fd3b1ec0daec8d67d23",
+  "selection": "Given any graph; no setup writes; no parameters; result-table scenarios",
+  "total": 293,
+  "counts": {
+    "pass": 270,
+    "fail": 0,
+    "unsupported": 23
+  },
+  "pass_rate": 0.9215,
+  "note": "Baseline selection; see scripts/cypher_tck.py. 0 wrong-result failures."
+}

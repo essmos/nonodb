@@ -76,6 +76,10 @@ seed = nodes.traverse(
     max_depth=2,
 )
 path = nodes.shortest_path("alice", "carol", weighted=True)
+cypher_rows = nodes.cypher(
+    "MATCH (n:Person) WHERE n.age > $age RETURN n.name AS name ORDER BY name",
+    params={"age": 20},
+)
 paths = nodes.all_shortest_paths("alice", "carol", limit_paths=10)
 matches = nodes.graph_match(
     "alice",

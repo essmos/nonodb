@@ -10,14 +10,14 @@ use std::time::{Duration, Instant};
 
 use cypher_rs_zk::ast::{
     BinOp, CaseAlternative, Clause, CollectionPredicateKind, Direction, Expr, FunctionArguments,
-    Literal, MapProjectionItem, Query, UnOp,
+    Literal, MapProjectionItem, Query, UnOp, YieldItem,
 };
 use cypher_rs_zk::{optimize, parse, plan as plan_query, Plan, ProjectExpr, SortKey};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
 use crate::error::{Error, Result};
-use crate::graph::{AdjEdge, GraphDirection, GraphView};
+use crate::graph::{AdjEdge, GraphAlgorithmKind, GraphAlgorithmOptions, GraphDirection, GraphView};
 
 const DEFAULT_CYPHER_ROWS: usize = 1_000;
 const DEFAULT_CYPHER_OPERATIONS: usize = 1_000_000;
@@ -365,6 +365,12 @@ impl<'a> Executor<'a> {
                 Ok(out)
             }
             Plan::PlannerHint { input, .. } => self.execute_input(input),
+            Plan::ProcedureCall {
+                input,
+                name,
+                arguments,
+                yields,
+            } => self.procedure(input, name, arguments, yields),
             Plan::PropertyMapFilter {
                 input,
                 variable,
@@ -680,6 +686,169 @@ impl<'a> Executor<'a> {
             }
         }
         Ok(())
+    }
+
+    fn procedure(
+        &mut self,
+        input: &Plan,
+        name: &str,
+        _arguments: &[Expr],
+        yields: &[YieldItem],
+    ) -> Result<Vec<Row>> {
+        let input_rows = self.execute_input(input)?;
+        if input_rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let lower = name.to_ascii_lowercase().replace(['_', '-'], "");
+        let short = if lower.contains("pagerank") {
+            "pagerank"
+        } else if lower.contains("degree") {
+            "degree"
+        } else if lower.contains("connectedcomponents") || lower.contains("wcc") {
+            "wcc"
+        } else if lower.contains("similarity") {
+            "similarity"
+        } else {
+            lower.rsplit('.').next().unwrap_or(lower.as_str())
+        };
+        let base = GraphAlgorithmOptions {
+            kind: GraphAlgorithmKind::Pagerank,
+            direction: GraphDirection::Out,
+            labels: Vec::new(),
+            edge_filter: None,
+            node_filter: None,
+            as_of: None,
+            limit: self.options.max_rows.min(10_000),
+            max_nodes: self.options.max_rows.max(1_000),
+            damping: 0.85,
+            iterations: 20,
+            tolerance: 1e-6,
+            projection: None,
+        };
+        let value = match short {
+            "pagerank" => crate::graph::graph_algorithm(
+                self.graph.view,
+                &GraphAlgorithmOptions {
+                    kind: GraphAlgorithmKind::Pagerank,
+                    ..base
+                },
+            )?,
+            "degree" => crate::graph::graph_algorithm(
+                self.graph.view,
+                &GraphAlgorithmOptions {
+                    kind: GraphAlgorithmKind::DegreeCentrality,
+                    direction: GraphDirection::Both,
+                    ..base
+                },
+            )?,
+            "wcc" => crate::graph::graph_algorithm(
+                self.graph.view,
+                &GraphAlgorithmOptions {
+                    kind: GraphAlgorithmKind::ConnectedComponents,
+                    direction: GraphDirection::Both,
+                    ..base
+                },
+            )?,
+            "similarity" => self.similarity_procedure()?,
+            _ => {
+                return Err(Error::Query(format!(
+                    "unsupported Cypher procedure `{name}`"
+                )))
+            }
+        };
+        let mut rows = Vec::new();
+        if short == "wcc" {
+            for component in value["components"].as_array().into_iter().flatten() {
+                let component_id = component["id"].clone();
+                let size = component["size"].clone();
+                for node in component["nodes"].as_array().into_iter().flatten() {
+                    let mut row = Row::new();
+                    set_yield(&mut row, yields, "nodeId", node.clone());
+                    set_yield(&mut row, yields, "componentId", component_id.clone());
+                    set_yield(&mut row, yields, "size", size.clone());
+                    rows.push(row);
+                }
+            }
+        } else if short == "similarity" {
+            for item in value["items"].as_array().into_iter().flatten() {
+                let mut row = Row::new();
+                set_yield(&mut row, yields, "node1", item["node1"].clone());
+                set_yield(&mut row, yields, "node2", item["node2"].clone());
+                set_yield(&mut row, yields, "similarity", item["similarity"].clone());
+                rows.push(row);
+            }
+        } else {
+            for item in value["items"].as_array().into_iter().flatten() {
+                let mut row = Row::new();
+                set_yield(&mut row, yields, "nodeId", item["id"].clone());
+                if short == "degree" {
+                    set_yield(&mut row, yields, "degree", item["total"].clone());
+                    set_yield(&mut row, yields, "in", item["in"].clone());
+                    set_yield(&mut row, yields, "out", item["out"].clone());
+                } else {
+                    set_yield(&mut row, yields, "score", item["score"].clone());
+                }
+                rows.push(row);
+            }
+        }
+        if rows.len() > self.options.max_rows {
+            rows.truncate(self.options.max_rows);
+            self.truncated = true;
+        }
+        Ok(rows)
+    }
+
+    fn similarity_procedure(&mut self) -> Result<Value> {
+        let ids = self.graph.node_ids()?;
+        let max = ids.len().min(1_000);
+        let mut neighbors: HashMap<String, HashSet<String>> = HashMap::new();
+        for id in ids.iter().take(max) {
+            let mut set = HashSet::new();
+            for edge in self.graph.view.neighbors(id, GraphDirection::Both, &[])? {
+                set.insert(edge.target);
+            }
+            neighbors.insert(id.clone(), set);
+        }
+        let ids: Vec<String> = neighbors.keys().cloned().collect();
+        let mut items = Vec::new();
+        for left in 0..ids.len() {
+            for right in left + 1..ids.len() {
+                self.tick()?;
+                let a = &neighbors[&ids[left]];
+                let b = &neighbors[&ids[right]];
+                if a.is_empty() && b.is_empty() {
+                    continue;
+                }
+                let intersection = a.intersection(b).count() as f64;
+                let union = a.union(b).count() as f64;
+                let similarity = if union == 0.0 {
+                    0.0
+                } else {
+                    intersection / union
+                };
+                if similarity > 0.0 {
+                    items.push(json!({
+                        "node1": ids[left],
+                        "node2": ids[right],
+                        "similarity": similarity,
+                    }));
+                }
+                if items.len() >= self.options.max_rows {
+                    self.truncated = true;
+                    break;
+                }
+            }
+            if items.len() >= self.options.max_rows {
+                break;
+            }
+        }
+        items.sort_by(|a, b| {
+            b["similarity"]
+                .as_f64()
+                .partial_cmp(&a["similarity"].as_f64())
+                .unwrap_or(Ordering::Equal)
+        });
+        Ok(json!({"items": items}))
     }
 
     fn project(
@@ -1013,8 +1182,16 @@ impl<'a> Executor<'a> {
                     Some(end) => self.eval(end, row, group)?,
                     None => json!(items.len()),
                 };
-                let start = start.as_i64().unwrap_or(0).max(0) as usize;
-                let end = end.as_i64().unwrap_or(items.len() as i64).max(0) as usize;
+                let len = items.len() as i64;
+                let normalize = |value: i64| -> usize {
+                    if value < 0 {
+                        (len + value).max(0) as usize
+                    } else {
+                        value as usize
+                    }
+                };
+                let start = normalize(start.as_i64().unwrap_or(0)).min(items.len());
+                let end = normalize(end.as_i64().unwrap_or(len)).min(items.len());
                 Ok(Value::Array(
                     items
                         .into_iter()
@@ -1123,6 +1300,7 @@ impl<'a> Executor<'a> {
         arguments: &FunctionArguments,
         group: &[Row],
     ) -> Result<Value> {
+        let wildcard = matches!(arguments, FunctionArguments::Wildcard);
         let mut values: Vec<Value> = Vec::new();
         match arguments {
             FunctionArguments::Wildcard => {
@@ -1144,6 +1322,9 @@ impl<'a> Executor<'a> {
                 }
             }
         }
+        if !wildcard {
+            values.retain(|value| !value.is_null());
+        }
         if distinct {
             let mut seen = HashSet::new();
             values.retain(|value| seen.insert(serde_json::to_string(value).unwrap_or_default()));
@@ -1160,15 +1341,22 @@ impl<'a> Executor<'a> {
                     Ok(json!(numbers.iter().sum::<f64>() / numbers.len() as f64))
                 }
             }
-            "min" => Ok(values.into_iter().min_by(cmp_json).unwrap_or(Value::Null)),
-            "max" => Ok(values.into_iter().max_by(cmp_json).unwrap_or(Value::Null)),
+            "min" => {
+                ensure_single_aggregate_type(&values)?;
+                Ok(values.into_iter().min_by(cmp_json).unwrap_or(Value::Null))
+            }
+            "max" => {
+                ensure_single_aggregate_type(&values)?;
+                Ok(values.into_iter().max_by(cmp_json).unwrap_or(Value::Null))
+            }
             _ => Err(Error::Query(format!("unsupported aggregate `{name}`"))),
         }
     }
 
     fn call_function(&mut self, name: &str, args: Vec<Value>) -> Result<Value> {
         let arg = |index: usize| args.get(index).cloned().unwrap_or(Value::Null);
-        match name {
+        let name = name.to_ascii_lowercase();
+        match name.as_str() {
             "coalesce" => Ok(args
                 .into_iter()
                 .find(|value| !value.is_null())
@@ -1202,18 +1390,24 @@ impl<'a> Executor<'a> {
                     .map(|items| items.iter().skip(1).cloned().collect())
                     .unwrap_or_default(),
             )),
-            "keys" => Ok(Value::Array(
-                arg(0)
-                    .as_object()
-                    .map(|map| map.keys().cloned().map(Value::String).collect())
-                    .unwrap_or_default(),
-            )),
+            "keys" => Ok(match arg(0) {
+                Value::Object(map) => {
+                    Value::Array(map.keys().cloned().map(Value::String).collect())
+                }
+                _ => Value::Null,
+            }),
             "properties" => Ok(arg(0)),
-            "nodes" => Ok(arg(0).get("nodes").cloned().unwrap_or_else(|| json!([]))),
-            "relationships" | "rels" => Ok(arg(0)
-                .get("relationships")
-                .cloned()
-                .unwrap_or_else(|| json!([]))),
+            "nodes" => Ok(match arg(0) {
+                Value::Null => Value::Null,
+                value => value.get("nodes").cloned().unwrap_or_else(|| json!([])),
+            }),
+            "relationships" | "rels" => Ok(match arg(0) {
+                Value::Null => Value::Null,
+                value => value
+                    .get("relationships")
+                    .cloned()
+                    .unwrap_or_else(|| json!([])),
+            }),
             "labels" => Ok(arg(0)
                 .get("_labels")
                 .cloned()
@@ -1225,7 +1419,7 @@ impl<'a> Executor<'a> {
                     .to_string(),
             )),
             "id" => Ok(arg(0).get("_id").cloned().unwrap_or(Value::Null)),
-            "startNode" => {
+            "startnode" => {
                 let id = arg(0)
                     .get("_start")
                     .and_then(Value::as_str)
@@ -1235,7 +1429,7 @@ impl<'a> Executor<'a> {
                     None => Ok(Value::Null),
                 }
             }
-            "endNode" => {
+            "endnode" => {
                 let id = arg(0)
                     .get("_end")
                     .and_then(Value::as_str)
@@ -1245,26 +1439,42 @@ impl<'a> Executor<'a> {
                     None => Ok(Value::Null),
                 }
             }
-            "toString" => Ok(Value::String(match arg(0) {
-                Value::String(value) => value,
-                Value::Null => return Ok(Value::Null),
-                value => value.to_string(),
-            })),
-            "toInteger" => Ok(match arg(0) {
+            "tostring" => Ok(match arg(0) {
+                Value::String(value) => Value::String(value),
+                Value::Null => Value::Null,
+                value if value.get("__type").is_some() => Value::String(format_temporal(&value)),
+                value => Value::String(value.to_string()),
+            }),
+            "tointeger" => Ok(match arg(0) {
                 Value::String(value) => value
+                    .trim()
                     .parse::<i64>()
                     .map(|value| json!(value))
+                    .or_else(|_| {
+                        value
+                            .trim()
+                            .parse::<f64>()
+                            .map(|value| json!(value.trunc() as i64))
+                    })
                     .unwrap_or(Value::Null),
                 Value::Number(value) => value
                     .as_i64()
+                    .or_else(|| value.as_f64().map(|value| value.trunc() as i64))
                     .map(|value| json!(value))
                     .unwrap_or(Value::Null),
                 _ => Value::Null,
             }),
-            "toFloat" => Ok(number(&arg(0))
-                .map(|value| json!(value))
-                .unwrap_or(Value::Null)),
-            "toBoolean" => Ok(match arg(0) {
+            "tofloat" => Ok(match arg(0) {
+                Value::String(value) => value
+                    .trim()
+                    .parse::<f64>()
+                    .map(|value| json!(value))
+                    .unwrap_or(Value::Null),
+                value => number(&value)
+                    .map(|value| json!(value))
+                    .unwrap_or(Value::Null),
+            }),
+            "toboolean" => Ok(match arg(0) {
                 Value::Bool(value) => json!(value),
                 Value::String(value) if value.eq_ignore_ascii_case("true") => json!(true),
                 Value::String(value) if value.eq_ignore_ascii_case("false") => json!(false),
@@ -1321,8 +1531,8 @@ impl<'a> Executor<'a> {
                 .as_str()
                 .unwrap_or("")
                 .replace(arg(1).as_str().unwrap_or(""), arg(2).as_str().unwrap_or("")))),
-            "toLower" => Ok(json!(arg(0).as_str().unwrap_or("").to_lowercase())),
-            "toUpper" => Ok(json!(arg(0).as_str().unwrap_or("").to_uppercase())),
+            "tolower" => Ok(json!(arg(0).as_str().unwrap_or("").to_lowercase())),
+            "toupper" => Ok(json!(arg(0).as_str().unwrap_or("").to_uppercase())),
             "trim" => Ok(json!(arg(0).as_str().unwrap_or("").trim())),
             "ltrim" => Ok(json!(arg(0).as_str().unwrap_or("").trim_start())),
             "rtrim" => Ok(json!(arg(0).as_str().unwrap_or("").trim_end())),
@@ -1399,6 +1609,10 @@ impl<'a> Executor<'a> {
                 .unwrap_or(Value::Null)),
             "pi" => Ok(json!(std::f64::consts::PI)),
             "e" => Ok(json!(std::f64::consts::E)),
+            "date" | "localtime" | "time" | "localdatetime" | "datetime" => {
+                temporal_value(&name, &args)
+            }
+            "duration.inseconds" => duration_seconds(&args),
             _ => Err(Error::Query(format!(
                 "unsupported Cypher function `{name}`"
             ))),
@@ -1420,6 +1634,17 @@ fn join_rows(left: &Row, right: &Row) -> Option<Row> {
     let mut out = left.clone();
     out.merge(right);
     Some(out)
+}
+
+fn set_yield(row: &mut Row, yields: &[YieldItem], field: &str, value: Value) {
+    if let Some(item) = yields
+        .iter()
+        .find(|item| item.field.eq_ignore_ascii_case(field))
+    {
+        row.set(item.binding().to_string(), value);
+    } else if yields.is_empty() {
+        row.set(field, value);
+    }
 }
 
 fn source_id(row: &Row, src: Option<&str>) -> Option<String> {
@@ -1552,6 +1777,30 @@ fn contains_aggregate(expr: &Expr) -> bool {
     }
 }
 
+fn ensure_single_aggregate_type(values: &[Value]) -> Result<()> {
+    let mut kind: Option<u8> = None;
+    for value in values {
+        let current = match value {
+            Value::Number(_) => 0,
+            Value::String(_) => 1,
+            Value::Bool(_) => 2,
+            Value::Array(_) => 3,
+            Value::Object(_) => 4,
+            Value::Null => continue,
+        };
+        if let Some(existing) = kind {
+            if existing != current {
+                return Err(Error::Query(
+                    "min/max over mixed value types is not supported".into(),
+                ));
+            }
+        } else {
+            kind = Some(current);
+        }
+    }
+    Ok(())
+}
+
 fn is_aggregate(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
@@ -1560,11 +1809,142 @@ fn is_aggregate(name: &str) -> bool {
 }
 
 fn expr_name(expr: &Expr) -> String {
+    expr_name_prec(expr, 0)
+}
+
+fn expr_prec(expr: &Expr) -> u8 {
     match expr {
+        Expr::Binary { op, .. } => match op {
+            BinOp::Pow => 70,
+            BinOp::Mul | BinOp::Div | BinOp::Mod => 60,
+            BinOp::Add | BinOp::Sub => 50,
+            BinOp::In
+            | BinOp::StartsWith
+            | BinOp::EndsWith
+            | BinOp::Contains
+            | BinOp::RegexMatch => 40,
+            BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Lte | BinOp::Gt | BinOp::Gte => 40,
+            BinOp::And => 30,
+            BinOp::Xor => 25,
+            BinOp::Or => 20,
+        },
+        Expr::Unary { .. } => 75,
+        Expr::Property { .. } | Expr::Subscript { .. } | Expr::Slice { .. } => 90,
+        _ => 100,
+    }
+}
+
+fn expr_name_prec(expr: &Expr, parent: u8) -> String {
+    let text = match expr {
         Expr::Variable(name) => name.clone(),
-        Expr::Property { base, key } => format!("{}.{}", expr_name(base), key),
-        Expr::FunctionCall { name, .. } => name.clone(),
+        Expr::Param(name) => format!("${name}"),
+        Expr::Property { base, key } => {
+            let wrap = matches!(
+                base.as_ref(),
+                Expr::Subscript { .. } | Expr::Slice { .. } | Expr::Binary { .. }
+            );
+            let base = expr_name_prec(base, 90);
+            if wrap {
+                format!("({base}).{key}")
+            } else {
+                format!("{base}.{key}")
+            }
+        }
+        Expr::Literal(Literal::Int(value)) => value.to_string(),
+        Expr::Literal(Literal::Float(value)) => value.to_string(),
+        Expr::Literal(Literal::String(value)) => format!("'{value}'"),
+        Expr::Literal(Literal::Bool(value)) => value.to_string(),
+        Expr::Literal(Literal::Null) => "null".into(),
+        Expr::List(items) => format!(
+            "[{}]",
+            items.iter().map(expr_name).collect::<Vec<_>>().join(", ")
+        ),
+        Expr::Map(items) => format!(
+            "{{{}}}",
+            items
+                .iter()
+                .map(|(key, value)| format!("{key}: {}", expr_name(value)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Expr::FunctionCall {
+            name,
+            distinct,
+            arguments,
+        } => {
+            let args = match arguments {
+                FunctionArguments::Wildcard => "*".to_string(),
+                FunctionArguments::Expressions(items) => {
+                    items.iter().map(expr_name).collect::<Vec<_>>().join(", ")
+                }
+            };
+            if *distinct {
+                format!("{name}(DISTINCT {args})")
+            } else {
+                format!("{name}({args})")
+            }
+        }
+        Expr::Binary { op, lhs, rhs } => {
+            let prec = expr_prec(expr);
+            let left = expr_name_prec(lhs, prec);
+            let right = expr_name_prec(rhs, prec.saturating_add(1));
+            format!("{left} {} {right}", bin_op_name(*op))
+        }
+        Expr::Unary { op, operand } => match op {
+            UnOp::Neg => format!("-{}", expr_name_prec(operand, 75)),
+            UnOp::Pos => format!("+{}", expr_name_prec(operand, 75)),
+            UnOp::Not => format!("NOT {}", expr_name_prec(operand, 75)),
+            UnOp::IsNull => format!("{} IS NULL", expr_name_prec(operand, 40)),
+            UnOp::IsNotNull => format!("{} IS NOT NULL", expr_name_prec(operand, 40)),
+        },
+        Expr::ComparisonChain { arguments, .. } => arguments
+            .iter()
+            .map(expr_name)
+            .collect::<Vec<_>>()
+            .join(" "),
+        Expr::Subscript { base, index } => {
+            format!("{}[{}]", expr_name_prec(base, 90), expr_name(index))
+        }
+        Expr::Slice { base, start, end } => format!(
+            "{}[{}..{}]",
+            expr_name_prec(base, 90),
+            start
+                .as_ref()
+                .map(|expr| expr_name(expr))
+                .unwrap_or_default(),
+            end.as_ref().map(|expr| expr_name(expr)).unwrap_or_default()
+        ),
         _ => format!("{expr:?}"),
+    };
+    if expr_prec(expr) < parent {
+        format!("({text})")
+    } else {
+        text
+    }
+}
+
+fn bin_op_name(op: BinOp) -> &'static str {
+    match op {
+        BinOp::Eq => "=",
+        BinOp::Neq => "<>",
+        BinOp::Lt => "<",
+        BinOp::Lte => "<=",
+        BinOp::Gt => ">",
+        BinOp::Gte => ">=",
+        BinOp::And => "AND",
+        BinOp::Xor => "XOR",
+        BinOp::Or => "OR",
+        BinOp::Add => "+",
+        BinOp::Sub => "-",
+        BinOp::Mul => "*",
+        BinOp::Div => "/",
+        BinOp::Mod => "%",
+        BinOp::Pow => "^",
+        BinOp::RegexMatch => "=~",
+        BinOp::In => "IN",
+        BinOp::StartsWith => "STARTS WITH",
+        BinOp::EndsWith => "ENDS WITH",
+        BinOp::Contains => "CONTAINS",
     }
 }
 
@@ -1624,6 +2004,67 @@ fn truthy(value: &Value) -> bool {
     value.as_bool().unwrap_or(false)
 }
 
+fn eq3(a: &Value, b: &Value) -> Value {
+    if a.is_null() || b.is_null() {
+        return Value::Null;
+    }
+    if let (Some(left), Some(right)) = (
+        a.get("__type").and_then(Value::as_str),
+        b.get("__type").and_then(Value::as_str),
+    ) {
+        if left == right
+            && matches!(
+                left,
+                "date" | "localtime" | "time" | "localdatetime" | "datetime"
+            )
+        {
+            return json!(format_temporal(a) == format_temporal(b));
+        }
+    }
+    match (a, b) {
+        (Value::Array(a), Value::Array(b)) => {
+            if a.len() != b.len() {
+                return json!(false);
+            }
+            let mut saw_null = false;
+            for (left, right) in a.iter().zip(b.iter()) {
+                match eq3(left, right) {
+                    Value::Bool(true) => {}
+                    Value::Bool(false) => return json!(false),
+                    _ => saw_null = true,
+                }
+            }
+            if saw_null {
+                Value::Null
+            } else {
+                json!(true)
+            }
+        }
+        (Value::Object(a), Value::Object(b)) => {
+            if a.len() != b.len() {
+                return json!(false);
+            }
+            let mut saw_null = false;
+            for (key, left) in a {
+                match b.get(key) {
+                    None => return json!(false),
+                    Some(right) => match eq3(left, right) {
+                        Value::Bool(true) => {}
+                        Value::Bool(false) => return json!(false),
+                        _ => saw_null = true,
+                    },
+                }
+            }
+            if saw_null {
+                Value::Null
+            } else {
+                json!(true)
+            }
+        }
+        _ => json!(json_eq(a, b)),
+    }
+}
+
 fn json_eq(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Number(a), Value::Number(b)) => a.as_f64() == b.as_f64(),
@@ -1632,16 +2073,37 @@ fn json_eq(a: &Value, b: &Value) -> bool {
 }
 
 fn cmp_json(a: &Value, b: &Value) -> Ordering {
+    fn rank(value: &Value) -> u8 {
+        match value {
+            Value::Number(_) => 0,
+            Value::String(_) => 1,
+            Value::Bool(_) => 2,
+            Value::Array(_) => 3,
+            Value::Object(_) => 4,
+            Value::Null => 5,
+        }
+    }
+    let (a_rank, b_rank) = (rank(a), rank(b));
+    if a_rank != b_rank {
+        return a_rank.cmp(&b_rank);
+    }
     match (a, b) {
         (Value::Null, Value::Null) => Ordering::Equal,
-        (Value::Null, _) => Ordering::Greater,
-        (_, Value::Null) => Ordering::Less,
         (Value::Number(a), Value::Number(b)) => a
             .as_f64()
             .partial_cmp(&b.as_f64())
             .unwrap_or(Ordering::Equal),
         (Value::String(a), Value::String(b)) => a.cmp(b),
         (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
+        (Value::Array(a), Value::Array(b)) => {
+            for (left, right) in a.iter().zip(b.iter()) {
+                let order = cmp_json(left, right);
+                if order != Ordering::Equal {
+                    return order;
+                }
+            }
+            a.len().cmp(&b.len())
+        }
         _ => a.to_string().cmp(&b.to_string()),
     }
 }
@@ -1668,18 +2130,20 @@ fn eval_binary(op: BinOp, lhs: Value, rhs: Value) -> Result<Value> {
             _ => unreachable!(),
         });
     }
-    if matches!(
-        op,
-        BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Lte | BinOp::Gt | BinOp::Gte
-    ) {
+    if matches!(op, BinOp::Eq | BinOp::Neq) {
+        let equal = eq3(&lhs, &rhs);
+        if matches!(op, BinOp::Neq) {
+            return Ok(match equal {
+                Value::Bool(value) => json!(!value),
+                Value::Null => Value::Null,
+                other => other,
+            });
+        }
+        return Ok(equal);
+    }
+    if matches!(op, BinOp::Lt | BinOp::Lte | BinOp::Gt | BinOp::Gte) {
         if lhs.is_null() || rhs.is_null() {
             return Ok(Value::Null);
-        }
-        if matches!(op, BinOp::Eq) {
-            return Ok(json!(json_eq(&lhs, &rhs)));
-        }
-        if matches!(op, BinOp::Neq) {
-            return Ok(json!(!json_eq(&lhs, &rhs)));
         }
         let order = cmp_json(&lhs, &rhs);
         return Ok(json!(match op {
@@ -1691,10 +2155,18 @@ fn eval_binary(op: BinOp, lhs: Value, rhs: Value) -> Result<Value> {
         }));
     }
     if matches!(op, BinOp::In) {
-        return Ok(match rhs {
-            Value::Array(items) => json!(items.iter().any(|item| json_eq(item, &lhs))),
-            _ => Value::Null,
-        });
+        let Value::Array(items) = rhs else {
+            return Ok(Value::Null);
+        };
+        let mut saw_null = false;
+        for item in items {
+            match eq3(&lhs, &item) {
+                Value::Bool(true) => return Ok(json!(true)),
+                Value::Null => saw_null = true,
+                _ => {}
+            }
+        }
+        return Ok(if saw_null { Value::Null } else { json!(false) });
     }
     if matches!(
         op,
@@ -1718,8 +2190,19 @@ fn eval_binary(op: BinOp, lhs: Value, rhs: Value) -> Result<Value> {
         if let (Some(lhs), Some(rhs)) = (lhs.as_str(), rhs.as_str()) {
             return Ok(json!(format!("{lhs}{rhs}")));
         }
-        if let (Some(lhs), Some(rhs)) = (lhs.as_array(), rhs.as_array()) {
+        if let Some(lhs) = lhs.as_array() {
+            if let Some(rhs) = rhs.as_array() {
+                let mut out = lhs.clone();
+                out.extend(rhs.clone());
+                return Ok(Value::Array(out));
+            }
             let mut out = lhs.clone();
+            out.push(rhs);
+            return Ok(Value::Array(out));
+        }
+        if let Some(rhs) = rhs.as_array() {
+            let mut out = Vec::with_capacity(rhs.len() + 1);
+            out.push(lhs);
             out.extend(rhs.clone());
             return Ok(Value::Array(out));
         }
@@ -1748,18 +2231,302 @@ fn eval_unary(op: UnOp, value: Value) -> Result<Value> {
             None => Value::Null,
         },
         UnOp::Pos => value,
-        UnOp::Neg => number(&value)
-            .map(|value| json!(-value))
-            .unwrap_or(Value::Null),
+        UnOp::Neg => match &value {
+            Value::Number(number) if number.as_i64().is_some() => {
+                json!(-number.as_i64().unwrap_or(0))
+            }
+            _ => number(&value)
+                .map(|value| json!(-value))
+                .unwrap_or(Value::Null),
+        },
         UnOp::IsNull => json!(value.is_null()),
         UnOp::IsNotNull => json!(!value.is_null()),
     })
 }
 
+fn temporal_int(value: Option<&Value>, default: i64) -> i64 {
+    value.and_then(Value::as_i64).unwrap_or(default)
+}
+
+fn temporal_value(kind: &str, args: &[Value]) -> Result<Value> {
+    let input = args.first().cloned().unwrap_or(Value::Null);
+    let mut out = Map::new();
+    out.insert("__type".into(), Value::String(kind.to_string()));
+    if let Some(map) = input.as_object() {
+        for (key, value) in map {
+            out.insert(key.clone(), value.clone());
+        }
+    } else if let Some(text) = input.as_str() {
+        parse_temporal_text(kind, text, &mut out)?;
+    } else {
+        return Ok(Value::Null);
+    }
+    if kind == "date" {
+        out.entry("month").or_insert(json!(1));
+        out.entry("day").or_insert(json!(1));
+    } else {
+        for (key, value) in [("hour", 0), ("minute", 0), ("second", 0), ("nanosecond", 0)] {
+            out.entry(key).or_insert(json!(value));
+        }
+    }
+    if kind == "datetime" {
+        if let Some(zone) = out
+            .get("timezone")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        {
+            if !zone.starts_with('+') && !zone.starts_with('-') {
+                if let Ok(tz) = zone.parse::<chrono_tz::Tz>() {
+                    if let Some(offset) = named_offset(&out, tz) {
+                        out.insert("offset".into(), Value::String(offset));
+                    }
+                }
+            }
+        }
+    }
+    Ok(Value::Object(out))
+}
+
+fn parse_temporal_text(kind: &str, text: &str, out: &mut Map<String, Value>) -> Result<()> {
+    let (date_part, time_part) = if let Some((date, time)) = text.split_once('T') {
+        (Some(date), Some(time))
+    } else if kind == "date" {
+        (Some(text), None)
+    } else {
+        (None, Some(text))
+    };
+    if let Some(date) = date_part {
+        let negative = date.starts_with('-');
+        let mut parts = date.trim_start_matches('-').split('-');
+        let year: i64 = parts
+            .next()
+            .unwrap_or("1")
+            .parse()
+            .map_err(|_| Error::Query("invalid date".into()))?;
+        let year = if negative { -year } else { year };
+        let month: i64 = parts
+            .next()
+            .unwrap_or("1")
+            .parse()
+            .map_err(|_| Error::Query("invalid date".into()))?;
+        let day: i64 = parts
+            .next()
+            .unwrap_or("1")
+            .parse()
+            .map_err(|_| Error::Query("invalid date".into()))?;
+        out.insert("year".into(), json!(year));
+        out.insert("month".into(), json!(month));
+        out.insert("day".into(), json!(day));
+    }
+    if let Some(time) = time_part {
+        let (clock, offset) = split_offset(time);
+        let mut parts = clock.split(':');
+        let hour: i64 = parts.next().unwrap_or("0").parse().unwrap_or(0);
+        let minute: i64 = parts.next().unwrap_or("0").parse().unwrap_or(0);
+        let seconds = parts.next().unwrap_or("0");
+        let (second, nanosecond) = if let Some((sec, nanos)) = seconds.split_once('.') {
+            let sec = sec.parse().unwrap_or(0);
+            let mut nanos = nanos.to_string();
+            while nanos.len() < 9 {
+                nanos.push('0');
+            }
+            (sec, nanos[..9].parse().unwrap_or(0))
+        } else {
+            (seconds.parse().unwrap_or(0), 0)
+        };
+        out.insert("hour".into(), json!(hour));
+        out.insert("minute".into(), json!(minute));
+        out.insert("second".into(), json!(second));
+        out.insert("nanosecond".into(), json!(nanosecond));
+        if let Some((offset, zone)) = offset {
+            if !offset.is_empty() {
+                out.insert("offset".into(), Value::String(offset.clone()));
+                out.insert("timezone".into(), Value::String(offset));
+            }
+            if let Some(zone) = zone {
+                out.insert("timezone".into(), Value::String(zone));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn split_offset(text: &str) -> (&str, Option<(String, Option<String>)>) {
+    if let Some((clock, zone)) = text.split_once('[') {
+        let zone = zone.trim_end_matches(']');
+        return (clock, Some((String::new(), Some(zone.to_string()))));
+    }
+    for index in (1..text.len()).rev() {
+        let ch = text.as_bytes()[index] as char;
+        if ch == '+' || ch == '-' {
+            let clock = &text[..index];
+            let mut offset = text[index..].to_string();
+            if offset.len() == 5 && !offset.contains(':') {
+                offset.insert(3, ':');
+            }
+            return (clock, Some((offset, None)));
+        }
+    }
+    (text, None)
+}
+
+fn named_offset(values: &Map<String, Value>, tz: chrono_tz::Tz) -> Option<String> {
+    use chrono::TimeZone;
+    let year = temporal_int(values.get("year"), 1970) as i32;
+    let month = temporal_int(values.get("month"), 1) as u32;
+    let day = temporal_int(values.get("day"), 1) as u32;
+    let hour = temporal_int(values.get("hour"), 0) as u32;
+    let minute = temporal_int(values.get("minute"), 0) as u32;
+    let second = temporal_int(values.get("second"), 0) as u32;
+    let date = chrono::NaiveDate::from_ymd_opt(year, month, day)?;
+    let time = chrono::NaiveTime::from_hms_opt(hour, minute, second)?;
+    let local = date.and_time(time);
+    tz.from_local_datetime(&local)
+        .single()
+        .map(|value| value.format("%:z").to_string())
+}
+
+fn format_temporal(value: &Value) -> String {
+    let kind = value.get("__type").and_then(Value::as_str).unwrap_or("");
+    let year = temporal_int(value.get("year"), 1970);
+    let month = temporal_int(value.get("month"), 1);
+    let day = temporal_int(value.get("day"), 1);
+    let hour = temporal_int(value.get("hour"), 0);
+    let minute = temporal_int(value.get("minute"), 0);
+    let second = temporal_int(value.get("second"), 0);
+    let nanosecond = temporal_int(value.get("nanosecond"), 0);
+    let fraction = if nanosecond == 0 {
+        String::new()
+    } else {
+        format!(".{nanosecond:09}")
+    };
+    let clock = format!("{hour:02}:{minute:02}:{second:02}{fraction}");
+    let date = format!("{year:04}-{month:02}-{day:02}");
+    let offset = value
+        .get("offset")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("timezone").and_then(Value::as_str))
+        .unwrap_or("");
+    let zone = value
+        .get("timezone")
+        .and_then(Value::as_str)
+        .filter(|zone| !zone.starts_with('+') && !zone.starts_with('-'))
+        .map(|zone| format!("[{zone}]"))
+        .unwrap_or_default();
+    match kind {
+        "date" => date,
+        "localtime" => clock,
+        "time" => format!("{clock}{offset}"),
+        "localdatetime" => format!("{date}T{clock}"),
+        "datetime" => format!("{date}T{clock}{offset}{zone}"),
+        _ => value.to_string(),
+    }
+}
+
+fn duration_seconds(args: &[Value]) -> Result<Value> {
+    let (Some(left), Some(right)) = (args.first(), args.get(1)) else {
+        return Ok(Value::Null);
+    };
+    for value in [left, right] {
+        let year = temporal_int(value.get("year"), 0);
+        if year.unsigned_abs() > 10_000 {
+            return Err(Error::Query(
+                "temporal durations outside the supported year range are not supported".into(),
+            ));
+        }
+    }
+    let parse = |value: &Value| -> Option<chrono::NaiveDateTime> {
+        let text = format_temporal(value);
+        chrono::NaiveDateTime::parse_from_str(&text, "%Y-%m-%dT%H:%M:%S%.f").ok()
+    };
+    let (Some(left), Some(right)) = (parse(left), parse(right)) else {
+        return Ok(Value::Null);
+    };
+    let diff = right.signed_duration_since(left);
+    let negative = diff.num_nanoseconds().is_some_and(|value| value < 0);
+    let abs = diff.abs();
+    let seconds = abs.num_seconds();
+    let nanos = abs.subsec_nanos();
+    let sign = if negative { "-" } else { "" };
+    let text = if nanos == 0 {
+        format!("PT{sign}{seconds}S")
+    } else {
+        let mut fraction = format!("{nanos:09}");
+        while fraction.ends_with('0') {
+            fraction.pop();
+        }
+        format!("PT{sign}{seconds}.{fraction}S")
+    };
+    Ok(Value::String(text))
+}
+
+fn normalize_literals(query: &str) -> String {
+    let mut out = String::with_capacity(query.len());
+    let mut chars = query.chars().peekable();
+    let mut quote: Option<char> = None;
+    while let Some(ch) = chars.next() {
+        if let Some(active) = quote {
+            out.push(ch);
+            if ch == '\\' {
+                if let Some(next) = chars.next() {
+                    out.push(next);
+                }
+            } else if ch == active {
+                quote = None;
+            }
+            continue;
+        }
+        if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+            out.push(ch);
+            continue;
+        }
+        if ch == '0' && matches!(chars.peek(), Some('o' | 'O' | 'x' | 'X')) {
+            let radix = chars.peek().copied().unwrap_or('o');
+            chars.next();
+            let mut digits = String::new();
+            while let Some(next) = chars.peek().copied() {
+                let valid = if radix == 'o' || radix == 'O' {
+                    next.is_ascii_digit() && next < '8'
+                } else {
+                    next.is_ascii_hexdigit()
+                };
+                if !valid {
+                    break;
+                }
+                digits.push(next);
+                chars.next();
+            }
+            if !digits.is_empty() {
+                let parsed =
+                    u64::from_str_radix(&digits, if radix == 'o' || radix == 'O' { 8 } else { 16 });
+                if let Ok(value) = parsed {
+                    if value <= i64::MAX as u64 {
+                        out.push_str(&value.to_string());
+                        continue;
+                    }
+                    if value == i64::MIN.unsigned_abs() && out.ends_with('-') {
+                        out.pop();
+                        out.push_str("(-9223372036854775807 - 1)");
+                        continue;
+                    }
+                }
+            }
+            out.push('0');
+            out.push(radix);
+            out.push_str(&digits);
+            continue;
+        }
+        out.push(ch);
+    }
+    out.replace("-9223372036854775808", "(-9223372036854775807 - 1)")
+}
+
 pub fn execute(view: &dyn GraphView, options: &CypherOptions) -> Result<Value> {
     options.validate()?;
-    let query: Query = parse(&options.query)
-        .map_err(|error| Error::Query(format!("cypher parse error: {error}")))?;
+    let normalized = normalize_literals(&options.query);
+    let query: Query =
+        parse(&normalized).map_err(|error| Error::Query(format!("cypher parse error: {error}")))?;
     if query.statement_count() != 1 {
         return Err(Error::Query(
             "cypher supports exactly one read-only statement".into(),

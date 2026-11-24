@@ -110,6 +110,17 @@ jobs:
       - name: Build debug binaries for integration tests
         run: cargo build --locked --bins
 
+      - name: Run read-only openCypher TCK baseline
+        run: |
+          scripts/fetch-opencypher-tck.sh /tmp/opencypher-tck
+          python3 scripts/cypher_tck.py             --tck-dir /tmp/opencypher-tck             --daemon target/debug/nonodb-daemon             --output tck-report.json
+          python3 - <<'PY'
+          import json
+          report = json.load(open("tck-report.json"))
+          assert report["counts"]["fail"] == 0, report["counts"]
+          assert report["pass_rate"] >= 0.90, report["pass_rate"]
+          PY
+
       - name: Test MongoDB wire limits
         run: python3 scripts/mongo_wire_limits_test.py
 

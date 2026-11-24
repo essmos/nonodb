@@ -178,6 +178,7 @@ client timeout with `NONODB_TIMEOUT` or the `timeout=` argument.
 | [`neighbors`](#graph) | One-hop filtered neighbors |
 | [`hybrid_search`](#graph) | Vector + graph rerank |
 | [`shortest_path`](#graph) | BFS or weighted shortest path |
+| [`cypher`](#read-only-cypher) | Read-only Cypher query execution |
 | [`all_shortest_paths`](#graph) | Every shortest path with bounded output |
 | [`graph_match`](#graph) | Linear variable-length pattern matching |
 | [`graph_algorithm`](#graph) | PageRank, degree centrality, connected components |
@@ -2377,6 +2378,17 @@ Graph configuration requires admin scope on both collections; graph reads
 require a read scope on the node **and** edge collections. Vault collections are
 rejected as node or edge collections. The MongoDB
 wire listener does not expose graph operations.
+
+## Read-only Cypher
+
+```json
+{"op":"cypher","coll":"nodes",
+ "query":"MATCH (n:Person) WHERE n.age > $age RETURN n.name AS name",
+ "params":{"age":20}}
+```
+
+Returns `columns`, `rows`, `row_count`, and `truncated`. Write clauses and
+arbitrary procedures are rejected. See [Read-only Cypher](cypher.md).
 
 ## vector_search
 

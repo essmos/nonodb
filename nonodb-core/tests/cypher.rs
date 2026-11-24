@@ -119,3 +119,38 @@ fn cypher_rejects_write_queries() {
     let error = collection.graph_cypher(options).unwrap_err().to_string();
     assert!(error.contains("read-only"));
 }
+
+#[test]
+fn cypher_gds_procedures_are_bounded_and_callable() {
+    let (_dir, store) = graph_store();
+    let out = run(
+        &store,
+        "CALL gds.pagerank.stream() YIELD nodeId, score \
+         RETURN nodeId, score ORDER BY nodeId",
+    );
+    assert_eq!(out["row_count"], 4);
+    assert!(out["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|row| row["score"].as_f64().is_some()));
+
+    let out = run(
+        &store,
+        "CALL gds.degree.stream() YIELD nodeId, degree \
+         RETURN nodeId, degree ORDER BY nodeId",
+    );
+    assert_eq!(out["row_count"], 4);
+    assert!(out["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|row| row["nodeId"] == "carol" && row["degree"] == 2));
+
+    let out = run(
+        &store,
+        "CALL gds.connectedComponents.stream() YIELD nodeId, componentId \
+         RETURN nodeId, componentId ORDER BY nodeId",
+    );
+    assert_eq!(out["row_count"], 4);
+}

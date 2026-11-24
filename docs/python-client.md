@@ -850,6 +850,10 @@ seeded = nodes.traverse(
 # BFS by hops, or Dijkstra with the configured weight field.
 path = nodes.shortest_path("alice", "carol")
 weighted = nodes.shortest_path("alice", "carol", weighted=True)
+rows = nodes.cypher(
+    "MATCH (n:Person) WHERE n.age > $age RETURN n.name AS name ORDER BY name",
+    params={"age": 20},
+)
 paths = nodes.all_shortest_paths("alice", "carol", limit_paths=10)
 matches = nodes.graph_match(
     "alice",
