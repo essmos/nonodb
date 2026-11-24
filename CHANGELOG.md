@@ -36,6 +36,10 @@ Full release notes: https://github.com/essmos/nonodb/releases
   on time-series collections. Selects reuse the bucket read path and planner;
   writes reuse the time-series update/insert/delete paths, so indexes and
   synthetic ids stay consistent.
+- Run time-series aggregations with the full aggregation host, enabling
+  `$lookup` (local/foreign and pipeline/`let`), `$graphLookup`, and
+  `$unionWith` against document or time-series collections. Tests compare the
+  results with the equivalent pipeline on a document collection.
 - Add aggregation and retention for time-series collections. `aggregate` now
   decodes buckets through the time-range-pruned find path and runs the normal
   in-memory pipeline, so `$group`/`$bucket` downsampling works. The new

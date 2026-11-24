@@ -211,7 +211,8 @@ Stages that need a second collection or an index host (`$lookup`, `$search`,
 | retention: delete rows older than a cutoff | `retain_timeseries` |
 | SQL `SELECT`/`INSERT`/`UPDATE`/`DELETE`, `explain` | yes (same find/aggregate path) |
 | `$search`, `$searchMeta`, `$vectorSearch` | yes |
-| `$lookup`, `$unionWith`, watches/events | not supported |
+| `$lookup` (local/foreign and pipeline/`let`), `$graphLookup`, `$unionWith` | yes |
+| watches/events | not supported |
 | drop collection | removes all buckets and series pointers |
 | replication, backup, restore, verify | yes (buckets travel with the database) |
 
@@ -243,6 +244,15 @@ stages return the same documents as a scan. Inserts, updates (including rows
 that move buckets), deletes, upserts, and replicated writes maintain the
 entries; `reindex` rebuilds all of them. Secondary indexes remain non-unique,
 but text/fuzzy/geo/vector indexes have no uniqueness semantics of their own.
+
+### Joins and set stages
+
+Aggregation on a time-series collection runs with the same host as document
+collections, so `$lookup` (both `localField`/`foreignField` and
+`pipeline`/`let` forms), `$graphLookup`, and `$unionWith` work. The foreign
+collection can be a document collection or another time-series collection;
+`find` on it uses its own bucket pruning and indexes. `$out`/`$merge` remain
+unsupported because they would need to re-encode rows into buckets.
 
 ### SQL
 
@@ -476,7 +486,7 @@ Reproduce: `ROWS=100000 READS=500 cargo run --release -p nonodb-core --example t
 - Unique indexes are rejected. Non-unique secondary indexes are supported and
   used by `find`/`count`/`explain` (`index_used`), but deletes and updates by
   filter still decode candidate buckets when no index applies.
-- No `$lookup`, `$unionWith`, or watches inside the collection yet.
+- Watches/events and `$out`/`$merge` are not supported for time-series rows.
 - Aggregation decodes the full time range into memory before running stages.
 - Point lookup by `_id` decodes the containing bucket (see above).
 - Open buckets are uncompressed until they seal.

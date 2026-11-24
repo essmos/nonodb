@@ -4459,6 +4459,117 @@ mod tests {
     }
 
     #[test]
+    fn lookup_and_union_with_work_on_timeseries() {
+        use crate::vault::CollectionProfile;
+        let (_dir, store) = ts_store();
+        let settings = Settings {
+            time_field: "ts".into(),
+            ..Settings::default()
+        };
+        let ts = store
+            .create_timeseries_collection("metrics", &settings)
+            .unwrap();
+        let std_metrics = store
+            .create_collection("metrics_std", CollectionProfile::Standard)
+            .unwrap();
+        let devices = store
+            .create_collection("devices", CollectionProfile::Standard)
+            .unwrap();
+        let base = 1_700_000_000_000i64;
+        for idx in 0..4i64 {
+            let doc = json!({
+                "ts": base + idx * 1000,
+                "device": if idx < 2 { "a" } else { "b" },
+                "value": idx,
+            });
+            ts.insert_one(doc.clone()).unwrap();
+            std_metrics.insert_one(doc).unwrap();
+        }
+        devices
+            .insert_one(json!({"device_id": "a", "label": "Alpha"}))
+            .unwrap();
+        devices
+            .insert_one(json!({"device_id": "b", "label": "Beta"}))
+            .unwrap();
+
+        let lookup = vec![
+            json!({"$match": {"value": {"$gte": 1}}}),
+            json!({"$lookup": {
+                "from": "devices",
+                "localField": "device",
+                "foreignField": "device_id",
+                "as": "info"
+            }}),
+            json!({"$project": {
+                "_id": 0,
+                "device": 1,
+                "value": 1,
+                "info": 1
+            }}),
+            json!({"$sort": {"value": 1}}),
+        ];
+        let ts_out = ts.aggregate(&lookup).unwrap();
+        let std_out = std_metrics.aggregate(&lookup).unwrap();
+        assert_eq!(ts_out, std_out, "local/foreign $lookup must match");
+        assert_eq!(ts_out.len(), 3);
+        assert_eq!(ts_out[0]["info"][0]["label"], json!("Alpha"));
+
+        // Pipeline `$lookup` with `let` and `$expr`.
+        let pipelined = vec![
+            json!({"$lookup": {
+                "from": "devices",
+                "let": {"d": "$device"},
+                "pipeline": [
+                    {"$match": {"$expr": {"$eq": ["$device_id", "$$d"]}}},
+                    {"$project": {"_id": 0, "label": 1}}
+                ],
+                "as": "info"
+            }}),
+            json!({"$project": {"_id": 0, "device": 1, "info": 1}}),
+            json!({"$sort": {"device": 1}}),
+        ];
+        assert_eq!(
+            ts.aggregate(&pipelined).unwrap(),
+            std_metrics.aggregate(&pipelined).unwrap(),
+            "pipeline $lookup must match"
+        );
+
+        // `$unionWith`, including a pipeline on the joined collection.
+        let union = vec![
+            json!({"$match": {"device": "a"}}),
+            json!({"$project": {"_id": 0, "device": 1, "value": 1}}),
+            json!({"$unionWith": {
+                "coll": "metrics_std",
+                "pipeline": [
+                    {"$match": {"device": "b"}},
+                    {"$project": {"_id": 0, "device": 1, "value": 1}}
+                ]
+            }}),
+            json!({"$sort": {"value": 1}}),
+        ];
+        let union_out = ts.aggregate(&union).unwrap();
+        assert_eq!(union_out.len(), 4);
+        assert_eq!(union_out[0]["device"], json!("a"));
+        assert_eq!(union_out[3]["device"], json!("b"));
+
+        // A TS-to-TS `$lookup` also works.
+        let self_lookup = vec![
+            json!({"$match": {"device": "a"}}),
+            json!({"$lookup": {
+                "from": "metrics",
+                "localField": "value",
+                "foreignField": "value",
+                "as": "same"
+            }}),
+            json!({"$project": {"_id": 0, "value": 1, "n": {"$size": "$same"}}}),
+            json!({"$sort": {"value": 1}}),
+        ];
+        let rows = ts.aggregate(&self_lookup).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row["n"] == json!(1)));
+    }
+
+    #[test]
     fn replication_applies_timeseries_update_and_move() {
         use crate::replication::{ReplicationChange, ReplicationOp, ReplicationTxn};
 
