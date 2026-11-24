@@ -32,6 +32,10 @@ Full release notes: https://github.com/essmos/nonodb/releases
   including `$search`, `$searchMeta`, `$vectorSearch`, fuzzy/vector search, and
   `$near`/`$geoWithin`. Backfills decode bucket rows, and inserts, updates,
   deletes, upserts, and replicated writes keep the search structures current.
+- SQL statements (`SELECT`, `INSERT`, `UPDATE`, `DELETE`, `EXPLAIN`) now work
+  on time-series collections. Selects reuse the bucket read path and planner;
+  writes reuse the time-series update/insert/delete paths, so indexes and
+  synthetic ids stay consistent.
 - Add aggregation and retention for time-series collections. `aggregate` now
   decodes buckets through the time-range-pruned find path and runs the normal
   in-memory pipeline, so `$group`/`$bucket` downsampling works. The new

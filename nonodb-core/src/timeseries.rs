@@ -4381,6 +4381,84 @@ mod tests {
     }
 
     #[test]
+    fn sql_select_insert_update_delete_on_timeseries() {
+        use crate::sql;
+        let (_dir, store) = ts_store();
+        let settings = Settings {
+            time_field: "ts".into(),
+            ..Settings::default()
+        };
+        let c = store
+            .create_timeseries_collection("metrics", &settings)
+            .unwrap();
+        let insert = sql::PreparedSql::parse(
+            "INSERT INTO metrics (ts, device, value) VALUES \
+             (1700000000000, 'a', 1), (1700000001000, 'a', 2), \
+             (1700000002000, 'a', 3), (1700000003000, 'b', 2), \
+             (1700000004000, 'b', 4)",
+        )
+        .unwrap();
+        let mut wtxn = store.write_txn().unwrap();
+        let out = insert.execute_write(&c, &mut wtxn, &[]).unwrap();
+        wtxn.commit().unwrap();
+        assert_eq!(out["inserted"], 5);
+        assert_eq!(c.count(&json!({})).unwrap(), 5);
+
+        // SELECT uses `find`: filter, sort, limit/offset.
+        let rows = sql::execute(
+            &c,
+            "SELECT device, value FROM metrics WHERE value >= 2 ORDER BY value DESC LIMIT 2 OFFSET 1",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["value"], json!(3));
+        assert_eq!(rows[1]["value"], json!(2));
+
+        // GROUP BY matches the equivalent native aggregation.
+        let grouped = sql::execute(
+            &c,
+            "SELECT device, COUNT(*) AS n, SUM(value) AS total FROM metrics GROUP BY device ORDER BY device",
+            &[],
+        )
+        .unwrap();
+        let native = c
+            .aggregate(&[
+                json!({"$group": {"_id": "$device", "n": {"$sum": 1}, "total": {"$sum": "$value"}}}),
+                json!({"$sort": {"_id": 1}}),
+            ])
+            .unwrap();
+        assert_eq!(grouped.len(), native.len());
+        for (sql_row, native_row) in grouped.iter().zip(native.iter()) {
+            assert_eq!(sql_row["device"], native_row["_id"]);
+            assert_eq!(sql_row["n"], native_row["n"]);
+            assert_eq!(sql_row["total"], native_row["total"]);
+        }
+
+        // SQL explain goes through the collection planner.
+        c.create_index("value", false).unwrap();
+        let explained = sql::explain(&c, "SELECT * FROM metrics WHERE value = 3", &[]).unwrap();
+        assert_eq!(explained["index_used"], json!(true), "{explained}");
+
+        // UPDATE rewrites rows; the time field stays intact and ids are stable.
+        let update =
+            sql::PreparedSql::parse("UPDATE metrics SET value = 100 WHERE device = 'a'").unwrap();
+        let mut wtxn = store.write_txn().unwrap();
+        let out = update.execute_write(&c, &mut wtxn, &[]).unwrap();
+        wtxn.commit().unwrap();
+        assert_eq!(out["matched"], 3);
+        assert_eq!(c.count(&json!({"value": 100})).unwrap(), 3);
+
+        // DELETE removes matching rows.
+        let delete = sql::PreparedSql::parse("DELETE FROM metrics WHERE value = 100").unwrap();
+        let mut wtxn = store.write_txn().unwrap();
+        let out = delete.execute_write(&c, &mut wtxn, &[]).unwrap();
+        wtxn.commit().unwrap();
+        assert_eq!(out["deleted"], 3);
+        assert_eq!(c.count(&json!({})).unwrap(), 2);
+    }
+
+    #[test]
     fn replication_applies_timeseries_update_and_move() {
         use crate::replication::{ReplicationChange, ReplicationOp, ReplicationTxn};
 

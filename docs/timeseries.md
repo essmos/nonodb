@@ -209,7 +209,9 @@ Stages that need a second collection or an index host (`$lookup`, `$search`,
 | `update` (`$set`, `$inc`, `$mul`, `$unset`, `$rename`, pipelines, upsert) | yes |
 | aggregation pipelines (`$match`, `$group`, `$bucket`, `$sort`, ...) | yes, decoded then run in memory |
 | retention: delete rows older than a cutoff | `retain_timeseries` |
-| SQL, `$search`, `$lookup`, watches/events | not supported |
+| SQL `SELECT`/`INSERT`/`UPDATE`/`DELETE`, `explain` | yes (same find/aggregate path) |
+| `$search`, `$searchMeta`, `$vectorSearch` | yes |
+| `$lookup`, `$unionWith`, watches/events | not supported |
 | drop collection | removes all buckets and series pointers |
 | replication, backup, restore, verify | yes (buckets travel with the database) |
 
@@ -241,6 +243,15 @@ stages return the same documents as a scan. Inserts, updates (including rows
 that move buckets), deletes, upserts, and replicated writes maintain the
 entries; `reindex` rebuilds all of them. Secondary indexes remain non-unique,
 but text/fuzzy/geo/vector indexes have no uniqueness semantics of their own.
+
+### SQL
+
+`sql::execute` and the daemon's `sql` API work on time-series collections.
+`SELECT` reuses the collection read path, so WHERE pruning, secondary indexes,
+sorting, `LIMIT`/`OFFSET`, `GROUP BY`, and `HAVING` behave the same as the
+native API; `INSERT`, `UPDATE`, and `DELETE` route through the time-series
+write path and therefore keep buckets, indexes, and ids consistent. `EXPLAIN`
+for a simple `SELECT` reports the bucket scan or `index_scan` plan.
 
 ### Updates and ids
 
@@ -465,7 +476,7 @@ Reproduce: `ROWS=100000 READS=500 cargo run --release -p nonodb-core --example t
 - Unique indexes are rejected. Non-unique secondary indexes are supported and
   used by `find`/`count`/`explain` (`index_used`), but deletes and updates by
   filter still decode candidate buckets when no index applies.
-- No SQL, `$lookup`, `$unionWith`, or watches inside the collection yet.
+- No `$lookup`, `$unionWith`, or watches inside the collection yet.
 - Aggregation decodes the full time range into memory before running stages.
 - Point lookup by `_id` decodes the containing bucket (see above).
 - Open buckets are uncompressed until they seal.
