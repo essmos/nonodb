@@ -6732,6 +6732,28 @@ impl<'e> Collection<'e> {
         self.aggregate_in_with_options(rtxn, pipeline, None)
     }
 
+    fn timeseries_aggregate_streamable(pipeline: &[Value]) -> bool {
+        !pipeline.is_empty()
+            && pipeline.iter().all(|stage| {
+                stage.as_object().is_some_and(|object| {
+                    object.keys().all(|key| {
+                        matches!(
+                            key.as_str(),
+                            "$match"
+                                | "$project"
+                                | "$addFields"
+                                | "$set"
+                                | "$unset"
+                                | "$replaceRoot"
+                                | "$replaceWith"
+                                | "$lookup"
+                                | "$unwind"
+                        )
+                    })
+                })
+            })
+    }
+
     pub fn aggregate_in_with_options(
         &self,
         rtxn: &RoTxn<'_>,
@@ -6803,6 +6825,34 @@ impl<'e> Collection<'e> {
                     )?;
                     return Ok(out);
                 }
+            }
+            if Self::timeseries_aggregate_streamable(pipeline) {
+                let batch_size = std::env::var("NONODB_TS_AGG_BATCH")
+                    .ok()
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(4096);
+                let host = LookupHost { coll: self, rtxn };
+                let limit = aggregate::max_docs();
+                let mut out = Vec::new();
+                crate::timeseries::scan_batches(
+                    rtxn,
+                    self.env,
+                    &self.name,
+                    &settings,
+                    &query.filter,
+                    batch_size,
+                    |batch| {
+                        let mut part =
+                            aggregate::run_with_host(batch, pipeline, limit, Some(&host))?;
+                        if out.len() + part.len() > limit {
+                            part.truncate(limit.saturating_sub(out.len()));
+                        }
+                        let full = out.len() + part.len() >= limit;
+                        out.extend(part);
+                        Ok(!full)
+                    },
+                )?;
+                return Ok(out);
             }
             let docs = crate::timeseries::find(rtxn, self.env, &self.name, &settings, &query)?;
             let host = LookupHost { coll: self, rtxn };

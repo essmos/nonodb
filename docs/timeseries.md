@@ -618,7 +618,10 @@ prepared statements were used. Reproduce the Timescale side with
   `find`/`count`/`explain` and by indexed updates/deletes.
 - `$out`/`$merge` write to time-series targets through the bucket writer, so
   indexes, events, and replication stay consistent.
-- Aggregation decodes the full time range into memory before running stages.
+- Aggregation streams row-local pipelines (`$match`, `$project`, `$addFields`,
+  `$set`, `$unset`, `$replaceRoot`, `$lookup`, `$unwind`) in batches
+  (`NONODB_TS_AGG_BATCH`, default 4096). Pipelines with `$group`, `$sort`,
+  `$skip`, `$limit`, or `$facet` fall back to the materialized path.
 - Point lookup by `_id` decodes the containing bucket (see above); deletes by
   `_id` use the locator directly.
 - Open buckets are uncompressed until they seal.

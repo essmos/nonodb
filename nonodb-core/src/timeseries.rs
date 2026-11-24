@@ -2420,6 +2420,126 @@ pub fn find_with_ids(
     Ok(out)
 }
 
+/// Streams a full-scan query in fixed-size batches.
+///
+/// The callback receives decoded documents and can stop early by returning
+/// `Ok(false)`. Bucket pruning, expiry, and the residual filter are identical
+/// to [`find`], but no full result vector is retained.
+pub fn scan_batches<F>(
+    rtxn: &RoTxn<'_>,
+    env: &heed::Env,
+    name: &str,
+    settings: &Settings,
+    filter: &Value,
+    batch_size: usize,
+    mut emit: F,
+) -> Result<()>
+where
+    F: FnMut(Vec<Value>) -> Result<bool>,
+{
+    validate_filter(filter)?;
+    let Some(db) =
+        env.open_database::<Bytes, Bytes>(rtxn, Some(&format!("{BUCKET_DB_PREFIX}{name}")))?
+    else {
+        return Ok(());
+    };
+    let (low, high) = time_bounds(filter, &settings.time_field);
+    let meta_hash = meta_equality_hash(filter, settings);
+    let meta_filter = meta_only_filter(filter, settings);
+    let now = crate::ttl::now_ms() as i64;
+    let span = settings.span_ms();
+    let batch_size = batch_size.max(1);
+    let mut batch = Vec::with_capacity(batch_size);
+    let mut flush = |batch: &mut Vec<Value>| -> Result<bool> {
+        if batch.is_empty() {
+            return Ok(true);
+        }
+        let current = std::mem::take(batch);
+        emit(current)
+    };
+    for item in db.iter(rtxn)? {
+        let (key, payload) = item?;
+        match key.first() {
+            Some(&KEY_BUCKET) => {
+                if let Some(expected) = meta_hash {
+                    if key_parts(key).map(|parts| parts.0) != Some(expected) {
+                        continue;
+                    }
+                }
+                let (_, start, end, meta) = bucket_header(payload, settings)?;
+                if low.is_some_and(|low| end < low) || high.is_some_and(|high| start > high) {
+                    continue;
+                }
+                if let Some(filter) = &meta_filter {
+                    if !meta_bucket_matches(filter, settings, meta.as_ref()) {
+                        continue;
+                    }
+                }
+                let (bucket, selected) = decode_bucket_inner(payload, settings, low, high)?;
+                let (hash, salt, window, serial) = key_parts(key).unwrap_or((0, 0, start, 0));
+                let tombs = tombstones(rtxn, &db, hash, salt, window, serial)?;
+                for (row, idx) in bucket.rows.iter().zip(selected.iter()) {
+                    if deleted_at(&bucket, &tombs, *idx as u32) {
+                        continue;
+                    }
+                    let mut doc = Value::Object(row.clone());
+                    if !row.contains_key("_id") {
+                        set_path(
+                            doc.as_object_mut().expect("object"),
+                            "_id",
+                            Value::String(row_id(hash, salt, window, serial, *idx as u32)),
+                        );
+                    }
+                    if expired(settings, &doc, now) || !matcher::matches(&doc, filter) {
+                        continue;
+                    }
+                    batch.push(doc);
+                    if batch.len() >= batch_size && !flush(&mut batch)? {
+                        return Ok(());
+                    }
+                }
+            }
+            Some(&KEY_ROW) => {
+                let Some((hash, salt, window, serial, seq)) = row_key_parts(key) else {
+                    continue;
+                };
+                if let Some(expected) = meta_hash {
+                    if hash != expected {
+                        continue;
+                    }
+                }
+                let window_end = window.saturating_add(span).saturating_sub(1);
+                if low.is_some_and(|low| window_end < low) || high.is_some_and(|high| window > high)
+                {
+                    continue;
+                }
+                let row: Map<String, Value> = serde_json::from_slice(payload)?;
+                let mut doc = Value::Object(row);
+                if !doc
+                    .as_object()
+                    .is_some_and(|object| object.contains_key("_id"))
+                {
+                    set_path(
+                        doc.as_object_mut().expect("object"),
+                        "_id",
+                        Value::String(row_id(hash, salt, window, serial, seq)),
+                    );
+                }
+                if expired(settings, &doc, now) || !matcher::matches(&doc, filter) {
+                    continue;
+                }
+                batch.push(doc);
+                if batch.len() >= batch_size && !flush(&mut batch)? {
+                    return Ok(());
+                }
+            }
+            _ => {}
+        }
+    }
+    flush(&mut batch)?;
+    Ok(())
+}
+
 /// Returns every live row with its `_id`, decoded from buckets. Used to build
 /// and rebuild secondary indexes.
 pub fn all_docs(
@@ -4921,6 +5041,70 @@ mod tests {
         d.insert_one(json!({"ts": 2, "seq": 1})).unwrap();
         assert!(d.create_index("seq", true).is_err());
         assert!(d.create_index("seq", false).is_ok());
+    }
+
+    #[test]
+    fn aggregation_streams_batches_and_matches_fallback() {
+        let (_dir, store) = ts_store();
+        let settings = Settings {
+            time_field: "ts".into(),
+            ..Settings::default()
+        };
+        let c = store
+            .create_timeseries_collection("metrics", &settings)
+            .unwrap();
+        for idx in 0..250i64 {
+            c.insert_one(json!({
+                "ts": 1_700_000_000_000i64 + idx * 1000,
+                "grp": if idx % 2 == 0 { "a" } else { "b" },
+                "v": idx,
+            }))
+            .unwrap();
+        }
+        let streamed = c
+            .aggregate(&[
+                json!({"$match": {"grp": "a"}}),
+                json!({"$project": {"v": 1, "_id": 0}}),
+            ])
+            .unwrap();
+        assert_eq!(streamed.len(), 125);
+        let grouped = c
+            .aggregate(&[
+                json!({"$group": {"_id": "$grp", "n": {"$sum": 1}}}),
+                json!({"$sort": {"_id": 1}}),
+            ])
+            .unwrap();
+        assert_eq!(grouped.len(), 2);
+        assert_eq!(grouped[0]["n"], json!(125));
+        assert_eq!(grouped[1]["n"], json!(125));
+        let limited = c
+            .aggregate(&[
+                json!({"$match": {"grp": "b"}}),
+                json!({"$sort": {"v": 1}}),
+                json!({"$limit": 7}),
+            ])
+            .unwrap();
+        assert_eq!(limited.len(), 7);
+        assert_eq!(limited[0]["v"], json!(1));
+
+        let mut seen = 0usize;
+        let mut batches = 0usize;
+        scan_batches(
+            &store.read_txn().unwrap(),
+            store.env(),
+            "metrics",
+            &settings,
+            &json!({}),
+            17,
+            |batch| {
+                batches += 1;
+                seen += batch.len();
+                Ok(true)
+            },
+        )
+        .unwrap();
+        assert_eq!(seen, 250);
+        assert_eq!(batches, 15);
     }
 
     #[test]
