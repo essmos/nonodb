@@ -1126,11 +1126,6 @@ impl<'e> Collection<'e> {
                     "index fields must be non-empty and must not contain `+`".into(),
                 ));
             }
-            if self.profile.is_timeseries() && spec.unique {
-                return Err(Error::Query(
-                    "unique indexes are not supported on time-series collections".into(),
-                ));
-            }
             if spec.geo && (spec.fields.len() != 1 || spec.unique || !spec.include.is_empty()) {
                 return Err(Error::Query(
                     "geo indexes require exactly one field and cannot be unique or covering".into(),
@@ -1308,6 +1303,16 @@ impl<'e> Collection<'e> {
                 }
                 let value = index::encode_index_value(def, doc, id);
                 for vb in keys.keys {
+                    if def.unique {
+                        for item in index_dbs[slot].prefix_iter(&*wtxn, vb.as_slice())? {
+                            let (_key, existing) = item?;
+                            if index::decode_index_value(existing)
+                                .is_some_and(|(existing_id, _)| existing_id != *id)
+                            {
+                                return Err(Error::DuplicateKey(id.clone()));
+                            }
+                        }
+                    }
                     let mut key = vb;
                     key.extend_from_slice(id.as_bytes());
                     index_dbs[slot].put(&mut *wtxn, key.as_slice(), value.as_slice())?;
@@ -1440,11 +1445,6 @@ impl<'e> Collection<'e> {
         geo: bool,
     ) -> Result<()> {
         self.ensure_standard()?;
-        if self.profile.is_timeseries() && unique {
-            return Err(Error::Query(
-                "unique indexes are not supported on time-series collections".into(),
-            ));
-        }
         if fields.is_empty() {
             return Err(Error::Query("index requires at least one field".into()));
         }
@@ -4813,6 +4813,7 @@ impl<'e> Collection<'e> {
                         object.insert("_id".into(), Value::String(id.clone()));
                     }
                 }
+                self.validate_unique(&*wtxn, &doc, id)?;
                 self.apply_all_index_entries(wtxn, None, Some(&doc), id)?;
             }
             return Ok(ids);
@@ -4832,6 +4833,7 @@ impl<'e> Collection<'e> {
             if let Some(doc) =
                 crate::timeseries::find_by_id(&*wtxn, self.env, &self.name, &settings, &id)?
             {
+                self.validate_unique(&*wtxn, &doc, &id)?;
                 self.apply_index_entries(wtxn, None, Some(&doc), &id)?;
                 self.apply_text_entries(wtxn, None, Some(&doc), &id)?;
                 self.apply_fuzzy_entries(wtxn, None, Some(&doc), &id)?;
@@ -5151,11 +5153,13 @@ impl<'e> Collection<'e> {
                     if let Some(new_doc) = crate::timeseries::find_by_id(
                         &*wtxn, self.env, &self.name, &settings, new_id,
                     )? {
+                        self.validate_unique(&*wtxn, &new_doc, new_id)?;
                         self.apply_all_index_entries(wtxn, None, Some(&new_doc), new_id)?;
                     }
                 } else if let Some(new_doc) =
                     crate::timeseries::find_by_id(&*wtxn, self.env, &self.name, &settings, old_id)?
                 {
+                    self.validate_unique(&*wtxn, &new_doc, old_id)?;
                     self.apply_all_index_entries(wtxn, Some(old), Some(&new_doc), old_id)?;
                 }
             }
@@ -5163,6 +5167,7 @@ impl<'e> Collection<'e> {
                 if let Some(new_doc) =
                     crate::timeseries::find_by_id(&*wtxn, self.env, &self.name, &settings, id)?
                 {
+                    self.validate_unique(&*wtxn, &new_doc, id)?;
                     self.apply_all_index_entries(wtxn, None, Some(&new_doc), id)?;
                 }
             }
@@ -5480,9 +5485,11 @@ impl<'e> Collection<'e> {
                         Error::Query("updated time-series document disappeared".into())
                     })?;
             if new_id == id {
+                self.validate_unique(&*wtxn, &new, &id)?;
                 self.apply_all_index_entries(wtxn, Some(&old), Some(&new), &id)?;
             } else {
                 self.apply_all_index_entries(wtxn, Some(&old), None, &id)?;
+                self.validate_unique(&*wtxn, &new, &new_id)?;
                 self.apply_all_index_entries(wtxn, None, Some(&new), &new_id)?;
             }
             return Ok(FindAndModifyOutcome {
@@ -5516,6 +5523,7 @@ impl<'e> Collection<'e> {
             .ok_or_else(|| Error::Query("upserted time-series document disappeared".into()))?;
         let inserted = crate::timeseries::find_by_id(&*wtxn, self.env, &self.name, &settings, &id)?;
         if let Some(doc) = &inserted {
+            self.validate_unique(&*wtxn, doc, &id)?;
             self.apply_all_index_entries(wtxn, None, Some(doc), &id)?;
         }
         let value = if opts.new {

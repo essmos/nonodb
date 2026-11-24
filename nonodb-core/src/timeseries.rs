@@ -4761,9 +4761,14 @@ mod tests {
         assert_eq!(c.delete(&json!({"_id": target}), false).unwrap(), 1);
         assert!(!find_level(3).iter().any(|doc| doc["_id"] == json!(target)));
 
-        // Unique indexes are rejected with a clear message.
-        let err = c.create_index("value", true).unwrap_err();
-        assert!(err.to_string().contains("unique"), "{err}");
+        // Unique indexes are supported and tracked in metadata.
+        c.create_index("value", true).unwrap();
+        assert!(c
+            .list_indexes()
+            .unwrap()
+            .iter()
+            .any(|(name, unique)| name == "value" && *unique));
+        c.drop_index("value").unwrap();
 
         // Reindex rebuilds the same index and keeps the planner happy.
         let report = c.reindex().unwrap();
@@ -4865,6 +4870,57 @@ mod tests {
         wtxn.commit().unwrap();
         assert_eq!(c.count(&json!({})).unwrap(), 18);
         assert_eq!(c.count(&json!({"flag": true})).unwrap(), 1);
+    }
+
+    #[test]
+    fn unique_indexes_are_enforced_on_timeseries() {
+        let (_dir, store) = ts_store();
+        let settings = Settings {
+            time_field: "ts".into(),
+            ..Settings::default()
+        };
+        let c = store
+            .create_timeseries_collection("metrics", &settings)
+            .unwrap();
+        c.create_index("seq", true).unwrap();
+        let first = c.insert_one(json!({"ts": 1, "seq": 1})).unwrap();
+        assert!(c.insert_one(json!({"ts": 2, "seq": 1})).is_err());
+        let second = c.insert_one(json!({"ts": 3, "seq": 2})).unwrap();
+        assert!(c
+            .update_opts(
+                &json!({"_id": second}),
+                &json!({"$set": {"seq": 1}}),
+                false,
+                false,
+            )
+            .is_err());
+        assert_eq!(c.delete(&json!({"_id": first}), false).unwrap(), 1);
+        c.update_opts(
+            &json!({"_id": second}),
+            &json!({"$set": {"seq": 1}}),
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(c.insert_one(json!({"ts": 4, "seq": 1})).is_err());
+
+        let mut wtxn = store.write_txn().unwrap();
+        assert!(c
+            .insert_many_txn(
+                &mut wtxn,
+                &[json!({"ts": 10, "seq": 9}), json!({"ts": 11, "seq": 9})],
+            )
+            .is_err());
+        drop(wtxn);
+        assert_eq!(c.count(&json!({"seq": 9})).unwrap(), 0);
+
+        let d = store
+            .create_timeseries_collection("dups", &settings)
+            .unwrap();
+        d.insert_one(json!({"ts": 1, "seq": 1})).unwrap();
+        d.insert_one(json!({"ts": 2, "seq": 1})).unwrap();
+        assert!(d.create_index("seq", true).is_err());
+        assert!(d.create_index("seq", false).is_ok());
     }
 
     #[test]

@@ -612,10 +612,10 @@ prepared statements were used. Reproduce the Timescale side with
   deleted rows occupy their bucket (and its encoded payload) until retention or
   compaction. Reclaiming file space requires an offline compacting copy, not
   only a retention pass (`data.mdb` keeps its high-water mark).
-- Unique indexes are rejected. Non-unique secondary, text, fuzzy, geo, and
-  vector indexes are supported and used by `find`/`count`/`explain`
-  (`index_used`), but deletes and updates by filter still decode candidate
-  buckets when no index applies.
+- Unique secondary indexes are enforced on insert, update, upsert, and reindex
+  (deleted rows immediately free their value). Non-unique secondary, text,
+  fuzzy, geo, and vector indexes are also supported. The planner is used by
+  `find`/`count`/`explain` and by indexed updates/deletes.
 - `$out`/`$merge` are not supported for time-series rows (writes must go
   through the bucket writer).
 - Aggregation decodes the full time range into memory before running stages.
