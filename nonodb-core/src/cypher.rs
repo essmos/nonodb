@@ -220,6 +220,7 @@ struct Executor<'a> {
     options: &'a CypherOptions,
     deadline: Option<Instant>,
     operations: usize,
+    memory_used: usize,
     truncated: bool,
     pending_input: Vec<Row>,
 }
@@ -234,6 +235,7 @@ impl<'a> Executor<'a> {
                 .timeout_ms
                 .map(|ms| Instant::now() + Duration::from_millis(ms)),
             operations: 0,
+            memory_used: 0,
             truncated: false,
             pending_input: Vec::new(),
         }
@@ -249,6 +251,17 @@ impl<'a> Executor<'a> {
             .is_some_and(|deadline| Instant::now() > deadline)
         {
             return Err(Error::Query("cypher query timed out".into()));
+        }
+        Ok(())
+    }
+
+    fn charge_memory(&mut self, bytes: usize) -> Result<()> {
+        self.memory_used = self.memory_used.saturating_add(bytes);
+        if self.memory_used > self.options.max_memory_bytes {
+            return Err(Error::Query(format!(
+                "cypher memory budget exceeded ({} bytes)",
+                self.options.max_memory_bytes
+            )));
         }
         Ok(())
     }
@@ -289,11 +302,23 @@ impl<'a> Executor<'a> {
                 )
             }
             Plan::Filter { input, pred } => {
+                if let Plan::Optional {
+                    input: base,
+                    optional,
+                } = input.as_ref()
+                {
+                    return self.optional(base, optional, Some(pred));
+                }
                 let rows = self.execute_input(input)?;
                 let mut out = Vec::new();
                 for row in rows {
                     self.tick()?;
-                    if truthy(&self.eval(pred, &row, None)?) {
+                    let keep = if let Some(value) = self.relationship_list_predicate(pred, &row)? {
+                        value
+                    } else {
+                        truthy(&self.eval(pred, &row, None)?)
+                    };
+                    if keep {
                         out.push(row);
                     }
                 }
@@ -348,7 +373,10 @@ impl<'a> Executor<'a> {
                 let left_rows = self.execute_input(left)?;
                 let mut out = Vec::new();
                 for left_row in left_rows {
-                    let right_rows = self.execute(right, vec![left_row.clone()])?;
+                    let mut seed = left_row.clone();
+                    seed.set(HIDDEN_PATH_NODES, json!([]));
+                    seed.set(HIDDEN_PATH_RELS, json!([]));
+                    let right_rows = self.execute(right, vec![seed])?;
                     for right_row in right_rows {
                         self.tick()?;
                         if let Some(mut joined) = join_rows(&left_row, &right_row) {
@@ -363,28 +391,7 @@ impl<'a> Executor<'a> {
                 }
                 Ok(out)
             }
-            Plan::Optional { input, optional } => {
-                let rows = self.execute_input(input)?;
-                let optional_vars = plan_vars(optional);
-                let mut out = Vec::new();
-                for row in rows {
-                    self.pending_input = vec![row.clone()];
-                    let mut matched = self.execute(optional, Vec::new())?;
-                    self.pending_input.clear();
-                    if matched.is_empty() {
-                        let mut next = row.clone();
-                        for var in &optional_vars {
-                            if next.get(var).is_none() {
-                                next.set(var.clone(), Value::Null);
-                            }
-                        }
-                        out.push(next);
-                    } else {
-                        out.append(&mut matched);
-                    }
-                }
-                Ok(out)
-            }
+            Plan::Optional { input, optional } => self.optional(input, optional, None),
             Plan::ShortestPath { input, all } => self.shortest(input, *all),
             Plan::NamedPath { input, variable } => {
                 let rows = self.execute_input(input)?;
@@ -519,7 +526,16 @@ impl<'a> Executor<'a> {
                                 continue;
                             }
                         }
-                        out.push(base);
+                        let mut row = base.clone();
+                        let empty_path = row
+                            .get(HIDDEN_PATH_NODES)
+                            .and_then(Value::as_array)
+                            .is_none_or(Vec::is_empty);
+                        if empty_path {
+                            row.set(HIDDEN_PATH_NODES, json!([bound]));
+                            row.set(HIDDEN_PATH_RELS, json!([]));
+                        }
+                        out.push(row);
                         if out.len() >= self.options.max_rows {
                             self.truncated = true;
                             return Ok(out);
@@ -545,9 +561,8 @@ impl<'a> Executor<'a> {
                     row.set(HIDDEN_ANON_NODE, node.clone());
                 }
                 row.set(HIDDEN_ANON_ID, Value::String(id.clone()));
-                if row.get(HIDDEN_PATH_NODES).is_none() {
-                    row.set(HIDDEN_PATH_NODES, json!([node]));
-                }
+                row.set(HIDDEN_PATH_NODES, json!([node]));
+                row.set(HIDDEN_PATH_RELS, json!([]));
                 out.push(row);
                 if out.len() >= self.options.max_rows {
                     self.truncated = true;
@@ -589,8 +604,16 @@ impl<'a> Executor<'a> {
                 if max < min {
                     continue;
                 }
-                let mut used = HashSet::new();
-                let mut rels = Vec::new();
+                let existing_rels = row
+                    .get(HIDDEN_PATH_RELS)
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                let mut used: HashSet<String> = existing_rels
+                    .iter()
+                    .filter_map(|rel| rel.get("_id").and_then(Value::as_str).map(str::to_string))
+                    .collect();
+                let mut rels = existing_rels;
                 let mut nodes: Vec<Value> = row
                     .get(HIDDEN_PATH_NODES)
                     .and_then(Value::as_array)
@@ -618,12 +641,31 @@ impl<'a> Executor<'a> {
                     &mut out,
                 )?;
             } else {
+                let path_rels: HashSet<String> = row
+                    .get(HIDDEN_PATH_RELS)
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|rel| rel.get("_id").and_then(Value::as_str).map(str::to_string))
+                    .collect();
+                let bound_rel = rel_var
+                    .and_then(|var| row.get(var))
+                    .filter(|value| value.is_object())
+                    .and_then(|value| value.get("_id"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
                 for edge in self
                     .graph
                     .view
                     .neighbors(&current, graph_direction, rel_types)?
                 {
                     self.tick()?;
+                    if path_rels.contains(&edge.edge_id) {
+                        continue;
+                    }
+                    if bound_rel.as_deref().is_some_and(|id| id != edge.edge_id) {
+                        continue;
+                    }
                     let Some(target) = self.graph.node(&edge.target)? else {
                         continue;
                     };
@@ -881,7 +923,8 @@ impl<'a> Executor<'a> {
             }
             neighbors.insert(id.clone(), set);
         }
-        let ids: Vec<String> = neighbors.keys().cloned().collect();
+        let mut ids: Vec<String> = neighbors.keys().cloned().collect();
+        ids.sort();
         let mut items = Vec::new();
         for left in 0..ids.len() {
             for right in left + 1..ids.len() {
@@ -919,6 +962,18 @@ impl<'a> Executor<'a> {
                 .as_f64()
                 .partial_cmp(&a["similarity"].as_f64())
                 .unwrap_or(Ordering::Equal)
+                .then_with(|| {
+                    a["node1"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .cmp(b["node1"].as_str().unwrap_or_default())
+                })
+                .then_with(|| {
+                    a["node2"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .cmp(b["node2"].as_str().unwrap_or_default())
+                })
         });
         Ok(json!({"items": items}))
     }
@@ -944,10 +999,11 @@ impl<'a> Executor<'a> {
             let mut out = Vec::with_capacity(rows.len());
             for row in rows {
                 self.tick()?;
-                let mut next = row.clone();
-                if !include_existing {
-                    next.order.clear();
-                }
+                let mut next = if include_existing {
+                    row.clone()
+                } else {
+                    Row::new()
+                };
                 for expr in exprs {
                     let value = self.eval(&expr.expr, &row, None)?;
                     let name = expr.alias.clone().unwrap_or_else(|| expr_name(&expr.expr));
@@ -980,10 +1036,11 @@ impl<'a> Executor<'a> {
         let mut out = Vec::new();
         for (_, group) in groups {
             let base = group.first().cloned().unwrap_or_else(Row::new);
-            let mut next = base.clone();
-            if !include_existing {
-                next.order.clear();
-            }
+            let mut next = if include_existing {
+                base.clone()
+            } else {
+                Row::new()
+            };
             for expr in exprs {
                 let value = self.eval(&expr.expr, &base, Some(&group))?;
                 let name = expr.alias.clone().unwrap_or_else(|| expr_name(&expr.expr));
@@ -998,6 +1055,107 @@ impl<'a> Executor<'a> {
         Ok(out)
     }
 
+    fn optional(&mut self, input: &Plan, optional: &Plan, pred: Option<&Expr>) -> Result<Vec<Row>> {
+        let rows = self.execute_input(input)?;
+        let optional_vars = plan_vars(optional);
+        let mut out = Vec::new();
+        for row in rows {
+            let mut seed = row.clone();
+            seed.set(HIDDEN_PATH_NODES, json!([]));
+            seed.set(HIDDEN_PATH_RELS, json!([]));
+            self.pending_input = vec![seed];
+            let mut matched = self.execute(optional, Vec::new())?;
+            self.pending_input.clear();
+            let null_check = pred.is_some_and(|pred| {
+                matches!(
+                    pred,
+                    Expr::Unary {
+                        op: UnOp::IsNull | UnOp::IsNotNull,
+                        ..
+                    }
+                )
+            });
+            if matched.is_empty() {
+                let mut next = row.clone();
+                for var in &optional_vars {
+                    if next.get(var).is_none() {
+                        next.set(var.clone(), Value::Null);
+                    }
+                }
+                if null_check {
+                    let keep = pred
+                        .map(|pred| self.eval(pred, &next, None))
+                        .transpose()?
+                        .is_some_and(|value| truthy(&value));
+                    if !keep {
+                        continue;
+                    }
+                }
+                out.push(next);
+                continue;
+            }
+            if let Some(pred) = pred {
+                let mut kept = Vec::new();
+                for candidate in matched {
+                    self.tick()?;
+                    if truthy(&self.eval(pred, &candidate, None)?) {
+                        kept.push(candidate);
+                    }
+                }
+                matched = kept;
+            }
+            if matched.is_empty() && !null_check {
+                let mut next = row.clone();
+                for var in &optional_vars {
+                    if next.get(var).is_none() {
+                        next.set(var.clone(), Value::Null);
+                    }
+                }
+                out.push(next);
+                continue;
+            }
+            out.append(&mut matched);
+        }
+        Ok(out)
+    }
+
+    fn relationship_list_predicate(&mut self, pred: &Expr, row: &Row) -> Result<Option<bool>> {
+        let Expr::Binary { op, lhs, rhs } = pred else {
+            return Ok(None);
+        };
+        if !matches!(op, BinOp::Eq | BinOp::Neq) {
+            return Ok(None);
+        }
+        let Expr::Property { base, key } = lhs.as_ref() else {
+            return Ok(None);
+        };
+        let Expr::Variable(variable) = base.as_ref() else {
+            return Ok(None);
+        };
+        let Some(rels) = row.get(variable).and_then(Value::as_array) else {
+            return Ok(None);
+        };
+        if rels.is_empty()
+            || !rels
+                .iter()
+                .all(|rel| rel.get("_id").is_some() && rel.get("_type").is_some())
+        {
+            return Ok(None);
+        }
+        let want = self.eval(rhs, row, None)?;
+        let mut ok = true;
+        for rel in rels {
+            let got = rel.get(key).cloned().unwrap_or(Value::Null);
+            let equal = json_eq(&got, &want);
+            ok &= if matches!(op, BinOp::Eq) {
+                equal
+            } else {
+                !equal
+            };
+        }
+        Ok(Some(ok))
+    }
+
     fn sort(&mut self, input: &Plan, keys: &[SortKey]) -> Result<Vec<Row>> {
         if let Plan::Project {
             input: inner,
@@ -1009,6 +1167,31 @@ impl<'a> Executor<'a> {
                 let rows = self.sort(inner, keys)?;
                 return self.project_rows(rows, *include_existing, exprs);
             }
+            let rows = self.execute_input(inner)?;
+            let mut keyed = Vec::new();
+            for row in rows {
+                let projected = self.project_rows(vec![row.clone()], *include_existing, exprs)?;
+                let Some(projected) = projected.into_iter().next() else {
+                    continue;
+                };
+                let mut scope = row;
+                scope.merge(&projected);
+                let mut values = Vec::with_capacity(keys.len());
+                for key in keys {
+                    values.push(self.eval(&key.expr, &scope, None)?);
+                }
+                keyed.push((values, projected));
+            }
+            keyed.sort_by(|(a, _), (b, _)| {
+                for (index, key) in keys.iter().enumerate() {
+                    let order = cmp_json(&a[index], &b[index]);
+                    if order != Ordering::Equal {
+                        return if key.desc { order.reverse() } else { order };
+                    }
+                }
+                Ordering::Equal
+            });
+            return Ok(keyed.into_iter().map(|(_, row)| row).collect());
         }
         let mut rows = self.execute_input(input)?;
         let mut keyed = Vec::with_capacity(rows.len());
@@ -1270,6 +1453,16 @@ impl<'a> Executor<'a> {
                 if let Some(var) = &chain[index].rel.var {
                     terminal.set(var.clone(), Value::Array(rels.clone()));
                 }
+                if let Some(var) = &chain[index].node.var {
+                    if let Some(target) = terminal
+                        .get(HIDDEN_PATH_NODES)
+                        .and_then(Value::as_array)
+                        .and_then(|nodes| nodes.last())
+                        .cloned()
+                    {
+                        terminal.set(var.clone(), target);
+                    }
+                }
                 self.walk_pattern(chain, index + 1, terminal, used, out)?;
             }
         }
@@ -1304,9 +1497,6 @@ impl<'a> Executor<'a> {
             let mut next = row.clone();
             append_path(&mut next, &target, &rel);
             rels.push(rel);
-            if let Some(var) = &chain[index].node.var {
-                next.set(var.clone(), target.clone());
-            }
             let target_id = target
                 .get("_id")
                 .and_then(Value::as_str)
@@ -1767,10 +1957,17 @@ impl<'a> Executor<'a> {
             values.retain(|value| seen.insert(serde_json::to_string(value).unwrap_or_default()));
         }
         let name = name.to_ascii_lowercase();
+        if name == "collect" {
+            let bytes = serde_json::to_vec(&values).map_or(0, |bytes| bytes.len());
+            self.charge_memory(bytes)?;
+        }
         match name.as_str() {
             "count" => Ok(json!(values.len())),
             "collect" => Ok(Value::Array(values)),
-            "sum" => Ok(json!(values.iter().filter_map(number).sum::<f64>())),
+            "sum" => {
+                let sum = values.iter().filter_map(number).sum::<f64>();
+                Ok(json!(if sum.abs() < 1e-12 { 0.0 } else { sum }))
+            }
             "avg" => {
                 let numbers: Vec<f64> = values.iter().filter_map(number).collect();
                 if numbers.is_empty() {
@@ -1826,6 +2023,8 @@ impl<'a> Executor<'a> {
             "keys" => Ok(match arg(0) {
                 Value::Object(map) => {
                     let relationship = map.contains_key("_type");
+                    let entity =
+                        relationship || map.contains_key("_id") || map.contains_key("_labels");
                     Value::Array(
                         map.iter()
                             .filter(|(key, value)| {
@@ -1833,7 +2032,7 @@ impl<'a> Executor<'a> {
                                     && *key != "from"
                                     && *key != "to"
                                     && (!relationship || *key != "label")
-                                    && !value.is_null()
+                                    && (!entity || !value.is_null())
                             })
                             .map(|(key, _)| key.clone())
                             .map(Value::String)
@@ -1944,15 +2143,35 @@ impl<'a> Executor<'a> {
                 let start = arg(0).as_i64().unwrap_or(0);
                 let end = arg(1).as_i64().unwrap_or(0);
                 let step = args.get(2).and_then(Value::as_i64).unwrap_or(1);
-                let mut out = Vec::new();
-                if step != 0 {
-                    let mut current = start;
-                    while (step > 0 && current <= end) || (step < 0 && current >= end) {
-                        out.push(json!(current));
-                        current += step;
-                        if out.len() > 100_000 {
-                            break;
-                        }
+                if step == 0 {
+                    return Err(Error::Query("cypher range step must not be zero".into()));
+                }
+                let length = if (step > 0 && start <= end) || (step < 0 && start >= end) {
+                    ((i128::from(end) - i128::from(start)) / i128::from(step)).unsigned_abs() + 1
+                } else {
+                    0
+                };
+                let memory_limit = self.options.max_memory_bytes / 16;
+                if length > memory_limit as u128 {
+                    return Err(Error::Query(format!(
+                        "cypher memory budget exceeded: range produces {length} elements"
+                    )));
+                }
+                if length > self.options.max_operations as u128 {
+                    return Err(Error::Query(format!(
+                        "cypher operation budget exceeded: range produces {length} elements"
+                    )));
+                }
+                self.charge_memory((length as usize).saturating_mul(16))?;
+                let mut out = Vec::with_capacity(length as usize);
+                let mut current = start;
+                while (step > 0 && current <= end) || (step < 0 && current >= end) {
+                    out.push(json!(current));
+                    current = current
+                        .checked_add(step)
+                        .ok_or_else(|| Error::Query("cypher range integer overflow".into()))?;
+                    if out.len() == length as usize {
+                        break;
                     }
                 }
                 Ok(Value::Array(out))
@@ -2332,6 +2551,9 @@ fn expr_name_prec(expr: &Expr, parent: u8) -> String {
             UnOp::IsNull => format!("{} IS NULL", expr_name_prec(operand, 40)),
             UnOp::IsNotNull => format!("{} IS NOT NULL", expr_name_prec(operand, 40)),
         },
+        Expr::LabelPredicate { expression, labels } => {
+            format!("({}:{})", expr_name_prec(expression, 0), labels.join(":"))
+        }
         Expr::ComparisonChain { arguments, .. } => arguments
             .iter()
             .map(expr_name)
@@ -3607,9 +3829,10 @@ pub fn execute(view: &dyn GraphView, options: &CypherOptions) -> Result<Value> {
             "cypher write clauses are not supported in read-only mode".into(),
         ));
     }
+    let extra_labels = collect_extra_labels(&query);
     let plan =
         plan_query(&query).map_err(|error| Error::Query(format!("cypher plan error: {error}")))?;
-    let plan = optimize(plan);
+    let plan = inject_extra_labels(optimize(plan), &extra_labels);
     if std::env::var_os("NONODB_CYPHER_DEBUG_PLAN").is_some() {
         eprintln!("{plan:#?}");
     }
@@ -3641,6 +3864,168 @@ pub fn execute(view: &dyn GraphView, options: &CypherOptions) -> Result<Value> {
         )));
     }
     Ok(result)
+}
+
+fn collect_extra_labels(query: &Query) -> HashMap<String, Vec<String>> {
+    let mut extras: HashMap<String, Vec<String>> = HashMap::new();
+    for clause in &query.clauses {
+        if let Clause::Match(matched) = clause {
+            for pattern in &matched.patterns {
+                collect_node_extra_labels(&pattern.anchor, &mut extras);
+                for chain in &pattern.chain {
+                    collect_node_extra_labels(&chain.node, &mut extras);
+                }
+            }
+        }
+    }
+    extras
+}
+
+fn collect_node_extra_labels(node: &NodePattern, extras: &mut HashMap<String, Vec<String>>) {
+    let Some(variable) = &node.var else {
+        return;
+    };
+    for label in node.labels.iter().skip(1) {
+        let labels = extras.entry(variable.clone()).or_default();
+        if !labels.contains(label) {
+            labels.push(label.clone());
+        }
+    }
+}
+
+fn inject_extra_labels(plan: Plan, extras: &HashMap<String, Vec<String>>) -> Plan {
+    if extras.is_empty() {
+        return plan;
+    }
+    match plan {
+        Plan::Scan {
+            var: Some(variable),
+            label,
+        } => {
+            let mut plan = Plan::Scan {
+                var: Some(variable.clone()),
+                label,
+            };
+            for extra in extras.get(&variable).into_iter().flatten() {
+                plan = Plan::Filter {
+                    input: Box::new(plan),
+                    pred: Expr::LabelPredicate {
+                        expression: Box::new(Expr::Variable(variable.clone())),
+                        labels: vec![extra.clone()],
+                    },
+                };
+            }
+            plan
+        }
+        Plan::Expand {
+            input,
+            src,
+            rel_var,
+            rel_types,
+            range,
+            direction,
+            dst,
+            dst_label,
+        } => Plan::Expand {
+            input: Box::new(inject_extra_labels(*input, extras)),
+            src,
+            rel_var,
+            rel_types,
+            range,
+            direction,
+            dst,
+            dst_label,
+        },
+        Plan::Filter { input, pred } => Plan::Filter {
+            input: Box::new(inject_extra_labels(*input, extras)),
+            pred,
+        },
+        Plan::PropertyMapFilter {
+            input,
+            variable,
+            map,
+        } => Plan::PropertyMapFilter {
+            input: Box::new(inject_extra_labels(*input, extras)),
+            variable,
+            map,
+        },
+        Plan::Project {
+            input,
+            include_existing,
+            exprs,
+        } => Plan::Project {
+            input: Box::new(inject_extra_labels(*input, extras)),
+            include_existing,
+            exprs,
+        },
+        Plan::Sort { input, keys } => Plan::Sort {
+            input: Box::new(inject_extra_labels(*input, extras)),
+            keys,
+        },
+        Plan::Skip { input, count } => Plan::Skip {
+            input: Box::new(inject_extra_labels(*input, extras)),
+            count,
+        },
+        Plan::Limit { input, count } => Plan::Limit {
+            input: Box::new(inject_extra_labels(*input, extras)),
+            count,
+        },
+        Plan::Cartesian { left, right } => Plan::Cartesian {
+            left: Box::new(inject_extra_labels(*left, extras)),
+            right: Box::new(inject_extra_labels(*right, extras)),
+        },
+        Plan::Optional { input, optional } => Plan::Optional {
+            input: Box::new(inject_extra_labels(*input, extras)),
+            optional: Box::new(inject_extra_labels(*optional, extras)),
+        },
+        Plan::ShortestPath { input, all } => Plan::ShortestPath {
+            input: Box::new(inject_extra_labels(*input, extras)),
+            all,
+        },
+        Plan::NamedPath { input, variable } => Plan::NamedPath {
+            input: Box::new(inject_extra_labels(*input, extras)),
+            variable,
+        },
+        Plan::PlannerHint { input, hint } => Plan::PlannerHint {
+            input: Box::new(inject_extra_labels(*input, extras)),
+            hint,
+        },
+        Plan::ProcedureCall {
+            input,
+            name,
+            arguments,
+            yields,
+        } => Plan::ProcedureCall {
+            input: Box::new(inject_extra_labels(*input, extras)),
+            name,
+            arguments,
+            yields,
+        },
+        Plan::Unwind {
+            input,
+            expression,
+            alias,
+        } => Plan::Unwind {
+            input: Box::new(inject_extra_labels(*input, extras)),
+            expression,
+            alias,
+        },
+        Plan::Distinct { input } => Plan::Distinct {
+            input: Box::new(inject_extra_labels(*input, extras)),
+        },
+        Plan::Union { left, right, all } => Plan::Union {
+            left: Box::new(inject_extra_labels(*left, extras)),
+            right: Box::new(inject_extra_labels(*right, extras)),
+            all,
+        },
+        Plan::Explain { input } => Plan::Explain {
+            input: Box::new(inject_extra_labels(*input, extras)),
+        },
+        Plan::Profile { input } => Plan::Profile {
+            input: Box::new(inject_extra_labels(*input, extras)),
+        },
+        other => other,
+    }
 }
 
 fn is_write_clause(clause: &Clause) -> bool {

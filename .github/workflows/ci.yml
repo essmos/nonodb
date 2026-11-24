@@ -118,6 +118,7 @@ jobs:
           import json
           report = json.load(open("tck-report.json"))
           assert report["pass_rate"] >= 0.90, report["pass_rate"]
+          assert report["counts"]["known_gap"] == 0, report["counts"]
           assert report["counts"]["pass"] + report["counts"]["known_gap"] + report["counts"]["unsupported"] == report["total"]
           PY
 

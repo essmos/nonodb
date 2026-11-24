@@ -3,11 +3,11 @@
   "selection": "All result-table scenarios with a read-only query, including graph fixtures, parameters, and named graphs. Expected-error and outline scenarios are excluded.",
   "total": 874,
   "counts": {
-    "pass": 789,
-    "known_gap": 28,
+    "pass": 817,
+    "known_gap": 0,
     "unsupported": 57
   },
-  "pass_rate": 0.9027,
+  "pass_rate": 0.9348,
   "excluded": [
     {
       "feature": "Call1 - Basic procedure calling",
@@ -4478,8 +4478,8 @@
       "scenario": "[3] Matching nodes using multiple labels",
       "line": "62",
       "query": "MATCH (a:A:B)\n      RETURN a",
-      "status": "known_gap",
-      "detail": "row count 4 != 2"
+      "status": "pass",
+      "detail": ""
     },
     {
       "feature": "Match1 - Match nodes",
@@ -4670,16 +4670,16 @@
       "scenario": "[15] Mixing directed and undirected pattern parts with self-relationship, simple",
       "line": "268",
       "query": "MATCH (x:A)-[r1]->(y)-[r2]-(z)\n      RETURN x, r1, y, r2, z",
-      "status": "known_gap",
-      "detail": "row count 3 != 2"
+      "status": "pass",
+      "detail": ""
     },
     {
       "feature": "Match3 - Match fixed length patterns",
       "scenario": "[16] Mixing directed and undirected pattern parts with self-relationship, undirected",
       "line": "287",
       "query": "MATCH (x)-[r1]-(y)-[r2]-(z)\n      RETURN x, r1, y, r2, z",
-      "status": "known_gap",
-      "detail": "row count 11 != 6"
+      "status": "pass",
+      "detail": ""
     },
     {
       "feature": "Match3 - Match fixed length patterns",
@@ -4806,16 +4806,16 @@
       "scenario": "[5] Matching variable length pattern with property predicate",
       "line": "116",
       "query": "MATCH (a:Artist)-[:WORKED_WITH* {year: 1988}]->(b:Artist)\n      RETURN *",
-      "status": "known_gap",
-      "detail": "row count 0 != 1"
+      "status": "pass",
+      "detail": ""
     },
     {
       "feature": "Match4 - Match variable length patterns scenarios",
       "scenario": "[7] Matching variable length patterns including a bound relationship",
       "line": "153",
       "query": "MATCH ()-[r:EDGE]-()\n      MATCH p = (n)-[*0..1]-()-[r]-()-[*0..1]-(m)\n      RETURN count(p) AS c",
-      "status": "known_gap",
-      "detail": "missing expected row: {'c': 32}"
+      "status": "pass",
+      "detail": ""
     },
     {
       "feature": "Match4 - Match variable length patterns scenarios",
@@ -5142,8 +5142,8 @@
       "scenario": "[17] Return a named var length path of length zero",
       "line": "314",
       "query": "MATCH p = (a {name: 'A'})-[:KNOWS*0..1]->(b)-[:FRIEND*0..1]->(c)\n      RETURN p",
-      "status": "known_gap",
-      "detail": "missing expected row: {'p': {'__type': 'node', 'labels': ['A'], 'properties': {'name': 'A'}}}"
+      "status": "pass",
+      "detail": ""
     },
     {
       "feature": "Match6 - Match named paths scenarios",
@@ -5254,8 +5254,8 @@
       "scenario": "[11] Return two subgraphs with bound undirected relationship and optional relationship",
       "line": "219",
       "query": "MATCH (a)-[r {name: 'r1'}]-(b)\n      OPTIONAL MATCH (b)-[r2]-(c)\n      WHERE r <> r2\n      RETURN a, b, c",
-      "status": "known_gap",
-      "detail": "row count 1 != 2"
+      "status": "pass",
+      "detail": ""
     },
     {
       "feature": "Match7 - Optional match",
@@ -5430,8 +5430,8 @@
       "scenario": "[3] Matching and disregarding output, then matching again",
       "line": "75",
       "query": "MATCH ()-->()\n      WITH 1 AS x\n      MATCH ()-[r1]->()<--()\n      RETURN sum(r1.times)",
-      "status": "known_gap",
-      "detail": "missing expected row: {'sum(r1.times)': 776}"
+      "status": "pass",
+      "detail": ""
     },
     {
       "feature": "Match9 - Match deprecated scenarios",
@@ -5702,8 +5702,8 @@
       "scenario": "[2] Filter node with false node label predicate after OPTIONAL MATCH",
       "line": "55",
       "query": "MATCH (n:Single)\n      OPTIONAL MATCH (n)-[r]-(m)\n      WHERE m:NonExistent\n      RETURN r",
-      "status": "known_gap",
-      "detail": "row count 0 != 1"
+      "status": "pass",
+      "detail": ""
     },
     {
       "feature": "MatchWhere6 - Filter optional matches",
@@ -5718,40 +5718,40 @@
       "scenario": "[4] Do not fail when predicates on optionally matched and missed nodes are invalid",
       "line": "101",
       "query": "MATCH (n)-->(x0)\n      OPTIONAL MATCH (x0)-->(x1)\n      WHERE x1.name = 'bar'\n      RETURN x0.name",
-      "status": "known_gap",
-      "detail": "row count 0 != 1"
+      "status": "pass",
+      "detail": ""
     },
     {
       "feature": "MatchWhere6 - Filter optional matches",
       "scenario": "[5] Matching and optionally matching with unbound nodes and equality predicate in reverse direction",
       "line": "120",
       "query": "MATCH (a1)-[r]->()\n      WITH r, a1\n        LIMIT 1\n      OPTIONAL MATCH (a2)<-[r]-(b2)\n      WHERE a1 = a2\n      RETURN a1, r, b2, a2",
-      "status": "known_gap",
-      "detail": "row count 0 != 1"
+      "status": "pass",
+      "detail": ""
     },
     {
       "feature": "MatchWhere6 - Filter optional matches",
       "scenario": "[6] Join nodes on non-equality of properties \u2013 OPTIONAL MATCH and WHERE",
       "line": "140",
       "query": "MATCH (x:X)\n      OPTIONAL MATCH (x)-[:E1]->(y:Y)\n      WHERE x.val < y.val\n      RETURN x, y",
-      "status": "known_gap",
-      "detail": "row count 2 != 3"
+      "status": "pass",
+      "detail": ""
     },
     {
       "feature": "MatchWhere6 - Filter optional matches",
       "scenario": "[7] Join nodes on non-equality of properties \u2013 OPTIONAL MATCH on two relationships and WHERE",
       "line": "163",
       "query": "MATCH (x:X)\n      OPTIONAL MATCH (x)-[:E1]->(y:Y)-[:E2]->(z:Z)\n      WHERE x.val < z.val\n      RETURN x, y, z",
-      "status": "known_gap",
-      "detail": "row count 1 != 3"
+      "status": "pass",
+      "detail": ""
     },
     {
       "feature": "MatchWhere6 - Filter optional matches",
       "scenario": "[8] Join nodes on non-equality of properties \u2013 Two OPTIONAL MATCH clauses and WHERE",
       "line": "186",
       "query": "MATCH (x:X)\n      OPTIONAL MATCH (x)-[:E1]->(y:Y)\n      OPTIONAL MATCH (y)-[:E2]->(z:Z)\n      WHERE x.val < z.val\n      RETURN x, y, z",
-      "status": "known_gap",
-      "detail": "row count 1 != 3"
+      "status": "pass",
+      "detail": ""
     },
     {
       "feature": "Return1 - Return single variable (correct return of values according to their type)",
@@ -5862,8 +5862,8 @@
       "scenario": "[13] Projecting a map of nodes and relationships",
       "line": "217",
       "query": "MATCH (n)-[r]->(m)\n      RETURN {node1: n, rel: r, node2: m} AS m",
-      "status": "known_gap",
-      "detail": "missing expected row: {'m': {'node1': {'__type': 'node', 'labels': ['A'], 'properties': {}}, 'rel': {'__type': 'rel', 'type': 'T', 'properties': {}}, 'node2': {'__type': 'node', 'labels': ['B'], 'properties': {}}}}"
+      "status": "pass",
+      "detail": ""
     },
     {
       "feature": "Return3 - Return multiple expressions (if column order correct)",
@@ -6078,8 +6078,8 @@
       "scenario": "[16] Aggregation on complex expressions",
       "line": "267",
       "query": "MATCH (me)-[r1:ATE]->()<-[r2:ATE]-(you)\n      WHERE me.name = 'Michael'\n      WITH me, count(DISTINCT r1) AS H1, count(DISTINCT r2) AS H2, you\n      MATCH (me)-[r1:ATE]->()<-[r2:ATE]-(you)\n      RETURN me, you, sum((1 - abs(r1.times / H1 - r2.times / H2)) * (r1.times + r2.times) / (H1 + H2)) AS sum",
-      "status": "known_gap",
-      "detail": "row count 3 != 2"
+      "status": "pass",
+      "detail": ""
     },
     {
       "feature": "Return6 - Implicit grouping with aggregates",
@@ -6614,8 +6614,8 @@
       "scenario": "[13] Multiple unwinds after each other",
       "line": "241",
       "query": "WITH [1, 2] AS xs, [3, 4] AS ys, [5, 6] AS zs\n      UNWIND xs AS x\n      UNWIND ys AS y\n      UNWIND zs AS z\n      RETURN *",
-      "status": "known_gap",
-      "detail": "missing expected row: {'x': 1, 'xs': [1, 2], 'y': 3, 'ys': [3, 4], 'z': 5, 'zs': [5, 6]}"
+      "status": "pass",
+      "detail": ""
     },
     {
       "feature": "With1 - Forward single variable",
@@ -6630,8 +6630,8 @@
       "scenario": "[2] Forwarind a node variable 2",
       "line": "52",
       "query": "MATCH (a:A)\n      WITH a\n      MATCH (x:X), (a)-->(b)\n      RETURN *",
-      "status": "known_gap",
-      "detail": "missing expected row: {'a': {'__type': 'node', 'labels': ['A'], 'properties': {}}, 'b': {'__type': 'node', 'labels': ['B'], 'properties': {}}, 'x': {'__type': 'node', 'labels': ['X'], 'properties': {}}}"
+      "status": "pass",
+      "detail": ""
     },
     {
       "feature": "With1 - Forward single variable",
@@ -6790,8 +6790,8 @@
       "scenario": "[1] A simple pattern with one bound endpoint",
       "line": "33",
       "query": "MATCH (a:A)-[r:REL]->(b:B)\n      WITH a AS b, b AS tmp, r AS r\n      WITH b AS a, r\n      LIMIT 1\n      MATCH (a)-[r]->(b)\n      RETURN a, r, b",
-      "status": "known_gap",
-      "detail": "row count 0 != 1"
+      "status": "pass",
+      "detail": ""
     },
     {
       "feature": "With7 - WITH on WITH",
@@ -7142,8 +7142,8 @@
       "scenario": "[3] Connected components succeeding WITH with LIMIT",
       "line": "106",
       "query": "MATCH (n:A)\n      WITH n\n      LIMIT 1\n      MATCH (m:B), (n)-->(x:X)\n      RETURN *",
-      "status": "known_gap",
-      "detail": "missing expected row: {'m': {'__type': 'node', 'labels': ['B'], 'properties': {}}, 'n': {'__type': 'node', 'labels': ['A'], 'properties': {}}, 'x': {'__type': 'node', 'labels': ['X'], 'properties': {}}}"
+      "status": "pass",
+      "detail": ""
     },
     {
       "feature": "WithSkipLimit2 - Limit",
@@ -7822,8 +7822,8 @@
       "scenario": "[14] Direction of traversed relationship is not significant for path equality, simple",
       "line": "276",
       "query": "MATCH p1 = (:A)-->()\n      MATCH p2 = (:A)<--()\n      RETURN p1 = p2",
-      "status": "known_gap",
-      "detail": "row count 0 != 1"
+      "status": "pass",
+      "detail": ""
     },
     {
       "feature": "Comparison1 - Equality",
@@ -9326,8 +9326,8 @@
       "scenario": "[5] Return a single-quoted string with escaped characters",
       "line": "78",
       "query": "RETURN 'a\\\\bcn5t\\'\"\\\\//\\\\\"\\'' AS literal",
-      "status": "known_gap",
-      "detail": "missing expected row: {'literal': 'a\\\\\\\\bcn5t\\'\"\\\\\\\\//\\\\\\\\\"\\''}"
+      "status": "pass",
+      "detail": ""
     },
     {
       "feature": "Literals6 - String",
@@ -9734,8 +9734,8 @@
       "scenario": "[5] Using `keys()` and `IN` to check field existence",
       "line": "90",
       "query": "WITH {exists: 42, notMissing: null} AS map\n      RETURN 'exists' IN keys(map) AS a,\n             'notMissing' IN keys(map) AS b,\n             'missing' IN keys(map) AS c",
-      "status": "known_gap",
-      "detail": "missing expected row: {'a': True, 'b': True, 'c': False}"
+      "status": "pass",
+      "detail": ""
     },
     {
       "feature": "Mathematical11 - Signed numbers functions",
@@ -10030,24 +10030,24 @@
       "scenario": "[16] Matching two nodes on a specific type of a variable length outgoing directed connection",
       "line": "303",
       "query": "MATCH (n), (m) WHERE (n)-[:REL1*]->(m) RETURN n, m",
-      "status": "known_gap",
-      "detail": "row count 4 != 2"
+      "status": "pass",
+      "detail": ""
     },
     {
       "feature": "Pattern1 - Pattern predicate",
       "scenario": "[17] Matching two nodes on a specific type of variable length undirected connection",
       "line": "319",
       "query": "MATCH (n), (m) WHERE (n)-[:REL1*]-(m) RETURN n, m",
-      "status": "known_gap",
-      "detail": "row count 12 != 6"
+      "status": "pass",
+      "detail": ""
     },
     {
       "feature": "Pattern1 - Pattern predicate",
       "scenario": "[18] Matching two nodes on a specific type of undirected connection with length 2",
       "line": "339",
       "query": "MATCH (n), (m) WHERE (n)-[:REL1*2]-(m) RETURN n, m",
-      "status": "known_gap",
-      "detail": "row count 8 != 2"
+      "status": "pass",
+      "detail": ""
     },
     {
       "feature": "Pattern1 - Pattern predicate",
@@ -11286,16 +11286,16 @@
       "scenario": "[10] Mixing directed and undirected pattern parts with self-relationship, count",
       "line": "178",
       "query": "MATCH (:A)-->()--()\n      RETURN count(*)",
-      "status": "known_gap",
-      "detail": "missing expected row: {'count(*)': 2}"
+      "status": "pass",
+      "detail": ""
     },
     {
       "feature": "CountingSubgraphMatches1 - Matching subgraph patterns and count the number of matches",
       "scenario": "[11] Mixing directed and undirected pattern parts with self-relationship, undirected count",
       "line": "196",
       "query": "MATCH ()-[]-()-[]-()\n      RETURN count(*)",
-      "status": "known_gap",
-      "detail": "missing expected row: {'count(*)': 6}"
+      "status": "pass",
+      "detail": ""
     },
     {
       "feature": "TriadicSelection1 - Query three related nodes on binary-tree graphs",

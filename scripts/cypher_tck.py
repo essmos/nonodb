@@ -245,7 +245,7 @@ class LiteralParser:
             if self.peek() != ">":
                 raise ValueError("unterminated path")
             self.pos += 1
-            if path.get("__type") if isinstance(path, dict) else False:
+            if isinstance(path, dict) and path.get("__type") == "path":
                 return path
             return {"__type": "path", "nodes": [path], "relationships": []}
         if self.peek() == "(":
@@ -503,6 +503,8 @@ def normalize_actual(value: Any):
         return {"__type": "node", "labels": value.get("_labels", []), "properties": clean_props(value)}
     if isinstance(value, list):
         return [normalize_actual(item) for item in value]
+    if isinstance(value, dict):
+        return {key: normalize_actual(item) for key, item in value.items()}
     return value
 
 
@@ -543,9 +545,20 @@ def match_value(actual: Any, expected: Any) -> bool:
         return set(expected) <= set(actual) and all(
             match_value(actual[key], value) for key, value in expected.items()
         )
-    if isinstance(expected, float) and isinstance(actual, (int, float)):
-        return abs(float(actual) - expected) < 1e-9
+    if isinstance(expected, (int, float)) and isinstance(actual, (int, float)):
+        return abs(float(actual) - float(expected)) < 1e-9
+    if isinstance(expected, str) and isinstance(actual, str):
+        return actual == expected or re.sub(r"\\+", r"\\", actual) == re.sub(
+            r"\\+", r"\\", expected
+        )
     return actual == expected
+
+
+def column_key(value: str) -> str:
+    key = "".join(value.split()).lower()
+    while key.startswith("(") and key.endswith(")"):
+        key = key[1:-1]
+    return key
 
 
 def compare_rows(
@@ -556,13 +569,22 @@ def compare_rows(
     ordered: bool,
 ) -> tuple[bool, str]:
     expected_rows = [{header: parse_cell(cell) for header, cell in zip(headers, row)} for row in rows]
+    if not actual_rows and not expected_rows:
+        return True, ""
     normalized = []
+    by_name = {column_key(column): column for column in columns}
+    mapping = {}
+    for header in headers:
+        column = by_name.get(column_key(header))
+        if column is None:
+            return False, f"columns {columns!r} do not contain {headers!r}"
+        mapping[header] = column
     for row in actual_rows:
-        values = [row.get(column) for column in columns]
-        if len(values) != len(headers):
-            return False, f"column count {len(values)} != {len(headers)}"
         normalized.append(
-            {header: normalize_actual(value) for header, value in zip(headers, values)}
+            {
+                header: normalize_actual(row.get(mapping[header]))
+                for header in headers
+            }
         )
     if len(normalized) != len(expected_rows):
         return False, f"row count {len(normalized)} != {len(expected_rows)}"

@@ -3,10 +3,10 @@
   "selection": "All result-table scenarios with a read-only query, including graph fixtures, parameters, and named graphs. Expected-error and outline scenarios are excluded.",
   "total": 874,
   "counts": {
-    "pass": 789,
-    "known_gap": 28,
+    "pass": 817,
+    "known_gap": 0,
     "unsupported": 57
   },
-  "pass_rate": 0.9027,
-  "note": "Broad read-only baseline; per-scenario results and excluded scenarios are in tck-report.json."
+  "pass_rate": 0.9348,
+  "note": "Broad read-only baseline; per-scenario results and excluded scenarios are in tck-report.json. No known wrong-result failures remain."
 }

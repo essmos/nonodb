@@ -119,11 +119,10 @@ write queries, custom `test.*` procedures, and unsupported fixture syntax are
 excluded; each excluded scenario and its reason are listed in the committed
 [`tck-report.json`](tck-report.json), not silently skipped.
 
-Current baseline: **789 / 874 pass (90.27%)**, with **28 known-gap mismatches**
-and **57 explicit unsupported cases**. The known gaps are real semantic
-differences (for example optional-match joins and rare variable-length pattern
-shapes); they are reported per scenario in `tck-report.json`. Unsupported syntax
-returns `invalid_query`, never a silent success.
+Current baseline: **817 / 874 pass (93.48%)**, with **0 known wrong-result
+mismatches** and **57 explicit unsupported cases**. Unsupported syntax returns
+`invalid_query`, never a silent success. Each unsupported scenario and reason is
+listed in `tck-report.json`.
 
 ```bash
 scripts/fetch-opencypher-tck.sh /tmp/opencypher-tck
@@ -134,4 +133,4 @@ python3 scripts/cypher_tck.py \
   --output tck-report.json
 ```
 
-The harness runs in CI and fails below 90%.
+The harness runs in CI and fails below 90% or on any known wrong-result mismatch.

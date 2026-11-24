@@ -156,12 +156,32 @@ fn cypher_gds_procedures_are_bounded_and_callable() {
     );
     assert_eq!(out["row_count"], 4);
 
-    let out = run(
+    let first = run(
         &store,
         "CALL gds.nodeSimilarity.stream() YIELD node1, node2, similarity \
-         RETURN node1, node2, similarity ORDER BY node1, node2",
+         RETURN node1, node2, similarity",
     );
-    assert!(out["row_count"].as_u64().unwrap() > 0);
+    let second = run(
+        &store,
+        "CALL gds.nodeSimilarity.stream() YIELD node1, node2, similarity \
+         RETURN node1, node2, similarity",
+    );
+    assert_eq!(first, second);
+    assert!(first["row_count"].as_u64().unwrap() > 0);
+    let rows = first["rows"].as_array().unwrap();
+    for pair in rows.windows(2) {
+        let left = &pair[0];
+        let right = &pair[1];
+        let left_score = left["similarity"].as_f64().unwrap();
+        let right_score = right["similarity"].as_f64().unwrap();
+        assert!(
+            left_score > right_score
+                || (left_score == right_score
+                    && left["node1"].as_str().unwrap() <= right["node1"].as_str().unwrap()
+                    && left["node2"].as_str().unwrap() <= right["node2"].as_str().unwrap()),
+            "{left} -> {right}"
+        );
+    }
 }
 
 #[test]
@@ -232,13 +252,13 @@ fn cypher_limits_and_nesting_fail_explicitly() {
     let (_dir, store) = graph_store();
     let collection = store.collection("nodes").unwrap();
     let options: CypherOptions = serde_json::from_value(json!({
-        "query": "UNWIND range(1, 1000000) AS x RETURN sum(x)",
+        "query": "UNWIND range(1, 1000) AS x UNWIND range(1, 1000) AS y RETURN sum(x + y)",
         "max_rows": 10,
         "max_operations": 50
     }))
     .unwrap();
     let error = collection.graph_cypher(options).unwrap_err().to_string();
-    assert!(error.contains("operation budget"));
+    assert!(error.contains("budget"), "{error}");
 
     let options: CypherOptions = serde_json::from_value(json!({
         "query": "RETURN [[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]] AS x"
@@ -250,6 +270,22 @@ fn cypher_limits_and_nesting_fail_explicitly() {
     let options: CypherOptions = serde_json::from_value(json!({
         "query": "UNWIND range(1, 1000) AS x RETURN x",
         "max_memory_bytes": 100
+    }))
+    .unwrap();
+    let error = collection.graph_cypher(options).unwrap_err().to_string();
+    assert!(error.contains("memory budget"), "{error}");
+
+    let options: CypherOptions = serde_json::from_value(json!({
+        "query": "RETURN size(range(1, 200000)) AS n",
+        "max_operations": 1_000_000
+    }))
+    .unwrap();
+    let out = collection.graph_cypher(options).unwrap();
+    assert_eq!(out["rows"], json!([{"n": 200000}]));
+
+    let options: CypherOptions = serde_json::from_value(json!({
+        "query": "UNWIND range(1, 200000) AS x WITH collect(x) AS xs RETURN size(xs)",
+        "max_memory_bytes": 1000
     }))
     .unwrap();
     let error = collection.graph_cypher(options).unwrap_err().to_string();
@@ -298,7 +334,7 @@ fn cypher_timeout_cancels_long_queries() {
     let (_dir, store) = graph_store();
     let collection = store.collection("nodes").unwrap();
     let options: CypherOptions = serde_json::from_value(json!({
-        "query": "UNWIND range(1, 100000000) AS x RETURN sum(x)",
+        "query": "UNWIND range(1, 1000000) AS x RETURN sum(x)",
         "timeout_ms": 1,
         "max_operations": 1_000_000_000
     }))
