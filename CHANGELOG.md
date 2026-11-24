@@ -4,6 +4,10 @@ Full release notes: https://github.com/essmos/nonodb/releases
 
 ## Unreleased
 
+- Keep synthetic time-series ids stable when a pending row is deleted or moved
+  and the open bucket is later sealed: sealing now preserves sequence gaps as
+  deleted bitmap rows instead of renumbering the surviving rows. Added a pending
+  move test alongside the `findAndModify` index test.
 - Run time-series retention automatically in the daemon for collections with
   `expireAfterSeconds`, via the single writer thread, and request an offline
   compaction when deleted pages pass `NONODB_TS_COMPACT_THRESHOLD_MB`. The

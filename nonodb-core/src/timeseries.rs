@@ -1724,19 +1724,37 @@ fn seal_bucket(
         return Ok(0);
     };
     let prefix = row_base(hash, salt, window, serial);
-    let mut rows = Vec::new();
-    let mut keys = Vec::new();
+    let mut source: Vec<(u32, Map<String, Value>, Vec<u8>)> = Vec::new();
+    let mut max_seq = None;
     for item in db.prefix_iter(&*wtxn, &prefix)? {
         let (key, value) = item?;
-        keys.push(key.to_vec());
-        rows.push(serde_json::from_slice::<Map<String, Value>>(value)?);
+        if key.len() != 27 {
+            return Err(corrupt("malformed pending row key"));
+        }
+        let seq = u32::from_be_bytes(key[23..27].try_into().expect("4 bytes"));
+        max_seq = Some(max_seq.map_or(seq, |current: u32| current.max(seq)));
+        source.push((
+            seq,
+            serde_json::from_slice::<Map<String, Value>>(value)?,
+            key.to_vec(),
+        ));
     }
-    if rows.is_empty() {
+    let Some(max_seq) = max_seq else {
         return Ok(0);
+    };
+    let len = max_seq as usize + 1;
+    if len > HARD_BUCKET_MAX_DOCS {
+        return Err(corrupt("pending row sequence out of range"));
     }
+    // Synthetic ids encode the pending row's sequence number. Deleting a
+    // pending row leaves a gap; keep the gap (marked deleted) instead of
+    // renumbering the surviving rows, so previously returned ids stay valid.
+    let mut rows: Vec<Map<String, Value>> = vec![Map::new(); len];
+    let mut deleted = BTreeSet::new();
+    deleted.extend((0..len as u32).filter(|seq| !source.iter().any(|(s, _, _)| s == seq)));
     let mut end = window;
     let mut meta = None;
-    for row in &rows {
+    for (seq, row, _) in &source {
         let doc = Value::Object(row.clone());
         if let Some(ts) = extract_time(&doc, &settings.time_field) {
             end = end.max(ts);
@@ -1744,6 +1762,7 @@ fn seal_bucket(
         if meta.is_none() {
             meta = series_meta(&doc, settings);
         }
+        rows[*seq as usize] = row.clone();
     }
     let mut bucket = Bucket {
         sealed: true,
@@ -1751,14 +1770,14 @@ fn seal_bucket(
         end,
         meta,
         rows,
-        deleted: BTreeSet::new(),
+        deleted,
     };
     let tombs = tombstones(wtxn, db, hash, salt, window, serial)?;
     bucket.deleted.extend(tombs);
     drop_tombstones(wtxn, db, hash, salt, window, serial)?;
     let payload = encode_bucket(&bucket, settings)?;
     db.put(&mut *wtxn, bucket_key_bytes, &payload)?;
-    for key in keys {
+    for (_, _, key) in source {
         db.delete(&mut *wtxn, &key)?;
     }
     Ok(payload.len())
@@ -4182,10 +4201,31 @@ mod tests {
         assert_eq!(doc["value"], json!(1));
         assert_eq!(doc["device"]["id"], json!("zzz"));
 
+        // Moving a pending row to another time window removes the old key.
+        let out = c
+            .update_opts(
+                &json!({"_id": ids[0]}),
+                &json!({"$set": {"ts": {"$date": {"$numberLong": (base + 86_400_000).to_string()}}}}),
+                false,
+                false,
+            )
+            .unwrap();
+        assert_eq!(out.moved.len(), 1);
+        assert!(
+            c.find_by_key(&ids[0]).unwrap().is_none(),
+            "{:?}",
+            c.find_by_key(&ids[0]).unwrap()
+        );
+        assert!(c.find_by_key(&out.moved[0].1).unwrap().is_some());
+        // Sealing the old bucket preserved the sequence gaps, so the surviving
+        // pending ids did not shift.
+        assert!(c.find_by_key(&ids[1]).unwrap().is_some());
+        assert!(c.find_by_key(&ids[2]).unwrap().is_some());
+
         // Removing the time field from a row is rejected.
         let err = c
             .update_opts(
-                &json!({"_id": ids[0]}),
+                &json!({"_id": ids[2]}),
                 &json!({"$unset": {"ts": ""}}),
                 false,
                 false,
@@ -4458,9 +4498,18 @@ mod tests {
             "ts": {"$date": {"$numberLong": (base + 86_400_000).to_string()}},
             "level": 4
         }});
+        let moved_before = c.find_by_key(&changed_id).unwrap().unwrap();
         let moved = c.find_and_modify(&opts(&filter, &update, false)).unwrap();
         let moved_id = moved.new_id.as_ref().unwrap();
         assert_ne!(moved_id, &changed_id);
+        assert!(
+            c.find_by_key(&changed_id).unwrap().is_none(),
+            "{moved_before}"
+        );
+        assert_eq!(
+            c.find_by_key(moved_id).unwrap().unwrap()["value"],
+            moved_before["value"]
+        );
         assert_eq!(c.count(&json!({"level": 3})).unwrap(), 10);
         assert_eq!(c.count(&json!({"level": 4})).unwrap(), 11);
         assert_eq!(c.count(&json!({"_id": moved_id, "level": 4})).unwrap(), 1);
