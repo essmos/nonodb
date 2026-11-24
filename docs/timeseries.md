@@ -398,12 +398,35 @@ and sealed payloads is reclaimed when the bucket's whole window ages out
 (retention drops the bucket) or by compaction — see below. `delete` with
 `multi: false` removes at most one row.
 
-## Retention
+## Retention and compaction
 
 `retain_timeseries` deletes every row older than a cutoff. Buckets whose whole
 window is older are dropped by key with **no column decode**; the boundary
-bucket keeps its immutable payload and tombstones only the expired rows, so
+bucket keeps its immutable payload and marks only the expired rows deleted, so
 synthetic ids remain valid. Pending rows are inspected individually.
+
+The daemon runs retention automatically for every time-series collection whose
+settings have `expireAfterSeconds` > 0. The schedule is controlled by:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `NONODB_TS_RETENTION_INTERVAL_SECS` | `60` | How often to check collections; `0` disables automatic retention and compaction checks. |
+| `NONODB_TS_COMPACT_THRESHOLD_MB` | `256` | Size of `data.mdb` above which deleted time-series pages trigger a compaction request; `0` disables the request. |
+
+Retention runs online through the single writer thread, so `find`, cursors, live
+subscriptions, and replication keep working. LMDB does not shrink `data.mdb`
+when rows are deleted, so when deletions were observed and the file is at or
+above the threshold the daemon writes `.timeseries-compact-requested` and logs a
+warning. The compaction happens automatically **before the environment is
+opened on the next daemon startup** — no live connection is interrupted, and no
+write transaction can race the file swap. The marker is removed only after the
+new file is fsynced and the old file swapped out.
+
+To apply it immediately, restart the daemon or run
+`nonodb-cli compact <data-dir>` while the daemon is stopped. The startup routine
+uses the same compacting copy as the CLI, keeps `data.mdb.before-compact` until
+the swap succeeds, and leaves the request marker in place if compaction fails so
+the next start retries.
 
 ```json
 {

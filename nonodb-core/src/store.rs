@@ -259,6 +259,63 @@ impl DerefMut for WriteTxn<'_> {
     }
 }
 
+/// Result of an offline compaction pass.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct CompactReport {
+    pub before_bytes: u64,
+    pub after_bytes: u64,
+}
+
+/// Rewrites `data.mdb` through LMDB's compacting copy and swaps it in.
+///
+/// LMDB never shrinks the file when rows are deleted; this is the offline way
+/// to return freed pages to the filesystem. The environment must be closed:
+/// the directory is opened read-only, a compacted copy is written to
+/// `data.mdb.compacting`, fsynced, and atomically swapped in. The previous file
+/// is kept as `data.mdb.before-compact` until the swap succeeds.
+pub fn compact_data_dir(data: &Path) -> Result<CompactReport> {
+    let source = data.join("data.mdb");
+    if !source.is_file() {
+        return Err(Error::Query(format!("{} has no data.mdb", data.display())));
+    }
+    let before_bytes = std::fs::metadata(&source)?.len();
+    let tmp = data.join("data.mdb.compacting");
+    if tmp.exists() {
+        std::fs::remove_file(&tmp)?;
+    }
+    let env = unsafe {
+        EnvOpenOptions::new()
+            .flags(EnvFlags::READ_ONLY)
+            .open(data)
+            .map_err(|e| Error::Query(format!("open {}: {e}", data.display())))?
+    };
+    let file = env.copy_to_file(&tmp, heed::CompactionOption::Enabled)?;
+    file.sync_all()?;
+    env.prepare_for_closing().wait();
+
+    let backup = data.join("data.mdb.before-compact");
+    if backup.exists() {
+        std::fs::remove_file(&backup)?;
+    }
+    std::fs::rename(&source, &backup)?;
+    if let Err(error) = std::fs::rename(&tmp, &source) {
+        let _ = std::fs::rename(&backup, &source);
+        return Err(Error::Query(format!(
+            "compaction swap failed, original restored: {error}"
+        )));
+    }
+    std::fs::remove_file(&backup)?;
+    // Persist the directory entry so a crash cannot resurrect the old inode.
+    if let Ok(dir) = std::fs::File::open(data) {
+        let _ = dir.sync_all();
+    }
+    let after_bytes = std::fs::metadata(&source)?.len();
+    Ok(CompactReport {
+        before_bytes,
+        after_bytes,
+    })
+}
+
 /// Database handle. One `Store` = one `Env` = one LMDB file.
 pub struct Store {
     env: Env,
@@ -2627,5 +2684,61 @@ mod tests {
         assert_eq!(parse_size("512mb"), Some(512_000_000));
         assert_eq!(parse_size("1073741824"), Some(1 << 30));
         assert_eq!(parse_size("nonsense"), None);
+    }
+
+    #[test]
+    fn compact_data_dir_reclaims_deleted_timeseries_rows() {
+        use serde_json::json;
+        let dir = tempfile::tempdir().unwrap();
+        let store = super::Store::open(dir.path()).unwrap();
+        let settings = crate::timeseries::Settings {
+            time_field: "ts".into(),
+            meta_field: Some("device".into()),
+            ..Default::default()
+        };
+        let c = store
+            .create_timeseries_collection("metrics", &settings)
+            .unwrap();
+        for idx in 0..2000i64 {
+            c.insert_one(json!({
+                "ts": idx * 1000,
+                "device": {"id": format!("dev-{}", idx % 10)},
+                "value": idx,
+                "payload": "x".repeat(200),
+            }))
+            .unwrap();
+        }
+        store.seal_timeseries("metrics").unwrap();
+        assert_eq!(
+            c.delete(&json!({"value": {"$lt": 1900}}), true).unwrap(),
+            1900
+        );
+        store.close();
+
+        let before = std::fs::metadata(dir.path().join("data.mdb"))
+            .unwrap()
+            .len();
+        let report = super::compact_data_dir(dir.path()).unwrap();
+        assert!(report.after_bytes < before);
+        assert!(!dir.path().join("data.mdb.compacting").exists());
+        assert!(!dir.path().join("data.mdb.before-compact").exists());
+
+        let store = super::Store::open(dir.path()).unwrap();
+        let c = store.collection("metrics").unwrap();
+        assert_eq!(c.count(&json!({})).unwrap(), 100);
+        let docs = c
+            .find(&crate::collection::FindQuery {
+                filter: json!({}),
+                projection: None,
+                sort: Vec::new(),
+                skip: 0,
+                limit: Some(1),
+                comment: None,
+                max_time_ms: None,
+                hint: None,
+            })
+            .unwrap();
+        let id = docs[0]["_id"].as_str().unwrap();
+        assert!(c.find_by_key(id).unwrap().is_some());
     }
 }

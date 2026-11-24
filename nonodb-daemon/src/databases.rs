@@ -324,6 +324,14 @@ impl Databases {
 fn start_runtime(root: &Path, name: &str) -> Result<DatabaseRuntime, String> {
     let path = root.join(name);
     fs::create_dir_all(&path).map_err(|e| format!("create database `{name}`: {e}"))?;
+    if let Err(error) = crate::maintenance::compact_if_requested(&path) {
+        tracing::warn!(
+            database = name,
+            path = %path.display(),
+            error = %error,
+            "deferred time-series compaction; keeping the request marker"
+        );
+    }
     let store = Arc::new(Store::open(&path).map_err(|e| format!("open database `{name}`: {e}"))?);
     let (write_tx, write_rx) = mpsc::channel::<WriteJob>();
     let cache = Arc::new(QueryCache::from_env());
@@ -340,6 +348,7 @@ fn start_runtime(root: &Path, name: &str) -> Result<DatabaseRuntime, String> {
         store.clone(),
         write_tx.clone(),
         auto_index.clone(),
+        path.clone(),
         stop.clone(),
     );
     let webhooks =

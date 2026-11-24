@@ -1064,10 +1064,15 @@ fn execute(
         }
         WriteReq::RetainTimeSeries { coll, before_ms } => {
             let report = store.retain_timeseries_in(wtxn, coll, *before_ms)?;
-            replication.capture_op(ReplicationOp::TimeSeriesRetain {
-                coll: coll.clone(),
-                before_ms: *before_ms,
-            });
+            let changed = report.dropped_buckets > 0
+                || report.tombstoned_buckets > 0
+                || report.dropped_rows > 0;
+            if changed {
+                replication.capture_op(ReplicationOp::TimeSeriesRetain {
+                    coll: coll.clone(),
+                    before_ms: *before_ms,
+                });
+            }
             Ok(json!({
                 "coll": coll,
                 "before_ms": before_ms,
