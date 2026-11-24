@@ -359,10 +359,10 @@ Read that carefully, because it matters operationally:
   against a replica, exactly like any other LMDB high-water issue.
 - Deleted rows are bits in a per-bucket deletion bitmap appended to the columnar
   payload (one bit per row, so 1000 deleted rows cost 125 bytes instead of
-  27-byte tombstone keys). Retention keeps the boundary bucket's columnar
-  payload and sets expired bits (so synthetic ids stay valid), which is why the
-  post-retention file is slightly larger than a renumbered rewrite would be;
-  the whole window is dropped once it ages out. Buckets written by older
+  27-byte tombstone keys). Deleted row values are cleared on the next bucket
+  write, so their columns stop occupying space even though the sequence slots
+  remain (synthetic ids stay valid). Retention uses the same path for the
+  boundary bucket; the whole window is dropped once it ages out. Buckets written by older
   versions keep separate `0x03` tombstone keys; reads accept both formats and
   any write/seal folds the old keys into the bitmap.
 
@@ -401,7 +401,10 @@ logically immutable (the column data is never renumbered), so previously
 returned `_id`s stay valid, and a delete costs one bucket re-encode instead of
 one LMDB key per deleted row. A full bucket that becomes empty is dropped
 outright. `find`, `count`, `find_by_key`, aggregation, and `verify_data_dir` all
-skip deleted rows. `timeseries_stats()` reports them as `deleted_rows`.
+skip deleted rows. Deleted values are cleared when the bucket is re-encoded;
+`Store::compact_timeseries_buckets(name, min_deleted)` rewrites buckets that
+still contain deleted payload and returns a `BucketCompactReport` with
+before/after/reclaimed bytes. `timeseries_stats()` reports deleted rows.
 
 The bucket format is `NTB2` (bitmap appended after the columns). `NTB1` payloads
 and legacy `0x03` tombstone keys are still read; the next bucket write, delete,

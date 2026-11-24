@@ -1782,6 +1782,73 @@ fn merge_tombstones(
     Ok(())
 }
 
+/// Clears the payload of rows already marked deleted. Their sequence slots stay
+/// in place so synthetic `_id`s keep pointing at the same physical row, while
+/// column encoders no longer store their values.
+fn clear_deleted_rows(bucket: &mut Bucket) {
+    for seq in &bucket.deleted {
+        if let Some(row) = bucket.rows.get_mut(*seq as usize) {
+            row.clear();
+        }
+    }
+}
+
+/// Result of rewriting sealed buckets to drop deleted-row payloads.
+#[derive(Debug, Clone, Default)]
+pub struct BucketCompactReport {
+    pub compacted_buckets: usize,
+    pub before_bytes: u64,
+    pub after_bytes: u64,
+}
+
+impl BucketCompactReport {
+    pub fn reclaimed_bytes(&self) -> u64 {
+        self.before_bytes.saturating_sub(self.after_bytes)
+    }
+}
+
+/// Rewrites sealed buckets with at least `min_deleted` deleted rows, dropping
+/// their column values without renumbering surviving rows.
+pub fn compact_deleted_buckets(
+    wtxn: &mut RwTxn<'_>,
+    env: &heed::Env,
+    name: &str,
+    settings: &Settings,
+    min_deleted: usize,
+) -> Result<BucketCompactReport> {
+    let db =
+        env.create_database::<Bytes, Bytes>(wtxn, Some(&format!("{BUCKET_DB_PREFIX}{name}")))?;
+    let mut report = BucketCompactReport::default();
+    let mut candidates = Vec::new();
+    for item in db.iter(&*wtxn)? {
+        let (key, payload) = item?;
+        if key.first() != Some(&KEY_BUCKET) {
+            continue;
+        }
+        let (bucket, _) = decode_bucket_inner(payload, settings, None, None)?;
+        if bucket.deleted.len() >= min_deleted {
+            candidates.push((key.to_vec(), payload.to_vec(), bucket));
+        }
+    }
+    for (key, payload, mut bucket) in candidates {
+        let Some((hash, salt, window, serial)) = key_parts(&key) else {
+            continue;
+        };
+        report.before_bytes += payload.len() as u64;
+        clear_deleted_rows(&mut bucket);
+        let encoded = encode_bucket(&bucket, settings)?;
+        if encoded.len() < payload.len() {
+            db.put(&mut *wtxn, &key, &encoded)?;
+            report.compacted_buckets += 1;
+            report.after_bytes += encoded.len() as u64;
+        } else {
+            report.after_bytes += payload.len() as u64;
+        }
+        let _ = (hash, salt, window, serial);
+    }
+    Ok(report)
+}
+
 /// Re-encodes a bucket with its deletion bitmap and drops legacy tombstone keys.
 fn persist_bucket(
     wtxn: &mut RwTxn<'_>,
@@ -1792,6 +1859,7 @@ fn persist_bucket(
     loc: (u64, u32, i64, u16),
 ) -> Result<()> {
     merge_tombstones(wtxn, db, bucket, loc.0, loc.1, loc.2, loc.3)?;
+    clear_deleted_rows(bucket);
     let payload = encode_bucket(bucket, settings)?;
     db.put(&mut *wtxn, key, &payload)?;
     Ok(())
@@ -1859,6 +1927,7 @@ fn seal_bucket(
     let tombs = tombstones(wtxn, db, hash, salt, window, serial)?;
     bucket.deleted.extend(tombs);
     drop_tombstones(wtxn, db, hash, salt, window, serial)?;
+    clear_deleted_rows(&mut bucket);
     let payload = encode_bucket(&bucket, settings)?;
     db.put(&mut *wtxn, bucket_key_bytes, &payload)?;
     for (_, _, key) in source {
@@ -5122,6 +5191,55 @@ mod tests {
         d.insert_one(json!({"ts": 2, "seq": 1})).unwrap();
         assert!(d.create_index("seq", true).is_err());
         assert!(d.create_index("seq", false).is_ok());
+    }
+
+    #[test]
+    fn deleting_rows_reclaims_bucket_payload_and_keeps_ids() {
+        let (_dir, store) = ts_store();
+        let settings = Settings {
+            time_field: "ts".into(),
+            ..Settings::default()
+        };
+        let c = store
+            .create_timeseries_collection("metrics", &settings)
+            .unwrap();
+        let ids: Vec<String> = (0..20_000i64)
+            .map(|idx| {
+                c.insert_one(json!({"ts": idx * 1000, "value": idx}))
+                    .unwrap()
+            })
+            .collect();
+        let mut wtxn = store.write_txn().unwrap();
+        seal_all(&mut wtxn, store.env(), "metrics", &settings).unwrap();
+        wtxn.commit().unwrap();
+        let before = store
+            .timeseries_stats("metrics")
+            .unwrap()
+            .unwrap()
+            .encoded_bytes;
+
+        assert_eq!(
+            c.delete(&json!({"value": {"$lt": 10_000}}), true).unwrap(),
+            10_000
+        );
+        let after = store.timeseries_stats("metrics").unwrap().unwrap();
+        assert_eq!(after.rows, 10_000);
+        assert!(
+            after.encoded_bytes < before,
+            "payload did not shrink: {before} -> {}",
+            after.encoded_bytes
+        );
+        assert_eq!(
+            c.find_by_key(&ids[15_000]).unwrap().unwrap()["value"],
+            json!(15_000)
+        );
+        assert!(c.find_by_key(&ids[5_000]).unwrap().is_none());
+
+        let mut wtxn = store.write_txn().unwrap();
+        let report =
+            compact_deleted_buckets(&mut wtxn, store.env(), "metrics", &settings, 1).unwrap();
+        wtxn.commit().unwrap();
+        assert_eq!(report.reclaimed_bytes(), 0);
     }
 
     #[test]

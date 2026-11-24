@@ -769,6 +769,31 @@ impl Store {
         Ok(sealed)
     }
 
+    /// Re-encodes sealed buckets with at least `min_deleted` deleted rows,
+    /// dropping their column values while keeping synthetic ids stable.
+    pub fn compact_timeseries_buckets(
+        &self,
+        name: &str,
+        min_deleted: usize,
+    ) -> Result<crate::timeseries::BucketCompactReport> {
+        let mut wtxn = self.write_txn()?;
+        let collection = self.collection_in(&mut wtxn, name)?;
+        let Some(settings) = collection.timeseries_settings_in(&wtxn)? else {
+            return Err(Error::Query(format!(
+                "collection `{name}` is not a time-series collection"
+            )));
+        };
+        let report = crate::timeseries::compact_deleted_buckets(
+            &mut wtxn,
+            &self.env,
+            name,
+            &settings,
+            min_deleted,
+        )?;
+        wtxn.commit()?;
+        Ok(report)
+    }
+
     /// Removes time-series rows older than `before_ms`.
     pub fn retain_timeseries(
         &self,
