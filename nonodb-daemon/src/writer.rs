@@ -2357,6 +2357,79 @@ mod tests {
     }
 
     #[test]
+    fn out_and_merge_write_timeseries_targets() {
+        let (_dir, store) = setup();
+        let settings = nonodb_core::timeseries::Settings {
+            time_field: "ts".into(),
+            ..Default::default()
+        };
+        for name in ["source", "target"] {
+            execute_commit(
+                &store,
+                &WriteReq::CreateCollection {
+                    coll: name.into(),
+                    profile: CollectionProfile::TimeSeries,
+                    ttl_seconds: None,
+                    ttl_purge_history: None,
+                    timeseries: Some(settings.clone()),
+                },
+            )
+            .unwrap();
+        }
+        let source = store.collection("source").unwrap();
+        source
+            .insert_one(json!({"ts": 1, "k": 1, "v": "a", "keep": true}))
+            .unwrap();
+        source
+            .insert_one(json!({"ts": 2, "k": 2, "v": "b", "keep": false}))
+            .unwrap();
+        let target = store.collection("target").unwrap();
+        target
+            .insert_one(json!({"ts": 0, "k": 9, "old": true}))
+            .unwrap();
+
+        let out = execute_commit(
+            &store,
+            &WriteReq::Aggregate {
+                coll: "source".into(),
+                pipeline: vec![json!({"$match": {"keep": true}}), json!({"$out": "target"})],
+                max_time_ms: None,
+                database: "default".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(out["deleted"], 1);
+        assert_eq!(out["inserted"], 1);
+        let docs = all(&store, "target");
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0]["k"], 1);
+        assert!(docs[0].get("old").is_none());
+
+        target.create_index("k", true).unwrap();
+        target
+            .insert_one(json!({"ts": 5, "k": 2, "v": "old"}))
+            .unwrap();
+        source
+            .insert_one(json!({"ts": 3, "k": 3, "v": "c"}))
+            .unwrap();
+        assert_eq!(source.count(&json!({"k": 3})).unwrap(), 1);
+        let merged = execute_commit(
+            &store,
+            &WriteReq::Aggregate {
+                coll: "source".into(),
+                pipeline: vec![json!({"$merge": {"into": "target", "on": "k"}})],
+                max_time_ms: None,
+                database: "default".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(merged["matched"], 2);
+        assert_eq!(merged["inserted"], 1);
+        assert_eq!(all(&store, "target").len(), 3);
+        assert_eq!(target.count(&json!({"k": 2, "v": "b"})).unwrap(), 1);
+    }
+
+    #[test]
     fn merge_updates_inserts_and_preserves_unique_index() {
         let (_dir, store) = setup();
         let source = store.collection("source").unwrap();

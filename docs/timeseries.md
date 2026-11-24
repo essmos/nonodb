@@ -616,8 +616,8 @@ prepared statements were used. Reproduce the Timescale side with
   (deleted rows immediately free their value). Non-unique secondary, text,
   fuzzy, geo, and vector indexes are also supported. The planner is used by
   `find`/`count`/`explain` and by indexed updates/deletes.
-- `$out`/`$merge` are not supported for time-series rows (writes must go
-  through the bucket writer).
+- `$out`/`$merge` write to time-series targets through the bucket writer, so
+  indexes, events, and replication stay consistent.
 - Aggregation decodes the full time range into memory before running stages.
 - Point lookup by `_id` decodes the containing bucket (see above); deletes by
   `_id` use the locator directly.
