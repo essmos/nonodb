@@ -65,6 +65,9 @@ The following procedures are available through `CALL ... YIELD`:
 | `gds.degree.stream()` | `nodeId`, `degree`, `in`, `out` |
 | `gds.connectedComponents.stream()` | `nodeId`, `componentId`, `size` |
 | `gds.nodeSimilarity.stream()` | `node1`, `node2`, `similarity` |
+| `gds.labelPropagation.stream()` | `nodeId`, `label` |
+| `gds.kCore.stream()` | `nodeId`, `core` |
+| `gds.degreeDistribution.stream()` | `degree`, `count` |
 
 Definitions:
 
@@ -77,6 +80,11 @@ Definitions:
 - **Node similarity**: Jaccard similarity between neighbor sets, using both edge
   directions; pairs with similarity `<= 0` are omitted; results sorted by
   descending similarity.
+- **Label propagation**: deterministic synchronous propagation over both edge
+  directions, with label ids initialized to node ids; ties choose the
+  lexicographically smallest label.
+- **k-core**: deterministic peeling core number using both edge directions.
+- **Degree distribution**: histogram of `in + out` total degree.
 
 They run over the configured graph, are bounded by `max_rows`/`max_operations`,
 and use the same read-only transaction and authorization path as other graph
@@ -100,8 +108,14 @@ RETURN nodeId, score ORDER BY score DESC
 - `max_depth` bounds variable-length expansion (hard maximum 64);
 - literal/pattern nesting is capped at 16 levels to prevent parser stack
   exhaustion;
-- the GDS procedures process at most 1,000 nodes, emit at most `max_rows` (and
-  set `truncated:true` when clipped), and receive the same timeout budget;
+- the GDS procedures use configurable `gds_max_nodes` (default 100,000, max
+  1,000,000), `gds_max_edges` (default 1,000,000, max 10,000,000),
+  `gds_max_memory_bytes` (default 256 MiB, max 1 GiB), and `gds_timeout_ms`
+  (falling back to `timeout_ms` when unset); they emit at most `max_rows` and
+  set `truncated:true` when the algorithm output is larger, with no hidden
+  10,000-row cap;
+- GDS node, edge, memory, and timeout overruns fail explicitly with
+  `invalid_query` instead of returning an incomplete graph;
 - unsupported syntax fails explicitly with `invalid_query`, never a silent
   wrong result;
 - vault collections are rejected, and graph reads require scope on the node

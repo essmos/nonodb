@@ -181,7 +181,12 @@ client timeout with `NONODB_TIMEOUT` or the `timeout=` argument.
 | [`cypher`](#read-only-cypher) | Read-only Cypher query execution |
 | [`all_shortest_paths`](#graph) | Every shortest path with bounded output |
 | [`graph_match`](#graph) | Linear variable-length pattern matching |
-| [`graph_algorithm`](#graph) | PageRank, degree centrality, connected components |
+| [`graph_algorithm`](#graph) | PageRank, degree centrality, components, label propagation, k-core, degree distribution |
+| [`start_graph_job`](#background-analytics-jobs) | Start an analytics algorithm in the background |
+| [`graph_job_status`](#background-analytics-jobs) | Read job state, progress, and error |
+| [`graph_job_result`](#background-analytics-jobs) | Read a completed job result |
+| [`cancel_graph_job`](#background-analytics-jobs) | Cooperatively cancel a job |
+| [`export_graph_job`](#background-analytics-jobs) | Atomically export a result to a collection |
 | [`watch`](#watch) | Long-poll append-only events by sortable `_id` |
 | [`explain`](#explain) | Show the selected plan, bounds, and actual counts |
 | [`update`](#update) | Update or upsert documents |
@@ -2342,7 +2347,12 @@ operations are:
 | `shortest_path` | BFS hops or Dijkstra over edge weights |
 | `all_shortest_paths` | Every shortest path, capped by `limit_paths`/`limit_nodes` |
 | `graph_match` | Linear variable-length pattern with per-step filters |
-| `graph_algorithm` | PageRank, degree centrality, or weakly connected components |
+| `graph_algorithm` | PageRank, degree centrality, components, label propagation, k-core, or degree distribution |
+| `start_graph_job` | Start the same bounded algorithm in the background |
+| `graph_job_status` | Read state, progress, timestamps, and error |
+| `graph_job_result` | Read the completed result |
+| `cancel_graph_job` | Request cooperative cancellation |
+| `export_graph_job` | Atomically write a completed result to a collection |
 
 ```json
 {"op":"traverse","coll":"nodes","start":["alice"],
@@ -2371,8 +2381,22 @@ atomic swap.
 `all_shortest_paths` returns all shortest paths with `limit_paths` and
 `limit_nodes`; `weighted:true` uses Dijkstra. `graph_match` takes a `pattern`
 array of `{direction, labels, min_hops, max_hops, edge_filter, node_filter}`
-segments. `graph_algorithm` takes `kind` = `pagerank`, `degree_centrality`, or
-`connected_components`, bounded by `limit` and `max_nodes`.
+segments. `graph_algorithm` takes `kind` = `pagerank`, `degree_centrality`,
+`connected_components`, `label_propagation`, `k_core`, or `degree_distribution`,
+bounded by `limit`, `max_nodes`, `max_edges`, `max_memory_bytes`, and
+`timeout_ms`; execution-budget overruns are explicit errors.
+
+### Background analytics jobs
+
+`start_graph_job` runs the same options in the background and returns a
+`job_id`; `graph_job_status`, `graph_job_result`, and `cancel_graph_job` manage
+that job. States are `queued`, `running`, `cancelling`, `exporting`, `completed`, `failed`,
+and `cancelled`. Status includes a `progress` object with `phase`, `done`, and
+`total`. Jobs are database-scoped, owner-isolated, and bounded to two concurrent
+runs per database. `export_graph_job` atomically copies a completed result into
+a target collection with deterministic ids; a failed export restores the result,
+and a successful export consumes the in-memory
+result.
 
 Graph configuration requires admin scope on both collections; graph reads
 require a read scope on the node **and** edge collections. Vault collections are

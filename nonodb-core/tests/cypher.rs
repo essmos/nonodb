@@ -336,6 +336,16 @@ fn cypher_gds_clamps_large_row_limits_and_reports_truncation() {
     }))
     .unwrap();
     let out = nodes.graph_cypher(options).unwrap();
+    assert_eq!(out["row_count"], 1_500);
+    assert_eq!(out["truncated"], false);
+
+    let options: CypherOptions = serde_json::from_value(json!({
+        "query": "CALL gds.pagerank.stream() YIELD nodeId, score RETURN nodeId, score",
+        "max_rows": 1_000,
+        "max_operations": 10_000_000
+    }))
+    .unwrap();
+    let out = nodes.graph_cypher(options).unwrap();
     assert_eq!(out["row_count"], 1_000);
     assert_eq!(out["truncated"], true);
 }
@@ -448,6 +458,54 @@ fn cypher_is_deterministic_and_rejects_vault_collections() {
 }
 
 #[test]
+fn cypher_cheap_gds_procedures_are_allowlisted_and_deterministic() {
+    let (_dir, store) = graph_store();
+    let labels = run(
+        &store,
+        "CALL gds.labelPropagation.stream() YIELD nodeId, label          RETURN nodeId, label ORDER BY nodeId",
+    );
+    assert_eq!(labels["row_count"], 4);
+    let again = run(
+        &store,
+        "CALL gds.labelPropagation.stream() YIELD nodeId, label          RETURN nodeId, label ORDER BY nodeId",
+    );
+    assert_eq!(labels, again);
+    let community_labels: std::collections::HashSet<&str> = labels["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["nodeId"] != "acme")
+        .map(|row| row["label"].as_str().unwrap())
+        .collect();
+    assert_eq!(community_labels.len(), 1, "{labels}");
+
+    let cores = run(
+        &store,
+        "CALL gds.kCore.stream() YIELD nodeId, core RETURN nodeId, core ORDER BY nodeId",
+    );
+    assert_eq!(cores["row_count"], 4);
+    assert!(cores["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|row| row["core"].as_u64().unwrap() > 0));
+
+    let distribution = run(
+        &store,
+        "CALL gds.degreeDistribution.stream() YIELD degree, count          RETURN degree, count ORDER BY degree",
+    );
+    assert!(distribution["row_count"].as_u64().unwrap() > 0);
+
+    let collection = store.collection("nodes").unwrap();
+    let options: CypherOptions = serde_json::from_value(json!({
+        "query": "CALL gds.notAllowed.stream() YIELD nodeId RETURN nodeId"
+    }))
+    .unwrap();
+    let err = collection.graph_cypher(options).unwrap_err().to_string();
+    assert!(err.contains("unsupported Cypher procedure"), "{err}");
+}
+
+#[test]
 fn cypher_timeout_cancels_long_queries() {
     let (_dir, store) = graph_store();
     let collection = store.collection("nodes").unwrap();
@@ -459,6 +517,59 @@ fn cypher_timeout_cancels_long_queries() {
     .unwrap();
     let error = collection.graph_cypher(options).unwrap_err().to_string();
     assert!(error.contains("timed out"), "{error}");
+}
+
+#[test]
+fn cypher_gds_processes_more_than_1000_nodes_and_honors_budgets() {
+    let dir = TempDir::new().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let nodes = store
+        .create_collection("nodes", nonodb_core::CollectionProfile::Standard)
+        .unwrap();
+    store
+        .create_collection("edges", nonodb_core::CollectionProfile::Standard)
+        .unwrap();
+    for i in 0..12_000 {
+        nodes
+            .insert_one(json!({"_id": format!("n{i:05}")}))
+            .unwrap();
+    }
+    let def: GraphDef = serde_json::from_value(json!({
+        "node_collection": "nodes",
+        "edge_collection": "edges"
+    }))
+    .unwrap();
+    nodes.set_graph(def).unwrap();
+
+    let options: CypherOptions = serde_json::from_value(json!({
+        "query": "CALL gds.pagerank.stream() YIELD nodeId, score RETURN nodeId, score",
+        "max_rows": 20_000,
+        "max_operations": 10_000_000,
+        "gds_max_nodes": 20_000
+    }))
+    .unwrap();
+    let out = nodes.graph_cypher(options).unwrap();
+    assert_eq!(out["row_count"], 12_000);
+    assert_eq!(out["truncated"], false);
+
+    let options: CypherOptions = serde_json::from_value(json!({
+        "query": "CALL gds.degree.stream() YIELD nodeId, degree RETURN nodeId, degree",
+        "max_rows": 1_000,
+        "max_operations": 10_000_000,
+        "gds_max_nodes": 20_000
+    }))
+    .unwrap();
+    let out = nodes.graph_cypher(options).unwrap();
+    assert_eq!(out["row_count"], 1_000);
+    assert_eq!(out["truncated"], true);
+
+    let options: CypherOptions = serde_json::from_value(json!({
+        "query": "CALL gds.pagerank.stream() YIELD nodeId, score RETURN nodeId, score",
+        "gds_max_nodes": 1_000
+    }))
+    .unwrap();
+    let err = nodes.graph_cypher(options).unwrap_err().to_string();
+    assert!(err.contains("node budget exceeded"), "{err}");
 }
 
 #[test]
