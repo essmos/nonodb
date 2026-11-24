@@ -337,7 +337,10 @@ impl AnalyticsManager {
             return Err(ApiError::forbidden());
         }
         match job.state {
-            JobState::Completed => Ok(job.result.clone().unwrap_or(Value::Null)),
+            JobState::Completed => job.result.clone().ok_or_else(|| ApiError {
+                code: "not_found".into(),
+                message: "analytics result was already exported".into(),
+            }),
             JobState::Failed | JobState::Cancelled => {
                 Err(job.error.clone().unwrap_or_else(|| ApiError {
                     code: "cancelled".into(),

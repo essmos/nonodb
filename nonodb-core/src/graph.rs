@@ -2348,6 +2348,31 @@ fn check_algorithm_memory(options: &GraphAlgorithmOptions, used: usize) -> Resul
     Ok(())
 }
 
+fn estimate_ids_memory(ids: &[String]) -> usize {
+    ids.iter()
+        .map(|id| id.len() + std::mem::size_of::<String>() + 32)
+        .sum()
+}
+
+fn estimate_adjacency_memory(ids: &[String], adjacency: &HashMap<String, Vec<AdjEdge>>) -> usize {
+    estimate_ids_memory(ids)
+        + adjacency
+            .values()
+            .map(|_| 64 + std::mem::size_of::<Vec<AdjEdge>>())
+            .sum::<usize>()
+        + adjacency
+            .values()
+            .flatten()
+            .map(|edge| {
+                std::mem::size_of::<AdjEdge>()
+                    + edge.edge_id.len()
+                    + edge.label.len()
+                    + edge.target.len()
+                    + 32
+            })
+            .sum::<usize>()
+}
+
 fn algorithm_nodes(
     view: &dyn GraphView,
     options: &GraphAlgorithmOptions,
@@ -2479,6 +2504,15 @@ fn pagerank(
         }
     }
     let mut scores: HashMap<String, f64> = ids.iter().map(|id| (id.clone(), 1.0 / n)).collect();
+    let mut working = estimate_adjacency_memory(&ids, &adjacency)
+        .saturating_add(
+            incoming
+                .values()
+                .map(|parents| parents.iter().map(|p| p.len() + 48).sum::<usize>())
+                .sum::<usize>(),
+        )
+        .saturating_add(ids.len().saturating_mul(std::mem::size_of::<String>() + 32));
+    check_algorithm_memory(options, working)?;
     let mut converged = false;
     let mut iterations = 0usize;
     for iteration in 0..options.iterations {
@@ -2513,6 +2547,9 @@ fn pagerank(
             })
             .sum();
         scores = next;
+        working =
+            working.saturating_add(ids.len().saturating_mul(std::mem::size_of::<String>() + 48));
+        check_algorithm_memory(options, working)?;
         iterations += 1;
         if delta < options.tolerance {
             converged = true;
@@ -2631,6 +2668,11 @@ fn label_propagation(
     )?;
     let mut labels: HashMap<String, String> =
         ids.iter().map(|id| (id.clone(), id.clone())).collect();
+    let mut working = estimate_adjacency_memory(&ids, &adjacency).saturating_add(
+        ids.len()
+            .saturating_mul(2 * (std::mem::size_of::<String>() + 32)),
+    );
+    check_algorithm_memory(options, working)?;
     let mut converged = false;
     let mut iterations = 0usize;
     for iteration in 0..options.iterations {
@@ -2665,6 +2707,9 @@ fn label_propagation(
             }
         }
         labels = next;
+        working =
+            working.saturating_add(ids.len().saturating_mul(std::mem::size_of::<String>() + 32));
+        check_algorithm_memory(options, working)?;
         iterations += 1;
         if !changed {
             converged = true;
@@ -2727,6 +2772,18 @@ fn k_core(
         .map(|id| std::cmp::Reverse((degree[id], id.clone())))
         .collect();
     let mut core: HashMap<String, usize> = HashMap::new();
+    let mut working = estimate_adjacency_memory(&ids, &adjacency)
+        .saturating_add(
+            neighbors
+                .values()
+                .map(|set| 64 + set.iter().map(|n| n.len() + 48).sum::<usize>())
+                .sum::<usize>(),
+        )
+        .saturating_add(
+            ids.len()
+                .saturating_mul(3 * (std::mem::size_of::<String>() + 32)),
+        );
+    check_algorithm_memory(options, working)?;
     while let Some(std::cmp::Reverse((d, id))) = heap.pop() {
         check_algorithm_timeout(options, started)?;
         check_algorithm_observer(observer)?;
@@ -2734,6 +2791,8 @@ fn k_core(
             continue;
         }
         core.insert(id.clone(), d);
+        working = working.saturating_add(id.len() + std::mem::size_of::<String>() + 32);
+        check_algorithm_memory(options, working)?;
         note_algorithm_progress(observer, "k_core", core.len(), Some(ids.len()));
         if let Some(set) = neighbors.get(&id) {
             for neighbor in set {
@@ -2741,7 +2800,7 @@ fn k_core(
                     continue;
                 }
                 if let Some(value) = degree.get_mut(neighbor) {
-                    if *value > 0 {
+                    if *value > d {
                         *value -= 1;
                         heap.push(std::cmp::Reverse((*value, neighbor.clone())));
                     }
@@ -2803,14 +2862,17 @@ fn degree_distribution(
         let degree = outgoing.get(id).map_or(0, Vec::len) + incoming.get(id).map_or(0, Vec::len);
         *histogram.entry(degree).or_default() += 1;
     }
-    let items: Vec<Value> = histogram
+    let mut items: Vec<Value> = histogram
         .into_iter()
         .map(|(degree, count)| json!({"degree": degree, "count": count}))
         .collect();
+    let limited = items.len() > options.limit;
+    items.truncate(options.limit);
     Ok(json!({
         "kind": "degree_distribution",
         "items": items,
         "nodes": ids.len(),
+        "truncated": limited,
     }))
 }
 
@@ -2835,6 +2897,8 @@ fn connected_components(
     check_algorithm_timeout(options, started)?;
     let mut seen: HashSet<String> = HashSet::new();
     let mut components: Vec<(String, Vec<String>)> = Vec::new();
+    let mut working = estimate_adjacency_memory(&ids, &adjacency);
+    check_algorithm_memory(options, working)?;
     let mut truncated = false;
     let mut walked = 0usize;
     for id in &ids {
@@ -2858,6 +2922,8 @@ fn connected_components(
                 check_algorithm_observer(observer)?;
             }
             members.push(current.clone());
+            working = working.saturating_add(current.len() + std::mem::size_of::<String>() + 32);
+            check_algorithm_memory(options, working)?;
             if let Some(edges) = adjacency.get(&current) {
                 for edge in edges {
                     if allowed.contains(edge.target.as_str()) && seen.insert(edge.target.clone()) {
@@ -3414,7 +3480,36 @@ mod tests {
         }))
         .unwrap();
         let out = graph_algorithm(&view(), &kcore).unwrap();
-        assert_eq!(out["items"][0]["core"], 2);
+        assert_eq!(
+            out["items"],
+            json!([
+                {"id": "a", "core": 2},
+                {"id": "b", "core": 2},
+                {"id": "c", "core": 2}
+            ])
+        );
+
+        let path_view = MockView {
+            edges: HashMap::from([
+                (
+                    "a".into(),
+                    vec![MockView::edge("p1", "a", "b", "ROAD", None)],
+                ),
+                (
+                    "b".into(),
+                    vec![MockView::edge("p2", "b", "c", "ROAD", None)],
+                ),
+            ]),
+        };
+        let out = graph_algorithm(&path_view, &kcore).unwrap();
+        assert_eq!(
+            out["items"],
+            json!([
+                {"id": "a", "core": 1},
+                {"id": "b", "core": 1},
+                {"id": "c", "core": 1}
+            ])
+        );
 
         let distribution: GraphAlgorithmOptions = serde_json::from_value(json!({
             "kind": "degree_distribution",
@@ -3430,6 +3525,16 @@ mod tests {
                 {"degree": 3, "count": 2}
             ])
         );
+        let limited: GraphAlgorithmOptions = serde_json::from_value(json!({
+            "kind": "degree_distribution",
+            "direction": "both",
+            "max_nodes": 100,
+            "limit": 1
+        }))
+        .unwrap();
+        let out = graph_algorithm(&view(), &limited).unwrap();
+        assert_eq!(out["items"], json!([{"degree": 2, "count": 1}]));
+        assert_eq!(out["truncated"], true);
 
         let labels: GraphAlgorithmOptions = serde_json::from_value(json!({
             "kind": "label_propagation",

@@ -271,7 +271,10 @@ are read-only, use the same `edge_filter`, `node_filter`, `as_of`, and `labels`
 options as traversal, and are bounded by `limit` (returned rows), `max_nodes`,
 `max_edges`, `max_memory_bytes`, and `timeout_ms`. Exceeding any execution budget
 fails explicitly with `invalid_query`; algorithms never return a silently
-truncated graph.
+truncated graph. `max_memory_bytes` accounts for node ids, adjacency, and the
+algorithm's working maps (scores/labels/core numbers/components) using
+conservative estimates, so it is enforced during computation rather than only
+for the final JSON.
 
 - `pagerank` returns `items` sorted by `score` descending, plus `iterations` and
   `converged`.
@@ -283,7 +286,7 @@ truncated graph.
 - `k_core` returns `items` with the peeling `core` number, using both edge
   directions.
 - `degree_distribution` returns `items` as `{degree, count}` in ascending degree
-  order.
+  order; `truncated` is set when `limit` cuts the histogram.
 
 ```json
 {"ok":true,"result":{

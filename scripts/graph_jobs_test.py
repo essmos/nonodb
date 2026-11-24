@@ -152,6 +152,12 @@ def main() -> int:
         exported = nodes.export_graph_job(small["job_id"], "rank_a")
         assert exported["exported"] == 10, exported
         first_ids = sorted(doc["_id"] for doc in db.collection("rank_a").find({}))
+        try:
+            nodes.graph_job_result(small["job_id"])
+        except NonoDBError as err:
+            assert "not_found" in str(err), err
+        else:
+            raise AssertionError("exported result must not be returned again")
 
         second_job = nodes.start_graph_job("pagerank", **{**job_args, "iterations": 1})
         assert wait_terminal(db, second_job["job_id"])["state"] == "completed"
