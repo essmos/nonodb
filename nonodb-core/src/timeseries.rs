@@ -2569,6 +2569,44 @@ fn refresh_pointers(wtxn: &mut RwTxn<'_>, db: &Database<Bytes, Bytes>) -> Result
 /// buckets whose every row matches are dropped by key. Pending rows are deleted
 /// individually and the open-bucket counters are recomputed. With
 /// `multi = false` at most one row is removed.
+#[derive(Default)]
+struct WriteFilter {
+    by_bucket: std::collections::HashMap<(u64, u32, i64, u16), std::collections::HashSet<u32>>,
+}
+
+impl WriteFilter {
+    fn from_ids(ids: &std::collections::HashSet<String>) -> Option<Self> {
+        let mut out = Self::default();
+        for id in ids {
+            let (hash, salt, window, serial, seq) = parse_row_id(id)?;
+            out.by_bucket
+                .entry((hash, salt, window, serial))
+                .or_default()
+                .insert(seq);
+        }
+        Some(out)
+    }
+
+    fn bucket_ok(&self, key: &[u8]) -> bool {
+        key_parts(key)
+            .map(|parts| (parts.0, parts.1, parts.2, parts.3))
+            .is_some_and(|loc| self.by_bucket.contains_key(&loc))
+    }
+
+    fn seq_ok(&self, key: &[u8], seq: u32) -> bool {
+        let loc = if key.first() == Some(&KEY_ROW) {
+            row_key_parts(key).map(|parts| (parts.0, parts.1, parts.2, parts.3))
+        } else {
+            key_parts(key).map(|parts| (parts.0, parts.1, parts.2, parts.3))
+        };
+        loc.is_some_and(|loc| {
+            self.by_bucket
+                .get(&loc)
+                .is_some_and(|seqs| seqs.contains(&seq))
+        })
+    }
+}
+
 pub fn delete(
     wtxn: &mut RwTxn<'_>,
     env: &heed::Env,
@@ -2577,6 +2615,31 @@ pub fn delete(
     filter: &Value,
     multi: bool,
 ) -> Result<usize> {
+    delete_inner(wtxn, env, name, settings, filter, multi, None)
+}
+
+/// Deletes rows restricted to secondary-index candidate ids.
+pub fn delete_with_ids(
+    wtxn: &mut RwTxn<'_>,
+    env: &heed::Env,
+    name: &str,
+    settings: &Settings,
+    filter: &Value,
+    multi: bool,
+    ids: &std::collections::HashSet<String>,
+) -> Result<usize> {
+    delete_inner(wtxn, env, name, settings, filter, multi, Some(ids))
+}
+
+fn delete_inner(
+    wtxn: &mut RwTxn<'_>,
+    env: &heed::Env,
+    name: &str,
+    settings: &Settings,
+    filter: &Value,
+    multi: bool,
+    candidate_ids: Option<&std::collections::HashSet<String>>,
+) -> Result<usize> {
     validate_filter(filter)?;
     let db =
         env.create_database::<Bytes, Bytes>(wtxn, Some(&format!("{BUCKET_DB_PREFIX}{name}")))?;
@@ -2584,6 +2647,7 @@ pub fn delete(
     let meta_hash = meta_equality_hash(filter, settings);
     let meta_filter = meta_only_filter(filter, settings);
     let now = crate::ttl::now_ms() as i64;
+    let write_filter = candidate_ids.and_then(WriteFilter::from_ids);
     let mut deleted = 0usize;
 
     let mut buckets: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
@@ -2596,6 +2660,11 @@ pub fn delete(
     for (key, payload) in buckets {
         if !multi && deleted > 0 {
             break;
+        }
+        if let Some(filter) = &write_filter {
+            if !filter.bucket_ok(&key) {
+                continue;
+            }
         }
         if let Some(expected) = meta_hash {
             if key_parts(&key).map(|parts| parts.0) != Some(expected) {
@@ -2622,6 +2691,12 @@ pub fn delete(
                 continue;
             }
             live += 1;
+            if write_filter
+                .as_ref()
+                .is_some_and(|filter| !filter.seq_ok(&key, seq))
+            {
+                continue;
+            }
             let mut doc = Value::Object(row.clone());
             if !row.contains_key("_id") {
                 set_path(
@@ -2673,6 +2748,12 @@ pub fn delete(
             let Some((hash, salt, window, serial, seq)) = row_key_parts(&key) else {
                 continue;
             };
+            if write_filter
+                .as_ref()
+                .is_some_and(|filter| !filter.seq_ok(&key, seq))
+            {
+                continue;
+            }
             if let Some(expected) = meta_hash {
                 if hash != expected {
                     continue;
@@ -3017,6 +3098,61 @@ pub fn update(
     array_filters: &[Value],
     upsert: bool,
 ) -> Result<UpdateReport> {
+    update_inner(
+        wtxn,
+        env,
+        name,
+        settings,
+        filter,
+        update,
+        multi,
+        array_filters,
+        upsert,
+        None,
+    )
+}
+
+/// Updates rows restricted to secondary-index candidate ids.
+#[allow(clippy::too_many_arguments)]
+pub fn update_with_ids(
+    wtxn: &mut RwTxn<'_>,
+    env: &heed::Env,
+    name: &str,
+    settings: &Settings,
+    filter: &Value,
+    update: &Value,
+    multi: bool,
+    array_filters: &[Value],
+    upsert: bool,
+    ids: &std::collections::HashSet<String>,
+) -> Result<UpdateReport> {
+    update_inner(
+        wtxn,
+        env,
+        name,
+        settings,
+        filter,
+        update,
+        multi,
+        array_filters,
+        upsert,
+        Some(ids),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn update_inner(
+    wtxn: &mut RwTxn<'_>,
+    env: &heed::Env,
+    name: &str,
+    settings: &Settings,
+    filter: &Value,
+    update: &Value,
+    multi: bool,
+    array_filters: &[Value],
+    upsert: bool,
+    candidate_ids: Option<&std::collections::HashSet<String>>,
+) -> Result<UpdateReport> {
     use crate::query::updater::{apply_upsert_with_options, apply_with_options, seed_from_filter};
 
     validate_filter(filter)?;
@@ -3026,6 +3162,7 @@ pub fn update(
     let meta_hash = meta_equality_hash(filter, settings);
     let meta_filter = meta_only_filter(filter, settings);
     let now = crate::ttl::now_ms() as i64;
+    let write_filter = candidate_ids.and_then(WriteFilter::from_ids);
     let mut report = UpdateReport::default();
     // A pure `_id` equality only needs the bucket encoded in that id.
     let direct = (!multi)
@@ -3047,9 +3184,17 @@ pub fn update(
             buckets.push((key.to_vec(), payload.to_vec()));
         }
     }
+    if std::env::var("TS_DEBUG").is_ok() {
+        eprintln!("UPDATE direct={:?} collected={}", direct, buckets.len());
+    }
     for (key, payload) in buckets {
         if !multi && report.matched > 0 {
             break;
+        }
+        if let Some(filter) = &write_filter {
+            if !filter.bucket_ok(&key) {
+                continue;
+            }
         }
         if let Some(expected) = meta_hash {
             if key_parts(&key).map(|parts| parts.0) != Some(expected) {
@@ -3075,6 +3220,12 @@ pub fn update(
                 break;
             }
             let seq = *idx as u32;
+            if write_filter
+                .as_ref()
+                .is_some_and(|filter| !filter.seq_ok(&key, seq))
+            {
+                continue;
+            }
             if bucket.deleted.contains(&seq) {
                 continue;
             }
@@ -3152,6 +3303,12 @@ pub fn update(
             let Some((hash, salt, window, serial, seq)) = row_key_parts(&key) else {
                 continue;
             };
+            if write_filter
+                .as_ref()
+                .is_some_and(|filter| !filter.seq_ok(&key, seq))
+            {
+                continue;
+            }
             if let Some((dhash, dsalt, dwindow, dserial, dseq)) = direct {
                 if (hash, salt, window, serial, seq) != (dhash, dsalt, dwindow, dserial, dseq) {
                     continue;
@@ -4651,6 +4808,94 @@ mod tests {
             let doc = c.find_by_key(id).unwrap().expect("inserted id");
             assert_eq!(doc["value"], json!(idx));
         }
+    }
+
+    #[test]
+    fn write_candidates_reach_sealed_buckets() {
+        let (_dir, store) = ts_store();
+        let settings = Settings {
+            time_field: "ts".into(),
+            ..Settings::default()
+        };
+        let c = store
+            .create_timeseries_collection("metrics", &settings)
+            .unwrap();
+        let ids: Vec<String> = (0..20i64)
+            .map(|idx| {
+                c.insert_one(json!({"ts": idx * 60_000, "value": idx, "flag": false}))
+                    .unwrap()
+            })
+            .collect();
+        let mut wtxn = store.write_txn().unwrap();
+        seal_all(&mut wtxn, store.env(), "metrics", &settings).unwrap();
+        wtxn.commit().unwrap();
+        let one: std::collections::HashSet<String> = [ids[3].clone()].into();
+        let mut wtxn = store.write_txn().unwrap();
+        let report = update_with_ids(
+            &mut wtxn,
+            store.env(),
+            "metrics",
+            &settings,
+            &json!({}),
+            &json!({"$set": {"flag": true}}),
+            true,
+            &[],
+            false,
+            &one,
+        )
+        .unwrap();
+        assert_eq!(report.matched, 1);
+        wtxn.commit().unwrap();
+        assert_eq!(c.count(&json!({"flag": true})).unwrap(), 1);
+        let mut wtxn = store.write_txn().unwrap();
+        let two: std::collections::HashSet<String> = [ids[4].clone(), ids[5].clone()].into();
+        assert_eq!(
+            delete_with_ids(
+                &mut wtxn,
+                store.env(),
+                "metrics",
+                &settings,
+                &json!({}),
+                true,
+                &two
+            )
+            .unwrap(),
+            2
+        );
+        wtxn.commit().unwrap();
+        assert_eq!(c.count(&json!({})).unwrap(), 18);
+        assert_eq!(c.count(&json!({"flag": true})).unwrap(), 1);
+    }
+
+    #[test]
+    fn indexed_filter_update_and_delete_on_timeseries() {
+        let (_dir, store) = ts_store();
+        let settings = Settings {
+            time_field: "ts".into(),
+            ..Settings::default()
+        };
+        let c = store
+            .create_timeseries_collection("metrics", &settings)
+            .unwrap();
+        let docs: Vec<Value> = (0..12i64)
+            .map(|idx| json!({"ts": idx * 60_000, "status": if idx % 3 == 0 { "bad" } else { "ok" }}))
+            .collect();
+        for doc in docs {
+            c.insert_one(doc).unwrap();
+        }
+        c.create_index("status", false).unwrap();
+        assert_eq!(
+            c.update(
+                &json!({"status": "bad"}),
+                &json!({"$set": {"fixed": true}}),
+                true
+            )
+            .unwrap(),
+            4
+        );
+        assert_eq!(c.delete(&json!({"status": "ok"}), true).unwrap(), 8);
+        assert_eq!(c.count(&json!({"fixed": true})).unwrap(), 4);
+        assert_eq!(c.count(&json!({})).unwrap(), 4);
     }
 
     #[test]

@@ -624,6 +624,26 @@ impl<'e> Collection<'e> {
         Ok(Some(stats))
     }
 
+    fn timeseries_index_ids(
+        &self,
+        rtxn: &RoTxn<'_>,
+        filter: &Value,
+        hint: Option<&IndexHint>,
+    ) -> Result<Option<HashSet<String>>> {
+        let Some(plan) = self.query_index_plan(rtxn, filter, hint)? else {
+            return Ok(None);
+        };
+        let range = (as_bound(&plan.bounds.0), as_bound(&plan.bounds.1));
+        let mut ids = HashSet::new();
+        for item in plan.db.range(rtxn, &range)? {
+            let (_key, value) = item?;
+            if let Some((id, _)) = index::decode_index_value(value) {
+                ids.insert(id);
+            }
+        }
+        Ok(Some(ids))
+    }
+
     fn find_timeseries_in(&self, rtxn: &RoTxn<'_>, query: &FindQuery) -> Result<Vec<Value>> {
         let settings = self.timeseries_settings_in(rtxn)?.unwrap_or_default();
         if let Some((field, near)) = geo::extract_near(&query.filter) {
@@ -660,15 +680,7 @@ impl<'e> Collection<'e> {
                 .collect());
         }
         let hint = query.hint.as_ref().map(parse_index_hint).transpose()?;
-        if let Some(plan) = self.query_index_plan(rtxn, &query.filter, hint.as_ref())? {
-            let range = (as_bound(&plan.bounds.0), as_bound(&plan.bounds.1));
-            let mut ids = HashSet::new();
-            for item in plan.db.range(rtxn, &range)? {
-                let (_key, value) = item?;
-                if let Some((id, _)) = index::decode_index_value(value) {
-                    ids.insert(id);
-                }
-            }
+        if let Some(ids) = self.timeseries_index_ids(rtxn, &query.filter, hint.as_ref())? {
             return crate::timeseries::find_with_ids(
                 rtxn,
                 self.env,
@@ -5071,6 +5083,11 @@ impl<'e> Collection<'e> {
             let direct_id = (!multi)
                 .then(|| crate::timeseries::exact_id_filter(filter))
                 .flatten();
+            let candidate_ids = if direct_id.is_some() {
+                None
+            } else {
+                self.timeseries_index_ids(&*wtxn, filter, None)?
+            };
             let before = if let Some(id) = direct_id {
                 crate::timeseries::find_by_id(&*wtxn, self.env, &self.name, &settings, id)?
                     .into_iter()
@@ -5086,19 +5103,45 @@ impl<'e> Collection<'e> {
                     max_time_ms: None,
                     hint: None,
                 };
-                crate::timeseries::find(&*wtxn, self.env, &self.name, &settings, &query)?
+                if let Some(ids) = &candidate_ids {
+                    crate::timeseries::find_with_ids(
+                        &*wtxn,
+                        self.env,
+                        &self.name,
+                        &settings,
+                        &query,
+                        Some(ids),
+                    )?
+                } else {
+                    crate::timeseries::find(&*wtxn, self.env, &self.name, &settings, &query)?
+                }
             };
-            let report = crate::timeseries::update(
-                wtxn,
-                self.env,
-                &self.name,
-                &settings,
-                filter,
-                update,
-                multi,
-                array_filters,
-                upsert,
-            )?;
+            let report = if let Some(ids) = &candidate_ids {
+                crate::timeseries::update_with_ids(
+                    wtxn,
+                    self.env,
+                    &self.name,
+                    &settings,
+                    filter,
+                    update,
+                    multi,
+                    array_filters,
+                    upsert,
+                    ids,
+                )?
+            } else {
+                crate::timeseries::update(
+                    wtxn,
+                    self.env,
+                    &self.name,
+                    &settings,
+                    filter,
+                    update,
+                    multi,
+                    array_filters,
+                    upsert,
+                )?
+            };
             for old in &before {
                 let Some(old_id) = old.get("_id").and_then(Value::as_str) else {
                     continue;
@@ -5637,9 +5680,26 @@ impl<'e> Collection<'e> {
                 max_time_ms: None,
                 hint: None,
             };
-            let before = crate::timeseries::find(&*wtxn, self.env, &self.name, &settings, &query)?;
-            let removed =
-                crate::timeseries::delete(wtxn, self.env, &self.name, &settings, filter, multi)?;
+            let candidate_ids = self.timeseries_index_ids(&*wtxn, filter, None)?;
+            let before = if let Some(ids) = &candidate_ids {
+                crate::timeseries::find_with_ids(
+                    &*wtxn,
+                    self.env,
+                    &self.name,
+                    &settings,
+                    &query,
+                    Some(ids),
+                )?
+            } else {
+                crate::timeseries::find(&*wtxn, self.env, &self.name, &settings, &query)?
+            };
+            let removed = if let Some(ids) = &candidate_ids {
+                crate::timeseries::delete_with_ids(
+                    wtxn, self.env, &self.name, &settings, filter, multi, ids,
+                )?
+            } else {
+                crate::timeseries::delete(wtxn, self.env, &self.name, &settings, filter, multi)?
+            };
             for doc in before {
                 if let Some(id) = doc.get("_id").and_then(Value::as_str) {
                     self.apply_index_entries(wtxn, Some(&doc), None, id)?;
