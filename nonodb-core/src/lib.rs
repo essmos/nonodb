@@ -20,6 +20,7 @@ pub mod date;
 pub mod error;
 pub mod events;
 pub mod geo;
+pub mod graph;
 pub mod history;
 pub mod id;
 pub mod index;

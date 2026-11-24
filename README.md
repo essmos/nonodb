@@ -184,6 +184,32 @@ single-database directories are migrated to `default/` on startup. See
   required. Results include `_distance`, lowest first.
 - All search indexes are maintained in the same transaction as the document.
 
+### Graph
+
+- Nodes and edges are ordinary documents; a graph definition names the edge
+  collection and endpoint/label/weight fields.
+- Native `out`/`in` adjacency slots are maintained in the same transaction as
+  every edge insert, update, delete, TTL expiry, and replication apply.
+- `traverse` supports BFS/DFS, directions, label/edge/node filters, temporal
+  `as_of` windows, projection, cycle markers, tree or flat output, hard
+  node/edge/byte budgets, and vector-search seeds.
+- `neighbors` returns one-hop filtered neighbors without building a tree.
+- `shortest_path` uses BFS by hops or Dijkstra over edge weights;
+  `all_shortest_paths` returns every shortest path with bounded path/node budgets.
+- `graph_match` matches linear variable-length patterns with per-step direction,
+  labels, node/edge filters, and relationship uniqueness.
+- `graph_algorithm` computes bounded PageRank, degree centrality, and weakly
+  connected components.
+- `hybrid_search` reranks vector hits and their graph neighborhood with
+  deterministic `vector_weight`/`graph_weight` scoring.
+- `$graphLookup` uses the adjacency fast path when the lookup fields match the
+  configured graph, with a safe fallback.
+- Online `reindex_graph` builds a new adjacency generation into temporary slots
+  and atomically swaps it after a complete scan; reads keep using the old
+  generation and edge writes are mirrored meanwhile.
+- Graph configuration and traversal are available through the HTTP API, Python
+  client, and the GUI Graph tab. See [Graph traversal](docs/graph.md).
+
 ### Aggregation
 
 - `aggregate` endpoint for reporting, grouping, and summaries. A terminal
@@ -783,6 +809,7 @@ documentation.
 | [Backup and restore](docs/backup.md) | Online backup, snapshots, verification, restore drills, retention, Docker, vault keys, authorization state |
 | [Branching a database](docs/branching.md) | Offline CoW clone for CI, snapshot sources, verification, limits |
 | [Benchmarks](docs/benchmarks.md) | Test environment, throughput, latency, large data sets, RAM, reproducibility |
+| [Graph benchmark](docs/graph-benchmark.md) | NonoDB vs Neo4j Community graph ingest/traversal methodology and results |
 | [Development](docs/development.md) | Repository layout, tests, linting, benchmark scripts, contribution notes |
 | [Contributing](CONTRIBUTING.md) | Setup, required checks, code guidelines, pull requests |
 | [Security policy](SECURITY.md) | Supported versions, private vulnerability reporting, scope |

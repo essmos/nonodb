@@ -64,6 +64,15 @@ pub fn authorize_request(
         | Request::ListFuzzyIndexes { coll }
         | Request::ListVectorIndexes { coll }
         | Request::VectorSearch { coll, .. }
+        | Request::GetGraph { coll }
+        | Request::Traverse { coll, .. }
+        | Request::ShortestPath { coll, .. }
+        | Request::AllShortestPaths { coll, .. }
+        | Request::GraphMatch { coll, .. }
+        | Request::GraphAlgorithm { coll, .. }
+        | Request::Neighbors { coll, .. }
+        | Request::HybridSearch { coll, .. }
+        | Request::GraphRebuildStatus { coll }
         | Request::Search { coll, .. }
         | Request::Fuzzy { coll, .. }
         | Request::History { coll, .. }
@@ -120,6 +129,9 @@ pub fn authorize_request(
         | Request::DropFuzzyIndex { coll, .. }
         | Request::CreateVectorIndex { coll, .. }
         | Request::Reindex { coll }
+        | Request::DropGraph { coll }
+        | Request::ReindexGraph { coll, .. }
+        | Request::CancelGraphRebuild { coll }
         | Request::DropVectorIndex { coll, .. }
         | Request::CreateCollection { coll, .. }
         | Request::DropCollection { coll }
@@ -137,6 +149,25 @@ pub fn authorize_request(
             coll,
             req.op_name(),
         ),
+        Request::SetGraph { coll, def } => {
+            allow(
+                principal,
+                Action::AdminCollection,
+                database,
+                coll,
+                req.op_name(),
+            )?;
+            if def.edge_collection != *coll {
+                allow(
+                    principal,
+                    Action::AdminCollection,
+                    database,
+                    &def.edge_collection,
+                    req.op_name(),
+                )?;
+            }
+            Ok(())
+        }
         Request::CreateWebhook { rule } => allow(
             principal,
             Action::AdminCollection,
@@ -193,6 +224,16 @@ pub fn authorize_request(
             Ok(())
         }
     }
+}
+
+pub fn allow_collection(
+    principal: &Principal,
+    action: Action,
+    database: &str,
+    coll: &str,
+    op: &'static str,
+) -> Result<(), ApiError> {
+    allow(principal, action, database, coll, op)
 }
 
 pub fn authorize_write_op(

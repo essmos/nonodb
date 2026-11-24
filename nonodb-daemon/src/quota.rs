@@ -428,12 +428,18 @@ impl Growth {
             | DropFuzzyIndex { .. }
             | DropVectorIndex { .. }
             | DropSearchIndex { .. }
+            | DropGraph { .. }
+            | CancelGraphRebuild { .. }
             | PruneSubscriptions
             | PruneHistory { .. }
             | Expire { .. }
             | DeleteSubscription { .. }
             | DeleteWebhook { .. } => Self::default(),
             CreateCollection { .. }
+            | SetGraph { .. }
+            | ReindexGraph { .. }
+            | StartGraphRebuild { .. }
+            | GraphRebuildStep { .. }
             | SetCollectionTtl { .. }
             | SetCollectionTtlAfter { .. }
             | BackfillCollectionTtl { .. } => Self {

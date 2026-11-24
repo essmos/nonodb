@@ -144,6 +144,10 @@ support only a restricted subset of operations. See
 | `lookup` result budget | 64 MiB (`result_too_large`) |
 | Fuzzy candidates | 5,000 per query |
 | Vector dimensions | 1–65,536 |
+| Graph `start` ids | 10,000 |
+| Graph `max_depth` | 64 |
+| Graph `limit_nodes` / `limit_edges` | defaults 1,000 / 10,000 |
+| Graph result budget | 64 MiB (`truncated` instead of an error) |
 | `write_batch` operations | bounded by request size |
 | LMDB named databases | 1024 (`MDB_DBS_FULL` when exhausted) |
 
@@ -164,6 +168,19 @@ client timeout with `NONODB_TIMEOUT` or the `timeout=` argument.
 | [`find_one`](#find_one) | Return one document |
 | [`lookup`](#lookup) | Ordered point lookups by `_id` or a unique index |
 | [`explain_lookup`](#explain_lookup) | Index, coverage, and counters for a lookup |
+| [`set_graph`](#graph) | Configure a graph and rebuild adjacency |
+| [`get_graph`](#graph) | Read the graph definition |
+| [`drop_graph`](#graph) | Remove a graph definition and adjacency |
+| [`reindex_graph`](#graph) | Rebuild graph adjacency (sync or online) |
+| [`graph_rebuild_status`](#graph) | Read online rebuild progress |
+| [`cancel_graph_rebuild`](#graph) | Discard an online rebuild |
+| [`traverse`](#graph) | BFS/DFS traversal with a tree or flat result |
+| [`neighbors`](#graph) | One-hop filtered neighbors |
+| [`hybrid_search`](#graph) | Vector + graph rerank |
+| [`shortest_path`](#graph) | BFS or weighted shortest path |
+| [`all_shortest_paths`](#graph) | Every shortest path with bounded output |
+| [`graph_match`](#graph) | Linear variable-length pattern matching |
+| [`graph_algorithm`](#graph) | PageRank, degree centrality, connected components |
 | [`watch`](#watch) | Long-poll append-only events by sortable `_id` |
 | [`explain`](#explain) | Show the selected plan, bounds, and actual counts |
 | [`update`](#update) | Update or upsert documents |
@@ -2303,6 +2320,63 @@ Semantics:
   Vector writes are tracked in a small LMDB delta and merged into unfiltered
   ANN queries. After 4,096 changed ids, queries use the exact index until the
   sidecar is rebuilt.
+
+## Graph
+
+Graphs are ordinary node and edge documents plus a native adjacency index. Full
+semantics, limits, and examples are in [Graph traversal](graph.md). The
+operations are:
+
+| `op` | Purpose |
+|---|---|
+| `set_graph` | Create/replace a definition and rebuild adjacency |
+| `get_graph` | Read the definition (`null` when absent) |
+| `drop_graph` | Remove the definition and clear adjacency |
+| `reindex_graph` | Rebuild adjacency synchronously or start an online rebuild |
+| `graph_rebuild_status` | Read online rebuild progress |
+| `cancel_graph_rebuild` | Discard an in-progress online rebuild |
+| `traverse` | BFS/DFS traversal with filters, projection, and vector seed |
+| `neighbors` | One-hop filtered neighbors |
+| `hybrid_search` | Vector seed + graph rerank |
+| `shortest_path` | BFS hops or Dijkstra over edge weights |
+| `all_shortest_paths` | Every shortest path, capped by `limit_paths`/`limit_nodes` |
+| `graph_match` | Linear variable-length pattern with per-step filters |
+| `graph_algorithm` | PageRank, degree centrality, or weakly connected components |
+
+```json
+{"op":"traverse","coll":"nodes","start":["alice"],
+ "direction":"out","labels":["KNOWS"],"max_depth":2,
+ "algorithm":"bfs","tree":true}
+```
+
+Every traversal runs in one read snapshot. A node is expanded once; repeated
+arrivals are marked with `"cycle":true`. Results include `nodes`, `edges`,
+`truncated`, and `missing`. `start` and `seed` are mutually exclusive.
+`edge_filter`, `node_filter`, `as_of`, and `projection` are supported.
+Adjacency values store only a compact summary; full edge documents are fetched
+for `include_edges` or `edge_filter`.
+
+`neighbors` returns one-hop `{node, via}` entries. `hybrid_search` combines
+vector scores with graph proximity and returns deterministic
+`score`/`vector_score`/`graph_score` values. Online rebuilds keep the active
+generation readable and mirror edge writes into the target generation until an
+atomic swap.
+
+```json
+{"op":"shortest_path","coll":"nodes","start":"alice","target":"carol",
+ "weighted":true,"max_depth":8}
+```
+
+`all_shortest_paths` returns all shortest paths with `limit_paths` and
+`limit_nodes`; `weighted:true` uses Dijkstra. `graph_match` takes a `pattern`
+array of `{direction, labels, min_hops, max_hops, edge_filter, node_filter}`
+segments. `graph_algorithm` takes `kind` = `pagerank`, `degree_centrality`, or
+`connected_components`, bounded by `limit` and `max_nodes`.
+
+Graph configuration requires admin scope on both collections; graph reads
+require a read scope on the node **and** edge collections. Vault collections are
+rejected as node or edge collections. The MongoDB
+wire listener does not expose graph operations.
 
 ## vector_search
 

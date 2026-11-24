@@ -39,6 +39,11 @@ Implemented:
 - fuzzy search with trigrams and bounded Levenshtein distance;
 - exact brute-force vector search with cosine, dot, and L2 metrics, plus an
   optional internal IVF sidecar for approximate unfiltered queries;
+- graph traversal over ordinary node/edge documents with a native transactional
+  adjacency index, BFS/DFS, label and direction filters, vector seeds, BFS and
+  Dijkstra `shortest_path`, all-shortest paths, linear pattern matching,
+  PageRank/degree/component algorithms, hard result budgets, a Python client, and
+  a GUI tree;
 - read batches and atomic write batches;
 - ordered point lookups by `_id` or a unique single-field or compound index,
   with covering projections, index-only `_id` projections, `_id` exclusion, key
@@ -59,8 +64,8 @@ Implemented:
 - connection-scoped live subscriptions (`watch` with `mode:"live"`) that push
   matching changes directly to SSE/NDJSON without writing to `_events`;
 - an embedded local web console (`nonodb-cli gui`) with document CRUD, collection
-  settings, indexes, SQL, map settings, per-collection metrics, and authorization
-  management;
+  settings, indexes, SQL, graph traversal, map settings, per-collection metrics,
+  and authorization management;
 - per-collection append-only document revision history with retention (`0` disables);
 - document TTL with collection defaults, per-document overrides, and background expiry;
 - BSON-compatible dates with RFC 3339 input, UTC normalization, indexed ranges, and sorting;

@@ -1880,6 +1880,65 @@ fn execute(
             }
             Ok(json!({ "dropped": existed, "kind": "vector" }))
         }
+        WriteReq::SetGraph { coll, def } => {
+            if def.node_collection != *coll {
+                return Err(ApiError {
+                    code: "invalid_query".into(),
+                    message: "graph `node_collection` must equal `coll`".into(),
+                });
+            }
+            let c = standard_collection(store, wtxn, coll)?;
+            let out = def.clone();
+            c.set_graph_txn(wtxn, def)?;
+            replication.capture_op(ReplicationOp::GraphSet {
+                coll: coll.clone(),
+                def: out.clone(),
+            });
+            Ok(json!({ "graph": out }))
+        }
+        WriteReq::DropGraph { coll } => {
+            let c = standard_collection(store, wtxn, coll)?;
+            let dropped = c.drop_graph_txn(wtxn)?;
+            if dropped {
+                replication.capture_op(ReplicationOp::GraphDrop { coll: coll.clone() });
+            }
+            Ok(json!({ "dropped": dropped, "collection": coll }))
+        }
+        WriteReq::ReindexGraph { coll } => {
+            let c = standard_collection(store, wtxn, coll)?;
+            let edges = c.reindex_graph_txn(wtxn)?;
+            Ok(json!({ "reindexed": coll, "edges": edges }))
+        }
+        WriteReq::StartGraphRebuild { coll } => {
+            let c = standard_collection(store, wtxn, coll)?;
+            Ok(c.start_graph_rebuild_txn(wtxn)?)
+        }
+        WriteReq::CancelGraphRebuild { coll } => {
+            let c = standard_collection(store, wtxn, coll)?;
+            let canceled = c.cancel_graph_rebuild_txn(wtxn)?;
+            Ok(json!({ "canceled": canceled }))
+        }
+        WriteReq::GraphRebuildStep { edge, limit } => {
+            let c = store.collection_at(wtxn, edge)?.ok_or_else(|| ApiError {
+                code: "not_found".into(),
+                message: format!("collection `{edge}` does not exist"),
+            })?;
+            let state = c.graph_rebuild_state_in(wtxn)?;
+            let out = c.step_graph_rebuild_txn(wtxn, *limit)?;
+            if out.get("done").and_then(Value::as_bool) == Some(true) {
+                if let Some(state) = state {
+                    if let Some(node) = store.collection_at(wtxn, &state.node_collection)? {
+                        if let Some(def) = node.get_graph_in(wtxn)? {
+                            replication.capture_op(ReplicationOp::GraphSet {
+                                coll: state.node_collection,
+                                def,
+                            });
+                        }
+                    }
+                }
+            }
+            Ok(out)
+        }
         WriteReq::Sql { query, params } => {
             let prepared = nonodb_core::sql::PreparedSql::parse(query)?;
             if prepared.is_read_only() {

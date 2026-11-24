@@ -333,6 +333,19 @@ cooldown, HMAC secret environment variable, request timeout, custom headers, and
 max attempts. Filters and aggregates are evaluated by the daemon worker, never
 in the writer. See [Asynchronous webhooks](webhooks.md).
 
+### Graph
+
+The **Graph** tab configures a graph on a node collection and explores it:
+
+- choose the edge collection and the from/to/label/weight fields;
+- configure, update, drop, or reindex adjacency;
+- start from one or more node ids, choose direction, labels, depth, BFS/DFS,
+  and whether to include full edge documents;
+- expand tree nodes lazily one level at a time, with cycle and missing-node
+  markers.
+
+See [Graph traversal](graph.md).
+
 ### Changes
 
 Each collection has a **Changes** tab:

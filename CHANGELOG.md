@@ -4,6 +4,11 @@ Full release notes: https://github.com/essmos/nonodb/releases
 
 ## v0.32.0 - 2026-11-23
 
+- Add graph search parity features: `all_shortest_paths` (BFS and weighted
+  Dijkstra), `graph_match` for linear variable-length patterns with per-step
+  filters, and `graph_algorithm` for bounded PageRank, degree centrality, and
+  weakly connected components. Python client methods and the graph benchmark
+  cover the new operations. See `docs/graph.md`.
 - **Upgrade: plain indexes now index a missing field as `null`.** Run
   `nonodb-cli reindex <collection>` for every collection with plain indexes
   after upgrading. Existing plain unique indexes can fail to rebuild if several
@@ -59,6 +64,18 @@ Full release notes: https://github.com/essmos/nonodb/releases
 
 ## v0.31.0 - 2026-11-23
 
+- Add graph traversal over ordinary node and edge documents. A graph definition
+  in `meta` drives native `out`/`in` adjacency slots maintained in the same
+  transaction as every edge insert, update, delete, TTL expiry, and replication
+  apply. Add `set_graph`, `get_graph`, `drop_graph`, `reindex_graph`
+  (synchronous or online with generation swap and progress/cancel), `traverse`
+  (BFS/DFS, directions, label/edge/node filters, `as_of`, projection, cycle
+  markers, tree/flat output, node/edge/byte budgets, vector-search seeds),
+  `neighbors`, `hybrid_search` vector+graph rerank, `shortest_path` (BFS or
+  Dijkstra), adjacency-backed `$graphLookup`, Python client methods, and a lazy
+  Graph tree in the GUI. Adjacency values store a compact summary instead of
+  duplicating edge JSON; graph reads require edge-collection read scope and
+  vault edge collections are rejected. See `docs/graph.md`.
 - Remove orphaned `.dropped-*` database directories at startup. A failed
   `remove_dir_all` no longer turns an already-committed database drop into an
   error.
