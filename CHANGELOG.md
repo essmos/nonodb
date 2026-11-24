@@ -54,6 +54,10 @@ Full release notes: https://github.com/essmos/nonodb/releases
   collection settings panel shows bucket statistics, deleted rows, and
   compression sizes. Compression/bucket/expiry settings are editable; the
   structural fields are read-only once rows exist.
+- CLI: add `create-collection` (including `--profile timeseries` with
+  `--time-field`, meta field, granularity, compression, and expiry) and
+  `get-collection-timeseries`/`set-collection-timeseries`, which read and merge
+  settings through the daemon socket.
 - Add aggregation and retention for time-series collections. `aggregate` now
   decodes buckets through the time-range-pruned find path and runs the normal
   in-memory pipeline, so `$group`/`$bucket` downsampling works. The new

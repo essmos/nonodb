@@ -1053,10 +1053,7 @@ impl Store {
     }
 
     /// Storage statistics for a time-series collection.
-    pub fn timeseries_stats(
-        &self,
-        name: &str,
-    ) -> Result<Option<crate::timeseries::Stats>> {
+    pub fn timeseries_stats(&self, name: &str) -> Result<Option<crate::timeseries::Stats>> {
         let Some(settings) = self.timeseries_settings(name)? else {
             return Ok(None);
         };

@@ -180,6 +180,37 @@ List known collections:
 nonodb-cli collections
 ```
 
+## create-collection
+
+Create a collection through the running daemon:
+
+```bash
+nonodb-cli create-collection orders --ttl 86400
+nonodb-cli create-collection readings --profile timeseries \
+  --time-field ts --meta-field device --granularity seconds \
+  --compression balanced --expire-after 86400
+```
+
+`--profile` accepts `standard` (default), `vault`, and `timeseries`. A
+time-series profile requires `--time-field`; `--meta-field`, `--granularity`
+(`seconds`/`minutes`/`hours`), `--compression` (`fast`/`balanced`/`max`), and
+`--expire-after` are optional.
+
+## get-collection-timeseries / set-collection-timeseries
+
+Read and update time-series settings over the daemon socket:
+
+```bash
+nonodb-cli get-collection-timeseries readings
+nonodb-cli set-collection-timeseries readings --compression max --expire-after none
+nonodb-cli set-collection-timeseries readings --granularity hours
+```
+
+`set-collection-timeseries` reads the current settings and merges only the
+flags you pass, so structural fields are preserved. Changing `timeField`,
+`metaField`, or `granularity` on a collection with rows is rejected by the
+daemon.
+
 ## count
 
 Count documents in a collection, optionally with a filter:
