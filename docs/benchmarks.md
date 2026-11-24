@@ -16,6 +16,7 @@ filesystem, page cache, and client overhead all affect the result.
 | 1B dense | 16 vCPU Xeon D-2141I, 31 GiB RAM | ZFS mirror, 438 GB | `v0.27.0`, 2026-11-20 |
 | 100M ANN sidecar | 16 vCPU Xeon D-2141I, 31 GiB RAM | ZFS, 438 GB | `v0.28.0`, 2026-11-22 |
 | 500k engine comparison | 16 vCPU Xeon D-2141I, 31 GiB RAM | ZFS, 438 GB | `v0.28.0`, 2026-11-22 |
+| Graph vs Neo4j Community | 8 vCPU Haswell, 22 GiB RAM | ext4 (`/var/tmp`) | `v0.31.0`, 2026-11-23 |
 
 Do not compare rows from different hosts as if they came from one controlled
 run. The 100M dense comparator in the 1B table comes from an older ext4 host.
@@ -396,6 +397,45 @@ mandatory in the v3 format; there is no positions-off mode.
   filtered queries and oversized deltas still use exact scans.
 - **RSS is not heap.** Large RSS values after scans mostly reflect mapped LMDB
   pages.
+
+## Graph traversal vs Neo4j Community
+
+This is a small end-to-end comparison, not a claim about every graph workload.
+Both engines ran on the same host with release binaries/containers and the same
+deterministic graph: 2,000 nodes, 8,000 directed edges (a ring plus random
+edges), and 20 reachable shortest-path pairs. Ingest used 1,000-edge batches.
+The table is the median of three runs; timings are end-to-end request latency
+after warmup, with p50/p95 over 100 samples.
+
+| Metric | NonoDB | Neo4j 5 Community | NonoDB advantage |
+|---|---:|---:|---:|
+| Ingest nodes + edges | **145 ms** (~55k edges/s) | 2,256 ms (~3.5k edges/s) | ~15.6× |
+| Traverse depth 1, p50 / p95 | **0.74 / 1.45 ms** | 8.41 / 13.36 ms | ~11.3× p50 |
+| Traverse depth 3, p50 / p95 | **1.31 / 2.47 ms** | 7.34 / 11.18 ms | ~5.6× p50 |
+| Shortest path by hops, p50 / p95 | **0.72 / 1.24 ms** | 6.40 / 11.60 ms | ~8.9× p50 |
+
+Caveats:
+
+- NonoDB was queried over a Unix socket with JSON request/response; Neo4j was
+  queried through HTTP transactional Cypher. Part of Neo4j's fixed latency is
+  the HTTP transaction and JVM client path, not graph traversal itself.
+- Neo4j queries returned only a count/ID result, while NonoDB materialized
+  projected node documents. The NonoDB side therefore did more response work.
+- Neo4j Community is a single instance and has no built-in multi-node
+  replication. This table is **not** a replication or failover benchmark.
+- Results are sensitive to batching, page cache, JVM warmup, and graph shape.
+  Use the script on the target hardware before making capacity decisions.
+
+Run it with:
+
+```bash
+cargo build --release --bins
+docker pull neo4j:5-community
+NONODB_DAEMON=target/release/nonodb-daemon \
+  python3 scripts/graph_neo4j_bench.py
+```
+
+---
 
 ## Reproducing
 
