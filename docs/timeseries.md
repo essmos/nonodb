@@ -336,9 +336,9 @@ Same 100k-row workload (10 series, 8 columns, 183 bytes of JSON per row),
 | standard collection (`data.mdb`, no indexes) | 41.35 MB | 433.6 |
 | TS, pending rows before seal (`data.mdb`) | 7.53 MB | 78.9 |
 | TS, sealed, before compaction (`data.mdb`) | 7.53 MB | 78.9 |
-| TS, sealed, compacted copy | **0.46 MB** | **4.87** |
-| TS after deleting 25k rows (bitmap), compacted | 0.46 MB | 4.87 |
-| TS after retention leaves 37.5k rows, compacted | 0.25 MB | 7.10 |
+| TS, sealed, compacted copy | **0.53 MB** | **14.75** |
+| TS after deleting 25k rows (bitmap), compacted | 1.00 MB | 26.7 |
+| TS after retention leaves 37.5k rows, compacted | 0.53 MB | 14.75 |
 
 Read that carefully, because it matters operationally:
 
@@ -424,20 +424,25 @@ settings have `expireAfterSeconds` > 0. The schedule is controlled by:
 | --- | --- | --- |
 | `NONODB_TS_RETENTION_INTERVAL_SECS` | `60` | How often to check collections; `0` disables automatic retention and compaction checks. |
 | `NONODB_TS_COMPACT_THRESHOLD_MB` | `256` | Size of `data.mdb` above which deleted time-series pages trigger a compaction request; `0` disables the request. |
+| `NONODB_TS_ONLINE_COMPACT_INTERVAL_SECS` | `30` | How often the daemon looks for compaction markers and compacts an idle database; `0` disables online compaction. |
 
 Retention runs online through the single writer thread, so `find`, cursors, live
 subscriptions, and replication keep working. LMDB does not shrink `data.mdb`
 when rows are deleted, so when deletions were observed and the file is at or
 above the threshold the daemon writes `.timeseries-compact-requested` and logs a
-warning. The compaction happens automatically **before the environment is
-opened on the next daemon startup** — no live connection is interrupted, and no
-write transaction can race the file swap. The marker is removed only after the
-new file is fsynced and the old file swapped out.
+warning. The online compactor picks the marker up within
+`NONODB_TS_ONLINE_COMPACT_INTERVAL_SECS`. It removes the database runtime from
+the pool, refuses to swap while any request still holds it, joins the writer and
+maintenance threads (closing the LMDB environment), runs the compacting copy,
+restarts the runtime, and inserts it back under the same database name. Active
+connections therefore finish against the old runtime instead of being
+interrupted; the marker stays until the new file is fsynced and swapped in.
 
-To apply it immediately, restart the daemon or run
-`nonodb-cli compact <data-dir>` while the daemon is stopped. The startup routine
-uses the same compacting copy as the CLI, keeps `data.mdb.before-compact` until
-the swap succeeds, and leaves the request marker in place if compaction fails so
+The same compacting copy is also used before the environment is opened on
+startup, so a marker left by a crash or a disabled compactor is handled on the
+next start. `nonodb-cli compact <data-dir>` remains available while the daemon is
+stopped. The swap keeps `data.mdb.before-compact` until it succeeds and leaves
+the request marker in place if compaction fails so
 the next start retries.
 
 ```json

@@ -256,6 +256,7 @@ async fn run_async() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
     let databases = databases::Databases::open(&data)
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    databases.start_online_compactor();
     metrics::set_disk_paths(
         data.clone(),
         std::env::var_os("NONODB_SNAPSHOT_DIR").map(PathBuf::from),

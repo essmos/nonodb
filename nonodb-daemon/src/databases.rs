@@ -185,6 +185,89 @@ impl Databases {
         Ok(runtime)
     }
 
+    /// Compacts one database while it has no active request holding its runtime.
+    ///
+    /// The runtime is removed from the pool, its writer/maintenance threads are
+    /// joined (which closes the LMDB environment), the file is compacted, and a
+    /// fresh runtime is started. If a request already cloned the runtime, the
+    /// function returns `Ok(None)` and leaves it untouched.
+    pub async fn compact_idle_database(
+        &self,
+        name: &str,
+    ) -> Result<Option<nonodb_core::store::CompactReport>, String> {
+        validate_name(name)?;
+        let _open_guard = self.open_lock.lock().await;
+        let Some(runtime) = self.runtimes.write().await.remove(name) else {
+            return Ok(None);
+        };
+        if Arc::strong_count(&runtime) > 1 {
+            self.runtimes
+                .write()
+                .await
+                .insert(name.to_string(), runtime);
+            return Ok(None);
+        }
+        let env = runtime.store.env().clone();
+        drop(runtime);
+        env.prepare_for_closing().wait();
+        let path = self.root.join(name);
+        let report = crate::maintenance::compact_if_requested(&path);
+        let startup = tokio::task::spawn_blocking({
+            let root = self.root.clone();
+            let name = name.to_string();
+            move || start_runtime(&root, &name)
+        })
+        .await
+        .map_err(|e| format!("database reopen join error: {e}"))?;
+        let runtime = startup?;
+        self.runtimes
+            .write()
+            .await
+            .insert(name.to_string(), Arc::new(runtime));
+        report
+    }
+
+    /// Watches for offline-compaction markers and compacts idle databases.
+    pub fn start_online_compactor(self: &Arc<Self>) {
+        let interval = std::env::var("NONODB_TS_ONLINE_COMPACT_INTERVAL_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(30);
+        if interval == 0 {
+            return;
+        }
+        let databases = self.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+                let names: Vec<String> = databases.known.read().await.iter().cloned().collect();
+                for name in names {
+                    let marker = databases
+                        .root
+                        .join(&name)
+                        .join(crate::maintenance::COMPACT_REQUEST_FILE);
+                    if !marker.is_file() {
+                        continue;
+                    }
+                    match databases.compact_idle_database(&name).await {
+                        Ok(Some(report)) => tracing::info!(
+                            database = %name,
+                            before = report.before_bytes,
+                            after = report.after_bytes,
+                            "compacted idle database online"
+                        ),
+                        Ok(None) => {}
+                        Err(error) => tracing::warn!(
+                            database = %name,
+                            error = %error,
+                            "online compaction failed; keeping request marker"
+                        ),
+                    }
+                }
+            }
+        });
+    }
+
     pub async fn default_runtime(&self) -> Result<Arc<DatabaseRuntime>, ApiError> {
         self.get(DEFAULT_DATABASE).await
     }
@@ -464,6 +547,50 @@ mod tests {
         let databases = Databases::open(dir.path()).unwrap();
         assert!(!trash.exists(), "startup cleanup left {}", trash.display());
         drop(databases);
+    }
+
+    #[tokio::test]
+    async fn online_compaction_waits_for_idle_runtime_and_preserves_data() {
+        use serde_json::json;
+
+        let dir = temp_root();
+        let databases = Databases::open(dir.path()).unwrap();
+        let runtime = databases.default_runtime().await.unwrap();
+        let coll = runtime.store.collection("docs").unwrap();
+        coll.insert_one(json!({"_id": "a", "v": 1})).unwrap();
+        let marker = dir
+            .path()
+            .join(DEFAULT_DATABASE)
+            .join(crate::maintenance::COMPACT_REQUEST_FILE);
+        fs::write(&marker, b"1").unwrap();
+
+        // A live request clone prevents the runtime swap.
+        assert!(databases
+            .compact_idle_database(DEFAULT_DATABASE)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(marker.exists());
+        assert_eq!(coll.count(&json!({})).unwrap(), 1);
+        drop(coll);
+        drop(runtime);
+
+        let report = databases
+            .compact_idle_database(DEFAULT_DATABASE)
+            .await
+            .unwrap();
+        assert!(report.is_some());
+        assert!(!marker.exists());
+        let reopened = databases.default_runtime().await.unwrap();
+        assert_eq!(
+            reopened
+                .store
+                .collection("docs")
+                .unwrap()
+                .count(&json!({}))
+                .unwrap(),
+            1
+        );
     }
 
     #[tokio::test]
