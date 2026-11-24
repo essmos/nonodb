@@ -122,6 +122,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         rows
     );
 
+    // Deletion bitmap: remove one status class from sealed buckets, then compact a copy.
+    let delete_started = Instant::now();
+    let deleted_rows = ts.delete(&json!({"status": "offline"}), true)?;
+    let delete_time = delete_started.elapsed();
+    let after_delete = data_mdb(ts_dir.path());
+    let deleted_stats = ts.timeseries_stats()?.unwrap_or_default();
+    let deleted_path = ts_dir.path().join("compacted-after-delete.mdb");
+    let file = ts_store.copy_to_file(&deleted_path, CompactionOption::Enabled)?;
+    file.sync_all()?;
+    let deleted_compacted = std::fs::metadata(&deleted_path)?.len();
+    println!(
+        "delete:            {:?} for {} rows (bitmap), deleted_rows={}",
+        delete_time, deleted_rows, deleted_stats.deleted_rows
+    );
+    println!(
+        "  data.mdb after deletes: {:.2} MB; compacted copy {:.2} MB",
+        mb(after_delete),
+        mb(deleted_compacted)
+    );
+
     // Retention: drop the first half of the time range.
     let cutoff = 1_700_000_000_000i64 + 5_000_000;
     let retain_started = Instant::now();

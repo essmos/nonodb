@@ -17,6 +17,13 @@ Use SQL for reporting jobs, BI tools, ad-hoc operators, and simple maintenance.
 Use the JSON API for `find_and_modify`, upserts, pipeline updates, joins, and
 features such as full-text, fuzzy, geo, and vector search.
 
+Time-series collections are supported through the same paths: `SELECT` prunes
+buckets by time and decodes only the needed range, `INSERT`/`UPDATE`/`DELETE`
+go through the bucket writer (keeping the synthetic `_id` stable unless the time
+or meta field changes), and `EXPLAIN` reports `index_scan` when a secondary
+index is used. See [Time-series collections](timeseries.md). `$out` and
+`$merge` are still rejected on time-series collections.
+
 ## SELECT
 
 ```json

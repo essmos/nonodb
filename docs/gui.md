@@ -169,7 +169,10 @@ a shared machine. Use **Disconnect** to clear the active session.
 - multi-document selection with bulk delete and bulk field update;
 - document history viewer with previous-revision comparison and restore;
 - import/export as JSON, NDJSON, or CSV, with optional upsert on import;
-- saved per-collection views for filter, sort, projection, and limit.
+- saved per-collection views for filter, sort, projection, and limit;
+- **New collection** supports the `timeseries` profile: `timeField` is required,
+  and `metaField`, granularity, compression, and `expireAfterSeconds` are
+  optional.
 
 ### Indexes
 
@@ -529,6 +532,16 @@ the daemon request. The bottom-right timing badge and the recent-operation log u
 that value, so they show backend time plus local socket overhead rather than full
 browser round-trip time. Direct connections without the local proxy fall back to
 client-side timing.
+
+## Time-series settings
+
+Open a time-series collection and use its settings panel to inspect storage
+statistics (live rows, deleted rows, buckets, series, encoded/raw bytes) and to
+edit compression, bucket limits, and expiry. `timeField`, `metaField`, and
+granularity are read-only after creation because changing them would require
+rewriting every bucket; the API rejects those changes on a non-empty
+collection. Creating a time-series collection from the GUI requires a time
+field; the profile selector defaults to `standard`.
 
 ## Collection settings
 

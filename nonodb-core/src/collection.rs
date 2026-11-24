@@ -5549,6 +5549,29 @@ impl<'e> Collection<'e> {
     pub fn delete_txn(&self, wtxn: &mut RwTxn<'_>, filter: &Value, multi: bool) -> Result<usize> {
         if self.profile.is_timeseries() {
             let settings = self.timeseries_settings_in(&*wtxn)?.unwrap_or_default();
+            // A pure `_id` equality can go straight to the locator encoded in
+            // the synthetic id instead of decoding every bucket.
+            let direct_id = (!multi)
+                .then(|| filter.as_object())
+                .flatten()
+                .filter(|object| object.len() == 1)
+                .and_then(|object| object.get("_id"))
+                .and_then(Value::as_str);
+            if let Some(id) = direct_id {
+                let before =
+                    crate::timeseries::find_by_id(&*wtxn, self.env, &self.name, &settings, id)?;
+                let Some(before) = before else {
+                    return Ok(0);
+                };
+                if !crate::timeseries::delete_by_id(wtxn, self.env, &self.name, &settings, id)? {
+                    return Ok(0);
+                }
+                self.apply_index_entries(wtxn, Some(&before), None, id)?;
+                self.apply_text_entries(wtxn, Some(&before), None, id)?;
+                self.apply_fuzzy_entries(wtxn, Some(&before), None, id)?;
+                self.apply_vector_entries(wtxn, Some(&before), None, id)?;
+                return Ok(1);
+            }
             let query = FindQuery {
                 filter: filter.clone(),
                 projection: None,

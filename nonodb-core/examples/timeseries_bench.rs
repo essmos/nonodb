@@ -5,6 +5,8 @@
 //! - insert throughput and per-insert latency percentiles;
 //! - bucket sealing cost;
 //! - point lookup, narrow and wide time-range reads, match-all scans, counts;
+//! - secondary-index create/lookup, `$set` updates, SQL `GROUP BY`, and the
+//!   deletion bitmap with a compacted copy;
 //! - the same operations against a standard (document-per-row) collection as a
 //!   baseline.
 //!
@@ -239,8 +241,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Point deletes by synthetic id: sealed buckets take a tombstone, so the
     // cost is one LMDB put plus the bucket header read.
+    let delete_sample = (rows / 2000).clamp(1, 100);
     let doomed: Vec<String> = ts
-        .find(&query(json!({}), Some(500)))?
+        .find(&query(json!({}), Some(delete_sample)))?
         .iter()
         .filter_map(|doc| doc["_id"].as_str().map(str::to_string))
         .collect();
@@ -250,7 +253,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ts.delete(&json!({"_id": id}), false)?;
         samples.push(op.elapsed());
     }
-    report_latency("delete by _id (tombstone)", samples, doomed.len());
+    report_latency("delete by _id (bitmap)", samples, doomed.len());
 
     let scans = (reads / 50).max(1);
     let mut samples = Vec::with_capacity(scans);
@@ -279,6 +282,90 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &format!("find all rows series-by-series ({series} queries)"),
         samples,
         scans,
+    );
+
+    // ------------------------------------------------------------------
+    // Index, update, and SQL
+    // ------------------------------------------------------------------
+    println!("\nindex, update, and SQL (time-series collection)");
+    let index_started = Instant::now();
+    ts.create_index("status", false)?;
+    println!(
+        "{:<34} {:>9.2?}",
+        "createIndex status",
+        index_started.elapsed()
+    );
+    let indexed = query(
+        json!({"status": "error", "device.id": "sensor-0"}),
+        Some(100),
+    );
+    let mut samples = Vec::with_capacity(reads / 10);
+    let mut indexed_rows = 0usize;
+    for _ in 0..(reads / 10).max(1) {
+        let op = Instant::now();
+        indexed_rows = ts.find(&indexed)?.len();
+        samples.push(op.elapsed());
+    }
+    report_latency(
+        &format!("find indexed status+series ({indexed_rows} rows)"),
+        samples,
+        (reads / 10).max(1),
+    );
+    let plan = ts.explain(&indexed)?;
+    println!(
+        "{:<34} index_used={} access={}",
+        "explain indexed query",
+        plan.get("index_used")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        plan.get("access").and_then(Value::as_str).unwrap_or("?")
+    );
+
+    let update_sample = (rows / 1000).clamp(1, 100);
+    let updatable: Vec<String> = ts
+        .find(&query(json!({"status": "ok"}), Some(update_sample)))?
+        .iter()
+        .filter_map(|doc| doc["_id"].as_str().map(str::to_string))
+        .collect();
+    let mut samples = Vec::with_capacity(updatable.len());
+    for id in &updatable {
+        let op = Instant::now();
+        ts.update(&json!({"_id": id}), &json!({"$set": {"level": 9}}), false)?;
+        samples.push(op.elapsed());
+    }
+    report_latency(
+        &format!("update $set by _id ({} rows)", updatable.len()),
+        samples,
+        updatable.len(),
+    );
+
+    let sql = "SELECT status, COUNT(*) AS n FROM tsbench GROUP BY status ORDER BY n DESC LIMIT 10";
+    let sql_runs = (reads / 100).clamp(1, 20);
+    let mut samples = Vec::with_capacity(sql_runs);
+    let mut sql_rows = 0usize;
+    for _ in 0..sql_runs {
+        let op = Instant::now();
+        sql_rows = nonodb_core::sql::execute(&ts, sql, &[])?.len();
+        samples.push(op.elapsed());
+    }
+    report_latency(
+        &format!("SQL GROUP BY status ({sql_rows} groups)"),
+        samples,
+        sql_runs,
+    );
+
+    // Deletion bitmap and its effect on the on-disk size.
+    let before_delete = ts.timeseries_stats()?.unwrap_or_default();
+    let compacted_after_delete = dir.path().join("after-delete.mdb");
+    let file = store.copy_to_file(
+        &compacted_after_delete,
+        nonodb_core::heed::CompactionOption::Enabled,
+    )?;
+    file.sync_all()?;
+    println!(
+        "deleted_rows={} (bitmap), compacted copy {:.2} MB",
+        before_delete.deleted_rows,
+        std::fs::metadata(&compacted_after_delete)?.len() as f64 / 1_048_576.0
     );
 
     // ------------------------------------------------------------------

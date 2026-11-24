@@ -22,10 +22,8 @@ Full release notes: https://github.com/essmos/nonodb/releases
   dictionary, frame-of-reference bit packing, boolean bit packing, byte
   shuffle, and optional zlib per column. Open buckets append rows in O(1) and
   seal when full or when the window advances. `find`, `count`, `explain`,
-  ordered lookups, replication, backup, and drop work; indexes, search, and SQL
-  are rejected with a clear error. The bundled
-  benchmark stores 50k mixed IoT samples in 4.21 bytes/row, 43.6x smaller than
-  raw JSON and 2.64x smaller than row-oriented zlib with the same data. See
+  ordered lookups, replication, backup, and drop work. The bundled 100k-row
+  benchmark stores 4.07 bytes/row, 45x smaller than raw JSON. See
   `docs/timeseries.md`.
 - Add `update` and `findAndModify` update support for time-series collections:
   `$set`, `$inc`, `$mul`, `$unset`, `$rename`, update pipelines and upserts.
@@ -80,17 +78,19 @@ Full release notes: https://github.com/essmos/nonodb/releases
   unused `coll:<name>` database, and replicate `retain_timeseries` as
   `time_series_retain`. Replicas now produce byte-identical documents, including
   synthetic `_id`s, which is covered by a two-store replication test. Add
-  `examples/timeseries_space.rs`: 100k rows occupy 0.46 MB compacted (4.79
-  B/row) versus 41.66 MB (436.8 B/row) for a document-per-row collection, with
-  the LMDB high-water caveat documented.
+  `examples/timeseries_space.rs`: 100k rows occupy 0.46 MB compacted (4.87
+  B/row) versus 41.35 MB (433.6 B/row) for a document-per-row collection, with
+  the LMDB high-water caveat documented. The benchmark now also measures
+  secondary-index creation/lookup, `$set` updates, SQL `GROUP BY`, bitmap
+  deletes, and compaction.
 - Add `delete` and `findAndModify(remove: true)` for time-series collections.
-  Sealed buckets stay immutable: deleting a row writes a 27-byte tombstone key,
-  so synthetic `_id`s stay valid and a delete is one LMDB put instead of a
-  2048-row bucket rewrite. `find`, `count`, `find_by_key`, aggregation, and
-  `verify_data_dir` skip tombstones; `timeseries_stats` reports `deleted_rows`.
-  Retention now tombstones the boundary bucket instead of renumbering it. Add
-  `nonodb-cli compact <data-dir>` for offline in-place compaction (compacting
-  copy + fsync + swap, with a `.before-compact` fallback), plus
+  Sealed buckets never renumber rows, so synthetic `_id`s stay valid; deleted
+  rows are tracked in a per-bucket bitmap and a pure `_id` delete goes straight
+  to the row locator. `find`, `count`, `find_by_key`, aggregation, and
+  `verify_data_dir` skip deleted rows; `timeseries_stats` reports
+  `deleted_rows`. Retention marks the boundary bucket instead of renumbering.
+  Add `nonodb-cli compact <data-dir>` for offline in-place compaction
+  (compacting copy + fsync + swap, with a `.before-compact` fallback), plus
   `Store::close()` so offline maintenance can reopen the environment in the same
   process.
 

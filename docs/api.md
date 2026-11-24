@@ -2742,8 +2742,8 @@ The MongoDB wire `create` command accepts the same options:
 ```
 
 `retain_timeseries` drops time-series rows older than a date. Whole buckets are
-removed by key without decoding; the boundary bucket tombstones expired rows so
-synthetic `_id`s stay valid:
+removed by key without decoding; the boundary bucket marks expired rows in its
+deletion bitmap so synthetic `_id`s stay valid:
 
 ```json
 {"op": "retain_timeseries", "coll": "readings",
@@ -2923,7 +2923,20 @@ additive.
     "search": {"search_all": true, "modes": ["lexical", "fuzzy", "vector", "hybrid"]},
     "aggregation": {"convert": true, "conversion_aliases": ["$toString", "$toInt"]},
     "ttl": {"insertion_based": true, "date_field": true, "backfill": true, "strict_reads_default": true},
-    "events": {"watch": true, "webhooks": true}
+    "events": {"collection_events": true, "watch": true, "webhooks": true,
+               "webhook_thresholds": ["count", "sum", "avg"]},
+    "storage": {
+      "history": true, "vault": true, "branching": true, "backups": true,
+      "replication": true,
+      "timeseries": {
+        "profile": "timeseries",
+        "codecs": ["delta", "delta_delta", "gorilla_xor", "dictionary",
+                   "for_bitpack", "bool_bits", "byte_shuffle", "deflate"],
+        "granularities": ["seconds", "minutes", "hours"],
+        "compression_levels": ["fast", "balanced", "max"],
+        "aggregation": true, "retention": true, "point_lookup": "synthetic_id"
+      }
+    }
   },
   "limits": {"document_bytes": 1048576, "aggregate_docs": 100000, "search_results": 1000}
 }

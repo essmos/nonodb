@@ -470,7 +470,7 @@ nonodb-cli verify-backup ./backup
 
 ## compact
 
-LMDB never shrinks `data.mdb`; TTL expiry, time-series retention, tombstoned
+LMDB never shrinks `data.mdb`; TTL expiry, time-series retention, bitmap-deleted
 deletes, and dropped collections only free pages for reuse. Compact a stopped
 database in place:
 

@@ -197,13 +197,13 @@ Stages that need a second collection or an index host (`$lookup`, `$search`,
 | projections, sorts, `skip`/`limit`, `maxTimeMS`, hints | yes (residual, after decode) |
 | TTL: `expireAfterSeconds` on the TS settings | yes (read-time) |
 | TTL: collection/document TTL | not applied to buckets |
-| `verify_data_dir` | decodes every bucket and validates keys, headers, rows, tombstones |
+| `verify_data_dir` | decodes every bucket and validates keys, headers, rows, and deletion bitmaps |
 | document history | not recorded (keeps the format columnar) |
 | secondary indexes (`createIndex`/`dropIndex`/`reindex`) | yes, non-unique only |
 | unique indexes | rejected with a clear error |
 | text, fuzzy, geo, vector indexes | yes (`createTextIndex`, `createFuzzyIndex`, `createGeoIndex`, `createVectorIndex`) |
 | `$search`, `$searchMeta`, `$vectorSearch` aggregation stages | yes |
-| `delete` by filter or by `_id` | yes (tombstones) |
+| `delete` by filter or by `_id` | yes (bitmap; `_id` uses the locator directly) |
 | `findAndModify` with `remove: true` | yes |
 | `findAndModify` with an update | yes (returns the new `_id` when the row moves) |
 | `update` (`$set`, `$inc`, `$mul`, `$unset`, `$rename`, pipelines, upsert) | yes |
@@ -232,8 +232,8 @@ condition on the leading field and reports `"index_used": true` with
 update removes its old entry and adds a new one. Retention drops whole buckets
 without visiting index entries, so stale entries can remain until `reindex` or
 `dropIndex`; they are harmless because candidate rows that no longer exist are
-skipped. Unique indexes are rejected because tombstones and bucket rewrites
-make uniqueness checks incompatible with the columnar layout.
+skipped. Unique indexes are rejected because the deletion bitmap and bucket
+rewrites make uniqueness checks incompatible with the columnar layout.
 
 ### Search indexes
 
@@ -310,7 +310,7 @@ behaves differently depending on what it touches:
   row keeps its position and its `_id` stays valid. Pending rows are rewritten
   under their existing key.
 - Changing `timeField` or `metaField` moves the row to another bucket: the old
-  row is tombstoned, the document is re-inserted, and its synthetic `_id`
+  row is marked deleted, the document is re-inserted, and its synthetic `_id`
   changes. `update` still reports `matched`/`modified`; `findAndModify` returns
   the new `_id` in `new_id` and the updated document when `new: true`. The
   change is replicated as `delete(old)` + `insert(new)`.
@@ -327,11 +327,12 @@ Same 100k-row workload (10 series, 8 columns, 183 bytes of JSON per row),
 | Form | Size | Bytes/row |
 |---|---|---|
 | raw JSON documents | 17.47 MB | 183.2 |
-| standard collection (`data.mdb`, no indexes) | 41.66 MB | 436.8 |
-| TS, pending rows before seal (`data.mdb`) | 7.52 MB | 78.9 |
-| TS, sealed, before compaction (`data.mdb`) | 7.52 MB | 78.9 |
-| TS, sealed, compacted copy | **0.46 MB** | **4.79** |
-| TS after retention to half, compacted | 0.32 MB | 6.64 |
+| standard collection (`data.mdb`, no indexes) | 41.35 MB | 433.6 |
+| TS, pending rows before seal (`data.mdb`) | 7.53 MB | 78.9 |
+| TS, sealed, before compaction (`data.mdb`) | 7.53 MB | 78.9 |
+| TS, sealed, compacted copy | **0.46 MB** | **4.87** |
+| TS after deleting 25k rows (bitmap), compacted | 0.46 MB | 4.87 |
+| TS after retention leaves 37.5k rows, compacted | 0.25 MB | 7.10 |
 
 Read that carefully, because it matters operationally:
 
@@ -345,6 +346,9 @@ Read that carefully, because it matters operationally:
 - **Pending rows are raw JSON on purpose** (O(1) inserts). With
   `bucket_max_docs = 2048`, at most 2048 rows per series are uncompressed at
   any moment; seal or `seal_timeseries` shrinks them into the columnar payload.
+- **Updates and `_id` deletes decode one bucket**, not the whole collection.
+  An update by `_id` rewrites the affected sealed bucket (about 0.7 s for a
+  1,667-row bucket in the 100k-row benchmark); changing time/meta is a move.
 - Compaction is a whole-database operation: plan a maintenance window or run it
   against a replica, exactly like any other LMDB high-water issue.
 - Deleted rows are bits in a per-bucket deletion bitmap appended to the columnar
@@ -370,8 +374,10 @@ run against a live environment. `nonodb-cli backup <data-dir> <out-dir>` produce
 a compacted copy without touching the source, which is the safer option on a
 primary.
 
-Compacted on-disk size is **~91x smaller than a document-per-row collection**
-and **~38x smaller than the raw JSON** for this workload.
+Compacted on-disk size is **~89x smaller than a document-per-row collection**
+and **~38x smaller than the raw JSON** for this workload. Deleting 25,000 rows
+with the bitmap took ~1.26 s and left the sealed file at its high-water mark
+until the compacting copy above.
 
 ## Deleting rows
 
@@ -467,8 +473,9 @@ Time-series collections participate in the normal replication stream:
   clears the bucket database.
 
 `verify_data_dir` decodes every sealed bucket, checks the header (window bounds,
-meta), validates every row still has its time field, validates pending-row keys
-and tombstones, and reports live row counts for time-series collections.
+meta), validates every row still has its time field, validates pending-row keys,
+deletion bitmaps, and legacy tombstones, and reports live row counts for
+time-series collections.
 
 ## Maintenance
 
@@ -513,51 +520,69 @@ standard collection holding the same documents:
 
 ```text
 write
-insert (time-series)                 100000 ops   21700 ops/s  p50 32.7us  p95 53.2us  p99 61.6us
-insert (standard, baseline)          100000 ops   46700 ops/s  p50 20.6us  p95 25.7us  p99 30.1us
-seal open buckets                        10 perm  156 ms total, 15.6 ms/bucket
-stored: 3.95 bytes/row, 46.4x smaller than raw JSON
+insert (time-series)                 100000 ops   22750 ops/s  p50 36.3us  p95 41.9us  p99 51.5us
+insert (standard, baseline)          100000 ops   48840 ops/s  p50 20.4us  p95 24.2us  p99 27.6us
+seal open buckets                        10 perm  126 ms total, 12.6 ms/bucket
+stored: 4.07 bytes/row, 45.0x smaller than raw JSON
 
 read (time-series collection)
-find_by_key (point)                      500 ops     371 ops/s  p50 2.54 ms  p99 4.44 ms
-find 1 min, 1 series (60 rows)           500 ops     185 ops/s  p50 5.24 ms  p99 8.03 ms
-find 1 h, 1 series (3600 rows)           125 ops      38 ops/s  p50 25.6 ms  p99 36.2 ms
-count 1 h, 1 series                      125 ops      32 ops/s  p50 31.1 ms  p99 40.4 ms
-aggregate $group 1 h, 1 series            50 ops      23 ops/s  p50 43.7 ms  p99 49.4 ms
-delete by _id (tombstone)                500 ops     128 ops/s  p50 7.8 ms  p99 8.9 ms
-find match-all (100000 rows)              10 ops     2.0 ops/s  p50 499 ms   p99 525 ms
-retention before +1 h                      1 pass   410 ms, 20 dropped + 10 tombstoned
+find_by_key (point)                     2000 ops     463 ops/s  p50 2.16 ms  p99 2.25 ms
+find 1 min, 1 series (60 rows)          2000 ops     219 ops/s  p50 4.56 ms  p99 4.75 ms
+find 1 h, 1 series (3600 rows)           500 ops      47 ops/s  p50 21.0 ms  p99 22.8 ms
+count 1 h, 1 series                      500 ops      39 ops/s  p50 25.5 ms  p99 27.5 ms
+aggregate $group 1 h, 1 series           200 ops      26 ops/s  p50 37.8 ms  p99 40.6 ms
+delete by _id (bitmap)                    50 ops      62 ops/s  p50 16.1 ms  p99 17.1 ms
+find match-all (99950 rows)               40 ops     2.4 ops/s  p50 424 ms   p99 428 ms
+retention before +1 h                      1 pass   541 ms, 20 dropped + 10 tombstoned
+
+index, update, and SQL
+createIndex status                         1 call   757 ms
+find indexed status+series (100 rows)    200 ops     5.2 ops/s  p50 193 ms   p99 197 ms
+explain indexed query                               index_used=true, access=index_scan
+update $set by _id (100 rows)            100 ops     1.5 ops/s  p50 688 ms   p99 703 ms
+SQL GROUP BY status (4 groups)            20 ops     1.7 ops/s  p50 604 ms   p99 606 ms
 
 baseline (standard collection, one document per row)
-find 1 h, 1 series (no index)             10 ops     3.8 ops/s  p50 262 ms   p99 284 ms
-find match-all (100000 rows)              10 ops     2.5 ops/s  p50 400 ms   p99 407 ms
+find 1 h, 1 series (no index)             40 ops     3.6 ops/s  p50 282 ms   p99 286 ms
+find match-all (100000 rows)              40 ops     2.3 ops/s  p50 434 ms   p99 442 ms
 ```
 
-Reading a one-hour slice is ~10x faster than the document baseline because
+Reading a one-hour slice is ~13x faster than the document baseline because
 whole buckets outside the time range are skipped instead of parsing 100k JSON
 documents. Inserts are ~2x slower than the raw document path: each insert is two
 LMDB puts (row + open-bucket pointer) instead of one, and series resolution
 reads the pointer.
 
 The weak spot is point lookup by `_id`: sealed buckets decode their columns
-sequentially, so a synthetic id costs ~2.5 ms instead of the microsecond a
+sequentially, so a synthetic id costs ~2.2 ms instead of the microsecond a
 document store needs. Range scans, counts, and downsampling are the intended
 access pattern; if you need millions of single-row lookups, keep a small
 document or index mapping outside the collection, or query by time range.
+
+The first indexed query over a broad, low-selectivity field can still cost
+~190 ms because candidate buckets are decoded and the residual filter runs
+afterwards. Updates rewrite the containing bucket (~690 ms for a 1,667-row
+bucket in this run), so prefer collecting ids and batching by time window for
+large maintenance jobs. A pure `_id` delete now goes straight to the locator
+(~16 ms) instead of scanning every bucket.
 
 Reproduce: `ROWS=100000 READS=500 cargo run --release -p nonodb-core --example timeseries_bench`
 
 ## Limitations
 
-- Deletes and rows moved by an update use tombstones; deleted rows keep
-  occupying their bucket until retention or compaction.
-- Unique indexes are rejected. Non-unique secondary indexes are supported and
-  used by `find`/`count`/`explain` (`index_used`), but deletes and updates by
-  filter still decode candidate buckets when no index applies.
+- Deletes and rows moved by an update set bits in the bucket deletion bitmap;
+  deleted rows occupy their bucket (and its encoded payload) until retention or
+  compaction. Reclaiming file space requires an offline compacting copy, not
+  only a retention pass (`data.mdb` keeps its high-water mark).
+- Unique indexes are rejected. Non-unique secondary, text, fuzzy, geo, and
+  vector indexes are supported and used by `find`/`count`/`explain`
+  (`index_used`), but deletes and updates by filter still decode candidate
+  buckets when no index applies.
 - `$out`/`$merge` are not supported for time-series rows (writes must go
   through the bucket writer).
 - Aggregation decodes the full time range into memory before running stages.
-- Point lookup by `_id` decodes the containing bucket (see above).
+- Point lookup by `_id` decodes the containing bucket (see above); deletes by
+  `_id` use the locator directly.
 - Open buckets are uncompressed until they seal.
 - `bucketMaxDocs` bounds row count, not wall-clock rate; a very high ingest rate
   simply produces more buckets per window (serial counter in the key).
