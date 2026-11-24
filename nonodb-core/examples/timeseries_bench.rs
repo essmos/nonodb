@@ -441,7 +441,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         samples.push(op.elapsed());
     }
     report_latency(
-        &format!("aggregate $group 1 h, 1 series (standard)"),
+        "aggregate $group 1 h, 1 series (standard)",
         samples,
         agg_runs,
     );
