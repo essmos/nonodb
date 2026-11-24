@@ -336,6 +336,16 @@ fn cypher_gds_clamps_large_row_limits_and_reports_truncation() {
     }))
     .unwrap();
     let out = nodes.graph_cypher(options).unwrap();
+    assert_eq!(out["row_count"], 1_500);
+    assert_eq!(out["truncated"], false);
+
+    let options: CypherOptions = serde_json::from_value(json!({
+        "query": "CALL gds.pagerank.stream() YIELD nodeId, score RETURN nodeId, score",
+        "max_rows": 1_000,
+        "max_operations": 10_000_000
+    }))
+    .unwrap();
+    let out = nodes.graph_cypher(options).unwrap();
     assert_eq!(out["row_count"], 1_000);
     assert_eq!(out["truncated"], true);
 }
