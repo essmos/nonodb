@@ -4072,6 +4072,93 @@ impl<'e> Collection<'e> {
         Ok(())
     }
 
+    /// Applies deletions for many documents while writing each text manifest
+    /// once. Bulk deletes otherwise reserialize a growing tombstone map for
+    /// every document, which is quadratic for large collections.
+    fn apply_text_deletes(&self, wtxn: &mut RwTxn<'_>, docs: &[(String, Value)]) -> Result<()> {
+        if docs.is_empty() {
+            return Ok(());
+        }
+        for def in self.search_index_defs_in(&*wtxn)? {
+            if def.kind != SearchKind::Text {
+                continue;
+            }
+            let mut manifest = self
+                .segment_manifest_in(&*wtxn, &def.name)?
+                .unwrap_or_default();
+            let prefix = self.segment_delta_prefix(&def.name);
+            let mut count = self.segment_delta_count(&*wtxn, &def.name);
+            let mut manifest_changed = false;
+            for field in &def.fields {
+                for (id, old) in docs {
+                    let Some(old_text) =
+                        index::field_value(old, &field.path).and_then(search::field_text)
+                    else {
+                        continue;
+                    };
+                    manifest
+                        .tombstones
+                        .insert(id.clone(), manifest.segments.len());
+                    manifest_changed = true;
+                    let key = format!("{prefix}{id}");
+                    if self.meta.get(&*wtxn, key.as_bytes())?.is_some() {
+                        self.meta.delete(&mut *wtxn, key.as_bytes())?;
+                        count = count.saturating_sub(1);
+                    }
+                    self.adjust_segment_stats(wtxn, &def, Some(&old_text), None)?;
+                }
+            }
+            if manifest_changed {
+                self.put_segment_manifest(wtxn, &def.name, &manifest)?;
+            }
+            self.set_segment_delta_count(wtxn, &def.name, count)?;
+        }
+        Ok(())
+    }
+
+    /// Applies fuzzy-index deletions for many documents with one manifest
+    /// write, mirroring [`Self::apply_text_deletes`].
+    fn apply_fuzzy_deletes(&self, wtxn: &mut RwTxn<'_>, docs: &[(String, Value)]) -> Result<()> {
+        if docs.is_empty() {
+            return Ok(());
+        }
+        for def in self.search_index_defs_in(&*wtxn)? {
+            if def.kind != SearchKind::Fuzzy {
+                continue;
+            }
+            let mut manifest = self
+                .fuzzy_segment_manifest_in(&*wtxn, &def.name)?
+                .unwrap_or_default();
+            let prefix = self.fuzzy_segment_delta_prefix(&def.name);
+            let mut count = self.fuzzy_segment_delta_count(&*wtxn, &def.name);
+            let mut manifest_changed = false;
+            for field in &def.fields {
+                for (id, old) in docs {
+                    let Some(_old_text) = index::field_value(old, &field.path)
+                        .and_then(search::field_text)
+                        .map(|text| search::normalize(&text))
+                    else {
+                        continue;
+                    };
+                    manifest
+                        .tombstones
+                        .insert(id.clone(), manifest.segments.len());
+                    manifest_changed = true;
+                    let key = format!("{prefix}{id}");
+                    if self.meta.get(&*wtxn, key.as_bytes())?.is_some() {
+                        self.meta.delete(&mut *wtxn, key.as_bytes())?;
+                        count = count.saturating_sub(1);
+                    }
+                }
+            }
+            if manifest_changed {
+                self.put_fuzzy_segment_manifest(wtxn, &def.name, &manifest)?;
+            }
+            self.set_fuzzy_segment_delta_count(wtxn, &def.name, count)?;
+        }
+        Ok(())
+    }
+
     fn apply_segment_fuzzy_entry(
         &self,
         wtxn: &mut RwTxn<'_>,
@@ -5138,6 +5225,7 @@ impl<'e> Collection<'e> {
     pub fn delete_txn(&self, wtxn: &mut RwTxn<'_>, filter: &Value, multi: bool) -> Result<usize> {
         self.ensure_standard()?;
         let keys = self.matching_keys(&*wtxn, filter, multi)?;
+        let mut deleted_docs = Vec::with_capacity(keys.len());
         for key in &keys {
             let id = std::str::from_utf8(key)
                 .map_err(|e| Error::Query(e.to_string()))?
@@ -5151,12 +5239,13 @@ impl<'e> Collection<'e> {
             self.db.delete(&mut *wtxn, key.as_slice())?;
             self.apply_index_entries(wtxn, Some(&old), None, &id)?;
             self.apply_graph_entries(wtxn, Some(&old), None)?;
-            self.apply_text_entries(wtxn, Some(&old), None, &id)?;
-            self.apply_fuzzy_entries(wtxn, Some(&old), None, &id)?;
             self.apply_vector_entries(wtxn, Some(&old), None, &id)?;
             self.set_ttl(wtxn, &id, None)?;
             self.record_history(wtxn, &id, "delete", None)?;
+            deleted_docs.push((id, old));
         }
+        self.apply_text_deletes(wtxn, &deleted_docs)?;
+        self.apply_fuzzy_deletes(wtxn, &deleted_docs)?;
         Ok(keys.len())
     }
 
@@ -13271,6 +13360,39 @@ mod tests {
             .fuzzy_search("name", "Krakw", 1, &json!({}), Some(10))
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn bulk_delete_batches_text_and_fuzzy_tombstones() {
+        let (_dir, store) = store();
+        let c = store.collection("bulk_delete_search").unwrap();
+        for i in 0..1000 {
+            c.insert_one(json!({
+                "_id": format!("d{i:04}"),
+                "body": "rust database search",
+                "name": format!("City{i:04}"),
+            }))
+            .unwrap();
+        }
+        c.create_text_segment_index("body").unwrap();
+        c.create_fuzzy_segment_index("name").unwrap();
+
+        assert_eq!(c.delete(&json!({}), true).unwrap(), 1000);
+        assert_eq!(c.count(&json!({})).unwrap(), 0);
+        assert!(c
+            .search("body", "rust", &json!({}), 0, Some(10))
+            .unwrap()
+            .is_empty());
+        assert!(c
+            .fuzzy_search("name", "city0500", 0, &json!({}), Some(10))
+            .unwrap()
+            .is_empty());
+
+        let rtxn = store.env().read_txn().unwrap();
+        let text = c.segment_manifest_in(&rtxn, "body").unwrap().unwrap();
+        let fuzzy = c.fuzzy_segment_manifest_in(&rtxn, "name").unwrap().unwrap();
+        assert_eq!(text.tombstones.len(), 1000);
+        assert_eq!(fuzzy.tombstones.len(), 1000);
     }
 
     #[test]

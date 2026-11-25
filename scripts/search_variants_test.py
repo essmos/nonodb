@@ -65,10 +65,11 @@ def test_bm25(db: NonoDB) -> None:
     assert all(h["_score"] > 0 for h in hits)
     assert [h["_score"] for h in hits] == sorted((h["_score"] for h in hits), reverse=True)
 
-    # OR: "async" narrows the top results, but g still matches through "rust" alone.
-    # The shorter document with both terms (b) beats the long one (a).
+    # Multi-term queries require every positive term (AND). g has "rust"
+    # but not "async", so it is excluded; the shorter document with both
+    # terms (b) beats the longer one (a).
     hits = c.search("body", "rust async", limit=10)
-    assert set(ids(hits)) == {"a", "b", "g"}, hits
+    assert set(ids(hits)) == {"a", "b"}, hits
     assert hits[0]["_id"] == "b"
 
     # Duplicates in the query do not change the result.
@@ -279,8 +280,8 @@ def test_query_operators(db: NonoDB) -> None:
 
     # Sort/projection/skip/limit.
     got = c.find({}, sort=[("a", 1)], projection={"a": 1, "_id": 1})
-    # null and missing fields sort last (missing last).
-    assert [d["_id"] for d in got] == ["q1", "q2", "q5", "q3", "q4"]
+    # MongoDB sorts null and missing values before numbers in ascending order.
+    assert [d["_id"] for d in got] == ["q3", "q4", "q1", "q2", "q5"]
     assert set(got[2]) == {"_id", "a"}
     got = c.find({}, sort=[("a", -1)], skip=1, limit=2, projection={"a": 0})
     assert len(got) == 2 and all("a" not in d for d in got)

@@ -28,6 +28,7 @@ PER_WRITER = int(os.environ.get("PER_WRITER", "300"))
 READERS = int(os.environ.get("READERS", "12"))
 READS_PER = int(os.environ.get("READS_PER", "500"))
 COLL = "concurrency"
+UNIQ_COLL = "concurrency_unique"
 
 
 def _client():
@@ -83,7 +84,7 @@ def unique_worker(keys: list[str]) -> tuple[int, int]:
     from nonodb import NonoDBError
 
     db = _client()
-    c = db.collection(COLL)
+    c = db.collection(UNIQ_COLL)
     ok = dup = 0
     for k in keys:
         try:
@@ -220,7 +221,11 @@ def main() -> int:
         print(f"  $inc: {WRITERS} źródeł × 100 -> n={n}")
 
     # --- 6. unique index under load ---------------------------------
-    create_index(db, COLL, "uniq", unique=True)
+    # Keep the unique-index workload in its own collection: plain unique
+    # indexes treat a missing field as null, so the main collection (which has
+    # no "uniq" field) cannot accept more than one document under that index.
+    db.collection(UNIQ_COLL).delete({}, multi=True)
+    create_index(db, UNIQ_COLL, "uniq", unique=True)
     keys = [f"k{i}" for i in range(50)]
     with ProcessPoolExecutor(max_workers=WRITERS) as ex:
         res = list(ex.map(unique_worker, [keys] * WRITERS))
@@ -249,13 +254,16 @@ def main() -> int:
 
     # --- final consistency ------------------------------------------
     total = c_all(db, COLL, {})
-    want_total = expected + 1 + len(keys) + wres
+    want_total = expected + 1 + wres
     if len(total) != want_total:
         failures.append(f"końcowa liczba: {len(total)} != {want_total}")
     for w in range(WRITERS):
         cnt = len(c_all(db, COLL, {"src": w}))
         if cnt != PER_WRITER:
             failures.append(f"per-src {w}: {cnt} != {PER_WRITER}")
+    uniq_count = len(c_all(db, UNIQ_COLL, {}))
+    if uniq_count != len(keys):
+        failures.append(f"unique collection: {uniq_count} != {len(keys)}")
 
     if failures:
         print("\nFAIL:")
