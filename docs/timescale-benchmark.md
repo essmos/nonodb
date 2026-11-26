@@ -5,7 +5,6 @@ definitions, results, storage, index sizes, RAM usage, correctness checks and
 caveats for the comparison between NonoDB (`profile: "timeseries"`) and
 TimescaleDB on a real 206-million-row dataset.
 
-Raw data and per-stage logs: `data/timescale_benchmark_report.md`.
 
 ## 1. Environment
 

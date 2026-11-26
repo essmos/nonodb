@@ -642,14 +642,13 @@ TimescaleDB wins the point/update/delete and highly selective indexed queries
 because it is a general OLTP engine with native B-tree indexes. NonoDB
 time-series wins on footprint and is close on range scans. On the 206M-row
 import, bucket locators, header-only counts, and hourly/daily rollups bring
-BTC/USD 30-day OHLC to about 5.5 ms (TimescaleDB: 56.9 ms) and all-symbol
-one-day OHLC to about 85 ms (TimescaleDB: 33.4 ms); `count`/ordered `find`
+BTC/USD 30-day OHLC to about 5.5 ms (TimescaleDB: 56.8 ms) and all-symbol
+one-day OHLC to about 65 ms (TimescaleDB: 33.6 ms); `count`/ordered `find`
 on one series are in the low milliseconds. The 100k-row table above is a shape
 check, not a tuned benchmark: no PostgreSQL tuning, connection pooling, or
 prepared statements were used. Reproduce the Timescale side with
 `scripts/timescale_bench.py`; the 206M-row results are in
-`docs/timescale-benchmark.md` and the per-stage log in
-`data/timescale_benchmark_report.md`.
+`docs/timescale-benchmark.md`.
 
 ## Limitations
 
