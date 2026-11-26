@@ -10102,22 +10102,35 @@ impl<'e> Collection<'e> {
             let matched = self.count_in(rtxn, &query.filter)?;
             let hint = query.hint.as_ref().map(parse_index_hint).transpose()?;
             let plan = self.query_index_plan(rtxn, &query.filter, hint.as_ref())?;
+            let mut prune_stats = None;
             let bucket_index = if plan.is_none() {
                 match self.timeseries_settings_in(rtxn)? {
-                    Some(settings) => crate::timeseries::lookup_indexed_buckets(
-                        rtxn,
-                        self.env,
-                        &self.name,
-                        &query.filter,
-                        &settings,
-                    )?
-                    .is_some(),
+                    Some(settings) => {
+                        let locators = crate::timeseries::lookup_indexed_buckets(
+                            rtxn,
+                            self.env,
+                            &self.name,
+                            &query.filter,
+                            &settings,
+                        )?;
+                        if locators.is_some() {
+                            prune_stats = crate::timeseries::bucket_prune_stats(
+                                rtxn,
+                                self.env,
+                                &self.name,
+                                &query.filter,
+                                &settings,
+                            )?;
+                        }
+                        locators.is_some()
+                    }
                     None => false,
                 }
             } else {
                 false
             };
             let indexed = plan.is_some() || bucket_index;
+            let (buckets_total, buckets_pruned) = prune_stats.unwrap_or((0, 0));
             return Ok(serde_json::json!({
                 "collection": self.name,
                 "profile": "timeseries",
@@ -10125,6 +10138,8 @@ impl<'e> Collection<'e> {
                 "index_used": indexed,
                 "bucket_index_used": bucket_index,
                 "index": if bucket_index { Some("bucket_locator".to_string()) } else { plan.as_ref().map(|plan| plan.def.name()) },
+                "buckets_total": buckets_total,
+                "buckets_pruned": buckets_pruned,
                 "filter": query.filter,
                 "matched": matched,
             }));

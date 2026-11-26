@@ -53,8 +53,11 @@ pub const BUCKET_DB_PREFIX: &str = "tsb:";
 
 const MAGIC: &[u8; 4] = b"NTB2";
 const MAGIC_V1: &[u8; 4] = b"NTB1";
-const FORMAT_VERSION: u8 = 2;
+const FORMAT_VERSION: u8 = 3;
+const FORMAT_VERSION_PREV: u8 = 2;
 const FORMAT_VERSION_LEGACY: u8 = 1;
+const BLOOM_BYTES: usize = 256;
+const BLOOM_HASHES: u8 = 3;
 const BLOCK_ROWS: usize = 256;
 const KEY_OPEN: u8 = 0x00;
 const KEY_BUCKET: u8 = 0x01;
@@ -1042,6 +1045,320 @@ fn has_bitmap(data: &[u8]) -> bool {
 fn deleted_at(bucket: &Bucket, tombs: &BTreeSet<u32>, seq: u32) -> bool {
     tombs.contains(&seq) || bucket.deleted.contains(&seq)
 }
+/// Per-bucket min/max ranges and a compact Bloom filter for string equality.
+#[derive(Clone, Default)]
+struct ZoneMap {
+    ranges: BTreeMap<String, (f64, f64)>,
+    bloom: Vec<u8>,
+}
+
+impl ZoneMap {
+    fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.push(1u8);
+        put_uvarint(&mut out, self.ranges.len() as u64);
+        for (field, (min, max)) in &self.ranges {
+            put_bytes(&mut out, field.as_bytes());
+            out.extend_from_slice(&min.to_bits().to_be_bytes());
+            out.extend_from_slice(&max.to_bits().to_be_bytes());
+        }
+        out.extend_from_slice(&self.bloom);
+        out
+    }
+
+    fn decode(raw: &[u8]) -> Result<Self> {
+        let mut pos = 0;
+        let version = *raw.get(pos).ok_or_else(|| corrupt("empty zone map"))?;
+        pos += 1;
+        if version != 1 {
+            return Err(corrupt("unsupported zone-map version"));
+        }
+        let count = get_uvarint(raw, &mut pos)? as usize;
+        if count > 4096 {
+            return Err(corrupt("zone-map column count out of range"));
+        }
+        let mut ranges = BTreeMap::new();
+        for _ in 0..count {
+            let field = std::str::from_utf8(get_bytes(raw, &mut pos)?)
+                .map_err(|_| corrupt("zone-map field is not UTF-8"))?
+                .to_string();
+            let min_bytes: [u8; 8] = raw
+                .get(pos..pos + 8)
+                .ok_or_else(|| corrupt("malformed zone-map minimum"))?
+                .try_into()
+                .map_err(|_| corrupt("malformed zone-map minimum"))?;
+            pos += 8;
+            let max_bytes: [u8; 8] = raw
+                .get(pos..pos + 8)
+                .ok_or_else(|| corrupt("malformed zone-map maximum"))?
+                .try_into()
+                .map_err(|_| corrupt("malformed zone-map maximum"))?;
+            pos += 8;
+            let min = f64::from_bits(u64::from_be_bytes(min_bytes));
+            let max = f64::from_bits(u64::from_be_bytes(max_bytes));
+            ranges.insert(field, (min, max));
+        }
+        if raw.len().saturating_sub(pos) != BLOOM_BYTES {
+            return Err(corrupt("malformed zone-map Bloom filter"));
+        }
+        Ok(Self {
+            ranges,
+            bloom: raw[pos..].to_vec(),
+        })
+    }
+
+    fn allows(&self, filter: &Value, settings: &Settings) -> bool {
+        fn bloom_key(field: &str, value: &str) -> Vec<u8> {
+            let mut key = Vec::with_capacity(field.len() + value.len() + 1);
+            key.extend_from_slice(field.as_bytes());
+            key.push(0);
+            key.extend_from_slice(value.as_bytes());
+            key
+        }
+        fn bloom_contains(bloom: &[u8], key: &[u8]) -> bool {
+            if bloom.len() != BLOOM_BYTES {
+                return true;
+            }
+            let first = fnv1a64(key);
+            let mut second = 0x9e37_79b9_7f4a_7c15u64;
+            for byte in key {
+                second ^= u64::from(*byte);
+                second = second.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            (0..BLOOM_HASHES).all(|i| {
+                let hash = first.wrapping_add(u64::from(i).wrapping_mul(second));
+                let bit = hash as usize % (BLOOM_BYTES * 8);
+                bloom[bit / 8] & (1 << (bit % 8)) != 0
+            })
+        }
+        fn string_operand(value: &Value) -> Option<String> {
+            match value {
+                Value::String(text) => Some(text.clone()),
+                Value::Bool(flag) => Some(flag.to_string()),
+                Value::Object(object) => object.get("$eq").and_then(string_operand),
+                _ => None,
+            }
+        }
+        fn numeric_operand(value: &Value, is_time: bool) -> Option<f64> {
+            if is_time {
+                time_value_ms(value).map(|value| value as f64)
+            } else {
+                value.as_f64().or_else(|| {
+                    value
+                        .as_object()
+                        .and_then(|object| object.get("$eq"))
+                        .and_then(Value::as_f64)
+                })
+            }
+        }
+        fn range_allows(
+            ranges: &BTreeMap<String, (f64, f64)>,
+            field: &str,
+            low: Option<f64>,
+            high: Option<f64>,
+        ) -> bool {
+            let Some((min, max)) = ranges.get(field) else {
+                return true;
+            };
+            !low.is_some_and(|low| *max < low) && !high.is_some_and(|high| *min > high)
+        }
+        fn check(value: &Value, settings: &Settings, zone: &ZoneMap) -> bool {
+            let Some(object) = value.as_object() else {
+                return true;
+            };
+            for (field, operand) in object {
+                if field == "$and" {
+                    if let Some(items) = operand.as_array() {
+                        if !items.iter().all(|item| check(item, settings, zone)) {
+                            return false;
+                        }
+                    }
+                    continue;
+                }
+                if field.starts_with('$') || settings.meta_field.as_deref() == Some(field.as_str())
+                {
+                    continue;
+                }
+                let is_time = field == &settings.time_field;
+                if let Some(conditions) = operand.as_object() {
+                    let mut low = None;
+                    let mut high = None;
+                    let mut had_numeric = false;
+                    for (op, value) in conditions {
+                        let Some(number) = numeric_operand(value, is_time) else {
+                            continue;
+                        };
+                        had_numeric = true;
+                        match op.as_str() {
+                            "$gte" => {
+                                low = Some(low.map_or(number, |current: f64| current.max(number)))
+                            }
+                            "$gt" => {
+                                low = Some(low.map_or(number, |current: f64| current.max(number)))
+                            }
+                            "$lte" => {
+                                high = Some(high.map_or(number, |current: f64| current.min(number)))
+                            }
+                            "$lt" => {
+                                high = Some(high.map_or(number, |current: f64| current.min(number)))
+                            }
+                            "$eq" => {
+                                low = Some(number);
+                                high = Some(number);
+                            }
+                            _ => {}
+                        }
+                    }
+                    if had_numeric && !range_allows(&zone.ranges, field, low, high) {
+                        return false;
+                    }
+                    if let Some(string) = string_operand(operand) {
+                        if !bloom_contains(&zone.bloom, &bloom_key(field, &string)) {
+                            return false;
+                        }
+                    }
+                    if let Some(items) = conditions.get("$in").and_then(Value::as_array) {
+                        let any = items
+                            .iter()
+                            .filter_map(string_operand)
+                            .any(|string| bloom_contains(&zone.bloom, &bloom_key(field, &string)));
+                        if !any {
+                            return false;
+                        }
+                    }
+                } else if let Some(string) = string_operand(operand) {
+                    if !bloom_contains(&zone.bloom, &bloom_key(field, &string)) {
+                        return false;
+                    }
+                } else if let Some(number) = numeric_operand(operand, is_time) {
+                    if !range_allows(&zone.ranges, field, Some(number), Some(number)) {
+                        return false;
+                    }
+                }
+            }
+            true
+        }
+        check(filter, settings, self)
+    }
+}
+
+fn bloom_insert(bloom: &mut [u8], key: &[u8]) {
+    if bloom.len() != BLOOM_BYTES {
+        return;
+    }
+    let first = fnv1a64(key);
+    let mut second = 0x9e37_79b9_7f4a_7c15u64;
+    for byte in key {
+        second ^= u64::from(*byte);
+        second = second.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    for i in 0..BLOOM_HASHES {
+        let hash = first.wrapping_add(u64::from(i).wrapping_mul(second));
+        let bit = hash as usize % (BLOOM_BYTES * 8);
+        bloom[bit / 8] |= 1 << (bit % 8);
+    }
+}
+
+fn zone_number(value: &Value) -> Option<f64> {
+    value.as_f64().or_else(|| {
+        value
+            .as_object()
+            .and_then(|object| object.get("$date"))
+            .and_then(|_| time_value_ms(value))
+            .map(|value| value as f64)
+    })
+}
+
+fn zone_string(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => Some(text.clone()),
+        Value::Bool(flag) => Some(flag.to_string()),
+        _ => None,
+    }
+}
+
+fn zone_from_flat(rows: &[BTreeMap<String, Value>]) -> ZoneMap {
+    let mut ranges: BTreeMap<String, (f64, f64)> = BTreeMap::new();
+    let mut keys = BTreeSet::new();
+    for row in rows {
+        for (field, value) in row {
+            if let Some(number) = zone_number(value) {
+                ranges
+                    .entry(field.clone())
+                    .and_modify(|(min, max)| {
+                        *min = min.min(number);
+                        *max = max.max(number);
+                    })
+                    .or_insert((number, number));
+            }
+            if let Some(text) = zone_string(value) {
+                let mut key = field.as_bytes().to_vec();
+                key.push(0);
+                key.extend_from_slice(text.as_bytes());
+                keys.insert(key);
+            }
+        }
+    }
+    let mut bloom = vec![0u8; BLOOM_BYTES];
+    for key in keys {
+        bloom_insert(&mut bloom, &key);
+    }
+    ZoneMap { ranges, bloom }
+}
+
+fn skip_zone_map(data: &[u8], pos: &mut usize, version: u8) -> Result<()> {
+    if version >= 3 {
+        let _ = get_bytes(data, pos)?;
+    }
+    Ok(())
+}
+
+fn zone_filter_relevant(filter: &Value, settings: &Settings) -> bool {
+    fn check(value: &Value, settings: &Settings) -> bool {
+        let Some(object) = value.as_object() else {
+            return false;
+        };
+        for (field, operand) in object {
+            if field == "$and" {
+                if operand
+                    .as_array()
+                    .is_some_and(|items| items.iter().any(|item| check(item, settings)))
+                {
+                    return true;
+                }
+            } else if !field.starts_with('$')
+                && field != &settings.time_field
+                && settings.meta_field.as_deref() != Some(field.as_str())
+                && operand.as_object().is_none_or(|condition| {
+                    condition
+                        .keys()
+                        .any(|key| matches!(key.as_str(), "$eq" | "$in"))
+                        || condition
+                            .keys()
+                            .any(|key| matches!(key.as_str(), "$gte" | "$gt" | "$lte" | "$lt"))
+                })
+            {
+                return true;
+            }
+        }
+        false
+    }
+    check(filter, settings)
+}
+
+fn bucket_zone_allows(data: &[u8], settings: &Settings, filter: &Value) -> Result<bool> {
+    if !valid_magic(data) || data[4] < 3 || !zone_filter_relevant(filter, settings) {
+        return Ok(true);
+    }
+    let mut pos = 6;
+    let _n = get_uvarint(data, &mut pos)?;
+    let _start = get_ivarint(data, &mut pos)?;
+    let _end = get_ivarint(data, &mut pos)?;
+    let _meta = get_bytes(data, &mut pos)?;
+    let raw = get_bytes(data, &mut pos)?;
+    let zone = ZoneMap::decode(raw)?;
+    Ok(zone.allows(filter, settings))
+}
 
 fn encode_deleted(bucket: &Bucket) -> Vec<u8> {
     let mut bytes = vec![0u8; bucket.rows.len().div_ceil(8)];
@@ -1372,6 +1689,34 @@ pub fn lookup_indexed_buckets(
     filter: &Value,
     settings: &Settings,
 ) -> Result<Option<Vec<BucketLocator>>> {
+    Ok(
+        lookup_indexed_buckets_inner(rtxn, env, name, filter, settings, true)?
+            .map(|(locators, _)| locators),
+    )
+}
+
+/// Returns `(candidate buckets, buckets pruned by zone maps/Bloom)`.
+pub fn bucket_prune_stats(
+    rtxn: &RoTxn<'_>,
+    env: &heed::Env,
+    name: &str,
+    filter: &Value,
+    settings: &Settings,
+) -> Result<Option<(usize, usize)>> {
+    Ok(
+        lookup_indexed_buckets_inner(rtxn, env, name, filter, settings, false)?
+            .map(|(locators, pruned)| (locators.len(), pruned)),
+    )
+}
+
+fn lookup_indexed_buckets_inner(
+    rtxn: &RoTxn<'_>,
+    env: &heed::Env,
+    name: &str,
+    filter: &Value,
+    settings: &Settings,
+    prune: bool,
+) -> Result<Option<(Vec<BucketLocator>, usize)>> {
     let Some(db) =
         env.open_database::<Bytes, Bytes>(rtxn, Some(&format!("{BUCKET_DB_PREFIX}{name}")))?
     else {
@@ -1442,11 +1787,23 @@ pub fn lookup_indexed_buckets(
             }
         }
     }
+    let mut pruned = 0usize;
     out.retain(|loc| {
         let window_end = loc.window.saturating_add(span).saturating_sub(1);
-        !low.is_some_and(|low| window_end < low) && !high.is_some_and(|high| loc.window > high)
+        if low.is_some_and(|low| window_end < low) || high.is_some_and(|high| loc.window > high) {
+            return false;
+        }
+        let key = bucket_locator_key(*loc);
+        let allowed = match db.get(rtxn, &key) {
+            Ok(Some(payload)) => bucket_zone_allows(payload, settings, filter).unwrap_or(true),
+            _ => true,
+        };
+        if !allowed {
+            pruned += 1;
+        }
+        allowed || !prune
     });
-    Ok(Some(out))
+    Ok(Some((out, pruned)))
 }
 
 fn encode_bucket(bucket: &Bucket, settings: &Settings) -> Result<Vec<u8>> {
@@ -1494,6 +1851,8 @@ fn encode_bucket(bucket: &Bucket, settings: &Settings) -> Result<Vec<u8>> {
         Some(meta) => put_bytes(&mut out, &serde_json::to_vec(meta)?),
         None => put_uvarint(&mut out, 0),
     }
+    let zones = zone_from_flat(&flattened);
+    put_bytes(&mut out, &zones.encode());
     put_uvarint(&mut out, BLOCK_ROWS as u64);
     put_uvarint(&mut out, encoded_columns.len() as u64);
     for (field, values) in encoded_columns {
@@ -1588,7 +1947,7 @@ fn decode_bucket_top(
     if !valid_magic(data) {
         return Err(corrupt("bad magic"));
     }
-    if data[4] < FORMAT_VERSION {
+    if data[4] < FORMAT_VERSION_PREV {
         return decode_bucket_inner_take(data, settings, low, high, Some((direction, limit)));
     }
     let sealed = data[5] & FLAG_SEALED != 0;
@@ -1605,6 +1964,7 @@ fn decode_bucket_top(
     } else {
         Some(serde_json::from_slice(meta_raw)?)
     };
+    skip_zone_map(data, &mut pos, data[4])?;
     let block_rows = get_uvarint(data, &mut pos)? as usize;
     if block_rows == 0 || block_rows > HARD_BUCKET_MAX_DOCS {
         return Err(corrupt("column block size out of range"));
@@ -1758,7 +2118,7 @@ fn decode_bucket_inner_take(
         return Err(corrupt("bad magic"));
     }
     let version = data[4];
-    if version != FORMAT_VERSION && version != FORMAT_VERSION_LEGACY {
+    if !(FORMAT_VERSION_LEGACY..=FORMAT_VERSION).contains(&version) {
         return Err(corrupt("unsupported format version"));
     }
     let sealed = data[5] & FLAG_SEALED != 0;
@@ -1775,6 +2135,7 @@ fn decode_bucket_inner_take(
     } else {
         Some(serde_json::from_slice(meta_raw)?)
     };
+    skip_zone_map(data, &mut pos, version)?;
     let mut decoded = Vec::new();
     if version >= 2 {
         let block_rows = get_uvarint(data, &mut pos)? as usize;
@@ -1951,10 +2312,11 @@ fn decode_bucket_row(
     } else {
         Some(serde_json::from_slice(meta_raw)?)
     };
+    let version = data[4];
+    skip_zone_map(data, &mut pos, version)?;
     if index >= n {
         return Ok(None);
     }
-    let version = data[4];
     let mut row = Map::new();
     if version >= 2 {
         let block_rows = get_uvarint(data, &mut pos)? as usize;
@@ -3641,7 +4003,7 @@ fn bucket_count_inner(
         return Err(corrupt("bad magic"));
     }
     let version = data[4];
-    if version != FORMAT_VERSION && version != FORMAT_VERSION_LEGACY {
+    if !(FORMAT_VERSION_LEGACY..=FORMAT_VERSION).contains(&version) {
         return Err(corrupt("unsupported format version"));
     }
     let mut pos = 6;
@@ -3652,6 +4014,7 @@ fn bucket_count_inner(
     let start = get_ivarint(data, &mut pos)?;
     let end = get_ivarint(data, &mut pos)?;
     let _meta = get_bytes(data, &mut pos)?;
+    skip_zone_map(data, &mut pos, version)?;
     let mut time_values: Option<Vec<Option<Value>>> = None;
     if version >= 2 {
         let block_rows = get_uvarint(data, &mut pos)? as usize;
@@ -5224,6 +5587,56 @@ pub fn stats(rtxn: &RoTxn<'_>, env: &heed::Env, name: &str, settings: &Settings)
     Ok(stats)
 }
 
+/// Lists every sealed bucket key in a collection.
+pub fn bucket_keys(rtxn: &RoTxn<'_>, env: &heed::Env, name: &str) -> Result<Vec<Vec<u8>>> {
+    let Some(db) =
+        env.open_database::<Bytes, Bytes>(rtxn, Some(&format!("{BUCKET_DB_PREFIX}{name}")))?
+    else {
+        return Ok(Vec::new());
+    };
+    let mut keys = Vec::new();
+    for item in db.iter(rtxn)? {
+        let (key, _) = item?;
+        if key.first() == Some(&KEY_BUCKET) {
+            keys.push(key.to_vec());
+        }
+    }
+    Ok(keys)
+}
+
+/// Re-encodes one legacy bucket with zone maps and Bloom filters.
+pub fn reencode_bucket(
+    wtxn: &mut RwTxn<'_>,
+    env: &heed::Env,
+    name: &str,
+    key: &[u8],
+    settings: &Settings,
+) -> Result<bool> {
+    let db = ensure_bucket_db(wtxn, env, name)?;
+    let Some(payload) = db.get(&*wtxn, key)? else {
+        return Ok(false);
+    };
+    if payload
+        .get(4)
+        .is_some_and(|version| *version >= FORMAT_VERSION)
+    {
+        return Ok(false);
+    }
+    let Some((hash, salt, window, serial)) = key_parts(key) else {
+        return Ok(false);
+    };
+    let (mut bucket, _) = decode_bucket_inner(payload, settings, None, None)?;
+    persist_bucket(
+        wtxn,
+        &db,
+        key,
+        &mut bucket,
+        settings,
+        (hash, salt, window, serial),
+    )?;
+    Ok(true)
+}
+
 /// Parses settings from stored JSON.
 pub fn parse_settings(raw: &[u8]) -> Result<Settings> {
     let settings: Settings = serde_json::from_slice(raw)?;
@@ -6317,6 +6730,96 @@ mod tests {
             assert!(crate::timeseries::verify_in(&rtxn, store.env(), "metrics", &settings).is_ok());
             rtxn.commit().unwrap();
         }
+    }
+
+    #[test]
+    fn zone_maps_prune_without_decoding() {
+        let (_dir, store) = ts_store();
+        let settings = Settings {
+            time_field: "ts".into(),
+            meta_field: Some("device".into()),
+            granularity: Granularity::Minutes,
+            bucket_max_docs: 64,
+            ..Settings::default()
+        };
+        let c = store
+            .create_timeseries_collection("zones", &settings)
+            .unwrap();
+        let base = 1_700_000_000_000i64;
+        for idx in 0..20i64 {
+            c.insert_one(json!({
+                "ts": {"$date": {"$numberLong": (base + idx * 60_000).to_string()}},
+                "device": "d0",
+                "source": if idx % 2 == 0 { "alpha" } else { "beta" },
+                "value": 10 + idx,
+            }))
+            .unwrap();
+        }
+        {
+            let mut wtxn = store.write_txn().unwrap();
+            seal_all(&mut wtxn, store.env(), "zones", &settings).unwrap();
+            wtxn.commit().unwrap();
+        }
+        {
+            let rtxn = store.read_txn().unwrap();
+            let db = store
+                .env()
+                .open_database::<Bytes, Bytes>(&rtxn, Some("tsb:zones"))
+                .unwrap()
+                .unwrap();
+            let key = db
+                .iter(&rtxn)
+                .unwrap()
+                .find_map(|item| {
+                    let (key, value) = item.unwrap();
+                    (key.first() == Some(&KEY_BUCKET)).then(|| (key.to_vec(), value.to_vec()))
+                })
+                .unwrap();
+            let filter = json!({"device": "d0", "source": "gamma"});
+            assert!(!bucket_zone_allows(&key.1, &settings, &filter).unwrap());
+            assert_eq!(key.1[4], FORMAT_VERSION);
+        }
+        let check = |filter: Value| {
+            let rtxn = store.read_txn().unwrap();
+            let locators = lookup_indexed_buckets(&rtxn, store.env(), "zones", &filter, &settings)
+                .unwrap()
+                .expect("bucket index");
+            rtxn.commit().unwrap();
+            locators
+        };
+        // Bloom rejects a string that is absent from the bucket.
+        assert!(check(json!({"device": "d0", "source": "gamma"})).is_empty());
+        // Zone min/max rejects a numeric range entirely above the bucket.
+        assert!(check(json!({"device": "d0", "value": {"$gt": 1000}})).is_empty());
+        // Inside/boundary ranges survive and return the correct rows.
+        assert!(!check(json!({"device": "d0", "value": 10})).is_empty());
+        assert!(!check(json!({"device": "d0", "value": 29})).is_empty());
+        assert_eq!(
+            c.count(&json!({"device": "d0", "source": "alpha"}))
+                .unwrap(),
+            10
+        );
+        assert_eq!(
+            c.count(&json!({"device": "d0", "source": "gamma"}))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            c.count(&json!({"device": "d0", "value": {"$gte": 20, "$lt": 25}}))
+                .unwrap(),
+            5
+        );
+        let row = json!({"device": "d0", "value": 15});
+        assert_eq!(
+            c.find(&FindQuery {
+                filter: row.clone(),
+                ..Default::default()
+            })
+            .unwrap()
+            .len(),
+            1
+        );
+        assert_eq!(c.count(&row).unwrap(), 1);
     }
 
     #[test]
@@ -7758,12 +8261,6 @@ mod tests {
         let db = env
             .create_database::<Bytes, Bytes>(&mut wtxn, Some("tsb:metrics"))
             .unwrap();
-        let payload = db.get(&wtxn, &key).unwrap().unwrap().to_vec();
-        let bitmap_len = 10usize.div_ceil(8);
-        let mut legacy = payload[..payload.len() - bitmap_len].to_vec();
-        assert_eq!(legacy.pop(), Some(bitmap_len as u8));
-        legacy[..4].copy_from_slice(MAGIC_V1);
-        db.put(&mut wtxn, &key, &legacy).unwrap();
         // Legacy 0x03 tombstone for the second row.
         let (_, _, _, _, seq1) = ids[1].1;
         db.put(&mut wtxn, &tomb_key(hash, salt, window, serial, seq1), &[])
