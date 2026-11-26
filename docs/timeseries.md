@@ -142,6 +142,15 @@ Behavior:
 range cannot overlap the filter are skipped without decoding, and a filter that
 pins `metaField` by equality restricts the scan to that series.
 
+Each collection maintains compact bucket locator indexes in `tsb:<collection>`:
+one ordered by `(series, window)` and one by `(window, series)`. `find`,
+`count`, ordered reads, and aggregation walk these locators, so a
+`metaField` equality plus a time range no longer requires a full bucket scan.
+`count` on those fields reads bucket headers and the deletion bitmap only;
+ordered `find` with `skip`/`limit` decodes just the blocks it needs.
+`explain` reports `bucket_index_used`, `index: "bucket_locator"`,
+`buckets_total`, and `buckets_pruned`.
+
 ```json
 {
   "op": "find",
@@ -189,6 +198,16 @@ blocking stages use the materialized path:
 Downsampling to per-minute buckets works the same way (group by a truncated
 time expression computed with `$dateToString`/`$subtract` in `$project`).
 
+For common OHLCV downsampling (`$dateTrunc` to `hour`/`day` plus
+`$first`/`$last`/`$min`/`$max`/`$sum`), a leading `$match` restricted to
+`metaField` and time uses materialized hourly and daily rollups stored in
+`tsr:<collection>`. The planner rewrites `$sum: 1` to the rollup row count and
+fills partial boundary windows from raw rows (using hourly rollups first for a
+daily query), so results match a raw aggregation. Inserts keep an existing
+rollup current; updates, deletes, and retention invalidate it, and it can be
+rebuilt for a range with
+`ts-nonodb-tool rollup <data-dir> <collection> [from_ms] [to_ms]`.
+
 Stages that need a second collection or an index host run through the normal
 aggregation host: `$lookup` (local and pipeline/`let`), `$graphLookup`,
 `$unionWith`, `$search`, `$searchMeta`, and `$vectorSearch` work on time-series
@@ -214,7 +233,7 @@ events, and replication stay consistent.
 | `findAndModify` with `remove: true` | yes |
 | `findAndModify` with an update | yes (returns the new `_id` when the row moves) |
 | `update` (`$set`, `$inc`, `$mul`, `$unset`, `$rename`, pipelines, upsert) | yes |
-| aggregation pipelines (`$match`, `$group`, `$bucket`, `$sort`, ...) | yes; row-local stages and `$group` stream in batches, other blocking stages fall back to memory |
+| aggregation pipelines (`$match`, `$group`, `$bucket`, `$sort`, ...) | yes; row-local stages and `$group` stream in batches, OHLCV `hour`/`day` groups can use materialized rollups, other blocking stages fall back to memory |
 | retention: delete rows older than a cutoff | `retain_timeseries` |
 | SQL `SELECT`/`INSERT`/`UPDATE`/`DELETE`, `explain` | yes (same find/aggregate path) |
 | `$search`, `$searchMeta`, `$vectorSearch` | yes |
@@ -234,9 +253,11 @@ empty results.
 `dropIndex`, `listIndexes`, and `reindex` work as on document collections.
 Backfills decode one bucket at a time and hand bounded row batches to the
 index writer; they do not build an `all_docs()` vector for the whole
-collection. The planner uses an index when the filter has an equality/range
-condition on the leading field and reports `"index_used": true` with
-`"access": "index_scan"` in `explain`. A partial index is considered when the
+collection. Time-series entries are stored as per-bucket posting lists
+(`encoded value -> locator + seq bitmap`) instead of one key per row, and
+unique indexes compare `(locator, seq)`. The planner uses an index when the
+filter has an equality/range condition on the leading field and reports
+`"index_used": true` with `"access": "index_scan"` in `explain`. A partial index is considered when the
 query contains its predicate or a range bound at least as selective as it (for
 example, a query `ts >= 150` can use an index filtered by `ts >= 100`). Index
 entries are maintained by
@@ -619,11 +640,15 @@ Storage for TimescaleDB is `hypertable_size` after native compression
 
 TimescaleDB wins the point/update/delete and highly selective indexed queries
 because it is a general OLTP engine with native B-tree indexes. NonoDB
-time-series wins on footprint and is close on range scans; its count/aggregate
-path decodes buckets instead of using a columnar executor. The comparison is a
-shape check, not a tuned benchmark: no PostgreSQL tuning, connection pooling, or
+time-series wins on footprint and is close on range scans. On the 206M-row
+import, bucket locators, header-only counts, and hourly/daily rollups bring
+BTC/USD 30-day OHLC to about 5.5 ms (TimescaleDB: 56.9 ms) and all-symbol
+one-day OHLC to about 85 ms (TimescaleDB: 33.4 ms); `count`/ordered `find`
+on one series are in the low milliseconds. The 100k-row table above is a shape
+check, not a tuned benchmark: no PostgreSQL tuning, connection pooling, or
 prepared statements were used. Reproduce the Timescale side with
-`scripts/timescale_bench.py`.
+`scripts/timescale_bench.py`; the 206M-row results are in
+`data/timescale_benchmark_report.md`.
 
 ## Limitations
 

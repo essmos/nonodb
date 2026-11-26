@@ -2957,7 +2957,7 @@ pub fn insert(
         None => row_id(hash, salt, window, serial, count),
     };
     remember_user_id(&db, wtxn, &id, hash, salt, window, serial, count)?;
-    invalidate_rollups(wtxn, env, name)?;
+    update_rollups_for_doc(wtxn, env, name, settings, &doc)?;
     Ok(id)
 }
 
@@ -3077,6 +3077,7 @@ pub fn insert_many(
             serial,
             state.count,
         )?;
+        update_rollups_for_doc(wtxn, env, name, settings, &doc)?;
         state.count = state.count.saturating_add(1);
         ids.push(id);
     }
@@ -3099,7 +3100,6 @@ pub fn insert_many(
             )?;
         }
     }
-    invalidate_rollups(wtxn, env, name)?;
     Ok(ids)
 }
 
@@ -5950,6 +5950,74 @@ pub fn rollup_docs(
     Ok(Some((out, partial)))
 }
 
+/// Keeps an already-built rollup current for an inserted row. If the row falls
+/// outside the covered range, the marker is removed so the next query rebuilds.
+fn update_rollups_for_doc(
+    wtxn: &mut RwTxn<'_>,
+    env: &heed::Env,
+    name: &str,
+    settings: &Settings,
+    doc: &Value,
+) -> Result<()> {
+    let Some(db) =
+        env.open_database::<Bytes, Bytes>(&*wtxn, Some(&format!("{ROLLUP_DB_PREFIX}{name}")))?
+    else {
+        return Ok(());
+    };
+    let mut covered = Vec::new();
+    for unit in [ROLLUP_HOUR, ROLLUP_DAY] {
+        let Some(marker) = db.get(&*wtxn, &[ROLLUP_MARKER, unit])? else {
+            continue;
+        };
+        if marker.len() != 16 {
+            continue;
+        }
+        covered.push((
+            unit,
+            i64::from_be_bytes(marker[0..8].try_into().expect("8 bytes")),
+            i64::from_be_bytes(marker[8..16].try_into().expect("8 bytes")),
+        ));
+    }
+    if covered.is_empty() {
+        return Ok(());
+    }
+    let Some(ts) = extract_time(doc, &settings.time_field) else {
+        return Ok(());
+    };
+    let Some((open, high, low, close, volume)) = rollup_ohlc(doc) else {
+        return Ok(());
+    };
+    let meta = series_meta(doc, settings);
+    let hash = series_hash(settings, meta.as_ref());
+    if let Some(meta) = meta {
+        db.put(
+            &mut *wtxn,
+            &rollup_meta_key(hash),
+            &serde_json::to_vec(&meta)?,
+        )?;
+    }
+    for (unit, covered_low, covered_high) in covered {
+        if ts < covered_low || ts > covered_high {
+            invalidate_rollups(wtxn, env, name)?;
+            return Ok(());
+        }
+        let window_size = if unit == ROLLUP_HOUR {
+            ROLLUP_HOUR_MS
+        } else {
+            ROLLUP_DAY_MS
+        };
+        let window = ts.div_euclid(window_size) * window_size;
+        let key = rollup_key(unit, hash, window);
+        let mut row = db
+            .get(&*wtxn, &key)?
+            .and_then(RollupRow::decode)
+            .unwrap_or_default();
+        row.add(ts, open, high, low, close, volume);
+        db.put(&mut *wtxn, &key, &row.encode())?;
+    }
+    Ok(())
+}
+
 /// Invalidates rollup coverage after a write/retention.
 pub fn invalidate_rollups(wtxn: &mut RwTxn<'_>, env: &heed::Env, name: &str) -> Result<()> {
     let Some(db) =
@@ -7132,12 +7200,13 @@ mod tests {
         assert_eq!(c.aggregate(&pipeline("hour")).unwrap(), raw_hour);
         assert_eq!(c.aggregate(&pipeline("day")).unwrap(), raw_day);
 
-        // A write invalidates coverage; the next query must not use a stale rollup.
-        c.insert_one(json!({
-            "ts": {"$date": {"$numberLong": (base + day + 90_000_000).to_string()}},
-            "device": "d0", "open": 1, "high": 2, "low": 0, "close": 1, "volume": 1.0,
-        }))
-        .unwrap();
+        // Inserts keep the rollup current; a later delete invalidates it.
+        let added = c
+            .insert_one(json!({
+                "ts": {"$date": {"$numberLong": (base + day + 90_000_000).to_string()}},
+                "device": "d0", "open": 1, "high": 2, "low": 0, "close": 1, "volume": 1.0,
+            }))
+            .unwrap();
         let raw_after = c.aggregate(&pipeline("hour")).unwrap();
         assert_ne!(raw_after, raw_hour);
         {
@@ -7154,6 +7223,8 @@ mod tests {
             wtxn.commit().unwrap();
         }
         assert_eq!(c.aggregate(&pipeline("hour")).unwrap(), raw_after);
+        c.delete(&json!({"_id": added}), false).unwrap();
+        assert_eq!(c.aggregate(&pipeline("hour")).unwrap(), raw_hour);
     }
 
     #[test]

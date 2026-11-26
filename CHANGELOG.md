@@ -4,6 +4,27 @@ Full release notes: https://github.com/essmos/nonodb/releases
 
 ## v0.32.0 - 2026-11-23
 
+- Add compact bucket locator indexes to time-series collections. Two
+  directional keys (`series + window` and `window + series`) let `find`,
+  `count`, ordered reads, and aggregation iterate bucket locators instead of
+  scanning the whole collection; existing collections are backfilled once on
+  `Store::open` from bucket keys alone.
+- Time-series `count` on `metaField` + time filters reads only bucket headers
+  and the time column/deletion bitmap, and ordered `find` with `skip`/`limit`
+  walks locators and decodes only the blocks it needs. `explain` reports
+  `index=bucket_locator` and `buckets_total`/`buckets_pruned`.
+- Store per-bucket zone maps (numeric/time min-max) and 256-byte Bloom filters
+  in bucket format v3, so filters on non-key columns are rejected before
+  decoding. Existing v1/v2 buckets stay readable; `reencode` upgrades them.
+- Replace per-row time-series secondary index entries with per-bucket posting
+  lists (value + locator + seq bitmap). The `symbol_ts_recent` index shrank by
+  about 63% versus the old per-row format, while unique indexes check
+  `(locator, seq)`.
+- Add materialized hourly and daily OHLCV rollups in `tsr:<collection>` for
+  `$group` downsampling with `$first`/`$last`/`$min`/`$max`/`$sum`. Inserts keep an existing
+  rollup current, while updates, deletes, and retention invalidate it; partial boundary windows are filled from
+  raw rows (or hourly rollups for daily queries). 30-day BTC/USD OHLC dropped
+  from ~814 ms to ~5 ms.
 - Time-series secondary indexes now drive `update`/`delete` filters as well as
   reads, unique indexes are enforced (including insert/update/upsert/reindex and
   reuse after delete), and retention removes index entries for reaped rows.
