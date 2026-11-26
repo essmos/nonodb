@@ -10102,12 +10102,29 @@ impl<'e> Collection<'e> {
             let matched = self.count_in(rtxn, &query.filter)?;
             let hint = query.hint.as_ref().map(parse_index_hint).transpose()?;
             let plan = self.query_index_plan(rtxn, &query.filter, hint.as_ref())?;
+            let bucket_index = if plan.is_none() {
+                match self.timeseries_settings_in(rtxn)? {
+                    Some(settings) => crate::timeseries::lookup_indexed_buckets(
+                        rtxn,
+                        self.env,
+                        &self.name,
+                        &query.filter,
+                        &settings,
+                    )?
+                    .is_some(),
+                    None => false,
+                }
+            } else {
+                false
+            };
+            let indexed = plan.is_some() || bucket_index;
             return Ok(serde_json::json!({
                 "collection": self.name,
                 "profile": "timeseries",
-                "access": if plan.is_some() { "index_scan" } else { "bucket_scan" },
-                "index_used": plan.is_some(),
-                "index": plan.as_ref().map(|plan| plan.def.name()),
+                "access": if indexed { "index_scan" } else { "bucket_scan" },
+                "index_used": indexed,
+                "bucket_index_used": bucket_index,
+                "index": if bucket_index { Some("bucket_locator".to_string()) } else { plan.as_ref().map(|plan| plan.def.name()) },
                 "filter": query.filter,
                 "matched": matched,
             }));
