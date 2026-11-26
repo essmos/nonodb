@@ -7,6 +7,10 @@ Full release notes: https://github.com/essmos/nonodb/releases
 - Time-series secondary indexes now drive `update`/`delete` filters as well as
   reads, unique indexes are enforced (including insert/update/upsert/reindex and
   reuse after delete), and retention removes index entries for reaped rows.
+  Backfills stream bucket-by-bucket instead of materializing every row, so large
+  collections no longer need one `all_docs()` vector in memory. Partial-index
+  range predicates are also recognized when a query bound is at least as
+  selective as the index predicate.
 - Time-series `$out`/`$merge` targets write through the bucket writer, so
   indexes, events, replication, and synthetic ids stay consistent.
 - Row-local time-series aggregation stages stream in batches

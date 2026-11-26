@@ -231,9 +231,15 @@ empty results.
 ### Secondary indexes
 
 `createIndex`/`createIndexes` build secondary indexes over time-series rows;
-`dropIndex`, `listIndexes`, and `reindex` work as on document collections. The planner uses an index when the filter has an equality/range
+`dropIndex`, `listIndexes`, and `reindex` work as on document collections.
+Backfills decode one bucket at a time and hand bounded row batches to the
+index writer; they do not build an `all_docs()` vector for the whole
+collection. The planner uses an index when the filter has an equality/range
 condition on the leading field and reports `"index_used": true` with
-`"access": "index_scan"` in `explain`. Index entries are maintained by
+`"access": "index_scan"` in `explain`. A partial index is considered when the
+query contains its predicate or a range bound at least as selective as it (for
+example, a query `ts >= 150` can use an index filtered by `ts >= 100`). Index
+entries are maintained by
 `insert`, `delete`, `update`, upserts, and replicated writes; a row moved by an
 update removes its old entry and adds a new one. Retention removes index
 entries for every reaped row (whole dropped buckets and the tombstoned boundary

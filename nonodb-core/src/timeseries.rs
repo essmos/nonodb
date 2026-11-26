@@ -2741,6 +2741,118 @@ where
 
 /// Returns every live row with its `_id`, decoded from buckets. Used to build
 /// and rebuild secondary indexes.
+fn docs_for_key(
+    rtxn: &RoTxn<'_>,
+    db: &Database<Bytes, Bytes>,
+    key: &[u8],
+    payload: &[u8],
+    settings: &Settings,
+) -> Result<Vec<(String, Value)>> {
+    let mut out = Vec::new();
+    match key.first() {
+        Some(&KEY_BUCKET) => {
+            let Some((hash, salt, window, serial)) = key_parts(key) else {
+                return Ok(out);
+            };
+            let (bucket, selected) = decode_bucket_inner(payload, settings, None, None)?;
+            let tombs = tombstones(rtxn, db, hash, salt, window, serial)?;
+            for (row, idx) in bucket.rows.iter().zip(selected.iter()) {
+                if deleted_at(&bucket, &tombs, *idx as u32) {
+                    continue;
+                }
+                let mut doc = Value::Object(row.clone());
+                if !row.contains_key("_id") {
+                    set_path(
+                        doc.as_object_mut().expect("object"),
+                        "_id",
+                        Value::String(row_id(hash, salt, window, serial, *idx as u32)),
+                    );
+                }
+                let id = doc
+                    .get("_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                out.push((id, doc));
+            }
+        }
+        Some(&KEY_ROW) => {
+            let Some((hash, salt, window, serial, seq)) = row_key_parts(key) else {
+                return Ok(out);
+            };
+            let row: Map<String, Value> = serde_json::from_slice(payload)?;
+            let mut doc = Value::Object(row);
+            if !doc
+                .as_object()
+                .is_some_and(|object| object.contains_key("_id"))
+            {
+                set_path(
+                    doc.as_object_mut().expect("object"),
+                    "_id",
+                    Value::String(row_id(hash, salt, window, serial, seq)),
+                );
+            }
+            let id = doc
+                .get("_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            out.push((id, doc));
+        }
+        _ => {}
+    }
+    Ok(out)
+}
+
+/// Streams time-series rows into a caller-provided batch callback.
+///
+/// Unlike [`all_docs`], this never materializes the full collection: only the
+/// bucket keys are listed up front, and each decoded bucket is handed to
+/// `visit` before the next one is read. The callback receives the write
+/// transaction so it can update index databases in place.
+pub fn scan_index_docs<F>(
+    wtxn: &mut RwTxn<'_>,
+    env: &heed::Env,
+    name: &str,
+    settings: &Settings,
+    batch_size: usize,
+    mut visit: F,
+) -> Result<()>
+where
+    F: FnMut(&mut RwTxn<'_>, Vec<(String, Value)>) -> Result<()>,
+{
+    settings.validate()?;
+    let db = ensure_bucket_db(wtxn, env, name)?;
+    let keys: Vec<Vec<u8>> = {
+        let mut keys = Vec::new();
+        for item in db.iter(&*wtxn)? {
+            let (key, _) = item?;
+            if matches!(key.first(), Some(&KEY_BUCKET) | Some(&KEY_ROW)) {
+                keys.push(key.to_vec());
+            }
+        }
+        keys
+    };
+    let batch_size = batch_size.max(1);
+    let mut batch = Vec::with_capacity(batch_size);
+    for key in keys {
+        let Some(payload) = db.get(&*wtxn, &key)? else {
+            continue;
+        };
+        let docs = docs_for_key(&*wtxn, &db, &key, payload, settings)?;
+        batch.extend(docs);
+        while batch.len() >= batch_size {
+            let chunk: Vec<_> = batch.drain(..batch_size).collect();
+            visit(&mut *wtxn, chunk)?;
+        }
+    }
+    if !batch.is_empty() {
+        visit(&mut *wtxn, batch)?;
+    }
+    Ok(())
+}
+
+/// Returns every live time-series document with its `_id`.
 pub fn all_docs(
     rtxn: &RoTxn<'_>,
     env: &heed::Env,
@@ -2755,58 +2867,7 @@ pub fn all_docs(
     let mut out = Vec::new();
     for item in db.iter(rtxn)? {
         let (key, payload) = item?;
-        match key.first() {
-            Some(&KEY_BUCKET) => {
-                let Some((hash, salt, window, serial)) = key_parts(key) else {
-                    continue;
-                };
-                let (bucket, selected) = decode_bucket_inner(payload, settings, None, None)?;
-                let tombs = tombstones(rtxn, &db, hash, salt, window, serial)?;
-                for (row, idx) in bucket.rows.iter().zip(selected.iter()) {
-                    if deleted_at(&bucket, &tombs, *idx as u32) {
-                        continue;
-                    }
-                    let mut doc = Value::Object(row.clone());
-                    if !row.contains_key("_id") {
-                        set_path(
-                            doc.as_object_mut().expect("object"),
-                            "_id",
-                            Value::String(row_id(hash, salt, window, serial, *idx as u32)),
-                        );
-                    }
-                    let id = doc
-                        .get("_id")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string();
-                    out.push((id, doc));
-                }
-            }
-            Some(&KEY_ROW) => {
-                let Some((hash, salt, window, serial, seq)) = row_key_parts(key) else {
-                    continue;
-                };
-                let row: Map<String, Value> = serde_json::from_slice(payload)?;
-                let mut doc = Value::Object(row);
-                if !doc
-                    .as_object()
-                    .is_some_and(|object| object.contains_key("_id"))
-                {
-                    set_path(
-                        doc.as_object_mut().expect("object"),
-                        "_id",
-                        Value::String(row_id(hash, salt, window, serial, seq)),
-                    );
-                }
-                let id = doc
-                    .get("_id")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
-                out.push((id, doc));
-            }
-            _ => {}
-        }
+        out.extend(docs_for_key(rtxn, &db, key, payload, settings)?);
     }
     Ok(out)
 }
@@ -5257,6 +5318,48 @@ mod tests {
         assert!(c.drop_index("level").unwrap());
         assert!(!c.drop_index("level").unwrap());
         assert_eq!(c.explain(&query(None)).unwrap()["index_used"], json!(false));
+    }
+
+    #[test]
+    fn index_backfill_streams_across_many_buckets() {
+        let (_dir, store) = ts_store();
+        let settings = Settings {
+            time_field: "ts".into(),
+            meta_field: Some("device".into()),
+            bucket_max_docs: 7,
+            ..Settings::default()
+        };
+        let c = store
+            .create_timeseries_collection("metrics", &settings)
+            .unwrap();
+        let base = 1_700_000_000_000i64;
+        for idx in 0..500i64 {
+            c.insert_one(json!({
+                "ts": {"$date": {"$numberLong": (base + idx * 3_600_000).to_string()}},
+                "device": format!("d{}", idx % 5),
+                "level": idx % 10,
+                "value": idx,
+            }))
+            .unwrap();
+        }
+        assert!(c.timeseries_stats().unwrap().unwrap().buckets > 100);
+        c.create_index("level", false).unwrap();
+        let query = |hint: Option<Value>| crate::collection::FindQuery {
+            filter: json!({"level": 7}),
+            projection: None,
+            sort: vec![("ts".into(), 1)],
+            skip: 0,
+            limit: None,
+            comment: None,
+            max_time_ms: None,
+            hint,
+        };
+        let indexed = c.find(&query(None)).unwrap();
+        let natural = c.find(&query(Some(json!({"$natural": 1})))).unwrap();
+        assert_eq!(indexed, natural);
+        assert_eq!(indexed.len(), 50);
+        c.reindex().unwrap();
+        assert_eq!(c.find(&query(None)).unwrap(), natural);
     }
 
     #[test]

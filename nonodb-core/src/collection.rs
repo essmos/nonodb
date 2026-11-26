@@ -1354,8 +1354,6 @@ impl<'e> Collection<'e> {
         defs: &mut [(String, IndexDef)],
     ) -> Result<()> {
         let settings = self.timeseries_settings_in(&*wtxn)?.unwrap_or_default();
-        let docs = crate::timeseries::all_docs(&*wtxn, self.env, &self.name, &settings)?;
-        let total = docs.len() as u64;
         let index_dbs: Vec<_> = defs
             .iter()
             .map(|(_key, def)| self.index_db_in(wtxn, def))
@@ -1363,38 +1361,50 @@ impl<'e> Collection<'e> {
         for db in &index_dbs {
             db.clear(&mut *wtxn)?;
         }
+        let mut total = 0u64;
         let mut docs_per_index = vec![0u64; defs.len()];
         let mut multikey_fields: Vec<Vec<String>> = vec![Vec::new(); defs.len()];
-        for (id, doc) in &docs {
-            for (slot, (_key, def)) in defs.iter_mut().enumerate() {
-                let keys = index::encode_index_keys(def, doc)?;
-                if keys.keys.is_empty() {
-                    continue;
-                }
-                docs_per_index[slot] = docs_per_index[slot].saturating_add(1);
-                for field in &keys.multikey_fields {
-                    if !multikey_fields[slot].contains(field) {
-                        multikey_fields[slot].push(field.clone());
-                    }
-                }
-                let value = index::encode_index_value(def, doc, id);
-                for vb in keys.keys {
-                    if def.unique {
-                        for item in index_dbs[slot].prefix_iter(&*wtxn, vb.as_slice())? {
-                            let (_key, existing) = item?;
-                            if index::decode_index_value(existing)
-                                .is_some_and(|(existing_id, _)| existing_id != *id)
-                            {
-                                return Err(Error::DuplicateKey(id.clone()));
+        crate::timeseries::scan_index_docs(
+            wtxn,
+            self.env,
+            &self.name,
+            &settings,
+            4096,
+            |wtxn, docs| {
+                total = total.saturating_add(docs.len() as u64);
+                for (id, doc) in &docs {
+                    for (slot, ((_key, def), db)) in defs.iter().zip(index_dbs.iter()).enumerate() {
+                        let keys = index::encode_index_keys(def, doc)?;
+                        if keys.keys.is_empty() {
+                            continue;
+                        }
+                        docs_per_index[slot] = docs_per_index[slot].saturating_add(1);
+                        for field in &keys.multikey_fields {
+                            if !multikey_fields[slot].contains(field) {
+                                multikey_fields[slot].push(field.clone());
                             }
                         }
+                        let value = index::encode_index_value(def, doc, id);
+                        for vb in keys.keys {
+                            if def.unique {
+                                for item in db.prefix_iter(&*wtxn, vb.as_slice())? {
+                                    let (_key, existing) = item?;
+                                    if index::decode_index_value(existing)
+                                        .is_some_and(|(existing_id, _)| existing_id != *id)
+                                    {
+                                        return Err(Error::DuplicateKey(id.clone()));
+                                    }
+                                }
+                            }
+                            let mut key = vb;
+                            key.extend_from_slice(id.as_bytes());
+                            db.put(&mut *wtxn, key.as_slice(), value.as_slice())?;
+                        }
                     }
-                    let mut key = vb;
-                    key.extend_from_slice(id.as_bytes());
-                    index_dbs[slot].put(&mut *wtxn, key.as_slice(), value.as_slice())?;
                 }
-            }
-        }
+                Ok(())
+            },
+        )?;
         for (slot, (key, def)) in defs.iter_mut().enumerate() {
             for field in &multikey_fields[slot] {
                 if !def.multikey_fields.contains(field) {
@@ -11072,8 +11082,74 @@ fn flatten_filter_conditions(filter: &Value) -> Option<Vec<(String, Value)>> {
     )
 }
 
+fn comparable_range_values(left: &Value, right: &Value) -> bool {
+    if left.is_number() && right.is_number() {
+        return true;
+    }
+    if crate::date::is_date(left) && crate::date::is_date(right) {
+        return true;
+    }
+    left.is_string() && right.is_string()
+}
+
+fn range_condition_implies(query: &Value, partial: &Value) -> bool {
+    let (Some(query), Some(partial)) = (query.as_object(), partial.as_object()) else {
+        return false;
+    };
+    if query.is_empty() || partial.is_empty() {
+        return false;
+    }
+    let mut compared = false;
+    for (partial_op, partial_value) in partial {
+        let (query_value, strict) = match partial_op.as_str() {
+            "$gte" => match (query.get("$gte"), query.get("$gt")) {
+                (Some(value), _) => (value, false),
+                (None, Some(value)) => (value, true),
+                _ => return false,
+            },
+            "$gt" => match query.get("$gt") {
+                Some(value) => (value, false),
+                None => return false,
+            },
+            "$lte" => match (query.get("$lte"), query.get("$lt")) {
+                (Some(value), _) => (value, false),
+                (None, Some(value)) => (value, true),
+                _ => return false,
+            },
+            "$lt" => match query.get("$lt") {
+                Some(value) => (value, false),
+                None => return false,
+            },
+            _ => return false,
+        };
+        if !comparable_range_values(query_value, partial_value) {
+            return false;
+        }
+        let ordering = crate::aggregate::compare_value(query_value, partial_value);
+        let valid = if partial_op == "$gte" || partial_op == "$gt" {
+            ordering != Ordering::Less
+        } else {
+            ordering != Ordering::Greater
+        };
+        if !valid || (strict && ordering == Ordering::Equal) {
+            return false;
+        }
+        compared = true;
+    }
+    compared
+}
+
 fn condition_implies(query: &Value, partial: &Value) -> bool {
     if query == partial {
+        return true;
+    }
+    if let Some(value) = query.as_object().and_then(|object| object.get("$eq")) {
+        if value == partial || range_condition_implies(&serde_json::json!({"$eq": value}), partial)
+        {
+            return true;
+        }
+    }
+    if range_condition_implies(query, partial) {
         return true;
     }
     let query = query
@@ -13665,6 +13741,42 @@ mod tests {
         let defs = p.list_index_defs().unwrap();
         assert!(defs.iter().any(|def| def.name() == "active_email"
             && def.partial_filter_expression == Some(json!({"status": "active"}))));
+    }
+
+    #[test]
+    fn partial_index_range_predicate_is_used() {
+        let (_dir, store) = store();
+        let c = store.collection("partial_range").unwrap();
+        for score in [50, 100, 150, 200] {
+            c.insert_one(json!({"score": score})).unwrap();
+        }
+        c.create_indexes(&[IndexSpec {
+            fields: vec!["score".into()],
+            name: "score_hot".into(),
+            directions: Vec::new(),
+            unique: false,
+            sparse: false,
+            partial_filter_expression: Some(json!({"score": {"$gte": 100}})),
+            include: Vec::new(),
+            geo: false,
+        }])
+        .unwrap();
+        let stronger = FindQuery {
+            filter: json!({"score": {"$gte": 150, "$lte": 250}}),
+            ..Default::default()
+        };
+        let plan = c.explain(&stronger).unwrap();
+        assert_eq!(plan["access_path"], "index_scan", "{plan}");
+        assert_eq!(plan["index_used"], true);
+        let weaker = FindQuery {
+            filter: json!({"score": {"$gte": 50}}),
+            ..Default::default()
+        };
+        assert_eq!(
+            c.explain(&weaker).unwrap()["access_path"],
+            "collection_scan"
+        );
+        assert_eq!(c.find(&stronger).unwrap().len(), 2);
     }
 
     #[test]
