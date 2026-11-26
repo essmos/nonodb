@@ -7993,6 +7993,164 @@ impl<'e> Collection<'e> {
         self.aggregate_in_deadline(rtxn, pipeline, deadline)
     }
 
+    fn try_timeseries_rollup(
+        &self,
+        rtxn: &RoTxn<'_>,
+        pipeline: &[Value],
+        settings: &crate::timeseries::Settings,
+    ) -> Result<Option<Vec<Value>>> {
+        let Some(group_at) = pipeline
+            .iter()
+            .position(|stage| stage.get("$group").is_some())
+        else {
+            return Ok(None);
+        };
+        let prefix = &pipeline[..group_at];
+        let mut filter = Value::Object(Map::new());
+        for stage in prefix {
+            let Some(object) = stage.as_object() else {
+                return Ok(None);
+            };
+            if object.len() != 1 {
+                return Ok(None);
+            }
+            if let Some(matched) = object.get("$match") {
+                filter = matched.clone();
+            } else if object.get("$sort").is_none() {
+                return Ok(None);
+            }
+        }
+        if !crate::timeseries::filter_is_meta_time_only(&filter, settings) {
+            return Ok(None);
+        }
+        let Some(group) = pipeline[group_at].get("$group").and_then(Value::as_object) else {
+            return Ok(None);
+        };
+        let unit = group
+            .get("_id")
+            .and_then(|id| {
+                id.get("bucket")
+                    .and_then(|bucket| bucket.get("$dateTrunc"))
+                    .or_else(|| id.get("$dateTrunc"))
+            })
+            .and_then(|trunc| trunc.get("unit"))
+            .and_then(Value::as_str);
+        let Some(unit) = unit.filter(|unit| matches!(*unit, "hour" | "day")) else {
+            return Ok(None);
+        };
+        for (field, accumulator) in group {
+            if field == "_id" {
+                continue;
+            }
+            let Some(accumulator) = accumulator.as_object() else {
+                return Ok(None);
+            };
+            if !accumulator
+                .keys()
+                .all(|op| matches!(op.as_str(), "$first" | "$last" | "$max" | "$min" | "$sum"))
+            {
+                return Ok(None);
+            }
+        }
+        let Some((mut docs, partial)) =
+            crate::timeseries::rollup_docs(rtxn, self.env, &self.name, settings, &filter, unit)?
+        else {
+            return Ok(None);
+        };
+        for (start, end) in partial {
+            let partial_filter = json!({
+                "$and": [
+                    filter.clone(),
+                    {"ts": {
+                        "$gte": {"$date": {"$numberLong": start.to_string()}},
+                        "$lte": {"$date": {"$numberLong": end.to_string()}}
+                    }}
+                ]
+            });
+            let mut hour_partial = Vec::new();
+            if unit == "day" {
+                if let Some((hour_docs, partials)) = crate::timeseries::rollup_docs(
+                    rtxn,
+                    self.env,
+                    &self.name,
+                    settings,
+                    &partial_filter,
+                    "hour",
+                )? {
+                    docs.extend(hour_docs);
+                    hour_partial = partials;
+                    if hour_partial.is_empty() {
+                        continue;
+                    }
+                }
+            }
+            let ranges = if hour_partial.is_empty() {
+                vec![(start, end)]
+            } else {
+                hour_partial
+            };
+            for (start, end) in ranges {
+                let partial_filter = json!({
+                    "$and": [
+                        filter.clone(),
+                        {"ts": {
+                            "$gte": {"$date": {"$numberLong": start.to_string()}},
+                            "$lte": {"$date": {"$numberLong": end.to_string()}}
+                        }}
+                    ]
+                });
+                let raw = crate::timeseries::find(
+                    rtxn,
+                    self.env,
+                    &self.name,
+                    settings,
+                    &FindQuery {
+                        filter: partial_filter,
+                        projection: None,
+                        sort: Vec::new(),
+                        skip: 0,
+                        limit: None,
+                        comment: None,
+                        max_time_ms: None,
+                        hint: None,
+                    },
+                )?;
+                for mut doc in raw {
+                    if let Some(object) = doc.as_object_mut() {
+                        object.insert("n".into(), Value::from(1));
+                    }
+                    docs.push(doc);
+                }
+            }
+        }
+        docs.sort_by(|a, b| {
+            let ta = crate::timeseries::extract_time_public(a, &settings.time_field).unwrap_or(0);
+            let tb = crate::timeseries::extract_time_public(b, &settings.time_field).unwrap_or(0);
+            ta.cmp(&tb)
+        });
+        let mut rewritten = Map::new();
+        for (field, accumulator) in group {
+            let mut accumulator = accumulator.clone();
+            if field != "_id" {
+                if let Some(object) = accumulator.as_object_mut() {
+                    if object.get("$sum") == Some(&Value::from(1)) {
+                        object.insert("$sum".into(), Value::String("$n".into()));
+                    }
+                }
+            }
+            rewritten.insert(field.clone(), accumulator);
+        }
+        let mut stages = vec![json!({"$group": Value::Object(rewritten)})];
+        stages.extend_from_slice(&pipeline[group_at + 1..]);
+        let host = LookupHost { coll: self, rtxn };
+        Ok(Some(aggregate::run_with_host(
+            docs,
+            &stages,
+            aggregate::max_docs(),
+            Some(&host),
+        )?))
+    }
+
     fn aggregate_in_deadline(
         &self,
         rtxn: &RoTxn<'_>,
@@ -8007,6 +8165,9 @@ impl<'e> Collection<'e> {
             check_find_deadline(deadline)?;
             aggregate::validate_pipeline(pipeline)?;
             let settings = self.timeseries_settings_in(rtxn)?.unwrap_or_default();
+            if let Some(out) = self.try_timeseries_rollup(rtxn, pipeline, &settings)? {
+                return Ok(out);
+            }
             let filter = pipeline
                 .first()
                 .and_then(|stage| stage.get("$match"))

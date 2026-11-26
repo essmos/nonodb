@@ -2385,7 +2385,7 @@ fn time_value_ms(value: &Value) -> Option<i64> {
     }
 }
 
-fn extract_time(doc: &Value, field: &str) -> Option<i64> {
+pub(crate) fn extract_time(doc: &Value, field: &str) -> Option<i64> {
     let raw = get_path(doc, field)?;
     if let Some(ms) = time_value_ms(raw) {
         return Some(ms);
@@ -2957,6 +2957,7 @@ pub fn insert(
         None => row_id(hash, salt, window, serial, count),
     };
     remember_user_id(&db, wtxn, &id, hash, salt, window, serial, count)?;
+    invalidate_rollups(wtxn, env, name)?;
     Ok(id)
 }
 
@@ -3098,6 +3099,7 @@ pub fn insert_many(
             )?;
         }
     }
+    invalidate_rollups(wtxn, env, name)?;
     Ok(ids)
 }
 
@@ -3953,7 +3955,7 @@ pub fn all_docs(
 }
 
 /// Counts matching documents.
-fn filter_is_meta_time_only(filter: &Value, settings: &Settings) -> bool {
+pub(crate) fn filter_is_meta_time_only(filter: &Value, settings: &Settings) -> bool {
     fn simple_operand(value: &Value) -> bool {
         value
             .as_object()
@@ -4474,6 +4476,7 @@ fn delete_inner(
     }
 
     refresh_pointers(wtxn, &db)?;
+    invalidate_rollups(wtxn, env, name)?;
     Ok(deleted)
 }
 
@@ -4783,6 +4786,7 @@ fn retain_inner(
 
     refresh_pointers(wtxn, &db)?;
     report.remaining_rows = stats(wtxn, env, name, settings)?.rows;
+    invalidate_rollups(wtxn, env, name)?;
     Ok(report)
 }
 
@@ -5158,6 +5162,7 @@ fn update_inner(
         report.upserted_id = Some(id);
     }
 
+    invalidate_rollups(wtxn, env, name)?;
     Ok(report)
 }
 
@@ -5666,6 +5671,296 @@ pub fn reencode_bucket(
         (hash, salt, window, serial),
     )?;
     Ok(true)
+}
+
+/// Prefix of the per-collection rollup sub-database.
+pub const ROLLUP_DB_PREFIX: &str = "tsr:";
+const ROLLUP_MARKER: u8 = 0x7F;
+const ROLLUP_META: u8 = 0x00;
+const ROLLUP_HOUR: u8 = 0x01;
+const ROLLUP_DAY: u8 = 0x02;
+const ROLLUP_HOUR_MS: i64 = 3_600_000;
+const ROLLUP_DAY_MS: i64 = 86_400_000;
+
+#[derive(Clone, Copy, Default)]
+struct RollupRow {
+    min_ts: i64,
+    max_ts: i64,
+    open: f64,
+    high: f64,
+    low: f64,
+    close: f64,
+    volume: f64,
+    n: u64,
+}
+
+impl RollupRow {
+    fn add(&mut self, ts: i64, open: f64, high: f64, low: f64, close: f64, volume: f64) {
+        if self.n == 0 {
+            self.min_ts = ts;
+            self.max_ts = ts;
+            self.open = open;
+            self.high = high;
+            self.low = low;
+            self.close = close;
+            self.volume = volume;
+            self.n = 1;
+            return;
+        }
+        if ts < self.min_ts {
+            self.min_ts = ts;
+            self.open = open;
+        }
+        if ts > self.max_ts {
+            self.max_ts = ts;
+            self.close = close;
+        }
+        self.high = self.high.max(high);
+        self.low = self.low.min(low);
+        self.volume += volume;
+        self.n += 1;
+    }
+
+    fn encode(self) -> [u8; 64] {
+        let mut out = [0u8; 64];
+        out[0..8].copy_from_slice(&self.min_ts.to_be_bytes());
+        out[8..16].copy_from_slice(&self.max_ts.to_be_bytes());
+        for (slot, value) in [self.open, self.high, self.low, self.close, self.volume]
+            .into_iter()
+            .enumerate()
+        {
+            out[16 + slot * 8..24 + slot * 8].copy_from_slice(&value.to_bits().to_be_bytes());
+        }
+        out[56..64].copy_from_slice(&self.n.to_be_bytes());
+        out
+    }
+
+    fn decode(raw: &[u8]) -> Option<Self> {
+        if raw.len() != 64 {
+            return None;
+        }
+        let value = |slot: usize| -> Option<f64> {
+            Some(f64::from_bits(u64::from_be_bytes(
+                raw[16 + slot * 8..24 + slot * 8].try_into().ok()?,
+            )))
+        };
+        Some(Self {
+            min_ts: i64::from_be_bytes(raw[0..8].try_into().ok()?),
+            max_ts: i64::from_be_bytes(raw[8..16].try_into().ok()?),
+            open: value(0)?,
+            high: value(1)?,
+            low: value(2)?,
+            close: value(3)?,
+            volume: value(4)?,
+            n: u64::from_be_bytes(raw[56..64].try_into().ok()?),
+        })
+    }
+}
+
+fn rollup_key(unit: u8, hash: u64, window: i64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(17);
+    key.push(unit);
+    key.extend_from_slice(&hash.to_be_bytes());
+    key.extend_from_slice(&window.to_be_bytes());
+    key
+}
+
+fn rollup_meta_key(hash: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(9);
+    key.push(ROLLUP_META);
+    key.extend_from_slice(&hash.to_be_bytes());
+    key
+}
+
+fn rollup_ohlc(doc: &Value) -> Option<(f64, f64, f64, f64, f64)> {
+    let field = |name: &str| get_path(doc, name).and_then(Value::as_f64);
+    Some((
+        field("open")?,
+        field("high")?,
+        field("low")?,
+        field("close")?,
+        field("volume")?,
+    ))
+}
+
+pub(crate) fn extract_time_public(doc: &Value, field: &str) -> Option<i64> {
+    extract_time(doc, field)
+}
+
+/// Builds hourly and daily OHLC/volume rollups for `[low, high]` and marks the
+/// covered range. Existing rollups in the collection are replaced.
+pub fn build_rollups(
+    wtxn: &mut RwTxn<'_>,
+    env: &heed::Env,
+    name: &str,
+    settings: &Settings,
+    low: i64,
+    high: i64,
+) -> Result<usize> {
+    let db_name = format!("{ROLLUP_DB_PREFIX}{name}");
+    let db = env.create_database::<Bytes, Bytes>(wtxn, Some(&db_name))?;
+    db.clear(&mut *wtxn)?;
+    let filter = serde_json::json!({
+        "ts": {
+            "$gte": {"$date": {"$numberLong": low.to_string()}},
+            "$lte": {"$date": {"$numberLong": high.to_string()}},
+        }
+    });
+    let mut rows: std::collections::HashMap<(u8, u64, i64), RollupRow> =
+        std::collections::HashMap::new();
+    let mut metas: std::collections::HashMap<u64, Value> = std::collections::HashMap::new();
+    scan_batches(wtxn, env, name, settings, &filter, 4096, |batch| {
+        for doc in batch {
+            let Some(ts) = extract_time(&doc, &settings.time_field) else {
+                continue;
+            };
+            let Some((open, high, low_price, close, volume)) = rollup_ohlc(&doc) else {
+                continue;
+            };
+            let meta = series_meta(&doc, settings);
+            let hash = series_hash(settings, meta.as_ref());
+            if let Some(meta) = meta {
+                metas.insert(hash, meta);
+            }
+            let hour = ts.div_euclid(ROLLUP_HOUR_MS) * ROLLUP_HOUR_MS;
+            let day = ts.div_euclid(ROLLUP_DAY_MS) * ROLLUP_DAY_MS;
+            rows.entry((ROLLUP_HOUR, hash, hour))
+                .or_default()
+                .add(ts, open, high, low_price, close, volume);
+            rows.entry((ROLLUP_DAY, hash, day))
+                .or_default()
+                .add(ts, open, high, low_price, close, volume);
+        }
+        Ok(true)
+    })?;
+    for (hash, meta) in metas {
+        db.put(
+            &mut *wtxn,
+            &rollup_meta_key(hash),
+            &serde_json::to_vec(&meta)?,
+        )?;
+    }
+    let mut keys: Vec<_> = rows.keys().copied().collect();
+    keys.sort_unstable();
+    for key in &keys {
+        let row = rows[key];
+        db.put(&mut *wtxn, &rollup_key(key.0, key.1, key.2), &row.encode())?;
+    }
+    let mut marker = Vec::with_capacity(16);
+    marker.extend_from_slice(&low.to_be_bytes());
+    marker.extend_from_slice(&high.to_be_bytes());
+    for unit in [ROLLUP_HOUR, ROLLUP_DAY] {
+        db.put(&mut *wtxn, &[ROLLUP_MARKER, unit], &marker)?;
+    }
+    Ok(keys.len())
+}
+
+/// Loads rollup documents for a unit. Returns `None` when the covered range
+/// does not fully contain the query or when a boundary rollup would include
+/// rows outside the query.
+#[allow(clippy::type_complexity)]
+pub fn rollup_docs(
+    rtxn: &RoTxn<'_>,
+    env: &heed::Env,
+    name: &str,
+    settings: &Settings,
+    filter: &Value,
+    unit: &str,
+) -> Result<Option<(Vec<Value>, Vec<(i64, i64)>)>> {
+    let (unit_byte, window_size) = match unit {
+        "hour" => (ROLLUP_HOUR, ROLLUP_HOUR_MS),
+        "day" => (ROLLUP_DAY, ROLLUP_DAY_MS),
+        _ => return Ok(None),
+    };
+    let Some(db) =
+        env.open_database::<Bytes, Bytes>(rtxn, Some(&format!("{ROLLUP_DB_PREFIX}{name}")))?
+    else {
+        return Ok(None);
+    };
+    let marker = db.get(rtxn, &[ROLLUP_MARKER, unit_byte])?;
+    let Some(marker) = marker else {
+        return Ok(None);
+    };
+    if marker.len() != 16 {
+        return Ok(None);
+    }
+    let covered_low = i64::from_be_bytes(marker[0..8].try_into().expect("8 bytes"));
+    let covered_high = i64::from_be_bytes(marker[8..16].try_into().expect("8 bytes"));
+    let (low, high) = time_bounds(filter, &settings.time_field);
+    let (Some(low), Some(high)) = (low, high) else {
+        return Ok(None);
+    };
+    if low < covered_low || high > covered_high {
+        return Ok(None);
+    }
+    let meta_hash = meta_equality_hash(filter, settings);
+    let mut out = Vec::new();
+    let mut partial = Vec::new();
+    for item in db.iter(rtxn)? {
+        let (key, raw) = item?;
+        if key.len() != 17 || key[0] != unit_byte {
+            continue;
+        }
+        let hash = u64::from_be_bytes(key[1..9].try_into().expect("8 bytes"));
+        if meta_hash.is_some_and(|expected| expected != hash) {
+            continue;
+        }
+        let window = i64::from_be_bytes(key[9..17].try_into().expect("8 bytes"));
+        let Some(row) = RollupRow::decode(raw) else {
+            continue;
+        };
+        // A rollup may only cover rows outside the requested interval.
+        if row.max_ts < low || row.min_ts > high {
+            continue;
+        }
+        // Partial boundary windows fall back to raw rows; full windows use the
+        // materialized rollup.
+        if row.min_ts < low || row.max_ts > high {
+            partial.push((window, window.saturating_add(window_size).saturating_sub(1)));
+            continue;
+        }
+        let meta = db
+            .get(rtxn, &rollup_meta_key(hash))?
+            .and_then(|raw| serde_json::from_slice::<Value>(raw).ok());
+        let mut doc = Map::new();
+        if let Some(field) = &settings.meta_field {
+            if let Some(meta) = meta {
+                doc.insert(field.clone(), meta);
+            }
+        }
+        doc.insert(
+            settings.time_field.clone(),
+            serde_json::json!({"$date": {"$numberLong": window.to_string()}}),
+        );
+        doc.insert("open".into(), serde_json::json!(row.open));
+        doc.insert("high".into(), serde_json::json!(row.high));
+        doc.insert("low".into(), serde_json::json!(row.low));
+        doc.insert("close".into(), serde_json::json!(row.close));
+        doc.insert("volume".into(), serde_json::json!(row.volume));
+        doc.insert("n".into(), serde_json::json!(row.n));
+        out.push(Value::Object(doc));
+    }
+    out.sort_by(|a, b| {
+        let ta = extract_time(a, &settings.time_field).unwrap_or(0);
+        let tb = extract_time(b, &settings.time_field).unwrap_or(0);
+        ta.cmp(&tb)
+    });
+    partial.sort_unstable();
+    partial.dedup();
+    Ok(Some((out, partial)))
+}
+
+/// Invalidates rollup coverage after a write/retention.
+pub fn invalidate_rollups(wtxn: &mut RwTxn<'_>, env: &heed::Env, name: &str) -> Result<()> {
+    let Some(db) =
+        env.open_database::<Bytes, Bytes>(&*wtxn, Some(&format!("{ROLLUP_DB_PREFIX}{name}")))?
+    else {
+        return Ok(());
+    };
+    for unit in [ROLLUP_HOUR, ROLLUP_DAY] {
+        db.delete(&mut *wtxn, &[ROLLUP_MARKER, unit])?;
+    }
+    Ok(())
 }
 
 /// Parses settings from stored JSON.
@@ -6761,6 +7056,104 @@ mod tests {
             assert!(crate::timeseries::verify_in(&rtxn, store.env(), "metrics", &settings).is_ok());
             rtxn.commit().unwrap();
         }
+    }
+
+    #[test]
+    fn rollups_match_raw_aggregations_and_invalidate_on_write() {
+        let (_dir, store) = ts_store();
+        let settings = Settings {
+            time_field: "ts".into(),
+            meta_field: Some("device".into()),
+            granularity: Granularity::Minutes,
+            bucket_max_docs: 256,
+            ..Settings::default()
+        };
+        let c = store
+            .create_timeseries_collection("rolled", &settings)
+            .unwrap();
+        let base = 1_700_000_000_000i64;
+        let day = 86_400_000i64;
+        for d in 0..3i64 {
+            for device in 0..2i64 {
+                for h in 0..6i64 {
+                    let ts = base + d * day + h * 3_600_000;
+                    c.insert_one(json!({
+                        "ts": {"$date": {"$numberLong": ts.to_string()}},
+                        "device": format!("d{device}"),
+                        "open": 10 + h,
+                        "high": 12 + h,
+                        "low": 9 + h,
+                        "close": 11 + h,
+                        "volume": 1.5,
+                    }))
+                    .unwrap();
+                }
+            }
+        }
+        let range = |unit: &str| {
+            let trunc = |ms: i64, span: i64| ms.div_euclid(span) * span;
+            let span = if unit == "hour" { 3_600_000 } else { day };
+            json!({
+                "$gte": {"$date": {"$numberLong": trunc(base, span).to_string()}},
+                "$lte": {"$date": {"$numberLong": (trunc(base + 3 * day, span) - 1).to_string()}}
+            })
+        };
+        let pipeline = |unit: &str| {
+            vec![
+                json!({"$match": {"ts": range(unit)}}),
+                json!({"$sort": {"ts": 1}}),
+                json!({"$group": {
+                    "_id": {"device": "$device", "bucket": {"$dateTrunc": {"date": "$ts", "unit": unit}}},
+                    "open": {"$first": "$open"},
+                    "high": {"$max": "$high"},
+                    "low": {"$min": "$low"},
+                    "close": {"$last": "$close"},
+                    "volume": {"$sum": "$volume"},
+                    "n": {"$sum": 1}
+                }}),
+                json!({"$sort": {"_id": 1}}),
+            ]
+        };
+        let raw_hour = c.aggregate(&pipeline("hour")).unwrap();
+        let raw_day = c.aggregate(&pipeline("day")).unwrap();
+        {
+            let mut wtxn = store.write_txn().unwrap();
+            build_rollups(
+                &mut wtxn,
+                store.env(),
+                "rolled",
+                &settings,
+                base,
+                base + 3 * day,
+            )
+            .unwrap();
+            wtxn.commit().unwrap();
+        }
+        assert_eq!(c.aggregate(&pipeline("hour")).unwrap(), raw_hour);
+        assert_eq!(c.aggregate(&pipeline("day")).unwrap(), raw_day);
+
+        // A write invalidates coverage; the next query must not use a stale rollup.
+        c.insert_one(json!({
+            "ts": {"$date": {"$numberLong": (base + day + 90_000_000).to_string()}},
+            "device": "d0", "open": 1, "high": 2, "low": 0, "close": 1, "volume": 1.0,
+        }))
+        .unwrap();
+        let raw_after = c.aggregate(&pipeline("hour")).unwrap();
+        assert_ne!(raw_after, raw_hour);
+        {
+            let mut wtxn = store.write_txn().unwrap();
+            build_rollups(
+                &mut wtxn,
+                store.env(),
+                "rolled",
+                &settings,
+                base,
+                base + 3 * day,
+            )
+            .unwrap();
+            wtxn.commit().unwrap();
+        }
+        assert_eq!(c.aggregate(&pipeline("hour")).unwrap(), raw_after);
     }
 
     #[test]
