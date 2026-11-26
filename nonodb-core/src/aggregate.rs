@@ -17,7 +17,7 @@ use serde_json::{Map, Value};
 use time::{Date, Duration, Month, OffsetDateTime, Time, UtcOffset, Weekday};
 
 use crate::bson_types;
-use crate::collection::compare_docs;
+use crate::collection::{compare_docs, compare_window_sort_keys, window_sort_key, WindowSortKey};
 use crate::date;
 use crate::error::{Error, Result};
 use crate::numeric;
@@ -1427,21 +1427,21 @@ fn group(docs: Vec<Value>, spec: &Value, vars: &BTreeMap<String, Value>) -> Resu
     builder.finish()
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 enum WindowBound {
     Unbounded,
     Current,
     Offset(i64),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 enum WindowRangeBound {
     Unbounded,
     Current,
     Offset(Value),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 enum WindowFrame {
     Documents {
         start: WindowBound,
@@ -1774,14 +1774,19 @@ enum RangeValue {
 }
 
 fn range_sort_value(doc: &Value, field: &str) -> Result<Option<RangeValue>> {
-    let Some(value) = path::get(doc, field) else {
+    let value = if field.contains('.') {
+        path::get(doc, field)
+    } else {
+        doc.get(field)
+    };
+    let Some(value) = value else {
         return Ok(None);
     };
     if value.is_null() {
         return Ok(None);
     }
-    if date::is_date(value) {
-        return Ok(Some(RangeValue::Date(date_millis(value)?)));
+    if let Some(ms) = date::parse_value(value) {
+        return Ok(Some(RangeValue::Date(ms)));
     }
     if let Some(number) = numeric::as_bigdecimal(value) {
         return Ok(Some(RangeValue::Number(number)));
@@ -1816,6 +1821,20 @@ fn range_bound_value(
                 let offset = offset.as_i64().ok_or_else(|| {
                     Error::Query("date range offsets must be integer numbers".into())
                 })?;
+                let fixed_ms = match unit {
+                    "millisecond" => 1i64,
+                    "second" => 1_000,
+                    "minute" => 60_000,
+                    "hour" => 3_600_000,
+                    "day" => 86_400_000,
+                    "week" => 604_800_000,
+                    _ => 0,
+                };
+                if fixed_ms != 0 {
+                    return Ok(Some(RangeValue::Date(
+                        current.saturating_add(offset.saturating_mul(fixed_ms)),
+                    )));
+                }
                 Ok(Some(RangeValue::Date(densify_add_date(
                     *current, offset, unit,
                 )?)))
@@ -1987,6 +2006,59 @@ fn frame_bounds(
     }
 }
 
+#[derive(Default)]
+struct RangeCursor {
+    left: usize,
+    right: usize,
+}
+
+fn range_advance_left(values: &[RangeValue], bound: &RangeValue, from: usize) -> Result<usize> {
+    let mut index = from.min(values.len());
+    while index < values.len() && range_value_cmp(&values[index], bound)? == Ordering::Less {
+        index += 1;
+    }
+    Ok(index)
+}
+
+fn range_advance_right(values: &[RangeValue], bound: &RangeValue, from: usize) -> Result<usize> {
+    let mut index = from.min(values.len());
+    while index < values.len() && range_value_cmp(&values[index], bound)? != Ordering::Greater {
+        index += 1;
+    }
+    Ok(index)
+}
+
+fn frame_bounds_cursor(
+    frame: Option<&WindowFrame>,
+    position: usize,
+    len: usize,
+    range_values: Option<&[RangeValue]>,
+    cursor: &mut RangeCursor,
+) -> Result<Option<(usize, usize)>> {
+    let Some(WindowFrame::Range { start, end, unit }) = frame else {
+        return frame_bounds(frame, position, len, range_values);
+    };
+    let Some(values) = range_values else {
+        return Ok(None);
+    };
+    let current = &values[position];
+    let lower = range_bound_value(start, current, unit.as_deref())?;
+    let upper = range_bound_value(end, current, unit.as_deref())?;
+    let start = match lower {
+        Some(bound) => range_advance_left(values, &bound, cursor.left)?,
+        None => 0,
+    };
+    let end = match upper {
+        Some(bound) => range_advance_right(values, &bound, cursor.right)?,
+        None => len,
+    };
+    cursor.left = start;
+    cursor.right = end;
+    let start = start.min(len);
+    let end = end.clamp(start, len);
+    Ok(Some((start, end)))
+}
+
 fn window_sliding_values(
     op: &str,
     values: &[Value],
@@ -2000,11 +2072,13 @@ fn window_sliding_values(
         return Ok(None);
     }
     let len = values.len();
+    let mut cursor = RangeCursor::default();
     let mut out = Vec::with_capacity(len);
 
     if op == "$first" || op == "$last" {
         for position in 0..len {
-            let Some((start, end)) = frame_bounds(Some(window), position, len, range_values)?
+            let Some((start, end)) =
+                frame_bounds_cursor(Some(window), position, len, range_values, &mut cursor)?
             else {
                 return Ok(None);
             };
@@ -2024,7 +2098,8 @@ fn window_sliding_values(
         let mut left = 0usize;
         let mut right = 0usize;
         for position in 0..len {
-            let Some((start, end)) = frame_bounds(Some(window), position, len, range_values)?
+            let Some((start, end)) =
+                frame_bounds_cursor(Some(window), position, len, range_values, &mut cursor)?
             else {
                 return Ok(None);
             };
@@ -2083,8 +2158,38 @@ fn window_sliding_values(
         }
         let numbers: Vec<Option<f64>> = values.iter().map(numeric::as_f64).collect();
         let mut out = Vec::with_capacity(len);
+        if std::env::var("NONODB_WINDOW_FAST_FLOAT").ok().as_deref() == Some("1") {
+            let mut sums = vec![0.0f64; len + 1];
+            let mut counts = vec![0u64; len + 1];
+            for index in 0..len {
+                let value = numbers[index].unwrap_or(0.0);
+                sums[index + 1] = sums[index] + value;
+                counts[index + 1] = counts[index]
+                    + u64::from(numbers[index].is_some_and(|value| value.is_finite()));
+            }
+            for position in 0..len {
+                let Some((start, end)) =
+                    frame_bounds_cursor(Some(window), position, len, range_values, &mut cursor)?
+                else {
+                    return Ok(None);
+                };
+                let sum = sums[end] - sums[start];
+                let count = counts[end] - counts[start];
+                out.push(if op == "$avg" {
+                    if count == 0 {
+                        Value::Null
+                    } else {
+                        number_value(sum / count as f64)
+                    }
+                } else {
+                    number_value(sum)
+                });
+            }
+            return Ok(Some(out));
+        }
         for position in 0..len {
-            let Some((start, end)) = frame_bounds(Some(window), position, len, range_values)?
+            let Some((start, end)) =
+                frame_bounds_cursor(Some(window), position, len, range_values, &mut cursor)?
             else {
                 return Ok(None);
             };
@@ -2120,7 +2225,9 @@ fn window_sliding_values(
     let mut left = 0usize;
     let mut right = 0usize;
     for position in 0..len {
-        let Some((start, end)) = frame_bounds(Some(window), position, len, range_values)? else {
+        let Some((start, end)) =
+            frame_bounds_cursor(Some(window), position, len, range_values, &mut cursor)?
+        else {
             return Ok(None);
         };
         if start < left || end < right {
@@ -2149,6 +2256,194 @@ fn window_sliding_values(
         out.push(accumulator.value()?);
     }
     Ok(Some(out))
+}
+
+fn window_accumulator_group_values(
+    docs: &[Value],
+    indices: &[usize],
+    outputs: &[&WindowOutput],
+    window: Option<&WindowFrame>,
+    sort: &[(String, i32)],
+    vars: &BTreeMap<String, Value>,
+) -> Result<Option<Vec<Vec<Value>>>> {
+    let ops: Vec<(&str, &Value)> = outputs
+        .iter()
+        .map(|output| match &output.op {
+            WindowOp::Accumulator(op, expression) => Ok((op.as_str(), expression)),
+            _ => Err(Error::Query(
+                "internal window accumulator group mismatch".into(),
+            )),
+        })
+        .collect::<Result<_>>()?;
+    if ops.iter().any(|(op, _)| {
+        !matches!(
+            *op,
+            "$sum" | "$avg" | "$min" | "$max" | "$count" | "$first" | "$last"
+        )
+    }) {
+        return Ok(None);
+    }
+    let values: Vec<Vec<Value>> = ops
+        .iter()
+        .map(|(op, expression)| {
+            if *op == "$count" {
+                Ok(vec![Value::Null; indices.len()])
+            } else {
+                indices
+                    .iter()
+                    .map(|index| eval_expr_vars(&docs[*index], expression, vars))
+                    .collect::<Result<Vec<_>>>()
+            }
+        })
+        .collect::<Result<_>>()?;
+    let numeric_ops: Vec<Option<Vec<Option<f64>>>> = ops
+        .iter()
+        .zip(&values)
+        .map(|((op, _), values)| {
+            if matches!(*op, "$sum" | "$avg" | "$min" | "$max") {
+                let numbers: Option<Vec<Option<f64>>> = values
+                    .iter()
+                    .map(|value| {
+                        if value.is_null() {
+                            Some(None)
+                        } else if numeric::is_decimal(value) {
+                            None
+                        } else {
+                            numeric::as_f64(value)
+                                .filter(|value| value.is_finite())
+                                .map(Some)
+                        }
+                    })
+                    .collect();
+                numbers
+            } else {
+                Some(Vec::new())
+            }
+        })
+        .collect();
+    if numeric_ops.iter().any(Option::is_none) {
+        return Ok(None);
+    }
+    let numeric_ops: Vec<Vec<Option<f64>>> = numeric_ops.into_iter().map(Option::unwrap).collect();
+    let range_values = match window {
+        Some(WindowFrame::Range { .. }) => range_values_for(docs, indices, sort)?,
+        _ => None,
+    };
+    let len = indices.len();
+    let mut results: Vec<Vec<Value>> = ops.iter().map(|_| Vec::with_capacity(len)).collect();
+    let mut sums = vec![0.0f64; ops.len()];
+    let mut counts = vec![0u64; ops.len()];
+    let mut mins = vec![f64::INFINITY; ops.len()];
+    let mut maxs = vec![f64::NEG_INFINITY; ops.len()];
+    let mut seen = vec![false; ops.len()];
+    let mut update = |position: usize, start: usize, end: usize| -> Result<()> {
+        sums.fill(0.0);
+        counts.fill(0);
+        mins.fill(f64::INFINITY);
+        maxs.fill(f64::NEG_INFINITY);
+        seen.fill(false);
+        let mut frame_position = start;
+        while frame_position < end {
+            for (index, (op, _)) in ops.iter().enumerate() {
+                if !matches!(*op, "$sum" | "$avg" | "$min" | "$max") {
+                    continue;
+                }
+                let Some(Some(value)) = numeric_ops[index].get(frame_position) else {
+                    continue;
+                };
+                match *op {
+                    "$sum" => sums[index] += value,
+                    "$avg" => {
+                        sums[index] += value;
+                        counts[index] += 1;
+                    }
+                    "$min" => {
+                        seen[index] = true;
+                        if *value < mins[index] {
+                            mins[index] = *value;
+                        }
+                    }
+                    "$max" => {
+                        seen[index] = true;
+                        if *value > maxs[index] {
+                            maxs[index] = *value;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            frame_position += 1;
+        }
+        for (index, (op, _)) in ops.iter().enumerate() {
+            let value = match *op {
+                "$sum" => number_value(sums[index]),
+                "$avg" => {
+                    if counts[index] == 0 {
+                        Value::Null
+                    } else {
+                        number_value(sums[index] / counts[index] as f64)
+                    }
+                }
+                "$min" => {
+                    if seen[index] {
+                        number_value(mins[index])
+                    } else {
+                        Value::Null
+                    }
+                }
+                "$max" => {
+                    if seen[index] {
+                        number_value(maxs[index])
+                    } else {
+                        Value::Null
+                    }
+                }
+                "$count" => Value::from((end - start) as u64),
+                "$first" => {
+                    if start >= end {
+                        Value::Null
+                    } else {
+                        values[index][start].clone()
+                    }
+                }
+                "$last" => {
+                    if start >= end {
+                        Value::Null
+                    } else {
+                        values[index][end - 1].clone()
+                    }
+                }
+                _ => unreachable!("validated grouped accumulator"),
+            };
+            results[index].push(value);
+            let _ = position;
+        }
+        Ok(())
+    };
+    if let Some(window) = window {
+        let mut cursor = RangeCursor::default();
+        for position in 0..len {
+            let Some((start, end)) = frame_bounds_cursor(
+                Some(window),
+                position,
+                len,
+                range_values.as_deref(),
+                &mut cursor,
+            )?
+            else {
+                return Ok(None);
+            };
+            update(position, start, end)?;
+        }
+        return Ok(Some(results));
+    }
+    let (start, end) = (0, len);
+    update(0, start, end)?;
+    for result in &mut results {
+        let value = result.first().cloned().unwrap_or(Value::Null);
+        result.resize(len, value);
+    }
+    Ok(Some(results))
 }
 
 fn window_accumulator_values(
@@ -2217,15 +2512,21 @@ fn window_rank_values(
     indices: &[usize],
     sort: &[(String, i32)],
     dense: bool,
+    sort_keys: Option<&[Vec<Option<WindowSortKey>>]>,
 ) -> Vec<Value> {
     let mut out = Vec::with_capacity(indices.len());
     let mut rank = 1usize;
     let mut dense_rank = 1usize;
     for position in 0..indices.len() {
         if position > 0 {
-            let previous = &docs[indices[position - 1]];
-            let current = &docs[indices[position]];
-            if compare_docs(previous, current, sort) != Ordering::Equal {
+            let different = if let Some(keys) = sort_keys {
+                compare_window_sort_keys(&keys[position - 1], &keys[position], sort)
+                    != Ordering::Equal
+            } else {
+                compare_docs(&docs[indices[position - 1]], &docs[indices[position]], sort)
+                    != Ordering::Equal
+            };
+            if different {
                 rank = position + 1;
                 dense_rank += 1;
             }
@@ -2563,6 +2864,7 @@ fn window_output_values(
     indices: &[usize],
     output: &WindowOutput,
     sort: &[(String, i32)],
+    sort_keys: Option<&[Vec<Option<WindowSortKey>>]>,
     vars: &BTreeMap<String, Value>,
 ) -> Result<Vec<Value>> {
     match &output.op {
@@ -2575,8 +2877,8 @@ fn window_output_values(
             sort,
             vars,
         ),
-        WindowOp::Rank => Ok(window_rank_values(docs, indices, sort, false)),
-        WindowOp::DenseRank => Ok(window_rank_values(docs, indices, sort, true)),
+        WindowOp::Rank => Ok(window_rank_values(docs, indices, sort, false, sort_keys)),
+        WindowOp::DenseRank => Ok(window_rank_values(docs, indices, sort, true, sort_keys)),
         WindowOp::DocumentNumber => Ok((1..=indices.len()).map(Value::from).collect()),
         WindowOp::Shift {
             output,
@@ -2605,6 +2907,98 @@ fn window_output_values(
             vars,
         ),
     }
+}
+
+type WindowPartitionResult = (Vec<usize>, Vec<Vec<Value>>);
+
+fn window_partition_results(
+    docs: &[Value],
+    mut indices: Vec<usize>,
+    outputs: &[WindowOutput],
+    sort: &[(String, i32)],
+    vars: &BTreeMap<String, Value>,
+) -> Result<WindowPartitionResult> {
+    let sort_keys = if sort.is_empty() {
+        Vec::new()
+    } else {
+        let mut keyed: Vec<(usize, Vec<Option<WindowSortKey>>)> = indices
+            .iter()
+            .map(|index| (*index, window_sort_key(&docs[*index], sort)))
+            .collect();
+        keyed.sort_by(|left, right| compare_window_sort_keys(&left.1, &right.1, sort));
+        indices = keyed.iter().map(|(index, _)| *index).collect();
+        keyed.into_iter().map(|(_, key)| key).collect()
+    };
+    let sort_keys = if sort.is_empty() {
+        None
+    } else {
+        Some(sort_keys.as_slice())
+    };
+    let mut results: Vec<Option<Vec<Value>>> = vec![None; outputs.len()];
+    let mut grouped = vec![false; outputs.len()];
+    for position in 0..outputs.len() {
+        if grouped[position] {
+            continue;
+        }
+        let mut group = vec![position];
+        if matches!(outputs[position].op, WindowOp::Accumulator(..)) {
+            for (candidate, output) in outputs.iter().enumerate().skip(position + 1) {
+                if !grouped[candidate]
+                    && matches!(output.op, WindowOp::Accumulator(..))
+                    && output.window == outputs[position].window
+                {
+                    group.push(candidate);
+                }
+            }
+        }
+        let grouped_accumulators = std::env::var("NONODB_WINDOW_SEQUENTIAL").ok().as_deref()
+            != Some("1")
+            && std::env::var("NONODB_WINDOW_FAST_FLOAT").ok().as_deref() != Some("1");
+        if group.len() > 1 && grouped_accumulators {
+            let selected: Vec<&WindowOutput> = group.iter().map(|index| &outputs[*index]).collect();
+            let values = window_accumulator_group_values(
+                docs,
+                &indices,
+                &selected,
+                outputs[position].window.as_ref(),
+                sort,
+                vars,
+            )?;
+            if let Some(values) = values {
+                for (index, value) in group.into_iter().zip(values) {
+                    grouped[index] = true;
+                    results[index] = Some(value);
+                }
+            } else {
+                for index in group {
+                    grouped[index] = true;
+                    results[index] = Some(window_output_values(
+                        docs,
+                        &indices,
+                        &outputs[index],
+                        sort,
+                        sort_keys,
+                        vars,
+                    )?);
+                }
+            }
+        } else {
+            grouped[position] = true;
+            results[position] = Some(window_output_values(
+                docs,
+                &indices,
+                &outputs[position],
+                sort,
+                sort_keys,
+                vars,
+            )?);
+        }
+    }
+    let results = results
+        .into_iter()
+        .map(|result| result.expect("window output result"))
+        .collect();
+    Ok((indices, results))
 }
 
 fn set_window_fields(
@@ -2669,14 +3063,51 @@ fn set_window_fields(
             .push(index);
     }
 
-    for indices in partitions.values_mut() {
-        if !sort.is_empty() {
-            indices.sort_by(|left, right| compare_docs(&docs[*left], &docs[*right], &sort));
+    let partitions: Vec<Vec<usize>> = partitions.into_values().collect();
+    let workers = crate::collection::aggregate_workers()
+        .min(partitions.len())
+        .max(1);
+    let computed = if workers > 1 && docs.len() > 256 {
+        let mut buckets: Vec<Vec<Vec<usize>>> = (0..workers).map(|_| Vec::new()).collect();
+        for (index, partition) in partitions.into_iter().enumerate() {
+            buckets[index % workers].push(partition);
         }
-        let mut results = Vec::with_capacity(outputs.len());
-        for output in &outputs {
-            results.push(window_output_values(&docs, indices, output, &sort, vars)?);
+        std::thread::scope(|scope| -> Result<Vec<WindowPartitionResult>> {
+            let mut handles = Vec::with_capacity(buckets.len());
+            for bucket in buckets {
+                let docs = &docs;
+                let outputs = &outputs;
+                let sort = &sort;
+                handles.push(scope.spawn(move || -> Result<Vec<WindowPartitionResult>> {
+                    let mut out = Vec::with_capacity(bucket.len());
+                    for indices in bucket {
+                        out.push(window_partition_results(
+                            docs, indices, outputs, sort, vars,
+                        )?);
+                    }
+                    Ok(out)
+                }));
+            }
+            let mut computed = Vec::new();
+            for handle in handles {
+                computed.extend(
+                    handle
+                        .join()
+                        .map_err(|_| Error::Query("window partition worker panicked".into()))??,
+                );
+            }
+            Ok(computed)
+        })?
+    } else {
+        let mut computed = Vec::with_capacity(partitions.len());
+        for indices in partitions {
+            computed.push(window_partition_results(
+                &docs, indices, &outputs, &sort, vars,
+            )?);
         }
+        computed
+    };
+    for (indices, results) in computed {
         for (output, values) in outputs.iter().zip(results) {
             for (index, value) in indices.iter().zip(values) {
                 path::set(&mut docs[*index], &output.field, value)?;
@@ -6284,7 +6715,7 @@ mod tests {
                 }
                 Ok(out)
             }
-            _ => window_output_values(docs, indices, output, sort, vars),
+            _ => window_output_values(docs, indices, output, sort, None, vars),
         }
     }
 

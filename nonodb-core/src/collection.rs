@@ -211,7 +211,7 @@ fn configured_workers(var: &str) -> usize {
         .unwrap_or(default)
 }
 
-fn scan_workers() -> usize {
+pub(crate) fn scan_workers() -> usize {
     configured_workers("NONODB_SCAN_WORKERS")
 }
 
@@ -219,7 +219,7 @@ fn backfill_workers() -> usize {
     configured_workers("NONODB_BACKFILL_WORKERS")
 }
 
-fn aggregate_workers() -> usize {
+pub(crate) fn aggregate_workers() -> usize {
     configured_workers("NONODB_AGGREGATE_WORKERS")
 }
 
@@ -8151,6 +8151,25 @@ impl<'e> Collection<'e> {
         )?))
     }
 
+    fn timeseries_window_docs(
+        &self,
+        rtxn: &RoTxn<'_>,
+        settings: &crate::timeseries::Settings,
+        filter: &Value,
+    ) -> Result<Vec<Value>> {
+        let query = FindQuery {
+            filter: filter.clone(),
+            projection: None,
+            sort: Vec::new(),
+            skip: 0,
+            limit: None,
+            comment: None,
+            max_time_ms: None,
+            hint: None,
+        };
+        crate::timeseries::find_window_docs(rtxn, self.env, &self.name, settings, &query)
+    }
+
     fn aggregate_in_deadline(
         &self,
         rtxn: &RoTxn<'_>,
@@ -8299,8 +8318,15 @@ impl<'e> Collection<'e> {
                 )?;
                 return Ok(out);
             }
-            let docs = crate::timeseries::find(rtxn, self.env, &self.name, &settings, &query)?;
             let host = LookupHost { coll: self, rtxn };
+            let docs = if pipeline
+                .iter()
+                .any(|stage| stage.get("$setWindowFields").is_some())
+            {
+                self.timeseries_window_docs(rtxn, &settings, &query.filter)?
+            } else {
+                crate::timeseries::find(rtxn, self.env, &self.name, &settings, &query)?
+            };
             return aggregate::run_with_host(docs, pipeline, aggregate::max_docs(), Some(&host));
         }
         check_find_deadline(deadline)?;
@@ -12108,6 +12134,54 @@ fn index_matches_sort(def: &IndexDef, sort: &[(String, i32)]) -> Option<bool> {
         return Some(true);
     }
     None
+}
+
+/// Precomputes the values used by `compare_docs` for a sort specification.
+#[derive(Clone, Debug)]
+pub(crate) struct WindowSortKey {
+    value: Option<Value>,
+    date_ms: Option<i64>,
+}
+
+pub(crate) fn window_sort_key(doc: &Value, sort: &[(String, i32)]) -> Vec<Option<WindowSortKey>> {
+    sort.iter()
+        .map(|(field, dir)| {
+            sort_value(value_at(doc, field), *dir < 0)
+                .cloned()
+                .map(|value| WindowSortKey {
+                    date_ms: date::parse_value(&value),
+                    value: Some(value),
+                })
+        })
+        .collect()
+}
+
+/// Compares two precomputed sort keys with the same semantics as
+/// `compare_docs`.
+pub(crate) fn compare_window_sort_keys(
+    a: &[Option<WindowSortKey>],
+    b: &[Option<WindowSortKey>],
+    sort: &[(String, i32)],
+) -> Ordering {
+    for (index, (_, dir)) in sort.iter().enumerate() {
+        let left = a.get(index).and_then(Option::as_ref);
+        let right = b.get(index).and_then(Option::as_ref);
+        let ord = match (
+            left.and_then(|key| key.date_ms),
+            right.and_then(|key| key.date_ms),
+        ) {
+            (Some(left), Some(right)) => left.cmp(&right),
+            _ => compare_values(
+                left.and_then(|key| key.value.as_ref()),
+                right.and_then(|key| key.value.as_ref()),
+                *dir < 0,
+            ),
+        };
+        if ord != Ordering::Equal {
+            return if *dir >= 0 { ord } else { ord.reverse() };
+        }
+    }
+    Ordering::Equal
 }
 
 pub(crate) fn compare_docs(a: &Value, b: &Value, sort: &[(String, i32)]) -> Ordering {

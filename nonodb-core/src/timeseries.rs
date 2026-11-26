@@ -3103,7 +3103,7 @@ pub fn insert_many(
     Ok(ids)
 }
 
-fn time_bounds(filter: &Value, field: &str) -> (Option<i64>, Option<i64>) {
+pub(crate) fn time_bounds(filter: &Value, field: &str) -> (Option<i64>, Option<i64>) {
     let mut low = None;
     let mut high = None;
     collect_time_bounds(filter, field, &mut low, &mut high);
@@ -3271,6 +3271,90 @@ pub fn find(
     query: &FindQuery,
 ) -> Result<Vec<Value>> {
     find_with_ids(rtxn, env, name, settings, query, None)
+}
+
+/// Loads the rows for a window pipeline, decoding independent bucket
+/// locators on worker threads when the bucket index can narrow the scan.
+pub fn find_window_docs(
+    rtxn: &RoTxn<'_>,
+    env: &heed::Env,
+    name: &str,
+    settings: &Settings,
+    query: &FindQuery,
+) -> Result<Vec<Value>> {
+    let workers = crate::collection::scan_workers().min(4);
+    if workers <= 1 {
+        return find(rtxn, env, name, settings, query);
+    }
+    let Some(locators) = lookup_indexed_buckets(rtxn, env, name, &query.filter, settings)? else {
+        return find(rtxn, env, name, settings, query);
+    };
+    if locators.len() < 2 {
+        return find(rtxn, env, name, settings, query);
+    }
+    let db_name = format!("{BUCKET_DB_PREFIX}{name}");
+    if env
+        .open_database::<Bytes, Bytes>(rtxn, Some(&db_name))?
+        .is_none()
+    {
+        return Ok(Vec::new());
+    }
+    let (low, high) = time_bounds(&query.filter, &settings.time_field);
+    let time_only = meta_equality_hash(&query.filter, settings).is_none()
+        && filter_is_meta_time_only(&query.filter, settings);
+    let now = crate::ttl::now_ms() as i64;
+    let chunk = locators.len().div_ceil(workers);
+    let parts = std::thread::scope(|scope| -> Result<Vec<Vec<Value>>> {
+        let mut handles = Vec::new();
+        for chunk in locators.chunks(chunk) {
+            let chunk = chunk.to_vec();
+            let db_name = db_name.clone();
+            let settings = settings.clone();
+            let filter = query.filter.clone();
+            handles.push(scope.spawn(move || -> Result<Vec<Value>> {
+                let rtxn = env.read_txn()?;
+                let Some(db) = env.open_database::<Bytes, Bytes>(&rtxn, Some(&db_name))? else {
+                    rtxn.commit()?;
+                    return Ok(Vec::new());
+                };
+                let mut docs = Vec::new();
+                for loc in chunk {
+                    for doc in docs_for_bucket_window(&rtxn, &db, loc, &settings, low, high)? {
+                        if expired(&settings, &doc, now)
+                            || (!time_only && !matcher::matches(&doc, &filter))
+                        {
+                            continue;
+                        }
+                        docs.push(doc);
+                    }
+                }
+                rtxn.commit()?;
+                Ok(docs)
+            }));
+        }
+        let mut parts = Vec::with_capacity(handles.len());
+        for handle in handles {
+            parts.push(
+                handle
+                    .join()
+                    .map_err(|_| Error::Query("window scan worker panicked".into()))??,
+            );
+        }
+        Ok(parts)
+    })?;
+    let mut docs: Vec<Value> = parts.into_iter().flatten().collect();
+    if !query.sort.is_empty() {
+        docs.sort_by(|left, right| compare_docs(left, right, &query.sort));
+    }
+    let start = query.skip.min(docs.len());
+    let limit = query.limit.unwrap_or(usize::MAX);
+    let mut docs: Vec<Value> = docs.into_iter().skip(start).take(limit).collect();
+    if let Some(projection) = &query.projection {
+        for doc in &mut docs {
+            *doc = project_document(doc, Some(projection));
+        }
+    }
+    Ok(docs)
 }
 
 /// Finds documents, optionally restricted to a set of `_id` values (index
@@ -3884,6 +3968,352 @@ where
     Ok(())
 }
 
+/// Decodes a time column directly into milliseconds, avoiding a JSON object
+/// allocation for every row in a bucket when only a narrow range is selected.
+fn decode_time_column_ms(data: &[u8]) -> Result<Vec<Option<i64>>> {
+    let mut pos = 0;
+    let field = std::str::from_utf8(get_bytes(data, &mut pos)?)
+        .map_err(|_| corrupt("field name is not UTF-8"))?
+        .to_string();
+    let kind = *data
+        .get(pos)
+        .ok_or_else(|| corrupt("missing column kind"))?;
+    let codec = *data
+        .get(pos + 1)
+        .ok_or_else(|| corrupt("missing column codec"))?;
+    let flags = *data
+        .get(pos + 2)
+        .ok_or_else(|| corrupt("missing column flags"))?;
+    pos += 3;
+    let n = get_uvarint(data, &mut pos)? as usize;
+    if n > HARD_BUCKET_MAX_DOCS {
+        return Err(corrupt("column row count out of range"));
+    }
+    let mut present = vec![true; n];
+    if flags & 1 != 0 {
+        let mut reader = BitReader::new(
+            data.get(pos..)
+                .ok_or_else(|| corrupt("missing null bitmap"))?,
+        );
+        for slot in present.iter_mut() {
+            *slot = reader.read(1)? == 1;
+        }
+        pos += n.div_ceil(8);
+    }
+    let raw = get_bytes(data, &mut pos)?;
+    let deflated = codec & CODEC_DEFLATE != 0;
+    let base = codec & !CODEC_DEFLATE;
+    let owned;
+    let payload: &[u8] = if deflated {
+        owned = inflate(raw)?;
+        &owned
+    } else {
+        raw
+    };
+    let count = present.iter().filter(|value| **value).count();
+    eprintln!(
+        "TIMECOL field={field} kind={kind} codec={base} deflated={deflated} n={n} count={count}"
+    );
+    let mut values: Vec<Option<i64>> = Vec::with_capacity(n);
+    match (kind, base) {
+        (KIND_JSON, CODEC_RAW) => {
+            let mut reader = 0;
+            for _ in 0..count {
+                let bytes = get_bytes(payload, &mut reader)?;
+                let text = std::str::from_utf8(bytes)
+                    .map_err(|_| corrupt("time column is not UTF-8 JSON"))?;
+                let ms = text
+                    .find("\"$numberLong\":\"")
+                    .and_then(|start| {
+                        let digits = &text[start + 15..];
+                        let end = digits.find('"')?;
+                        digits[..end].parse::<i64>().ok()
+                    })
+                    .or_else(|| {
+                        serde_json::from_str::<Value>(text)
+                            .ok()
+                            .and_then(|value| time_value_ms(&value))
+                    });
+                values.push(ms);
+            }
+        }
+        (KIND_I64, CODEC_RAW | CODEC_SHUFFLE) => {
+            let numbers = if base == CODEC_SHUFFLE {
+                decode_shuffle(payload, count)?
+            } else {
+                if payload.len() != count * 8 {
+                    return Err(corrupt("integer column length mismatch"));
+                }
+                payload
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|chunk| u64::from_le_bytes(*chunk))
+                    .collect()
+            };
+            values.extend(numbers.into_iter().map(|value| Some(value as i64)));
+        }
+        (KIND_I64, CODEC_DELTA | CODEC_DELTA_DELTA | CODEC_FOR) => {
+            let numbers = match base {
+                CODEC_DELTA => decode_delta(payload, count)?,
+                CODEC_DELTA_DELTA => decode_delta_delta(payload, count)?,
+                _ => decode_for(payload, count)?,
+            };
+            values.extend(numbers.into_iter().map(Some));
+        }
+        _ => {
+            let _ = field;
+            let mut reader = 0;
+            let column = decode_column(data, &mut reader)?;
+            return Ok(column
+                .values
+                .into_iter()
+                .map(|value| value.as_ref().and_then(time_value_ms))
+                .collect());
+        }
+    }
+    if values.len() != count {
+        return Err(corrupt("time column length mismatch"));
+    }
+    let mut out = Vec::with_capacity(n);
+    let mut values = values.into_iter();
+    for present in present {
+        out.push(if present {
+            values.next().flatten()
+        } else {
+            None
+        });
+    }
+    Ok(out)
+}
+
+/// Decodes only the rows selected by a time range from a sealed columnar
+/// bucket. Column blocks for other rows are skipped entirely, so a narrow time
+/// window over a day bucket never materializes the full bucket as JSON.
+fn decode_bucket_window_rows(
+    data: &[u8],
+    settings: &Settings,
+    low: Option<i64>,
+    high: Option<i64>,
+    tombs: &BTreeSet<u32>,
+) -> Result<Vec<(usize, Map<String, Value>)>> {
+    if !valid_magic(data) {
+        return Err(corrupt("bad magic"));
+    }
+    let version = data[4];
+    if version < FORMAT_VERSION_PREV {
+        return Err(corrupt("columnar window path requires format v2+"));
+    }
+    let mut pos = 6;
+    let n = get_uvarint(data, &mut pos)? as usize;
+    if n > HARD_BUCKET_MAX_DOCS {
+        return Err(corrupt("row count out of range"));
+    }
+    let _window_start = get_ivarint(data, &mut pos)?;
+    let _end = get_ivarint(data, &mut pos)?;
+    let meta_raw = get_bytes(data, &mut pos)?;
+    let meta: Option<Value> = if meta_raw.is_empty() {
+        None
+    } else {
+        Some(serde_json::from_slice(meta_raw)?)
+    };
+    skip_zone_map(data, &mut pos, version)?;
+    let block_rows = get_uvarint(data, &mut pos)? as usize;
+    if block_rows == 0 || block_rows > HARD_BUCKET_MAX_DOCS {
+        return Err(corrupt("column block size out of range"));
+    }
+    let column_count = get_uvarint(data, &mut pos)? as usize;
+    if column_count > 4096 {
+        return Err(corrupt("column count out of range"));
+    }
+    let mut columns: Vec<(String, Vec<&[u8]>)> = Vec::with_capacity(column_count);
+    for _ in 0..column_count {
+        let field = std::str::from_utf8(get_bytes(data, &mut pos)?)
+            .map_err(|_| corrupt("field name is not UTF-8"))?
+            .to_string();
+        let blocks = get_uvarint(data, &mut pos)? as usize;
+        if blocks > HARD_BUCKET_MAX_DOCS {
+            return Err(corrupt("column block count out of range"));
+        }
+        let mut blobs = Vec::with_capacity(blocks);
+        for _ in 0..blocks {
+            blobs.push(get_bytes(data, &mut pos)?);
+        }
+        columns.push((field, blobs));
+    }
+    let mut deleted = BTreeSet::new();
+    let bitmap_len = get_uvarint(data, &mut pos)? as usize;
+    if bitmap_len != n.div_ceil(8) || pos + bitmap_len > data.len() {
+        return Err(corrupt("malformed deletion bitmap"));
+    }
+    for idx in 0..n {
+        if data[pos + idx / 8] & (1 << (idx % 8)) != 0 {
+            deleted.insert(idx as u32);
+        }
+    }
+    let time_index = columns
+        .iter()
+        .position(|(field, _)| field == &settings.time_field);
+    let mut time_values = vec![None; n];
+    if let Some(time_index) = time_index {
+        let mut base = 0;
+        for blob in &columns[time_index].1 {
+            let block_end = (base + block_rows).min(n);
+            let block = decode_time_column_ms(blob)?;
+            for (offset, value) in block.into_iter().enumerate() {
+                if base + offset < block_end {
+                    time_values[base + offset] = value;
+                }
+            }
+            base = block_end;
+        }
+    }
+    let selected: Vec<usize> = (0..n)
+        .filter(|idx| !deleted.contains(&(*idx as u32)) && !tombs.contains(&(*idx as u32)))
+        .filter(|idx| {
+            time_values[*idx].is_some_and(|ts| {
+                low.is_none_or(|low| ts >= low) && high.is_none_or(|high| ts <= high)
+            })
+        })
+        .collect();
+    if std::env::var("NONODB_DEBUG_WINDOW").is_ok() {
+        eprintln!(
+            "WINBUCKET n={n} selected={} columns={} blocks_time={}",
+            selected.len(),
+            columns.len(),
+            columns.first().map(|c| c.1.len()).unwrap_or(0)
+        );
+    }
+    if std::env::var("NONODB_DEBUG_WINDOW").is_ok() {
+        eprintln!(
+            "COLSCAN n={n} selected={} blocks={}",
+            selected.len(),
+            columns.first().map(|c| c.1.len()).unwrap_or(0)
+        );
+    }
+    if selected.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut positions = vec![None; n];
+    for (room, index) in selected.iter().enumerate() {
+        positions[*index] = Some(room);
+    }
+    let mut rows: Vec<Map<String, Value>> = vec![Map::new(); selected.len()];
+    for (field, blobs) in &columns {
+        let is_time = field == &settings.time_field;
+        let paths: Vec<&str> = field.split('.').collect();
+        let simple = paths.len() == 1;
+        if is_time {
+            for index in &selected {
+                let Some(room) = positions[*index] else {
+                    continue;
+                };
+                let Some(ms) = time_values[*index] else {
+                    continue;
+                };
+                let value = crate::date::canonical(ms);
+                if simple {
+                    rows[room].insert(paths[0].to_string(), value);
+                } else {
+                    set_path_parts(&mut rows[room], &paths, value);
+                }
+            }
+            continue;
+        }
+        let mut base = 0;
+        for blob in blobs {
+            let block_end = (base + block_rows).min(n);
+            if !selected
+                .iter()
+                .any(|index| (base..block_end).contains(index))
+            {
+                base = block_end;
+                continue;
+            }
+            let mut block_pos = 0;
+            let block = decode_column(blob, &mut block_pos)?;
+            if block.field != *field {
+                return Err(corrupt("column block field mismatch"));
+            }
+            for (offset, value) in block.values.into_iter().enumerate() {
+                let index = base + offset;
+                if index >= block_end {
+                    break;
+                }
+                let Some(room) = positions[index] else {
+                    continue;
+                };
+                let Some(value) = value else {
+                    continue;
+                };
+                if simple {
+                    rows[room].insert(paths[0].to_string(), value);
+                } else {
+                    set_path_parts(&mut rows[room], &paths, value);
+                }
+            }
+            base = block_end;
+        }
+    }
+    if let Some(meta) = &meta {
+        if let Some(field) = &settings.meta_field {
+            for row in &mut rows {
+                set_path(row, field, meta.clone());
+            }
+        }
+    }
+    Ok(selected.into_iter().zip(rows).collect())
+}
+
+fn docs_from_window_rows(loc: BucketLocator, rows: Vec<(usize, Map<String, Value>)>) -> Vec<Value> {
+    let mut out = Vec::with_capacity(rows.len());
+    for (index, row) in rows {
+        let mut doc = Value::Object(row);
+        if !doc
+            .as_object()
+            .is_some_and(|object| object.contains_key("_id"))
+        {
+            set_path(
+                doc.as_object_mut().expect("object"),
+                "_id",
+                Value::String(row_id(
+                    loc.hash,
+                    loc.salt,
+                    loc.window,
+                    loc.serial,
+                    index as u32,
+                )),
+            );
+        }
+        out.push(doc);
+    }
+    out
+}
+
+fn docs_for_bucket_window(
+    rtxn: &RoTxn<'_>,
+    db: &Database<Bytes, Bytes>,
+    loc: BucketLocator,
+    settings: &Settings,
+    low: Option<i64>,
+    high: Option<i64>,
+) -> Result<Vec<Value>> {
+    let key = bucket_locator_key(loc);
+    let Some(payload) = db.get(rtxn, &key)? else {
+        return docs_for_bucket_locator(rtxn, db, loc, settings, low, high, None);
+    };
+    if !valid_magic(payload) || payload.get(4).is_none_or(|v| *v < FORMAT_VERSION_PREV) {
+        return docs_for_bucket_locator(rtxn, db, loc, settings, low, high, None);
+    }
+    let tombs = if payload[4] >= FORMAT_VERSION {
+        BTreeSet::new()
+    } else {
+        tombstones(rtxn, db, loc.hash, loc.salt, loc.window, loc.serial)?
+    };
+    let rows = decode_bucket_window_rows(payload, settings, low, high, &tombs)?;
+    Ok(docs_from_window_rows(loc, rows))
+}
+
 fn docs_for_bucket_locator(
     rtxn: &RoTxn<'_>,
     db: &Database<Bytes, Bytes>,
@@ -3912,7 +4342,11 @@ fn docs_for_bucket_locator(
             continue;
         };
         let row: Map<String, Value> = serde_json::from_slice(payload)?;
-        let ts = extract_time(&Value::Object(row.clone()), &settings.time_field);
+        let ts = if settings.time_field.contains('.') {
+            extract_time(&Value::Object(row.clone()), &settings.time_field)
+        } else {
+            row.get(&settings.time_field).and_then(time_value_ms)
+        };
         if ts
             .is_some_and(|ts| low.is_some_and(|low| ts < low) || high.is_some_and(|high| ts > high))
         {
@@ -7414,6 +7848,63 @@ mod tests {
         );
         let natural = c.find(&query).unwrap();
         assert_eq!(indexed, natural);
+    }
+
+    #[test]
+    fn window_scan_matches_find_for_time_ranges() {
+        let (_dir, store) = ts_store();
+        let settings = Settings {
+            time_field: "ts".into(),
+            meta_field: Some("device".into()),
+            granularity: Granularity::Minutes,
+            bucket_max_docs: 64,
+            ..Settings::default()
+        };
+        let c = store
+            .create_timeseries_collection("window_scan", &settings)
+            .unwrap();
+        let base = 1_700_000_000_000i64;
+        let day = 86_400_000i64;
+        for d in 0..3i64 {
+            for device in 0..2i64 {
+                for idx in 0..12i64 {
+                    c.insert_one(json!({
+                        "ts": {"$date": {"$numberLong": (base + d * day + idx * 60_000).to_string()}},
+                        "device": format!("d{device}"),
+                        "value": idx,
+                    }))
+                    .unwrap();
+                }
+            }
+        }
+        {
+            let mut wtxn = store.write_txn().unwrap();
+            seal_all(&mut wtxn, store.env(), "window_scan", &settings).unwrap();
+            wtxn.commit().unwrap();
+        }
+        let range = |from: i64, to: i64| {
+            json!({
+                "$gte": {"$date": {"$numberLong": from.to_string()}},
+                "$lte": {"$date": {"$numberLong": to.to_string()}},
+            })
+        };
+        let query = FindQuery {
+            filter: json!({"ts": range(base + day, base + 2 * day - 1)}),
+            ..Default::default()
+        };
+        let rtxn = store.read_txn().unwrap();
+        let mut expected = find(&rtxn, store.env(), "window_scan", &settings, &query).unwrap();
+        let mut actual =
+            find_window_docs(&rtxn, store.env(), "window_scan", &settings, &query).unwrap();
+        let id = |doc: &Value| {
+            doc.get("_id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string()
+        };
+        expected.sort_by_key(id);
+        actual.sort_by_key(id);
+        assert_eq!(actual, expected);
     }
 
     #[test]
