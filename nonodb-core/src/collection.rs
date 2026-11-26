@@ -378,6 +378,137 @@ struct GeoIndexPlan {
     ranges: Vec<index::RangeBytes>,
     def: IndexDef,
 }
+type PostingLocator = (u64, u32, i64, u16);
+
+const POSTING_TAG: [u8; 2] = [0, 0];
+
+fn posting_key(vb: &[u8], locator: PostingLocator) -> Vec<u8> {
+    let mut key = Vec::with_capacity(2 + vb.len() + 22);
+    key.extend_from_slice(&POSTING_TAG);
+    key.extend_from_slice(vb);
+    key.extend_from_slice(&locator.0.to_be_bytes());
+    key.extend_from_slice(&locator.1.to_be_bytes());
+    key.extend_from_slice(&locator.2.to_be_bytes());
+    key.extend_from_slice(&locator.3.to_be_bytes());
+    key
+}
+
+fn posting_locator(key: &[u8]) -> Option<PostingLocator> {
+    if key.len() < 24 || key[..2] != POSTING_TAG {
+        return None;
+    }
+    let tail = &key[key.len() - 22..];
+    Some((
+        u64::from_be_bytes(tail[0..8].try_into().ok()?),
+        u32::from_be_bytes(tail[8..12].try_into().ok()?),
+        i64::from_be_bytes(tail[12..20].try_into().ok()?),
+        u16::from_be_bytes(tail[20..22].try_into().ok()?),
+    ))
+}
+
+fn posting_bounds(bounds: &index::RangeBytes) -> index::RangeBytes {
+    let map = |bound: &Bound<Vec<u8>>| match bound {
+        Bound::Included(value) => {
+            let mut out = POSTING_TAG.to_vec();
+            out.extend_from_slice(value);
+            Bound::Included(out)
+        }
+        Bound::Excluded(value) => {
+            let mut out = POSTING_TAG.to_vec();
+            out.extend_from_slice(value);
+            Bound::Excluded(out)
+        }
+        Bound::Unbounded => Bound::Unbounded,
+    };
+    (map(&bounds.0), map(&bounds.1))
+}
+
+fn posting_update(
+    db: &Database<Bytes, Bytes>,
+    txn: &mut RwTxn<'_>,
+    vb: &[u8],
+    locator: PostingLocator,
+    seq: u32,
+    add: bool,
+) -> Result<()> {
+    let key = posting_key(vb, locator);
+    let mut bits = db.get(&*txn, &key)?.unwrap_or_default().to_vec();
+    let byte = (seq / 8) as usize;
+    let mask = 1u8 << (seq % 8);
+    if add {
+        if bits.len() <= byte {
+            bits.resize(byte + 1, 0);
+        }
+        bits[byte] |= mask;
+    } else if let Some(value) = bits.get_mut(byte) {
+        *value &= !mask;
+        while bits.last() == Some(&0) {
+            bits.pop();
+        }
+    }
+    if bits.is_empty() {
+        db.delete(&mut *txn, &key)?;
+    } else {
+        db.put(&mut *txn, &key, &bits)?;
+    }
+    Ok(())
+}
+
+fn posting_conflict(
+    db: &Database<Bytes, Bytes>,
+    txn: &RoTxn<'_>,
+    vb: &[u8],
+    allowed: &HashSet<(PostingLocator, u32)>,
+) -> Result<bool> {
+    let mut prefix = POSTING_TAG.to_vec();
+    prefix.extend_from_slice(vb);
+    for item in db.prefix_iter(txn, prefix.as_slice())? {
+        let (key, bits) = item?;
+        let Some(locator) = posting_locator(key) else {
+            continue;
+        };
+        for (byte, &bits_byte) in bits.iter().enumerate() {
+            let mut value = bits_byte;
+            while value != 0 {
+                let bit = value.trailing_zeros();
+                let seq = (byte * 8) as u32 + bit;
+                if !allowed.contains(&(locator, seq)) {
+                    return Ok(true);
+                }
+                value &= value - 1;
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn posting_ids(
+    db: &Database<Bytes, Bytes>,
+    txn: &RoTxn<'_>,
+    bounds: &index::RangeBytes,
+) -> Result<HashSet<String>> {
+    let posting_bounds = posting_bounds(bounds);
+    let range = (as_bound(&posting_bounds.0), as_bound(&posting_bounds.1));
+    let mut ids = HashSet::new();
+    for item in db.range(txn, &range)? {
+        let (key, bits) = item?;
+        let Some(locator) = posting_locator(key) else {
+            continue;
+        };
+        for (byte, &bits_byte) in bits.iter().enumerate() {
+            let mut value = bits_byte;
+            while value != 0 {
+                let bit = value.trailing_zeros();
+                let seq = (byte * 8) as u32 + bit;
+                ids.insert(crate::timeseries::row_id(
+                    locator.0, locator.1, locator.2, locator.3, seq,
+                ));
+                value &= value - 1;
+            }
+        }
+    }
+    Ok(ids)
+}
 
 /// `find` query parameters.
 #[derive(Debug, Clone, Default)]
@@ -704,6 +835,9 @@ impl<'e> Collection<'e> {
         let Some(plan) = self.query_index_plan(rtxn, filter, hint)? else {
             return Ok(None);
         };
+        if plan.def.postings && !plan.def.geo {
+            return Ok(Some(posting_ids(&plan.db, rtxn, &plan.bounds)?));
+        }
         let range = (as_bound(&plan.bounds.0), as_bound(&plan.bounds.1));
         let mut ids = HashSet::new();
         for item in plan.db.range(rtxn, &range)? {
@@ -1232,6 +1366,9 @@ impl<'e> Collection<'e> {
                 def.directions = spec.directions.clone();
                 def.directions_encoded = def.directions.iter().any(|direction| *direction < 0);
             }
+            if self.profile.is_timeseries() && !def.geo {
+                def.postings = true;
+            }
             let name = def.name();
             if name == "_id_" {
                 return Err(Error::Query("index name `_id_` is reserved".into()));
@@ -1384,21 +1521,38 @@ impl<'e> Collection<'e> {
                                 multikey_fields[slot].push(field.clone());
                             }
                         }
-                        let value = index::encode_index_value(def, doc, id);
-                        for vb in keys.keys {
-                            if def.unique {
-                                for item in db.prefix_iter(&*wtxn, vb.as_slice())? {
-                                    let (_key, existing) = item?;
-                                    if index::decode_index_value(existing)
-                                        .is_some_and(|(existing_id, _)| existing_id != *id)
-                                    {
-                                        return Err(Error::DuplicateKey(id.clone()));
+                        if def.geo {
+                            let value = index::encode_index_value(def, doc, id);
+                            for vb in keys.keys {
+                                if def.unique {
+                                    for item in db.prefix_iter(&*wtxn, vb.as_slice())? {
+                                        let (_key, existing) = item?;
+                                        if index::decode_index_value(existing)
+                                            .is_some_and(|(existing_id, _)| existing_id != *id)
+                                        {
+                                            return Err(Error::DuplicateKey(id.clone()));
+                                        }
                                     }
                                 }
+                                let mut key = vb;
+                                key.extend_from_slice(id.as_bytes());
+                                db.put(&mut *wtxn, key.as_slice(), value.as_slice())?;
                             }
-                            let mut key = vb;
-                            key.extend_from_slice(id.as_bytes());
-                            db.put(&mut *wtxn, key.as_slice(), value.as_slice())?;
+                            continue;
+                        }
+                        let Some((hash, salt, window, serial, seq)) =
+                            crate::timeseries::locator_for_id(&*wtxn, self.env, &self.name, id)?
+                        else {
+                            continue;
+                        };
+                        let locator = (hash, salt, window, serial);
+                        let allowed: HashSet<(PostingLocator, u32)> =
+                            std::iter::once((locator, seq)).collect();
+                        for vb in keys.keys {
+                            if def.unique && posting_conflict(db, &*wtxn, &vb, &allowed)? {
+                                return Err(Error::DuplicateKey(id.clone()));
+                            }
+                            posting_update(db, wtxn, &vb, locator, seq, true)?;
                         }
                     }
                 }
@@ -1557,6 +1711,9 @@ impl<'e> Collection<'e> {
         def.sparse = sparse;
         def.partial_filter_expression = partial_filter_expression;
         validate_partial_filter(def.partial_filter_expression.as_ref())?;
+        if self.profile.is_timeseries() && !def.geo {
+            def.postings = true;
+        }
         let key = index::def_key(&self.name, &def.name());
         self.meta.put(
             &mut *wtxn,
@@ -1690,6 +1847,21 @@ impl<'e> Collection<'e> {
             let Some(db) = self.index_db(txn, &def)? else {
                 continue;
             };
+            if def.postings && !def.geo {
+                let allowed: HashSet<(PostingLocator, u32)> =
+                    crate::timeseries::locator_for_id(txn, self.env, &self.name, id)?
+                        .map(|(hash, salt, window, serial, seq)| {
+                            ((hash, salt, window, serial), seq)
+                        })
+                        .into_iter()
+                        .collect();
+                for vb in keys.keys {
+                    if posting_conflict(&db, txn, &vb, &allowed)? {
+                        return Err(Error::DuplicateKey(id.to_string()));
+                    }
+                }
+                continue;
+            }
             for vb in keys.keys {
                 for item in db.prefix_iter(txn, vb.as_slice())? {
                     let (_key, existing) = item?;
@@ -1715,6 +1887,7 @@ impl<'e> Collection<'e> {
                 continue;
             };
             let mut seen: HashSet<Vec<u8>> = HashSet::new();
+            let no_locators: HashSet<(PostingLocator, u32)> = HashSet::new();
             for doc in docs {
                 let id = doc
                     .get("_id")
@@ -1724,6 +1897,12 @@ impl<'e> Collection<'e> {
                 for vb in keys.keys {
                     if !seen.insert(vb.clone()) {
                         return Err(Error::DuplicateKey(id));
+                    }
+                    if def.postings && !def.geo {
+                        if posting_conflict(&db, txn, &vb, &no_locators)? {
+                            return Err(Error::DuplicateKey(id));
+                        }
+                        continue;
                     }
                     for item in db.prefix_iter(txn, vb.as_slice())? {
                         let (_key, existing) = item?;
@@ -1752,11 +1931,27 @@ impl<'e> Collection<'e> {
                 continue;
             };
             let mut seen: HashSet<Vec<u8>> = HashSet::new();
+            let mut allowed: HashSet<(PostingLocator, u32)> = HashSet::new();
+            if def.postings && !def.geo {
+                for id in &updated {
+                    if let Some((hash, salt, window, serial, seq)) =
+                        crate::timeseries::locator_for_id(txn, self.env, &self.name, id)?
+                    {
+                        allowed.insert(((hash, salt, window, serial), seq));
+                    }
+                }
+            }
             for (id, doc) in updates {
                 let keys = index::encode_index_keys(&def, doc)?;
                 for vb in keys.keys {
                     if !seen.insert(vb.clone()) {
                         return Err(Error::DuplicateKey(id.clone()));
+                    }
+                    if def.postings && !def.geo {
+                        if posting_conflict(&db, txn, &vb, &allowed)? {
+                            return Err(Error::DuplicateKey(id.clone()));
+                        }
+                        continue;
                     }
                     for item in db.prefix_iter(txn, vb.as_slice())? {
                         let (_key, existing) = item?;
@@ -1794,6 +1989,59 @@ impl<'e> Collection<'e> {
         Ok(())
     }
 
+    fn apply_timeseries_posting_entries(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        def: &IndexDef,
+        old: Option<&Value>,
+        new: Option<&Value>,
+        id: &str,
+    ) -> Result<()> {
+        let empty = index::IndexKeys {
+            keys: Vec::new(),
+            multikey_fields: Vec::new(),
+        };
+        let mut old_keys = old
+            .map(|doc| index::encode_index_keys(def, doc))
+            .transpose()?
+            .unwrap_or(empty);
+        let new_keys = new
+            .map(|doc| index::encode_index_keys(def, doc))
+            .transpose()?
+            .unwrap_or(index::IndexKeys {
+                keys: Vec::new(),
+                multikey_fields: Vec::new(),
+            });
+        old_keys.keys.sort();
+        old_keys.keys.dedup();
+        if old_keys.keys == new_keys.keys {
+            return Ok(());
+        }
+        let Some((hash, salt, window, serial, seq)) =
+            crate::timeseries::locator_for_id(&*wtxn, self.env, &self.name, id)?
+        else {
+            return Ok(());
+        };
+        let locator = (hash, salt, window, serial);
+        let idx_db = self.index_db_in(wtxn, def)?;
+        let allowed: HashSet<(PostingLocator, u32)> = std::iter::once((locator, seq)).collect();
+        for vb in &old_keys.keys {
+            if !new_keys.keys.contains(vb) {
+                posting_update(&idx_db, wtxn, vb, locator, seq, false)?;
+            }
+        }
+        for vb in &new_keys.keys {
+            if old_keys.keys.contains(vb) {
+                continue;
+            }
+            if def.unique && posting_conflict(&idx_db, &*wtxn, vb, &allowed)? {
+                return Err(Error::DuplicateKey(id.to_string()));
+            }
+            posting_update(&idx_db, wtxn, vb, locator, seq, true)?;
+        }
+        Ok(())
+    }
+
     /// Updates index entries for an `old -> new` change (insert: `old=None`,
     /// delete: `new=None`).
     fn apply_index_entries(
@@ -1805,6 +2053,10 @@ impl<'e> Collection<'e> {
     ) -> Result<()> {
         let defs = self.index_defs(&*wtxn)?;
         for mut def in defs {
+            if self.profile.is_timeseries() && def.postings && !def.geo {
+                self.apply_timeseries_posting_entries(wtxn, &def, old, new, id)?;
+                continue;
+            }
             let mut old_keys = old
                 .map(|doc| index::encode_index_keys(&def, doc))
                 .transpose()?

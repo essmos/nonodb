@@ -1503,6 +1503,9 @@ fn key_parts(key: &[u8]) -> Option<(u64, u32, i64, u16)> {
     Some((hash, salt, window, serial))
 }
 
+/// Physical location and sequence of one time-series row.
+pub type RowLocator = (u64, u32, i64, u16, u32);
+
 /// Physical location of one time-series bucket.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct BucketLocator {
@@ -2399,7 +2402,7 @@ fn row_json_bytes(doc: &Value) -> u64 {
 /// Encodes the full physical location (series hash, salt, window, bucket
 /// serial, row sequence) so `find_by_key` can jump straight to the row instead
 /// of scanning the collection.
-fn row_id(hash: u64, salt: u32, window_start: i64, serial: u16, seq: u32) -> String {
+pub(crate) fn row_id(hash: u64, salt: u32, window_start: i64, serial: u16, seq: u32) -> String {
     format!(
         "{hash:016x}{salt:08x}{:016x}{serial:04x}{seq:08x}",
         window_start as u64
@@ -5585,6 +5588,34 @@ pub fn stats(rtxn: &RoTxn<'_>, env: &heed::Env, name: &str, settings: &Settings)
         }
     }
     Ok(stats)
+}
+
+/// Resolves a row `_id` to its bucket locator and sequence.
+pub fn locator_for_id(
+    rtxn: &RoTxn<'_>,
+    env: &heed::Env,
+    name: &str,
+    id: &str,
+) -> Result<Option<RowLocator>> {
+    if let Some(locator) = parse_row_id(id) {
+        return Ok(Some(locator));
+    }
+    let Some(db) =
+        env.open_database::<Bytes, Bytes>(rtxn, Some(&format!("{BUCKET_DB_PREFIX}{name}")))?
+    else {
+        return Ok(None);
+    };
+    let Some(value) = db.get(rtxn, &user_key(id))? else {
+        return Ok(None);
+    };
+    if value.len() != 27 || value[0] != KEY_BUCKET {
+        return Ok(None);
+    }
+    let Some((hash, salt, window, serial)) = key_parts(&value[..23]) else {
+        return Ok(None);
+    };
+    let seq = u32::from_be_bytes(value[23..27].try_into().expect("4 bytes"));
+    Ok(Some((hash, salt, window, serial, seq)))
 }
 
 /// Lists every sealed bucket key in a collection.
