@@ -13,7 +13,7 @@ use std::sync::Arc;
 use bigdecimal::num_traits::{ToPrimitive, Zero};
 use bigdecimal::{BigDecimal, FromPrimitive};
 use rand::seq::SliceRandom;
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 use time::{Date, Duration, Month, OffsetDateTime, Time, UtcOffset, Weekday};
 
 use crate::bson_types;
@@ -821,6 +821,14 @@ pub(crate) fn run_with_host_vars(
                     docs = fill(docs, arg, vars)?;
                     i += 1;
                 }
+                "$timeBucketGapfill" => {
+                    docs = time_bucket_gapfill(docs, arg, vars)?;
+                    i += 1;
+                }
+                "$marketSession" => {
+                    docs = market_session(docs, arg, vars)?;
+                    i += 1;
+                }
                 "$out" | "$merge" => {
                     return Err(Error::Query(format!(
                         "{name} must be executed by the writer"
@@ -1168,6 +1176,17 @@ impl GroupBuilder {
                     | "$push"
                     | "$addToSet"
                     | "$count"
+                    | "$percentile"
+                    | "$median"
+                    | "$stdDevPop"
+                    | "$stdDevSamp"
+                    | "$histogram"
+                    | "$counterAgg"
+                    | "$gaugeAgg"
+                    | "$vwap"
+                    | "$corr"
+                    | "$covariance"
+                    | "$regression"
             ) {
                 return Err(Error::Query(format!(
                     "unsupported group accumulator `{op}`"
@@ -1188,9 +1207,20 @@ impl GroupBuilder {
     /// set semantics but its array order follows discovery, so it stays on the
     /// sequential path as well.
     pub(crate) fn order_independent(&self) -> bool {
-        self.accumulators
-            .iter()
-            .all(|(_, op, _)| matches!(op.as_str(), "$sum" | "$avg" | "$min" | "$max" | "$count"))
+        self.accumulators.iter().all(|(_, op, _)| {
+            matches!(
+                op.as_str(),
+                "$sum"
+                    | "$avg"
+                    | "$min"
+                    | "$max"
+                    | "$count"
+                    | "$percentile"
+                    | "$median"
+                    | "$stdDevPop"
+                    | "$stdDevSamp"
+            )
+        })
     }
 
     pub(crate) fn update(&mut self, doc: Value) -> Result<()> {
@@ -1201,12 +1231,50 @@ impl GroupBuilder {
             values: self
                 .accumulators
                 .iter()
-                .map(|(_, op, _)| Accumulator::new(op))
+                .map(|(_, op, arg)| Accumulator::new(op, arg))
                 .collect(),
         });
         for ((_, op, arg), state) in self.accumulators.iter().zip(group.values.iter_mut()) {
             let value = if op == "$count" {
                 Value::Null
+            } else if op == "$percentile" || op == "$histogram" {
+                let input = arg
+                    .get("input")
+                    .ok_or_else(|| Error::Query(format!("{op} requires `input`")))?;
+                eval_expr_vars(&doc, input, &self.vars)?
+            } else if op == "$vwap" {
+                let price = arg
+                    .get("price")
+                    .ok_or_else(|| Error::Query("$vwap requires `price`".into()))?;
+                let volume = arg
+                    .get("volume")
+                    .ok_or_else(|| Error::Query("$vwap requires `volume`".into()))?;
+                json!({
+                    "price": eval_expr_vars(&doc, price, &self.vars)?,
+                    "volume": eval_expr_vars(&doc, volume, &self.vars)?,
+                })
+            } else if op == "$corr" || op == "$covariance" || op == "$regression" {
+                let x = arg
+                    .get("x")
+                    .ok_or_else(|| Error::Query(format!("{op} requires `x`")))?;
+                let y = arg
+                    .get("y")
+                    .ok_or_else(|| Error::Query(format!("{op} requires `y`")))?;
+                json!({
+                    "x": eval_expr_vars(&doc, x, &self.vars)?,
+                    "y": eval_expr_vars(&doc, y, &self.vars)?,
+                })
+            } else if op == "$counterAgg" || op == "$gaugeAgg" {
+                let input = arg
+                    .get("input")
+                    .ok_or_else(|| Error::Query(format!("{op} requires `input`")))?;
+                let time = arg
+                    .get("time")
+                    .ok_or_else(|| Error::Query(format!("{op} requires `time`")))?;
+                json!({
+                    "value": eval_expr_vars(&doc, input, &self.vars)?,
+                    "time": eval_expr_vars(&doc, time, &self.vars)?,
+                })
             } else {
                 eval_expr_vars(&doc, arg, &self.vars)?
             };
@@ -1477,6 +1545,14 @@ enum WindowOp {
         input: Value,
         unit: Option<String>,
     },
+    Returns {
+        input: Value,
+        log: bool,
+    },
+    Financial {
+        kind: String,
+        spec: Value,
+    },
 }
 
 fn valid_date_unit(unit: &str) -> bool {
@@ -1576,7 +1652,8 @@ fn parse_window_frame(value: &Value) -> Result<WindowFrame> {
 fn parse_window_op(name: &str, arg: &Value) -> Result<WindowOp> {
     match name {
         "$sum" | "$avg" | "$min" | "$max" | "$first" | "$last" | "$push" | "$addToSet"
-        | "$count" => Ok(WindowOp::Accumulator(name.to_string(), arg.clone())),
+        | "$count" | "$percentile" | "$median" | "$stdDevPop" | "$stdDevSamp" | "$histogram"
+        | "$counterAgg" | "$gaugeAgg" => Ok(WindowOp::Accumulator(name.to_string(), arg.clone())),
         "$rank" | "$denseRank" | "$documentNumber" => {
             if !arg.is_object() {
                 return Err(Error::Query(format!("{name} requires an object argument")));
@@ -1587,6 +1664,15 @@ fn parse_window_op(name: &str, arg: &Value) -> Result<WindowOp> {
                 _ => WindowOp::DocumentNumber,
             })
         }
+        "$sma" | "$ema" | "$rsi" | "$macd" | "$bollinger" | "$atr" | "$drawdown"
+        | "$maxDrawdown" | "$sharpe" | "$sortino" => Ok(WindowOp::Financial {
+            kind: name.to_string(),
+            spec: arg.clone(),
+        }),
+        "$returns" | "$logReturns" => Ok(WindowOp::Returns {
+            input: arg.clone(),
+            log: name == "$logReturns",
+        }),
         "$shift" => {
             let spec = arg
                 .as_object()
@@ -2221,7 +2307,7 @@ fn window_sliding_values(
         return Ok(Some(out));
     }
 
-    let mut accumulator = Accumulator::new(op);
+    let mut accumulator = Accumulator::new(op, &Value::Null);
     let mut left = 0usize;
     let mut right = 0usize;
     for position in 0..len {
@@ -2249,7 +2335,7 @@ fn window_sliding_values(
         if start >= end {
             // Avoid a floating/decimal residual left by add/remove when the
             // frame becomes empty.
-            accumulator = Accumulator::new(op);
+            accumulator = Accumulator::new(op, &Value::Null);
             left = start;
             right = start;
         }
@@ -2858,12 +2944,32 @@ fn window_accumulator_values(
     sort: &[(String, i32)],
     vars: &BTreeMap<String, Value>,
 ) -> Result<Vec<Value>> {
+    let input = if op == "$percentile" || op == "$histogram" {
+        expression
+            .get("input")
+            .ok_or_else(|| Error::Query(format!("{op} requires `input`")))?
+    } else {
+        expression
+    };
     let values: Vec<Value> = if op == "$count" {
         vec![Value::Null; indices.len()]
+    } else if op == "$counterAgg" || op == "$gaugeAgg" {
+        let time = expression
+            .get("time")
+            .ok_or_else(|| Error::Query(format!("{op} requires `time`")))?;
+        indices
+            .iter()
+            .map(|index| {
+                Ok(json!({
+                    "value": eval_expr_vars(&docs[*index], input, vars)?,
+                    "time": eval_expr_vars(&docs[*index], time, vars)?,
+                }))
+            })
+            .collect::<Result<Vec<_>>>()?
     } else {
         indices
             .iter()
-            .map(|index| eval_expr_vars(&docs[*index], expression, vars))
+            .map(|index| eval_expr_vars(&docs[*index], input, vars))
             .collect::<Result<Vec<_>>>()?
     };
     let range_values = match window {
@@ -2878,7 +2984,7 @@ fn window_accumulator_values(
     let mut out = Vec::with_capacity(indices.len());
     if let Some(window) = window {
         for position in 0..indices.len() {
-            let mut accumulator = Accumulator::new(op);
+            let mut accumulator = Accumulator::new(op, expression);
             if let Some((start, end)) = frame_bounds(
                 Some(window),
                 position,
@@ -2901,7 +3007,7 @@ fn window_accumulator_values(
 
     // MongoDB's default window is unbounded to unbounded: the accumulator sees
     // the whole partition and every row receives the same result.
-    let mut accumulator = Accumulator::new(op);
+    let mut accumulator = Accumulator::new(op, expression);
     for value in &values {
         accumulator.update(op, value)?;
     }
@@ -3309,7 +3415,385 @@ fn window_output_values(
             sort,
             vars,
         ),
+        WindowOp::Returns { input, log } => window_return_values(docs, indices, input, *log, vars),
+        WindowOp::Financial { kind, spec } => {
+            window_financial_values(docs, indices, kind, spec, vars)
+        }
     }
+}
+
+fn window_series_values(
+    docs: &[Value],
+    indices: &[usize],
+    expression: &Value,
+    vars: &BTreeMap<String, Value>,
+) -> Result<Vec<Option<f64>>> {
+    let mut out = Vec::with_capacity(indices.len());
+    for index in indices {
+        out.push(
+            eval_expr_vars(&docs[*index], expression, vars)?
+                .as_f64()
+                .filter(|value| value.is_finite()),
+        );
+    }
+    Ok(out)
+}
+
+fn window_ema(values: &[Option<f64>], period: usize) -> Vec<Option<f64>> {
+    let alpha = 2.0 / (period as f64 + 1.0);
+    let mut out = Vec::with_capacity(values.len());
+    let mut current = None;
+    for value in values {
+        match (value, current) {
+            (Some(value), Some(previous)) => {
+                let next = alpha * value + (1.0 - alpha) * previous;
+                current = Some(next);
+                out.push(Some(next));
+            }
+            (Some(value), None) => {
+                current = Some(*value);
+                out.push(Some(*value));
+            }
+            _ => out.push(None),
+        }
+    }
+    out
+}
+
+fn window_financial_values(
+    docs: &[Value],
+    indices: &[usize],
+    kind: &str,
+    spec: &Value,
+    vars: &BTreeMap<String, Value>,
+) -> Result<Vec<Value>> {
+    let spec = spec
+        .as_object()
+        .ok_or_else(|| Error::Query(format!("{kind} requires an object")))?;
+    let values = if kind == "$atr" {
+        vec![None; indices.len()]
+    } else {
+        let input = spec
+            .get("input")
+            .ok_or_else(|| Error::Query(format!("{kind} requires `input`")))?;
+        window_series_values(docs, indices, input, vars)?
+    };
+    let period = spec
+        .get("period")
+        .and_then(Value::as_u64)
+        .unwrap_or(14)
+        .max(1) as usize;
+    let mut out = Vec::with_capacity(values.len());
+    match kind {
+        "$sma" => {
+            let mut sum = 0.0;
+            let mut count = 0usize;
+            for (index, value) in values.iter().enumerate() {
+                if let Some(value) = value {
+                    sum += value;
+                    count += 1;
+                }
+                if index >= period {
+                    if let Some(old) = values[index - period] {
+                        sum -= old;
+                        count -= 1;
+                    }
+                }
+                out.push(if index + 1 < period || count == 0 {
+                    Value::Null
+                } else {
+                    number_value(sum / count as f64)
+                });
+            }
+        }
+        "$ema" => {
+            out.extend(
+                window_ema(&values, period)
+                    .into_iter()
+                    .map(|value| value.map(number_value).unwrap_or(Value::Null)),
+            );
+        }
+        "$rsi" => {
+            let mut gains = Vec::new();
+            let mut losses = Vec::new();
+            for pair in values.windows(2) {
+                match (pair[0], pair[1]) {
+                    (Some(previous), Some(current)) => {
+                        let change = current - previous;
+                        gains.push(change.max(0.0));
+                        losses.push((-change).max(0.0));
+                    }
+                    _ => {
+                        gains.push(0.0);
+                        losses.push(0.0);
+                    }
+                }
+            }
+            out.push(Value::Null);
+            let mut avg_gain = None;
+            let mut avg_loss = None;
+            for index in 0..gains.len() {
+                if index + 1 < period {
+                    out.push(Value::Null);
+                } else if index + 1 == period {
+                    let gain = gains[..period].iter().sum::<f64>() / period as f64;
+                    let loss = losses[..period].iter().sum::<f64>() / period as f64;
+                    avg_gain = Some(gain);
+                    avg_loss = Some(loss);
+                    out.push(rsi_value(gain, loss));
+                } else {
+                    let gain = (avg_gain.unwrap_or(0.0) * (period as f64 - 1.0) + gains[index])
+                        / period as f64;
+                    let loss = (avg_loss.unwrap_or(0.0) * (period as f64 - 1.0) + losses[index])
+                        / period as f64;
+                    avg_gain = Some(gain);
+                    avg_loss = Some(loss);
+                    out.push(rsi_value(gain, loss));
+                }
+            }
+        }
+        "$bollinger" => {
+            let multiplier = spec
+                .get("multiplier")
+                .and_then(Value::as_f64)
+                .unwrap_or(2.0);
+            let mut sum = 0.0;
+            let mut sum_sq = 0.0;
+            let mut count = 0usize;
+            for (index, value) in values.iter().enumerate() {
+                if let Some(value) = value {
+                    sum += value;
+                    sum_sq += value * value;
+                    count += 1;
+                }
+                if index >= period {
+                    if let Some(old) = values[index - period] {
+                        sum -= old;
+                        sum_sq -= old * old;
+                        count -= 1;
+                    }
+                }
+                if index + 1 < period || count == 0 {
+                    out.push(Value::Null);
+                } else {
+                    let mean = sum / count as f64;
+                    let variance = (sum_sq / count as f64 - mean * mean).max(0.0);
+                    let deviation = variance.sqrt() * multiplier;
+                    out.push(json!({
+                        "middle": number_value(mean),
+                        "upper": number_value(mean + deviation),
+                        "lower": number_value(mean - deviation),
+                    }));
+                }
+            }
+        }
+        "$macd" => {
+            let fast = spec.get("fastPeriod").and_then(Value::as_u64).unwrap_or(12) as usize;
+            let slow = spec.get("slowPeriod").and_then(Value::as_u64).unwrap_or(26) as usize;
+            let signal = spec
+                .get("signalPeriod")
+                .and_then(Value::as_u64)
+                .unwrap_or(9) as usize;
+            let fast = window_ema(&values, fast.max(1));
+            let slow = window_ema(&values, slow.max(1));
+            let macd: Vec<Option<f64>> = fast
+                .iter()
+                .zip(&slow)
+                .map(|(fast, slow)| match (fast, slow) {
+                    (Some(fast), Some(slow)) => Some(fast - slow),
+                    _ => None,
+                })
+                .collect();
+            let signal_values = window_ema(&macd, signal.max(1));
+            for index in 0..values.len() {
+                match (macd[index], signal_values[index]) {
+                    (Some(macd), Some(signal)) => out.push(json!({
+                        "macd": number_value(macd),
+                        "signal": number_value(signal),
+                        "histogram": number_value(macd - signal),
+                    })),
+                    _ => out.push(Value::Null),
+                }
+            }
+        }
+        "$atr" => {
+            let high = window_series_values(
+                docs,
+                indices,
+                spec.get("high")
+                    .ok_or_else(|| Error::Query("$atr requires `high`".into()))?,
+                vars,
+            )?;
+            let low = window_series_values(
+                docs,
+                indices,
+                spec.get("low")
+                    .ok_or_else(|| Error::Query("$atr requires `low`".into()))?,
+                vars,
+            )?;
+            let close = window_series_values(
+                docs,
+                indices,
+                spec.get("close")
+                    .ok_or_else(|| Error::Query("$atr requires `close`".into()))?,
+                vars,
+            )?;
+            let mut ranges = Vec::with_capacity(values.len());
+            for index in 0..values.len() {
+                let Some(high) = high[index] else {
+                    ranges.push(None);
+                    continue;
+                };
+                let Some(low) = low[index] else {
+                    ranges.push(None);
+                    continue;
+                };
+                let previous_close = index.checked_sub(1).and_then(|index| close[index]);
+                ranges.push(Some(match previous_close {
+                    Some(previous) => (high - low)
+                        .max((high - previous).abs())
+                        .max((low - previous).abs()),
+                    None => high - low,
+                }));
+            }
+            let mut sum = 0.0;
+            for (index, range) in ranges.iter().enumerate() {
+                sum += range.unwrap_or(0.0);
+                if index >= period {
+                    sum -= ranges[index - period].unwrap_or(0.0);
+                }
+                out.push(
+                    if index + 1 < period || ranges[..=index].iter().any(Option::is_none) {
+                        Value::Null
+                    } else {
+                        number_value(sum / period as f64)
+                    },
+                );
+            }
+        }
+        "$drawdown" | "$maxDrawdown" => {
+            let mut peak = None;
+            let mut worst = 0.0f64;
+            for value in values {
+                if let Some(value) = value {
+                    if peak.is_none_or(|peak| value > peak) {
+                        peak = Some(value);
+                    }
+                    if let Some(peak) = peak.filter(|peak| *peak > 0.0) {
+                        let drawdown = value / peak - 1.0;
+                        worst = worst.min(drawdown);
+                        out.push(if kind == "$drawdown" {
+                            number_value(drawdown)
+                        } else {
+                            number_value(worst)
+                        });
+                    } else {
+                        out.push(Value::Null);
+                    }
+                } else {
+                    out.push(Value::Null);
+                }
+            }
+        }
+        "$sharpe" | "$sortino" => {
+            let annualization = spec
+                .get("annualization")
+                .and_then(Value::as_f64)
+                .unwrap_or(1.0)
+                .sqrt();
+            let risk_free = spec.get("riskFree").and_then(Value::as_f64).unwrap_or(0.0);
+            let mut window = Vec::new();
+            for (index, value) in values.iter().enumerate() {
+                window.push(value.map(|value| value - risk_free));
+                if window.len() > period {
+                    window.remove(0);
+                }
+                if index + 1 < period || window.iter().any(Option::is_none) {
+                    out.push(Value::Null);
+                    continue;
+                }
+                let numbers: Vec<f64> = window.iter().filter_map(|value| *value).collect();
+                let mean = numbers.iter().sum::<f64>() / numbers.len() as f64;
+                if kind == "$sharpe" {
+                    let variance = numbers
+                        .iter()
+                        .map(|value| (value - mean).powi(2))
+                        .sum::<f64>()
+                        / numbers.len() as f64;
+                    let deviation = variance.sqrt();
+                    out.push(if deviation == 0.0 {
+                        Value::Null
+                    } else {
+                        number_value(mean / deviation * annualization)
+                    });
+                } else {
+                    let downside = (numbers
+                        .iter()
+                        .map(|value| value.min(0.0).powi(2))
+                        .sum::<f64>()
+                        / numbers.len() as f64)
+                        .sqrt();
+                    out.push(if downside == 0.0 {
+                        Value::Null
+                    } else {
+                        number_value(mean / downside * annualization)
+                    });
+                }
+            }
+        }
+        _ => {
+            return Err(Error::Query(format!(
+                "unsupported financial function `{kind}`"
+            )))
+        }
+    }
+    Ok(out)
+}
+
+fn rsi_value(gain: f64, loss: f64) -> Value {
+    if loss == 0.0 {
+        Value::from(100)
+    } else {
+        number_value(100.0 - 100.0 / (1.0 + gain / loss))
+    }
+}
+
+fn window_return_values(
+    docs: &[Value],
+    indices: &[usize],
+    input: &Value,
+    log: bool,
+    vars: &BTreeMap<String, Value>,
+) -> Result<Vec<Value>> {
+    let mut values = Vec::with_capacity(indices.len());
+    for index in indices {
+        values.push(
+            eval_expr_vars(&docs[*index], input, vars)?
+                .as_f64()
+                .filter(|value| value.is_finite()),
+        );
+    }
+    let mut out = Vec::with_capacity(values.len());
+    for position in 0..values.len() {
+        let current = values[position];
+        let previous = position.checked_sub(1).and_then(|index| values[index]);
+        out.push(match (current, previous) {
+            (Some(current), Some(previous)) if previous != 0.0 => {
+                let ratio = current / previous;
+                if log {
+                    if ratio > 0.0 {
+                        number_value(ratio.ln())
+                    } else {
+                        Value::Null
+                    }
+                } else {
+                    number_value(ratio - 1.0)
+                }
+            }
+            _ => Value::Null,
+        });
+    }
+    Ok(out)
 }
 
 type WindowPartitionResult = (Vec<usize>, Vec<Vec<Value>>);
@@ -3438,6 +3922,8 @@ fn set_window_fields_with_workers(
                 | WindowOp::ExpMovingAvg { .. }
                 | WindowOp::Derivative { .. }
                 | WindowOp::Integral { .. }
+                | WindowOp::Returns { .. }
+                | WindowOp::Financial { .. }
         ) || matches!(
             &output.op,
             WindowOp::Accumulator(op, _) if op == "$first" || op == "$last"
@@ -3990,6 +4476,236 @@ fn fill_values(
     Ok(out)
 }
 
+fn nth_weekday(year: i32, month: Month, weekday: Weekday, nth: u8) -> Result<Date> {
+    let first = Date::from_calendar_date(year, month, 1)
+        .map_err(|error| Error::Query(format!("invalid calendar date: {error}")))?;
+    let offset = (weekday.number_from_monday() + 7 - first.weekday().number_from_monday()) % 7;
+    first
+        .checked_add(Duration::days(i64::from(offset) + 7 * i64::from(nth - 1)))
+        .ok_or_else(|| Error::Query("calendar date overflow".into()))
+}
+
+fn last_weekday(year: i32, month: Month, weekday: Weekday) -> Result<Date> {
+    let next = if month == Month::December {
+        Date::from_calendar_date(year + 1, Month::January, 1)
+    } else {
+        Date::from_calendar_date(year, month.next(), 1)
+    }
+    .map_err(|error| Error::Query(format!("invalid calendar date: {error}")))?;
+    let last = next
+        .checked_sub(Duration::days(1))
+        .ok_or_else(|| Error::Query("calendar date overflow".into()))?;
+    let offset = (last.weekday().number_from_monday() + 7 - weekday.number_from_monday()) % 7;
+    last.checked_sub(Duration::days(i64::from(offset)))
+        .ok_or_else(|| Error::Query("calendar date overflow".into()))
+}
+
+fn utc_ms(date: Date, hour: u8, minute: u8) -> Result<i64> {
+    let time = Time::from_hms(hour, minute, 0)
+        .map_err(|error| Error::Query(format!("invalid time: {error}")))?;
+    Ok(OffsetDateTime::new_utc(date, time).unix_timestamp() * 1000)
+}
+
+fn timezone_offset_minutes(ms: i64, zone: &str) -> Result<i32> {
+    let utc = OffsetDateTime::from_unix_timestamp(ms.div_euclid(1000))
+        .map_err(|error| Error::Query(format!("invalid timestamp: {error}")))?;
+    let year = utc.year();
+    match zone {
+        "UTC" => Ok(0),
+        "Asia/Tokyo" => Ok(9 * 60),
+        "America/New_York" => {
+            let start = utc_ms(nth_weekday(year, Month::March, Weekday::Sunday, 2)?, 7, 0)?;
+            let end = utc_ms(
+                nth_weekday(year, Month::November, Weekday::Sunday, 1)?,
+                6,
+                0,
+            )?;
+            Ok(if ms >= start && ms < end {
+                -4 * 60
+            } else {
+                -5 * 60
+            })
+        }
+        "Europe/London" => {
+            let start = utc_ms(last_weekday(year, Month::March, Weekday::Sunday)?, 1, 0)?;
+            let end = utc_ms(last_weekday(year, Month::October, Weekday::Sunday)?, 1, 0)?;
+            Ok(if ms >= start && ms < end { 60 } else { 0 })
+        }
+        "Europe/Warsaw" => {
+            let start = utc_ms(last_weekday(year, Month::March, Weekday::Sunday)?, 1, 0)?;
+            let end = utc_ms(last_weekday(year, Month::October, Weekday::Sunday)?, 1, 0)?;
+            Ok(if ms >= start && ms < end { 120 } else { 60 })
+        }
+        other => other
+            .parse::<i32>()
+            .map_err(|_| Error::Query(format!("unsupported market timezone `{other}`"))),
+    }
+}
+
+fn parse_session_minutes(value: &str) -> Result<i64> {
+    let (hour, minute) = value
+        .split_once(':')
+        .ok_or_else(|| Error::Query("market session time must be HH:MM".into()))?;
+    let hour = hour
+        .parse::<i64>()
+        .map_err(|_| Error::Query("invalid market session hour".into()))?;
+    let minute = minute
+        .parse::<i64>()
+        .map_err(|_| Error::Query("invalid market session minute".into()))?;
+    if !(0..24).contains(&hour) || !(0..60).contains(&minute) {
+        return Err(Error::Query("market session time is out of range".into()));
+    }
+    Ok(hour * 60 + minute)
+}
+
+fn market_session(
+    mut docs: Vec<Value>,
+    spec: &Value,
+    _vars: &BTreeMap<String, Value>,
+) -> Result<Vec<Value>> {
+    let spec = spec
+        .as_object()
+        .ok_or_else(|| Error::Query("$marketSession requires an object".into()))?;
+    let field = spec
+        .get("field")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::Query("$marketSession requires `field`".into()))?;
+    let zone = spec
+        .get("timezone")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::Query("$marketSession requires `timezone`".into()))?;
+    let output = spec
+        .get("output")
+        .and_then(Value::as_str)
+        .unwrap_or("session");
+    let sessions = spec
+        .get("sessions")
+        .and_then(Value::as_array)
+        .ok_or_else(|| Error::Query("$marketSession requires `sessions`".into()))?;
+    let mut parsed = Vec::new();
+    for session in sessions {
+        let session = session
+            .as_object()
+            .ok_or_else(|| Error::Query("market session must be an object".into()))?;
+        let name = session
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::Query("market session requires `name`".into()))?;
+        let start = parse_session_minutes(
+            session
+                .get("start")
+                .and_then(Value::as_str)
+                .ok_or_else(|| Error::Query("market session requires `start`".into()))?,
+        )?;
+        let end = parse_session_minutes(
+            session
+                .get("end")
+                .and_then(Value::as_str)
+                .ok_or_else(|| Error::Query("market session requires `end`".into()))?,
+        )?;
+        if end <= start {
+            return Err(Error::Query(
+                "market session must have end after start".into(),
+            ));
+        }
+        let days: Vec<u8> = session
+            .get("days")
+            .and_then(Value::as_array)
+            .map(|days| {
+                days.iter()
+                    .filter_map(Value::as_u64)
+                    .filter(|day| (1..=7).contains(day))
+                    .map(|day| day as u8)
+                    .collect()
+            })
+            .unwrap_or_else(|| vec![1, 2, 3, 4, 5]);
+        parsed.push((name.to_string(), start, end, days));
+    }
+    for doc in &mut docs {
+        let Some(ms) = path::get(doc, field).and_then(date::parse_value) else {
+            path::set(doc, output, Value::Null)?;
+            continue;
+        };
+        let offset = timezone_offset_minutes(ms, zone)?;
+        let local = OffsetDateTime::from_unix_timestamp(ms.div_euclid(1000))
+            .map_err(|error| Error::Query(format!("invalid timestamp: {error}")))?
+            .to_offset(
+                UtcOffset::from_whole_seconds(offset * 60)
+                    .map_err(|error| Error::Query(format!("invalid offset: {error}")))?,
+            );
+        let minutes = i64::from(local.hour()) * 60 + i64::from(local.minute());
+        let weekday = local.weekday().number_from_monday() as u8;
+        let label = parsed
+            .iter()
+            .find(|(_, start, end, days)| {
+                days.contains(&weekday) && minutes >= *start && minutes < *end
+            })
+            .map(|(name, ..)| Value::String(name.clone()))
+            .unwrap_or(Value::Null);
+        path::set(doc, output, label)?;
+    }
+    Ok(docs)
+}
+
+fn time_bucket_gapfill(
+    docs: Vec<Value>,
+    spec: &Value,
+    vars: &BTreeMap<String, Value>,
+) -> Result<Vec<Value>> {
+    let spec = spec
+        .as_object()
+        .ok_or_else(|| Error::Query("$timeBucketGapfill requires an object".into()))?;
+    let field = spec
+        .get("field")
+        .and_then(Value::as_str)
+        .filter(|field| !field.is_empty())
+        .ok_or_else(|| Error::Query("$timeBucketGapfill requires `field`".into()))?;
+    let unit = spec
+        .get("unit")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::Query("$timeBucketGapfill requires `unit`".into()))?;
+    let step = spec.get("step").cloned().unwrap_or_else(|| Value::from(1));
+    let bounds = spec
+        .get("bounds")
+        .cloned()
+        .unwrap_or_else(|| Value::String("partition".into()));
+    let partition = spec
+        .get("partitionByFields")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let output = spec
+        .get("output")
+        .cloned()
+        .ok_or_else(|| Error::Query("$timeBucketGapfill requires `output`".into()))?;
+    let mut densify_spec = Map::new();
+    densify_spec.insert("field".into(), Value::String(field.into()));
+    densify_spec.insert(
+        "range".into(),
+        json!({"step": step, "unit": unit, "bounds": bounds}),
+    );
+    if !partition.is_null() {
+        densify_spec.insert("partitionByFields".into(), partition.clone());
+    }
+    let mut docs = densify(docs, &Value::Object(densify_spec), vars)?;
+    let mut sort = Vec::new();
+    if let Some(fields) = partition.as_array() {
+        for field in fields {
+            if let Some(field) = field.as_str() {
+                sort.push((field.to_string(), 1));
+            }
+        }
+    }
+    sort.push((field.to_string(), 1));
+    docs.sort_by(|left, right| compare_docs(left, right, &sort));
+    let mut fill_spec = Map::new();
+    if !partition.is_null() {
+        fill_spec.insert("partitionByFields".into(), partition);
+    }
+    fill_spec.insert("sortBy".into(), json!({field: 1}));
+    fill_spec.insert("output".into(), output);
+    fill(docs, &Value::Object(fill_spec), vars)
+}
+
 fn fill(mut docs: Vec<Value>, spec: &Value, vars: &BTreeMap<String, Value>) -> Result<Vec<Value>> {
     let spec = spec
         .as_object()
@@ -4146,6 +4862,54 @@ impl NumericSum {
     }
 }
 
+fn percentile_ps(arg: &Value) -> Vec<f64> {
+    arg.get("p")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_f64)
+                .filter(|p| (0.0..=1.0).contains(p))
+                .collect()
+        })
+        .unwrap_or_else(|| vec![0.5])
+}
+
+fn histogram_boundaries(arg: &Value) -> Vec<f64> {
+    arg.get("boundaries")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_f64)
+                .filter(|value| value.is_finite())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn percentile_value(values: &[f64], p: f64) -> Value {
+    if values.is_empty() {
+        return Value::Null;
+    }
+    let rank = (values.len() - 1) as f64 * p.clamp(0.0, 1.0);
+    let lower = rank.floor() as usize;
+    let upper = rank.ceil() as usize;
+    if lower == upper {
+        number_value(values[lower])
+    } else {
+        let weight = rank - lower as f64;
+        number_value(values[lower] * (1.0 - weight) + values[upper] * weight)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PairMode {
+    Correlation,
+    Covariance,
+    Regression,
+}
+
 #[derive(Clone)]
 enum Accumulator {
     Sum(NumericSum),
@@ -4166,10 +4930,54 @@ enum Accumulator {
         values: Vec<Value>,
     },
     Count(u64),
+    Percentile {
+        ps: Vec<f64>,
+        values: Vec<f64>,
+    },
+    Median(Vec<f64>),
+    StdDev {
+        count: u64,
+        mean: f64,
+        m2: f64,
+        sample: bool,
+    },
+    Histogram {
+        boundaries: Vec<f64>,
+        counts: Vec<u64>,
+    },
+    CounterAgg {
+        last_value: Option<f64>,
+        last_time: Option<i64>,
+        start_time: Option<i64>,
+        delta: f64,
+        last_delta: f64,
+        last_interval: f64,
+        resets: u64,
+    },
+    GaugeAgg {
+        first_value: Option<f64>,
+        first_time: Option<i64>,
+        last_value: Option<f64>,
+        last_time: Option<i64>,
+        integral: f64,
+    },
+    Vwap {
+        weighted: f64,
+        volume: f64,
+    },
+    PairStats {
+        mode: PairMode,
+        count: u64,
+        sum_x: f64,
+        sum_y: f64,
+        sum_xx: f64,
+        sum_yy: f64,
+        sum_xy: f64,
+    },
 }
 
 impl Accumulator {
-    fn new(op: &str) -> Self {
+    fn new(op: &str, arg: &Value) -> Self {
         match op {
             "$sum" => Self::Sum(NumericSum::Float(0.0)),
             "$avg" => Self::Avg {
@@ -4189,6 +4997,57 @@ impl Accumulator {
                 values: Vec::new(),
             },
             "$count" => Self::Count(0),
+            "$percentile" => Self::Percentile {
+                ps: percentile_ps(arg),
+                values: Vec::new(),
+            },
+            "$median" => Self::Median(Vec::new()),
+            "$stdDevPop" | "$stdDevSamp" => Self::StdDev {
+                count: 0,
+                mean: 0.0,
+                m2: 0.0,
+                sample: op == "$stdDevSamp",
+            },
+            "$histogram" => {
+                let boundaries = histogram_boundaries(arg);
+                Self::Histogram {
+                    counts: vec![0; boundaries.len().saturating_sub(1)],
+                    boundaries,
+                }
+            }
+            "$counterAgg" => Self::CounterAgg {
+                last_value: None,
+                last_time: None,
+                start_time: None,
+                delta: 0.0,
+                last_delta: 0.0,
+                last_interval: 0.0,
+                resets: 0,
+            },
+            "$gaugeAgg" => Self::GaugeAgg {
+                first_value: None,
+                first_time: None,
+                last_value: None,
+                last_time: None,
+                integral: 0.0,
+            },
+            "$vwap" => Self::Vwap {
+                weighted: 0.0,
+                volume: 0.0,
+            },
+            "$corr" | "$covariance" | "$regression" => Self::PairStats {
+                mode: match op {
+                    "$corr" => PairMode::Correlation,
+                    "$covariance" => PairMode::Covariance,
+                    _ => PairMode::Regression,
+                },
+                count: 0,
+                sum_x: 0.0,
+                sum_y: 0.0,
+                sum_xx: 0.0,
+                sum_yy: 0.0,
+                sum_xy: 0.0,
+            },
             _ => unreachable!("validated accumulator"),
         }
     }
@@ -4243,6 +5102,152 @@ impl Accumulator {
                 }
             }
             (Self::Count(count), "$count") => *count += 1,
+            (
+                Self::CounterAgg {
+                    last_value,
+                    last_time,
+                    start_time,
+                    delta,
+                    last_delta,
+                    last_interval,
+                    resets,
+                },
+                "$counterAgg",
+            ) => {
+                let (Some(value), Some(time)) = (
+                    value.get("value").and_then(numeric::as_f64),
+                    value
+                        .get("time")
+                        .and_then(|time| date::parse_value(time).or_else(|| time.as_i64())),
+                ) else {
+                    return Ok(());
+                };
+                if !value.is_finite() {
+                    return Ok(());
+                }
+                if let (Some(previous), Some(previous_time)) = (*last_value, *last_time) {
+                    let interval = (time - previous_time) as f64 / 1000.0;
+                    if interval > 0.0 {
+                        let step = if value >= previous {
+                            value - previous
+                        } else {
+                            *resets += 1;
+                            value
+                        };
+                        if start_time.is_none() {
+                            *start_time = Some(previous_time);
+                        }
+                        *delta += step;
+                        *last_delta = step;
+                        *last_interval = interval;
+                        *last_value = Some(value);
+                        *last_time = Some(time);
+                    }
+                } else {
+                    *last_value = Some(value);
+                    *last_time = Some(time);
+                    *start_time = Some(time);
+                }
+            }
+            (
+                Self::GaugeAgg {
+                    first_value,
+                    first_time,
+                    last_value,
+                    last_time,
+                    integral,
+                },
+                "$gaugeAgg",
+            ) => {
+                let (Some(value), Some(time)) = (
+                    value.get("value").and_then(numeric::as_f64),
+                    value
+                        .get("time")
+                        .and_then(|time| date::parse_value(time).or_else(|| time.as_i64())),
+                ) else {
+                    return Ok(());
+                };
+                if !value.is_finite() {
+                    return Ok(());
+                }
+                if first_time.is_none() {
+                    *first_value = Some(value);
+                    *first_time = Some(time);
+                }
+                if let (Some(previous), Some(previous_time)) = (*last_value, *last_time) {
+                    *integral += (previous + value) * 0.5 * (time - previous_time) as f64 / 1000.0;
+                }
+                *last_value = Some(value);
+                *last_time = Some(time);
+            }
+            (Self::Vwap { weighted, volume }, "$vwap") => {
+                let (Some(price), Some(quantity)) = (
+                    value.get("price").and_then(numeric::as_f64),
+                    value.get("volume").and_then(numeric::as_f64),
+                ) else {
+                    return Ok(());
+                };
+                if price.is_finite() && quantity.is_finite() {
+                    *weighted += price * quantity;
+                    *volume += quantity;
+                }
+            }
+            (
+                Self::PairStats {
+                    count,
+                    sum_x,
+                    sum_y,
+                    sum_xx,
+                    sum_yy,
+                    sum_xy,
+                    ..
+                },
+                "$corr" | "$covariance" | "$regression",
+            ) => {
+                let (Some(x), Some(y)) = (
+                    value.get("x").and_then(numeric::as_f64),
+                    value.get("y").and_then(numeric::as_f64),
+                ) else {
+                    return Ok(());
+                };
+                if x.is_finite() && y.is_finite() {
+                    *count += 1;
+                    *sum_x += x;
+                    *sum_y += y;
+                    *sum_xx += x * x;
+                    *sum_yy += y * y;
+                    *sum_xy += x * y;
+                }
+            }
+            (Self::Percentile { values, .. }, "$percentile")
+            | (Self::Median(values), "$median") => {
+                if let Some(number) = numeric::as_f64(value).filter(|n| n.is_finite()) {
+                    values.push(number);
+                }
+            }
+            (Self::Histogram { boundaries, counts }, "$histogram") => {
+                if let Some(number) = numeric::as_f64(value).filter(|n| n.is_finite()) {
+                    if let Some(index) = boundaries
+                        .windows(2)
+                        .position(|pair| number >= pair[0] && number < pair[1])
+                    {
+                        counts[index] += 1;
+                    }
+                }
+            }
+            (
+                Self::StdDev {
+                    count, mean, m2, ..
+                },
+                "$stdDevPop" | "$stdDevSamp",
+            ) => {
+                if let Some(number) = numeric::as_f64(value).filter(|n| n.is_finite()) {
+                    *count += 1;
+                    let delta = number - *mean;
+                    *mean += delta / *count as f64;
+                    *m2 += delta * (number - *mean);
+                }
+            }
             _ => {
                 return Err(Error::Query("internal group accumulator mismatch".into()));
             }
@@ -4305,6 +5310,79 @@ impl Accumulator {
                 }
             }
             (Self::Count(left), Self::Count(right)) => *left = left.saturating_add(right),
+            (Self::Percentile { values: left, .. }, Self::Percentile { values: right, .. })
+            | (Self::Median(left), Self::Median(right)) => left.extend(right),
+            (
+                Self::StdDev {
+                    count: left_count,
+                    mean: left_mean,
+                    m2: left_m2,
+                    sample: left_sample,
+                },
+                Self::StdDev {
+                    count: right_count,
+                    mean: right_mean,
+                    m2: right_m2,
+                    sample: right_sample,
+                },
+            ) if *left_sample == right_sample => {
+                if right_count > 0 {
+                    let total = *left_count + right_count;
+                    let delta = right_mean - *left_mean;
+                    *left_mean += delta * right_count as f64 / total as f64;
+                    *left_m2 = *left_m2
+                        + right_m2
+                        + delta * delta * (*left_count as f64) * right_count as f64 / total as f64;
+                    *left_count = total;
+                }
+            }
+            (Self::Histogram { counts: left, .. }, Self::Histogram { counts: right, .. })
+                if left.len() == right.len() =>
+            {
+                for (left, right) in left.iter_mut().zip(right) {
+                    *left = left.saturating_add(right);
+                }
+            }
+            (
+                Self::Vwap {
+                    weighted: left_w,
+                    volume: left_v,
+                },
+                Self::Vwap {
+                    weighted: right_w,
+                    volume: right_v,
+                },
+            ) => {
+                *left_w += right_w;
+                *left_v += right_v;
+            }
+            (
+                Self::PairStats {
+                    mode: left_mode,
+                    count: left_count,
+                    sum_x: left_x,
+                    sum_y: left_y,
+                    sum_xx: left_xx,
+                    sum_yy: left_yy,
+                    sum_xy: left_xy,
+                },
+                Self::PairStats {
+                    mode: right_mode,
+                    count: right_count,
+                    sum_x: right_x,
+                    sum_y: right_y,
+                    sum_xx: right_xx,
+                    sum_yy: right_yy,
+                    sum_xy: right_xy,
+                },
+            ) if *left_mode as u8 == right_mode as u8 => {
+                *left_count += right_count;
+                *left_x += right_x;
+                *left_y += right_y;
+                *left_xx += right_xx;
+                *left_yy += right_yy;
+                *left_xy += right_xy;
+            }
             _ => {
                 return Err(Error::Query(
                     "internal group accumulator merge mismatch".into(),
@@ -4334,6 +5412,125 @@ impl Accumulator {
             Self::First { seen, value } => Ok(if seen { value } else { Value::Null }),
             Self::Push(values) | Self::AddToSet { values, .. } => Ok(Value::Array(values)),
             Self::Count(count) => Ok(Value::from(count)),
+            Self::Percentile { ps, mut values } => {
+                let mut out = Vec::with_capacity(ps.len());
+                values.sort_by(|left, right| left.partial_cmp(right).unwrap());
+                for p in ps {
+                    out.push(percentile_value(&values, p));
+                }
+                Ok(Value::Array(out))
+            }
+            Self::Median(mut values) => {
+                values.sort_by(|left, right| left.partial_cmp(right).unwrap());
+                Ok(percentile_value(&values, 0.5))
+            }
+            Self::CounterAgg {
+                last_value,
+                last_time,
+                start_time,
+                delta,
+                last_delta,
+                last_interval,
+                resets,
+            } => {
+                let duration = match (start_time, last_time) {
+                    (Some(start), Some(end)) => (end - start) as f64 / 1000.0,
+                    _ => 0.0,
+                };
+                Ok(json!({
+                    "delta": number_value(delta),
+                    "rate": if duration > 0.0 { number_value(delta / duration) } else { Value::Null },
+                    "irate": if last_interval > 0.0 { number_value(last_delta / last_interval) } else { Value::Null },
+                    "resets": resets,
+                    "last": last_value.map(number_value).unwrap_or(Value::Null),
+                    "last_time": last_time.map(Value::from).unwrap_or(Value::Null),
+                }))
+            }
+            Self::GaugeAgg {
+                first_value,
+                first_time,
+                last_value,
+                last_time,
+                integral,
+            } => {
+                let duration = match (first_time, last_time) {
+                    (Some(start), Some(end)) => (end - start) as f64 / 1000.0,
+                    _ => 0.0,
+                };
+                let delta = match (first_value, last_value) {
+                    (Some(first), Some(last)) => last - first,
+                    _ => 0.0,
+                };
+                Ok(json!({
+                    "integral": number_value(integral),
+                    "average": if duration > 0.0 { number_value(integral / duration) } else { Value::Null },
+                    "delta": number_value(delta),
+                    "first": first_value.map(number_value).unwrap_or(Value::Null),
+                    "last": last_value.map(number_value).unwrap_or(Value::Null),
+                }))
+            }
+            Self::Vwap { weighted, volume } => Ok(if volume == 0.0 {
+                Value::Null
+            } else {
+                number_value(weighted / volume)
+            }),
+            Self::PairStats {
+                mode,
+                count,
+                sum_x,
+                sum_y,
+                sum_xx,
+                sum_yy,
+                sum_xy,
+            } => {
+                if count < 2 {
+                    return Ok(Value::Null);
+                }
+                let n = count as f64;
+                let covariance = (sum_xy - sum_x * sum_y / n) / (n - 1.0);
+                let variance_x = sum_xx - sum_x * sum_x / n;
+                let variance_y = sum_yy - sum_y * sum_y / n;
+                match mode {
+                    PairMode::Covariance => Ok(number_value(covariance)),
+                    PairMode::Correlation => {
+                        let denominator = (variance_x * variance_y).sqrt();
+                        Ok(if denominator == 0.0 {
+                            Value::Null
+                        } else {
+                            number_value((sum_xy - sum_x * sum_y / n) / denominator)
+                        })
+                    }
+                    PairMode::Regression => {
+                        let slope = if variance_x == 0.0 {
+                            Value::Null
+                        } else {
+                            number_value((sum_xy - sum_x * sum_y / n) / variance_x)
+                        };
+                        let intercept = match slope.as_f64() {
+                            Some(slope) => number_value((sum_y - slope * sum_x) / n),
+                            None => Value::Null,
+                        };
+                        Ok(json!({"slope": slope, "intercept": intercept}))
+                    }
+                }
+            }
+            Self::Histogram { counts, .. } => {
+                Ok(Value::Array(counts.into_iter().map(Value::from).collect()))
+            }
+            Self::StdDev {
+                count, m2, sample, ..
+            } => {
+                let denominator = if sample {
+                    count.saturating_sub(1)
+                } else {
+                    count
+                };
+                if count == 0 || denominator == 0 {
+                    Ok(Value::Null)
+                } else {
+                    Ok(number_value((m2 / denominator as f64).sqrt()))
+                }
+            }
         }
     }
 }
@@ -7015,8 +8212,15 @@ mod tests {
         match &output.op {
             WindowOp::Accumulator(op, expression) => {
                 let mut out = Vec::with_capacity(indices.len());
+                let input = if op == "$percentile" {
+                    expression
+                        .get("input")
+                        .ok_or_else(|| Error::Query("$percentile requires `input`".into()))?
+                } else {
+                    expression
+                };
                 for position in 0..indices.len() {
-                    let mut accumulator = Accumulator::new(op);
+                    let mut accumulator = Accumulator::new(op, expression);
                     for frame_position in brute_frame_positions(
                         docs,
                         indices,
@@ -7028,7 +8232,7 @@ mod tests {
                         let value = if op == "$count" {
                             Value::Null
                         } else {
-                            eval_expr_vars(&docs[frame_index], expression, vars)?
+                            eval_expr_vars(&docs[frame_index], input, vars)?
                         };
                         accumulator.update(op, &value)?;
                     }
@@ -7383,5 +8587,261 @@ mod tests {
         let actual =
             set_window_fields_with_workers(docs, &spec, &BTreeMap::new(), Some(4)).unwrap();
         assert_eq!(actual, expected);
+    }
+    #[test]
+    fn statistical_accumulators_match_reference() {
+        let docs: Vec<Value> = [1.0, 2.0, 3.0, 4.0]
+            .into_iter()
+            .enumerate()
+            .map(|(index, value)| json!({"_id": index, "x": index, "v": value}))
+            .collect();
+        let mut builder = GroupBuilder::new(&json!({
+            "_id": null,
+            "median": {"$median": "$v"},
+            "p50": {"$percentile": {"input": "$v", "p": [0.5, 0.9]}},
+            "sd_pop": {"$stdDevPop": "$v"},
+            "sd_sample": {"$stdDevSamp": "$v"}
+        }))
+        .unwrap();
+        for doc in docs.clone() {
+            builder.update(doc).unwrap();
+        }
+        let grouped = builder.finish().unwrap();
+        assert_eq!(grouped[0]["median"], json!(2.5));
+        assert_eq!(grouped[0]["p50"], json!([2.5, 3.7]));
+        assert!((grouped[0]["sd_pop"].as_f64().unwrap() - 1.118_033_988_749_895).abs() < 1e-12);
+        assert!((grouped[0]["sd_sample"].as_f64().unwrap() - 1.290_994_448_736_379).abs() < 1e-12);
+
+        let spec = json!({
+            "sortBy": {"x": 1},
+            "output": {
+                "median": {"$median": "$v"},
+                "sd_pop": {"$stdDevPop": "$v"},
+                "sd_sample": {"$stdDevSamp": "$v"}
+            }
+        });
+        let windowed = set_window_fields(docs, &spec, &BTreeMap::new()).unwrap();
+        for row in &windowed {
+            assert_eq!(row["median"], json!(2.5));
+            assert!((row["sd_pop"].as_f64().unwrap() - 1.118_033_988_749_895).abs() < 1e-12);
+            assert!((row["sd_sample"].as_f64().unwrap() - 1.290_994_448_736_379).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn statistical_accumulators_ignore_nulls() {
+        let docs = vec![
+            json!({"x": 0, "v": 1.0}),
+            json!({"x": 1}),
+            json!({"x": 2, "v": 3.0}),
+        ];
+        let mut builder = GroupBuilder::new(&json!({
+            "_id": null,
+            "median": {"$median": "$v"},
+            "sd_pop": {"$stdDevPop": "$v"}
+        }))
+        .unwrap();
+        for doc in docs {
+            builder.update(doc).unwrap();
+        }
+        let grouped = builder.finish().unwrap();
+        assert_eq!(grouped[0]["median"], json!(2));
+        assert!((grouped[0]["sd_pop"].as_f64().unwrap() - 1.0).abs() < 1e-12);
+    }
+    #[test]
+    fn histogram_counts_half_open_boundaries() {
+        let docs = vec![
+            json!({"x": 0, "v": -1.0}),
+            json!({"x": 1, "v": 0.0}),
+            json!({"x": 2, "v": 9.9}),
+            json!({"x": 3, "v": 10.0}),
+            json!({"x": 4, "v": 99.0}),
+            json!({"x": 5, "v": null}),
+        ];
+        let mut builder = GroupBuilder::new(&json!({
+            "_id": null,
+            "hist": {"$histogram": {"input": "$v", "boundaries": [0, 10, 100]}}
+        }))
+        .unwrap();
+        for doc in docs.clone() {
+            builder.update(doc).unwrap();
+        }
+        assert_eq!(builder.finish().unwrap()[0]["hist"], json!([2, 2]));
+        let spec = json!({
+            "sortBy": {"x": 1},
+            "output": {"hist": {"$histogram": {"input": "$v", "boundaries": [0, 10, 100]}}}
+        });
+        let windowed = set_window_fields(docs, &spec, &BTreeMap::new()).unwrap();
+        for row in windowed {
+            assert_eq!(row["hist"], json!([2, 2]));
+        }
+    }
+    #[test]
+    fn time_bucket_gapfill_fills_and_interpolates() {
+        let base = 1_700_000_000_000i64;
+        let minute = 60_000i64;
+        let date = |ms: i64| json!({"$date": {"$numberLong": ms.to_string()}});
+        let docs = vec![
+            json!({"ts": date(base), "v": 0.0, "symbol": "A"}),
+            json!({"ts": date(base + 4 * minute), "v": 40.0, "symbol": "A"}),
+        ];
+        let filled = time_bucket_gapfill(
+            docs,
+            &json!({
+                "field": "ts",
+                "unit": "minute",
+                "bounds": [date(base), date(base + 4 * minute)],
+                "partitionByFields": ["symbol"],
+                "output": {"v": {"method": "linear"}}
+            }),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(filled.len(), 5);
+        for (index, doc) in filled.iter().enumerate() {
+            assert!((doc["v"].as_f64().unwrap() - index as f64 * 10.0).abs() < 1e-12);
+        }
+    }
+    #[test]
+    fn counter_and_gauge_aggregates_handle_resets_and_time_weight() {
+        let base = 1_700_000_000_000i64;
+        let date = |ms: i64| json!({"$date": {"$numberLong": ms.to_string()}});
+        let docs = vec![
+            json!({"x": 0, "ts": date(base), "counter": 10.0, "gauge": 10.0}),
+            json!({"x": 1, "ts": date(base + 1000), "counter": 15.0, "gauge": 20.0}),
+            json!({"x": 2, "ts": date(base + 2000), "counter": 3.0, "gauge": 20.0}),
+            json!({"x": 3, "ts": date(base + 3000), "counter": 8.0, "gauge": 10.0}),
+        ];
+        let mut builder = GroupBuilder::new(&json!({
+            "_id": null,
+            "counter": {"$counterAgg": {"input": "$counter", "time": "$ts"}},
+            "gauge": {"$gaugeAgg": {"input": "$gauge", "time": "$ts"}}
+        }))
+        .unwrap();
+        for doc in docs {
+            builder.update(doc).unwrap();
+        }
+        let result = builder.finish().unwrap();
+        let counter = &result[0]["counter"];
+        assert!((counter["delta"].as_f64().unwrap() - 13.0).abs() < 1e-12);
+        assert_eq!(counter["resets"], json!(1));
+        assert!((counter["rate"].as_f64().unwrap() - 13.0 / 3.0).abs() < 1e-12);
+        assert!((counter["irate"].as_f64().unwrap() - 5.0).abs() < 1e-12);
+        let gauge = &result[0]["gauge"];
+        assert!((gauge["integral"].as_f64().unwrap() - 50.0).abs() < 1e-12);
+        assert!((gauge["average"].as_f64().unwrap() - 50.0 / 3.0).abs() < 1e-12);
+        assert_eq!(gauge["delta"], json!(0));
+    }
+    #[test]
+    fn financial_primitives_match_reference() {
+        let docs = vec![
+            json!({"x": 0, "price": 10.0, "volume": 1.0, "a": 1.0, "b": 2.0}),
+            json!({"x": 1, "price": 20.0, "volume": 3.0, "a": 2.0, "b": 4.0}),
+            json!({"x": 2, "price": 30.0, "volume": 2.0, "a": 3.0, "b": 6.0}),
+        ];
+        let mut builder = GroupBuilder::new(&json!({
+            "_id": null,
+            "vwap": {"$vwap": {"price": "$price", "volume": "$volume"}},
+            "corr": {"$corr": {"x": "$a", "y": "$b"}},
+            "cov": {"$covariance": {"x": "$a", "y": "$b"}},
+            "reg": {"$regression": {"x": "$a", "y": "$b"}}
+        }))
+        .unwrap();
+        for doc in docs.clone() {
+            builder.update(doc).unwrap();
+        }
+        let result = builder.finish().unwrap();
+        assert!((result[0]["vwap"].as_f64().unwrap() - 130.0 / 6.0).abs() < 1e-12);
+        assert!((result[0]["corr"].as_f64().unwrap() - 1.0).abs() < 1e-12);
+        assert!((result[0]["cov"].as_f64().unwrap() - 2.0).abs() < 1e-12);
+        assert!((result[0]["reg"]["slope"].as_f64().unwrap() - 2.0).abs() < 1e-12);
+        assert!((result[0]["reg"]["intercept"].as_f64().unwrap() - 0.0).abs() < 1e-12);
+
+        let spec = json!({
+            "sortBy": {"x": 1},
+            "output": {
+                "ret": {"$returns": "$price"},
+                "logret": {"$logReturns": "$price"}
+            }
+        });
+        let windowed = set_window_fields(docs, &spec, &BTreeMap::new()).unwrap();
+        assert_eq!(windowed[0]["ret"], Value::Null);
+        assert!((windowed[1]["ret"].as_f64().unwrap() - 1.0).abs() < 1e-12);
+        assert!((windowed[2]["ret"].as_f64().unwrap() - 0.5).abs() < 1e-12);
+        assert!((windowed[1]["logret"].as_f64().unwrap() - 2.0f64.ln()).abs() < 1e-12);
+    }
+    #[test]
+    fn financial_indicators_and_risk_match_reference() {
+        let docs: Vec<Value> = (1..=5)
+            .map(|value| {
+                json!({
+                    "x": value,
+                    "v": value as f64,
+                    "high": value as f64 + 1.0,
+                    "low": value as f64 - 1.0
+                })
+            })
+            .collect();
+        let spec = json!({
+            "sortBy": {"x": 1},
+            "output": {
+                "sma": {"$sma": {"input": "$v", "period": 3}},
+                "boll": {"$bollinger": {"input": "$v", "period": 3}},
+                "rsi": {"$rsi": {"input": "$v", "period": 3}},
+                "atr": {"$atr": {"high": "$high", "low": "$low", "close": "$v", "period": 3}},
+                "dd": {"$drawdown": {"input": "$v"}}
+            }
+        });
+        let out = set_window_fields(docs, &spec, &BTreeMap::new()).unwrap();
+        assert_eq!(out[0]["sma"], Value::Null);
+        assert_eq!(out[2]["sma"], json!(2));
+        assert_eq!(out[4]["sma"], json!(4));
+        assert!((out[2]["boll"]["middle"].as_f64().unwrap() - 2.0).abs() < 1e-12);
+        assert!(
+            (out[2]["boll"]["upper"].as_f64().unwrap() - (2.0 + 2.0 * (2.0f64 / 3.0).sqrt())).abs()
+                < 1e-12
+        );
+        assert_eq!(out[4]["rsi"], json!(100));
+        assert!((out[4]["atr"].as_f64().unwrap() - 2.0).abs() < 1e-12);
+        assert_eq!(out[0]["dd"], json!(0));
+        assert_eq!(out[4]["dd"], json!(0));
+    }
+    #[test]
+    fn market_sessions_respect_timezone_and_dst() {
+        let date = |ms: i64| json!({"$date": {"$numberLong": ms.to_string()}});
+        let ms = |year: i32, month: Month, day: u8, hour: u8| {
+            utc_ms(Date::from_calendar_date(year, month, day).unwrap(), hour, 0).unwrap()
+        };
+        let docs = vec![
+            json!({"x": 0, "ts": date(1_700_000_000_000i64)}),
+            json!({"x": 1, "ts": date(ms(2026, Month::July, 1, 14))}),
+            json!({"x": 2, "ts": date(ms(2026, Month::January, 5, 15))}),
+            json!({"x": 3, "ts": date(ms(2026, Month::July, 1, 4))}),
+        ];
+        let out = market_session(
+            docs,
+            &json!({
+                "field": "ts",
+                "timezone": "America/New_York",
+                "sessions": [{"name": "NY", "start": "09:30", "end": "16:00", "days": [1,2,3,4,5]}]
+            }),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(out[1]["session"], json!("NY"));
+        assert_eq!(out[2]["session"], json!("NY"));
+        assert_eq!(out[3]["session"], Value::Null);
+
+        let fixed = market_session(
+            vec![json!({"ts": date(ms(2026, Month::July, 1, 10))})],
+            &json!({
+                "field": "ts",
+                "timezone": "0",
+                "sessions": [{"name": "UTC", "start": "09:00", "end": "17:00", "days": [3]}]
+            }),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(fixed[0]["session"], json!("UTC"));
     }
 }

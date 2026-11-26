@@ -8026,16 +8026,16 @@ impl<'e> Collection<'e> {
         let Some(group) = pipeline[group_at].get("$group").and_then(Value::as_object) else {
             return Ok(None);
         };
-        let unit = group
-            .get("_id")
-            .and_then(|id| {
-                id.get("bucket")
-                    .and_then(|bucket| bucket.get("$dateTrunc"))
-                    .or_else(|| id.get("$dateTrunc"))
-            })
-            .and_then(|trunc| trunc.get("unit"))
-            .and_then(Value::as_str);
-        let Some(unit) = unit.filter(|unit| matches!(*unit, "hour" | "day")) else {
+        let Some(trunc) = group.get("_id").and_then(|id| {
+            id.get("bucket")
+                .and_then(|bucket| bucket.get("$dateTrunc"))
+                .or_else(|| id.get("$dateTrunc"))
+        }) else {
+            return Ok(None);
+        };
+        let Some((unit, _unit_byte, _window_size)) =
+            crate::timeseries::rollup_spec_for_trunc(trunc)
+        else {
             return Ok(None);
         };
         for (field, accumulator) in group {
@@ -8068,14 +8068,14 @@ impl<'e> Collection<'e> {
                 ]
             });
             let mut hour_partial = Vec::new();
-            if unit == "day" {
+            if unit == "1d" {
                 if let Some((hour_docs, partials)) = crate::timeseries::rollup_docs(
                     rtxn,
                     self.env,
                     &self.name,
                     settings,
                     &partial_filter,
-                    "hour",
+                    "1h",
                 )? {
                     docs.extend(hour_docs);
                     hour_partial = partials;

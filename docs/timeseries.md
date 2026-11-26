@@ -198,10 +198,10 @@ blocking stages use the materialized path:
 Downsampling to per-minute buckets works the same way (group by a truncated
 time expression computed with `$dateToString`/`$subtract` in `$project`).
 
-For common OHLCV downsampling (`$dateTrunc` to `hour`/`day` plus
-`$first`/`$last`/`$min`/`$max`/`$sum`), a leading `$match` restricted to
-`metaField` and time uses materialized hourly and daily rollups stored in
-`tsr:<collection>`. The planner rewrites `$sum: 1` to the rollup row count and
+For common OHLCV downsampling (`$dateTrunc` to `minute`/`hour`/`day`/`week`
+plus `$first`/`$last`/`$min`/`$max`/`$sum`), a leading `$match` restricted to
+`metaField` and time uses materialized rollups stored in `tsr:<collection>`.
+Supported intervals are 1m, 5m, 15m, 30m, 1h, 4h, 1d, and 1w. The planner rewrites `$sum: 1` to the rollup row count and
 fills partial boundary windows from raw rows (using hourly rollups first for a
 daily query), so results match a raw aggregation. Inserts keep an existing
 rollup current; updates, deletes, and retention invalidate it, and it can be
@@ -213,6 +213,12 @@ aggregation host: `$lookup` (local and pipeline/`let`), `$graphLookup`,
 `$unionWith`, `$search`, `$searchMeta`, and `$vectorSearch` work on time-series
 inputs. `$out` and `$merge` write through the bucket writer, so indexes,
 events, and replication stay consistent.
+
+For analytics, `$group` and `$setWindowFields` also accept `$percentile`,
+`$median`, `$stdDevPop`, `$stdDevSamp`, `$histogram`, `$counterAgg`,
+`$gaugeAgg`, `$vwap`, `$corr`, `$covariance`, and `$regression`; window outputs
+include `$returns` and `$logReturns`. `$timeBucketGapfill` fills missing time
+buckets and applies `locf` or `linear` values before charting.
 
 ## Supported operations
 

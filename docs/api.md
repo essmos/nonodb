@@ -1079,6 +1079,43 @@ valid in `$project` (use `$group` for accumulators).
 `$sum` and `$avg` ignore non-numeric values. `$addToSet` deduplicates by JSON
 value equality.
 
+Statistical and financial accumulators:
+
+```json
+{
+  "$group": {
+    "_id": "$symbol",
+    "median": {"$median": "$latency"},
+    "p95": {"$percentile": {"input": "$latency", "p": [0.95]}},
+    "sd": {"$stdDevPop": "$latency"},
+    "hist": {"$histogram": {
+      "input": "$latency", "boundaries": [0, 10, 50, 100]
+    }},
+    "vwap": {"$vwap": {"price": "$price", "volume": "$volume"}},
+    "corr": {"$corr": {"x": "$a", "y": "$b"}},
+    "reg": {"$regression": {"x": "$a", "y": "$b"}}
+  }
+}
+```
+
+- `$percentile` accepts `input` and `p` (one or more probabilities in
+  `[0, 1]`), returning an array. Interpolation is linear between adjacent
+  sorted values.
+- `$median` is `$percentile` at `p = 0.5` and returns a scalar.
+- `$stdDevPop`/`$stdDevSamp` ignore missing/null/non-numeric values and return
+  `null` when no values are present (`$stdDevSamp` also needs two values).
+- `$histogram` returns counts for half-open boundaries
+  `[b[i], b[i+1])`; values below the first or at/above the last boundary are
+  ignored.
+- `$counterAgg` takes `{input, time}` and returns `delta`, `rate`, `irate`,
+  `resets`, `last`, and `last_time`; a decrease is treated as a counter reset.
+  Rates are per second.
+- `$gaugeAgg` takes `{input, time}` and returns trapezoidal `integral`,
+  time-weighted `average`, `delta`, `first`, and `last`.
+- `$vwap` takes `{price, volume}`.
+- `$corr`, `$covariance`, and `$regression` take `{x, y}`; regression returns
+  `{slope, intercept}`.
+
 ### `$unwind`
 
 ```json
@@ -1222,7 +1259,64 @@ Adds partitioned, sorted window calculations without collapsing documents:
 - Ranking operators: `$rank`, `$denseRank`, and `$documentNumber`, which require
   `sortBy`.
 - `$shift` supports `output`, integer `by`, and optional `default`.
+- Statistical accumulators (`$percentile`, `$median`, `$stdDevPop`,
+  `$stdDevSamp`, `$histogram`, `$counterAgg`, `$gaugeAgg`) are also valid window
+  outputs.
+- `$returns` and `$logReturns` take an input expression and compare the current
+  row with the previous row in partition order; the first row is `null`.
+- Financial indicators: `$sma` (`input`, `period`), `$ema`, `$rsi` (`period`,
+  default 14), `$bollinger` (`period`, optional `multiplier`, default 2),
+  `$macd` (`fastPeriod` 12, `slowPeriod` 26, `signalPeriod` 9), and `$atr`
+  (`high`, `low`, `close`, `period`). Bollinger and MACD return objects.
+- Risk metrics: `$drawdown` and `$maxDrawdown` take a price input; `$sharpe`
+  and `$sortino` take a returns input, optional `period`, `riskFree`, and
+  `annualization` (the square root is applied to this factor).
 - The aggregate intermediate-document limit still applies.
+
+### `$marketSession`
+
+Adds a session label from a timezone and session calendar:
+
+```json
+{
+  "$marketSession": {
+    "field": "ts",
+    "timezone": "America/New_York",
+    "sessions": [
+      {"name": "NY", "start": "09:30", "end": "16:00", "days": [1,2,3,4,5]}
+    ]
+  }
+}
+```
+
+Supported named zones are `America/New_York`, `Europe/London`,
+`Europe/Warsaw`, `Asia/Tokyo`, and `UTC`; a numeric UTC offset in minutes is
+also accepted. DST transitions are applied for the named zones. `days` uses
+ISO weekdays (Monday = 1) and defaults to Monday–Friday. The output field is
+`session` unless `output` is set.
+
+### `$timeBucketGapfill`
+
+Fills missing time buckets and optional values:
+
+```json
+{
+  "$timeBucketGapfill": {
+    "field": "ts",
+    "unit": "minute",
+    "step": 1,
+    "bounds": ["$date", "$date"],
+    "partitionByFields": ["symbol"],
+    "output": {"price": {"method": "locf"}, "rate": {"method": "linear"}}
+  }
+}
+```
+
+`bounds` may be `partition` (default), `full`, or an explicit
+`[lower, upper]` pair. `output` accepts the same `value`, `locf`, and `linear`
+methods as `$fill`; linear interpolation does not extrapolate. Rows are sorted
+by partition fields and time before filling, so generated rows are placed in
+chronological order.
 
 ### `$densify`
 

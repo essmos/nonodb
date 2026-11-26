@@ -6148,6 +6148,56 @@ const ROLLUP_HOUR: u8 = 0x01;
 const ROLLUP_DAY: u8 = 0x02;
 const ROLLUP_HOUR_MS: i64 = 3_600_000;
 const ROLLUP_DAY_MS: i64 = 86_400_000;
+const ROLLUP_MINUTE: u8 = 0x03;
+const ROLLUP_MINUTE_5: u8 = 0x04;
+const ROLLUP_MINUTE_15: u8 = 0x05;
+const ROLLUP_MINUTE_30: u8 = 0x06;
+const ROLLUP_HOUR_4: u8 = 0x07;
+const ROLLUP_WEEK: u8 = 0x08;
+
+/// byte, duration, canonical name, dateTrunc unit, binSize
+const ROLLUP_SPECS: &[(u8, i64, &str, &str, i64)] = &[
+    (ROLLUP_MINUTE, 60_000, "1m", "minute", 1),
+    (ROLLUP_MINUTE_5, 300_000, "5m", "minute", 5),
+    (ROLLUP_MINUTE_15, 900_000, "15m", "minute", 15),
+    (ROLLUP_MINUTE_30, 1_800_000, "30m", "minute", 30),
+    (ROLLUP_HOUR, ROLLUP_HOUR_MS, "1h", "hour", 1),
+    (ROLLUP_HOUR_4, 14_400_000, "4h", "hour", 4),
+    (ROLLUP_DAY, ROLLUP_DAY_MS, "1d", "day", 1),
+    (ROLLUP_WEEK, 604_800_000, "1w", "week", 1),
+];
+
+fn rollup_spec_by_name(name: &str) -> Option<(u8, i64)> {
+    let normalized = match name {
+        "minute" => "1m",
+        "hour" => "1h",
+        "day" => "1d",
+        "week" => "1w",
+        other => other,
+    };
+    ROLLUP_SPECS
+        .iter()
+        .find(|spec| spec.2 == normalized)
+        .map(|spec| (spec.0, spec.1))
+}
+
+pub(crate) fn rollup_spec_for_trunc(trunc: &Value) -> Option<(&'static str, u8, i64)> {
+    let unit = trunc.get("unit").and_then(Value::as_str)?;
+    let bin_size = trunc.get("binSize").and_then(Value::as_i64).unwrap_or(1);
+    ROLLUP_SPECS
+        .iter()
+        .find(|spec| spec.3 == unit && spec.4 == bin_size)
+        .map(|spec| (spec.2, spec.0, spec.1))
+}
+
+fn rollup_bucket_start(unit: u8, size: i64, ts: i64) -> i64 {
+    if unit == ROLLUP_WEEK {
+        let shift = 3 * ROLLUP_DAY_MS;
+        (ts.saturating_add(shift)).div_euclid(size) * size - shift
+    } else {
+        ts.div_euclid(size) * size
+    }
+}
 
 #[derive(Clone, Copy, Default)]
 struct RollupRow {
@@ -6289,14 +6339,12 @@ pub fn build_rollups(
             if let Some(meta) = meta {
                 metas.insert(hash, meta);
             }
-            let hour = ts.div_euclid(ROLLUP_HOUR_MS) * ROLLUP_HOUR_MS;
-            let day = ts.div_euclid(ROLLUP_DAY_MS) * ROLLUP_DAY_MS;
-            rows.entry((ROLLUP_HOUR, hash, hour))
-                .or_default()
-                .add(ts, open, high, low_price, close, volume);
-            rows.entry((ROLLUP_DAY, hash, day))
-                .or_default()
-                .add(ts, open, high, low_price, close, volume);
+            for (unit, size, ..) in ROLLUP_SPECS {
+                let window = rollup_bucket_start(*unit, *size, ts);
+                rows.entry((*unit, hash, window))
+                    .or_default()
+                    .add(ts, open, high, low_price, close, volume);
+            }
         }
         Ok(true)
     })?;
@@ -6316,8 +6364,8 @@ pub fn build_rollups(
     let mut marker = Vec::with_capacity(16);
     marker.extend_from_slice(&low.to_be_bytes());
     marker.extend_from_slice(&high.to_be_bytes());
-    for unit in [ROLLUP_HOUR, ROLLUP_DAY] {
-        db.put(&mut *wtxn, &[ROLLUP_MARKER, unit], &marker)?;
+    for (unit, ..) in ROLLUP_SPECS {
+        db.put(&mut *wtxn, &[ROLLUP_MARKER, *unit], &marker)?;
     }
     Ok(keys.len())
 }
@@ -6334,10 +6382,8 @@ pub fn rollup_docs(
     filter: &Value,
     unit: &str,
 ) -> Result<Option<(Vec<Value>, Vec<(i64, i64)>)>> {
-    let (unit_byte, window_size) = match unit {
-        "hour" => (ROLLUP_HOUR, ROLLUP_HOUR_MS),
-        "day" => (ROLLUP_DAY, ROLLUP_DAY_MS),
-        _ => return Ok(None),
+    let Some((unit_byte, window_size)) = rollup_spec_by_name(unit) else {
+        return Ok(None);
     };
     let Some(db) =
         env.open_database::<Bytes, Bytes>(rtxn, Some(&format!("{ROLLUP_DB_PREFIX}{name}")))?
@@ -6432,15 +6478,15 @@ fn update_rollups_for_doc(
         return Ok(());
     };
     let mut covered = Vec::new();
-    for unit in [ROLLUP_HOUR, ROLLUP_DAY] {
-        let Some(marker) = db.get(&*wtxn, &[ROLLUP_MARKER, unit])? else {
+    for (unit, ..) in ROLLUP_SPECS {
+        let Some(marker) = db.get(&*wtxn, &[ROLLUP_MARKER, *unit])? else {
             continue;
         };
         if marker.len() != 16 {
             continue;
         }
         covered.push((
-            unit,
+            *unit,
             i64::from_be_bytes(marker[0..8].try_into().expect("8 bytes")),
             i64::from_be_bytes(marker[8..16].try_into().expect("8 bytes")),
         ));
@@ -6468,12 +6514,12 @@ fn update_rollups_for_doc(
             invalidate_rollups(wtxn, env, name)?;
             return Ok(());
         }
-        let window_size = if unit == ROLLUP_HOUR {
-            ROLLUP_HOUR_MS
-        } else {
-            ROLLUP_DAY_MS
-        };
-        let window = ts.div_euclid(window_size) * window_size;
+        let window_size = ROLLUP_SPECS
+            .iter()
+            .find(|spec| spec.0 == unit)
+            .map(|spec| spec.1)
+            .unwrap_or(ROLLUP_DAY_MS);
+        let window = rollup_bucket_start(unit, window_size, ts);
         let key = rollup_key(unit, hash, window);
         let mut row = db
             .get(&*wtxn, &key)?
@@ -6492,8 +6538,8 @@ pub fn invalidate_rollups(wtxn: &mut RwTxn<'_>, env: &heed::Env, name: &str) -> 
     else {
         return Ok(());
     };
-    for unit in [ROLLUP_HOUR, ROLLUP_DAY] {
-        db.delete(&mut *wtxn, &[ROLLUP_MARKER, unit])?;
+    for (unit, ..) in ROLLUP_SPECS {
+        db.delete(&mut *wtxn, &[ROLLUP_MARKER, *unit])?;
     }
     Ok(())
 }
@@ -9399,5 +9445,51 @@ mod tests {
             bitmap_size < legacy_size,
             "bitmap {bitmap_size} should be smaller than legacy {legacy_size}"
         );
+    }
+    #[test]
+    fn financial_rollup_intervals_are_materialized() {
+        let (_dir, store) = ts_store();
+        let settings = Settings {
+            time_field: "ts".into(),
+            meta_field: Some("device".into()),
+            granularity: Granularity::Minutes,
+            ..Settings::default()
+        };
+        let c = store
+            .create_timeseries_collection("intervals", &settings)
+            .unwrap();
+        let base = 1_700_000_000_000i64;
+        let day = 86_400_000i64;
+        for index in 0..3 * 24 * 6i64 {
+            let ts = base + index * 10 * 60_000;
+            c.insert_one(json!({
+                "ts": {"$date": {"$numberLong": ts.to_string()}},
+                "device": "d0",
+                "open": 10, "high": 12, "low": 9, "close": 11, "volume": 1.0
+            }))
+            .unwrap();
+        }
+        let mut wtxn = store.write_txn().unwrap();
+        build_rollups(
+            &mut wtxn,
+            store.env(),
+            "intervals",
+            &settings,
+            base,
+            base + 3 * day,
+        )
+        .unwrap();
+        wtxn.commit().unwrap();
+        let filter = json!({"ts": {
+            "$gte": {"$date": {"$numberLong": base.to_string()}},
+            "$lte": {"$date": {"$numberLong": (base + 3 * day - 1).to_string()}}
+        }});
+        let rtxn = store.read_txn().unwrap();
+        for name in ["1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w"] {
+            let (docs, _) = rollup_docs(&rtxn, store.env(), "intervals", &settings, &filter, name)
+                .unwrap()
+                .unwrap_or_else(|| panic!("missing rollup {name}"));
+            assert!(!docs.is_empty(), "empty rollup {name}");
+        }
     }
 }
