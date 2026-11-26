@@ -1268,9 +1268,15 @@ Adds partitioned, sorted window calculations without collapsing documents:
   default 14), `$bollinger` (`period`, optional `multiplier`, default 2),
   `$macd` (`fastPeriod` 12, `slowPeriod` 26, `signalPeriod` 9), and `$atr`
   (`high`, `low`, `close`, `period`). Bollinger and MACD return objects.
+  All indicators follow partition order, ignore null/non-numeric inputs, and
+  return `null` until enough observations exist. `$ema` seeds on the first
+  value; `$macd` seeds its EMAs the same way and starts emitting when the slow
+  EMA is available. SMA/Bollinger/ATR use the last `period` rows.
 - Risk metrics: `$drawdown` and `$maxDrawdown` take a price input; `$sharpe`
-  and `$sortino` take a returns input, optional `period`, `riskFree`, and
-  `annualization` (the square root is applied to this factor).
+  and `$sortino` take a returns input, optional `period` (default 14),
+  `riskFree` (default 0), and `annualization` (default 1; its square root is
+  applied). Sharpe uses population standard deviation; Sortino uses downside
+  deviation against zero. Both return `null` when the deviation is zero.
 - The aggregate intermediate-document limit still applies.
 
 ### `$marketSession`
@@ -1293,7 +1299,8 @@ Supported named zones are `America/New_York`, `Europe/London`,
 `Europe/Warsaw`, `Asia/Tokyo`, and `UTC`; a numeric UTC offset in minutes is
 also accepted. DST transitions are applied for the named zones. `days` uses
 ISO weekdays (Monday = 1) and defaults to Monday–Friday. The output field is
-`session` unless `output` is set.
+`session` unless `output` is set. Set `bucket` to also emit a session bucket key
+in the form `<local-date>:<session>`.
 
 ### `$timeBucketGapfill`
 

@@ -4578,6 +4578,7 @@ fn market_session(
         .get("output")
         .and_then(Value::as_str)
         .unwrap_or("session");
+    let bucket_field = spec.get("bucket").and_then(Value::as_str);
     let sessions = spec
         .get("sessions")
         .and_then(Value::as_array)
@@ -4635,14 +4636,20 @@ fn market_session(
             );
         let minutes = i64::from(local.hour()) * 60 + i64::from(local.minute());
         let weekday = local.weekday().number_from_monday() as u8;
-        let label = parsed
-            .iter()
-            .find(|(_, start, end, days)| {
-                days.contains(&weekday) && minutes >= *start && minutes < *end
-            })
+        let matched = parsed.iter().find(|(_, start, end, days)| {
+            days.contains(&weekday) && minutes >= *start && minutes < *end
+        });
+        let label = matched
             .map(|(name, ..)| Value::String(name.clone()))
             .unwrap_or(Value::Null);
-        path::set(doc, output, label)?;
+        path::set(doc, output, label.clone())?;
+        if let Some(field) = bucket_field {
+            let bucket = match (&label, matched) {
+                (Value::String(name), Some(_)) => Value::String(format!("{}:{name}", local.date())),
+                _ => Value::Null,
+            };
+            path::set(doc, field, bucket)?;
+        }
     }
     Ok(docs)
 }
@@ -8823,12 +8830,14 @@ mod tests {
             &json!({
                 "field": "ts",
                 "timezone": "America/New_York",
+                "bucket": "session_bucket",
                 "sessions": [{"name": "NY", "start": "09:30", "end": "16:00", "days": [1,2,3,4,5]}]
             }),
             &BTreeMap::new(),
         )
         .unwrap();
         assert_eq!(out[1]["session"], json!("NY"));
+        assert!(out[1]["session_bucket"].as_str().unwrap().ends_with(":NY"));
         assert_eq!(out[2]["session"], json!("NY"));
         assert_eq!(out[3]["session"], Value::Null);
 
@@ -8843,5 +8852,65 @@ mod tests {
         )
         .unwrap();
         assert_eq!(fixed[0]["session"], json!("UTC"));
+    }
+    #[test]
+    fn ema_macd_and_risk_metrics_have_reference_values() {
+        let docs: Vec<Value> = (1..=5)
+            .map(|value| json!({"x": value, "v": value as f64}))
+            .collect();
+        let spec = json!({
+            "sortBy": {"x": 1},
+            "output": {
+                "ema": {"$ema": {"input": "$v", "period": 3}},
+                "macd": {"$macd": {"input": "$v"}},
+                "maxdd": {"$maxDrawdown": {"input": "$v"}},
+                "sharpe": {"$sharpe": {"input": "$v", "period": 3}},
+                "sortino": {"$sortino": {"input": "$v", "period": 3}}
+            }
+        });
+        let out = set_window_fields(docs, &spec, &BTreeMap::new()).unwrap();
+        assert_eq!(out[0]["ema"], json!(1));
+        assert!((out[4]["ema"].as_f64().unwrap() - 4.0625).abs() < 1e-12);
+        assert!(out[4]["macd"].is_object());
+        assert_eq!(out[0]["maxdd"], json!(0));
+        assert!(out[4]["sharpe"].is_number());
+        let risk_docs: Vec<Value> = [-0.1, 0.2, -0.1, 0.2, -0.1]
+            .into_iter()
+            .enumerate()
+            .map(|(index, value)| json!({"x": index, "v": value}))
+            .collect();
+        let risk = set_window_fields(
+            risk_docs,
+            &json!({"sortBy": {"x": 1}, "output": {
+                "sortino": {"$sortino": {"input": "$v", "period": 3}}
+            }}),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert!(risk[4]["sortino"].is_number());
+    }
+
+    #[test]
+    fn gapfill_locf_and_value_methods() {
+        let base = 1_700_000_000_000i64;
+        let date = |ms: i64| json!({"$date": {"$numberLong": ms.to_string()}});
+        let docs = vec![
+            json!({"ts": date(base), "v": 5.0}),
+            json!({"ts": date(base + 2 * 60_000)}),
+        ];
+        let out = time_bucket_gapfill(
+            docs,
+            &json!({
+                "field": "ts",
+                "unit": "minute",
+                "bounds": [date(base), date(base + 2 * 60_000)],
+                "output": {"v": {"method": "locf"}, "w": {"value": 7}}
+            }),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(out.len(), 3);
+        assert!((out[2]["v"].as_f64().unwrap() - 5.0).abs() < 1e-12);
+        assert_eq!(out[2]["w"], json!(7));
     }
 }

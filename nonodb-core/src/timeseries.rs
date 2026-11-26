@@ -6182,6 +6182,9 @@ fn rollup_spec_by_name(name: &str) -> Option<(u8, i64)> {
 }
 
 pub(crate) fn rollup_spec_for_trunc(trunc: &Value) -> Option<(&'static str, u8, i64)> {
+    if trunc.get("timezone").is_some() || trunc.get("startOfWeek").is_some() {
+        return None;
+    }
     let unit = trunc.get("unit").and_then(Value::as_str)?;
     let bin_size = trunc.get("binSize").and_then(Value::as_i64).unwrap_or(1);
     ROLLUP_SPECS
@@ -6192,7 +6195,7 @@ pub(crate) fn rollup_spec_for_trunc(trunc: &Value) -> Option<(&'static str, u8, 
 
 fn rollup_bucket_start(unit: u8, size: i64, ts: i64) -> i64 {
     if unit == ROLLUP_WEEK {
-        let shift = 3 * ROLLUP_DAY_MS;
+        let shift = 4 * ROLLUP_DAY_MS;
         (ts.saturating_add(shift)).div_euclid(size) * size - shift
     } else {
         ts.div_euclid(size) * size
@@ -9491,5 +9494,19 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing rollup {name}"));
             assert!(!docs.is_empty(), "empty rollup {name}");
         }
+    }
+    #[test]
+    fn rollup_week_alignment_and_timezone_fallback_are_safe() {
+        let week = 604_800_000i64;
+        assert_eq!(rollup_bucket_start(ROLLUP_WEEK, week, 0), -4 * 86_400_000);
+        assert_eq!(
+            rollup_bucket_start(ROLLUP_WEEK, week, 4 * 86_400_000),
+            3 * 86_400_000
+        );
+        assert!(rollup_spec_for_trunc(&json!({"unit": "week", "startOfWeek": "monday"})).is_none());
+        assert!(rollup_spec_for_trunc(&json!({
+            "unit": "hour", "binSize": 4, "timezone": "Europe/Warsaw"
+        }))
+        .is_none());
     }
 }

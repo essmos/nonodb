@@ -201,7 +201,10 @@ time expression computed with `$dateToString`/`$subtract` in `$project`).
 For common OHLCV downsampling (`$dateTrunc` to `minute`/`hour`/`day`/`week`
 plus `$first`/`$last`/`$min`/`$max`/`$sum`), a leading `$match` restricted to
 `metaField` and time uses materialized rollups stored in `tsr:<collection>`.
-Supported intervals are 1m, 5m, 15m, 30m, 1h, 4h, 1d, and 1w. The planner rewrites `$sum: 1` to the rollup row count and
+Supported intervals are 1m, 5m, 15m, 30m, 1h, 4h, 1d, and 1w. The week
+default matches `$dateTrunc` (`startOfWeek: "sunday"`). Queries with an explicit
+`timezone` or non-default `startOfWeek` bypass materialized rollups and fall
+back to raw aggregation, so their results stay correct. The planner rewrites `$sum: 1` to the rollup row count and
 fills partial boundary windows from raw rows (using hourly rollups first for a
 daily query), so results match a raw aggregation. Inserts keep an existing
 rollup current; updates, deletes, and retention invalidate it, and it can be
