@@ -191,7 +191,48 @@ NONODB_MAP_SIZE=64GiB END_MS=1795682340000 \
 TimescaleDB: the same SQL queries from section 4 against the `collect_data`
 database (`TIMESCALE_URL` in `timescaledb.env`).
 
-## 11. Comparison caveats
+## 11. Window functions
+
+The same 206M-row dataset was used for `$setWindowFields` versus SQL window
+functions. NonoDB ran the pipeline `$match` + `$setWindowFields`; TimescaleDB ran
+the equivalent `OVER (PARTITION BY symbol ORDER BY time ...)` query. Times are
+medians of 3 runs after one warm-up.
+
+### BTC/USD, last 1 day (1,441 rows)
+
+| Window operation | NonoDB | TimescaleDB | Ratio |
+|---|---:|---:|---:|
+| `$documentNumber`/`row_number()` | 22.94 ms | **9.35 ms** | 2.5× slower |
+| 60-row moving average | 186.86 ms | **18.64 ms** | 10.0× slower |
+| 1-hour range average | 696.45 ms | **18.77 ms** | 37.1× slower |
+
+### BTC/USD, last 7 days (10,081 rows)
+
+| Window operation | NonoDB | TimescaleDB | Ratio |
+|---|---:|---:|---:|
+| `$documentNumber`/`row_number()` | 165.24 ms | **36.00 ms** | 4.6× slower |
+| 60-row moving average | 1,313.04 ms | **107.66 ms** | 12.2× slower |
+| 1-hour range average | **41,893 ms** | **109.13 ms** | **384× slower** |
+
+### All symbols, last 1 hour (1,155 rows)
+
+| Window operation | NonoDB | TimescaleDB | Ratio |
+|---|---:|---:|---:|
+| `$documentNumber`/`row_number()` | 43.30 ms | **4.81 ms** | 9.0× slower |
+| 60-row moving average | 123.11 ms | **5.10 ms** | 24.1× slower |
+| 1-hour range average | 111.18 ms | **6.35 ms** | 17.5× slower |
+
+NonoDB's ranking/shift/EMA paths are linear and comparatively cheap. The
+accumulator/range paths are not optimized yet: each output row builds its frame
+by rescanning the partition. Document frames are `O(n × frame_width)`; date
+range frames currently are `O(n²)` per partition, which is why the 7-day
+1-hour range query takes ~42 s. The 30-day BTC range query was therefore not
+run to completion; its cost grows quadratically from the 7-day result.
+
+These are end-to-end times including bucket decoding and result handling. NonoDB
+aggregation is single-process; TimescaleDB may use PostgreSQL parallelism.
+
+## 12. Comparison caveats
 
 - NonoDB is measured in-process; TimescaleDB is measured over the network and
   through a client, so the timings cover different layers.
