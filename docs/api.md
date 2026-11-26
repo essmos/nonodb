@@ -1100,21 +1100,29 @@ Statistical and financial accumulators:
 
 - `$percentile` accepts `input` and `p` (one or more probabilities in
   `[0, 1]`), returning an array. Interpolation is linear between adjacent
-  sorted values.
+  sorted values; an empty sample yields `null` for each probability.
 - `$median` is `$percentile` at `p = 0.5` and returns a scalar.
-- `$stdDevPop`/`$stdDevSamp` ignore missing/null/non-numeric values and return
-  `null` when no values are present (`$stdDevSamp` also needs two values).
+- `$stdDevPop`/`$stdDevSamp` ignore missing/null/non-numeric/non-finite values
+  and return `null` when no values are present (`$stdDevSamp` also needs two
+  values). They use Welford's stable online algorithm.
 - `$histogram` returns counts for half-open boundaries
   `[b[i], b[i+1])`; values below the first or at/above the last boundary are
-  ignored.
+  ignored, and fewer than two boundaries produce an empty count array.
 - `$counterAgg` takes `{input, time}` and returns `delta`, `rate`, `irate`,
   `resets`, `last`, and `last_time`; a decrease is treated as a counter reset.
-  Rates are per second.
+  Invalid/missing value/time pairs are skipped. Rates are per second and are
+  `null` when fewer than two timestamps are available.
 - `$gaugeAgg` takes `{input, time}` and returns trapezoidal `integral`,
-  time-weighted `average`, `delta`, `first`, and `last`.
-- `$vwap` takes `{price, volume}`.
-- `$corr`, `$covariance`, and `$regression` take `{x, y}`; regression returns
-  `{slope, intercept}`.
+  time-weighted `average`, `delta`, `first`, and `last`. Invalid/missing pairs
+  are skipped; `average` is `null` without a positive time span.
+- `$vwap` takes `{price, volume}`, uses only pairs where both values are numeric,
+  and returns `null` when total volume is zero.
+- `$corr`, `$covariance`, and `$regression` take `{x, y}` and use only complete
+  numeric pairs. `$covariance` is the sample covariance (denominator `n - 1`);
+  fewer than two pairs yields `null`. Correlation and regression return `null`
+  when a variance is zero; regression returns `{slope, intercept}`.
+- In `$setWindowFields`, accumulators use the active window frame; without an
+  explicit frame the default is unbounded preceding through unbounded following.
 
 ### `$unwind`
 

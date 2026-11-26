@@ -3514,41 +3514,39 @@ fn window_financial_values(
             );
         }
         "$rsi" => {
-            let mut gains = Vec::new();
-            let mut losses = Vec::new();
-            for pair in values.windows(2) {
-                match (pair[0], pair[1]) {
-                    (Some(previous), Some(current)) => {
-                        let change = current - previous;
-                        gains.push(change.max(0.0));
-                        losses.push((-change).max(0.0));
-                    }
-                    _ => {
-                        gains.push(0.0);
-                        losses.push(0.0);
-                    }
-                }
-            }
-            out.push(Value::Null);
+            out.resize(values.len(), Value::Null);
+            let valid: Vec<(usize, f64)> = values
+                .iter()
+                .enumerate()
+                .filter_map(|(index, value)| value.map(|value| (index, value)))
+                .collect();
             let mut avg_gain = None;
             let mut avg_loss = None;
-            for index in 0..gains.len() {
-                if index + 1 < period {
-                    out.push(Value::Null);
-                } else if index + 1 == period {
-                    let gain = gains[..period].iter().sum::<f64>() / period as f64;
-                    let loss = losses[..period].iter().sum::<f64>() / period as f64;
+            let mut first_gain = 0.0;
+            let mut first_loss = 0.0;
+            for index in 1..valid.len() {
+                let change = valid[index].1 - valid[index - 1].1;
+                let gain = change.max(0.0);
+                let loss = (-change).max(0.0);
+                if index < period {
+                    first_gain += gain;
+                    first_loss += loss;
+                } else if index == period {
+                    first_gain += gain;
+                    first_loss += loss;
+                    let gain = first_gain / period as f64;
+                    let loss = first_loss / period as f64;
                     avg_gain = Some(gain);
                     avg_loss = Some(loss);
-                    out.push(rsi_value(gain, loss));
+                    out[valid[index].0] = rsi_value(gain, loss);
                 } else {
-                    let gain = (avg_gain.unwrap_or(0.0) * (period as f64 - 1.0) + gains[index])
-                        / period as f64;
-                    let loss = (avg_loss.unwrap_or(0.0) * (period as f64 - 1.0) + losses[index])
-                        / period as f64;
+                    let gain =
+                        (avg_gain.unwrap_or(0.0) * (period as f64 - 1.0) + gain) / period as f64;
+                    let loss =
+                        (avg_loss.unwrap_or(0.0) * (period as f64 - 1.0) + loss) / period as f64;
                     avg_gain = Some(gain);
                     avg_loss = Some(loss);
-                    out.push(rsi_value(gain, loss));
+                    out[valid[index].0] = rsi_value(gain, loss);
                 }
             }
         }
@@ -3656,19 +3654,21 @@ fn window_financial_values(
                     None => high - low,
                 }));
             }
+            let mut window = VecDeque::new();
             let mut sum = 0.0;
-            for (index, range) in ranges.iter().enumerate() {
-                sum += range.unwrap_or(0.0);
-                if index >= period {
-                    sum -= ranges[index - period].unwrap_or(0.0);
+            for range in &ranges {
+                if let Some(range) = range {
+                    window.push_back(*range);
+                    sum += *range;
+                    if window.len() > period {
+                        sum -= window.pop_front().unwrap_or(0.0);
+                    }
                 }
-                out.push(
-                    if index + 1 < period || ranges[..=index].iter().any(Option::is_none) {
-                        Value::Null
-                    } else {
-                        number_value(sum / period as f64)
-                    },
-                );
+                out.push(if window.len() < period {
+                    Value::Null
+                } else {
+                    number_value(sum / period as f64)
+                });
             }
         }
         "$drawdown" | "$maxDrawdown" => {
@@ -8858,36 +8858,127 @@ mod tests {
         let docs: Vec<Value> = (1..=5)
             .map(|value| json!({"x": value, "v": value as f64}))
             .collect();
-        let spec = json!({
-            "sortBy": {"x": 1},
-            "output": {
+        let out = set_window_fields(
+            docs,
+            &json!({"sortBy": {"x": 1}, "output": {
                 "ema": {"$ema": {"input": "$v", "period": 3}},
-                "macd": {"$macd": {"input": "$v"}},
-                "maxdd": {"$maxDrawdown": {"input": "$v"}},
-                "sharpe": {"$sharpe": {"input": "$v", "period": 3}},
-                "sortino": {"$sortino": {"input": "$v", "period": 3}}
-            }
-        });
-        let out = set_window_fields(docs, &spec, &BTreeMap::new()).unwrap();
-        assert_eq!(out[0]["ema"], json!(1));
-        assert!((out[4]["ema"].as_f64().unwrap() - 4.0625).abs() < 1e-12);
-        assert!(out[4]["macd"].is_object());
-        assert_eq!(out[0]["maxdd"], json!(0));
-        assert!(out[4]["sharpe"].is_number());
-        let risk_docs: Vec<Value> = [-0.1, 0.2, -0.1, 0.2, -0.1]
+                "macd": {"$macd": {
+                    "input": "$v", "fastPeriod": 2, "slowPeriod": 3, "signalPeriod": 2
+                }}
+            }}),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let close = |actual: &Value, expected: f64| {
+            assert!(
+                (actual.as_f64().unwrap() - expected).abs() < 1e-12,
+                "{actual} != {expected}"
+            );
+        };
+        for (index, expected) in [1.0, 1.5, 2.25, 3.125, 4.0625].into_iter().enumerate() {
+            close(&out[index]["ema"], expected);
+        }
+        for (index, (macd, signal, histogram)) in [
+            (0.0, 0.0, 0.0),
+            (
+                0.16666666666666652,
+                0.11111111111111101,
+                0.05555555555555551,
+            ),
+            (0.30555555555555536, 0.24074074074074056, 0.0648148148148148),
+            (
+                0.39351851851851816,
+                0.3425925925925923,
+                0.050925925925925875,
+            ),
+            (0.4436728395061724, 0.4099794238683124, 0.03369341563786005),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            close(&out[index]["macd"]["macd"], macd);
+            close(&out[index]["macd"]["signal"], signal);
+            close(&out[index]["macd"]["histogram"], histogram);
+        }
+
+        let prices: Vec<Value> = [100.0, 120.0, 90.0, 110.0]
+            .into_iter()
+            .enumerate()
+            .map(|(index, value)| json!({"x": index, "v": value}))
+            .collect();
+        let drawdown = set_window_fields(
+            prices,
+            &json!({"sortBy": {"x": 1}, "output": {
+                "dd": {"$drawdown": {"input": "$v"}},
+                "maxdd": {"$maxDrawdown": {"input": "$v"}}
+            }}),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        close(&drawdown[2]["dd"], -0.25);
+        close(&drawdown[2]["maxdd"], -0.25);
+        close(&drawdown[3]["maxdd"], -0.25);
+
+        let returns: Vec<Value> = [-0.1, 0.2, -0.1, 0.2, -0.1]
             .into_iter()
             .enumerate()
             .map(|(index, value)| json!({"x": index, "v": value}))
             .collect();
         let risk = set_window_fields(
-            risk_docs,
+            returns,
             &json!({"sortBy": {"x": 1}, "output": {
-                "sortino": {"$sortino": {"input": "$v", "period": 3}}
+                "sharpe": {"$sharpe": {"input": "$v", "period": 5}},
+                "sortino": {"$sortino": {"input": "$v", "period": 5}}
             }}),
             &BTreeMap::new(),
         )
         .unwrap();
-        assert!(risk[4]["sortino"].is_number());
+        close(&risk[4]["sharpe"], 0.13608276348795434);
+        close(&risk[4]["sortino"], 0.25819888974716115);
+    }
+
+    #[test]
+    fn financial_indicators_skip_null_inputs() {
+        let docs = vec![
+            json!({"x": 0, "h": 10, "l": 9, "c": 9.5}),
+            json!({"x": 1, "h": null, "l": null, "c": 10}),
+            json!({"x": 2, "h": 12, "l": 11, "c": 11.5}),
+            json!({"x": 3, "h": 13, "l": 12, "c": 12.5}),
+        ];
+        let atr = set_window_fields(
+            docs,
+            &json!({"sortBy": {"x": 1}, "output": {
+                "atr": {"$atr": {"high": "$h", "low": "$l", "close": "$c", "period": 2}}
+            }}),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(atr[1]["atr"], Value::Null);
+        assert!((atr[2]["atr"].as_f64().unwrap() - 1.5).abs() < 1e-12);
+        assert!((atr[3]["atr"].as_f64().unwrap() - 1.75).abs() < 1e-12);
+
+        let rsi_docs: Vec<Value> = [10.0, 11.0, f64::NAN, 10.0, 12.0]
+            .into_iter()
+            .enumerate()
+            .map(|(index, value)| {
+                if value.is_nan() {
+                    json!({"x": index, "v": null})
+                } else {
+                    json!({"x": index, "v": value})
+                }
+            })
+            .collect();
+        let rsi = set_window_fields(
+            rsi_docs,
+            &json!({"sortBy": {"x": 1}, "output": {
+                "rsi": {"$rsi": {"input": "$v", "period": 2}}
+            }}),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(rsi[2]["rsi"], Value::Null);
+        assert!((rsi[3]["rsi"].as_f64().unwrap() - 50.0).abs() < 1e-12);
+        assert!((rsi[4]["rsi"].as_f64().unwrap() - 83.33333333333333).abs() < 1e-12);
     }
 
     #[test]
