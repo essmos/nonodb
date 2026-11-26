@@ -79,7 +79,7 @@ Benchmark po etapie (koniec danych `2026-11-26 08:39:00`, mediany 3 przebiegów)
 
 | Operacja | TimescaleDB | NonoDB bez indeksu | NonoDB partial idx | NonoDB bucket locator |
 |---|---:|---:|---:|---:|
-| punkt: BTC/USD, 1 minuta | 3,98 ms | 32,11 ms | 25,17 ms | **2,61 ms** |
+| count BTC/USD, ostatnia 1 minuta | 3,98 ms | 32,11 ms | 25,17 ms | **2,61 ms** |
 | count BTC/USD, 1 h | 3,91 ms | 26,68 ms | 25,43 ms | **2,28 ms** |
 | count BTC/USD, 1 d | 5,60 ms | 39,92 ms | 38,75 ms | **14,11 ms** |
 | find BTC/USD, 1 d, limit 100, sort desc | 6,29 ms | 57,71 ms | 20,32 ms | **17,78 ms** |
@@ -117,7 +117,7 @@ Benchmark po etapie 2 (`2026-11-26 08:39:00`, mediany 3 przebiegów):
 
 | Operacja | TimescaleDB | Etap 1 | Etap 2 | Cel |
 |---|---:|---:|---:|---:|
-| punkt: BTC/USD, 1 minuta | 3,98 ms | 2,61 ms | **1,78 ms** | ≤ 5 ms |
+| count BTC/USD, ostatnia 1 minuta | 3,98 ms | 2,61 ms | **1,78 ms** | ≤ 5 ms |
 | count BTC/USD, 1 h | 3,91 ms | 2,28 ms | **1,62 ms** | ≤ 5 ms |
 | count BTC/USD, 1 d | 5,60 ms | 14,11 ms | **3,57 ms** | ≤ 5 ms |
 | find BTC/USD, 1 d, limit 100, sort desc | 6,29 ms | 17,78 ms | **6,58 ms** | ≤ 10 ms |
@@ -163,7 +163,7 @@ Benchmark po etapie 3 (`2026-11-26 08:39:00`, mediany 3 przebiegów):
 
 | Operacja | TimescaleDB | Etap 2 | Etap 3 |
 |---|---:|---:|---:|
-| punkt: BTC/USD, 1 minuta | 3,98 ms | 1,78 ms | **1,25 ms** |
+| count BTC/USD, ostatnia 1 minuta | 3,98 ms | 1,78 ms | **1,25 ms** |
 | count BTC/USD, 1 h | 3,91 ms | 1,62 ms | **1,10 ms** |
 | count BTC/USD, 1 d | 5,60 ms | 3,57 ms | **3,30 ms** |
 | find BTC/USD, 1 d, limit 100, sort desc | 6,29 ms | 6,58 ms | **7,16 ms** |
@@ -206,7 +206,7 @@ Benchmark po etapie 4 (`2026-11-26 08:39:00`, mediany 3 przebiegów):
 
 | Operacja | TimescaleDB | Etap 3 | Etap 4 |
 |---|---:|---:|---:|
-| punkt: BTC/USD, 1 minuta | 3,98 ms | 1,25 ms | **1,46 ms** |
+| count BTC/USD, ostatnia 1 minuta | 3,98 ms | 1,25 ms | **1,46 ms** |
 | count BTC/USD, 1 h | 3,91 ms | 1,10 ms | **1,06 ms** |
 | count BTC/USD, 1 d | 5,60 ms | 3,30 ms | **3,90 ms** |
 | find BTC/USD, 1 d, limit 100, sort desc | 6,29 ms | 7,16 ms | **7,86 ms** |
@@ -247,7 +247,7 @@ Benchmark po etapie 5 (`2026-11-26 08:39:00`, mediany 3 przebiegów):
 | OHLC 1 h, BTC/USD, 30 d | 56,85 ms | 813,95 ms | **5,12 ms** | ≤ 150 ms |
 | OHLC 1 h, wszystkie symbole, 1 h | 2,65 ms | 38,66 ms | **38,67 ms** | — |
 | OHLC 1 d, wszystkie symbole, 1 d | 33,37 ms | 628,75 ms | **86,06 ms** | ≤ 300 ms |
-| punkt: BTC/USD, 1 minuta | 3,98 ms | 1,46 ms | 1,51 ms | — |
+| count BTC/USD, ostatnia 1 minuta | 3,98 ms | 1,46 ms | 1,51 ms | — |
 | count BTC/USD, 1 h | 3,91 ms | 1,06 ms | 1,13 ms | — |
 | count BTC/USD, 1 d | 5,60 ms | 3,90 ms | 3,28 ms | — |
 | find BTC/USD, 1 d, limit 100, sort desc | 6,29 ms | 7,86 ms | 7,46 ms | — |
@@ -260,7 +260,7 @@ godzinowe i dzienne z surową agregacją oraz sprawdza unieważnienie po zapisie
 
 | Operacja | TimescaleDB | Etap 1 | Etap 2 | Etap 3 | Etap 4 | Etap 5 |
 |---|---:|---:|---:|---:|---:|---:|
-| punkt: BTC/USD, 1 minuta | 3,98 ms | 2,61 | 1,78 | 1,25 | 1,46 | **1,51** |
+| count BTC/USD, ostatnia 1 minuta | 3,98 ms | 2,61 | 1,78 | 1,25 | 1,46 | **1,51** |
 | count BTC/USD, 1 h | 3,91 ms | 2,28 | 1,62 | 1,10 | 1,06 | **1,13** |
 | count BTC/USD, 1 d | 5,60 ms | 14,11 | 3,57 | 3,30 | 3,90 | **3,28** |
 | find BTC/USD, 1 d, limit 100, sort desc | 6,29 ms | 17,78 | 6,58 | 7,16 | 7,86 | **7,46** |
@@ -276,7 +276,7 @@ została zachowana.
 
 | Operacja | TimescaleDB | NonoDB bez indeksu | NonoDB z indeksem częściowym |
 |---|---:|---:|---:|
-| punkt: BTC/USD, 1 minuta | 3,98 ms | 32,11 ms | 25,17 ms |
+| count BTC/USD, ostatnia 1 minuta | 3,98 ms | 32,11 ms | 25,17 ms |
 | count BTC/USD, 1 h | 3,91 ms | 26,68 ms | 25,43 ms |
 | count BTC/USD, 1 d | 5,60 ms | 39,92 ms | 38,75 ms |
 | find BTC/USD, 1 d, limit 100, sort desc | 6,29 ms | 57,71 ms | **20,32 ms** |

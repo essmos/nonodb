@@ -648,6 +648,7 @@ on one series are in the low milliseconds. The 100k-row table above is a shape
 check, not a tuned benchmark: no PostgreSQL tuning, connection pooling, or
 prepared statements were used. Reproduce the Timescale side with
 `scripts/timescale_bench.py`; the 206M-row results are in
+`docs/timescale-benchmark.md` and the per-stage log in
 `data/timescale_benchmark_report.md`.
 
 ## Limitations
