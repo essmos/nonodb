@@ -36,7 +36,7 @@ client; TimescaleDB was queried through `psycopg2` over the LAN.
 |---|---:|---:|
 | Rows | **206,336,608** | **206,345,595** |
 | Difference | — | +8,987 rows (**0.004%**); snapshots differ slightly |
-| Database size | **7,881,351,168 B = 7.34 GiB** (`data.mdb`) | **11 GB** (`pg_database_size('collect_data')`) |
+| Database size | **7,881,351,168 B = 7.34 GiB** (`data.mdb`) | **11.07 GiB** (11.89 GB, `pg_database_size('collect_data')`) |
 | `symbol_ts_recent` index | **~52.3 MB** | **~435 MB** (`pg_indexes_size` + chunks) |
 | Buckets / chunks | 375,522 sealed + 429 open | hypertable with native compression |
 
@@ -77,18 +77,18 @@ does not fetch a document by `_id`.
 
 Medians of 3 runs on the full 206-million-row dataset:
 
-| Operation | NonoDB | TimescaleDB | NonoDB/Timescale ratio | Winner |
-|---|---:|---:|---:|---|
-| count BTC/USD, last 1 minute | **1.08 ms** | 4.14 ms | 0.26× | NonoDB |
-| count BTC/USD, 1 h | **1.04 ms** | 3.83 ms | 0.27× | NonoDB |
-| count BTC/USD, 1 d | **2.78 ms** | 5.58 ms | 0.50× | NonoDB |
-| find BTC/USD, 1 d, limit 100, sort desc | **6.13 ms** | 6.58 ms | 0.93× | NonoDB |
-| OHLC 1 h BTC/USD, 30 d | **5.52 ms** | 56.80 ms | 0.10× | NonoDB |
-| OHLC 1 h all symbols, 1 h | 16.79 ms | **2.49 ms** | 6.75× | TimescaleDB |
-| OHLC 1 d all symbols, 1 d | 65.25 ms | **33.63 ms** | 1.94× | TimescaleDB |
-| RAM: process vs container | **26.1 MiB** process RSS | **~2.2 GiB** cgroup | 0.012× | NonoDB* |
-| Database size | **7.34 GiB** | 11 GB | 0.67× | NonoDB |
-| `symbol_ts_recent` index | **~52.3 MB** | ~435 MB | 0.12× | NonoDB |
+| Operation | NonoDB | TimescaleDB | Winner and advantage |
+|---|---:|---:|---|
+| count BTC/USD, last 1 minute | **1.08 ms** | 4.14 ms | **NonoDB 3.8× faster** |
+| count BTC/USD, 1 h | **1.04 ms** | 3.83 ms | **NonoDB 3.7× faster** |
+| count BTC/USD, 1 d | **2.78 ms** | 5.58 ms | **NonoDB 2.0× faster** |
+| find BTC/USD, 1 d, limit 100, sort desc | **6.13 ms** | 6.58 ms | **NonoDB 1.07× faster** |
+| OHLC 1 h BTC/USD, 30 d | **5.52 ms** | 56.80 ms | **NonoDB 10.3× faster** |
+| OHLC 1 h all symbols, 1 h | 16.79 ms | **2.49 ms** | **TimescaleDB 6.75× faster** |
+| OHLC 1 d all symbols, 1 d | 65.25 ms | **33.63 ms** | **TimescaleDB 1.94× faster** |
+| RAM: process vs container | **26.1 MiB** process RSS | **~2.2 GiB** cgroup | **NonoDB ~85× less RAM** |
+| Database size | **7.34 GiB** | 11.07 GiB | **NonoDB 1.51× smaller** |
+| `symbol_ts_recent` index | **~52.3 MB** | ~435 MB | **NonoDB 8.3× smaller** |
 
 \* RAM is not directly comparable: the NonoDB number is process RSS only
 (OS page cache is additional), while the TimescaleDB number is the whole `pg`
@@ -97,11 +97,13 @@ breakdown.
 
 Key numbers:
 
-- NonoDB is **3.8× faster** for count last minute, **3.7×** for count 1 h,
-  **2.0×** for count 1 d, **1.07×** for find 1 d with limit 100 and **10.3×**
-  for OHLC BTC 30 d.
-- TimescaleDB is **6.75× faster** for OHLC all symbols 1 h and **1.94×** for
-  OHLC all symbols 1 d.
+- NonoDB wins every single-series query: **3.8× faster** for count last minute,
+  **3.7×** for count 1 h, **2.0×** for count 1 d, **1.07×** for find 1 d with
+  limit 100 and **10.3×** for OHLC BTC 30 d.
+- TimescaleDB wins the all-series aggregations: **6.75× faster** for OHLC all
+  symbols 1 h and **1.94×** for OHLC all symbols 1 d.
+- NonoDB uses **~85× less process RAM**, is **1.51× smaller on disk** and has
+  an **8.3× smaller** `symbol_ts_recent` index.
 - Stage targets: BTC 30 d **≤150 ms** (actual 5.52 ms), all symbols 1 d
   **≤300 ms** (actual 65.25 ms) — met.
 
@@ -133,7 +135,7 @@ server memory. Under heavy sorting/hashing TimescaleDB can grow toward
 
 | Item | NonoDB | TimescaleDB |
 |---|---:|---:|
-| Database | 7.34 GiB | 11 GB |
+| Database | 7.34 GiB | 11.07 GiB |
 | `symbol_ts_recent` index | ~52.3 MB | ~435 MB |
 | Bucket locator entries | 751,902 (375,951 buckets × 2) | — |
 | Rollups | 11,685 entries, +2.17 MiB | — |
@@ -191,14 +193,14 @@ and order by `time`; TimescaleDB uses `RANK() OVER (...)`,
 PRECEDING AND CURRENT ROW)` for the 1-hour range. The times cover query
 execution and result processing.
 
-| Case | Rows | NonoDB | TimescaleDB | NonoDB/Timescale | Winner |
-|---|---:|---:|---:|---:|---|
-| `$rank`, BTC/USD 7 d | 10,081 | **71 ms** | 71.3 ms | 1.00× | tie |
-| 60-row `$avg close`, BTC/USD 7 d | 10,081 | **100 ms** | 163.3 ms | 0.61× | NonoDB |
-| 1-hour range `$avg close`, BTC/USD 7 d | 10,081 | **91 ms** | 168.9 ms | 0.54× | NonoDB |
-| `$rank`, all symbols, last 1 h | 1,155 | 11 ms | **8.3 ms** | 1.33× | TimescaleDB |
-| 60-row `$avg close`, all symbols, last 1 h | 1,155 | 12 ms | **8.6 ms** | 1.39× | TimescaleDB |
-| 1-hour range `$avg close`, all symbols, last 1 h | 1,155 | 12 ms | **8.1 ms** | 1.48× | TimescaleDB |
+| Case | Rows | NonoDB | TimescaleDB | Winner and advantage |
+|---|---:|---:|---:|---|
+| `$rank`, BTC/USD 7 d | 10,081 | 71 ms | 71.3 ms | tie (1.00×) |
+| 60-row `$avg close`, BTC/USD 7 d | 10,081 | **100 ms** | 163.3 ms | **NonoDB 1.63× faster** |
+| 1-hour range `$avg close`, BTC/USD 7 d | 10,081 | **91 ms** | 168.9 ms | **NonoDB 1.86× faster** |
+| `$rank`, all symbols, last 1 h | 1,155 | 11 ms | **8.3 ms** | **TimescaleDB 1.33× faster** |
+| 60-row `$avg close`, all symbols, last 1 h | 1,155 | 12 ms | **8.6 ms** | **TimescaleDB 1.39× faster** |
+| 1-hour range `$avg close`, all symbols, last 1 h | 1,155 | 12 ms | **8.1 ms** | **TimescaleDB 1.48× faster** |
 
 The all-symbols cases decode 38 open buckets and 1,155 rows. The columnar scan
 reads only the time field before materializing a row, so rows outside the
