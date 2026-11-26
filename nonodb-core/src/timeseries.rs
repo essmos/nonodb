@@ -61,6 +61,9 @@ const KEY_BUCKET: u8 = 0x01;
 const KEY_ROW: u8 = 0x02;
 const KEY_TOMB: u8 = 0x03;
 const KEY_USER: u8 = 0x05;
+const KEY_INDEX_MARKER: u8 = 0x0F;
+const KEY_INDEX_SERIES: u8 = 0x10;
+const KEY_INDEX_TIME: u8 = 0x11;
 const FLAG_SEALED: u8 = 0x01;
 
 /// Default bucket width per granularity, in milliseconds.
@@ -1183,6 +1186,269 @@ fn key_parts(key: &[u8]) -> Option<(u64, u32, i64, u16)> {
     Some((hash, salt, window, serial))
 }
 
+/// Physical location of one time-series bucket.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct BucketLocator {
+    pub hash: u64,
+    pub salt: u32,
+    pub window: i64,
+    pub serial: u16,
+}
+
+fn ordered_window(window: i64) -> u64 {
+    (window as u64) ^ (1u64 << 63)
+}
+
+fn unordered_window(encoded: u64) -> i64 {
+    (encoded ^ (1u64 << 63)) as i64
+}
+
+fn series_index_key(loc: BucketLocator) -> Vec<u8> {
+    let mut key = Vec::with_capacity(23);
+    key.push(KEY_INDEX_SERIES);
+    key.extend_from_slice(&loc.hash.to_be_bytes());
+    key.extend_from_slice(&ordered_window(loc.window).to_be_bytes());
+    key.extend_from_slice(&loc.salt.to_be_bytes());
+    key.extend_from_slice(&loc.serial.to_be_bytes());
+    key
+}
+
+fn time_index_key(loc: BucketLocator) -> Vec<u8> {
+    let mut key = Vec::with_capacity(23);
+    key.push(KEY_INDEX_TIME);
+    key.extend_from_slice(&ordered_window(loc.window).to_be_bytes());
+    key.extend_from_slice(&loc.hash.to_be_bytes());
+    key.extend_from_slice(&loc.salt.to_be_bytes());
+    key.extend_from_slice(&loc.serial.to_be_bytes());
+    key
+}
+
+fn index_key_locator(key: &[u8]) -> Option<BucketLocator> {
+    if key.len() != 23 {
+        return None;
+    }
+    match key[0] {
+        KEY_INDEX_SERIES => Some(BucketLocator {
+            hash: u64::from_be_bytes(key[1..9].try_into().ok()?),
+            window: unordered_window(u64::from_be_bytes(key[9..17].try_into().ok()?)),
+            salt: u32::from_be_bytes(key[17..21].try_into().ok()?),
+            serial: u16::from_be_bytes(key[21..23].try_into().ok()?),
+        }),
+        KEY_INDEX_TIME => Some(BucketLocator {
+            window: unordered_window(u64::from_be_bytes(key[1..9].try_into().ok()?)),
+            hash: u64::from_be_bytes(key[9..17].try_into().ok()?),
+            salt: u32::from_be_bytes(key[17..21].try_into().ok()?),
+            serial: u16::from_be_bytes(key[21..23].try_into().ok()?),
+        }),
+        _ => None,
+    }
+}
+
+fn bucket_locator_key(loc: BucketLocator) -> Vec<u8> {
+    bucket_key(loc.hash, loc.salt, loc.window, loc.serial)
+}
+
+fn index_put(wtxn: &mut RwTxn<'_>, db: &Database<Bytes, Bytes>, loc: BucketLocator) -> Result<()> {
+    db.put(&mut *wtxn, &series_index_key(loc), b"")?;
+    db.put(&mut *wtxn, &time_index_key(loc), b"")?;
+    Ok(())
+}
+
+fn index_remove(
+    wtxn: &mut RwTxn<'_>,
+    db: &Database<Bytes, Bytes>,
+    loc: BucketLocator,
+) -> Result<()> {
+    db.delete(&mut *wtxn, &series_index_key(loc))?;
+    db.delete(&mut *wtxn, &time_index_key(loc))?;
+    Ok(())
+}
+
+fn delete_bucket_payload(
+    wtxn: &mut RwTxn<'_>,
+    db: &Database<Bytes, Bytes>,
+    key: &[u8],
+) -> Result<()> {
+    if let Some((hash, salt, window, serial)) = key_parts(key) {
+        index_remove(
+            wtxn,
+            db,
+            BucketLocator {
+                hash,
+                salt,
+                window,
+                serial,
+            },
+        )?;
+    }
+    db.delete(&mut *wtxn, key)?;
+    Ok(())
+}
+
+fn bucket_index_ready(rtxn: &RoTxn<'_>, db: &Database<Bytes, Bytes>) -> Result<bool> {
+    Ok(db.get(rtxn, &[KEY_INDEX_MARKER])?.is_some())
+}
+
+/// Marks a fresh time-series collection as having complete bucket indexes.
+pub fn init_bucket_index(wtxn: &mut RwTxn<'_>, env: &heed::Env, name: &str) -> Result<()> {
+    let db = ensure_bucket_db(wtxn, env, name)?;
+    db.put(&mut *wtxn, &[KEY_INDEX_MARKER], b"1")?;
+    Ok(())
+}
+
+/// Builds bucket indexes for an existing collection when they are missing.
+/// Returns `true` when a backfill was performed.
+pub fn ensure_bucket_index(wtxn: &mut RwTxn<'_>, env: &heed::Env, name: &str) -> Result<bool> {
+    let db = ensure_bucket_db(wtxn, env, name)?;
+    if bucket_index_ready(&*wtxn, &db)? {
+        return Ok(false);
+    }
+    let mut locators = std::collections::BTreeSet::new();
+    for item in db.iter(&*wtxn)? {
+        let (key, value) = item?;
+        match key.first() {
+            Some(&KEY_BUCKET) => {
+                if let Some((hash, salt, window, serial)) = key_parts(key) {
+                    locators.insert(BucketLocator {
+                        hash,
+                        salt,
+                        window,
+                        serial,
+                    });
+                }
+            }
+            Some(&KEY_OPEN) => {
+                if let Some((bucket, _)) = parse_open(value) {
+                    if let Some((hash, salt, window, serial)) = key_parts(&bucket) {
+                        locators.insert(BucketLocator {
+                            hash,
+                            salt,
+                            window,
+                            serial,
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    for loc in locators {
+        index_put(wtxn, &db, loc)?;
+    }
+    db.put(&mut *wtxn, &[KEY_INDEX_MARKER], b"1")?;
+    Ok(true)
+}
+
+/// Returns `(ready, entries, bytes)` for the bucket locator indexes.
+pub fn bucket_index_stats(
+    rtxn: &RoTxn<'_>,
+    env: &heed::Env,
+    name: &str,
+) -> Result<(bool, u64, u64)> {
+    let Some(db) =
+        env.open_database::<Bytes, Bytes>(rtxn, Some(&format!("{BUCKET_DB_PREFIX}{name}")))?
+    else {
+        return Ok((false, 0, 0));
+    };
+    let ready = bucket_index_ready(rtxn, &db)?;
+    let mut entries = 0u64;
+    let mut bytes = 0u64;
+    for item in db.iter(rtxn)? {
+        let (key, value) = item?;
+        if matches!(key.first(), Some(&KEY_INDEX_SERIES) | Some(&KEY_INDEX_TIME)) {
+            entries += 1;
+            bytes += (key.len() + value.len()) as u64;
+        }
+    }
+    Ok((ready, entries, bytes))
+}
+
+/// Uses the bucket locator indexes when the filter can be narrowed by series
+/// and/or time. Returns `None` for collections without a complete index.
+pub fn lookup_indexed_buckets(
+    rtxn: &RoTxn<'_>,
+    env: &heed::Env,
+    name: &str,
+    filter: &Value,
+    settings: &Settings,
+) -> Result<Option<Vec<BucketLocator>>> {
+    let Some(db) =
+        env.open_database::<Bytes, Bytes>(rtxn, Some(&format!("{BUCKET_DB_PREFIX}{name}")))?
+    else {
+        return Ok(None);
+    };
+    if !bucket_index_ready(rtxn, &db)? {
+        return Ok(None);
+    }
+    let (low, high) = time_bounds(filter, &settings.time_field);
+    let meta_hash = meta_equality_hash(filter, settings);
+    if meta_hash.is_none() && low.is_none() && high.is_none() {
+        return Ok(None);
+    }
+    let span = settings.span_ms();
+    let start_window = low
+        .map(|low| low.saturating_sub(span.saturating_sub(1)))
+        .unwrap_or(i64::MIN);
+    let end_window = high.unwrap_or(i64::MAX);
+    let mut out = Vec::new();
+    if let Some(hash) = meta_hash {
+        let start = series_index_key(BucketLocator {
+            hash,
+            salt: 0,
+            window: start_window,
+            serial: 0,
+        });
+        let end = series_index_key(BucketLocator {
+            hash,
+            salt: u32::MAX,
+            window: end_window,
+            serial: u16::MAX,
+        });
+        for item in db.range(
+            rtxn,
+            &(
+                std::ops::Bound::Included(start.as_slice()),
+                std::ops::Bound::Included(end.as_slice()),
+            ),
+        )? {
+            let (key, _) = item?;
+            if let Some(loc) = index_key_locator(key) {
+                out.push(loc);
+            }
+        }
+    } else {
+        let start = time_index_key(BucketLocator {
+            hash: 0,
+            salt: 0,
+            window: start_window,
+            serial: 0,
+        });
+        let end = time_index_key(BucketLocator {
+            hash: u64::MAX,
+            salt: u32::MAX,
+            window: end_window,
+            serial: u16::MAX,
+        });
+        for item in db.range(
+            rtxn,
+            &(
+                std::ops::Bound::Included(start.as_slice()),
+                std::ops::Bound::Included(end.as_slice()),
+            ),
+        )? {
+            let (key, _) = item?;
+            if let Some(loc) = index_key_locator(key) {
+                out.push(loc);
+            }
+        }
+    }
+    out.retain(|loc| {
+        let window_end = loc.window.saturating_add(span).saturating_sub(1);
+        !low.is_some_and(|low| window_end < low) && !high.is_some_and(|high| loc.window > high)
+    });
+    Ok(Some(out))
+}
+
 fn encode_bucket(bucket: &Bucket, settings: &Settings) -> Result<Vec<u8>> {
     let n = bucket.rows.len();
     let meta_field = settings.meta_field.as_deref();
@@ -1897,6 +2163,16 @@ fn persist_bucket(
     clear_deleted_rows(bucket);
     let payload = encode_bucket(bucket, settings)?;
     db.put(&mut *wtxn, key, &payload)?;
+    index_put(
+        wtxn,
+        db,
+        BucketLocator {
+            hash: loc.0,
+            salt: loc.1,
+            window: loc.2,
+            serial: loc.3,
+        },
+    )?;
     Ok(())
 }
 
@@ -1965,6 +2241,16 @@ fn seal_bucket(
     clear_deleted_rows(&mut bucket);
     let payload = encode_bucket(&bucket, settings)?;
     db.put(&mut *wtxn, bucket_key_bytes, &payload)?;
+    index_put(
+        wtxn,
+        db,
+        BucketLocator {
+            hash,
+            salt,
+            window,
+            serial,
+        },
+    )?;
     for (_, _, key) in source {
         db.delete(&mut *wtxn, &key)?;
     }
@@ -2079,6 +2365,16 @@ pub fn insert(
         &row_bytes,
     )?;
     db.put(&mut *wtxn, &pointer_key, &encode_open(&key, count + 1))?;
+    index_put(
+        wtxn,
+        &db,
+        BucketLocator {
+            hash,
+            salt,
+            window,
+            serial,
+        },
+    )?;
 
     let id = match object.get("_id") {
         Some(Value::String(id)) => id.clone(),
@@ -2214,6 +2510,18 @@ pub fn insert_many(
             &open_key(hash, state.salt),
             &encode_open(&state.key, state.count),
         )?;
+        if let Some((_, _, window, serial)) = key_parts(&state.key) {
+            index_put(
+                wtxn,
+                &db,
+                BucketLocator {
+                    hash,
+                    salt: state.salt,
+                    window,
+                    serial,
+                },
+            )?;
+        }
     }
     Ok(ids)
 }
@@ -2408,6 +2716,35 @@ pub fn find_with_ids(
     };
 
     let mut out: Vec<Value> = Vec::new();
+    if candidates.is_none() {
+        if let Some(locators) = lookup_indexed_buckets(rtxn, env, name, &query.filter, settings)? {
+            for loc in locators {
+                for doc in docs_for_bucket_locator(rtxn, &db, loc, settings)? {
+                    if expired(settings, &doc, now) || !matcher::matches(&doc, &query.filter) {
+                        continue;
+                    }
+                    out.push(doc);
+                    if query.sort.is_empty() && out.len() >= need {
+                        break;
+                    }
+                }
+                if query.sort.is_empty() && out.len() >= need {
+                    break;
+                }
+            }
+            if !query.sort.is_empty() {
+                out.sort_by(|a, b| compare_docs(a, b, &query.sort));
+            }
+            let start = query.skip.min(out.len());
+            let mut out: Vec<Value> = out.into_iter().skip(start).take(limit).collect();
+            if let Some(projection) = &query.projection {
+                for doc in out.iter_mut() {
+                    *doc = project_document(doc, Some(projection));
+                }
+            }
+            return Ok(out);
+        }
+    }
     if let Some(candidates) = candidates {
         let mut by_bucket: std::collections::HashMap<(u64, u32, i64, u16), Vec<u32>> =
             std::collections::HashMap::new();
@@ -2656,6 +2993,21 @@ where
         let current = std::mem::take(batch);
         emit(current)
     };
+    if let Some(locators) = lookup_indexed_buckets(rtxn, env, name, filter, settings)? {
+        for loc in locators {
+            for doc in docs_for_bucket_locator(rtxn, &db, loc, settings)? {
+                if expired(settings, &doc, now) || !matcher::matches(&doc, filter) {
+                    continue;
+                }
+                batch.push(doc);
+                if batch.len() >= batch_size && !flush(&mut batch)? {
+                    return Ok(());
+                }
+            }
+        }
+        flush(&mut batch)?;
+        return Ok(());
+    }
     for item in db.iter(rtxn)? {
         let (key, payload) = item?;
         match key.first() {
@@ -2850,6 +3202,45 @@ where
         visit(&mut *wtxn, batch)?;
     }
     Ok(())
+}
+
+fn docs_for_bucket_locator(
+    rtxn: &RoTxn<'_>,
+    db: &Database<Bytes, Bytes>,
+    loc: BucketLocator,
+    settings: &Settings,
+) -> Result<Vec<Value>> {
+    let key = bucket_locator_key(loc);
+    if let Some(payload) = db.get(rtxn, &key)? {
+        return Ok(docs_for_key(rtxn, db, &key, payload, settings)?
+            .into_iter()
+            .map(|(_, doc)| doc)
+            .collect());
+    }
+    let mut out = Vec::new();
+    for item in db.prefix_iter(rtxn, &row_base(loc.hash, loc.salt, loc.window, loc.serial))? {
+        let (key, payload) = item?;
+        if key.first() != Some(&KEY_ROW) {
+            continue;
+        }
+        let Some((hash, salt, window, serial, seq)) = row_key_parts(key) else {
+            continue;
+        };
+        let row: Map<String, Value> = serde_json::from_slice(payload)?;
+        let mut doc = Value::Object(row);
+        if !doc
+            .as_object()
+            .is_some_and(|object| object.contains_key("_id"))
+        {
+            set_path(
+                doc.as_object_mut().expect("object"),
+                "_id",
+                Value::String(row_id(hash, salt, window, serial, seq)),
+            );
+        }
+        out.push(doc);
+    }
+    Ok(out)
 }
 
 /// Returns every live time-series document with its `_id`.
@@ -3136,7 +3527,7 @@ fn delete_inner(
         // If every row of the bucket is now deleted, drop the payload instead
         // of keeping an empty sealed bucket.
         if removed >= live {
-            db.delete(&mut *wtxn, &key)?;
+            delete_bucket_payload(wtxn, &db, &key)?;
             drop_tombstones(wtxn, &db, hash, salt, window, serial)?;
         } else {
             persist_bucket(
@@ -3251,7 +3642,7 @@ pub fn delete_by_id(
             }
             bucket.deleted.insert(seq);
             if bucket.deleted.len() >= bucket.rows.len() {
-                db.delete(&mut *wtxn, &sealed)?;
+                delete_bucket_payload(wtxn, &db, &sealed)?;
                 drop_tombstones(wtxn, &db, hash, salt, window, serial)?;
             } else {
                 persist_bucket(
@@ -3355,6 +3746,16 @@ pub fn verify_in(
                     return Err(corrupt("malformed tombstone bucket key"));
                 }
             }
+            Some(&KEY_INDEX_MARKER) => {
+                if key.len() != 1 {
+                    return Err(corrupt("malformed bucket-index marker"));
+                }
+            }
+            Some(&KEY_INDEX_SERIES) | Some(&KEY_INDEX_TIME) => {
+                if index_key_locator(key).is_none() {
+                    return Err(corrupt("malformed bucket-index key"));
+                }
+            }
             _ => return Err(corrupt("unknown time-series key prefix")),
         }
     }
@@ -3444,7 +3845,7 @@ fn retain_inner(
                     }
                 }
             }
-            db.delete(&mut *wtxn, &key)?;
+            delete_bucket_payload(wtxn, &db, &key)?;
             drop_tombstones(wtxn, &db, hash, salt, window, serial)?;
             report.dropped_buckets += 1;
             continue;
@@ -3484,7 +3885,7 @@ fn retain_inner(
         }
         let live_after = bucket.rows.len() - bucket.deleted.len();
         if live_after == 0 {
-            db.delete(&mut *wtxn, &key)?;
+            delete_bucket_payload(wtxn, &db, &key)?;
             drop_tombstones(wtxn, &db, hash, salt, window, serial)?;
             report.dropped_buckets += 1;
         } else if added > 0 {
@@ -3764,7 +4165,7 @@ fn update_inner(
         bucket.deleted.extend(moved_out.iter().copied());
         if changed || !moved_out.is_empty() {
             if bucket.deleted.len() >= bucket.rows.len() {
-                db.delete(&mut *wtxn, &key)?;
+                delete_bucket_payload(wtxn, &db, &key)?;
                 drop_tombstones(wtxn, &db, hash, salt, window, serial)?;
             } else {
                 persist_bucket(
@@ -4135,7 +4536,7 @@ fn delete_locator(
         merge_tombstones(wtxn, db, &mut bucket, hash, salt, window, serial)?;
         if bucket.deleted.insert(seq) {
             if bucket.deleted.len() >= bucket.rows.len() {
-                db.delete(&mut *wtxn, &key)?;
+                delete_bucket_payload(wtxn, db, &key)?;
                 drop_tombstones(wtxn, db, hash, salt, window, serial)?;
             } else {
                 persist_bucket(
@@ -5318,6 +5719,171 @@ mod tests {
         assert!(c.drop_index("level").unwrap());
         assert!(!c.drop_index("level").unwrap());
         assert_eq!(c.explain(&query(None)).unwrap()["index_used"], json!(false));
+    }
+
+    #[test]
+    fn bucket_locator_indexes_follow_insert_delete_and_retention() {
+        let (_dir, store) = ts_store();
+        let settings = Settings {
+            time_field: "ts".into(),
+            meta_field: Some("device".into()),
+            bucket_max_docs: 8,
+            ..Settings::default()
+        };
+        let c = store
+            .create_timeseries_collection("metrics", &settings)
+            .unwrap();
+        let base = 1_700_000_000_000i64;
+        let day = 86_400_000i64;
+        for d in 0..5i64 {
+            for device in 0..2i64 {
+                for idx in 0..4i64 {
+                    c.insert_one(json!({
+                        "ts": {"$date": {"$numberLong": (base + d * day + idx * 60_000).to_string()}},
+                        "device": format!("d{device}"),
+                        "value": idx,
+                    }))
+                    .unwrap();
+                }
+            }
+        }
+        {
+            let mut wtxn = store.write_txn().unwrap();
+            seal_all(&mut wtxn, store.env(), "metrics", &settings).unwrap();
+            wtxn.commit().unwrap();
+        }
+        let range = |from: i64, to: i64| {
+            json!({
+                "$gte": {"$date": {"$numberLong": from.to_string()}},
+                "$lte": {"$date": {"$numberLong": to.to_string()}},
+            })
+        };
+        let filter =
+            json!({"device": "d0", "ts": range(base + 2 * day, base + 4 * day - 3_600_000)});
+        let hash = series_hash(&settings, Some(&json!("d0")));
+        {
+            let rtxn = store.read_txn().unwrap();
+            let locators =
+                lookup_indexed_buckets(&rtxn, store.env(), "metrics", &filter, &settings)
+                    .unwrap()
+                    .expect("bucket index");
+            assert!(!locators.is_empty());
+            assert!(locators.iter().all(|loc| loc.hash == hash));
+            let span = settings.span_ms();
+            assert!(locators.iter().all(|loc| {
+                loc.window.saturating_add(span).saturating_sub(1) >= base + 2 * day
+                    && loc.window <= base + 4 * day - 3_600_000
+            }));
+            rtxn.commit().unwrap();
+        }
+        assert_eq!(c.count(&filter).unwrap(), 8);
+        assert_eq!(
+            c.find(&FindQuery {
+                filter: filter.clone(),
+                ..Default::default()
+            })
+            .unwrap()
+            .len(),
+            8
+        );
+
+        // Emptying a day removes its locator entries.
+        assert_eq!(c.delete(&filter, true).unwrap(), 8);
+        {
+            let rtxn = store.read_txn().unwrap();
+            let locators =
+                lookup_indexed_buckets(&rtxn, store.env(), "metrics", &filter, &settings)
+                    .unwrap()
+                    .expect("bucket index");
+            assert!(locators.is_empty());
+            rtxn.commit().unwrap();
+        }
+
+        // Dropping old buckets by retention removes their locator entries too.
+        let report = store.retain_timeseries("metrics", base + 2 * day).unwrap();
+        assert!(report.dropped_buckets > 0);
+        let old = json!({"device": "d0", "ts": range(base, base + day)});
+        {
+            let rtxn = store.read_txn().unwrap();
+            let locators = lookup_indexed_buckets(&rtxn, store.env(), "metrics", &old, &settings)
+                .unwrap()
+                .expect("bucket index");
+            assert!(locators.is_empty());
+            assert!(crate::timeseries::verify_in(&rtxn, store.env(), "metrics", &settings).is_ok());
+            rtxn.commit().unwrap();
+        }
+    }
+
+    #[test]
+    fn ensure_bucket_index_backfills_legacy_collections() {
+        let (_dir, store) = ts_store();
+        let settings = Settings {
+            time_field: "ts".into(),
+            meta_field: Some("device".into()),
+            ..Settings::default()
+        };
+        let c = store
+            .create_timeseries_collection("legacy", &settings)
+            .unwrap();
+        for idx in 0..20 {
+            c.insert_one(json!({
+                "ts": {"$date": {"$numberLong": (1_700_000_000_000i64 + idx * 60_000).to_string()}},
+                "device": format!("d{}", idx % 2),
+                "value": idx,
+            }))
+            .unwrap();
+        }
+        {
+            let mut wtxn = store.write_txn().unwrap();
+            seal_all(&mut wtxn, store.env(), "legacy", &settings).unwrap();
+            wtxn.commit().unwrap();
+        }
+        {
+            let mut wtxn = store.write_txn().unwrap();
+            let db = ensure_bucket_db(&mut wtxn, store.env(), "legacy").unwrap();
+            let keys: Vec<Vec<u8>> = db
+                .iter(&wtxn)
+                .unwrap()
+                .filter_map(|item| {
+                    let (key, _) = item.ok()?;
+                    matches!(key.first(), Some(&KEY_INDEX_SERIES) | Some(&KEY_INDEX_TIME))
+                        .then(|| key.to_vec())
+                })
+                .collect();
+            for key in keys {
+                db.delete(&mut wtxn, &key).unwrap();
+            }
+            db.delete(&mut wtxn, &[KEY_INDEX_MARKER]).unwrap();
+            wtxn.commit().unwrap();
+        }
+        {
+            let rtxn = store.read_txn().unwrap();
+            assert!(!bucket_index_stats(&rtxn, store.env(), "legacy").unwrap().0);
+            rtxn.commit().unwrap();
+        }
+        let built = {
+            let mut wtxn = store.write_txn().unwrap();
+            let built = ensure_bucket_index(&mut wtxn, store.env(), "legacy").unwrap();
+            wtxn.commit().unwrap();
+            built
+        };
+        assert!(built);
+        let rtxn = store.read_txn().unwrap();
+        let (ready, entries, bytes) = bucket_index_stats(&rtxn, store.env(), "legacy").unwrap();
+        assert!(ready);
+        assert!(entries > 0);
+        assert!(bytes > 0);
+        let locators = lookup_indexed_buckets(
+            &rtxn,
+            store.env(),
+            "legacy",
+            &json!({"device": "d0"}),
+            &settings,
+        )
+        .unwrap()
+        .expect("index");
+        assert_eq!(locators.len() as u64, entries / 4);
+        rtxn.commit().unwrap();
     }
 
     #[test]

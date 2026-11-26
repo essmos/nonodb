@@ -368,12 +368,26 @@ impl Store {
         // After `kill -9`, dead reader slots may remain in the lock table.
         let _ = env.clear_stale_readers();
         let (history, ttl) = Self::init_meta(&env)?;
-        Ok(Self {
+        let store = Self {
             env,
             history,
             ttl,
             txn_gate: TxnGate::default(),
-        })
+        };
+        store.ensure_timeseries_bucket_indexes()?;
+        Ok(store)
+    }
+
+    fn ensure_timeseries_bucket_indexes(&self) -> Result<()> {
+        for name in self.collections()? {
+            if self.timeseries_settings(&name)?.is_none() {
+                continue;
+            }
+            let mut wtxn = self.write_txn()?;
+            crate::timeseries::ensure_bucket_index(&mut wtxn, &self.env, &name)?;
+            wtxn.commit()?;
+        }
+        Ok(())
     }
 
     /// Opens an existing database read-only for verification and inspection.
@@ -833,6 +847,7 @@ impl Store {
             None,
         )?;
         collection.set_timeseries_settings_in(&mut wtxn, settings)?;
+        crate::timeseries::init_bucket_index(&mut wtxn, &self.env, name)?;
         wtxn.commit()?;
         Ok(collection)
     }
