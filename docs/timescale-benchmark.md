@@ -71,9 +71,8 @@ results.
 | OHLC all symbols 1 h | filter 1 h, `$group` by `symbol` + hour, `$count` groups | `GROUP BY symbol, time_bucket('1 hour', time)` |
 | OHLC all symbols 1 d | filter 1 d, `$group` by `symbol` + day, `$count` groups | `GROUP BY symbol, time_bucket('1 day', time)` |
 
-Note: the label "count last minute" replaces the earlier imprecise "point" in
-the stage tables. This query counts rows in a one-minute window; it does not
-fetch a document by `_id`.
+Note: the label "count last minute" counts rows in a one-minute window; it
+does not fetch a document by `_id`.
 
 ## 5. Final results
 
@@ -81,47 +80,33 @@ Medians of 3 runs on the full 206-million-row dataset:
 
 | Operation | NonoDB | TimescaleDB | NonoDB/Timescale ratio | Winner |
 |---|---:|---:|---:|---|
-| count BTC/USD, last 1 minute | **1.51 ms** | 3.86 ms | 0.39× | NonoDB |
-| count BTC/USD, 1 h | **1.13 ms** | 3.79 ms | 0.30× | NonoDB |
-| count BTC/USD, 1 d | **3.28 ms** | 5.39 ms | 0.61× | NonoDB |
-| find BTC/USD, 1 d, limit 100, sort desc | 7.46 ms | **6.21 ms** | 1.20× | TimescaleDB |
-| OHLC 1 h BTC/USD, 30 d | **5.12 ms** | 55.87 ms | 0.09× | NonoDB |
-| OHLC 1 h all symbols, 1 h | 38.67 ms | **2.48 ms** | 15.6× | TimescaleDB |
-| OHLC 1 d all symbols, 1 d | 86.06 ms | **32.89 ms** | 2.6× | TimescaleDB |
-| RAM: process vs container | **27.1 MiB** process RSS | **~2.2 GiB** cgroup | 0.012× | NonoDB* |
+| count BTC/USD, last 1 minute | **1.08 ms** | 4.14 ms | 0.26× | NonoDB |
+| count BTC/USD, 1 h | **1.04 ms** | 3.83 ms | 0.27× | NonoDB |
+| count BTC/USD, 1 d | **2.78 ms** | 5.58 ms | 0.50× | NonoDB |
+| find BTC/USD, 1 d, limit 100, sort desc | **6.13 ms** | 6.58 ms | 0.93× | NonoDB |
+| OHLC 1 h BTC/USD, 30 d | **5.52 ms** | 56.80 ms | 0.10× | NonoDB |
+| OHLC 1 h all symbols, 1 h | 16.79 ms | **2.49 ms** | 6.75× | TimescaleDB |
+| OHLC 1 d all symbols, 1 d | 65.25 ms | **33.63 ms** | 1.94× | TimescaleDB |
+| RAM: process vs container | **26.1 MiB** process RSS | **~2.2 GiB** cgroup | 0.012× | NonoDB* |
 | Database size | **7.34 GiB** | 11 GB | 0.67× | NonoDB |
 | `symbol_ts_recent` index | **~52.3 MB** | ~435 MB | 0.12× | NonoDB |
 
 \* RAM is not directly comparable: the NonoDB number is process RSS only
 (OS page cache is additional), while the TimescaleDB number is the whole `pg`
-cgroup including `shared_buffers`/`shmem`. See section 7 for the detailed
+cgroup including `shared_buffers`/`shmem`. See section 6 for the detailed
 breakdown.
 
 Key numbers:
 
-- NonoDB is **2.6× faster** for count last minute, **3.4×** for count 1 h,
-  **1.6×** for count 1 d and **10.9×** for OHLC BTC 30 d.
-- TimescaleDB is **1.2× faster** for find 1 d with limit 100, **15.6×** for
-  OHLC all symbols 1 h and **2.6×** for OHLC all symbols 1 d.
-- Stage targets: BTC 30 d **≤150 ms** (actual 5.12 ms), all symbols 1 d
-  **≤300 ms** (actual 86.06 ms) — met.
+- NonoDB is **3.8× faster** for count last minute, **3.7×** for count 1 h,
+  **2.0×** for count 1 d, **1.07×** for find 1 d with limit 100 and **10.3×**
+  for OHLC BTC 30 d.
+- TimescaleDB is **6.75× faster** for OHLC all symbols 1 h and **1.94×** for
+  OHLC all symbols 1 d.
+- Stage targets: BTC 30 d **≤150 ms** (actual 5.52 ms), all symbols 1 d
+  **≤300 ms** (actual 65.25 ms) — met.
 
-## 6. Evolution by stage
-
-The same operations before and after each improvement (ms, medians):
-
-| Stage | BTC 30 d | all symbols 1 h | all symbols 1 d |
-|---|---:|---:|---:|
-| 1. bucket locators | 755.95 | 48.13 | 670.61 |
-| 2. fast count/ordered find | 820.85 | 50.83 | 736.55 |
-| 3. zone maps + Bloom | 821.66 | 59.53 | 755.17 |
-| 4. posting lists | 813.95 | 38.66 | 628.75 |
-| 5. 1h/1d rollups | **5.12** | **38.67** | **86.06** |
-
-The full point/count/find table for every stage is in
-`data/timescale_benchmark_report.md`.
-
-## 7. RAM usage
+## 6. RAM usage
 
 NonoDB was sampled through `/proc/<pid>/status` and `/proc/<pid>/smaps_rollup`
 during the benchmark; TimescaleDB through `/sys/fs/cgroup/memory.current` and
@@ -129,23 +114,23 @@ during the benchmark; TimescaleDB through `/sys/fs/cgroup/memory.current` and
 
 | Metric | NonoDB | TimescaleDB |
 |---|---:|---:|
-| Peak observed memory | **27.1 MiB** process RSS (**25.8 MiB** PSS) | **~2.18–2.23 GiB** cgroup `memory.current` |
+| Peak observed memory | **26.1 MiB** process RSS (**24.8 MiB** PSS) | **~2.18–2.23 GiB** cgroup `memory.current` |
 | Shared cache | no explicit shared buffer; LMDB `mmap` is backed by OS page cache | **~2.07 GiB** `shmem` (`shared_buffers=2GB`; `pg_shmem_allocations` ≈2.19 GB) |
-| Private/anonymous memory | ~27 MiB in the measured process | **~38–88 MiB** cgroup `anon`; individual backend contexts are much smaller |
+| Private/anonymous memory | ~26 MiB in the measured process | **~38–88 MiB** cgroup `anon`; individual backend contexts are much smaller |
 | File/page cache | outside process RSS; OS-managed LMDB pages | cgroup `file` **~2.13 GiB**, mostly the same `shmem` |
 | Virtual mapping | **64 GiB** LMDB `mmap` (not resident) | **~2.2 GiB** shared-memory mapping per backend |
 | Hard memory limit | none in the benchmark (14 GiB environment) | **6 GiB** cgroup (CT 103 has 8 GiB) |
-| Per-query memory budget | no `work_mem`; process peak stayed ~27 MiB | `work_mem` **128 MB** per operation |
+| Per-query memory budget | no `work_mem`; process peak stayed ~26 MiB | `work_mem` **128 MB** per operation |
 | Connection limit | no server connection pool in this test | `max_connections=25` |
 
-Conclusion: **NonoDB has ~27 MiB of process overhead**, but the OS page cache
+Conclusion: **NonoDB has ~26 MiB of process overhead**, but the OS page cache
 for LMDB pages read by queries is additional. **TimescaleDB actually uses
 ~2.2 GiB**, mostly because of `shared_buffers=2GB`; a single backend has only a
 few MiB of private memory, so that number must not be confused with total
 server memory. Under heavy sorting/hashing TimescaleDB can grow toward
 `work_mem × concurrent queries`, up to the 6 GiB limit.
 
-## 8. Indexes and size
+## 7. Indexes and size
 
 | Item | NonoDB | TimescaleDB |
 |---|---:|---:|
@@ -159,7 +144,7 @@ NonoDB stores series metadata once per bucket and secondary indexes as
 per-bucket posting lists. TimescaleDB has a larger index footprint but wins on
 columnar execution for aggregations across all series.
 
-## 9. Correctness and tests
+## 8. Correctness and tests
 
 - `rollups_match_raw_aggregations_and_invalidate_on_write` — 1h/1d rollups
   compared with raw aggregation; insert updates a rollup, delete invalidates it.
@@ -173,7 +158,7 @@ columnar execution for aggregations across all series.
 - `cargo clippy --workspace --all-targets -- -D warnings` — clean.
 - `cargo fmt --all -- --check` — clean.
 
-## 10. Reproduction
+## 9. Reproduction
 
 ```bash
 # NonoDB — full 206M-row benchmark
@@ -187,7 +172,7 @@ NONODB_MAP_SIZE=64GiB END_MS=1795682340000 \
   /tmp/ts-nonodb-tool/target/release/ts-nonodb-tool \
   rollup data/timescale_collect_data ohlc_data
 
-# window functions (isolated runs; see section 11)
+# window functions (isolated runs; see section 10)
 NONODB_MAP_SIZE=64GiB END_MS=1795682340000 \
   /tmp/ts-nonodb-tool/target/release/ts-nonodb-tool \
   window data/timescale_collect_data ohlc_data 7
@@ -196,7 +181,7 @@ NONODB_MAP_SIZE=64GiB END_MS=1795682340000 \
 TimescaleDB: the same SQL queries from section 4 against the `collect_data`
 database (`TIMESCALE_URL` in `timescaledb.env`).
 
-## 11. Window functions (`$setWindowFields`)
+## 10. Window functions (`$setWindowFields`)
 
 Window execution was measured on the same 206M-row import with the same end
 timestamp. NonoDB runs in-process; TimescaleDB queries run through `psycopg2`
@@ -228,7 +213,7 @@ includes `grouped_unbounded_prefix_matches_brute_force`,
 `fast_float_is_opt_in_and_matches_within_tolerance`; differential window tests
 compare against the brute-force reference.
 
-## 12. Comparison caveats
+## 11. Comparison caveats
 
 - NonoDB is measured in-process; TimescaleDB is measured over the network and
   through a client, so the timings cover different layers.

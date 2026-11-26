@@ -1,5 +1,9 @@
 # TimescaleDB → NonoDB: import, streamed index backfill i benchmark
 
+> **Aktualne wyniki końcowe:** `docs/timescale-benchmark.md`, sekcje 5 i 10.
+> Tabele etapowe poniżej są historycznym zapisem kolejnych iteracji, a nie
+> bieżącym porównaniem.
+
 Data: 2026-11-26. Baza pozostała na dysku: `data/timescale_collect_data` (nie usuwana).
 
 ## Zakres
