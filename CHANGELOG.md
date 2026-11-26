@@ -2,10 +2,10 @@
 
 Full release notes: https://github.com/essmos/nonodb/releases
 
-## v0.33.0-rc.1 - 2026-11-24
+## v0.33.0 - 2026-11-26
 
-Pre-release focused on graph traversal, read-only Cypher, and background graph
-analytics.
+Stable release focused on graph traversal, read-only Cypher, and background
+graph analytics.
 
 - Add read-only Cypher execution through `cypher` and `Collection.cypher()`,
   including `MATCH`/`WHERE`/`WITH`/`UNWIND`, variable-length paths, shortest
@@ -35,6 +35,9 @@ analytics.
 - Fix graph metadata cleanup on `drop_collection`, enable the `$graphLookup`
   adjacency fast path, cap rebuild generations, and tighten Cypher string
   literal, operation, timeout, and memory-budget handling.
+- Fix quadratic bulk deletion for collections with text or fuzzy indexes by
+  batching tombstone writes into a single manifest update per index kind. A
+  100k-document delete that previously timed out now completes in about 1.2 s.
 
 ## v0.32.0 - 2026-11-23
 
