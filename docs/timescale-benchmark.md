@@ -186,12 +186,61 @@ NONODB_MAP_SIZE=64GiB END_MS=1795682340000 \
 NONODB_MAP_SIZE=64GiB END_MS=1795682340000 \
   /tmp/ts-nonodb-tool/target/release/ts-nonodb-tool \
   rollup data/timescale_collect_data ohlc_data
+
+# window functions (isolated runs; see section 11)
+NONODB_MAP_SIZE=64GiB END_MS=1795682340000 \
+  /tmp/ts-nonodb-tool/target/release/ts-nonodb-tool \
+  window data/timescale_collect_data ohlc_data 7
 ```
 
 TimescaleDB: the same SQL queries from section 4 against the `collect_data`
 database (`TIMESCALE_URL` in `timescaledb.env`).
 
-## 11. Comparison caveats
+## 11. Window functions (`$setWindowFields`)
+
+Six window-engine optimizations were measured on the same 206M-row import.
+Window cases were run in isolation (median of 3) because the full tool suite
+loads both the page cache and the 4-vCPU host between cases.
+
+| Case | Before window work | After |
+|---|---:|---:|
+| `$rank`, BTC/USD 7 d, partitionBy `symbol` | ~160–177 ms | **71 ms** |
+| 60-row `$avg close`, BTC/USD 7 d | ~191 ms | **97–108 ms** |
+| 1-hour range `$avg close`, BTC/USD 7 d | ~192 ms | **90–94 ms** |
+| all symbols, last 1 h, `$rank` | — | **11 ms** |
+| all symbols, last 1 h, 60-row `$avg` | — | **12 ms** |
+| all symbols, last 1 h, 1-hour range `$avg` | — | **12–14 ms** (occasional 16 ms under host contention) |
+
+The all-symbols cases decode 38 open buckets and 1,155 rows; the columnar scan
+reads only the time field before materializing a row, so rows outside the
+requested window are skipped without allocating a full JSON document.
+
+Grouped outputs are reproducible with `cargo run --release --example
+window_group_bench -p nonodb-core`. It creates a 10k-row time-series collection
+and runs four distinct `$sum` outputs on the same `["unbounded", "current"]`
+frame. Exact/default mode, no fast-float:
+
+```text
+exact sequential outputs: 418.0 ms
+exact grouped outputs:    117.5 ms
+speedup:                  3.56x
+```
+
+The grouped path uses exact prefix sums/counts/min/max for unbounded-start
+frames; it preserves the sequential float addition order, so default results
+remain bit-for-bit identical. `window_ts_bench` also covers rank, range,
+parallel partitions, the columnar path and fast-float. Its full-pipeline
+fast-float run measured **20.7 ms exact -> 13.4 ms fast (1.55x)** for 1200-row
+`$sum`/`$avg` outputs. Fast-float remains opt-in through
+`NONODB_WINDOW_FAST_FLOAT=1`; an in-memory window-only check measured ~1.84x.
+
+Correctness coverage includes `grouped_unbounded_prefix_matches_brute_force`,
+`parallel_partitions_match_brute_force`,
+`window_scan_matches_find_for_time_ranges`, and
+`fast_float_is_opt_in_and_matches_within_tolerance`; all differential window
+tests compare against the brute-force reference.
+
+## 12. Comparison caveats
 
 - NonoDB is measured in-process; TimescaleDB is measured over the network and
   through a client, so the timings cover different layers.
