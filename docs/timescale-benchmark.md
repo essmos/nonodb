@@ -123,32 +123,20 @@ The full point/count/find table for every stage is in
 
 ## 7. RAM usage
 
-### NonoDB
+NonoDB was sampled through `/proc/<pid>/status` and `/proc/<pid>/smaps_rollup`
+during the benchmark; TimescaleDB through `/sys/fs/cgroup/memory.current` and
+`memory.stat` of the `pg` container.
 
-Measured via `/proc/<pid>/status` and `/proc/<pid>/smaps_rollup` during the
-benchmark:
-
-| Metric | Value |
-|---|---:|
-| peak process `VmRSS` | **27.1 MiB** |
-| peak process `PSS` | **25.8 MiB** |
-| LMDB `mmap` | 64 GiB **virtual**; RSS only touched pages |
-| OS page cache | outside process RSS, managed by the kernel |
-
-### TimescaleDB
-
-Measured via `/sys/fs/cgroup/memory.current` and `memory.stat` of the `pg`
-container:
-
-| Metric | Value |
-|---|---:|
-| `memory.current` | **~2.18–2.23 GiB** |
-| `memory.max` | **6 GiB** |
-| `shared_buffers` / `shmem` | **~2.07 GiB** (`pg_shmem_allocations` ≈2.19 GB) |
-| `anon` | **~38–88 MiB** |
-| `file` (includes shmem) | **~2.13 GiB** |
-| `work_mem` | 128 MB per operation |
-| `max_connections` | 25 |
+| Metric | NonoDB | TimescaleDB |
+|---|---:|---:|
+| Peak observed memory | **27.1 MiB** process RSS (**25.8 MiB** PSS) | **~2.18–2.23 GiB** cgroup `memory.current` |
+| Shared cache | no explicit shared buffer; LMDB `mmap` is backed by OS page cache | **~2.07 GiB** `shmem` (`shared_buffers=2GB`; `pg_shmem_allocations` ≈2.19 GB) |
+| Private/anonymous memory | ~27 MiB in the measured process | **~38–88 MiB** cgroup `anon`; individual backend contexts are much smaller |
+| File/page cache | outside process RSS; OS-managed LMDB pages | cgroup `file` **~2.13 GiB**, mostly the same `shmem` |
+| Virtual mapping | **64 GiB** LMDB `mmap` (not resident) | **~2.2 GiB** shared-memory mapping per backend |
+| Hard memory limit | none in the benchmark (14 GiB environment) | **6 GiB** cgroup (CT 103 has 8 GiB) |
+| Per-query memory budget | no `work_mem`; process peak stayed ~27 MiB | `work_mem` **128 MB** per operation |
+| Connection limit | no server connection pool in this test | `max_connections=25` |
 
 Conclusion: **NonoDB has ~27 MiB of process overhead**, but the OS page cache
 for LMDB pages read by queries is additional. **TimescaleDB actually uses
