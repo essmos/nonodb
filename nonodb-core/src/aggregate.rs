@@ -2370,6 +2370,166 @@ fn window_group_chunk(
     Ok(Some(results))
 }
 
+enum GroupFastState {
+    Sum(Vec<f64>),
+    Avg(Vec<f64>, Vec<u64>),
+    Min(Vec<Vec<f64>>, Vec<u64>),
+    Max(Vec<Vec<f64>>, Vec<u64>),
+    Count,
+    First,
+    Last,
+}
+
+fn group_sparse_table(values: &[f64], minimum: bool) -> Vec<Vec<f64>> {
+    let mut table = vec![values.to_vec()];
+    let mut width = 2usize;
+    while width <= values.len() {
+        let previous = table.last().expect("table");
+        let half = width / 2;
+        let mut level = Vec::with_capacity(previous.len().saturating_sub(half));
+        for index in 0..previous.len().saturating_sub(half) {
+            let left = previous[index];
+            let right = previous[index + half];
+            level.push(if minimum {
+                left.min(right)
+            } else {
+                left.max(right)
+            });
+        }
+        table.push(level);
+        width = width.saturating_mul(2);
+    }
+    table
+}
+
+fn group_sparse_query(table: &[Vec<f64>], start: usize, end: usize, minimum: bool) -> f64 {
+    let length = end - start;
+    let level = (usize::BITS - 1 - length.leading_zeros()) as usize;
+    let span = 1usize << level;
+    let left = table[level][start];
+    let right = table[level][end - span];
+    if minimum {
+        left.min(right)
+    } else {
+        left.max(right)
+    }
+}
+
+fn window_group_fast_values(
+    ops: &[(&str, &Value)],
+    values: &[Vec<Value>],
+    numeric_ops: &[Vec<Option<f64>>],
+    window: &WindowFrame,
+    range_values: Option<&[RangeValue]>,
+    len: usize,
+) -> Result<Option<Vec<Vec<Value>>>> {
+    let mut states = Vec::with_capacity(ops.len());
+    for (index, (op, _)) in ops.iter().enumerate() {
+        states.push(match *op {
+            "$sum" => {
+                let mut prefix = vec![0.0; len + 1];
+                for position in 0..len {
+                    prefix[position + 1] =
+                        prefix[position] + numeric_ops[index][position].unwrap_or(0.0);
+                }
+                GroupFastState::Sum(prefix)
+            }
+            "$avg" => {
+                let mut prefix = vec![0.0; len + 1];
+                let mut counts = vec![0u64; len + 1];
+                for position in 0..len {
+                    prefix[position + 1] =
+                        prefix[position] + numeric_ops[index][position].unwrap_or(0.0);
+                    counts[position + 1] =
+                        counts[position] + u64::from(numeric_ops[index][position].is_some());
+                }
+                GroupFastState::Avg(prefix, counts)
+            }
+            "$min" | "$max" => {
+                let minimum = *op == "$min";
+                let sentinel = if minimum {
+                    f64::INFINITY
+                } else {
+                    f64::NEG_INFINITY
+                };
+                let values: Vec<f64> = numeric_ops[index]
+                    .iter()
+                    .map(|value| value.unwrap_or(sentinel))
+                    .collect();
+                let mut present = Vec::with_capacity(len + 1);
+                present.push(0u64);
+                for value in &numeric_ops[index] {
+                    let previous = *present.last().expect("present");
+                    present.push(previous + u64::from(value.is_some()));
+                }
+                let table = group_sparse_table(&values, minimum);
+                if minimum {
+                    GroupFastState::Min(table, present)
+                } else {
+                    GroupFastState::Max(table, present)
+                }
+            }
+            "$count" => GroupFastState::Count,
+            "$first" => GroupFastState::First,
+            "$last" => GroupFastState::Last,
+            _ => return Ok(None),
+        });
+    }
+    let mut results: Vec<Vec<Value>> = ops.iter().map(|_| Vec::with_capacity(len)).collect();
+    let mut cursor = RangeCursor::default();
+    for position in 0..len {
+        let Some((start, end)) =
+            frame_bounds_cursor(Some(window), position, len, range_values, &mut cursor)?
+        else {
+            return Ok(None);
+        };
+        for (index, state) in states.iter().enumerate() {
+            let value = match state {
+                GroupFastState::Sum(prefix) => number_value(prefix[end] - prefix[start]),
+                GroupFastState::Avg(prefix, counts) => {
+                    let count = counts[end] - counts[start];
+                    if count == 0 {
+                        Value::Null
+                    } else {
+                        number_value((prefix[end] - prefix[start]) / count as f64)
+                    }
+                }
+                GroupFastState::Min(table, present) => {
+                    if present[end] == present[start] {
+                        Value::Null
+                    } else {
+                        number_value(group_sparse_query(table, start, end, true))
+                    }
+                }
+                GroupFastState::Max(table, present) => {
+                    if present[end] == present[start] {
+                        Value::Null
+                    } else {
+                        number_value(group_sparse_query(table, start, end, false))
+                    }
+                }
+                GroupFastState::Count => Value::from((end - start) as u64),
+                GroupFastState::First => {
+                    if start >= end {
+                        Value::Null
+                    } else {
+                        values[index][start].clone()
+                    }
+                }
+                GroupFastState::Last => {
+                    if start >= end {
+                        Value::Null
+                    } else {
+                        values[index][end - 1].clone()
+                    }
+                }
+            };
+            results[index].push(value);
+        }
+    }
+    Ok(Some(results))
+}
+
 fn window_accumulator_group_values(
     docs: &[Value],
     indices: &[usize],
@@ -2381,6 +2541,39 @@ fn window_accumulator_group_values(
     let Some(window) = window else {
         return Ok(None);
     };
+    let same_output = |left: &WindowOutput, right: &WindowOutput| match (&left.op, &right.op) {
+        (
+            WindowOp::Accumulator(left_op, left_expr),
+            WindowOp::Accumulator(right_op, right_expr),
+        ) => left_op == right_op && left_expr == right_expr,
+        _ => false,
+    };
+    let mut unique = Vec::new();
+    let mut mapping = Vec::with_capacity(outputs.len());
+    for output in outputs {
+        if let Some(index) = unique
+            .iter()
+            .position(|candidate: &&WindowOutput| same_output(candidate, output))
+        {
+            mapping.push(index);
+        } else {
+            mapping.push(unique.len());
+            unique.push(output);
+        }
+    }
+    if unique.len() < outputs.len() {
+        let values =
+            window_accumulator_group_values(docs, indices, &unique, Some(window), sort, vars)?;
+        let Some(values) = values else {
+            return Ok(None);
+        };
+        return Ok(Some(
+            mapping
+                .into_iter()
+                .map(|index| values[index].clone())
+                .collect(),
+        ));
+    }
     let ops: Vec<(&str, &Value)> = outputs
         .iter()
         .map(|output| match &output.op {
@@ -2445,6 +2638,18 @@ fn window_accumulator_group_values(
         _ => None,
     };
     let len = indices.len();
+    if std::env::var("NONODB_WINDOW_FAST_FLOAT").ok().as_deref() == Some("1") {
+        if let Some(values) = window_group_fast_values(
+            &ops,
+            &values,
+            &numeric_ops,
+            window,
+            range_values.as_deref(),
+            len,
+        )? {
+            return Ok(Some(values));
+        }
+    }
     let workers = crate::collection::aggregate_workers()
         .min(len.div_ceil(512))
         .max(1);
@@ -3011,9 +3216,8 @@ fn window_partition_results(
                 }
             }
         }
-        let grouped_accumulators = std::env::var("NONODB_WINDOW_SEQUENTIAL").ok().as_deref()
-            != Some("1")
-            && std::env::var("NONODB_WINDOW_FAST_FLOAT").ok().as_deref() != Some("1");
+        let grouped_accumulators =
+            std::env::var("NONODB_WINDOW_SEQUENTIAL").ok().as_deref() != Some("1");
         if group.len() > 1 && grouped_accumulators {
             let selected: Vec<&WindowOutput> = group.iter().map(|index| &outputs[*index]).collect();
             let values = window_accumulator_group_values(

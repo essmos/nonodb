@@ -8,7 +8,10 @@ fn pipeline() -> Vec<Value> {
             "sortBy": {"i": 1},
             "output": {
                 "sum": {"$sum": "$amount", "window": {"documents": [-9, 0]}},
-                "avg": {"$avg": "$amount", "window": {"documents": [-9, 0]}}
+                "avg": {"$avg": "$amount", "window": {"documents": [-9, 0]}},
+                "avg2": {"$avg": "$amount", "window": {"documents": [-9, 0]}},
+                "min": {"$min": "$amount", "window": {"documents": [-9, 0]}},
+                "max": {"$max": "$amount", "window": {"documents": [-9, 0]}}
             }
         }
     })]
@@ -50,6 +53,14 @@ fn fast_float_is_opt_in_and_matches_within_tolerance() {
         assert!((exact_sum - fast_sum).abs() <= 1e-9 * exact_sum.abs().max(1.0));
         assert!((exact_avg - fast_avg).abs() <= 1e-9 * exact_avg.abs().max(1.0));
     }
+    for (exact_doc, fast_doc) in exact.iter().zip(&fast) {
+        assert_eq!(exact_doc["avg2"], exact_doc["avg"]);
+        let exact_avg2 = exact_doc["avg2"].as_f64().unwrap();
+        let fast_avg2 = fast_doc["avg2"].as_f64().unwrap();
+        assert!((exact_avg2 - fast_avg2).abs() <= 1e-9 * exact_avg2.abs().max(1.0));
+        assert_eq!(exact_doc["min"], fast_doc["min"]);
+        assert_eq!(exact_doc["max"], fast_doc["max"]);
+    }
 
     // The default path must stay bit-for-bit identical to direct sequential
     // accumulation; the fast path is isolated behind the environment flag.
@@ -64,5 +75,6 @@ fn fast_float_is_opt_in_and_matches_within_tolerance() {
         }
         assert_eq!(doc["sum"].as_f64().unwrap(), sum);
         assert_eq!(doc["avg"].as_f64().unwrap(), sum / count as f64);
+        assert_eq!(doc["avg2"].as_f64().unwrap(), sum / count as f64);
     }
 }
