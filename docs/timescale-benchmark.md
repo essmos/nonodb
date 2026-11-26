@@ -198,47 +198,35 @@ database (`TIMESCALE_URL` in `timescaledb.env`).
 
 ## 11. Window functions (`$setWindowFields`)
 
-Six window-engine optimizations were measured on the same 206M-row import.
-Window cases were run in isolation (median of 3) because the full tool suite
-loads both the page cache and the 4-vCPU host between cases.
+Window execution was measured on the same 206M-row import with the same end
+timestamp. NonoDB runs in-process; TimescaleDB queries run through `psycopg2`
+over the LAN and fetch the full result set. Both sides partition by `symbol`
+and order by `time`; TimescaleDB uses `RANK() OVER (...)`,
+`AVG(close) OVER (... ROWS BETWEEN 59 PRECEDING AND CURRENT ROW)` for the
+60-row average, and `AVG(close) OVER (... RANGE BETWEEN INTERVAL '1 hour'
+PRECEDING AND CURRENT ROW)` for the 1-hour range. The times cover query
+execution and result processing.
 
-| Case | Before window work | After |
-|---|---:|---:|
-| `$rank`, BTC/USD 7 d, partitionBy `symbol` | ~160–177 ms | **71 ms** |
-| 60-row `$avg close`, BTC/USD 7 d | ~191 ms | **97–108 ms** |
-| 1-hour range `$avg close`, BTC/USD 7 d | ~192 ms | **90–94 ms** |
-| all symbols, last 1 h, `$rank` | — | **11 ms** |
-| all symbols, last 1 h, 60-row `$avg` | — | **12 ms** |
-| all symbols, last 1 h, 1-hour range `$avg` | — | **12–14 ms** (occasional 16 ms under host contention) |
+| Case | Rows | NonoDB | TimescaleDB | NonoDB/Timescale | Winner |
+|---|---:|---:|---:|---:|---|
+| `$rank`, BTC/USD 7 d | 10,081 | **71 ms** | 71.3 ms | 1.00× | tie |
+| 60-row `$avg close`, BTC/USD 7 d | 10,081 | **100 ms** | 163.3 ms | 0.61× | NonoDB |
+| 1-hour range `$avg close`, BTC/USD 7 d | 10,081 | **91 ms** | 168.9 ms | 0.54× | NonoDB |
+| `$rank`, all symbols, last 1 h | 1,155 | 11 ms | **8.3 ms** | 1.33× | TimescaleDB |
+| 60-row `$avg close`, all symbols, last 1 h | 1,155 | 12 ms | **8.6 ms** | 1.39× | TimescaleDB |
+| 1-hour range `$avg close`, all symbols, last 1 h | 1,155 | 12 ms | **8.1 ms** | 1.48× | TimescaleDB |
 
-The all-symbols cases decode 38 open buckets and 1,155 rows; the columnar scan
+The all-symbols cases decode 38 open buckets and 1,155 rows. The columnar scan
 reads only the time field before materializing a row, so rows outside the
 requested window are skipped without allocating a full JSON document.
 
-Grouped outputs are reproducible with `cargo run --release --example
-window_group_bench -p nonodb-core`. It creates a 10k-row time-series collection
-and runs four distinct `$sum` outputs on the same `["unbounded", "current"]`
-frame. Exact/default mode, no fast-float:
-
-```text
-exact sequential outputs: 418.0 ms
-exact grouped outputs:    117.5 ms
-speedup:                  3.56x
-```
-
-The grouped path uses exact prefix sums/counts/min/max for unbounded-start
-frames; it preserves the sequential float addition order, so default results
-remain bit-for-bit identical. `window_ts_bench` also covers rank, range,
-parallel partitions, the columnar path and fast-float. Its full-pipeline
-fast-float run measured **20.7 ms exact -> 13.4 ms fast (1.55x)** for 1200-row
-`$sum`/`$avg` outputs. Fast-float remains opt-in through
-`NONODB_WINDOW_FAST_FLOAT=1`; an in-memory window-only check measured ~1.84x.
-
-Correctness coverage includes `grouped_unbounded_prefix_matches_brute_force`,
+NonoDB wins the single-series moving and range frames; the all-symbols cases
+favor TimescaleDB's columnar executor and result path. Correctness coverage
+includes `grouped_unbounded_prefix_matches_brute_force`,
 `parallel_partitions_match_brute_force`,
 `window_scan_matches_find_for_time_ranges`, and
-`fast_float_is_opt_in_and_matches_within_tolerance`; all differential window
-tests compare against the brute-force reference.
+`fast_float_is_opt_in_and_matches_within_tolerance`; differential window tests
+compare against the brute-force reference.
 
 ## 12. Comparison caveats
 

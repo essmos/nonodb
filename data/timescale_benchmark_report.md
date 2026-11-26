@@ -274,47 +274,36 @@ została zachowana.
 
 ## Funkcje okienkowe `$setWindowFields`
 
-Po etapie rollupów wdrożono sześć optymalizacji okien: precomputowane klucze
-sortowania i ranking, równoległość partycji, wspólny przebieg outputów na tej
-samej ramce, two-pointer range bounds, columnar/streaming skan TS oraz
-opcjonalny fast-float. Pomiary na tym samym imporcie 206 mln wierszy, osobne
-przebiegi (mediana 3), BTC/USD 7 dni:
+Pomiary na tym samym imporcie 206 mln wierszy i z tym samym końcem zakresu.
+NonoDB działa w procesie; zapytania TimescaleDB idą przez `psycopg2` po LAN
+i pobierają cały wynik. Obie strony dzielą po `symbol` i sortują po `time`;
+TimescaleDB używa `RANK() OVER (...)`,
+`AVG(close) OVER (... ROWS BETWEEN 59 PRECEDING AND CURRENT ROW)` dla średniej
+z 60 wierszy oraz `AVG(close) OVER (... RANGE BETWEEN INTERVAL '1 hour'
+PRECEDING AND CURRENT ROW)` dla zakresu 1 h. Czas obejmuje wykonanie zapytania
+i przetworzenie wyniku.
 
-| Przypadek | Przed | Po |
-|---|---:|---:|
-| `$rank`, BTC/USD 7 d | ~160–177 ms | **71 ms** |
-| `$avg` z 60-wierszowej ramki, BTC/USD 7 d | ~191 ms | **97–108 ms** |
-| `$avg` z ramki 1 h, BTC/USD 7 d | ~192 ms | **90–94 ms** |
-| wszystkie symbole, ostatnia 1 h, `$rank` | — | **11 ms** |
-| wszystkie symbole, ostatnia 1 h, `$avg` 60 wierszy | — | **12 ms** |
-| wszystkie symbole, ostatnia 1 h, `$avg` zakres 1 h | — | **12–14 ms** (sporadycznie 16 ms przy obciążeniu hosta) |
+| Przypadek | Wiersze | NonoDB | TimescaleDB | NonoDB/Timescale | Zwycięzca |
+|---|---:|---:|---:|---:|---|
+| `$rank`, BTC/USD 7 d | 10 081 | **71 ms** | 71,3 ms | 1,00× | remis |
+| `$avg` z 60-wierszowej ramki, BTC/USD 7 d | 10 081 | **100 ms** | 163,3 ms | 0,61× | NonoDB |
+| `$avg` z ramki 1 h, BTC/USD 7 d | 10 081 | **91 ms** | 168,9 ms | 0,54× | NonoDB |
+| `$rank`, wszystkie symbole, ostatnia 1 h | 1 155 | 11 ms | **8,3 ms** | 1,33× | TimescaleDB |
+| `$avg` z 60-wierszowej ramki, wszystkie symbole, ostatnia 1 h | 1 155 | 12 ms | **8,6 ms** | 1,39× | TimescaleDB |
+| `$avg` z ramki 1 h, wszystkie symbole, ostatnia 1 h | 1 155 | 12 ms | **8,1 ms** | 1,48× | TimescaleDB |
 
 Przypadek „wszystkie symbole” dekoduje 38 otwartych bucketów i 1 155 wierszy.
 Skan kolumnowy najpierw czyta tylko kolumnę czasu, a pełny JSON materializuje
 dopiero dla wierszy w żądanym zakresie.
 
-Cztery akumulatory na jednej ramce (`window_group_bench`, 10 tys. wierszy TS,
-cztery różne `$sum` na ramce `["unbounded", "current"]`, tryb domyślny/exact):
-
-```text
-exact sequential outputs: 418,0 ms
-exact grouped outputs:    117,5 ms
-speedup:                  3,56x
-```
-
-Grupowanie używa dokładnych sum prefiksowych dla ramek z początkiem
-`unbounded`; kolejność dodawania floatów jest taka sama jak w trybie
-sekwencyjnym, więc wyniki domyślne pozostają bit-zgodne. Fast-float jest tylko
-opt-in (`NONODB_WINDOW_FAST_FLOAT=1`); pełny pipeline w `window_ts_bench`:
-**20,7 ms exact -> 13,4 ms fast (1,55x)**, a pomiar samego okna w pamięci
-dał ~1,84x.
-
-Testy: `grouped_unbounded_prefix_matches_brute_force`,
+NonoDB wygrywa pojedynczą serię dla średniej ruchomej i zakresu; przypadki
+wszystkich symboli wygrywa TimescaleDB dzięki kolumnowemu wykonaniu i ścieżce
+wyniku. Testy: `grouped_unbounded_prefix_matches_brute_force`,
 `parallel_partitions_match_brute_force`,
 `window_scan_matches_find_for_time_ranges` oraz
 `fast_float_is_opt_in_and_matches_within_tolerance`.
 
-## Benchmark zapytań
+## Benchmark zapytań## Benchmark zapytań
 
 | Operacja | TimescaleDB | NonoDB bez indeksu | NonoDB z indeksem częściowym |
 |---|---:|---:|---:|
