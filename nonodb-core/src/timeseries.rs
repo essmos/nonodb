@@ -7741,6 +7741,24 @@ mod tests {
         assert_eq!(c.aggregate(&pipeline("hour")).unwrap(), raw_after);
         c.delete(&json!({"_id": added}), false).unwrap();
         assert_eq!(c.aggregate(&pipeline("hour")).unwrap(), raw_hour);
+
+        // An update invalidates the covering rollups and falls back to raw rows.
+        let changed = c
+            .insert_one(json!({
+                "ts": {"$date": {"$numberLong": (base + day + 90_000_000).to_string()}},
+                "device": "d0", "open": 1, "high": 2, "low": 0, "close": 1, "volume": 1.0,
+            }))
+            .unwrap();
+        c.update(
+            &json!({"_id": changed}),
+            &json!({"$set": {"volume": 42.0}}),
+            false,
+        )
+        .unwrap();
+        let raw_updated = c.aggregate(&pipeline("hour")).unwrap();
+        assert_ne!(raw_updated, raw_hour);
+        assert_eq!(c.aggregate(&pipeline("hour")).unwrap(), raw_updated);
+        c.delete(&json!({"_id": changed}), false).unwrap();
     }
 
     #[test]
