@@ -2048,9 +2048,9 @@ fn window_sliding_values(
                     while let Some((_, back)) = deque.back() {
                         let ordering = compare_value(value, back);
                         let remove = if op == "$min" {
-                            ordering != Ordering::Greater
+                            ordering == Ordering::Less
                         } else {
-                            ordering != Ordering::Less
+                            ordering == Ordering::Greater
                         };
                         if remove {
                             deque.pop_back();
@@ -2068,6 +2068,50 @@ fn window_sliding_values(
                     .map(|(_, value)| value.clone())
                     .unwrap_or(Value::Null),
             );
+        }
+        return Ok(Some(out));
+    }
+
+    // Floating-point sums must add values in the same order as the
+    // brute-force frame accumulator. A running sum is not bit-exact (and a
+    // Decimal in the frame would leak its type after leaving). Use a tight
+    // sequential f64 loop for plain numbers; Decimal frames keep the generic
+    // per-frame accumulator.
+    if op == "$sum" || op == "$avg" {
+        if values.iter().any(numeric::is_decimal) {
+            return Ok(None);
+        }
+        let numbers: Vec<Option<f64>> = values.iter().map(numeric::as_f64).collect();
+        let mut out = Vec::with_capacity(len);
+        for position in 0..len {
+            let Some((start, end)) = frame_bounds(Some(window), position, len, range_values)?
+            else {
+                return Ok(None);
+            };
+            let mut sum = 0.0f64;
+            let mut count = 0u64;
+            for value in &numbers[start..end] {
+                let Some(value) = *value else {
+                    continue;
+                };
+                if op == "$avg" {
+                    if value.is_finite() {
+                        sum += value;
+                        count += 1;
+                    }
+                } else {
+                    sum += value;
+                }
+            }
+            out.push(if op == "$avg" {
+                if count == 0 {
+                    Value::Null
+                } else {
+                    number_value(sum / count as f64)
+                }
+            } else {
+                number_value(sum)
+            });
         }
         return Ok(Some(out));
     }
@@ -2094,6 +2138,13 @@ fn window_sliding_values(
         while right < end {
             accumulator.update(op, &values[right])?;
             right += 1;
+        }
+        if start >= end {
+            // Avoid a floating/decimal residual left by add/remove when the
+            // frame becomes empty.
+            accumulator = Accumulator::new(op);
+            left = start;
+            right = start;
         }
         out.push(accumulator.value()?);
     }
@@ -3227,34 +3278,6 @@ impl NumericSum {
         }
     }
 
-    fn sub(&mut self, value: &Value) {
-        if numeric::is_decimal(value) {
-            let Some(d) = numeric::as_bigdecimal(value) else {
-                return;
-            };
-            match self {
-                Self::Float(f) => {
-                    let mut sum = BigDecimal::from_f64(*f).unwrap_or_default();
-                    sum -= d;
-                    *self = Self::Decimal(sum);
-                }
-                Self::Decimal(sum) => *sum -= d,
-            }
-            return;
-        }
-        let Some(f) = numeric::as_f64(value) else {
-            return;
-        };
-        match self {
-            Self::Float(sum) => *sum -= f,
-            Self::Decimal(sum) => {
-                if let Some(d) = BigDecimal::from_f64(f) {
-                    *sum -= d;
-                }
-            }
-        }
-    }
-
     fn merge(&mut self, other: NumericSum) {
         match (&mut *self, other) {
             (Self::Float(left), Self::Float(right)) => *left += right,
@@ -3384,15 +3407,8 @@ impl Accumulator {
         Ok(())
     }
 
-    fn remove(&mut self, op: &str, value: &Value) -> Result<()> {
+    fn remove(&mut self, op: &str, _value: &Value) -> Result<()> {
         match (self, op) {
-            (Self::Sum(sum), "$sum") => sum.sub(value),
-            (Self::Avg { sum, count }, "$avg") => {
-                if numeric::parse_value(value).is_some_and(|n| n.is_finite()) {
-                    sum.sub(value);
-                    *count = count.saturating_sub(1);
-                }
-            }
             (Self::Count(count), "$count") => *count = count.saturating_sub(1),
             _ => {
                 return Err(Error::Query(
@@ -6394,5 +6410,78 @@ mod tests {
             brute_set_window_fields(date_docs.clone(), &date_spec, &BTreeMap::new()).unwrap();
         let actual = set_window_fields(date_docs, &date_spec, &BTreeMap::new()).unwrap();
         assert_eq!(actual, expected);
+
+        // Floating-point frame sums must preserve the brute-force addition
+        // order; a running f64 sum can otherwise differ in the last bits.
+        let float_docs = vec![
+            json!({"_id": "f1", "x": 1, "amount": 0.1}),
+            json!({"_id": "f2", "x": 2, "amount": 0.2}),
+            json!({"_id": "f3", "x": 3, "amount": 0.3}),
+            json!({"_id": "f4", "x": 4, "amount": 0.4}),
+            json!({"_id": "f5", "x": 5, "amount": 1e16}),
+            json!({"_id": "f6", "x": 6, "amount": 1.0}),
+            json!({"_id": "f7", "x": 7, "amount": 1.0}),
+            json!({"_id": "f8", "x": 8, "amount": 1.0}),
+        ];
+        let float_spec = json!({
+            "sortBy": {"x": 1},
+            "output": {
+                "forward": {"$sum": "$amount", "window": {"documents": [1, 2]}},
+                "backward": {"$sum": "$amount", "window": {"documents": [-1, 0]}},
+                "around": {"$sum": "$amount", "window": {"documents": [-1, 1]}},
+                "avg": {"$avg": "$amount", "window": {"documents": [-1, 1]}}
+            }
+        });
+        let expected =
+            brute_set_window_fields(float_docs.clone(), &float_spec, &BTreeMap::new()).unwrap();
+        let actual = set_window_fields(float_docs, &float_spec, &BTreeMap::new()).unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(actual[6]["backward"], 2.0);
+        assert_eq!(actual[6]["around"], 3.0);
+        assert_eq!(actual[7]["forward"], 0);
+
+        // A Decimal in the frame must not make a later all-float frame return
+        // an Extended JSON Decimal.
+        let decimal_docs = vec![
+            json!({"_id": "m1", "x": 1, "amount": {"$numberDecimal": "1.5"}}),
+            json!({"_id": "m2", "x": 2, "amount": 2.5}),
+            json!({"_id": "m3", "x": 3, "amount": 3.5}),
+            json!({"_id": "m4", "x": 4, "amount": 4.5}),
+        ];
+        let decimal_spec = json!({
+            "sortBy": {"x": 1},
+            "output": {
+                "sum": {"$sum": "$amount", "window": {"range": [-1, 1]}},
+                "avg": {"$avg": "$amount", "window": {"range": [-1, 1]}},
+                "min": {"$min": "$amount", "window": {"range": [-1, 1]}},
+                "max": {"$max": "$amount", "window": {"range": [-1, 1]}}
+            }
+        });
+        let expected =
+            brute_set_window_fields(decimal_docs.clone(), &decimal_spec, &BTreeMap::new()).unwrap();
+        let actual = set_window_fields(decimal_docs, &decimal_spec, &BTreeMap::new()).unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(actual[3]["sum"], 8);
+
+        // Equal numeric values in different representations must keep the
+        // first value, matching the strict comparison in Accumulator.
+        let tie_docs = vec![
+            json!({"_id": "t1", "x": 1, "amount": 1}),
+            json!({"_id": "t2", "x": 2, "amount": {"$numberDecimal": "1"}}),
+            json!({"_id": "t3", "x": 3, "amount": 1}),
+        ];
+        let tie_spec = json!({
+            "sortBy": {"x": 1},
+            "output": {
+                "min": {"$min": "$amount", "window": {"documents": [-1, 1]}},
+                "max": {"$max": "$amount", "window": {"documents": [-1, 1]}}
+            }
+        });
+        let expected =
+            brute_set_window_fields(tie_docs.clone(), &tie_spec, &BTreeMap::new()).unwrap();
+        let actual = set_window_fields(tie_docs, &tie_spec, &BTreeMap::new()).unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(actual[1]["min"], 1);
+        assert_eq!(actual[1]["max"], 1);
     }
 }
