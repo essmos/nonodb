@@ -33,11 +33,13 @@
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 
 use heed::types::Bytes;
 use heed::{Database, RoTxn, RwTxn};
-use serde::{Deserialize, Serialize};
+use serde::de::{IgnoredAny, MapAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 
 use crate::collection::{compare_docs, project_document, FindQuery};
@@ -3282,8 +3284,8 @@ pub(crate) fn find_window_docs(
     settings: &Settings,
     query: &FindQuery,
 ) -> Result<Vec<Value>> {
-    let workers = crate::collection::scan_workers().min(4);
-    if workers <= 1 {
+    let available_workers = crate::collection::scan_workers();
+    if available_workers <= 1 {
         return find(rtxn, env, name, settings, query);
     }
     let Some(locators) = lookup_indexed_buckets(rtxn, env, name, &query.filter, settings)? else {
@@ -3292,6 +3294,11 @@ pub(crate) fn find_window_docs(
     if locators.len() < 2 {
         return find(rtxn, env, name, settings, query);
     }
+    let workers = if locators.len() > 16 {
+        available_workers.min(8)
+    } else {
+        available_workers.min(4)
+    };
     let db_name = format!("{BUCKET_DB_PREFIX}{name}");
     if env
         .open_database::<Bytes, Bytes>(rtxn, Some(&db_name))?
@@ -4294,6 +4301,41 @@ fn docs_for_bucket_window(
     Ok(docs_from_window_rows(loc, rows))
 }
 
+struct TimeFieldVisitor<'a> {
+    field: &'a str,
+    value: Option<Value>,
+}
+
+impl<'de, 'a> Visitor<'de> for TimeFieldVisitor<'a> {
+    type Value = Option<Value>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a time-series document object")
+    }
+
+    fn visit_map<M>(mut self, mut map: M) -> std::result::Result<Self::Value, M::Error>
+    where
+        M: MapAccess<'de>,
+    {
+        while let Some(key) = map.next_key::<Cow<'de, str>>()? {
+            if key == self.field {
+                self.value = Some(map.next_value::<Value>()?);
+            } else {
+                let _: IgnoredAny = map.next_value()?;
+            }
+        }
+        Ok(self.value)
+    }
+}
+
+fn payload_time_ms(payload: &[u8], field: &str) -> Option<i64> {
+    let mut deserializer = serde_json::Deserializer::from_slice(payload);
+    let value = deserializer
+        .deserialize_map(TimeFieldVisitor { field, value: None })
+        .ok()?;
+    value.as_ref().and_then(time_value_ms)
+}
+
 fn docs_for_bucket_locator(
     rtxn: &RoTxn<'_>,
     db: &Database<Bytes, Bytes>,
@@ -4321,11 +4363,22 @@ fn docs_for_bucket_locator(
         let Some((hash, salt, window, serial, seq)) = row_key_parts(key) else {
             continue;
         };
-        let row: Map<String, Value> = serde_json::from_slice(payload)?;
-        let ts = if settings.time_field.contains('.') {
-            extract_time(&Value::Object(row.clone()), &settings.time_field)
+        let simple_time = !settings.time_field.contains('.');
+        let quick_time = if simple_time && (low.is_some() || high.is_some()) {
+            payload_time_ms(payload, &settings.time_field)
         } else {
+            None
+        };
+        if quick_time
+            .is_some_and(|ts| low.is_some_and(|low| ts < low) || high.is_some_and(|high| ts > high))
+        {
+            continue;
+        }
+        let row: Map<String, Value> = serde_json::from_slice(payload)?;
+        let ts = if simple_time {
             row.get(&settings.time_field).and_then(time_value_ms)
+        } else {
+            extract_time(&Value::Object(row.clone()), &settings.time_field)
         };
         if ts
             .is_some_and(|ts| low.is_some_and(|low| ts < low) || high.is_some_and(|high| ts > high))

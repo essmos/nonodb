@@ -2415,6 +2415,134 @@ fn group_sparse_query(table: &[Vec<f64>], start: usize, end: usize, minimum: boo
     }
 }
 
+fn window_group_unbounded_values(
+    ops: &[(&str, &Value)],
+    values: &[Vec<Value>],
+    numeric_ops: &[Vec<Option<f64>>],
+    window: &WindowFrame,
+    range_values: Option<&[RangeValue]>,
+    len: usize,
+) -> Result<Option<Vec<Vec<Value>>>> {
+    let start_unbounded = match window {
+        WindowFrame::Documents { start, .. } => *start == WindowBound::Unbounded,
+        WindowFrame::Range { start, .. } => *start == WindowRangeBound::Unbounded,
+    };
+    if !start_unbounded {
+        return Ok(None);
+    }
+    enum State {
+        Sum(Vec<f64>),
+        Avg(Vec<f64>, Vec<u64>),
+        Min(Vec<Option<Value>>),
+        Max(Vec<Option<Value>>),
+        Count,
+        First,
+        Last,
+    }
+    let mut states = Vec::with_capacity(ops.len());
+    for (index, (op, _)) in ops.iter().enumerate() {
+        states.push(match *op {
+            "$sum" => {
+                let mut prefix = Vec::with_capacity(len + 1);
+                prefix.push(0.0);
+                for value in &numeric_ops[index] {
+                    prefix.push(prefix.last().copied().unwrap_or(0.0) + value.unwrap_or(0.0));
+                }
+                State::Sum(prefix)
+            }
+            "$avg" => {
+                let mut prefix = Vec::with_capacity(len + 1);
+                let mut counts = Vec::with_capacity(len + 1);
+                prefix.push(0.0);
+                counts.push(0u64);
+                for value in &numeric_ops[index] {
+                    prefix.push(prefix.last().copied().unwrap_or(0.0) + value.unwrap_or(0.0));
+                    counts.push(counts.last().copied().unwrap_or(0) + u64::from(value.is_some()));
+                }
+                State::Avg(prefix, counts)
+            }
+            "$min" | "$max" => {
+                let minimum = *op == "$min";
+                let mut prefix = Vec::with_capacity(len + 1);
+                prefix.push(None);
+                let mut current: Option<Value> = None;
+                for value in &values[index] {
+                    if !value.is_null()
+                        && current
+                            .as_ref()
+                            .map(|old| {
+                                let ordering = compare_value(value, old);
+                                if minimum {
+                                    ordering == Ordering::Less
+                                } else {
+                                    ordering == Ordering::Greater
+                                }
+                            })
+                            .unwrap_or(true)
+                    {
+                        current = Some(value.clone());
+                    }
+                    prefix.push(current.clone());
+                }
+                if minimum {
+                    State::Min(prefix)
+                } else {
+                    State::Max(prefix)
+                }
+            }
+            "$count" => State::Count,
+            "$first" => State::First,
+            "$last" => State::Last,
+            _ => return Ok(None),
+        });
+    }
+    let mut results: Vec<Vec<Value>> = ops.iter().map(|_| Vec::with_capacity(len)).collect();
+    let mut cursor = RangeCursor::default();
+    for position in 0..len {
+        let Some((start, end)) =
+            frame_bounds_cursor(Some(window), position, len, range_values, &mut cursor)?
+        else {
+            return Ok(None);
+        };
+        if start != 0 {
+            return Ok(None);
+        }
+        for (index, state) in states.iter().enumerate() {
+            let value = match state {
+                State::Sum(prefix) => number_value(prefix[end]),
+                State::Avg(prefix, counts) => {
+                    let count = counts[end];
+                    if count == 0 {
+                        Value::Null
+                    } else {
+                        number_value(prefix[end] / count as f64)
+                    }
+                }
+                State::Min(prefix) | State::Max(prefix) => {
+                    prefix[end].clone().unwrap_or(Value::Null)
+                }
+                State::Count => Value::from(end as u64),
+                State::First => {
+                    if end == 0 {
+                        Value::Null
+                    } else {
+                        values[index][0].clone()
+                    }
+                }
+                State::Last => {
+                    if end == 0 {
+                        Value::Null
+                    } else {
+                        values[index][end - 1].clone()
+                    }
+                }
+            };
+            results[index].push(value);
+        }
+    }
+    Ok(Some(results))
+}
+
 fn window_group_fast_values(
     ops: &[(&str, &Value)],
     values: &[Vec<Value>],
@@ -2638,6 +2766,16 @@ fn window_accumulator_group_values(
         _ => None,
     };
     let len = indices.len();
+    if let Some(values) = window_group_unbounded_values(
+        &ops,
+        &values,
+        &numeric_ops,
+        window,
+        range_values.as_deref(),
+        len,
+    )? {
+        return Ok(Some(values));
+    }
     if std::env::var("NONODB_WINDOW_FAST_FLOAT").ok().as_deref() == Some("1") {
         if let Some(values) = window_group_fast_values(
             &ops,
@@ -7208,6 +7346,37 @@ mod tests {
                 "rank": {"$rank": {}},
                 "sum": {"$sum": "$amount", "window": {"documents": [-5, 0]}},
                 "avg": {"$avg": "$amount", "window": {"documents": [-5, 0]}}
+            }
+        });
+        let expected = brute_set_window_fields(docs.clone(), &spec, &BTreeMap::new()).unwrap();
+        let actual =
+            set_window_fields_with_workers(docs, &spec, &BTreeMap::new(), Some(4)).unwrap();
+        assert_eq!(actual, expected);
+    }
+    #[test]
+    fn grouped_unbounded_prefix_matches_brute_force() {
+        let docs: Vec<Value> = (0..300)
+            .map(|index| {
+                json!({
+                    "_id": format!("d{index}"),
+                    "x": index,
+                    "a": (index as f64 + 1.0) / 7.0,
+                    "b": (index as f64 + 2.0) / 11.0,
+                    "c": (index as f64 + 3.0) / 13.0,
+                    "d": (index as f64 + 4.0) / 17.0,
+                })
+            })
+            .collect();
+        let spec = json!({
+            "sortBy": {"x": 1},
+            "output": {
+                "a": {"$sum": "$a", "window": {"documents": ["unbounded", "current"]}},
+                "b": {"$avg": "$b", "window": {"documents": ["unbounded", "current"]}},
+                "c": {"$min": "$c", "window": {"documents": ["unbounded", "current"]}},
+                "d": {"$max": "$d", "window": {"documents": ["unbounded", "current"]}},
+                "e": {"$count": {}, "window": {"documents": ["unbounded", "current"]}},
+                "f": {"$first": "$a", "window": {"documents": ["unbounded", "current"]}},
+                "g": {"$last": "$d", "window": {"documents": ["unbounded", "current"]}}
             }
         });
         let expected = brute_set_window_fields(docs.clone(), &spec, &BTreeMap::new()).unwrap();
