@@ -88,6 +88,14 @@ Medians of 3 runs on the full 206-million-row dataset:
 | OHLC 1 h BTC/USD, 30 d | **5.12 ms** | 55.87 ms | 0.09× | NonoDB |
 | OHLC 1 h all symbols, 1 h | 38.67 ms | **2.48 ms** | 15.6× | TimescaleDB |
 | OHLC 1 d all symbols, 1 d | 86.06 ms | **32.89 ms** | 2.6× | TimescaleDB |
+| RAM: process vs container | **27.1 MiB** process RSS | **~2.2 GiB** cgroup | 0.012× | NonoDB* |
+| Database size | **7.34 GiB** | 11 GB | 0.67× | NonoDB |
+| `symbol_ts_recent` index | **~52.3 MB** | ~435 MB | 0.12× | NonoDB |
+
+\* RAM is not directly comparable: the NonoDB number is process RSS only
+(OS page cache is additional), while the TimescaleDB number is the whole `pg`
+cgroup including `shared_buffers`/`shmem`. See section 7 for the detailed
+breakdown.
 
 Key numbers:
 
