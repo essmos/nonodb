@@ -6,7 +6,7 @@
 
 use std::cmp::Ordering;
 use std::collections::btree_map::Entry;
-use std::collections::{BTreeMap, BinaryHeap, HashSet};
+use std::collections::{BTreeMap, BinaryHeap, HashSet, VecDeque};
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -1892,6 +1892,214 @@ fn window_frame_positions(
     }
 }
 
+fn range_values_for(
+    docs: &[Value],
+    indices: &[usize],
+    sort: &[(String, i32)],
+) -> Result<Option<Vec<RangeValue>>> {
+    let Some((field, direction)) = sort.first().filter(|_| sort.len() == 1) else {
+        return Ok(None);
+    };
+    if *direction != 1 {
+        return Ok(None);
+    }
+    let mut values = Vec::with_capacity(indices.len());
+    for index in indices {
+        let Some(value) = range_sort_value(&docs[*index], field)? else {
+            return Ok(None);
+        };
+        values.push(value);
+    }
+    Ok(Some(values))
+}
+
+fn range_lower_bound(values: &[RangeValue], bound: &RangeValue) -> Result<usize> {
+    let mut left = 0usize;
+    let mut right = values.len();
+    while left < right {
+        let middle = left + (right - left) / 2;
+        if range_value_cmp(&values[middle], bound)? == Ordering::Less {
+            left = middle + 1;
+        } else {
+            right = middle;
+        }
+    }
+    Ok(left)
+}
+
+fn range_upper_bound(values: &[RangeValue], bound: &RangeValue) -> Result<usize> {
+    let mut left = 0usize;
+    let mut right = values.len();
+    while left < right {
+        let middle = left + (right - left) / 2;
+        if range_value_cmp(&values[middle], bound)? == Ordering::Greater {
+            right = middle;
+        } else {
+            left = middle + 1;
+        }
+    }
+    Ok(left)
+}
+
+fn document_frame_bounds(frame: &WindowFrame, position: usize, len: usize) -> (usize, usize) {
+    let WindowFrame::Documents { start, end } = frame else {
+        unreachable!("document frame expected");
+    };
+    let raw_start = resolve_window_bound(start, position, len, true);
+    let raw_end = resolve_window_bound(end, position, len, false);
+    let start = raw_start.clamp(0, len as i64) as usize;
+    let end = raw_end.saturating_add(1).clamp(0, len as i64) as usize;
+    (start, end.max(start))
+}
+
+/// Returns `[start, end)` for a frame. `None` means the range frame needs the
+/// slow fallback (descending sort or missing sort values).
+fn frame_bounds(
+    frame: Option<&WindowFrame>,
+    position: usize,
+    len: usize,
+    range_values: Option<&[RangeValue]>,
+) -> Result<Option<(usize, usize)>> {
+    match frame {
+        None => Ok(Some((0, len))),
+        Some(WindowFrame::Documents { .. }) => {
+            Ok(Some(document_frame_bounds(frame.unwrap(), position, len)))
+        }
+        Some(WindowFrame::Range { start, end, unit }) => {
+            let Some(values) = range_values else {
+                return Ok(None);
+            };
+            let current = &values[position];
+            let lower = range_bound_value(start, current, unit.as_deref())?;
+            let upper = range_bound_value(end, current, unit.as_deref())?;
+            let start = match lower {
+                Some(bound) => range_lower_bound(values, &bound)?,
+                None => 0,
+            };
+            let end = match upper {
+                Some(bound) => range_upper_bound(values, &bound)?,
+                None => len,
+            };
+            let start = start.min(len);
+            let end = end.clamp(start, len);
+            Ok(Some((start, end)))
+        }
+    }
+}
+
+fn window_sliding_values(
+    op: &str,
+    values: &[Value],
+    window: &WindowFrame,
+    range_values: Option<&[RangeValue]>,
+) -> Result<Option<Vec<Value>>> {
+    if !matches!(
+        op,
+        "$sum" | "$avg" | "$count" | "$min" | "$max" | "$first" | "$last"
+    ) {
+        return Ok(None);
+    }
+    let len = values.len();
+    let mut out = Vec::with_capacity(len);
+
+    if op == "$first" || op == "$last" {
+        for position in 0..len {
+            let Some((start, end)) = frame_bounds(Some(window), position, len, range_values)?
+            else {
+                return Ok(None);
+            };
+            if start >= end {
+                out.push(Value::Null);
+            } else if op == "$first" {
+                out.push(values[start].clone());
+            } else {
+                out.push(values[end - 1].clone());
+            }
+        }
+        return Ok(Some(out));
+    }
+
+    if op == "$min" || op == "$max" {
+        let mut deque: VecDeque<(usize, Value)> = VecDeque::new();
+        let mut left = 0usize;
+        let mut right = 0usize;
+        for position in 0..len {
+            let Some((start, end)) = frame_bounds(Some(window), position, len, range_values)?
+            else {
+                return Ok(None);
+            };
+            if start < left || end < right {
+                return Ok(None);
+            }
+            left = start;
+            while let Some((index, _)) = deque.front() {
+                if *index < left {
+                    deque.pop_front();
+                } else {
+                    break;
+                }
+            }
+            if right < left {
+                right = left;
+            }
+            while right < end {
+                let value = &values[right];
+                if !value.is_null() {
+                    while let Some((_, back)) = deque.back() {
+                        let ordering = compare_value(value, back);
+                        let remove = if op == "$min" {
+                            ordering != Ordering::Greater
+                        } else {
+                            ordering != Ordering::Less
+                        };
+                        if remove {
+                            deque.pop_back();
+                        } else {
+                            break;
+                        }
+                    }
+                    deque.push_back((right, value.clone()));
+                }
+                right += 1;
+            }
+            out.push(
+                deque
+                    .front()
+                    .map(|(_, value)| value.clone())
+                    .unwrap_or(Value::Null),
+            );
+        }
+        return Ok(Some(out));
+    }
+
+    let mut accumulator = Accumulator::new(op);
+    let mut left = 0usize;
+    let mut right = 0usize;
+    for position in 0..len {
+        let Some((start, end)) = frame_bounds(Some(window), position, len, range_values)? else {
+            return Ok(None);
+        };
+        if start < left || end < right {
+            return Ok(None);
+        }
+        while left < start {
+            if left < right {
+                accumulator.remove(op, &values[left])?;
+            }
+            left += 1;
+        }
+        if right < left {
+            right = left;
+        }
+        while right < end {
+            accumulator.update(op, &values[right])?;
+            right += 1;
+        }
+        out.push(accumulator.value()?);
+    }
+    Ok(Some(out))
+}
+
 fn window_accumulator_values(
     docs: &[Value],
     indices: &[usize],
@@ -1901,18 +2109,41 @@ fn window_accumulator_values(
     sort: &[(String, i32)],
     vars: &BTreeMap<String, Value>,
 ) -> Result<Vec<Value>> {
+    let values: Vec<Value> = if op == "$count" {
+        vec![Value::Null; indices.len()]
+    } else {
+        indices
+            .iter()
+            .map(|index| eval_expr_vars(&docs[*index], expression, vars))
+            .collect::<Result<Vec<_>>>()?
+    };
+    let range_values = match window {
+        Some(WindowFrame::Range { .. }) => range_values_for(docs, indices, sort)?,
+        _ => None,
+    };
+    if let Some(window) = window {
+        if let Some(values) = window_sliding_values(op, &values, window, range_values.as_deref())? {
+            return Ok(values);
+        }
+    }
     let mut out = Vec::with_capacity(indices.len());
     if let Some(window) = window {
         for position in 0..indices.len() {
             let mut accumulator = Accumulator::new(op);
-            for frame_position in window_frame_positions(window, docs, indices, position, sort)? {
-                let frame_index = indices[frame_position];
-                let value = if op == "$count" {
-                    Value::Null
-                } else {
-                    eval_expr_vars(&docs[frame_index], expression, vars)?
-                };
-                accumulator.update(op, &value)?;
+            if let Some((start, end)) = frame_bounds(
+                Some(window),
+                position,
+                indices.len(),
+                range_values.as_deref(),
+            )? {
+                for value in &values[start..end] {
+                    accumulator.update(op, value)?;
+                }
+            } else {
+                for frame_position in window_frame_positions(window, docs, indices, position, sort)?
+                {
+                    accumulator.update(op, &values[frame_position])?;
+                }
             }
             out.push(accumulator.finish()?);
         }
@@ -1922,13 +2153,8 @@ fn window_accumulator_values(
     // MongoDB's default window is unbounded to unbounded: the accumulator sees
     // the whole partition and every row receives the same result.
     let mut accumulator = Accumulator::new(op);
-    for index in indices {
-        let value = if op == "$count" {
-            Value::Null
-        } else {
-            eval_expr_vars(&docs[*index], expression, vars)?
-        };
-        accumulator.update(op, &value)?;
+    for value in &values {
+        accumulator.update(op, value)?;
     }
     let value = accumulator.finish()?;
     out.resize(indices.len(), value);
@@ -2079,6 +2305,125 @@ fn window_derivative_values(
             "$derivative requires exactly one sortBy field".into(),
         ));
     };
+    let range_values = match window {
+        Some(WindowFrame::Range { .. }) => range_values_for(docs, indices, sort)?,
+        _ => None,
+    };
+    let mut out = Vec::with_capacity(indices.len());
+    for position in 0..indices.len() {
+        let Some((start, end)) =
+            frame_bounds(window, position, indices.len(), range_values.as_deref())?
+        else {
+            return window_derivative_values_slow(docs, indices, input, unit, window, sort, vars);
+        };
+        if start >= end {
+            out.push(Value::Null);
+            continue;
+        }
+        let first_doc = &docs[indices[start]];
+        let last_doc = &docs[indices[end - 1]];
+        let (Some(x0), Some(x1)) = (
+            window_x_value(first_doc, field, unit, "$derivative")?,
+            window_x_value(last_doc, field, unit, "$derivative")?,
+        ) else {
+            out.push(Value::Null);
+            continue;
+        };
+        let (Some(y0), Some(y1)) = (
+            numeric::as_f64(&eval_expr_vars(first_doc, input, vars)?),
+            numeric::as_f64(&eval_expr_vars(last_doc, input, vars)?),
+        ) else {
+            out.push(Value::Null);
+            continue;
+        };
+        out.push(if x1 == x0 {
+            Value::Null
+        } else {
+            number_value((y1 - y0) / (x1 - x0))
+        });
+    }
+    Ok(out)
+}
+
+fn window_integral_values(
+    docs: &[Value],
+    indices: &[usize],
+    input: &Value,
+    unit: Option<&str>,
+    window: Option<&WindowFrame>,
+    sort: &[(String, i32)],
+    vars: &BTreeMap<String, Value>,
+) -> Result<Vec<Value>> {
+    let Some((field, _)) = sort.first().filter(|_| sort.len() == 1) else {
+        return Err(Error::Query(
+            "$integral requires exactly one sortBy field".into(),
+        ));
+    };
+    let range_values = match window {
+        Some(WindowFrame::Range { .. }) => range_values_for(docs, indices, sort)?,
+        _ => None,
+    };
+    let len = indices.len();
+    let mut xs = Vec::with_capacity(len);
+    let mut ys = Vec::with_capacity(len);
+    for index in indices {
+        xs.push(window_x_value(&docs[*index], field, unit, "$integral")?);
+        ys.push(numeric::as_f64(&eval_expr_vars(
+            &docs[*index],
+            input,
+            vars,
+        )?));
+    }
+    let mut prefix = vec![0.0f64; len];
+    let mut invalid_prefix = vec![0usize; len];
+    for position in 0..len.saturating_sub(1) {
+        if let (Some(x0), Some(x1), Some(y0), Some(y1)) = (
+            xs[position],
+            xs[position + 1],
+            ys[position],
+            ys[position + 1],
+        ) {
+            prefix[position + 1] = prefix[position] + (x1 - x0) * (y0 + y1) / 2.0;
+            invalid_prefix[position + 1] = invalid_prefix[position];
+        } else {
+            prefix[position + 1] = prefix[position];
+            invalid_prefix[position + 1] = invalid_prefix[position] + 1;
+        }
+    }
+    let mut out = Vec::with_capacity(len);
+    for position in 0..len {
+        let Some((start, end)) = frame_bounds(window, position, len, range_values.as_deref())?
+        else {
+            return window_integral_values_slow(docs, indices, input, unit, window, sort, vars);
+        };
+        if end.saturating_sub(start) < 2 {
+            out.push(Value::from(0));
+            continue;
+        }
+        let invalid = invalid_prefix[end - 1].saturating_sub(invalid_prefix[start]);
+        if invalid > 0 {
+            out.push(Value::Null);
+        } else {
+            out.push(number_value(prefix[end - 1] - prefix[start]));
+        }
+    }
+    Ok(out)
+}
+
+fn window_derivative_values_slow(
+    docs: &[Value],
+    indices: &[usize],
+    input: &Value,
+    unit: Option<&str>,
+    window: Option<&WindowFrame>,
+    sort: &[(String, i32)],
+    vars: &BTreeMap<String, Value>,
+) -> Result<Vec<Value>> {
+    let Some((field, _)) = sort.first().filter(|_| sort.len() == 1) else {
+        return Err(Error::Query(
+            "$derivative requires exactly one sortBy field".into(),
+        ));
+    };
     let mut out = Vec::with_capacity(indices.len());
     for position in 0..indices.len() {
         let frame = window_frame_positions_or_all(docs, indices, position, sort, window)?;
@@ -2111,7 +2456,7 @@ fn window_derivative_values(
     Ok(out)
 }
 
-fn window_integral_values(
+fn window_integral_values_slow(
     docs: &[Value],
     indices: &[usize],
     input: &Value,
@@ -2882,6 +3227,34 @@ impl NumericSum {
         }
     }
 
+    fn sub(&mut self, value: &Value) {
+        if numeric::is_decimal(value) {
+            let Some(d) = numeric::as_bigdecimal(value) else {
+                return;
+            };
+            match self {
+                Self::Float(f) => {
+                    let mut sum = BigDecimal::from_f64(*f).unwrap_or_default();
+                    sum -= d;
+                    *self = Self::Decimal(sum);
+                }
+                Self::Decimal(sum) => *sum -= d,
+            }
+            return;
+        }
+        let Some(f) = numeric::as_f64(value) else {
+            return;
+        };
+        match self {
+            Self::Float(sum) => *sum -= f,
+            Self::Decimal(sum) => {
+                if let Some(d) = BigDecimal::from_f64(f) {
+                    *sum -= d;
+                }
+            }
+        }
+    }
+
     fn merge(&mut self, other: NumericSum) {
         match (&mut *self, other) {
             (Self::Float(left), Self::Float(right)) => *left += right,
@@ -3009,6 +3382,29 @@ impl Accumulator {
             }
         }
         Ok(())
+    }
+
+    fn remove(&mut self, op: &str, value: &Value) -> Result<()> {
+        match (self, op) {
+            (Self::Sum(sum), "$sum") => sum.sub(value),
+            (Self::Avg { sum, count }, "$avg") => {
+                if numeric::parse_value(value).is_some_and(|n| n.is_finite()) {
+                    sum.sub(value);
+                    *count = count.saturating_sub(1);
+                }
+            }
+            (Self::Count(count), "$count") => *count = count.saturating_sub(1),
+            _ => {
+                return Err(Error::Query(
+                    "internal sliding-window accumulator mismatch".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn value(&self) -> Result<Value> {
+        self.clone().finish()
     }
 
     fn merge(&mut self, other: Accumulator) -> Result<()> {
@@ -5700,5 +6096,303 @@ mod tests {
             "whenMatched": [{"$group": {"_id": "$x"}}]
         }})])
         .is_err());
+    }
+    fn brute_frame_positions(
+        docs: &[Value],
+        indices: &[usize],
+        position: usize,
+        sort: &[(String, i32)],
+        window: Option<&WindowFrame>,
+    ) -> Result<Vec<usize>> {
+        match window {
+            None => Ok((0..indices.len()).collect()),
+            Some(WindowFrame::Documents { .. }) => {
+                Ok(window_slice(window.unwrap(), position, indices.len())
+                    .map(|range| range.collect())
+                    .unwrap_or_default())
+            }
+            Some(WindowFrame::Range { start, end, unit }) => {
+                let Some((field, _)) = sort.first().filter(|_| sort.len() == 1) else {
+                    return Err(Error::Query(
+                        "range windows require exactly one sortBy field".into(),
+                    ));
+                };
+                let Some(current) = range_sort_value(&docs[indices[position]], field)? else {
+                    return Err(Error::Query(
+                        "range window sortBy value is missing or null".into(),
+                    ));
+                };
+                let lower = range_bound_value(start, &current, unit.as_deref())?;
+                let upper = range_bound_value(end, &current, unit.as_deref())?;
+                let mut out = Vec::new();
+                for (candidate_position, index) in indices.iter().enumerate() {
+                    let Some(value) = range_sort_value(&docs[*index], field)? else {
+                        continue;
+                    };
+                    if let Some(lower) = &lower {
+                        if range_value_cmp(&value, lower)? == Ordering::Less {
+                            continue;
+                        }
+                    }
+                    if let Some(upper) = &upper {
+                        if range_value_cmp(&value, upper)? == Ordering::Greater {
+                            continue;
+                        }
+                    }
+                    out.push(candidate_position);
+                }
+                Ok(out)
+            }
+        }
+    }
+
+    fn brute_window_output_values(
+        docs: &[Value],
+        indices: &[usize],
+        output: &WindowOutput,
+        sort: &[(String, i32)],
+        vars: &BTreeMap<String, Value>,
+    ) -> Result<Vec<Value>> {
+        match &output.op {
+            WindowOp::Accumulator(op, expression) => {
+                let mut out = Vec::with_capacity(indices.len());
+                for position in 0..indices.len() {
+                    let mut accumulator = Accumulator::new(op);
+                    for frame_position in brute_frame_positions(
+                        docs,
+                        indices,
+                        position,
+                        sort,
+                        output.window.as_ref(),
+                    )? {
+                        let frame_index = indices[frame_position];
+                        let value = if op == "$count" {
+                            Value::Null
+                        } else {
+                            eval_expr_vars(&docs[frame_index], expression, vars)?
+                        };
+                        accumulator.update(op, &value)?;
+                    }
+                    out.push(accumulator.finish()?);
+                }
+                Ok(out)
+            }
+            WindowOp::Derivative { input, unit } => {
+                let Some((field, _)) = sort.first().filter(|_| sort.len() == 1) else {
+                    return Err(Error::Query(
+                        "$derivative requires exactly one sortBy field".into(),
+                    ));
+                };
+                let mut out = Vec::with_capacity(indices.len());
+                for position in 0..indices.len() {
+                    let frame = brute_frame_positions(
+                        docs,
+                        indices,
+                        position,
+                        sort,
+                        output.window.as_ref(),
+                    )?;
+                    let (Some(first), Some(last)) = (frame.first(), frame.last()) else {
+                        out.push(Value::Null);
+                        continue;
+                    };
+                    let first_doc = &docs[indices[*first]];
+                    let last_doc = &docs[indices[*last]];
+                    let (Some(x0), Some(x1)) = (
+                        window_x_value(first_doc, field, unit.as_deref(), "$derivative")?,
+                        window_x_value(last_doc, field, unit.as_deref(), "$derivative")?,
+                    ) else {
+                        out.push(Value::Null);
+                        continue;
+                    };
+                    let (Some(y0), Some(y1)) = (
+                        numeric::as_f64(&eval_expr_vars(first_doc, input, vars)?),
+                        numeric::as_f64(&eval_expr_vars(last_doc, input, vars)?),
+                    ) else {
+                        out.push(Value::Null);
+                        continue;
+                    };
+                    out.push(if x1 == x0 {
+                        Value::Null
+                    } else {
+                        number_value((y1 - y0) / (x1 - x0))
+                    });
+                }
+                Ok(out)
+            }
+            WindowOp::Integral { input, unit } => {
+                let Some((field, _)) = sort.first().filter(|_| sort.len() == 1) else {
+                    return Err(Error::Query(
+                        "$integral requires exactly one sortBy field".into(),
+                    ));
+                };
+                let mut out = Vec::with_capacity(indices.len());
+                for position in 0..indices.len() {
+                    let frame = brute_frame_positions(
+                        docs,
+                        indices,
+                        position,
+                        sort,
+                        output.window.as_ref(),
+                    )?;
+                    if frame.len() < 2 {
+                        out.push(Value::from(0));
+                        continue;
+                    }
+                    let mut total = 0.0;
+                    let mut valid = true;
+                    for pair in frame.windows(2) {
+                        let left = &docs[indices[pair[0]]];
+                        let right = &docs[indices[pair[1]]];
+                        let (Some(x0), Some(x1)) = (
+                            window_x_value(left, field, unit.as_deref(), "$integral")?,
+                            window_x_value(right, field, unit.as_deref(), "$integral")?,
+                        ) else {
+                            valid = false;
+                            break;
+                        };
+                        let (Some(y0), Some(y1)) = (
+                            numeric::as_f64(&eval_expr_vars(left, input, vars)?),
+                            numeric::as_f64(&eval_expr_vars(right, input, vars)?),
+                        ) else {
+                            valid = false;
+                            break;
+                        };
+                        total += (x1 - x0) * (y0 + y1) / 2.0;
+                    }
+                    out.push(if valid {
+                        number_value(total)
+                    } else {
+                        Value::Null
+                    });
+                }
+                Ok(out)
+            }
+            _ => window_output_values(docs, indices, output, sort, vars),
+        }
+    }
+
+    fn brute_set_window_fields(
+        mut docs: Vec<Value>,
+        spec: &Value,
+        vars: &BTreeMap<String, Value>,
+    ) -> Result<Vec<Value>> {
+        let spec = spec
+            .as_object()
+            .ok_or_else(|| Error::Query("$setWindowFields requires an object".into()))?;
+        let outputs = parse_window_outputs(
+            spec.get("output")
+                .ok_or_else(|| Error::Query("$setWindowFields requires `output`".into()))?,
+        )?;
+        let sort = match spec.get("sortBy") {
+            Some(sort) => parse_sort(sort)?,
+            None => Vec::new(),
+        };
+        let mut partitions: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+        for (index, doc) in docs.iter().enumerate() {
+            let key = match spec.get("partitionBy") {
+                Some(expression) => eval_expr_vars(doc, expression, vars)?,
+                None => Value::Null,
+            };
+            partitions
+                .entry(serde_json::to_string(&key)?)
+                .or_default()
+                .push(index);
+        }
+        for indices in partitions.values_mut() {
+            if !sort.is_empty() {
+                indices.sort_by(|left, right| compare_docs(&docs[*left], &docs[*right], &sort));
+            }
+            let mut results = Vec::with_capacity(outputs.len());
+            for output in &outputs {
+                results.push(brute_window_output_values(
+                    &docs, indices, output, &sort, vars,
+                )?);
+            }
+            for (output, values) in outputs.iter().zip(results) {
+                for (index, value) in indices.iter().zip(values) {
+                    path::set(&mut docs[*index], &output.field, value)?;
+                }
+            }
+        }
+        Ok(docs)
+    }
+
+    #[test]
+    fn window_optimizer_matches_brute_force() {
+        let docs = vec![
+            json!({"_id": "a1", "region": "a", "day": 1, "x": 1, "amount": 10, "flag": "x"}),
+            json!({"_id": "a2", "region": "a", "day": 2, "x": 2, "amount": null, "flag": "y"}),
+            json!({"_id": "a3", "region": "a", "day": 3, "x": 4, "amount": 5, "flag": "x"}),
+            json!({"_id": "a4", "region": "a", "day": 4, "x": 8, "amount": 20, "flag": "z"}),
+            json!({"_id": "b1", "region": "b", "day": 1, "x": 2, "amount": 7, "flag": "y"}),
+            json!({"_id": "b2", "region": "b", "day": 2, "x": 3, "amount": 3, "flag": "y"}),
+        ];
+        let specs = vec![
+            json!({
+                "partitionBy": "$region", "sortBy": {"day": 1},
+                "output": {
+                    "run": {"$sum": "$amount", "window": {"documents": ["unbounded", "current"]}},
+                    "all": {"$sum": "$amount"},
+                    "sum3": {"$sum": "$amount", "window": {"documents": [-1, 1]}},
+                    "avg3": {"$avg": "$amount", "window": {"documents": [-1, 1]}},
+                    "min3": {"$min": "$amount", "window": {"documents": [-1, 1]}},
+                    "max3": {"$max": "$amount", "window": {"documents": [-1, 1]}},
+                    "first3": {"$first": "$amount", "window": {"documents": [-1, 1]}},
+                    "last3": {"$last": "$amount", "window": {"documents": [-1, 1]}},
+                    "count3": {"$count": {}, "window": {"documents": [-1, 1]}},
+                    "push3": {"$push": "$flag", "window": {"documents": [-1, 1]}},
+                    "set3": {"$addToSet": "$flag", "window": {"documents": [-1, 1]}},
+                    "rank": {"$rank": {}}, "dense": {"$denseRank": {}},
+                    "row": {"$documentNumber": {}},
+                    "prev": {"$shift": {"output": "$amount", "by": -1, "default": 0}},
+                    "ema": {"$expMovingAvg": {"input": "$amount", "N": 3}}
+                }
+            }),
+            json!({
+                "partitionBy": "$region", "sortBy": {"x": 1},
+                "output": {
+                    "range": {"$sum": "$amount", "window": {"range": [-1, 1]}},
+                    "rangeUnbounded": {"$sum": "$amount", "window": {"range": ["unbounded", "current"]}},
+                    "rangeCurrent": {"$avg": "$amount", "window": {"range": ["current", "current"]}},
+                    "rangeEmpty": {"$count": {}, "window": {"range": [-10, -9]}},
+                    "deriv": {"$derivative": {"input": "$amount"}},
+                    "rangeDeriv": {"$derivative": {"input": "$amount"}, "window": {"range": [-1, 1]}},
+                    "integral": {"$integral": {"input": "$amount"}},
+                    "rangeIntegral": {"$integral": {"input": "$amount"}, "window": {"range": [-1, 1]}}
+                }
+            }),
+            json!({
+                "partitionBy": "$region", "sortBy": {"day": -1},
+                "output": {
+                    "runDesc": {"$sum": "$amount", "window": {"documents": ["unbounded", "current"]}},
+                    "minDesc": {"$min": "$amount", "window": {"documents": [-1, 1]}},
+                    "rowDesc": {"$documentNumber": {}}
+                }
+            }),
+        ];
+        for spec in specs {
+            let expected = brute_set_window_fields(docs.clone(), &spec, &BTreeMap::new()).unwrap();
+            let actual = set_window_fields(docs.clone(), &spec, &BTreeMap::new()).unwrap();
+            assert_eq!(actual, expected);
+        }
+
+        let date_docs = vec![
+            json!({"_id": "d1", "ts": {"$date": {"$numberLong": "1704067200000"}}, "v": 1}),
+            json!({"_id": "d2", "ts": {"$date": {"$numberLong": "1704070800000"}}, "v": 2}),
+            json!({"_id": "d3", "ts": {"$date": {"$numberLong": "1704078000000"}}, "v": 4}),
+        ];
+        let date_spec = json!({
+            "sortBy": {"ts": 1},
+            "output": {
+                "range": {"$sum": "$v", "window": {"range": [-1, 1], "unit": "hour"}},
+                "rangeUnbounded": {"$sum": "$v", "window": {"range": ["unbounded", "current"], "unit": "hour"}},
+                "rangeDeriv": {"$derivative": {"input": "$v"}, "window": {"range": [-1, 1], "unit": "hour"}}
+            }
+        });
+        let expected =
+            brute_set_window_fields(date_docs.clone(), &date_spec, &BTreeMap::new()).unwrap();
+        let actual = set_window_fields(date_docs, &date_spec, &BTreeMap::new()).unwrap();
+        assert_eq!(actual, expected);
     }
 }
