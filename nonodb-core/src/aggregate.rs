@@ -2258,85 +2258,34 @@ fn window_sliding_values(
     Ok(Some(out))
 }
 
-fn window_accumulator_group_values(
-    docs: &[Value],
+#[allow(clippy::too_many_arguments)]
+fn window_group_chunk(
+    ops: &[(&str, &Value)],
+    values: &[Vec<Value>],
+    numeric_ops: &[Vec<Option<f64>>],
+    window: &WindowFrame,
+    range_values: Option<&[RangeValue]>,
     indices: &[usize],
-    outputs: &[&WindowOutput],
-    window: Option<&WindowFrame>,
-    sort: &[(String, i32)],
-    vars: &BTreeMap<String, Value>,
+    start_position: usize,
+    end_position: usize,
 ) -> Result<Option<Vec<Vec<Value>>>> {
-    let ops: Vec<(&str, &Value)> = outputs
-        .iter()
-        .map(|output| match &output.op {
-            WindowOp::Accumulator(op, expression) => Ok((op.as_str(), expression)),
-            _ => Err(Error::Query(
-                "internal window accumulator group mismatch".into(),
-            )),
-        })
-        .collect::<Result<_>>()?;
-    if ops.iter().any(|(op, _)| {
-        !matches!(
-            *op,
-            "$sum" | "$avg" | "$min" | "$max" | "$count" | "$first" | "$last"
-        )
-    }) {
-        return Ok(None);
-    }
-    let values: Vec<Vec<Value>> = ops
-        .iter()
-        .map(|(op, expression)| {
-            if *op == "$count" {
-                Ok(vec![Value::Null; indices.len()])
-            } else {
-                indices
-                    .iter()
-                    .map(|index| eval_expr_vars(&docs[*index], expression, vars))
-                    .collect::<Result<Vec<_>>>()
-            }
-        })
-        .collect::<Result<_>>()?;
-    let numeric_ops: Vec<Option<Vec<Option<f64>>>> = ops
-        .iter()
-        .zip(&values)
-        .map(|((op, _), values)| {
-            if matches!(*op, "$sum" | "$avg" | "$min" | "$max") {
-                let numbers: Option<Vec<Option<f64>>> = values
-                    .iter()
-                    .map(|value| {
-                        if value.is_null() {
-                            Some(None)
-                        } else if numeric::is_decimal(value) {
-                            None
-                        } else {
-                            numeric::as_f64(value)
-                                .filter(|value| value.is_finite())
-                                .map(Some)
-                        }
-                    })
-                    .collect();
-                numbers
-            } else {
-                Some(Vec::new())
-            }
-        })
-        .collect();
-    if numeric_ops.iter().any(Option::is_none) {
-        return Ok(None);
-    }
-    let numeric_ops: Vec<Vec<Option<f64>>> = numeric_ops.into_iter().map(Option::unwrap).collect();
-    let range_values = match window {
-        Some(WindowFrame::Range { .. }) => range_values_for(docs, indices, sort)?,
-        _ => None,
-    };
     let len = indices.len();
-    let mut results: Vec<Vec<Value>> = ops.iter().map(|_| Vec::with_capacity(len)).collect();
+    let mut results: Vec<Vec<Value>> = ops
+        .iter()
+        .map(|_| Vec::with_capacity(end_position - start_position))
+        .collect();
     let mut sums = vec![0.0f64; ops.len()];
     let mut counts = vec![0u64; ops.len()];
     let mut mins = vec![f64::INFINITY; ops.len()];
     let mut maxs = vec![f64::NEG_INFINITY; ops.len()];
     let mut seen = vec![false; ops.len()];
-    let mut update = |position: usize, start: usize, end: usize| -> Result<()> {
+    let mut cursor = RangeCursor::default();
+    for position in start_position..end_position {
+        let Some((start, end)) =
+            frame_bounds_cursor(Some(window), position, len, range_values, &mut cursor)?
+        else {
+            return Ok(None);
+        };
         sums.fill(0.0);
         counts.fill(0);
         mins.fill(f64::INFINITY);
@@ -2416,34 +2365,145 @@ fn window_accumulator_group_values(
                 _ => unreachable!("validated grouped accumulator"),
             };
             results[index].push(value);
-            let _ = position;
         }
-        Ok(())
+    }
+    Ok(Some(results))
+}
+
+fn window_accumulator_group_values(
+    docs: &[Value],
+    indices: &[usize],
+    outputs: &[&WindowOutput],
+    window: Option<&WindowFrame>,
+    sort: &[(String, i32)],
+    vars: &BTreeMap<String, Value>,
+) -> Result<Option<Vec<Vec<Value>>>> {
+    let Some(window) = window else {
+        return Ok(None);
     };
-    if let Some(window) = window {
-        let mut cursor = RangeCursor::default();
-        for position in 0..len {
-            let Some((start, end)) = frame_bounds_cursor(
-                Some(window),
-                position,
-                len,
-                range_values.as_deref(),
-                &mut cursor,
-            )?
-            else {
-                return Ok(None);
-            };
-            update(position, start, end)?;
+    let ops: Vec<(&str, &Value)> = outputs
+        .iter()
+        .map(|output| match &output.op {
+            WindowOp::Accumulator(op, expression) => Ok((op.as_str(), expression)),
+            _ => Err(Error::Query(
+                "internal window accumulator group mismatch".into(),
+            )),
+        })
+        .collect::<Result<_>>()?;
+    if ops.iter().any(|(op, _)| {
+        !matches!(
+            *op,
+            "$sum" | "$avg" | "$min" | "$max" | "$count" | "$first" | "$last"
+        )
+    }) {
+        return Ok(None);
+    }
+    let values: Vec<Vec<Value>> = ops
+        .iter()
+        .map(|(op, expression)| {
+            if *op == "$count" {
+                Ok(vec![Value::Null; indices.len()])
+            } else {
+                indices
+                    .iter()
+                    .map(|index| eval_expr_vars(&docs[*index], expression, vars))
+                    .collect::<Result<Vec<_>>>()
+            }
+        })
+        .collect::<Result<_>>()?;
+    let numeric_ops: Vec<Option<Vec<Option<f64>>>> = ops
+        .iter()
+        .zip(&values)
+        .map(|((op, _), values)| {
+            if matches!(*op, "$sum" | "$avg" | "$min" | "$max") {
+                let numbers: Option<Vec<Option<f64>>> = values
+                    .iter()
+                    .map(|value| {
+                        if value.is_null() {
+                            Some(None)
+                        } else if numeric::is_decimal(value) {
+                            None
+                        } else {
+                            numeric::as_f64(value)
+                                .filter(|value| value.is_finite())
+                                .map(Some)
+                        }
+                    })
+                    .collect();
+                numbers
+            } else {
+                Some(Vec::new())
+            }
+        })
+        .collect();
+    if numeric_ops.iter().any(Option::is_none) {
+        return Ok(None);
+    }
+    let numeric_ops: Vec<Vec<Option<f64>>> = numeric_ops.into_iter().map(Option::unwrap).collect();
+    let range_values = match window {
+        WindowFrame::Range { .. } => range_values_for(docs, indices, sort)?,
+        _ => None,
+    };
+    let len = indices.len();
+    let workers = crate::collection::aggregate_workers()
+        .min(len.div_ceil(512))
+        .max(1);
+    if workers > 1 {
+        let chunk_len = len.div_ceil(workers);
+        let parts = std::thread::scope(|scope| -> Result<Vec<Vec<Vec<Value>>>> {
+            let mut handles = Vec::new();
+            for start in (0..len).step_by(chunk_len) {
+                let end = (start + chunk_len).min(len);
+                let ops = &ops;
+                let values = &values;
+                let numeric_ops = &numeric_ops;
+                let range_values = range_values.as_deref();
+                handles.push(scope.spawn(move || -> Result<Option<Vec<Vec<Value>>>> {
+                    window_group_chunk(
+                        ops,
+                        values,
+                        numeric_ops,
+                        window,
+                        range_values,
+                        indices,
+                        start,
+                        end,
+                    )
+                }));
+            }
+            let mut parts = Vec::with_capacity(handles.len());
+            for handle in handles {
+                let part = handle
+                    .join()
+                    .map_err(|_| Error::Query("window accumulator worker panicked".into()))??;
+                let Some(part) = part else {
+                    return Ok(Vec::new());
+                };
+                parts.push(part);
+            }
+            Ok(parts)
+        })?;
+        if parts.is_empty() {
+            return Ok(None);
+        }
+        let mut results: Vec<Vec<Value>> = ops.iter().map(|_| Vec::with_capacity(len)).collect();
+        for part in parts {
+            for (result, chunk) in results.iter_mut().zip(part) {
+                result.extend(chunk);
+            }
         }
         return Ok(Some(results));
     }
-    let (start, end) = (0, len);
-    update(0, start, end)?;
-    for result in &mut results {
-        let value = result.first().cloned().unwrap_or(Value::Null);
-        result.resize(len, value);
-    }
-    Ok(Some(results))
+    window_group_chunk(
+        &ops,
+        &values,
+        &numeric_ops,
+        window,
+        range_values.as_deref(),
+        indices,
+        0,
+        len,
+    )
 }
 
 fn window_accumulator_values(
@@ -3002,9 +3062,18 @@ fn window_partition_results(
 }
 
 fn set_window_fields(
+    docs: Vec<Value>,
+    spec: &Value,
+    vars: &BTreeMap<String, Value>,
+) -> Result<Vec<Value>> {
+    set_window_fields_with_workers(docs, spec, vars, None)
+}
+
+fn set_window_fields_with_workers(
     mut docs: Vec<Value>,
     spec: &Value,
     vars: &BTreeMap<String, Value>,
+    workers_override: Option<usize>,
 ) -> Result<Vec<Value>> {
     let spec = spec
         .as_object()
@@ -3064,7 +3133,8 @@ fn set_window_fields(
     }
 
     let partitions: Vec<Vec<usize>> = partitions.into_values().collect();
-    let workers = crate::collection::aggregate_workers()
+    let workers = workers_override
+        .unwrap_or_else(crate::collection::aggregate_workers)
         .min(partitions.len())
         .max(1);
     let computed = if workers > 1 && docs.len() > 256 {
@@ -6914,5 +6984,31 @@ mod tests {
         assert_eq!(actual, expected);
         assert_eq!(actual[1]["min"], 1);
         assert_eq!(actual[1]["max"], 1);
+    }
+    #[test]
+    fn parallel_partitions_match_brute_force() {
+        let docs: Vec<Value> = (0..600)
+            .map(|index| {
+                json!({
+                    "_id": format!("d{index}"),
+                    "group": format!("g{}", index % 3),
+                    "x": index,
+                    "amount": (index % 17) as f64 + 0.25,
+                })
+            })
+            .collect();
+        let spec = json!({
+            "partitionBy": "$group",
+            "sortBy": {"x": 1},
+            "output": {
+                "rank": {"$rank": {}},
+                "sum": {"$sum": "$amount", "window": {"documents": [-5, 0]}},
+                "avg": {"$avg": "$amount", "window": {"documents": [-5, 0]}}
+            }
+        });
+        let expected = brute_set_window_fields(docs.clone(), &spec, &BTreeMap::new()).unwrap();
+        let actual =
+            set_window_fields_with_workers(docs, &spec, &BTreeMap::new(), Some(4)).unwrap();
+        assert_eq!(actual, expected);
     }
 }

@@ -3275,7 +3275,7 @@ pub fn find(
 
 /// Loads the rows for a window pipeline, decoding independent bucket
 /// locators on worker threads when the bucket index can narrow the scan.
-pub fn find_window_docs(
+pub(crate) fn find_window_docs(
     rtxn: &RoTxn<'_>,
     env: &heed::Env,
     name: &str,
@@ -3972,9 +3972,8 @@ where
 /// allocation for every row in a bucket when only a narrow range is selected.
 fn decode_time_column_ms(data: &[u8]) -> Result<Vec<Option<i64>>> {
     let mut pos = 0;
-    let field = std::str::from_utf8(get_bytes(data, &mut pos)?)
-        .map_err(|_| corrupt("field name is not UTF-8"))?
-        .to_string();
+    std::str::from_utf8(get_bytes(data, &mut pos)?)
+        .map_err(|_| corrupt("field name is not UTF-8"))?;
     let kind = *data
         .get(pos)
         .ok_or_else(|| corrupt("missing column kind"))?;
@@ -4011,9 +4010,6 @@ fn decode_time_column_ms(data: &[u8]) -> Result<Vec<Option<i64>>> {
         raw
     };
     let count = present.iter().filter(|value| **value).count();
-    eprintln!(
-        "TIMECOL field={field} kind={kind} codec={base} deflated={deflated} n={n} count={count}"
-    );
     let mut values: Vec<Option<i64>> = Vec::with_capacity(n);
     match (kind, base) {
         (KIND_JSON, CODEC_RAW) => {
@@ -4062,7 +4058,6 @@ fn decode_time_column_ms(data: &[u8]) -> Result<Vec<Option<i64>>> {
             values.extend(numbers.into_iter().map(Some));
         }
         _ => {
-            let _ = field;
             let mut reader = 0;
             let column = decode_column(data, &mut reader)?;
             return Ok(column
@@ -4176,21 +4171,6 @@ fn decode_bucket_window_rows(
             })
         })
         .collect();
-    if std::env::var("NONODB_DEBUG_WINDOW").is_ok() {
-        eprintln!(
-            "WINBUCKET n={n} selected={} columns={} blocks_time={}",
-            selected.len(),
-            columns.len(),
-            columns.first().map(|c| c.1.len()).unwrap_or(0)
-        );
-    }
-    if std::env::var("NONODB_DEBUG_WINDOW").is_ok() {
-        eprintln!(
-            "COLSCAN n={n} selected={} blocks={}",
-            selected.len(),
-            columns.first().map(|c| c.1.len()).unwrap_or(0)
-        );
-    }
     if selected.is_empty() {
         return Ok(Vec::new());
     }
