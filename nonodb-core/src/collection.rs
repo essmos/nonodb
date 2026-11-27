@@ -8787,6 +8787,60 @@ impl<'e> Collection<'e> {
                 return Ok(out);
             }
         }
+        if self.profile.is_columnar() {
+            let plan = aggregate::pushdown(pipeline)?;
+            check_find_deadline(deadline)?;
+            if let Some(field) = plan.count {
+                let count = self.count_in_deadline(rtxn, &plan.filter, deadline)?;
+                if count == 0 {
+                    return Ok(Vec::new());
+                }
+                return Ok(vec![Value::Object(Map::from_iter([(
+                    field,
+                    Value::from(count as u64),
+                )]))]);
+            }
+            if let Some(field) = aggregate::terminal_count_skippable(&pipeline[plan.next..])? {
+                let count = self.count_in_deadline(rtxn, &plan.filter, deadline)?;
+                let after_skip = count.saturating_sub(plan.skip);
+                let count = plan.limit.map_or(after_skip, |limit| after_skip.min(limit));
+                if count == 0 {
+                    return Ok(Vec::new());
+                }
+                return Ok(vec![Value::Object(Map::from_iter([(
+                    field,
+                    Value::from(count as u64),
+                )]))]);
+            }
+            let max_docs = aggregate::max_docs();
+            let limit = plan
+                .limit
+                .map(|n| n.min(max_docs.saturating_add(1)))
+                .unwrap_or_else(|| max_docs.saturating_add(1));
+            let docs = self.find_in(
+                rtxn,
+                &FindQuery {
+                    filter: plan.filter,
+                    projection: plan.projection,
+                    sort: plan.sort,
+                    skip: plan.skip,
+                    limit: Some(limit),
+                    comment: None,
+                    max_time_ms: deadline_remaining_ms(deadline),
+                    hint: None,
+                },
+            )?;
+            if docs.len() > max_docs {
+                return Err(Error::Query(format!(
+                    "aggregation input exceeds {max_docs} documents"
+                )));
+            }
+            let host = LookupHost { coll: self, rtxn };
+            let out =
+                aggregate::run_with_host(docs, &pipeline[plan.next..], max_docs, Some(&host))?;
+            check_find_deadline(deadline)?;
+            return Ok(out);
+        }
         let plan = aggregate::pushdown(pipeline)?;
         check_find_deadline(deadline)?;
 

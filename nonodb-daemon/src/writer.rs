@@ -2575,6 +2575,98 @@ mod tests {
     }
 
     #[test]
+    fn out_and_merge_write_through_columnar_collections() {
+        let (_dir, store) = setup();
+        for name in ["source", "target"] {
+            execute_commit(
+                &store,
+                &WriteReq::CreateCollection {
+                    coll: name.into(),
+                    profile: CollectionProfile::Columnar,
+                    ttl_seconds: None,
+                    ttl_purge_history: None,
+                    timeseries: None,
+                },
+            )
+            .unwrap();
+        }
+        for doc in [
+            json!({"_id": "a", "k": 1, "v": "a"}),
+            json!({"_id": "b", "k": 2, "v": "b"}),
+        ] {
+            execute_commit(
+                &store,
+                &WriteReq::Insert {
+                    coll: "source".into(),
+                    doc,
+                    vault: None,
+                },
+            )
+            .unwrap();
+        }
+        execute_commit(
+            &store,
+            &WriteReq::Insert {
+                coll: "target".into(),
+                doc: json!({"_id": "old", "k": 9, "v": "old"}),
+                vault: None,
+            },
+        )
+        .unwrap();
+        let out = execute_commit(
+            &store,
+            &WriteReq::Aggregate {
+                coll: "source".into(),
+                pipeline: vec![json!({"$out": "target"})],
+                max_time_ms: None,
+                database: "default".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(out["deleted"], 1);
+        assert_eq!(out["inserted"], 2);
+        assert_eq!(all(&store, "target").len(), 2);
+
+        execute_commit(
+            &store,
+            &WriteReq::Update {
+                coll: "source".into(),
+                filter: json!({"_id": "a"}),
+                update: json!({"$set": {"v": "updated"}}),
+                multi: false,
+                upsert: false,
+                array_filters: Vec::new(),
+                default_id: None,
+                vault: None,
+            },
+        )
+        .unwrap();
+        let merged = execute_commit(
+            &store,
+            &WriteReq::Aggregate {
+                coll: "source".into(),
+                pipeline: vec![
+                    json!({"$match": {"_id": "a"}}),
+                    json!({"$merge": {"into": "target", "on": "_id"}}),
+                ],
+                max_time_ms: None,
+                database: "default".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(merged["matched"], 1);
+        assert_eq!(
+            store
+                .collection("target")
+                .unwrap()
+                .find_by_key("a")
+                .unwrap()
+                .unwrap()["v"],
+            "updated"
+        );
+    }
+
+    #[test]
     fn failed_timeseries_unique_write_leaves_no_partial_rows() {
         let (_dir, store) = setup();
         let settings = nonodb_core::timeseries::Settings {
