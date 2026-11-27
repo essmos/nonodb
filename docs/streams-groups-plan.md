@@ -289,6 +289,12 @@ stops blocking the group; two members on one group split the stream.
 - `truncated_below` propagation and the `stream_truncated` error;
 - bounded, batched deletion inside the writer.
 
+Implemented as a default-on maintenance tick (`NONODB_STREAM_PRUNE_INTERVAL`,
+60s, `0` disables) that first runs the lease-expiry janitor, then prunes every
+stream with a bound. `retention.max_bytes` is stored and validated but the drop
+rule still ignores it; `nonodb_stream_pruned_events_total` counts dropped
+events and `nonodb_stream_truncated_total` counts groups crossed.
+
 Acceptance: a group that stops committing pins retention; `min_seq_keep` below
 a group's offset marks it truncated and the next `watch` fails with
 `stream_truncated`; no partial visibility across a delete batch.
