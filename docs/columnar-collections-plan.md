@@ -6,6 +6,8 @@ existing `standard`, `vault`, or `timeseries` profiles.
 
 Acceptance criteria: [Columnar collections acceptance criteria](columnar-collections-acceptance.md).
 
+Phase 0 results and decisions: [Columnar collections Phase 0 report](columnar-phase-0-report.md).
+
 ## 1. Goal
 
 Determine whether the bucketed columnar storage used by time-series collections
@@ -453,20 +455,56 @@ cold cache without labeling it.
 
 ## 11. Open decisions
 
+Resolved in Phase 0 (see the [Phase 0 report](columnar-phase-0-report.md)):
+
+- **Id access:** a compact `hash64(_id)` locator with collision verification,
+  not the full canonical `_id` string as the map key.
+- **Partitioning:** append bucket segments with a documented target size; the
+  working default is 512 rows, with the locator directory outside the bucket.
+- **Update strategy:** an append-only hot overlay for sealed rows; whole-bucket
+  rewrite is rejected as a general update path.
+- **Point read:** sub-block/row-addressable access for sealed buckets; a full
+  256-row block decode is rejected as the general point-read path.
+- **Id-map gate:** point update/delete must use the locator and must not scan
+  the bucket set.
+
+Still open:
+
 - Final profile name and settings names.
-- Default bucket partition and number of open buckets.
-- Id-map versus hash-directory design after measurement.
+- Exact hash-collision representation and collision-chain limit.
+- Sub-block size and whether it is a format field or a setting.
+- Overlay format (JSON rows, delta documents, or columnar mini-buckets) and
+  compaction threshold.
 - Array representation: JSON leaf, expanded columns, or adaptive.
-- Update strategy: bucket rewrite, delta overlay, or hot-row store.
 - Column-count/byte limits and overflow policy.
 - History representation and whether it can ever be columnar.
 - Whether a columnar collection can coexist with vault encryption.
 - Which performance gates become hard release gates.
 
-These are resolved in Phase 0/1 and recorded in this document before the
+These remaining decisions are resolved in Phase 1 and recorded here before the
 acceptance criteria are marked complete.
 
-## 12. Definition of done
+## 12. Phase 0 outcome
+
+The feasibility benchmark used the time-series format as a proxy for 100k
+generic documents with realistic UUID-sized ids. It found:
+
+- the full canonical id map costs 141–152 B/row with those ids, reducing the
+  storage win from 25× to only 2.7× versus standard;
+- the current TS update path scans the bucket set for user ids and takes ~874 ms
+  per update; even synthetic direct-id updates rewrite a bucket and take
+  12.35 ms (36 µs standard);
+- sealed point reads decode a full 256-row block and take 0.2–0.8 ms
+  (17–68× standard);
+- shrinking buckets to 64 rows improves synthetic update to 2.32 ms and point
+  read to 214 µs, but costs storage and still misses the point-read gate.
+
+Phase 1 therefore starts with a compact hash locator, an append-only update
+overlay, and sub-block point access. These are release blockers, not later
+optimizations. The full measurements and reproduction steps are in the
+[Phase 0 report](columnar-phase-0-report.md).
+
+## 13. Definition of done
 
 The profile is done only when:
 

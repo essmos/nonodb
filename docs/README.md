@@ -24,6 +24,7 @@ quick-start instructions, and a feature overview.
 | [Time-series benchmark vs TimescaleDB](timescale-benchmark.md) | Evaluators, maintainers | Dataset, methodology, results, caveats, and reproduction for NonoDB and TimescaleDB |
 | [Columnar collections plan](columnar-collections-plan.md) | Maintainers, evaluators | Proposed general-purpose bucket-columnar profile, architecture, phases, benchmark plan, and risks |
 | [Columnar collections acceptance](columnar-collections-acceptance.md) | Maintainers, reviewers | Mandatory semantic, operational, and performance parity gates for the columnar profile |
+| [Columnar Phase 0 report](columnar-phase-0-report.md) | Maintainers, reviewers | Feasibility benchmark, id-map/update/point-read measurements, and Phase 1 decisions |
 | [Numbers and decimals](numerics.md) | Application developers | Exact numeric comparison, Decimal128, arithmetic, NaN/Infinity, index compatibility, long text limits |
 | [BSON scalar types](bson-types.md) | Application developers | `$numberInt`/`$numberLong`, `$type`, binary/UUID, ObjectId, Timestamp, MinKey/MaxKey, index compatibility |
 | [Clients](clients.md) | Application developers | Python, Rust, Node.js and Go: install, connection, CRUD, batches, indexes, search, aggregation |

@@ -91,6 +91,8 @@ observable.
 | AC-WRITE-010 | Document write, id map, index entry, history entry, event, TTL metadata, graph hook, and replication record commit in one transaction. | Fault-injection + consistency check |
 | AC-WRITE-011 | An insert that seals a bucket does not change the returned id, visible document, or index result. | Seal-boundary test |
 | AC-WRITE-012 | A document larger than the configured bucket limit is stored through a supported overflow/raw path without breaking reads or indexes. | Oversize test |
+| AC-WRITE-013 | Update/delete/`findAndModify` by `_id` use the compact locator and never scan the bucket set; the p50 gate is measured on a sealed collection. | Operation trace + latency |
+| AC-WRITE-014 | Sealed-row updates use an append-only overlay with read-your-writes, bounded growth, and compaction merge; they do not rewrite the whole bucket per mutation. | Overlay/compaction tests |
 
 ## 4. Reads, filters, projection, sorting, and explain
 
@@ -111,6 +113,8 @@ observable.
 | AC-READ-013 | Full scans, indexed scans, and parallel scans return identical result sets and counts. | Scan parity tests |
 | AC-READ-014 | `retain_visible`/TTL visibility hides expired docs on every read path, including index and lookup paths. | TTL read suite |
 | AC-READ-015 | `batch` read operations share one snapshot and match standard when mixing find, aggregate, lookup, count, and cursor-free reads. | Read-batch suite |
+| AC-READ-016 | A sealed point read checks the overlay and decodes only the target row or a bounded sub-block, not a full 256-row block. | Decode instrumentation + latency |
+| AC-READ-017 | A point read verifies the full `_id` after a hash-locator hit and reports a miss correctly on collision or stale locator. | Collision tests |
 
 ## 5. Aggregation and SQL
 
