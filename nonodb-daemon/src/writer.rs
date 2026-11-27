@@ -1255,6 +1255,28 @@ fn execute(
         WriteReq::CreateStream { coll, retention } => {
             let mut def = nonodb_core::streams::StreamDef::new(coll.clone(), coll.clone());
             def.retention = retention.clone();
+            // Creating a stream on a collection that does not exist yet is a
+            // normal bootstrap step; create it as a standard collection instead
+            // of failing with "collection does not exist".
+            if store.collection_profile_in_rw(wtxn, coll)?.is_none() {
+                store.create_collection_with_ttl_and_purge_in(
+                    wtxn,
+                    coll,
+                    nonodb_core::vault::CollectionProfile::Standard,
+                    None,
+                    None,
+                )?;
+                // A replica applying this transaction starts without the
+                // collection; create it first or `set_stream_in` fails there.
+                replication.capture_op(ReplicationOp::CollectionCreate {
+                    name: coll.clone(),
+                    profile: "standard".into(),
+                    ttl_seconds: None,
+                    ttl_field: None,
+                    ttl_purge_history: None,
+                    timeseries: None,
+                });
+            }
             store.set_stream_in(wtxn, &def)?;
             replication.capture_op(ReplicationOp::StreamSet { def: def.clone() });
             Ok(serde_json::to_value(def).map_err(nonodb_core::Error::from)?)

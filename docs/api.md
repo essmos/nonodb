@@ -3911,8 +3911,13 @@ Administration:
 {"op":"drop_stream","coll":"_events"}
 ```
 
+Claiming and committing a group need `consume:<coll>` (or `admin:<coll>`);
+`stale_lease` and `commit_out_of_order` are HTTP 409, `stream_truncated` is 410.
+
 `stream_stats` returns `committed_seq`, `head_seq`, `lag`, the active lease, and
-`truncated_below` per group. `create_stream` builds the `_seq` index, so it costs
+`truncated_below` per group. `create_stream` creates the collection if it does not
+exist (standard profile only: time-series and vault collections are rejected) and
+builds the `_seq` index, so it costs
 like an index build. `retention` is validated but not enforced yet; use TTL until
 the retention phase lands. Scopes: `admin:<coll>` for mutations,
 `read:<coll>` for reads.

@@ -52,10 +52,13 @@ class Api:
         return body.get("result")
 
     def error(self, payload: dict[str, Any]) -> str:
+        return self.error_with_status(payload)[1]
+
+    def error_with_status(self, payload: dict[str, Any]) -> tuple[int, str]:
         response = self._client.post("/v1/exec", json=payload)
         body = response.json()
         assert not body.get("ok"), body
-        return body["error"]["code"]
+        return response.status_code, body["error"]["code"]
 
 
 def start(tmp: Path, env: dict[str, str]) -> tuple[subprocess.Popen[bytes], Path]:
@@ -154,7 +157,8 @@ def main() -> int:
                 assert seq == batch["committed_seq"] + 1, batch
                 # A commit from a lease that does not own the batch is rejected.
                 if seen:
-                    assert api.error(
+                    # A client conflict, not a server fault.
+                    status, code = api.error_with_status(
                         {
                             "op": "commit_stream_group",
                             "coll": "_events",
@@ -162,7 +166,9 @@ def main() -> int:
                             "seq": seq,
                             "lease_id": "stale-lease",
                         }
-                    ) == "stale_lease", "stale lease must be rejected"
+                    )
+                    assert code == "stale_lease", code
+                    assert status == 409, f"stale_lease must be 409, got {status}"
                 api.call(
                     {
                         "op": "commit_stream_group",
@@ -245,6 +251,27 @@ def main() -> int:
         assert api.call({"op": "stream_stats", "coll": "_events"})["streams"][0][
             "groups"
         ] == []
+
+        # `create_stream` bootstraps the collection instead of requiring a
+        # separate `create_collection`.
+        api.call({"op": "create_stream", "coll": "boot_events"})
+        api.call({"op": "insert", "coll": "boot_events", "doc": {"n": 1}})
+        assert (
+            api.call({"op": "get_stream", "coll": "boot_events"})["head_seq"] == 1
+        ), "create_stream must create the collection"
+
+        # Time-series collections cannot back a stream.
+        api.call(
+            {
+                "op": "create_collection",
+                "coll": "ts_events",
+                "profile": "timeseries",
+                "timeseries": {"timeField": "ts"},
+            }
+        )
+        assert (
+            api.error({"op": "create_stream", "coll": "ts_events"}) == "invalid_query"
+        ), "a time-series collection must not accept a stream"
 
         api.close()
         print("streams/groups: ok")

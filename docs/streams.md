@@ -528,6 +528,11 @@ that supplies it is rejected with `invalid_query`.
 Events written **before** `create_stream` have no `_seq` and are not delivered
 by group reads. Define the stream before writing events, or backfill them.
 
+If the collection does not exist yet, `create_stream` creates it as a standard
+collection. Only standard collections can back a stream: time-series buckets and
+vault collections do not carry `_seq`, so the request is rejected instead of
+silently delivering nothing.
+
 `create_stream` also builds the `_seq` index used by group reads, so it behaves
 like an index build on a large collection.
 
@@ -574,6 +579,12 @@ reorder events, and the late-commit overlap rescan used by `_id` tails is not
 needed: there are no gaps. `filter`, `types`, and `projection` behave as in the
 `_id` tail.
 
+Group reads need the `consume:<coll>` scope (or `admin:<coll>`, which implies
+it); `read:<coll>` is enough to tail a stream in the default mode but **not** to
+claim a group or acknowledge a batch, because claiming writes the lease and
+committing moves the offset. A bare `group` field counts as group mode even when
+`mode` is omitted.
+
 Reading a group **claims the group lease**. One member owns the group at a time:
 a second member gets `timed_out` (or `stale_lease`) until the lease expires or
 the owner commits. The lease lasts `lease_ms` (default `60000`), and re-claiming
@@ -586,9 +597,10 @@ as the same member extends it.
 ```
 
 - The commit must present the `lease_id` from the batch, otherwise it fails with
-  `stale_lease`. A stale worker cannot advance a group it no longer owns.
+  `stale_lease` (HTTP 409). A stale worker cannot advance a group it no longer
+  owns.
 - Offsets only move forward and never past the stream head; anything else fails
-  with `commit_out_of_order`.
+  with `commit_out_of_order` (409), and `stream_truncated` is 410.
 - A successful commit clears the lease, so another member can take over.
 - Delivery is at-least-once: after a crash between processing and committing the
   batch is delivered again. Handlers must stay idempotent.

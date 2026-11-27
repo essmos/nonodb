@@ -6155,6 +6155,28 @@ fn flatten_join(
     }
 }
 
+#[cfg(test)]
+mod stream_error_status_tests {
+    use super::*;
+
+    fn status(code: &str) -> StatusCode {
+        error_status(&ApiError {
+            code: code.into(),
+            message: "x".into(),
+        })
+    }
+
+    #[test]
+    fn consumer_protocol_errors_are_not_server_faults() {
+        assert_eq!(status("stale_lease"), StatusCode::CONFLICT);
+        assert_eq!(status("commit_out_of_order"), StatusCode::CONFLICT);
+        assert_eq!(status("stream_truncated"), StatusCode::GONE);
+        assert_eq!(status("invalid_query"), StatusCode::BAD_REQUEST);
+        // Unknown codes stay server faults.
+        assert_eq!(status("weird"), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+}
+
 pub(crate) fn error_status(err: &ApiError) -> StatusCode {
     match err.code.as_str() {
         "duplicate_key"
@@ -6175,6 +6197,9 @@ pub(crate) fn error_status(err: &ApiError) -> StatusCode {
         | "vault_profile_immutable"
         | "invalid_collection_profile" => StatusCode::BAD_REQUEST,
         "not_found" => StatusCode::NOT_FOUND,
+        // Expected consumer-protocol outcomes, not server faults.
+        "stale_lease" | "commit_out_of_order" => StatusCode::CONFLICT,
+        "stream_truncated" => StatusCode::GONE,
         "database_limit" => StatusCode::SERVICE_UNAVAILABLE,
         "database_busy" => StatusCode::CONFLICT,
         "wal_full" | "quota_exceeded" => StatusCode::INSUFFICIENT_STORAGE,

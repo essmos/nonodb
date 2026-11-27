@@ -1569,9 +1569,18 @@ impl Store {
     /// Creates or replaces a stream definition inside a writer transaction.
     pub fn set_stream_in(&self, wtxn: &mut RwTxn<'_>, def: &StreamDef) -> Result<()> {
         def.validate()?;
-        if self.collection_profile_in_rw(wtxn, &def.coll)?.is_none() {
+        let Some(profile) = self.collection_profile_in_rw(wtxn, &def.coll)? else {
             return Err(Error::Query(format!(
                 "collection `{}` does not exist",
+                def.coll
+            )));
+        };
+        // Time-series buckets and vault collections do not store `_seq` on the
+        // documents this feature reads, so a stream over them would silently
+        // deliver nothing (or the wrong rows). Reject instead of lying.
+        if profile != crate::vault::CollectionProfile::Standard {
+            return Err(Error::Query(format!(
+                "collection `{}` cannot back a stream: only standard collections are supported",
                 def.coll
             )));
         }
@@ -2049,13 +2058,19 @@ impl Store {
                 Error::Query(format!("stream group `{stream}:{group}` does not exist"))
             })?;
         let now = crate::streams::now_ms();
-        if let Some(_owner) = current.lease_id.as_deref() {
-            if current.lease_until > now && current.member.as_deref() != Some(member) {
+        if current.lease_id.is_some() && current.lease_until > now {
+            if current.member.as_deref() != Some(member) {
                 return Err(Error::StaleLease(format!(
                     "group `{group}` is leased by {} until {}",
                     current.member.as_deref().unwrap_or("another member"),
                     current.lease_until
                 )));
+            }
+            // The owner re-polling a lease that still has most of its lifetime
+            // left is a no-op: rewriting the row (and its replication entry)
+            // every few milliseconds buys nothing.
+            if current.lease_until > now.saturating_add(lease_ms.max(1_000) / 4 * 3) {
+                return Ok(current);
             }
         }
         current.lease_id = Some(crate::events::new_event_id());

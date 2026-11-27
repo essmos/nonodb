@@ -262,3 +262,18 @@ fn dropping_a_stream_keeps_data_and_groups() {
         .iter()
         .any(|doc| doc.get("n") == Some(&json!(1)) && doc.get("_seq").is_none()));
 }
+
+#[test]
+fn streams_require_a_standard_collection() {
+    let (_dir, store) = store();
+    store
+        .create_timeseries_collection("metrics", &Default::default())
+        .unwrap();
+    let mut def = nonodb_core::streams::StreamDef::new("metrics", "metrics");
+    def.retention.max_events = None;
+    let err = store.set_stream(&def).unwrap_err();
+    assert!(
+        matches!(err, Error::Query(ref message) if message.contains("only standard collections")),
+        "unexpected error: {err:?}"
+    );
+}

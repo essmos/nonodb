@@ -4,6 +4,16 @@ Full release notes: https://github.com/essmos/nonodb/releases
 
 ## Unreleased
 
+- Harden streams: consuming a consumer group (`watch` with `mode:"group"` or a
+  bare `group` field, `claim_stream_group`, `commit_stream_group`) requires the
+  new `consume:<collection>` scope, so a read-only credential can no longer claim
+  a lease. `create_stream` bootstraps a missing standard collection and replicates
+  it (`CollectionCreate` before `StreamSet`), time-series and vault collections
+  are rejected instead of silently delivering nothing, and expected consumer
+  errors return 409 (`stale_lease`, `commit_out_of_order`) or 410
+  (`stream_truncated`) instead of 500. A re-claim by the member that already owns
+  a live lease does not rewrite the group row.
+
 - Add streams with server-side offsets and consumer groups over append-only
   collections. The writer assigns a reserved `_seq` to every insert in a stream
   collection; `create_stream`, `create_stream_group`, `watch` with
