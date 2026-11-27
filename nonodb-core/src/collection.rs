@@ -5514,6 +5514,37 @@ impl<'e> Collection<'e> {
     /// Inserts many documents in one writer transaction. Time-series
     /// collections resolve each open bucket once and flush pointers at the end.
     pub fn insert_many_txn(&self, wtxn: &mut RwTxn<'_>, docs: &[Value]) -> Result<Vec<String>> {
+        if self.profile.is_columnar() {
+            let settings = self.columnar_settings_in(&*wtxn)?.unwrap_or_default();
+            let mut prepared = Vec::with_capacity(docs.len());
+            let mut ttls = Vec::with_capacity(docs.len());
+            for doc in docs {
+                let mut doc = doc.clone();
+                let ttl_at = ttl::take_insert_ttl_with_field(
+                    &mut doc,
+                    self.ttl_default_seconds,
+                    self.ttl_field_pair(),
+                )?;
+                date::normalize_document(&mut doc)?;
+                numeric::normalize_document(&mut doc)?;
+                bson_types::normalize_document(&mut doc)?;
+                self.validate_graph_edge_txn(&*wtxn, &doc)?;
+                prepared.push(doc);
+                ttls.push(ttl_at);
+            }
+            let inserted =
+                crate::columnar::insert_batch(wtxn, self.env, &self.name, &settings, prepared)?;
+            let mut ids = Vec::with_capacity(inserted.len());
+            for ((id, stored), ttl_at) in inserted.into_iter().zip(ttls) {
+                self.validate_unique(&*wtxn, &stored, &id)?;
+                self.apply_all_index_entries(wtxn, None, Some(&stored), &id)?;
+                self.apply_graph_entries(wtxn, None, Some(&stored))?;
+                self.set_ttl(wtxn, &id, ttl_at)?;
+                self.record_history(wtxn, &id, "insert", Some(stored))?;
+                ids.push(id);
+            }
+            return Ok(ids);
+        }
         if self.profile.is_timeseries() {
             let settings = self.timeseries_settings_in(&*wtxn)?.unwrap_or_default();
             let mut normalized = Vec::with_capacity(docs.len());
@@ -9128,6 +9159,42 @@ impl<'e> Collection<'e> {
                     field,
                     Value::from(count as u64),
                 )]))]);
+            }
+            let remaining = &pipeline[plan.next..];
+            if plan.sort.is_empty()
+                && plan.skip == 0
+                && plan.limit.is_none()
+                && plan.projection.is_none()
+                && !self.ttl_filter_active(rtxn)?
+            {
+                if let Some(group_arg) = remaining
+                    .first()
+                    .and_then(Value::as_object)
+                    .filter(|obj| obj.len() == 1)
+                    .and_then(|obj| obj.get("$group"))
+                {
+                    let builder = aggregate::GroupBuilder::new(group_arg)?;
+                    if builder.order_independent() {
+                        let groups = crate::columnar::group_parallel(
+                            rtxn,
+                            self.env,
+                            &self.name,
+                            &plan.filter,
+                            group_arg,
+                            aggregate_workers(),
+                        )?;
+                        check_find_deadline(deadline)?;
+                        let host = LookupHost { coll: self, rtxn };
+                        let out = aggregate::run_with_host(
+                            groups,
+                            &remaining[1..],
+                            aggregate::max_docs(),
+                            Some(&host),
+                        )?;
+                        check_find_deadline(deadline)?;
+                        return Ok(out);
+                    }
+                }
             }
             let max_docs = aggregate::max_docs();
             let limit = plan

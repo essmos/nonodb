@@ -14,6 +14,12 @@ Full release notes: https://github.com/essmos/nonodb/releases
   Rust/Python/Node.js/Go clients, CLI, and GUI.
 - Add columnar bucket version/settings guards and migration support via
   `scripts/nonodb-migrate.py --target-profile columnar`.
+- Add columnar hardening coverage for randomized differential operations,
+  concurrent writers/readers, crash/rollback recovery, interrupted compaction,
+  malformed buckets, unknown formats, and float bit-exact roundtrips. The write
+  path uses a row-oriented staging bucket that compaction re-encodes with the
+  adaptive column codecs; unsorted scans and order-independent `$group` stages
+  decode blocks in parallel.
 
 ## v0.34.0 - 2026-11-27
 

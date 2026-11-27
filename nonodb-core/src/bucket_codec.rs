@@ -614,6 +614,211 @@ pub(crate) fn encode_column(column: &Column, compression: Compression) -> Result
     Ok(out)
 }
 
+/// Write-path column encoder: one fixed layout per kind, no deflate.
+///
+/// Sealed write-path buckets are compacted in the background or by an explicit
+/// compaction, which re-encodes them with the adaptive encoder.
+pub(crate) fn encode_column_write(field: &str, values: &[Option<Value>]) -> Result<Vec<u8>> {
+    let kind = classify(values);
+    let n = values.len();
+    let present: Vec<&Value> = values.iter().flatten().collect();
+    let has_nulls = present.len() != n;
+    let (codec, payload) = match kind {
+        KIND_I64 => {
+            let mut raw = Vec::with_capacity(present.len() * 8);
+            for value in &present {
+                let number =
+                    value_as_i64(value).ok_or_else(|| corrupt("non-integer in integer column"))?;
+                raw.extend_from_slice(&number.to_le_bytes());
+            }
+            (CODEC_RAW, raw)
+        }
+        KIND_F64 => {
+            let mut raw = Vec::with_capacity(present.len() * 8);
+            for value in &present {
+                let number = value
+                    .as_f64()
+                    .ok_or_else(|| corrupt("non-numeric value in float column"))?;
+                raw.extend_from_slice(&number.to_bits().to_le_bytes());
+            }
+            (CODEC_RAW, raw)
+        }
+        KIND_BOOL => {
+            let mut writer = BitWriter::new();
+            for value in &present {
+                writer.write(u64::from(value.as_bool().unwrap_or(false)), 1);
+            }
+            (CODEC_BOOL_BITS, writer.finish())
+        }
+        KIND_STR => {
+            let mut raw = Vec::new();
+            for value in &present {
+                let text = value
+                    .as_str()
+                    .ok_or_else(|| corrupt("non-string in string column"))?;
+                put_bytes(&mut raw, text.as_bytes());
+            }
+            (CODEC_RAW, raw)
+        }
+        _ => {
+            let mut raw = Vec::new();
+            for value in &present {
+                put_bytes(&mut raw, &serde_json::to_vec(value)?);
+            }
+            (CODEC_RAW, raw)
+        }
+    };
+    let mut out = Vec::with_capacity(payload.len() + field.len() + 16);
+    put_bytes(&mut out, field.as_bytes());
+    out.push(kind);
+    out.push(codec);
+    out.push(u8::from(has_nulls));
+    put_uvarint(&mut out, n as u64);
+    if has_nulls {
+        let mut writer = BitWriter::new();
+        for value in values {
+            writer.write(u64::from(value.is_some()), 1);
+        }
+        out.extend_from_slice(&writer.finish());
+    }
+    put_bytes(&mut out, &payload);
+    Ok(out)
+}
+
+/// Column encoder for general columnar buckets.
+///
+/// The time-series encoder tries every codec candidate and keeps the smallest
+/// result. That is ideal for storage but dominates batch-insert CPU. This
+/// variant picks one candidate from cheap column statistics, then applies the
+/// same deflate step and writes the same block format.
+pub(crate) fn encode_column_fast(
+    field: &str,
+    values: &[Option<Value>],
+    compression: Compression,
+) -> Result<Vec<u8>> {
+    let kind = classify(values);
+    let n = values.len();
+    let present: Vec<&Value> = values.iter().flatten().collect();
+    let has_nulls = present.len() != n;
+
+    let (codec, payload) = match kind {
+        KIND_I64 => {
+            let mut numbers = Vec::with_capacity(present.len());
+            for value in &present {
+                match value_as_i64(value) {
+                    Some(number) => numbers.push(number),
+                    None => return Err(corrupt("non-integer in integer column")),
+                }
+            }
+            let sorted = numbers.windows(2).all(|pair| pair[0] <= pair[1]);
+            let min = numbers.iter().copied().min().unwrap_or(0);
+            let max = numbers.iter().copied().max().unwrap_or(0);
+            let range = (max as i128).saturating_sub(min as i128);
+            if sorted && numbers.len() > 2 {
+                (CODEC_DELTA, encode_delta(&numbers))
+            } else if range <= u32::MAX as i128 && numbers.len() > 2 {
+                (CODEC_FOR, encode_for(&numbers))
+            } else {
+                (
+                    CODEC_RAW,
+                    numbers.iter().flat_map(|v| v.to_le_bytes()).collect(),
+                )
+            }
+        }
+        KIND_F64 => {
+            let mut raw = Vec::with_capacity(present.len() * 8);
+            for value in &present {
+                let number = value
+                    .as_f64()
+                    .ok_or_else(|| corrupt("non-numeric value in float column"))?;
+                raw.extend_from_slice(&number.to_bits().to_le_bytes());
+            }
+            (CODEC_RAW, raw)
+        }
+        KIND_BOOL => {
+            let mut writer = BitWriter::new();
+            for value in &present {
+                writer.write(u64::from(value.as_bool().unwrap_or(false)), 1);
+            }
+            (CODEC_BOOL_BITS, writer.finish())
+        }
+        KIND_STR => {
+            let strings: Vec<&str> = present.iter().filter_map(|value| value.as_str()).collect();
+            if strings.len() != present.len() {
+                return Err(corrupt("non-string value in string column"));
+            }
+            let unique: std::collections::HashSet<&str> = strings.iter().copied().collect();
+            if unique.len() * 2 <= strings.len().max(1) {
+                let mut dict: Vec<&str> = Vec::new();
+                let mut index: std::collections::HashMap<&str, u32> =
+                    std::collections::HashMap::new();
+                let mut indices = Vec::with_capacity(strings.len());
+                for value in &strings {
+                    let slot = *index.entry(*value).or_insert_with(|| {
+                        let slot = dict.len() as u32;
+                        dict.push(*value);
+                        slot
+                    });
+                    indices.push(slot);
+                }
+                let mut out = Vec::new();
+                put_uvarint(&mut out, dict.len() as u64);
+                for entry in &dict {
+                    put_bytes(&mut out, entry.as_bytes());
+                }
+                let width = bits_needed(dict.len().saturating_sub(1) as u64);
+                out.push(width);
+                let mut writer = BitWriter::new();
+                for slot in indices {
+                    writer.write(u64::from(slot), width);
+                }
+                out.extend_from_slice(&writer.finish());
+                (CODEC_DICT, out)
+            } else {
+                let mut raw = Vec::new();
+                for value in &strings {
+                    put_bytes(&mut raw, value.as_bytes());
+                }
+                (CODEC_RAW, raw)
+            }
+        }
+        _ => {
+            let mut raw = Vec::new();
+            for value in &present {
+                put_bytes(&mut raw, &serde_json::to_vec(value)?);
+            }
+            (CODEC_RAW, raw)
+        }
+    };
+
+    let (codec, payload) = if payload.len() > 48 {
+        let packed = deflate(&payload, compression.level())?;
+        if packed.len() + 2 < payload.len() {
+            (codec | CODEC_DEFLATE, packed)
+        } else {
+            (codec, payload)
+        }
+    } else {
+        (codec, payload)
+    };
+
+    let mut out = Vec::with_capacity(payload.len() + field.len() + 16);
+    put_bytes(&mut out, field.as_bytes());
+    out.push(kind);
+    out.push(codec);
+    out.push(u8::from(has_nulls));
+    put_uvarint(&mut out, n as u64);
+    if has_nulls {
+        let mut writer = BitWriter::new();
+        for value in values {
+            writer.write(u64::from(value.is_some()), 1);
+        }
+        out.extend_from_slice(&writer.finish());
+    }
+    put_bytes(&mut out, &payload);
+    Ok(out)
+}
+
 pub(crate) fn decode_column(data: &[u8], pos: &mut usize) -> Result<Column> {
     let field = std::str::from_utf8(get_bytes(data, pos)?)
         .map_err(|_| corrupt("field name is not UTF-8"))?
@@ -772,8 +977,190 @@ pub(crate) fn decode_column(data: &[u8], pos: &mut usize) -> Result<Column> {
     }
 }
 
+/// Decodes only one row of one column, advancing `pos` past the whole column.
+///
+/// Point reads use this to avoid materializing every value in the block for
+/// every column while preserving the exact same on-disk format.
+pub(crate) fn decode_column_at(
+    data: &[u8],
+    pos: &mut usize,
+    row: usize,
+) -> Result<(String, Option<Value>)> {
+    let field = std::str::from_utf8(get_bytes(data, pos)?)
+        .map_err(|_| corrupt("field name is not UTF-8"))?
+        .to_string();
+    let kind = *data
+        .get(*pos)
+        .ok_or_else(|| corrupt("missing column kind"))?;
+    let codec = *data
+        .get(*pos + 1)
+        .ok_or_else(|| corrupt("missing column codec"))?;
+    let flags = *data
+        .get(*pos + 2)
+        .ok_or_else(|| corrupt("missing column flags"))?;
+    *pos += 3;
+    let n = get_uvarint(data, pos)? as usize;
+    if n > HARD_MAX_COLUMN_ROWS {
+        return Err(corrupt("column row count out of range"));
+    }
+    if row >= n {
+        return Err(corrupt("column row out of range"));
+    }
+    let mut present = vec![true; n];
+    if flags & 1 != 0 {
+        let mut reader = BitReader::new(
+            data.get(*pos..)
+                .ok_or_else(|| corrupt("missing null bitmap"))?,
+        );
+        for slot in present.iter_mut() {
+            *slot = reader.read(1)? == 1;
+        }
+        *pos += n.div_ceil(8);
+    }
+    let raw = get_bytes(data, pos)?;
+    if !present[row] {
+        return Ok((field, None));
+    }
+    let deflated = codec & CODEC_DEFLATE != 0;
+    let base = codec & !CODEC_DEFLATE;
+    let owned;
+    let payload: &[u8] = if deflated {
+        owned = inflate(raw)?;
+        &owned
+    } else {
+        raw
+    };
+    let count = present.iter().filter(|value| **value).count();
+    let index = present[..row].iter().filter(|value| **value).count();
+    let value = match base {
+        CODEC_RAW | CODEC_SHUFFLE => {
+            if kind == KIND_I64 {
+                let numbers = if base == CODEC_SHUFFLE {
+                    decode_shuffle(payload, count)?
+                } else {
+                    if payload.len() != count * 8 {
+                        return Err(corrupt("integer column length mismatch"));
+                    }
+                    payload
+                        .as_chunks::<8>()
+                        .0
+                        .iter()
+                        .map(|chunk| u64::from_le_bytes(*chunk))
+                        .collect()
+                };
+                Value::from(numbers[index] as i64)
+            } else if kind == KIND_F64 {
+                let numbers = if base == CODEC_SHUFFLE {
+                    decode_shuffle(payload, count)?
+                } else {
+                    if payload.len() != count * 8 {
+                        return Err(corrupt("float column length mismatch"));
+                    }
+                    payload
+                        .as_chunks::<8>()
+                        .0
+                        .iter()
+                        .map(|chunk| u64::from_le_bytes(*chunk))
+                        .collect()
+                };
+                match serde_json::Number::from_f64(f64::from_bits(numbers[index])) {
+                    Some(number) => Value::Number(number),
+                    None => Value::Null,
+                }
+            } else if kind == KIND_STR || kind == KIND_JSON {
+                let mut reader = 0;
+                let mut bytes = &[][..];
+                for _ in 0..=index {
+                    bytes = get_bytes(payload, &mut reader)?;
+                }
+                if kind == KIND_STR {
+                    Value::String(
+                        std::str::from_utf8(bytes)
+                            .map_err(|_| corrupt("string column is not UTF-8"))?
+                            .to_string(),
+                    )
+                } else {
+                    serde_json::from_slice(bytes)?
+                }
+            } else if kind == KIND_BOOL {
+                let mut reader = BitReader::new(payload);
+                let mut bit = 0;
+                for _ in 0..=index {
+                    bit = reader.read(1)?;
+                }
+                Value::Bool(bit == 1)
+            } else {
+                return Err(corrupt("unsupported column kind"));
+            }
+        }
+        CODEC_DELTA | CODEC_DELTA_DELTA | CODEC_FOR => {
+            let numbers = match base {
+                CODEC_DELTA => decode_delta(payload, count)?,
+                CODEC_DELTA_DELTA => decode_delta_delta(payload, count)?,
+                _ => decode_for(payload, count)?,
+            };
+            Value::from(numbers[index])
+        }
+        CODEC_XOR => match serde_json::Number::from_f64(decode_xor(payload, count)?[index]) {
+            Some(number) => Value::Number(number),
+            None => Value::Null,
+        },
+        CODEC_DICT => Value::String(decode_dict(payload, count)?[index].clone()),
+        CODEC_BOOL_BITS => {
+            let mut reader = BitReader::new(payload);
+            let mut bit = 0;
+            for _ in 0..=index {
+                bit = reader.read(1)?;
+            }
+            Value::Bool(bit == 1)
+        }
+        _ => return Err(corrupt("unknown column codec")),
+    };
+    Ok((field, Some(value)))
+}
+
 fn has_nulls_mask(present: &[bool]) -> bool {
     present.iter().any(|value| !*value)
+}
+
+#[cfg(test)]
+mod float_probe {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn float_columns_roundtrip_bit_exactly() {
+        let vals = [
+            69.0f64,
+            76.14285714285714,
+            5.142857142857143,
+            63.142857142857146,
+            107.42857142857143,
+            1.5,
+            2.5,
+        ];
+        let column = Column {
+            field: "f".into(),
+            values: vals.iter().map(|v| Some(json!(v))).collect(),
+        };
+        for compression in [Compression::Fast, Compression::Balanced, Compression::Max] {
+            let encoded = encode_column(&column, compression).unwrap();
+            let mut pos = 0;
+            let decoded = decode_column(&encoded, &mut pos).unwrap();
+            for (index, val) in vals.iter().enumerate() {
+                assert_eq!(
+                    decoded.values[index]
+                        .as_ref()
+                        .unwrap()
+                        .as_f64()
+                        .unwrap()
+                        .to_bits(),
+                    val.to_bits(),
+                    "{index} {val:?} {compression:?}"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]

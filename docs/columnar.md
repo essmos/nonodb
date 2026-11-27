@@ -171,6 +171,14 @@ Compaction rewrites visible rows into fresh sealed buckets and discards
 tombstoned overlay entries. It is crash-safe: an interrupted compaction is
 recovered on the next `Store::open`.
 
+The insert path seals buckets with a row-oriented staging encoding so append
+throughput stays close to `standard`; an explicit compaction re-encodes those
+buckets with the adaptive column codecs. Reads understand both layouts, point
+lookups decode one row, and storage comparisons should be made after
+compaction. Unsorted scans and order-independent `$group` stages decode bucket
+blocks in parallel by default (`NONODB_SCAN_WORKERS` and
+`NONODB_AGGREGATE_WORKERS`).
+
 Replication carries collection creation with profile and settings, every
 insert/update/delete, TTL changes, and `columnar_settings` operations. Replica
 apply uses the same validation as the primary, including duplicate `_id`
