@@ -149,7 +149,9 @@ one ordered by `(series, window)` and one by `(window, series)`. `find`,
 `count` on those fields reads bucket headers and the deletion bitmap only;
 ordered `find` with `skip`/`limit` decodes just the blocks it needs.
 `explain` reports `bucket_index_used`, `index: "bucket_locator"`,
-`buckets_total`, and `buckets_pruned`.
+`buckets_total`, and `buckets_pruned`. These bucket locator indexes are
+internal: they are not created, listed, or dropped through the index CLI/GUI
+commands.
 
 ```json
 {
@@ -282,6 +284,13 @@ entries for every reaped row (whole dropped buckets and the tombstoned boundary
 bucket) before returning, so `reindex` is not required to avoid stale keys. Unique indexes are enforced on insert, update, upsert, and reindex; deleted
 rows free their value immediately.
 
+Automatic secondary indexes (`NONODB_AUTO_INDEX=1`) also apply to time-series
+collections, except `vault` collections. They are ordinary non-unique
+secondary indexes; auto-index never creates text, fuzzy, vector, geo, unique,
+sparse, partial, or covering indexes. The internal bucket locator indexes are
+independent of auto-index and always remain available. Automatic indexes have
+no CLI or GUI toggle; enable them with the daemon environment variables.
+
 ### Search indexes
 
 Time-series collections accept the same text, fuzzy, geo, and vector indexes as
@@ -302,6 +311,24 @@ the wire API. Opening a time-series collection and clicking **Settings** shows
 the stored settings plus row/bucket/series counts, deleted rows, encoded size,
 and raw JSON size; compression, bucket size, and expiry are editable (the
 structural time/meta/granularity fields are read-only once rows exist).
+
+The **Indexes** tab works for time-series collections as well. It lists
+secondary, text, fuzzy, and vector indexes and can create or drop them.
+The secondary form accepts comma-separated fields, `include`, `unique`, and
+`geo`; text and fuzzy indexes take one field, and vector indexes also take
+dimensions and a metric. **Reindex all** rebuilds every index type. The form
+does not expose `sparse`, `partialFilterExpression`, or explicit per-field
+`directions`; use the wire API or `create_indexes` for those options.
+
+The CLI has no dedicated create-index subcommand. It lists secondary indexes
+with `indexes`, rebuilds all index types with `reindex`, and creates indexes
+through `exec`:
+
+```bash
+nonodb-cli exec '{"op":"create_index","coll":"readings","fields":["device","ts"]}'
+nonodb-cli exec '{"op":"create_text_index","coll":"readings","field":"source"}'
+nonodb-cli exec '{"op":"create_vector_index","coll":"readings","field":"embedding","dims":384,"metric":"cosine"}'
+```
 
 ### Reading and changing settings
 

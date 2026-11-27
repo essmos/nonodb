@@ -1968,6 +1968,12 @@ sorts and selective unsorted scans are parallelized for shallow queries.
 
 ## create_index
 
+`create_index` and `create_indexes` apply to standard and time-series
+collections. Time-series indexes use per-bucket posting lists and maintain
+unique constraints by `(locator, seq)`; see
+[`docs/timeseries.md`](timeseries.md#secondary-indexes) for storage and
+lifecycle details.
+
 Single-field index:
 
 ```json

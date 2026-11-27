@@ -291,6 +291,20 @@ nonodb-cli indexes users
 ```
 
 The output includes the index name, fields, uniqueness, and `include` fields.
+It lists secondary indexes; use `exec` with `list_text_indexes`,
+`list_fuzzy_indexes`, or `list_vector_indexes` for search indexes.
+
+There is no separate `create-index` subcommand. Create indexes through `exec`:
+
+```bash
+nonodb-cli exec '{"op":"create_index","coll":"users","field":"email","unique":true}'
+nonodb-cli exec '{"op":"create_indexes","coll":"events","indexes":[{"fields":["tenant","created_at"]},{"field":"tags","sparse":true}]}'
+nonodb-cli exec '{"op":"create_text_index","coll":"articles","field":"body"}'
+nonodb-cli exec '{"op":"create_vector_index","coll":"articles","field":"embedding","dims":384,"metric":"cosine"}'
+```
+
+The same operations work on time-series collections. `sparse`, `partialFilterExpression`,
+and per-field `directions` are available through `exec`/`create_indexes`.
 
 ## reindex
 
