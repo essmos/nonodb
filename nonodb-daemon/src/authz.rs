@@ -181,6 +181,7 @@ pub fn authorize_request(
         | Request::CreateStreamGroup { coll, .. }
         | Request::ResetStreamGroup { coll, .. }
         | Request::DeleteStreamGroup { coll, .. }
+        | Request::PruneStream { coll, .. }
         | Request::RetryStreamDead { coll, .. }
         | Request::DropStreamDead { coll, .. } => allow(
             principal,

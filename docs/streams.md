@@ -8,10 +8,10 @@ NonoDB can tail **append-only event collections** in two ways:
 Both are designed for collections such as `_events`, where documents are
 inserted with sortable ULID `_id` values by the outbox producer.
 
-> **Planned:** server-side offsets, consumer groups, in-flight leases, and
-> offset/size-based retention are specified in the
-> [streams groups plan](streams-groups-plan.md). The behaviour documented below is
-> the current implementation.
+> **Streams:** server-side offsets, consumer groups, and in-flight range leases
+> are implemented (see [consumer groups](#consumer-groups-and-durable-offsets)).
+> Offset-driven retention is implemented; byte-based retention (`max_bytes`) is
+> still planned. Details in the [streams groups plan](streams-groups-plan.md).
 
 The normal mode tails existing documents by `_id`. It is **not** an automatic
 change stream for arbitrary collections; updates and deletes are not emitted.
@@ -590,6 +590,10 @@ claim a group or acknowledge a batch, because claiming writes the lease and
 committing moves the offset. A bare `group` field counts as group mode even when
 `mode` is omitted.
 
+Reading a group **claims the group lease**. One member owns the group at a time:
+a second member gets `timed_out` (or `stale_lease`) until the lease expires or
+the owner commits. The lease lasts `lease_ms` (default `60000`), and re-claiming
+as the same member extends it.
 Every read **claims a contiguous range** of offsets (`from_seq..=to_seq`,
 bounded by `limit`) and writes one lease covering the whole range. Several
 members of the same group therefore work in parallel: each gets a distinct
@@ -655,6 +659,66 @@ in-flight batches and dead letters of that group, and clears `truncated_below`.
 `drop_stream` keeps the data and the groups; only the definition (and future
 offset assignment) is removed.
 
+### Retention
+
+```json
+{"op":"create_stream","coll":"_events","retention":{"max_events":1000000,"max_age_ms":604800000,"min_seq_keep":10000}}
+```
+
+A stream is pruned by the **lowest committed offset** among its groups, bounded
+by the other retention settings:
+
+```
+drop everything at or below  min(
+    head - max_events,
+    events older than max_age_ms,
+    slowest group's committed_seq - min_seq_keep,
+)
+```
+
+Consequences worth knowing:
+
+- A group that stops committing **pins retention**: nothing at or above its
+  offset is dropped. A paused consumer is a disk-growth decision, so alert on
+  `nonodb_stream_lag_events` rather than letting the log grow silently.
+- `min_seq_keep` leaves a safety margin of events behind the slowest consumer;
+  setting it explicitly requires it to be at most the current lag.
+- A group created behind the retained window (or one that fell behind) fails its
+  next claim with `stream_truncated` instead of silently skipping events, and
+  records `truncated_below` in `stream_stats`. `reset_stream_group` with
+  `"earliest"` resumes at the oldest surviving event.
+- `max_bytes` is **not** part of the rule yet; it is validated but ignored.
+- The age boundary is read from each event's numeric `created_at`; when it is
+  missing, the timestamp embedded in a 26-character ULID `_id` is used (that is
+  the shape [EventProducer](events.md) writes). An event with **neither** is
+  "unknown age", not "very old": it stops the boundary, so nothing at or after it
+  is pruned by age. If you write plain documents into a stream collection, set
+  `created_at` or rely on `max_events`/`min_seq_keep` instead.
+- The boundary only covers a **contiguous prefix**: the scan walks `_seq` upwards
+  and stops at the first event that is not provably old. Out-of-order timestamps
+  therefore delay pruning instead of deleting a fresh event, and the cost is
+  bounded by one prune batch rather than the stream length.
+- Pruning runs through the writer, so deletions replicate and the stream stays
+  consistent on replicas. It removes up to `NONODB_STREAM_PRUNE_BATCH` events
+  per pass; the pass repeats while it keeps finding events to drop.
+- The lease janitor runs only on the primary and through the writer: requeues and
+  the committed-offset advance, as well as the dead records it creates, replicate
+  to replicas instead of staying node-local.
+
+Run the retention loop in the background, or trigger a single pass by hand:
+
+```
+NONODB_STREAM_PRUNE_INTERVAL=60 NONODB_STREAM_PRUNE_BATCH=1000 nonodb-daemon ...
+```
+
+```json
+{"op":"prune_stream","coll":"_events","batch":1000}
+```
+
+A quiet stream costs one small index scan per pass, bounded by
+`NONODB_STREAM_PRUNE_BATCH`. Dropped events are counted in
+`nonodb_stream_truncated_total`.
+
 ### Metrics
 
 `/metrics/prometheus` exposes per-group stream gauges and counters:
@@ -669,17 +733,16 @@ offset assignment) is removed.
 | `nonodb_stream_redeliveries_total` | batches delivered again |
 | `nonodb_stream_nacks_total` | batches released with nack |
 | `nonodb_stream_dead_letters_total` | events dead-lettered |
+| `nonodb_stream_truncated_total` | events dropped by retention |
+| `nonodb_stream_lease_recoveries_total` | expired leases requeued or dead-lettered |
 
 ### Current limits
 
-- `retention` is stored and validated but not enforced yet. Until the retention
-  phase lands, use TTL on the event collection as today; the
-  [streams groups plan](streams-groups-plan.md) has the remaining phases.
-- Leases are node-local ownership and are not replicated. The claim position is
-  derived from `committed_seq` plus the leases on the current node, never from the
-  replicated `next_seq`, so a promoted replica resumes at `committed_seq + 1` and
-  **redelivers** ranges the old primary had claimed but not committed
-  (at-least-once, never silent loss). A node that takes over a group with a copied
-  data directory can call `clear_stream_leases` to drop stale ownership.
+- `retention.max_bytes` is validated but ignored; use `max_events` and
+  `max_age_ms` instead. The
+  [streams groups plan](streams-groups-plan.md) has the remaining phase.
+- Leases are node-local ownership and are not replicated; a promoted replica
+  starts with no active lease, which is safe because a new claim is required
+  before any commit.
 - A commit must cover the whole leased range. Partial acknowledgements inside a
   range are rejected rather than split.

@@ -20,8 +20,14 @@ Full release notes: https://github.com/essmos/nonodb/releases
   it (`CollectionCreate` before `StreamSet`), time-series and vault collections
   are rejected instead of silently delivering nothing, and expected consumer
   errors return 409 (`stale_lease`, `commit_out_of_order`) or 410
-  (`stream_truncated`) instead of 500. A re-claim by the member that already owns
-  a live lease does not rewrite the group row.
+  (`stream_truncated`) instead of 500.
+
+- Make stream retention safe: the age boundary only drops a contiguous prefix
+  that is provably older than `max_age_ms`, using `created_at` with a ULID `_id`
+  fallback, so a deleted head, an out-of-order timestamp, or a missing timestamp
+  never deletes a fresh event; `max_events` counts from the newest surviving
+  event. The lease janitor runs only on the primary and through the writer, so
+  its offset advances and dead letters replicate.
 
 - Add streams with server-side offsets and consumer groups over append-only
   collections. The writer assigns a reserved `_seq` to every insert in a stream

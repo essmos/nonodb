@@ -680,6 +680,12 @@ pub enum Request {
         group: Option<String>,
     },
     /// Move a dead letter back into the redelivery queue.
+    /// Runs one retention pass over a stream.
+    PruneStream {
+        coll: String,
+        #[serde(default)]
+        batch: Option<usize>,
+    },
     RetryStreamDead {
         coll: String,
         group: String,
@@ -1072,6 +1078,16 @@ pub enum WriteReq {
         lease_id: String,
         retry_in_ms: u64,
     },
+    PruneStream {
+        coll: String,
+        batch: usize,
+    },
+    /// Run the lease janitor for one group through the writer, so requeues and
+    /// dead letters are replicated instead of staying node-local.
+    RecoverStreamLeases {
+        stream: String,
+        group: String,
+    },
     RetryStreamDead {
         coll: String,
         group: String,
@@ -1330,6 +1346,7 @@ impl Request {
             Self::NackStreamGroup { .. } => "nack_stream_group",
             Self::StreamDead { .. } => "stream_dead",
             Self::RetryStreamDead { .. } => "retry_stream_dead",
+            Self::PruneStream { .. } => "prune_stream",
             Self::DropStreamDead { .. } => "drop_stream_dead",
             Self::GetCollectionEvents { .. } => "get_collection_events",
             Self::GetCollectionMetrics { .. } => "get_collection_metrics",
@@ -1508,6 +1525,7 @@ impl Request {
             | Self::ClaimStreamGroup { coll, .. }
             | Self::NackStreamGroup { coll, .. }
             | Self::RetryStreamDead { coll, .. }
+            | Self::PruneStream { coll, .. }
             | Self::DropStreamDead { coll, .. } => vec![coll.clone()],
             Self::StreamDead { coll, .. } => coll.iter().cloned().collect(),
             Self::ListStreams => Vec::new(),

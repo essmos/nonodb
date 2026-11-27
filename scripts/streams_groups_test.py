@@ -449,6 +449,109 @@ def main() -> int:
         assert (
             api.error({"op": "create_stream", "coll": "ts_events"}) == "invalid_query"
         ), "a time-series collection must not accept a stream"
+        # Offset retention: a group without commits pins the window, and a group
+        # behind the window gets `stream_truncated` instead of silent skips.
+        api.call({"op": "create_collection", "coll": "ret_events"})
+        api.call(
+            {
+                "op": "create_stream",
+                "coll": "ret_events",
+                "retention": {"max_events": 5},
+            }
+        )
+        for n in range(20):
+            api.call({"op": "insert", "coll": "ret_events", "doc": {"n": n}})
+        api.call(
+            {
+                "op": "create_stream_group",
+                "coll": "ret_events",
+                "group": "pin",
+                "start": "earliest",
+            }
+        )
+        assert api.call({"op": "prune_stream", "coll": "ret_events"})["deleted"] == 0, (
+            "a group with no commits must pin retention"
+        )
+        pinned = api.call({"op": "stream_stats", "coll": "ret_events"})["streams"][0]
+        assert pinned["groups"][0]["committed_seq"] == 0, pinned
+        drained = api.call(
+            {
+                "op": "watch",
+                "coll": "ret_events",
+                "mode": "group",
+                "group": "pin",
+                "member": "p1",
+                "limit": 100,
+                "timeout_ms": 100,
+            }
+        )
+        api.call(
+            {
+                "op": "commit_stream_group",
+                "coll": "ret_events",
+                "group": "pin",
+                "seq": drained["to_seq"],
+                "lease_id": drained["lease_id"],
+            }
+        )
+        pruned = api.call({"op": "prune_stream", "coll": "ret_events"})
+        assert pruned["deleted"] == 15, pruned
+        remaining = api.call(
+            {"op": "find", "coll": "ret_events", "sort": [["_seq", 1]]}
+        )
+        assert [doc["_seq"] for doc in remaining] == list(range(16, 21)), remaining
+
+        api.call({"op": "insert", "coll": "ret_events", "doc": {"n": 20}})
+        api.call(
+            {
+                "op": "create_stream_group",
+                "coll": "ret_events",
+                "group": "late",
+                "start": "earliest",
+            }
+        )
+        status, code = api.error_with_status(
+            {
+                "op": "watch",
+                "coll": "ret_events",
+                "mode": "group",
+                "group": "late",
+                "timeout_ms": 100,
+            }
+        )
+        assert code == "stream_truncated", code
+        assert status == 410, f"stream_truncated must be 410, got {status}"
+        late = [
+            group
+            for group in api.call({"op": "stream_stats", "coll": "ret_events"})["streams"][0][
+                "groups"
+            ]
+            if group["group"] == "late"
+        ][0]
+        assert late["truncated_below"] == 16, late
+        assert late["committed_seq"] == 0, late
+
+        # Reset resumes at the oldest surviving event instead of failing again.
+        reset = api.call(
+            {
+                "op": "reset_stream_group",
+                "coll": "ret_events",
+                "group": "late",
+                "to": "earliest",
+            }
+        )
+        assert reset["committed_seq"] == 15, reset
+        assert reset.get("truncated_below") is None, reset
+        resumedret_events = api.call(
+            {
+                "op": "watch",
+                "coll": "ret_events",
+                "mode": "group",
+                "group": "late",
+                "timeout_ms": 100,
+            }
+        )
+        assert resumedret_events["from_seq"] == 16, resumedret_events
 
         api.close()
         print("streams/groups: ok")

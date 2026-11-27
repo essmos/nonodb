@@ -1398,6 +1398,28 @@ fn execute(
                 "dead": dead,
             }))
         }
+        WriteReq::PruneStream { coll, batch } => {
+            let dropped = store.prune_stream_in(wtxn, coll, *batch)?;
+            for (id, before) in &dropped {
+                replication.capture(coll, "delete", id, Some(before), None);
+            }
+            Ok(json!({ "deleted": dropped.len() }))
+        }
+        WriteReq::RecoverStreamLeases { stream, group } => {
+            let before = store.stream_group_in_rw(wtxn, stream, group)?;
+            let (recovered, dead) = store.recover_stream_leases_in(wtxn, stream, group)?;
+            if let Some(group_row) = store.stream_group_in_rw(wtxn, stream, group)? {
+                if before.as_ref().map(|row| row.committed_seq) != Some(group_row.committed_seq) {
+                    replication.capture_op(ReplicationOp::StreamGroupSet { group: group_row });
+                }
+            }
+            for lease in &dead {
+                replication.capture_op(ReplicationOp::StreamLeaseDead {
+                    lease: lease.clone(),
+                });
+            }
+            Ok(json!({ "recovered": recovered, "dead": dead.len() }))
+        }
         WriteReq::RetryStreamDead {
             coll,
             group,
