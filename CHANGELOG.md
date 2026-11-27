@@ -2,6 +2,14 @@
 
 Full release notes: https://github.com/essmos/nonodb/releases
 
+## Unreleased
+
+- Wake continuous `/v1/watch` streams as soon as the writer commits instead of
+  waiting for the idle poll interval, and send one buffered frame per poll page
+  instead of one channel message per event. Delivered-event latency drops from
+  about 52 ms to about 2 ms at p99, and draining a backlog through one stream is
+  roughly 20% faster.
+
 ## v0.34.0 - 2026-11-27
 
 Stable release focused on time-series collections, columnar compression, and a

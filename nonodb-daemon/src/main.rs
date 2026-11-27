@@ -2083,17 +2083,28 @@ async fn open_cursor(
 
 /// One frame for the streaming `/v1/watch` endpoint.
 fn watch_frame(sse: bool, event: &Value) -> Bytes {
-    let data = serde_json::to_string(event).unwrap_or_else(|_| "{}".to_string());
+    let mut out = Vec::with_capacity(256);
+    append_watch_frame(&mut out, sse, event);
+    Bytes::from(out)
+}
+
+/// Appends one frame to an existing buffer so a poll page is sent as a single
+/// channel message instead of one message per event.
+fn append_watch_frame(out: &mut Vec<u8>, sse: bool, event: &Value) {
     if sse {
         let id = event
             .get("_id")
             .and_then(Value::as_str)
             .unwrap_or_default()
             .replace(['\r', '\n'], "");
-        Bytes::from(format!("event: message\nid: {id}\ndata: {data}\n\n"))
-    } else {
-        Bytes::from(format!("{data}\n"))
+        out.extend_from_slice(b"event: message\nid: ");
+        out.extend_from_slice(id.as_bytes());
+        out.extend_from_slice(b"\ndata: ");
     }
+    if serde_json::to_writer(&mut *out, event).is_err() {
+        out.extend_from_slice(b"{}");
+    }
+    out.extend_from_slice(if sse { b"\n\n" } else { b"\n" });
 }
 
 fn watch_control(sse: bool, name: &str, value: &Value) -> Bytes {
@@ -2382,16 +2393,18 @@ async fn watch_stream_loop(
         });
         if !events.is_empty() {
             let mut sent = 0usize;
+            let mut batch: Vec<u8> = Vec::with_capacity(events.len() * 160);
             for event in &events {
                 let Some(event) = thresholds.apply(event) else {
                     continue;
                 };
-                if tx.send(Ok(watch_frame(sse, &event))).await.is_err() {
-                    return Ok(());
-                }
+                append_watch_frame(&mut batch, sse, &event);
                 sent += 1;
             }
             if sent > 0 {
+                if tx.send(Ok(Bytes::from(batch))).await.is_err() {
+                    return Ok(());
+                }
                 metrics::add(&metrics::WATCH_EVENTS, sent as u64);
                 last_write = Instant::now();
             }
@@ -2415,7 +2428,12 @@ async fn watch_stream_loop(
             metrics::inc(&metrics::WATCH_HEARTBEATS);
             last_write = Instant::now();
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Wake as soon as the writer commits, with the poll interval as an
+        // upper bound so a missed notification cannot stall the stream.
+        tokio::select! {
+            _ = live::stream_notify().notified() => {}
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
     }
 }
 

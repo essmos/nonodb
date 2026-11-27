@@ -30,6 +30,9 @@ const IDLE_GRACE: Duration = Duration::from_secs(30);
 
 static REGISTRY: OnceLock<Arc<LiveRegistry>> = OnceLock::new();
 
+/// Writer-side wake-up for continuous `/v1/watch` streams.
+static STREAM_NOTIFY: OnceLock<Arc<tokio::sync::Notify>> = OnceLock::new();
+
 thread_local! {
     /// Live events collected by the writer transaction, dispatched only after a
     /// successful commit, or discarded when the transaction aborts.
@@ -91,6 +94,23 @@ pub fn collect_pending(
         PENDING.with(|slot| slot.borrow_mut().extend(pending));
     }
     Ok(())
+}
+
+/// Wakes `watch`/`_events` streams after a successful commit so they do not
+/// have to wait for their polling interval.
+pub fn notify_streams() {
+    stream_notify().notify_waiters();
+}
+
+/// Global wake-up handle shared by every continuous stream.
+pub fn stream_notify() -> &'static Arc<tokio::sync::Notify> {
+    STREAM_NOTIFY.get_or_init(|| Arc::new(tokio::sync::Notify::new()))
+}
+
+/// Runs the post-commit hooks for a committed write transaction.
+pub fn after_commit() {
+    dispatch_pending();
+    notify_streams();
 }
 
 /// Sends collected live events after a successful commit.
