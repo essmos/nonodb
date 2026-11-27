@@ -20,6 +20,7 @@ use crate::bucket_codec::{
     decode_column, encode_column, get_bytes, get_uvarint, put_bytes, put_uvarint, Column,
     Compression, HARD_MAX_COLUMN_ROWS,
 };
+use crate::collection::{compare_docs, project_document, FindQuery, UpdateOutcome};
 use crate::error::{Error, Result};
 
 /// Metadata prefix for columnar settings.
@@ -35,6 +36,8 @@ const KEY_OPEN_ROW: u8 = 0x00;
 const KEY_BUCKET: u8 = 0x01;
 const KEY_ID: u8 = 0x02;
 const KEY_POINTER: u8 = 0x03;
+const KEY_OVERLAY: u8 = 0x04;
+const KEY_DELETED: u8 = 0x05;
 
 const DEFAULT_BUCKET_MAX_DOCS: usize = 512;
 const DEFAULT_BUCKET_MAX_BYTES: usize = 512 * 1024;
@@ -104,6 +107,7 @@ pub struct Stats {
 }
 
 type Locator = (u64, u32);
+type OverlayMap = BTreeMap<u64, Vec<(u32, Map<String, Value>)>>;
 
 fn db_name(name: &str) -> String {
     format!("{DB_PREFIX}{name}")
@@ -146,6 +150,32 @@ fn id_key(hash: u64) -> Vec<u8> {
 
 fn pointer_key() -> [u8; 1] {
     [KEY_POINTER]
+}
+
+fn overlay_key(bucket: u64, row: u32) -> Vec<u8> {
+    let mut key = Vec::with_capacity(13);
+    key.push(KEY_OVERLAY);
+    key.extend_from_slice(&bucket.to_be_bytes());
+    key.extend_from_slice(&row.to_be_bytes());
+    key
+}
+
+fn deleted_key(bucket: u64, row: u32) -> Vec<u8> {
+    let mut key = Vec::with_capacity(13);
+    key.push(KEY_DELETED);
+    key.extend_from_slice(&bucket.to_be_bytes());
+    key.extend_from_slice(&row.to_be_bytes());
+    key
+}
+
+fn key_locator(key: &[u8]) -> Option<Locator> {
+    if key.len() != 13 {
+        return None;
+    }
+    Some((
+        u64::from_be_bytes(key[1..9].try_into().ok()?),
+        u32::from_be_bytes(key[9..13].try_into().ok()?),
+    ))
 }
 
 fn encode_pointer(id: u64, count: u32, bytes: u32) -> [u8; POINTER_LEN] {
@@ -332,6 +362,12 @@ fn read_doc_at(
     locator: Locator,
 ) -> Result<Option<Map<String, Value>>> {
     let (bucket, row) = locator;
+    if let Some(raw) = db.get(txn, &overlay_key(bucket, row))? {
+        return Ok(Some(serde_json::from_slice(raw)?));
+    }
+    if db.get(txn, &deleted_key(bucket, row))?.is_some() {
+        return Ok(None);
+    }
     if let Some(raw) = db.get(txn, &open_row_key(bucket, row))? {
         return Ok(Some(serde_json::from_slice(raw)?));
     }
@@ -341,12 +377,133 @@ fn read_doc_at(
     Ok(decode_bucket(raw)?.into_iter().nth(row as usize))
 }
 
+fn write_doc_at(
+    wtxn: &mut RwTxn<'_>,
+    db: &Database<Bytes, Bytes>,
+    locator: Locator,
+    doc: &Map<String, Value>,
+) -> Result<()> {
+    let (bucket, row) = locator;
+    let encoded = serde_json::to_vec(doc)?;
+    if db.get(&*wtxn, &open_row_key(bucket, row))?.is_some() {
+        db.put(&mut *wtxn, &open_row_key(bucket, row), &encoded)?;
+    } else {
+        db.put(&mut *wtxn, &overlay_key(bucket, row), &encoded)?;
+        db.delete(&mut *wtxn, &deleted_key(bucket, row))?;
+    }
+    Ok(())
+}
+
+fn delete_doc_at(
+    wtxn: &mut RwTxn<'_>,
+    db: &Database<Bytes, Bytes>,
+    locator: Locator,
+) -> Result<()> {
+    let (bucket, row) = locator;
+    if db.get(&*wtxn, &open_row_key(bucket, row))?.is_some() {
+        db.delete(&mut *wtxn, &open_row_key(bucket, row))?;
+    } else {
+        db.delete(&mut *wtxn, &overlay_key(bucket, row))?;
+        db.put(&mut *wtxn, &deleted_key(bucket, row), b"")?;
+    }
+    Ok(())
+}
+
+fn remove_locator(
+    wtxn: &mut RwTxn<'_>,
+    db: &Database<Bytes, Bytes>,
+    hash: u64,
+    locator: Locator,
+) -> Result<()> {
+    let mut locators = read_locators(&*wtxn, db, hash)?;
+    locators.retain(|item| *item != locator);
+    if locators.is_empty() {
+        db.delete(&mut *wtxn, &id_key(hash))?;
+    } else {
+        db.put(&mut *wtxn, &id_key(hash), &encode_locators(&locators))?;
+    }
+    Ok(())
+}
+
+fn all_located(
+    txn: &RoTxn<'_>,
+    env: &Env,
+    name: &str,
+) -> Result<Vec<(Locator, Map<String, Value>)>> {
+    let Some(db) = env.open_database::<Bytes, Bytes>(txn, Some(&db_name(name)))? else {
+        return Ok(Vec::new());
+    };
+    let mut docs: BTreeMap<Locator, Map<String, Value>> = BTreeMap::new();
+    for item in db.iter(txn)? {
+        let (key, value) = item?;
+        match key.first() {
+            Some(&KEY_OPEN_ROW) => {
+                if let Some(locator) = key_locator(key) {
+                    docs.insert(locator, serde_json::from_slice(value)?);
+                }
+            }
+            Some(&KEY_BUCKET) => {
+                if key.len() != 9 {
+                    return Err(corrupt("malformed bucket key"));
+                }
+                let bucket = u64::from_be_bytes(key[1..9].try_into().expect("8 bytes"));
+                for (row, doc) in decode_bucket(value)?.into_iter().enumerate() {
+                    docs.insert((bucket, row as u32), doc);
+                }
+            }
+            _ => {}
+        }
+    }
+    for item in db.iter(txn)? {
+        let (key, value) = item?;
+        match key.first() {
+            Some(&KEY_OVERLAY) => {
+                if let Some(locator) = key_locator(key) {
+                    docs.insert(locator, serde_json::from_slice(value)?);
+                }
+            }
+            Some(&KEY_DELETED) => {
+                if let Some(locator) = key_locator(key) {
+                    docs.remove(&locator);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(docs.into_iter().collect())
+}
+
 fn doc_id(doc: &Map<String, Value>) -> Result<String> {
     let value = doc.get("_id").ok_or(Error::InvalidId)?;
     if let Some(raw) = value.as_str() {
         crate::id::validate_string_key(raw)?;
     }
     crate::id::key_from_value(value).ok_or(Error::InvalidId)
+}
+
+/// Returns the canonical key when the filter is exactly `{"_id": ...}`.
+pub fn exact_id_filter(filter: &Value) -> Option<String> {
+    let object = filter.as_object()?;
+    if object.len() != 1 {
+        return None;
+    }
+    crate::id::key_from_value(object.get("_id")?)
+}
+
+fn find_located_id(
+    txn: &RoTxn<'_>,
+    db: &Database<Bytes, Bytes>,
+    id: &str,
+) -> Result<Option<(Locator, Map<String, Value>)>> {
+    for locator in read_locators(txn, db, fnv1a64(id.as_bytes()))? {
+        let Some(row) = read_doc_at(txn, db, locator)? else {
+            continue;
+        };
+        if doc_id(&row)? == id {
+            return Ok(Some((locator, row)));
+        }
+    }
+    Ok(None)
 }
 
 /// Inserts one document and returns its `_id`.
@@ -386,6 +543,12 @@ pub fn insert(
     }
 
     let encoded = serde_json::to_vec(&doc)?;
+    if encoded.len() > crate::store::MAX_DOCUMENT_BYTES {
+        return Err(Error::DocumentTooLarge(
+            encoded.len(),
+            crate::store::MAX_DOCUMENT_BYTES,
+        ));
+    }
     let mut pointer = read_pointer_rw(&*wtxn, &db)?.unwrap_or((1, 0, 0));
     if pointer.1 >= settings.bucket_max_docs as u32
         || pointer.2 as usize >= settings.bucket_max_bytes
@@ -457,6 +620,7 @@ pub fn seal_all(wtxn: &mut RwTxn<'_>, env: &Env, name: &str, settings: &Settings
     };
     let count = read_pointer_rw(&*wtxn, &db)?.map_or(0, |(_, count, _)| count) as usize;
     seal_current(wtxn, env, name, settings, &db)?;
+    compact_overlays(wtxn, env, name, settings)?;
     Ok(count)
 }
 
@@ -476,38 +640,213 @@ pub fn find_by_id(rtxn: &RoTxn<'_>, env: &Env, name: &str, id: &str) -> Result<O
     Ok(None)
 }
 
-/// Scans every visible document. Used by lifecycle tests and early query work.
+/// Scans every visible document, applying update overlays and tombstones.
 pub fn all_docs(rtxn: &RoTxn<'_>, env: &Env, name: &str) -> Result<Vec<Value>> {
-    let Some(db) = env.open_database::<Bytes, Bytes>(rtxn, Some(&db_name(name)))? else {
-        return Ok(Vec::new());
+    Ok(all_located(rtxn, env, name)?
+        .into_iter()
+        .map(|(_, doc)| Value::Object(doc))
+        .collect())
+}
+
+/// Runs the normal find query shape over a columnar collection.
+pub fn find(rtxn: &RoTxn<'_>, env: &Env, name: &str, query: &FindQuery) -> Result<Vec<Value>> {
+    let mut docs = all_docs(rtxn, env, name)?;
+    docs.retain(|doc| crate::query::matcher::matches(doc, &query.filter));
+    if !query.sort.is_empty() {
+        docs.sort_by(|a, b| compare_docs(a, b, &query.sort));
+    }
+    let limit = query.limit.unwrap_or(usize::MAX);
+    Ok(docs
+        .into_iter()
+        .skip(query.skip)
+        .take(limit)
+        .map(|doc| project_document(&doc, query.projection.as_ref()))
+        .collect())
+}
+
+/// Updates matching documents. Returns the standard update outcome.
+#[allow(clippy::too_many_arguments)]
+pub fn update(
+    wtxn: &mut RwTxn<'_>,
+    env: &Env,
+    name: &str,
+    settings: &Settings,
+    filter: &Value,
+    update: &Value,
+    multi: bool,
+    array_filters: &[Value],
+    upsert: bool,
+    default_id: Option<&Value>,
+) -> Result<UpdateOutcome> {
+    use crate::query::updater::{apply_upsert_with_options, apply_with_options, seed_from_filter};
+
+    let db = env.create_database::<Bytes, Bytes>(wtxn, Some(&db_name(name)))?;
+    let direct = if !multi {
+        match exact_id_filter(filter) {
+            Some(id) => find_located_id(&*wtxn, &db, &id)?,
+            None => None,
+        }
+    } else {
+        None
     };
-    let mut keys: Vec<Vec<u8>> = Vec::new();
-    for item in db.iter(rtxn)? {
-        let (key, _) = item?;
-        if matches!(key.first(), Some(&KEY_OPEN_ROW) | Some(&KEY_BUCKET)) {
-            keys.push(key.to_vec());
+    let candidates = match direct {
+        Some(found) => vec![found],
+        None => all_located(&*wtxn, env, name)?,
+    };
+    let mut changes = Vec::new();
+    let mut matched = 0usize;
+    for (locator, row) in candidates {
+        let old = Value::Object(row.clone());
+        if !crate::query::matcher::matches(&old, filter) {
+            continue;
+        }
+        matched += 1;
+        let mut next = old.clone();
+        apply_with_options(&mut next, update, filter, array_filters)?;
+        normalize_document(&mut next)?;
+        let old_id = doc_id(&row)?;
+        let next_object = next
+            .as_object()
+            .ok_or_else(|| Error::Query("updated document must be an object".into()))?;
+        let next_id = doc_id(next_object)?;
+        if old_id != next_id {
+            return Err(Error::Query("columnar update cannot change `_id`".into()));
+        }
+        let bytes = serde_json::to_vec(&next)?;
+        if bytes.len() > crate::store::MAX_DOCUMENT_BYTES {
+            return Err(Error::DocumentTooLarge(
+                bytes.len(),
+                crate::store::MAX_DOCUMENT_BYTES,
+            ));
+        }
+        changes.push((locator, next_object.clone()));
+        if !multi {
+            break;
         }
     }
-    keys.sort();
-    let mut out = Vec::new();
-    for key in keys {
-        match key.first() {
-            Some(&KEY_OPEN_ROW) => {
-                if let Some(raw) = db.get(rtxn, &key)? {
-                    out.push(serde_json::to_value(serde_json::from_slice::<
-                        Map<String, Value>,
-                    >(raw)?)?);
-                }
+    for (locator, doc) in &changes {
+        write_doc_at(wtxn, &db, *locator, doc)?;
+    }
+    if matched == 0 && upsert {
+        let mut doc = seed_from_filter(filter);
+        let filter_id = doc.get("_id").cloned();
+        apply_upsert_with_options(&mut doc, update, filter, array_filters)?;
+        if let Some(id) = filter_id {
+            doc["_id"] = id;
+        }
+        if doc.get("_id").is_none() {
+            if let Some(id) = default_id {
+                doc["_id"] = id.clone();
             }
-            Some(&KEY_BUCKET) => {
-                if let Some(raw) = db.get(rtxn, &key)? {
-                    out.extend(decode_bucket(raw)?.into_iter().map(Value::Object));
-                }
-            }
-            _ => {}
+        }
+        normalize_document(&mut doc)?;
+        let id = insert(wtxn, env, name, settings, doc)?;
+        return Ok(UpdateOutcome {
+            matched: 0,
+            modified: 0,
+            upserted_id: Some(id),
+            moved: Vec::new(),
+        });
+    }
+    Ok(UpdateOutcome {
+        matched,
+        modified: changes.len(),
+        upserted_id: None,
+        moved: Vec::new(),
+    })
+}
+
+/// Deletes matching documents.
+pub fn delete(
+    wtxn: &mut RwTxn<'_>,
+    env: &Env,
+    name: &str,
+    filter: &Value,
+    multi: bool,
+) -> Result<usize> {
+    let db = env.create_database::<Bytes, Bytes>(wtxn, Some(&db_name(name)))?;
+    let direct = if !multi {
+        match exact_id_filter(filter) {
+            Some(id) => find_located_id(&*wtxn, &db, &id)?,
+            None => None,
+        }
+    } else {
+        None
+    };
+    let candidates = match direct {
+        Some(found) => vec![found],
+        None => all_located(&*wtxn, env, name)?,
+    };
+    let mut removed = 0usize;
+    for (locator, row) in candidates {
+        let doc = Value::Object(row.clone());
+        if !crate::query::matcher::matches(&doc, filter) {
+            continue;
+        }
+        let id = doc_id(&row)?;
+        delete_doc_at(wtxn, &db, locator)?;
+        remove_locator(wtxn, &db, fnv1a64(id.as_bytes()), locator)?;
+        removed += 1;
+        if !multi {
+            break;
         }
     }
-    Ok(out)
+    Ok(removed)
+}
+
+fn normalize_document(doc: &mut Value) -> Result<()> {
+    crate::date::normalize_document(doc)?;
+    crate::numeric::normalize_document(doc)?;
+    crate::bson_types::normalize_document(doc)?;
+    Ok(())
+}
+
+/// Merges update overlays into their sealed buckets. Delete markers remain
+/// until the bucket is physically compacted, preserving row locators.
+pub fn compact_overlays(
+    wtxn: &mut RwTxn<'_>,
+    env: &Env,
+    name: &str,
+    settings: &Settings,
+) -> Result<usize> {
+    let Some(db) = env.open_database::<Bytes, Bytes>(wtxn, Some(&db_name(name)))? else {
+        return Ok(0);
+    };
+    let mut overlays: OverlayMap = BTreeMap::new();
+    for item in db.iter(&*wtxn)? {
+        let (key, value) = item?;
+        if key.first() != Some(&KEY_OVERLAY) {
+            continue;
+        }
+        let Some((bucket, row)) = key_locator(key) else {
+            return Err(corrupt("malformed overlay key"));
+        };
+        overlays
+            .entry(bucket)
+            .or_default()
+            .push((row, serde_json::from_slice(value)?));
+    }
+    let merged = overlays.values().map(Vec::len).sum();
+    for (bucket, docs) in overlays {
+        let Some(raw) = db.get(&*wtxn, &bucket_key(bucket))? else {
+            return Err(corrupt("overlay points at a missing bucket"));
+        };
+        let mut rows = decode_bucket(raw)?;
+        let mut keys = Vec::new();
+        for (row, doc) in docs {
+            let slot = rows
+                .get_mut(row as usize)
+                .ok_or_else(|| corrupt("overlay row out of range"))?;
+            *slot = doc;
+            keys.push(overlay_key(bucket, row));
+        }
+        let payload = encode_bucket(&rows, settings)?;
+        db.put(&mut *wtxn, &bucket_key(bucket), &payload)?;
+        for key in keys {
+            db.delete(&mut *wtxn, &key)?;
+        }
+    }
+    Ok(merged)
 }
 
 /// Counts documents matching a filter. The filter uses the normal matcher.
@@ -551,6 +890,7 @@ pub fn stats(rtxn: &RoTxn<'_>, env: &Env, name: &str) -> Result<Stats> {
         }
     }
     stats.buckets = stats.open_buckets + stats.sealed_buckets;
+    stats.rows = all_docs(rtxn, env, name)?.len() as u64;
     Ok(stats)
 }
 
@@ -565,6 +905,7 @@ pub fn clear(wtxn: &mut RwTxn<'_>, env: &Env, name: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::collection::FindAndModifyOptions;
     use crate::store::Store;
     use serde_json::json;
 
@@ -622,6 +963,89 @@ mod tests {
         assert_eq!(coll.columnar_stats().unwrap().unwrap().rows, 0);
         assert!(store.drop_collection("empty").unwrap());
         assert!(store.collection_profile("empty").unwrap().is_none());
+    }
+
+    #[test]
+    fn update_delete_and_find_modify_work_on_open_and_sealed_buckets() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let settings = Settings {
+            bucket_max_docs: 2,
+            ..Default::default()
+        };
+        let coll = store.create_columnar_collection("docs", &settings).unwrap();
+        for index in 0..5 {
+            coll.insert_one(json!({
+                "_id": format!("doc-{index}"),
+                "group": if index % 2 == 0 { "even" } else { "odd" },
+                "value": index,
+            }))
+            .unwrap();
+        }
+        assert_eq!(
+            coll.find(&FindQuery {
+                filter: json!({"group": "even"}),
+                sort: vec![("value".into(), -1)],
+                ..Default::default()
+            })
+            .unwrap()
+            .len(),
+            3
+        );
+        assert_eq!(
+            coll.update(
+                &json!({"group": "even"}),
+                &json!({"$set": {"value": 100}}),
+                true
+            )
+            .unwrap(),
+            3
+        );
+        assert_eq!(
+            coll.find(&FindQuery {
+                filter: json!({"value": 100}),
+                ..Default::default()
+            })
+            .unwrap()
+            .len(),
+            3
+        );
+        assert_eq!(
+            coll.update(
+                &json!({"_id": "doc-0"}),
+                &json!({"$inc": {"value": 1}}),
+                false
+            )
+            .unwrap(),
+            1
+        );
+        let mut upsert = FindAndModifyOptions {
+            filter: &json!({"_id": "upserted"}),
+            update: Some(&json!({"$set": {"value": 9}})),
+            sort: &[],
+            new: true,
+            upsert: true,
+            remove: false,
+            array_filters: &[],
+            projection: None,
+        };
+        let outcome = coll.find_and_modify(&upsert).unwrap();
+        assert_eq!(outcome.upserted_id.as_deref(), Some("upserted"));
+        assert_eq!(outcome.value.as_ref().unwrap()["value"], 9);
+        upsert.new = false;
+        let removed = {
+            let mut opts = upsert;
+            opts.remove = true;
+            opts.upsert = false;
+            opts.update = None;
+            coll.find_and_modify(&opts).unwrap()
+        };
+        assert_eq!(removed.matched, 1);
+        assert_eq!(coll.find(&FindQuery::default()).unwrap().len(), 5);
+        assert_eq!(coll.delete(&json!({"group": "even"}), true).unwrap(), 3);
+        assert_eq!(coll.find(&FindQuery::default()).unwrap().len(), 2);
+        store.seal_columnar("docs").unwrap();
+        assert_eq!(coll.find(&FindQuery::default()).unwrap().len(), 2);
     }
 
     #[test]

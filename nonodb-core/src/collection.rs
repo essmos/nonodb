@@ -5679,6 +5679,21 @@ impl<'e> Collection<'e> {
         array_filters: &[Value],
         default_id: Option<&Value>,
     ) -> Result<UpdateOutcome> {
+        if self.profile.is_columnar() {
+            let settings = self.columnar_settings_in(&*wtxn)?.unwrap_or_default();
+            return crate::columnar::update(
+                wtxn,
+                self.env,
+                &self.name,
+                &settings,
+                filter,
+                update,
+                multi,
+                array_filters,
+                upsert,
+                default_id,
+            );
+        }
         if self.profile.is_timeseries() {
             let settings = self.timeseries_settings_in(&*wtxn)?.unwrap_or_default();
             let direct_id = (!multi)
@@ -5949,6 +5964,9 @@ impl<'e> Collection<'e> {
         opts: &FindAndModifyOptions<'_>,
         default_id: Option<&Value>,
     ) -> Result<FindAndModifyOutcome> {
+        if self.profile.is_columnar() {
+            return self.find_and_modify_columnar(wtxn, opts, default_id);
+        }
         if self.profile.is_timeseries() {
             return self.find_and_modify_timeseries(wtxn, opts);
         }
@@ -6025,6 +6043,110 @@ impl<'e> Collection<'e> {
                 opts.projection,
                 Some(opts.filter),
             ))
+        } else {
+            None
+        };
+        Ok(FindAndModifyOutcome {
+            value,
+            matched: 0,
+            modified: 0,
+            upserted_id: Some(id),
+            new_id: None,
+        })
+    }
+
+    fn find_and_modify_columnar(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        opts: &FindAndModifyOptions<'_>,
+        default_id: Option<&Value>,
+    ) -> Result<FindAndModifyOutcome> {
+        validate_find_and_modify(opts)?;
+        let settings = self.columnar_settings_in(&*wtxn)?.unwrap_or_default();
+        let query = FindQuery {
+            filter: opts.filter.clone(),
+            projection: None,
+            sort: opts.sort.to_vec(),
+            skip: 0,
+            limit: Some(1),
+            comment: None,
+            max_time_ms: None,
+            hint: None,
+        };
+        let selected = if let Some(id) = crate::columnar::exact_id_filter(opts.filter) {
+            crate::columnar::find_by_id(&*wtxn, self.env, &self.name, &id)?
+        } else {
+            crate::columnar::find(&*wtxn, self.env, &self.name, &query)?
+                .into_iter()
+                .next()
+        };
+        if opts.remove {
+            let Some(old) = selected else {
+                return Ok(empty_find_and_modify());
+            };
+            let id = old.get("_id").cloned().ok_or(Error::InvalidId)?;
+            let removed = self.delete_txn(wtxn, &serde_json::json!({"_id": id}), false)?;
+            return Ok(FindAndModifyOutcome {
+                value: Some(apply_projection(old, opts.projection, Some(opts.filter))),
+                matched: removed,
+                modified: removed,
+                upserted_id: None,
+                new_id: None,
+            });
+        }
+        let update = opts
+            .update
+            .ok_or_else(|| Error::Query("find_and_modify requires `update` or `remove`".into()))?;
+        if let Some(old) = selected {
+            let id = old
+                .get("_id")
+                .and_then(Value::as_str)
+                .ok_or(Error::InvalidId)?
+                .to_string();
+            let outcome = crate::columnar::update(
+                wtxn,
+                self.env,
+                &self.name,
+                &settings,
+                &serde_json::json!({"_id": id}),
+                update,
+                false,
+                opts.array_filters,
+                false,
+                None,
+            )?;
+            let new = crate::columnar::find_by_id(&*wtxn, self.env, &self.name, &id)?
+                .ok_or_else(|| Error::Query("updated document disappeared".into()))?;
+            return Ok(FindAndModifyOutcome {
+                value: Some(apply_projection(
+                    if opts.new { new } else { old },
+                    opts.projection,
+                    Some(opts.filter),
+                )),
+                matched: outcome.matched,
+                modified: outcome.modified,
+                upserted_id: None,
+                new_id: None,
+            });
+        }
+        if !opts.upsert {
+            return Ok(empty_find_and_modify());
+        }
+        let mut doc = seed_from_filter(opts.filter);
+        let filter_id = doc.get("_id").cloned();
+        apply_upsert_with_options(&mut doc, update, opts.filter, opts.array_filters)?;
+        if let Some(id) = filter_id {
+            doc["_id"] = id;
+        }
+        if doc.get("_id").is_none() {
+            if let Some(id) = default_id {
+                doc["_id"] = id.clone();
+            }
+        }
+        let id = self.insert_one_txn(wtxn, doc)?;
+        let value = if opts.new {
+            crate::columnar::find_by_id(&*wtxn, self.env, &self.name, &id)?
+                .map(|doc| apply_projection(doc, opts.projection, Some(opts.filter)))
         } else {
             None
         };
@@ -6284,6 +6406,9 @@ impl<'e> Collection<'e> {
     }
 
     pub fn delete_txn(&self, wtxn: &mut RwTxn<'_>, filter: &Value, multi: bool) -> Result<usize> {
+        if self.profile.is_columnar() {
+            return crate::columnar::delete(wtxn, self.env, &self.name, filter, multi);
+        }
         if self.profile.is_timeseries() {
             let settings = self.timeseries_settings_in(&*wtxn)?.unwrap_or_default();
             // A pure `_id` equality can go straight to the locator encoded in
@@ -10000,6 +10125,12 @@ impl<'e> Collection<'e> {
     pub fn find_in(&self, rtxn: &RoTxn<'_>, query: &FindQuery) -> Result<Vec<Value>> {
         if self.profile.is_timeseries() {
             return self.find_timeseries_in(rtxn, query);
+        }
+        if self.profile.is_columnar() {
+            let normalized = normalized_find_query(query)?;
+            let query = normalized.as_ref();
+            crate::query::validate::validate_filter(&query.filter)?;
+            return crate::columnar::find(rtxn, self.env, &self.name, query);
         }
         let normalized = normalized_find_query(query)?;
         let query = normalized.as_ref();
