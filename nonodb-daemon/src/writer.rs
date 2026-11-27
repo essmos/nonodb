@@ -1406,9 +1406,21 @@ fn execute(
             }))
         }
         WriteReq::PruneStream { coll, batch } => {
+            // Pruning can set `truncated_below` (and bump `truncations`) on group
+            // rows; replicas must see those markers, not just the deletions.
+            let before: Vec<nonodb_core::streams::StreamGroup> = store.stream_groups(Some(coll))?;
             let dropped = store.prune_stream_in(wtxn, coll, *batch)?;
             for (id, before) in &dropped {
                 replication.capture(coll, "delete", id, Some(before), None);
+            }
+            for after in store.stream_groups(Some(coll))? {
+                let changed = before
+                    .iter()
+                    .find(|row| row.group == after.group && row.stream == after.stream)
+                    .is_none_or(|row| row.truncated_below != after.truncated_below);
+                if changed {
+                    replication.capture_op(ReplicationOp::StreamGroupSet { group: after });
+                }
             }
             Ok(json!({ "deleted": dropped.len() }))
         }
