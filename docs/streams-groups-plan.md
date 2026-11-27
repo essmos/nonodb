@@ -2,7 +2,7 @@
 
 Status: phases 1-4 implemented (server-side offsets, groups, lease-fenced
 commits, range leases with redelivery and dead letters, offset-driven retention
-without `max_bytes`, CLI/GUI/metrics/docs). Target release: after `v0.34.0`.
+without `max_bytes`, CLI/GUI/metrics/docs). Released in `v0.35.0`.
 
 This document records the design decision for turning the outbox-and-watch
 machinery into a stream with server-side offsets, consumer groups, and

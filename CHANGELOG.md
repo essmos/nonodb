@@ -2,7 +2,12 @@
 
 Full release notes: https://github.com/essmos/nonodb/releases
 
-## Unreleased
+## v0.35.0 - 2026-11-27
+
+Streams and consumer groups release: writer-assigned `_seq` offsets, durable
+group positions, range leases with redelivery and dead letters, offset-driven
+retention, and CLI/GUI/metrics/docs support. The release also closes the
+failover, authorization, and retention-safety gaps found during review.
 
 - Fix stream failover and authorization: a promoted replica now resumes at the
   committed offset and redelivers ranges the old primary had claimed but not

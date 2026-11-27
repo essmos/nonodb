@@ -1729,7 +1729,7 @@ dependencies = [
 
 [[package]]
 name = "nonodb-auth"
-version = "0.34.0"
+version = "0.35.0"
 dependencies = [
  "base64 0.23.1",
  "fs2",
@@ -1741,7 +1741,7 @@ dependencies = [
 
 [[package]]
 name = "nonodb-cli"
-version = "0.34.0"
+version = "0.35.0"
 dependencies = [
  "libc",
  "mime_guess",
@@ -1754,7 +1754,7 @@ dependencies = [
 
 [[package]]
 name = "nonodb-client"
-version = "0.34.0"
+version = "0.35.0"
 dependencies = [
  "reqwest",
  "serde",
@@ -1763,7 +1763,7 @@ dependencies = [
 
 [[package]]
 name = "nonodb-core"
-version = "0.34.0"
+version = "0.35.0"
 dependencies = [
  "age",
  "base64 0.23.1",
@@ -1794,7 +1794,7 @@ dependencies = [
 
 [[package]]
 name = "nonodb-daemon"
-version = "0.34.0"
+version = "0.35.0"
 dependencies = [
  "axum",
  "base64 0.23.1",
