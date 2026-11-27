@@ -9,6 +9,21 @@ machinery into a stream with server-side offsets, consumer groups, and
 size/offset-based retention, and explains why the chosen approach reuses
 existing daemon primitives instead of adding a second ordering log.
 
+## Review follow-ups (implemented)
+
+The review of the base PR asked for these guarantees; each one has a test:
+
+| Finding | Fix |
+|---|---|
+| A promoted replica skipped ranges claimed but never committed | claim position is derived from `committed_seq` plus node-local leases, never from the replicated `next_seq`; test `a_promoted_node_redelivers_claimed_but_uncommitted_ranges` |
+| `watch` in group mode wrote leases under a read scope | new `consume:<coll>` scope for group `watch`, `claim`, `commit`, `nack`; `admin:<coll>` implies it; tests in `nonodb-auth` and `authz` |
+| An idle long-poll appended a write (and a replication entry) every 50 ms | `stream_claim_ready` read-only pre-check, and the writer only captures the group row when it actually changed; test `claim_readiness_is_read_only_and_false_when_caught_up` |
+| Streams over time-series/vault collections would silently deliver nothing | `set_stream` rejects non-standard profiles; test `streams_require_a_standard_collection` |
+| Expected consumer errors surfaced as HTTP 500 | `stale_lease`/`commit_out_of_order` → 409, `stream_truncated` → 410; `stream_error_status_tests` |
+| `max_age_ms` could delete fresh events after a deleted head or a missing `created_at` | the age boundary only drops a contiguous prefix that is provably old, using `created_at` or a ULID `_id`; tests for a deleted head, out-of-order timestamps, and a missing timestamp |
+| The lease janitor wrote node-local state and could run on a replica | it runs only on the primary and goes through the writer, replicating the committed-offset advance and the dead records |
+| `dead` meant ranges in `stream_stats` but events in metrics | both count events, and `dead_ranges` exposes the range count |
+
 ## Decision
 
 Implement **option A**: offsets on the existing `_events`-style append-only

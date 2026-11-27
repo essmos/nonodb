@@ -2406,7 +2406,8 @@ impl Store {
         for def in self.streams()? {
             for group in self.stream_groups(Some(&def.name))? {
                 let mut wtxn = self.write_txn()?;
-                let count = self.recover_stream_leases_in(&mut wtxn, &def.name, &group.group)?;
+                let (count, _dead) =
+                    self.recover_stream_leases_in(&mut wtxn, &def.name, &group.group)?;
                 wtxn.commit()?;
                 groups += 1;
                 recovered += count;
@@ -2474,7 +2475,9 @@ impl Store {
         lease_ms: u64,
     ) -> Result<Option<StreamLease>> {
         let mut dead = Vec::new();
-        self.claim_stream_lease_in_with_dead(wtxn, stream, group, member, limit, lease_ms, &mut dead)
+        self.claim_stream_lease_in_with_dead(
+            wtxn, stream, group, member, limit, lease_ms, &mut dead,
+        )
     }
 
     /// Same as [`Store::claim_stream_lease_in`], also returning any ranges that
@@ -2530,27 +2533,17 @@ impl Store {
         // empty window (everything pruned) still truncates a group that has
         // offsets left to read.
         let head = self.stream_head_in(wtxn, stream)?;
-<<<<<<< HEAD
         if next_seq <= head {
             let oldest = self.stream_oldest_seq_in(wtxn, stream)?;
             let crossed = match oldest {
                 Some(oldest) => oldest > next_seq,
-=======
-        if group_row.next_seq < head {
-            let oldest = self.stream_oldest_seq_in(wtxn, stream)?;
-            let crossed = match oldest {
-                Some(oldest) => oldest > group_row.next_seq.saturating_add(1),
->>>>>>> 761ae58 (fix(streams): reject partial commits, truncate empty windows, per-group counters)
                 // No events survive, so nothing can be delivered below the head.
                 None => true,
             };
             if crossed {
                 let below = oldest.unwrap_or_else(|| head.saturating_add(1));
                 group_row.truncated_below = Some(below);
-<<<<<<< HEAD
-=======
                 group_row.truncations = group_row.truncations.saturating_add(1);
->>>>>>> 761ae58 (fix(streams): reject partial commits, truncate empty windows, per-group counters)
                 group_row.touch();
                 self.put_stream_group_in(wtxn, &group_row)?;
                 return Err(Error::StreamTruncated(format!(
@@ -2571,10 +2564,7 @@ impl Store {
             })
             .cloned();
         if let Some(mut lease) = pending {
-<<<<<<< HEAD
-=======
             group_row.redeliveries = group_row.redeliveries.saturating_add(1);
->>>>>>> 761ae58 (fix(streams): reject partial commits, truncate empty windows, per-group counters)
             group_row.touch();
             self.put_stream_group_in(wtxn, &group_row)?;
             lease.attempts += 1;
@@ -2588,7 +2578,6 @@ impl Store {
             return Ok(Some(lease));
         }
 
-        let head = self.stream_head_in(wtxn, stream)?;
         let from = next_seq;
         if from > head {
             return Ok(None);

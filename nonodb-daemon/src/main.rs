@@ -1699,10 +1699,12 @@ async fn prometheus_handler(
                             })
                             .map(|lease| lease.events())
                             .sum();
-                        let dead = runtime
+                        // Same unit as `inflight` and `nonodb_stream_dead_letters_total`:
+                        // events, not leased ranges.
+                        let dead: u64 = runtime
                             .store
                             .stream_dead_letters(Some(&def.name), Some(&group.group))
-                            .map(|rows| rows.len() as u64)
+                            .map(|rows| rows.iter().map(|lease| lease.events()).sum())
                             .unwrap_or(0);
                         stream_rows.push(metrics::StreamMetricRow {
                             database: name.clone(),
@@ -3199,9 +3201,37 @@ async fn exec_inner(
                         metrics::inc(&metrics::READ_OPS);
                         metrics::add(&metrics::WATCH_EVENTS, events.len() as u64);
                         metrics::add(&metrics::STREAM_CLAIMS, 1);
-                        let timed_out = events.is_empty();
-                        if timed_out {
-                            metrics::inc(&metrics::WATCH_TIMEOUTS);
+                        if events.is_empty() {
+                            // Everything in this range was filtered out for this
+                            // member; acknowledge so the group advances instead
+                            // of redelivering a batch nobody can consume.
+                            if let Err(err) = commit_filtered_batch(
+                                &state,
+                                &coll,
+                                &group,
+                                claim.to_seq,
+                                &claim.lease_id,
+                            )
+                            .await
+                            {
+                                return respond(Err(err));
+                            }
+                            if Instant::now() >= deadline {
+                                metrics::inc(&metrics::READ_OPS);
+                                metrics::inc(&metrics::WATCH_TIMEOUTS);
+                                return respond(Ok(json!({
+                                    "events": [],
+                                    "group": group,
+                                    "member": member,
+                                    "timed_out": true,
+                                    "has_more": false,
+                                })));
+                            }
+                            tokio::select! {
+                                _ = live::stream_notify().notified() => {}
+                                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+                            }
+                            continue;
                         }
                         return respond(Ok(json!({
                             "events": events,
@@ -3213,7 +3243,7 @@ async fn exec_inner(
                             "next_seq": claim.to_seq,
                             "attempts": claim.attempts,
                             "max_attempts": claim.max_attempts,
-                            "timed_out": timed_out,
+                            "timed_out": false,
                             "has_more": false,
                         })));
                     }
@@ -5039,17 +5069,23 @@ fn stream_stats_value(store: &Store, coll: Option<&str>) -> Result<Value, ApiErr
                 .filter(|lease| lease.status == nonodb_core::streams::LeaseStatus::Leased)
                 .map(|lease| lease.events())
                 .sum();
-            let dead = store
-                .stream_dead_letters(Some(&def.name), Some(&group.group))?
-                .len() as u64;
+            let dead_letters = store.stream_dead_letters(Some(&def.name), Some(&group.group))?;
+            // Events, not ranges: the same unit as `inflight`, the dead-letter
+            // metrics, and what an operator would retry.
+            let dead: u64 = dead_letters.iter().map(|lease| lease.events()).sum();
+            let leased_through = leases.iter().map(|lease| lease.to_seq).max().unwrap_or(0);
             groups.push(json!({
                 "group": group.group,
                 "committed_seq": group.committed_seq,
-                "next_seq": group.next_seq,
+                // Derived, not the cached watermark: after a failover the next
+                // claim resumes at the committed offset, not at a claim the old
+                // primary never committed.
+                "next_seq": group.committed_seq.max(leased_through),
                 "head_seq": head,
                 "lag": nonodb_core::streams::lag(head, group.committed_seq),
                 "inflight": inflight,
                 "dead": dead,
+                "dead_ranges": dead_letters.len() as u64,
                 "max_attempts": group.max_attempts,
                 "redeliveries": group.redeliveries,
                 "truncations": group.truncations,
@@ -5244,6 +5280,34 @@ struct StreamClaim {
     max_attempts: u32,
 }
 
+/// Acknowledges a leased range whose events were all filtered out for this
+/// member.
+///
+/// The filter is part of the member's subscription, so an empty result means
+/// "nothing here for me", not "release the batch". Releasing it would hand the
+/// same range back forever (and eventually dead-letter it) while the group never
+/// advances.
+async fn commit_filtered_batch(
+    state: &AppState,
+    coll: &str,
+    group: &str,
+    to_seq: u64,
+    lease_id: &str,
+) -> Result<(), ApiError> {
+    submit_write_value(
+        state,
+        WriteReq::CommitStreamGroup {
+            coll: coll.to_string(),
+            group: group.to_string(),
+            seq: to_seq,
+            lease_id: Some(lease_id.to_string()),
+        },
+        Durability::Full,
+    )
+    .await
+    .map(|_| ())
+}
+
 /// Claims the next batch of a consumer group for one member.
 async fn claim_lease(
     state: &AppState,
@@ -5397,23 +5461,8 @@ async fn watch_group_stream_loop(
         let claim = claim_lease(&state, &coll, &group, &member, limit, lease_ms).await?;
         if let Some(claim) = claim {
             metrics::add(&metrics::STREAM_CLAIMS, 1);
-            let control = json!({
-                "mode": "group",
-                "group": group,
-                "member": member,
-                "lease_id": claim.lease_id,
-                "from_seq": claim.from_seq,
-                "to_seq": claim.to_seq,
-                "attempts": claim.attempts,
-                "max_attempts": claim.max_attempts,
-            });
-            if tx
-                .send(Ok(watch_control(sse, "group", &control)))
-                .await
-                .is_err()
-            {
-                return Ok(());
-            }
+            // Read first: a range that is entirely filtered out must be
+            // acknowledged, not held under a lease the client never sees.
             let store_now = state.store.clone();
             let coll_now = coll.clone();
             let types_now = types.clone();
@@ -5448,6 +5497,27 @@ async fn watch_group_stream_loop(
                     return Err(err);
                 }
             };
+            if events.is_empty() {
+                commit_filtered_batch(&state, &coll, &group, claim.to_seq, &claim.lease_id).await?;
+                continue;
+            }
+            let control = json!({
+                "mode": "group",
+                "group": group,
+                "member": member,
+                "lease_id": claim.lease_id,
+                "from_seq": claim.from_seq,
+                "to_seq": claim.to_seq,
+                "attempts": claim.attempts,
+                "max_attempts": claim.max_attempts,
+            });
+            if tx
+                .send(Ok(watch_control(sse, "group", &control)))
+                .await
+                .is_err()
+            {
+                return Ok(());
+            }
             let mut batch: Vec<u8> = Vec::with_capacity(events.len() * 160);
             for event in &events {
                 append_watch_frame(&mut batch, sse, event);

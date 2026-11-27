@@ -13,7 +13,10 @@ type GroupInfo = {
   head_seq: number;
   lag: number;
   inflight: number;
+  /** Dead-lettered events (sum of range sizes). */
   dead: number;
+  /** Number of dead-lettered ranges. */
+  dead_ranges?: number;
   redeliveries?: number;
   truncations?: number;
   max_attempts: number;
@@ -149,6 +152,9 @@ export default function StreamsPage({ connection }: { connection: Connection }) 
   };
 
   const reset = async (stream: string, group: string, to: string) => {
+    if (!window.confirm(`Reset ${stream}/${group} to ${to}? Unread events become redeliverable.`)) {
+      return;
+    }
     setBusy(true);
     setError('');
     try {
@@ -168,6 +174,9 @@ export default function StreamsPage({ connection }: { connection: Connection }) 
   };
 
   const deleteGroup = async (stream: string, group: string) => {
+    if (!window.confirm(`Delete group ${stream}/${group}? Its leases and dead letters are dropped.`)) {
+      return;
+    }
     setBusy(true);
     setError('');
     try {
@@ -181,6 +190,9 @@ export default function StreamsPage({ connection }: { connection: Connection }) 
   };
 
   const prune = async (stream: string) => {
+    if (!window.confirm(`Prune ${stream} now? Events below every group's committed offset are deleted.`)) {
+      return;
+    }
     setBusy(true);
     setError('');
     try {
@@ -251,7 +263,7 @@ export default function StreamsPage({ connection }: { connection: Connection }) 
         <div className="panel-title">
           <h3>Consumer groups</h3>
           <span>
-            lag {totals.lag} · in-flight {totals.inflight} · dead {totals.dead}
+            lag {totals.lag} · in-flight {totals.inflight} · dead {totals.dead} events
           </span>
         </div>
         {groups.length === 0 ? (
@@ -292,7 +304,9 @@ export default function StreamsPage({ connection }: { connection: Connection }) 
                     <td>{group.head_seq}</td>
                     <td>{group.lag}</td>
                     <td>{group.inflight}</td>
-                    <td>{group.dead}</td>
+                    <td title="dead events / dead ranges">
+                      {group.dead} ev / {group.dead_ranges ?? 0} rng
+                    </td>
                     <td>{group.redeliveries ?? 0}</td>
                     <td>{group.truncations ?? 0}</td>
                     <td>

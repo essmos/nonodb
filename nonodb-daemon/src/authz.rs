@@ -87,8 +87,8 @@ pub fn authorize_request(
         | Request::ListSubscriptions { coll } => {
             allow(principal, Action::Read, database, coll, req.op_name())
         }
-        // Tail reads need `read`; group mode claims a lease and advances the
-        // group, which is consumption, not reading.
+        // Tail reads need `read`; group mode claims and leases batches, which
+        // is consumption, not reading.
         Request::Watch {
             coll,
             mode,
@@ -96,7 +96,8 @@ pub fn authorize_request(
             ..
         } => {
             // `exec_inner` treats a bare `group` field as group mode, so the
-            // authorization predicate must too.
+            // authorization predicate must too; otherwise omitting `mode` would
+            // let a read-only credential claim leases.
             let group = mode
                 .as_deref()
                 .is_some_and(|mode| mode.eq_ignore_ascii_case("group"))
@@ -622,18 +623,8 @@ mod tests {
             limit: None,
         };
         assert!(authorize_request(&reader, &claim, "app1").is_err());
-        let consumer = principal(&["consume:orders"]);
-        assert!(authorize_request(&consumer, &claim, "app1").is_ok());
-        let commit = Request::CommitStreamGroup {
-            coll: "orders".into(),
-            group: "workers".into(),
-            seq: 3,
-            lease_id: None,
-        };
-        assert!(authorize_request(&reader, &commit, "app1").is_err());
-        assert!(authorize_request(&consumer, &commit, "app1").is_ok());
-        // A bare `group` field is group mode even without `mode`.
-        let implicit = Request::Watch {
+        // Group mode without an explicit `mode` field is still consumption.
+        let implicit_group_watch = Request::Watch {
             coll: "orders".into(),
             after: None,
             limit: None,
@@ -654,8 +645,18 @@ mod tests {
             event_type: None,
             name: None,
         };
-        assert!(authorize_request(&reader, &implicit, "app1").is_err());
-        assert!(authorize_request(&consumer, &implicit, "app1").is_ok());
+        assert!(authorize_request(&reader, &implicit_group_watch, "app1").is_err());
+        let consumer = principal(&["consume:orders"]);
+        assert!(authorize_request(&consumer, &implicit_group_watch, "app1").is_ok());
+        assert!(authorize_request(&consumer, &claim, "app1").is_ok());
+        let commit = Request::CommitStreamGroup {
+            coll: "orders".into(),
+            group: "workers".into(),
+            seq: 3,
+            lease_id: None,
+        };
+        assert!(authorize_request(&reader, &commit, "app1").is_err());
+        assert!(authorize_request(&consumer, &commit, "app1").is_ok());
         // Group administration is still admin-only.
         let create = Request::CreateStreamGroup {
             coll: "orders".into(),

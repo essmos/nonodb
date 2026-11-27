@@ -79,11 +79,13 @@ def main() -> int:
                 ),
                 NONODB_REPLICATION_VOTER_TOKEN=token,
                 NONODB_REPLICATION_POLL_INTERVAL="1",
-
                 # The primary needs a live lease to accept writes; the streams
                 # scenario below writes before the promotion.
                 NONODB_REPLICATION_LEASE_INTERVAL="1",
                 NONODB_REPLICATION_LEASE_TTL="3",
+                # Stream janitor runs every second so the dead-letter replication
+                # below completes inside the test window.
+                NONODB_STREAM_PRUNE_INTERVAL="1",
                 NONODB_LOG="warn",
                 **extra,
             )
@@ -116,9 +118,12 @@ def main() -> int:
             assert response.status_code == 200, response.text
             return response.json()["result"]
 
-        # `create_stream` bootstraps a missing collection, and that has to
-        # replicate (CollectionCreate before StreamSet) or the replica apply
-        # fails on an unknown collection.
+        def stats_on(client, coll):
+            streams = exec_on(client, {"op": "stream_stats", "coll": coll})["streams"]
+            return streams[0] if streams else None
+
+        # --- streams: leaked claims, janitor replication, and failover ---
+        # The primary only accepts writes once its replication lease is live.
         deadline = time.monotonic() + 20
         while time.monotonic() < deadline:
             if primary.get("/readyz/write").status_code == 200:
@@ -126,6 +131,8 @@ def main() -> int:
             time.sleep(0.2)
         else:
             raise RuntimeError("primary never became writable")
+        # No `create_collection` first: `create_stream` bootstraps the
+        # collection, and that has to replicate (CollectionCreate + StreamSet).
         exec_on(primary, {"op": "create_stream", "coll": "ledger"})
         deadline = time.monotonic() + 20
         while time.monotonic() < deadline:
@@ -138,12 +145,6 @@ def main() -> int:
             time.sleep(0.2)
         else:
             raise RuntimeError("replica never applied the bootstrapped collection/stream")
-
-        def stats_on(client, coll):
-            streams = exec_on(client, {"op": "stream_stats", "coll": coll})["streams"]
-            return streams[0] if streams else None
-
-        # --- streams: leaked claims, janitor replication, and failover ---
         exec_on(
             primary,
             {
@@ -198,21 +199,6 @@ def main() -> int:
             },
         )
         assert (poison["from_seq"], poison["to_seq"]) == (1, 3), poison
-        time.sleep(1.3)
-        # The next claim recovers the expired lease and dead-letters it; the
-        # resulting committed offset and dead record must replicate.
-        exec_on(
-            primary,
-            {
-                "op": "watch",
-                "coll": "ledger",
-                "mode": "group",
-                "group": "poison",
-                "member": "p2",
-                "limit": 10,
-                "timeout_ms": 100,
-            },
-        )
         deadline = time.monotonic() + 20
         replicated = None
         while time.monotonic() < deadline:
@@ -225,6 +211,14 @@ def main() -> int:
             time.sleep(0.2)
         assert replicated, "expired lease was dead-lettered on the primary only"
         assert replicated["dead"][0]["from_seq"] == 1, replicated
+        replica_poison = [
+            group
+            for group in stats_on(replica, "ledger")["groups"]
+            if group["group"] == "poison"
+        ][0]
+        assert replica_poison["committed_seq"] == 3, replica_poison
+        assert replica_poison["dead"] == 3, replica_poison
+        assert replica_poison["dead_ranges"] == 1, replica_poison
 
         promoted = replica.post(
             "/v1/replication/promote",
@@ -286,6 +280,7 @@ def main() -> int:
             "a promoted replica must redeliver claimed-but-uncommitted ranges: "
             f"{resumed}"
         )
+        # Dead letters replicated above are still visible on the new primary.
         still_dead = exec_on(
             replica, {"op": "stream_dead", "coll": "ledger", "group": "poison"}
         )
