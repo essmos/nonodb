@@ -18,6 +18,7 @@ use crate::history::{self, DEFAULT_HISTORY_MAX_VERSIONS, HISTORY_DB};
 use crate::replication::{
     ReplicationChange, ReplicationOp, ReplicationTxn, REPLICATION_DB, REPLICATION_SEQ_KEY,
 };
+use crate::streams::{ResetTo, StartAt, StreamDef, StreamGroup};
 use crate::subscriptions::{self, Subscription};
 use crate::ttl::{self, TTL_DB};
 use crate::vault::CollectionProfile;
@@ -1537,6 +1538,577 @@ impl Store {
         Self::events_from_rw(meta, wtxn, name)
     }
 
+    // ---------------------------------------------------------------------
+    // Streams: durable offsets and consumer groups.
+    // ---------------------------------------------------------------------
+
+    fn stream_key(name: &str) -> String {
+        format!("{}{name}", crate::streams::STREAM_PREFIX)
+    }
+
+    fn stream_seq_key(name: &str) -> String {
+        format!("{}{name}", crate::streams::STREAM_SEQ_PREFIX)
+    }
+
+    fn stream_coll_key(coll: &str) -> String {
+        format!("stream:coll:{coll}")
+    }
+
+    fn stream_group_key(stream: &str, group: &str) -> String {
+        format!("{}{stream}:{group}", crate::streams::GROUP_PREFIX)
+    }
+
+    /// Creates or replaces a stream definition and its offset index.
+    pub fn set_stream(&self, def: &StreamDef) -> Result<()> {
+        let mut wtxn = self.write_txn()?;
+        self.set_stream_in(&mut wtxn, def)?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    /// Creates or replaces a stream definition inside a writer transaction.
+    pub fn set_stream_in(&self, wtxn: &mut RwTxn<'_>, def: &StreamDef) -> Result<()> {
+        def.validate()?;
+        if self.collection_profile_in_rw(wtxn, &def.coll)?.is_none() {
+            return Err(Error::Query(format!(
+                "collection `{}` does not exist",
+                def.coll
+            )));
+        }
+        let collection = self.collection_in(wtxn, &def.coll)?;
+        collection.create_index_fields_txn(
+            wtxn,
+            std::slice::from_ref(&def.seq_field),
+            false,
+            &[],
+            false,
+            false,
+            None,
+        )?;
+        let meta = self
+            .env
+            .create_database::<Bytes, Bytes>(&mut *wtxn, Some(META_DB))?;
+        let raw = serde_json::to_vec(def)?;
+        meta.put(&mut *wtxn, Self::stream_key(&def.name).as_bytes(), &raw)?;
+        // Reverse lookup used by the insert hot path: one key per collection.
+        meta.put(
+            &mut *wtxn,
+            Self::stream_coll_key(&def.coll).as_bytes(),
+            def.name.as_bytes(),
+        )?;
+        Ok(())
+    }
+
+    /// Removes a stream definition. Data and groups are left in place.
+    pub fn drop_stream_in(&self, wtxn: &mut RwTxn<'_>, name: &str) -> Result<bool> {
+        let meta = self
+            .env
+            .create_database::<Bytes, Bytes>(&mut *wtxn, Some(META_DB))?;
+        let existing = meta
+            .get(&*wtxn, Self::stream_key(name).as_bytes())?
+            .and_then(|raw| serde_json::from_slice::<StreamDef>(raw).ok());
+        let existed = meta.delete(&mut *wtxn, Self::stream_key(name).as_bytes())?;
+        if let Some(def) = existing {
+            let owner = meta
+                .get(&*wtxn, Self::stream_coll_key(&def.coll).as_bytes())?
+                .and_then(|raw| std::str::from_utf8(raw).ok());
+            if owner == Some(name) {
+                meta.delete(&mut *wtxn, Self::stream_coll_key(&def.coll).as_bytes())?;
+            }
+        }
+        Ok(existed)
+    }
+
+    /// Returns one stream definition.
+    pub fn stream(&self, name: &str) -> Result<Option<StreamDef>> {
+        let rtxn = self.read_txn()?;
+        let out = self.stream_in(&rtxn, name)?;
+        rtxn.commit()?;
+        Ok(out)
+    }
+
+    /// Stream lookup inside an existing read transaction.
+    pub fn stream_in(&self, rtxn: &RoTxn<'_>, name: &str) -> Result<Option<StreamDef>> {
+        let Some(meta) = self
+            .env
+            .open_database::<Bytes, Bytes>(rtxn, Some(META_DB))?
+        else {
+            return Ok(None);
+        };
+        Ok(meta
+            .get(rtxn, Self::stream_key(name).as_bytes())?
+            .and_then(|raw| serde_json::from_slice(raw).ok()))
+    }
+
+    /// Stream lookup inside a writer transaction.
+    pub fn stream_in_rw(&self, wtxn: &RwTxn<'_>, name: &str) -> Result<Option<StreamDef>> {
+        let Some(meta) = self
+            .env
+            .open_database::<Bytes, Bytes>(wtxn, Some(META_DB))?
+        else {
+            return Ok(None);
+        };
+        Ok(meta
+            .get(wtxn, Self::stream_key(name).as_bytes())?
+            .and_then(|raw| serde_json::from_slice(raw).ok()))
+    }
+
+    /// Returns the stream defined for a collection, if any.
+    ///
+    /// This runs on the insert path, so it uses the reverse `stream:coll:<coll>`
+    /// key instead of scanning every definition.
+    pub fn collection_stream_in_rw(
+        &self,
+        wtxn: &RwTxn<'_>,
+        coll: &str,
+    ) -> Result<Option<StreamDef>> {
+        let Some(meta) = self
+            .env
+            .open_database::<Bytes, Bytes>(wtxn, Some(META_DB))?
+        else {
+            return Ok(None);
+        };
+        let Some(name) = meta
+            .get(wtxn, Self::stream_coll_key(coll).as_bytes())?
+            .and_then(|raw| std::str::from_utf8(raw).ok())
+            .map(str::to_string)
+        else {
+            return Ok(None);
+        };
+        self.stream_in_rw(wtxn, &name)
+    }
+
+    /// Lists every stream definition.
+    pub fn streams(&self) -> Result<Vec<StreamDef>> {
+        let rtxn = self.read_txn()?;
+        let out = self.streams_in(&rtxn)?;
+        rtxn.commit()?;
+        Ok(out)
+    }
+
+    /// Lists stream definitions inside a read transaction.
+    pub fn streams_in(&self, rtxn: &RoTxn<'_>) -> Result<Vec<StreamDef>> {
+        let Some(meta) = self
+            .env
+            .open_database::<Bytes, Bytes>(rtxn, Some(META_DB))?
+        else {
+            return Ok(Vec::new());
+        };
+        let prefix = crate::streams::STREAM_PREFIX.as_bytes();
+        let mut out = Vec::new();
+        for item in meta.iter(rtxn)? {
+            let (key, value) = item?;
+            if !key.starts_with(prefix)
+                || key.starts_with(crate::streams::STREAM_SEQ_PREFIX.as_bytes())
+                || key.starts_with(b"stream:coll:")
+            {
+                continue;
+            }
+            if let Ok(def) = serde_json::from_slice::<StreamDef>(value) {
+                out.push(def);
+            }
+        }
+        out.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(out)
+    }
+
+    /// Lists stream definitions inside a writer transaction.
+    pub fn streams_in_rw(&self, wtxn: &RwTxn<'_>) -> Result<Vec<StreamDef>> {
+        let Some(meta) = self
+            .env
+            .open_database::<Bytes, Bytes>(wtxn, Some(META_DB))?
+        else {
+            return Ok(Vec::new());
+        };
+        let prefix = crate::streams::STREAM_PREFIX.as_bytes();
+        let mut out = Vec::new();
+        for item in meta.iter(wtxn)? {
+            let (key, value) = item?;
+            if !key.starts_with(prefix)
+                || key.starts_with(crate::streams::STREAM_SEQ_PREFIX.as_bytes())
+                || key.starts_with(b"stream:coll:")
+            {
+                continue;
+            }
+            if let Ok(def) = serde_json::from_slice::<StreamDef>(value) {
+                out.push(def);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Highest offset allocated for a stream, or `0` when nothing was written.
+    pub fn stream_head(&self, name: &str) -> Result<u64> {
+        let rtxn = self.read_txn()?;
+        let out = self.stream_head_in(&rtxn, name)?;
+        rtxn.commit()?;
+        Ok(out)
+    }
+
+    /// Highest allocated offset inside a read transaction.
+    pub fn stream_head_in(&self, rtxn: &RoTxn<'_>, name: &str) -> Result<u64> {
+        let Some(meta) = self
+            .env
+            .open_database::<Bytes, Bytes>(rtxn, Some(META_DB))?
+        else {
+            return Ok(0);
+        };
+        Ok(meta
+            .get(rtxn, Self::stream_seq_key(name).as_bytes())?
+            .and_then(|raw| {
+                std::str::from_utf8(raw)
+                    .ok()
+                    .and_then(|text| text.parse().ok())
+            })
+            .unwrap_or(0))
+    }
+
+    /// Allocates the next offset for a stream inside a writer transaction.
+    pub fn allocate_stream_seq_in(&self, wtxn: &mut RwTxn<'_>, name: &str) -> Result<u64> {
+        let meta = self
+            .env
+            .create_database::<Bytes, Bytes>(&mut *wtxn, Some(META_DB))?;
+        let key = Self::stream_seq_key(name);
+        let next = meta
+            .get(&*wtxn, key.as_bytes())?
+            .and_then(|raw| {
+                std::str::from_utf8(raw)
+                    .ok()
+                    .and_then(|text| text.parse::<u64>().ok())
+            })
+            .unwrap_or(0)
+            + 1;
+        meta.put(&mut *wtxn, key.as_bytes(), next.to_string().as_bytes())?;
+        Ok(next)
+    }
+
+    /// Raises the stream counter to at least `seq`.
+    ///
+    /// Replicas apply the primary's `_seq` values verbatim, so the local counter
+    /// must follow them; otherwise a promoted replica would reissue offsets that
+    /// already exist.
+    pub fn observe_stream_seq_in(&self, wtxn: &mut RwTxn<'_>, name: &str, seq: u64) -> Result<()> {
+        let meta = self
+            .env
+            .create_database::<Bytes, Bytes>(&mut *wtxn, Some(META_DB))?;
+        let key = Self::stream_seq_key(name);
+        let current = meta
+            .get(&*wtxn, key.as_bytes())?
+            .and_then(|raw| {
+                std::str::from_utf8(raw)
+                    .ok()
+                    .and_then(|text| text.parse::<u64>().ok())
+            })
+            .unwrap_or(0);
+        if seq > current {
+            meta.put(&mut *wtxn, key.as_bytes(), seq.to_string().as_bytes())?;
+        }
+        Ok(())
+    }
+
+    /// Returns one consumer group.
+    pub fn stream_group(&self, stream: &str, group: &str) -> Result<Option<StreamGroup>> {
+        let rtxn = self.read_txn()?;
+        let out = self.stream_group_in(&rtxn, stream, group)?;
+        rtxn.commit()?;
+        Ok(out)
+    }
+
+    /// Consumer-group lookup inside a read transaction.
+    pub fn stream_group_in(
+        &self,
+        rtxn: &RoTxn<'_>,
+        stream: &str,
+        group: &str,
+    ) -> Result<Option<StreamGroup>> {
+        let Some(meta) = self
+            .env
+            .open_database::<Bytes, Bytes>(rtxn, Some(META_DB))?
+        else {
+            return Ok(None);
+        };
+        Ok(meta
+            .get(rtxn, Self::stream_group_key(stream, group).as_bytes())?
+            .and_then(|raw| serde_json::from_slice(raw).ok()))
+    }
+
+    /// Consumer-group lookup inside a writer transaction.
+    pub fn stream_group_in_rw(
+        &self,
+        wtxn: &RwTxn<'_>,
+        stream: &str,
+        group: &str,
+    ) -> Result<Option<StreamGroup>> {
+        let Some(meta) = self
+            .env
+            .open_database::<Bytes, Bytes>(wtxn, Some(META_DB))?
+        else {
+            return Ok(None);
+        };
+        Ok(meta
+            .get(wtxn, Self::stream_group_key(stream, group).as_bytes())?
+            .and_then(|raw| serde_json::from_slice(raw).ok()))
+    }
+
+    /// Lists groups for one stream, or every group when `stream` is `None`.
+    pub fn stream_groups(&self, stream: Option<&str>) -> Result<Vec<StreamGroup>> {
+        let rtxn = self.read_txn()?;
+        let Some(meta) = self
+            .env
+            .open_database::<Bytes, Bytes>(&rtxn, Some(META_DB))?
+        else {
+            return Ok(Vec::new());
+        };
+        let prefix = crate::streams::GROUP_PREFIX.as_bytes();
+        let mut out = Vec::new();
+        for item in meta.iter(&rtxn)? {
+            let (key, value) = item?;
+            if !key.starts_with(prefix) {
+                continue;
+            }
+            let Ok(group) = serde_json::from_slice::<StreamGroup>(value) else {
+                continue;
+            };
+            if stream.is_some_and(|name| group.stream != name) {
+                continue;
+            }
+            out.push(group);
+        }
+        out.sort_by(|left, right| {
+            left.stream
+                .cmp(&right.stream)
+                .then_with(|| left.group.cmp(&right.group))
+        });
+        rtxn.commit()?;
+        Ok(out)
+    }
+
+    /// Writes a consumer group inside a writer transaction.
+    pub fn put_stream_group_in(&self, wtxn: &mut RwTxn<'_>, group: &StreamGroup) -> Result<()> {
+        group.validate()?;
+        let meta = self
+            .env
+            .create_database::<Bytes, Bytes>(&mut *wtxn, Some(META_DB))?;
+        let raw = serde_json::to_vec(group)?;
+        meta.put(
+            &mut *wtxn,
+            Self::stream_group_key(&group.stream, &group.group).as_bytes(),
+            &raw,
+        )?;
+        Ok(())
+    }
+
+    /// Creates a consumer group at the requested position.
+    pub fn create_stream_group_in(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        stream: &str,
+        group: &str,
+        start: StartAt,
+    ) -> Result<StreamGroup> {
+        crate::streams::validate_name(group, "group")?;
+        if self.stream_in_rw(wtxn, stream)?.is_none() {
+            return Err(Error::Query(format!("stream `{stream}` does not exist")));
+        }
+        if self.stream_group_in_rw(wtxn, stream, group)?.is_some() {
+            return Err(Error::DuplicateKey(group.to_string()));
+        }
+        let head = self.stream_head_in(wtxn, stream)?;
+        let committed = match start {
+            StartAt::Latest => head,
+            StartAt::Earliest => 0,
+            StartAt::Seq(seq) => {
+                if seq > head {
+                    return Err(Error::Query(format!(
+                        "start offset {seq} is past the stream head {head}"
+                    )));
+                }
+                seq
+            }
+        };
+        let mut out = StreamGroup::new(stream, group, committed);
+        out.touch();
+        self.put_stream_group_in(wtxn, &out)?;
+        Ok(out)
+    }
+
+    /// Moves a group and clears its in-flight batch.
+    pub fn reset_stream_group_in(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        stream: &str,
+        group: &str,
+        to: ResetTo,
+    ) -> Result<StreamGroup> {
+        let mut current = self
+            .stream_group_in_rw(wtxn, stream, group)?
+            .ok_or_else(|| {
+                Error::Query(format!("stream group `{stream}:{group}` does not exist"))
+            })?;
+        let head = self.stream_head_in(wtxn, stream)?;
+        current.committed_seq = match to {
+            ResetTo::Earliest => 0,
+            ResetTo::Latest => head,
+            ResetTo::Seq(seq) => {
+                if seq > head {
+                    return Err(Error::Query(format!(
+                        "reset offset {seq} is past the stream head {head}"
+                    )));
+                }
+                seq
+            }
+        };
+        current.truncated_below = None;
+        current.clear_lease();
+        self.put_stream_group_in(wtxn, &current)?;
+        Ok(current)
+    }
+
+    /// Deletes a group and its offset.
+    pub fn delete_stream_group_in(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        stream: &str,
+        group: &str,
+    ) -> Result<bool> {
+        let meta = self
+            .env
+            .create_database::<Bytes, Bytes>(&mut *wtxn, Some(META_DB))?;
+        Ok(meta.delete(&mut *wtxn, Self::stream_group_key(stream, group).as_bytes())?)
+    }
+
+    /// Creates a consumer group in its own transaction.
+    pub fn create_stream_group(
+        &self,
+        stream: &str,
+        group: &str,
+        start: StartAt,
+    ) -> Result<StreamGroup> {
+        let mut wtxn = self.write_txn()?;
+        let out = self.create_stream_group_in(&mut wtxn, stream, group, start)?;
+        wtxn.commit()?;
+        Ok(out)
+    }
+
+    /// Moves a group offset in its own transaction.
+    pub fn reset_stream_group(
+        &self,
+        stream: &str,
+        group: &str,
+        to: ResetTo,
+    ) -> Result<StreamGroup> {
+        let mut wtxn = self.write_txn()?;
+        let out = self.reset_stream_group_in(&mut wtxn, stream, group, to)?;
+        wtxn.commit()?;
+        Ok(out)
+    }
+
+    /// Claims a group in its own transaction.
+    pub fn claim_stream_group(
+        &self,
+        stream: &str,
+        group: &str,
+        member: &str,
+        lease_ms: u64,
+    ) -> Result<StreamGroup> {
+        let mut wtxn = self.write_txn()?;
+        let out = self.claim_stream_group_in(&mut wtxn, stream, group, member, lease_ms)?;
+        wtxn.commit()?;
+        Ok(out)
+    }
+
+    /// Commits a group offset in its own transaction.
+    pub fn commit_stream_group(
+        &self,
+        stream: &str,
+        group: &str,
+        seq: u64,
+        lease_id: Option<&str>,
+    ) -> Result<StreamGroup> {
+        let mut wtxn = self.write_txn()?;
+        let out = self.commit_stream_group_in(&mut wtxn, stream, group, seq, lease_id)?;
+        wtxn.commit()?;
+        Ok(out)
+    }
+
+    /// Claims the group for one member until `lease_ms` elapses.
+    ///
+    /// Only one member owns a group at a time; a second claim is rejected until
+    /// the current lease expires or the owner commits.
+    pub fn claim_stream_group_in(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        stream: &str,
+        group: &str,
+        member: &str,
+        lease_ms: u64,
+    ) -> Result<StreamGroup> {
+        let mut current = self
+            .stream_group_in_rw(wtxn, stream, group)?
+            .ok_or_else(|| {
+                Error::Query(format!("stream group `{stream}:{group}` does not exist"))
+            })?;
+        let now = crate::streams::now_ms();
+        if let Some(_owner) = current.lease_id.as_deref() {
+            if current.lease_until > now && current.member.as_deref() != Some(member) {
+                return Err(Error::StaleLease(format!(
+                    "group `{group}` is leased by {} until {}",
+                    current.member.as_deref().unwrap_or("another member"),
+                    current.lease_until
+                )));
+            }
+        }
+        current.lease_id = Some(crate::events::new_event_id());
+        current.lease_until = now.saturating_add(lease_ms.max(1_000));
+        current.member = Some(member.to_string());
+        current.touch();
+        self.put_stream_group_in(wtxn, &current)?;
+        Ok(current)
+    }
+
+    /// Advances a group offset after a successful batch.
+    ///
+    /// The commit is rejected when the presented lease no longer owns the batch
+    /// (`StaleLease`) or when it would move the offset backwards or past the
+    /// stream head (`CommitOutOfOrder`).
+    pub fn commit_stream_group_in(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        stream: &str,
+        group: &str,
+        seq: u64,
+        lease_id: Option<&str>,
+    ) -> Result<StreamGroup> {
+        let mut current = self
+            .stream_group_in_rw(wtxn, stream, group)?
+            .ok_or_else(|| {
+                Error::Query(format!("stream group `{stream}:{group}` does not exist"))
+            })?;
+        if let Some(expected) = current.lease_id.as_deref() {
+            if lease_id != Some(expected) {
+                return Err(Error::StaleLease(format!(
+                    "group `{group}` is owned by lease {expected}"
+                )));
+            }
+        }
+        if seq < current.committed_seq {
+            return Err(Error::CommitOutOfOrder(format!(
+                "offset {seq} is below the committed offset {}",
+                current.committed_seq
+            )));
+        }
+        let head = self.stream_head_in(wtxn, stream)?;
+        if seq > head {
+            return Err(Error::CommitOutOfOrder(format!(
+                "offset {seq} is past the stream head {head}"
+            )));
+        }
+        current.committed_seq = seq;
+        current.clear_lease();
+        self.put_stream_group_in(wtxn, &current)?;
+        Ok(current)
+    }
+
     /// Returns the per-collection history retention. `0` means disabled.
     pub fn collection_history(&self, name: &str) -> Result<usize> {
         let rtxn = self.read_txn()?;
@@ -2548,6 +3120,16 @@ impl Store {
             }
             ReplicationOp::SubscriptionDelete { coll, name } => {
                 self.delete_subscription_in(wtxn, coll, name)?;
+                Ok(())
+            }
+            ReplicationOp::StreamSet { def } => self.set_stream_in(wtxn, def),
+            ReplicationOp::StreamDrop { name } => {
+                self.drop_stream_in(wtxn, name)?;
+                Ok(())
+            }
+            ReplicationOp::StreamGroupSet { group } => self.put_stream_group_in(wtxn, group),
+            ReplicationOp::StreamGroupDelete { stream, group } => {
+                self.delete_stream_group_in(wtxn, stream, group)?;
                 Ok(())
             }
             ReplicationOp::EventAppend { doc } => {

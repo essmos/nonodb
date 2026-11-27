@@ -84,6 +84,7 @@ pub fn authorize_request(
         | Request::GetCollectionHistory { coll }
         | Request::GetCollectionEvents { coll }
         | Request::GetCollectionMetrics { coll }
+        | Request::GetStream { coll }
         | Request::ListSubscriptions { coll } => {
             allow(principal, Action::Read, database, coll, req.op_name())
         }
@@ -155,13 +156,31 @@ pub fn authorize_request(
         | Request::SetCollectionEvents { coll, .. }
         | Request::CreateSubscription { coll, .. }
         | Request::RenewSubscription { coll, .. }
-        | Request::DeleteSubscription { coll, .. } => allow(
+        | Request::DeleteSubscription { coll, .. }
+        | Request::CreateStream { coll, .. }
+        | Request::DropStream { coll }
+        | Request::CreateStreamGroup { coll, .. }
+        | Request::ResetStreamGroup { coll, .. }
+        | Request::DeleteStreamGroup { coll, .. }
+        | Request::CommitStreamGroup { coll, .. }
+        | Request::ClaimStreamGroup { coll, .. } => allow(
             principal,
             Action::AdminCollection,
             database,
             coll,
             req.op_name(),
         ),
+        Request::ListStreams => Ok(()),
+        Request::StreamStats { coll } => match coll {
+            Some(coll) => allow(principal, Action::Read, database, coll, req.op_name()),
+            None => {
+                if principal.allows_database_admin(database) {
+                    Ok(())
+                } else {
+                    Err(ApiError::forbidden())
+                }
+            }
+        },
         Request::SetGraph { coll, def } => {
             allow(
                 principal,

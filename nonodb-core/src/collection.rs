@@ -5402,6 +5402,21 @@ impl<'e> Collection<'e> {
             }
         };
 
+        // Stream collections get a writer-assigned offset. The field is reserved:
+        // a user-supplied value would break group ordering.
+        if let Some(store) = self.store {
+            if let Some(def) = store.collection_stream_in_rw(&*wtxn, &self.name)? {
+                if obj.contains_key(&def.seq_field) {
+                    return Err(Error::Query(format!(
+                        "`{}` is reserved and managed by the stream writer",
+                        def.seq_field
+                    )));
+                }
+                let seq = store.allocate_stream_seq_in(wtxn, &def.name)?;
+                obj.insert(def.seq_field.clone(), Value::from(seq));
+            }
+        }
+
         if self.db.get(&*wtxn, id.as_bytes())?.is_some() {
             return Err(Error::DuplicateKey(id));
         }
@@ -5552,6 +5567,13 @@ impl<'e> Collection<'e> {
                     return Err(Error::DocumentTooLarge(bytes.len(), MAX_DOCUMENT_BYTES));
                 }
                 self.db.put(&mut *wtxn, id.as_bytes(), &bytes)?;
+                if let Some(store) = self.store {
+                    if let Some(def) = store.collection_stream_in_rw(&*wtxn, &self.name)? {
+                        if let Some(seq) = after.get(&def.seq_field).and_then(Value::as_u64) {
+                            store.observe_stream_seq_in(wtxn, &def.name, seq)?;
+                        }
+                    }
+                }
                 self.apply_index_entries(wtxn, None, Some(after), id)?;
                 self.apply_graph_entries(wtxn, None, Some(after))?;
                 self.apply_text_entries(wtxn, None, Some(after), id)?;

@@ -8,6 +8,11 @@ NonoDB can tail **append-only event collections** in two ways:
 Both are designed for collections such as `_events`, where documents are
 inserted with sortable ULID `_id` values by the outbox producer.
 
+> **Planned:** server-side offsets, consumer groups, in-flight leases, and
+> offset/size-based retention are specified in the
+> [streams groups plan](streams-groups-plan.md). The behaviour documented below is
+> the current implementation.
+
 The normal mode tails existing documents by `_id`. It is **not** an automatic
 change stream for arbitrary collections; updates and deletes are not emitted.
 For change notification, write an event document explicitly with
@@ -499,3 +504,124 @@ PRODUCERS=16 PER=1000 CONSUMERS=16 \
 The latest stress run delivered 16,000 events to 16 independent stream
 consumers, with 0 missing and 0 duplicate deliveries. `watch_active` returned to
 0 after the consumers disconnected.
+
+## Consumer groups and durable offsets
+
+A **stream** turns an append-only collection into an ordered log with
+server-side offsets. Consumers commit offsets to the daemon instead of keeping
+them client-side, and several processes can share the work of one group.
+
+In this release the stream name is the collection name, and groups are per
+database.
+
+### Define a stream
+
+```json
+{"op":"create_stream","coll":"_events","retention":{"max_events":1000000,"max_age_ms":604800000}}
+```
+
+From then on, every document inserted into `_events` gets a writer-assigned
+`_seq` field: a strictly increasing `u64` allocated by the single writer, so it
+matches the commit order of the database exactly. `_seq` is reserved — an insert
+that supplies it is rejected with `invalid_query`.
+
+Events written **before** `create_stream` have no `_seq` and are not delivered
+by group reads. Define the stream before writing events, or backfill them.
+
+`create_stream` also builds the `_seq` index used by group reads, so it behaves
+like an index build on a large collection.
+
+### Create a group
+
+```json
+{"op":"create_stream_group","coll":"_events","group":"order-sync","start":"latest"}
+```
+
+`start` is `latest` (default, only new events), `earliest` (offset `0`), or
+`{"seq": 1234}`. Creating the same group twice fails with `duplicate_key`.
+
+### Read as a member
+
+```json
+{
+  "op": "watch",
+  "coll": "_events",
+  "mode": "group",
+  "group": "order-sync",
+  "member": "worker-1",
+  "limit": 100,
+  "timeout_ms": 1000,
+  "filter": {"payload.tenant": "acme"}
+}
+```
+
+Response:
+
+```json
+{
+  "events": [{"_id": "01J...", "_seq": 412901, "type": "order.paid"}],
+  "next_seq": 412901,
+  "committed_seq": 412900,
+  "lease_id": "01J...",
+  "group": "order-sync",
+  "timed_out": false,
+  "has_more": false
+}
+```
+
+Group reads order by `_seq`, not `_id`, so out-of-order `_id` commits cannot
+reorder events, and the late-commit overlap rescan used by `_id` tails is not
+needed: there are no gaps. `filter`, `types`, and `projection` behave as in the
+`_id` tail.
+
+Reading a group **claims the group lease**. One member owns the group at a time:
+a second member gets `timed_out` (or `stale_lease`) until the lease expires or
+the owner commits. The lease lasts `lease_ms` (default `60000`), and re-claiming
+as the same member extends it.
+
+### Commit
+
+```json
+{"op":"commit_stream_group","coll":"_events","group":"order-sync","seq":412901,"lease_id":"01J..."}
+```
+
+- The commit must present the `lease_id` from the batch, otherwise it fails with
+  `stale_lease`. A stale worker cannot advance a group it no longer owns.
+- Offsets only move forward and never past the stream head; anything else fails
+  with `commit_out_of_order`.
+- A successful commit clears the lease, so another member can take over.
+- Delivery is at-least-once: after a crash between processing and committing the
+  batch is delivered again. Handlers must stay idempotent.
+
+A long-poll `watch` (`{"op":"watch",...,"mode":"group"}`) and the continuous
+`/v1/watch` stream (`"mode":"group"` with `Accept: application/x-ndjson` or
+`text/event-stream`) accept the same fields. The continuous stream emits one
+`ready` control frame carrying `lease_id` and `committed_seq`, then events with
+their `_seq`.
+
+### Inspect and reset
+
+```json
+{"op":"stream_stats","coll":"_events"}
+{"op":"reset_stream_group","coll":"_events","group":"order-sync","to":"latest"}
+{"op":"delete_stream_group","coll":"_events","group":"order-sync"}
+{"op":"drop_stream","coll":"_events"}
+```
+
+`stream_stats` reports `committed_seq`, `head_seq`, `lag`, the current lease, and
+`truncated_below`. `reset_stream_group` accepts `earliest`, `latest`, or
+`{"seq": n}`, clears the lease, and clears `truncated_below`. `drop_stream` keeps
+the data and the groups; only the definition (and future offset assignment) is
+removed.
+
+### Current limits
+
+- One member processes a group at a time. Splitting a group across concurrent
+  members with batch ranges, expiry-driven redelivery, attempt counters, and a
+  dead-letter queue is the next phase; see the
+  [streams groups plan](streams-groups-plan.md).
+- `retention` is stored and validated but not enforced yet. Until the retention
+  phase lands, use TTL on the event collection as today.
+- A lease is node-local ownership and is not replicated; a promoted replica
+  starts with no active lease, which is safe because a new claim is required
+  before any commit.

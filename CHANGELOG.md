@@ -4,6 +4,16 @@ Full release notes: https://github.com/essmos/nonodb/releases
 
 ## Unreleased
 
+- Add streams with server-side offsets and consumer groups over append-only
+  collections. The writer assigns a reserved `_seq` to every insert in a stream
+  collection; `create_stream`, `create_stream_group`, `watch` with
+  `"mode":"group"`, `commit_stream_group`, `reset_stream_group`,
+  `delete_stream_group`, `get_stream`, `list_streams`, and `stream_stats` expose
+  offsets, lease-fenced commits, and lag. Group reads order by `_seq`, so
+  out-of-order `_id` commits cannot reorder events and no overlap rescan is
+  needed. Retention is stored and validated but not enforced yet; see
+  `docs/streams-groups-plan.md` for the remaining phases.
+
 - Wake continuous `/v1/watch` streams as soon as the writer commits instead of
   waiting for the idle poll interval, and send one buffered frame per poll page
   instead of one channel message per event. Delivered-event latency drops from

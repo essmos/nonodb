@@ -220,6 +220,16 @@ pub enum Request {
         event_type: Option<String>,
         #[serde(default)]
         name: Option<String>,
+        /// Consumer group name. When set, `mode` defaults to `group` and the
+        /// stream is read by committed offset instead of by `_id` cursor.
+        #[serde(default)]
+        group: Option<String>,
+        /// Member identity holding the group lease.
+        #[serde(default)]
+        member: Option<String>,
+        /// Lease duration for a group claim, in milliseconds.
+        #[serde(default)]
+        lease_ms: Option<u64>,
     },
     /// Read-only query plan and actual count diagnostics.
     Explain {
@@ -592,6 +602,63 @@ pub enum Request {
         #[serde(default)]
         durability: Option<Durability>,
     },
+    // ---- Streams: durable offsets and consumer groups -------------------
+    /// Define a stream over a collection. The collection name is the stream
+    /// name in this release.
+    CreateStream {
+        coll: String,
+        #[serde(default)]
+        retention: nonodb_core::streams::Retention,
+    },
+    /// Remove a stream definition. Data and groups are kept.
+    DropStream {
+        coll: String,
+    },
+    /// Read one stream definition.
+    GetStream {
+        coll: String,
+    },
+    /// List stream definitions.
+    ListStreams,
+    /// Create a consumer group at `earliest`, `latest`, or an explicit offset.
+    CreateStreamGroup {
+        coll: String,
+        group: String,
+        #[serde(default)]
+        start: nonodb_core::streams::StartAt,
+    },
+    /// Move a group offset and clear its in-flight lease.
+    ResetStreamGroup {
+        coll: String,
+        group: String,
+        to: nonodb_core::streams::ResetTo,
+    },
+    /// Delete a consumer group.
+    DeleteStreamGroup {
+        coll: String,
+        group: String,
+    },
+    /// Per-group offsets, lag, and lease state.
+    StreamStats {
+        #[serde(default)]
+        coll: Option<String>,
+    },
+    /// Commit a group offset after a successfully processed batch.
+    CommitStreamGroup {
+        coll: String,
+        group: String,
+        seq: u64,
+        #[serde(default)]
+        lease_id: Option<String>,
+    },
+    /// Claim the group for one member until the lease expires.
+    ClaimStreamGroup {
+        coll: String,
+        group: String,
+        member: String,
+        #[serde(default)]
+        lease_ms: Option<u64>,
+    },
     ListCollections,
     /// Per-collection record counts and storage estimates for this database.
     DatabaseStats,
@@ -932,6 +999,39 @@ pub enum WriteReq {
     },
     /// Internal maintenance: delete expired subscriptions.
     PruneSubscriptions,
+    CreateStream {
+        coll: String,
+        retention: nonodb_core::streams::Retention,
+    },
+    DropStream {
+        coll: String,
+    },
+    CreateStreamGroup {
+        coll: String,
+        group: String,
+        start: nonodb_core::streams::StartAt,
+    },
+    ResetStreamGroup {
+        coll: String,
+        group: String,
+        to: nonodb_core::streams::ResetTo,
+    },
+    DeleteStreamGroup {
+        coll: String,
+        group: String,
+    },
+    CommitStreamGroup {
+        coll: String,
+        group: String,
+        seq: u64,
+        lease_id: Option<String>,
+    },
+    ClaimStreamGroup {
+        coll: String,
+        group: String,
+        member: String,
+        lease_ms: u64,
+    },
     CreateWebhook {
         rule: WebhookRule,
     },
@@ -1167,6 +1267,16 @@ impl Request {
             Self::SetCollectionHistory { .. } => "set_collection_history",
             Self::GetCollectionHistory { .. } => "get_collection_history",
             Self::SetCollectionEvents { .. } => "set_collection_events",
+            Self::CreateStream { .. } => "create_stream",
+            Self::DropStream { .. } => "drop_stream",
+            Self::GetStream { .. } => "get_stream",
+            Self::ListStreams => "list_streams",
+            Self::CreateStreamGroup { .. } => "create_stream_group",
+            Self::ResetStreamGroup { .. } => "reset_stream_group",
+            Self::DeleteStreamGroup { .. } => "delete_stream_group",
+            Self::StreamStats { .. } => "stream_stats",
+            Self::CommitStreamGroup { .. } => "commit_stream_group",
+            Self::ClaimStreamGroup { .. } => "claim_stream_group",
             Self::GetCollectionEvents { .. } => "get_collection_events",
             Self::GetCollectionMetrics { .. } => "get_collection_metrics",
             Self::CreateSubscription { .. } => "create_subscription",
@@ -1251,6 +1361,9 @@ impl Request {
             | Self::ListSubscriptions { .. }
             | Self::ListWebhooks
             | Self::ListWebhookDeliveries { .. }
+            | Self::GetStream { .. }
+            | Self::ListStreams
+            | Self::StreamStats { .. }
             | Self::ListDatabases => true,
             Self::Aggregate { pipeline, .. } => nonodb_core::aggregate::write_stage_spec(pipeline)
                 .ok()
@@ -1330,6 +1443,16 @@ impl Request {
             | Self::RenewSubscription { coll, .. }
             | Self::DeleteSubscription { coll, .. }
             | Self::ListSubscriptions { coll } => vec![coll.clone()],
+            Self::CreateStream { coll, .. }
+            | Self::DropStream { coll }
+            | Self::GetStream { coll }
+            | Self::CreateStreamGroup { coll, .. }
+            | Self::ResetStreamGroup { coll, .. }
+            | Self::DeleteStreamGroup { coll, .. }
+            | Self::CommitStreamGroup { coll, .. }
+            | Self::ClaimStreamGroup { coll, .. } => vec![coll.clone()],
+            Self::ListStreams => Vec::new(),
+            Self::StreamStats { coll } => coll.iter().cloned().collect(),
             Self::SetGraph { coll, def } => {
                 if def.edge_collection == *coll {
                     vec![coll.clone()]
@@ -1498,6 +1621,9 @@ impl From<nonodb_core::Error> for ApiError {
             E::Lmdb(_) => "storage",
             E::Io(_) => "io",
             E::Vault { code, .. } => *code,
+            E::StreamTruncated(_) => "stream_truncated",
+            E::StaleLease(_) => "stale_lease",
+            E::CommitOutOfOrder(_) => "commit_out_of_order",
         };
         Self {
             code: code.to_string(),
