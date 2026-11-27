@@ -5400,10 +5400,24 @@ impl<'e> Collection<'e> {
     pub fn insert_one_txn(&self, wtxn: &mut RwTxn<'_>, mut doc: Value) -> Result<String> {
         if self.profile.is_columnar() {
             let settings = self.columnar_settings_in(&*wtxn)?.unwrap_or_default();
+            let ttl_at = ttl::take_insert_ttl_with_field(
+                &mut doc,
+                self.ttl_default_seconds,
+                self.ttl_field_pair(),
+            )?;
             date::normalize_document(&mut doc)?;
             numeric::normalize_document(&mut doc)?;
             bson_types::normalize_document(&mut doc)?;
-            return crate::columnar::insert(wtxn, self.env, &self.name, &settings, doc);
+            self.validate_graph_edge_txn(&*wtxn, &doc)?;
+            let id = crate::columnar::insert(wtxn, self.env, &self.name, &settings, doc)?;
+            if let Some(stored) = crate::columnar::find_by_id(&*wtxn, self.env, &self.name, &id)? {
+                self.validate_unique(&*wtxn, &stored, &id)?;
+                self.apply_all_index_entries(wtxn, None, Some(&stored), &id)?;
+                self.apply_graph_entries(wtxn, None, Some(&stored))?;
+                self.set_ttl(wtxn, &id, ttl_at)?;
+                self.record_history(wtxn, &id, "insert", Some(stored))?;
+            }
+            return Ok(id);
         }
         if self.profile.is_timeseries() {
             let settings = self.timeseries_settings_in(&*wtxn)?.unwrap_or_default();
@@ -5680,17 +5694,13 @@ impl<'e> Collection<'e> {
         default_id: Option<&Value>,
     ) -> Result<UpdateOutcome> {
         if self.profile.is_columnar() {
-            let settings = self.columnar_settings_in(&*wtxn)?.unwrap_or_default();
-            return crate::columnar::update(
+            return self.update_columnar_txn(
                 wtxn,
-                self.env,
-                &self.name,
-                &settings,
                 filter,
                 update,
                 multi,
-                array_filters,
                 upsert,
+                array_filters,
                 default_id,
             );
         }
@@ -6055,6 +6065,94 @@ impl<'e> Collection<'e> {
         })
     }
 
+    fn columnar_candidates_in(&self, txn: &RoTxn<'_>, filter: &Value) -> Result<Vec<Value>> {
+        if let Some(id) = crate::columnar::exact_id_filter(filter) {
+            return Ok(crate::columnar::find_by_id(txn, self.env, &self.name, &id)?
+                .into_iter()
+                .collect());
+        }
+        crate::columnar::find(
+            txn,
+            self.env,
+            &self.name,
+            &FindQuery {
+                filter: filter.clone(),
+                ..Default::default()
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn update_columnar_txn(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        filter: &Value,
+        update: &Value,
+        multi: bool,
+        upsert: bool,
+        array_filters: &[Value],
+        default_id: Option<&Value>,
+    ) -> Result<UpdateOutcome> {
+        let settings = self.columnar_settings_in(&*wtxn)?.unwrap_or_default();
+        let before = self.columnar_candidates_in(&*wtxn, filter)?;
+        let outcome = crate::columnar::update(
+            wtxn,
+            self.env,
+            &self.name,
+            &settings,
+            filter,
+            update,
+            multi,
+            array_filters,
+            upsert,
+            default_id,
+        )?;
+        for old in &before {
+            let Some(id) = old.get("_id").and_then(id::key_from_value) else {
+                continue;
+            };
+            let Some(new) = crate::columnar::find_by_id(&*wtxn, self.env, &self.name, &id)? else {
+                continue;
+            };
+            self.validate_unique(&*wtxn, &new, &id)?;
+            self.apply_all_index_entries(wtxn, Some(old), Some(&new), &id)?;
+            self.apply_graph_entries(wtxn, Some(old), Some(&new))?;
+            self.record_history(wtxn, &id, "update", Some(new))?;
+        }
+        if let Some(id) = outcome.upserted_id.as_deref() {
+            if let Some(new) = crate::columnar::find_by_id(&*wtxn, self.env, &self.name, id)? {
+                self.validate_unique(&*wtxn, &new, id)?;
+                self.apply_all_index_entries(wtxn, None, Some(&new), id)?;
+                self.apply_graph_entries(wtxn, None, Some(&new))?;
+                self.record_history(wtxn, id, "insert", Some(new))?;
+            }
+        }
+        Ok(outcome)
+    }
+
+    fn delete_columnar_txn(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        filter: &Value,
+        multi: bool,
+    ) -> Result<usize> {
+        let before = self.columnar_candidates_in(&*wtxn, filter)?;
+        let removed = crate::columnar::delete(wtxn, self.env, &self.name, filter, multi)?;
+        if removed == 0 {
+            return Ok(0);
+        }
+        for old in &before {
+            let Some(id) = old.get("_id").and_then(id::key_from_value) else {
+                continue;
+            };
+            self.apply_all_index_entries(wtxn, Some(old), None, &id)?;
+            self.apply_graph_entries(wtxn, Some(old), None)?;
+            self.set_ttl(wtxn, &id, None)?;
+            self.record_history(wtxn, &id, "delete", None)?;
+        }
+        Ok(removed)
+    }
+
     fn find_and_modify_columnar(
         &self,
         wtxn: &mut RwTxn<'_>,
@@ -6062,7 +6160,6 @@ impl<'e> Collection<'e> {
         default_id: Option<&Value>,
     ) -> Result<FindAndModifyOutcome> {
         validate_find_and_modify(opts)?;
-        let settings = self.columnar_settings_in(&*wtxn)?.unwrap_or_default();
         let query = FindQuery {
             filter: opts.filter.clone(),
             projection: None,
@@ -6103,16 +6200,13 @@ impl<'e> Collection<'e> {
                 .and_then(Value::as_str)
                 .ok_or(Error::InvalidId)?
                 .to_string();
-            let outcome = crate::columnar::update(
+            let outcome = self.update_opts_txn_filtered_with_id(
                 wtxn,
-                self.env,
-                &self.name,
-                &settings,
                 &serde_json::json!({"_id": id}),
                 update,
                 false,
-                opts.array_filters,
                 false,
+                opts.array_filters,
                 None,
             )?;
             let new = crate::columnar::find_by_id(&*wtxn, self.env, &self.name, &id)?
@@ -6407,7 +6501,7 @@ impl<'e> Collection<'e> {
 
     pub fn delete_txn(&self, wtxn: &mut RwTxn<'_>, filter: &Value, multi: bool) -> Result<usize> {
         if self.profile.is_columnar() {
-            return crate::columnar::delete(wtxn, self.env, &self.name, filter, multi);
+            return self.delete_columnar_txn(wtxn, filter, multi);
         }
         if self.profile.is_timeseries() {
             let settings = self.timeseries_settings_in(&*wtxn)?.unwrap_or_default();

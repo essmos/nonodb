@@ -230,3 +230,21 @@ fn columnar_roundtrips_bson_scalars_and_nested_values() {
         col_coll.find_by_key("bson").unwrap()
     );
 }
+
+#[test]
+fn columnar_mutations_record_history_in_the_same_transaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    store
+        .create_columnar_collection("docs", &nonodb_core::columnar::Settings::default())
+        .unwrap();
+    store.set_collection_history("docs", 10).unwrap();
+    let coll = store.collection("docs").unwrap();
+    coll.insert_one(json!({"_id": "a", "value": 1})).unwrap();
+    coll.update(&json!({"_id": "a"}), &json!({"$set": {"value": 2}}), false)
+        .unwrap();
+    coll.delete(&json!({"_id": "a"}), false).unwrap();
+    let entries = coll.history("a", None, true).unwrap();
+    let ops: Vec<&str> = entries.iter().map(|entry| entry.op.as_str()).collect();
+    assert_eq!(ops, vec!["delete", "update", "insert"]);
+}
