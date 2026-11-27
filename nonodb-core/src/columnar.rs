@@ -640,6 +640,24 @@ pub fn find_by_id(rtxn: &RoTxn<'_>, env: &Env, name: &str, id: &str) -> Result<O
     Ok(None)
 }
 
+/// Replaces a stored document without changing its locator or `_id`.
+pub fn replace_by_id(
+    wtxn: &mut RwTxn<'_>,
+    env: &Env,
+    name: &str,
+    id: &str,
+    doc: &Map<String, Value>,
+) -> Result<()> {
+    let db = env.create_database::<Bytes, Bytes>(wtxn, Some(&db_name(name)))?;
+    let Some((locator, _)) = find_located_id(&*wtxn, &db, id)? else {
+        return Err(Error::Query(format!("document `{id}` disappeared")));
+    };
+    if doc_id(doc)? != id {
+        return Err(Error::Query("columnar update cannot change `_id`".into()));
+    }
+    write_doc_at(wtxn, &db, locator, doc)
+}
+
 /// Scans every visible document, applying update overlays and tombstones.
 pub fn all_docs(rtxn: &RoTxn<'_>, env: &Env, name: &str) -> Result<Vec<Value>> {
     Ok(all_located(rtxn, env, name)?

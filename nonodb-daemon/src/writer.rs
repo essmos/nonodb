@@ -2258,6 +2258,99 @@ mod tests {
     }
 
     #[test]
+    fn columnar_changes_feed_events_and_live_watches() {
+        use nonodb_core::subscriptions::{CountCondition, Subscription};
+
+        let (_dir, store) = setup();
+        execute_commit(
+            &store,
+            &WriteReq::CreateCollection {
+                coll: "items".into(),
+                profile: CollectionProfile::Columnar,
+                ttl_seconds: None,
+                ttl_purge_history: None,
+                timeseries: None,
+            },
+        )
+        .unwrap();
+        execute_commit(
+            &store,
+            &WriteReq::SetCollectionEvents {
+                coll: "items".into(),
+                enabled: true,
+                fields: Vec::new(),
+                ops: Vec::new(),
+                filter: Value::Null,
+                include_before: true,
+                include_after: true,
+                projection: None,
+            },
+        )
+        .unwrap();
+        execute_commit(
+            &store,
+            &WriteReq::CreateSubscription {
+                coll: "items".into(),
+                subscription: Subscription {
+                    name: "watch-items".into(),
+                    ops: vec!["insert".into()],
+                    count: Some(CountCondition {
+                        gte: Some(1),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            },
+        )
+        .unwrap();
+
+        execute_commit(
+            &store,
+            &WriteReq::Insert {
+                coll: "items".into(),
+                doc: json!({"_id": "a", "v": 1}),
+                vault: None,
+            },
+        )
+        .unwrap();
+        execute_commit(
+            &store,
+            &WriteReq::Update {
+                coll: "items".into(),
+                filter: json!({"_id": "a"}),
+                update: json!({"$set": {"v": 2}}),
+                multi: false,
+                upsert: false,
+                array_filters: Vec::new(),
+                default_id: None,
+                vault: None,
+            },
+        )
+        .unwrap();
+        execute_commit(
+            &store,
+            &WriteReq::Delete {
+                coll: "items".into(),
+                filter: json!({"_id": "a"}),
+                multi: false,
+                vault: None,
+            },
+        )
+        .unwrap();
+        let events = all(&store, nonodb_core::events::EVENTS_COLLECTION);
+        let ops: Vec<&str> = events
+            .iter()
+            .filter(|event| event["payload"]["coll"] == json!("items"))
+            .filter(|event| event["payload"].get("subscription").is_none())
+            .filter_map(|event| event["payload"]["op"].as_str())
+            .collect();
+        assert_eq!(ops, vec!["insert", "update", "delete"]);
+        assert!(events
+            .iter()
+            .any(|event| event["type"] == json!("subscription.watch-items")));
+    }
+
+    #[test]
     fn timeseries_changes_feed_events_and_live() {
         use nonodb_core::subscriptions::{CountCondition, Subscription};
 

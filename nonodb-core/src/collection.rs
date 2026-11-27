@@ -1139,15 +1139,34 @@ impl<'e> Collection<'e> {
         // must still be backfilled when the collection switches to date-field
         // semantics.
         let mut docs: Vec<Value> = Vec::with_capacity(limit);
-        for item in self.db.iter(wtxn)? {
-            let (_key, bytes) = item?;
-            let doc = parse_json(bytes)?;
-            if !matches(&doc, &filter) {
-                continue;
+        if self.profile.is_columnar() {
+            let mut all = crate::columnar::all_docs(&*wtxn, self.env, &self.name)?;
+            all.sort_by(|a, b| {
+                a.get("_id")
+                    .map(id::key_from_value)
+                    .unwrap_or_default()
+                    .cmp(&b.get("_id").map(id::key_from_value).unwrap_or_default())
+            });
+            for doc in all {
+                if !matches(&doc, &filter) {
+                    continue;
+                }
+                docs.push(doc);
+                if docs.len() >= limit {
+                    break;
+                }
             }
-            docs.push(doc);
-            if docs.len() >= limit {
-                break;
+        } else {
+            for item in self.db.iter(wtxn)? {
+                let (_key, bytes) = item?;
+                let doc = parse_json(bytes)?;
+                if !matches(&doc, &filter) {
+                    continue;
+                }
+                docs.push(doc);
+                if docs.len() >= limit {
+                    break;
+                }
             }
         }
         let mut updated = 0u64;
@@ -6188,6 +6207,17 @@ impl<'e> Collection<'e> {
     ) -> Result<UpdateOutcome> {
         let settings = self.columnar_settings_in(&*wtxn)?.unwrap_or_default();
         let before = self.columnar_candidates_in(&*wtxn, filter)?;
+        let mut ttl_changes: HashMap<String, (ttl::TtlUpdate, Option<u64>)> = HashMap::new();
+        for old in &before {
+            let Some(id) = old.get("_id").and_then(id::key_from_value) else {
+                continue;
+            };
+            let old_ttl = self.ttl_at(&*wtxn, &id)?;
+            let mut check = old.clone();
+            apply_with_options(&mut check, update, filter, array_filters)?;
+            let directive = ttl::take_update_ttl_with_field(&mut check, self.ttl_field_pair())?;
+            ttl_changes.insert(id, (directive, old_ttl));
+        }
         let outcome = crate::columnar::update(
             wtxn,
             self.env,
@@ -6204,16 +6234,45 @@ impl<'e> Collection<'e> {
             let Some(id) = old.get("_id").and_then(id::key_from_value) else {
                 continue;
             };
-            let Some(new) = crate::columnar::find_by_id(&*wtxn, self.env, &self.name, &id)? else {
+            let Some(mut new) = crate::columnar::find_by_id(&*wtxn, self.env, &self.name, &id)?
+            else {
                 continue;
             };
+            let stripped = new
+                .as_object_mut()
+                .is_some_and(|object| object.remove("_ttl").is_some());
+            if stripped {
+                let object = new
+                    .as_object()
+                    .ok_or_else(|| Error::Query("updated document must be an object".into()))?;
+                crate::columnar::replace_by_id(wtxn, self.env, &self.name, &id, object)?;
+            }
+            let (directive, old_ttl) = ttl_changes
+                .get(&id)
+                .copied()
+                .unwrap_or((ttl::TtlUpdate::Preserve, None));
+            let ttl_at = match directive {
+                ttl::TtlUpdate::Preserve => old_ttl,
+                ttl::TtlUpdate::Clear => None,
+                ttl::TtlUpdate::Set(at) => Some(at),
+            };
+            self.set_ttl(wtxn, &id, ttl_at)?;
             self.validate_unique(&*wtxn, &new, &id)?;
             self.apply_all_index_entries(wtxn, Some(old), Some(&new), &id)?;
             self.apply_graph_entries(wtxn, Some(old), Some(&new))?;
             self.record_history(wtxn, &id, "update", Some(new))?;
         }
         if let Some(id) = outcome.upserted_id.as_deref() {
-            if let Some(new) = crate::columnar::find_by_id(&*wtxn, self.env, &self.name, id)? {
+            if let Some(mut new) = crate::columnar::find_by_id(&*wtxn, self.env, &self.name, id)? {
+                let ttl_at = ttl::take_insert_ttl_with_field(
+                    &mut new,
+                    self.ttl_default_seconds,
+                    self.ttl_field_pair(),
+                )?;
+                if let Some(object) = new.as_object() {
+                    crate::columnar::replace_by_id(wtxn, self.env, &self.name, id, object)?;
+                }
+                self.set_ttl(wtxn, id, ttl_at)?;
                 self.validate_unique(&*wtxn, &new, id)?;
                 self.apply_all_index_entries(wtxn, None, Some(&new), id)?;
                 self.apply_graph_entries(wtxn, None, Some(&new))?;
@@ -7852,6 +7911,35 @@ impl<'e> Collection<'e> {
         };
         if current != expected_ttl_at {
             return Ok(None);
+        }
+        if self.profile.is_columnar() {
+            let Some(old) = crate::columnar::find_by_id(&*wtxn, self.env, &self.name, id)? else {
+                self.set_ttl(wtxn, id, None)?;
+                return Ok(None);
+            };
+            if crate::columnar::delete(
+                wtxn,
+                self.env,
+                &self.name,
+                &serde_json::json!({"_id": id}),
+                false,
+            )? == 0
+            {
+                self.set_ttl(wtxn, id, None)?;
+                return Ok(None);
+            }
+            self.apply_index_entries(wtxn, Some(&old), None, id)?;
+            self.apply_graph_entries(wtxn, Some(&old), None)?;
+            self.apply_text_entries(wtxn, Some(&old), None, id)?;
+            self.apply_fuzzy_entries(wtxn, Some(&old), None, id)?;
+            self.apply_vector_entries(wtxn, Some(&old), None, id)?;
+            self.set_ttl(wtxn, id, None)?;
+            if self.ttl_purge_history {
+                history::purge(&self.history, wtxn, &self.name, id)?;
+            } else {
+                self.record_history(wtxn, id, "delete", None)?;
+            }
+            return Ok(Some(old));
         }
         let Some(raw) = self.db.get(&*wtxn, id.as_bytes())? else {
             self.set_ttl(wtxn, id, None)?;
