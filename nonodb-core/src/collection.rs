@@ -1326,6 +1326,9 @@ impl<'e> Collection<'e> {
             let settings = self.timeseries_settings_in(txn)?.unwrap_or_default();
             return crate::timeseries::find_by_id(txn, self.env, &self.name, &settings, id);
         }
+        if self.profile.is_columnar() {
+            return crate::columnar::find_by_id(txn, self.env, &self.name, id);
+        }
         self.db.get(txn, id.as_bytes())?.map(parse_json).transpose()
     }
 
@@ -3022,7 +3025,7 @@ impl<'e> Collection<'e> {
 
         let db = self.vector_db_in(wtxn, field)?;
         db.clear(&mut *wtxn)?;
-        if self.profile.is_timeseries() {
+        if self.profile.is_timeseries() || self.profile.is_columnar() {
             for (id, doc) in self.documents_for_backfill(&*wtxn)? {
                 let Some(vector) =
                     index::field_value(&doc, field).and_then(|v| vector::parse_vector(v, dims))
@@ -6957,7 +6960,7 @@ impl<'e> Collection<'e> {
         }
         edge.clear_graph_adjacency_txn(wtxn, &def)?;
         edge.rebuild_graph_adjacency_txn(wtxn, &def)?;
-        Ok(edge.db.iter(&*wtxn)?.filter_map(|item| item.ok()).count())
+        Ok(edge.documents_for_backfill(&*wtxn)?.len())
     }
 
     /// Starts an online adjacency rebuild. Readers keep using the active
@@ -7125,15 +7128,33 @@ impl<'e> Collection<'e> {
         let incoming =
             self.graph_adjacency_db_in(&mut *wtxn, GraphDirection::In, state.target_generation)?;
         let mut docs = Vec::with_capacity(limit);
-        let range = match state.after.as_deref() {
-            Some(after) => (Bound::Excluded(after.as_bytes()), Bound::Unbounded),
-            None => (Bound::Unbounded, Bound::Unbounded),
-        };
-        for item in self.db.range(&*wtxn, &range)? {
-            let (id, raw) = item?;
-            docs.push((String::from_utf8_lossy(id).into_owned(), raw.to_vec()));
-            if docs.len() >= limit {
-                break;
+        if self.profile.is_columnar() {
+            let mut all = self.documents_for_backfill(&*wtxn)?;
+            all.sort_by(|a, b| a.0.cmp(&b.0));
+            for (id, doc) in all {
+                if state
+                    .after
+                    .as_deref()
+                    .is_some_and(|after| id.as_str() <= after)
+                {
+                    continue;
+                }
+                docs.push((id, serde_json::to_vec(&doc)?));
+                if docs.len() >= limit {
+                    break;
+                }
+            }
+        } else {
+            let range = match state.after.as_deref() {
+                Some(after) => (Bound::Excluded(after.as_bytes()), Bound::Unbounded),
+                None => (Bound::Unbounded, Bound::Unbounded),
+            };
+            for item in self.db.range(&*wtxn, &range)? {
+                let (id, raw) = item?;
+                docs.push((String::from_utf8_lossy(id).into_owned(), raw.to_vec()));
+                if docs.len() >= limit {
+                    break;
+                }
             }
         }
         let done_scan = docs.len() < limit;
@@ -12218,30 +12239,20 @@ impl<'a, 't> GraphViewImpl<'a, 't> {
 
 impl GraphView for GraphViewImpl<'_, '_> {
     fn node(&self, id: &str) -> Result<Option<Value>> {
-        self.node
-            .db
-            .get(self.txn, id.as_bytes())?
-            .map(parse_json)
-            .transpose()
+        self.node.document_in(self.txn, id)
     }
 
     fn edge(&self, id: &str) -> Result<Option<Value>> {
-        self.edge
-            .db
-            .get(self.txn, id.as_bytes())?
-            .map(parse_json)
-            .transpose()
+        self.edge.document_in(self.txn, id)
     }
 
     fn node_ids(&self) -> Result<Vec<String>> {
-        let mut ids = Vec::new();
-        for item in self.node.db.iter(self.txn)? {
-            let (key, _) = item?;
-            if let Ok(id) = std::str::from_utf8(key) {
-                ids.push(id.to_string());
-            }
-        }
-        Ok(ids)
+        Ok(self
+            .node
+            .documents_for_backfill(self.txn)?
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect())
     }
 
     fn neighbors(
