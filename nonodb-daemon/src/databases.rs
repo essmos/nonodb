@@ -15,6 +15,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use nonodb_core::Store;
 use tokio::sync::{Mutex as AsyncMutex, RwLock};
 
+use crate::analytics::AnalyticsManager;
 use crate::auto_index::AutoIndexer;
 use crate::cache::QueryCache;
 use crate::protocol::ApiError;
@@ -45,6 +46,7 @@ pub struct DatabaseRuntime {
     pub cache: Arc<QueryCache>,
     pub auto_index: Arc<AutoIndexer>,
     pub quota: Arc<Quota>,
+    pub analytics: Arc<AnalyticsManager>,
     stop: Arc<AtomicBool>,
     writer: Mutex<Option<std::thread::JoinHandle<()>>>,
     maintenance: Mutex<Option<std::thread::JoinHandle<()>>>,
@@ -67,6 +69,7 @@ impl DatabaseRuntime {
 impl Drop for DatabaseRuntime {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        self.analytics.shutdown();
         if let Some(handle) = self.maintenance.lock().expect("maintenance lock").take() {
             let _ = handle.join();
         }
@@ -641,6 +644,7 @@ fn start_runtime(root: &Path, name: &str) -> Result<DatabaseRuntime, String> {
             )
         })
         .map_err(|e| format!("start writer for `{name}`: {e}"))?;
+    let analytics = AnalyticsManager::new(name, stop.clone(), write_tx.clone());
     let auto_index = AutoIndexer::start(store.clone(), write_tx.clone(), &path);
     let maintenance = crate::maintenance::start(
         store.clone(),
@@ -670,6 +674,7 @@ fn start_runtime(root: &Path, name: &str) -> Result<DatabaseRuntime, String> {
         cache,
         auto_index,
         quota,
+        analytics,
         stop,
         writer: Mutex::new(Some(writer)),
         maintenance: Mutex::new(Some(maintenance)),

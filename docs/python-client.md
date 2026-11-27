@@ -850,6 +850,10 @@ seeded = nodes.traverse(
 # BFS by hops, or Dijkstra with the configured weight field.
 path = nodes.shortest_path("alice", "carol")
 weighted = nodes.shortest_path("alice", "carol", weighted=True)
+rows = nodes.cypher(
+    "MATCH (n:Person) WHERE n.age > $age RETURN n.name AS name ORDER BY name",
+    params={"age": 20},
+)
 paths = nodes.all_shortest_paths("alice", "carol", limit_paths=10)
 matches = nodes.graph_match(
     "alice",
@@ -858,6 +862,18 @@ matches = nodes.graph_match(
 ranked = nodes.pagerank(limit=20)
 degrees = nodes.degree_centrality(limit=20)
 components = nodes.connected_components()
+communities = nodes.label_propagation(iterations=5)
+cores = nodes.k_core()
+histogram = nodes.degree_distribution()
+
+# Long analytics run in the background and can be cancelled.
+job = nodes.start_graph_job("pagerank", max_nodes=100_000, iterations=20)
+status = nodes.graph_job_status(job["job_id"])
+if status["state"] == "running":
+    nodes.cancel_graph_job(job["job_id"])
+# After completion: read or atomically export the result.
+result = nodes.graph_job_result(job["job_id"])
+nodes.export_graph_job(job["job_id"], "pagerank_results")
 
 # Adjacency is derived data and can always be rebuilt.
 nodes.reindex_graph()

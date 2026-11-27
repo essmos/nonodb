@@ -70,7 +70,7 @@ mount. Do not put the data only in an unencrypted container layer:
 ```yaml
 services:
   nonodb:
-    image: ghcr.io/essmos/nonodb:0.32.0
+    image: ghcr.io/essmos/nonodb:0.33.0
     volumes:
       - /var/lib/nonodb:/var/lib/nonodb
 ```

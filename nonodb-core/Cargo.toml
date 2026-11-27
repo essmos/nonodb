@@ -27,6 +27,7 @@ bigdecimal = "0.4.11"
 regex = "1"
 sha2 = "0.10"
 age = "0.11"
+cypher-rs-zk = "1.1.0"
 
 [dev-dependencies]
 tempfile = "3"

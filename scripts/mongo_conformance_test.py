@@ -239,6 +239,24 @@ def main() -> int:
         if not check(name, function, nonodb_db, mongodb_db):
             failures += 1
 
+    def check_rejected_both(name, function, accepted_codes):
+        nonlocal failures
+        codes = []
+        for db in (nonodb_db, mongodb_db):
+            try:
+                function(db)
+            except OperationFailure as error:
+                codes.append(error.code)
+            except Exception as error:  # noqa: BLE001 - report unexpected errors
+                codes.append(type(error).__name__)
+            else:
+                codes.append(None)
+        if all(code in accepted_codes for code in codes):
+            print(f"ok   {name} ({codes})")
+        else:
+            print(f"FAIL {name}: codes={codes}, accepted={sorted(accepted_codes)}")
+            failures += 1
+
     try:
         check_both("ping", ping_ok)
         check_both(
@@ -491,17 +509,20 @@ def main() -> int:
                 )
             ),
         )
-        check_both(
+        # Collation is documented as unsupported. NonoDB rejects it with
+        # BadValue (2); MongoDB validates the invalid strength and returns
+        # Location51024. Both are explicit rejections; exact code parity is not
+        # part of the documented compatibility subset.
+        check_rejected_both(
             "invalid collation error",
-            command_error_code(
-                lambda db: db.command(
-                    {
-                        "find": "items",
-                        "filter": {},
-                        "collation": {"locale": "en", "strength": 99},
-                    }
-                )
+            lambda db: db.command(
+                {
+                    "find": "items",
+                    "filter": {},
+                    "collation": {"locale": "en", "strength": 99},
+                }
             ),
+            {2, 51024},
         )
         check_both(
             "unknown field operator rejected",

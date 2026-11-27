@@ -15,14 +15,15 @@ use sha2::{Digest, Sha256};
 
 use crate::aggregate;
 use crate::bson_types;
+use crate::cypher::CypherOptions;
 use crate::date;
 use crate::error::{Error, Result};
 use crate::events::{self, EventConfig, EVENTS_COLLECTION};
 use crate::geo;
 use crate::graph::{
-    self, AdjEdge, AllShortestPathsOptions, GraphAlgorithmOptions, GraphDef, GraphDirection,
-    GraphMatchOptions, GraphRebuildState, GraphView, HybridOptions, NeighborsOptions,
-    ShortestPathOptions, TraverseOptions,
+    self, AdjEdge, AllShortestPathsOptions, GraphAlgorithmObserver, GraphAlgorithmOptions,
+    GraphDef, GraphDirection, GraphMatchOptions, GraphRebuildState, GraphView, HybridOptions,
+    NeighborsOptions, ShortestPathOptions, TraverseOptions,
 };
 use crate::history::{self, HistoryEntry};
 use crate::id;
@@ -657,6 +658,10 @@ pub struct IndexSpec {
     #[serde(default)]
     pub geo: bool,
 }
+
+#[cfg(test)]
+static GRAPH_LOOKUP_FAST_PATH_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 pub struct Collection<'e> {
     store: Option<&'e crate::store::Store>,
@@ -4701,6 +4706,93 @@ impl<'e> Collection<'e> {
         Ok(())
     }
 
+    /// Applies deletions for many documents while writing each text manifest
+    /// once. Bulk deletes otherwise reserialize a growing tombstone map for
+    /// every document, which is quadratic for large collections.
+    fn apply_text_deletes(&self, wtxn: &mut RwTxn<'_>, docs: &[(String, Value)]) -> Result<()> {
+        if docs.is_empty() {
+            return Ok(());
+        }
+        for def in self.search_index_defs_in(&*wtxn)? {
+            if def.kind != SearchKind::Text {
+                continue;
+            }
+            let mut manifest = self
+                .segment_manifest_in(&*wtxn, &def.name)?
+                .unwrap_or_default();
+            let prefix = self.segment_delta_prefix(&def.name);
+            let mut count = self.segment_delta_count(&*wtxn, &def.name);
+            let mut manifest_changed = false;
+            for field in &def.fields {
+                for (id, old) in docs {
+                    let Some(old_text) =
+                        index::field_value(old, &field.path).and_then(search::field_text)
+                    else {
+                        continue;
+                    };
+                    manifest
+                        .tombstones
+                        .insert(id.clone(), manifest.segments.len());
+                    manifest_changed = true;
+                    let key = format!("{prefix}{id}");
+                    if self.meta.get(&*wtxn, key.as_bytes())?.is_some() {
+                        self.meta.delete(&mut *wtxn, key.as_bytes())?;
+                        count = count.saturating_sub(1);
+                    }
+                    self.adjust_segment_stats(wtxn, &def, Some(&old_text), None)?;
+                }
+            }
+            if manifest_changed {
+                self.put_segment_manifest(wtxn, &def.name, &manifest)?;
+            }
+            self.set_segment_delta_count(wtxn, &def.name, count)?;
+        }
+        Ok(())
+    }
+
+    /// Applies fuzzy-index deletions for many documents with one manifest
+    /// write, mirroring [`Self::apply_text_deletes`].
+    fn apply_fuzzy_deletes(&self, wtxn: &mut RwTxn<'_>, docs: &[(String, Value)]) -> Result<()> {
+        if docs.is_empty() {
+            return Ok(());
+        }
+        for def in self.search_index_defs_in(&*wtxn)? {
+            if def.kind != SearchKind::Fuzzy {
+                continue;
+            }
+            let mut manifest = self
+                .fuzzy_segment_manifest_in(&*wtxn, &def.name)?
+                .unwrap_or_default();
+            let prefix = self.fuzzy_segment_delta_prefix(&def.name);
+            let mut count = self.fuzzy_segment_delta_count(&*wtxn, &def.name);
+            let mut manifest_changed = false;
+            for field in &def.fields {
+                for (id, old) in docs {
+                    let Some(_old_text) = index::field_value(old, &field.path)
+                        .and_then(search::field_text)
+                        .map(|text| search::normalize(&text))
+                    else {
+                        continue;
+                    };
+                    manifest
+                        .tombstones
+                        .insert(id.clone(), manifest.segments.len());
+                    manifest_changed = true;
+                    let key = format!("{prefix}{id}");
+                    if self.meta.get(&*wtxn, key.as_bytes())?.is_some() {
+                        self.meta.delete(&mut *wtxn, key.as_bytes())?;
+                        count = count.saturating_sub(1);
+                    }
+                }
+            }
+            if manifest_changed {
+                self.put_fuzzy_segment_manifest(wtxn, &def.name, &manifest)?;
+            }
+            self.set_fuzzy_segment_delta_count(wtxn, &def.name, count)?;
+        }
+        Ok(())
+    }
+
     fn apply_segment_fuzzy_entry(
         &self,
         wtxn: &mut RwTxn<'_>,
@@ -6208,6 +6300,7 @@ impl<'e> Collection<'e> {
         }
         self.ensure_standard()?;
         let keys = self.matching_keys(&*wtxn, filter, multi)?;
+        let mut deleted_docs = Vec::with_capacity(keys.len());
         for key in &keys {
             let id = std::str::from_utf8(key)
                 .map_err(|e| Error::Query(e.to_string()))?
@@ -6221,12 +6314,13 @@ impl<'e> Collection<'e> {
             self.db.delete(&mut *wtxn, key.as_slice())?;
             self.apply_index_entries(wtxn, Some(&old), None, &id)?;
             self.apply_graph_entries(wtxn, Some(&old), None)?;
-            self.apply_text_entries(wtxn, Some(&old), None, &id)?;
-            self.apply_fuzzy_entries(wtxn, Some(&old), None, &id)?;
             self.apply_vector_entries(wtxn, Some(&old), None, &id)?;
             self.set_ttl(wtxn, &id, None)?;
             self.record_history(wtxn, &id, "delete", None)?;
+            deleted_docs.push((id, old));
         }
+        self.apply_text_deletes(wtxn, &deleted_docs)?;
+        self.apply_fuzzy_deletes(wtxn, &deleted_docs)?;
         Ok(keys.len())
     }
 
@@ -6282,7 +6376,7 @@ impl<'e> Collection<'e> {
         Ok(state)
     }
 
-    fn set_graph_rebuild_state_in(
+    pub(crate) fn set_graph_rebuild_state_in(
         &self,
         wtxn: &mut RwTxn<'_>,
         state: Option<&GraphRebuildState>,
@@ -6303,7 +6397,7 @@ impl<'e> Collection<'e> {
         Ok(())
     }
 
-    fn edge_graph_def_in(&self, txn: &RoTxn<'_>) -> Result<Option<GraphDef>> {
+    pub(crate) fn edge_graph_def_in(&self, txn: &RoTxn<'_>) -> Result<Option<GraphDef>> {
         let key = graph::edge_def_key(&self.name);
         let Some(raw) = self.meta.get(txn, key.as_bytes())? else {
             return Ok(None);
@@ -6331,6 +6425,7 @@ impl<'e> Collection<'e> {
     }
 
     pub fn set_graph_txn(&self, wtxn: &mut RwTxn<'_>, def: &GraphDef) -> Result<()> {
+        def.validate()?;
         if self.profile.is_vault() {
             return Err(Error::Query(
                 "graph operations are not supported on vault collections".into(),
@@ -6428,7 +6523,11 @@ impl<'e> Collection<'e> {
         Ok(true)
     }
 
-    fn clear_graph_adjacency_txn(&self, wtxn: &mut RwTxn<'_>, def: &GraphDef) -> Result<()> {
+    pub(crate) fn clear_graph_adjacency_txn(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        def: &GraphDef,
+    ) -> Result<()> {
         for generation in 0..=def.generation.saturating_add(1) {
             for direction in [GraphDirection::Out, GraphDirection::In] {
                 let resource =
@@ -6535,6 +6634,12 @@ impl<'e> Collection<'e> {
             return Err(Error::Query("graph rebuild is already running".into()));
         }
         let target = def.generation.saturating_add(1);
+        if target > graph::MAX_GRAPH_GENERATION {
+            return Err(Error::Query(format!(
+                "graph rebuild would exceed the maximum generation {}",
+                graph::MAX_GRAPH_GENERATION
+            )));
+        }
         for direction in [GraphDirection::Out, GraphDirection::In] {
             let resource = graph::adjacency_resource_gen(&edge.name, direction, target);
             edge.drop_resource_db(&mut *wtxn, &resource, &resource)?;
@@ -6649,6 +6754,12 @@ impl<'e> Collection<'e> {
                 "graph rebuild target generation is stale".into(),
             ));
         }
+        if state.target_generation > graph::MAX_GRAPH_GENERATION {
+            return Err(Error::Query(format!(
+                "graph rebuild target exceeds the maximum generation {}",
+                graph::MAX_GRAPH_GENERATION
+            )));
+        }
         let out =
             self.graph_adjacency_db_in(&mut *wtxn, GraphDirection::Out, state.target_generation)?;
         let incoming =
@@ -6692,6 +6803,7 @@ impl<'e> Collection<'e> {
         // the old generations in the same transaction.
         let mut new_def = def.clone();
         new_def.generation = state.target_generation;
+        new_def.validate()?;
         let raw_def = serde_json::to_vec(&new_def)?;
         node.meta.put(
             &mut *wtxn,
@@ -6785,6 +6897,26 @@ impl<'e> Collection<'e> {
         Ok(out)
     }
 
+    pub fn graph_cypher(&self, options: CypherOptions) -> Result<Value> {
+        if self.profile.is_vault() {
+            return Err(Error::Query(
+                "graph operations are not supported on vault collections".into(),
+            ));
+        }
+        options.validate()?;
+        let rtxn = self.read_txn()?;
+        let def = self
+            .graph_def_in(&rtxn)?
+            .ok_or_else(|| Error::Query("graph is not configured for this collection".into()))?;
+        let store = self.store.ok_or_else(|| {
+            Error::Query("graph traversal requires a store-backed collection".into())
+        })?;
+        let view = GraphViewImpl::new(store, &rtxn, def)?;
+        let out = crate::cypher::execute(&view, &options)?;
+        rtxn.commit()?;
+        Ok(out)
+    }
+
     pub fn graph_all_shortest_paths(&self, options: AllShortestPathsOptions) -> Result<Value> {
         if self.profile.is_vault() {
             return Err(Error::Query(
@@ -6826,6 +6958,14 @@ impl<'e> Collection<'e> {
     }
 
     pub fn graph_algorithm(&self, options: GraphAlgorithmOptions) -> Result<Value> {
+        self.graph_algorithm_with_observer(options, None)
+    }
+
+    pub fn graph_algorithm_with_observer(
+        &self,
+        options: GraphAlgorithmOptions,
+        observer: Option<&dyn GraphAlgorithmObserver>,
+    ) -> Result<Value> {
         if self.profile.is_vault() {
             return Err(Error::Query(
                 "graph operations are not supported on vault collections".into(),
@@ -6840,7 +6980,7 @@ impl<'e> Collection<'e> {
             Error::Query("graph traversal requires a store-backed collection".into())
         })?;
         let view = GraphViewImpl::new(store, &rtxn, def)?;
-        let out = graph::graph_algorithm(&view, &options)?;
+        let out = graph::graph_algorithm_with_observer(&view, &options, observer)?;
         rtxn.commit()?;
         Ok(out)
     }
@@ -8675,7 +8815,7 @@ impl<'e> Collection<'e> {
         };
         let max_docs = aggregate::max_docs();
         if restrict.is_none() {
-            let fast_def = match foreign.get_graph_in(rtxn)? {
+            let fast_def = match foreign.edge_graph_def_in(rtxn)? {
                 Some(def)
                     if def.node_collection == self.name
                         && def.edge_collection == foreign.name
@@ -8784,6 +8924,8 @@ impl<'e> Collection<'e> {
         depth_field: Option<&str>,
         vars: &BTreeMap<String, Value>,
     ) -> Result<Option<Vec<Value>>> {
+        #[cfg(test)]
+        GRAPH_LOOKUP_FAST_PATH_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let Some(store) = self.store else {
             return Ok(None);
         };
@@ -14884,6 +15026,39 @@ mod tests {
     }
 
     #[test]
+    fn bulk_delete_batches_text_and_fuzzy_tombstones() {
+        let (_dir, store) = store();
+        let c = store.collection("bulk_delete_search").unwrap();
+        for i in 0..1000 {
+            c.insert_one(json!({
+                "_id": format!("d{i:04}"),
+                "body": "rust database search",
+                "name": format!("City{i:04}"),
+            }))
+            .unwrap();
+        }
+        c.create_text_segment_index("body").unwrap();
+        c.create_fuzzy_segment_index("name").unwrap();
+
+        assert_eq!(c.delete(&json!({}), true).unwrap(), 1000);
+        assert_eq!(c.count(&json!({})).unwrap(), 0);
+        assert!(c
+            .search("body", "rust", &json!({}), 0, Some(10))
+            .unwrap()
+            .is_empty());
+        assert!(c
+            .fuzzy_search("name", "city0500", 0, &json!({}), Some(10))
+            .unwrap()
+            .is_empty());
+
+        let rtxn = store.env().read_txn().unwrap();
+        let text = c.segment_manifest_in(&rtxn, "body").unwrap().unwrap();
+        let fuzzy = c.fuzzy_segment_manifest_in(&rtxn, "name").unwrap().unwrap();
+        assert_eq!(text.tombstones.len(), 1000);
+        assert_eq!(fuzzy.tombstones.len(), 1000);
+    }
+
+    #[test]
     fn create_indexes_batch_builds_all_indexes_in_one_pass() {
         let (_dir, store) = store();
         let c = store.collection("batch_indexes").unwrap();
@@ -15698,6 +15873,62 @@ mod tests {
         assert!(primary
             .aggregate(&[json!({"$unionWith": {"coll": "union_archive", "pipeline": 1}})])
             .is_err());
+    }
+
+    #[test]
+    fn online_rebuild_rejects_generation_overflow() {
+        let (_dir, store) = store();
+        store
+            .create_collection("nodes", crate::vault::CollectionProfile::Standard)
+            .unwrap();
+        store
+            .create_collection("edges", crate::vault::CollectionProfile::Standard)
+            .unwrap();
+        let nodes = store.collection("nodes").unwrap();
+        let def: crate::graph::GraphDef = serde_json::from_value(json!({
+            "node_collection": "nodes",
+            "edge_collection": "edges",
+            "generation": crate::graph::MAX_GRAPH_GENERATION
+        }))
+        .unwrap();
+        nodes.set_graph(def).unwrap();
+        let error = nodes.start_graph_rebuild().unwrap_err().to_string();
+        assert!(error.contains("maximum generation"), "{error}");
+    }
+
+    #[test]
+    fn graph_lookup_uses_adjacency_fast_path() {
+        let (_dir, store) = store();
+        let nodes = store.collection("nodes").unwrap();
+        let edges = store.collection("edges").unwrap();
+        for id in ["n1", "n2", "n3"] {
+            nodes.insert_one(json!({"_id": id})).unwrap();
+        }
+        let def: GraphDef = serde_json::from_value(json!({
+            "node_collection": "nodes",
+            "edge_collection": "edges"
+        }))
+        .unwrap();
+        nodes.set_graph(def).unwrap();
+        edges
+            .insert_one(json!({"_id": "e1", "from": "n1", "to": "n2"}))
+            .unwrap();
+        edges
+            .insert_one(json!({"_id": "e2", "from": "n2", "to": "n3"}))
+            .unwrap();
+        super::GRAPH_LOOKUP_FAST_PATH_HITS.store(0, std::sync::atomic::Ordering::Relaxed);
+        let out = nodes
+            .aggregate(&[json!({"$graphLookup": {
+                "from": "edges",
+                "startWith": "n3",
+                "connectFromField": "from",
+                "connectToField": "to",
+                "as": "chain",
+                "maxDepth": 2
+            }})])
+            .unwrap();
+        assert!(super::GRAPH_LOOKUP_FAST_PATH_HITS.load(std::sync::atomic::Ordering::Relaxed) > 0);
+        assert_eq!(out[0]["chain"].as_array().unwrap().len(), 2);
     }
 
     #[test]

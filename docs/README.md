@@ -35,6 +35,7 @@ quick-start instructions, and a feature overview.
 | [Search and Atlas compatibility](search.md) | Application developers | Unified `search_all`, BM25, fuzzy, vector, hybrid RRF, and Atlas migration |
 | [Graph traversal](graph.md) | Application developers | Nodes and edges as documents, adjacency index, BFS/DFS, shortest/all-shortest paths, pattern matching, PageRank/degree/components, filters, hybrid search, online rebuild, GUI tree, limits |
 | [Graph benchmark](graph-benchmark.md) | Evaluators, maintainers | NonoDB vs Neo4j Community: dataset, methodology, results, caveats, reproduction |
+| [Read-only Cypher](cypher.md) | Application developers, evaluators | Cypher API, supported clauses, GDS procedures, limits, pinned TCK baseline |
 | [Streaming outbox events](streams.md) | Application developers | Long-poll `watch`, NDJSON/SSE streams, resume tokens, filters, truncation, Python/Rust/Node.js/Go examples |
 | [Asynchronous webhooks](webhooks.md) | Application developers, operators | Webhook rules, async filters and count/sum/avg thresholds, retries, HMAC, dead-letter, GUI |
 | [CLI](cli.md) | Operators | Administration, map resize, backup verification, restore drills, inspect, raw requests |

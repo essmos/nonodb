@@ -12,6 +12,7 @@
 
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -29,6 +30,19 @@ pub const EDGE_DEF_PREFIX: &str = "graph_edge:";
 
 /// Maximum accepted traversal depth.
 pub const MAX_GRAPH_DEPTH: usize = 64;
+/// Maximum accepted node budget for graph operations.
+pub const MAX_GRAPH_NODES: usize = 100_000;
+/// Maximum accepted edge/adjacency budget for graph operations.
+pub const MAX_GRAPH_EDGES: usize = 100_000;
+/// Maximum accepted serialized result budget (256 MiB).
+pub const MAX_GRAPH_BYTES: usize = 256 * 1024 * 1024;
+/// Maximum number of labels/types accepted by one graph request.
+pub const MAX_GRAPH_LABELS: usize = 64;
+/// Maximum byte length of one label/type.
+pub const MAX_GRAPH_LABEL_LEN: usize = 256;
+/// Maximum accepted adjacency generation; rebuilds stop with an explicit error
+/// once this is exceeded.
+pub const MAX_GRAPH_GENERATION: u64 = 1_024;
 /// Default traversal depth.
 pub const DEFAULT_GRAPH_DEPTH: usize = 3;
 /// Default node budget.
@@ -37,6 +51,18 @@ pub const DEFAULT_GRAPH_NODES: usize = 1000;
 pub const DEFAULT_GRAPH_EDGES: usize = 10_000;
 /// Default serialized result budget (64 MiB), matching lookup.
 pub const DEFAULT_GRAPH_BYTES: usize = 64 * 1024 * 1024;
+/// Hard limit for one graph algorithm run.
+pub const MAX_ALGORITHM_NODES: usize = 1_000_000;
+/// Hard limit for adjacency entries inspected by one graph algorithm run.
+pub const MAX_ALGORITHM_EDGES: usize = 10_000_000;
+/// Hard limit for graph algorithm working memory (1 GiB).
+pub const MAX_ALGORITHM_MEMORY: usize = 1024 * 1024 * 1024;
+/// Default graph algorithm node budget.
+pub const DEFAULT_ALGORITHM_NODES: usize = 100_000;
+/// Default graph algorithm adjacency-entry budget.
+pub const DEFAULT_ALGORITHM_EDGES: usize = 1_000_000;
+/// Default graph algorithm working-memory budget (256 MiB).
+pub const DEFAULT_ALGORITHM_MEMORY: usize = 256 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GraphDef {
@@ -108,6 +134,11 @@ impl GraphDef {
             return Err(Error::Query(
                 "graph `from_field` and `to_field` must differ".into(),
             ));
+        }
+        if self.generation > MAX_GRAPH_GENERATION {
+            return Err(Error::Query(format!(
+                "graph generation must be at most {MAX_GRAPH_GENERATION}"
+            )));
         }
         Ok(())
     }
@@ -199,6 +230,22 @@ fn default_bytes() -> usize {
     DEFAULT_GRAPH_BYTES
 }
 
+fn validate_graph_labels(labels: &[String]) -> Result<()> {
+    if labels.len() > MAX_GRAPH_LABELS {
+        return Err(Error::Query(format!(
+            "graph labels must contain at most {MAX_GRAPH_LABELS} entries"
+        )));
+    }
+    for label in labels {
+        if label.is_empty() || label.len() > MAX_GRAPH_LABEL_LEN || label.contains('\0') {
+            return Err(Error::Query(format!(
+                "graph label must be 1..={MAX_GRAPH_LABEL_LEN} bytes"
+            )));
+        }
+    }
+    Ok(())
+}
+
 impl TraverseOptions {
     pub fn validate(&self) -> Result<()> {
         if self.start.is_empty() && self.seed.is_none() {
@@ -214,11 +261,18 @@ impl TraverseOptions {
                 "traverse `max_depth` must be at most {MAX_GRAPH_DEPTH}"
             )));
         }
-        if self.limit_nodes == 0 || self.limit_edges == 0 || self.max_bytes == 0 {
-            return Err(Error::Query(
-                "traverse limits must be greater than zero".into(),
-            ));
+        if self.limit_nodes == 0
+            || self.limit_nodes > MAX_GRAPH_NODES
+            || self.limit_edges == 0
+            || self.limit_edges > MAX_GRAPH_EDGES
+            || self.max_bytes == 0
+            || self.max_bytes > MAX_GRAPH_BYTES
+        {
+            return Err(Error::Query(format!(
+                "traverse limits must be between 1 and ({MAX_GRAPH_NODES} nodes, {MAX_GRAPH_EDGES} edges, {MAX_GRAPH_BYTES} bytes)"
+            )));
         }
+        validate_graph_labels(&self.labels)?;
         if let Some(filter) = &self.edge_filter {
             validate_filter(filter)?;
         }
@@ -273,11 +327,12 @@ impl ShortestPathOptions {
                 "shortest_path `max_depth` must be at most {MAX_GRAPH_DEPTH}"
             )));
         }
-        if self.limit_nodes == 0 {
-            return Err(Error::Query(
-                "shortest_path `limit_nodes` must be greater than zero".into(),
-            ));
+        if self.limit_nodes == 0 || self.limit_nodes > MAX_GRAPH_NODES {
+            return Err(Error::Query(format!(
+                "shortest_path `limit_nodes` must be between 1 and {MAX_GRAPH_NODES}"
+            )));
         }
+        validate_graph_labels(&self.labels)?;
         if let Some(filter) = &self.edge_filter {
             validate_filter(filter)?;
         }
@@ -315,6 +370,7 @@ fn default_neighbors_limit() -> usize {
 
 impl NeighborsOptions {
     pub fn validate(&self) -> Result<()> {
+        validate_graph_labels(&self.labels)?;
         if self.limit == 0 || self.limit > DEFAULT_GRAPH_EDGES {
             return Err(Error::Query(format!(
                 "neighbors `limit` must be between 1 and {DEFAULT_GRAPH_EDGES}"
@@ -375,6 +431,7 @@ fn default_graph_weight() -> f64 {
 
 impl HybridOptions {
     pub fn validate(&self) -> Result<()> {
+        validate_graph_labels(&self.labels)?;
         if self.vector.k == 0 || self.vector.k > 1000 {
             return Err(Error::Query("hybrid `k` must be between 1 and 1000".into()));
         }
@@ -465,6 +522,7 @@ fn default_algo_nodes() -> usize {
 
 impl AllShortestPathsOptions {
     pub fn validate(&self) -> Result<()> {
+        validate_graph_labels(&self.labels)?;
         if self.max_depth > MAX_GRAPH_DEPTH {
             return Err(Error::Query(format!(
                 "all_shortest_paths `max_depth` must be at most {MAX_GRAPH_DEPTH}"
@@ -564,6 +622,7 @@ impl GraphMatchOptions {
             ));
         }
         for step in &self.pattern {
+            validate_graph_labels(&step.labels)?;
             if step.min_hops > step.max_hops {
                 return Err(Error::Query(
                     "graph_match step `min_hops` must not exceed `max_hops`".into(),
@@ -594,6 +653,9 @@ pub enum GraphAlgorithmKind {
     Pagerank,
     DegreeCentrality,
     ConnectedComponents,
+    LabelPropagation,
+    KCore,
+    DegreeDistribution,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -611,8 +673,12 @@ pub struct GraphAlgorithmOptions {
     pub as_of: Option<Value>,
     #[serde(default = "default_match_limit")]
     pub limit: usize,
-    #[serde(default = "default_algo_nodes")]
+    #[serde(default = "default_algorithm_nodes")]
     pub max_nodes: usize,
+    #[serde(default = "default_algorithm_edges")]
+    pub max_edges: usize,
+    #[serde(default = "default_algorithm_memory")]
+    pub max_memory_bytes: usize,
     #[serde(default = "default_damping")]
     pub damping: f64,
     #[serde(default = "default_iterations")]
@@ -621,8 +687,19 @@ pub struct GraphAlgorithmOptions {
     pub tolerance: f64,
     #[serde(default)]
     pub projection: Option<Value>,
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
 }
 
+fn default_algorithm_nodes() -> usize {
+    DEFAULT_ALGORITHM_NODES
+}
+fn default_algorithm_edges() -> usize {
+    DEFAULT_ALGORITHM_EDGES
+}
+fn default_algorithm_memory() -> usize {
+    DEFAULT_ALGORITHM_MEMORY
+}
 fn default_damping() -> f64 {
     0.85
 }
@@ -635,14 +712,30 @@ fn default_tolerance() -> f64 {
 
 impl GraphAlgorithmOptions {
     pub fn validate(&self) -> Result<()> {
-        if self.limit == 0 || self.limit > DEFAULT_GRAPH_NODES {
+        validate_graph_labels(&self.labels)?;
+        if self.limit == 0 || self.limit > MAX_ALGORITHM_NODES {
             return Err(Error::Query(format!(
-                "graph algorithm `limit` must be between 1 and {DEFAULT_GRAPH_NODES}"
+                "graph algorithm `limit` must be between 1 and {MAX_ALGORITHM_NODES}"
             )));
         }
-        if self.max_nodes == 0 || self.max_nodes > 100_000 {
+        if self.max_nodes == 0 || self.max_nodes > MAX_ALGORITHM_NODES {
+            return Err(Error::Query(format!(
+                "graph algorithm `max_nodes` must be between 1 and {MAX_ALGORITHM_NODES}"
+            )));
+        }
+        if self.max_edges == 0 || self.max_edges > MAX_ALGORITHM_EDGES {
+            return Err(Error::Query(format!(
+                "graph algorithm `max_edges` must be between 1 and {MAX_ALGORITHM_EDGES}"
+            )));
+        }
+        if self.max_memory_bytes == 0 || self.max_memory_bytes > MAX_ALGORITHM_MEMORY {
+            return Err(Error::Query(format!(
+                "graph algorithm `max_memory_bytes` must be between 1 and {MAX_ALGORITHM_MEMORY}"
+            )));
+        }
+        if self.timeout_ms == Some(0) {
             return Err(Error::Query(
-                "graph algorithm `max_nodes` must be between 1 and 100000".into(),
+                "graph algorithm `timeout_ms` must be positive".into(),
             ));
         }
         if !self.damping.is_finite() || !(0.0..1.0).contains(&self.damping) {
@@ -2218,28 +2311,108 @@ pub fn hybrid(
     }))
 }
 
+/// Receives bounded progress updates and cooperative cancellation checks for a
+/// graph algorithm run. Implementations must be cheap and non-blocking.
+pub trait GraphAlgorithmObserver {
+    fn progress(&self, phase: &str, done: usize, total: Option<usize>);
+    fn is_cancelled(&self) -> bool {
+        false
+    }
+}
+
+fn check_algorithm_observer(observer: Option<&dyn GraphAlgorithmObserver>) -> Result<()> {
+    if observer.is_some_and(GraphAlgorithmObserver::is_cancelled) {
+        return Err(Error::Query("graph algorithm cancelled".into()));
+    }
+    Ok(())
+}
+
+fn note_algorithm_progress(
+    observer: Option<&dyn GraphAlgorithmObserver>,
+    phase: &str,
+    done: usize,
+    total: Option<usize>,
+) {
+    if let Some(observer) = observer {
+        observer.progress(phase, done, total);
+    }
+}
+
+fn check_algorithm_memory(options: &GraphAlgorithmOptions, used: usize) -> Result<()> {
+    if used > options.max_memory_bytes {
+        return Err(Error::Query(format!(
+            "graph algorithm memory budget exceeded ({} bytes, limit {})",
+            used, options.max_memory_bytes
+        )));
+    }
+    Ok(())
+}
+
+fn estimate_ids_memory(ids: &[String]) -> usize {
+    ids.iter()
+        .map(|id| id.len() + std::mem::size_of::<String>() + 32)
+        .sum()
+}
+
+fn estimate_adjacency_memory(ids: &[String], adjacency: &HashMap<String, Vec<AdjEdge>>) -> usize {
+    estimate_ids_memory(ids)
+        + adjacency
+            .values()
+            .map(|_| 64 + std::mem::size_of::<Vec<AdjEdge>>())
+            .sum::<usize>()
+        + adjacency
+            .values()
+            .flatten()
+            .map(|edge| {
+                std::mem::size_of::<AdjEdge>()
+                    + edge.edge_id.len()
+                    + edge.label.len()
+                    + edge.target.len()
+                    + 32
+            })
+            .sum::<usize>()
+}
+
 fn algorithm_nodes(
     view: &dyn GraphView,
     options: &GraphAlgorithmOptions,
-) -> Result<(Vec<String>, bool)> {
+    started: Instant,
+    observer: Option<&dyn GraphAlgorithmObserver>,
+) -> Result<Vec<String>> {
     let mut ids = view.node_ids()?;
     ids.sort();
     ids.dedup();
+    let mut id_bytes = ids.len().saturating_mul(std::mem::size_of::<String>() + 24);
+    id_bytes = id_bytes.saturating_add(ids.iter().map(String::len).sum::<usize>());
+    check_algorithm_memory(options, id_bytes)?;
+    let total = ids.len();
     let mut kept = Vec::new();
-    let mut truncated = false;
+    let mut scanned = 0usize;
     for id in ids {
-        if kept.len() >= options.max_nodes {
-            truncated = true;
-            break;
+        check_algorithm_timeout(options, started)?;
+        check_algorithm_observer(observer)?;
+        scanned += 1;
+        if scanned.is_multiple_of(1024) {
+            note_algorithm_progress(observer, "scan_nodes", scanned, Some(total));
         }
         let Some(node) = view.node(&id)? else {
             continue;
         };
-        if node_matches(&node, &options.node_filter) {
-            kept.push(id);
+        if !node_matches(&node, &options.node_filter) {
+            continue;
         }
+        if kept.len() >= options.max_nodes {
+            return Err(Error::Query(format!(
+                "graph algorithm node budget exceeded (limit {})",
+                options.max_nodes
+            )));
+        }
+        id_bytes = id_bytes.saturating_add(id.len() + std::mem::size_of::<String>());
+        check_algorithm_memory(options, id_bytes)?;
+        kept.push(id);
     }
-    Ok((kept, truncated))
+    note_algorithm_progress(observer, "scan_nodes", scanned, Some(total));
+    Ok(kept)
 }
 
 fn algorithm_adjacency(
@@ -2248,17 +2421,30 @@ fn algorithm_adjacency(
     options: &GraphAlgorithmOptions,
     as_of: Option<i64>,
     direction: GraphDirection,
-) -> Result<(HashMap<String, Vec<AdjEdge>>, bool)> {
+    started: Instant,
+    observer: Option<&dyn GraphAlgorithmObserver>,
+) -> Result<HashMap<String, Vec<AdjEdge>>> {
     let allowed: HashSet<&str> = ids.iter().map(String::as_str).collect();
     let mut adjacency: HashMap<String, Vec<AdjEdge>> = HashMap::new();
-    let mut truncated = false;
+    let mut used = ids
+        .iter()
+        .map(|id| id.len() + std::mem::size_of::<String>() + 64)
+        .sum::<usize>();
+    check_algorithm_memory(options, used)?;
     let mut scanned = 0usize;
     for id in ids {
         for edge in view.neighbors(id, direction, &options.labels)? {
-            scanned += 1;
-            if scanned > 1_000_000 {
-                truncated = true;
-                break;
+            check_algorithm_timeout(options, started)?;
+            check_algorithm_observer(observer)?;
+            scanned = scanned.saturating_add(1);
+            if scanned.is_multiple_of(1024) {
+                note_algorithm_progress(observer, "scan_edges", scanned, None);
+            }
+            if scanned > options.max_edges {
+                return Err(Error::Query(format!(
+                    "graph algorithm edge budget exceeded (limit {})",
+                    options.max_edges
+                )));
             }
             if !edge_in_window(&edge, as_of) || !edge_matches(view, &edge, &options.edge_filter)? {
                 continue;
@@ -2266,18 +2452,28 @@ fn algorithm_adjacency(
             if !allowed.contains(edge.target.as_str()) {
                 continue;
             }
+            used = used.saturating_add(
+                std::mem::size_of::<AdjEdge>()
+                    + edge.edge_id.len()
+                    + edge.label.len()
+                    + edge.target.len()
+                    + 32,
+            );
+            check_algorithm_memory(options, used)?;
             adjacency.entry(id.clone()).or_default().push(edge);
         }
-        if truncated {
-            break;
-        }
     }
-    Ok((adjacency, truncated))
+    Ok(adjacency)
 }
 
-fn pagerank(view: &dyn GraphView, options: &GraphAlgorithmOptions) -> Result<Value> {
+fn pagerank(
+    view: &dyn GraphView,
+    options: &GraphAlgorithmOptions,
+    observer: Option<&dyn GraphAlgorithmObserver>,
+) -> Result<Value> {
+    let started = Instant::now();
     let as_of = as_of_ms(options.as_of.as_ref())?;
-    let (ids, ids_truncated) = algorithm_nodes(view, options)?;
+    let ids = algorithm_nodes(view, options, started, observer)?;
     if ids.is_empty() {
         return Ok(json!({
             "kind": "pagerank",
@@ -2285,11 +2481,18 @@ fn pagerank(view: &dyn GraphView, options: &GraphAlgorithmOptions) -> Result<Val
             "nodes": 0,
             "iterations": 0,
             "converged": true,
-            "truncated": ids_truncated,
+            "truncated": false,
         }));
     }
-    let (adjacency, edges_truncated) =
-        algorithm_adjacency(view, &ids, options, as_of, options.direction)?;
+    let adjacency = algorithm_adjacency(
+        view,
+        &ids,
+        options,
+        as_of,
+        options.direction,
+        started,
+        observer,
+    )?;
     let n = ids.len() as f64;
     let mut incoming: HashMap<String, Vec<String>> = HashMap::new();
     for (source, edges) in &adjacency {
@@ -2301,9 +2504,24 @@ fn pagerank(view: &dyn GraphView, options: &GraphAlgorithmOptions) -> Result<Val
         }
     }
     let mut scores: HashMap<String, f64> = ids.iter().map(|id| (id.clone(), 1.0 / n)).collect();
+    let base_memory = estimate_adjacency_memory(&ids, &adjacency).saturating_add(
+        incoming
+            .values()
+            .map(|parents| parents.iter().map(|p| p.len() + 48).sum::<usize>())
+            .sum::<usize>(),
+    );
+    let score_memory = ids
+        .iter()
+        .map(|id| id.len() + std::mem::size_of::<String>() + 48)
+        .sum::<usize>();
+    let working = base_memory.saturating_add(score_memory);
+    check_algorithm_memory(options, working)?;
     let mut converged = false;
     let mut iterations = 0usize;
-    for _ in 0..options.iterations {
+    for iteration in 0..options.iterations {
+        check_algorithm_timeout(options, started)?;
+        check_algorithm_observer(observer)?;
+        note_algorithm_progress(observer, "pagerank", iteration, Some(options.iterations));
         let dangling: f64 = ids
             .iter()
             .filter(|id| adjacency.get(*id).is_none_or(|edges| edges.is_empty()))
@@ -2332,6 +2550,10 @@ fn pagerank(view: &dyn GraphView, options: &GraphAlgorithmOptions) -> Result<Val
             })
             .sum();
         scores = next;
+        check_algorithm_memory(
+            options,
+            base_memory.saturating_add(score_memory.saturating_mul(2)),
+        )?;
         iterations += 1;
         if delta < options.tolerance {
             converged = true;
@@ -2356,24 +2578,46 @@ fn pagerank(view: &dyn GraphView, options: &GraphAlgorithmOptions) -> Result<Val
         "nodes": ids.len(),
         "iterations": iterations,
         "converged": converged,
-        "truncated": ids_truncated || edges_truncated || limited,
+        "truncated": limited,
     }))
 }
 
-fn degree_centrality(view: &dyn GraphView, options: &GraphAlgorithmOptions) -> Result<Value> {
+fn degree_centrality(
+    view: &dyn GraphView,
+    options: &GraphAlgorithmOptions,
+    observer: Option<&dyn GraphAlgorithmObserver>,
+) -> Result<Value> {
+    let started = Instant::now();
     let as_of = as_of_ms(options.as_of.as_ref())?;
-    let (ids, ids_truncated) = algorithm_nodes(view, options)?;
+    let ids = algorithm_nodes(view, options, started, observer)?;
     let empty = HashMap::new();
-    let (outgoing, out_truncated) = if options.direction == GraphDirection::In {
-        (empty, false)
+    let outgoing = if options.direction == GraphDirection::In {
+        empty
     } else {
-        algorithm_adjacency(view, &ids, options, as_of, GraphDirection::Out)?
+        algorithm_adjacency(
+            view,
+            &ids,
+            options,
+            as_of,
+            GraphDirection::Out,
+            started,
+            observer,
+        )?
     };
-    let (incoming, in_truncated) = if options.direction == GraphDirection::Out {
-        (HashMap::new(), false)
+    let incoming = if options.direction == GraphDirection::Out {
+        HashMap::new()
     } else {
-        algorithm_adjacency(view, &ids, options, as_of, GraphDirection::In)?
+        algorithm_adjacency(
+            view,
+            &ids,
+            options,
+            as_of,
+            GraphDirection::In,
+            started,
+            observer,
+        )?
     };
+    check_algorithm_timeout(options, started)?;
     let mut ranked: Vec<(String, usize, usize)> = ids
         .iter()
         .map(|id| {
@@ -2405,20 +2649,268 @@ fn degree_centrality(view: &dyn GraphView, options: &GraphAlgorithmOptions) -> R
         "kind": "degree_centrality",
         "items": items,
         "nodes": ids.len(),
-        "truncated": ids_truncated || out_truncated || in_truncated || limited,
+        "truncated": limited,
     }))
 }
 
-fn connected_components(view: &dyn GraphView, options: &GraphAlgorithmOptions) -> Result<Value> {
+fn label_propagation(
+    view: &dyn GraphView,
+    options: &GraphAlgorithmOptions,
+    observer: Option<&dyn GraphAlgorithmObserver>,
+) -> Result<Value> {
+    let started = Instant::now();
     let as_of = as_of_ms(options.as_of.as_ref())?;
-    let (ids, ids_truncated) = algorithm_nodes(view, options)?;
+    let ids = algorithm_nodes(view, options, started, observer)?;
+    let adjacency = algorithm_adjacency(
+        view,
+        &ids,
+        options,
+        as_of,
+        options.direction,
+        started,
+        observer,
+    )?;
+    let mut labels: HashMap<String, String> =
+        ids.iter().map(|id| (id.clone(), id.clone())).collect();
+    let base_memory = estimate_adjacency_memory(&ids, &adjacency);
+    let label_memory = ids
+        .iter()
+        .map(|id| 2 * (id.len() + std::mem::size_of::<String>()) + 64)
+        .sum::<usize>();
+    let working = base_memory.saturating_add(label_memory);
+    check_algorithm_memory(options, working)?;
+    let mut converged = false;
+    let mut iterations = 0usize;
+    for iteration in 0..options.iterations {
+        check_algorithm_timeout(options, started)?;
+        check_algorithm_observer(observer)?;
+        note_algorithm_progress(
+            observer,
+            "label_propagation",
+            iteration,
+            Some(options.iterations),
+        );
+        let mut next = labels.clone();
+        let mut changed = false;
+        for id in &ids {
+            let mut counts: HashMap<&str, usize> = HashMap::new();
+            if let Some(edges) = adjacency.get(id) {
+                for edge in edges {
+                    if let Some(label) = labels.get(&edge.target) {
+                        *counts.entry(label.as_str()).or_default() += 1;
+                    }
+                }
+            }
+            let best = counts
+                .into_iter()
+                .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(a.0)))
+                .map(|(label, _)| label.to_string());
+            if let Some(best) = best {
+                if labels.get(id) != Some(&best) {
+                    next.insert(id.clone(), best);
+                    changed = true;
+                }
+            }
+        }
+        labels = next;
+        check_algorithm_memory(
+            options,
+            base_memory.saturating_add(label_memory.saturating_mul(2)),
+        )?;
+        iterations += 1;
+        if !changed {
+            converged = true;
+            break;
+        }
+    }
+    let mut items: Vec<Value> = ids
+        .iter()
+        .map(|id| json!({"id": id, "label": labels.get(id).cloned().unwrap_or_else(|| id.clone())}))
+        .collect();
+    items.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+    let limited = items.len() > options.limit;
+    items.truncate(options.limit);
+    Ok(json!({
+        "kind": "label_propagation",
+        "items": items,
+        "nodes": ids.len(),
+        "iterations": iterations,
+        "converged": converged,
+        "truncated": limited,
+    }))
+}
+
+fn k_core(
+    view: &dyn GraphView,
+    options: &GraphAlgorithmOptions,
+    observer: Option<&dyn GraphAlgorithmObserver>,
+) -> Result<Value> {
+    let started = Instant::now();
+    let as_of = as_of_ms(options.as_of.as_ref())?;
+    let ids = algorithm_nodes(view, options, started, observer)?;
+    let adjacency = algorithm_adjacency(
+        view,
+        &ids,
+        options,
+        as_of,
+        GraphDirection::Both,
+        started,
+        observer,
+    )?;
     let allowed: HashSet<&str> = ids.iter().map(String::as_str).collect();
-    let (adjacency, edges_truncated) =
-        algorithm_adjacency(view, &ids, options, as_of, GraphDirection::Both)?;
+    let mut neighbors: HashMap<String, HashSet<String>> = HashMap::new();
+    for id in &ids {
+        let mut set = HashSet::new();
+        if let Some(edges) = adjacency.get(id) {
+            for edge in edges {
+                if allowed.contains(edge.target.as_str()) {
+                    set.insert(edge.target.clone());
+                }
+            }
+        }
+        neighbors.insert(id.clone(), set);
+    }
+    let mut degree: HashMap<String, usize> = ids
+        .iter()
+        .map(|id| (id.clone(), neighbors.get(id).map_or(0, HashSet::len)))
+        .collect();
+    let mut heap: std::collections::BinaryHeap<std::cmp::Reverse<(usize, String)>> = ids
+        .iter()
+        .map(|id| std::cmp::Reverse((degree[id], id.clone())))
+        .collect();
+    let mut core: HashMap<String, usize> = HashMap::new();
+    let mut working = estimate_adjacency_memory(&ids, &adjacency)
+        .saturating_add(
+            neighbors
+                .values()
+                .map(|set| 64 + set.iter().map(|n| n.len() + 48).sum::<usize>())
+                .sum::<usize>(),
+        )
+        .saturating_add(
+            ids.len()
+                .saturating_mul(3 * (std::mem::size_of::<String>() + 32)),
+        );
+    check_algorithm_memory(options, working)?;
+    while let Some(std::cmp::Reverse((d, id))) = heap.pop() {
+        check_algorithm_timeout(options, started)?;
+        check_algorithm_observer(observer)?;
+        if core.contains_key(&id) || degree.get(&id).copied() != Some(d) {
+            continue;
+        }
+        core.insert(id.clone(), d);
+        working = working.saturating_add(id.len() + std::mem::size_of::<String>() + 32);
+        check_algorithm_memory(options, working)?;
+        note_algorithm_progress(observer, "k_core", core.len(), Some(ids.len()));
+        if let Some(set) = neighbors.get(&id) {
+            for neighbor in set {
+                if core.contains_key(neighbor) {
+                    continue;
+                }
+                if let Some(value) = degree.get_mut(neighbor) {
+                    if *value > d {
+                        *value -= 1;
+                        heap.push(std::cmp::Reverse((*value, neighbor.clone())));
+                    }
+                }
+            }
+        }
+    }
+    let mut items: Vec<Value> = ids
+        .iter()
+        .map(|id| json!({"id": id, "core": core.get(id).copied().unwrap_or(0)}))
+        .collect();
+    items.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+    let limited = items.len() > options.limit;
+    items.truncate(options.limit);
+    Ok(json!({
+        "kind": "k_core",
+        "items": items,
+        "nodes": ids.len(),
+        "truncated": limited,
+    }))
+}
+
+fn degree_distribution(
+    view: &dyn GraphView,
+    options: &GraphAlgorithmOptions,
+    observer: Option<&dyn GraphAlgorithmObserver>,
+) -> Result<Value> {
+    let started = Instant::now();
+    let as_of = as_of_ms(options.as_of.as_ref())?;
+    let ids = algorithm_nodes(view, options, started, observer)?;
+    let outgoing = if options.direction == GraphDirection::In {
+        HashMap::new()
+    } else {
+        algorithm_adjacency(
+            view,
+            &ids,
+            options,
+            as_of,
+            GraphDirection::Out,
+            started,
+            observer,
+        )?
+    };
+    let incoming = if options.direction == GraphDirection::Out {
+        HashMap::new()
+    } else {
+        algorithm_adjacency(
+            view,
+            &ids,
+            options,
+            as_of,
+            GraphDirection::In,
+            started,
+            observer,
+        )?
+    };
+    let mut histogram: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
+    for id in &ids {
+        let degree = outgoing.get(id).map_or(0, Vec::len) + incoming.get(id).map_or(0, Vec::len);
+        *histogram.entry(degree).or_default() += 1;
+    }
+    let mut items: Vec<Value> = histogram
+        .into_iter()
+        .map(|(degree, count)| json!({"degree": degree, "count": count}))
+        .collect();
+    let limited = items.len() > options.limit;
+    items.truncate(options.limit);
+    Ok(json!({
+        "kind": "degree_distribution",
+        "items": items,
+        "nodes": ids.len(),
+        "truncated": limited,
+    }))
+}
+
+fn connected_components(
+    view: &dyn GraphView,
+    options: &GraphAlgorithmOptions,
+    observer: Option<&dyn GraphAlgorithmObserver>,
+) -> Result<Value> {
+    let started = Instant::now();
+    let as_of = as_of_ms(options.as_of.as_ref())?;
+    let ids = algorithm_nodes(view, options, started, observer)?;
+    let allowed: HashSet<&str> = ids.iter().map(String::as_str).collect();
+    let adjacency = algorithm_adjacency(
+        view,
+        &ids,
+        options,
+        as_of,
+        GraphDirection::Both,
+        started,
+        observer,
+    )?;
+    check_algorithm_timeout(options, started)?;
     let mut seen: HashSet<String> = HashSet::new();
     let mut components: Vec<(String, Vec<String>)> = Vec::new();
-    let mut truncated = ids_truncated || edges_truncated;
+    let mut working = estimate_adjacency_memory(&ids, &adjacency);
+    check_algorithm_memory(options, working)?;
+    let mut truncated = false;
+    let mut walked = 0usize;
     for id in &ids {
+        check_algorithm_timeout(options, started)?;
+        check_algorithm_observer(observer)?;
         if seen.contains(id) {
             continue;
         }
@@ -2431,7 +2923,14 @@ fn connected_components(view: &dyn GraphView, options: &GraphAlgorithmOptions) -
         seen.insert(id.clone());
         queue.push_back(id.clone());
         while let Some(current) = queue.pop_front() {
+            walked += 1;
+            if walked.is_multiple_of(1024) {
+                note_algorithm_progress(observer, "components", walked, Some(ids.len()));
+                check_algorithm_observer(observer)?;
+            }
             members.push(current.clone());
+            working = working.saturating_add(current.len() + std::mem::size_of::<String>() + 32);
+            check_algorithm_memory(options, working)?;
             if let Some(edges) = adjacency.get(&current) {
                 for edge in edges {
                     if allowed.contains(edge.target.as_str()) && seen.insert(edge.target.clone()) {
@@ -2468,12 +2967,33 @@ fn connected_components(view: &dyn GraphView, options: &GraphAlgorithmOptions) -
 
 /// Runs a read-only graph algorithm over all nodes in the graph's node
 /// collection. The result is bounded by `limit` and `max_nodes`.
+fn check_algorithm_timeout(options: &GraphAlgorithmOptions, started: Instant) -> Result<()> {
+    if let Some(timeout_ms) = options.timeout_ms {
+        if started.elapsed().as_millis() as u64 >= timeout_ms {
+            return Err(Error::Query("graph algorithm timed out".into()));
+        }
+    }
+    Ok(())
+}
+
 pub fn graph_algorithm(view: &dyn GraphView, options: &GraphAlgorithmOptions) -> Result<Value> {
+    graph_algorithm_with_observer(view, options, None)
+}
+
+/// Runs a graph algorithm with cooperative cancellation and progress callbacks.
+pub fn graph_algorithm_with_observer(
+    view: &dyn GraphView,
+    options: &GraphAlgorithmOptions,
+    observer: Option<&dyn GraphAlgorithmObserver>,
+) -> Result<Value> {
     options.validate()?;
     match options.kind {
-        GraphAlgorithmKind::Pagerank => pagerank(view, options),
-        GraphAlgorithmKind::DegreeCentrality => degree_centrality(view, options),
-        GraphAlgorithmKind::ConnectedComponents => connected_components(view, options),
+        GraphAlgorithmKind::Pagerank => pagerank(view, options, observer),
+        GraphAlgorithmKind::DegreeCentrality => degree_centrality(view, options, observer),
+        GraphAlgorithmKind::ConnectedComponents => connected_components(view, options, observer),
+        GraphAlgorithmKind::LabelPropagation => label_propagation(view, options, observer),
+        GraphAlgorithmKind::KCore => k_core(view, options, observer),
+        GraphAlgorithmKind::DegreeDistribution => degree_distribution(view, options, observer),
     }
 }
 
@@ -2594,6 +3114,46 @@ mod tests {
         };
         assert!(def.validate().is_ok());
         def.to_field = "from".into();
+        assert!(def.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_oversized_graph_budgets_generation_and_labels() {
+        let mut options: TraverseOptions = serde_json::from_value(json!({
+            "start": ["a"],
+            "limit_nodes": MAX_GRAPH_NODES + 1
+        }))
+        .unwrap();
+        assert!(options.validate().is_err());
+        options.limit_nodes = 1;
+        options.limit_edges = MAX_GRAPH_EDGES + 1;
+        assert!(options.validate().is_err());
+        options.limit_edges = 1;
+        options.max_bytes = MAX_GRAPH_BYTES + 1;
+        assert!(options.validate().is_err());
+
+        let labels = vec!["L".to_string(); MAX_GRAPH_LABELS + 1];
+        let options: TraverseOptions = serde_json::from_value(json!({
+            "start": ["a"],
+            "labels": labels
+        }))
+        .unwrap();
+        assert!(options.validate().is_err());
+
+        let shortest: ShortestPathOptions = serde_json::from_value(json!({
+            "start": "a",
+            "target": "b",
+            "limit_nodes": MAX_GRAPH_NODES + 1
+        }))
+        .unwrap();
+        assert!(shortest.validate().is_err());
+
+        let def: GraphDef = serde_json::from_value(json!({
+            "node_collection": "nodes",
+            "edge_collection": "edges",
+            "generation": MAX_GRAPH_GENERATION + 1
+        }))
+        .unwrap();
         assert!(def.validate().is_err());
     }
 
@@ -2829,6 +3389,191 @@ mod tests {
         assert_eq!(out["found"], true);
         assert_eq!(out["weight"], 2.0);
         assert_eq!(out["paths"][0]["hops"], 2);
+    }
+
+    struct LargeMockView {
+        ids: Vec<String>,
+    }
+
+    impl GraphView for LargeMockView {
+        fn node(&self, id: &str) -> Result<Option<Value>> {
+            Ok(Some(json!({"_id": id})))
+        }
+
+        fn edge(&self, id: &str) -> Result<Option<Value>> {
+            Ok(Some(json!({"_id": id})))
+        }
+
+        fn node_ids(&self) -> Result<Vec<String>> {
+            Ok(self.ids.clone())
+        }
+
+        fn neighbors(
+            &self,
+            _id: &str,
+            _direction: GraphDirection,
+            _labels: &[String],
+        ) -> Result<Vec<AdjEdge>> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn graph_algorithm_scales_to_100k_nodes_and_rejects_budget_overruns() {
+        let large = LargeMockView {
+            ids: (0..100_000).map(|i| format!("n{i:06}")).collect(),
+        };
+        let options: GraphAlgorithmOptions = serde_json::from_value(json!({
+            "kind": "pagerank",
+            "limit": 10,
+            "max_nodes": 100_000,
+            "max_edges": 1_000_000,
+            "max_memory_bytes": 256 * 1024 * 1024,
+            "iterations": 2,
+            "tolerance": 1e-9
+        }))
+        .unwrap();
+        let out = graph_algorithm(&large, &options).unwrap();
+        assert_eq!(out["nodes"], 100_000);
+
+        let too_few: GraphAlgorithmOptions = serde_json::from_value(json!({
+            "kind": "degree_centrality",
+            "max_nodes": 99_999
+        }))
+        .unwrap();
+        let err = graph_algorithm(&large, &too_few).unwrap_err().to_string();
+        assert!(err.contains("node budget exceeded"), "{err}");
+
+        let low_memory: GraphAlgorithmOptions = serde_json::from_value(json!({
+            "kind": "degree_centrality",
+            "max_nodes": 100_000,
+            "max_memory_bytes": 1
+        }))
+        .unwrap();
+        let err = graph_algorithm(&large, &low_memory)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("memory budget exceeded"), "{err}");
+
+        let low_edges: GraphAlgorithmOptions = serde_json::from_value(json!({
+            "kind": "pagerank",
+            "max_nodes": 100,
+            "max_edges": 1
+        }))
+        .unwrap();
+        let err = graph_algorithm(&view(), &low_edges)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("edge budget exceeded"), "{err}");
+
+        let many_iterations: GraphAlgorithmOptions = serde_json::from_value(json!({
+            "kind": "pagerank",
+            "limit": 10,
+            "max_nodes": 100_000,
+            "max_edges": 1_000_000,
+            "max_memory_bytes": 256 * 1024 * 1024,
+            "iterations": 100,
+            "tolerance": 1e-300
+        }))
+        .unwrap();
+        let out = graph_algorithm(&large, &many_iterations).unwrap();
+        assert_eq!(out["nodes"], 100_000);
+
+        let timed: GraphAlgorithmOptions = serde_json::from_value(json!({
+            "kind": "pagerank",
+            "max_nodes": 100_000,
+            "iterations": 100,
+            "timeout_ms": 1
+        }))
+        .unwrap();
+        let err = graph_algorithm(&large, &timed).unwrap_err().to_string();
+        assert!(err.contains("timed out"), "{err}");
+    }
+
+    #[test]
+    fn cheap_analytics_algorithms_are_deterministic_and_handle_empty_graphs() {
+        let kcore: GraphAlgorithmOptions = serde_json::from_value(json!({
+            "kind": "k_core",
+            "direction": "both",
+            "limit": 10,
+            "max_nodes": 100
+        }))
+        .unwrap();
+        let out = graph_algorithm(&view(), &kcore).unwrap();
+        assert_eq!(
+            out["items"],
+            json!([
+                {"id": "a", "core": 2},
+                {"id": "b", "core": 2},
+                {"id": "c", "core": 2}
+            ])
+        );
+
+        let path_view = MockView {
+            edges: HashMap::from([
+                (
+                    "a".into(),
+                    vec![MockView::edge("p1", "a", "b", "ROAD", None)],
+                ),
+                (
+                    "b".into(),
+                    vec![MockView::edge("p2", "b", "c", "ROAD", None)],
+                ),
+            ]),
+        };
+        let out = graph_algorithm(&path_view, &kcore).unwrap();
+        assert_eq!(
+            out["items"],
+            json!([
+                {"id": "a", "core": 1},
+                {"id": "b", "core": 1},
+                {"id": "c", "core": 1}
+            ])
+        );
+
+        let distribution: GraphAlgorithmOptions = serde_json::from_value(json!({
+            "kind": "degree_distribution",
+            "direction": "both",
+            "max_nodes": 100
+        }))
+        .unwrap();
+        let out = graph_algorithm(&view(), &distribution).unwrap();
+        assert_eq!(
+            out["items"],
+            json!([
+                {"degree": 2, "count": 1},
+                {"degree": 3, "count": 2}
+            ])
+        );
+        let limited: GraphAlgorithmOptions = serde_json::from_value(json!({
+            "kind": "degree_distribution",
+            "direction": "both",
+            "max_nodes": 100,
+            "limit": 1
+        }))
+        .unwrap();
+        let out = graph_algorithm(&view(), &limited).unwrap();
+        assert_eq!(out["items"], json!([{"degree": 2, "count": 1}]));
+        assert_eq!(out["truncated"], true);
+
+        let labels: GraphAlgorithmOptions = serde_json::from_value(json!({
+            "kind": "label_propagation",
+            "direction": "both",
+            "max_nodes": 100,
+            "iterations": 5
+        }))
+        .unwrap();
+        let first = graph_algorithm(&view(), &labels).unwrap();
+        let second = graph_algorithm(&view(), &labels).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first["items"].as_array().unwrap().len(), 3);
+
+        let empty = MockView {
+            edges: HashMap::new(),
+        };
+        let out = graph_algorithm(&empty, &kcore).unwrap();
+        assert_eq!(out["nodes"], 0);
+        assert_eq!(out["items"], json!([]));
     }
 
     #[test]
