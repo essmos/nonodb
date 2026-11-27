@@ -365,7 +365,10 @@ fn decode_bucket_raw(data: &[u8]) -> Result<Vec<Map<String, Value>>> {
     }
     let mut out = Vec::with_capacity(rows);
     for _ in 0..rows {
-        out.push(serde_json::from_slice(get_bytes(data, &mut pos)?)?);
+        out.push(
+            sonic_rs::from_slice(get_bytes(data, &mut pos)?)
+                .map_err(|e| Error::JsonFast(e.to_string()))?,
+        );
     }
     Ok(out)
 }
@@ -450,7 +453,10 @@ fn decode_bucket_row(data: &[u8], row: usize) -> Result<Option<Map<String, Value
         for _ in 0..row {
             get_bytes(data, &mut pos)?;
         }
-        return Ok(Some(serde_json::from_slice(get_bytes(data, &mut pos)?)?));
+        return Ok(Some(
+            sonic_rs::from_slice(get_bytes(data, &mut pos)?)
+                .map_err(|e| Error::JsonFast(e.to_string()))?,
+        ));
     }
     let (block_rows, rows, mut pos) = decode_bucket_header(data)?;
     if row >= rows {
@@ -619,6 +625,55 @@ fn decode_blocks(blocks: &[RawBlock]) -> Result<Vec<(Locator, Map<String, Value>
         }
     }
     Ok(docs)
+}
+
+fn visit_block<F>(
+    block: &RawBlock,
+    prefilter: Option<&crate::collection::RawPrefilter>,
+    mut emit: F,
+) -> Result<()>
+where
+    F: FnMut(Locator, Map<String, Value>) -> Result<()>,
+{
+    match block {
+        RawBlock::Open(locator, raw) => {
+            let Some(value) = crate::collection::parse_prefiltered(raw, prefilter)? else {
+                return Ok(());
+            };
+            let doc = value
+                .as_object()
+                .cloned()
+                .ok_or_else(|| corrupt("open row is not an object"))?;
+            emit(*locator, doc)
+        }
+        RawBlock::Bucket(bucket, raw) => {
+            if raw.starts_with(WRITE_MAGIC) {
+                let mut pos = 4;
+                let rows = get_uvarint(raw, &mut pos)? as usize;
+                if rows > HARD_MAX_COLUMN_ROWS {
+                    return Err(corrupt("row count out of range"));
+                }
+                for row in 0..rows {
+                    let Some(value) =
+                        crate::collection::parse_prefiltered(get_bytes(raw, &mut pos)?, prefilter)?
+                    else {
+                        continue;
+                    };
+                    let doc = value
+                        .as_object()
+                        .cloned()
+                        .ok_or_else(|| corrupt("staged row is not an object"))?;
+                    emit((*bucket, row as u32), doc)?;
+                }
+                Ok(())
+            } else {
+                for (row, doc) in decode_bucket(raw)?.into_iter().enumerate() {
+                    emit((*bucket, row as u32), doc)?;
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 fn all_located(
@@ -1133,18 +1188,25 @@ pub fn group_parallel(
         }
     }
 
+    let has_deleted = !deleted.is_empty();
+    let has_overlays = !overlays.is_empty();
     let process = |chunk: &[RawBlock], builder: &mut GroupBuilder| -> Result<()> {
         for block in chunk {
-            for (locator, doc) in decode_blocks(std::slice::from_ref(block))? {
-                if deleted.contains(&locator) {
-                    continue;
+            visit_block(block, None, |locator, doc| {
+                if has_deleted && deleted.contains(&locator) {
+                    return Ok(());
                 }
-                let doc = overlays.get(&locator).cloned().unwrap_or(doc);
+                let doc = if has_overlays {
+                    overlays.get(&locator).cloned().unwrap_or(doc)
+                } else {
+                    doc
+                };
                 let value = Value::Object(doc);
                 if crate::query::matcher::matches(&value, filter) {
                     builder.update(value)?;
                 }
-            }
+                Ok(())
+            })?;
         }
         Ok(())
     };
@@ -1163,17 +1225,24 @@ pub fn group_parallel(
             let deleted = &deleted;
             handles.push(scope.spawn(move || -> Result<GroupBuilder> {
                 let mut builder = GroupBuilder::new(group_spec)?;
+                let has_deleted = !deleted.is_empty();
+                let has_overlays = !overlays.is_empty();
                 for block in chunk {
-                    for (locator, doc) in decode_blocks(std::slice::from_ref(block))? {
-                        if deleted.contains(&locator) {
-                            continue;
+                    visit_block(block, None, |locator, doc| {
+                        if has_deleted && deleted.contains(&locator) {
+                            return Ok(());
                         }
-                        let doc = overlays.get(&locator).cloned().unwrap_or(doc);
+                        let doc = if has_overlays {
+                            overlays.get(&locator).cloned().unwrap_or(doc)
+                        } else {
+                            doc
+                        };
                         let value = Value::Object(doc);
                         if crate::query::matcher::matches(&value, filter) {
                             builder.update(value)?;
                         }
-                    }
+                        Ok(())
+                    })?;
                 }
                 Ok(builder)
             }));
@@ -1246,19 +1315,32 @@ fn find_parallel(rtxn: &RoTxn<'_>, env: &Env, name: &str, query: &FindQuery) -> 
 
     let workers = crate::collection::scan_workers().min(blocks.len().max(1));
     let filter = &query.filter;
-    let mut hits = if workers <= 1 || blocks.len() < 2 {
+    let prefilter = if overlays.is_empty() {
+        crate::collection::raw_prefilter(filter)
+    } else {
+        None
+    };
+    let prefilter_ref = prefilter.as_ref();
+    let hits = if workers <= 1 || blocks.len() < 2 {
         let mut hits = Vec::new();
+        let has_deleted = !deleted.is_empty();
+        let has_overlays = !overlays.is_empty();
         for block in &blocks {
-            for (locator, doc) in decode_blocks(std::slice::from_ref(block))? {
-                if deleted.contains(&locator) {
-                    continue;
+            visit_block(block, prefilter_ref, |locator, doc| {
+                if has_deleted && deleted.contains(&locator) {
+                    return Ok(());
                 }
-                let doc = overlays.get(&locator).cloned().unwrap_or(doc);
+                let doc = if has_overlays {
+                    overlays.get(&locator).cloned().unwrap_or(doc)
+                } else {
+                    doc
+                };
                 let value = Value::Object(doc);
                 if crate::query::matcher::matches(&value, filter) {
-                    hits.push((locator, value));
+                    hits.push(value);
                 }
-            }
+                Ok(())
+            })?;
         }
         hits
     } else {
@@ -1268,19 +1350,27 @@ fn find_parallel(rtxn: &RoTxn<'_>, env: &Env, name: &str, query: &FindQuery) -> 
             for chunk in blocks.chunks(chunk_size) {
                 let overlays = &overlays;
                 let deleted = &deleted;
-                handles.push(scope.spawn(move || -> Result<Vec<(Locator, Value)>> {
+                let prefilter = prefilter_ref;
+                handles.push(scope.spawn(move || -> Result<Vec<Value>> {
                     let mut hits = Vec::new();
+                    let has_deleted = !deleted.is_empty();
+                    let has_overlays = !overlays.is_empty();
                     for block in chunk {
-                        for (locator, doc) in decode_blocks(std::slice::from_ref(block))? {
-                            if deleted.contains(&locator) {
-                                continue;
+                        visit_block(block, prefilter, |locator, doc| {
+                            if has_deleted && deleted.contains(&locator) {
+                                return Ok(());
                             }
-                            let doc = overlays.get(&locator).cloned().unwrap_or(doc);
+                            let doc = if has_overlays {
+                                overlays.get(&locator).cloned().unwrap_or(doc)
+                            } else {
+                                doc
+                            };
                             let value = Value::Object(doc);
                             if crate::query::matcher::matches(&value, filter) {
-                                hits.push((locator, value));
+                                hits.push(value);
                             }
-                        }
+                            Ok(())
+                        })?;
                     }
                     Ok(hits)
                 }));
@@ -1300,13 +1390,12 @@ fn find_parallel(rtxn: &RoTxn<'_>, env: &Env, name: &str, query: &FindQuery) -> 
         }
         hits
     };
-    hits.sort_unstable_by_key(|(locator, _)| *locator);
     let limit = query.limit.unwrap_or(usize::MAX);
     Ok(hits
         .into_iter()
         .skip(query.skip)
         .take(limit)
-        .map(|(_, doc)| project_document(&doc, query.projection.as_ref()))
+        .map(|doc| project_document(&doc, query.projection.as_ref()))
         .collect())
 }
 

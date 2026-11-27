@@ -241,7 +241,7 @@ struct ScanChunk {
 /// allowed. Numbers and `null` are skipped because their semantics/formatting
 /// differences require the full parser.
 #[derive(Debug, Clone, Default)]
-struct RawPrefilter {
+pub(crate) struct RawPrefilter {
     needles: Vec<Vec<u8>>,
 }
 
@@ -255,7 +255,7 @@ impl RawPrefilter {
 
 /// Builds a prefilter for safe equality conditions. Conditions we cannot
 /// check at the byte level are ignored (the filter is an AND, so this is safe).
-fn raw_prefilter(filter: &Value) -> Option<RawPrefilter> {
+pub(crate) fn raw_prefilter(filter: &Value) -> Option<RawPrefilter> {
     let obj = filter.as_object()?;
     let mut needles = Vec::new();
     for (key, cond) in obj {
@@ -299,7 +299,7 @@ fn raw_equality_value(cond: &Value) -> Option<&Value> {
 }
 
 /// Parses a document only when the prefilter did not reject it.
-fn parse_prefiltered(bytes: &[u8], raw: Option<&RawPrefilter>) -> Result<Option<Value>> {
+pub(crate) fn parse_prefiltered(bytes: &[u8], raw: Option<&RawPrefilter>) -> Result<Option<Value>> {
     if raw.is_some_and(|r| !r.matches(bytes)) {
         return Ok(None);
     }
