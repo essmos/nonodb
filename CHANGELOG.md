@@ -142,8 +142,8 @@ Full release notes: https://github.com/essmos/nonodb/releases
   unused `coll:<name>` database, and replicate `retain_timeseries` as
   `time_series_retain`. Replicas now produce byte-identical documents, including
   synthetic `_id`s, which is covered by a two-store replication test. Add
-  `examples/timeseries_space.rs`: 100k rows occupy 0.46 MB compacted (4.87
-  B/row) versus 41.35 MB (433.6 B/row) for a document-per-row collection, with
+  `examples/timeseries_space.rs`: 100k rows occupy 1.02 MB compacted (10.69
+  B/row) versus 41.59 MB (436.1 B/row) for a document-per-row collection, with
   the LMDB high-water caveat documented. The benchmark now also measures
   secondary-index creation/lookup, `$set` updates, SQL `GROUP BY`, bitmap
   deletes, and compaction.
