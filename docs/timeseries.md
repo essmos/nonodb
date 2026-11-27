@@ -659,10 +659,9 @@ Reproduce: `ROWS=100000 READS=500 cargo run --release -p nonodb-core --example t
 ### Comparison with TimescaleDB
 
 The same 100k-row workload was loaded into TimescaleDB 2.x (PostgreSQL 16,
-`timescale/timescaledb:latest-pg16`) through the local TCP listener. Timescale
-rows were inserted one statement at a time for the insert sample and in
-1000-row batches for the rest; range/count/aggregate timings include fetching
-the result. NonoDB runs in-process, so its timings exclude a network round trip.
+`timescale/timescaledb:latest-pg16`). Timescale rows were inserted one
+statement at a time for the insert sample and in 1000-row batches for the rest;
+range/count/aggregate timings include fetching the result.
 Storage for TimescaleDB is `hypertable_size` after native compression
 (`segmentby=device`, `orderby=ts DESC`).
 

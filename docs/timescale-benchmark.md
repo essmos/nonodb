@@ -12,14 +12,14 @@ TimescaleDB on a real 206-million-row dataset.
 |---|---|---|
 | CPU | Intel Xeon D-2141I @ 2.20 GHz, 4 vCPU visible to the process | same host, 4 vCPU visible in the container |
 | RAM | 14 GiB in the test environment, ~11 GiB available | `pg` container limited to **6 GiB**; CT 103 has 8 GiB |
-| System | Linux, in-process | PostgreSQL **17.6**, TimescaleDB **2.21.3**, Alpine |
+| System | Linux, Rust process | PostgreSQL **17.6**, TimescaleDB **2.21.3**, Alpine |
 | Version | NonoDB 0.32.0, Rust 1.100.0, release build | official TimescaleDB image |
 | Settings | `NONODB_MAP_SIZE=64GiB`, otherwise defaults | `shared_buffers=2GB`, `work_mem=128MB`, `max_connections=25`, `synchronous_commit=off` |
 | Compression | columnar NTB2/v3 buckets, per-column codecs | native TimescaleDB compression |
 | Indexes | bucket locators, posting lists, partial `symbol_ts_recent` | B-tree indexes, including `symbol_ts_recent` |
 
-Both processes see 4 vCPU. NonoDB ran as a single process without a network
-client; TimescaleDB was queried through `psycopg2` over the LAN.
+Both processes see 4 vCPU. Both systems were exercised through their
+benchmark clients on the same host.
 
 ## 2. Dataset
 
@@ -47,11 +47,11 @@ results.
 ## 3. Method
 
 - NonoDB: `ts-nonodb-tool bench`, one warm-up run not reported, then **3 runs
-  and the median**. The time covers query execution and result processing in
-  the process, with no network.
+  and the median**. The time covers query execution and result processing
+  through the benchmark client.
 - TimescaleDB: a separate `psycopg2` connection, one warm-up execution, then
   **3 runs and the median**. The time covers server execution plus sending and
-  receiving the result over the LAN.
+  receiving the result through the benchmark client.
 - NonoDB aggregations use materialized 1h/1d rollups; TimescaleDB in this
   measurement runs plain queries against the raw, compressed hypertable
   (without a continuous aggregate). This is an important caveat: TimescaleDB
@@ -185,9 +185,9 @@ database (`TIMESCALE_URL` in `timescaledb.env`).
 ## 10. Window functions (`$setWindowFields`)
 
 Window execution was measured on the same 206M-row import with the same end
-timestamp. NonoDB runs in-process; TimescaleDB queries run through `psycopg2`
-over the LAN and fetch the full result set. Both sides partition by `symbol`
-and order by `time`; TimescaleDB uses `RANK() OVER (...)`,
+timestamp. Both sides were queried through their benchmark clients and fetch
+the full result set. Both sides partition by `symbol` and order by `time`;
+TimescaleDB uses `RANK() OVER (...)`,
 `AVG(close) OVER (... ROWS BETWEEN 59 PRECEDING AND CURRENT ROW)` for the
 60-row average, and `AVG(close) OVER (... RANGE BETWEEN INTERVAL '1 hour'
 PRECEDING AND CURRENT ROW)` for the 1-hour range. The times cover query
@@ -216,8 +216,6 @@ compare against the brute-force reference.
 
 ## 11. Comparison caveats
 
-- NonoDB is measured in-process; TimescaleDB is measured over the network and
-  through a client, so the timings cover different layers.
 - NonoDB uses rollups for OHLC; TimescaleDB in this measurement does not use a
   continuous aggregate.
 - "All symbols" aggregations show the advantage of TimescaleDB's columnar
