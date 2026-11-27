@@ -22,6 +22,8 @@ quick-start instructions, and a feature overview.
 | [Dates and time zones](dates.md) | Application developers | BSON-compatible dates, RFC 3339 input, filtering, indexes, sorting, timezone semantics |
 | [Time-series collections](timeseries.md) | Application developers, evaluators | `profile: "timeseries"`, per-series/window buckets, columnar codecs, aggregation, retention, indexes, SQL, replication, limits |
 | [Time-series benchmark vs TimescaleDB](timescale-benchmark.md) | Evaluators, maintainers | Dataset, methodology, results, caveats, and reproduction for NonoDB and TimescaleDB |
+| [Columnar collections plan](columnar-collections-plan.md) | Maintainers, evaluators | Proposed general-purpose bucket-columnar profile, architecture, phases, benchmark plan, and risks |
+| [Columnar collections acceptance](columnar-collections-acceptance.md) | Maintainers, reviewers | Mandatory semantic, operational, and performance parity gates for the columnar profile |
 | [Numbers and decimals](numerics.md) | Application developers | Exact numeric comparison, Decimal128, arithmetic, NaN/Infinity, index compatibility, long text limits |
 | [BSON scalar types](bson-types.md) | Application developers | `$numberInt`/`$numberLong`, `$type`, binary/UUID, ObjectId, Timestamp, MinKey/MaxKey, index compatibility |
 | [Clients](clients.md) | Application developers | Python, Rust, Node.js and Go: install, connection, CRUD, batches, indexes, search, aggregation |
