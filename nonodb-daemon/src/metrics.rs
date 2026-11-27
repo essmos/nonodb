@@ -30,6 +30,11 @@ pub static WATCH_TRUNCATED: AtomicU64 = AtomicU64::new(0);
 pub static WATCH_HEARTBEATS: AtomicU64 = AtomicU64::new(0);
 pub static WATCH_THRESHOLD_EMITTED: AtomicU64 = AtomicU64::new(0);
 pub static WATCH_THRESHOLD_SUPPRESSED: AtomicU64 = AtomicU64::new(0);
+/// Stream consumer-group counters.
+pub static STREAM_CLAIMS: AtomicU64 = AtomicU64::new(0);
+pub static STREAM_REDELIVERIES: AtomicU64 = AtomicU64::new(0);
+pub static STREAM_NACKS: AtomicU64 = AtomicU64::new(0);
+pub static STREAM_DEAD_LETTERS: AtomicU64 = AtomicU64::new(0);
 /// SQL statement counters and total execution time.
 pub static SQL_SELECT: AtomicU64 = AtomicU64::new(0);
 pub static SQL_INSERT: AtomicU64 = AtomicU64::new(0);
@@ -1060,6 +1065,85 @@ pub fn append_replication_metrics(
     }
 }
 
+/// One `(database, stream, group, committed, head, lag, inflight, dead)` row.
+pub type StreamMetricRow = (String, String, String, u64, u64, u64, u64, u64);
+
+/// Appends per-group stream metrics gathered from every open database.
+pub fn append_stream_metrics(out: &mut String, rows: &[StreamMetricRow]) {
+    prom_header(
+        out,
+        "nonodb_stream_committed_seq",
+        "gauge",
+        "Committed offset of a consumer group.",
+    );
+    for (database, stream, group, committed, _head, _lag, _inflight, _dead) in rows {
+        prom_sample(
+            out,
+            "nonodb_stream_committed_seq",
+            &[
+                ("database", database.as_str()),
+                ("stream", stream.as_str()),
+                ("group", group.as_str()),
+            ],
+            &json!(committed),
+        );
+    }
+    prom_header(
+        out,
+        "nonodb_stream_lag_events",
+        "gauge",
+        "Events between a group offset and the stream head.",
+    );
+    for (database, stream, group, _committed, _head, lag, _inflight, _dead) in rows {
+        prom_sample(
+            out,
+            "nonodb_stream_lag_events",
+            &[
+                ("database", database.as_str()),
+                ("stream", stream.as_str()),
+                ("group", group.as_str()),
+            ],
+            &json!(lag),
+        );
+    }
+    prom_header(
+        out,
+        "nonodb_stream_inflight_events",
+        "gauge",
+        "Events leased to members but not yet committed.",
+    );
+    for (database, stream, group, _committed, _head, _lag, inflight, _dead) in rows {
+        prom_sample(
+            out,
+            "nonodb_stream_inflight_events",
+            &[
+                ("database", database.as_str()),
+                ("stream", stream.as_str()),
+                ("group", group.as_str()),
+            ],
+            &json!(inflight),
+        );
+    }
+    prom_header(
+        out,
+        "nonodb_stream_dead_events",
+        "gauge",
+        "Dead-lettered events of a consumer group.",
+    );
+    for (database, stream, group, _committed, _head, _lag, _inflight, dead) in rows {
+        prom_sample(
+            out,
+            "nonodb_stream_dead_events",
+            &[
+                ("database", database.as_str()),
+                ("stream", stream.as_str()),
+                ("group", group.as_str()),
+            ],
+            &json!(dead),
+        );
+    }
+}
+
 pub fn prometheus() -> String {
     let snapshot = snapshot();
     let mut out = String::with_capacity(16 * 1024);
@@ -1125,6 +1209,26 @@ pub fn prometheus() -> String {
             "nonodb_watch_truncated_total",
             "watch_truncated_total",
             "Watch requests with an expired cursor.",
+        ),
+        (
+            "nonodb_stream_claims_total",
+            "stream_claims_total",
+            "Consumer-group batches claimed.",
+        ),
+        (
+            "nonodb_stream_redeliveries_total",
+            "stream_redeliveries_total",
+            "Consumer-group batches delivered more than once.",
+        ),
+        (
+            "nonodb_stream_nacks_total",
+            "stream_nacks_total",
+            "Consumer-group batches released with nack.",
+        ),
+        (
+            "nonodb_stream_dead_letters_total",
+            "stream_dead_letters_total",
+            "Consumer-group batches dead-lettered.",
         ),
         (
             "nonodb_watch_heartbeats_total",

@@ -180,19 +180,33 @@ pub fn authorize_request(
         | Request::DropStream { coll }
         | Request::CreateStreamGroup { coll, .. }
         | Request::ResetStreamGroup { coll, .. }
-        | Request::DeleteStreamGroup { coll, .. } => allow(
+        | Request::DeleteStreamGroup { coll, .. }
+        | Request::RetryStreamDead { coll, .. }
+        | Request::DropStreamDead { coll, .. } => allow(
             principal,
             Action::AdminCollection,
             database,
             coll,
             req.op_name(),
         ),
-        // Consuming a group: claim and acknowledge. `consume:<coll>` or
+        // Consuming a group: claim, acknowledge, release. `consume:<coll>` or
         // `admin:<coll>` is enough; plain `read` is not.
-        Request::ClaimStreamGroup { coll, .. } | Request::CommitStreamGroup { coll, .. } => {
+        Request::ClaimStreamGroup { coll, .. }
+        | Request::CommitStreamGroup { coll, .. }
+        | Request::NackStreamGroup { coll, .. } => {
             allow(principal, Action::Consume, database, coll, req.op_name())
         }
         Request::ListStreams => Ok(()),
+        Request::StreamDead { coll, .. } => match coll {
+            Some(coll) => allow(principal, Action::Read, database, coll, req.op_name()),
+            None => {
+                if principal.allows_database_admin(database) {
+                    Ok(())
+                } else {
+                    Err(ApiError::forbidden())
+                }
+            }
+        },
         Request::StreamStats { coll } => match coll {
             Some(coll) => allow(principal, Action::Read, database, coll, req.op_name()),
             None => {
@@ -604,6 +618,7 @@ mod tests {
             group: "workers".into(),
             member: "w1".into(),
             lease_ms: None,
+            limit: None,
         };
         assert!(authorize_request(&reader, &claim, "app1").is_err());
         let consumer = principal(&["consume:orders"]);
@@ -645,6 +660,7 @@ mod tests {
             coll: "orders".into(),
             group: "workers".into(),
             start: nonodb_core::streams::StartAt::Latest,
+            max_attempts: None,
         };
         assert!(authorize_request(&consumer, &create, "app1").is_err());
         let group_admin = principal(&["admin:app1/orders"]);

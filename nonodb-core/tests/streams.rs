@@ -57,7 +57,7 @@ fn inserts_get_monotonic_offsets_and_reserved_field_is_rejected() {
 }
 
 #[test]
-fn group_commits_are_fenced_and_monotonic() {
+fn batches_are_fenced_and_commit_in_order() {
     let (_dir, store) = stream_store();
     let events = store.collection("_events").unwrap();
     for n in 0..3 {
@@ -72,46 +72,177 @@ fn group_commits_are_fenced_and_monotonic() {
     events.insert_one(json!({"n": 3})).unwrap();
     events.insert_one(json!({"n": 4})).unwrap();
 
-    let claimed = store
-        .claim_stream_group("_events", "orders", "worker-1", 60_000)
+    // Two members share one group: each gets a distinct contiguous range.
+    let first = store
+        .claim_stream_lease("_events", "orders", "worker-1", 1, 60_000)
+        .unwrap()
         .unwrap();
-    let lease = claimed.lease_id.clone().unwrap();
-    assert_eq!(claimed.committed_seq, 3);
-
-    // Another member cannot steal an active lease.
-    let err = store
-        .claim_stream_group("_events", "orders", "worker-2", 60_000)
-        .unwrap_err();
-    assert!(matches!(err, Error::StaleLease(_)), "{err:?}");
+    let second = store
+        .claim_stream_lease("_events", "orders", "worker-2", 1, 60_000)
+        .unwrap()
+        .unwrap();
+    assert_eq!((first.from_seq, first.to_seq), (4, 4));
+    assert_eq!((second.from_seq, second.to_seq), (5, 5));
 
     // A commit from a lease that does not own the batch is rejected.
     let err = store
-        .commit_stream_group("_events", "orders", 5, Some("not-the-lease"))
+        .ack_stream_lease("_events", "orders", "not-a-lease", 4)
         .unwrap_err();
     assert!(matches!(err, Error::StaleLease(_)), "{err:?}");
 
-    let committed = store
-        .commit_stream_group("_events", "orders", 5, Some(&lease))
-        .unwrap();
-    assert_eq!(committed.committed_seq, 5);
-    assert!(committed.lease_id.is_none());
-
-    // Moving backwards is rejected; committing past the head is rejected.
+    // Committing outside the leased range is rejected.
+    let first_lease = first.lease_id.clone().unwrap();
     let err = store
-        .commit_stream_group("_events", "orders", 4, None)
-        .unwrap_err();
-    assert!(matches!(err, Error::CommitOutOfOrder(_)), "{err:?}");
-    let err = store
-        .commit_stream_group("_events", "orders", 99, None)
+        .ack_stream_lease("_events", "orders", &first_lease, 9)
         .unwrap_err();
     assert!(matches!(err, Error::CommitOutOfOrder(_)), "{err:?}");
 
-    // A second member takes over after the commit cleared the lease.
-    let next = store
-        .claim_stream_group("_events", "orders", "worker-2", 60_000)
+    // The later range can finish first, but the committed offset only moves
+    // when the earlier range finishes too.
+    let second_lease = second.lease_id.clone().unwrap();
+    store
+        .ack_stream_lease("_events", "orders", &second_lease, 5)
         .unwrap();
-    assert_eq!(next.committed_seq, 5);
-    assert_eq!(next.member.as_deref(), Some("worker-2"));
+    assert_eq!(
+        store
+            .stream_group("_events", "orders")
+            .unwrap()
+            .unwrap()
+            .committed_seq,
+        3
+    );
+    store
+        .ack_stream_lease("_events", "orders", &first_lease, 4)
+        .unwrap();
+    let group = store.stream_group("_events", "orders").unwrap().unwrap();
+    assert_eq!(group.committed_seq, 5);
+    assert_eq!(group.next_seq, 5);
+
+    // Committing the same batch twice is rejected.
+    let err = store
+        .ack_stream_lease("_events", "orders", &first_lease, 4)
+        .unwrap_err();
+    assert!(matches!(err, Error::StaleLease(_)), "{err:?}");
+
+    // The group is caught up: no batch to claim.
+    assert!(store
+        .claim_stream_lease("_events", "orders", "worker-1", 10, 60_000)
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn expired_lease_is_redelivered_and_dead_letters_after_max_attempts() {
+    let (_dir, store) = stream_store();
+    let events = store.collection("_events").unwrap();
+    for n in 0..3 {
+        events.insert_one(json!({"n": n})).unwrap();
+    }
+    let mut group = store
+        .create_stream_group("_events", "retry", StartAt::Earliest)
+        .unwrap();
+    group.max_attempts = 2;
+    let mut wtxn = store.write_txn().unwrap();
+    store.put_stream_group_in(&mut wtxn, &group).unwrap();
+    wtxn.commit().unwrap();
+
+    // First delivery, then the member "dies" without committing.
+    let first = store
+        .claim_stream_lease("_events", "retry", "worker-1", 3, 1_000)
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.attempts, 1);
+    std::thread::sleep(std::time::Duration::from_millis(1_200));
+
+    // The expired range is redelivered with a higher attempt counter.
+    let second = store
+        .claim_stream_lease("_events", "retry", "worker-2", 3, 1_000)
+        .unwrap()
+        .unwrap();
+    assert_eq!((second.from_seq, second.to_seq), (1, 3));
+    assert_eq!(second.attempts, 2);
+    std::thread::sleep(std::time::Duration::from_millis(1_200));
+
+    // Attempts are exhausted: the batch becomes a dead letter and the group is
+    // not blocked by it.
+    assert!(store
+        .claim_stream_lease("_events", "retry", "worker-1", 3, 1_000)
+        .unwrap()
+        .is_none());
+    let dead = store
+        .stream_dead_letters(Some("_events"), Some("retry"))
+        .unwrap();
+    assert_eq!(dead.len(), 1);
+    assert_eq!((dead[0].from_seq, dead[0].to_seq), (1, 3));
+    assert_eq!(
+        store
+            .stream_group("_events", "retry")
+            .unwrap()
+            .unwrap()
+            .committed_seq,
+        3
+    );
+
+    // Retrying a dead letter puts it back in the queue; dropping removes it.
+    assert!(store.retry_stream_dead("_events", "retry", 1).unwrap());
+    assert!(store
+        .stream_dead_letters(Some("_events"), Some("retry"))
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        store
+            .claim_stream_lease("_events", "retry", "worker-1", 3, 1_000)
+            .unwrap()
+            .unwrap()
+            .attempts,
+        1
+    );
+}
+
+#[test]
+fn nack_releases_a_batch_before_attempts_run_out() {
+    let (_dir, store) = stream_store();
+    let events = store.collection("_events").unwrap();
+    events.insert_one(json!({"n": 0})).unwrap();
+    store
+        .create_stream_group("_events", "nack", StartAt::Earliest)
+        .unwrap();
+
+    let claim = store
+        .claim_stream_lease("_events", "nack", "worker-1", 1, 60_000)
+        .unwrap()
+        .unwrap();
+    let lease_id = claim.lease_id.clone().unwrap();
+    let released = store
+        .nack_stream_lease("_events", "nack", &lease_id, 0)
+        .unwrap();
+    assert_eq!(released.attempts, 1);
+    assert_eq!(
+        store
+            .stream_leases("_events", "nack")
+            .unwrap()
+            .first()
+            .unwrap()
+            .status,
+        nonodb_core::streams::LeaseStatus::Available
+    );
+
+    let again = store
+        .claim_stream_lease("_events", "nack", "worker-2", 1, 60_000)
+        .unwrap()
+        .unwrap();
+    assert_eq!(again.attempts, 2);
+    store
+        .ack_stream_lease("_events", "nack", again.lease_id.as_deref().unwrap(), 1)
+        .unwrap();
+    assert_eq!(
+        store
+            .stream_group("_events", "nack")
+            .unwrap()
+            .unwrap()
+            .committed_seq,
+        1
+    );
 }
 
 #[test]
@@ -125,10 +256,16 @@ fn committed_offset_survives_reopen() {
         .create_stream_group("_events", "restart", StartAt::Earliest)
         .unwrap();
     let claimed = store
-        .claim_stream_group("_events", "restart", "worker-1", 60_000)
+        .claim_stream_lease("_events", "restart", "worker-1", 2, 60_000)
+        .unwrap()
         .unwrap();
     store
-        .commit_stream_group("_events", "restart", 2, claimed.lease_id.as_deref())
+        .ack_stream_lease(
+            "_events",
+            "restart",
+            claimed.lease_id.as_deref().unwrap(),
+            2,
+        )
         .unwrap();
     drop(store);
 
@@ -195,7 +332,8 @@ fn stats_match_a_manual_drain_and_reset_moves_the_group() {
         .reset_stream_group("_events", "stats", ResetTo::Latest)
         .unwrap();
     assert_eq!(reset.committed_seq, head);
-    assert!(reset.lease_id.is_none());
+    assert_eq!(reset.next_seq, head);
+    assert!(store.stream_leases("_events", "stats").unwrap().is_empty());
 
     let reset = store
         .reset_stream_group("_events", "stats", ResetTo::Seq(2))
@@ -264,16 +402,89 @@ fn dropping_a_stream_keeps_data_and_groups() {
 }
 
 #[test]
-fn streams_require_a_standard_collection() {
-    let (_dir, store) = store();
+fn a_promoted_node_redelivers_claimed_but_uncommitted_ranges() {
+    let (_dir, store) = stream_store();
+    let events = store.collection("_events").unwrap();
+    for n in 1..=5 {
+        events.insert_one(json!({ "n": n })).unwrap();
+    }
     store
-        .create_timeseries_collection("metrics", &Default::default())
+        .create_stream_group("_events", "g", StartAt::Earliest)
         .unwrap();
-    let mut def = nonodb_core::streams::StreamDef::new("metrics", "metrics");
-    def.retention.max_events = None;
-    let err = store.set_stream(&def).unwrap_err();
-    assert!(
-        matches!(err, Error::Query(ref message) if message.contains("only standard collections")),
-        "unexpected error: {err:?}"
+
+    let mut wtxn = store.write_txn().unwrap();
+    let lease = store
+        .claim_stream_lease_in(&mut wtxn, "_events", "g", "a", 3, 60_000)
+        .unwrap()
+        .unwrap();
+    wtxn.commit().unwrap();
+    assert_eq!((lease.from_seq, lease.to_seq), (1, 3));
+    assert_eq!(
+        store
+            .stream_group("_events", "g")
+            .unwrap()
+            .unwrap()
+            .next_seq,
+        3
     );
+
+    // A promoted replica never saw the claim: leases are node-local, so it
+    // starts from its own (empty) lease table.
+    assert_eq!(store.clear_stream_leases("_events", "g").unwrap(), 1);
+    let mut wtxn = store.write_txn().unwrap();
+    let lease = store
+        .claim_stream_lease_in(&mut wtxn, "_events", "g", "b", 3, 60_000)
+        .unwrap()
+        .unwrap();
+    wtxn.commit().unwrap();
+    assert_eq!(
+        (lease.from_seq, lease.to_seq),
+        (1, 3),
+        "ranges claimed but never committed must be redelivered, not skipped"
+    );
+}
+
+#[test]
+fn claim_readiness_is_read_only_and_false_when_caught_up() {
+    let (_dir, store) = stream_store();
+    let events = store.collection("_events").unwrap();
+    events.insert_one(json!({ "n": 1 })).unwrap();
+    events.insert_one(json!({ "n": 2 })).unwrap();
+    store
+        .create_stream_group("_events", "g", StartAt::Earliest)
+        .unwrap();
+
+    assert!(store.stream_claim_ready("_events", "g").unwrap());
+    let mut wtxn = store.write_txn().unwrap();
+    let lease = store
+        .claim_stream_lease_in(&mut wtxn, "_events", "g", "a", 10, 60_000)
+        .unwrap()
+        .unwrap();
+    wtxn.commit().unwrap();
+
+    // Leased but not committed: nothing new to claim, and no write happens.
+    let before = store.stream_group("_events", "g").unwrap().unwrap();
+    assert!(!store.stream_claim_ready("_events", "g").unwrap());
+    assert!(store
+        .claim_stream_lease("_events", "g", "b", 10, 60_000)
+        .unwrap()
+        .is_none());
+    let after = store.stream_group("_events", "g").unwrap().unwrap();
+    assert_eq!(
+        (before.next_seq, before.updated_at),
+        (after.next_seq, after.updated_at),
+        "an idle claim must not write the group row"
+    );
+
+    store
+        .ack_stream_lease(
+            "_events",
+            "g",
+            lease.lease_id.as_deref().unwrap(),
+            lease.to_seq,
+        )
+        .unwrap();
+    assert!(!store.stream_claim_ready("_events", "g").unwrap());
+    events.insert_one(json!({ "n": 3 })).unwrap();
+    assert!(store.stream_claim_ready("_events", "g").unwrap());
 }

@@ -79,6 +79,7 @@ def main() -> int:
                 ),
                 NONODB_REPLICATION_VOTER_TOKEN=token,
                 NONODB_REPLICATION_POLL_INTERVAL="1",
+
                 # The primary needs a live lease to accept writes; the streams
                 # scenario below writes before the promotion.
                 NONODB_REPLICATION_LEASE_INTERVAL="1",
@@ -138,6 +139,93 @@ def main() -> int:
         else:
             raise RuntimeError("replica never applied the bootstrapped collection/stream")
 
+        def stats_on(client, coll):
+            streams = exec_on(client, {"op": "stream_stats", "coll": coll})["streams"]
+            return streams[0] if streams else None
+
+        # --- streams: leaked claims, janitor replication, and failover ---
+        exec_on(
+            primary,
+            {
+                "op": "create_stream_group",
+                "coll": "ledger",
+                "group": "workers",
+                "start": "earliest",
+            },
+        )
+        for n in range(3):
+            exec_on(primary, {"op": "insert", "coll": "ledger", "doc": {"n": n}})
+
+        # A claim that is never committed. The group row replicates, the lease
+        # does not: the promoted replica must deliver this range again.
+        claim = exec_on(
+            primary,
+            {
+                "op": "watch",
+                "coll": "ledger",
+                "mode": "group",
+                "group": "workers",
+                "member": "w1",
+                "limit": 2,
+                "lease_ms": 60_000,
+                "timeout_ms": 100,
+            },
+        )
+        assert (claim["from_seq"], claim["to_seq"]) == (1, 2), claim
+
+        # A range whose lease expires into a dead letter must reach replicas.
+        exec_on(
+            primary,
+            {
+                "op": "create_stream_group",
+                "coll": "ledger",
+                "group": "poison",
+                "start": "earliest",
+                "max_attempts": 1,
+            },
+        )
+        poison = exec_on(
+            primary,
+            {
+                "op": "watch",
+                "coll": "ledger",
+                "mode": "group",
+                "group": "poison",
+                "member": "p1",
+                "limit": 10,
+                "lease_ms": 1_000,
+                "timeout_ms": 100,
+            },
+        )
+        assert (poison["from_seq"], poison["to_seq"]) == (1, 3), poison
+        time.sleep(1.3)
+        # The next claim recovers the expired lease and dead-letters it; the
+        # resulting committed offset and dead record must replicate.
+        exec_on(
+            primary,
+            {
+                "op": "watch",
+                "coll": "ledger",
+                "mode": "group",
+                "group": "poison",
+                "member": "p2",
+                "limit": 10,
+                "timeout_ms": 100,
+            },
+        )
+        deadline = time.monotonic() + 20
+        replicated = None
+        while time.monotonic() < deadline:
+            dead = exec_on(
+                replica, {"op": "stream_dead", "coll": "ledger", "group": "poison"}
+            )
+            if dead["dead"]:
+                replicated = dead
+                break
+            time.sleep(0.2)
+        assert replicated, "expired lease was dead-lettered on the primary only"
+        assert replicated["dead"][0]["from_seq"] == 1, replicated
+
         promoted = replica.post(
             "/v1/replication/promote",
             headers=headers,
@@ -178,6 +266,30 @@ def main() -> int:
         assert blocked.status_code == 403, blocked.text
         assert blocked.json()["error"]["code"] == "read_only", blocked.text
         assert blocked.headers.get("location") == f"http://127.0.0.1:{replica_port}"
+
+        # The promoted node never saw the lease for `1..=2`, so its next claim
+        # resumes at the committed offset and redelivers the range.
+        resumed = exec_on(
+            replica,
+            {
+                "op": "watch",
+                "coll": "ledger",
+                "mode": "group",
+                "group": "workers",
+                "member": "w2",
+                "limit": 2,
+                "lease_ms": 60_000,
+                "timeout_ms": 100,
+            },
+        )
+        assert (resumed["from_seq"], resumed["to_seq"]) == (1, 2), (
+            "a promoted replica must redeliver claimed-but-uncommitted ranges: "
+            f"{resumed}"
+        )
+        still_dead = exec_on(
+            replica, {"op": "stream_dead", "coll": "ledger", "group": "poison"}
+        )
+        assert still_dead["dead"], still_dead
 
         print(json.dumps({"ok": True, "new_epoch": role["epoch"], "old_role": old["role"]}))
         return 0

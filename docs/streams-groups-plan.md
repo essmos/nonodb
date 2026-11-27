@@ -1,7 +1,8 @@
 # Streams with durable offsets and consumer groups — implementation plan
 
-Status: phase 1 implemented (server-side offsets, groups, lease-fenced commits).
-Phases 2-4 remain. Target release: after `v0.34.0`.
+Status: phases 1-2 implemented (server-side offsets, groups, lease-fenced
+commits, range leases with redelivery and dead letters). Phases 3-4 remain.
+Target release: after `v0.34.0`.
 
 This document records the design decision for turning the outbox-and-watch
 machinery into a stream with server-side offsets, consumer groups, and
