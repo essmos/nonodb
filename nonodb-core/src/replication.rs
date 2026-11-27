@@ -185,6 +185,18 @@ pub enum ReplicationOp {
     StreamLeaseDead {
         lease: StreamLease,
     },
+    /// Drop one dead-lettered range (retried or discarded) on replicas.
+    StreamDeadDelete {
+        stream: String,
+        group: String,
+        from_seq: u64,
+    },
+    /// Drop the node-local leases and dead records of one group on replicas
+    /// (group reset or recreation).
+    StreamGroupClear {
+        stream: String,
+        group: String,
+    },
     SubscriptionDelete {
         coll: String,
         name: String,

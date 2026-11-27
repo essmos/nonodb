@@ -1300,6 +1300,10 @@ fn execute(
         }
         WriteReq::ResetStreamGroup { coll, group, to } => {
             let out = store.reset_stream_group_in(wtxn, coll, group, *to)?;
+            replication.capture_op(ReplicationOp::StreamGroupClear {
+                stream: coll.clone(),
+                group: group.clone(),
+            });
             replication.capture_op(ReplicationOp::StreamGroupSet { group: out.clone() });
             Ok(serde_json::to_value(out).map_err(nonodb_core::Error::from)?)
         }
@@ -1387,6 +1391,9 @@ fn execute(
             crate::metrics::inc(&crate::metrics::STREAM_NACKS);
             if dead {
                 crate::metrics::add(&crate::metrics::STREAM_DEAD_LETTERS, lease.events());
+                replication.capture_op(ReplicationOp::StreamLeaseDead {
+                    lease: lease.clone(),
+                });
             }
             if let Some(group_row) = store.stream_group_in_rw(wtxn, coll, group)? {
                 replication.capture_op(ReplicationOp::StreamGroupSet { group: group_row });
@@ -1426,6 +1433,13 @@ fn execute(
             from_seq,
         } => {
             let retried = store.retry_stream_dead_in(wtxn, coll, group, *from_seq)?;
+            if retried {
+                replication.capture_op(ReplicationOp::StreamDeadDelete {
+                    stream: coll.clone(),
+                    group: group.clone(),
+                    from_seq: *from_seq,
+                });
+            }
             Ok(json!({ "retried": retried }))
         }
         WriteReq::DropStreamDead {
@@ -1434,6 +1448,13 @@ fn execute(
             from_seq,
         } => {
             let dropped = store.drop_stream_dead_in(wtxn, coll, group, *from_seq)?;
+            if dropped {
+                replication.capture_op(ReplicationOp::StreamDeadDelete {
+                    stream: coll.clone(),
+                    group: group.clone(),
+                    from_seq: *from_seq,
+                });
+            }
             Ok(json!({ "dropped": dropped }))
         }
         WriteReq::PruneSubscriptions => {
