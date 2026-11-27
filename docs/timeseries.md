@@ -405,12 +405,12 @@ Same 100k-row workload (10 series, 8 columns, 183 bytes of JSON per row),
 | Form | Size | Bytes/row |
 |---|---|---|
 | raw JSON documents | 17.47 MB | 183.2 |
-| standard collection (`data.mdb`, no indexes) | 41.35 MB | 433.6 |
-| TS, pending rows before seal (`data.mdb`) | 7.53 MB | 78.9 |
-| TS, sealed, before compaction (`data.mdb`) | 7.53 MB | 78.9 |
-| TS, sealed, compacted copy | **0.53 MB** | **14.75** |
-| TS after deleting 25k rows (bitmap), compacted | 1.00 MB | 26.7 |
-| TS after retention leaves 37.5k rows, compacted | 0.53 MB | 14.75 |
+| standard collection (`data.mdb`, no indexes) | 41.59 MB | 436.1 |
+| TS, pending rows before seal (`data.mdb`) | 8.04 MB | 84.3 |
+| TS, sealed, before compaction (`data.mdb`) | 8.18 MB | 85.7 |
+| TS, sealed, compacted copy | **1.02 MB** | **10.69** |
+| TS after deleting 25k rows (bitmap), compacted | 1.02 MB | 14.3 |
+| TS after retention leaves 37.5k rows, compacted | 0.54 MB | 15.07 |
 
 Read that carefully, because it matters operationally:
 
@@ -678,7 +678,7 @@ Storage for TimescaleDB is `hypertable_size` after native compression
 | Delete by id | 20 µs | 14.8 ms | 1.33 ms |
 | Indexed status+series, limit 100 | 0.36 ms | 33.1 ms | 1.11 ms |
 | Create index on status | 209 ms | 919 ms | 222 ms |
-| Storage, 100k rows | 41.35 MB | **0.53 MB** (compacted) | 1.98 MB (compressed) |
+| Storage, 100k rows | 41.59 MB | **1.02 MB** (compacted) | 1.98 MB (compressed) |
 
 TimescaleDB wins the point/update/delete and highly selective indexed queries
 because it is a general OLTP engine with native B-tree indexes. NonoDB
