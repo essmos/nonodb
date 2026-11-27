@@ -96,7 +96,7 @@ export class NonoDB {
   capabilities(): Promise<Capabilities>;
   exec(payload: Record<string, unknown>): Promise<any>;
   collections(): Promise<string[]>;
-  createCollection(name: string, profile?: string, ttlSeconds?: number | null, purgeHistory?: boolean | null): Promise<any>;
+  createCollection(name: string, profile?: string, ttlSeconds?: number | null, purgeHistory?: boolean | null, timeseries?: Record<string, unknown> | null): Promise<any>;
   setCollectionTtl(name: string, ttlSeconds: number | null, purgeHistory?: boolean | null): Promise<any>;
   collectionTtl(name: string): Promise<number | null>;
   sql(query: string, params?: unknown[]): Promise<Record<string, any>[]>;

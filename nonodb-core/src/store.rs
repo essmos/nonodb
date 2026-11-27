@@ -266,6 +266,43 @@ pub struct CompactReport {
     pub after_bytes: u64,
 }
 
+/// Restores the database if a previous compaction crashed between its two swaps.
+///
+/// The normal compaction sequence is:
+/// `data.mdb -> data.mdb.before-compact` then `data.mdb.compacting -> data.mdb`.
+/// A crash can leave only the backup or the compacting copy in place.
+fn recover_interrupted_compaction(data: &Path) -> Result<()> {
+    let source = data.join("data.mdb");
+    let backup = data.join("data.mdb.before-compact");
+    let tmp = data.join("data.mdb.compacting");
+    let mut changed = false;
+    if !source.exists() {
+        if backup.is_file() {
+            std::fs::rename(&backup, &source)?;
+            changed = true;
+        } else if tmp.is_file() {
+            std::fs::rename(&tmp, &source)?;
+            changed = true;
+        }
+    }
+    if source.exists() {
+        if tmp.exists() {
+            std::fs::remove_file(&tmp)?;
+            changed = true;
+        }
+        if backup.exists() {
+            std::fs::remove_file(&backup)?;
+            changed = true;
+        }
+    }
+    if changed {
+        if let Ok(dir) = std::fs::File::open(data) {
+            let _ = dir.sync_all();
+        }
+    }
+    Ok(())
+}
+
 /// Rewrites `data.mdb` through LMDB's compacting copy and swaps it in.
 ///
 /// LMDB never shrinks the file when rows are deleted; this is the offline way
@@ -341,6 +378,7 @@ impl Store {
         }
         let path = path.as_ref();
         std::fs::create_dir_all(path)?;
+        recover_interrupted_compaction(path)?;
 
         // SAFETY: the file is not modified outside LMDB and is not opened
         // concurrently with another `map_size` (the daemon is the sole owner).
@@ -2794,6 +2832,29 @@ mod tests {
         assert_eq!(parse_size("512mb"), Some(512_000_000));
         assert_eq!(parse_size("1073741824"), Some(1 << 30));
         assert_eq!(parse_size("nonsense"), None);
+    }
+
+    #[test]
+    fn store_open_recovers_interrupted_compaction_swap() {
+        use serde_json::json;
+        let dir = tempfile::tempdir().unwrap();
+        let store = super::Store::open(dir.path()).unwrap();
+        let c = store.collection("docs").unwrap();
+        c.insert_one(json!({"_id": "a", "value": 1})).unwrap();
+        store.close();
+
+        let source = dir.path().join("data.mdb");
+        let backup = dir.path().join("data.mdb.before-compact");
+        std::fs::rename(&source, &backup).unwrap();
+        assert!(!source.exists());
+
+        let store = super::Store::open(dir.path()).unwrap();
+        assert_eq!(
+            store.collection("docs").unwrap().count(&json!({})).unwrap(),
+            1
+        );
+        assert!(source.exists());
+        assert!(!backup.exists());
     }
 
     #[test]

@@ -2,7 +2,32 @@
 
 Full release notes: https://github.com/essmos/nonodb/releases
 
-## v0.32.0 - 2026-11-23
+## Unreleased
+
+- Remove orphaned `.dropped-*` database directories at startup. A failed
+  `remove_dir_all` no longer turns an already-committed database drop into an
+  error.
+- Add aggregation `$convert` with `input`, `to`, `onNull`, and `onError`, plus
+  `$toString`, `$toInt`, `$toLong`, `$toDouble`, `$toDecimal`, `$toBool`, and
+  `$toDate`. `$lookup` pipelines using `let` and these expressions are covered.
+- Add date-field TTL through `set_collection_ttl_after` and idempotent
+  `backfill_collection_ttl` pages. MongoDB `createIndexes` with
+  `expireAfterSeconds` and `scripts/nonodb-migrate.py` now map the indexed date
+  field, backfill existing documents, and preserve the mode across restarts.
+  Backfilled per-document expiry is replicated so replicas hide expired
+  documents before any local sweep. Missing or non-date fields never expire;
+  explicit `_ttl` still overrides.
+- Add public `GET /v1/capabilities` with a versioned schema, feature flags, and
+  limits. Expose it through `nonodb-cli capabilities` and the Python, Node.js,
+  Rust, and Go clients.
+- Accept the documented time-series wire aliases `get_collection_timeseries`,
+  `set_collection_timeseries` (with a `timeseries` payload), and
+  `retain_timeseries`, alongside the canonical snake_case operation names.
+- Recover an interrupted offline compaction from `data.mdb.before-compact` (or
+  `data.mdb.compacting`) when `Store::open` finds no `data.mdb`, so a crash
+  during the two-step rename cannot strand the database.
+- Add a time-series settings argument to Python `create_collection` and Node.js
+  `createCollection`, covering the required `timeField`.
 
 - Add compact bucket locator indexes to time-series collections. Two
   directional keys (`series + window` and `window + series`) let `find`,
@@ -155,6 +180,9 @@ Full release notes: https://github.com/essmos/nonodb/releases
   filters, and `graph_algorithm` for bounded PageRank, degree centrality, and
   weakly connected components. Python client methods and the graph benchmark
   cover the new operations. See `docs/graph.md`.
+
+## v0.32.0 - 2026-11-23
+
 - **Upgrade: plain indexes now index a missing field as `null`.** Run
   `nonodb-cli reindex <collection>` for every collection with plain indexes
   after upgrading. Existing plain unique indexes can fail to rebuild if several

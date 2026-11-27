@@ -3020,6 +3020,10 @@ compression, and `expireAfterSeconds` can change at any time.
                 "granularity": "minutes", "compression": "max"}}
 ```
 
+The daemon accepts both the canonical `*_time_series` operation names and the
+documented `*_timeseries` aliases, and accepts either `settings` or
+`timeseries` as the settings payload key.
+
 The MongoDB wire `create` command accepts the same options:
 
 ```json

@@ -595,17 +595,21 @@ pub enum Request {
         coll: String,
     },
     /// Removes time-series rows older than `before` (date or epoch ms).
+    #[serde(alias = "retain_timeseries")]
     RetainTimeSeries {
         coll: String,
         before: Value,
     },
     /// Reads the time-series settings of a collection.
+    #[serde(alias = "get_collection_timeseries")]
     GetCollectionTimeSeries {
         coll: String,
     },
     /// Replaces the time-series settings of a collection.
+    #[serde(alias = "set_collection_timeseries")]
     SetCollectionTimeSeries {
         coll: String,
+        #[serde(alias = "timeseries")]
         settings: nonodb_core::timeseries::Settings,
     },
     /// Sets or clears the default document TTL for a collection.
@@ -1511,6 +1515,39 @@ impl ApiResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn time_series_aliases_deserialize() {
+        let get: Request = serde_json::from_value(serde_json::json!({
+            "op": "get_collection_timeseries", "coll": "readings"
+        }))
+        .unwrap();
+        assert!(matches!(get, Request::GetCollectionTimeSeries { coll } if coll == "readings"));
+
+        let retain: Request = serde_json::from_value(serde_json::json!({
+            "op": "retain_timeseries", "coll": "readings", "before": 0
+        }))
+        .unwrap();
+        assert!(matches!(retain, Request::RetainTimeSeries { .. }));
+
+        let set: Request = serde_json::from_value(serde_json::json!({
+            "op": "set_collection_timeseries",
+            "coll": "readings",
+            "timeseries": {"timeField": "ts"}
+        }))
+        .unwrap();
+        assert!(
+            matches!(set, Request::SetCollectionTimeSeries { coll, settings } if coll == "readings" && settings.time_field == "ts")
+        );
+
+        let canonical: Request = serde_json::from_value(serde_json::json!({
+            "op": "set_collection_time_series",
+            "coll": "readings",
+            "settings": {"timeField": "ts"}
+        }))
+        .unwrap();
+        assert!(matches!(canonical, Request::SetCollectionTimeSeries { .. }));
+    }
 
     #[test]
     fn raw_result_is_serialized_under_result() {
