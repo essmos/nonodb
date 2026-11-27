@@ -1405,6 +1405,40 @@ fn execute(
                 "dead": dead,
             }))
         }
+        WriteReq::PruneStream { coll, batch } => {
+            // Pruning can set `truncated_below` (and bump `truncations`) on group
+            // rows; replicas must see those markers, not just the deletions.
+            let before: Vec<nonodb_core::streams::StreamGroup> = store.stream_groups(Some(coll))?;
+            let dropped = store.prune_stream_in(wtxn, coll, *batch)?;
+            for (id, before) in &dropped {
+                replication.capture(coll, "delete", id, Some(before), None);
+            }
+            for after in store.stream_groups(Some(coll))? {
+                let changed = before
+                    .iter()
+                    .find(|row| row.group == after.group && row.stream == after.stream)
+                    .is_none_or(|row| row.truncated_below != after.truncated_below);
+                if changed {
+                    replication.capture_op(ReplicationOp::StreamGroupSet { group: after });
+                }
+            }
+            Ok(json!({ "deleted": dropped.len() }))
+        }
+        WriteReq::RecoverStreamLeases { stream, group } => {
+            let before = store.stream_group_in_rw(wtxn, stream, group)?;
+            let (recovered, dead) = store.recover_stream_leases_in(wtxn, stream, group)?;
+            if let Some(group_row) = store.stream_group_in_rw(wtxn, stream, group)? {
+                if before.as_ref().map(|row| row.committed_seq) != Some(group_row.committed_seq) {
+                    replication.capture_op(ReplicationOp::StreamGroupSet { group: group_row });
+                }
+            }
+            for lease in &dead {
+                replication.capture_op(ReplicationOp::StreamLeaseDead {
+                    lease: lease.clone(),
+                });
+            }
+            Ok(json!({ "recovered": recovered, "dead": dead.len() }))
+        }
         WriteReq::RetryStreamDead {
             coll,
             group,

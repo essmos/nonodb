@@ -42,6 +42,7 @@ mod retention;
 mod revocation;
 mod s3_import;
 mod server_info;
+mod stream_retention;
 mod wal;
 mod webhooks;
 mod writer;
@@ -416,6 +417,8 @@ async fn run_async() -> Result<(), Box<dyn std::error::Error>> {
     )
     .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
     retention::start(databases.clone(), shutdown_rx.clone())
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    stream_retention::start(databases.clone(), shutdown_rx.clone())
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
     lease::start(data.clone(), shutdown_rx.clone())
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
@@ -4606,6 +4609,10 @@ async fn exec_inner(
                     group,
                     lease_id,
                     retry_in_ms: retry_in_ms.unwrap_or(0),
+                },
+                Request::PruneStream { coll, batch } => WriteReq::PruneStream {
+                    coll,
+                    batch: batch.unwrap_or(1000).clamp(1, 10_000),
                 },
                 Request::RetryStreamDead {
                     coll,

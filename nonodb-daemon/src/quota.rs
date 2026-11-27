@@ -466,6 +466,8 @@ impl Growth {
             | CommitStreamGroup { .. }
             | ClaimStreamGroup { .. }
             | NackStreamGroup { .. }
+            | PruneStream { .. }
+            | RecoverStreamLeases { .. }
             | RetryStreamDead { .. }
             | DropStreamDead { .. } => Self::default(),
             SetCollectionEvents { .. }

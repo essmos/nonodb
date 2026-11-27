@@ -3935,5 +3935,17 @@ from `committed_seq` plus this node's leases: after a failover the claims that
 were never committed are delivered again rather than skipped. `create_stream`
 creates the collection if it does not exist (standard profile only: time-series
 and vault collections are rejected) and builds the `_seq` index, so it costs like
-an index build. `retention` is validated but not enforced yet; use TTL until the
-retention phase lands.
+an index build.
+
+Retention drops events below the slowest group offset, bounded by
+`max_events`/`max_age_ms` and `min_seq_keep`; `max_bytes` is validated but
+ignored. A group behind the retained window gets `stream_truncated` on its next
+claim and shows `truncated_below` in `stream_stats`:
+
+```json
+{"op":"prune_stream","coll":"_events","batch":1000}
+```
+
+`prune_stream` runs one retention pass (the daemon can also run it in the
+background with `NONODB_STREAM_PRUNE_INTERVAL`). Scopes: `admin:<coll>` for
+mutations, `read:<coll>` for reads.

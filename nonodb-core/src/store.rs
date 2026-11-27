@@ -1958,7 +1958,11 @@ impl Store {
             })?;
         let head = self.stream_head_in(wtxn, stream)?;
         current.committed_seq = match to {
-            ResetTo::Earliest => 0,
+            // Resume from the oldest event retention left behind, so resetting a
+            // truncated group does not immediately fail again.
+            ResetTo::Earliest => self
+                .stream_oldest_seq_in(wtxn, stream)?
+                .map_or(0, |oldest| oldest.saturating_sub(1)),
             ResetTo::Latest => head,
             ResetTo::Seq(seq) => {
                 if seq > head {
@@ -2037,9 +2041,17 @@ impl Store {
         lease_ms: u64,
     ) -> Result<Option<StreamLease>> {
         let mut wtxn = self.write_txn()?;
-        let out = self.claim_stream_lease_in(&mut wtxn, stream, group, member, limit, lease_ms)?;
-        wtxn.commit()?;
-        Ok(out)
+        match self.claim_stream_lease_in(&mut wtxn, stream, group, member, limit, lease_ms) {
+            Ok(lease) => {
+                wtxn.commit()?;
+                Ok(lease)
+            }
+            Err(error) => {
+                // Keep the `truncated_below` marker written on the error path.
+                let _ = wtxn.commit();
+                Err(error)
+            }
+        }
     }
 
     /// Acknowledges a batch in its own transaction.
@@ -2482,6 +2494,28 @@ impl Store {
             .max(leased_through)
             .saturating_add(1);
 
+        // The oldest surviving event decides whether the next offset to deliver
+        // still exists; retention may have run without touching this group. An
+        // empty window (everything pruned) still truncates a group that has
+        // offsets left to read.
+        let head = self.stream_head_in(wtxn, stream)?;
+        if next_seq <= head {
+            let oldest = self.stream_oldest_seq_in(wtxn, stream)?;
+            let crossed = match oldest {
+                Some(oldest) => oldest > next_seq,
+                // No events survive, so nothing can be delivered below the head.
+                None => true,
+            };
+            if crossed {
+                let below = oldest.unwrap_or_else(|| head.saturating_add(1));
+                group_row.truncated_below = Some(below);
+                group_row.touch();
+                self.put_stream_group_in(wtxn, &group_row)?;
+                return Err(Error::StreamTruncated(format!(
+                    "group `{stream}:{group}` fell behind the retained window at offset {below}"
+                )));
+            }
+        }
         if group_row.next_seq != next_seq.saturating_sub(1) {
             group_row.next_seq = next_seq.saturating_sub(1);
         }
@@ -2673,6 +2707,243 @@ impl Store {
             &mut *wtxn,
             Self::stream_dead_key(stream, group, from_seq).as_bytes(),
         )?)
+    }
+
+    /// Oldest `_seq` still stored in a stream collection.
+    fn stream_oldest_seq_in(&self, wtxn: &RwTxn<'_>, coll: &str) -> Result<Option<u64>> {
+        let collection = self.collection(coll)?;
+        let docs = collection.find_in(
+            wtxn,
+            &crate::collection::FindQuery {
+                // Documents written before the stream was defined have no
+                // `_seq` and must not be mistaken for "nothing is retained".
+                filter: serde_json::json!({crate::streams::SEQ_FIELD: {"$gt": 0}}),
+                projection: Some(serde_json::json!({"_seq": 1})),
+                sort: vec![(crate::streams::SEQ_FIELD.to_string(), 1)],
+                skip: 0,
+                limit: Some(1),
+                comment: None,
+                max_time_ms: None,
+                hint: None,
+            },
+        )?;
+        Ok(docs
+            .first()
+            .and_then(|doc| doc.get(crate::streams::SEQ_FIELD))
+            .and_then(Value::as_u64))
+    }
+
+    /// Newest surviving `_seq` for a collection, if any.
+    fn stream_newest_seq_in(&self, wtxn: &RwTxn<'_>, coll: &str) -> Result<Option<u64>> {
+        let collection = self.collection(coll)?;
+        let docs = collection.find_in(
+            wtxn,
+            &crate::collection::FindQuery {
+                filter: serde_json::json!({crate::streams::SEQ_FIELD: {"$gt": 0}}),
+                projection: Some(serde_json::json!({"_seq": 1})),
+                sort: vec![(crate::streams::SEQ_FIELD.to_string(), -1)],
+                skip: 0,
+                limit: Some(1),
+                comment: None,
+                max_time_ms: None,
+                hint: None,
+            },
+        )?;
+        Ok(docs
+            .first()
+            .and_then(|doc| doc.get(crate::streams::SEQ_FIELD))
+            .and_then(Value::as_u64))
+    }
+
+    /// Highest `_seq` that is provably older than `max_age_ms`.
+    ///
+    /// Walks the `_seq` index forward from the oldest surviving event for at
+    /// most one prune batch and stops at the first event that is *not* older
+    /// than the cutoff. Out-of-order timestamps, a missing `created_at`, and a
+    /// deleted head therefore block the boundary instead of widening it, so a
+    /// retention pass can never delete an event that might still be fresh.
+    /// Cost is bounded by the batch size, not by the stream length.
+    fn stream_age_limit_in(
+        &self,
+        wtxn: &RwTxn<'_>,
+        def: &StreamDef,
+        batch: usize,
+    ) -> Result<Option<u64>> {
+        let Some(max_age_ms) = def.retention.max_age_ms else {
+            return Ok(None);
+        };
+        let cutoff = crate::streams::now_ms() as i64 - max_age_ms as i64;
+        let collection = self.collection(&def.coll)?;
+        let docs = collection.find_in(
+            wtxn,
+            &crate::collection::FindQuery {
+                filter: serde_json::json!({crate::streams::SEQ_FIELD: {"$gt": 0}}),
+                projection: Some(serde_json::json!({
+                    crate::streams::SEQ_FIELD: 1,
+                    "created_at": 1,
+                    "_id": 1,
+                })),
+                sort: vec![(crate::streams::SEQ_FIELD.to_string(), 1)],
+                skip: 0,
+                limit: Some(batch.max(1)),
+                comment: None,
+                max_time_ms: None,
+                hint: None,
+            },
+        )?;
+        let mut limit = None;
+        for doc in docs {
+            let Some(seq) = doc.get(crate::streams::SEQ_FIELD).and_then(Value::as_u64) else {
+                break;
+            };
+            // Unknown age is not proof of age: stop rather than guess.
+            let Some(created_at) = crate::events::document_created_at_ms(&doc) else {
+                break;
+            };
+            if created_at >= cutoff {
+                break;
+            }
+            limit = Some(seq);
+        }
+        Ok(limit)
+    }
+
+    /// Highest `_seq` retention may drop for a stream: the minimum of the age
+    /// limit and the slowest consumer's position minus `min_seq_keep`.
+    ///
+    /// `max_bytes` is deliberately not part of the rule yet; `None` means
+    /// nothing may be dropped.
+    pub fn stream_retention_limit_in(
+        &self,
+        wtxn: &RwTxn<'_>,
+        def: &StreamDef,
+        batch: usize,
+    ) -> Result<Option<u64>> {
+        if def.retention.is_empty() {
+            return Ok(None);
+        }
+        let mut limit = self.stream_age_limit_in(wtxn, def, batch)?;
+        if let Some(max_events) = def.retention.max_events {
+            // The newest *surviving* event, not the counter head: when the head
+            // document was deleted by hand the counter would over-count and
+            // retain one event fewer than requested.
+            if let Some(newest) = self.stream_newest_seq_in(wtxn, &def.coll)? {
+                let events_limit = newest.saturating_sub(max_events);
+                limit = Some(match limit {
+                    Some(other) => other.min(events_limit),
+                    None => events_limit,
+                });
+            }
+        }
+        let groups = self.stream_groups(Some(&def.name))?;
+        if !groups.is_empty() {
+            let slowest = groups
+                .iter()
+                .map(|group| group.committed_seq)
+                .min()
+                .unwrap_or(0);
+            let consumer_limit = slowest.saturating_sub(def.retention.min_seq_keep);
+            limit = Some(match limit {
+                Some(age) => age.min(consumer_limit),
+                None => consumer_limit,
+            });
+        }
+        Ok(limit)
+    }
+
+    /// Drops up to `batch` events below the retention limit.
+    ///
+    /// Groups that fell behind the retained window get `truncated_below` set, so
+    /// their next claim fails with `stream_truncated` instead of silently
+    /// skipping events.
+    pub fn prune_stream_in(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        stream: &str,
+        batch: usize,
+    ) -> Result<Vec<(String, Value)>> {
+        let Some(def) = self.stream_in_rw(wtxn, stream)? else {
+            return Ok(Vec::new());
+        };
+        let Some(limit) = self.stream_retention_limit_in(wtxn, &def, batch)? else {
+            return Ok(Vec::new());
+        };
+        let Some(oldest) = self.stream_oldest_seq_in(wtxn, &def.coll)? else {
+            return Ok(Vec::new());
+        };
+        if oldest > limit {
+            return Ok(Vec::new());
+        }
+        let collection = self.collection(&def.coll)?;
+        let doomed = collection.find_in(
+            wtxn,
+            &crate::collection::FindQuery {
+                filter: serde_json::json!({crate::streams::SEQ_FIELD: {"$lte": limit}}),
+                projection: None,
+                sort: vec![(crate::streams::SEQ_FIELD.to_string(), 1)],
+                skip: 0,
+                limit: Some(batch.max(1)),
+                comment: None,
+                max_time_ms: None,
+                hint: None,
+            },
+        )?;
+        let mut deleted = Vec::new();
+        for doc in doomed {
+            let Some(id) = doc.get("_id").cloned() else {
+                continue;
+            };
+            if collection.delete_txn(wtxn, &serde_json::json!({"_id": id.clone()}), false)? > 0 {
+                match id.as_str() {
+                    Some(id) => deleted.push((id.to_string(), doc)),
+                    None => continue,
+                }
+            }
+        }
+        if deleted.is_empty() {
+            return Ok(deleted);
+        }
+        let Some(remaining) = self.stream_oldest_seq_in(wtxn, &def.coll)? else {
+            return Ok(deleted);
+        };
+        for mut group in self.stream_groups(Some(&def.name))? {
+            if group.next_seq.saturating_add(1) < remaining
+                && group.truncated_below != Some(remaining)
+            {
+                group.truncated_below = Some(remaining);
+                group.touch();
+                self.put_stream_group_in(wtxn, &group)?;
+            }
+        }
+        Ok(deleted)
+    }
+
+    /// Runs one retention pass over every stream, in its own transactions.
+    ///
+    /// Returns `(events_deleted, streams_touched)`.
+    pub fn prune_streams(&self, batch: usize) -> Result<(usize, usize)> {
+        let mut deleted = 0usize;
+        let mut touched = 0usize;
+        for def in self.streams()? {
+            if def.retention.is_empty() {
+                continue;
+            }
+            loop {
+                let mut wtxn = self.write_txn()?;
+                let dropped = self.prune_stream_in(&mut wtxn, &def.name, batch)?;
+                let n = dropped.len();
+                wtxn.commit()?;
+                if n == 0 {
+                    break;
+                }
+                deleted += n;
+                touched += 1;
+                if n < batch {
+                    break;
+                }
+            }
+        }
+        Ok((deleted, touched))
     }
 
     /// Returns the per-collection history retention. `0` means disabled.
@@ -4075,11 +4346,11 @@ mod tests {
 
     #[test]
     fn store_open_recovers_interrupted_compaction_swap() {
-        use serde_json::json;
         let dir = tempfile::tempdir().unwrap();
         let store = super::Store::open(dir.path()).unwrap();
         let c = store.collection("docs").unwrap();
-        c.insert_one(json!({"_id": "a", "value": 1})).unwrap();
+        c.insert_one(serde_json::json!({"_id": "a", "value": 1}))
+            .unwrap();
         store.close();
 
         let source = dir.path().join("data.mdb");
@@ -4089,7 +4360,11 @@ mod tests {
 
         let store = super::Store::open(dir.path()).unwrap();
         assert_eq!(
-            store.collection("docs").unwrap().count(&json!({})).unwrap(),
+            store
+                .collection("docs")
+                .unwrap()
+                .count(&serde_json::json!({}))
+                .unwrap(),
             1
         );
         assert!(source.exists());
@@ -4098,7 +4373,6 @@ mod tests {
 
     #[test]
     fn compact_data_dir_reclaims_deleted_timeseries_rows() {
-        use serde_json::json;
         let dir = tempfile::tempdir().unwrap();
         let store = super::Store::open(dir.path()).unwrap();
         let settings = crate::timeseries::Settings {
@@ -4110,7 +4384,7 @@ mod tests {
             .create_timeseries_collection("metrics", &settings)
             .unwrap();
         for idx in 0..2000i64 {
-            c.insert_one(json!({
+            c.insert_one(serde_json::json!({
                 "ts": idx * 1000,
                 "device": {"id": format!("dev-{}", idx % 10)},
                 "value": idx,
@@ -4120,7 +4394,8 @@ mod tests {
         }
         store.seal_timeseries("metrics").unwrap();
         assert_eq!(
-            c.delete(&json!({"value": {"$lt": 1900}}), true).unwrap(),
+            c.delete(&serde_json::json!({"value": {"$lt": 1900}}), true)
+                .unwrap(),
             1900
         );
         store.close();
@@ -4135,10 +4410,10 @@ mod tests {
 
         let store = super::Store::open(dir.path()).unwrap();
         let c = store.collection("metrics").unwrap();
-        assert_eq!(c.count(&json!({})).unwrap(), 100);
+        assert_eq!(c.count(&serde_json::json!({})).unwrap(), 100);
         let docs = c
             .find(&crate::collection::FindQuery {
-                filter: json!({}),
+                filter: serde_json::json!({}),
                 projection: None,
                 sort: Vec::new(),
                 skip: 0,

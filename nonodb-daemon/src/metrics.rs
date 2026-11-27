@@ -35,6 +35,8 @@ pub static STREAM_CLAIMS: AtomicU64 = AtomicU64::new(0);
 pub static STREAM_REDELIVERIES: AtomicU64 = AtomicU64::new(0);
 pub static STREAM_NACKS: AtomicU64 = AtomicU64::new(0);
 pub static STREAM_DEAD_LETTERS: AtomicU64 = AtomicU64::new(0);
+pub static STREAM_TRUNCATED: AtomicU64 = AtomicU64::new(0);
+pub static STREAM_LEASE_RECOVERIES: AtomicU64 = AtomicU64::new(0);
 /// SQL statement counters and total execution time.
 pub static SQL_SELECT: AtomicU64 = AtomicU64::new(0);
 pub static SQL_INSERT: AtomicU64 = AtomicU64::new(0);
@@ -1229,6 +1231,16 @@ pub fn prometheus() -> String {
             "nonodb_stream_dead_letters_total",
             "stream_dead_letters_total",
             "Consumer-group batches dead-lettered.",
+        ),
+        (
+            "nonodb_stream_truncated_total",
+            "stream_truncated_total",
+            "Stream events dropped by offset retention.",
+        ),
+        (
+            "nonodb_stream_lease_recoveries_total",
+            "stream_lease_recoveries_total",
+            "Expired stream leases requeued or dead-lettered by the janitor.",
         ),
         (
             "nonodb_watch_heartbeats_total",
