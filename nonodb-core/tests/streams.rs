@@ -420,7 +420,11 @@ fn a_promoted_node_redelivers_claimed_but_uncommitted_ranges() {
     wtxn.commit().unwrap();
     assert_eq!((lease.from_seq, lease.to_seq), (1, 3));
     assert_eq!(
-        store.stream_group("_events", "g").unwrap().unwrap().next_seq,
+        store
+            .stream_group("_events", "g")
+            .unwrap()
+            .unwrap()
+            .next_seq,
         3
     );
 
