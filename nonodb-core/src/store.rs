@@ -891,6 +891,42 @@ impl Store {
         Ok(collection)
     }
 
+    /// Creates a general-purpose columnar collection.
+    pub fn create_columnar_collection(
+        &self,
+        name: &str,
+        settings: &crate::columnar::Settings,
+    ) -> Result<Collection<'_>> {
+        settings.validate()?;
+        let mut wtxn = self.write_txn()?;
+        let collection = self.create_collection_with_ttl_and_purge_in(
+            &mut wtxn,
+            name,
+            CollectionProfile::Columnar,
+            None,
+            None,
+        )?;
+        collection.set_columnar_settings_in(&mut wtxn, settings)?;
+        let _ = self.env.create_database::<Bytes, Bytes>(
+            &mut wtxn,
+            Some(&format!("{}{name}", crate::columnar::DB_PREFIX)),
+        )?;
+        wtxn.commit()?;
+        Ok(collection)
+    }
+
+    /// Seals the open columnar bucket.
+    pub fn seal_columnar(&self, name: &str) -> Result<usize> {
+        let mut wtxn = self.write_txn()?;
+        let collection = self.collection_in(&mut wtxn, name)?;
+        let Some(settings) = collection.columnar_settings_in(&wtxn)? else {
+            return Ok(0);
+        };
+        let sealed = crate::columnar::seal_all(&mut wtxn, &self.env, name, &settings)?;
+        wtxn.commit()?;
+        Ok(sealed)
+    }
+
     /// Creates a collection with an optional default document TTL.
     pub fn create_collection_with_ttl(
         &self,
@@ -1835,6 +1871,9 @@ impl Store {
         if collection.profile().is_timeseries() {
             crate::timeseries::clear(wtxn, &self.env, name)?;
         }
+        if collection.profile().is_columnar() {
+            crate::columnar::clear(wtxn, &self.env, name)?;
+        }
 
         if let Some(db) = self.env.open_database::<Bytes, Bytes>(&*wtxn, Some(name))? {
             db.clear(&mut *wtxn)?;
@@ -1847,6 +1886,7 @@ impl Store {
             format!("ttl:{name}"),
             format!("ttl_purge:{name}"),
             format!("{}{name}", crate::timeseries::SETTINGS_META_PREFIX),
+            format!("{}{name}", crate::columnar::SETTINGS_META_PREFIX),
             subscriptions::meta_key(name),
             graph::node_def_key(name),
             graph::edge_def_key(name),

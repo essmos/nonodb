@@ -17,6 +17,7 @@ pub mod backup_info;
 pub mod bson_types;
 mod bucket_codec;
 pub mod collection;
+pub mod columnar;
 pub mod cypher;
 pub mod date;
 pub mod error;

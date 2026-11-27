@@ -24,6 +24,8 @@ pub enum CollectionProfile {
     Vault,
     /// Bucketed, columnar, compressed time-series storage.
     TimeSeries,
+    /// General-purpose bucketed columnar storage.
+    Columnar,
 }
 
 impl CollectionProfile {
@@ -32,6 +34,7 @@ impl CollectionProfile {
             "standard" | "" => Ok(Self::Standard),
             "vault" => Ok(Self::Vault),
             "timeseries" | "time-series" => Ok(Self::TimeSeries),
+            "columnar" => Ok(Self::Columnar),
             other => Err(Error::Vault {
                 code: "invalid_collection_profile",
                 message: format!("unknown collection profile `{other}`"),
@@ -44,6 +47,7 @@ impl CollectionProfile {
             Self::Standard => "standard",
             Self::Vault => "vault",
             Self::TimeSeries => "timeseries",
+            Self::Columnar => "columnar",
         }
     }
 
@@ -53,6 +57,10 @@ impl CollectionProfile {
 
     pub fn is_timeseries(self) -> bool {
         matches!(self, Self::TimeSeries)
+    }
+
+    pub fn is_columnar(self) -> bool {
+        matches!(self, Self::Columnar)
     }
 }
 

@@ -750,7 +750,7 @@ impl<'e> Collection<'e> {
         &self.name
     }
 
-    /// Collection profile (`standard`, `vault`, or `timeseries`).
+    /// Collection profile (`standard`, `vault`, `timeseries`, or `columnar`).
     pub fn profile(&self) -> CollectionProfile {
         self.profile
     }
@@ -790,6 +790,45 @@ impl<'e> Collection<'e> {
         self.set_timeseries_settings_in(&mut wtxn, settings)?;
         wtxn.commit()?;
         Ok(())
+    }
+
+    /// Columnar settings, or `None` for non-columnar collections.
+    pub fn columnar_settings_in(
+        &self,
+        txn: &RoTxn<'_>,
+    ) -> Result<Option<crate::columnar::Settings>> {
+        if !self.profile.is_columnar() {
+            return Ok(None);
+        }
+        let key = format!("{}{}", crate::columnar::SETTINGS_META_PREFIX, self.name);
+        match self.meta.get(txn, key.as_bytes())? {
+            Some(raw) => Ok(Some(crate::columnar::parse_settings(raw)?)),
+            None => Ok(Some(crate::columnar::Settings::default())),
+        }
+    }
+
+    /// Stores columnar settings for this collection.
+    pub fn set_columnar_settings_in(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        settings: &crate::columnar::Settings,
+    ) -> Result<()> {
+        settings.validate()?;
+        let key = format!("{}{}", crate::columnar::SETTINGS_META_PREFIX, self.name);
+        let bytes = serde_json::to_vec(settings)?;
+        self.meta.put(&mut *wtxn, key.as_bytes(), &bytes)?;
+        Ok(())
+    }
+
+    /// Compression and size statistics for a columnar collection.
+    pub fn columnar_stats(&self) -> Result<Option<crate::columnar::Stats>> {
+        if !self.profile.is_columnar() {
+            return Ok(None);
+        }
+        let rtxn = self.read_txn()?;
+        let stats = crate::columnar::stats(&rtxn, self.env, &self.name)?;
+        rtxn.commit()?;
+        Ok(Some(stats))
     }
 
     /// Compression and size statistics for a time-series collection.
@@ -5359,6 +5398,13 @@ impl<'e> Collection<'e> {
 
     /// Inserts a document in the given transaction. Assigns `_id` (UUID v4) if missing.
     pub fn insert_one_txn(&self, wtxn: &mut RwTxn<'_>, mut doc: Value) -> Result<String> {
+        if self.profile.is_columnar() {
+            let settings = self.columnar_settings_in(&*wtxn)?.unwrap_or_default();
+            date::normalize_document(&mut doc)?;
+            numeric::normalize_document(&mut doc)?;
+            bson_types::normalize_document(&mut doc)?;
+            return crate::columnar::insert(wtxn, self.env, &self.name, &settings, doc);
+        }
         if self.profile.is_timeseries() {
             let settings = self.timeseries_settings_in(&*wtxn)?.unwrap_or_default();
             let mut check = doc.clone();
@@ -5429,6 +5475,11 @@ impl<'e> Collection<'e> {
     /// upserted key back into the original BSON `_id` value.
     pub fn find_by_key(&self, key: &str) -> Result<Option<Value>> {
         let rtxn = self.read_txn()?;
+        if self.profile.is_columnar() {
+            let out = crate::columnar::find_by_id(&rtxn, self.env, &self.name, key)?;
+            rtxn.commit()?;
+            return Ok(out);
+        }
         if self.profile.is_timeseries() {
             let settings = self.timeseries_settings_in(&rtxn)?.unwrap_or_default();
             let out = crate::timeseries::find_by_id(&rtxn, self.env, &self.name, &settings, key)?;
@@ -11060,6 +11111,10 @@ impl<'e> Collection<'e> {
         if self.profile.is_timeseries() {
             let settings = self.timeseries_settings_in(rtxn)?.unwrap_or_default();
             return crate::timeseries::count(rtxn, self.env, &self.name, &settings, filter);
+        }
+        if self.profile.is_columnar() {
+            crate::query::validate::validate_filter(filter)?;
+            return crate::columnar::count(rtxn, self.env, &self.name, filter);
         }
         crate::query::validate::validate_filter(filter)?;
         check_find_deadline(deadline)?;
