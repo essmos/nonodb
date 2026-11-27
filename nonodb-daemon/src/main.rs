@@ -4140,14 +4140,7 @@ async fn exec_inner(
 
         Request::ListStreams => {
             let store = state.store.clone();
-            let joined = tokio::task::spawn_blocking(move || {
-                let mut out = Vec::new();
-                for def in store.streams()? {
-                    let head = store.stream_head(&def.name)?;
-                    out.push(json!({ "stream": def, "head_seq": head }));
-                }
-                Ok::<Value, ApiError>(json!({ "streams": out }))
-            });
+            let joined = tokio::task::spawn_blocking(move || list_streams_value(&store));
             read_result(joined).await
         }
 
@@ -5001,6 +4994,25 @@ fn lookup_projection(
         projection.insert(field.clone(), Value::from(1));
     }
     Ok(Some(Value::Object(projection)))
+}
+
+/// Flat stream listing shared by the read handler and the read batch path.
+fn list_streams_value(store: &Store) -> Result<Value, ApiError> {
+    let mut out = Vec::new();
+    for def in store.streams()? {
+        let head = store.stream_head(&def.name)?;
+        let groups = store.stream_groups(Some(&def.name))?.len();
+        out.push(json!({
+            "stream": def.name,
+            "coll": def.coll,
+            "seq_field": def.seq_field,
+            "head_seq": head,
+            "groups": groups,
+            "retention": def.retention,
+            "created_at": def.created_at,
+        }));
+    }
+    Ok(json!({ "streams": out }))
 }
 
 /// Builds `stream_stats` output for one database.
@@ -6016,14 +6028,7 @@ fn execute_read(
             })?;
             Ok(json!({ "stream": def, "head_seq": store.stream_head(&coll)? }))
         }
-        Request::ListStreams => {
-            let mut out = Vec::new();
-            for def in store.streams()? {
-                let head = store.stream_head(&def.name)?;
-                out.push(json!({ "stream": def, "head_seq": head }));
-            }
-            Ok(json!({ "streams": out }))
-        }
+        Request::ListStreams => list_streams_value(store),
         Request::StreamStats { coll } => stream_stats_value(store, coll.as_deref()),
         Request::StreamDead { coll, group } => Ok(json!({
             "dead": store.stream_dead_letters(coll.as_deref(), group.as_deref())?

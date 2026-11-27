@@ -4,6 +4,7 @@ Full release notes: https://github.com/essmos/nonodb/releases
 
 ## Unreleased
 
+<<<<<<< HEAD
 - Fix stream failover: the claim position is derived from `committed_seq` plus
   node-local leases instead of the replicated `next_seq`, so a promoted replica
   redelivers ranges the old primary claimed but never committed. An idle
@@ -29,6 +30,24 @@ Full release notes: https://github.com/essmos/nonodb/releases
   event. The lease janitor runs only on the primary and through the writer, so
   its offset advances and dead letters replicate.
 
+=======
+- Add stream operations: `nonodb-cli streams list|create|groups|reset|dead|retry|drop|prune`,
+  a Streams page in the local GUI (lag, in-flight, dead letters, reset, prune),
+  and a stream metrics section in `docs/monitoring.md`.
+- Add stream retention driven by offsets: events below the slowest group's
+  committed offset (bounded by `max_events`, `max_age_ms`, and `min_seq_keep`)
+  are dropped in batched, replicated passes (`prune_stream`, or the
+  `NONODB_STREAM_PRUNE_INTERVAL` loop). A group behind the retained window fails
+  with `stream_truncated` and records `truncated_below` instead of skipping
+  events. `retention.max_bytes` is accepted but ignored.
+- Add stream range leases: `watch` with `"mode":"group"` claims a contiguous
+  range for a member, `nack_stream_group` releases it, expired leases are
+  redelivered with an attempt counter, and exhausted ranges become dead letters
+  (`stream_dead`, `retry_stream_dead`, `drop_stream_dead`) that no longer block
+  the group. The committed offset advances only across a contiguous prefix, so
+  several members share one group. `/metrics/prometheus` exposes
+  `nonodb_stream_*` lag, in-flight, and dead-letter series.
+>>>>>>> fa0beb3 (feat(streams): CLI, GUI, metrics, and docs)
 - Add streams with server-side offsets and consumer groups over append-only
   collections. The writer assigns a reserved `_seq` to every insert in a stream
   collection; `create_stream`, `create_stream_group`, `watch` with

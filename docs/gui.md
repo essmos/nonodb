@@ -336,6 +336,23 @@ cooldown, HMAC secret environment variable, request timeout, custom headers, and
 max attempts. Filters and aggregates are evaluated by the daemon worker, never
 in the writer. See [Asynchronous webhooks](webhooks.md).
 
+### Streams
+
+The **Streams** tab manages server-side offsets and consumer groups:
+
+- **Consumer groups** — committed offset, stream head, lag, in-flight events,
+  dead letters, attempt budget, and a truncation marker; reset a group to
+  `earliest`/`latest`, or delete it;
+- **Streams** — stream name, collection, head offset, group count, retention
+  settings, and **Prune now** for one retention pass;
+- **Dead letters** — list a collection's dead-lettered batches, retry one (the
+  attempt counter resets) or drop it;
+- **Define a stream** and **Create a group** forms, including `max_events`,
+  `max_age_ms`, `min_seq_keep`, start position, and `max_attempts`.
+
+A group that stops committing pins retention, so lag is also a disk-growth
+signal. See [Streams](streams.md).
+
 ### Graph
 
 The **Graph** tab configures a graph on a node collection and explores it:

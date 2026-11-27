@@ -283,6 +283,39 @@ bitmap deletes are accumulating; check `NONODB_TS_COMPACT_THRESHOLD_MB`. The
 daemon's online compactor picks up the marker and swaps the file once the
 database has no active runtime (`NONODB_TS_ONLINE_COMPACT_INTERVAL_SECS`).
 
+## Stream metrics
+
+Streams publish per-group gauges on every `/metrics/prometheus` scrape and
+process-wide counters. Gauges are read from LMDB (head, committed offset, lease
+rows, dead letters); they do not scan documents.
+
+| Metric | Meaning |
+|---|---|
+| `nonodb_stream_committed_seq{database,stream,group}` | Group committed offset |
+| `nonodb_stream_lag_events{database,stream,group}` | Head minus committed offset |
+| `nonodb_stream_inflight_events{database,stream,group}` | Events leased but not committed |
+| `nonodb_stream_dead_events{database,stream,group}` | Dead-lettered events |
+| `nonodb_stream_claims_total` | Batches claimed by a member |
+| `nonodb_stream_redeliveries_total` | Batches delivered more than once |
+| `nonodb_stream_nacks_total` | Batches released with nack |
+| `nonodb_stream_dead_letters_total` | Events dead-lettered after `max_attempts` |
+| `nonodb_stream_truncated_total` | Events dropped by offset retention |
+
+How to read them:
+
+- A flat `nonodb_stream_lag_events` with a growing `nonodb_stream_inflight_events`
+  means members hold leases without committing: check for crashed workers before
+  `max_attempts` dead-letters the batch.
+- A rising `nonodb_stream_redeliveries_total` with a stable lag indicates
+  timeouts that are too short for the handler, not missing events.
+- `nonodb_stream_lag_events > 0` on every group keeps retention from advancing
+  (`min(head - max_events, age boundary, slowest committed - min_seq_keep)`), so
+  disk use follows the slowest consumer. A paused consumer is a disk-growth
+  decision.
+- `nonodb_stream_truncated_total` only moves when a stream has retention
+  configured (`max_events` or `max_age_ms`). A group behind the window fails with
+  `stream_truncated` instead of skipping events.
+
 ## Recommended alerts
 
 At minimum, alert on:
@@ -299,6 +332,9 @@ At minimum, alert on:
 10. `nonodb_wal_oldest_age_seconds` above the configured PITR window
 11. `nonodb_tls_revocation_refresh_errors_total` increasing when CRL/OCSP is configured
 12. `nonodb_tls_revocation_unavailable_total` increasing with fail-closed mTLS
+13. `nonodb_stream_lag_events > <budget>` for more than one scrape interval
+14. `nonodb_stream_dead_events` increasing on a group with `max_attempts` set
+15. `nonodb_stream_inflight_events` flat at a non-zero value while lag stays flat
 
 `GET /metrics` remains available for existing JSON consumers and includes the
 same extra `disk`, `snapshots`, `wal`, and `collection_metrics` fields.

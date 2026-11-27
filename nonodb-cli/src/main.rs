@@ -478,6 +478,7 @@ fn run() -> Result<(), String> {
         }
         "search-all" => search_all_cmd(&args[1..])?,
         "webhooks" => webhooks_cmd(&args[1..])?,
+        "streams" | "stream" => streams_cmd(&args[1..])?,
         "events" => {
             if args.get(1).map(String::as_str) == Some("tail") {
                 return events_tail(&args[2..]);
@@ -739,6 +740,7 @@ fn usage() -> Result<(), String> {
               [--fields a,b] [--vector JSON] [--vector-field pole] [--filter JSON]\n\
               [--skip N] [--limit N] [--max-distance N] [--rrf-k N]  ujednolicone wyszukiwanie\n\
          webhooks <list|create|update|delete|deliveries|retry> ...  zarządzaj asynchronicznymi webhookami\n\
+         streams [list|create|groups|reset|dead|retry|drop|prune] ...  offsety, grupy i retencja strumieni\n\
          branch <target-db> --data <root> [--from-snapshot <plik>] [--force] [--verify] [--no-sidecars] [--json]\n\
               utwórz niezależny klon bazy (reflink/copy; daemon zatrzymany lub snapshot)\n\
          backup <data> <out> [--without-search-sidecars]  kopia wybranej bazy (--db) + manifest.json\n\
@@ -1005,6 +1007,202 @@ fn search_all_cmd(args: &[String]) -> Result<(), String> {
     }
     let res = http_post("/v1/exec", &payload)?;
     print_result(&res);
+    Ok(())
+}
+
+fn streams_cmd(args: &[String]) -> Result<(), String> {
+    let action = args.first().map(String::as_str).unwrap_or("list");
+    match action {
+        "list" => {
+            let res = http_post("/v1/exec", &json!({"op": "list_streams"}))?;
+            let streams = res
+                .pointer("/result/streams")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if streams.is_empty() {
+                println!("no streams");
+                return Ok(());
+            }
+            for stream in streams {
+                let name = stream
+                    .get("stream")
+                    .or_else(|| stream.get("name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("?");
+                let coll = stream.get("coll").and_then(Value::as_str).unwrap_or("?");
+                let head = stream.get("head_seq").and_then(Value::as_u64).unwrap_or(0);
+                let retention = stream
+                    .get("retention")
+                    .filter(|value| !value.as_object().is_some_and(|object| object.is_empty()))
+                    .map(|value| format!(" retention={value}"))
+                    .unwrap_or_default();
+                println!("{name}  coll={coll}  head={head}{retention}");
+            }
+        }
+        "create" => {
+            let coll = args
+                .get(1)
+                .ok_or("użycie: nonodb-cli streams create <coll> [--max-events N] [--max-age-ms N] [--min-seq-keep N]")?;
+            let mut payload = json!({"op": "create_stream", "coll": coll});
+            let mut retention = serde_json::Map::new();
+            let mut i = 2;
+            while i < args.len() {
+                let key = match args[i].as_str() {
+                    "--max-events" => "max_events",
+                    "--max-age-ms" => "max_age_ms",
+                    "--min-seq-keep" => "min_seq_keep",
+                    other => return Err(format!("nieznana opcja: {other}")),
+                };
+                let value: u64 = args
+                    .get(i + 1)
+                    .ok_or_else(|| format!("{key} wymaga liczby"))?
+                    .parse()
+                    .map_err(|e| format!("{key}: {e}"))?;
+                retention.insert(key.to_string(), json!(value));
+                i += 2;
+            }
+            if !retention.is_empty() {
+                payload["retention"] = Value::Object(retention);
+            }
+            let res = http_post("/v1/exec", &payload)?;
+            print_result(&res);
+        }
+        "groups" | "stats" => {
+            let coll = args.get(1);
+            let res = http_post(
+                "/v1/exec",
+                &match coll {
+                    Some(coll) => json!({"op": "stream_stats", "coll": coll}),
+                    None => json!({"op": "stream_stats"}),
+                },
+            )?;
+            let streams = res
+                .pointer("/result/streams")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if streams.is_empty() {
+                println!("no streams");
+                return Ok(());
+            }
+            println!(
+                "{:<20} {:<20} {:>12} {:>12} {:>8} {:>9} {:>6}",
+                "STREAM", "GROUP", "COMMITTED", "HEAD", "LAG", "INFLIGHT", "DEAD"
+            );
+            for stream in streams {
+                let name = stream
+                    .get("stream")
+                    .or_else(|| stream.get("name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("?")
+                    .to_string();
+                let head = stream.get("head_seq").and_then(Value::as_u64).unwrap_or(0);
+                let groups = stream
+                    .get("groups")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                if groups.is_empty() {
+                    println!("{name:<20} {:<20} {:>12} {:>12}", "-", "-", head);
+                    continue;
+                }
+                for group in groups {
+                    let truncated = group
+                        .get("truncated_below")
+                        .and_then(Value::as_u64)
+                        .map(|value| format!(" truncated_below={value}"))
+                        .unwrap_or_default();
+                    println!(
+                        "{:<20} {:<20} {:>12} {:>12} {:>8} {:>9} {:>6}{}",
+                        name,
+                        group.get("group").and_then(Value::as_str).unwrap_or("?"),
+                        group
+                            .get("committed_seq")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0),
+                        head,
+                        group.get("lag").and_then(Value::as_u64).unwrap_or(0),
+                        group.get("inflight").and_then(Value::as_u64).unwrap_or(0),
+                        group.get("dead").and_then(Value::as_u64).unwrap_or(0),
+                        truncated,
+                    );
+                }
+            }
+        }
+        "dead" => {
+            let coll = args
+                .get(1)
+                .ok_or("użycie: nonodb-cli streams dead <coll> [group]")?;
+            let mut payload = json!({"op": "stream_dead", "coll": coll});
+            if let Some(group) = args.get(2) {
+                payload["group"] = json!(group);
+            }
+            let res = http_post("/v1/exec", &payload)?;
+            print_result(&res);
+        }
+        "retry" | "drop" => {
+            let coll = args
+                .get(1)
+                .ok_or("użycie: nonodb-cli streams retry|drop <coll> <group> <from_seq>")?;
+            let group = args
+                .get(2)
+                .ok_or("użycie: nonodb-cli streams retry|drop <coll> <group> <from_seq>")?;
+            let from_seq: u64 = args
+                .get(3)
+                .ok_or("użycie: nonodb-cli streams retry|drop <coll> <group> <from_seq>")?
+                .parse()
+                .map_err(|e| format!("from_seq: {e}"))?;
+            let op = if action == "retry" {
+                "retry_stream_dead"
+            } else {
+                "drop_stream_dead"
+            };
+            let res = http_post(
+                "/v1/exec",
+                &json!({"op": op, "coll": coll, "group": group, "from_seq": from_seq}),
+            )?;
+            print_result(&res);
+        }
+        "reset" => {
+            let coll = args
+                .get(1)
+                .ok_or("użycie: nonodb-cli streams reset <coll> <group> [earliest|latest|<seq>]")?;
+            let group = args
+                .get(2)
+                .ok_or("użycie: nonodb-cli streams reset <coll> <group> [earliest|latest|<seq>]")?;
+            let to = match args.get(3).map(String::as_str) {
+                None | Some("latest") => json!("latest"),
+                Some("earliest") => json!("earliest"),
+                Some(raw) => {
+                    let seq: u64 = raw.parse().map_err(|e| format!("seq: {e}"))?;
+                    json!({"seq": seq})
+                }
+            };
+            let res = http_post(
+                "/v1/exec",
+                &json!({"op": "reset_stream_group", "coll": coll, "group": group, "to": to}),
+            )?;
+            print_result(&res);
+        }
+        "prune" => {
+            let coll = args
+                .get(1)
+                .ok_or("użycie: nonodb-cli streams prune <coll> [batch]")?;
+            let mut payload = json!({"op": "prune_stream", "coll": coll});
+            if let Some(batch) = args.get(2) {
+                let batch: usize = batch.parse().map_err(|e| format!("batch: {e}"))?;
+                payload["batch"] = json!(batch);
+            }
+            let res = http_post("/v1/exec", &payload)?;
+            print_result(&res);
+        }
+        other => {
+            return Err(format!(
+                "nieznana akcja streams: {other} (list/create/groups/reset/dead/retry/drop/prune)"
+            ))
+        }
+    }
     Ok(())
 }
 

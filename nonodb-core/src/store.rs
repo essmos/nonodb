@@ -2441,9 +2441,7 @@ impl Store {
         lease_ms: u64,
     ) -> Result<Option<StreamLease>> {
         let mut dead = Vec::new();
-        self.claim_stream_lease_in_with_dead(
-            wtxn, stream, group, member, limit, lease_ms, &mut dead,
-        )
+        self.claim_stream_lease_in_with_dead(wtxn, stream, group, member, limit, lease_ms, &mut dead)
     }
 
     /// Same as [`Store::claim_stream_lease_in`], also returning any ranges that
