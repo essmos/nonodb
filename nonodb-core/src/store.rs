@@ -3695,6 +3695,17 @@ impl Store {
             }
             ReplicationOp::StreamGroupSet { group } => self.put_stream_group_in(wtxn, group),
             ReplicationOp::StreamLeaseDead { lease } => self.put_stream_dead_in(wtxn, lease),
+            ReplicationOp::StreamDeadDelete {
+                stream,
+                group,
+                from_seq,
+            } => {
+                self.drop_stream_dead_in(wtxn, stream, group, *from_seq)?;
+                Ok(())
+            }
+            ReplicationOp::StreamGroupClear { stream, group } => {
+                self.clear_stream_leases_in(wtxn, stream, group)
+            }
             ReplicationOp::StreamGroupDelete { stream, group } => {
                 self.delete_stream_group_in(wtxn, stream, group)?;
                 Ok(())
