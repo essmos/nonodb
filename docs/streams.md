@@ -555,6 +555,7 @@ like an index build on a large collection.
   "group": "order-sync",
   "member": "worker-1",
   "limit": 100,
+  "lease_ms": 60000,
   "timeout_ms": 1000,
   "filter": {"payload.tenant": "acme"}
 }
@@ -565,10 +566,14 @@ Response:
 ```json
 {
   "events": [{"_id": "01J...", "_seq": 412901, "type": "order.paid"}],
-  "next_seq": 412901,
-  "committed_seq": 412900,
-  "lease_id": "01J...",
   "group": "order-sync",
+  "member": "worker-1",
+  "lease_id": "01J...",
+  "from_seq": 412901,
+  "to_seq": 413000,
+  "next_seq": 413000,
+  "attempts": 1,
+  "max_attempts": 5,
   "timed_out": false,
   "has_more": false
 }
@@ -585,31 +590,54 @@ claim a group or acknowledge a batch, because claiming writes the lease and
 committing moves the offset. A bare `group` field counts as group mode even when
 `mode` is omitted.
 
-Reading a group **claims the group lease**. One member owns the group at a time:
-a second member gets `timed_out` (or `stale_lease`) until the lease expires or
-the owner commits. The lease lasts `lease_ms` (default `60000`), and re-claiming
-as the same member extends it.
+Every read **claims a contiguous range** of offsets (`from_seq..=to_seq`,
+bounded by `limit`) and writes one lease covering the whole range. Several
+members of the same group therefore work in parallel: each gets a distinct
+range, and no offset is handed out twice. A member that is caught up gets
+`"events": []` with `timed_out: true` and no lease.
 
-### Commit
+
+Redelivery is bounded: a lease is valid for `lease_ms` (default `60000`, minimum
+`1000`). If the member neither commits nor nacks before it expires, the range
+becomes available again and the next claim picks it up with
+`attempts` incremented. After `max_attempts` (group setting, default `5`, set at
+creation) the range is dead-lettered instead of looping.
+
+### Commit and nack
 
 ```json
-{"op":"commit_stream_group","coll":"_events","group":"order-sync","seq":412901,"lease_id":"01J..."}
+{"op":"commit_stream_group","coll":"_events","group":"order-sync","seq":413000,"lease_id":"01J..."}
+{"op":"nack_stream_group","coll":"_events","group":"order-sync","lease_id":"01J...","retry_in_ms":5000}
 ```
 
-- The commit must present the `lease_id` from the batch, otherwise it fails with
-  `stale_lease` (HTTP 409). A stale worker cannot advance a group it no longer
-  owns.
-- Offsets only move forward and never past the stream head; anything else fails
-  with `commit_out_of_order` (409), and `stream_truncated` is 410.
-- A successful commit clears the lease, so another member can take over.
-- Delivery is at-least-once: after a crash between processing and committing the
-  batch is delivered again. Handlers must stay idempotent.
+- A commit must present the `lease_id` of the batch, otherwise it fails with
+  `stale_lease`. A worker that lost its lease cannot advance the group.
+- The acknowledged `seq` must be inside the leased range, otherwise it fails with
+  `commit_out_of_order`; out-of-range or repeated commits never move the offset.
+- The committed offset only advances across a **contiguous** prefix. If member A
+  finishes range `11..=20` while member B is still working on `1..=10`, the group
+  offset stays at `0` until B commits; then it jumps to `20` in one step.
+- `nack_stream_group` releases the range immediately (or after `retry_in_ms`) and
+  keeps the attempt counter. Nacking with attempts exhausted dead-letters the
+  range.
+- Delivery is at-least-once: a crash between processing and committing replays
+  the range. Handlers must be idempotent.
 
-A long-poll `watch` (`{"op":"watch",...,"mode":"group"}`) and the continuous
-`/v1/watch` stream (`"mode":"group"` with `Accept: application/x-ndjson` or
-`text/event-stream`) accept the same fields. The continuous stream emits one
-`ready` control frame carrying `lease_id` and `committed_seq`, then events with
-their `_seq`.
+### Dead letters
+
+Ranges that exhausted their attempts are removed from the queue, kept for
+inspection, and **do not block** the group: the committed offset advances across
+them.
+
+```json
+{"op":"stream_dead","coll":"_events","group":"order-sync"}
+{"op":"retry_stream_dead","coll":"_events","group":"order-sync","from_seq":413001}
+{"op":"drop_stream_dead","coll":"_events","group":"order-sync","from_seq":413001}
+```
+
+`stream_dead` requires read scope; `retry_stream_dead` and `drop_stream_dead`
+require `admin:<coll>`. Retrying resets the attempt counter and puts the range
+back in the queue.
 
 ### Inspect and reset
 
@@ -620,20 +648,38 @@ their `_seq`.
 {"op":"drop_stream","coll":"_events"}
 ```
 
-`stream_stats` reports `committed_seq`, `head_seq`, `lag`, the current lease, and
-`truncated_below`. `reset_stream_group` accepts `earliest`, `latest`, or
-`{"seq": n}`, clears the lease, and clears `truncated_below`. `drop_stream` keeps
-the data and the groups; only the definition (and future offset assignment) is
-removed.
+`stream_stats` reports `committed_seq`, `next_seq`, `head_seq`, `lag`, `inflight`
+(events leased but not committed), `dead`, `max_attempts`, and `truncated_below`.
+`reset_stream_group` accepts `earliest`, `latest`, or `{"seq": n}`, drops the
+in-flight batches and dead letters of that group, and clears `truncated_below`.
+`drop_stream` keeps the data and the groups; only the definition (and future
+offset assignment) is removed.
+
+### Metrics
+
+`/metrics/prometheus` exposes per-group stream gauges and counters:
+
+| Metric | Meaning |
+|---|---|
+| `nonodb_stream_committed_seq{database,stream,group}` | group offset |
+| `nonodb_stream_lag_events{database,stream,group}` | head minus committed |
+| `nonodb_stream_inflight_events{database,stream,group}` | leased events |
+| `nonodb_stream_dead_events{database,stream,group}` | dead-lettered events |
+| `nonodb_stream_claims_total` | batches claimed |
+| `nonodb_stream_redeliveries_total` | batches delivered again |
+| `nonodb_stream_nacks_total` | batches released with nack |
+| `nonodb_stream_dead_letters_total` | events dead-lettered |
 
 ### Current limits
 
-- One member processes a group at a time. Splitting a group across concurrent
-  members with batch ranges, expiry-driven redelivery, attempt counters, and a
-  dead-letter queue is the next phase; see the
-  [streams groups plan](streams-groups-plan.md).
 - `retention` is stored and validated but not enforced yet. Until the retention
-  phase lands, use TTL on the event collection as today.
-- A lease is node-local ownership and is not replicated; a promoted replica
-  starts with no active lease, which is safe because a new claim is required
-  before any commit.
+  phase lands, use TTL on the event collection as today; the
+  [streams groups plan](streams-groups-plan.md) has the remaining phases.
+- Leases are node-local ownership and are not replicated. The claim position is
+  derived from `committed_seq` plus the leases on the current node, never from the
+  replicated `next_seq`, so a promoted replica resumes at `committed_seq + 1` and
+  **redelivers** ranges the old primary had claimed but not committed
+  (at-least-once, never silent loss). A node that takes over a group with a copied
+  data directory can call `clear_stream_leases` to drop stale ownership.
+- A commit must cover the whole leased range. Partial acknowledgements inside a
+  range are rejected rather than split.

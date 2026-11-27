@@ -4,6 +4,15 @@ Full release notes: https://github.com/essmos/nonodb/releases
 
 ## Unreleased
 
+- Fix stream failover: the claim position is derived from `committed_seq` plus
+  node-local leases instead of the replicated `next_seq`, so a promoted replica
+  redelivers ranges the old primary claimed but never committed. An idle
+  long-poll of a caught-up group no longer opens a write transaction
+  (`stream_claim_ready`), the writer only replicates a claim when the group row
+  changed, and dead letters created while recovering an expired lease are
+  replicated (`ReplicationOp::StreamLeaseDead`). `store.clear_stream_leases`
+  drops node-local ownership on takeover.
+
 - Harden streams: consuming a consumer group (`watch` with `mode:"group"` or a
   bare `group` field, `claim_stream_group`, `commit_stream_group`) requires the
   new `consume:<collection>` scope, so a read-only credential can no longer claim

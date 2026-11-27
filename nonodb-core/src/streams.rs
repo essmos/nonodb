@@ -148,20 +148,22 @@ pub struct StreamGroup {
     /// Highest offset the group has fully processed.
     #[serde(default)]
     pub committed_seq: u64,
-    /// Fencing token of the batch currently being processed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub lease_id: Option<String>,
-    /// Unix milliseconds after which the current batch may be claimed again.
+    /// Highest offset handed out to a batch. Batches are contiguous ranges
+    /// above this watermark, so claims never overlap.
     #[serde(default)]
-    pub lease_until: u64,
-    /// Member holding the current batch.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub member: Option<String>,
+    pub next_seq: u64,
+    /// Redelivery attempts before a batch is dead-lettered.
+    #[serde(default = "default_max_attempts")]
+    pub max_attempts: u32,
     /// Oldest offset still available, set when retention crossed the group.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub truncated_below: Option<u64>,
     pub created_at: u64,
     pub updated_at: u64,
+}
+
+fn default_max_attempts() -> u32 {
+    5
 }
 
 impl StreamGroup {
@@ -171,9 +173,8 @@ impl StreamGroup {
             stream: stream.into(),
             group: group.into(),
             committed_seq,
-            lease_id: None,
-            lease_until: 0,
-            member: None,
+            next_seq: committed_seq,
+            max_attempts: default_max_attempts(),
             truncated_below: None,
             created_at: now,
             updated_at: now,
@@ -183,19 +184,98 @@ impl StreamGroup {
     pub fn validate(&self) -> Result<()> {
         validate_name(&self.stream, "stream")?;
         validate_name(&self.group, "group")?;
+        if self.max_attempts == 0 {
+            return Err(Error::Query("max_attempts must be positive".into()));
+        }
         Ok(())
     }
 
     pub fn touch(&mut self) {
         self.updated_at = now_ms();
     }
+}
 
-    /// Clears the in-flight batch. Used by commit, nack, and reset.
-    pub fn clear_lease(&mut self) {
-        self.lease_id = None;
-        self.lease_until = 0;
-        self.member = None;
-        self.touch();
+/// Metadata key prefix for in-flight batch leases.
+pub(crate) const LEASE_PREFIX: &str = "streamlease:";
+
+/// Metadata key prefix for dead-lettered batches.
+pub(crate) const DEAD_PREFIX: &str = "streamdead:";
+
+/// State of one batch lease.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LeaseStatus {
+    /// A member owns the range until `lease_until`.
+    Leased,
+    /// The range is waiting for redelivery after `lease_until`.
+    Available,
+    /// The range is fully processed and only waits for earlier ranges before
+    /// the committed offset can move.
+    Done,
+}
+
+/// One contiguous range of offsets handed to a member.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StreamLease {
+    pub stream: String,
+    pub group: String,
+    pub from_seq: u64,
+    pub to_seq: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member: Option<String>,
+    /// Unix milliseconds after which the range may be claimed again.
+    #[serde(default)]
+    pub lease_until: u64,
+    pub attempts: u32,
+    pub max_attempts: u32,
+    pub status: LeaseStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub created_at: u64,
+    pub updated_at: u64,
+}
+
+impl StreamLease {
+    pub fn new(stream: &str, group: &str, from_seq: u64, to_seq: u64, max_attempts: u32) -> Self {
+        let now = now_ms();
+        Self {
+            stream: stream.to_string(),
+            group: group.to_string(),
+            from_seq,
+            to_seq,
+            lease_id: None,
+            member: None,
+            lease_until: 0,
+            attempts: 0,
+            max_attempts,
+            status: LeaseStatus::Available,
+            error: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        validate_name(&self.stream, "stream")?;
+        validate_name(&self.group, "group")?;
+        if self.from_seq == 0 || self.to_seq < self.from_seq {
+            return Err(Error::Query("invalid lease range".into()));
+        }
+        Ok(())
+    }
+
+    pub fn events(&self) -> u64 {
+        self.to_seq - self.from_seq + 1
+    }
+
+    pub fn is_expired(&self, now: u64) -> bool {
+        self.status == LeaseStatus::Leased && self.lease_until <= now
+    }
+
+    pub fn touch(&mut self) {
+        self.updated_at = now_ms();
     }
 }
 
@@ -282,16 +362,23 @@ mod tests {
     }
 
     #[test]
-    fn group_commit_state_is_cleared() {
-        let mut group = StreamGroup::new("events", "g", 10);
-        group.lease_id = Some("lease".into());
-        group.lease_until = 5;
-        group.member = Some("m1".into());
-        group.clear_lease();
-        assert!(group.lease_id.is_none());
-        assert_eq!(group.lease_until, 0);
-        assert!(group.member.is_none());
+    fn new_group_starts_claiming_at_its_offset() {
+        let group = StreamGroup::new("events", "g", 10);
         assert_eq!(group.committed_seq, 10);
+        assert_eq!(group.next_seq, 10);
+        assert_eq!(group.max_attempts, default_max_attempts());
+    }
+
+    #[test]
+    fn lease_ranges_and_expiry() {
+        let mut lease = StreamLease::new("events", "g", 5, 9, 3);
+        assert_eq!(lease.events(), 5);
+        assert!(!lease.is_expired(now_ms()));
+        lease.status = LeaseStatus::Leased;
+        lease.lease_until = 1;
+        assert!(lease.is_expired(now_ms()));
+        lease.status = LeaseStatus::Available;
+        assert!(!lease.is_expired(1));
     }
 
     #[test]

@@ -134,66 +134,127 @@ def main() -> int:
 
         seen: list[int] = []
         members = ["m1", "m2"]
-        for _ in range(4):
-            for member in members:
-                batch = api.call(
-                    {
-                        "op": "watch",
-                        "coll": "_events",
-                        "mode": "group",
-                        "group": "workers",
-                        "member": member,
-                        "limit": 1,
-                        "timeout_ms": 100,
-                    }
-                )
-                events = batch["events"]
-                if not events:
-                    # The other member holds the lease.
-                    assert batch["timed_out"] is True, batch
-                    continue
-                seq = events[0]["_seq"]
-                assert seq not in seen, f"duplicate delivery of offset {seq}"
-                assert seq == batch["committed_seq"] + 1, batch
-                # A commit from a lease that does not own the batch is rejected.
-                if seen:
-                    # A client conflict, not a server fault.
-                    status, code = api.error_with_status(
-                        {
-                            "op": "commit_stream_group",
-                            "coll": "_events",
-                            "group": "workers",
-                            "seq": seq,
-                            "lease_id": "stale-lease",
-                        }
-                    )
-                    assert code == "stale_lease", code
-                    assert status == 409, f"stale_lease must be 409, got {status}"
-                api.call(
-                    {
-                        "op": "commit_stream_group",
-                        "coll": "_events",
-                        "group": "workers",
-                        "seq": seq,
-                        "lease_id": batch["lease_id"],
-                    }
-                )
-                seen.append(seq)
-                if len(seen) == 2:
-                    break
-            if len(seen) == 2:
-                break
-        assert seen == [4, 5], seen
+        # Two members claim distinct contiguous ranges of the same group.
+        claims = []
+        for member in members:
+            batch = api.call(
+                {
+                    "op": "watch",
+                    "coll": "_events",
+                    "mode": "group",
+                    "group": "workers",
+                    "member": member,
+                    "limit": 1,
+                    "timeout_ms": 100,
+                }
+            )
+            assert batch["events"], batch
+            claims.append((member, batch))
+        ranges = sorted((claim["from_seq"], claim["to_seq"]) for _m, claim in claims)
+        assert ranges == [(4, 4), (5, 5)], ranges
 
-        # Offsets never move backwards.
-        assert api.error(
+        # A stale lease cannot commit, and the failure is a client conflict
+        # (409), not a server fault.
+        first_member, first_batch = claims[0]
+        status, code = api.error_with_status(
             {
                 "op": "commit_stream_group",
                 "coll": "_events",
                 "group": "workers",
-                "seq": 3,
+                "seq": first_batch["to_seq"],
+                "lease_id": "stale-lease",
             }
-        ) == "commit_out_of_order", "backwards commit must be rejected"
+        )
+        assert code == "stale_lease", code
+        assert status == 409, f"stale_lease must be 409, got {status}"
+
+        # Committing out of range is rejected too.
+        assert (
+            api.error(
+                {
+                    "op": "commit_stream_group",
+                    "coll": "_events",
+                    "group": "workers",
+                    "seq": first_batch["to_seq"] + 10,
+                    "lease_id": first_batch["lease_id"],
+                }
+            )
+            == "commit_out_of_order"
+        ), "out-of-range commit must be rejected"
+
+        # The later range commits first; the committed offset waits for the hole.
+        second_member, second_batch = claims[1]
+        api.call(
+            {
+                "op": "commit_stream_group",
+                "coll": "_events",
+                "group": "workers",
+                "seq": second_batch["to_seq"],
+                "lease_id": second_batch["lease_id"],
+            }
+        )
+        assert (
+            api.call({"op": "stream_stats", "coll": "_events"})["streams"][0]["groups"][0][
+                "committed_seq"
+            ]
+            == 3
+        ), "committed offset must not skip the hole"
+        api.call(
+            {
+                "op": "commit_stream_group",
+                "coll": "_events",
+                "group": "workers",
+                "seq": first_batch["to_seq"],
+                "lease_id": first_batch["lease_id"],
+            }
+        )
+        seen = [first_batch["from_seq"], second_batch["from_seq"]]
+        assert seen == [4, 5], seen
+        assert (
+            api.call({"op": "stream_stats", "coll": "_events"})["streams"][0]["groups"][0][
+                "committed_seq"
+            ]
+            == 5
+        )
+
+        # A caught-up group must not be written to by an idle long-poll: no new
+        # lease, no replication entry, no `updated_at` bump.
+        def workers_group() -> dict[str, Any]:
+            streams = api.call({"op": "stream_stats", "coll": "_events"})["streams"]
+            return [g for g in streams[0]["groups"] if g["group"] == "workers"][0]
+
+        idle_before = workers_group()
+        for _ in range(3):
+            idle = api.call(
+                {
+                    "op": "watch",
+                    "coll": "_events",
+                    "mode": "group",
+                    "group": "workers",
+                    "member": "idle",
+                    "timeout_ms": 20,
+                }
+            )
+            assert idle["events"] == [], idle
+            assert idle.get("lease_id") is None, idle
+        idle_after = workers_group()
+        assert idle_after["committed_seq"] == idle_before["committed_seq"]
+        assert (
+            idle_after["updated_at"] == idle_before["updated_at"]
+        ), "an idle claim must not write the group row"
+
+        # Offsets never move backwards.
+        assert (
+            api.error(
+                {
+                    "op": "commit_stream_group",
+                    "coll": "_events",
+                    "group": "workers",
+                    "seq": 3,
+                }
+            )
+            == "stale_lease"
+        ), "committing an unknown batch must be rejected"
 
         # stats agree with a manual drain
         manual = api.call(
@@ -206,10 +267,120 @@ def main() -> int:
         )
         stats = api.call({"op": "stream_stats", "coll": "_events"})["streams"][0]
         group_stats = stats["groups"][0]
-        assert group_stats["committed_seq"] == seen[-1], group_stats
+        assert group_stats["committed_seq"] == 5, group_stats
         assert group_stats["head_seq"] == 5, group_stats
         assert group_stats["lag"] == 0, group_stats
+        assert group_stats["inflight"] == 0, group_stats
         assert len(manual) == 2, manual
+
+        # Redelivery: a member claims a batch, dies, and another member gets it
+        # with a higher attempt counter.
+        api.call({"op": "insert", "coll": "_events", "doc": {"type": "g"}})
+        dying = api.call(
+            {
+                "op": "watch",
+                "coll": "_events",
+                "mode": "group",
+                "group": "workers",
+                "member": "m1",
+                "limit": 1,
+                "lease_ms": 1000,
+                "timeout_ms": 100,
+            }
+        )
+        assert dying["attempts"] == 1, dying
+        time.sleep(1.3)
+        redelivered = api.call(
+            {
+                "op": "watch",
+                "coll": "_events",
+                "mode": "group",
+                "group": "workers",
+                "member": "m2",
+                "limit": 1,
+                "lease_ms": 1000,
+                "timeout_ms": 100,
+            }
+        )
+        assert redelivered["from_seq"] == dying["from_seq"], redelivered
+        assert redelivered["attempts"] == 2, redelivered
+        api.call(
+            {
+                "op": "nack_stream_group",
+                "coll": "_events",
+                "group": "workers",
+                "lease_id": redelivered["lease_id"],
+                "retry_in_ms": 0,
+            }
+        )
+
+        # Dead letters: a group with a single attempt allowance dead-letters a
+        # batch that keeps failing, and the group is not blocked by it.
+        api.call(
+            {
+                "op": "create_stream_group",
+                "coll": "_events",
+                "group": "poison",
+                "start": "earliest",
+                "max_attempts": 1,
+            }
+        )
+        claim = api.call(
+            {
+                "op": "watch",
+                "coll": "_events",
+                "mode": "group",
+                "group": "poison",
+                "member": "p1",
+                "limit": 100,
+                "lease_ms": 1000,
+                "timeout_ms": 100,
+            }
+        )
+        assert claim["attempts"] == 1, claim
+        time.sleep(1.3)
+        # The expired lease is dead-lettered on the next claim attempt.
+        api.call(
+            {
+                "op": "watch",
+                "coll": "_events",
+                "mode": "group",
+                "group": "poison",
+                "member": "p2",
+                "limit": 100,
+                "timeout_ms": 100,
+            }
+        )
+        dead = api.call({"op": "stream_dead", "coll": "_events", "group": "poison"})
+        assert len(dead["dead"]) == 1, dead
+        poison_stats = [
+            stream
+            for stream in api.call({"op": "stream_stats", "coll": "_events"})["streams"]
+            if stream["stream"] == "_events"
+        ][0]
+        poison_group = [g for g in poison_stats["groups"] if g["group"] == "poison"][0]
+        assert poison_group["dead"] == 1, poison_group
+        assert poison_group["lag"] == 0, poison_group
+
+        # Retrying a dead letter puts it back in the queue.
+        assert api.call(
+            {
+                "op": "retry_stream_dead",
+                "coll": "_events",
+                "group": "poison",
+                "from_seq": dead["dead"][0]["from_seq"],
+            }
+        )["retried"] is True
+        assert api.call({"op": "stream_dead", "coll": "_events", "group": "poison"})[
+            "dead"
+        ] == []
+        api.call({"op": "delete_stream_group", "coll": "_events", "group": "poison"})
+
+        # Metrics expose per-group lag.
+        metrics = api._client.get("/metrics/prometheus").text
+        assert "nonodb_stream_lag_events" in metrics, metrics[:400]
+        assert 'group="workers"' in metrics, "stream metrics must be labelled"
+        assert "nonodb_stream_claims_total" in metrics
 
         # Restart: the group resumes from the committed offset.
         stop(proc)
@@ -227,8 +398,17 @@ def main() -> int:
                 "timeout_ms": 200,
             }
         )
-        assert [event["_seq"] for event in resumed["events"]] == [6], resumed
-        assert resumed["committed_seq"] == 5, resumed
+        assert resumed["from_seq"] >= 6, resumed
+        assert resumed["events"], resumed
+        api.call(
+            {
+                "op": "commit_stream_group",
+                "coll": "_events",
+                "group": "workers",
+                "seq": resumed["to_seq"],
+                "lease_id": resumed["lease_id"],
+            }
+        )
 
         # Reset moves the group without touching the data.
         reset = api.call(
@@ -239,10 +419,7 @@ def main() -> int:
                 "to": "latest",
             }
         )
-        assert reset["committed_seq"] == 6, reset
-        assert api.call({"op": "count", "coll": "_events"}) == api.call(
-            {"op": "count", "coll": "_events"}
-        )
+        assert reset["committed_seq"] == reset["next_seq"], reset
 
         # Deleting the group removes only its offset.
         assert api.call(

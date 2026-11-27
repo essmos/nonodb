@@ -3881,24 +3881,39 @@ writer-assigned `_seq` (reserved: user writes that set it fail with
 
 ```json
 {"op":"create_stream","coll":"_events","retention":{"max_events":1000000}}
-{"op":"create_stream_group","coll":"_events","group":"order-sync","start":"latest"}
+{"op":"create_stream_group","coll":"_events","group":"order-sync","start":"latest","max_attempts":5}
 ```
 
 `start` is `latest` (default), `earliest`, or `{"seq": 1234}`.
 
-Read and commit:
+Read, commit, and nack:
 
 ```json
-{"op":"watch","coll":"_events","mode":"group","group":"order-sync","member":"worker-1","limit":100}
+{"op":"watch","coll":"_events","mode":"group","group":"order-sync","member":"worker-1","limit":100,"lease_ms":60000}
 {"op":"commit_stream_group","coll":"_events","group":"order-sync","seq":412901,"lease_id":"01J..."}
+{"op":"nack_stream_group","coll":"_events","group":"order-sync","lease_id":"01J...","retry_in_ms":5000}
 ```
 
-- A group is owned by one member at a time. Reading claims the lease for
-  `lease_ms` (default `60000`); another member waits until the owner commits or
-  the lease expires.
-- `commit_stream_group` requires the `lease_id` of the batch (`stale_lease`
-  otherwise), only moves forward (`commit_out_of_order`), and clears the lease.
+- Every read claims a contiguous range `from_seq..=to_seq` and returns one
+  `lease_id` for it. Distinct members get distinct ranges, so a group is
+  processed in parallel.
+- The lease lasts `lease_ms` (default `60000`, minimum `1000`). An expired lease
+  is redelivered with `attempts` incremented; after `max_attempts` the range is
+  dead-lettered.
+- `commit_stream_group` requires the batch `lease_id` (`stale_lease` otherwise),
+  must land inside the leased range (`commit_out_of_order`), and only advances
+  the committed offset across a contiguous prefix.
+- `nack_stream_group` releases the range (optionally after `retry_in_ms`) and
+  keeps the attempt counter.
 - Delivery is at-least-once; handlers must be idempotent.
+
+Dead letters:
+
+```json
+{"op":"stream_dead","coll":"_events","group":"order-sync"}
+{"op":"retry_stream_dead","coll":"_events","group":"order-sync","from_seq":412901}
+{"op":"drop_stream_dead","coll":"_events","group":"order-sync","from_seq":412901}
+```
 
 Administration:
 
@@ -3914,10 +3929,11 @@ Administration:
 Claiming and committing a group need `consume:<coll>` (or `admin:<coll>`);
 `stale_lease` and `commit_out_of_order` are HTTP 409, `stream_truncated` is 410.
 
-`stream_stats` returns `committed_seq`, `head_seq`, `lag`, the active lease, and
-`truncated_below` per group. `create_stream` creates the collection if it does not
-exist (standard profile only: time-series and vault collections are rejected) and
-builds the `_seq` index, so it costs
-like an index build. `retention` is validated but not enforced yet; use TTL until
-the retention phase lands. Scopes: `admin:<coll>` for mutations,
-`read:<coll>` for reads.
+`stream_stats` returns `committed_seq`, `next_seq`, `head_seq`, `lag`, `inflight`,
+`dead`, `max_attempts`, and `truncated_below` per group. `next_seq` is derived
+from `committed_seq` plus this node's leases: after a failover the claims that
+were never committed are delivered again rather than skipped. `create_stream`
+creates the collection if it does not exist (standard profile only: time-series
+and vault collections are rejected) and builds the `_seq` index, so it costs like
+an index build. `retention` is validated but not enforced yet; use TTL until the
+retention phase lands.

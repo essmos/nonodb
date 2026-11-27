@@ -13,7 +13,7 @@ use serde_json::Value;
 use crate::events::EventConfig;
 use crate::graph::GraphDef;
 use crate::search::{SearchIndexDef, SearchKind};
-use crate::streams::{StreamDef, StreamGroup};
+use crate::streams::{StreamDef, StreamGroup, StreamLease};
 use crate::subscriptions::Subscription;
 use crate::ttl::BackfillEntry;
 use crate::vector::VectorMetric;
@@ -180,6 +180,10 @@ pub enum ReplicationOp {
     StreamGroupDelete {
         stream: String,
         group: String,
+    },
+    /// Record one dead-lettered range so replicas show the same dead letters.
+    StreamLeaseDead {
+        lease: StreamLease,
     },
     SubscriptionDelete {
         coll: String,

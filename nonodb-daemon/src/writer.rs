@@ -1288,8 +1288,13 @@ fn execute(
             }
             Ok(json!({ "dropped": existed }))
         }
-        WriteReq::CreateStreamGroup { coll, group, start } => {
-            let out = store.create_stream_group_in(wtxn, coll, group, *start)?;
+        WriteReq::CreateStreamGroup {
+            coll,
+            group,
+            start,
+            max_attempts,
+        } => {
+            let out = store.create_stream_group_in(wtxn, coll, group, *start, *max_attempts)?;
             replication.capture_op(ReplicationOp::StreamGroupSet { group: out.clone() });
             Ok(serde_json::to_value(out).map_err(nonodb_core::Error::from)?)
         }
@@ -1314,20 +1319,100 @@ fn execute(
             seq,
             lease_id,
         } => {
-            let out = store.commit_stream_group_in(wtxn, coll, group, *seq, lease_id.as_deref())?;
+            let lease_id = lease_id.clone().unwrap_or_default();
+            let lease = store.ack_stream_lease_in(wtxn, coll, group, &lease_id, *seq)?;
+            let out = store
+                .stream_group_in_rw(wtxn, coll, group)?
+                .ok_or_else(|| nonodb_core::Error::Query("stream group vanished".into()))?;
             replication.capture_op(ReplicationOp::StreamGroupSet { group: out.clone() });
-            Ok(serde_json::to_value(out).map_err(nonodb_core::Error::from)?)
+            Ok(json!({
+                "committed_seq": out.committed_seq,
+                "next_seq": out.next_seq,
+                "from_seq": lease.from_seq,
+                "to_seq": lease.to_seq,
+            }))
         }
         WriteReq::ClaimStreamGroup {
             coll,
             group,
             member,
             lease_ms,
+            limit,
         } => {
-            let out = store.claim_stream_group_in(wtxn, coll, group, member, *lease_ms)?;
-            // A lease is node-local ownership: replicate the offset but not the
-            // claim, so a replica never blocks its own members on our lease.
-            Ok(serde_json::to_value(out).map_err(nonodb_core::Error::from)?)
+            let before = store.stream_group_in_rw(wtxn, coll, group)?;
+            let mut dead = Vec::new();
+            let out = store.claim_stream_lease_in_with_dead(
+                wtxn, coll, group, member, *limit, *lease_ms, &mut dead,
+            )?;
+            // A lease is node-local ownership: only replicate the group row when
+            // the claim actually moved something. An idle long-poll must not
+            // append a replication entry every few milliseconds.
+            if let Some(group_row) = store.stream_group_in_rw(wtxn, coll, group)? {
+                if before.as_ref() != Some(&group_row) {
+                    replication.capture_op(ReplicationOp::StreamGroupSet { group: group_row });
+                }
+            }
+            for lease in &dead {
+                replication.capture_op(ReplicationOp::StreamLeaseDead {
+                    lease: lease.clone(),
+                });
+            }
+            if !dead.is_empty() {
+                crate::metrics::add(
+                    &crate::metrics::STREAM_DEAD_LETTERS,
+                    dead.iter().map(|lease| lease.events()).sum(),
+                );
+            }
+            Ok(match out {
+                Some(lease) => json!({
+                    "lease_id": lease.lease_id,
+                    "member": lease.member,
+                    "from_seq": lease.from_seq,
+                    "to_seq": lease.to_seq,
+                    "attempts": lease.attempts,
+                    "max_attempts": lease.max_attempts,
+                    "lease_until": lease.lease_until,
+                }),
+                None => Value::Null,
+            })
+        }
+        WriteReq::NackStreamGroup {
+            coll,
+            group,
+            lease_id,
+            retry_in_ms,
+        } => {
+            let lease = store.nack_stream_lease_in(wtxn, coll, group, lease_id, *retry_in_ms)?;
+            let dead = lease.status == nonodb_core::streams::LeaseStatus::Done;
+            crate::metrics::inc(&crate::metrics::STREAM_NACKS);
+            if dead {
+                crate::metrics::add(&crate::metrics::STREAM_DEAD_LETTERS, lease.events());
+            }
+            if let Some(group_row) = store.stream_group_in_rw(wtxn, coll, group)? {
+                replication.capture_op(ReplicationOp::StreamGroupSet { group: group_row });
+            }
+            Ok(json!({
+                "from_seq": lease.from_seq,
+                "to_seq": lease.to_seq,
+                "attempts": lease.attempts,
+                "dead": dead,
+            }))
+        }
+        WriteReq::RetryStreamDead {
+            coll,
+            group,
+            from_seq,
+        } => {
+            let retried = store.retry_stream_dead_in(wtxn, coll, group, *from_seq)?;
+            Ok(json!({ "retried": retried }))
+        }
+        WriteReq::DropStreamDead {
+            coll,
+            group,
+            from_seq,
+        } => {
+            let dropped = store.drop_stream_dead_in(wtxn, coll, group, *from_seq)?;
+            Ok(json!({ "dropped": dropped }))
         }
         WriteReq::PruneSubscriptions => {
             let removed = store.prune_expired_subscriptions_in(wtxn)?;

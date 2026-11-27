@@ -626,6 +626,9 @@ pub enum Request {
         group: String,
         #[serde(default)]
         start: nonodb_core::streams::StartAt,
+        /// Redelivery attempts before a batch is dead-lettered.
+        #[serde(default)]
+        max_attempts: Option<u32>,
     },
     /// Move a group offset and clear its in-flight lease.
     ResetStreamGroup {
@@ -651,13 +654,42 @@ pub enum Request {
         #[serde(default)]
         lease_id: Option<String>,
     },
-    /// Claim the group for one member until the lease expires.
+    /// Claim the next batch for one member until the lease expires.
     ClaimStreamGroup {
         coll: String,
         group: String,
         member: String,
         #[serde(default)]
         lease_ms: Option<u64>,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    /// Release a batch for redelivery, or dead-letter it when attempts run out.
+    NackStreamGroup {
+        coll: String,
+        group: String,
+        lease_id: String,
+        #[serde(default)]
+        retry_in_ms: Option<u64>,
+    },
+    /// List dead-lettered batches.
+    StreamDead {
+        #[serde(default)]
+        coll: Option<String>,
+        #[serde(default)]
+        group: Option<String>,
+    },
+    /// Move a dead letter back into the redelivery queue.
+    RetryStreamDead {
+        coll: String,
+        group: String,
+        from_seq: u64,
+    },
+    /// Drop a dead letter without reprocessing it.
+    DropStreamDead {
+        coll: String,
+        group: String,
+        from_seq: u64,
     },
     ListCollections,
     /// Per-collection record counts and storage estimates for this database.
@@ -1010,6 +1042,7 @@ pub enum WriteReq {
         coll: String,
         group: String,
         start: nonodb_core::streams::StartAt,
+        max_attempts: u32,
     },
     ResetStreamGroup {
         coll: String,
@@ -1031,6 +1064,23 @@ pub enum WriteReq {
         group: String,
         member: String,
         lease_ms: u64,
+        limit: usize,
+    },
+    NackStreamGroup {
+        coll: String,
+        group: String,
+        lease_id: String,
+        retry_in_ms: u64,
+    },
+    RetryStreamDead {
+        coll: String,
+        group: String,
+        from_seq: u64,
+    },
+    DropStreamDead {
+        coll: String,
+        group: String,
+        from_seq: u64,
     },
     CreateWebhook {
         rule: WebhookRule,
@@ -1277,6 +1327,10 @@ impl Request {
             Self::StreamStats { .. } => "stream_stats",
             Self::CommitStreamGroup { .. } => "commit_stream_group",
             Self::ClaimStreamGroup { .. } => "claim_stream_group",
+            Self::NackStreamGroup { .. } => "nack_stream_group",
+            Self::StreamDead { .. } => "stream_dead",
+            Self::RetryStreamDead { .. } => "retry_stream_dead",
+            Self::DropStreamDead { .. } => "drop_stream_dead",
             Self::GetCollectionEvents { .. } => "get_collection_events",
             Self::GetCollectionMetrics { .. } => "get_collection_metrics",
             Self::CreateSubscription { .. } => "create_subscription",
@@ -1364,6 +1418,7 @@ impl Request {
             | Self::GetStream { .. }
             | Self::ListStreams
             | Self::StreamStats { .. }
+            | Self::StreamDead { .. }
             | Self::ListDatabases => true,
             Self::Aggregate { pipeline, .. } => nonodb_core::aggregate::write_stage_spec(pipeline)
                 .ok()
@@ -1450,7 +1505,11 @@ impl Request {
             | Self::ResetStreamGroup { coll, .. }
             | Self::DeleteStreamGroup { coll, .. }
             | Self::CommitStreamGroup { coll, .. }
-            | Self::ClaimStreamGroup { coll, .. } => vec![coll.clone()],
+            | Self::ClaimStreamGroup { coll, .. }
+            | Self::NackStreamGroup { coll, .. }
+            | Self::RetryStreamDead { coll, .. }
+            | Self::DropStreamDead { coll, .. } => vec![coll.clone()],
+            Self::StreamDead { coll, .. } => coll.iter().cloned().collect(),
             Self::ListStreams => Vec::new(),
             Self::StreamStats { coll } => coll.iter().cloned().collect(),
             Self::SetGraph { coll, def } => {

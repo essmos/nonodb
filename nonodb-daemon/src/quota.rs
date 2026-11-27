@@ -464,7 +464,10 @@ impl Growth {
             | ResetStreamGroup { .. }
             | DeleteStreamGroup { .. }
             | CommitStreamGroup { .. }
-            | ClaimStreamGroup { .. } => Self::default(),
+            | ClaimStreamGroup { .. }
+            | NackStreamGroup { .. }
+            | RetryStreamDead { .. }
+            | DropStreamDead { .. } => Self::default(),
             SetCollectionEvents { .. }
             | CreateSubscription { .. }
             | RenewSubscription { .. }
