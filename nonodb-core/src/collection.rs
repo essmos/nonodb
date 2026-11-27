@@ -7675,8 +7675,11 @@ impl<'e> Collection<'e> {
         let db = self
             .env
             .create_database::<Bytes, Bytes>(&mut *wtxn, Some(EVENTS_COLLECTION))?;
+        // The outbox shares the writer's stream counter: without the store the
+        // automatically produced events would get no `_seq` and consumer groups
+        // over `_events` would silently skip them.
         let outbox = Collection::new(
-            None,
+            self.store,
             self.env,
             db,
             self.meta,

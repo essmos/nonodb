@@ -253,6 +253,13 @@ pub struct StreamLease {
     pub status: LeaseStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Set when the batch was requeued from the dead-letter queue.
+    ///
+    /// A retried batch may sit below the group's committed offset (the group
+    /// moved on while the batch was dead), so its acknowledgement must be
+    /// accepted without moving the offset.
+    #[serde(default)]
+    pub retried: bool,
     pub created_at: u64,
     pub updated_at: u64,
 }
@@ -272,6 +279,7 @@ impl StreamLease {
             max_attempts,
             status: LeaseStatus::Available,
             error: None,
+            retried: false,
             created_at: now,
             updated_at: now,
         }

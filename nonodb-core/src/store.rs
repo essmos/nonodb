@@ -2642,6 +2642,19 @@ impl Store {
             )));
         }
         if seq < group_row.committed_seq {
+            // A batch retried from the dead-letter queue can sit below the
+            // committed offset because the group advanced while it was dead.
+            // Acknowledge the replay and drop the lease; the offset is already
+            // past it.
+            if lease.retried {
+                lease.status = crate::streams::LeaseStatus::Done;
+                lease.lease_id = None;
+                lease.member = None;
+                lease.lease_until = 0;
+                lease.touch();
+                self.delete_stream_lease_in(wtxn, stream, group, lease.from_seq)?;
+                return Ok(lease);
+            }
             return Err(Error::CommitOutOfOrder(format!(
                 "offset {seq} is below the committed offset {}",
                 group_row.committed_seq
@@ -2735,6 +2748,7 @@ impl Store {
         lease.member = None;
         lease.lease_until = 0;
         lease.error = None;
+        lease.retried = true;
         lease.touch();
         self.put_stream_lease_in(wtxn, &lease)?;
         Ok(true)

@@ -118,29 +118,24 @@ def main() -> int:
         head = api.call({"op": "get_stream", "coll": "_events"})["head_seq"]
         assert head == 3, head
 
-        # `_seq` is reserved for updates too, not just inserts.
-        assert (
-            api.error(
-                {
-                    "op": "update",
-                    "coll": "_events",
-                    "filter": {},
-                    "update": {"$set": {"_seq": 100}},
-                }
-            )
-            == "invalid_query"
-        ), "updates must not rewrite the reserved offset"
-        assert (
-            api.error(
-                {
-                    "op": "update",
-                    "coll": "_events",
-                    "filter": {},
-                    "update": {"$unset": {"_seq": ""}},
-                }
-            )
-            == "invalid_query"
-        ), "updates must not remove the reserved offset"
+        # `_seq` is reserved for updates too, not just inserts. Target a document
+        # that already has an offset so the check exercises rewrite/removal.
+        for update in ({"$set": {"_seq": 100}}, {"$unset": {"_seq": ""}}, {"$inc": {"_seq": 1}}):
+            assert (
+                api.error(
+                    {
+                        "op": "update",
+                        "coll": "_events",
+                        "filter": {"_seq": {"$gt": 0}},
+                        "update": update,
+                    }
+                )
+                == "invalid_query"
+            ), f"updates must not change the reserved offset: {update}"
+        protected = api.call(
+            {"op": "find", "coll": "_events", "filter": {"_seq": {"$gt": 0}}}
+        )
+        assert all(doc["_seq"] in (1, 2, 3) for doc in protected), protected
 
         # A user-supplied offset would break ordering.
         assert api.error(
@@ -446,7 +441,9 @@ def main() -> int:
             if stream["stream"] == "_events"
         ][0]
         poison_group = [g for g in poison_stats["groups"] if g["group"] == "poison"][0]
-        assert poison_group["dead"] == 1, poison_group
+        # `dead` counts events and `dead_ranges` counts batches.
+        assert poison_group["dead"] == 6, poison_group
+        assert poison_group["dead_ranges"] == 1, poison_group
         assert poison_group["lag"] == 0, poison_group
 
         # Retrying a dead letter puts it back in the queue.
@@ -461,6 +458,99 @@ def main() -> int:
         assert api.call({"op": "stream_dead", "coll": "_events", "group": "poison"})[
             "dead"
         ] == []
+        # Retrying a dead letter after the group moved on must be committable
+        # without rewinding the offset.
+        api.call(
+            {
+                "op": "create_stream_group",
+                "coll": "_events",
+                "group": "replay",
+                "start": "earliest",
+                "max_attempts": 1,
+            }
+        )
+        first = api.call(
+            {
+                "op": "watch",
+                "coll": "_events",
+                "mode": "group",
+                "group": "replay",
+                "member": "r1",
+                "limit": 2,
+                "lease_ms": 1000,
+                "timeout_ms": 100,
+            }
+        )
+        dead_range = (first["from_seq"], first["to_seq"])
+        time.sleep(1.3)
+        ahead = api.call(
+            {
+                "op": "watch",
+                "coll": "_events",
+                "mode": "group",
+                "group": "replay",
+                "member": "r2",
+                "limit": 2,
+                "timeout_ms": 100,
+            }
+        )
+        assert ahead["events"], ahead
+        api.call(
+            {
+                "op": "commit_stream_group",
+                "coll": "_events",
+                "group": "replay",
+                "seq": ahead["to_seq"],
+                "lease_id": ahead["lease_id"],
+            }
+        )
+        committed_ahead = [
+            group
+            for group in api.call({"op": "stream_stats", "coll": "_events"})["streams"][0][
+                "groups"
+            ]
+            if group["group"] == "replay"
+        ][0]["committed_seq"]
+        assert api.call(
+            {
+                "op": "retry_stream_dead",
+                "coll": "_events",
+                "group": "replay",
+                "from_seq": dead_range[0],
+            }
+        )["retried"] is True
+        replay = api.call(
+            {
+                "op": "watch",
+                "coll": "_events",
+                "mode": "group",
+                "group": "replay",
+                "member": "r3",
+                "limit": 10,
+                "timeout_ms": 100,
+            }
+        )
+        assert (replay["from_seq"], replay["to_seq"]) == dead_range, replay
+        api.call(
+            {
+                "op": "commit_stream_group",
+                "coll": "_events",
+                "group": "replay",
+                "seq": replay["to_seq"],
+                "lease_id": replay["lease_id"],
+            }
+        )
+        after_replay = [
+            group
+            for group in api.call({"op": "stream_stats", "coll": "_events"})["streams"][0][
+                "groups"
+            ]
+            if group["group"] == "replay"
+        ][0]
+        assert after_replay["committed_seq"] == committed_ahead, after_replay
+        assert after_replay["inflight"] == 0, after_replay
+        api.call({"op": "delete_stream_group", "coll": "_events", "group": "replay"})
+
         api.call({"op": "delete_stream_group", "coll": "_events", "group": "poison"})
 
         # Metrics expose per-group lag and counters.
@@ -611,26 +701,63 @@ def main() -> int:
             "groups"
         ] == []
 
-        # `create_stream` bootstraps the collection instead of requiring a
-        # separate `create_collection`.
-        api.call({"op": "create_stream", "coll": "boot_events"})
-        api.call({"op": "insert", "coll": "boot_events", "doc": {"n": 1}})
-        assert (
-            api.call({"op": "get_stream", "coll": "boot_events"})["head_seq"] == 1
-        ), "create_stream must create the collection"
-
-        # Time-series collections cannot back a stream.
+        # Automatic change events (the daemon's main `_events` producer) must
+        # get offsets too, and a group must deliver them.
+        api.call({"op": "create_collection", "coll": "orders_auto"})
         api.call(
             {
-                "op": "create_collection",
-                "coll": "ts_events",
-                "profile": "timeseries",
-                "timeseries": {"timeField": "ts"},
+                "op": "set_collection_events",
+                "coll": "orders_auto",
+                "enabled": True,
+                "ops": ["insert"],
             }
         )
-        assert (
-            api.error({"op": "create_stream", "coll": "ts_events"}) == "invalid_query"
-        ), "a time-series collection must not accept a stream"
+        head_before = api.call({"op": "get_stream", "coll": "_events"})["head_seq"]
+        api.call({"op": "insert", "coll": "orders_auto", "doc": {"_id": "o1"}})
+        auto = api.call(
+            {
+                "op": "find",
+                "coll": "_events",
+                "filter": {"type": "orders_auto.insert"},
+                "sort": [["_seq", 1]],
+            }
+        )
+        assert len(auto) == 1, auto
+        assert auto[0].get("_seq") == head_before + 1, auto
+        assert api.call({"op": "get_stream", "coll": "_events"})["head_seq"] == head_before + 1
+        api.call(
+            {
+                "op": "create_stream_group",
+                "coll": "_events",
+                "group": "auto",
+                "start": "earliest",
+            }
+        )
+        delivered = api.call(
+            {
+                "op": "watch",
+                "coll": "_events",
+                "mode": "group",
+                "group": "auto",
+                "member": "a1",
+                "limit": 1000,
+                "timeout_ms": 100,
+            }
+        )
+        assert any(
+            event.get("type") == "orders_auto.insert" for event in delivered["events"]
+        ), delivered
+        api.call(
+            {
+                "op": "commit_stream_group",
+                "coll": "_events",
+                "group": "auto",
+                "seq": delivered["to_seq"],
+                "lease_id": delivered["lease_id"],
+            }
+        )
+        api.call({"op": "delete_stream_group", "coll": "_events", "group": "auto"})
+
         # Offset retention: a group without commits pins the window, and a group
         # behind the window gets `stream_truncated` instead of silent skips.
         api.call({"op": "create_collection", "coll": "ret_events"})
@@ -746,7 +873,15 @@ def main() -> int:
             }
         )
         for n in range(3):
-            api.call({"op": "insert", "coll": "age_events", "doc": {"n": n}})
+            # Age retention needs a timestamp: events without one are treated as
+            # "unknown age" and pin the age boundary.
+            api.call(
+                {
+                    "op": "insert",
+                    "coll": "age_events",
+                    "doc": {"n": n, "created_at": 1_000},
+                }
+            )
         time.sleep(0.03)
         assert api.call({"op": "prune_stream", "coll": "age_events"})["deleted"] == 3
         api.call(
@@ -757,18 +892,17 @@ def main() -> int:
                 "start": "earliest",
             }
         )
-        assert (
-            api.error(
-                {
-                    "op": "watch",
-                    "coll": "age_events",
-                    "mode": "group",
-                    "group": "behind",
-                    "timeout_ms": 100,
-                }
-            )
-            == "stream_truncated"
-        ), "an empty retained window must fail with stream_truncated"
+        status, code = api.error_with_status(
+            {
+                "op": "watch",
+                "coll": "age_events",
+                "mode": "group",
+                "group": "behind",
+                "timeout_ms": 100,
+            }
+        )
+        assert code == "stream_truncated", code
+        assert status == 410, status
         behind = api.call({"op": "stream_stats", "coll": "age_events"})["streams"][0][
             "groups"
         ][0]
@@ -871,6 +1005,81 @@ def main() -> int:
         assert [doc["_seq"] for doc in docs] == [4, 5], docs
         metrics = api._client.get("/metrics/prometheus").text
         assert "nonodb_stream_lease_recoveries_total" in metrics
+
+        # `create_stream` bootstraps the collection, and a fully filtered batch is
+        # acknowledged server-side instead of being handed back until it dies.
+        api.call(
+            {
+                "op": "create_stream",
+                "coll": "filtered_events",
+                "retention": {"max_events": 100},
+            }
+        )
+        api.call(
+            {
+                "op": "insert_many",
+                "coll": "filtered_events",
+                "docs": [{"kind": "drop", "n": n} for n in range(3)]
+                + [{"kind": "keep", "n": n} for n in range(2)],
+            }
+        )
+        api.call(
+            {
+                "op": "create_stream_group",
+                "coll": "filtered_events",
+                "group": "pick",
+                "start": "earliest",
+                "max_attempts": 1,
+            }
+        )
+        # First range is 1..=3, all "drop" for this member.
+        first = api.call(
+            {
+                "op": "watch",
+                "coll": "filtered_events",
+                "mode": "group",
+                "group": "pick",
+                "member": "m1",
+                "filter": {"kind": "keep"},
+                "limit": 3,
+                "timeout_ms": 100,
+            }
+        )
+        assert first["from_seq"] == 4, first
+        assert [event["n"] for event in first["events"]] == [0, 1], first
+        pick = [
+            group
+            for group in api.call({"op": "stream_stats", "coll": "filtered_events"})[
+                "streams"
+            ][0]["groups"]
+            if group["group"] == "pick"
+        ][0]
+        assert pick["dead_ranges"] == 0, pick
+        assert pick["committed_seq"] == 3, pick
+        assert first["to_seq"] == 5, first
+        api.call(
+            {
+                "op": "commit_stream_group",
+                "coll": "filtered_events",
+                "group": "pick",
+                "seq": first["to_seq"],
+                "lease_id": first["lease_id"],
+            }
+        )
+
+        # Time-series collections cannot back a stream.
+        api.call(
+            {
+                "op": "create_collection",
+                "coll": "ts_events",
+                "profile": "timeseries",
+                "timeseries": {"timeField": "ts"},
+            }
+        )
+        assert (
+            api.error({"op": "create_stream", "coll": "ts_events"})
+            == "invalid_query"
+        ), "a time-series collection must not accept a stream"
 
         api.close()
         print("streams/groups: ok")
