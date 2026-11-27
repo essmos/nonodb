@@ -223,6 +223,12 @@ For analytics, `$group` and `$setWindowFields` also accept `$percentile`,
 include `$returns` and `$logReturns`. `$timeBucketGapfill` fills missing time
 buckets and applies `locf` or `linear` values before charting.
 
+A raw time-bucketed `$group` that uses only `$first`, `$last`, `$min`, `$max`,
+`$sum`, and `$count` with an ascending time sort uses a columnar scan and
+avoids materializing every document as JSON. Other pipelines use the normal
+scan. For diagnostics, `NONODB_TS_DISABLE_ROLLUPS=1` bypasses materialized
+rollups and `NONODB_TS_DISABLE_COLUMNAR=1` disables the columnar group path.
+
 ## Supported operations
 
 | Operation | Time-series collection |

@@ -5542,7 +5542,7 @@ impl Accumulator {
     }
 }
 
-fn number_value(n: f64) -> Value {
+pub(crate) fn number_value(n: f64) -> Value {
     if n.fract() == 0.0 && n >= i64::MIN as f64 && n <= i64::MAX as f64 {
         Value::from(n as i64)
     } else {

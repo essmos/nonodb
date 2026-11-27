@@ -4252,6 +4252,563 @@ fn decode_bucket_window_rows(
     Ok(selected.into_iter().zip(rows).collect())
 }
 
+#[derive(Clone)]
+enum ColumnarAgg {
+    First(Option<String>),
+    Last(Option<String>),
+    Min(Option<String>),
+    Max(Option<String>),
+    Sum(Option<String>),
+    Count,
+}
+
+struct ColumnarGroupSpec {
+    filter: Value,
+    width: i64,
+    week_shift: i64,
+    nested: bool,
+    outputs: Vec<(String, ColumnarAgg)>,
+    descending: bool,
+}
+
+fn columnar_group_spec(pipeline: &[Value], settings: &Settings) -> Option<ColumnarGroupSpec> {
+    let group_at = pipeline
+        .iter()
+        .position(|stage| stage.get("$group").is_some())?;
+    let mut filter = Value::Object(Map::new());
+    for stage in &pipeline[..group_at] {
+        let object = stage.as_object()?;
+        if object.len() != 1 {
+            return None;
+        }
+        match (object.get("$match"), object.get("$sort")) {
+            (Some(matched), None) => filter = matched.clone(),
+            (None, Some(sort)) => {
+                let sort = sort.as_object()?;
+                if sort.len() != 1
+                    || sort.get(&settings.time_field).and_then(Value::as_i64) != Some(1)
+                {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+        if !filter_is_meta_time_only(&filter, settings) {
+            return None;
+        }
+    }
+    if !filter_is_meta_time_only(&filter, settings)
+        || meta_equality_hash(&filter, settings).is_none()
+    {
+        return None;
+    }
+    let group = pipeline[group_at].get("$group")?.as_object()?;
+    let id = group.get("_id")?;
+    let object = id.as_object()?;
+    if object.len() != 1 {
+        return None;
+    }
+    let (trunc, nested) = match (object.get("bucket"), object.get("$dateTrunc")) {
+        (Some(bucket), None) => (bucket.get("$dateTrunc").unwrap_or(bucket), true),
+        (None, Some(trunc)) => (trunc, false),
+        _ => return None,
+    };
+    let expected_date = format!("${}", settings.time_field);
+    if trunc.get("date").and_then(Value::as_str) != Some(expected_date.as_str())
+        || trunc.get("timezone").is_some()
+    {
+        eprintln!(
+            "columnar reject: date {:?} expected {} trunc {trunc}",
+            trunc.get("date"),
+            expected_date
+        );
+        return None;
+    }
+    let unit = trunc.get("unit").and_then(Value::as_str)?;
+    let bin = trunc
+        .get("binSize")
+        .and_then(Value::as_i64)
+        .unwrap_or(1)
+        .max(1);
+    let (base, week_shift) = match unit {
+        "minute" => (60_000i64, 0i64),
+        "hour" => (3_600_000i64, 0i64),
+        "day" => (86_400_000i64, 0i64),
+        "week" => {
+            let start = trunc
+                .get("startOfWeek")
+                .and_then(Value::as_str)
+                .unwrap_or("sunday");
+            let shift = match start.to_ascii_lowercase().as_str() {
+                "sunday" => 4 * 86_400_000,
+                "monday" => 3 * 86_400_000,
+                _ => return None,
+            };
+            (604_800_000i64, shift)
+        }
+        _ => return None,
+    };
+    let width = base.checked_mul(bin)?;
+    let mut outputs = Vec::new();
+    for (field, accumulator) in group {
+        if field == "_id" {
+            continue;
+        }
+        let accumulator = accumulator.as_object()?;
+        if accumulator.len() != 1 {
+            return None;
+        }
+        let (op, arg) = accumulator.iter().next()?;
+        let expression = |value: &Value| -> Option<Option<String>> {
+            if value.is_null() {
+                return Some(None);
+            }
+            let field = value.as_str()?.strip_prefix('$')?;
+            (!field.is_empty() && !field.contains('.')).then(|| Some(field.to_string()))
+        };
+        let parsed = match op.as_str() {
+            "$first" => ColumnarAgg::First(expression(arg)?),
+            "$last" => ColumnarAgg::Last(expression(arg)?),
+            "$min" => ColumnarAgg::Min(expression(arg)?),
+            "$max" => ColumnarAgg::Max(expression(arg)?),
+            "$sum" => {
+                if arg.as_i64() == Some(1) {
+                    ColumnarAgg::Sum(None)
+                } else {
+                    ColumnarAgg::Sum(Some(expression(arg)??))
+                }
+            }
+            "$count" => ColumnarAgg::Count,
+            _ => return None,
+        };
+        outputs.push((field.clone(), parsed));
+    }
+    if outputs.is_empty() {
+        return None;
+    }
+    let mut descending = false;
+    for stage in &pipeline[group_at + 1..] {
+        let object = stage.as_object()?;
+        if object.len() != 1 {
+            return None;
+        }
+        let sort = object.get("$sort")?.as_object()?;
+        if sort.len() != 1 {
+            return None;
+        }
+        let direction = sort.get("_id")?.as_i64()?;
+        descending = direction < 0;
+    }
+    Some(ColumnarGroupSpec {
+        filter,
+        width,
+        week_shift,
+        nested,
+        outputs,
+        descending,
+    })
+}
+
+fn bucket_start_for_width(ts: i64, width: i64, week_shift: i64) -> i64 {
+    if week_shift == 0 {
+        ts.div_euclid(width) * width
+    } else {
+        (ts.saturating_add(week_shift)).div_euclid(width) * width - week_shift
+    }
+}
+
+type SelectedColumns = (Vec<usize>, Vec<i64>, BTreeMap<String, Vec<Option<Value>>>);
+
+fn decode_bucket_selected_columns(
+    data: &[u8],
+    settings: &Settings,
+    low: Option<i64>,
+    high: Option<i64>,
+    tombs: &BTreeSet<u32>,
+    fields: &BTreeSet<String>,
+) -> Result<Option<SelectedColumns>> {
+    if !valid_magic(data) || data[4] < FORMAT_VERSION_PREV {
+        return Ok(None);
+    }
+    let version = data[4];
+    let mut pos = 6;
+    let n = get_uvarint(data, &mut pos)? as usize;
+    if n > HARD_BUCKET_MAX_DOCS {
+        return Err(corrupt("row count out of range"));
+    }
+    let _window_start = get_ivarint(data, &mut pos)?;
+    let _end = get_ivarint(data, &mut pos)?;
+    let meta_raw = get_bytes(data, &mut pos)?;
+    let _meta: Option<Value> = if meta_raw.is_empty() {
+        None
+    } else {
+        Some(serde_json::from_slice(meta_raw)?)
+    };
+    skip_zone_map(data, &mut pos, version)?;
+    let block_rows = get_uvarint(data, &mut pos)? as usize;
+    if block_rows == 0 || block_rows > HARD_BUCKET_MAX_DOCS {
+        return Err(corrupt("column block size out of range"));
+    }
+    let column_count = get_uvarint(data, &mut pos)? as usize;
+    if column_count > 4096 {
+        return Err(corrupt("column count out of range"));
+    }
+    let mut columns: Vec<(String, Vec<&[u8]>)> = Vec::new();
+    for _ in 0..column_count {
+        let field = std::str::from_utf8(get_bytes(data, &mut pos)?)
+            .map_err(|_| corrupt("field name is not UTF-8"))?
+            .to_string();
+        let blocks = get_uvarint(data, &mut pos)? as usize;
+        if blocks > HARD_BUCKET_MAX_DOCS {
+            return Err(corrupt("column block count out of range"));
+        }
+        let selected = fields.contains(&field);
+        let mut blobs = Vec::with_capacity(if selected { blocks } else { 0 });
+        for _ in 0..blocks {
+            let blob = get_bytes(data, &mut pos)?;
+            if selected {
+                blobs.push(blob);
+            }
+        }
+        if selected {
+            columns.push((field, blobs));
+        }
+    }
+    let mut deleted = BTreeSet::new();
+    let bitmap_len = get_uvarint(data, &mut pos)? as usize;
+    if bitmap_len != n.div_ceil(8) || pos + bitmap_len > data.len() {
+        return Err(corrupt("malformed deletion bitmap"));
+    }
+    for idx in 0..n {
+        if data[pos + idx / 8] & (1 << (idx % 8)) != 0 {
+            deleted.insert(idx as u32);
+        }
+    }
+    let Some((_, time_blobs)) = columns
+        .iter()
+        .find(|(field, _)| field == &settings.time_field)
+    else {
+        return Ok(None);
+    };
+    let mut time_values = vec![None; n];
+    let mut base = 0;
+    for blob in time_blobs {
+        let block_end = (base + block_rows).min(n);
+        let block = decode_time_column_ms(blob)?;
+        for (offset, value) in block.into_iter().enumerate() {
+            if base + offset < block_end {
+                time_values[base + offset] = value;
+            }
+        }
+        base = block_end;
+    }
+    let selected: Vec<usize> = (0..n)
+        .filter(|idx| !deleted.contains(&(*idx as u32)) && !tombs.contains(&(*idx as u32)))
+        .filter(|idx| {
+            time_values[*idx].is_some_and(|ts| {
+                low.is_none_or(|low| ts >= low) && high.is_none_or(|high| ts <= high)
+            })
+        })
+        .collect();
+    if selected.is_empty() {
+        return Ok(Some((Vec::new(), Vec::new(), BTreeMap::new())));
+    }
+    let mut positions = vec![None; n];
+    for (room, index) in selected.iter().enumerate() {
+        positions[*index] = Some(room);
+    }
+    let mut times = Vec::with_capacity(selected.len());
+    for index in &selected {
+        times.push(time_values[*index].unwrap_or_default());
+    }
+    let mut values: BTreeMap<String, Vec<Option<Value>>> = BTreeMap::new();
+    for (field, blobs) in &columns {
+        if field == &settings.time_field {
+            continue;
+        }
+        let mut column = vec![None; selected.len()];
+        let mut base = 0;
+        for blob in blobs {
+            let block_end = (base + block_rows).min(n);
+            if !selected
+                .iter()
+                .any(|index| (base..block_end).contains(index))
+            {
+                base = block_end;
+                continue;
+            }
+            let mut block_pos = 0;
+            let block = decode_column(blob, &mut block_pos)?;
+            if block.field != *field {
+                return Err(corrupt("column block field mismatch"));
+            }
+            for (offset, value) in block.values.into_iter().enumerate() {
+                let index = base + offset;
+                if index >= block_end {
+                    break;
+                }
+                if let Some(room) = positions[index] {
+                    column[room] = value;
+                }
+            }
+            base = block_end;
+        }
+        values.insert(field.clone(), column);
+    }
+    Ok(Some((selected, times, values)))
+}
+
+enum ColumnarState {
+    First(Option<Value>),
+    Last(Option<Value>),
+    Min(Option<Value>),
+    Max(Option<Value>),
+    Sum(f64),
+    Count(u64),
+}
+
+impl ColumnarState {
+    fn new(op: &ColumnarAgg) -> Self {
+        match op {
+            ColumnarAgg::First(_) => Self::First(None),
+            ColumnarAgg::Last(_) => Self::Last(None),
+            ColumnarAgg::Min(_) => Self::Min(None),
+            ColumnarAgg::Max(_) => Self::Max(None),
+            ColumnarAgg::Sum(_) => Self::Sum(0.0),
+            ColumnarAgg::Count => Self::Count(0),
+        }
+    }
+
+    fn value(&self) -> Value {
+        match self {
+            Self::First(value) | Self::Last(value) | Self::Min(value) | Self::Max(value) => {
+                value.clone().unwrap_or(Value::Null)
+            }
+            Self::Sum(value) => crate::aggregate::number_value(*value),
+            Self::Count(value) => Value::from(*value),
+        }
+    }
+}
+
+pub(crate) fn try_columnar_group(
+    rtxn: &RoTxn<'_>,
+    env: &heed::Env,
+    name: &str,
+    settings: &Settings,
+    pipeline: &[Value],
+) -> Result<Option<Vec<Value>>> {
+    if std::env::var("NONODB_TS_DISABLE_COLUMNAR").ok().as_deref() == Some("1") {
+        return Ok(None);
+    }
+    if settings.expire_after_seconds.is_some() {
+        return Ok(None);
+    }
+    let Some(spec) = columnar_group_spec(pipeline, settings) else {
+        return Ok(None);
+    };
+    let Some(locators) = lookup_indexed_buckets(rtxn, env, name, &spec.filter, settings)? else {
+        return Ok(None);
+    };
+    let Some(db) =
+        env.open_database::<Bytes, Bytes>(rtxn, Some(&format!("{BUCKET_DB_PREFIX}{name}")))?
+    else {
+        return Ok(None);
+    };
+    let (low, high) = time_bounds(&spec.filter, &settings.time_field);
+    let mut fields = BTreeSet::new();
+    fields.insert(settings.time_field.clone());
+    for (_, op) in &spec.outputs {
+        let field = match op {
+            ColumnarAgg::First(field)
+            | ColumnarAgg::Last(field)
+            | ColumnarAgg::Min(field)
+            | ColumnarAgg::Max(field)
+            | ColumnarAgg::Sum(field) => field,
+            ColumnarAgg::Count => &None,
+        };
+        if let Some(field) = field {
+            fields.insert(field.clone());
+        }
+    }
+    struct BucketRows {
+        order: (u64, u32, i64, u16),
+        times: Vec<i64>,
+        columns: BTreeMap<String, Vec<Option<Value>>>,
+    }
+    let mut buckets = Vec::new();
+    for loc in locators {
+        let Some(payload) = db.get(
+            rtxn,
+            &bucket_key(loc.hash, loc.salt, loc.window, loc.serial),
+        )?
+        else {
+            continue;
+        };
+        let tombs = tombstones(rtxn, &db, loc.hash, loc.salt, loc.window, loc.serial)?;
+        let Some((selected, times, columns)) =
+            decode_bucket_selected_columns(payload, settings, low, high, &tombs, &fields)?
+        else {
+            return Ok(None);
+        };
+        if !selected.is_empty() {
+            buckets.push(BucketRows {
+                order: (loc.hash, loc.salt, loc.window, loc.serial),
+                times,
+                columns,
+            });
+        }
+    }
+    let meta_hash = meta_equality_hash(&spec.filter, settings).unwrap_or(0);
+    for item in db.prefix_iter(rtxn, &[KEY_ROW])? {
+        let (key, payload) = item?;
+        let Some((hash, salt, window, serial, _seq)) = row_key_parts(key) else {
+            continue;
+        };
+        if hash != meta_hash {
+            continue;
+        }
+        let Ok(row) = serde_json::from_slice::<Map<String, Value>>(payload) else {
+            return Ok(None);
+        };
+        let doc = Value::Object(row);
+        let Some(ts) = extract_time(&doc, &settings.time_field) else {
+            continue;
+        };
+        if low.is_some_and(|low| ts < low) || high.is_some_and(|high| ts > high) {
+            continue;
+        }
+        if !matcher::matches(&doc, &spec.filter) {
+            continue;
+        }
+        let mut columns = BTreeMap::new();
+        for field in &fields {
+            if field == &settings.time_field {
+                continue;
+            }
+            columns.insert(field.clone(), vec![doc.get(field).cloned()]);
+        }
+        buckets.push(BucketRows {
+            order: (hash, salt, window, serial),
+            times: vec![ts],
+            columns,
+        });
+    }
+    type Record = (i64, usize, usize, (u64, u32, i64, u16));
+    let mut records: Vec<Record> = Vec::new();
+    for (bucket_index, bucket) in buckets.iter().enumerate() {
+        for (room, ts) in bucket.times.iter().enumerate() {
+            records.push((*ts, bucket_index, room, bucket.order));
+        }
+    }
+    records.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.3.cmp(&right.3))
+            .then_with(|| left.2.cmp(&right.2))
+    });
+    let mut groups: BTreeMap<i64, Vec<ColumnarState>> = BTreeMap::new();
+    for (ts, bucket_index, room, _) in records {
+        let bucket_start = bucket_start_for_width(ts, spec.width, spec.week_shift);
+        let states = groups.entry(bucket_start).or_insert_with(|| {
+            spec.outputs
+                .iter()
+                .map(|(_, op)| ColumnarState::new(op))
+                .collect()
+        });
+        let bucket = &buckets[bucket_index];
+        for (state_index, (_, op)) in spec.outputs.iter().enumerate() {
+            let state = &mut states[state_index];
+            if matches!(state, ColumnarState::Count(_)) {
+                if let ColumnarState::Count(count) = state {
+                    *count += 1;
+                }
+                continue;
+            }
+            let field = match op {
+                ColumnarAgg::First(field)
+                | ColumnarAgg::Last(field)
+                | ColumnarAgg::Min(field)
+                | ColumnarAgg::Max(field)
+                | ColumnarAgg::Sum(field) => field,
+                ColumnarAgg::Count => continue,
+            };
+            let Some(field) = field else {
+                if let ColumnarState::Sum(total) = state {
+                    *total += 1.0;
+                }
+                continue;
+            };
+            let Some(column) = bucket.columns.get(field) else {
+                return Ok(None);
+            };
+            let value = column.get(room).and_then(Clone::clone);
+            match state {
+                ColumnarState::First(target) => {
+                    if target.is_none() {
+                        *target = Some(value.unwrap_or(Value::Null));
+                    }
+                }
+                ColumnarState::Last(target) => {
+                    *target = Some(value.unwrap_or(Value::Null));
+                }
+                ColumnarState::Min(target) | ColumnarState::Max(target) => {
+                    let Some(value) = value else { continue };
+                    if !value.is_number() {
+                        return Ok(None);
+                    }
+                    let is_min = matches!(op, ColumnarAgg::Min(_));
+                    let replace = target.as_ref().is_none_or(|current| {
+                        let Some(current) = current.as_f64() else {
+                            return true;
+                        };
+                        let Some(value) = value.as_f64() else {
+                            return true;
+                        };
+                        if is_min {
+                            value < current
+                        } else {
+                            value > current
+                        }
+                    });
+                    if replace {
+                        *target = Some(value);
+                    }
+                }
+                ColumnarState::Sum(total) => {
+                    let Some(value) = value else { continue };
+                    let Some(value) = value.as_f64() else {
+                        return Ok(None);
+                    };
+                    *total += value;
+                }
+                ColumnarState::Count(_) => unreachable!(),
+            }
+        }
+    }
+    let mut out = Vec::with_capacity(groups.len());
+    let groups: Vec<(i64, Vec<ColumnarState>)> = if spec.descending {
+        groups.into_iter().rev().collect()
+    } else {
+        groups.into_iter().collect()
+    };
+    for (bucket_start, states) in groups {
+        let mut doc = Map::new();
+        let bucket = crate::date::canonical(bucket_start);
+        if spec.nested {
+            let mut id = Map::new();
+            id.insert("bucket".into(), bucket);
+            doc.insert("_id".into(), Value::Object(id));
+        } else {
+            doc.insert("_id".into(), bucket);
+        }
+        for ((name, _), state) in spec.outputs.iter().zip(states.iter()) {
+            doc.insert(name.clone(), state.value());
+        }
+        out.push(Value::Object(doc));
+    }
+    Ok(Some(out))
+}
+
 fn docs_from_window_rows(loc: BucketLocator, rows: Vec<(usize, Map<String, Value>)>) -> Vec<Value> {
     let mut out = Vec::with_capacity(rows.len());
     for (index, row) in rows {
@@ -9526,5 +10083,69 @@ mod tests {
             "unit": "hour", "binSize": 4, "timezone": "Europe/Warsaw"
         }))
         .is_none());
+    }
+    #[test]
+    fn columnar_group_matches_generic_pipeline() {
+        let (_dir, store) = ts_store();
+        let settings = Settings {
+            time_field: "ts".into(),
+            meta_field: Some("device".into()),
+            granularity: Granularity::Minutes,
+            ..Settings::default()
+        };
+        let c = store
+            .create_timeseries_collection("columnar", &settings)
+            .unwrap();
+        let base = 1_700_000_000_000i64;
+        let minute = 60_000i64;
+        for (index, offset) in [0, 10, 70, 80, 120, 180].into_iter().enumerate() {
+            c.insert_one(json!({
+                "ts": {"$date": {"$numberLong": (base + offset * minute).to_string()}},
+                "device": "d0",
+                "open": 10.0 + index as f64,
+                "high": 20.0 + index as f64,
+                "low": 5.0 + index as f64,
+                "close": 15.0 + index as f64,
+                "volume": 0.5 + index as f64,
+            }))
+            .unwrap();
+        }
+        let group = json!({
+            "_id": {"bucket": {"$dateTrunc": {"date": "$ts", "unit": "hour"}}},
+            "open": {"$first": "$open"},
+            "high": {"$max": "$high"},
+            "low": {"$min": "$low"},
+            "close": {"$last": "$close"},
+            "volume": {"$sum": "$volume"},
+            "n": {"$sum": 1}
+        });
+        let fast = c
+            .aggregate(&[
+                json!({"$match": {"device": "d0"}}),
+                json!({"$sort": {"ts": 1}}),
+                json!({"$group": group.clone()}),
+                json!({"$sort": {"_id": 1}}),
+            ])
+            .unwrap();
+        // `$set` makes the pipeline ineligible for the columnar fast path.
+        let generic = c
+            .aggregate(&[
+                json!({"$match": {"device": "d0"}}),
+                json!({"$set": {"unused": 1}}),
+                json!({"$sort": {"ts": 1}}),
+                json!({"$group": group}),
+                json!({"$sort": {"_id": 1}}),
+            ])
+            .unwrap();
+        assert_eq!(fast, generic);
+        assert_eq!(fast.len(), 4);
+        assert_eq!(fast[0]["n"], json!(2));
+        assert_eq!(fast[0]["open"], json!(10.0));
+        assert_eq!(fast[0]["close"], json!(16.0));
+        assert!((fast[0]["volume"].as_f64().unwrap() - 2.0).abs() < 1e-12);
+        assert_eq!(fast[1]["n"], json!(2));
+        assert!((fast[1]["volume"].as_f64().unwrap() - 6.0).abs() < 1e-12);
+        assert_eq!(fast[2]["n"], json!(1));
+        assert_eq!(fast[3]["n"], json!(1));
     }
 }

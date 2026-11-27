@@ -7999,6 +7999,9 @@ impl<'e> Collection<'e> {
         pipeline: &[Value],
         settings: &crate::timeseries::Settings,
     ) -> Result<Option<Vec<Value>>> {
+        if std::env::var("NONODB_TS_DISABLE_ROLLUPS").ok().as_deref() == Some("1") {
+            return Ok(None);
+        }
         let Some(group_at) = pipeline
             .iter()
             .position(|stage| stage.get("$group").is_some())
@@ -8185,6 +8188,11 @@ impl<'e> Collection<'e> {
             aggregate::validate_pipeline(pipeline)?;
             let settings = self.timeseries_settings_in(rtxn)?.unwrap_or_default();
             if let Some(out) = self.try_timeseries_rollup(rtxn, pipeline, &settings)? {
+                return Ok(out);
+            }
+            if let Some(out) = crate::timeseries::try_columnar_group(
+                rtxn, self.env, &self.name, &settings, pipeline,
+            )? {
                 return Ok(out);
             }
             let filter = pipeline
