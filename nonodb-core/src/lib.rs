@@ -15,6 +15,7 @@ pub mod backup_compress;
 pub mod backup_crypto;
 pub mod backup_info;
 pub mod bson_types;
+mod bucket_codec;
 pub mod collection;
 pub mod cypher;
 pub mod date;
