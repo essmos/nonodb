@@ -1,8 +1,10 @@
-//! Stream retention driven by offsets.
+//! Stream maintenance: the lease-expiry janitor and offset-driven retention.
 //!
-//! Events below the slowest consumer's committed offset (minus `min_seq_keep`)
-//! and older than `max_age_ms` are dropped in batches. The pass runs through the
-//! writer so deletions are replicated and observable like any other write.
+//! Every tick the loop first recovers expired leases (requeue or dead-letter)
+//! for every group, then drops events below the slowest consumer's committed
+//! offset (minus `min_seq_keep`) and older than `max_age_ms`. Pruning runs
+//! through the writer so deletions are replicated and observable like any other
+//! write.
 
 use std::{sync::Arc, time::Duration};
 
@@ -23,11 +25,13 @@ struct Config {
 
 impl Config {
     fn from_env() -> Result<Option<Self>, String> {
+        // Retention and the lease janitor run by default; `0` disables them.
         let interval = std::env::var("NONODB_STREAM_PRUNE_INTERVAL")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(0);
+            .unwrap_or(60);
         if interval == 0 {
+            tracing::info!("stream maintenance disabled by NONODB_STREAM_PRUNE_INTERVAL=0");
             return Ok(None);
         }
         let batch = std::env::var("NONODB_STREAM_PRUNE_BATCH")
@@ -119,7 +123,7 @@ async fn run_once(databases: &Databases, config: Config) {
             loop {
                 match prune(&runtime.write_tx, &def.name, config.batch).await {
                     Ok(deleted) if deleted > 0 => {
-                        metrics::add(&metrics::STREAM_TRUNCATED, deleted as u64);
+                        metrics::add(&metrics::STREAM_PRUNED_EVENTS, deleted as u64);
                         tracing::info!(
                             database = name,
                             stream = def.name,

@@ -3876,11 +3876,12 @@ See the [Python client](python-client.md) for a higher-level interface and the
 
 Streams give an append-only collection server-side offsets and consumer groups.
 The stream name is the collection name. Inserts into a stream collection get a
-writer-assigned `_seq` (reserved: user writes that set it fail with
-`invalid_query`), and group reads order by `_seq` instead of `_id`.
+writer-assigned `_seq` (reserved: inserts that set it, and updates, pipelines, or
+find-and-modify operations that change or remove it, fail with `invalid_query`),
+and group reads order by `_seq` instead of `_id`.
 
 ```json
-{"op":"create_stream","coll":"_events","retention":{"max_events":1000000}}
+{"op":"create_stream","coll":"_events","retention":{"max_events":1000000,"max_age_ms":604800000,"min_seq_keep":0}}
 {"op":"create_stream_group","coll":"_events","group":"order-sync","start":"latest","max_attempts":5}
 ```
 
@@ -3900,9 +3901,13 @@ Read, commit, and nack:
 - The lease lasts `lease_ms` (default `60000`, minimum `1000`). An expired lease
   is redelivered with `attempts` incremented; after `max_attempts` the range is
   dead-lettered.
-- `commit_stream_group` requires the batch `lease_id` (`stale_lease` otherwise),
-  must land inside the leased range (`commit_out_of_order`), and only advances
-  the committed offset across a contiguous prefix.
+- `commit_stream_group` requires the batch `lease_id` (`stale_lease`, HTTP 409
+  otherwise) and must acknowledge the **end** of the leased range; a partial
+  acknowledgement fails with `commit_out_of_order` (409), leaves the batch
+  leased, and advances nothing. The committed offset only moves across a
+  contiguous prefix.
+- Claiming, committing, and nacking a group need `consume:<coll>` (or
+  `admin:<coll>`); `stream_truncated` is HTTP 410.
 - `nack_stream_group` releases the range (optionally after `retry_in_ms`) and
   keeps the attempt counter.
 - Delivery is at-least-once; handlers must be idempotent.
@@ -3926,20 +3931,35 @@ Administration:
 {"op":"drop_stream","coll":"_events"}
 ```
 
-Claiming and committing a group need `consume:<coll>` (or `admin:<coll>`);
-`stale_lease` and `commit_out_of_order` are HTTP 409, `stream_truncated` is 410.
+`stream_stats` returns `committed_seq`, `next_seq`, `head_seq`, `lag`,
+`inflight`, `dead` (dead-lettered events), `dead_ranges`, `redeliveries`,
+`truncations`, `max_attempts`, and `truncated_below` per group. `next_seq` is
+derived from `committed_seq` plus this node's leases: after a failover the claims
+that were never committed are delivered again rather than skipped.
+`delete_stream_group` removes the offset together with the group's leases and
+dead letters, so recreating a group with the same name starts clean.
+`/metrics/prometheus` exposes the same numbers as `nonodb_stream_*` series.
+Automatic change events (collection event configs and subscriptions) are written
+into `_events` by the daemon through the same path, so they also receive `_seq`
+and are delivered by groups.
 
-`stream_stats` returns `committed_seq`, `next_seq`, `head_seq`, `lag`, `inflight`,
-`dead`, `max_attempts`, and `truncated_below` per group. `next_seq` is derived
-from `committed_seq` plus this node's leases: after a failover the claims that
-were never committed are delivered again rather than skipped. `create_stream`
-creates the collection if it does not exist (standard profile only: time-series
-and vault collections are rejected) and builds the `_seq` index, so it costs like
-an index build.
+`retry_stream_dead` requeues the range with a reset attempt counter; if the group
+already moved past it, committing the replay does not move the offset backwards.
+
+`create_stream` creates the collection if it does not exist (standard profile
+only: time-series and vault collections are rejected), and builds the `_seq`
+index, so it costs like an index build. A group read whose filter matches none of
+the leased events commits that range server-side, so a filtered member never
+stalls the group.
 
 Retention drops events below the slowest group offset, bounded by
-`max_events`/`max_age_ms` and `min_seq_keep`; `max_bytes` is validated but
-ignored. A group behind the retained window gets `stream_truncated` on its next
+`max_events`/`max_age_ms` and `min_seq_keep`; `max_bytes` is validated and stored
+but ignored. The age boundary reads `created_at` (falling back to a ULID `_id`)
+and only drops a contiguous old prefix: an event with an unknown age or an
+out-of-order timestamp stops the boundary instead of being deleted. It runs on a
+background tick (every 60s, `NONODB_STREAM_PRUNE_INTERVAL=0` disables it) that
+also recovers expired leases through the writer, so requeues and dead letters
+replicate and replicas never run the janitor themselves. A group behind the retained window gets `stream_truncated` on its next
 claim and shows `truncated_below` in `stream_stats`:
 
 ```json

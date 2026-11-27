@@ -51,6 +51,9 @@ pub struct Retention {
     /// Keep events newer than this many milliseconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_age_ms: Option<u64>,
+    /// Accepted for forward compatibility; validated but not enforced yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<u64>,
     /// Allow deleting below a group offset, leaving this many events behind.
     #[serde(default)]
     pub min_seq_keep: u64,
@@ -68,9 +71,18 @@ impl Retention {
                 "retention.max_age_ms must be greater than zero".into(),
             ));
         }
+        if self.max_bytes == Some(0) {
+            return Err(Error::Query(
+                "retention.max_bytes must be greater than zero".into(),
+            ));
+        }
         Ok(())
     }
 
+    /// True when no bound is configured, so the stream is never pruned.
+    ///
+    /// `max_bytes` does not count yet: it is validated and stored but the drop
+    /// rule ignores it, so a stream with only `max_bytes` is not pruned.
     pub fn is_empty(&self) -> bool {
         self.max_events.is_none() && self.max_age_ms.is_none() && self.min_seq_keep == 0
     }
@@ -158,6 +170,12 @@ pub struct StreamGroup {
     /// Oldest offset still available, set when retention crossed the group.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub truncated_below: Option<u64>,
+    /// Ranges handed out again after their lease expired or was nacked.
+    #[serde(default)]
+    pub redeliveries: u64,
+    /// Times retention crossed this group (each sets `truncated_below`).
+    #[serde(default)]
+    pub truncations: u64,
     pub created_at: u64,
     pub updated_at: u64,
 }
@@ -176,6 +194,8 @@ impl StreamGroup {
             next_seq: committed_seq,
             max_attempts: default_max_attempts(),
             truncated_below: None,
+            redeliveries: 0,
+            truncations: 0,
             created_at: now,
             updated_at: now,
         }
@@ -233,6 +253,13 @@ pub struct StreamLease {
     pub status: LeaseStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Set when the batch was requeued from the dead-letter queue.
+    ///
+    /// A retried batch may sit below the group's committed offset (the group
+    /// moved on while the batch was dead), so its acknowledgement must be
+    /// accepted without moving the offset.
+    #[serde(default)]
+    pub retried: bool,
     pub created_at: u64,
     pub updated_at: u64,
 }
@@ -252,6 +279,7 @@ impl StreamLease {
             max_attempts,
             status: LeaseStatus::Available,
             error: None,
+            retried: false,
             created_at: now,
             updated_at: now,
         }

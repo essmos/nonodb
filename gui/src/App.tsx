@@ -14,6 +14,7 @@ import {
   type SavedView,
 } from './savedViews';
 import EventingPage from './EventingPage';
+import StreamsPage from './StreamsPage';
 import GraphPage from './GraphPage';
 import {
   applyFirewall,
@@ -5715,7 +5716,7 @@ function Shell({
 }) {
   const [collections, setCollections] = useState<string[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
-  const [tab, setTab] = useState<'dashboard' | 'storage' | 'playground' | 'database' | 'backups' | 'import' | 'replication' | 'cluster' | 'network' | 'auth' | 'eventing' | 'graph'>('dashboard');
+  const [tab, setTab] = useState<'dashboard' | 'storage' | 'playground' | 'database' | 'backups' | 'import' | 'replication' | 'cluster' | 'network' | 'auth' | 'eventing' | 'streams' | 'graph'>('dashboard');
   const [showNewCollection, setShowNewCollection] = useState(false);
   const [showPalette, setShowPalette] = useState(false);
   const [paletteQuery, setPaletteQuery] = useState('');
@@ -5871,6 +5872,9 @@ function Shell({
           <button className={tab === 'eventing' ? 'active' : ''} aria-current={tab === 'eventing' ? 'page' : undefined} onClick={() => setTab('eventing')}>
             Eventing
           </button>
+          <button className={tab === 'streams' ? 'active' : ''} aria-current={tab === 'streams' ? 'page' : undefined} onClick={() => setTab('streams')}>
+            Streams
+          </button>
           <button className={tab === 'graph' ? 'active' : ''} aria-current={tab === 'graph' ? 'page' : undefined} onClick={() => setTab('graph')}>
             Graph
           </button>
@@ -5973,6 +5977,8 @@ function Shell({
             collections={collections}
             onOpenCollection={(name, eventingTab) => openCollection(name, eventingTab ?? 'events')}
           />
+        ) : tab === 'streams' ? (
+          <StreamsPage connection={connection} />
         ) : tab === 'graph' ? (
           <GraphPage connection={connection} collections={collections} />
         ) : tab === 'replication' ? (

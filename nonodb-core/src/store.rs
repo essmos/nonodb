@@ -1988,10 +1988,21 @@ impl Store {
         stream: &str,
         group: &str,
     ) -> Result<bool> {
+        // A recreated group must not inherit the previous group's batches: drop
+        // its leases and dead letters together with the offset.
+        self.clear_stream_leases_in(wtxn, stream, group)?;
         let meta = self
             .env
             .create_database::<Bytes, Bytes>(&mut *wtxn, Some(META_DB))?;
         Ok(meta.delete(&mut *wtxn, Self::stream_group_key(stream, group).as_bytes())?)
+    }
+
+    /// Deletes a group, its offset, its leases, and its dead letters.
+    pub fn delete_stream_group(&self, stream: &str, group: &str) -> Result<bool> {
+        let mut wtxn = self.write_txn()?;
+        let out = self.delete_stream_group_in(&mut wtxn, stream, group)?;
+        wtxn.commit()?;
+        Ok(out)
     }
 
     /// Creates a consumer group in its own transaction.
@@ -2382,6 +2393,29 @@ impl Store {
         Ok(())
     }
 
+    /// Runs the expiry janitor over every stream and group, in its own
+    /// transactions.
+    ///
+    /// Returns `(groups_scanned, leases_recovered)`. Expired leases are requeued
+    /// or dead-lettered even when no member is currently claiming, so a crashed
+    /// worker surfaces in the dead-letter and stats views on the maintenance
+    /// tick.
+    pub fn recover_stream_leases(&self) -> Result<(usize, usize)> {
+        let mut groups = 0usize;
+        let mut recovered = 0usize;
+        for def in self.streams()? {
+            for group in self.stream_groups(Some(&def.name))? {
+                let mut wtxn = self.write_txn()?;
+                let (count, _dead) =
+                    self.recover_stream_leases_in(&mut wtxn, &def.name, &group.group)?;
+                wtxn.commit()?;
+                groups += 1;
+                recovered += count;
+            }
+        }
+        Ok((groups, recovered))
+    }
+
     /// Requeues or dead-letters every expired lease of one group.
     /// Returns `(recovered, dead_lettered)`; the dead leases are the ranges
     /// that crossed `max_attempts` and must be replicated as dead records.
@@ -2509,6 +2543,7 @@ impl Store {
             if crossed {
                 let below = oldest.unwrap_or_else(|| head.saturating_add(1));
                 group_row.truncated_below = Some(below);
+                group_row.truncations = group_row.truncations.saturating_add(1);
                 group_row.touch();
                 self.put_stream_group_in(wtxn, &group_row)?;
                 return Err(Error::StreamTruncated(format!(
@@ -2529,6 +2564,7 @@ impl Store {
             })
             .cloned();
         if let Some(mut lease) = pending {
+            group_row.redeliveries = group_row.redeliveries.saturating_add(1);
             group_row.touch();
             self.put_stream_group_in(wtxn, &group_row)?;
             lease.attempts += 1;
@@ -2542,7 +2578,6 @@ impl Store {
             return Ok(Some(lease));
         }
 
-        let head = self.stream_head_in(wtxn, stream)?;
         let from = next_seq;
         if from > head {
             return Ok(None);
@@ -2587,13 +2622,28 @@ impl Store {
                 lease.from_seq, lease.to_seq
             )));
         }
-        if seq < lease.from_seq || seq > lease.to_seq {
+        // A batch is acknowledged as a whole: a partial ack inside the range
+        // would mark the whole range done and silently drop the rest.
+        if seq != lease.to_seq {
             return Err(Error::CommitOutOfOrder(format!(
-                "offset {seq} is outside the leased range {}..={}",
+                "offset {seq} is not the end of the leased range {}..={}",
                 lease.from_seq, lease.to_seq
             )));
         }
         if seq < group_row.committed_seq {
+            // A batch retried from the dead-letter queue can sit below the
+            // committed offset because the group advanced while it was dead.
+            // Acknowledge the replay and drop the lease; the offset is already
+            // past it.
+            if lease.retried {
+                lease.status = crate::streams::LeaseStatus::Done;
+                lease.lease_id = None;
+                lease.member = None;
+                lease.lease_until = 0;
+                lease.touch();
+                self.delete_stream_lease_in(wtxn, stream, group, lease.from_seq)?;
+                return Ok(lease);
+            }
             return Err(Error::CommitOutOfOrder(format!(
                 "offset {seq} is below the committed offset {}",
                 group_row.committed_seq
@@ -2687,6 +2737,7 @@ impl Store {
         lease.member = None;
         lease.lease_until = 0;
         lease.error = None;
+        lease.retried = true;
         lease.touch();
         self.put_stream_lease_in(wtxn, &lease)?;
         Ok(true)
@@ -2903,14 +2954,17 @@ impl Store {
         if deleted.is_empty() {
             return Ok(deleted);
         }
-        let Some(remaining) = self.stream_oldest_seq_in(wtxn, &def.coll)? else {
-            return Ok(deleted);
-        };
+        // When retention removed the entire window there is no surviving offset
+        // to report; the group must resume after the current head instead.
+        let remaining = self.stream_oldest_seq_in(wtxn, &def.coll)?;
+        let head = self.stream_head_in(wtxn, &def.name)?;
+        let below = remaining.unwrap_or(head.saturating_add(1));
         for mut group in self.stream_groups(Some(&def.name))? {
-            if group.next_seq.saturating_add(1) < remaining
-                && group.truncated_below != Some(remaining)
-            {
-                group.truncated_below = Some(remaining);
+            // The group's next event (`next_seq + 1`) was dropped when it is at
+            // or below the highest dropped offset.
+            if group.next_seq < limit && group.truncated_below != Some(below) {
+                group.truncated_below = Some(below);
+                group.truncations = group.truncations.saturating_add(1);
                 group.touch();
                 self.put_stream_group_in(wtxn, &group)?;
             }

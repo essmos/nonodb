@@ -40,6 +40,10 @@ quick-start instructions, and a feature overview.
 | [Read-only Cypher](cypher.md) | Application developers, evaluators | Cypher API, supported clauses, GDS procedures, limits, pinned TCK baseline |
 | [Streaming outbox events](streams.md) | Application developers | Long-poll `watch`, NDJSON/SSE streams, resume tokens, filters, truncation, Python/Rust/Node.js/Go examples |
 | [Streams with groups (plan)](streams-groups-plan.md) | Maintainers, application developers | Design plan for server-side offsets, consumer groups, in-flight leases, and offset-based retention |
+| [Use cases](use-cases/README.md) | Application developers, architects | Task-oriented patterns built from the primitives, with guarantees, limits and checklists |
+| [Financial ledger and payment processing](use-cases/financial-ledger.md) | Application developers, architects | Double-entry ledger, atomic transfers, ordering of execution, idempotent handlers, dead letters, retention, reconciliation |
+| [Replacing Redis Streams](use-cases/replacing-redis-streams.md) | Application developers, architects | Concept mapping from `XADD`/`XREADGROUP`/`XACK`, semantics that change your consumer code, migration plan, checklist |
+| [Replacing Kafka](use-cases/replacing-kafka.md) | Application developers, architects | Topic/partition/group mapping, atomic multi-stream publish, migration plan, and when to keep Kafka |
 | [Asynchronous webhooks](webhooks.md) | Application developers, operators | Webhook rules, async filters and count/sum/avg thresholds, retries, HMAC, dead-letter, GUI |
 | [CLI](cli.md) | Operators | Administration, map resize, backup verification, restore drills, inspect, raw requests |
 | [Operations](operations.md) | Operators, SRE | Configuration, deployment, security, snapshots, monitoring, capacity, troubleshooting |
@@ -77,6 +81,7 @@ quick-start instructions, and a feature overview.
 - **Consume change events:** [Outbox events](events.md)
 - **React to collection conditions:** [Conditional subscriptions](subscriptions.md)
 - **Stream events with a resume token:** [Streaming outbox events](streams.md)
+- **Process payments and keep an ordered ledger:** [Financial ledger](use-cases/financial-ledger.md)
 - **Deliver changes to an HTTP endpoint:** [Asynchronous webhooks](webhooks.md)
 - **Secure a deployment:** [Authentication and authorization](auth.md) and
   [TCP/TLS](operations.md#tcp-and-tls)

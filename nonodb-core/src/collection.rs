@@ -5842,6 +5842,20 @@ impl<'e> Collection<'e> {
         numeric::normalize_document(&mut new)?;
         bson_types::normalize_document(&mut new)?;
 
+        // The stream offset is reserved: updates, pipelines, and
+        // find-and-modify must not rewrite or remove it, or group ordering and
+        // delivery would silently break.
+        if let Some(store) = self.store {
+            if let Some(def) = store.collection_stream_in_rw(&*wtxn, &self.name)? {
+                if old.get(&def.seq_field) != new.get(&def.seq_field) {
+                    return Err(Error::Query(format!(
+                        "`{}` is reserved and managed by the stream writer",
+                        def.seq_field
+                    )));
+                }
+            }
+        }
+
         self.validate_graph_edge_txn(&*wtxn, &new)?;
         self.validate_unique(&*wtxn, &new, &id)?;
         let bytes = serde_json::to_vec(&new)?;
@@ -7661,8 +7675,11 @@ impl<'e> Collection<'e> {
         let db = self
             .env
             .create_database::<Bytes, Bytes>(&mut *wtxn, Some(EVENTS_COLLECTION))?;
+        // The outbox shares the writer's stream counter: without the store the
+        // automatically produced events would get no `_seq` and consumer groups
+        // over `_events` would silently skip them.
         let outbox = Collection::new(
-            None,
+            self.store,
             self.env,
             db,
             self.meta,
