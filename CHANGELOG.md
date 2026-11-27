@@ -2,7 +2,16 @@
 
 Full release notes: https://github.com/essmos/nonodb/releases
 
-## v0.32.0 - 2026-11-23
+## Unreleased
+
+- Accept the documented time-series wire aliases `get_collection_timeseries`,
+  `set_collection_timeseries` (with a `timeseries` payload), and
+  `retain_timeseries`, alongside the canonical snake_case operation names.
+- Recover an interrupted offline compaction from `data.mdb.before-compact` (or
+  `data.mdb.compacting`) when `Store::open` finds no `data.mdb`, so a crash
+  during the two-step rename cannot strand the database.
+- Add a time-series settings argument to Python `create_collection` and Node.js
+  `createCollection`, covering the required `timeField`.
 
 - Add compact bucket locator indexes to time-series collections. Two
   directional keys (`series + window` and `window + series`) let `find`,
@@ -149,6 +158,44 @@ Full release notes: https://github.com/essmos/nonodb/releases
   `Store::close()` so offline maintenance can reopen the environment in the same
   process.
 
+## v0.33.0 - 2026-11-26
+
+Stable release focused on graph traversal, read-only Cypher, and background
+graph analytics.
+
+- Add read-only Cypher execution through `cypher` and `Collection.cypher()`,
+  including `MATCH`/`WHERE`/`WITH`/`UNWIND`, variable-length paths, shortest
+  paths, optional matches, existential subqueries, and a bounded execution
+  model. See `docs/cypher.md`.
+- Add an openCypher TCK harness and CI regression gate. The pinned read-only
+  baseline is 859/874 passing, with unsupported and known-gap cases reported
+  explicitly.
+- Add GDS-style procedures: `gds.pagerank.stream`, `gds.degree.stream`,
+  `gds.connectedComponents.stream`, `gds.nodeSimilarity.stream`,
+  `gds.labelPropagation.stream`, `gds.kCore.stream`, and
+  `gds.degreeDistribution.stream`.
+- Expand `graph_algorithm` with label propagation, k-core, and degree
+  distribution; remove the hidden 1,000-node GDS cap and add configurable
+  `max_nodes`, `max_edges`, `max_memory_bytes`, and `timeout_ms` budgets with
+  explicit overrun errors.
+- Add bounded background graph analytics jobs through `start_graph_job`,
+  `graph_job_status`, `graph_job_result`, `cancel_graph_job`, and
+  `export_graph_job`. Jobs support progress, cooperative cancellation,
+  owner/database isolation, two concurrent runs per database, and atomic export
+  with deterministic ids. Completed results are capped at 64 MiB each and
+  128 MiB total; failed exports restore the result for retry.
+- Add Python client helpers for Cypher, the new graph algorithms, background
+  jobs, and result export.
+- Add the reproducible 100k/500k/1M-node graph analytics benchmark and document
+  its methodology, timings, and memory use.
+- Fix graph metadata cleanup on `drop_collection`, enable the `$graphLookup`
+  adjacency fast path, cap rebuild generations, and tighten Cypher string
+  literal, operation, timeout, and memory-budget handling.
+- Fix quadratic bulk deletion for collections with text or fuzzy indexes by
+  batching tombstone writes into a single manifest update per index kind. A
+  100k-document delete that previously timed out now completes in about 1.2 s.
+
+## v0.32.0 - 2026-11-23
 
 - Add graph search parity features: `all_shortest_paths` (BFS and weighted
   Dijkstra), `graph_match` for linear variable-length patterns with per-step

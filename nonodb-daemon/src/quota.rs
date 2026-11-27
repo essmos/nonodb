@@ -411,9 +411,12 @@ impl Growth {
             sidecar: false,
         };
         match req {
-            Insert { .. } | InsertMany { .. } | Update { .. } | Sql { .. } | Aggregate { .. } => {
-                document
-            }
+            Insert { .. }
+            | InsertMany { .. }
+            | ExportGraphResult { .. }
+            | Update { .. }
+            | Sql { .. }
+            | Aggregate { .. } => document,
             FindAndModify { remove, .. } => {
                 if *remove {
                     Self::default()

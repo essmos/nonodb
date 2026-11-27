@@ -186,7 +186,7 @@ def main() -> int:
     m = int(os.environ.get("NONODB_BENCH_EDGES", "8000"))
     batch = int(os.environ.get("NONODB_BENCH_BATCH", "1000"))
     rng = random.Random(42)
-    node_docs = [{"_id": f"n{i}"} for i in range(n)]
+    node_docs = [{"_id": f"n{i}", "id": f"n{i}", "_labels": ["Node"]} for i in range(n)]
     edges = [
         {
             "_id": f"e{i}",
@@ -296,6 +296,22 @@ def main() -> int:
                     "MATCH p=(n:Node {id: $id})-[:EDGE*1..2]->(m) RETURN count(p)",
                     {"id": start},
                 )
+                coll.cypher(
+                    "MATCH p=(a:Node)-[*1..2]->(b) RETURN count(p) AS c",
+                    max_rows=10,
+                )
+                neo.scalar("MATCH p=(a:Node)-[*1..2]->(b) RETURN count(p)")
+                coll.cypher(
+                    "MATCH (a:Node {id: $a}), (b:Node {id: $b}) "
+                    "MATCH p=shortestPath((a)-[*..6]->(b)) RETURN length(p) AS len",
+                    params={"a": pairs[0][0], "b": pairs[0][1]},
+                    max_rows=10,
+                )
+                neo.scalar(
+                    "MATCH (a:Node {id: $a}), (b:Node {id: $b}) "
+                    "MATCH p=shortestPath((a)-[*..6]->(b)) RETURN length(p)",
+                    {"a": pairs[0][0], "b": pairs[0][1]},
+                )
 
         def time_nonodb_traverse(depth: int) -> list[float]:
             values = []
@@ -396,6 +412,52 @@ def main() -> int:
                     values.append((time.perf_counter() - t0) * 1000)
             return values
 
+        def time_nonodb_cypher_match() -> list[float]:
+            values = []
+            for _ in range(5):
+                t0 = time.perf_counter()
+                coll.cypher(
+                    "MATCH p=(a:Node)-[*1..2]->(b) RETURN count(p) AS c",
+                    max_rows=10,
+                )
+                values.append((time.perf_counter() - t0) * 1000)
+            return values
+
+        def time_neo4j_cypher_match() -> list[float]:
+            values = []
+            for _ in range(5):
+                t0 = time.perf_counter()
+                neo.scalar("MATCH p=(a:Node)-[*1..2]->(b) RETURN count(p)")
+                values.append((time.perf_counter() - t0) * 1000)
+            return values
+
+        def time_nonodb_cypher_shortest() -> list[float]:
+            values = []
+            for _ in range(5):
+                for start, target in pairs:
+                    t0 = time.perf_counter()
+                    coll.cypher(
+                        "MATCH (a:Node {id: $a}), (b:Node {id: $b}) "
+                        "MATCH p=shortestPath((a)-[*..6]->(b)) RETURN length(p) AS len",
+                        params={"a": start, "b": target},
+                        max_rows=10,
+                    )
+                    values.append((time.perf_counter() - t0) * 1000)
+            return values
+
+        def time_neo4j_cypher_shortest() -> list[float]:
+            values = []
+            for _ in range(5):
+                for start, target in pairs:
+                    t0 = time.perf_counter()
+                    neo.scalar(
+                        "MATCH (a:Node {id: $a}), (b:Node {id: $b}) "
+                        "MATCH p=shortestPath((a)-[*..6]->(b)) RETURN length(p)",
+                        {"a": start, "b": target},
+                    )
+                    values.append((time.perf_counter() - t0) * 1000)
+            return values
+
         # Validate reachability counts for one start on both engines.
         sample = starts[0]
         nonodb_sample = coll.traverse(
@@ -452,6 +514,10 @@ def main() -> int:
         all_shortest_neo4j = stats(time_neo4j_all_shortest())
         match_nonodb = stats(time_nonodb_match())
         match_neo4j = stats(time_neo4j_match())
+        cypher_match_nonodb = stats(time_nonodb_cypher_match())
+        cypher_match_neo4j = stats(time_neo4j_cypher_match())
+        cypher_shortest_nonodb = stats(time_nonodb_cypher_shortest())
+        cypher_shortest_neo4j = stats(time_neo4j_cypher_shortest())
         print(
             json.dumps(
                 {
@@ -475,6 +541,18 @@ def main() -> int:
                     "graph_match_depth2": {
                         "nonodb": match_nonodb,
                         "neo4j": match_neo4j,
+                    },
+                    "cypher_match_depth2": {
+                        "nonodb": cypher_match_nonodb,
+                        "neo4j": cypher_match_neo4j,
+                    },
+                    "cypher_shortest_path": {
+                        "nonodb": cypher_shortest_nonodb,
+                        "neo4j": cypher_shortest_neo4j,
+                    },
+                    "queries": {
+                        "cypher_match_depth2": "MATCH p=(a:Node)-[*1..2]->(b) RETURN count(p) AS c",
+                        "cypher_shortest_path": "MATCH (a:Node {id: $a}), (b:Node {id: $b}) MATCH p=shortestPath((a)-[*..6]->(b)) RETURN length(p) AS len",
                     },
                     "notes": [
                         "End-to-end request latency after warmup, one machine.",

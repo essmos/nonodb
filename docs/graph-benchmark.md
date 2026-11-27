@@ -50,6 +50,8 @@ request-path overhead.
 | Shortest path | BFS by hops, `max_depth=6`, projected nodes | `shortestPath()` with `*..6`, returns path length |
 | All shortest paths | `all_shortest_paths(..., limit_paths=10)` | `allShortestPaths()` with `*..6`, returns path count |
 | Pattern match depth 2 | `graph_match` with `min_hops=1`, `max_hops=2` | `MATCH p=...*1..2` returns path count |
+| Cypher pattern depth 2 | `cypher("MATCH p=(a:Node)-[*1..2]->(b) RETURN count(p) AS c")` | same Cypher text |
+| Cypher shortest path | `cypher("... MATCH p=shortestPath((a)-[*..6]->(b)) RETURN length(p)")` | same Cypher text |
 
 The benchmark validates reachability, all-shortest-path counts, and pattern-match
 counts for one sample against both engines before reporting timings. It does not
@@ -63,23 +65,27 @@ request time in milliseconds; smaller is better.
 
 | Metric | NonoDB | Neo4j Community | NonoDB advantage |
 |---|---:|---:|---:|
-| Ingest nodes + edges | **149 ms** (~54k edges/s) | 2,214 ms (~3.6k edges/s) | **~14.8×** |
-| Traverse depth 1 p50 / p95 | **0.62 / 0.86 ms** | 7.29 / 12.35 ms | **~11.8×** p50 |
-| Traverse depth 3 p50 / p95 | **1.32 / 2.22 ms** | 6.62 / 10.02 ms | **~5.0×** p50 |
-| Shortest path by hops p50 / p95 | **0.70 / 1.60 ms** | 6.94 / 12.62 ms | **~9.9×** p50 |
-| All shortest paths p50 / p95 | **0.72 / 1.23 ms** | 5.59 / 9.27 ms | **~7.8×** p50 |
-| Pattern match depth 2 p50 / p95 | **0.92 / 1.60 ms** | 4.55 / 7.60 ms | **~5.0×** p50 |
+| Ingest nodes + edges | **166 ms** (~48k edges/s) | 2,335 ms (~3.4k edges/s) | **~14.0×** |
+| Traverse depth 1 p50 / p95 | **0.72 / 1.30 ms** | 9.41 / 18.60 ms | **~13.1×** p50 |
+| Traverse depth 3 p50 / p95 | **1.53 / 2.84 ms** | 8.41 / 15.07 ms | **~5.5×** p50 |
+| Shortest path by hops p50 / p95 | **0.78 / 1.53 ms** | 6.76 / 12.38 ms | **~8.7×** p50 |
+| All shortest paths p50 / p95 | **0.73 / 1.36 ms** | 6.18 / 11.35 ms | **~8.5×** p50 |
+| Pattern match depth 2 p50 / p95 | **1.09 / 1.92 ms** | 5.50 / 9.85 ms | **~5.0×** p50 |
+| Cypher pattern depth 2 p50 / p95 | **1.48 / 2.06 ms** | 33.61 / 39.52 ms | **~22.8×** p50 |
+| Cypher shortest path p50 / p95 | **0.99 / 1.45 ms** | 5.85 / 10.88 ms | **~5.9×** p50 |
 
 Observed run-to-run range:
 
 | Metric | NonoDB p50 | Neo4j p50 |
 |---|---:|---:|
-| Traverse depth 1 | 0.60–0.63 ms | 6.60–7.95 ms |
-| Traverse depth 3 | 1.30–1.41 ms | 6.61–7.48 ms |
-| Shortest path | 0.68–0.83 ms | 5.73–7.62 ms |
-| All shortest paths | 0.65–0.72 ms | 5.26–5.89 ms |
-| Pattern match depth 2 | 0.91–1.01 ms | 4.19–4.67 ms |
-| Ingest | 143–163 ms | 2,125–2,241 ms |
+| Traverse depth 1 | 0.66–0.75 ms | 8.90–9.63 ms |
+| Traverse depth 3 | 1.50–1.62 ms | 6.20–9.04 ms |
+| Shortest path | 0.73–0.82 ms | 6.33–8.27 ms |
+| All shortest paths | 0.70–0.77 ms | 5.79–6.96 ms |
+| Pattern match depth 2 | 1.06–1.12 ms | 5.44–6.44 ms |
+| Cypher pattern depth 2 | 1.38–1.63 ms | 32.76–33.97 ms |
+| Cypher shortest path | 0.97–1.03 ms | 5.01–6.43 ms |
+| Ingest | 159–177 ms | 2,301–2,338 ms |
 
 ## How to read the numbers
 
@@ -91,12 +97,12 @@ Observed run-to-run range:
   work, so the gap is not explained by NonoDB returning less data.
 - **Pattern semantics are close, not identical.** NonoDB `graph_match` uses a
   linear JSON pattern with relationship uniqueness. Neo4j `MATCH p=...*1..2`
-  uses Cypher path semantics. Validation checks the sample counts, but this is
-  not a test of full Cypher pattern expressiveness.
+  uses Cypher path semantics. The two Cypher rows run the same read-only query
+  text in both engines and validate the returned count/length before timing.
 - **Graph algorithms are not benchmarked against Neo4j.** PageRank, degree
-  centrality, and connected components are implemented in NonoDB, but Neo4j
-  Community has no built-in GDS equivalent without installing a plugin. There is
-  no apples-to-apples latency row for those operations.
+  centrality, connected components, and node similarity are implemented in
+  NonoDB, but Neo4j Community has no built-in GDS equivalent without installing
+  a plugin. There is no apples-to-apples latency row for those operations.
 - **The graph is small.** On a larger-than-RAM graph, storage and page-cache
   behavior would matter more. The relative gap may narrow or widen depending on
   graph shape and indexes.

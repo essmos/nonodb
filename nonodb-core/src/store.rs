@@ -13,6 +13,7 @@ use serde_json::Value;
 use crate::collection::Collection;
 use crate::error::{Error, Result};
 use crate::events::EventConfig;
+use crate::graph;
 use crate::history::{self, DEFAULT_HISTORY_MAX_VERSIONS, HISTORY_DB};
 use crate::replication::{
     ReplicationChange, ReplicationOp, ReplicationTxn, REPLICATION_DB, REPLICATION_SEQ_KEY,
@@ -266,6 +267,43 @@ pub struct CompactReport {
     pub after_bytes: u64,
 }
 
+/// Restores the database if a previous compaction crashed between its two swaps.
+///
+/// The normal compaction sequence is:
+/// `data.mdb -> data.mdb.before-compact` then `data.mdb.compacting -> data.mdb`.
+/// A crash can leave only the backup or the compacting copy in place.
+fn recover_interrupted_compaction(data: &Path) -> Result<()> {
+    let source = data.join("data.mdb");
+    let backup = data.join("data.mdb.before-compact");
+    let tmp = data.join("data.mdb.compacting");
+    let mut changed = false;
+    if !source.exists() {
+        if backup.is_file() {
+            std::fs::rename(&backup, &source)?;
+            changed = true;
+        } else if tmp.is_file() {
+            std::fs::rename(&tmp, &source)?;
+            changed = true;
+        }
+    }
+    if source.exists() {
+        if tmp.exists() {
+            std::fs::remove_file(&tmp)?;
+            changed = true;
+        }
+        if backup.exists() {
+            std::fs::remove_file(&backup)?;
+            changed = true;
+        }
+    }
+    if changed {
+        if let Ok(dir) = std::fs::File::open(data) {
+            let _ = dir.sync_all();
+        }
+    }
+    Ok(())
+}
+
 /// Rewrites `data.mdb` through LMDB's compacting copy and swaps it in.
 ///
 /// LMDB never shrinks the file when rows are deleted; this is the offline way
@@ -341,6 +379,7 @@ impl Store {
         }
         let path = path.as_ref();
         std::fs::create_dir_all(path)?;
+        recover_interrupted_compaction(path)?;
 
         // SAFETY: the file is not modified outside LMDB and is not opened
         // concurrently with another `map_size` (the daemon is the sole owner).
@@ -1750,6 +1789,35 @@ impl Store {
         let Some(collection) = self.collection_at(&*wtxn, name)? else {
             return Ok(false);
         };
+        // Drop graph metadata/adjacency owned by this collection before its
+        // documents and collection metadata disappear. This covers both the
+        // node-side `graph:<node>` definition and the edge-side
+        // `graph_edge:<edge>` reverse mapping, whichever collection is dropped.
+        if collection.get_graph_in(&*wtxn)?.is_some() {
+            collection.drop_graph_txn(wtxn)?;
+        }
+        if let Some(def) = collection.edge_graph_def_in(&*wtxn)? {
+            if let Some(node) = self.collection_at(&*wtxn, &def.node_collection)? {
+                node.drop_graph_txn(wtxn)?;
+            } else {
+                collection.clear_graph_adjacency_txn(wtxn, &def)?;
+                collection.set_graph_rebuild_state_in(wtxn, None)?;
+                if let Some(meta) = self
+                    .env
+                    .open_database::<Bytes, Bytes>(&*wtxn, Some(META_DB))?
+                {
+                    meta.delete(
+                        &mut *wtxn,
+                        graph::node_def_key(&def.node_collection).as_bytes(),
+                    )?;
+                    meta.delete(
+                        &mut *wtxn,
+                        graph::edge_def_key(collection.name()).as_bytes(),
+                    )?;
+                }
+            }
+        }
+
         let indexes = collection.index_defs_in(&*wtxn)?;
         let vectors = collection.list_vector_indexes_in(&*wtxn)?;
         let search = collection.search_index_defs_in(&*wtxn)?;
@@ -1780,6 +1848,9 @@ impl Store {
             format!("ttl_purge:{name}"),
             format!("{}{name}", crate::timeseries::SETTINGS_META_PREFIX),
             subscriptions::meta_key(name),
+            graph::node_def_key(name),
+            graph::edge_def_key(name),
+            graph::rebuild_key(name),
         ];
         let prefixes = [
             format!("index:{name}:"),
@@ -2788,12 +2859,81 @@ mod tests {
     }
 
     #[test]
+    fn drop_collection_cleans_graph_metadata_and_adjacency() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = super::Store::open(dir.path()).unwrap();
+        let nodes = store
+            .create_collection("nodes", crate::vault::CollectionProfile::Standard)
+            .unwrap();
+        let _edges = store
+            .create_collection("edges", crate::vault::CollectionProfile::Standard)
+            .unwrap();
+        let def: crate::graph::GraphDef = serde_json::from_value(serde_json::json!({
+            "node_collection": "nodes",
+            "edge_collection": "edges"
+        }))
+        .unwrap();
+        nodes.set_graph(def.clone()).unwrap();
+        assert!(nodes.get_graph().unwrap().is_some());
+
+        assert!(store.drop_collection("nodes").unwrap());
+        let recreated = store
+            .create_collection("nodes", crate::vault::CollectionProfile::Standard)
+            .unwrap();
+        assert!(recreated.get_graph().unwrap().is_none());
+
+        // Dropping the node side must also free the edge collection's reverse
+        // mapping so another graph can reuse it.
+        let other = store
+            .create_collection("other", crate::vault::CollectionProfile::Standard)
+            .unwrap();
+        let mut reused = def.clone();
+        reused.node_collection = "other".into();
+        other.set_graph(reused).unwrap();
+
+        assert!(store.drop_collection("edges").unwrap());
+        let _edges = store
+            .create_collection("edges", crate::vault::CollectionProfile::Standard)
+            .unwrap();
+        assert!(other.get_graph().unwrap().is_none());
+        let third = store
+            .create_collection("third", crate::vault::CollectionProfile::Standard)
+            .unwrap();
+        let mut third_def = def;
+        third_def.node_collection = "third".into();
+        third.set_graph(third_def).unwrap();
+    }
+
+    #[test]
     fn parses_map_sizes() {
         assert_eq!(parse_size("4GiB"), Some(4 * (1 << 30)));
         assert_eq!(parse_size("2048MiB"), Some(2048 * (1 << 20)));
         assert_eq!(parse_size("512mb"), Some(512_000_000));
         assert_eq!(parse_size("1073741824"), Some(1 << 30));
         assert_eq!(parse_size("nonsense"), None);
+    }
+
+    #[test]
+    fn store_open_recovers_interrupted_compaction_swap() {
+        use serde_json::json;
+        let dir = tempfile::tempdir().unwrap();
+        let store = super::Store::open(dir.path()).unwrap();
+        let c = store.collection("docs").unwrap();
+        c.insert_one(json!({"_id": "a", "value": 1})).unwrap();
+        store.close();
+
+        let source = dir.path().join("data.mdb");
+        let backup = dir.path().join("data.mdb.before-compact");
+        std::fs::rename(&source, &backup).unwrap();
+        assert!(!source.exists());
+
+        let store = super::Store::open(dir.path()).unwrap();
+        assert_eq!(
+            store.collection("docs").unwrap().count(&json!({})).unwrap(),
+            1
+        );
+        assert!(source.exists());
+        assert!(!backup.exists());
     }
 
     #[test]

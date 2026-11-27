@@ -3,6 +3,7 @@
 use serde::{ser::SerializeMap, Deserialize, Serialize, Serializer};
 use serde_json::{value::RawValue, Value};
 
+use nonodb_core::cypher::CypherOptions;
 use nonodb_core::graph::{
     AllShortestPathsOptions, GraphAlgorithmOptions, GraphDef, GraphMatchOptions, HybridOptions,
     NeighborsOptions, ShortestPathOptions, TraverseOptions,
@@ -483,6 +484,12 @@ pub enum Request {
         #[serde(flatten)]
         options: ShortestPathOptions,
     },
+    /// Execute a read-only Cypher query.
+    Cypher {
+        coll: String,
+        #[serde(flatten)]
+        options: CypherOptions,
+    },
     /// Every shortest path between two nodes.
     AllShortestPaths {
         coll: String,
@@ -500,6 +507,26 @@ pub enum Request {
         coll: String,
         #[serde(flatten)]
         options: GraphAlgorithmOptions,
+    },
+    /// Start a graph algorithm as a background job.
+    StartGraphJob {
+        coll: String,
+        #[serde(flatten)]
+        options: GraphAlgorithmOptions,
+    },
+    GraphJobStatus {
+        job_id: String,
+    },
+    GraphJobResult {
+        job_id: String,
+    },
+    CancelGraphJob {
+        job_id: String,
+    },
+    /// Atomically export a completed analytics result into a collection.
+    ExportGraphJob {
+        job_id: String,
+        coll: String,
     },
     /// One-hop neighbors of a node with graph filters.
     Neighbors {
@@ -595,17 +622,21 @@ pub enum Request {
         coll: String,
     },
     /// Removes time-series rows older than `before` (date or epoch ms).
+    #[serde(alias = "retain_timeseries")]
     RetainTimeSeries {
         coll: String,
         before: Value,
     },
     /// Reads the time-series settings of a collection.
+    #[serde(alias = "get_collection_timeseries")]
     GetCollectionTimeSeries {
         coll: String,
     },
     /// Replaces the time-series settings of a collection.
+    #[serde(alias = "set_collection_timeseries")]
     SetCollectionTimeSeries {
         coll: String,
+        #[serde(alias = "timeseries")]
         settings: nonodb_core::timeseries::Settings,
     },
     /// Sets or clears the default document TTL for a collection.
@@ -797,6 +828,12 @@ pub enum WriteReq {
         coll: String,
         docs: Vec<Value>,
         vault: Option<VaultAuth>,
+    },
+    /// Atomically materialize a completed analytics result as documents.
+    ExportGraphResult {
+        coll: String,
+        kind: String,
+        result: Value,
     },
     Update {
         coll: String,
@@ -1091,9 +1128,15 @@ impl Request {
             Self::GetGraph { .. } => "get_graph",
             Self::Traverse { .. } => "traverse",
             Self::ShortestPath { .. } => "shortest_path",
+            Self::Cypher { .. } => "cypher",
             Self::AllShortestPaths { .. } => "all_shortest_paths",
             Self::GraphMatch { .. } => "graph_match",
             Self::GraphAlgorithm { .. } => "graph_algorithm",
+            Self::StartGraphJob { .. } => "start_graph_job",
+            Self::GraphJobStatus { .. } => "graph_job_status",
+            Self::GraphJobResult { .. } => "graph_job_result",
+            Self::CancelGraphJob { .. } => "cancel_graph_job",
+            Self::ExportGraphJob { .. } => "export_graph_job",
             Self::Neighbors { .. } => "neighbors",
             Self::HybridSearch { .. } => "hybrid_search",
             Self::SetGraph { .. } => "set_graph",
@@ -1182,9 +1225,14 @@ impl Request {
             | Self::GetGraph { .. }
             | Self::Traverse { .. }
             | Self::ShortestPath { .. }
+            | Self::Cypher { .. }
             | Self::AllShortestPaths { .. }
             | Self::GraphMatch { .. }
             | Self::GraphAlgorithm { .. }
+            | Self::StartGraphJob { .. }
+            | Self::GraphJobStatus { .. }
+            | Self::GraphJobResult { .. }
+            | Self::CancelGraphJob { .. }
             | Self::Neighbors { .. }
             | Self::HybridSearch { .. }
             | Self::GraphRebuildStatus { .. }
@@ -1249,9 +1297,11 @@ impl Request {
             | Self::GetGraph { coll }
             | Self::Traverse { coll, .. }
             | Self::ShortestPath { coll, .. }
+            | Self::Cypher { coll, .. }
             | Self::AllShortestPaths { coll, .. }
             | Self::GraphMatch { coll, .. }
             | Self::GraphAlgorithm { coll, .. }
+            | Self::StartGraphJob { coll, .. }
             | Self::Neighbors { coll, .. }
             | Self::HybridSearch { coll, .. }
             | Self::DropGraph { coll }
@@ -1315,7 +1365,12 @@ impl Request {
                 out
             }
             Self::WriteBatch { ops, .. } => ops.iter().flat_map(|op| op.collections()).collect(),
-            Self::GetMore { .. } | Self::CloseCursor { .. } => Vec::new(),
+            Self::GetMore { .. }
+            | Self::CloseCursor { .. }
+            | Self::GraphJobStatus { .. }
+            | Self::GraphJobResult { .. }
+            | Self::CancelGraphJob { .. } => Vec::new(),
+            Self::ExportGraphJob { coll, .. } => vec![coll.clone()],
             Self::ListCollections
             | Self::DatabaseStats
             | Self::GetQuota
@@ -1511,6 +1566,39 @@ impl ApiResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn time_series_aliases_deserialize() {
+        let get: Request = serde_json::from_value(serde_json::json!({
+            "op": "get_collection_timeseries", "coll": "readings"
+        }))
+        .unwrap();
+        assert!(matches!(get, Request::GetCollectionTimeSeries { coll } if coll == "readings"));
+
+        let retain: Request = serde_json::from_value(serde_json::json!({
+            "op": "retain_timeseries", "coll": "readings", "before": 0
+        }))
+        .unwrap();
+        assert!(matches!(retain, Request::RetainTimeSeries { .. }));
+
+        let set: Request = serde_json::from_value(serde_json::json!({
+            "op": "set_collection_timeseries",
+            "coll": "readings",
+            "timeseries": {"timeField": "ts"}
+        }))
+        .unwrap();
+        assert!(
+            matches!(set, Request::SetCollectionTimeSeries { coll, settings } if coll == "readings" && settings.time_field == "ts")
+        );
+
+        let canonical: Request = serde_json::from_value(serde_json::json!({
+            "op": "set_collection_time_series",
+            "coll": "readings",
+            "settings": {"timeField": "ts"}
+        }))
+        .unwrap();
+        assert!(matches!(canonical, Request::SetCollectionTimeSeries { .. }));
+    }
 
     #[test]
     fn raw_result_is_serialized_under_result() {
