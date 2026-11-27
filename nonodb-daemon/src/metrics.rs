@@ -34,13 +34,8 @@ pub static WATCH_THRESHOLD_SUPPRESSED: AtomicU64 = AtomicU64::new(0);
 pub static STREAM_CLAIMS: AtomicU64 = AtomicU64::new(0);
 pub static STREAM_NACKS: AtomicU64 = AtomicU64::new(0);
 pub static STREAM_DEAD_LETTERS: AtomicU64 = AtomicU64::new(0);
-<<<<<<< HEAD
-pub static STREAM_TRUNCATED: AtomicU64 = AtomicU64::new(0);
-pub static STREAM_LEASE_RECOVERIES: AtomicU64 = AtomicU64::new(0);
-pub static STREAM_COMMIT_FAILURES: AtomicU64 = AtomicU64::new(0);
-=======
 pub static STREAM_PRUNED_EVENTS: AtomicU64 = AtomicU64::new(0);
->>>>>>> 761ae58 (fix(streams): reject partial commits, truncate empty windows, per-group counters)
+pub static STREAM_LEASE_RECOVERIES: AtomicU64 = AtomicU64::new(0);
 /// SQL statement counters and total execution time.
 pub static SQL_SELECT: AtomicU64 = AtomicU64::new(0);
 pub static SQL_INSERT: AtomicU64 = AtomicU64::new(0);
@@ -755,6 +750,7 @@ pub fn snapshot() -> Value {
         "stream_nacks_total": STREAM_NACKS.load(Relaxed),
         "stream_dead_letters_total": STREAM_DEAD_LETTERS.load(Relaxed),
         "stream_pruned_events_total": STREAM_PRUNED_EVENTS.load(Relaxed),
+        "stream_lease_recoveries_total": STREAM_LEASE_RECOVERIES.load(Relaxed),
         "watch_heartbeats_total": WATCH_HEARTBEATS.load(Relaxed),
         "watch_threshold_emitted_total": WATCH_THRESHOLD_EMITTED.load(Relaxed),
         "watch_threshold_suppressed_total": WATCH_THRESHOLD_SUPPRESSED.load(Relaxed),
@@ -1309,17 +1305,11 @@ pub fn prometheus() -> String {
             "Stream events dropped by offset retention.",
         ),
         (
-<<<<<<< HEAD
             "nonodb_stream_lease_recoveries_total",
             "stream_lease_recoveries_total",
             "Expired stream leases requeued or dead-lettered by the janitor.",
-            "nonodb_stream_commit_failures_total",
-            "stream_commit_failures_total",
-            "Stream commits rejected (stale lease or out-of-order offset).",
         ),
         (
-=======
->>>>>>> 761ae58 (fix(streams): reject partial commits, truncate empty windows, per-group counters)
             "nonodb_watch_heartbeats_total",
             "watch_heartbeats_total",
             "Watch keepalive frames.",

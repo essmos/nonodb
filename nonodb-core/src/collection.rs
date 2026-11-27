@@ -5842,6 +5842,20 @@ impl<'e> Collection<'e> {
         numeric::normalize_document(&mut new)?;
         bson_types::normalize_document(&mut new)?;
 
+        // The stream offset is reserved: updates, pipelines, and
+        // find-and-modify must not rewrite or remove it, or group ordering and
+        // delivery would silently break.
+        if let Some(store) = self.store {
+            if let Some(def) = store.collection_stream_in_rw(&*wtxn, &self.name)? {
+                if old.get(&def.seq_field) != new.get(&def.seq_field) {
+                    return Err(Error::Query(format!(
+                        "`{}` is reserved and managed by the stream writer",
+                        def.seq_field
+                    )));
+                }
+            }
+        }
+
         self.validate_graph_edge_txn(&*wtxn, &new)?;
         self.validate_unique(&*wtxn, &new, &id)?;
         let bytes = serde_json::to_vec(&new)?;

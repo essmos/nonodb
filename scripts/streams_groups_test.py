@@ -118,6 +118,30 @@ def main() -> int:
         head = api.call({"op": "get_stream", "coll": "_events"})["head_seq"]
         assert head == 3, head
 
+        # `_seq` is reserved for updates too, not just inserts.
+        assert (
+            api.error(
+                {
+                    "op": "update",
+                    "coll": "_events",
+                    "filter": {},
+                    "update": {"$set": {"_seq": 100}},
+                }
+            )
+            == "invalid_query"
+        ), "updates must not rewrite the reserved offset"
+        assert (
+            api.error(
+                {
+                    "op": "update",
+                    "coll": "_events",
+                    "filter": {},
+                    "update": {"$unset": {"_seq": ""}},
+                }
+            )
+            == "invalid_query"
+        ), "updates must not remove the reserved offset"
+
         # A user-supplied offset would break ordering.
         assert api.error(
             {"op": "insert", "coll": "_events", "doc": {"_seq": 99}}
@@ -523,6 +547,62 @@ def main() -> int:
         )
         assert reset["committed_seq"] == reset["next_seq"], reset
 
+        # Deleting a group also drops its leases and dead letters, so a
+        # recreated group cannot inherit stale batches.
+        api.call(
+            {
+                "op": "create_stream_group",
+                "coll": "_events",
+                "group": "cleanup",
+                "start": "earliest",
+                "max_attempts": 1,
+            }
+        )
+        stale = api.call(
+            {
+                "op": "watch",
+                "coll": "_events",
+                "mode": "group",
+                "group": "cleanup",
+                "member": "c1",
+                "limit": 2,
+                "lease_ms": 1000,
+                "timeout_ms": 100,
+            }
+        )
+        assert stale["events"], stale
+        head_now = api.call({"op": "get_stream", "coll": "_events"})["head_seq"]
+        assert api.call(
+            {"op": "delete_stream_group", "coll": "_events", "group": "cleanup"}
+        )["deleted"] is True
+        time.sleep(1.3)
+        api.call(
+            {
+                "op": "create_stream_group",
+                "coll": "_events",
+                "group": "cleanup",
+                "start": "latest",
+            }
+        )
+        recreated = next(st for st in api.call({"op": "stream_stats", "coll": "_events"})["streams"] if st["stream"] == "_events")
+        cleanup = [g for g in recreated["groups"] if g["group"] == "cleanup"][0]
+        assert cleanup["committed_seq"] == head_now, cleanup
+        assert cleanup["inflight"] == 0, cleanup
+        assert (
+            api.call(
+                {
+                    "op": "watch",
+                    "coll": "_events",
+                    "mode": "group",
+                    "group": "cleanup",
+                    "member": "c1",
+                    "timeout_ms": 100,
+                }
+            )["events"]
+            == []
+        ), "a recreated group must not receive the deleted group's batches"
+        api.call({"op": "delete_stream_group", "coll": "_events", "group": "cleanup"})
+
         # Deleting the group removes only its offset.
         assert api.call(
             {"op": "delete_stream_group", "coll": "_events", "group": "workers"}
@@ -695,6 +775,102 @@ def main() -> int:
         assert behind["truncated_below"] == 4, behind
         assert behind["truncations"] == 1, behind
         assert behind["redeliveries"] == 0, behind
+
+        # Default maintenance loop: expired leases are recovered and retention
+        # runs without an explicit prune request or extra configuration.
+        api.close()
+        stop(proc)
+        loop_env = env.copy()
+        loop_env["NONODB_STREAM_PRUNE_INTERVAL"] = "1"
+        proc, sock = start(tmp, loop_env)
+        api = Api(sock)
+
+        # The janitor dead-letters an expired batch even though no member claims
+        # again.
+        api.call({"op": "insert", "coll": "_events", "doc": {"type": "janitor"}})
+        api.call(
+            {
+                "op": "create_stream_group",
+                "coll": "_events",
+                "group": "exp",
+                "start": "earliest",
+                "max_attempts": 1,
+            }
+        )
+        claim = api.call(
+            {
+                "op": "watch",
+                "coll": "_events",
+                "mode": "group",
+                "group": "exp",
+                "member": "j1",
+                "limit": 100,
+                "lease_ms": 1000,
+                "timeout_ms": 100,
+            }
+        )
+        assert claim["events"], claim
+        deadline = time.time() + 10
+        dead = {"dead": []}
+        while time.time() < deadline:
+            dead = api.call({"op": "stream_dead", "coll": "_events", "group": "exp"})
+            if dead["dead"]:
+                break
+            time.sleep(0.3)
+        assert dead["dead"], "the janitor must dead-letter an expired lease"
+        assert dead["dead"][0]["attempts"] == 1, dead
+
+        # Retention prunes on its own tick once a group commits.
+        api.call({"op": "create_collection", "coll": "auto_events"})
+        api.call(
+            {"op": "create_stream", "coll": "auto_events", "retention": {"max_events": 2}}
+        )
+        api.call(
+            {
+                "op": "insert_many",
+                "coll": "auto_events",
+                "docs": [{"n": 1}, {"n": 2}, {"n": 3}, {"n": 4}, {"n": 5}],
+            }
+        )
+        api.call(
+            {
+                "op": "create_stream_group",
+                "coll": "auto_events",
+                "group": "drain",
+                "start": "earliest",
+            }
+        )
+        batch = api.call(
+            {
+                "op": "watch",
+                "coll": "auto_events",
+                "mode": "group",
+                "group": "drain",
+                "member": "a1",
+                "limit": 100,
+                "timeout_ms": 100,
+            }
+        )
+        api.call(
+            {
+                "op": "commit_stream_group",
+                "coll": "auto_events",
+                "group": "drain",
+                "seq": batch["to_seq"],
+                "lease_id": batch["lease_id"],
+            }
+        )
+        deadline = time.time() + 10
+        docs = []
+        while time.time() < deadline:
+            docs = api.call({"op": "find", "coll": "auto_events", "sort": [["_seq", 1]]})
+            if len(docs) <= 2:
+                break
+            time.sleep(0.3)
+        assert len(docs) == 2, docs
+        assert [doc["_seq"] for doc in docs] == [4, 5], docs
+        metrics = api._client.get("/metrics/prometheus").text
+        assert "nonodb_stream_lease_recoveries_total" in metrics
 
         api.close()
         print("streams/groups: ok")

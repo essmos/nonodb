@@ -1988,10 +1988,21 @@ impl Store {
         stream: &str,
         group: &str,
     ) -> Result<bool> {
+        // A recreated group must not inherit the previous group's batches: drop
+        // its leases and dead letters together with the offset.
+        self.clear_stream_leases_in(wtxn, stream, group)?;
         let meta = self
             .env
             .create_database::<Bytes, Bytes>(&mut *wtxn, Some(META_DB))?;
         Ok(meta.delete(&mut *wtxn, Self::stream_group_key(stream, group).as_bytes())?)
+    }
+
+    /// Deletes a group, its offset, its leases, and its dead letters.
+    pub fn delete_stream_group(&self, stream: &str, group: &str) -> Result<bool> {
+        let mut wtxn = self.write_txn()?;
+        let out = self.delete_stream_group_in(&mut wtxn, stream, group)?;
+        wtxn.commit()?;
+        Ok(out)
     }
 
     /// Creates a consumer group in its own transaction.
@@ -2380,6 +2391,28 @@ impl Store {
         }
         self.put_stream_lease_in(wtxn, lease)?;
         Ok(())
+    }
+
+    /// Runs the expiry janitor over every stream and group, in its own
+    /// transactions.
+    ///
+    /// Returns `(groups_scanned, leases_recovered)`. Expired leases are requeued
+    /// or dead-lettered even when no member is currently claiming, so a crashed
+    /// worker surfaces in the dead-letter and stats views on the maintenance
+    /// tick.
+    pub fn recover_stream_leases(&self) -> Result<(usize, usize)> {
+        let mut groups = 0usize;
+        let mut recovered = 0usize;
+        for def in self.streams()? {
+            for group in self.stream_groups(Some(&def.name))? {
+                let mut wtxn = self.write_txn()?;
+                let count = self.recover_stream_leases_in(&mut wtxn, &def.name, &group.group)?;
+                wtxn.commit()?;
+                groups += 1;
+                recovered += count;
+            }
+        }
+        Ok((groups, recovered))
     }
 
     /// Requeues or dead-letters every expired lease of one group.

@@ -51,6 +51,9 @@ pub struct Retention {
     /// Keep events newer than this many milliseconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_age_ms: Option<u64>,
+    /// Accepted for forward compatibility; validated but not enforced yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<u64>,
     /// Allow deleting below a group offset, leaving this many events behind.
     #[serde(default)]
     pub min_seq_keep: u64,
@@ -68,9 +71,18 @@ impl Retention {
                 "retention.max_age_ms must be greater than zero".into(),
             ));
         }
+        if self.max_bytes == Some(0) {
+            return Err(Error::Query(
+                "retention.max_bytes must be greater than zero".into(),
+            ));
+        }
         Ok(())
     }
 
+    /// True when no bound is configured, so the stream is never pruned.
+    ///
+    /// `max_bytes` does not count yet: it is validated and stored but the drop
+    /// rule ignores it, so a stream with only `max_bytes` is not pruned.
     pub fn is_empty(&self) -> bool {
         self.max_events.is_none() && self.max_age_ms.is_none() && self.min_seq_keep == 0
     }
