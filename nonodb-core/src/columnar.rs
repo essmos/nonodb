@@ -933,6 +933,21 @@ pub fn stats(rtxn: &RoTxn<'_>, env: &Env, name: &str) -> Result<Stats> {
     Ok(stats)
 }
 
+/// Rewrites only visible documents into fresh sealed buckets.
+///
+/// This removes tombstones, update overlays, and unused bucket rows without
+/// changing `_id`s or index entries.
+pub fn compact(wtxn: &mut RwTxn<'_>, env: &Env, name: &str, settings: &Settings) -> Result<usize> {
+    let docs = all_docs(&*wtxn, env, name)?;
+    let rows = docs.len();
+    clear(wtxn, env, name)?;
+    for doc in docs {
+        insert(wtxn, env, name, settings, doc)?;
+    }
+    seal_all(wtxn, env, name, settings)?;
+    Ok(rows)
+}
+
 /// Removes all keys owned by a columnar collection.
 pub fn clear(wtxn: &mut RwTxn<'_>, env: &Env, name: &str) -> Result<()> {
     if let Some(db) = env.open_database::<Bytes, Bytes>(wtxn, Some(&db_name(name)))? {

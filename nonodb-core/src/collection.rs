@@ -972,6 +972,38 @@ impl<'e> Collection<'e> {
                 indexes,
             });
         }
+        if self.profile.is_columnar() {
+            let stats = crate::columnar::stats(txn, self.env, &self.name)?;
+            let db_name = format!("{}{}", crate::columnar::DB_PREFIX, self.name);
+            let data_bytes = self
+                .env
+                .open_database::<Bytes, Bytes>(txn, Some(&db_name))?
+                .map(|db| db.stat(txn).map(|stat| stat_bytes(&stat)))
+                .transpose()?
+                .unwrap_or(0);
+            let mut index_bytes = 0u64;
+            let mut indexes = 0u64;
+            for def in self.index_defs(txn)? {
+                let resource = index::db_name(&self.name, &def.name());
+                if let Some(bytes) = self.resource_db_bytes(txn, &resource, &resource)? {
+                    index_bytes = index_bytes.saturating_add(bytes);
+                    indexes += 1;
+                }
+            }
+            for def in self.vector_defs(txn)? {
+                let resource = vector::db_name(&self.name, &def.field);
+                if let Some(bytes) = self.resource_db_bytes(txn, &resource, &resource)? {
+                    index_bytes = index_bytes.saturating_add(bytes);
+                    indexes += 1;
+                }
+            }
+            return Ok(CollectionStorageStats {
+                records: stats.rows,
+                data_bytes,
+                index_bytes,
+                indexes,
+            });
+        }
         let data = self.db.stat(txn)?;
         let mut index_bytes = 0u64;
         let mut indexes = 0u64;
@@ -5631,6 +5663,86 @@ impl<'e> Collection<'e> {
         after: Option<&Value>,
         ttl_at: Option<u64>,
     ) -> Result<()> {
+        if self.profile.is_columnar() {
+            let settings = self.columnar_settings_in(&*wtxn)?.unwrap_or_default();
+            match op {
+                "insert" | "update" => {
+                    let after = after.ok_or_else(|| {
+                        Error::Query("replication change is missing `after`".into())
+                    })?;
+                    if after.get("_id").and_then(id::key_from_value).as_deref() != Some(id) {
+                        return Err(Error::Query(
+                            "replication document `_id` does not match change id".into(),
+                        ));
+                    }
+                    let before = crate::columnar::find_by_id(&*wtxn, self.env, &self.name, id)?;
+                    match op {
+                        "insert" => {
+                            if before.is_some() {
+                                return Err(Error::DuplicateKey(id.to_string()));
+                            }
+                            let inserted = crate::columnar::insert(
+                                wtxn,
+                                self.env,
+                                &self.name,
+                                &settings,
+                                after.clone(),
+                            )?;
+                            if inserted != id {
+                                return Err(Error::Query(
+                                    "replicated insert returned a different id".into(),
+                                ));
+                            }
+                        }
+                        "update" => {
+                            if before.is_none() {
+                                return Err(Error::Query(format!(
+                                    "replication update target `{id}` does not exist"
+                                )));
+                            }
+                            let object = after.as_object().ok_or_else(|| {
+                                Error::Query("replicated document must be an object".into())
+                            })?;
+                            crate::columnar::replace_by_id(wtxn, self.env, &self.name, id, object)?;
+                        }
+                        _ => unreachable!(),
+                    }
+                    let after = crate::columnar::find_by_id(&*wtxn, self.env, &self.name, id)?;
+                    if let Some(doc) = &after {
+                        self.validate_unique(&*wtxn, doc, id)?;
+                    }
+                    self.apply_all_index_entries(wtxn, before.as_ref(), after.as_ref(), id)?;
+                    self.apply_graph_entries(wtxn, before.as_ref(), after.as_ref())?;
+                    self.set_ttl(wtxn, id, ttl_at)?;
+                    self.record_history(wtxn, id, op, after)?;
+                    return Ok(());
+                }
+                "delete" => {
+                    let before = crate::columnar::find_by_id(&*wtxn, self.env, &self.name, id)?;
+                    crate::columnar::delete(
+                        wtxn,
+                        self.env,
+                        &self.name,
+                        &serde_json::json!({"_id": id}),
+                        false,
+                    )?;
+                    if let Some(doc) = &before {
+                        self.apply_all_index_entries(wtxn, Some(doc), None, id)?;
+                        self.apply_graph_entries(wtxn, Some(doc), None)?;
+                    }
+                    self.set_ttl(wtxn, id, None)?;
+                    if before.is_some() {
+                        self.record_history(wtxn, id, "delete", None)?;
+                    }
+                    return Ok(());
+                }
+                other => {
+                    return Err(Error::Query(format!(
+                        "unknown replication operation `{other}`"
+                    )))
+                }
+            }
+        }
         if self.profile.is_timeseries() {
             // Time-series rows do not live in `coll:<name>`; appending them to
             // the bucket store keeps replicas byte-compatible with the primary

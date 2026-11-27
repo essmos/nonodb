@@ -915,6 +915,18 @@ impl Store {
         Ok(collection)
     }
 
+    /// Rewrites a columnar collection into fresh sealed buckets.
+    pub fn compact_columnar(&self, name: &str) -> Result<usize> {
+        let mut wtxn = self.write_txn()?;
+        let collection = self.collection_in(&mut wtxn, name)?;
+        let Some(settings) = collection.columnar_settings_in(&wtxn)? else {
+            return Ok(0);
+        };
+        let rows = crate::columnar::compact(&mut wtxn, &self.env, name, &settings)?;
+        wtxn.commit()?;
+        Ok(rows)
+    }
+
     /// Seals the open columnar bucket.
     pub fn seal_columnar(&self, name: &str) -> Result<usize> {
         let mut wtxn = self.write_txn()?;
