@@ -1,6 +1,6 @@
 # Replication and cluster guide
 
-This is the practical operator guide for NonoDB replication in `0.33.0` and
+This is the practical operator guide for NonoDB replication in `0.34.0` and
 later. It covers a primary, read replicas, hot standby, quorum failover, the CLI,
 the GUI Cluster view, monitoring, and the common failure modes.
 
@@ -28,7 +28,7 @@ docker volume create nonodb-replica-run
 docker run --rm \
   -v nonodb-replica-data:/var/lib/nonodb \
   -e NONODB_AUTH_FILE=/var/lib/nonodb/auth.json \
-  ghcr.io/essmos/nonodb:0.33.0 \
+  ghcr.io/essmos/nonodb:0.34.0 \
   nonodb-cli auth init
 
 docker run -d --name nonodb-replica \
@@ -40,7 +40,7 @@ docker run -d --name nonodb-replica \
   -e NONODB_REPLICATION_ROLE=replica \
   -e NONODB_REPLICATION_NODE_ID=replica-docker \
   -e NONODB_REPLICATION_ADVERTISE_URL=http://10.0.0.3:7912 \
-  ghcr.io/essmos/nonodb:0.33.0
+  ghcr.io/essmos/nonodb:0.34.0
 
 docker exec nonodb-replica nonodb-cli replication join \
   http://10.0.0.10:7878 K7M4P9QX
@@ -187,7 +187,7 @@ Install the released binaries on every node (see [Operations](operations.md#inst
 for the full systemd and Docker variants):
 
 ```bash
-TAG=v0.33.0
+TAG=v0.34.0
 ARCHIVE="nonodb-$TAG-linux-x86_64.tar.gz"
 curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/$ARCHIVE"
 curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/$ARCHIVE.sha256"
@@ -537,7 +537,7 @@ docker volume create nonodb-replica-run
 docker run --rm \
   -v nonodb-replica-data:/var/lib/nonodb \
   -e NONODB_AUTH_FILE=/var/lib/nonodb/auth.json \
-  ghcr.io/essmos/nonodb:0.33.0 \
+  ghcr.io/essmos/nonodb:0.34.0 \
   nonodb-cli auth init
 
 docker run -d --name nonodb-replica \
@@ -549,7 +549,7 @@ docker run -d --name nonodb-replica \
   -e NONODB_REPLICATION_ROLE=replica \
   -e NONODB_REPLICATION_NODE_ID=replica-docker \
   -e NONODB_REPLICATION_ADVERTISE_URL=http://DOCKER_HOST_IP:7912 \
-  ghcr.io/essmos/nonodb:0.33.0
+  ghcr.io/essmos/nonodb:0.34.0
 
 docker exec nonodb-replica nonodb-cli replication join \
   http://PRIMARY_HOST:7878 PAIRING-CODE

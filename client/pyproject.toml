@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nonodb-client"
-version = "0.33.0"
+version = "0.34.0"
 description = "Thin Python client for NonoDB over Unix sockets or TCP/TLS"
 readme = "python-readme.md"
 requires-python = ">=3.9"

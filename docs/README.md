@@ -20,6 +20,8 @@ quick-start instructions, and a feature overview.
 | [Vault collections](vault.md) | Application developers, security reviewers | Optional whole-document encryption, tenant keys, restrictions, operations, key rotation |
 | [Document TTL](ttl.md) | Application developers, operators | Collection defaults, date-field MongoDB TTL, per-document overrides, strict read visibility, update semantics, limits |
 | [Dates and time zones](dates.md) | Application developers | BSON-compatible dates, RFC 3339 input, filtering, indexes, sorting, timezone semantics |
+| [Time-series collections](timeseries.md) | Application developers, evaluators | `profile: "timeseries"`, per-series/window buckets, columnar codecs, aggregation, retention, indexes, SQL, replication, limits |
+| [Time-series benchmark vs TimescaleDB](timescale-benchmark.md) | Evaluators, maintainers | Dataset, methodology, results, caveats, and reproduction for NonoDB and TimescaleDB |
 | [Numbers and decimals](numerics.md) | Application developers | Exact numeric comparison, Decimal128, arithmetic, NaN/Infinity, index compatibility, long text limits |
 | [BSON scalar types](bson-types.md) | Application developers | `$numberInt`/`$numberLong`, `$type`, binary/UUID, ObjectId, Timestamp, MinKey/MaxKey, index compatibility |
 | [Clients](clients.md) | Application developers | Python, Rust, Node.js and Go: install, connection, CRUD, batches, indexes, search, aggregation |
@@ -83,6 +85,8 @@ quick-start instructions, and a feature overview.
 - **Store sensitive tenant data encrypted:** [Vault collections](vault.md)
 - **Expire documents automatically:** [Document TTL](ttl.md)
 - **Filter and index timestamps:** [Dates and time zones](dates.md)
+- **Store time-series data:** [Time-series collections](timeseries.md)
+- **Compare time-series performance with TimescaleDB:** [Time-series benchmark](timescale-benchmark.md)
 - **Store money and exact decimals:** [Numbers and decimals](numerics.md)
 - **Use binary, UUID, ObjectId, or `$type`:** [BSON scalar types](bson-types.md)
 - **Back up and restore:** [Backup and restore](backup.md)
