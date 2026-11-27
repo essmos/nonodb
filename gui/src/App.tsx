@@ -127,6 +127,13 @@ type IndexInfo = {
   geo?: boolean;
 };
 
+const INDEX_TYPE_HELP: Record<'secondary' | 'text' | 'fuzzy' | 'vector', string> = {
+  secondary: 'Secondary: equality and range filters, sorting, unique constraints, and covering fields.',
+  text: 'Text/BM25: full-text search with tokenized, ranked matches on one field.',
+  fuzzy: 'Fuzzy: approximate string matching for typos and spelling variants on one field.',
+  vector: 'Vector: nearest-neighbour search over one embedding field.',
+};
+
 type Revision = {
   rev: number;
   op: string;
@@ -4235,9 +4242,9 @@ function CollectionView({
                   Include
                   <input value={indexInclude} onChange={(e) => setIndexInclude(e.target.value)} placeholder="fields" />
                 </label>
-                <label className="checkbox"><input type="checkbox" checked={indexUnique} onChange={(e) => setIndexUnique(e.target.checked)} /> unique</label>
-                <label className="checkbox"><input type="checkbox" checked={indexSparse} onChange={(e) => setIndexSparse(e.target.checked)} /> sparse</label>
-                <label className="checkbox"><input type="checkbox" checked={indexGeo} onChange={(e) => setIndexGeo(e.target.checked)} /> geo</label>
+                <label className="checkbox" title="Reject documents with duplicate index keys"><input type="checkbox" checked={indexUnique} onChange={(e) => setIndexUnique(e.target.checked)} /> unique</label>
+                <label className="checkbox" title="Omit documents where the indexed field is absent"><input type="checkbox" checked={indexSparse} onChange={(e) => setIndexSparse(e.target.checked)} /> sparse</label>
+                <label className="checkbox" title="Index a GeoJSON point field"><input type="checkbox" checked={indexGeo} onChange={(e) => setIndexGeo(e.target.checked)} /> geo</label>
                 <label className="compact">
                   Directions
                   <input value={indexDirections} onChange={(e) => setIndexDirections(e.target.value)} placeholder="1,-1" />
@@ -4256,6 +4263,20 @@ function CollectionView({
             )}
             <button onClick={() => void createIndex()} disabled={busy}>Create</button>
             <button onClick={() => void reindexIndexes()} disabled={busy || indexes.length + textIndexes.length + fuzzyIndexes.length + vectorIndexes.length === 0}>Reindex all</button>
+          </div>
+          <div className="index-help">
+            <p className="field-hint">{INDEX_TYPE_HELP[indexKind]}</p>
+            <p className="field-hint">
+              <strong>Secondary options:</strong> <strong>unique</strong> rejects duplicate keys;{' '}
+              <strong>sparse</strong> omits documents without the field; <strong>geo</strong> indexes
+              GeoJSON points; <strong>include</strong> adds covering fields; <strong>directions</strong>{' '}
+              sets compound order (<code>1</code> ascending, <code>-1</code> descending);{' '}
+              <strong>partial filter</strong> indexes only documents matching a query predicate.
+            </p>
+            <p className="field-hint">
+              Documentation: <a href="https://github.com/essmos/nonodb/blob/main/docs/timeseries.md#secondary-indexes" target="_blank" rel="noreferrer">time-series indexes</a>{' '}
+              · <a href="https://github.com/essmos/nonodb/blob/main/docs/api.md#create_index" target="_blank" rel="noreferrer">index API and all index types</a>
+            </p>
           </div>
           <div className="index-list">
             {indexes.map((index) => (
