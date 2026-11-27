@@ -97,12 +97,16 @@ matching the time-series aliases.
 - Users choose `bucket_max_docs` and `bucket_max_bytes`; the hard format limit
   is 4 MiB per encoded bucket. A row that cannot fit is rejected without
   changing the collection.
-- The on-disk magic is versioned (`NCB1`, format version 1). Readers reject
-  unknown versions instead of guessing.
+- The on-disk magic is versioned (`NCB1`, format version 2). Version 2 uses
+  32-row column blocks for cheaper point reads; version 1 remains readable and
+  is upgraded by compaction. Readers reject unknown versions instead of
+  guessing.
 
 The shared column codec (`bucket_codec`) is the same codec used by time-series
-buckets: dictionary, delta, delta-of-delta, XOR, frame-of-reference, boolean
-bitmap, raw, and deflate paths selected per column.
+buckets: dictionary, prefix/front coding, delta, delta-of-delta, XOR,
+frame-of-reference, boolean bitmap, raw, and deflate paths selected per column.
+Columnar indexes without `include` store the id once in a compact key trailer
+instead of duplicating it in the index value.
 
 ## Documents and API parity
 
@@ -285,6 +289,22 @@ Backups containing columnar collections can only be restored on a binary that
 supports this profile. Check the release notes before downgrading a node. The
 on-disk bucket magic and format version are independent of the collection
 metadata, so an unknown bucket version also fails closed.
+
+## Performance
+
+The canonical 100k-row release gates are reproduced with:
+
+```bash
+cargo build --release -p nonodb-core --example columnar_bench
+NONODB_AGGREGATE_MAX_DOCS=200000 ./target/release/examples/columnar_bench
+```
+
+Measured evidence, including storage with indexes, batch insert, point reads,
+updates, scans, aggregation, and compaction reclaim, is recorded in
+[columnar performance evidence](columnar-performance.md). The write path uses
+row-oriented staging buckets and parallel serialization; scans and
+order-independent `$group` stages decode document-count-balanced chunks in
+parallel.
 
 ## Current limits
 

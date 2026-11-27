@@ -344,14 +344,21 @@ fn encode_bucket_with(
 }
 
 fn encode_bucket_raw(rows: &[Map<String, Value>]) -> Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(rows.len() * 128);
-    out.extend_from_slice(WRITE_MAGIC);
-    put_uvarint(&mut out, rows.len() as u64);
+    let mut parts = Vec::with_capacity(rows.len());
     for row in rows {
-        let encoded = encode_json_fast(row)?;
-        put_bytes(&mut out, &encoded);
+        parts.push(encode_json_fast(row)?);
     }
-    Ok(out)
+    Ok(encode_bucket_raw_parts(&parts))
+}
+
+fn encode_bucket_raw_parts(parts: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(parts.iter().map(|part| part.len() + 4).sum());
+    out.extend_from_slice(WRITE_MAGIC);
+    put_uvarint(&mut out, parts.len() as u64);
+    for part in parts {
+        put_bytes(&mut out, part);
+    }
+    out
 }
 
 fn decode_bucket_raw(data: &[u8]) -> Result<Vec<Map<String, Value>>> {
@@ -605,12 +612,12 @@ fn remove_locator(
     Ok(())
 }
 
-enum RawBlock {
-    Open(Locator, Vec<u8>),
-    Bucket(u64, Vec<u8>),
+enum RawBlock<'a> {
+    Open(Locator, &'a [u8]),
+    Bucket(u64, &'a [u8]),
 }
 
-fn decode_blocks(blocks: &[RawBlock]) -> Result<Vec<(Locator, Map<String, Value>)>> {
+fn decode_blocks(blocks: &[RawBlock<'_>]) -> Result<Vec<(Locator, Map<String, Value>)>> {
     let mut docs = Vec::new();
     for block in blocks {
         match block {
@@ -628,7 +635,7 @@ fn decode_blocks(blocks: &[RawBlock]) -> Result<Vec<(Locator, Map<String, Value>
 }
 
 fn visit_block<F>(
-    block: &RawBlock,
+    block: &RawBlock<'_>,
     prefilter: Option<&crate::collection::RawPrefilter>,
     mut emit: F,
 ) -> Result<()>
@@ -684,13 +691,13 @@ fn all_located(
     let Some(db) = env.open_database::<Bytes, Bytes>(txn, Some(&db_name(name)))? else {
         return Ok(Vec::new());
     };
-    let mut blocks: Vec<RawBlock> = Vec::new();
+    let mut blocks: Vec<RawBlock<'_>> = Vec::new();
     for item in db.iter(txn)? {
         let (key, value) = item?;
         match key.first() {
             Some(&KEY_OPEN_ROW) => {
                 if let Some(locator) = key_locator(key) {
-                    blocks.push(RawBlock::Open(locator, value.to_vec()));
+                    blocks.push(RawBlock::Open(locator, value));
                 }
             }
             Some(&KEY_BUCKET) => {
@@ -698,7 +705,7 @@ fn all_located(
                     return Err(corrupt("malformed bucket key"));
                 }
                 let bucket = u64::from_be_bytes(key[1..9].try_into().expect("8 bytes"));
-                blocks.push(RawBlock::Bucket(bucket, value.to_vec()));
+                blocks.push(RawBlock::Bucket(bucket, value));
             }
             _ => {}
         }
@@ -846,6 +853,35 @@ fn encode_json_fast<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>> {
     sonic_rs::to_vec(value).map_err(|error| Error::JsonFast(error.to_string()))
 }
 
+fn encode_batch_parallel(docs: &[Value]) -> Result<Vec<Vec<u8>>> {
+    let workers = crate::collection::scan_workers().min(docs.len()).max(1);
+    if workers <= 1 || docs.len() < 64 {
+        return docs.iter().map(encode_json_fast).collect();
+    }
+    let chunk_size = docs.len().div_ceil(workers);
+    let results = std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for chunk in docs.chunks(chunk_size) {
+            handles.push(scope.spawn(move || -> Result<Vec<Vec<u8>>> {
+                chunk.iter().map(encode_json_fast).collect()
+            }));
+        }
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .unwrap_or_else(|_| Err(Error::Query("columnar encode worker panicked".into())))
+            })
+            .collect::<Vec<_>>()
+    });
+    let mut out = Vec::with_capacity(docs.len());
+    for result in results {
+        out.extend(result?);
+    }
+    Ok(out)
+}
+
 /// Inserts a batch of already-normalized documents, buffering the active
 /// bucket in memory. Returns the assigned ids and the stored documents.
 pub fn insert_batch(
@@ -859,40 +895,42 @@ pub fn insert_batch(
     let db = env.create_database::<Bytes, Bytes>(wtxn, Some(&db_name(name)))?;
     let mut pointer = read_pointer_rw(&*wtxn, &db)?.unwrap_or((1, 0, 0));
     let mut disk_rows = pointer.1;
-    let mut open: Vec<Map<String, Value>> = Vec::with_capacity(pointer.1 as usize + docs.len());
+    let mut open: Vec<Vec<u8>> = Vec::with_capacity(pointer.1 as usize + docs.len());
     for row in 0..pointer.1 {
         let key = open_row_key(pointer.0, row);
         let raw = db
             .get(&*wtxn, &key)?
             .ok_or_else(|| corrupt("missing open row"))?;
-        open.push(serde_json::from_slice(raw)?);
+        open.push(raw.to_vec());
     }
     let mut known: HashMap<u64, Vec<(String, Locator)>> = HashMap::new();
-    let mut seen: HashSet<String> = HashSet::new();
     let mut out = Vec::with_capacity(docs.len());
-    for mut doc in docs.drain(..) {
-        let id = {
-            let object = doc
-                .as_object_mut()
-                .ok_or_else(|| Error::Query("document must be an object".into()))?;
-            match object.get("_id") {
-                Some(value) => {
-                    if let Some(raw) = value.as_str() {
-                        crate::id::validate_string_key(raw)?;
-                    }
-                    crate::id::key_from_value(value).ok_or(Error::InvalidId)?
+    let mut ids = Vec::with_capacity(docs.len());
+    for doc in docs.iter_mut() {
+        let object = doc
+            .as_object_mut()
+            .ok_or_else(|| Error::Query("document must be an object".into()))?;
+        let id = match object.get("_id") {
+            Some(value) => {
+                if let Some(raw) = value.as_str() {
+                    crate::id::validate_string_key(raw)?;
                 }
-                None => {
-                    let id = uuid::Uuid::new_v4().to_string();
-                    object.insert("_id".into(), Value::String(id.clone()));
-                    id
-                }
+                crate::id::key_from_value(value).ok_or(Error::InvalidId)?
+            }
+            None => {
+                let id = uuid::Uuid::new_v4().to_string();
+                object.insert("_id".into(), Value::String(id.clone()));
+                id
             }
         };
-        if !seen.insert(id.clone()) {
-            return Err(Error::DuplicateKey(id));
-        }
-        let encoded = encode_json_fast(&doc)?;
+        ids.push(id);
+    }
+    let encoded_docs = encode_batch_parallel(&docs)?;
+    let mut encoded_iter = encoded_docs.into_iter();
+    let mut ids_iter = ids.into_iter();
+    for doc in docs.drain(..) {
+        let id = ids_iter.next().expect("id per document");
+        let encoded = encoded_iter.next().expect("encoded per document");
         if encoded.len() > crate::store::MAX_DOCUMENT_BYTES {
             return Err(Error::DocumentTooLarge(
                 encoded.len(),
@@ -917,12 +955,11 @@ pub fn insert_batch(
         {
             return Err(Error::DuplicateKey(id));
         }
-
         if pointer.1 >= settings.bucket_max_docs as u32
             || pointer.2 as usize + encoded.len() > settings.bucket_max_bytes
         {
             if !open.is_empty() {
-                let payload = encode_bucket(&open, settings)?;
+                let payload = encode_bucket_raw_parts(&open);
                 db.put(&mut *wtxn, &bucket_key(pointer.0), &payload)?;
                 for row in 0..disk_rows {
                     db.delete(&mut *wtxn, &open_row_key(pointer.0, row))?;
@@ -933,7 +970,8 @@ pub fn insert_batch(
             disk_rows = 0;
         }
         let row = pointer.1;
-        open.push(doc.as_object().expect("document validated above").clone());
+        let encoded_len = encoded.len() as u32;
+        open.push(encoded);
         known
             .get_mut(&hash)
             .expect("hash inserted")
@@ -941,14 +979,14 @@ pub fn insert_batch(
         pointer = (
             pointer.0,
             pointer.1 + 1,
-            pointer.2.saturating_add(encoded.len() as u32),
+            pointer.2.saturating_add(encoded_len),
         );
         out.push((id, doc));
 
         if pointer.1 >= settings.bucket_max_docs as u32
             || pointer.2 as usize >= settings.bucket_max_bytes
         {
-            let payload = encode_bucket(&open, settings)?;
+            let payload = encode_bucket_raw_parts(&open);
             db.put(&mut *wtxn, &bucket_key(pointer.0), &payload)?;
             for row in 0..disk_rows {
                 db.delete(&mut *wtxn, &open_row_key(pointer.0, row))?;
@@ -973,16 +1011,15 @@ pub fn insert_batch(
         // re-reading and re-encoding those rows on the next batch, and keeps
         // the next writer transaction on an empty active bucket.
         if pointer.1 >= (settings.bucket_max_docs as u32 / 2).max(1) {
-            let payload = encode_bucket(&open, settings)?;
+            let payload = encode_bucket_raw_parts(&open);
             db.put(&mut *wtxn, &bucket_key(pointer.0), &payload)?;
             for row in 0..disk_rows {
                 db.delete(&mut *wtxn, &open_row_key(pointer.0, row))?;
             }
             pointer = (pointer.0 + 1, 0, 0);
         } else {
-            for (row, doc) in open.iter().enumerate().skip(disk_rows as usize) {
-                let encoded = encode_json_fast(doc)?;
-                db.put(&mut *wtxn, &open_row_key(pointer.0, row as u32), &encoded)?;
+            for (row, encoded) in open.iter().enumerate().skip(disk_rows as usize) {
+                db.put(&mut *wtxn, &open_row_key(pointer.0, row as u32), encoded)?;
             }
         }
     }
@@ -1136,6 +1173,431 @@ where
     Ok(())
 }
 
+struct GroupProjection {
+    tree: sonic_rs::PointerTree,
+    paths: Vec<Vec<String>>,
+}
+
+fn collect_group_paths(expr: &Value, paths: &mut Vec<Vec<String>>) -> Option<()> {
+    match expr {
+        Value::String(text) => {
+            let Some(path) = text.strip_prefix('$') else {
+                return Some(());
+            };
+            if path.is_empty() || path.starts_with('$') || path.contains('$') {
+                return None;
+            }
+            let parts: Vec<String> = path.split('.').map(str::to_string).collect();
+            if parts.iter().any(|part| part.is_empty()) {
+                return None;
+            }
+            if !paths.contains(&parts) {
+                paths.push(parts);
+            }
+            Some(())
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_group_paths(item, paths)?;
+            }
+            Some(())
+        }
+        Value::Object(object) => {
+            for value in object.values() {
+                collect_group_paths(value, paths)?;
+            }
+            Some(())
+        }
+        _ => Some(()),
+    }
+}
+
+fn group_projection(spec: &Value) -> Option<GroupProjection> {
+    let object = spec.as_object()?;
+    let mut paths = Vec::new();
+    if let Some(id) = object.get("_id") {
+        collect_group_paths(id, &mut paths)?;
+    }
+    for (field, accumulator) in object {
+        if field == "_id" {
+            continue;
+        }
+        let accumulator = accumulator.as_object()?;
+        if accumulator.len() != 1 {
+            return None;
+        }
+        collect_group_paths(accumulator.values().next()?, &mut paths)?;
+    }
+    let mut tree = sonic_rs::PointerTree::new();
+    for path in &paths {
+        tree.add_path(path.iter().map(String::as_str));
+    }
+    Some(GroupProjection { tree, paths })
+}
+
+fn project_raw_doc(raw: &[u8], projection: &GroupProjection) -> Result<Map<String, Value>> {
+    if projection.paths.is_empty() {
+        return Ok(Map::new());
+    }
+    let nodes = sonic_rs::get_many(raw, &projection.tree)
+        .map_err(|error| Error::JsonFast(error.to_string()))?;
+    let mut doc = Map::new();
+    for (path, node) in projection.paths.iter().zip(nodes) {
+        let Some(node) = node else {
+            continue;
+        };
+        let value: Value = serde_json::from_str(node.as_raw_str())?;
+        set_path_parts(&mut doc, path, value)?;
+    }
+    Ok(doc)
+}
+
+fn block_rows(block: &RawBlock<'_>) -> usize {
+    match block {
+        RawBlock::Open(_, _) => 1,
+        RawBlock::Bucket(_, raw) => {
+            if raw.starts_with(WRITE_MAGIC) {
+                let mut pos = 4;
+                get_uvarint(raw, &mut pos).unwrap_or(1) as usize
+            } else {
+                decode_bucket_header(raw).map_or(1, |(_, rows, _)| rows)
+            }
+        }
+    }
+}
+
+fn balanced_ranges(blocks: &[RawBlock<'_>], workers: usize) -> Vec<(usize, usize)> {
+    if blocks.is_empty() {
+        return Vec::new();
+    }
+    let total: usize = blocks.iter().map(block_rows).sum();
+    let target = total.div_ceil(workers.max(1));
+    let mut ranges = Vec::with_capacity(workers);
+    let mut start = 0usize;
+    let mut accumulated = 0usize;
+    for (index, block) in blocks.iter().enumerate() {
+        let rows = block_rows(block);
+        if accumulated > 0 && accumulated + rows > target && ranges.len() + 1 < workers {
+            ranges.push((start, index));
+            start = index;
+            accumulated = 0;
+        }
+        accumulated += rows;
+    }
+    ranges.push((start, blocks.len()));
+    ranges
+}
+
+fn block_is_raw(block: &RawBlock<'_>) -> bool {
+    match block {
+        RawBlock::Open(_, _) => true,
+        RawBlock::Bucket(_, raw) => raw.starts_with(WRITE_MAGIC),
+    }
+}
+
+fn visit_projected_block<F>(
+    block: &RawBlock<'_>,
+    projection: &GroupProjection,
+    mut emit: F,
+) -> Result<bool>
+where
+    F: FnMut(Map<String, Value>) -> Result<()>,
+{
+    match block {
+        RawBlock::Open(_, raw) => {
+            emit(project_raw_doc(raw, projection)?)?;
+            Ok(true)
+        }
+        RawBlock::Bucket(_, raw) => {
+            if !raw.starts_with(WRITE_MAGIC) {
+                return Ok(false);
+            }
+            let mut pos = 4;
+            let rows = get_uvarint(raw, &mut pos)? as usize;
+            if rows > HARD_MAX_COLUMN_ROWS {
+                return Err(corrupt("row count out of range"));
+            }
+            let mut docs = Vec::with_capacity(rows);
+            for _ in 0..rows {
+                docs.push(project_raw_doc(get_bytes(raw, &mut pos)?, projection)?);
+            }
+            for doc in docs {
+                emit(doc)?;
+            }
+            Ok(true)
+        }
+    }
+}
+
+#[derive(Clone)]
+struct FastSpec {
+    id: Vec<String>,
+    sums: Vec<(String, Option<Vec<String>>)>,
+}
+
+#[derive(Clone)]
+enum FastSum {
+    Count(u64),
+    Sum(crate::aggregate::NumericSum),
+}
+
+struct FastState {
+    id: Value,
+    sums: Vec<FastSum>,
+}
+
+struct FastGroups {
+    spec: FastSpec,
+    strings: BTreeMap<String, FastState>,
+    others: BTreeMap<String, FastState>,
+}
+
+fn field_path(value: &Value) -> Option<Vec<String>> {
+    let text = value.as_str()?;
+    let path = text.strip_prefix('$')?;
+    if path.is_empty() || path.starts_with('$') || path.contains('$') {
+        return None;
+    }
+    let parts: Vec<String> = path.split('.').map(str::to_string).collect();
+    if parts.iter().any(|part| part.is_empty()) {
+        return None;
+    }
+    Some(parts)
+}
+
+fn fast_group_spec(spec: &Value) -> Option<FastSpec> {
+    let object = spec.as_object()?;
+    let id = field_path(object.get("_id")?)?;
+    let mut sums = Vec::new();
+    for (field, accumulator) in object {
+        if field == "_id" {
+            continue;
+        }
+        let accumulator = accumulator.as_object()?;
+        if accumulator.len() != 1 {
+            return None;
+        }
+        let (op, arg) = accumulator.iter().next()?;
+        match op.as_str() {
+            "$count" => sums.push((field.clone(), None)),
+            "$sum" => {
+                if arg.as_u64() == Some(1) || arg.as_i64() == Some(1) {
+                    sums.push((field.clone(), None));
+                } else {
+                    sums.push((field.clone(), Some(field_path(arg)?)));
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some(FastSpec { id, sums })
+}
+
+fn value_at<'a>(value: &'a Value, parts: &[String]) -> Option<&'a Value> {
+    let mut current = value;
+    for part in parts {
+        current = match current {
+            Value::Object(object) => object.get(part)?,
+            Value::Array(items) => items.get(part.parse::<usize>().ok()?)?,
+            _ => return None,
+        };
+    }
+    Some(current)
+}
+
+impl FastGroups {
+    fn new(spec: FastSpec) -> Self {
+        Self {
+            spec,
+            strings: BTreeMap::new(),
+            others: BTreeMap::new(),
+        }
+    }
+
+    fn state(&self, id: Value) -> FastState {
+        FastState {
+            id,
+            sums: self
+                .spec
+                .sums
+                .iter()
+                .map(|(_, path)| match path {
+                    Some(_) => FastSum::Sum(crate::aggregate::NumericSum::zero()),
+                    None => FastSum::Count(0),
+                })
+                .collect(),
+        }
+    }
+
+    fn apply_sums(state: &mut FastState, spec: &FastSpec, doc: &Value) {
+        for ((_, path), sum) in spec.sums.iter().zip(state.sums.iter_mut()) {
+            match sum {
+                FastSum::Count(count) => *count += 1,
+                FastSum::Sum(total) => {
+                    if let Some(path) = path {
+                        if let Some(value) = value_at(doc, path) {
+                            total.add(value);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn update(&mut self, doc: &Value) {
+        let id = value_at(doc, &self.spec.id);
+        if let Some(text) = id.and_then(Value::as_str) {
+            if let Some(state) = self.strings.get_mut(text) {
+                Self::apply_sums(state, &self.spec, doc);
+                return;
+            }
+            let id = Value::String(text.to_string());
+            let mut state = self.state(id);
+            Self::apply_sums(&mut state, &self.spec, doc);
+            self.strings.insert(text.to_string(), state);
+            return;
+        }
+        let id = id.cloned().unwrap_or(Value::Null);
+        let key = serde_json::to_string(&id).unwrap_or_default();
+        if let Some(state) = self.others.get_mut(&key) {
+            Self::apply_sums(state, &self.spec, doc);
+            return;
+        }
+        let mut state = self.state(id);
+        Self::apply_sums(&mut state, &self.spec, doc);
+        self.others.insert(key, state);
+    }
+
+    fn merge(&mut self, other: FastGroups) -> Result<()> {
+        for (key, incoming) in other.strings {
+            match self.strings.entry(key) {
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    slot.insert(incoming);
+                }
+                std::collections::btree_map::Entry::Occupied(mut slot) => {
+                    merge_fast_state(slot.get_mut(), incoming)?;
+                }
+            }
+        }
+        for (key, incoming) in other.others {
+            match self.others.entry(key) {
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    slot.insert(incoming);
+                }
+                std::collections::btree_map::Entry::Occupied(mut slot) => {
+                    merge_fast_state(slot.get_mut(), incoming)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Result<Vec<Value>> {
+        let mut rows = Vec::with_capacity(self.strings.len() + self.others.len());
+        for state in self.strings.into_values().chain(self.others.into_values()) {
+            let key = serde_json::to_string(&state.id)?;
+            let mut out = Map::new();
+            out.insert("_id".into(), state.id);
+            for ((field, _), sum) in self.spec.sums.iter().zip(state.sums) {
+                let value = match sum {
+                    FastSum::Count(count) => Value::from(count),
+                    FastSum::Sum(total) => total.finish()?,
+                };
+                out.insert(field.clone(), value);
+            }
+            rows.push((key, Value::Object(out)));
+        }
+        rows.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(rows.into_iter().map(|(_, value)| value).collect())
+    }
+}
+
+fn merge_fast_state(target: &mut FastState, incoming: FastState) -> Result<()> {
+    for (left, right) in target.sums.iter_mut().zip(incoming.sums) {
+        match (left, right) {
+            (FastSum::Count(left), FastSum::Count(right)) => *left += right,
+            (FastSum::Sum(left), FastSum::Sum(right)) => left.merge(right),
+            _ => return Err(Error::Query("incompatible fast group state".into())),
+        }
+    }
+    Ok(())
+}
+
+fn visit_fast_block(block: &RawBlock<'_>, groups: &mut FastGroups) -> Result<bool> {
+    match block {
+        RawBlock::Open(_, raw) => {
+            let value: Value =
+                sonic_rs::from_slice(raw).map_err(|error| Error::JsonFast(error.to_string()))?;
+            groups.update(&value);
+            Ok(true)
+        }
+        RawBlock::Bucket(_, raw) => {
+            if !raw.starts_with(WRITE_MAGIC) {
+                return Ok(false);
+            }
+            let mut pos = 4;
+            let rows = get_uvarint(raw, &mut pos)? as usize;
+            if rows > HARD_MAX_COLUMN_ROWS {
+                return Err(corrupt("row count out of range"));
+            }
+            for _ in 0..rows {
+                let value: Value = sonic_rs::from_slice(get_bytes(raw, &mut pos)?)
+                    .map_err(|error| Error::JsonFast(error.to_string()))?;
+                groups.update(&value);
+            }
+            Ok(true)
+        }
+    }
+}
+
+fn fast_group_parallel(
+    blocks: &[RawBlock<'_>],
+    group_spec: &Value,
+    workers: usize,
+) -> Result<Option<Vec<Value>>> {
+    let Some(spec) = fast_group_spec(group_spec) else {
+        return Ok(None);
+    };
+    if !blocks.iter().all(block_is_raw) {
+        return Ok(None);
+    }
+    let workers = workers.min(blocks.len().max(1));
+    if workers <= 1 || blocks.len() < 2 {
+        let mut groups = FastGroups::new(spec);
+        for block in blocks {
+            visit_fast_block(block, &mut groups)?;
+        }
+        return groups.finish().map(Some);
+    }
+    let results = std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for (start, end) in balanced_ranges(blocks, workers) {
+            let chunk = &blocks[start..end];
+            let spec = spec.clone();
+            handles.push(scope.spawn(move || -> Result<FastGroups> {
+                let mut groups = FastGroups::new(spec);
+                for block in chunk {
+                    visit_fast_block(block, &mut groups)?;
+                }
+                Ok(groups)
+            }));
+        }
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .unwrap_or_else(|_| Err(Error::Query("columnar group worker panicked".into())))
+            })
+            .collect::<Vec<_>>()
+    });
+    let mut merged = FastGroups::new(spec);
+    for result in results {
+        merged.merge(result?)?;
+    }
+    merged.finish().map(Some)
+}
+
 /// Runs an order-independent `$group` over decoded buckets in parallel.
 pub fn group_parallel(
     rtxn: &RoTxn<'_>,
@@ -1168,13 +1630,13 @@ pub fn group_parallel(
             _ => {}
         }
     }
-    let mut blocks: Vec<RawBlock> = Vec::new();
+    let mut blocks: Vec<RawBlock<'_>> = Vec::new();
     for item in db.iter(rtxn)? {
         let (key, value) = item?;
         match key.first() {
             Some(&KEY_OPEN_ROW) => {
                 if let Some(locator) = key_locator(key) {
-                    blocks.push(RawBlock::Open(locator, value.to_vec()));
+                    blocks.push(RawBlock::Open(locator, value));
                 }
             }
             Some(&KEY_BUCKET) => {
@@ -1182,7 +1644,7 @@ pub fn group_parallel(
                     return Err(corrupt("malformed bucket key"));
                 }
                 let bucket = u64::from_be_bytes(key[1..9].try_into().expect("8 bytes"));
-                blocks.push(RawBlock::Bucket(bucket, value.to_vec()));
+                blocks.push(RawBlock::Bucket(bucket, value));
             }
             _ => {}
         }
@@ -1190,7 +1652,30 @@ pub fn group_parallel(
 
     let has_deleted = !deleted.is_empty();
     let has_overlays = !overlays.is_empty();
+    let empty_filter =
+        filter.is_null() || filter.as_object().is_some_and(|object| object.is_empty());
+    let workers = workers.min(blocks.len().max(1));
+    if empty_filter && !has_deleted && !has_overlays {
+        if let Some(groups) = fast_group_parallel(&blocks, group_spec, workers)? {
+            return Ok(groups);
+        }
+    }
+    let projection = if empty_filter && !has_deleted && !has_overlays {
+        group_projection(group_spec)
+    } else {
+        None
+    };
     let process = |chunk: &[RawBlock], builder: &mut GroupBuilder| -> Result<()> {
+        if let Some(projection) = &projection {
+            if chunk.iter().all(block_is_raw) {
+                for block in chunk {
+                    visit_projected_block(block, projection, |doc| {
+                        builder.update(Value::Object(doc))
+                    })?;
+                }
+                return Ok(());
+            }
+        }
         for block in chunk {
             visit_block(block, None, |locator, doc| {
                 if has_deleted && deleted.contains(&locator) {
@@ -1211,22 +1696,32 @@ pub fn group_parallel(
         Ok(())
     };
 
-    let workers = workers.min(blocks.len().max(1));
     if workers <= 1 || blocks.len() < 2 {
         let mut builder = GroupBuilder::new(group_spec)?;
         process(&blocks, &mut builder)?;
         return builder.finish();
     }
-    let chunk_size = blocks.len().div_ceil(workers);
     let results = std::thread::scope(|scope| {
         let mut handles = Vec::new();
-        for chunk in blocks.chunks(chunk_size) {
+        for (start, end) in balanced_ranges(&blocks, workers) {
+            let chunk = &blocks[start..end];
             let overlays = &overlays;
             let deleted = &deleted;
+            let projection = projection.as_ref();
             handles.push(scope.spawn(move || -> Result<GroupBuilder> {
                 let mut builder = GroupBuilder::new(group_spec)?;
                 let has_deleted = !deleted.is_empty();
                 let has_overlays = !overlays.is_empty();
+                if let Some(projection) = projection {
+                    if chunk.iter().all(block_is_raw) {
+                        for block in chunk {
+                            visit_projected_block(block, projection, |doc| {
+                                builder.update(Value::Object(doc))
+                            })?;
+                        }
+                        return Ok(builder);
+                    }
+                }
                 for block in chunk {
                     visit_block(block, None, |locator, doc| {
                         if has_deleted && deleted.contains(&locator) {
@@ -1293,13 +1788,13 @@ fn find_parallel(rtxn: &RoTxn<'_>, env: &Env, name: &str, query: &FindQuery) -> 
             _ => {}
         }
     }
-    let mut blocks: Vec<RawBlock> = Vec::new();
+    let mut blocks: Vec<RawBlock<'_>> = Vec::new();
     for item in db.iter(rtxn)? {
         let (key, value) = item?;
         match key.first() {
             Some(&KEY_OPEN_ROW) => {
                 if let Some(locator) = key_locator(key) {
-                    blocks.push(RawBlock::Open(locator, value.to_vec()));
+                    blocks.push(RawBlock::Open(locator, value));
                 }
             }
             Some(&KEY_BUCKET) => {
@@ -1307,7 +1802,7 @@ fn find_parallel(rtxn: &RoTxn<'_>, env: &Env, name: &str, query: &FindQuery) -> 
                     return Err(corrupt("malformed bucket key"));
                 }
                 let bucket = u64::from_be_bytes(key[1..9].try_into().expect("8 bytes"));
-                blocks.push(RawBlock::Bucket(bucket, value.to_vec()));
+                blocks.push(RawBlock::Bucket(bucket, value));
             }
             _ => {}
         }
@@ -1344,10 +1839,10 @@ fn find_parallel(rtxn: &RoTxn<'_>, env: &Env, name: &str, query: &FindQuery) -> 
         }
         hits
     } else {
-        let chunk_size = blocks.len().div_ceil(workers);
         let parts = std::thread::scope(|scope| {
             let mut handles = Vec::new();
-            for chunk in blocks.chunks(chunk_size) {
+            for (start, end) in balanced_ranges(&blocks, workers) {
+                let chunk = &blocks[start..end];
                 let overlays = &overlays;
                 let deleted = &deleted;
                 let prefilter = prefilter_ref;

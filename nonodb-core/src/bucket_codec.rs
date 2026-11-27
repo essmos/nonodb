@@ -33,6 +33,7 @@ pub(crate) const CODEC_XOR: u8 = 4;
 pub(crate) const CODEC_DICT: u8 = 5;
 pub(crate) const CODEC_BOOL_BITS: u8 = 6;
 pub(crate) const CODEC_FOR: u8 = 7;
+pub(crate) const CODEC_PREFIX: u8 = 8;
 pub(crate) const CODEC_DEFLATE: u8 = 0x80;
 
 /// Compression effort. All levels are adaptive: they try the same codec set and
@@ -482,6 +483,43 @@ pub(crate) fn decode_dict(data: &[u8], n: usize) -> Result<Vec<String>> {
     Ok(out)
 }
 
+pub(crate) fn encode_prefix<S: AsRef<str>>(values: &[S]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut previous: &[u8] = &[];
+    for value in values {
+        let bytes = value.as_ref().as_bytes();
+        let mut common = 0;
+        while common < previous.len() && common < bytes.len() && previous[common] == bytes[common] {
+            common += 1;
+        }
+        put_uvarint(&mut out, common as u64);
+        put_bytes(&mut out, &bytes[common..]);
+        previous = bytes;
+    }
+    out
+}
+
+pub(crate) fn decode_prefix(data: &[u8], n: usize) -> Result<Vec<String>> {
+    let mut pos = 0;
+    let mut previous = String::new();
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        let common = get_uvarint(data, &mut pos)? as usize;
+        let suffix = get_bytes(data, &mut pos)?;
+        if common > previous.len() {
+            return Err(corrupt("prefix length exceeds previous value"));
+        }
+        let mut bytes = Vec::with_capacity(common + suffix.len());
+        bytes.extend_from_slice(&previous.as_bytes()[..common]);
+        bytes.extend_from_slice(suffix);
+        let value =
+            String::from_utf8(bytes).map_err(|_| corrupt("prefix-coded string is not UTF-8"))?;
+        previous = value.clone();
+        out.push(value);
+    }
+    Ok(out)
+}
+
 pub(crate) struct Column {
     pub(crate) field: String,
     pub(crate) values: Vec<Option<Value>>,
@@ -585,7 +623,11 @@ pub(crate) fn encode_column(column: &Column, compression: Compression) -> Result
             for value in &strings {
                 put_bytes(&mut raw, value.as_bytes());
             }
-            let candidates = vec![(CODEC_RAW, raw), (CODEC_DICT, encode_dict(&strings))];
+            let candidates = vec![
+                (CODEC_RAW, raw),
+                (CODEC_DICT, encode_dict(&strings)),
+                (CODEC_PREFIX, encode_prefix(&strings)),
+            ];
             pick_codec(candidates, compression)?
         }
         _ => {
@@ -747,6 +789,11 @@ pub(crate) fn encode_column_fast(
             if strings.len() != present.len() {
                 return Err(corrupt("non-string value in string column"));
             }
+            let mut raw = Vec::new();
+            for value in &strings {
+                put_bytes(&mut raw, value.as_bytes());
+            }
+            let mut candidates = vec![(CODEC_RAW, raw), (CODEC_PREFIX, encode_prefix(&strings))];
             let unique: std::collections::HashSet<&str> = strings.iter().copied().collect();
             if unique.len() * 2 <= strings.len().max(1) {
                 let mut dict: Vec<&str> = Vec::new();
@@ -773,14 +820,12 @@ pub(crate) fn encode_column_fast(
                     writer.write(u64::from(slot), width);
                 }
                 out.extend_from_slice(&writer.finish());
-                (CODEC_DICT, out)
-            } else {
-                let mut raw = Vec::new();
-                for value in &strings {
-                    put_bytes(&mut raw, value.as_bytes());
-                }
-                (CODEC_RAW, raw)
+                candidates.push((CODEC_DICT, out));
             }
+            candidates
+                .into_iter()
+                .min_by_key(|(_, payload)| payload.len())
+                .ok_or_else(|| corrupt("no string codec candidate"))?
         }
         _ => {
             let mut raw = Vec::new();
@@ -946,6 +991,13 @@ pub(crate) fn decode_column(data: &[u8], pos: &mut usize) -> Result<Column> {
                     .map(|v| Some(Value::String(v))),
             );
         }
+        CODEC_PREFIX => {
+            decoded.extend(
+                decode_prefix(payload, count)?
+                    .into_iter()
+                    .map(|v| Some(Value::String(v))),
+            );
+        }
         CODEC_BOOL_BITS => {
             let mut reader = BitReader::new(payload);
             for _ in 0..count {
@@ -1106,6 +1158,7 @@ pub(crate) fn decode_column_at(
             None => Value::Null,
         },
         CODEC_DICT => Value::String(decode_dict(payload, count)?[index].clone()),
+        CODEC_PREFIX => Value::String(decode_prefix(payload, count)?[index].clone()),
         CODEC_BOOL_BITS => {
             let mut reader = BitReader::new(payload);
             let mut bit = 0;

@@ -1,0 +1,85 @@
+# Columnar collections: performance evidence
+
+Status: release-gate evidence for the
+[columnar acceptance criteria](columnar-collections-acceptance.md#12-performance-and-capacity-gates).
+
+This report records the canonical standard-vs-columnar benchmark required by
+`AC-PERF-001` through `AC-PERF-010`. It is intentionally a small summary rather
+than a committed benchmark log; the reproducible harness prints raw results to
+stdout and does not write them into the repository.
+
+## Reproduction
+
+```bash
+cargo build --release -p nonodb-core --example columnar_bench
+NONODB_AGGREGATE_MAX_DOCS=200000 ./target/release/examples/columnar_bench
+```
+
+The harness creates both profiles in temporary LMDB directories, inserts the
+same documents, and measures the same operations in the same order. It is a raw
+standard-vs-standard workload, not a columnar-optimized query against a
+standard full scan.
+
+Dataset: 100,000 append-heavy analytics documents with realistic string `_id`
+values (`id-00000000`), nested objects, arrays, timestamps, floats, enums, and
+booleans. Ingest is 100 transactions of 1,000 rows; buckets hold 512 rows. Two
+secondary indexes (`user`, `status`) are created before the storage and
+retention measurements. History is disabled for both profiles by default, TTL
+is unused, and both profiles run on the same filesystem and LMDB map size.
+
+Environment: Linux 7.0.14, Intel Xeon D-2141I, 14 GiB RAM, Rust 1.100.0,
+`--release`, LMDB map size 1 GiB.
+
+## Canonical result
+
+One representative run:
+
+| Metric | standard | columnar | gate | result |
+|---|---:|---:|---:|---|
+| Storage including ids, locator map, and 2 indexes | 36.1 MB | 17.5 MB | `columnar / standard <= 0.50` | **0.485** |
+| Batch insert (1,000 rows / transaction) | 610.0 ms | 661.6 ms | `standard / columnar >= 0.80` | **0.922** |
+| Single insert | 17.90 us | 34.20 us | `columnar / standard <= 2.0` (gate 0.50×) | **1.91x** |
+| Sealed point read p50 | 4.8 us | 9.7 us | `columnar / standard <= 3.0` | **2.04x** |
+| Full scan | 223.2 ms | 136.8 ms | `standard / columnar >= 0.80` | **1.63x** |
+| `$group` + `$sort` aggregation | 106.7 ms | 105.4 ms | `standard / columnar >= 0.80` | **1.01x** |
+| Single-document update p50 | 23.9 us | 44.9 us | `columnar / standard <= 5.0` | **1.88x** |
+
+Three consecutive runs produced these ranges: storage `0.485-0.489`, batch
+`0.922-0.956`, point `1.996-2.104x`, update `1.856-1.878x`, scan
+`1.591-1.631x`, aggregation `0.850-1.012x`.
+
+Retention/compaction (`AC-PERF-007`, `AC-PERF-010`): deleting 25% of rows left
+18.1 MB; compaction reduced it to 15.6 MB (`reclaim = 0.860`). Bucket
+seal/compaction p95 was 1.36 s, and sealed point-read p95 was 12.3 us. No
+correctness result changed after compaction or reopen.
+
+## Interpretation
+
+- Storage passes because sealed buckets use the shared adaptive codec, the
+  columnar index entries store the id once in a compact key trailer instead of
+  duplicating it in the value, and compaction re-encodes row-oriented staging
+  buckets into typed columns.
+- Batch insert passes because the write path buffers a whole transaction,
+  serializes rows in parallel, appends a row-oriented staging bucket, and skips
+  index/graph/TTL hooks that cannot apply to an empty index set.
+- Scan and aggregation pass because raw staging buckets are decoded in
+  parallel with document-count-balanced chunks; order-independent simple
+  `$group` specs use a typed accumulator path instead of a generic document
+  evaluator.
+- Point reads and updates are intentionally slower than standard: they resolve
+  an id hash to a locator and decode one column block, which remains within the
+  accepted `3x`/`5x` gates.
+
+## Pathological cases (`AC-PERF-009`)
+
+The design falls back safely rather than silently choosing a worst case:
+
+- schema drift: each bucket owns its field dictionary; missing fields use null
+  bitmaps;
+- high string cardinality: the adaptive codec keeps raw/dictionary/prefix
+  candidates and picks the smallest; compaction re-evaluates the choice;
+- large arrays and nested values: arrays are stored as JSON leaf columns;
+- large ids: the compact index trailer switches from one byte to a tagged
+  `u32` length, and bucket rows still carry the exact id;
+- oversized rows: a row that cannot fit the 4 MiB hard bucket limit is rejected
+  with the documented `DocumentTooLarge` path instead of truncating.

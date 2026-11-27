@@ -891,8 +891,8 @@ impl<'e> Collection<'e> {
         let range = (as_bound(&plan.bounds.0), as_bound(&plan.bounds.1));
         let mut ids = HashSet::new();
         for item in plan.db.range(rtxn, &range)? {
-            let (_key, value) = item?;
-            if let Some((id, _)) = index::decode_index_value(value) {
+            let (key, value) = item?;
+            if let Some((id, _)) = index::decode_index_entry(key, value) {
                 ids.insert(id);
             }
         }
@@ -1546,7 +1546,11 @@ impl<'e> Collection<'e> {
                     if keys.keys.is_empty() {
                         continue;
                     }
-                    let value = index::encode_index_value(def, &doc, &id);
+                    let value = if self.compact_index_ids(def) {
+                        Vec::new()
+                    } else {
+                        index::encode_index_value(def, &doc, &id)
+                    };
                     out.push((slot, keys, value, id.clone()));
                 }
                 Ok(out)
@@ -1565,9 +1569,9 @@ impl<'e> Collection<'e> {
                             let range = index::exact_prefix(&vb);
                             let bounds = (as_bound(&range.0), as_bound(&range.1));
                             for item in index_dbs[slot].range(&*wtxn, &bounds)? {
-                                let (_existing_key, existing_value) = item?;
+                                let (existing_key, existing_value) = item?;
                                 if let Some((existing_id, _)) =
-                                    index::decode_index_value(existing_value)
+                                    index::decode_index_entry(existing_key, existing_value)
                                 {
                                     if existing_id != id {
                                         return Err(Error::DuplicateKey(id));
@@ -1576,7 +1580,11 @@ impl<'e> Collection<'e> {
                             }
                         }
                         let mut key = vb;
-                        key.extend_from_slice(id.as_bytes());
+                        index::append_index_id(
+                            &mut key,
+                            &id,
+                            self.compact_index_ids(&defs_ref[slot].1),
+                        );
                         index_dbs[slot].put(&mut *wtxn, key.as_slice(), value.as_slice())?;
                     }
                 }
@@ -1634,15 +1642,15 @@ impl<'e> Collection<'e> {
                         multikey_fields[slot].push(field.clone());
                     }
                 }
-                let value = index::encode_index_value(def, &doc, &id);
+                let value = self.index_value_for(def, &doc, &id);
                 for vb in keys.keys {
                     if def.unique {
                         let range = index::exact_prefix(&vb);
                         let bounds = (as_bound(&range.0), as_bound(&range.1));
                         for item in db.range(&*wtxn, &bounds)? {
-                            let (_existing_key, existing_value) = item?;
+                            let (existing_key, existing_value) = item?;
                             if let Some((existing_id, _)) =
-                                index::decode_index_value(existing_value)
+                                index::decode_index_entry(existing_key, existing_value)
                             {
                                 if existing_id != id {
                                     return Err(Error::DuplicateKey(id.clone()));
@@ -1651,7 +1659,7 @@ impl<'e> Collection<'e> {
                         }
                     }
                     let mut key = vb;
-                    key.extend_from_slice(id.as_bytes());
+                    index::append_index_id(&mut key, &id, self.compact_index_ids(def));
                     db.put(&mut *wtxn, key.as_slice(), value.as_slice())?;
                 }
             }
@@ -1712,12 +1720,12 @@ impl<'e> Collection<'e> {
                             }
                         }
                         if def.geo {
-                            let value = index::encode_index_value(def, doc, id);
+                            let value = self.index_value_for(def, doc, id);
                             for vb in keys.keys {
                                 if def.unique {
                                     for item in db.prefix_iter(&*wtxn, vb.as_slice())? {
-                                        let (_key, existing) = item?;
-                                        if index::decode_index_value(existing)
+                                        let (existing_key, existing) = item?;
+                                        if index::decode_index_entry(existing_key, existing)
                                             .is_some_and(|(existing_id, _)| existing_id != *id)
                                         {
                                             return Err(Error::DuplicateKey(id.clone()));
@@ -1725,7 +1733,7 @@ impl<'e> Collection<'e> {
                                     }
                                 }
                                 let mut key = vb;
-                                key.extend_from_slice(id.as_bytes());
+                                index::append_index_id(&mut key, id, self.compact_index_ids(def));
                                 db.put(&mut *wtxn, key.as_slice(), value.as_slice())?;
                             }
                             continue;
@@ -1936,7 +1944,11 @@ impl<'e> Collection<'e> {
                 if keys.keys.is_empty() {
                     return Ok(Vec::new());
                 }
-                let value = index::encode_index_value(def_ref, &doc, &id);
+                let value = if self.compact_index_ids(def_ref) {
+                    Vec::new()
+                } else {
+                    index::encode_index_value(def_ref, &doc, &id)
+                };
                 Ok(vec![(keys, value, id)])
             },
             |wtxn, entries| {
@@ -1952,9 +1964,9 @@ impl<'e> Collection<'e> {
                             let range = index::exact_prefix(&vb);
                             let bounds = (as_bound(&range.0), as_bound(&range.1));
                             for item in idx_db.range(&*wtxn, &bounds)? {
-                                let (_existing_key, existing_value) = item?;
+                                let (existing_key, existing_value) = item?;
                                 if let Some((existing_id, _)) =
-                                    index::decode_index_value(existing_value)
+                                    index::decode_index_entry(existing_key, existing_value)
                                 {
                                     if existing_id != id {
                                         return Err(Error::DuplicateKey(id));
@@ -1963,7 +1975,7 @@ impl<'e> Collection<'e> {
                             }
                         }
                         let mut key = vb;
-                        key.extend_from_slice(id.as_bytes());
+                        index::append_index_id(&mut key, &id, self.compact_index_ids(def_ref));
                         idx_db.put(&mut *wtxn, key.as_slice(), value.as_slice())?;
                     }
                 }
@@ -2058,8 +2070,8 @@ impl<'e> Collection<'e> {
             }
             for vb in keys.keys {
                 for item in db.prefix_iter(txn, vb.as_slice())? {
-                    let (_key, existing) = item?;
-                    if index::decode_index_value(existing)
+                    let (key, existing) = item?;
+                    if index::decode_index_entry(key, existing)
                         .is_some_and(|(existing_id, _)| existing_id != id)
                     {
                         return Err(Error::DuplicateKey(id.to_string()));
@@ -2099,8 +2111,8 @@ impl<'e> Collection<'e> {
                         continue;
                     }
                     for item in db.prefix_iter(txn, vb.as_slice())? {
-                        let (_key, existing) = item?;
-                        if index::decode_index_value(existing)
+                        let (key, existing) = item?;
+                        if index::decode_index_entry(key, existing)
                             .is_some_and(|(existing_id, _)| existing_id != id)
                         {
                             return Err(Error::DuplicateKey(id));
@@ -2148,8 +2160,8 @@ impl<'e> Collection<'e> {
                         continue;
                     }
                     for item in db.prefix_iter(txn, vb.as_slice())? {
-                        let (_key, existing) = item?;
-                        if let Some((existing_id, _)) = index::decode_index_value(existing) {
+                        let (key, existing) = item?;
+                        if let Some((existing_id, _)) = index::decode_index_entry(key, existing) {
                             if existing_id != *id && !updated.contains(&existing_id) {
                                 return Err(Error::DuplicateKey(id.clone()));
                             }
@@ -2238,6 +2250,18 @@ impl<'e> Collection<'e> {
 
     /// Updates index entries for an `old -> new` change (insert: `old=None`,
     /// delete: `new=None`).
+    fn compact_index_ids(&self, def: &IndexDef) -> bool {
+        self.profile.is_columnar() && def.include.is_empty()
+    }
+
+    fn index_value_for(&self, def: &IndexDef, doc: &Value, id: &str) -> Vec<u8> {
+        if self.compact_index_ids(def) {
+            Vec::new()
+        } else {
+            index::encode_index_value(def, doc, id)
+        }
+    }
+
     fn apply_index_entries(
         &self,
         wtxn: &mut RwTxn<'_>,
@@ -2267,8 +2291,8 @@ impl<'e> Collection<'e> {
                 });
             // With `include`, copied fields must also be compared because they can
             // change without changing the index key.
-            let old_value = old.map(|d| index::encode_index_value(&def, d, id));
-            let new_value = new.map(|d| index::encode_index_value(&def, d, id));
+            let old_value = old.map(|d| self.index_value_for(&def, d, id));
+            let new_value = new.map(|d| self.index_value_for(&def, d, id));
             let mut def_changed = false;
             for field in &new_keys.multikey_fields {
                 if !def.multikey_fields.contains(field) {
@@ -2294,14 +2318,15 @@ impl<'e> Collection<'e> {
                 continue;
             }
             let idx_db = self.index_db_in(wtxn, &def)?;
+            let compact = self.compact_index_ids(&def);
             for vb in old_keys.keys {
                 let mut key = vb;
-                key.extend_from_slice(id.as_bytes());
+                index::append_index_id(&mut key, id, compact);
                 idx_db.delete(&mut *wtxn, key.as_slice())?;
             }
             for vb in new_keys.keys {
                 let mut key = vb;
-                key.extend_from_slice(id.as_bytes());
+                index::append_index_id(&mut key, id, compact);
                 let value = new_value.as_deref().expect("nowy dokument");
                 idx_db.put(&mut *wtxn, key.as_slice(), value)?;
             }
@@ -2476,8 +2501,8 @@ impl<'e> Collection<'e> {
         for (lower, upper) in &plan.ranges {
             let range = (as_bound(lower), as_bound(upper));
             for item in plan.db.range(rtxn, &range)? {
-                let (_key, value) = item?;
-                if let Some((id, _)) = index::decode_index_value(value) {
+                let (key, value) = item?;
+                if let Some((id, _)) = index::decode_index_entry(key, value) {
                     if seen.insert(id.clone()) {
                         ids.push(id);
                     }
@@ -2631,8 +2656,8 @@ impl<'e> Collection<'e> {
         let mut seen = HashSet::new();
         for item in iter {
             check_find_deadline(deadline)?;
-            let (_key, value) = item?;
-            let Some((id, inc)) = index::decode_index_value(value) else {
+            let (key, value) = item?;
+            let Some((id, inc)) = index::decode_index_entry(key, value) else {
                 continue;
             };
             if multikey && !seen.insert(id.clone()) {
@@ -2853,8 +2878,8 @@ impl<'e> Collection<'e> {
             let range = (as_bound(&lower), as_bound(&upper));
             let mut ids = HashSet::new();
             for item in db.range(rtxn, &range)? {
-                let (_key, value) = item?;
-                if let Some((id, _)) = index::decode_index_value(value) {
+                let (key, value) = item?;
+                if let Some((id, _)) = index::decode_index_entry(key, value) {
                     ids.insert(id);
                 }
             }
@@ -2926,8 +2951,8 @@ impl<'e> Collection<'e> {
         // a second full-size `HashSet<String>` when deduplication is unnecessary.
         let mut seen = plan.def.is_multikey().then(HashSet::new);
         for item in plan.db.range(rtxn, &range)? {
-            let (_key, value) = item?;
-            if let Some((id, _)) = index::decode_index_value(value) {
+            let (key, value) = item?;
+            if let Some((id, _)) = index::decode_index_entry(key, value) {
                 if let Some(seen) = seen.as_mut() {
                     if !seen.insert(id.clone()) {
                         continue;
@@ -2960,8 +2985,8 @@ impl<'e> Collection<'e> {
         let range = (as_bound(lower), as_bound(upper));
         let mut ids = HashSet::new();
         for item in plan.db.range(rtxn, &range)? {
-            let (_key, value) = item?;
-            if let Some((id, _)) = index::decode_index_value(value) {
+            let (key, value) = item?;
+            if let Some((id, _)) = index::decode_index_entry(key, value) {
                 ids.insert(id);
             }
         }
@@ -5513,33 +5538,83 @@ impl<'e> Collection<'e> {
 
     /// Inserts many documents in one writer transaction. Time-series
     /// collections resolve each open bucket once and flush pointers at the end.
+    fn normalize_columnar_batch(
+        docs: &[Value],
+        default_seconds: Option<u64>,
+        ttl_field: Option<(&str, u64)>,
+    ) -> Result<Vec<(Value, Option<u64>)>> {
+        let normalize = |doc: &Value| -> Result<(Value, Option<u64>)> {
+            let mut doc = doc.clone();
+            let ttl_at = ttl::take_insert_ttl_with_field(&mut doc, default_seconds, ttl_field)?;
+            date::normalize_document(&mut doc)?;
+            numeric::normalize_document(&mut doc)?;
+            bson_types::normalize_document(&mut doc)?;
+            Ok((doc, ttl_at))
+        };
+        let workers = scan_workers().min(docs.len()).max(1);
+        if workers <= 1 || docs.len() < 64 {
+            return docs.iter().map(normalize).collect();
+        }
+        let chunk_size = docs.len().div_ceil(workers);
+        let results = std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for chunk in docs.chunks(chunk_size) {
+                handles.push(scope.spawn(move || -> Result<Vec<(Value, Option<u64>)>> {
+                    chunk.iter().map(normalize).collect()
+                }));
+            }
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle.join().unwrap_or_else(|_| {
+                        Err(Error::Query("columnar normalize worker panicked".into()))
+                    })
+                })
+                .collect::<Vec<_>>()
+        });
+        let mut out = Vec::with_capacity(docs.len());
+        for result in results {
+            out.extend(result?);
+        }
+        Ok(out)
+    }
+
     pub fn insert_many_txn(&self, wtxn: &mut RwTxn<'_>, docs: &[Value]) -> Result<Vec<String>> {
         if self.profile.is_columnar() {
             let settings = self.columnar_settings_in(&*wtxn)?.unwrap_or_default();
-            let mut prepared = Vec::with_capacity(docs.len());
-            let mut ttls = Vec::with_capacity(docs.len());
-            for doc in docs {
-                let mut doc = doc.clone();
-                let ttl_at = ttl::take_insert_ttl_with_field(
-                    &mut doc,
-                    self.ttl_default_seconds,
-                    self.ttl_field_pair(),
-                )?;
-                date::normalize_document(&mut doc)?;
-                numeric::normalize_document(&mut doc)?;
-                bson_types::normalize_document(&mut doc)?;
+            let ttl_field = self.ttl_field.as_deref().zip(self.ttl_default_seconds);
+            let normalized =
+                Self::normalize_columnar_batch(docs, self.ttl_default_seconds, ttl_field)?;
+            let mut prepared = Vec::with_capacity(normalized.len());
+            let mut ttls = Vec::with_capacity(normalized.len());
+            for (doc, ttl_at) in normalized {
                 self.validate_graph_edge_txn(&*wtxn, &doc)?;
                 prepared.push(doc);
                 ttls.push(ttl_at);
             }
             let inserted =
                 crate::columnar::insert_batch(wtxn, self.env, &self.name, &settings, prepared)?;
+            let index_defs = self.index_defs(&*wtxn)?;
+            let has_unique = index_defs.iter().any(|def| def.unique);
+            let has_indexes = !index_defs.is_empty()
+                || !self.text_defs(&*wtxn)?.is_empty()
+                || !self.fuzzy_defs(&*wtxn)?.is_empty()
+                || !self.vector_defs(&*wtxn)?.is_empty();
+            let has_graph = self.edge_graph_def_in(&*wtxn)?.is_some();
             let mut ids = Vec::with_capacity(inserted.len());
             for ((id, stored), ttl_at) in inserted.into_iter().zip(ttls) {
-                self.validate_unique(&*wtxn, &stored, &id)?;
-                self.apply_all_index_entries(wtxn, None, Some(&stored), &id)?;
-                self.apply_graph_entries(wtxn, None, Some(&stored))?;
-                self.set_ttl(wtxn, &id, ttl_at)?;
+                if has_unique {
+                    self.validate_unique(&*wtxn, &stored, &id)?;
+                }
+                if has_indexes {
+                    self.apply_all_index_entries(wtxn, None, Some(&stored), &id)?;
+                }
+                if has_graph {
+                    self.apply_graph_entries(wtxn, None, Some(&stored))?;
+                }
+                if ttl_at.is_some() {
+                    self.set_ttl(wtxn, &id, ttl_at)?;
+                }
                 self.record_history(wtxn, &id, "insert", Some(stored))?;
                 ids.push(id);
             }
@@ -8448,8 +8523,8 @@ impl<'e> Collection<'e> {
                 let (lower, upper) = &plan.bounds;
                 let range = (as_bound(lower), as_bound(upper));
                 for item in plan.db.range(txn, &range)? {
-                    let (_key, value) = item?;
-                    let Some((id, _)) = index::decode_index_value(value) else {
+                    let (key, value) = item?;
+                    let Some((id, _)) = index::decode_index_entry(key, value) else {
                         continue;
                     };
                     if !seen.insert(id.clone()) {
@@ -8615,8 +8690,8 @@ impl<'e> Collection<'e> {
                 let range = (as_bound(lower), as_bound(upper));
                 for item in plan.db.range(txn, &range)? {
                     check_find_deadline(deadline)?;
-                    let (_key, value) = item?;
-                    let Some((id, _)) = index::decode_index_value(value) else {
+                    let (key, value) = item?;
+                    let Some((id, _)) = index::decode_index_entry(key, value) else {
                         continue;
                     };
                     if !seen.insert(id.clone()) {
@@ -8643,8 +8718,8 @@ impl<'e> Collection<'e> {
             let mut seen = HashSet::new();
             for item in plan.db.range(txn, &range)? {
                 check_find_deadline(deadline)?;
-                let (_key, value) = item?;
-                let Some((id, _)) = index::decode_index_value(value) else {
+                let (key, value) = item?;
+                let Some((id, _)) = index::decode_index_entry(key, value) else {
                     continue;
                 };
                 if multikey && !seen.insert(id.clone()) {
@@ -10766,8 +10841,8 @@ impl<'e> Collection<'e> {
                 let range = (as_bound(&plan.bounds.0), as_bound(&plan.bounds.1));
                 for item in plan.db.range(rtxn, &range)? {
                     check_find_deadline(deadline)?;
-                    let (_key, value) = item?;
-                    let Some((id, _)) = index::decode_index_value(value) else {
+                    let (key, value) = item?;
+                    let Some((id, _)) = index::decode_index_entry(key, value) else {
                         continue;
                     };
                     if !seen.insert(id.clone()) {
@@ -10913,8 +10988,8 @@ impl<'e> Collection<'e> {
                 };
                 for item in iter {
                     check_find_deadline(deadline)?;
-                    let (_key, value) = item?;
-                    let Some((id, inc)) = index::decode_index_value(value) else {
+                    let (key, value) = item?;
+                    let Some((id, inc)) = index::decode_index_entry(key, value) else {
                         continue;
                     };
                     let doc = if let Some(doc) =
@@ -11431,9 +11506,9 @@ impl<'e> Collection<'e> {
                 let mut found = None;
                 for item in db.range(rtxn, &range)? {
                     stats.index_entries_read = stats.index_entries_read.saturating_add(1);
-                    let (_key, raw) = item?;
+                    let (key, raw) = item?;
                     let raw_size = raw.len();
-                    let Some((id, _inc)) = index::decode_index_value(raw) else {
+                    let Some((id, _inc)) = index::decode_index_entry(key, raw) else {
                         continue;
                     };
                     if strict_ttl && self.ttl_expired_at(rtxn, &id, now)? {
@@ -11525,9 +11600,9 @@ impl<'e> Collection<'e> {
             let mut found = None;
             for item in db.range(rtxn, &range)? {
                 stats.index_entries_read = stats.index_entries_read.saturating_add(1);
-                let (_key, raw) = item?;
+                let (key, raw) = item?;
                 let raw_size = raw.len();
-                let Some((id, inc)) = index::decode_index_value(raw) else {
+                let Some((id, inc)) = index::decode_index_entry(key, raw) else {
                     continue;
                 };
                 if strict_ttl && self.ttl_expired_at(rtxn, &id, now)? {

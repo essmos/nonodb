@@ -535,6 +535,50 @@ pub fn encode_index_keys(def: &IndexDef, doc: &Value) -> Result<IndexKeys, crate
 /// Index entry value. When the index has `include` fields, the value contains
 /// `_id` plus a copy of index and `include` fields (covering projections). In the
 /// legacy format the value is just `_id`.
+/// Appends `_id` to an index key. Columnar indexes without `include` use a
+/// compact trailer (`id_len:u32`) and store an empty value, so the id is not
+/// duplicated in both key and value.
+pub fn append_index_id(key: &mut Vec<u8>, id: &str, compact: bool) {
+    key.extend_from_slice(id.as_bytes());
+    if compact {
+        if id.len() < 0xFF {
+            key.push(id.len() as u8);
+        } else {
+            key.extend_from_slice(&(id.len() as u32).to_le_bytes());
+            key.push(0xFF);
+        }
+    }
+}
+
+/// Decodes an index entry id from the value, falling back to the compact
+/// id trailer used by columnar indexes.
+pub fn decode_index_entry(
+    key: &[u8],
+    value: &[u8],
+) -> Option<(String, Option<serde_json::Map<String, Value>>)> {
+    if !value.is_empty() {
+        return decode_index_value(value);
+    }
+    let last = *key.last()?;
+    let (len, trailer) = if last == 0xFF {
+        if key.len() < 5 {
+            return None;
+        }
+        (
+            u32::from_le_bytes(key[key.len() - 5..key.len() - 1].try_into().ok()?) as usize,
+            5,
+        )
+    } else {
+        (last as usize, 1)
+    };
+    if len == 0 || key.len() < len + trailer {
+        return None;
+    }
+    let start = key.len() - len - trailer;
+    let id = std::str::from_utf8(&key[start..start + len]).ok()?;
+    Some((id.to_string(), None))
+}
+
 pub fn encode_index_value(def: &IndexDef, doc: &Value, id: &str) -> Vec<u8> {
     if def.include.is_empty() {
         return id.as_bytes().to_vec();

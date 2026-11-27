@@ -19,7 +19,14 @@ Full release notes: https://github.com/essmos/nonodb/releases
   malformed buckets, unknown formats, and float bit-exact roundtrips. The write
   path uses a row-oriented staging bucket that compaction re-encodes with the
   adaptive column codecs; unsorted scans and order-independent `$group` stages
-  decode blocks in parallel.
+  decode document-count-balanced chunks in parallel.
+- Meet the columnar release performance gates on the canonical 100k-row
+  benchmark: storage `0.485×`, batch insert `0.92×`, scan `1.63×`, and
+  aggregation `1.01×` versus standard, with point reads and updates inside the
+  `3×`/`5×` limits. The write path serializes and normalizes batches in
+  parallel, skips inapplicable index/graph/TTL hooks, uses 32-row blocks and
+  prefix/front-coded columns, and stores columnar index ids once in a compact
+  key trailer. See `docs/columnar-performance.md`.
 
 ## v0.34.0 - 2026-11-27
 
