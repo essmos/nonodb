@@ -665,9 +665,13 @@ fn empty_retained_window_still_truncates_a_lagging_group() {
     let (_dir, store) = stream_store();
     let events = store.collection("_events").unwrap();
     for n in 0..4 {
+<<<<<<< HEAD
         events
             .insert_one(json!({"n": n, "created_at": 1_000i64}))
             .unwrap();
+=======
+        events.insert_one(json!({"n": n})).unwrap();
+>>>>>>> 761ae58 (fix(streams): reject partial commits, truncate empty windows, per-group counters)
     }
     let mut def = store.stream("_events").unwrap().unwrap();
     // Age retention with a window that removes everything.
@@ -746,6 +750,7 @@ fn redeliveries_are_counted_per_group() {
     assert_eq!(group.redeliveries, 1);
     assert_eq!(again.attempts, 2);
 }
+<<<<<<< HEAD
 
 #[test]
 fn updates_cannot_rewrite_or_remove_the_reserved_offset() {
@@ -1218,3 +1223,5 @@ fn remaining_seqs(store: &Store, events: &nonodb_core::Collection<'_>) -> Vec<u6
     seqs.sort_unstable();
     seqs
 }
+=======
+>>>>>>> 761ae58 (fix(streams): reject partial commits, truncate empty windows, per-group counters)

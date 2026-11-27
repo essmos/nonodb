@@ -182,6 +182,7 @@ def main() -> int:
             == "commit_out_of_order"
         ), "out-of-range commit must be rejected"
 
+
         # The later range commits first; the committed offset waits for the hole.
         second_member, second_batch = claims[1]
         api.call(
@@ -304,6 +305,14 @@ def main() -> int:
         )
         assert redelivered["from_seq"] == dying["from_seq"], redelivered
         assert redelivered["attempts"] == 2, redelivered
+        workers = [
+            group
+            for group in api.call({"op": "stream_stats", "coll": "_events"})["streams"][0][
+                "groups"
+            ]
+            if group["group"] == "workers"
+        ][0]
+        assert workers["redeliveries"] == 1, workers
         api.call(
             {
                 "op": "nack_stream_group",
@@ -313,6 +322,60 @@ def main() -> int:
                 "retry_in_ms": 0,
             }
         )
+
+        # A partial ack inside a multi-event range is rejected and advances
+        # nothing; the batch stays leased so the same member can finish it.
+        api.call(
+            {
+                "op": "create_stream_group",
+                "coll": "_events",
+                "group": "partial",
+                "start": "earliest",
+            }
+        )
+        multi = api.call(
+            {
+                "op": "watch",
+                "coll": "_events",
+                "mode": "group",
+                "group": "partial",
+                "member": "p1",
+                "limit": 3,
+                "timeout_ms": 100,
+            }
+        )
+        assert multi["to_seq"] > multi["from_seq"], multi
+        assert (
+            api.error(
+                {
+                    "op": "commit_stream_group",
+                    "coll": "_events",
+                    "group": "partial",
+                    "seq": multi["from_seq"],
+                    "lease_id": multi["lease_id"],
+                }
+            )
+            == "commit_out_of_order"
+        ), "a partial commit must be rejected"
+        partial = [
+            group
+            for group in api.call({"op": "stream_stats", "coll": "_events"})["streams"][0][
+                "groups"
+            ]
+            if group["group"] == "partial"
+        ][0]
+        assert partial["committed_seq"] == 0, partial
+        assert partial["inflight"] == multi["to_seq"] - multi["from_seq"] + 1, partial
+        api.call(
+            {
+                "op": "commit_stream_group",
+                "coll": "_events",
+                "group": "partial",
+                "seq": multi["to_seq"],
+                "lease_id": multi["lease_id"],
+            }
+        )
+        api.call({"op": "delete_stream_group", "coll": "_events", "group": "partial"})
 
         # Dead letters: a group with a single attempt allowance dead-letters a
         # batch that keeps failing, and the group is not blocked by it.
@@ -376,22 +439,50 @@ def main() -> int:
         ] == []
         api.call({"op": "delete_stream_group", "coll": "_events", "group": "poison"})
 
-        # Metrics expose per-group lag.
+        # Metrics expose per-group lag and counters.
         metrics = api._client.get("/metrics/prometheus").text
         assert "nonodb_stream_lag_events" in metrics, metrics[:400]
         assert 'group="workers"' in metrics, "stream metrics must be labelled"
         assert "nonodb_stream_claims_total" in metrics
-        assert "nonodb_stream_head_seq" in metrics
-        # Counters must actually move, not just be present in the exposition.
-        for prefix, expected in (
-            ("nonodb_stream_claims_total ", 1),
-            ("nonodb_stream_commit_failures_total ", 1),
+        for name in (
+            "nonodb_stream_head_seq",
+            "nonodb_stream_inflight_events",
+            "nonodb_stream_dead_events",
+            "nonodb_stream_redeliveries_total",
+            "nonodb_stream_truncated_total",
+            "nonodb_stream_commit_failures_total",
+            "nonodb_stream_pruned_events_total",
         ):
-            line = next(
-                (row for row in metrics.splitlines() if row.startswith(prefix)), None
-            )
-            assert line is not None, f"missing {prefix}"
-            assert int(line.split()[-1]) >= expected, line
+            assert name in metrics, name
+        for name in (
+            "nonodb_stream_redeliveries_total",
+            "nonodb_stream_commit_failures_total",
+        ):
+            series = [
+                row
+                for row in metrics.splitlines()
+                if row.startswith(name + "{") and 'group="workers"' in row
+            ]
+            assert series, f"{name} must carry {{database,stream,group}} labels"
+            assert any(float(row.split()[-1]) >= 1 for row in series), series
+        truncated = [
+            row
+            for row in metrics.splitlines()
+            if row.startswith("nonodb_stream_truncated_total{")
+        ]
+        assert truncated, "retention crossings must be labelled per group"
+        assert "nonodb_stream_head_seq" in metrics
+        # The global claim counter must actually move, not just be present.
+        claims_line = next(
+            (
+                row
+                for row in metrics.splitlines()
+                if row.startswith("nonodb_stream_claims_total ")
+            ),
+            None,
+        )
+        assert claims_line is not None, "missing nonodb_stream_claims_total"
+        assert int(claims_line.split()[-1]) >= 1, claims_line
 
         # Restart: the group resumes from the committed offset.
         stop(proc)
@@ -563,6 +654,47 @@ def main() -> int:
             }
         )
         assert resumedret_events["from_seq"] == 16, resumedret_events
+
+        # Age retention that removes the whole window still truncates a group
+        # left behind instead of handing it an empty lease.
+        api.call({"op": "create_collection", "coll": "age_events"})
+        api.call(
+            {
+                "op": "create_stream",
+                "coll": "age_events",
+                "retention": {"max_age_ms": 1},
+            }
+        )
+        for n in range(3):
+            api.call({"op": "insert", "coll": "age_events", "doc": {"n": n}})
+        time.sleep(0.03)
+        assert api.call({"op": "prune_stream", "coll": "age_events"})["deleted"] == 3
+        api.call(
+            {
+                "op": "create_stream_group",
+                "coll": "age_events",
+                "group": "behind",
+                "start": "earliest",
+            }
+        )
+        assert (
+            api.error(
+                {
+                    "op": "watch",
+                    "coll": "age_events",
+                    "mode": "group",
+                    "group": "behind",
+                    "timeout_ms": 100,
+                }
+            )
+            == "stream_truncated"
+        ), "an empty retained window must fail with stream_truncated"
+        behind = api.call({"op": "stream_stats", "coll": "age_events"})["streams"][0][
+            "groups"
+        ][0]
+        assert behind["truncated_below"] == 4, behind
+        assert behind["truncations"] == 1, behind
+        assert behind["redeliveries"] == 0, behind
 
         api.close()
         print("streams/groups: ok")

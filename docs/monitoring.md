@@ -294,12 +294,15 @@ rows, dead letters); they do not scan documents.
 | `nonodb_stream_committed_seq{database,stream,group}` | Group committed offset |
 | `nonodb_stream_lag_events{database,stream,group}` | Head minus committed offset |
 | `nonodb_stream_inflight_events{database,stream,group}` | Events leased but not committed |
-| `nonodb_stream_dead_events{database,stream,group}` | Dead-lettered events |
+| `nonodb_stream_dead_events{database,stream,group}` | Dead-lettered events (sum of range sizes, the same unit as `inflight` and the dead-letter counter) |
 | `nonodb_stream_claims_total` | Batches claimed by a member |
-| `nonodb_stream_redeliveries_total` | Batches delivered more than once |
+| `nonodb_stream_redeliveries_total{database,stream,group}` | Ranges delivered more than once |
+| `nonodb_stream_truncated_total{database,stream,group}` | Retention passes that crossed this group |
+| `nonodb_stream_commit_failures_total{database,stream,group}` | Rejected commits |
 | `nonodb_stream_nacks_total` | Batches released with nack |
-| `nonodb_stream_dead_letters_total` | Events dead-lettered when a nack exhausts `max_attempts` (expiry-driven dead letters show up in the `nonodb_stream_dead_events` gauge) |
-| `nonodb_stream_truncated_total` | Events dropped by offset retention |
+| `nonodb_stream_dead_letters_total` | Events dead-lettered by a nack or an expired lease that exhausted `max_attempts`; the `nonodb_stream_dead_events` gauge carries the current backlog |
+| `nonodb_stream_pruned_events_total` | Events dropped by offset retention |
+| `nonodb_stream_lease_recoveries_total` | Expired leases requeued or dead-lettered |
 
 How to read them:
 
@@ -312,9 +315,11 @@ How to read them:
   (`min(head - max_events, age boundary, slowest committed - min_seq_keep)`), so
   disk use follows the slowest consumer. A paused consumer is a disk-growth
   decision.
-- `nonodb_stream_truncated_total` only moves when a stream has retention
-  configured (`max_events` or `max_age_ms`). A group behind the window fails with
-  `stream_truncated` instead of skipping events.
+- `nonodb_stream_truncated_total` counts **groups crossed** by retention, once per
+  crossing, and only moves when a stream has retention configured (`max_events`
+  or `max_age_ms`). A group behind the window fails with `stream_truncated`
+  instead of skipping events. `nonodb_stream_pruned_events_total` counts the
+  dropped events themselves.
 
 ## Recommended alerts
 

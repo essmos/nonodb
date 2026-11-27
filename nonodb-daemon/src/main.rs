@@ -1704,16 +1704,18 @@ async fn prometheus_handler(
                             .stream_dead_letters(Some(&def.name), Some(&group.group))
                             .map(|rows| rows.len() as u64)
                             .unwrap_or(0);
-                        stream_rows.push((
-                            name.clone(),
-                            def.name.clone(),
-                            group.group.clone(),
-                            group.committed_seq,
-                            head,
-                            nonodb_core::streams::lag(head, group.committed_seq),
+                        stream_rows.push(metrics::StreamMetricRow {
+                            database: name.clone(),
+                            stream: def.name.clone(),
+                            group: group.group.clone(),
+                            committed_seq: group.committed_seq,
+                            head_seq: head,
+                            lag: nonodb_core::streams::lag(head, group.committed_seq),
                             inflight,
                             dead,
-                        ));
+                            redeliveries: group.redeliveries,
+                            truncations: group.truncations,
+                        });
                     }
                 }
             }
@@ -2927,6 +2929,10 @@ async fn exec(
     let collections = req.collections();
     let read_only = req.is_read_only();
     let operation = req.op_name();
+    let commit_target = match &req {
+        Request::CommitStreamGroup { coll, group, .. } => Some((coll.clone(), group.clone())),
+        _ => None,
+    };
     let response = exec_inner(
         State(state),
         Extension(connection),
@@ -2935,6 +2941,11 @@ async fn exec(
         Json(req),
     )
     .await;
+    if let (Some((coll, group)), Some(error)) = (&commit_target, response.1 .0.error.as_ref()) {
+        if matches!(error.code.as_str(), "stale_lease" | "commit_out_of_order") {
+            metrics::record_stream_commit_failure(&database, coll, group);
+        }
+    }
     // Do not create per-collection series for unauthenticated/unauthorized
     // names. The global request/error counters still see those attempts.
     if response.0 != StatusCode::UNAUTHORIZED && response.0 != StatusCode::FORBIDDEN {
@@ -3188,9 +3199,6 @@ async fn exec_inner(
                         metrics::inc(&metrics::READ_OPS);
                         metrics::add(&metrics::WATCH_EVENTS, events.len() as u64);
                         metrics::add(&metrics::STREAM_CLAIMS, 1);
-                        if claim.attempts > 1 {
-                            metrics::add(&metrics::STREAM_REDELIVERIES, 1);
-                        }
                         let timed_out = events.is_empty();
                         if timed_out {
                             metrics::inc(&metrics::WATCH_TIMEOUTS);
@@ -5043,6 +5051,8 @@ fn stream_stats_value(store: &Store, coll: Option<&str>) -> Result<Value, ApiErr
                 "inflight": inflight,
                 "dead": dead,
                 "max_attempts": group.max_attempts,
+                "redeliveries": group.redeliveries,
+                "truncations": group.truncations,
                 "truncated_below": group.truncated_below,
                 "updated_at": group.updated_at,
             }));
@@ -5387,9 +5397,6 @@ async fn watch_group_stream_loop(
         let claim = claim_lease(&state, &coll, &group, &member, limit, lease_ms).await?;
         if let Some(claim) = claim {
             metrics::add(&metrics::STREAM_CLAIMS, 1);
-            if claim.attempts > 1 {
-                metrics::add(&metrics::STREAM_REDELIVERIES, 1);
-            }
             let control = json!({
                 "mode": "group",
                 "group": group,

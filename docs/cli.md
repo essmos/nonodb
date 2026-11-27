@@ -386,7 +386,8 @@ nonodb-cli streams prune _events [batch]
 ```
 
 `streams groups` prints the committed offset, stream head, lag, in-flight
-events, dead letters, attempt budget, and truncation per group. `streams create`
+events, dead-lettered **events** (`DEAD_EV`), dead-lettered **ranges**
+(`DEAD_RNG`), redeliveries, truncations, and the attempt budget per group. `streams create`
 accepts `--max-events`, `--max-age-ms`, and `--min-seq-keep`;
 `retention.max_bytes` is not enforced. Pruning only moves when a group commits,
 so `streams prune` is a no-op while a consumer with no commits exists. See

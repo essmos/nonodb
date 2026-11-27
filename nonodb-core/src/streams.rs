@@ -158,6 +158,12 @@ pub struct StreamGroup {
     /// Oldest offset still available, set when retention crossed the group.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub truncated_below: Option<u64>,
+    /// Ranges handed out again after their lease expired or was nacked.
+    #[serde(default)]
+    pub redeliveries: u64,
+    /// Times retention crossed this group (each sets `truncated_below`).
+    #[serde(default)]
+    pub truncations: u64,
     pub created_at: u64,
     pub updated_at: u64,
 }
@@ -176,6 +182,8 @@ impl StreamGroup {
             next_seq: committed_seq,
             max_attempts: default_max_attempts(),
             truncated_below: None,
+            redeliveries: 0,
+            truncations: 0,
             created_at: now,
             updated_at: now,
         }

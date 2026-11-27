@@ -523,10 +523,15 @@ database.
 From then on, every document inserted into `_events` gets a writer-assigned
 `_seq` field: a strictly increasing `u64` allocated by the single writer, so it
 matches the commit order of the database exactly. `_seq` is reserved — an insert
-that supplies it is rejected with `invalid_query`.
+that supplies it, and any update, pipeline, or find-and-modify that would change
+or remove it, is rejected with `invalid_query`.
 
 Events written **before** `create_stream` have no `_seq` and are not delivered
 by group reads. Define the stream before writing events, or backfill them.
+Automatic change events (collection event configs and subscriptions, which the
+daemon writes into `_events`) go through the same writer path and get offsets
+too, so a group over `_events` sees both explicit and automatic events in one
+order.
 
 If the collection does not exist yet, `create_stream` creates it as a standard
 collection. Only standard collections can back a stream: time-series buckets and
@@ -584,28 +589,35 @@ reorder events, and the late-commit overlap rescan used by `_id` tails is not
 needed: there are no gaps. `filter`, `types`, and `projection` behave as in the
 `_id` tail.
 
-Group reads need the `consume:<coll>` scope (or `admin:<coll>`, which implies
-it); `read:<coll>` is enough to tail a stream in the default mode but **not** to
-claim a group or acknowledge a batch, because claiming writes the lease and
-committing moves the offset. A bare `group` field counts as group mode even when
-`mode` is omitted.
+The filter is part of the member's subscription. If a claimed range contains no
+events matching it, the server **acknowledges that range** and keeps polling: the
+group advances, and the batch is not handed back (and eventually dead-lettered)
+just because one member filters it out.
 
-Reading a group **claims the group lease**. One member owns the group at a time:
-a second member gets `timed_out` (or `stale_lease`) until the lease expires or
-the owner commits. The lease lasts `lease_ms` (default `60000`), and re-claiming
-as the same member extends it.
+Group reads need the `consume:<coll>` scope (or `admin:<coll>`, which implies
+it); `read:<coll>` is enough to tail a stream with the default mode but **not**
+to claim or acknowledge batches, because claiming writes a lease and advances the
+group. `commit_stream_group` and `nack_stream_group` require the same scope;
+creating, resetting, deleting, pruning, and retrying dead letters require
+`admin:<coll>`.
+
 Every read **claims a contiguous range** of offsets (`from_seq..=to_seq`,
 bounded by `limit`) and writes one lease covering the whole range. Several
-members of the same group therefore work in parallel: each gets a distinct
-range, and no offset is handed out twice. A member that is caught up gets
+members of the same group therefore work in parallel: each gets a distinct range,
+and no offset is handed out twice. A member that is caught up gets
 `"events": []` with `timed_out: true` and no lease.
-
 
 Redelivery is bounded: a lease is valid for `lease_ms` (default `60000`, minimum
 `1000`). If the member neither commits nor nacks before it expires, the range
 becomes available again and the next claim picks it up with
 `attempts` incremented. After `max_attempts` (group setting, default `5`, set at
-creation) the range is dead-lettered instead of looping.
+creation) the range is dead-lettered instead of looping. A background janitor
+(every 60s, `NONODB_STREAM_PRUNE_INTERVAL=0` disables it) also requeues or
+dead-letters expired batches even when no member is claiming, so a crashed
+worker shows up in `stream_stats` and `stream_dead` without waiting for new
+traffic. The janitor goes through the writer (so its committed-offset advances
+and dead letters replicate) and runs only on the primary; replicas never
+dead-letter a batch on their own.
 
 ### Commit and nack
 
@@ -615,9 +627,11 @@ creation) the range is dead-lettered instead of looping.
 ```
 
 - A commit must present the `lease_id` of the batch, otherwise it fails with
-  `stale_lease`. A worker that lost its lease cannot advance the group.
-- The acknowledged `seq` must be inside the leased range, otherwise it fails with
-  `commit_out_of_order`; out-of-range or repeated commits never move the offset.
+  `stale_lease` (HTTP 409). A worker that lost its lease cannot advance the
+  group; `commit_out_of_order` is also 409 and `stream_truncated` is 410.
+- The acknowledged `seq` must be the **end** of the leased range, otherwise it
+  fails with `commit_out_of_order`; partial, out-of-range, or repeated commits
+  never move the offset and leave the batch leased, so the member can finish it.
 - The committed offset only advances across a **contiguous** prefix. If member A
   finishes range `11..=20` while member B is still working on `1..=10`, the group
   offset stays at `0` until B commits; then it jumps to `20` in one step.
@@ -641,7 +655,10 @@ them.
 
 `stream_dead` requires read scope; `retry_stream_dead` and `drop_stream_dead`
 require `admin:<coll>`. Retrying resets the attempt counter and puts the range
-back in the queue.
+back in the queue. If the group already moved past the retried range, the replay
+is acknowledged without moving the offset backwards, so following the normal
+"nack on failure, retry the dead letter" flow always terminates. Deleting a group (`delete_stream_group`) also deletes its
+leases and dead letters, so a group recreated with the same name starts clean.
 
 ### Inspect and reset
 
@@ -653,7 +670,11 @@ back in the queue.
 ```
 
 `stream_stats` reports `committed_seq`, `next_seq`, `head_seq`, `lag`, `inflight`
-(events leased but not committed), `dead`, `max_attempts`, and `truncated_below`.
+(events leased but not committed), `dead` (dead-lettered **events**), `dead_ranges`
+(number of dead-lettered batches), `redeliveries`, `truncations`, `max_attempts`,
+and `truncated_below`. `next_seq` is derived from the committed offset plus the
+leases known to this node, so after a failover it reports what the next claim will
+actually deliver.
 `reset_stream_group` accepts `earliest`, `latest`, or `{"seq": n}`, drops the
 in-flight batches and dead letters of that group, and clears `truncated_below`.
 `drop_stream` keeps the data and the groups; only the definition (and future
@@ -687,7 +708,8 @@ Consequences worth knowing:
   next claim with `stream_truncated` instead of silently skipping events, and
   records `truncated_below` in `stream_stats`. `reset_stream_group` with
   `"earliest"` resumes at the oldest surviving event.
-- `max_bytes` is **not** part of the rule yet; it is validated but ignored.
+- `max_bytes` is **not** part of the rule yet; it is validated and stored but
+  ignored (`max_events` and `max_age_ms` are the enforced bounds).
 - The age boundary is read from each event's numeric `created_at`; when it is
   missing, the timestamp embedded in a 26-character ULID `_id` is used (that is
   the shape [EventProducer](events.md) writes). An event with **neither** is
@@ -695,17 +717,16 @@ Consequences worth knowing:
   is pruned by age. If you write plain documents into a stream collection, set
   `created_at` or rely on `max_events`/`min_seq_keep` instead.
 - The boundary only covers a **contiguous prefix**: the scan walks `_seq` upwards
-  and stops at the first event that is not provably old. Out-of-order timestamps
-  therefore delay pruning instead of deleting a fresh event, and the cost is
-  bounded by one prune batch rather than the stream length.
+  and stops at the first event that is not provably old. Out-of-order
+  timestamps therefore delay pruning instead of deleting a fresh event, and the
+  cost is bounded by one prune batch rather than the stream length.
 - Pruning runs through the writer, so deletions replicate and the stream stays
   consistent on replicas. It removes up to `NONODB_STREAM_PRUNE_BATCH` events
   per pass; the pass repeats while it keeps finding events to drop.
-- The lease janitor runs only on the primary and through the writer: requeues and
-  the committed-offset advance, as well as the dead records it creates, replicate
-  to replicas instead of staying node-local.
 
-Run the retention loop in the background, or trigger a single pass by hand:
+Retention and the lease janitor run in the background by default (every 60s).
+Tune or disable them with environment variables; a single pass can also be
+triggered by hand:
 
 ```
 NONODB_STREAM_PRUNE_INTERVAL=60 NONODB_STREAM_PRUNE_BATCH=1000 nonodb-daemon ...
@@ -717,7 +738,8 @@ NONODB_STREAM_PRUNE_INTERVAL=60 NONODB_STREAM_PRUNE_BATCH=1000 nonodb-daemon ...
 
 A quiet stream costs one small index scan per pass, bounded by
 `NONODB_STREAM_PRUNE_BATCH`. Dropped events are counted in
-`nonodb_stream_truncated_total`.
+`nonodb_stream_pruned_events_total`; `nonodb_stream_truncated_total` counts the
+groups that retention crossed.
 
 ### Metrics
 
@@ -729,20 +751,36 @@ A quiet stream costs one small index scan per pass, bounded by
 | `nonodb_stream_lag_events{database,stream,group}` | head minus committed |
 | `nonodb_stream_inflight_events{database,stream,group}` | leased events |
 | `nonodb_stream_dead_events{database,stream,group}` | dead-lettered events |
+| `nonodb_stream_redeliveries_total{database,stream,group}` | ranges delivered again |
+| `nonodb_stream_truncated_total{database,stream,group}` | retention crossed the group |
+| `nonodb_stream_commit_failures_total{database,stream,group}` | rejected commits |
 | `nonodb_stream_claims_total` | batches claimed |
-| `nonodb_stream_redeliveries_total` | batches delivered again |
+| `nonodb_stream_lease_recoveries_total` | expired leases requeued or dead-lettered by the janitor |
 | `nonodb_stream_nacks_total` | batches released with nack |
-| `nonodb_stream_dead_letters_total` | events dead-lettered |
-| `nonodb_stream_truncated_total` | events dropped by retention |
-| `nonodb_stream_lease_recoveries_total` | expired leases requeued or dead-lettered |
+| `nonodb_stream_dead_letters_total` | events dead-lettered by a nack |
+| `nonodb_stream_pruned_events_total` | events dropped by retention |
 
 ### Current limits
 
 - `retention.max_bytes` is validated but ignored; use `max_events` and
   `max_age_ms` instead. The
   [streams groups plan](streams-groups-plan.md) has the remaining phase.
-- Leases are node-local ownership and are not replicated; a promoted replica
-  starts with no active lease, which is safe because a new claim is required
-  before any commit.
+- Leases are node-local ownership and are not replicated. The claim position is
+  derived from `committed_seq` plus the leases on the current node, never from
+  the replicated `next_seq`, so a promoted replica resumes at
+  `committed_seq + 1` and **redelivers** ranges the old primary had claimed but
+  not committed (at-least-once, never silent loss). A node that takes over a
+  group with a copied data directory can call `clear_stream_leases` to drop
+  stale ownership.
 - A commit must cover the whole leased range. Partial acknowledgements inside a
   range are rejected rather than split.
+
+## Use cases
+
+- [Financial ledger and payment processing](use-cases/financial-ledger.md) —
+  per-account streams, atomic double-entry writes, strict per-account execution,
+  idempotent handlers, dead-letter handling, reconciliation.
+- [Replacing Redis Streams](use-cases/replacing-redis-streams.md) — concept
+  mapping, semantics that change your consumer code, migration plan.
+- [Replacing Kafka](use-cases/replacing-kafka.md) — topics/partitions/groups as
+  meta-mapping, atomic multi-stream publish, and when to keep Kafka.

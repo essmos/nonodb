@@ -341,8 +341,10 @@ in the writer. See [Asynchronous webhooks](webhooks.md).
 The **Streams** tab manages server-side offsets and consumer groups:
 
 - **Consumer groups** — committed offset, stream head, lag, in-flight events,
-  dead letters, attempt budget, and a truncation marker; reset a group to
-  `earliest`/`latest`, or delete it;
+  dead letters in both units (`ev / rng`), attempt budget, and a truncation
+  marker; reset a group to `earliest`/`latest`, or delete it. Resetting,
+  deleting, and pruning ask for confirmation because they move or drop
+  unprocessed events;
 - **Streams** — stream name, collection, head offset, group count, retention
   settings, and **Prune now** for one retention pass;
 - **Dead letters** — list a collection's dead-lettered batches, retry one (the

@@ -119,7 +119,7 @@ async fn run_once(databases: &Databases, config: Config) {
             loop {
                 match prune(&runtime.write_tx, &def.name, config.batch).await {
                     Ok(deleted) if deleted > 0 => {
-                        metrics::add(&metrics::STREAM_TRUNCATED, deleted as u64);
+                        metrics::add(&metrics::STREAM_PRUNED_EVENTS, deleted as u64);
                         tracing::info!(
                             database = name,
                             stream = def.name,

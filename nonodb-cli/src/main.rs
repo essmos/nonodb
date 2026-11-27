@@ -1087,8 +1087,16 @@ fn streams_cmd(args: &[String]) -> Result<(), String> {
                 return Ok(());
             }
             println!(
-                "{:<20} {:<20} {:>12} {:>12} {:>8} {:>9} {:>6}",
-                "STREAM", "GROUP", "COMMITTED", "HEAD", "LAG", "INFLIGHT", "DEAD"
+                "{:<20} {:<20} {:>12} {:>12} {:>8} {:>9} {:>6} {:>7} {:>6}",
+                "STREAM",
+                "GROUP",
+                "COMMITTED",
+                "HEAD",
+                "LAG",
+                "INFLIGHT",
+                "DEAD",
+                "REDELIV",
+                "TRUNC"
             );
             for stream in streams {
                 let name = stream
@@ -1114,7 +1122,7 @@ fn streams_cmd(args: &[String]) -> Result<(), String> {
                         .map(|value| format!(" truncated_below={value}"))
                         .unwrap_or_default();
                     println!(
-                        "{:<20} {:<20} {:>12} {:>12} {:>8} {:>9} {:>6}{}",
+                        "{:<20} {:<20} {:>12} {:>12} {:>8} {:>9} {:>6} {:>7} {:>6}{}",
                         name,
                         group.get("group").and_then(Value::as_str).unwrap_or("?"),
                         group
@@ -1125,6 +1133,14 @@ fn streams_cmd(args: &[String]) -> Result<(), String> {
                         group.get("lag").and_then(Value::as_u64).unwrap_or(0),
                         group.get("inflight").and_then(Value::as_u64).unwrap_or(0),
                         group.get("dead").and_then(Value::as_u64).unwrap_or(0),
+                        group
+                            .get("redeliveries")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0),
+                        group
+                            .get("truncations")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0),
                         truncated,
                     );
                 }

@@ -2497,16 +2497,27 @@ impl Store {
         // empty window (everything pruned) still truncates a group that has
         // offsets left to read.
         let head = self.stream_head_in(wtxn, stream)?;
+<<<<<<< HEAD
         if next_seq <= head {
             let oldest = self.stream_oldest_seq_in(wtxn, stream)?;
             let crossed = match oldest {
                 Some(oldest) => oldest > next_seq,
+=======
+        if group_row.next_seq < head {
+            let oldest = self.stream_oldest_seq_in(wtxn, stream)?;
+            let crossed = match oldest {
+                Some(oldest) => oldest > group_row.next_seq.saturating_add(1),
+>>>>>>> 761ae58 (fix(streams): reject partial commits, truncate empty windows, per-group counters)
                 // No events survive, so nothing can be delivered below the head.
                 None => true,
             };
             if crossed {
                 let below = oldest.unwrap_or_else(|| head.saturating_add(1));
                 group_row.truncated_below = Some(below);
+<<<<<<< HEAD
+=======
+                group_row.truncations = group_row.truncations.saturating_add(1);
+>>>>>>> 761ae58 (fix(streams): reject partial commits, truncate empty windows, per-group counters)
                 group_row.touch();
                 self.put_stream_group_in(wtxn, &group_row)?;
                 return Err(Error::StreamTruncated(format!(
@@ -2527,6 +2538,10 @@ impl Store {
             })
             .cloned();
         if let Some(mut lease) = pending {
+<<<<<<< HEAD
+=======
+            group_row.redeliveries = group_row.redeliveries.saturating_add(1);
+>>>>>>> 761ae58 (fix(streams): reject partial commits, truncate empty windows, per-group counters)
             group_row.touch();
             self.put_stream_group_in(wtxn, &group_row)?;
             lease.attempts += 1;
@@ -2585,9 +2600,11 @@ impl Store {
                 lease.from_seq, lease.to_seq
             )));
         }
-        if seq < lease.from_seq || seq > lease.to_seq {
+        // A batch is acknowledged as a whole: a partial ack inside the range
+        // would mark the whole range done and silently drop the rest.
+        if seq != lease.to_seq {
             return Err(Error::CommitOutOfOrder(format!(
-                "offset {seq} is outside the leased range {}..={}",
+                "offset {seq} is not the end of the leased range {}..={}",
                 lease.from_seq, lease.to_seq
             )));
         }
@@ -2901,14 +2918,17 @@ impl Store {
         if deleted.is_empty() {
             return Ok(deleted);
         }
-        let Some(remaining) = self.stream_oldest_seq_in(wtxn, &def.coll)? else {
-            return Ok(deleted);
-        };
+        // When retention removed the entire window there is no surviving offset
+        // to report; the group must resume after the current head instead.
+        let remaining = self.stream_oldest_seq_in(wtxn, &def.coll)?;
+        let head = self.stream_head_in(wtxn, &def.name)?;
+        let below = remaining.unwrap_or(head.saturating_add(1));
         for mut group in self.stream_groups(Some(&def.name))? {
-            if group.next_seq.saturating_add(1) < remaining
-                && group.truncated_below != Some(remaining)
-            {
-                group.truncated_below = Some(remaining);
+            // The group's next event (`next_seq + 1`) was dropped when it is at
+            // or below the highest dropped offset.
+            if group.next_seq < limit && group.truncated_below != Some(below) {
+                group.truncated_below = Some(below);
+                group.truncations = group.truncations.saturating_add(1);
                 group.touch();
                 self.put_stream_group_in(wtxn, &group)?;
             }

@@ -14,6 +14,8 @@ type GroupInfo = {
   lag: number;
   inflight: number;
   dead: number;
+  redeliveries?: number;
+  truncations?: number;
   max_attempts: number;
   truncated_below?: number | null;
   updated_at?: number;
@@ -266,6 +268,8 @@ export default function StreamsPage({ connection }: { connection: Connection }) 
                   <th>Lag</th>
                   <th>In-flight</th>
                   <th>Dead</th>
+                  <th>Redeliv</th>
+                  <th>Trunc</th>
                   <th>Attempts</th>
                   <th />
                 </tr>
@@ -289,6 +293,8 @@ export default function StreamsPage({ connection }: { connection: Connection }) 
                     <td>{group.lag}</td>
                     <td>{group.inflight}</td>
                     <td>{group.dead}</td>
+                    <td>{group.redeliveries ?? 0}</td>
+                    <td>{group.truncations ?? 0}</td>
                     <td>
                       {group.max_attempts}
                       {group.inflight > 0 ? ' · leased' : ''}
