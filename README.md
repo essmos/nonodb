@@ -11,10 +11,30 @@
 [![CI](https://github.com/essmos/nonodb/actions/workflows/ci.yml/badge.svg)](https://github.com/essmos/nonodb/actions/workflows/ci.yml)
 [![Release](https://github.com/essmos/nonodb/actions/workflows/release.yml/badge.svg)](https://github.com/essmos/nonodb/actions/workflows/release.yml)
 
-**The all-in-one JSON document database for small VMs and edge boxes.**
+**One process for six everyday database roles.**
 
-**Idle daemon: ~5 MB RAM** with 1M documents and three indexes; crash-safe
+NonoDB is the all-in-one JSON document database for small VMs and edge boxes:
+documents, SQL, full-text search, vector search, graph traversal, and
+time-series in one Rust daemon. One backup, one auth model, no JVM and no
+sidecar database servers.
+
+**Verified RAM:** ~5 MB idle with 1M documents and three indexes; ~26 MiB
+process RSS in the 206M-row benchmark (OS page cache excluded). Crash-safe
 LMDB storage and production features in one binary.
+
+### What it replaces
+
+| Everyday role | Usually a separate tool | Coverage in NonoDB | Not a drop-in replacement for |
+|---|---|---|---|
+| Documents | MongoDB Community | CRUD, indexes, aggregation, TTL, watch, MongoDB wire subset | the full MongoDB ecosystem and every wire-protocol feature |
+| SQL | PostgreSQL | `SELECT`, `INSERT`, `UPDATE`, `DELETE` over one collection | joins, cross-collection transactions, and PostgreSQL extensions |
+| Search | Elasticsearch / OpenSearch | BM25 full-text, fuzzy, filters | cluster features, every analyzer, and search-time aggregation |
+| Vectors | Qdrant / Milvus | exact/ANN vector search, metrics, hybrid ranking | advanced quantization and large-scale sharding |
+| Graph | Neo4j Community | adjacency traversal, shortest paths, analytics, read-only Cypher | write Cypher, APOC, and the full Neo4j ecosystem |
+| Time-series | TimescaleDB / InfluxDB | time-series profile, columnar buckets, retention, rollups | the maturity and scale of dedicated time-series databases |
+
+Coverage means everyday workloads, not full API parity. One process replaces
+six separate operational surfaces, not six complete product ecosystems.
 
 One Rust daemon for small VMs and edge boxes: owns the LMDB files, speaks
 HTTP/JSON, exposes an optional MongoDB-compatible endpoint for official drivers,
@@ -842,6 +862,7 @@ See [Benchmarks](docs/benchmarks.md) for methodology and full tables.
 | Index-only sort at 1M docs | 1–2 ms |
 | Full sort at 1M docs (no index) | 250–420 ms |
 | Idle daemon RSS at 1M docs, 3 indexes | ~5 MB |
+| Process RSS in the 206M-row benchmark | ~26 MiB |
 | Live backup of 8M docs + 1M text docs | 5.1 GB in ~10 s |
 
 ## Sponsors
