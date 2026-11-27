@@ -1335,6 +1335,17 @@ impl<'e> Collection<'e> {
             let settings = self.timeseries_settings_in(txn)?.unwrap_or_default();
             return crate::timeseries::all_docs(txn, self.env, &self.name, &settings);
         }
+        if self.profile.is_columnar() {
+            let mut out = Vec::new();
+            for doc in crate::columnar::all_docs(txn, self.env, &self.name)? {
+                let id = doc
+                    .get("_id")
+                    .and_then(id::key_from_value)
+                    .ok_or(Error::InvalidId)?;
+                out.push((id, doc));
+            }
+            return Ok(out);
+        }
         let mut out = Vec::new();
         for item in self.db.iter(txn)? {
             let (id, bytes) = item?;
@@ -1448,6 +1459,10 @@ impl<'e> Collection<'e> {
             self.backfill_timeseries_indexes_txn(wtxn, &mut defs)?;
             return Ok(());
         }
+        if self.profile.is_columnar() {
+            self.backfill_columnar_indexes_txn(wtxn, &mut defs)?;
+            return Ok(());
+        }
         let total_docs = self.db.stat(wtxn)?.entries as u64;
         let index_dbs: Vec<_> = defs
             .iter()
@@ -1517,6 +1532,77 @@ impl<'e> Collection<'e> {
             }
             def.multikey_all_docs = docs_per_index[slot] == total_docs;
             let key = index::def_key(&self.name, &def.name());
+            self.meta.put(
+                &mut *wtxn,
+                key.as_bytes(),
+                serde_json::to_vec(def)?.as_slice(),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Backfills secondary indexes from decoded columnar documents.
+    fn backfill_columnar_indexes_txn(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        defs: &mut [(String, IndexDef)],
+    ) -> Result<()> {
+        let docs = crate::columnar::all_docs(&*wtxn, self.env, &self.name)?;
+        let total = docs.len() as u64;
+        let index_dbs: Vec<_> = defs
+            .iter()
+            .map(|(_key, def)| self.index_db_in(wtxn, def))
+            .collect::<Result<_>>()?;
+        for db in &index_dbs {
+            db.clear(&mut *wtxn)?;
+        }
+        let mut docs_per_index = vec![0u64; defs.len()];
+        let mut multikey_fields: Vec<Vec<String>> = vec![Vec::new(); defs.len()];
+        for doc in docs {
+            let id = doc
+                .get("_id")
+                .and_then(id::key_from_value)
+                .ok_or(Error::InvalidId)?;
+            for (slot, ((_key, def), db)) in defs.iter().zip(index_dbs.iter()).enumerate() {
+                let keys = index::encode_index_keys(def, &doc)?;
+                if keys.keys.is_empty() {
+                    continue;
+                }
+                docs_per_index[slot] = docs_per_index[slot].saturating_add(1);
+                for field in &keys.multikey_fields {
+                    if !multikey_fields[slot].contains(field) {
+                        multikey_fields[slot].push(field.clone());
+                    }
+                }
+                let value = index::encode_index_value(def, &doc, &id);
+                for vb in keys.keys {
+                    if def.unique {
+                        let range = index::exact_prefix(&vb);
+                        let bounds = (as_bound(&range.0), as_bound(&range.1));
+                        for item in db.range(&*wtxn, &bounds)? {
+                            let (_existing_key, existing_value) = item?;
+                            if let Some((existing_id, _)) =
+                                index::decode_index_value(existing_value)
+                            {
+                                if existing_id != id {
+                                    return Err(Error::DuplicateKey(id.clone()));
+                                }
+                            }
+                        }
+                    }
+                    let mut key = vb;
+                    key.extend_from_slice(id.as_bytes());
+                    db.put(&mut *wtxn, key.as_slice(), value.as_slice())?;
+                }
+            }
+        }
+        for (slot, (key, def)) in defs.iter_mut().enumerate() {
+            for field in &multikey_fields[slot] {
+                if !def.multikey_fields.contains(field) {
+                    def.multikey_fields.push(field.clone());
+                }
+            }
+            def.multikey_all_docs = docs_per_index[slot] == total;
             self.meta.put(
                 &mut *wtxn,
                 key.as_bytes(),
@@ -1768,6 +1854,10 @@ impl<'e> Collection<'e> {
         idx_db.clear(&mut *wtxn)?;
         if self.profile.is_timeseries() {
             self.backfill_timeseries_indexes_txn(wtxn, &mut [(key, def)])?;
+            return Ok(());
+        }
+        if self.profile.is_columnar() {
+            self.backfill_columnar_indexes_txn(wtxn, &mut [(key, def)])?;
             return Ok(());
         }
 
@@ -10287,6 +10377,39 @@ impl<'e> Collection<'e> {
             crate::query::validate::validate_filter(&query.filter)?;
             let deadline = find_deadline(query);
             check_find_deadline(deadline)?;
+            if let Some((field, near)) = geo::extract_near(&query.filter) {
+                if !query.sort.is_empty() {
+                    return Err(Error::Query(
+                        "$near cannot be combined with an explicit sort".into(),
+                    ));
+                }
+                let limit = query.limit.unwrap_or(usize::MAX);
+                if limit == 0 {
+                    return Ok(Vec::new());
+                }
+                let strict_ttl = self.ttl_filter_active(rtxn)?;
+                let now = ttl::now_ms();
+                let mut hits = Vec::new();
+                for doc in crate::columnar::all_docs(rtxn, self.env, &self.name)? {
+                    check_find_deadline(deadline)?;
+                    if !crate::query::matcher::matches(&doc, &query.filter) {
+                        continue;
+                    }
+                    if strict_ttl && !self.ttl_doc_visible(rtxn, &doc, now)? {
+                        continue;
+                    }
+                    if let Some(distance) = geo::field_distance(&doc, &field, near.center) {
+                        hits.push((distance, doc));
+                    }
+                }
+                hits.sort_by(|a, b| a.0.total_cmp(&b.0));
+                return Ok(hits
+                    .into_iter()
+                    .skip(query.skip)
+                    .take(limit)
+                    .map(|(_, doc)| project_document(&doc, query.projection.as_ref()))
+                    .collect());
+            }
             let out = if self.ttl_filter_active(rtxn)? {
                 let now = ttl::now_ms();
                 crate::columnar::find_visible(rtxn, self.env, &self.name, query, &mut |doc| {
@@ -10843,13 +10966,7 @@ impl<'e> Collection<'e> {
         let id_only = projection_is_id_only(projection);
         stats.unique_keys = unique_values.len();
 
-        if self.profile.is_columnar() {
-            if by.len() != 1 || by[0] != "_id" {
-                return Err(Error::Query(format!(
-                    "lookup on `{}` requires a unique single-field or compound index",
-                    by.join("+")
-                )));
-            }
+        if self.profile.is_columnar() && by.len() == 1 && by[0] == "_id" {
             stats.selected_index = "_id_".to_string();
             stats.index_fields = by.to_vec();
             stats.primary = true;
@@ -10978,6 +11095,100 @@ impl<'e> Collection<'e> {
         stats.selected_index = def.name();
         stats.index_fields = def.effective_fields();
         stats.index_include = def.include.clone();
+
+        if self.profile.is_columnar() {
+            for &value in &unique_values {
+                let parts = if by.len() == 1 {
+                    std::slice::from_ref(value)
+                } else {
+                    let Some(parts) = value.as_array() else {
+                        push_lookup_result(
+                            &mut unique_out,
+                            &mut unique_sizes,
+                            &mut unique_bytes,
+                            None,
+                            4,
+                        )?;
+                        continue;
+                    };
+                    if parts.len() != by.len() {
+                        push_lookup_result(
+                            &mut unique_out,
+                            &mut unique_sizes,
+                            &mut unique_bytes,
+                            None,
+                            4,
+                        )?;
+                        continue;
+                    }
+                    parts.as_slice()
+                };
+                let Some((lower, upper)) = lookup_bounds(parts, &def) else {
+                    push_lookup_result(
+                        &mut unique_out,
+                        &mut unique_sizes,
+                        &mut unique_bytes,
+                        None,
+                        4,
+                    )?;
+                    continue;
+                };
+                let range = (as_bound(&lower), as_bound(&upper));
+                let mut found = None;
+                for item in db.range(rtxn, &range)? {
+                    stats.index_entries_read = stats.index_entries_read.saturating_add(1);
+                    let (_key, raw) = item?;
+                    let raw_size = raw.len();
+                    let Some((id, _inc)) = index::decode_index_value(raw) else {
+                        continue;
+                    };
+                    if strict_ttl && self.ttl_expired_at(rtxn, &id, now)? {
+                        continue;
+                    }
+                    let Some(doc) = crate::columnar::find_by_id(rtxn, self.env, &self.name, &id)?
+                    else {
+                        continue;
+                    };
+                    let (doc, size) = if id_only {
+                        stats.bytes_read = stats.bytes_read.saturating_add(raw_size as u64);
+                        (serde_json::json!({"_id": id}), raw_size)
+                    } else {
+                        stats.documents_read = stats.documents_read.saturating_add(1);
+                        let bytes = serde_json::to_vec(&doc)?;
+                        stats.bytes_read = stats.bytes_read.saturating_add(bytes.len() as u64);
+                        let size = bytes.len();
+                        let doc = match projection {
+                            Some(projection) => project(&doc, projection, None),
+                            None => doc,
+                        };
+                        (doc, size)
+                    };
+                    found = Some((doc, size));
+                    break;
+                }
+                let (doc, size) = match found {
+                    Some((doc, size)) => (Some(doc), size),
+                    None => (None, 4),
+                };
+                push_lookup_result(
+                    &mut unique_out,
+                    &mut unique_sizes,
+                    &mut unique_bytes,
+                    doc,
+                    size,
+                )?;
+            }
+            stats.covering = id_only;
+            finish_lookup_stats(
+                values.len(),
+                &unique_out,
+                &unique_sizes,
+                &positions,
+                &mut stats,
+            );
+            let out = finish_lookup(values.len(), unique_out, unique_sizes, &positions)?;
+            return Ok((out, stats));
+        }
 
         let covering_projection = projection.cloned();
         for &value in &unique_values {

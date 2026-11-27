@@ -2604,6 +2604,11 @@ mod tests {
             )
             .unwrap();
         }
+        store
+            .collection("target")
+            .unwrap()
+            .create_index("k", true)
+            .unwrap();
         execute_commit(
             &store,
             &WriteReq::Insert {
