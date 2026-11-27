@@ -381,6 +381,17 @@ def main() -> int:
         assert "nonodb_stream_lag_events" in metrics, metrics[:400]
         assert 'group="workers"' in metrics, "stream metrics must be labelled"
         assert "nonodb_stream_claims_total" in metrics
+        assert "nonodb_stream_head_seq" in metrics
+        # Counters must actually move, not just be present in the exposition.
+        for prefix, expected in (
+            ("nonodb_stream_claims_total ", 1),
+            ("nonodb_stream_commit_failures_total ", 1),
+        ):
+            line = next(
+                (row for row in metrics.splitlines() if row.startswith(prefix)), None
+            )
+            assert line is not None, f"missing {prefix}"
+            assert int(line.split()[-1]) >= expected, line
 
         # Restart: the group resumes from the committed offset.
         stop(proc)

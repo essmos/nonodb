@@ -298,7 +298,7 @@ rows, dead letters); they do not scan documents.
 | `nonodb_stream_claims_total` | Batches claimed by a member |
 | `nonodb_stream_redeliveries_total` | Batches delivered more than once |
 | `nonodb_stream_nacks_total` | Batches released with nack |
-| `nonodb_stream_dead_letters_total` | Events dead-lettered after `max_attempts` |
+| `nonodb_stream_dead_letters_total` | Events dead-lettered when a nack exhausts `max_attempts` (expiry-driven dead letters show up in the `nonodb_stream_dead_events` gauge) |
 | `nonodb_stream_truncated_total` | Events dropped by offset retention |
 
 How to read them:
@@ -334,6 +334,8 @@ At minimum, alert on:
 12. `nonodb_tls_revocation_unavailable_total` increasing with fail-closed mTLS
 13. `nonodb_stream_lag_events > <budget>` for more than one scrape interval
 14. `nonodb_stream_dead_events` increasing on a group with `max_attempts` set
+    (the authoritative dead-volume signal; the counter only tracks nack-driven
+    dead letters)
 15. `nonodb_stream_inflight_events` flat at a non-zero value while lag stays flat
 
 `GET /metrics` remains available for existing JSON consumers and includes the

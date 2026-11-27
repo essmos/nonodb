@@ -37,6 +37,7 @@ pub static STREAM_NACKS: AtomicU64 = AtomicU64::new(0);
 pub static STREAM_DEAD_LETTERS: AtomicU64 = AtomicU64::new(0);
 pub static STREAM_TRUNCATED: AtomicU64 = AtomicU64::new(0);
 pub static STREAM_LEASE_RECOVERIES: AtomicU64 = AtomicU64::new(0);
+pub static STREAM_COMMIT_FAILURES: AtomicU64 = AtomicU64::new(0);
 /// SQL statement counters and total execution time.
 pub static SQL_SELECT: AtomicU64 = AtomicU64::new(0);
 pub static SQL_INSERT: AtomicU64 = AtomicU64::new(0);
@@ -747,6 +748,12 @@ pub fn snapshot() -> Value {
         "watch_events_total": WATCH_EVENTS.load(Relaxed),
         "watch_timeouts_total": WATCH_TIMEOUTS.load(Relaxed),
         "watch_truncated_total": WATCH_TRUNCATED.load(Relaxed),
+        "stream_claims_total": STREAM_CLAIMS.load(Relaxed),
+        "stream_redeliveries_total": STREAM_REDELIVERIES.load(Relaxed),
+        "stream_nacks_total": STREAM_NACKS.load(Relaxed),
+        "stream_dead_letters_total": STREAM_DEAD_LETTERS.load(Relaxed),
+        "stream_truncated_total": STREAM_TRUNCATED.load(Relaxed),
+        "stream_commit_failures_total": STREAM_COMMIT_FAILURES.load(Relaxed),
         "watch_heartbeats_total": WATCH_HEARTBEATS.load(Relaxed),
         "watch_threshold_emitted_total": WATCH_THRESHOLD_EMITTED.load(Relaxed),
         "watch_threshold_suppressed_total": WATCH_THRESHOLD_SUPPRESSED.load(Relaxed),
@@ -1074,6 +1081,28 @@ pub type StreamMetricRow = (String, String, String, u64, u64, u64, u64, u64);
 pub fn append_stream_metrics(out: &mut String, rows: &[StreamMetricRow]) {
     prom_header(
         out,
+        "nonodb_stream_head_seq",
+        "gauge",
+        "Highest offset written to a stream.",
+    );
+    let mut seen_streams: Vec<(&str, &str, u64)> = Vec::new();
+    for (database, stream, _group, _committed, head, _lag, _inflight, _dead) in rows {
+        if seen_streams
+            .iter()
+            .any(|(db, name, _)| db == database && name == stream)
+        {
+            continue;
+        }
+        seen_streams.push((database, stream, *head));
+        prom_sample(
+            out,
+            "nonodb_stream_head_seq",
+            &[("database", database.as_str()), ("stream", stream.as_str())],
+            &json!(head),
+        );
+    }
+    prom_header(
+        out,
         "nonodb_stream_committed_seq",
         "gauge",
         "Committed offset of a consumer group.",
@@ -1241,6 +1270,9 @@ pub fn prometheus() -> String {
             "nonodb_stream_lease_recoveries_total",
             "stream_lease_recoveries_total",
             "Expired stream leases requeued or dead-lettered by the janitor.",
+            "nonodb_stream_commit_failures_total",
+            "stream_commit_failures_total",
+            "Stream commits rejected (stale lease or out-of-order offset).",
         ),
         (
             "nonodb_watch_heartbeats_total",

@@ -1320,7 +1320,13 @@ fn execute(
             lease_id,
         } => {
             let lease_id = lease_id.clone().unwrap_or_default();
-            let lease = store.ack_stream_lease_in(wtxn, coll, group, &lease_id, *seq)?;
+            let lease = match store.ack_stream_lease_in(wtxn, coll, group, &lease_id, *seq) {
+                Ok(lease) => lease,
+                Err(error) => {
+                    crate::metrics::inc(&crate::metrics::STREAM_COMMIT_FAILURES);
+                    return Err(error.into());
+                }
+            };
             let out = store
                 .stream_group_in_rw(wtxn, coll, group)?
                 .ok_or_else(|| nonodb_core::Error::Query("stream group vanished".into()))?;
