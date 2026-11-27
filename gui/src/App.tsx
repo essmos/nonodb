@@ -120,6 +120,8 @@ type IndexInfo = {
   field: string;
   fields: string[];
   unique: boolean;
+  sparse?: boolean;
+  partial_filter_expression?: unknown;
   include?: string[];
   format?: string;
   geo?: boolean;
@@ -3121,8 +3123,11 @@ function CollectionView({
   const [indexKind, setIndexKind] = useState<'secondary' | 'text' | 'fuzzy' | 'vector'>('secondary');
   const [indexField, setIndexField] = useState('');
   const [indexUnique, setIndexUnique] = useState(false);
+  const [indexSparse, setIndexSparse] = useState(false);
   const [indexInclude, setIndexInclude] = useState('');
   const [indexGeo, setIndexGeo] = useState(false);
+  const [indexDirections, setIndexDirections] = useState('');
+  const [indexPartial, setIndexPartial] = useState('');
   const [vectorDims, setVectorDims] = useState('3');
   const [vectorMetric, setVectorMetric] = useState('cosine');
   const [subscriptions, setSubscriptions] = useState<Array<Record<string, unknown>>>([]);
@@ -3590,18 +3595,53 @@ function CollectionView({
       setError('Text, fuzzy, and vector indexes need exactly one field');
       return;
     }
+    let directions: number[] = [];
+    let partialFilterExpression: Record<string, unknown> | undefined;
+    if (indexKind === 'secondary') {
+      if (indexDirections.trim()) {
+        directions = indexDirections.split(',').map((part) => Number(part.trim()));
+        if (directions.length !== fields.length || directions.some((part) => part !== 1 && part !== -1)) {
+          setError('Directions must contain one 1 or -1 per field');
+          return;
+        }
+      }
+      if (indexPartial.trim()) {
+        try {
+          const parsed = JSON.parse(indexPartial) as unknown;
+          if (parsed === null || Array.isArray(parsed) || typeof parsed !== 'object') {
+            setError('Partial filter must be a JSON object');
+            return;
+          }
+          partialFilterExpression = parsed as Record<string, unknown>;
+        } catch {
+          setError('Partial filter is not valid JSON');
+          return;
+        }
+      }
+    }
     setBusy(true);
     setError('');
     try {
       if (indexKind === 'secondary') {
-        await exec(connection, {
-          op: 'create_index',
-          coll: name,
+        const include = indexInclude.split(',').map((part) => part.trim()).filter(Boolean);
+        const spec = {
           fields,
           unique: indexUnique,
-          include: indexInclude.split(',').map((part) => part.trim()).filter(Boolean),
+          sparse: indexSparse,
+          include,
           geo: indexGeo,
-        });
+          ...(partialFilterExpression ? { partialFilterExpression } : {}),
+          ...(directions.length ? { directions } : {}),
+        };
+        if (directions.length) {
+          await exec(connection, {
+            op: 'create_indexes',
+            coll: name,
+            indexes: [spec],
+          });
+        } else {
+          await exec(connection, { op: 'create_index', coll: name, ...spec });
+        }
       } else if (indexKind === 'text') {
         await exec(connection, { op: 'create_text_index', coll: name, field: fields[0] });
       } else if (indexKind === 'fuzzy') {
@@ -3618,7 +3658,10 @@ function CollectionView({
       setIndexField('');
       setIndexInclude('');
       setIndexUnique(false);
+      setIndexSparse(false);
       setIndexGeo(false);
+      setIndexDirections('');
+      setIndexPartial('');
       setNotice('Index created');
       await load();
     } catch (err) {
@@ -4193,7 +4236,16 @@ function CollectionView({
                   <input value={indexInclude} onChange={(e) => setIndexInclude(e.target.value)} placeholder="fields" />
                 </label>
                 <label className="checkbox"><input type="checkbox" checked={indexUnique} onChange={(e) => setIndexUnique(e.target.checked)} /> unique</label>
+                <label className="checkbox"><input type="checkbox" checked={indexSparse} onChange={(e) => setIndexSparse(e.target.checked)} /> sparse</label>
                 <label className="checkbox"><input type="checkbox" checked={indexGeo} onChange={(e) => setIndexGeo(e.target.checked)} /> geo</label>
+                <label className="compact">
+                  Directions
+                  <input value={indexDirections} onChange={(e) => setIndexDirections(e.target.value)} placeholder="1,-1" />
+                </label>
+                <label className="grow">
+                  Partial filter
+                  <input value={indexPartial} onChange={(e) => setIndexPartial(e.target.value)} placeholder='{"status":"active"}' />
+                </label>
               </>
             )}
             {indexKind === 'vector' && (
@@ -4208,7 +4260,7 @@ function CollectionView({
           <div className="index-list">
             {indexes.map((index) => (
               <div key={`secondary-${index.field}`} className="index-row">
-                <span><strong>{index.field}</strong><span className="badge">secondary</span>{index.unique && <span className="badge">unique</span>}{index.geo && <span className="badge">geo</span>}</span>
+                <span><strong>{index.field}</strong><span className="badge">secondary</span>{index.unique && <span className="badge">unique</span>}{index.sparse && <span className="badge">sparse</span>}{index.partial_filter_expression != null && <span className="badge">partial</span>}{index.geo && <span className="badge">geo</span>}</span>
                 <button className="danger small" onClick={() => void dropIndex(index.field, 'secondary')}>Drop</button>
               </div>
             ))}
