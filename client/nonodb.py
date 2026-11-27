@@ -665,13 +665,15 @@ class NonoDB:
         ttl_seconds: int | None = None,
         ttl_purge_history: bool | None = None,
         timeseries: dict[str, Any] | None = None,
+        columnar: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Creates a collection explicitly. Use `profile="vault"` for encrypted storage.
 
         `ttl_seconds` sets a default document TTL; individual documents can
         override it with a `_ttl` field. For `profile="timeseries"`, pass the
         required `timeField` and optional `metaField`, `granularity`, and
-        `expireAfterSeconds` in `timeseries`.
+        `expireAfterSeconds` in `timeseries`. For `profile="columnar"`, pass
+        optional `bucket_max_docs`, `bucket_max_bytes`, and `compression`.
         """
         req: dict[str, Any] = {
             "op": "create_collection",
@@ -684,7 +686,19 @@ class NonoDB:
             req["ttl_purge_history"] = ttl_purge_history
         if timeseries is not None:
             req["timeseries"] = timeseries
+        if columnar is not None:
+            req["columnar"] = columnar
         return self.exec(req)
+
+    def get_collection_columnar(self, name: str) -> dict[str, Any]:
+        """Returns columnar settings and bucket statistics for a collection."""
+        return self.exec({"op": "get_collection_columnar", "coll": name})
+
+    def set_collection_columnar(self, name: str, settings: dict[str, Any]) -> dict[str, Any]:
+        """Replaces columnar bucket/compression settings."""
+        return self.exec(
+            {"op": "set_collection_columnar", "coll": name, "settings": settings}
+        )
 
     def set_collection_ttl(
         self,

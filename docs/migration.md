@@ -51,6 +51,13 @@ of `--socket`. The target database is created automatically unless
 `--no-create-database` is passed. `--dry-run` discovers collections, counts
 documents, and validates `_id` values without writing.
 
+Pass `--target-profile columnar` to create new target collections with the
+columnar profile. The helper still preserves documents, ids, BSON types,
+indexes, and TTL, and runs the same checksum verification. Optional
+`--columnar-bucket-max-docs`, `--columnar-bucket-max-bytes`, and
+`--columnar-compression` control bucket settings. See
+[Columnar collections](columnar.md).
+
 What the helper does:
 
 - discovers collections and common scalar, compound, unique, geo, and
@@ -76,6 +83,10 @@ Useful options:
 | `--drop` | Drop a non-empty target collection before copying |
 | `--dry-run` | Discover and validate without writing |
 | `--report PATH` | Write the JSON migration report |
+| `--target-profile standard\|columnar` | Storage profile for new target collections |
+| `--columnar-bucket-max-docs N` | Columnar bucket row limit (default 512) |
+| `--columnar-bucket-max-bytes N` | Columnar bucket byte limit (default 524288) |
+| `--columnar-compression fast\|balanced\|max` | Columnar codec (default balanced) |
 
 The source must be stopped or at a consistent snapshot. This is not a live CDC
 tool: writes made during the copy are not replayed. Unsupported `_id` types and

@@ -635,6 +635,41 @@ impl Client {
         }))
     }
 
+    /// Create a columnar collection with explicit bucket/compression settings.
+    pub fn create_collection_with_columnar(
+        &self,
+        name: impl Into<String>,
+        columnar: Value,
+    ) -> Result<Value> {
+        self.exec(json!({
+            "op": "create_collection",
+            "coll": name.into(),
+            "profile": "columnar",
+            "columnar": columnar,
+        }))
+    }
+
+    /// Read columnar settings and bucket statistics.
+    pub fn get_collection_columnar(&self, name: impl Into<String>) -> Result<Value> {
+        self.exec(json!({
+            "op": "get_collection_columnar",
+            "coll": name.into(),
+        }))
+    }
+
+    /// Replace columnar bucket/compression settings.
+    pub fn set_collection_columnar(
+        &self,
+        name: impl Into<String>,
+        settings: Value,
+    ) -> Result<Value> {
+        self.exec(json!({
+            "op": "set_collection_columnar",
+            "coll": name.into(),
+            "settings": settings,
+        }))
+    }
+
     /// Set or clear a collection's default document TTL.
     pub fn set_collection_ttl(
         &self,

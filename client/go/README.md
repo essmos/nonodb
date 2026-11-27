@@ -67,6 +67,21 @@ current, err := client.CollectionTTL(ctx, "sessions")
 Documents use the reserved `_ttl` field for a per-document override. See
 [Document TTL](../../docs/ttl.md).
 
+## Columnar collections
+
+```go
+err := client.CreateCollectionWithColumnar(ctx, "events", map[string]any{
+    "bucket_max_docs": 512,
+    "compression": "balanced",
+}, nil)
+settings, err := client.GetCollectionColumnar(ctx, "events")
+err = client.SetCollectionColumnar(ctx, "events", map[string]any{
+    "compression": "max",
+})
+```
+
+See [Columnar collections](../../docs/columnar.md).
+
 ## Aggregation
 
 ```go

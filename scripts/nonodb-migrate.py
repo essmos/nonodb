@@ -236,11 +236,14 @@ def copy_collection(
     batch_size: int,
     max_bytes: int,
     drop: bool,
+    profile: str,
+    columnar: dict[str, Any] | None,
 ) -> None:
     target_names = set(target_db.collections())
     if plan.name in target_names:
         if drop:
             target_db.exec({"op": "drop_collection", "coll": plan.name})
+            target_names.discard(plan.name)
         else:
             existing = target_db.collection(plan.name).count()
             if existing:
@@ -249,11 +252,28 @@ def copy_collection(
                     "use --drop or an empty target"
                 )
 
-    if plan.ttl_seconds is not None and plan.ttl_field is None:
-        if plan.name in target_db.collections():
-            target_db.set_collection_ttl(plan.name, plan.ttl_seconds)
-        else:
+    created = False
+    if plan.name not in target_names:
+        if profile == "columnar":
+            target_db.create_collection(
+                plan.name,
+                profile="columnar",
+                ttl_seconds=(
+                    plan.ttl_seconds if plan.ttl_field is None else None
+                ),
+                columnar=columnar or {},
+            )
+            created = True
+        elif plan.ttl_seconds is not None and plan.ttl_field is None:
             target_db.create_collection(plan.name, ttl_seconds=plan.ttl_seconds)
+            created = True
+
+    if (
+        not created
+        and plan.ttl_seconds is not None
+        and plan.ttl_field is None
+    ):
+        target_db.set_collection_ttl(plan.name, plan.ttl_seconds)
 
     target = target_db.collection(plan.name)
     source_collection = source[plan.name]
@@ -367,6 +387,30 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--exclude", action="append", default=[], help="skip these collections (repeatable)"
     )
+    parser.add_argument(
+        "--target-profile",
+        choices=["standard", "columnar"],
+        default="standard",
+        help="storage profile for newly created target collections",
+    )
+    parser.add_argument(
+        "--columnar-bucket-max-docs",
+        type=int,
+        default=512,
+        help="columnar bucket row limit (only with --target-profile columnar)",
+    )
+    parser.add_argument(
+        "--columnar-bucket-max-bytes",
+        type=int,
+        default=524288,
+        help="columnar bucket byte limit (only with --target-profile columnar)",
+    )
+    parser.add_argument(
+        "--columnar-compression",
+        choices=["fast", "balanced", "max"],
+        default="balanced",
+        help="columnar compression codec",
+    )
     parser.add_argument("--batch-size", type=int, default=500)
     parser.add_argument("--max-bytes", type=int, default=3_000_000)
     parser.add_argument(
@@ -387,6 +431,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.max_bytes <= 0:
         print("--max-bytes must be positive", file=sys.stderr)
         return 2
+    if args.columnar_bucket_max_docs <= 0 or args.columnar_bucket_max_bytes <= 0:
+        print("columnar bucket limits must be positive", file=sys.stderr)
+        return 2
 
     include = set(args.include)
     exclude = set(args.exclude)
@@ -402,7 +449,11 @@ def main(argv: list[str] | None = None) -> int:
             "database": args.source_db,
             "uri": redact_uri(args.mongo_uri),
         },
-        "target": {"database": args.database, "dry_run": args.dry_run},
+        "target": {
+            "database": args.database,
+            "profile": args.target_profile,
+            "dry_run": args.dry_run,
+        },
         "collections": [],
         "ok": False,
     }
@@ -457,6 +508,16 @@ def main(argv: list[str] | None = None) -> int:
                     batch_size=args.batch_size,
                     max_bytes=args.max_bytes,
                     drop=args.drop,
+                    profile=args.target_profile,
+                    columnar=(
+                        {
+                            "bucket_max_docs": args.columnar_bucket_max_docs,
+                            "bucket_max_bytes": args.columnar_bucket_max_bytes,
+                            "compression": args.columnar_compression,
+                        }
+                        if args.target_profile == "columnar"
+                        else None
+                    ),
                 )
                 print(
                     f"  copied {plan.count} documents, {plan.bytes} bytes, "

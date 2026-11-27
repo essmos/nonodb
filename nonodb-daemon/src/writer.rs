@@ -1034,6 +1034,7 @@ fn execute(
             ttl_seconds,
             ttl_purge_history,
             timeseries,
+            columnar,
         } => {
             let c = store.create_collection_with_ttl_and_purge_in(
                 wtxn,
@@ -1045,6 +1046,9 @@ fn execute(
             if let Some(settings) = timeseries {
                 c.set_timeseries_settings_in(wtxn, settings)?;
             }
+            if let Some(settings) = columnar {
+                c.set_columnar_settings_in(wtxn, settings)?;
+            }
             replication.capture_op(ReplicationOp::CollectionCreate {
                 name: coll.clone(),
                 profile: profile.as_str().to_string(),
@@ -1052,6 +1056,11 @@ fn execute(
                 ttl_field: None,
                 ttl_purge_history: *ttl_purge_history,
                 timeseries: timeseries
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()
+                    .map_err(nonodb_core::Error::from)?,
+                columnar: columnar
                     .as_ref()
                     .map(serde_json::to_string)
                     .transpose()
@@ -1085,6 +1094,25 @@ fn execute(
                 "coll": coll,
                 "ttl_seconds": ttl_seconds,
                 "purge_history": purge_history,
+            }))
+        }
+        WriteReq::SetCollectionColumnar { coll, settings } => {
+            let c = write_collection(store, wtxn, coll, None)?;
+            if !c.profile().is_columnar() {
+                return Err(nonodb_core::Error::Query(format!(
+                    "collection `{coll}` is not a columnar collection"
+                ))
+                .into());
+            }
+            settings.validate()?;
+            c.set_columnar_settings_in(wtxn, settings)?;
+            replication.capture_op(ReplicationOp::ColumnarSettings {
+                coll: coll.clone(),
+                settings: settings.clone(),
+            });
+            Ok(json!({
+                "coll": coll,
+                "columnar": settings,
             }))
         }
         WriteReq::SetCollectionTimeSeries { coll, settings } => {
@@ -2270,6 +2298,7 @@ mod tests {
                 ttl_seconds: None,
                 ttl_purge_history: None,
                 timeseries: None,
+                columnar: Some(nonodb_core::columnar::Settings::default()),
             },
         )
         .unwrap();
@@ -2368,6 +2397,7 @@ mod tests {
                 ttl_seconds: None,
                 ttl_purge_history: None,
                 timeseries: Some(settings),
+                columnar: None,
             },
         )
         .unwrap();
@@ -2519,6 +2549,7 @@ mod tests {
                 ttl_seconds: None,
                 ttl_purge_history: None,
                 timeseries: Some(initial),
+                columnar: None,
             },
         )
         .unwrap();
@@ -2596,6 +2627,119 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.message.contains("timeField"));
+    }
+
+    #[test]
+    fn set_collection_columnar_validates_and_replicates() {
+        let (_dir, store) = setup();
+        execute_commit(
+            &store,
+            &WriteReq::CreateCollection {
+                coll: "events".into(),
+                profile: CollectionProfile::Columnar,
+                ttl_seconds: None,
+                ttl_purge_history: None,
+                timeseries: None,
+                columnar: Some(nonodb_core::columnar::Settings {
+                    bucket_max_docs: 128,
+                    ..nonodb_core::columnar::Settings::default()
+                }),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            store
+                .columnar_settings("events")
+                .unwrap()
+                .unwrap()
+                .bucket_max_docs,
+            128
+        );
+
+        let mut wtxn = store.write_txn().unwrap();
+        let mut replication = ReplicationContext {
+            origin: Some("test".into()),
+            changes: Vec::new(),
+            ops: Vec::new(),
+        };
+        let out = execute(
+            &store,
+            &mut wtxn,
+            &WriteReq::SetCollectionColumnar {
+                coll: "events".into(),
+                settings: nonodb_core::columnar::Settings {
+                    bucket_max_docs: 64,
+                    bucket_max_bytes: 256 * 1024,
+                    ..nonodb_core::columnar::Settings::default()
+                },
+            },
+            &mut replication,
+        )
+        .unwrap();
+        wtxn.commit().unwrap();
+        assert_eq!(out["columnar"]["bucket_max_docs"], json!(64));
+        assert!(replication.ops.iter().any(|op| matches!(
+            op,
+            nonodb_core::replication::ReplicationOp::ColumnarSettings { .. }
+        )));
+        let stored = store.columnar_settings("events").unwrap().unwrap();
+        assert_eq!(stored.bucket_max_docs, 64);
+        assert_eq!(stored.bucket_max_bytes, 256 * 1024);
+
+        execute_commit(
+            &store,
+            &WriteReq::Insert {
+                coll: "events".into(),
+                doc: json!({"k": 1}),
+                vault: None,
+            },
+        )
+        .unwrap();
+        let stats = store.columnar_stats("events").unwrap().unwrap();
+        assert_eq!(stats.rows, 1);
+
+        let mut wtxn = store.write_txn().unwrap();
+        let mut replication = ReplicationContext {
+            origin: None,
+            changes: Vec::new(),
+            ops: Vec::new(),
+        };
+        let error = execute(
+            &store,
+            &mut wtxn,
+            &WriteReq::SetCollectionColumnar {
+                coll: "events".into(),
+                settings: nonodb_core::columnar::Settings {
+                    bucket_max_docs: 0,
+                    ..nonodb_core::columnar::Settings::default()
+                },
+            },
+            &mut replication,
+        )
+        .unwrap_err();
+        assert!(error.message.contains("bucket"));
+        drop(wtxn);
+
+        execute_commit(
+            &store,
+            &WriteReq::CreateCollection {
+                coll: "plain".into(),
+                profile: CollectionProfile::Standard,
+                ttl_seconds: None,
+                ttl_purge_history: None,
+                timeseries: None,
+                columnar: None,
+            },
+        )
+        .unwrap();
+        let error = execute_commit(
+            &store,
+            &WriteReq::SetCollectionColumnar {
+                coll: "plain".into(),
+                settings: nonodb_core::columnar::Settings::default(),
+            },
+        );
+        assert!(error.is_err());
     }
 
     #[test]
@@ -2679,6 +2823,7 @@ mod tests {
                     ttl_seconds: None,
                     ttl_purge_history: None,
                     timeseries: None,
+                    columnar: Some(nonodb_core::columnar::Settings::default()),
                 },
             )
             .unwrap();
@@ -2779,6 +2924,7 @@ mod tests {
                 ttl_seconds: None,
                 ttl_purge_history: None,
                 timeseries: Some(settings),
+                columnar: None,
             },
         )
         .unwrap();
@@ -2879,6 +3025,7 @@ mod tests {
                     ttl_seconds: None,
                     ttl_purge_history: None,
                     timeseries: Some(settings.clone()),
+                    columnar: None,
                 },
             )
             .unwrap();

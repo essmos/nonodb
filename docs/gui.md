@@ -263,9 +263,10 @@ back up the database first if a copy is needed. See
 - document history viewer with previous-revision comparison and restore;
 - import/export as JSON, NDJSON, or CSV, with optional upsert on import;
 - saved per-collection views for filter, sort, projection, and limit;
-- **New collection** supports the `timeseries` profile: `timeField` is required,
-  and `metaField`, granularity, compression, and `expireAfterSeconds` are
-  optional.
+- **New collection** supports the `timeseries` and `columnar` profiles. For
+  time-series, `timeField` is required and `metaField`, granularity,
+  compression, and `expireAfterSeconds` are optional. For columnar, bucket row
+  limit, bucket byte limit, and compression are optional.
 - credential-free JSON export and import of saved views.
 
 ### Saved views

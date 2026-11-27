@@ -617,6 +617,9 @@ pub enum Request {
         /// Time-series settings (`timeField`, `metaField`, granularity, ...).
         #[serde(default)]
         timeseries: Option<nonodb_core::timeseries::Settings>,
+        /// General-purpose columnar settings.
+        #[serde(default)]
+        columnar: Option<nonodb_core::columnar::Settings>,
     },
     DropCollection {
         coll: String,
@@ -631,6 +634,15 @@ pub enum Request {
     #[serde(alias = "get_collection_timeseries")]
     GetCollectionTimeSeries {
         coll: String,
+    },
+    /// Reads the general-purpose columnar settings and bucket statistics.
+    GetCollectionColumnar {
+        coll: String,
+    },
+    /// Replaces the general-purpose columnar settings.
+    SetCollectionColumnar {
+        coll: String,
+        settings: nonodb_core::columnar::Settings,
     },
     /// Replaces the time-series settings of a collection.
     #[serde(alias = "set_collection_timeseries")]
@@ -872,6 +884,11 @@ pub enum WriteReq {
         ttl_seconds: Option<u64>,
         ttl_purge_history: Option<bool>,
         timeseries: Option<nonodb_core::timeseries::Settings>,
+        columnar: Option<nonodb_core::columnar::Settings>,
+    },
+    SetCollectionColumnar {
+        coll: String,
+        settings: nonodb_core::columnar::Settings,
     },
     DropCollection {
         coll: String,
@@ -1158,6 +1175,8 @@ impl Request {
             Self::CreateCollection { .. } => "create_collection",
             Self::DropCollection { .. } => "drop_collection",
             Self::GetCollectionTimeSeries { .. } => "get_collection_timeseries",
+            Self::GetCollectionColumnar { .. } => "get_collection_columnar",
+            Self::SetCollectionColumnar { .. } => "set_collection_columnar",
             Self::SetCollectionTimeSeries { .. } => "set_collection_timeseries",
             Self::SetCollectionTtl { .. } => "set_collection_ttl",
             Self::SetCollectionTtlAfter { .. } => "set_collection_ttl_after",
@@ -1316,6 +1335,8 @@ impl Request {
             | Self::DropCollection { coll }
             | Self::GetCollectionTimeSeries { coll }
             | Self::SetCollectionTimeSeries { coll, .. }
+            | Self::GetCollectionColumnar { coll }
+            | Self::SetCollectionColumnar { coll, .. }
             | Self::SetCollectionTtl { coll, .. }
             | Self::SetCollectionTtlAfter { coll, .. }
             | Self::RetainTimeSeries { coll, .. }

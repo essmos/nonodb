@@ -1970,6 +1970,75 @@ fn parse_timeseries_spec(
     Ok(Some(settings))
 }
 
+fn parse_columnar_spec(
+    body: &Document,
+) -> Result<Option<nonodb_core::columnar::Settings>, ApiError> {
+    let Some(value) = body.get("columnar") else {
+        return Ok(None);
+    };
+    let doc = value
+        .as_document()
+        .ok_or_else(|| bad_value("columnar must be a document"))?;
+    for key in doc.keys() {
+        if !matches!(
+            key.as_str(),
+            "bucketMaxDocs"
+                | "bucket_max_docs"
+                | "bucketMaxBytes"
+                | "bucket_max_bytes"
+                | "compression"
+        ) {
+            return Err(bad_value(format!(
+                "collection option `columnar.{key}` is not supported by NonoDB"
+            )));
+        }
+    }
+    let mut settings = nonodb_core::columnar::Settings::default();
+    if let Some(raw) = doc
+        .get("bucketMaxDocs")
+        .or_else(|| doc.get("bucket_max_docs"))
+    {
+        settings.bucket_max_docs = raw
+            .as_i64()
+            .or_else(|| raw.as_i32().map(i64::from))
+            .filter(|value| *value > 0)
+            .ok_or_else(|| bad_value("columnar.bucketMaxDocs must be a positive integer"))?
+            as usize;
+    }
+    if let Some(raw) = doc
+        .get("bucketMaxBytes")
+        .or_else(|| doc.get("bucket_max_bytes"))
+    {
+        settings.bucket_max_bytes = raw
+            .as_i64()
+            .or_else(|| raw.as_i32().map(i64::from))
+            .filter(|value| *value > 0)
+            .ok_or_else(|| bad_value("columnar.bucketMaxBytes must be a positive integer"))?
+            as usize;
+    }
+    if let Some(raw) = doc.get("compression") {
+        let raw = raw
+            .as_str()
+            .ok_or_else(|| bad_value("columnar.compression must be a string"))?;
+        settings = serde_json::from_value(serde_json::json!({
+            "bucket_max_docs": settings.bucket_max_docs,
+            "bucket_max_bytes": settings.bucket_max_bytes,
+            "compression": raw,
+        }))
+        .map_err(|_| bad_value(format!("unknown columnar compression `{raw}`")))?;
+    }
+    settings.validate().map_err(ApiError::from)?;
+    Ok(Some(settings))
+}
+
+fn columnar_options_doc(settings: &nonodb_core::columnar::Settings) -> Document {
+    bson::doc! {
+        "bucketMaxDocs": settings.bucket_max_docs as i64,
+        "bucketMaxBytes": settings.bucket_max_bytes as i64,
+        "compression": settings.compression.as_str(),
+    }
+}
+
 async fn create_collection_command(
     state: &super::AppState,
     body: &Document,
@@ -2002,8 +2071,16 @@ async fn create_collection_command(
         }
     }
     let timeseries = parse_timeseries_spec(body)?;
+    let columnar = parse_columnar_spec(body)?;
+    if timeseries.is_some() && columnar.is_some() {
+        return Err(bad_value(
+            "timeseries and columnar options cannot be combined",
+        ));
+    }
     let profile = if timeseries.is_some() {
         nonodb_core::CollectionProfile::TimeSeries
+    } else if columnar.is_some() {
+        nonodb_core::CollectionProfile::Columnar
     } else {
         nonodb_core::CollectionProfile::Standard
     };
@@ -2016,6 +2093,7 @@ async fn create_collection_command(
             ttl_seconds: None,
             ttl_purge_history: None,
             timeseries,
+            columnar,
         },
         Durability::Full,
     )
@@ -2089,8 +2167,9 @@ async fn list_collections_command(
         let names = store.collections()?;
         let mut entries = Vec::with_capacity(names.len());
         for name in names {
-            let settings = store.timeseries_settings(&name)?;
-            entries.push((name, settings));
+            let timeseries = store.timeseries_settings(&name)?;
+            let columnar = store.columnar_settings(&name)?;
+            entries.push((name, timeseries, columnar));
         }
         Ok::<_, nonodb_core::Error>(entries)
     })
@@ -2099,7 +2178,7 @@ async fn list_collections_command(
     let name_only = body.get_bool("nameOnly").unwrap_or(false);
     let filter = document_field(body, "filter")?;
     let mut batch = Vec::with_capacity(entries.len());
-    for (name, timeseries) in entries {
+    for (name, timeseries, columnar) in entries {
         if name.starts_with('\u{1}') || name == crate::databases::DEFAULT_DATABASE {
             continue;
         }
@@ -2112,6 +2191,9 @@ async fn list_collections_command(
                 "timeseries",
                 Bson::Document(timeseries_options_doc(&settings)),
             );
+        }
+        if let Some(settings) = columnar {
+            options.insert("columnar", Bson::Document(columnar_options_doc(&settings)));
         }
         let mut doc = bson::doc! {
             "name": name.clone(),
@@ -4513,6 +4595,42 @@ mod tests {
             "timeseries": bson::doc! {"timeField": "ts", "granularity": "weeks"},
         };
         assert!(parse_timeseries_spec(&bad).is_err());
+    }
+
+    #[test]
+    fn create_parses_columnar_options() {
+        let body = bson::doc! {
+            "create": "events",
+            "columnar": bson::doc! {
+                "bucketMaxDocs": 128i64,
+                "bucketMaxBytes": 262144i64,
+                "compression": "max",
+            },
+        };
+        let settings = parse_columnar_spec(&body).unwrap().unwrap();
+        assert_eq!(settings.bucket_max_docs, 128);
+        assert_eq!(settings.bucket_max_bytes, 262_144);
+        let rendered = columnar_options_doc(&settings);
+        assert_eq!(rendered.get_i64("bucketMaxDocs").unwrap(), 128);
+        assert_eq!(rendered.get_str("compression").unwrap(), "max");
+        assert!(parse_columnar_spec(&bson::doc! {"create": "plain"})
+            .unwrap()
+            .is_none());
+        let bad = bson::doc! {
+            "create": "events",
+            "columnar": bson::doc! {"bucketMaxDocs": 0i64},
+        };
+        assert!(parse_columnar_spec(&bad).is_err());
+        let bad = bson::doc! {
+            "create": "events",
+            "columnar": bson::doc! {"compression": "turbo"},
+        };
+        assert!(parse_columnar_spec(&bad).is_err());
+        let bad = bson::doc! {
+            "create": "events",
+            "columnar": bson::doc! {"timeField": "ts"},
+        };
+        assert!(parse_columnar_spec(&bad).is_err());
     }
 
     #[test]

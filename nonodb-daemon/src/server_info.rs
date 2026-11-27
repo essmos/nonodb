@@ -131,6 +131,19 @@ pub fn capabilities() -> Value {
                     "retention": true,
                     "point_lookup": "synthetic_id",
                 },
+                "columnar": {
+                    "profile": "columnar",
+                    "codecs": [
+                        "delta", "delta_delta", "gorilla_xor", "dictionary",
+                        "for_bitpack", "bool_bits", "byte_shuffle", "deflate"
+                    ],
+                    "compression_levels": ["fast", "balanced", "max"],
+                    "bucket_by": "id_hash",
+                    "operation_parity": "standard",
+                    "point_lookup": "id_locator",
+                    "update_overlay": true,
+                    "compaction": true,
+                },
             },
             "migration": {
                 "mongodb_ddl": true,

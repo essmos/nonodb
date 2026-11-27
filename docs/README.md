@@ -21,6 +21,7 @@ quick-start instructions, and a feature overview.
 | [Document TTL](ttl.md) | Application developers, operators | Collection defaults, date-field MongoDB TTL, per-document overrides, strict read visibility, update semantics, limits |
 | [Dates and time zones](dates.md) | Application developers | BSON-compatible dates, RFC 3339 input, filtering, indexes, sorting, timezone semantics |
 | [Time-series collections](timeseries.md) | Application developers, evaluators | `profile: "timeseries"`, per-series/window buckets, columnar codecs, aggregation, retention, indexes, SQL, replication, limits |
+| [Columnar collections](columnar.md) | Application developers, evaluators | `profile: "columnar"`, general-purpose buckets, settings, API parity, indexes, TTL, backup, migration, downgrade |
 | [Time-series benchmark vs TimescaleDB](timescale-benchmark.md) | Evaluators, maintainers | Dataset, methodology, results, caveats, and reproduction for NonoDB and TimescaleDB |
 | [Columnar collections plan](columnar-collections-plan.md) | Maintainers, evaluators | Proposed general-purpose bucket-columnar profile, architecture, phases, benchmark plan, and risks |
 | [Columnar collections acceptance](columnar-collections-acceptance.md) | Maintainers, reviewers | Mandatory semantic, operational, and performance parity gates for the columnar profile |
@@ -89,6 +90,7 @@ quick-start instructions, and a feature overview.
 - **Expire documents automatically:** [Document TTL](ttl.md)
 - **Filter and index timestamps:** [Dates and time zones](dates.md)
 - **Store time-series data:** [Time-series collections](timeseries.md)
+- **Use general-purpose columnar storage:** [Columnar collections](columnar.md)
 - **Compare time-series performance with TimescaleDB:** [Time-series benchmark](timescale-benchmark.md)
 - **Store money and exact decimals:** [Numbers and decimals](numerics.md)
 - **Use binary, UUID, ObjectId, or `$type`:** [BSON scalar types](bson-types.md)

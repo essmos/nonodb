@@ -813,6 +813,12 @@ impl<'e> Collection<'e> {
         wtxn: &mut RwTxn<'_>,
         settings: &crate::columnar::Settings,
     ) -> Result<()> {
+        if !self.profile.is_columnar() {
+            return Err(Error::Query(format!(
+                "collection `{}` is not a columnar collection",
+                self.name
+            )));
+        }
         settings.validate()?;
         let key = format!("{}{}", crate::columnar::SETTINGS_META_PREFIX, self.name);
         let bytes = serde_json::to_vec(settings)?;

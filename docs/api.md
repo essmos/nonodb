@@ -231,6 +231,8 @@ client timeout with `NONODB_TIMEOUT` or the `timeout=` argument.
 | [`get_collection_ttl`](#document-ttl) | Read collection TTL and mode |
 | [`get_collection_timeseries`](#time-series-settings) | Read time-series settings |
 | [`set_collection_timeseries`](#time-series-settings) | Replace time-series settings |
+| [`get_collection_columnar`](#columnar-settings) | Read columnar settings and bucket statistics |
+| [`set_collection_columnar`](#columnar-settings) | Replace columnar bucket/compression settings |
 | [`set_collection_history`](#set_collection_history) | Set per-collection history retention (`0` disables) |
 | [`get_collection_history`](#get_collection_history) | Read per-collection history retention |
 | [`set_collection_events`](#set_collection_events) | Enable/disable automatic collection change events |
@@ -3008,9 +3010,9 @@ Response:
 {"ok": true, "result": {"created": "vault", "profile": "vault", "ttl_seconds": null, "purge_history": false}}
 ```
 
-`profile` is `standard` (default), `vault`, or `timeseries`. An existing
-collection cannot be converted between profiles; the request fails with
-`vault_profile_immutable`.
+`profile` is `standard` (default), `vault`, `timeseries`, or `columnar`. An
+existing collection cannot be converted between profiles; the request fails
+with `vault_profile_immutable`.
 
 A `timeseries` profile requires a `timeseries` settings object with `timeField`;
 see [Time-series collections](timeseries.md) for the bucketed columnar format,
@@ -3029,6 +3031,53 @@ codecs, and measured compression:
   }
 }
 ```
+
+A `columnar` profile accepts an optional `columnar` settings object. The
+profile keeps the full standard API and groups rows into immutable buckets by
+`_id` hash:
+
+```json
+{
+  "op": "create_collection",
+  "coll": "events",
+  "profile": "columnar",
+  "columnar": {
+    "bucket_max_docs": 512,
+    "bucket_max_bytes": 524288,
+    "compression": "balanced"
+  }
+}
+```
+
+See [Columnar collections](columnar.md) for the storage format, parity,
+operational behavior, and migration guidance.
+
+### Columnar settings
+
+`get_collection_columnar` returns stored settings and bucket statistics.
+`set_collection_columnar` validates and replicates a replacement; the
+`settings` key also accepts `columnar`.
+
+```json
+{"op": "get_collection_columnar", "coll": "events"}
+```
+
+```json
+{"ok": true, "result": {"coll": "events", "profile": "columnar",
+ "columnar": {"bucket_max_docs": 512, "bucket_max_bytes": 524288,
+              "compression": "balanced"},
+ "stats": {"buckets": 4, "sealed_buckets": 3, "open_buckets": 1,
+           "rows": 1700}}}
+```
+
+```json
+{"op": "set_collection_columnar", "coll": "events",
+ "settings": {"bucket_max_docs": 1024, "compression": "max"}}
+```
+
+The MongoDB wire `create` command accepts `columnar` with `bucketMaxDocs`,
+`bucketMaxBytes`, and `compression`; `listCollections` reports them under
+`options.columnar`. `columnar` and `timeseries` are mutually exclusive.
 
 ### Time-series settings
 

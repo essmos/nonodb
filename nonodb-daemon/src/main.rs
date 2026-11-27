@@ -3893,6 +3893,26 @@ async fn exec_inner(
             read_result(joined).await
         }
 
+        Request::GetCollectionColumnar { coll } => {
+            let store = state.store.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                let settings = store.columnar_settings(&coll)?;
+                let Some(settings) = settings else {
+                    return Err(ApiError::from(nonodb_core::Error::Query(format!(
+                        "collection `{coll}` is not a columnar collection"
+                    ))));
+                };
+                let stats = store.columnar_stats(&coll)?;
+                Ok::<Value, ApiError>(json!({
+                    "coll": coll,
+                    "profile": "columnar",
+                    "columnar": settings,
+                    "stats": stats,
+                }))
+            });
+            read_result(joined).await
+        }
+
         Request::GetCollectionHistory { coll } => {
             let store = state.store.clone();
             let joined = tokio::task::spawn_blocking(move || {
@@ -4196,6 +4216,7 @@ async fn exec_inner(
                     ttl_seconds,
                     ttl_purge_history,
                     timeseries,
+                    columnar,
                 } => {
                     let profile = match profile {
                         Some(raw) => match CollectionProfile::parse(&raw) {
@@ -4226,13 +4247,35 @@ async fn exec_inner(
                         }
                         None => None,
                     };
+                    let columnar = match columnar {
+                        Some(settings) => {
+                            if !profile.is_columnar() {
+                                return respond(Err(nonodb_core::Error::Query(
+                                    "`columnar` settings require profile `columnar`".into(),
+                                )
+                                .into()));
+                            }
+                            if let Err(err) = settings.validate() {
+                                return respond(Err(err.into()));
+                            }
+                            Some(settings)
+                        }
+                        None if profile.is_columnar() => {
+                            Some(nonodb_core::columnar::Settings::default())
+                        }
+                        None => None,
+                    };
                     WriteReq::CreateCollection {
                         coll,
                         profile,
                         ttl_seconds,
                         ttl_purge_history,
                         timeseries,
+                        columnar,
                     }
+                }
+                Request::SetCollectionColumnar { coll, settings } => {
+                    WriteReq::SetCollectionColumnar { coll, settings }
                 }
                 Request::DropCollection { coll } => WriteReq::DropCollection { coll },
                 Request::SetCollectionTimeSeries { coll, settings } => {

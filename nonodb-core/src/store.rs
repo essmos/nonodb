@@ -1231,6 +1231,43 @@ impl Store {
         Ok(out)
     }
 
+    /// Columnar settings for `name`, or `None` when it is not columnar.
+    pub fn columnar_settings(&self, name: &str) -> Result<Option<crate::columnar::Settings>> {
+        let rtxn = self.read_txn()?;
+        let out = match self.collection_at(&rtxn, name)? {
+            Some(collection) => collection.columnar_settings_in(&rtxn)?,
+            None => None,
+        };
+        rtxn.commit()?;
+        Ok(out)
+    }
+
+    /// Replaces columnar settings for an existing collection.
+    pub fn set_columnar_settings(
+        &self,
+        name: &str,
+        settings: &crate::columnar::Settings,
+    ) -> Result<()> {
+        let mut wtxn = self.write_txn()?;
+        let collection = self.collection_in(&mut wtxn, name)?;
+        collection.set_columnar_settings_in(&mut wtxn, settings)?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    /// Storage statistics for a columnar collection.
+    pub fn columnar_stats(&self, name: &str) -> Result<Option<crate::columnar::Stats>> {
+        let rtxn = self.read_txn()?;
+        let out = match self.collection_at(&rtxn, name)? {
+            Some(collection) if collection.profile().is_columnar() => {
+                Some(crate::columnar::stats(&rtxn, self.env(), name)?)
+            }
+            _ => None,
+        };
+        rtxn.commit()?;
+        Ok(out)
+    }
+
     /// Storage statistics for a time-series collection.
     pub fn timeseries_stats(&self, name: &str) -> Result<Option<crate::timeseries::Stats>> {
         let Some(settings) = self.timeseries_settings(name)? else {
@@ -2458,6 +2495,7 @@ impl Store {
                 ttl_field,
                 ttl_purge_history,
                 timeseries,
+                columnar,
             } => {
                 let profile = CollectionProfile::parse(profile)?;
                 let collection = self.create_collection_with_ttl_and_purge_in(
@@ -2470,6 +2508,10 @@ impl Store {
                 if let Some(raw) = timeseries {
                     let settings: crate::timeseries::Settings = serde_json::from_str(raw)?;
                     collection.set_timeseries_settings_in(wtxn, &settings)?;
+                }
+                if let Some(raw) = columnar {
+                    let settings: crate::columnar::Settings = serde_json::from_str(raw)?;
+                    collection.set_columnar_settings_in(wtxn, &settings)?;
                 }
                 if let (Some(field), Some(seconds)) = (ttl_field.as_deref(), ttl_seconds) {
                     self.set_collection_ttl_after_in(
@@ -2492,6 +2534,10 @@ impl Store {
                 let collection = self.collection_in(&mut *wtxn, coll)?;
                 collection.set_timeseries_settings_in(wtxn, settings)?;
                 Ok(())
+            }
+            ReplicationOp::ColumnarSettings { coll, settings } => {
+                let collection = self.collection_in(&mut *wtxn, coll)?;
+                collection.set_columnar_settings_in(wtxn, settings)
             }
             ReplicationOp::CollectionTtl {
                 coll,
@@ -2877,6 +2923,34 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::parse_size;
+
+    #[test]
+    fn unknown_collection_profile_fails_closed() {
+        use crate::heed::types::Bytes;
+        let dir = tempfile::tempdir().unwrap();
+        let store = super::Store::open(dir.path()).unwrap();
+        store
+            .create_collection("docs", crate::vault::CollectionProfile::Standard)
+            .unwrap();
+        let mut wtxn = store.write_txn().unwrap();
+        let meta = store
+            .env()
+            .create_database::<Bytes, Bytes>(&mut wtxn, Some(super::META_DB))
+            .unwrap();
+        meta.put(
+            &mut wtxn,
+            super::Store::profile_key("docs").as_bytes(),
+            b"binary-does-not-know-this-profile",
+        )
+        .unwrap();
+        wtxn.commit().unwrap();
+        let error = match store.collection("docs") {
+            Ok(_) => panic!("unknown profile unexpectedly opened"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("unknown collection profile"));
+        assert!(store.collections().unwrap().contains(&"docs".to_string()));
+    }
 
     #[test]
     fn drop_collection_removes_data_indexes_and_metadata() {

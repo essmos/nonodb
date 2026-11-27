@@ -341,12 +341,23 @@ class NonoDB {
   /** Create a collection explicitly. Use profile `vault` for encrypted storage.
    * For `timeseries`, pass the settings object with the required `timeField`.
    */
-  async createCollection(name, profile = 'standard', ttlSeconds = null, purgeHistory = null, timeseries = null) {
+  async createCollection(name, profile = 'standard', ttlSeconds = null, purgeHistory = null, timeseries = null, columnar = null) {
     const req = { op: 'create_collection', coll: name, profile };
     if (ttlSeconds !== null) req.ttl_seconds = ttlSeconds;
     if (purgeHistory !== null) req.ttl_purge_history = purgeHistory;
     if (timeseries !== null) req.timeseries = timeseries;
+    if (columnar !== null) req.columnar = columnar;
     return this.exec(req);
+  }
+
+  /** Read columnar settings and bucket statistics. */
+  async getCollectionColumnar(name) {
+    return this.exec({ op: 'get_collection_columnar', coll: name });
+  }
+
+  /** Replace columnar bucket/compression settings. */
+  async setCollectionColumnar(name, settings) {
+    return this.exec({ op: 'set_collection_columnar', coll: name, settings });
   }
 
   /** Set or clear a collection's default document TTL. */

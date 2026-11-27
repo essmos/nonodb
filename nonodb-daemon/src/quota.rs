@@ -447,6 +447,7 @@ impl Growth {
             | SetCollectionTtl { .. }
             | SetCollectionTtlAfter { .. }
             | SetCollectionTimeSeries { .. }
+            | SetCollectionColumnar { .. }
             | BackfillCollectionTtl { .. } => Self {
                 data: true,
                 ..Self::default()

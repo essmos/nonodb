@@ -1145,6 +1145,112 @@ mod tests {
     }
 
     #[test]
+    fn unknown_bucket_version_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let settings = Settings {
+            bucket_max_docs: 1,
+            ..Default::default()
+        };
+        let coll = store.create_columnar_collection("docs", &settings).unwrap();
+        coll.insert_one(json!({"_id": "a", "value": 1})).unwrap();
+        coll.insert_one(json!({"_id": "b", "value": 2})).unwrap();
+        let mut wtxn = store.write_txn().unwrap();
+        let db = store
+            .env()
+            .open_database::<Bytes, Bytes>(&wtxn, Some(&db_name("docs")))
+            .unwrap()
+            .unwrap();
+        let mut payload = db.get(&wtxn, &bucket_key(1)).unwrap().unwrap().to_vec();
+        assert_eq!(&payload[..4], MAGIC);
+        payload[4] = FORMAT_VERSION + 1;
+        db.put(&mut wtxn, &bucket_key(1), &payload).unwrap();
+        wtxn.commit().unwrap();
+        let error = coll.find_by_key("a").unwrap_err();
+        assert!(error.to_string().contains("bad header"), "{error}");
+        let error = coll.find(&FindQuery::default()).unwrap_err();
+        assert!(error.to_string().contains("bad header"), "{error}");
+        let mut wtxn = store.write_txn().unwrap();
+        let error = compact(&mut wtxn, store.env(), "docs", &settings).unwrap_err();
+        assert!(error.to_string().contains("bad header"), "{error}");
+    }
+
+    #[test]
+    fn compaction_reencodes_with_current_version_and_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let settings = Settings {
+            bucket_max_docs: 2,
+            ..Default::default()
+        };
+        let coll = store.create_columnar_collection("docs", &settings).unwrap();
+        for index in 0..5 {
+            coll.insert_one(json!({"_id": format!("doc-{index}"), "value": index}))
+                .unwrap();
+        }
+        coll.update(
+            &json!({"_id": "doc-1"}),
+            &json!({"$set": {"value": 100}}),
+            false,
+        )
+        .unwrap();
+        coll.delete(&json!({"_id": "doc-2"}), false).unwrap();
+        let changed = Settings {
+            bucket_max_docs: 3,
+            bucket_max_bytes: 128 * 1024,
+            ..Default::default()
+        };
+        store.set_columnar_settings("docs", &changed).unwrap();
+        assert_eq!(store.compact_columnar("docs").unwrap(), 4);
+        assert_eq!(coll.count(&json!({})).unwrap(), 4);
+        assert_eq!(coll.find_by_key("doc-1").unwrap().unwrap()["value"], 100);
+        assert!(coll.find_by_key("doc-2").unwrap().is_none());
+        let wtxn = store.write_txn().unwrap();
+        let db = store
+            .env()
+            .open_database::<Bytes, Bytes>(&wtxn, Some(&db_name("docs")))
+            .unwrap()
+            .unwrap();
+        let mut sealed = 0;
+        for item in db.iter(&wtxn).unwrap() {
+            let (key, value) = item.unwrap();
+            if key.first() != Some(&KEY_BUCKET) {
+                continue;
+            }
+            sealed += 1;
+            assert_eq!(&value[..4], MAGIC);
+            assert_eq!(value[4], FORMAT_VERSION);
+        }
+        assert!(sealed > 0);
+        drop(wtxn);
+        assert_eq!(store.columnar_settings("docs").unwrap(), Some(changed));
+        drop(coll);
+        drop(store);
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(store.columnar_stats("docs").unwrap().unwrap().rows, 4);
+    }
+
+    #[test]
+    fn invalid_settings_leave_previous_settings_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let initial = Settings {
+            bucket_max_docs: 64,
+            ..Default::default()
+        };
+        store.create_columnar_collection("docs", &initial).unwrap();
+        let invalid = Settings {
+            bucket_max_docs: HARD_MAX_COLUMN_ROWS + 1,
+            ..Default::default()
+        };
+        assert!(store.set_columnar_settings("docs", &invalid).is_err());
+        assert_eq!(store.columnar_settings("docs").unwrap(), Some(initial));
+        assert!(store
+            .set_columnar_settings("plain", &Settings::default())
+            .is_err());
+    }
+
+    #[test]
     fn id_hash_collision_chain_keeps_both_docs() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();

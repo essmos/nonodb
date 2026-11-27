@@ -6557,6 +6557,7 @@ mod tests {
             ttl_field: None,
             ttl_purge_history: None,
             timeseries: Some(serde_json::to_string(&settings).unwrap()),
+            columnar: None,
         }];
         for (id, doc) in &inserted {
             let change = changes.len();
@@ -8850,6 +8851,7 @@ mod tests {
                 ttl_field: None,
                 ttl_purge_history: None,
                 timeseries: Some(serde_json::to_string(&initial).unwrap()),
+                columnar: None,
             }],
         );
         assert!(replica.apply_replication_txn(&txn).unwrap());
@@ -8905,6 +8907,7 @@ mod tests {
             ttl_field: None,
             ttl_purge_history: None,
             timeseries: Some(serde_json::to_string(&settings).unwrap()),
+            columnar: None,
         }];
         for id in &ids {
             let doc = source.find_by_key(id).unwrap().unwrap();

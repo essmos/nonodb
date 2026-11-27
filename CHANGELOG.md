@@ -2,6 +2,19 @@
 
 Full release notes: https://github.com/essmos/nonodb/releases
 
+## Unreleased
+
+- Add experimental `profile: "columnar"` collections: general-purpose buckets
+  keyed by `_id` hash, shared column codecs, locator-based point reads, update
+  overlays, compaction, and full standard-collection parity for CRUD, indexes,
+  TTL, history, search, graph, aggregation, SQL, replication, backup, events,
+  MongoDB wire, clients, CLI, and GUI. See `docs/columnar.md`.
+- Expose `get_collection_columnar` / `set_collection_columnar` and columnar
+  creation settings over HTTP/socket, MongoDB `create`/`listCollections`,
+  Rust/Python/Node.js/Go clients, CLI, and GUI.
+- Add columnar bucket version/settings guards and migration support via
+  `scripts/nonodb-migrate.py --target-profile columnar`.
+
 ## v0.34.0 - 2026-11-27
 
 Stable release focused on time-series collections, columnar compression, and a

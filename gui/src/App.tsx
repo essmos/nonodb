@@ -5649,12 +5649,14 @@ function Shell({
   const [newCollection, setNewCollection] = useState('');
   const [ttl, setTtl] = useState('');
   const [history, setHistory] = useState('0');
-  const [profile, setProfile] = useState<'standard' | 'vault' | 'timeseries'>('standard');
+  const [profile, setProfile] = useState<'standard' | 'vault' | 'timeseries' | 'columnar'>('standard');
   const [timeField, setTimeField] = useState('ts');
   const [metaField, setMetaField] = useState('');
   const [granularity, setGranularity] = useState('seconds');
   const [tsCompression, setTsCompression] = useState('balanced');
   const [expireAfter, setExpireAfter] = useState('');
+  const [bucketMaxDocs, setBucketMaxDocs] = useState('512');
+  const [bucketMaxBytes, setBucketMaxBytes] = useState('524288');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
   const [databases, setDatabases] = useState<string[]>([]);
@@ -5730,6 +5732,13 @@ function Shell({
         profile,
         ttl_seconds: profile === 'timeseries' || ttl.trim() === '' ? null : Number(ttl),
       };
+      if (profile === 'columnar') {
+        request.columnar = {
+          bucket_max_docs: Number(bucketMaxDocs || 512),
+          bucket_max_bytes: Number(bucketMaxBytes || 524288),
+          compression: tsCompression,
+        };
+      }
       if (profile === 'timeseries') {
         request.timeseries = {
           timeField: timeField.trim(),
@@ -5998,11 +6007,12 @@ function Shell({
               Storage profile
               <select
                 value={profile}
-                onChange={(e) => setProfile(e.target.value as 'standard' | 'vault' | 'timeseries')}
+                onChange={(e) => setProfile(e.target.value as 'standard' | 'vault' | 'timeseries' | 'columnar')}
               >
                 <option value="standard">standard</option>
                 <option value="vault">vault (encrypted)</option>
-                <option value="timeseries">timeseries (columnar buckets)</option>
+                <option value="timeseries">timeseries (time buckets)</option>
+                <option value="columnar">columnar (general-purpose buckets)</option>
               </select>
               {profile === 'vault' && (
                 <span className="field-hint">
@@ -6014,6 +6024,12 @@ function Shell({
                 <span className="field-hint">
                   Rows are grouped into buckets by time window and optional series field.
                   Field names become columns; deletes use a bucket deletion bitmap.
+                </span>
+              )}
+              {profile === 'columnar' && (
+                <span className="field-hint">
+                  General-purpose bucket-columnar storage with the full standard
+                  collection API, indexes, TTL, history, search, graph, and compaction.
                 </span>
               )}
             </label>
@@ -6064,6 +6080,38 @@ function Shell({
                   <span className="field-hint">
                     Rows older than this many seconds are hidden at read time.
                   </span>
+                </label>
+              </>
+            )}
+            {profile === 'columnar' && (
+              <>
+                <label>
+                  Bucket max documents
+                  <input
+                    value={bucketMaxDocs}
+                    onChange={(e) => setBucketMaxDocs(e.target.value)}
+                    placeholder="512"
+                  />
+                  <span className="field-hint">
+                    Rows per sealed bucket. Smaller buckets reduce update amplification;
+                    larger buckets compress better.
+                  </span>
+                </label>
+                <label>
+                  Bucket max bytes
+                  <input
+                    value={bucketMaxBytes}
+                    onChange={(e) => setBucketMaxBytes(e.target.value)}
+                    placeholder="524288"
+                  />
+                </label>
+                <label>
+                  Compression
+                  <select value={tsCompression} onChange={(e) => setTsCompression(e.target.value)}>
+                    <option value="fast">fast</option>
+                    <option value="balanced">balanced</option>
+                    <option value="max">max</option>
+                  </select>
                 </label>
               </>
             )}
