@@ -229,6 +229,8 @@ client timeout with `NONODB_TIMEOUT` or the `timeout=` argument.
 | [`set_collection_ttl_after`](#document-ttl) | Select date-field collection TTL |
 | [`backfill_collection_ttl`](#document-ttl) | Backfill date-field TTL metadata in pages |
 | [`get_collection_ttl`](#document-ttl) | Read collection TTL and mode |
+| [`get_collection_timeseries`](#time-series-settings) | Read time-series settings |
+| [`set_collection_timeseries`](#time-series-settings) | Replace time-series settings |
 | [`set_collection_history`](#set_collection_history) | Set per-collection history retention (`0` disables) |
 | [`get_collection_history`](#get_collection_history) | Read per-collection history retention |
 | [`set_collection_events`](#set_collection_events) | Enable/disable automatic collection change events |
@@ -1083,6 +1085,51 @@ valid in `$project` (use `$group` for accumulators).
 `$sum` and `$avg` ignore non-numeric values. `$addToSet` deduplicates by JSON
 value equality.
 
+Statistical and financial accumulators:
+
+```json
+{
+  "$group": {
+    "_id": "$symbol",
+    "median": {"$median": "$latency"},
+    "p95": {"$percentile": {"input": "$latency", "p": [0.95]}},
+    "sd": {"$stdDevPop": "$latency"},
+    "hist": {"$histogram": {
+      "input": "$latency", "boundaries": [0, 10, 50, 100]
+    }},
+    "vwap": {"$vwap": {"price": "$price", "volume": "$volume"}},
+    "corr": {"$corr": {"x": "$a", "y": "$b"}},
+    "reg": {"$regression": {"x": "$a", "y": "$b"}}
+  }
+}
+```
+
+- `$percentile` accepts `input` and `p` (one or more probabilities in
+  `[0, 1]`), returning an array. Interpolation is linear between adjacent
+  sorted values; an empty sample yields `null` for each probability.
+- `$median` is `$percentile` at `p = 0.5` and returns a scalar.
+- `$stdDevPop`/`$stdDevSamp` ignore missing/null/non-numeric/non-finite values
+  and return `null` when no values are present (`$stdDevSamp` also needs two
+  values). They use Welford's stable online algorithm.
+- `$histogram` returns counts for half-open boundaries
+  `[b[i], b[i+1])`; values below the first or at/above the last boundary are
+  ignored, and fewer than two boundaries produce an empty count array.
+- `$counterAgg` takes `{input, time}` and returns `delta`, `rate`, `irate`,
+  `resets`, `last`, and `last_time`; a decrease is treated as a counter reset.
+  Invalid/missing value/time pairs are skipped. Rates are per second and are
+  `null` when fewer than two timestamps are available.
+- `$gaugeAgg` takes `{input, time}` and returns trapezoidal `integral`,
+  time-weighted `average`, `delta`, `first`, and `last`. Invalid/missing pairs
+  are skipped; `average` is `null` without a positive time span.
+- `$vwap` takes `{price, volume}`, uses only pairs where both values are numeric,
+  and returns `null` when total volume is zero.
+- `$corr`, `$covariance`, and `$regression` take `{x, y}` and use only complete
+  numeric pairs. `$covariance` is the sample covariance (denominator `n - 1`);
+  fewer than two pairs yields `null`. Correlation and regression return `null`
+  when a variance is zero; regression returns `{slope, intercept}`.
+- In `$setWindowFields`, accumulators use the active window frame; without an
+  explicit frame the default is unbounded preceding through unbounded following.
+
 ### `$unwind`
 
 ```json
@@ -1226,7 +1273,71 @@ Adds partitioned, sorted window calculations without collapsing documents:
 - Ranking operators: `$rank`, `$denseRank`, and `$documentNumber`, which require
   `sortBy`.
 - `$shift` supports `output`, integer `by`, and optional `default`.
+- Statistical accumulators (`$percentile`, `$median`, `$stdDevPop`,
+  `$stdDevSamp`, `$histogram`, `$counterAgg`, `$gaugeAgg`) are also valid window
+  outputs.
+- `$returns` and `$logReturns` take an input expression and compare the current
+  row with the previous row in partition order; the first row is `null`.
+- Financial indicators: `$sma` (`input`, `period`), `$ema`, `$rsi` (`period`,
+  default 14), `$bollinger` (`period`, optional `multiplier`, default 2),
+  `$macd` (`fastPeriod` 12, `slowPeriod` 26, `signalPeriod` 9), and `$atr`
+  (`high`, `low`, `close`, `period`). Bollinger and MACD return objects.
+  All indicators follow partition order, ignore null/non-numeric inputs, and
+  return `null` until enough observations exist. `$ema` seeds on the first
+  value; `$macd` seeds its EMAs the same way and starts emitting when the slow
+  EMA is available. SMA/Bollinger/ATR use the last `period` rows.
+- Risk metrics: `$drawdown` and `$maxDrawdown` take a price input; `$sharpe`
+  and `$sortino` take a returns input, optional `period` (default 14),
+  `riskFree` (default 0), and `annualization` (default 1; its square root is
+  applied). Sharpe uses population standard deviation; Sortino uses downside
+  deviation against zero. Both return `null` when the deviation is zero.
 - The aggregate intermediate-document limit still applies.
+
+### `$marketSession`
+
+Adds a session label from a timezone and session calendar:
+
+```json
+{
+  "$marketSession": {
+    "field": "ts",
+    "timezone": "America/New_York",
+    "sessions": [
+      {"name": "NY", "start": "09:30", "end": "16:00", "days": [1,2,3,4,5]}
+    ]
+  }
+}
+```
+
+Supported named zones are `America/New_York`, `Europe/London`,
+`Europe/Warsaw`, `Asia/Tokyo`, and `UTC`; a numeric UTC offset in minutes is
+also accepted. DST transitions are applied for the named zones. `days` uses
+ISO weekdays (Monday = 1) and defaults to Monday–Friday. The output field is
+`session` unless `output` is set. Set `bucket` to also emit a session bucket key
+in the form `<local-date>:<session>`.
+
+### `$timeBucketGapfill`
+
+Fills missing time buckets and optional values:
+
+```json
+{
+  "$timeBucketGapfill": {
+    "field": "ts",
+    "unit": "minute",
+    "step": 1,
+    "bounds": ["$date", "$date"],
+    "partitionByFields": ["symbol"],
+    "output": {"price": {"method": "locf"}, "rate": {"method": "linear"}}
+  }
+}
+```
+
+`bounds` may be `partition` (default), `full`, or an explicit
+`[lower, upper]` pair. `output` accepts the same `value`, `locf`, and `linear`
+methods as `$fill`; linear interpolation does not extrapolate. Rows are sorted
+by partition fields and time before filling, so generated rows are placed in
+chronological order.
 
 ### `$densify`
 
@@ -1862,6 +1973,12 @@ sorts and selective unsorted scans are parallelized for shallow queries.
 ---
 
 ## create_index
+
+`create_index` and `create_indexes` apply to standard and time-series
+collections. Time-series indexes use per-bucket posting lists and maintain
+unique constraints by `(locator, seq)`; see
+[`docs/timeseries.md`](timeseries.md#secondary-indexes) for storage and
+lifecycle details.
 
 Single-field index:
 
@@ -2891,9 +3008,90 @@ Response:
 {"ok": true, "result": {"created": "vault", "profile": "vault", "ttl_seconds": null, "purge_history": false}}
 ```
 
-`profile` is `standard` (default) or `vault`. An existing collection cannot be
-converted between profiles; the request fails with
+`profile` is `standard` (default), `vault`, or `timeseries`. An existing
+collection cannot be converted between profiles; the request fails with
 `vault_profile_immutable`.
+
+A `timeseries` profile requires a `timeseries` settings object with `timeField`;
+see [Time-series collections](timeseries.md) for the bucketed columnar format,
+codecs, and measured compression:
+
+```json
+{
+  "op": "create_collection",
+  "coll": "readings",
+  "profile": "timeseries",
+  "timeseries": {
+    "timeField": "ts",
+    "metaField": "device",
+    "granularity": "seconds",
+    "compression": "balanced"
+  }
+}
+```
+
+### Time-series settings
+
+`get_collection_timeseries` returns the stored settings and storage statistics; `set_collection_timeseries`
+validates and replicates a replacement. `timeField`, `metaField`, and
+`granularity` may only change while the collection is empty; bucket sizing,
+compression, and `expireAfterSeconds` can change at any time.
+
+```json
+{"op": "get_collection_timeseries", "coll": "readings"}
+```
+
+```json
+{"ok": true, "result": {"coll": "readings", "profile": "timeseries",
+ "timeseries": {"time_field": "ts", "meta_field": "device",
+                "granularity": "seconds", "compression": "balanced",
+                "expire_after_seconds": 86400},
+ "stats": {"rows": 1200, "deleted_rows": 3, "buckets": 8, "series": 1,
+           "encoded_bytes": 8123, "open_bytes": 0, "raw_bytes": 204800}}}
+```
+
+```json
+{"op": "set_collection_timeseries", "coll": "readings",
+ "timeseries": {"timeField": "ts", "metaField": "device",
+                "granularity": "minutes", "compression": "max"}}
+```
+
+The daemon accepts both the canonical `*_time_series` operation names and the
+documented `*_timeseries` aliases, and accepts either `settings` or
+`timeseries` as the settings payload key.
+
+The MongoDB wire `create` command accepts the same options:
+
+```json
+{"create": "readings",
+ "timeseries": {"timeField": "ts", "metaField": "device",
+                "granularity": "seconds", "expireAfterSeconds": 86400}}
+```
+
+`listCollections` reads them back: the collection entry includes
+`options.timeseries` with `timeField`, `metaField`, `granularity`, and
+`expireAfterSeconds` (plus the NonoDB `bucketMaxDocs`, `bucketMaxBytes`, and
+`compression` extensions). This is the Mongo-wire equivalent of
+`get_collection_timeseries`.
+
+`retain_timeseries` drops time-series rows older than a date. Whole buckets are
+removed by key without decoding; the boundary bucket marks expired rows in its
+deletion bitmap so synthetic `_id`s stay valid:
+
+```json
+{"op": "retain_timeseries", "coll": "readings",
+ "before": {"$date": "2026-01-01T00:00:00Z"}}
+```
+
+```json
+{"ok": true, "result": {"coll": "readings", "before_ms": 1767225600000,
+ "report": {"dropped_buckets": 20, "tombstoned_buckets": 10,
+            "dropped_rows": 0, "remaining_rows": 64000}}}
+```
+
+`aggregate` works on time-series collections. Row-local stages are streamed in
+batches after bucket pruning; blocking stages still materialize the selected
+range (see [Time-series collections](timeseries.md)).
 
 An optional `ttl_seconds` sets the default document TTL for new inserts.
 `ttl_purge_history` controls whether TTL expiry deletes stored history:
@@ -3120,7 +3318,20 @@ additive.
     "search": {"search_all": true, "modes": ["lexical", "fuzzy", "vector", "hybrid"]},
     "aggregation": {"convert": true, "conversion_aliases": ["$toString", "$toInt"]},
     "ttl": {"insertion_based": true, "date_field": true, "backfill": true, "strict_reads_default": true},
-    "events": {"watch": true, "webhooks": true}
+    "events": {"collection_events": true, "watch": true, "webhooks": true,
+               "webhook_thresholds": ["count", "sum", "avg"]},
+    "storage": {
+      "history": true, "vault": true, "branching": true, "backups": true,
+      "replication": true,
+      "timeseries": {
+        "profile": "timeseries",
+        "codecs": ["delta", "delta_delta", "gorilla_xor", "dictionary",
+                   "for_bitpack", "bool_bits", "byte_shuffle", "deflate"],
+        "granularities": ["seconds", "minutes", "hours"],
+        "compression_levels": ["fast", "balanced", "max"],
+        "aggregation": true, "retention": true, "point_lookup": "synthetic_id"
+      }
+    }
   },
   "limits": {"document_bytes": 1048576, "aggregate_docs": 100000, "search_results": 1000}
 }

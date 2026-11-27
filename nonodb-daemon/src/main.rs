@@ -1,4 +1,4 @@
-#![recursion_limit = "256"]
+#![recursion_limit = "512"]
 
 //! nonodb daemon: HTTP/JSON over a Unix socket.
 //!
@@ -264,6 +264,7 @@ async fn run_async() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
     let databases = databases::Databases::open(&data)
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    databases.start_online_compactor();
     metrics::set_disk_paths(
         data.clone(),
         std::env::var_os("NONODB_SNAPSHOT_DIR").map(PathBuf::from),
@@ -3872,6 +3873,26 @@ async fn exec_inner(
             read_result(joined).await
         }
 
+        Request::GetCollectionTimeSeries { coll } => {
+            let store = state.store.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                let settings = store.timeseries_settings(&coll)?;
+                let Some(settings) = settings else {
+                    return Err(ApiError::from(nonodb_core::Error::Query(format!(
+                        "collection `{coll}` is not a time-series collection"
+                    ))));
+                };
+                let stats = store.timeseries_stats(&coll)?;
+                Ok::<Value, ApiError>(json!({
+                    "coll": coll,
+                    "profile": "timeseries",
+                    "timeseries": settings,
+                    "stats": stats,
+                }))
+            });
+            read_result(joined).await
+        }
+
         Request::GetCollectionHistory { coll } => {
             let store = state.store.clone();
             let joined = tokio::task::spawn_blocking(move || {
@@ -4174,6 +4195,7 @@ async fn exec_inner(
                     profile,
                     ttl_seconds,
                     ttl_purge_history,
+                    timeseries,
                 } => {
                     let profile = match profile {
                         Some(raw) => match CollectionProfile::parse(&raw) {
@@ -4182,14 +4204,40 @@ async fn exec_inner(
                         },
                         None => CollectionProfile::Standard,
                     };
+                    let timeseries = match timeseries {
+                        Some(settings) => {
+                            if !profile.is_timeseries() {
+                                return respond(Err(nonodb_core::Error::Query(
+                                    "`timeseries` settings require profile `timeseries`".into(),
+                                )
+                                .into()));
+                            }
+                            if let Err(err) = settings.validate() {
+                                return respond(Err(err.into()));
+                            }
+                            Some(settings)
+                        }
+                        None if profile.is_timeseries() => {
+                            return respond(Err(nonodb_core::Error::Query(
+                                "profile `timeseries` requires a `timeseries` settings object with `timeField`"
+                                    .into(),
+                            )
+                            .into()));
+                        }
+                        None => None,
+                    };
                     WriteReq::CreateCollection {
                         coll,
                         profile,
                         ttl_seconds,
                         ttl_purge_history,
+                        timeseries,
                     }
                 }
                 Request::DropCollection { coll } => WriteReq::DropCollection { coll },
+                Request::SetCollectionTimeSeries { coll, settings } => {
+                    WriteReq::SetCollectionTimeSeries { coll, settings }
+                }
                 Request::SetCollectionTtl {
                     coll,
                     ttl_seconds,
@@ -4199,6 +4247,21 @@ async fn exec_inner(
                     ttl_seconds,
                     purge_history,
                 },
+                Request::RetainTimeSeries { coll, before } => {
+                    let before_ms = match nonodb_core::date::parse_value(&before) {
+                        Some(ms) => ms,
+                        None => match before.as_i64() {
+                            Some(ms) => ms,
+                            None => {
+                                return respond(Err(nonodb_core::Error::Query(
+                                    "`before` must be a date or epoch milliseconds".into(),
+                                )
+                                .into()))
+                            }
+                        },
+                    };
+                    WriteReq::RetainTimeSeries { coll, before_ms }
+                }
                 Request::SetCollectionTtlAfter {
                     coll,
                     field,
@@ -4842,6 +4905,7 @@ fn cacheable(req: &Request) -> bool {
             | Request::VectorSearch { .. }
             | Request::ListCollections
             | Request::GetCollectionTtl { .. }
+            | Request::GetCollectionTimeSeries { .. }
             | Request::GetCollectionHistory { .. }
             | Request::GetCollectionEvents { .. }
             | Request::ListSubscriptions { .. }
@@ -4907,7 +4971,7 @@ fn read_collection<'a>(
     if auth.is_some() {
         match store.collection_profile(coll)? {
             Some(CollectionProfile::Vault) => {}
-            Some(CollectionProfile::Standard) => return Err(vault::key_unexpected().into()),
+            Some(_) => return Err(vault::key_unexpected().into()),
             None => return Err(vault::not_a_vault_collection().into()),
         }
     }

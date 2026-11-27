@@ -437,7 +437,8 @@ impl Growth {
             | PruneHistory { .. }
             | Expire { .. }
             | DeleteSubscription { .. }
-            | DeleteWebhook { .. } => Self::default(),
+            | DeleteWebhook { .. }
+            | RetainTimeSeries { .. } => Self::default(),
             CreateCollection { .. }
             | SetGraph { .. }
             | ReindexGraph { .. }
@@ -445,6 +446,7 @@ impl Growth {
             | GraphRebuildStep { .. }
             | SetCollectionTtl { .. }
             | SetCollectionTtlAfter { .. }
+            | SetCollectionTimeSeries { .. }
             | BackfillCollectionTtl { .. } => Self {
                 data: true,
                 ..Self::default()

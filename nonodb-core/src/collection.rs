@@ -212,7 +212,7 @@ fn configured_workers(var: &str) -> usize {
         .unwrap_or(default)
 }
 
-fn scan_workers() -> usize {
+pub(crate) fn scan_workers() -> usize {
     configured_workers("NONODB_SCAN_WORKERS")
 }
 
@@ -220,7 +220,7 @@ fn backfill_workers() -> usize {
     configured_workers("NONODB_BACKFILL_WORKERS")
 }
 
-fn aggregate_workers() -> usize {
+pub(crate) fn aggregate_workers() -> usize {
     configured_workers("NONODB_AGGREGATE_WORKERS")
 }
 
@@ -317,6 +317,8 @@ pub struct UpdateOutcome {
     pub matched: usize,
     pub modified: usize,
     pub upserted_id: Option<String>,
+    /// `(old_id, new_id)` rows whose time or series changed (time-series only).
+    pub moved: Vec<(String, String)>,
 }
 
 /// Options for an atomic find-and-modify operation.
@@ -342,6 +344,8 @@ pub struct FindAndModifyOutcome {
     pub matched: usize,
     pub modified: usize,
     pub upserted_id: Option<String>,
+    /// New synthetic `_id` when a time-series update moved the row.
+    pub new_id: Option<String>,
 }
 type IndexIter<'a> = Box<dyn Iterator<Item = heed::Result<(&'a [u8], &'a [u8])>> + 'a>;
 type IdBounds = (Bound<Vec<u8>>, Bound<Vec<u8>>);
@@ -374,6 +378,137 @@ struct GeoIndexPlan {
     db: Database<Bytes, Bytes>,
     ranges: Vec<index::RangeBytes>,
     def: IndexDef,
+}
+type PostingLocator = (u64, u32, i64, u16);
+
+const POSTING_TAG: [u8; 2] = [0, 0];
+
+fn posting_key(vb: &[u8], locator: PostingLocator) -> Vec<u8> {
+    let mut key = Vec::with_capacity(2 + vb.len() + 22);
+    key.extend_from_slice(&POSTING_TAG);
+    key.extend_from_slice(vb);
+    key.extend_from_slice(&locator.0.to_be_bytes());
+    key.extend_from_slice(&locator.1.to_be_bytes());
+    key.extend_from_slice(&locator.2.to_be_bytes());
+    key.extend_from_slice(&locator.3.to_be_bytes());
+    key
+}
+
+fn posting_locator(key: &[u8]) -> Option<PostingLocator> {
+    if key.len() < 24 || key[..2] != POSTING_TAG {
+        return None;
+    }
+    let tail = &key[key.len() - 22..];
+    Some((
+        u64::from_be_bytes(tail[0..8].try_into().ok()?),
+        u32::from_be_bytes(tail[8..12].try_into().ok()?),
+        i64::from_be_bytes(tail[12..20].try_into().ok()?),
+        u16::from_be_bytes(tail[20..22].try_into().ok()?),
+    ))
+}
+
+fn posting_bounds(bounds: &index::RangeBytes) -> index::RangeBytes {
+    let map = |bound: &Bound<Vec<u8>>| match bound {
+        Bound::Included(value) => {
+            let mut out = POSTING_TAG.to_vec();
+            out.extend_from_slice(value);
+            Bound::Included(out)
+        }
+        Bound::Excluded(value) => {
+            let mut out = POSTING_TAG.to_vec();
+            out.extend_from_slice(value);
+            Bound::Excluded(out)
+        }
+        Bound::Unbounded => Bound::Unbounded,
+    };
+    (map(&bounds.0), map(&bounds.1))
+}
+
+fn posting_update(
+    db: &Database<Bytes, Bytes>,
+    txn: &mut RwTxn<'_>,
+    vb: &[u8],
+    locator: PostingLocator,
+    seq: u32,
+    add: bool,
+) -> Result<()> {
+    let key = posting_key(vb, locator);
+    let mut bits = db.get(&*txn, &key)?.unwrap_or_default().to_vec();
+    let byte = (seq / 8) as usize;
+    let mask = 1u8 << (seq % 8);
+    if add {
+        if bits.len() <= byte {
+            bits.resize(byte + 1, 0);
+        }
+        bits[byte] |= mask;
+    } else if let Some(value) = bits.get_mut(byte) {
+        *value &= !mask;
+        while bits.last() == Some(&0) {
+            bits.pop();
+        }
+    }
+    if bits.is_empty() {
+        db.delete(&mut *txn, &key)?;
+    } else {
+        db.put(&mut *txn, &key, &bits)?;
+    }
+    Ok(())
+}
+
+fn posting_conflict(
+    db: &Database<Bytes, Bytes>,
+    txn: &RoTxn<'_>,
+    vb: &[u8],
+    allowed: &HashSet<(PostingLocator, u32)>,
+) -> Result<bool> {
+    let mut prefix = POSTING_TAG.to_vec();
+    prefix.extend_from_slice(vb);
+    for item in db.prefix_iter(txn, prefix.as_slice())? {
+        let (key, bits) = item?;
+        let Some(locator) = posting_locator(key) else {
+            continue;
+        };
+        for (byte, &bits_byte) in bits.iter().enumerate() {
+            let mut value = bits_byte;
+            while value != 0 {
+                let bit = value.trailing_zeros();
+                let seq = (byte * 8) as u32 + bit;
+                if !allowed.contains(&(locator, seq)) {
+                    return Ok(true);
+                }
+                value &= value - 1;
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn posting_ids(
+    db: &Database<Bytes, Bytes>,
+    txn: &RoTxn<'_>,
+    bounds: &index::RangeBytes,
+) -> Result<HashSet<String>> {
+    let posting_bounds = posting_bounds(bounds);
+    let range = (as_bound(&posting_bounds.0), as_bound(&posting_bounds.1));
+    let mut ids = HashSet::new();
+    for item in db.range(txn, &range)? {
+        let (key, bits) = item?;
+        let Some(locator) = posting_locator(key) else {
+            continue;
+        };
+        for (byte, &bits_byte) in bits.iter().enumerate() {
+            let mut value = bits_byte;
+            while value != 0 {
+                let bit = value.trailing_zeros();
+                let seq = (byte * 8) as u32 + bit;
+                ids.insert(crate::timeseries::row_id(
+                    locator.0, locator.1, locator.2, locator.3, seq,
+                ));
+                value &= value - 1;
+            }
+        }
+    }
+    Ok(ids)
 }
 
 /// `find` query parameters.
@@ -615,15 +750,189 @@ impl<'e> Collection<'e> {
         &self.name
     }
 
-    /// Collection profile (`standard` or `vault`).
+    /// Collection profile (`standard`, `vault`, or `timeseries`).
     pub fn profile(&self) -> CollectionProfile {
         self.profile
+    }
+
+    /// Time-series settings, or `None` for non-time-series collections.
+    pub fn timeseries_settings_in(
+        &self,
+        txn: &RoTxn<'_>,
+    ) -> Result<Option<crate::timeseries::Settings>> {
+        if !self.profile.is_timeseries() {
+            return Ok(None);
+        }
+        let key = format!("{}{}", crate::timeseries::SETTINGS_META_PREFIX, self.name);
+        match self.meta.get(txn, key.as_bytes())? {
+            Some(raw) => Ok(Some(crate::timeseries::parse_settings(raw)?)),
+            None => Ok(Some(crate::timeseries::Settings::default())),
+        }
+    }
+
+    /// Stores time-series settings for this collection.
+    pub fn set_timeseries_settings_in(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        settings: &crate::timeseries::Settings,
+    ) -> Result<()> {
+        settings.validate()?;
+        let key = format!("{}{}", crate::timeseries::SETTINGS_META_PREFIX, self.name);
+        let bytes = serde_json::to_vec(settings)?;
+        self.meta.put(&mut *wtxn, key.as_bytes(), &bytes)?;
+        Ok(())
+    }
+
+    /// Stores time-series settings for this collection using its own write
+    /// transaction.
+    pub fn set_timeseries_settings(&self, settings: &crate::timeseries::Settings) -> Result<()> {
+        let mut wtxn = self.write_txn()?;
+        self.set_timeseries_settings_in(&mut wtxn, settings)?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    /// Compression and size statistics for a time-series collection.
+    /// Time-based retention that also removes index entries for reaped rows.
+    pub fn retain_timeseries_txn(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        before_ms: i64,
+    ) -> Result<crate::timeseries::RetainReport> {
+        let settings = self.timeseries_settings_in(&*wtxn)?.ok_or_else(|| {
+            Error::Query(format!(
+                "collection `{}` is not a time-series collection",
+                self.name
+            ))
+        })?;
+        let has_indexes = !self.index_defs(&*wtxn)?.is_empty()
+            || !self.search_index_defs_in(&*wtxn)?.is_empty()
+            || !self.vector_defs(&*wtxn)?.is_empty();
+        if !has_indexes {
+            return crate::timeseries::retain(wtxn, self.env, &self.name, &settings, before_ms);
+        }
+        let report = crate::timeseries::retain_with_reaped(
+            wtxn, self.env, &self.name, &settings, before_ms,
+        )?;
+        for (id, doc) in &report.reaped {
+            self.apply_all_index_entries(wtxn, Some(doc), None, id)?;
+        }
+        Ok(report)
+    }
+
+    pub fn timeseries_stats(&self) -> Result<Option<crate::timeseries::Stats>> {
+        if !self.profile.is_timeseries() {
+            return Ok(None);
+        }
+        let rtxn = self.read_txn()?;
+        let settings = self.timeseries_settings_in(&rtxn)?.unwrap_or_default();
+        let stats = crate::timeseries::stats(&rtxn, self.env, &self.name, &settings)?;
+        rtxn.commit()?;
+        Ok(Some(stats))
+    }
+
+    fn timeseries_index_ids(
+        &self,
+        rtxn: &RoTxn<'_>,
+        filter: &Value,
+        hint: Option<&IndexHint>,
+    ) -> Result<Option<HashSet<String>>> {
+        let Some(plan) = self.query_index_plan(rtxn, filter, hint)? else {
+            return Ok(None);
+        };
+        if plan.def.postings && !plan.def.geo {
+            return Ok(Some(posting_ids(&plan.db, rtxn, &plan.bounds)?));
+        }
+        let range = (as_bound(&plan.bounds.0), as_bound(&plan.bounds.1));
+        let mut ids = HashSet::new();
+        for item in plan.db.range(rtxn, &range)? {
+            let (_key, value) = item?;
+            if let Some((id, _)) = index::decode_index_value(value) {
+                ids.insert(id);
+            }
+        }
+        Ok(Some(ids))
+    }
+
+    fn find_timeseries_in(&self, rtxn: &RoTxn<'_>, query: &FindQuery) -> Result<Vec<Value>> {
+        let settings = self.timeseries_settings_in(rtxn)?.unwrap_or_default();
+        if let Some((field, near)) = geo::extract_near(&query.filter) {
+            let docs = match self.geo_index_candidates(rtxn, &query.filter)? {
+                Some(ids) => {
+                    let ids: HashSet<String> = ids.into_iter().collect();
+                    crate::timeseries::find_with_ids(
+                        rtxn,
+                        self.env,
+                        &self.name,
+                        &settings,
+                        query,
+                        Some(&ids),
+                    )?
+                }
+                None => crate::timeseries::find(rtxn, self.env, &self.name, &settings, query)?,
+            };
+            let limit = query.limit.unwrap_or(usize::MAX);
+            let mut hits: Vec<(f64, Value)> = docs
+                .into_iter()
+                .filter_map(|doc| {
+                    geo::field_distance(&doc, &field, near.center).map(|distance| (distance, doc))
+                })
+                .collect();
+            hits.sort_by(|a, b| a.0.total_cmp(&b.0));
+            return Ok(hits
+                .into_iter()
+                .skip(query.skip)
+                .take(limit)
+                .map(|(_, doc)| match &query.projection {
+                    Some(projection) => project(&doc, projection, Some(&query.filter)),
+                    None => doc,
+                })
+                .collect());
+        }
+        let hint = query.hint.as_ref().map(parse_index_hint).transpose()?;
+        if let Some(ids) = self.timeseries_index_ids(rtxn, &query.filter, hint.as_ref())? {
+            return crate::timeseries::find_with_ids(
+                rtxn,
+                self.env,
+                &self.name,
+                &settings,
+                query,
+                Some(&ids),
+            );
+        }
+        crate::timeseries::find(rtxn, self.env, &self.name, &settings, query)
     }
 
     /// Storage summary for this collection. Data and index bytes come from
     /// LMDB B-tree page allocation; shared history/TTL bytes are added by the
     /// store-level aggregation.
     pub fn storage_stats(&self, txn: &RoTxn<'_>) -> Result<CollectionStorageStats> {
+        if self.profile.is_timeseries() {
+            let settings = self.timeseries_settings_in(txn)?.unwrap_or_default();
+            let stats = crate::timeseries::stats(txn, self.env, &self.name, &settings)?;
+            let db_name = format!("{}{}", crate::timeseries::BUCKET_DB_PREFIX, self.name);
+            let data_bytes = self
+                .env
+                .open_database::<Bytes, Bytes>(txn, Some(&db_name))?
+                .map(|db| db.stat(txn).map(|stat| stat_bytes(&stat)))
+                .transpose()?
+                .unwrap_or(0);
+            let mut index_bytes = 0u64;
+            let mut indexes = 0u64;
+            for def in self.index_defs(txn)? {
+                let resource = index::db_name(&self.name, &def.name());
+                if let Some(bytes) = self.resource_db_bytes(txn, &resource, &resource)? {
+                    index_bytes = index_bytes.saturating_add(bytes);
+                    indexes += 1;
+                }
+            }
+            return Ok(CollectionStorageStats {
+                records: stats.rows,
+                data_bytes,
+                index_bytes,
+                indexes,
+            });
+        }
         let data = self.db.stat(txn)?;
         let mut index_bytes = 0u64;
         let mut indexes = 0u64;
@@ -971,6 +1280,33 @@ impl<'e> Collection<'e> {
         self.resource_db_in(wtxn, &name, &name)
     }
 
+    /// Fetches a document by `_id`, branching to the bucket store for
+    /// time-series collections.
+    fn document_in(&self, txn: &RoTxn<'_>, id: &str) -> Result<Option<Value>> {
+        if self.profile.is_timeseries() {
+            let settings = self.timeseries_settings_in(txn)?.unwrap_or_default();
+            return crate::timeseries::find_by_id(txn, self.env, &self.name, &settings, id);
+        }
+        self.db.get(txn, id.as_bytes())?.map(parse_json).transpose()
+    }
+
+    /// Every document, used to backfill text/fuzzy/vector indexes.
+    fn documents_for_backfill(&self, txn: &RoTxn<'_>) -> Result<Vec<(String, Value)>> {
+        if self.profile.is_timeseries() {
+            let settings = self.timeseries_settings_in(txn)?.unwrap_or_default();
+            return crate::timeseries::all_docs(txn, self.env, &self.name, &settings);
+        }
+        let mut out = Vec::new();
+        for item in self.db.iter(txn)? {
+            let (id, bytes) = item?;
+            let id = std::str::from_utf8(id)
+                .map_err(|e| Error::Query(format!("invalid document id: {e}")))?
+                .to_string();
+            out.push((id, parse_json(bytes)?));
+        }
+        Ok(out)
+    }
+
     /// Creates multiple secondary indexes in one collection scan.
     ///
     /// Parsing and key encoding run in parallel; all index writes happen in the
@@ -1035,6 +1371,9 @@ impl<'e> Collection<'e> {
                 def.directions = spec.directions.clone();
                 def.directions_encoded = def.directions.iter().any(|direction| *direction < 0);
             }
+            if self.profile.is_timeseries() && !def.geo {
+                def.postings = true;
+            }
             let name = def.name();
             if name == "_id_" {
                 return Err(Error::Query("index name `_id_` is reserved".into()));
@@ -1066,6 +1405,10 @@ impl<'e> Collection<'e> {
             defs.push((key, def));
         }
 
+        if self.profile.is_timeseries() {
+            self.backfill_timeseries_indexes_txn(wtxn, &mut defs)?;
+            return Ok(());
+        }
         let total_docs = self.db.stat(wtxn)?.entries as u64;
         let index_dbs: Vec<_> = defs
             .iter()
@@ -1135,6 +1478,99 @@ impl<'e> Collection<'e> {
             }
             def.multikey_all_docs = docs_per_index[slot] == total_docs;
             let key = index::def_key(&self.name, &def.name());
+            self.meta.put(
+                &mut *wtxn,
+                key.as_bytes(),
+                serde_json::to_vec(def)?.as_slice(),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Backfills secondary indexes from time-series rows. Rows live in bucket
+    /// databases instead of `coll:<name>`, so they cannot use the document
+    /// backfill path.
+    fn backfill_timeseries_indexes_txn(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        defs: &mut [(String, IndexDef)],
+    ) -> Result<()> {
+        let settings = self.timeseries_settings_in(&*wtxn)?.unwrap_or_default();
+        let index_dbs: Vec<_> = defs
+            .iter()
+            .map(|(_key, def)| self.index_db_in(wtxn, def))
+            .collect::<Result<_>>()?;
+        for db in &index_dbs {
+            db.clear(&mut *wtxn)?;
+        }
+        let mut total = 0u64;
+        let mut docs_per_index = vec![0u64; defs.len()];
+        let mut multikey_fields: Vec<Vec<String>> = vec![Vec::new(); defs.len()];
+        crate::timeseries::scan_index_docs(
+            wtxn,
+            self.env,
+            &self.name,
+            &settings,
+            4096,
+            |wtxn, docs| {
+                total = total.saturating_add(docs.len() as u64);
+                for (id, doc) in &docs {
+                    for (slot, ((_key, def), db)) in defs.iter().zip(index_dbs.iter()).enumerate() {
+                        let keys = index::encode_index_keys(def, doc)?;
+                        if keys.keys.is_empty() {
+                            continue;
+                        }
+                        docs_per_index[slot] = docs_per_index[slot].saturating_add(1);
+                        for field in &keys.multikey_fields {
+                            if !multikey_fields[slot].contains(field) {
+                                multikey_fields[slot].push(field.clone());
+                            }
+                        }
+                        if def.geo {
+                            let value = index::encode_index_value(def, doc, id);
+                            for vb in keys.keys {
+                                if def.unique {
+                                    for item in db.prefix_iter(&*wtxn, vb.as_slice())? {
+                                        let (_key, existing) = item?;
+                                        if index::decode_index_value(existing)
+                                            .is_some_and(|(existing_id, _)| existing_id != *id)
+                                        {
+                                            return Err(Error::DuplicateKey(id.clone()));
+                                        }
+                                    }
+                                }
+                                let mut key = vb;
+                                key.extend_from_slice(id.as_bytes());
+                                db.put(&mut *wtxn, key.as_slice(), value.as_slice())?;
+                            }
+                            continue;
+                        }
+                        let Some((hash, salt, window, serial, seq)) =
+                            crate::timeseries::locator_for_id(&*wtxn, self.env, &self.name, id)?
+                        else {
+                            continue;
+                        };
+                        let locator = (hash, salt, window, serial);
+                        let allowed: HashSet<(PostingLocator, u32)> =
+                            std::iter::once((locator, seq)).collect();
+                        for vb in keys.keys {
+                            if def.unique && posting_conflict(db, &*wtxn, &vb, &allowed)? {
+                                return Err(Error::DuplicateKey(id.clone()));
+                            }
+                            posting_update(db, wtxn, &vb, locator, seq, true)?;
+                        }
+                    }
+                }
+                Ok(())
+            },
+        )?;
+        for (slot, (key, def)) in defs.iter_mut().enumerate() {
+            for field in &multikey_fields[slot] {
+                if !def.multikey_fields.contains(field) {
+                    def.multikey_fields.push(field.clone());
+                }
+            }
+            def.multikey_all_docs = docs_per_index[slot] == total;
             self.meta.put(
                 &mut *wtxn,
                 key.as_bytes(),
@@ -1280,6 +1716,9 @@ impl<'e> Collection<'e> {
         def.sparse = sparse;
         def.partial_filter_expression = partial_filter_expression;
         validate_partial_filter(def.partial_filter_expression.as_ref())?;
+        if self.profile.is_timeseries() && !def.geo {
+            def.postings = true;
+        }
         let key = index::def_key(&self.name, &def.name());
         self.meta.put(
             &mut *wtxn,
@@ -1288,6 +1727,10 @@ impl<'e> Collection<'e> {
         )?;
         let idx_db = self.index_db_in(wtxn, &def)?;
         idx_db.clear(&mut *wtxn)?;
+        if self.profile.is_timeseries() {
+            self.backfill_timeseries_indexes_txn(wtxn, &mut [(key, def)])?;
+            return Ok(());
+        }
 
         // Backfill incrementally: workers parse/encode, the main thread writes
         // each completed chunk into the index immediately.
@@ -1409,6 +1852,21 @@ impl<'e> Collection<'e> {
             let Some(db) = self.index_db(txn, &def)? else {
                 continue;
             };
+            if def.postings && !def.geo {
+                let allowed: HashSet<(PostingLocator, u32)> =
+                    crate::timeseries::locator_for_id(txn, self.env, &self.name, id)?
+                        .map(|(hash, salt, window, serial, seq)| {
+                            ((hash, salt, window, serial), seq)
+                        })
+                        .into_iter()
+                        .collect();
+                for vb in keys.keys {
+                    if posting_conflict(&db, txn, &vb, &allowed)? {
+                        return Err(Error::DuplicateKey(id.to_string()));
+                    }
+                }
+                continue;
+            }
             for vb in keys.keys {
                 for item in db.prefix_iter(txn, vb.as_slice())? {
                     let (_key, existing) = item?;
@@ -1419,6 +1877,172 @@ impl<'e> Collection<'e> {
                     }
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Validates unique indexes for a whole insert batch before any row is
+    /// written, including duplicates inside the batch.
+    fn validate_unique_batch(&self, txn: &RoTxn<'_>, docs: &[Value]) -> Result<()> {
+        for def in self.index_defs(txn)? {
+            if !def.unique {
+                continue;
+            }
+            let Some(db) = self.index_db(txn, &def)? else {
+                continue;
+            };
+            let mut seen: HashSet<Vec<u8>> = HashSet::new();
+            let no_locators: HashSet<(PostingLocator, u32)> = HashSet::new();
+            for doc in docs {
+                let id = doc
+                    .get("_id")
+                    .and_then(id::key_from_value)
+                    .unwrap_or_default();
+                let keys = index::encode_index_keys(&def, doc)?;
+                for vb in keys.keys {
+                    if !seen.insert(vb.clone()) {
+                        return Err(Error::DuplicateKey(id));
+                    }
+                    if def.postings && !def.geo {
+                        if posting_conflict(&db, txn, &vb, &no_locators)? {
+                            return Err(Error::DuplicateKey(id));
+                        }
+                        continue;
+                    }
+                    for item in db.prefix_iter(txn, vb.as_slice())? {
+                        let (_key, existing) = item?;
+                        if index::decode_index_value(existing)
+                            .is_some_and(|(existing_id, _)| existing_id != id)
+                        {
+                            return Err(Error::DuplicateKey(id));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Validates a multi-row update as one set: old entries of every updated id
+    /// are ignored (they are about to be replaced), while collisions within the
+    /// new batch are rejected before any row is written.
+    fn validate_unique_updates(&self, txn: &RoTxn<'_>, updates: &[(String, Value)]) -> Result<()> {
+        let updated: HashSet<String> = updates.iter().map(|(id, _)| id.clone()).collect();
+        for def in self.index_defs(txn)? {
+            if !def.unique {
+                continue;
+            }
+            let Some(db) = self.index_db(txn, &def)? else {
+                continue;
+            };
+            let mut seen: HashSet<Vec<u8>> = HashSet::new();
+            let mut allowed: HashSet<(PostingLocator, u32)> = HashSet::new();
+            if def.postings && !def.geo {
+                for id in &updated {
+                    if let Some((hash, salt, window, serial, seq)) =
+                        crate::timeseries::locator_for_id(txn, self.env, &self.name, id)?
+                    {
+                        allowed.insert(((hash, salt, window, serial), seq));
+                    }
+                }
+            }
+            for (id, doc) in updates {
+                let keys = index::encode_index_keys(&def, doc)?;
+                for vb in keys.keys {
+                    if !seen.insert(vb.clone()) {
+                        return Err(Error::DuplicateKey(id.clone()));
+                    }
+                    if def.postings && !def.geo {
+                        if posting_conflict(&db, txn, &vb, &allowed)? {
+                            return Err(Error::DuplicateKey(id.clone()));
+                        }
+                        continue;
+                    }
+                    for item in db.prefix_iter(txn, vb.as_slice())? {
+                        let (_key, existing) = item?;
+                        if let Some((existing_id, _)) = index::decode_index_value(existing) {
+                            if existing_id != *id && !updated.contains(&existing_id) {
+                                return Err(Error::DuplicateKey(id.clone()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn normalize_for_index(doc: &mut Value) -> Result<()> {
+        date::normalize_document(doc)?;
+        numeric::normalize_document(doc)?;
+        bson_types::normalize_document(doc)?;
+        Ok(())
+    }
+
+    /// Updates secondary, text, fuzzy, and vector entries for one row.
+    fn apply_all_index_entries(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        old: Option<&Value>,
+        new: Option<&Value>,
+        id: &str,
+    ) -> Result<()> {
+        self.apply_index_entries(wtxn, old, new, id)?;
+        self.apply_text_entries(wtxn, old, new, id)?;
+        self.apply_fuzzy_entries(wtxn, old, new, id)?;
+        self.apply_vector_entries(wtxn, old, new, id)?;
+        Ok(())
+    }
+
+    fn apply_timeseries_posting_entries(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        def: &IndexDef,
+        old: Option<&Value>,
+        new: Option<&Value>,
+        id: &str,
+    ) -> Result<()> {
+        let empty = index::IndexKeys {
+            keys: Vec::new(),
+            multikey_fields: Vec::new(),
+        };
+        let mut old_keys = old
+            .map(|doc| index::encode_index_keys(def, doc))
+            .transpose()?
+            .unwrap_or(empty);
+        let new_keys = new
+            .map(|doc| index::encode_index_keys(def, doc))
+            .transpose()?
+            .unwrap_or(index::IndexKeys {
+                keys: Vec::new(),
+                multikey_fields: Vec::new(),
+            });
+        old_keys.keys.sort();
+        old_keys.keys.dedup();
+        if old_keys.keys == new_keys.keys {
+            return Ok(());
+        }
+        let Some((hash, salt, window, serial, seq)) =
+            crate::timeseries::locator_for_id(&*wtxn, self.env, &self.name, id)?
+        else {
+            return Ok(());
+        };
+        let locator = (hash, salt, window, serial);
+        let idx_db = self.index_db_in(wtxn, def)?;
+        let allowed: HashSet<(PostingLocator, u32)> = std::iter::once((locator, seq)).collect();
+        for vb in &old_keys.keys {
+            if !new_keys.keys.contains(vb) {
+                posting_update(&idx_db, wtxn, vb, locator, seq, false)?;
+            }
+        }
+        for vb in &new_keys.keys {
+            if old_keys.keys.contains(vb) {
+                continue;
+            }
+            if def.unique && posting_conflict(&idx_db, &*wtxn, vb, &allowed)? {
+                return Err(Error::DuplicateKey(id.to_string()));
+            }
+            posting_update(&idx_db, wtxn, vb, locator, seq, true)?;
         }
         Ok(())
     }
@@ -1434,6 +2058,10 @@ impl<'e> Collection<'e> {
     ) -> Result<()> {
         let defs = self.index_defs(&*wtxn)?;
         for mut def in defs {
+            if self.profile.is_timeseries() && def.postings && !def.geo {
+                self.apply_timeseries_posting_entries(wtxn, &def, old, new, id)?;
+                continue;
+            }
             let mut old_keys = old
                 .map(|doc| index::encode_index_keys(&def, doc))
                 .transpose()?
@@ -2265,6 +2893,27 @@ impl<'e> Collection<'e> {
 
         let db = self.vector_db_in(wtxn, field)?;
         db.clear(&mut *wtxn)?;
+        if self.profile.is_timeseries() {
+            for (id, doc) in self.documents_for_backfill(&*wtxn)? {
+                let Some(vector) =
+                    index::field_value(&doc, field).and_then(|v| vector::parse_vector(v, dims))
+                else {
+                    continue;
+                };
+                db.put(
+                    &mut *wtxn,
+                    id.as_bytes(),
+                    vector::encode_vector(&vector).as_slice(),
+                )?;
+            }
+            let def = VectorDef::new(field, dims, metric);
+            self.meta.put(
+                &mut *wtxn,
+                def_key.as_bytes(),
+                serde_json::to_vec(&def)?.as_slice(),
+            )?;
+            return Ok(());
+        }
         self.parallel_backfill_apply(
             wtxn,
             "vector",
@@ -2600,10 +3249,9 @@ impl<'e> Collection<'e> {
             if let Some(ids) = ids {
                 let mut heap: BinaryHeap<Candidate> = BinaryHeap::new();
                 for id in ids {
-                    let Some(raw_doc) = self.db.get(rtxn, id.as_bytes())? else {
+                    let Some(doc) = self.document_in(rtxn, &id)? else {
                         continue;
                     };
-                    let doc: Value = parse_json(raw_doc)?;
                     if !matches(&doc, filter) {
                         continue;
                     }
@@ -2657,10 +3305,12 @@ impl<'e> Collection<'e> {
                 }
             }
             if filter_active {
-                let Some(raw_doc) = self.db.get(rtxn, key)? else {
+                let Some(id) = std::str::from_utf8(key).ok() else {
                     continue;
                 };
-                let doc: Value = parse_json(raw_doc)?;
+                let Some(doc) = self.document_in(rtxn, id)? else {
+                    continue;
+                };
                 if !matches(&doc, filter) {
                     continue;
                 }
@@ -2822,10 +3472,9 @@ impl<'e> Collection<'e> {
         });
         let mut out = Vec::new();
         for candidate in ranked.into_iter().skip(skip).take(limit) {
-            let Some(bytes) = self.db.get(rtxn, candidate.id.as_bytes())? else {
+            let Some(mut doc) = self.document_in(rtxn, &candidate.id)? else {
                 continue;
             };
-            let mut doc: Value = parse_json(bytes)?;
             if let Some(object) = doc.as_object_mut() {
                 object.insert(
                     "_distance".to_string(),
@@ -3014,13 +3663,12 @@ impl<'e> Collection<'e> {
         let rel = format!("{dir}/full-{stamp}.seg");
         let mut builder = SegmentBuilder::new(root.join(&rel))?;
         let field = &def.fields[0].path;
-        for item in self.db.iter(&*wtxn)? {
-            let (id_bytes, doc_bytes) = item?;
-            let id = std::str::from_utf8(id_bytes)
-                .map_err(|e| Error::Query(format!("invalid document id: {e}")))?;
-            let doc: Value = serde_json::from_slice(doc_bytes)?;
+        let docs = self.documents_for_backfill(&*wtxn)?;
+        eprintln!("text backfill docs: {}", docs.len());
+        for (id, doc) in docs {
             if let Some(text) = index::field_value(&doc, field).and_then(search::field_text) {
-                builder.add_document(id, &text)?;
+                eprintln!("text add {id}: {text}");
+                builder.add_document(&id, &text)?;
             }
         }
         builder.finish()?;
@@ -3087,13 +3735,9 @@ impl<'e> Collection<'e> {
         let values_rel = format!("{dir}/full-{stamp}.values");
         let mut builder = FuzzySegmentBuilder::new(root.join(&rel))?;
         let field = &def.fields[0].path;
-        for item in self.db.iter(&*wtxn)? {
-            let (id_bytes, doc_bytes) = item?;
-            let id = std::str::from_utf8(id_bytes)
-                .map_err(|e| Error::Query(format!("invalid document id: {e}")))?;
-            let doc: Value = serde_json::from_slice(doc_bytes)?;
+        for (id, doc) in self.documents_for_backfill(&*wtxn)? {
             if let Some(text) = index::field_value(&doc, field).and_then(search::field_text) {
-                builder.add_document(id, &text)?;
+                builder.add_document(&id, &text)?;
             }
         }
         builder.finish(root.join(&values_rel))?;
@@ -3301,13 +3945,9 @@ impl<'e> Collection<'e> {
         let values_path = root.join(&values_rel);
         let mut builder = FuzzySegmentBuilder::new(&path)?;
         let field = &def.fields[0].path;
-        for item in self.db.iter(&*wtxn)? {
-            let (id_bytes, doc_bytes) = item?;
-            let id = std::str::from_utf8(id_bytes)
-                .map_err(|e| Error::Query(format!("invalid document id: {e}")))?;
-            let doc: Value = serde_json::from_slice(doc_bytes)?;
+        for (id, doc) in self.documents_for_backfill(&*wtxn)? {
             if let Some(text) = index::field_value(&doc, field).and_then(search::field_text) {
-                builder.add_document(id, &text)?;
+                builder.add_document(&id, &text)?;
             }
         }
         builder.finish(&values_path)?;
@@ -3494,9 +4134,7 @@ impl<'e> Collection<'e> {
         let mut documents = 0u64;
         let mut total_doc_len = 0u64;
         let mut df: HashMap<String, u64> = HashMap::new();
-        for item in self.db.iter(&*wtxn)? {
-            let (_, doc_bytes) = item?;
-            let doc: Value = serde_json::from_slice(doc_bytes)?;
+        for (_, doc) in self.documents_for_backfill(&*wtxn)? {
             let Some(text) = index::field_value(&doc, field).and_then(search::field_text) else {
                 continue;
             };
@@ -3634,13 +4272,9 @@ impl<'e> Collection<'e> {
         let path = root.join(&rel);
         let mut builder = SegmentBuilder::new(&path)?;
         let field = &def.fields[0].path;
-        for item in self.db.iter(&*wtxn)? {
-            let (id_bytes, doc_bytes) = item?;
-            let id = std::str::from_utf8(id_bytes)
-                .map_err(|e| Error::Query(format!("invalid document id: {e}")))?;
-            let doc: Value = serde_json::from_slice(doc_bytes)?;
+        for (id, doc) in self.documents_for_backfill(&*wtxn)? {
             if let Some(text) = index::field_value(&doc, field).and_then(search::field_text) {
-                builder.add_document(id, &text)?;
+                builder.add_document(&id, &text)?;
             }
         }
         builder.finish()?;
@@ -4348,10 +4982,9 @@ impl<'e> Collection<'e> {
         };
         let mut out = Vec::with_capacity(hits.len());
         for hit in hits {
-            let Some(bytes) = self.db.get(rtxn, hit.id.as_bytes())? else {
+            let Some(mut doc) = self.document_in(rtxn, &hit.id)? else {
                 continue;
             };
-            let mut doc: Value = serde_json::from_slice(bytes)?;
             if let Some(obj) = doc.as_object_mut() {
                 obj.insert("_score".to_string(), serde_json::json!(hit.score));
             }
@@ -4460,14 +5093,9 @@ impl<'e> Collection<'e> {
         }
         let candidate_query = candidate_terms.join(" ");
         let verify = |id: &str| -> std::io::Result<Option<f64>> {
-            let Some(bytes) = self
-                .db
-                .get(rtxn, id.as_bytes())
-                .map_err(std::io::Error::other)?
-            else {
+            let Some(doc) = self.document_in(rtxn, id).map_err(std::io::Error::other)? else {
                 return Ok(None);
             };
-            let doc: Value = serde_json::from_slice(bytes).map_err(std::io::Error::other)?;
             if needs_filter && !matches(&doc, filter) {
                 return Ok(None);
             }
@@ -4581,10 +5209,9 @@ impl<'e> Collection<'e> {
         hits.truncate(limit);
         let mut out = Vec::with_capacity(hits.len());
         for (distance, id) in hits {
-            let Some(bytes) = self.db.get(rtxn, id.as_bytes())? else {
+            let Some(mut doc) = self.document_in(rtxn, &id)? else {
                 continue;
             };
-            let mut doc: Value = serde_json::from_slice(bytes)?;
             if let Some(obj) = doc.as_object_mut() {
                 obj.insert("_distance".to_string(), serde_json::json!(distance));
             }
@@ -4670,14 +5297,10 @@ impl<'e> Collection<'e> {
         };
         let needs_filter = !empty_filter && allowed.is_none();
         let verify = |id: &str| -> std::io::Result<Option<f64>> {
-            let Some(bytes) = self
-                .db
-                .get(rtxn, id.as_bytes())
-                .map_err(std::io::Error::other)?
-            else {
+            let doc = self.document_in(rtxn, id).map_err(std::io::Error::other)?;
+            let Some(doc) = doc else {
                 return Ok(None);
             };
-            let doc: Value = serde_json::from_slice(bytes).map_err(std::io::Error::other)?;
             Ok(matches(&doc, filter).then_some(0.0))
         };
         let verify: Option<&DocVerifier<'_>> = needs_filter.then_some(&verify);
@@ -4699,8 +5322,64 @@ impl<'e> Collection<'e> {
         Ok(id)
     }
 
+    /// Inserts many documents in one writer transaction. Time-series
+    /// collections resolve each open bucket once and flush pointers at the end.
+    pub fn insert_many_txn(&self, wtxn: &mut RwTxn<'_>, docs: &[Value]) -> Result<Vec<String>> {
+        if self.profile.is_timeseries() {
+            let settings = self.timeseries_settings_in(&*wtxn)?.unwrap_or_default();
+            let mut normalized = Vec::with_capacity(docs.len());
+            for doc in docs {
+                let mut doc = doc.clone();
+                Self::normalize_for_index(&mut doc)?;
+                normalized.push(doc);
+            }
+            self.validate_unique_batch(&*wtxn, &normalized)?;
+            let ids = crate::timeseries::insert_many(wtxn, self.env, &self.name, &settings, docs)?;
+            for (doc, id) in docs.iter().zip(ids.iter()) {
+                let mut doc = doc.clone();
+                if !doc
+                    .as_object()
+                    .is_some_and(|object| object.contains_key("_id"))
+                {
+                    if let Some(object) = doc.as_object_mut() {
+                        object.insert("_id".into(), Value::String(id.clone()));
+                    }
+                }
+                self.validate_unique(&*wtxn, &doc, id)?;
+                self.apply_all_index_entries(wtxn, None, Some(&doc), id)?;
+            }
+            return Ok(ids);
+        }
+        let mut ids = Vec::with_capacity(docs.len());
+        for doc in docs {
+            ids.push(self.insert_one_txn(wtxn, doc.clone())?);
+        }
+        Ok(ids)
+    }
+
     /// Inserts a document in the given transaction. Assigns `_id` (UUID v4) if missing.
     pub fn insert_one_txn(&self, wtxn: &mut RwTxn<'_>, mut doc: Value) -> Result<String> {
+        if self.profile.is_timeseries() {
+            let settings = self.timeseries_settings_in(&*wtxn)?.unwrap_or_default();
+            let mut check = doc.clone();
+            Self::normalize_for_index(&mut check)?;
+            let check_id = check
+                .get("_id")
+                .and_then(id::key_from_value)
+                .unwrap_or_default();
+            self.validate_unique(&*wtxn, &check, &check_id)?;
+            let id = crate::timeseries::insert(wtxn, self.env, &self.name, &settings, doc)?;
+            if let Some(doc) =
+                crate::timeseries::find_by_id(&*wtxn, self.env, &self.name, &settings, &id)?
+            {
+                self.validate_unique(&*wtxn, &doc, &id)?;
+                self.apply_index_entries(wtxn, None, Some(&doc), &id)?;
+                self.apply_text_entries(wtxn, None, Some(&doc), &id)?;
+                self.apply_fuzzy_entries(wtxn, None, Some(&doc), &id)?;
+                self.apply_vector_entries(wtxn, None, Some(&doc), &id)?;
+            }
+            return Ok(id);
+        }
         self.ensure_standard()?;
         let ttl_at = ttl::take_insert_ttl_with_field(
             &mut doc,
@@ -4750,6 +5429,12 @@ impl<'e> Collection<'e> {
     /// upserted key back into the original BSON `_id` value.
     pub fn find_by_key(&self, key: &str) -> Result<Option<Value>> {
         let rtxn = self.read_txn()?;
+        if self.profile.is_timeseries() {
+            let settings = self.timeseries_settings_in(&rtxn)?.unwrap_or_default();
+            let out = crate::timeseries::find_by_id(&rtxn, self.env, &self.name, &settings, key)?;
+            rtxn.commit()?;
+            return Ok(out);
+        }
         let out = self
             .db
             .get(&rtxn, key.as_bytes())?
@@ -4769,6 +5454,69 @@ impl<'e> Collection<'e> {
         after: Option<&Value>,
         ttl_at: Option<u64>,
     ) -> Result<()> {
+        if self.profile.is_timeseries() {
+            // Time-series rows do not live in `coll:<name>`; appending them to
+            // the bucket store keeps replicas byte-compatible with the primary
+            // (same settings, same insert order, same synthetic ids).
+            let settings = self.timeseries_settings_in(&*wtxn)?.unwrap_or_default();
+            match op {
+                "insert" => {
+                    let after = after.ok_or_else(|| {
+                        Error::Query("replication change is missing `after`".into())
+                    })?;
+                    crate::timeseries::insert_replicated(
+                        wtxn, self.env, &self.name, &settings, id, after,
+                    )?;
+                    if let Some(doc) =
+                        crate::timeseries::find_by_id(&*wtxn, self.env, &self.name, &settings, id)?
+                    {
+                        self.validate_unique(&*wtxn, &doc, id)?;
+                        self.apply_index_entries(wtxn, None, Some(&doc), id)?;
+                        self.apply_text_entries(wtxn, None, Some(&doc), id)?;
+                        self.apply_fuzzy_entries(wtxn, None, Some(&doc), id)?;
+                        self.apply_vector_entries(wtxn, None, Some(&doc), id)?;
+                    }
+                    return Ok(());
+                }
+                "update" => {
+                    let after = after.ok_or_else(|| {
+                        Error::Query("replication change is missing `after`".into())
+                    })?;
+                    let before =
+                        crate::timeseries::find_by_id(&*wtxn, self.env, &self.name, &settings, id)?;
+                    crate::timeseries::replace_by_id(
+                        wtxn, self.env, &self.name, &settings, id, after,
+                    )?;
+                    let after =
+                        crate::timeseries::find_by_id(&*wtxn, self.env, &self.name, &settings, id)?;
+                    if let Some(doc) = &after {
+                        self.validate_unique(&*wtxn, doc, id)?;
+                    }
+                    self.apply_index_entries(wtxn, before.as_ref(), after.as_ref(), id)?;
+                    self.apply_text_entries(wtxn, before.as_ref(), after.as_ref(), id)?;
+                    self.apply_fuzzy_entries(wtxn, before.as_ref(), after.as_ref(), id)?;
+                    self.apply_vector_entries(wtxn, before.as_ref(), after.as_ref(), id)?;
+                    return Ok(());
+                }
+                "delete" => {
+                    let before =
+                        crate::timeseries::find_by_id(&*wtxn, self.env, &self.name, &settings, id)?;
+                    crate::timeseries::delete_by_id(wtxn, self.env, &self.name, &settings, id)?;
+                    if let Some(doc) = &before {
+                        self.apply_index_entries(wtxn, Some(doc), None, id)?;
+                        self.apply_text_entries(wtxn, Some(doc), None, id)?;
+                        self.apply_fuzzy_entries(wtxn, Some(doc), None, id)?;
+                        self.apply_vector_entries(wtxn, Some(doc), None, id)?;
+                    }
+                    return Ok(());
+                }
+                other => {
+                    return Err(Error::Query(format!(
+                        "unknown replication operation `{other}`"
+                    )))
+                }
+            }
+        }
         self.ensure_standard()?;
         let existing = self.db.get(&*wtxn, id.as_bytes())?.map(|raw| raw.to_vec());
         let old = existing.as_deref().map(parse_json).transpose()?;
@@ -4880,6 +5628,122 @@ impl<'e> Collection<'e> {
         array_filters: &[Value],
         default_id: Option<&Value>,
     ) -> Result<UpdateOutcome> {
+        if self.profile.is_timeseries() {
+            let settings = self.timeseries_settings_in(&*wtxn)?.unwrap_or_default();
+            let direct_id = (!multi)
+                .then(|| crate::timeseries::exact_id_filter(filter))
+                .flatten();
+            let candidate_ids = if direct_id.is_some() {
+                None
+            } else {
+                self.timeseries_index_ids(&*wtxn, filter, None)?
+            };
+            let before = if let Some(id) = direct_id {
+                crate::timeseries::find_by_id(&*wtxn, self.env, &self.name, &settings, id)?
+                    .into_iter()
+                    .collect()
+            } else {
+                let query = FindQuery {
+                    filter: filter.clone(),
+                    projection: None,
+                    sort: Vec::new(),
+                    skip: 0,
+                    limit: if multi { None } else { Some(1) },
+                    comment: None,
+                    max_time_ms: None,
+                    hint: None,
+                };
+                if let Some(ids) = &candidate_ids {
+                    crate::timeseries::find_with_ids(
+                        &*wtxn,
+                        self.env,
+                        &self.name,
+                        &settings,
+                        &query,
+                        Some(ids),
+                    )?
+                } else {
+                    crate::timeseries::find(&*wtxn, self.env, &self.name, &settings, &query)?
+                }
+            };
+            let mut checks = Vec::with_capacity(before.len());
+            for old in &before {
+                let mut check = old.clone();
+                apply_with_options(&mut check, update, filter, array_filters)?;
+                Self::normalize_for_index(&mut check)?;
+                if let Some(id) = old.get("_id").and_then(id::key_from_value) {
+                    checks.push((id, check));
+                }
+            }
+            self.validate_unique_updates(&*wtxn, &checks)?;
+            if before.is_empty() && upsert {
+                let mut check = seed_from_filter(filter);
+                apply_upsert_with_options(&mut check, update, filter, array_filters)?;
+                Self::normalize_for_index(&mut check)?;
+                let check_id = check
+                    .get("_id")
+                    .and_then(id::key_from_value)
+                    .or_else(|| default_id.and_then(id::key_from_value))
+                    .unwrap_or_default();
+                self.validate_unique(&*wtxn, &check, &check_id)?;
+            }
+            let report = if let Some(ids) = &candidate_ids {
+                crate::timeseries::update_with_ids(
+                    wtxn,
+                    self.env,
+                    &self.name,
+                    &settings,
+                    filter,
+                    update,
+                    multi,
+                    array_filters,
+                    upsert,
+                    ids,
+                )?
+            } else {
+                crate::timeseries::update(
+                    wtxn,
+                    self.env,
+                    &self.name,
+                    &settings,
+                    filter,
+                    update,
+                    multi,
+                    array_filters,
+                    upsert,
+                )?
+            };
+            for old in &before {
+                let Some(old_id) = old.get("_id").and_then(Value::as_str) else {
+                    continue;
+                };
+                if let Some((_, new_id)) = report.moved.iter().find(|(old, _)| old == old_id) {
+                    self.apply_all_index_entries(wtxn, Some(old), None, old_id)?;
+                    if let Some(new_doc) = crate::timeseries::find_by_id(
+                        &*wtxn, self.env, &self.name, &settings, new_id,
+                    )? {
+                        self.apply_all_index_entries(wtxn, None, Some(&new_doc), new_id)?;
+                    }
+                } else if let Some(new_doc) =
+                    crate::timeseries::find_by_id(&*wtxn, self.env, &self.name, &settings, old_id)?
+                {
+                    self.apply_all_index_entries(wtxn, Some(old), Some(&new_doc), old_id)?;
+                }
+            }
+            if let Some(id) = &report.upserted_id {
+                if let Some(new_doc) =
+                    crate::timeseries::find_by_id(&*wtxn, self.env, &self.name, &settings, id)?
+                {
+                    self.apply_all_index_entries(wtxn, None, Some(&new_doc), id)?;
+                }
+            }
+            return Ok(UpdateOutcome {
+                matched: report.matched,
+                modified: report.modified,
+                upserted_id: report.upserted_id,
+                moved: report.moved,
+            });
+        }
         self.ensure_standard()?;
         let keys = self.matching_keys(&*wtxn, filter, multi)?;
         if keys.is_empty() {
@@ -4888,6 +5752,7 @@ impl<'e> Collection<'e> {
                     matched: 0,
                     modified: 0,
                     upserted_id: None,
+                    moved: Vec::new(),
                 });
             }
             let mut doc = seed_from_filter(filter);
@@ -4907,6 +5772,7 @@ impl<'e> Collection<'e> {
                 matched: 0,
                 modified: 0,
                 upserted_id: Some(id),
+                moved: Vec::new(),
             });
         }
 
@@ -4926,6 +5792,7 @@ impl<'e> Collection<'e> {
             matched,
             modified,
             upserted_id: None,
+            moved: Vec::new(),
         })
     }
 
@@ -5031,6 +5898,9 @@ impl<'e> Collection<'e> {
         opts: &FindAndModifyOptions<'_>,
         default_id: Option<&Value>,
     ) -> Result<FindAndModifyOutcome> {
+        if self.profile.is_timeseries() {
+            return self.find_and_modify_timeseries(wtxn, opts);
+        }
         self.ensure_standard()?;
         validate_find_and_modify(opts)?;
         let query = FindQuery {
@@ -5056,6 +5926,7 @@ impl<'e> Collection<'e> {
                 matched: removed,
                 modified: removed,
                 upserted_id: None,
+                new_id: None,
             });
         }
 
@@ -5074,6 +5945,7 @@ impl<'e> Collection<'e> {
                 matched: 1,
                 modified: 1,
                 upserted_id: None,
+                new_id: None,
             });
         }
 
@@ -5110,6 +5982,141 @@ impl<'e> Collection<'e> {
             matched: 0,
             modified: 0,
             upserted_id: Some(id),
+            new_id: None,
+        })
+    }
+
+    fn find_and_modify_timeseries(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        opts: &FindAndModifyOptions<'_>,
+    ) -> Result<FindAndModifyOutcome> {
+        validate_find_and_modify(opts)?;
+        let settings = self.timeseries_settings_in(&*wtxn)?.unwrap_or_default();
+        let query = FindQuery {
+            filter: opts.filter.clone(),
+            projection: None,
+            sort: opts.sort.to_vec(),
+            skip: 0,
+            limit: Some(1),
+            comment: None,
+            max_time_ms: None,
+            hint: None,
+        };
+        let selected = if let Some(id) = crate::timeseries::exact_id_filter(opts.filter) {
+            crate::timeseries::find_by_id(&*wtxn, self.env, &self.name, &settings, id)?
+        } else {
+            self.find_in(&*wtxn, &query)?.into_iter().next()
+        };
+        if opts.remove {
+            let Some(old) = selected else {
+                return Ok(empty_find_and_modify());
+            };
+            let id = old.get("_id").cloned().ok_or(Error::InvalidId)?;
+            let removed = self.delete_txn(wtxn, &serde_json::json!({"_id": id}), false)?;
+            return Ok(FindAndModifyOutcome {
+                value: Some(apply_projection(old, opts.projection, Some(opts.filter))),
+                matched: removed,
+                modified: removed,
+                upserted_id: None,
+                new_id: None,
+            });
+        }
+        let update = opts
+            .update
+            .ok_or_else(|| Error::Query("find_and_modify requires `update` or `remove`".into()))?;
+        if let Some(old) = selected {
+            let id = old
+                .get("_id")
+                .and_then(Value::as_str)
+                .ok_or(Error::InvalidId)?
+                .to_string();
+            let mut check = old.clone();
+            apply_with_options(&mut check, update, opts.filter, opts.array_filters)?;
+            Self::normalize_for_index(&mut check)?;
+            self.validate_unique(&*wtxn, &check, &id)?;
+            let report = crate::timeseries::update(
+                wtxn,
+                self.env,
+                &self.name,
+                &settings,
+                &serde_json::json!({"_id": id}),
+                update,
+                false,
+                opts.array_filters,
+                false,
+            )?;
+            let new_id = report
+                .moved
+                .last()
+                .map(|(_, new_id)| new_id.clone())
+                .unwrap_or_else(|| id.clone());
+            let new =
+                crate::timeseries::find_by_id(&*wtxn, self.env, &self.name, &settings, &new_id)?
+                    .ok_or_else(|| {
+                        Error::Query("updated time-series document disappeared".into())
+                    })?;
+            if new_id == id {
+                self.validate_unique(&*wtxn, &new, &id)?;
+                self.apply_all_index_entries(wtxn, Some(&old), Some(&new), &id)?;
+            } else {
+                self.apply_all_index_entries(wtxn, Some(&old), None, &id)?;
+                self.validate_unique(&*wtxn, &new, &new_id)?;
+                self.apply_all_index_entries(wtxn, None, Some(&new), &new_id)?;
+            }
+            return Ok(FindAndModifyOutcome {
+                value: Some(apply_projection(
+                    if opts.new { new } else { old },
+                    opts.projection,
+                    Some(opts.filter),
+                )),
+                matched: 1,
+                modified: 1,
+                upserted_id: None,
+                new_id: Some(new_id),
+            });
+        }
+        if !opts.upsert {
+            return Ok(empty_find_and_modify());
+        }
+        let mut check = seed_from_filter(opts.filter);
+        apply_upsert_with_options(&mut check, update, opts.filter, opts.array_filters)?;
+        Self::normalize_for_index(&mut check)?;
+        let check_id = check
+            .get("_id")
+            .and_then(id::key_from_value)
+            .unwrap_or_default();
+        self.validate_unique(&*wtxn, &check, &check_id)?;
+        let report = crate::timeseries::update(
+            wtxn,
+            self.env,
+            &self.name,
+            &settings,
+            opts.filter,
+            update,
+            false,
+            opts.array_filters,
+            true,
+        )?;
+        let id = report
+            .upserted_id
+            .ok_or_else(|| Error::Query("upserted time-series document disappeared".into()))?;
+        let inserted = crate::timeseries::find_by_id(&*wtxn, self.env, &self.name, &settings, &id)?;
+        if let Some(doc) = &inserted {
+            self.validate_unique(&*wtxn, doc, &id)?;
+            self.apply_all_index_entries(wtxn, None, Some(doc), &id)?;
+        }
+        let value = if opts.new {
+            inserted.map(|doc| apply_projection(doc, opts.projection, Some(opts.filter)))
+        } else {
+            None
+        };
+        Ok(FindAndModifyOutcome {
+            value,
+            matched: 0,
+            modified: 0,
+            upserted_id: Some(id.clone()),
+            new_id: Some(id),
         })
     }
 
@@ -5164,6 +6171,7 @@ impl<'e> Collection<'e> {
                 matched: removed,
                 modified: removed,
                 upserted_id: None,
+                new_id: None,
             });
         }
         let update = opts
@@ -5185,6 +6193,7 @@ impl<'e> Collection<'e> {
                 matched: 1,
                 modified: 1,
                 upserted_id: None,
+                new_id: None,
             });
         }
         if !opts.upsert {
@@ -5205,6 +6214,7 @@ impl<'e> Collection<'e> {
             matched: 0,
             modified: 0,
             upserted_id: Some(id),
+            new_id: None,
         })
     }
 
@@ -5223,6 +6233,71 @@ impl<'e> Collection<'e> {
     }
 
     pub fn delete_txn(&self, wtxn: &mut RwTxn<'_>, filter: &Value, multi: bool) -> Result<usize> {
+        if self.profile.is_timeseries() {
+            let settings = self.timeseries_settings_in(&*wtxn)?.unwrap_or_default();
+            // A pure `_id` equality can go straight to the locator encoded in
+            // the synthetic id instead of decoding every bucket.
+            let direct_id = (!multi)
+                .then(|| filter.as_object())
+                .flatten()
+                .filter(|object| object.len() == 1)
+                .and_then(|object| object.get("_id"))
+                .and_then(Value::as_str);
+            if let Some(id) = direct_id {
+                let before =
+                    crate::timeseries::find_by_id(&*wtxn, self.env, &self.name, &settings, id)?;
+                let Some(before) = before else {
+                    return Ok(0);
+                };
+                if !crate::timeseries::delete_by_id(wtxn, self.env, &self.name, &settings, id)? {
+                    return Ok(0);
+                }
+                self.apply_index_entries(wtxn, Some(&before), None, id)?;
+                self.apply_text_entries(wtxn, Some(&before), None, id)?;
+                self.apply_fuzzy_entries(wtxn, Some(&before), None, id)?;
+                self.apply_vector_entries(wtxn, Some(&before), None, id)?;
+                return Ok(1);
+            }
+            let query = FindQuery {
+                filter: filter.clone(),
+                projection: None,
+                sort: Vec::new(),
+                skip: 0,
+                limit: if multi { None } else { Some(1) },
+                comment: None,
+                max_time_ms: None,
+                hint: None,
+            };
+            let candidate_ids = self.timeseries_index_ids(&*wtxn, filter, None)?;
+            let before = if let Some(ids) = &candidate_ids {
+                crate::timeseries::find_with_ids(
+                    &*wtxn,
+                    self.env,
+                    &self.name,
+                    &settings,
+                    &query,
+                    Some(ids),
+                )?
+            } else {
+                crate::timeseries::find(&*wtxn, self.env, &self.name, &settings, &query)?
+            };
+            let removed = if let Some(ids) = &candidate_ids {
+                crate::timeseries::delete_with_ids(
+                    wtxn, self.env, &self.name, &settings, filter, multi, ids,
+                )?
+            } else {
+                crate::timeseries::delete(wtxn, self.env, &self.name, &settings, filter, multi)?
+            };
+            for doc in before {
+                if let Some(id) = doc.get("_id").and_then(Value::as_str) {
+                    self.apply_index_entries(wtxn, Some(&doc), None, id)?;
+                    self.apply_text_entries(wtxn, Some(&doc), None, id)?;
+                    self.apply_fuzzy_entries(wtxn, Some(&doc), None, id)?;
+                    self.apply_vector_entries(wtxn, Some(&doc), None, id)?;
+                }
+            }
+            return Ok(removed);
+        }
         self.ensure_standard()?;
         let keys = self.matching_keys(&*wtxn, filter, multi)?;
         let mut deleted_docs = Vec::with_capacity(keys.len());
@@ -6271,6 +7346,7 @@ impl<'e> Collection<'e> {
                     matched: 0,
                     modified: 0,
                     upserted_id: None,
+                    moved: Vec::new(),
                 });
             }
             let mut doc = seed_from_filter(filter);
@@ -6281,6 +7357,7 @@ impl<'e> Collection<'e> {
                 matched: 0,
                 modified: 0,
                 upserted_id: Some(id),
+                moved: Vec::new(),
             });
         };
         let old_stored: Value = parse_json(raw)?;
@@ -6290,6 +7367,7 @@ impl<'e> Collection<'e> {
             matched: 1,
             modified: 1,
             upserted_id: None,
+            moved: Vec::new(),
         })
     }
 
@@ -7023,6 +8101,28 @@ impl<'e> Collection<'e> {
         self.aggregate_in_with_options(rtxn, pipeline, None)
     }
 
+    fn timeseries_aggregate_streamable(pipeline: &[Value]) -> bool {
+        !pipeline.is_empty()
+            && pipeline.iter().all(|stage| {
+                stage.as_object().is_some_and(|object| {
+                    object.keys().all(|key| {
+                        matches!(
+                            key.as_str(),
+                            "$match"
+                                | "$project"
+                                | "$addFields"
+                                | "$set"
+                                | "$unset"
+                                | "$replaceRoot"
+                                | "$replaceWith"
+                                | "$lookup"
+                                | "$unwind"
+                        )
+                    })
+                })
+            })
+    }
+
     pub fn aggregate_in_with_options(
         &self,
         rtxn: &RoTxn<'_>,
@@ -7033,12 +8133,350 @@ impl<'e> Collection<'e> {
         self.aggregate_in_deadline(rtxn, pipeline, deadline)
     }
 
+    fn try_timeseries_rollup(
+        &self,
+        rtxn: &RoTxn<'_>,
+        pipeline: &[Value],
+        settings: &crate::timeseries::Settings,
+    ) -> Result<Option<Vec<Value>>> {
+        if std::env::var("NONODB_TS_DISABLE_ROLLUPS").ok().as_deref() == Some("1") {
+            return Ok(None);
+        }
+        let Some(group_at) = pipeline
+            .iter()
+            .position(|stage| stage.get("$group").is_some())
+        else {
+            return Ok(None);
+        };
+        let prefix = &pipeline[..group_at];
+        let mut filter = Value::Object(Map::new());
+        for stage in prefix {
+            let Some(object) = stage.as_object() else {
+                return Ok(None);
+            };
+            if object.len() != 1 {
+                return Ok(None);
+            }
+            if let Some(matched) = object.get("$match") {
+                filter = matched.clone();
+            } else if object.get("$sort").is_none() {
+                return Ok(None);
+            }
+        }
+        if !crate::timeseries::filter_is_meta_time_only(&filter, settings) {
+            return Ok(None);
+        }
+        let Some(group) = pipeline[group_at].get("$group").and_then(Value::as_object) else {
+            return Ok(None);
+        };
+        let Some(trunc) = group.get("_id").and_then(|id| {
+            id.get("bucket")
+                .and_then(|bucket| bucket.get("$dateTrunc"))
+                .or_else(|| id.get("$dateTrunc"))
+        }) else {
+            return Ok(None);
+        };
+        let Some((unit, _unit_byte, _window_size)) =
+            crate::timeseries::rollup_spec_for_trunc(trunc)
+        else {
+            return Ok(None);
+        };
+        for (field, accumulator) in group {
+            if field == "_id" {
+                continue;
+            }
+            let Some(accumulator) = accumulator.as_object() else {
+                return Ok(None);
+            };
+            if !accumulator
+                .keys()
+                .all(|op| matches!(op.as_str(), "$first" | "$last" | "$max" | "$min" | "$sum"))
+            {
+                return Ok(None);
+            }
+        }
+        let Some((mut docs, partial)) =
+            crate::timeseries::rollup_docs(rtxn, self.env, &self.name, settings, &filter, unit)?
+        else {
+            return Ok(None);
+        };
+        for (start, end) in partial {
+            let partial_filter = json!({
+                "$and": [
+                    filter.clone(),
+                    {"ts": {
+                        "$gte": {"$date": {"$numberLong": start.to_string()}},
+                        "$lte": {"$date": {"$numberLong": end.to_string()}}
+                    }}
+                ]
+            });
+            let mut hour_partial = Vec::new();
+            if unit == "1d" {
+                if let Some((hour_docs, partials)) = crate::timeseries::rollup_docs(
+                    rtxn,
+                    self.env,
+                    &self.name,
+                    settings,
+                    &partial_filter,
+                    "1h",
+                )? {
+                    docs.extend(hour_docs);
+                    hour_partial = partials;
+                    if hour_partial.is_empty() {
+                        continue;
+                    }
+                }
+            }
+            let ranges = if hour_partial.is_empty() {
+                vec![(start, end)]
+            } else {
+                hour_partial
+            };
+            for (start, end) in ranges {
+                let partial_filter = json!({
+                    "$and": [
+                        filter.clone(),
+                        {"ts": {
+                            "$gte": {"$date": {"$numberLong": start.to_string()}},
+                            "$lte": {"$date": {"$numberLong": end.to_string()}}
+                        }}
+                    ]
+                });
+                let raw = crate::timeseries::find(
+                    rtxn,
+                    self.env,
+                    &self.name,
+                    settings,
+                    &FindQuery {
+                        filter: partial_filter,
+                        projection: None,
+                        sort: Vec::new(),
+                        skip: 0,
+                        limit: None,
+                        comment: None,
+                        max_time_ms: None,
+                        hint: None,
+                    },
+                )?;
+                for mut doc in raw {
+                    if let Some(object) = doc.as_object_mut() {
+                        object.insert("n".into(), Value::from(1));
+                    }
+                    docs.push(doc);
+                }
+            }
+        }
+        docs.sort_by(|a, b| {
+            let ta = crate::timeseries::extract_time_public(a, &settings.time_field).unwrap_or(0);
+            let tb = crate::timeseries::extract_time_public(b, &settings.time_field).unwrap_or(0);
+            ta.cmp(&tb)
+        });
+        let mut rewritten = Map::new();
+        for (field, accumulator) in group {
+            let mut accumulator = accumulator.clone();
+            if field != "_id" {
+                if let Some(object) = accumulator.as_object_mut() {
+                    if object.get("$sum") == Some(&Value::from(1)) {
+                        object.insert("$sum".into(), Value::String("$n".into()));
+                    }
+                }
+            }
+            rewritten.insert(field.clone(), accumulator);
+        }
+        let mut stages = vec![json!({"$group": Value::Object(rewritten)})];
+        stages.extend_from_slice(&pipeline[group_at + 1..]);
+        let host = LookupHost { coll: self, rtxn };
+        Ok(Some(aggregate::run_with_host(
+            docs,
+            &stages,
+            aggregate::max_docs(),
+            Some(&host),
+        )?))
+    }
+
+    fn timeseries_window_docs(
+        &self,
+        rtxn: &RoTxn<'_>,
+        settings: &crate::timeseries::Settings,
+        filter: &Value,
+    ) -> Result<Vec<Value>> {
+        let query = FindQuery {
+            filter: filter.clone(),
+            projection: None,
+            sort: Vec::new(),
+            skip: 0,
+            limit: None,
+            comment: None,
+            max_time_ms: None,
+            hint: None,
+        };
+        crate::timeseries::find_window_docs(rtxn, self.env, &self.name, settings, &query)
+    }
+
     fn aggregate_in_deadline(
         &self,
         rtxn: &RoTxn<'_>,
         pipeline: &[Value],
         deadline: Option<Instant>,
     ) -> Result<Vec<Value>> {
+        if self.profile.is_timeseries() {
+            // Time-series buckets are decoded through the normal find path so
+            // bucket pruning and residual filters still apply, then the regular
+            // in-memory pipeline runs on the decoded documents. This enables
+            // `$group`/`$bucket` downsampling without a second query engine.
+            check_find_deadline(deadline)?;
+            aggregate::validate_pipeline(pipeline)?;
+            let settings = self.timeseries_settings_in(rtxn)?.unwrap_or_default();
+            if let Some(out) = self.try_timeseries_rollup(rtxn, pipeline, &settings)? {
+                return Ok(out);
+            }
+            if let Some(out) = crate::timeseries::try_columnar_group(
+                rtxn, self.env, &self.name, &settings, pipeline,
+            )? {
+                return Ok(out);
+            }
+            let filter = pipeline
+                .first()
+                .and_then(|stage| stage.get("$match"))
+                .cloned()
+                .unwrap_or_else(|| Value::Object(Map::new()));
+            let query = FindQuery {
+                filter,
+                projection: None,
+                sort: Vec::new(),
+                skip: 0,
+                limit: None,
+                comment: None,
+                max_time_ms: None,
+                hint: None,
+            };
+            if let Some(stage) = pipeline.first().and_then(Value::as_object) {
+                let host = LookupHost { coll: self, rtxn };
+                if let Some(spec) = stage.get("$search") {
+                    let docs = crate::search_compat::search_stage_in(self, rtxn, spec, 1000)?;
+                    let out = aggregate::run_with_host(
+                        docs,
+                        &pipeline[1..],
+                        aggregate::max_docs(),
+                        Some(&host),
+                    )?;
+                    return Ok(out);
+                }
+                if let Some(spec) = stage.get("$searchMeta") {
+                    let meta = crate::search_compat::search_meta_stage_in(self, rtxn, spec)?;
+                    let out = aggregate::run_with_host(
+                        vec![meta],
+                        &pipeline[1..],
+                        aggregate::max_docs(),
+                        Some(&host),
+                    )?;
+                    return Ok(out);
+                }
+                if let Some(spec) = stage.get("$vectorSearch") {
+                    let docs = crate::search_compat::vector_search_stage_in(self, rtxn, spec)?;
+                    let out = aggregate::run_with_host(
+                        docs,
+                        &pipeline[1..],
+                        aggregate::max_docs(),
+                        Some(&host),
+                    )?;
+                    return Ok(out);
+                }
+            }
+            if let Some(group_at) = pipeline
+                .iter()
+                .position(|stage| stage.get("$group").is_some())
+            {
+                let prefix = &pipeline[..group_at];
+                let tail = &pipeline[group_at + 1..];
+                let streamable_prefix = prefix.iter().all(|stage| {
+                    Self::timeseries_aggregate_streamable(std::slice::from_ref(stage))
+                });
+                if streamable_prefix {
+                    if let Some(spec) = pipeline[group_at].get("$group") {
+                        if let Ok(builder) = aggregate::GroupBuilder::new(spec) {
+                            {
+                                let mut builder = builder;
+                                let batch_size = std::env::var("NONODB_TS_AGG_BATCH")
+                                    .ok()
+                                    .and_then(|value| value.parse::<usize>().ok())
+                                    .unwrap_or(4096);
+                                let host = LookupHost { coll: self, rtxn };
+                                crate::timeseries::scan_batches(
+                                    rtxn,
+                                    self.env,
+                                    &self.name,
+                                    &settings,
+                                    &query.filter,
+                                    batch_size,
+                                    |batch| {
+                                        let docs = if prefix.is_empty() {
+                                            batch
+                                        } else {
+                                            aggregate::run_with_host(
+                                                batch,
+                                                prefix,
+                                                aggregate::max_docs(),
+                                                Some(&host),
+                                            )?
+                                        };
+                                        for doc in docs {
+                                            builder.update(doc)?;
+                                        }
+                                        Ok(true)
+                                    },
+                                )?;
+                                let groups = builder.finish()?;
+                                return aggregate::run_with_host(
+                                    groups,
+                                    tail,
+                                    aggregate::max_docs(),
+                                    Some(&host),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            if Self::timeseries_aggregate_streamable(pipeline) {
+                let batch_size = std::env::var("NONODB_TS_AGG_BATCH")
+                    .ok()
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(4096);
+                let host = LookupHost { coll: self, rtxn };
+                let limit = aggregate::max_docs();
+                let mut out = Vec::new();
+                crate::timeseries::scan_batches(
+                    rtxn,
+                    self.env,
+                    &self.name,
+                    &settings,
+                    &query.filter,
+                    batch_size,
+                    |batch| {
+                        let mut part =
+                            aggregate::run_with_host(batch, pipeline, limit, Some(&host))?;
+                        if out.len() + part.len() > limit {
+                            part.truncate(limit.saturating_sub(out.len()));
+                        }
+                        let full = out.len() + part.len() >= limit;
+                        out.extend(part);
+                        Ok(!full)
+                    },
+                )?;
+                return Ok(out);
+            }
+            let host = LookupHost { coll: self, rtxn };
+            let docs = if pipeline
+                .iter()
+                .any(|stage| stage.get("$setWindowFields").is_some())
+            {
+                self.timeseries_window_docs(rtxn, &settings, &query.filter)?
+            } else {
+                crate::timeseries::find(rtxn, self.env, &self.name, &settings, &query)?
+            };
+            return aggregate::run_with_host(docs, pipeline, aggregate::max_docs(), Some(&host));
+        }
         check_find_deadline(deadline)?;
         aggregate::validate_pipeline(pipeline)?;
         if let Some(stage) = pipeline.first().and_then(Value::as_object) {
@@ -7630,6 +9068,12 @@ impl<'e> Collection<'e> {
     }
 
     pub fn find(&self, query: &FindQuery) -> Result<Vec<Value>> {
+        if self.profile.is_timeseries() {
+            let rtxn = self.read_txn()?;
+            let out = self.find_timeseries_in(&rtxn, query)?;
+            rtxn.commit()?;
+            return Ok(out);
+        }
         let normalized = normalized_find_query(query)?;
         let query = normalized.as_ref();
         crate::query::validate::validate_filter(&query.filter)?;
@@ -7693,6 +9137,7 @@ impl<'e> Collection<'e> {
         let query = normalized.as_ref();
         crate::query::validate::validate_filter(&query.filter)?;
         if self.profile().is_vault()
+            || self.profile().is_timeseries()
             || query.projection.is_some()
             || !query.sort.is_empty()
             || query.hint.is_some()
@@ -8502,6 +9947,9 @@ impl<'e> Collection<'e> {
     }
 
     pub fn find_in(&self, rtxn: &RoTxn<'_>, query: &FindQuery) -> Result<Vec<Value>> {
+        if self.profile.is_timeseries() {
+            return self.find_timeseries_in(rtxn, query);
+        }
         let normalized = normalized_find_query(query)?;
         let query = normalized.as_ref();
         crate::query::validate::validate_filter(&query.filter)?;
@@ -9239,6 +10687,52 @@ impl<'e> Collection<'e> {
     /// This executes the query so `actual_matched` and `actual_returned` are
     /// exact. Use small limits when explaining broad queries.
     pub fn explain_in(&self, rtxn: &RoTxn<'_>, query: &FindQuery) -> Result<Value> {
+        if self.profile.is_timeseries() {
+            let matched = self.count_in(rtxn, &query.filter)?;
+            let hint = query.hint.as_ref().map(parse_index_hint).transpose()?;
+            let plan = self.query_index_plan(rtxn, &query.filter, hint.as_ref())?;
+            let mut prune_stats = None;
+            let bucket_index = if plan.is_none() {
+                match self.timeseries_settings_in(rtxn)? {
+                    Some(settings) => {
+                        let locators = crate::timeseries::lookup_indexed_buckets(
+                            rtxn,
+                            self.env,
+                            &self.name,
+                            &query.filter,
+                            &settings,
+                        )?;
+                        if locators.is_some() {
+                            prune_stats = crate::timeseries::bucket_prune_stats(
+                                rtxn,
+                                self.env,
+                                &self.name,
+                                &query.filter,
+                                &settings,
+                            )?;
+                        }
+                        locators.is_some()
+                    }
+                    None => false,
+                }
+            } else {
+                false
+            };
+            let indexed = plan.is_some() || bucket_index;
+            let (buckets_total, buckets_pruned) = prune_stats.unwrap_or((0, 0));
+            return Ok(serde_json::json!({
+                "collection": self.name,
+                "profile": "timeseries",
+                "access": if indexed { "index_scan" } else { "bucket_scan" },
+                "index_used": indexed,
+                "bucket_index_used": bucket_index,
+                "index": if bucket_index { Some("bucket_locator".to_string()) } else { plan.as_ref().map(|plan| plan.def.name()) },
+                "buckets_total": buckets_total,
+                "buckets_pruned": buckets_pruned,
+                "filter": query.filter,
+                "matched": matched,
+            }));
+        }
         let normalized = normalized_find_query(query)?;
         let query = normalized.as_ref();
         crate::query::validate::validate_filter(&query.filter)?;
@@ -9563,6 +11057,10 @@ impl<'e> Collection<'e> {
         filter: &Value,
         deadline: Option<Instant>,
     ) -> Result<usize> {
+        if self.profile.is_timeseries() {
+            let settings = self.timeseries_settings_in(rtxn)?.unwrap_or_default();
+            return crate::timeseries::count(rtxn, self.env, &self.name, &settings, filter);
+        }
         crate::query::validate::validate_filter(filter)?;
         check_find_deadline(deadline)?;
         if self.ttl_filter_active(rtxn)? {
@@ -9676,6 +11174,19 @@ impl<'e> Collection<'e> {
         rtxn: &RoTxn<'_>,
         allow_missing_search: bool,
     ) -> Result<CollectionVerification> {
+        if self.profile.is_timeseries() {
+            let settings = self.timeseries_settings_in(rtxn)?.unwrap_or_default();
+            let (documents, bytes) =
+                crate::timeseries::verify_in(rtxn, self.env, &self.name, &settings)?;
+            return Ok(CollectionVerification {
+                documents,
+                bytes,
+                indexes: Vec::new(),
+                text_indexes: Vec::new(),
+                fuzzy_indexes: Vec::new(),
+                vector_indexes: Vec::new(),
+            });
+        }
         let defs = self.index_defs(rtxn)?;
         let search_defs = self.search_index_defs_in(rtxn)?;
         let text_names: Vec<String> = search_defs
@@ -10192,8 +11703,74 @@ fn flatten_filter_conditions(filter: &Value) -> Option<Vec<(String, Value)>> {
     )
 }
 
+fn comparable_range_values(left: &Value, right: &Value) -> bool {
+    if left.is_number() && right.is_number() {
+        return true;
+    }
+    if crate::date::is_date(left) && crate::date::is_date(right) {
+        return true;
+    }
+    left.is_string() && right.is_string()
+}
+
+fn range_condition_implies(query: &Value, partial: &Value) -> bool {
+    let (Some(query), Some(partial)) = (query.as_object(), partial.as_object()) else {
+        return false;
+    };
+    if query.is_empty() || partial.is_empty() {
+        return false;
+    }
+    let mut compared = false;
+    for (partial_op, partial_value) in partial {
+        let (query_value, strict) = match partial_op.as_str() {
+            "$gte" => match (query.get("$gte"), query.get("$gt")) {
+                (Some(value), _) => (value, false),
+                (None, Some(value)) => (value, true),
+                _ => return false,
+            },
+            "$gt" => match query.get("$gt") {
+                Some(value) => (value, false),
+                None => return false,
+            },
+            "$lte" => match (query.get("$lte"), query.get("$lt")) {
+                (Some(value), _) => (value, false),
+                (None, Some(value)) => (value, true),
+                _ => return false,
+            },
+            "$lt" => match query.get("$lt") {
+                Some(value) => (value, false),
+                None => return false,
+            },
+            _ => return false,
+        };
+        if !comparable_range_values(query_value, partial_value) {
+            return false;
+        }
+        let ordering = crate::aggregate::compare_value(query_value, partial_value);
+        let valid = if partial_op == "$gte" || partial_op == "$gt" {
+            ordering != Ordering::Less
+        } else {
+            ordering != Ordering::Greater
+        };
+        if !valid || (strict && ordering == Ordering::Equal) {
+            return false;
+        }
+        compared = true;
+    }
+    compared
+}
+
 fn condition_implies(query: &Value, partial: &Value) -> bool {
     if query == partial {
+        return true;
+    }
+    if let Some(value) = query.as_object().and_then(|object| object.get("$eq")) {
+        if value == partial || range_condition_implies(&serde_json::json!({"$eq": value}), partial)
+        {
+            return true;
+        }
+    }
+    if range_condition_implies(query, partial) {
         return true;
     }
     let query = query
@@ -10709,6 +12286,54 @@ fn index_matches_sort(def: &IndexDef, sort: &[(String, i32)]) -> Option<bool> {
     None
 }
 
+/// Precomputes the values used by `compare_docs` for a sort specification.
+#[derive(Clone, Debug)]
+pub(crate) struct WindowSortKey {
+    value: Option<Value>,
+    date_ms: Option<i64>,
+}
+
+pub(crate) fn window_sort_key(doc: &Value, sort: &[(String, i32)]) -> Vec<Option<WindowSortKey>> {
+    sort.iter()
+        .map(|(field, dir)| {
+            sort_value(value_at(doc, field), *dir < 0)
+                .cloned()
+                .map(|value| WindowSortKey {
+                    date_ms: date::parse_value(&value),
+                    value: Some(value),
+                })
+        })
+        .collect()
+}
+
+/// Compares two precomputed sort keys with the same semantics as
+/// `compare_docs`.
+pub(crate) fn compare_window_sort_keys(
+    a: &[Option<WindowSortKey>],
+    b: &[Option<WindowSortKey>],
+    sort: &[(String, i32)],
+) -> Ordering {
+    for (index, (_, dir)) in sort.iter().enumerate() {
+        let left = a.get(index).and_then(Option::as_ref);
+        let right = b.get(index).and_then(Option::as_ref);
+        let ord = match (
+            left.and_then(|key| key.date_ms),
+            right.and_then(|key| key.date_ms),
+        ) {
+            (Some(left), Some(right)) => left.cmp(&right),
+            _ => compare_values(
+                left.and_then(|key| key.value.as_ref()),
+                right.and_then(|key| key.value.as_ref()),
+                *dir < 0,
+            ),
+        };
+        if ord != Ordering::Equal {
+            return if *dir >= 0 { ord } else { ord.reverse() };
+        }
+    }
+    Ordering::Equal
+}
+
 pub(crate) fn compare_docs(a: &Value, b: &Value, sort: &[(String, i32)]) -> Ordering {
     for (field, dir) in sort {
         let ord = compare_values(value_at(a, field), value_at(b, field), *dir < 0);
@@ -10903,6 +12528,7 @@ fn empty_find_and_modify() -> FindAndModifyOutcome {
         matched: 0,
         modified: 0,
         upserted_id: None,
+        new_id: None,
     }
 }
 
@@ -12680,7 +14306,8 @@ mod tests {
             UpdateOutcome {
                 matched: 0,
                 modified: 0,
-                upserted_id: None
+                upserted_id: None,
+                moved: Vec::new()
             }
         );
         assert_eq!(c.count(&serde_json::json!({})).unwrap(), 0);
@@ -12783,6 +14410,42 @@ mod tests {
         let defs = p.list_index_defs().unwrap();
         assert!(defs.iter().any(|def| def.name() == "active_email"
             && def.partial_filter_expression == Some(json!({"status": "active"}))));
+    }
+
+    #[test]
+    fn partial_index_range_predicate_is_used() {
+        let (_dir, store) = store();
+        let c = store.collection("partial_range").unwrap();
+        for score in [50, 100, 150, 200] {
+            c.insert_one(json!({"score": score})).unwrap();
+        }
+        c.create_indexes(&[IndexSpec {
+            fields: vec!["score".into()],
+            name: "score_hot".into(),
+            directions: Vec::new(),
+            unique: false,
+            sparse: false,
+            partial_filter_expression: Some(json!({"score": {"$gte": 100}})),
+            include: Vec::new(),
+            geo: false,
+        }])
+        .unwrap();
+        let stronger = FindQuery {
+            filter: json!({"score": {"$gte": 150, "$lte": 250}}),
+            ..Default::default()
+        };
+        let plan = c.explain(&stronger).unwrap();
+        assert_eq!(plan["access_path"], "index_scan", "{plan}");
+        assert_eq!(plan["index_used"], true);
+        let weaker = FindQuery {
+            filter: json!({"score": {"$gte": 50}}),
+            ..Default::default()
+        };
+        assert_eq!(
+            c.explain(&weaker).unwrap()["access_path"],
+            "collection_scan"
+        );
+        assert_eq!(c.find(&stronger).unwrap().len(), 2);
     }
 
     #[test]

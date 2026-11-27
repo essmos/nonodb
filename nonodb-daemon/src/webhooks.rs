@@ -1133,4 +1133,161 @@ mod tests {
         };
         assert!(rule.validate().is_err());
     }
+
+    #[test]
+    fn timeseries_events_trigger_a_threshold_webhook() {
+        use crate::protocol::{Durability, WriteReq};
+        use crate::writer::{self, WriteJob};
+        use nonodb_core::Store;
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(Store::open(dir.path()).unwrap());
+        let settings = nonodb_core::timeseries::Settings {
+            time_field: "ts".into(),
+            ..Default::default()
+        };
+        store
+            .create_timeseries_collection("metrics", &settings)
+            .unwrap();
+        let mut wtxn = store.write_txn().unwrap();
+        ensure_events(&store, &mut wtxn, "metrics").unwrap();
+        wtxn.commit().unwrap();
+        // The daemon registers the internal event log at startup.
+        store
+            .create_collection(
+                events::EVENTS_COLLECTION,
+                nonodb_core::CollectionProfile::Standard,
+            )
+            .unwrap();
+
+        // Local HTTP receiver.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut raw = Vec::new();
+                let mut chunk = [0u8; 4096];
+                while let Ok(read) = stream.read(&mut chunk) {
+                    if read == 0 {
+                        break;
+                    }
+                    raw.extend_from_slice(&chunk[..read]);
+                    if let Some(end) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let body_start = end + 4;
+                        let headers = String::from_utf8_lossy(&raw[..end]);
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .and_then(|value| value.trim().parse::<usize>().ok())
+                            })
+                            .unwrap_or(0);
+                        if raw.len() >= body_start + length {
+                            break;
+                        }
+                    }
+                }
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok");
+                let _ = request_tx.send(raw);
+            }
+        });
+
+        let rule = WebhookRule {
+            name: "ts_sum".into(),
+            coll: "metrics".into(),
+            url: format!("http://{address}/hook"),
+            ops: vec!["insert".into()],
+            threshold: Some(WebhookThreshold {
+                aggregate: "sum".into(),
+                field: Some("value".into()),
+                gte: Some(3.0),
+                ..WebhookThreshold::default()
+            }),
+            enabled: true,
+            max_attempts: 1,
+            timeout_ms: 5_000,
+            ..WebhookRule::default()
+        };
+        let mut rule_doc = serde_json::to_value(&rule).unwrap();
+        rule_doc["_id"] = json!("ts_sum");
+        store
+            .collection(WEBHOOKS_COLLECTION)
+            .unwrap()
+            .insert_one(rule_doc)
+            .unwrap();
+
+        // Real writer thread so events and delivery bookkeeping happen normally.
+        let (write_tx, write_rx) = std::sync::mpsc::channel::<WriteJob>();
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let writer_store = store.clone();
+        let cache = std::sync::Arc::new(crate::cache::QueryCache::new(
+            Duration::from_secs(60),
+            8,
+            4096,
+        ));
+        let writer_stop = stop.clone();
+        let quota =
+            std::sync::Arc::new(crate::quota::Quota::load("test", dir.path()).expect("test quota"));
+        let writer_thread = std::thread::spawn(move || {
+            writer::run(writer_store, write_rx, cache, quota, writer_stop)
+        });
+        let submit = |req| {
+            let (resp, out) = tokio::sync::oneshot::channel();
+            write_tx
+                .send(WriteJob {
+                    req,
+                    resp,
+                    isolated: false,
+                    durability: Durability::Full,
+                })
+                .unwrap();
+            out.blocking_recv().unwrap().unwrap()
+        };
+
+        let rules = load_rules(&store).unwrap();
+        let mut state = State::default();
+        // Bootstrap the cursor while the event log is still empty.
+        let _ = process_events(&store, &write_tx, &rules, &mut state);
+
+        submit(WriteReq::Insert {
+            coll: "metrics".into(),
+            doc: json!({"ts": 1_700_000_000_000i64, "value": 1}),
+            vault: None,
+        });
+        submit(WriteReq::Insert {
+            coll: "metrics".into(),
+            doc: json!({"ts": 1_700_000_001_000i64, "value": 2}),
+            vault: None,
+        });
+
+        let mut received = None;
+        for _ in 0..60 {
+            let _ = process_deliveries(&store, &write_tx);
+            let _ = process_events(&store, &write_tx, &rules, &mut state);
+            if let Ok(raw) = request_rx.try_recv() {
+                received = Some(raw);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let raw = received.expect("webhook receiver should get a request");
+        let body_start = raw
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .map(|pos| pos + 4)
+            .unwrap();
+        let body: Value = serde_json::from_slice(&raw[body_start..]).unwrap();
+        assert_eq!(body["webhook"]["rule"], json!("ts_sum"));
+        assert_eq!(body["webhook"]["threshold_value"], json!(3.0));
+        assert_eq!(body["payload"]["after"]["value"], json!(2));
+
+        stop.store(true, Ordering::Relaxed);
+        drop(write_tx);
+        writer_thread.join().unwrap();
+    }
 }

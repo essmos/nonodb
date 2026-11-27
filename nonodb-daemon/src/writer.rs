@@ -493,9 +493,7 @@ fn write_collection<'a>(
     if vault.is_some() {
         match store.collection_profile_in_rw(wtxn, coll)? {
             Some(nonodb_core::CollectionProfile::Vault) => {}
-            Some(nonodb_core::CollectionProfile::Standard) => {
-                return Err(vault::key_unexpected().into())
-            }
+            Some(_) => return Err(vault::key_unexpected().into()),
             None => return Err(vault::not_a_vault_collection().into()),
         }
     }
@@ -512,6 +510,15 @@ fn standard_collection<'a>(
     coll: &str,
 ) -> Result<Collection<'a>, ApiError> {
     write_collection(store, wtxn, coll, None)
+}
+
+fn timeseries_rows(
+    store: &Store,
+    wtxn: &mut nonodb_core::heed::RwTxn<'_>,
+    coll: &str,
+    settings: &nonodb_core::timeseries::Settings,
+) -> Result<u64, ApiError> {
+    Ok(nonodb_core::timeseries::stats(&*wtxn, store.env(), coll, settings)?.rows)
 }
 
 fn event_config(
@@ -1026,6 +1033,7 @@ fn execute(
             profile,
             ttl_seconds,
             ttl_purge_history,
+            timeseries,
         } => {
             let c = store.create_collection_with_ttl_and_purge_in(
                 wtxn,
@@ -1034,12 +1042,20 @@ fn execute(
                 *ttl_seconds,
                 *ttl_purge_history,
             )?;
+            if let Some(settings) = timeseries {
+                c.set_timeseries_settings_in(wtxn, settings)?;
+            }
             replication.capture_op(ReplicationOp::CollectionCreate {
                 name: coll.clone(),
                 profile: profile.as_str().to_string(),
                 ttl_seconds: *ttl_seconds,
                 ttl_field: None,
                 ttl_purge_history: *ttl_purge_history,
+                timeseries: timeseries
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()
+                    .map_err(nonodb_core::Error::from)?,
             });
             Ok(json!({
                 "created": coll,
@@ -1069,6 +1085,55 @@ fn execute(
                 "coll": coll,
                 "ttl_seconds": ttl_seconds,
                 "purge_history": purge_history,
+            }))
+        }
+        WriteReq::SetCollectionTimeSeries { coll, settings } => {
+            let c = write_collection(store, wtxn, coll, None)?;
+            if !c.profile().is_timeseries() {
+                return Err(nonodb_core::Error::Query(format!(
+                    "collection `{coll}` is not a time-series collection"
+                ))
+                .into());
+            }
+            settings.validate()?;
+            let current = c.timeseries_settings_in(&*wtxn)?.unwrap_or_default();
+            let rows = timeseries_rows(store, wtxn, coll, &current)?;
+            if rows > 0
+                && (current.time_field != settings.time_field
+                    || current.meta_field != settings.meta_field
+                    || current.granularity != settings.granularity)
+            {
+                return Err(nonodb_core::Error::Query(
+                    "time field, meta field, and granularity can only change on an empty time-series collection"
+                        .into(),
+                )
+                .into());
+            }
+            c.set_timeseries_settings_in(wtxn, settings)?;
+            replication.capture_op(ReplicationOp::TimeSeriesSettings {
+                coll: coll.clone(),
+                settings: settings.clone(),
+            });
+            Ok(json!({
+                "coll": coll,
+                "timeseries": settings,
+            }))
+        }
+        WriteReq::RetainTimeSeries { coll, before_ms } => {
+            let report = store.retain_timeseries_in(wtxn, coll, *before_ms)?;
+            let changed = report.dropped_buckets > 0
+                || report.tombstoned_buckets > 0
+                || report.dropped_rows > 0;
+            if changed {
+                replication.capture_op(ReplicationOp::TimeSeriesRetain {
+                    coll: coll.clone(),
+                    before_ms: *before_ms,
+                });
+            }
+            Ok(json!({
+                "coll": coll,
+                "before_ms": before_ms,
+                "report": report,
             }))
         }
         WriteReq::SetCollectionTtlAfter {
@@ -1358,14 +1423,11 @@ fn execute(
                 if vault.is_some() {
                     return Err(vault::key_unexpected().into());
                 }
-                let mut ids = Vec::with_capacity(docs.len());
-                let mut inserted_ids = Vec::with_capacity(docs.len());
-                for doc in docs {
-                    let inserted_id = doc.get("_id").cloned();
-                    let id = c.insert_one_txn(wtxn, doc.clone())?;
-                    inserted_ids.push(inserted_id.unwrap_or_else(|| Value::String(id.clone())));
-                    ids.push(id);
-                }
+                let ids = c.insert_many_txn(wtxn, docs)?;
+                let inserted_ids = ids
+                    .iter()
+                    .map(|id| Value::String(id.clone()))
+                    .collect::<Vec<_>>();
                 if let Some(config) = &config {
                     for id in &ids {
                         emit_by_id(
@@ -1552,6 +1614,9 @@ fn execute(
                                 code: "invalid_id".into(),
                                 message: "document has no valid _id".into(),
                             })?;
+                            if out.moved.iter().any(|(old, _)| old == &id) {
+                                continue;
+                            }
                             emit_by_id(
                                 store,
                                 wtxn,
@@ -1560,6 +1625,31 @@ fn execute(
                                 "update",
                                 &id,
                                 Some(before),
+                                config,
+                                replication,
+                            )?;
+                        }
+                        // Time-series rows that moved buckets: replay as delete+insert.
+                        for (old, new_id) in &out.moved {
+                            emit_event(
+                                store,
+                                wtxn,
+                                coll,
+                                "delete",
+                                old,
+                                None,
+                                None,
+                                config,
+                                replication,
+                            )?;
+                            emit_by_id(
+                                store,
+                                wtxn,
+                                &c,
+                                coll,
+                                "insert",
+                                new_id,
+                                None,
                                 config,
                                 replication,
                             )?;
@@ -1693,17 +1783,45 @@ fn execute(
                                 replication,
                             )?;
                         } else if out.modified > 0 {
-                            emit_by_id(
-                                store,
-                                wtxn,
-                                &c,
-                                coll,
-                                "update",
-                                id,
-                                Some(before),
-                                config,
-                                replication,
-                            )?;
+                            let moved = out.new_id.as_deref().is_some_and(|new_id| new_id != id);
+                            if moved {
+                                emit_event(
+                                    store,
+                                    wtxn,
+                                    coll,
+                                    "delete",
+                                    id,
+                                    Some(before),
+                                    None,
+                                    config,
+                                    replication,
+                                )?;
+                                if let Some(new_id) = &out.new_id {
+                                    emit_by_id(
+                                        store,
+                                        wtxn,
+                                        &c,
+                                        coll,
+                                        "insert",
+                                        new_id,
+                                        None,
+                                        config,
+                                        replication,
+                                    )?;
+                                }
+                            } else {
+                                emit_by_id(
+                                    store,
+                                    wtxn,
+                                    &c,
+                                    coll,
+                                    "update",
+                                    id,
+                                    Some(before),
+                                    config,
+                                    replication,
+                                )?;
+                            }
                         }
                     }
                 }
@@ -2140,6 +2258,254 @@ mod tests {
     }
 
     #[test]
+    fn timeseries_changes_feed_events_and_live() {
+        use nonodb_core::subscriptions::{CountCondition, Subscription};
+
+        let _dir = TempDir::new().unwrap();
+        let store = Arc::new(Store::open(_dir.path()).unwrap());
+        let settings = nonodb_core::timeseries::Settings {
+            time_field: "ts".into(),
+            ..Default::default()
+        };
+        execute_commit(
+            &store,
+            &WriteReq::CreateCollection {
+                coll: "metrics".into(),
+                profile: CollectionProfile::TimeSeries,
+                ttl_seconds: None,
+                ttl_purge_history: None,
+                timeseries: Some(settings),
+            },
+        )
+        .unwrap();
+        execute_commit(
+            &store,
+            &WriteReq::SetCollectionEvents {
+                coll: "metrics".into(),
+                enabled: true,
+                fields: Vec::new(),
+                ops: Vec::new(),
+                filter: Value::Null,
+                include_before: true,
+                include_after: true,
+                projection: None,
+            },
+        )
+        .unwrap();
+
+        // A persisted subscription also writes watch events into `_events`.
+        execute_commit(
+            &store,
+            &WriteReq::CreateSubscription {
+                coll: "metrics".into(),
+                subscription: Subscription {
+                    name: "watch-metrics".into(),
+                    ops: vec!["insert".into()],
+                    count: Some(CountCondition {
+                        gte: Some(2),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            },
+        )
+        .unwrap();
+
+        // A live subscription with a count threshold (>= 2 rows) as the receiver.
+        let (live_tx, mut live_rx) = tokio::sync::mpsc::channel(8);
+        let (_live_id, _live_guard) = crate::live::registry().register(
+            store.id(),
+            "metrics".into(),
+            Subscription {
+                name: "live-metrics".into(),
+                ops: vec!["insert".into()],
+                count: Some(CountCondition {
+                    gte: Some(2),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            live_tx,
+        );
+
+        execute_commit(
+            &store,
+            &WriteReq::Insert {
+                coll: "metrics".into(),
+                doc: json!({"ts": 1_700_000_000_000i64, "value": 1, "device": "a"}),
+                vault: None,
+            },
+        )
+        .unwrap();
+        crate::live::dispatch_pending();
+        assert!(
+            live_rx.try_recv().is_err(),
+            "count threshold not reached yet"
+        );
+        execute_commit(
+            &store,
+            &WriteReq::Insert {
+                coll: "metrics".into(),
+                doc: json!({"ts": 1_700_000_001_000i64, "value": 2, "device": "a"}),
+                vault: None,
+            },
+        )
+        .unwrap();
+        crate::live::dispatch_pending();
+        let live = live_rx
+            .try_recv()
+            .expect("live subscription should fire at count >= 2");
+        assert_eq!(live["payload"]["coll"], json!("metrics"));
+        assert_eq!(live["payload"]["after"]["value"], json!(2));
+
+        // Update and delete also produce `_events` entries.
+        let inserted = all(&store, "metrics");
+        let id = inserted[0]["_id"].as_str().unwrap().to_string();
+        execute_commit(
+            &store,
+            &WriteReq::Update {
+                coll: "metrics".into(),
+                filter: json!({"_id": id}),
+                update: json!({"$set": {"value": 7}}),
+                multi: false,
+                upsert: false,
+                array_filters: Vec::new(),
+                default_id: None,
+                vault: None,
+            },
+        )
+        .unwrap();
+        execute_commit(
+            &store,
+            &WriteReq::Delete {
+                coll: "metrics".into(),
+                filter: json!({"_id": id}),
+                multi: false,
+                vault: None,
+            },
+        )
+        .unwrap();
+        let events = all(&store, nonodb_core::events::EVENTS_COLLECTION);
+        let ops: Vec<String> = events
+            .iter()
+            .filter(|event| event["payload"]["coll"] == json!("metrics"))
+            .filter(|event| event["payload"].get("subscription").is_none())
+            .filter_map(|event| event["payload"]["op"].as_str().map(str::to_string))
+            .collect();
+        assert_eq!(ops, vec!["insert", "insert", "update", "delete"]);
+        let update_event = events
+            .iter()
+            .find(|event| event["payload"]["op"] == json!("update"))
+            .unwrap();
+        assert_eq!(update_event["payload"]["after"]["value"], json!(7));
+        let subscription_events: Vec<&Value> = events
+            .iter()
+            .filter(|event| event["type"] == json!("subscription.watch-metrics"))
+            .collect();
+        assert_eq!(subscription_events.len(), 1);
+        assert_eq!(
+            subscription_events[0]["payload"]["count"],
+            json!(2),
+            "watch event carries the threshold count"
+        );
+    }
+
+    #[test]
+    fn set_collection_timeseries_validates_and_replicates() {
+        use nonodb_core::timeseries::{Compression, Settings};
+        let (_dir, store) = setup();
+        let initial = Settings {
+            time_field: "ts".into(),
+            ..Settings::default()
+        };
+        execute_commit(
+            &store,
+            &WriteReq::CreateCollection {
+                coll: "metrics".into(),
+                profile: CollectionProfile::TimeSeries,
+                ttl_seconds: None,
+                ttl_purge_history: None,
+                timeseries: Some(initial),
+            },
+        )
+        .unwrap();
+        let changed = Settings {
+            time_field: "ts".into(),
+            compression: Compression::Max,
+            expire_after_seconds: Some(600),
+            ..Settings::default()
+        };
+        let mut wtxn = store.write_txn().unwrap();
+        let mut replication = ReplicationContext {
+            origin: Some("test".into()),
+            changes: Vec::new(),
+            ops: Vec::new(),
+        };
+        let out = execute(
+            &store,
+            &mut wtxn,
+            &WriteReq::SetCollectionTimeSeries {
+                coll: "metrics".into(),
+                settings: changed.clone(),
+            },
+            &mut replication,
+        )
+        .unwrap();
+        wtxn.commit().unwrap();
+        assert_eq!(out["timeseries"]["compression"], json!("max"));
+        assert!(replication.ops.iter().any(|op| matches!(
+            op,
+            nonodb_core::replication::ReplicationOp::TimeSeriesSettings { .. }
+        )));
+        assert_eq!(store.timeseries_settings("metrics").unwrap(), Some(changed));
+
+        execute_commit(
+            &store,
+            &WriteReq::Insert {
+                coll: "metrics".into(),
+                doc: json!({"ts": 1_700_000_000_000i64, "value": 1}),
+                vault: None,
+            },
+        )
+        .unwrap();
+        let mut wtxn = store.write_txn().unwrap();
+        let mut replication = ReplicationContext {
+            origin: None,
+            changes: Vec::new(),
+            ops: Vec::new(),
+        };
+        let error = execute(
+            &store,
+            &mut wtxn,
+            &WriteReq::SetCollectionTimeSeries {
+                coll: "metrics".into(),
+                settings: Settings {
+                    time_field: "other".into(),
+                    ..Settings::default()
+                },
+            },
+            &mut replication,
+        )
+        .unwrap_err();
+        assert!(error.message.contains("empty time-series collection"));
+        drop(wtxn);
+
+        // Non-time-series collections are rejected.
+        let error = execute_commit(
+            &store,
+            &WriteReq::SetCollectionTimeSeries {
+                coll: "metrics".into(),
+                settings: Settings {
+                    time_field: "_id".into(),
+                    ..Settings::default()
+                },
+            },
+        )
+        .unwrap_err();
+        assert!(error.message.contains("timeField"));
+    }
+
+    #[test]
     fn drop_collection_is_idempotent() {
         let (_dir, store) = setup();
         let c = store.collection("drop_me").unwrap();
@@ -2206,6 +2572,178 @@ mod tests {
 
         let source_docs = all(&store, "source");
         assert_eq!(source_docs.len(), 2);
+    }
+
+    #[test]
+    fn failed_timeseries_unique_write_leaves_no_partial_rows() {
+        let (_dir, store) = setup();
+        let settings = nonodb_core::timeseries::Settings {
+            time_field: "ts".into(),
+            ..Default::default()
+        };
+        execute_commit(
+            &store,
+            &WriteReq::CreateCollection {
+                coll: "metrics".into(),
+                profile: CollectionProfile::TimeSeries,
+                ttl_seconds: None,
+                ttl_purge_history: None,
+                timeseries: Some(settings),
+            },
+        )
+        .unwrap();
+        let c = store.collection("metrics").unwrap();
+        c.create_index("k", true).unwrap();
+        for (ts, k) in [(1, 1), (2, 2)] {
+            execute_commit(
+                &store,
+                &WriteReq::Insert {
+                    coll: "metrics".into(),
+                    doc: json!({"ts": ts, "k": k}),
+                    vault: None,
+                },
+            )
+            .unwrap();
+        }
+        let mut wtxn = store.write_txn().unwrap();
+        let mut replication = ReplicationContext {
+            origin: None,
+            changes: Vec::new(),
+            ops: Vec::new(),
+        };
+        assert!(execute(
+            &store,
+            &mut wtxn,
+            &WriteReq::Insert {
+                coll: "metrics".into(),
+                doc: json!({"ts": 3, "k": 1}),
+                vault: None,
+            },
+            &mut replication,
+        )
+        .is_err());
+        assert!(execute(
+            &store,
+            &mut wtxn,
+            &WriteReq::Update {
+                coll: "metrics".into(),
+                filter: json!({"k": 2}),
+                update: json!({"$set": {"k": 1}}),
+                multi: false,
+                upsert: false,
+                array_filters: Vec::new(),
+                default_id: None,
+                vault: None,
+            },
+            &mut replication,
+        )
+        .is_err());
+        wtxn.commit().unwrap();
+        assert_eq!(c.count(&json!({})).unwrap(), 2);
+        assert_eq!(c.count(&json!({"k": 1})).unwrap(), 1);
+        assert_eq!(c.count(&json!({"k": 2})).unwrap(), 1);
+
+        // A multi-update that makes two rows collide is rejected as a set
+        // before any row is rewritten; committing the shared txn is safe.
+        let mut wtxn = store.write_txn().unwrap();
+        let mut replication = ReplicationContext {
+            origin: None,
+            changes: Vec::new(),
+            ops: Vec::new(),
+        };
+        assert!(execute(
+            &store,
+            &mut wtxn,
+            &WriteReq::Update {
+                coll: "metrics".into(),
+                filter: json!({}),
+                update: json!({"$set": {"k": 5}}),
+                multi: true,
+                upsert: false,
+                array_filters: Vec::new(),
+                default_id: None,
+                vault: None,
+            },
+            &mut replication,
+        )
+        .is_err());
+        wtxn.commit().unwrap();
+        assert_eq!(c.count(&json!({"k": 1})).unwrap(), 1);
+        assert_eq!(c.count(&json!({"k": 2})).unwrap(), 1);
+        assert_eq!(c.count(&json!({"k": 5})).unwrap(), 0);
+    }
+
+    #[test]
+    fn out_and_merge_write_timeseries_targets() {
+        let (_dir, store) = setup();
+        let settings = nonodb_core::timeseries::Settings {
+            time_field: "ts".into(),
+            ..Default::default()
+        };
+        for name in ["source", "target"] {
+            execute_commit(
+                &store,
+                &WriteReq::CreateCollection {
+                    coll: name.into(),
+                    profile: CollectionProfile::TimeSeries,
+                    ttl_seconds: None,
+                    ttl_purge_history: None,
+                    timeseries: Some(settings.clone()),
+                },
+            )
+            .unwrap();
+        }
+        let source = store.collection("source").unwrap();
+        source
+            .insert_one(json!({"ts": 1, "k": 1, "v": "a", "keep": true}))
+            .unwrap();
+        source
+            .insert_one(json!({"ts": 2, "k": 2, "v": "b", "keep": false}))
+            .unwrap();
+        let target = store.collection("target").unwrap();
+        target
+            .insert_one(json!({"ts": 0, "k": 9, "old": true}))
+            .unwrap();
+
+        let out = execute_commit(
+            &store,
+            &WriteReq::Aggregate {
+                coll: "source".into(),
+                pipeline: vec![json!({"$match": {"keep": true}}), json!({"$out": "target"})],
+                max_time_ms: None,
+                database: "default".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(out["deleted"], 1);
+        assert_eq!(out["inserted"], 1);
+        let docs = all(&store, "target");
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0]["k"], 1);
+        assert!(docs[0].get("old").is_none());
+
+        target.create_index("k", true).unwrap();
+        target
+            .insert_one(json!({"ts": 5, "k": 2, "v": "old"}))
+            .unwrap();
+        source
+            .insert_one(json!({"ts": 3, "k": 3, "v": "c"}))
+            .unwrap();
+        assert_eq!(source.count(&json!({"k": 3})).unwrap(), 1);
+        let merged = execute_commit(
+            &store,
+            &WriteReq::Aggregate {
+                coll: "source".into(),
+                pipeline: vec![json!({"$merge": {"into": "target", "on": "k"}})],
+                max_time_ms: None,
+                database: "default".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(merged["matched"], 2);
+        assert_eq!(merged["inserted"], 1);
+        assert_eq!(all(&store, "target").len(), 3);
+        assert_eq!(target.count(&json!({"k": 2, "v": "b"})).unwrap(), 1);
     }
 
     #[test]

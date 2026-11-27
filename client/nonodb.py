@@ -664,11 +664,14 @@ class NonoDB:
         profile: str = "standard",
         ttl_seconds: int | None = None,
         ttl_purge_history: bool | None = None,
+        timeseries: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Creates a collection explicitly. Use `profile="vault"` for encrypted storage.
 
         `ttl_seconds` sets a default document TTL; individual documents can
-        override it with a `_ttl` field.
+        override it with a `_ttl` field. For `profile="timeseries"`, pass the
+        required `timeField` and optional `metaField`, `granularity`, and
+        `expireAfterSeconds` in `timeseries`.
         """
         req: dict[str, Any] = {
             "op": "create_collection",
@@ -679,6 +682,8 @@ class NonoDB:
             req["ttl_seconds"] = ttl_seconds
         if ttl_purge_history is not None:
             req["ttl_purge_history"] = ttl_purge_history
+        if timeseries is not None:
+            req["timeseries"] = timeseries
         return self.exec(req)
 
     def set_collection_ttl(

@@ -119,6 +119,18 @@ pub fn capabilities() -> Value {
                 "branching": true,
                 "backups": true,
                 "replication": true,
+                "timeseries": {
+                    "profile": "timeseries",
+                    "codecs": [
+                        "delta", "delta_delta", "gorilla_xor", "dictionary",
+                        "for_bitpack", "bool_bits", "byte_shuffle", "deflate"
+                    ],
+                    "granularities": ["seconds", "minutes", "hours"],
+                    "compression_levels": ["fast", "balanced", "max"],
+                    "aggregation": true,
+                    "retention": true,
+                    "point_lookup": "synthetic_id",
+                },
             },
             "migration": {
                 "mongodb_ddl": true,

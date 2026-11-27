@@ -80,6 +80,7 @@ pub fn authorize_request(
         | Request::History { coll, .. }
         | Request::GetVersion { coll, .. }
         | Request::GetCollectionTtl { coll }
+        | Request::GetCollectionTimeSeries { coll }
         | Request::GetCollectionHistory { coll }
         | Request::GetCollectionEvents { coll }
         | Request::GetCollectionMetrics { coll }
@@ -146,7 +147,9 @@ pub fn authorize_request(
         | Request::CreateCollection { coll, .. }
         | Request::DropCollection { coll }
         | Request::SetCollectionTtl { coll, .. }
+        | Request::SetCollectionTimeSeries { coll, .. }
         | Request::SetCollectionTtlAfter { coll, .. }
+        | Request::RetainTimeSeries { coll, .. }
         | Request::BackfillCollectionTtl { coll, .. }
         | Request::SetCollectionHistory { coll, .. }
         | Request::SetCollectionEvents { coll, .. }

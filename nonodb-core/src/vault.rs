@@ -22,6 +22,8 @@ pub enum CollectionProfile {
     #[default]
     Standard,
     Vault,
+    /// Bucketed, columnar, compressed time-series storage.
+    TimeSeries,
 }
 
 impl CollectionProfile {
@@ -29,6 +31,7 @@ impl CollectionProfile {
         match raw.trim().to_ascii_lowercase().as_str() {
             "standard" | "" => Ok(Self::Standard),
             "vault" => Ok(Self::Vault),
+            "timeseries" | "time-series" => Ok(Self::TimeSeries),
             other => Err(Error::Vault {
                 code: "invalid_collection_profile",
                 message: format!("unknown collection profile `{other}`"),
@@ -40,11 +43,16 @@ impl CollectionProfile {
         match self {
             Self::Standard => "standard",
             Self::Vault => "vault",
+            Self::TimeSeries => "timeseries",
         }
     }
 
     pub fn is_vault(self) -> bool {
         matches!(self, Self::Vault)
+    }
+
+    pub fn is_timeseries(self) -> bool {
+        matches!(self, Self::TimeSeries)
     }
 }
 

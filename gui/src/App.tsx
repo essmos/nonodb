@@ -94,6 +94,28 @@ type Doc = Record<string, unknown>;
 
 type CollectionTab = 'documents' | 'indexes' | 'events' | 'search' | 'aggregate' | 'schema' | 'metrics';
 
+type TimeSeriesSettings = {
+  time_field: string;
+  meta_field?: string | null;
+  granularity: string;
+  bucket_max_docs?: number;
+  bucket_max_bytes?: number;
+  compression?: string;
+  expire_after_seconds?: number | null;
+};
+
+type TimeSeriesStats = {
+  buckets: number;
+  sealed_buckets: number;
+  open_buckets: number;
+  series: number;
+  rows: number;
+  raw_bytes: number;
+  encoded_bytes: number;
+  open_bytes: number;
+  deleted_rows: number;
+};
+
 type IndexInfo = {
   field: string;
   fields: string[];
@@ -3090,6 +3112,11 @@ function CollectionView({
   const [vectorIndexes, setVectorIndexes] = useState<Array<{ field: string; dims: number; metric?: string }>>([]);
   const [ttl, setTtl] = useState('');
   const [history, setHistory] = useState('');
+  const [tsSettings, setTsSettings] = useState<TimeSeriesSettings | null>(null);
+  const [tsStats, setTsStats] = useState<TimeSeriesStats | null>(null);
+  const [tsEditCompression, setTsEditCompression] = useState('balanced');
+  const [tsEditExpire, setTsEditExpire] = useState('');
+  const [tsEditBucketDocs, setTsEditBucketDocs] = useState('');
   const [eventsEnabled, setEventsEnabled] = useState(false);
   const [indexKind, setIndexKind] = useState<'secondary' | 'text' | 'fuzzy' | 'vector'>('secondary');
   const [indexField, setIndexField] = useState('');
@@ -3146,7 +3173,7 @@ function CollectionView({
     try {
       const filter = parseJson(filterText, 'Filter');
       const projection = projectionText.trim() ? parseJson(projectionText, 'Projection') : undefined;
-      const [found, total, indexResult, textResult, fuzzyResult, vectorResult, ttlResult, historyResult, eventsResult] =
+      const [found, total, indexResult, textResult, fuzzyResult, vectorResult, ttlResult, historyResult, eventsResult, timeseriesResult] =
         await Promise.all([
           exec<Doc[]>(connection, {
             op: 'find',
@@ -3168,6 +3195,10 @@ function CollectionView({
           exec<{ ttl_seconds: number | null }>(connection, { op: 'get_collection_ttl', coll: name }),
           exec<{ max_versions: number }>(connection, { op: 'get_collection_history', coll: name }),
           exec<{ enabled: boolean }>(connection, { op: 'get_collection_events', coll: name }),
+          exec<{ timeseries: TimeSeriesSettings; stats: TimeSeriesStats }>(connection, {
+            op: 'get_collection_timeseries',
+            coll: name,
+          }).catch(() => null),
         ]);
       setDocs(found);
       setFieldPaths((current) => [...collectFieldPaths(found, '', new Set(current))].sort());
@@ -3179,6 +3210,17 @@ function CollectionView({
       setTtl(ttlResult.ttl_seconds == null ? '' : String(ttlResult.ttl_seconds));
       setHistory(String(historyResult.max_versions ?? 0));
       setEventsEnabled(Boolean(eventsResult.enabled));
+      setTsSettings(timeseriesResult?.timeseries ?? null);
+      setTsStats(timeseriesResult?.stats ?? null);
+      if (timeseriesResult) {
+        setTsEditCompression(timeseriesResult.timeseries.compression ?? 'balanced');
+        setTsEditExpire(
+          timeseriesResult.timeseries.expire_after_seconds == null
+            ? ''
+            : String(timeseriesResult.timeseries.expire_after_seconds),
+        );
+        setTsEditBucketDocs(String(timeseriesResult.timeseries.bucket_max_docs ?? ''));
+      }
       if (selected) {
         const fresh = found.find((doc) => idOf(doc) === idOf(selected));
         setSelected(fresh ?? null);
@@ -3475,16 +3517,32 @@ function CollectionView({
     setError('');
     setNotice('');
     try {
-      await exec(connection, {
-        op: 'set_collection_ttl',
-        coll: name,
-        ttl_seconds: ttl.trim() === '' ? null : Number(ttl),
-      });
-      await exec(connection, {
-        op: 'set_collection_history',
-        coll: name,
-        max_versions: Number(history || 0),
-      });
+      if (tsSettings) {
+        await exec(connection, {
+          op: 'set_collection_timeseries',
+          coll: name,
+          timeseries: {
+            ...tsSettings,
+            compression: tsEditCompression,
+            expire_after_seconds: tsEditExpire.trim() === '' ? null : Number(tsEditExpire),
+            bucket_max_docs:
+              tsEditBucketDocs.trim() === ''
+                ? tsSettings.bucket_max_docs
+                : Number(tsEditBucketDocs),
+          },
+        });
+      } else {
+        await exec(connection, {
+          op: 'set_collection_ttl',
+          coll: name,
+          ttl_seconds: ttl.trim() === '' ? null : Number(ttl),
+        });
+        await exec(connection, {
+          op: 'set_collection_history',
+          coll: name,
+          max_versions: Number(history || 0),
+        });
+      }
       setNotice('Collection settings saved');
       await load();
     } catch (err) {
@@ -4352,8 +4410,69 @@ function CollectionView({
       {showSettings && (
         <Modal title={`${name} settings`} subtitle="Applies to this collection only" onClose={() => setShowSettings(false)}>
           <div className="form-grid">
-            <label>Default document TTL (seconds)<input value={ttl} onChange={(e) => setTtl(e.target.value)} placeholder="empty = disabled" /><span className="field-hint">Documents expire after this many seconds unless they have their own TTL. Leave empty to disable automatic expiry.</span></label>
-            <label>Versioning / history versions<input type="number" min={0} value={history} onChange={(e) => setHistory(e.target.value)} /><span className="field-hint">Number of previous document revisions to keep. 0 disables history for this collection.</span></label>
+            {tsSettings && (
+              <>
+                <label>
+                  Time-series profile
+                  <span className="field-hint">
+                    timeField <strong>{tsSettings.time_field}</strong>
+                    {tsSettings.meta_field ? ` · metaField ${tsSettings.meta_field}` : ''} ·{' '}
+                    granularity {tsSettings.granularity}
+                  </span>
+                </label>
+                <label>
+                  Compression
+                  <select
+                    value={tsEditCompression}
+                    onChange={(e) => setTsEditCompression(e.target.value)}
+                  >
+                    <option value="fast">fast</option>
+                    <option value="balanced">balanced</option>
+                    <option value="max">max</option>
+                  </select>
+                </label>
+                <label>
+                  Bucket max docs
+                  <input
+                    type="number"
+                    min={1}
+                    value={tsEditBucketDocs}
+                    onChange={(e) => setTsEditBucketDocs(e.target.value)}
+                  />
+                  <span className="field-hint">
+                    Structural fields (timeField, metaField, granularity) can only change while
+                    the collection is empty.
+                  </span>
+                </label>
+                <label>
+                  Expire after (seconds)
+                  <input
+                    value={tsEditExpire}
+                    onChange={(e) => setTsEditExpire(e.target.value)}
+                    placeholder="empty = disabled"
+                  />
+                  <span className="field-hint">
+                    Read-time expiry relative to the event time.
+                  </span>
+                </label>
+                {tsStats && (
+                  <div className="stat-grid">
+                    <div className="stat"><span>Rows</span><strong>{tsStats.rows.toLocaleString()}</strong></div>
+                    <div className="stat"><span>Deleted rows</span><strong>{tsStats.deleted_rows.toLocaleString()}</strong></div>
+                    <div className="stat"><span>Buckets</span><strong>{tsStats.buckets} ({tsStats.open_buckets} open)</strong></div>
+                    <div className="stat"><span>Series</span><strong>{tsStats.series}</strong></div>
+                    <div className="stat"><span>Encoded size</span><strong>{formatBytes(tsStats.encoded_bytes + tsStats.open_bytes)}</strong></div>
+                    <div className="stat"><span>Raw JSON</span><strong>{formatBytes(tsStats.raw_bytes)}</strong></div>
+                  </div>
+                )}
+              </>
+            )}
+            {!tsSettings && (
+              <>
+                <label>Default document TTL (seconds)<input value={ttl} onChange={(e) => setTtl(e.target.value)} placeholder="empty = disabled" /><span className="field-hint">Documents expire after this many seconds unless they have their own TTL. Leave empty to disable automatic expiry.</span></label>
+                <label>Versioning / history versions<input type="number" min={0} value={history} onChange={(e) => setHistory(e.target.value)} /><span className="field-hint">Number of previous document revisions to keep. 0 disables history for this collection.</span></label>
+              </>
+            )}
           </div>
           <div className="modal-actions"><button onClick={() => setShowSettings(false)}>Cancel</button><button className="primary" onClick={() => void saveSettings().then(() => setShowSettings(false))} disabled={busy}>Save settings</button></div>
         </Modal>
@@ -5530,7 +5649,12 @@ function Shell({
   const [newCollection, setNewCollection] = useState('');
   const [ttl, setTtl] = useState('');
   const [history, setHistory] = useState('0');
-  const [profile, setProfile] = useState<'standard' | 'vault'>('standard');
+  const [profile, setProfile] = useState<'standard' | 'vault' | 'timeseries'>('standard');
+  const [timeField, setTimeField] = useState('ts');
+  const [metaField, setMetaField] = useState('');
+  const [granularity, setGranularity] = useState('seconds');
+  const [tsCompression, setTsCompression] = useState('balanced');
+  const [expireAfter, setExpireAfter] = useState('');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
   const [databases, setDatabases] = useState<string[]>([]);
@@ -5600,12 +5724,22 @@ function Shell({
     setError('');
     try {
       const name = newCollection.trim();
-      await exec(connection, {
+      const request: Record<string, unknown> = {
         op: 'create_collection',
         coll: name,
         profile,
-        ttl_seconds: ttl.trim() === '' ? null : Number(ttl),
-      });
+        ttl_seconds: profile === 'timeseries' || ttl.trim() === '' ? null : Number(ttl),
+      };
+      if (profile === 'timeseries') {
+        request.timeseries = {
+          timeField: timeField.trim(),
+          ...(metaField.trim() ? { metaField: metaField.trim() } : {}),
+          granularity,
+          compression: tsCompression,
+          ...(expireAfter.trim() ? { expireAfterSeconds: Number(expireAfter) } : {}),
+        };
+      }
+      await exec(connection, request);
       const versions = Number(history || 0);
       if (versions > 0) {
         await exec(connection, {
@@ -5618,6 +5752,11 @@ function Shell({
       setTtl('');
       setHistory('0');
       setProfile('standard');
+      setTimeField('ts');
+      setMetaField('');
+      setGranularity('seconds');
+      setTsCompression('balanced');
+      setExpireAfter('');
       setShowNewCollection(false);
       await refreshCollections();
       setCollectionTab('documents');
@@ -5857,9 +5996,13 @@ function Shell({
             </label>
             <label>
               Storage profile
-              <select value={profile} onChange={(e) => setProfile(e.target.value as 'standard' | 'vault')}>
+              <select
+                value={profile}
+                onChange={(e) => setProfile(e.target.value as 'standard' | 'vault' | 'timeseries')}
+              >
                 <option value="standard">standard</option>
                 <option value="vault">vault (encrypted)</option>
+                <option value="timeseries">timeseries (columnar buckets)</option>
               </select>
               {profile === 'vault' && (
                 <span className="field-hint">
@@ -5867,7 +6010,63 @@ function Shell({
                   screen. Data is encrypted per tenant.
                 </span>
               )}
+              {profile === 'timeseries' && (
+                <span className="field-hint">
+                  Rows are grouped into buckets by time window and optional series field.
+                  Field names become columns; deletes use a bucket deletion bitmap.
+                </span>
+              )}
             </label>
+            {profile === 'timeseries' && (
+              <>
+                <label>
+                  Time field (required)
+                  <input
+                    value={timeField}
+                    onChange={(e) => setTimeField(e.target.value)}
+                    placeholder="ts"
+                  />
+                  <span className="field-hint">
+                    Document field holding the event time. Cannot be changed after rows exist.
+                  </span>
+                </label>
+                <label>
+                  Meta / series field
+                  <input
+                    value={metaField}
+                    onChange={(e) => setMetaField(e.target.value)}
+                    placeholder="device (optional)"
+                  />
+                </label>
+                <label>
+                  Granularity
+                  <select value={granularity} onChange={(e) => setGranularity(e.target.value)}>
+                    <option value="seconds">seconds</option>
+                    <option value="minutes">minutes</option>
+                    <option value="hours">hours</option>
+                  </select>
+                </label>
+                <label>
+                  Compression
+                  <select value={tsCompression} onChange={(e) => setTsCompression(e.target.value)}>
+                    <option value="fast">fast</option>
+                    <option value="balanced">balanced</option>
+                    <option value="max">max</option>
+                  </select>
+                </label>
+                <label>
+                  Expire after (seconds)
+                  <input
+                    value={expireAfter}
+                    onChange={(e) => setExpireAfter(e.target.value)}
+                    placeholder="empty = read-time only"
+                  />
+                  <span className="field-hint">
+                    Rows older than this many seconds are hidden at read time.
+                  </span>
+                </label>
+              </>
+            )}
             <label>
               Default document TTL (seconds)
               <input
@@ -5899,7 +6098,7 @@ function Shell({
             <button
               className="primary"
               onClick={() => void createCollection()}
-              disabled={busy || !newCollection.trim()}
+              disabled={busy || !newCollection.trim() || (profile === 'timeseries' && !timeField.trim())}
             >
               Create collection
             </button>

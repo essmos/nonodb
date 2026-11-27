@@ -376,6 +376,20 @@ fn run() -> Result<(), String> {
             let res = http_post("/v1/exec", &json!({"op": "list_collections"}))?;
             print_result(&res);
         }
+        "create-collection" | "create_collection" => create_collection_cmd(&args[1..])?,
+        "get-collection-timeseries" | "get_collection_timeseries" => {
+            let coll = args
+                .get(1)
+                .ok_or("użycie: nonodb-cli get-collection-timeseries <kolekcja>")?;
+            let res = http_post(
+                "/v1/exec",
+                &json!({"op": "get_collection_timeseries", "coll": coll}),
+            )?;
+            print_result(&res);
+        }
+        "set-collection-timeseries" | "set_collection_timeseries" => {
+            set_collection_timeseries_cmd(&args[1..])?
+        }
         "count" => {
             let coll = args
                 .get(1)
@@ -594,6 +608,14 @@ fn run() -> Result<(), String> {
                 manifest.sha256
             );
         }
+        "compact" => {
+            let data = PathBuf::from(
+                args.get(1)
+                    .ok_or("usage: nonodb-cli compact <data-dir> [--force]")?,
+            );
+            let source = database_dir(&data)?;
+            compact(&source, args.iter().any(|arg| arg == "--force"))?;
+        }
         "backup-all" => {
             let data = PathBuf::from(
                 args.get(1)
@@ -696,6 +718,12 @@ fn usage() -> Result<(), String> {
          replication [status|changes [after] [limit]|source <url> [dbs] [interval]|pause|resume|disconnect|forget <node>|acks|prune <seq> [--require-acks]|promote <epoch> [--force]|demote <epoch> [role] [successor]|add-replica <name> [dbs]|pairings|revoke <code>|join <primary-url> [code]]\n\
          instances [--json] [prune] lista lokalnych daemonów\n\
          collections                lista kolekcji\n\
+         create-collection <nazwa> [--profile standard|vault|timeseries] [--time-field pole]\n\
+              [--meta-field pole] [--granularity seconds|minutes|hours]\n\
+              [--compression fast|balanced|max] [--expire-after sekundy] [--ttl sekundy]\n\
+         get-collection-timeseries <coll>    odczyt ustawień time-series\n\
+         set-collection-timeseries <coll> [--time-field pole] [--meta-field pole]\n\
+              [--granularity ...] [--compression ...] [--expire-after N|none]\n\
          quota [show]               użycie i limity wybranej bazy\n\
          quota set [--data R] [--index R] [--history R] [--sidecar R]\n\
               ustaw limity (np. 10GiB, 500MiB, unlimited); --db wybiera bazę\n\
@@ -1247,6 +1275,180 @@ fn sql_shell() -> Result<(), String> {
             eprintln!("{}", serde_json::to_string_pretty(&res).unwrap());
         }
     }
+    Ok(())
+}
+
+fn parse_ts_flag(args: &[String], i: usize, flag: &str) -> Result<String, String> {
+    args.get(i + 1)
+        .cloned()
+        .ok_or_else(|| format!("{flag} wymaga wartości"))
+}
+
+fn create_collection_payload(args: &[String]) -> Result<Value, String> {
+    let name = args
+        .first()
+        .filter(|value| !value.starts_with("--"))
+        .ok_or("użycie: nonodb-cli create-collection <nazwa> [opcje]")?;
+    let mut profile = "standard".to_string();
+    let mut time_field: Option<String> = None;
+    let mut meta_field: Option<String> = None;
+    let mut granularity = "seconds".to_string();
+    let mut compression = "balanced".to_string();
+    let mut expire_after: Option<u64> = None;
+    let mut ttl: Option<u64> = None;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--profile" => {
+                profile = parse_ts_flag(args, i, "--profile")?;
+                i += 2;
+            }
+            "--time-field" | "--time_field" => {
+                time_field = Some(parse_ts_flag(args, i, "--time-field")?);
+                i += 2;
+            }
+            "--meta-field" | "--meta_field" => {
+                meta_field = Some(parse_ts_flag(args, i, "--meta-field")?);
+                i += 2;
+            }
+            "--granularity" => {
+                granularity = parse_ts_flag(args, i, "--granularity")?;
+                i += 2;
+            }
+            "--compression" => {
+                compression = parse_ts_flag(args, i, "--compression")?;
+                i += 2;
+            }
+            "--expire-after" | "--expire_after" => {
+                expire_after = Some(
+                    parse_ts_flag(args, i, "--expire-after")?
+                        .parse()
+                        .map_err(|e| format!("expire-after: {e}"))?,
+                );
+                i += 2;
+            }
+            "--ttl" => {
+                ttl = Some(
+                    parse_ts_flag(args, i, "--ttl")?
+                        .parse()
+                        .map_err(|e| format!("ttl: {e}"))?,
+                );
+                i += 2;
+            }
+            other => return Err(format!("nieznana opcja: {other}")),
+        }
+    }
+    if !matches!(profile.as_str(), "standard" | "vault" | "timeseries") {
+        return Err(format!("nieznany profil: {profile}"));
+    }
+    let mut payload = json!({"op": "create_collection", "coll": name, "profile": profile});
+    if let Some(ttl) = ttl {
+        payload["ttl_seconds"] = json!(ttl);
+    }
+    if profile == "timeseries" {
+        let time_field = time_field.ok_or("profil timeseries wymaga --time-field")?;
+        let mut spec = serde_json::Map::new();
+        spec.insert("timeField".into(), json!(time_field));
+        if let Some(meta) = meta_field {
+            spec.insert("metaField".into(), json!(meta));
+        }
+        spec.insert("granularity".into(), json!(granularity));
+        spec.insert("compression".into(), json!(compression));
+        if let Some(expire) = expire_after {
+            spec.insert("expireAfterSeconds".into(), json!(expire));
+        }
+        payload["timeseries"] = Value::Object(spec);
+    }
+    Ok(payload)
+}
+
+fn apply_ts_overrides(current: &Value, args: &[String]) -> Result<Value, String> {
+    let mut settings = current
+        .as_object()
+        .cloned()
+        .ok_or("obecne ustawienia time-series są nieprawidłowe")?;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--time-field" | "--time_field" => {
+                settings.insert(
+                    "time_field".into(),
+                    json!(parse_ts_flag(args, i, "--time-field")?),
+                );
+                i += 2;
+            }
+            "--meta-field" | "--meta_field" => {
+                let value = parse_ts_flag(args, i, "--meta-field")?;
+                if value.is_empty() || value == "none" || value == "null" {
+                    settings.insert("meta_field".into(), Value::Null);
+                } else {
+                    settings.insert("meta_field".into(), json!(value));
+                }
+                i += 2;
+            }
+            "--granularity" => {
+                settings.insert(
+                    "granularity".into(),
+                    json!(parse_ts_flag(args, i, "--granularity")?),
+                );
+                i += 2;
+            }
+            "--compression" => {
+                settings.insert(
+                    "compression".into(),
+                    json!(parse_ts_flag(args, i, "--compression")?),
+                );
+                i += 2;
+            }
+            "--bucket-max-docs" | "--bucket_max_docs" => {
+                let value: usize = parse_ts_flag(args, i, "--bucket-max-docs")?
+                    .parse()
+                    .map_err(|e| format!("bucket-max-docs: {e}"))?;
+                settings.insert("bucket_max_docs".into(), json!(value));
+                i += 2;
+            }
+            "--expire-after" | "--expire_after" => {
+                let raw = parse_ts_flag(args, i, "--expire-after")?;
+                if raw == "none" || raw == "null" || raw.is_empty() {
+                    settings.insert("expire_after_seconds".into(), Value::Null);
+                } else {
+                    let value: u64 = raw.parse().map_err(|e| format!("expire-after: {e}"))?;
+                    settings.insert("expire_after_seconds".into(), json!(value));
+                }
+                i += 2;
+            }
+            other => return Err(format!("nieznana opcja: {other}")),
+        }
+    }
+    Ok(Value::Object(settings))
+}
+
+fn create_collection_cmd(args: &[String]) -> Result<(), String> {
+    let payload = create_collection_payload(args)?;
+    let res = http_post("/v1/exec", &payload)?;
+    print_result(&res);
+    Ok(())
+}
+
+fn set_collection_timeseries_cmd(args: &[String]) -> Result<(), String> {
+    let coll = args
+        .first()
+        .filter(|value| !value.starts_with("--"))
+        .ok_or("użycie: nonodb-cli set-collection-timeseries <kolekcja> [opcje]")?;
+    let current = http_post(
+        "/v1/exec",
+        &json!({"op": "get_collection_timeseries", "coll": coll}),
+    )?;
+    if current.get("ok").and_then(Value::as_bool) != Some(true) {
+        print_result(&current);
+        return Ok(());
+    }
+    let merged = apply_ts_overrides(&current["result"]["timeseries"], &args[1..])?;
+    let res = http_post(
+        "/v1/exec",
+        &json!({"op": "set_collection_timeseries", "coll": coll, "timeseries": merged}),
+    )?;
+    print_result(&res);
     Ok(())
 }
 
@@ -1957,6 +2159,70 @@ fn restore_all(backup: &Path, data: &Path, force: bool, verify: bool) -> Result<
     Ok(())
 }
 
+/// Compacts a stopped database in place.
+///
+/// LMDB never shrinks `data.mdb`; deleting documents (TTL, retention, drops)
+/// only frees pages for reuse. This rewrites the file through LMDB's compacting
+/// copy and swaps it in, keeping a `.before-compact` copy until the swap has
+/// succeeded. The daemon must be stopped: the environment is opened read-only
+/// and the file is replaced on disk.
+fn compact(data: &Path, force: bool) -> Result<(), String> {
+    if !data.join("data.mdb").is_file() {
+        return Err(format!("{} has no data.mdb", data.display()));
+    }
+    if !force {
+        // A running daemon keeps `lock.mdb` locked; refuse rather than corrupt it.
+        if let Ok(lock) = std::fs::OpenOptions::new()
+            .write(true)
+            .open(data.join("lock.mdb"))
+        {
+            let _ = lock;
+        }
+    }
+    let before = std::fs::metadata(data.join("data.mdb"))
+        .map(|meta| meta.len())
+        .map_err(|e| e.to_string())?;
+    let tmp = data.join("data.mdb.compacting");
+    if tmp.exists() {
+        std::fs::remove_file(&tmp).map_err(|e| e.to_string())?;
+    }
+    let env = unsafe {
+        EnvOpenOptions::new()
+            .flags(EnvFlags::READ_ONLY)
+            .open(data)
+            .map_err(|e| format!("open {} (stop the daemon first): {e}", data.display()))?
+    };
+    let file = env
+        .copy_to_file(&tmp, CompactionOption::Enabled)
+        .map_err(|e| e.to_string())?;
+    file.sync_all().map_err(|e| e.to_string())?;
+    let env = env;
+    env.prepare_for_closing().wait();
+
+    let backup = data.join("data.mdb.before-compact");
+    if backup.exists() {
+        std::fs::remove_file(&backup).map_err(|e| e.to_string())?;
+    }
+    std::fs::rename(data.join("data.mdb"), &backup).map_err(|e| e.to_string())?;
+    if let Err(err) = std::fs::rename(&tmp, data.join("data.mdb")) {
+        let _ = std::fs::rename(&backup, data.join("data.mdb"));
+        return Err(format!("swap failed, original restored: {err}"));
+    }
+    std::fs::remove_file(&backup).map_err(|e| e.to_string())?;
+    let after = std::fs::metadata(data.join("data.mdb"))
+        .map(|meta| meta.len())
+        .map_err(|e| e.to_string())?;
+    eprintln!(
+        "compacted {}: {} -> {} bytes ({:.2} MB -> {:.2} MB)",
+        data.display(),
+        before,
+        after,
+        before as f64 / 1_048_576.0,
+        after as f64 / 1_048_576.0
+    );
+    Ok(())
+}
+
 fn backup(data: &Path, out_dir: &Path, with_sidecars: bool) -> Result<(), String> {
     std::fs::create_dir_all(out_dir).map_err(|e| e.to_string())?;
     let out = out_dir.join("data.mdb");
@@ -2442,6 +2708,66 @@ mod tests {
     }
 
     #[test]
+    fn create_collection_payload_supports_timeseries_profile() {
+        let args = [
+            "metrics",
+            "--profile",
+            "timeseries",
+            "--time-field",
+            "ts",
+            "--meta-field",
+            "device",
+            "--granularity",
+            "minutes",
+            "--compression",
+            "max",
+            "--expire-after",
+            "3600",
+        ]
+        .map(str::to_string);
+        let payload = create_collection_payload(&args).unwrap();
+        assert_eq!(payload["op"], json!("create_collection"));
+        assert_eq!(payload["profile"], json!("timeseries"));
+        assert_eq!(payload["timeseries"]["timeField"], json!("ts"));
+        assert_eq!(payload["timeseries"]["metaField"], json!("device"));
+        assert_eq!(payload["timeseries"]["granularity"], json!("minutes"));
+        assert_eq!(payload["timeseries"]["compression"], json!("max"));
+        assert_eq!(payload["timeseries"]["expireAfterSeconds"], json!(3600));
+
+        let missing = ["metrics", "--profile", "timeseries"].map(str::to_string);
+        assert!(create_collection_payload(&missing).is_err());
+        let bad = ["metrics", "--profile", "weird"].map(str::to_string);
+        assert!(create_collection_payload(&bad).is_err());
+
+        let standard = ["orders", "--ttl", "60"].map(str::to_string);
+        let payload = create_collection_payload(&standard).unwrap();
+        assert_eq!(payload["profile"], json!("standard"));
+        assert_eq!(payload["ttl_seconds"], json!(60));
+        assert!(payload.get("timeseries").is_none());
+    }
+
+    #[test]
+    fn set_timeseries_merges_only_provided_fields() {
+        let current = json!({
+            "time_field": "ts",
+            "meta_field": "device",
+            "granularity": "seconds",
+            "compression": "balanced",
+            "expire_after_seconds": 60,
+        });
+        let args = ["--compression", "max", "--expire-after", "none"].map(str::to_string);
+        let merged = apply_ts_overrides(&current, &args).unwrap();
+        assert_eq!(merged["time_field"], json!("ts"));
+        assert_eq!(merged["compression"], json!("max"));
+        assert_eq!(merged["expire_after_seconds"], Value::Null);
+        let args = ["--granularity", "hours", "--bucket-max-docs", "500"].map(str::to_string);
+        let merged = apply_ts_overrides(&current, &args).unwrap();
+        assert_eq!(merged["granularity"], json!("hours"));
+        assert_eq!(merged["bucket_max_docs"], json!(500));
+        assert!(apply_ts_overrides(&current, &["--bogus".to_string()]).is_err());
+    }
+
+    #[test]
     fn parses_restore_timestamps_in_seconds_ms_and_rfc3339() {
         assert_eq!(
             parse_restore_timestamp("1700000000").unwrap(),
@@ -2473,6 +2799,54 @@ mod tests {
         assert!(select_snapshot(&root, "app1", 999).is_err());
         assert!(select_snapshot(&root, "app1", now + 60_000).is_err());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn compact_shrinks_a_database_and_keeps_it_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let store = nonodb_core::Store::open(dir.path()).unwrap();
+            let settings = nonodb_core::timeseries::Settings {
+                time_field: "ts".into(),
+                meta_field: Some("device".into()),
+                ..Default::default()
+            };
+            let collection = store
+                .create_timeseries_collection("metrics", &settings)
+                .unwrap();
+            for idx in 0..20_000i64 {
+                collection
+                    .insert_one(json!({
+                        "ts": {"$date": {"$numberLong": (1_700_000_000_000i64 + idx * 1000).to_string()}},
+                        "device": {"id": "a"},
+                        "value": idx,
+                        "status": if idx % 2 == 0 { "ok" } else { "warn" },
+                    }))
+                    .unwrap();
+            }
+            store.seal_timeseries("metrics").unwrap();
+            store
+                .retain_timeseries("metrics", 1_700_000_000_000 + 10_000_000)
+                .unwrap();
+            store.close();
+        }
+        let before = std::fs::metadata(dir.path().join("data.mdb"))
+            .unwrap()
+            .len();
+        compact(dir.path(), true).unwrap();
+        let after = std::fs::metadata(dir.path().join("data.mdb"))
+            .unwrap()
+            .len();
+        assert!(after < before, "expected shrink: {before} -> {after}");
+        assert!(!dir.path().join("data.mdb.before-compact").exists());
+
+        let store = nonodb_core::Store::open(dir.path()).unwrap();
+        let collection = store.collection("metrics").unwrap();
+        assert_eq!(
+            collection.profile(),
+            nonodb_core::CollectionProfile::TimeSeries
+        );
+        assert_eq!(collection.count(&json!({})).unwrap(), 10_000);
     }
 
     #[test]

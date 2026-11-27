@@ -260,6 +260,100 @@ impl DerefMut for WriteTxn<'_> {
     }
 }
 
+/// Result of an offline compaction pass.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct CompactReport {
+    pub before_bytes: u64,
+    pub after_bytes: u64,
+}
+
+/// Restores the database if a previous compaction crashed between its two swaps.
+///
+/// The normal compaction sequence is:
+/// `data.mdb -> data.mdb.before-compact` then `data.mdb.compacting -> data.mdb`.
+/// A crash can leave only the backup or the compacting copy in place.
+fn recover_interrupted_compaction(data: &Path) -> Result<()> {
+    let source = data.join("data.mdb");
+    let backup = data.join("data.mdb.before-compact");
+    let tmp = data.join("data.mdb.compacting");
+    let mut changed = false;
+    if !source.exists() {
+        if backup.is_file() {
+            std::fs::rename(&backup, &source)?;
+            changed = true;
+        } else if tmp.is_file() {
+            std::fs::rename(&tmp, &source)?;
+            changed = true;
+        }
+    }
+    if source.exists() {
+        if tmp.exists() {
+            std::fs::remove_file(&tmp)?;
+            changed = true;
+        }
+        if backup.exists() {
+            std::fs::remove_file(&backup)?;
+            changed = true;
+        }
+    }
+    if changed {
+        if let Ok(dir) = std::fs::File::open(data) {
+            let _ = dir.sync_all();
+        }
+    }
+    Ok(())
+}
+
+/// Rewrites `data.mdb` through LMDB's compacting copy and swaps it in.
+///
+/// LMDB never shrinks the file when rows are deleted; this is the offline way
+/// to return freed pages to the filesystem. The environment must be closed:
+/// the directory is opened read-only, a compacted copy is written to
+/// `data.mdb.compacting`, fsynced, and atomically swapped in. The previous file
+/// is kept as `data.mdb.before-compact` until the swap succeeds.
+pub fn compact_data_dir(data: &Path) -> Result<CompactReport> {
+    let source = data.join("data.mdb");
+    if !source.is_file() {
+        return Err(Error::Query(format!("{} has no data.mdb", data.display())));
+    }
+    let before_bytes = std::fs::metadata(&source)?.len();
+    let tmp = data.join("data.mdb.compacting");
+    if tmp.exists() {
+        std::fs::remove_file(&tmp)?;
+    }
+    let env = unsafe {
+        EnvOpenOptions::new()
+            .flags(EnvFlags::READ_ONLY)
+            .open(data)
+            .map_err(|e| Error::Query(format!("open {}: {e}", data.display())))?
+    };
+    let file = env.copy_to_file(&tmp, heed::CompactionOption::Enabled)?;
+    file.sync_all()?;
+    env.prepare_for_closing().wait();
+
+    let backup = data.join("data.mdb.before-compact");
+    if backup.exists() {
+        std::fs::remove_file(&backup)?;
+    }
+    std::fs::rename(&source, &backup)?;
+    if let Err(error) = std::fs::rename(&tmp, &source) {
+        let _ = std::fs::rename(&backup, &source);
+        return Err(Error::Query(format!(
+            "compaction swap failed, original restored: {error}"
+        )));
+    }
+    std::fs::remove_file(&backup)?;
+    // Persist the directory entry so a crash cannot resurrect the old inode.
+    if let Ok(dir) = std::fs::File::open(data) {
+        let _ = dir.sync_all();
+    }
+    let after_bytes = std::fs::metadata(&source)?.len();
+    Ok(CompactReport {
+        before_bytes,
+        after_bytes,
+    })
+}
+
 /// Database handle. One `Store` = one `Env` = one LMDB file.
 pub struct Store {
     env: Env,
@@ -285,6 +379,7 @@ impl Store {
         }
         let path = path.as_ref();
         std::fs::create_dir_all(path)?;
+        recover_interrupted_compaction(path)?;
 
         // SAFETY: the file is not modified outside LMDB and is not opened
         // concurrently with another `map_size` (the daemon is the sole owner).
@@ -312,12 +407,26 @@ impl Store {
         // After `kill -9`, dead reader slots may remain in the lock table.
         let _ = env.clear_stale_readers();
         let (history, ttl) = Self::init_meta(&env)?;
-        Ok(Self {
+        let store = Self {
             env,
             history,
             ttl,
             txn_gate: TxnGate::default(),
-        })
+        };
+        store.ensure_timeseries_bucket_indexes()?;
+        Ok(store)
+    }
+
+    fn ensure_timeseries_bucket_indexes(&self) -> Result<()> {
+        for name in self.collections()? {
+            if self.timeseries_settings(&name)?.is_none() {
+                continue;
+            }
+            let mut wtxn = self.write_txn()?;
+            crate::timeseries::ensure_bucket_index(&mut wtxn, &self.env, &name)?;
+            wtxn.commit()?;
+        }
+        Ok(())
     }
 
     /// Opens an existing database read-only for verification and inspection.
@@ -476,6 +585,16 @@ impl Store {
     }
 
     /// Makes a consistent LMDB copy while holding the resize gate.
+    /// Consumes the store and waits until LMDB releases the environment path.
+    ///
+    /// Useful for offline maintenance (compaction, file replacement) performed
+    /// in the same process. The daemon normally relies on process exit.
+    pub fn close(self) {
+        let env = self.env.clone();
+        drop(self);
+        env.prepare_for_closing().wait();
+    }
+
     pub fn copy_to_file(
         &self,
         path: impl AsRef<Path>,
@@ -676,14 +795,100 @@ impl Store {
 
     /// Creates a collection with an explicit profile.
     ///
-    /// Existing collections cannot be converted between `standard` and `vault`;
-    /// create a new collection and reinsert the data instead.
+    /// Existing collections cannot be converted between `standard`, `vault`,
+    /// and `timeseries`; create a new collection and reinsert the data instead.
     pub fn create_collection(
         &self,
         name: &str,
         profile: CollectionProfile,
     ) -> Result<Collection<'_>> {
         self.create_collection_with_ttl(name, profile, None)
+    }
+
+    /// Seals all pending time-series rows into columnar buckets.
+    ///
+    /// Open buckets keep rows as raw JSON so inserts stay O(1). Sealing is
+    /// automatic when a bucket fills or the window advances; this method lets
+    /// operators force it (for example before a compression report or a cold
+    /// backup).
+    pub fn seal_timeseries(&self, name: &str) -> Result<usize> {
+        let mut wtxn = self.write_txn()?;
+        let collection = self.collection_in(&mut wtxn, name)?;
+        let Some(settings) = collection.timeseries_settings_in(&wtxn)? else {
+            return Ok(0);
+        };
+        let sealed = crate::timeseries::seal_all(&mut wtxn, &self.env, name, &settings)?;
+        wtxn.commit()?;
+        Ok(sealed)
+    }
+
+    /// Re-encodes sealed buckets with at least `min_deleted` deleted rows,
+    /// dropping their column values while keeping synthetic ids stable.
+    pub fn compact_timeseries_buckets(
+        &self,
+        name: &str,
+        min_deleted: usize,
+    ) -> Result<crate::timeseries::BucketCompactReport> {
+        let mut wtxn = self.write_txn()?;
+        let collection = self.collection_in(&mut wtxn, name)?;
+        let Some(settings) = collection.timeseries_settings_in(&wtxn)? else {
+            return Err(Error::Query(format!(
+                "collection `{name}` is not a time-series collection"
+            )));
+        };
+        let report = crate::timeseries::compact_deleted_buckets(
+            &mut wtxn,
+            &self.env,
+            name,
+            &settings,
+            min_deleted,
+        )?;
+        wtxn.commit()?;
+        Ok(report)
+    }
+
+    /// Removes time-series rows older than `before_ms`.
+    pub fn retain_timeseries(
+        &self,
+        name: &str,
+        before_ms: i64,
+    ) -> Result<crate::timeseries::RetainReport> {
+        let mut wtxn = self.write_txn()?;
+        let report = self.retain_timeseries_in(&mut wtxn, name, before_ms)?;
+        wtxn.commit()?;
+        Ok(report)
+    }
+
+    /// Retention variant for an existing writer transaction.
+    pub fn retain_timeseries_in(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        name: &str,
+        before_ms: i64,
+    ) -> Result<crate::timeseries::RetainReport> {
+        let collection = self.collection_in(wtxn, name)?;
+        collection.retain_timeseries_txn(wtxn, before_ms)
+    }
+
+    /// Creates a time-series collection backed by columnar buckets.
+    pub fn create_timeseries_collection(
+        &self,
+        name: &str,
+        settings: &crate::timeseries::Settings,
+    ) -> Result<Collection<'_>> {
+        settings.validate()?;
+        let mut wtxn = self.write_txn()?;
+        let collection = self.create_collection_with_ttl_and_purge_in(
+            &mut wtxn,
+            name,
+            CollectionProfile::TimeSeries,
+            None,
+            None,
+        )?;
+        collection.set_timeseries_settings_in(&mut wtxn, settings)?;
+        crate::timeseries::init_bucket_index(&mut wtxn, &self.env, name)?;
+        wtxn.commit()?;
+        Ok(collection)
     }
 
     /// Creates a collection with an optional default document TTL.
@@ -965,6 +1170,30 @@ impl Store {
     }
 
     /// Returns a collection's default TTL, if any.
+    /// Time-series settings for `name`, or `None` when it is not a
+    /// time-series collection.
+    pub fn timeseries_settings(&self, name: &str) -> Result<Option<crate::timeseries::Settings>> {
+        let rtxn = self.read_txn()?;
+        let collection = self.collection_at(&rtxn, name)?;
+        let out = match collection {
+            Some(collection) => collection.timeseries_settings_in(&rtxn)?,
+            None => None,
+        };
+        rtxn.commit()?;
+        Ok(out)
+    }
+
+    /// Storage statistics for a time-series collection.
+    pub fn timeseries_stats(&self, name: &str) -> Result<Option<crate::timeseries::Stats>> {
+        let Some(settings) = self.timeseries_settings(name)? else {
+            return Ok(None);
+        };
+        let rtxn = self.read_txn()?;
+        let out = crate::timeseries::stats(&rtxn, self.env(), name, &settings)?;
+        rtxn.commit()?;
+        Ok(Some(out))
+    }
+
     pub fn collection_ttl(&self, name: &str) -> Result<Option<u64>> {
         let rtxn = self.read_txn()?;
         let meta = self
@@ -1603,6 +1832,10 @@ impl Store {
             collection.drop_search_index_txn(wtxn, def.kind, &def.name)?;
         }
 
+        if collection.profile().is_timeseries() {
+            crate::timeseries::clear(wtxn, &self.env, name)?;
+        }
+
         if let Some(db) = self.env.open_database::<Bytes, Bytes>(&*wtxn, Some(name))? {
             db.clear(&mut *wtxn)?;
         }
@@ -1613,6 +1846,7 @@ impl Store {
             format!("events:{name}"),
             format!("ttl:{name}"),
             format!("ttl_purge:{name}"),
+            format!("{}{name}", crate::timeseries::SETTINGS_META_PREFIX),
             subscriptions::meta_key(name),
             graph::node_def_key(name),
             graph::edge_def_key(name),
@@ -2171,15 +2405,20 @@ impl Store {
                 ttl_seconds,
                 ttl_field,
                 ttl_purge_history,
+                timeseries,
             } => {
                 let profile = CollectionProfile::parse(profile)?;
-                self.create_collection_with_ttl_and_purge_in(
+                let collection = self.create_collection_with_ttl_and_purge_in(
                     wtxn,
                     name,
                     profile,
                     *ttl_seconds,
                     *ttl_purge_history,
                 )?;
+                if let Some(raw) = timeseries {
+                    let settings: crate::timeseries::Settings = serde_json::from_str(raw)?;
+                    collection.set_timeseries_settings_in(wtxn, &settings)?;
+                }
                 if let (Some(field), Some(seconds)) = (ttl_field.as_deref(), ttl_seconds) {
                     self.set_collection_ttl_after_in(
                         wtxn,
@@ -2193,6 +2432,14 @@ impl Store {
             }
             ReplicationOp::CollectionDrop { name } => {
                 self.drop_collection_in(wtxn, name).map(|_| ())
+            }
+            ReplicationOp::TimeSeriesRetain { coll, before_ms } => self
+                .retain_timeseries_in(wtxn, coll, *before_ms)
+                .map(|_| ()),
+            ReplicationOp::TimeSeriesSettings { coll, settings } => {
+                let collection = self.collection_in(&mut *wtxn, coll)?;
+                collection.set_timeseries_settings_in(wtxn, settings)?;
+                Ok(())
             }
             ReplicationOp::CollectionTtl {
                 coll,
@@ -2664,5 +2911,84 @@ mod tests {
         assert_eq!(parse_size("512mb"), Some(512_000_000));
         assert_eq!(parse_size("1073741824"), Some(1 << 30));
         assert_eq!(parse_size("nonsense"), None);
+    }
+
+    #[test]
+    fn store_open_recovers_interrupted_compaction_swap() {
+        use serde_json::json;
+        let dir = tempfile::tempdir().unwrap();
+        let store = super::Store::open(dir.path()).unwrap();
+        let c = store.collection("docs").unwrap();
+        c.insert_one(json!({"_id": "a", "value": 1})).unwrap();
+        store.close();
+
+        let source = dir.path().join("data.mdb");
+        let backup = dir.path().join("data.mdb.before-compact");
+        std::fs::rename(&source, &backup).unwrap();
+        assert!(!source.exists());
+
+        let store = super::Store::open(dir.path()).unwrap();
+        assert_eq!(
+            store.collection("docs").unwrap().count(&json!({})).unwrap(),
+            1
+        );
+        assert!(source.exists());
+        assert!(!backup.exists());
+    }
+
+    #[test]
+    fn compact_data_dir_reclaims_deleted_timeseries_rows() {
+        use serde_json::json;
+        let dir = tempfile::tempdir().unwrap();
+        let store = super::Store::open(dir.path()).unwrap();
+        let settings = crate::timeseries::Settings {
+            time_field: "ts".into(),
+            meta_field: Some("device".into()),
+            ..Default::default()
+        };
+        let c = store
+            .create_timeseries_collection("metrics", &settings)
+            .unwrap();
+        for idx in 0..2000i64 {
+            c.insert_one(json!({
+                "ts": idx * 1000,
+                "device": {"id": format!("dev-{}", idx % 10)},
+                "value": idx,
+                "payload": "x".repeat(200),
+            }))
+            .unwrap();
+        }
+        store.seal_timeseries("metrics").unwrap();
+        assert_eq!(
+            c.delete(&json!({"value": {"$lt": 1900}}), true).unwrap(),
+            1900
+        );
+        store.close();
+
+        let before = std::fs::metadata(dir.path().join("data.mdb"))
+            .unwrap()
+            .len();
+        let report = super::compact_data_dir(dir.path()).unwrap();
+        assert!(report.after_bytes < before);
+        assert!(!dir.path().join("data.mdb.compacting").exists());
+        assert!(!dir.path().join("data.mdb.before-compact").exists());
+
+        let store = super::Store::open(dir.path()).unwrap();
+        let c = store.collection("metrics").unwrap();
+        assert_eq!(c.count(&json!({})).unwrap(), 100);
+        let docs = c
+            .find(&crate::collection::FindQuery {
+                filter: json!({}),
+                projection: None,
+                sort: Vec::new(),
+                skip: 0,
+                limit: Some(1),
+                comment: None,
+                max_time_ms: None,
+                hint: None,
+            })
+            .unwrap();
+        let id = docs[0]["_id"].as_str().unwrap();
+        assert!(c.find_by_key(id).unwrap().is_some());
     }
 }

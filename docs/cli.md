@@ -180,6 +180,37 @@ List known collections:
 nonodb-cli collections
 ```
 
+## create-collection
+
+Create a collection through the running daemon:
+
+```bash
+nonodb-cli create-collection orders --ttl 86400
+nonodb-cli create-collection readings --profile timeseries \
+  --time-field ts --meta-field device --granularity seconds \
+  --compression balanced --expire-after 86400
+```
+
+`--profile` accepts `standard` (default), `vault`, and `timeseries`. A
+time-series profile requires `--time-field`; `--meta-field`, `--granularity`
+(`seconds`/`minutes`/`hours`), `--compression` (`fast`/`balanced`/`max`), and
+`--expire-after` are optional.
+
+## get-collection-timeseries / set-collection-timeseries
+
+Read and update time-series settings over the daemon socket:
+
+```bash
+nonodb-cli get-collection-timeseries readings
+nonodb-cli set-collection-timeseries readings --compression max --expire-after none
+nonodb-cli set-collection-timeseries readings --granularity hours
+```
+
+`set-collection-timeseries` reads the current settings and merges only the
+flags you pass, so structural fields are preserved. Changing `timeField`,
+`metaField`, or `granularity` on a collection with rows is rejected by the
+daemon.
+
 ## count
 
 Count documents in a collection, optionally with a filter:
@@ -260,6 +291,20 @@ nonodb-cli indexes users
 ```
 
 The output includes the index name, fields, uniqueness, and `include` fields.
+It lists secondary indexes; use `exec` with `list_text_indexes`,
+`list_fuzzy_indexes`, or `list_vector_indexes` for search indexes.
+
+There is no separate `create-index` subcommand. Create indexes through `exec`:
+
+```bash
+nonodb-cli exec '{"op":"create_index","coll":"users","field":"email","unique":true}'
+nonodb-cli exec '{"op":"create_indexes","coll":"events","indexes":[{"fields":["tenant","created_at"]},{"field":"tags","sparse":true}]}'
+nonodb-cli exec '{"op":"create_text_index","coll":"articles","field":"body"}'
+nonodb-cli exec '{"op":"create_vector_index","coll":"articles","field":"embedding","dims":384,"metric":"cosine"}'
+```
+
+The same operations work on time-series collections. `sparse`, `partialFilterExpression`,
+and per-field `directions` are available through `exec`/`create_indexes`.
 
 ## reindex
 
@@ -457,6 +502,23 @@ inspect and verify it directly:
 nonodb-cli inspect ./backup
 nonodb-cli verify-backup ./backup
 ```
+
+## compact
+
+The daemon compacts time-series databases online once they are idle; `compact`
+is the offline/manual path. LMDB never shrinks `data.mdb`; TTL expiry, time-series retention, bitmap-deleted
+deletes, and dropped collections only free pages for reuse. Compact a stopped
+database in place:
+
+```bash
+nonodb-cli compact /var/lib/nonodb/default
+```
+
+The command opens the database read-only, copies it through LMDB's compacting
+copy, fsyncs the result, and swaps it in. `data.mdb.before-compact` keeps the
+previous file until the swap succeeds. Stop the daemon first — the command
+refuses to run against a live environment. `nonodb-cli backup` produces a
+compacted copy without replacing the source, which is safer on a primary.
 
 ## backup-all
 

@@ -2,6 +2,162 @@
 
 Full release notes: https://github.com/essmos/nonodb/releases
 
+## Unreleased
+
+- Accept the documented time-series wire aliases `get_collection_timeseries`,
+  `set_collection_timeseries` (with a `timeseries` payload), and
+  `retain_timeseries`, alongside the canonical snake_case operation names.
+- Recover an interrupted offline compaction from `data.mdb.before-compact` (or
+  `data.mdb.compacting`) when `Store::open` finds no `data.mdb`, so a crash
+  during the two-step rename cannot strand the database.
+- Add a time-series settings argument to Python `create_collection` and Node.js
+  `createCollection`, covering the required `timeField`.
+
+- Add compact bucket locator indexes to time-series collections. Two
+  directional keys (`series + window` and `window + series`) let `find`,
+  `count`, ordered reads, and aggregation iterate bucket locators instead of
+  scanning the whole collection; existing collections are backfilled once on
+  `Store::open` from bucket keys alone.
+- Time-series `count` on `metaField` + time filters reads only bucket headers
+  and the time column/deletion bitmap, and ordered `find` with `skip`/`limit`
+  walks locators and decodes only the blocks it needs. `explain` reports
+  `index=bucket_locator` and `buckets_total`/`buckets_pruned`.
+- Store per-bucket zone maps (numeric/time min-max) and 256-byte Bloom filters
+  in bucket format v3, so filters on non-key columns are rejected before
+  decoding. Existing v1/v2 buckets stay readable; `reencode` upgrades them.
+- Replace per-row time-series secondary index entries with per-bucket posting
+  lists (value + locator + seq bitmap). The `symbol_ts_recent` index shrank by
+  about 63% versus the old per-row format, while unique indexes check
+  `(locator, seq)`.
+- Add materialized hourly and daily OHLCV rollups in `tsr:<collection>` for
+  `$group` downsampling with `$first`/`$last`/`$min`/`$max`/`$sum`. Inserts keep an existing
+  rollup current, while updates, deletes, and retention invalidate it; partial boundary windows are filled from
+  raw rows (or hourly rollups for daily queries). 30-day BTC/USD OHLC dropped
+  from ~814 ms to ~5 ms.
+- Time-series secondary indexes now drive `update`/`delete` filters as well as
+  reads, unique indexes are enforced (including insert/update/upsert/reindex and
+  reuse after delete), and retention removes index entries for reaped rows.
+  Backfills stream bucket-by-bucket instead of materializing every row, so large
+  collections no longer need one `all_docs()` vector in memory. Partial-index
+  range predicates are also recognized when a query bound is at least as
+  selective as the index predicate.
+- Time-series `$out`/`$merge` targets write through the bucket writer, so
+  indexes, events, replication, and synthetic ids stay consistent.
+- Row-local time-series aggregation stages stream in batches
+  (`NONODB_TS_AGG_BATCH`); a single `$group` stage streams all supported
+  accumulators into one builder so downsampling does not materialize the range.
+  `$sort`/`$limit` run on the group result; other blocking stages keep the
+  materialized path.
+- Buckets use block-column encoding (256 rows per block), so `find_by_key`
+  decodes one block instead of the whole bucket. User-supplied ids use a small
+  id-to-locator map instead of a collection scan. Old `NTB1`/`NTB2` payloads
+  remain readable.
+- Idle databases can be compacted online without restarting the daemon; active
+  runtimes are left untouched until they finish, and deleted row values are
+  cleared per bucket during rewrites.
+- Add `Collection::insert_many_txn` with a time-series batch writer that
+  resolves each open bucket once and flushes its pointer at the end of the
+  transaction. A 100k-row load in 1000-row transactions improved from ~40.5k to
+  ~49k rows/s; the daemon `insert_many` path and the benchmark use it.
+- Speed up time-series single-row maintenance: `update`/`findAndModify` by a
+  synthetic `_id` now restrict scanning to the bucket encoded in the id, and
+  unsorted indexed reads stop after `skip + limit` rows instead of decoding all
+  candidates. Add `/metrics` gauges for time-series rows, deleted rows, buckets,
+  encoded/raw bytes, plus retention and compaction counters, documented in
+  `docs/monitoring.md`.
+- Keep synthetic time-series ids stable when a pending row is deleted or moved
+  and the open bucket is later sealed: sealing now preserves sequence gaps as
+  deleted bitmap rows instead of renumbering the surviving rows. Added a pending
+  move test alongside the `findAndModify` index test.
+- Run time-series retention automatically in the daemon for collections with
+  `expireAfterSeconds`, via the single writer thread, and request compaction
+  when deleted pages pass `NONODB_TS_COMPACT_THRESHOLD_MB`. The daemon compacts
+  an idle runtime online; startup compaction remains the crash/disabled-fallback
+  path. Added `compact_data_dir` in the core crate and retention/startup tests.
+- Store time-series deletions as a per-bucket bitmap appended to the columnar
+  payload instead of one 27-byte tombstone key per deleted row. `NTB1`
+  payloads and legacy `0x03` keys remain readable and migrate into the bitmap on
+  the next write, delete, retention, or seal. 10,000 deleted rows now cost about
+  1.25 KB of bitmap instead of 270 KB of keys.
+- Add `profile: "timeseries"` collections with bucketed columnar storage for
+  IoT and event data. A bucket covers one series (`metaField`) and one time
+  window; the meta value is stored once and every other field becomes a typed
+  column encoded with the cheapest of delta, delta-of-delta, Gorilla XOR,
+  dictionary, frame-of-reference bit packing, boolean bit packing, byte
+  shuffle, and optional zlib per column. Open buckets append rows in O(1) and
+  seal when full or when the window advances. `find`, `count`, `explain`,
+  ordered lookups, replication, backup, and drop work. The bundled 100k-row
+  benchmark stores 4.07 bytes/row, 45x smaller than raw JSON. See
+  `docs/timeseries.md`.
+- Add `update` and `findAndModify` update support for time-series collections:
+  `$set`, `$inc`, `$mul`, `$unset`, `$rename`, update pipelines and upserts.
+  Ordinary field changes rewrite the affected bucket in place and keep the
+  synthetic `_id`; changing the time or meta field is a delete + insert and
+  reports the new `_id` (`new_id` from `findAndModify`). Replication replays a
+  move as delete + insert and pinned locators keep ids identical on replicas.
+- Add non-unique secondary indexes to time-series collections. `createIndex`,
+  `createIndexes`, `dropIndex`, `listIndexes`, and `reindex` backfill from
+  bucket rows; inserts, deletes, updates, upserts, and replicated writes keep
+  entries current, and `find`/`count`/`explain` use the planner
+  (`index_used`, `access: index_scan`). Unique indexes are enforced on the
+  same paths.
+- Enable text, fuzzy, geo, and vector indexes on time-series collections,
+  including `$search`, `$searchMeta`, `$vectorSearch`, fuzzy/vector search, and
+  `$near`/`$geoWithin`. Backfills decode bucket rows, and inserts, updates,
+  deletes, upserts, and replicated writes keep the search structures current.
+- SQL statements (`SELECT`, `INSERT`, `UPDATE`, `DELETE`, `EXPLAIN`) now work
+  on time-series collections. Selects reuse the bucket read path and planner;
+  writes reuse the time-series update/insert/delete paths, so indexes and
+  synthetic ids stay consistent.
+- Run time-series aggregations with the full aggregation host, enabling
+  `$lookup` (local/foreign and pipeline/`let`), `$graphLookup`, and
+  `$unionWith` against document or time-series collections. Tests compare the
+  results with the equivalent pipeline on a document collection.
+- Time-series writes now feed change events, watches, persistent/live
+  subscriptions, and webhooks. `_events` entries carry the decoded row and the
+  new id when an update moves it; count thresholds use the normal `count` path;
+  tests cover a live receiver and a webhook delivery with a `sum` threshold.
+- Add `get_collection_timeseries`/`set_collection_timeseries` (native API and
+  core `Store::timeseries_settings`) with validation and replication. Structural
+  fields (`timeField`, `metaField`, `granularity`) can only change on an empty
+  collection. The MongoDB wire `create` command now accepts the standard
+  `timeseries` object.
+- GUI: the New collection dialog supports the `timeseries` profile (required
+  time field plus meta field, granularity, compression, and expiry), and the
+  collection settings panel shows bucket statistics, deleted rows, and
+  compression sizes. Compression/bucket/expiry settings are editable; the
+  structural fields are read-only once rows exist.
+- CLI: add `create-collection` (including `--profile timeseries` with
+  `--time-field`, meta field, granularity, compression, and expiry) and
+  `get-collection-timeseries`/`set-collection-timeseries`, which read and merge
+  settings through the daemon socket.
+- Add aggregation and retention for time-series collections. `aggregate` now
+  decodes buckets through the time-range-pruned find path and runs the normal
+  in-memory pipeline, so `$group`/`$bucket` downsampling works. The new
+  `retain_timeseries` write op (replicated as `time_series_retain`) drops whole
+  old buckets by key without decoding columns and only rewrites the boundary
+  bucket. Add `examples/timeseries_bench.rs` with write/read/aggregate/retention
+  latency percentiles and a standard-collection baseline.
+- Route replicated time-series inserts through the bucket writer instead of the
+  unused `coll:<name>` database, and replicate `retain_timeseries` as
+  `time_series_retain`. Replicas now produce byte-identical documents, including
+  synthetic `_id`s, which is covered by a two-store replication test. Add
+  `examples/timeseries_space.rs`: 100k rows occupy 1.02 MB compacted (10.69
+  B/row) versus 41.59 MB (436.1 B/row) for a document-per-row collection, with
+  the LMDB high-water caveat documented. The benchmark now also measures
+  secondary-index creation/lookup, `$set` updates, SQL `GROUP BY`, bitmap
+  deletes, and compaction.
+- Add `delete` and `findAndModify(remove: true)` for time-series collections.
+  Sealed buckets never renumber rows, so synthetic `_id`s stay valid; deleted
+  rows are tracked in a per-bucket bitmap and a pure `_id` delete goes straight
+  to the row locator. `find`, `count`, `find_by_key`, aggregation, and
+  `verify_data_dir` skip deleted rows; `timeseries_stats` reports
+  `deleted_rows`. Retention marks the boundary bucket instead of renumbering.
+  Add `nonodb-cli compact <data-dir>` for offline in-place compaction
+  (compacting copy + fsync + swap, with a `.before-compact` fallback), plus
+  `Store::close()` so offline maintenance can reopen the environment in the same
+  process.
+
 ## v0.33.0 - 2026-11-26
 
 Stable release focused on graph traversal, read-only Cypher, and background

@@ -323,6 +323,13 @@ they are at least `NONODB_AUTO_INDEX_MIN_AGE` old. Manual indexes are never
 dropped automatically. The state file stores timestamps and index definitions,
 not document values.
 
+Time-series collections are eligible for automatic secondary indexes too,
+except `vault` collections. Auto-index creates only ordinary non-unique
+secondary indexes: it does not create text, fuzzy, vector, geo, unique, sparse,
+partial, or covering indexes. The internal time-series bucket locator indexes
+are managed separately and are unaffected. There is no CLI or GUI switch for
+auto-index; configure it with the daemon environment variables above.
+
 ## Deployment with systemd
 
 The repository includes [`deploy/nonodb.service`](../deploy/nonodb.service).

@@ -602,7 +602,9 @@ pub enum Request {
     SetQuota {
         limits: crate::quota::QuotaLimits,
     },
-    /// Creates a collection explicitly. `profile` is `standard` (default) or `vault`.
+    /// Creates a collection explicitly. `profile` is `standard` (default),
+    /// `vault`, or `timeseries`; `timeseries` configures the time-series bucket
+    /// layout when the profile is `timeseries`.
     CreateCollection {
         coll: String,
         #[serde(default)]
@@ -612,9 +614,30 @@ pub enum Request {
         /// Purge stored history on TTL expiry instead of adding a tombstone.
         #[serde(default)]
         ttl_purge_history: Option<bool>,
+        /// Time-series settings (`timeField`, `metaField`, granularity, ...).
+        #[serde(default)]
+        timeseries: Option<nonodb_core::timeseries::Settings>,
     },
     DropCollection {
         coll: String,
+    },
+    /// Removes time-series rows older than `before` (date or epoch ms).
+    #[serde(alias = "retain_timeseries")]
+    RetainTimeSeries {
+        coll: String,
+        before: Value,
+    },
+    /// Reads the time-series settings of a collection.
+    #[serde(alias = "get_collection_timeseries")]
+    GetCollectionTimeSeries {
+        coll: String,
+    },
+    /// Replaces the time-series settings of a collection.
+    #[serde(alias = "set_collection_timeseries")]
+    SetCollectionTimeSeries {
+        coll: String,
+        #[serde(alias = "timeseries")]
+        settings: nonodb_core::timeseries::Settings,
     },
     /// Sets or clears the default document TTL for a collection.
     SetCollectionTtl {
@@ -848,6 +871,7 @@ pub enum WriteReq {
         profile: CollectionProfile,
         ttl_seconds: Option<u64>,
         ttl_purge_history: Option<bool>,
+        timeseries: Option<nonodb_core::timeseries::Settings>,
     },
     DropCollection {
         coll: String,
@@ -857,11 +881,19 @@ pub enum WriteReq {
         ttl_seconds: Option<u64>,
         purge_history: Option<bool>,
     },
+    SetCollectionTimeSeries {
+        coll: String,
+        settings: nonodb_core::timeseries::Settings,
+    },
     SetCollectionTtlAfter {
         coll: String,
         field: String,
         ttl_seconds: u64,
         purge_history: Option<bool>,
+    },
+    RetainTimeSeries {
+        coll: String,
+        before_ms: i64,
     },
     BackfillCollectionTtl {
         coll: String,
@@ -1125,8 +1157,11 @@ impl Request {
             Self::SetQuota { .. } => "set_quota",
             Self::CreateCollection { .. } => "create_collection",
             Self::DropCollection { .. } => "drop_collection",
+            Self::GetCollectionTimeSeries { .. } => "get_collection_timeseries",
+            Self::SetCollectionTimeSeries { .. } => "set_collection_timeseries",
             Self::SetCollectionTtl { .. } => "set_collection_ttl",
             Self::SetCollectionTtlAfter { .. } => "set_collection_ttl_after",
+            Self::RetainTimeSeries { .. } => "retain_timeseries",
             Self::BackfillCollectionTtl { .. } => "backfill_collection_ttl",
             Self::GetCollectionTtl { .. } => "get_collection_ttl",
             Self::SetCollectionHistory { .. } => "set_collection_history",
@@ -1279,8 +1314,11 @@ impl Request {
             | Self::GetVersion { coll, .. }
             | Self::CreateCollection { coll, .. }
             | Self::DropCollection { coll }
+            | Self::GetCollectionTimeSeries { coll }
+            | Self::SetCollectionTimeSeries { coll, .. }
             | Self::SetCollectionTtl { coll, .. }
             | Self::SetCollectionTtlAfter { coll, .. }
+            | Self::RetainTimeSeries { coll, .. }
             | Self::BackfillCollectionTtl { coll, .. }
             | Self::GetCollectionTtl { coll }
             | Self::SetCollectionHistory { coll, .. }
@@ -1528,6 +1566,39 @@ impl ApiResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn time_series_aliases_deserialize() {
+        let get: Request = serde_json::from_value(serde_json::json!({
+            "op": "get_collection_timeseries", "coll": "readings"
+        }))
+        .unwrap();
+        assert!(matches!(get, Request::GetCollectionTimeSeries { coll } if coll == "readings"));
+
+        let retain: Request = serde_json::from_value(serde_json::json!({
+            "op": "retain_timeseries", "coll": "readings", "before": 0
+        }))
+        .unwrap();
+        assert!(matches!(retain, Request::RetainTimeSeries { .. }));
+
+        let set: Request = serde_json::from_value(serde_json::json!({
+            "op": "set_collection_timeseries",
+            "coll": "readings",
+            "timeseries": {"timeField": "ts"}
+        }))
+        .unwrap();
+        assert!(
+            matches!(set, Request::SetCollectionTimeSeries { coll, settings } if coll == "readings" && settings.time_field == "ts")
+        );
+
+        let canonical: Request = serde_json::from_value(serde_json::json!({
+            "op": "set_collection_time_series",
+            "coll": "readings",
+            "settings": {"timeField": "ts"}
+        }))
+        .unwrap();
+        assert!(matches!(canonical, Request::SetCollectionTimeSeries { .. }));
+    }
 
     #[test]
     fn raw_result_is_serialized_under_result() {

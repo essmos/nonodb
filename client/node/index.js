@@ -338,11 +338,14 @@ class NonoDB {
     return clone;
   }
 
-  /** Create a collection explicitly. Use profile `vault` for encrypted storage. */
-  async createCollection(name, profile = 'standard', ttlSeconds = null, purgeHistory = null) {
+  /** Create a collection explicitly. Use profile `vault` for encrypted storage.
+   * For `timeseries`, pass the settings object with the required `timeField`.
+   */
+  async createCollection(name, profile = 'standard', ttlSeconds = null, purgeHistory = null, timeseries = null) {
     const req = { op: 'create_collection', coll: name, profile };
     if (ttlSeconds !== null) req.ttl_seconds = ttlSeconds;
     if (purgeHistory !== null) req.ttl_purge_history = purgeHistory;
+    if (timeseries !== null) req.timeseries = timeseries;
     return this.exec(req);
   }
 

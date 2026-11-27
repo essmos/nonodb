@@ -1928,6 +1928,48 @@ fn streamable_aggregate_pipeline(pipeline: &[Value]) -> Option<(Value, Vec<Value
     Some((filter, stages.to_vec()))
 }
 
+fn parse_timeseries_spec(
+    body: &Document,
+) -> Result<Option<nonodb_core::timeseries::Settings>, ApiError> {
+    use nonodb_core::timeseries::{Granularity, Settings};
+    let Some(value) = body.get("timeseries") else {
+        return Ok(None);
+    };
+    let spec = value
+        .as_document()
+        .ok_or_else(|| bad_value("timeseries must be a document"))?;
+    let time_field = spec
+        .get_str("timeField")
+        .map_err(|_| bad_value("timeseries.timeField must be a non-empty string"))?;
+    let mut settings = Settings::new(time_field);
+    if let Ok(meta) = spec.get_str("metaField") {
+        if meta.is_empty() {
+            return Err(bad_value("timeseries.metaField must be a non-empty string"));
+        }
+        settings.meta_field = Some(meta.to_string());
+    }
+    if let Ok(raw) = spec.get_str("granularity") {
+        settings.granularity =
+            Granularity::parse(raw).map_err(|error| bad_value(error.to_string()))?;
+    }
+    if let Some(raw) = spec
+        .get_i64("expireAfterSeconds")
+        .ok()
+        .or_else(|| spec.get_i32("expireAfterSeconds").ok().map(i64::from))
+    {
+        if raw < 0 {
+            return Err(bad_value(
+                "timeseries.expireAfterSeconds must not be negative",
+            ));
+        }
+        settings.expire_after_seconds = Some(raw as u64);
+    }
+    settings
+        .validate()
+        .map_err(|error| bad_value(error.to_string()))?;
+    Ok(Some(settings))
+}
+
 async fn create_collection_command(
     state: &super::AppState,
     body: &Document,
@@ -1947,7 +1989,6 @@ async fn create_collection_command(
         "viewOn",
         "pipeline",
         "collation",
-        "timeseries",
         "expireAfterSeconds",
         "storageEngine",
         "indexOptionDefaults",
@@ -1960,14 +2001,21 @@ async fn create_collection_command(
             )));
         }
     }
+    let timeseries = parse_timeseries_spec(body)?;
+    let profile = if timeseries.is_some() {
+        nonodb_core::CollectionProfile::TimeSeries
+    } else {
+        nonodb_core::CollectionProfile::Standard
+    };
     let runtime = database_for_write(state, &database).await?;
     let (_, response) = super::submit_write(
         &runtime,
         WriteReq::CreateCollection {
             coll: collection,
-            profile: nonodb_core::CollectionProfile::Standard,
+            profile,
             ttl_seconds: None,
             ttl_purge_history: None,
+            timeseries,
         },
         Durability::Full,
     )
@@ -2007,6 +2055,25 @@ async fn drop_collection_command(
     })
 }
 
+/// Renders stored time-series settings with the MongoDB `listCollections`
+/// option names (plus NonoDB bucket/compression extensions).
+fn timeseries_options_doc(settings: &nonodb_core::timeseries::Settings) -> Document {
+    let mut spec = bson::doc! {
+        "timeField": settings.time_field.clone(),
+        "granularity": settings.granularity.as_str(),
+    };
+    if let Some(meta) = &settings.meta_field {
+        spec.insert("metaField", meta.clone());
+    }
+    if let Some(expire) = settings.expire_after_seconds {
+        spec.insert("expireAfterSeconds", expire as i64);
+    }
+    spec.insert("bucketMaxDocs", settings.bucket_max_docs as i64);
+    spec.insert("bucketMaxBytes", settings.bucket_max_bytes as i64);
+    spec.insert("compression", settings.compression.as_str());
+    spec
+}
+
 async fn list_collections_command(
     state: &super::AppState,
     body: &Document,
@@ -2018,28 +2085,38 @@ async fn list_collections_command(
         return Ok(cursor_reply(0, &namespace, Vec::new(), true));
     };
     let store = runtime.store.clone();
-    let names = tokio::task::spawn_blocking(move || {
-        let rtxn = store.read_txn()?;
-        let names = store.collections_in(&rtxn)?;
-        rtxn.commit()?;
-        Ok::<Vec<String>, nonodb_core::Error>(names)
+    let entries = tokio::task::spawn_blocking(move || {
+        let names = store.collections()?;
+        let mut entries = Vec::with_capacity(names.len());
+        for name in names {
+            let settings = store.timeseries_settings(&name)?;
+            entries.push((name, settings));
+        }
+        Ok::<_, nonodb_core::Error>(entries)
     })
     .await
     .map_err(|error| ApiError::internal(format!("listCollections join error: {error}")))??;
     let name_only = body.get_bool("nameOnly").unwrap_or(false);
     let filter = document_field(body, "filter")?;
-    let mut batch = Vec::with_capacity(names.len());
-    for name in names {
+    let mut batch = Vec::with_capacity(entries.len());
+    for (name, timeseries) in entries {
         if name.starts_with('\u{1}') || name == crate::databases::DEFAULT_DATABASE {
             continue;
         }
         if principal.is_some_and(|principal| !principal.can_see_collection(&database, &name)) {
             continue;
         }
+        let mut options = Document::new();
+        if let Some(settings) = timeseries {
+            options.insert(
+                "timeseries",
+                Bson::Document(timeseries_options_doc(&settings)),
+            );
+        }
         let mut doc = bson::doc! {
             "name": name.clone(),
             "type": "collection",
-            "options": Bson::Document(Document::new()),
+            "options": Bson::Document(options),
             "info": Bson::Document(bson::doc! {"readOnly": false}),
             "idIndex": Bson::Document(bson::doc! {
                 "v": 2i32,
@@ -4410,6 +4487,50 @@ mod tests {
         assert_eq!(reply.get_i32("maxWireVersion").unwrap(), MAX_WIRE_VERSION);
         assert_eq!(reply.get_i32("maxBsonObjectSize").unwrap(), MAX_BSON_BYTES);
         assert!(reply.get_bool("isWritablePrimary").unwrap());
+    }
+
+    #[test]
+    fn create_parses_timeseries_options() {
+        let spec = bson::doc! {
+            "timeField": "ts",
+            "metaField": "device",
+            "granularity": "minutes",
+            "expireAfterSeconds": 3600i64,
+        };
+        let body = bson::doc! {"create": "metrics", "timeseries": spec};
+        let settings = parse_timeseries_spec(&body).unwrap().unwrap();
+        assert_eq!(settings.time_field, "ts");
+        assert_eq!(settings.meta_field.as_deref(), Some("device"));
+        assert_eq!(settings.granularity.as_str(), "minutes");
+        assert_eq!(settings.expire_after_seconds, Some(3600));
+        assert!(parse_timeseries_spec(&bson::doc! {"create": "plain"})
+            .unwrap()
+            .is_none());
+        let bad = bson::doc! {"create": "metrics", "timeseries": bson::doc! {"metaField": "d"}};
+        assert!(parse_timeseries_spec(&bad).is_err());
+        let bad = bson::doc! {
+            "create": "metrics",
+            "timeseries": bson::doc! {"timeField": "ts", "granularity": "weeks"},
+        };
+        assert!(parse_timeseries_spec(&bad).is_err());
+    }
+
+    #[test]
+    fn list_collections_renders_timeseries_options() {
+        let settings = nonodb_core::timeseries::Settings {
+            time_field: "ts".into(),
+            meta_field: Some("device".into()),
+            granularity: nonodb_core::timeseries::Granularity::Minutes,
+            expire_after_seconds: Some(3600),
+            ..Default::default()
+        };
+        let options = timeseries_options_doc(&settings);
+        assert_eq!(options.get_str("timeField").unwrap(), "ts");
+        assert_eq!(options.get_str("metaField").unwrap(), "device");
+        assert_eq!(options.get_str("granularity").unwrap(), "minutes");
+        assert_eq!(options.get_i64("expireAfterSeconds").unwrap(), 3600);
+        assert_eq!(options.get_i64("bucketMaxDocs").unwrap(), 2048);
+        assert_eq!(options.get_str("compression").unwrap(), "balanced");
     }
 
     #[test]

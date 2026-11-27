@@ -74,6 +74,9 @@ pub struct IndexDef {
     /// This is required before a multikey index can provide sort order.
     #[serde(default, skip_serializing_if = "is_false")]
     pub multikey_all_docs: bool,
+    /// Time-series indexes store per-bucket seq bitmaps instead of per-row ids.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub postings: bool,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -96,6 +99,7 @@ impl IndexDef {
             format: FORMAT_VERSION,
             multikey_fields: Vec::new(),
             multikey_all_docs: false,
+            postings: false,
         }
     }
 
@@ -114,6 +118,7 @@ impl IndexDef {
             format: FORMAT_VERSION,
             multikey_fields: Vec::new(),
             multikey_all_docs: false,
+            postings: false,
         }
     }
 

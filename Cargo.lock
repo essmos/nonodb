@@ -1749,6 +1749,7 @@ dependencies = [
  "nonodb-core",
  "rust-embed",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
