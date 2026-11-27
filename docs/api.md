@@ -187,7 +187,11 @@ client timeout with `NONODB_TIMEOUT` or the `timeout=` argument.
 | [`graph_job_result`](#background-analytics-jobs) | Read a completed job result |
 | [`cancel_graph_job`](#background-analytics-jobs) | Cooperatively cancel a job |
 | [`export_graph_job`](#background-analytics-jobs) | Atomically export a result to a collection |
-| [`watch`](#watch) | Long-poll append-only events by sortable `_id` |
+| [`watch`](#watch) | Long-poll append-only events by sortable `_id`, or by group offset |
+| [`create_stream`](#streams) | Define a stream over an append-only collection |
+| [`create_stream_group`](#streams) | Create a consumer group at earliest, latest, or an offset |
+| [`commit_stream_group`](#streams) | Commit a group offset with lease fencing |
+| [`stream_stats`](#streams) | Per-group offsets, lag, and lease state |
 | [`explain`](#explain) | Show the selected plan, bounds, and actual counts |
 | [`update`](#update) | Update or upsert documents |
 | [`find_and_modify`](#find_and_modify) | Atomically update/remove one document and return it |
@@ -575,6 +579,10 @@ Response:
   oldest event id still available.
 - `watch` requires read scope on `coll`, is not cacheable, and is rejected inside
   a read `batch`. Vault collections are rejected.
+
+With `"mode": "group"` the same operation reads by committed offset instead of by
+`_id` (fields `group`, `member`, `lease_ms`; response fields `next_seq`,
+`committed_seq`, `lease_id`). See [streams](#streams).
 
 ### Continuous stream
 
@@ -3863,3 +3871,53 @@ curl -s --unix-socket "$S" http://localhost/metrics
 
 See the [Python client](python-client.md) for a higher-level interface and the
 [Operations](operations.md) guide for deployment and security.
+
+## streams
+
+Streams give an append-only collection server-side offsets and consumer groups.
+The stream name is the collection name. Inserts into a stream collection get a
+writer-assigned `_seq` (reserved: user writes that set it fail with
+`invalid_query`), and group reads order by `_seq` instead of `_id`.
+
+```json
+{"op":"create_stream","coll":"_events","retention":{"max_events":1000000}}
+{"op":"create_stream_group","coll":"_events","group":"order-sync","start":"latest"}
+```
+
+`start` is `latest` (default), `earliest`, or `{"seq": 1234}`.
+
+Read and commit:
+
+```json
+{"op":"watch","coll":"_events","mode":"group","group":"order-sync","member":"worker-1","limit":100}
+{"op":"commit_stream_group","coll":"_events","group":"order-sync","seq":412901,"lease_id":"01J..."}
+```
+
+- A group is owned by one member at a time. Reading claims the lease for
+  `lease_ms` (default `60000`); another member waits until the owner commits or
+  the lease expires.
+- `commit_stream_group` requires the `lease_id` of the batch (`stale_lease`
+  otherwise), only moves forward (`commit_out_of_order`), and clears the lease.
+- Delivery is at-least-once; handlers must be idempotent.
+
+Administration:
+
+```json
+{"op":"get_stream","coll":"_events"}
+{"op":"list_streams"}
+{"op":"stream_stats","coll":"_events"}
+{"op":"reset_stream_group","coll":"_events","group":"order-sync","to":"earliest"}
+{"op":"delete_stream_group","coll":"_events","group":"order-sync"}
+{"op":"drop_stream","coll":"_events"}
+```
+
+Claiming and committing a group need `consume:<coll>` (or `admin:<coll>`);
+`stale_lease` and `commit_out_of_order` are HTTP 409, `stream_truncated` is 410.
+
+`stream_stats` returns `committed_seq`, `head_seq`, `lag`, the active lease, and
+`truncated_below` per group. `create_stream` creates the collection if it does not
+exist (standard profile only: time-series and vault collections are rejected) and
+builds the `_seq` index, so it costs
+like an index build. `retention` is validated but not enforced yet; use TTL until
+the retention phase lands. Scopes: `admin:<coll>` for mutations,
+`read:<coll>` for reads.

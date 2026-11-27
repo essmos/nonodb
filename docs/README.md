@@ -39,6 +39,7 @@ quick-start instructions, and a feature overview.
 | [Graph benchmark](graph-benchmark.md) | Evaluators, maintainers | NonoDB vs Neo4j Community: dataset, methodology, results, caveats, reproduction |
 | [Read-only Cypher](cypher.md) | Application developers, evaluators | Cypher API, supported clauses, GDS procedures, limits, pinned TCK baseline |
 | [Streaming outbox events](streams.md) | Application developers | Long-poll `watch`, NDJSON/SSE streams, resume tokens, filters, truncation, Python/Rust/Node.js/Go examples |
+| [Streams with groups (plan)](streams-groups-plan.md) | Maintainers, application developers | Design plan for server-side offsets, consumer groups, in-flight leases, and offset-based retention |
 | [Asynchronous webhooks](webhooks.md) | Application developers, operators | Webhook rules, async filters and count/sum/avg thresholds, retries, HMAC, dead-letter, GUI |
 | [CLI](cli.md) | Operators | Administration, map resize, backup verification, restore drills, inspect, raw requests |
 | [Operations](operations.md) | Operators, SRE | Configuration, deployment, security, snapshots, monitoring, capacity, troubleshooting |

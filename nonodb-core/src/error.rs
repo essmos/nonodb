@@ -64,4 +64,16 @@ pub enum Error {
     /// Vault/encryption error with a stable API code.
     #[error("{message}")]
     Vault { code: &'static str, message: String },
+
+    /// A consumer group fell behind the retained part of its stream.
+    #[error("stream truncated: {0}")]
+    StreamTruncated(String),
+
+    /// A commit presented a lease that no longer owns the batch.
+    #[error("stale lease: {0}")]
+    StaleLease(String),
+
+    /// A commit moved a group offset backwards or past the stream head.
+    #[error("commit out of order: {0}")]
+    CommitOutOfOrder(String),
 }

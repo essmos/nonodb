@@ -1252,6 +1252,83 @@ fn execute(
             }
             Ok(json!({ "subscription": out }))
         }
+        WriteReq::CreateStream { coll, retention } => {
+            let mut def = nonodb_core::streams::StreamDef::new(coll.clone(), coll.clone());
+            def.retention = retention.clone();
+            // Creating a stream on a collection that does not exist yet is a
+            // normal bootstrap step; create it as a standard collection instead
+            // of failing with "collection does not exist".
+            if store.collection_profile_in_rw(wtxn, coll)?.is_none() {
+                store.create_collection_with_ttl_and_purge_in(
+                    wtxn,
+                    coll,
+                    nonodb_core::vault::CollectionProfile::Standard,
+                    None,
+                    None,
+                )?;
+                // A replica applying this transaction starts without the
+                // collection; create it first or `set_stream_in` fails there.
+                replication.capture_op(ReplicationOp::CollectionCreate {
+                    name: coll.clone(),
+                    profile: "standard".into(),
+                    ttl_seconds: None,
+                    ttl_field: None,
+                    ttl_purge_history: None,
+                    timeseries: None,
+                });
+            }
+            store.set_stream_in(wtxn, &def)?;
+            replication.capture_op(ReplicationOp::StreamSet { def: def.clone() });
+            Ok(serde_json::to_value(def).map_err(nonodb_core::Error::from)?)
+        }
+        WriteReq::DropStream { coll } => {
+            let existed = store.drop_stream_in(wtxn, coll)?;
+            if existed {
+                replication.capture_op(ReplicationOp::StreamDrop { name: coll.clone() });
+            }
+            Ok(json!({ "dropped": existed }))
+        }
+        WriteReq::CreateStreamGroup { coll, group, start } => {
+            let out = store.create_stream_group_in(wtxn, coll, group, *start)?;
+            replication.capture_op(ReplicationOp::StreamGroupSet { group: out.clone() });
+            Ok(serde_json::to_value(out).map_err(nonodb_core::Error::from)?)
+        }
+        WriteReq::ResetStreamGroup { coll, group, to } => {
+            let out = store.reset_stream_group_in(wtxn, coll, group, *to)?;
+            replication.capture_op(ReplicationOp::StreamGroupSet { group: out.clone() });
+            Ok(serde_json::to_value(out).map_err(nonodb_core::Error::from)?)
+        }
+        WriteReq::DeleteStreamGroup { coll, group } => {
+            let deleted = store.delete_stream_group_in(wtxn, coll, group)?;
+            if deleted {
+                replication.capture_op(ReplicationOp::StreamGroupDelete {
+                    stream: coll.clone(),
+                    group: group.clone(),
+                });
+            }
+            Ok(json!({ "deleted": deleted }))
+        }
+        WriteReq::CommitStreamGroup {
+            coll,
+            group,
+            seq,
+            lease_id,
+        } => {
+            let out = store.commit_stream_group_in(wtxn, coll, group, *seq, lease_id.as_deref())?;
+            replication.capture_op(ReplicationOp::StreamGroupSet { group: out.clone() });
+            Ok(serde_json::to_value(out).map_err(nonodb_core::Error::from)?)
+        }
+        WriteReq::ClaimStreamGroup {
+            coll,
+            group,
+            member,
+            lease_ms,
+        } => {
+            let out = store.claim_stream_group_in(wtxn, coll, group, member, *lease_ms)?;
+            // A lease is node-local ownership: replicate the offset but not the
+            // claim, so a replica never blocks its own members on our lease.
+            Ok(serde_json::to_value(out).map_err(nonodb_core::Error::from)?)
+        }
         WriteReq::PruneSubscriptions => {
             let removed = store.prune_expired_subscriptions_in(wtxn)?;
             Ok(json!({ "removed": removed }))

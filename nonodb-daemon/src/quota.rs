@@ -455,6 +455,16 @@ impl Growth {
                 history: *max_versions > 0,
                 ..Self::default()
             },
+            CreateStream { .. } => Self {
+                index: true,
+                ..Self::default()
+            },
+            DropStream { .. }
+            | CreateStreamGroup { .. }
+            | ResetStreamGroup { .. }
+            | DeleteStreamGroup { .. }
+            | CommitStreamGroup { .. }
+            | ClaimStreamGroup { .. } => Self::default(),
             SetCollectionEvents { .. }
             | CreateSubscription { .. }
             | RenewSubscription { .. }

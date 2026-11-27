@@ -45,7 +45,12 @@ def main() -> int:
         primary_port = free_port()
         replica_port = free_port()
         for name, port, role, extra in [
-            ("primary", primary_port, "primary", {}),
+            (
+                "primary",
+                primary_port,
+                "primary",
+                {"NONODB_REPLICATION_ADVERTISE_URL": f"http://127.0.0.1:{primary_port}"},
+            ),
             (
                 "replica",
                 replica_port,
@@ -74,6 +79,10 @@ def main() -> int:
                 ),
                 NONODB_REPLICATION_VOTER_TOKEN=token,
                 NONODB_REPLICATION_POLL_INTERVAL="1",
+                # The primary needs a live lease to accept writes; the streams
+                # scenario below writes before the promotion.
+                NONODB_REPLICATION_LEASE_INTERVAL="1",
+                NONODB_REPLICATION_LEASE_TTL="3",
                 NONODB_LOG="warn",
                 **extra,
             )
@@ -100,6 +109,35 @@ def main() -> int:
                 raise RuntimeError(f"{name} did not become healthy")
 
         primary, replica = clients
+
+        def exec_on(client, payload):
+            response = client.post("/v1/exec", headers=headers, json=payload)
+            assert response.status_code == 200, response.text
+            return response.json()["result"]
+
+        # `create_stream` bootstraps a missing collection, and that has to
+        # replicate (CollectionCreate before StreamSet) or the replica apply
+        # fails on an unknown collection.
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            if primary.get("/readyz/write").status_code == 200:
+                break
+            time.sleep(0.2)
+        else:
+            raise RuntimeError("primary never became writable")
+        exec_on(primary, {"op": "create_stream", "coll": "ledger"})
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            try:
+                stream = exec_on(replica, {"op": "get_stream", "coll": "ledger"})
+                if stream and stream.get("head_seq") is not None:
+                    break
+            except AssertionError:
+                pass
+            time.sleep(0.2)
+        else:
+            raise RuntimeError("replica never applied the bootstrapped collection/stream")
+
         promoted = replica.post(
             "/v1/replication/promote",
             headers=headers,

@@ -85,12 +85,14 @@ version make the file invalid.
 |---|---|
 | `read:<collection>` | find, find_one, lookup, count, aggregate, SQL `SELECT`, explain_sql, explain, search, fuzzy, vector search, history, get_version, get_collection_ttl, get_collection_history, get_collection_events, get_collection_metrics, list_subscriptions, list indexes |
 | `write:<collection>` | insert, insert_many, update, find_and_modify, delete, SQL `INSERT`/`UPDATE` |
+| `consume:<collection>` | Consume a stream/consumer group: `watch` with `mode:"group"`, `claim_stream_group`, `commit_stream_group`, `nack_stream_group`. Does not grant reads of plain documents, group administration, or dead-letter retries |
 | `admin:<collection>` | create/drop collection, create/drop secondary/text/fuzzy/vector index, set collection TTL, set collection history, set collection events, create/renew/delete subscription |
 | `admin:db` | Instance-wide administration: `create_database`, `drop_database`, authorization management, and `/metrics`; collection actions still use collection scopes |
 | `metrics:read` | Read `/metrics` and `/metrics/prometheus` without granting database administration |
-| `read:*` / `write:*` / `admin:*` | The action on every collection in every database |
+| `read:*` / `write:*` / `consume:*` / `admin:*` | The action on every collection in every database |
 | `read:<database>/<collection>` | Same read actions, limited to one database |
 | `write:<database>/<collection>` | Same write actions, limited to one database |
+| `consume:<database>/<collection>` | Same consume actions, limited to one database |
 | `admin:<database>/<collection>` | Collection administration, limited to one database |
 | `admin:<database>/*` | Per-database administrator: collection administration plus map operations, `sync`, and webhooks in that database. Does not create/drop databases, manage authorization, or read instance-wide metrics |
 | `read:<database>/*` | Read every collection in one database |
@@ -101,7 +103,10 @@ Rules:
 
 - Authorization is deny-by-default.
 - `write` does not imply `read`; grant both when the workload needs both.
-- `admin:<collection>` does not imply `read` or `write`.
+- `admin:<collection>` does not imply `read` or `write`, but it does imply
+  `consume` (an operator can always drain their own stream).
+- `read` does not imply `consume`: claiming a batch writes a lease and advances
+  the group offset, which a read-only credential must not be able to do.
 - `write_batch` is checked per operation; one forbidden collection rejects the
   whole request before any write happens.
 - Unqualified collection scopes such as `read:orders` apply to that collection
