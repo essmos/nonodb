@@ -9344,6 +9344,12 @@ impl<'e> Collection<'e> {
             rtxn.commit()?;
             return Ok(out);
         }
+        if self.profile.is_columnar() {
+            let rtxn = self.read_txn()?;
+            let out = self.find_in(&rtxn, query)?;
+            rtxn.commit()?;
+            return Ok(out);
+        }
         let normalized = normalized_find_query(query)?;
         let query = normalized.as_ref();
         crate::query::validate::validate_filter(&query.filter)?;
@@ -9408,6 +9414,7 @@ impl<'e> Collection<'e> {
         crate::query::validate::validate_filter(&query.filter)?;
         if self.profile().is_vault()
             || self.profile().is_timeseries()
+            || self.profile().is_columnar()
             || query.projection.is_some()
             || !query.sort.is_empty()
             || query.hint.is_some()
@@ -10224,7 +10231,18 @@ impl<'e> Collection<'e> {
             let normalized = normalized_find_query(query)?;
             let query = normalized.as_ref();
             crate::query::validate::validate_filter(&query.filter)?;
-            return crate::columnar::find(rtxn, self.env, &self.name, query);
+            let deadline = find_deadline(query);
+            check_find_deadline(deadline)?;
+            let out = if self.ttl_filter_active(rtxn)? {
+                let now = ttl::now_ms();
+                crate::columnar::find_visible(rtxn, self.env, &self.name, query, &mut |doc| {
+                    self.ttl_doc_visible(rtxn, doc, now)
+                })?
+            } else {
+                crate::columnar::find(rtxn, self.env, &self.name, query)?
+            };
+            check_find_deadline(deadline)?;
+            return Ok(out);
         }
         let normalized = normalized_find_query(query)?;
         let query = normalized.as_ref();
@@ -10771,6 +10789,65 @@ impl<'e> Collection<'e> {
         let id_only = projection_is_id_only(projection);
         stats.unique_keys = unique_values.len();
 
+        if self.profile.is_columnar() {
+            if by.len() != 1 || by[0] != "_id" {
+                return Err(Error::Query(format!(
+                    "lookup on `{}` requires a unique single-field or compound index",
+                    by.join("+")
+                )));
+            }
+            stats.selected_index = "_id_".to_string();
+            stats.index_fields = by.to_vec();
+            stats.primary = true;
+            for &value in &unique_values {
+                stats.index_entries_read = stats.index_entries_read.saturating_add(1);
+                let (doc, size) = match value.as_str() {
+                    Some(id) if strict_ttl && self.ttl_expired_at(rtxn, id, now)? => (None, 4),
+                    Some(id) => {
+                        match crate::columnar::find_by_id(rtxn, self.env, &self.name, id)? {
+                            Some(doc) => {
+                                if id_only {
+                                    stats.bytes_read =
+                                        stats.bytes_read.saturating_add(id.len() as u64);
+                                    (Some(serde_json::json!({"_id": id})), id.len())
+                                } else {
+                                    stats.documents_read = stats.documents_read.saturating_add(1);
+                                    let bytes = serde_json::to_vec(&doc)?;
+                                    stats.bytes_read =
+                                        stats.bytes_read.saturating_add(bytes.len() as u64);
+                                    let size = bytes.len();
+                                    let doc = match projection {
+                                        Some(projection) => project(&doc, projection, None),
+                                        None => doc,
+                                    };
+                                    (Some(doc), size)
+                                }
+                            }
+                            None => (None, 4),
+                        }
+                    }
+                    None => (None, 4),
+                };
+                push_lookup_result(
+                    &mut unique_out,
+                    &mut unique_sizes,
+                    &mut unique_bytes,
+                    doc,
+                    size,
+                )?;
+            }
+            stats.covering = id_only;
+            finish_lookup_stats(
+                values.len(),
+                &unique_out,
+                &unique_sizes,
+                &positions,
+                &mut stats,
+            );
+            let out = finish_lookup(values.len(), unique_out, unique_sizes, &positions)?;
+            return Ok((out, stats));
+        }
+
         if by.len() == 1 && by[0] == "_id" {
             stats.selected_index = "_id_".to_string();
             stats.index_fields = by.to_vec();
@@ -11007,6 +11084,43 @@ impl<'e> Collection<'e> {
                 "buckets_pruned": buckets_pruned,
                 "filter": query.filter,
                 "matched": matched,
+            }));
+        }
+        if self.profile.is_columnar() {
+            let normalized = normalized_find_query(query)?;
+            let query = normalized.as_ref();
+            crate::query::validate::validate_filter(&query.filter)?;
+            let stats = crate::columnar::stats(rtxn, self.env, &self.name)?;
+            let matched = self.count_in(rtxn, &query.filter)?;
+            let returned = self.find_in(rtxn, query)?.len();
+            return Ok(serde_json::json!({
+                "collection": self.name,
+                "profile": "columnar",
+                "access": "bucket_scan",
+                "access_path": "bucket_scan",
+                "index_used": false,
+                "index": Value::Null,
+                "bounds": Value::Null,
+                "buckets_total": stats.buckets,
+                "buckets_pruned": 0,
+                "buckets_sealed": stats.sealed_buckets,
+                "buckets_open": stats.open_buckets,
+                "estimated_documents": stats.rows,
+                "candidates": stats.rows,
+                "documents_scanned": stats.rows,
+                "sort_covered": query.sort.is_empty(),
+                "filter": query.filter,
+                "sort": Value::Array(
+                    query
+                        .sort
+                        .iter()
+                        .map(|(field, dir)| serde_json::json!([field, dir]))
+                        .collect(),
+                ),
+                "skip": query.skip,
+                "limit": query.limit.map_or(Value::Null, Value::from),
+                "actual_matched": matched,
+                "actual_returned": returned,
             }));
         }
         let normalized = normalized_find_query(query)?;
@@ -11339,6 +11453,22 @@ impl<'e> Collection<'e> {
         }
         if self.profile.is_columnar() {
             crate::query::validate::validate_filter(filter)?;
+            check_find_deadline(deadline)?;
+            if self.ttl_filter_active(rtxn)? {
+                let query = FindQuery {
+                    filter: filter.clone(),
+                    ..Default::default()
+                };
+                let now = ttl::now_ms();
+                return Ok(crate::columnar::find_visible(
+                    rtxn,
+                    self.env,
+                    &self.name,
+                    &query,
+                    &mut |doc| self.ttl_doc_visible(rtxn, doc, now),
+                )?
+                .len());
+            }
             return crate::columnar::count(rtxn, self.env, &self.name, filter);
         }
         crate::query::validate::validate_filter(filter)?;

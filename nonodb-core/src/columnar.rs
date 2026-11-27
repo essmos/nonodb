@@ -650,8 +650,29 @@ pub fn all_docs(rtxn: &RoTxn<'_>, env: &Env, name: &str) -> Result<Vec<Value>> {
 
 /// Runs the normal find query shape over a columnar collection.
 pub fn find(rtxn: &RoTxn<'_>, env: &Env, name: &str, query: &FindQuery) -> Result<Vec<Value>> {
+    find_visible(rtxn, env, name, query, &mut |_| Ok(true))
+}
+
+/// Runs a find query with an additional visibility predicate (TTL reads).
+pub fn find_visible(
+    rtxn: &RoTxn<'_>,
+    env: &Env,
+    name: &str,
+    query: &FindQuery,
+    visible: &mut dyn FnMut(&Value) -> Result<bool>,
+) -> Result<Vec<Value>> {
     let mut docs = all_docs(rtxn, env, name)?;
-    docs.retain(|doc| crate::query::matcher::matches(doc, &query.filter));
+    let mut kept = Vec::with_capacity(docs.len());
+    for doc in docs.drain(..) {
+        if !crate::query::matcher::matches(&doc, &query.filter) {
+            continue;
+        }
+        if !visible(&doc)? {
+            continue;
+        }
+        kept.push(doc);
+    }
+    docs = kept;
     if !query.sort.is_empty() {
         docs.sort_by(|a, b| compare_docs(a, b, &query.sort));
     }
