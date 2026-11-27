@@ -784,7 +784,7 @@ mkdir -p /host/backups
 docker run --rm \
   -v nonodb-data:/var/lib/nonodb:ro \
   -v /host/backups:/backups \
-  ghcr.io/essmos/nonodb:0.33.0 \
+  ghcr.io/essmos/nonodb:0.34.0 \
   nonodb-cli backup-all /var/lib/nonodb "/backups/$(date -u +%Y%m%dT%H%M%SZ)"
 ```
 
@@ -799,7 +799,7 @@ docker compose -f deploy/docker-compose.yml stop
 docker run --rm \
   -v nonodb-data:/var/lib/nonodb \
   -v /host/backups:/backups \
-  ghcr.io/essmos/nonodb:0.33.0 \
+  ghcr.io/essmos/nonodb:0.34.0 \
   nonodb-cli restore-all /backups/20261109T120000Z /var/lib/nonodb --force --verify
 
 docker compose -f deploy/docker-compose.yml up -d

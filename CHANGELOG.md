@@ -2,7 +2,18 @@
 
 Full release notes: https://github.com/essmos/nonodb/releases
 
-## Unreleased
+## v0.34.0 - 2026-11-27
+
+Stable release focused on time-series collections, columnar compression, and a
+measured comparison with TimescaleDB.
+
+- Add `profile: "timeseries"` collections with per-series/per-window buckets,
+  adaptive typed-column codecs, retention, compaction, indexes, SQL,
+  aggregation, events, webhooks, replication, backup, CLI, and GUI support. See
+  `docs/timeseries.md`.
+- Add the reproducible 100k-row comparison with TimescaleDB, including ingest,
+  range scans, aggregation, storage, operational tradeoffs, and reproduction
+  commands. See `docs/timescale-benchmark.md`.
 
 - Accept the documented time-series wire aliases `get_collection_timeseries`,
   `set_collection_timeseries` (with a `timeseries` payload), and
