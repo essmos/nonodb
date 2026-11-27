@@ -370,7 +370,7 @@ fn run_batch(store: &Store, cache: &QueryCache, quota: &Quota, jobs: Vec<WriteJo
                     // The transaction is committed and visible; only durability
                     // failed. Invalidate reads and dispatch live events anyway.
                     cache.invalidate();
-                    live::dispatch_pending();
+                    live::after_commit();
                     let err = ApiError::from(e);
                     for job in jobs {
                         let _ = job.resp.send(Err(err.clone()));
@@ -380,7 +380,7 @@ fn run_batch(store: &Store, cache: &QueryCache, quota: &Quota, jobs: Vec<WriteJo
             }
             metrics::add(&metrics::COMMIT_NS, started.elapsed().as_nanos() as u64);
             cache.invalidate();
-            live::dispatch_pending();
+            live::after_commit();
             for (job, res) in jobs.into_iter().zip(results) {
                 let _ = job.resp.send(res);
             }
@@ -454,14 +454,14 @@ fn run_single(store: &Store, cache: &QueryCache, quota: &Quota, job: WriteJob) {
                     if sync {
                         if let Err(e) = store.force_sync() {
                             cache.invalidate();
-                            live::dispatch_pending();
+                            live::after_commit();
                             let _ = job.resp.send(Err(ApiError::from(e)));
                             return;
                         }
                     }
                     metrics::add(&metrics::COMMIT_NS, started.elapsed().as_nanos() as u64);
                     cache.invalidate();
-                    live::dispatch_pending();
+                    live::after_commit();
                     let _ = job.resp.send(Ok(value));
                 }
                 Err(e) => {
@@ -2337,7 +2337,7 @@ mod tests {
             },
         )
         .unwrap();
-        crate::live::dispatch_pending();
+        crate::live::after_commit();
         assert!(
             live_rx.try_recv().is_err(),
             "count threshold not reached yet"
@@ -2351,7 +2351,7 @@ mod tests {
             },
         )
         .unwrap();
-        crate::live::dispatch_pending();
+        crate::live::after_commit();
         let live = live_rx
             .try_recv()
             .expect("live subscription should fire at count >= 2");
