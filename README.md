@@ -80,7 +80,7 @@ feature gates:
 - **[Instant CI database branches](docs/branching.md)** — clone a stopped database or data-only snapshot into an independent, writable database with `nonodb-cli branch`; CoW reflink/clonefile keeps it cheap, sidecars are copied or rebuilt, and the source is never modified.
 - **[Simple backup scheduling](docs/backup.md#scheduled-backups-from-the-daemon-and-gui)** — durable backup jobs configured through the CLI, API, or GUI.
 - **[Simple credential management](docs/auth.md)** — principals, database-qualified scopes, hashed tokens, client certificates, lockout, and reloads.
-- **[Streams beyond the local socket](docs/streams.md#continuous-stream)** — watch/SSE/NDJSON streams over the TCP/TLS listener, so remote consumers can use them through a secured endpoint.
+- **[Durable streams and consumer groups](docs/streams.md#consumer-groups-and-durable-offsets)** — writer-assigned `_seq` offsets, shared consumer groups, contiguous range leases, automatic redelivery, persistent dead letters, and offset-driven retention; watch/SSE/NDJSON also work over the TCP/TLS listener.
 - **[Schedulers and background jobs](docs/workers.md#scheduling)** — durable jobs, workers, leases, retries, and scheduler-friendly CLI commands.
 - **[Replication and failover](docs/replication-cluster-guide.md)** — asynchronous primary/replica/standby replication with durable ordered operations, snapshot bootstrap, lease-gated writes, quorum promotion, automatic election, partition rejoin, and a cluster-wide [GUI](docs/gui.md#cluster-view).
 - **[MongoDB-compatible access](docs/mongodb-compatibility.md)** — an optional wire endpoint for official PyMongo, Node.js, and Go drivers, without making MongoDB a deployment dependency.
