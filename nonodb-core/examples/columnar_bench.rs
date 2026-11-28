@@ -58,9 +58,13 @@ struct Run {
     single_insert: Duration,
     point_p50: Duration,
     point_p95: Duration,
+    open_point_p50: Duration,
+    open_point_p95: Duration,
     scan: Duration,
     aggregate: Duration,
     update_p50: Duration,
+    multi_update: Duration,
+    multi_update_rows: usize,
     storage: u64,
     after_delete: u64,
     after_compact: u64,
@@ -87,6 +91,21 @@ fn run(label: &'static str, profile: CollectionProfile) -> Run {
     let start = Instant::now();
     insert_batches(&coll, store);
     let insert_batch = start.elapsed();
+
+    // The final staging bucket is still open: measure point reads there before
+    // the explicit seal.
+    let mut open_point = Vec::with_capacity(POINT_READS.min(512));
+    let open_reads = POINT_READS.min(512);
+    for index in 0..open_reads {
+        let id = id(DOCS - 1 - (index % 128));
+        let start = Instant::now();
+        let found = coll.find_by_key(&id).unwrap();
+        open_point.push(start.elapsed());
+        assert!(found.is_some());
+    }
+    let open_point_p50 = pct(&mut open_point, 0.50);
+    let open_point_p95 = pct(&mut open_point, 0.95);
+
     store.seal_columnar("docs").unwrap();
 
     let single_start = Instant::now();
@@ -148,6 +167,22 @@ fn run(label: &'static str, profile: CollectionProfile) -> Run {
         .copy_to_file(&storage_path, nonodb_core::heed::CompactionOption::Enabled)
         .unwrap();
     let storage = std::fs::metadata(&storage_path).unwrap().len();
+    if profile == CollectionProfile::Columnar {
+        let stats = store.columnar_stats("docs").unwrap().unwrap();
+        println!(
+            "columnar storage parts rows={} buckets={} open={} sealed={} id_entries={} deletes={} data={} open_bytes={} sealed_bytes={} id_bytes={}",
+            stats.rows,
+            stats.buckets,
+            stats.open_buckets,
+            stats.sealed_buckets,
+            stats.id_entries,
+            stats.deletes,
+            stats.data_bytes,
+            stats.open_bytes,
+            stats.sealed_bytes,
+            stats.id_bytes
+        );
+    }
 
     let deleted = coll.delete(&json!({"qty": {"$lt": 25}}), true).unwrap();
     assert!(deleted > 0);
@@ -184,6 +219,14 @@ fn run(label: &'static str, profile: CollectionProfile) -> Run {
         }
     }
 
+    // Multi-row update runs after the storage snapshot so it cannot perturb
+    // the retention/compaction gate.
+    let multi_start = Instant::now();
+    let multi_update_rows = coll
+        .update(&json!({"flag": true}), &json!({"$inc": {"qty": 1}}), true)
+        .unwrap();
+    let multi_update = multi_start.elapsed();
+
     Run {
         label,
         coll,
@@ -193,9 +236,13 @@ fn run(label: &'static str, profile: CollectionProfile) -> Run {
         single_insert,
         point_p50: pct(&mut point, 0.50),
         point_p95: pct(&mut point, 0.95),
+        open_point_p50,
+        open_point_p95,
         scan,
         aggregate,
         update_p50: pct(&mut updates, 0.50),
+        multi_update,
+        multi_update_rows,
         storage,
         after_delete,
         after_compact,
@@ -219,7 +266,7 @@ fn main() {
     let columnar = run("columnar", CollectionProfile::Columnar);
 
     println!(
-        "{:<10} {:>14} {:>14} {:>10} {:>14} {:>14} {:>14} {:>14}",
+        "{:<10} {:>14} {:>14} {:>10} {:>14} {:>14} {:>14} {:>14} {:>14} {:>14} {:>14}",
         "profile",
         "batch_ms",
         "single_us",
@@ -227,11 +274,14 @@ fn main() {
         "scan_ms",
         "agg_ms",
         "update_us",
+        "open_point_us",
+        "multi_update_ms",
+        "multi_update_rows",
         "storage_mb"
     );
     for run in [&standard, &columnar] {
         println!(
-            "{:<10} {:>14.1} {:>14.2} {:>10.1} {:>14.1} {:>14.1} {:>14.1} {:>14.1}",
+            "{:<10} {:>14.1} {:>14.2} {:>10.1} {:>14.1} {:>14.1} {:>14.1} {:>14.1} {:>14.1} {:>14.1} {:>14.1}",
             run.label,
             run.insert_batch.as_secs_f64() * 1000.0,
             run.single_insert.as_secs_f64() * 1_000_000.0,
@@ -239,6 +289,9 @@ fn main() {
             run.scan.as_secs_f64() * 1000.0,
             run.aggregate.as_secs_f64() * 1000.0,
             run.update_p50.as_secs_f64() * 1_000_000.0,
+            run.open_point_p50.as_secs_f64() * 1_000_000.0,
+            run.multi_update.as_secs_f64() * 1000.0,
+            run.multi_update_rows as f64,
             mb(run.storage),
         );
     }
@@ -252,12 +305,13 @@ fn main() {
         standard.aggregate.as_secs_f64() / columnar.aggregate.as_secs_f64(),
     );
     println!(
-        "columnar after_delete_mb={:.1} after_compact_mb={:.1} compact_reclaim_ratio={:.3} seal_compact_p95_ms={:.1} point_p95_us={:.1}",
+        "columnar after_delete_mb={:.1} after_compact_mb={:.1} compact_reclaim_ratio={:.3} seal_compact_p95_ms={:.1} point_p95_us={:.1} open_point_p95_us={:.1}",
         mb(columnar.after_delete),
         mb(columnar.after_compact),
         columnar.after_compact as f64 / columnar.after_delete.max(1) as f64,
         columnar.seal_p95.as_secs_f64() * 1000.0,
         columnar.point_p95.as_secs_f64() * 1_000_000.0,
+        columnar.open_point_p95.as_secs_f64() * 1_000_000.0,
     );
     println!(
         "columnar_rows={} standard_rows={}",

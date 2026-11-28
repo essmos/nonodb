@@ -686,6 +686,7 @@ pub struct CollectionStorageStats {
     pub data_bytes: u64,
     pub index_bytes: u64,
     pub indexes: u64,
+    pub id_bytes: u64,
 }
 
 fn stat_bytes(stat: &heed::DatabaseStat) -> u64 {
@@ -976,6 +977,7 @@ impl<'e> Collection<'e> {
                 data_bytes,
                 index_bytes,
                 indexes,
+                id_bytes: 0,
             });
         }
         if self.profile.is_columnar() {
@@ -1008,6 +1010,7 @@ impl<'e> Collection<'e> {
                 data_bytes,
                 index_bytes,
                 indexes,
+                id_bytes: stats.id_bytes,
             });
         }
         let data = self.db.stat(txn)?;
@@ -1034,6 +1037,7 @@ impl<'e> Collection<'e> {
             data_bytes: stat_bytes(&data),
             index_bytes,
             indexes,
+            id_bytes: 0,
         })
     }
 
@@ -1389,6 +1393,46 @@ impl<'e> Collection<'e> {
         self.db.get(txn, id.as_bytes())?.map(parse_json).transpose()
     }
 
+    /// Streams documents for index backfill. Columnar buckets are decoded one
+    /// at a time instead of materializing the whole collection.
+    fn for_each_backfill_doc<F>(&self, txn: &RoTxn<'_>, mut emit: F) -> Result<()>
+    where
+        F: FnMut(&str, &Value) -> Result<()>,
+    {
+        if self.profile.is_timeseries() {
+            let settings = self.timeseries_settings_in(txn)?.unwrap_or_default();
+            for (id, doc) in crate::timeseries::all_docs(txn, self.env, &self.name, &settings)? {
+                emit(&id, &doc)?;
+            }
+            return Ok(());
+        }
+        if self.profile.is_columnar() {
+            let mut error = None;
+            let result = crate::columnar::for_each(txn, self.env, &self.name, |doc| {
+                let id = doc
+                    .get("_id")
+                    .and_then(id::key_from_value)
+                    .ok_or(Error::InvalidId)?;
+                if let Err(err) = emit(&id, &doc) {
+                    error = Some(err);
+                    return Err(Error::Query("backfill stopped".into()));
+                }
+                Ok(())
+            });
+            if let Some(err) = error {
+                return Err(err);
+            }
+            return result;
+        }
+        for item in self.db.iter(txn)? {
+            let (id, bytes) = item?;
+            let id = std::str::from_utf8(id)
+                .map_err(|e| Error::Query(format!("invalid document id: {e}")))?;
+            emit(id, &parse_json(bytes)?)?;
+        }
+        Ok(())
+    }
+
     /// Every document, used to backfill text/fuzzy/vector indexes.
     fn documents_for_backfill(&self, txn: &RoTxn<'_>) -> Result<Vec<(String, Value)>> {
         if self.profile.is_timeseries() {
@@ -1615,8 +1659,7 @@ impl<'e> Collection<'e> {
         wtxn: &mut RwTxn<'_>,
         defs: &mut [(String, IndexDef)],
     ) -> Result<()> {
-        let docs = crate::columnar::all_docs(&*wtxn, self.env, &self.name)?;
-        let total = docs.len() as u64;
+        let total = crate::columnar::stats(&*wtxn, self.env, &self.name)?.rows;
         let index_dbs: Vec<_> = defs
             .iter()
             .map(|(_key, def)| self.index_db_in(wtxn, def))
@@ -1626,44 +1669,43 @@ impl<'e> Collection<'e> {
         }
         let mut docs_per_index = vec![0u64; defs.len()];
         let mut multikey_fields: Vec<Vec<String>> = vec![Vec::new(); defs.len()];
-        for doc in docs {
-            let id = doc
-                .get("_id")
-                .and_then(id::key_from_value)
-                .ok_or(Error::InvalidId)?;
-            for (slot, ((_key, def), db)) in defs.iter().zip(index_dbs.iter()).enumerate() {
-                let keys = index::encode_index_keys(def, &doc)?;
-                if keys.keys.is_empty() {
-                    continue;
-                }
-                docs_per_index[slot] = docs_per_index[slot].saturating_add(1);
-                for field in &keys.multikey_fields {
-                    if !multikey_fields[slot].contains(field) {
-                        multikey_fields[slot].push(field.clone());
+        crate::columnar::for_each_bucket(wtxn, self.env, &self.name, |wtxn, batch| {
+            for (id, doc) in batch {
+                for (slot, ((_key, def), db)) in defs.iter().zip(index_dbs.iter()).enumerate() {
+                    let keys = index::encode_index_keys(def, &doc)?;
+                    if keys.keys.is_empty() {
+                        continue;
                     }
-                }
-                let value = self.index_value_for(def, &doc, &id);
-                for vb in keys.keys {
-                    if def.unique {
-                        let range = index::exact_prefix(&vb);
-                        let bounds = (as_bound(&range.0), as_bound(&range.1));
-                        for item in db.range(&*wtxn, &bounds)? {
-                            let (existing_key, existing_value) = item?;
-                            if let Some((existing_id, _)) =
-                                index::decode_index_entry(existing_key, existing_value)
-                            {
-                                if existing_id != id {
-                                    return Err(Error::DuplicateKey(id.clone()));
+                    docs_per_index[slot] = docs_per_index[slot].saturating_add(1);
+                    for field in &keys.multikey_fields {
+                        if !multikey_fields[slot].contains(field) {
+                            multikey_fields[slot].push(field.clone());
+                        }
+                    }
+                    let value = self.index_value_for(def, &doc, &id);
+                    for vb in keys.keys {
+                        if def.unique {
+                            let range = index::exact_prefix(&vb);
+                            let bounds = (as_bound(&range.0), as_bound(&range.1));
+                            for item in db.range(&*wtxn, &bounds)? {
+                                let (existing_key, existing_value) = item?;
+                                if let Some((existing_id, _)) =
+                                    index::decode_index_entry(existing_key, existing_value)
+                                {
+                                    if existing_id != id {
+                                        return Err(Error::DuplicateKey(id.clone()));
+                                    }
                                 }
                             }
                         }
+                        let mut key = vb;
+                        index::append_index_id(&mut key, &id, self.compact_index_ids(def));
+                        db.put(&mut *wtxn, key.as_slice(), value.as_slice())?;
                     }
-                    let mut key = vb;
-                    index::append_index_id(&mut key, &id, self.compact_index_ids(def));
-                    db.put(&mut *wtxn, key.as_slice(), value.as_slice())?;
                 }
             }
-        }
+            Ok(())
+        })?;
         for (slot, (key, def)) in defs.iter_mut().enumerate() {
             for field in &multikey_fields[slot] {
                 if !def.multikey_fields.contains(field) {
@@ -3107,7 +3149,31 @@ impl<'e> Collection<'e> {
 
         let db = self.vector_db_in(wtxn, field)?;
         db.clear(&mut *wtxn)?;
-        if self.profile.is_timeseries() || self.profile.is_columnar() {
+        if self.profile.is_columnar() {
+            crate::columnar::for_each_bucket(wtxn, self.env, &self.name, |wtxn, batch| {
+                for (id, doc) in batch {
+                    let Some(vector) =
+                        index::field_value(&doc, field).and_then(|v| vector::parse_vector(v, dims))
+                    else {
+                        continue;
+                    };
+                    db.put(
+                        &mut *wtxn,
+                        id.as_bytes(),
+                        vector::encode_vector(&vector).as_slice(),
+                    )?;
+                }
+                Ok(())
+            })?;
+            let def = VectorDef::new(field, dims, metric);
+            self.meta.put(
+                &mut *wtxn,
+                def_key.as_bytes(),
+                serde_json::to_vec(&def)?.as_slice(),
+            )?;
+            return Ok(());
+        }
+        if self.profile.is_timeseries() {
             for (id, doc) in self.documents_for_backfill(&*wtxn)? {
                 let Some(vector) =
                     index::field_value(&doc, field).and_then(|v| vector::parse_vector(v, dims))
@@ -3877,14 +3943,12 @@ impl<'e> Collection<'e> {
         let rel = format!("{dir}/full-{stamp}.seg");
         let mut builder = SegmentBuilder::new(root.join(&rel))?;
         let field = &def.fields[0].path;
-        let docs = self.documents_for_backfill(&*wtxn)?;
-        eprintln!("text backfill docs: {}", docs.len());
-        for (id, doc) in docs {
-            if let Some(text) = index::field_value(&doc, field).and_then(search::field_text) {
-                eprintln!("text add {id}: {text}");
-                builder.add_document(&id, &text)?;
+        self.for_each_backfill_doc(&*wtxn, |id, doc| {
+            if let Some(text) = index::field_value(doc, field).and_then(search::field_text) {
+                builder.add_document(id, &text)?;
             }
-        }
+            Ok(())
+        })?;
         builder.finish()?;
         let prefix = self.segment_delta_prefix(&def.name);
         let keys: Vec<Vec<u8>> = self
@@ -3949,11 +4013,12 @@ impl<'e> Collection<'e> {
         let values_rel = format!("{dir}/full-{stamp}.values");
         let mut builder = FuzzySegmentBuilder::new(root.join(&rel))?;
         let field = &def.fields[0].path;
-        for (id, doc) in self.documents_for_backfill(&*wtxn)? {
-            if let Some(text) = index::field_value(&doc, field).and_then(search::field_text) {
-                builder.add_document(&id, &text)?;
+        self.for_each_backfill_doc(&*wtxn, |id, doc| {
+            if let Some(text) = index::field_value(doc, field).and_then(search::field_text) {
+                builder.add_document(id, &text)?;
             }
-        }
+            Ok(())
+        })?;
         builder.finish(root.join(&values_rel))?;
         let prefix = self.fuzzy_segment_delta_prefix(&def.name);
         let keys: Vec<Vec<u8>> = self
@@ -4159,11 +4224,12 @@ impl<'e> Collection<'e> {
         let values_path = root.join(&values_rel);
         let mut builder = FuzzySegmentBuilder::new(&path)?;
         let field = &def.fields[0].path;
-        for (id, doc) in self.documents_for_backfill(&*wtxn)? {
-            if let Some(text) = index::field_value(&doc, field).and_then(search::field_text) {
-                builder.add_document(&id, &text)?;
+        self.for_each_backfill_doc(&*wtxn, |id, doc| {
+            if let Some(text) = index::field_value(doc, field).and_then(search::field_text) {
+                builder.add_document(id, &text)?;
             }
-        }
+            Ok(())
+        })?;
         builder.finish(&values_path)?;
         let manifest = FuzzySegmentManifest {
             segments: vec![rel],
@@ -4486,11 +4552,12 @@ impl<'e> Collection<'e> {
         let path = root.join(&rel);
         let mut builder = SegmentBuilder::new(&path)?;
         let field = &def.fields[0].path;
-        for (id, doc) in self.documents_for_backfill(&*wtxn)? {
-            if let Some(text) = index::field_value(&doc, field).and_then(search::field_text) {
-                builder.add_document(&id, &text)?;
+        self.for_each_backfill_doc(&*wtxn, |id, doc| {
+            if let Some(text) = index::field_value(doc, field).and_then(search::field_text) {
+                builder.add_document(id, &text)?;
             }
-        }
+            Ok(())
+        })?;
         builder.finish()?;
         let manifest = SegmentManifest {
             segments: vec![rel],
@@ -8120,6 +8187,7 @@ impl<'e> Collection<'e> {
                 self.set_ttl(wtxn, id, None)?;
                 return Ok(None);
             };
+            let locator = crate::columnar::locator_for_id(&*wtxn, self.env, &self.name, id)?;
             let id_value = old
                 .get("_id")
                 .cloned()
@@ -8136,6 +8204,9 @@ impl<'e> Collection<'e> {
                 return Ok(None);
             }
             crate::columnar::failpoint("ttl_after_delete")?;
+            if let Some(locator) = locator {
+                crate::columnar::drop_empty_bucket(wtxn, self.env, &self.name, locator)?;
+            }
             self.apply_index_entries(wtxn, Some(&old), None, id)?;
             self.apply_graph_entries(wtxn, Some(&old), None)?;
             self.apply_text_entries(wtxn, Some(&old), None, id)?;
@@ -10784,10 +10855,10 @@ impl<'e> Collection<'e> {
                     }
                     docs.push(doc);
                 }
-                if !query.sort.is_empty() {
-                    docs.sort_by(|a, b| compare_docs(a, b, &query.sort));
-                }
                 let limit = query.limit.unwrap_or(usize::MAX);
+                if !query.sort.is_empty() {
+                    docs = top_k_docs(docs, &query.sort, query.skip.saturating_add(limit));
+                }
                 return Ok(docs
                     .into_iter()
                     .skip(query.skip)
@@ -13491,6 +13562,20 @@ impl<'a> Acc<'a> {
             Acc::Top(top) => top.into_sorted(),
         }
     }
+}
+
+/// Selects the best `want` documents with the same comparator and heap
+/// algorithm as the standard profile. Columnar reads use this instead of
+/// `slice::sort_by` so inconsistent mixed-type comparators behave identically.
+pub(crate) fn top_k_docs<I>(docs: I, sort: &[(String, i32)], want: usize) -> Vec<Value>
+where
+    I: IntoIterator<Item = Value>,
+{
+    let mut top = TopK::new(sort, want);
+    for doc in docs {
+        top.push(doc);
+    }
+    top.into_sorted()
 }
 
 /// Document in the TopK heap; `seq` preserves stability for equal keys.

@@ -109,8 +109,26 @@ try:
     )
     cursor_column = db.collection("py_cursor_columnar")
     cursor_column.insert_many(
-        [{"_id": f"c{index}", "n": index} for index in range(5)]
+        [
+            {"_id": "c3", "n": 3},
+            {"_id": "c0", "n": 0},
+            {"_id": "c4", "n": 4},
+            {"_id": "c1", "n": 1},
+            {"_id": "c2", "n": 2},
+        ]
     )
+    assert [doc["_id"] for doc in cursor_column.find({})] == [
+        f"c{index}" for index in range(5)
+    ]
+    assert [doc["_id"] for doc in cursor_column.find({}, skip=1, limit=2)] == [
+        "c1",
+        "c2",
+    ]
+    assert cursor_column.find_one({})["_id"] == "c0"
+    assert [
+        doc["_id"]
+        for doc in cursor_column.aggregate([{"$project": {"_id": 1}}, {"$limit": 2}])
+    ] == ["c0", "c1"]
     cursor = cursor_column.find_cursor({}, sort=[("_id", 1)], batch_size=2)
     assert [doc["_id"] for doc in cursor] == [f"c{index}" for index in range(5)]
     assert cursor.close() is False

@@ -234,6 +234,7 @@ fn columnar_storage_and_database_stats_include_buckets_and_indexes() {
     assert_eq!(stats.records, 45);
     assert!(stats.data_bytes > 0);
     assert!(stats.index_bytes > 0);
+    assert!(stats.id_bytes > 0);
     assert_eq!(stats.indexes, 1);
     let raw = nonodb_core::columnar::stats(&rtxn, store.env(), "docs").unwrap();
     assert_eq!(raw.rows, 45);
@@ -257,6 +258,9 @@ fn columnar_storage_and_database_stats_include_buckets_and_indexes() {
     assert_eq!(collection.records, 45);
     assert!(collection.data_bytes > 0);
     assert!(collection.index_bytes > 0);
+    assert!(collection.id_bytes > 0);
+    assert_eq!(collection.logical_bytes, collection.total_bytes);
+    assert_eq!(collection.physical_bytes, collection.total_bytes);
 }
 
 #[test]

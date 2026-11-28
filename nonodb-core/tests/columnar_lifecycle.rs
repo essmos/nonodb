@@ -155,3 +155,42 @@ fn columnar_date_ttl_backfill_pages_are_idempotent() {
     let due = store.ttl_due(now + 300_000, 100).unwrap();
     assert_eq!(due.len(), 10);
 }
+
+#[test]
+fn columnar_ttl_drops_a_wholly_expired_sealed_bucket() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    store
+        .create_columnar_collection(
+            "docs",
+            &nonodb_core::columnar::Settings {
+                bucket_max_docs: 2,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    store
+        .set_collection_ttl_after("docs", "expireAt", 60, Some(false))
+        .unwrap();
+    let c = store.collection("docs").unwrap();
+    let now = nonodb_core::ttl::now_ms();
+    for id in ["a", "b"] {
+        c.insert_one(json!({"_id": id, "expireAt": date(now - 120_000)}))
+            .unwrap();
+    }
+    store.seal_columnar("docs").unwrap();
+    assert_eq!(store.columnar_stats("docs").unwrap().unwrap().buckets, 1);
+    let due = store.ttl_due(now, 10).unwrap();
+    for entry in due
+        .iter()
+        .filter(|entry| entry.id == "a" || entry.id == "b")
+    {
+        let mut wtxn = store.write_txn().unwrap();
+        c.expire_txn(&mut wtxn, &entry.id, entry.expire_at).unwrap();
+        wtxn.commit().unwrap();
+    }
+    let stats = store.columnar_stats("docs").unwrap().unwrap();
+    assert_eq!(stats.rows, 0, "{stats:?}");
+    assert_eq!(stats.buckets, 0, "{stats:?}");
+    assert_eq!(stats.deletes, 0, "{stats:?}");
+}

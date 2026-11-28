@@ -152,6 +152,24 @@ def main() -> int:
         event = columnar_stream.next_event()
         assert event["payload"]["op"] == "delete", event
         assert event["payload"]["before"]["_id"] == "e2", event
+
+        events.insert({"_id": "b", "status": "paid", "g": "y"})
+        assert columnar_stream.next_event()["payload"]["after"]["_id"] == "b"
+        events.insert({"_id": "a", "status": "paid", "g": "y"})
+        assert columnar_stream.next_event()["payload"]["after"]["_id"] == "a"
+        events.update(
+            {"status": "paid", "g": "y"},
+            {"$set": {"hit": True}},
+            multi=False,
+        )
+        event = columnar_stream.next_event()
+        assert event["payload"]["op"] == "update", event
+        assert event["payload"]["before"]["_id"] == "a", event
+        assert event["payload"]["after"]["_id"] == "a", event
+        events.delete({"status": "paid", "g": "y"}, multi=False)
+        event = columnar_stream.next_event()
+        assert event["payload"]["op"] == "delete", event
+        assert event["payload"]["before"]["_id"] == "a", event
         columnar_stream.close()
         assert db.collection("_events").count({"type": {"$regex": "^subscription\\."}}) == 0
 

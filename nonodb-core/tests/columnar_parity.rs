@@ -275,3 +275,68 @@ fn single_update_delete_and_find_and_modify_choose_the_same_id() {
         col.count(&json!({})).unwrap()
     );
 }
+
+#[test]
+fn columnar_unsorted_reads_and_mixed_sorts_match_standard() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    store.create_collection("std", Default::default()).unwrap();
+    columnar(&store, "col");
+    let docs = [
+        json!({"_id": "b", "g": "x"}),
+        json!({"_id": "a", "g": "x", "v": null}),
+        json!({"_id": "d", "g": "x", "v": "x"}),
+        json!({"_id": "c", "g": "x", "v": 2}),
+        json!({"_id": "f", "g": "x", "v": {"$numberLong": "9"}}),
+        json!({"_id": "e", "g": "x", "v": true}),
+    ];
+    for name in ["std", "col"] {
+        let coll = store.collection(name).unwrap();
+        for doc in &docs {
+            coll.insert_one(doc.clone()).unwrap();
+        }
+    }
+    let std = store.collection("std").unwrap();
+    let col = store.collection("col").unwrap();
+    let read = |coll: &Collection<'_>, skip, limit| {
+        coll.find(&FindQuery {
+            filter: json!({}),
+            sort: Vec::new(),
+            skip,
+            limit: Some(limit),
+            ..Default::default()
+        })
+        .unwrap()
+    };
+    assert_eq!(read(&std, 0, 10), read(&col, 0, 10));
+    assert_eq!(read(&std, 1, 2), read(&col, 1, 2));
+    assert_eq!(
+        std.find(&FindQuery {
+            filter: json!({}),
+            limit: Some(1),
+            ..Default::default()
+        })
+        .unwrap(),
+        col.find(&FindQuery {
+            filter: json!({}),
+            limit: Some(1),
+            ..Default::default()
+        })
+        .unwrap()
+    );
+    assert_eq!(
+        std.aggregate(&[json!({"$project": {"_id": 1}}), json!({"$limit": 2})])
+            .unwrap(),
+        col.aggregate(&[json!({"$project": {"_id": 1}}), json!({"$limit": 2})])
+            .unwrap()
+    );
+    let sorted = |coll: &Collection<'_>| {
+        coll.find(&FindQuery {
+            filter: json!({}),
+            sort: vec![("v".into(), -1)],
+            ..Default::default()
+        })
+        .unwrap()
+    };
+    assert_eq!(sorted(&std), sorted(&col));
+}

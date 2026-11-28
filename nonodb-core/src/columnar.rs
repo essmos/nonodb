@@ -20,7 +20,7 @@ use crate::bucket_codec::{
     decode_column, decode_column_at, encode_column_fast, encode_column_write, get_bytes,
     get_uvarint, put_bytes, put_uvarint, Compression, HARD_MAX_COLUMN_ROWS,
 };
-use crate::collection::{compare_docs, project_document, FindQuery, UpdateOutcome};
+use crate::collection::{project_document, FindQuery, UpdateOutcome};
 use crate::error::{Error, Result};
 
 /// Metadata prefix for columnar settings.
@@ -1128,6 +1128,48 @@ pub fn replace_by_id(
     write_doc_at(wtxn, &db, locator, doc)
 }
 
+/// Returns the physical locator for an `_id`, if it is still present.
+pub(crate) fn locator_for_id(
+    wtxn: &RwTxn<'_>,
+    env: &Env,
+    name: &str,
+    id: &str,
+) -> Result<Option<Locator>> {
+    let Some(db) = env.open_database::<Bytes, Bytes>(wtxn, Some(&db_name(name)))? else {
+        return Ok(None);
+    };
+    Ok(find_located_id(wtxn, &db, id)?.map(|(locator, _)| locator))
+}
+
+/// Drops a sealed bucket once every row in it is tombstoned. Used by the TTL
+/// sweeper so a wholly expired bucket does not remain as dead payload.
+pub(crate) fn drop_empty_bucket(
+    wtxn: &mut RwTxn<'_>,
+    env: &Env,
+    name: &str,
+    locator: Locator,
+) -> Result<bool> {
+    let Some(db) = env.open_database::<Bytes, Bytes>(&*wtxn, Some(&db_name(name)))? else {
+        return Ok(false);
+    };
+    let bucket = locator.0;
+    let Some(payload) = db.get(&*wtxn, &bucket_key(bucket))? else {
+        return Ok(false);
+    };
+    let rows = decode_bucket(payload)?.len();
+    for row in 0..rows {
+        if db.get(&*wtxn, &deleted_key(bucket, row as u32))?.is_none() {
+            return Ok(false);
+        }
+    }
+    db.delete(&mut *wtxn, &bucket_key(bucket))?;
+    for row in 0..rows {
+        db.delete(&mut *wtxn, &overlay_key(bucket, row as u32))?;
+        db.delete(&mut *wtxn, &deleted_key(bucket, row as u32))?;
+    }
+    Ok(true)
+}
+
 /// Visits every visible document in on-disk order without materializing the
 /// whole collection. Used by streaming aggregation.
 pub fn for_each<F>(rtxn: &RoTxn<'_>, env: &Env, name: &str, mut emit: F) -> Result<()>
@@ -1186,6 +1228,83 @@ where
                 }
             }
             _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Streams visible documents in bucket-sized batches while allowing the caller
+/// to write index entries through the same write transaction. Only bucket keys
+/// plus one decoded bucket are held at a time.
+pub fn for_each_bucket<F>(wtxn: &mut RwTxn<'_>, env: &Env, name: &str, mut emit: F) -> Result<()>
+where
+    F: FnMut(&mut RwTxn<'_>, Vec<(String, Value)>) -> Result<()>,
+{
+    let db = env.create_database::<Bytes, Bytes>(&mut *wtxn, Some(&db_name(name)))?;
+    let mut overlays: HashMap<Locator, Map<String, Value>> = HashMap::new();
+    let mut deleted: HashSet<Locator> = HashSet::new();
+    for item in db.iter(&*wtxn)? {
+        let (key, value) = item?;
+        match key.first() {
+            Some(&KEY_OVERLAY) => {
+                if let Some(locator) = key_locator(key) {
+                    overlays.insert(locator, serde_json::from_slice(value)?);
+                }
+            }
+            Some(&KEY_DELETED) => {
+                if let Some(locator) = key_locator(key) {
+                    deleted.insert(locator);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut keys: Vec<Vec<u8>> = Vec::new();
+    for item in db.iter(&*wtxn)? {
+        let (key, _) = item?;
+        if matches!(key.first(), Some(&KEY_OPEN_ROW) | Some(&KEY_BUCKET)) {
+            keys.push(key.to_vec());
+        }
+    }
+    for key in keys {
+        let Some(value) = db.get(&*wtxn, &key)? else {
+            continue;
+        };
+        let mut batch = Vec::new();
+        match key.first() {
+            Some(&KEY_OPEN_ROW) => {
+                let Some(locator) = key_locator(&key) else {
+                    continue;
+                };
+                if deleted.contains(&locator) {
+                    continue;
+                }
+                let doc = overlays
+                    .remove(&locator)
+                    .map(Ok)
+                    .unwrap_or_else(|| serde_json::from_slice(value))?;
+                let id = doc_id(&doc)?;
+                batch.push((id, Value::Object(doc)));
+            }
+            Some(&KEY_BUCKET) => {
+                if key.len() != 9 {
+                    return Err(corrupt("malformed bucket key"));
+                }
+                let bucket = u64::from_be_bytes(key[1..9].try_into().expect("8 bytes"));
+                for (row, doc) in decode_bucket(value)?.into_iter().enumerate() {
+                    let locator = (bucket, row as u32);
+                    if deleted.contains(&locator) {
+                        continue;
+                    }
+                    let doc = overlays.remove(&locator).unwrap_or(doc);
+                    let id = doc_id(&doc)?;
+                    batch.push((id, Value::Object(doc)));
+                }
+            }
+            _ => {}
+        }
+        if !batch.is_empty() {
+            emit(&mut *wtxn, batch)?;
         }
     }
     Ok(())
@@ -1834,7 +1953,7 @@ fn find_parallel(rtxn: &RoTxn<'_>, env: &Env, name: &str, query: &FindQuery) -> 
         None
     };
     let prefilter_ref = prefilter.as_ref();
-    let hits = if workers <= 1 || blocks.len() < 2 {
+    let mut hits = if workers <= 1 || blocks.len() < 2 {
         let mut hits = Vec::new();
         let has_deleted = !deleted.is_empty();
         let has_overlays = !overlays.is_empty();
@@ -1904,6 +2023,11 @@ fn find_parallel(rtxn: &RoTxn<'_>, env: &Env, name: &str, query: &FindQuery) -> 
         hits
     };
     let limit = query.limit.unwrap_or(usize::MAX);
+    hits.sort_by(|a, b| {
+        let left = a.get("_id").and_then(crate::id::key_from_value);
+        let right = b.get("_id").and_then(crate::id::key_from_value);
+        left.cmp(&right)
+    });
     Ok(hits
         .into_iter()
         .skip(query.skip)
@@ -1940,10 +2064,19 @@ pub fn find_visible(
         kept.push(doc);
     }
     docs = kept;
-    if !query.sort.is_empty() {
-        docs.sort_by(|a, b| compare_docs(a, b, &query.sort));
-    }
+    // Feed the TopK heap in the same canonical `_id` order as the standard
+    // primary-key scan. The mixed-type comparator is intentionally not
+    // transitive, so insertion order is observable for equal/incomparable keys.
+    docs.sort_by(|a, b| {
+        let left = a.get("_id").and_then(crate::id::key_from_value);
+        let right = b.get("_id").and_then(crate::id::key_from_value);
+        left.cmp(&right)
+    });
     let limit = query.limit.unwrap_or(usize::MAX);
+    if !query.sort.is_empty() {
+        let want = query.skip.saturating_add(limit);
+        docs = crate::collection::top_k_docs(docs, &query.sort, want);
+    }
     Ok(docs
         .into_iter()
         .skip(query.skip)
