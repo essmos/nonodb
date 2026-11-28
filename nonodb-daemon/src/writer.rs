@@ -7,6 +7,7 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -188,6 +189,29 @@ fn window_config() -> (Duration, Duration, Duration, Duration) {
         .min(max);
     (idle, base, pressure, max)
 }
+/// Commits that returned without an explicit `force_sync`.
+///
+/// The interval syncer drains this counter: a commit in `Durability::Relaxed`
+/// (or `Unsafe`) is visible and crash-consistent but not yet on stable storage,
+/// so the syncer has work to do. Listening to writes instead of syncing on a
+/// timer keeps an idle daemon from touching the disk at all.
+static UNSYNCED_WRITES: AtomicU64 = AtomicU64::new(0);
+
+fn note_unsynced() {
+    UNSYNCED_WRITES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Marks a commit as not yet on stable storage. Test hook for the syncer.
+#[cfg(test)]
+pub fn note_unsynced_for_test() {
+    note_unsynced();
+}
+
+/// Number of commits since the last call that did not fsync, reset to zero.
+pub fn take_unsynced_writes() -> u64 {
+    UNSYNCED_WRITES.swap(0, Ordering::Relaxed)
+}
+
 pub struct WriteJob {
     pub req: WriteReq,
     pub resp: oneshot::Sender<Result<Value, ApiError>>,
@@ -379,6 +403,9 @@ fn run_batch(store: &Store, cache: &QueryCache, quota: &Quota, jobs: Vec<WriteJo
                 }
             }
             metrics::add(&metrics::COMMIT_NS, started.elapsed().as_nanos() as u64);
+            if !sync {
+                note_unsynced();
+            }
             cache.invalidate();
             live::after_commit();
             for (job, res) in jobs.into_iter().zip(results) {
@@ -460,6 +487,9 @@ fn run_single(store: &Store, cache: &QueryCache, quota: &Quota, job: WriteJob) {
                         }
                     }
                     metrics::add(&metrics::COMMIT_NS, started.elapsed().as_nanos() as u64);
+                    if !sync {
+                        note_unsynced();
+                    }
                     cache.invalidate();
                     live::after_commit();
                     let _ = job.resp.send(Ok(value));

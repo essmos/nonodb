@@ -23,6 +23,61 @@ use crate::subscriptions::{self, Subscription};
 use crate::ttl::{self, TTL_DB};
 use crate::vault::CollectionProfile;
 
+/// How commits reach stable storage.
+///
+/// LMDB sync flags are environment-wide, so this has to be decided when the
+/// environment is opened:
+///
+/// * [`SyncPolicy::PerCommit`] - default. The environment is opened with
+///   `NO_META_SYNC`; a commit still syncs data pages, and `Durability::Full`
+///   adds an explicit `force_sync`. `relaxed` therefore measures close to
+///   `full`: only the meta page is skipped.
+/// * [`SyncPolicy::Interval`] - `NONODB_SYNC_INTERVAL_MS=N`. The environment is
+///   opened with `NO_SYNC` and a background syncer calls `force_sync` every `N`
+///   milliseconds. `Durability::Full` stays durable because it still syncs per
+///   commit; `relaxed` writes now cost a memory copy, at the price of losing up
+///   to `N` milliseconds of `relaxed` writes on a crash.
+/// * [`SyncPolicy::Unsafe`] - `NONODB_ALLOW_UNSAFE_WRITES=1` without an
+///   interval. Nothing is synced unless a write asks for `Durability::Full`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncPolicy {
+    PerCommit,
+    Interval,
+    Unsafe,
+}
+
+/// Decides the environment sync policy from the two opt-in flags.
+///
+/// `unsafe_writes` wins: an operator who allowed crash loss explicitly should
+/// not silently get interval syncing on top.
+pub fn sync_policy(unsafe_writes: bool, sync_interval_ms: u64) -> SyncPolicy {
+    if unsafe_writes {
+        SyncPolicy::Unsafe
+    } else if sync_interval_ms > 0 {
+        SyncPolicy::Interval
+    } else {
+        SyncPolicy::PerCommit
+    }
+}
+
+/// `NONODB_SYNC_INTERVAL_MS`, `0` meaning "no interval syncing".
+pub fn sync_interval_ms() -> u64 {
+    env_u64("NONODB_SYNC_INTERVAL_MS")
+}
+
+fn env_u64(name: &str) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
+}
+
 /// Maximum database file size. This is mmap address space - **not**
 /// a disk or RAM reservation. The file grows on demand up to this limit.
 pub const MAP_SIZE: usize = 1024 * 1024 * 1024; // 1 GiB
@@ -384,18 +439,24 @@ impl Store {
 
         // SAFETY: the file is not modified outside LMDB and is not opened
         // concurrently with another `map_size` (the daemon is the sole owner).
-        // LMDB sync flags are environment-wide, not transaction-wide. We open
-        // with NO_META_SYNC and force a full sync for durable commits. This
-        // allows per-request `relaxed` writes without changing the default
-        // durability of ordinary writes. Unsafe mode is opt-in because NO_SYNC
-        // can lose recent transactions on a crash.
-        let flags = if std::env::var("NONODB_ALLOW_UNSAFE_WRITES")
-            .ok()
-            .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
-        {
-            EnvFlags::NO_SYNC
-        } else {
-            EnvFlags::NO_META_SYNC
+        // LMDB sync flags are environment-wide, not transaction-wide, so the
+        // open mode decides what a commit does and `force_sync` decides what
+        // "durable" means:
+        //
+        // * `NO_META_SYNC` (default): the commit syncs data pages itself and
+        //   only the meta page is flushed lazily. `relaxed` therefore costs
+        //   almost the same as `full` - see `sync_policy` below.
+        // * `NO_SYNC`: the commit touches nothing; only an explicit
+        //   `force_sync` puts data on disk. This is what makes `relaxed`
+        //   actually cheap, and it is why the daemon runs a syncer thread when
+        //   `NONODB_SYNC_INTERVAL_MS` is set.
+        let flags = match sync_policy(
+            env_flag("NONODB_ALLOW_UNSAFE_WRITES"),
+            env_u64("NONODB_SYNC_INTERVAL_MS"),
+        ) {
+            SyncPolicy::Unsafe => EnvFlags::NO_SYNC,
+            SyncPolicy::Interval => EnvFlags::NO_SYNC,
+            SyncPolicy::PerCommit => EnvFlags::NO_META_SYNC,
         };
         let env = unsafe {
             EnvOpenOptions::new()
@@ -4479,5 +4540,28 @@ mod tests {
             .unwrap();
         let id = docs[0]["_id"].as_str().unwrap();
         assert!(c.find_by_key(id).unwrap().is_some());
+    }
+}
+
+#[cfg(test)]
+mod sync_policy_tests {
+    use super::*;
+
+    #[test]
+    fn default_policy_syncs_every_commit() {
+        assert_eq!(sync_policy(false, 0), SyncPolicy::PerCommit);
+    }
+
+    #[test]
+    fn interval_policy_skips_per_commit_sync() {
+        assert_eq!(sync_policy(false, 100), SyncPolicy::Interval);
+    }
+
+    #[test]
+    fn unsafe_writes_win_over_the_interval() {
+        // An operator who asked for crash loss explicitly must not silently get
+        // interval syncing on top of it.
+        assert_eq!(sync_policy(true, 100), SyncPolicy::Unsafe);
+        assert_eq!(sync_policy(true, 0), SyncPolicy::Unsafe);
     }
 }

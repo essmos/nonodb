@@ -43,6 +43,7 @@ mod revocation;
 mod s3_import;
 mod server_info;
 mod stream_retention;
+mod sync;
 mod wal;
 mod webhooks;
 mod writer;
