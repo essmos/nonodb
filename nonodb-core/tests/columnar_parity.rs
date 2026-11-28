@@ -134,6 +134,22 @@ fn find_and_modify_accepts_object_id() {
         col_coll.find_and_modify(&options).unwrap().value
     );
     assert_eq!(col_coll.count(&json!({})).unwrap(), 1);
+
+    let remove = FindAndModifyOptions {
+        filter: &filter,
+        update: None,
+        sort: &[],
+        new: false,
+        upsert: false,
+        remove: true,
+        array_filters: &[],
+        projection: None,
+    };
+    assert_eq!(
+        std_coll.find_and_modify(&remove).unwrap().value,
+        col_coll.find_and_modify(&remove).unwrap().value
+    );
+    assert_eq!(col_coll.count(&json!({})).unwrap(), 0);
 }
 
 #[test]
