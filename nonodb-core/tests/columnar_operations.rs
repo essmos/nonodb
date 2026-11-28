@@ -258,3 +258,64 @@ fn columnar_storage_and_database_stats_include_buckets_and_indexes() {
     assert!(collection.data_bytes > 0);
     assert!(collection.index_bytes > 0);
 }
+
+#[test]
+fn columnar_history_survives_seal_compaction_backup_and_replication() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let backup_dir = tempfile::tempdir().unwrap();
+    let source = Store::open(source_dir.path()).unwrap();
+    columnar(&source, "docs");
+    source.set_collection_history("docs", 10).unwrap();
+    let c = source.collection("docs").unwrap();
+    c.insert_one(json!({"_id": "a", "v": 1})).unwrap();
+    c.update(&json!({"_id": "a"}), &json!({"$set": {"v": 2}}), false)
+        .unwrap();
+    assert_eq!(c.history("a", None, false).unwrap().len(), 2);
+    source.seal_columnar("docs").unwrap();
+    assert_eq!(c.history("a", None, false).unwrap().len(), 2);
+    c.update(&json!({"_id": "a"}), &json!({"$set": {"v": 3}}), false)
+        .unwrap();
+    source.compact_columnar("docs").unwrap();
+    let ops = |coll: &nonodb_core::Collection<'_>| -> Vec<String> {
+        coll.history("a", None, false)
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.op)
+            .collect()
+    };
+    assert_eq!(ops(&c), vec!["update", "update", "insert"]);
+
+    let backup_path = backup_dir.path().join("data.mdb");
+    source
+        .copy_to_file(&backup_path, nonodb_core::heed::CompactionOption::Enabled)
+        .unwrap();
+    let restored = Store::open(backup_dir.path()).unwrap();
+    let r = restored.collection("docs").unwrap();
+    assert_eq!(ops(&r), vec!["update", "update", "insert"]);
+
+    let primary = source.collection("docs").unwrap();
+    let replica_dir = tempfile::tempdir().unwrap();
+    let replica_store = Store::open(replica_dir.path()).unwrap();
+    columnar(&replica_store, "docs");
+    replica_store.set_collection_history("docs", 10).unwrap();
+    let replica = replica_store.collection("docs").unwrap();
+    let initial = primary.find_by_key("a").unwrap().unwrap();
+    let mut wtxn = replica_store.write_txn().unwrap();
+    replica
+        .apply_replication_change_txn(&mut wtxn, "insert", "a", Some(&initial), None)
+        .unwrap();
+    wtxn.commit().unwrap();
+    let mut wtxn = replica_store.write_txn().unwrap();
+    replica
+        .apply_replication_change_txn(
+            &mut wtxn,
+            "update",
+            "a",
+            Some(&json!({"_id": "a", "v": 4})),
+            None,
+        )
+        .unwrap();
+    wtxn.commit().unwrap();
+    assert_eq!(ops(&replica), vec!["update", "insert"]);
+    assert_eq!(replica.find_by_key("a").unwrap().unwrap()["v"], 4);
+}

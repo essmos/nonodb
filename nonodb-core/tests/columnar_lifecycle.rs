@@ -95,11 +95,13 @@ fn columnar_ttl_purge_removes_history_and_leaves_other_docs() {
         .unwrap();
     store.set_collection_history("docs", 10).unwrap();
     let c = store.collection("docs").unwrap();
+    c.create_index("v", true).unwrap();
     let now = nonodb_core::ttl::now_ms();
     c.insert_one(json!({"_id": "expired", "expireAt": date(now - 120_000), "v": 1}))
         .unwrap();
     c.insert_one(json!({"_id": "live", "expireAt": date(now + 60_000), "v": 2}))
         .unwrap();
+    assert_eq!(c.lookup("v", &[json!(1)], None).unwrap(), vec![None]);
     assert_eq!(c.history("expired", None, false).unwrap().len(), 1);
     let due = store.ttl_due(now, 10).unwrap();
     let entry = due
@@ -111,6 +113,13 @@ fn columnar_ttl_purge_removes_history_and_leaves_other_docs() {
     assert!(c.expire_txn(&mut wtxn, &entry.id, entry.expire_at).unwrap());
     wtxn.commit().unwrap();
     assert!(c.history("expired", None, false).unwrap().is_empty());
+    assert_eq!(c.lookup("v", &[json!(1)], None).unwrap(), vec![None]);
+    assert_eq!(
+        c.lookup("v", &[json!(2)], None).unwrap()[0]
+            .as_ref()
+            .unwrap()["_id"],
+        "live"
+    );
     assert_eq!(c.find(&FindQuery::default()).unwrap().len(), 1);
     assert_eq!(c.find_by_key("live").unwrap().unwrap()["v"], 2);
 }

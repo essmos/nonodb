@@ -142,6 +142,7 @@ def main() -> int:
                 profile="columnar",
                 columnar={"bucket_max_docs": 2, "compression": "max"},
             )
+            db.set_collection_history("events", 10)
             events = db.collection("events")
             events.insert_many(
                 [
@@ -150,6 +151,9 @@ def main() -> int:
                 ]
             )
             events.update({"_id": "e0"}, {"$set": {"n": 10}}, multi=False)
+            events.create_text_index("kind")
+            events.create_fuzzy_index("kind")
+            assert [entry["op"] for entry in events.history("e0")] == ["update", "insert"]
             db.close()
             admin.close()
         finally:
@@ -217,6 +221,20 @@ def main() -> int:
                 events = database.collection("events")
                 assert events.count() == 3
                 assert events.find_one({"_id": "e0"})["n"] == 10
+                assert [entry["op"] for entry in events.history("e0")] == [
+                    "update",
+                    "insert",
+                ], database
+                assert len(
+                    events.search_all(
+                        mode="lexical", query="columnar", fields=["kind"], limit=10
+                    )
+                ) == 3, database
+                assert len(
+                    events.search_all(
+                        mode="fuzzy", query="columnr", fields=["kind"], max_distance=2, limit=10
+                    )
+                ) >= 1, database
             expected_ids = ["0", "1", "2", "3", "4"]
             assert [
                 d["_id"] for d in branch_db.collection(COLL).search("bio", "rust")

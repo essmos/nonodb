@@ -151,6 +151,8 @@ jobs:
           python3 scripts/durability_test.py
           python3 scripts/graph_test.py
           python3 scripts/graph_auth_test.py
+          python3 scripts/auth_test.py
+          bash scripts/columnar_cli_test.sh
           python3 scripts/graph_jobs_test.py
           python3 scripts/graph_property_test.py
           python3 scripts/graph_crash_test.py

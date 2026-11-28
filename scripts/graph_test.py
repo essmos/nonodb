@@ -276,8 +276,12 @@ def main() -> int:
         assert all(0.0 <= item["vector_score"] <= 1.0 for item in l2["items"]), l2
 
         # TTL expiry removes edge adjacency through the same hook.
-        db.create_collection("tnodes")
-        db.create_collection("tedges")
+        db.create_collection(
+            "tnodes", profile="columnar", columnar={"bucket_max_docs": 8}
+        )
+        db.create_collection(
+            "tedges", profile="columnar", columnar={"bucket_max_docs": 8}
+        )
         tnodes = db.collection("tnodes")
         tedges = db.collection("tedges")
         tnodes.insert({"_id": "n1"})

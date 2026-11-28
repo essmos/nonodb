@@ -218,6 +218,28 @@ def main() -> int:
                 create_db.text[:200],
             )
 
+            create_events_app1 = post(
+                client,
+                "/app1/v1/exec",
+                {
+                    "op": "create_collection",
+                    "coll": "events",
+                    "profile": "columnar",
+                    "columnar": {"bucket_max_docs": 8, "compression": "max"},
+                },
+                token=admin_token,
+            )
+            create_events_default = post(
+                client,
+                "/v1/exec",
+                {
+                    "op": "create_collection",
+                    "coll": "events",
+                    "profile": "columnar",
+                    "columnar": {"bucket_max_docs": 8, "compression": "max"},
+                },
+                token=admin_token,
+            )
             insert_app1 = post(
                 client,
                 "/app1/v1/exec",
@@ -230,10 +252,32 @@ def main() -> int:
                 {"op": "insert", "coll": "orders", "doc": {"_id": "d1", "total": 20}},
                 token=admin_token,
             )
+            insert_events_app1 = post(
+                client,
+                "/app1/v1/exec",
+                {"op": "insert", "coll": "events", "doc": {"_id": "e1", "v": 1}},
+                token=admin_token,
+            )
+            insert_events_default = post(
+                client,
+                "/v1/exec",
+                {"op": "insert", "coll": "events", "doc": {"_id": "d-e1", "v": 2}},
+                token=admin_token,
+            )
             checks.check(
                 "admin can seed both databases",
-                insert_app1.status_code == 200 and insert_default.status_code == 200,
-                f"app1={insert_app1.status_code} default={insert_default.status_code}",
+                insert_app1.status_code == 200
+                and insert_default.status_code == 200
+                and insert_events_app1.status_code == 200
+                and insert_events_default.status_code == 200,
+                f"app1={insert_app1.status_code} default={insert_default.status_code} "
+                f"events={insert_events_app1.status_code}/{insert_events_default.status_code}",
+            )
+            checks.check(
+                "admin can create columnar collections in both databases",
+                create_events_app1.status_code == 200
+                and create_events_default.status_code == 200,
+                f"app1={create_events_app1.status_code} default={create_events_default.status_code}",
             )
 
             run_cli(
@@ -241,7 +285,7 @@ def main() -> int:
                 "principal",
                 "add",
                 "reviewer",
-                "read:app1/orders,write:app1/orders",
+                "read:app1/orders,write:app1/orders,read:app1/events,write:app1/events",
             )
             reviewer_token = run_cli(auth_file, "token", "create", "reviewer")
             # The daemon watches the auth file and reloads valid changes in about
@@ -261,6 +305,43 @@ def main() -> int:
                 "scoped token can read its database/collection",
                 app1_read.status_code == 200 and len(app1_rows) == 1,
                 f"got {app1_read.status_code}: {app1_read.text[:200]}",
+            )
+
+            app1_events = post(
+                client,
+                "/app1/v1/exec",
+                {"op": "find", "coll": "events", "filter": {}},
+                token=reviewer_token,
+            )
+            app1_event_rows = []
+            if app1_events.status_code == 200:
+                app1_event_rows = app1_events.json().get("result", [])
+            checks.check(
+                "scoped token can read a columnar collection in its database",
+                app1_events.status_code == 200 and len(app1_event_rows) == 1,
+                f"got {app1_events.status_code}: {app1_events.text[:200]}",
+            )
+            app1_event_write = post(
+                client,
+                "/app1/v1/exec",
+                {"op": "update", "coll": "events", "filter": {"_id": "e1"}, "update": {"$inc": {"v": 1}}},
+                token=reviewer_token,
+            )
+            checks.check(
+                "scoped token can write a columnar collection in its database",
+                app1_event_write.status_code == 200,
+                f"got {app1_event_write.status_code}: {app1_event_write.text[:200]}",
+            )
+            default_event_read = post(
+                client,
+                "/v1/exec",
+                {"op": "find", "coll": "events", "filter": {}},
+                token=reviewer_token,
+            )
+            checks.check(
+                "scoped token cannot read the same columnar collection in default",
+                default_event_read.status_code == 403,
+                f"got {default_event_read.status_code}",
             )
 
             default_read = post(

@@ -77,6 +77,7 @@ def main() -> int:
             NONODB_DATA=str(tmp / "data"),
             NONODB_SOCK=str(sock),
             NONODB_LOG="warn",
+            NONODB_TTL_SWEEP_INTERVAL="1",
             NONODB_BACKUP_CONFIG=str(tmp / "backups.json"),
             NONODB_IMPORT_ROOTS=str(tmp / "backups"),
         )
@@ -258,6 +259,27 @@ def main() -> int:
             assert columnar_metrics["rows"] == 1, columnar_metrics
             for field in ("deletes", "open_bytes", "sealed_bytes", "id_bytes"):
                 assert field in columnar_metrics, (field, columnar_metrics)
+            fetch(
+                base + "/v1/exec",
+                data={
+                    "op": "insert",
+                    "coll": "gui_events",
+                    "doc": {"_id": "expired", "v": 2, "_ttl": 1},
+                },
+            )
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                metrics = json.loads(fetch(base + "/metrics"))
+                columnar_metrics = next(
+                    item
+                    for item in metrics.get("columnar_collections", [])
+                    if item["collection"] == "gui_events"
+                )
+                if columnar_metrics["deletes"] >= 1:
+                    break
+                time.sleep(0.2)
+            else:
+                raise AssertionError(f"TTL delete metric did not increment: {columnar_metrics}")
 
             health = json.loads(fetch(base + "/healthz"))
             assert health, health

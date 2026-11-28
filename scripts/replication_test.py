@@ -69,6 +69,7 @@ def main() -> int:
             NONODB_REPLICATION_ORIGIN="test-node",
             NONODB_REPLICATION_PRUNE_INTERVAL="1",
             NONODB_REPLICATION_RETENTION_KEEP="0",
+            NONODB_TTL_SWEEP_INTERVAL="1",
             NONODB_LOG="warn",
         )
         log = open(temp / "daemon.log", "w", encoding="utf-8")
@@ -210,6 +211,7 @@ def main() -> int:
                 NONODB_REPLICATION_ROLE="replica",
                 NONODB_REPLICATION_ENABLED="1",
                 NONODB_REPLICATION_NODE_ID="replica-1",
+                NONODB_TTL_SWEEP_INTERVAL="1",
                 NONODB_REPLICATION_EXIT_ON_GAP="1",
                 NONODB_REPLICATION_SOURCE=f"http://127.0.0.1:{port}",
                 NONODB_REPLICATION_SOURCE_TOKEN=admin,
@@ -321,6 +323,30 @@ def main() -> int:
                     time.sleep(0.1)
                 else:
                     raise RuntimeError("replica did not apply the live change")
+
+                exec(
+                    {
+                        "op": "insert",
+                        "coll": "events",
+                        "doc": {"_id": "e-ttl", "n": 6, "_ttl": 1},
+                    }
+                )
+                deadline = time.monotonic() + 20
+                while time.monotonic() < deadline:
+                    source_event = replica_exec(
+                        {"op": "find_one", "coll": "events", "filter": {"_id": "e1"}}
+                    )
+                    replica_ttl = replica_exec(
+                        {"op": "find_one", "coll": "events", "filter": {"_id": "e-ttl"}}
+                    )
+                    source_ttl = exec(
+                        {"op": "find_one", "coll": "events", "filter": {"_id": "e-ttl"}}
+                    )
+                    if replica_ttl is None and source_ttl is None and source_event:
+                        break
+                    time.sleep(0.2)
+                else:
+                    raise RuntimeError("TTL expiry did not replicate as a delete")
 
                 source_demote = client.post(
                     "/v1/replication/demote",

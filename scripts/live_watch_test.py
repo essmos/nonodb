@@ -86,6 +86,7 @@ def main() -> int:
         "NONODB_DATA": str(tmp / "data"),
         "NONODB_SOCK": str(sock),
         "NONODB_LOG": "warn",
+        "NONODB_TTL_SWEEP_INTERVAL": "1",
     })
     fh = log.open("wb")
     proc = subprocess.Popen([str(daemon)], env=env, stdout=fh, stderr=subprocess.STDOUT)
@@ -145,6 +146,12 @@ def main() -> int:
         events.delete({"_id": "e1"})
         event = columnar_stream.next_event()
         assert event["payload"]["op"] == "delete", event
+        events.insert({"_id": "e2", "status": "paid", "total": 3, "_ttl": 1})
+        event = columnar_stream.next_event()
+        assert event["payload"]["op"] == "insert", event
+        event = columnar_stream.next_event()
+        assert event["payload"]["op"] == "delete", event
+        assert event["payload"]["before"]["_id"] == "e2", event
         columnar_stream.close()
         assert db.collection("_events").count({"type": {"$regex": "^subscription\\."}}) == 0
 

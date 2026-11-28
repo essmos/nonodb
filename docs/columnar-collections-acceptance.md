@@ -67,6 +67,9 @@ Every row below points at concrete files. The primary columnar suites are:
 | Quota and metrics gauges | `scripts/quota_test.py`, `/metrics` `columnar_collections`, `nonodb_columnar_*` |
 | Webhooks, live watches, graph jobs, and branches | `scripts/webhook_test.py`, `scripts/live_watch_test.py`, `scripts/graph_jobs_test.py`, `scripts/branch_test.py` |
 | Release sign-off record | `docs/columnar-release-signoff.md` |
+| Auth scopes, isolation, audit, vault profile isolation | `scripts/security_check.py`, `scripts/auth_test.py`, `cargo test -p nonodb-core --test columnar_security` |
+| Offline CLI inspect/verify/compact | `bash scripts/columnar_cli_test.sh` |
+| History lifecycle and search-sidecar rebuild | `columnar_operations.rs`, `columnar_search_graph.rs`, `scripts/branch_test.py` |
 | Migration helper | `python3 scripts/nonodb_migrate_columnar_test.py` |
 | GUI create/settings/stats | `cd gui && npm run build` |
 | Canonical performance and 10M soak | `docs/columnar-performance.md` |
@@ -189,7 +192,7 @@ observable.
 | [x] AC-SEARCH-002 | Fuzzy index and `fuzzy` query match standard. | Evidence: `nonodb-core/tests/columnar_search_graph.rs` |
 | [x] AC-SEARCH-003 | Exact and IVF vector indexes, `vector_search`, and limits match standard. | Evidence: `nonodb-core/tests/columnar_search_graph.rs` |
 | [x] AC-SEARCH-004 | `search_all` and hybrid RRF results match standard. | Evidence: `nonodb-core/tests/columnar_search_graph.rs`, `scripts/search_all_test.py` (columnar lexical/fuzzy/vector/hybrid) |
-| [x] AC-SEARCH-005 | Search sidecars rebuild after restore, branch, reindex, and crash; `index_status` reports reality. | Evidence: `nonodb-core/tests/columnar_search_graph.rs` |
+| [x] AC-SEARCH-005 | Search sidecars rebuild after restore, branch, reindex, and crash; `index_status` reports reality. | Evidence: `nonodb-core/tests/columnar_search_graph.rs::columnar_search_sidecars_survive_backup_reopen_and_crash_reopen` (text/fuzzy/vector), `scripts/branch_test.py` (columnar lexical/fuzzy after branch), `reindex()` parity test |
 | [x] AC-SEARCH-006 | Search/fuzzy/vector errors and missing-index behavior match standard. | Evidence: `nonodb-core/tests/columnar_search_graph.rs` |
 | [x] AC-GRAPH-001 | `set_graph`, `get_graph`, `drop_graph`, and `reindex_graph` match standard. | Evidence: `nonodb-core/tests/columnar_search_graph.rs` |
 | [x] AC-GRAPH-002 | BFS/DFS, neighbors, filters, shortest/all-shortest paths, and `graph_match` match standard. | Evidence: `nonodb-core/tests/columnar_search_graph.rs` (`columnar_graph_mutations_and_traversal_match_standard`), `scripts/graph_test.py` |
@@ -209,11 +212,11 @@ observable.
 | [x] AC-TTL-004 | Strict TTL reads hide expired docs before physical reclamation on every read path. | Evidence: `nonodb-core/tests/columnar_lifecycle.rs`, `columnar_query.rs`, `columnar_operations.rs` |
 | [x] AC-TTL-005 | TTL purge of stored history and `ttl_purge_history` behavior match standard. | Evidence: `nonodb-core/tests/columnar_lifecycle.rs`, `columnar_query.rs`, `columnar_operations.rs` |
 | [x] AC-TTL-006 | The sweeper can delete expired rows from open/sealed buckets and can drop a wholly expired bucket. | Evidence: `nonodb-core/tests/columnar_lifecycle.rs`, `columnar_query.rs`, `columnar_operations.rs` |
-| [x] AC-TTL-007 | TTL expiry updates indexes, events, graph, history, replication, and metrics consistently. | Evidence: `nonodb-core/tests/columnar_lifecycle.rs`, `columnar_query.rs`, `columnar_operations.rs` |
+| [x] AC-TTL-007 | TTL expiry updates indexes, events, graph, history, replication, and metrics consistently. | Evidence: `columnar_lifecycle.rs` (index/history), `scripts/live_watch_test.py` (TTL delete event), `scripts/graph_test.py` (columnar edge expiry), `scripts/replication_test.py` (TTL delete replicated), `scripts/gui_test.py` (delete metric) |
 | [x] AC-TTL-008 | Snapshots and backups restore the same TTL state and do not resurrect expired documents. | Evidence: `nonodb-core/tests/columnar_operations.rs::columnar_backup_copy_and_reopen_preserves_documents` (expired row hidden, TTL entry restored), `scripts/backup_api_test.py` |
 | [x] AC-HISTORY-001 | `set_collection_history`, `get_collection_history`, `history`, and `get_version` match standard. | Evidence: `nonodb-core/tests/columnar_crud.rs`, `columnar_export_rollback.rs`, `columnar_operations.rs` |
 | [x] AC-HISTORY-002 | Insert/update/delete/TTL revisions have the same numbering, payloads, and retention boundaries. | Evidence: `nonodb-core/tests/columnar_crud.rs`, `columnar_export_rollback.rs`, `columnar_operations.rs` |
-| [x] AC-HISTORY-003 | History survives seal, compaction, backup, restore, branch, and replication. | Evidence: `nonodb-core/tests/columnar_crud.rs`, `columnar_export_rollback.rs`, `columnar_operations.rs` |
+| [x] AC-HISTORY-003 | History survives seal, compaction, backup, restore, branch, and replication. | Evidence: `nonodb-core/tests/columnar_operations.rs::columnar_history_survives_seal_compaction_backup_and_replication`, `scripts/branch_test.py` (columnar `events` history after branch/snapshot) |
 | [x] AC-HISTORY-004 | History storage is excluded from columnar compression claims but included in quotas/stats. | Evidence: `nonodb-core/tests/columnar_crud.rs`, `columnar_export_rollback.rs`, `columnar_operations.rs` |
 | [x] AC-EVENT-001 | Automatic collection events, source filters, and event payloads match standard. | Evidence: `nonodb-core/tests/columnar_operations.rs`, `nonodb-daemon/src/writer.rs::columnar_changes_feed_events_and_live_watches` |
 | [x] AC-EVENT-002 | `watch`, NDJSON/SSE streams, resume tokens, and truncation behavior match standard. | Evidence: `nonodb-core/tests/columnar_operations.rs`, `nonodb-daemon/src/writer.rs::columnar_changes_feed_events_and_live_watches` |
@@ -240,9 +243,9 @@ observable.
 | [x] AC-OPS-008 | Dropped collections and failed creates leave no orphan columnar sub-databases or keys. | Evidence: `nonodb-core/tests/columnar_operations.rs`, `columnar_crash.rs`, `columnar_export_rollback.rs` |
 | [x] AC-OPS-009 | Request timeouts, `max_time_ms`, memory ceilings, and long-operation limits match standard. | Evidence: `nonodb-core/tests/columnar_operations.rs`, `columnar_crash.rs`, `columnar_export_rollback.rs` |
 | [x] AC-OBS-001 | Per-collection metrics include rows, open/sealed buckets, encoded/open/id bytes, deletes, TTL, seal, and compaction counters. | Evidence: `nonodb-daemon/src/server_info.rs`, `nonodb-daemon/src/main.rs`, `nonodb-core/tests/columnar_operations.rs` |
-| [x] AC-OBS-002 | Audit logs and operation logs include columnar writes without leaking document contents. | Evidence: `nonodb-daemon/src/server_info.rs`, `nonodb-daemon/src/main.rs`, `nonodb-core/tests/columnar_operations.rs` |
+| [x] AC-OBS-002 | Audit logs and operation logs include columnar writes without leaking document contents. | Evidence: `scripts/auth_test.py` (JSONL audit records for columnar insert/update, secret payload absent) |
 | [x] AC-OBS-003 | Health, readiness, capabilities, and server info report the profile correctly. | Evidence: `nonodb-daemon/src/server_info.rs`, `nonodb-daemon/src/main.rs`, `nonodb-core/tests/columnar_operations.rs` |
-| [x] AC-OBS-004 | CLI inspect/verify/stats/compact commands work on a columnar database. | Evidence: `nonodb-daemon/src/server_info.rs`, `nonodb-daemon/src/main.rs`, `nonodb-core/tests/columnar_operations.rs` |
+| [x] AC-OBS-004 | CLI inspect/verify/stats/compact commands work on a columnar database. | Evidence: `scripts/columnar_cli_test.sh` (offline inspect, verify, compact, restart/count/find) |
 
 ## 10. API, clients, CLI, GUI, and migration
 
@@ -264,11 +267,11 @@ observable.
 
 | ID | Criterion | Evidence |
 |---|---|---|
-| [x] AC-SEC-001 | Authentication scopes and intent checks apply identically to columnar reads/writes/admin operations. | Evidence: `nonodb-core/tests/columnar_properties.rs`, `columnar_crash.rs`, `nonodb-daemon/src/authz.rs` |
-| [x] AC-SEC-002 | Database and collection isolation prevents cross-database/cross-collection id-map or bucket access. | Evidence: `nonodb-core/tests/columnar_properties.rs`, `columnar_crash.rs`, `nonodb-daemon/src/authz.rs` |
-| [x] AC-SEC-003 | Audit events identify columnar operations without exposing document payloads. | Evidence: `nonodb-core/tests/columnar_properties.rs`, `columnar_crash.rs`, `nonodb-daemon/src/authz.rs` |
-| [x] AC-SEC-004 | A vault collection remains encrypted; columnar cannot silently bypass or downgrade vault semantics. | Evidence: `nonodb-core/tests/columnar_properties.rs`, `columnar_crash.rs`, `nonodb-daemon/src/authz.rs` |
-| [x] AC-SEC-005 | Malformed bucket/block/id-map input is rejected without panics, unbounded allocation, or out-of-bounds reads. | Evidence: `nonodb-core/tests/columnar_properties.rs`, `columnar_crash.rs`, `nonodb-daemon/src/authz.rs` |
+| [x] AC-SEC-001 | Authentication scopes and intent checks apply identically to columnar reads/writes/admin operations. | Evidence: `scripts/security_check.py` (scoped columnar read/write), `scripts/auth_test.py` (columnar insert/update under token scopes), `columnar_security.rs` |
+| [x] AC-SEC-002 | Database and collection isolation prevents cross-database/cross-collection id-map or bucket access. | Evidence: `scripts/security_check.py` (same columnar `events` collection in `app1` and `default`, cross-db denied), `.github/workflows/ci.yml` |
+| [x] AC-SEC-003 | Audit events identify columnar operations without exposing document payloads. | Evidence: `scripts/auth_test.py` (columnar insert/update audit records; `columnar-payload-secret` absent) |
+| [x] AC-SEC-004 | A vault collection remains encrypted; columnar cannot silently bypass or downgrade vault semantics. | Evidence: `nonodb-core/tests/columnar_security.rs` (vault/columnar profile conversion rejected, profile preserved) |
+| [x] AC-SEC-005 | Malformed bucket/block/id-map input is rejected without panics, unbounded allocation, or out-of-bounds reads. | Evidence: `columnar::tests::malformed_bucket_payloads_never_panic`, `unknown_bucket_version_fails_closed`, `columnar_crash.rs` |
 
 ## 12. Performance and capacity gates
 
@@ -285,7 +288,7 @@ id map, indexes, and history where present.
 | [x] AC-PERF-005 | Full scan and aggregation throughput on the canonical dataset is at least 0.80× standard. | Evidence: `docs/columnar-performance.md`, `nonodb-core/examples/columnar_bench.rs`, `columnar_soak.rs` |
 | [x] AC-PERF-006 | Memory is bounded by open buckets and batches, not total collection size; a 10M-row collection still runs within the documented ceiling. | Evidence: `docs/columnar-performance.md`, `nonodb-core/examples/columnar_bench.rs`, `columnar_soak.rs` |
 | [x] AC-PERF-007 | Deleting/retaining 25% of rows followed by compaction reclaims space and leaves results unchanged. | Evidence: `docs/columnar-performance.md`, `nonodb-core/examples/columnar_bench.rs`, `columnar_soak.rs` |
-| [x] AC-PERF-008 | Standard and time-series benchmark results do not regress beyond the project's noise threshold after shared-codec extraction. | Evidence: `docs/columnar-performance.md`, `nonodb-core/examples/columnar_bench.rs`, `columnar_soak.rs` |
+| [x] AC-PERF-008 | Standard and time-series benchmark results do not regress beyond the project's noise threshold after shared-codec extraction. | Evidence: `docs/columnar-performance.md#shared-codec-regression-check-ac-perf-008` (v0.34.0 vs branch, 3 runs), `timeseries_bench` |
 | [x] AC-PERF-009 | Pathological cases (schema drift, high string cardinality, large arrays, large ids) are measured and have a documented fallback; they are not silently worst-case. | Evidence: `docs/columnar-performance.md`, `nonodb-core/examples/columnar_bench.rs`, `columnar_soak.rs` |
 | [x] AC-PERF-010 | A bucket seal or compaction does not cause an unbounded latency spike; p95 is recorded. | Evidence: `docs/columnar-performance.md`, `nonodb-core/examples/columnar_bench.rs`, `columnar_soak.rs` |
 
@@ -385,6 +388,29 @@ The following evidence was reviewed for this release candidate:
 - Single-document update/delete and unsorted `findAndModify` now choose the
   same smallest `_id` as the standard primary-key scan; the regression is
   covered by `columnar_parity.rs::single_update_delete_and_find_and_modify_choose_the_same_id`.
+- `scripts/security_check.py` exercises scoped columnar reads/writes and
+  cross-database denial with the same `events` collection in `app1` and
+  `default`; `scripts/auth_test.py` checks columnar audit records and confirms
+  a document payload never reaches the audit log. `columnar_security.rs`
+  rejects vault/columnar conversion and downgrade.
+- `scripts/columnar_cli_test.sh` stops the daemon and runs offline
+  `inspect`, `verify --json`, and `compact`, then reopens and checks the rows.
+- Columnar TTL expiry updates index visibility and purges history
+  (`columnar_lifecycle.rs`), emits a live delete event
+  (`scripts/live_watch_test.py`), removes graph adjacency
+  (`scripts/graph_test.py`), replicates the delete
+  (`scripts/replication_test.py`), and increments the `deletes` metric
+  (`scripts/gui_test.py`).
+- `columnar_operations.rs::columnar_history_survives_seal_compaction_backup_and_replication`
+  covers history through seal, compaction, LMDB backup copy, reopen, and
+  replicated insert/update; `scripts/branch_test.py` checks columnar history and
+  lexical/fuzzy search after branch and snapshot.
+- `columnar_search_graph.rs::columnar_search_sidecars_survive_backup_reopen_and_crash_reopen`
+  checks text/fuzzy/vector sidecars after backup copy, crash-style reopen, and
+  reindex.
+- `docs/columnar-performance.md#shared-codec-regression-check-ac-perf-008`
+  records three-run v0.34.0-vs-branch ranges for time-series and standard
+  workloads; every metric stayed inside the measured noise band.
 
 ## 16. Release sign-off
 

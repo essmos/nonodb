@@ -53,6 +53,37 @@ Retention/compaction (`AC-PERF-007`, `AC-PERF-010`): deleting 25% of rows left
 seal/compaction p95 was 1.36-1.38 s, and sealed point-read p95 was 12.3 us. No
 correctness result changed after compaction or reopen.
 
+## Shared-codec regression check (`AC-PERF-008`)
+
+The adaptive codec extraction was checked against the pre-extraction commit
+`2e30bc2` (v0.34.0) with three runs of the same time-series benchmark:
+
+```bash
+git worktree add /tmp/nonodb-old 2e30bc2
+(cd /tmp/nonodb-old && CARGO_TARGET_DIR=/tmp/old-target \
+  cargo build --release -p nonodb-core --example timeseries_bench)
+for run in 1 2 3; do
+  ROWS=100000 SERIES=10 READS=2000 /tmp/old-target/release/examples/timeseries_bench
+  ROWS=100000 SERIES=10 READS=2000 ./target/release/examples/timeseries_bench
+done
+```
+
+The project noise band for these short runs is roughly ±5%. Observed ranges:
+
+| Workload | v0.34.0 (3 runs) | branch (3 runs) | result |
+|---|---:|---:|---|
+| time-series insert | 16,252-16,521 ops/s | 16,004-16,599 ops/s | within noise |
+| time-series bulk load (1k txns) | 35,189-35,842 rows/s | 35,101-37,249 rows/s | within noise |
+| time-series point read | 2,734-2,921 ops/s | 2,717-2,908 ops/s | within noise |
+| standard insert | 41,480-42,517 ops/s | 42,390-43,137 ops/s | within noise |
+| standard bulk load | 84,279-86,130 rows/s | 81,986-87,913 rows/s | within noise |
+| standard point read | 148,604-156,485 ops/s | 143,633-160,931 ops/s | within noise |
+
+No standard or time-series metric moved outside the measured spread. The
+shared codec keeps its byte-compatibility fixture (`timeseries` formatting is
+unchanged), and the columnar profile adds no branch to the standard document
+write path.
+
 ## Bounded-memory soak (`AC-PERF-006`)
 
 `nonodb-core/examples/columnar_soak.rs` inserts a configurable number of rows in

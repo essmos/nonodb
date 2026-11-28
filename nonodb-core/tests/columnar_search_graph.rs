@@ -248,3 +248,75 @@ fn columnar_graph_mutations_and_traversal_match_standard() {
         .unwrap();
     assert_eq!(actual, expected);
 }
+
+#[test]
+fn columnar_search_sidecars_survive_backup_reopen_and_crash_reopen() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let backup_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(source_dir.path()).unwrap();
+    let c = store
+        .create_columnar_collection("docs", &nonodb_core::columnar::Settings::default())
+        .unwrap();
+    for doc in docs() {
+        c.insert_one(doc).unwrap();
+    }
+    c.create_text_index("body").unwrap();
+    c.create_fuzzy_index("body").unwrap();
+    c.create_vector_index("embedding", 2, VectorMetric::Cosine)
+        .unwrap();
+    store.seal_columnar("docs").unwrap();
+    assert!(!text_ids(&c, "rust").is_empty());
+    assert_eq!(
+        c.vector_search("embedding", &[1.0, 0.0], &json!({}), 0, Some(1))
+            .unwrap()[0]["_id"],
+        "a"
+    );
+
+    let backup = backup_dir.path().join("data.mdb");
+    store
+        .copy_to_file(&backup, nonodb_core::heed::CompactionOption::Enabled)
+        .unwrap();
+    for relative in store.search_sidecar_files().unwrap() {
+        let target = backup_dir.path().join(&relative);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::copy(source_dir.path().join(&relative), target).unwrap();
+    }
+    drop(store);
+    let restored = Store::open(backup_dir.path()).unwrap();
+    let r = restored.collection("docs").unwrap();
+    assert!(!text_ids(&r, "rust").is_empty());
+    assert_eq!(
+        r.vector_search("embedding", &[1.0, 0.0], &json!({}), 0, Some(1))
+            .unwrap()[0]["_id"],
+        "a"
+    );
+    let fuzzy = r
+        .search_all(&SearchAllRequest {
+            coll: "docs".into(),
+            mode: SearchMode::Fuzzy,
+            query: Some("rustt".into()),
+            fields: vec!["body".into()],
+            vector: None,
+            vector_field: None,
+            filter: serde_json::Value::Null,
+            skip: 0,
+            limit: Some(10),
+            max_distance: Some(2),
+            rrf_k: None,
+        })
+        .unwrap();
+    assert!(
+        fuzzy.results.iter().any(|doc| doc["_id"] == "c"),
+        "{fuzzy:?}"
+    );
+    drop(restored);
+
+    // Crash recovery: reopening the original store must not lose sidecars.
+    let source = Store::open(source_dir.path()).unwrap();
+    let c = source.collection("docs").unwrap();
+    assert!(!text_ids(&c, "rust").is_empty());
+    c.reindex().unwrap();
+    assert!(!text_ids(&c, "rust").is_empty());
+}
