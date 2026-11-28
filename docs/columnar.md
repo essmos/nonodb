@@ -209,6 +209,10 @@ db.createCollection("events", {
 `collection_info` entries with `profile` and `columnar` settings. The GUI
 collection settings panel reads this data together with
 `get_collection_columnar` and shows live row/bucket/id-map/bucket-byte stats.
+The JSON `/metrics` snapshot adds `columnar_collections` entries with rows,
+open/sealed buckets, id-map entries, and bucket bytes; Prometheus exposes the
+same values as `nonodb_columnar_*` gauges. `nonodb-cli inspect` reports the
+columnar profile and bucket statistics for an offline database.
 
 ## Clients, CLI, and GUI
 

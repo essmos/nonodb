@@ -318,6 +318,18 @@ The following evidence was reviewed for this release candidate:
 - The 10,000,000-row bounded-memory soak completed with 9 MiB peak anonymous
   memory; total RSS (603 MiB) is LMDB file-backed mapping, as recorded in the
   same performance evidence.
+- Single-document update/delete on non-`_id` filters now operate only on the
+  rows actually changed; ObjectId `findAndModify`, index hints, and explain
+  parity are covered by `columnar_parity.rs`.
+- `columnar_writes.rs` covers the supported update-operator matrix, replacement
+  updates, `insert_many` id order/atomicity, and ObjectId ids.
+- `scripts/clients_test.sh` exercises columnar create/settings/stats/CRUD
+  through the Python, Rust, Node.js, and Go clients and the CLI,
+  `scripts/columnar_wire_test.py` covers MongoDB wire CRUD/create/listCollections,
+  and `/metrics` exposes `columnar_collections` plus `nonodb_columnar_*` gauges.
+- The v0.34.0 daemon (without columnar support) was opened against a columnar
+  data directory and exited with `unknown collection profile \`columnar\``
+  without modifying the database.
 - Decoder fuzzing, randomized differential operations, concurrent
   writers/readers, crash/rollback, interrupted compaction, unknown formats,
   and float bit-exact roundtrips are covered by

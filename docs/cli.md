@@ -210,6 +210,10 @@ nonodb-cli set-collection-columnar events --compression max
 nonodb-cli set-collection-columnar events --bucket-max-docs 1024
 ```
 
+`nonodb-cli inspect <data-dir> <collection>` reports the columnar profile, row
+count, bucket counts, id-map entries, and bucket bytes. `nonodb-cli compact`
+also works on a stopped database that contains columnar collections.
+
 `set-collection-columnar` merges only the flags you pass. The new limits apply
 to new writes; sealed buckets are re-encoded by compaction.
 
