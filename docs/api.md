@@ -3294,6 +3294,9 @@ scopes are omitted and the totals are recalculated.
         "indexes": 7,
         "history_bytes": 0,
         "ttl_bytes": 0,
+        "id_bytes": 0,
+        "logical_bytes": 498000000,
+        "physical_bytes": 608000000,
         "total_bytes": 608000000,
         "requests_last_minute": 240,
         "avg_requests_per_second": 4.0
@@ -3305,7 +3308,12 @@ scopes are omitted and the totals are recalculated.
 
 `data_bytes` and `index_bytes` are allocated LMDB B-tree pages
 (`(branch + leaf + overflow) * page_size`). `history_bytes` and `ttl_bytes` are
-estimated from shared history/TTL keys and values. `requests_last_minute` is a
+estimated from shared history/TTL keys and values. `logical_bytes` is the
+encoded payload region before LMDB page allocation (for columnar, bucket
+payload plus id-map values). `physical_bytes` is the allocated
+data/index/history/TTL total and equals `total_bytes`; `id_bytes` is the subset
+of the columnar payload used by the id locator map. For standard and
+time-series profiles `id_bytes` is `0`. `requests_last_minute` is a
 rolling 60-second request count and `avg_requests_per_second` is that count
 divided by 60. `used_bytes` is the LMDB file high-water mark and can exceed the
 sum of collection totals because LMDB keeps freed pages and does not shrink the

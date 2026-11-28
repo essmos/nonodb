@@ -322,4 +322,7 @@ parallel.
 - The hard bucket limit is 4 MiB encoded; keep documents well below the
   configured bucket byte target.
 - Index definitions and graph/search sidecars consume additional space and are
-  included in `storage_stats`.
+  included in `storage_stats`. Columnar stats also report `id_bytes` (locator
+  map), `logical_bytes` (encoded bucket payload plus id-map values), and
+  `physical_bytes` (allocated data/index/history/TTL bytes). Index builds
+  register the same `index_status` progress records as standard collections.

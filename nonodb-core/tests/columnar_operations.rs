@@ -259,8 +259,12 @@ fn columnar_storage_and_database_stats_include_buckets_and_indexes() {
     assert!(collection.data_bytes > 0);
     assert!(collection.index_bytes > 0);
     assert!(collection.id_bytes > 0);
-    assert_eq!(collection.logical_bytes, collection.total_bytes);
+    assert!(collection.logical_bytes > 0);
+    assert!(collection.physical_bytes > 0);
     assert_eq!(collection.physical_bytes, collection.total_bytes);
+    // Logical bytes are the encoded bucket/id-map payload; physical bytes are
+    // LMDB data/index/history/TTL allocation, so the two are distinct.
+    assert_ne!(collection.logical_bytes, collection.physical_bytes);
 }
 
 #[test]

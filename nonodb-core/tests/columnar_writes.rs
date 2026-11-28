@@ -190,3 +190,66 @@ fn insert_many_order_duplicate_atomicity_and_bson_ids_match_standard() {
     assert!(sc.find_by_key("twice").unwrap().is_none());
     assert!(cc.find_by_key("twice").unwrap().is_none());
 }
+
+#[test]
+fn unique_failures_leave_no_partial_state_when_the_transaction_commits() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let c = store
+        .create_columnar_collection("docs", &nonodb_core::columnar::Settings::default())
+        .unwrap();
+    c.create_index("v", true).unwrap();
+    c.insert_one(json!({"_id": "i0", "v": 1})).unwrap();
+
+    // The daemon commits the shared transaction even when one job returns an
+    // error, so each failed write must have made no changes before returning.
+    let mut wtxn = store.write_txn().unwrap();
+    let err = c
+        .insert_one_txn(&mut wtxn, json!({"_id": "x", "v": 1}))
+        .unwrap_err();
+    assert!(err.to_string().contains("duplicate key"), "{err}");
+    wtxn.commit().unwrap();
+    assert!(c.find_by_key("x").unwrap().is_none());
+    assert_eq!(c.count(&json!({"v": 1})).unwrap(), 1);
+
+    c.insert_one(json!({"_id": "i1", "v": 2})).unwrap();
+    let mut wtxn = store.write_txn().unwrap();
+    let err = c
+        .update_txn(
+            &mut wtxn,
+            &json!({"_id": "i1"}),
+            &json!({"$set": {"v": 1}}),
+            false,
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("duplicate key"), "{err}");
+    wtxn.commit().unwrap();
+    assert_eq!(c.find_by_key("i1").unwrap().unwrap()["v"], 2);
+    assert_eq!(c.count(&json!({"v": 1})).unwrap(), 1);
+
+    let batch = [json!({"_id": "n1", "v": 3}), json!({"_id": "n2", "v": 1})];
+    let mut wtxn = store.write_txn().unwrap();
+    let err = c.insert_many_txn(&mut wtxn, &batch).unwrap_err();
+    assert!(err.to_string().contains("duplicate key"), "{err}");
+    wtxn.commit().unwrap();
+    assert!(c.find_by_key("n1").unwrap().is_none());
+    assert!(c.find_by_key("n2").unwrap().is_none());
+    assert_eq!(c.count(&json!({"v": 1})).unwrap(), 1);
+
+    let opts = nonodb_core::FindAndModifyOptions {
+        filter: &json!({"_id": "i1"}),
+        update: Some(&json!({"$set": {"v": 1}})),
+        sort: &[],
+        new: false,
+        upsert: false,
+        remove: false,
+        array_filters: &[],
+        projection: None,
+    };
+    let mut wtxn = store.write_txn().unwrap();
+    let err = c.find_and_modify_txn(&mut wtxn, &opts).unwrap_err();
+    assert!(err.to_string().contains("duplicate key"), "{err}");
+    wtxn.commit().unwrap();
+    assert_eq!(c.find_by_key("i1").unwrap().unwrap()["v"], 2);
+    assert_eq!(c.count(&json!({"v": 1})).unwrap(), 1);
+}

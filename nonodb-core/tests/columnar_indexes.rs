@@ -162,3 +162,25 @@ fn failed_columnar_unique_backfill_rolls_back_index() {
         vec![Some(json!({"_id": "a", "g": "same"}))]
     );
 }
+
+#[test]
+fn columnar_index_backfill_registers_finished_progress() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let coll = store
+        .create_columnar_collection("progress_docs", &nonodb_core::columnar::Settings::default())
+        .unwrap();
+    for (id, g) in [("a", "x"), ("b", "y"), ("c", "z")] {
+        coll.insert_one(json!({"_id": id, "g": g})).unwrap();
+    }
+    coll.create_index("g", false).unwrap();
+    let snapshot = nonodb_core::progress::snapshot();
+    let entry = snapshot
+        .iter()
+        .find(|entry| entry.collection == "progress_docs")
+        .expect("columnar index build progress");
+    assert_eq!(entry.kind, "index");
+    assert_eq!(entry.total, 3);
+    assert_eq!(entry.processed, 3);
+    assert!(entry.finished);
+}

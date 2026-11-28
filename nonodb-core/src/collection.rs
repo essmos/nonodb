@@ -687,6 +687,7 @@ pub struct CollectionStorageStats {
     pub index_bytes: u64,
     pub indexes: u64,
     pub id_bytes: u64,
+    pub logical_bytes: u64,
 }
 
 fn stat_bytes(stat: &heed::DatabaseStat) -> u64 {
@@ -978,6 +979,7 @@ impl<'e> Collection<'e> {
                 index_bytes,
                 indexes,
                 id_bytes: 0,
+                logical_bytes: data_bytes,
             });
         }
         if self.profile.is_columnar() {
@@ -1011,6 +1013,7 @@ impl<'e> Collection<'e> {
                 index_bytes,
                 indexes,
                 id_bytes: stats.id_bytes,
+                logical_bytes: stats.data_bytes.saturating_add(stats.id_bytes),
             });
         }
         let data = self.db.stat(txn)?;
@@ -1038,6 +1041,7 @@ impl<'e> Collection<'e> {
             index_bytes,
             indexes,
             id_bytes: 0,
+            logical_bytes: stat_bytes(&data),
         })
     }
 
@@ -1660,6 +1664,8 @@ impl<'e> Collection<'e> {
         defs: &mut [(String, IndexDef)],
     ) -> Result<()> {
         let total = crate::columnar::stats(&*wtxn, self.env, &self.name)?.rows;
+        let target = format!("{} indexes", defs.len());
+        let progress = crate::progress::begin(&self.name, &target, "index", total);
         let index_dbs: Vec<_> = defs
             .iter()
             .map(|(_key, def)| self.index_db_in(wtxn, def))
@@ -1670,6 +1676,7 @@ impl<'e> Collection<'e> {
         let mut docs_per_index = vec![0u64; defs.len()];
         let mut multikey_fields: Vec<Vec<String>> = vec![Vec::new(); defs.len()];
         crate::columnar::for_each_bucket(wtxn, self.env, &self.name, |wtxn, batch| {
+            let processed = batch.len() as u64;
             for (id, doc) in batch {
                 for (slot, ((_key, def), db)) in defs.iter().zip(index_dbs.iter()).enumerate() {
                     let keys = index::encode_index_keys(def, &doc)?;
@@ -1704,6 +1711,7 @@ impl<'e> Collection<'e> {
                     }
                 }
             }
+            progress.advance(processed);
             Ok(())
         })?;
         for (slot, (key, def)) in defs.iter_mut().enumerate() {
@@ -5654,11 +5662,35 @@ impl<'e> Collection<'e> {
                 Self::normalize_columnar_batch(docs, self.ttl_default_seconds, ttl_field)?;
             let mut prepared = Vec::with_capacity(normalized.len());
             let mut ttls = Vec::with_capacity(normalized.len());
-            for (doc, ttl_at) in normalized {
+            for (mut doc, ttl_at) in normalized {
                 self.validate_graph_edge_txn(&*wtxn, &doc)?;
+                if doc.get("_id").is_none() {
+                    doc.as_object_mut()
+                        .ok_or_else(|| Error::Query("document must be an object".into()))?
+                        .insert(
+                            "_id".into(),
+                            Value::String(uuid::Uuid::new_v4().to_string()),
+                        );
+                }
                 prepared.push(doc);
                 ttls.push(ttl_at);
             }
+            // Validate the whole batch before writing any row. The daemon can
+            // commit the shared transaction after this job reports an error,
+            // so insert_batch must not be the first place a duplicate shows up.
+            let mut seen_ids = HashSet::with_capacity(prepared.len());
+            for doc in &prepared {
+                let id = doc
+                    .get("_id")
+                    .and_then(id::key_from_value)
+                    .ok_or(Error::InvalidId)?;
+                if !seen_ids.insert(id.clone())
+                    || crate::columnar::find_by_id(&*wtxn, self.env, &self.name, &id)?.is_some()
+                {
+                    return Err(Error::DuplicateKey(id));
+                }
+            }
+            self.validate_unique_batch(&*wtxn, &prepared)?;
             let inserted =
                 crate::columnar::insert_batch(wtxn, self.env, &self.name, &settings, prepared)?;
             let index_defs = self.index_defs(&*wtxn)?;
@@ -5732,9 +5764,25 @@ impl<'e> Collection<'e> {
             numeric::normalize_document(&mut doc)?;
             bson_types::normalize_document(&mut doc)?;
             self.validate_graph_edge_txn(&*wtxn, &doc)?;
+            let id = match doc.get("_id") {
+                Some(value) => id::key_from_value(value).ok_or(Error::InvalidId)?,
+                None => {
+                    let id = uuid::Uuid::new_v4().to_string();
+                    doc.as_object_mut()
+                        .ok_or_else(|| Error::Query("document must be an object".into()))?
+                        .insert("_id".into(), Value::String(id.clone()));
+                    id
+                }
+            };
+            if crate::columnar::find_by_id(&*wtxn, self.env, &self.name, &id)?.is_some() {
+                return Err(Error::DuplicateKey(id));
+            }
+            // Validate uniques before the row is written: the daemon may
+            // commit the shared transaction even when this job reports an
+            // error, so a late failure must not leave a partial document.
+            self.validate_unique(&*wtxn, &doc, &id)?;
             let id = crate::columnar::insert(wtxn, self.env, &self.name, &settings, doc)?;
             if let Some(stored) = crate::columnar::find_by_id(&*wtxn, self.env, &self.name, &id)? {
-                self.validate_unique(&*wtxn, &stored, &id)?;
                 self.apply_all_index_entries(wtxn, None, Some(&stored), &id)?;
                 crate::columnar::failpoint("insert_after_index")?;
                 self.apply_graph_entries(wtxn, None, Some(&stored))?;
@@ -6494,6 +6542,32 @@ impl<'e> Collection<'e> {
         default_id: Option<&Value>,
     ) -> Result<UpdateOutcome> {
         let settings = self.columnar_settings_in(&*wtxn)?.unwrap_or_default();
+        if self.index_defs(&*wtxn)?.iter().any(|def| def.unique) {
+            let (preview, upsert) = crate::columnar::preview_update(
+                &*wtxn,
+                self.env,
+                &self.name,
+                filter,
+                update,
+                multi,
+                array_filters,
+                upsert,
+                default_id,
+            )?;
+            let updates: Vec<(String, Value)> = preview
+                .iter()
+                .map(|(id, _old, new)| (id.clone(), Value::Object(new.clone())))
+                .collect();
+            self.validate_unique_updates(&*wtxn, &updates)?;
+            if let Some(doc) = upsert {
+                let doc = Value::Object(doc);
+                let id = doc
+                    .get("_id")
+                    .and_then(id::key_from_value)
+                    .unwrap_or_default();
+                self.validate_unique(&*wtxn, &doc, &id)?;
+            }
+        }
         let (outcome, changed) = crate::columnar::update_with_changes(
             wtxn,
             self.env,

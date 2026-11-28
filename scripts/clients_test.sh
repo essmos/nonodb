@@ -138,6 +138,34 @@ try:
     )
     assert [doc["_id"] for doc in aggregate_cursor] == ["c2", "c3", "c4"]
     assert aggregate_cursor.close() is False
+
+    db.create_collection(
+        "py_unique_columnar",
+        profile="columnar",
+        columnar={"bucket_max_docs": 2, "compression": "max"},
+    )
+    unique = db.collection("py_unique_columnar")
+    unique.insert_many([{"_id": "i0", "v": 1}, {"_id": "i1", "v": 2}])
+    unique.create_index("v", unique=True)
+    for action in (
+        lambda: unique.insert({"_id": "x", "v": 1}),
+        lambda: unique.update({"_id": "i1"}, {"$set": {"v": 1}}),
+        lambda: unique.find_and_modify({"_id": "i1"}, {"$set": {"v": 1}}),
+        lambda: unique.insert_many(
+            [{"_id": "n1", "v": 9}, {"_id": "n2", "v": 1}]
+        ),
+    ):
+        try:
+            action()
+        except Exception:
+            pass
+        else:
+            raise AssertionError("duplicate unique write unexpectedly succeeded")
+        assert unique.find_one({"_id": "i1"})["v"] == 2
+        assert unique.find_one({"v": 1})["_id"] == "i0"
+        assert unique.find_one({"_id": "x"}) is None
+        assert unique.find_one({"_id": "n1"}) is None
+        assert unique.find_one({"_id": "n2"}) is None
 finally:
     db.close()
 PY

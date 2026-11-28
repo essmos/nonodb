@@ -2899,7 +2899,7 @@ impl Store {
                 history_bytes,
                 ttl_bytes,
                 id_bytes: stats.id_bytes,
-                logical_bytes: total,
+                logical_bytes: stats.logical_bytes,
                 physical_bytes: total,
                 total_bytes: total,
                 requests_last_minute: 0,

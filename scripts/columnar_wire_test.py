@@ -14,7 +14,7 @@ import sys
 import uuid
 
 from pymongo import MongoClient
-from pymongo.errors import OperationFailure
+from pymongo.errors import BulkWriteError, DuplicateKeyError, OperationFailure
 
 
 def main() -> int:
@@ -61,6 +61,51 @@ def main() -> int:
         assert grouped == [{"_id": "x", "n": 2}], grouped
         events.create_index("v", unique=True)
         assert events.find_one({"v": 11})["_id"] == "a"
+
+        # A rejected unique write must not leave a document or a partial
+        # batch behind when the daemon commits the shared write transaction.
+        try:
+            events.insert_one({"_id": "dup-insert", "v": 11})
+        except DuplicateKeyError:
+            pass
+        else:
+            raise AssertionError("duplicate unique insert unexpectedly succeeded")
+        assert events.find_one({"_id": "dup-insert"}) is None
+        assert events.count_documents({"v": 11}) == 1
+
+        try:
+            events.update_one({"_id": "b"}, {"$set": {"v": 11}})
+        except DuplicateKeyError:
+            pass
+        else:
+            raise AssertionError("duplicate unique update unexpectedly succeeded")
+        assert events.find_one({"_id": "b"})["v"] == 2
+        assert events.count_documents({"v": 11}) == 1
+
+        try:
+            events.find_one_and_update({"_id": "b"}, {"$set": {"v": 11}})
+        except DuplicateKeyError:
+            pass
+        else:
+            raise AssertionError("duplicate unique findAndModify unexpectedly succeeded")
+        assert events.find_one({"_id": "b"})["v"] == 2
+
+        try:
+            events.insert_many(
+                [
+                    {"_id": "batch-ok", "v": 99},
+                    {"_id": "batch-dup", "v": 11},
+                ]
+            )
+        except (DuplicateKeyError, BulkWriteError):
+            pass
+        else:
+            raise AssertionError("duplicate unique insert_many unexpectedly succeeded")
+        # MongoDB ordered inserts may retain earlier documents from a failed
+        # batch, but the conflicting document must never be written and the
+        # unique index must still hold.
+        assert events.find_one({"_id": "batch-dup"}) is None
+        assert events.count_documents({"v": 11}) == 1
 
         for bad in (
             {"columnar": {"bucketMaxDocs": 0}},

@@ -2088,6 +2088,9 @@ pub fn find_visible(
 /// A changed columnar row: `(id, old document, new document)`.
 pub(crate) type ChangedRow = (String, Map<String, Value>, Map<String, Value>);
 
+/// Candidate rows and an optional upsert document, produced without writing.
+pub(crate) type UpdatePreview = (Vec<ChangedRow>, Option<Map<String, Value>>);
+
 /// Updates matching documents. Returns the standard update outcome.
 #[allow(clippy::too_many_arguments)]
 pub fn update(
@@ -2122,24 +2125,33 @@ pub fn update(
 /// The collection layer uses the returned rows to keep indexes, history, TTL,
 /// and graph entries in sync without re-querying candidates it did not modify.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn update_with_changes(
-    wtxn: &mut RwTxn<'_>,
+struct UpdatePlan {
+    changes: Vec<(Locator, Map<String, Value>)>,
+    changed: Vec<ChangedRow>,
+    matched: usize,
+    upsert: Option<Map<String, Value>>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_update(
+    rtxn: &RoTxn<'_>,
     env: &Env,
     name: &str,
-    settings: &Settings,
     filter: &Value,
     update: &Value,
     multi: bool,
     array_filters: &[Value],
     upsert: bool,
     default_id: Option<&Value>,
-) -> Result<(UpdateOutcome, Vec<ChangedRow>)> {
+) -> Result<UpdatePlan> {
     use crate::query::updater::{apply_upsert_with_options, apply_with_options, seed_from_filter};
 
-    let db = env.create_database::<Bytes, Bytes>(wtxn, Some(&db_name(name)))?;
+    let Some(db) = env.open_database::<Bytes, Bytes>(rtxn, Some(&db_name(name)))? else {
+        return Err(corrupt("missing columnar database"));
+    };
     let direct = if !multi {
         match exact_id_filter(filter) {
-            Some(id) => find_located_id(&*wtxn, &db, &id)?,
+            Some(id) => find_located_id(rtxn, &db, &id)?,
             None => None,
         }
     } else {
@@ -2147,7 +2159,7 @@ pub(crate) fn update_with_changes(
     };
     let mut candidates = match direct {
         Some(found) => vec![found],
-        None => all_located(&*wtxn, env, name)?,
+        None => all_located(rtxn, env, name)?,
     };
     if !multi && candidates.len() > 1 {
         // Standard updates scan the primary `_id` tree, so a single-document
@@ -2191,11 +2203,7 @@ pub(crate) fn update_with_changes(
             break;
         }
     }
-    for (locator, doc) in &changes {
-        write_doc_at(wtxn, &db, *locator, doc)?;
-    }
-    failpoint("update_after_write")?;
-    if matched == 0 && upsert {
+    let upsert = if matched == 0 && upsert {
         let mut doc = seed_from_filter(filter);
         let filter_id = doc.get("_id").cloned();
         apply_upsert_with_options(&mut doc, update, filter, array_filters)?;
@@ -2208,7 +2216,78 @@ pub(crate) fn update_with_changes(
             }
         }
         normalize_document(&mut doc)?;
-        let id = insert(wtxn, env, name, settings, doc)?;
+        doc.as_object().cloned()
+    } else {
+        None
+    };
+    Ok(UpdatePlan {
+        changes,
+        changed,
+        matched,
+        upsert,
+    })
+}
+
+/// Plans an update without writing. Collection-level unique validation uses
+/// this before the actual update so a rejected write cannot leave rows or
+/// index entries behind when the caller commits the shared transaction.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn preview_update(
+    rtxn: &RoTxn<'_>,
+    env: &Env,
+    name: &str,
+    filter: &Value,
+    update: &Value,
+    multi: bool,
+    array_filters: &[Value],
+    upsert: bool,
+    default_id: Option<&Value>,
+) -> Result<UpdatePreview> {
+    let plan = plan_update(
+        rtxn,
+        env,
+        name,
+        filter,
+        update,
+        multi,
+        array_filters,
+        upsert,
+        default_id,
+    )?;
+    Ok((plan.changed, plan.upsert))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn update_with_changes(
+    wtxn: &mut RwTxn<'_>,
+    env: &Env,
+    name: &str,
+    settings: &Settings,
+    filter: &Value,
+    update: &Value,
+    multi: bool,
+    array_filters: &[Value],
+    upsert: bool,
+    default_id: Option<&Value>,
+) -> Result<(UpdateOutcome, Vec<ChangedRow>)> {
+    let plan = plan_update(
+        &*wtxn,
+        env,
+        name,
+        filter,
+        update,
+        multi,
+        array_filters,
+        upsert,
+        default_id,
+    )?;
+    let db = env.create_database::<Bytes, Bytes>(wtxn, Some(&db_name(name)))?;
+    for (locator, doc) in &plan.changes {
+        write_doc_at(wtxn, &db, *locator, doc)?;
+    }
+    failpoint("update_after_write")?;
+    if let Some(doc) = plan.upsert {
+        let id = insert(wtxn, env, name, settings, Value::Object(doc))?;
         return Ok((
             UpdateOutcome {
                 matched: 0,
@@ -2216,17 +2295,17 @@ pub(crate) fn update_with_changes(
                 upserted_id: Some(id),
                 moved: Vec::new(),
             },
-            changed,
+            plan.changed,
         ));
     }
     Ok((
         UpdateOutcome {
-            matched,
-            modified: changes.len(),
+            matched: plan.matched,
+            modified: plan.changes.len(),
             upserted_id: None,
             moved: Vec::new(),
         },
-        changed,
+        plan.changed,
     ))
 }
 
