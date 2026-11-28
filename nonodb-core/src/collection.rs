@@ -241,7 +241,7 @@ struct ScanChunk {
 /// allowed. Numbers and `null` are skipped because their semantics/formatting
 /// differences require the full parser.
 #[derive(Debug, Clone, Default)]
-struct RawPrefilter {
+pub(crate) struct RawPrefilter {
     needles: Vec<Vec<u8>>,
 }
 
@@ -255,7 +255,7 @@ impl RawPrefilter {
 
 /// Builds a prefilter for safe equality conditions. Conditions we cannot
 /// check at the byte level are ignored (the filter is an AND, so this is safe).
-fn raw_prefilter(filter: &Value) -> Option<RawPrefilter> {
+pub(crate) fn raw_prefilter(filter: &Value) -> Option<RawPrefilter> {
     let obj = filter.as_object()?;
     let mut needles = Vec::new();
     for (key, cond) in obj {
@@ -299,7 +299,7 @@ fn raw_equality_value(cond: &Value) -> Option<&Value> {
 }
 
 /// Parses a document only when the prefilter did not reject it.
-fn parse_prefiltered(bytes: &[u8], raw: Option<&RawPrefilter>) -> Result<Option<Value>> {
+pub(crate) fn parse_prefiltered(bytes: &[u8], raw: Option<&RawPrefilter>) -> Result<Option<Value>> {
     if raw.is_some_and(|r| !r.matches(bytes)) {
         return Ok(None);
     }
@@ -686,6 +686,8 @@ pub struct CollectionStorageStats {
     pub data_bytes: u64,
     pub index_bytes: u64,
     pub indexes: u64,
+    pub id_bytes: u64,
+    pub logical_bytes: u64,
 }
 
 fn stat_bytes(stat: &heed::DatabaseStat) -> u64 {
@@ -750,7 +752,7 @@ impl<'e> Collection<'e> {
         &self.name
     }
 
-    /// Collection profile (`standard`, `vault`, or `timeseries`).
+    /// Collection profile (`standard`, `vault`, `timeseries`, or `columnar`).
     pub fn profile(&self) -> CollectionProfile {
         self.profile
     }
@@ -790,6 +792,51 @@ impl<'e> Collection<'e> {
         self.set_timeseries_settings_in(&mut wtxn, settings)?;
         wtxn.commit()?;
         Ok(())
+    }
+
+    /// Columnar settings, or `None` for non-columnar collections.
+    pub fn columnar_settings_in(
+        &self,
+        txn: &RoTxn<'_>,
+    ) -> Result<Option<crate::columnar::Settings>> {
+        if !self.profile.is_columnar() {
+            return Ok(None);
+        }
+        let key = format!("{}{}", crate::columnar::SETTINGS_META_PREFIX, self.name);
+        match self.meta.get(txn, key.as_bytes())? {
+            Some(raw) => Ok(Some(crate::columnar::parse_settings(raw)?)),
+            None => Ok(Some(crate::columnar::Settings::default())),
+        }
+    }
+
+    /// Stores columnar settings for this collection.
+    pub fn set_columnar_settings_in(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        settings: &crate::columnar::Settings,
+    ) -> Result<()> {
+        if !self.profile.is_columnar() {
+            return Err(Error::Query(format!(
+                "collection `{}` is not a columnar collection",
+                self.name
+            )));
+        }
+        settings.validate()?;
+        let key = format!("{}{}", crate::columnar::SETTINGS_META_PREFIX, self.name);
+        let bytes = serde_json::to_vec(settings)?;
+        self.meta.put(&mut *wtxn, key.as_bytes(), &bytes)?;
+        Ok(())
+    }
+
+    /// Compression and size statistics for a columnar collection.
+    pub fn columnar_stats(&self) -> Result<Option<crate::columnar::Stats>> {
+        if !self.profile.is_columnar() {
+            return Ok(None);
+        }
+        let rtxn = self.read_txn()?;
+        let stats = crate::columnar::stats(&rtxn, self.env, &self.name)?;
+        rtxn.commit()?;
+        Ok(Some(stats))
     }
 
     /// Compression and size statistics for a time-series collection.
@@ -846,8 +893,8 @@ impl<'e> Collection<'e> {
         let range = (as_bound(&plan.bounds.0), as_bound(&plan.bounds.1));
         let mut ids = HashSet::new();
         for item in plan.db.range(rtxn, &range)? {
-            let (_key, value) = item?;
-            if let Some((id, _)) = index::decode_index_value(value) {
+            let (key, value) = item?;
+            if let Some((id, _)) = index::decode_index_entry(key, value) {
                 ids.insert(id);
             }
         }
@@ -931,6 +978,42 @@ impl<'e> Collection<'e> {
                 data_bytes,
                 index_bytes,
                 indexes,
+                id_bytes: 0,
+                logical_bytes: data_bytes,
+            });
+        }
+        if self.profile.is_columnar() {
+            let stats = crate::columnar::stats(txn, self.env, &self.name)?;
+            let db_name = format!("{}{}", crate::columnar::DB_PREFIX, self.name);
+            let data_bytes = self
+                .env
+                .open_database::<Bytes, Bytes>(txn, Some(&db_name))?
+                .map(|db| db.stat(txn).map(|stat| stat_bytes(&stat)))
+                .transpose()?
+                .unwrap_or(0);
+            let mut index_bytes = 0u64;
+            let mut indexes = 0u64;
+            for def in self.index_defs(txn)? {
+                let resource = index::db_name(&self.name, &def.name());
+                if let Some(bytes) = self.resource_db_bytes(txn, &resource, &resource)? {
+                    index_bytes = index_bytes.saturating_add(bytes);
+                    indexes += 1;
+                }
+            }
+            for def in self.vector_defs(txn)? {
+                let resource = vector::db_name(&self.name, &def.field);
+                if let Some(bytes) = self.resource_db_bytes(txn, &resource, &resource)? {
+                    index_bytes = index_bytes.saturating_add(bytes);
+                    indexes += 1;
+                }
+            }
+            return Ok(CollectionStorageStats {
+                records: stats.rows,
+                data_bytes,
+                index_bytes,
+                indexes,
+                id_bytes: stats.id_bytes,
+                logical_bytes: stats.data_bytes.saturating_add(stats.id_bytes),
             });
         }
         let data = self.db.stat(txn)?;
@@ -957,6 +1040,8 @@ impl<'e> Collection<'e> {
             data_bytes: stat_bytes(&data),
             index_bytes,
             indexes,
+            id_bytes: 0,
+            logical_bytes: stat_bytes(&data),
         })
     }
 
@@ -1100,15 +1185,34 @@ impl<'e> Collection<'e> {
         // must still be backfilled when the collection switches to date-field
         // semantics.
         let mut docs: Vec<Value> = Vec::with_capacity(limit);
-        for item in self.db.iter(wtxn)? {
-            let (_key, bytes) = item?;
-            let doc = parse_json(bytes)?;
-            if !matches(&doc, &filter) {
-                continue;
+        if self.profile.is_columnar() {
+            let mut all = crate::columnar::all_docs(&*wtxn, self.env, &self.name)?;
+            all.sort_by(|a, b| {
+                a.get("_id")
+                    .map(id::key_from_value)
+                    .unwrap_or_default()
+                    .cmp(&b.get("_id").map(id::key_from_value).unwrap_or_default())
+            });
+            for doc in all {
+                if !matches(&doc, &filter) {
+                    continue;
+                }
+                docs.push(doc);
+                if docs.len() >= limit {
+                    break;
+                }
             }
-            docs.push(doc);
-            if docs.len() >= limit {
-                break;
+        } else {
+            for item in self.db.iter(wtxn)? {
+                let (_key, bytes) = item?;
+                let doc = parse_json(bytes)?;
+                if !matches(&doc, &filter) {
+                    continue;
+                }
+                docs.push(doc);
+                if docs.len() >= limit {
+                    break;
+                }
             }
         }
         let mut updated = 0u64;
@@ -1287,7 +1391,50 @@ impl<'e> Collection<'e> {
             let settings = self.timeseries_settings_in(txn)?.unwrap_or_default();
             return crate::timeseries::find_by_id(txn, self.env, &self.name, &settings, id);
         }
+        if self.profile.is_columnar() {
+            return crate::columnar::find_by_id(txn, self.env, &self.name, id);
+        }
         self.db.get(txn, id.as_bytes())?.map(parse_json).transpose()
+    }
+
+    /// Streams documents for index backfill. Columnar buckets are decoded one
+    /// at a time instead of materializing the whole collection.
+    fn for_each_backfill_doc<F>(&self, txn: &RoTxn<'_>, mut emit: F) -> Result<()>
+    where
+        F: FnMut(&str, &Value) -> Result<()>,
+    {
+        if self.profile.is_timeseries() {
+            let settings = self.timeseries_settings_in(txn)?.unwrap_or_default();
+            for (id, doc) in crate::timeseries::all_docs(txn, self.env, &self.name, &settings)? {
+                emit(&id, &doc)?;
+            }
+            return Ok(());
+        }
+        if self.profile.is_columnar() {
+            let mut error = None;
+            let result = crate::columnar::for_each(txn, self.env, &self.name, |doc| {
+                let id = doc
+                    .get("_id")
+                    .and_then(id::key_from_value)
+                    .ok_or(Error::InvalidId)?;
+                if let Err(err) = emit(&id, &doc) {
+                    error = Some(err);
+                    return Err(Error::Query("backfill stopped".into()));
+                }
+                Ok(())
+            });
+            if let Some(err) = error {
+                return Err(err);
+            }
+            return result;
+        }
+        for item in self.db.iter(txn)? {
+            let (id, bytes) = item?;
+            let id = std::str::from_utf8(id)
+                .map_err(|e| Error::Query(format!("invalid document id: {e}")))?;
+            emit(id, &parse_json(bytes)?)?;
+        }
+        Ok(())
     }
 
     /// Every document, used to backfill text/fuzzy/vector indexes.
@@ -1295,6 +1442,17 @@ impl<'e> Collection<'e> {
         if self.profile.is_timeseries() {
             let settings = self.timeseries_settings_in(txn)?.unwrap_or_default();
             return crate::timeseries::all_docs(txn, self.env, &self.name, &settings);
+        }
+        if self.profile.is_columnar() {
+            let mut out = Vec::new();
+            for doc in crate::columnar::all_docs(txn, self.env, &self.name)? {
+                let id = doc
+                    .get("_id")
+                    .and_then(id::key_from_value)
+                    .ok_or(Error::InvalidId)?;
+                out.push((id, doc));
+            }
+            return Ok(out);
         }
         let mut out = Vec::new();
         for item in self.db.iter(txn)? {
@@ -1409,6 +1567,10 @@ impl<'e> Collection<'e> {
             self.backfill_timeseries_indexes_txn(wtxn, &mut defs)?;
             return Ok(());
         }
+        if self.profile.is_columnar() {
+            self.backfill_columnar_indexes_txn(wtxn, &mut defs)?;
+            return Ok(());
+        }
         let total_docs = self.db.stat(wtxn)?.entries as u64;
         let index_dbs: Vec<_> = defs
             .iter()
@@ -1432,7 +1594,11 @@ impl<'e> Collection<'e> {
                     if keys.keys.is_empty() {
                         continue;
                     }
-                    let value = index::encode_index_value(def, &doc, &id);
+                    let value = if self.compact_index_ids(def) {
+                        Vec::new()
+                    } else {
+                        index::encode_index_value(def, &doc, &id)
+                    };
                     out.push((slot, keys, value, id.clone()));
                 }
                 Ok(out)
@@ -1451,9 +1617,9 @@ impl<'e> Collection<'e> {
                             let range = index::exact_prefix(&vb);
                             let bounds = (as_bound(&range.0), as_bound(&range.1));
                             for item in index_dbs[slot].range(&*wtxn, &bounds)? {
-                                let (_existing_key, existing_value) = item?;
+                                let (existing_key, existing_value) = item?;
                                 if let Some((existing_id, _)) =
-                                    index::decode_index_value(existing_value)
+                                    index::decode_index_entry(existing_key, existing_value)
                                 {
                                     if existing_id != id {
                                         return Err(Error::DuplicateKey(id));
@@ -1462,7 +1628,11 @@ impl<'e> Collection<'e> {
                             }
                         }
                         let mut key = vb;
-                        key.extend_from_slice(id.as_bytes());
+                        index::append_index_id(
+                            &mut key,
+                            &id,
+                            self.compact_index_ids(&defs_ref[slot].1),
+                        );
                         index_dbs[slot].put(&mut *wtxn, key.as_slice(), value.as_slice())?;
                     }
                 }
@@ -1478,6 +1648,79 @@ impl<'e> Collection<'e> {
             }
             def.multikey_all_docs = docs_per_index[slot] == total_docs;
             let key = index::def_key(&self.name, &def.name());
+            self.meta.put(
+                &mut *wtxn,
+                key.as_bytes(),
+                serde_json::to_vec(def)?.as_slice(),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Backfills secondary indexes from decoded columnar documents.
+    fn backfill_columnar_indexes_txn(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        defs: &mut [(String, IndexDef)],
+    ) -> Result<()> {
+        let total = crate::columnar::stats(&*wtxn, self.env, &self.name)?.rows;
+        let target = format!("{} indexes", defs.len());
+        let progress = crate::progress::begin(&self.name, &target, "index", total);
+        let index_dbs: Vec<_> = defs
+            .iter()
+            .map(|(_key, def)| self.index_db_in(wtxn, def))
+            .collect::<Result<_>>()?;
+        for db in &index_dbs {
+            db.clear(&mut *wtxn)?;
+        }
+        let mut docs_per_index = vec![0u64; defs.len()];
+        let mut multikey_fields: Vec<Vec<String>> = vec![Vec::new(); defs.len()];
+        crate::columnar::for_each_bucket(wtxn, self.env, &self.name, |wtxn, batch| {
+            let processed = batch.len() as u64;
+            for (id, doc) in batch {
+                for (slot, ((_key, def), db)) in defs.iter().zip(index_dbs.iter()).enumerate() {
+                    let keys = index::encode_index_keys(def, &doc)?;
+                    if keys.keys.is_empty() {
+                        continue;
+                    }
+                    docs_per_index[slot] = docs_per_index[slot].saturating_add(1);
+                    for field in &keys.multikey_fields {
+                        if !multikey_fields[slot].contains(field) {
+                            multikey_fields[slot].push(field.clone());
+                        }
+                    }
+                    let value = self.index_value_for(def, &doc, &id);
+                    for vb in keys.keys {
+                        if def.unique {
+                            let range = index::exact_prefix(&vb);
+                            let bounds = (as_bound(&range.0), as_bound(&range.1));
+                            for item in db.range(&*wtxn, &bounds)? {
+                                let (existing_key, existing_value) = item?;
+                                if let Some((existing_id, _)) =
+                                    index::decode_index_entry(existing_key, existing_value)
+                                {
+                                    if existing_id != id {
+                                        return Err(Error::DuplicateKey(id.clone()));
+                                    }
+                                }
+                            }
+                        }
+                        let mut key = vb;
+                        index::append_index_id(&mut key, &id, self.compact_index_ids(def));
+                        db.put(&mut *wtxn, key.as_slice(), value.as_slice())?;
+                    }
+                }
+            }
+            progress.advance(processed);
+            Ok(())
+        })?;
+        for (slot, (key, def)) in defs.iter_mut().enumerate() {
+            for field in &multikey_fields[slot] {
+                if !def.multikey_fields.contains(field) {
+                    def.multikey_fields.push(field.clone());
+                }
+            }
+            def.multikey_all_docs = docs_per_index[slot] == total;
             self.meta.put(
                 &mut *wtxn,
                 key.as_bytes(),
@@ -1527,12 +1770,12 @@ impl<'e> Collection<'e> {
                             }
                         }
                         if def.geo {
-                            let value = index::encode_index_value(def, doc, id);
+                            let value = self.index_value_for(def, doc, id);
                             for vb in keys.keys {
                                 if def.unique {
                                     for item in db.prefix_iter(&*wtxn, vb.as_slice())? {
-                                        let (_key, existing) = item?;
-                                        if index::decode_index_value(existing)
+                                        let (existing_key, existing) = item?;
+                                        if index::decode_index_entry(existing_key, existing)
                                             .is_some_and(|(existing_id, _)| existing_id != *id)
                                         {
                                             return Err(Error::DuplicateKey(id.clone()));
@@ -1540,7 +1783,7 @@ impl<'e> Collection<'e> {
                                     }
                                 }
                                 let mut key = vb;
-                                key.extend_from_slice(id.as_bytes());
+                                index::append_index_id(&mut key, id, self.compact_index_ids(def));
                                 db.put(&mut *wtxn, key.as_slice(), value.as_slice())?;
                             }
                             continue;
@@ -1731,6 +1974,10 @@ impl<'e> Collection<'e> {
             self.backfill_timeseries_indexes_txn(wtxn, &mut [(key, def)])?;
             return Ok(());
         }
+        if self.profile.is_columnar() {
+            self.backfill_columnar_indexes_txn(wtxn, &mut [(key, def)])?;
+            return Ok(());
+        }
 
         // Backfill incrementally: workers parse/encode, the main thread writes
         // each completed chunk into the index immediately.
@@ -1747,7 +1994,11 @@ impl<'e> Collection<'e> {
                 if keys.keys.is_empty() {
                     return Ok(Vec::new());
                 }
-                let value = index::encode_index_value(def_ref, &doc, &id);
+                let value = if self.compact_index_ids(def_ref) {
+                    Vec::new()
+                } else {
+                    index::encode_index_value(def_ref, &doc, &id)
+                };
                 Ok(vec![(keys, value, id)])
             },
             |wtxn, entries| {
@@ -1763,9 +2014,9 @@ impl<'e> Collection<'e> {
                             let range = index::exact_prefix(&vb);
                             let bounds = (as_bound(&range.0), as_bound(&range.1));
                             for item in idx_db.range(&*wtxn, &bounds)? {
-                                let (_existing_key, existing_value) = item?;
+                                let (existing_key, existing_value) = item?;
                                 if let Some((existing_id, _)) =
-                                    index::decode_index_value(existing_value)
+                                    index::decode_index_entry(existing_key, existing_value)
                                 {
                                     if existing_id != id {
                                         return Err(Error::DuplicateKey(id));
@@ -1774,7 +2025,7 @@ impl<'e> Collection<'e> {
                             }
                         }
                         let mut key = vb;
-                        key.extend_from_slice(id.as_bytes());
+                        index::append_index_id(&mut key, &id, self.compact_index_ids(def_ref));
                         idx_db.put(&mut *wtxn, key.as_slice(), value.as_slice())?;
                     }
                 }
@@ -1869,8 +2120,8 @@ impl<'e> Collection<'e> {
             }
             for vb in keys.keys {
                 for item in db.prefix_iter(txn, vb.as_slice())? {
-                    let (_key, existing) = item?;
-                    if index::decode_index_value(existing)
+                    let (key, existing) = item?;
+                    if index::decode_index_entry(key, existing)
                         .is_some_and(|(existing_id, _)| existing_id != id)
                     {
                         return Err(Error::DuplicateKey(id.to_string()));
@@ -1910,8 +2161,8 @@ impl<'e> Collection<'e> {
                         continue;
                     }
                     for item in db.prefix_iter(txn, vb.as_slice())? {
-                        let (_key, existing) = item?;
-                        if index::decode_index_value(existing)
+                        let (key, existing) = item?;
+                        if index::decode_index_entry(key, existing)
                             .is_some_and(|(existing_id, _)| existing_id != id)
                         {
                             return Err(Error::DuplicateKey(id));
@@ -1959,8 +2210,8 @@ impl<'e> Collection<'e> {
                         continue;
                     }
                     for item in db.prefix_iter(txn, vb.as_slice())? {
-                        let (_key, existing) = item?;
-                        if let Some((existing_id, _)) = index::decode_index_value(existing) {
+                        let (key, existing) = item?;
+                        if let Some((existing_id, _)) = index::decode_index_entry(key, existing) {
                             if existing_id != *id && !updated.contains(&existing_id) {
                                 return Err(Error::DuplicateKey(id.clone()));
                             }
@@ -2049,6 +2300,18 @@ impl<'e> Collection<'e> {
 
     /// Updates index entries for an `old -> new` change (insert: `old=None`,
     /// delete: `new=None`).
+    fn compact_index_ids(&self, def: &IndexDef) -> bool {
+        self.profile.is_columnar() && def.include.is_empty()
+    }
+
+    fn index_value_for(&self, def: &IndexDef, doc: &Value, id: &str) -> Vec<u8> {
+        if self.compact_index_ids(def) {
+            Vec::new()
+        } else {
+            index::encode_index_value(def, doc, id)
+        }
+    }
+
     fn apply_index_entries(
         &self,
         wtxn: &mut RwTxn<'_>,
@@ -2078,8 +2341,8 @@ impl<'e> Collection<'e> {
                 });
             // With `include`, copied fields must also be compared because they can
             // change without changing the index key.
-            let old_value = old.map(|d| index::encode_index_value(&def, d, id));
-            let new_value = new.map(|d| index::encode_index_value(&def, d, id));
+            let old_value = old.map(|d| self.index_value_for(&def, d, id));
+            let new_value = new.map(|d| self.index_value_for(&def, d, id));
             let mut def_changed = false;
             for field in &new_keys.multikey_fields {
                 if !def.multikey_fields.contains(field) {
@@ -2105,14 +2368,15 @@ impl<'e> Collection<'e> {
                 continue;
             }
             let idx_db = self.index_db_in(wtxn, &def)?;
+            let compact = self.compact_index_ids(&def);
             for vb in old_keys.keys {
                 let mut key = vb;
-                key.extend_from_slice(id.as_bytes());
+                index::append_index_id(&mut key, id, compact);
                 idx_db.delete(&mut *wtxn, key.as_slice())?;
             }
             for vb in new_keys.keys {
                 let mut key = vb;
-                key.extend_from_slice(id.as_bytes());
+                index::append_index_id(&mut key, id, compact);
                 let value = new_value.as_deref().expect("nowy dokument");
                 idx_db.put(&mut *wtxn, key.as_slice(), value)?;
             }
@@ -2287,8 +2551,8 @@ impl<'e> Collection<'e> {
         for (lower, upper) in &plan.ranges {
             let range = (as_bound(lower), as_bound(upper));
             for item in plan.db.range(rtxn, &range)? {
-                let (_key, value) = item?;
-                if let Some((id, _)) = index::decode_index_value(value) {
+                let (key, value) = item?;
+                if let Some((id, _)) = index::decode_index_entry(key, value) {
                     if seen.insert(id.clone()) {
                         ids.push(id);
                     }
@@ -2442,8 +2706,8 @@ impl<'e> Collection<'e> {
         let mut seen = HashSet::new();
         for item in iter {
             check_find_deadline(deadline)?;
-            let (_key, value) = item?;
-            let Some((id, inc)) = index::decode_index_value(value) else {
+            let (key, value) = item?;
+            let Some((id, inc)) = index::decode_index_entry(key, value) else {
                 continue;
             };
             if multikey && !seen.insert(id.clone()) {
@@ -2664,8 +2928,8 @@ impl<'e> Collection<'e> {
             let range = (as_bound(&lower), as_bound(&upper));
             let mut ids = HashSet::new();
             for item in db.range(rtxn, &range)? {
-                let (_key, value) = item?;
-                if let Some((id, _)) = index::decode_index_value(value) {
+                let (key, value) = item?;
+                if let Some((id, _)) = index::decode_index_entry(key, value) {
                     ids.insert(id);
                 }
             }
@@ -2737,8 +3001,8 @@ impl<'e> Collection<'e> {
         // a second full-size `HashSet<String>` when deduplication is unnecessary.
         let mut seen = plan.def.is_multikey().then(HashSet::new);
         for item in plan.db.range(rtxn, &range)? {
-            let (_key, value) = item?;
-            if let Some((id, _)) = index::decode_index_value(value) {
+            let (key, value) = item?;
+            if let Some((id, _)) = index::decode_index_entry(key, value) {
                 if let Some(seen) = seen.as_mut() {
                     if !seen.insert(id.clone()) {
                         continue;
@@ -2771,8 +3035,8 @@ impl<'e> Collection<'e> {
         let range = (as_bound(lower), as_bound(upper));
         let mut ids = HashSet::new();
         for item in plan.db.range(rtxn, &range)? {
-            let (_key, value) = item?;
-            if let Some((id, _)) = index::decode_index_value(value) {
+            let (key, value) = item?;
+            if let Some((id, _)) = index::decode_index_entry(key, value) {
                 ids.insert(id);
             }
         }
@@ -2893,6 +3157,30 @@ impl<'e> Collection<'e> {
 
         let db = self.vector_db_in(wtxn, field)?;
         db.clear(&mut *wtxn)?;
+        if self.profile.is_columnar() {
+            crate::columnar::for_each_bucket(wtxn, self.env, &self.name, |wtxn, batch| {
+                for (id, doc) in batch {
+                    let Some(vector) =
+                        index::field_value(&doc, field).and_then(|v| vector::parse_vector(v, dims))
+                    else {
+                        continue;
+                    };
+                    db.put(
+                        &mut *wtxn,
+                        id.as_bytes(),
+                        vector::encode_vector(&vector).as_slice(),
+                    )?;
+                }
+                Ok(())
+            })?;
+            let def = VectorDef::new(field, dims, metric);
+            self.meta.put(
+                &mut *wtxn,
+                def_key.as_bytes(),
+                serde_json::to_vec(&def)?.as_slice(),
+            )?;
+            return Ok(());
+        }
         if self.profile.is_timeseries() {
             for (id, doc) in self.documents_for_backfill(&*wtxn)? {
                 let Some(vector) =
@@ -3663,14 +3951,12 @@ impl<'e> Collection<'e> {
         let rel = format!("{dir}/full-{stamp}.seg");
         let mut builder = SegmentBuilder::new(root.join(&rel))?;
         let field = &def.fields[0].path;
-        let docs = self.documents_for_backfill(&*wtxn)?;
-        eprintln!("text backfill docs: {}", docs.len());
-        for (id, doc) in docs {
-            if let Some(text) = index::field_value(&doc, field).and_then(search::field_text) {
-                eprintln!("text add {id}: {text}");
-                builder.add_document(&id, &text)?;
+        self.for_each_backfill_doc(&*wtxn, |id, doc| {
+            if let Some(text) = index::field_value(doc, field).and_then(search::field_text) {
+                builder.add_document(id, &text)?;
             }
-        }
+            Ok(())
+        })?;
         builder.finish()?;
         let prefix = self.segment_delta_prefix(&def.name);
         let keys: Vec<Vec<u8>> = self
@@ -3735,11 +4021,12 @@ impl<'e> Collection<'e> {
         let values_rel = format!("{dir}/full-{stamp}.values");
         let mut builder = FuzzySegmentBuilder::new(root.join(&rel))?;
         let field = &def.fields[0].path;
-        for (id, doc) in self.documents_for_backfill(&*wtxn)? {
-            if let Some(text) = index::field_value(&doc, field).and_then(search::field_text) {
-                builder.add_document(&id, &text)?;
+        self.for_each_backfill_doc(&*wtxn, |id, doc| {
+            if let Some(text) = index::field_value(doc, field).and_then(search::field_text) {
+                builder.add_document(id, &text)?;
             }
-        }
+            Ok(())
+        })?;
         builder.finish(root.join(&values_rel))?;
         let prefix = self.fuzzy_segment_delta_prefix(&def.name);
         let keys: Vec<Vec<u8>> = self
@@ -3945,11 +4232,12 @@ impl<'e> Collection<'e> {
         let values_path = root.join(&values_rel);
         let mut builder = FuzzySegmentBuilder::new(&path)?;
         let field = &def.fields[0].path;
-        for (id, doc) in self.documents_for_backfill(&*wtxn)? {
-            if let Some(text) = index::field_value(&doc, field).and_then(search::field_text) {
-                builder.add_document(&id, &text)?;
+        self.for_each_backfill_doc(&*wtxn, |id, doc| {
+            if let Some(text) = index::field_value(doc, field).and_then(search::field_text) {
+                builder.add_document(id, &text)?;
             }
-        }
+            Ok(())
+        })?;
         builder.finish(&values_path)?;
         let manifest = FuzzySegmentManifest {
             segments: vec![rel],
@@ -4272,11 +4560,12 @@ impl<'e> Collection<'e> {
         let path = root.join(&rel);
         let mut builder = SegmentBuilder::new(&path)?;
         let field = &def.fields[0].path;
-        for (id, doc) in self.documents_for_backfill(&*wtxn)? {
-            if let Some(text) = index::field_value(&doc, field).and_then(search::field_text) {
-                builder.add_document(&id, &text)?;
+        self.for_each_backfill_doc(&*wtxn, |id, doc| {
+            if let Some(text) = index::field_value(doc, field).and_then(search::field_text) {
+                builder.add_document(id, &text)?;
             }
-        }
+            Ok(())
+        })?;
         builder.finish()?;
         let manifest = SegmentManifest {
             segments: vec![rel],
@@ -5324,7 +5613,110 @@ impl<'e> Collection<'e> {
 
     /// Inserts many documents in one writer transaction. Time-series
     /// collections resolve each open bucket once and flush pointers at the end.
+    fn normalize_columnar_batch(
+        docs: &[Value],
+        default_seconds: Option<u64>,
+        ttl_field: Option<(&str, u64)>,
+    ) -> Result<Vec<(Value, Option<u64>)>> {
+        let normalize = |doc: &Value| -> Result<(Value, Option<u64>)> {
+            let mut doc = doc.clone();
+            let ttl_at = ttl::take_insert_ttl_with_field(&mut doc, default_seconds, ttl_field)?;
+            date::normalize_document(&mut doc)?;
+            numeric::normalize_document(&mut doc)?;
+            bson_types::normalize_document(&mut doc)?;
+            Ok((doc, ttl_at))
+        };
+        let workers = scan_workers().min(docs.len()).max(1);
+        if workers <= 1 || docs.len() < 64 {
+            return docs.iter().map(normalize).collect();
+        }
+        let chunk_size = docs.len().div_ceil(workers);
+        let results = std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for chunk in docs.chunks(chunk_size) {
+                handles.push(scope.spawn(move || -> Result<Vec<(Value, Option<u64>)>> {
+                    chunk.iter().map(normalize).collect()
+                }));
+            }
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle.join().unwrap_or_else(|_| {
+                        Err(Error::Query("columnar normalize worker panicked".into()))
+                    })
+                })
+                .collect::<Vec<_>>()
+        });
+        let mut out = Vec::with_capacity(docs.len());
+        for result in results {
+            out.extend(result?);
+        }
+        Ok(out)
+    }
+
     pub fn insert_many_txn(&self, wtxn: &mut RwTxn<'_>, docs: &[Value]) -> Result<Vec<String>> {
+        if self.profile.is_columnar() {
+            let settings = self.columnar_settings_in(&*wtxn)?.unwrap_or_default();
+            let ttl_field = self.ttl_field.as_deref().zip(self.ttl_default_seconds);
+            let normalized =
+                Self::normalize_columnar_batch(docs, self.ttl_default_seconds, ttl_field)?;
+            let mut prepared = Vec::with_capacity(normalized.len());
+            let mut ttls = Vec::with_capacity(normalized.len());
+            for (mut doc, ttl_at) in normalized {
+                self.validate_graph_edge_txn(&*wtxn, &doc)?;
+                if doc.get("_id").is_none() {
+                    doc.as_object_mut()
+                        .ok_or_else(|| Error::Query("document must be an object".into()))?
+                        .insert(
+                            "_id".into(),
+                            Value::String(uuid::Uuid::new_v4().to_string()),
+                        );
+                }
+                prepared.push(doc);
+                ttls.push(ttl_at);
+            }
+            // Validate the whole batch before writing any row. The daemon can
+            // commit the shared transaction after this job reports an error,
+            // so insert_batch must not be the first place a duplicate shows up.
+            let mut seen_ids = HashSet::with_capacity(prepared.len());
+            for doc in &prepared {
+                let id = doc
+                    .get("_id")
+                    .and_then(id::key_from_value)
+                    .ok_or(Error::InvalidId)?;
+                if !seen_ids.insert(id.clone()) {
+                    return Err(Error::DuplicateKey(id));
+                }
+            }
+            self.validate_unique_batch(&*wtxn, &prepared)?;
+            let inserted =
+                crate::columnar::insert_batch(wtxn, self.env, &self.name, &settings, prepared)?;
+            let index_defs = self.index_defs(&*wtxn)?;
+            let has_unique = index_defs.iter().any(|def| def.unique);
+            let has_indexes = !index_defs.is_empty()
+                || !self.text_defs(&*wtxn)?.is_empty()
+                || !self.fuzzy_defs(&*wtxn)?.is_empty()
+                || !self.vector_defs(&*wtxn)?.is_empty();
+            let has_graph = self.edge_graph_def_in(&*wtxn)?.is_some();
+            let mut ids = Vec::with_capacity(inserted.len());
+            for ((id, stored), ttl_at) in inserted.into_iter().zip(ttls) {
+                if has_unique {
+                    self.validate_unique(&*wtxn, &stored, &id)?;
+                }
+                if has_indexes {
+                    self.apply_all_index_entries(wtxn, None, Some(&stored), &id)?;
+                }
+                if has_graph {
+                    self.apply_graph_entries(wtxn, None, Some(&stored))?;
+                }
+                if ttl_at.is_some() {
+                    self.set_ttl(wtxn, &id, ttl_at)?;
+                }
+                self.record_history(wtxn, &id, "insert", Some(stored))?;
+                ids.push(id);
+            }
+            return Ok(ids);
+        }
         if self.profile.is_timeseries() {
             let settings = self.timeseries_settings_in(&*wtxn)?.unwrap_or_default();
             let mut normalized = Vec::with_capacity(docs.len());
@@ -5359,6 +5751,47 @@ impl<'e> Collection<'e> {
 
     /// Inserts a document in the given transaction. Assigns `_id` (UUID v4) if missing.
     pub fn insert_one_txn(&self, wtxn: &mut RwTxn<'_>, mut doc: Value) -> Result<String> {
+        if self.profile.is_columnar() {
+            let settings = self.columnar_settings_in(&*wtxn)?.unwrap_or_default();
+            let ttl_at = ttl::take_insert_ttl_with_field(
+                &mut doc,
+                self.ttl_default_seconds,
+                self.ttl_field_pair(),
+            )?;
+            date::normalize_document(&mut doc)?;
+            numeric::normalize_document(&mut doc)?;
+            bson_types::normalize_document(&mut doc)?;
+            self.validate_graph_edge_txn(&*wtxn, &doc)?;
+            let id = match doc.get("_id") {
+                Some(value) => id::key_from_value(value).ok_or(Error::InvalidId)?,
+                None => {
+                    let id = uuid::Uuid::new_v4().to_string();
+                    doc.as_object_mut()
+                        .ok_or_else(|| Error::Query("document must be an object".into()))?
+                        .insert("_id".into(), Value::String(id.clone()));
+                    id
+                }
+            };
+            // `columnar::insert` checks duplicate `_id`s before writing. Validate
+            // uniques before the row is written: the daemon may
+            // commit the shared transaction even when this job reports an
+            // error, so a late failure must not leave a partial document.
+            self.validate_unique(&*wtxn, &doc, &id)?;
+            let stored = Value::Object(
+                doc.as_object()
+                    .cloned()
+                    .ok_or_else(|| Error::Query("document must be an object".into()))?,
+            );
+            let id = crate::columnar::insert(wtxn, self.env, &self.name, &settings, doc)?;
+            self.apply_all_index_entries(wtxn, None, Some(&stored), &id)?;
+            crate::columnar::failpoint("insert_after_index")?;
+            self.apply_graph_entries(wtxn, None, Some(&stored))?;
+            self.set_ttl(wtxn, &id, ttl_at)?;
+            crate::columnar::failpoint("insert_after_ttl")?;
+            self.record_history(wtxn, &id, "insert", Some(stored))?;
+            crate::columnar::failpoint("insert_after_history")?;
+            return Ok(id);
+        }
         if self.profile.is_timeseries() {
             let settings = self.timeseries_settings_in(&*wtxn)?.unwrap_or_default();
             let mut check = doc.clone();
@@ -5444,6 +5877,11 @@ impl<'e> Collection<'e> {
     /// upserted key back into the original BSON `_id` value.
     pub fn find_by_key(&self, key: &str) -> Result<Option<Value>> {
         let rtxn = self.read_txn()?;
+        if self.profile.is_columnar() {
+            let out = crate::columnar::find_by_id(&rtxn, self.env, &self.name, key)?;
+            rtxn.commit()?;
+            return Ok(out);
+        }
         if self.profile.is_timeseries() {
             let settings = self.timeseries_settings_in(&rtxn)?.unwrap_or_default();
             let out = crate::timeseries::find_by_id(&rtxn, self.env, &self.name, &settings, key)?;
@@ -5469,6 +5907,90 @@ impl<'e> Collection<'e> {
         after: Option<&Value>,
         ttl_at: Option<u64>,
     ) -> Result<()> {
+        if self.profile.is_columnar() {
+            let settings = self.columnar_settings_in(&*wtxn)?.unwrap_or_default();
+            match op {
+                "insert" | "update" => {
+                    let after = after.ok_or_else(|| {
+                        Error::Query("replication change is missing `after`".into())
+                    })?;
+                    if after.get("_id").and_then(id::key_from_value).as_deref() != Some(id) {
+                        return Err(Error::Query(
+                            "replication document `_id` does not match change id".into(),
+                        ));
+                    }
+                    let before = crate::columnar::find_by_id(&*wtxn, self.env, &self.name, id)?;
+                    match op {
+                        "insert" => {
+                            if before.is_some() {
+                                return Err(Error::DuplicateKey(id.to_string()));
+                            }
+                            let inserted = crate::columnar::insert(
+                                wtxn,
+                                self.env,
+                                &self.name,
+                                &settings,
+                                after.clone(),
+                            )?;
+                            if inserted != id {
+                                return Err(Error::Query(
+                                    "replicated insert returned a different id".into(),
+                                ));
+                            }
+                        }
+                        "update" => {
+                            if before.is_none() {
+                                return Err(Error::Query(format!(
+                                    "replication update target `{id}` does not exist"
+                                )));
+                            }
+                            let object = after.as_object().ok_or_else(|| {
+                                Error::Query("replicated document must be an object".into())
+                            })?;
+                            crate::columnar::replace_by_id(wtxn, self.env, &self.name, id, object)?;
+                        }
+                        _ => unreachable!(),
+                    }
+                    let after = crate::columnar::find_by_id(&*wtxn, self.env, &self.name, id)?;
+                    if let Some(doc) = &after {
+                        self.validate_unique(&*wtxn, doc, id)?;
+                    }
+                    self.apply_all_index_entries(wtxn, before.as_ref(), after.as_ref(), id)?;
+                    self.apply_graph_entries(wtxn, before.as_ref(), after.as_ref())?;
+                    self.set_ttl(wtxn, id, ttl_at)?;
+                    self.record_history(wtxn, id, op, after)?;
+                    return Ok(());
+                }
+                "delete" => {
+                    let before = crate::columnar::find_by_id(&*wtxn, self.env, &self.name, id)?;
+                    if let Some(doc) = &before {
+                        let id_value = doc
+                            .get("_id")
+                            .cloned()
+                            .unwrap_or_else(|| serde_json::Value::String(id.to_string()));
+                        crate::columnar::delete(
+                            wtxn,
+                            self.env,
+                            &self.name,
+                            &serde_json::json!({"_id": id_value}),
+                            false,
+                        )?;
+                        self.apply_all_index_entries(wtxn, Some(doc), None, id)?;
+                        self.apply_graph_entries(wtxn, Some(doc), None)?;
+                    }
+                    self.set_ttl(wtxn, id, None)?;
+                    if before.is_some() {
+                        self.record_history(wtxn, id, "delete", None)?;
+                    }
+                    return Ok(());
+                }
+                other => {
+                    return Err(Error::Query(format!(
+                        "unknown replication operation `{other}`"
+                    )))
+                }
+            }
+        }
         if self.profile.is_timeseries() {
             // Time-series rows do not live in `coll:<name>`; appending them to
             // the bucket store keeps replicas byte-compatible with the primary
@@ -5650,6 +6172,17 @@ impl<'e> Collection<'e> {
         array_filters: &[Value],
         default_id: Option<&Value>,
     ) -> Result<UpdateOutcome> {
+        if self.profile.is_columnar() {
+            return self.update_columnar_txn(
+                wtxn,
+                filter,
+                update,
+                multi,
+                upsert,
+                array_filters,
+                default_id,
+            );
+        }
         if self.profile.is_timeseries() {
             let settings = self.timeseries_settings_in(&*wtxn)?.unwrap_or_default();
             let direct_id = (!multi)
@@ -5841,6 +6374,13 @@ impl<'e> Collection<'e> {
         date::normalize_document(&mut new)?;
         numeric::normalize_document(&mut new)?;
         bson_types::normalize_document(&mut new)?;
+        let new_id = new
+            .get("_id")
+            .and_then(id::key_from_value)
+            .ok_or(Error::InvalidId)?;
+        if new_id != id {
+            return Err(Error::Query("update cannot change `_id`".into()));
+        }
 
         // The stream offset is reserved: updates, pipelines, and
         // find-and-modify must not rewrite or remove it, or group ordering and
@@ -5934,6 +6474,9 @@ impl<'e> Collection<'e> {
         opts: &FindAndModifyOptions<'_>,
         default_id: Option<&Value>,
     ) -> Result<FindAndModifyOutcome> {
+        if self.profile.is_columnar() {
+            return self.find_and_modify_columnar(wtxn, opts, default_id);
+        }
         if self.profile.is_timeseries() {
             return self.find_and_modify_timeseries(wtxn, opts);
         }
@@ -6010,6 +6553,225 @@ impl<'e> Collection<'e> {
                 opts.projection,
                 Some(opts.filter),
             ))
+        } else {
+            None
+        };
+        Ok(FindAndModifyOutcome {
+            value,
+            matched: 0,
+            modified: 0,
+            upserted_id: Some(id),
+            new_id: None,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn update_columnar_txn(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        filter: &Value,
+        update: &Value,
+        multi: bool,
+        upsert: bool,
+        array_filters: &[Value],
+        default_id: Option<&Value>,
+    ) -> Result<UpdateOutcome> {
+        let settings = self.columnar_settings_in(&*wtxn)?.unwrap_or_default();
+        if self.index_defs(&*wtxn)?.iter().any(|def| def.unique) {
+            let (preview, upsert) = crate::columnar::preview_update(
+                &*wtxn,
+                self.env,
+                &self.name,
+                filter,
+                update,
+                multi,
+                array_filters,
+                upsert,
+                default_id,
+            )?;
+            let updates: Vec<(String, Value)> = preview
+                .iter()
+                .map(|(id, _old, new)| (id.clone(), Value::Object(new.clone())))
+                .collect();
+            self.validate_unique_updates(&*wtxn, &updates)?;
+            if let Some(doc) = upsert {
+                let doc = Value::Object(doc);
+                let id = doc
+                    .get("_id")
+                    .and_then(id::key_from_value)
+                    .unwrap_or_default();
+                self.validate_unique(&*wtxn, &doc, &id)?;
+            }
+        }
+        let (outcome, changed) = crate::columnar::update_with_changes(
+            wtxn,
+            self.env,
+            &self.name,
+            &settings,
+            filter,
+            update,
+            multi,
+            array_filters,
+            upsert,
+            default_id,
+        )?;
+        for (id, old, new) in changed {
+            let old_ttl = self.ttl_at(&*wtxn, &id)?;
+            let old = Value::Object(old);
+            let mut new = Value::Object(new);
+            let directive = ttl::take_update_ttl_with_field(&mut new, self.ttl_field_pair())?;
+            let stripped = new
+                .as_object_mut()
+                .is_some_and(|object| object.remove("_ttl").is_some());
+            if stripped {
+                let object = new
+                    .as_object()
+                    .ok_or_else(|| Error::Query("updated document must be an object".into()))?;
+                crate::columnar::replace_by_id(wtxn, self.env, &self.name, &id, object)?;
+            }
+            let ttl_at = match directive {
+                ttl::TtlUpdate::Preserve => old_ttl,
+                ttl::TtlUpdate::Clear => None,
+                ttl::TtlUpdate::Set(at) => Some(at),
+            };
+            self.validate_unique(&*wtxn, &new, &id)?;
+            self.apply_all_index_entries(wtxn, Some(&old), Some(&new), &id)?;
+            crate::columnar::failpoint("update_after_index")?;
+            self.apply_graph_entries(wtxn, Some(&old), Some(&new))?;
+            self.set_ttl(wtxn, &id, ttl_at)?;
+            crate::columnar::failpoint("update_after_ttl")?;
+            self.record_history(wtxn, &id, "update", Some(new))?;
+            crate::columnar::failpoint("update_after_history")?;
+        }
+        if let Some(id) = outcome.upserted_id.as_deref() {
+            if let Some(mut new) = crate::columnar::find_by_id(&*wtxn, self.env, &self.name, id)? {
+                let ttl_at = ttl::take_insert_ttl_with_field(
+                    &mut new,
+                    self.ttl_default_seconds,
+                    self.ttl_field_pair(),
+                )?;
+                if let Some(object) = new.as_object() {
+                    crate::columnar::replace_by_id(wtxn, self.env, &self.name, id, object)?;
+                }
+                self.set_ttl(wtxn, id, ttl_at)?;
+                self.validate_unique(&*wtxn, &new, id)?;
+                self.apply_all_index_entries(wtxn, None, Some(&new), id)?;
+                self.apply_graph_entries(wtxn, None, Some(&new))?;
+                self.record_history(wtxn, id, "insert", Some(new))?;
+            }
+        }
+        Ok(outcome)
+    }
+
+    fn delete_columnar_txn(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        filter: &Value,
+        multi: bool,
+    ) -> Result<usize> {
+        let removed = crate::columnar::delete_with_docs(wtxn, self.env, &self.name, filter, multi)?;
+        for (id, old) in &removed {
+            let old = Value::Object(old.clone());
+            self.apply_all_index_entries(wtxn, Some(&old), None, id)?;
+            crate::columnar::failpoint("delete_after_index")?;
+            self.apply_graph_entries(wtxn, Some(&old), None)?;
+            self.set_ttl(wtxn, id, None)?;
+            crate::columnar::failpoint("delete_after_ttl")?;
+            self.record_history(wtxn, id, "delete", None)?;
+            crate::columnar::failpoint("delete_after_history")?;
+        }
+        Ok(removed.len())
+    }
+
+    fn find_and_modify_columnar(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        opts: &FindAndModifyOptions<'_>,
+        default_id: Option<&Value>,
+    ) -> Result<FindAndModifyOutcome> {
+        validate_find_and_modify(opts)?;
+        let query = FindQuery {
+            filter: opts.filter.clone(),
+            projection: None,
+            sort: if opts.sort.is_empty() {
+                vec![("_id".to_string(), 1)]
+            } else {
+                opts.sort.to_vec()
+            },
+            skip: 0,
+            limit: Some(1),
+            comment: None,
+            max_time_ms: None,
+            hint: None,
+        };
+        let selected = if let Some(id) = crate::columnar::exact_id_filter(opts.filter) {
+            crate::columnar::find_by_id(&*wtxn, self.env, &self.name, &id)?
+        } else {
+            crate::columnar::find(&*wtxn, self.env, &self.name, &query)?
+                .into_iter()
+                .next()
+        };
+        if opts.remove {
+            let Some(old) = selected else {
+                return Ok(empty_find_and_modify());
+            };
+            let id_value = old.get("_id").cloned().ok_or(Error::InvalidId)?;
+            let removed = self.delete_txn(wtxn, &serde_json::json!({"_id": id_value}), false)?;
+            return Ok(FindAndModifyOutcome {
+                value: Some(apply_projection(old, opts.projection, Some(opts.filter))),
+                matched: removed,
+                modified: removed,
+                upserted_id: None,
+                new_id: None,
+            });
+        }
+        let update = opts
+            .update
+            .ok_or_else(|| Error::Query("find_and_modify requires `update` or `remove`".into()))?;
+        if let Some(old) = selected {
+            let id = id::key_from_document(&old).ok_or(Error::InvalidId)?;
+            let id_value = old.get("_id").cloned().ok_or(Error::InvalidId)?;
+            let outcome = self.update_opts_txn_filtered_with_id(
+                wtxn,
+                &serde_json::json!({"_id": id_value}),
+                update,
+                false,
+                false,
+                opts.array_filters,
+                None,
+            )?;
+            let new = crate::columnar::find_by_id(&*wtxn, self.env, &self.name, &id)?
+                .ok_or_else(|| Error::Query("updated document disappeared".into()))?;
+            return Ok(FindAndModifyOutcome {
+                value: Some(apply_projection(
+                    if opts.new { new } else { old },
+                    opts.projection,
+                    Some(opts.filter),
+                )),
+                matched: outcome.matched,
+                modified: outcome.modified,
+                upserted_id: None,
+                new_id: None,
+            });
+        }
+        if !opts.upsert {
+            return Ok(empty_find_and_modify());
+        }
+        let mut doc = seed_from_filter(opts.filter);
+        let filter_id = doc.get("_id").cloned();
+        apply_upsert_with_options(&mut doc, update, opts.filter, opts.array_filters)?;
+        if let Some(id) = filter_id {
+            doc["_id"] = id;
+        }
+        if doc.get("_id").is_none() {
+            if let Some(id) = default_id {
+                doc["_id"] = id.clone();
+            }
+        }
+        let id = self.insert_one_txn(wtxn, doc)?;
+        let value = if opts.new {
+            crate::columnar::find_by_id(&*wtxn, self.env, &self.name, &id)?
+                .map(|doc| apply_projection(doc, opts.projection, Some(opts.filter)))
         } else {
             None
         };
@@ -6269,6 +7031,9 @@ impl<'e> Collection<'e> {
     }
 
     pub fn delete_txn(&self, wtxn: &mut RwTxn<'_>, filter: &Value, multi: bool) -> Result<usize> {
+        if self.profile.is_columnar() {
+            return self.delete_columnar_txn(wtxn, filter, multi);
+        }
         if self.profile.is_timeseries() {
             let settings = self.timeseries_settings_in(&*wtxn)?.unwrap_or_default();
             // A pure `_id` equality can go straight to the locator encoded in
@@ -6633,7 +7398,7 @@ impl<'e> Collection<'e> {
         }
         edge.clear_graph_adjacency_txn(wtxn, &def)?;
         edge.rebuild_graph_adjacency_txn(wtxn, &def)?;
-        Ok(edge.db.iter(&*wtxn)?.filter_map(|item| item.ok()).count())
+        Ok(edge.documents_for_backfill(&*wtxn)?.len())
     }
 
     /// Starts an online adjacency rebuild. Readers keep using the active
@@ -6801,15 +7566,33 @@ impl<'e> Collection<'e> {
         let incoming =
             self.graph_adjacency_db_in(&mut *wtxn, GraphDirection::In, state.target_generation)?;
         let mut docs = Vec::with_capacity(limit);
-        let range = match state.after.as_deref() {
-            Some(after) => (Bound::Excluded(after.as_bytes()), Bound::Unbounded),
-            None => (Bound::Unbounded, Bound::Unbounded),
-        };
-        for item in self.db.range(&*wtxn, &range)? {
-            let (id, raw) = item?;
-            docs.push((String::from_utf8_lossy(id).into_owned(), raw.to_vec()));
-            if docs.len() >= limit {
-                break;
+        if self.profile.is_columnar() {
+            let mut all = self.documents_for_backfill(&*wtxn)?;
+            all.sort_by(|a, b| a.0.cmp(&b.0));
+            for (id, doc) in all {
+                if state
+                    .after
+                    .as_deref()
+                    .is_some_and(|after| id.as_str() <= after)
+                {
+                    continue;
+                }
+                docs.push((id, serde_json::to_vec(&doc)?));
+                if docs.len() >= limit {
+                    break;
+                }
+            }
+        } else {
+            let range = match state.after.as_deref() {
+                Some(after) => (Bound::Excluded(after.as_bytes()), Bound::Unbounded),
+                None => (Bound::Unbounded, Bound::Unbounded),
+            };
+            for item in self.db.range(&*wtxn, &range)? {
+                let (id, raw) = item?;
+                docs.push((String::from_utf8_lossy(id).into_owned(), raw.to_vec()));
+                if docs.len() >= limit {
+                    break;
+                }
             }
         }
         let done_scan = docs.len() < limit;
@@ -7508,6 +8291,44 @@ impl<'e> Collection<'e> {
         if current != expected_ttl_at {
             return Ok(None);
         }
+        if self.profile.is_columnar() {
+            let Some(old) = crate::columnar::find_by_id(&*wtxn, self.env, &self.name, id)? else {
+                self.set_ttl(wtxn, id, None)?;
+                return Ok(None);
+            };
+            let locator = crate::columnar::locator_for_id(&*wtxn, self.env, &self.name, id)?;
+            let id_value = old
+                .get("_id")
+                .cloned()
+                .unwrap_or_else(|| serde_json::Value::String(id.to_string()));
+            if crate::columnar::delete(
+                wtxn,
+                self.env,
+                &self.name,
+                &serde_json::json!({"_id": id_value}),
+                false,
+            )? == 0
+            {
+                self.set_ttl(wtxn, id, None)?;
+                return Ok(None);
+            }
+            crate::columnar::failpoint("ttl_after_delete")?;
+            if let Some(locator) = locator {
+                crate::columnar::drop_empty_bucket(wtxn, self.env, &self.name, locator)?;
+            }
+            self.apply_index_entries(wtxn, Some(&old), None, id)?;
+            self.apply_graph_entries(wtxn, Some(&old), None)?;
+            self.apply_text_entries(wtxn, Some(&old), None, id)?;
+            self.apply_fuzzy_entries(wtxn, Some(&old), None, id)?;
+            self.apply_vector_entries(wtxn, Some(&old), None, id)?;
+            self.set_ttl(wtxn, id, None)?;
+            if self.ttl_purge_history {
+                history::purge(&self.history, wtxn, &self.name, id)?;
+            } else {
+                self.record_history(wtxn, id, "delete", None)?;
+            }
+            return Ok(Some(old));
+        }
         let Some(raw) = self.db.get(&*wtxn, id.as_bytes())? else {
             self.set_ttl(wtxn, id, None)?;
             return Ok(None);
@@ -7869,8 +8690,8 @@ impl<'e> Collection<'e> {
                 let (lower, upper) = &plan.bounds;
                 let range = (as_bound(lower), as_bound(upper));
                 for item in plan.db.range(txn, &range)? {
-                    let (_key, value) = item?;
-                    let Some((id, _)) = index::decode_index_value(value) else {
+                    let (key, value) = item?;
+                    let Some((id, _)) = index::decode_index_entry(key, value) else {
                         continue;
                     };
                     if !seen.insert(id.clone()) {
@@ -8036,8 +8857,8 @@ impl<'e> Collection<'e> {
                 let range = (as_bound(lower), as_bound(upper));
                 for item in plan.db.range(txn, &range)? {
                     check_find_deadline(deadline)?;
-                    let (_key, value) = item?;
-                    let Some((id, _)) = index::decode_index_value(value) else {
+                    let (key, value) = item?;
+                    let Some((id, _)) = index::decode_index_entry(key, value) else {
                         continue;
                     };
                     if !seen.insert(id.clone()) {
@@ -8064,8 +8885,8 @@ impl<'e> Collection<'e> {
             let mut seen = HashSet::new();
             for item in plan.db.range(txn, &range)? {
                 check_find_deadline(deadline)?;
-                let (_key, value) = item?;
-                let Some((id, _)) = index::decode_index_value(value) else {
+                let (key, value) = item?;
+                let Some((id, _)) = index::decode_index_entry(key, value) else {
                     continue;
                 };
                 if multikey && !seen.insert(id.clone()) {
@@ -8555,6 +9376,96 @@ impl<'e> Collection<'e> {
                 check_find_deadline(deadline)?;
                 return Ok(out);
             }
+        }
+        if self.profile.is_columnar() {
+            let plan = aggregate::pushdown(pipeline)?;
+            check_find_deadline(deadline)?;
+            if let Some(field) = plan.count {
+                let count = self.count_in_deadline(rtxn, &plan.filter, deadline)?;
+                if count == 0 {
+                    return Ok(Vec::new());
+                }
+                return Ok(vec![Value::Object(Map::from_iter([(
+                    field,
+                    Value::from(count as u64),
+                )]))]);
+            }
+            if let Some(field) = aggregate::terminal_count_skippable(&pipeline[plan.next..])? {
+                let count = self.count_in_deadline(rtxn, &plan.filter, deadline)?;
+                let after_skip = count.saturating_sub(plan.skip);
+                let count = plan.limit.map_or(after_skip, |limit| after_skip.min(limit));
+                if count == 0 {
+                    return Ok(Vec::new());
+                }
+                return Ok(vec![Value::Object(Map::from_iter([(
+                    field,
+                    Value::from(count as u64),
+                )]))]);
+            }
+            let remaining = &pipeline[plan.next..];
+            if plan.sort.is_empty()
+                && plan.skip == 0
+                && plan.limit.is_none()
+                && plan.projection.is_none()
+                && !self.ttl_filter_active(rtxn)?
+            {
+                if let Some(group_arg) = remaining
+                    .first()
+                    .and_then(Value::as_object)
+                    .filter(|obj| obj.len() == 1)
+                    .and_then(|obj| obj.get("$group"))
+                {
+                    let builder = aggregate::GroupBuilder::new(group_arg)?;
+                    if builder.order_independent() {
+                        let groups = crate::columnar::group_parallel(
+                            rtxn,
+                            self.env,
+                            &self.name,
+                            &plan.filter,
+                            group_arg,
+                            aggregate_workers(),
+                        )?;
+                        check_find_deadline(deadline)?;
+                        let host = LookupHost { coll: self, rtxn };
+                        let out = aggregate::run_with_host(
+                            groups,
+                            &remaining[1..],
+                            aggregate::max_docs(),
+                            Some(&host),
+                        )?;
+                        check_find_deadline(deadline)?;
+                        return Ok(out);
+                    }
+                }
+            }
+            let max_docs = aggregate::max_docs();
+            let limit = plan
+                .limit
+                .map(|n| n.min(max_docs.saturating_add(1)))
+                .unwrap_or_else(|| max_docs.saturating_add(1));
+            let docs = self.find_in(
+                rtxn,
+                &FindQuery {
+                    filter: plan.filter,
+                    projection: plan.projection,
+                    sort: plan.sort,
+                    skip: plan.skip,
+                    limit: Some(limit),
+                    comment: None,
+                    max_time_ms: deadline_remaining_ms(deadline),
+                    hint: None,
+                },
+            )?;
+            if docs.len() > max_docs {
+                return Err(Error::Query(format!(
+                    "aggregation input exceeds {max_docs} documents"
+                )));
+            }
+            let host = LookupHost { coll: self, rtxn };
+            let out =
+                aggregate::run_with_host(docs, &pipeline[plan.next..], max_docs, Some(&host))?;
+            check_find_deadline(deadline)?;
+            return Ok(out);
         }
         let plan = aggregate::pushdown(pipeline)?;
         check_find_deadline(deadline)?;
@@ -9113,6 +10024,12 @@ impl<'e> Collection<'e> {
             rtxn.commit()?;
             return Ok(out);
         }
+        if self.profile.is_columnar() {
+            let rtxn = self.read_txn()?;
+            let out = self.find_in(&rtxn, query)?;
+            rtxn.commit()?;
+            return Ok(out);
+        }
         let normalized = normalized_find_query(query)?;
         let query = normalized.as_ref();
         crate::query::validate::validate_filter(&query.filter)?;
@@ -9177,6 +10094,7 @@ impl<'e> Collection<'e> {
         crate::query::validate::validate_filter(&query.filter)?;
         if self.profile().is_vault()
             || self.profile().is_timeseries()
+            || self.profile().is_columnar()
             || query.projection.is_some()
             || !query.sort.is_empty()
             || query.hint.is_some()
@@ -9989,6 +10907,88 @@ impl<'e> Collection<'e> {
         if self.profile.is_timeseries() {
             return self.find_timeseries_in(rtxn, query);
         }
+        if self.profile.is_columnar() {
+            let normalized = normalized_find_query(query)?;
+            let query = normalized.as_ref();
+            crate::query::validate::validate_filter(&query.filter)?;
+            let hint = query.hint.as_ref().map(parse_index_hint).transpose()?;
+            let plan = self.query_index_plan(rtxn, &query.filter, hint.as_ref())?;
+            let deadline = find_deadline(query);
+            check_find_deadline(deadline)?;
+            if let Some((field, near)) = geo::extract_near(&query.filter) {
+                if !query.sort.is_empty() {
+                    return Err(Error::Query(
+                        "$near cannot be combined with an explicit sort".into(),
+                    ));
+                }
+                let limit = query.limit.unwrap_or(usize::MAX);
+                if limit == 0 {
+                    return Ok(Vec::new());
+                }
+                let strict_ttl = self.ttl_filter_active(rtxn)?;
+                let now = ttl::now_ms();
+                let mut hits = Vec::new();
+                for doc in crate::columnar::all_docs(rtxn, self.env, &self.name)? {
+                    check_find_deadline(deadline)?;
+                    if !crate::query::matcher::matches(&doc, &query.filter) {
+                        continue;
+                    }
+                    if strict_ttl && !self.ttl_doc_visible(rtxn, &doc, now)? {
+                        continue;
+                    }
+                    if let Some(distance) = geo::field_distance(&doc, &field, near.center) {
+                        hits.push((distance, doc));
+                    }
+                }
+                hits.sort_by(|a, b| a.0.total_cmp(&b.0));
+                return Ok(hits
+                    .into_iter()
+                    .skip(query.skip)
+                    .take(limit)
+                    .map(|(_, doc)| project_document(&doc, query.projection.as_ref()))
+                    .collect());
+            }
+            if let Some(plan) = plan {
+                let ids = self.index_plan_candidates(rtxn, &plan, None)?;
+                let strict_ttl = self.ttl_filter_active(rtxn)?;
+                let now = ttl::now_ms();
+                let mut docs = Vec::with_capacity(ids.len());
+                for id in ids {
+                    check_find_deadline(deadline)?;
+                    let Some(doc) = crate::columnar::find_by_id(rtxn, self.env, &self.name, &id)?
+                    else {
+                        continue;
+                    };
+                    if !crate::query::matcher::matches(&doc, &query.filter) {
+                        continue;
+                    }
+                    if strict_ttl && !self.ttl_doc_visible(rtxn, &doc, now)? {
+                        continue;
+                    }
+                    docs.push(doc);
+                }
+                let limit = query.limit.unwrap_or(usize::MAX);
+                if !query.sort.is_empty() {
+                    docs = top_k_docs(docs, &query.sort, query.skip.saturating_add(limit));
+                }
+                return Ok(docs
+                    .into_iter()
+                    .skip(query.skip)
+                    .take(limit)
+                    .map(|doc| project_document(&doc, query.projection.as_ref()))
+                    .collect());
+            }
+            let out = if self.ttl_filter_active(rtxn)? {
+                let now = ttl::now_ms();
+                crate::columnar::find_visible(rtxn, self.env, &self.name, query, &mut |doc| {
+                    self.ttl_doc_visible(rtxn, doc, now)
+                })?
+            } else {
+                crate::columnar::find(rtxn, self.env, &self.name, query)?
+            };
+            check_find_deadline(deadline)?;
+            return Ok(out);
+        }
         let normalized = normalized_find_query(query)?;
         let query = normalized.as_ref();
         crate::query::validate::validate_filter(&query.filter)?;
@@ -10040,8 +11040,8 @@ impl<'e> Collection<'e> {
                 let range = (as_bound(&plan.bounds.0), as_bound(&plan.bounds.1));
                 for item in plan.db.range(rtxn, &range)? {
                     check_find_deadline(deadline)?;
-                    let (_key, value) = item?;
-                    let Some((id, _)) = index::decode_index_value(value) else {
+                    let (key, value) = item?;
+                    let Some((id, _)) = index::decode_index_entry(key, value) else {
                         continue;
                     };
                     if !seen.insert(id.clone()) {
@@ -10187,8 +11187,8 @@ impl<'e> Collection<'e> {
                 };
                 for item in iter {
                     check_find_deadline(deadline)?;
-                    let (_key, value) = item?;
-                    let Some((id, inc)) = index::decode_index_value(value) else {
+                    let (key, value) = item?;
+                    let Some((id, inc)) = index::decode_index_entry(key, value) else {
                         continue;
                     };
                     let doc = if let Some(doc) =
@@ -10534,6 +11534,59 @@ impl<'e> Collection<'e> {
         let id_only = projection_is_id_only(projection);
         stats.unique_keys = unique_values.len();
 
+        if self.profile.is_columnar() && by.len() == 1 && by[0] == "_id" {
+            stats.selected_index = "_id_".to_string();
+            stats.index_fields = by.to_vec();
+            stats.primary = true;
+            for &value in &unique_values {
+                stats.index_entries_read = stats.index_entries_read.saturating_add(1);
+                let (doc, size) = match value.as_str() {
+                    Some(id) if strict_ttl && self.ttl_expired_at(rtxn, id, now)? => (None, 4),
+                    Some(id) => {
+                        match crate::columnar::find_by_id(rtxn, self.env, &self.name, id)? {
+                            Some(doc) => {
+                                if id_only {
+                                    stats.bytes_read =
+                                        stats.bytes_read.saturating_add(id.len() as u64);
+                                    (Some(serde_json::json!({"_id": id})), id.len())
+                                } else {
+                                    stats.documents_read = stats.documents_read.saturating_add(1);
+                                    let bytes = serde_json::to_vec(&doc)?;
+                                    stats.bytes_read =
+                                        stats.bytes_read.saturating_add(bytes.len() as u64);
+                                    let size = bytes.len();
+                                    let doc = match projection {
+                                        Some(projection) => project(&doc, projection, None),
+                                        None => doc,
+                                    };
+                                    (Some(doc), size)
+                                }
+                            }
+                            None => (None, 4),
+                        }
+                    }
+                    None => (None, 4),
+                };
+                push_lookup_result(
+                    &mut unique_out,
+                    &mut unique_sizes,
+                    &mut unique_bytes,
+                    doc,
+                    size,
+                )?;
+            }
+            stats.covering = id_only;
+            finish_lookup_stats(
+                values.len(),
+                &unique_out,
+                &unique_sizes,
+                &positions,
+                &mut stats,
+            );
+            let out = finish_lookup(values.len(), unique_out, unique_sizes, &positions)?;
+            return Ok((out, stats));
+        }
+
         if by.len() == 1 && by[0] == "_id" {
             stats.selected_index = "_id_".to_string();
             stats.index_fields = by.to_vec();
@@ -10611,6 +11664,100 @@ impl<'e> Collection<'e> {
         stats.index_fields = def.effective_fields();
         stats.index_include = def.include.clone();
 
+        if self.profile.is_columnar() {
+            for &value in &unique_values {
+                let parts = if by.len() == 1 {
+                    std::slice::from_ref(value)
+                } else {
+                    let Some(parts) = value.as_array() else {
+                        push_lookup_result(
+                            &mut unique_out,
+                            &mut unique_sizes,
+                            &mut unique_bytes,
+                            None,
+                            4,
+                        )?;
+                        continue;
+                    };
+                    if parts.len() != by.len() {
+                        push_lookup_result(
+                            &mut unique_out,
+                            &mut unique_sizes,
+                            &mut unique_bytes,
+                            None,
+                            4,
+                        )?;
+                        continue;
+                    }
+                    parts.as_slice()
+                };
+                let Some((lower, upper)) = lookup_bounds(parts, &def) else {
+                    push_lookup_result(
+                        &mut unique_out,
+                        &mut unique_sizes,
+                        &mut unique_bytes,
+                        None,
+                        4,
+                    )?;
+                    continue;
+                };
+                let range = (as_bound(&lower), as_bound(&upper));
+                let mut found = None;
+                for item in db.range(rtxn, &range)? {
+                    stats.index_entries_read = stats.index_entries_read.saturating_add(1);
+                    let (key, raw) = item?;
+                    let raw_size = raw.len();
+                    let Some((id, _inc)) = index::decode_index_entry(key, raw) else {
+                        continue;
+                    };
+                    if strict_ttl && self.ttl_expired_at(rtxn, &id, now)? {
+                        continue;
+                    }
+                    let Some(doc) = crate::columnar::find_by_id(rtxn, self.env, &self.name, &id)?
+                    else {
+                        continue;
+                    };
+                    let (doc, size) = if id_only {
+                        stats.bytes_read = stats.bytes_read.saturating_add(raw_size as u64);
+                        (serde_json::json!({"_id": id}), raw_size)
+                    } else {
+                        stats.documents_read = stats.documents_read.saturating_add(1);
+                        let bytes = serde_json::to_vec(&doc)?;
+                        stats.bytes_read = stats.bytes_read.saturating_add(bytes.len() as u64);
+                        let size = bytes.len();
+                        let doc = match projection {
+                            Some(projection) => project(&doc, projection, None),
+                            None => doc,
+                        };
+                        (doc, size)
+                    };
+                    found = Some((doc, size));
+                    break;
+                }
+                let (doc, size) = match found {
+                    Some((doc, size)) => (Some(doc), size),
+                    None => (None, 4),
+                };
+                push_lookup_result(
+                    &mut unique_out,
+                    &mut unique_sizes,
+                    &mut unique_bytes,
+                    doc,
+                    size,
+                )?;
+            }
+            stats.covering = id_only;
+            finish_lookup_stats(
+                values.len(),
+                &unique_out,
+                &unique_sizes,
+                &positions,
+                &mut stats,
+            );
+            let out = finish_lookup(values.len(), unique_out, unique_sizes, &positions)?;
+            return Ok((out, stats));
+        }
+
         let covering_projection = projection.cloned();
         for &value in &unique_values {
             let parts = if by.len() == 1 {
@@ -10652,9 +11799,9 @@ impl<'e> Collection<'e> {
             let mut found = None;
             for item in db.range(rtxn, &range)? {
                 stats.index_entries_read = stats.index_entries_read.saturating_add(1);
-                let (_key, raw) = item?;
+                let (key, raw) = item?;
                 let raw_size = raw.len();
-                let Some((id, inc)) = index::decode_index_value(raw) else {
+                let Some((id, inc)) = index::decode_index_entry(key, raw) else {
                     continue;
                 };
                 if strict_ttl && self.ttl_expired_at(rtxn, &id, now)? {
@@ -10770,6 +11917,59 @@ impl<'e> Collection<'e> {
                 "buckets_pruned": buckets_pruned,
                 "filter": query.filter,
                 "matched": matched,
+            }));
+        }
+        if self.profile.is_columnar() {
+            let normalized = normalized_find_query(query)?;
+            let query = normalized.as_ref();
+            crate::query::validate::validate_filter(&query.filter)?;
+            let hint = query.hint.as_ref().map(parse_index_hint).transpose()?;
+            let plan = self.query_index_plan(rtxn, &query.filter, hint.as_ref())?;
+            let stats = crate::columnar::stats(rtxn, self.env, &self.name)?;
+            let matched = self.count_in(rtxn, &query.filter)?;
+            let returned = self.find_in(rtxn, query)?.len();
+            let candidates = match &plan {
+                Some(plan) => self.index_count_plan(rtxn, plan)? as u64,
+                None => stats.rows,
+            };
+            let sort_covered = query.sort.is_empty()
+                || id_sort_direction(&query.sort).is_some()
+                || plan
+                    .as_ref()
+                    .is_some_and(|plan| index_matches_sort(&plan.def, &query.sort).is_some());
+            return Ok(serde_json::json!({
+                "collection": self.name,
+                "profile": "columnar",
+                "access": if plan.is_some() { "index_scan" } else { "bucket_scan" },
+                "access_path": if plan.is_some() { "index_scan" } else { "bucket_scan" },
+                "index_used": plan.is_some(),
+                "index": plan.as_ref().map(|plan| serde_json::json!({
+                    "fields": plan.def.effective_fields(),
+                    "unique": plan.def.unique,
+                    "include": plan.def.include,
+                    "multikey": plan.def.multikey_fields,
+                })).unwrap_or(Value::Null),
+                "bounds": Value::Null,
+                "buckets_total": stats.buckets,
+                "buckets_pruned": 0,
+                "buckets_sealed": stats.sealed_buckets,
+                "buckets_open": stats.open_buckets,
+                "estimated_documents": stats.rows,
+                "candidates": candidates,
+                "documents_scanned": candidates,
+                "sort_covered": sort_covered,
+                "filter": query.filter,
+                "sort": Value::Array(
+                    query
+                        .sort
+                        .iter()
+                        .map(|(field, dir)| serde_json::json!([field, dir]))
+                        .collect(),
+                ),
+                "skip": query.skip,
+                "limit": query.limit.map_or(Value::Null, Value::from),
+                "actual_matched": matched,
+                "actual_returned": returned,
             }));
         }
         let normalized = normalized_find_query(query)?;
@@ -11100,6 +12300,26 @@ impl<'e> Collection<'e> {
             let settings = self.timeseries_settings_in(rtxn)?.unwrap_or_default();
             return crate::timeseries::count(rtxn, self.env, &self.name, &settings, filter);
         }
+        if self.profile.is_columnar() {
+            crate::query::validate::validate_filter(filter)?;
+            check_find_deadline(deadline)?;
+            if self.ttl_filter_active(rtxn)? {
+                let query = FindQuery {
+                    filter: filter.clone(),
+                    ..Default::default()
+                };
+                let now = ttl::now_ms();
+                return Ok(crate::columnar::find_visible(
+                    rtxn,
+                    self.env,
+                    &self.name,
+                    &query,
+                    &mut |doc| self.ttl_doc_visible(rtxn, doc, now),
+                )?
+                .len());
+            }
+            return crate::columnar::count(rtxn, self.env, &self.name, filter);
+        }
         crate::query::validate::validate_filter(filter)?;
         check_find_deadline(deadline)?;
         if self.ttl_filter_active(rtxn)? {
@@ -11245,28 +12465,56 @@ impl<'e> Collection<'e> {
         let mut expected_index = vec![0u64; defs.len()];
         let mut expected_vectors = vec![0u64; vector_fields.len()];
 
-        for item in self.db.iter(rtxn)? {
-            let (key, raw) = item?;
-            let id = std::str::from_utf8(key).map_err(|e| {
-                Error::Query(format!("invalid document key in `{}`: {e}", self.name))
+        let docs_for_verify: Vec<(String, Value, u64)> = if self.profile.is_columnar() {
+            let mut docs = Vec::new();
+            crate::columnar::for_each(rtxn, self.env, &self.name, |doc| {
+                let Some(obj) = doc.as_object() else {
+                    return Err(Error::Query(format!(
+                        "columnar document in `{}` is not a JSON object",
+                        self.name
+                    )));
+                };
+                let id = obj
+                    .get("_id")
+                    .and_then(id::key_from_value)
+                    .ok_or(Error::InvalidId)?;
+                let size = serde_json::to_vec(&doc)?.len() as u64;
+                docs.push((id, doc, size));
+                Ok(())
             })?;
-            let doc: Value = serde_json::from_slice(raw).map_err(|e| {
-                Error::Query(format!("invalid JSON for `{}`/`{id}`: {e}", self.name))
-            })?;
-            let Some(obj) = doc.as_object() else {
-                return Err(Error::Query(format!(
-                    "document `{}`/`{id}` is not a JSON object",
-                    self.name
-                )));
-            };
-            if obj.get("_id").and_then(id::key_from_value).as_deref() != Some(id) {
-                return Err(Error::Query(format!(
-                    "document `{}`/`{id}` has a missing or mismatched _id",
-                    self.name
-                )));
+            docs
+        } else {
+            let mut docs = Vec::new();
+            for item in self.db.iter(rtxn)? {
+                let (key, raw) = item?;
+                let id = std::str::from_utf8(key).map_err(|e| {
+                    Error::Query(format!("invalid document key in `{}`: {e}", self.name))
+                })?;
+                let doc: Value = serde_json::from_slice(raw).map_err(|e| {
+                    Error::Query(format!("invalid JSON for `{}`/`{id}`: {e}", self.name))
+                })?;
+                let Some(obj) = doc.as_object() else {
+                    return Err(Error::Query(format!(
+                        "document `{}`/`{id}` is not a JSON object",
+                        self.name
+                    )));
+                };
+                if obj.get("_id").and_then(id::key_from_value).as_deref() != Some(id) {
+                    return Err(Error::Query(format!(
+                        "document `{}`/`{id}` has a missing or mismatched _id",
+                        self.name
+                    )));
+                }
+                docs.push((id.to_string(), doc, raw.len() as u64));
             }
+            docs
+        };
+
+        for (id, doc, size) in docs_for_verify {
+            let id = id.as_str();
+            let key = id.as_bytes();
             documents += 1;
-            bytes += raw.len() as u64;
+            bytes += size;
 
             for (i, def) in defs.iter().enumerate() {
                 if !def.current_format() {
@@ -11283,10 +12531,11 @@ impl<'e> Collection<'e> {
                         self.name
                     ))
                 })?;
-                let expected = index::encode_index_value(def, &doc, id);
+                let expected = self.index_value_for(def, &doc, id);
+                let compact = self.compact_index_ids(def);
                 for value_bytes in keys.keys {
                     let mut index_key = value_bytes;
-                    index_key.extend_from_slice(key);
+                    index::append_index_id(&mut index_key, id, compact);
                     let actual = db.get(rtxn, &index_key)?.ok_or_else(|| {
                         Error::Query(format!(
                             "index `{}` on `{}` is missing entry for `{id}`",
@@ -11582,30 +12831,20 @@ impl<'a, 't> GraphViewImpl<'a, 't> {
 
 impl GraphView for GraphViewImpl<'_, '_> {
     fn node(&self, id: &str) -> Result<Option<Value>> {
-        self.node
-            .db
-            .get(self.txn, id.as_bytes())?
-            .map(parse_json)
-            .transpose()
+        self.node.document_in(self.txn, id)
     }
 
     fn edge(&self, id: &str) -> Result<Option<Value>> {
-        self.edge
-            .db
-            .get(self.txn, id.as_bytes())?
-            .map(parse_json)
-            .transpose()
+        self.edge.document_in(self.txn, id)
     }
 
     fn node_ids(&self) -> Result<Vec<String>> {
-        let mut ids = Vec::new();
-        for item in self.node.db.iter(self.txn)? {
-            let (key, _) = item?;
-            if let Ok(id) = std::str::from_utf8(key) {
-                ids.push(id.to_string());
-            }
-        }
-        Ok(ids)
+        Ok(self
+            .node
+            .documents_for_backfill(self.txn)?
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect())
     }
 
     fn neighbors(
@@ -12380,7 +13619,16 @@ pub(crate) fn compare_docs(a: &Value, b: &Value, sort: &[(String, i32)]) -> Orde
             return if *dir >= 0 { ord } else { ord.reverse() };
         }
     }
-    Ordering::Equal
+    // The standard profile iterates LMDB keys in canonical `_id` order, so
+    // ties after every sort field are deterministic by `_id`, regardless of
+    // the requested direction. Columnar locators are hash ordered, so apply
+    // the same tie-break explicitly.
+    let a = a.get("_id").and_then(crate::id::key_from_value);
+    let b = b.get("_id").and_then(crate::id::key_from_value);
+    match (a, b) {
+        (Some(a), Some(b)) => a.cmp(&b),
+        _ => Ordering::Equal,
+    }
 }
 
 /// `find` result accumulator: a plain list without sorting, TopK with sorting.
@@ -12426,6 +13674,20 @@ impl<'a> Acc<'a> {
             Acc::Top(top) => top.into_sorted(),
         }
     }
+}
+
+/// Selects the best `want` documents with the same comparator and heap
+/// algorithm as the standard profile. Columnar reads use this instead of
+/// `slice::sort_by` so inconsistent mixed-type comparators behave identically.
+pub(crate) fn top_k_docs<I>(docs: I, sort: &[(String, i32)], want: usize) -> Vec<Value>
+where
+    I: IntoIterator<Item = Value>,
+{
+    let mut top = TopK::new(sort, want);
+    for doc in docs {
+        top.push(doc);
+    }
+    top.into_sorted()
 }
 
 /// Document in the TopK heap; `seq` preserves stability for equal keys.

@@ -801,6 +801,39 @@ func (c *Client) CreateCollectionWithTTLAndPurge(ctx context.Context, name, prof
 	return err
 }
 
+// CreateCollectionWithColumnar creates a columnar collection with settings.
+func (c *Client) CreateCollectionWithColumnar(ctx context.Context, name string, settings map[string]any, ttlSeconds *uint64) error {
+	req := map[string]any{
+		"op": "create_collection", "coll": name, "profile": "columnar", "columnar": settings,
+	}
+	if ttlSeconds != nil {
+		req["ttl_seconds"] = *ttlSeconds
+	}
+	_, err := c.execRaw(ctx, req)
+	return err
+}
+
+// GetCollectionColumnar returns columnar settings and bucket statistics.
+func (c *Client) GetCollectionColumnar(ctx context.Context, name string) (map[string]any, error) {
+	result, err := c.execRaw(ctx, map[string]any{"op": "get_collection_columnar", "coll": name})
+	if err != nil {
+		return nil, err
+	}
+	var out map[string]any
+	if err := json.Unmarshal(result, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// SetCollectionColumnar replaces columnar bucket/compression settings.
+func (c *Client) SetCollectionColumnar(ctx context.Context, name string, settings map[string]any) error {
+	_, err := c.execRaw(ctx, map[string]any{
+		"op": "set_collection_columnar", "coll": name, "settings": settings,
+	})
+	return err
+}
+
 // SetCollectionTTL sets or clears (nil) the collection default TTL.
 func (c *Client) SetCollectionTTL(ctx context.Context, name string, ttlSeconds *uint64) error {
 	return c.SetCollectionTTLWithPurge(ctx, name, ttlSeconds, nil)

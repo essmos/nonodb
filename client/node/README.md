@@ -75,6 +75,19 @@ const ttl = await db.collectionTtl('sessions');
 Documents use the reserved `_ttl` field for a per-document override. See
 [Document TTL](../../docs/ttl.md).
 
+## Columnar collections
+
+```js
+await db.createCollection('events', 'columnar', null, null, null, {
+  bucket_max_docs: 512,
+  compression: 'balanced',
+});
+await db.getCollectionColumnar('events');
+await db.setCollectionColumnar('events', { compression: 'max' });
+```
+
+See [Columnar collections](../../docs/columnar.md).
+
 ## Aggregation
 
 Use `aggregate()` for reporting pipelines. A terminal `$out`/`$merge` stage

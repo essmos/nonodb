@@ -2,6 +2,34 @@
 
 Full release notes: https://github.com/essmos/nonodb/releases
 
+## Unreleased
+
+- Add experimental `profile: "columnar"` collections: general-purpose buckets
+  keyed by `_id` hash, shared column codecs, locator-based point reads, update
+  overlays, compaction, and full standard-collection parity for CRUD, indexes,
+  TTL, history, search, graph, aggregation, SQL, replication, backup, events,
+  MongoDB wire, clients, CLI, and GUI. See `docs/columnar.md`.
+- Expose `get_collection_columnar` / `set_collection_columnar` and columnar
+  creation settings over HTTP/socket, MongoDB `create`/`listCollections`,
+  Rust/Python/Node.js/Go clients, CLI, and GUI.
+- Add columnar bucket version/settings guards and migration support via
+  `scripts/nonodb-migrate.py --target-profile columnar`.
+- Add columnar hardening coverage for randomized differential operations,
+  concurrent writers/readers, crash/rollback recovery, interrupted compaction,
+  malformed buckets, unknown formats, and float bit-exact roundtrips. The write
+  path uses a row-oriented staging bucket that compaction re-encodes with the
+  adaptive column codecs; unsorted scans and order-independent `$group` stages
+  decode document-count-balanced chunks in parallel.
+- Meet the columnar release performance gates on the canonical 100k-row
+  benchmark: storage `0.485×`, batch insert `0.92×`, scan `1.63×`, and
+  aggregation `1.01×` versus standard, with point reads and updates inside the
+  `3×`/`5×` limits. The write path serializes and normalizes batches in
+  parallel, skips inapplicable index/graph/TTL hooks, uses 32-row blocks and
+  prefix/front-coded columns, and stores columnar index ids once in a compact
+  key trailer. `storage_stats` reads sealed-bucket headers and subtracts
+  tombstones instead of materializing the collection, so it stays bounded for
+  large collections. See `docs/columnar-performance.md` and the
+  `columnar_soak` example.
 ## v0.35.0 - 2026-11-27
 
 Streams and consumer groups release: writer-assigned `_seq` offsets, durable

@@ -4810,13 +4810,17 @@ fn fill(mut docs: Vec<Value>, spec: &Value, vars: &BTreeMap<String, Value>) -> R
 }
 
 #[derive(Clone)]
-enum NumericSum {
+pub(crate) enum NumericSum {
     Float(f64),
     Decimal(BigDecimal),
 }
 
 impl NumericSum {
-    fn add(&mut self, value: &Value) {
+    pub(crate) fn zero() -> Self {
+        Self::Float(0.0)
+    }
+
+    pub(crate) fn add(&mut self, value: &Value) {
         if numeric::is_decimal(value) {
             let Some(d) = numeric::as_bigdecimal(value) else {
                 return;
@@ -4844,7 +4848,7 @@ impl NumericSum {
         }
     }
 
-    fn merge(&mut self, other: NumericSum) {
+    pub(crate) fn merge(&mut self, other: NumericSum) {
         match (&mut *self, other) {
             (Self::Float(left), Self::Float(right)) => *left += right,
             (Self::Float(left), Self::Decimal(right)) => {
@@ -4861,7 +4865,7 @@ impl NumericSum {
         }
     }
 
-    fn finish(self) -> Result<Value> {
+    pub(crate) fn finish(self) -> Result<Value> {
         match self {
             Self::Float(n) => Ok(number_value(n)),
             Self::Decimal(n) => numeric::decimal_value(&n),

@@ -989,7 +989,7 @@ def free_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def start_daemon(daemon: Path):
+def start_daemon(daemon: Path, profile: str = "standard"):
     root = Path(tempfile.mkdtemp(prefix="nonodb-tck-", dir="/var/tmp"))
     sock = root / "n.sock"
     env = os.environ.copy()
@@ -1005,8 +1005,14 @@ def start_daemon(daemon: Path):
     if not sock.exists():
         raise RuntimeError("timed out waiting for daemon socket")
     db = NonoDB(str(sock), cache_ttl=0.0)
-    db.create_collection("nodes")
-    db.create_collection("edges")
+    options = {}
+    if profile == "columnar":
+        options = {
+            "profile": "columnar",
+            "columnar": {"bucket_max_docs": 128, "compression": "max"},
+        }
+    db.create_collection("nodes", **options)
+    db.create_collection("edges", **options)
     nodes = db.collection("nodes")
     nodes.set_graph("edges")
     return proc, db, nodes, db.collection("edges")
@@ -1018,6 +1024,11 @@ def main() -> int:
     parser.add_argument("--daemon", default=os.environ.get("NONODB_DAEMON", "target/release/nonodb-daemon"))
     parser.add_argument("--output", default="tck-report.json")
     parser.add_argument("--limit", type=int, default=0)
+    parser.add_argument(
+        "--profile",
+        choices=["standard", "columnar"],
+        default=os.environ.get("NONODB_TCK_PROFILE", "standard"),
+    )
     args = parser.parse_args()
     tck = Path(args.tck_dir)
     if not (tck / "tck/features").is_dir():
@@ -1060,7 +1071,7 @@ def main() -> int:
         if args.limit and len(selected) >= args.limit:
             break
 
-    proc, db, nodes, edges = start_daemon(daemon)
+    proc, db, nodes, edges = start_daemon(daemon, args.profile)
     results = []
     try:
         for scenario, location, query, table in selected:
@@ -1103,7 +1114,7 @@ def main() -> int:
                         proc.wait(timeout=5)
                     except subprocess.TimeoutExpired:
                         proc.kill()
-                    proc, db, nodes, edges = start_daemon(daemon)
+                    proc, db, nodes, edges = start_daemon(daemon, args.profile)
                     try:
                         value = nodes.cypher(
                             query,

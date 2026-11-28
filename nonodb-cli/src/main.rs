@@ -377,6 +377,19 @@ fn run() -> Result<(), String> {
             print_result(&res);
         }
         "create-collection" | "create_collection" => create_collection_cmd(&args[1..])?,
+        "get-collection-columnar" | "get_collection_columnar" => {
+            let coll = args
+                .get(1)
+                .ok_or("użycie: nonodb-cli get-collection-columnar <kolekcja>")?;
+            let res = http_post(
+                "/v1/exec",
+                &json!({"op": "get_collection_columnar", "coll": coll}),
+            )?;
+            print_result(&res);
+        }
+        "set-collection-columnar" | "set_collection_columnar" => {
+            set_collection_columnar_cmd(&args[1..])?
+        }
         "get-collection-timeseries" | "get_collection_timeseries" => {
             let coll = args
                 .get(1)
@@ -719,9 +732,10 @@ fn usage() -> Result<(), String> {
          replication [status|changes [after] [limit]|source <url> [dbs] [interval]|pause|resume|disconnect|forget <node>|acks|prune <seq> [--require-acks]|promote <epoch> [--force]|demote <epoch> [role] [successor]|add-replica <name> [dbs]|pairings|revoke <code>|join <primary-url> [code]]\n\
          instances [--json] [prune] lista lokalnych daemonów\n\
          collections                lista kolekcji\n\
-         create-collection <nazwa> [--profile standard|vault|timeseries] [--time-field pole]\n\
-              [--meta-field pole] [--granularity seconds|minutes|hours]\n\
+         create-collection <nazwa> [--profile standard|vault|timeseries|columnar]\n\
+              [--time-field pole] [--meta-field pole] [--granularity seconds|minutes|hours]\n\
               [--compression fast|balanced|max] [--expire-after sekundy] [--ttl sekundy]\n\
+              [--bucket-max-docs N] [--bucket-max-bytes N]\n\
          get-collection-timeseries <coll>    odczyt ustawień time-series\n\
          set-collection-timeseries <coll> [--time-field pole] [--meta-field pole]\n\
               [--granularity ...] [--compression ...] [--expire-after N|none]\n\
@@ -1515,6 +1529,8 @@ fn create_collection_payload(args: &[String]) -> Result<Value, String> {
     let mut compression = "balanced".to_string();
     let mut expire_after: Option<u64> = None;
     let mut ttl: Option<u64> = None;
+    let mut bucket_max_docs: Option<usize> = None;
+    let mut bucket_max_bytes: Option<usize> = None;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -1554,10 +1570,29 @@ fn create_collection_payload(args: &[String]) -> Result<Value, String> {
                 );
                 i += 2;
             }
+            "--bucket-max-docs" | "--bucket_max_docs" => {
+                bucket_max_docs = Some(
+                    parse_ts_flag(args, i, "--bucket-max-docs")?
+                        .parse()
+                        .map_err(|e| format!("bucket-max-docs: {e}"))?,
+                );
+                i += 2;
+            }
+            "--bucket-max-bytes" | "--bucket_max_bytes" => {
+                bucket_max_bytes = Some(
+                    parse_ts_flag(args, i, "--bucket-max-bytes")?
+                        .parse()
+                        .map_err(|e| format!("bucket-max-bytes: {e}"))?,
+                );
+                i += 2;
+            }
             other => return Err(format!("nieznana opcja: {other}")),
         }
     }
-    if !matches!(profile.as_str(), "standard" | "vault" | "timeseries") {
+    if !matches!(
+        profile.as_str(),
+        "standard" | "vault" | "timeseries" | "columnar"
+    ) {
         return Err(format!("nieznany profil: {profile}"));
     }
     let mut payload = json!({"op": "create_collection", "coll": name, "profile": profile});
@@ -1577,6 +1612,17 @@ fn create_collection_payload(args: &[String]) -> Result<Value, String> {
             spec.insert("expireAfterSeconds".into(), json!(expire));
         }
         payload["timeseries"] = Value::Object(spec);
+    }
+    if profile == "columnar" {
+        let mut spec = serde_json::Map::new();
+        if let Some(bucket_max_docs) = bucket_max_docs {
+            spec.insert("bucket_max_docs".into(), json!(bucket_max_docs));
+        }
+        if let Some(bucket_max_bytes) = bucket_max_bytes {
+            spec.insert("bucket_max_bytes".into(), json!(bucket_max_bytes));
+        }
+        spec.insert("compression".into(), json!(compression));
+        payload["columnar"] = Value::Object(spec);
     }
     Ok(payload)
 }
@@ -1645,6 +1691,63 @@ fn apply_ts_overrides(current: &Value, args: &[String]) -> Result<Value, String>
 fn create_collection_cmd(args: &[String]) -> Result<(), String> {
     let payload = create_collection_payload(args)?;
     let res = http_post("/v1/exec", &payload)?;
+    print_result(&res);
+    Ok(())
+}
+
+fn apply_columnar_overrides(current: &Value, args: &[String]) -> Result<Value, String> {
+    let mut settings = current
+        .as_object()
+        .cloned()
+        .ok_or("obecne ustawienia columnar są nieprawidłowe")?;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--bucket-max-docs" | "--bucket_max_docs" => {
+                let value: usize = parse_ts_flag(args, i, "--bucket-max-docs")?
+                    .parse()
+                    .map_err(|e| format!("bucket-max-docs: {e}"))?;
+                settings.insert("bucket_max_docs".into(), json!(value));
+                i += 2;
+            }
+            "--bucket-max-bytes" | "--bucket_max_bytes" => {
+                let value: usize = parse_ts_flag(args, i, "--bucket-max-bytes")?
+                    .parse()
+                    .map_err(|e| format!("bucket-max-bytes: {e}"))?;
+                settings.insert("bucket_max_bytes".into(), json!(value));
+                i += 2;
+            }
+            "--compression" => {
+                settings.insert(
+                    "compression".into(),
+                    json!(parse_ts_flag(args, i, "--compression")?),
+                );
+                i += 2;
+            }
+            other => return Err(format!("nieznana opcja: {other}")),
+        }
+    }
+    Ok(Value::Object(settings))
+}
+
+fn set_collection_columnar_cmd(args: &[String]) -> Result<(), String> {
+    let coll = args
+        .first()
+        .filter(|value| !value.starts_with("--"))
+        .ok_or("użycie: nonodb-cli set-collection-columnar <kolekcja> [opcje]")?;
+    let current = http_post(
+        "/v1/exec",
+        &json!({"op": "get_collection_columnar", "coll": coll}),
+    )?;
+    if current.get("ok").and_then(Value::as_bool) != Some(true) {
+        print_result(&current);
+        return Ok(());
+    }
+    let merged = apply_columnar_overrides(&current["result"]["columnar"], &args[1..])?;
+    let res = http_post(
+        "/v1/exec",
+        &json!({"op": "set_collection_columnar", "coll": coll, "settings": merged}),
+    )?;
     print_result(&res);
     Ok(())
 }
@@ -2572,12 +2675,33 @@ fn inspect(data: &Path, only: Option<&str>) -> Result<(), String> {
         if only.is_some_and(|o| o != name) {
             continue;
         }
+        let profile = meta
+            .get(&rtxn, format!("profile:{name}").as_bytes())
+            .map_err(|e| e.to_string())?
+            .and_then(|raw| std::str::from_utf8(raw).ok())
+            .unwrap_or("standard")
+            .to_string();
+        if profile == "columnar" {
+            let stats =
+                nonodb_core::columnar::stats(&rtxn, &env, &name).map_err(|e| e.to_string())?;
+            println!(
+                "  {name}: {} docs ({profile}, {} buckets: {} open, {} sealed, {} id entries, {} deletes, {} data bytes)",
+                stats.rows,
+                stats.buckets,
+                stats.open_buckets,
+                stats.sealed_buckets,
+                stats.id_entries,
+                stats.deletes,
+                stats.data_bytes,
+            );
+            continue;
+        }
         if let Some(db) = env
             .open_database::<Bytes, Bytes>(&rtxn, Some(&name))
             .map_err(|e| e.to_string())?
         {
             let entries = db.stat(&rtxn).map_err(|e| e.to_string())?.entries;
-            println!("  {name}: {entries} docs");
+            println!("  {name}: {entries} docs ({profile})");
         }
     }
     let _ = rtxn.commit();
@@ -2963,6 +3087,44 @@ mod tests {
         assert_eq!(payload["profile"], json!("standard"));
         assert_eq!(payload["ttl_seconds"], json!(60));
         assert!(payload.get("timeseries").is_none());
+    }
+
+    #[test]
+    fn create_collection_payload_supports_columnar_profile() {
+        let args = [
+            "events",
+            "--profile",
+            "columnar",
+            "--bucket-max-docs",
+            "128",
+            "--bucket-max-bytes",
+            "262144",
+            "--compression",
+            "max",
+            "--ttl",
+            "3600",
+        ]
+        .map(str::to_string);
+        let payload = create_collection_payload(&args).unwrap();
+        assert_eq!(payload["op"], json!("create_collection"));
+        assert_eq!(payload["profile"], json!("columnar"));
+        assert_eq!(payload["ttl_seconds"], json!(3600));
+        assert_eq!(payload["columnar"]["bucket_max_docs"], json!(128));
+        assert_eq!(payload["columnar"]["bucket_max_bytes"], json!(262144));
+        assert_eq!(payload["columnar"]["compression"], json!("max"));
+        assert!(payload.get("timeseries").is_none());
+
+        let current = json!({
+            "bucket_max_docs": 512,
+            "bucket_max_bytes": 524288,
+            "compression": "balanced",
+        });
+        let overrides = ["--bucket-max-docs", "64", "--compression", "fast"].map(str::to_string);
+        let merged = apply_columnar_overrides(&current, &overrides).unwrap();
+        assert_eq!(merged["bucket_max_docs"], json!(64));
+        assert_eq!(merged["bucket_max_bytes"], json!(524288));
+        assert_eq!(merged["compression"], json!("fast"));
+        assert!(apply_columnar_overrides(&current, &["--bogus".to_string()]).is_err());
     }
 
     #[test]

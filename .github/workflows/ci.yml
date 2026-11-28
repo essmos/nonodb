@@ -110,16 +110,28 @@ jobs:
       - name: Build debug binaries for integration tests
         run: cargo build --locked --bins
 
+      - name: Verify pre-columnar binary fails closed
+        run: |
+          curl -sSL -o /tmp/nonodb-old.tar.gz \
+            https://github.com/essmos/nonodb/releases/download/v0.34.0/nonodb-v0.34.0-linux-x86_64.tar.gz
+          tar xzf /tmp/nonodb-old.tar.gz -C /tmp
+          NONODB_DAEMON=target/debug/nonodb-daemon \
+          NONODB_CLI=target/debug/nonodb-cli \
+          NONODB_OLD_DAEMON=/tmp/nonodb-v0.34.0-linux-x86_64/nonodb-daemon \
+            bash scripts/columnar_old_binary_test.sh
+
       - name: Run read-only openCypher TCK baseline
         run: |
           scripts/fetch-opencypher-tck.sh /tmp/opencypher-tck
           python3 scripts/cypher_tck.py             --tck-dir /tmp/opencypher-tck             --daemon target/debug/nonodb-daemon             --output tck-report.json
+          python3 scripts/cypher_tck.py             --tck-dir /tmp/opencypher-tck             --daemon target/debug/nonodb-daemon             --profile columnar             --output tck-columnar-report.json
           python3 - <<'PY'
           import json
-          report = json.load(open("tck-report.json"))
-          assert report["pass_rate"] >= 0.90, report["pass_rate"]
-          assert report["counts"]["known_gap"] == 0, report["counts"]
-          assert report["counts"]["pass"] + report["counts"]["known_gap"] + report["counts"]["unsupported"] == report["total"]
+          for path in ("tck-report.json", "tck-columnar-report.json"):
+              report = json.load(open(path))
+              assert report["pass_rate"] >= 0.90, (path, report["pass_rate"])
+              assert report["counts"]["known_gap"] == 0, (path, report["counts"])
+              assert report["counts"]["pass"] + report["counts"]["known_gap"] + report["counts"]["unsupported"] == report["total"], path
           PY
 
       - name: Test MongoDB wire limits
@@ -139,9 +151,12 @@ jobs:
           python3 scripts/durability_test.py
           python3 scripts/graph_test.py
           python3 scripts/graph_auth_test.py
+          python3 scripts/auth_test.py
+          bash scripts/columnar_cli_test.sh
           python3 scripts/graph_jobs_test.py
           python3 scripts/graph_property_test.py
           python3 scripts/graph_crash_test.py
+          NONODB_GRAPH_PROFILE=columnar python3 scripts/graph_crash_test.py
           python3 scripts/graph_rebuild_crash_test.py
           python3 scripts/graph_replication_test.py
           python3 scripts/gui_test.py
@@ -248,7 +263,9 @@ jobs:
       - name: Run MongoDB conformance and wire smoke tests
         run: |
           python3 scripts/mongo_conformance_test.py
+          NONODB_CONFORMANCE_PROFILE=columnar python3 scripts/mongo_conformance_test.py
           python3 scripts/mongo_wire_test.py
+          python3 scripts/columnar_wire_test.py
           python3 scripts/search_all_test.py
 
       - name: Run MongoDB DDL translation tests
@@ -328,6 +345,10 @@ jobs:
 
       - name: Check macOS/Windows build
         run: cargo check --locked --all-targets --all-features
+
+      - name: Run columnar core tests
+        run: |
+          cargo test --locked -p nonodb-core --test columnar_crud --test columnar_parity --test columnar_writes --test columnar_query --test columnar_aggregation --test columnar_indexes --test columnar_search_graph --test columnar_lifecycle --test columnar_operations
 
       - name: Test APFS clonefile branch method
         if: runner.os == 'macOS'

@@ -245,6 +245,32 @@ def main() -> int:
                 client.post(
                     "/v1/exec",
                     headers=headers,
+                    json={
+                        "op": "create_collection",
+                        "coll": "events",
+                        "profile": "columnar",
+                        "columnar": {"bucket_max_docs": 8, "compression": "max"},
+                    },
+                ).status_code
+                == 200
+            )
+            for index in range(3):
+                assert (
+                    client.post(
+                        "/v1/exec",
+                        headers=headers,
+                        json={
+                            "op": "insert",
+                            "coll": "events",
+                            "doc": {"_id": f"e{index}", "v": index},
+                        },
+                    ).status_code
+                    == 200
+                )
+            assert (
+                client.post(
+                    "/v1/exec",
+                    headers=headers,
                     json={"op": "insert", "coll": "secret", "doc": {"_id": "s1", "x": 2}},
                 ).status_code
                 == 200
@@ -315,6 +341,7 @@ def main() -> int:
             assert restore.returncode == 0, restore.stderr
             report = json.loads(run_cli(auth_file, "verify", str(restored), "--json"))
             assert "orders" in report["collections"], report["collections"]
+            assert report["collections"]["events"]["documents"] == 3, report["collections"]
             assert "secret" not in report["collections"], report["collections"]
 
             assert (
@@ -362,6 +389,9 @@ def main() -> int:
             )
             gzip_report = json.loads(run_cli(auth_file, "verify", str(restored_gzip), "--json"))
             assert "orders" in gzip_report["collections"], gzip_report["collections"]
+            assert gzip_report["collections"]["events"]["documents"] == 3, gzip_report[
+                "collections"
+            ]
 
             encrypted_sidecar_root = temp / "encrypted-sidecars"
             encrypted_sidecar_job = {

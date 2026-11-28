@@ -132,6 +132,14 @@ analyzer is lowercase/diacritic-folding tokenization without stemming or
 stop-word removal,
 so ranking and language behavior are approximate rather than MongoDB-identical.
 
+### Columnar collections
+
+The wire `create` command also accepts a NonoDB `columnar` extension alongside
+the standard MongoDB options. `columnar` and `timeseries` are mutually
+exclusive, and `listCollections` reports `options.columnar`. This is a NonoDB
+profile extension; MongoDB drivers that do not send it create standard
+collections. See [Columnar collections](columnar.md).
+
 ### Tenant IDs and encryption
 
 `tenant_id` is a normal field in a standard collection. It provides logical

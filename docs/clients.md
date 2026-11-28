@@ -851,11 +851,15 @@ daemon. See [Vault collections](vault.md).
 
 All clients expose the common document operations:
 
-- `create_collection` for explicit standard/vault/time-series collection
-  creation, with an optional default TTL (`create_collection_with_ttl` in Rust,
-  optional arguments in Python/Node.js, `CreateCollectionWithTTL` in Go). For
-  time-series, pass the `timeseries` settings object with the required
-  `timeField` (and optional `metaField`, `granularity`, `expireAfterSeconds`);
+- `create_collection` for explicit standard/vault/time-series/columnar
+  collection creation, with an optional default TTL (`create_collection_with_ttl`
+  in Rust, optional arguments in Python/Node.js, `CreateCollectionWithTTL` in
+  Go). For time-series, pass the `timeseries` settings object with the required
+  `timeField` (and optional `metaField`, `granularity`, `expireAfterSeconds`).
+  For columnar, pass `columnar` with optional `bucket_max_docs`,
+  `bucket_max_bytes`, and `compression`;
+- `get_collection_columnar` / `set_collection_columnar` through the wire API,
+  Rust/Python/Node.js/Go clients, and CLI;
 - `get_collection_timeseries` / `set_collection_timeseries` and
   `retain_timeseries` through the wire API and CLI;
 - `set_collection_ttl`/`get_collection_ttl` for insertion-based collection TTL

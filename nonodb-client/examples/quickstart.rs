@@ -79,5 +79,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("search_all: {}", serde_json::to_string(&unified)?);
 
     println!("collections: {:?}", db.collections()?);
+
+    let columnar = "quickstart_columnar";
+    db.create_collection_with_columnar(
+        columnar,
+        json!({"bucket_max_docs": 64, "bucket_max_bytes": 65536, "compression": "max"}),
+    )?;
+    let columnar_coll = db.collection(columnar);
+    columnar_coll.insert(&json!({"kind": "columnar", "n": 1}))?;
+    let settings = db.get_collection_columnar(columnar)?;
+    assert_eq!(settings["columnar"]["bucket_max_docs"], json!(64));
+    assert_eq!(settings["stats"]["rows"], json!(1));
+    db.set_collection_columnar(columnar, json!({"compression": "balanced"}))?;
+    assert_eq!(
+        db.get_collection_columnar(columnar)?["columnar"]["compression"],
+        json!("balanced")
+    );
+    let listed = db.exec(json!({"op": "list_collections"}))?;
+    assert!(listed["collection_info"]
+        .as_array()
+        .is_some_and(|items| items
+            .iter()
+            .any(|item| item["name"] == json!(columnar) && item["profile"] == json!("columnar"))));
     Ok(())
 }

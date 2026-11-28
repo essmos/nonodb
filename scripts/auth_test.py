@@ -57,8 +57,8 @@ def auth_doc() -> dict:
         "version": 1,
         "principals": {
             "admin": {"scopes": ["*:*"]},
-            "app": {"scopes": ["read:orders", "write:orders"]},
-            "reader": {"scopes": ["read:orders"]},
+            "app": {"scopes": ["read:orders", "write:orders", "read:events", "write:events"]},
+            "reader": {"scopes": ["read:orders", "read:events"]},
             "wide": {"scopes": ["read:orders", "read:customers"]},
             "dbadmin": {"scopes": ["admin:app1/*"]},
         },
@@ -162,8 +162,16 @@ def main() -> None:
             # Admin bootstraps two collections.
             admin.create_collection("orders")
             admin.create_collection("customers")
+            admin.create_collection(
+                "events",
+                profile="columnar",
+                columnar={"bucket_max_docs": 8, "compression": "max"},
+            )
             admin.collection("orders").insert({"_id": "o1", "total": 10})
             admin.collection("customers").insert({"_id": "c1", "name": "Ada"})
+            admin.collection("events").insert(
+                {"_id": "e1", "kind": "columnar", "secret": "columnar-payload-secret"}
+            )
             admin.exec({"op": "create_database", "name": "app1"})
 
             # Per-database administrator: full control of app1, none of the
@@ -192,9 +200,10 @@ def main() -> None:
                 == 403
             )
 
-            # Reader: read one collection only.
+            # Reader: read one collection only, including a columnar one.
             assert reader.collection("orders").count({}) == 1
-            assert reader.collections() == ["orders"]
+            assert reader.collection("events").count({}) == 1
+            assert reader.collections() == ["events", "orders"]
             expect_code(
                 lambda: reader.collection("orders").insert({"total": 11}),
                 "forbidden",
@@ -211,8 +220,13 @@ def main() -> None:
                 "forbidden",
             )
 
-            # App: read/write orders, but not admin or another collection.
+            # App: read/write orders and the columnar events collection, but
+            # not admin or another collection.
             app.collection("orders").insert({"_id": "o2", "total": 20})
+            app.collection("events").update(
+                {"_id": "e1"}, {"$set": {"kind": "columnar-updated"}}, multi=False
+            )
+            assert app.collection("events").find_one({"_id": "e1"})["kind"] == "columnar-updated"
             updated = app.sql(
                 "UPDATE orders SET total = $1 WHERE _id = $2",
                 [11, "o1"],
@@ -260,9 +274,9 @@ def main() -> None:
             # Admin-only operations.
             admin.collection("orders").create_index("total")
             assert admin.map_info()["map_size"] > 0
-            assert admin.collections() == ["customers", "orders"]
-            assert reader.collections() == ["orders"]
-            assert app.collections() == ["orders"]
+            assert admin.collections() == ["customers", "events", "orders"]
+            assert reader.collections() == ["events", "orders"]
+            assert app.collections() == ["events", "orders"]
 
             # Metrics require admin:db.
             assert httpx.get(url + "/metrics", timeout=10).status_code == 401
@@ -330,6 +344,13 @@ def main() -> None:
                 r["principal"] == "app" and r["op"] == "insert" and r["result"] == "ok"
                 for r in records
             ), records
+            assert any(
+                r["principal"] == "admin"
+                and r["op"] in ("insert", "update")
+                and r["result"] == "ok"
+                for r in records
+            ), records
+            assert "columnar-payload-secret" not in audit_text
             assert any(
                 r["principal"] == "app" and r["result"] == "error" for r in records
             ), records

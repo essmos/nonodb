@@ -189,12 +189,33 @@ nonodb-cli create-collection orders --ttl 86400
 nonodb-cli create-collection readings --profile timeseries \
   --time-field ts --meta-field device --granularity seconds \
   --compression balanced --expire-after 86400
+nonodb-cli create-collection events --profile columnar \
+  --bucket-max-docs 512 --bucket-max-bytes 524288 --compression balanced
 ```
 
-`--profile` accepts `standard` (default), `vault`, and `timeseries`. A
-time-series profile requires `--time-field`; `--meta-field`, `--granularity`
-(`seconds`/`minutes`/`hours`), `--compression` (`fast`/`balanced`/`max`), and
-`--expire-after` are optional.
+`--profile` accepts `standard` (default), `vault`, `timeseries`, and
+`columnar`. A time-series profile requires `--time-field`; `--meta-field`,
+`--granularity` (`seconds`/`minutes`/`hours`), `--compression`
+(`fast`/`balanced`/`max`), and `--expire-after` are optional. A columnar
+profile accepts optional `--bucket-max-docs`, `--bucket-max-bytes`, and
+`--compression`.
+
+## get-collection-columnar / set-collection-columnar
+
+Read and update columnar settings over the daemon socket:
+
+```bash
+nonodb-cli get-collection-columnar events
+nonodb-cli set-collection-columnar events --compression max
+nonodb-cli set-collection-columnar events --bucket-max-docs 1024
+```
+
+`nonodb-cli inspect <data-dir> <collection>` reports the columnar profile, row
+count, bucket counts, id-map entries, and bucket bytes. `nonodb-cli compact`
+also works on a stopped database that contains columnar collections.
+
+`set-collection-columnar` merges only the flags you pass. The new limits apply
+to new writes; sealed buckets are re-encoded by compaction.
 
 ## get-collection-timeseries / set-collection-timeseries
 

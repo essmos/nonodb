@@ -1597,7 +1597,29 @@ async fn metrics_handler(
     if let Some(auth) = &state.auth {
         auth.refresh_blocked_clients();
     }
-    (StatusCode::OK, Json(metrics::snapshot()))
+    let mut snapshot = metrics::snapshot();
+    let mut columnar = Vec::new();
+    for name in state.store.collections().unwrap_or_default() {
+        if let Ok(Some(stats)) = state.store.columnar_stats(&name) {
+            columnar.push(json!({
+                "collection": name,
+                "rows": stats.rows,
+                "buckets": stats.buckets,
+                "open_buckets": stats.open_buckets,
+                "sealed_buckets": stats.sealed_buckets,
+                "id_entries": stats.id_entries,
+                "deletes": stats.deletes,
+                "data_bytes": stats.data_bytes,
+                "open_bytes": stats.open_bytes,
+                "sealed_bytes": stats.sealed_bytes,
+                "id_bytes": stats.id_bytes,
+            }));
+        }
+    }
+    if let Some(object) = snapshot.as_object_mut() {
+        object.insert("columnar_collections".into(), Value::Array(columnar));
+    }
+    (StatusCode::OK, Json(snapshot))
 }
 
 async fn prometheus_handler(
@@ -1736,6 +1758,25 @@ async fn prometheus_handler(
         &applied,
         &acks,
     );
+    for name in state.store.collections().unwrap_or_default() {
+        if let Ok(Some(stats)) = state.store.columnar_stats(&name) {
+            let fields = [
+                ("nonodb_columnar_rows", stats.rows),
+                ("nonodb_columnar_buckets", stats.buckets),
+                ("nonodb_columnar_open_buckets", stats.open_buckets),
+                ("nonodb_columnar_sealed_buckets", stats.sealed_buckets),
+                ("nonodb_columnar_id_entries", stats.id_entries),
+                ("nonodb_columnar_deletes", stats.deletes),
+                ("nonodb_columnar_data_bytes", stats.data_bytes),
+                ("nonodb_columnar_open_bytes", stats.open_bytes),
+                ("nonodb_columnar_sealed_bytes", stats.sealed_bytes),
+                ("nonodb_columnar_id_bytes", stats.id_bytes),
+            ];
+            for (metric, value) in fields {
+                body.push_str(&format!("{metric}{{collection=\"{name}\"}} {value}\n"));
+            }
+        }
+    }
     (
         [(
             CONTENT_TYPE,
@@ -4133,6 +4174,26 @@ async fn exec_inner(
             read_result(joined).await
         }
 
+        Request::GetCollectionColumnar { coll } => {
+            let store = state.store.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                let settings = store.columnar_settings(&coll)?;
+                let Some(settings) = settings else {
+                    return Err(ApiError::from(nonodb_core::Error::Query(format!(
+                        "collection `{coll}` is not a columnar collection"
+                    ))));
+                };
+                let stats = store.columnar_stats(&coll)?;
+                Ok::<Value, ApiError>(json!({
+                    "coll": coll,
+                    "profile": "columnar",
+                    "columnar": settings,
+                    "stats": stats,
+                }))
+            });
+            read_result(joined).await
+        }
+
         Request::GetCollectionHistory { coll } => {
             let store = state.store.clone();
             let joined = tokio::task::spawn_blocking(move || {
@@ -4297,7 +4358,18 @@ async fn exec_inner(
             let joined = tokio::task::spawn_blocking(move || {
                 let mut collections = store.collections()?;
                 collections.retain(|coll| principal.can_see_collection(&database, coll));
-                Ok::<Value, ApiError>(json!({ "collections": collections }))
+                let info: Vec<_> = store
+                    .collections_info()?
+                    .into_iter()
+                    .filter(|item| {
+                        item.get("name")
+                            .and_then(Value::as_str)
+                            .is_some_and(|name| collections.iter().any(|coll| coll == name))
+                    })
+                    .collect();
+                Ok::<Value, ApiError>(
+                    json!({ "collections": collections, "collection_info": info }),
+                )
             });
             read_result(joined).await
         }
@@ -4471,6 +4543,7 @@ async fn exec_inner(
                     ttl_seconds,
                     ttl_purge_history,
                     timeseries,
+                    columnar,
                 } => {
                     let profile = match profile {
                         Some(raw) => match CollectionProfile::parse(&raw) {
@@ -4501,13 +4574,35 @@ async fn exec_inner(
                         }
                         None => None,
                     };
+                    let columnar = match columnar {
+                        Some(settings) => {
+                            if !profile.is_columnar() {
+                                return respond(Err(nonodb_core::Error::Query(
+                                    "`columnar` settings require profile `columnar`".into(),
+                                )
+                                .into()));
+                            }
+                            if let Err(err) = settings.validate() {
+                                return respond(Err(err.into()));
+                            }
+                            Some(settings)
+                        }
+                        None if profile.is_columnar() => {
+                            Some(nonodb_core::columnar::Settings::default())
+                        }
+                        None => None,
+                    };
                     WriteReq::CreateCollection {
                         coll,
                         profile,
                         ttl_seconds,
                         ttl_purge_history,
                         timeseries,
+                        columnar,
                     }
+                }
+                Request::SetCollectionColumnar { coll, settings } => {
+                    WriteReq::SetCollectionColumnar { coll, settings }
                 }
                 Request::DropCollection { coll } => WriteReq::DropCollection { coll },
                 Request::SetCollectionTimeSeries { coll, settings } => {
@@ -6309,7 +6404,16 @@ fn execute_read(
         Request::ListCollections => {
             let mut collections = store.collections_in(rtxn)?;
             collections.retain(|coll| principal.can_see_collection(database, coll));
-            Ok(json!({ "collections": collections }))
+            let info: Vec<_> = store
+                .collections_info_in(rtxn)?
+                .into_iter()
+                .filter(|item| {
+                    item.get("name")
+                        .and_then(Value::as_str)
+                        .is_some_and(|name| collections.iter().any(|coll| coll == name))
+                })
+                .collect();
+            Ok(json!({ "collections": collections, "collection_info": info }))
         }
         _ => Err(ApiError {
             code: "invalid_query".to_string(),

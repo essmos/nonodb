@@ -66,6 +66,9 @@ pub enum ReplicationOp {
         /// Serialized time-series settings for `profile = "timeseries"`.
         #[serde(default)]
         timeseries: Option<String>,
+        /// Serialized columnar settings for `profile = "columnar"`.
+        #[serde(default)]
+        columnar: Option<String>,
     },
     CollectionDrop {
         name: String,
@@ -74,6 +77,11 @@ pub enum ReplicationOp {
     TimeSeriesRetain {
         coll: String,
         before_ms: i64,
+    },
+    /// Replaces the columnar settings of an existing collection.
+    ColumnarSettings {
+        coll: String,
+        settings: crate::columnar::Settings,
     },
     /// Replaces the time-series settings of an existing collection.
     TimeSeriesSettings {
@@ -352,6 +360,7 @@ mod tests {
                     ttl_field: None,
                     ttl_purge_history: None,
                     timeseries: None,
+                    columnar: None,
                 },
                 ReplicationOp::CollectionDrop {
                     name: "orders".into(),

@@ -86,6 +86,7 @@ def main() -> int:
         "NONODB_DATA": str(tmp / "data"),
         "NONODB_SOCK": str(sock),
         "NONODB_LOG": "warn",
+        "NONODB_TTL_SWEEP_INTERVAL": "1",
     })
     fh = log.open("wb")
     proc = subprocess.Popen([str(daemon)], env=env, stdout=fh, stderr=subprocess.STDOUT)
@@ -120,6 +121,56 @@ def main() -> int:
         stream.close()
 
         # Live events are never written to the outbox.
+        assert db.collection("_events").count({"type": {"$regex": "^subscription\\."}}) == 0
+
+        db.create_collection(
+            "events",
+            profile="columnar",
+            columnar={"bucket_max_docs": 8, "compression": "max"},
+        )
+        events = db.collection("events")
+        columnar_stream = Stream(db, {
+            "op": "watch",
+            "coll": "events",
+            "mode": "live",
+            "filter": {"status": "paid"},
+        })
+        events.insert({"_id": "e1", "status": "paid", "total": 1})
+        event = columnar_stream.next_event()
+        assert event["payload"]["op"] == "insert", event
+        assert event["payload"]["after"]["_id"] == "e1", event
+        events.update({"_id": "e1"}, {"$set": {"total": 2}})
+        event = columnar_stream.next_event()
+        assert event["payload"]["op"] == "update", event
+        assert event["payload"]["after"]["total"] == 2, event
+        events.delete({"_id": "e1"})
+        event = columnar_stream.next_event()
+        assert event["payload"]["op"] == "delete", event
+        events.insert({"_id": "e2", "status": "paid", "total": 3, "_ttl": 1})
+        event = columnar_stream.next_event()
+        assert event["payload"]["op"] == "insert", event
+        event = columnar_stream.next_event()
+        assert event["payload"]["op"] == "delete", event
+        assert event["payload"]["before"]["_id"] == "e2", event
+
+        events.insert({"_id": "b", "status": "paid", "g": "y"})
+        assert columnar_stream.next_event()["payload"]["after"]["_id"] == "b"
+        events.insert({"_id": "a", "status": "paid", "g": "y"})
+        assert columnar_stream.next_event()["payload"]["after"]["_id"] == "a"
+        events.update(
+            {"status": "paid", "g": "y"},
+            {"$set": {"hit": True}},
+            multi=False,
+        )
+        event = columnar_stream.next_event()
+        assert event["payload"]["op"] == "update", event
+        assert event["payload"]["before"]["_id"] == "a", event
+        assert event["payload"]["after"]["_id"] == "a", event
+        events.delete({"status": "paid", "g": "y"}, multi=False)
+        event = columnar_stream.next_event()
+        assert event["payload"]["op"] == "delete", event
+        assert event["payload"]["before"]["_id"] == "a", event
+        columnar_stream.close()
         assert db.collection("_events").count({"type": {"$regex": "^subscription\\."}}) == 0
 
         # SQL writes use the same writer-side live path.

@@ -60,9 +60,128 @@ from nonodb import NonoDB
 db = NonoDB(os.environ["NONODB_SOCK"])
 try:
     db.exec({"op": "create_database", "name": "app1"})
+    db.create_collection(
+        "py_columnar",
+        profile="columnar",
+        columnar={"bucket_max_docs": 64, "compression": "max"},
+    )
+    collection = db.collection("py_columnar")
+    collection.insert({"kind": "columnar", "n": 1})
+    settings = db.get_collection_columnar("py_columnar")
+    assert settings["columnar"]["bucket_max_docs"] == 64
+    assert settings["stats"]["rows"] == 1
+    db.set_collection_columnar("py_columnar", {"compression": "balanced"})
+    assert db.get_collection_columnar("py_columnar")["columnar"]["compression"] == "balanced"
+    listed = db.exec({"op": "list_collections"})
+    entry = next(item for item in listed["collection_info"] if item["name"] == "py_columnar")
+    assert entry["profile"] == "columnar"
+
+    collection.insert({"_id": "rollback", "kind": "old", "n": 2})
+    collection.write_batch([
+        {"op": "insert", "doc": {"_id": "batch", "kind": "batch", "n": 3}},
+        {"op": "update", "filter": {"kind": "columnar"}, "update": {"$inc": {"n": 10}}},
+        {"op": "delete", "filter": {"kind": "old"}},
+    ])
+    assert collection.find_one({"kind": "batch"})["n"] == 3
+    assert collection.find_one({"kind": "columnar"})["n"] == 11
+    assert collection.find_one({"kind": "old"}) is None
+    try:
+        collection.write_batch([
+            {"op": "insert", "doc": {"_id": "dup", "n": 1}},
+            {"op": "insert", "doc": {"_id": "dup", "n": 2}},
+        ])
+    except Exception:
+        pass
+    else:
+        raise AssertionError("duplicate write_batch unexpectedly succeeded")
+    assert collection.find_one({"_id": "dup"}) is None
+
+    for index in range(5):
+        collection.insert({"_id": f"cursor-{index}", "kind": "cursor", "n": index})
+    cursor = collection.find_cursor({"kind": "cursor"}, batch_size=2)
+    assert [doc["_id"] for doc in cursor] == [f"cursor-{index}" for index in range(5)]
+    assert cursor.close() is False
+
+    db.create_collection(
+        "py_cursor_columnar",
+        profile="columnar",
+        columnar={"bucket_max_docs": 2, "compression": "max"},
+    )
+    cursor_column = db.collection("py_cursor_columnar")
+    cursor_column.insert_many(
+        [
+            {"_id": "c3", "n": 3},
+            {"_id": "c0", "n": 0},
+            {"_id": "c4", "n": 4},
+            {"_id": "c1", "n": 1},
+            {"_id": "c2", "n": 2},
+        ]
+    )
+    assert [doc["_id"] for doc in cursor_column.find({})] == [
+        f"c{index}" for index in range(5)
+    ]
+    assert [doc["_id"] for doc in cursor_column.find({}, skip=1, limit=2)] == [
+        "c1",
+        "c2",
+    ]
+    assert cursor_column.find_one({})["_id"] == "c0"
+    assert [
+        doc["_id"]
+        for doc in cursor_column.aggregate([{"$project": {"_id": 1}}, {"$limit": 2}])
+    ] == ["c0", "c1"]
+    cursor = cursor_column.find_cursor({}, sort=[("_id", 1)], batch_size=2)
+    assert [doc["_id"] for doc in cursor] == [f"c{index}" for index in range(5)]
+    assert cursor.close() is False
+    aggregate_cursor = cursor_column.aggregate_cursor(
+        [{"$match": {"n": {"$gte": 2}}}, {"$project": {"_id": 1, "n": 1}}],
+        batch_size=1,
+    )
+    assert [doc["_id"] for doc in aggregate_cursor] == ["c2", "c3", "c4"]
+    assert aggregate_cursor.close() is False
+
+    db.create_collection(
+        "py_unique_columnar",
+        profile="columnar",
+        columnar={"bucket_max_docs": 2, "compression": "max"},
+    )
+    unique = db.collection("py_unique_columnar")
+    unique.insert_many([{"_id": "i0", "v": 1}, {"_id": "i1", "v": 2}])
+    unique.create_index("v", unique=True)
+    for action in (
+        lambda: unique.insert({"_id": "x", "v": 1}),
+        lambda: unique.update({"_id": "i1"}, {"$set": {"v": 1}}),
+        lambda: unique.find_and_modify({"_id": "i1"}, {"$set": {"v": 1}}),
+        lambda: unique.insert_many(
+            [{"_id": "n1", "v": 9}, {"_id": "n2", "v": 1}]
+        ),
+    ):
+        try:
+            action()
+        except Exception:
+            pass
+        else:
+            raise AssertionError("duplicate unique write unexpectedly succeeded")
+        assert unique.find_one({"_id": "i1"})["v"] == 2
+        assert unique.find_one({"v": 1})["_id"] == "i0"
+        assert unique.find_one({"_id": "x"}) is None
+        assert unique.find_one({"_id": "n1"}) is None
+        assert unique.find_one({"_id": "n2"}) is None
 finally:
     db.close()
 PY
+
+echo "== CLI columnar settings"
+CLI="${NONODB_CLI:-$ROOT/target/release/nonodb-cli}"
+if [[ -x "$CLI" ]]; then
+  "$CLI" --db app1 create-collection cli_columnar --profile columnar \
+    --bucket-max-docs 64 --bucket-max-bytes 65536 --compression max
+  "$CLI" --db app1 get-collection-columnar cli_columnar >/dev/null
+  "$CLI" --db app1 set-collection-columnar cli_columnar --compression balanced
+  "$CLI" --db app1 get-collection-columnar cli_columnar | grep -q '"compression": "balanced"'
+  "$CLI" --db app1 collections | grep -q cli_columnar
+else
+  echo "missing $CLI; skipping CLI columnar check" >&2
+fi
 
 echo "== Rust client (database app1)"
 NONODB_DB=app1 cargo run -q -p nonodb-client --example quickstart

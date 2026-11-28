@@ -66,6 +66,12 @@ def main() -> int:
     try:
         wait_for_socket(sock, proc)
         db = NonoDB(str(sock), cache_ttl=0.0)
+        for collection in ("nodes", "edges", "rank_a", "rank_b"):
+            db.create_collection(
+                collection,
+                profile="columnar",
+                columnar={"bucket_max_docs": 256, "compression": "max"},
+            )
         nodes = db.collection("nodes")
         edges = db.collection("edges")
         batch = []
@@ -147,8 +153,6 @@ def main() -> int:
             "analytics worker threads leaked"
         )
 
-        db.create_collection("rank_a")
-        db.create_collection("rank_b")
         exported = nodes.export_graph_job(small["job_id"], "rank_a")
         assert exported["exported"] == 10, exported
         first_ids = sorted(doc["_id"] for doc in db.collection("rank_a").find({}))

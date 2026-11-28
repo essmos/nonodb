@@ -55,8 +55,18 @@ def main() -> int:
         env.update(NONODB_DATA=str(tmp / "data"), NONODB_SOCK=str(sock), NONODB_LOG="warn")
         proc = start(daemon, env, sock)
         db = NonoDB(str(sock), cache_ttl=0.0)
+        profile = os.environ.get("NONODB_GRAPH_PROFILE", "").strip()
+        node_options = {}
+        edge_options = {}
+        if profile == "columnar":
+            node_options = {
+                "profile": "columnar",
+                "columnar": {"bucket_max_docs": 32, "compression": "max"},
+            }
+            edge_options = dict(node_options)
+            db.create_collection("nodes", **node_options)
         nodes = db.collection("nodes")
-        db.create_collection("edges")
+        db.create_collection("edges", **edge_options)
         edges = db.collection("edges")
         nodes.set_graph("edges")
         nodes.insert_many([{"_id": f"n{i}"} for i in range(20)])

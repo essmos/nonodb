@@ -166,5 +166,48 @@ func main() {
 	if err != nil || version == nil {
 		log.Fatalf("get_version: %v %v", version, err)
 	}
+
+	columnarName := fmt.Sprintf("go_columnar_test_%d", time.Now().UnixNano())
+	if err := db.CreateCollectionWithColumnar(ctx, columnarName, map[string]any{
+		"bucket_max_docs":  64,
+		"bucket_max_bytes": 65536,
+		"compression":      "max",
+	}, nil); err != nil {
+		log.Fatal(err)
+	}
+	columnar := db.Collection(columnarName)
+	if _, err := columnar.Insert(ctx, map[string]any{"kind": "columnar", "n": 1}); err != nil {
+		log.Fatal(err)
+	}
+	settings, err := db.GetCollectionColumnar(ctx, columnarName)
+	if err != nil {
+		log.Fatal(err)
+	}
+	columnarPart, _ := settings["columnar"].(map[string]any)
+	if columnarPart["bucket_max_docs"] != float64(64) {
+		log.Fatalf("columnar settings: %v", settings)
+	}
+	statsPart, _ := settings["stats"].(map[string]any)
+	if statsPart["rows"] != float64(1) {
+		log.Fatalf("columnar stats: %v", settings)
+	}
+	if err := db.SetCollectionColumnar(ctx, columnarName, map[string]any{
+		"compression": "balanced",
+	}); err != nil {
+		log.Fatal(err)
+	}
+	names, err := db.Collections(ctx)
+	if err != nil {
+		log.Fatal(err)
+	}
+	foundColumnar := false
+	for _, name := range names {
+		if name == columnarName {
+			foundColumnar = true
+		}
+	}
+	if !foundColumnar {
+		log.Fatalf("columnar collection missing from list: %v", names)
+	}
 	fmt.Println("go client smoke test: ok")
 }

@@ -69,6 +69,7 @@ def main() -> int:
             NONODB_REPLICATION_ORIGIN="test-node",
             NONODB_REPLICATION_PRUNE_INTERVAL="1",
             NONODB_REPLICATION_RETENTION_KEEP="0",
+            NONODB_TTL_SWEEP_INTERVAL="1",
             NONODB_LOG="warn",
         )
         log = open(temp / "daemon.log", "w", encoding="utf-8")
@@ -94,6 +95,14 @@ def main() -> int:
                 return response.json()["result"]
 
             exec({"op": "create_collection", "coll": "orders"})
+            exec(
+                {
+                    "op": "create_collection",
+                    "coll": "events",
+                    "profile": "columnar",
+                    "columnar": {"bucket_max_docs": 8, "compression": "max"},
+                }
+            )
             inserted = exec({"op": "insert", "coll": "orders", "doc": {"_id": "o1", "n": 1}})
             assert inserted["inserted_id"] == "o1"
             exec(
@@ -114,6 +123,25 @@ def main() -> int:
                 }
             )
             exec({"op": "delete", "coll": "orders", "filter": {"_id": "o2"}})
+            exec({"op": "insert", "coll": "events", "doc": {"_id": "e1", "n": 1}})
+            exec(
+                {
+                    "op": "update",
+                    "coll": "events",
+                    "filter": {"_id": "e1"},
+                    "update": {"$inc": {"n": 1}},
+                }
+            )
+            exec(
+                {
+                    "op": "write_batch",
+                    "ops": [
+                        {"op": "insert", "coll": "events", "doc": {"_id": "e2", "n": 2}},
+                        {"op": "insert", "coll": "events", "doc": {"_id": "e3", "n": 3}},
+                    ],
+                }
+            )
+            exec({"op": "delete", "coll": "events", "filter": {"_id": "e2"}})
             exec({"op": "sql", "query": "INSERT INTO orders (_id, n) VALUES ('o4', 4)"})
             exec({"op": "sql", "query": "UPDATE orders SET n = 5 WHERE _id = 'o4'"})
             exec({"op": "sql", "query": "DELETE FROM orders WHERE _id = 'o4'"})
@@ -183,6 +211,7 @@ def main() -> int:
                 NONODB_REPLICATION_ROLE="replica",
                 NONODB_REPLICATION_ENABLED="1",
                 NONODB_REPLICATION_NODE_ID="replica-1",
+                NONODB_TTL_SWEEP_INTERVAL="1",
                 NONODB_REPLICATION_EXIT_ON_GAP="1",
                 NONODB_REPLICATION_SOURCE=f"http://127.0.0.1:{port}",
                 NONODB_REPLICATION_SOURCE_TOKEN=admin,
@@ -250,6 +279,15 @@ def main() -> int:
                 assert replica_exec(
                     {"op": "find_one", "coll": "orders", "filter": {"_id": "o4"}}
                 ) is None
+                assert replica_exec(
+                    {"op": "find_one", "coll": "events", "filter": {"_id": "e1"}}
+                )["n"] == 2
+                assert replica_exec(
+                    {"op": "find_one", "coll": "events", "filter": {"_id": "e2"}}
+                ) is None
+                assert replica_exec(
+                    {"op": "find_one", "coll": "events", "filter": {"_id": "e3"}}
+                )["n"] == 3
 
                 exec(
                     {
@@ -271,16 +309,44 @@ def main() -> int:
                     raise RuntimeError("replica served a stale cached read after apply")
 
                 exec({"op": "insert", "coll": "orders", "doc": {"_id": "o5", "n": 5}})
+                exec({"op": "insert", "coll": "events", "doc": {"_id": "e4", "n": 4}})
                 deadline = time.monotonic() + 20
                 while time.monotonic() < deadline:
                     doc = replica_exec(
                         {"op": "find_one", "coll": "orders", "filter": {"_id": "o5"}}
                     )
-                    if doc and doc.get("n") == 5:
+                    event = replica_exec(
+                        {"op": "find_one", "coll": "events", "filter": {"_id": "e4"}}
+                    )
+                    if doc and doc.get("n") == 5 and event and event.get("n") == 4:
                         break
                     time.sleep(0.1)
                 else:
                     raise RuntimeError("replica did not apply the live change")
+
+                exec(
+                    {
+                        "op": "insert",
+                        "coll": "events",
+                        "doc": {"_id": "e-ttl", "n": 6, "_ttl": 1},
+                    }
+                )
+                deadline = time.monotonic() + 20
+                while time.monotonic() < deadline:
+                    source_event = replica_exec(
+                        {"op": "find_one", "coll": "events", "filter": {"_id": "e1"}}
+                    )
+                    replica_ttl = replica_exec(
+                        {"op": "find_one", "coll": "events", "filter": {"_id": "e-ttl"}}
+                    )
+                    source_ttl = exec(
+                        {"op": "find_one", "coll": "events", "filter": {"_id": "e-ttl"}}
+                    )
+                    if replica_ttl is None and source_ttl is None and source_event:
+                        break
+                    time.sleep(0.2)
+                else:
+                    raise RuntimeError("TTL expiry did not replicate as a delete")
 
                 source_demote = client.post(
                     "/v1/replication/demote",
@@ -297,12 +363,16 @@ def main() -> int:
                 assert source_promote.status_code == 200, source_promote.text
                 assert source_promote.json()["result"]["role"]["epoch"] == 2
                 exec({"op": "insert", "coll": "orders", "doc": {"_id": "o6", "n": 6}})
+                exec({"op": "insert", "coll": "events", "doc": {"_id": "e5", "n": 5}})
                 deadline = time.monotonic() + 20
                 while time.monotonic() < deadline:
                     doc = replica_exec(
                         {"op": "find_one", "coll": "orders", "filter": {"_id": "o6"}}
                     )
-                    if doc and doc.get("n") == 6:
+                    event = replica_exec(
+                        {"op": "find_one", "coll": "events", "filter": {"_id": "e5"}}
+                    )
+                    if doc and doc.get("n") == 6 and event and event.get("n") == 5:
                         break
                     time.sleep(0.1)
                 else:

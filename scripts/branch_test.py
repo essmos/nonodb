@@ -137,6 +137,23 @@ def main() -> int:
             collection.create_text_index("bio")
             collection.create_fuzzy_index("bio")
             collection.create_vector_index("vec", 2, "cosine")
+            db.create_collection(
+                "events",
+                profile="columnar",
+                columnar={"bucket_max_docs": 2, "compression": "max"},
+            )
+            db.set_collection_history("events", 10)
+            events = db.collection("events")
+            events.insert_many(
+                [
+                    {"_id": f"e{i}", "kind": "columnar", "n": i}
+                    for i in range(3)
+                ]
+            )
+            events.update({"_id": "e0"}, {"$set": {"n": 10}}, multi=False)
+            events.create_text_index("kind")
+            events.create_fuzzy_index("kind")
+            assert [entry["op"] for entry in events.history("e0")] == ["update", "insert"]
             db.close()
             admin.close()
         finally:
@@ -153,7 +170,7 @@ def main() -> int:
         assert output["elapsed_ms"] >= 0
         if output["method"] == "copy":
             assert "reflink unavailable" in output["warning"], output
-        assert output["verification"]["documents"] == 5, output
+        assert output["verification"]["documents"] == 8, output
         assert output["verification"]["path"] == str(data / "branch"), output
         assert (data / "branch" / "search").is_dir(), output
         assert not (data / "branch" / "lock.mdb").exists(), output
@@ -173,7 +190,7 @@ def main() -> int:
             "--verify",
         )
         assert no_sidecars["sidecars"] == [], no_sidecars
-        assert no_sidecars["verification"]["documents"] == 5, no_sidecars
+        assert no_sidecars["verification"]["documents"] == 8, no_sidecars
 
         # Build the real daemon snapshot shape: only data-<ms>.mdb, no sidecars.
         backup = tmp / "backup"
@@ -186,7 +203,7 @@ def main() -> int:
         snapshot_output = branch_json(
             cli, "snapshot", "--from-snapshot", str(snapshot), "--data", str(data), "--verify"
         )
-        assert snapshot_output["verification"]["documents"] == 5, snapshot_output
+        assert snapshot_output["verification"]["documents"] == 8, snapshot_output
         assert snapshot_output["sidecars"] == ["search"], snapshot_output
         assert snapshot_output["sidecar_rebuilds"] >= 2, snapshot_output
         assert (data / "snapshot" / "search").is_dir(), snapshot_output
@@ -200,6 +217,24 @@ def main() -> int:
             assert source_db.collection(COLL).count() == 5
             assert branch_db.collection(COLL).count() == 5
             assert snapshot_db.collection(COLL).count() == 5
+            for database in (source_db, branch_db, snapshot_db):
+                events = database.collection("events")
+                assert events.count() == 3
+                assert events.find_one({"_id": "e0"})["n"] == 10
+                assert [entry["op"] for entry in events.history("e0")] == [
+                    "update",
+                    "insert",
+                ], database
+                assert len(
+                    events.search_all(
+                        mode="lexical", query="columnar", fields=["kind"], limit=10
+                    )
+                ) == 3, database
+                assert len(
+                    events.search_all(
+                        mode="fuzzy", query="columnr", fields=["kind"], max_distance=2, limit=10
+                    )
+                ) >= 1, database
             expected_ids = ["0", "1", "2", "3", "4"]
             assert [
                 d["_id"] for d in branch_db.collection(COLL).search("bio", "rust")
@@ -211,9 +246,13 @@ def main() -> int:
             hits = snapshot_db.collection(COLL).vector_search("vec", [0, 1], limit=3)
             assert hits and hits[0]["_id"] == "0", hits
             branch_db.collection(COLL).insert({"_id": "branch-only", "n": 99})
+            branch_db.collection("events").insert({"_id": "branch-event", "n": 99})
             assert branch_db.collection(COLL).count() == 6
             assert source_db.collection(COLL).count() == 5
             assert snapshot_db.collection(COLL).count() == 5
+            assert branch_db.collection("events").count() == 4
+            assert source_db.collection("events").count() == 3
+            assert snapshot_db.collection("events").count() == 3
             source_db.close()
             branch_db.close()
             snapshot_db.close()

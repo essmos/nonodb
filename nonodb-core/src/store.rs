@@ -87,6 +87,9 @@ pub struct CollectionSpace {
     pub indexes: u64,
     pub history_bytes: u64,
     pub ttl_bytes: u64,
+    pub id_bytes: u64,
+    pub logical_bytes: u64,
+    pub physical_bytes: u64,
     pub total_bytes: u64,
     pub requests_last_minute: u64,
     pub avg_requests_per_second: f64,
@@ -892,6 +895,54 @@ impl Store {
         Ok(collection)
     }
 
+    /// Creates a general-purpose columnar collection.
+    pub fn create_columnar_collection(
+        &self,
+        name: &str,
+        settings: &crate::columnar::Settings,
+    ) -> Result<Collection<'_>> {
+        settings.validate()?;
+        let mut wtxn = self.write_txn()?;
+        let collection = self.create_collection_with_ttl_and_purge_in(
+            &mut wtxn,
+            name,
+            CollectionProfile::Columnar,
+            None,
+            None,
+        )?;
+        collection.set_columnar_settings_in(&mut wtxn, settings)?;
+        let _ = self.env.create_database::<Bytes, Bytes>(
+            &mut wtxn,
+            Some(&format!("{}{name}", crate::columnar::DB_PREFIX)),
+        )?;
+        wtxn.commit()?;
+        Ok(collection)
+    }
+
+    /// Rewrites a columnar collection into fresh sealed buckets.
+    pub fn compact_columnar(&self, name: &str) -> Result<usize> {
+        let mut wtxn = self.write_txn()?;
+        let collection = self.collection_in(&mut wtxn, name)?;
+        let Some(settings) = collection.columnar_settings_in(&wtxn)? else {
+            return Ok(0);
+        };
+        let rows = crate::columnar::compact(&mut wtxn, &self.env, name, &settings)?;
+        wtxn.commit()?;
+        Ok(rows)
+    }
+
+    /// Seals the open columnar bucket.
+    pub fn seal_columnar(&self, name: &str) -> Result<usize> {
+        let mut wtxn = self.write_txn()?;
+        let collection = self.collection_in(&mut wtxn, name)?;
+        let Some(settings) = collection.columnar_settings_in(&wtxn)? else {
+            return Ok(0);
+        };
+        let sealed = crate::columnar::seal_all(&mut wtxn, &self.env, name, &settings)?;
+        wtxn.commit()?;
+        Ok(sealed)
+    }
+
     /// Creates a collection with an optional default document TTL.
     pub fn create_collection_with_ttl(
         &self,
@@ -1179,6 +1230,43 @@ impl Store {
         let out = match collection {
             Some(collection) => collection.timeseries_settings_in(&rtxn)?,
             None => None,
+        };
+        rtxn.commit()?;
+        Ok(out)
+    }
+
+    /// Columnar settings for `name`, or `None` when it is not columnar.
+    pub fn columnar_settings(&self, name: &str) -> Result<Option<crate::columnar::Settings>> {
+        let rtxn = self.read_txn()?;
+        let out = match self.collection_at(&rtxn, name)? {
+            Some(collection) => collection.columnar_settings_in(&rtxn)?,
+            None => None,
+        };
+        rtxn.commit()?;
+        Ok(out)
+    }
+
+    /// Replaces columnar settings for an existing collection.
+    pub fn set_columnar_settings(
+        &self,
+        name: &str,
+        settings: &crate::columnar::Settings,
+    ) -> Result<()> {
+        let mut wtxn = self.write_txn()?;
+        let collection = self.collection_in(&mut wtxn, name)?;
+        collection.set_columnar_settings_in(&mut wtxn, settings)?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    /// Storage statistics for a columnar collection.
+    pub fn columnar_stats(&self, name: &str) -> Result<Option<crate::columnar::Stats>> {
+        let rtxn = self.read_txn()?;
+        let out = match self.collection_at(&rtxn, name)? {
+            Some(collection) if collection.profile().is_columnar() => {
+                Some(crate::columnar::stats(&rtxn, self.env(), name)?)
+            }
+            _ => None,
         };
         rtxn.commit()?;
         Ok(out)
@@ -3298,6 +3386,9 @@ impl Store {
         if collection.profile().is_timeseries() {
             crate::timeseries::clear(wtxn, &self.env, name)?;
         }
+        if collection.profile().is_columnar() {
+            crate::columnar::clear(wtxn, &self.env, name)?;
+        }
 
         if let Some(db) = self.env.open_database::<Bytes, Bytes>(&*wtxn, Some(name))? {
             db.clear(&mut *wtxn)?;
@@ -3310,6 +3401,7 @@ impl Store {
             format!("ttl:{name}"),
             format!("ttl_purge:{name}"),
             format!("{}{name}", crate::timeseries::SETTINGS_META_PREFIX),
+            format!("{}{name}", crate::columnar::SETTINGS_META_PREFIX),
             subscriptions::meta_key(name),
             graph::node_def_key(name),
             graph::edge_def_key(name),
@@ -3869,6 +3961,7 @@ impl Store {
                 ttl_field,
                 ttl_purge_history,
                 timeseries,
+                columnar,
             } => {
                 let profile = CollectionProfile::parse(profile)?;
                 let collection = self.create_collection_with_ttl_and_purge_in(
@@ -3881,6 +3974,10 @@ impl Store {
                 if let Some(raw) = timeseries {
                     let settings: crate::timeseries::Settings = serde_json::from_str(raw)?;
                     collection.set_timeseries_settings_in(wtxn, &settings)?;
+                }
+                if let Some(raw) = columnar {
+                    let settings: crate::columnar::Settings = serde_json::from_str(raw)?;
+                    collection.set_columnar_settings_in(wtxn, &settings)?;
                 }
                 if let (Some(field), Some(seconds)) = (ttl_field.as_deref(), ttl_seconds) {
                     self.set_collection_ttl_after_in(
@@ -3903,6 +4000,10 @@ impl Store {
                 let collection = self.collection_in(&mut *wtxn, coll)?;
                 collection.set_timeseries_settings_in(wtxn, settings)?;
                 Ok(())
+            }
+            ReplicationOp::ColumnarSettings { coll, settings } => {
+                let collection = self.collection_in(&mut *wtxn, coll)?;
+                collection.set_columnar_settings_in(wtxn, settings)
             }
             ReplicationOp::CollectionTtl {
                 coll,
@@ -4189,6 +4290,38 @@ impl Store {
         Ok(out)
     }
 
+    /// Names, profiles, and profile settings for every registered collection.
+    pub fn collections_info(&self) -> Result<Vec<Value>> {
+        let rtxn = self.read_txn()?;
+        let out = self.collections_info_in(&rtxn)?;
+        rtxn.commit()?;
+        Ok(out)
+    }
+
+    /// Names, profiles, and profile settings inside an existing read transaction.
+    pub fn collections_info_in(&self, rtxn: &RoTxn<'_>) -> Result<Vec<Value>> {
+        let mut out = Vec::new();
+        for name in self.collections_in(rtxn)? {
+            let Some(collection) = self.collection_at(rtxn, &name)? else {
+                continue;
+            };
+            let mut info = serde_json::Map::new();
+            info.insert("name".into(), Value::String(name));
+            info.insert(
+                "profile".into(),
+                Value::String(collection.profile().as_str().to_string()),
+            );
+            if let Some(settings) = collection.columnar_settings_in(rtxn)? {
+                info.insert("columnar".into(), serde_json::to_value(settings)?);
+            }
+            if let Some(settings) = collection.timeseries_settings_in(rtxn)? {
+                info.insert("timeseries".into(), serde_json::to_value(settings)?);
+            }
+            out.push(Value::Object(info));
+        }
+        Ok(out)
+    }
+
     /// Per-collection record counts and storage estimates for the current
     /// database. Data/index bytes use LMDB B-tree page allocation; history and
     /// TTL bytes are measured from shared key/value entries. The file
@@ -4250,6 +4383,9 @@ impl Store {
                 indexes: stats.indexes,
                 history_bytes,
                 ttl_bytes,
+                id_bytes: stats.id_bytes,
+                logical_bytes: stats.logical_bytes,
+                physical_bytes: total,
                 total_bytes: total,
                 requests_last_minute: 0,
                 avg_requests_per_second: 0.0,
@@ -4310,6 +4446,34 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::parse_size;
+
+    #[test]
+    fn unknown_collection_profile_fails_closed() {
+        use crate::heed::types::Bytes;
+        let dir = tempfile::tempdir().unwrap();
+        let store = super::Store::open(dir.path()).unwrap();
+        store
+            .create_collection("docs", crate::vault::CollectionProfile::Standard)
+            .unwrap();
+        let mut wtxn = store.write_txn().unwrap();
+        let meta = store
+            .env()
+            .create_database::<Bytes, Bytes>(&mut wtxn, Some(super::META_DB))
+            .unwrap();
+        meta.put(
+            &mut wtxn,
+            super::Store::profile_key("docs").as_bytes(),
+            b"binary-does-not-know-this-profile",
+        )
+        .unwrap();
+        wtxn.commit().unwrap();
+        let error = match store.collection("docs") {
+            Ok(_) => panic!("unknown profile unexpectedly opened"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("unknown collection profile"));
+        assert!(store.collections().unwrap().contains(&"docs".to_string()));
+    }
 
     #[test]
     fn drop_collection_removes_data_indexes_and_metadata() {

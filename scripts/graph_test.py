@@ -276,8 +276,12 @@ def main() -> int:
         assert all(0.0 <= item["vector_score"] <= 1.0 for item in l2["items"]), l2
 
         # TTL expiry removes edge adjacency through the same hook.
-        db.create_collection("tnodes")
-        db.create_collection("tedges")
+        db.create_collection(
+            "tnodes", profile="columnar", columnar={"bucket_max_docs": 8}
+        )
+        db.create_collection(
+            "tedges", profile="columnar", columnar={"bucket_max_docs": 8}
+        )
         tnodes = db.collection("tnodes")
         tedges = db.collection("tedges")
         tnodes.insert({"_id": "n1"})
@@ -359,8 +363,16 @@ def main() -> int:
 
         # Online rebuild mirrors writes into the target generation and swaps
         # only after a complete scan; reads use the old generation meanwhile.
-        db.create_collection("onodes")
-        db.create_collection("oedges")
+        db.create_collection(
+            "onodes",
+            profile="columnar",
+            columnar={"bucket_max_docs": 4, "compression": "max"},
+        )
+        db.create_collection(
+            "oedges",
+            profile="columnar",
+            columnar={"bucket_max_docs": 4, "compression": "max"},
+        )
         onodes = db.collection("onodes")
         oedges = db.collection("oedges")
         for i in range(5):
