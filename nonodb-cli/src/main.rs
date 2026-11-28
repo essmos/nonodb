@@ -731,9 +731,10 @@ fn usage() -> Result<(), String> {
          replication [status|changes [after] [limit]|source <url> [dbs] [interval]|pause|resume|disconnect|forget <node>|acks|prune <seq> [--require-acks]|promote <epoch> [--force]|demote <epoch> [role] [successor]|add-replica <name> [dbs]|pairings|revoke <code>|join <primary-url> [code]]\n\
          instances [--json] [prune] lista lokalnych daemonów\n\
          collections                lista kolekcji\n\
-         create-collection <nazwa> [--profile standard|vault|timeseries] [--time-field pole]\n\
-              [--meta-field pole] [--granularity seconds|minutes|hours]\n\
+         create-collection <nazwa> [--profile standard|vault|timeseries|columnar]\n\
+              [--time-field pole] [--meta-field pole] [--granularity seconds|minutes|hours]\n\
               [--compression fast|balanced|max] [--expire-after sekundy] [--ttl sekundy]\n\
+              [--bucket-max-docs N] [--bucket-max-bytes N]\n\
          get-collection-timeseries <coll>    odczyt ustawień time-series\n\
          set-collection-timeseries <coll> [--time-field pole] [--meta-field pole]\n\
               [--granularity ...] [--compression ...] [--expire-after N|none]\n\
