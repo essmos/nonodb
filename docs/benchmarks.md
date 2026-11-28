@@ -445,17 +445,25 @@ Kafka `acks=all` + `log.flush.interval.messages=1`. 20k events per phase.
   directory is dominated by segment files. Kafka wins nothing here on this
   single-node, single-partition-per-consumer setup: its consumers are capped by
   the Python client, and 4 consumers do not beat 2.
-- **Durability costs throughput, but these three configurations are not
-  equivalent.** Produce dropped from 14 700 to 8 500 ev/s on nonodb (−42%), from
-  45 700 to 27 800 on Redis (−39%), and from 13 100 to 9 100 on Kafka (−31%) when
-  going from the relaxed row to the full row. That is a sensitivity check, not a
-  like-for-like durability benchmark: nonodb and Redis fsync once per commit or
-  pipeline batch, while Kafka was pinned to `log.flush.interval.messages=1`, which
-  flushes **per message** and is stricter than how Kafka is normally deployed
-  (replication, with the OS flushing segments). Kafka's in-Kafka durability story
-  is replica acknowledgement, not fsync; on a single node there is nothing to
+- **`durability: "relaxed"` buys much less than it sounds like.** The LMDB
+  environment is opened with `NO_META_SYNC`, so a commit still `fsync`s the data
+  pages and only skips the meta page. Measured at the store level, one document
+  per transaction: 1 141 commits/s with the default path and 1 278 commits/s with
+  the relaxed path — about the same, and both bound by the ~0.85 ms `fsync` on
+  this filesystem. Only `durability: "unsafe"` (which requires
+  `NONODB_ALLOW_UNSAFE_WRITES=1`) actually skips the sync. Plan capacity around
+  `full`, and treat `relaxed` as a small win, not a mode change.
+- **The durability comparison is a sensitivity check, not a like-for-like
+  benchmark.** Produce dropped from 14 700 to 8 500 ev/s on nonodb, 45 700 to
+  27 800 on Redis, and 13 100 to 9 100 on Kafka between the relaxed and full rows.
+  Those configurations are not equivalent: nonodb and Redis fsync once per commit
+  or pipeline batch, while Kafka was pinned to `log.flush.interval.messages=1`,
+  which flushes **per message** and is stricter than how Kafka is normally
+  deployed (replication, with the OS flushing segments). Kafka's durability story
+  is replica acknowledgement, not `fsync`; on a single node there is nothing to
   acknowledge to. The drops are also single runs at different event counts
-  (50k relaxed, 20k durable).
+  (50k relaxed, 20k durable), and the host got measurably slower across repeats,
+  so treat the deltas as ±10 points.
 - **Disk numbers for containers are incomplete.** `cgroup` I/O counters read 0
   for the containers on this host (overlayfs on ZFS), so only the data-directory
   growth is shown for Redis and Kafka. nonodb runs as a host process, so its
@@ -495,9 +503,14 @@ python3 scripts/streams_bench.py --backend kafka  --events 50000 --consumers 1,2
 - **RSS is not heap.** Large RSS values after scans mostly reflect mapped LMDB
   pages.
 - **Streams are commit-bound, not CPU-bound.** Every batched nonodb write pays a
-  real transaction; the group-commit window batches concurrent requests into one
-  commit. That is why `insert_many`/`watch limit` matter far more than client
-  concurrency, and why producer throughput does not scale with connections.
+  real transaction and one `fsync`; the group-commit window batches concurrent
+  requests into one commit. That is why `insert_many`/`watch limit` matter far
+  more than client concurrency, and why producer throughput does not scale with
+  connections. Measured directly against the store (no daemon, no client):
+  1 141 documents/s at one transaction per document versus 29 800 at 100 documents
+  per transaction on the same filesystem — the per-commit `fsync` is 0.85 ms and
+  everything else is noise. Batching is the only lever that moves this number by
+  an order of magnitude.
 
 ## Graph traversal vs Neo4j Community
 
