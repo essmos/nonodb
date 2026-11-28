@@ -2455,12 +2455,32 @@ fn inspect(data: &Path, only: Option<&str>) -> Result<(), String> {
         if only.is_some_and(|o| o != name) {
             continue;
         }
+        let profile = meta
+            .get(&rtxn, format!("profile:{name}").as_bytes())
+            .map_err(|e| e.to_string())?
+            .and_then(|raw| std::str::from_utf8(raw).ok())
+            .unwrap_or("standard")
+            .to_string();
+        if profile == "columnar" {
+            let stats =
+                nonodb_core::columnar::stats(&rtxn, &env, &name).map_err(|e| e.to_string())?;
+            println!(
+                "  {name}: {} docs ({profile}, {} buckets: {} open, {} sealed, {} id entries, {} data bytes)",
+                stats.rows,
+                stats.buckets,
+                stats.open_buckets,
+                stats.sealed_buckets,
+                stats.id_entries,
+                stats.data_bytes,
+            );
+            continue;
+        }
         if let Some(db) = env
             .open_database::<Bytes, Bytes>(&rtxn, Some(&name))
             .map_err(|e| e.to_string())?
         {
             let entries = db.stat(&rtxn).map_err(|e| e.to_string())?.entries;
-            println!("  {name}: {entries} docs");
+            println!("  {name}: {entries} docs ({profile})");
         }
     }
     let _ = rtxn.commit();

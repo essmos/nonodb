@@ -129,6 +129,22 @@ async function main() {
   const deleted = await users.delete({ name: 'Atomic' });
   assert.equal(deleted, 1);
 
+  const columnarName = `node_columnar_${Date.now()}`;
+  await db.createCollection(columnarName, 'columnar', null, null, null, {
+    bucket_max_docs: 64,
+    compression: 'max',
+  });
+  const columnar = db.collection(columnarName);
+  await columnar.insert({ kind: 'columnar', n: 1 });
+  const columnarSettings = await db.getCollectionColumnar(columnarName);
+  assert.equal(columnarSettings.columnar.bucket_max_docs, 64);
+  assert.equal(columnarSettings.stats.rows, 1);
+  await db.setCollectionColumnar(columnarName, { compression: 'balanced' });
+  assert.equal((await db.getCollectionColumnar(columnarName)).columnar.compression, 'balanced');
+  const listed = await db.exec({ op: 'list_collections' });
+  const entry = listed.collection_info.find((item) => item.name === columnarName);
+  assert.equal(entry.profile, 'columnar');
+
   console.log('node client smoke test: ok');
 }
 

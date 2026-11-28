@@ -249,6 +249,7 @@ jobs:
         run: |
           python3 scripts/mongo_conformance_test.py
           python3 scripts/mongo_wire_test.py
+          python3 scripts/columnar_wire_test.py
           python3 scripts/search_all_test.py
 
       - name: Run MongoDB DDL translation tests

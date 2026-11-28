@@ -4634,6 +4634,20 @@ mod tests {
     }
 
     #[test]
+    fn list_collections_renders_columnar_options() {
+        let settings: nonodb_core::columnar::Settings = serde_json::from_value(serde_json::json!({
+            "bucket_max_docs": 128,
+            "bucket_max_bytes": 262_144,
+            "compression": "max",
+        }))
+        .unwrap();
+        let options = columnar_options_doc(&settings);
+        assert_eq!(options.get_i64("bucketMaxDocs").unwrap(), 128);
+        assert_eq!(options.get_i64("bucketMaxBytes").unwrap(), 262_144);
+        assert_eq!(options.get_str("compression").unwrap(), "max");
+    }
+
+    #[test]
     fn list_collections_renders_timeseries_options() {
         let settings = nonodb_core::timeseries::Settings {
             time_field: "ts".into(),

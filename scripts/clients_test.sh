@@ -60,9 +60,37 @@ from nonodb import NonoDB
 db = NonoDB(os.environ["NONODB_SOCK"])
 try:
     db.exec({"op": "create_database", "name": "app1"})
+    db.create_collection(
+        "py_columnar",
+        profile="columnar",
+        columnar={"bucket_max_docs": 64, "compression": "max"},
+    )
+    collection = db.collection("py_columnar")
+    collection.insert({"kind": "columnar", "n": 1})
+    settings = db.get_collection_columnar("py_columnar")
+    assert settings["columnar"]["bucket_max_docs"] == 64
+    assert settings["stats"]["rows"] == 1
+    db.set_collection_columnar("py_columnar", {"compression": "balanced"})
+    assert db.get_collection_columnar("py_columnar")["columnar"]["compression"] == "balanced"
+    listed = db.exec({"op": "list_collections"})
+    entry = next(item for item in listed["collection_info"] if item["name"] == "py_columnar")
+    assert entry["profile"] == "columnar"
 finally:
     db.close()
 PY
+
+echo "== CLI columnar settings"
+CLI="${NONODB_CLI:-$ROOT/target/release/nonodb-cli}"
+if [[ -x "$CLI" ]]; then
+  "$CLI" --db app1 create-collection cli_columnar --profile columnar \
+    --bucket-max-docs 64 --bucket-max-bytes 65536 --compression max
+  "$CLI" --db app1 get-collection-columnar cli_columnar >/dev/null
+  "$CLI" --db app1 set-collection-columnar cli_columnar --compression balanced
+  "$CLI" --db app1 get-collection-columnar cli_columnar | grep -q '"compression": "balanced"'
+  "$CLI" --db app1 collections | grep -q cli_columnar
+else
+  echo "missing $CLI; skipping CLI columnar check" >&2
+fi
 
 echo "== Rust client (database app1)"
 NONODB_DB=app1 cargo run -q -p nonodb-client --example quickstart

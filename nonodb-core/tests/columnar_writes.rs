@@ -1,0 +1,137 @@
+//! Differential write-operator, batch, and id coverage for columnar collections.
+
+use nonodb_core::{Collection, CollectionProfile, Store};
+use serde_json::{json, Value};
+
+fn query() -> nonodb_core::FindQuery {
+    nonodb_core::FindQuery {
+        sort: vec![("_id".into(), 1)],
+        ..Default::default()
+    }
+}
+
+fn setup() -> (
+    tempfile::TempDir,
+    tempfile::TempDir,
+    Collection<'static>,
+    Collection<'static>,
+) {
+    let sd = tempfile::tempdir().unwrap();
+    let cd = tempfile::tempdir().unwrap();
+    let ss: &'static Store = Box::leak(Box::new(Store::open(sd.path()).unwrap()));
+    let cs: &'static Store = Box::leak(Box::new(Store::open(cd.path()).unwrap()));
+    let sc = ss
+        .create_collection("docs", CollectionProfile::Standard)
+        .unwrap();
+    let cc = cs
+        .create_columnar_collection("docs", &nonodb_core::columnar::Settings::default())
+        .unwrap();
+    let doc = json!({
+        "_id": "a",
+        "n": 5,
+        "s": "alpha",
+        "arr": [1, 2, 3],
+        "items": [{"k": "a", "q": 1}, {"k": "b", "q": 2}],
+        "nested": {"x": 1, "y": 2},
+        "nullable": null,
+    });
+    sc.insert_one(doc.clone()).unwrap();
+    cc.insert_one(doc).unwrap();
+    (sd, cd, sc, cc)
+}
+
+fn assert_same(sc: &Collection<'_>, cc: &Collection<'_>, step: &str) {
+    assert_eq!(
+        sc.find(&query()).unwrap(),
+        cc.find(&query()).unwrap(),
+        "documents after {step}"
+    );
+}
+
+#[test]
+fn update_operators_and_replacements_match_standard() {
+    let (_sd, _cd, sc, cc) = setup();
+    let updates = [
+        json!({"$inc": {"n": 2, "nested.x": -1}}),
+        json!({"$mul": {"n": 3}}),
+        json!({"$min": {"n": 4}, "$max": {"nested.y": 10}}),
+        json!({"$rename": {"s": "label"}}),
+        json!({"$set": {"nullable": 0, "new.deep": {"v": true}}}),
+        json!({"$unset": {"nullable": "", "new.deep": ""}}),
+        json!({"$push": {"arr": {"$each": [4, 5], "$sort": 1, "$slice": -3}}}),
+        json!({"$addToSet": {"arr": {"$each": [5, 6]}}}),
+        json!({"$pull": {"arr": {"$gte": 5}}}),
+        json!({"$pop": {"arr": -1}}),
+        json!({"$set": {"items.$[el].q": 99}}),
+    ];
+    for (index, update) in updates.iter().enumerate() {
+        let filters: &[Value] = if index == updates.len() - 1 {
+            &[json!({"items.k": "b"})]
+        } else {
+            &[json!({"_id": "a"})]
+        };
+        for filter in filters {
+            let array_filters: &[Value] = if index == updates.len() - 1 {
+                &[json!({"el.k": "b"})]
+            } else {
+                &[]
+            };
+            let result_s = sc
+                .update_opts_filtered(filter, update, false, false, array_filters)
+                .unwrap();
+            let result_c = cc
+                .update_opts_filtered(filter, update, false, false, array_filters)
+                .unwrap();
+            assert_eq!(
+                result_s.modified, result_c.modified,
+                "step {index} {update}"
+            );
+            assert_same(&sc, &cc, &format!("{index} {update}"));
+        }
+    }
+
+    let replacement = json!({"_id": "a", "n": 1, "arr": [], "items": [], "nested": {}});
+    sc.update(&json!({"_id": "a"}), &replacement, false)
+        .unwrap();
+    cc.update(&json!({"_id": "a"}), &replacement, false)
+        .unwrap();
+    assert_same(&sc, &cc, "replacement");
+}
+
+#[test]
+fn insert_many_order_duplicate_atomicity_and_bson_ids_match_standard() {
+    let sd = tempfile::tempdir().unwrap();
+    let cd = tempfile::tempdir().unwrap();
+    let ss = Store::open(sd.path()).unwrap();
+    let cs = Store::open(cd.path()).unwrap();
+    let sc = ss
+        .create_collection("docs", CollectionProfile::Standard)
+        .unwrap();
+    let cc = cs
+        .create_columnar_collection("docs", &nonodb_core::columnar::Settings::default())
+        .unwrap();
+    let docs = vec![
+        json!({"_id": "b", "n": 2}),
+        json!({"_id": "a", "n": 1}),
+        json!({"_id": {"$oid": "0123456789abcdef01234567"}, "n": 3}),
+    ];
+    let mut sw = ss.write_txn().unwrap();
+    let ids_s = sc.insert_many_txn(&mut sw, &docs).unwrap();
+    sw.commit().unwrap();
+    let mut cw = cs.write_txn().unwrap();
+    let ids_c = cc.insert_many_txn(&mut cw, &docs).unwrap();
+    cw.commit().unwrap();
+    assert_eq!(ids_s, ids_c);
+    assert_same(&sc, &cc, "insert_many");
+
+    let duplicate = vec![json!({"_id": "fresh"}), json!({"_id": "a"})];
+    let mut sw = ss.write_txn().unwrap();
+    let err_s = sc.insert_many_txn(&mut sw, &duplicate).unwrap_err();
+    drop(sw);
+    let mut cw = cs.write_txn().unwrap();
+    let err_c = cc.insert_many_txn(&mut cw, &duplicate).unwrap_err();
+    drop(cw);
+    assert_eq!(err_s.to_string(), err_c.to_string());
+    assert!(sc.find_by_key("fresh").unwrap().is_none());
+    assert!(cc.find_by_key("fresh").unwrap().is_none());
+}

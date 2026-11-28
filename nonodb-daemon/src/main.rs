@@ -1594,7 +1594,25 @@ async fn metrics_handler(
     if let Some(auth) = &state.auth {
         auth.refresh_blocked_clients();
     }
-    (StatusCode::OK, Json(metrics::snapshot()))
+    let mut snapshot = metrics::snapshot();
+    let mut columnar = Vec::new();
+    for name in state.store.collections().unwrap_or_default() {
+        if let Ok(Some(stats)) = state.store.columnar_stats(&name) {
+            columnar.push(json!({
+                "collection": name,
+                "rows": stats.rows,
+                "buckets": stats.buckets,
+                "open_buckets": stats.open_buckets,
+                "sealed_buckets": stats.sealed_buckets,
+                "id_entries": stats.id_entries,
+                "data_bytes": stats.data_bytes,
+            }));
+        }
+    }
+    if let Some(object) = snapshot.as_object_mut() {
+        object.insert("columnar_collections".into(), Value::Array(columnar));
+    }
+    (StatusCode::OK, Json(snapshot))
 }
 
 async fn prometheus_handler(
@@ -1691,6 +1709,21 @@ async fn prometheus_handler(
         &applied,
         &acks,
     );
+    for name in state.store.collections().unwrap_or_default() {
+        if let Ok(Some(stats)) = state.store.columnar_stats(&name) {
+            let fields = [
+                ("nonodb_columnar_rows", stats.rows),
+                ("nonodb_columnar_buckets", stats.buckets),
+                ("nonodb_columnar_open_buckets", stats.open_buckets),
+                ("nonodb_columnar_sealed_buckets", stats.sealed_buckets),
+                ("nonodb_columnar_id_entries", stats.id_entries),
+                ("nonodb_columnar_data_bytes", stats.data_bytes),
+            ];
+            for (metric, value) in fields {
+                body.push_str(&format!("{metric}{{collection=\"{name}\"}} {value}\n"));
+            }
+        }
+    }
     (
         [(
             CONTENT_TYPE,
