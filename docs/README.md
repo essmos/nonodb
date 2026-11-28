@@ -38,8 +38,8 @@ quick-start instructions, and a feature overview.
 | [Graph traversal](graph.md) | Application developers | Nodes and edges as documents, adjacency index, BFS/DFS, shortest/all-shortest paths, pattern matching, PageRank/degree/components, filters, hybrid search, online rebuild, GUI tree, limits |
 | [Graph benchmark](graph-benchmark.md) | Evaluators, maintainers | NonoDB vs Neo4j Community: dataset, methodology, results, caveats, reproduction |
 | [Read-only Cypher](cypher.md) | Application developers, evaluators | Cypher API, supported clauses, GDS procedures, limits, pinned TCK baseline |
-| [Streaming outbox events](streams.md) | Application developers | Long-poll `watch`, NDJSON/SSE streams, resume tokens, filters, truncation, Python/Rust/Node.js/Go examples |
-| [Streams with groups (plan)](streams-groups-plan.md) | Maintainers, application developers | Design plan for server-side offsets, consumer groups, in-flight leases, and offset-based retention |
+| [Streams and consumer groups](streams.md) | Application developers | Server-side offsets, consumer groups, range leases, redelivery, dead letters, offset retention, long-poll `watch`, NDJSON/SSE streams, and client examples |
+| [Streams design notes](streams-groups-plan.md) | Maintainers | Historical design notes for consumer groups, leases, and offset-based retention |
 | [Use cases](use-cases/README.md) | Application developers, architects | Task-oriented patterns built from the primitives, with guarantees, limits and checklists |
 | [Financial ledger and payment processing](use-cases/financial-ledger.md) | Application developers, architects | Double-entry ledger, atomic transfers, ordering of execution, idempotent handlers, dead letters, retention, reconciliation |
 | [Replacing Redis Streams](use-cases/replacing-redis-streams.md) | Application developers, architects | Concept mapping from `XADD`/`XREADGROUP`/`XACK`, semantics that change your consumer code, migration plan, checklist |
