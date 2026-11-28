@@ -4042,7 +4042,18 @@ async fn exec_inner(
             let joined = tokio::task::spawn_blocking(move || {
                 let mut collections = store.collections()?;
                 collections.retain(|coll| principal.can_see_collection(&database, coll));
-                Ok::<Value, ApiError>(json!({ "collections": collections }))
+                let info: Vec<_> = store
+                    .collections_info()?
+                    .into_iter()
+                    .filter(|item| {
+                        item.get("name")
+                            .and_then(Value::as_str)
+                            .is_some_and(|name| collections.iter().any(|coll| coll == name))
+                    })
+                    .collect();
+                Ok::<Value, ApiError>(
+                    json!({ "collections": collections, "collection_info": info }),
+                )
             });
             read_result(joined).await
         }
@@ -5564,7 +5575,16 @@ fn execute_read(
         Request::ListCollections => {
             let mut collections = store.collections_in(rtxn)?;
             collections.retain(|coll| principal.can_see_collection(database, coll));
-            Ok(json!({ "collections": collections }))
+            let info: Vec<_> = store
+                .collections_info_in(rtxn)?
+                .into_iter()
+                .filter(|item| {
+                    item.get("name")
+                        .and_then(Value::as_str)
+                        .is_some_and(|name| collections.iter().any(|coll| coll == name))
+                })
+                .collect();
+            Ok(json!({ "collections": collections, "collection_info": info }))
         }
         _ => Err(ApiError {
             code: "invalid_query".to_string(),

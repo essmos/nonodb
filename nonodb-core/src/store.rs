@@ -2802,6 +2802,38 @@ impl Store {
         Ok(out)
     }
 
+    /// Names, profiles, and profile settings for every registered collection.
+    pub fn collections_info(&self) -> Result<Vec<Value>> {
+        let rtxn = self.read_txn()?;
+        let out = self.collections_info_in(&rtxn)?;
+        rtxn.commit()?;
+        Ok(out)
+    }
+
+    /// Names, profiles, and profile settings inside an existing read transaction.
+    pub fn collections_info_in(&self, rtxn: &RoTxn<'_>) -> Result<Vec<Value>> {
+        let mut out = Vec::new();
+        for name in self.collections_in(rtxn)? {
+            let Some(collection) = self.collection_at(rtxn, &name)? else {
+                continue;
+            };
+            let mut info = serde_json::Map::new();
+            info.insert("name".into(), Value::String(name));
+            info.insert(
+                "profile".into(),
+                Value::String(collection.profile().as_str().to_string()),
+            );
+            if let Some(settings) = collection.columnar_settings_in(rtxn)? {
+                info.insert("columnar".into(), serde_json::to_value(settings)?);
+            }
+            if let Some(settings) = collection.timeseries_settings_in(rtxn)? {
+                info.insert("timeseries".into(), serde_json::to_value(settings)?);
+            }
+            out.push(Value::Object(info));
+        }
+        Ok(out)
+    }
+
     /// Per-collection record counts and storage estimates for the current
     /// database. Data/index bytes use LMDB B-tree page allocation; history and
     /// TTL bytes are measured from shared key/value entries. The file

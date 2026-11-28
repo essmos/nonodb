@@ -115,6 +115,21 @@ type TimeSeriesStats = {
   open_bytes: number;
   deleted_rows: number;
 };
+type ColumnarSettings = {
+  bucket_max_docs: number;
+  bucket_max_bytes: number;
+  compression: string;
+};
+
+type ColumnarStats = {
+  rows: number;
+  buckets: number;
+  open_buckets: number;
+  sealed_buckets: number;
+  id_entries: number;
+  data_bytes: number;
+};
+
 
 type IndexInfo = {
   field: string;
@@ -3117,6 +3132,11 @@ function CollectionView({
   const [tsEditCompression, setTsEditCompression] = useState('balanced');
   const [tsEditExpire, setTsEditExpire] = useState('');
   const [tsEditBucketDocs, setTsEditBucketDocs] = useState('');
+  const [columnarSettings, setColumnarSettings] = useState<ColumnarSettings | null>(null);
+  const [columnarStats, setColumnarStats] = useState<ColumnarStats | null>(null);
+  const [colEditCompression, setColEditCompression] = useState('balanced');
+  const [colEditBucketDocs, setColEditBucketDocs] = useState('');
+  const [colEditBucketBytes, setColEditBucketBytes] = useState('');
   const [eventsEnabled, setEventsEnabled] = useState(false);
   const [indexKind, setIndexKind] = useState<'secondary' | 'text' | 'fuzzy' | 'vector'>('secondary');
   const [indexField, setIndexField] = useState('');
@@ -3173,7 +3193,7 @@ function CollectionView({
     try {
       const filter = parseJson(filterText, 'Filter');
       const projection = projectionText.trim() ? parseJson(projectionText, 'Projection') : undefined;
-      const [found, total, indexResult, textResult, fuzzyResult, vectorResult, ttlResult, historyResult, eventsResult, timeseriesResult] =
+      const [found, total, indexResult, textResult, fuzzyResult, vectorResult, ttlResult, historyResult, eventsResult, timeseriesResult, columnarResult] =
         await Promise.all([
           exec<Doc[]>(connection, {
             op: 'find',
@@ -3199,6 +3219,10 @@ function CollectionView({
             op: 'get_collection_timeseries',
             coll: name,
           }).catch(() => null),
+          exec<{ columnar: ColumnarSettings; stats: ColumnarStats }>(connection, {
+            op: 'get_collection_columnar',
+            coll: name,
+          }).catch(() => null),
         ]);
       setDocs(found);
       setFieldPaths((current) => [...collectFieldPaths(found, '', new Set(current))].sort());
@@ -3212,6 +3236,13 @@ function CollectionView({
       setEventsEnabled(Boolean(eventsResult.enabled));
       setTsSettings(timeseriesResult?.timeseries ?? null);
       setTsStats(timeseriesResult?.stats ?? null);
+      setColumnarSettings(columnarResult?.columnar ?? null);
+      setColumnarStats(columnarResult?.stats ?? null);
+      if (columnarResult) {
+        setColEditCompression(columnarResult.columnar.compression ?? 'balanced');
+        setColEditBucketDocs(String(columnarResult.columnar.bucket_max_docs ?? 512));
+        setColEditBucketBytes(String(columnarResult.columnar.bucket_max_bytes ?? 524288));
+      }
       if (timeseriesResult) {
         setTsEditCompression(timeseriesResult.timeseries.compression ?? 'balanced');
         setTsEditExpire(
@@ -3517,7 +3548,27 @@ function CollectionView({
     setError('');
     setNotice('');
     try {
-      if (tsSettings) {
+      if (columnarSettings) {
+        await exec(connection, {
+          op: 'set_collection_columnar',
+          coll: name,
+          settings: {
+            bucket_max_docs: Number(colEditBucketDocs || columnarSettings.bucket_max_docs),
+            bucket_max_bytes: Number(colEditBucketBytes || columnarSettings.bucket_max_bytes),
+            compression: colEditCompression,
+          },
+        });
+        await exec(connection, {
+          op: 'set_collection_ttl',
+          coll: name,
+          ttl_seconds: ttl.trim() === '' ? null : Number(ttl),
+        });
+        await exec(connection, {
+          op: 'set_collection_history',
+          coll: name,
+          max_versions: Number(history || 0),
+        });
+      } else if (tsSettings) {
         await exec(connection, {
           op: 'set_collection_timeseries',
           coll: name,
@@ -4410,6 +4461,60 @@ function CollectionView({
       {showSettings && (
         <Modal title={`${name} settings`} subtitle="Applies to this collection only" onClose={() => setShowSettings(false)}>
           <div className="form-grid">
+            {columnarSettings && (
+              <>
+                <label>
+                  Columnar profile
+                  <span className="field-hint">
+                    General-purpose bucketed columns with the full standard collection
+                    API. Buckets are sealed by size and id point reads resolve through
+                    a hash locator.
+                  </span>
+                </label>
+                <label>
+                  Compression
+                  <select
+                    value={colEditCompression}
+                    onChange={(e) => setColEditCompression(e.target.value)}
+                  >
+                    <option value="fast">fast</option>
+                    <option value="balanced">balanced</option>
+                    <option value="max">max</option>
+                  </select>
+                </label>
+                <label>
+                  Bucket max documents
+                  <input
+                    type="number"
+                    min={1}
+                    value={colEditBucketDocs}
+                    onChange={(e) => setColEditBucketDocs(e.target.value)}
+                  />
+                  <span className="field-hint">
+                    Rows per sealed bucket. Smaller buckets reduce update amplification;
+                    larger buckets compress better.
+                  </span>
+                </label>
+                <label>
+                  Bucket max bytes
+                  <input
+                    type="number"
+                    min={1}
+                    value={colEditBucketBytes}
+                    onChange={(e) => setColEditBucketBytes(e.target.value)}
+                  />
+                </label>
+                {columnarStats && (
+                  <div className="stat-grid">
+                    <div className="stat"><span>Rows</span><strong>{columnarStats.rows.toLocaleString()}</strong></div>
+                    <div className="stat"><span>Buckets</span><strong>{columnarStats.buckets} ({columnarStats.open_buckets} open)</strong></div>
+                    <div className="stat"><span>Sealed buckets</span><strong>{columnarStats.sealed_buckets}</strong></div>
+                    <div className="stat"><span>Id entries</span><strong>{columnarStats.id_entries.toLocaleString()}</strong></div>
+                    <div className="stat"><span>Bucket data</span><strong>{formatBytes(columnarStats.data_bytes)}</strong></div>
+                  </div>
+                )}
+              </>
+            )}
             {tsSettings && (
               <>
                 <label>

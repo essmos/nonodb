@@ -6401,23 +6401,6 @@ impl<'e> Collection<'e> {
         })
     }
 
-    fn columnar_candidates_in(&self, txn: &RoTxn<'_>, filter: &Value) -> Result<Vec<Value>> {
-        if let Some(id) = crate::columnar::exact_id_filter(filter) {
-            return Ok(crate::columnar::find_by_id(txn, self.env, &self.name, &id)?
-                .into_iter()
-                .collect());
-        }
-        crate::columnar::find(
-            txn,
-            self.env,
-            &self.name,
-            &FindQuery {
-                filter: filter.clone(),
-                ..Default::default()
-            },
-        )
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn update_columnar_txn(
         &self,
@@ -6430,19 +6413,7 @@ impl<'e> Collection<'e> {
         default_id: Option<&Value>,
     ) -> Result<UpdateOutcome> {
         let settings = self.columnar_settings_in(&*wtxn)?.unwrap_or_default();
-        let before = self.columnar_candidates_in(&*wtxn, filter)?;
-        let mut ttl_changes: HashMap<String, (ttl::TtlUpdate, Option<u64>)> = HashMap::new();
-        for old in &before {
-            let Some(id) = old.get("_id").and_then(id::key_from_value) else {
-                continue;
-            };
-            let old_ttl = self.ttl_at(&*wtxn, &id)?;
-            let mut check = old.clone();
-            apply_with_options(&mut check, update, filter, array_filters)?;
-            let directive = ttl::take_update_ttl_with_field(&mut check, self.ttl_field_pair())?;
-            ttl_changes.insert(id, (directive, old_ttl));
-        }
-        let outcome = crate::columnar::update(
+        let (outcome, changed) = crate::columnar::update_with_changes(
             wtxn,
             self.env,
             &self.name,
@@ -6454,14 +6425,11 @@ impl<'e> Collection<'e> {
             upsert,
             default_id,
         )?;
-        for old in &before {
-            let Some(id) = old.get("_id").and_then(id::key_from_value) else {
-                continue;
-            };
-            let Some(mut new) = crate::columnar::find_by_id(&*wtxn, self.env, &self.name, &id)?
-            else {
-                continue;
-            };
+        for (id, old, new) in changed {
+            let old_ttl = self.ttl_at(&*wtxn, &id)?;
+            let old = Value::Object(old);
+            let mut new = Value::Object(new);
+            let directive = ttl::take_update_ttl_with_field(&mut new, self.ttl_field_pair())?;
             let stripped = new
                 .as_object_mut()
                 .is_some_and(|object| object.remove("_ttl").is_some());
@@ -6471,10 +6439,6 @@ impl<'e> Collection<'e> {
                     .ok_or_else(|| Error::Query("updated document must be an object".into()))?;
                 crate::columnar::replace_by_id(wtxn, self.env, &self.name, &id, object)?;
             }
-            let (directive, old_ttl) = ttl_changes
-                .get(&id)
-                .copied()
-                .unwrap_or((ttl::TtlUpdate::Preserve, None));
             let ttl_at = match directive {
                 ttl::TtlUpdate::Preserve => old_ttl,
                 ttl::TtlUpdate::Clear => None,
@@ -6482,8 +6446,8 @@ impl<'e> Collection<'e> {
             };
             self.set_ttl(wtxn, &id, ttl_at)?;
             self.validate_unique(&*wtxn, &new, &id)?;
-            self.apply_all_index_entries(wtxn, Some(old), Some(&new), &id)?;
-            self.apply_graph_entries(wtxn, Some(old), Some(&new))?;
+            self.apply_all_index_entries(wtxn, Some(&old), Some(&new), &id)?;
+            self.apply_graph_entries(wtxn, Some(&old), Some(&new))?;
             self.record_history(wtxn, &id, "update", Some(new))?;
         }
         if let Some(id) = outcome.upserted_id.as_deref() {
@@ -6512,21 +6476,15 @@ impl<'e> Collection<'e> {
         filter: &Value,
         multi: bool,
     ) -> Result<usize> {
-        let before = self.columnar_candidates_in(&*wtxn, filter)?;
-        let removed = crate::columnar::delete(wtxn, self.env, &self.name, filter, multi)?;
-        if removed == 0 {
-            return Ok(0);
+        let removed = crate::columnar::delete_with_docs(wtxn, self.env, &self.name, filter, multi)?;
+        for (id, old) in &removed {
+            let old = Value::Object(old.clone());
+            self.apply_all_index_entries(wtxn, Some(&old), None, id)?;
+            self.apply_graph_entries(wtxn, Some(&old), None)?;
+            self.set_ttl(wtxn, id, None)?;
+            self.record_history(wtxn, id, "delete", None)?;
         }
-        for old in &before {
-            let Some(id) = old.get("_id").and_then(id::key_from_value) else {
-                continue;
-            };
-            self.apply_all_index_entries(wtxn, Some(old), None, &id)?;
-            self.apply_graph_entries(wtxn, Some(old), None)?;
-            self.set_ttl(wtxn, &id, None)?;
-            self.record_history(wtxn, &id, "delete", None)?;
-        }
-        Ok(removed)
+        Ok(removed.len())
     }
 
     fn find_and_modify_columnar(
@@ -6557,8 +6515,8 @@ impl<'e> Collection<'e> {
             let Some(old) = selected else {
                 return Ok(empty_find_and_modify());
             };
-            let id = old.get("_id").cloned().ok_or(Error::InvalidId)?;
-            let removed = self.delete_txn(wtxn, &serde_json::json!({"_id": id}), false)?;
+            let id_value = old.get("_id").cloned().ok_or(Error::InvalidId)?;
+            let removed = self.delete_txn(wtxn, &serde_json::json!({"_id": id_value}), false)?;
             return Ok(FindAndModifyOutcome {
                 value: Some(apply_projection(old, opts.projection, Some(opts.filter))),
                 matched: removed,
@@ -6571,14 +6529,11 @@ impl<'e> Collection<'e> {
             .update
             .ok_or_else(|| Error::Query("find_and_modify requires `update` or `remove`".into()))?;
         if let Some(old) = selected {
-            let id = old
-                .get("_id")
-                .and_then(Value::as_str)
-                .ok_or(Error::InvalidId)?
-                .to_string();
+            let id = id::key_from_document(&old).ok_or(Error::InvalidId)?;
+            let id_value = old.get("_id").cloned().ok_or(Error::InvalidId)?;
             let outcome = self.update_opts_txn_filtered_with_id(
                 wtxn,
-                &serde_json::json!({"_id": id}),
+                &serde_json::json!({"_id": id_value}),
                 update,
                 false,
                 false,
@@ -10744,6 +10699,8 @@ impl<'e> Collection<'e> {
             let normalized = normalized_find_query(query)?;
             let query = normalized.as_ref();
             crate::query::validate::validate_filter(&query.filter)?;
+            let hint = query.hint.as_ref().map(parse_index_hint).transpose()?;
+            let plan = self.query_index_plan(rtxn, &query.filter, hint.as_ref())?;
             let deadline = find_deadline(query);
             check_find_deadline(deadline)?;
             if let Some((field, near)) = geo::extract_near(&query.filter) {
@@ -10777,6 +10734,36 @@ impl<'e> Collection<'e> {
                     .skip(query.skip)
                     .take(limit)
                     .map(|(_, doc)| project_document(&doc, query.projection.as_ref()))
+                    .collect());
+            }
+            if let Some(plan) = plan {
+                let ids = self.index_plan_candidates(rtxn, &plan, None)?;
+                let strict_ttl = self.ttl_filter_active(rtxn)?;
+                let now = ttl::now_ms();
+                let mut docs = Vec::with_capacity(ids.len());
+                for id in ids {
+                    check_find_deadline(deadline)?;
+                    let Some(doc) = crate::columnar::find_by_id(rtxn, self.env, &self.name, &id)?
+                    else {
+                        continue;
+                    };
+                    if !crate::query::matcher::matches(&doc, &query.filter) {
+                        continue;
+                    }
+                    if strict_ttl && !self.ttl_doc_visible(rtxn, &doc, now)? {
+                        continue;
+                    }
+                    docs.push(doc);
+                }
+                if !query.sort.is_empty() {
+                    docs.sort_by(|a, b| compare_docs(a, b, &query.sort));
+                }
+                let limit = query.limit.unwrap_or(usize::MAX);
+                return Ok(docs
+                    .into_iter()
+                    .skip(query.skip)
+                    .take(limit)
+                    .map(|doc| project_document(&doc, query.projection.as_ref()))
                     .collect());
             }
             let out = if self.ttl_filter_active(rtxn)? {
@@ -11724,25 +11711,41 @@ impl<'e> Collection<'e> {
             let normalized = normalized_find_query(query)?;
             let query = normalized.as_ref();
             crate::query::validate::validate_filter(&query.filter)?;
+            let hint = query.hint.as_ref().map(parse_index_hint).transpose()?;
+            let plan = self.query_index_plan(rtxn, &query.filter, hint.as_ref())?;
             let stats = crate::columnar::stats(rtxn, self.env, &self.name)?;
             let matched = self.count_in(rtxn, &query.filter)?;
             let returned = self.find_in(rtxn, query)?.len();
+            let candidates = match &plan {
+                Some(plan) => self.index_count_plan(rtxn, plan)? as u64,
+                None => stats.rows,
+            };
+            let sort_covered = query.sort.is_empty()
+                || id_sort_direction(&query.sort).is_some()
+                || plan
+                    .as_ref()
+                    .is_some_and(|plan| index_matches_sort(&plan.def, &query.sort).is_some());
             return Ok(serde_json::json!({
                 "collection": self.name,
                 "profile": "columnar",
-                "access": "bucket_scan",
-                "access_path": "bucket_scan",
-                "index_used": false,
-                "index": Value::Null,
+                "access": if plan.is_some() { "index_scan" } else { "bucket_scan" },
+                "access_path": if plan.is_some() { "index_scan" } else { "bucket_scan" },
+                "index_used": plan.is_some(),
+                "index": plan.as_ref().map(|plan| serde_json::json!({
+                    "fields": plan.def.effective_fields(),
+                    "unique": plan.def.unique,
+                    "include": plan.def.include,
+                    "multikey": plan.def.multikey_fields,
+                })).unwrap_or(Value::Null),
                 "bounds": Value::Null,
                 "buckets_total": stats.buckets,
                 "buckets_pruned": 0,
                 "buckets_sealed": stats.sealed_buckets,
                 "buckets_open": stats.open_buckets,
                 "estimated_documents": stats.rows,
-                "candidates": stats.rows,
-                "documents_scanned": stats.rows,
-                "sort_covered": query.sort.is_empty(),
+                "candidates": candidates,
+                "documents_scanned": candidates,
+                "sort_covered": sort_covered,
                 "filter": query.filter,
                 "sort": Value::Array(
                     query

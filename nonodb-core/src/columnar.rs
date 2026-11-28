@@ -1934,6 +1934,9 @@ pub fn find_visible(
         .collect())
 }
 
+/// A changed columnar row: `(id, old document, new document)`.
+pub(crate) type ChangedRow = (String, Map<String, Value>, Map<String, Value>);
+
 /// Updates matching documents. Returns the standard update outcome.
 #[allow(clippy::too_many_arguments)]
 pub fn update(
@@ -1948,6 +1951,38 @@ pub fn update(
     upsert: bool,
     default_id: Option<&Value>,
 ) -> Result<UpdateOutcome> {
+    Ok(update_with_changes(
+        wtxn,
+        env,
+        name,
+        settings,
+        filter,
+        update,
+        multi,
+        array_filters,
+        upsert,
+        default_id,
+    )?
+    .0)
+}
+
+/// Updates matching documents and returns the rows that actually changed.
+///
+/// The collection layer uses the returned rows to keep indexes, history, TTL,
+/// and graph entries in sync without re-querying candidates it did not modify.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn update_with_changes(
+    wtxn: &mut RwTxn<'_>,
+    env: &Env,
+    name: &str,
+    settings: &Settings,
+    filter: &Value,
+    update: &Value,
+    multi: bool,
+    array_filters: &[Value],
+    upsert: bool,
+    default_id: Option<&Value>,
+) -> Result<(UpdateOutcome, Vec<ChangedRow>)> {
     use crate::query::updater::{apply_upsert_with_options, apply_with_options, seed_from_filter};
 
     let db = env.create_database::<Bytes, Bytes>(wtxn, Some(&db_name(name)))?;
@@ -1964,6 +1999,7 @@ pub fn update(
         None => all_located(&*wtxn, env, name)?,
     };
     let mut changes = Vec::new();
+    let mut changed = Vec::new();
     let mut matched = 0usize;
     for (locator, row) in candidates {
         let old = Value::Object(row.clone());
@@ -1990,6 +2026,7 @@ pub fn update(
             ));
         }
         changes.push((locator, next_object.clone()));
+        changed.push((old_id, row, next_object.clone()));
         if !multi {
             break;
         }
@@ -2011,19 +2048,25 @@ pub fn update(
         }
         normalize_document(&mut doc)?;
         let id = insert(wtxn, env, name, settings, doc)?;
-        return Ok(UpdateOutcome {
-            matched: 0,
-            modified: 0,
-            upserted_id: Some(id),
-            moved: Vec::new(),
-        });
+        return Ok((
+            UpdateOutcome {
+                matched: 0,
+                modified: 0,
+                upserted_id: Some(id),
+                moved: Vec::new(),
+            },
+            changed,
+        ));
     }
-    Ok(UpdateOutcome {
-        matched,
-        modified: changes.len(),
-        upserted_id: None,
-        moved: Vec::new(),
-    })
+    Ok((
+        UpdateOutcome {
+            matched,
+            modified: changes.len(),
+            upserted_id: None,
+            moved: Vec::new(),
+        },
+        changed,
+    ))
 }
 
 /// Deletes matching documents.
@@ -2034,6 +2077,17 @@ pub fn delete(
     filter: &Value,
     multi: bool,
 ) -> Result<usize> {
+    Ok(delete_with_docs(wtxn, env, name, filter, multi)?.len())
+}
+
+/// Deletes matching documents and returns the removed rows.
+pub(crate) fn delete_with_docs(
+    wtxn: &mut RwTxn<'_>,
+    env: &Env,
+    name: &str,
+    filter: &Value,
+    multi: bool,
+) -> Result<Vec<(String, Map<String, Value>)>> {
     let db = env.create_database::<Bytes, Bytes>(wtxn, Some(&db_name(name)))?;
     let direct = if !multi {
         match exact_id_filter(filter) {
@@ -2047,7 +2101,7 @@ pub fn delete(
         Some(found) => vec![found],
         None => all_located(&*wtxn, env, name)?,
     };
-    let mut removed = 0usize;
+    let mut removed = Vec::new();
     for (locator, row) in candidates {
         let doc = Value::Object(row.clone());
         if !crate::query::matcher::matches(&doc, filter) {
@@ -2056,7 +2110,7 @@ pub fn delete(
         let id = doc_id(&row)?;
         delete_doc_at(wtxn, &db, locator)?;
         remove_locator(wtxn, &db, fnv1a64(id.as_bytes()), locator)?;
-        removed += 1;
+        removed.push((id, row));
         if !multi {
             break;
         }
