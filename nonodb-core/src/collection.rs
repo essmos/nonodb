@@ -5777,16 +5777,19 @@ impl<'e> Collection<'e> {
             // commit the shared transaction even when this job reports an
             // error, so a late failure must not leave a partial document.
             self.validate_unique(&*wtxn, &doc, &id)?;
+            let stored = Value::Object(
+                doc.as_object()
+                    .cloned()
+                    .ok_or_else(|| Error::Query("document must be an object".into()))?,
+            );
             let id = crate::columnar::insert(wtxn, self.env, &self.name, &settings, doc)?;
-            if let Some(stored) = crate::columnar::find_by_id(&*wtxn, self.env, &self.name, &id)? {
-                self.apply_all_index_entries(wtxn, None, Some(&stored), &id)?;
-                crate::columnar::failpoint("insert_after_index")?;
-                self.apply_graph_entries(wtxn, None, Some(&stored))?;
-                self.set_ttl(wtxn, &id, ttl_at)?;
-                crate::columnar::failpoint("insert_after_ttl")?;
-                self.record_history(wtxn, &id, "insert", Some(stored))?;
-                crate::columnar::failpoint("insert_after_history")?;
-            }
+            self.apply_all_index_entries(wtxn, None, Some(&stored), &id)?;
+            crate::columnar::failpoint("insert_after_index")?;
+            self.apply_graph_entries(wtxn, None, Some(&stored))?;
+            self.set_ttl(wtxn, &id, ttl_at)?;
+            crate::columnar::failpoint("insert_after_ttl")?;
+            self.record_history(wtxn, &id, "insert", Some(stored))?;
+            crate::columnar::failpoint("insert_after_history")?;
             return Ok(id);
         }
         if self.profile.is_timeseries() {

@@ -96,11 +96,16 @@ fn run(label: &'static str, profile: CollectionProfile) -> Run {
     // normal batch path seals every full bucket, so these extra rows ensure the
     // open-bucket point-read gate measures a real open bucket.
     const OPEN_TAIL: usize = 128;
-    for index in 0..OPEN_TAIL {
-        let mut d = doc(DOCS + index);
-        d["_id"] = json!(format!("open-{index:08}"));
-        coll.insert_one(d).unwrap();
-    }
+    let tail: Vec<Value> = (0..OPEN_TAIL)
+        .map(|index| {
+            let mut d = doc(DOCS + index);
+            d["_id"] = json!(format!("open-{index:08}"));
+            d
+        })
+        .collect();
+    let mut tail_txn = store.write_txn().unwrap();
+    coll.insert_many_txn(&mut tail_txn, &tail).unwrap();
+    tail_txn.commit().unwrap();
     let mut open_point = Vec::with_capacity(POINT_READS.min(512));
     let open_reads = POINT_READS.min(512);
     for index in 0..open_reads {

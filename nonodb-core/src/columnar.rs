@@ -859,7 +859,6 @@ pub fn insert(
     }
     let row = pointer.1;
     db.put(&mut *wtxn, &open_row_key(pointer.0, row), &encoded)?;
-    db.put(&mut *wtxn, &open_id_key(&id), &encoded)?;
     failpoint("insert_after_row")?;
     db.put(
         &mut *wtxn,

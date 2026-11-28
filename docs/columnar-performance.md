@@ -23,8 +23,8 @@ standard full scan.
 Dataset: 100,128 append-heavy analytics documents with realistic string `_id`
 values (`id-00000000`), nested objects, arrays, timestamps, floats, enums, and
 booleans. Ingest is 100 transactions of 1,000 rows; buckets hold 512 rows. The
-last 128 rows are inserted singly so the open-bucket gate measures a genuinely
-open staging bucket rather than a sealed one. Two secondary indexes (`user`,
+last 128 rows are inserted in one small transaction so the open-bucket gate
+measures a genuinely open staging bucket rather than a sealed one. Two secondary indexes (`user`,
 `status`) are created before the storage and retention measurements. History is
 disabled for both profiles by default, TTL is unused, and both profiles run on
 the same filesystem and LMDB map size.
@@ -38,28 +38,28 @@ One representative run:
 
 | Metric | standard | columnar | gate | result |
 |---|---:|---:|---:|---|
-| Storage including ids, locator map, and 2 indexes | 36.1 MB | 17.6 MB | `columnar / standard <= 0.50` | **0.487** |
-| Batch insert (1,000 rows / transaction) | 643.3 ms | 727.2 ms | `standard / columnar >= 0.80` | **0.885** |
-| Single insert | 19.95 us | 38.29 us | `columnar / standard <= 2.0` (gate 0.50×) | **1.92x** |
-| Sealed point read p50 | 4.9 us | 9.5 us | `columnar / standard <= 3.0` | **1.94x** |
-| Open-bucket point read p50 | 4.5 us | 6.0 us | `columnar / standard <= 1.5` | **1.33x** |
-| Full scan | 228.0 ms | 159.6 ms | `standard / columnar >= 0.80` | **1.43x** |
-| `$group` + `$sort` aggregation | 91.0 ms | 107.0 ms | `standard / columnar >= 0.80` | **0.85x** |
-| Single-document update p50 | 24.9 us | 33.5 us | `columnar / standard <= 5.0` | **1.35x** |
-| Multi-document update, 37,527 rows | 718.3 ms | 1156.0 ms | reported separately | **0.62x throughput** |
+| Storage including ids, locator map, and 2 indexes | 35.9 MB | 17.6 MB | `columnar / standard <= 0.50` | **0.489** |
+| Batch insert (1,000 rows / transaction) | 632.5 ms | 760.6 ms | `standard / columnar >= 0.80` | **0.832** |
+| Single insert | 18.12 us | 31.04 us | `columnar / standard <= 2.0` (gate 0.50×) | **1.71x** |
+| Sealed point read p50 | 5.1 us | 9.7 us | `columnar / standard <= 3.0` | **1.90x** |
+| Open-bucket point read p50 | 5.2 us | 6.0 us | `columnar / standard <= 1.5` | **1.15x** |
+| Full scan | 227.8 ms | 162.2 ms | `standard / columnar >= 0.80` | **1.40x** |
+| `$group` + `$sort` aggregation | 92.6 ms | 105.9 ms | `standard / columnar >= 0.80` | **0.87x** |
+| Single-document update p50 | 24.1 us | 33.1 us | `columnar / standard <= 5.0` | **1.37x** |
+| Multi-document update, 37,527 rows | 690.2 ms | 1178.5 ms | reported separately | **0.58x throughput** |
 
 Three runs after an untimed aggregation warmup produced these ranges: storage
-`0.487-0.488`, batch `0.849-0.906`, single insert `1.90-1.98x`, sealed point
-`1.94-2.15x`, open-bucket point `1.28-1.33x`, update `1.35-1.37x`, scan
-`1.36-1.43x`, aggregation `0.805-0.920x`. The untimed warmup prevents
+`0.489-0.490`, batch `0.832-0.893`, single insert `1.71-1.84x`, sealed point
+`1.69-1.90x`, open-bucket point `1.14-1.16x`, update `1.36-1.44x`, scan
+`1.19-1.40x`, aggregation `0.834-0.904x`. The untimed warmup prevents
 thread-startup and page-cache effects from dominating the aggregation ratio.
-Multi-update throughput was `32.5k-33.4k rows/s` for columnar versus
-`52.2k-54.2k rows/s` for standard in the same runs.
+Multi-update throughput was `31.2k-31.8k rows/s` for columnar versus
+`51.1k-54.4k rows/s` for standard in the same runs.
 
 Retention/compaction (`AC-PERF-007`, `AC-PERF-010`): deleting 25% of rows left
 18.2 MB; compaction reduced it to 15.6 MB (`reclaim = 0.860`). Bucket
-seal/compaction p95 was 1.47-1.50 s, sealed point-read p95 was 11.9-12.6 us, and
-open-bucket point-read p95 was 6.0-6.1 us. No correctness result changed after
+seal/compaction p95 was 1.51-1.54 s, sealed point-read p95 was 12.0-12.2 us, and
+open-bucket point-read p95 was 6.1-6.3 us. No correctness result changed after
 compaction or reopen.
 
 ## Shared-codec regression check (`AC-PERF-008`)
