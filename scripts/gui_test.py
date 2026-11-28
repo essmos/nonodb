@@ -178,6 +178,10 @@ def main() -> int:
                 b"Graph definition",
                 b"Traverse",
                 b"Initial depth",
+                b"Columnar profile",
+                b"Bucket max documents",
+                b"Bucket max bytes",
+                b"Id entries",
             ):
                 assert marker in asset, marker
             assert b"Backup, restore, and verification remain CLI-only" not in asset
@@ -213,6 +217,43 @@ def main() -> int:
                 )
             )
             assert sql["result"]["results"] == [{"n": 1}], sql
+
+            fetch(
+                base + "/v1/exec",
+                data={
+                    "op": "create_collection",
+                    "coll": "gui_events",
+                    "profile": "columnar",
+                    "columnar": {"bucket_max_docs": 64, "compression": "max"},
+                },
+            )
+            fetch(
+                base + "/v1/exec",
+                data={"op": "insert", "coll": "gui_events", "doc": {"_id": "e1", "v": 1}},
+            )
+            columnar = json.loads(
+                fetch(
+                    base + "/v1/exec",
+                    data={"op": "get_collection_columnar", "coll": "gui_events"},
+                )
+            )
+            assert columnar["result"]["columnar"]["bucket_max_docs"] == 64, columnar
+            assert columnar["result"]["stats"]["rows"] == 1, columnar
+            listed = json.loads(
+                fetch(base + "/v1/exec", data={"op": "list_collections"})
+            )
+            entry = next(
+                item
+                for item in listed["result"]["collection_info"]
+                if item["name"] == "gui_events"
+            )
+            assert entry["profile"] == "columnar", entry
+            assert entry["columnar"]["compression"] == "max", entry
+            metrics = json.loads(fetch(base + "/metrics"))
+            assert any(
+                item["collection"] == "gui_events" and item["rows"] == 1
+                for item in metrics.get("columnar_collections", [])
+            ), metrics.get("columnar_collections")
 
             health = json.loads(fetch(base + "/healthz"))
             assert health, health

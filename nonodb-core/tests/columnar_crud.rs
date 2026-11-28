@@ -232,6 +232,54 @@ fn columnar_roundtrips_bson_scalars_and_nested_values() {
 }
 
 #[test]
+fn columnar_roundtrips_adversarial_field_names_without_path_collisions() {
+    let std_dir = tempfile::tempdir().unwrap();
+    let col_dir = tempfile::tempdir().unwrap();
+    let std_store = Store::open(std_dir.path()).unwrap();
+    let col_store = Store::open(col_dir.path()).unwrap();
+    let std_coll = standard_collection(&std_store);
+    let col_coll = columnar_collection(&col_store);
+    let docs = [
+        json!({
+            "_id": "dotted",
+            "a.b": 1,
+            "a": {"b": 2},
+            "$literal": 3,
+            "": 4,
+            "unicode-zażółć": 5,
+            "with space": 6,
+        }),
+        json!({
+            "_id": "arrmix",
+            "items": [{"k": "a", "n": 1}, {"k": "b", "n": null}, [1, [2, 3]]],
+            "missing": null,
+        }),
+    ];
+    for doc in docs {
+        std_coll.insert_one(doc.clone()).unwrap();
+        col_coll.insert_one(doc).unwrap();
+    }
+    assert_eq!(
+        std_coll
+            .find(&query(json!({}), vec![("_id".into(), 1)], None))
+            .unwrap(),
+        col_coll
+            .find(&query(json!({}), vec![("_id".into(), 1)], None))
+            .unwrap()
+    );
+    for filter in [
+        json!({"a.b": 1}),
+        json!({"a.b": 2}),
+        json!({"items": {"$elemMatch": {"k": "a"}}}),
+    ] {
+        assert_eq!(
+            std_coll.find(&query(filter.clone(), vec![], None)).unwrap(),
+            col_coll.find(&query(filter, vec![], None)).unwrap()
+        );
+    }
+}
+
+#[test]
 fn columnar_mutations_record_history_in_the_same_transaction() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path()).unwrap();

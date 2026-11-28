@@ -58,6 +58,9 @@ Every row below points at concrete files. The primary columnar suites are:
 | Export back to standard | `cargo test -p nonodb-core --test columnar_export_rollback` |
 | HTTP/socket clients (Python, Rust, Node.js, Go) | `NONODB_BIN=target/release/nonodb-daemon bash scripts/clients_test.sh` |
 | MongoDB wire create/listCollections/CRUD | `python3 scripts/columnar_wire_test.py` |
+| GUI columnar create/settings/stats and metrics proxy | `python3 scripts/gui_test.py` |
+| Offline inspect/compact and branch/clone | `nonodb-cli inspect`, `nonodb-cli compact`, `nonodb-cli branch` |
+| Quota and metrics gauges | `nonodb-cli quota show`, `/metrics` `columnar_collections`, `nonodb_columnar_*` |
 | Migration helper | `python3 scripts/nonodb_migrate_columnar_test.py` |
 | GUI create/settings/stats | `cd gui && npm run build` |
 | Canonical performance and 10M soak | `docs/columnar-performance.md` |
