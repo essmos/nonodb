@@ -5684,9 +5684,7 @@ impl<'e> Collection<'e> {
                     .get("_id")
                     .and_then(id::key_from_value)
                     .ok_or(Error::InvalidId)?;
-                if !seen_ids.insert(id.clone())
-                    || crate::columnar::find_by_id(&*wtxn, self.env, &self.name, &id)?.is_some()
-                {
+                if !seen_ids.insert(id.clone()) {
                     return Err(Error::DuplicateKey(id));
                 }
             }
@@ -5774,10 +5772,8 @@ impl<'e> Collection<'e> {
                     id
                 }
             };
-            if crate::columnar::find_by_id(&*wtxn, self.env, &self.name, &id)?.is_some() {
-                return Err(Error::DuplicateKey(id));
-            }
-            // Validate uniques before the row is written: the daemon may
+            // `columnar::insert` checks duplicate `_id`s before writing. Validate
+            // uniques before the row is written: the daemon may
             // commit the shared transaction even when this job reports an
             // error, so a late failure must not leave a partial document.
             self.validate_unique(&*wtxn, &doc, &id)?;

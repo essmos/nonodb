@@ -41,6 +41,7 @@ const KEY_ID: u8 = 0x02;
 const KEY_POINTER: u8 = 0x03;
 const KEY_OVERLAY: u8 = 0x04;
 const KEY_DELETED: u8 = 0x05;
+const KEY_OPEN_ID: u8 = 0x06;
 
 const DEFAULT_BUCKET_MAX_DOCS: usize = 512;
 const DEFAULT_BUCKET_MAX_BYTES: usize = 512 * 1024;
@@ -147,6 +148,13 @@ fn bucket_key(id: u64) -> Vec<u8> {
     let mut key = Vec::with_capacity(9);
     key.push(KEY_BUCKET);
     key.extend_from_slice(&id.to_be_bytes());
+    key
+}
+
+fn open_id_key(id: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(1 + id.len());
+    key.push(KEY_OPEN_ID);
+    key.extend_from_slice(id.as_bytes());
     key
 }
 
@@ -560,14 +568,20 @@ fn read_doc_at(
     locator: Locator,
 ) -> Result<Option<Map<String, Value>>> {
     let (bucket, row) = locator;
+    // Open rows are the hot point-read path. Check the staging row first so a
+    // live open document costs one row lookup plus one tombstone check instead
+    // of three misses before the hit.
+    if let Some(raw) = db.get(txn, &open_row_key(bucket, row))? {
+        if db.get(txn, &deleted_key(bucket, row))?.is_some() {
+            return Ok(None);
+        }
+        return Ok(Some(serde_json::from_slice(raw)?));
+    }
     if let Some(raw) = db.get(txn, &overlay_key(bucket, row))? {
         return Ok(Some(serde_json::from_slice(raw)?));
     }
     if db.get(txn, &deleted_key(bucket, row))?.is_some() {
         return Ok(None);
-    }
-    if let Some(raw) = db.get(txn, &open_row_key(bucket, row))? {
-        return Ok(Some(serde_json::from_slice(raw)?));
     }
     let Some(raw) = db.get(txn, &bucket_key(bucket))? else {
         return Ok(None);
@@ -585,6 +599,7 @@ fn write_doc_at(
     let encoded = serde_json::to_vec(doc)?;
     if db.get(&*wtxn, &open_row_key(bucket, row))?.is_some() {
         db.put(&mut *wtxn, &open_row_key(bucket, row), &encoded)?;
+        db.put(&mut *wtxn, &open_id_key(&doc_id(doc)?), &encoded)?;
         db.delete(&mut *wtxn, &deleted_key(bucket, row))?;
     } else {
         db.put(&mut *wtxn, &overlay_key(bucket, row), &encoded)?;
@@ -599,9 +614,11 @@ fn delete_doc_at(
     locator: Locator,
 ) -> Result<()> {
     let (bucket, row) = locator;
-    if db.get(&*wtxn, &open_row_key(bucket, row))?.is_some() {
+    if let Some(raw) = db.get(&*wtxn, &open_row_key(bucket, row))? {
         // Keep the open row until the bucket is sealed; sealing walks every
         // row between the pointer and the end. The tombstone hides it now.
+        let doc: Map<String, Value> = serde_json::from_slice(raw)?;
+        db.delete(&mut *wtxn, &open_id_key(&doc_id(&doc)?))?;
         db.put(&mut *wtxn, &deleted_key(bucket, row), b"")?;
     } else {
         db.delete(&mut *wtxn, &overlay_key(bucket, row))?;
@@ -842,6 +859,7 @@ pub fn insert(
     }
     let row = pointer.1;
     db.put(&mut *wtxn, &open_row_key(pointer.0, row), &encoded)?;
+    db.put(&mut *wtxn, &open_id_key(&id), &encoded)?;
     failpoint("insert_after_row")?;
     db.put(
         &mut *wtxn,
@@ -912,11 +930,14 @@ pub fn insert_batch(
     let mut pointer = read_pointer_rw(&*wtxn, &db)?.unwrap_or((1, 0, 0));
     let mut disk_rows = pointer.1;
     let mut open: Vec<Vec<u8>> = Vec::with_capacity(pointer.1 as usize + docs.len());
+    let mut open_ids: Vec<String> = Vec::with_capacity(pointer.1 as usize + docs.len());
     for row in 0..pointer.1 {
         let key = open_row_key(pointer.0, row);
         let raw = db
             .get(&*wtxn, &key)?
             .ok_or_else(|| corrupt("missing open row"))?;
+        let doc: Map<String, Value> = serde_json::from_slice(raw)?;
+        open_ids.push(doc_id(&doc)?);
         open.push(raw.to_vec());
     }
     let mut known: HashMap<u64, Vec<(String, Locator)>> = HashMap::new();
@@ -941,6 +962,28 @@ pub fn insert_batch(
         };
         ids.push(id);
     }
+    // Validate every `_id` (including duplicates inside the batch and ids
+    // already on disk) before writing any row. This keeps a failed
+    // `insert_many` atomic without doing a second lookup pass in the caller.
+    let mut seen_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for id in &ids {
+        if !seen_ids.insert(id.as_str()) {
+            return Err(Error::DuplicateKey(id.clone()));
+        }
+        let hash = fnv1a64(id.as_bytes());
+        if let std::collections::hash_map::Entry::Vacant(entry) = known.entry(hash) {
+            let mut entries = Vec::new();
+            for locator in read_locators(&*wtxn, &db, hash)? {
+                if let Some(row) = read_doc_at(&*wtxn, &db, locator)? {
+                    entries.push((doc_id(&row)?, locator));
+                }
+            }
+            if entries.iter().any(|(existing, _)| existing == id) {
+                return Err(Error::DuplicateKey(id.clone()));
+            }
+            entry.insert(entries);
+        }
+    }
     let encoded_docs = encode_batch_parallel(&docs)?;
     let mut encoded_iter = encoded_docs.into_iter();
     let mut ids_iter = ids.into_iter();
@@ -954,23 +997,6 @@ pub fn insert_batch(
             ));
         }
         let hash = fnv1a64(id.as_bytes());
-        if let std::collections::hash_map::Entry::Vacant(entry) = known.entry(hash) {
-            let mut entries = Vec::new();
-            for locator in read_locators(&*wtxn, &db, hash)? {
-                if let Some(row) = read_doc_at(&*wtxn, &db, locator)? {
-                    entries.push((doc_id(&row)?, locator));
-                }
-            }
-            if entries.iter().any(|(existing, _)| *existing == id) {
-                return Err(Error::DuplicateKey(id));
-            }
-            entry.insert(entries);
-        } else if known
-            .get(&hash)
-            .is_some_and(|entries| entries.iter().any(|(existing, _)| *existing == id))
-        {
-            return Err(Error::DuplicateKey(id));
-        }
         if pointer.1 >= settings.bucket_max_docs as u32
             || pointer.2 as usize + encoded.len() > settings.bucket_max_bytes
         {
@@ -988,6 +1014,7 @@ pub fn insert_batch(
         let row = pointer.1;
         let encoded_len = encoded.len() as u32;
         open.push(encoded);
+        open_ids.push(id.clone());
         known
             .get_mut(&hash)
             .expect("hash inserted")
@@ -1007,7 +1034,11 @@ pub fn insert_batch(
             for row in 0..disk_rows {
                 db.delete(&mut *wtxn, &open_row_key(pointer.0, row))?;
             }
+            for id in &open_ids {
+                db.delete(&mut *wtxn, &open_id_key(id))?;
+            }
             open.clear();
+            open_ids.clear();
             pointer = (pointer.0 + 1, 0, 0);
             disk_rows = 0;
         }
@@ -1032,10 +1063,14 @@ pub fn insert_batch(
             for row in 0..disk_rows {
                 db.delete(&mut *wtxn, &open_row_key(pointer.0, row))?;
             }
+            for id in &open_ids {
+                db.delete(&mut *wtxn, &open_id_key(id))?;
+            }
             pointer = (pointer.0 + 1, 0, 0);
         } else {
             for (row, encoded) in open.iter().enumerate().skip(disk_rows as usize) {
                 db.put(&mut *wtxn, &open_row_key(pointer.0, row as u32), encoded)?;
+                db.put(&mut *wtxn, &open_id_key(&open_ids[row]), encoded)?;
             }
         }
     }
@@ -1071,6 +1106,9 @@ fn seal_current(
     let payload = encode_bucket(&rows, settings)?;
     db.put(&mut *wtxn, &bucket_key(bucket), &payload)?;
     failpoint("seal_after_bucket")?;
+    for row in &rows {
+        db.delete(&mut *wtxn, &open_id_key(&doc_id(row)?))?;
+    }
     for row in 0..count {
         db.delete(&mut *wtxn, &open_row_key(bucket, row))?;
     }
@@ -1099,6 +1137,11 @@ pub fn find_by_id(rtxn: &RoTxn<'_>, env: &Env, name: &str, id: &str) -> Result<O
     let Some(db) = env.open_database::<Bytes, Bytes>(rtxn, Some(&db_name(name)))? else {
         return Ok(None);
     };
+    // Open staging rows have a direct `_id` key so point reads do not need the
+    // hash locator plus a second row lookup. Sealed rows keep using locators.
+    if let Some(raw) = db.get(rtxn, &open_id_key(id))? {
+        return Ok(Some(serde_json::from_slice(raw)?));
+    }
     for locator in read_locators(rtxn, &db, fnv1a64(id.as_bytes()))? {
         let Some(row) = read_doc_at(rtxn, &db, locator)? else {
             continue;
@@ -1259,14 +1302,23 @@ where
             _ => {}
         }
     }
-    let mut keys: Vec<Vec<u8>> = Vec::new();
+    // Emit rows in the same `(bucket, row)` order as `all_located`. LMDB index
+    // pages are order-sensitive, and inserting the last open bucket before the
+    // sealed buckets grows the index by megabytes on the canonical workload.
+    let mut bucket_keys: Vec<Vec<u8>> = Vec::new();
+    let mut open_keys: Vec<Vec<u8>> = Vec::new();
     for item in db.iter(&*wtxn)? {
         let (key, _) = item?;
-        if matches!(key.first(), Some(&KEY_OPEN_ROW) | Some(&KEY_BUCKET)) {
-            keys.push(key.to_vec());
+        match key.first() {
+            Some(&KEY_OPEN_ROW) => open_keys.push(key.to_vec()),
+            Some(&KEY_BUCKET) => bucket_keys.push(key.to_vec()),
+            _ => {}
         }
     }
-    for key in keys {
+    bucket_keys.sort_unstable();
+    open_keys.sort_unstable();
+    bucket_keys.extend(open_keys);
+    for key in bucket_keys {
         let Some(value) = db.get(&*wtxn, &key)? else {
             continue;
         };

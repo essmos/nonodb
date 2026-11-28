@@ -20,12 +20,14 @@ same documents, and measures the same operations in the same order. It is a raw
 standard-vs-standard workload, not a columnar-optimized query against a
 standard full scan.
 
-Dataset: 100,000 append-heavy analytics documents with realistic string `_id`
+Dataset: 100,128 append-heavy analytics documents with realistic string `_id`
 values (`id-00000000`), nested objects, arrays, timestamps, floats, enums, and
-booleans. Ingest is 100 transactions of 1,000 rows; buckets hold 512 rows. Two
-secondary indexes (`user`, `status`) are created before the storage and
-retention measurements. History is disabled for both profiles by default, TTL
-is unused, and both profiles run on the same filesystem and LMDB map size.
+booleans. Ingest is 100 transactions of 1,000 rows; buckets hold 512 rows. The
+last 128 rows are inserted singly so the open-bucket gate measures a genuinely
+open staging bucket rather than a sealed one. Two secondary indexes (`user`,
+`status`) are created before the storage and retention measurements. History is
+disabled for both profiles by default, TTL is unused, and both profiles run on
+the same filesystem and LMDB map size.
 
 Environment: Linux 7.0.14, Intel Xeon D-2141I, 14 GiB RAM, Rust 1.100.0,
 `--release`, LMDB map size 1 GiB.
@@ -36,22 +38,27 @@ One representative run:
 
 | Metric | standard | columnar | gate | result |
 |---|---:|---:|---:|---|
-| Storage including ids, locator map, and 2 indexes | 36.1 MB | 17.5 MB | `columnar / standard <= 0.50` | **0.485** |
-| Batch insert (1,000 rows / transaction) | 610.0 ms | 661.6 ms | `standard / columnar >= 0.80` | **0.922** |
-| Single insert | 17.90 us | 34.20 us | `columnar / standard <= 2.0` (gate 0.50×) | **1.91x** |
-| Sealed point read p50 | 4.8 us | 9.7 us | `columnar / standard <= 3.0` | **2.04x** |
-| Full scan | 223.2 ms | 136.8 ms | `standard / columnar >= 0.80` | **1.63x** |
-| `$group` + `$sort` aggregation | 106.7 ms | 105.4 ms | `standard / columnar >= 0.80` | **1.01x** |
-| Single-document update p50 | 23.9 us | 44.9 us | `columnar / standard <= 5.0` | **1.88x** |
+| Storage including ids, locator map, and 2 indexes | 36.5 MB | 17.6 MB | `columnar / standard <= 0.50` | **0.481** |
+| Batch insert (1,000 rows / transaction) | 651.5 ms | 747.1 ms | `standard / columnar >= 0.80` | **0.872** |
+| Single insert | 17.96 us | 35.59 us | `columnar / standard <= 2.0` (gate 0.50×) | **1.98x** |
+| Sealed point read p50 | 5.0 us | 9.8 us | `columnar / standard <= 3.0` | **1.96x** |
+| Open-bucket point read p50 | 4.6 us | 6.0 us | `columnar / standard <= 1.5` | **1.30x** |
+| Full scan | 208.4 ms | 161.6 ms | `standard / columnar >= 0.80` | **1.29x** |
+| `$group` + `$sort` aggregation | 115.1 ms | 102.2 ms | `standard / columnar >= 0.80` | **1.13x** |
+| Single-document update p50 | 23.8 us | 33.8 us | `columnar / standard <= 5.0` | **1.42x** |
+| Multi-document update, 37,527 rows | 727.0 ms | 1182.6 ms | reported separately | **0.61x throughput** |
 
-Three consecutive runs plus the final release commit produced these ranges:
-storage `0.485-0.489`, batch `0.922-0.966`, point `1.996-2.104x`, update
-`1.856-1.895x`, scan `1.591-1.676x`, aggregation `0.829-1.012x`.
+Three consecutive runs produced these ranges: storage `0.481-0.488`, batch
+`0.840-0.872`, single insert `1.934-1.982x`, sealed point `1.788-1.954x`,
+open-bucket point `1.234-1.304x`, update `1.392-1.423x`, scan `1.290-1.402x`,
+aggregation `0.846-1.127x`. Multi-update throughput was `31.7k-32.4k rows/s`
+for columnar versus `50.7k-51.6k rows/s` for standard in the same runs.
 
 Retention/compaction (`AC-PERF-007`, `AC-PERF-010`): deleting 25% of rows left
-18.1 MB; compaction reduced it to 15.6 MB (`reclaim = 0.860`). Bucket
-seal/compaction p95 was 1.36-1.38 s, and sealed point-read p95 was 12.3 us. No
-correctness result changed after compaction or reopen.
+18.2 MB; compaction reduced it to 15.6 MB (`reclaim = 0.860`). Bucket
+seal/compaction p95 was 1.50-1.52 s, sealed point-read p95 was 11.7-12.3 us, and
+open-bucket point-read p95 was 6.0-6.2 us. No correctness result changed after
+compaction or reopen.
 
 ## Shared-codec regression check (`AC-PERF-008`)
 

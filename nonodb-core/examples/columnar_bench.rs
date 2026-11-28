@@ -92,12 +92,19 @@ fn run(label: &'static str, profile: CollectionProfile) -> Run {
     insert_batches(&coll, store);
     let insert_batch = start.elapsed();
 
-    // The final staging bucket is still open: measure point reads there before
-    // the explicit seal.
+    // Leave a deliberately open staging bucket after the batch load. The
+    // normal batch path seals every full bucket, so these extra rows ensure the
+    // open-bucket point-read gate measures a real open bucket.
+    const OPEN_TAIL: usize = 128;
+    for index in 0..OPEN_TAIL {
+        let mut d = doc(DOCS + index);
+        d["_id"] = json!(format!("open-{index:08}"));
+        coll.insert_one(d).unwrap();
+    }
     let mut open_point = Vec::with_capacity(POINT_READS.min(512));
     let open_reads = POINT_READS.min(512);
     for index in 0..open_reads {
-        let id = id(DOCS - 1 - (index % 128));
+        let id = format!("open-{:08}", index % OPEN_TAIL);
         let start = Instant::now();
         let found = coll.find_by_key(&id).unwrap();
         open_point.push(start.elapsed());
