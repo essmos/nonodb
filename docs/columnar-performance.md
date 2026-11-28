@@ -66,11 +66,15 @@ NONODB_MAP_SIZE=4294967296 \
   cargo run --release -p nonodb-core --example columnar_soak
 ```
 
-The 10,000,000-row insertion reached its peak at **103 MiB RSS** after
-546.5 s; memory did not grow with the number of sealed buckets. The write path
+The 10,000,000-row insertion plus the final `storage_stats` call completed in
+402.7 s and reported 2.05 GB of bucket data. Peak **anonymous** memory
+(`RssAnon`) stayed at **9 MiB** for every million-row checkpoint; the write path
 only holds one transaction's staging buffer, and `storage_stats` reads bucket
-headers instead of materializing every document. Run this harness on a disk
-path, not a small tmpfs, so the LMDB map file does not compete with RAM.
+headers instead of materializing every document. Peak total RSS reached
+603 MiB because LMDB maps the 4 GiB data file and touched pages are counted as
+file-backed RSS; the kernel can reclaim those pages and they do not grow the
+process heap. Run this harness on a disk path, not a small tmpfs, so the LMDB
+map file does not compete with RAM.
 
 ## Interpretation
 

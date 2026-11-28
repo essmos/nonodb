@@ -22,10 +22,10 @@ fn doc(index: usize) -> Value {
     })
 }
 
-fn peak_rss_kib() -> Option<u64> {
+fn status_kib(prefix: &str) -> Option<u64> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
     for line in status.lines() {
-        if let Some(value) = line.strip_prefix("VmHWM:") {
+        if let Some(value) = line.strip_prefix(prefix) {
             return value
                 .split_whitespace()
                 .next()
@@ -33,6 +33,14 @@ fn peak_rss_kib() -> Option<u64> {
         }
     }
     None
+}
+
+fn peak_rss_kib() -> Option<u64> {
+    status_kib("VmHWM:")
+}
+
+fn anonymous_kib() -> Option<u64> {
+    status_kib("RssAnon:")
 }
 
 fn main() {
@@ -62,6 +70,7 @@ fn main() {
         )
         .unwrap();
     let started = std::time::Instant::now();
+    let mut peak_anon_kib = 0u64;
     for start in (0..docs).step_by(BATCH) {
         let batch: Vec<Value> = (start..(start + BATCH).min(docs)).map(doc).collect();
         let mut wtxn = store.write_txn().unwrap();
@@ -69,21 +78,25 @@ fn main() {
         tx_coll.insert_many_txn(&mut wtxn, &batch).unwrap();
         wtxn.commit().unwrap();
         let inserted = start + batch.len();
+        peak_anon_kib = peak_anon_kib.max(anonymous_kib().unwrap_or(0));
         if inserted.is_multiple_of(1_000_000) {
             eprintln!(
-                "progress inserted={inserted} elapsed_s={:.1} peak_rss_mib={}",
+                "progress inserted={inserted} elapsed_s={:.1} peak_rss_mib={} peak_anon_mib={}",
                 started.elapsed().as_secs_f64(),
                 peak_rss_kib().map_or(0, |kib| kib / 1024),
+                peak_anon_kib / 1024,
             );
         }
     }
     store.seal_columnar("soak").unwrap();
     let stats = store.storage_stats().unwrap();
     let collection = &stats.collections[0];
+    peak_anon_kib = peak_anon_kib.max(anonymous_kib().unwrap_or(0));
     println!(
-        "docs={docs} elapsed_s={:.1} peak_rss_mib={} data_bytes={} index_bytes={} records={}",
+        "docs={docs} elapsed_s={:.1} peak_rss_mib={} peak_anon_mib={} data_bytes={} index_bytes={} records={}",
         started.elapsed().as_secs_f64(),
         peak_rss_kib().map_or(0, |kib| kib / 1024),
+        peak_anon_kib / 1024,
         collection.data_bytes,
         collection.index_bytes,
         collection.records,

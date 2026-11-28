@@ -291,6 +291,9 @@ The following evidence was reviewed for this release candidate:
 - The canonical release benchmark passed every `AC-PERF` gate; the measured
   ranges and reproduction command are in
   [columnar performance evidence](columnar-performance.md).
+- The 10,000,000-row bounded-memory soak completed with 9 MiB peak anonymous
+  memory; total RSS (603 MiB) is LMDB file-backed mapping, as recorded in the
+  same performance evidence.
 - Decoder fuzzing, randomized differential operations, concurrent
   writers/readers, crash/rollback, interrupted compaction, unknown formats,
   and float bit-exact roundtrips are covered by
