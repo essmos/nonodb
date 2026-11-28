@@ -58,8 +58,35 @@ and `write_batch` accept an optional `durability` field:
 | Mode | Behavior | Guarantee |
 |---|---|---|
 | `full` | Default. Force data and metadata to stable storage before replying | Acknowledged writes survive a crash |
-| `relaxed` | Commit with LMDB `NO_META_SYNC`; data is flushed, metadata is not forced every commit | Database stays consistent, but the last commits can be lost after a power failure |
-| `unsafe` | Skip the extra sync. Requires daemon opt-in | Fastest; recent writes can be lost on a crash/power failure |
+| `relaxed` | Skip the per-commit sync; the daemon syncs in the background when `NONODB_SYNC_INTERVAL_MS` is set (see below) | Acknowledged writes are consistent; up to one sync interval of `relaxed` writes can be lost on a crash |
+| `unsafe` | Skip every sync. Requires daemon opt-in | Fastest; recent writes can be lost on a crash/power failure |
+
+### What `relaxed` actually costs
+
+LMDB's sync flags are environment-wide, not per-transaction, so the daemon has to
+decide at startup how commits reach the disk. Two configurations matter:
+
+| Daemon setting | LMDB mode | What a commit does | `relaxed` gain |
+|---|---|---|---|
+| *(default)* | `MDB_NOMETASYNC` | Syncs data pages, leaves the meta page lazy | **None.** `relaxed` measures within noise of `full` |
+| `NONODB_SYNC_INTERVAL_MS=100` | `MDB_NOSYNC` | Touches nothing; a syncer thread calls `mdb_env_sync` every 100 ms, and once more on a clean shutdown | Large: a commit becomes a memory copy |
+
+```bash
+# opt in: relaxed writes lose at most the last 100 ms on a crash
+NONODB_SYNC_INTERVAL_MS=100
+```
+
+`full` requests stay durable in both configurations, because `full` always calls
+`mdb_env_sync` itself after the commit. Event writes, authentication state, TTL
+maintenance and auto-index builds use `full` regardless of what the client asked
+for. The syncer only wakes the disk when a commit that asked for less than `full`
+actually happened, so an idle daemon does not write at all.
+
+Measured end to end (4 vCPU, ZFS under load from another job, one insert per
+request through the load generator in `scripts/loadgen.rs`): 22 requests/s with
+the default policy against 3 141 requests/s with `NONODB_SYNC_INTERVAL_MS=50` and
+`durability: "relaxed"`; the commit itself went from 28 113 µs to 128 µs. On an
+idle host the same comparison is ~0.85 ms against ~0.05 ms per commit.
 
 `unsafe` is rejected unless the daemon is started with:
 
@@ -67,10 +94,13 @@ and `write_batch` accept an optional `durability` field:
 NONODB_ALLOW_UNSAFE_WRITES=1
 ```
 
-With that opt-in the LMDB environment uses `MDB_NOSYNC`; in that mode both
-`relaxed` and `unsafe` skip the forced sync. Without it, the environment uses
-`MDB_NOMETASYNC`, so `relaxed` still flushes data but not the metadata page.
-`full` calls `mdb_env_sync` after the writer transaction commits.
+With that opt-in the environment uses `MDB_NOSYNC` and nothing is synced unless a
+write asks for `full`. It is mutually exclusive with interval syncing: an
+explicit "I accept crash loss" wins over the timer.
+
+`scripts/durability_test.py` checks all of this with `SIGKILL`:
+`full` survives an immediate kill, interval-synced `relaxed` survives a kill after
+the window, and `relaxed` without the interval loses only what was never synced.
 
 When the writer groups several requests into one commit, the strictest mode in
 the group wins: a single `full` request forces an fsync for the whole group.

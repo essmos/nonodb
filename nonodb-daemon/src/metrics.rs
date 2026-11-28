@@ -62,6 +62,9 @@ pub static WRITE_OPS: AtomicU64 = AtomicU64::new(0);
 pub static WRITE_BATCHES: AtomicU64 = AtomicU64::new(0);
 /// Total `commit` time (including `fsync`) in nanoseconds.
 pub static COMMIT_NS: AtomicU64 = AtomicU64::new(0);
+/// Interval-durability syncs performed and the time they took.
+pub static SYNC_INTERVAL_RUNS: AtomicU64 = AtomicU64::new(0);
+pub static SYNC_INTERVAL_NS: AtomicU64 = AtomicU64::new(0);
 /// TTL sweeps, expired documents, errors, and the last due backlog.
 pub static TTL_SWEEPS: AtomicU64 = AtomicU64::new(0);
 pub static TTL_EXPIRED: AtomicU64 = AtomicU64::new(0);
@@ -821,6 +824,8 @@ pub fn snapshot() -> Value {
         "lookup_latency": lookup_latency,
         "latency_series_overflow_total": LATENCY_SERIES_OVERFLOW.load(Relaxed),
         "commit_ns_total": commit_ns,
+        "sync_interval_runs_total": SYNC_INTERVAL_RUNS.load(Relaxed),
+        "sync_interval_ns_total": SYNC_INTERVAL_NS.load(Relaxed),
         "ttl_sweeps_total": TTL_SWEEPS.load(Relaxed),
         "ttl_expired_total": TTL_EXPIRED.load(Relaxed),
         "ttl_sweep_errors_total": TTL_SWEEP_ERRORS.load(Relaxed),
@@ -1484,6 +1489,16 @@ pub fn prometheus() -> String {
             "nonodb_commit_ns_total",
             "commit_ns_total",
             "Total commit time including fsync.",
+        ),
+        (
+            "nonodb_sync_interval_runs_total",
+            "sync_interval_runs_total",
+            "Background syncs performed for interval durability.",
+        ),
+        (
+            "nonodb_sync_interval_ns_total",
+            "sync_interval_ns_total",
+            "Total time spent in background interval syncs.",
         ),
         (
             "nonodb_ttl_sweeps_total",

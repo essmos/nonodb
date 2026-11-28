@@ -53,6 +53,7 @@ pub struct DatabaseRuntime {
     webhooks: Mutex<Option<std::thread::JoinHandle<()>>>,
     snapshots: Mutex<Option<std::thread::JoinHandle<()>>>,
     wal: Mutex<Option<std::thread::JoinHandle<()>>>,
+    sync: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl DatabaseRuntime {
@@ -77,6 +78,9 @@ impl Drop for DatabaseRuntime {
             let _ = handle.join();
         }
         if let Some(handle) = self.snapshots.lock().expect("snapshots lock").take() {
+            let _ = handle.join();
+        }
+        if let Some(handle) = self.sync.lock().expect("sync lock").take() {
             let _ = handle.join();
         }
         if let Some(handle) = self.wal.lock().expect("wal lock").take() {
@@ -656,6 +660,7 @@ fn start_runtime(root: &Path, name: &str) -> Result<DatabaseRuntime, String> {
     let webhooks =
         crate::webhooks::start(store.clone(), write_tx.clone(), path.clone(), stop.clone());
     let wal = crate::wal::start(store.clone(), path.clone(), name.to_string(), stop.clone());
+    let sync = crate::sync::start(store.clone(), name.to_string(), stop.clone());
     let snapshot_dir = std::env::var_os("NONODB_SNAPSHOT_DIR")
         .map(|dir| PathBuf::from(dir).join(name))
         .or_else(|| crate::wal::enabled().then(|| path.join("snapshots")));
@@ -681,6 +686,7 @@ fn start_runtime(root: &Path, name: &str) -> Result<DatabaseRuntime, String> {
         webhooks: Mutex::new(Some(webhooks)),
         snapshots: Mutex::new(snapshots),
         wal: Mutex::new(wal),
+        sync: Mutex::new(sync),
     })
 }
 

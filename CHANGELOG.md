@@ -2,6 +2,22 @@
 
 Full release notes: https://github.com/essmos/nonodb/releases
 
+## Unreleased
+
+- **`NONODB_SYNC_INTERVAL_MS` makes `relaxed` durability actually cheap.** LMDB sync
+  flags are environment-wide, so the previous `MDB_NOMETASYNC` setup still synced
+  data pages on every commit: `relaxed` measured within noise of `full` (~0.85 ms
+  per commit on ZFS, ~1.2k single-document writes/s). With the interval set, the
+  environment runs `MDB_NOSYNC` and a background syncer calls `mdb_env_sync` every
+  N ms - and once more on a clean shutdown - while `full` requests keep syncing
+  themselves per commit. Measured on a loaded ZFS box: one insert per request went
+  from 22 to 3 141 requests/s and the commit from 28 113 us to 128 us; on an idle
+  host the commit drops from ~0.85 ms to ~0.05 ms. The loss window is one interval
+  and is documented. New metrics: `nonodb_sync_interval_runs_total`,
+  `nonodb_sync_interval_ns_total`. `scripts/durability_test.py` verifies the ladder
+  with `SIGKILL`, and `scripts/loadgen.rs` measures the server instead of the
+  GIL-bound Python client.
+
 ## v0.35.0 - 2026-11-27
 
 Streams and consumer groups release: writer-assigned `_seq` offsets, durable

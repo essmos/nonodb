@@ -23,17 +23,27 @@ DAEMON = Path(os.environ.get("NONODB_DAEMON", ROOT / "target/debug/nonodb-daemon
 
 
 def wait_socket(path: Path, proc) -> None:
+    import socket
+
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
-        if path.exists():
-            return
         if proc.poll() is not None:
             raise RuntimeError(f"daemon exited with {proc.returncode}")
+        # A killed daemon leaves its socket file behind, so a plain `exists()`
+        # check races the restart; only a successful connect means "listening".
+        if path.exists():
+            try:
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+                    probe.settimeout(0.2)
+                    probe.connect(str(path))
+                return
+            except OSError:
+                pass
         time.sleep(0.05)
     raise RuntimeError("daemon socket did not appear")
 
 
-def start(data: Path, sock: Path, *, unsafe: bool, log: Path):
+def start(data: Path, sock: Path, *, unsafe: bool, log: Path, interval_ms: int | None = None):
     env = os.environ.copy()
     env.update(
         NONODB_DATA=str(data),
@@ -45,6 +55,10 @@ def start(data: Path, sock: Path, *, unsafe: bool, log: Path):
         env["NONODB_ALLOW_UNSAFE_WRITES"] = "1"
     else:
         env.pop("NONODB_ALLOW_UNSAFE_WRITES", None)
+    if interval_ms:
+        env["NONODB_SYNC_INTERVAL_MS"] = str(interval_ms)
+    else:
+        env.pop("NONODB_SYNC_INTERVAL_MS", None)
     fh = log.open("ab")
     proc = __import__("subprocess").Popen(
         [str(DAEMON)], env=env, stdout=fh, stderr=__import__("subprocess").STDOUT
@@ -52,6 +66,16 @@ def start(data: Path, sock: Path, *, unsafe: bool, log: Path):
     fh.close()
     wait_socket(sock, proc)
     return proc
+
+
+def sync_runs(sock: Path) -> int | None:
+    """Reads `sync_interval_runs_total` from the daemon metrics endpoint."""
+    import httpx
+
+    transport = httpx.HTTPTransport(uds=str(sock))
+    with httpx.Client(transport=transport, base_url="http://localhost", timeout=10) as client:
+        body = client.get("/metrics").json()
+    return body.get("sync_interval_runs_total")
 
 
 def crash(proc) -> None:
@@ -180,6 +204,34 @@ def main() -> int:
         db.close()
     finally:
         stop(proc)
+
+    # Interval syncing: with NONODB_SYNC_INTERVAL_MS the environment runs
+    # MDB_NOSYNC and a background thread syncs on a timer, so a relaxed write
+    # survives SIGKILL once the window has passed - and nothing more.
+    interval_data = tmp / "interval"
+    interval_sock = tmp / "interval.sock"
+    proc = start(interval_data, interval_sock, unsafe=False, log=log, interval_ms=50)
+    try:
+        db = NonoDB(str(interval_sock), cache_ttl=0.0)
+        c = db.collection("interval")
+        for i in range(200):
+            c.insert({"i": i, "payload": "x" * 64}, durability="relaxed")
+        time.sleep(0.6)  # several windows: the syncer must have run by now
+        runs = sync_runs(interval_sock)
+        assert runs and runs > 0, f"interval syncer never ran: {runs}"
+        db.close()
+    finally:
+        crash(proc)
+
+    proc = start(interval_data, interval_sock, unsafe=False, log=log, interval_ms=50)
+    try:
+        db = NonoDB(str(interval_sock), cache_ttl=0.0)
+        stored = db.collection("interval").count({})
+        db.close()
+    finally:
+        stop(proc)
+    assert stored == 200, f"interval syncing lost durable-by-contract writes: {stored}/200"
+    print(f"interval sync: {runs} background syncs, 200/200 relaxed writes survived SIGKILL")
 
     print("durability test: ok")
     import shutil

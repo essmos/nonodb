@@ -63,8 +63,8 @@ pub use search::{
 };
 pub use search_all::{SearchAllRequest, SearchAllResponse, SearchMode};
 pub use store::{
-    parse_size, ReadTxn, Store, WriteTxn, CONTROL_DB, MAP_SIZE, MAX_DBS, MAX_DOCUMENT_BYTES,
-    META_DB, PAGE_SIZE,
+    parse_size, sync_interval_ms, sync_policy, ReadTxn, Store, SyncPolicy, WriteTxn, CONTROL_DB,
+    MAP_SIZE, MAX_DBS, MAX_DOCUMENT_BYTES, META_DB, PAGE_SIZE,
 };
 pub use timeseries::{
     Compression as TimeSeriesCompression, Granularity as TimeSeriesGranularity,

@@ -321,6 +321,22 @@ How to read them:
   instead of skipping events. `nonodb_stream_pruned_events_total` counts the
   dropped events themselves.
 
+## Interval syncing
+
+When `NONODB_SYNC_INTERVAL_MS` is set, commits stop syncing individually and a
+background thread syncs on a timer. Two series describe it:
+
+- `nonodb_sync_interval_runs_total` — syncs actually performed. It stays flat
+  while the daemon is idle (the syncer only runs when a write asked for less than
+  `full`), and it should advance steadily under `relaxed` write load.
+- `nonodb_sync_interval_ns_total` — time spent in those syncs; divide by the run
+  count to see how expensive one sync is on your storage.
+
+A rising `nonodb_sync_interval_ns_total` with a flat `nonodb_sync_interval_runs_total`
+is normal (fewer, slower syncs under write pressure). A flat run count while
+`nonodb_commit_ns_total` climbs means writes are all `full` and the syncer has
+nothing to do.
+
 ## Recommended alerts
 
 At minimum, alert on:
