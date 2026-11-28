@@ -253,3 +253,59 @@ fn unique_failures_leave_no_partial_state_when_the_transaction_commits() {
     assert_eq!(c.find_by_key("i1").unwrap().unwrap()["v"], 2);
     assert_eq!(c.count(&json!({"v": 1})).unwrap(), 1);
 }
+
+#[test]
+fn byte_limit_seal_keeps_open_id_point_reads_aligned() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let c = store
+        .create_columnar_collection(
+            "docs",
+            &nonodb_core::columnar::Settings {
+                bucket_max_docs: 512,
+                bucket_max_bytes: 4096,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let docs: Vec<Value> = (0..300)
+        .map(|index| {
+            json!({
+                "_id": format!("d{index}"),
+                "blob": "x".repeat(2000),
+                "n": index,
+            })
+        })
+        .collect();
+    let mut wtxn = store.write_txn().unwrap();
+    c.insert_many_txn(&mut wtxn, &docs).unwrap();
+    wtxn.commit().unwrap();
+    let stats = store.columnar_stats("docs").unwrap().unwrap();
+    assert!(stats.sealed_buckets > 0, "{stats:?}");
+    assert!(stats.open_buckets > 0, "{stats:?}");
+
+    for index in [0usize, 1, 50, 258, 299] {
+        let id = format!("d{index}");
+        let doc = c.find_by_key(&id).unwrap().expect("point read after seal");
+        assert_eq!(doc["_id"], id, "point read returned the wrong document");
+        assert_eq!(doc["n"], index as i64);
+    }
+
+    let opts = nonodb_core::FindAndModifyOptions {
+        filter: &json!({"_id": "d0"}),
+        update: Some(&json!({"$set": {"n": 999}})),
+        sort: &[],
+        new: false,
+        upsert: false,
+        remove: false,
+        array_filters: &[],
+        projection: None,
+    };
+    let mut wtxn = store.write_txn().unwrap();
+    let out = c.find_and_modify_txn(&mut wtxn, &opts).unwrap();
+    wtxn.commit().unwrap();
+    assert_eq!(out.value.as_ref().unwrap()["_id"], "d0");
+    assert_eq!(out.value.as_ref().unwrap()["n"], 0);
+    assert_eq!(c.find_by_key("d0").unwrap().unwrap()["n"], 999);
+    assert_eq!(c.find_by_key("d258").unwrap().unwrap()["n"], 258);
+}

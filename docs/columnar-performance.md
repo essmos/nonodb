@@ -38,26 +38,28 @@ One representative run:
 
 | Metric | standard | columnar | gate | result |
 |---|---:|---:|---:|---|
-| Storage including ids, locator map, and 2 indexes | 36.5 MB | 17.6 MB | `columnar / standard <= 0.50` | **0.481** |
-| Batch insert (1,000 rows / transaction) | 651.5 ms | 747.1 ms | `standard / columnar >= 0.80` | **0.872** |
-| Single insert | 17.96 us | 35.59 us | `columnar / standard <= 2.0` (gate 0.50×) | **1.98x** |
-| Sealed point read p50 | 5.0 us | 9.8 us | `columnar / standard <= 3.0` | **1.96x** |
-| Open-bucket point read p50 | 4.6 us | 6.0 us | `columnar / standard <= 1.5` | **1.30x** |
-| Full scan | 208.4 ms | 161.6 ms | `standard / columnar >= 0.80` | **1.29x** |
-| `$group` + `$sort` aggregation | 115.1 ms | 102.2 ms | `standard / columnar >= 0.80` | **1.13x** |
-| Single-document update p50 | 23.8 us | 33.8 us | `columnar / standard <= 5.0` | **1.42x** |
-| Multi-document update, 37,527 rows | 727.0 ms | 1182.6 ms | reported separately | **0.61x throughput** |
+| Storage including ids, locator map, and 2 indexes | 36.1 MB | 17.6 MB | `columnar / standard <= 0.50` | **0.487** |
+| Batch insert (1,000 rows / transaction) | 643.3 ms | 727.2 ms | `standard / columnar >= 0.80` | **0.885** |
+| Single insert | 19.95 us | 38.29 us | `columnar / standard <= 2.0` (gate 0.50×) | **1.92x** |
+| Sealed point read p50 | 4.9 us | 9.5 us | `columnar / standard <= 3.0` | **1.94x** |
+| Open-bucket point read p50 | 4.5 us | 6.0 us | `columnar / standard <= 1.5` | **1.33x** |
+| Full scan | 228.0 ms | 159.6 ms | `standard / columnar >= 0.80` | **1.43x** |
+| `$group` + `$sort` aggregation | 91.0 ms | 107.0 ms | `standard / columnar >= 0.80` | **0.85x** |
+| Single-document update p50 | 24.9 us | 33.5 us | `columnar / standard <= 5.0` | **1.35x** |
+| Multi-document update, 37,527 rows | 718.3 ms | 1156.0 ms | reported separately | **0.62x throughput** |
 
-Three consecutive runs produced these ranges: storage `0.481-0.488`, batch
-`0.840-0.872`, single insert `1.934-1.982x`, sealed point `1.788-1.954x`,
-open-bucket point `1.234-1.304x`, update `1.392-1.423x`, scan `1.290-1.402x`,
-aggregation `0.846-1.127x`. Multi-update throughput was `31.7k-32.4k rows/s`
-for columnar versus `50.7k-51.6k rows/s` for standard in the same runs.
+Three runs after an untimed aggregation warmup produced these ranges: storage
+`0.487-0.488`, batch `0.849-0.906`, single insert `1.90-1.98x`, sealed point
+`1.94-2.15x`, open-bucket point `1.28-1.33x`, update `1.35-1.37x`, scan
+`1.36-1.43x`, aggregation `0.805-0.920x`. The untimed warmup prevents
+thread-startup and page-cache effects from dominating the aggregation ratio.
+Multi-update throughput was `32.5k-33.4k rows/s` for columnar versus
+`52.2k-54.2k rows/s` for standard in the same runs.
 
 Retention/compaction (`AC-PERF-007`, `AC-PERF-010`): deleting 25% of rows left
 18.2 MB; compaction reduced it to 15.6 MB (`reclaim = 0.860`). Bucket
-seal/compaction p95 was 1.50-1.52 s, sealed point-read p95 was 11.7-12.3 us, and
-open-bucket point-read p95 was 6.0-6.2 us. No correctness result changed after
+seal/compaction p95 was 1.47-1.50 s, sealed point-read p95 was 11.9-12.6 us, and
+open-bucket point-read p95 was 6.0-6.1 us. No correctness result changed after
 compaction or reopen.
 
 ## Shared-codec regression check (`AC-PERF-008`)

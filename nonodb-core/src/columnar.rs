@@ -1006,7 +1006,11 @@ pub fn insert_batch(
                 for row in 0..disk_rows {
                     db.delete(&mut *wtxn, &open_row_key(pointer.0, row))?;
                 }
+                for id in &open_ids {
+                    db.delete(&mut *wtxn, &open_id_key(id))?;
+                }
                 open.clear();
+                open_ids.clear();
             }
             pointer = (pointer.0 + 1, 0, 0);
             disk_rows = 0;
@@ -1066,6 +1070,8 @@ pub fn insert_batch(
             for id in &open_ids {
                 db.delete(&mut *wtxn, &open_id_key(id))?;
             }
+            open.clear();
+            open_ids.clear();
             pointer = (pointer.0 + 1, 0, 0);
         } else {
             for (row, encoded) in open.iter().enumerate().skip(disk_rows as usize) {

@@ -141,13 +141,15 @@ fn run(label: &'static str, profile: CollectionProfile) -> Run {
     let scan = scan_start.elapsed();
     assert!(!rows.is_empty());
 
+    // Warm the aggregation path so per-run thread startup and page-cache
+    // effects do not dominate the measured ratio.
+    let stages = [
+        json!({"$group": {"_id": "$status", "n": {"$sum": 1}, "total": {"$sum": "$amount"}}}),
+        json!({"$sort": {"_id": 1}}),
+    ];
+    let _ = coll.aggregate(&stages).unwrap();
     let agg_start = Instant::now();
-    let groups = coll
-        .aggregate(&[
-            json!({"$group": {"_id": "$status", "n": {"$sum": 1}, "total": {"$sum": "$amount"}}}),
-            json!({"$sort": {"_id": 1}}),
-        ])
-        .unwrap();
+    let groups = coll.aggregate(&stages).unwrap();
     let aggregate = agg_start.elapsed();
     assert_eq!(groups.len(), 4);
 
