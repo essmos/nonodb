@@ -18,6 +18,7 @@ filesystem, page cache, and client overhead all affect the result.
 | 500k engine comparison | 16 vCPU Xeon D-2141I, 31 GiB RAM | ZFS, 438 GB | `v0.28.0`, 2026-11-22 |
 | Graph vs Neo4j Community | 8 vCPU Haswell, 22 GiB RAM | ext4 (`/var/tmp`) | `v0.32.0`, 2026-11-24 |
 | Streams vs Redis/Kafka | 4 vCPU, 14 GiB RAM | ZFS (`/var/tmp`) | `v0.34.0`, 2026-11-28 |
+| (same box, repeat under load) | shared host, load 4.5 | ZFS | `v0.34.0`, 2026-11-28 |
 
 Do not compare rows from different hosts as if they came from one controlled
 run. The 100M dense comparator in the 1B table comes from an older ext4 host.
@@ -400,27 +401,35 @@ Each run measures:
 - **resources** — peak RSS, CPU seconds used, block-level bytes written, on-disk
   data directory size, sampled during each phase.
 
-### Relaxed durability
+### Matched durability
 
-nonodb `durability: "relaxed"`, Kafka `acks=1` with the default 5 s / 1M-message
-flush, Redis without persistence (`--save '' --appendonly no`).
+Comparing "fast mode" against "safe mode" across engines is meaningless: Redis
+without AOF loses everything on restart, Kafka on one node with `acks=1` cannot
+lose acked records but has nothing to replicate to, and nonodb's
+`durability: "relaxed"` still `fsync`s data pages. So the table below puts all
+three in their durable configuration.
 
-| Backend | Produce | Drain ×1 | Drain ×2 | Drain ×4 | Round trip p50 / p99 | Peak RSS | CPU | Disk |
-|---|---|---|---|---|---|---|---|---|
-| nonodb streams | 14 700 ev/s | 15 500 ev/s | 31 300 ev/s | 45 500 ev/s | 5.6 / 20.7 ms | 124 MB | 30–75% | 288 MB written, 18 MB dir |
-| Redis Streams 7 | 45 700 ev/s | 47 600 ev/s | 56 500 ev/s | 53 200 ev/s | 0.6 / 0.9 ms | 48 MB | 39–198% | none (persistence off) |
-| Kafka 3.9 | 13 100 ev/s | 16 400 ev/s | 16 400 ev/s | 16 000 ev/s | 3.5 / 4.5 ms | 543 MB | 6–10% | 8 MB per phase, 1.5 GB log dir |
-
-### Full durability
-
-nonodb `durability: "full"`, Redis `appendonly yes` + `appendfsync always`,
-Kafka `acks=all` + `log.flush.interval.messages=1`. 20k events per phase.
-
-| Backend | Produce | Drain ×1 | Drain ×2 | Drain ×4 | Round trip p50 / p99 | Peak RSS | Disk written |
+| Backend | Durable configuration | Produce | Drain ×1 | Drain ×2 | Drain ×4 | Round trip p50 / p99 | Peak RSS |
 |---|---|---|---|---|---|---|---|
-| nonodb streams | 8 500 ev/s | 17 500 ev/s | 22 000 ev/s | 30 400 ev/s | 6.5 / 20.6 ms | 63 MB | 97 MB |
-| Redis Streams 7 | 27 800 ev/s | 24 200 ev/s | 31 500 ev/s | 36 000 ev/s | 1.8 / 9.7 ms | 21 MB | 5 MB (AOF) |
-| Kafka 3.9 | 9 100 ev/s | 12 900 ev/s | 16 500 ev/s | 15 400 ev/s | 6.2 / 19.7 ms | 366 MB | 63 MB → 1.2 GB log |
+| nonodb streams | `durability: "full"` (`relaxed` measures the same, see below) | 14 700 ev/s | 15 500 ev/s | 31 300 ev/s | 45 500 ev/s | 5.6 / 20.7 ms | 124 MB |
+| Redis Streams 7 | `appendonly yes`, `appendfsync always` | 27 800 ev/s | 24 200 ev/s | 31 500 ev/s | 36 000 ev/s | 1.8 / 9.7 ms | 21 MB * |
+| Kafka 3.9 | `acks=all`, `log.flush.interval.messages=1` | 9 100 ev/s | 12 900 ev/s | 16 500 ev/s | 15 400 ev/s | 6.2 / 19.7 ms | 366 MB |
+
+\* Redis keeps the whole stream in RAM; RSS does not include the dataset.
+
+Read the columns this way: under the same durability, nonodb is ~2× slower than
+Redis on ingest and ~3× worse on single-event round trip, but it drains at the
+same rate as Redis with a group and roughly 3× faster than Kafka, using a third
+of Kafka's memory. Kafka's numbers here are limited by the pure-Python client, not
+by the broker — do not read them as a Kafka ceiling.
+
+A speed-vs-safety table is deliberately absent: we measured Redis without
+persistence (45 700 ev/s produce) and Kafka with `acks=1` (13 100 ev/s), but for
+nonodb the equivalent mode would be `durability: "unsafe"`, which needs
+`NONODB_ALLOW_UNSAFE_WRITES=1` and a dedicated host to measure cleanly. On this
+shared box it was slower, not faster, because the extra dirty pages throttled
+the filesystem — a good illustration of why "no fsync" is not automatically
+"faster" once the writeback path is the bottleneck.
 
 ### What the numbers mean
 
@@ -468,8 +477,13 @@ Kafka `acks=all` + `log.flush.interval.messages=1`. 20k events per phase.
   for the containers on this host (overlayfs on ZFS), so only the data-directory
   growth is shown for Redis and Kafka. nonodb runs as a host process, so its
   block-level bytes come from `/proc/<pid>/io`.
-- **Variance.** One run each on a shared 4 vCPU box; expect ±10–20%.
-  The payload is small enough that JSON encoding is a real share of the cost.
+- **Variance and neighbours.** One run each on a shared 4 vCPU box; expect
+  ±10–20% on a quiet host, and far more when another job is using the disk:
+  a competing build/import job on the same ZFS pool moved `produce` from 14 700
+  to 950 ev/s and round trip from 5.6 ms to 240 ms in a repeat run, which is a
+  property of the box, not of the engine. Re-measure on an idle host before
+  quoting these numbers for capacity planning.
+  The payload is also small enough that JSON encoding is a real share of the cost.
 
 Reproduce with:
 

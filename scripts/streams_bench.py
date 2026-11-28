@@ -84,6 +84,10 @@ class NonodbBackend:
                 "NONODB_LOG": "warn",
             }
         )
+        if self.durability == "unsafe":
+            # LMDB has to be opened with NO_SYNC, which is an environment-wide
+            # flag and therefore an explicit opt-in for the whole daemon.
+            env["NONODB_ALLOW_UNSAFE_WRITES"] = "1"
         log = (tmp / "daemon.log").open("ab")
         self._proc = subprocess.Popen(
             [str(DAEMON)], env=env, stdout=log, stderr=subprocess.STDOUT
@@ -395,7 +399,7 @@ class KafkaBackend:
         self.addr = addr
         self.stream = stream
         self.batch = batch
-        self.acks = 1 if durability == "relaxed" else "all"
+        self.acks = 1 if durability in ("relaxed", "unsafe") else "all"
         self.durability = durability
 
     def start(self) -> None:
@@ -882,11 +886,14 @@ def main() -> int:
     parser.add_argument("--batch", type=int, default=100)
     parser.add_argument(
         "--durability",
-        choices=["relaxed", "full"],
+        choices=["relaxed", "full", "unsafe"],
         default="relaxed",
         help=(
-            "nonodb insert durability / Kafka producer acks. Redis needs the "
-            "matching server config (appendonly yes + appendfsync always for full)."
+            "nonodb insert durability / Kafka producer acks. `relaxed` still "
+            "fsyncs data pages (LMDB NO_META_SYNC), so it measures close to "
+            "`full`; `unsafe` opens LMDB NO_SYNC and is the only mode that "
+            "skips the sync. Redis needs the matching server config "
+            "(appendonly yes + appendfsync always for full)."
         ),
     )
     parser.add_argument("--json-out", default=None)
