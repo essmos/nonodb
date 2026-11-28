@@ -171,4 +171,22 @@ fn insert_many_order_duplicate_atomicity_and_bson_ids_match_standard() {
     assert_eq!(err_s.to_string(), err_c.to_string());
     assert!(sc.find_by_key("fresh").unwrap().is_none());
     assert!(cc.find_by_key("fresh").unwrap().is_none());
+
+    let duplicate_in_batch = vec![
+        json!({"_id": "twice", "n": 1}),
+        json!({"_id": "twice", "n": 2}),
+    ];
+    let mut sw = ss.write_txn().unwrap();
+    let err_s = sc
+        .insert_many_txn(&mut sw, &duplicate_in_batch)
+        .unwrap_err();
+    drop(sw);
+    let mut cw = cs.write_txn().unwrap();
+    let err_c = cc
+        .insert_many_txn(&mut cw, &duplicate_in_batch)
+        .unwrap_err();
+    drop(cw);
+    assert_eq!(err_s.to_string(), err_c.to_string());
+    assert!(sc.find_by_key("twice").unwrap().is_none());
+    assert!(cc.find_by_key("twice").unwrap().is_none());
 }
