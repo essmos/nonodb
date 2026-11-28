@@ -73,4 +73,32 @@ if [[ "$BEFORE" != "$AFTER" ]]; then
   echo "old daemon modified data.mdb" >&2
   exit 1
 fi
+
+mkdir -p "$TMP/backup" "$TMP/restored"
+"$CLI" backup "$TMP/data" "$TMP/backup" >/dev/null
+"$CLI" restore "$TMP/backup" "$TMP/restored" --force --verify >/dev/null
+RESTORED="$TMP/restored/default/data.mdb"
+[[ -f "$RESTORED" ]] || { echo "missing restored data file" >&2; exit 1; }
+RESTORED_BEFORE=$(sha256sum "$RESTORED" | awk '{print $1}')
+set +e
+NONODB_DATA="$TMP/restored" NONODB_SOCK="$TMP/run/old-restored.sock" RUST_LOG=warn \
+  timeout 15 "$OLD" >"$TMP/old-restored.log" 2>&1
+RESTORED_STATUS=$?
+set -e
+if [[ $RESTORED_STATUS -eq 0 ]]; then
+  echo "old daemon unexpectedly opened a restored columnar backup" >&2
+  cat "$TMP/old-restored.log" >&2
+  exit 1
+fi
+if ! grep -q 'unknown collection profile.*columnar' "$TMP/old-restored.log"; then
+  echo "old daemon rejected the restored backup without the profile error" >&2
+  cat "$TMP/old-restored.log" >&2
+  exit 1
+fi
+RESTORED_AFTER=$(sha256sum "$RESTORED" | awk '{print $1}')
+if [[ "$RESTORED_BEFORE" != "$RESTORED_AFTER" ]]; then
+  echo "old daemon modified a restored columnar backup" >&2
+  exit 1
+fi
 echo "old binary rejection: ok"
+echo "old binary cross-version backup rejection: ok"

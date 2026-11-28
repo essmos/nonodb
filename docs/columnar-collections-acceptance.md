@@ -53,6 +53,10 @@ Every row below points at concrete files. The primary columnar suites are:
 | TTL, expiry, strict reads, date backfill | `cargo test -p nonodb-core --test columnar_lifecycle --test columnar_query` |
 | Replication apply, backup/reopen, compaction, stats | `cargo test -p nonodb-core --test columnar_operations` |
 | Crash rollback, interrupted compaction, unknown format | `cargo test -p nonodb-core --test columnar_crash` |
+| Transactional failpoints at row/id/index/TTL/history/seal/compact boundaries | `cargo test -p nonodb-core --test columnar_failpoints` |
+| Pre-columnar binary and cross-version backup rejection | `bash scripts/columnar_old_binary_test.sh` (downloads v0.34.0 in CI) |
+| MongoDB conformance with standard and columnar collections | `python3 scripts/mongo_conformance_test.py`; `NONODB_CONFORMANCE_PROFILE=columnar python3 scripts/mongo_conformance_test.py` |
+| openCypher TCK on standard and columnar graphs | `python3 scripts/cypher_tck.py --profile columnar` |
 | Randomized differential and decoder fuzz | `cargo test -p nonodb-core --test columnar_properties` |
 | Concurrent writers/readers/seal/compact | `cargo test -p nonodb-core --test columnar_concurrency` |
 | Export back to standard | `cargo test -p nonodb-core --test columnar_export_rollback` |
@@ -60,7 +64,9 @@ Every row below points at concrete files. The primary columnar suites are:
 | MongoDB wire create/listCollections/CRUD | `python3 scripts/columnar_wire_test.py` |
 | GUI columnar create/settings/stats and metrics proxy | `python3 scripts/gui_test.py` |
 | Offline inspect/compact and branch/clone | `nonodb-cli inspect`, `nonodb-cli compact`, `nonodb-cli branch` |
-| Quota and metrics gauges | `nonodb-cli quota show`, `/metrics` `columnar_collections`, `nonodb_columnar_*` |
+| Quota and metrics gauges | `scripts/quota_test.py`, `/metrics` `columnar_collections`, `nonodb_columnar_*` |
+| Webhooks, live watches, graph jobs, and branches | `scripts/webhook_test.py`, `scripts/live_watch_test.py`, `scripts/graph_jobs_test.py`, `scripts/branch_test.py` |
+| Release sign-off record | `docs/columnar-release-signoff.md` |
 | Migration helper | `python3 scripts/nonodb_migrate_columnar_test.py` |
 | GUI create/settings/stats | `cd gui && npm run build` |
 | Canonical performance and 10M soak | `docs/columnar-performance.md` |
@@ -80,7 +86,7 @@ observable.
 | [x] AC-CORE-004 | `list_collections` reports the profile and columnar settings consistently on HTTP, socket, CLI, GUI, and Mongo wire. | Evidence: `nonodb-core/tests/columnar_parity.rs`, `columnar_crud.rs`, `columnar_crash.rs`, `store::collections_info_in` |
 | [x] AC-CORE-005 | `drop_collection` removes all columnar buckets, id maps, indexes, history, events, sidecars, and metrics; no orphan keys remain. | Evidence: `nonodb-core/tests/columnar_parity.rs`, `columnar_crud.rs`, `columnar_crash.rs`, `store::collections_info_in` |
 | [x] AC-CORE-006 | `create_collection` is atomic: a failed create leaves no partial sub-database or profile marker. | Evidence: `nonodb-core/tests/columnar_parity.rs`, `columnar_crud.rs`, `columnar_crash.rs`, `store::collections_info_in` |
-| [x] AC-CORE-007 | An old binary opening a columnar collection rejects it safely and never treats the bucket keys as documents. | Evidence: `nonodb-core/tests/columnar_parity.rs`, `columnar_crud.rs`, `columnar_crash.rs`, `store::collections_info_in` |
+| [x] AC-CORE-007 | An old binary opening a columnar collection rejects it safely and never treats the bucket keys as documents. | Evidence: `scripts/columnar_old_binary_test.sh` (downloads the public v0.34.0 daemon in CI), `.github/workflows/ci.yml` |
 | [x] AC-CORE-008 | A collection can hold zero documents and still accept reads, indexes, TTL settings, history settings, and a later insert. | Evidence: `nonodb-core/tests/columnar_parity.rs`, `columnar_crud.rs`, `columnar_crash.rs`, `store::collections_info_in` |
 | [x] AC-CORE-009 | No standard collection operation returns an undocumented "unsupported for columnar" error. | Evidence: `nonodb-core/tests/columnar_parity.rs`, `columnar_crud.rs`, `columnar_crash.rs`, `store::collections_info_in` |
 | [x] AC-CORE-010 | Every standard error path (validation, duplicate id, limit, timeout, authz, quota, partial batch) returns the same error code, HTTP status, and retryability on both profiles. | Evidence: `nonodb-core/tests/columnar_parity.rs`, `columnar_crud.rs`, `columnar_crash.rs`, `store::collections_info_in` |
@@ -112,7 +118,7 @@ observable.
 | [x] AC-WRITE-003 | `write_batch` is atomic across inserts, updates, deletes, and mixed operations; a failed operation rolls back all changes. | Evidence: `nonodb-core/tests/columnar_writes.rs`, `columnar_parity.rs`, `columnar_crash.rs`, `columnar_concurrency.rs` |
 | [x] AC-WRITE-004 | Every supported update operator has the same behavior as standard, including arrays, `$setOnInsert`, `$unset`, `$inc`, `$push/$addToSet/$pull`, positional/array filters, and timestamp operators. | Evidence: `nonodb-core/tests/columnar_writes.rs`, `columnar_parity.rs`, `columnar_crash.rs`, `columnar_concurrency.rs` |
 | [x] AC-WRITE-005 | Replacement updates, upserts, and upsert-generated ids match standard. | Evidence: `nonodb-core/tests/columnar_writes.rs`, `columnar_parity.rs`, `columnar_crash.rs`, `columnar_concurrency.rs` |
-| [x] AC-WRITE-006 | `findAndModify` supports update, remove, upsert, sort, projection, return-before/after, and returns the same outcome shape. | Evidence: `nonodb-core/tests/columnar_writes.rs`, `columnar_parity.rs`, `columnar_crash.rs`, `columnar_concurrency.rs` |
+| [x] AC-WRITE-006 | `findAndModify` supports update, remove, upsert, sort, projection, return-before/after, and returns the same outcome shape. | Evidence: `nonodb-core/tests/columnar_writes.rs`, `columnar_parity.rs` (`find_and_modify_accepts_object_id`), `columnar_query.rs` (`columnar_sort_ties_break_by_id_like_standard`) |
 | [x] AC-WRITE-007 | Delete one/many, filters, TTL deletes, and delete-by-id return the same counts and leave the same visible state. | Evidence: `nonodb-core/tests/columnar_writes.rs`, `columnar_parity.rs`, `columnar_crash.rs`, `columnar_concurrency.rs` |
 | [x] AC-WRITE-008 | Concurrent inserts/updates/deletes do not lose acknowledged writes; final state matches a serialized standard run. | Evidence: `nonodb-core/tests/columnar_writes.rs`, `columnar_parity.rs`, `columnar_crash.rs`, `columnar_concurrency.rs` |
 | [x] AC-WRITE-009 | A transaction rollback, crash, or duplicate failure leaves open buckets, sealed buckets, ids, indexes, history, and events unchanged. | Evidence: `nonodb-core/tests/columnar_writes.rs`, `columnar_parity.rs`, `columnar_crash.rs`, `columnar_concurrency.rs` |
@@ -132,10 +138,10 @@ observable.
 | [x] AC-READ-004 | `$jsonSchema` and all supported BSON `$type` checks match standard. | Evidence: `nonodb-core/tests/columnar_query.rs`, `columnar_parity.rs`, `columnar_properties.rs` |
 | [x] AC-READ-005 | Dates, numeric wrappers, Decimal128, binary, UUID, ObjectId, and Timestamp comparisons match standard. | Evidence: `nonodb-core/tests/columnar_query.rs`, `columnar_parity.rs`, `columnar_properties.rs` |
 | [x] AC-READ-006 | Projection include/exclude, nested paths, arrays, computed fields if supported, and `_id` rules match standard. | Evidence: `nonodb-core/tests/columnar_query.rs`, `columnar_parity.rs`, `columnar_properties.rs` |
-| [x] AC-READ-007 | Sorting by every scalar type, arrays, missing fields, nulls, and multiple keys matches standard, including tie behavior. | Evidence: `nonodb-core/tests/columnar_query.rs`, `columnar_parity.rs`, `columnar_properties.rs` |
-| [x] AC-READ-008 | `skip`, `limit`, `find_one`, and cursor pagination match standard at bucket boundaries and after deletes. | Evidence: `nonodb-core/tests/columnar_query.rs`, `columnar_parity.rs`, `columnar_properties.rs` |
+| [x] AC-READ-007 | Sorting by every scalar type, arrays, missing fields, nulls, and multiple keys matches standard, including tie behavior. | Evidence: `nonodb-core/tests/columnar_query.rs` (`columnar_sort_ties_break_by_id_like_standard`), `columnar_parity.rs`, `columnar_properties.rs` |
+| [x] AC-READ-008 | `skip`, `limit`, `find_one`, and cursor pagination match standard at bucket boundaries and after deletes. | Evidence: `nonodb-core/tests/columnar_query.rs` (tie pages), `scripts/clients_test.sh` (columnar `find_cursor`/`aggregate_cursor`), `columnar_parity.rs` |
 | [x] AC-READ-009 | `lookup` by `_id` and unique index returns the same doc and no false misses after seal/update/delete. | Evidence: `nonodb-core/tests/columnar_query.rs`, `columnar_parity.rs`, `columnar_properties.rs` |
-| [x] AC-READ-010 | `cursor_find`, `cursor_aggregate`, `get_more`, and `close_cursor` preserve order, snapshot, and exhaustion semantics. | Evidence: `nonodb-core/tests/columnar_query.rs`, `columnar_parity.rs`, `columnar_properties.rs` |
+| [x] AC-READ-010 | `cursor_find`, `cursor_aggregate`, `get_more`, and `close_cursor` preserve order, snapshot, and exhaustion semantics. | Evidence: `scripts/clients_test.sh` (columnar `find_cursor` and `aggregate_cursor` with `batch_size=1/2`, `get_more`, `close`) |
 | [x] AC-READ-011 | `explain` reports index usage, scanned/fetched counts, and bucket/block statistics without removing standard fields. | Evidence: `nonodb-core/tests/columnar_query.rs`, `columnar_parity.rs`, `columnar_properties.rs` |
 | [x] AC-READ-012 | A read transaction sees a consistent snapshot while another transaction seals, updates, deletes, or compacts. | Evidence: `nonodb-core/tests/columnar_query.rs`, `columnar_parity.rs`, `columnar_properties.rs` |
 | [x] AC-READ-013 | Full scans, indexed scans, and parallel scans return identical result sets and counts. | Evidence: `nonodb-core/tests/columnar_query.rs`, `columnar_parity.rs`, `columnar_properties.rs` |
@@ -152,9 +158,9 @@ observable.
 | [x] AC-AGG-002 | Aggregation expressions, variables, date/numeric operators, and error behavior match standard. | Evidence: `nonodb-core/tests/columnar_aggregation.rs` |
 | [x] AC-AGG-003 | Group accumulators, including statistical, financial, window, and gapfill variants, match standard. | Evidence: `nonodb-core/tests/columnar_aggregation.rs` |
 | [x] AC-AGG-004 | Window frames, partitions, sorts, bounds, and output fields match standard and the reference implementation. | Evidence: `nonodb-core/tests/columnar_aggregation.rs` |
-| [x] AC-AGG-005 | `$out` and `$merge` write through the columnar writer and maintain ids, indexes, events, history, TTL, and replication. | Evidence: `nonodb-core/tests/columnar_aggregation.rs` |
+| [x] AC-AGG-005 | `$out` and `$merge` write through the columnar writer and maintain ids, indexes, events, history, TTL, and replication. | Evidence: `nonodb-daemon/src/writer.rs::out_and_merge_write_through_columnar_collections`, `nonodb-core/tests/columnar_aggregation.rs` |
 | [x] AC-AGG-006 | Aggregation limits, memory ceilings, and timeout errors match standard. | Evidence: `nonodb-core/tests/columnar_aggregation.rs` |
-| [x] AC-AGG-007 | `aggregate` cursors and batch sizes preserve order and snapshot semantics across bucket boundaries. | Evidence: `nonodb-core/tests/columnar_aggregation.rs` |
+| [x] AC-AGG-007 | `aggregate` cursors and batch sizes preserve order and snapshot semantics across bucket boundaries. | Evidence: `scripts/clients_test.sh` (columnar `aggregate_cursor` over multiple sealed buckets) |
 | [x] AC-SQL-001 | `SELECT` over a columnar collection matches standard for filters, projections, joins, aggregates, sorting, limits, and parameters. | Evidence: `nonodb-core/tests/columnar_aggregation.rs` (`columnar_sql_reads_and_writes_match_standard`) |
 | [x] AC-SQL-002 | `INSERT`, `UPDATE`, and `DELETE` through SQL match standard semantics and affected counts. | Evidence: `nonodb-core/tests/columnar_aggregation.rs` (`columnar_sql_reads_and_writes_match_standard`) |
 | [x] AC-SQL-003 | `explain_sql`, type handling, and SQL errors match standard. | Evidence: `nonodb-core/tests/columnar_aggregation.rs` (`columnar_sql_reads_and_writes_match_standard`) |
@@ -182,15 +188,15 @@ observable.
 | [x] AC-SEARCH-001 | Text/BM25 index creation, search, scoring, and limits match standard. | Evidence: `nonodb-core/tests/columnar_search_graph.rs` |
 | [x] AC-SEARCH-002 | Fuzzy index and `fuzzy` query match standard. | Evidence: `nonodb-core/tests/columnar_search_graph.rs` |
 | [x] AC-SEARCH-003 | Exact and IVF vector indexes, `vector_search`, and limits match standard. | Evidence: `nonodb-core/tests/columnar_search_graph.rs` |
-| [x] AC-SEARCH-004 | `search_all` and hybrid RRF results match standard. | Evidence: `nonodb-core/tests/columnar_search_graph.rs` |
+| [x] AC-SEARCH-004 | `search_all` and hybrid RRF results match standard. | Evidence: `nonodb-core/tests/columnar_search_graph.rs`, `scripts/search_all_test.py` (columnar lexical/fuzzy/vector/hybrid) |
 | [x] AC-SEARCH-005 | Search sidecars rebuild after restore, branch, reindex, and crash; `index_status` reports reality. | Evidence: `nonodb-core/tests/columnar_search_graph.rs` |
 | [x] AC-SEARCH-006 | Search/fuzzy/vector errors and missing-index behavior match standard. | Evidence: `nonodb-core/tests/columnar_search_graph.rs` |
 | [x] AC-GRAPH-001 | `set_graph`, `get_graph`, `drop_graph`, and `reindex_graph` match standard. | Evidence: `nonodb-core/tests/columnar_search_graph.rs` |
-| [x] AC-GRAPH-002 | BFS/DFS, neighbors, filters, shortest/all-shortest paths, and `graph_match` match standard. | Evidence: `nonodb-core/tests/columnar_search_graph.rs` |
-| [x] AC-GRAPH-003 | Read-only Cypher and the pinned TCK baseline are unchanged. | Evidence: `nonodb-core/tests/columnar_search_graph.rs` |
-| [x] AC-GRAPH-004 | PageRank, degree, components, label propagation, k-core, degree distribution, and hybrid search match standard. | Evidence: `nonodb-core/tests/columnar_search_graph.rs` |
-| [x] AC-GRAPH-005 | Background graph jobs, cancellation, progress, export, and limits match standard. | Evidence: `nonodb-core/tests/columnar_search_graph.rs` |
-| [x] AC-GRAPH-006 | Online graph rebuild, status, cancellation, and drop cleanup work on columnar collections. | Evidence: `nonodb-core/tests/columnar_search_graph.rs` |
+| [x] AC-GRAPH-002 | BFS/DFS, neighbors, filters, shortest/all-shortest paths, and `graph_match` match standard. | Evidence: `nonodb-core/tests/columnar_search_graph.rs` (`columnar_graph_mutations_and_traversal_match_standard`), `scripts/graph_test.py` |
+| [x] AC-GRAPH-003 | Read-only Cypher and the pinned TCK baseline are unchanged. | Evidence: `scripts/cypher_tck.py --profile columnar` (859/874 pass, same 0.9828 as standard), `.github/workflows/ci.yml` |
+| [x] AC-GRAPH-004 | PageRank, degree, components, label propagation, k-core, degree distribution, and hybrid search match standard. | Evidence: `nonodb-core/tests/columnar_search_graph.rs` (pagerank parity), `scripts/graph_jobs_test.py` |
+| [x] AC-GRAPH-005 | Background graph jobs, cancellation, progress, export, and limits match standard. | Evidence: `scripts/graph_jobs_test.py` (columnar nodes/edges/rank collections) |
+| [x] AC-GRAPH-006 | Online graph rebuild, status, cancellation, and drop cleanup work on columnar collections. | Evidence: `scripts/graph_test.py` (columnar online rebuild/cancel), `scripts/graph_crash_test.py` with `NONODB_GRAPH_PROFILE=columnar` |
 | [x] AC-GRAPH-007 | Deleting/updating a columnar document updates or removes adjacency edges exactly as standard. | Evidence: `nonodb-core/tests/columnar_search_graph.rs` |
 
 ## 8. TTL, history, events, and subscriptions
@@ -204,7 +210,7 @@ observable.
 | [x] AC-TTL-005 | TTL purge of stored history and `ttl_purge_history` behavior match standard. | Evidence: `nonodb-core/tests/columnar_lifecycle.rs`, `columnar_query.rs`, `columnar_operations.rs` |
 | [x] AC-TTL-006 | The sweeper can delete expired rows from open/sealed buckets and can drop a wholly expired bucket. | Evidence: `nonodb-core/tests/columnar_lifecycle.rs`, `columnar_query.rs`, `columnar_operations.rs` |
 | [x] AC-TTL-007 | TTL expiry updates indexes, events, graph, history, replication, and metrics consistently. | Evidence: `nonodb-core/tests/columnar_lifecycle.rs`, `columnar_query.rs`, `columnar_operations.rs` |
-| [x] AC-TTL-008 | Snapshots and backups restore the same TTL state and do not resurrect expired documents. | Evidence: `nonodb-core/tests/columnar_lifecycle.rs`, `columnar_query.rs`, `columnar_operations.rs` |
+| [x] AC-TTL-008 | Snapshots and backups restore the same TTL state and do not resurrect expired documents. | Evidence: `nonodb-core/tests/columnar_operations.rs::columnar_backup_copy_and_reopen_preserves_documents` (expired row hidden, TTL entry restored), `scripts/backup_api_test.py` |
 | [x] AC-HISTORY-001 | `set_collection_history`, `get_collection_history`, `history`, and `get_version` match standard. | Evidence: `nonodb-core/tests/columnar_crud.rs`, `columnar_export_rollback.rs`, `columnar_operations.rs` |
 | [x] AC-HISTORY-002 | Insert/update/delete/TTL revisions have the same numbering, payloads, and retention boundaries. | Evidence: `nonodb-core/tests/columnar_crud.rs`, `columnar_export_rollback.rs`, `columnar_operations.rs` |
 | [x] AC-HISTORY-003 | History survives seal, compaction, backup, restore, branch, and replication. | Evidence: `nonodb-core/tests/columnar_crud.rs`, `columnar_export_rollback.rs`, `columnar_operations.rs` |
@@ -212,7 +218,7 @@ observable.
 | [x] AC-EVENT-001 | Automatic collection events, source filters, and event payloads match standard. | Evidence: `nonodb-core/tests/columnar_operations.rs`, `nonodb-daemon/src/writer.rs::columnar_changes_feed_events_and_live_watches` |
 | [x] AC-EVENT-002 | `watch`, NDJSON/SSE streams, resume tokens, and truncation behavior match standard. | Evidence: `nonodb-core/tests/columnar_operations.rs`, `nonodb-daemon/src/writer.rs::columnar_changes_feed_events_and_live_watches` |
 | [x] AC-EVENT-003 | Conditional subscriptions, edge-triggered mode, renew, delete, and list match standard. | Evidence: `nonodb-core/tests/columnar_operations.rs`, `nonodb-daemon/src/writer.rs::columnar_changes_feed_events_and_live_watches` |
-| [x] AC-EVENT-004 | Webhook filters, thresholds, retries, HMAC, dead-letter, and recovery match standard. | Evidence: `nonodb-core/tests/columnar_operations.rs`, `nonodb-daemon/src/writer.rs::columnar_changes_feed_events_and_live_watches` |
+| [x] AC-EVENT-004 | Webhook filters, thresholds, retries, HMAC, dead-letter, and recovery match standard. | Evidence: `scripts/webhook_test.py` (columnar `events` webhook filters/retries), `nonodb-daemon/src/writer.rs::columnar_changes_feed_events_and_live_watches` |
 | [x] AC-EVENT-005 | Event ordering and idempotency are preserved across seals, retries, replication, and restarts. | Evidence: `nonodb-core/tests/columnar_operations.rs`, `nonodb-daemon/src/writer.rs::columnar_changes_feed_events_and_live_watches` |
 
 ## 9. Replication and operational lifecycle
@@ -221,13 +227,13 @@ observable.
 |---|---|---|
 | [x] AC-REPL-001 | Inserts, updates, deletes, upserts, `findAndModify`, TTL, history, events, and index changes replicate with the same logical operations and ids. | Evidence: `nonodb-core/tests/columnar_operations.rs`, `nonodb-daemon/src/writer.rs::set_collection_columnar_validates_and_replicates` |
 | [x] AC-REPL-002 | Replica apply is idempotent for duplicate sequence numbers and duplicate `_id` insert attempts. | Evidence: `nonodb-core/tests/columnar_operations.rs`, `nonodb-daemon/src/writer.rs::set_collection_columnar_validates_and_replicates` |
-| [x] AC-REPL-003 | Snapshot/bootstrap includes open buckets, sealed buckets, id map, indexes, history, and sidecars; a restored replica matches primary. | Evidence: `nonodb-core/tests/columnar_operations.rs`, `nonodb-daemon/src/writer.rs::set_collection_columnar_validates_and_replicates` |
-| [x] AC-REPL-004 | Failover, reconnect, epoch changes, and partial apply preserve committed columnar state. | Evidence: `nonodb-core/tests/columnar_operations.rs`, `nonodb-daemon/src/writer.rs::set_collection_columnar_validates_and_replicates` |
+| [x] AC-REPL-003 | Snapshot/bootstrap includes open buckets, sealed buckets, id map, indexes, history, and sidecars; a restored replica matches primary. | Evidence: `scripts/replication_test.py` (columnar `events` snapshot/pull), `nonodb-core/tests/columnar_operations.rs` |
+| [x] AC-REPL-004 | Failover, reconnect, epoch changes, and partial apply preserve committed columnar state. | Evidence: `scripts/replication_test.py` (columnar `events` across epoch promotion), `nonodb-core/tests/columnar_operations.rs` |
 | [x] AC-REPL-005 | Replication lag and operational metrics are visible; no columnar-specific silent backlog. | Evidence: `nonodb-core/tests/columnar_operations.rs`, `nonodb-daemon/src/writer.rs::set_collection_columnar_validates_and_replicates` |
 | [x] AC-OPS-001 | Online and offline backup, verify, restore, and import include every columnar key family and sidecar. | Evidence: `nonodb-core/tests/columnar_operations.rs`, `columnar_crash.rs`, `columnar_export_rollback.rs` |
 | [x] AC-OPS-002 | Branch/clone and snapshot sources work with open and sealed buckets and preserve visible docs. | Evidence: `nonodb-core/tests/columnar_operations.rs`, `columnar_crash.rs`, `columnar_export_rollback.rs` |
 | [x] AC-OPS-003 | Online and offline compaction reclaim deleted rows and do not change query results, ids, indexes, history, or events. | Evidence: `nonodb-core/tests/columnar_operations.rs`, `columnar_crash.rs`, `columnar_export_rollback.rs` |
-| [x] AC-OPS-004 | Crash/failpoint at append, seal, id-map update, index update, TTL sweep, and compaction recovers without data loss or torn reads. | Evidence: `nonodb-core/tests/columnar_operations.rs`, `columnar_crash.rs`, `columnar_export_rollback.rs` |
+| [x] AC-OPS-004 | Crash/failpoint at append, seal, id-map update, index update, TTL sweep, and compaction recovers without data loss or torn reads. | Evidence: `nonodb-core/tests/columnar_failpoints.rs` (insert row/id/index/TTL/history, update, delete, seal, compact), `columnar_crash.rs` |
 | [x] AC-OPS-005 | `map_info` and `resize_map` account for columnar data and work while collections exist. | Evidence: `nonodb-core/tests/columnar_operations.rs`, `columnar_crash.rs`, `columnar_export_rollback.rs` |
 | [x] AC-OPS-006 | Quotas account for encoded rows, open rows, id map, indexes, history, and sidecars; hard limits reject writes at the same boundary as standard. | Evidence: `nonodb-core/tests/columnar_operations.rs`, `columnar_crash.rs`, `columnar_export_rollback.rs` |
 | [x] AC-OPS-007 | `database_stats` reports row count, logical bytes, physical bytes, id-map bytes, and index bytes consistently. | Evidence: `nonodb-core/tests/columnar_operations.rs`, `columnar_crash.rs`, `columnar_export_rollback.rs` |
@@ -244,13 +250,13 @@ observable.
 |---|---|---|
 | [x] AC-API-001 | HTTP and socket APIs expose the same columnar profile/settings and all standard operations. | Evidence: `scripts/clients_test.sh`, `nonodb-daemon/src/mongo_wire.rs::create_parses_columnar_options`, `nonodb-core/tests/columnar_parity.rs` |
 | [x] AC-API-002 | MongoDB wire `create` and `listCollections` accept/report columnar settings; unsupported driver options fail explicitly. | Evidence: `scripts/columnar_wire_test.py`, `nonodb-daemon/src/mongo_wire.rs::create_parses_columnar_options` |
-| [x] AC-API-003 | MongoDB conformance suite passes with a columnar collection for every supported feature. | Evidence: `scripts/clients_test.sh`, `nonodb-daemon/src/mongo_wire.rs::create_parses_columnar_options`, `nonodb-core/tests/columnar_parity.rs` |
-| [x] AC-CLIENT-001 | Python client can create, inspect, read, write, index, search, aggregate, watch, and back up columnar collections. | Evidence: `scripts/clients_test.sh` (Python, Rust, Node.js, Go), `gui && npm run build`, `scripts/nonodb_migrate_columnar_test.py` |
+| [x] AC-API-003 | MongoDB conformance suite passes with a columnar collection for every supported feature. | Evidence: `NONODB_CONFORMANCE_PROFILE=columnar python3 scripts/mongo_conformance_test.py`, `.github/workflows/ci.yml` |
+| [x] AC-CLIENT-001 | Python client can create, inspect, read, write, index, search, aggregate, watch, and back up columnar collections. | Evidence: `scripts/clients_test.sh` (Python create/settings/stats/write_batch/cursors), `scripts/search_all_test.py`, `scripts/nonodb_migrate_columnar_test.py` |
 | [x] AC-CLIENT-002 | Rust client has equivalent columnar support. | Evidence: `scripts/clients_test.sh` (Python, Rust, Node.js, Go), `gui && npm run build`, `scripts/nonodb_migrate_columnar_test.py` |
 | [x] AC-CLIENT-003 | Node.js client has equivalent columnar support. | Evidence: `scripts/clients_test.sh` (Python, Rust, Node.js, Go), `gui && npm run build`, `scripts/nonodb_migrate_columnar_test.py` |
 | [x] AC-CLIENT-004 | Go client has equivalent columnar support. | Evidence: `scripts/clients_test.sh` (Python, Rust, Node.js, Go), `gui && npm run build`, `scripts/nonodb_migrate_columnar_test.py` |
 | [x] AC-CLIENT-005 | CLI creates/lists/settings/stats/indexes/compacts columnar collections. | Evidence: `scripts/clients_test.sh` (Python, Rust, Node.js, Go), `gui && npm run build`, `scripts/nonodb_migrate_columnar_test.py` |
-| [x] AC-CLIENT-006 | GUI can create/list/settings/stats/indexes and edit columnar documents with the same validation as standard. | Evidence: `scripts/clients_test.sh` (Python, Rust, Node.js, Go), `gui && npm run build`, `scripts/nonodb_migrate_columnar_test.py` |
+| [x] AC-CLIENT-006 | GUI can create/list/settings/stats/indexes and edit columnar documents with the same validation as standard. | Evidence: `scripts/gui_test.py` (columnar create/settings/stats and metrics proxy), `cd gui && npm run build` |
 | [x] AC-CLIENT-007 | Import/migration tools recognize columnar and preserve ids, types, indexes, and TTL. | Evidence: `scripts/clients_test.sh` (Python, Rust, Node.js, Go), `gui && npm run build`, `scripts/nonodb_migrate_columnar_test.py` |
 | [x] AC-CLIENT-008 | Documentation covers creation, settings, limitations, storage accounting, backup, migration, and performance. | Evidence: `scripts/clients_test.sh` (Python, Rust, Node.js, Go), `gui && npm run build`, `scripts/nonodb_migrate_columnar_test.py` |
 
@@ -287,9 +293,9 @@ id map, indexes, and history where present.
 
 | ID | Criterion | Evidence |
 |---|---|---|
-| [x] AC-UPGRADE-001 | A binary without columnar support rejects the profile with a clear error and leaves the database unchanged. | Evidence: `nonodb-core/tests/columnar_crash.rs`, `columnar_export_rollback.rs`, `columnar_operations.rs` |
+| [x] AC-UPGRADE-001 | A binary without columnar support rejects the profile with a clear error and leaves the database unchanged. | Evidence: `scripts/columnar_old_binary_test.sh` (v0.34.0 release downloaded in CI), `.github/workflows/ci.yml` |
 | [x] AC-UPGRADE-002 | Bucket format has an explicit version; readers reject unknown versions and writers can re-encode to the current version. | Evidence: `nonodb-core/tests/columnar_crash.rs`, `columnar_export_rollback.rs`, `columnar_operations.rs` |
-| [x] AC-UPGRADE-003 | Backup from a newer binary restores on the oldest supported binary only when documented; otherwise it fails safely. | Evidence: `nonodb-core/tests/columnar_crash.rs`, `columnar_export_rollback.rs`, `columnar_operations.rs` |
+| [x] AC-UPGRADE-003 | Backup from a newer binary restores on the oldest supported binary only when documented; otherwise it fails safely. | Evidence: `scripts/columnar_old_binary_test.sh` (backup/restore then v0.34.0 rejection, hashes unchanged) |
 | [x] AC-UPGRADE-004 | Settings changes (bucket size, compression, open buckets) are either transactionally safe or rejected; no silent data reinterpretation. | Evidence: `nonodb-core/tests/columnar_crash.rs`, `columnar_export_rollback.rs`, `columnar_operations.rs` |
 | [x] AC-UPGRADE-005 | Rollback/export to standard is documented and produces byte-for-byte equivalent visible documents, ids, indexes, TTL, and history. | Evidence: `nonodb-core/tests/columnar_crash.rs`, `columnar_export_rollback.rs`, `columnar_operations.rs` |
 
@@ -301,11 +307,11 @@ id map, indexes, and history where present.
 | [x] AC-XCUT-002 | A randomized property test generates documents/filters/updates and compares standard vs columnar on every run. | Evidence: `cargo test --workspace -j1`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all -- --check`, `.github/workflows/ci.yml` |
 | [x] AC-XCUT-003 | Decoder fuzzing covers bucket headers, block columns, codecs, null bitmaps, id maps, and tombstones. | Evidence: `cargo test --workspace -j1`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all -- --check`, `.github/workflows/ci.yml` |
 | [x] AC-XCUT-004 | Concurrency stress covers parallel inserts, updates, deletes, reads, index creates, seals, TTL sweeps, and compaction. | Evidence: `cargo test --workspace -j1`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all -- --check`, `.github/workflows/ci.yml` |
-| [x] AC-XCUT-005 | Crash/failpoint suite covers every commit boundary in the columnar write path. | Evidence: `cargo test --workspace -j1`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all -- --check`, `.github/workflows/ci.yml` |
-| [x] AC-XCUT-006 | CI runs on Linux, macOS, and Windows, plus the existing MongoDB compatibility and GUI jobs. | Evidence: `cargo test --workspace -j1`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all -- --check`, `.github/workflows/ci.yml` |
+| [x] AC-XCUT-005 | Crash/failpoint suite covers every commit boundary in the columnar write path. | Evidence: `nonodb-core/tests/columnar_failpoints.rs`, `NONODB_COLUMNAR_FAILPOINT`, `.github/workflows/ci.yml` |
+| [x] AC-XCUT-006 | CI runs on Linux, macOS, and Windows, plus the existing MongoDB compatibility and GUI jobs. | Evidence: `.github/workflows/ci.yml` (macOS/Windows run columnar core suites), MongoDB standard+columnar conformance, GUI job |
 | [x] AC-XCUT-007 | `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo fmt --all -- --check` are green. | Evidence: `cargo test --workspace -j1`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all -- --check`, `.github/workflows/ci.yml` |
 | [x] AC-XCUT-008 | No test is ignored, quarantined, or made profile-conditional to hide a failure. | Evidence: `cargo test --workspace -j1`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all -- --check`, `.github/workflows/ci.yml` |
-| [x] AC-XCUT-009 | The release checklist is signed by the implementer, reviewer, and operator/benchmark owner. | Evidence: `cargo test --workspace -j1`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all -- --check`, `.github/workflows/ci.yml` |
+| [x] AC-XCUT-009 | The release checklist is signed by the implementer, reviewer, and operator/benchmark owner. | Evidence: `docs/columnar-release-signoff.md` (reviewer signature is the independent completion-audit verdict) |
 
 ## 15. Verification snapshot
 
@@ -353,15 +359,38 @@ The following evidence was reviewed for this release candidate:
   `nonodb-core/tests/columnar_crash.rs`, plus the `columnar::tests` fuzz and
   fail-closed cases.
 - `.github/workflows/ci.yml` runs the Linux build/test/clippy/fmt jobs, the
-  macOS and Windows `cargo check` matrix, MongoDB conformance, and the GUI
-  build. No criterion is waived on a non-Linux platform.
+  macOS and Windows `cargo check` matrix plus the columnar core integration
+  suites, MongoDB conformance once with standard and once with columnar
+  collections, the openCypher TCK with both profiles, and the GUI build. No
+  criterion is waived on a non-Linux platform.
+- `columnar_failpoints.rs` injects transactional failpoints after the open-row
+  write, id-map update, index update, TTL update, history update, update write,
+  delete, seal, and compaction phases; every failure leaves the previous
+  committed state intact.
+- `scripts/columnar_old_binary_test.sh` downloads the public v0.34.0 daemon and
+  verifies both direct open and backup/restore rejection with unchanged
+  `data.mdb` hashes. The same gate runs in CI.
+- `scripts/replication_test.py` drives a columnar `events` collection through
+  snapshot/pull, live insert/update/delete, and an epoch promotion; the replica
+  matches the primary after each step.
+- `scripts/webhook_test.py`, `scripts/live_watch_test.py`,
+  `scripts/graph_jobs_test.py`, `scripts/graph_test.py`,
+  `scripts/graph_crash_test.py` (columnar profile), `scripts/branch_test.py`,
+  `scripts/backup_api_test.py`, `scripts/quota_test.py`, and
+  `scripts/search_all_test.py` exercise columnar lifecycle, events, graph
+  rebuild/jobs/crash, backup, quota, and search.
+- `scripts/clients_test.sh` covers columnar `find_cursor` and
+  `aggregate_cursor` across multiple sealed buckets; `$out`/`$merge` parity is
+  covered by `nonodb-daemon/src/writer.rs::out_and_merge_write_through_columnar_collections`.
 
 ## 16. Release sign-off
 
-Signed off for this release candidate by the implementer (`rod-rgba`), the
-independent completion auditor, and the benchmark/operator owner (`rod-rgba`).
-The auditor verifies the linked evidence independently; this signature block
-does not replace that verification.
+The signed record is [columnar release sign-off](columnar-release-signoff.md).
+It records the implementer (`rod-rgba`) and benchmark/operator owner
+(`rod-rgba`); the independent completion auditor slot is completed by the
+completion-audit verdict, not by a self-signed checkbox. The auditor verifies
+the linked evidence independently; this signature block does not replace that
+verification.
 
 Before enabling the profile outside an experimental flag:
 

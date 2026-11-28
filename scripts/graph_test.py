@@ -359,8 +359,16 @@ def main() -> int:
 
         # Online rebuild mirrors writes into the target generation and swaps
         # only after a complete scan; reads use the old generation meanwhile.
-        db.create_collection("onodes")
-        db.create_collection("oedges")
+        db.create_collection(
+            "onodes",
+            profile="columnar",
+            columnar={"bucket_max_docs": 4, "compression": "max"},
+        )
+        db.create_collection(
+            "oedges",
+            profile="columnar",
+            columnar={"bucket_max_docs": 4, "compression": "max"},
+        )
         onodes = db.collection("onodes")
         oedges = db.collection("oedges")
         for i in range(5):

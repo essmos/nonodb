@@ -101,6 +101,25 @@ try:
     cursor = collection.find_cursor({"kind": "cursor"}, batch_size=2)
     assert [doc["_id"] for doc in cursor] == [f"cursor-{index}" for index in range(5)]
     assert cursor.close() is False
+
+    db.create_collection(
+        "py_cursor_columnar",
+        profile="columnar",
+        columnar={"bucket_max_docs": 2, "compression": "max"},
+    )
+    cursor_column = db.collection("py_cursor_columnar")
+    cursor_column.insert_many(
+        [{"_id": f"c{index}", "n": index} for index in range(5)]
+    )
+    cursor = cursor_column.find_cursor({}, sort=[("_id", 1)], batch_size=2)
+    assert [doc["_id"] for doc in cursor] == [f"c{index}" for index in range(5)]
+    assert cursor.close() is False
+    aggregate_cursor = cursor_column.aggregate_cursor(
+        [{"$match": {"n": {"$gte": 2}}}, {"$project": {"_id": 1, "n": 1}}],
+        batch_size=1,
+    )
+    assert [doc["_id"] for doc in aggregate_cursor] == ["c2", "c3", "c4"]
+    assert aggregate_cursor.close() is False
 finally:
     db.close()
 PY

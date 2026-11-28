@@ -84,11 +84,29 @@ fn columnar_backup_copy_and_reopen_preserves_documents() {
     let source_dir = tempfile::tempdir().unwrap();
     let backup_dir = tempfile::tempdir().unwrap();
     let source = Store::open(source_dir.path()).unwrap();
-    let c = columnar(&source, "docs");
+    columnar(&source, "docs");
+    source
+        .set_collection_ttl_after("docs", "expireAt", 60, Some(false))
+        .unwrap();
+    let c = source.collection("docs").unwrap();
     for index in 0..20 {
         c.insert_one(json!({"_id": format!("d{index:02}"), "v": index}))
             .unwrap();
     }
+    let now = nonodb_core::ttl::now_ms();
+    let date = |ms: u64| json!({"$date": {"$numberLong": ms.to_string()}});
+    c.insert_one(json!({
+        "_id": "expired",
+        "expireAt": date(now.saturating_sub(120_000)),
+        "v": 99,
+    }))
+    .unwrap();
+    c.insert_one(json!({
+        "_id": "alive",
+        "expireAt": date(now + 120_000),
+        "v": 100,
+    }))
+    .unwrap();
     source.seal_columnar("docs").unwrap();
     let backup_path = backup_dir.path().join("data.mdb");
     source
@@ -98,11 +116,19 @@ fn columnar_backup_copy_and_reopen_preserves_documents() {
 
     let restored = Store::open(backup_dir.path()).unwrap();
     let r = restored.collection("docs").unwrap();
-    assert_eq!(r.count(&json!({})).unwrap(), 20);
+    assert_eq!(r.count(&json!({})).unwrap(), 21);
     assert_eq!(r.find_by_key("d07").unwrap().unwrap()["v"], 7);
+    assert!(r.find_by_key("expired").unwrap().is_some());
+    let due = restored.ttl_due(now, 100).unwrap();
+    assert!(due.iter().any(|entry| entry.id == "expired"), "{due:?}");
+    let visible = r.find(&FindQuery::default()).unwrap();
+    assert!(
+        visible.iter().all(|doc| doc["_id"] != "expired"),
+        "{visible:?}"
+    );
     assert_eq!(
         r.find(&FindQuery {
-            filter: json!({"v": {"$gte": 18}}),
+            filter: json!({"v": {"$gte": 18, "$lt": 99}}),
             sort: vec![("v".into(), -1)],
             ..Default::default()
         })

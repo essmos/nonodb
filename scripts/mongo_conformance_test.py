@@ -239,6 +239,23 @@ def main() -> int:
         if not check(name, function, nonodb_db, mongodb_db):
             failures += 1
 
+    profile = os.environ.get("NONODB_CONFORMANCE_PROFILE", "").strip()
+    if profile == "columnar":
+        for name in ("items", "text_items", "unique_missing"):
+            nonodb_db.command(
+                {
+                    "create": name,
+                    "profile": "columnar",
+                    "columnar": {
+                        "bucket_max_docs": 16,
+                        "bucket_max_bytes": 65536,
+                        "compression": "max",
+                    },
+                }
+            )
+            mongodb_db.create_collection(name)
+        print("prepared columnar collections on NonoDB")
+
     def check_rejected_both(name, function, accepted_codes):
         nonlocal failures
         codes = []

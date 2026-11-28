@@ -255,6 +255,125 @@ def main() -> int:
                 assert result.returncode == 0, result.stderr
                 assert "coffee beans" in result.stdout, result.stdout
 
+            db.create_collection(
+                "products_columnar",
+                profile="columnar",
+                columnar={"bucket_max_docs": 2, "compression": "max"},
+            )
+            columnar = db.collection("products_columnar")
+            columnar.insert_many(
+                [
+                    {
+                        "_id": "a",
+                        "title": "coffee beans",
+                        "description": "fresh roasted beans",
+                        "status": "active",
+                        "price": 20,
+                        "embedding": [1.0, 0.0],
+                    },
+                    {
+                        "_id": "b",
+                        "title": "coffee grinder",
+                        "description": "burr grinder",
+                        "status": "active",
+                        "price": 30,
+                        "embedding": [0.9, 0.1],
+                    },
+                    {
+                        "_id": "c",
+                        "title": "tea",
+                        "description": "green tea",
+                        "status": "hidden",
+                        "price": 5,
+                        "embedding": [0.0, 1.0],
+                    },
+                ]
+            )
+            columnar.create_text_index("title")
+            columnar.create_fuzzy_index("title")
+            columnar.create_vector_index("embedding", 2, "cosine")
+            columnar_lexical = columnar.search_all(
+                mode="lexical", query="coffee", fields=["title"], limit=10
+            )
+            assert [doc["_id"] for doc in columnar_lexical] == ["a", "b"], (
+                columnar_lexical
+            )
+            columnar_fuzzy = columnar.search_all(
+                mode="fuzzy",
+                query="cofee",
+                fields=["title"],
+                max_distance=2,
+                limit=10,
+            )
+            assert "a" in {doc["_id"] for doc in columnar_fuzzy}, columnar_fuzzy
+            columnar_vector = columnar.search_all(
+                mode="vector",
+                vector=[1.0, 0.0],
+                vector_field="embedding",
+                limit=2,
+            )
+            assert [doc["_id"] for doc in columnar_vector] == ["a", "b"], (
+                columnar_vector
+            )
+            columnar_hybrid = columnar.search_all(
+                mode="hybrid",
+                query="coffee",
+                fields=["title"],
+                vector=[1.0, 0.0],
+                vector_field="embedding",
+                limit=3,
+            )
+            assert {doc["_id"] for doc in columnar_hybrid} >= {"a", "b"}, (
+                columnar_hybrid
+            )
+            columnar_found = db.exec(
+                {
+                    "op": "aggregate",
+                    "coll": "products_columnar",
+                    "pipeline": [
+                        {"$search": {"text": {"query": "coffee", "path": "title"}}},
+                        {"$limit": 1},
+                        {"$project": {"_id": 1, "_score": 1}},
+                    ],
+                }
+            )["results"]
+            assert len(columnar_found) == 1 and columnar_found[0]["_score"] > 0, (
+                columnar_found
+            )
+            columnar_meta = db.exec(
+                {
+                    "op": "aggregate",
+                    "coll": "products_columnar",
+                    "pipeline": [
+                        {
+                            "$searchMeta": {
+                                "search": {
+                                    "text": {"query": "coffee", "path": "title"}
+                                }
+                            }
+                        }
+                    ],
+                }
+            )["results"]
+            assert columnar_meta[0]["count"]["total"] == 2, columnar_meta
+            columnar_vector_stage = db.exec(
+                {
+                    "op": "aggregate",
+                    "coll": "products_columnar",
+                    "pipeline": [
+                        {
+                            "$vectorSearch": {
+                                "path": "embedding",
+                                "queryVector": [1.0, 0.0],
+                                "limit": 1,
+                                "numCandidates": 10,
+                            }
+                        }
+                    ],
+                }
+            )["results"]
+            assert columnar_vector_stage[0]["_id"] == "a", columnar_vector_stage
+
             db.close()
 
             # Verify the same stages through the MongoDB wire aggregation path.
