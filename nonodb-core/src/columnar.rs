@@ -124,6 +124,16 @@ fn corrupt(what: &str) -> Error {
     Error::Query(format!("corrupt columnar bucket: {what}"))
 }
 
+/// Test-only transactional failpoint used by crash/rollback drills.
+pub(crate) fn failpoint(name: &str) -> Result<()> {
+    #[cfg(debug_assertions)]
+    if std::env::var("NONODB_COLUMNAR_FAILPOINT").ok().as_deref() == Some(name) {
+        return Err(Error::Query(format!("columnar failpoint `{name}`")));
+    }
+    let _ = name;
+    Ok(())
+}
+
 fn fnv1a64(bytes: &[u8]) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
     for byte in bytes {
@@ -832,6 +842,7 @@ pub fn insert(
     }
     let row = pointer.1;
     db.put(&mut *wtxn, &open_row_key(pointer.0, row), &encoded)?;
+    failpoint("insert_after_row")?;
     db.put(
         &mut *wtxn,
         &pointer_key(),
@@ -844,6 +855,7 @@ pub fn insert(
     let mut locators = existing;
     locators.push((pointer.0, row));
     db.put(&mut *wtxn, &id_key(hash), &encode_locators(&locators))?;
+    failpoint("insert_after_id")?;
 
     if row as usize + 1 >= settings.bucket_max_docs
         || pointer.2 as usize + encoded.len() >= settings.bucket_max_bytes
@@ -1058,6 +1070,7 @@ fn seal_current(
     }
     let payload = encode_bucket(&rows, settings)?;
     db.put(&mut *wtxn, &bucket_key(bucket), &payload)?;
+    failpoint("seal_after_bucket")?;
     for row in 0..count {
         db.delete(&mut *wtxn, &open_row_key(bucket, row))?;
     }
@@ -1066,6 +1079,7 @@ fn seal_current(
         &pointer_key(),
         &encode_pointer(bucket + 1, 0, 0),
     )?;
+    failpoint("seal_after_pointer")?;
     Ok(())
 }
 
@@ -2038,6 +2052,7 @@ pub(crate) fn update_with_changes(
     for (locator, doc) in &changes {
         write_doc_at(wtxn, &db, *locator, doc)?;
     }
+    failpoint("update_after_write")?;
     if matched == 0 && upsert {
         let mut doc = seed_from_filter(filter);
         let filter_id = doc.get("_id").cloned();
@@ -2113,7 +2128,9 @@ pub(crate) fn delete_with_docs(
         }
         let id = doc_id(&row)?;
         delete_doc_at(wtxn, &db, locator)?;
+        failpoint("delete_after_delete")?;
         remove_locator(wtxn, &db, fnv1a64(id.as_bytes()), locator)?;
+        failpoint("delete_after_id")?;
         removed.push((id, row));
         if !multi {
             break;
@@ -2243,7 +2260,9 @@ pub fn stats(rtxn: &RoTxn<'_>, env: &Env, name: &str) -> Result<Stats> {
 pub fn compact(wtxn: &mut RwTxn<'_>, env: &Env, name: &str, settings: &Settings) -> Result<usize> {
     let docs = all_docs(&*wtxn, env, name)?;
     let rows = docs.len();
+    failpoint("compact_before_clear")?;
     clear(wtxn, env, name)?;
+    failpoint("compact_after_clear")?;
     let db = env.create_database::<Bytes, Bytes>(wtxn, Some(&db_name(name)))?;
     let mut open = Vec::new();
     let mut bucket = 1u64;
@@ -2280,6 +2299,7 @@ pub fn compact(wtxn: &mut RwTxn<'_>, env: &Env, name: &str, settings: &Settings)
         locators.push((bucket, bucket_row));
         db.put(&mut *wtxn, &id_key(hash), &encode_locators(&locators))?;
     }
+    failpoint("compact_after_rebuild")?;
     Ok(rows)
 }
 

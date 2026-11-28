@@ -143,6 +143,35 @@ def main() -> int:
             daemon = Daemon(daemon_bin, data, sock, tmp / "daemon.log")
             try:
                 db = NonoDB(str(sock), timeout=30)
+                db.create_collection(
+                    "events",
+                    profile="columnar",
+                    columnar={"bucket_max_docs": 8, "compression": "max"},
+                )
+                db.exec(
+                    {
+                        "op": "create_webhook",
+                        "name": "columnar-simple",
+                        "coll": "events",
+                        "url": base + "/simple",
+                        "enabled": True,
+                        "filter": {"status": "paid"},
+                        "ops": ["insert"],
+                        "secret_env": "WEBHOOK_SECRET",
+                    }
+                )
+                db.exec(
+                    {
+                        "op": "create_webhook",
+                        "name": "columnar-slow",
+                        "coll": "events",
+                        "url": base + "/slow",
+                        "enabled": True,
+                        "filter": {"_id": "col-slow"},
+                        "max_attempts": 1,
+                        "timeout_ms": 150,
+                    }
+                )
                 db.exec(
                     {
                         "op": "create_webhook",
@@ -291,6 +320,24 @@ def main() -> int:
                     "timed-out delivery",
                 )
 
+                events = db.collection("events")
+                columnar_before = len(received.get("/simple", []))
+                events.insert({"_id": "col-paid", "status": "paid", "v": 1})
+                events.update({"_id": "col-paid"}, {"$set": {"v": 2}})
+                events.delete({"_id": "col-paid"})
+                wait_for(
+                    lambda: len(received.get("/simple", [])) > columnar_before,
+                    "columnar webhook",
+                )
+                events.insert({"_id": "col-slow", "status": "slow"})
+                wait_for(
+                    lambda: any(
+                        item["status"] == "dead"
+                        for item in deliveries(db, "columnar-slow")
+                    ),
+                    "columnar timed-out delivery",
+                )
+
                 orders.insert_many(
                     [
                         {"_id": "a", "status": "paid", "total": 4},
@@ -431,6 +478,8 @@ def main() -> int:
                     "cooldown",
                     "slow",
                     "missing-secret",
+                    "columnar-simple",
+                    "columnar-slow",
                 }
                 db.close()
 

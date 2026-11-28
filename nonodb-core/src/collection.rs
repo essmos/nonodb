@@ -5669,9 +5669,12 @@ impl<'e> Collection<'e> {
             if let Some(stored) = crate::columnar::find_by_id(&*wtxn, self.env, &self.name, &id)? {
                 self.validate_unique(&*wtxn, &stored, &id)?;
                 self.apply_all_index_entries(wtxn, None, Some(&stored), &id)?;
+                crate::columnar::failpoint("insert_after_index")?;
                 self.apply_graph_entries(wtxn, None, Some(&stored))?;
                 self.set_ttl(wtxn, &id, ttl_at)?;
+                crate::columnar::failpoint("insert_after_ttl")?;
                 self.record_history(wtxn, &id, "insert", Some(stored))?;
+                crate::columnar::failpoint("insert_after_history")?;
             }
             return Ok(id);
         }
@@ -6455,11 +6458,14 @@ impl<'e> Collection<'e> {
                 ttl::TtlUpdate::Clear => None,
                 ttl::TtlUpdate::Set(at) => Some(at),
             };
-            self.set_ttl(wtxn, &id, ttl_at)?;
             self.validate_unique(&*wtxn, &new, &id)?;
             self.apply_all_index_entries(wtxn, Some(&old), Some(&new), &id)?;
+            crate::columnar::failpoint("update_after_index")?;
             self.apply_graph_entries(wtxn, Some(&old), Some(&new))?;
+            self.set_ttl(wtxn, &id, ttl_at)?;
+            crate::columnar::failpoint("update_after_ttl")?;
             self.record_history(wtxn, &id, "update", Some(new))?;
+            crate::columnar::failpoint("update_after_history")?;
         }
         if let Some(id) = outcome.upserted_id.as_deref() {
             if let Some(mut new) = crate::columnar::find_by_id(&*wtxn, self.env, &self.name, id)? {
@@ -6491,9 +6497,12 @@ impl<'e> Collection<'e> {
         for (id, old) in &removed {
             let old = Value::Object(old.clone());
             self.apply_all_index_entries(wtxn, Some(&old), None, id)?;
+            crate::columnar::failpoint("delete_after_index")?;
             self.apply_graph_entries(wtxn, Some(&old), None)?;
             self.set_ttl(wtxn, id, None)?;
+            crate::columnar::failpoint("delete_after_ttl")?;
             self.record_history(wtxn, id, "delete", None)?;
+            crate::columnar::failpoint("delete_after_history")?;
         }
         Ok(removed.len())
     }
@@ -8122,6 +8131,7 @@ impl<'e> Collection<'e> {
                 self.set_ttl(wtxn, id, None)?;
                 return Ok(None);
             }
+            crate::columnar::failpoint("ttl_after_delete")?;
             self.apply_index_entries(wtxn, Some(&old), None, id)?;
             self.apply_graph_entries(wtxn, Some(&old), None)?;
             self.apply_text_entries(wtxn, Some(&old), None, id)?;

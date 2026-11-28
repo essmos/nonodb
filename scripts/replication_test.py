@@ -94,6 +94,14 @@ def main() -> int:
                 return response.json()["result"]
 
             exec({"op": "create_collection", "coll": "orders"})
+            exec(
+                {
+                    "op": "create_collection",
+                    "coll": "events",
+                    "profile": "columnar",
+                    "columnar": {"bucket_max_docs": 8, "compression": "max"},
+                }
+            )
             inserted = exec({"op": "insert", "coll": "orders", "doc": {"_id": "o1", "n": 1}})
             assert inserted["inserted_id"] == "o1"
             exec(
@@ -114,6 +122,25 @@ def main() -> int:
                 }
             )
             exec({"op": "delete", "coll": "orders", "filter": {"_id": "o2"}})
+            exec({"op": "insert", "coll": "events", "doc": {"_id": "e1", "n": 1}})
+            exec(
+                {
+                    "op": "update",
+                    "coll": "events",
+                    "filter": {"_id": "e1"},
+                    "update": {"$inc": {"n": 1}},
+                }
+            )
+            exec(
+                {
+                    "op": "write_batch",
+                    "ops": [
+                        {"op": "insert", "coll": "events", "doc": {"_id": "e2", "n": 2}},
+                        {"op": "insert", "coll": "events", "doc": {"_id": "e3", "n": 3}},
+                    ],
+                }
+            )
+            exec({"op": "delete", "coll": "events", "filter": {"_id": "e2"}})
             exec({"op": "sql", "query": "INSERT INTO orders (_id, n) VALUES ('o4', 4)"})
             exec({"op": "sql", "query": "UPDATE orders SET n = 5 WHERE _id = 'o4'"})
             exec({"op": "sql", "query": "DELETE FROM orders WHERE _id = 'o4'"})
@@ -250,6 +277,15 @@ def main() -> int:
                 assert replica_exec(
                     {"op": "find_one", "coll": "orders", "filter": {"_id": "o4"}}
                 ) is None
+                assert replica_exec(
+                    {"op": "find_one", "coll": "events", "filter": {"_id": "e1"}}
+                )["n"] == 2
+                assert replica_exec(
+                    {"op": "find_one", "coll": "events", "filter": {"_id": "e2"}}
+                ) is None
+                assert replica_exec(
+                    {"op": "find_one", "coll": "events", "filter": {"_id": "e3"}}
+                )["n"] == 3
 
                 exec(
                     {
@@ -271,12 +307,16 @@ def main() -> int:
                     raise RuntimeError("replica served a stale cached read after apply")
 
                 exec({"op": "insert", "coll": "orders", "doc": {"_id": "o5", "n": 5}})
+                exec({"op": "insert", "coll": "events", "doc": {"_id": "e4", "n": 4}})
                 deadline = time.monotonic() + 20
                 while time.monotonic() < deadline:
                     doc = replica_exec(
                         {"op": "find_one", "coll": "orders", "filter": {"_id": "o5"}}
                     )
-                    if doc and doc.get("n") == 5:
+                    event = replica_exec(
+                        {"op": "find_one", "coll": "events", "filter": {"_id": "e4"}}
+                    )
+                    if doc and doc.get("n") == 5 and event and event.get("n") == 4:
                         break
                     time.sleep(0.1)
                 else:
@@ -297,12 +337,16 @@ def main() -> int:
                 assert source_promote.status_code == 200, source_promote.text
                 assert source_promote.json()["result"]["role"]["epoch"] == 2
                 exec({"op": "insert", "coll": "orders", "doc": {"_id": "o6", "n": 6}})
+                exec({"op": "insert", "coll": "events", "doc": {"_id": "e5", "n": 5}})
                 deadline = time.monotonic() + 20
                 while time.monotonic() < deadline:
                     doc = replica_exec(
                         {"op": "find_one", "coll": "orders", "filter": {"_id": "o6"}}
                     )
-                    if doc and doc.get("n") == 6:
+                    event = replica_exec(
+                        {"op": "find_one", "coll": "events", "filter": {"_id": "e5"}}
+                    )
+                    if doc and doc.get("n") == 6 and event and event.get("n") == 5:
                         break
                     time.sleep(0.1)
                 else:

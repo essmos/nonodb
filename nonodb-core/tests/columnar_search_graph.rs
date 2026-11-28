@@ -197,6 +197,31 @@ fn columnar_graph_mutations_and_traversal_match_standard() {
     let actual = cn.graph_traverse(opts).unwrap();
     assert_eq!(actual, expected);
 
+    let shortest: nonodb_core::graph::ShortestPathOptions =
+        serde_json::from_value(json!({"start": "n1", "target": "n3", "max_depth": 4})).unwrap();
+    assert_eq!(
+        cn.graph_shortest_path(shortest.clone()).unwrap(),
+        sn.graph_shortest_path(shortest).unwrap()
+    );
+    let all: nonodb_core::graph::AllShortestPathsOptions =
+        serde_json::from_value(json!({"start": "n1", "target": "n3", "max_depth": 4})).unwrap();
+    assert_eq!(
+        cn.graph_all_shortest_paths(all.clone()).unwrap(),
+        sn.graph_all_shortest_paths(all).unwrap()
+    );
+    let neighbors: nonodb_core::graph::NeighborsOptions =
+        serde_json::from_value(json!({"start": "n2", "include_edges": true})).unwrap();
+    assert_eq!(
+        cn.graph_neighbors(neighbors.clone()).unwrap(),
+        sn.graph_neighbors(neighbors).unwrap()
+    );
+    let algorithm: nonodb_core::graph::GraphAlgorithmOptions =
+        serde_json::from_value(json!({"kind": "pagerank", "limit": 10})).unwrap();
+    assert_eq!(
+        cn.graph_algorithm(algorithm.clone()).unwrap(),
+        sn.graph_algorithm(algorithm).unwrap()
+    );
+
     let lookup = json!([
         {"$graphLookup": {
             "from": "edges",

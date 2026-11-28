@@ -122,6 +122,32 @@ def main() -> int:
         # Live events are never written to the outbox.
         assert db.collection("_events").count({"type": {"$regex": "^subscription\\."}}) == 0
 
+        db.create_collection(
+            "events",
+            profile="columnar",
+            columnar={"bucket_max_docs": 8, "compression": "max"},
+        )
+        events = db.collection("events")
+        columnar_stream = Stream(db, {
+            "op": "watch",
+            "coll": "events",
+            "mode": "live",
+            "filter": {"status": "paid"},
+        })
+        events.insert({"_id": "e1", "status": "paid", "total": 1})
+        event = columnar_stream.next_event()
+        assert event["payload"]["op"] == "insert", event
+        assert event["payload"]["after"]["_id"] == "e1", event
+        events.update({"_id": "e1"}, {"$set": {"total": 2}})
+        event = columnar_stream.next_event()
+        assert event["payload"]["op"] == "update", event
+        assert event["payload"]["after"]["total"] == 2, event
+        events.delete({"_id": "e1"})
+        event = columnar_stream.next_event()
+        assert event["payload"]["op"] == "delete", event
+        columnar_stream.close()
+        assert db.collection("_events").count({"type": {"$regex": "^subscription\\."}}) == 0
+
         # SQL writes use the same writer-side live path.
         sql_stream = Stream(db, {
             "op": "watch",
