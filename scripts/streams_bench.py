@@ -875,6 +875,54 @@ def run_backend(
     return out
 
 
+def _median(values: list[float]) -> float:
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[middle]
+    return (ordered[middle - 1] + ordered[middle]) / 2
+
+
+def median_result(runs: list[dict[str, Any]]) -> dict[str, Any]:
+    """Median of every numeric field across repeats, keyed by phase."""
+    if len(runs) == 1:
+        return runs[0]
+    out = {"backend": runs[0]["backend"], "events": runs[0]["events"], "runs": []}
+    produce_keys = [run["runs"][0] for run in runs]
+    produce: dict[str, Any] = {"phase": "produce", "events": produce_keys[0]["events"]}
+    for field in ("events_per_second", "seconds", "peak_rss_mb", "cpu_pct",
+                  "disk_write_mb", "data_dir_mb", "data_dir_growth_mb"):
+        produce[field] = round(_median([float(row[field]) for row in produce_keys]), 3)
+    out["runs"].append(produce)
+
+    drain_rows = len([row for row in runs[0]["runs"] if row["phase"] == "drain"])
+    for index in range(drain_rows):
+        rows = [run["runs"][index + 1] for run in runs]
+        drain: dict[str, Any] = {
+            "phase": "drain",
+            "consumers": rows[0]["consumers"],
+            "events": rows[0]["events"],
+        }
+        for field in ("events_per_second", "seconds", "peak_rss_mb", "cpu_pct",
+                      "disk_write_mb", "data_dir_mb", "data_dir_growth_mb"):
+            drain[field] = round(_median([float(row[field]) for row in rows]), 3)
+        out["runs"].append(drain)
+
+    latency = {"samples": runs[0]["latency"]["samples"]}
+    for field in ("p50_ms", "p99_ms", "mean_ms", "peak_rss_mb", "cpu_pct"):
+        latency[field] = round(_median([float(run["latency"][field]) for run in runs]), 3)
+    out["latency"] = latency
+    out["repeats"] = [
+        {
+            "produce": run["runs"][0]["events_per_second"],
+            "drain": [row["events_per_second"] for row in run["runs"][1:]],
+            "p50_ms": run["latency"]["p50_ms"],
+        }
+        for run in runs
+    ]
+    return out
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--backend", choices=sorted(BACKENDS), required=True)
@@ -896,6 +944,12 @@ def main() -> int:
             "(appendonly yes + appendfsync always for full)."
         ),
     )
+    parser.add_argument(
+        "--repeat",
+        type=int,
+        default=1,
+        help="Run the whole workload N times and report the median of each metric.",
+    )
     parser.add_argument("--json-out", default=None)
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args()
@@ -911,11 +965,18 @@ def main() -> int:
     consumers = [int(part) for part in args.consumers.split(",") if part]
     backend.start()
     try:
-        result = run_backend(
-            backend, args.events, consumers, args.latency_samples, not args.quiet
-        )
+        runs = []
+        for index in range(max(1, args.repeat)):
+            if args.repeat > 1 and not args.quiet:
+                print(f"repeat {index + 1}/{args.repeat}", file=sys.stderr)
+            runs.append(
+                run_backend(
+                    backend, args.events, consumers, args.latency_samples, not args.quiet
+                )
+            )
     finally:
         backend.stop()
+    result = median_result(runs)
     result["meta"] = {
         "python": sys.version.split()[0],
         "durability": args.durability,
