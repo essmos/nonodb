@@ -44,13 +44,13 @@ One representative run:
 | `$group` + `$sort` aggregation | 106.7 ms | 105.4 ms | `standard / columnar >= 0.80` | **1.01x** |
 | Single-document update p50 | 23.9 us | 44.9 us | `columnar / standard <= 5.0` | **1.88x** |
 
-Three consecutive runs produced these ranges: storage `0.485-0.489`, batch
-`0.922-0.956`, point `1.996-2.104x`, update `1.856-1.878x`, scan
-`1.591-1.631x`, aggregation `0.850-1.012x`.
+Three consecutive runs plus the final release commit produced these ranges:
+storage `0.485-0.489`, batch `0.922-0.966`, point `1.996-2.104x`, update
+`1.856-1.895x`, scan `1.591-1.676x`, aggregation `0.829-1.012x`.
 
 Retention/compaction (`AC-PERF-007`, `AC-PERF-010`): deleting 25% of rows left
 18.1 MB; compaction reduced it to 15.6 MB (`reclaim = 0.860`). Bucket
-seal/compaction p95 was 1.36 s, and sealed point-read p95 was 12.3 us. No
+seal/compaction p95 was 1.36-1.38 s, and sealed point-read p95 was 12.3 us. No
 correctness result changed after compaction or reopen.
 
 ## Bounded-memory soak (`AC-PERF-006`)
