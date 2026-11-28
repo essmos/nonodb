@@ -204,7 +204,11 @@ db.createCollection("events", {
 ```
 
 `listCollections` returns the settings under `options.columnar` with
-`bucketMaxDocs`, `bucketMaxBytes`, and `compression`.
+`bucketMaxDocs`, `bucketMaxBytes`, and `compression`. The HTTP/socket
+`list_collections` response keeps the `collections` name list and adds
+`collection_info` entries with `profile` and `columnar` settings. The GUI
+collection settings panel reads this data together with
+`get_collection_columnar` and shows live row/bucket/id-map/bucket-byte stats.
 
 ## Clients, CLI, and GUI
 

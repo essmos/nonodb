@@ -267,6 +267,10 @@ back up the database first if a copy is needed. See
   time-series, `timeField` is required and `metaField`, granularity,
   compression, and `expireAfterSeconds` are optional. For columnar, bucket row
   limit, bucket byte limit, and compression are optional.
+- **Collection settings** reads `get_collection_columnar` for columnar
+  collections and displays the active bucket limits, compression, row/bucket
+  counts, id-map entries, and bucket bytes. Saving updates the settings through
+  `set_collection_columnar`; TTL and history remain editable on the same panel.
 - credential-free JSON export and import of saved views.
 
 ### Saved views

@@ -3183,8 +3183,23 @@ search/vector sidecars. The request is idempotent: a missing collection returns
 Response:
 
 ```json
-{"ok": true, "result": {"collections": ["users", "settings"]}}
+{
+  "ok": true,
+  "result": {
+    "collections": ["users", "events"],
+    "collection_info": [
+      {"name": "users", "profile": "standard"},
+      {"name": "events", "profile": "columnar",
+       "columnar": {"bucket_max_docs": 512, "bucket_max_bytes": 524288,
+                    "compression": "balanced"}}
+    ]
+  }
+}
 ```
+
+`collections` keeps the historical name-only list used by existing clients.
+`collection_info` adds the profile and the profile settings (`columnar` or
+`timeseries`) for dashboards and migration tools.
 
 Standard collections are created on first write. Vault collections should be
 created explicitly with `create_collection`.
