@@ -250,10 +250,14 @@ def main() -> int:
             assert entry["profile"] == "columnar", entry
             assert entry["columnar"]["compression"] == "max", entry
             metrics = json.loads(fetch(base + "/metrics"))
-            assert any(
-                item["collection"] == "gui_events" and item["rows"] == 1
+            columnar_metrics = next(
+                item
                 for item in metrics.get("columnar_collections", [])
-            ), metrics.get("columnar_collections")
+                if item["collection"] == "gui_events"
+            )
+            assert columnar_metrics["rows"] == 1, columnar_metrics
+            for field in ("deletes", "open_bytes", "sealed_bytes", "id_bytes"):
+                assert field in columnar_metrics, (field, columnar_metrics)
 
             health = json.loads(fetch(base + "/healthz"))
             assert health, health

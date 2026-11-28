@@ -94,6 +94,18 @@ fn columnar_aggregation_matches_standard_for_supported_stages() {
         vec![
             json!({"$facet": {"by_g": [{"$group": {"_id": "$g", "n": {"$sum": 1}}}, {"$sort": {"_id": 1}}], "count": [{"$count": "n"}]}}),
         ],
+        vec![
+            json!({"$densify": {"field": "v", "range": {"step": 1, "bounds": "full"}}}),
+            json!({"$sort": {"v": 1}}),
+        ],
+        vec![
+            json!({"$fill": {"output": {"missing": {"value": "x"}}}}),
+            json!({"$sort": {"_id": 1}}),
+        ],
+        vec![
+            json!({"$setWindowFields": {"partitionBy": "$g", "sortBy": {"v": 1}, "output": {"running": {"$sum": "$v", "window": {"documents": ["unbounded", "current"]}}}}}),
+            json!({"$sort": {"_id": 1}}),
+        ],
     ];
     for pipeline in pipelines {
         let expected = sc.aggregate(&pipeline).unwrap();
