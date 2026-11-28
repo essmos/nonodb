@@ -5831,14 +5831,18 @@ impl<'e> Collection<'e> {
                 }
                 "delete" => {
                     let before = crate::columnar::find_by_id(&*wtxn, self.env, &self.name, id)?;
-                    crate::columnar::delete(
-                        wtxn,
-                        self.env,
-                        &self.name,
-                        &serde_json::json!({"_id": id}),
-                        false,
-                    )?;
                     if let Some(doc) = &before {
+                        let id_value = doc
+                            .get("_id")
+                            .cloned()
+                            .unwrap_or_else(|| serde_json::Value::String(id.to_string()));
+                        crate::columnar::delete(
+                            wtxn,
+                            self.env,
+                            &self.name,
+                            &serde_json::json!({"_id": id_value}),
+                            false,
+                        )?;
                         self.apply_all_index_entries(wtxn, Some(doc), None, id)?;
                         self.apply_graph_entries(wtxn, Some(doc), None)?;
                     }
@@ -8096,11 +8100,15 @@ impl<'e> Collection<'e> {
                 self.set_ttl(wtxn, id, None)?;
                 return Ok(None);
             };
+            let id_value = old
+                .get("_id")
+                .cloned()
+                .unwrap_or_else(|| serde_json::Value::String(id.to_string()));
             if crate::columnar::delete(
                 wtxn,
                 self.env,
                 &self.name,
-                &serde_json::json!({"_id": id}),
+                &serde_json::json!({"_id": id_value}),
                 false,
             )? == 0
             {

@@ -60,6 +60,32 @@ fn columnar_ttl_update_expire_and_visibility_follow_standard_rules() {
 }
 
 #[test]
+fn columnar_ttl_expires_object_id_documents() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    columnar(&store);
+    store
+        .set_collection_ttl_after("docs", "expireAt", 60, Some(false))
+        .unwrap();
+    let c = store.collection("docs").unwrap();
+    let now = nonodb_core::ttl::now_ms();
+    let oid = json!({"$oid": "0123456789abcdef01234567"});
+    let id = c
+        .insert_one(json!({"_id": oid, "expireAt": date(now - 120_000), "v": 1}))
+        .unwrap();
+    assert!(c.find_by_key(&id).unwrap().is_some());
+    let due = store.ttl_due(now, 10).unwrap();
+    let entry = due.iter().find(|entry| entry.id == id).unwrap().clone();
+    let mut wtxn = store.write_txn().unwrap();
+    assert!(c
+        .expire_txn_with_doc(&mut wtxn, &entry.id, entry.expire_at)
+        .unwrap()
+        .is_some());
+    wtxn.commit().unwrap();
+    assert!(c.find_by_key(&id).unwrap().is_none());
+}
+
+#[test]
 fn columnar_ttl_purge_removes_history_and_leaves_other_docs() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path()).unwrap();

@@ -106,7 +106,11 @@ pub struct Stats {
     pub open_buckets: u64,
     pub sealed_buckets: u64,
     pub id_entries: u64,
+    pub deletes: u64,
     pub data_bytes: u64,
+    pub open_bytes: u64,
+    pub sealed_bytes: u64,
+    pub id_bytes: u64,
 }
 
 type Locator = (u64, u32);
@@ -2197,10 +2201,12 @@ pub fn stats(rtxn: &RoTxn<'_>, env: &Env, name: &str) -> Result<Stats> {
             Some(&KEY_OPEN_ROW) => {
                 stats.rows += 1;
                 stats.data_bytes += value.len() as u64;
+                stats.open_bytes += value.len() as u64;
             }
             Some(&KEY_BUCKET) => {
                 stats.sealed_buckets += 1;
                 stats.data_bytes += value.len() as u64;
+                stats.sealed_bytes += value.len() as u64;
                 let rows = if value.starts_with(WRITE_MAGIC) {
                     let mut pos = 4;
                     get_uvarint(value, &mut pos)? as usize
@@ -2216,12 +2222,16 @@ pub fn stats(rtxn: &RoTxn<'_>, env: &Env, name: &str) -> Result<Stats> {
                     }
                 }
             }
-            Some(&KEY_ID) => stats.id_entries += 1,
+            Some(&KEY_ID) => {
+                stats.id_entries += 1;
+                stats.id_bytes += (key.len() + value.len()) as u64;
+            }
             Some(&KEY_DELETED) => deleted += 1,
             _ => {}
         }
     }
     stats.buckets = stats.open_buckets + stats.sealed_buckets;
+    stats.deletes = deleted;
     stats.rows = stats.rows.saturating_sub(deleted);
     Ok(stats)
 }

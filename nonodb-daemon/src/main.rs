@@ -1605,7 +1605,11 @@ async fn metrics_handler(
                 "open_buckets": stats.open_buckets,
                 "sealed_buckets": stats.sealed_buckets,
                 "id_entries": stats.id_entries,
+                "deletes": stats.deletes,
                 "data_bytes": stats.data_bytes,
+                "open_bytes": stats.open_bytes,
+                "sealed_bytes": stats.sealed_bytes,
+                "id_bytes": stats.id_bytes,
             }));
         }
     }
@@ -1717,7 +1721,11 @@ async fn prometheus_handler(
                 ("nonodb_columnar_open_buckets", stats.open_buckets),
                 ("nonodb_columnar_sealed_buckets", stats.sealed_buckets),
                 ("nonodb_columnar_id_entries", stats.id_entries),
+                ("nonodb_columnar_deletes", stats.deletes),
                 ("nonodb_columnar_data_bytes", stats.data_bytes),
+                ("nonodb_columnar_open_bytes", stats.open_bytes),
+                ("nonodb_columnar_sealed_bytes", stats.sealed_bytes),
+                ("nonodb_columnar_id_bytes", stats.id_bytes),
             ];
             for (metric, value) in fields {
                 body.push_str(&format!("{metric}{{collection=\"{name}\"}} {value}\n"));

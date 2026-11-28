@@ -61,6 +61,22 @@ fn columnar_replication_apply_is_idempotent_and_maintains_indexes() {
     wtxn.commit().unwrap();
     assert!(replica.find_by_key("a").unwrap().is_none());
     assert!(replica.lookup("v", &[json!(2)], None).unwrap()[0].is_none());
+
+    let oid = json!({"$oid": "0123456789abcdef01234567"});
+    let object_id = primary.insert_one(json!({"_id": oid, "v": 3})).unwrap();
+    let after = primary.find_by_key(&object_id).unwrap().unwrap();
+    let mut wtxn = replica_store.write_txn().unwrap();
+    replica
+        .apply_replication_change_txn(&mut wtxn, "insert", &object_id, Some(&after), None)
+        .unwrap();
+    wtxn.commit().unwrap();
+    assert_eq!(replica.find_by_key(&object_id).unwrap(), Some(after));
+    let mut wtxn = replica_store.write_txn().unwrap();
+    replica
+        .apply_replication_change_txn(&mut wtxn, "delete", &object_id, None, None)
+        .unwrap();
+    wtxn.commit().unwrap();
+    assert!(replica.find_by_key(&object_id).unwrap().is_none());
 }
 
 #[test]
@@ -162,10 +178,17 @@ fn columnar_storage_and_database_stats_include_buckets_and_indexes() {
     assert!(stats.data_bytes > 0);
     assert!(stats.index_bytes > 0);
     assert_eq!(stats.indexes, 1);
+    let raw = nonodb_core::columnar::stats(&rtxn, store.env(), "docs").unwrap();
+    assert_eq!(raw.rows, 45);
+    assert_eq!(raw.deletes, 5);
+    assert!(raw.open_bytes > 0);
+    assert!(raw.id_bytes > 0);
     rtxn.commit().unwrap();
     store.seal_columnar("docs").unwrap();
     let rtxn = store.read_txn().unwrap();
     assert_eq!(c.storage_stats(&rtxn).unwrap().records, 45);
+    let raw = nonodb_core::columnar::stats(&rtxn, store.env(), "docs").unwrap();
+    assert_eq!(raw.sealed_bytes, raw.data_bytes);
     rtxn.commit().unwrap();
 
     let db = store.storage_stats().unwrap();
