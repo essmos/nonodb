@@ -445,8 +445,17 @@ Kafka `acks=all` + `log.flush.interval.messages=1`. 20k events per phase.
   directory is dominated by segment files. Kafka wins nothing here on this
   single-node, single-partition-per-consumer setup: its consumers are capped by
   the Python client, and 4 consumers do not beat 2.
-- **Durability costs what it costs.** Forcing an fsync per batch cuts nonodb
-  produce by ~40%, Redis by ~40%, Kafka by ~30% on this box.
+- **Durability costs throughput, but these three configurations are not
+  equivalent.** Produce dropped from 14 700 to 8 500 ev/s on nonodb (−42%), from
+  45 700 to 27 800 on Redis (−39%), and from 13 100 to 9 100 on Kafka (−31%) when
+  going from the relaxed row to the full row. That is a sensitivity check, not a
+  like-for-like durability benchmark: nonodb and Redis fsync once per commit or
+  pipeline batch, while Kafka was pinned to `log.flush.interval.messages=1`, which
+  flushes **per message** and is stricter than how Kafka is normally deployed
+  (replication, with the OS flushing segments). Kafka's in-Kafka durability story
+  is replica acknowledgement, not fsync; on a single node there is nothing to
+  acknowledge to. The drops are also single runs at different event counts
+  (50k relaxed, 20k durable).
 - **Disk numbers for containers are incomplete.** `cgroup` I/O counters read 0
   for the containers on this host (overlayfs on ZFS), so only the data-directory
   growth is shown for Redis and Kafka. nonodb runs as a host process, so its
