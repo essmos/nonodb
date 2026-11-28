@@ -1,6 +1,6 @@
 //! Replication, backup, compaction, and accounting tests for columnar collections.
 
-use nonodb_core::{FindQuery, Store};
+use nonodb_core::{FindQuery, Store, VectorMetric};
 use serde_json::json;
 
 fn columnar<'a>(store: &'a Store, name: &'a str) -> nonodb_core::Collection<'a> {
@@ -155,6 +155,37 @@ fn columnar_compaction_merges_overlays_and_preserves_visible_state() {
         c.lookup("v", &[json!(100)], None).unwrap()[0],
         Some(json!({"_id": "d00", "v": 100}))
     );
+}
+
+#[test]
+fn columnar_verification_counts_documents_indexes_and_vectors() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let c = columnar(&store, "docs");
+    for index in 0..12 {
+        c.insert_one(json!({
+            "_id": format!("d{index:02}"),
+            "v": index,
+            "vec": [index as f64, 1.0],
+        }))
+        .unwrap();
+    }
+    c.create_index("v", false).unwrap();
+    c.create_vector_index("vec", 2, VectorMetric::Cosine)
+        .unwrap();
+    c.update(&json!({"_id": "d01"}), &json!({"$set": {"v": 100}}), false)
+        .unwrap();
+    c.delete(&json!({"_id": "d02"}), false).unwrap();
+    store.seal_columnar("docs").unwrap();
+
+    let rtxn = store.read_txn().unwrap();
+    let report = c.verify_in(&rtxn).unwrap();
+    assert_eq!(report.documents, 11);
+    assert!(report.bytes > 0);
+    assert_eq!(report.indexes.len(), 1);
+    assert_eq!(report.indexes[0].entries, 11);
+    assert_eq!(report.vector_indexes, vec!["vec".to_string()]);
+    rtxn.commit().unwrap();
 }
 
 #[test]

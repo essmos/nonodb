@@ -1,5 +1,6 @@
 //! Search and graph tests for the experimental columnar profile.
 
+use nonodb_core::search_all::{SearchAllRequest, SearchMode};
 use nonodb_core::{CollectionProfile, Store, VectorMetric};
 use serde_json::json;
 
@@ -68,6 +69,76 @@ fn columnar_text_fuzzy_and_vector_indexes_backfill_and_track_mutations() {
     assert_eq!(report.fuzzy, vec!["name"]);
     assert_eq!(report.vector, vec!["embedding"]);
     assert_eq!(text_ids(&c, "python"), vec!["a"]);
+}
+
+#[test]
+fn columnar_search_all_matches_standard_in_every_mode() {
+    let sd = tempfile::tempdir().unwrap();
+    let cd = tempfile::tempdir().unwrap();
+    let ss = Store::open(sd.path()).unwrap();
+    let cs = Store::open(cd.path()).unwrap();
+    let sc = ss
+        .create_collection("docs", CollectionProfile::Standard)
+        .unwrap();
+    let cc = cs
+        .create_columnar_collection("docs", &nonodb_core::columnar::Settings::default())
+        .unwrap();
+    for doc in docs() {
+        sc.insert_one(doc.clone()).unwrap();
+        cc.insert_one(doc).unwrap();
+    }
+    for collection in [&sc, &cc] {
+        collection.create_text_index("body").unwrap();
+        collection.create_fuzzy_index("name").unwrap();
+        collection
+            .create_vector_index("embedding", 2, VectorMetric::Cosine)
+            .unwrap();
+    }
+    let request = SearchAllRequest {
+        coll: "docs".into(),
+        mode: SearchMode::Lexical,
+        query: None,
+        fields: Vec::new(),
+        vector: None,
+        vector_field: None,
+        filter: serde_json::Value::Null,
+        skip: 0,
+        limit: Some(10),
+        max_distance: None,
+        rrf_k: None,
+    };
+    let cases = [
+        SearchAllRequest {
+            mode: SearchMode::Lexical,
+            query: Some("rust".into()),
+            ..request.clone()
+        },
+        SearchAllRequest {
+            mode: SearchMode::Fuzzy,
+            query: Some("helo".into()),
+            ..request.clone()
+        },
+        SearchAllRequest {
+            mode: SearchMode::Vector,
+            vector: Some(vec![1.0, 0.0]),
+            vector_field: Some("embedding".into()),
+            ..request.clone()
+        },
+        SearchAllRequest {
+            mode: SearchMode::Hybrid,
+            query: Some("rust".into()),
+            vector: Some(vec![1.0, 0.0]),
+            vector_field: Some("embedding".into()),
+            ..request.clone()
+        },
+    ];
+    for case in cases {
+        let expected = sc.search_all(&case).unwrap();
+        let actual = cc.search_all(&case).unwrap();
+        assert_eq!(actual.mode, expected.mode, "mode {case:?}");
+        assert_eq!(actual.sources, expected.sources, "sources {case:?}");
+        assert_eq!(actual.results, expected.results, "results {case:?}");
+    }
 }
 
 #[test]

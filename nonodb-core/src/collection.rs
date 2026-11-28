@@ -12268,28 +12268,56 @@ impl<'e> Collection<'e> {
         let mut expected_index = vec![0u64; defs.len()];
         let mut expected_vectors = vec![0u64; vector_fields.len()];
 
-        for item in self.db.iter(rtxn)? {
-            let (key, raw) = item?;
-            let id = std::str::from_utf8(key).map_err(|e| {
-                Error::Query(format!("invalid document key in `{}`: {e}", self.name))
+        let docs_for_verify: Vec<(String, Value, u64)> = if self.profile.is_columnar() {
+            let mut docs = Vec::new();
+            crate::columnar::for_each(rtxn, self.env, &self.name, |doc| {
+                let Some(obj) = doc.as_object() else {
+                    return Err(Error::Query(format!(
+                        "columnar document in `{}` is not a JSON object",
+                        self.name
+                    )));
+                };
+                let id = obj
+                    .get("_id")
+                    .and_then(id::key_from_value)
+                    .ok_or(Error::InvalidId)?;
+                let size = serde_json::to_vec(&doc)?.len() as u64;
+                docs.push((id, doc, size));
+                Ok(())
             })?;
-            let doc: Value = serde_json::from_slice(raw).map_err(|e| {
-                Error::Query(format!("invalid JSON for `{}`/`{id}`: {e}", self.name))
-            })?;
-            let Some(obj) = doc.as_object() else {
-                return Err(Error::Query(format!(
-                    "document `{}`/`{id}` is not a JSON object",
-                    self.name
-                )));
-            };
-            if obj.get("_id").and_then(id::key_from_value).as_deref() != Some(id) {
-                return Err(Error::Query(format!(
-                    "document `{}`/`{id}` has a missing or mismatched _id",
-                    self.name
-                )));
+            docs
+        } else {
+            let mut docs = Vec::new();
+            for item in self.db.iter(rtxn)? {
+                let (key, raw) = item?;
+                let id = std::str::from_utf8(key).map_err(|e| {
+                    Error::Query(format!("invalid document key in `{}`: {e}", self.name))
+                })?;
+                let doc: Value = serde_json::from_slice(raw).map_err(|e| {
+                    Error::Query(format!("invalid JSON for `{}`/`{id}`: {e}", self.name))
+                })?;
+                let Some(obj) = doc.as_object() else {
+                    return Err(Error::Query(format!(
+                        "document `{}`/`{id}` is not a JSON object",
+                        self.name
+                    )));
+                };
+                if obj.get("_id").and_then(id::key_from_value).as_deref() != Some(id) {
+                    return Err(Error::Query(format!(
+                        "document `{}`/`{id}` has a missing or mismatched _id",
+                        self.name
+                    )));
+                }
+                docs.push((id.to_string(), doc, raw.len() as u64));
             }
+            docs
+        };
+
+        for (id, doc, size) in docs_for_verify {
+            let id = id.as_str();
+            let key = id.as_bytes();
             documents += 1;
-            bytes += raw.len() as u64;
+            bytes += size;
 
             for (i, def) in defs.iter().enumerate() {
                 if !def.current_format() {
@@ -12306,10 +12334,11 @@ impl<'e> Collection<'e> {
                         self.name
                     ))
                 })?;
-                let expected = index::encode_index_value(def, &doc, id);
+                let expected = self.index_value_for(def, &doc, id);
+                let compact = self.compact_index_ids(def);
                 for value_bytes in keys.keys {
                     let mut index_key = value_bytes;
-                    index_key.extend_from_slice(key);
+                    index::append_index_id(&mut index_key, id, compact);
                     let actual = db.get(rtxn, &index_key)?.ok_or_else(|| {
                         Error::Query(format!(
                             "index `{}` on `{}` is missing entry for `{id}`",

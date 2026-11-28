@@ -206,6 +206,31 @@ def main() -> int:
                 "persisted quota",
             )
             assert db.exec({"op": "database_stats"})["quota"]["status"] == "warning"
+
+            # Columnar writes use the same database data budget.
+            db.exec({"op": "set_quota", "limits": all_limits()})
+            db.create_collection(
+                "events",
+                profile="columnar",
+                columnar={"bucket_max_docs": 8, "compression": "max"},
+            )
+            events = db.collection("events")
+            events.insert({"_id": "e1", "v": 1})
+            events.update({"_id": "e1"}, {"$inc": {"v": 1}})
+            assert events.find_one({"_id": "e1"})["v"] == 2
+            before = db.exec({"op": "get_quota"})["usage"]["data_bytes"]
+            db.exec(
+                {
+                    "op": "set_quota",
+                    "limits": all_limits(data_bytes=before + 1),
+                }
+            )
+            expect_quota_error(
+                lambda: events.insert({"_id": "blocked-columnar", "v": 3}),
+                "columnar data quota",
+            )
+            db.exec({"op": "set_quota", "limits": all_limits()})
+            assert events.delete({"_id": "blocked-columnar"}) == 0
         finally:
             stop_daemon(proc)
 
