@@ -1303,6 +1303,7 @@ fn execute(
                     ttl_field: None,
                     ttl_purge_history: None,
                     timeseries: None,
+                    columnar: None,
                 });
             }
             store.set_stream_in(wtxn, &def)?;
