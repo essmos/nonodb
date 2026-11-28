@@ -146,18 +146,26 @@ fn columnar_storage_and_database_stats_include_buckets_and_indexes() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path()).unwrap();
     let c = columnar(&store, "docs");
-    for index in 0..50 {
-        c.insert_one(json!({"_id": format!("d{index:02}"), "v": index}))
-            .unwrap();
-    }
+    let docs: Vec<_> = (0..50)
+        .map(|index| json!({"_id": format!("d{index:02}"), "v": index}))
+        .collect();
+    let mut wtxn = store.write_txn().unwrap();
+    c.insert_many_txn(&mut wtxn, &docs).unwrap();
+    wtxn.commit().unwrap();
     c.create_index("v", false).unwrap();
-    store.seal_columnar("docs").unwrap();
+    assert_eq!(c.delete(&json!({"v": {"$lt": 5}}), true).unwrap(), 5);
+    // The statistic must count visible rows in row-oriented staging buckets
+    // without decoding every document.
     let rtxn = store.read_txn().unwrap();
     let stats = c.storage_stats(&rtxn).unwrap();
-    assert_eq!(stats.records, 50);
+    assert_eq!(stats.records, 45);
     assert!(stats.data_bytes > 0);
     assert!(stats.index_bytes > 0);
     assert_eq!(stats.indexes, 1);
+    rtxn.commit().unwrap();
+    store.seal_columnar("docs").unwrap();
+    let rtxn = store.read_txn().unwrap();
+    assert_eq!(c.storage_stats(&rtxn).unwrap().records, 45);
     rtxn.commit().unwrap();
 
     let db = store.storage_stats().unwrap();
@@ -166,7 +174,7 @@ fn columnar_storage_and_database_stats_include_buckets_and_indexes() {
         .iter()
         .find(|item| item.collection == "docs")
         .unwrap();
-    assert_eq!(collection.records, 50);
+    assert_eq!(collection.records, 45);
     assert!(collection.data_bytes > 0);
     assert!(collection.index_bytes > 0);
 }

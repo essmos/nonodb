@@ -53,6 +53,25 @@ Retention/compaction (`AC-PERF-007`, `AC-PERF-010`): deleting 25% of rows left
 seal/compaction p95 was 1.36 s, and sealed point-read p95 was 12.3 us. No
 correctness result changed after compaction or reopen.
 
+## Bounded-memory soak (`AC-PERF-006`)
+
+`nonodb-core/examples/columnar_soak.rs` inserts a configurable number of rows in
+1,000-row transactions into a columnar collection on real disk. It prints the
+peak resident set size from `/proc/self/status` (`VmHWM`) every million rows.
+
+```bash
+NONODB_SOAK_DOCS=10000000 \
+NONODB_SOAK_DIR=/path/on/disk \
+NONODB_MAP_SIZE=4294967296 \
+  cargo run --release -p nonodb-core --example columnar_soak
+```
+
+The 10,000,000-row insertion reached its peak at **103 MiB RSS** after
+546.5 s; memory did not grow with the number of sealed buckets. The write path
+only holds one transaction's staging buffer, and `storage_stats` reads bucket
+headers instead of materializing every document. Run this harness on a disk
+path, not a small tmpfs, so the LMDB map file does not compete with RAM.
+
 ## Interpretation
 
 - Storage passes because sealed buckets use the shared adaptive codec, the

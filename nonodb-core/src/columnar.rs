@@ -2136,6 +2136,7 @@ pub fn stats(rtxn: &RoTxn<'_>, env: &Env, name: &str) -> Result<Stats> {
         return Ok(Stats::default());
     };
     let mut stats = Stats::default();
+    let mut deleted = 0u64;
     for item in db.iter(rtxn)? {
         let (key, value) = item?;
         match key.first() {
@@ -2146,7 +2147,13 @@ pub fn stats(rtxn: &RoTxn<'_>, env: &Env, name: &str) -> Result<Stats> {
             Some(&KEY_BUCKET) => {
                 stats.sealed_buckets += 1;
                 stats.data_bytes += value.len() as u64;
-                stats.rows += decode_bucket(value)?.len() as u64;
+                let rows = if value.starts_with(WRITE_MAGIC) {
+                    let mut pos = 4;
+                    get_uvarint(value, &mut pos)? as usize
+                } else {
+                    decode_bucket_header(value)?.1
+                };
+                stats.rows += rows as u64;
             }
             Some(&KEY_POINTER) => {
                 if let Some((_, count, _)) = decode_pointer(value) {
@@ -2156,11 +2163,12 @@ pub fn stats(rtxn: &RoTxn<'_>, env: &Env, name: &str) -> Result<Stats> {
                 }
             }
             Some(&KEY_ID) => stats.id_entries += 1,
+            Some(&KEY_DELETED) => deleted += 1,
             _ => {}
         }
     }
     stats.buckets = stats.open_buckets + stats.sealed_buckets;
-    stats.rows = all_docs(rtxn, env, name)?.len() as u64;
+    stats.rows = stats.rows.saturating_sub(deleted);
     Ok(stats)
 }
 

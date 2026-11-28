@@ -26,7 +26,10 @@ Full release notes: https://github.com/essmos/nonodb/releases
   `3×`/`5×` limits. The write path serializes and normalizes batches in
   parallel, skips inapplicable index/graph/TTL hooks, uses 32-row blocks and
   prefix/front-coded columns, and stores columnar index ids once in a compact
-  key trailer. See `docs/columnar-performance.md`.
+  key trailer. `storage_stats` reads sealed-bucket headers and subtracts
+  tombstones instead of materializing the collection, so it stays bounded for
+  large collections. See `docs/columnar-performance.md` and the
+  `columnar_soak` example.
 
 ## v0.34.0 - 2026-11-27
 
