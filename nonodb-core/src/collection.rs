@@ -13393,7 +13393,16 @@ pub(crate) fn compare_docs(a: &Value, b: &Value, sort: &[(String, i32)]) -> Orde
             return if *dir >= 0 { ord } else { ord.reverse() };
         }
     }
-    Ordering::Equal
+    // The standard profile iterates LMDB keys in canonical `_id` order, so
+    // ties after every sort field are deterministic by `_id`, regardless of
+    // the requested direction. Columnar locators are hash ordered, so apply
+    // the same tie-break explicitly.
+    let a = a.get("_id").and_then(crate::id::key_from_value);
+    let b = b.get("_id").and_then(crate::id::key_from_value);
+    match (a, b) {
+        (Some(a), Some(b)) => a.cmp(&b),
+        _ => Ordering::Equal,
+    }
 }
 
 /// `find` result accumulator: a plain list without sorting, TopK with sorting.

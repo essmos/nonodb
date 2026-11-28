@@ -1,6 +1,6 @@
 //! Differential read-path tests for the experimental columnar profile.
 
-use nonodb_core::{Collection, CollectionProfile, FindQuery, Store};
+use nonodb_core::{Collection, CollectionProfile, FindAndModifyOptions, FindQuery, Store};
 use serde_json::{json, Value};
 
 fn docs() -> Vec<Value> {
@@ -161,6 +161,57 @@ fn columnar_reads_match_standard_across_filters_projection_sort_and_paging() {
             sc.find_one(&json!({"_id": id})).unwrap()
         );
     }
+}
+
+#[test]
+fn columnar_sort_ties_break_by_id_like_standard() {
+    let sd = tempfile::tempdir().unwrap();
+    let cd = tempfile::tempdir().unwrap();
+    let ss = Store::open(sd.path()).unwrap();
+    let cs = Store::open(cd.path()).unwrap();
+    let sc = standard(&ss);
+    let cc = columnar(&cs);
+    for id in ["z", "m", "a", "q"] {
+        let doc = json!({"_id": id, "v": 7});
+        sc.insert_one(doc.clone()).unwrap();
+        cc.insert_one(doc).unwrap();
+    }
+    for (id, value) in [
+        ("m2", json!(null)),
+        ("a2", json!(null)),
+        ("z2", json!(null)),
+    ] {
+        let doc = json!({"_id": id, "v": value});
+        sc.insert_one(doc.clone()).unwrap();
+        cc.insert_one(doc).unwrap();
+    }
+
+    for sort in [vec![("v", 1)], vec![("v", -1)]] {
+        for (skip, limit) in [(0, None), (0, Some(2)), (2, Some(2)), (1, Some(3))] {
+            let q = query(json!({}), sort.clone(), skip, limit, None);
+            let expected = sc.find(&q).unwrap();
+            let actual = cc.find(&q).unwrap();
+            assert_eq!(
+                actual, expected,
+                "sort {sort:?} skip {skip} limit {limit:?}"
+            );
+        }
+    }
+
+    let options = FindAndModifyOptions {
+        filter: &json!({}),
+        update: Some(&json!({"$set": {"picked": true}})),
+        sort: &[("v".to_string(), 1)],
+        new: false,
+        upsert: false,
+        remove: false,
+        array_filters: &[],
+        projection: None,
+    };
+    let expected = sc.find_and_modify(&options).unwrap().value;
+    let actual = cc.find_and_modify(&options).unwrap().value;
+    assert_eq!(actual, expected);
+    assert_eq!(actual.unwrap()["_id"], json!("a2"));
 }
 
 #[test]
