@@ -6517,7 +6517,11 @@ impl<'e> Collection<'e> {
         let query = FindQuery {
             filter: opts.filter.clone(),
             projection: None,
-            sort: opts.sort.to_vec(),
+            sort: if opts.sort.is_empty() {
+                vec![("_id".to_string(), 1)]
+            } else {
+                opts.sort.to_vec()
+            },
             skip: 0,
             limit: Some(1),
             comment: None,

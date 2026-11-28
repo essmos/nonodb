@@ -119,7 +119,7 @@ observable.
 | [x] AC-WRITE-004 | Every supported update operator has the same behavior as standard, including arrays, `$setOnInsert`, `$unset`, `$inc`, `$push/$addToSet/$pull`, positional/array filters, and timestamp operators. | Evidence: `nonodb-core/tests/columnar_writes.rs`, `columnar_parity.rs`, `columnar_crash.rs`, `columnar_concurrency.rs` |
 | [x] AC-WRITE-005 | Replacement updates, upserts, and upsert-generated ids match standard. | Evidence: `nonodb-core/tests/columnar_writes.rs`, `columnar_parity.rs`, `columnar_crash.rs`, `columnar_concurrency.rs` |
 | [x] AC-WRITE-006 | `findAndModify` supports update, remove, upsert, sort, projection, return-before/after, and returns the same outcome shape. | Evidence: `nonodb-core/tests/columnar_writes.rs`, `columnar_parity.rs` (`find_and_modify_accepts_object_id`), `columnar_query.rs` (`columnar_sort_ties_break_by_id_like_standard`) |
-| [x] AC-WRITE-007 | Delete one/many, filters, TTL deletes, and delete-by-id return the same counts and leave the same visible state. | Evidence: `nonodb-core/tests/columnar_writes.rs`, `columnar_parity.rs`, `columnar_crash.rs`, `columnar_concurrency.rs` |
+| [x] AC-WRITE-007 | Delete one/many, filters, TTL deletes, and delete-by-id return the same counts and leave the same visible state. | Evidence: `nonodb-core/tests/columnar_parity.rs::single_update_delete_and_find_and_modify_choose_the_same_id`, `columnar_writes.rs`, `columnar_crash.rs` |
 | [x] AC-WRITE-008 | Concurrent inserts/updates/deletes do not lose acknowledged writes; final state matches a serialized standard run. | Evidence: `nonodb-core/tests/columnar_writes.rs`, `columnar_parity.rs`, `columnar_crash.rs`, `columnar_concurrency.rs` |
 | [x] AC-WRITE-009 | A transaction rollback, crash, or duplicate failure leaves open buckets, sealed buckets, ids, indexes, history, and events unchanged. | Evidence: `nonodb-core/tests/columnar_writes.rs`, `columnar_parity.rs`, `columnar_crash.rs`, `columnar_concurrency.rs` |
 | [x] AC-WRITE-010 | Document write, id map, index entry, history entry, event, TTL metadata, graph hook, and replication record commit in one transaction. | Evidence: `nonodb-core/tests/columnar_writes.rs`, `columnar_parity.rs`, `columnar_crash.rs`, `columnar_concurrency.rs` |
@@ -382,6 +382,9 @@ The following evidence was reviewed for this release candidate:
 - `scripts/clients_test.sh` covers columnar `find_cursor` and
   `aggregate_cursor` across multiple sealed buckets; `$out`/`$merge` parity is
   covered by `nonodb-daemon/src/writer.rs::out_and_merge_write_through_columnar_collections`.
+- Single-document update/delete and unsorted `findAndModify` now choose the
+  same smallest `_id` as the standard primary-key scan; the regression is
+  covered by `columnar_parity.rs::single_update_delete_and_find_and_modify_choose_the_same_id`.
 
 ## 16. Release sign-off
 

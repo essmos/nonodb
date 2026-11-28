@@ -2012,10 +2012,19 @@ pub(crate) fn update_with_changes(
     } else {
         None
     };
-    let candidates = match direct {
+    let mut candidates = match direct {
         Some(found) => vec![found],
         None => all_located(&*wtxn, env, name)?,
     };
+    if !multi && candidates.len() > 1 {
+        // Standard updates scan the primary `_id` tree, so a single-document
+        // update selects the smallest `_id` among the matches.
+        candidates.sort_by(|a, b| {
+            let left = doc_id(&a.1).unwrap_or_default();
+            let right = doc_id(&b.1).unwrap_or_default();
+            left.cmp(&right)
+        });
+    }
     let mut changes = Vec::new();
     let mut changed = Vec::new();
     let mut matched = 0usize;
@@ -2116,10 +2125,18 @@ pub(crate) fn delete_with_docs(
     } else {
         None
     };
-    let candidates = match direct {
+    let mut candidates = match direct {
         Some(found) => vec![found],
         None => all_located(&*wtxn, env, name)?,
     };
+    if !multi && candidates.len() > 1 {
+        // Match standard's primary-key scan order for a single delete.
+        candidates.sort_by(|a, b| {
+            let left = doc_id(&a.1).unwrap_or_default();
+            let right = doc_id(&b.1).unwrap_or_default();
+            left.cmp(&right)
+        });
+    }
     let mut removed = Vec::new();
     for (locator, row) in candidates {
         let doc = Value::Object(row.clone());

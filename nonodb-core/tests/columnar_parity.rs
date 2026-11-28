@@ -219,3 +219,59 @@ fn list_collection_info_reports_profile_and_settings() {
     assert_eq!(events["profile"], json!("columnar"));
     assert_eq!(events["columnar"]["bucket_max_docs"], json!(1024));
 }
+
+#[test]
+fn single_update_delete_and_find_and_modify_choose_the_same_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    store.create_collection("std", Default::default()).unwrap();
+    columnar(&store, "col");
+    for name in ["std", "col"] {
+        let coll = store.collection(name).unwrap();
+        for id in ["z", "m", "a", "q"] {
+            coll.insert_one(json!({"_id": id, "g": "x"})).unwrap();
+        }
+    }
+    let std = store.collection("std").unwrap();
+    let col = store.collection("col").unwrap();
+
+    assert_eq!(
+        std.update(&json!({"g": "x"}), &json!({"$set": {"hit": true}}), false)
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        col.update(&json!({"g": "x"}), &json!({"$set": {"hit": true}}), false)
+            .unwrap(),
+        1
+    );
+    let changed_id = |coll: &Collection<'_>| {
+        coll.find(&query(json!({"hit": true}), None)).unwrap()[0]["_id"].clone()
+    };
+    assert_eq!(changed_id(&std), json!("a"));
+    assert_eq!(changed_id(&col), json!("a"));
+
+    let opts = FindAndModifyOptions {
+        filter: &json!({"g": "x"}),
+        update: Some(&json!({"$set": {"fam": true}})),
+        sort: &[],
+        new: false,
+        upsert: false,
+        remove: false,
+        array_filters: &[],
+        projection: None,
+    };
+    let std_fam = std.find_and_modify(&opts).unwrap().value.unwrap()["_id"].clone();
+    let col_fam = col.find_and_modify(&opts).unwrap().value.unwrap()["_id"].clone();
+    assert_eq!(std_fam, json!("a"));
+    assert_eq!(col_fam, json!("a"));
+
+    assert_eq!(std.delete(&json!({"g": "x"}), false).unwrap(), 1);
+    assert_eq!(col.delete(&json!({"g": "x"}), false).unwrap(), 1);
+    assert_eq!(std.find_by_key("a").unwrap(), None);
+    assert_eq!(col.find_by_key("a").unwrap(), None);
+    assert_eq!(
+        std.count(&json!({})).unwrap(),
+        col.count(&json!({})).unwrap()
+    );
+}
