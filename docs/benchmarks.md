@@ -17,6 +17,8 @@ filesystem, page cache, and client overhead all affect the result.
 | 100M ANN sidecar | 16 vCPU Xeon D-2141I, 31 GiB RAM | ZFS, 438 GB | `v0.28.0`, 2026-11-22 |
 | 500k engine comparison | 16 vCPU Xeon D-2141I, 31 GiB RAM | ZFS, 438 GB | `v0.28.0`, 2026-11-22 |
 | Graph vs Neo4j Community | 8 vCPU Haswell, 22 GiB RAM | ext4 (`/var/tmp`) | `v0.32.0`, 2026-11-24 |
+| Streams vs Redis/Kafka | 4 vCPU, 14 GiB RAM | ZFS (`/var/tmp`) | `v0.34.0`, 2026-11-28 |
+| (same box, repeat under load) | shared host, load 4.5 | ZFS | `v0.34.0`, 2026-11-28 |
 
 Do not compare rows from different hosts as if they came from one controlled
 run. The 100M dense comparator in the 1B table comes from an older ext4 host.
@@ -380,6 +382,123 @@ mandatory in the v3 format; there is no positions-off mode.
 
 ---
 
+## Streams: Redis Streams and Kafka comparison
+
+`scripts/streams_bench.py` runs the same workload against nonodb consumer
+groups, Redis Streams (`XADD`/`XREADGROUP`) and Kafka 3.9 (KRaft, single node,
+one partition per consumer). Same payload (159-byte JSON), same client language
+(Python 3.13), same batch size (100 events per request or poll), localhost
+transport.
+
+Each run measures:
+
+- **produce** — batched ingestion of 50k events (`insert_many` / Redis pipeline /
+  `KafkaProducer`), events per second.
+- **drain** — 1, 2 and 4 consumers draining the pre-filled stream, measured
+  from the first delivered record so consumer start-up is excluded.
+- **latency** — one event at a time through a live consumer (`insert` +
+  `watch`/`XREADGROUP`/`poll`), produce→consume round trip.
+- **resources** — peak RSS, CPU seconds used, block-level bytes written, on-disk
+  data directory size, sampled during each phase.
+
+### Matched durability
+
+Comparing "fast mode" against "safe mode" across engines is meaningless: Redis
+without AOF loses everything on restart, Kafka on one node with `acks=1` cannot
+lose acked records but has nothing to replicate to, and nonodb's
+`durability: "relaxed"` still `fsync`s data pages. So the table below puts all
+three in their durable configuration.
+
+| Backend | Durable configuration | Produce | Drain ×1 | Drain ×2 | Drain ×4 | Round trip p50 / p99 | Peak RSS |
+|---|---|---|---|---|---|---|---|
+| nonodb streams | `durability: "full"` (`relaxed` measures the same, see below) | 14 700 ev/s | 15 500 ev/s | 31 300 ev/s | 45 500 ev/s | 5.6 / 20.7 ms | 124 MB |
+| Redis Streams 7 | `appendonly yes`, `appendfsync always` | 27 800 ev/s | 24 200 ev/s | 31 500 ev/s | 36 000 ev/s | 1.8 / 9.7 ms | 21 MB * |
+| Kafka 3.9 | `acks=all`, `log.flush.interval.messages=1` | 9 100 ev/s | 12 900 ev/s | 16 500 ev/s | 15 400 ev/s | 6.2 / 19.7 ms | 366 MB |
+
+\* Redis keeps the whole stream in RAM; RSS does not include the dataset.
+
+Read the columns this way: under the same durability, nonodb is ~2× slower than
+Redis on ingest and ~3× worse on single-event round trip, but it drains at the
+same rate as Redis with a group and roughly 3× faster than Kafka, using a third
+of Kafka's memory. Kafka's numbers here are limited by the pure-Python client, not
+by the broker — do not read them as a Kafka ceiling.
+
+A speed-vs-safety table is deliberately absent: we measured Redis without
+persistence (45 700 ev/s produce) and Kafka with `acks=1` (13 100 ev/s), but for
+nonodb the equivalent mode would be `durability: "unsafe"`, which needs
+`NONODB_ALLOW_UNSAFE_WRITES=1` and a dedicated host to measure cleanly. On this
+shared box it was slower, not faster, because the extra dirty pages throttled
+the filesystem — a good illustration of why "no fsync" is not automatically
+"faster" once the writeback path is the bottleneck.
+
+### What the numbers mean
+
+- **These are client-bound, not engine-bound.** One Python process saturates
+  before any of the three servers does: `kafka-python` is pure Python, and the
+  nonodb client pays one HTTP round trip per request. A Rust or Go producer
+  reaches far higher rates on all three. Use the ratios, not the absolutes.
+- **Batching is the whole story for nonodb.** A single-document `insert` costs
+  about 0.6–0.9 ms (HTTP + one write transaction), which caps a naive
+  one-request-per-event producer at roughly 1.2k events/s no matter how many
+  client threads you add. `insert_many` with 100 documents per transaction, and
+  `watch` with `limit: 100`, is what turns that into tens of thousands per
+  second.
+- **Drain scales with members, produce does not.** A consumer group splits the
+  range across members, so 4 consumers drain ~3× faster than one. Producers on
+  nonodb share the single writer, so extra producer connections do not raise
+  throughput — they only raise the batch size per commit.
+- **Redis wins on raw append and round-trip latency.** It is a single-threaded
+  in-memory server with no per-request transaction and no fsync unless you ask
+  for one. nonodb pays for a real LMDB transaction and an index per event.
+- **Kafka's memory is the JVM.** 540 MB RSS is the broker, not the data; its log
+  directory is dominated by segment files. Kafka wins nothing here on this
+  single-node, single-partition-per-consumer setup: its consumers are capped by
+  the Python client, and 4 consumers do not beat 2.
+- **`durability: "relaxed"` buys much less than it sounds like.** The LMDB
+  environment is opened with `NO_META_SYNC`, so a commit still `fsync`s the data
+  pages and only skips the meta page. Measured at the store level, one document
+  per transaction: 1 141 commits/s with the default path and 1 278 commits/s with
+  the relaxed path — about the same, and both bound by the ~0.85 ms `fsync` on
+  this filesystem. Only `durability: "unsafe"` (which requires
+  `NONODB_ALLOW_UNSAFE_WRITES=1`) actually skips the sync. Plan capacity around
+  `full`, and treat `relaxed` as a small win, not a mode change.
+- **The durability comparison is a sensitivity check, not a like-for-like
+  benchmark.** Produce dropped from 14 700 to 8 500 ev/s on nonodb, 45 700 to
+  27 800 on Redis, and 13 100 to 9 100 on Kafka between the relaxed and full rows.
+  Those configurations are not equivalent: nonodb and Redis fsync once per commit
+  or pipeline batch, while Kafka was pinned to `log.flush.interval.messages=1`,
+  which flushes **per message** and is stricter than how Kafka is normally
+  deployed (replication, with the OS flushing segments). Kafka's durability story
+  is replica acknowledgement, not `fsync`; on a single node there is nothing to
+  acknowledge to. The drops are also single runs at different event counts
+  (50k relaxed, 20k durable), and the host got measurably slower across repeats,
+  so treat the deltas as ±10 points.
+- **Disk numbers for containers are incomplete.** `cgroup` I/O counters read 0
+  for the containers on this host (overlayfs on ZFS), so only the data-directory
+  growth is shown for Redis and Kafka. nonodb runs as a host process, so its
+  block-level bytes come from `/proc/<pid>/io`.
+- **Variance and neighbours.** One run each on a shared 4 vCPU box; expect
+  ±10–20% on a quiet host, and far more when another job is using the disk:
+  a competing build/import job on the same ZFS pool moved `produce` from 14 700
+  to 950 ev/s and round trip from 5.6 ms to 240 ms in a repeat run, which is a
+  property of the box, not of the engine. Re-measure on an idle host before
+  quoting these numbers for capacity planning.
+  The payload is also small enough that JSON encoding is a real share of the cost.
+
+Reproduce with:
+
+```bash
+cargo build --release -p nonodb-daemon
+docker run -d --name bench-redis -p 6379:6379 redis:7-alpine \
+    redis-server --save '' --appendonly no
+# Kafka 3.9 in KRaft mode on 127.0.0.1:9092 (see the script docstring)
+python3 scripts/streams_bench.py --backend nonodb --events 50000 --consumers 1,2,4
+python3 scripts/streams_bench.py --backend redis  --events 50000 --consumers 1,2,4
+python3 scripts/streams_bench.py --backend kafka  --events 50000 --consumers 1,2,4
+```
+
+---
+
 ## Interpreting the results
 
 - **Point lookups scale.** `_id` reads stay under 1.5 ms p99 from 1M to 1B
@@ -397,6 +516,15 @@ mandatory in the v3 format; there is no positions-off mode.
   filtered queries and oversized deltas still use exact scans.
 - **RSS is not heap.** Large RSS values after scans mostly reflect mapped LMDB
   pages.
+- **Streams are commit-bound, not CPU-bound.** Every batched nonodb write pays a
+  real transaction and one `fsync`; the group-commit window batches concurrent
+  requests into one commit. That is why `insert_many`/`watch limit` matter far
+  more than client concurrency, and why producer throughput does not scale with
+  connections. Measured directly against the store (no daemon, no client):
+  1 141 documents/s at one transaction per document versus 29 800 at 100 documents
+  per transaction on the same filesystem — the per-commit `fsync` is 0.85 ms and
+  everything else is noise. Batching is the only lever that moves this number by
+  an order of magnitude.
 
 ## Graph traversal vs Neo4j Community
 

@@ -9,6 +9,10 @@ group positions, range leases with redelivery and dead letters, offset-driven
 retention, and CLI/GUI/metrics/docs support. The release also closes the
 failover, authorization, and retention-safety gaps found during review.
 
+- **Benchmarks.** `scripts/streams_bench.py` compares streams and consumer groups
+  against Redis Streams and Kafka with the same payload and client, reporting
+  throughput, round-trip latency, peak RSS, CPU, and disk per phase. Results and
+  the caveats that matter are in `docs/benchmarks.md`.
 - Fix stream failover and authorization: a promoted replica now resumes at the
   committed offset and redelivers ranges the old primary had claimed but not
   committed (the claim position is derived from leases instead of the replicated

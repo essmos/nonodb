@@ -791,3 +791,12 @@ groups that retention crossed.
   mapping, semantics that change your consumer code, migration plan.
 - [Replacing Kafka](use-cases/replacing-kafka.md) — topics/partitions/groups as
   meta-mapping, atomic multi-stream publish, and when to keep Kafka.
+
+## Benchmarks
+
+`scripts/streams_bench.py` measures produce, drain (1/2/4 consumers), and
+produce→consume latency for nonodb consumer groups, Redis Streams, and Kafka with
+the same payload and the same Python client, and reports peak RSS, CPU seconds,
+and disk usage per phase. Current numbers, methodology, and the caveats that
+matter (client-bound measurements, why `insert_many` matters more than extra
+producer connections) are in [`benchmarks.md`](benchmarks.md#streams-redis-streams-and-kafka-comparison).
