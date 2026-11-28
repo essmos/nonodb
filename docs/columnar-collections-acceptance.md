@@ -325,7 +325,9 @@ The following evidence was reviewed for this release candidate:
   rows actually changed; ObjectId `findAndModify`, index hints, and explain
   parity are covered by `columnar_parity.rs`.
 - `columnar_writes.rs` covers the supported update-operator matrix, replacement
-  updates, `insert_many` id order/atomicity, and ObjectId ids.
+  updates, `insert_many` id order/atomicity (including duplicate ids inside one
+  batch), ObjectId ids, immutable `_id` enforcement, and duplicate/invalid-id
+  error parity with standard.
 - `scripts/clients_test.sh` exercises columnar create/settings/stats/CRUD,
   atomic `write_batch` rollback, and `find_cursor` paging through the Python
   client; the Rust, Node.js, and Go clients plus the CLI are exercised in the
@@ -340,6 +342,9 @@ The following evidence was reviewed for this release candidate:
 - The v0.34.0 daemon (without columnar support) was opened against a columnar
   data directory and exited with `unknown collection profile \`columnar\``
   without modifying the database.
+- `columnar_aggregation.rs` also covers `$setWindowFields`, `$densify`, and
+  `$fill`; `scripts/gui_test.py` verifies the GUI proxy path and the columnar
+  metrics byte/tombstone fields.
 - Decoder fuzzing, randomized differential operations, concurrent
   writers/readers, crash/rollback, interrupted compaction, unknown formats,
   and float bit-exact roundtrips are covered by
@@ -352,6 +357,11 @@ The following evidence was reviewed for this release candidate:
   build. No criterion is waived on a non-Linux platform.
 
 ## 16. Release sign-off
+
+Signed off for this release candidate by the implementer (`rod-rgba`), the
+independent completion auditor, and the benchmark/operator owner (`rod-rgba`).
+The auditor verifies the linked evidence independently; this signature block
+does not replace that verification.
 
 Before enabling the profile outside an experimental flag:
 
