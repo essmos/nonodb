@@ -30,6 +30,12 @@ pub static WATCH_TRUNCATED: AtomicU64 = AtomicU64::new(0);
 pub static WATCH_HEARTBEATS: AtomicU64 = AtomicU64::new(0);
 pub static WATCH_THRESHOLD_EMITTED: AtomicU64 = AtomicU64::new(0);
 pub static WATCH_THRESHOLD_SUPPRESSED: AtomicU64 = AtomicU64::new(0);
+/// Stream consumer-group counters.
+pub static STREAM_CLAIMS: AtomicU64 = AtomicU64::new(0);
+pub static STREAM_NACKS: AtomicU64 = AtomicU64::new(0);
+pub static STREAM_DEAD_LETTERS: AtomicU64 = AtomicU64::new(0);
+pub static STREAM_PRUNED_EVENTS: AtomicU64 = AtomicU64::new(0);
+pub static STREAM_LEASE_RECOVERIES: AtomicU64 = AtomicU64::new(0);
 /// SQL statement counters and total execution time.
 pub static SQL_SELECT: AtomicU64 = AtomicU64::new(0);
 pub static SQL_INSERT: AtomicU64 = AtomicU64::new(0);
@@ -740,6 +746,11 @@ pub fn snapshot() -> Value {
         "watch_events_total": WATCH_EVENTS.load(Relaxed),
         "watch_timeouts_total": WATCH_TIMEOUTS.load(Relaxed),
         "watch_truncated_total": WATCH_TRUNCATED.load(Relaxed),
+        "stream_claims_total": STREAM_CLAIMS.load(Relaxed),
+        "stream_nacks_total": STREAM_NACKS.load(Relaxed),
+        "stream_dead_letters_total": STREAM_DEAD_LETTERS.load(Relaxed),
+        "stream_pruned_events_total": STREAM_PRUNED_EVENTS.load(Relaxed),
+        "stream_lease_recoveries_total": STREAM_LEASE_RECOVERIES.load(Relaxed),
         "watch_heartbeats_total": WATCH_HEARTBEATS.load(Relaxed),
         "watch_threshold_emitted_total": WATCH_THRESHOLD_EMITTED.load(Relaxed),
         "watch_threshold_suppressed_total": WATCH_THRESHOLD_SUPPRESSED.load(Relaxed),
@@ -1060,6 +1071,153 @@ pub fn append_replication_metrics(
     }
 }
 
+/// One `(database, stream, group, committed, head, lag, inflight, dead)` row.
+/// One consumer group's stream state as gathered for the metrics endpoint.
+#[derive(Debug, Clone)]
+pub struct StreamMetricRow {
+    pub database: String,
+    pub stream: String,
+    pub group: String,
+    pub committed_seq: u64,
+    pub head_seq: u64,
+    pub lag: u64,
+    pub inflight: u64,
+    pub dead: u64,
+    pub redeliveries: u64,
+    pub truncations: u64,
+}
+
+type StreamGroupKey = (String, String, String);
+
+fn stream_group_counters() -> &'static Mutex<BTreeMap<StreamGroupKey, u64>> {
+    static MAP: OnceLock<Mutex<BTreeMap<StreamGroupKey, u64>>> = OnceLock::new();
+    MAP.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+/// Records a rejected stream commit for one `{database, stream, group}`.
+pub fn record_stream_commit_failure(database: &str, stream: &str, group: &str) {
+    let mut map = stream_group_counters()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let key = (database.to_string(), stream.to_string(), group.to_string());
+    *map.entry(key).or_insert(0) += 1;
+}
+
+fn stream_commit_failures(database: &str, stream: &str, group: &str) -> u64 {
+    let map = stream_group_counters()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    map.get(&(database.to_string(), stream.to_string(), group.to_string()))
+        .copied()
+        .unwrap_or(0)
+}
+
+/// Appends per-group stream metrics gathered from every open database.
+pub fn append_stream_metrics(out: &mut String, rows: &[StreamMetricRow]) {
+    prom_header(
+        out,
+        "nonodb_stream_head_seq",
+        "gauge",
+        "Highest offset written to a stream.",
+    );
+    let mut seen_streams: Vec<(&str, &str, u64)> = Vec::new();
+    for row in rows {
+        if seen_streams
+            .iter()
+            .any(|(db, name, _)| *db == row.database && *name == row.stream)
+        {
+            continue;
+        }
+        seen_streams.push((&row.database, &row.stream, row.head_seq));
+        prom_sample(
+            out,
+            "nonodb_stream_head_seq",
+            &[
+                ("database", row.database.as_str()),
+                ("stream", row.stream.as_str()),
+            ],
+            &json!(row.head_seq),
+        );
+    }
+    for (name, description, pick) in [
+        (
+            "nonodb_stream_committed_seq",
+            "Committed offset of a consumer group.",
+            (|row: &StreamMetricRow| row.committed_seq) as fn(&StreamMetricRow) -> u64,
+        ),
+        (
+            "nonodb_stream_lag_events",
+            "Events between a group offset and the stream head.",
+            |row: &StreamMetricRow| row.lag,
+        ),
+        (
+            "nonodb_stream_inflight_events",
+            "Events leased to members but not yet committed.",
+            |row: &StreamMetricRow| row.inflight,
+        ),
+        (
+            "nonodb_stream_dead_events",
+            "Dead-lettered events of a consumer group.",
+            |row: &StreamMetricRow| row.dead,
+        ),
+        (
+            "nonodb_stream_redeliveries_total",
+            "Consumer-group ranges redelivered after an expiry or nack.",
+            |row: &StreamMetricRow| row.redeliveries,
+        ),
+        (
+            "nonodb_stream_truncated_total",
+            "Retention passes that crossed this consumer group.",
+            |row: &StreamMetricRow| row.truncations,
+        ),
+    ] {
+        prom_header(
+            out,
+            name,
+            if name.ends_with("_total") {
+                "counter"
+            } else {
+                "gauge"
+            },
+            description,
+        );
+        for row in rows {
+            prom_sample(
+                out,
+                name,
+                &[
+                    ("database", row.database.as_str()),
+                    ("stream", row.stream.as_str()),
+                    ("group", row.group.as_str()),
+                ],
+                &json!(pick(row)),
+            );
+        }
+    }
+    prom_header(
+        out,
+        "nonodb_stream_commit_failures_total",
+        "counter",
+        "Stream commits rejected (stale lease or out-of-order offset).",
+    );
+    for row in rows {
+        prom_sample(
+            out,
+            "nonodb_stream_commit_failures_total",
+            &[
+                ("database", row.database.as_str()),
+                ("stream", row.stream.as_str()),
+                ("group", row.group.as_str()),
+            ],
+            &json!(stream_commit_failures(
+                &row.database,
+                &row.stream,
+                &row.group
+            )),
+        );
+    }
+}
+
 pub fn prometheus() -> String {
     let snapshot = snapshot();
     let mut out = String::with_capacity(16 * 1024);
@@ -1125,6 +1283,31 @@ pub fn prometheus() -> String {
             "nonodb_watch_truncated_total",
             "watch_truncated_total",
             "Watch requests with an expired cursor.",
+        ),
+        (
+            "nonodb_stream_claims_total",
+            "stream_claims_total",
+            "Consumer-group batches claimed.",
+        ),
+        (
+            "nonodb_stream_nacks_total",
+            "stream_nacks_total",
+            "Consumer-group batches released with nack.",
+        ),
+        (
+            "nonodb_stream_dead_letters_total",
+            "stream_dead_letters_total",
+            "Consumer-group batches dead-lettered.",
+        ),
+        (
+            "nonodb_stream_pruned_events_total",
+            "stream_pruned_events_total",
+            "Stream events dropped by offset retention.",
+        ),
+        (
+            "nonodb_stream_lease_recoveries_total",
+            "stream_lease_recoveries_total",
+            "Expired stream leases requeued or dead-lettered by the janitor.",
         ),
         (
             "nonodb_watch_heartbeats_total",

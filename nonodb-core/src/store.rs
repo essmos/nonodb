@@ -18,6 +18,7 @@ use crate::history::{self, DEFAULT_HISTORY_MAX_VERSIONS, HISTORY_DB};
 use crate::replication::{
     ReplicationChange, ReplicationOp, ReplicationTxn, REPLICATION_DB, REPLICATION_SEQ_KEY,
 };
+use crate::streams::{ResetTo, StartAt, StreamDef, StreamGroup, StreamLease};
 use crate::subscriptions::{self, Subscription};
 use crate::ttl::{self, TTL_DB};
 use crate::vault::CollectionProfile;
@@ -1625,6 +1626,1468 @@ impl Store {
         Self::events_from_rw(meta, wtxn, name)
     }
 
+    // ---------------------------------------------------------------------
+    // Streams: durable offsets and consumer groups.
+    // ---------------------------------------------------------------------
+
+    fn stream_key(name: &str) -> String {
+        format!("{}{name}", crate::streams::STREAM_PREFIX)
+    }
+
+    fn stream_seq_key(name: &str) -> String {
+        format!("{}{name}", crate::streams::STREAM_SEQ_PREFIX)
+    }
+
+    fn stream_coll_key(coll: &str) -> String {
+        format!("stream:coll:{coll}")
+    }
+
+    fn stream_group_key(stream: &str, group: &str) -> String {
+        format!("{}{stream}:{group}", crate::streams::GROUP_PREFIX)
+    }
+
+    /// Creates or replaces a stream definition and its offset index.
+    pub fn set_stream(&self, def: &StreamDef) -> Result<()> {
+        let mut wtxn = self.write_txn()?;
+        self.set_stream_in(&mut wtxn, def)?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    /// Creates or replaces a stream definition inside a writer transaction.
+    pub fn set_stream_in(&self, wtxn: &mut RwTxn<'_>, def: &StreamDef) -> Result<()> {
+        def.validate()?;
+        let Some(profile) = self.collection_profile_in_rw(wtxn, &def.coll)? else {
+            return Err(Error::Query(format!(
+                "collection `{}` does not exist",
+                def.coll
+            )));
+        };
+        // Time-series buckets and vault collections do not store `_seq` on the
+        // documents this feature reads, so a stream over them would silently
+        // deliver nothing (or the wrong rows). Reject instead of lying.
+        if profile != crate::vault::CollectionProfile::Standard {
+            return Err(Error::Query(format!(
+                "collection `{}` cannot back a stream: only standard collections are supported",
+                def.coll
+            )));
+        }
+        let collection = self.collection_in(wtxn, &def.coll)?;
+        collection.create_index_fields_txn(
+            wtxn,
+            std::slice::from_ref(&def.seq_field),
+            false,
+            &[],
+            false,
+            false,
+            None,
+        )?;
+        let meta = self
+            .env
+            .create_database::<Bytes, Bytes>(&mut *wtxn, Some(META_DB))?;
+        let raw = serde_json::to_vec(def)?;
+        meta.put(&mut *wtxn, Self::stream_key(&def.name).as_bytes(), &raw)?;
+        // Reverse lookup used by the insert hot path: one key per collection.
+        meta.put(
+            &mut *wtxn,
+            Self::stream_coll_key(&def.coll).as_bytes(),
+            def.name.as_bytes(),
+        )?;
+        Ok(())
+    }
+
+    /// Removes a stream definition. Data and groups are left in place.
+    pub fn drop_stream_in(&self, wtxn: &mut RwTxn<'_>, name: &str) -> Result<bool> {
+        let meta = self
+            .env
+            .create_database::<Bytes, Bytes>(&mut *wtxn, Some(META_DB))?;
+        let existing = meta
+            .get(&*wtxn, Self::stream_key(name).as_bytes())?
+            .and_then(|raw| serde_json::from_slice::<StreamDef>(raw).ok());
+        let existed = meta.delete(&mut *wtxn, Self::stream_key(name).as_bytes())?;
+        if let Some(def) = existing {
+            let owner = meta
+                .get(&*wtxn, Self::stream_coll_key(&def.coll).as_bytes())?
+                .and_then(|raw| std::str::from_utf8(raw).ok());
+            if owner == Some(name) {
+                meta.delete(&mut *wtxn, Self::stream_coll_key(&def.coll).as_bytes())?;
+            }
+        }
+        Ok(existed)
+    }
+
+    /// Returns one stream definition.
+    pub fn stream(&self, name: &str) -> Result<Option<StreamDef>> {
+        let rtxn = self.read_txn()?;
+        let out = self.stream_in(&rtxn, name)?;
+        rtxn.commit()?;
+        Ok(out)
+    }
+
+    /// Stream lookup inside an existing read transaction.
+    pub fn stream_in(&self, rtxn: &RoTxn<'_>, name: &str) -> Result<Option<StreamDef>> {
+        let Some(meta) = self
+            .env
+            .open_database::<Bytes, Bytes>(rtxn, Some(META_DB))?
+        else {
+            return Ok(None);
+        };
+        Ok(meta
+            .get(rtxn, Self::stream_key(name).as_bytes())?
+            .and_then(|raw| serde_json::from_slice(raw).ok()))
+    }
+
+    /// Stream lookup inside a writer transaction.
+    pub fn stream_in_rw(&self, wtxn: &RwTxn<'_>, name: &str) -> Result<Option<StreamDef>> {
+        let Some(meta) = self
+            .env
+            .open_database::<Bytes, Bytes>(wtxn, Some(META_DB))?
+        else {
+            return Ok(None);
+        };
+        Ok(meta
+            .get(wtxn, Self::stream_key(name).as_bytes())?
+            .and_then(|raw| serde_json::from_slice(raw).ok()))
+    }
+
+    /// Returns the stream defined for a collection, if any.
+    ///
+    /// This runs on the insert path, so it uses the reverse `stream:coll:<coll>`
+    /// key instead of scanning every definition.
+    pub fn collection_stream_in_rw(
+        &self,
+        wtxn: &RwTxn<'_>,
+        coll: &str,
+    ) -> Result<Option<StreamDef>> {
+        let Some(meta) = self
+            .env
+            .open_database::<Bytes, Bytes>(wtxn, Some(META_DB))?
+        else {
+            return Ok(None);
+        };
+        let Some(name) = meta
+            .get(wtxn, Self::stream_coll_key(coll).as_bytes())?
+            .and_then(|raw| std::str::from_utf8(raw).ok())
+            .map(str::to_string)
+        else {
+            return Ok(None);
+        };
+        self.stream_in_rw(wtxn, &name)
+    }
+
+    /// Lists every stream definition.
+    pub fn streams(&self) -> Result<Vec<StreamDef>> {
+        let rtxn = self.read_txn()?;
+        let out = self.streams_in(&rtxn)?;
+        rtxn.commit()?;
+        Ok(out)
+    }
+
+    /// Lists stream definitions inside a read transaction.
+    pub fn streams_in(&self, rtxn: &RoTxn<'_>) -> Result<Vec<StreamDef>> {
+        let Some(meta) = self
+            .env
+            .open_database::<Bytes, Bytes>(rtxn, Some(META_DB))?
+        else {
+            return Ok(Vec::new());
+        };
+        let prefix = crate::streams::STREAM_PREFIX.as_bytes();
+        let mut out = Vec::new();
+        for item in meta.iter(rtxn)? {
+            let (key, value) = item?;
+            if !key.starts_with(prefix)
+                || key.starts_with(crate::streams::STREAM_SEQ_PREFIX.as_bytes())
+                || key.starts_with(b"stream:coll:")
+            {
+                continue;
+            }
+            if let Ok(def) = serde_json::from_slice::<StreamDef>(value) {
+                out.push(def);
+            }
+        }
+        out.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(out)
+    }
+
+    /// Lists stream definitions inside a writer transaction.
+    pub fn streams_in_rw(&self, wtxn: &RwTxn<'_>) -> Result<Vec<StreamDef>> {
+        let Some(meta) = self
+            .env
+            .open_database::<Bytes, Bytes>(wtxn, Some(META_DB))?
+        else {
+            return Ok(Vec::new());
+        };
+        let prefix = crate::streams::STREAM_PREFIX.as_bytes();
+        let mut out = Vec::new();
+        for item in meta.iter(wtxn)? {
+            let (key, value) = item?;
+            if !key.starts_with(prefix)
+                || key.starts_with(crate::streams::STREAM_SEQ_PREFIX.as_bytes())
+                || key.starts_with(b"stream:coll:")
+            {
+                continue;
+            }
+            if let Ok(def) = serde_json::from_slice::<StreamDef>(value) {
+                out.push(def);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Highest offset allocated for a stream, or `0` when nothing was written.
+    pub fn stream_head(&self, name: &str) -> Result<u64> {
+        let rtxn = self.read_txn()?;
+        let out = self.stream_head_in(&rtxn, name)?;
+        rtxn.commit()?;
+        Ok(out)
+    }
+
+    /// Highest allocated offset inside a read transaction.
+    pub fn stream_head_in(&self, rtxn: &RoTxn<'_>, name: &str) -> Result<u64> {
+        let Some(meta) = self
+            .env
+            .open_database::<Bytes, Bytes>(rtxn, Some(META_DB))?
+        else {
+            return Ok(0);
+        };
+        Ok(meta
+            .get(rtxn, Self::stream_seq_key(name).as_bytes())?
+            .and_then(|raw| {
+                std::str::from_utf8(raw)
+                    .ok()
+                    .and_then(|text| text.parse().ok())
+            })
+            .unwrap_or(0))
+    }
+
+    /// Allocates the next offset for a stream inside a writer transaction.
+    pub fn allocate_stream_seq_in(&self, wtxn: &mut RwTxn<'_>, name: &str) -> Result<u64> {
+        let meta = self
+            .env
+            .create_database::<Bytes, Bytes>(&mut *wtxn, Some(META_DB))?;
+        let key = Self::stream_seq_key(name);
+        let next = meta
+            .get(&*wtxn, key.as_bytes())?
+            .and_then(|raw| {
+                std::str::from_utf8(raw)
+                    .ok()
+                    .and_then(|text| text.parse::<u64>().ok())
+            })
+            .unwrap_or(0)
+            + 1;
+        meta.put(&mut *wtxn, key.as_bytes(), next.to_string().as_bytes())?;
+        Ok(next)
+    }
+
+    /// Raises the stream counter to at least `seq`.
+    ///
+    /// Replicas apply the primary's `_seq` values verbatim, so the local counter
+    /// must follow them; otherwise a promoted replica would reissue offsets that
+    /// already exist.
+    pub fn observe_stream_seq_in(&self, wtxn: &mut RwTxn<'_>, name: &str, seq: u64) -> Result<()> {
+        let meta = self
+            .env
+            .create_database::<Bytes, Bytes>(&mut *wtxn, Some(META_DB))?;
+        let key = Self::stream_seq_key(name);
+        let current = meta
+            .get(&*wtxn, key.as_bytes())?
+            .and_then(|raw| {
+                std::str::from_utf8(raw)
+                    .ok()
+                    .and_then(|text| text.parse::<u64>().ok())
+            })
+            .unwrap_or(0);
+        if seq > current {
+            meta.put(&mut *wtxn, key.as_bytes(), seq.to_string().as_bytes())?;
+        }
+        Ok(())
+    }
+
+    /// Returns one consumer group.
+    pub fn stream_group(&self, stream: &str, group: &str) -> Result<Option<StreamGroup>> {
+        let rtxn = self.read_txn()?;
+        let out = self.stream_group_in(&rtxn, stream, group)?;
+        rtxn.commit()?;
+        Ok(out)
+    }
+
+    /// Consumer-group lookup inside a read transaction.
+    pub fn stream_group_in(
+        &self,
+        rtxn: &RoTxn<'_>,
+        stream: &str,
+        group: &str,
+    ) -> Result<Option<StreamGroup>> {
+        let Some(meta) = self
+            .env
+            .open_database::<Bytes, Bytes>(rtxn, Some(META_DB))?
+        else {
+            return Ok(None);
+        };
+        Ok(meta
+            .get(rtxn, Self::stream_group_key(stream, group).as_bytes())?
+            .and_then(|raw| serde_json::from_slice(raw).ok()))
+    }
+
+    /// Consumer-group lookup inside a writer transaction.
+    pub fn stream_group_in_rw(
+        &self,
+        wtxn: &RwTxn<'_>,
+        stream: &str,
+        group: &str,
+    ) -> Result<Option<StreamGroup>> {
+        let Some(meta) = self
+            .env
+            .open_database::<Bytes, Bytes>(wtxn, Some(META_DB))?
+        else {
+            return Ok(None);
+        };
+        Ok(meta
+            .get(wtxn, Self::stream_group_key(stream, group).as_bytes())?
+            .and_then(|raw| serde_json::from_slice(raw).ok()))
+    }
+
+    /// Lists groups for one stream, or every group when `stream` is `None`.
+    pub fn stream_groups(&self, stream: Option<&str>) -> Result<Vec<StreamGroup>> {
+        let rtxn = self.read_txn()?;
+        let Some(meta) = self
+            .env
+            .open_database::<Bytes, Bytes>(&rtxn, Some(META_DB))?
+        else {
+            return Ok(Vec::new());
+        };
+        let prefix = crate::streams::GROUP_PREFIX.as_bytes();
+        let mut out = Vec::new();
+        for item in meta.iter(&rtxn)? {
+            let (key, value) = item?;
+            if !key.starts_with(prefix) {
+                continue;
+            }
+            let Ok(group) = serde_json::from_slice::<StreamGroup>(value) else {
+                continue;
+            };
+            if stream.is_some_and(|name| group.stream != name) {
+                continue;
+            }
+            out.push(group);
+        }
+        out.sort_by(|left, right| {
+            left.stream
+                .cmp(&right.stream)
+                .then_with(|| left.group.cmp(&right.group))
+        });
+        rtxn.commit()?;
+        Ok(out)
+    }
+
+    /// Writes a consumer group inside a writer transaction.
+    pub fn put_stream_group_in(&self, wtxn: &mut RwTxn<'_>, group: &StreamGroup) -> Result<()> {
+        group.validate()?;
+        let meta = self
+            .env
+            .create_database::<Bytes, Bytes>(&mut *wtxn, Some(META_DB))?;
+        let raw = serde_json::to_vec(group)?;
+        meta.put(
+            &mut *wtxn,
+            Self::stream_group_key(&group.stream, &group.group).as_bytes(),
+            &raw,
+        )?;
+        Ok(())
+    }
+
+    /// Creates a consumer group at the requested position.
+    pub fn create_stream_group_in(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        stream: &str,
+        group: &str,
+        start: StartAt,
+        max_attempts: u32,
+    ) -> Result<StreamGroup> {
+        crate::streams::validate_name(group, "group")?;
+        if self.stream_in_rw(wtxn, stream)?.is_none() {
+            return Err(Error::Query(format!("stream `{stream}` does not exist")));
+        }
+        if self.stream_group_in_rw(wtxn, stream, group)?.is_some() {
+            return Err(Error::DuplicateKey(group.to_string()));
+        }
+        let head = self.stream_head_in(wtxn, stream)?;
+        let committed = match start {
+            StartAt::Latest => head,
+            StartAt::Earliest => 0,
+            StartAt::Seq(seq) => {
+                if seq > head {
+                    return Err(Error::Query(format!(
+                        "start offset {seq} is past the stream head {head}"
+                    )));
+                }
+                seq
+            }
+        };
+        let mut out = StreamGroup::new(stream, group, committed);
+        out.max_attempts = max_attempts.max(1);
+        out.touch();
+        self.put_stream_group_in(wtxn, &out)?;
+        Ok(out)
+    }
+
+    /// Moves a group and clears its in-flight batch.
+    pub fn reset_stream_group_in(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        stream: &str,
+        group: &str,
+        to: ResetTo,
+    ) -> Result<StreamGroup> {
+        let mut current = self
+            .stream_group_in_rw(wtxn, stream, group)?
+            .ok_or_else(|| {
+                Error::Query(format!("stream group `{stream}:{group}` does not exist"))
+            })?;
+        let head = self.stream_head_in(wtxn, stream)?;
+        current.committed_seq = match to {
+            // Resume from the oldest event retention left behind, so resetting a
+            // truncated group does not immediately fail again.
+            ResetTo::Earliest => self
+                .stream_oldest_seq_in(wtxn, stream)?
+                .map_or(0, |oldest| oldest.saturating_sub(1)),
+            ResetTo::Latest => head,
+            ResetTo::Seq(seq) => {
+                if seq > head {
+                    return Err(Error::Query(format!(
+                        "reset offset {seq} is past the stream head {head}"
+                    )));
+                }
+                seq
+            }
+        };
+        current.truncated_below = None;
+        current.next_seq = current.committed_seq;
+        current.touch();
+        self.clear_stream_leases_in(wtxn, stream, group)?;
+        self.put_stream_group_in(wtxn, &current)?;
+        Ok(current)
+    }
+
+    /// Deletes a group and its offset.
+    pub fn delete_stream_group_in(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        stream: &str,
+        group: &str,
+    ) -> Result<bool> {
+        // A recreated group must not inherit the previous group's batches: drop
+        // its leases and dead letters together with the offset.
+        self.clear_stream_leases_in(wtxn, stream, group)?;
+        let meta = self
+            .env
+            .create_database::<Bytes, Bytes>(&mut *wtxn, Some(META_DB))?;
+        Ok(meta.delete(&mut *wtxn, Self::stream_group_key(stream, group).as_bytes())?)
+    }
+
+    /// Deletes a group, its offset, its leases, and its dead letters.
+    pub fn delete_stream_group(&self, stream: &str, group: &str) -> Result<bool> {
+        let mut wtxn = self.write_txn()?;
+        let out = self.delete_stream_group_in(&mut wtxn, stream, group)?;
+        wtxn.commit()?;
+        Ok(out)
+    }
+
+    /// Creates a consumer group in its own transaction.
+    pub fn create_stream_group(
+        &self,
+        stream: &str,
+        group: &str,
+        start: StartAt,
+    ) -> Result<StreamGroup> {
+        self.create_stream_group_with_attempts(stream, group, start, 5)
+    }
+
+    /// Creates a consumer group with an explicit redelivery budget.
+    pub fn create_stream_group_with_attempts(
+        &self,
+        stream: &str,
+        group: &str,
+        start: StartAt,
+        max_attempts: u32,
+    ) -> Result<StreamGroup> {
+        let mut wtxn = self.write_txn()?;
+        let out = self.create_stream_group_in(&mut wtxn, stream, group, start, max_attempts)?;
+        wtxn.commit()?;
+        Ok(out)
+    }
+
+    /// Moves a group offset in its own transaction.
+    pub fn reset_stream_group(
+        &self,
+        stream: &str,
+        group: &str,
+        to: ResetTo,
+    ) -> Result<StreamGroup> {
+        let mut wtxn = self.write_txn()?;
+        let out = self.reset_stream_group_in(&mut wtxn, stream, group, to)?;
+        wtxn.commit()?;
+        Ok(out)
+    }
+
+    /// Claims the next batch for a member, in its own transaction.
+    pub fn claim_stream_lease(
+        &self,
+        stream: &str,
+        group: &str,
+        member: &str,
+        limit: usize,
+        lease_ms: u64,
+    ) -> Result<Option<StreamLease>> {
+        let mut wtxn = self.write_txn()?;
+        match self.claim_stream_lease_in(&mut wtxn, stream, group, member, limit, lease_ms) {
+            Ok(lease) => {
+                wtxn.commit()?;
+                Ok(lease)
+            }
+            Err(error) => {
+                // Keep the `truncated_below` marker written on the error path.
+                let _ = wtxn.commit();
+                Err(error)
+            }
+        }
+    }
+
+    /// Acknowledges a batch in its own transaction.
+    pub fn ack_stream_lease(
+        &self,
+        stream: &str,
+        group: &str,
+        lease_id: &str,
+        seq: u64,
+    ) -> Result<StreamLease> {
+        let mut wtxn = self.write_txn()?;
+        let out = self.ack_stream_lease_in(&mut wtxn, stream, group, lease_id, seq)?;
+        wtxn.commit()?;
+        Ok(out)
+    }
+
+    /// Releases a batch for redelivery in its own transaction.
+    pub fn nack_stream_lease(
+        &self,
+        stream: &str,
+        group: &str,
+        lease_id: &str,
+        retry_in_ms: u64,
+    ) -> Result<StreamLease> {
+        let mut wtxn = self.write_txn()?;
+        let out = self.nack_stream_lease_in(&mut wtxn, stream, group, lease_id, retry_in_ms)?;
+        wtxn.commit()?;
+        Ok(out)
+    }
+
+    fn stream_lease_key(stream: &str, group: &str, from_seq: u64) -> String {
+        format!(
+            "{}{stream}:{group}:{from_seq:020}",
+            crate::streams::LEASE_PREFIX
+        )
+    }
+
+    fn stream_dead_key(stream: &str, group: &str, from_seq: u64) -> String {
+        format!(
+            "{}{stream}:{group}:{from_seq:020}",
+            crate::streams::DEAD_PREFIX
+        )
+    }
+
+    fn put_stream_lease_in(&self, wtxn: &mut RwTxn<'_>, lease: &StreamLease) -> Result<()> {
+        lease.validate()?;
+        let meta = self
+            .env
+            .create_database::<Bytes, Bytes>(&mut *wtxn, Some(META_DB))?;
+        let raw = serde_json::to_vec(lease)?;
+        meta.put(
+            &mut *wtxn,
+            Self::stream_lease_key(&lease.stream, &lease.group, lease.from_seq).as_bytes(),
+            &raw,
+        )?;
+        Ok(())
+    }
+
+    fn put_stream_dead_in(&self, wtxn: &mut RwTxn<'_>, lease: &StreamLease) -> Result<()> {
+        let meta = self
+            .env
+            .create_database::<Bytes, Bytes>(&mut *wtxn, Some(META_DB))?;
+        let raw = serde_json::to_vec(lease)?;
+        meta.put(
+            &mut *wtxn,
+            Self::stream_dead_key(&lease.stream, &lease.group, lease.from_seq).as_bytes(),
+            &raw,
+        )?;
+        Ok(())
+    }
+
+    fn delete_stream_lease_in(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        stream: &str,
+        group: &str,
+        from_seq: u64,
+    ) -> Result<()> {
+        let meta = self
+            .env
+            .create_database::<Bytes, Bytes>(&mut *wtxn, Some(META_DB))?;
+        meta.delete(
+            &mut *wtxn,
+            Self::stream_lease_key(stream, group, from_seq).as_bytes(),
+        )?;
+        Ok(())
+    }
+
+    /// Reads one lease record.
+    pub fn stream_lease(
+        &self,
+        stream: &str,
+        group: &str,
+        from_seq: u64,
+    ) -> Result<Option<StreamLease>> {
+        let rtxn = self.read_txn()?;
+        let Some(meta) = self
+            .env
+            .open_database::<Bytes, Bytes>(&rtxn, Some(META_DB))?
+        else {
+            return Ok(None);
+        };
+        let out = meta
+            .get(
+                &rtxn,
+                Self::stream_lease_key(stream, group, from_seq).as_bytes(),
+            )?
+            .and_then(|raw| serde_json::from_slice(raw).ok());
+        rtxn.commit()?;
+        Ok(out)
+    }
+
+    /// Lists in-flight and pending batches of one group.
+    /// Cheap read-only check used to avoid an empty write transaction when a
+    /// consumer long-polls a caught-up group.
+    ///
+    /// Returns `true` when a claim would make progress: an expired lease is
+    /// waiting for recovery, a released range is waiting for redelivery, or
+    /// unpublished events exist above the committed offset.
+    pub fn stream_claim_ready(&self, stream: &str, group: &str) -> Result<bool> {
+        let rtxn = self.read_txn()?;
+        let Some(group_row) = self.stream_group_in(&rtxn, stream, group)? else {
+            // Let the writer raise the real "group does not exist" error instead
+            // of silently reporting a caught-up group.
+            return Ok(true);
+        };
+        let now = crate::streams::now_ms();
+        let leases = self.stream_leases_in(&rtxn, stream, group)?;
+        let ready = leases.iter().any(|lease| {
+            (lease.status == crate::streams::LeaseStatus::Available && lease.lease_until <= now)
+                || lease.is_expired(now)
+        }) || {
+            let leased_through = leases.iter().map(|lease| lease.to_seq).max().unwrap_or(0);
+            let next_seq = group_row
+                .committed_seq
+                .max(leased_through)
+                .saturating_add(1);
+            let head = self.stream_head_in(&rtxn, stream)?;
+            next_seq <= head
+        };
+        rtxn.commit()?;
+        Ok(ready)
+    }
+
+    pub fn stream_leases(&self, stream: &str, group: &str) -> Result<Vec<StreamLease>> {
+        let rtxn = self.read_txn()?;
+        let out = self.stream_leases_in(&rtxn, stream, group)?;
+        rtxn.commit()?;
+        Ok(out)
+    }
+
+    fn stream_leases_in(
+        &self,
+        rtxn: &RoTxn<'_>,
+        stream: &str,
+        group: &str,
+    ) -> Result<Vec<StreamLease>> {
+        let Some(meta) = self
+            .env
+            .open_database::<Bytes, Bytes>(rtxn, Some(META_DB))?
+        else {
+            return Ok(Vec::new());
+        };
+        let prefix = format!("{}{stream}:{group}:", crate::streams::LEASE_PREFIX);
+        let mut out = Vec::new();
+        for item in meta.iter(rtxn)? {
+            let (key, value) = item?;
+            if !key.starts_with(prefix.as_bytes()) {
+                continue;
+            }
+            if let Ok(lease) = serde_json::from_slice::<StreamLease>(value) {
+                out.push(lease);
+            }
+        }
+        out.sort_by_key(|lease| lease.from_seq);
+        Ok(out)
+    }
+
+    fn stream_leases_in_rw(
+        &self,
+        wtxn: &RwTxn<'_>,
+        stream: &str,
+        group: &str,
+    ) -> Result<Vec<StreamLease>> {
+        let Some(meta) = self
+            .env
+            .open_database::<Bytes, Bytes>(wtxn, Some(META_DB))?
+        else {
+            return Ok(Vec::new());
+        };
+        let prefix = format!("{}{stream}:{group}:", crate::streams::LEASE_PREFIX);
+        let mut out = Vec::new();
+        for item in meta.iter(wtxn)? {
+            let (key, value) = item?;
+            if !key.starts_with(prefix.as_bytes()) {
+                continue;
+            }
+            if let Ok(lease) = serde_json::from_slice::<StreamLease>(value) {
+                out.push(lease);
+            }
+        }
+        out.sort_by_key(|lease| lease.from_seq);
+        Ok(out)
+    }
+
+    /// Lists dead-lettered batches, optionally for one group.
+    pub fn stream_dead_letters(
+        &self,
+        stream: Option<&str>,
+        group: Option<&str>,
+    ) -> Result<Vec<StreamLease>> {
+        let rtxn = self.read_txn()?;
+        let Some(meta) = self
+            .env
+            .open_database::<Bytes, Bytes>(&rtxn, Some(META_DB))?
+        else {
+            return Ok(Vec::new());
+        };
+        let prefix = crate::streams::DEAD_PREFIX.as_bytes();
+        let mut out = Vec::new();
+        for item in meta.iter(&rtxn)? {
+            let (key, value) = item?;
+            if !key.starts_with(prefix) {
+                continue;
+            }
+            let Ok(dead) = serde_json::from_slice::<StreamLease>(value) else {
+                continue;
+            };
+            if stream.is_some_and(|name| dead.stream != name) {
+                continue;
+            }
+            if group.is_some_and(|name| dead.group != name) {
+                continue;
+            }
+            out.push(dead);
+        }
+        out.sort_by_key(|lease| (lease.stream.clone(), lease.group.clone(), lease.from_seq));
+        rtxn.commit()?;
+        Ok(out)
+    }
+
+    /// Drops the node-local leases of one group without touching its committed
+    /// offset.
+    ///
+    /// Leases are ownership records for the node that handed them out, not
+    /// cluster state; a node that takes a group over (promotion, restart with a
+    /// copied data directory) must clear them so the ranges are claimed again
+    /// instead of being skipped. Returns the number of leases removed.
+    pub fn clear_stream_leases(&self, stream: &str, group: &str) -> Result<usize> {
+        let mut wtxn = self.write_txn()?;
+        let count = self.stream_leases_in_rw(&wtxn, stream, group)?.len();
+        self.clear_stream_leases_in(&mut wtxn, stream, group)?;
+        wtxn.commit()?;
+        Ok(count)
+    }
+
+    fn clear_stream_leases_in(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        stream: &str,
+        group: &str,
+    ) -> Result<()> {
+        for lease in self.stream_leases_in_rw(wtxn, stream, group)? {
+            self.delete_stream_lease_in(wtxn, stream, group, lease.from_seq)?;
+        }
+        let meta = self
+            .env
+            .create_database::<Bytes, Bytes>(&mut *wtxn, Some(META_DB))?;
+        let prefix = format!("{}{stream}:{group}:", crate::streams::DEAD_PREFIX);
+        let keys: Vec<Vec<u8>> = meta
+            .iter(&*wtxn)?
+            .filter_map(|item| {
+                let (key, _) = item.ok()?;
+                key.starts_with(prefix.as_bytes()).then(|| key.to_vec())
+            })
+            .collect();
+        for key in keys {
+            meta.delete(&mut *wtxn, &key)?;
+        }
+        Ok(())
+    }
+
+    /// Advances `committed_seq` across every contiguous finished batch.
+    fn advance_stream_committed_in(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        group: &mut StreamGroup,
+    ) -> Result<()> {
+        loop {
+            let next = group.committed_seq.saturating_add(1);
+            let ready = self
+                .stream_leases_in_rw(wtxn, &group.stream, &group.group)?
+                .into_iter()
+                .find(|lease| {
+                    lease.from_seq == next && lease.status == crate::streams::LeaseStatus::Done
+                });
+            let Some(lease) = ready else {
+                break;
+            };
+            group.committed_seq = lease.to_seq;
+            group.touch();
+            self.delete_stream_lease_in(wtxn, &group.stream, &group.group, lease.from_seq)?;
+        }
+        self.put_stream_group_in(wtxn, group)?;
+        Ok(())
+    }
+
+    fn finish_stream_lease_in(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        lease: &mut StreamLease,
+        dead: bool,
+        error: Option<String>,
+    ) -> Result<()> {
+        lease.status = crate::streams::LeaseStatus::Done;
+        lease.lease_id = None;
+        lease.member = None;
+        lease.lease_until = 0;
+        lease.error = error;
+        lease.touch();
+        // A dead-lettered range stays in the lease table marked `Done` so the
+        // committed offset can advance across it; the dead record keeps it for
+        // inspection and manual retry.
+        if dead {
+            self.put_stream_dead_in(wtxn, lease)?;
+        }
+        self.put_stream_lease_in(wtxn, lease)?;
+        Ok(())
+    }
+
+    /// Runs the expiry janitor over every stream and group, in its own
+    /// transactions.
+    ///
+    /// Returns `(groups_scanned, leases_recovered)`. Expired leases are requeued
+    /// or dead-lettered even when no member is currently claiming, so a crashed
+    /// worker surfaces in the dead-letter and stats views on the maintenance
+    /// tick.
+    pub fn recover_stream_leases(&self) -> Result<(usize, usize)> {
+        let mut groups = 0usize;
+        let mut recovered = 0usize;
+        for def in self.streams()? {
+            for group in self.stream_groups(Some(&def.name))? {
+                let mut wtxn = self.write_txn()?;
+                let (count, _dead) =
+                    self.recover_stream_leases_in(&mut wtxn, &def.name, &group.group)?;
+                wtxn.commit()?;
+                groups += 1;
+                recovered += count;
+            }
+        }
+        Ok((groups, recovered))
+    }
+
+    /// Requeues or dead-letters every expired lease of one group.
+    /// Returns `(recovered, dead_lettered)`; the dead leases are the ranges
+    /// that crossed `max_attempts` and must be replicated as dead records.
+    pub fn recover_stream_leases_in(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        stream: &str,
+        group: &str,
+    ) -> Result<(usize, Vec<StreamLease>)> {
+        let now = crate::streams::now_ms();
+        let mut recovered = 0;
+        let mut dead_leases = Vec::new();
+        let mut dead_range: Option<(u64, u64)> = None;
+        for mut lease in self.stream_leases_in_rw(wtxn, stream, group)? {
+            if !lease.is_expired(now) {
+                continue;
+            }
+            recovered += 1;
+            if lease.attempts >= lease.max_attempts {
+                dead_range = Some((lease.from_seq, lease.to_seq));
+                self.finish_stream_lease_in(
+                    wtxn,
+                    &mut lease,
+                    true,
+                    Some("lease expired".to_string()),
+                )?;
+                dead_leases.push(lease.clone());
+            } else {
+                lease.status = crate::streams::LeaseStatus::Available;
+                lease.lease_id = None;
+                lease.member = None;
+                lease.lease_until = 0;
+                lease.touch();
+                self.put_stream_lease_in(wtxn, &lease)?;
+            }
+        }
+        if dead_range.is_some() {
+            if let Some(mut group_row) = self.stream_group_in_rw(wtxn, stream, group)? {
+                self.advance_stream_committed_in(wtxn, &mut group_row)?;
+            }
+        }
+        Ok((recovered, dead_leases))
+    }
+
+    /// Claims a contiguous batch for a member.
+    ///
+    /// Pending ranges are handed out before new offsets are allocated, so a
+    /// redelivery keeps the original range and its attempt counter. Returns
+    /// `None` when the group is caught up.
+    pub fn claim_stream_lease_in(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        stream: &str,
+        group: &str,
+        member: &str,
+        limit: usize,
+        lease_ms: u64,
+    ) -> Result<Option<StreamLease>> {
+        let mut dead = Vec::new();
+        self.claim_stream_lease_in_with_dead(
+            wtxn, stream, group, member, limit, lease_ms, &mut dead,
+        )
+    }
+
+    /// Same as [`Store::claim_stream_lease_in`], also returning any ranges that
+    /// expired into dead letters while recovering, so the writer can replicate
+    /// those dead records.
+    #[allow(clippy::too_many_arguments)]
+    pub fn claim_stream_lease_in_with_dead(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        stream: &str,
+        group: &str,
+        member: &str,
+        limit: usize,
+        lease_ms: u64,
+        dead: &mut Vec<StreamLease>,
+    ) -> Result<Option<StreamLease>> {
+        if self.stream_group_in_rw(wtxn, stream, group)?.is_none() {
+            return Err(Error::Query(format!(
+                "stream group `{stream}:{group}` does not exist"
+            )));
+        }
+        // Recover first: it can advance the committed offset across freshly
+        // dead-lettered ranges, and this claim must not write a stale group row
+        // back over that advance.
+        let (_, dead_now) = self.recover_stream_leases_in(wtxn, stream, group)?;
+        dead.extend(dead_now);
+        let mut group_row = self
+            .stream_group_in_rw(wtxn, stream, group)?
+            .ok_or_else(|| {
+                Error::Query(format!("stream group `{stream}:{group}` does not exist"))
+            })?;
+        if let Some(below) = group_row.truncated_below {
+            if group_row.committed_seq < below {
+                return Err(Error::StreamTruncated(format!(
+                    "group `{stream}:{group}` fell behind the retained window at offset {below}"
+                )));
+            }
+        }
+        // The never-delivered offset is derived from *durable* state (the
+        // committed offset) plus the leases that exist on this node, never from
+        // the cached `next_seq`. Leases are node-local, so after a failover a
+        // promoted replica must resume from `committed_seq + 1` and redeliver
+        // ranges that the previous primary had claimed but never committed.
+        let leases = self.stream_leases_in_rw(wtxn, stream, group)?;
+        let leased_through = leases.iter().map(|lease| lease.to_seq).max().unwrap_or(0);
+        let next_seq = group_row
+            .committed_seq
+            .max(leased_through)
+            .saturating_add(1);
+
+        // The oldest surviving event decides whether the next offset to deliver
+        // still exists; retention may have run without touching this group. An
+        // empty window (everything pruned) still truncates a group that has
+        // offsets left to read.
+        let head = self.stream_head_in(wtxn, stream)?;
+        if next_seq <= head {
+            let oldest = self.stream_oldest_seq_in(wtxn, stream)?;
+            let crossed = match oldest {
+                Some(oldest) => oldest > next_seq,
+                // No events survive, so nothing can be delivered below the head.
+                None => true,
+            };
+            if crossed {
+                let below = oldest.unwrap_or_else(|| head.saturating_add(1));
+                group_row.truncated_below = Some(below);
+                group_row.truncations = group_row.truncations.saturating_add(1);
+                group_row.touch();
+                self.put_stream_group_in(wtxn, &group_row)?;
+                return Err(Error::StreamTruncated(format!(
+                    "group `{stream}:{group}` fell behind the retained window at offset {below}"
+                )));
+            }
+        }
+        if group_row.next_seq != next_seq.saturating_sub(1) {
+            group_row.next_seq = next_seq.saturating_sub(1);
+        }
+        let now = crate::streams::now_ms();
+        let lease_until = now.saturating_add(lease_ms.max(1_000));
+
+        let pending = leases
+            .iter()
+            .find(|lease| {
+                lease.status == crate::streams::LeaseStatus::Available && lease.lease_until <= now
+            })
+            .cloned();
+        if let Some(mut lease) = pending {
+            group_row.redeliveries = group_row.redeliveries.saturating_add(1);
+            group_row.touch();
+            self.put_stream_group_in(wtxn, &group_row)?;
+            lease.attempts += 1;
+            lease.status = crate::streams::LeaseStatus::Leased;
+            lease.lease_id = Some(crate::events::new_event_id());
+            lease.member = Some(member.to_string());
+            lease.lease_until = lease_until;
+            lease.error = None;
+            lease.touch();
+            self.put_stream_lease_in(wtxn, &lease)?;
+            return Ok(Some(lease));
+        }
+
+        let from = next_seq;
+        if from > head {
+            return Ok(None);
+        }
+        let to = head.min(from.saturating_add(limit.max(1) as u64 - 1));
+        let mut lease = StreamLease::new(stream, group, from, to, group_row.max_attempts);
+        lease.attempts = 1;
+        lease.status = crate::streams::LeaseStatus::Leased;
+        lease.lease_id = Some(crate::events::new_event_id());
+        lease.member = Some(member.to_string());
+        lease.lease_until = lease_until;
+        group_row.next_seq = to;
+        group_row.touch();
+        self.put_stream_group_in(wtxn, &group_row)?;
+        self.put_stream_lease_in(wtxn, &lease)?;
+        Ok(Some(lease))
+    }
+
+    /// Acknowledges a batch and advances the committed offset when the prefix
+    /// is contiguous.
+    pub fn ack_stream_lease_in(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        stream: &str,
+        group: &str,
+        lease_id: &str,
+        seq: u64,
+    ) -> Result<StreamLease> {
+        let mut group_row = self
+            .stream_group_in_rw(wtxn, stream, group)?
+            .ok_or_else(|| {
+                Error::Query(format!("stream group `{stream}:{group}` does not exist"))
+            })?;
+        let mut lease = self
+            .stream_leases_in_rw(wtxn, stream, group)?
+            .into_iter()
+            .find(|lease| lease.lease_id.as_deref() == Some(lease_id))
+            .ok_or_else(|| Error::StaleLease(format!("no batch is leased under `{lease_id}`")))?;
+        if lease.status != crate::streams::LeaseStatus::Leased {
+            return Err(Error::StaleLease(format!(
+                "batch {}..={} is not leased",
+                lease.from_seq, lease.to_seq
+            )));
+        }
+        // A batch is acknowledged as a whole: a partial ack inside the range
+        // would mark the whole range done and silently drop the rest.
+        if seq != lease.to_seq {
+            return Err(Error::CommitOutOfOrder(format!(
+                "offset {seq} is not the end of the leased range {}..={}",
+                lease.from_seq, lease.to_seq
+            )));
+        }
+        if seq < group_row.committed_seq {
+            // A batch retried from the dead-letter queue can sit below the
+            // committed offset because the group advanced while it was dead.
+            // Acknowledge the replay and drop the lease; the offset is already
+            // past it.
+            if lease.retried {
+                lease.status = crate::streams::LeaseStatus::Done;
+                lease.lease_id = None;
+                lease.member = None;
+                lease.lease_until = 0;
+                lease.touch();
+                self.delete_stream_lease_in(wtxn, stream, group, lease.from_seq)?;
+                return Ok(lease);
+            }
+            return Err(Error::CommitOutOfOrder(format!(
+                "offset {seq} is below the committed offset {}",
+                group_row.committed_seq
+            )));
+        }
+        lease.status = crate::streams::LeaseStatus::Done;
+        lease.lease_id = None;
+        lease.member = None;
+        lease.lease_until = 0;
+        lease.touch();
+        self.put_stream_lease_in(wtxn, &lease)?;
+        self.advance_stream_committed_in(wtxn, &mut group_row)?;
+        Ok(lease)
+    }
+
+    /// Releases a batch for redelivery, or dead-letters it once attempts are
+    /// exhausted.
+    pub fn nack_stream_lease_in(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        stream: &str,
+        group: &str,
+        lease_id: &str,
+        retry_in_ms: u64,
+    ) -> Result<StreamLease> {
+        let mut group_row = self
+            .stream_group_in_rw(wtxn, stream, group)?
+            .ok_or_else(|| {
+                Error::Query(format!("stream group `{stream}:{group}` does not exist"))
+            })?;
+        let mut lease = self
+            .stream_leases_in_rw(wtxn, stream, group)?
+            .into_iter()
+            .find(|lease| lease.lease_id.as_deref() == Some(lease_id))
+            .ok_or_else(|| Error::StaleLease(format!("no batch is leased under `{lease_id}`")))?;
+        if lease.attempts >= lease.max_attempts {
+            self.finish_stream_lease_in(
+                wtxn,
+                &mut lease,
+                true,
+                Some("attempts exhausted".to_string()),
+            )?;
+            self.advance_stream_committed_in(wtxn, &mut group_row)?;
+            return Ok(lease);
+        }
+        lease.status = crate::streams::LeaseStatus::Available;
+        lease.lease_id = None;
+        lease.member = None;
+        lease.lease_until = crate::streams::now_ms().saturating_add(retry_in_ms);
+        lease.touch();
+        self.put_stream_lease_in(wtxn, &lease)?;
+        Ok(lease)
+    }
+
+    /// Moves a dead letter back into the redelivery queue, in its own transaction.
+    pub fn retry_stream_dead(&self, stream: &str, group: &str, from_seq: u64) -> Result<bool> {
+        let mut wtxn = self.write_txn()?;
+        let out = self.retry_stream_dead_in(&mut wtxn, stream, group, from_seq)?;
+        wtxn.commit()?;
+        Ok(out)
+    }
+
+    /// Drops a dead letter, in its own transaction.
+    pub fn drop_stream_dead(&self, stream: &str, group: &str, from_seq: u64) -> Result<bool> {
+        let mut wtxn = self.write_txn()?;
+        let out = self.drop_stream_dead_in(&mut wtxn, stream, group, from_seq)?;
+        wtxn.commit()?;
+        Ok(out)
+    }
+
+    /// Moves a dead letter back into the redelivery queue.
+    pub fn retry_stream_dead_in(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        stream: &str,
+        group: &str,
+        from_seq: u64,
+    ) -> Result<bool> {
+        let meta = self
+            .env
+            .create_database::<Bytes, Bytes>(&mut *wtxn, Some(META_DB))?;
+        let key = Self::stream_dead_key(stream, group, from_seq);
+        let Some(raw) = meta.get(&*wtxn, key.as_bytes())? else {
+            return Ok(false);
+        };
+        let mut lease: StreamLease = serde_json::from_slice(raw)?;
+        meta.delete(&mut *wtxn, key.as_bytes())?;
+        lease.status = crate::streams::LeaseStatus::Available;
+        lease.attempts = 0;
+        lease.lease_id = None;
+        lease.member = None;
+        lease.lease_until = 0;
+        lease.error = None;
+        lease.retried = true;
+        lease.touch();
+        self.put_stream_lease_in(wtxn, &lease)?;
+        Ok(true)
+    }
+
+    /// Drops a dead letter without reprocessing it.
+    pub fn drop_stream_dead_in(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        stream: &str,
+        group: &str,
+        from_seq: u64,
+    ) -> Result<bool> {
+        let meta = self
+            .env
+            .create_database::<Bytes, Bytes>(&mut *wtxn, Some(META_DB))?;
+        Ok(meta.delete(
+            &mut *wtxn,
+            Self::stream_dead_key(stream, group, from_seq).as_bytes(),
+        )?)
+    }
+
+    /// Oldest `_seq` still stored in a stream collection.
+    fn stream_oldest_seq_in(&self, wtxn: &RwTxn<'_>, coll: &str) -> Result<Option<u64>> {
+        let collection = self.collection(coll)?;
+        let docs = collection.find_in(
+            wtxn,
+            &crate::collection::FindQuery {
+                // Documents written before the stream was defined have no
+                // `_seq` and must not be mistaken for "nothing is retained".
+                filter: serde_json::json!({crate::streams::SEQ_FIELD: {"$gt": 0}}),
+                projection: Some(serde_json::json!({"_seq": 1})),
+                sort: vec![(crate::streams::SEQ_FIELD.to_string(), 1)],
+                skip: 0,
+                limit: Some(1),
+                comment: None,
+                max_time_ms: None,
+                hint: None,
+            },
+        )?;
+        Ok(docs
+            .first()
+            .and_then(|doc| doc.get(crate::streams::SEQ_FIELD))
+            .and_then(Value::as_u64))
+    }
+
+    /// Newest surviving `_seq` for a collection, if any.
+    fn stream_newest_seq_in(&self, wtxn: &RwTxn<'_>, coll: &str) -> Result<Option<u64>> {
+        let collection = self.collection(coll)?;
+        let docs = collection.find_in(
+            wtxn,
+            &crate::collection::FindQuery {
+                filter: serde_json::json!({crate::streams::SEQ_FIELD: {"$gt": 0}}),
+                projection: Some(serde_json::json!({"_seq": 1})),
+                sort: vec![(crate::streams::SEQ_FIELD.to_string(), -1)],
+                skip: 0,
+                limit: Some(1),
+                comment: None,
+                max_time_ms: None,
+                hint: None,
+            },
+        )?;
+        Ok(docs
+            .first()
+            .and_then(|doc| doc.get(crate::streams::SEQ_FIELD))
+            .and_then(Value::as_u64))
+    }
+
+    /// Highest `_seq` that is provably older than `max_age_ms`.
+    ///
+    /// Walks the `_seq` index forward from the oldest surviving event for at
+    /// most one prune batch and stops at the first event that is *not* older
+    /// than the cutoff. Out-of-order timestamps, a missing `created_at`, and a
+    /// deleted head therefore block the boundary instead of widening it, so a
+    /// retention pass can never delete an event that might still be fresh.
+    /// Cost is bounded by the batch size, not by the stream length.
+    fn stream_age_limit_in(
+        &self,
+        wtxn: &RwTxn<'_>,
+        def: &StreamDef,
+        batch: usize,
+    ) -> Result<Option<u64>> {
+        let Some(max_age_ms) = def.retention.max_age_ms else {
+            return Ok(None);
+        };
+        let cutoff = crate::streams::now_ms() as i64 - max_age_ms as i64;
+        let collection = self.collection(&def.coll)?;
+        let docs = collection.find_in(
+            wtxn,
+            &crate::collection::FindQuery {
+                filter: serde_json::json!({crate::streams::SEQ_FIELD: {"$gt": 0}}),
+                projection: Some(serde_json::json!({
+                    crate::streams::SEQ_FIELD: 1,
+                    "created_at": 1,
+                    "_id": 1,
+                })),
+                sort: vec![(crate::streams::SEQ_FIELD.to_string(), 1)],
+                skip: 0,
+                limit: Some(batch.max(1)),
+                comment: None,
+                max_time_ms: None,
+                hint: None,
+            },
+        )?;
+        let mut limit = None;
+        for doc in docs {
+            let Some(seq) = doc.get(crate::streams::SEQ_FIELD).and_then(Value::as_u64) else {
+                break;
+            };
+            // Unknown age is not proof of age: stop rather than guess.
+            let Some(created_at) = crate::events::document_created_at_ms(&doc) else {
+                break;
+            };
+            if created_at >= cutoff {
+                break;
+            }
+            limit = Some(seq);
+        }
+        Ok(limit)
+    }
+
+    /// Highest `_seq` retention may drop for a stream: the minimum of the age
+    /// limit and the slowest consumer's position minus `min_seq_keep`.
+    ///
+    /// `max_bytes` is deliberately not part of the rule yet; `None` means
+    /// nothing may be dropped.
+    pub fn stream_retention_limit_in(
+        &self,
+        wtxn: &RwTxn<'_>,
+        def: &StreamDef,
+        batch: usize,
+    ) -> Result<Option<u64>> {
+        if def.retention.is_empty() {
+            return Ok(None);
+        }
+        let mut limit = self.stream_age_limit_in(wtxn, def, batch)?;
+        if let Some(max_events) = def.retention.max_events {
+            // The newest *surviving* event, not the counter head: when the head
+            // document was deleted by hand the counter would over-count and
+            // retain one event fewer than requested.
+            if let Some(newest) = self.stream_newest_seq_in(wtxn, &def.coll)? {
+                let events_limit = newest.saturating_sub(max_events);
+                limit = Some(match limit {
+                    Some(other) => other.min(events_limit),
+                    None => events_limit,
+                });
+            }
+        }
+        let groups = self.stream_groups(Some(&def.name))?;
+        if !groups.is_empty() {
+            let slowest = groups
+                .iter()
+                .map(|group| group.committed_seq)
+                .min()
+                .unwrap_or(0);
+            let consumer_limit = slowest.saturating_sub(def.retention.min_seq_keep);
+            limit = Some(match limit {
+                Some(age) => age.min(consumer_limit),
+                None => consumer_limit,
+            });
+        }
+        Ok(limit)
+    }
+
+    /// Drops up to `batch` events below the retention limit.
+    ///
+    /// Groups that fell behind the retained window get `truncated_below` set, so
+    /// their next claim fails with `stream_truncated` instead of silently
+    /// skipping events.
+    pub fn prune_stream_in(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        stream: &str,
+        batch: usize,
+    ) -> Result<Vec<(String, Value)>> {
+        let Some(def) = self.stream_in_rw(wtxn, stream)? else {
+            return Ok(Vec::new());
+        };
+        let Some(limit) = self.stream_retention_limit_in(wtxn, &def, batch)? else {
+            return Ok(Vec::new());
+        };
+        let Some(oldest) = self.stream_oldest_seq_in(wtxn, &def.coll)? else {
+            return Ok(Vec::new());
+        };
+        if oldest > limit {
+            return Ok(Vec::new());
+        }
+        let collection = self.collection(&def.coll)?;
+        let doomed = collection.find_in(
+            wtxn,
+            &crate::collection::FindQuery {
+                filter: serde_json::json!({crate::streams::SEQ_FIELD: {"$lte": limit}}),
+                projection: None,
+                sort: vec![(crate::streams::SEQ_FIELD.to_string(), 1)],
+                skip: 0,
+                limit: Some(batch.max(1)),
+                comment: None,
+                max_time_ms: None,
+                hint: None,
+            },
+        )?;
+        let mut deleted = Vec::new();
+        for doc in doomed {
+            let Some(id) = doc.get("_id").cloned() else {
+                continue;
+            };
+            if collection.delete_txn(wtxn, &serde_json::json!({"_id": id.clone()}), false)? > 0 {
+                match id.as_str() {
+                    Some(id) => deleted.push((id.to_string(), doc)),
+                    None => continue,
+                }
+            }
+        }
+        if deleted.is_empty() {
+            return Ok(deleted);
+        }
+        // When retention removed the entire window there is no surviving offset
+        // to report; the group must resume after the current head instead.
+        let remaining = self.stream_oldest_seq_in(wtxn, &def.coll)?;
+        let head = self.stream_head_in(wtxn, &def.name)?;
+        let below = remaining.unwrap_or(head.saturating_add(1));
+        for mut group in self.stream_groups(Some(&def.name))? {
+            // The group's next event (`next_seq + 1`) was dropped when it is at
+            // or below the highest dropped offset.
+            if group.next_seq < limit && group.truncated_below != Some(below) {
+                group.truncated_below = Some(below);
+                group.truncations = group.truncations.saturating_add(1);
+                group.touch();
+                self.put_stream_group_in(wtxn, &group)?;
+            }
+        }
+        Ok(deleted)
+    }
+
+    /// Runs one retention pass over every stream, in its own transactions.
+    ///
+    /// Returns `(events_deleted, streams_touched)`.
+    pub fn prune_streams(&self, batch: usize) -> Result<(usize, usize)> {
+        let mut deleted = 0usize;
+        let mut touched = 0usize;
+        for def in self.streams()? {
+            if def.retention.is_empty() {
+                continue;
+            }
+            loop {
+                let mut wtxn = self.write_txn()?;
+                let dropped = self.prune_stream_in(&mut wtxn, &def.name, batch)?;
+                let n = dropped.len();
+                wtxn.commit()?;
+                if n == 0 {
+                    break;
+                }
+                deleted += n;
+                touched += 1;
+                if n < batch {
+                    break;
+                }
+            }
+        }
+        Ok((deleted, touched))
+    }
+
     /// Returns the per-collection history retention. `0` means disabled.
     pub fn collection_history(&self, name: &str) -> Result<usize> {
         let rtxn = self.read_txn()?;
@@ -2651,6 +4114,28 @@ impl Store {
                 self.delete_subscription_in(wtxn, coll, name)?;
                 Ok(())
             }
+            ReplicationOp::StreamSet { def } => self.set_stream_in(wtxn, def),
+            ReplicationOp::StreamDrop { name } => {
+                self.drop_stream_in(wtxn, name)?;
+                Ok(())
+            }
+            ReplicationOp::StreamGroupSet { group } => self.put_stream_group_in(wtxn, group),
+            ReplicationOp::StreamLeaseDead { lease } => self.put_stream_dead_in(wtxn, lease),
+            ReplicationOp::StreamDeadDelete {
+                stream,
+                group,
+                from_seq,
+            } => {
+                self.drop_stream_dead_in(wtxn, stream, group, *from_seq)?;
+                Ok(())
+            }
+            ReplicationOp::StreamGroupClear { stream, group } => {
+                self.clear_stream_leases_in(wtxn, stream, group)
+            }
+            ReplicationOp::StreamGroupDelete { stream, group } => {
+                self.delete_stream_group_in(wtxn, stream, group)?;
+                Ok(())
+            }
             ReplicationOp::EventAppend { doc } => {
                 let id = doc
                     .get("_id")
@@ -3079,11 +4564,11 @@ mod tests {
 
     #[test]
     fn store_open_recovers_interrupted_compaction_swap() {
-        use serde_json::json;
         let dir = tempfile::tempdir().unwrap();
         let store = super::Store::open(dir.path()).unwrap();
         let c = store.collection("docs").unwrap();
-        c.insert_one(json!({"_id": "a", "value": 1})).unwrap();
+        c.insert_one(serde_json::json!({"_id": "a", "value": 1}))
+            .unwrap();
         store.close();
 
         let source = dir.path().join("data.mdb");
@@ -3093,7 +4578,11 @@ mod tests {
 
         let store = super::Store::open(dir.path()).unwrap();
         assert_eq!(
-            store.collection("docs").unwrap().count(&json!({})).unwrap(),
+            store
+                .collection("docs")
+                .unwrap()
+                .count(&serde_json::json!({}))
+                .unwrap(),
             1
         );
         assert!(source.exists());
@@ -3102,7 +4591,6 @@ mod tests {
 
     #[test]
     fn compact_data_dir_reclaims_deleted_timeseries_rows() {
-        use serde_json::json;
         let dir = tempfile::tempdir().unwrap();
         let store = super::Store::open(dir.path()).unwrap();
         let settings = crate::timeseries::Settings {
@@ -3114,7 +4602,7 @@ mod tests {
             .create_timeseries_collection("metrics", &settings)
             .unwrap();
         for idx in 0..2000i64 {
-            c.insert_one(json!({
+            c.insert_one(serde_json::json!({
                 "ts": idx * 1000,
                 "device": {"id": format!("dev-{}", idx % 10)},
                 "value": idx,
@@ -3124,7 +4612,8 @@ mod tests {
         }
         store.seal_timeseries("metrics").unwrap();
         assert_eq!(
-            c.delete(&json!({"value": {"$lt": 1900}}), true).unwrap(),
+            c.delete(&serde_json::json!({"value": {"$lt": 1900}}), true)
+                .unwrap(),
             1900
         );
         store.close();
@@ -3139,10 +4628,10 @@ mod tests {
 
         let store = super::Store::open(dir.path()).unwrap();
         let c = store.collection("metrics").unwrap();
-        assert_eq!(c.count(&json!({})).unwrap(), 100);
+        assert_eq!(c.count(&serde_json::json!({})).unwrap(), 100);
         let docs = c
             .find(&crate::collection::FindQuery {
-                filter: json!({}),
+                filter: serde_json::json!({}),
                 projection: None,
                 sort: Vec::new(),
                 skip: 0,

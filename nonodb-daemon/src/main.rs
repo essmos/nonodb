@@ -42,6 +42,7 @@ mod retention;
 mod revocation;
 mod s3_import;
 mod server_info;
+mod stream_retention;
 mod wal;
 mod webhooks;
 mod writer;
@@ -416,6 +417,8 @@ async fn run_async() -> Result<(), Box<dyn std::error::Error>> {
     )
     .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
     retention::start(databases.clone(), shutdown_rx.clone())
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    stream_retention::start(databases.clone(), shutdown_rx.clone())
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
     lease::start(data.clone(), shutdown_rx.clone())
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
@@ -1676,6 +1679,7 @@ async fn prometheus_handler(
     let mut heads = Vec::new();
     let mut applied = Vec::new();
     let mut acks = Vec::new();
+    let mut stream_rows: Vec<metrics::StreamMetricRow> = Vec::new();
     let origin = writer::replication_origin();
     for name in state.databases.names().await {
         if let Ok(runtime) = state.databases.get(&name).await {
@@ -1699,10 +1703,51 @@ async fn prometheus_handler(
                     }
                 }
             }
+            if let Ok(streams) = runtime.store.streams() {
+                for def in streams {
+                    let head = runtime.store.stream_head(&def.name).unwrap_or(0);
+                    let Ok(groups) = runtime.store.stream_groups(Some(&def.name)) else {
+                        continue;
+                    };
+                    for group in groups {
+                        let leases = runtime
+                            .store
+                            .stream_leases(&def.name, &group.group)
+                            .unwrap_or_default();
+                        let inflight: u64 = leases
+                            .iter()
+                            .filter(|lease| {
+                                lease.status == nonodb_core::streams::LeaseStatus::Leased
+                            })
+                            .map(|lease| lease.events())
+                            .sum();
+                        // Same unit as `inflight` and `nonodb_stream_dead_letters_total`:
+                        // events, not leased ranges.
+                        let dead: u64 = runtime
+                            .store
+                            .stream_dead_letters(Some(&def.name), Some(&group.group))
+                            .map(|rows| rows.iter().map(|lease| lease.events()).sum())
+                            .unwrap_or(0);
+                        stream_rows.push(metrics::StreamMetricRow {
+                            database: name.clone(),
+                            stream: def.name.clone(),
+                            group: group.group.clone(),
+                            committed_seq: group.committed_seq,
+                            head_seq: head,
+                            lag: nonodb_core::streams::lag(head, group.committed_seq),
+                            inflight,
+                            dead,
+                            redeliveries: group.redeliveries,
+                            truncations: group.truncations,
+                        });
+                    }
+                }
+            }
         }
     }
     let role = replicator::role();
     let mut body = metrics::prometheus();
+    metrics::append_stream_metrics(&mut body, &stream_rows);
     metrics::append_replication_metrics(
         &mut body,
         origin.is_some(),
@@ -2124,17 +2169,28 @@ async fn open_cursor(
 
 /// One frame for the streaming `/v1/watch` endpoint.
 fn watch_frame(sse: bool, event: &Value) -> Bytes {
-    let data = serde_json::to_string(event).unwrap_or_else(|_| "{}".to_string());
+    let mut out = Vec::with_capacity(256);
+    append_watch_frame(&mut out, sse, event);
+    Bytes::from(out)
+}
+
+/// Appends one frame to an existing buffer so a poll page is sent as a single
+/// channel message instead of one message per event.
+fn append_watch_frame(out: &mut Vec<u8>, sse: bool, event: &Value) {
     if sse {
         let id = event
             .get("_id")
             .and_then(Value::as_str)
             .unwrap_or_default()
             .replace(['\r', '\n'], "");
-        Bytes::from(format!("event: message\nid: {id}\ndata: {data}\n\n"))
-    } else {
-        Bytes::from(format!("{data}\n"))
+        out.extend_from_slice(b"event: message\nid: ");
+        out.extend_from_slice(id.as_bytes());
+        out.extend_from_slice(b"\ndata: ");
     }
+    if serde_json::to_writer(&mut *out, event).is_err() {
+        out.extend_from_slice(b"{}");
+    }
+    out.extend_from_slice(if sse { b"\n\n" } else { b"\n" });
 }
 
 fn watch_control(sse: bool, name: &str, value: &Value) -> Bytes {
@@ -2423,16 +2479,18 @@ async fn watch_stream_loop(
         });
         if !events.is_empty() {
             let mut sent = 0usize;
+            let mut batch: Vec<u8> = Vec::with_capacity(events.len() * 160);
             for event in &events {
                 let Some(event) = thresholds.apply(event) else {
                     continue;
                 };
-                if tx.send(Ok(watch_frame(sse, &event))).await.is_err() {
-                    return Ok(());
-                }
+                append_watch_frame(&mut batch, sse, &event);
                 sent += 1;
             }
             if sent > 0 {
+                if tx.send(Ok(Bytes::from(batch))).await.is_err() {
+                    return Ok(());
+                }
                 metrics::add(&metrics::WATCH_EVENTS, sent as u64);
                 last_write = Instant::now();
             }
@@ -2456,7 +2514,12 @@ async fn watch_stream_loop(
             metrics::inc(&metrics::WATCH_HEARTBEATS);
             last_write = Instant::now();
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Wake as soon as the writer commits, with the poll interval as an
+        // upper bound so a missed notification cannot stall the stream.
+        tokio::select! {
+            _ = live::stream_notify().notified() => {}
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
     }
 }
 
@@ -2578,6 +2641,9 @@ async fn watch_stream_inner(
         once,
         event_type,
         name,
+        group,
+        member,
+        lease_ms,
     } = req
     else {
         let err = ApiError {
@@ -2775,10 +2841,75 @@ async fn watch_stream_inner(
         .get(ACCEPT)
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.contains("text/event-stream"));
+    if mode.as_deref() == Some("group") || group.is_some() {
+        let group = match group {
+            Some(group) => group,
+            None => {
+                let err = ApiError {
+                    code: "invalid_request".into(),
+                    message: "group mode requires `group`".into(),
+                };
+                audit_error(
+                    &state,
+                    &connection,
+                    principal.name(),
+                    audit_op,
+                    &audit_collections,
+                    &err,
+                    started,
+                    audit_needed,
+                );
+                return respond(Err(err)).into_response();
+            }
+        };
+        let member = member.unwrap_or_else(|| "default".to_string());
+        let lease_ms = lease_ms.unwrap_or(60_000).clamp(1_000, 3_600_000);
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
+        metrics::inc(&metrics::READ_OPS);
+        metrics::inc(&metrics::WATCH_STREAMS);
+        metrics::inc(&metrics::WATCH_ACTIVE);
+        let task_state = state.clone();
+        let task_coll = coll.clone();
+        let audit_connection = connection.clone();
+        let audit_principal = principal.name().to_string();
+        tokio::spawn(async move {
+            let result = watch_group_stream_loop(
+                task_state.clone(),
+                coll,
+                group,
+                member,
+                lease_ms,
+                limit,
+                types,
+                filter,
+                projection,
+                heartbeat,
+                deadline,
+                sse,
+                tx,
+            )
+            .await;
+            metrics::sub(&metrics::WATCH_ACTIVE, 1);
+            if audit_needed {
+                if let Some(audit) = &task_state.audit {
+                    audit.record(
+                        &audit_principal,
+                        audit_connection.source.as_str(),
+                        audit_connection.peer.as_deref(),
+                        "watch_stream",
+                        &[&task_coll],
+                        result.is_ok(),
+                        result.as_ref().err().map(|err| err.code.as_str()),
+                        started.elapsed().as_secs_f64() * 1000.0,
+                        None,
+                    );
+                }
+            }
+        });
+        return stream_response(rx, sse);
+    }
+
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
-    let stream = futures_util::stream::unfold(rx, |mut rx| async move {
-        rx.recv().await.map(|item| (item, rx))
-    });
 
     metrics::inc(&metrics::READ_OPS);
     metrics::inc(&metrics::WATCH_STREAMS);
@@ -2825,24 +2956,7 @@ async fn watch_stream_inner(
         }
     });
 
-    let content_type = if sse {
-        "text/event-stream"
-    } else {
-        "application/x-ndjson"
-    };
-    let mut response = Body::from_stream(stream).into_response();
-    response.headers_mut().insert(
-        axum::http::header::CONTENT_TYPE,
-        HeaderValue::from_static(content_type),
-    );
-    response
-        .headers_mut()
-        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    response.headers_mut().insert(
-        axum::http::header::HeaderName::from_static("x-accel-buffering"),
-        HeaderValue::from_static("no"),
-    );
-    response
+    stream_response(rx, sse)
 }
 
 async fn exec(
@@ -2858,6 +2972,10 @@ async fn exec(
     let collections = req.collections();
     let read_only = req.is_read_only();
     let operation = req.op_name();
+    let commit_target = match &req {
+        Request::CommitStreamGroup { coll, group, .. } => Some((coll.clone(), group.clone())),
+        _ => None,
+    };
     let response = exec_inner(
         State(state),
         Extension(connection),
@@ -2866,6 +2984,11 @@ async fn exec(
         Json(req),
     )
     .await;
+    if let (Some((coll, group)), Some(error)) = (&commit_target, response.1 .0.error.as_ref()) {
+        if matches!(error.code.as_str(), "stale_lease" | "commit_out_of_order") {
+            metrics::record_stream_commit_failure(&database, coll, group);
+        }
+    }
     // Do not create per-collection series for unauthenticated/unauthorized
     // names. The global request/error counters still see those attempts.
     if response.0 != StatusCode::UNAUTHORIZED && response.0 != StatusCode::FORBIDDEN {
@@ -3051,6 +3174,9 @@ async fn exec_inner(
             overlap_ms: _,
             threshold,
             mode,
+            group,
+            member,
+            lease_ms,
             ..
         } => {
             if mode.as_deref() == Some("live") {
@@ -3064,6 +3190,120 @@ async fn exec_inner(
                     code: "invalid_query".into(),
                     message: "threshold is only supported by /v1/watch streaming".into(),
                 }));
+            }
+            if mode.as_deref() == Some("group") || group.is_some() {
+                let group = match group {
+                    Some(group) => group,
+                    None => {
+                        return respond(Err(ApiError {
+                            code: "invalid_request".into(),
+                            message: "group mode requires `group`".into(),
+                        }))
+                    }
+                };
+                let member = member.unwrap_or_else(|| "default".to_string());
+                let lease_ms = lease_ms.unwrap_or(60_000).clamp(1_000, 3_600_000);
+                let limit = limit.unwrap_or(100).clamp(1, 1_000);
+                let timeout_ms = timeout_ms.unwrap_or(1_000).min(25_000);
+                let types = types.unwrap_or_default();
+                let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+                loop {
+                    let claim =
+                        match claim_lease(&state, &coll, &group, &member, limit, lease_ms).await {
+                            Ok(value) => value,
+                            Err(err) => return respond(Err(err)),
+                        };
+                    if let Some(claim) = claim {
+                        let store = state.store.clone();
+                        let auth = vault_auth.clone();
+                        let coll_now = coll.clone();
+                        let types_now = types.clone();
+                        let filter_now = filter.clone();
+                        let projection_now = projection.clone();
+                        let joined = tokio::task::spawn_blocking(move || {
+                            watch_seq_range(
+                                &store,
+                                &coll_now,
+                                auth.as_ref(),
+                                claim.from_seq,
+                                claim.to_seq,
+                                &types_now,
+                                filter_now.as_ref(),
+                                projection_now.as_ref(),
+                            )
+                        });
+                        let events = match joined.await {
+                            Ok(Ok(events)) => events,
+                            Ok(Err(err)) => return respond(Err(err)),
+                            Err(e) => {
+                                return respond(Err(ApiError::internal(format!("join error: {e}"))))
+                            }
+                        };
+                        metrics::inc(&metrics::READ_OPS);
+                        metrics::add(&metrics::WATCH_EVENTS, events.len() as u64);
+                        metrics::add(&metrics::STREAM_CLAIMS, 1);
+                        if events.is_empty() {
+                            // Everything in this range was filtered out for this
+                            // member; acknowledge so the group advances instead
+                            // of redelivering a batch nobody can consume.
+                            if let Err(err) = commit_filtered_batch(
+                                &state,
+                                &coll,
+                                &group,
+                                claim.to_seq,
+                                &claim.lease_id,
+                            )
+                            .await
+                            {
+                                return respond(Err(err));
+                            }
+                            if Instant::now() >= deadline {
+                                metrics::inc(&metrics::READ_OPS);
+                                metrics::inc(&metrics::WATCH_TIMEOUTS);
+                                return respond(Ok(json!({
+                                    "events": [],
+                                    "group": group,
+                                    "member": member,
+                                    "timed_out": true,
+                                    "has_more": false,
+                                })));
+                            }
+                            tokio::select! {
+                                _ = live::stream_notify().notified() => {}
+                                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+                            }
+                            continue;
+                        }
+                        return respond(Ok(json!({
+                            "events": events,
+                            "group": group,
+                            "member": member,
+                            "lease_id": claim.lease_id,
+                            "from_seq": claim.from_seq,
+                            "to_seq": claim.to_seq,
+                            "next_seq": claim.to_seq,
+                            "attempts": claim.attempts,
+                            "max_attempts": claim.max_attempts,
+                            "timed_out": false,
+                            "has_more": false,
+                        })));
+                    }
+                    if Instant::now() >= deadline {
+                        metrics::inc(&metrics::READ_OPS);
+                        metrics::inc(&metrics::WATCH_TIMEOUTS);
+                        return respond(Ok(json!({
+                            "events": [],
+                            "group": group,
+                            "member": member,
+                            "timed_out": true,
+                            "has_more": false,
+                        })));
+                    }
+                    tokio::select! {
+                        _ = live::stream_notify().notified() => {}
+                        _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+                    }
+                }
             }
             let store = state.store.clone();
             let auth = vault_auth.clone();
@@ -3984,6 +4224,41 @@ async fn exec_inner(
             read_result(joined).await
         }
 
+        Request::GetStream { coll } => {
+            let store = state.store.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                let def = store.stream(&coll)?.ok_or_else(|| ApiError {
+                    code: "not_found".into(),
+                    message: format!("stream `{coll}` does not exist"),
+                })?;
+                let head = store.stream_head(&coll)?;
+                Ok::<Value, ApiError>(json!({ "stream": def, "head_seq": head }))
+            });
+            read_result(joined).await
+        }
+
+        Request::ListStreams => {
+            let store = state.store.clone();
+            let joined = tokio::task::spawn_blocking(move || list_streams_value(&store));
+            read_result(joined).await
+        }
+
+        Request::StreamStats { coll } => {
+            let store = state.store.clone();
+            let joined =
+                tokio::task::spawn_blocking(move || stream_stats_value(&store, coll.as_deref()));
+            read_result(joined).await
+        }
+
+        Request::StreamDead { coll, group } => {
+            let store = state.store.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                let dead = store.stream_dead_letters(coll.as_deref(), group.as_deref())?;
+                Ok::<Value, ApiError>(json!({ "dead": dead }))
+            });
+            read_result(joined).await
+        }
+
         Request::GetCollectionMetrics { coll } => {
             respond(Ok(metrics::collection_snapshot(&database, &coll)))
         }
@@ -4405,6 +4680,84 @@ async fn exec_inner(
                     include_after,
                     projection,
                 },
+                Request::CreateStream { coll, retention } => {
+                    WriteReq::CreateStream { coll, retention }
+                }
+                Request::DropStream { coll } => WriteReq::DropStream { coll },
+                Request::CreateStreamGroup {
+                    coll,
+                    group,
+                    start,
+                    max_attempts,
+                } => WriteReq::CreateStreamGroup {
+                    coll,
+                    group,
+                    start,
+                    max_attempts: max_attempts.unwrap_or(5).max(1),
+                },
+                Request::ResetStreamGroup { coll, group, to } => {
+                    WriteReq::ResetStreamGroup { coll, group, to }
+                }
+                Request::DeleteStreamGroup { coll, group } => {
+                    WriteReq::DeleteStreamGroup { coll, group }
+                }
+                Request::CommitStreamGroup {
+                    coll,
+                    group,
+                    seq,
+                    lease_id,
+                } => WriteReq::CommitStreamGroup {
+                    coll,
+                    group,
+                    seq,
+                    lease_id,
+                },
+                Request::ClaimStreamGroup {
+                    coll,
+                    group,
+                    member,
+                    lease_ms,
+                    limit,
+                } => WriteReq::ClaimStreamGroup {
+                    coll,
+                    group,
+                    member,
+                    lease_ms: lease_ms.unwrap_or(60_000),
+                    limit: limit.unwrap_or(100).clamp(1, 1_000),
+                },
+                Request::NackStreamGroup {
+                    coll,
+                    group,
+                    lease_id,
+                    retry_in_ms,
+                } => WriteReq::NackStreamGroup {
+                    coll,
+                    group,
+                    lease_id,
+                    retry_in_ms: retry_in_ms.unwrap_or(0),
+                },
+                Request::PruneStream { coll, batch } => WriteReq::PruneStream {
+                    coll,
+                    batch: batch.unwrap_or(1000).clamp(1, 10_000),
+                },
+                Request::RetryStreamDead {
+                    coll,
+                    group,
+                    from_seq,
+                } => WriteReq::RetryStreamDead {
+                    coll,
+                    group,
+                    from_seq,
+                },
+                Request::DropStreamDead {
+                    coll,
+                    group,
+                    from_seq,
+                } => WriteReq::DropStreamDead {
+                    coll,
+                    group,
+                    from_seq,
+                },
                 Request::CreateSubscription {
                     coll,
                     name,
@@ -4776,6 +5129,76 @@ fn lookup_projection(
     Ok(Some(Value::Object(projection)))
 }
 
+/// Flat stream listing shared by the read handler and the read batch path.
+fn list_streams_value(store: &Store) -> Result<Value, ApiError> {
+    let mut out = Vec::new();
+    for def in store.streams()? {
+        let head = store.stream_head(&def.name)?;
+        let groups = store.stream_groups(Some(&def.name))?.len();
+        out.push(json!({
+            "stream": def.name,
+            "coll": def.coll,
+            "seq_field": def.seq_field,
+            "head_seq": head,
+            "groups": groups,
+            "retention": def.retention,
+            "created_at": def.created_at,
+        }));
+    }
+    Ok(json!({ "streams": out }))
+}
+
+/// Builds `stream_stats` output for one database.
+fn stream_stats_value(store: &Store, coll: Option<&str>) -> Result<Value, ApiError> {
+    let mut out = Vec::new();
+    for def in store.streams()? {
+        if coll.is_some_and(|want| want != def.coll) {
+            continue;
+        }
+        let head = store.stream_head(&def.name)?;
+        let mut groups = Vec::new();
+        for group in store.stream_groups(Some(&def.name))? {
+            let leases = store.stream_leases(&def.name, &group.group)?;
+            let inflight: u64 = leases
+                .iter()
+                .filter(|lease| lease.status == nonodb_core::streams::LeaseStatus::Leased)
+                .map(|lease| lease.events())
+                .sum();
+            let dead_letters = store.stream_dead_letters(Some(&def.name), Some(&group.group))?;
+            // Events, not ranges: the same unit as `inflight`, the dead-letter
+            // metrics, and what an operator would retry.
+            let dead: u64 = dead_letters.iter().map(|lease| lease.events()).sum();
+            let leased_through = leases.iter().map(|lease| lease.to_seq).max().unwrap_or(0);
+            groups.push(json!({
+                "group": group.group,
+                "committed_seq": group.committed_seq,
+                // Derived, not the cached watermark: after a failover the next
+                // claim resumes at the committed offset, not at a claim the old
+                // primary never committed.
+                "next_seq": group.committed_seq.max(leased_through),
+                "head_seq": head,
+                "lag": nonodb_core::streams::lag(head, group.committed_seq),
+                "inflight": inflight,
+                "dead": dead,
+                "dead_ranges": dead_letters.len() as u64,
+                "max_attempts": group.max_attempts,
+                "redeliveries": group.redeliveries,
+                "truncations": group.truncations,
+                "truncated_below": group.truncated_below,
+                "updated_at": group.updated_at,
+            }));
+        }
+        out.push(json!({
+            "stream": def.name,
+            "coll": def.coll,
+            "head_seq": head,
+            "retention": def.retention,
+            "groups": groups,
+        }));
+    }
+    Ok(json!({ "streams": out }))
+}
+
 fn watch_filter(after: &str, types: &[String], filter: Option<&Value>) -> Value {
     let mut clauses = Vec::new();
     if !after.is_empty() {
@@ -4913,6 +5336,356 @@ fn watch_once(
     Ok((events, next, has_more))
 }
 
+/// Submits a write and returns its `Value` result instead of an HTTP response.
+async fn submit_write_value(
+    state: &AppState,
+    req: WriteReq,
+    durability: Durability,
+) -> Result<Value, ApiError> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    metrics::inc(&metrics::WRITE_OPS);
+    metrics::inc(&metrics::QUEUE_LEN);
+    metrics::note_queue();
+    if state
+        .write_tx
+        .send(WriteJob {
+            req,
+            resp: tx,
+            isolated: false,
+            durability,
+        })
+        .is_err()
+    {
+        metrics::sub(&metrics::QUEUE_LEN, 1);
+        return Err(ApiError::internal("writer unavailable"));
+    }
+    match tokio::time::timeout(request_timeout(), rx).await {
+        Ok(Ok(res)) => res,
+        Ok(Err(_)) => Err(ApiError::internal("writer dropped request")),
+        Err(_) => Err(ApiError::timeout()),
+    }
+}
+
+/// A claimed batch: offsets to read and the lease that guards the commit.
+struct StreamClaim {
+    lease_id: String,
+    from_seq: u64,
+    to_seq: u64,
+    attempts: u32,
+    max_attempts: u32,
+}
+
+/// Acknowledges a leased range whose events were all filtered out for this
+/// member.
+///
+/// The filter is part of the member's subscription, so an empty result means
+/// "nothing here for me", not "release the batch". Releasing it would hand the
+/// same range back forever (and eventually dead-letter it) while the group never
+/// advances.
+async fn commit_filtered_batch(
+    state: &AppState,
+    coll: &str,
+    group: &str,
+    to_seq: u64,
+    lease_id: &str,
+) -> Result<(), ApiError> {
+    submit_write_value(
+        state,
+        WriteReq::CommitStreamGroup {
+            coll: coll.to_string(),
+            group: group.to_string(),
+            seq: to_seq,
+            lease_id: Some(lease_id.to_string()),
+        },
+        Durability::Full,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// Claims the next batch of a consumer group for one member.
+async fn claim_lease(
+    state: &AppState,
+    coll: &str,
+    group: &str,
+    member: &str,
+    limit: usize,
+    lease_ms: u64,
+) -> Result<Option<StreamClaim>, ApiError> {
+    // Long-polling consumers call this every few milliseconds. Check first,
+    // read-only, so a caught-up group never opens a write transaction (or
+    // appends a replication entry) just to discover there is nothing to do.
+    let ready = {
+        let store = state.store.clone();
+        let coll = coll.to_string();
+        let group = group.to_string();
+        tokio::task::spawn_blocking(move || store.stream_claim_ready(&coll, &group))
+            .await
+            .map_err(|error| ApiError::internal(error.to_string()))??
+    };
+    if !ready {
+        return Ok(None);
+    }
+    let value = submit_write_value(
+        state,
+        WriteReq::ClaimStreamGroup {
+            coll: coll.to_string(),
+            group: group.to_string(),
+            member: member.to_string(),
+            lease_ms,
+            limit,
+        },
+        Durability::Full,
+    )
+    .await?;
+    if value.is_null() {
+        return Ok(None);
+    }
+    let claim = StreamClaim {
+        lease_id: value
+            .get("lease_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        from_seq: value.get("from_seq").and_then(Value::as_u64).unwrap_or(0),
+        to_seq: value.get("to_seq").and_then(Value::as_u64).unwrap_or(0),
+        attempts: value.get("attempts").and_then(Value::as_u64).unwrap_or(1) as u32,
+        max_attempts: value
+            .get("max_attempts")
+            .and_then(Value::as_u64)
+            .unwrap_or(1) as u32,
+    };
+    Ok(Some(claim))
+}
+
+/// Reads the events of one claimed range, ordered by `_seq`.
+#[allow(clippy::too_many_arguments)]
+fn watch_seq_range(
+    store: &Store,
+    coll: &str,
+    auth: Option<&VaultAuth>,
+    from_seq: u64,
+    to_seq: u64,
+    types: &[String],
+    filter: Option<&Value>,
+    projection: Option<&Value>,
+) -> Result<Vec<Value>, ApiError> {
+    let c = read_collection(store, coll, auth)?;
+    reject_vault_read(&c, auth, "watch on vault collections")?;
+    let mut clauses = vec![json!({"_seq": {"$gte": from_seq, "$lte": to_seq}})];
+    if !types.is_empty() {
+        clauses.push(json!({"type": {"$in": types}}));
+    }
+    if let Some(filter) = filter {
+        if !filter.as_object().is_some_and(|object| object.is_empty()) && !filter.is_null() {
+            clauses.push(filter.clone());
+        }
+    }
+    let limit = to_seq.saturating_sub(from_seq).saturating_add(1);
+    let query = FindQuery {
+        filter: if clauses.len() == 1 {
+            clauses.pop().unwrap_or_else(|| json!({}))
+        } else {
+            json!({"$and": clauses})
+        },
+        projection: watch_projection(projection),
+        sort: vec![("_seq".to_string(), 1)],
+        skip: 0,
+        limit: Some(limit.min(u64::from(u32::MAX)) as usize),
+        comment: None,
+        max_time_ms: None,
+        hint: None,
+    };
+    Ok(c.find(&query)?)
+}
+
+/// Builds the streaming HTTP response for an NDJSON or SSE stream.
+fn stream_response(
+    rx: tokio::sync::mpsc::Receiver<Result<Bytes, std::io::Error>>,
+    sse: bool,
+) -> Response {
+    let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|item| (item, rx))
+    });
+    let content_type = if sse {
+        "text/event-stream"
+    } else {
+        "application/x-ndjson"
+    };
+    let mut response = Body::from_stream(stream).into_response();
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        HeaderValue::from_static(content_type),
+    );
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response.headers_mut().insert(
+        axum::http::header::HeaderName::from_static("x-accel-buffering"),
+        HeaderValue::from_static("no"),
+    );
+    response
+}
+
+/// Continuous group stream: claims batches, delivers them, and waits for the
+/// member to commit before claiming the next one (at most one in-flight batch).
+#[allow(clippy::too_many_arguments)]
+async fn watch_group_stream_loop(
+    state: AppState,
+    coll: String,
+    group: String,
+    member: String,
+    lease_ms: u64,
+    limit: usize,
+    types: Vec<String>,
+    filter: Value,
+    projection: Option<Value>,
+    heartbeat: Duration,
+    deadline: Option<Instant>,
+    sse: bool,
+    tx: tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
+) -> Result<(), ApiError> {
+    let mut last_write = Instant::now();
+    loop {
+        if tx.is_closed() {
+            return Ok(());
+        }
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Ok(());
+        }
+        let claim = claim_lease(&state, &coll, &group, &member, limit, lease_ms).await?;
+        if let Some(claim) = claim {
+            metrics::add(&metrics::STREAM_CLAIMS, 1);
+            // Read first: a range that is entirely filtered out must be
+            // acknowledged, not held under a lease the client never sees.
+            let store_now = state.store.clone();
+            let coll_now = coll.clone();
+            let types_now = types.clone();
+            let filter_now = filter.clone();
+            let projection_now = projection.clone();
+            let (from_seq, to_seq) = (claim.from_seq, claim.to_seq);
+            let joined = tokio::task::spawn_blocking(move || {
+                watch_seq_range(
+                    &store_now,
+                    &coll_now,
+                    None,
+                    from_seq,
+                    to_seq,
+                    &types_now,
+                    Some(&filter_now),
+                    projection_now.as_ref(),
+                )
+            });
+            let events = match joined.await {
+                Ok(Ok(events)) => events,
+                Ok(Err(err)) => {
+                    let _ = tx
+                        .send(Ok(watch_control(sse, "error", &json!({"error": err}))))
+                        .await;
+                    return Err(err);
+                }
+                Err(e) => {
+                    let err = ApiError::internal(format!("join error: {e}"));
+                    let _ = tx
+                        .send(Ok(watch_control(sse, "error", &json!({"error": err}))))
+                        .await;
+                    return Err(err);
+                }
+            };
+            if events.is_empty() {
+                commit_filtered_batch(&state, &coll, &group, claim.to_seq, &claim.lease_id).await?;
+                continue;
+            }
+            let control = json!({
+                "mode": "group",
+                "group": group,
+                "member": member,
+                "lease_id": claim.lease_id,
+                "from_seq": claim.from_seq,
+                "to_seq": claim.to_seq,
+                "attempts": claim.attempts,
+                "max_attempts": claim.max_attempts,
+            });
+            if tx
+                .send(Ok(watch_control(sse, "group", &control)))
+                .await
+                .is_err()
+            {
+                return Ok(());
+            }
+            let mut batch: Vec<u8> = Vec::with_capacity(events.len() * 160);
+            for event in &events {
+                append_watch_frame(&mut batch, sse, event);
+            }
+            if !events.is_empty() {
+                if tx.send(Ok(Bytes::from(batch))).await.is_err() {
+                    return Ok(());
+                }
+                metrics::add(&metrics::WATCH_EVENTS, events.len() as u64);
+                last_write = Instant::now();
+            }
+
+            // Hold the connection until the member commits, nacks, or the lease
+            // expires; then claim the next batch.
+            loop {
+                if tx.is_closed() {
+                    return Ok(());
+                }
+                let store_now = state.store.clone();
+                let coll_now = coll.clone();
+                let group_now = group.clone();
+                let from_now = claim.from_seq;
+                let joined = tokio::task::spawn_blocking(move || {
+                    store_now.stream_lease(&coll_now, &group_now, from_now)
+                });
+                let held = match joined.await {
+                    Ok(Ok(lease)) => lease
+                        .map(|lease| lease.status == nonodb_core::streams::LeaseStatus::Leased)
+                        .unwrap_or(false),
+                    _ => false,
+                };
+                if !held {
+                    break;
+                }
+                let now = Instant::now();
+                if last_write.elapsed() >= heartbeat {
+                    let value = json!({"heartbeat": true, "ts_ms": now_ms()});
+                    if tx
+                        .send(Ok(watch_control(sse, "heartbeat", &value)))
+                        .await
+                        .is_err()
+                    {
+                        return Ok(());
+                    }
+                    metrics::inc(&metrics::WATCH_HEARTBEATS);
+                    last_write = now;
+                }
+                tokio::select! {
+                    _ = live::stream_notify().notified() => {}
+                    _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+                }
+            }
+            continue;
+        }
+        if last_write.elapsed() >= heartbeat {
+            let value = json!({"heartbeat": true, "ts_ms": now_ms()});
+            if tx
+                .send(Ok(watch_control(sse, "heartbeat", &value)))
+                .await
+                .is_err()
+            {
+                return Ok(());
+            }
+            metrics::inc(&metrics::WATCH_HEARTBEATS);
+            last_write = Instant::now();
+        }
+        tokio::select! {
+            _ = live::stream_notify().notified() => {}
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+    }
+}
+
 /// Returns `(truncated, oldest_retained_id)` when `after` is no longer present
 /// and events older than it may have expired or been deleted.
 fn watch_status(
@@ -5003,6 +5776,9 @@ fn cacheable(req: &Request) -> bool {
             | Request::GetCollectionTimeSeries { .. }
             | Request::GetCollectionHistory { .. }
             | Request::GetCollectionEvents { .. }
+            | Request::GetStream { .. }
+            | Request::ListStreams
+            | Request::StreamStats { .. }
             | Request::ListSubscriptions { .. }
             | Request::History { .. }
             | Request::GetVersion { .. }
@@ -5417,6 +6193,18 @@ fn execute_read(
                 "projection": config.projection,
             }))
         }
+        Request::GetStream { coll } => {
+            let def = store.stream(&coll)?.ok_or_else(|| ApiError {
+                code: "not_found".into(),
+                message: format!("stream `{coll}` does not exist"),
+            })?;
+            Ok(json!({ "stream": def, "head_seq": store.stream_head(&coll)? }))
+        }
+        Request::ListStreams => list_streams_value(store),
+        Request::StreamStats { coll } => stream_stats_value(store, coll.as_deref()),
+        Request::StreamDead { coll, group } => Ok(json!({
+            "dead": store.stream_dead_letters(coll.as_deref(), group.as_deref())?
+        })),
         Request::GetCollectionMetrics { coll } => Ok(metrics::collection_snapshot(database, &coll)),
         Request::DatabaseStats => Err(ApiError {
             code: "invalid_query".into(),
@@ -5695,6 +6483,28 @@ fn flatten_join(
     }
 }
 
+#[cfg(test)]
+mod stream_error_status_tests {
+    use super::*;
+
+    fn status(code: &str) -> StatusCode {
+        error_status(&ApiError {
+            code: code.into(),
+            message: "x".into(),
+        })
+    }
+
+    #[test]
+    fn consumer_protocol_errors_are_not_server_faults() {
+        assert_eq!(status("stale_lease"), StatusCode::CONFLICT);
+        assert_eq!(status("commit_out_of_order"), StatusCode::CONFLICT);
+        assert_eq!(status("stream_truncated"), StatusCode::GONE);
+        assert_eq!(status("invalid_query"), StatusCode::BAD_REQUEST);
+        // Unknown codes stay server faults.
+        assert_eq!(status("weird"), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+}
+
 pub(crate) fn error_status(err: &ApiError) -> StatusCode {
     match err.code.as_str() {
         "duplicate_key"
@@ -5715,6 +6525,9 @@ pub(crate) fn error_status(err: &ApiError) -> StatusCode {
         | "vault_profile_immutable"
         | "invalid_collection_profile" => StatusCode::BAD_REQUEST,
         "not_found" => StatusCode::NOT_FOUND,
+        // Expected consumer-protocol outcomes, not server faults.
+        "stale_lease" | "commit_out_of_order" => StatusCode::CONFLICT,
+        "stream_truncated" => StatusCode::GONE,
         "database_limit" => StatusCode::SERVICE_UNAVAILABLE,
         "database_busy" => StatusCode::CONFLICT,
         "wal_full" | "quota_exceeded" => StatusCode::INSUFFICIENT_STORAGE,

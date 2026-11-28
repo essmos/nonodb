@@ -41,6 +41,7 @@ pub mod search_compat;
 pub mod search_segment;
 pub mod sql;
 pub mod store;
+pub mod streams;
 pub mod subscriptions;
 pub mod timeseries;
 pub mod ttl;

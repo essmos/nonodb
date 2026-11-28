@@ -341,6 +341,25 @@ cooldown, HMAC secret environment variable, request timeout, custom headers, and
 max attempts. Filters and aggregates are evaluated by the daemon worker, never
 in the writer. See [Asynchronous webhooks](webhooks.md).
 
+### Streams
+
+The **Streams** tab manages server-side offsets and consumer groups:
+
+- **Consumer groups** — committed offset, stream head, lag, in-flight events,
+  dead letters in both units (`ev / rng`), attempt budget, and a truncation
+  marker; reset a group to `earliest`/`latest`, or delete it. Resetting,
+  deleting, and pruning ask for confirmation because they move or drop
+  unprocessed events;
+- **Streams** — stream name, collection, head offset, group count, retention
+  settings, and **Prune now** for one retention pass;
+- **Dead letters** — list a collection's dead-lettered batches, retry one (the
+  attempt counter resets) or drop it;
+- **Define a stream** and **Create a group** forms, including `max_events`,
+  `max_age_ms`, `min_seq_keep`, start position, and `max_attempts`.
+
+A group that stops committing pins retention, so lag is also a disk-growth
+signal. See [Streams](streams.md).
+
 ### Graph
 
 The **Graph** tab configures a graph on a node collection and explores it:
@@ -651,7 +670,7 @@ docker volume create nonodb-replica-run
 docker run --rm \
   -v nonodb-replica-data:/var/lib/nonodb \
   -e NONODB_AUTH_FILE=/var/lib/nonodb/auth.json \
-  ghcr.io/essmos/nonodb:0.34.0 \
+  ghcr.io/essmos/nonodb:0.35.0 \
   nonodb-cli auth init
 
 docker run -d --name nonodb-replica \
@@ -663,7 +682,7 @@ docker run -d --name nonodb-replica \
   -e NONODB_REPLICATION_ROLE=replica \
   -e NONODB_REPLICATION_NODE_ID=replica-docker \
   -e NONODB_REPLICATION_ADVERTISE_URL=http://DOCKER_HOST_IP:7912 \
-  ghcr.io/essmos/nonodb:0.34.0
+  ghcr.io/essmos/nonodb:0.35.0
 
 docker exec nonodb-replica nonodb-cli replication join \
   http://PRIMARY_HOST:7878 PAIRING-CODE
@@ -773,7 +792,7 @@ docker run -d --name nonodb-gui \
   -p 127.0.0.1:8787:8787 \
   -v nonodb-run:/run/nonodb \
   -e NONODB_SOCK=/run/nonodb/nonodb.sock \
-  ghcr.io/essmos/nonodb:0.34.0 \
+  ghcr.io/essmos/nonodb:0.35.0 \
   nonodb-cli gui --host 0.0.0.0 --port 8787 --allow-remote --no-open
 ```
 

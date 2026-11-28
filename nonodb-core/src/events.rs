@@ -217,6 +217,44 @@ pub fn new_event_id() -> String {
     String::from_utf8_lossy(&chars).into_owned()
 }
 
+/// Millisecond timestamp embedded in a 26-character ULID-style id.
+pub fn id_timestamp_ms(id: &str) -> Option<i64> {
+    const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    if id.len() != 26 {
+        return None;
+    }
+    let mut value: u128 = 0;
+    for byte in id.as_bytes() {
+        let digit = CROCKFORD
+            .iter()
+            .position(|candidate| candidate.eq_ignore_ascii_case(byte))?;
+        value = (value << 5) | digit as u128;
+    }
+    let timestamp = (value >> 80) & ((1u128 << 48) - 1);
+    Some(timestamp as i64)
+}
+
+/// Creation time of a document in epoch milliseconds.
+///
+/// Prefers an explicit numeric `created_at` and falls back to the timestamp
+/// embedded in an event id. Returns `None` when neither is available: age
+/// retention must treat unknown age as "not old" rather than delete blindly.
+pub fn document_created_at_ms(doc: &Value) -> Option<i64> {
+    match doc.get("created_at") {
+        Some(Value::Number(number)) => number.as_i64().or_else(|| {
+            number
+                .as_f64()
+                .filter(|value| value.is_finite())
+                .map(|value| value as i64)
+        }),
+        Some(Value::String(text)) => text.parse::<i64>().ok(),
+        _ => doc
+            .get("_id")
+            .and_then(Value::as_str)
+            .and_then(id_timestamp_ms),
+    }
+}
+
 #[cfg(test)]
 mod id_tests {
     use super::*;

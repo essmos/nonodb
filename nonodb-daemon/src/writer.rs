@@ -370,7 +370,7 @@ fn run_batch(store: &Store, cache: &QueryCache, quota: &Quota, jobs: Vec<WriteJo
                     // The transaction is committed and visible; only durability
                     // failed. Invalidate reads and dispatch live events anyway.
                     cache.invalidate();
-                    live::dispatch_pending();
+                    live::after_commit();
                     let err = ApiError::from(e);
                     for job in jobs {
                         let _ = job.resp.send(Err(err.clone()));
@@ -380,7 +380,7 @@ fn run_batch(store: &Store, cache: &QueryCache, quota: &Quota, jobs: Vec<WriteJo
             }
             metrics::add(&metrics::COMMIT_NS, started.elapsed().as_nanos() as u64);
             cache.invalidate();
-            live::dispatch_pending();
+            live::after_commit();
             for (job, res) in jobs.into_iter().zip(results) {
                 let _ = job.resp.send(res);
             }
@@ -454,14 +454,14 @@ fn run_single(store: &Store, cache: &QueryCache, quota: &Quota, job: WriteJob) {
                     if sync {
                         if let Err(e) = store.force_sync() {
                             cache.invalidate();
-                            live::dispatch_pending();
+                            live::after_commit();
                             let _ = job.resp.send(Err(ApiError::from(e)));
                             return;
                         }
                     }
                     metrics::add(&metrics::COMMIT_NS, started.elapsed().as_nanos() as u64);
                     cache.invalidate();
-                    live::dispatch_pending();
+                    live::after_commit();
                     let _ = job.resp.send(Ok(value));
                 }
                 Err(e) => {
@@ -1279,6 +1279,223 @@ fn execute(
                 });
             }
             Ok(json!({ "subscription": out }))
+        }
+        WriteReq::CreateStream { coll, retention } => {
+            let mut def = nonodb_core::streams::StreamDef::new(coll.clone(), coll.clone());
+            def.retention = retention.clone();
+            // Creating a stream on a collection that does not exist yet is a
+            // normal bootstrap step; create it as a standard collection instead
+            // of failing with "collection does not exist".
+            if store.collection_profile_in_rw(wtxn, coll)?.is_none() {
+                store.create_collection_with_ttl_and_purge_in(
+                    wtxn,
+                    coll,
+                    nonodb_core::vault::CollectionProfile::Standard,
+                    None,
+                    None,
+                )?;
+                // A replica applying this transaction starts without the
+                // collection; create it first or `set_stream_in` fails there.
+                replication.capture_op(ReplicationOp::CollectionCreate {
+                    name: coll.clone(),
+                    profile: "standard".into(),
+                    ttl_seconds: None,
+                    ttl_field: None,
+                    ttl_purge_history: None,
+                    timeseries: None,
+                });
+            }
+            store.set_stream_in(wtxn, &def)?;
+            replication.capture_op(ReplicationOp::StreamSet { def: def.clone() });
+            Ok(serde_json::to_value(def).map_err(nonodb_core::Error::from)?)
+        }
+        WriteReq::DropStream { coll } => {
+            let existed = store.drop_stream_in(wtxn, coll)?;
+            if existed {
+                replication.capture_op(ReplicationOp::StreamDrop { name: coll.clone() });
+            }
+            Ok(json!({ "dropped": existed }))
+        }
+        WriteReq::CreateStreamGroup {
+            coll,
+            group,
+            start,
+            max_attempts,
+        } => {
+            let out = store.create_stream_group_in(wtxn, coll, group, *start, *max_attempts)?;
+            replication.capture_op(ReplicationOp::StreamGroupSet { group: out.clone() });
+            Ok(serde_json::to_value(out).map_err(nonodb_core::Error::from)?)
+        }
+        WriteReq::ResetStreamGroup { coll, group, to } => {
+            let out = store.reset_stream_group_in(wtxn, coll, group, *to)?;
+            replication.capture_op(ReplicationOp::StreamGroupClear {
+                stream: coll.clone(),
+                group: group.clone(),
+            });
+            replication.capture_op(ReplicationOp::StreamGroupSet { group: out.clone() });
+            Ok(serde_json::to_value(out).map_err(nonodb_core::Error::from)?)
+        }
+        WriteReq::DeleteStreamGroup { coll, group } => {
+            let deleted = store.delete_stream_group_in(wtxn, coll, group)?;
+            if deleted {
+                replication.capture_op(ReplicationOp::StreamGroupDelete {
+                    stream: coll.clone(),
+                    group: group.clone(),
+                });
+            }
+            Ok(json!({ "deleted": deleted }))
+        }
+        WriteReq::CommitStreamGroup {
+            coll,
+            group,
+            seq,
+            lease_id,
+        } => {
+            let lease_id = lease_id.clone().unwrap_or_default();
+            let lease = store.ack_stream_lease_in(wtxn, coll, group, &lease_id, *seq)?;
+            let out = store
+                .stream_group_in_rw(wtxn, coll, group)?
+                .ok_or_else(|| nonodb_core::Error::Query("stream group vanished".into()))?;
+            replication.capture_op(ReplicationOp::StreamGroupSet { group: out.clone() });
+            Ok(json!({
+                "committed_seq": out.committed_seq,
+                "next_seq": out.next_seq,
+                "from_seq": lease.from_seq,
+                "to_seq": lease.to_seq,
+            }))
+        }
+        WriteReq::ClaimStreamGroup {
+            coll,
+            group,
+            member,
+            lease_ms,
+            limit,
+        } => {
+            let before = store.stream_group_in_rw(wtxn, coll, group)?;
+            let mut dead = Vec::new();
+            let out = store.claim_stream_lease_in_with_dead(
+                wtxn, coll, group, member, *limit, *lease_ms, &mut dead,
+            )?;
+            // A lease is node-local ownership: only replicate the group row when
+            // the claim actually moved something. An idle long-poll must not
+            // append a replication entry every few milliseconds.
+            if let Some(group_row) = store.stream_group_in_rw(wtxn, coll, group)? {
+                if before.as_ref() != Some(&group_row) {
+                    replication.capture_op(ReplicationOp::StreamGroupSet { group: group_row });
+                }
+            }
+            for lease in &dead {
+                replication.capture_op(ReplicationOp::StreamLeaseDead {
+                    lease: lease.clone(),
+                });
+            }
+            if !dead.is_empty() {
+                crate::metrics::add(
+                    &crate::metrics::STREAM_DEAD_LETTERS,
+                    dead.iter().map(|lease| lease.events()).sum(),
+                );
+            }
+            Ok(match out {
+                Some(lease) => json!({
+                    "lease_id": lease.lease_id,
+                    "member": lease.member,
+                    "from_seq": lease.from_seq,
+                    "to_seq": lease.to_seq,
+                    "attempts": lease.attempts,
+                    "max_attempts": lease.max_attempts,
+                    "lease_until": lease.lease_until,
+                }),
+                None => Value::Null,
+            })
+        }
+        WriteReq::NackStreamGroup {
+            coll,
+            group,
+            lease_id,
+            retry_in_ms,
+        } => {
+            let lease = store.nack_stream_lease_in(wtxn, coll, group, lease_id, *retry_in_ms)?;
+            let dead = lease.status == nonodb_core::streams::LeaseStatus::Done;
+            crate::metrics::inc(&crate::metrics::STREAM_NACKS);
+            if dead {
+                crate::metrics::add(&crate::metrics::STREAM_DEAD_LETTERS, lease.events());
+                replication.capture_op(ReplicationOp::StreamLeaseDead {
+                    lease: lease.clone(),
+                });
+            }
+            if let Some(group_row) = store.stream_group_in_rw(wtxn, coll, group)? {
+                replication.capture_op(ReplicationOp::StreamGroupSet { group: group_row });
+            }
+            Ok(json!({
+                "from_seq": lease.from_seq,
+                "to_seq": lease.to_seq,
+                "attempts": lease.attempts,
+                "dead": dead,
+            }))
+        }
+        WriteReq::PruneStream { coll, batch } => {
+            // Pruning can set `truncated_below` (and bump `truncations`) on group
+            // rows; replicas must see those markers, not just the deletions.
+            let before: Vec<nonodb_core::streams::StreamGroup> = store.stream_groups(Some(coll))?;
+            let dropped = store.prune_stream_in(wtxn, coll, *batch)?;
+            for (id, before) in &dropped {
+                replication.capture(coll, "delete", id, Some(before), None);
+            }
+            for after in store.stream_groups(Some(coll))? {
+                let changed = before
+                    .iter()
+                    .find(|row| row.group == after.group && row.stream == after.stream)
+                    .is_none_or(|row| row.truncated_below != after.truncated_below);
+                if changed {
+                    replication.capture_op(ReplicationOp::StreamGroupSet { group: after });
+                }
+            }
+            Ok(json!({ "deleted": dropped.len() }))
+        }
+        WriteReq::RecoverStreamLeases { stream, group } => {
+            let before = store.stream_group_in_rw(wtxn, stream, group)?;
+            let (recovered, dead) = store.recover_stream_leases_in(wtxn, stream, group)?;
+            if let Some(group_row) = store.stream_group_in_rw(wtxn, stream, group)? {
+                if before.as_ref().map(|row| row.committed_seq) != Some(group_row.committed_seq) {
+                    replication.capture_op(ReplicationOp::StreamGroupSet { group: group_row });
+                }
+            }
+            for lease in &dead {
+                replication.capture_op(ReplicationOp::StreamLeaseDead {
+                    lease: lease.clone(),
+                });
+            }
+            Ok(json!({ "recovered": recovered, "dead": dead.len() }))
+        }
+        WriteReq::RetryStreamDead {
+            coll,
+            group,
+            from_seq,
+        } => {
+            let retried = store.retry_stream_dead_in(wtxn, coll, group, *from_seq)?;
+            if retried {
+                replication.capture_op(ReplicationOp::StreamDeadDelete {
+                    stream: coll.clone(),
+                    group: group.clone(),
+                    from_seq: *from_seq,
+                });
+            }
+            Ok(json!({ "retried": retried }))
+        }
+        WriteReq::DropStreamDead {
+            coll,
+            group,
+            from_seq,
+        } => {
+            let dropped = store.drop_stream_dead_in(wtxn, coll, group, *from_seq)?;
+            if dropped {
+                replication.capture_op(ReplicationOp::StreamDeadDelete {
+                    stream: coll.clone(),
+                    group: group.clone(),
+                    from_seq: *from_seq,
+                });
+            }
+            Ok(json!({ "dropped": dropped }))
         }
         WriteReq::PruneSubscriptions => {
             let removed = store.prune_expired_subscriptions_in(wtxn)?;
@@ -2460,7 +2677,7 @@ mod tests {
             },
         )
         .unwrap();
-        crate::live::dispatch_pending();
+        crate::live::after_commit();
         assert!(
             live_rx.try_recv().is_err(),
             "count threshold not reached yet"
@@ -2474,7 +2691,7 @@ mod tests {
             },
         )
         .unwrap();
-        crate::live::dispatch_pending();
+        crate::live::after_commit();
         let live = live_rx
             .try_recv()
             .expect("live subscription should fire at count >= 2");

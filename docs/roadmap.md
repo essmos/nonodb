@@ -5,7 +5,7 @@ is deliberately out of scope, and where active implementation work is tracked.
 
 ## Current status
 
-The project is at `0.34.0`. It is suitable for local, single-host, and
+The project is at `0.35.0`. It is suitable for local, single-host, and
 primary/replica deployments that need a small, durable, queryable JSON store
 and can accept a single-writer model per database.
 
@@ -61,6 +61,10 @@ Implemented:
   event writes, automatic per-collection insert/update/delete events, optional
   field-change filtering, sortable event ids, per-consumer checkpoints, and
   server-side `watch` long-polling and continuous NDJSON/SSE streaming;
+- streams with writer-assigned `_seq` offsets, durable consumer groups,
+  contiguous range leases shared by several members, expiry-driven redelivery
+  with attempt counters, dead letters that do not block a group, offset-driven
+  retention, and `nonodb_stream_*` metrics;
 - server-side stream filtering by topic and payload, plus count thresholds with
   grouping and time windows;
 - persistent conditional subscriptions with document filters, index-backed
@@ -177,6 +181,13 @@ comparison and practical migration caveats.
   ordinary client processes. `watch` long-polls or streams append-only outbox
   collections; it is not an automatic change stream for arbitrary writes,
   updates, or deletes.
+- Streams are "Redis Streams with a durable offset in the document database",
+  not Kafka: there is no Kafka wire protocol, partition/ISR model, log
+  compaction, or binary record framing. Delivery is at-least-once, so handlers
+  must be idempotent; there is no exactly-once mode. Lag is per group, not per
+  event type. `retention.max_bytes` is accepted but ignored; retention is driven
+  by `max_events`, `max_age_ms`, and the slowest committed group offset. Leases
+  are node-local and not replicated, and partitions are only a future option.
 - TTL read visibility is strict by default.
 - Projection expressions are limited; nested paths, positional `$`, and basic
   `$meta` are supported, but arbitrary computed projection expressions are not.

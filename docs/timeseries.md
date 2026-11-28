@@ -314,11 +314,11 @@ structural time/meta/granularity fields are read-only once rows exist).
 
 The **Indexes** tab works for time-series collections as well. It lists
 secondary, text, fuzzy, and vector indexes and can create or drop them.
-The secondary form accepts comma-separated fields, `include`, `unique`, and
-`geo`; text and fuzzy indexes take one field, and vector indexes also take
-dimensions and a metric. **Reindex all** rebuilds every index type. The form
-does not expose `sparse`, `partialFilterExpression`, or explicit per-field
-`directions`; use the wire API or `create_indexes` for those options.
+The secondary form accepts comma-separated fields, `include`, `unique`,
+`sparse`, `geo`, an optional JSON `partialFilterExpression`, and optional
+per-field `directions` (`1` or `-1`); text and fuzzy indexes take one field,
+and vector indexes also take dimensions and a metric. **Reindex all** rebuilds
+every index type.
 
 The CLI has no dedicated create-index subcommand. It lists secondary indexes
 with `indexes`, rebuilds all index types with `reindex`, and creates indexes
@@ -659,10 +659,9 @@ Reproduce: `ROWS=100000 READS=500 cargo run --release -p nonodb-core --example t
 ### Comparison with TimescaleDB
 
 The same 100k-row workload was loaded into TimescaleDB 2.x (PostgreSQL 16,
-`timescale/timescaledb:latest-pg16`) through the local TCP listener. Timescale
-rows were inserted one statement at a time for the insert sample and in
-1000-row batches for the rest; range/count/aggregate timings include fetching
-the result. NonoDB runs in-process, so its timings exclude a network round trip.
+`timescale/timescaledb:latest-pg16`). Timescale rows were inserted one
+statement at a time for the insert sample and in 1000-row batches for the rest;
+range/count/aggregate timings include fetching the result.
 Storage for TimescaleDB is `hypertable_size` after native compression
 (`segmentby=device`, `orderby=ts DESC`).
 

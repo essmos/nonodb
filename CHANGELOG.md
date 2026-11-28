@@ -30,6 +30,82 @@ Full release notes: https://github.com/essmos/nonodb/releases
   tombstones instead of materializing the collection, so it stays bounded for
   large collections. See `docs/columnar-performance.md` and the
   `columnar_soak` example.
+## v0.35.0 - 2026-11-27
+
+Streams and consumer groups release: writer-assigned `_seq` offsets, durable
+group positions, range leases with redelivery and dead letters, offset-driven
+retention, and CLI/GUI/metrics/docs support. The release also closes the
+failover, authorization, and retention-safety gaps found during review.
+
+- Fix stream failover and authorization: a promoted replica now resumes at the
+  committed offset and redelivers ranges the old primary had claimed but not
+  committed (the claim position is derived from leases instead of the replicated
+  watermark). Consuming a group requires the new `consume:<collection>` scope
+  (`admin` implies it), so a read-only credential can no longer claim a batch,
+  let it expire, and have the janitor dead-letter it. An idle long-poll no longer
+  opens a write transaction or appends a replication entry when the group is
+  caught up.
+- Fix stream retention safety: the age boundary only drops a contiguous prefix
+  that is provably older than `max_age_ms`, using `created_at` (with a ULID `_id`
+  fallback); a missing timestamp or an out-of-order one stops the boundary
+  instead of deleting a fresh event. Streams over time-series or vault
+  collections are rejected instead of delivering nothing. The lease janitor runs
+  only on the primary and through the writer, so its offset advances and dead
+  letters replicate. Consumer errors now return 409 (`stale_lease`,
+  `commit_out_of_order`) and 410 (`stream_truncated`) instead of 500, and the
+  dead-letter gauge counts events like `inflight` (`dead_ranges` added).
+- Fix stream gaps: automatic change events written by the daemon into `_events`
+  (collection event configs and subscriptions) now get `_seq` like direct
+  inserts, so groups deliver the main outbox producer; and a retried dead letter
+  can be committed after the group moved past it (the offset does not rewind).
+- Fix stream correctness: `_seq` is now reserved for updates, pipelines, and
+  find-and-modify (not just inserts), deleting a group drops its leases and dead
+  letters so a recreated group starts clean, and a background maintenance tick
+  (default every 60s, `NONODB_STREAM_PRUNE_INTERVAL=0` disables it) recovers
+  expired leases and enforces retention without extra configuration. A partial
+  commit inside a leased range is now rejected
+  with `commit_out_of_order` (it used to mark the whole range done and skip the
+  remaining events), retention that empties the window now raises
+  `stream_truncated` for a lagging group instead of leasing deleted offsets, and
+  `stream_stats`/`/metrics/prometheus` expose per-group `redeliveries`,
+  `truncations`, and `commit_failures` counters.
+- Add a `docs/use-cases/` section: task-oriented patterns with guarantees,
+  limits and checklists — a financial ledger and payment processing page
+  (per-account streams, atomic double-entry writes, strict per-account
+  execution, idempotent handlers, dead letters, retention, reconciliation),
+  plus "Replacing Redis Streams" and "Replacing Kafka" migration pages with
+  concept mapping, code before/after, migration plans and honest limits.
+- Add stream operations: `nonodb-cli streams list|create|groups|reset|dead|retry|drop|prune`,
+  a Streams page in the local GUI (lag, in-flight, dead letters, reset, prune),
+  and a stream metrics section in `docs/monitoring.md`.
+- Add stream retention driven by offsets: events below the slowest group's
+  committed offset (bounded by `max_events`, `max_age_ms`, and `min_seq_keep`)
+  are dropped in batched, replicated passes (`prune_stream`, or the
+  `NONODB_STREAM_PRUNE_INTERVAL` loop). A group behind the retained window fails
+  with `stream_truncated` and records `truncated_below` instead of skipping
+  events. `retention.max_bytes` is accepted but ignored.
+- Add stream range leases: `watch` with `"mode":"group"` claims a contiguous
+  range for a member, `nack_stream_group` releases it, expired leases are
+  redelivered with an attempt counter, and exhausted ranges become dead letters
+  (`stream_dead`, `retry_stream_dead`, `drop_stream_dead`) that no longer block
+  the group. The committed offset advances only across a contiguous prefix, so
+  several members share one group. `/metrics/prometheus` exposes
+  `nonodb_stream_*` lag, in-flight, and dead-letter series.
+- Add streams with server-side offsets and consumer groups over append-only
+  collections. The writer assigns a reserved `_seq` to every insert in a stream
+  collection; `create_stream`, `create_stream_group`, `watch` with
+  `"mode":"group"`, `commit_stream_group`, `reset_stream_group`,
+  `delete_stream_group`, `get_stream`, `list_streams`, and `stream_stats` expose
+  offsets, lease-fenced commits, and lag. Group reads order by `_seq`, so
+  out-of-order `_id` commits cannot reorder events and no overlap rescan is
+  needed. Retention is stored and validated but not enforced yet; see
+  `docs/streams-groups-plan.md` for the remaining phases.
+
+- Wake continuous `/v1/watch` streams as soon as the writer commits instead of
+  waiting for the idle poll interval, and send one buffered frame per poll page
+  instead of one channel message per event. Delivered-event latency drops from
+  about 52 ms to about 2 ms at p99, and draining a backlog through one stream is
+  roughly 20% faster.
 
 ## v0.34.0 - 2026-11-27
 

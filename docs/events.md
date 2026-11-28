@@ -282,8 +282,10 @@ Helpers:
 Use the daemon-side [`watch`](streams.md) long-poll or the continuous
 `/v1/watch` NDJSON/SSE stream when you want the server to push events to a
 consumer. `watch` returns `_id`-ordered batches with a `next` resume token; the
-stream adds heartbeats and keeps the connection open. Neither replaces the
-checkpointing consumer described below.
+stream adds heartbeats and keeps the connection open. These modes do not store
+an offset; the consumer described below keeps its own checkpoint. For
+server-side offsets and consumer groups, use `watch` with `"mode":"group"`
+(see [streams](streams.md#consumer-groups-and-durable-offsets)).
 
 ```python
 batch = db.collection("_events").watch_once(after=None, timeout_ms=1000)

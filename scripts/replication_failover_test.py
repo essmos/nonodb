@@ -45,7 +45,12 @@ def main() -> int:
         primary_port = free_port()
         replica_port = free_port()
         for name, port, role, extra in [
-            ("primary", primary_port, "primary", {}),
+            (
+                "primary",
+                primary_port,
+                "primary",
+                {"NONODB_REPLICATION_ADVERTISE_URL": f"http://127.0.0.1:{primary_port}"},
+            ),
             (
                 "replica",
                 replica_port,
@@ -74,6 +79,13 @@ def main() -> int:
                 ),
                 NONODB_REPLICATION_VOTER_TOKEN=token,
                 NONODB_REPLICATION_POLL_INTERVAL="1",
+                # The primary needs a live lease to accept writes; the streams
+                # scenario below writes before the promotion.
+                NONODB_REPLICATION_LEASE_INTERVAL="1",
+                NONODB_REPLICATION_LEASE_TTL="3",
+                # Stream janitor runs every second so the dead-letter replication
+                # below completes inside the test window.
+                NONODB_STREAM_PRUNE_INTERVAL="1",
                 NONODB_LOG="warn",
                 **extra,
             )
@@ -100,6 +112,305 @@ def main() -> int:
                 raise RuntimeError(f"{name} did not become healthy")
 
         primary, replica = clients
+
+        def exec_on(client, payload):
+            response = client.post("/v1/exec", headers=headers, json=payload)
+            assert response.status_code == 200, response.text
+            return response.json()["result"]
+
+        def stats_on(client, coll):
+            streams = exec_on(client, {"op": "stream_stats", "coll": coll})["streams"]
+            return streams[0] if streams else None
+
+        # --- streams: leaked claims, janitor replication, and failover ---
+        # The primary only accepts writes once its replication lease is live.
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            if primary.get("/readyz/write").status_code == 200:
+                break
+            time.sleep(0.2)
+        else:
+            raise RuntimeError("primary never became writable")
+        # No `create_collection` first: `create_stream` bootstraps the
+        # collection, and that has to replicate (CollectionCreate + StreamSet).
+        exec_on(primary, {"op": "create_stream", "coll": "ledger"})
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            try:
+                stream = exec_on(replica, {"op": "get_stream", "coll": "ledger"})
+                if stream and stream.get("head_seq") is not None:
+                    break
+            except AssertionError:
+                pass
+            time.sleep(0.2)
+        else:
+            raise RuntimeError("replica never applied the bootstrapped collection/stream")
+        exec_on(
+            primary,
+            {
+                "op": "create_stream_group",
+                "coll": "ledger",
+                "group": "workers",
+                "start": "earliest",
+            },
+        )
+        for n in range(3):
+            exec_on(primary, {"op": "insert", "coll": "ledger", "doc": {"n": n}})
+
+        # A claim that is never committed. The group row replicates, the lease
+        # does not: the promoted replica must deliver this range again.
+        claim = exec_on(
+            primary,
+            {
+                "op": "watch",
+                "coll": "ledger",
+                "mode": "group",
+                "group": "workers",
+                "member": "w1",
+                "limit": 2,
+                "lease_ms": 60_000,
+                "timeout_ms": 100,
+            },
+        )
+        assert (claim["from_seq"], claim["to_seq"]) == (1, 2), claim
+
+        # A range whose lease expires into a dead letter must reach replicas.
+        exec_on(
+            primary,
+            {
+                "op": "create_stream_group",
+                "coll": "ledger",
+                "group": "poison",
+                "start": "earliest",
+                "max_attempts": 1,
+            },
+        )
+        poison = exec_on(
+            primary,
+            {
+                "op": "watch",
+                "coll": "ledger",
+                "mode": "group",
+                "group": "poison",
+                "member": "p1",
+                "limit": 10,
+                "lease_ms": 1_000,
+                "timeout_ms": 100,
+            },
+        )
+        assert (poison["from_seq"], poison["to_seq"]) == (1, 3), poison
+        deadline = time.monotonic() + 20
+        replicated = None
+        while time.monotonic() < deadline:
+            dead = exec_on(
+                replica, {"op": "stream_dead", "coll": "ledger", "group": "poison"}
+            )
+            if dead["dead"]:
+                replicated = dead
+                break
+            time.sleep(0.2)
+        assert replicated, "expired lease was dead-lettered on the primary only"
+        assert replicated["dead"][0]["from_seq"] == 1, replicated
+        replica_poison = [
+            group
+            for group in stats_on(replica, "ledger")["groups"]
+            if group["group"] == "poison"
+        ][0]
+        assert replica_poison["committed_seq"] == 3, replica_poison
+        assert replica_poison["dead"] == 3, replica_poison
+        assert replica_poison["dead_ranges"] == 1, replica_poison
+
+        # --- dead-letter administration replicates ---
+        exec_on(primary, {"op": "create_stream", "coll": "admin_stream"})
+        exec_on(
+            primary,
+            {
+                "op": "create_stream_group",
+                "coll": "admin_stream",
+                "group": "ops",
+                "start": "earliest",
+                "max_attempts": 1,
+            },
+        )
+        for n in range(2):
+            exec_on(primary, {"op": "insert", "coll": "admin_stream", "doc": {"n": n}})
+        lease = exec_on(
+            primary,
+            {
+                "op": "watch",
+                "coll": "admin_stream",
+                "mode": "group",
+                "group": "ops",
+                "member": "a1",
+                "limit": 10,
+                "timeout_ms": 100,
+            },
+        )
+        assert (lease["from_seq"], lease["to_seq"]) == (1, 2), lease
+
+        def dead_count(client, coll, group):
+            return len(
+                exec_on(
+                    client, {"op": "stream_dead", "coll": coll, "group": group}
+                )["dead"]
+            )
+
+        def wait_dead(coll, group, want):
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline:
+                if dead_count(replica, coll, group) == want:
+                    return
+                time.sleep(0.2)
+            raise AssertionError(
+                f"replica dead letters for {coll}:{group} = "
+                f"{dead_count(replica, coll, group)}, want {want}"
+            )
+
+        # nack into a dead letter -> replicated
+        exec_on(
+            primary,
+            {
+                "op": "nack_stream_group",
+                "coll": "admin_stream",
+                "group": "ops",
+                "lease_id": lease["lease_id"],
+            },
+        )
+        wait_dead("admin_stream", "ops", 1)
+
+        # retry -> the dead record disappears on the replica
+        exec_on(
+            primary,
+            {
+                "op": "retry_stream_dead",
+                "coll": "admin_stream",
+                "group": "ops",
+                "from_seq": 1,
+            },
+        )
+        wait_dead("admin_stream", "ops", 0)
+
+        # claim again, let the lease expire into a dead letter, then drop it
+        exec_on(
+            primary,
+            {
+                "op": "watch",
+                "coll": "admin_stream",
+                "mode": "group",
+                "group": "ops",
+                "member": "a2",
+                "limit": 10,
+                "lease_ms": 1_000,
+                "timeout_ms": 100,
+            },
+        )
+        time.sleep(1.3)
+        exec_on(
+            primary,
+            {
+                "op": "watch",
+                "coll": "admin_stream",
+                "mode": "group",
+                "group": "ops",
+                "member": "a3",
+                "limit": 10,
+                "timeout_ms": 100,
+            },
+        )
+        wait_dead("admin_stream", "ops", 1)
+        exec_on(
+            primary,
+            {
+                "op": "drop_stream_dead",
+                "coll": "admin_stream",
+                "group": "ops",
+                "from_seq": 1,
+            },
+        )
+        wait_dead("admin_stream", "ops", 0)
+
+        # --- reset clears leases/dead letters on the replica ---
+        exec_on(
+            primary,
+            {
+                "op": "reset_stream_group",
+                "coll": "admin_stream",
+                "group": "ops",
+                "to": "earliest",
+            },
+        )
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            rows = [
+                group
+                for group in stats_on(replica, "admin_stream")["groups"]
+                if group["group"] == "ops"
+            ]
+            if rows and rows[0]["committed_seq"] == 0 and rows[0]["inflight"] == 0:
+                break
+            time.sleep(0.2)
+        else:
+            raise AssertionError(f"reset did not replicate: {rows}")
+
+        # --- prune replicates, and a late group sees the same truncation ---
+        exec_on(
+            primary,
+            {
+                "op": "create_stream",
+                "coll": "window",
+                "retention": {"max_events": 2},
+            },
+        )
+        for n in range(6):
+            exec_on(primary, {"op": "insert", "coll": "window", "doc": {"n": n}})
+        pruned = exec_on(primary, {"op": "prune_stream", "coll": "window"})
+        assert pruned["deleted"] == 4, pruned
+
+        def window_docs(client):
+            return exec_on(client, {"op": "find", "coll": "window", "query": {}})
+
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            if len(window_docs(replica)) == 2:
+                break
+            time.sleep(0.2)
+        else:
+            raise AssertionError(
+                f"prune did not replicate: {len(window_docs(replica))} documents"
+            )
+
+        exec_on(
+            primary,
+            {
+                "op": "create_stream_group",
+                "coll": "window",
+                "group": "slow",
+                "start": "earliest",
+            },
+        )
+        truncation_probe = {
+            "op": "watch",
+            "coll": "window",
+            "mode": "group",
+            "group": "slow",
+            "member": "late",
+            "limit": 5,
+            "timeout_ms": 100,
+        }
+        # Claims are writes, so only the primary can answer before promotion; the
+        # promoted replica is checked below.
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            groups = stats_on(replica, "window")
+            if groups and any(g["group"] == "slow" for g in groups["groups"]):
+                break
+            time.sleep(0.2)
+        else:
+            raise AssertionError(f"group create did not replicate: {groups}")
+        probe = primary.post("/v1/exec", headers=headers, json=truncation_probe)
+        assert probe.status_code == 410, probe.text
+        assert probe.json()["error"]["code"] == "stream_truncated", probe.text
+
         promoted = replica.post(
             "/v1/replication/promote",
             headers=headers,
@@ -140,6 +451,36 @@ def main() -> int:
         assert blocked.status_code == 403, blocked.text
         assert blocked.json()["error"]["code"] == "read_only", blocked.text
         assert blocked.headers.get("location") == f"http://127.0.0.1:{replica_port}"
+
+        # The promoted node never saw the lease for `1..=2`, so its next claim
+        # resumes at the committed offset and redelivers the range.
+        resumed = exec_on(
+            replica,
+            {
+                "op": "watch",
+                "coll": "ledger",
+                "mode": "group",
+                "group": "workers",
+                "member": "w2",
+                "limit": 2,
+                "lease_ms": 60_000,
+                "timeout_ms": 100,
+            },
+        )
+        assert (resumed["from_seq"], resumed["to_seq"]) == (1, 2), (
+            "a promoted replica must redeliver claimed-but-uncommitted ranges: "
+            f"{resumed}"
+        )
+        # Dead letters replicated above are still visible on the new primary.
+        still_dead = exec_on(
+            replica, {"op": "stream_dead", "coll": "ledger", "group": "poison"}
+        )
+        assert still_dead["dead"], still_dead
+        # The administration paths on the promoted node see the replicated state.
+        assert dead_count(replica, "admin_stream", "ops") == 0
+        probe = replica.post("/v1/exec", headers=headers, json=truncation_probe)
+        assert probe.status_code == 410, probe.text
+        assert probe.json()["error"]["code"] == "stream_truncated", probe.text
 
         print(json.dumps({"ok": True, "new_epoch": role["epoch"], "old_role": old["role"]}))
         return 0

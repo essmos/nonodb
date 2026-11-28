@@ -11,10 +11,35 @@
 [![CI](https://github.com/essmos/nonodb/actions/workflows/ci.yml/badge.svg)](https://github.com/essmos/nonodb/actions/workflows/ci.yml)
 [![Release](https://github.com/essmos/nonodb/actions/workflows/release.yml/badge.svg)](https://github.com/essmos/nonodb/actions/workflows/release.yml)
 
-**The all-in-one JSON document database for small VMs and edge boxes.**
+**One process for six everyday database roles.**
 
-**Idle daemon: ~5 MB RAM** with 1M documents and three indexes; crash-safe
+NonoDB is the all-in-one JSON document database for small VMs and edge boxes:
+documents, SQL, full-text search, vector search, graph traversal, and
+time-series in one Rust daemon. One backup, one auth model, no JVM and no
+sidecar database servers.
+
+**Verified RAM:** ~5 MB idle with 1M documents and three indexes; ~26 MiB
+process RSS in the 206M-row benchmark (OS page cache excluded). Crash-safe
 LMDB storage and production features in one binary.
+
+### What it replaces
+
+| Everyday role | Usually a separate tool | Coverage in NonoDB | Not a drop-in replacement for |
+|---|---|---|---|
+| Documents | MongoDB Community | CRUD, indexes, aggregation, TTL, watch, MongoDB wire subset | the full MongoDB ecosystem and every wire-protocol feature |
+| SQL | PostgreSQL | `SELECT`, `INSERT`, `UPDATE`, `DELETE` over one collection | joins, cross-collection transactions, and PostgreSQL extensions |
+| Search | Elasticsearch / OpenSearch | BM25 full-text, fuzzy, filters | cluster features, every analyzer, and search-time aggregation |
+| Vectors | Qdrant / Milvus | exact/ANN vector search, metrics, hybrid ranking | advanced quantization and large-scale sharding |
+| Graph | Neo4j Community | adjacency traversal, shortest paths, analytics, read-only Cypher | write Cypher, APOC, and the full Neo4j ecosystem |
+| Time-series | TimescaleDB / InfluxDB | time-series profile, columnar buckets, retention, rollups | the maturity and scale of dedicated time-series databases |
+
+Coverage means everyday workloads, not full API parity. One process replaces
+six separate operational surfaces, not six complete product ecosystems.
+
+Streams and consumer groups add a durable event log on an ordinary collection:
+useful for simple Redis Streams-style work queues and fan-out, but not a full
+broker with topics, partitions, or the Kafka ecosystem. See
+[Streams and consumer groups](docs/streams.md).
 
 One Rust daemon for small VMs and edge boxes: owns the LMDB files, speaks
 HTTP/JSON, exposes an optional MongoDB-compatible endpoint for official drivers,
@@ -60,7 +85,7 @@ feature gates:
 - **[Instant CI database branches](docs/branching.md)** — clone a stopped database or data-only snapshot into an independent, writable database with `nonodb-cli branch`; CoW reflink/clonefile keeps it cheap, sidecars are copied or rebuilt, and the source is never modified.
 - **[Simple backup scheduling](docs/backup.md#scheduled-backups-from-the-daemon-and-gui)** — durable backup jobs configured through the CLI, API, or GUI.
 - **[Simple credential management](docs/auth.md)** — principals, database-qualified scopes, hashed tokens, client certificates, lockout, and reloads.
-- **[Streams beyond the local socket](docs/streams.md#continuous-stream)** — watch/SSE/NDJSON streams over the TCP/TLS listener, so remote consumers can use them through a secured endpoint.
+- **[Durable streams and consumer groups](docs/streams.md#consumer-groups-and-durable-offsets)** — writer-assigned `_seq` offsets, shared consumer groups, contiguous range leases, automatic redelivery, persistent dead letters, and offset-driven retention; watch/SSE/NDJSON also work over the TCP/TLS listener.
 - **[Schedulers and background jobs](docs/workers.md#scheduling)** — durable jobs, workers, leases, retries, and scheduler-friendly CLI commands.
 - **[Replication and failover](docs/replication-cluster-guide.md)** — asynchronous primary/replica/standby replication with durable ordered operations, snapshot bootstrap, lease-gated writes, quorum promotion, automatic election, partition rejoin, and a cluster-wide [GUI](docs/gui.md#cluster-view).
 - **[MongoDB-compatible access](docs/mongodb-compatibility.md)** — an optional wire endpoint for official PyMongo, Node.js, and Go drivers, without making MongoDB a deployment dependency.
@@ -490,7 +515,7 @@ docker run -d --name nonodb \
   --group-add "$(id -g)" \
   -v "$NONODB_AUTH_FILE:/etc/nonodb/auth.json:ro" \
   -v nonodb-data:/var/lib/nonodb \
-  ghcr.io/essmos/nonodb:0.34.0
+  ghcr.io/essmos/nonodb:0.35.0
 ```
 
 Check health and logs:
@@ -574,7 +599,7 @@ listener, so the Windows daemon requires TCP plus `NONODB_AUTH_FILE`.
 Download, verify, and extract the x86_64 archive:
 
 ```bash
-TAG=v0.34.0
+TAG=v0.35.0
 curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/nonodb-$TAG-linux-x86_64.tar.gz"
 curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/nonodb-$TAG-linux-x86_64.tar.gz.sha256"
 sha256sum -c "nonodb-$TAG-linux-x86_64.tar.gz.sha256"
@@ -662,7 +687,7 @@ connection failures, or `5xx`. You can also set `write_url` explicitly. See
 Download the archive matching your CPU (`uname -m` prints `arm64` or `x86_64`):
 
 ```bash
-TAG=v0.34.0
+TAG=v0.35.0
 ARCHIVE="nonodb-$TAG-macos-arm64.tar.gz"   # use macos-x86_64 on Intel
 curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/$ARCHIVE"
 curl -LO "https://github.com/essmos/nonodb/releases/download/$TAG/$ARCHIVE.sha256"
@@ -842,6 +867,7 @@ See [Benchmarks](docs/benchmarks.md) for methodology and full tables.
 | Index-only sort at 1M docs | 1–2 ms |
 | Full sort at 1M docs (no index) | 250–420 ms |
 | Idle daemon RSS at 1M docs, 3 indexes | ~5 MB |
+| Process RSS in the 206M-row benchmark | ~26 MiB |
 | Live backup of 8M docs + 1M text docs | 5.1 GB in ~10 s |
 
 ## Sponsors
@@ -860,7 +886,7 @@ results. Visit [liveapisec.com](https://liveapisec.com) to learn more.
 
 ## Status
 
-nonodb is an early-stage project (`0.34.0`). Its core storage, query, index,
+nonodb is an early-stage project (`0.35.0`). Its core storage, query, index,
 search, batching, security, snapshot, and operational paths are covered by unit,
 property-based, end-to-end, concurrency, crash, and large-data tests. The API
 may still change before a stable release.

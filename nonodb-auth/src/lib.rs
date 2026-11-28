@@ -130,6 +130,8 @@ pub struct Principal {
 pub enum Action {
     Read,
     Write,
+    /// Stream/queue consumption: claiming batches and acknowledging them.
+    Consume,
     AdminCollection,
     AdminDatabase,
 }
@@ -139,6 +141,7 @@ enum ScopeRule {
     All,
     Read(Resource),
     Write(Resource),
+    Consume(Resource),
     AdminCollection(Resource),
     AdminDatabase,
     MetricsRead,
@@ -182,6 +185,7 @@ impl ScopeRule {
         match action {
             "read" => Ok(Self::Read(resource)),
             "write" => Ok(Self::Write(resource)),
+            "consume" => Ok(Self::Consume(resource)),
             "admin" => Ok(Self::AdminCollection(resource)),
             other => Err(format!("unknown scope action `{other}`")),
         }
@@ -192,9 +196,13 @@ impl ScopeRule {
             (Self::All, _) => true,
             (Self::Read(rule), Action::Read)
             | (Self::Write(rule), Action::Write)
+            | (Self::Consume(rule), Action::Consume)
             | (Self::AdminCollection(rule), Action::AdminCollection) => {
                 rule.matches(database, coll)
             }
+            // Collection administration implies consuming that collection:
+            // operators can always drain their own streams.
+            (Self::AdminCollection(rule), Action::Consume) => rule.matches(database, coll),
             _ => false,
         }
     }
@@ -314,6 +322,7 @@ impl Principal {
     pub fn can_see_collection(&self, database: &str, coll: &str) -> bool {
         self.allows(Action::Read, database, coll)
             || self.allows(Action::Write, database, coll)
+            || self.allows(Action::Consume, database, coll)
             || self.allows(Action::AdminCollection, database, coll)
             || self
                 .scopes
@@ -327,6 +336,7 @@ impl Principal {
             ScopeRule::All | ScopeRule::AdminDatabase => true,
             ScopeRule::Read(resource)
             | ScopeRule::Write(resource)
+            | ScopeRule::Consume(resource)
             | ScopeRule::AdminCollection(resource) => resource
                 .database
                 .as_deref()
@@ -342,6 +352,7 @@ impl Principal {
                 ScopeRule::All => "*:*".to_string(),
                 ScopeRule::Read(resource) => format!("read:{}", resource.display()),
                 ScopeRule::Write(resource) => format!("write:{}", resource.display()),
+                ScopeRule::Consume(resource) => format!("consume:{}", resource.display()),
                 ScopeRule::AdminCollection(resource) => format!("admin:{}", resource.display()),
                 ScopeRule::AdminDatabase => "admin:db".to_string(),
                 ScopeRule::MetricsRead => "metrics:read".to_string(),
@@ -764,6 +775,26 @@ mod tests {
         assert!(!principal.allows_metrics());
         assert!(principal.can_see_collection("default", "orders"));
         assert!(!principal.can_see_collection("default", "customers"));
+    }
+
+    #[test]
+    fn consume_scope_is_separate_from_read() {
+        let principal = Principal::new(
+            "consumer",
+            &["consume:orders".to_string(), "read:audit".to_string()],
+        )
+        .unwrap();
+        assert!(principal.allows(Action::Consume, "default", "orders"));
+        assert!(!principal.allows(Action::Read, "default", "orders"));
+        assert!(!principal.allows(Action::Write, "default", "orders"));
+        assert!(!principal.allows(Action::AdminCollection, "default", "orders"));
+        assert!(principal.allows(Action::Read, "default", "audit"));
+        assert!(!principal.allows(Action::Consume, "default", "audit"));
+        // Admins can always consume their own collection.
+        let admin = Principal::new("ops", &["admin:orders".to_string()]).unwrap();
+        assert!(admin.allows(Action::Consume, "default", "orders"));
+        assert!(!admin.allows(Action::Consume, "default", "audit"));
+        assert_eq!(principal.scopes(), vec!["consume:orders", "read:audit"]);
     }
 
     #[test]

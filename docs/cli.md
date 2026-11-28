@@ -115,7 +115,7 @@ NONODB_SOCK=/tmp/nonodb.sock nonodb-cli server
 {
   "ok": true,
   "result": {
-    "version": "0.34.0",
+    "version": "0.35.0",
     "tcp": {
       "configured": "127.0.0.1:7902",
       "bound": "127.0.0.1:7902",
@@ -392,6 +392,27 @@ edge-triggered (`false -> true`). Persistent subscriptions have a client lease
 (default 600 seconds); run `subscription-ping` before it expires. Events are
 stored in `_events` with type `subscription.<name>` unless `--type` is given. See
 [Conditional subscriptions](subscriptions.md).
+
+## streams
+
+```bash
+nonodb-cli streams list
+nonodb-cli streams create _events --max-events 1000000 --max-age-ms 604800000
+nonodb-cli streams groups [_events]
+nonodb-cli streams dead _events order-sync
+nonodb-cli streams retry _events order-sync 412901
+nonodb-cli streams drop _events order-sync 412901
+nonodb-cli streams reset _events order-sync earliest|latest|<seq>
+nonodb-cli streams prune _events [batch]
+```
+
+`streams groups` prints the committed offset, stream head, lag, in-flight
+events, dead-lettered **events** (`DEAD_EV`), dead-lettered **ranges**
+(`DEAD_RNG`), redeliveries, truncations, and the attempt budget per group. `streams create`
+accepts `--max-events`, `--max-age-ms`, and `--min-seq-keep`;
+`retention.max_bytes` is not enforced. Pruning only moves when a group commits,
+so `streams prune` is a no-op while a consumer with no commits exists. See
+[Streams](streams.md).
 
 ## history
 

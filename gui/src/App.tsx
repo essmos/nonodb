@@ -14,6 +14,7 @@ import {
   type SavedView,
 } from './savedViews';
 import EventingPage from './EventingPage';
+import StreamsPage from './StreamsPage';
 import GraphPage from './GraphPage';
 import {
   applyFirewall,
@@ -135,9 +136,18 @@ type IndexInfo = {
   field: string;
   fields: string[];
   unique: boolean;
+  sparse?: boolean;
+  partial_filter_expression?: unknown;
   include?: string[];
   format?: string;
   geo?: boolean;
+};
+
+const INDEX_TYPE_HELP: Record<'secondary' | 'text' | 'fuzzy' | 'vector', string> = {
+  secondary: 'Secondary: equality and range filters, sorting, unique constraints, and covering fields.',
+  text: 'Text/BM25: full-text search with tokenized, ranked matches on one field.',
+  fuzzy: 'Fuzzy: approximate string matching for typos and spelling variants on one field.',
+  vector: 'Vector: nearest-neighbour search over one embedding field.',
 };
 
 type Revision = {
@@ -2371,7 +2381,7 @@ docker volume create nonodb-replica-run
 docker run --rm \
   -v nonodb-replica-data:/var/lib/nonodb \
   -e NONODB_AUTH_FILE=/var/lib/nonodb/auth.json \
-  ghcr.io/essmos/nonodb:0.34.0 \
+  ghcr.io/essmos/nonodb:0.35.0 \
   nonodb-cli auth init
 
 docker run -d --name nonodb-replica \
@@ -2383,7 +2393,7 @@ docker run -d --name nonodb-replica \
   -e NONODB_REPLICATION_ROLE=replica \
   -e NONODB_REPLICATION_NODE_ID=replica-docker \
   -e NONODB_REPLICATION_ADVERTISE_URL=http://DOCKER_HOST_IP:7912 \
-  ghcr.io/essmos/nonodb:0.34.0
+  ghcr.io/essmos/nonodb:0.35.0
 
 docker exec nonodb-replica nonodb-cli replication join \
   http://PRIMARY_HOST:7878 PAIRING-CODE
@@ -3141,8 +3151,11 @@ function CollectionView({
   const [indexKind, setIndexKind] = useState<'secondary' | 'text' | 'fuzzy' | 'vector'>('secondary');
   const [indexField, setIndexField] = useState('');
   const [indexUnique, setIndexUnique] = useState(false);
+  const [indexSparse, setIndexSparse] = useState(false);
   const [indexInclude, setIndexInclude] = useState('');
   const [indexGeo, setIndexGeo] = useState(false);
+  const [indexDirections, setIndexDirections] = useState('');
+  const [indexPartial, setIndexPartial] = useState('');
   const [vectorDims, setVectorDims] = useState('3');
   const [vectorMetric, setVectorMetric] = useState('cosine');
   const [subscriptions, setSubscriptions] = useState<Array<Record<string, unknown>>>([]);
@@ -3641,18 +3654,53 @@ function CollectionView({
       setError('Text, fuzzy, and vector indexes need exactly one field');
       return;
     }
+    let directions: number[] = [];
+    let partialFilterExpression: Record<string, unknown> | undefined;
+    if (indexKind === 'secondary') {
+      if (indexDirections.trim()) {
+        directions = indexDirections.split(',').map((part) => Number(part.trim()));
+        if (directions.length !== fields.length || directions.some((part) => part !== 1 && part !== -1)) {
+          setError('Directions must contain one 1 or -1 per field');
+          return;
+        }
+      }
+      if (indexPartial.trim()) {
+        try {
+          const parsed = JSON.parse(indexPartial) as unknown;
+          if (parsed === null || Array.isArray(parsed) || typeof parsed !== 'object') {
+            setError('Partial filter must be a JSON object');
+            return;
+          }
+          partialFilterExpression = parsed as Record<string, unknown>;
+        } catch {
+          setError('Partial filter is not valid JSON');
+          return;
+        }
+      }
+    }
     setBusy(true);
     setError('');
     try {
       if (indexKind === 'secondary') {
-        await exec(connection, {
-          op: 'create_index',
-          coll: name,
+        const include = indexInclude.split(',').map((part) => part.trim()).filter(Boolean);
+        const spec = {
           fields,
           unique: indexUnique,
-          include: indexInclude.split(',').map((part) => part.trim()).filter(Boolean),
+          sparse: indexSparse,
+          include,
           geo: indexGeo,
-        });
+          ...(partialFilterExpression ? { partialFilterExpression } : {}),
+          ...(directions.length ? { directions } : {}),
+        };
+        if (directions.length) {
+          await exec(connection, {
+            op: 'create_indexes',
+            coll: name,
+            indexes: [spec],
+          });
+        } else {
+          await exec(connection, { op: 'create_index', coll: name, ...spec });
+        }
       } else if (indexKind === 'text') {
         await exec(connection, { op: 'create_text_index', coll: name, field: fields[0] });
       } else if (indexKind === 'fuzzy') {
@@ -3669,7 +3717,10 @@ function CollectionView({
       setIndexField('');
       setIndexInclude('');
       setIndexUnique(false);
+      setIndexSparse(false);
       setIndexGeo(false);
+      setIndexDirections('');
+      setIndexPartial('');
       setNotice('Index created');
       await load();
     } catch (err) {
@@ -4243,8 +4294,17 @@ function CollectionView({
                   Include
                   <input value={indexInclude} onChange={(e) => setIndexInclude(e.target.value)} placeholder="fields" />
                 </label>
-                <label className="checkbox"><input type="checkbox" checked={indexUnique} onChange={(e) => setIndexUnique(e.target.checked)} /> unique</label>
-                <label className="checkbox"><input type="checkbox" checked={indexGeo} onChange={(e) => setIndexGeo(e.target.checked)} /> geo</label>
+                <label className="checkbox" title="Reject documents with duplicate index keys"><input type="checkbox" checked={indexUnique} onChange={(e) => setIndexUnique(e.target.checked)} /> unique</label>
+                <label className="checkbox" title="Omit documents where the indexed field is absent"><input type="checkbox" checked={indexSparse} onChange={(e) => setIndexSparse(e.target.checked)} /> sparse</label>
+                <label className="checkbox" title="Index a GeoJSON point field"><input type="checkbox" checked={indexGeo} onChange={(e) => setIndexGeo(e.target.checked)} /> geo</label>
+                <label className="compact">
+                  Directions
+                  <input value={indexDirections} onChange={(e) => setIndexDirections(e.target.value)} placeholder="1,-1" />
+                </label>
+                <label className="grow">
+                  Partial filter
+                  <input value={indexPartial} onChange={(e) => setIndexPartial(e.target.value)} placeholder='{"status":"active"}' />
+                </label>
               </>
             )}
             {indexKind === 'vector' && (
@@ -4256,10 +4316,24 @@ function CollectionView({
             <button onClick={() => void createIndex()} disabled={busy}>Create</button>
             <button onClick={() => void reindexIndexes()} disabled={busy || indexes.length + textIndexes.length + fuzzyIndexes.length + vectorIndexes.length === 0}>Reindex all</button>
           </div>
+          <div className="index-help">
+            <p className="field-hint">{INDEX_TYPE_HELP[indexKind]}</p>
+            <p className="field-hint">
+              <strong>Secondary options:</strong> <strong>unique</strong> rejects duplicate keys;{' '}
+              <strong>sparse</strong> omits documents without the field; <strong>geo</strong> indexes
+              GeoJSON points; <strong>include</strong> adds covering fields; <strong>directions</strong>{' '}
+              sets compound order (<code>1</code> ascending, <code>-1</code> descending);{' '}
+              <strong>partial filter</strong> indexes only documents matching a query predicate.
+            </p>
+            <p className="field-hint">
+              Documentation: <a href="https://github.com/essmos/nonodb/blob/main/docs/timeseries.md#secondary-indexes" target="_blank" rel="noreferrer">time-series indexes</a>{' '}
+              · <a href="https://github.com/essmos/nonodb/blob/main/docs/api.md#create_index" target="_blank" rel="noreferrer">index API and all index types</a>
+            </p>
+          </div>
           <div className="index-list">
             {indexes.map((index) => (
               <div key={`secondary-${index.field}`} className="index-row">
-                <span><strong>{index.field}</strong><span className="badge">secondary</span>{index.unique && <span className="badge">unique</span>}{index.geo && <span className="badge">geo</span>}</span>
+                <span><strong>{index.field}</strong><span className="badge">secondary</span>{index.unique && <span className="badge">unique</span>}{index.sparse && <span className="badge">sparse</span>}{index.partial_filter_expression != null && <span className="badge">partial</span>}{index.geo && <span className="badge">geo</span>}</span>
                 <button className="danger small" onClick={() => void dropIndex(index.field, 'secondary')}>Drop</button>
               </div>
             ))}
@@ -5747,7 +5821,7 @@ function Shell({
 }) {
   const [collections, setCollections] = useState<string[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
-  const [tab, setTab] = useState<'dashboard' | 'storage' | 'playground' | 'database' | 'backups' | 'import' | 'replication' | 'cluster' | 'network' | 'auth' | 'eventing' | 'graph'>('dashboard');
+  const [tab, setTab] = useState<'dashboard' | 'storage' | 'playground' | 'database' | 'backups' | 'import' | 'replication' | 'cluster' | 'network' | 'auth' | 'eventing' | 'streams' | 'graph'>('dashboard');
   const [showNewCollection, setShowNewCollection] = useState(false);
   const [showPalette, setShowPalette] = useState(false);
   const [paletteQuery, setPaletteQuery] = useState('');
@@ -5912,6 +5986,9 @@ function Shell({
           <button className={tab === 'eventing' ? 'active' : ''} aria-current={tab === 'eventing' ? 'page' : undefined} onClick={() => setTab('eventing')}>
             Eventing
           </button>
+          <button className={tab === 'streams' ? 'active' : ''} aria-current={tab === 'streams' ? 'page' : undefined} onClick={() => setTab('streams')}>
+            Streams
+          </button>
           <button className={tab === 'graph' ? 'active' : ''} aria-current={tab === 'graph' ? 'page' : undefined} onClick={() => setTab('graph')}>
             Graph
           </button>
@@ -6014,6 +6091,8 @@ function Shell({
             collections={collections}
             onOpenCollection={(name, eventingTab) => openCollection(name, eventingTab ?? 'events')}
           />
+        ) : tab === 'streams' ? (
+          <StreamsPage connection={connection} />
         ) : tab === 'graph' ? (
           <GraphPage connection={connection} collections={collections} />
         ) : tab === 'replication' ? (
