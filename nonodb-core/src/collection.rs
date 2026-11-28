@@ -6235,6 +6235,13 @@ impl<'e> Collection<'e> {
         date::normalize_document(&mut new)?;
         numeric::normalize_document(&mut new)?;
         bson_types::normalize_document(&mut new)?;
+        let new_id = new
+            .get("_id")
+            .and_then(id::key_from_value)
+            .ok_or(Error::InvalidId)?;
+        if new_id != id {
+            return Err(Error::Query("update cannot change `_id`".into()));
+        }
 
         self.validate_graph_edge_txn(&*wtxn, &new)?;
         self.validate_unique(&*wtxn, &new, &id)?;

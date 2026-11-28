@@ -99,6 +99,43 @@ fn update_operators_and_replacements_match_standard() {
 }
 
 #[test]
+fn invalid_id_and_duplicate_errors_match_standard() {
+    let (_sd, _cd, sc, cc) = setup();
+    for id in [json!(42), json!(true), json!(["array"])] {
+        let doc = json!({"_id": id, "n": 1});
+        let se = sc.insert_one(doc.clone()).unwrap_err().to_string();
+        let ce = cc.insert_one(doc).unwrap_err().to_string();
+        assert_eq!(se, ce, "insert invalid id {id}");
+    }
+    let doc = json!({"_id": "a", "n": 99});
+    let se = sc.insert_one(doc.clone()).unwrap_err().to_string();
+    let ce = cc.insert_one(doc).unwrap_err().to_string();
+    assert_eq!(se, ce, "duplicate insert");
+    let operator = json!({"$set": {"_id": "b"}});
+    let se = sc
+        .update(&json!({"_id": "a"}), &operator, false)
+        .unwrap_err()
+        .to_string();
+    let ce = cc
+        .update(&json!({"_id": "a"}), &operator, false)
+        .unwrap_err()
+        .to_string();
+    assert_eq!(se, ce, "operator id change");
+    let replacement = json!({"_id": "b", "n": 1});
+    assert_eq!(
+        sc.update(&json!({"_id": "a"}), &replacement, false)
+            .unwrap(),
+        cc.update(&json!({"_id": "a"}), &replacement, false)
+            .unwrap()
+    );
+    assert_eq!(
+        sc.find_by_key("a").unwrap().unwrap()["_id"],
+        cc.find_by_key("a").unwrap().unwrap()["_id"]
+    );
+    assert_same(&sc, &cc, "invalid id attempts");
+}
+
+#[test]
 fn insert_many_order_duplicate_atomicity_and_bson_ids_match_standard() {
     let sd = tempfile::tempdir().unwrap();
     let cd = tempfile::tempdir().unwrap();

@@ -1109,7 +1109,7 @@ pub fn replace_by_id(
         return Err(Error::Query(format!("document `{id}` disappeared")));
     };
     if doc_id(doc)? != id {
-        return Err(Error::Query("columnar update cannot change `_id`".into()));
+        return Err(Error::Query("update cannot change `_id`".into()));
     }
     write_doc_at(wtxn, &db, locator, doc)
 }
@@ -2020,7 +2020,7 @@ pub(crate) fn update_with_changes(
             .ok_or_else(|| Error::Query("updated document must be an object".into()))?;
         let next_id = doc_id(next_object)?;
         if old_id != next_id {
-            return Err(Error::Query("columnar update cannot change `_id`".into()));
+            return Err(Error::Query("update cannot change `_id`".into()));
         }
         let bytes = serde_json::to_vec(&next)?;
         if bytes.len() > crate::store::MAX_DOCUMENT_BYTES {
