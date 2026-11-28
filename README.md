@@ -36,6 +36,11 @@ LMDB storage and production features in one binary.
 Coverage means everyday workloads, not full API parity. One process replaces
 six separate operational surfaces, not six complete product ecosystems.
 
+Streams and consumer groups add a durable event log on an ordinary collection:
+useful for simple Redis Streams-style work queues and fan-out, but not a full
+broker with topics, partitions, or the Kafka ecosystem. See
+[Streams and consumer groups](docs/streams.md).
+
 One Rust daemon for small VMs and edge boxes: owns the LMDB files, speaks
 HTTP/JSON, exposes an optional MongoDB-compatible endpoint for official drivers,
 and hosts multiple databases.

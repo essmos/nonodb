@@ -1,12 +1,16 @@
 # Streaming outbox events
 
-NonoDB can tail **append-only event collections** in two ways:
+NonoDB can consume **append-only event collections** in three modes:
 
 - `watch` — a bounded long-poll request over `/v1/exec`;
-- `/v1/watch` — a continuous NDJSON or SSE stream.
+- `/v1/watch` — a continuous NDJSON or SSE stream;
+- `watch` with `"mode":"group"` — durable consumer groups with server-side
+  offsets.
 
-Both are designed for collections such as `_events`, where documents are
-inserted with sortable ULID `_id` values by the outbox producer.
+The first two tail documents by `_id` and are designed for collections such as
+`_events`, where documents are inserted with sortable ULID `_id` values by the
+outbox producer. Group mode tails by `_seq` and is described in
+[Consumer groups and durable offsets](#consumer-groups-and-durable-offsets).
 
 > **Streams:** server-side offsets, consumer groups, and in-flight range leases
 > are implemented (see [consumer groups](#consumer-groups-and-durable-offsets)).
@@ -398,10 +402,14 @@ body to `/v1/watch` and decode NDJSON lines with `json.Decoder`.
 
 ## Checkpoints, delivery, and retention
 
-`watch` and `/v1/watch` are transport-level streams, not durable consumers. They
-do **not** store a checkpoint. The application must persist the last processed
-`_id` after successful processing, just like the
+`watch` in the default mode and `/v1/watch` are transport-level streams, not
+durable consumers. They do **not** store a checkpoint. The application must
+persist the last processed `_id` after successful processing, just like the
 [outbox consumer](events.md#consume-with-checkpoints).
+
+Group mode is different: the daemon stores `committed_seq` per group, and
+`commit_stream_group` advances it. See
+[Consumer groups and durable offsets](#consumer-groups-and-durable-offsets).
 
 Delivery is at-least-once:
 
@@ -763,8 +771,7 @@ groups that retention crossed.
 ### Current limits
 
 - `retention.max_bytes` is validated but ignored; use `max_events` and
-  `max_age_ms` instead. The
-  [streams groups plan](streams-groups-plan.md) has the remaining phase.
+  `max_age_ms` instead.
 - Leases are node-local ownership and are not replicated. The claim position is
   derived from `committed_seq` plus the leases on the current node, never from
   the replicated `next_seq`, so a promoted replica resumes at
