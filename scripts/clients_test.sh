@@ -75,6 +75,32 @@ try:
     listed = db.exec({"op": "list_collections"})
     entry = next(item for item in listed["collection_info"] if item["name"] == "py_columnar")
     assert entry["profile"] == "columnar"
+
+    collection.insert({"_id": "rollback", "kind": "old", "n": 2})
+    collection.write_batch([
+        {"op": "insert", "doc": {"_id": "batch", "kind": "batch", "n": 3}},
+        {"op": "update", "filter": {"kind": "columnar"}, "update": {"$inc": {"n": 10}}},
+        {"op": "delete", "filter": {"kind": "old"}},
+    ])
+    assert collection.find_one({"kind": "batch"})["n"] == 3
+    assert collection.find_one({"kind": "columnar"})["n"] == 11
+    assert collection.find_one({"kind": "old"}) is None
+    try:
+        collection.write_batch([
+            {"op": "insert", "doc": {"_id": "dup", "n": 1}},
+            {"op": "insert", "doc": {"_id": "dup", "n": 2}},
+        ])
+    except Exception:
+        pass
+    else:
+        raise AssertionError("duplicate write_batch unexpectedly succeeded")
+    assert collection.find_one({"_id": "dup"}) is None
+
+    for index in range(5):
+        collection.insert({"_id": f"cursor-{index}", "kind": "cursor", "n": index})
+    cursor = collection.find_cursor({"kind": "cursor"}, batch_size=2)
+    assert [doc["_id"] for doc in cursor] == [f"cursor-{index}" for index in range(5)]
+    assert cursor.close() is False
 finally:
     db.close()
 PY

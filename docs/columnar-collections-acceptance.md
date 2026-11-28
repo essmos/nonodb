@@ -326,10 +326,17 @@ The following evidence was reviewed for this release candidate:
   parity are covered by `columnar_parity.rs`.
 - `columnar_writes.rs` covers the supported update-operator matrix, replacement
   updates, `insert_many` id order/atomicity, and ObjectId ids.
-- `scripts/clients_test.sh` exercises columnar create/settings/stats/CRUD
-  through the Python, Rust, Node.js, and Go clients and the CLI,
-  `scripts/columnar_wire_test.py` covers MongoDB wire CRUD/create/listCollections,
-  and `/metrics` exposes `columnar_collections` plus `nonodb_columnar_*` gauges.
+- `scripts/clients_test.sh` exercises columnar create/settings/stats/CRUD,
+  atomic `write_batch` rollback, and `find_cursor` paging through the Python
+  client; the Rust, Node.js, and Go clients plus the CLI are exercised in the
+  same run. `scripts/columnar_wire_test.py` covers MongoDB wire
+  CRUD/create/listCollections, and `/metrics` exposes `columnar_collections`
+  plus `nonodb_columnar_*` gauges, including tombstone deletes and
+  open/sealed/id-map byte counters.
+- ObjectId `findAndModify`, TTL expiry, and replication deletion use the
+  stored `_id` value rather than an internal locator key; the regressions are
+  covered by `columnar_parity.rs`, `columnar_lifecycle.rs`, and
+  `columnar_operations.rs`.
 - The v0.34.0 daemon (without columnar support) was opened against a columnar
   data directory and exited with `unknown collection profile \`columnar\``
   without modifying the database.
